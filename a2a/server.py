@@ -8,7 +8,6 @@ managing task lifecycle, and returning results.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
 from typing import Any, Callable
 
 from loguru import logger as log

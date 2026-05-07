@@ -36,7 +36,6 @@ from typing import Any
 
 import pandas as pd
 from loguru import logger as log
-from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller

@@ -9,7 +9,6 @@ from loguru import logger as log
 from intelligence.entity_resolver import SpiderEntityResolver as EntityResolver
 from intelligence.spider.graph_engine import GraphEngine
 from intelligence.spider.models import ConnectionMeta, DiscoveredConnection
-from intelligence.spider.sources import BaseSourceAdapter
 
 
 class DiscoveryOrchestrator:

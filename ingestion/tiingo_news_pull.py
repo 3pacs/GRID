@@ -12,10 +12,9 @@ from __future__ import annotations
 import hashlib
 import os
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from typing import Any
 
-import pandas as pd
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -101,7 +100,7 @@ class TiingoNewsPuller(BasePuller):
                 for article in articles:
                     title = str(article.get("title", ""))[:500]
                     url = str(article.get("url", ""))
-                    source = str(article.get("source", ""))
+                    str(article.get("source", ""))
                     pub_date = article.get("publishedDate", "")
 
                     if not title:
@@ -117,8 +116,8 @@ class TiingoNewsPuller(BasePuller):
 
                     # Tiingo doesn't provide explicit sentiment, but we can derive
                     # a simple signal from article count + tags
-                    tags = article.get("tags", [])
-                    tickers_mentioned = article.get("tickers", [])
+                    article.get("tags", [])
+                    article.get("tickers", [])
 
                     # Simple sentiment proxy: more coverage = more attention
                     # We store 1.0 for each article as a count signal

@@ -4,14 +4,10 @@ from __future__ import annotations
 from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from intelligence.eight_k_clustering import (
     ITEM_SEVERITY,
-    ClusterAlert,
     EightKFiling,
-    _CLUSTER_WINDOW_DAYS,
-    _MIN_CLUSTER_SIZE,
     classify_severity,
     detect_clusters,
     scan_for_clusters,

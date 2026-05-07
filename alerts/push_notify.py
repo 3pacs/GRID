@@ -342,7 +342,7 @@ def send_push(subscription: dict, title: str, body: str,
         return False
 
     try:
-        from pywebpush import webpush, WebPushException
+        from pywebpush import webpush
 
         payload = json.dumps({
             "title": title,

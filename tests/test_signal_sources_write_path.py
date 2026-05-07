@@ -288,7 +288,6 @@ def test_institutional_flows_emits_net_position_delta_per_change(monkeypatch):
     block logic via a tiny script that mirrors what _pull_13f_filings
     does per-change. This keeps the test hermetic (no network, no DB).
     """
-    from ingestion.altdata import institutional_flows as mod
 
     conn = _StubConn()
     cik = "0001067983"

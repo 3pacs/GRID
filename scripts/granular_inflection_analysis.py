@@ -20,7 +20,6 @@ import sys
 from datetime import date, timedelta
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 from loguru import logger as log
 
@@ -186,8 +185,8 @@ def main() -> None:
             snapshot[feat_name] = at_trough
 
             # Only log features that show interesting movement
-            slope = traj.get("10d_slope")
-            change_7d = traj.get("7d_change")
+            traj.get("10d_slope")
+            traj.get("7d_change")
 
             before_avg = traj.get("7d_before_avg", at_trough)
             after_avg = traj.get("7d_after_avg", at_trough)

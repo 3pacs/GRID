@@ -233,7 +233,7 @@ class JupiterClient:
         """
         # Imported lazily so importing this module never fails when the
         # heavy ``solders`` SDK is absent.
-        from trading.solana.wallet import SolanaWallet, WalletUnavailableError
+        from trading.solana.wallet import SolanaWallet
 
         if not isinstance(wallet, SolanaWallet):
             raise ValueError("wallet must be a SolanaWallet instance")

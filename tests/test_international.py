@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import pytest
 import requests
 
 
@@ -18,7 +17,6 @@ class TestECBPuller:
 
     def test_ecb_puller_init(self):
         """ECBPuller initializes without error when source exists."""
-        import sys
         mock_engine = MagicMock()
         mock_conn = MagicMock()
         mock_engine.connect.return_value.__enter__ = MagicMock(return_value=mock_conn)

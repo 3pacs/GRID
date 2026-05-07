@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import reduce
-from typing import Any
 
 from oracle.hallucination_guard import GuardCheck
 from verification.url_health import URLCheckResult, URLClassification

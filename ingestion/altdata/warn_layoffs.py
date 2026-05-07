@@ -47,7 +47,7 @@ or manual load) and handles dedup + entity resolution.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date
 from typing import Any
 
 from loguru import logger as log

@@ -277,7 +277,6 @@ class TestBuildPrompt:
 class TestExplainEndpoint:
     def test_returns_404_when_node_missing(self, mock_engine):
         """The endpoint returns 404 when nodes are not found."""
-        from fastapi.testclient import TestClient
 
         from api.routers.canvas_llm import router
 

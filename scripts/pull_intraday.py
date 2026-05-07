@@ -10,11 +10,9 @@ Run: python3 pull_intraday.py
 
 import os
 import sys
-from datetime import datetime, date, timedelta
 from pathlib import Path
 
 import psycopg2
-import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -86,7 +84,7 @@ def compute_intraday_features(df, name):
         low = group["Low"].min()
         close = group["Close"].iloc[-1]
         open_price = group["Open"].iloc[0]
-        volume = group["Volume"].sum() if "Volume" in group.columns else 0
+        group["Volume"].sum() if "Volume" in group.columns else 0
 
         # Intraday range (high-low as pct of open)
         intraday_range = (high - low) / open_price if open_price > 0 else 0

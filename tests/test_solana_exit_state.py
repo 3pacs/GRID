@@ -9,16 +9,13 @@ The store is a thin SQL wrapper, so these tests focus on:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 import pytest
 from sqlalchemy.engine import Engine
 
 from trading.solana.exit_state import (
-    SOURCE_UNKNOWN,
     ExitStateStore,
-    PositionStateRow,
     VariantStatsRow,
 )
 

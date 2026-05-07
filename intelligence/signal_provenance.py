@@ -30,8 +30,8 @@ classification (strong/neutral/weak/anti).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from typing import Any
 
 from loguru import logger as log
@@ -39,9 +39,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from features.per_signal_brier import (
-    MIN_CALIBRATED_SAMPLES,
     SignalScorecard,
-    get_signal_scorecard,
 )
 from features.regime_conditional_brier import (
     get_scorecard_with_regime_fallback,

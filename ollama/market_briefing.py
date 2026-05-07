@@ -384,7 +384,7 @@ class MarketBriefingEngine:
                 _eng = get_engine()
             sentiment = compute_sentiment(_eng)
             log_prediction(_eng, sentiment)
-            data_context += f"\n\n### COMPUTED SENTIMENT (deterministic — DO NOT override)\n"
+            data_context += "\n\n### COMPUTED SENTIMENT (deterministic — DO NOT override)\n"
             data_context += f"- Score: {sentiment.score:+.2f} ({sentiment.label})\n"
             data_context += f"- Context: {sentiment.context}\n"
             for comp in sentiment.components:
@@ -655,7 +655,6 @@ class MarketBriefingEngine:
 
         Returns the number of files deleted.
         """
-        from datetime import timedelta
 
         cutoff = datetime.now() - timedelta(days=max_age_days)
         deleted = 0

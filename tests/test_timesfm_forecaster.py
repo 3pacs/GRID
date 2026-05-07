@@ -8,7 +8,7 @@ so the actual model weights are not required.
 from __future__ import annotations
 
 from datetime import date
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
@@ -213,7 +213,7 @@ class TestForecasterForecast:
             forecaster._available = True
             forecaster._model = mock_model
 
-            result = forecaster.forecast(
+            forecaster.forecast(
                 series=long_series,
                 series_id="LONG",
             )

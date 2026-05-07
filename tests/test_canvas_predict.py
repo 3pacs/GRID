@@ -554,7 +554,6 @@ class TestCanvasPredictDB:
 
     def test_no_lever_no_conditions(self):
         """Test prediction without lever or conditions uses plain thesis."""
-        from sqlalchemy import text
         from api.routers.canvas_predict import create_prediction, PredictionRequest
         import asyncio
 

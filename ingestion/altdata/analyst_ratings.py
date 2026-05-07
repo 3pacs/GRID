@@ -17,7 +17,7 @@ Features follow the naming convention already in feature_registry:
 from __future__ import annotations
 
 import time
-from datetime import date, datetime, timezone
+from datetime import date
 from typing import Any
 
 import yfinance as yf

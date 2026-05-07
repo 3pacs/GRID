@@ -8,7 +8,7 @@ using latest available prices from raw_series, and closes trades open > 7 days.
 from __future__ import annotations
 
 import sys
-from datetime import date, timedelta
+from datetime import date
 
 from loguru import logger as log
 from sqlalchemy import create_engine, text

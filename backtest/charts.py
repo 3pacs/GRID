@@ -162,7 +162,7 @@ def _chart_regime_timeline(result, plt, mdates, Patch) -> str:
     ax1.set_ylabel("SPY", color="#8AA0B8", fontsize=10)
 
     # Bottom: Regime bars
-    regime_nums = [["GROWTH", "NEUTRAL", "FRAGILE", "CRISIS"].index(r) if r in ["GROWTH", "NEUTRAL", "FRAGILE", "CRISIS"] else 1 for r in regimes]
+    [["GROWTH", "NEUTRAL", "FRAGILE", "CRISIS"].index(r) if r in ["GROWTH", "NEUTRAL", "FRAGILE", "CRISIS"] else 1 for r in regimes]
     colors = [REGIME_COLORS.get(r, "#333") for r in regimes]
     ax2.bar(dates, [1] * len(dates), width=1.5, color=colors, linewidth=0)
     ax2.set_yticks([])

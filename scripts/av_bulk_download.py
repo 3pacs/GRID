@@ -17,8 +17,7 @@ from __future__ import annotations
 import os
 import sys
 import time
-from datetime import date, datetime
-from typing import Any
+from datetime import datetime
 
 import requests
 from loguru import logger as log
@@ -27,7 +26,6 @@ from loguru import logger as log
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from db import get_engine
-from sqlalchemy import text
 from ingestion.base import BasePuller
 
 AV_BASE = "https://www.alphavantage.co/query"

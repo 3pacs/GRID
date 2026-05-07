@@ -217,9 +217,9 @@ def store_results(
                 values_list = []
                 params = []
                 for idx, node_id in enumerate(batch):
-                    offset = idx * 8
+                    idx * 8
                     values_list.append(
-                        f"(%s, %s, %s, %s, %s, %s, %s, %s, NOW())"
+                        "(%s, %s, %s, %s, %s, %s, %s, %s, NOW())"
                     )
                     params.extend([
                         node_id,

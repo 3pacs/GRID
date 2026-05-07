@@ -36,7 +36,6 @@ from sqlalchemy import text
 from db import get_engine
 from alpha_research.strategies.adaptive_rotation import run_rotation
 from trading.hyperliquid import HyperliquidTrader
-from trading.wallet_manager import WalletManager
 
 
 # ── Regime → Crypto Allocation Map ──────────────────────────────────

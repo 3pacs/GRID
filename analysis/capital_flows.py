@@ -771,7 +771,7 @@ class CapitalFlowResearchEngine:
                 ctx_parts.append(f"  {sector}: P/C={info.get('put_call_ratio', '?')} ({info.get('sentiment', '?')})")
             ctx_parts.append("")
 
-        data_context = "\n".join(ctx_parts)
+        "\n".join(ctx_parts)
 
         # Build compact summary for LLM (must fit in ~1200 tokens prompt)
         compact_parts = [f"Capital flows as of {as_of}:"]

@@ -356,11 +356,11 @@ def _pull_options_events(
             for r in rows:
                 sig_date = r[0]
                 pcr = _safe_float(r[1])
-                max_pain = _safe_float(r[2])
+                _safe_float(r[2])
                 iv_skew = _safe_float(r[3])
-                total_volume = int(r[5]) if r[5] else 0
-                spot = _safe_float(r[6])
-                iv_atm = _safe_float(r[7])
+                int(r[5]) if r[5] else 0
+                _safe_float(r[6])
+                _safe_float(r[7])
 
                 # High put/call ratio (bearish signal)
                 if pcr is not None and pcr > 1.5:
@@ -558,7 +558,7 @@ def _pull_earnings_events(
                 surprise = _safe_float(r[4])
                 rev_est = _safe_float(r[5])
                 rev_act = _safe_float(r[6])
-                rev_surprise = _safe_float(r[7])
+                _safe_float(r[7])
                 classification = r[8] or "pending"
                 reported = r[9]
 
@@ -808,7 +808,6 @@ def find_recurring_patterns(
 
     # Pull all scored signals and their outcomes to find patterns
     cutoff = datetime.now(timezone.utc) - timedelta(days=365)
-    all_events: list[Event] = []
 
     try:
         with engine.connect() as conn:

@@ -18,7 +18,6 @@ from __future__ import annotations
 from datetime import date
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from intelligence import fundamental_divergence as fd
 

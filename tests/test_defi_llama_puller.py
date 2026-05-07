@@ -2,18 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
-from unittest.mock import MagicMock, patch, call
+from datetime import datetime, timezone
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from ingestion.altdata.defi_llama_puller import (
     DefiLlamaPuller,
     MAJOR_CHAINS,
-    _PROTOCOLS_URL,
-    _STABLECOINS_URL,
-    _BRIDGES_URL,
-    _TVL_DROP_THRESHOLD,
     _TOP_PROTOCOLS,
 )
 

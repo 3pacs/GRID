@@ -1,5 +1,6 @@
-import duckdb, psycopg2, json
-from datetime import datetime
+import duckdb
+import psycopg2
+import json
 from loguru import logger as log
 from config import settings
 
@@ -83,7 +84,7 @@ def run():
                     inserted += 1
                 except Exception:
                     skipped += 1
-        except Exception as e:
+        except Exception:
             skipped += 1
 
     dk.close()

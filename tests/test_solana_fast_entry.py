@@ -13,13 +13,11 @@ import pytest
 
 from trading.solana.cross_ref import (
     CrossRefReport,
-    CrossRefWeights,
     DEFAULT_CROSS_REF_WEIGHTS,
     LaunchEvent,
 )
 from trading.solana.executor import ExecutionResult
 from trading.solana.fast_entry import (
-    DEFAULT_FAST_ENTRY_CONFIG,
     FastEntryConfig,
     FastEntryPath,
 )

@@ -451,6 +451,6 @@ if __name__ == "__main__":
     result = sync_trial_sponsors_to_actors(conn)
     conn.close()
 
-    print(f"\nTrial → Actor Bridge complete:")
+    print("\nTrial → Actor Bridge complete:")
     for k, v in result.items():
         print(f"  {k}: {v}")

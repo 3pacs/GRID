@@ -7,7 +7,6 @@ without requiring a database connection.
 
 from __future__ import annotations
 
-import pytest
 
 from knowledge.tree import (
     _detect_category,

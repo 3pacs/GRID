@@ -18,9 +18,8 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
-from loguru import logger as log
 from pydantic import BaseModel
 
 from api.auth import require_auth

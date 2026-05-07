@@ -250,7 +250,7 @@ class PredictionMarketHistoryPuller(BasePuller):
                         skipped += 1
                         continue
 
-                    result = conn.execute(
+                    conn.execute(
                         text("""
                             INSERT INTO prediction_market_markets
                             (platform, market_id, ticker, title, category,

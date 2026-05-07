@@ -224,7 +224,6 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=10_000, help="Rows per INSERT batch (default 10000)")
     args = parser.parse_args()
 
-    batch_size = args.batch_size
 
     engine = get_engine()
     log.info("Bulk resolver starting (dry_run={dr})", dr=args.dry_run)

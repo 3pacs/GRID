@@ -1,5 +1,6 @@
 import yfinance as yf
-import psycopg2, json, time
+import psycopg2
+import time
 from datetime import datetime
 from config import settings
 from loguru import logger as log

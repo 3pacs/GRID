@@ -12,9 +12,8 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import pytest
 
 from ingestion.altdata.memecoin_classifier import (
     ClassifiedMessage,
@@ -279,7 +278,6 @@ class TestTelegramUserConfig:
     """Test Telegram user configuration loading."""
 
     def test_load_single_user_from_env(self) -> None:
-        from ingestion.altdata.telegram_scanner import TelegramUser
 
         with patch.dict(os.environ, {
             "TELEGRAM_API_ID": "12345",

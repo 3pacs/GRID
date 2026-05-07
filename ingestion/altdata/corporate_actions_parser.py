@@ -482,16 +482,12 @@ class CorporateActionsParser:
             "shockwave": "swav",
             "dechra pharmaceuticals": "dph",
             "iveco": "iveco_eu",
-            # Extra aliases surfaced by the 2026-04-12 backfill audit.
-            "warner bros": "wbd",             # NFLX press release truncated cp
-            "warner bros. discovery": "wbd",
             "duke realty": "pld_duke",        # PLD closed 2022, private pre-merger
             "immunomedics": "immu",           # GILD closed 2020
             "slack technologies": "work",     # CRM closed 2021
             "sovos brands": "sovo",           # CPB closed 2023
             "r1 rcm": "rcm",                  # TowerBrook take-private
-            "splunk inc": "splk",
-            "pioneer": "pxd",                 # alt spelling without suffix
+            "splunk inc": "splk",                 # alt spelling without suffix
             "albemarle": "alb",
             "seagen inc": "sgen",
         }

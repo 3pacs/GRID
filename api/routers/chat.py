@@ -1447,7 +1447,7 @@ async def _ask_grid_impl(
 
                 # ── Prompt pruning: track feature citations ──
                 try:
-                    from oracle.citation_extractor import extract_citations, compute_citation_ratio
+                    from oracle.citation_extractor import extract_citations
                     from oracle.feedback_recorder import record_prompt_feedback
 
                     features_in_prompt = _extract_feature_names_from_context(context_text)

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
 from fastapi.responses import Response
-from loguru import logger as log
 
 from api.auth import require_auth
 from store.blob import blob_store, BUCKETS

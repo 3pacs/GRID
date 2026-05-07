@@ -8,7 +8,6 @@ from sqlalchemy import text
 import pytest
 
 from contracts.dead_letter import (
-    DeadLetterEntry,
     RETRY_SCHEDULE,
     mark_resolved,
     record_failure,

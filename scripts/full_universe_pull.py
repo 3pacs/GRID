@@ -37,7 +37,6 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
 import requests
 from loguru import logger as log
 
@@ -139,7 +138,7 @@ def twelve_splits(ticker: str) -> list[dict]:
     """Get historical split dates and ratios."""
     if not _TWELVE_KEY:
         return []
-    url = f"https://api.twelvedata.com/splits"
+    url = "https://api.twelvedata.com/splits"
     params = {"symbol": ticker, "apikey": _TWELVE_KEY}
     try:
         r = requests.get(url, params=params, timeout=15)
@@ -153,7 +152,7 @@ def twelve_statistics(ticker: str) -> dict:
     """Get statistics including shares outstanding, float, short ratio."""
     if not _TWELVE_KEY:
         return {}
-    url = f"https://api.twelvedata.com/statistics"
+    url = "https://api.twelvedata.com/statistics"
     params = {"symbol": ticker, "apikey": _TWELVE_KEY}
     try:
         r = requests.get(url, params=params, timeout=15)
@@ -166,7 +165,7 @@ def twelve_dividends(ticker: str) -> list[dict]:
     """Historical dividend payments."""
     if not _TWELVE_KEY:
         return []
-    url = f"https://api.twelvedata.com/dividends"
+    url = "https://api.twelvedata.com/dividends"
     params = {"symbol": ticker, "apikey": _TWELVE_KEY}
     try:
         r = requests.get(url, params=params, timeout=15)

@@ -23,9 +23,9 @@ degrades gracefully to a neutral report with ``ensemble_score = 0``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Any, Callable, Mapping
+from typing import Any
 
 import pandas as pd
 from loguru import logger as log

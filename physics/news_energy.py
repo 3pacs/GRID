@@ -217,8 +217,8 @@ class NewsEnergyEngine:
                 "direction": "insufficient_data",
             }
 
-        n = news_energy.rename("n")
-        m = market_energy.rename("m")
+        news_energy.rename("n")
+        market_energy.rename("m")
 
         best_corr = 0.0
         best_lag = 0

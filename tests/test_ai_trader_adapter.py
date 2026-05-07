@@ -12,7 +12,6 @@ Covers:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -21,7 +20,6 @@ from intelligence.adapters.ai_trader_adapter import (
     AITraderAdapter,
     _ACTION_MAP,
     _ACTION_VALUE,
-    _SOURCE_MODULE,
 )
 from intelligence.signal_registry import Direction, SignalType
 

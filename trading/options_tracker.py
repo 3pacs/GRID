@@ -302,7 +302,7 @@ def generate_improvement_report(engine: Engine) -> str:
     # Aggregate stats
     outcomes = [r[6] for r in rows]
     returns = [float(r[7]) for r in rows if r[7] is not None]
-    tickers = [r[0] for r in rows]
+    [r[0] for r in rows]
 
     total = len(outcomes)
     wins = outcomes.count("WIN")

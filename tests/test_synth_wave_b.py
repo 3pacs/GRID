@@ -15,12 +15,12 @@ without touching the real bus.
 from __future__ import annotations
 
 from unittest.mock import MagicMock
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 
 from contracts.router import ROUTES, resolve_handler
-from contracts.schemas import BaseContract, SignalFired
+from contracts.schemas import SignalFired
 
 
 # ── Fixtures ───────────────────────────────────────────────────────────────
@@ -235,7 +235,7 @@ class TestRegulatoryAntiSignals:
         conn.execute.return_value.fetchall.return_value = rows
 
         out = eng._regulatory_anti_signals("PFE")
-        severities = {a.contradiction[:3]: a.severity for a in out}
+        {a.contradiction[:3]: a.severity for a in out}
         assert any(a.name == "regulatory_threat" for a in out)
         assert len(out) == 2
         # 'HIGH' → 0.7, 'CRITICAL' → 1.0

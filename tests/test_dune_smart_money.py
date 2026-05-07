@@ -6,7 +6,6 @@ import json
 from datetime import date
 from unittest.mock import MagicMock
 
-import pytest
 
 from intelligence.dune_smart_money import (
     cex_flow_balance,

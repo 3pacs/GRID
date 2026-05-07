@@ -6,18 +6,15 @@ math, dedupe, sort order) are tested directly.
 """
 from __future__ import annotations
 
-from datetime import date, timedelta
-from unittest.mock import MagicMock, patch
+from datetime import date
+from unittest.mock import MagicMock
 
-import pytest
 
 from intelligence.catalyst_aggregator import (
-    CATALYST_CLINICAL,
     CATALYST_EARNINGS,
     CATALYST_FOMC,
     CATALYST_OPEX_MONTHLY,
     CATALYST_OPEX_QUARTERLY,
-    CatalystEvent,
     _opex_dates_for_year,
     _seeded_market_events,
     _third_friday,

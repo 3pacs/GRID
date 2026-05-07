@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Queue 100,000 research tasks for Qwen."""
-import os, sys, random, json
+import os
+import sys
+import random
+import json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db import get_engine
 from sqlalchemy import text

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from uuid import uuid4
 
-import pytest
 
 from contracts.dispatcher import Dispatcher
 from contracts.schemas import PullLifecycle

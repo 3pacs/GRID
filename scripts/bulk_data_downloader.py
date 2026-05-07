@@ -13,11 +13,10 @@ Usage:
 
 import os
 import subprocess
-import sys
 import json
 from datetime import datetime
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from loguru import logger as log
 
 BASE_DIR = Path("/data/bulk_data")

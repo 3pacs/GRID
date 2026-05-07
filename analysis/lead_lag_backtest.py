@@ -33,11 +33,10 @@ All math is pure — no DB I/O.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Sequence
 
 import numpy as np
-from loguru import logger as log
 
 
 # ── Defaults ─────────────────────────────────────────────────────────────

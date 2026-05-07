@@ -10,9 +10,7 @@ import pytest
 
 from ingestion.altdata.ais_ground_truth import (
     AIS_PORTS,
-    AISGroundTruthPuller,
     AISSnapshot,
-    PortSpec,
     SOURCE_PRIORITY,
     VESSELFINDER_URL_FMT,
     _parse_vesselfinder_html,

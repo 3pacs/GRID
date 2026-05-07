@@ -1,17 +1,12 @@
 """CAT-182 — consensus crowdedness detector tests."""
 from __future__ import annotations
 
-from datetime import date
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from intelligence.consensus_crowdedness import (
-    _CROWDED_THRESHOLD,
     _DAMPING_CROWDED,
     _DAMPING_NEUTRAL,
-    CrowdednessPenalty,
-    CrowdednessResult,
     _normalize,
     _normalize_options_skew,
     compose_crowdedness,

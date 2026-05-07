@@ -53,13 +53,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PREAMBLE_PATH = REPO_ROOT / "docs" / "AGENT_PROMPT_TEMPLATE.md"

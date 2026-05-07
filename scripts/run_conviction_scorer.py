@@ -2,7 +2,8 @@
 """Run the conviction scorer across all tickers."""
 
 from __future__ import annotations
-import os, sys
+import os
+import sys
 from pathlib import Path
 
 _GRID_DIR = str(Path(__file__).resolve().parent.parent)

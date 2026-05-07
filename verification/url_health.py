@@ -10,11 +10,8 @@ import asyncio
 import time
 from dataclasses import dataclass
 from enum import Enum
-from functools import lru_cache
-from typing import Any
 
 import aiohttp
-from loguru import logger as log
 
 
 class URLClassification(str, Enum):

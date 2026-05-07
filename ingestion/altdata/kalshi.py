@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from typing import Any
 
 import requests

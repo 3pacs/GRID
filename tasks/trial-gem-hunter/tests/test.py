@@ -17,7 +17,6 @@ against a WATCHLIST benchmark (not penalized for not being BUYs).
 import os
 import sys
 import json
-import math
 import datetime
 import traceback
 import requests
@@ -337,7 +336,7 @@ def main():
 
             # Log summary
             print(f"\n{'='*60}")
-            print(f"GRID Trial Gem Hunter — Scoring Report")
+            print("GRID Trial Gem Hunter — Scoring Report")
             print(f"{'='*60}")
             print(f"Current Regime : {current_regime}")
             print(f"Picks Evaluated: {len(results)}")

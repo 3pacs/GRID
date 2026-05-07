@@ -34,10 +34,7 @@ API: GET /api/v1/intelligence/levers
 
 from __future__ import annotations
 
-import json
 from collections import defaultdict
-from dataclasses import dataclass, field, asdict
-from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from loguru import logger as log

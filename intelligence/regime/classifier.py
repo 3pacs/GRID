@@ -15,11 +15,10 @@ Also computes regime transition probabilities from historical data.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date
 from typing import Any
 
 import numpy as np
-from loguru import logger as log
 from sqlalchemy.engine import Engine
 
 from intelligence.regime.state_vector import (
@@ -222,8 +221,8 @@ def _classify_economic_cycle(sv: StateVector) -> RegimeLabel:
     ue_dir = _val(sv, 'unemployment_dir')
     ip_yoy = _val(sv, 'industrial_prod_yoy')
     curve = _val(sv, 'yield_curve_level')
-    sentiment = _val(sv, 'consumer_sentiment')
-    cap_util = _val(sv, 'capacity_util')
+    _val(sv, 'consumer_sentiment')
+    _val(sv, 'capacity_util')
 
     drivers = []
     signals = {}

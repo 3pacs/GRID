@@ -40,8 +40,8 @@ sec_filings and feeds the analyzer.
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import date, timedelta
 from typing import Any
 
 from loguru import logger as log

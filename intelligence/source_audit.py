@@ -22,12 +22,10 @@ DB tables:
 from __future__ import annotations
 
 import itertools
-import json
 from collections import defaultdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
-import numpy as np
 import pandas as pd
 from loguru import logger as log
 from sqlalchemy import text
@@ -387,7 +385,7 @@ def compare_sources(engine: Engine, feature_name: str) -> dict[str, Any]:
 
         # Accuracy: higher correlation + lower deviation wins
         # Score: corr * (1 - pct_mean_dev), clamped to [0, 1]
-        score_a_accuracy = max(0.0, min(1.0, corr * (1.0 - pct_mean_dev)))
+        max(0.0, min(1.0, corr * (1.0 - pct_mean_dev)))
         accuracy_winner = sa if gaps_a <= gaps_b and last_a >= last_b else sb
 
         # Composite per source in this pair
@@ -961,12 +959,12 @@ if __name__ == "__main__":
 
     engine = get_engine()
     report = run_full_audit(engine)
-    print(f"\nAudit complete:")
+    print("\nAudit complete:")
     print(f"  Redundant features:     {report['redundant_features']}")
     print(f"  Single-source features: {report['single_source_features_count']}")
     print(f"  Active discrepancies:   {report['active_discrepancies']}")
     print(f"  Elapsed:                {report['elapsed_seconds']:.1f}s")
-    print(f"\nSource rankings:")
+    print("\nSource rankings:")
     for src, score in list(report["source_rankings"].items())[:15]:
         print(f"    {src:40s}  {score:.4f}")
     print(f"\nSingle-source features ({report['single_source_features_count']}):")

@@ -7,9 +7,7 @@ LLM response parsing, and context gathering with mocked database/LLM.
 
 from __future__ import annotations
 
-import json
-from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -17,12 +15,6 @@ from intelligence.sleuth import (
     Lead,
     Sleuth,
     _parse_investigation_response,
-    _llm_investigate,
-    ensure_tables,
-    LEAD_CATEGORIES,
-    LEAD_STATUSES,
-    ANOMALY_ZSCORE_THRESHOLD,
-    HIGH_PRIORITY_THRESHOLD,
 )
 
 

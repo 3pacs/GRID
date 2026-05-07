@@ -4,7 +4,6 @@ from __future__ import annotations
 from datetime import date
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from ingestion.altdata.h8_bank_balance import (
     H8_SERIES,

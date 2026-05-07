@@ -286,7 +286,7 @@ def migrate_default_models(engine: Engine) -> None:
        so that when a new source (like ``sector_network``) is added to
        the default list, existing prod rows actually pick it up.
     """
-    factory = ModelFactory(engine)
+    ModelFactory(engine)
     default_wc = {"mode": "equal", "trust_decay_half_life_days": 90.0, "min_weight": 0.1, "max_weight": 3.0, "family_weights": None}
 
     for model_name, sources in _DEFAULT_SIGNAL_SOURCES.items():

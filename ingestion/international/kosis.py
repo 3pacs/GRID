@@ -9,7 +9,7 @@ data release (week 1 of following month).
 from __future__ import annotations
 
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import requests

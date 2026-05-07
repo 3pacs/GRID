@@ -576,7 +576,6 @@ def _gen_company_analysis(
     try:
         from intelligence.company_analyzer import (
             ANALYSIS_QUEUE,
-            run_analysis_queue,
             _TICKER_NAMES,
         )
         from sqlalchemy import text as sa_text
@@ -805,13 +804,13 @@ def _gen_deep_forensics(
             prompt = (
                 f"DEEP FORENSIC ANALYSIS: {ticker}\n\n"
                 f"Recent price data:\n" + "\n".join(prices) + "\n\n"
-                f"Analyze:\n"
-                f"1. What drove each day's move?\n"
-                f"2. How much was market-wide vs stock-specific?\n"
-                f"3. Current implied expectation from options?\n"
-                f"4. Biggest risk NOT priced in?\n"
-                f"5. 2-month outlook?\n\n"
-                f"Be specific with numbers."
+                "Analyze:\n"
+                "1. What drove each day's move?\n"
+                "2. How much was market-wide vs stock-specific?\n"
+                "3. Current implied expectation from options?\n"
+                "4. Biggest risk NOT priced in?\n"
+                "5. 2-month outlook?\n\n"
+                "Be specific with numbers."
             )
             tasks.append(("deep_forensic", prompt, {"ticker": ticker}))
     except Exception as exc:
@@ -1058,7 +1057,7 @@ def _gen_alpha101_compute(
     tasks: list[tuple[str, str, dict]] = []
     try:
         from features.alpha101 import Alpha101Engine
-        a101 = Alpha101Engine(engine)
+        Alpha101Engine(engine)
         tickers = ["AAPL", "NVDA", "MSFT", "TSLA", "GOOGL", "META", "AMZN"]
         import random
         ticker = random.choice(tickers)

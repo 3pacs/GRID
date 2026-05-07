@@ -16,8 +16,7 @@ Usage:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, timedelta
-from typing import Any
+from datetime import date
 
 from loguru import logger as log
 from sqlalchemy import text

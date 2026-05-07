@@ -25,14 +25,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
 
 import numpy as np
-import pandas as pd
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -1118,7 +1116,7 @@ class OracleEngine:
                     rs_data = row[0] if isinstance(row[0], dict) else json.loads(row[0])
                     # Find sector for this ticker from relative_strength
                     for sector, info in rs_data.items():
-                        signal = info.get("signal", "NEUTRAL") if isinstance(info, dict) else "NEUTRAL"
+                        info.get("signal", "NEUTRAL") if isinstance(info, dict) else "NEUTRAL"
                         context.setdefault("sectors_scanned", []).append(sector)
                         # Match ticker to sector via options_daily_signals
                     if row[1]:
@@ -1320,7 +1318,6 @@ class OracleEngine:
                     try:
                         from intelligence.actor_signal_bridge import (
                             get_actor_signals_for_ticker,
-                            get_actor_trust_weights,
                         )
                         actor_sigs = get_actor_signals_for_ticker(self.engine, ticker, days=30)
                         if actor_sigs:

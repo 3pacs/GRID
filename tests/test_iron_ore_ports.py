@@ -14,7 +14,6 @@ from ingestion.altdata.iron_ore_ports import (
     AKSHARE_FUNCTION_CANDIDATES,
     CHINESE_PORTS_45,
     IronOrePortSnapshot,
-    IronOrePortsPuller,
     MYSTEEL_URL,
     SERIES_DELTA_WOW_AGG,
     SERIES_PORT_STOCKS_AGG,

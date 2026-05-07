@@ -23,14 +23,13 @@ from __future__ import annotations
 
 import os
 import time
-from datetime import date, timedelta
+from datetime import date
 from typing import Any
 
 import pandas as pd
 import requests
 from loguru import logger as log
 from sqlalchemy import text
-from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller
 
@@ -110,7 +109,7 @@ class TiingoFundamentalsPuller(BasePuller):
                             continue
 
                         series_id = f"TIINGO_FUND:{ticker}:{grid_suffix}"
-                        feature_name = f"{ticker.lower()}_{grid_suffix}"
+                        f"{ticker.lower()}_{grid_suffix}"
 
                         res = conn.execute(
                             text("""

@@ -23,7 +23,7 @@ Schedule: Weekly (data published weekly with ~2-week lag)
 from __future__ import annotations
 
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from typing import Any
 
 import requests

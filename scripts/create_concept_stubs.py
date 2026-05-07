@@ -8,7 +8,6 @@ linking back to the documents that reference them.
 
 import re
 from pathlib import Path
-from collections import defaultdict
 
 GRID_ROOT = Path(__file__).resolve().parent.parent
 WIKI_DIR = GRID_ROOT / "docs" / "wiki"
@@ -302,33 +301,33 @@ def create_stub(target: str, category: str, description: str,
                 source_path: str | None, backlinks: list[tuple[str, str]]) -> str:
     """Generate a concept stub page."""
     lines = [
-        f"---",
+        "---",
         f"title: {target}",
         f"category: {category}",
-        f"type: concept",
-        f"auto_generated: true",
-        f"---",
-        f"",
+        "type: concept",
+        "auto_generated: true",
+        "---",
+        "",
         f"# {target}",
-        f"",
+        "",
         f"**Category:** {category}",
-        f"",
+        "",
         f"{description}",
-        f"",
+        "",
     ]
 
     if source_path:
         lines.extend([
-            f"## Source",
-            f"",
+            "## Source",
+            "",
             f"`{source_path}`",
-            f"",
+            "",
         ])
 
     if backlinks:
         lines.extend([
-            f"## Referenced By",
-            f"",
+            "## Referenced By",
+            "",
         ])
         for filepath, stem in sorted(set(backlinks)):
             lines.append(f"- [[{stem}]]")
@@ -345,7 +344,7 @@ def main():
 
     for target, (category, description, source_path) in sorted(CONCEPTS.items()):
         # Check if a page already exists for this target
-        slug = target.replace(" ", "-")
+        target.replace(" ", "-")
         target_file = WIKI_DIR / f"{target}.md"
 
         # Find backlinks from across the docs

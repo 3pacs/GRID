@@ -39,7 +39,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from loguru import logger as log
 from sqlalchemy.engine import Engine
 
 
@@ -1021,7 +1020,7 @@ def build_institutional_graph(engine: Engine) -> dict[str, Any]:
     # ── Revolving door links ──
     for rd in REVOLVING_DOOR:
         from_id = rd["from_entity"]
-        to_id = rd["to_entity"]
+        rd["to_entity"]
         # Add person nodes if meaningful
         person_id = f"person_{rd['person'].lower().replace(' ', '_')}"
         nodes.append({

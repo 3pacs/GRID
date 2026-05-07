@@ -30,9 +30,8 @@ Score interpretation:
 from __future__ import annotations
 
 import json
-import math
-from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from loguru import logger as log
@@ -468,16 +467,16 @@ def _score_trend(engine: Engine) -> SentimentComponent:
 
                 if above_50 and above_200:
                     score = 0.8
-                    detail = f"SPY above 50d & 200d MA (strong uptrend)"
+                    detail = "SPY above 50d & 200d MA (strong uptrend)"
                 elif above_50:
                     score = 0.3
-                    detail = f"SPY above 50d but below 200d MA (recovery)"
+                    detail = "SPY above 50d but below 200d MA (recovery)"
                 elif above_200:
                     score = -0.2
-                    detail = f"SPY below 50d but above 200d MA (pullback)"
+                    detail = "SPY below 50d but above 200d MA (pullback)"
                 else:
                     score = -0.8
-                    detail = f"SPY below 50d & 200d MA (downtrend)"
+                    detail = "SPY below 50d & 200d MA (downtrend)"
 
                 return SentimentComponent(
                     name="trend", raw_value=latest, score=score, weight=0.0, detail=detail,
@@ -996,7 +995,6 @@ def _update_weights(engine: Engine) -> None:
 
             for pred_score, comp_json, outcome, realized in rows:
                 comps = comp_json if isinstance(comp_json, list) else json.loads(comp_json)
-                is_correct = outcome in ("CORRECT", "NEUTRAL_CORRECT")
 
                 for c in comps:
                     name = c["name"]

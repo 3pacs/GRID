@@ -8,10 +8,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from oracle.uncertainty import (
-    ConfidenceInterval,
     _critical_value,
     _vote_confidence_values,
     compute_confidence_interval,

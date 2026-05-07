@@ -42,7 +42,7 @@ decision timestamp is ever used to score that decision.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from typing import Any
 
 from loguru import logger as log

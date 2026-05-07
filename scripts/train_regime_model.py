@@ -72,7 +72,7 @@ def main():
         sys.exit(1)
 
     feature_ids = [r[0] for r in rows]
-    feature_names = {r[0]: r[1] for r in rows}
+    {r[0]: r[1] for r in rows}
     log.info("Found {} model-eligible features", len(feature_ids))
 
     # Use orthogonal features if available

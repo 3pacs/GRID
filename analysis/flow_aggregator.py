@@ -20,7 +20,6 @@ Key entry points:
 
 from __future__ import annotations
 
-import math
 import time as _time
 from collections import defaultdict
 from datetime import date, timedelta

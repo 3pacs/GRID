@@ -14,7 +14,6 @@ Features generated:
 
 from __future__ import annotations
 
-import math
 from datetime import date, timedelta, datetime, timezone
 from typing import Any
 
@@ -141,7 +140,7 @@ def _chinese_lunar_month(d: date) -> int:
     # Position within current lunation (0-1)
     frac = lunation - int(lunation)
     # Days into current lunar month
-    day_in_month = frac * _SYNODIC_MONTH
+    frac * _SYNODIC_MONTH
 
     # Approximate which Chinese month this is:
     # Chinese month 1 starts at the new moon nearest to Feb 5

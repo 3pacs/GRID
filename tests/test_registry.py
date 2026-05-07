@@ -8,7 +8,7 @@ logic, flagging, and production model queries without a live database.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock
 
 import pytest
 

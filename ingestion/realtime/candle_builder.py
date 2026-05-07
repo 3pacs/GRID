@@ -10,7 +10,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from loguru import logger as log
 
 
 INTERVAL_SECONDS = 300  # 5 minutes

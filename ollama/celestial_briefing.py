@@ -14,7 +14,7 @@ Uses the local Qwen 32B model (same as market briefing).
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 from loguru import logger as log

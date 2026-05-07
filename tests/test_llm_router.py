@@ -2,7 +2,6 @@
 
 from unittest.mock import MagicMock
 
-import pytest
 
 from ollama.router import TaskComplexity, TaskRouter, classify_task
 
@@ -101,7 +100,7 @@ class TestTaskRouter:
         with MagicMock() as mock_get:
             mock_get.return_value = singleton
             import ollama.router as router_mod
-            original = router_mod.__dict__.get("get_client", None)
+            router_mod.__dict__.get("get_client", None)
             try:
                 # Patch at module level for the import inside route()
                 result = router.route(

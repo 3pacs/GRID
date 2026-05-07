@@ -17,15 +17,11 @@ from datetime import date, timedelta
 from typing import Any
 
 import numpy as np
-import pandas as pd
 from loguru import logger as log
-from scipy import stats
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from physics.conventions import (
-    CONVENTIONS,
-    check_unit_compatibility,
     validate_convention,
 )
 from store.pit import PITStore

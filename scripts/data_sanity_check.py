@@ -17,7 +17,7 @@ Exit code 0 = clean, 1 = warnings only, 2 = critical failures found.
 from __future__ import annotations
 
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from typing import Any
 
 from loguru import logger as log
@@ -382,7 +382,7 @@ def cross_validate(engine: Engine, result: SanityResult) -> None:
 
             if yc_row:
                 spread_val = float(yc_row[0])
-                spread_date = yc_row[1]
+                yc_row[1]
 
                 # Separately get 2Y and 10Y to cross-check
                 y2_row = conn.execute(text("""

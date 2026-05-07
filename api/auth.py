@@ -527,7 +527,7 @@ async def register(body: RegisterRequest, request: Request) -> LoginResponse:
             "VALUES (%s, %s, %s) RETURNING id, username, role, created_at",
             (body.username, pw_hash, "contributor"),
         )
-        user = dict(cur.fetchone())
+        dict(cur.fetchone())
         log.info("User registered: {u}", u=body.username)
     except psycopg2.errors.UniqueViolation:
         raise HTTPException(409, f"Username '{body.username}' already exists")

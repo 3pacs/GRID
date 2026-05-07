@@ -1,9 +1,7 @@
 """Tests for crypto signal bridge — existing data → signal_sources."""
-import json
 import pytest
-from datetime import date, datetime, timedelta, timezone
+from datetime import date
 from sqlalchemy import create_engine, text
-from unittest.mock import patch
 
 
 @pytest.fixture

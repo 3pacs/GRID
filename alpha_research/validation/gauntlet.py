@@ -19,7 +19,6 @@ import pandas as pd
 from scipy import stats
 
 from alpha_research.validation.metrics import (
-    compute_signal_metrics,
     long_short_returns,
     rank_ic,
     sharpe_ratio,

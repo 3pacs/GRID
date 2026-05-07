@@ -23,7 +23,6 @@ from intelligence.signal_convergence_scanner import (
     ALL_STREAM_NAMES,
     BEARISH,
     BULLISH,
-    ConvergenceReport,
     DEFAULT_TRUST_WEIGHT,
     MULTIPLIER_MODERATE,
     MULTIPLIER_NEUTRAL,

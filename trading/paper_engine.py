@@ -16,8 +16,7 @@ with full provenance (hypothesis ID, signal strength, physics score).
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta
-from typing import Any
+from datetime import date, datetime
 
 from loguru import logger as log
 from sqlalchemy import text

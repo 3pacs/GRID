@@ -333,7 +333,7 @@ def _build_deep_dive_prompt(thesis_data: dict, context: dict) -> str:
     narrative = thesis_data.get("narrative", "No narrative available.")
     key_drivers = thesis_data.get("key_drivers", [])
     risk_factors = thesis_data.get("risk_factors", [])
-    agreements = thesis_data.get("agreements", [])
+    thesis_data.get("agreements", [])
     contradictions = thesis_data.get("contradictions", [])
 
     # Format models

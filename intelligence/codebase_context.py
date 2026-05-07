@@ -12,7 +12,7 @@ Usage:
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from loguru import logger as log

@@ -28,12 +28,11 @@ The table `baseline_predictions` stores ALL predictions with:
 """
 import os
 import sys
-import json
 import time
 import hashlib
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

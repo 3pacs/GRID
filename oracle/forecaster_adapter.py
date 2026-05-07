@@ -13,7 +13,6 @@ objects directly from TimesFM output — used when the oracle wants a
 from __future__ import annotations
 
 import hashlib
-from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -27,7 +26,6 @@ from oracle.engine import (
     OraclePrediction,
     PredictionType,
     Signal,
-    Verdict,
 )
 
 

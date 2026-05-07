@@ -880,7 +880,7 @@ class DatasetParser:
                         self._insert_actors_batch(batch)
                         batch = []
 
-                except Exception as e:
+                except Exception:
                     errors += 1
                     continue
 

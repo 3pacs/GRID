@@ -249,7 +249,7 @@ class SectorNetworkAdapter:
                     w = _sector_weight(entry)
                     if w is not None:
                         weights[tkr] = w
-                total_weight = sum(w for w, _ in weights.values())
+                sum(w for w, _ in weights.values())
 
                 # Only emit sector_share within one basis family. If the
                 # sector mixes market_cap and revenue entries, prefer

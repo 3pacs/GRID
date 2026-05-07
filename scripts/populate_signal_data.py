@@ -251,7 +251,7 @@ def populate_from_lobbying(engine) -> int:
         for r in rows:
             parts = r[0].split(":")
             entity = parts[2] if len(parts) > 2 else None
-            payload = r[3] if isinstance(r[3], dict) else (json.loads(r[3]) if r[3] else {})
+            r[3] if isinstance(r[3], dict) else (json.loads(r[3]) if r[3] else {})
 
             conn.execute(_INSERT_SIGNAL, {
                 "st": "lobbying",

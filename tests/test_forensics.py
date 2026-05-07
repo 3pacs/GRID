@@ -11,10 +11,8 @@ Tests cover:
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from intelligence.forensics import (
     ForensicReport,
@@ -23,7 +21,6 @@ from intelligence.forensics import (
     _event_aligns,
     _safe_float,
     find_significant_moves,
-    analyze_move,
     load_forensic_reports,
     _generate_narrative,
 )

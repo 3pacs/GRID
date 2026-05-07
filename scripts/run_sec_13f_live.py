@@ -29,7 +29,6 @@ from loguru import logger as log  # noqa: E402
 
 from db import get_engine  # noqa: E402
 from ingestion.altdata.sec_13f_live import (  # noqa: E402
-    FILERS,
     SEC13FLiveIngestor,
     filer_by_key,
 )
@@ -87,7 +86,7 @@ def main() -> int:
     coverage = (100.0 * match_pos / total_pos) if total_pos else 0.0
 
     print()
-    print(f"SEC 13F live ingest summary:")
+    print("SEC 13F live ingest summary:")
     print(f"  filers ok   : {ok}/{len(results)}")
     print(f"  rows written: {rows}")
     print(f"  positions   : {match_pos}/{total_pos} matched ({coverage:.1f}% CUSIP coverage)")

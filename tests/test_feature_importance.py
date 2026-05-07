@@ -6,8 +6,8 @@ Uses mock_engine and mock_pit_store from conftest.py with synthetic numpy data.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
-from unittest.mock import MagicMock, patch
+from datetime import date
+from unittest.mock import MagicMock
 
 import numpy as np
 import pandas as pd

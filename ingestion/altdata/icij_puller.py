@@ -10,7 +10,6 @@ Data source: https://offshoreleaks.icij.org/pages/database
 from __future__ import annotations
 
 import csv
-import io
 import zipfile
 from pathlib import Path
 from typing import Any

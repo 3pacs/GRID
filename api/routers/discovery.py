@@ -446,7 +446,6 @@ async def get_correlation_matrix(
     covering equities, bonds, commodities, crypto, FX, vol, and credit.
     Optionally breaks down by market regime detected from decision_journal.
     """
-    import json
     import numpy as np
     import pandas as pd
     from sklearn.decomposition import PCA
@@ -493,7 +492,7 @@ async def get_correlation_matrix(
                 "pca": {"components": [], "total_variance": 0}}
 
     id_to_name = {r[0]: r[1] for r in feat_rows}
-    name_to_id = {r[1]: r[0] for r in feat_rows}
+    {r[1]: r[0] for r in feat_rows}
     feature_ids = [r[0] for r in feat_rows]
 
     # Build feature matrix using PIT store
@@ -676,8 +675,6 @@ async def smart_heatmap(
     This is the "smart" version that first removes redundant features via
     orthogonality analysis, then optionally filters by taxonomy family.
     """
-    import json
-    import numpy as np
 
     engine = get_db_engine()
     pit_store = get_pit_store()

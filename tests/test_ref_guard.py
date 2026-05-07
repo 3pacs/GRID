@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 sys.path.insert(0, ".")
 
-from verification.ref_guard import verify_references, ReferenceVerdict
+from verification.ref_guard import verify_references
 from verification.url_health import URLCheckResult, URLClassification
 
 

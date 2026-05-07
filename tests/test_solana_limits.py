@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-import pytest
 from sqlalchemy.engine import Engine
 
 from trading.solana.limits import DailyLimits, LimitConfig

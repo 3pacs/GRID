@@ -26,7 +26,6 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
-import uuid
 from dataclasses import dataclass, asdict, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -1727,7 +1726,7 @@ class HypothesisGenerator:
             try:
                 from intelligence.trust_scorer import get_trusted_sources
                 trusted = get_trusted_sources(self.engine, min_signals=3, min_trust=0.3)
-                trusted_ids = {s.source_id for s in trusted}
+                {s.source_id for s in trusted}
                 # Check all sources — if none are trusted anymore, kill
                 all_sources = get_trusted_sources(self.engine, min_signals=1, min_trust=0.0)
                 actor_source = next(
@@ -2043,7 +2042,7 @@ def main() -> None:
     if cmd == "discover":
         gen = HypothesisGenerator(engine)
         results = gen.auto_discover()
-        print(f"\n=== Auto-Discovery Complete ===")
+        print("\n=== Auto-Discovery Complete ===")
         print(f"Generated {len(results)} hypotheses\n")
         for h in results[:10]:
             print(f"  [{h['pattern_type']}] {h['thesis'][:100]}...")
@@ -2067,7 +2066,7 @@ def main() -> None:
         vol = hunter.scan_volume_anomalies()
         act = hunter.scan_actor_anomalies()
         conv = hunter.scan_convergence()
-        print(f"\n=== Anomalies Found ===")
+        print("\n=== Anomalies Found ===")
         print(f"  Volume spikes:  {len(vol)}")
         print(f"  Actor shifts:   {len(act)}")
         print(f"  Convergence:    {len(conv)}")

@@ -8,10 +8,9 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from a2a.agent_card import AgentCard, AgentSkill, build_grid_agent_card
-from a2a.client import A2AClient, A2ATask, TaskState
+from a2a.client import A2AClient, TaskState
 from a2a.server import A2ATaskManager
 
 

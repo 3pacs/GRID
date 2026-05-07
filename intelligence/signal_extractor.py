@@ -20,11 +20,8 @@ Runs as a daemon alongside the backlinker.
 from __future__ import annotations
 
 import json
-import re
 import sys
 import time
-from datetime import datetime, timezone
-from typing import Any
 
 from loguru import logger as log
 from sqlalchemy import text

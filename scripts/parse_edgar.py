@@ -17,7 +17,6 @@ import sys
 import csv
 import zipfile
 import io
-from datetime import datetime
 from pathlib import Path
 
 import psycopg2

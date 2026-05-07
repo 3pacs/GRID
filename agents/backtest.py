@@ -8,8 +8,6 @@ accuracy and agreement metrics.
 
 from __future__ import annotations
 
-import json
-from datetime import date, timedelta
 from typing import Any
 
 import pandas as pd

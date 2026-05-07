@@ -4,7 +4,6 @@ from __future__ import annotations
 from datetime import date
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from ingestion.altdata.freight_cass_ata import (
     FREIGHT_SERIES,

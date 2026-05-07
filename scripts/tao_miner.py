@@ -28,9 +28,7 @@ Prerequisites:
 # and needs them to be real classes, not strings.
 
 import argparse
-import asyncio
 import time
-from typing import Any
 
 import requests
 from loguru import logger as log

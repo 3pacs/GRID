@@ -4,14 +4,11 @@ Tests for the agents module — config, adapter, and runner fallback logic.
 
 from __future__ import annotations
 
-import json
-from datetime import date
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import pytest
 
 from agents.adapter import parse_agent_decision, _extract_action
-from agents.config import build_agent_config, _llamacpp_config
+from agents.config import build_agent_config
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +82,7 @@ class TestBuildAgentConfig:
 
         with patch("agents.config._llamacpp_config") as mock_llama:
             mock_llama.return_value = {"llm_provider": "openai"}
-            config = build_agent_config()
+            build_agent_config()
             mock_llama.assert_called_once()
 
     @patch("agents.config.settings")
@@ -99,7 +96,7 @@ class TestBuildAgentConfig:
 
         with patch("agents.config._llamacpp_config") as mock_llama:
             mock_llama.return_value = {"llm_provider": "openai"}
-            config = build_agent_config()
+            build_agent_config()
             mock_llama.assert_called_once()
 
 

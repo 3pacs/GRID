@@ -4,7 +4,6 @@ from __future__ import annotations
 from datetime import date
 from unittest.mock import MagicMock
 
-import pytest
 
 from ingestion.altdata.warn_layoffs import (
     CLOSURE_TYPES,

@@ -12,12 +12,10 @@ Steps:
 
 import json
 import sys
-import os
 from typing import Any
 sys.path.insert(0, "/data/grid_v4/grid_repo")
 
-from datetime import date, datetime, timedelta
-from collections import defaultdict
+from datetime import date, timedelta
 
 from loguru import logger as log
 import pandas as pd

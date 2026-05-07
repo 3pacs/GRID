@@ -46,7 +46,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Sequence
+from typing import Any, Sequence
 
 from loguru import logger as log
 from sqlalchemy import text

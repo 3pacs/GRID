@@ -14,7 +14,7 @@ Prefix: mounted at /api/v1 — paths are actor- or intel-scoped.
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, status

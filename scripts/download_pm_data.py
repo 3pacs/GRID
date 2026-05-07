@@ -13,10 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import io
-import os
 import subprocess
-import sys
 import tarfile
 from pathlib import Path
 

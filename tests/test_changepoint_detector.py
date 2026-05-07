@@ -8,17 +8,15 @@ run_changepoint_cycle with mocked database.
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
-import pytest
 
 from discovery.changepoint_detector import (
     ChangeReport,
     scan_for_changepoints,
     run_changepoint_cycle,
 )
-from timeseries.autobnn import RegimeChangeSignal
 
 
 # ---------------------------------------------------------------------------

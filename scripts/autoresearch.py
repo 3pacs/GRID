@@ -23,7 +23,6 @@ import argparse
 import json
 import re
 import sys
-import time
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -33,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from loguru import logger as log
 
 from config import settings
-from db import get_engine, execute_sql
+from db import get_engine
 from store.pit import PITStore
 from ollama.client import get_client as get_ollama
 from ollama.reasoner import OllamaReasoner, SYSTEM_PROMPT
@@ -431,7 +430,6 @@ def run_autoresearch(
         dict: Summary with best hypothesis, all attempts, and final verdict.
     """
     import psycopg2
-    from config import settings
 
     if backtest_start is None:
         backtest_start = date.today() - timedelta(days=365)

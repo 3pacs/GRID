@@ -1,16 +1,13 @@
 """Tests for intelligence/llm_narrator.py."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
 
 from intelligence.llm_narrator import (
     MAX_WORDS,
     TARGET_WORDS,
-    NarrativeReport,
     _count_words,
     _format_signal_line,
     _headline_from_verdict,

@@ -7,7 +7,6 @@ queries are tested against a scripted mock engine.
 
 from __future__ import annotations
 
-import math
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
@@ -15,7 +14,6 @@ import pytest
 from sqlalchemy.engine import Engine
 
 from trading.solana.universe import (
-    UniverseRank,
     UniverseRegistry,
     rank_to_score,
 )

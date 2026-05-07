@@ -22,7 +22,6 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
-import math
 import os
 import sys
 from collections import Counter

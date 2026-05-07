@@ -25,8 +25,7 @@ No API key required -- all NOAA SWPC data is public.
 
 from __future__ import annotations
 
-import math
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from loguru import logger as log

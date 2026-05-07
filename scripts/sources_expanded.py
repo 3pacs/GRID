@@ -1,4 +1,6 @@
-import requests, json, os
+import requests
+import json
+import os
 from datetime import datetime, timedelta
 from loguru import logger as log
 

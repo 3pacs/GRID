@@ -4,12 +4,10 @@ from __future__ import annotations
 from datetime import date
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from intelligence.cot_extremes import (
     CORE_CONTRACTS,
     EXTREME_METRICS,
-    _MIN_HISTORY,
     COTExtreme,
     classify_extreme,
     rank_contrarian_signals,

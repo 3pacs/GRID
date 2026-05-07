@@ -8,12 +8,10 @@ EU KLEMS database. Covers EU, US, and Japan, 1970-present.
 from __future__ import annotations
 
 import os
-import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date
 from typing import Any
 
 import pandas as pd
-import requests
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -51,7 +49,6 @@ class EUKLEMSPuller(BasePuller):
         attempts to download the analytical database Excel file.
         """
         # EU KLEMS provides data via download portal
-        url = "https://euklems.eu/download/"
         local_path = os.path.join(_EUKLEMS_DATA_DIR, "euklems_analytical.xlsx")
 
         if os.path.exists(local_path):

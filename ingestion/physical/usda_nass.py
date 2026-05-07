@@ -8,7 +8,7 @@ from the USDA National Agricultural Statistics Service QuickStats API.
 from __future__ import annotations
 
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from typing import Any
 
 import requests

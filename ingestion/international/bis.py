@@ -7,9 +7,8 @@ from the Bank for International Settlements SDMX REST API.
 
 from __future__ import annotations
 
-import json
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime
 from typing import Any
 
 import requests

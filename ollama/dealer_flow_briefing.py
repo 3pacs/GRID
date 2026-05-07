@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import calendar
 import json
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 from loguru import logger as log
@@ -576,7 +576,7 @@ def _generate_fallback(positioning: dict[str, Any]) -> str:
 
     vix = positioning.get("vix")
     if vix:
-        lines.append(f"## Market Context")
+        lines.append("## Market Context")
         lines.append(f"- VIX: {vix}")
 
     opex = positioning.get("opex", {})

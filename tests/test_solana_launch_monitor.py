@@ -7,7 +7,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
-import pytest
 
 from trading.solana.helius_client import (
     WEBHOOK_CREATE_POOL,

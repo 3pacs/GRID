@@ -7,12 +7,12 @@ from TimesFM forecast results.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date
 from unittest.mock import MagicMock
 
 import pytest
 
-from oracle.engine import Signal, AntiSignal, PredictionType
+from oracle.engine import Signal, PredictionType
 from oracle.forecaster_adapter import (
     forecast_to_anti_signals,
     forecast_to_prediction,

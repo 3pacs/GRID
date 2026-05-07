@@ -8,9 +8,7 @@ from __future__ import annotations
 from datetime import date
 from unittest.mock import MagicMock
 
-import numpy as np
 import pandas as pd
-import pytest
 
 from discovery.options_scanner import MispricingOpportunity, OptionsScanner
 

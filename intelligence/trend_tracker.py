@@ -254,14 +254,14 @@ def _analyze_momentum(engine: Engine, lookback_days: int) -> list[Trend]:
             contradicting = []
 
             if is_golden:
-                supporting.append(f"50-day MA crossed above 200-day MA")
+                supporting.append("50-day MA crossed above 200-day MA")
                 supporting.append(f"RSI proxy at {rsi_approx:.0f}")
                 if vol_ratio > 1.2:
                     supporting.append("Volume elevated on breakout")
                 if rsi_approx > 70:
                     contradicting.append(f"RSI proxy ({rsi_approx:.0f}) suggests overbought")
             else:
-                supporting.append(f"50-day MA crossed below 200-day MA")
+                supporting.append("50-day MA crossed below 200-day MA")
                 supporting.append(f"RSI proxy at {rsi_approx:.0f}")
                 if vol_ratio > 1.2:
                     supporting.append("Volume elevated on breakdown")
@@ -282,7 +282,7 @@ def _analyze_momentum(engine: Engine, lookback_days: int) -> list[Trend]:
                 contradicting_evidence=contradicting,
                 implications=[
                     f"{'Bullish' if is_golden else 'Bearish'} momentum signal for {meta['label']}",
-                    f"Watch for follow-through in coming sessions",
+                    "Watch for follow-through in coming sessions",
                 ],
                 tickers_affected=meta["tickers"],
                 started=str(series.index[-1].date()) if hasattr(series.index[-1], 'date') else str(date.today()),
@@ -297,7 +297,7 @@ def _analyze_momentum(engine: Engine, lookback_days: int) -> list[Trend]:
                 direction=DIRECTION_TRANSITIONING,
                 strength=0.4,
                 description=f"{meta['label']} MAs converging — cross likely within days",
-                supporting_evidence=[f"MA spread narrowing rapidly"],
+                supporting_evidence=["MA spread narrowing rapidly"],
                 contradicting_evidence=[],
                 implications=[f"Watch for confirmation of {'golden' if approaching_dir == 'golden' else 'death'} cross"],
                 tickers_affected=meta["tickers"],
@@ -769,7 +769,7 @@ def _analyze_correlations(engine: Engine, lookback_days: int) -> list[Trend]:
                 description=(
                     f"{label}: current 30-day correlation is {current_corr:.2f}, "
                     f"expected ~{expected_corr:.2f}. "
-                    f"{'Assets have decoupled — sign flipped.' if decoupling else f'Correlation has weakened significantly.'}"
+                    f"{'Assets have decoupled — sign flipped.' if decoupling else 'Correlation has weakened significantly.'}"
                 ),
                 supporting_evidence=[
                     f"Current rolling correlation: {current_corr:.2f}",
@@ -781,7 +781,7 @@ def _analyze_correlations(engine: Engine, lookback_days: int) -> list[Trend]:
                 ),
                 implications=[
                     f"Pair trades based on {label} correlation may fail",
-                    f"Potential regime shift in inter-asset dynamics",
+                    "Potential regime shift in inter-asset dynamics",
                 ],
                 tickers_affected=tickers,
                 started=str(date.today() - timedelta(days=30)),

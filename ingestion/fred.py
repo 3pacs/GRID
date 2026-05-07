@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from typing import Any
 
 import pandas as pd
@@ -387,7 +387,7 @@ class FREDPuller(BasePuller):
             data = data[data["value"].apply(
                 lambda v: v != "." and pd.notna(v)
             )].copy()
-            pre_coerce_count = len(data)
+            len(data)
             data["value"] = pd.to_numeric(data["value"], errors="coerce")
             coerced_count = data["value"].isna().sum()
             if coerced_count > 0:

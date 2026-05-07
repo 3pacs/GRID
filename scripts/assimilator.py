@@ -20,14 +20,12 @@ import json
 import os
 import sys
 import time
-from datetime import date, datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import requests
 from loguru import logger as log
 
-from config import settings
 from llm.router import get_llm as get_client
 
 COORDINATOR_URL = os.getenv("GRID_COORDINATOR_URL", "http://localhost:8100")

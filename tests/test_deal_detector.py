@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 
 import pytest
 
 from intelligence.deal_detector import (
     DealClassifier,
-    DealSignal,
     DEAL_STAGES,
     DEAL_TYPES,
     TYPICAL_IMPACT_BPS,

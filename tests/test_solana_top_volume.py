@@ -19,7 +19,6 @@ from ingestion.solana.top_volume import (
     TopVolumeIngestor,
     _batched,
     _fold_pair,
-    _MintAccumulator,
 )
 
 

@@ -11,7 +11,7 @@ Fully self-contained — no external dependencies beyond numpy/pandas/sklearn.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from itertools import product
 from typing import Any, Callable
 

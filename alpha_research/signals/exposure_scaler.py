@@ -11,7 +11,7 @@ When VIX > MA → reduce exposure proportionally. Not a binary switch.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd

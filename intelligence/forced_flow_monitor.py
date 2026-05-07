@@ -28,7 +28,7 @@ trading day at ~06:30 ET (pre-open briefing window).
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -257,7 +257,7 @@ def upcoming_calendar_events(
                 events.append(CalendarEvent(
                     event_date=roll,
                     kind="JHEQX_ROLL",
-                    label=f"JHEQX + buffer ETF quarterly collar roll",
+                    label="JHEQX + buffer ETF quarterly collar roll",
                     trading_days_out=_trading_days_between(ref_date, roll),
                 ))
 
@@ -267,7 +267,7 @@ def upcoming_calendar_events(
             events.append(CalendarEvent(
                 event_date=fomc,
                 kind="FOMC",
-                label=f"FOMC statement",
+                label="FOMC statement",
                 trading_days_out=_trading_days_between(ref_date, fomc),
             ))
 

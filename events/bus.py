@@ -11,7 +11,6 @@ The SSE router subscribes to all channels and streams events to the frontend.
 
 from __future__ import annotations
 
-import asyncio
 import json
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -125,7 +124,7 @@ class EventBus:
         if self._pg_conn:
             try:
                 await self._pg_conn.execute(
-                    f"SELECT pg_notify($1, $2)",
+                    "SELECT pg_notify($1, $2)",
                     channel,
                     json.dumps(payload),
                 )

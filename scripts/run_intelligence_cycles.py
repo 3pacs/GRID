@@ -9,7 +9,6 @@ Targets:
 """
 
 import sys
-import os
 import json
 import traceback
 from loguru import logger as log

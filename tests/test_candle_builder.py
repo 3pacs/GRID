@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from ingestion.realtime.candle_builder import CandleBuilder, CandleState, INTERVAL_SECONDS
+from ingestion.realtime.candle_builder import CandleBuilder, CandleState
 
 
 def make_ts(epoch: int) -> datetime:
@@ -159,7 +159,7 @@ class TestLowUpdates:
         assert c.low == 100.0
 
     def test_high_low_sequence(self, builder):
-        ts = make_ts(MID_BUCKET)
+        make_ts(MID_BUCKET)
         for i, price in enumerate([100.0, 150.0, 75.0, 130.0]):
             builder.ingest("SOL", price, 1.0, make_ts(MID_BUCKET + i * 10), "crypto", "binance")
         c = builder.candles[("SOL", "5m")]

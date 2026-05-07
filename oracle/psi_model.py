@@ -17,11 +17,10 @@ AstroGrid's save_prediction() interface.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-import pandas as pd
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -218,7 +217,7 @@ def build_astrogrid_prediction_payload(signal: PSISignal) -> dict[str, Any]:
         "call": f"{signal.direction.upper()} {signal.symbol} — PSI oracle signal",
         "timing": "5-day holding period, review on next PSI reading",
         "setup": signal.reasoning,
-        "invalidation": f"VIX spike above 30 or PSI regime change invalidates this call",
+        "invalidation": "VIX spike above 30 or PSI regime change invalidates this call",
         "note": f"Automated PSI oracle signal. Config: {signal.config_name}",
         "seer_summary": (
             f"The Planetary Stress Index reads {signal.psi_value:.2f}. "

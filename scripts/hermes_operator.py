@@ -49,7 +49,7 @@ import subprocess
 import sys
 import time
 import traceback
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +60,7 @@ if _GRID_DIR not in sys.path:
     sys.path.insert(0, _GRID_DIR)
 
 from loguru import logger as log
+from sqlalchemy import text  # used by run_cycle DB writes
 
 
 # ─── Configuration ───────────────────────────────────────────────────
@@ -87,6 +88,8 @@ TIMEOUT_BLACKLIST_HOURS = 24          # blacklist sources that cause cycle timeo
 # cooldown blacklist break the loop after a single timeout.
 ORACLE_CYCLE_TIMEOUT_SECONDS = 300            # oracle.run_cycle (LLM-bound)
 SIGNAL_CLASSIFICATION_TIMEOUT_SECONDS = 120   # gemma micro classifier batch
+ANOMALY_NARRATION_TIMEOUT_SECONDS = 90        # gemma micro anomaly narrator
+KNOWLEDGE_MAP_TIMEOUT_SECONDS = 120           # gemma micro knowledge mapper
 
 
 def _run_with_timeout(name: str, fn, timeout_s: int, state):
@@ -1501,6 +1504,135 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         log.debug("Signal classification skipped: {e}", e=str(exc))
         state.cooldowns.record_attempt("signal_classification", success=False, error=str(exc))
 
+    # 7d-v. Gemma micro anomaly narration (every cycle, after classification)
+    # Reads recent high-z signals from signal_registry, asks the
+    # anomaly_narrator (port 8083) for a one-line plain-English summary,
+    # persists into anomaly_narratives. Idempotent: UNIQUE constraint on
+    # (source_module, ticker, signal_ts) means re-runs are no-ops.
+    try:
+        if not state.cooldowns.can_retry("anomaly_narration"):
+            log.debug(
+                "Skipping anomaly_narration — blacklisted (timed out previously, "
+                "blacklist clears in {h}h)",
+                h=TIMEOUT_BLACKLIST_HOURS,
+            )
+        else:
+            state.current_step = "anomaly_narration"
+            if not dry_run:
+                from ingestion.signal_classifier import narrate_anomalies
+
+                def _narrate_call():
+                    return narrate_anomalies(engine, z_threshold=3.0, limit=20)
+
+                narratives, ok = _run_with_timeout(
+                    "anomaly_narration", _narrate_call,
+                    ANOMALY_NARRATION_TIMEOUT_SECONDS, state,
+                )
+                if ok and narratives:
+                    inserted = 0
+                    for n in narratives:
+                        try:
+                            with engine.begin() as conn:
+                                conn.execute(text("""
+                                    INSERT INTO anomaly_narratives
+                                        (ticker, source_module, z_score,
+                                         narrative, signal_ts)
+                                    VALUES (:ticker, :src, :z, :narr, :ts)
+                                    ON CONFLICT (source_module, ticker, signal_ts)
+                                    DO NOTHING
+                                """).bindparams(
+                                    ticker=n.get("ticker"),
+                                    src=n["source"],
+                                    z=n["z_score"],
+                                    narr=n["narrative"],
+                                    ts=n.get("timestamp"),
+                                ))
+                                inserted += 1
+                        except Exception as exc:
+                            log.debug(
+                                "Failed to persist narrative: {e}",
+                                e=str(exc),
+                            )
+                    if inserted:
+                        cycle_result["anomaly_narration"] = {
+                            "narratives_generated": len(narratives),
+                            "persisted": inserted,
+                        }
+                        log.info(
+                            "Anomaly narration: {n} narratives persisted",
+                            n=inserted,
+                        )
+                if ok:
+                    state.cooldowns.record_attempt("anomaly_narration", success=True)
+    except Exception as exc:
+        log.debug("Anomaly narration skipped: {e}", e=str(exc))
+        state.cooldowns.record_attempt("anomaly_narration", success=False, error=str(exc))
+
+    # 7d-vi. Gemma micro knowledge mapping (every cycle, after classification)
+    # Takes recently classified high-urgency signals and asks the
+    # knowledge_mapper (port 8085) for a wiki-style entry with [[backlinks]].
+    # Persists into signal_knowledge_entries. The helper itself flips
+    # signal_registry.knowledge_mapped=TRUE so signals are processed once.
+    try:
+        if not state.cooldowns.can_retry("knowledge_mapping"):
+            log.debug(
+                "Skipping knowledge_mapping — blacklisted (timed out previously, "
+                "blacklist clears in {h}h)",
+                h=TIMEOUT_BLACKLIST_HOURS,
+            )
+        else:
+            state.current_step = "knowledge_mapping"
+            if not dry_run:
+                from ingestion.signal_classifier import map_signal_knowledge
+
+                def _map_call():
+                    return map_signal_knowledge(
+                        engine, urgency_filter="high", limit=10,
+                    )
+
+                entries, ok = _run_with_timeout(
+                    "knowledge_mapping", _map_call,
+                    KNOWLEDGE_MAP_TIMEOUT_SECONDS, state,
+                )
+                if ok and entries:
+                    inserted = 0
+                    for e in entries:
+                        try:
+                            with engine.begin() as conn:
+                                conn.execute(text("""
+                                    INSERT INTO signal_knowledge_entries
+                                        (signal_id, ticker, category,
+                                         knowledge_entry, signal_ts)
+                                    VALUES (:sid, :ticker, :cat, :entry, :ts)
+                                    ON CONFLICT (signal_id) DO NOTHING
+                                """).bindparams(
+                                    sid=e["signal_id"],
+                                    ticker=e.get("ticker"),
+                                    cat=e.get("category"),
+                                    entry=e["knowledge_entry"],
+                                    ts=e.get("timestamp"),
+                                ))
+                                inserted += 1
+                        except Exception as exc:
+                            log.debug(
+                                "Failed to persist knowledge entry: {e}",
+                                e=str(exc),
+                            )
+                    if inserted:
+                        cycle_result["knowledge_mapping"] = {
+                            "entries_generated": len(entries),
+                            "persisted": inserted,
+                        }
+                        log.info(
+                            "Knowledge mapping: {n} entries persisted",
+                            n=inserted,
+                        )
+                if ok:
+                    state.cooldowns.record_attempt("knowledge_mapping", success=True)
+    except Exception as exc:
+        log.debug("Knowledge mapping skipped: {e}", e=str(exc))
+        state.cooldowns.record_attempt("knowledge_mapping", success=False, error=str(exc))
+
     # 7e. Alpha research heartbeat + signal publishing (every cycle)
     try:
         state.current_step = "alpha_heartbeat"
@@ -1690,7 +1822,6 @@ def main(args: list[str] | None = None) -> None:
         return
 
     # Continuous loop with per-cycle timeout
-    import signal
     import threading
 
     def _run_cycle_with_timeout(state, dry_run, timeout):

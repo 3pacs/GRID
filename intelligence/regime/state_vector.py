@@ -11,9 +11,8 @@ State vectors are cached in the `regime_state_vectors` table.
 from __future__ import annotations
 
 import json
-import math
-from dataclasses import dataclass, field, asdict
-from datetime import date, timedelta, datetime, timezone
+from dataclasses import dataclass
+from datetime import date, timedelta
 from typing import Any
 
 import numpy as np

@@ -565,7 +565,7 @@ def generate_forensic_summary(engine: Engine, ticker: str, days: int = 90) -> st
     lines = [
         f"FORENSIC SUMMARY: {ticker} ({days} days)",
         f"{'=' * 50}",
-        f"",
+        "",
         f"Significant moves: {total} ({up_count} up, {down_count} down)",
         f"Avg warning signals per move: {avg_signals:.1f}",
         f"Avg lead time: {avg_lead:.1f} hours",
@@ -577,21 +577,21 @@ def generate_forensic_summary(engine: Engine, ticker: str, days: int = 90) -> st
         lines.append(f"Avg estimated dollar flow: ${avg_flow:,.0f}")
 
     if top_actors:
-        lines.append(f"")
-        lines.append(f"Key actors (most active before moves):")
+        lines.append("")
+        lines.append("Key actors (most active before moves):")
         for actor, count in top_actors:
             lines.append(f"  - {actor}: appeared before {count}/{total} moves")
 
     if top_event_types:
-        lines.append(f"")
-        lines.append(f"Most common preceding signals:")
+        lines.append("")
+        lines.append("Most common preceding signals:")
         for evt, count in top_event_types:
             lines.append(f"  - {evt}: {count} occurrences")
 
     # Identify the most reliable predictor
     if top_event_types:
         best_type = top_event_types[0][0]
-        lines.append(f"")
+        lines.append("")
         lines.append(
             f"The most reliable predictor was {best_type} signals, "
             f"appearing {top_event_types[0][1]} times across {total} moves."

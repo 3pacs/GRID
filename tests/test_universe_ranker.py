@@ -22,14 +22,12 @@ from __future__ import annotations
 
 import sys
 import types
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from intelligence import universe_ranker as ur
 from intelligence.universe_ranker import (
-    DEFAULT_TOP_K,
-    SECTOR_CONCENTRATION_ALERT_THRESHOLD,
     SectorDistribution,
     TickerRanking,
     UNIVERSE_NASDAQ100,
@@ -371,7 +369,7 @@ class TestRunOneTicker:
 
     def test_decision_gateway_import_fails(self, monkeypatch) -> None:
         # Sabotage the import by installing a module that raises on attr
-        bad_mod = types.ModuleType("intelligence.decision_gateway")
+        types.ModuleType("intelligence.decision_gateway")
 
         def raise_on_access(name):
             raise ImportError("cannot import should_i_trade")

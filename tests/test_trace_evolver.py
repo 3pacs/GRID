@@ -9,14 +9,11 @@ from __future__ import annotations
 
 import json
 import pytest
-from dataclasses import asdict
-from unittest.mock import MagicMock, patch, PropertyMock
 
 from oracle.trace_evolver import (
     TraceAnalyzer, TargetedMutator, EvolutionGate, TraceEvolver,
     FailurePattern, MutationProposal, EvolutionCycleResult,
-    _parse_json, MIN_SIGNAL_SOURCES, MAX_SIGNAL_SOURCES,
-    MIN_POSTMORTEMS_FOR_ANALYSIS, MIN_SCORED_PREDICTIONS,
+    _parse_json,
 )
 
 
@@ -132,7 +129,6 @@ class MockResult:
             return [("flow_momentum", 0.65)]
         if "oracle_predictions" in self._query and "group by model_name" in self._query:
             # Scoring data aggregation
-            from collections import Counter
             model_stats = {}
             for p in self._engine._predictions:
                 m = p["model_name"]
@@ -147,7 +143,6 @@ class MockResult:
                 for m, s in model_stats.items()
             ]
         if "signal_sources" in self._query and "group by source_type" in self._query:
-            from collections import Counter
             stats = {}
             for ss in self._engine._signal_sources:
                 st = ss["source_type"]

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Bridge Crucix DuckDB data into GRID PostgreSQL."""
-import duckdb, psycopg2, json, os
+import psycopg2
+import os
 from datetime import datetime
 from loguru import logger as log
 from config import settings
@@ -37,7 +38,8 @@ def ins(fid, d, val, sid):
 total = 0
 
 # Find Crucix DB
-import os, glob
+import os
+import glob
 crucix_paths = glob.glob(os.path.join(CRUCIX_DATA_DIR, "*.db")) + glob.glob(os.path.join(os.path.dirname(CRUCIX_DATA_DIR), "*.db")) + glob.glob(os.path.join(CRUCIX_DATA_DIR, "*.duckdb"))
 if not crucix_paths:
     # Check Crucix data structure

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from datetime import date, datetime, timedelta, timezone
+from datetime import date
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -12,14 +12,12 @@ os.environ.setdefault("FRED_API_KEY", "test")
 os.environ.setdefault("GRID_MASTER_PASSWORD_HASH", "$2b$12$test")
 
 from intelligence.news_impact import (
-    Catalyst,
     CatalystClassifier,
     DeepDiveEngine,
     Expectation,
     ExpectationTracker,
     MoveAttribution,
     PriceDecomposer,
-    ensure_tables,
 )
 
 

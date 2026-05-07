@@ -18,13 +18,12 @@ from __future__ import annotations
 
 import math
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date
 from typing import Any
 
 import pandas as pd
 import yfinance as yf
 from loguru import logger as log
-from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, retry_on_failure
@@ -585,7 +584,7 @@ if __name__ == "__main__":
     puller = EarningsPuller(db_engine=get_engine())
     results = puller.pull_all()
     summary = puller.get_summary(results)
-    print(f"\nEarnings Pull Summary:")
+    print("\nEarnings Pull Summary:")
     print(f"  Succeeded: {summary['succeeded']}/{summary['total_tickers']}")
     print(f"  Failed: {summary['failed']} — {summary['failed_tickers']}")
     print(f"  Total rows: {summary['total_rows_inserted']}")

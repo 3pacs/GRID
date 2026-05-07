@@ -252,7 +252,7 @@ class TestRegimeRouter:
     def test_nudge_regime_weight_writes_via_jsonb_set_and_clamps(
         self, mock_engine
     ):
-        from oracle.regime_router import MAX_WEIGHT, MIN_WEIGHT, RegimeRouter
+        from oracle.regime_router import MAX_WEIGHT, RegimeRouter
 
         mock_conn = mock_engine.begin.return_value.__enter__.return_value
         # First SELECT returns a 4.9 weight; the +1.0 delta clamps to MAX.

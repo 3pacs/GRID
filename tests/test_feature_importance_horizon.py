@@ -5,11 +5,9 @@ in isolation. The real DB path is exercised by a smoke on the server.
 """
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date
 from unittest.mock import MagicMock
 
-import pandas as pd
-import pytest
 
 from features.importance import FeatureImportanceTracker
 

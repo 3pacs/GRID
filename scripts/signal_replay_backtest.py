@@ -274,7 +274,7 @@ def main(argv: list[str] | None = None) -> int:
         by_source.setdefault(s["source"], {})[s["horizon"]] = s
 
     horizon_order = ["1", "5", "30", "90", "180", "outcome"]
-    print(f"=== Horizon × Lift heatmap (lift = avg_return_buy − avg_return_sell) ===")
+    print("=== Horizon × Lift heatmap (lift = avg_return_buy − avg_return_sell) ===")
     print(f"{'source':<40} " + " ".join(f"{h:>10}" for h in horizon_order))
     print("-" * (40 + 11 * len(horizon_order)))
     # Sort sources by max-abs-lift across horizons so the most-actionable ones rise.
@@ -320,10 +320,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\n=== Summary (across {report['n_sources']} cells) ===")
     for k, v in buckets.items():
         print(f"  {k:<14} {v:>4} cells")
-    print(f"\n✓ INFORMATIVE — keep direction at this horizon")
-    print(f"↯ INVERTED   — flip BUY↔SELL at this horizon")
-    print(f"· NOISE      — publish NEUTRAL or skip at this horizon")
-    print(f"\nA signal can be NOISE at 5d and INFORMATIVE at 90d — that's the heatmap.")
+    print("\n✓ INFORMATIVE — keep direction at this horizon")
+    print("↯ INVERTED   — flip BUY↔SELL at this horizon")
+    print("· NOISE      — publish NEUTRAL or skip at this horizon")
+    print("\nA signal can be NOISE at 5d and INFORMATIVE at 90d — that's the heatmap.")
     return 0
 
 

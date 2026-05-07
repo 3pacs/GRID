@@ -6,7 +6,6 @@ import hashlib
 import tempfile
 from pathlib import Path
 
-import pytest
 
 
 def _make_note(tmp: Path, rel_path: str, content: str) -> Path:

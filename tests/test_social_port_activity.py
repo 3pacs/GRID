@@ -22,7 +22,6 @@ from ingestion.altdata.social_port_activity import (
     SERIES_YOUTUBE,
     SocialActivitySnapshot,
     SocialPortActivityPuller,
-    SocialPortSpec,
     _fetch_bilibili_counts,
     _fetch_nitter_counts,
     _fetch_reddit_counts,

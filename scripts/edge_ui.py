@@ -25,7 +25,6 @@ import threading
 import time
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
 from typing import Optional
 from loguru import logger as log
 
@@ -332,7 +331,7 @@ def render_html() -> str:
 
     {pending_html}
 
-    {f'<div class="section-title">Recently Completed</div>' if done else ''}
+    {'<div class="section-title">Recently Completed</div>' if done else ''}
     {completed_html}
 
     <script>
@@ -639,7 +638,7 @@ def main():
     # Register
     worker_id = register_worker(coordinator_url, worker_name)
     print(f"  Registered as worker #{worker_id}")
-    print(f"  Polling for HUMAN_LLM_QUERY jobs...")
+    print("  Polling for HUMAN_LLM_QUERY jobs...")
     print()
 
     # Start background poller

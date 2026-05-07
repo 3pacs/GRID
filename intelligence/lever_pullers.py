@@ -31,9 +31,8 @@ Key entry points:
 from __future__ import annotations
 
 import json
-import math
 from collections import defaultdict
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -375,12 +374,12 @@ def identify_lever_pullers(engine: Engine) -> list[LeverPuller]:
         # Fetch the most recent metadata for each source (for position/committee info)
         for r in rows:
             src_type, src_id = r[0], r[1]
-            total, correct, wrong = int(r[2]), int(r[3] or 0), int(r[4] or 0)
-            avg_ret_correct = float(r[5]) if r[5] is not None else 0.0
-            avg_ret_wrong = float(r[6]) if r[6] is not None else 0.0
-            last_date = r[7]
+            _total, correct, wrong = int(r[2]), int(r[3] or 0), int(r[4] or 0)
+            float(r[5]) if r[5] is not None else 0.0
+            float(r[6]) if r[6] is not None else 0.0
+            r[7]
             avg_lead_hours = float(r[8]) if r[8] is not None else 0.0
-            avg_trust = float(r[9]) if r[9] is not None else 0.5
+            float(r[9]) if r[9] is not None else 0.5
 
             # Fetch latest signal metadata for context
             meta_row = conn.execute(text("""
@@ -822,7 +821,7 @@ def _motivation_narrative(
             committee = details.get("committee", "")
             if committee:
                 return f"Likely informed — {committee} has jurisdiction over {ticker}'s sector"
-            return f"Likely informed — large position or unusual timing"
+            return "Likely informed — large position or unusual timing"
         if puller.category == "insider":
             return "Likely informed — insider buying own stock (skin in the game)"
         return "Likely informed — unusual pattern"

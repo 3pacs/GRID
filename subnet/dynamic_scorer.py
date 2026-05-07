@@ -27,9 +27,7 @@ import math
 import re
 import struct
 import time
-from typing import Any
 
-from loguru import logger as log
 
 
 # ── Constants ────────────────────────────────────────────────────────────

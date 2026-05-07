@@ -11,10 +11,9 @@ Rate-limited to 1 request per 2 seconds to avoid 429 errors.
 from __future__ import annotations
 
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from typing import Any
 
-import numpy as np
 import pandas as pd
 from loguru import logger as log
 from sqlalchemy.engine import Engine

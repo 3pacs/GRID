@@ -295,7 +295,6 @@ async def physics_dashboard(
         hurst_exponent,
         kinetic_energy,
         potential_energy,
-        total_energy,
     )
     from store.pit import PITStore
 

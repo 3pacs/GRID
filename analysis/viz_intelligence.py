@@ -24,9 +24,8 @@ Learned rules (encoded from discovery):
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field, asdict
-from datetime import date, datetime
+from datetime import datetime
 from enum import Enum
 from typing import Any
 

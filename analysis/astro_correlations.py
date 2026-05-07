@@ -11,9 +11,7 @@ DB table:
 from __future__ import annotations
 
 import math
-import random
 from datetime import date, datetime, timedelta, timezone
-from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -312,7 +310,6 @@ class AstroCorrelationEngine:
             _LUNAR_ECLIPSES,
             _SOLAR_ECLIPSES,
             _lunar_phase,
-            SYNODIC_MONTH,
         )
 
         # Determine event dates

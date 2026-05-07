@@ -1,25 +1,19 @@
 """Tests for Adaptive Rotation Strategy, Exposure Scaler, Credit Cycle, and Signal Adapter."""
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from alpha_research.signals.exposure_scaler import (
-    compute_vix_exposure_scalar,
-    compute_vix_exposure_series,
-)
-from alpha_research.signals.credit_cycle import compute_credit_cycle
 from alpha_research.strategies.adaptive_rotation import (
     ASSET_GROUPS,
     PositionState,
     check_stops,
     detect_regime,
-    run_rotation,
     score_groups,
 )
-from alpha_research.heartbeat import HeartbeatAlert, format_alerts, run_heartbeat
+from alpha_research.heartbeat import HeartbeatAlert, format_alerts
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────

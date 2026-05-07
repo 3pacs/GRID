@@ -57,7 +57,6 @@ from sqlalchemy.engine import Engine
 
 # Reuse canonical constants & helpers — never reimplement them.
 from features.per_signal_brier import (
-    CANONICAL_HORIZONS,
     MIN_CALIBRATED_SAMPLES,
     _canonical_horizon,
 )

@@ -7,7 +7,6 @@ the core logic and testing it directly, without requiring a database.
 
 from __future__ import annotations
 
-import pytest
 
 from normalization.resolver import (
     CONFLICT_THRESHOLD,

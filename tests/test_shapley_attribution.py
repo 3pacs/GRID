@@ -6,12 +6,8 @@ behavior, edge cases.
 """
 from __future__ import annotations
 
-import pytest
 
 from intelligence.shapley_attribution import (
-    _EXACT_MAX_N,
-    _FRAGILE_HERFINDAHL,
-    ShapleyAttribution,
     attribute_votes,
     shapley_exact,
     shapley_leave_one_out,

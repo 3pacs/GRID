@@ -23,9 +23,8 @@ directly with :meth:`trading.solana.launch_monitor.LaunchMonitor.on_launch`.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
 
 from loguru import logger as log
 

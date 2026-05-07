@@ -13,7 +13,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from trading.solana.cross_ref import (
-    DEFAULT_CROSS_REF_WEIGHTS,
     CrossRefWeights,
     CrossReferencer,
     LaunchEvent,

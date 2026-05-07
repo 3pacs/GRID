@@ -4,9 +4,10 @@
 Crypto markets are 24/7 — predictions can be scored immediately.
 This script should run every hour via Hermes or cron.
 """
-import os, sys, json, requests
-from datetime import datetime, timezone
-from decimal import Decimal
+import os
+import sys
+import json
+import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

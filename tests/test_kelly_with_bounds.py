@@ -6,9 +6,7 @@ edge cases (NaN/inf, inverted bounds, below break-even skip).
 """
 from __future__ import annotations
 
-import math
 
-import pytest
 
 from trading.options_recommender import (
     DEFAULT_PAYOUT_RATIO,

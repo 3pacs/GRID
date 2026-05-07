@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import date
 
-import pytest
 
 from intelligence.earnings_transcript_analyzer import (
     ToneScorer,

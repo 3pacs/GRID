@@ -7,17 +7,14 @@ for living graphs. The frontend takes a VizSpec and renders it.
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Query
-from loguru import logger as log
 
 from analysis.viz_intelligence import (
     ChartType,
     VizSpec,
     AnimationConfig,
-    WeightSchedule,
     WEIGHT_SCHEDULES,
     VISUALIZATION_RULES,
     compute_source_weights,

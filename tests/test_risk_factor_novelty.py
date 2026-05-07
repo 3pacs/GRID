@@ -4,14 +4,8 @@ from __future__ import annotations
 from datetime import date
 from unittest.mock import MagicMock
 
-import pytest
 
 from intelligence.risk_factor_novelty import (
-    _REWRITE_MIN_SIM,
-    _SEVERITY_ELEVATED,
-    _UNCHANGED_SIM,
-    RiskFactorChange,
-    RiskNoveltyResult,
     compute_novelty,
     detect_novelty,
     jaccard_similarity,

@@ -11,7 +11,6 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
-from ingestion.altdata import sge_premium as mod
 from ingestion.altdata.sge_premium import (
     AKSHARE_FX_FUNCTIONS,
     AKSHARE_LONDON_FUNCTIONS,

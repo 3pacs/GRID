@@ -29,7 +29,7 @@ from loguru import logger as log
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, retry_on_failure
-from intelligence.actor_ingest import ingest_actor, ingest_actors_batch
+from intelligence.actor_ingest import ingest_actors_batch
 
 # ---- API URLs ----
 _BASE_URL: str = "https://api.llama.fi"

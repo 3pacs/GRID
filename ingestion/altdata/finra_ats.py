@@ -19,7 +19,7 @@ Series stored:
 from __future__ import annotations
 
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from typing import Any
 
 import requests
@@ -225,7 +225,7 @@ class FINRAATSPuller(BasePuller):
 
             # Extract volume fields
             ats_volume = rec.get("totalWeeklyShareQuantity")
-            total_volume = rec.get("lastUpdateDate")  # not always available
+            rec.get("lastUpdateDate")  # not always available
 
             if ats_volume is None:
                 continue

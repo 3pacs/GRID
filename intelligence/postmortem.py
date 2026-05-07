@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -169,7 +169,7 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
     strike_f = float(strike) if strike else 0.0
     target_f = float(target_price) if target_price else 0.0
     actual_ret = float(actual_return) if actual_return else 0.0
-    conf = float(confidence) if confidence else 0.0
+    float(confidence) if confidence else 0.0
 
     # Parse sanity_status
     sanity = _parse_json(sanity_status)
@@ -1322,8 +1322,8 @@ def _classify_prediction_failure(
             )
             return (
                 "wrong_signal",
-                f"Anti-signals warned against this prediction but were overridden. "
-                f"Net signal strength was insufficient.",
+                "Anti-signals warned against this prediction but were overridden. "
+                "Net signal strength was insufficient.",
                 signals_wrong,
                 signals_right,
                 what_missed,
@@ -1347,8 +1347,8 @@ def _classify_prediction_failure(
     if direction_was_right:
         return (
             "right_signal_wrong_timing",
-            f"Direction was correct at some point during the prediction window "
-            f"but the move did not persist through expiry.",
+            "Direction was correct at some point during the prediction window "
+            "but the move did not persist through expiry.",
             signals_wrong,
             signals_right,
             "Consider longer prediction horizons or trailing exit logic.",

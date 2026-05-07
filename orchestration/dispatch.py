@@ -84,13 +84,11 @@ def build_prompt(brief_content: str, task: str) -> str:
         lines = brief_content.splitlines()
         result = []
         in_task_section = False
-        replaced = False
         for line in lines:
             if "## Your Task" in line:
                 in_task_section = True
                 result.append(line)
                 result.append(task)
-                replaced = True
                 continue
             if in_task_section and line.startswith("<!--"):
                 continue  # skip placeholder comments

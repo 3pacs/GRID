@@ -313,7 +313,7 @@ def main() -> None:
 
     # SPY as market benchmark
     spy_ret_1d = fwd_1d["SPY"].dropna() if "SPY" in fwd_1d.columns else pd.Series(dtype=float)
-    spy_ret_5d = fwd_5d["SPY"].dropna() if "SPY" in fwd_5d.columns else pd.Series(dtype=float)
+    fwd_5d["SPY"].dropna() if "SPY" in fwd_5d.columns else pd.Series(dtype=float)
 
     # === 2. Astro Feature → Market Return Analysis ===
     log.info("\n" + "=" * 70)

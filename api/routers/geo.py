@@ -6,7 +6,6 @@ import json
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
-from loguru import logger as log
 from sqlalchemy import text
 
 from api.auth import require_auth

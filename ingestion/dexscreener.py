@@ -17,7 +17,7 @@ These feed into GRID as crypto-native sentiment/risk-appetite indicators.
 from __future__ import annotations
 
 import time
-from datetime import date, datetime, timezone
+from datetime import date
 from typing import Any
 
 import requests

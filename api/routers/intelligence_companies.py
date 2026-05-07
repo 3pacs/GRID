@@ -304,7 +304,6 @@ async def get_institutional_map(
     try:
         from intelligence.institutional_map import (
             build_institutional_graph,
-            find_conflicts_of_interest,
             get_institutional_summary,
         )
 

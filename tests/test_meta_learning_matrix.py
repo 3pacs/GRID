@@ -29,7 +29,6 @@ from intelligence import meta_learning_matrix as mlm
 from intelligence.meta_learning_matrix import (
     MAX_EDGE_MULTIPLIER,
     MIN_EDGE_MULTIPLIER,
-    MIN_META_SAMPLES,
     ConditionTuple,
     MetaEdgeRow,
     _reset_initialized_engines,

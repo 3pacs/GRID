@@ -11,7 +11,7 @@ require a live pg_engine fixture.
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from unittest.mock import MagicMock, patch
 
 import pandas as pd

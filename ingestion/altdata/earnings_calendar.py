@@ -17,10 +17,9 @@ Schedule: daily pull via hermes operator.
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from typing import Any
 
-import pandas as pd
 import yfinance as yf
 from loguru import logger as log
 from sqlalchemy import text

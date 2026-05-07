@@ -487,7 +487,7 @@ if __name__ == "__main__":
     print(f"\nTested: {summary['tested']}, Passed: {summary['passed']}, "
           f"Failed: {summary['failed']}, Inconclusive: {summary['inconclusive']}, "
           f"Skipped: {summary['skipped']}")
-    print(f"\nDetails:")
+    print("\nDetails:")
     for r in summary["results"]:
         status = r.get("verdict", r.get("status", "?"))
         stmt = r.get("statement", "")[:60]

@@ -29,8 +29,7 @@ from __future__ import annotations
 
 import collections
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Callable, Iterable, Protocol
+from typing import Any, Callable, Iterable
 
 from loguru import logger as log
 

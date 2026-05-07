@@ -20,11 +20,9 @@ Final score = sum(score * trust) / sum(max * trust) * 100
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Any
 
-import numpy as np
 import pandas as pd
 from loguru import logger as log
 from sqlalchemy import text
@@ -119,7 +117,7 @@ def score_setup(conn, ticker: str, price: pd.Series) -> LayerResult:
 
     vix = _load_latest(conn, "vix_spot")
     hy = _load_latest(conn, "hy_oas_spread")
-    stress = _load_latest(conn, "ofr_financial_stress")
+    _load_latest(conn, "ofr_financial_stress")
     psi = _load_latest(conn, "planetary_stress_index")
     yc = _load_latest(conn, "yld_curve_2s10s")
 
@@ -176,7 +174,7 @@ def score_company(conn, ticker: str) -> LayerResult:
     eps = _load_raw_series(conn, f"XBRL:{ticker}:EarningsPerShareDiluted", 730)
     shares = _load_raw_series(conn, f"XBRL:{ticker}:CommonStockSharesOutstanding", 730)
     cash = _load_raw_series(conn, f"XBRL:{ticker}:CashAndCashEquivalentsAtCarryingValue", 730)
-    assets = _load_raw_series(conn, f"XBRL:{ticker}:Assets", 730)
+    _load_raw_series(conn, f"XBRL:{ticker}:Assets", 730)
     liabilities = _load_raw_series(conn, f"XBRL:{ticker}:Liabilities", 730)
 
     # Revenue trend (0-4 pts)
@@ -323,7 +321,7 @@ def score_narrative(conn, ticker: str) -> LayerResult:
     wiki = _load_latest(conn, wiki_name)
     if wiki is not None:
         has_data = True
-        score += 2; signals.append(f"Wiki attention tracked")
+        score += 2; signals.append("Wiki attention tracked")
 
     # GDELT (market-wide narrative)
     gdelt = _load_latest(conn, "gdelt_article_count")

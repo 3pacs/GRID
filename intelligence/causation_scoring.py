@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 from datetime import date, timedelta
-from typing import Any
 
 from loguru import logger as log
 from sqlalchemy import text
@@ -1065,15 +1064,15 @@ def _try_llm_narrative(
     if rag_context:
         prompt += f"{rag_context}\n"
     prompt += (
-        f"Recent trading signals:\n"
+        "Recent trading signals:\n"
         + "\n".join(signal_lines)
         + "\n\nProbable causes:\n"
         + "\n".join(cause_lines)
         + "\n\nFor each cause, state:\n"
-        f"LEVER: [Who] did [what] affecting [which valve]\n"
-        f"CONDITION: [Environmental factor] that amplifies/dampens the lever\n\n"
-        f"Write 3-5 sentences. Reference historical patterns if relevant. "
-        f"Be direct. No disclaimers."
+        "LEVER: [Who] did [what] affecting [which valve]\n"
+        "CONDITION: [Environmental factor] that amplifies/dampens the lever\n\n"
+        "Write 3-5 sentences. Reference historical patterns if relevant. "
+        "Be direct. No disclaimers."
     )
 
     try:

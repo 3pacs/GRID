@@ -23,8 +23,6 @@ import platform
 import signal
 import sys
 import time
-import traceback
-from datetime import datetime, timezone
 
 # Minimal imports — this runs standalone on worker nodes
 try:

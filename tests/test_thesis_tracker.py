@@ -8,11 +8,8 @@ using mocked database results.
 
 from __future__ import annotations
 
-import json
-from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock
 
-import pytest
 
 from intelligence.thesis_tracker import (
     ThesisSnapshot,
@@ -23,9 +20,7 @@ from intelligence.thesis_tracker import (
     _classify_root_cause,
     snapshot_thesis,
     score_old_theses,
-    generate_thesis_postmortem,
     get_thesis_history,
-    get_thesis_accuracy,
     load_thesis_postmortems,
 )
 

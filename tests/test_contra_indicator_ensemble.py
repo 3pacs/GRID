@@ -11,7 +11,7 @@ entirely from Python.
 from __future__ import annotations
 
 from datetime import date, timedelta
-from typing import Any, Callable
+from typing import Any
 from unittest.mock import MagicMock
 
 import pandas as pd
@@ -24,23 +24,16 @@ from intelligence.contra_indicator_ensemble import (
     CONTRA_BEARISH,
     CONTRA_BULLISH,
     INDICATOR_SPECS,
-    MEDIUM_SCORE_ABS,
-    MEDIUM_N_ACTIVE,
-    MIN_HISTORY_OBS,
     MULT_MEDIUM_ALIGNED,
     MULT_MEDIUM_OPPOSED,
     MULT_NEUTRAL,
     MULT_STRONG_ALIGNED,
     MULT_STRONG_OPPOSED,
-    NEUTRAL_SCORE_EPSILON,
     NORMALIZATION_WINDOW_DAYS,
     SAME_DIRECTION,
-    STRONG_SCORE_ABS,
-    STRONG_N_ACTIVE,
     Z_CLAMP,
     ContraEnsembleReport,
     ContraIndicator,
-    IndicatorSpec,
     _classify_bias,
     _clamp,
     _compute_zscore,

@@ -20,7 +20,7 @@ Usage:
 from __future__ import annotations
 
 import json
-from typing import Any, Callable, Iterator
+from typing import Callable, Iterator
 
 from loguru import logger as log
 

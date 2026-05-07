@@ -11,13 +11,11 @@ Sends the Oracle's latest predictions with:
 
 from __future__ import annotations
 
-import json
-from datetime import datetime, timezone
 from typing import Any
 
 from loguru import logger as log
 
-from alerts.email import _render_html, _send_in_thread, _section_text, _section_kpi
+from alerts.email import _render_html, _send_in_thread
 
 
 def send_oracle_report(cycle_result: dict[str, Any]) -> None:

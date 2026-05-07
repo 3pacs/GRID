@@ -20,7 +20,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import statistics
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -548,7 +547,7 @@ class EarningsTranscriptAnalyzer:
         stored = 0
 
         for row in rows:
-            series_id = row[0]
+            row[0]
             obs_date = row[1]
             payload = row[2] if isinstance(row[2], dict) else {}
 

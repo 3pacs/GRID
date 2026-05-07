@@ -11,21 +11,54 @@ Run: python3 worker.py
 """
 
 import argparse
-import json
 import os
-import platform
 import shutil
 import socket
 import subprocess
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from loguru import logger as log
+try:
+    from loguru import logger as log
+except ImportError:  # pragma: no cover - exercised on lightweight edge nodes
+    import logging
+
+    _base_logger = logging.getLogger("grid-worker")
+    if not _base_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        _base_logger.addHandler(handler)
+    _base_logger.setLevel(logging.INFO)
+
+    class _LoggerAdapter:
+        def __init__(self, logger):
+            self._logger = logger
+
+        def _fmt(self, message, **kwargs):
+            if kwargs:
+                try:
+                    return message.format(**kwargs)
+                except Exception:
+                    return f"{message} {kwargs}"
+            return message
+
+        def info(self, message, **kwargs):
+            self._logger.info(self._fmt(message, **kwargs))
+
+        def warning(self, message, **kwargs):
+            self._logger.warning(self._fmt(message, **kwargs))
+
+        def error(self, message, **kwargs):
+            self._logger.error(self._fmt(message, **kwargs))
+
+        def debug(self, message, **kwargs):
+            self._logger.debug(self._fmt(message, **kwargs))
+
+    log = _LoggerAdapter(_base_logger)
 
 DEFAULT_COORDINATOR = "http://100.75.185.36:8100"
 HEARTBEAT_INTERVAL = 30  # seconds
@@ -63,10 +96,20 @@ def detect_gpu():
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode == 0 and result.stdout.strip():
-            parts = result.stdout.strip().split(",")
-            name = parts[0].strip()
-            vram = float(parts[1].strip()) / 1024  # MB to GB
-            return name, round(vram, 1)
+            rows = []
+            for line in result.stdout.strip().splitlines():
+                parts = [part.strip() for part in line.split(",", 1)]
+                if len(parts) != 2:
+                    continue
+                try:
+                    rows.append((parts[0], float(parts[1]) / 1024))
+                except ValueError:
+                    continue
+            if rows:
+                # Register the largest GPU so the coordinator has a stable,
+                # conservative capability view even on mixed-card hosts.
+                name, vram = max(rows, key=lambda row: row[1])
+                return name, round(vram, 1)
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
     return None, None
@@ -99,6 +142,44 @@ def get_tailscale_ip():
         pass
     # Fallback to hostname IP
     return socket.gethostbyname(socket.gethostname())
+
+
+def _ollama_model_catalog():
+    """Return installed Ollama model names on the local node."""
+    r = requests.get("http://localhost:11434/api/tags", timeout=10)
+    r.raise_for_status()
+    payload = r.json()
+    models = []
+    for model in payload.get("models", []):
+        name = model.get("name") or model.get("model")
+        if name:
+            models.append(name)
+    return models
+
+
+def _resolve_ollama_model(requested_model: str) -> str:
+    """Resolve a usable local Ollama model name for the requested alias."""
+    models = _ollama_model_catalog()
+    if not models:
+        raise RuntimeError("No Ollama models installed on local node")
+
+    if requested_model in models:
+        return requested_model
+
+    latest_alias = f"{requested_model}:latest"
+    if latest_alias in models:
+        return latest_alias
+
+    requested_base = requested_model.split(":", 1)[0]
+    for name in models:
+        if name.split(":", 1)[0] == requested_base:
+            return name
+
+    for name in models:
+        if "embed" not in name and "embedding" not in name:
+            return name
+
+    return models[0]
 
 
 # ── Job Execution ──────────────────────────────────────────────
@@ -239,7 +320,7 @@ def run_regime_detect(params):
 
 def run_llm_inference(params):
     """Run LLM inference via local Ollama."""
-    model = params.get("model", "llama3.2")
+    requested_model = params.get("model", "llama3.2")
     prompt = params.get("prompt", "")
     system_prompt = params.get("system_prompt", (
         "You are GRID, an internal trading intelligence system. "
@@ -250,6 +331,7 @@ def run_llm_inference(params):
     if not prompt:
         return {"error": "No prompt provided"}
 
+    model = _resolve_ollama_model(requested_model)
     r = requests.post(
         "http://localhost:11434/api/generate",
         json={"model": model, "prompt": prompt, "system": system_prompt, "stream": False},
@@ -261,6 +343,7 @@ def run_llm_inference(params):
     return {
         "output": {
             "model": model,
+            "requested_model": requested_model,
             "response": data.get("response", ""),
             "done": data.get("done", False),
         },
@@ -527,6 +610,16 @@ def main():
     parser = argparse.ArgumentParser(description="GRID Compute Worker")
     parser.add_argument("--coordinator", default=DEFAULT_COORDINATOR, help="Coordinator URL")
     parser.add_argument("--max-concurrent", type=int, default=2, help="Max concurrent jobs")
+    parser.add_argument(
+        "--heartbeat-only",
+        action="store_true",
+        help="Register and heartbeat without claiming jobs; useful for fresh node bootstrap.",
+    )
+    parser.add_argument(
+        "--exclude-types",
+        default="HUMAN_LLM_QUERY",
+        help="Comma-separated job types to skip while claiming.",
+    )
     args = parser.parse_args()
 
     coordinator = args.coordinator.rstrip("/")
@@ -580,13 +673,17 @@ def main():
                 except Exception:
                     log.warning("Heartbeat failed")
 
+            if args.heartbeat_only:
+                time.sleep(POLL_INTERVAL)
+                continue
+
             # Try to claim a job (skip human-only jobs)
             try:
                 r = requests.post(f"{coordinator}/jobs/claim", params={
                     "worker_id": worker_id,
                     "gpu_available": gpu_model is not None,
                     "ollama_available": has_ollama,
-                    "exclude_types": "HUMAN_LLM_QUERY",
+                    "exclude_types": args.exclude_types,
                 }, timeout=10)
                 r.raise_for_status()
                 job = r.json()

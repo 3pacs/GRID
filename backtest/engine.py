@@ -766,19 +766,19 @@ if __name__ == "__main__":
         else:
             gm = result["grid_metrics"]
             print(f"\n{'='*60}")
-            print(f"GRID PITCH BACKTEST RESULTS")
+            print("GRID PITCH BACKTEST RESULTS")
             print(f"{'='*60}")
             print(f"Period: {result['period']['start']} → {result['period']['end']}")
             print(f"Initial: ${result['initial_capital']:,.0f}")
             print(f"Final:   ${result['final_value']:,.0f}")
-            print(f"")
+            print("")
             print(f"Cumulative Return: {gm['cumulative_return']:.1%}")
             print(f"Annualized Return: {gm['annualized_return']:.1%}")
             print(f"Sharpe Ratio:      {gm['sharpe_ratio']:.2f}")
             print(f"Sortino Ratio:     {gm['sortino_ratio']:.2f}")
             print(f"Max Drawdown:      {gm['max_drawdown']:.1%}")
             print(f"Calmar Ratio:      {gm['calmar_ratio']:.2f}")
-            print(f"")
+            print("")
             print(f"vs SPY:  {result['benchmark_metrics']['SPY']['cumulative_return']:.1%}")
             print(f"vs 60/40: {result['benchmark_metrics']['60/40']['cumulative_return']:.1%}")
 

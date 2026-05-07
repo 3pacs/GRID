@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import re
 import xml.etree.ElementTree as ET
-from datetime import date, datetime
+from datetime import date
 from typing import Any
 
 import requests
@@ -163,7 +163,6 @@ class WikiHistoryPuller:
 
         # Atom feed fallback
         if not items:
-            ns = {"atom": "http://www.w3.org/2005/Atom"}
             for entry in root.iter("{http://www.w3.org/2005/Atom}entry"):
                 title = entry.findtext("{http://www.w3.org/2005/Atom}title", "")
                 link_el = entry.find("{http://www.w3.org/2005/Atom}link")

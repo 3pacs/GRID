@@ -23,7 +23,6 @@ from contracts.channels import channel_for
 from contracts.correlation import (
     correlation_scope,
     get_current_correlation_id,
-    new_correlation_id,
 )
 from contracts.schemas import BaseContract, PullLifecycle
 

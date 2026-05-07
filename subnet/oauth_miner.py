@@ -29,11 +29,8 @@ GRID gets free compute. User earns API credits + future TAO.
 from __future__ import annotations
 
 import hashlib
-import json
 import os
-import time
 from datetime import datetime, timedelta, timezone
-from typing import Any
 from urllib.parse import urlencode
 
 import requests

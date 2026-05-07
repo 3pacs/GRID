@@ -17,13 +17,11 @@ from __future__ import annotations
 
 import hashlib
 import math
-import re
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date
 from typing import Any
 
 from loguru import logger as log
-from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from config import settings

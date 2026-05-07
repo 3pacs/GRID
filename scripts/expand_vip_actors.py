@@ -175,7 +175,7 @@ def seed_actors(engine):
     for aid, name, category, tier, title, net_worth in all_actors:
         try:
             with engine.begin() as conn:
-                result = conn.execute(
+                conn.execute(
                     text(
                         "INSERT INTO actors (id, name, category, tier, title, net_worth_estimate, "
                         "influence_score, trust_score, credibility, updated_at) "

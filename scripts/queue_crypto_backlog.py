@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Queue crypto-specific research tasks for Qwen."""
-import os, sys
+import os
+import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db import get_engine
 from sqlalchemy import text

@@ -8,7 +8,6 @@ from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
-from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 
 from ingestion.altdata.pboc_omo import (

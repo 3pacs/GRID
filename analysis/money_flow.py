@@ -42,7 +42,6 @@ Data sources:
 from __future__ import annotations
 
 import json
-import math
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -1334,7 +1333,7 @@ def _build_levers(
                     continue
                 m = node.get("metrics", {})
                 nl = m.get("net_liquidity_change_1m")
-                sig = m.get("signal", "stable")
+                m.get("signal", "stable")
                 if nl is not None:
                     levers.append({
                         "name": "Fed Net Liquidity",

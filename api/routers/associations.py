@@ -227,7 +227,7 @@ async def get_correlation_matrix(
 
     feature_ids = registry["id"].tolist()
     id_to_name = dict(zip(registry["id"], registry["name"]))
-    id_to_family = dict(zip(registry["id"], registry["family"]))
+    dict(zip(registry["id"], registry["family"]))
     name_to_family = dict(zip(registry["name"], registry["family"]))
 
     matrix = _build_feature_matrix(pit_store, feature_ids, days)
@@ -589,7 +589,7 @@ async def get_anomalies(
     z_scores = (latest - means) / (stds + 1e-12)
 
     # Compute correlation matrix for breaking-correlation detection
-    corr = matrix.corr()
+    matrix.corr()
 
     anomalies: list[dict[str, Any]] = []
 

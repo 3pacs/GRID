@@ -1,17 +1,12 @@
 """CAT-162 — credit event probability machine tests."""
 from __future__ import annotations
 
-import math
-from datetime import date
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from intelligence.credit_event_probability import (
     _DTD_CEIL,
-    _DTD_FLOOR,
     _norm_cdf,
-    CreditEventResult,
     compose_credit_event_probability,
     compute_credit_event_probability,
     credit_spread_default_probability,

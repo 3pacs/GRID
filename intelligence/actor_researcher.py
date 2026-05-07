@@ -19,7 +19,7 @@ ANTI-HALLUCINATION RULES:
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from loguru import logger as log
@@ -105,7 +105,6 @@ def gather_evidence(engine: Engine, actor_name: str, actor_id: str) -> dict[str,
             })
 
         # 2. QuiverQuant congressional/insider trading
-        name_pattern = f"%{actor_name}%"
         trades = conn.execute(text("""
             SELECT series_id, obs_date, value, raw_payload
             FROM raw_series

@@ -1,8 +1,8 @@
 """Tests for intelligence.context_provider — LLM prompt context injection."""
 
 import pytest
-from datetime import datetime, timezone, timedelta
-from unittest.mock import MagicMock, patch
+from datetime import datetime, timezone
+from unittest.mock import MagicMock
 from sqlalchemy import create_engine, text
 
 

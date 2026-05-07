@@ -9,7 +9,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from ingestion.altdata import semi_book_to_bill as sbb
 from ingestion.altdata.semi_book_to_bill import (
     FRED_SERIES_IDS,
     SERIES_LABELS,

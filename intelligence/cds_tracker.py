@@ -339,7 +339,7 @@ def _build_narrative(
 ) -> str:
     """Generate human-readable credit narrative."""
     hy = next((s for s in spreads if s.series_key == "hy"), None)
-    ig = next((s for s in spreads if s.series_key == "ig"), None)
+    next((s for s in spreads if s.series_key == "ig"), None)
     ccc = next((s for s in spreads if s.series_key == "ccc"), None)
 
     parts = []

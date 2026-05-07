@@ -79,7 +79,7 @@ class TestCanvasRouter:
             if hasattr(r, "methods"):
                 for m in r.methods:
                     methods.setdefault(r.path, set()).add(m)
-        board_paths = [p for p in methods if "{board_id}" in p and not "node" in p and not "edge" in p and not "graph" in p]
+        board_paths = [p for p in methods if "{board_id}" in p and "node" not in p and "edge" not in p and "graph" not in p]
         assert any("DELETE" in methods[p] for p in board_paths)
 
     def test_bulk_save_endpoint_exists(self):

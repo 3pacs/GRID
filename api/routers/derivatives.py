@@ -336,7 +336,6 @@ async def get_skew(ticker: str) -> dict[str, Any]:
             ), {"t": ticker.upper(), "sd": snap_date}).fetchall()
 
         # Group by expiry
-        from collections import defaultdict
         expiry_map: dict[str, dict] = {}
 
         for r in rows:
@@ -505,7 +504,6 @@ async def get_oi_heatmap(ticker: str) -> dict[str, Any]:
             ), {"t": ticker.upper(), "sd": snap_date}).fetchall()
 
         # Aggregate into strike x expiry cells
-        from collections import defaultdict
         cell_map: dict[tuple, dict] = {}
 
         for r in rows:

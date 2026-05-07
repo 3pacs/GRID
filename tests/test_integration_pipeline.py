@@ -9,11 +9,10 @@ are maintained throughout.
 from __future__ import annotations
 
 from datetime import date
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pandas as pd
-import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +54,6 @@ class TestConflictDetection:
 
     def test_single_source_no_conflict(self):
         """Single source: value passes through without conflict."""
-        from normalization.resolver import CONFLICT_THRESHOLD
 
         values = [100.0]
         priorities = [1]

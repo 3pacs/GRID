@@ -13,7 +13,6 @@ Features generated:
 
 from __future__ import annotations
 
-import math
 from datetime import date, timedelta, datetime, timezone
 from typing import Any
 
@@ -178,7 +177,7 @@ class VedicAstroPuller(BasePuller):
         nak_idx = _nakshatra_from_longitude(moon_lon)
         rahu_lon = _rahu_longitude(d)
         # Ketu is always 180 degrees from Rahu
-        ketu_lon = (rahu_lon + 180.0) % 360.0
+        (rahu_lon + 180.0) % 360.0
 
         return {
             "nakshatra_index": float(nak_idx),

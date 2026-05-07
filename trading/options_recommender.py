@@ -25,7 +25,6 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
 
-import numpy as np
 import pandas as pd
 from loguru import logger as log
 from sqlalchemy import text
@@ -855,7 +854,7 @@ class OptionsRecommender:
         For earnings plays with huge disparity, can go as short as 2 weeks.
         Requires sufficient OI (>500 contracts) at the chosen expiry.
         """
-        today = date.today()
+        date.today()
 
         # Get distinct expiries with aggregate OI
         expiry_stats = (
@@ -1506,7 +1505,7 @@ Respond with ONLY the JSON object."""
         if gamma_flip:
             parts.append(f"Gamma flip: ${gamma_flip:,.2f}")
 
-        spot = gex_profile.get("spot", 0)
+        gex_profile.get("spot", 0)
         call_wall = gex_profile.get("call_wall")
         put_wall = gex_profile.get("put_wall")
         if call_wall:
@@ -1525,7 +1524,7 @@ Respond with ONLY the JSON object."""
         if regime == "SHORT_GAMMA":
             parts.append(f"Dealers are short gamma — will amplify {direction} move")
         elif regime == "LONG_GAMMA":
-            parts.append(f"Dealers are long gamma — will dampen moves")
+            parts.append("Dealers are long gamma — will dampen moves")
 
         return " | ".join(parts)
 

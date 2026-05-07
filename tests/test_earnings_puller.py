@@ -10,9 +10,8 @@ Covers:
 
 from __future__ import annotations
 
-import math
 from datetime import date
-from unittest.mock import MagicMock, PropertyMock, patch, call
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pandas as pd
 import pytest

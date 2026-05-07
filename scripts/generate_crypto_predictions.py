@@ -5,8 +5,11 @@ Crypto markets never close — predictions can be scored immediately.
 This script generates swing (7-day) and macro (30-day) predictions
 for BTC, ETH, SOL and queues them for AstroGrid scoring.
 """
-import os, sys, json, hashlib
-from datetime import datetime, timedelta, timezone, date
+import os
+import sys
+import json
+import hashlib
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

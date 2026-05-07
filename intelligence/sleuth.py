@@ -835,7 +835,6 @@ class Sleuth:
             # Normalize — could be CrossRefCheck dataclass or dict
             if hasattr(flag, "name"):
                 name = flag.name
-                category = flag.category
                 divergence = flag.actual_divergence
                 official = flag.official_source
                 physical = flag.physical_source
@@ -843,7 +842,7 @@ class Sleuth:
                 flag_dict = asdict(flag) if hasattr(flag, "__dataclass_fields__") else {}
             elif isinstance(flag, dict):
                 name = flag.get("name", "unknown")
-                category = flag.get("category", "unknown")
+                flag.get("category", "unknown")
                 divergence = flag.get("actual_divergence", 0)
                 official = flag.get("official_source", "?")
                 physical = flag.get("physical_source", "?")
@@ -876,7 +875,7 @@ class Sleuth:
         leads: list[Lead] = []
 
         try:
-            from intelligence.actor_network import track_wealth_migration, WealthFlow
+            from intelligence.actor_network import track_wealth_migration
             flows = track_wealth_migration(self.engine, days=30)
         except Exception as exc:
             log.debug("Sleuth: wealth flow scan failed: {e}", e=str(exc))
@@ -1024,7 +1023,6 @@ class Sleuth:
             try:
                 from intelligence.actor_network import (
                     get_actor_context_for_ticker,
-                    find_connected_actions,
                 )
                 for ticker in list(tickers)[:3]:
                     ctx = get_actor_context_for_ticker(self.engine, ticker)
@@ -1270,7 +1268,7 @@ if __name__ == "__main__":
         print(f"  [{lead.category}] (p={lead.priority:.2f}) {lead.question[:100]}")
 
     if leads:
-        print(f"\nInvestigating top lead...")
+        print("\nInvestigating top lead...")
         top = max(leads, key=lambda l: l.priority)
         result = sleuth.investigate_lead(top)
         print(f"  Findings: {result.findings}")

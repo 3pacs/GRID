@@ -301,11 +301,11 @@ def _print_combined_range() -> None:
         hi_prod *= L.high
     print(f"  product of all 13 lows  : {lo_prod:.4f}")
     print(f"  product of all 13 highs : {hi_prod:.4f}")
-    print(f"  aggregator clamp         : [0.00, 1.50]")
+    print("  aggregator clamp         : [0.00, 1.50]")
     print(f"  ⇒ max achievable boost   : {min(1.5, hi_prod):.4f}")
     print(f"  ⇒ max achievable haircut : {max(0.0, lo_prod):.4f}")
-    print(f"  ⇒ typical base conviction: ~1.0 (sum of shapley × conviction_weight)")
-    print(f"  ⇒ realistic ceiling/floor: ~0.5× to ~1.5× once clamp applies")
+    print("  ⇒ typical base conviction: ~1.0 (sum of shapley × conviction_weight)")
+    print("  ⇒ realistic ceiling/floor: ~0.5× to ~1.5× once clamp applies")
 
 
 def main() -> int:

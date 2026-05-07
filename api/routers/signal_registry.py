@@ -5,8 +5,7 @@ Signal Registry, Model Factory & Ensemble API endpoints.
 from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from loguru import logger as log
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 from api.auth import require_auth
 from api.dependencies import get_db_engine

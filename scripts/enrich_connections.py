@@ -14,7 +14,6 @@ Usage:
 """
 from __future__ import annotations
 
-import sys
 from collections import defaultdict
 
 from loguru import logger as log

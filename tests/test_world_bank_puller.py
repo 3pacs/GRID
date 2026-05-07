@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import json
 from datetime import date
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -12,7 +11,6 @@ from ingestion.international.world_bank_puller import (
     WorldBankPuller,
     INDICATORS,
     COUNTRIES,
-    _WB_BASE_URL,
     _PER_PAGE,
 )
 
@@ -26,7 +24,7 @@ def mock_engine():
     """Create a mock SQLAlchemy engine with source_catalog lookup."""
     engine = MagicMock()
     conn = MagicMock()
-    ctx = MagicMock()
+    MagicMock()
 
     # source_catalog lookup returns id=42
     row_mock = MagicMock()
@@ -82,7 +80,7 @@ class TestConfiguration:
 
     def test_series_id_format(self, puller):
         """Series IDs must follow wb:{country}:{indicator} pattern."""
-        sid = f"wb:us:NY.GDP.MKTP.CD"
+        sid = "wb:us:NY.GDP.MKTP.CD"
         assert sid.startswith("wb:")
         parts = sid.split(":")
         assert len(parts) == 3

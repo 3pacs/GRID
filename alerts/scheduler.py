@@ -8,7 +8,6 @@ Called from ``api/main.py`` during application startup.
 from __future__ import annotations
 
 import threading
-import time
 from datetime import datetime, timezone
 
 from loguru import logger as log

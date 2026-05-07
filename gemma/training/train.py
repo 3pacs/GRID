@@ -40,7 +40,6 @@ Best Practices Applied:
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
 from loguru import logger as log
@@ -561,7 +560,7 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     # Train
-    lora_dir = train(cfg)
+    train(cfg)
 
     # Optional: merge LoRA into base model
     if args.merge:

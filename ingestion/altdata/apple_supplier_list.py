@@ -53,7 +53,7 @@ import io
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from typing import Any, Iterable
+from typing import Any
 
 import requests
 from loguru import logger as log

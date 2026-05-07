@@ -7,7 +7,6 @@ Fire-and-forget: errors are logged but never block the response.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from typing import Any
 
 from loguru import logger as log

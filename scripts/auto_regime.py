@@ -23,7 +23,6 @@ vs straddling boundaries.
 """
 
 import json
-import os
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -131,7 +130,6 @@ def _compute_stress_index(
     Returns:
         1D array of stress index values, one per row.
     """
-    import pandas as pd
 
     active_weights = weights if weights is not None else FEATURE_WEIGHTS
     n_rows = len(feature_matrix)

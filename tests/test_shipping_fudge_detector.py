@@ -10,17 +10,11 @@ from __future__ import annotations
 from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from intelligence.cross_reference import (
-    MAJOR_DIVERGENCE_THRESHOLD,
     MIN_OBSERVATIONS,
 )
 from intelligence.shipping_fudge_detector import (
-    DELTA_LOOKBACK_DAYS,
-    MIN_HISTORY_DAYS,
-    PERSISTENCE_WINDOW_DAYS,
-    SHIPPING_DIVERGENCE_THRESHOLD,
     _align_latest_pair,
     _build_implication,
     _build_narrative,

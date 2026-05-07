@@ -2,19 +2,16 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from intelligence.news_momentum import (
-    ACCELERATION_THRESHOLD,
     MomentumCalculator,
     MomentumSignal,
     SentimentSnapshot,
     SentimentTimeSeries,
     DivergenceDetector,
-    NewsMomentumEngine,
 )
 
 

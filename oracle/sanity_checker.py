@@ -10,10 +10,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date
 from typing import Literal
 
-from loguru import logger as log
 
 from oracle.claim_verifier import VerifiedClaim
 

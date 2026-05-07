@@ -19,8 +19,8 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from dataclasses import dataclass, field, asdict
-from datetime import date, datetime, timedelta, timezone
+from dataclasses import dataclass, asdict
+from datetime import date, timedelta
 from typing import Any
 
 from loguru import logger as log
@@ -29,7 +29,6 @@ from sqlalchemy.engine import Engine
 
 from ingestion.altdata.legislation import (
     COMMITTEE_SECTOR_MAP,
-    TOPIC_SECTOR_MAP,
     _tickers_for_committee,
 )
 

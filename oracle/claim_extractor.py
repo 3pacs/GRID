@@ -9,8 +9,7 @@ dependency — pure deterministic parsing.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
-from datetime import date, datetime
+from dataclasses import dataclass
 from typing import Literal
 
 ClaimType = Literal[
@@ -186,7 +185,7 @@ def extract_claims(text: str) -> list[Claim]:
 
     # --- Date claims ---
     for m in _DATE_RE.finditer(text):
-        raw_date = m.group(1) or m.group(2)
+        m.group(1) or m.group(2)
         sentence = _enclosing_sentence(text, m.start(), m.end())
         _add(Claim(
             text=sentence,

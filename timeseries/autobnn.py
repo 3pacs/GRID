@@ -22,7 +22,7 @@ Installation:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
@@ -194,7 +194,7 @@ class AutoBNNDecomposer:
             x_test=jnp.array(x),
         )
 
-        mean_pred = np.array(predictions["mean"])
+        np.array(predictions["mean"])
         std_pred = np.array(predictions["std"])
 
         # Decompose into components

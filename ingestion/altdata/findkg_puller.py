@@ -14,11 +14,10 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-import requests
 from loguru import logger as log
 from sqlalchemy.engine import Engine
 
-from ingestion.base import BasePuller, retry_on_failure
+from ingestion.base import BasePuller
 
 DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "findkg"
 

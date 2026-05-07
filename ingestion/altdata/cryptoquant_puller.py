@@ -10,7 +10,7 @@ API: https://docs.cryptoquant.com/
 from __future__ import annotations
 
 import time
-from datetime import date, datetime, timedelta
+from datetime import datetime
 from typing import Any
 
 import requests

@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import time
 import traceback
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 from loguru import logger as log
@@ -284,7 +284,7 @@ def diagnose_and_fix_pulls(
                         "Be specific and concise. No preamble."
                     )},
                     {"role": "user", "content": (
-                        f"Failed sources with details:\n"
+                        "Failed sources with details:\n"
                         + json.dumps(failed_info, default=str, indent=2)
                         + f"\nCurrent date: {date.today()}"
                     )},
@@ -357,7 +357,7 @@ def diagnose_and_fix_pulls(
             if action == "BACKFILL":
                 attempt = MAX_PULL_RETRIES  # force extended lookback
 
-            pull_result = _retry_source(source_name, engine, attempt=attempt)
+            _retry_source(source_name, engine, attempt=attempt)
             result["retried"] += 1
             result["fixed"] += 1
             state.cooldowns.record_attempt(source_name, success=True)

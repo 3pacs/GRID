@@ -128,7 +128,7 @@ class AITraderAdapter:
                         continue
 
                     agent_id = sig.get("agent_id", "unknown")
-                    signal_ts = sig.get("executed_at") or sig.get("created_at") or now.isoformat()
+                    sig.get("executed_at") or sig.get("created_at") or now.isoformat()
                     value = _ACTION_VALUE.get(action, 0.0)
 
                     # Confidence from agent's leaderboard PnL rank

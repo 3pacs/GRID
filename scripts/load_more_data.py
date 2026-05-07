@@ -1,9 +1,7 @@
 import yfinance as yf
 import psycopg2
 import requests
-import json
 import os
-from datetime import datetime
 from config import settings
 from loguru import logger as log
 

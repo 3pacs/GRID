@@ -49,7 +49,6 @@ from __future__ import annotations
 
 import csv
 import json
-import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -3136,7 +3135,6 @@ def discover_board_interlocks(engine: Engine) -> dict:
         dict with actors, connections, interlock stats.
     """
     _ensure_actors_table(engine)
-    new_actors = 0
     new_connections = 0
     interlocked_directors: set[str] = set()
     company_pairs: set[tuple[str, str]] = set()

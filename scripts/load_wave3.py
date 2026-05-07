@@ -1,5 +1,6 @@
-import psycopg2, requests, json, time
-from datetime import datetime
+import psycopg2
+import requests
+import time
 from config import settings
 from loguru import logger as log
 

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """GRID v4 — Full Data Ingest Pipeline"""
 
-import duckdb, json, os, sys
+import duckdb
+import os
+import sys
 from datetime import datetime
 from pathlib import Path
 

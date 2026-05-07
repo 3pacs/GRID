@@ -25,7 +25,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from trading.paper_engine import PaperTradingEngine
-from trading.solana.jupiter_client import JupiterClient, SOL_MINT, USDC_MINT
+from trading.solana.jupiter_client import JupiterClient, USDC_MINT
 from trading.solana.limits import DailyLimits, LimitConfig, LimitDecision
 from trading.solana.pipeline import PipelineDecision
 from trading.solana.safety import (
