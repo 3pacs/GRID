@@ -31,7 +31,7 @@ def _row_to_response(row: Any) -> dict:
 
 
 @router.get("")
-async def get_all(
+def get_all(
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     verdict: str | None = Query(default=None),
@@ -79,7 +79,7 @@ async def get_all(
 
 
 @router.get("/stats", response_model=JournalStatsResponse)
-async def get_stats(
+def get_stats(
     _token: str = Depends(require_auth),
 ) -> JournalStatsResponse:
     """Return journal performance summary."""
@@ -89,7 +89,7 @@ async def get_stats(
 
 
 @router.get("/{entry_id}")
-async def get_one(
+def get_one(
     entry_id: int,
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -109,7 +109,7 @@ async def get_one(
 
 
 @router.post("", status_code=201)
-async def create(
+def create(
     body: JournalEntryCreate,
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -135,7 +135,7 @@ async def create(
 
 
 @router.put("/{entry_id}/outcome")
-async def record_outcome(
+def record_outcome(
     entry_id: int,
     body: JournalOutcomeRecord,
     _token: str = Depends(require_auth),

@@ -57,6 +57,11 @@ Complete audit of every issue, gap, and improvement opportunity across the codeb
 ### 14. NaN Handling Inconsistency (NOTED)
 - Different modules use different ffill strategies by design ([[Orthogonality Audit|orthogonality]] uses limit=5, clustering uses ffill+dropna). This is intentional — each module's data quality requirements differ. Comment in orthogonality.py fixed (said >30% but code checked >50%).
 
+### Async/Sync Mixing (PARTIAL — consolidated audit HIGH #13)
+- 160 of 547 async-def API handlers have synchronous-only bodies (sync `engine.connect()` / `conn.execute(text(...))` and no awaits). [[FastAPI]] runs sync `def` handlers in a threadpool but blocks the event loop on async-def + sync-DB. None are crashing — no `await conn.execute` patterns exist — but throughput suffers under concurrent load.
+- `scripts/lint_async_handlers.py` lints `api/routers/*.py` and prints the punch list. Use `--strict` for CI gating once fully closed.
+- `api/routers/journal.py` converted as the reference (5 handlers downgraded `async def` → `def`). Mass conversion of the remaining 155 deferred — too many files at once risks regressions; linter tracks progress.
+
 ### 15. Conflict Resolution Threshold (FIXED)
 - **`normalization/resolver.py`** — Added per-family thresholds: vol=2%, commodity=1.5%, crypto=3%. Default threshold configurable via `GRID_CONFLICT_THRESHOLD` env var.
 
