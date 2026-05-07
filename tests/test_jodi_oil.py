@@ -11,7 +11,6 @@ Covers:
 
 from __future__ import annotations
 
-import json
 from datetime import date
 from unittest.mock import MagicMock, patch
 
@@ -21,7 +20,6 @@ from ingestion.altdata.jodi_oil import (
     JODI_CSV_URL,
     JODI_SDMX_URL,
     JODIObservation,
-    JODIOilPuller,
     TRACKED_COUNTRIES,
     TRACKED_FLOWS,
     TRACKED_PRODUCTS,

@@ -12,10 +12,9 @@ Companies that miss or defer → the market eventually punishes.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date
 from typing import Any
 
-from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 

@@ -15,6 +15,25 @@ Both are on the same filesystem (`/data/sdc1`) and owned by `grid:grid`. Neither
 
 **Why two trees:** historical — the repo was forked into a second path during the V5 astrogrid dedup work and the two have drifted. Unifying is task #82 wave-2 (the present deploy.py is wave-1, stop the bleeding).
 
+## Systemd unit drift verifier
+
+`scripts/verify_systemd_units.py` compares every `*.service` and `*.timer` in `server_setup/` against the live systemd state on the host it's run on. It checks the runtime-relevant keys (`WorkingDirectory`, `EnvironmentFile`, `ExecStart`, `ExecStartPost`, `User`, `Restart`, …) and prints a per-unit drift report.
+
+```bash
+# Run on grid-svr — exits 0 if repo == live, 1 if any drift
+python3 scripts/verify_systemd_units.py
+
+# Show a sudo-able patch to push repo state into live
+python3 scripts/verify_systemd_units.py --fix-direction repo-to-live
+
+# Capture live state back into the repo (when an operator hand-edited live)
+python3 scripts/verify_systemd_units.py --fix-direction live-to-repo
+```
+
+**Canonical paths for ingestor/scheduler units** (everything except `grid-api`): `WorkingDirectory=/home/grid/grid_v4/grid_repo` and `EnvironmentFile=/home/grid/grid_v4/grid_repo/.env`. The earlier `…/grid_repo/grid/` paths in four units were typos — `grid_repo/grid/` exists but contains only a vestigial `migrations/` subdir, not the canonical scripts. `grid-hermes`, `grid-coordinator`, `grid-worker` were already corrected in live by hand; `grid-assimilator` still drifts in live and needs a `daemon-reload + restart` to pick up the repo paths.
+
+**`grid-api` exception:** intentionally lives on `/data/grid_v4/astrogrid_dedup` per the two-tree split documented above. The verifier does not flag this.
+
 ## `scripts/deploy.py` — what it does
 
 1. **Resolves local paths** relative to the repo root.
@@ -81,8 +100,8 @@ Every agent prompt that writes code to the server MUST invoke this tool instead 
 ## What this fix does NOT address
 
 - **The historical drift between the two trees is NOT resolved.** `diff -rq` still shows ~100+ diverged files (unique-to-one-side, plus wiki/docs/CLAUDE.md). A separate task (TAF-1 wave 2) will pick a per-file winner and either merge or replace one tree with a symlink to the other once content is identical.
-- **Legacy bash scripts.** `deploy_to_grid_svr.sh` still exists for the Trial Gem Hunter install flow; it's annotated as LEGACY and should not gain new deploy steps.
-- **Non-file state.** Migrations, systemd unit reloads, and venv updates still need manual intervention. Deploy.py is for file writes only.
+- **Legacy bash scripts.** `deploy_to_grid_svr.sh` still exists for the [[Trial Gem Hunter]] install flow; it's annotated as LEGACY and should not gain new deploy steps.
+- **Non-file state.** [[migrations|Migrations]], systemd unit reloads, and venv updates still need manual intervention. Deploy.py is for file writes only.
 
 ## Related tasks
 

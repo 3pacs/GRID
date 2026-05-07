@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import date
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from loguru import logger as log
 
@@ -96,8 +95,6 @@ async def generate_forecast(
         )
 
     # Fetch historical data from resolved_series
-    import pandas as pd
-    from sqlalchemy import text
 
     series_data = _fetch_series_data(engine, req.series_id)
     if series_data is None or len(series_data) < 10:

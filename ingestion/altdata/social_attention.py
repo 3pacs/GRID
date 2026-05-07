@@ -16,15 +16,13 @@ All stored as raw_series with ATTENTION: prefix for entity_map resolution.
 from __future__ import annotations
 
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import requests
 from loguru import logger as log
-from sqlalchemy import text
-from sqlalchemy.engine import Engine
 
-from ingestion.base import BasePuller, retry_on_failure
+from ingestion.base import BasePuller
 
 # ── Ticker → search term mapping ────────────────────────────────────────
 
@@ -236,7 +234,7 @@ class EdgarViewsPuller(BasePuller):
 
         recent = data.get("filings", {}).get("recent", {})
         dates = recent.get("filingDate", [])
-        forms = recent.get("form", [])
+        recent.get("form", [])
 
         cutoff = (date.today() - timedelta(days=days)).isoformat()
         count = sum(1 for d in dates if d >= cutoff)

@@ -20,7 +20,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from loguru import logger as log
 
-from config import settings
 from db import execute_sql
 from llm.router import get_llm as get_llamacpp
 

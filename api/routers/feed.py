@@ -11,11 +11,9 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import Response
-from loguru import logger as log
 from sqlalchemy import text
 
 from api.auth import require_auth
-from config import settings
 from api.dependencies import get_db_engine
 
 router = APIRouter(prefix="/api/v1/feed", tags=["feed"])

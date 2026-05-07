@@ -24,8 +24,6 @@ from api.routers.astrogrid_helpers import (
     _build_signal_field,
     _build_snapshot_events,
     _build_snapshot_seer,
-    _classify_prediction_scoreability,
-    _compact_engine_outputs,
     _compute_full_ephemeris,
     _fallback_interpretation,
     _build_interpret_messages,
@@ -41,10 +39,6 @@ from api.routers.astrogrid_helpers import (
     _resolve_scorecard_feature,
     _load_scorecard_history,
     _solar_cycle_phase,
-    _zodiac_index,
-    _element_index,
-    _ZODIAC_ANIMALS,
-    _ELEMENTS,
 )
 
 router = APIRouter(tags=["astrogrid"])

@@ -8,7 +8,7 @@ securities reports and annual financial statements for major Japanese companies.
 from __future__ import annotations
 
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from typing import Any
 
 import requests

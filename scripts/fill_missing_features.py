@@ -27,8 +27,7 @@ import json
 import os
 import sys
 import time
-from datetime import date, datetime, timedelta, timezone
-from typing import Any
+from datetime import date, timedelta
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 os.chdir(os.path.join(os.path.dirname(__file__), ".."))
@@ -37,7 +36,6 @@ import pandas as pd
 import requests
 from loguru import logger as log
 from sqlalchemy import text
-from sqlalchemy.engine import Engine
 
 from config import settings
 from db import get_engine

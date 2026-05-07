@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import math
-from datetime import date, timedelta
-from unittest.mock import MagicMock, patch
+from datetime import date
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -242,9 +241,9 @@ class TestFundamentalDivergence:
                 # Check if this is a regime query or pmxt query based on
                 # the params
                 if args and hasattr(args[0], 'text'):
-                    query_text = str(args[0])
+                    str(args[0])
                 else:
-                    query_text = str(args[0]) if args else ""
+                    str(args[0]) if args else ""
 
                 # Return regime rows for first batch, pmxt for second
                 if call_count[0] == 1:

@@ -11,7 +11,6 @@ from datetime import date
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from loguru import logger as log
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine

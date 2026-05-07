@@ -39,7 +39,7 @@ import json
 import hashlib
 import logging
 import datetime
-from typing import Optional, Any
+from typing import Any
 
 log = logging.getLogger("grid.llm.feedback_loop")
 

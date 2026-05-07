@@ -22,9 +22,8 @@ Scheduled: weekly pull (export control actions are infrequent but high-impact).
 from __future__ import annotations
 
 import json
-import re
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from typing import Any
 
 import requests

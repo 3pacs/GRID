@@ -20,7 +20,7 @@ if _GRID_DIR not in sys.path:
     sys.path.insert(0, _GRID_DIR)
 
 from db import get_engine
-from alpha_research.data.panel_builder import build_price_panel, build_returns_panel
+from alpha_research.data.panel_builder import build_price_panel
 from alpha_research.signals.quanta_alpha import vol_price_divergence
 from alpha_research.validation.gauntlet import run_gauntlet
 from alpha_research.validation.metrics import compute_signal_metrics

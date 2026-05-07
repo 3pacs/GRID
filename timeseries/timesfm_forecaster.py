@@ -23,14 +23,16 @@ Usage:
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
-from typing import Any
+from dataclasses import dataclass
+from datetime import date
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
 from loguru import logger as log
+
+if TYPE_CHECKING:
+    from inference.timesfm_service import SignalForecast
 
 
 @dataclass(frozen=True)
@@ -392,7 +394,6 @@ def signal_forecast_to_forecast_result(
     Returns:
         ForecastResult with equivalent data.
     """
-    from inference.timesfm_service import SignalForecast as _SF  # noqa: F811
 
     predictions = list(sf.quantile_50)
     lower = list(sf.quantile_10)
@@ -433,7 +434,7 @@ def forecast_result_to_signal_forecast(
     """
     from inference.timesfm_service import SignalForecast
 
-    last_val = fr.predictions[-1] if fr.predictions else 0.0
+    fr.predictions[-1] if fr.predictions else 0.0
     median_endpoint = fr.predictions[-1] if fr.predictions else 0.0
 
     # Direction from predictions trend

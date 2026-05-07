@@ -407,10 +407,10 @@ async def expand_node(
             all_ys = [float(r[1] or 0) for r in all_board_nodes]
             board_min_x, board_max_x = min(all_xs), max(all_xs)
             board_min_y, board_max_y = min(all_ys), max(all_ys)
-            board_span_x = board_max_x - board_min_x
-            board_span_y = board_max_y - board_min_y
+            board_max_x - board_min_x
+            board_max_y - board_min_y
         else:
-            board_span_x = board_span_y = 0
+            pass
 
         # Scale radius based on how many nodes are already on the board
         # More nodes → push new ones further out

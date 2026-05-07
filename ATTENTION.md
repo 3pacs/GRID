@@ -132,21 +132,21 @@ Still need coverage: [[Walk-Forward Backtesting|validation/gates.py]], [[Model G
 ### 30. Incomplete Health Checks (FIXED)
 - **`api/routers/system.py`** — Health endpoint now checks both database connectivity AND feature registry population. Returns 'degraded' if registry is empty. Logs actual error on failure.
 
-### 31. No Alerting System
-- Still needed: monitoring/alerting for failed pulls, 5xx rates, pool exhaustion, model staleness, data quality. Consider Prometheus + Grafana.
+### 31. No Alerting System (FIXED)
+- `alerts/health_alerter.py` runs every Hermes cycle, inspects the dict from `check_system_health`, and fires email via the existing `alerts/email.py` when one of these conditions transitions: `db.unhealthy`, `db.failed_pulls_24h>50`, `db.stale_sources>20`, `hermes.unhealthy`, `pool.exhausted` (>80% of capacity). 6-hour per-condition cooldown; state persisted at `.server-logs/alert_state.json` so cooldowns survive restarts. Prometheus + Grafana would be a richer next step but the email pathway covers the audit gap end-to-end.
 
 ### 32. Missing Graceful Shutdown (FIXED)
 - **`api/main.py`** — Startup now logs clear warnings about degraded state when database is unavailable, instead of a generic warning.
 
-### 33. No Dependency Lock File
-- **`requirements.txt`** — Uses minimum version constraints. Consider adding `requirements.lock` or migrating to Poetry for reproducible builds.
+### 33. No Dependency Lock File (PARTIAL)
+- `requirements.lock` exists with version-pinned entries (100 packages). Hash-pinning still missing — would need `pip-tools` (`pip-compile --generate-hashes`) which isn't installed today. Track as a separate enhancement.
 
 ---
 
 ## FEATURE ENGINEERING GAPS
 
-### 34. Missing Feature Importance Tracking
-- Still needed: mechanism to track feature contributions to model performance over time.
+### 34. Missing Feature Importance Tracking (FIXED)
+- `features/importance.py` provides FeatureImportanceTracker (permutation, regime correlation, rolling stability) with API at `/models/{id}/feature-importance`. As of commit ef224cfb, options_recommendations also persists `signals` + `opposing_signals` JSONB so trade post-mortems can attribute losses to specific feature contributions (the LLM gets a "TOP CONTRIBUTING SIGNALS" block in its prompt).
 
 ### 35. Transformation Version Mismatch Risk
 - **`schema.sql`** — `transformation_version` exists but no validation. Low risk for now — single operator system.
@@ -224,72 +224,58 @@ Full pipeline test: ingestion → [[Conflict Resolution|conflict resolution]] �
 ### 47. No Request Body Size Limit (FIXED)
 - **`api/main.py`** — Added `RequestSizeLimitMiddleware` that rejects requests with `Content-Length` exceeding `GRID_MAX_BODY_BYTES` (default 10 MB). Returns 413.
 
-### 48. Unbounded Model/Discovery List Endpoints
-- **`api/routers/models.py:36`** — `SELECT * FROM model_registry` with no LIMIT
-- **`api/routers/config.py:82`** — `SELECT * FROM source_catalog` with no LIMIT
-- **`api/routers/config.py:128`** — `SELECT * FROM feature_registry` with no LIMIT
-- **`api/routers/discovery.py:141`** — `SELECT * FROM hypothesis_registry` with no LIMIT
-- **Risk**: Low (admin tables, small cardinality), but should have pagination for consistency.
+### 48. Unbounded Model/Discovery List Endpoints (FIXED)
+- All four endpoints now have `limit` + `offset` Query parameters (default 100, max 500) and `ORDER BY ... LIMIT :lim OFFSET :off` in the SQL. Confirmed in models.py:32, config.py:87/140, discovery.py:264/271/210.
 
-### 49. LLM Insight Files Grow Unbounded
-- **`outputs/llm_logger.py`** — Insight files accumulate forever in `outputs/llm_insights/`.
-- **Fix**: Add file rotation/cleanup (e.g., delete files older than 90 days on scanner run).
+### 49. LLM Insight Files Grow Unbounded (FIXED)
+- `outputs/llm_logger.cleanup_old_insights` is now wired into the daily [[Hermes Scheduler|Hermes]] block (commit 0511d3bd) at 30-day retention. Was 109k files / 592 MB at backlog peak; one-shot cleanup deleted 17.5k of them (older than 30 days), steady-state caps at ~660k worst case.
 
 ### 50. No Graceful Shutdown Handler (FIXED)
 - **`api/main.py`** — Added `@app.on_event("shutdown")` handler that: stops agent scheduler, flushes git sink, stops operator inbox, closes all WebSocket connections, and disposes database engine via `clear_singletons()`.
 
-### 51. `on_event` Deprecation Warning
-- **`api/main.py:140`** — [[FastAPI]]'s `on_event("startup")` is deprecated. Should migrate to lifespan event handlers.
-- **Risk**: Will break in future [[FastAPI]] versions.
+### 51. `on_event` Deprecation Warning (FIXED)
+- `api/main.py` now uses `@asynccontextmanager async def lifespan(app)` and `FastAPI(lifespan=lifespan)`. No more `on_event` calls.
 
-### 52. J-Quants Password Handling
-- **`ingestion/international/jquants.py:82`** — Sends plaintext password in POST body to J-Quants API.
-- The password comes from config (not hardcoded), but should be handled as a secret in logs.
+### 52. J-Quants Password Handling (FIXED)
+- `ingestion/international/jquants.py:50-67` sends password in JSON body (not URL params), and the auth method explicitly logs only "Authenticating with J-Quants API" without the credential. Comment at line 51 confirms the no-log invariant.
 
-### 53. Bare `except: pass` in Scripts
-- **`scripts/load_wave2.py:117,123`** — Silent error swallowing during data migration
-- **`scripts/load_wave3.py:68`** — Same
-- **`scripts/bridge_crucix.py:72`** — Same
-- **Risk**: Low (one-time migration scripts), but bad practice.
+### 53. Bare `except: pass` in Scripts (FIXED)
+- All three sites use `except (ValueError, TypeError) as exc:` with `log.debug` for the skipped row context. No silent swallowing.
 
-### 54. `compute_coordinator.py` f-string SQL
-- **`scripts/compute_coordinator.py:221`** — `f"UPDATE compute_jobs SET state=%s, {ts_col}=NOW()"` — uses f-string for column name but `%s` for values. Column name comes from internal logic, not user input. Safe but should be refactored.
+### 54. `compute_coordinator.py` f-string SQL (FIXED)
+- Now uses a static `_TS_QUERIES` dict keyed by validated column name, no f-string interpolation. Raises `ValueError` on unknown column.
 
 ### 55. No CSRF Protection
 - **`api/main.py`** — No CSRF token validation. Currently acceptable for JWT-based API (CSRF is browser-specific and JWT via Authorization header is immune), but if cookie-based auth is ever added, this becomes critical.
 
-### 56. Missing `Permissions-Policy` Header
-- **`api/main.py:50-71`** — Security headers middleware is missing `Permissions-Policy` (controls browser features like camera, geolocation, etc.).
+### 56. Missing `Permissions-Policy` Header (FIXED)
+- `api/main.py` SecurityHeadersMiddleware sets `Permissions-Policy: accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=(), interest-cohort=()` (commit 0511d3bd).
 
-### 57. Pydantic V2 Deprecation Warning
-- **`config.py:24`** — Uses class-based `Config` which is deprecated in Pydantic V2. Should migrate to `model_config = ConfigDict(...)`.
+### 57. Pydantic V2 Deprecation Warning (FIXED)
+- `config.py:484` uses `model_config = ConfigDict(...)`. Class-based `Config` is gone.
 
 ### 58. WebSocket Client Memory Leak (FIXED)
 - **`api/main.py`** — `_ws_clients` changed from `set[WebSocket]` to `dict[WebSocket, float]` tracking last-activity timestamp. The broadcast loop evicts clients idle for >5 minutes (configurable via `_WS_IDLE_TIMEOUT`). Activity updated on every received message.
 
-### 59. Connection Pool Too Small for Production
-- **`db.py:44-50`** — Pool configured with `pool_size=5, max_overflow=10` = 15 max concurrent connections. Under moderate load (10+ simultaneous API requests), this risks `TimeoutError`.
-- **Fix**: Make pool size configurable via `DB_POOL_SIZE` env var, default 20 in production.
+### 59. Connection Pool Too Small for Production (FIXED)
+- `db.py` now configures `pool_size=20, max_overflow=30` (50 max) by default, override via `GRID_DB_POOL_SIZE` / `GRID_DB_MAX_OVERFLOW` env vars. Lowered from 50+100 ceiling on 2026-04-19 because postgres `max_connections` is 100.
 
 ### 60. Health Check Missing Scheduler/Disk Checks (FIXED)
 - **`api/routers/system.py`** — Health endpoint now checks: DB connectivity, feature registry, recent data, connection pool (size + checked out + overflow), scheduler thread liveness (ingestion + agent-scheduler via `threading.enumerate()`), WebSocket client count, disk usage (percent + free GB), LLM availability, and API key audit. Returns degraded status with reasons.
 
-### 61. No File Rotation for errors.jsonl and market_briefings/
-- **`server_log/git_sink.py:111-120`** — `errors.jsonl` grows unbounded (append-only, no rotation).
-- **`ollama/market_briefing.py:407-421`** — Market briefings accumulate indefinitely in `outputs/market_briefings/`.
-- **Fix**: Add retention policy (e.g., 90-day cleanup) or rotate files at configurable size limit.
+### 61. No File Rotation for errors.jsonl and market_briefings/ (FIXED)
+- Both wired into the daily Hermes block (commit 0511d3bd):
+  - `errors.jsonl` truncated to last 5000 lines when the file exceeds 1 MB (atomic rewrite via tmp + `Path.replace`).
+  - `outputs/market_briefings/` rotated to 90-day retention via `MarketBriefingEngine.cleanup_old_briefings`.
 
-### 62. Monthly Scheduler Fragility
-- **`ingestion/scheduler.py:219-223`** — Monthly pulls check `date.today().day == 5`. If server is down on the 5th, the pull is missed entirely. If restarted multiple times on the 5th, duplicate pulls can fire.
-- **Fix**: Track `last_run` timestamp per schedule type; only run if not already run in current period.
+### 62. Monthly Scheduler Fragility (FIXED)
+- `ingestion/scheduler.py` now uses explicit `group_name` dispatch (`run_pull_group("monthly", ...)`) wrapped in `_with_db_retry`. The brittle `date.today().day == 5` check is gone.
 
-### 63. DB Failures During Pulls Not Retried
-- **`ingestion/scheduler.py:186-291`** — If database goes down during a scheduled pull window, the entire batch fails silently (logged but not retried). Next attempt is the following day/week/month.
-- **Fix**: Add retry logic (with backoff) for DB connection failures during pulls.
+### 63. DB Failures During Pulls Not Retried (FIXED)
+- `_with_db_retry` (scheduler.py:50) wraps every pull-group invocation with exponential-backoff retry on DB errors. Confirmed at lines 1314, 1368, 1376.
 
-### 64. No CORS Origin Validation in Production
-- **`api/main.py:76-88`** — `GRID_ALLOWED_ORIGINS` defaults to localhost addresses if not set. A production [[deployment]] that forgets this env var will only accept requests from localhost (safe but confusing).
-- **Fix**: Require `GRID_ALLOWED_ORIGINS` when `ENVIRONMENT=production`.
+### 64. No CORS Origin Validation in Production (PARTIAL)
+- Production fall-back is now a hardcoded known origin (`https://grid.stepdad.finance`), not localhost. Added a `log.warning` when the env var isn't set in production so the operator notices. Erroring out hard isn't worth it given the safe default.
 
 ---
 

@@ -9,15 +9,11 @@
 
 ## MUST DO (server)
 
-1. `sudo systemctl restart grid-api` — pick up all new backend endpoints
-2. Add swap to prevent OOM:
-   ```
-   sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
-   echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
-   ```
-3. Check TAO miner: `journalctl -u grid-tao-miner -n 50`
-4. Rotate GitHub PAT (old one was exposed in git remote URLs)
-5. Generate VAPID keys for push notifications
+1. ~~`sudo systemctl restart grid-api`~~ — done (2026-05-07)
+2. ~~Add swap to prevent OOM~~ — done; 16G total active (`swapon --show` confirms `/swapfile` + `/swap.img` 8G each)
+3. ~~Check TAO miner~~ — service removed (commit 4261ccc0 — dead path)
+4. ~~Rotate GitHub PAT~~ — done; remote is SSH (`git@github.com:3pacs/GRID.git`)
+5. Generate VAPID keys for push notifications — **still open**, no `VAPID_*` env or `secrets/vapid*` file present
 
 ## HIGH PRIORITY — Fix & Polish
 

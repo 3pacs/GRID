@@ -5,7 +5,7 @@ backtests whenever it is supposed to.
 
 ## Findings
 
-1. **`scripts/walk_forward_validate.py` was orphaned** — a full walk-forward
+1. **`scripts/walk_forward_validate.py` was orphaned** — a full [[Walk-Forward Backtesting|walk-forward]]
    backtest harness with its own CLI, but no systemd unit, cron, or in-process
    schedule entry invoked it. Nothing was running it automatically.
 

@@ -10,13 +10,12 @@ No authentication required.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import requests
 from loguru import logger as log
 from sqlalchemy import text
-from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, retry_on_failure
 

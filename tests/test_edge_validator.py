@@ -20,7 +20,6 @@ from datetime import date, timedelta
 from typing import Any
 from unittest.mock import patch
 
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -28,7 +27,6 @@ from intelligence.supply_chain_edge_validator import (
     EdgeRow,
     MIN_OBSERVATIONS,
     ValidationResult,
-    WEAK_CORRELATION_FLOOR,
     WEAK_MIN_DURATION_DAYS,
     compute_edge_correlation,
     next_edge_state,

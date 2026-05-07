@@ -17,7 +17,7 @@ Only scores decisions with at least 1 trading day of forward SPY data.
 from __future__ import annotations
 
 import sys
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 
 # Add project root to path

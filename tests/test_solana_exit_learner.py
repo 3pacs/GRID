@@ -13,13 +13,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from trading.solana.exit_learner import (
-    PRIOR_STDDEV,
     REWARD_CLIP_HIGH,
     REWARD_CLIP_LOW,
     ExitLearner,
     _clip_reward,
 )
-from trading.solana.exit_policy import CONSERVATIVE, SEED_VARIANTS, BALANCED
+from trading.solana.exit_policy import SEED_VARIANTS
 from trading.solana.exit_state import VariantStatsRow
 
 

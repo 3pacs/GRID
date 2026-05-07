@@ -1,9 +1,7 @@
 """Tests for scripts.ux_auditor — UX audit engine."""
 
-import pytest
 
 from scripts.ux_auditor import (
-    _test_endpoint,
     _test_journey,
     _truncate_sample,
     _parse_ux_analysis,

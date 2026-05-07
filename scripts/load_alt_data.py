@@ -1,6 +1,5 @@
 import psycopg2
 import requests
-import json
 import time
 from datetime import datetime, timedelta
 from loguru import logger as log

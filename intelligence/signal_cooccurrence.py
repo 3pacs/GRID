@@ -47,7 +47,7 @@ key unique and cuts storage in half.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from itertools import combinations
 from typing import Any

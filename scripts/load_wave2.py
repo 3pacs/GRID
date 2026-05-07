@@ -1,5 +1,7 @@
-import psycopg2, requests, json, time, os
-from datetime import datetime, timedelta
+import psycopg2
+import requests
+import time
+from datetime import datetime
 from loguru import logger as log
 from config import settings
 

@@ -28,7 +28,7 @@ Known examples of "I almost built it but it already exists" (from the 2026-04-13
 - `intelligence/hypothesis_engine.py` — LLM-driven hypothesis generation with kill criteria.
 - `intelligence/prediction_calibration.py` — Brier / reliability tracking (but not persisted, not per-horizon).
 - `intelligence/signal_registry.py` + `signal_backlinker.py` + `signal_extractor.py` — signal inventory.
-- `physics/dealer_gamma.py` — vanna and charm are computed at lines 248-250 but never used in scoring.
+- `physics/dealer_gamma.py` — [[Dealer Gamma|vanna]] and charm are computed at lines 248-250 but never used in scoring.
 - **Sector networks** (refactored post-merge): the standalone `banking_network.py` / `energy_network.py` / `pharma_network.py` / `defense_contractors.py` / `tech_monopoly_network.py` / `real_estate_network.py` / `commodities_agriculture_network.py` / `defi_protocols.py` / `media_network.py` / `swf_network.py` modules have been consolidated into `intelligence/sector_networks/*.yaml` loaded by `intelligence/sector_networks/loader.py`. Extend the YAML files, not the deleted Python modules.
 
 Full session orientation: **`docs/planning/SESSION-ROADMAP-2026-04-13.md`**.
@@ -127,9 +127,9 @@ Every live prediction runs through `intelligence.signal_provenance.build_provena
 | prediction_market_arb | intelligence/prediction_market_arbitrage | [0.95, 1.10] | per-ticker × horizon |
 | convergence | intelligence/signal_convergence_scanner | [0.92, 1.25] | per-ticker × direction × 7d |
 
-Run `python3 -m scripts.audit_conviction_stack` for the full offline puzzle map (taxonomy, entry points, orthogonality hypothesis per layer, redundancy check). Run `python3 -m scripts.call_a_trade` to see a worked TSM example with every adjuster shown in the `adjusters:` ticket line.
+Run `python3 -m scripts.audit_conviction_stack` for the full offline puzzle map (taxonomy, entry points, [[Orthogonality Audit|orthogonality]] hypothesis per layer, redundancy check). Run `python3 -m scripts.call_a_trade` to see a worked TSM example with every adjuster shown in the `adjusters:` ticket line.
 
-**Data state on grid-svr as of 2026-04-14:** 31,793 oracle_predictions · 1,312 scored · 61k signal_sources · 2.2M resolved_series (1947→2026) · 1,188 eligible features. Calibration tables populating: per_signal_brier=1 (aggregate only — oracle doesn't yet write Shapley contributions), confidence_bucket=3, signal_cooccurrence=410, regime_brier=0 (blocked on oracle enrichment), meta_learning=0 (same block).
+**Data state on grid-svr as of 2026-04-14:** 31,793 oracle_predictions · 1,312 scored · 61k signal_sources · 2.2M [[Resolved Series Table|resolved_series]] (1947→2026) · 1,188 eligible features. Calibration tables populating: per_signal_brier=1 (aggregate only — oracle doesn't yet write Shapley contributions), confidence_bucket=3, signal_cooccurrence=410, regime_brier=0 (blocked on oracle enrichment), meta_learning=0 (same block).
 
 **Known gap:** `oracle/engine.py` write path doesn't populate `signals.{regime,fci_regime,vix_level,signal_contributions}` JSONB keys, which blocks the per-signal / per-regime / meta-learning calibrators from learning anything beyond the aggregate. Fix in progress in a gap-fix agent worktree.
 
@@ -137,20 +137,20 @@ Run `python3 -m scripts.audit_conviction_stack` for the full offline puzzle map 
 
 **Authoritative inventory:** [`docs/MODULE_INVENTORY.md`](docs/MODULE_INVENTORY.md) — generated 2026-04-13, catalogs all 649 modules across 30 directories with docstrings, public APIs, DB table I/O, and import graphs. Read this BEFORE creating any new intelligence module to avoid duplication.
 
-The intelligence layer tracks who moves markets and why. The top-level `intelligence/` tree contains 143 modules (the original "14-module scaffold" is historical and should no longer be cited). Below are the most load-bearing ones; see MODULE_INVENTORY.md for the rest and for every `physics/`, `features/`, `discovery/`, `oracle/`, `analysis/`, `inference/` module alongside.
+The intelligence layer tracks who moves markets and why. The top-level `intelligence/` tree contains 143 modules (the original "14-module scaffold" is historical and should no longer be cited). Below are the most load-bearing ones; see [[MODULE_INVENTORY]].md for the rest and for every `physics/`, `features/`, `discovery/`, `oracle/`, `analysis/`, `inference/` module alongside.
 
-- `intelligence/actor_network.py` (153 LOC façade) — thin re-export shim; the real actor network now lives in the `intelligence/actors/` subpackage (db, registry, expand, etc.). Do not edit the façade — extend the subpackage.
+- `intelligence/actor_network.py` (153 LOC façade) — thin re-export shim; the real [[Actor Network|actor network]] now lives in the `intelligence/actors/` subpackage (db, registry, expand, etc.). Do not edit the façade — extend the subpackage.
 - `intelligence/actor_discovery.py` (3,533 LOC) — automated actor discovery & enrichment at 250K+ scale (board interlocks, 3-degree expansion, ICIJ import)
 - `intelligence/causation.py` (26 LOC re-export shim) — real logic split across `causation_core.py` (194), `causation_graph.py` (1,178), `causation_scoring.py` (1,089). Extend the split modules, not the shim.
 - `intelligence/sector_networks/` (YAML-driven) — banking / energy / pharma / defense / tech_monopoly / real_estate / commodities / defi / media / sovereign_wealth actor meshes, loaded by `sector_networks/loader.py`. Replaces the prior standalone `*_network.py` modules.
 - `intelligence/global_levers.py` (2,258 LOC) — macro lever identification
 - `intelligence/hypothesis_engine.py` (2,137 LOC) — hypothesis generation, scoring, kill
 - `intelligence/deep_graph.py` (1,772 LOC) — multi-hop graph traversal engine
-- `intelligence/cross_reference.py` (1,435 LOC) — government stats vs physical reality (lie detector)
+- `intelligence/cross_reference.py` (1,435 LOC) — government stats vs physical reality ([[Cross Reference|lie detector]])
 - `intelligence/entity_resolver.py` (1,411 LOC) — canonical actor disambiguation
 - `intelligence/lever_pullers.py` (1,376 LOC) — identifies market-moving actors across 5 categories
 - `intelligence/postmortem.py` (1,344 LOC) — automated failure analysis for bad trades
-- `intelligence/trust_scorer.py` (1,100 LOC) — Bayesian trust scoring with recency decay
+- `intelligence/trust_scorer.py` (1,100 LOC) — [[Trust Scorer|Bayesian trust]] scoring with recency decay
 
 **Canonical scoring/flow stack** (also referenced in other sections): `trust_scorer`, `dollar_flows`, `flow_aggregator`, `flow_thesis`, `forensics`, `event_sequence`, `thesis_tracker`, `sleuth`, `source_audit`. The original 14-module description in prior CLAUDE.md revisions is now historical — do not use it as the working model; always reconcile against MODULE_INVENTORY.md.
 

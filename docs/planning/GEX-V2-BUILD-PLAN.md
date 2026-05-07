@@ -12,7 +12,7 @@
 
 ## 1. Intro — The Unlock
 
-GRID currently has a production-grade **equity** dealer-gamma engine (`DealerGammaEngine` in `physics/dealer_gamma.py`) that computes GEX, gamma flip, call/put walls, vanna and charm — vectorized, DB-backed, wired into `options_recommender.py`. What it does **not** have is: (a) coverage of **crypto options** (Deribit/OKX/Bybit), where dealer flow is the dominant intraday signal because expiries compress into hours and retail is concentrated; (b) the three higher-order Greeks the V2 spec requires — **vomma (VOEX), color (COLEX), zomma (ZEX), speed (SPEEDEX)**; (c) a **normalized contract schema** that abstracts across venues with explicit `contract_size`, `settlement_currency`, and provenance tracking; and (d) a **venue-adapter pattern** that lets us bolt on new exchanges without touching the exposure engine. GEX V2 closes all four gaps so that the `chain_contagion.py` → `oracle/engine.py` → `contagion_to_ticket.py` → `options_recommender.py` pipeline can emit **crypto dealer-flow-conditioned trade tickets** with identical semantics to the equity path. The endgame: Deribit 0DTE BTC chain hits the pipeline at T+30s, a gamma-flip breach shows up as a dealer-flow shock in `chain_contagion`, oracle tags it with `negative_gamma_breakout_candidate`, and `options_recommender` sizes a Kelly position against it — all in the same plumbing that already ships for SPY/QQQ/TSMC.
+GRID currently has a production-grade **equity** dealer-gamma engine (`DealerGammaEngine` in `physics/dealer_gamma.py`) that computes GEX, gamma flip, call/put walls, [[Dealer Gamma|vanna]] and charm — vectorized, DB-backed, wired into `options_recommender.py`. What it does **not** have is: (a) coverage of **crypto options** (Deribit/OKX/Bybit), where dealer flow is the dominant intraday signal because expiries compress into hours and retail is concentrated; (b) the three higher-order Greeks the V2 spec requires — **vomma (VOEX), color (COLEX), zomma (ZEX), speed (SPEEDEX)**; (c) a **normalized contract schema** that abstracts across venues with explicit `contract_size`, `settlement_currency`, and provenance tracking; and (d) a **venue-adapter pattern** that lets us bolt on new exchanges without touching the exposure engine. GEX V2 closes all four gaps so that the `chain_contagion.py` → `oracle/engine.py` → `contagion_to_ticket.py` → `options_recommender.py` pipeline can emit **crypto dealer-flow-conditioned trade tickets** with identical semantics to the equity path. The endgame: Deribit 0DTE BTC chain hits the pipeline at T+30s, a gamma-flip breach shows up as a dealer-flow shock in `chain_contagion`, oracle tags it with `negative_gamma_breakout_candidate`, and `options_recommender` sizes a Kelly position against it — all in the same plumbing that already ships for SPY/QQQ/TSMC.
 
 ---
 
@@ -218,7 +218,7 @@ def confidence_score(snapshot: pd.DataFrame, metrics: dict) -> float: ...  # ret
 **Test criteria**:
 - Migration applies cleanly on a throwaway Postgres 15 container with `sqlalchemy.create_engine` reflection.
 - Reverse migration (`DROP TABLE ... CASCADE`) included in a sibling `.down.sql` (or inline comment).
-- TimescaleDB hypertable on `option_snapshots_raw` partitioned by `source_ts_utc` (1-day chunks).
+- [[TimescaleDB]] hypertable on `option_snapshots_raw` partitioned by `source_ts_utc` (1-day chunks).
 - `option_exposures` primary key: `(venue, underlying, snapshot_id)`.
 - Indexes on `(underlying, source_ts_utc DESC)` for all 3 tables.
 - **No `DROP` of existing `options_snapshots`** — V2 tables are additive, equity path keeps working.
@@ -300,7 +300,7 @@ def get_v2_dealer_flow(underlying: str, venue: str = "deribit") -> DealerFlowSig
 **Risk**: **HIGH**. This is the integration wave that exposes V2 to live money. Mitigations:
 - Gate by `confidence_score >= 0.7` hardcoded in Wave 5 v1; relax in later iteration.
 - Wave 5 must ship with a **kill switch** feature flag (`ENABLE_V2_CRYPTO_TICKETS=false` default) so we can toggle off without redeploy.
-- All V2 tickets flagged in `decision_journal` with `source='gex_v2'` for post-mortem.
+- All V2 tickets flagged in `decision_journal` with `source='gex_v2'` for [[Postmortem|post-mortem]].
 - Do NOT wire to `scripts/live_trader.py` in this wave — Wave 5 produces tickets, does not execute them.
 **Follow-up mapping**: **Queue as new task GEX-7** after GEX-6 merges. Not in the existing queue.
 
@@ -318,7 +318,7 @@ The V2 signal is NOT bypassing `options_recommender`; it feeds it via the same t
 V2 registers `crypto_dealer_flow` as a new signal type in `oracle/engine.py`. Evaluation window **1 hour** (shorter than equity's 1-day window because crypto expiries are daily/weekly and intraday rehedging is dominant). Starting trust prior: 0.8 (high — dealer flow is mechanical, not discretionary). Trust decays per `intelligence/trust_scorer.py` (90-day half-life).
 
 ### 5.3 Upstream: `intelligence/chain_contagion.py`
-V2 pipeline is an **upstream producer** of shock events for `chain_contagion`. When `net_gex` flips sign between consecutive snapshots, or when spot breaches the `gamma_flip`, `chain_contagion` ingests a `DealerFlowShock` event (new event type in Wave 5). Downstream, `chain_contagion` can cross-reference this with other signals (funding rate spikes, whale flows) to raise conviction.
+V2 pipeline is an **upstream producer** of shock events for `chain_contagion`. When `net_gex` flips sign between consecutive snapshots, or when spot breaches the `gamma_flip`, `chain_contagion` ingests a `DealerFlowShock` event (new event type in Wave 5). Downstream, `chain_contagion` can [[Cross Reference|cross-reference]] this with other signals (funding rate spikes, whale flows) to raise conviction.
 
 ### 5.4 Frontend: `pwa/src/views/canvas_lenses/CapitalLens.jsx`
 V2 surfaces on the Canvas as a new **"Dealer Flow — Crypto"** sub-lens inside `CapitalLens`. Visualization:
@@ -326,14 +326,14 @@ V2 surfaces on the Canvas as a new **"Dealer Flow — Crypto"** sub-lens inside 
 - Gamma flip as a dashed line
 - Regime tag badge (`negative_gamma_breakout_candidate`, etc.) next to the underlying
 - Confidence score as the node border opacity
-Read path: `useAsyncData('/api/derivatives/v2/dealer_flow/BTC')`. Refresh every 60s via existing event bus. No new state management — reuse existing Zustand store.
+Read path: `useAsyncData('/api/derivatives/v2/dealer_flow/BTC')`. Refresh every 60s via existing event bus. No new state management — reuse existing [[Zustand]] store.
 
 ---
 
 ## 6. Schema Migration Plan — `migrations/0037_options_v2_schema.sql`
 
 Next migration number confirmed by listing `migrations/versions/`: latest is `0036_user_intel.sql`.
-**Full SQL body below. DO NOT DEPLOY — Wave 3/GEX-5 executes this.**
+**Full SQL body below. DO NOT [[DEPLOY]] — Wave 3/GEX-5 executes this.**
 
 ```sql
 -- migrations/versions/0037_options_v2_schema.sql
@@ -568,7 +568,7 @@ Total net LOC across V2 build: **~2,670** (ignoring the Wave 4 dedup reduction).
 
 - **No execution code.** V2 produces signals and trade tickets; it does NOT place orders. Wave 5 stops at ticket emission; execution is gated by the existing `trading/signal_executor.py` which stays behind `ENABLE_V2_CRYPTO_TICKETS=false` until post-mortem data exists.
 - **No OKX / Bybit adapters in this plan.** Deribit-only through Wave 5; other venues are GEX-8 backlog.
-- **No ML / walk-forward backtests.** Phase 3 of the spec (§19 "Research alpha layer") is out of scope for GEX V2 build. V2 ships the feature factory; ML is a separate follow-up.
+- **No ML / [[Walk-Forward Backtesting|walk-forward]] backtests.** Phase 3 of the spec (§19 "Research alpha layer") is out of scope for GEX V2 build. V2 ships the feature factory; ML is a separate follow-up.
 - **No retirement of `options_snapshots`**. The existing equity table and its pipeline stay live forever. V2 is purely additive.
 
 ---

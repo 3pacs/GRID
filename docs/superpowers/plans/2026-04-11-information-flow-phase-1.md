@@ -1,12 +1,12 @@
 # Information Flow Phase 1 — Contracts Infrastructure Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-[[development]] (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Ship the `contracts/` infrastructure layer — schemas, correlation ids, emit helpers, router, dead-letter store, dispatcher, retry scheduler, observability, and API endpoints — with zero behaviour change to any existing module. Phase 2 will wire actual contracts on top of this foundation.
 
-**Architecture:** Thin adapter layer above existing `events/bus.py`. Producers call `contracts.emit(ContractInstance)`; emit writes a row to `contracts_audit`, propagates `correlation_id` through `ContextVar`, and forwards to the existing `EventBus.emit_sync()` fan-out. A `Dispatcher` subscribes to each routed channel, validates payloads against Pydantic schemas, invokes handlers in a bounded thread pool, and writes failures to `contracts_dead_letter` for automatic retry (1min/10min/1hr) or manual replay at any time.
+**[[architecture|Architecture]]:** Thin adapter layer above existing `events/bus.py`. Producers call `contracts.emit(ContractInstance)`; emit writes a row to `contracts_audit`, propagates `correlation_id` through `ContextVar`, and forwards to the existing `EventBus.emit_sync()` fan-out. A `Dispatcher` subscribes to each routed channel, validates payloads against Pydantic schemas, invokes handlers in a bounded thread pool, and writes failures to `contracts_dead_letter` for automatic retry (1min/10min/1hr) or manual replay at any time.
 
-**Tech Stack:** Python 3.11, Pydantic v2 (`BaseModel`, frozen + `extra="forbid"`), SQLAlchemy 2.0 (`text().bindparams()` only — no f-string SQL per security rules), pytest, FastAPI, existing `events/bus.py` module, existing `tests/conftest.py` fixtures (`mock_engine`, `pg_engine`).
+**Tech Stack:** Python 3.11, Pydantic v2 (`BaseModel`, frozen + `extra="forbid"`), [[SQLAlchemy]] 2.0 (`text().bindparams()` only — no f-string SQL per security rules), pytest, [[FastAPI]], existing `events/bus.py` module, existing `tests/conftest.py` fixtures (`mock_engine`, `pg_engine`).
 
 **Spec reference:** `docs/superpowers/specs/2026-04-11-information-flow-optimization-design.md` — Phase 1 is §7 "Phase 1 — Infrastructure (no behaviour change)".
 

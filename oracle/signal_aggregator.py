@@ -13,7 +13,6 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
-from loguru import logger as log
 
 
 class WeightMode(str, Enum):

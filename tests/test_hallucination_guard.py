@@ -12,7 +12,7 @@ from datetime import date, datetime, timezone
 import pytest
 
 from oracle.engine import AntiSignal, OraclePrediction, PredictionType, Signal
-from oracle.hallucination_guard import GuardCheck, GuardVerdict, guard_summary, verify_predictions
+from oracle.hallucination_guard import guard_summary, verify_predictions
 
 
 # ── Mock calibration report ────────────────────────────────────────────────

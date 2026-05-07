@@ -21,8 +21,6 @@ import pytest
 
 from intelligence.pair_conviction import (
     DEFAULT_PAIR_CANDIDATES,
-    MIN_LEG_CONVICTION,
-    MIN_SPREAD_SHARPNESS,
     PAIR_KELLY_CAP,
     PairCandidate,
     PairLeg,

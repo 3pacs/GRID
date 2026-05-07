@@ -351,9 +351,9 @@ def _from_deal_pipeline(engine: Engine) -> int:
             acquirer = r[3] or ""
             target_co = r[4] or ""
             headline = r[5] or f"{deal_type}: {acquirer} / {target_co}"
-            direction = (r[6] or "neutral").lower()
+            (r[6] or "neutral").lower()
             probability = r[7] or 0.25
-            confidence = r[8] or 0.5
+            r[8] or 0.5
             detected_at = r[9]
             deal_value = r[10]
             article_url = r[11]
@@ -498,7 +498,7 @@ def _from_earnings(engine: Engine) -> int:
             tone_shift = r[4]
             confidence = r[5] or 0.5
             fwd_count = r[6] or 0
-            guidance = r[7]  # JSONB
+            r[7]  # JSONB
 
             ann_date = filing_date or date.today()
 

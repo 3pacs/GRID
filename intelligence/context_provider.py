@@ -11,7 +11,6 @@ All functions return formatted strings ready to inject into LLM prompts.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any
 
 from loguru import logger as log
 from sqlalchemy import text

@@ -19,7 +19,6 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any
 
-import numpy as np
 import pandas as pd
 from loguru import logger as log
 from sqlalchemy import text

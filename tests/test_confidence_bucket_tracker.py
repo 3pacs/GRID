@@ -16,18 +16,12 @@ from typing import Any
 import pytest
 
 from intelligence.confidence_bucket_tracker import (
-    CONFIDENCE_BUCKETS,
-    GAP_THRESHOLD_HIGH,
-    GAP_THRESHOLD_MILD,
-    GAP_THRESHOLD_SEVERE,
-    GAP_THRESHOLD_UNDERCONF_STRONG,
     MULT_HIGH_OVERCONF,
     MULT_MILD_OVERCONF,
     MULT_MILD_UNDERCONF,
     MULT_NEUTRAL,
     MULT_SEVERE_OVERCONF,
     MULT_STRONG_UNDERCONF,
-    BucketCalibration,
     _bucket_for,
     _compute_gap,
     _ensure_schema,

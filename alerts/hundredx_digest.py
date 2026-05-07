@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date
 from typing import Any
 
 import pandas as pd
@@ -29,7 +29,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from alerts.email import _render_html, _send_in_thread, _send, _section_text
+from alerts.email import _render_html, _send_in_thread, _section_text
 
 
 def _get_engine():
@@ -71,9 +71,8 @@ def _sanity_check(opp) -> list[str]:
 
     # Total OI should be at least 1000 for any liquid ticker
     # (near-expiry garbage has OI < 100)
-    total_oi = 0
     if hasattr(opp, 'signals') and isinstance(opp.signals, dict):
-        oi_sig = opp.signals.get("oi_concentration", {})
+        opp.signals.get("oi_concentration", {})
         # Try to get total_oi from the raw signals
     # Check from the MispricingOpportunity attributes
     if hasattr(opp, 'signals') and 'total_oi' in str(opp.signals):
@@ -316,7 +315,7 @@ def _verify_opportunity(ticker: str, opp: dict, engine: Engine) -> dict:
                 # Unusual volume (>5x average OI)
                 import numpy as np
                 oi_arr = [x for x in all_oi if x and x > 0]
-                vol_arr = [x for x in all_vol if x and x > 0]
+                [x for x in all_vol if x and x > 0]
                 if oi_arr:
                     mean_oi = np.mean(oi_arr)
                     for _, row in chain.calls.iterrows():

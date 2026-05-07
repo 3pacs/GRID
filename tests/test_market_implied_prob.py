@@ -4,10 +4,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
-import pytest
 
 from intelligence.market_implied_prob import (
-    DivergenceReport,
     MarketImpliedProb,
     _norm_cdf,
     compare_to_oracle,

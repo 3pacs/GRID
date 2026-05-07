@@ -18,7 +18,6 @@ from intelligence.forensic_journal import (
     classify_root_cause,
     compose_narrative_template,
     compute_failure_multiplier,
-    ensure_postmortem_table,
     get_failing_signals,
     get_recent_postmortems,
     is_high_confidence_failure,

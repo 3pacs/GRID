@@ -1,6 +1,6 @@
 # GRID Refactoring Report
 **Generated:** March 30, 2026
-**Codebase Size:** ~230K LOC (excluding venv and migrations)
+**Codebase Size:** ~230K LOC (excluding venv and [[migrations]])
 **Status:** Research & Analysis Phase (No code changes made)
 
 ---

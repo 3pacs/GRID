@@ -1,7 +1,7 @@
 # URGENT: Fix Duplicate Prediction Writes
 
 **Status:** OPEN — high priority
-**Discovered:** 2026-04-28 during walk-forward audit
+**Discovered:** 2026-04-28 during [[Walk-Forward Backtesting|walk-forward]] audit
 **Owner:** Anik (decisions) + agent (implementation)
 
 ## The Problem
@@ -51,7 +51,7 @@ Pick one:
   as new signals arrive.
 - **C. One prediction per (ticker, direction, expiry, model_version).**
   Allows re-prediction when the model changes (e.g., trace_evolver mutates
-  weights). Cleanest semantics for the post-mortem feedback loop.
+  weights). Cleanest semantics for the [[Postmortem|post-mortem]] feedback loop.
 
 **Recommendation: option C** — it lines up with the trace_evolver flow.
 A model change → fresh prediction; otherwise → no-op.

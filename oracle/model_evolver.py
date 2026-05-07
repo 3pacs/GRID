@@ -7,9 +7,10 @@ spawns mutations/crossovers of top performers, seeds from hypothesis discoveries
 """
 
 from __future__ import annotations
-import json, random, string
+import json
+import random
+import string
 from dataclasses import dataclass, field
-from typing import Any
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine

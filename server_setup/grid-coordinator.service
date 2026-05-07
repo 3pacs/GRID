@@ -6,8 +6,8 @@ Wants=postgresql.service
 [Service]
 Type=simple
 User=grid
-WorkingDirectory=/home/grid/grid_v4/grid_repo/grid
-EnvironmentFile=/home/grid/grid_v4/grid_repo/grid/.env
+WorkingDirectory=/home/grid/grid_v4/grid_repo
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
 ExecStart=/usr/bin/python3 -m uvicorn scripts.compute_coordinator:app --host 0.0.0.0 --port 8100
 Restart=always
 RestartSec=10

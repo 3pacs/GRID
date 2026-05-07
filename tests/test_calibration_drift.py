@@ -9,12 +9,9 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from oracle.calibration import (
     DriftAlert,
-    _DRIFT_MIN_HISTORY,
-    _DRIFT_MIN_SCORED,
     detect_calibration_drift,
     snapshot_calibration_history,
 )

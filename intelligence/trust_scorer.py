@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -423,7 +423,7 @@ def update_trust_scores(engine: Engine) -> dict[str, Any]:
     Returns ranked list of source dicts.
     """
     _ensure_tables(engine)
-    now = datetime.now(timezone.utc)
+    datetime.now(timezone.utc)
     today = date.today()
     decay_lambda = math.log(2) / RECENCY_HALF_LIFE_DAYS
 
@@ -461,7 +461,6 @@ def update_trust_scores(engine: Engine) -> dict[str, Any]:
             raw_hits = 0
             raw_misses = 0
             hit_returns: list[float] = []
-            lead_times: list[float] = []
             ticker_hits: dict[str, int] = {}
             ticker_totals: dict[str, int] = {}
             last_signal_date = None
@@ -1020,13 +1019,13 @@ def _get_llm_trust_narrative(
 
     prompt = (
         "You are analyzing signal source trust scores for GRID.\n\n"
-        f"Top 5 trusted sources:\n"
+        "Top 5 trusted sources:\n"
         + "\n".join(
             f"  {s['source_type']}/{s['source_id']}: trust={s['trust_score']:.3f}, "
             f"win_rate={s['win_rate']:.1%}, signals={s['total_signals']}"
             for s in top_5
         )
-        + f"\n\nBottom 5:\n"
+        + "\n\nBottom 5:\n"
         + "\n".join(
             f"  {s['source_type']}/{s['source_id']}: trust={s['trust_score']:.3f}, "
             f"win_rate={s['win_rate']:.1%}, signals={s['total_signals']}"

@@ -36,7 +36,7 @@ Public API:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Iterable
 from uuid import uuid4
 

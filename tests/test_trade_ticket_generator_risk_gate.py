@@ -32,7 +32,6 @@ from intelligence.signal_provenance import (
 from oracle.risk import (
     CircuitBreaker,
     CircuitBreakerConfig,
-    RiskCheckResult,
     get_global_circuit_breaker,
     reset_global_circuit_breaker,
 )

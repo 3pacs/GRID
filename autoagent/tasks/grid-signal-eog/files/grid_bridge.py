@@ -8,7 +8,6 @@ Provides PIT-correct feature data and price series.
 from __future__ import annotations
 
 import os
-from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 

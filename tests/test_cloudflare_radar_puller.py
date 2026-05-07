@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
-import json
-from datetime import date, datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch, call
+from datetime import date
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from ingestion.altdata.cloudflare_radar_puller import (
     CloudflareRadarPuller,
     TOP_COUNTRIES,
-    _ENDPOINTS,
-    _TRAFFIC_DROP_THRESHOLD,
 )
 
 
@@ -568,7 +565,7 @@ class TestPullOrchestrator:
                  puller, "_get_existing_dates",
                  return_value={date(2026, 4, 1)},  # already stored
              ), \
-             patch.object(puller, "_insert_raw") as mock_insert:
+             patch.object(puller, "_insert_raw"):
 
             result = puller.pull(days_back=7)
 

@@ -20,7 +20,6 @@ import psycopg2.extras
 from loguru import logger as log
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import Engine
-from sqlalchemy.pool import Pool
 
 from config import settings
 

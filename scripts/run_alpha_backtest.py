@@ -4,7 +4,7 @@ Run QuantaAlpha signals against real GRID data and report metrics.
 Usage: python3 scripts/run_alpha_backtest.py
 """
 
-from datetime import date, timedelta
+from datetime import date
 import sys
 sys.path.insert(0, ".")
 

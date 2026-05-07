@@ -9,7 +9,6 @@ from __future__ import annotations
 import heapq
 from typing import Optional
 
-from loguru import logger as log
 
 
 class PriorityQueue:

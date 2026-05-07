@@ -262,7 +262,7 @@ class WikidataPersonPuller(BasePuller):
         if not name or len(name.strip()) < 2:
             return []
 
-        sanitised = name.strip().replace('"', '\\"')
+        name.strip().replace('"', '\\"')
 
         # Use mwapi EntitySearch for fast name lookup, then enrich via SPARQL.
         # The old CONTAINS(LCASE()) approach scanned all Q5 entities — too slow.

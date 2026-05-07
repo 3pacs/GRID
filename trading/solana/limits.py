@@ -21,7 +21,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Sequence
 
 from loguru import logger as log
 from sqlalchemy import text

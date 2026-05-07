@@ -535,7 +535,7 @@ def _prediction_invalidation(direction: str, target, entry) -> str:
     if not target or not entry:
         return f"Price moves opposite to {direction} thesis"
 
-    target_f = float(target)
+    float(target)
     entry_f = float(entry)
 
     if direction in ("bullish", "long", "buy"):

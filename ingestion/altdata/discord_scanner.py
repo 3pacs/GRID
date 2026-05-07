@@ -36,13 +36,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import time
 from datetime import date, datetime, timezone
 from typing import Any
 
 import aiohttp
 from loguru import logger as log
-from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller
@@ -52,7 +50,6 @@ from ingestion.altdata.memecoin_classifier import (
     MentionTracker,
     SignalLabel,
     classify_full_message,
-    extract_token_addresses,
 )
 
 # ── Configuration ────────────────────────────────────────────────────

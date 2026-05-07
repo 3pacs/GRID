@@ -114,7 +114,7 @@ async def create_prediction(
         condition_ids_set = set(req.condition_node_ids)
 
         for n in nodes:
-            node_data = _parse_node_data(n["data"])
+            _parse_node_data(n["data"])
             nid = n["node_id"]
             label = n["label"] or ""
             ntype = n["node_type"]
@@ -222,7 +222,7 @@ async def create_prediction(
                 "ptype": "canvas_investigation",
                 "evidence": json.dumps(anti_evidence),
                 "criteria": json.dumps(anti_criteria),
-                "inv": f"Invalidated if original thesis is confirmed.",
+                "inv": "Invalidated if original thesis is confirmed.",
                 "conf": _clamp_confidence(1.0 - confidence),
                 "pair_id": hyp_id,
             },

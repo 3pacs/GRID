@@ -202,7 +202,7 @@ def main() -> int:
     print(f"Fragility multiplier:  × {fragility_multiplier:.3f}")
     print(f"Red-team penalty:      × {1 - 0.5 * red_team_epistemic_risk:.3f}")
     print(f"Fudge penalty:         × {max(0.1, 1 - 0.15 * fudge_alert_count):.3f}")
-    print(f"─────────────────────")
+    print("─────────────────────")
     print(f"Aggregate conviction:  {aggregate:.3f}")
     print(f"Provenance verdict:    {verdict.upper()}")
     print()

@@ -72,7 +72,6 @@ async def refresh_watchlist_prices(
     Uses yf.download for a single API call. Results are cached for 5 minutes.
     If called within TTL, returns cached data instantly.
     """
-    import time
 
     # Return cached if fresh
     cached = _get_cached_prices()
@@ -126,8 +125,6 @@ async def get_portfolio(
     asset type, risk metrics (concentration, beta, diversification), and
     options P&L from the recommendation tracker.
     """
-    import time
-    from datetime import date, timedelta
 
     _init_table()
     engine = get_db_engine()
@@ -541,7 +538,6 @@ async def search_tickers(
     Returns up to 8 results: [{ticker, name, asset_type, source}].
     Results are cached for 10 minutes.
     """
-    import time
 
     q = q.strip().upper()
     if not q:

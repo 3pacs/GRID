@@ -9,7 +9,7 @@ auto_generated: true
 
 **Category:** Frontend
 
-Government stats vs physical reality lie detector dashboard.
+Government stats vs physical reality [[Cross Reference|lie detector]] dashboard.
 
 ## Source
 

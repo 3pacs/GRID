@@ -27,8 +27,7 @@ row >= 25 days old. If no prior snapshot exists the trend is
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 from loguru import logger as log
@@ -127,7 +126,7 @@ def _margin_score(conn: Any, tickers: list[str]) -> float:
     if not tickers or not _table_exists(conn, "public.capital_flows"):
         return NEUTRAL
 
-    id_set = _id_variants(tickers)
+    _id_variants(tickers)
     scores: list[float] = []
     for t in tickers:
         # Try both upper and lower variants of this ticker.

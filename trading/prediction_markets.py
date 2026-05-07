@@ -225,7 +225,7 @@ class PolymarketTrader:
 
             # Resolve token_id for the outcome
             market = self.get_market(condition_id)
-            outcomes = market.get("outcomes", [])
+            market.get("outcomes", [])
             prices = market.get("outcome_prices", [])
 
             if outcome not in ("Yes", "No"):

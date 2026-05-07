@@ -130,7 +130,7 @@ Prior audit (Cluster 14 of the narrow audit) correctly flagged this as **NOT-A-D
 | `intelligence/causation_graph.py` | 1179 | Graph walker (`trace_causal_chain`, `find_longest_chains`) | **KEEP CANONICAL** |
 | `intelligence/causation_scoring.py` | 1090 | Scorer (`find_causes`, `batch_find_causes`) | **KEEP** |
 
-**Action:** zero code changes. Update `CLAUDE.md`'s stale "2,387 LOC causation.py" entry to reflect the actual 4-file split. **Doc fix only.**
+**Action:** zero code changes. Update `CLAUDE.md`'s stale "2,387 LOC [[Causation|causation.py]]" entry to reflect the actual 4-file split. **Doc fix only.**
 
 ---
 
@@ -225,7 +225,7 @@ Scheduler hedges between `<name>.py` and `<name>_puller.py` variants that were c
 | `analysis/flow_thesis_data.py` | 1414 | State + knowledge dicts | **KEEP CANONICAL** |
 | `analysis/flow_thesis_scoring.py` | 333 | Scoring/narrative | **KEEP** |
 
-No action. **Doc fix:** remove the "phantom flow_thesis.py" line from `MODULE_INVENTORY.md` phantom list — the file exists on disk as a legit facade.
+No action. **Doc fix:** remove the "phantom [[Flow Thesis|flow_thesis.py]]" line from `MODULE_INVENTORY.md` phantom list — the file exists on disk as a legit facade.
 
 ---
 
@@ -233,7 +233,7 @@ No action. **Doc fix:** remove the "phantom flow_thesis.py" line from `MODULE_IN
 
 `analysis/money_flow_engine/` has 8 layer modules (`layer_market`, `layer_credit`, `layer_monetary`, `layer_retail`, `layer_corporate`, `layer_institutional`, `layer_crypto`, `layer_sovereign`) + `helpers.py` + `flow_inference.py` + `types.py` + `__init__.py`.
 
-Each layer file is 236–417 LOC with parallel `build_*_layer()` functions. Same interface, different data sources. These are **intentional** per-layer modules (visual layers in the MoneyFlow view). They should stay split — each layer has a distinct product owner (credit, retail, etc.).
+Each layer file is 236–417 LOC with parallel `build_*_layer()` functions. Same interface, different data sources. These are **intentional** per-layer modules (visual layers in the [[MoneyFlow View|MoneyFlow view]]). They should stay split — each layer has a distinct product owner (credit, retail, etc.).
 
 **Verdict:** **KEEP ALL**. No action. This is a well-factored subsystem, unlike the sector-network modules in Cluster 2 (which are pure static dicts with no per-layer logic).
 
@@ -421,7 +421,7 @@ All violate the "<800 lines" coding style rule. None are dedupe candidates — t
 These are small modules (50–500 LOC) that bridge one subsystem to another. Every one has real callers. **KEEP ALL:**
 
 - `intelligence/signal_registry.py` (191) — 17 adapter callers
-- `intelligence/source_trust_config.py` (148) — trust scorer
+- `intelligence/source_trust_config.py` (148) — [[Trust Scorer|trust scorer]]
 - `intelligence/freshness_guard.py` (155) — 4 intelligence callers
 - `intelligence/context_provider.py` (252) — 6 callers
 - `intelligence/actor_signal_bridge.py` (292) — causation_scoring + trust_scorer + oracle
@@ -518,7 +518,7 @@ Four alert destinations + one scheduler. No duplicates. **KEEP ALL.**
 
 ## Phantom / stale doc references
 
-- **`intelligence/flow_aggregator.py`** — listed as phantom in MODULE_INVENTORY.md. **Actually exists at `analysis/flow_aggregator.py` (1148 LOC).** Doc fix: update inventory to point at the correct path.
+- **`intelligence/flow_aggregator.py`** — listed as phantom in [[MODULE_INVENTORY]].md. **Actually exists at `analysis/flow_aggregator.py` (1148 LOC).** Doc fix: update inventory to point at the correct path.
 - **`intelligence/flow_thesis.py`** — same story; exists at `analysis/flow_thesis.py` (22 LOC facade).
 - **`intelligence/scheduler_v2.py`** — CLAUDE.md gotcha #39. **Does not exist on disk.** Remove from CLAUDE.md.
 - **CLAUDE.md's "7002 LOC `intelligence/actor_network.py`"** — actually 153 LOC façade delegating to `intelligence/actors/*`. Prior audit caught this; CLAUDE.md still wrong.
@@ -529,7 +529,7 @@ Four alert destinations + one scheduler. No duplicates. **KEEP ALL.**
 
 ## Multiple implementations of the same function name
 
-Detected from inventory cross-reference:
+Detected from inventory [[Cross Reference|cross-reference]]:
 
 | Function | Locations | Verdict |
 |---|---|---|
@@ -630,7 +630,7 @@ Plus pending Wave 1 (after one extra grep pass):
 4. **Two "accuracy" implementations** — `contagion_backtest.compute_accuracy` and `postmortem.compute_accuracy` (implicit). They can drift; prior audit SYNTH-4 already flagged but the fix has not been applied.
 5. **Four separate schedulers** (`ingestion/scheduler.py`, `intelligence/scheduler.py`, `alerts/scheduler.py`, `agents/scheduler.py`) — all intentional, but no doc explains which runs what.
 6. **`rag/` package vs `intelligence/rag.py`** — high suspicion that one is a stale scaffold. Reconcile in Wave 3.
-7. **Hermes operator drift.** `scripts/hermes_operator.py` references modules (`power_mapper`, `icij_linker`, `milestone_tracker`, `obsidian_agent`, `gdelt_news`) that the production `ingestion/scheduler.py` does not. Hermes operator and the main scheduler have diverged. Either hermes_operator is dead scripts or it needs to be reconciled against scheduler.py.
+7. **[[Hermes Scheduler|Hermes operator]] drift.** `scripts/hermes_operator.py` references modules (`power_mapper`, `icij_linker`, `milestone_tracker`, `obsidian_agent`, `gdelt_news`) that the production `ingestion/scheduler.py` does not. Hermes operator and the main scheduler have diverged. Either hermes_operator is dead scripts or it needs to be reconciled against scheduler.py.
 
 ---
 

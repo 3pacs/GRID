@@ -11,7 +11,7 @@
 
 ## BROKEN: Active Sources with Zero Data (14 sources)
 
-These are marked `active = true` in source_catalog but have NO SUCCESS rows in raw_series.
+These are marked `active = true` in [[Source Catalog Table|source_catalog]] but have NO SUCCESS rows in [[Raw Series Table|raw_series]].
 
 | Source | Likely Issue | Fix Priority |
 |--------|-------------|--------------|
@@ -75,7 +75,7 @@ The 17 models query these series from raw_series:
 
 - 1,342 features registered, 1,188 model-eligible
 - 2.2M resolved rows
-- But the thesis scorer does NOT use the [[Feature Registry Table|feature_registry]] or resolved_series AT ALL
+- But the thesis scorer does NOT use the [[Feature Registry Table|feature_registry]] or [[Resolved Series Table|resolved_series]] AT ALL
 - It queries raw_series directly
 - The entire ML feature pipeline (features → resolution → model training) is separate from the thesis scorer
 
@@ -103,7 +103,7 @@ Current thesis model confidence ranges: 50-85%. To get to 98%:
 9. Wire GoogleTrends spikes into social_sentiment model
 
 ### MEDIUM — Deepen existing models
-10. Fed model should also read FRED series (DGS10, T10Y2Y, UNRATE)
-11. Geopolitical model should read GDELT directly, not just news
+10. Fed model should also read [[FRED]] series (DGS10, T10Y2Y, UNRATE)
+11. Geopolitical model should read [[GDELT]] directly, not just news
 12. Capital flows model should read INSTITUTIONAL_FLOWS
 13. Add housing/Redfin model for macro context

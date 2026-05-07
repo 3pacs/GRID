@@ -21,7 +21,6 @@ Usage::
 from __future__ import annotations
 
 import json
-import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -236,11 +235,11 @@ def _gather_thesis_accuracy(engine: Engine, target_date: date) -> dict[str, Any]
     }
 
     try:
-        from analysis.flow_thesis import generate_unified_thesis, BULLISH, BEARISH
+        from analysis.flow_thesis import generate_unified_thesis
 
         # Get the thesis generated in the morning (or most recent before market open)
         with engine.connect() as conn:
-            thesis_row = conn.execute(
+            conn.execute(
                 text(
                     "SELECT content, generated_at FROM market_diary "
                     "WHERE date = :dt - 1 "

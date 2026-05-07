@@ -15,7 +15,7 @@ it needs to compute forward returns is stale or missing. Specifically:
 - `resolved_series` for AAPL is current to **2026-04-29** (yesterday)
 - `oracle_predictions.actual_price` is set on scored rows for at least
   GLD, SPY, TLT, QQQ on 2026-04-28/29 — so SOMETHING is fetching prices,
-  just not into raw_series for all tickers
+  just not into [[Raw Series Table|raw_series]] for all tickers
 
 The ingestion pipeline has 45+ modules per a partial code map. The freshness
 audit (step62 SQL) timed out on the first query because `raw_series` is
@@ -32,7 +32,7 @@ Goal: produce a structured table of every data source's actual freshness,
 without melting the DB. Replace the original step62 nested-CTE approach
 with targeted queries that hit indexes:
 
-1. For `raw_series`, run **per-prefix** queries (FRED, YF, BLS, BCB, …)
+1. For `raw_series`, run **per-prefix** queries ([[FRED]], YF, [[BLS]], BCB, …)
    instead of one giant scan. The prefix-grouped query is what timed out;
    instead do `SELECT MAX(obs_date) FROM raw_series WHERE series_id LIKE 'YF:%'`
    for each known prefix. Should take seconds instead of minutes.
@@ -100,7 +100,7 @@ Once backfills run, verify the recurring schedule keeps them fresh:
 1. Wait for the next scheduled run cycle.
 2. Re-run Phase 1 queries.
 3. Confirm `latest_obs` advances by the expected daily/hourly increment.
-4. Add a **freshness alert** to the daily walk-forward report — if any
+4. Add a **freshness alert** to the daily [[Walk-Forward Backtesting|walk-forward]] report — if any
    high-value source goes stale by >7d, the report should yell.
 
 ### Phase 5 — Coverage expansion

@@ -2,16 +2,11 @@
 
 from __future__ import annotations
 
-import json
-import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from intelligence.breaking_news import (
-    COOLDOWN_SECONDS,
-    GDELT_TIMESPAN_MINUTES,
-    SPIKE_MULTIPLIER,
     WATCHLIST,
     check_gdelt,
     detect_spike,

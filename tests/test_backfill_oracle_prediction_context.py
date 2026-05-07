@@ -10,7 +10,6 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-import pytest
 
 from scripts.backfill_oracle_prediction_context import backfill
 
@@ -73,7 +72,6 @@ class FakeEngine:
         # Raise for a targeted row to simulate per-row failures.
         if self.fail_on_row is not None:
             trigger = self.fail_on_row
-            engine = self
 
             class _FailingCtx:
                 def __enter__(self):

@@ -152,7 +152,7 @@ class MarketWatchNewsPuller(BasePuller):
         sid = f"{_SERIES_PREFIX}.{feed_name}"
 
         with self.engine.begin() as conn:
-            existing = self._get_existing_dates(sid, conn)
+            self._get_existing_dates(sid, conn)
 
             for article in articles:
                 obs_date = article["pub_date"]

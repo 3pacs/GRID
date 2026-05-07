@@ -32,14 +32,12 @@ Wait — that's wrong. Let's be precise:
 
 from __future__ import annotations
 
-import math
-from datetime import date, timedelta
+from datetime import date
 from typing import Any
 
 import numpy as np
 import pandas as pd
 from loguru import logger as log
-from scipy.stats import norm
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 

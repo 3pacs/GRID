@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import asdict, dataclass, field
-from datetime import date, timedelta
+from datetime import date
 from typing import Any
 
 from loguru import logger as log

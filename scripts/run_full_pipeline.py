@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -121,7 +121,6 @@ def run_pipeline(historical: bool = False) -> dict:
     Returns:
         Summary dict with step results.
     """
-    from config import settings
     from db import get_engine
 
     engine = get_engine()

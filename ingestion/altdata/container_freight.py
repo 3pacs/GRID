@@ -47,13 +47,12 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from typing import Any, NamedTuple
 
 import requests
 from bs4 import BeautifulSoup
 from loguru import logger as log
-from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller

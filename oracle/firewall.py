@@ -10,8 +10,7 @@ inserts [UNVERIFIED] markers on flagged claims.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
 
 from loguru import logger as log
 from sqlalchemy import text as sql_text

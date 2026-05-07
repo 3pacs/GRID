@@ -8,7 +8,6 @@ response shape, and edge cases (empty results, missing actors).
 
 from __future__ import annotations
 
-import math
 import os
 from datetime import date, datetime, timedelta
 from decimal import Decimal

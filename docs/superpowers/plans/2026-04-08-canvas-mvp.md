@@ -1,12 +1,12 @@
 # Canvas MVP Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-[[development]] (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a React Flow investigation workspace where users drag actors, companies, hypotheses, signals, and notes onto a canvas, connect them, and save investigation boards.
 
-**Architecture:** Three new DB tables (canvas_boards, canvas_nodes, canvas_edges). FastAPI backend with facade + 2 sub-routers following the watchlist split pattern. React Flow frontend with custom node types per entity, a Zustand store slice, and a reusable "Send to Canvas" button wired into existing views.
+**[[architecture|Architecture]]:** Three new DB tables (canvas_boards, canvas_nodes, canvas_edges). [[FastAPI]] backend with facade + 2 sub-routers following the watchlist split pattern. React Flow frontend with custom node types per entity, a [[Zustand]] store slice, and a reusable "Send to Canvas" button wired into existing views.
 
-**Tech Stack:** @xyflow/react (React Flow v12), Zustand, FastAPI, SQLAlchemy text() queries, PostgreSQL
+**Tech Stack:** @xyflow/react (React Flow v12), Zustand, FastAPI, [[SQLAlchemy]] text() queries, [[PostgreSQL]]
 
 ---
 

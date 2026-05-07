@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import io
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 

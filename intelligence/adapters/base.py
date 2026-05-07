@@ -11,7 +11,7 @@ AdapterRegistry: orchestrates bulk refresh.
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Protocol, runtime_checkable
 
 from loguru import logger as log

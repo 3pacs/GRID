@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import time
-from dataclasses import asdict
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
@@ -85,7 +83,7 @@ async def get_actor_network(
         ]
 
     # Limit by influence
-    total = len(nodes)
+    len(nodes)
     if len(nodes) > limit:
         nodes = sorted(nodes, key=lambda n: n.get("influence", 0), reverse=True)[:limit]
 
@@ -970,7 +968,6 @@ async def get_sector_power_map(
 
     # Step 4: Also find actors connected TO our sector actors (1-hop expansion)
     # This brings in insiders, politicians, etc. connected to sector companies
-    connected_ids: set[str] = set()
     if actor_ids:
         with engine.connect() as conn:
             expand_rows = conn.execute(text(

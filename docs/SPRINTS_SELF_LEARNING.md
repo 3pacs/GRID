@@ -3,7 +3,7 @@
 **Created:** 2026-04-14
 **Scope:** Turn GRID from "80 modules with bespoke loops" into "every
 scorable module and every LLM call self-improves on a shared cadence,
-observed by one orchestrator, plugged into Hermes."
+observed by one orchestrator, plugged into [[Hermes Scheduler|Hermes]]."
 **Agents:** Assume **3 frontier-model agents** (Agent-A, Agent-B,
 Agent-C) can run in parallel. Every sprint is partitioned so the three
 agents never touch overlapping files — no merge collisions, no races.
@@ -108,7 +108,7 @@ shared `scripts/audit_self_learning.py` is read-only for this sprint.
 
 **Goal:** Put the `LLMHarness` between live code and 3 LLM call sites.
 These 3 are chosen because they already have scorable outcomes: oracle
-arena has brier scores, news_impact has forward returns,
+arena has [[Oracle Calibration|brier score]]s, news_impact has forward returns,
 earnings_transcript_analyzer has EPS surprise numbers.
 
 | Agent | Owns | Call site |

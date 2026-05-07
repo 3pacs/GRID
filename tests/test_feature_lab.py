@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from features.lab import pct_change_lagged, ratio, rolling_slope, spread, zscore_normalize
 

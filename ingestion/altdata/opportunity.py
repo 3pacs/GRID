@@ -9,7 +9,7 @@ quartile, employment, and K-shape recovery metrics.
 from __future__ import annotations
 
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date
 from typing import Any
 
 import pandas as pd
@@ -233,7 +233,6 @@ class OppInsightsPuller(BasePuller):
         results: list[dict[str, Any]] = []
 
         # Track which files we've already downloaded (avoid duplicate downloads)
-        downloaded_files: dict[str, pd.DataFrame] = {}
 
         for file_def in OI_FILES:
             res = self.pull_file(

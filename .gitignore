@@ -5,6 +5,8 @@ __pycache__/
 outputs/llm_insights/
 outputs/market_briefings/
 outputs/insight_reviews/
+outputs/capital_flow_research/
+log/
 *.egg-info/
 dist/
 build/

@@ -2,7 +2,6 @@
 
 from datetime import datetime, timezone
 
-import pytest
 
 from ingestion.realtime.candle_builder import CandleState
 from ingestion.realtime.flusher import build_insert_values, MAX_BUFFER_CYCLES

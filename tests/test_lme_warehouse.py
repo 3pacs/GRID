@@ -13,7 +13,6 @@ from ingestion.altdata.lme_warehouse import (
     LME_API_URL,
     LME_REPORT_URL,
     LMEStockSnapshot,
-    LMEWarehousePuller,
     _parse_lme_html,
     _parse_lme_json,
     compute_cancelled_ratio,
@@ -341,7 +340,6 @@ class TestRunLmeWarehousePuller:
     @patch("ingestion.altdata.lme_warehouse.requests.get")
     def test_json_returns_non_json_body(self, mock_get):
         # JSON probe returns 200 but body is not JSON → fall back to HTML
-        import requests as req
 
         json_resp = MagicMock()
         json_resp.raise_for_status = MagicMock()

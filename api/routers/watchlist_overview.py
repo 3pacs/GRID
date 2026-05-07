@@ -382,7 +382,7 @@ async def get_ticker_edge(
     whale flow, prediction markets, smart money, lever pullers,
     investigation leads, and convergence into one response.
     """
-    from datetime import date, datetime, timedelta, timezone
+    from datetime import date, timedelta
 
     ticker_upper = ticker.upper().strip()
 

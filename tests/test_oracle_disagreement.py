@@ -6,7 +6,6 @@ the dampening.
 """
 from __future__ import annotations
 
-import math
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 

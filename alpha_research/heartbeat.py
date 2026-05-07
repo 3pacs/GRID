@@ -19,7 +19,6 @@ from sqlalchemy.engine import Engine
 from dataclasses import dataclass
 
 from alpha_research.signals.exposure_scaler import compute_vix_exposure_scalar
-from alpha_research.signals.credit_cycle import compute_credit_cycle
 
 
 @dataclass

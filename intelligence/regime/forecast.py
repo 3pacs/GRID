@@ -8,12 +8,11 @@ by asset class and horizon, weighted by episode match quality.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
 import numpy as np
-from loguru import logger as log
 
 from intelligence.regime.episode_matcher import MatchResult, MatchedEpisode
 
@@ -277,11 +276,9 @@ def generate_conditional_forecast(
     all_flags: list[str] = []
 
     # Tickers that use absolute changes instead of percentage returns
-    absolute_tickers = {'VIX', 'HY_SPREAD'}
 
     for ticker in tickers:
         ticker_dists: list[OutcomeDistribution] = []
-        is_absolute = ticker in absolute_tickers
 
         for horizon in horizons:
             # Collect returns and qualities for this ticker/horizon

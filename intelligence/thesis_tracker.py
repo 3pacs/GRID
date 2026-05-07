@@ -28,7 +28,7 @@ Designed to be called by hermes_operator or via the API.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -535,7 +535,7 @@ def _compute_model_accuracy(conn) -> list[dict]:
     model_stats: dict[str, dict] = {}
     for r in rows:
         states = _parse_json(r[0], {})
-        outcome = r[1]
+        r[1]
         actual_move = float(r[2]) if r[2] is not None else 0.0
 
         if actual_move > 0.5:

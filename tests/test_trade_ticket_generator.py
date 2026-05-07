@@ -12,7 +12,6 @@ Validates:
 
 from __future__ import annotations
 
-import math
 
 import pytest
 
@@ -22,7 +21,6 @@ from intelligence.signal_provenance import (
     TradeProvenanceReport,
 )
 from trading.trade_ticket_generator import (
-    DEFAULT_RISK_MULTIPLE,
     DEFAULT_VOL_30D,
     MAX_KELLY_PER_TICKET,
     MIN_CONVICTION_FOR_TICKET,

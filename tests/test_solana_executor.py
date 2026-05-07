@@ -14,7 +14,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from trading.solana.executor import (
-    ExecutionResult,
     PaperSolanaExecutor,
     SOLANA_STRATEGY_ID,
 )

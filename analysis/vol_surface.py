@@ -30,7 +30,6 @@ from sqlalchemy.engine import Engine
 
 from physics.dealer_gamma import (
     _d1,
-    _d2,
     bs_charm,
     bs_delta_call,
     bs_delta_put,
@@ -1169,8 +1168,8 @@ class VolSurfaceEngine:
                         iv_est = math.sqrt(max(w / T, 0)) if T > 0 else None
                     else:
                         # Linear interpolation in total variance space
-                        T_lo = d_lo / 365.0
-                        T_hi = d_hi / 365.0
+                        d_lo / 365.0
+                        d_hi / 365.0
                         w_lo = self._svi_w(svi_lo, k)
                         w_hi = self._svi_w(svi_hi, k)
 

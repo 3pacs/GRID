@@ -3,12 +3,9 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-import pytest
 
 from intelligence.hmm_regime_transitions import (
     DEFAULT_STATES,
-    RegimeForecast,
-    TransitionMatrix,
     compute_entropy,
     fit_from_db,
     fit_transition_matrix,

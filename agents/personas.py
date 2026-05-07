@@ -10,7 +10,6 @@ configures signal weight multipliers.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
 
 from loguru import logger as log
 

@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 from datetime import date
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pandas as pd
-import pytest
 
 # ---------------------------------------------------------------------------
 # ingestion/options.py — signal computation helpers
@@ -17,7 +16,6 @@ from ingestion.options import (
     compute_iv_skew,
     compute_max_pain,
     _compute_atm_iv,
-    _compute_wing_iv,
     _compute_oi_concentration,
 )
 

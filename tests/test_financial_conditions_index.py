@@ -6,7 +6,6 @@ is covered by patching _read_series_history.
 from __future__ import annotations
 
 import math
-from datetime import date
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -14,7 +13,6 @@ import pytest
 from intelligence.financial_conditions_index import (
     _COMPONENTS,
     _FCI_CLAMP,
-    _MIN_VALID_COMPONENTS,
     _classify_fci,
     compose_fci,
     compute_fci,
@@ -237,7 +235,7 @@ class TestComputeFCI:
             # has its own try/except returning []. We patched AROUND that,
             # so raising here propagates. Fall back to a no-data path.
             try:
-                result = compute_fci(eng)
+                compute_fci(eng)
             except RuntimeError:
                 # Expected — the helper catches internally, but our mock
                 # bypassed that safety net. Validate the direct path: the

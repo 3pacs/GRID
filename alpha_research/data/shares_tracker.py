@@ -24,14 +24,11 @@ Fallback: derive from yfinance sharesOutstanding field.
 from __future__ import annotations
 
 import os
-from datetime import date, timedelta
-from typing import Any
+from datetime import date
 
 import pandas as pd
 import requests
 from loguru import logger as log
-from sqlalchemy import text
-from sqlalchemy.engine import Engine
 
 _TIINGO_API_KEY = os.getenv("TIINGO_API_KEY", "")
 _BASE_URL = "https://api.tiingo.com"

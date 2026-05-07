@@ -28,7 +28,7 @@ Comprehensive audit of the GRID codebase, compiled from [[ATTENTION]].md, CLAUDE
 
 ### Missing Security Headers
 
-- **`api/main.py:48-63`** — Security headers middleware is present and sets `X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protection`, `Referrer-Policy`, and `Strict-Transport-Security`. However, **Content-Security-Policy (CSP) header is still missing**, which is the most impactful security header for XSS prevention.
+- **`api/main.py:48-63`** — [[Security]] headers middleware is present and sets `X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protection`, `Referrer-Policy`, and `Strict-Transport-Security`. However, **Content-Security-Policy (CSP) header is still missing**, which is the most impactful security header for XSS prevention.
 
 ---
 

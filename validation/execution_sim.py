@@ -164,7 +164,7 @@ class RiskManager:
         if current_pos + order.size > self._max_position:
             return RiskCheckResult(
                 passed=False,
-                reason=f"Position size exceeds per-market limit",
+                reason="Position size exceeds per-market limit",
             )
 
         warnings = []

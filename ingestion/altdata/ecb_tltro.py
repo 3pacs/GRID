@@ -50,13 +50,12 @@ Data strategy:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date
 from typing import Any, Iterable
 
 import json
 import requests
 from loguru import logger as log
-from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller

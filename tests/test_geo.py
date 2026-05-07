@@ -6,7 +6,6 @@ import asyncio
 import json
 from unittest.mock import MagicMock
 
-import pytest
 
 from api.routers.geo import FINANCIAL_CENTERS, _extract_geo
 

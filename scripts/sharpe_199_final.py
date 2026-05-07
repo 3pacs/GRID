@@ -18,10 +18,9 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 from loguru import logger as log
 
@@ -81,7 +80,7 @@ def main() -> None:
     psi = load_feature(engine, "planetary_stress_index", start, end)
     vix = load_feature(engine, "vix_spot", start, end)
     hy = load_feature(engine, "hy_oas_spread", start, end)
-    yc = load_feature(engine, "yld_curve_2s10s", start, end)
+    load_feature(engine, "yld_curve_2s10s", start, end)
     solar_flux = load_feature(engine, "solar_flux_10_7cm", start, end)
     sunspot = load_feature(engine, "sunspot_number", start, end)
     lunar_illum = load_feature(engine, "lunar_illumination", start, end)

@@ -7,12 +7,8 @@ All tests run without git or network access (mocked).
 from __future__ import annotations
 
 import json
-import os
-from datetime import datetime, timezone
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from server_log.sanitizer import Sanitizer
 

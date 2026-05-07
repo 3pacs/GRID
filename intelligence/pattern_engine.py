@@ -26,7 +26,7 @@ import hashlib
 import json
 from collections import defaultdict
 from dataclasses import dataclass, asdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from loguru import logger as log

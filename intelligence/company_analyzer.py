@@ -21,8 +21,8 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from dataclasses import dataclass, field, asdict
-from datetime import date, datetime, timedelta, timezone
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from loguru import logger as log
@@ -689,7 +689,7 @@ def run_analysis_queue(engine: Engine, batch_size: int = 5) -> dict[str, Any]:
 
     for ticker in to_analyze:
         try:
-            profile = analyze_company(engine, ticker)
+            analyze_company(engine, ticker)
             analyzed.append(ticker)
         except Exception as exc:
             log.warning("Failed to analyze {t}: {e}", t=ticker, e=str(exc))

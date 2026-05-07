@@ -13,8 +13,7 @@ Run: python3 pull_options.py
 
 import os
 import sys
-import json
-from datetime import datetime, date
+from datetime import date
 
 import psycopg2
 import numpy as np

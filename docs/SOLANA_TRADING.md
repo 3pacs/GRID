@@ -110,7 +110,7 @@ In the meantime every trade lives under `source_type="unknown"`.
 
 Every partial close, stop fire, or trailing-arm event is appended to
 `solana_exit_events` — immutable by convention, matching GRID's
-decision journal rule. The blended exit price passed to
+[[Decision Journal|decision journal]] rule. The blended exit price passed to
 `paper_engine.close_trade()` is computed as
 `Σ(event_fraction × event_price) / total_closed_fraction`, so
 `paper_trades.pnl_pct` reflects the laddered exit, not just the last

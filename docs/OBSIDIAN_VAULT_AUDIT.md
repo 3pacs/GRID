@@ -12,7 +12,7 @@
 - **163** total `.md` files across 8 top-level directories + 5 orphan root files
 - Hottest folder: **`Modules/Intelligence/`** with **59** notes (36% of the vault), mostly thin stubs
 - Second hottest: **`Modules/`** umbrella with ~96 notes total across 16 subfolders
-- Real content weight is concentrated in **3 top-level GEX files** (3,323 lines) and **`version 5 - Stack & Visualization Architecture.md`** (the Palantir/Gotham master thesis)
+- Real content weight is concentrated in **3 top-level [[Dealer Gamma|GEX]] files** (3,323 lines) and **`version 5 - Stack & Visualization Architecture.md`** (the Palantir/Gotham master thesis)
 - Oldest meaningful content: 2026-04-04 (S19, Audit-2026-04-04, 120B dead-end, LLM decision)
 - Newest: Session 22 (2026-04-07), `TOP ASAP FIXES.md` (undated but references Phase 5 dedupe)
 
@@ -67,7 +67,7 @@ Total active GEX design surface in the vault: **3,323 lines of Markdown**.
   - `full_dealer_exposure(chain_df, spot, r, q)` — one-shot orchestration function combining all 7 exposure engines plus `combined_dealer_flow` aggregate
   - Per-strike schema (`strike`, `option_type`, `oi`, `gamma`, `iv`, `time_to_expiry`)
   - Sign convention: dealers net short options → call contributions negated, put contributions kept positive
-- **Completeness:** `Gamma`, `Vanna`, `Charm`, `Vomma`, `Speed`, `Color`, `Zomma` code snippets all present and drop-in-ready. Zomma section is **duplicated twice** in the file — the LLM output repeats itself. No tests. No storage layer. No validation. No architecture.
+- **Completeness:** `Gamma`, `Vanna`, `Charm`, `Vomma`, `Speed`, `Color`, `Zomma` code snippets all present and drop-in-ready. Zomma section is **duplicated twice** in the file — the LLM output repeats itself. No tests. No storage layer. No validation. No [[architecture]].
 - **Status:** Raw research, not production-ready, but the math is essentially complete.
 
 #### 2. `GEX GPT notes.md` (1,337 lines) — "V2 production spec" (THIS is the new GEX build)
@@ -92,7 +92,7 @@ Total active GEX design surface in the vault: **3,323 lines of Markdown**.
   14. Historical storage — raw payloads / normalized snapshots / features / signals, partitioned by venue + date, Parquet
   15. **Testing spec** — unit tests for formulas, snapshot tests on frozen chains, property tests, regression tests on golden datasets
   16. Monitoring spec — ingest latency, reject counts, percent missing IV, percent recomputed Greeks, venue disagreement score
-  17-18. Security and reference output payload (complete JSON schema example for a live snapshot)
+  17-18. [[Security]] and reference output payload (complete JSON schema example for a live snapshot)
   19. **Implementation roadmap — 4 phases** (Correct prototype -> Complete core engine -> Research alpha layer -> Production hardening)
   20. **Minimal repository structure** — full directory tree: `adapters/`, `schemas/`, `validation/`, `greeks/`, `exposures/`, `alpha/`, `storage/`, `configs/`
   21-24. What makes V2 better, first-build practical guidance, final assessment, suggested next deliverables
@@ -168,8 +168,8 @@ Total active GEX design surface in the vault: **3,323 lines of Markdown**.
 - `Overview.md` — 8-layer system map, module counts (ingestion 118, intelligence 89, scripts 82, api 69)
 - `Project-Structure.md` — referenced as canonical directory tree; not read in this pass
 - `Security.md` — referenced; not read in this pass
-- `Data-Pipeline.md` — Pull -> raw_series -> Resolver -> resolved_series -> PIT -> features -> models
-- `API-Layer.md` — 40 FastAPI routers
+- `Data-Pipeline.md` — Pull -> [[Raw Series Table|raw_series]] -> Resolver -> [[Resolved Series Table|resolved_series]] -> PIT -> features -> models
+- `API-Layer.md` — 40 [[FastAPI]] routers
 - `Intelligence-Layer.md` — 89 intelligence modules
 - `Analysis-Layer.md`, `Trading-Layer.md`, `ML-Inference.md`, `Orchestration-Layer.md`, `Cron-Schedule.md`, `Planning-Docs.md`, `Module-Sizes.md`, `Config-Map.md`
 
@@ -182,7 +182,7 @@ Most architecture notes are **documentation stubs** summarizing code that alread
 2 notes in `/Dead-Ends/`:
 
 - `120B-CPU-Inference.md` — Nemotron-3-Super-120B on 503GB RAM = 0.18 tok/s. MoE weights crossing CPU-GPU boundary 78 times per token. Don't retry without 2x A6000 or IQ2 quantization. Clean negative result.
-- `TimesFM-Pair-Trading.md` — 49.9% directional accuracy across 16K PYPL->XLK runs (random). Useless for cross-asset. Still marginally OK (~56%) for single-asset walk-forward. **Most interesting dead end** because the raw number is so clean — 16K runs, dead-flat 49.9%, across 3 different context window sizes.
+- `TimesFM-Pair-Trading.md` — 49.9% directional accuracy across 16K PYPL->XLK runs (random). Useless for cross-asset. Still marginally OK (~56%) for single-asset [[Walk-Forward Backtesting|walk-forward]]. **Most interesting dead end** because the raw number is so clean — 16K runs, dead-flat 49.9%, across 3 different context window sizes.
 
 Both are short, clear, and well-referenced. This is a healthy pattern worth preserving.
 
@@ -207,7 +207,7 @@ Both are short, clear, and well-referenced. This is a healthy pattern worth pres
 - `Oracle-Scoring-S20.md` — 12,656 pending predictions backfilled to 9,803 ready-to-score.
 - `Sentinel-Cleanup-S20.md` — 815K corrupt rows deleted from `resolved_series` (ephemeris future/past sentinels).
 
-These are **post-mortem artifacts**, not proposals. The corresponding code fixes mostly shipped in S20.
+These are **[[Postmortem|post-mortem]] artifacts**, not proposals. The corresponding code fixes mostly shipped in S20.
 
 ---
 
@@ -235,7 +235,7 @@ Vault sessions stop at S22 (2026-04-07). The `.claude` memory has handoffs throu
 - `Modules/Trading/Options-Analytics.md` -> `physics/dealer_gamma.py`, `analysis/vol_surface.py`, `trading/options_recommender.py`, `trading/options_tracker.py`, `discovery/options_scanner.py`, `derivatives/` frontend — all present
 - `Modules/Trading/Trading-Overview.md` -> accurate file-by-file inventory of 11 files in `trading/` with line counts
 - `Modules/Oracle/Oracle-Engine.md` -> `oracle/engine.py` etc. — present
-- `Modules/Intelligence/*.md` (59 notes) -> most correspond to files under `intelligence/` (143 modules per MODULE_INVENTORY.md). Not spot-checked 1:1 but scale matches.
+- `Modules/Intelligence/*.md` (59 notes) -> most correspond to files under `intelligence/` (143 modules per [[MODULE_INVENTORY]].md). Not spot-checked 1:1 but scale matches.
 - `Modules/Ingestion/*.md` (7 notes) -> broad categories (Core/AltData/International/Physical/Celestial/Trade/ML) — match `ingestion/` subdir layout
 - `Modules/API/*.md` (9 notes) -> broad router categories — match `api/routers/`
 
@@ -254,7 +254,7 @@ Vault sessions stop at S22 (2026-04-07). The `.claude` memory has handoffs throu
 Based on `docs/MODULE_INVENTORY.md` (649 modules in 30 directories) vs the ~96 module notes in the vault, **roughly 550+ GRID modules have no vault note**. Most of these are internal implementation files (feature helpers, specific ingestion pullers, API sub-routers). The vault notes are organized at the **subpackage** level, not the module level — which is reasonable — but it means the vault has systematic blind spots on:
 
 - Most of `features/`, `discovery/`, `inference/`, `governance/`, `validation/`, `normalization/` (each has 1-3 vault notes at most; code has 5-21 files each)
-- The entire `intelligence/actors/` subpackage (after the actor_network.py refactor — vault still references the monolith)
+- The entire `intelligence/actors/` subpackage (after the [[Actor Network|actor_network.py]] refactor — vault still references the monolith)
 - The `a2a/`, `contracts/`, `autoagent/`, `bitnet/`, `events/`, `hyperspace/` top-level dirs (no vault notes)
 - `oracle/` has 14 files but only 1 vault note (`Oracle-Engine.md`)
 - **Critically:** `physics/dealer_gamma.py` has no dedicated vault note. The only reference is inside `Modules/Trading/Options-Analytics.md`.
@@ -264,7 +264,7 @@ Based on `docs/MODULE_INVENTORY.md` (649 modules in 30 directories) vs the ~96 m
 Top drift items (vault says one thing, code does another):
 
 1. **LLM stack** — `Decisions/LLM-Model-Selection.md` says "FINAL — Nemotron-Super-49B v1.5, 60/81 GPU, ~1 tok/s. Don't revisit unless hardware changes." The decision file is marked `status: FINAL`. Reality (per S21 and the `.claude` CLAUDE.md): **Gemma 4 31B is the sole local LLM as of 2026-04-06.** The Decisions file is stale by at least one major migration.
-2. **`00-Dashboard.md` "System Status" table** — Lists "LLM (31B) ONLINE | Hermes 8B -> Gemma 4 31B". That's half right but says `Gemma 4` in one column and `Hermes` in another; also lists `Nemotron-Super-49B` as live in `Infrastructure/LLM-Stack` row. Three different LLMs claimed as active in the same dashboard.
+2. **`00-Dashboard.md` "System Status" table** — Lists "LLM (31B) ONLINE | [[Hermes Scheduler|Hermes]] 8B -> Gemma 4 31B". That's half right but says `Gemma 4` in one column and `Hermes` in another; also lists `Nemotron-Super-49B` as live in `Infrastructure/LLM-Stack` row. Three different LLMs claimed as active in the same dashboard.
 3. **`Modules/Trading/Options-Analytics.md`** — Lists `physics/dealer_gamma.py` as "Dealer gamma exposure calculation (GEX)" without mentioning vanna, charm, gamma flip, walls, dealer_delta, profile curves, or the vectorized refactor from S22. The note is 60 lines covering ~6 files; the actual `dealer_gamma.py` alone is 494 lines. **Massive undersell.**
 4. **Canvas / Gotham view** — version 5 doc says "Investigation canvas: Missing". Per `.claude` memory handoff 2026-04-09c, Gotham Canvas shipped with 6 commits, 12 intelligence tables wired, dedup, tiered depth, auto-seed, intel feed. Vault is >2 sessions behind.
 5. **`Modules/Intelligence/Actor Network.md`** references the old monolith. Per GRID CLAUDE.md: "`intelligence/actor_network.py` (153 LOC facade) — thin re-export shim; the real actor network now lives in the `intelligence/actors/` subpackage". Note is out of date.
@@ -305,13 +305,13 @@ Concretely:
 
 4. **Reverse direction** — GRID -> vault: only auto-sync `docs/MODULE_INVENTORY.md` and `docs/CODEBASE_INDEX.md` into a read-only `Modules/_Generated/` folder in the vault, replacing the hand-written module stubs over time. These are the only GRID docs the vault genuinely benefits from.
 
-5. **Do NOT attempt bidirectional sync.** The failure modes (conflict resolution, prose reformatting, wikilink translation) are not worth the complexity for <200 files.
+5. **Do NOT attempt bidirectional sync.** The failure modes ([[Conflict Resolution|conflict resolution]], prose reformatting, wikilink translation) are not worth the complexity for <200 files.
 
 **Tradeoffs:**
 
 - **Pro:** Each surface plays to its strength. Claude Code can read `docs/planning/*.md` without needing vault access. The user can still write freeform in Obsidian.
 - **Pro:** One-way promotion makes the vault -> GRID transition explicit and reviewable (git diff on the promoted file).
-- **Con:** Design docs will diverge between vault and GRID once promoted. Accept that — the vault version evolves, the GRID version is a point-in-time plan.
+- **Con:** Design docs will diverge between vault and GRID once promoted. Accept that — the vault version evolves, the GRID version is a [[PIT Store|point-in-time]] plan.
 - **Con:** No automatic backfill of the existing 96 module notes. That's fine; most of them are wrong or stale anyway.
 
 ---

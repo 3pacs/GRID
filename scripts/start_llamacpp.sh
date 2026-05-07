@@ -132,6 +132,24 @@ if [[ -n "$DEVICE" ]]; then
     DEVICE_FLAG="--device $DEVICE"
 fi
 
+# ── Multimodal projector (vision/audio) ─────────────────────
+# Set LLAMACPP_MMPROJ=/path/to/mmproj.gguf to enable omni features.
+MMPROJ_FLAG=""
+if [[ -n "${LLAMACPP_MMPROJ:-}" ]] && [[ -f "${LLAMACPP_MMPROJ}" ]]; then
+    MMPROJ_FLAG="--mmproj ${LLAMACPP_MMPROJ}"
+    echo "MMProj:   ${LLAMACPP_MMPROJ}"
+fi
+
+# ── Reasoning format (none|deepseek|claude|gemini) ──────────
+# Reasoning models (Qwen3.6, gemma-thinking) split output between
+# `content` and `reasoning_content`. Set LLAMACPP_REASONING_FORMAT=none
+# to keep all generation in `content` so existing clients work.
+REASONING_FLAG=""
+if [[ -n "${LLAMACPP_REASONING_FORMAT:-}" ]]; then
+    REASONING_FLAG="--reasoning-format ${LLAMACPP_REASONING_FORMAT}"
+    echo "Reason fmt: ${LLAMACPP_REASONING_FORMAT}"
+fi
+
 # ── Launch ──────────────────────────────────────────────────
 echo "Starting llama-server..."
 exec "$LLAMA_SERVER" \
@@ -145,4 +163,6 @@ exec "$LLAMA_SERVER" \
     --metrics \
     --alias "$MODEL_NAME" \
     $DEVICE_FLAG \
+    $MMPROJ_FLAG \
+    $REASONING_FLAG \
     $SLOT_SAVE

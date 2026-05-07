@@ -23,7 +23,6 @@ from datetime import date, timedelta
 from pathlib import Path
 from itertools import combinations
 
-import numpy as np
 import pandas as pd
 from loguru import logger as log
 

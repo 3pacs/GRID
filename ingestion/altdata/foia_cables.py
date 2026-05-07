@@ -27,10 +27,9 @@ Scheduled: weekly pull (new releases trickle out).
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date
 from typing import Any
 
 import requests
@@ -51,7 +50,7 @@ except ImportError:  # pragma: no cover — exercised only without playwright
     Page = None  # type: ignore[assignment,misc]
     _PLAYWRIGHT_AVAILABLE = False
 
-from ingestion.base import BasePuller, retry_on_failure
+from ingestion.base import BasePuller
 
 # ── API Configuration ────────────────────────────────────────────────────
 

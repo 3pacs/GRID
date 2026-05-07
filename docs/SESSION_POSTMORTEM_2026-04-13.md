@@ -11,7 +11,7 @@ _Window: since 2026-04-12T10:01:54.836959+00:00 (UTC)_
 
 ## Deploy failures (review before next session)
 
-- `2026-04-13T07:38:13.770284+00:00` exit_code=2: remote install [astrogrid_dedup] failed: cp: cannot stat '/tmp/grid_deploy_staging/intelligence__news_ticker_resolver.py': No such file or directory
+- `2026-04-13T07:38:13.770284+00:00` exit_code=2: remote install [astrogrid_dedup] failed: cp: cannot stat '/tmp/grid_deploy_staging/intelligence__news_ticker_[[Conflict Resolution|resolver.py]]': No such file or directory
 - `2026-04-13T08:34:43.303318+00:00` exit_code=2: staging hash check failed: sha256sum: /tmp/grid_deploy_staging/physics__dealer_flow____init__.py: No such file or directory
 - `2026-04-13T08:35:09.842417+00:00` exit_code=2: scp failed: scp: dest open "/tmp/grid_deploy_staging/physics__greeks__black_scholes.py": No such file or directory
 scp: failed to upload file /Users/anikdang/dev/GRID/physics/greeks/black_scholes.py to /tmp/grid_deploy_staging/physics__greeks__black_scholes.py
@@ -92,7 +92,7 @@ scp: failed to upload file /Users/anikdang/dev/GRID/contracts/router.py to /tmp/
 - `b3570e25` docs: inventory +1 (intelligence/actor_trust_cog.py — INTEL-2)
 - `397bdacd` feat: actor trust-or-cog classifier (INTEL-2)
 - `69d4cb81` feat: wire actor_news puller into intelligence scheduler (INTEL-1)
-- `c67cc00e` docs: reconcile MODULE_INVENTORY.md with filesystem (drift fix)
+- `c67cc00e` docs: reconcile [[MODULE_INVENTORY]].md with filesystem (drift fix)
 - `99576ca5` feat: synthesis wiring waves A-E + dedupe pass + intel build-out
 
 ## Wave log (recent)

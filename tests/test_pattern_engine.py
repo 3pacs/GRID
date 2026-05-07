@@ -13,11 +13,9 @@ Tests cover:
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
-import pytest
 
 from intelligence.pattern_engine import (
     Pattern,
@@ -29,8 +27,6 @@ from intelligence.pattern_engine import (
     match_active_patterns,
     score_pattern_accuracy,
     get_patterns_for_ticker,
-    _store_patterns,
-    _load_patterns,
     PATTERN_WINDOW_HOURS,
     MIN_HIT_RATE,
     PROMOTE_ACCURACY,

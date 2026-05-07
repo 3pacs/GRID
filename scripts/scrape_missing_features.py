@@ -30,9 +30,8 @@ os.chdir(os.path.join(os.path.dirname(__file__), ".."))
 from loguru import logger as log
 from sqlalchemy import text
 
-from config import settings
 from db import get_engine
-from ingestion.web_scraper import WebScraperPuller, FEATURE_SCRAPE_CONFIGS, TRUST_LABELS
+from ingestion.web_scraper import WebScraperPuller, FEATURE_SCRAPE_CONFIGS
 from normalization.entity_map import SEED_MAPPINGS
 from normalization.resolver import Resolver
 

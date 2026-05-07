@@ -12,7 +12,6 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from store.pit import PITStore
 
@@ -332,7 +331,7 @@ class TestFeatureLabTsfresh:
         mock_pit = MagicMock(spec=PITStore)
 
         from features.lab import FeatureLab
-        lab = FeatureLab(mock_engine, mock_pit)
+        FeatureLab(mock_engine, mock_pit)
 
         # Force reimport so the ImportError path is hit
         import importlib

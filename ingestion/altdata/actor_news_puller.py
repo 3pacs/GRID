@@ -413,7 +413,7 @@ class ActorNewsPuller:
             adsh = (src.get("adsh") or "").replace("-", "")
             cik = (src.get("ciks") or [""])[0] if src.get("ciks") else ""
             form = src.get("form", "")
-            file_type = (src.get("file_type") or "").lower()
+            (src.get("file_type") or "").lower()
             # Reconstruct filing URL
             if cik and adsh:
                 filing_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type={form}"

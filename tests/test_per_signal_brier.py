@@ -10,11 +10,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
-import pytest
 
 from features.per_signal_brier import (
-    ANTI_PREDICTIVE_BRIER_THRESHOLD,
-    CANONICAL_HORIZONS,
     MIN_CALIBRATED_SAMPLES,
     SignalScorecard,
     _canonical_horizon,

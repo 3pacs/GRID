@@ -14,8 +14,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from trading.solana.exit_decision import (
-    ACTION_ARM_TRAILING,
-    ACTION_HOLD,
     ACTION_STOP_LOSS,
     ACTION_TP_RUNG,
 )
@@ -89,7 +87,8 @@ def mock_learner():
 @pytest.fixture()
 def manager(mock_store, mock_jupiter, mock_paper, mock_learner):
     engine = MagicMock()
-    clock = lambda: EPOCH + timedelta(seconds=60)
+    def clock():
+        return EPOCH + timedelta(seconds=60)
     return ExitManager(
         engine=engine,
         jupiter=mock_jupiter,
@@ -131,7 +130,6 @@ def test_tick_skips_position_when_price_missing(mock_store, mock_jupiter, manage
 def test_tick_arms_trailing_stop(mock_store, mock_jupiter, manager):
     # Use a custom policy scenario via a position with rungs already done
     # so the decision falls through to ACTION_ARM_TRAILING.
-    from trading.solana.exit_policy import ExitPolicy, ExitRung, policy_by_id
 
     # Trick: make a position using 'balanced' but at a price between
     # the activation threshold (+50%) and the next rung. We need all

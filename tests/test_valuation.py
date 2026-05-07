@@ -7,18 +7,16 @@ support scoring, and composite model output.
 
 from __future__ import annotations
 
-import json
 from datetime import date
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from valuation.intrinsic import (
     FinancialInputs,
     IntrinsicValueEngine,
-    ValuationResult,
 )
-from valuation.milestones import Milestone, MilestoneTracker
+from valuation.milestones import Milestone
 from valuation.derivatives_support import (
     DerivativesSupportResult,
     DealerPositioning,

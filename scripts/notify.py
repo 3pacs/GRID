@@ -159,7 +159,7 @@ def format_backtest_summary(result: dict[str, Any]) -> str:
         HTML string suitable for email body.
     """
     best = result.get("best_result") or {}
-    passed = result.get("passed", False)
+    result.get("passed", False)
     iterations = result.get("iterations_run", 0)
 
     statement = best.get("statement", "(no hypothesis)")
@@ -357,7 +357,7 @@ def format_daily_digest(engine: Any) -> str:
                 lines.append(f"  {r[0]}: drift={r[1]:.3f}")
         else:
             lines.append("  No significant drift detected.")
-    except Exception as exc:
+    except Exception:
         # feature_drift_log may not exist yet — that's fine
         lines.append("\nFeature Drift Alerts: not available")
 

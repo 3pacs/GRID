@@ -8,7 +8,7 @@ from the MAS public data API.
 from __future__ import annotations
 
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime
 from typing import Any
 
 import requests

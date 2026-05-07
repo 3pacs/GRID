@@ -35,7 +35,6 @@ from ingestion.celestial.lunar import (
     _LUNAR_ECLIPSES,
     _SOLAR_ECLIPSES,
     SYNODIC_MONTH,
-    LunarCyclePuller,
 )
 from ingestion.celestial.planetary import (
     _is_mercury_retrograde,
@@ -45,12 +44,10 @@ from ingestion.celestial.planetary import (
     _venus_synodic_phase,
     _mars_volatility_index,
     _MERCURY_RETROGRADES,
-    PlanetaryAspectPuller,
 )
 from ingestion.celestial.solar import (
     _solar_cycle_phase,
     _kp_to_ap,
-    SolarActivityPuller,
 )
 from ingestion.celestial.vedic import (
     _moon_sidereal_longitude,
@@ -60,7 +57,6 @@ from ingestion.celestial.vedic import (
     _dasha_cycle_phase,
     _NAKSHATRA_NAMES,
     _NAKSHATRA_QUALITY,
-    VedicAstroPuller,
 )
 from ingestion.celestial.chinese import (
     _zodiac_index,
@@ -71,7 +67,6 @@ from ingestion.celestial.chinese import (
     _iching_hexagram,
     _ZODIAC_ANIMALS,
     _ELEMENTS,
-    ChineseCalendarPuller,
 )
 from oracle.astrogrid_universe import (
     enrich_astrogrid_scoreable_universe,
@@ -1275,7 +1270,7 @@ def _fallback_interpretation(req: AstrogridInterpretRequest) -> dict[str, Any]:
     seer = req.seer or {}
     engine_outputs = req.engine_outputs or []
     threads = list(req.threads or _top_snapshot_threads(snapshot))
-    support = [
+    [
         engine.get("engine_id")
         for engine in engine_outputs
         if float(engine.get("confidence", 0) or 0) >= 0.55

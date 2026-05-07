@@ -19,12 +19,10 @@ the best tools available, which benefits GRID.
 
 from __future__ import annotations
 
-import hashlib
 import math
 import statistics
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
-from typing import Any
+from datetime import datetime, timezone
 
 from loguru import logger as log
 from sqlalchemy import text

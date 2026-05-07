@@ -32,7 +32,6 @@ import pytest
 from contracts.router import ROUTES, resolve_handler
 from contracts.schemas import (
     ALL_CONTRACTS,
-    BaseContract,
     PredictionScored,
     SignalRef,
 )
@@ -443,7 +442,6 @@ def _iter_repo_python_sources() -> list[tuple[Path, str]]:
     if _PY_SOURCE_CACHE is not None:
         return _PY_SOURCE_CACHE
 
-    hits: list[Path] = []
     sources: list[tuple[Path, str]] = []
     skipped_dirs = {
         "tests",

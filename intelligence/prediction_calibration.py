@@ -35,7 +35,6 @@ from intelligence.cross_reference import (
     MINOR_DIVERGENCE_THRESHOLD,
     MAJOR_DIVERGENCE_THRESHOLD,
     CONTRADICTION_THRESHOLD,
-    MIN_OBSERVATIONS,
 )
 
 
@@ -287,7 +286,7 @@ class PredictionCalibrationChecker:
                     if assessment == "consistent":
                         continue
 
-                    avg_price = (p1_price + p2_price) / 2
+                    (p1_price + p2_price) / 2
                     confidence = min(1.0, diff / 0.20)
 
                     checks.append(

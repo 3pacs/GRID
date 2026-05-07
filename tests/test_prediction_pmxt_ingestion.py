@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import types
 from datetime import date
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 

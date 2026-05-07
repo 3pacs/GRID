@@ -8,11 +8,10 @@ and World Economic Outlook (WEO) datasets via the imfdatapy library.
 from __future__ import annotations
 
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime
 from typing import Any
 
 import pandas as pd
-import requests
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine

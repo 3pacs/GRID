@@ -22,7 +22,6 @@ import sys
 import time
 import zipfile
 from datetime import date, datetime, timedelta, timezone
-from typing import Any
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 os.chdir(os.path.join(os.path.dirname(__file__), ".."))
@@ -31,7 +30,6 @@ import pandas as pd
 import requests
 from loguru import logger as log
 from sqlalchemy import text
-from sqlalchemy.engine import Engine
 
 from config import settings
 from db import get_engine
@@ -235,7 +233,7 @@ def pull_binance_bulk(engine) -> list[dict]:
                                 except (ValueError, IndexError):
                                     continue
                 time.sleep(0.1)  # Rate limit
-            except Exception as e:
+            except Exception:
                 continue  # Skip months with no data (e.g., TAO before listing)
 
         # Insert close prices

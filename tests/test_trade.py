@@ -7,7 +7,6 @@ without requiring live API access or database connectivity.
 
 from __future__ import annotations
 
-import pytest
 
 
 class TestComtradePuller:

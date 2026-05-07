@@ -48,7 +48,7 @@ These are the ten things a new session must know **before** proposing any change
 
 7. **`intelligence/prediction_calibration.py` already exists.** Calibration tracking is not missing at the concept level — it is missing at the **persistence and per-horizon** level. `oracle/calibration.py` computes Brier/ECE on-demand but does not save results; there is no calibration drift tracking.
 
-8. **Vanna and charm are computed in `physics/dealer_gamma.py:248-250` but are never used in any prediction or score.** They are "measured but not actionable." Wiring them into the options scanner or recommender is a cheap quick win.
+8. **[[Dealer Gamma|Vanna]] and charm are computed in `physics/dealer_gamma.py:248-250` but are never used in any prediction or score.** They are "measured but not actionable." Wiring them into the [[Options Scanner|options scanner]] or recommender is a cheap quick win.
 
 9. **`physics/dealer_gamma.py` assumes dealers are net short every option** (`physics/dealer_gamma.py:19-30`). Per-ticker GEX is computed but the dealer positioning inference is crude. Any "improve dealer gamma" task is really "replace the net-short assumption with a flow-based inference."
 
@@ -56,7 +56,7 @@ These are the ten things a new session must know **before** proposing any change
 
 ### Also critical (but less often hit)
 
-- **`store/pit.py`** provides `PITStore.get_pit(feature_ids, as_of_date, vintage_policy)` at lines 43-132. `assert_no_lookahead()` is at line 129. This is the walk-forward backtest primitive — **do not reinvent PIT querying**.
+- **`store/pit.py`** provides `PITStore.get_pit(feature_ids, as_of_date, vintage_policy)` at lines 43-132. `assert_no_lookahead()` is at line 129. This is the [[Walk-Forward Backtesting|walk-forward]] backtest primitive — **do not reinvent PIT querying**.
 - **`hermes_operator.py:972-986`** is where `oracle.run_cycle()` is invoked every 6h. That is the oracle entry point.
 - **`scheduler.py` is authoritative; `scheduler_v2.py` is deprecated** (already noted in CLAUDE.md but worth repeating).
 - **`intelligence/hypothesis_engine.py` exists** for LLM-driven hypothesis generation. If a task involves "generate trade ideas from data," it already has infrastructure.
@@ -81,7 +81,7 @@ Before proposing **any** new module, puller, or oracle feature:
 
 **User prompt:** "https://cryexc.josedonato.com/app check this out."
 
-**What cryexc actually is:** a live crypto **market microstructure** scanner built by **Jose Donato** (founding engineer at OpenBB, 65.8k★ repo). It is **not** an options scanner — that was a misconception early in the session. Cryexc is the consolidation of four earlier repos into one shippable Python/FastAPI service.
+**What cryexc actually is:** a live crypto **market microstructure** scanner built by **Jose Donato** (founding engineer at OpenBB, 65.8k★ repo). It is **not** an options scanner — that was a misconception early in the session. Cryexc is the consolidation of four earlier repos into one shippable Python/[[FastAPI]] service.
 
 ### The four source repos (evolution path)
 
@@ -241,7 +241,7 @@ Stateless — no per-horizon breakdown possible without schema changes.
 
 ### Oracle entry point
 
-`hermes_operator.py:972-986` — `oracle.run_cycle()` called every 6h inside the Hermes cycle. Forecaster adapter (`forecaster_adapter.run_timesfm_forecast_cycle()`) runs in parallel in the same cycle.
+`hermes_operator.py:972-986` — `oracle.run_cycle()` called every 6h inside the [[Hermes Scheduler|Hermes]] cycle. Forecaster adapter (`forecaster_adapter.run_timesfm_forecast_cycle()`) runs in parallel in the same cycle.
 
 CLI: `oracle/run_cycle.py` (standalone with `--tickers` and `--no-email` flags).
 
@@ -352,7 +352,7 @@ Discovered this session via `ls intelligence/*.py` and exploration. Grouped by r
 - `gov_intel.py`
 - ~~`insider_intel.py`~~ (deleted in contracts-phase-1 merge)
 
-**Causation submodules (facade-delegated):**
+**[[Causation]] submodules (facade-delegated):**
 - `causation_core/`, `causation_scoring/`, `causation_graph/`
 
 **Micro-signal specialists:**
@@ -418,7 +418,7 @@ Recommendation output includes strike, expiry, entry (bid/ask mid), target, stop
   - Dealer short calls → negative gamma
   - Dealer short puts → positive gamma
 - No cross-name dealer net positioning inference
-- No actual market-maker filing data (13F, Form 4, Form 606)
+- No actual market-maker filing data ([[Institutional Flows|13F]], Form 4, Form 606)
 - **Vanna computed** at lines 248-249 (`bs_vanna × OI`, aggregated at line 179)
 - **Charm computed** at line 250 (time decay delta sensitivity, line 180)
 - **Both reported** at lines 205-206 in the output — **but never used** in predictions or scoring. **Free alpha on the floor.**
@@ -477,7 +477,7 @@ After verifying against `docs/MODULE_CATALOG.md` and live `intelligence/` / `ana
 
 4. **Ensemble disagreement as a meta-feature** — no inter-model correlation or disagreement tracking across the 5 oracle models. When models disagree that IS information (route to vol trade or size down).
 
-5. **Market-implied probability comparator** — no module compares GRID's prediction probability to market-implied probabilities (options skew, yield curve, Polymarket, Kalshi). **GRID's edge = |GRID_p − market_p|.** Any signal that doesn't move GRID away from consensus is not alpha.
+5. **Market-implied probability comparator** — no module compares GRID's prediction probability to market-implied probabilities (options skew, [[Yield Curve|yield curve]], [[Polymarket]], Kalshi). **GRID's edge = |GRID_p − market_p|.** Any signal that doesn't move GRID away from consensus is not alpha.
 
 6. **Per-horizon feature importance** — `features/importance.py` has permutation importance + regime correlation + rolling stability **but not per-horizon or per-regime**. A feature high-signal at 5d may be noise at 365d.
 
@@ -487,7 +487,7 @@ After verifying against `docs/MODULE_CATALOG.md` and live `intelligence/` / `ana
 
 8. **Granger / transfer entropy / mutual information discovery engine** — confirmed no implementation exists. Unsupervised lead-lag discovery across features would auto-surface edges GRID isn't currently exploiting.
 
-9. **HMM-style regime transition matrix** — `discovery/clustering.py` does regime discovery (PCA + GMM/KMeans/Agglomerative) but treats regimes as static labels. Transition probability `P(regime_next | regime_now, macro_state)` is missing.
+9. **HMM-style regime transition matrix** — `discovery/clustering.py` does [[Regime Discovery|regime discovery]] (PCA + GMM/KMeans/Agglomerative) but treats regimes as static labels. Transition probability `P(regime_next | regime_now, macro_state)` is missing.
 
 10. **Narrative lifecycle tracker** — `earnings_transcript_analyzer.py` does tone snapshots per call but does not track narrative evolution across quarters, analyst consensus language drift, or paradigm shifts. Partial; needs extension.
 
@@ -525,7 +525,7 @@ After verifying against `docs/MODULE_CATALOG.md` and live `intelligence/` / `ana
 
 26. **China LGFV + trust product default tracker** — same regional blind spot.
 
-27. **European gas storage + TTF curve** — EU inflation/ECB/EUR/DAX blind spot.
+27. **European gas storage + TTF curve** — EU inflation/[[ECB]]/EUR/DAX blind spot.
 
 28. **Japan MOF intervention + BOJ JGB operations** — carry trade condition tracker missing.
 
@@ -535,7 +535,7 @@ After verifying against `docs/MODULE_CATALOG.md` and live `intelligence/` / `ana
 
 ### Decomposition
 
-Gaps 1-7 are **pure inference architecture** — no new data required. Estimated leverage: these alone are likely **4-6% Brier improvement** if implemented correctly.
+Gaps 1-7 are **pure inference [[architecture]]** — no new data required. Estimated leverage: these alone are likely **4-6% Brier improvement** if implemented correctly.
 
 Gaps 8-14 are **analytics engines** built on existing data. Estimated leverage: **1-3% each on relevant trade slices**.
 
@@ -574,7 +574,7 @@ My highest-conviction picks from the session discussion. Each is estimated to de
 
 **Physical truth:**
 16. **LME cancellation ratios + warehouse stocks** (LME + SHFE + COMEX daily) — ~2% on metals + miner equities
-17. **Refined product crack spreads + refinery utilization** (EIA weekly detailed) — ~1.5% on energy
+17. **Refined product crack spreads + refinery utilization** ([[EIA]] weekly detailed) — ~1.5% on energy
 18. **Global port AIS-derived congestion** (MarineTraffic + VesselFinder + Port of LA) — ~1.5% on retail + logistics + inflation
 
 **Structural tail risk:**
@@ -593,11 +593,11 @@ My highest-conviction picks from the session discussion. Each is estimated to de
 **Causality engines:**
 26. **Fed reaction function estimator** — Bayesian model over `fed_speeches.py` + FOMC votes + dot plots — ~3% on rates/risk around Fed events
 27. **Dealer options surface (GEX/DEX/VEX/CEX) single-name** — extends `physics/dealer_gamma.py`; replaces crude net-short assumption — ~2% on single-name options
-28. **Cross-source disagreement / lie detector (expanded)** — extends `cross_reference.py` to 3+ source consensus — ~2% on macro-release trades
+28. **Cross-source disagreement / [[Cross Reference|lie detector]] (expanded)** — extends `cross_reference.py` to 3+ source consensus — ~2% on macro-release trades
 29. **13F delta clustering across 500 funds** — extends `institutional_flows.py` — ~1.5% on factor + sector trades
 30. **Earnings surprise cascade predictor** — leader → follower revisions via `earnings_calendar.py` + `analyst_ratings.py` — ~2% on earnings-season follow-the-leader
 
-**Actor network extensions:**
+**[[Actor Network|Actor network]] extensions:**
 31. **Director interlock + auditor graph** — extends `actor_network.py` with corporate governance overlay — ~2% on single-name credit/equity tail risk
 32. **Credit event probability machine** — CDS + bond + equity vol + rating → P(distressed | 90d) — ~3% on credit + distressed
 33. **Cross-asset carry trade monitor** — JPY/MXN/TRY/BRL stress + unwind probability — ~3% on FX and risk when building
@@ -718,7 +718,7 @@ GRID has 104+ intelligence modules and 100+ pullers producing evidence. It has a
 
 11. **Tail robustness — counterfactual stress tests.** Every prediction should show its P(outcome | GFC-analog), P(outcome | dotcom-analog), P(outcome | SNB-style shock). Max adverse excursion bound. Kelly fraction capped by tail-aware adjustment.
 
-12. **Pre-registration of theses.** Write lever + condition + invalidation BEFORE looking at recent data. Prevents post-hoc rationalization. GRID has decision journal infrastructure (`journal/log.py`) — enforce that every trade pre-registers.
+12. **Pre-registration of theses.** Write lever + condition + invalidation BEFORE looking at recent data. Prevents post-hoc rationalization. GRID has [[Decision Journal|decision journal]] infrastructure (`journal/log.py`) — enforce that every trade pre-registers.
 
 ### Outside-the-box ideas worth capturing
 

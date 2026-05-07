@@ -21,7 +21,7 @@ Run: uvicorn scripts.compute_coordinator:app --host 0.0.0.0 --port 8100
 import os
 import sys
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import Enum
 from typing import Optional
 

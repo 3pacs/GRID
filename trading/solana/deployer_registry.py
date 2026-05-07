@@ -26,7 +26,6 @@ import json
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
 
 from loguru import logger as log
 from sqlalchemy import text

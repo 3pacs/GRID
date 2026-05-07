@@ -18,7 +18,7 @@ import sys
 import os
 import time
 import argparse
-from datetime import date, timedelta
+from datetime import date
 
 # Ensure the grid package root is on sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

@@ -264,7 +264,7 @@ def test_confidence_collapsed_kill(engine):
         """), {"criteria": json.dumps({"watch_signal": "sig:x", "expect_signal": "sig:y",
                                        "lag_days": 7, "expected_direction": "increases"})})
 
-    result = gen.score_hypothesis("hyp_test_conf_kill")
+    gen.score_hypothesis("hyp_test_conf_kill")
 
     with engine.connect() as conn:
         row = conn.execute(text(

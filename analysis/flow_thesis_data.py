@@ -8,9 +8,8 @@ updater functions that fetch live data for each thesis model.
 from __future__ import annotations
 
 import json
-import math
 import types
-from datetime import date, datetime, timedelta, timezone
+from datetime import date
 from typing import Any
 
 from loguru import logger as log
@@ -542,7 +541,7 @@ def _get_vanna_charm_state(engine: Engine) -> dict[str, Any]:
                 ORDER BY signal_date DESC LIMIT 1
             """)).fetchone()
             if row:
-                mp, spot, sig_date = float(row[0]), float(row[1]), row[2]
+                mp, spot, _sig_date = float(row[0]), float(row[1]), row[2]
                 gap_pct = (spot - mp) / spot * 100
                 if gap_pct > 1.5:
                     direction = BEARISH  # Spot above max pain, charm pulls down
@@ -598,7 +597,7 @@ def _get_congressional_signal_state(engine: Engine) -> dict[str, Any]:
             if rows:
                 buys = sum(r[1] for r in rows if r[0] == "BUY")
                 sells = sum(r[1] for r in rows if r[0] == "SELL")
-                total = buys + sells
+                buys + sells
                 if buys > sells * 1.5:
                     direction = BULLISH
                 elif sells > buys * 1.5:

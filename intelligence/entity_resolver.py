@@ -28,7 +28,7 @@ import sys
 import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from loguru import logger as log
@@ -1384,7 +1384,6 @@ def _cli():
         python intelligence/entity_resolver.py stats
         python intelligence/entity_resolver.py normalize "PERDUE, DAVID A"
     """
-    import sys
     # Add project root to path
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -1433,7 +1432,7 @@ def _cli():
         print(f"  Bridge Score:    {entity.bridge_score}")
         print(f"  Domain Count:    {entity.domain_count}")
         print(f"  Aliases:         {', '.join(entity.aliases)}")
-        print(f"  Sources:")
+        print("  Sources:")
         for source, records in entity.sources.items():
             print(f"    {source}: {len(records)} record(s)")
             for rec in records[:3]:
@@ -1445,7 +1444,7 @@ def _cli():
     elif cmd == "build-index":
         print("Building entity resolution index (this may take a while)...")
         stats = resolver.build_resolution_index()
-        print(f"\n  Results:")
+        print("\n  Results:")
         for k, v in stats.items():
             print(f"    {k}: {v}")
         print()
@@ -1469,7 +1468,7 @@ def _cli():
 
     elif cmd == "stats":
         s = resolver.stats()
-        print(f"\n  Entity Resolution Statistics:")
+        print("\n  Entity Resolution Statistics:")
         print(f"  {'─' * 40}")
         print(f"  Total resolved entities:    {s['total_resolved_entities']}")
         print(f"  Entities with bridges:      {s['entities_with_bridges']}")

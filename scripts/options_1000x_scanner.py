@@ -26,10 +26,8 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import date, timedelta
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 from loguru import logger as log
 
@@ -261,11 +259,11 @@ def main() -> None:
         otm_50 = round(px * 1.5, 0)
         otm_100 = round(px * 2.0, 0)
         recovery_50 = round(ath * 0.5, 0)  # 50% recovery to ATH
-        recovery_100 = round(ath, 0)
+        round(ath, 0)
 
         # Premium estimate: 5% for 6-month, 8% for 12-month
         prem_6m = px * 0.05
-        prem_12m = px * 0.08
+        px * 0.08
 
         # Payoff scenarios
         scenarios = {

@@ -42,9 +42,8 @@ Each model in the breakdown:
 from __future__ import annotations
 
 import json
-import math
 import time as _time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 from loguru import logger as log
@@ -680,7 +679,7 @@ def _score_timesfm_consensus(engine: Engine, accuracy: float) -> dict:
 
         # Boost/penalize based on key families
         equity_fam = families.get("equity", {})
-        macro_fam = families.get("macro", {})
+        families.get("macro", {})
         vol_fam = families.get("vol", {})
 
         # If equity signals strongly directional, boost

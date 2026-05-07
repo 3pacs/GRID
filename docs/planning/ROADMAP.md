@@ -222,10 +222,10 @@ against the 702-module inventory; items below are net-new capability.
 | FinGPT sentiment LLM tier | DEFERRED | ~1w | Benchmark vs Nemotron on held-out sentiment set before adding a 4th process to `llm/router.py`. Requires GPU headroom audit. |
 
 **Explicitly rejected (already covered or unrelated):**
-- TauricResearch/TradingAgents — `agents/` is already this pattern
+- TauricResearch/[[TradingAgents]] — `agents/` is already this pattern
 - OpenBB platform — already integrated (`ingestion/openbb_pipeline.py`)
 - freqtrade — covered by `trading/hyperliquid.py` + `validation/gates.py`
-- daily_stock_analysis — covered by Hermes + `oracle/report.py`
+- daily_stock_analysis — covered by [[Hermes Scheduler|Hermes]] + `oracle/report.py`
 - TradingAgents-CN — A-share only
 - hyperswitch — payments router, unrelated
 
@@ -266,7 +266,7 @@ against the 702-module inventory; items below are net-new capability.
 
 **Goal:** Fix critical security holes. Wire the dormant 50% of the system.
 
-**Security (day 1):**
+**[[Security]] (day 1):**
 - [x] Fix JWT secret: crash on startup if weak in production
 - [x] Fix WebSocket auth: first-message pattern, no query params
 - [x] Remove DB default password from config.py

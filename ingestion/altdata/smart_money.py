@@ -22,7 +22,7 @@ import hashlib
 import json
 import re
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 import requests
@@ -377,11 +377,9 @@ class SmartMoneyPuller(BasePuller):
 
         # Calculate account age if available
         created_utc = post.get("created_utc")
-        account_age_days: int | None = None
         if created_utc:
             try:
-                post_time = datetime.fromtimestamp(created_utc, tz=timezone.utc)
-                account_age_days = None  # Post age, not account age
+                datetime.fromtimestamp(created_utc, tz=timezone.utc)
             except (ValueError, OSError):
                 pass
 

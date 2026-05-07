@@ -49,7 +49,7 @@ import subprocess
 import sys
 import time
 import traceback
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +60,7 @@ if _GRID_DIR not in sys.path:
     sys.path.insert(0, _GRID_DIR)
 
 from loguru import logger as log
+from sqlalchemy import text  # used by run_cycle DB writes
 
 
 # ─── Configuration ───────────────────────────────────────────────────
@@ -87,6 +88,8 @@ TIMEOUT_BLACKLIST_HOURS = 24          # blacklist sources that cause cycle timeo
 # cooldown blacklist break the loop after a single timeout.
 ORACLE_CYCLE_TIMEOUT_SECONDS = 300            # oracle.run_cycle (LLM-bound)
 SIGNAL_CLASSIFICATION_TIMEOUT_SECONDS = 120   # gemma micro classifier batch
+ANOMALY_NARRATION_TIMEOUT_SECONDS = 90        # gemma micro anomaly narrator
+KNOWLEDGE_MAP_TIMEOUT_SECONDS = 120           # gemma micro knowledge mapper
 
 
 def _run_with_timeout(name: str, fn, timeout_s: int, state):
@@ -761,6 +764,46 @@ def run_intelligence_tasks(
         except Exception as exc:
             log.warning("holder_deal_overlap failed: {e}", e=str(exc))
 
+        # ── Daily file rotation (audit #49, #61) ────────────────────
+        # Insight files in outputs/llm_insights/ accumulate forever
+        # without cleanup; the dir hit 100k+ files (45 days, ~22k/day
+        # peaks) before this hook was wired in. 30-day retention caps
+        # steady-state at ~660k worst case, manageable.
+        try:
+            from outputs.llm_logger import cleanup_old_insights
+            n_cleaned = cleanup_old_insights(max_age_days=30)
+            if n_cleaned:
+                log.info("Insight cleanup: deleted {n} files (>30d)", n=n_cleaned)
+        except Exception as exc:
+            log.warning("Insight cleanup failed: {e}", e=str(exc))
+
+        # Market briefings — same pattern, 90-day retention since these
+        # are higher-value artifacts (full market write-ups).
+        try:
+            from ollama.market_briefing import MarketBriefingEngine
+            n_briefings = MarketBriefingEngine.cleanup_old_briefings(max_age_days=90)
+            if n_briefings:
+                log.info("Briefing cleanup: deleted {n} files (>90d)", n=n_briefings)
+        except Exception as exc:
+            log.warning("Briefing cleanup failed: {e}", e=str(exc))
+
+        # errors.jsonl — append-only log, just truncate to last 5000 lines
+        # (~3-4 days of errors at current rate). Cheap, atomic.
+        try:
+            from pathlib import Path
+            errfile = Path(_GRID_DIR) / ".server-logs" / "errors.jsonl"
+            if errfile.exists() and errfile.stat().st_size > 1_000_000:
+                lines = errfile.read_text(encoding="utf-8", errors="replace").splitlines()
+                if len(lines) > 5000:
+                    keep = lines[-5000:]
+                    tmp = errfile.with_suffix(".jsonl.tmp")
+                    tmp.write_text("\n".join(keep) + "\n", encoding="utf-8")
+                    tmp.replace(errfile)
+                    log.info("errors.jsonl rotated: {n} → 5000 lines",
+                             n=len(lines))
+        except Exception as exc:
+            log.warning("errors.jsonl rotation failed: {e}", e=str(exc))
+
         state.last_daily_intel = now
 
     # ── Daily at 3:00 AM UTC — sector health snapshot ───────────────
@@ -1071,6 +1114,16 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
             s=len(health["db"].get("stale_sources", [])),
             f=health["db"].get("failed_pulls_24h", 0),
         )
+        # Audit #31 — fire alerts on threshold transitions. Best-effort,
+        # cooldown-throttled (6h default), email via alerts.email.
+        try:
+            from alerts.health_alerter import check_and_alert
+            fired = check_and_alert(health)
+            if fired:
+                log.warning("Health alerts fired: {f}", f=", ".join(fired))
+                cycle_result["alerts_fired"] = fired
+        except Exception as exc:
+            log.debug("Health alerter skipped: {e}", e=str(exc))
     except Exception as exc:
         log.error("Health check failed: {e}", e=str(exc))
         cycle_result["health"] = {"error": str(exc)}
@@ -1501,6 +1554,135 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         log.debug("Signal classification skipped: {e}", e=str(exc))
         state.cooldowns.record_attempt("signal_classification", success=False, error=str(exc))
 
+    # 7d-v. Gemma micro anomaly narration (every cycle, after classification)
+    # Reads recent high-z signals from signal_registry, asks the
+    # anomaly_narrator (port 8083) for a one-line plain-English summary,
+    # persists into anomaly_narratives. Idempotent: UNIQUE constraint on
+    # (source_module, ticker, signal_ts) means re-runs are no-ops.
+    try:
+        if not state.cooldowns.can_retry("anomaly_narration"):
+            log.debug(
+                "Skipping anomaly_narration — blacklisted (timed out previously, "
+                "blacklist clears in {h}h)",
+                h=TIMEOUT_BLACKLIST_HOURS,
+            )
+        else:
+            state.current_step = "anomaly_narration"
+            if not dry_run:
+                from ingestion.signal_classifier import narrate_anomalies
+
+                def _narrate_call():
+                    return narrate_anomalies(engine, z_threshold=3.0, limit=20)
+
+                narratives, ok = _run_with_timeout(
+                    "anomaly_narration", _narrate_call,
+                    ANOMALY_NARRATION_TIMEOUT_SECONDS, state,
+                )
+                if ok and narratives:
+                    inserted = 0
+                    for n in narratives:
+                        try:
+                            with engine.begin() as conn:
+                                conn.execute(text("""
+                                    INSERT INTO anomaly_narratives
+                                        (ticker, source_module, z_score,
+                                         narrative, signal_ts)
+                                    VALUES (:ticker, :src, :z, :narr, :ts)
+                                    ON CONFLICT (source_module, ticker, signal_ts)
+                                    DO NOTHING
+                                """).bindparams(
+                                    ticker=n.get("ticker"),
+                                    src=n["source"],
+                                    z=n["z_score"],
+                                    narr=n["narrative"],
+                                    ts=n.get("timestamp"),
+                                ))
+                                inserted += 1
+                        except Exception as exc:
+                            log.debug(
+                                "Failed to persist narrative: {e}",
+                                e=str(exc),
+                            )
+                    if inserted:
+                        cycle_result["anomaly_narration"] = {
+                            "narratives_generated": len(narratives),
+                            "persisted": inserted,
+                        }
+                        log.info(
+                            "Anomaly narration: {n} narratives persisted",
+                            n=inserted,
+                        )
+                if ok:
+                    state.cooldowns.record_attempt("anomaly_narration", success=True)
+    except Exception as exc:
+        log.debug("Anomaly narration skipped: {e}", e=str(exc))
+        state.cooldowns.record_attempt("anomaly_narration", success=False, error=str(exc))
+
+    # 7d-vi. Gemma micro knowledge mapping (every cycle, after classification)
+    # Takes recently classified high-urgency signals and asks the
+    # knowledge_mapper (port 8085) for a wiki-style entry with [[backlinks]].
+    # Persists into signal_knowledge_entries. The helper itself flips
+    # signal_registry.knowledge_mapped=TRUE so signals are processed once.
+    try:
+        if not state.cooldowns.can_retry("knowledge_mapping"):
+            log.debug(
+                "Skipping knowledge_mapping — blacklisted (timed out previously, "
+                "blacklist clears in {h}h)",
+                h=TIMEOUT_BLACKLIST_HOURS,
+            )
+        else:
+            state.current_step = "knowledge_mapping"
+            if not dry_run:
+                from ingestion.signal_classifier import map_signal_knowledge
+
+                def _map_call():
+                    return map_signal_knowledge(
+                        engine, urgency_filter="high", limit=10,
+                    )
+
+                entries, ok = _run_with_timeout(
+                    "knowledge_mapping", _map_call,
+                    KNOWLEDGE_MAP_TIMEOUT_SECONDS, state,
+                )
+                if ok and entries:
+                    inserted = 0
+                    for e in entries:
+                        try:
+                            with engine.begin() as conn:
+                                conn.execute(text("""
+                                    INSERT INTO signal_knowledge_entries
+                                        (signal_id, ticker, category,
+                                         knowledge_entry, signal_ts)
+                                    VALUES (:sid, :ticker, :cat, :entry, :ts)
+                                    ON CONFLICT (signal_id) DO NOTHING
+                                """).bindparams(
+                                    sid=e["signal_id"],
+                                    ticker=e.get("ticker"),
+                                    cat=e.get("category"),
+                                    entry=e["knowledge_entry"],
+                                    ts=e.get("timestamp"),
+                                ))
+                                inserted += 1
+                        except Exception as exc:
+                            log.debug(
+                                "Failed to persist knowledge entry: {e}",
+                                e=str(exc),
+                            )
+                    if inserted:
+                        cycle_result["knowledge_mapping"] = {
+                            "entries_generated": len(entries),
+                            "persisted": inserted,
+                        }
+                        log.info(
+                            "Knowledge mapping: {n} entries persisted",
+                            n=inserted,
+                        )
+                if ok:
+                    state.cooldowns.record_attempt("knowledge_mapping", success=True)
+    except Exception as exc:
+        log.debug("Knowledge mapping skipped: {e}", e=str(exc))
+        state.cooldowns.record_attempt("knowledge_mapping", success=False, error=str(exc))
+
     # 7e. Alpha research heartbeat + signal publishing (every cycle)
     try:
         state.current_step = "alpha_heartbeat"
@@ -1679,8 +1861,9 @@ def main(args: list[str] | None = None) -> None:
 
     # Run DB model migrations once on startup (idempotent)
     try:
+        from db import get_engine as _get_engine_for_migrate
         from oracle.model_factory import migrate_default_models
-        migrate_default_models(engine)
+        migrate_default_models(_get_engine_for_migrate())
     except Exception as exc:
         log.debug("migrate_default_models: {e}", e=str(exc))
 
@@ -1690,7 +1873,6 @@ def main(args: list[str] | None = None) -> None:
         return
 
     # Continuous loop with per-cycle timeout
-    import signal
     import threading
 
     def _run_cycle_with_timeout(state, dry_run, timeout):

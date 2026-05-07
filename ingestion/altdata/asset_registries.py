@@ -426,7 +426,6 @@ class AssetRegistryPuller(BasePuller):
             Dict with counts and match details.
         """
         # Fetch top ICIJ officers from raw_series
-        officer_names: list[str] = []
         try:
             with engine.connect() as conn:
                 rows = conn.execute(text("""

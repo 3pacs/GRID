@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from loguru import logger as log
 
 from api.auth import require_auth
+
+if TYPE_CHECKING:
+    from a2a.server import A2ATaskManager
 
 router = APIRouter(tags=["a2a"])
 
@@ -68,7 +71,6 @@ async def submit_task(
     The task is processed synchronously if a handler is registered,
     or queued for async processing otherwise.
     """
-    from a2a.server import A2ATaskManager
 
     manager = _get_task_manager()
     input_text = req.input.get("text", "")

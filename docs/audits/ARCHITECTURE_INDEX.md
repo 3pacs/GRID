@@ -26,7 +26,7 @@ This directory now contains three comprehensive [[architecture]] documents produ
 - Data flow analysis (ingestion → inference → journal)
 - Top 5 architectural risks with severity levels
 - 5 recommended [[architecture|Architecture]] Decision Records (ADRs)
-- Security assessment (strengths and vulnerabilities)
+- [[Security]] assessment (strengths and vulnerabilities)
 - Timeline and recommendations
 
 **Key Sections:**

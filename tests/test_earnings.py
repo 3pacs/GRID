@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
-from unittest.mock import MagicMock, patch
 
-import pytest
 
 
 # ── Ingestion: classify_surprise ─────────────────────────────────────────
@@ -48,7 +45,6 @@ def test_safe_float_normal():
 
 
 def test_safe_float_nan():
-    import math
     from ingestion.altdata.earnings_calendar import _safe_float
     assert _safe_float(float("nan")) is None
     assert _safe_float(float("inf")) is None

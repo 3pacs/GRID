@@ -16,8 +16,7 @@ import io
 import os
 import sys
 import time
-from datetime import date, datetime
-from typing import Any
+from datetime import datetime
 
 import requests
 from loguru import logger as log

@@ -22,14 +22,13 @@ import json
 import os
 import subprocess
 import threading
-import time as _time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from loguru import logger as log
 
-from server_log.sanitizer import Sanitizer, build_sanitizer_from_settings
+from server_log.sanitizer import build_sanitizer_from_settings
 
 _LOGS_DIR_NAME = ".server-logs"
 _INBOX_FILE = "inbox.jsonl"

@@ -34,7 +34,7 @@ DB shape must never break the prediction write path. Defaults are:
 from __future__ import annotations
 
 from dataclasses import is_dataclass, asdict
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from typing import Any, Iterable, Mapping
 
 from loguru import logger as log

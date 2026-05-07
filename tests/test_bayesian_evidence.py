@@ -3,10 +3,8 @@ from __future__ import annotations
 
 import math
 
-import pytest
 
 from intelligence.bayesian_evidence import (
-    BayesianResult,
     EvidenceItem,
     combine_evidence,
     from_oracle_votes,

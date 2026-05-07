@@ -22,10 +22,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import re
 import statistics
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -230,7 +229,6 @@ class CatalystClassifier:
 
     def _detect_type(self, text_lower: str) -> str:
         """Detect catalyst type from text keywords (word boundary matching)."""
-        import re
         checks = [
             (_EARNINGS_KW, "earnings"),
             (_GUIDANCE_KW, "guidance"),

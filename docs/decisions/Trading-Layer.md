@@ -19,11 +19,11 @@ promoted_via: OBSIDIAN-2 (task #76)
 - **`wallet_manager.py`** — Multi-wallet management. Each wallet has its own risk limits, kill switch, pause/resume.
 
 ### Prediction Markets
-- **`prediction_markets.py`** — Polymarket integration (buy, portfolio, markets)
+- **`prediction_markets.py`** — [[Polymarket]] integration (buy, portfolio, markets)
 - **`prediction_pmxt.py`** — PMXT (prediction market exchange) trader. Combined Polymarket + Kalshi.
 
 ### Options
-- **`options_recommender.py`** — Generates options trade recommendations based on vol surface, GEX, dealer positioning. Called daily at 07:00. See [[Options-Analytics]].
+- **`options_recommender.py`** — Generates options trade recommendations based on vol surface, [[Dealer Gamma|GEX]], dealer positioning. Called daily at 07:00. See [[Options-Analytics]].
 - **`options_tracker.py`** — Tracks and scores options recommendations over time. Weekly improvement cycle.
 
 ### Strategy
@@ -56,4 +56,4 @@ options_tracker.py (weekly scoring)
 
 - Hyperliquid integration is live — requires careful position management
 - Circuit breaker must be tested under extreme volatility scenarios
-- Options tracker scoring cycle can be slow for large recommendation sets
+- [[Options Tracker|Options tracker]] scoring cycle can be slow for large recommendation sets

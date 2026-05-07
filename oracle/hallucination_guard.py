@@ -20,7 +20,6 @@ provenance so the Oracle can learn from what it almost said.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, replace
 from functools import reduce
 from typing import Any

@@ -12,7 +12,6 @@ bad outcome never breaks the contract bus.
 """
 from __future__ import annotations
 
-from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from loguru import logger as log

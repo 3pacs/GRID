@@ -9,7 +9,7 @@ promoted_via: OBSIDIAN-2 (task #76)
 
 ## Event Bus (`orchestration/event_bus.py`)
 
-PostgreSQL-backed event bus and task queue. Uses `LISTEN/NOTIFY` for real-time delivery with polling fallback. No Redis/Celery dependency.
+[[PostgreSQL]]-backed event bus and task queue. Uses `LISTEN/NOTIFY` for real-time delivery with polling fallback. No Redis/Celery dependency.
 
 ```
 bus = EventBus(engine)
@@ -29,7 +29,7 @@ Priority queue keeping the local Qwen 32B model working continuously.
 
 **Priority levels:**
 1. Real-time requests (trade reviews, user chat)
-2. Hermes cycle tasks (scheduled work)
+2. [[Hermes Scheduler|Hermes]] cycle tasks (scheduled work)
 3. Background generators (feature interpretation, hypothesis generation)
 
 Auto-fills with background work when queue is empty. Provides status introspection via API.

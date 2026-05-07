@@ -49,9 +49,9 @@ import json
 import math
 import statistics
 import sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Iterable
+from typing import Any
 
 from loguru import logger as log
 from sqlalchemy import text
@@ -60,7 +60,6 @@ from sqlalchemy.engine import Engine
 # IMPORT — never reimplement. These are the exact entry points the live
 # decision gateway calls, so any calibration drift shows up here too.
 from features.per_signal_brier import (
-    CANONICAL_HORIZONS,
     MIN_CALIBRATED_SAMPLES,
     SignalScorecard,
     compute_conviction_weight,
@@ -79,7 +78,6 @@ from trading.trade_ticket_generator import generate_ticket
 # scripts.bootstrap_per_signal_brier owns the oracle_predictions row shape
 # + the 3-layer contribution cascade. Reuse it verbatim so we never diverge.
 from scripts.bootstrap_per_signal_brier import (
-    ORACLE_AGGREGATE_SOURCE,
     _coerce_confidence,
     _coerce_horizon_days,
     _load_oracle_models_lookup,

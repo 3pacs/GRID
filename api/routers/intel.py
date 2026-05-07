@@ -522,7 +522,7 @@ async def intel_ticker(
     engine = get_db_engine()
     ticker = symbol.upper()
     cutoff = date.today() - timedelta(days=days)
-    today = date.today()
+    date.today()
 
     result: dict[str, Any] = {
         "ticker": ticker,
@@ -744,7 +744,7 @@ async def intel_ticker(
                     "ORDER BY created_at DESC "
                     "LIMIT 1"
                 ),
-                {"q": f"%regime%"},
+                {"q": "%regime%"},
             ).fetchone()
             if row:
                 payload = _safe_json(row[0])
@@ -1993,7 +1993,7 @@ async def intel_briefing(
                     "is_100x": r[9],
                     "scanned_at": _safe_isoformat(r[10]),
                     "invalidation": (
-                        f"Score drops below 4.0 or IV normalizes above 50th pct"
+                        "Score drops below 4.0 or IV normalizes above 50th pct"
                         + (f" or {r[0]} moves >5% against {r[3]} before {expiry_str}" if expiry_str else "")
                     ),
                     "confidence_label": "derived",

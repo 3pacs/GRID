@@ -53,19 +53,15 @@ Pipeline entry points:
 from __future__ import annotations
 
 import math
-from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
-from typing import Iterable
 
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from intelligence.cross_reference import (
-    CONTRADICTION_THRESHOLD,
     CrossRefCheck,
     LieDetectorReport,
-    MAJOR_DIVERGENCE_THRESHOLD,
     MINOR_DIVERGENCE_THRESHOLD,
     MIN_OBSERVATIONS,
     ZSCORE_LOOKBACK_DAYS,
@@ -273,7 +269,7 @@ def _align_latest_pair(
     """
     if not reported_delta or not observed_delta:
         return None, None
-    r_by_date = {d: v for d, v in reported_delta}
+    {d: v for d, v in reported_delta}
     o_by_date = {d: v for d, v in observed_delta}
     # Walk reported dates from newest to oldest, find the closest
     # observed date within ±2d.

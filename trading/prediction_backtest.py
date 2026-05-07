@@ -30,10 +30,8 @@ Usage:
 
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -258,7 +256,7 @@ class MomentumReversalStrategy(BaseStrategy):
     """
 
     def on_trade(self, trade: pd.Series, market_state: dict[str, Any]) -> str | None:
-        lookback = self.params.get("lookback", 24)
+        self.params.get("lookback", 24)
         threshold = self.params.get("threshold", 0.05)
         recent = market_state.get("recent_prices", [])
 

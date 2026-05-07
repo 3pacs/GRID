@@ -22,7 +22,7 @@ This project is an **options dealer-flow alpha layer** that converts raw optio
 
 The engine is designed to estimate and aggregate:
 
-- **Gamma Exposure (GEX)**
+- **Gamma Exposure ([[Dealer Gamma|GEX]])**
     
 - **Gamma Flip**
     
@@ -1166,7 +1166,7 @@ Deliverables:
     
 - cross-venue consensus features
     
-- walk-forward backtests
+- [[Walk-Forward Backtesting|walk-forward]] backtests
     
 
 ### Phase 4 — Production hardening
@@ -1181,7 +1181,7 @@ Deliverables:
     
 - config versioning
     
-- packaged deployment targets
+- packaged [[deployment]] targets
     
 
 ---

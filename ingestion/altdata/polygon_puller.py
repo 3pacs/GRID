@@ -15,7 +15,7 @@ Free tier: 5 API calls/minute. Paid: unlimited.
 from __future__ import annotations
 
 import time
-from datetime import date, datetime, timedelta
+from datetime import date
 from typing import Any
 
 import requests
@@ -97,7 +97,7 @@ class PolygonPuller(BasePuller):
 
         # Fallback: get contract list (free tier) then fetch snapshots
         try:
-            data = self._api_get(f"/v3/reference/options/contracts", {
+            data = self._api_get("/v3/reference/options/contracts", {
                 "underlying_ticker": ticker,
                 "limit": 100,
                 "order": "desc",
@@ -197,7 +197,7 @@ class PolygonPuller(BasePuller):
 
     def pull_dividends(self, ticker: str) -> list[dict[str, Any]]:
         """Pull dividend history."""
-        data = self._api_get(f"/v3/reference/dividends", {
+        data = self._api_get("/v3/reference/dividends", {
             "ticker": ticker, "limit": 50, "order": "desc",
         })
         return data.get("results", [])

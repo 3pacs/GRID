@@ -18,10 +18,9 @@ Pipeline:
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 from dataclasses import dataclass, asdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from typing import Any
 
 import numpy as np
@@ -290,7 +289,7 @@ def predict_earnings_reaction(engine: Engine, ticker: str) -> dict:
             return {"ticker": ticker, "status": "no_upcoming_earnings"}
 
         earn_date = upcoming[0]
-        eps_estimate = upcoming[1]
+        upcoming[1]
 
         # ── Signal 1: Historical surprise pattern ──
         hist = conn.execute(text("""

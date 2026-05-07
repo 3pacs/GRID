@@ -51,7 +51,7 @@ import argparse
 import json
 import sys
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any
 
 from loguru import logger as log
 from sqlalchemy import text
@@ -60,7 +60,6 @@ from sqlalchemy.engine import Engine
 # IMPORT — never reimplement. record_scored_prediction owns the Welford
 # update path for per_signal_brier_history.
 from features.per_signal_brier import (
-    CANONICAL_HORIZONS,
     ensure_tables,
     record_scored_prediction,
 )

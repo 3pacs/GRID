@@ -9,7 +9,6 @@ Exported symbols used outside this package:
 from __future__ import annotations
 
 import re
-import time
 from typing import Any
 
 from loguru import logger as log
@@ -327,7 +326,7 @@ def _batch_fetch_prices(tickers: list[str]) -> dict[str, dict]:
         df = yf.download(joined, period="5d", group_by="ticker", progress=False)
 
         # Reverse map: yfinance ticker -> original ticker
-        reverse_map = {v: k for k, v in yf_map.items()}
+        {v: k for k, v in yf_map.items()}
 
         results: dict[str, dict] = {}
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -448,7 +447,6 @@ def _preload_one(tk: str) -> str | None:
     Called by the /preload endpoint in watchlist_core.py.
     Returns the uppercased ticker on success, None on failure.
     """
-    from typing import Any
 
     try:
         ticker_upper = tk.strip().upper()

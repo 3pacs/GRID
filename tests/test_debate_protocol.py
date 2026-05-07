@@ -2,7 +2,6 @@
 
 from unittest.mock import patch
 
-import pytest
 
 from agents.adapter import compute_conviction_score
 from agents.config import scale_debate_rounds

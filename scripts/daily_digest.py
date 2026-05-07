@@ -17,7 +17,7 @@ Runs as step 7b in the Hermes operator cycle, or standalone:
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from loguru import logger as log
@@ -177,7 +177,7 @@ def _build_digest_sections(
 ) -> list[dict[str, Any]]:
     """Build email sections for the daily digest."""
     sections: list[dict[str, Any]] = []
-    now = datetime.now(timezone.utc)
+    datetime.now(timezone.utc)
 
     # ── Error Summary ──
     critical = [i for i in issues if i["severity"] == "CRITICAL"]

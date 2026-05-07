@@ -43,7 +43,7 @@ SignalHealth so a broken puller is never silently trusted.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 

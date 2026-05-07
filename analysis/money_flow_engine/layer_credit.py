@@ -206,7 +206,6 @@ def _build_repo_stress_node(engine: Engine, as_of: date) -> FlowNode:
 
     # Repo market size ~$4.5T. Store the pool size, keep rate as metadata.
     _REPO_MARKET_SIZE = 4_500_000_000_000
-    rate_raw = value
 
     return FlowNode(
         id="repo_stress",

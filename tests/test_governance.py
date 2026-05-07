@@ -410,7 +410,6 @@ class TestModelRegistryTransitionValid:
     def test_staging_to_production_demotes_existing(self):
         """STAGING -> PRODUCTION demotes the existing PRODUCTION model."""
         engine = _mock_engine()
-        conn = engine._mock_conn
 
         # First call (connect context): model lookup
         # Subsequent calls (begin context): existing prod lookup, then updates

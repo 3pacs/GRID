@@ -8,9 +8,8 @@ correct logic for deduplication.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-import pytest
 
 from hyperspace.client import HyperspaceClient
 from hyperspace.embeddings import GRIDEmbeddings

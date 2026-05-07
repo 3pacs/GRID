@@ -9,9 +9,7 @@ All SQL uses parameterized queries via psycopg2 %s / %(name)s placeholders.
 
 from __future__ import annotations
 
-import math
 import re
-from datetime import datetime, timezone
 from typing import Any
 
 from loguru import logger as log

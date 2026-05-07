@@ -23,14 +23,16 @@ vs straddling boundaries.
 """
 
 import json
-import os
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from loguru import logger as log
 from sqlalchemy import text
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 from db import get_engine
 from store.pit import PITStore
@@ -131,7 +133,6 @@ def _compute_stress_index(
     Returns:
         1D array of stress index values, one per row.
     """
-    import pandas as pd
 
     active_weights = weights if weights is not None else FEATURE_WEIGHTS
     n_rows = len(feature_matrix)

@@ -15,7 +15,6 @@ from api.auth import require_auth, require_role
 from api.dependencies import get_db_engine
 from api.schemas.system import (
     DatabaseStatus,
-    FamilyCoverage,
     FamilyFreshness,
     FreshnessResponse,
     GridStats,
@@ -520,7 +519,6 @@ async def pipeline_health(
                     status = "broken"
                     freshness = "red"
                 else:
-                    from datetime import timedelta as _td
 
                     age = datetime.now(timezone.utc) - last_pull.replace(
                         tzinfo=timezone.utc
@@ -1105,7 +1103,6 @@ async def update_settings(
     Only non-secret, non-database fields may be updated via this endpoint.
     Restart is required for changes to take effect.
     """
-    import re
 
     blocked = _SECRET_FIELDS | {"DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"}
     updates = {k: v for k, v in payload.items() if k not in blocked and k != "settings"}
@@ -1284,18 +1281,6 @@ async def get_services(
         log.debug("Services: Hyperspace check failed: {e}", e=str(exc))
     services.append({"name": "Hyperspace", "status": "online" if hs_online else "offline"})
 
-    # 7. TAO Miner (check process)
-    tao_online = False
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", "tao_miner|bittensor"],
-            capture_output=True, text=True, timeout=3,
-        )
-        tao_online = result.returncode == 0
-    except Exception as exc:
-        log.debug("Services: TAO Miner process check failed: {e}", e=str(exc))
-    services.append({"name": "TAO Miner", "status": "online" if tao_online else "offline"})
-
     # Disk & Memory (summary for quick access)
     resource_info = {}
     try:
@@ -1412,7 +1397,6 @@ def _get_puller_stats(engine) -> list[dict]:
                     status = "new"
                     last_run = None
                 else:
-                    from datetime import timedelta
 
                     lp = last_pull.replace(tzinfo=timezone.utc) if last_pull.tzinfo is None else last_pull
                     age = datetime.now(timezone.utc) - lp
@@ -1546,7 +1530,7 @@ async def architecture(_token: str = Depends(require_auth)) -> dict:
             "children": [
                 {"id": "resolver", "label": "Conflict Resolver", "type": "processor",
                  "status": "healthy" if resolved_count > 0 else "new"},
-                {"id": "entity_map", "label": f"Entity Map", "type": "processor",
+                {"id": "entity_map", "label": "Entity Map", "type": "processor",
                  "status": "healthy"},
             ],
         },

@@ -480,13 +480,13 @@ class Ephemeris:
         h_next, _, _ = self._heliocentric_position(planet, T_next)
         e_next, _, _ = self._heliocentric_position("Earth", T_next)
 
-        geo_prev = _normalize_angle(h_prev - e_prev)
-        geo_next = _normalize_angle(h_next - e_next)
+        _normalize_angle(h_prev - e_prev)
+        _normalize_angle(h_next - e_next)
 
         # For proper geocentric, we should use full computation but the
         # simplified helio-minus-earth gives a good retrograde indicator
         # for outer planets. For inner planets we need full geocentric.
-        T_curr = self.centuries_since_j2000(dt)
+        self.centuries_since_j2000(dt)
 
         # Use full geocentric for accuracy
         def _quick_geo_lon(T: float) -> float:
@@ -882,7 +882,7 @@ class Ephemeris:
         moon_pos = self.compute_position("Moon", dt)
         moon_lon = moon_pos["geocentric_longitude"]
         current_sign = moon_pos["zodiac_sign"]
-        sign_idx = ZODIAC_SIGNS.index(current_sign)
+        ZODIAC_SIGNS.index(current_sign)
 
         # Degrees remaining in current sign
         deg_remaining = 30.0 - moon_pos["zodiac_degree"]
@@ -895,7 +895,6 @@ class Ephemeris:
         last_aspect = None
         makes_aspect = False
         step = 0.25  # quarter-day steps
-        check_dt = dt
 
         steps = int(days_to_exit / step) + 1
         for s in range(steps + 1):

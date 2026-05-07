@@ -12,7 +12,6 @@ Usage:
     python scripts/obsidian_backlinks.py --report      # Show link report only
 """
 
-import os
 import re
 import sys
 from pathlib import Path
@@ -283,7 +282,7 @@ def is_inside_link(text: str, match_start: int, match_end: int) -> bool:
     """Check if a match position is already inside a [[wikilink]], URL, or code block."""
     # Inside [[...]]
     before = text[:match_start]
-    after = text[match_end:]
+    text[match_end:]
 
     # Check if inside [[...]]
     last_open = before.rfind("[[")
@@ -394,6 +393,22 @@ def add_wikilinks(content: str, file_path: Path, all_entities: dict[str, str]) -
             fence_open = not fence_open
         in_code_block[i] = fence_open
 
+    # Pre-compute YAML frontmatter membership. The frontmatter is the
+    # block bracketed by `---` markers at the very top of the file. The
+    # backlinker used to wrap path values inside `source:` and other
+    # frontmatter keys, breaking them as filesystem references — e.g.
+    # `source: /path/Architecture/x.md` became
+    # `source: /path/[[architecture|Architecture]]/x.md`. Frontmatter is
+    # structured data, not prose, so skip it wholesale.
+    in_frontmatter = [False] * len(lines)
+    if lines and lines[0].strip() == "---":
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                # Mark the opening, body, and closing all as frontmatter
+                for j in range(0, i + 1):
+                    in_frontmatter[j] = True
+                break
+
     # Prefilter: only check entities that actually appear in this file
     content_lower = content.lower()
     active_patterns = [
@@ -408,6 +423,10 @@ def add_wikilinks(content: str, file_path: Path, all_entities: dict[str, str]) -
 
     for line_idx, line in enumerate(lines):
         if in_code_block[line_idx]:
+            new_lines.append(line)
+            continue
+
+        if in_frontmatter[line_idx]:
             new_lines.append(line)
             continue
 
@@ -457,7 +476,7 @@ def generate_report(all_changes: dict[str, list[str]], files: list[Path]):
     linked_files = sum(1 for c in all_changes.values() if c)
 
     print(f"\n{'='*60}")
-    print(f"OBSIDIAN BACKLINK REPORT")
+    print("OBSIDIAN BACKLINK REPORT")
     print(f"{'='*60}")
     print(f"Files scanned:  {len(files)}")
     print(f"Files modified: {linked_files}")
@@ -536,8 +555,8 @@ def main():
         return
 
     if not apply:
-        print(f"\nDry run complete. Use --apply to write changes.")
-        print(f"  python scripts/obsidian_backlinks.py --apply")
+        print("\nDry run complete. Use --apply to write changes.")
+        print("  python scripts/obsidian_backlinks.py --apply")
         return
 
     # Apply changes

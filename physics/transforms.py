@@ -22,7 +22,6 @@ import numpy as np
 import pandas as pd
 from loguru import logger as log
 from scipy import stats
-from scipy.optimize import minimize_scalar
 
 
 # ===================================================================

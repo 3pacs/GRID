@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-07
 **Status:** Approved
-**Goal:** Build a continuous connection mapping spider that discovers and maps actor relationships up to 11 degrees of separation, keeps the full graph in RAM (512GB server), and renders confidence-colored connections in the actor network visualization.
+**Goal:** Build a continuous connection mapping spider that discovers and maps actor relationships up to 11 degrees of separation, keeps the full graph in RAM (512GB server), and renders confidence-colored connections in the [[Actor Network|actor network]] visualization.
 
 ---
 
@@ -14,15 +14,15 @@ The system has four layers:
 
 2. **Spider Daemon** — A continuous background service (`grid-spider` systemd unit) that walks the graph, discovers new connections from 13 data sources, resolves entities, and enriches actors via LLM. Runs 24/7. Processes ~50-200 actors/hour. When all actors are explored to degree 11, re-enriches stale actors (oldest first).
 
-3. **Data Sources** — 13 sources across 4 confidence tiers feed the spider. Existing pullers (SEC, FARA, FEC, ICIJ, etc.) plus new adapters (Wikidata, OpenCorporates, GDELT co-occurrence, Google News, LLM speculation, operator input).
+3. **Data Sources** — 13 sources across 4 confidence tiers feed the spider. Existing pullers (SEC, [[FARA]], FEC, ICIJ, etc.) plus new adapters (Wikidata, OpenCorporates, [[GDELT]] co-occurrence, Google News, LLM speculation, operator input).
 
-4. **PostgreSQL** — Persistence layer. `actors`, `actor_connections`, `spider_queue`, `spider_runs` tables. The in-memory graph syncs from Postgres on startup and receives atomic updates from the spider daemon.
+4. **[[PostgreSQL]]** — Persistence layer. `actors`, `actor_connections`, `spider_queue`, `spider_runs` tables. The in-memory graph syncs from Postgres on startup and receives atomic updates from the spider daemon.
 
 ## 2. Phased Rollout
 
 **Phase 1 — Evidence Crawler (first):** BFS from 489 seed actors. Every new actor must have a source citation. LLM enriches each node. Builds the trust backbone. Target: 50K-100K high-confidence actors.
 
-**Phase 2 — Bulk Skeleton (second):** Import ICIJ (785K entities), SEC 13F filers, FEC donors, OpenCorporates officers. Entity resolution matches against Phase 1 actors. Fill degrees 4-11. Target: 1M-5M actors.
+**Phase 2 — Bulk Skeleton (second):** Import ICIJ (785K entities), SEC [[Institutional Flows|13F]] filers, FEC donors, OpenCorporates officers. Entity resolution matches against Phase 1 actors. Fill degrees 4-11. Target: 1M-5M actors.
 
 The spider never stops after Phase 2 — it continuously re-enriches, discovers rabbit holes, and processes operator leads.
 
@@ -75,7 +75,7 @@ Creates new actors only for genuinely new entities. Every new actor gets:
 
 ### Stage 4: LLM Enrichment
 
-Local LLM (Hermes/Nemotron on the z4 server) generates a structured profile from all gathered evidence:
+Local LLM ([[Hermes Scheduler|Hermes]]/Nemotron on the z4 server) generates a structured profile from all gathered evidence:
 
 - Key relationships with context
 - Trading patterns (if insider/congressional)

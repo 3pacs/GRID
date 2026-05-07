@@ -173,7 +173,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             len(drift[sub]["differs"]) - 20,
         )
         if truncated:
-            print(f"     ... and more (truncated to first 20 per category)")
+            print("     ... and more (truncated to first 20 per category)")
 
     if drift:
         print()

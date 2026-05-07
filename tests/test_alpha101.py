@@ -9,7 +9,6 @@ import pytest
 from features.alpha101 import (
     Alpha101Engine,
     correlation,
-    covariance,
     decay_linear,
     delay,
     delta,
@@ -20,10 +19,8 @@ from features.alpha101 import (
     sma,
     stddev,
     ts_argmax,
-    ts_argmin,
     ts_max,
     ts_min,
-    ts_rank,
     ts_sum,
 )
 

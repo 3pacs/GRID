@@ -237,7 +237,7 @@ def main():
     best_score = 0.0
     iteration = 0
 
-    print(f"=== GRID AutoAgent Runner ===")
+    print("=== GRID AutoAgent Runner ===")
     print(f"Task: {args.task}")
     print(f"Iterations: {'unlimited' if args.iterations == 0 else args.iterations}")
     print(f"Deadline: {deadline or 'none'}")
@@ -281,11 +281,11 @@ def main():
         )
 
         if not result["success"]:
-            print(f"  [WARN] Harbor returned non-zero exit code")
+            print("  [WARN] Harbor returned non-zero exit code")
             if result["stderr"]:
                 print(f"  stderr: {result['stderr'][:200]}")
 
-    print(f"\n=== Run complete ===")
+    print("\n=== Run complete ===")
     print(f"Iterations: {iteration - 1}")
     print(f"Best score: {best_score:.4f}")
     print(f"Results: {RESULTS_TSV}")

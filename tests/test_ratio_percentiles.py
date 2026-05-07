@@ -11,7 +11,7 @@ to features/lab.py on 2026-04-11 (SYNTH-12 / Wave 3 dedupe). The alias
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 

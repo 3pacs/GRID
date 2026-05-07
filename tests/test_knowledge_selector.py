@@ -6,8 +6,6 @@ from knowledge.selector import (
     _tokenize,
     _tf,
     _cosine_sim,
-    _tfidf_vector,
-    _idf,
     select_knowledge,
     select_and_format,
 )

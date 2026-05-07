@@ -13,18 +13,15 @@ Covers:
 
 from __future__ import annotations
 
-import math
 from datetime import date, timedelta
 from unittest.mock import MagicMock
 
-import pandas as pd
 import pytest
 
 from intelligence.pattern_library import (
     BaseRateDistribution,
     CONFIDENCE_SATURATION_COUNT,
     DEFAULT_K_NEAREST,
-    DEFAULT_OUTCOME_THRESHOLD_PCT,
     FORWARD_HORIZONS_DAYS,
     HistoricalAnalog,
     LIQUIDITY_STATE_ORDERING,

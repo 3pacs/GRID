@@ -8,14 +8,12 @@ mocked database results.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
-import pytest
 
 from intelligence.cross_reference import (
-    CrossRefCheck,
     LieDetectorReport,
     MINOR_DIVERGENCE_THRESHOLD,
     MAJOR_DIVERGENCE_THRESHOLD,
@@ -26,10 +24,6 @@ from intelligence.cross_reference import (
     _make_check,
     _generate_narrative,
     check_gdp_vs_physical,
-    check_inflation_vs_inputs,
-    check_central_bank_actions_vs_words,
-    check_employment_reality,
-    check_trade_bilateral,
     get_cross_ref_for_ticker,
     run_all_checks,
 )

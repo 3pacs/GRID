@@ -24,7 +24,6 @@ from intelligence.causation_core import (
     _safe_float,
     _macro_series_to_name,
 )
-from intelligence.causation_scoring import find_causes
 
 
 # ══════════════════════════════════════════════════════════════════════════

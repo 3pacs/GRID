@@ -31,9 +31,9 @@ Started as a daemon thread when the API boots.
 
 Started as a daemon thread from `api/main.py`. Handles all data source pulling.
 
-**Daily pulls**: FRED, yfinance, BLS, EDGAR, options chains, Tiingo, CoinGecko, social sentiment, fear/greed index, Google Trends, CBOE indices, Fed speeches, Baltic Dry
+**Daily pulls**: [[FRED]], yfinance, [[BLS]], [[EDGAR]], options chains, Tiingo, [[CoinGecko]], social sentiment, fear/greed index, Google Trends, CBOE indices, Fed speeches, [[Baltic Dry Index|Baltic Dry]]
 
-**Monthly pulls**: International sources (ECB, BCB, BIS, IMF, OECD, Eurostat, MAS, KOSIS, RBI, ABS_AU), physical data (USDA, patents, VIIRS, OFR), trade data (Comtrade, CEPII, WIOD, Atlas ECI)
+**Monthly pulls**: International sources ([[ECB]], BCB, BIS, IMF, OECD, Eurostat, MAS, KOSIS, RBI, ABS_AU), physical data ([[USDA]], patents, VIIRS, OFR), trade data (Comtrade, CEPII, WIOD, Atlas ECI)
 
 **Idempotency**: Uses `_last_run` timestamps to prevent duplicate pulls on server restart.
 
@@ -48,7 +48,7 @@ Autonomous daemon running every 5 minutes (300s cycle):
 5. **Autoresearch** — generates hypotheses when healthy
 6. **Self-Diagnostics** — reads own error logs, proposes fixes
 
-**Hermes Configuration:**
+**[[Hermes Scheduler|Hermes]] Configuration:**
 - `CYCLE_INTERVAL_SECONDS = 300` (5 min between cycles)
 - `CYCLE_TIMEOUT_SECONDS = 900` (15 min max per cycle)
 - `PIPELINE_INTERVAL_HOURS = 6`

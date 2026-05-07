@@ -7,7 +7,7 @@ requiring a live database connection.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
 from validation.gates import GateChecker
 
@@ -577,10 +577,10 @@ class TestStagingToProduction:
         conn.execute.side_effect = [result_model, result_count, result_no_prod]
 
         gc = GateChecker(db_engine=mock_engine)
-        result = gc.check_staging_to_production(10)
+        gc.check_staging_to_production(10)
 
         # Verify "LIQUIDITY" layer appears in one of the SQL calls
-        call_args = [str(c) for c in conn.execute.call_args_list]
+        [str(c) for c in conn.execute.call_args_list]
         assert any("LIQUIDITY" in str(args) for args in conn.execute.call_args_list)
 
     def test_staging_to_production_details_always_list(self, mock_engine):

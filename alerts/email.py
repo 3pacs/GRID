@@ -305,7 +305,6 @@ def send_insight(category: str, title: str, content: str, metadata: dict | None 
     """Send a newsletter for a noteworthy LLM insight."""
     if content is None:
         return
-    accent_map = {"regime_analysis": "amber", "hypothesis": "purple", "critique": "red", "explanation": "", "100x_opportunity": "purple"}
     _send(
         f"GRID Intelligence — {title}",
         [_section_insight(title, content)],

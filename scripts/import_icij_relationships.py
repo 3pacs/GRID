@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Import 3.3M ICIJ relationships into actor_connections."""
-import csv, os, sys
+import csv
+import os
+import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db import get_engine
 from sqlalchemy import text
@@ -49,7 +51,7 @@ with open(csv_path) as f:
                             "VALUES (:a, :b, :r, :s) ON CONFLICT DO NOTHING"
                         ), b)
                 inserted += len(batch)
-            except Exception as e:
+            except Exception:
                 skipped += len(batch)
             batch = []
             if inserted % 100000 == 0:

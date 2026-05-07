@@ -188,6 +188,15 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["X-XSS-Protection"] = "1; mode=block"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        # Permissions-Policy: deny browser features GRID has no business
+        # using. Closes audit item #56. Camera/mic/geolocation are
+        # particularly relevant — even if the app never asks for them, an
+        # XSS slip-through could try.
+        response.headers["Permissions-Policy"] = (
+            "accelerometer=(), camera=(), geolocation=(), gyroscope=(), "
+            "magnetometer=(), microphone=(), payment=(), usb=(), "
+            "interest-cohort=()"
+        )
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
             "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://static.cloudflareinsights.com; "
@@ -299,7 +308,16 @@ if not allowed_origins:
             "http://127.0.0.1:5173",
         ]
     else:
-        # Production default — explicit allowlist required for credentials.
+        # Production default — falls back to known origin, but log a
+        # warning so the operator knows GRID_ALLOWED_ORIGINS wasn't set.
+        # Misdeploying to a new domain without the env var would silently
+        # accept the old origin only, which is safer than allowing all
+        # but worth flagging.
+        log.warning(
+            "GRID_ALLOWED_ORIGINS not set in production — falling back "
+            "to hardcoded default. Set the env var explicitly to avoid "
+            "this warning and to support multi-origin deployments."
+        )
         allowed_origins = ["https://grid.stepdad.finance"]
 
 app.add_middleware(

@@ -77,8 +77,11 @@ class ModelSpec:
 class ModelFactory:
 
     def __init__(self, engine: Engine) -> None:
+        # Process-level guard: ALTER TABLE oracle_models would otherwise
+        # fire on every construction. See schema_guard.py.
+        from schema_guard import ensure_once
         self.engine = engine
-        self._ensure_columns()
+        ensure_once("ModelFactory.columns", self._ensure_columns)
 
     # Security: frozen whitelists for DDL identifiers and type definitions.
     # col_name is checked against _ALLOWED_COLUMNS + regex; col_def is checked
@@ -286,7 +289,7 @@ def migrate_default_models(engine: Engine) -> None:
        so that when a new source (like ``sector_network``) is added to
        the default list, existing prod rows actually pick it up.
     """
-    factory = ModelFactory(engine)
+    ModelFactory(engine)
     default_wc = {"mode": "equal", "trust_decay_half_life_days": 90.0, "min_weight": 0.1, "max_weight": 3.0, "family_weights": None}
 
     for model_name, sources in _DEFAULT_SIGNAL_SOURCES.items():

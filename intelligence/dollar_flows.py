@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 import re
 from collections import defaultdict
-from datetime import date, timedelta, timezone
+from datetime import date, timedelta
 from typing import Any
 
 from loguru import logger as log

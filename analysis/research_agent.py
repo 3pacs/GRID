@@ -21,7 +21,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from analysis.sector_map import SECTOR_MAP, get_actor_influence, get_sector_features
+from analysis.sector_map import SECTOR_MAP, get_actor_influence
 
 
 # ── Gap Analysis ────────────────────────────────────────────────

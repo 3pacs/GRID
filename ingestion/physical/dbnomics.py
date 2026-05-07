@@ -8,7 +8,7 @@ Acts as a fallback and supplementary source for international data.
 from __future__ import annotations
 
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date
 from typing import Any
 
 import pandas as pd

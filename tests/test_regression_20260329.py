@@ -19,10 +19,6 @@ from __future__ import annotations
 
 import os
 import re
-import time
-import threading
-from datetime import date, datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -39,11 +35,9 @@ class TestConvictionFormat:
 
     def test_flow_thesis_conviction_is_0_to_100(self):
         """flow_thesis.conviction_pct must be 0-100, not 0-1."""
-        from analysis.flow_thesis import FLOW_KNOWLEDGE
         # Simulate: even if all theses are bullish, conviction <= 100
         # The min(100, ...) cap on line 666 ensures this.
         # Verify the code path exists:
-        import ast
         import inspect
         from analysis import flow_thesis
         source = inspect.getsource(flow_thesis.generate_unified_thesis)
@@ -258,7 +252,6 @@ class TestHermesCycleTimeout:
 
     def test_cycle_timeout_constant_exists(self):
         """Hermes operator must define CYCLE_TIMEOUT_SECONDS."""
-        import importlib
         # Can't import hermes_operator directly (it has side effects),
         # so read the source
         with open(os.path.join(os.path.dirname(__file__), "..", "scripts", "hermes_operator.py")) as f:

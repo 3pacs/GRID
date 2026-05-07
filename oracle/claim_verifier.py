@@ -7,8 +7,8 @@ and returns a verdict: supported, contradicted, insufficient, or ambiguous.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Literal
+from dataclasses import dataclass
+from typing import Literal
 
 from loguru import logger as log
 from sqlalchemy import text as sql_text

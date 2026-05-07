@@ -18,7 +18,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import numpy as np
 import pandas as pd
 from loguru import logger as log
 

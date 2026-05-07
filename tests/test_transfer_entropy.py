@@ -2,11 +2,9 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from analysis.transfer_entropy import (
     _DEFAULT_BINS,
-    LeadLagScan,
     TransferEntropyResult,
     discover_leaders,
     pair_transfer_entropy,

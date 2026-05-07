@@ -8,11 +8,10 @@ mocked database results.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
-from unittest.mock import MagicMock, patch, PropertyMock
+from datetime import date
+from unittest.mock import MagicMock, patch
 import json
 
-import pytest
 
 from ingestion.altdata.gov_contracts import (
     CONTRACTOR_TICKER_MAP,
@@ -25,8 +24,6 @@ from intelligence.gov_intel import (
     ContractRecord,
     InsiderContractOverlap,
     get_recent_contracts,
-    get_contracts_for_ticker,
-    detect_contract_insider_overlap,
     _parse_payload,
 )
 

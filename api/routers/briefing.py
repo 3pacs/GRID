@@ -14,7 +14,6 @@ Endpoints:
 
 from __future__ import annotations
 
-from datetime import date, timedelta
 
 from fastapi import APIRouter, Depends, Query
 from loguru import logger as log

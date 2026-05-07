@@ -32,17 +32,17 @@ The transformation has 6 architectural vectors:
 
 ### What v4 Does Well (DON'T BREAK)
 
-- **PIT-correct data pipeline** — `store/pit.py` with DISTINCT ON, vintage policies, lookahead guard
-- **170+ data source integrations** — 7 subpackages, unified scheduler, Hermes 24/7 operator
+- **[[PIT Store|PIT-correct]] data pipeline** — `store/pit.py` with DISTINCT ON, vintage policies, lookahead guard
+- **170+ data source integrations** — 7 subpackages, unified scheduler, [[Hermes Scheduler|Hermes]] 24/7 operator
 - **Custom in-memory actor graph** — `intelligence/spider/graph_engine.py`, microsecond traversals, 495+ actors
 - **Self-improving Oracle** — 6 models, signal/anti-signal, weight evolution, 10,893 predictions pending scoring
-- **Self-tuning options scanner** — 7 signals with adaptive weights, Kelly sizing, 5-layer sanity gates
-- **22+ D3 visualization components** — ActorNetwork, MoneyFlow, CrossReference, Timeline, 3D ActorUniverse
+- **Self-tuning [[Options Scanner|options scanner]]** — 7 signals with adaptive weights, Kelly sizing, 5-layer sanity gates
+- **22+ D3 visualization components** — [[Actor Network View|ActorNetwork]], [[MoneyFlow View|MoneyFlow]], [[Cross Reference View|CrossReference]], Timeline, 3D ActorUniverse
 - **WebSocket real-time** — auto-reconnect, 15+ event types, exponential backoff
-- **Immutable decision journal** — full provenance, outcome tracking, postmortem automation
-- **Model governance** — CANDIDATE → SHADOW → STAGING → PRODUCTION state machine with gate checks
+- **Immutable [[Decision Journal|decision journal]]** — full provenance, outcome tracking, [[Postmortem|postmortem]] automation
+- **[[Model Governance|Model governance]]** — CANDIDATE → SHADOW → STAGING → PRODUCTION state machine with gate checks
 - **3-tier LLM routing** — LOCAL/REASON/ORACLE with automatic fallback chain
-- **Multi-source conflict resolution** — family-specific thresholds, priority ranking, conflict logging
+- **Multi-source [[Conflict Resolution|conflict resolution]]** — family-specific thresholds, priority ranking, conflict logging
 
 ### What v4 Gets Wrong (FIX)
 
@@ -229,7 +229,7 @@ GRID v4 broadcasts events via in-process asyncio. Events are lost on restart, ca
 
 ### Solution: PostgreSQL LISTEN/NOTIFY + SSE
 
-**Why not Kafka/Redpanda?** GRID is a single-server system with 512GB RAM. Adding a message broker adds operational complexity for no benefit. PostgreSQL's built-in LISTEN/NOTIFY gives us:
+**Why not Kafka/Redpanda?** GRID is a single-server system with 512GB RAM. Adding a message broker adds operational complexity for no benefit. [[PostgreSQL]]'s built-in LISTEN/NOTIFY gives us:
 - Zero additional infrastructure
 - Transactional event emission (event fires only if the INSERT commits)
 - Channel-based routing
@@ -908,7 +908,7 @@ Phase 6: Geo-Spatial (OPTIONAL) ◄┘
 5. **No microservices** — GRID is a single-operator system. Monolith is correct.
 6. **No React Native** — PWA with Capacitor wrapper (already planned for Q4 2026)
 7. **No full TypeScript rewrite** — Incremental migration, new files only
-8. **No frontend framework change** — React 18 + Zustand stays. No Next.js, no Remix.
+8. **No frontend framework change** — React 18 + [[Zustand]] stays. No Next.js, no Remix.
 
 ---
 
@@ -916,7 +916,7 @@ Phase 6: Geo-Spatial (OPTIONAL) ◄┘
 
 GRID v5 earns the "Palantir" label when an operator can:
 
-1. **Start from any signal** (unusual dark pool, congressional trade, regime shift)
+1. **Start from any signal** (unusual [[Dark Pool|dark pool]], congressional trade, regime shift)
 2. **Open a canvas** and drag the signal onto it
 3. **Expand the network** — see connected actors, tickers, committees, institutions
 4. **Search for evidence** — find filings, cables, predictions, theses that mention the entities

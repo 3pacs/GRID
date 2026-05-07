@@ -2,11 +2,9 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from analysis.lead_lag_backtest import (
     FoldResult,
-    WalkForwardResult,
     _correlation_at_lag,
     _directional_hit_rate,
     _estimate_half_life,

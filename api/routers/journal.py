@@ -2,18 +2,15 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from loguru import logger as log
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine, get_journal
 from api.schemas.journal import (
     JournalEntryCreate,
-    JournalEntryResponse,
     JournalOutcomeRecord,
     JournalStatsResponse,
 )

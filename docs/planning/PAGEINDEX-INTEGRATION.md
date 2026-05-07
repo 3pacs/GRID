@@ -6,9 +6,9 @@
 
 ## Problem Statement
 
-GRID's current RAG stack (pgvector + sentence-transformers / Ollama nomic-embed-text) excels at fast similarity search over pre-chunked text but has two blind spots:
+GRID's current RAG stack (pgvector + sentence-transformers / [[Ollama]] nomic-embed-text) excels at fast similarity search over pre-chunked text but has two blind spots:
 
-1. **No PDF ingestion** — SEC filings (10-K, 10-Q, 13F), FOIA cables, earnings transcripts, and diplomatic documents arrive as PDFs. We have no way to parse and reason over them natively.
+1. **No PDF ingestion** — SEC filings (10-K, 10-Q, [[Institutional Flows|13F]]), [[FOIA]] cables, earnings transcripts, and diplomatic documents arrive as PDFs. We have no way to parse and reason over them natively.
 2. **Structural reasoning** — Vector similarity treats all chunks as flat bags of meaning. For structured financial documents, "What was the change in operating margin between Q3 and Q4?" requires navigating a document hierarchy, not matching embedding distance.
 
 PageIndex solves both: it builds a hierarchical tree from document structure (TOC, headings, sections), then uses LLM reasoning — not vector similarity — to navigate to the right pages. It achieved **98.7% accuracy on FinanceBench**, a financial document QA benchmark.
@@ -123,7 +123,7 @@ async def index_earnings_transcript(ticker: str, quarter: str) -> int:
 **Tasks:**
 - [ ] Extend `edgar_transcripts.py` to fetch PDF versions when available
 - [ ] Create `ingestion/document_indexer.py` orchestrator
-- [ ] Add Hermes scheduler jobs for document indexing (daily, after market close)
+- [ ] Add [[Hermes Scheduler|Hermes scheduler]] jobs for document indexing (daily, after market close)
 - [ ] Backfill existing corpus (~500 documents)
 - [ ] Feed extracted sections into existing `index_document()` for pgvector fast path
 
@@ -170,19 +170,19 @@ class QueryRouter:
 
 **High-value integrations:**
 
-1. **Cross-Reference lie detector** (`intelligence/cross_reference.py`)
-   - Deep-query Fed minutes and BLS methodology PDFs to check if government stats align with the underlying methodology described in source documents
+1. **[[Cross Reference|Cross-Reference]] lie detector** (`intelligence/cross_reference.py`)
+   - Deep-query Fed minutes and [[BLS]] methodology PDFs to check if government stats align with the underlying methodology described in source documents
    - Example: "Does the CPI methodology PDF describe the substitution adjustment that explains this divergence?"
 
-2. **Actor Network enrichment** (`intelligence/actor_network.py`)
+2. **[[Actor Network]] enrichment** (`intelligence/actor_network.py`)
    - Extract board memberships, compensation, and ownership from 10-K/proxy PDFs
    - Currently hardcoded 495 actors — PageIndex enables dynamic extraction from filings
 
-3. **Postmortem analysis** (`intelligence/postmortem.py`)
-   - When a trade fails, pull the specific sections from relevant filings that were available at decision time (PIT-correct document retrieval)
-   - "What did the 10-Q say about supply chain risk in the quarter before the miss?"
+3. **[[Postmortem]] analysis** (`intelligence/postmortem.py`)
+   - When a trade fails, pull the specific sections from relevant filings that were available at decision time ([[PIT Store|PIT-correct]] document retrieval)
+   - "What did the 10-Q say about [[Supply Chain|supply chain]] risk in the quarter before the miss?"
 
-4. **Causation tracing** (`intelligence/causation.py`)
+4. **[[Causation]] tracing** (`intelligence/causation.py`)
    - Link market moves to specific disclosures found in documents
    - "Trace the 8% drop to the specific risk factor disclosed in the 10-K"
 
@@ -209,7 +209,7 @@ GET  /api/documents/search         # Search across indexed documents
 **Frontend integration points:**
 - **WhyView** (`pwa/src/WhyView.jsx`) — Add "Source Documents" panel showing PageIndex-retrieved evidence with page numbers
 - **Timeline** (`pwa/src/Timeline.jsx`) — Link events to source document sections
-- **IntelDashboard** — Document search with tree navigation
+- **[[Intel Dashboard View|IntelDashboard]]** — Document search with tree navigation
 - New **DocumentViewer** component — renders document tree with expandable sections and highlighted evidence
 
 **Tasks:**

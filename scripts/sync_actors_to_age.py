@@ -12,7 +12,6 @@ Safe to re-run — uses MERGE (upsert) semantics.
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 import time
 

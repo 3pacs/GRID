@@ -12,15 +12,13 @@ FOMC calendar: hardcoded schedule (updated annually).
 
 from __future__ import annotations
 
-import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import requests
 from loguru import logger as log
-from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, retry_on_failure

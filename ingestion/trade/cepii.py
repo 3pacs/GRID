@@ -8,12 +8,10 @@ BACI provides reconciled bilateral trade flows at the HS6 product level.
 from __future__ import annotations
 
 import os
-import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date
 from typing import Any
 
 import pandas as pd
-import requests
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine

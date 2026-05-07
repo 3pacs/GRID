@@ -6,11 +6,10 @@ All tests use mocked database and PIT store fixtures; no real PostgreSQL require
 from __future__ import annotations
 
 from datetime import date
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from discovery.orthogonality import OrthogonalityAudit
 

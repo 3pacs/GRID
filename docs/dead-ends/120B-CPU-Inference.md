@@ -18,7 +18,7 @@ tags: [dead-end, llm]
 - Tried as ORACLE-only tier: request timed out after 15 minutes
 
 ## Why It Failed
-MoE architecture needs ALL weights in fast memory. With 88 layers and only 10 on GPU, every token decode crosses the CPU-GPU boundary 78 times. CPU memory bandwidth (~50 GB/s) is the bottleneck, not compute.
+MoE [[architecture]] needs ALL weights in fast memory. With 88 layers and only 10 on GPU, every token decode crosses the CPU-GPU boundary 78 times. CPU memory bandwidth (~50 GB/s) is the bottleneck, not compute.
 
 ## Don't Retry Unless
 - Get 2x A6000 (96GB VRAM total) — fits entirely on GPU

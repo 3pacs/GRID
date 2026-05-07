@@ -8,20 +8,13 @@ import pytest
 
 from analysis.money_flow_engine.types import FlowEdge, FlowLayer, FlowMap, FlowNode
 from intelligence.money_flow_adapter import (
-    ALIGNED_MEDIUM,
     ALIGNED_STRONG,
     ALIGNED_WEAK,
-    LAYERS_MEDIUM,
-    LAYERS_STRONG,
-    LAYERS_WEAK,
-    MIN_LAYERS_FOR_SCORING,
     MULTIPLIER_CEILING,
     MULTIPLIER_FLOOR,
     NEUTRAL_MULTIPLIER,
     OPPOSED_MEDIUM,
     OPPOSED_STRONG,
-    OPPOSED_WEAK,
-    SCORE_MEDIUM,
     SCORE_STRONG,
     SCORE_WEAK,
     MoneyFlowConvictionReport,

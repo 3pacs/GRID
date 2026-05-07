@@ -5,7 +5,7 @@ promoted_via: OBSIDIAN-2 (task #76)
 ---
 # GRID System Architecture
 
-GRID is a self-improving intelligence amplifier for financial markets. It ingests data from 90+ sources, resolves it into a canonical feature store, runs ML inference and intelligence analysis, and serves everything through a FastAPI backend + React PWA.
+GRID is a self-improving intelligence amplifier for financial markets. It ingests data from 90+ sources, resolves it into a canonical feature store, runs ML inference and intelligence analysis, and serves everything through a [[FastAPI]] backend + React PWA.
 
 ## System Layers
 
@@ -55,11 +55,11 @@ GRID is a self-improving intelligence amplifier for financial markets. It ingest
 
 ## Key Infrastructure
 
-- **Database**: PostgreSQL with ~15 core tables ([[Database-Schema]])
-- **LLM Stack**: Qwen 32B (local via llama.cpp), Ollama, Claude/GPT/HF cloud
+- **Database**: [[PostgreSQL]] with ~15 core tables ([[Database-Schema]])
+- **LLM Stack**: Qwen 32B (local via [[llama.cpp]]), [[Ollama]], Claude/GPT/HF cloud
 - **Compute**: gridz4 worker node via Tailscale, BOINC-style distributed compute
-- **Deployment**: systemd services, Cloudflare tunnel
-- **Scheduling**: `schedule` library in-process, Hermes operator daemon
+- **[[deployment|Deployment]]**: systemd services, Cloudflare tunnel
+- **Scheduling**: `schedule` library in-process, [[Hermes Scheduler|Hermes operator]] daemon
 
 ## Data Flow Summary
 
@@ -80,5 +80,5 @@ See [[Data-Pipeline]] for detailed data flow documentation.
 - [[API-Endpoints-Master]] — complete endpoint listing
 - [[Feature-Registry]] — the 1,281 features
 - [[Entity-Map]] — how raw data maps to features
-- [[Planning-Docs]] — architecture and planning document index
+- [[Planning-Docs]] — [[architecture]] and planning document index
 - [[META-Agent-Brief-Template]] — template for agent briefing notes

@@ -7,7 +7,6 @@ Bottom section (FIXED): Harbor adapter. Do not modify below the boundary.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 # ============================================================
@@ -203,8 +202,6 @@ async def run_task(agent: Any, instruction: str, context: dict) -> Any:
 # unless explicitly asked by the operator.
 # ============================================================
 
-import asyncio
-import json
 import time
 from dataclasses import dataclass, field
 

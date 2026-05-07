@@ -51,7 +51,7 @@ monitor is trivially testable.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from loguru import logger as log

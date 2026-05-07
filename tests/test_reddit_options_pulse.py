@@ -18,7 +18,6 @@ from ingestion.altdata.reddit_options_pulse import (
     TICKER_PATTERN,
     TOP_N_TICKERS,
     ZERO_DTE_TOKENS,
-    _aggregate_pulse,
     _flatten_comments,
     _rank_tickers,
     compute_bull_bear_ratio,

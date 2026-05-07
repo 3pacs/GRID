@@ -12,8 +12,7 @@ from __future__ import annotations
 
 import os
 import time
-from datetime import date, datetime, timedelta
-from typing import Any
+from datetime import date, datetime
 
 import requests
 from loguru import logger as log

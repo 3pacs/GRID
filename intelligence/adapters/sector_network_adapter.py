@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from loguru import logger as log
 from sqlalchemy.engine import Engine
@@ -249,7 +250,7 @@ class SectorNetworkAdapter:
                     w = _sector_weight(entry)
                     if w is not None:
                         weights[tkr] = w
-                total_weight = sum(w for w, _ in weights.values())
+                sum(w for w, _ in weights.values())
 
                 # Only emit sector_share within one basis family. If the
                 # sector mixes market_cap and revenue entries, prefer

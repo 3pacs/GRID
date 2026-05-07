@@ -14,14 +14,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
 from loguru import logger as log
 from sqlalchemy import text
 
@@ -140,7 +137,7 @@ def run_paper_trading(engine) -> dict:
         return {"status": "KILLED", "risk": risk}
 
     wallet = wm.get_wallet(wallet_id)
-    current_capital = wallet["current_capital"]
+    wallet["current_capital"]
 
     # Run rotation strategy
     today = date.today()
@@ -254,7 +251,7 @@ def run_paper_trading(engine) -> dict:
 def show_dashboard(engine) -> None:
     """Print current rotation paper trading dashboard."""
     wm = WalletManager(engine)
-    pe = PaperTradingEngine(engine)
+    PaperTradingEngine(engine)
 
     wallets = wm.get_all_wallets(exchange=WALLET_EXCHANGE)
     if not wallets:

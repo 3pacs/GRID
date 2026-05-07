@@ -7,16 +7,13 @@ detection, and the full audit pipeline with mocked database results.
 
 from __future__ import annotations
 
-from collections import defaultdict
-from datetime import date, datetime, timezone
-from unittest.mock import MagicMock, patch, call
+from datetime import date
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from intelligence.source_audit import (
-    DEFAULT_DISCREPANCY_THRESHOLD,
     FAMILY_DISCREPANCY_THRESHOLDS,
     MIN_OVERLAP_DAYS,
     WEIGHT_ACCURACY,
@@ -28,10 +25,7 @@ from intelligence.source_audit import (
     detect_discrepancies,
     run_full_audit,
     update_source_priorities,
-    get_latest_audit_summary,
     _find_yfinance_tiebreaker,
-    _fetch_series,
-    ensure_tables,
 )
 
 
@@ -187,7 +181,7 @@ class TestDetectDiscrepancies:
         mock_family.return_value = "equity"
 
         conn_mock = MagicMock()
-        begin_mock = MagicMock()
+        MagicMock()
         begin_conn = MagicMock()
 
         # First two calls: fetch latest values for SRC_A and SRC_B

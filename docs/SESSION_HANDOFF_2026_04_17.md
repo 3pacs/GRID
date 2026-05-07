@@ -4,7 +4,7 @@
 **Runtime-fix baseline before this doc:** `33a94dee`.
 **Redbox node integration merged from other agent:** `3d7c6520` via merge commit `40c9719c`.
 **Scope:** Puller/scheduler hardening, hourly catch-up stability, production data-flow cleanup.
-**Result:** Production API is healthy, scheduler/Hermes are active, and fresh timestamped puller error scans were clean after the final deploy.
+**Result:** Production API is healthy, scheduler/[[Hermes Scheduler|Hermes]] are active, and fresh timestamped puller error scans were clean after the final deploy.
 
 ---
 
@@ -36,8 +36,8 @@ For API-only files, use `--restart --smoke` when practical.
 - Fresh follow-up after the "consume every article" correction:
   - Scheduler news ingestion no longer passes an article cap; RSS scheduler smoke consumed all active feed articles.
   - `ingestion/fred.py` now normalizes fedfred frames by preferring the observation-date index over realtime-vintage `date` columns. This fixed fresh `H8B1023NCBCMG` and `TOTRESNS` `{'error': "'date'"}` failures.
-  - FRED retry wrappers that only expose `HTTPStatusError` in their string/repr now soft-skip instead of writing `FAILED` rows.
-  - `ingestion/international/ecb.py` moved from retired `sdw-wsrest.ecb.europa.eu` to `data-api.ecb.europa.eu`, requests `format=jsondata`, and soft-skips transient ECB upstream failures.
+  - [[FRED]] retry wrappers that only expose `HTTPStatusError` in their string/repr now soft-skip instead of writing `FAILED` rows.
+  - `ingestion/international/ecb.py` moved from retired `sdw-wsrest.ecb.europa.eu` to `data-api.ecb.europa.eu`, requests `format=jsondata`, and soft-skips transient [[ECB]] upstream failures.
   - ECB scheduled keys were updated to current portal keys for M3, NFC loan growth, German sovereign yield proxy, and Italian sovereign yield proxy.
   - Production smoke at `2026-04-18 03:52 UTC`: all 6 ECB scheduled series returned `SUCCESS`; fresh `FAILED` scan since `2026-04-18 03:52 UTC` returned 0 rows.
 
@@ -45,7 +45,7 @@ For API-only files, use `--restart --smoke` when practical.
   - Made API-key constructor behavior explicit via `api_key_mode`.
   - Fixed Tiingo, Tiingo news, Tiingo fundamentals, KOSIS-style keyword args, and env-key-only pullers.
   - Corrected QuiverQuant registry path to `ingestion.altdata.quiverquant`.
-  - Added bounded GDELT fast-lane kwargs so it cannot consume the whole scheduler tick.
+  - Added bounded [[GDELT]] fast-lane kwargs so it cannot consume the whole scheduler tick.
 
 - `ingestion/altdata/quiverquant.py`
   - Added `QuiverQuantPuller` adapter class so the scheduler registry resolves a real class.
@@ -74,10 +74,10 @@ For API-only files, use `--restart --smoke` when practical.
 ### Earlier same-day hardening already pushed
 
 - Added hourly GRID catch-up script and cron entry.
-- Added separate hourly AstroGrid catch-up script and cron entry.
+- Added separate hourly [[AstroGrid]] catch-up script and cron entry.
 - Kept AstroGrid separate but running on top of the GRID API.
 - Hardened FRED permanent 400/404 handling.
-- Hardened solar Kp, Fed liquidity parsing, Finviz insider URL, prediction odds scan cap, signal convergence parsing.
+- Hardened solar Kp, [[Fed Liquidity|Fed liquidity]] parsing, Finviz insider URL, prediction odds scan cap, signal convergence parsing.
 - Restored missing oracle ensemble/model-registry/horizon behavior.
 - Added pull lifecycle contract handler.
 - Updated system health so external `grid-scheduler`/`grid-hermes` service status backs ingestion/thread checks.
@@ -154,7 +154,7 @@ What changed after checking Hugging Face and benchmarking local candidates:
   - Observed throughput was not acceptable for routine use.
 - Existing Gemma 31B file was tested on temp port `8091`:
   - File: `/data/models/gemma-4-31B-it-Q4_K_M.gguf`
-  - It projected to fit GPU memory, but did not become healthy on the current llama.cpp build; log stopped around a Gemma4 tensor-name formatting issue.
+  - It projected to fit GPU memory, but did not become healthy on the current [[llama.cpp]] build; log stopped around a Gemma4 tensor-name formatting issue.
 - Existing Qwen2.5 32B file was tested on temp port `8091` and briefly promoted:
   - File: `/data/models/archive/Qwen2.5-32B-Instruct-Q4_K_M.gguf`
   - Fully offloaded `65/65` layers to CUDA.
@@ -354,7 +354,7 @@ The user still wants the app to surface intelligence in ingestible bites. The ne
    - Add Playwright coverage for expand/detail if absent.
 
 2. Unique findings / "why this matters" surface.
-   - Need a page/card/stream that shows high-signal non-obvious findings from convergence, cross-reference, actor graph, and backtests.
+   - Need a page/card/stream that shows high-signal non-obvious findings from convergence, [[Cross Reference|cross-reference]], actor graph, and backtests.
    - Avoid dumping tables. Show small digestible cards with evidence links and confidence.
 
 3. Chart containment.

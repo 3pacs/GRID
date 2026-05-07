@@ -20,7 +20,6 @@ import sys
 from datetime import date, timedelta
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 from loguru import logger as log
 
@@ -44,13 +43,12 @@ from alpha_research.signals.macro_regime import (
     sector_dispersion_signal,
     relative_strength_signal,
 )
-from alpha_research.ensemble import train_ensemble, _build_feature_matrix, _DEFAULT_LGB_PARAMS
+from alpha_research.ensemble import _build_feature_matrix, _DEFAULT_LGB_PARAMS
 from alpha_research.validation.metrics import (
     long_short_returns,
     sharpe_ratio,
     max_drawdown,
     annualized_return,
-    calmar_ratio,
     compute_signal_metrics,
 )
 

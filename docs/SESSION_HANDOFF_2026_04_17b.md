@@ -1,7 +1,7 @@
 # Session Handoff - 2026-04-17b
 
 **Branch/main at handoff:** `3d7c652` (PR #43 squash-merged to main).
-**Scope:** Bring up redbox as a GRID compute node; wire it into the router as an opt-in QUICK-tier llama.cpp provider.
+**Scope:** Bring up redbox as a GRID compute node; wire it into the router as an opt-in QUICK-tier [[llama.cpp]] provider.
 **Result:** redbox is a live Tailscale-reachable GRID node. grid-svr offloads news-sentiment and UX-audit LLM calls to it. Both other compute nodes (grid-svr, gridz4) remain running; gridz4 is unchanged and not yet wired.
 
 ---

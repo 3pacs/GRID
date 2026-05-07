@@ -53,7 +53,7 @@ once per weak streak and is cleared the moment correlation recovers.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 import numpy as np

@@ -7,7 +7,6 @@ mocking HTTP calls so no live server is required.
 
 from __future__ import annotations
 
-import json
 from unittest.mock import MagicMock, patch
 
 import pytest

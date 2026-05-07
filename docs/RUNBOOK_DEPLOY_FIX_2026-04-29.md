@@ -176,7 +176,7 @@ The two fixes are localized to three files (`normalization/resolver.py`, `discov
 
 ## What this runbook does NOT do
 
-- **Doesn't run alembic migrations**: there are none for this PR set, and the project has unrelated pending revisions on the schedule audit branch — running `upgrade head` blindly would apply those too.
+- **Doesn't run alembic [[migrations]]**: there are none for this PR set, and the project has unrelated pending revisions on the schedule audit branch — running `upgrade head` blindly would apply those too.
 - **Doesn't rebuild the frontend**: backend-only change.
 - **Doesn't fix the failing CI Backend Tests check**: PR #63 and #64 both merged with that check red, on the user's explicit override. The failure pre-dates this PR set; investigate separately.
 - **Doesn't touch `grid-coordinator` or `grid-worker`**: per `CLAUDE.md` the canonical "restart all" set is `grid-api grid-llamacpp grid-crucix grid-hermes`. If your cron actually runs the pipeline via `grid-worker`, restart that too.

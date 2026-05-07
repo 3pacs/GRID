@@ -3,20 +3,17 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timezone
-from pathlib import Path
-from typing import Any
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger as log
 from pydantic import BaseModel
 from sqlalchemy import text
 
 from api.auth import require_auth
-from api.dependencies import get_db_engine, get_pit_store
+from api.dependencies import get_db_engine
 from api.schemas.regime import (
     RegimeCurrentResponse,
-    RegimeDriver,
     RegimeHistoryEntry,
     RegimeHistoryResponse,
     RegimeTransition,
@@ -86,7 +83,7 @@ async def update_weights(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Save weight overrides and re-run regime classification."""
-    from scripts.auto_regime import DEFAULT_FEATURE_WEIGHTS, _load_effective_weights, run_with_weights
+    from scripts.auto_regime import DEFAULT_FEATURE_WEIGHTS, run_with_weights
 
     engine = get_db_engine()
     # Merge with defaults

@@ -2,16 +2,12 @@
 
 from __future__ import annotations
 
-import io
-from datetime import date
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
 
 from ingestion.altdata.redfin_puller import (
-    METRICS,
-    TOP_METROS,
     RedfinPuller,
     _normalise_region,
 )
@@ -311,7 +307,7 @@ class TestPullAll:
 
 class TestSeriesIdFormat:
     def test_national_format(self):
-        assert f"redfin:national:median_sale_price" == "redfin:national:median_sale_price"
+        assert "redfin:national:median_sale_price" == "redfin:national:median_sale_price"
 
     def test_metro_format(self):
         region = _normalise_region("New York, NY")

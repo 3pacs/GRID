@@ -5,16 +5,11 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from features.per_signal_brier import (
-    MIN_CALIBRATED_SAMPLES,
     SignalScorecard,
 )
 from intelligence.signal_provenance import (
-    ANTI_CONVICTION_THRESHOLD,
-    STRONG_CONVICTION_THRESHOLD,
-    WEAK_CONVICTION_THRESHOLD,
     CausationChain,
     SignalEvidence,
     TradeProvenanceReport,

@@ -167,7 +167,7 @@ This reads `schema.sql` and creates all tables, indexes, and constraints.
 
 ### Database Migrations
 
-[[Alembic]] is configured for schema migrations:
+[[Alembic]] is configured for schema [[migrations]]:
 
 ```bash
 cd grid
@@ -375,7 +375,7 @@ Before going live, verify every item:
 - [ ] **Firewall configured** -- Only ports 22 (SSH), 80, 443 exposed; port 5432 and 8000 internal only
 - [ ] **API docs disabled** -- Swagger UI (`/api/docs`) is automatically disabled when `ENVIRONMENT != development`
 - [ ] **Request body limit** -- Default 10 MB via `GRID_MAX_BODY_BYTES` middleware (prevent OOM)
-- [ ] **Security headers active** -- Verified in production: HSTS, CSP, X-Frame-Options, X-Content-Type-Options
+- [ ] **[[Security]] headers active** -- Verified in production: HSTS, CSP, X-Frame-Options, X-Content-Type-Options
 - [ ] **WebSocket auth** -- Uses first-message auth pattern (tokens not in URLs)
 - [ ] **Rate limiting** -- Login attempts limited to 5 per 60 seconds (persisted to disk via shelve)
 

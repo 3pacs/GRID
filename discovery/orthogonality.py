@@ -507,7 +507,7 @@ class OrthogonalityAudit:
         # Compute correlation matrix
         corr = df.corr().values
         n = len(df.columns)
-        col_ids = [int(c) if str(c).isdigit() else c for c in df.columns]
+        [int(c) if str(c).isdigit() else c for c in df.columns]
 
         # Map column positions back to feature IDs
         col_to_id = {}

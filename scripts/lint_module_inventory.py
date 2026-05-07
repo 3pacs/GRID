@@ -41,7 +41,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 
 # Reuse the same canonical scan dirs as pre_create_check.py. This list is the

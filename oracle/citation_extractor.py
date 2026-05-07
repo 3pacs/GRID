@@ -8,7 +8,6 @@ family-level matching. No LLM dependency — pure string matching.
 
 from __future__ import annotations
 
-import re
 from loguru import logger as log
 
 

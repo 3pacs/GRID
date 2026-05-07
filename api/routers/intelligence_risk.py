@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends
 from loguru import logger as log
 
 from api.auth import require_auth
@@ -801,7 +801,7 @@ async def get_globe_data(
     Cached for 10 minutes. Heavy computation runs in a thread pool.
     """
     import asyncio
-    from datetime import datetime, timezone, date as dt_date, timedelta
+    from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc)
     if (

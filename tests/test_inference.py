@@ -16,7 +16,7 @@ All external dependencies (DB, PITStore, FeatureLab, TrainedModelBase) are mocke
 from __future__ import annotations
 
 from datetime import date
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd

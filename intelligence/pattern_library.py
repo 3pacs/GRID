@@ -25,9 +25,9 @@ Pipeline:
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any
 
 import pandas as pd
 from loguru import logger as log

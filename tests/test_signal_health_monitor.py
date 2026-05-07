@@ -15,14 +15,6 @@ import pytest
 
 from intelligence.signal_health_monitor import (
     EXPECTED_CADENCE_BY_PREFIX,
-    NAN_RATE_ORANGE,
-    NAN_RATE_RED,
-    NAN_RATE_YELLOW,
-    DRIFT_Z_RED,
-    DRIFT_Z_YELLOW,
-    STALENESS_ORANGE_MULT,
-    STALENESS_RED_MULT,
-    STALENESS_YELLOW_MULT,
     SignalHealth,
     SignalHealthReport,
     audit_all_series,
