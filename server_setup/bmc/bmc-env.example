@@ -1,0 +1,46 @@
+# BMC / IPMI environment variables for grid-svr's out-of-band controller.
+#
+# Copy this file to `bmc-env` (no extension) and fill in real values.
+# `bmc-env` is gitignored — do NOT commit it.
+#
+# Install location on grid-svr (or the gateway box for Approach B):
+#   /etc/grid/bmc-env       <- referenced by grid-bmc-tunnel.service
+# Install location for local use:
+#   server_setup/bmc/bmc-env
+#
+# Source it before running ipmitool:
+#   set -a; . ./bmc-env; set +a
+#   ipmitool -I lanplus -H "$BMC_IP" -U "$BMC_USER" -P "$BMC_PASS" chassis status
+
+# ---- REQUIRED ----
+
+# LAN IP of the BMC (NOT grid-svr's host OS IP).
+# Find via:  router DHCP leases  OR  `sudo ipmitool lan print 1` on grid-svr.
+BMC_IP=192.168.1.XXX                # CHANGE ME
+
+# Subnet that the Tailscale gateway should advertise so the BMC is reachable.
+# Use a /24 if you want any LAN host reachable, or a /32 if you only want
+# the BMC itself routed (more conservative, recommended).
+BMC_SUBNET=192.168.1.0/24           # CHANGE ME
+
+# BMC admin username. Vendor defaults:
+#   Supermicro:  ADMIN
+#   Dell iDRAC:  root
+#   HPE iLO:     Administrator
+#   ASRock:      admin
+#   Lenovo IMM:  USERID
+BMC_USER=ADMIN                      # CHANGE ME if not Supermicro
+
+# BMC admin password.
+# CHANGE THIS in the BMC web UI BEFORE TRUSTING THE NETWORK PATH.
+# Default Supermicro is `ADMIN`; default Dell is `calvin`; HPE is on a sticker.
+BMC_PASS=changeme                   # CHANGE ME
+
+# ---- OPTIONAL ----
+
+# Tailscale hostname of the gateway node that advertises BMC_SUBNET.
+# Used only by healthcheck.sh for log clarity.
+BMC_GATEWAY_HOSTNAME=bmc-gateway
+
+# Email or pager target for the healthcheck script (not yet wired).
+# BMC_ALERT_TO=anik@example.com
