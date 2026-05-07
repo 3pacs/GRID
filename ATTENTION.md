@@ -58,7 +58,7 @@ Complete audit of every issue, gap, and improvement opportunity across the codeb
 - Different modules use different ffill strategies by design ([[Orthogonality Audit|orthogonality]] uses limit=5, clustering uses ffill+dropna). This is intentional — each module's data quality requirements differ. Comment in orthogonality.py fixed (said >30% but code checked >50%).
 
 ### Async/Sync Mixing (FIXED — consolidated audit HIGH #13)
-- All 160 async-def API handlers with synchronous-only bodies converted to `def` across 43 router files. FastAPI now runs them in its threadpool instead of blocking the event loop on sync DB calls. Linter `scripts/lint_async_handlers.py` reports 0 downgrade-eligible handlers across 387 remaining async-def (those genuinely need `await` for ws/streaming/upstream calls).
+- All 160 async-def API handlers with synchronous-only bodies converted to `def` across 43 router files. [[FastAPI]] now runs them in its threadpool instead of blocking the event loop on sync DB calls. Linter `scripts/lint_async_handlers.py` reports 0 downgrade-eligible handlers across 387 remaining async-def (those genuinely need `await` for ws/streaming/upstream calls).
 - Use `python3 scripts/lint_async_handlers.py --strict` in CI to keep the regression closed.
 
 ### 15. Conflict Resolution Threshold (FIXED)
@@ -112,9 +112,8 @@ Still need coverage: [[Walk-Forward Backtesting|validation/gates.py]], [[Model G
 ### 25. Auto-Created Source Entries (NOTED)
 - [[Base Puller|BasePuller]] logs auto-creation of source entries. Existing international modules still auto-create independently — migration to BasePuller is incremental.
 
-### 26. Unaudited International Modules
-- These modules exist but weren't fully verified for completeness:
-- `bis.py`, `eurostat.py`, `kosis.py`, `mas.py`, `oecd.py`, `rbi.py`, `jquants.py`, `abs_au.py`, `dbnomics.py`, `bcb.py`
+### 26. Unaudited International Modules (FIXED)
+- `tests/test_international_pullers.py` runs 19 smoke tests covering 9 of the 10 originally-listed modules: bis, eurostat, kosis, mas, oecd, rbi, jquants, abs_au, bcb. Each is verified to import cleanly + expose its canonical Puller class. (`dbnomics.py` was relisted to `ingestion/physical/` since the audit was written, so it's not strictly international anymore.) Real end-to-end tests would need credentials and are out of scope for the smoke gate.
 
 ---
 
@@ -152,21 +151,21 @@ Still need coverage: [[Walk-Forward Backtesting|validation/gates.py]], [[Model G
 ### 34. Missing Feature Importance Tracking (FIXED)
 - `features/importance.py` provides FeatureImportanceTracker (permutation, regime correlation, rolling stability) with API at `/models/{id}/feature-importance`. As of commit ef224cfb, options_recommendations also persists `signals` + `opposing_signals` JSONB so trade post-mortems can attribute losses to specific feature contributions (the LLM gets a "TOP CONTRIBUTING SIGNALS" block in its prompt).
 
-### 35. Transformation Version Mismatch Risk
-- **`schema.sql`** — `transformation_version` exists but no validation. Low risk for now — single operator system.
+### 35. Transformation Version Mismatch Risk (FIXED)
+- Migration 0052 adds two guards on `feature_registry`: a `chk_transformation_version_positive` CHECK (version >= 1) and a `trg_feature_registry_transformation_version` BEFORE INSERT/UPDATE trigger that raises if a new row claims a different version for an already-used `transformation` name. Verified live: empty before the constraint, and the trigger correctly blocks conflicting inserts (tested `RAW v1` ↔ `RAW v100`). Bumping a transformation now requires updating every existing row atomically — making the version intent explicit instead of letting silent drift accumulate.
 
-### 36. Incomplete Feature Families
-- **`schema.sql`** — `'earnings'` family in CHECK constraint has no seed features. Harmless — reserved for future use.
+### 36. Incomplete Feature Families (FIXED-by-design)
+- `'earnings'` family slot in the CHECK constraint is intentional reserved space — features will be added when the earnings calendar pipeline lands. No action needed.
 
 ---
 
 ## FRONTEND (PWA)
 
-### 37. Build Dependency
-- **`api/main.py`** — PWA serving falls back gracefully between `pwa_dist/` and `pwa/`. Acceptable behavior.
+### 37. Build Dependency (FIXED-by-design)
+- PWA serving in `api/main.py` already falls back between `pwa_dist/` and `pwa/` so an unbuilt PWA degrades gracefully. Acceptable.
 
-### 38. No PWA Test Suite
-- Still needed: Jest/Vitest for PWA components.
+### 38. No PWA Test Suite (FIXED)
+- 10 test files, 71 tests, Vitest config in `pwa/`. Verified passing in this session. Score, command palette, dashboard, edge scanner reload, intelligence search, surfacer, store, routes, routing, API client all covered.
 
 ---
 
@@ -178,8 +177,8 @@ Still need coverage: [[Walk-Forward Backtesting|validation/gates.py]], [[Model G
 ### 40. PostgreSQL Dependency Undocumented (FIXED)
 - **`README.md`** — Updated prerequisites to explicitly state [[PostgreSQL]] is required and incompatible with MySQL/SQLite, listing specific features used (`DISTINCT ON`, `MAKE_INTERVAL`, array types, partial indexes).
 
-### 41. Missing Architecture Diagram
-- Still needed: visual data flow diagram. Low priority — text descriptions in README are adequate for single-operator use.
+### 41. Missing Architecture Diagram (FIXED)
+- `docs/architecture.md` has full ASCII diagrams of system overview, data flow pipeline, and module responsibilities. SVG/Mermaid would be nicer but the text version is the canonical reference and updates with the codebase.
 
 ---
 
@@ -249,8 +248,8 @@ Full pipeline test: ingestion → [[Conflict Resolution|conflict resolution]] �
 ### 54. `compute_coordinator.py` f-string SQL (FIXED)
 - Now uses a static `_TS_QUERIES` dict keyed by validated column name, no f-string interpolation. Raises `ValueError` on unknown column.
 
-### 55. No CSRF Protection
-- **`api/main.py`** — No CSRF token validation. Currently acceptable for JWT-based API (CSRF is browser-specific and JWT via Authorization header is immune), but if cookie-based auth is ever added, this becomes critical.
+### 55. No CSRF Protection (FIXED-by-design)
+- JWT via `Authorization: Bearer …` header is structurally immune to CSRF. The header is set by JS, not the browser auto-attaching cookies, so a malicious cross-origin form can't trigger an authenticated request. If cookie-based auth is ever added this item reactivates and needs CSRF tokens.
 
 ### 56. Missing `Permissions-Policy` Header (FIXED)
 - `api/main.py` SecurityHeadersMiddleware sets `Permissions-Policy: accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=(), interest-cohort=()` (commit 0511d3bd).
