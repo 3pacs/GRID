@@ -764,6 +764,46 @@ def run_intelligence_tasks(
         except Exception as exc:
             log.warning("holder_deal_overlap failed: {e}", e=str(exc))
 
+        # ── Daily file rotation (audit #49, #61) ────────────────────
+        # Insight files in outputs/llm_insights/ accumulate forever
+        # without cleanup; the dir hit 100k+ files (45 days, ~22k/day
+        # peaks) before this hook was wired in. 30-day retention caps
+        # steady-state at ~660k worst case, manageable.
+        try:
+            from outputs.llm_logger import cleanup_old_insights
+            n_cleaned = cleanup_old_insights(max_age_days=30)
+            if n_cleaned:
+                log.info("Insight cleanup: deleted {n} files (>30d)", n=n_cleaned)
+        except Exception as exc:
+            log.warning("Insight cleanup failed: {e}", e=str(exc))
+
+        # Market briefings — same pattern, 90-day retention since these
+        # are higher-value artifacts (full market write-ups).
+        try:
+            from ollama.market_briefing import MarketBriefingEngine
+            n_briefings = MarketBriefingEngine.cleanup_old_briefings(max_age_days=90)
+            if n_briefings:
+                log.info("Briefing cleanup: deleted {n} files (>90d)", n=n_briefings)
+        except Exception as exc:
+            log.warning("Briefing cleanup failed: {e}", e=str(exc))
+
+        # errors.jsonl — append-only log, just truncate to last 5000 lines
+        # (~3-4 days of errors at current rate). Cheap, atomic.
+        try:
+            from pathlib import Path
+            errfile = Path(_GRID_DIR) / ".server-logs" / "errors.jsonl"
+            if errfile.exists() and errfile.stat().st_size > 1_000_000:
+                lines = errfile.read_text(encoding="utf-8", errors="replace").splitlines()
+                if len(lines) > 5000:
+                    keep = lines[-5000:]
+                    tmp = errfile.with_suffix(".jsonl.tmp")
+                    tmp.write_text("\n".join(keep) + "\n", encoding="utf-8")
+                    tmp.replace(errfile)
+                    log.info("errors.jsonl rotated: {n} → 5000 lines",
+                             n=len(lines))
+        except Exception as exc:
+            log.warning("errors.jsonl rotation failed: {e}", e=str(exc))
+
         state.last_daily_intel = now
 
     # ── Daily at 3:00 AM UTC — sector health snapshot ───────────────

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import os
-import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -77,23 +76,12 @@ class ModelSpec:
 
 class ModelFactory:
 
-    # Process-level guard: every ModelFactory() previously executed 9
-    # ALTER TABLE oracle_models statements in __init__. Under concurrent
-    # load (multiple API requests + Hermes cycle + Oracle engine) the
-    # ALTERs serialised on ACCESS EXCLUSIVE lock, queued behind each
-    # other, and exhausted the connection pool. Run the schema check
-    # once per process; subsequent constructions skip. The lock makes
-    # the first-time path safe under FastAPI's threaded request pool.
-    _columns_ensured: bool = False
-    _ensure_lock: threading.Lock = threading.Lock()
-
     def __init__(self, engine: Engine) -> None:
+        # Process-level guard: ALTER TABLE oracle_models would otherwise
+        # fire on every construction. See schema_guard.py.
+        from schema_guard import ensure_once
         self.engine = engine
-        if not ModelFactory._columns_ensured:
-            with ModelFactory._ensure_lock:
-                if not ModelFactory._columns_ensured:
-                    self._ensure_columns()
-                    ModelFactory._columns_ensured = True
+        ensure_once("ModelFactory.columns", self._ensure_columns)
 
     # Security: frozen whitelists for DDL identifiers and type definitions.
     # col_name is checked against _ALLOWED_COLUMNS + regex; col_def is checked

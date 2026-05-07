@@ -28,7 +28,7 @@ import json
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, ClassVar
+from typing import Any
 
 import numpy as np
 from loguru import logger as log
@@ -590,22 +590,12 @@ class ModelRegistry:
 class OracleEngine:
     """The self-improving prediction engine."""
 
-    # Process-level guard — _ensure_tables runs 8+ CREATE TABLE/INDEX
-    # statements. Each construction would re-execute them. Same lock
-    # contention story as ModelFactory; gate behind a class flag.
-    _tables_ensured: bool = False
-    _ensure_lock: ClassVar[Any] = None  # set lazily in __init__ to avoid import order issues
-
     def __init__(self, db_engine: Engine) -> None:
+        # Process-level guard: _ensure_tables runs 8+ CREATE TABLE/INDEX.
+        # See schema_guard.py.
+        from schema_guard import ensure_once
         self.engine = db_engine
-        if not OracleEngine._tables_ensured:
-            import threading as _threading
-            if OracleEngine._ensure_lock is None:
-                OracleEngine._ensure_lock = _threading.Lock()
-            with OracleEngine._ensure_lock:
-                if not OracleEngine._tables_ensured:
-                    self._ensure_tables()
-                    OracleEngine._tables_ensured = True
+        ensure_once("OracleEngine.tables", self._ensure_tables)
         self.models = self._load_models()
         self._last_guard_verdicts: list = []
         log.info("Oracle initialised — {n} models loaded", n=len(self.models))
