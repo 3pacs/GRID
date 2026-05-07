@@ -207,3 +207,31 @@ class TestLlamacppReasoningResponses:
 
         client = LlamaCppClient(base_url="http://localhost:8081", model="Qwen3-32B-Q4_K_M")
         assert client.chat([{"role": "user", "content": "x"}], num_predict=8) is None
+
+    @patch("llamacpp.client.requests")
+    def test_inline_think_only_content_returns_none(self, mock_requests: object) -> None:
+        from unittest.mock import MagicMock
+
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.json.return_value = {"default_generation_settings": {"n_ctx": 8192}}
+        mock_requests.get.return_value = ok  # type: ignore[attr-defined]
+
+        unfinished = MagicMock()
+        unfinished.status_code = 200
+        unfinished.json.return_value = {
+            "model": "Qwen3-32B-Q4_K_M",
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {"content": "<think>still thinking</think>"},
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 8},
+        }
+        mock_requests.post.return_value = unfinished  # type: ignore[attr-defined]
+
+        from llamacpp.client import LlamaCppClient
+
+        client = LlamaCppClient(base_url="http://localhost:8081", model="Qwen3-32B-Q4_K_M")
+        assert client.chat([{"role": "user", "content": "x"}], num_predict=8) is None
