@@ -1281,18 +1281,6 @@ async def get_services(
         log.debug("Services: Hyperspace check failed: {e}", e=str(exc))
     services.append({"name": "Hyperspace", "status": "online" if hs_online else "offline"})
 
-    # 7. TAO Miner (check process)
-    tao_online = False
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", "tao_miner|bittensor"],
-            capture_output=True, text=True, timeout=3,
-        )
-        tao_online = result.returncode == 0
-    except Exception as exc:
-        log.debug("Services: TAO Miner process check failed: {e}", e=str(exc))
-    services.append({"name": "TAO Miner", "status": "online" if tao_online else "offline"})
-
     # Disk & Memory (summary for quick access)
     resource_info = {}
     try:

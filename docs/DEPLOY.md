@@ -30,7 +30,7 @@ python3 scripts/verify_systemd_units.py --fix-direction repo-to-live
 python3 scripts/verify_systemd_units.py --fix-direction live-to-repo
 ```
 
-**Canonical paths for ingestor/scheduler units** (everything except `grid-api`): `WorkingDirectory=/home/grid/grid_v4/grid_repo` and `EnvironmentFile=/home/grid/grid_v4/grid_repo/.env`. The earlier `…/grid_repo/grid/` paths in five units were typos — `grid_repo/grid/` exists but contains only a vestigial `migrations/` subdir, not the canonical scripts. `grid-hermes`, `grid-coordinator`, `grid-worker` were already corrected in live by hand; `grid-assimilator` and `grid-tao-miner` still drift in live and need a `daemon-reload + restart` to pick up the repo paths.
+**Canonical paths for ingestor/scheduler units** (everything except `grid-api`): `WorkingDirectory=/home/grid/grid_v4/grid_repo` and `EnvironmentFile=/home/grid/grid_v4/grid_repo/.env`. The earlier `…/grid_repo/grid/` paths in four units were typos — `grid_repo/grid/` exists but contains only a vestigial `migrations/` subdir, not the canonical scripts. `grid-hermes`, `grid-coordinator`, `grid-worker` were already corrected in live by hand; `grid-assimilator` still drifts in live and needs a `daemon-reload + restart` to pick up the repo paths.
 
 **`grid-api` exception:** intentionally lives on `/data/grid_v4/astrogrid_dedup` per the two-tree split documented above. The verifier does not flag this.
 
