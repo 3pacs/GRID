@@ -8,6 +8,7 @@ regime transition leaders.
 
 from __future__ import annotations
 
+import os
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -56,14 +57,45 @@ class ClusterDiscovery:
     def _get_eligible_feature_ids(self) -> list[int]:
         """Retrieve all model-eligible feature IDs.
 
+        Capped via GRID_CLUSTERING_MAX_FEATURES (default 500) so an
+        ever-growing feature_registry can't OOM the clustering job.
+        Features that have no rows in raw_series within the last year
+        are excluded — they'd just be all-NaN columns that the
+        clustering loop drops at the missing-pct filter anyway, but
+        loading them costs memory and PIT-pivot time.
+
         Returns:
-            list[int]: Feature IDs where model_eligible = TRUE.
+            list[int]: Feature IDs where model_eligible = TRUE, ordered
+            by id, capped at the env-configured ceiling.
         """
+        # Cap chosen to be safely above current usage (~1188 features
+        # with recent data as of 2026-05) while still preventing a
+        # runaway feature_registry from OOMing the clustering job.
+        # Bump via GRID_CLUSTERING_MAX_FEATURES if you grow past 1500.
+        max_features = int(os.getenv("GRID_CLUSTERING_MAX_FEATURES", "1500"))
         with self.engine.connect() as conn:
             rows = conn.execute(
-                text("SELECT id FROM feature_registry WHERE model_eligible = TRUE ORDER BY id")
+                text(
+                    "SELECT fr.id "
+                    "FROM feature_registry fr "
+                    "WHERE fr.model_eligible = TRUE "
+                    "  AND EXISTS ("
+                    "    SELECT 1 FROM resolved_series rs "
+                    "    WHERE rs.feature_id = fr.id "
+                    "      AND rs.obs_date >= NOW() - INTERVAL '365 days' "
+                    "  ) "
+                    "ORDER BY fr.id "
+                    "LIMIT :lim"
+                ),
+                {"lim": max_features},
             ).fetchall()
-        return [row[0] for row in rows]
+        ids = [row[0] for row in rows]
+        log.info(
+            "Eligible feature IDs: {n} (cap={cap}, recent-data filter)",
+            n=len(ids),
+            cap=max_features,
+        )
+        return ids
 
     def run_cluster_discovery(
         self,
@@ -77,7 +109,7 @@ class ClusterDiscovery:
         Parameters:
             n_components: Number of PCA components to use.
             as_of_date: Decision date (default: today).
-            start_date: Earliest date for feature data (default: 1947-01-01).
+            start_date: Earliest date for feature data (default: 5y back).
             output_dir: Directory for saving output files.
 
         Returns:
@@ -86,7 +118,11 @@ class ClusterDiscovery:
         if as_of_date is None:
             as_of_date = date.today()
         if start_date is None:
-            start_date = date(1947, 1, 1)
+            # Was hard-coded to 1947-01-01, which always tripped the
+            # GRID_PIT_MAX_YEARS=10 cap warning and loaded a far wider
+            # window than clustering needs. Override via the function
+            # arg if a longer history is genuinely required.
+            start_date = date(as_of_date.year - 5, as_of_date.month, as_of_date.day)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_path = Path(output_dir)
