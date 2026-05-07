@@ -63,10 +63,20 @@ def detect_gpu():
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode == 0 and result.stdout.strip():
-            parts = result.stdout.strip().split(",")
-            name = parts[0].strip()
-            vram = float(parts[1].strip()) / 1024  # MB to GB
-            return name, round(vram, 1)
+            rows = []
+            for line in result.stdout.strip().splitlines():
+                parts = [part.strip() for part in line.split(",", 1)]
+                if len(parts) != 2:
+                    continue
+                try:
+                    rows.append((parts[0], float(parts[1]) / 1024))
+                except ValueError:
+                    continue
+            if rows:
+                # Register the largest GPU so mixed-card hosts report a
+                # stable capability instead of crashing on multi-line output.
+                name, vram = max(rows, key=lambda row: row[1])
+                return name, round(vram, 1)
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
     return None, None
