@@ -425,6 +425,74 @@ class TestGitSinkCommit:
         assert "user.name=Custom Bot" in argv
         assert "user.email=bot@example.com" in argv
 
+    @patch("server_log.git_sink._git")
+    def test_stale_index_lock_is_removed_and_add_is_retried(self, mock_git, tmp_path):
+        """A stale .git/index.lock should not permanently block log commits."""
+        import os
+
+        (tmp_path / ".git").mkdir()
+        lock = tmp_path / ".git" / "index.lock"
+        lock.touch()
+        old = lock.stat().st_mtime - 300
+        os.utime(lock, (old, old))
+
+        from server_log.git_sink import GitSink
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        sink._pending_count = 1
+        mock_git.side_effect = [
+            (1, "fatal: Unable to create '.git/index.lock': File exists."),
+            (0, "add ok"),
+            (0, "commit ok"),
+        ]
+
+        sink._commit_and_push()
+
+        assert not lock.exists()
+        assert mock_git.call_args_list[0].args[0][0] == "add"
+        assert mock_git.call_args_list[1].args[0][0] == "add"
+
+    def test_fresh_index_lock_is_not_removed(self, tmp_path):
+        """A fresh git lock may belong to a live operator process."""
+        from server_log.git_sink import _clear_stale_index_lock
+
+        (tmp_path / ".git").mkdir()
+        lock = tmp_path / ".git" / "index.lock"
+        lock.touch()
+
+        assert _clear_stale_index_lock(tmp_path) is False
+        assert lock.exists()
+
+    @patch("server_log.git_sink._git")
+    def test_commit_failure_logs_warning_not_error(self, mock_git, tmp_path):
+        """Sink git failures should not recursively populate errors.jsonl."""
+        from loguru import logger
+
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        sink._pending_count = 1
+        mock_git.side_effect = [
+            (0, "add ok"),
+            (1, "On branch main\nyour branch and origin have diverged"),
+        ]
+
+        seen: list[tuple[str, str]] = []
+        sink_id = logger.add(
+            lambda msg: seen.append(
+                (msg.record["level"].name, msg.record["message"])
+            ),
+            level="WARNING",
+        )
+        try:
+            sink._commit_and_push()
+        finally:
+            logger.remove(sink_id)
+
+        assert any(
+            level == "WARNING" and "git commit failed" in message
+            for level, message in seen
+        )
+
 
 # ===================================================================
 # Inbox tests

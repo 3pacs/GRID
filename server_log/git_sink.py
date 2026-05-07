@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 import threading
+import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -83,6 +84,25 @@ def _git(args: list[str], cwd: Path) -> tuple[int, str]:
         return result.returncode, (result.stdout + result.stderr).strip()
     except Exception as exc:
         return 1, str(exc)
+
+
+def _clear_stale_index_lock(repo: Path) -> bool:
+    """Remove an old git index lock left behind by a crashed sink process."""
+    lock = repo / ".git" / "index.lock"
+    try:
+        if not lock.exists():
+            return False
+        age_s = max(0.0, time.time() - lock.stat().st_mtime)
+        if age_s < 60:
+            return False
+        lock.unlink()
+        _fallback_log.warning(
+            "[server_log] removed stale .git/index.lock (age={age:.0f}s)",
+            age=age_s,
+        )
+        return True
+    except OSError:
+        return False
 
 
 class GitSink:
@@ -237,10 +257,17 @@ class GitSink:
             count = self._pending_count
             self._pending_count = 0
 
-        # Stage the errors file
+        # Stage the errors file. A crashed prior git process can leave
+        # .git/index.lock behind and block the sink indefinitely.
         rc, out = _git(["add", str(self._errors_path)], self._repo)
+        if (
+            rc != 0
+            and "index.lock" in out.lower()
+            and _clear_stale_index_lock(self._repo)
+        ):
+            rc, out = _git(["add", str(self._errors_path)], self._repo)
         if rc != 0:
-            _fallback_log.error("[server_log] git add failed: {out}", out=out)
+            _fallback_log.warning("[server_log] git add failed: {out}", out=out)
             return
 
         # Commit
@@ -258,7 +285,7 @@ class GitSink:
                 or "nothing added to commit" in out_low
             ):
                 return
-            _fallback_log.error("[server_log] git commit failed: {out}", out=out)
+            _fallback_log.warning("[server_log] git commit failed: {out}", out=out)
             return
 
         # Push — only if explicitly enabled (default off to prevent
