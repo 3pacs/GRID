@@ -472,4 +472,4 @@ except Exception as e:
 
 ---
 
-**Generated:** 2026-03-30 | **Reviewer:** Claude Security Agent
+**Generated:** 2026-03-30 | **Reviewer:** Claude [[Security]] Agent

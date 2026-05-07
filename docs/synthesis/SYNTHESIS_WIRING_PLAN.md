@@ -71,7 +71,7 @@ Rows = producers. Columns = consumers. Cell legend:
 
 - **Oracle → calibration / journal:** direct. `oracle/engine.py:996-1095` reads `oracle_predictions`, scores them, and upserts back. `journal/log.py` owns the immutable leg.
 - **[[Trust Scorer|Trust scorer]] → oracle (read-only):** `oracle/engine.py::_get_convergence_for_ticker` calls `trust_scorer.detect_convergence` per ticker. One-way consumption only; oracle's verdict never feeds back into `signal_sources.outcome`.
-- **Supply chokepoints → trust scorer:** `SIGNAL_TRUST_DELTA["chokepoint_crossing"] = -0.10` exists, but only chokepoint *crossings* are read — not the baseline `chokepoint_score` rows. Partial.
+- **Supply chokepoints → [[Trust Scorer|trust scorer]]:** `SIGNAL_TRUST_DELTA["chokepoint_crossing"] = -0.10` exists, but only chokepoint *crossings* are read — not the baseline `chokepoint_score` rows. Partial.
 - **Contagion → options ticket → journal:** `trading/contagion_to_ticket.py` (SYNTH-13 canonical pricer) reads `contagion_predictions`, builds tickets, and logs them. The backward edge (journal verdict → contagion accuracy) exists via `contagion_backtest` but **does not flow through trust_scorer or oracle weight evolver**. The contagion model never earns or loses oracle weight from its trades.
 
 ### What "missing" looks like in practice

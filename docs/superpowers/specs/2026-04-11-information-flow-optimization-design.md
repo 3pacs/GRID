@@ -33,7 +33,7 @@ This spec defines a non-disruptive fix: a thin **Information Contract Layer** th
 - **G3.** Every emitted event is persisted with a `correlation_id` that allows full lineage tracing from source data to final prediction to post-expiry outcome.
 - **G4.** Failed consumer dispatches fall into a dead-letter store with automatic retry (1 min, 10 min, 1 hr) and manual replay on demand.
 - **G5.** All 13 contracts land incrementally without rewriting the internals of any existing module — producers add one emit call, consumers add one handler.
-- **G6.** Seven new API endpoints expose previously-hidden intelligence (postmortem, trust scores, [[Source Audit|source audit]], [[Sleuth|sleuth]] leads, thesis evolution, [[Dollar Flows|dollar flows]], conflict audit).
+- **G6.** Seven new API endpoints expose previously-hidden intelligence ([[Postmortem|postmortem]], trust scores, [[Source Audit|source audit]], [[Sleuth|sleuth]] leads, thesis evolution, [[Dollar Flows|dollar flows]], conflict audit).
 - **G7.** Six new SSE channels broadcast previously-missing lifecycle events to the frontend.
 - **G8.** Observability: every contract dispatch is counted, timed, and surfaced at `/api/v1/contracts/metrics`.
 

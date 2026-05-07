@@ -469,6 +469,6 @@ These items have been investigated and are either by design, already fixed, or n
 Every new session:
 1. Read this file first
 2. `git log --oneline -10` for recent changes
-3. Check Security / Bugs / Wiring Gaps tables — anything new?
+3. Check [[Security]] / Bugs / Wiring Gaps tables — anything new?
 4. Pick up from the 4-week plan
 5. **Update this file before ending the session**

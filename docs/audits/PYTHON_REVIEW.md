@@ -1025,7 +1025,7 @@ async def example():
 - **CLAUDE.md:** [[Security]] rules, data integrity rules
 - **[[ATTENTION]].md:** Known issues and gotchas (64-item audit)
 - **PEP 8:** Python style guide
-- **[[FastAPI]] Security:** https://fastapi.tiangolo.com/tutorial/security/
+- **[[FastAPI]] [[Security]]:** https://fastapi.tiangolo.com/tutorial/security/
 - **[[SQLAlchemy]] Docs:** https://docs.sqlalchemy.org/
 
 ---

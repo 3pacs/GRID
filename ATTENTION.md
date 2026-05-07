@@ -264,7 +264,7 @@ Full pipeline test: ingestion → [[Conflict Resolution|conflict resolution]] �
 - **`api/routers/system.py`** — Health endpoint now checks: DB connectivity, feature registry, recent data, connection pool (size + checked out + overflow), scheduler thread liveness (ingestion + agent-scheduler via `threading.enumerate()`), WebSocket client count, disk usage (percent + free GB), LLM availability, and API key audit. Returns degraded status with reasons.
 
 ### 61. No File Rotation for errors.jsonl and market_briefings/ (FIXED)
-- Both wired into the daily Hermes block (commit 0511d3bd):
+- Both wired into the daily [[Hermes Scheduler|Hermes]] block (commit 0511d3bd):
   - `errors.jsonl` truncated to last 5000 lines when the file exceeds 1 MB (atomic rewrite via tmp + `Path.replace`).
   - `outputs/market_briefings/` rotated to 90-day retention via `MarketBriefingEngine.cleanup_old_briefings`.
 

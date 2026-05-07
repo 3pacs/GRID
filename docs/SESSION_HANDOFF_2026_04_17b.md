@@ -47,7 +47,7 @@ Note: `/home/grid/grid_v4/grid_repo` is a symlink to `/data/grid_v4/astrogrid_de
 
 ### Redbox LLM serving
 
-- llama.cpp built from source with CUDA: `~/llama.cpp/build/bin/llama-server`.
+- [[llama.cpp]] built from source with CUDA: `~/llama.cpp/build/bin/llama-server`.
 - Model: `Qwen3-14B-Q5_K_M.gguf` (bartowski), staged at `/data/models/`.
 - systemd unit `llama-server.service` at `/etc/systemd/system/`:
   - `--host 0.0.0.0 --port 8080 -c 8192 -ngl 99 --split-mode row --alias qwen3-14b --reasoning off`

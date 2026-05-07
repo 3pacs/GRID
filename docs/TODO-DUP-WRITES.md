@@ -106,7 +106,7 @@ Two options:
 
 - **Soft (recommended):** add a `dedup_keep` boolean column. For each
   duplicate cluster, set `dedup_keep=true` on the earliest row and
-  `dedup_keep=false` on the rest. Walk-forward + dashboards filter on
+  `dedup_keep=false` on the rest. [[Walk-Forward Backtesting|Walk-forward]] + dashboards filter on
   `dedup_keep=true`. No data loss, fully reversible.
 - **Hard:** `DELETE` the duplicates. Faster queries but irreversible. Don't
   do this until you're confident the dedup logic is right.

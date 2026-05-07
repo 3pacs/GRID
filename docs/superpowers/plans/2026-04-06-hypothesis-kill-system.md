@@ -707,7 +707,7 @@ def test_postmortem_records_full_context(engine):
 Run: `cd /Users/anikdang/dev/GRID && python -m pytest tests/test_hypothesis_kills.py::test_expired_kill tests/test_hypothesis_kills.py::test_confidence_collapsed_kill tests/test_hypothesis_kills.py::test_antithesis_confirmed_kills_thesis -v`
 Expected: FAIL
 
-- [ ] **Step 3: Implement kill checking, killing, and postmortem writing**
+- [ ] **Step 3: Implement kill checking, killing, and [[Postmortem|postmortem]] writing**
 
 Add these methods to `HypothesisGenerator` class:
 

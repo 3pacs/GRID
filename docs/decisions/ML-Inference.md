@@ -93,6 +93,6 @@ Market physics analogies for signal generation:
 - [[Data-Pipeline]] — How data reaches the ML layer
 - [[Feature-Registry]] — Features that feed models
 - [[Modules/TimeSeries]] — TimesFM and AutoBNN forecasting modules
-- [[PIT-Store]] — Point-in-time correctness guarantee
+- [[PIT-Store]] — [[PIT Store|Point-in-time]] correctness guarantee
 - [[Trading-Layer]] — Where predictions become trades
 - [[Agents-System]] — LLM agents that use model outputs

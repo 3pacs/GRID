@@ -163,7 +163,7 @@ psql -U grid_user -d grid -c "
   Prefer 02:45+ or any hour other than 2 UTC.
 - **[[Walk-Forward Backtesting|Walk-forward]] backtest is systemd-timer-driven, not in-process.**
   If `OnCalendar` fires but the unit errors out, `journalctl -u
-  grid-walk-forward-daily.service` will show why; the hermes operator
+  grid-[[Walk-Forward Backtesting|walk-forward]]-daily.service` will show why; the hermes operator
   log will NOT.
 - **If you restart grid-hermes**, the hydrate step restores
   `last_daily_intel` from the most recent `analytical_snapshots` row
