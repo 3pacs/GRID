@@ -10,7 +10,9 @@ Environment=CUDA_VISIBLE_DEVICES=
 ExecStart=/data/vendor/llama.cpp/build/bin/llama-server \
     -m /data/models/micro/gemma-4-e2b-anomaly_narrator.gguf \
     --port 8083 \
-    --threads 4
+    --threads 4 \
+    --ctx-size 2048 \
+    --reasoning-format deepseek
 Restart=always
 RestartSec=5
 StandardOutput=append:/data/grid/logs/micro-narrator.log

@@ -13,7 +13,6 @@ Environment=LLAMACPP_NGL=60
 Environment=LLAMACPP_CTX=4096
 Environment=LLAMACPP_PARALLEL=1
 ExecStart=/bin/bash scripts/start_llamacpp.sh
-ExecStartPost=/bin/bash -c 'sleep 30 && curl -s http://localhost:8080/v1/chat/completions -H "Content-Type: application/json" -d "{\"messages\":[{\"role\":\"user\",\"content\":\"warmup\"}],\"max_tokens\":5}" > /dev/null 2>&1 || true'
 Restart=always
 RestartSec=10
 StandardOutput=append:/data/grid/logs/llamacpp.log

@@ -6,8 +6,8 @@ Wants=grid-llamacpp.service
 [Service]
 Type=simple
 User=grid
-WorkingDirectory=/home/grid/grid_v4/grid_repo/grid
-EnvironmentFile=/home/grid/grid_v4/grid_repo/grid/.env
+WorkingDirectory=/home/grid/grid_v4/grid_repo
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
 ExecStart=/usr/bin/python3 scripts/tao_miner.py --wallet.name grid_miner --netuid 1
 Restart=on-failure
 RestartSec=30

@@ -6,8 +6,8 @@ Wants=grid-api.service
 [Service]
 Type=simple
 User=grid
-WorkingDirectory=/home/grid/grid_v4/grid_repo/grid
-EnvironmentFile=/home/grid/grid_v4/grid_repo/grid/.env
+WorkingDirectory=/home/grid/grid_v4/grid_repo
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
 ExecStart=/usr/bin/python3 scripts/hermes_operator.py
 Restart=always
 RestartSec=30
