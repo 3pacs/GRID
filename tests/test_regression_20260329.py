@@ -277,6 +277,32 @@ class TestHermesCycleTimeout:
         assert "CYCLE_TIMEOUT_SECONDS" in source and "timeout" in source, \
             "Main loop must use CYCLE_TIMEOUT_SECONDS for cycle execution"
 
+    def test_slow_cycle_steps_have_individual_timeout_constants(self):
+        """Known slow Hermes steps must not consume the full cycle budget."""
+        with open(os.path.join(os.path.dirname(__file__), "..", "scripts", "hermes_operator.py")) as f:
+            source = f.read()
+        for constant in (
+            "DIAGNOSE_PULLS_TIMEOUT_SECONDS",
+            "SMART_INGESTION_TIMEOUT_SECONDS",
+            "INTELLIGENCE_TASKS_TIMEOUT_SECONDS",
+        ):
+            assert constant in source, f"missing per-step timeout {constant}"
+
+    def test_slow_cycle_steps_use_run_with_timeout(self):
+        """Regression guard for Hermes steps that caused cycle timeouts."""
+        with open(os.path.join(os.path.dirname(__file__), "..", "scripts", "hermes_operator.py")) as f:
+            source = f.read()
+        for step in (
+            '"diagnose_and_fix_pulls"',
+            '"smart_ingestion"',
+            '"intelligence_tasks"',
+        ):
+            step_pos = source.find(step)
+            assert step_pos != -1, f"missing Hermes step {step}"
+            surrounding = source[max(0, step_pos - 400): step_pos + 400]
+            assert "_run_with_timeout(" in surrounding, \
+                f"{step} must be guarded by _run_with_timeout"
+
 
 # ── 8. Column name mismatches ────────────────────────────────────────────
 # Bug: Multiple modules referenced 'direction' column in signal_sources

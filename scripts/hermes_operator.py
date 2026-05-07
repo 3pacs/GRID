@@ -90,6 +90,9 @@ ORACLE_CYCLE_TIMEOUT_SECONDS = 300            # oracle.run_cycle (LLM-bound)
 SIGNAL_CLASSIFICATION_TIMEOUT_SECONDS = 120   # gemma micro classifier batch
 ANOMALY_NARRATION_TIMEOUT_SECONDS = 90        # gemma micro anomaly narrator
 KNOWLEDGE_MAP_TIMEOUT_SECONDS = 120           # gemma micro knowledge mapper
+DIAGNOSE_PULLS_TIMEOUT_SECONDS = 120          # Hermes pull diagnosis/fix step
+SMART_INGESTION_TIMEOUT_SECONDS = 240         # smart_scheduler.tick()
+INTELLIGENCE_TASKS_TIMEOUT_SECONDS = 180      # cross-ref/source-audit/postmortems
 
 
 def _run_with_timeout(name: str, fn, timeout_s: int, state):
@@ -109,7 +112,11 @@ def _run_with_timeout(name: str, fn, timeout_s: int, state):
         try:
             return fut.result(timeout=timeout_s), True
         except concurrent.futures.TimeoutError:
-            log.error(
+            # Logged at WARNING (not ERROR) — the timeout is a correctly
+            # handled operational event: the step is blacklisted for
+            # TIMEOUT_BLACKLIST_HOURS and the cycle moves on.  Reserving
+            # ERROR for unhandled failures keeps errors.jsonl signal-rich.
+            log.warning(
                 "Step '{n}' timed out after {s}s — blacklisting for {h}h",
                 n=name, s=timeout_s, h=TIMEOUT_BLACKLIST_HOURS,
             )
@@ -1156,11 +1163,24 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     # 2. Fix broken pulls (with cooldown + smart retry)
     try:
         state.current_step = "diagnose_and_fix_pulls"
-        pull_result = diagnose_and_fix_pulls(engine, hermes_ok, state, dry_run=dry_run)
-        cycle_result["pull_fixer"] = pull_result
-        state.pulls_retried += pull_result.get("retried", 0)
-        state.fixes_applied += pull_result.get("fixed", 0)
-        state.errors_diagnosed += pull_result.get("diagnosed", 0)
+        pull_result, ok = _run_with_timeout(
+            "diagnose_and_fix_pulls",
+            lambda: diagnose_and_fix_pulls(
+                engine,
+                hermes_ok,
+                state,
+                dry_run=dry_run,
+            ),
+            DIAGNOSE_PULLS_TIMEOUT_SECONDS,
+            state,
+        )
+        if ok and pull_result:
+            cycle_result["pull_fixer"] = pull_result
+            state.pulls_retried += pull_result.get("retried", 0)
+            state.fixes_applied += pull_result.get("fixed", 0)
+            state.errors_diagnosed += pull_result.get("diagnosed", 0)
+        else:
+            cycle_result["pull_fixer"] = {"timeout": True}
     except Exception as exc:
         log.error("Pull fixer failed: {e}", e=str(exc))
         cycle_result["pull_fixer"] = {"error": str(exc)}
@@ -1191,13 +1211,21 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         from ingestion.smart_scheduler import SmartScheduler
         if not hasattr(state, "_smart_sched") or state._smart_sched is None:
             state._smart_sched = SmartScheduler(engine)
-        tick_result = state._smart_sched.tick()
-        cycle_result["ingestion"] = tick_result
-        log.info(
-            "Smart ingestion: {ok}/{ran} succeeded, {due} still due",
-            ok=tick_result["succeeded"], ran=tick_result["ran"],
-            due=len(tick_result.get("still_due", [])),
+        tick_result, ok = _run_with_timeout(
+            "smart_ingestion",
+            state._smart_sched.tick,
+            SMART_INGESTION_TIMEOUT_SECONDS,
+            state,
         )
+        if ok and tick_result:
+            cycle_result["ingestion"] = tick_result
+            log.info(
+                "Smart ingestion: {ok}/{ran} succeeded, {due} still due",
+                ok=tick_result["succeeded"], ran=tick_result["ran"],
+                due=len(tick_result.get("still_due", [])),
+            )
+        else:
+            cycle_result["ingestion"] = {"timeout": True}
     except Exception as exc:
         log.error("Smart ingestion failed: {e}", e=str(exc))
         cycle_result["ingestion"] = {"error": str(exc)}
@@ -1710,9 +1738,16 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     #     actor network, source audit, postmortem, options tracking, backtests
     try:
         state.current_step = "intelligence_tasks"
-        intel_result = run_intelligence_tasks(engine, state, dry_run=dry_run)
-        if intel_result:
+        intel_result, ok = _run_with_timeout(
+            "intelligence_tasks",
+            lambda: run_intelligence_tasks(engine, state, dry_run=dry_run),
+            INTELLIGENCE_TASKS_TIMEOUT_SECONDS,
+            state,
+        )
+        if ok and intel_result:
             cycle_result["intelligence"] = intel_result
+        elif not ok:
+            cycle_result["intelligence"] = {"timeout": True}
     except Exception as exc:
         log.warning("Intelligence tasks failed: {e}", e=str(exc))
 
@@ -1889,7 +1924,10 @@ def main(args: list[str] | None = None) -> None:
         t.join(timeout=timeout)
         if t.is_alive():
             stuck_on = state.current_step
-            log.error(
+            # WARNING — the cycle timeout is a handled degrade: the stuck
+            # step gets blacklisted and the next cycle starts fresh. Real
+            # failures inside cycle steps log ERROR at the call site.
+            log.warning(
                 "Cycle {n} TIMED OUT after {s}s (stuck on: {step}) "
                 "— blacklisting and starting fresh",
                 n=state.cycle_count, s=timeout,

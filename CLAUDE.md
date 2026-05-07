@@ -97,6 +97,19 @@ cd grid && python -m pytest tests/test_api.py -v   # API tests
 - **Graceful Degradation:** [[Hyperspace]]/[[Ollama]] calls return `None` if offline; system operates without them
 - **Config:** All settings via `config.py` (pydantic-settings). Copy `.env.example` to `.env`
 - **Logging:** `loguru` imported as `log` from config — use throughout
+- **Log levels:** Reserve `log.error` for unhandled application bugs. Transient network errors, handled-with-blacklist timeouts, and operational git/infra failures use `log.warning` so `errors.jsonl` stays signal-rich.
+
+## Error-Log Hygiene
+
+The `.server-logs/errors.jsonl` file is the canonical operational health signal. To audit it:
+
+```bash
+python3 scripts/audit_error_log.py --hours 24            # default: top patterns last 24h
+python3 scripts/audit_error_log.py --hours 168 --top 25  # weekly top 25
+python3 scripts/audit_error_log.py --new-only            # only patterns absent in baseline week
+```
+
+The script normalizes volatile noise (timestamps, FRED series IDs, hex addresses, request IDs) so similar-but-not-identical errors bucket together. Run it before declaring "all green" — it catches regressions that the test suite can't.
 
 ## Gotchas
 
