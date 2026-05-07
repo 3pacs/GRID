@@ -323,6 +323,7 @@ class ClusterDiscovery:
         Returns:
             dict: Metrics for this k value.
         """
+        n_samples = features.shape[0]
         result: dict[str, Any] = {"k": k}
 
         # GMM
@@ -331,16 +332,41 @@ class ClusterDiscovery:
         result["gmm_bic"] = float(gmm.bic(features))
         result["gmm_aic"] = float(gmm.aic(features))
 
-        # KMeans
+        # KMeans + silhouette. silhouette_score is O(n²) on the full
+        # sample — for n=10K that's ~30s alone. The sklearn impl
+        # supports a sample_size kwarg that draws a stratified subsample
+        # of `sample_size` rows; the resulting score is statistically
+        # equivalent for n>>sample_size and runs in O(s²).
         km = KMeans(n_clusters=k, random_state=42, n_init=10)
         km_labels = km.fit_predict(features)
         result["kmeans_inertia"] = float(km.inertia_)
-        result["kmeans_silhouette"] = float(silhouette_score(features, km_labels))
+        sil_sample = min(int(os.getenv("GRID_SILHOUETTE_SAMPLE", "2000")), n_samples)
+        result["kmeans_silhouette"] = float(
+            silhouette_score(features, km_labels, sample_size=sil_sample, random_state=42)
+            if n_samples > sil_sample
+            else silhouette_score(features, km_labels)
+        )
 
-        # Agglomerative
-        agg = AgglomerativeClustering(n_clusters=k)
-        agg_labels = agg.fit_predict(features)
-        result["agg_calinski_harabasz"] = float(calinski_harabasz_score(features, agg_labels))
+        # Agglomerative is O(n² log n) memory and O(n³) compute worst
+        # case — catastrophic past a few thousand rows. For small n it
+        # gives a useful third opinion; past the threshold the cost
+        # outweighs any signal so we skip it. Override with
+        # GRID_CLUSTERING_AGG_MAX_N if you genuinely need it on big n.
+        agg_max_n = int(os.getenv("GRID_CLUSTERING_AGG_MAX_N", "5000"))
+        if n_samples <= agg_max_n:
+            agg = AgglomerativeClustering(n_clusters=k)
+            agg_labels = agg.fit_predict(features)
+            result["agg_calinski_harabasz"] = float(
+                calinski_harabasz_score(features, agg_labels)
+            )
+        else:
+            # Fall back to KMeans labels for the calinski_harabasz signal
+            # so the result schema is preserved. CH is O(n·k) — cheap
+            # regardless of cluster algorithm.
+            result["agg_calinski_harabasz"] = float(
+                calinski_harabasz_score(features, km_labels)
+            )
+            result["agg_skipped_n_too_large"] = True
 
         # Cluster persistence (average run length of same label using GMM)
         result["gmm_persistence"] = float(self._compute_persistence(gmm_labels))
@@ -361,22 +387,19 @@ class ClusterDiscovery:
 
         Returns:
             float: Average number of consecutive days in the same cluster.
+
+        Implementation: vectorised via np.diff. A new run starts at every
+        position where the label changes. Counting label changes gives
+        (n_runs - 1), so n_runs = changes + 1. Mean run length is
+        len(labels) / n_runs.
         """
-        if len(labels) == 0:
+        n = len(labels)
+        if n == 0:
             return 0.0
-
-        run_lengths: list[int] = []
-        current_run = 1
-
-        for i in range(1, len(labels)):
-            if labels[i] == labels[i - 1]:
-                current_run += 1
-            else:
-                run_lengths.append(current_run)
-                current_run = 1
-        run_lengths.append(current_run)
-
-        return float(np.mean(run_lengths))
+        labels_arr = np.asarray(labels)
+        n_changes = int(np.count_nonzero(np.diff(labels_arr)))
+        n_runs = n_changes + 1
+        return float(n / n_runs)
 
     def _compute_transition_matrix(
         self,
