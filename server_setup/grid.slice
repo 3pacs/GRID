@@ -1,0 +1,29 @@
+# grid.slice — parent cgroup for every grid-* service.
+#
+# Every grid-*.service drop-in pins itself here via Slice=grid.slice. The slice
+# is the blast-radius cap: even if one service leaks, the whole GRID workload
+# cannot exceed MemoryMax and starve sshd / postgresql / system services.
+#
+# Sized for a 503 GiB host. Leaves ~60 GiB headroom for kernel, sshd, postgres,
+# MinIO, Caddy, and ad-hoc admin work. Tune in tandem with the per-service
+# caps in *.service.d/cgroup.conf — sum of per-service MemoryMax should remain
+# below MemoryMax here so the slice cap is the real ceiling, not a tripwire.
+
+[Unit]
+Description=GRID workload slice (cgroup parent for all grid-* services)
+Before=slices.target
+
+[Slice]
+MemoryAccounting=yes
+TasksAccounting=yes
+IOAccounting=yes
+
+# Soft cap: kernel reclaims/throttles inside the slice when crossed. No SIGKILL.
+MemoryHigh=400G
+
+# Hard cap: in-slice OOM kill fires here, BEFORE the system-wide OOM killer
+# starts hunting for victims (which is how sshd died on 2026-05-02).
+MemoryMax=440G
+
+# Don't constrain task count at the slice level — per-service TasksMax handles that.
+TasksMax=infinity
