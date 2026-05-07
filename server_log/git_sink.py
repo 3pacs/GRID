@@ -17,18 +17,39 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import threading
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from loguru import logger as _fallback_log
-
 from server_log.sanitizer import Sanitizer, build_sanitizer_from_settings
 
 if TYPE_CHECKING:
     from loguru import Message
+
+
+def _stderr_warn(msg: str) -> None:
+    """Write a warning straight to stderr, bypassing loguru sinks.
+
+    GitSink is registered as a loguru ERROR sink, so any error logged via
+    loguru from inside GitSink would loop back into errors.jsonl. Going
+    directly to stderr breaks that cycle while still surfacing the failure
+    to operators tailing the process.
+    """
+    try:
+        sys.stderr.write(f"[server_log] {msg}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+# Marker for log messages that originate from this module. We refuse to
+# re-sink any record carrying this prefix as a defensive belt against
+# future regressions where some other code path might log "[server_log] ..."
+# at ERROR.
+_SELF_LOG_PREFIX = "[server_log]"
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -55,8 +76,16 @@ def _repo_root() -> Path:
     return here.parent.parent.parent
 
 
-def _git(args: list[str], cwd: Path) -> tuple[int, str]:
+def _git(
+    args: list[str],
+    cwd: Path,
+    extra_env: dict[str, str] | None = None,
+) -> tuple[int, str]:
     """Run a git command and return (returncode, combined output)."""
+    env = None
+    if extra_env:
+        env = os.environ.copy()
+        env.update(extra_env)
     try:
         result = subprocess.run(
             ["git"] + args,
@@ -64,6 +93,7 @@ def _git(args: list[str], cwd: Path) -> tuple[int, str]:
             capture_output=True,
             text=True,
             timeout=30,
+            env=env,
         )
         return result.returncode, (result.stdout + result.stderr).strip()
     except Exception as exc:
@@ -119,11 +149,19 @@ class GitSink:
     def write(self, message: Message) -> None:
         """Called by loguru for each log record at the configured level."""
         record = message.record
+        raw_msg = str(record.get("message", ""))
+
+        # Refuse to sink our own messages. Even though _commit_and_push now
+        # writes failures to stderr instead of loguru, anything else in the
+        # process that logs with the "[server_log]" prefix at ERROR would
+        # otherwise feed back into the file we're trying to commit.
+        if raw_msg.startswith(_SELF_LOG_PREFIX):
+            return
+
         entry = self._format_entry(record)
 
         # Dedup: collapse repeated identical errors into one entry per window.
         # The "raw" message (loguru template, not interpolated) is most stable.
-        raw_msg = str(record.get("message", ""))
         key = (
             record.get("name", ""),
             record.get("function", ""),
@@ -210,7 +248,7 @@ class GitSink:
             self._commit_and_push()
         except Exception as exc:
             # Never let push failures crash the timer
-            _fallback_log.error("[server_log] git push failed: {e}", e=exc)
+            _stderr_warn(f"git push failed: {exc}")
         finally:
             self._schedule_push()
 
@@ -225,13 +263,30 @@ class GitSink:
         # Stage the errors file
         rc, out = _git(["add", str(self._errors_path)], self._repo)
         if rc != 0:
-            _fallback_log.error("[server_log] git add failed: {out}", out=out)
+            _stderr_warn(f"git add failed: {out}")
             return
 
-        # Commit
+        # Commit. Pass identity via -c so we don't depend on global git
+        # config being set on the host (production servers often run as
+        # service users with no ~/.gitconfig).
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         msg = f"server-log: {count} error(s) at {ts}"
-        rc, out = _git(["commit", "-m", msg, "--", str(self._errors_path)], self._repo)
+        author = os.getenv("GIT_SINK_AUTHOR_NAME", "grid-server-log")
+        email = os.getenv("GIT_SINK_AUTHOR_EMAIL", "server-log@grid.local")
+        rc, out = _git(
+            [
+                "-c", f"user.name={author}",
+                "-c", f"user.email={email}",
+                "commit", "-m", msg, "--", str(self._errors_path),
+            ],
+            self._repo,
+            extra_env={
+                "GIT_AUTHOR_NAME": author,
+                "GIT_AUTHOR_EMAIL": email,
+                "GIT_COMMITTER_NAME": author,
+                "GIT_COMMITTER_EMAIL": email,
+            },
+        )
         if rc != 0:
             # Nothing to commit (maybe file unchanged) — git emits several
             # phrasings depending on whether the working tree has other
@@ -243,7 +298,7 @@ class GitSink:
                 or "nothing added to commit" in out_low
             ):
                 return
-            _fallback_log.error("[server_log] git commit failed: {out}", out=out)
+            _stderr_warn(f"git commit failed: {out}")
             return
 
         # Push — only if explicitly enabled (default off to prevent
@@ -253,7 +308,7 @@ class GitSink:
 
         branch = self._branch or self._detect_branch()
         if not branch:
-            _fallback_log.warning("[server_log] could not detect git branch; skipping push")
+            _stderr_warn("could not detect git branch; skipping push")
             return
 
         delays = [2, 4, 8, 16]
@@ -265,7 +320,7 @@ class GitSink:
                 import time
                 time.sleep(delay)
 
-        _fallback_log.error("[server_log] git push failed after retries: {out}", out=out)
+        _stderr_warn(f"git push failed after retries: {out}")
 
     def _detect_branch(self) -> str | None:
         """Return the current git branch name."""
@@ -305,9 +360,8 @@ class GitSink:
         archive_name = f"errors_{ts}.jsonl"
         archive_path = self._logs_dir / archive_name
         self._errors_path.rename(archive_path)
-        _fallback_log.info(
-            "[server_log] Rotated errors.jsonl ({sz:.1f}MB) -> {a}",
-            sz=size_mb, a=archive_name,
+        _stderr_warn(
+            f"Rotated errors.jsonl ({size_mb:.1f}MB) -> {archive_name}"
         )
         return True
 
@@ -329,7 +383,5 @@ class GitSink:
             except ValueError:
                 continue
         if deleted:
-            _fallback_log.info(
-                "[server_log] Cleaned up {n} old error archives", n=deleted,
-            )
+            _stderr_warn(f"Cleaned up {deleted} old error archives")
         return deleted

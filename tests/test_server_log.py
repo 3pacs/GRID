@@ -232,6 +232,101 @@ class TestGitSinkCommit:
         sink._commit_and_push()
         mock_git.assert_not_called()
 
+    @patch("server_log.git_sink._git")
+    def test_commit_passes_author_identity(self, mock_git, tmp_path):
+        """commit always carries explicit user.name/user.email and
+        GIT_*_NAME/EMAIL env vars so it can't fail with 'Author identity
+        unknown' when the host has no global git config.
+
+        Regression: prior to this fix, host-level missing identity caused
+        ~hundreds of 'Author identity unknown' commit failures per day,
+        which were re-logged into errors.jsonl, ballooning the file.
+        """
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        sink._pending_count = 1
+        mock_git.return_value = (0, "ok")
+
+        sink._commit_and_push()
+
+        commit_call = next(
+            c for c in mock_git.call_args_list
+            if "commit" in c.args[0]
+        )
+        argv = commit_call.args[0]
+        # -c user.name=... and -c user.email=... must precede 'commit'
+        assert "-c" in argv
+        assert any(a.startswith("user.name=") for a in argv)
+        assert any(a.startswith("user.email=") for a in argv)
+        # Plus env-var belt to cover older git versions that ignore -c
+        env = commit_call.kwargs.get("extra_env") or {}
+        assert env.get("GIT_AUTHOR_EMAIL")
+        assert env.get("GIT_COMMITTER_EMAIL")
+
+
+class TestGitSinkRecursionGuard:
+    """GitSink must never re-log its own failures into errors.jsonl.
+
+    Regression: when commit/push failed, the sink logged via loguru — but
+    the sink itself was registered as a loguru ERROR sink, producing a
+    feedback loop that filled errors.jsonl with hundreds of '[server_log]
+    git commit failed' rows per day.
+    """
+
+    def test_self_prefixed_messages_dropped(self, tmp_path):
+        """Loguru records whose message starts with [server_log] are not
+        written to errors.jsonl, even if some other code logs them."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+
+        level = MagicMock()
+        level.name = "ERROR"
+        msg = MagicMock()
+        msg.record = {
+            "level": level,
+            "name": "server_log.git_sink",
+            "function": "_commit_and_push",
+            "line": 1,
+            "message": "[server_log] git commit failed: identity unknown",
+            "exception": None,
+        }
+
+        sink.write(msg)
+
+        errors_file = tmp_path / ".server-logs" / "errors.jsonl"
+        # File may not even exist (no entries written) — either way, no row.
+        if errors_file.exists():
+            assert errors_file.read_text() == ""
+        assert sink._pending_count == 0
+
+    @patch("server_log.git_sink._git")
+    def test_commit_failures_go_to_stderr_not_loguru(
+        self, mock_git, tmp_path, capsys
+    ):
+        """When commit fails, the failure surfaces on stderr — not via
+        loguru — so it cannot be re-sunk by GitSink itself."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        sink._pending_count = 1
+
+        # add succeeds, commit fails with a non-"nothing to commit" message
+        mock_git.side_effect = [
+            (0, "ok"),                                   # add
+            (128, "Author identity unknown"),            # commit
+        ]
+
+        sink._commit_and_push()
+
+        captured = capsys.readouterr()
+        assert "[server_log] git commit failed" in captured.err
+        # And critically, the errors file did NOT receive this message.
+        errors_file = tmp_path / ".server-logs" / "errors.jsonl"
+        if errors_file.exists():
+            assert "git commit failed" not in errors_file.read_text()
+
 
 # ===================================================================
 # Inbox tests
