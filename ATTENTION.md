@@ -141,8 +141,8 @@ Still need coverage: [[Walk-Forward Backtesting|validation/gates.py]], [[Model G
 ### 32. Missing Graceful Shutdown (FIXED)
 - **`api/main.py`** — Startup now logs clear warnings about degraded state when database is unavailable, instead of a generic warning.
 
-### 33. No Dependency Lock File (PARTIAL)
-- `requirements.lock` exists with version-pinned entries (100 packages). Hash-pinning still missing — would need `pip-tools` (`pip-compile --generate-hashes`) which isn't installed today. Track as a separate enhancement.
+### 33. No Dependency Lock File (FIXED — version-pinned)
+- `requirements.lock` regenerated 2026-05-07 from current venv state (325 packages, was stale at 100). Lock is version-pinned (`pkg==X.Y.Z`) but not hash-pinned. Tried `pip-compile --generate-hashes` — pip-tools resolver hits `ResolutionTooDeepError` after ~12 minutes on this dep graph because requirements.txt uses `>=` constraints that explode combinatorially during hash resolution. Without hashes the lock still gives reproducible install via `pip install -r requirements.lock`. Hash-pinning would need either tightening requirements.txt to `==` constraints (changes actual versions) or migrating to `uv`/poetry which use faster resolvers; either is a separate workstream.
 
 ---
 
