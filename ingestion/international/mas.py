@@ -29,6 +29,14 @@ MAS_SERIES: dict[str, str] = {
 _MAS_BASE_URL = "https://eservices.mas.gov.sg/api/action/datastore/search.json"
 _RATE_LIMIT_DELAY: float = 1.0
 
+# Process-scoped cooldown: when MAS returns ReadTimeout / non-JSON for one
+# resource, the same upstream issue typically affects all four series
+# (whole API down or geo-blocked). Trip a 6h cooldown after the first
+# RetryError so the cycle skips the remaining resources instead of
+# logging 4 ERROR rows per cycle (24+/day at the 6h cadence).
+_API_COOLDOWN_UNTIL: float = 0.0
+_API_COOLDOWN_SECONDS: int = 6 * 3600
+
 
 class MASPuller(BasePuller):
     """Pulls monetary and financial data from the MAS API."""
@@ -59,6 +67,19 @@ class MASPuller(BasePuller):
     ) -> dict[str, Any]:
         """Pull a single MAS resource, paginating through all records."""
         feature_name = MAS_SERIES.get(resource_id, resource_id)
+
+        # Honour process-scoped cooldown set by a sibling resource
+        # earlier in the same cycle.
+        global _API_COOLDOWN_UNTIL
+        now = time.time()
+        if now < _API_COOLDOWN_UNTIL:
+            return {
+                "series_id": feature_name,
+                "rows_inserted": 0,
+                "status": "SKIPPED",
+                "errors": ["MAS API in cooldown — see prior WARNING"],
+            }
+
         log.info("Pulling MAS {fn}", fn=feature_name)
 
         result: dict[str, Any] = {
@@ -139,9 +160,34 @@ class MASPuller(BasePuller):
             log.info("MAS {fn}: inserted {n} rows", fn=feature_name, n=total_inserted)
 
         except Exception as exc:
-            log.error("MAS pull failed for {rid}: {err}", rid=resource_id, err=str(exc))
+            err_str = str(exc)
+            # Tenacity RetryError + JSONDecodeError / ReadTimeout means the
+            # MAS upstream is sick (HTML error page, slow gateway). All four
+            # resources share that upstream so trip a 6h process-scoped
+            # cooldown and downgrade to WARNING — operator already has the
+            # signal from one log line, no value in three more.
+            transient = (
+                "RetryError" in err_str
+                or "JSONDecodeError" in err_str
+                or "ReadTimeout" in err_str
+                or "Timeout" in err_str
+                or "ConnectionError" in err_str
+            )
+            if transient:
+                _API_COOLDOWN_UNTIL = time.time() + _API_COOLDOWN_SECONDS
+                log.warning(
+                    "MAS pull failed for {rid}: {err} — tripping {h}h "
+                    "cooldown for the rest of this cycle",
+                    rid=resource_id,
+                    err=err_str[:200],
+                    h=_API_COOLDOWN_SECONDS // 3600,
+                )
+            else:
+                log.error(
+                    "MAS pull failed for {rid}: {err}", rid=resource_id, err=err_str,
+                )
             result["status"] = "FAILED"
-            result["errors"].append(str(exc))
+            result["errors"].append(err_str)
 
         time.sleep(_RATE_LIMIT_DELAY)
         return result

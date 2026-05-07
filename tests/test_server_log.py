@@ -381,6 +381,49 @@ class TestGitSinkCommit:
         sink._commit_and_push()
         mock_git.assert_not_called()
 
+    @patch("server_log.git_sink.subprocess.run")
+    def test_git_invocation_passes_author_identity(self, mock_run, tmp_path):
+        """`_git` always passes -c user.name / -c user.email so commits don't
+        fail with 'Author identity unknown' on hosts with empty git config."""
+        (tmp_path / ".git").mkdir()
+        mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+
+        from server_log.git_sink import _git
+        rc, _ = _git(["status"], tmp_path)
+        assert rc == 0
+
+        # The first positional arg is the argv list. Find -c user.name=*
+        # and -c user.email=* before the actual git subcommand.
+        argv = mock_run.call_args[0][0]
+        assert argv[0] == "git"
+        # Identity must be set BEFORE the subcommand ("status") so it
+        # applies to commit/log/etc.
+        sub_idx = argv.index("status")
+        prelude = argv[1:sub_idx]
+        assert "-c" in prelude
+        assert any(a.startswith("user.name=") for a in prelude)
+        assert any(a.startswith("user.email=") for a in prelude)
+
+    @patch("server_log.git_sink.subprocess.run")
+    def test_git_invocation_honours_env_overrides(self, mock_run, tmp_path):
+        """GRID_GIT_SINK_AUTHOR_{NAME,EMAIL} override the defaults."""
+        (tmp_path / ".git").mkdir()
+        mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+
+        from server_log.git_sink import _git
+        with patch.dict(
+            "os.environ",
+            {
+                "GRID_GIT_SINK_AUTHOR_NAME": "Custom Bot",
+                "GRID_GIT_SINK_AUTHOR_EMAIL": "bot@example.com",
+            },
+        ):
+            _git(["status"], tmp_path)
+
+        argv = mock_run.call_args[0][0]
+        assert "user.name=Custom Bot" in argv
+        assert "user.email=bot@example.com" in argv
+
 
 # ===================================================================
 # Inbox tests
