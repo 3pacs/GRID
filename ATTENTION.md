@@ -132,8 +132,8 @@ Still need coverage: [[Walk-Forward Backtesting|validation/gates.py]], [[Model G
 ### 30. Incomplete Health Checks (FIXED)
 - **`api/routers/system.py`** — Health endpoint now checks both database connectivity AND feature registry population. Returns 'degraded' if registry is empty. Logs actual error on failure.
 
-### 31. No Alerting System
-- Still needed: monitoring/alerting for failed pulls, 5xx rates, pool exhaustion, model staleness, data quality. Consider Prometheus + Grafana.
+### 31. No Alerting System (FIXED)
+- `alerts/health_alerter.py` runs every Hermes cycle, inspects the dict from `check_system_health`, and fires email via the existing `alerts/email.py` when one of these conditions transitions: `db.unhealthy`, `db.failed_pulls_24h>50`, `db.stale_sources>20`, `hermes.unhealthy`, `pool.exhausted` (>80% of capacity). 6-hour per-condition cooldown; state persisted at `.server-logs/alert_state.json` so cooldowns survive restarts. Prometheus + Grafana would be a richer next step but the email pathway covers the audit gap end-to-end.
 
 ### 32. Missing Graceful Shutdown (FIXED)
 - **`api/main.py`** — Startup now logs clear warnings about degraded state when database is unavailable, instead of a generic warning.
@@ -228,7 +228,7 @@ Full pipeline test: ingestion → [[Conflict Resolution|conflict resolution]] �
 - All four endpoints now have `limit` + `offset` Query parameters (default 100, max 500) and `ORDER BY ... LIMIT :lim OFFSET :off` in the SQL. Confirmed in models.py:32, config.py:87/140, discovery.py:264/271/210.
 
 ### 49. LLM Insight Files Grow Unbounded (FIXED)
-- `outputs/llm_logger.cleanup_old_insights` is now wired into the daily Hermes block (commit 0511d3bd) at 30-day retention. Was 109k files / 592 MB at backlog peak; one-shot cleanup deleted 17.5k of them (older than 30 days), steady-state caps at ~660k worst case.
+- `outputs/llm_logger.cleanup_old_insights` is now wired into the daily [[Hermes Scheduler|Hermes]] block (commit 0511d3bd) at 30-day retention. Was 109k files / 592 MB at backlog peak; one-shot cleanup deleted 17.5k of them (older than 30 days), steady-state caps at ~660k worst case.
 
 ### 50. No Graceful Shutdown Handler (FIXED)
 - **`api/main.py`** — Added `@app.on_event("shutdown")` handler that: stops agent scheduler, flushes git sink, stops operator inbox, closes all WebSocket connections, and disposes database engine via `clear_singletons()`.

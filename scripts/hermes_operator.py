@@ -1114,6 +1114,16 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
             s=len(health["db"].get("stale_sources", [])),
             f=health["db"].get("failed_pulls_24h", 0),
         )
+        # Audit #31 — fire alerts on threshold transitions. Best-effort,
+        # cooldown-throttled (6h default), email via alerts.email.
+        try:
+            from alerts.health_alerter import check_and_alert
+            fired = check_and_alert(health)
+            if fired:
+                log.warning("Health alerts fired: {f}", f=", ".join(fired))
+                cycle_result["alerts_fired"] = fired
+        except Exception as exc:
+            log.debug("Health alerter skipped: {e}", e=str(exc))
     except Exception as exc:
         log.error("Health check failed: {e}", e=str(exc))
         cycle_result["health"] = {"error": str(exc)}
