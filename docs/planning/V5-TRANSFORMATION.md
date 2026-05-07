@@ -32,7 +32,7 @@ The transformation has 6 architectural vectors:
 
 ### What v4 Does Well (DON'T BREAK)
 
-- **[[PIT Store|PIT-correct]] data pipeline** — `store/pit.py` with DISTINCT ON, vintage policies, lookahead guard
+- **[[PIT Store|PIT-correct]] data pipeline** — `store/pit.py` with [[PIT Store|DISTINCT ON]], vintage policies, lookahead guard
 - **170+ data source integrations** — 7 subpackages, unified scheduler, [[Hermes Scheduler|Hermes]] 24/7 operator
 - **Custom in-memory actor graph** — `intelligence/spider/graph_engine.py`, microsecond traversals, 495+ actors
 - **Self-improving Oracle** — 6 models, signal/anti-signal, weight evolution, 10,893 predictions pending scoring
@@ -188,10 +188,10 @@ New API endpoints:
 
 **Integration with existing views:**
 - Every entity in every view gets a right-click → "Send to Canvas" action
-- ActorNetwork: click actor → "Investigate"
-- MoneyFlow: click flow → "Trace on Canvas"
+- [[Actor Network View|ActorNetwork]]: click actor → "Investigate"
+- [[MoneyFlow View|MoneyFlow]]: click flow → "Trace on Canvas"
 - Timeline: select events → "Pin to Canvas"
-- CrossReference: click divergence → "Explain on Canvas"
+- [[Cross Reference View|CrossReference]]: click divergence → "Explain on Canvas"
 
 ### Files to Create
 
@@ -318,7 +318,7 @@ GRID's actor graph is a custom Python dict-based adjacency structure (`intellige
 
 ### Solution: Apache AGE (PostgreSQL Extension)
 
-**Why AGE over Neo4j?** Same PostgreSQL instance. No new infrastructure. SQL + Cypher in one query. Transactional consistency with relational data.
+**Why AGE over Neo4j?** Same [[PostgreSQL]] instance. No new infrastructure. SQL + Cypher in one query. Transactional consistency with relational data.
 
 ### Schema
 

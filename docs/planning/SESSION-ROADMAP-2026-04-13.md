@@ -50,7 +50,7 @@ These are the ten things a new session must know **before** proposing any change
 
 8. **[[Dealer Gamma|Vanna]] and charm are computed in `physics/dealer_gamma.py:248-250` but are never used in any prediction or score.** They are "measured but not actionable." Wiring them into the [[Options Scanner|options scanner]] or recommender is a cheap quick win.
 
-9. **`physics/dealer_gamma.py` assumes dealers are net short every option** (`physics/dealer_gamma.py:19-30`). Per-ticker GEX is computed but the dealer positioning inference is crude. Any "improve dealer gamma" task is really "replace the net-short assumption with a flow-based inference."
+9. **`physics/dealer_gamma.py` assumes dealers are net short every option** (`physics/dealer_gamma.py:19-30`). Per-ticker GEX is computed but the dealer positioning inference is crude. Any "improve [[Dealer Gamma|dealer gamma]]" task is really "replace the net-short assumption with a flow-based inference."
 
 10. **`features/importance.py` already tracks permutation importance, regime correlation, and rolling stability** — but **not per-horizon or per-regime**. Horizon-conditional feature importance is an extension, not a new build.
 
@@ -81,7 +81,7 @@ Before proposing **any** new module, puller, or oracle feature:
 
 **User prompt:** "https://cryexc.josedonato.com/app check this out."
 
-**What cryexc actually is:** a live crypto **market microstructure** scanner built by **Jose Donato** (founding engineer at OpenBB, 65.8k★ repo). It is **not** an options scanner — that was a misconception early in the session. Cryexc is the consolidation of four earlier repos into one shippable Python/[[FastAPI]] service.
+**What cryexc actually is:** a live crypto **market microstructure** scanner built by **Jose Donato** (founding engineer at OpenBB, 65.8k★ repo). It is **not** an [[Options Scanner|options scanner]] — that was a misconception early in the session. Cryexc is the consolidation of four earlier repos into one shippable Python/[[FastAPI]] service.
 
 ### The four source repos (evolution path)
 
@@ -95,7 +95,7 @@ Before proposing **any** new module, puller, or oracle feature:
 
 ### Architecture of cryexc-backend
 
-- **FastAPI + WebSocket** server
+- **[[FastAPI]] + WebSocket** server
 - **DuckDB in-memory** for hot trades/aggregates
 - **Binance Futures** as the primary venue (Hyperliquid noted as US-friendly alt)
 - **Tree of Alpha WebSocket** for crypto news
@@ -210,7 +210,7 @@ verdict, actual_price, actual_move_pct, pnl_pct, scored_at, score_notes
 
 **Missing fields (schema migration required for horizon-conditional work):**
 - `horizon` (days)
-- `as_of_date` (decision timestamp for walk-forward PIT)
+- `as_of_date` (decision timestamp for [[Walk-Forward Backtesting|walk-forward]] PIT)
 - `resolution_date` (when the prediction will be scored)
 - `catalyst_type` (earnings / FOMC / FDA / macro_release / none)
 - `catalyst_proximity` (days to nearest relevant catalyst)
@@ -513,7 +513,7 @@ After verifying against `docs/MODULE_CATALOG.md` and live `intelligence/` / `ana
 
 20. **TRACE corporate bond trade prints** — FINRA TRACE not ingested. Institutional rotation shows up in credit before equity.
 
-21. **13F delta clustering** — `institutional_flows.py` ingests 13F but no quarter-over-quarter delta clustering across 500 funds.
+21. **[[Institutional Flows|13F]] delta clustering** — `institutional_flows.py` ingests 13F but no quarter-over-quarter delta clustering across 500 funds.
 
 22. **Insider cluster detector (3+ simultaneous)** — `insider_filings.py` ingests but no 3-or-more-C-suite-within-30-days cluster detection.
 
@@ -606,7 +606,7 @@ My highest-conviction picks from the session discussion. Each is estimated to de
 
 **Real-time state classifiers:**
 36. **Liquidity regime classifier** — 5-state (gushing/ample/neutral/tightening/stressed), conditions everything — ~2-3% oracle-wide multiplicative
-37. **Recession nowcast ensemble** — Sahm + yield curve + spreads + claims + ISM + confidence + permits — ~2% on cyclical vs defensive
+37. **Recession nowcast ensemble** — Sahm + [[Yield Curve|yield curve]] + spreads + claims + ISM + confidence + permits — ~2% on cyclical vs defensive
 38. **Financial conditions index (multi-factor)** — rates + spreads + vol + FX + credit + housing — ~1.5% oracle-wide
 
 **NLP / novelty:**
@@ -615,7 +615,7 @@ My highest-conviction picks from the session discussion. Each is estimated to de
 
 ### Monday-morning top 5 (if you can only build five things this quarter)
 
-1. **Horizon-conditional oracle** (gap #1 — not on the Tier A list because it's inference architecture, not a signal) — multiplies the value of everything below
+1. **Horizon-conditional oracle** (gap #1 — not on the Tier A list because it's inference [[architecture]], not a signal) — multiplies the value of everything below
 2. **Liquidity regime classifier** (#36) — conditions every other prediction
 3. **Fed reaction function estimator** (#26) — every Fed event becomes a GRID opportunity
 4. **Structured-flow calendar engine** (#25) — cheap to build, systematic alpha on known dates
@@ -675,7 +675,7 @@ My highest-conviction picks from the session discussion. Each is estimated to de
 2. Domain (macro / positioning / flows / sentiment / etc.)
 3. One-line description
 4. Why ≥1% (lever named, coverage estimate)
-5. Lever vs Condition classification (per Prediction Causation Standard)
+5. Lever vs Condition classification (per Prediction [[Causation]] Standard)
 6. PIT feasibility (easy / tricky / hard — with reason)
 7. Source (API / scrape / paid / free / OSINT)
 8. Build cost (S / M / L)

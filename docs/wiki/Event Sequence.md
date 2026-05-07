@@ -17,6 +17,9 @@ Chronological timeline reconstruction of market-moving events. Orders signals by
 
 ## Referenced By
 
+- [[MODULE_INVENTORY]]
+- [[MODULE_OVERLAP_AUDIT]]
+- [[Intelligence-Layer]]
 - [[MASTER-PLAN]]
 - [[ROADMAP]]
 - [[SIGNAL-CONNECTIVITY-PLAN]]

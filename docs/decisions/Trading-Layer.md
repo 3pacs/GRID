@@ -20,7 +20,7 @@ promoted_via: OBSIDIAN-2 (task #76)
 
 ### Prediction Markets
 - **`prediction_markets.py`** — [[Polymarket]] integration (buy, portfolio, markets)
-- **`prediction_pmxt.py`** — PMXT (prediction market exchange) trader. Combined Polymarket + Kalshi.
+- **`prediction_pmxt.py`** — PMXT (prediction market exchange) trader. Combined [[Polymarket]] + Kalshi.
 
 ### Options
 - **`options_recommender.py`** — Generates options trade recommendations based on vol surface, [[Dealer Gamma|GEX]], dealer positioning. Called daily at 07:00. See [[Options-Analytics]].

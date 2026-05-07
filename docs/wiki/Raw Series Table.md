@@ -14,8 +14,12 @@ Stores every raw observation with source_id, obs_date, release_date, vintage_dat
 ## Referenced By
 
 - [[MODULE_CATALOG]]
+- [[MODULE_INVENTORY]]
+- [[OBSIDIAN_VAULT_AUDIT]]
 - [[SESSION_HANDOFF_2026_04_05]]
+- [[TODO-DATA-AUDIT]]
 - [[DATABASE_REVIEW]]
+- [[data_pipeline_audit]]
 - [[FILL-EMPTY-TABLES]]
 - [[NEXT-SESSION]]
 - [[ARCHITECTURE]]

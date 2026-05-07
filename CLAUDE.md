@@ -152,7 +152,7 @@ The intelligence layer tracks who moves markets and why. The top-level `intellig
 - `intelligence/postmortem.py` (1,344 LOC) — automated failure analysis for bad trades
 - `intelligence/trust_scorer.py` (1,100 LOC) — [[Trust Scorer|Bayesian trust]] scoring with recency decay
 
-**Canonical scoring/flow stack** (also referenced in other sections): `trust_scorer`, `dollar_flows`, `flow_aggregator`, `flow_thesis`, `forensics`, `event_sequence`, `thesis_tracker`, `sleuth`, `source_audit`. The original 14-module description in prior CLAUDE.md revisions is now historical — do not use it as the working model; always reconcile against MODULE_INVENTORY.md.
+**Canonical scoring/flow stack** (also referenced in other sections): `trust_scorer`, `dollar_flows`, `flow_aggregator`, `flow_thesis`, `forensics`, `event_sequence`, `thesis_tracker`, `sleuth`, `source_audit`. The original 14-module description in prior CLAUDE.md revisions is now historical — do not use it as the working model; always reconcile against [[MODULE_INVENTORY]].md.
 
 > **Note on location:** `flow_thesis.py` and `flow_aggregator.py` live in `analysis/`, not `intelligence/`. (Location bug fixed from earlier CLAUDE.md revisions.)
 

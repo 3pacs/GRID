@@ -155,7 +155,7 @@ two brand-new frontend files. No shared ownership.
 
 **Goal:** One agent only — this sprint is too small to parallelize.
 Running it as **Agent-A** keeps Agents B and C free to start sprint 6
-work that doesn't depend on Hermes.
+work that doesn't depend on [[Hermes Scheduler|Hermes]].
 
 | Agent | Owns | Tasks |
 |-------|------|-------|

@@ -65,7 +65,7 @@ risks are narrower than the brief suggested, but they still exist.
 - Shared table reads: *chain_contagion only* reads `supply_chain_edges` + `supply_chain_nodes` + `supply_shock_attributions`; *causation_graph only* reads `causal_chains` + `signal_sources`. Zero DB-level overlap.
 - Shared inputs: both produce a "downstream impact ranking," so their *outputs* conflict for consumers that ask "what's at risk downstream of X?"
 
-**Verdict:** **OVERLAP_PARTIAL** — chain_contagion operates on a fundamentally different graph (physical [[Supply Chain|supply chain]]) vs. the causation family (actor/signal graph). The risk is output contradiction: a downstream consumer could see a "HIGH impact" from causation_graph and "LOW impact" from chain_contagion for the same (ticker, horizon) and have no way to reconcile.
+**Verdict:** **OVERLAP_PARTIAL** — chain_contagion operates on a fundamentally different graph (physical [[Supply Chain|supply chain]]) vs. the [[Causation|causation]] family (actor/signal graph). The risk is output contradiction: a downstream consumer could see a "HIGH impact" from causation_graph and "LOW impact" from chain_contagion for the same (ticker, horizon) and have no way to reconcile.
 
 **Resolution task:** SYNTH-1 — Wire `chain_contagion.simulate_contagion` outputs through a unified contagion contract (`contracts/contagion_impact.json`?) that both causation_graph and [[Postmortem|postmortem.py]] already consume. `postmortem.py` already reads `contagion_backtest_results` and `contagion_predictions`, so the wiring half-exists. Extend causation_graph to join `supply_shock_attributions` when tracing a downstream impact chain so the two graphs converge at a single ticker-level impact score.
 
@@ -117,7 +117,7 @@ risks are narrower than the brief suggested, but they still exist.
 - `oracle/calibration.py` — Brier/ECE for oracle-level predictions, different table set.
 
 **Semantic check:**
-- Does postmortem.py already score contagion predictions? **PARTIAL** — it *consumes* the backtest results but does not *generate* them. The responsibility split is clean: `contagion_backtest.py` writes the scorecard, `postmortem.py` reads it and produces written analysis.
+- Does [[Postmortem|postmortem.py]] already score contagion predictions? **PARTIAL** — it *consumes* the backtest results but does not *generate* them. The responsibility split is clean: `contagion_backtest.py` writes the scorecard, `postmortem.py` reads it and produces written analysis.
 - Risk: contagion_backtest computes `compute_accuracy(predicted_margin_impact_pct, actual_price_move_pct)` and postmortem computes its own accuracy from oracle_predictions. **Two accuracy definitions can drift.**
 
 **Verdict:** **OVERLAP_PARTIAL** — clean responsibility split but the accuracy metrics risk divergence.
@@ -133,7 +133,7 @@ risks are narrower than the brief suggested, but they still exist.
 **Pre-existing candidates:**
 - `intelligence/hypothesis_engine.py` (2137 LOC) — discovers/scores/kills hypotheses, writes `discovered_hypotheses`. Not a composite score.
 - `oracle/engine.py` — 5-model ensemble for oracle-level direction/magnitude predictions, not sector health.
-- `intelligence/trust_scorer.py` — source-level Bayesian trust, not sector aggregate.
+- `intelligence/trust_scorer.py` — source-level [[Trust Scorer|Bayesian trust]], not sector aggregate.
 
 **Semantic check:** No pre-existing module computes a single-number sector health rollup across insider, darkpool, and supply-chain inputs.
 
@@ -202,7 +202,7 @@ risks are narrower than the brief suggested, but they still exist.
 **Session-created:** `intelligence/supply_chain_edge_validator.py` (450 LOC) — validates each `supply_chain_edges` row by checking upstream-downstream price correlation; marks weak relationships. Imports `intelligence.cross_lens`. Writes back to `supply_chain_edges`.
 
 **Pre-existing candidates:**
-- `intelligence/cross_reference.py` (1818 LOC) — government-stat lie detector. Does not touch `supply_chain_edges`.
+- `intelligence/cross_reference.py` (1818 LOC) — government-stat [[Cross Reference|lie detector]]. Does not touch `supply_chain_edges`.
 - `intelligence/source_audit.py` (940 LOC) — data-source trust audit. Does not touch `supply_chain_edges`.
 - `intelligence/resolution_audit.py` (961 LOC) — data resolution supervisor (duplicates, staleness, sanity checks on `resolved_series`). Generic, does not target supply-chain edges.
 - `intelligence/pct_cogs_enrichment.py` (1751 LOC, also session-created) — also writes `supply_chain_edges`.
@@ -256,7 +256,7 @@ risks are narrower than the brief suggested, but they still exist.
 
 **Pre-existing candidates:**
 - `features/lab.py` — has `zscore_normalize` (standardization), but no percentile rank.
-- `discovery/orthogonality.py` — orthogonality audit, not percentile ranking.
+- `discovery/orthogonality.py` — [[Orthogonality Audit|orthogonality audit]], not percentile ranking.
 
 **Semantic check:** percentile_rank is a common primitive; features/lab contains zscore but not percentile. This is a legitimate gap but a small one — 536 LOC for "percentile rank by group" is high.
 
@@ -363,7 +363,7 @@ Total: **~19,000 LOC.** All expose `get_<sector>_network()` + `get_entity(key)` 
 **Candidates:**
 - `intelligence/entity_resolver.py` (1411 LOC) — analytical entity resolution: phonetic keys, Levenshtein, Jaro-Winkler, `resolve`, `build_resolution_index`, `find_connections`. Writes `entity_resolution` table. Used in the actor/intelligence domain. Reads `actors`, `signal_data`, `wealth_flows`, `oracle_predictions`.
 - `normalization/entity_map.py` (1055 LOC) — `EntityMap` class for feature-source mapping ([[BLS]] codes ↔ feature_id etc.). Writes *nothing directly* — `load_v2_mappings` populates the mapping table via `resolver.py`. Used in the data-ingestion domain. Reads `feature_registry`, `resolved_series`.
-- `normalization/resolver.py` (322 LOC) — `Resolver` class, pending-feature-source conflict resolution. Writes `resolved_series`. Imports `normalization.entity_map`.
+- `normalization/resolver.py` (322 LOC) — `Resolver` class, pending-feature-source [[Conflict Resolution|conflict resolution]]. Writes `resolved_series`. Imports `normalization.entity_map`.
 
 **Semantic check:**
 - `normalization/*` = feature/source disambiguation (which [[FRED]] code maps to which canonical feature).
@@ -385,7 +385,7 @@ They are **different disambiguation domains**. BUT:
 Format: **SYNTH-N**: [canonical] [action] — [why]
 
 - **SYNTH-1** [HIGH]: `chain_contagion.py` — emit unified contagion-impact contract; join with `causation_graph` downstream impacts — two contagion graphs must not produce contradictory ticker-level impact scores.
-- **SYNTH-2** [LOW]: `supply_chokepoints.py` — add weekly Hermes schedule entry for `score_all_edges()` — keep chokepoint scores fresh so chain_contagion sees up-to-date weights.
+- **SYNTH-2** [LOW]: `supply_chokepoints.py` — add weekly [[Hermes Scheduler|Hermes]] schedule entry for `score_all_edges()` — keep chokepoint scores fresh so chain_contagion sees up-to-date weights.
 - **SYNTH-3** [MEDIUM]: `cross_lens.py` — register `supply_shock_attributions` as signal source in `trust_scorer` — otherwise this module's output rots unconsumed.
 - **SYNTH-4** [HIGH]: `postmortem.py` — extract shared `compute_accuracy()` between contagion_backtest and postmortem — two accuracy definitions diverging would silently miscalibrate the oracle.
 - **SYNTH-5** [MEDIUM]: `sector_health.py` — register `sector_health_snapshots` with `signal_registry` so oracle consumes it as a feature — stops parallel scoring track.

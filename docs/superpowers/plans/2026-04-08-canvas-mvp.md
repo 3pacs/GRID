@@ -6,7 +6,7 @@
 
 **[[architecture|Architecture]]:** Three new DB tables (canvas_boards, canvas_nodes, canvas_edges). [[FastAPI]] backend with facade + 2 sub-routers following the watchlist split pattern. React Flow frontend with custom node types per entity, a [[Zustand]] store slice, and a reusable "Send to Canvas" button wired into existing views.
 
-**Tech Stack:** @xyflow/react (React Flow v12), Zustand, FastAPI, [[SQLAlchemy]] text() queries, [[PostgreSQL]]
+**Tech Stack:** @xyflow/react (React Flow v12), [[Zustand]], [[FastAPI]], [[SQLAlchemy]] text() queries, [[PostgreSQL]]
 
 ---
 

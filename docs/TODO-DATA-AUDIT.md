@@ -85,7 +85,7 @@ For each stale source, pick the right action:
 - **Orphaned** (puller exists, never registered): register it in
   `ingestion/scheduler.py` with the right cadence, then run a one-time
   backfill.
-- **Coverage hole** (ticker in signal_registry but never in raw_series):
+- **Coverage hole** (ticker in signal_registry but never in [[Raw Series Table|raw_series]]):
   add the ticker to `ingestion/yfinance_pull.py`'s ticker list and run a
   full-history pull. Or stop generating signals for un-pricable tickers.
 
@@ -120,7 +120,7 @@ Recommendation: do #1 first (low effort), then #3 as a safety filter.
 ## What NOT to do
 
 - Don't paper over with fallbacks (e.g., "use last known price even if
-  9 years stale"). The walk-forward replay would produce garbage numbers.
+  9 years stale"). The [[Walk-Forward Backtesting|walk-forward]] replay would produce garbage numbers.
 - Don't run `raw_series` full-table scans during DB pressure hours.
 - Don't disable any ingestion modules until you've confirmed they're
   actually broken vs just slow.

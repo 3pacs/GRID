@@ -6,7 +6,7 @@
 
 **[[architecture|Architecture]]:** Two parallel tracks — backend event bus (PG LISTEN/NOTIFY + SSE endpoint) and frontend foundations (shared hooks + store split). TODO fixes are warm-up tasks that ship independently before V5 work begins.
 
-**Tech Stack:** Python 3.11, [[FastAPI]], asyncpg (new), [[PostgreSQL]] LISTEN/NOTIFY, SSE, React 18, Zustand
+**Tech Stack:** Python 3.11, [[FastAPI]], asyncpg (new), [[PostgreSQL]] LISTEN/NOTIFY, SSE, React 18, [[Zustand]]
 
 ---
 
@@ -53,7 +53,7 @@
 **Files:**
 - Modify: `api/main.py:239` (before the final log.info in `_deferred_startup`)
 
-- [ ] **Step 1: Add cross-reference pre-warm to _deferred_startup**
+- [ ] **Step 1: Add [[Cross Reference|cross-reference]] pre-warm to _deferred_startup**
 
 Add this block before line 241 (`log.info("GRID API ready...")`):
 
@@ -107,7 +107,7 @@ After line 39 (`GDELT_TIMEOUT_SECONDS = 10`), add:
 GDELT_REQUEST_SPACING = 6.0    # seconds between GDELT requests (free tier ~10/min)
 ```
 
-- [ ] **Step 2: Add sleep between GDELT requests in the monitor loop**
+- [ ] **Step 2: Add sleep between [[GDELT]] requests in the monitor loop**
 
 In `run_monitor()`, after the `continue` on line 278 (cooldown skip), add spacing before the `check_gdelt` call on line 280. The modified section of the loop body (lines 266-281) becomes:
 

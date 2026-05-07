@@ -20,7 +20,7 @@ random UUID primary key, not on the natural identity of the trade event.
 
 ### Why this matters for profitability
 
-Every metric is inflated. Pre-fix walk-forward reported:
+Every metric is inflated. Pre-fix [[Walk-Forward Backtesting|walk-forward]] reported:
 
 - astrogrid: 93% hit rate, +8.6% mean PnL (FAKE — n=15, one big winner echoed 590×)
 - direction: 29.3% hit rate (less inflated, but still 23× counted)
@@ -164,7 +164,7 @@ performance. Two protective moves:
   print honest numbers as soon as it runs. So you can iterate on the
   dup-write fix WITHOUT first fixing the report — they're decoupled.
 - Don't drop the existing UUID primary key. Add the natural-key UNIQUE
-  INDEX as a SECOND constraint. Some downstream code (postmortem,
+  INDEX as a SECOND constraint. Some downstream code ([[Postmortem|postmortem]],
   trace_evolver) joins on `id`, breaking that breaks the feedback loop.
 - The astrogrid 180× duplication is so much higher than direction's 23×
   because astrogrid runs on a faster cadence (likely every cycle, ~5min vs

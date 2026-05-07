@@ -38,7 +38,7 @@
 
 ### Notes found: 31 files mention GEX/dealer-gamma keywords
 
-Of those, **only 3 are actual GEX design documents** — the rest are one-line drive-by references inside module README stubs, session logs, or security docs.
+Of those, **only 3 are actual [[Dealer Gamma|GEX]] design documents** — the rest are one-line drive-by references inside module README stubs, session logs, or security docs.
 
 The 3 real design documents are all at the vault root:
 
@@ -74,7 +74,7 @@ Total active GEX design surface in the vault: **3,323 lines of Markdown**.
 
 - **Origin:** A much more rigorous follow-on document titled "Open-Source Alpha Layer for Options Dealer Flow — V2 Spec — Production-Oriented Research and Implementation Blueprint". Version header says **April 2026** — this is the current target.
 - **This is the document the user was referring to when he said "much of it is done."**
-- **Not "much of the code is done"** — much of the **DESIGN** is done. The V2 spec is essentially complete at the architecture level.
+- **Not "much of the code is done"** — much of the **DESIGN** is done. The V2 spec is essentially complete at the [[architecture]] level.
 - **Structure (24 sections):**
   1. Executive summary — confidence-scored feature factory, not a prediction claim
   2. Design principles — normalize first, infer second; make units explicit; fail loudly; dealer positioning is a latent model
@@ -281,7 +281,7 @@ Full drift audit would take another ~2 hours. These 5 are the most load-bearing.
 - **`version 5 - Stack & Visualization Architecture.md`** (173 lines) — Palantir/Gotham thesis. The "Five Views That Matter" + Canvas as killer feature. Proposes Apache AGE, Elasticsearch, Redpanda, MinIO, Temporal, React Flow, deck.gl. Partially shipped as V5 Phase 4+ per memory.
 - **`00-Dashboard.md`** — Command center index page with stale LLM info (see drift #2 above)
 - **`00-Session-Start.md`** — Not read this pass
-- **`TOP ASAP FIXES.md`** — 10-item post-Phase-5-dedupe todo list (dual-deploy tree, agent prompt templates, parallel agent file conflicts, MODULE_INVENTORY staleness gate, smoke test gate, LOC as metric, agent JSON contract, backup policy, pre-commit grep check, synthesis tasks INDEX-4). **This is fresh and actionable.**
+- **`TOP ASAP FIXES.md`** — 10-item post-Phase-5-dedupe todo list (dual-deploy tree, agent prompt templates, parallel agent file conflicts, [[MODULE_INVENTORY]] staleness gate, smoke test gate, LOC as metric, agent JSON contract, backup policy, pre-commit grep check, synthesis tasks INDEX-4). **This is fresh and actionable.**
 - **`META-Agent-Brief-Template.md`** — Not read this pass
 
 ---

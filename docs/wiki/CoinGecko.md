@@ -18,7 +18,10 @@ CoinGecko API — crypto prices, market cap, volume (free tier).
 ## Referenced By
 
 - [[DATA_GAPS]]
+- [[MODULE_INVENTORY]]
 - [[SESSION_HANDOFF_2026_04_05]]
+- [[Cron-Schedule]]
+- [[Data-Pipeline]]
 - [[PROJECT]]
 - [[REQUIREMENTS]]
 - [[ROADMAP]]

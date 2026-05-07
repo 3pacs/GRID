@@ -194,7 +194,7 @@ Phase 1 delivered the infrastructure. Phase 2 wires the 13 real contracts into `
 
 **~50 producer emit sites** — one-line `with pull_lifecycle(engine, "<name>") as rows:` per puller, plus single emit calls at each producer module ([[Postmortem|postmortem]], [[Oracle Engine|oracle engine]], gates, [[Options Tracker|options tracker]], cross_reference, leverage_network, clustering, hypothesis_engine, actor_discovery, [[Forensics|forensics]], canvas_investigate).
 
-**Expected outcome after Phase 2:** feedback loops close — postmortem failures decay signal trust, oracle weights evolve with scored predictions, backtest verdicts land in the journal, regime transitions re-weight sources, options trade outcomes tune the 7-signal scanner weights.
+**Expected outcome after Phase 2:** feedback loops close — [[Postmortem|postmortem]] failures decay signal trust, oracle weights evolve with scored predictions, backtest verdicts land in the journal, regime transitions re-weight sources, options trade outcomes tune the 7-signal scanner weights.
 
 ---
 

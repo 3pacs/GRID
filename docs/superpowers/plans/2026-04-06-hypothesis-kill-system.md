@@ -554,7 +554,7 @@ git commit -m "feat: score_all uses per-hypothesis test windows instead of blank
 
 ### Task 4: Kill Checks + Postmortem Writes
 
-The core logic: after scoring, check if any kill condition fires. If it does, mark the hypothesis as `invalidated`, record `kill_reason` and `killed_at`, and write a postmortem.
+The core logic: after scoring, check if any kill condition fires. If it does, mark the hypothesis as `invalidated`, record `kill_reason` and `killed_at`, and write a [[Postmortem|postmortem]].
 
 **Files:**
 - Modify: `intelligence/hypothesis_engine.py` — new `_check_kills()`, `_kill_hypothesis()`, `_write_postmortem()` methods; update `score_hypothesis()`

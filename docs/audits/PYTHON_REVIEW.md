@@ -1022,7 +1022,7 @@ async def example():
 
 ## References
 
-- **CLAUDE.md:** Security rules, data integrity rules
+- **CLAUDE.md:** [[Security]] rules, data integrity rules
 - **[[ATTENTION]].md:** Known issues and gotchas (64-item audit)
 - **PEP 8:** Python style guide
 - **[[FastAPI]] Security:** https://fastapi.tiangolo.com/tutorial/security/

@@ -8,7 +8,7 @@
 
 ## Start Here
 
-The user was trying to recover redbox (an older AM3+ workstation) that was failing to boot after a CPU fan replacement, then pivoted to enrolling it as a compute node once it was back up. "z4" in conversation = `gridz4` (Tailscale `100.68.9.27`), a separate HP Z4 workstation already running llama.cpp — not touched in this session.
+The user was trying to recover redbox (an older AM3+ workstation) that was failing to boot after a CPU fan replacement, then pivoted to enrolling it as a compute node once it was back up. "z4" in conversation = `gridz4` (Tailscale `100.68.9.27`), a separate HP Z4 workstation already running [[llama.cpp]] — not touched in this session.
 
 Local repo path:
 

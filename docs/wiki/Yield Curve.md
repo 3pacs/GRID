@@ -18,3 +18,5 @@ Full US Treasury yield curve daily — term structure signals.
 ## Referenced By
 
 - [[MODULE_CATALOG]]
+- [[MODULE_INVENTORY]]
+- [[SESSION-ROADMAP-2026-04-13]]

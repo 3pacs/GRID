@@ -30,7 +30,7 @@ The engine is designed to estimate and aggregate:
     
 - **Charm Exposure (CEX)**
     
-- **Vanna Exposure (VEX)**
+- **[[Dealer Gamma|Vanna]] Exposure (VEX)**
     
 - **Vomma Exposure (VOEX)**
     

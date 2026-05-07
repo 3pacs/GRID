@@ -18,3 +18,5 @@ Commitments of Traders — weekly futures positioning data.
 ## Referenced By
 
 - [[MODULE_CATALOG]]
+- [[MODULE_INVENTORY]]
+- [[Data-Pipeline]]

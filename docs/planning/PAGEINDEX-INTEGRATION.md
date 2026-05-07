@@ -170,7 +170,7 @@ class QueryRouter:
 
 **High-value integrations:**
 
-1. **[[Cross Reference|Cross-Reference]] lie detector** (`intelligence/cross_reference.py`)
+1. **[[Cross Reference|Cross-Reference]] [[Cross Reference|lie detector]]** (`intelligence/cross_reference.py`)
    - Deep-query Fed minutes and [[BLS]] methodology PDFs to check if government stats align with the underlying methodology described in source documents
    - Example: "Does the CPI methodology PDF describe the substitution adjustment that explains this divergence?"
 
@@ -190,8 +190,8 @@ class QueryRouter:
 - [ ] Add `pageindex_query()` helper to `intelligence/rag.py`
 - [ ] Integrate deep retrieval into cross-reference verification flow
 - [ ] Add filing-aware actor extraction to `actor_network.py`
-- [ ] Wire PIT-correct document retrieval into postmortem (use `release_date` filtering)
-- [ ] Add document-backed evidence to causation chains
+- [ ] Wire [[PIT Store|PIT-correct]] document retrieval into [[Postmortem|postmortem]] (use `release_date` filtering)
+- [ ] Add document-backed evidence to [[Causation|causation]] chains
 
 ### Phase 5: API + Frontend
 

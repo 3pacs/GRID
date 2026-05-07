@@ -18,8 +18,11 @@ Live model scoring engine. Loads production model, gets latest PIT data, compute
 ## Referenced By
 
 - [[MODULE_CATALOG]]
+- [[MODULE_INVENTORY]]
 - [[ARCHITECTURE_REVIEW]]
 - [[DOC_AUDIT]]
+- [[Data-Pipeline]]
+- [[ML-Inference]]
 - [[development]]
 - [[ARCHITECTURE]]
 - [[CONCERNS]]

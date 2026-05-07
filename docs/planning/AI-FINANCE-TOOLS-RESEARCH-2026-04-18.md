@@ -78,7 +78,7 @@ factor recipes.
   `qlib_alpha_*` namespace so they're trivially greppable.
 - Route through the normal [[Orthogonality Audit|orthogonality audit]] before promotion.
 
-**Risks:** Orthogonality check is mandatory — otherwise we balloon the feature
+**Risks:** [[Orthogonality Audit|Orthogonality]] check is mandatory — otherwise we balloon the feature
 set with correlated redundancy. Respect NaN strategy per the `data-integrity.md` rule.
 
 ### 4. FinGPT — evaluate as specialty sentiment LLM
@@ -111,7 +111,7 @@ Specifically interesting: **DBnomics** (2.6B+ series, ~300 providers) and
 - DBnomics is high-value because it aggregates [[FRED]], [[ECB]], BIS, IMF, etc. — could
   consolidate several existing pullers.
 
-**Risks:** Watch for overlap with existing sources (FRED, ECB). Entity-map
+**Risks:** Watch for overlap with existing sources ([[FRED]], [[ECB]]). Entity-map
 duplicate detection in `normalization/resolver.py` must be working before this
 lands or we double-count signals.
 
@@ -120,9 +120,9 @@ lands or we double-count signals.
 - **[[TradingAgents]] (tauric)** — already built. `agents/runner.py`,
   `agents/personas.py`, `agents/backtest.py` are our equivalent. Extending
   personas (item #2) is the only useful addition.
-- **TradingAgents-CN** — A-share / Shanghai & Shenzhen specific. Outside scope.
+- **[[TradingAgents]]-CN** — A-share / Shanghai & Shenzhen specific. Outside scope.
 - **daily_stock_analysis** — the value-add is the GH Actions scheduler. We have
-  Hermes (`ingestion/scheduler.py` + `hermes_operator.py`), which is strictly
+  [[Hermes Scheduler|Hermes]] (`ingestion/scheduler.py` + `hermes_operator.py`), which is strictly
   more capable. `oracle/report.py` already handles the daily-digest role.
 - **freqtrade** — crypto-only bot + backtester. We have
   `trading/hyperliquid.py` (exchange) and `validation/gates.py` (backtester).

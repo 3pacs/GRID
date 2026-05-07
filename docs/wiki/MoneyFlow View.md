@@ -18,6 +18,8 @@ Global money flow D3 visualization: Central Banks -> Markets -> Sectors.
 ## Referenced By
 
 - [[CLAUDE]]
+- [[MODULE_DEDUPE_PLAN]]
 - [[ROADMAP]]
+- [[V5-TRANSFORMATION]]
 - [[VIEW-ARCHITECTURE]]
 - [[viz-integration-instructions]]

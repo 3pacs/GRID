@@ -36,7 +36,7 @@ These are marked `active = true` in [[Source Catalog Table|source_catalog]] but 
 
 ## GAP: Data Flowing but NOT Scored by Thesis
 
-Data in raw_series that no thesis model touches:
+Data in [[Raw Series Table|raw_series]] that no thesis model touches:
 
 | Data Source | Rows | What It Has | Why It Matters |
 |------------|------|-------------|----------------|

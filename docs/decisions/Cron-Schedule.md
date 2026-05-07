@@ -58,7 +58,7 @@ Autonomous daemon running every 5 minutes (300s cycle):
 - `SOURCE_MAX_CONSECUTIVE_FAILS = 5` (extends cooldown to 6h)
 - `TIMEOUT_BLACKLIST_HOURS = 24`
 
-**Source Registry**: Hermes maintains a complete registry mapping source names to module paths, classes, and API key requirements. Covers: FRED, yfinance, EDGAR, BLS, Google Trends, CBOE, Fed speeches, fear/greed, Baltic, Crucix bridge, and many more.
+**Source Registry**: [[Hermes Scheduler|Hermes]] maintains a complete registry mapping source names to module paths, classes, and API key requirements. Covers: [[FRED]], yfinance, [[EDGAR]], [[BLS]], Google Trends, CBOE, Fed speeches, fear/greed, Baltic, Crucix bridge, and many more.
 
 ## Startup Tasks (api/main.py lifespan)
 

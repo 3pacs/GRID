@@ -1,5 +1,5 @@
 ---
-title: [[Cross Reference]] View
+title: Cross Reference View
 category: Frontend
 type: concept
 auto_generated: true
@@ -18,5 +18,6 @@ Government stats vs physical reality [[Cross Reference|lie detector]] dashboard.
 ## Referenced By
 
 - [[CLAUDE]]
+- [[V5-TRANSFORMATION]]
 - [[VIEW-ARCHITECTURE]]
 - [[viz-integration-instructions]]

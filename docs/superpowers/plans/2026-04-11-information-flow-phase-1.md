@@ -3313,7 +3313,7 @@ cd /Users/anikdang/dev/GRID && python -m pytest tests/contracts/ -v
 ```
 Expected: every test in `tests/contracts/` passes. Integration tests (tagged `@pytest.mark.integration`) skip automatically if Postgres is unavailable.
 
-- [ ] **Step 8: Smoke-import the FastAPI app**
+- [ ] **Step 8: Smoke-import the [[FastAPI]] app**
 
 ```bash
 cd /Users/anikdang/dev/GRID && python -c "from api.main import app; print(sorted(r.path for r in app.routes if '/contracts' in getattr(r, 'path', '')))"

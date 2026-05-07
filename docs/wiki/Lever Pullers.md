@@ -17,6 +17,8 @@ Identifies and tracks market-moving actors across 5 categories. Maps who pulls w
 
 ## Referenced By
 
+- [[MODULE_INVENTORY]]
 - [[DOC_AUDIT]]
+- [[Intelligence-Layer]]
 - [[ROADMAP]]
 - [[VIEW-ARCHITECTURE]]

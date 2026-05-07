@@ -18,13 +18,17 @@ Feature independence audit using PCA, correlation heatmaps, and scree plots. Ens
 ## Referenced By
 
 - [[ATTENTION]]
+- [[CLAUDE]]
 - [[MODULE_CATALOG]]
+- [[MODULE_INVENTORY]]
+- [[MODULE_OVERLAP_AUDIT]]
 - [[ARCHITECTURE_FIXES]]
 - [[ARCHITECTURE_INDEX]]
 - [[ARCHITECTURE_REVIEW]]
 - [[DATABASE_REVIEW]]
 - [[DOC_AUDIT]]
 - [[REFACTOR_REPORT]]
+- [[AI-FINANCE-TOOLS-RESEARCH-2026-04-18]]
 - [[FILL-EMPTY-TABLES]]
 - [[PROJECT]]
 - [[PROMPT_PRUNING_PLAN]]

@@ -21,6 +21,7 @@ P2P local LLM inference layer for distributed reasoning.
 - [[HOSTING]]
 - [[README]]
 - [[MODULE_CATALOG]]
+- [[MODULE_INVENTORY]]
 - [[ARCHITECTURE_REVIEW]]
 - [[PERFORMANCE_AUDIT]]
 - [[deployment]]

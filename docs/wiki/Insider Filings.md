@@ -20,6 +20,8 @@ SEC Form 4 insider filings with cluster buy detection.
 - [[CLAUDE]]
 - [[DATA_GAPS]]
 - [[MODULE_CATALOG]]
+- [[MODULE_INVENTORY]]
+- [[Data-Pipeline]]
 - [[GSD-OPTIONS-EDGE]]
 - [[GSD-PLAN]]
 - [[MASTER-PLAN]]
