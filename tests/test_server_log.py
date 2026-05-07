@@ -7,6 +7,7 @@ All tests run without git or network access (mocked).
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 
@@ -199,6 +200,155 @@ class TestGitSinkWrite:
         assert sink._pending_count == 2
 
 
+class TestGitSinkDedup:
+    """The dedup window is the universal backstop against error-log floods.
+
+    PR #61 introduced a 600s dedup that collapses identical
+    (module, function, line, message) records to a single entry. These
+    tests pin the contract so a regression cannot reintroduce the
+    4,560-row flood that motivated the fix.
+    """
+
+    @staticmethod
+    def _record(
+        module: str = "mod",
+        function: str = "fn",
+        line: int = 1,
+        message: str = "boom",
+    ) -> MagicMock:
+        level = MagicMock()
+        level.name = "ERROR"
+        msg = MagicMock()
+        msg.record = {
+            "level": level,
+            "name": module,
+            "function": function,
+            "line": line,
+            "message": message,
+            "exception": None,
+        }
+        return msg
+
+    def test_identical_records_collapse_to_one_line(self, tmp_path):
+        """Five identical records inside the window write one JSONL line."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        for _ in range(5):
+            sink.write(self._record())
+
+        errors_file = tmp_path / ".server-logs" / "errors.jsonl"
+        assert errors_file.exists()
+        lines = [ln for ln in errors_file.read_text().splitlines() if ln.strip()]
+        assert len(lines) == 1, "dedup window must collapse identical records"
+        # Only the first write counts toward the pending push batch
+        assert sink._pending_count == 1
+
+    def test_distinct_messages_are_not_deduped(self, tmp_path):
+        """Different message bodies bypass the dedup key and each persist."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        sink.write(self._record(message="alpha"))
+        sink.write(self._record(message="beta"))
+        sink.write(self._record(message="gamma"))
+
+        errors_file = tmp_path / ".server-logs" / "errors.jsonl"
+        lines = [ln for ln in errors_file.read_text().splitlines() if ln.strip()]
+        assert len(lines) == 3
+        assert sink._pending_count == 3
+
+    def test_window_expiry_emits_suppressed_count(self, tmp_path):
+        """When the dedup window expires, the next write reports suppressed N."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        sink.write(self._record())  # first write — record created
+        for _ in range(7):
+            sink.write(self._record())  # suppressed inside the window
+
+        # Force the dedup window to be considered expired without sleeping
+        key = list(sink._dedup.keys())[0]
+        first_ts, count = sink._dedup[key]
+        sink._dedup[key] = (first_ts - 10_000, count)
+
+        sink.write(self._record())  # window expired → flushes summary
+
+        errors_file = tmp_path / ".server-logs" / "errors.jsonl"
+        lines = [ln for ln in errors_file.read_text().splitlines() if ln.strip()]
+        assert len(lines) == 2
+        second = json.loads(lines[1])
+        assert "deduped" in second["message"]
+        assert "suppressed" in second["message"]
+
+    def test_dedup_key_includes_line_number(self, tmp_path):
+        """Same message from different source lines must not collapse."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        sink.write(self._record(line=10))
+        sink.write(self._record(line=20))
+
+        errors_file = tmp_path / ".server-logs" / "errors.jsonl"
+        lines = [ln for ln in errors_file.read_text().splitlines() if ln.strip()]
+        assert len(lines) == 2
+
+
+class TestGitSinkRotation:
+    """File rotation bounds disk usage even if dedup somehow fails."""
+
+    def test_rotate_if_needed_archives_oversized_file(self, tmp_path):
+        """Files over the threshold are renamed and a fresh file is started."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        errors_file = tmp_path / ".server-logs" / "errors.jsonl"
+        errors_file.write_text("x" * 1024)  # 1KB
+
+        rotated = sink.rotate_if_needed(max_size_mb=0.0001)  # ~100 bytes threshold
+
+        assert rotated is True
+        assert not errors_file.exists() or errors_file.stat().st_size == 0
+        archives = list((tmp_path / ".server-logs").glob("errors_*.jsonl"))
+        assert len(archives) == 1, "rotation must produce exactly one archive"
+
+    def test_rotate_skipped_when_under_threshold(self, tmp_path):
+        """Files under the threshold are left alone."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        errors_file = tmp_path / ".server-logs" / "errors.jsonl"
+        errors_file.write_text("small")
+
+        assert sink.rotate_if_needed(max_size_mb=10.0) is False
+        assert errors_file.exists()
+
+    def test_cleanup_old_archives_respects_age_cutoff(self, tmp_path):
+        """Archives older than max_age_days are deleted; newer ones survive."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        old = tmp_path / ".server-logs" / "errors_19990101_000000.jsonl"
+        recent = tmp_path / ".server-logs" / (
+            f"errors_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.jsonl"
+        )
+        old.write_text("ancient")
+        recent.write_text("today")
+
+        deleted = sink.cleanup_old_archives(max_age_days=30)
+
+        assert deleted == 1
+        assert not old.exists()
+        assert recent.exists()
+
+
 class TestGitSinkCommit:
     """GitSink commit+push cycle works correctly."""
 
@@ -231,6 +381,117 @@ class TestGitSinkCommit:
 
         sink._commit_and_push()
         mock_git.assert_not_called()
+
+    @patch("server_log.git_sink.subprocess.run")
+    def test_git_invocation_passes_author_identity(self, mock_run, tmp_path):
+        """`_git` always passes -c user.name / -c user.email so commits don't
+        fail with 'Author identity unknown' on hosts with empty git config."""
+        (tmp_path / ".git").mkdir()
+        mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+
+        from server_log.git_sink import _git
+        rc, _ = _git(["status"], tmp_path)
+        assert rc == 0
+
+        # The first positional arg is the argv list. Find -c user.name=*
+        # and -c user.email=* before the actual git subcommand.
+        argv = mock_run.call_args[0][0]
+        assert argv[0] == "git"
+        # Identity must be set BEFORE the subcommand ("status") so it
+        # applies to commit/log/etc.
+        sub_idx = argv.index("status")
+        prelude = argv[1:sub_idx]
+        assert "-c" in prelude
+        assert any(a.startswith("user.name=") for a in prelude)
+        assert any(a.startswith("user.email=") for a in prelude)
+
+    @patch("server_log.git_sink.subprocess.run")
+    def test_git_invocation_honours_env_overrides(self, mock_run, tmp_path):
+        """GRID_GIT_SINK_AUTHOR_{NAME,EMAIL} override the defaults."""
+        (tmp_path / ".git").mkdir()
+        mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+
+        from server_log.git_sink import _git
+        with patch.dict(
+            "os.environ",
+            {
+                "GRID_GIT_SINK_AUTHOR_NAME": "Custom Bot",
+                "GRID_GIT_SINK_AUTHOR_EMAIL": "bot@example.com",
+            },
+        ):
+            _git(["status"], tmp_path)
+
+        argv = mock_run.call_args[0][0]
+        assert "user.name=Custom Bot" in argv
+        assert "user.email=bot@example.com" in argv
+
+    @patch("server_log.git_sink._git")
+    def test_stale_index_lock_is_removed_and_add_is_retried(self, mock_git, tmp_path):
+        """A stale .git/index.lock should not permanently block log commits."""
+        import os
+
+        (tmp_path / ".git").mkdir()
+        lock = tmp_path / ".git" / "index.lock"
+        lock.touch()
+        old = lock.stat().st_mtime - 300
+        os.utime(lock, (old, old))
+
+        from server_log.git_sink import GitSink
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        sink._pending_count = 1
+        mock_git.side_effect = [
+            (1, "fatal: Unable to create '.git/index.lock': File exists."),
+            (0, "add ok"),
+            (0, "commit ok"),
+        ]
+
+        sink._commit_and_push()
+
+        assert not lock.exists()
+        assert mock_git.call_args_list[0].args[0][0] == "add"
+        assert mock_git.call_args_list[1].args[0][0] == "add"
+
+    def test_fresh_index_lock_is_not_removed(self, tmp_path):
+        """A fresh git lock may belong to a live operator process."""
+        from server_log.git_sink import _clear_stale_index_lock
+
+        (tmp_path / ".git").mkdir()
+        lock = tmp_path / ".git" / "index.lock"
+        lock.touch()
+
+        assert _clear_stale_index_lock(tmp_path) is False
+        assert lock.exists()
+
+    @patch("server_log.git_sink._git")
+    def test_commit_failure_logs_warning_not_error(self, mock_git, tmp_path):
+        """Sink git failures should not recursively populate errors.jsonl."""
+        from loguru import logger
+
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        sink._pending_count = 1
+        mock_git.side_effect = [
+            (0, "add ok"),
+            (1, "On branch main\nyour branch and origin have diverged"),
+        ]
+
+        seen: list[tuple[str, str]] = []
+        sink_id = logger.add(
+            lambda msg: seen.append(
+                (msg.record["level"].name, msg.record["message"])
+            ),
+            level="WARNING",
+        )
+        try:
+            sink._commit_and_push()
+        finally:
+            logger.remove(sink_id)
+
+        assert any(
+            level == "WARNING" and "git commit failed" in message
+            for level, message in seen
+        )
 
 
 # ===================================================================

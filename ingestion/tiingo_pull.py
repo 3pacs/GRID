@@ -19,8 +19,17 @@ import requests
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError
 
 from ingestion.base import BasePuller
+
+# Process-scoped circuit breaker for catastrophic DB index corruption.
+# Once a single ticker raises psycopg2.errors.IndexCorrupted on
+# uq_raw_series_composite, every subsequent ticker in the cycle hits the
+# same wall — burning ~30 ERROR rows per cycle until an operator runs
+# REINDEX. Flip this once and skip the rest of the cycle so the log
+# stays focused on the one actionable line.
+_INDEX_CORRUPTED_BREAKER: bool = False
 
 _TIINGO_API_KEY = os.getenv("TIINGO_API_KEY", "")
 _BASE_URL = "https://api.tiingo.com"
@@ -158,9 +167,36 @@ class TiingoPuller(BasePuller):
             result["status"] = "FAILED"
             result["errors"].append(str(e))
         except Exception as exc:
-            log.error("Tiingo pull failed for {t}: {err}", t=ticker, err=str(exc))
+            # Detect IndexCorrupted on uq_raw_series_composite: this is a
+            # catastrophic Postgres-level failure that requires an operator
+            # to run REINDEX. Every subsequent ticker would raise the same
+            # error, so flip a process-scoped breaker and surface ONE
+            # actionable line instead of N×30 noisy ERROR rows per cycle.
+            global _INDEX_CORRUPTED_BREAKER
+            err_str = str(exc)
+            if "IndexCorrupted" in err_str or "uq_raw_series_composite" in err_str:
+                if not _INDEX_CORRUPTED_BREAKER:
+                    _INDEX_CORRUPTED_BREAKER = True
+                    log.error(
+                        "Tiingo: Postgres index uq_raw_series_composite is "
+                        "CORRUPTED — operator must run "
+                        "`REINDEX INDEX CONCURRENTLY uq_raw_series_composite;` "
+                        "(see scripts/migrations/reindex_raw_series.sql). "
+                        "Skipping the rest of this Tiingo cycle to avoid "
+                        "log flood. Triggered by ticker {t}: {err}",
+                        t=ticker, err=err_str[:200],
+                    )
+                else:
+                    log.debug(
+                        "Tiingo: skipping {t} — index corruption breaker tripped",
+                        t=ticker,
+                    )
+                result["status"] = "FAILED"
+                result["errors"].append("index corruption — see prior ERROR")
+                return result
+            log.error("Tiingo pull failed for {t}: {err}", t=ticker, err=err_str)
             result["status"] = "FAILED"
-            result["errors"].append(str(exc))
+            result["errors"].append(err_str)
 
         return result
 
@@ -203,6 +239,16 @@ class TiingoPuller(BasePuller):
             results.append(res)
             if res["status"] == "SUCCESS":
                 succeeded += 1
+            # Short-circuit the rest of the cycle when the catastrophic
+            # IndexCorrupted breaker has tripped — every remaining ticker
+            # would re-raise the same error.
+            if _INDEX_CORRUPTED_BREAKER:
+                log.warning(
+                    "Tiingo bulk pull aborted at ticker {t} — "
+                    "index corruption breaker tripped (operator must REINDEX)",
+                    t=ticker,
+                )
+                break
             time.sleep(_RATE_LIMIT_DELAY)
 
         log.info(

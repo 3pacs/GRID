@@ -406,7 +406,20 @@ class DarkPoolPuller(BasePuller):
                 time.sleep(_RATE_LIMIT_DELAY)
 
         except Exception as exc:
-            log.error("DarkPool weekly pull failed: {e}", e=str(exc))
+            # FINRA's gateway intermittently 502/503/504s during their
+            # business hours. These are transient and our next cycle will
+            # retry — no operator action required, so log as WARNING to
+            # keep errors.jsonl focused on actionable issues. Permanent
+            # client errors (4xx) still bubble up as ERROR.
+            status_code: int | None = None
+            response = getattr(exc, "response", None)
+            if response is not None:
+                status_code = getattr(response, "status_code", None)
+            is_transient_5xx = (
+                status_code is not None and 500 <= int(status_code) < 600
+            )
+            log_fn = log.warning if is_transient_5xx else log.error
+            log_fn("DarkPool weekly pull failed: {e}", e=str(exc))
             return {
                 "status": "FAILED",
                 "rows_inserted": 0,

@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 import threading
+import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +44,13 @@ _ERRORS_FILE = "errors.jsonl"
 _DEDUP_WINDOW_SECONDS = 600  # 10 minutes
 _MAX_FILE_SIZE_MB = 50.0
 
+# Author identity used when the host's git config is empty (production
+# servers often run as a service account with no global user.name/email).
+# Embedding via -c keeps the commit working regardless of host config and
+# stops the recurring "Author identity unknown" ERROR cascade.
+_DEFAULT_AUTHOR_NAME = "GRID Error Logger"
+_DEFAULT_AUTHOR_EMAIL = "grid-bot@localhost"
+
 
 def _repo_root() -> Path:
     """Find the git repository root above the grid/ package."""
@@ -56,10 +64,18 @@ def _repo_root() -> Path:
 
 
 def _git(args: list[str], cwd: Path) -> tuple[int, str]:
-    """Run a git command and return (returncode, combined output)."""
+    """Run a git command and return (returncode, combined output).
+
+    Always passes -c user.name / -c user.email so commits succeed even when
+    the host has no global git identity configured. Override via
+    GRID_GIT_SINK_AUTHOR_NAME / GRID_GIT_SINK_AUTHOR_EMAIL env vars.
+    """
+    name = os.getenv("GRID_GIT_SINK_AUTHOR_NAME", _DEFAULT_AUTHOR_NAME)
+    email = os.getenv("GRID_GIT_SINK_AUTHOR_EMAIL", _DEFAULT_AUTHOR_EMAIL)
+    identity_args = ["-c", f"user.name={name}", "-c", f"user.email={email}"]
     try:
         result = subprocess.run(
-            ["git"] + args,
+            ["git"] + identity_args + args,
             cwd=str(cwd),
             capture_output=True,
             text=True,
@@ -68,6 +84,25 @@ def _git(args: list[str], cwd: Path) -> tuple[int, str]:
         return result.returncode, (result.stdout + result.stderr).strip()
     except Exception as exc:
         return 1, str(exc)
+
+
+def _clear_stale_index_lock(repo: Path) -> bool:
+    """Remove an old git index lock left behind by a crashed sink process."""
+    lock = repo / ".git" / "index.lock"
+    try:
+        if not lock.exists():
+            return False
+        age_s = max(0.0, time.time() - lock.stat().st_mtime)
+        if age_s < 60:
+            return False
+        lock.unlink()
+        _fallback_log.warning(
+            "[server_log] removed stale .git/index.lock (age={age:.0f}s)",
+            age=age_s,
+        )
+        return True
+    except OSError:
+        return False
 
 
 class GitSink:
@@ -222,10 +257,17 @@ class GitSink:
             count = self._pending_count
             self._pending_count = 0
 
-        # Stage the errors file
+        # Stage the errors file. A crashed prior git process can leave
+        # .git/index.lock behind and block the sink indefinitely.
         rc, out = _git(["add", str(self._errors_path)], self._repo)
+        if (
+            rc != 0
+            and "index.lock" in out.lower()
+            and _clear_stale_index_lock(self._repo)
+        ):
+            rc, out = _git(["add", str(self._errors_path)], self._repo)
         if rc != 0:
-            _fallback_log.error("[server_log] git add failed: {out}", out=out)
+            _fallback_log.warning("[server_log] git add failed: {out}", out=out)
             return
 
         # Commit
@@ -243,7 +285,7 @@ class GitSink:
                 or "nothing added to commit" in out_low
             ):
                 return
-            _fallback_log.error("[server_log] git commit failed: {out}", out=out)
+            _fallback_log.warning("[server_log] git commit failed: {out}", out=out)
             return
 
         # Push — only if explicitly enabled (default off to prevent

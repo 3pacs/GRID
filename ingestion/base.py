@@ -89,6 +89,55 @@ def _retry_after_seconds(exc: BaseException) -> float | None:
     return None
 
 
+# Exception types that always indicate a bug in our code, never an upstream
+# data-source issue. These should always be logged at ERROR so they show up
+# in error scans. Anything else from a network/API call is treated as
+# "external / transient" and downgraded to WARNING.
+_CODE_BUG_EXC_TYPES: tuple[type[BaseException], ...] = (
+    AttributeError,
+    KeyError,
+    IndexError,
+    NameError,
+    UnboundLocalError,
+    AssertionError,
+    ImportError,  # ImportError of an *expected* dep is a bug; optional deps
+                  # should be detected at puller init and skipped explicitly.
+    SyntaxError,
+)
+
+
+def log_pull_failure(
+    source: str,
+    series_or_topic: str,
+    exc: BaseException,
+    *,
+    bug_types: tuple[type[BaseException], ...] = _CODE_BUG_EXC_TYPES,
+) -> None:
+    """Log an ingestion failure at the appropriate severity.
+
+    Code bugs (KeyError, AttributeError, ImportError, …) get ERROR so they
+    surface in `.server-logs/errors.jsonl` and trigger alerts. Network /
+    HTTP / parsing failures from upstream get WARNING — they're noisy but
+    not actionable in our codebase, and drowning real bugs in 1,000+
+    "404 Forbidden" rows was the #1 source of `errors.jsonl` rot
+    (see PR #61, the 4,560-row error-log flood).
+
+    Parameters:
+        source: Puller name, e.g. ``"BCB"`` or ``"AKShare"``.
+        series_or_topic: What was being pulled (series id, ticker, …).
+        exc: The exception that bubbled up.
+        bug_types: Override the "this is a code bug" exception tuple.
+    """
+    is_bug = isinstance(exc, bug_types)
+    log_fn = log.opt(exception=is_bug).error if is_bug else log.warning
+    log_fn(
+        "{src} pull failed for {what}: {err}",
+        src=source,
+        what=series_or_topic,
+        err=str(exc),
+    )
+
+
 def retry_on_failure(
     max_attempts: int = DEFAULT_RETRY_ATTEMPTS,
     backoff: float = DEFAULT_RETRY_BACKOFF,

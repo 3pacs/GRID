@@ -180,7 +180,17 @@ class JupiterDexScreenerProvider:
             data = resp.json()
         except httpx.HTTPError as exc:
             self.http_errors += 1
-            log.error("Jupiter strict list fetch failed: {e}", e=str(exc))
+            # DNS / connect / timeout failures are transient (network
+            # blips, captive portals, brief upstream outages) and nothing
+            # is actionable from a single occurrence. Downgrade to WARNING
+            # so the universe-empty path stays graceful without flooding
+            # errors.jsonl. Genuine HTTPStatusError (4xx/5xx body) still
+            # logs as ERROR so a real outage is visible.
+            is_transient = isinstance(
+                exc, (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout)
+            )
+            log_fn = log.warning if is_transient else log.error
+            log_fn("Jupiter strict list fetch failed: {e}", e=str(exc))
             return []
         if not isinstance(data, list):
             log.warning("Jupiter strict list unexpected shape: {t}", t=type(data))

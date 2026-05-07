@@ -15,7 +15,7 @@ import requests
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
-from ingestion.base import BasePuller
+from ingestion.base import BasePuller, log_pull_failure
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 # BCB SGS series: series_code -> feature name
@@ -90,9 +90,28 @@ class BCBPuller(BasePuller):
                 result["errors"].append("No data returned")
                 return result
 
+            # BCB occasionally returns an error envelope (string or dict)
+            # rather than the documented list-of-dict response. Iterating
+            # over a string yielded single chars whose ``.get`` raised
+            # AttributeError and produced 60+ ERROR rows in errors.jsonl.
+            if not isinstance(data, list):
+                log.warning(
+                    "BCB code {code}: unexpected payload type {t} — skipping",
+                    code=series_code, t=type(data).__name__,
+                )
+                result["status"] = "SKIPPED"
+                result["errors"].append(
+                    f"Non-list payload: {type(data).__name__}"
+                )
+                return result
+
             inserted = 0
             with self.engine.begin() as conn:
                 for record in data:
+                    if not isinstance(record, dict):
+                        # Defensive: skip stray non-dict entries (error
+                        # strings, nested arrays). Don't kill the whole pull.
+                        continue
                     try:
                         # BCB returns {"data": "DD/MM/YYYY", "valor": "1.23"}
                         date_str = record.get("data", "")
@@ -125,7 +144,7 @@ class BCBPuller(BasePuller):
             log.info("BCB {fn}: inserted {n} rows", fn=feature_name, n=inserted)
 
         except Exception as exc:
-            log.error("BCB pull failed for code {code}: {err}", code=series_code, err=str(exc))
+            log_pull_failure("BCB", f"code {series_code}", exc)
             result["status"] = "FAILED"
             result["errors"].append(str(exc))
 
