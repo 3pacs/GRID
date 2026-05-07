@@ -288,6 +288,50 @@ def estimate_premium(
     return entry, target, stop
 
 
+def _split_signals_by_direction(
+    signals: dict[str, Any] | None,
+    trade_direction: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split a scanner signals dict into supporting / opposing buckets.
+
+    Each signal is a `{score, direction?, value?}` triple keyed by name.
+    Aligns the scanner's `direction` field ("bullish"/"bearish") against
+    the trade's `direction` ("CALL"/"PUT") to decide which bucket. Signals
+    without a direction or with score==0 are dropped — they didn't drive
+    the decision and aren't useful in the postmortem.
+
+    The output preserves the signal name and full payload so the
+    postmortem can render contribution scores and raw values without a
+    second DB lookup.
+    """
+    if not signals:
+        return [], []
+
+    bullish_dirs = {"bullish", "bull", "long", "up", "call"}
+    bearish_dirs = {"bearish", "bear", "short", "down", "put"}
+    supports = bullish_dirs if trade_direction == "CALL" else bearish_dirs
+    opposes = bearish_dirs if trade_direction == "CALL" else bullish_dirs
+
+    supporting: list[dict[str, Any]] = []
+    opposing: list[dict[str, Any]] = []
+    for name, payload in signals.items():
+        if not isinstance(payload, dict):
+            continue
+        score = payload.get("score") or 0
+        if not score:
+            continue
+        entry = {"name": name, **payload}
+        sig_dir = str(payload.get("direction", "")).lower()
+        if sig_dir in opposes:
+            opposing.append(entry)
+        else:
+            supporting.append(entry)
+
+    supporting.sort(key=lambda e: e.get("score") or 0, reverse=True)
+    opposing.sort(key=lambda e: e.get("score") or 0, reverse=True)
+    return supporting, opposing
+
+
 # ── Recommendation dataclass ─────────────────────────────────────────
 
 
@@ -622,10 +666,11 @@ class OptionsRecommender:
                         "INSERT INTO options_recommendations "
                         "(ticker, direction, strike, expiry, entry_price, target_price, "
                         "stop_loss, expected_return, kelly_fraction, confidence, thesis, "
-                        "dealer_context, sanity_status, generated_at) "
+                        "dealer_context, sanity_status, signals, opposing_signals, generated_at) "
                         "VALUES (:ticker, :direction, :strike, :expiry, :entry_price, "
                         ":target_price, :stop_loss, :expected_return, :kelly_fraction, "
-                        ":confidence, :thesis, :dealer_context, :sanity_status, :generated_at)"
+                        ":confidence, :thesis, :dealer_context, :sanity_status, "
+                        ":signals, :opposing_signals, :generated_at)"
                     ),
                     {
                         "ticker": rec.ticker,
@@ -641,6 +686,8 @@ class OptionsRecommender:
                         "thesis": rec.thesis,
                         "dealer_context": rec.dealer_context,
                         "sanity_status": json.dumps(rec.sanity_status),
+                        "signals": json.dumps(rec.supporting_signals or [], default=str),
+                        "opposing_signals": json.dumps(rec.opposing_signals or [], default=str),
                         "generated_at": rec.generated_at or datetime.utcnow().isoformat() + "Z",
                     },
                 )
@@ -731,6 +778,13 @@ class OptionsRecommender:
         # Thesis from scanner
         thesis = opp.thesis
 
+        # Decompose the scanner signal payload into supporting / opposing
+        # buckets so the postmortem can attribute failures to specific
+        # contributors. opp.signals is a free-form dict from the scanner;
+        # we treat the items as supporting evidence and only flag entries
+        # whose stored direction explicitly contradicts ours as opposing.
+        supporting, opposing = _split_signals_by_direction(opp.signals, direction)
+
         # Build preliminary recommendation
         rec = OptionsRecommendation(
             ticker=ticker,
@@ -747,6 +801,8 @@ class OptionsRecommender:
             thesis=thesis,
             dealer_context=dealer_context,
             sanity_status={},
+            supporting_signals=supporting,
+            opposing_signals=opposing,
             generated_at=datetime.utcnow().isoformat() + "Z",
         )
 

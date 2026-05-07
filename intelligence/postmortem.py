@@ -146,7 +146,7 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
             SELECT id, ticker, direction, strike, expiry, entry_price,
                    target_price, stop_loss, confidence, thesis,
                    sanity_status, generated_at, outcome, actual_return,
-                   closed_at, dealer_context
+                   closed_at, dealer_context, signals, opposing_signals
             FROM options_recommendations
             WHERE id = :id
         """), {"id": trade_id}).fetchone()
@@ -158,7 +158,10 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
     (rec_id, ticker, direction, strike, expiry, entry_price,
      target_price, stop_loss, confidence, thesis,
      sanity_status, generated_at, outcome, actual_return,
-     closed_at, dealer_context) = row
+     closed_at, dealer_context, signals_json, opposing_signals_json) = row
+
+    decision_signals = _parse_json(signals_json) or []
+    decision_opposing = _parse_json(opposing_signals_json) or []
 
     # Only generate for failures
     if outcome not in ("LOSS", "EXPIRED"):
@@ -180,6 +183,14 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
     data_at_decision = _reconstruct_decision_data(
         engine, ticker, generated_at, sanity, dealer_ctx,
     )
+
+    # Surface the actual scanner signals that drove the trade — these are
+    # persisted on options_recommendations as of migration 0051. Older
+    # rows may have NULLs, which the parse helper turns into empty lists.
+    if decision_signals:
+        data_at_decision["decision_signals"] = decision_signals
+    if decision_opposing:
+        data_at_decision["decision_signals_opposing"] = decision_opposing
 
     # Load price path from entry to outcome
     price_path = _load_price_path(engine, ticker, generated_at, closed_at or expiry)
@@ -218,6 +229,8 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
         price_path=price_path,
         signals_wrong=signals_wrong,
         signals_right=signals_right,
+        decision_signals=decision_signals,
+        decision_opposing=decision_opposing,
     )
 
     recommended_fix = llm_narrative.get("recommended_fix", root_cause)
@@ -1448,6 +1461,8 @@ def _get_llm_postmortem(
     price_path: list[dict],
     signals_wrong: list[str],
     signals_right: list[str],
+    decision_signals: list[dict] | None = None,
+    decision_opposing: list[dict] | None = None,
 ) -> dict[str, Any]:
     """Ask the LLM for a narrative post-mortem explanation.
 
@@ -1488,6 +1503,39 @@ def _get_llm_postmortem(
     except Exception as exc:
         log.warning("RAG context retrieval failed in postmortem: {e}", e=exc)
 
+    # Top contributors block — pulled from the persisted scanner signals
+    # on options_recommendations (migration 0051). Sorted by score so the
+    # LLM sees the highest-weight features first when explaining failure.
+    top_contrib_lines: list[str] = []
+    if decision_signals:
+        for s in decision_signals[:8]:
+            name = s.get("name", "?")
+            score = s.get("score", 0)
+            sig_dir = s.get("direction") or "—"
+            value = s.get("value")
+            top_contrib_lines.append(
+                f"  {name} (dir={sig_dir}, score={score}, value={value})"
+            )
+    top_contrib_block = (
+        "TOP CONTRIBUTING SIGNALS (highest-score first):\n"
+        + "\n".join(top_contrib_lines) + "\n"
+    ) if top_contrib_lines else ""
+
+    opposing_lines: list[str] = []
+    if decision_opposing:
+        for s in decision_opposing[:5]:
+            name = s.get("name", "?")
+            score = s.get("score", 0)
+            sig_dir = s.get("direction") or "—"
+            value = s.get("value")
+            opposing_lines.append(
+                f"  {name} (dir={sig_dir}, score={score}, value={value})"
+            )
+    opposing_block = (
+        "OPPOSING SIGNALS WE OVERRODE:\n"
+        + "\n".join(opposing_lines) + "\n"
+    ) if opposing_lines else ""
+
     prompt = (
         f"TRADE: {ticker} {direction}\n"
         f"THESIS: {thesis}\n"
@@ -1500,6 +1548,8 @@ def _get_llm_postmortem(
     prompt += (
         f"WHAT HAPPENED:\n{what_happened}\n\n"
         f"PRICE PATH:\n{price_summary}\n\n"
+        f"{top_contrib_block}"
+        f"{opposing_block}"
         f"DATA AT DECISION:\n{data_summary}\n\n"
         f"SIGNALS WRONG: {', '.join(signals_wrong) or 'none identified'}\n"
         f"SIGNALS RIGHT: {', '.join(signals_right) or 'none identified'}\n\n"
