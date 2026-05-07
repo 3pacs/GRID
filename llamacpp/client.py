@@ -201,20 +201,21 @@ class LlamaCppClient:
             if not content and reasoning_content:
                 log.warning(
                     "llama.cpp chat returned reasoning without final content; "
-                    "finish={finish}, max_tokens={max_tokens}, reasoning_chars={chars} "
-                    "— falling back to reasoning_content",
+                    "finish={finish}, max_tokens={max_tokens}, reasoning_chars={chars}",
                     finish=choice.get("finish_reason"),
                     max_tokens=payload["max_tokens"],
                     chars=len(reasoning_content),
                 )
-                content = reasoning_content
+                return None
             # Strip stray <think>...</think> blocks (--reasoning-format=none mode):
             # some models embed reasoning inline even when we asked for separation.
             if "<think>" in content and "</think>" in content:
                 import re as _re_strip
                 content = _re_strip.sub(
                     r"<think>.*?</think>\s*", "", content, flags=_re_strip.DOTALL
-                ).strip() or content  # keep original if stripping leaves empty
+                ).strip()
+                if not content:
+                    return None
             model_used = data.get("model", model or self.model)
             tokens = data.get("usage", {})
             log.debug(
