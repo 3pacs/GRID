@@ -672,8 +672,6 @@ class MarketBriefingEngine:
                     continue
         return deleted
 
-        log.debug("Briefing saved to {p}", p=filepath)
-
     # ------------------------------------------------------------------
     # Latest briefing retrieval
     # ------------------------------------------------------------------

@@ -687,7 +687,7 @@ def main():
         return
 
     BASE_DIR.mkdir(parents=True, exist_ok=True)
-    log = load_log()
+    state = load_log()
 
     jobs = JOBS
     if args.tier:
@@ -704,20 +704,20 @@ def main():
     log.info("Disk free: {:.1f}GB", free_gb)
 
     for job in jobs:
-        if log.get(job.name, {}).get("done"):
+        if state.get(job.name, {}).get("done"):
             log.info("\nSKIP {} — already done", job.name)
             continue
 
         ok = run_job(job)
-        log[job.name] = {
+        state[job.name] = {
             "done": ok,
             "timestamp": datetime.now().isoformat(),
             "dest": str(BASE_DIR / job.dest_dir),
         }
-        save_log(log)
+        save_log(state)
 
     log.info("\n{}", '='*60)
-    log.info("COMPLETE — {}/{} jobs succeeded", sum(1 for v in log.values() if v.get('done')), len(jobs))
+    log.info("COMPLETE — {}/{} jobs succeeded", sum(1 for v in state.values() if v.get('done')), len(jobs))
     log.info("Log: {}", LOG_FILE)
 
 

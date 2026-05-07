@@ -25,11 +25,14 @@ vs straddling boundaries.
 import json
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from loguru import logger as log
 from sqlalchemy import text
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 from db import get_engine
 from store.pit import PITStore

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from loguru import logger as log
 from sqlalchemy.engine import Engine

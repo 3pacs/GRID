@@ -155,7 +155,7 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
         log.warning("Post-mortem: trade {id} not found", id=trade_id)
         return None
 
-    (rec_id, ticker, signal_type, strike, expiry, entry_price,
+    (rec_id, ticker, direction, strike, expiry, entry_price,
      target_price, stop_loss, confidence, thesis,
      sanity_status, generated_at, outcome, actual_return,
      closed_at, dealer_context) = row
@@ -201,7 +201,7 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
 
     # What actually happened (factual summary)
     what_happened = _summarise_what_happened(
-        ticker, signal_type, entry_f, strike_f, outcome, actual_ret, price_path,
+        ticker, direction, entry_f, strike_f, outcome, actual_ret, price_path,
     )
 
     # LLM narrative (or rule-based fallback)

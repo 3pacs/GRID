@@ -41,8 +41,12 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from loguru import logger as log
+
+if TYPE_CHECKING:
+    from gemma.training.config import TrainingConfig
 
 
 def train(config: "TrainingConfig") -> Path:

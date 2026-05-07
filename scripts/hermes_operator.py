@@ -1811,8 +1811,9 @@ def main(args: list[str] | None = None) -> None:
 
     # Run DB model migrations once on startup (idempotent)
     try:
+        from db import get_engine as _get_engine_for_migrate
         from oracle.model_factory import migrate_default_models
-        migrate_default_models(engine)
+        migrate_default_models(_get_engine_for_migrate())
     except Exception as exc:
         log.debug("migrate_default_models: {e}", e=str(exc))
 

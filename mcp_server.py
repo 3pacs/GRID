@@ -42,6 +42,7 @@ from typing import Any
 
 from fastmcp import FastMCP
 from loguru import logger as log
+from sqlalchemy import text
 
 # Ensure GRID root is on the path so we can import db/config
 _GRID_DIR = os.path.dirname(os.path.abspath(__file__))

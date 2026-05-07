@@ -12,7 +12,12 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 from unittest.mock import patch
+
+if TYPE_CHECKING:
+    from ingestion.altdata.discord_scanner import DiscordScanner
+    from ingestion.altdata.telegram_scanner import TelegramScanner
 
 
 from ingestion.altdata.memecoin_classifier import (

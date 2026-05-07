@@ -25,11 +25,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
 from loguru import logger as log
+
+if TYPE_CHECKING:
+    from inference.timesfm_service import SignalForecast
 
 
 @dataclass(frozen=True)

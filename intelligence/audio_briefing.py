@@ -403,6 +403,7 @@ def _generate_script_text(data: dict[str, Any]) -> str:
     prompt = _build_briefing_prompt(data)
 
     # Try Gemini first (paid credits available)
+    gemini_exc: Exception | None = None
     try:
         client = _get_gemini_client()
         log.info("Generating briefing script via Gemini ({m})", m=GEMINI_SCRIPT_MODEL)
@@ -416,6 +417,7 @@ def _generate_script_text(data: dict[str, Any]) -> str:
         log.info("Briefing script generated via Gemini: {w} words", w=len(script.split()))
         return script
     except Exception as exc:
+        gemini_exc = exc
         log.warning("Gemini script gen failed, trying OpenAI: {e}", e=str(exc))
 
     # Fallback to OpenAI via the central router (REASON tier — script generation
@@ -445,7 +447,7 @@ def _generate_script_text(data: dict[str, Any]) -> str:
         log.info("Briefing script generated via OpenAI: {w} words", w=len(script.split()))
         return script
     except Exception as exc2:
-        raise RuntimeError(f"Both Gemini and OpenAI failed: Gemini={exc}, OpenAI={exc2}")
+        raise RuntimeError(f"Both Gemini and OpenAI failed: Gemini={gemini_exc}, OpenAI={exc2}")
 
 
 # -- Audio Generation via OpenAI TTS ----------------------------------------

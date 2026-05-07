@@ -13,7 +13,6 @@ import os
 import sys
 import time
 from datetime import date, datetime
-from typing import Any
 
 import requests
 from loguru import logger as log
@@ -21,7 +20,6 @@ from loguru import logger as log
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from db import get_engine
-from sqlalchemy import text
 from ingestion.base import BasePuller
 
 QQ_BASE = "https://api.quiverquant.com"
@@ -72,7 +70,6 @@ class QQBulkPuller(BasePuller):
                     amount = float(r.get("Amount", 0) or 0)
 
                     try:
-                        try:
                         self._insert_raw(conn,
                             series_id=f"qq:congress:{rep}:{ticker}",
                             obs_date=obs, value=amount,
@@ -110,10 +107,12 @@ class QQBulkPuller(BasePuller):
 
                     try:
                         self._insert_raw(conn,
-                        series_id=f"qq:insider:{ticker}:{name}",
-                        obs_date=obs, value=value,
-                        raw_payload=r)
-                    stored += 1
+                            series_id=f"qq:insider:{ticker}:{name}",
+                            obs_date=obs, value=value,
+                            raw_payload=r)
+                        stored += 1
+                    except Exception:
+                        pass  # skip dupes
 
                     try:
                         from intelligence.actor_ingest import ingest_actor
@@ -141,10 +140,12 @@ class QQBulkPuller(BasePuller):
 
                     try:
                         self._insert_raw(conn,
-                        series_id=f"qq:lobbying:{client}",
-                        obs_date=obs, value=amount,
-                        raw_payload=r)
-                    stored += 1
+                            series_id=f"qq:lobbying:{client}",
+                            obs_date=obs, value=amount,
+                            raw_payload=r)
+                        stored += 1
+                    except Exception:
+                        pass  # skip dupes
 
                     try:
                         from intelligence.actor_ingest import ingest_actor
@@ -170,10 +171,12 @@ class QQBulkPuller(BasePuller):
                     obs = datetime.strptime(flight_date[:10], "%Y-%m-%d").date()
                     try:
                         self._insert_raw(conn,
-                        series_id=f"qq:flight:{ticker}",
-                        obs_date=obs, value=1.0,
-                        raw_payload=r)
-                    stored += 1
+                            series_id=f"qq:flight:{ticker}",
+                            obs_date=obs, value=1.0,
+                            raw_payload=r)
+                        stored += 1
+                    except Exception:
+                        pass  # skip dupes
                 except (ValueError, TypeError):
                     pass
         return stored
@@ -192,14 +195,15 @@ class QQBulkPuller(BasePuller):
 
                     try:
                         self._insert_raw(conn,
-                        series_id=f"qq:wsb:{ticker}:mentions",
-                        obs_date=today, value=count)
-                    try:
+                            series_id=f"qq:wsb:{ticker}:mentions",
+                            obs_date=today, value=count)
                         self._insert_raw(conn,
-                        series_id=f"qq:wsb:{ticker}:sentiment",
-                        obs_date=today, value=sentiment,
-                        raw_payload=r)
-                    stored += 2
+                            series_id=f"qq:wsb:{ticker}:sentiment",
+                            obs_date=today, value=sentiment,
+                            raw_payload=r)
+                        stored += 2
+                    except Exception:
+                        pass  # skip dupes
                 except (ValueError, TypeError):
                     pass
         return stored
