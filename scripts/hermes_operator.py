@@ -109,7 +109,11 @@ def _run_with_timeout(name: str, fn, timeout_s: int, state):
         try:
             return fut.result(timeout=timeout_s), True
         except concurrent.futures.TimeoutError:
-            log.error(
+            # Logged at WARNING (not ERROR) — the timeout is a correctly
+            # handled operational event: the step is blacklisted for
+            # TIMEOUT_BLACKLIST_HOURS and the cycle moves on.  Reserving
+            # ERROR for unhandled failures keeps errors.jsonl signal-rich.
+            log.warning(
                 "Step '{n}' timed out after {s}s — blacklisting for {h}h",
                 n=name, s=timeout_s, h=TIMEOUT_BLACKLIST_HOURS,
             )
@@ -1889,7 +1893,10 @@ def main(args: list[str] | None = None) -> None:
         t.join(timeout=timeout)
         if t.is_alive():
             stuck_on = state.current_step
-            log.error(
+            # WARNING — the cycle timeout is a handled degrade: the stuck
+            # step gets blacklisted and the next cycle starts fresh. Real
+            # failures inside cycle steps log ERROR at the call site.
+            log.warning(
                 "Cycle {n} TIMED OUT after {s}s (stuck on: {step}) "
                 "— blacklisting and starting fresh",
                 n=state.cycle_count, s=timeout,
