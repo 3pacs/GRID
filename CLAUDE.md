@@ -68,7 +68,7 @@ cd grid/pwa && npm install && npm run dev          # Dev server on :5173
 cd grid/pwa && npm run build                       # Production build
 
 # Tests
-cd grid && python -m pytest tests/ -v              # Full suite: 1,148 tests across 76 files
+cd grid && python -m pytest tests/ -v              # Full suite: 5,702 tests across 301 files
 cd grid && python -m pytest tests/test_pit.py -v   # PIT store tests
 cd grid && python -m pytest tests/test_api.py -v   # API tests
 ```
@@ -262,7 +262,7 @@ New ingestion modules (all 48 pullers registered in `hermes_operator.py` schedul
 
 ```
 grid/
-├── api/           # FastAPI routes, auth, middleware (14 routers)
+├── api/           # FastAPI routes, auth, middleware (93 routers)
 ├── alerts/        # Email alerting system (failure, regime, 100x, digest)
 ├── ingestion/     # 50+ data source pullers (FRED, BLS, ECB, altdata, etc.)
 ├── normalization/ # Multi-source conflict resolution
@@ -283,7 +283,7 @@ grid/
 ├── server_log/    # Git-backed error logging + operator inbox
 ├── pwa/           # React 18 PWA frontend (Zustand, Vite)
 ├── docs/          # Architecture, API, deployment, development guides
-├── tests/         # pytest suite (1,148 tests across 76 files)
+├── tests/         # pytest suite (5,702 tests across 301 files)
 └── scripts/       # Migration and utility scripts
 ```
 

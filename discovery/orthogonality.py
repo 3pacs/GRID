@@ -114,7 +114,11 @@ class OrthogonalityAudit:
         if as_of_date is None:
             as_of_date = date.today()
         if start_date is None:
-            start_date = date(1947, 1, 1)
+            # Was hard-coded to 1947-01-01 which trips the
+            # GRID_PIT_MAX_YEARS=10 cap warning every run. 5 years is
+            # sufficient for orthogonality / correlation stability work;
+            # callers needing more pass start_date explicitly.
+            start_date = date(as_of_date.year - 5, as_of_date.month, as_of_date.day)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_path = Path(output_dir)
