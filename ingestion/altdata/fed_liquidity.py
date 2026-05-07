@@ -144,11 +144,19 @@ class FedLiquidityPuller(BasePuller):
             raise ImportError("fedfred library required for FedLiquidityPuller")
 
         fred = FredAPI(self._api_key)
-        df = fred.get_series_observations(
-            series_id,
-            observation_start=str(start_date),
-            observation_end=str(end_date),
-        )
+        try:
+            df = fred.get_series_observations(
+                series_id,
+                observation_start=str(start_date),
+                observation_end=str(end_date),
+            )
+        except KeyError as exc:
+            # fedfred.helpers.to_pd_df crashes with KeyError('date') when
+            # the observations list is empty (monthly/quarterly series
+            # polled on a day with no new data). Treat as "no new data".
+            if str(exc) == "'date'":
+                return pd.DataFrame(columns=["date", "value"])
+            raise
 
         if df is None or (hasattr(df, "empty") and df.empty):
             return pd.DataFrame(columns=["date", "value"])

@@ -345,9 +345,20 @@ class FREDPuller(BasePuller):
             if end_date:
                 obs_kwargs["observation_end"] = str(end_date)
 
-            data: pd.DataFrame = self.fred.get_series_observations(
-                series_id, **obs_kwargs
-            )
+            try:
+                data: pd.DataFrame = self.fred.get_series_observations(
+                    series_id, **obs_kwargs
+                )
+            except KeyError as exc:
+                # fedfred.helpers.to_pd_df crashes with KeyError('date')
+                # when observations is empty (incremental pulls of
+                # monthly/quarterly series on off-cycle days).
+                if str(exc) == "'date'":
+                    log.info("FRED {sid}: no observations in window", sid=series_id)
+                    result["status"] = "PARTIAL"
+                    result["errors"].append("No data returned")
+                    return result
+                raise
 
             if data is None or data.empty:
                 log.warning("FRED returned no data for {sid}", sid=series_id)
