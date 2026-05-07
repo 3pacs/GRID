@@ -27,3 +27,4 @@ pwa_dist/
 .superpowers/
 data/icij/
 models/.cache/
+.server-logs/alert_state.json
