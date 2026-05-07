@@ -1332,12 +1332,12 @@ def _get_fiscal_multiplier_state(engine: Engine) -> dict[str, Any]:
         with engine.connect() as conn:
             debt_now = conn.execute(text("""
                 SELECT value FROM raw_series
-                WHERE series_id = 'WDTOTAL' AND pull_status = 'SUCCESS'
+                WHERE series_id = 'GFDEBTN' AND pull_status = 'SUCCESS'
                 ORDER BY obs_date DESC LIMIT 1
             """)).fetchone()
             debt_prior = conn.execute(text("""
                 SELECT value FROM raw_series
-                WHERE series_id = 'WDTOTAL' AND pull_status = 'SUCCESS'
+                WHERE series_id = 'GFDEBTN' AND pull_status = 'SUCCESS'
                 AND obs_date <= CURRENT_DATE - 90
                 ORDER BY obs_date DESC LIMIT 1
             """)).fetchone()

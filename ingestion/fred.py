@@ -40,7 +40,10 @@ FRED_SERIES_LIST: list[str] = [
     "WALCL",
     "BAMLH0A0HYM2",
     "BAMLC0A0CM",
-    "TEDRATE",
+    # TEDRATE removed 2026-05-07 — discontinued by FRED 2022-01-21
+    # (LIBOR retirement). Replacement is the SOFR-T-Bill spread; not
+    # a single FRED series. Build it derived from SOFR (already pulled)
+    # minus DTB3 if we ever need it.
     "T5YIE",
     "UMCSENT",
     "ICSA",
@@ -78,11 +81,19 @@ FRED_SERIES_LIST: list[str] = [
     "TOTBKCR",          # Total bank credit, all commercial banks (weekly)
     "BUSLOANS",         # Commercial and Industrial loans
     "DRTSCIS",          # Sr Loan Officer Survey: tightening standards on C&I
-    "WDTOTAL",          # Total public debt outstanding (proxy for Treasury issuance)
+    # WDTOTAL was the legacy ID for Federal Debt: Total Public Debt
+    # but FRED renamed it to GFDEBTN sometime before 2026-05; the old
+    # ID returns "series does not exist" 1000+ times before this
+    # cleanup. Same data, just current ID.
+    "GFDEBTN",          # Federal Debt: Total Public Debt (was WDTOTAL)
     "CCLACBW027SBOG",   # Consumer loans, all commercial banks (weekly)
     "RHEACBW027SBOG",   # Real estate loans, all commercial banks (weekly)
     # ── Capital flow pipeline: sovereign/cross-border layer ──
-    "BOGZ1FL263061103Q",  # Foreign official holdings of US Treasuries (quarterly)
+    # BOGZ1FL263061103Q removed 2026-05-07 — FRED returns "does not
+    # exist". The ID looked like a Z.1 Financial Accounts series but
+    # the variant we used isn't published. layer_sovereign.py reads
+    # the constant; needs a working successor before that consumer
+    # produces meaningful output.
     # ── Capital flow pipeline: additional FX ──
     "DEXCHUS",          # Chinese Yuan per USD
     # ── CDS proxy / credit spread granularity ──
@@ -130,7 +141,9 @@ FRED_SERIES_LIST: list[str] = [
     "MSACSR",              # Monthly Supply of New Houses
     # ── EM bonds ──
     "BAMLEMHBHYCRPIOAS",   # EM High Yield OAS
-    "BAMLEMCLLOTRUSD",     # EM Corporate Total Return
+    # BAMLEMCLLOTRUSD renamed to BAMLEMCLLCRPIUSTRIV pre-2026-05.
+    # ICE BofA US EM Liquid Corporate Plus Index Total Return.
+    "BAMLEMCLLCRPIUSTRIV",  # EM Corporate Total Return (was BAMLEMCLLOTRUSD)
     # ── Activity ──
     "CFNAI",               # Chicago Fed National Activity Index
     # ── Margin debt / leverage ──

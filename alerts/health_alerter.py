@@ -46,9 +46,11 @@ DEFAULT_COOLDOWN_HOURS = 6
 """How long after firing an alert before the same condition can fire again.
 Prevents inbox flooding when a condition stays bad for hours."""
 
-FAILED_PULLS_24H_THRESHOLD = 50
-"""Failed-pull count over the last 24h that triggers an alert. Below
-this is treated as routine flakiness — many feeds have transient errors."""
+FAILED_PULLS_1H_THRESHOLD = 20
+"""Failed-pull count over the last hour. Sliding-window so a brief
+outage auto-resolves instead of paging for 24 hours after it ends.
+20 in 1 hour is a real ongoing problem; lower would be noise from
+transient timeouts."""
 
 STALE_SOURCES_THRESHOLD = 20
 """Number of sources past their freshness window before alerting. Below
@@ -117,17 +119,27 @@ def _db_unhealthy_render(h: dict) -> tuple[str, str]:
 
 
 def _failed_pulls(h: dict) -> bool:
-    n = h.get("db", {}).get("failed_pulls_24h", 0)
-    return bool(n and n > FAILED_PULLS_24H_THRESHOLD)
+    # Use the 1-hour sliding window so brief outages auto-resolve.
+    # Falls back to 24h if 1h isn't populated (older Hermes builds).
+    db = h.get("db", {})
+    n = db.get("failed_pulls_1h")
+    if n is None:
+        n = db.get("failed_pulls_24h", 0)
+        # Without 1h data, fall back to a higher threshold so we don't
+        # flood-alert on the same data we used to use cumulatively.
+        return bool(n and n > 200)
+    return bool(n and n > FAILED_PULLS_1H_THRESHOLD)
 
 
 def _failed_pulls_render(h: dict) -> tuple[str, str]:
-    n = h.get("db", {}).get("failed_pulls_24h", 0)
+    db = h.get("db", {})
+    n_1h = db.get("failed_pulls_1h", 0)
+    n_24h = db.get("failed_pulls_24h", 0)
     return (
-        f"GRID: {n} failed pulls in last 24h",
-        f"{n} pulls failed in the last 24 hours (threshold "
-        f"{FAILED_PULLS_24H_THRESHOLD}). Check raw_series.pull_status "
-        f"FAILED rows + scheduler logs.",
+        f"GRID: {n_1h} failed pulls in last hour ({n_24h} in 24h)",
+        f"{n_1h} pulls failed in the last hour (threshold "
+        f"{FAILED_PULLS_1H_THRESHOLD}); 24h cumulative is {n_24h}. "
+        f"Check raw_series.pull_status FAILED rows + scheduler logs.",
     )
 
 

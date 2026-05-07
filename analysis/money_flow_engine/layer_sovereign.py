@@ -35,6 +35,10 @@ _FOREIGN_TREASURY_EST = 7_600_000_000_000  # ~$7.6T
 
 # FRED series IDs
 _TRADE_BALANCE_SERIES = "BOPGTB"
+# BOGZ1FL263061103Q is no longer published by FRED — this constant is
+# kept for compatibility but reads will return no rows. A working
+# successor for foreign official US Treasury holdings hasn't been
+# identified yet; consider TIC data (treas.gov) as alternative.
 _TREASURY_HOLDINGS_SERIES = "BOGZ1FL263061103Q"
 _INDIA_FX_SERIES = "india_fx_reserves"
 

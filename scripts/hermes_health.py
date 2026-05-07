@@ -409,7 +409,10 @@ def check_db_health(engine: Any) -> dict[str, Any]:
             ).fetchone()
             result["latest_pull"] = row[0].isoformat() if row and row[0] else None
 
-            # Failed pulls in last 24h
+            # Failed pulls — both windows. The 24h count is for
+            # historical reporting / dashboards; the 1h count drives
+            # the alerter so a brief outage that's already over
+            # auto-resolves instead of paging for 23 more hours.
             row = conn.execute(
                 text(
                     "SELECT COUNT(*) FROM raw_series "
@@ -418,6 +421,14 @@ def check_db_health(engine: Any) -> dict[str, Any]:
                 )
             ).fetchone()
             result["failed_pulls_24h"] = row[0] if row else 0
+            row = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM raw_series "
+                    "WHERE pull_status = 'FAILED' "
+                    "AND pull_timestamp > NOW() - INTERVAL '1 hour'"
+                )
+            ).fetchone()
+            result["failed_pulls_1h"] = row[0] if row else 0
 
             # Source freshness — scan ALL active sources, not just 20
             rows = conn.execute(
