@@ -1,13 +1,21 @@
 from __future__ import annotations
 
-import threading
+import pytest
 
 from oracle.engine import OracleEngine
 from oracle.model_factory import ModelFactory
+from schema_guard import reset_for_tests
 
 
 class _FakeEngine:
     pass
+
+
+@pytest.fixture(autouse=True)
+def _reset_schema_guard():
+    reset_for_tests()
+    yield
+    reset_for_tests()
 
 
 def test_model_factory_schema_ensure_runs_once_per_process(monkeypatch):
@@ -16,8 +24,6 @@ def test_model_factory_schema_ensure_runs_once_per_process(monkeypatch):
     def fake_ensure(self):
         calls.append(self.engine)
 
-    monkeypatch.setattr(ModelFactory, "_columns_ensured", False)
-    monkeypatch.setattr(ModelFactory, "_ensure_lock", threading.Lock())
     monkeypatch.setattr(ModelFactory, "_ensure_columns", fake_ensure)
 
     first = _FakeEngine()
@@ -27,7 +33,6 @@ def test_model_factory_schema_ensure_runs_once_per_process(monkeypatch):
     ModelFactory(second)
 
     assert calls == [first]
-    assert ModelFactory._columns_ensured is True
 
 
 def test_model_factory_schema_ensure_retries_after_failure(monkeypatch):
@@ -38,17 +43,14 @@ def test_model_factory_schema_ensure_retries_after_failure(monkeypatch):
         calls += 1
         raise RuntimeError("ddl lock timeout")
 
-    monkeypatch.setattr(ModelFactory, "_columns_ensured", False)
-    monkeypatch.setattr(ModelFactory, "_ensure_lock", threading.Lock())
     monkeypatch.setattr(ModelFactory, "_ensure_columns", fake_ensure)
 
-    try:
+    with pytest.raises(RuntimeError):
         ModelFactory(_FakeEngine())
-    except RuntimeError:
-        pass
+    with pytest.raises(RuntimeError):
+        ModelFactory(_FakeEngine())
 
-    assert calls == 1
-    assert ModelFactory._columns_ensured is False
+    assert calls == 2
 
 
 def test_oracle_engine_schema_ensure_runs_once_per_process(monkeypatch):
@@ -57,8 +59,6 @@ def test_oracle_engine_schema_ensure_runs_once_per_process(monkeypatch):
     def fake_ensure(self):
         calls.append(self.engine)
 
-    monkeypatch.setattr(OracleEngine, "_tables_ensured", False)
-    monkeypatch.setattr(OracleEngine, "_ensure_lock", threading.Lock())
     monkeypatch.setattr(OracleEngine, "_ensure_tables", fake_ensure)
     monkeypatch.setattr(OracleEngine, "_load_models", lambda self: [])
 
@@ -69,7 +69,6 @@ def test_oracle_engine_schema_ensure_runs_once_per_process(monkeypatch):
     OracleEngine(second)
 
     assert calls == [first]
-    assert OracleEngine._tables_ensured is True
 
 
 def test_oracle_engine_schema_ensure_retries_after_failure(monkeypatch):
@@ -80,15 +79,12 @@ def test_oracle_engine_schema_ensure_retries_after_failure(monkeypatch):
         calls += 1
         raise RuntimeError("ddl lock timeout")
 
-    monkeypatch.setattr(OracleEngine, "_tables_ensured", False)
-    monkeypatch.setattr(OracleEngine, "_ensure_lock", threading.Lock())
     monkeypatch.setattr(OracleEngine, "_ensure_tables", fake_ensure)
     monkeypatch.setattr(OracleEngine, "_load_models", lambda self: [])
 
-    try:
+    with pytest.raises(RuntimeError):
         OracleEngine(_FakeEngine())
-    except RuntimeError:
-        pass
+    with pytest.raises(RuntimeError):
+        OracleEngine(_FakeEngine())
 
-    assert calls == 1
-    assert OracleEngine._tables_ensured is False
+    assert calls == 2
