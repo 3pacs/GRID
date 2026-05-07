@@ -10,6 +10,7 @@ Uses unittest.mock to avoid real API calls and database writes.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -69,9 +70,15 @@ def _mock_causal_row(
     )
 
 
-def _run(coro):
-    """Run an async coroutine synchronously."""
-    return asyncio.new_event_loop().run_until_complete(coro)
+def _run(value):
+    """Resolve route results whether the handler is sync or async."""
+    if not inspect.isawaitable(value):
+        return value
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(value)
+    finally:
+        loop.close()
 
 
 # ══════════════════════════════════════════════════════════════════════════
