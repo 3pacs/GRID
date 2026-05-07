@@ -236,18 +236,14 @@ Full pipeline test: ingestion → [[Conflict Resolution|conflict resolution]] �
 ### 51. `on_event` Deprecation Warning (FIXED)
 - `api/main.py` now uses `@asynccontextmanager async def lifespan(app)` and `FastAPI(lifespan=lifespan)`. No more `on_event` calls.
 
-### 52. J-Quants Password Handling
-- **`ingestion/international/jquants.py:82`** — Sends plaintext password in POST body to J-Quants API.
-- The password comes from config (not hardcoded), but should be handled as a secret in logs.
+### 52. J-Quants Password Handling (FIXED)
+- `ingestion/international/jquants.py:50-67` sends password in JSON body (not URL params), and the auth method explicitly logs only "Authenticating with J-Quants API" without the credential. Comment at line 51 confirms the no-log invariant.
 
-### 53. Bare `except: pass` in Scripts
-- **`scripts/load_wave2.py:117,123`** — Silent error swallowing during data migration
-- **`scripts/load_wave3.py:68`** — Same
-- **`scripts/bridge_crucix.py:72`** — Same
-- **Risk**: Low (one-time migration scripts), but bad practice.
+### 53. Bare `except: pass` in Scripts (FIXED)
+- All three sites use `except (ValueError, TypeError) as exc:` with `log.debug` for the skipped row context. No silent swallowing.
 
-### 54. `compute_coordinator.py` f-string SQL
-- **`scripts/compute_coordinator.py:221`** — `f"UPDATE compute_jobs SET state=%s, {ts_col}=NOW()"` — uses f-string for column name but `%s` for values. Column name comes from internal logic, not user input. Safe but should be refactored.
+### 54. `compute_coordinator.py` f-string SQL (FIXED)
+- Now uses a static `_TS_QUERIES` dict keyed by validated column name, no f-string interpolation. Raises `ValueError` on unknown column.
 
 ### 55. No CSRF Protection
 - **`api/main.py`** — No CSRF token validation. Currently acceptable for JWT-based API (CSRF is browser-specific and JWT via Authorization header is immune), but if cookie-based auth is ever added, this becomes critical.
@@ -255,8 +251,8 @@ Full pipeline test: ingestion → [[Conflict Resolution|conflict resolution]] �
 ### 56. Missing `Permissions-Policy` Header (FIXED)
 - `api/main.py` SecurityHeadersMiddleware sets `Permissions-Policy: accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=(), interest-cohort=()` (commit 0511d3bd).
 
-### 57. Pydantic V2 Deprecation Warning
-- **`config.py:24`** — Uses class-based `Config` which is deprecated in Pydantic V2. Should migrate to `model_config = ConfigDict(...)`.
+### 57. Pydantic V2 Deprecation Warning (FIXED)
+- `config.py:484` uses `model_config = ConfigDict(...)`. Class-based `Config` is gone.
 
 ### 58. WebSocket Client Memory Leak (FIXED)
 - **`api/main.py`** — `_ws_clients` changed from `set[WebSocket]` to `dict[WebSocket, float]` tracking last-activity timestamp. The broadcast loop evicts clients idle for >5 minutes (configurable via `_WS_IDLE_TIMEOUT`). Activity updated on every received message.
@@ -272,17 +268,14 @@ Full pipeline test: ingestion → [[Conflict Resolution|conflict resolution]] �
   - `errors.jsonl` truncated to last 5000 lines when the file exceeds 1 MB (atomic rewrite via tmp + `Path.replace`).
   - `outputs/market_briefings/` rotated to 90-day retention via `MarketBriefingEngine.cleanup_old_briefings`.
 
-### 62. Monthly Scheduler Fragility
-- **`ingestion/scheduler.py:219-223`** — Monthly pulls check `date.today().day == 5`. If server is down on the 5th, the pull is missed entirely. If restarted multiple times on the 5th, duplicate pulls can fire.
-- **Fix**: Track `last_run` timestamp per schedule type; only run if not already run in current period.
+### 62. Monthly Scheduler Fragility (FIXED)
+- `ingestion/scheduler.py` now uses explicit `group_name` dispatch (`run_pull_group("monthly", ...)`) wrapped in `_with_db_retry`. The brittle `date.today().day == 5` check is gone.
 
-### 63. DB Failures During Pulls Not Retried
-- **`ingestion/scheduler.py:186-291`** — If database goes down during a scheduled pull window, the entire batch fails silently (logged but not retried). Next attempt is the following day/week/month.
-- **Fix**: Add retry logic (with backoff) for DB connection failures during pulls.
+### 63. DB Failures During Pulls Not Retried (FIXED)
+- `_with_db_retry` (scheduler.py:50) wraps every pull-group invocation with exponential-backoff retry on DB errors. Confirmed at lines 1314, 1368, 1376.
 
-### 64. No CORS Origin Validation in Production
-- **`api/main.py:76-88`** — `GRID_ALLOWED_ORIGINS` defaults to localhost addresses if not set. A production [[deployment]] that forgets this env var will only accept requests from localhost (safe but confusing).
-- **Fix**: Require `GRID_ALLOWED_ORIGINS` when `ENVIRONMENT=production`.
+### 64. No CORS Origin Validation in Production (PARTIAL)
+- Production fall-back is now a hardcoded known origin (`https://grid.stepdad.finance`), not localhost. Added a `log.warning` when the env var isn't set in production so the operator notices. Erroring out hard isn't worth it given the safe default.
 
 ---
 

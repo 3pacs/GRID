@@ -308,7 +308,16 @@ if not allowed_origins:
             "http://127.0.0.1:5173",
         ]
     else:
-        # Production default — explicit allowlist required for credentials.
+        # Production default — falls back to known origin, but log a
+        # warning so the operator knows GRID_ALLOWED_ORIGINS wasn't set.
+        # Misdeploying to a new domain without the env var would silently
+        # accept the old origin only, which is safer than allowing all
+        # but worth flagging.
+        log.warning(
+            "GRID_ALLOWED_ORIGINS not set in production — falling back "
+            "to hardcoded default. Set the env var explicitly to avoid "
+            "this warning and to support multi-origin deployments."
+        )
         allowed_origins = ["https://grid.stepdad.finance"]
 
 app.add_middleware(
