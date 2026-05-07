@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from fastapi import APIRouter, Depends
@@ -76,7 +77,7 @@ async def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
                     name = id_to_name.get(col)
                     if name:
                         z = (last[col] - means[col]) / stds[col]
-                        if z == z:  # not NaN
+                        if not math.isnan(z):
                             z_map[name] = round(float(z), 3)
                             val_map[name] = float(last[col])
     except Exception as exc:
@@ -276,7 +277,7 @@ async def get_sector_detail(
                         name = id_to_name.get(col)
                         if name:
                             z = (last[col] - means[col]) / stds[col]
-                            if z == z:  # not NaN
+                            if not math.isnan(z):
                                 z_map[name] = round(float(z), 3)
             for r in records:
                 val_map[r["name"]] = r.get("value")
