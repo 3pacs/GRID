@@ -1,0 +1,23 @@
+[Unit]
+Description=GRID Agent Reporting Hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=grid
+WorkingDirectory=/data/grid_v4/grid_repo
+EnvironmentFile=/data/grid_v4/grid_repo/.env
+EnvironmentFile=-/etc/agent-hub/minio.env
+Environment=PYTHONPATH=/data/grid_v4/grid_repo
+Environment=AGENT_HUB_TOKEN_FILE=/etc/agent-hub/token
+Environment=AGENT_HUB_BUCKET=agent-reports
+Environment=MINIO_ENDPOINT=100.75.185.36:9000
+ExecStart=/data/grid_v4/venv/bin/python -m uvicorn agent_hub.app:create_app --factory --host 100.68.9.27 --port 7321
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
