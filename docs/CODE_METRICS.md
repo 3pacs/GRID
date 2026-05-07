@@ -148,7 +148,7 @@ By directory:
   inference + store + orchestration + physics + alpha_research + ollama +
   features + alerts + discovery + valuation + backtest + agents +
   normalization + governance + validation + hyperspace + timeseries +
-  outputs + events + journal + knowledge + llm + contracts + migrations +
+  outputs + events + journal + knowledge + llm + contracts + [[migrations]] +
   a2a + llamacpp + gemma + strategy + workflows) lines up with the expected
   ~298K figure.
 - **Executable LOC for `intelligence/`**: 47,405 across 123 files. The

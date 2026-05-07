@@ -43,7 +43,7 @@ Full breakdown in commit messages, but the headline items:
 
 2. **`prevent_journal_delete` trigger** — was unconditionally blocking all DELETEs, so tests could never clean up. Replaced with a trigger that permits DELETE only when BOTH `app.journal_testing = 'on'` (session GUC, `SET LOCAL` only) AND `annotation = 'TEST_JOURNAL'`. Production immutability verified rigorously.
 
-3. **`canvas_nodes` column rename** — 163 references across 6 canvas router files wrote `INSERT INTO canvas_nodes (node_id, ...)` but the live schema had the column as `id`. Every canvas write path was silently broken at runtime. Added idempotent `ALTER TABLE canvas_nodes RENAME COLUMN id TO node_id` migration + updated the one outlier router file + Alembic migration for fresh installs.
+3. **`canvas_nodes` column rename** — 163 references across 6 canvas router files wrote `INSERT INTO canvas_nodes (node_id, ...)` but the live schema had the column as `id`. Every canvas write path was silently broken at runtime. Added idempotent `ALTER TABLE canvas_nodes RENAME COLUMN id TO node_id` migration + updated the one outlier router file + [[Alembic]] migration for fresh installs.
 
 4. **`sys.modules['api.auth']` pollution** — five test files installed a stub via `setdefault`, breaking import for every subsequent test that needed `create_token`. Fixed all five to prefer the real import.
 
@@ -192,7 +192,7 @@ Phase 1 delivered the infrastructure. Phase 2 wires the 13 real contracts into `
 - `data_health.on_pull_lifecycle`
 - `sse.on_regime_transition`, `sse.on_signal_fired`, `sse.on_pull_lifecycle`, `sse.on_investigation_progress`
 
-**~50 producer emit sites** — one-line `with pull_lifecycle(engine, "<name>") as rows:` per puller, plus single emit calls at each producer module (postmortem, oracle engine, gates, options tracker, cross_reference, leverage_network, clustering, hypothesis_engine, actor_discovery, forensics, canvas_investigate).
+**~50 producer emit sites** — one-line `with pull_lifecycle(engine, "<name>") as rows:` per puller, plus single emit calls at each producer module ([[Postmortem|postmortem]], [[Oracle Engine|oracle engine]], gates, [[Options Tracker|options tracker]], cross_reference, leverage_network, clustering, hypothesis_engine, actor_discovery, [[Forensics|forensics]], canvas_investigate).
 
 **Expected outcome after Phase 2:** feedback loops close — postmortem failures decay signal trust, oracle weights evolve with scored predictions, backtest verdicts land in the journal, regime transitions re-weight sources, options trade outcomes tune the 7-signal scanner weights.
 

@@ -393,6 +393,22 @@ def add_wikilinks(content: str, file_path: Path, all_entities: dict[str, str]) -
             fence_open = not fence_open
         in_code_block[i] = fence_open
 
+    # Pre-compute YAML frontmatter membership. The frontmatter is the
+    # block bracketed by `---` markers at the very top of the file. The
+    # backlinker used to wrap path values inside `source:` and other
+    # frontmatter keys, breaking them as filesystem references — e.g.
+    # `source: /path/Architecture/x.md` became
+    # `source: /path/[[architecture|Architecture]]/x.md`. Frontmatter is
+    # structured data, not prose, so skip it wholesale.
+    in_frontmatter = [False] * len(lines)
+    if lines and lines[0].strip() == "---":
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                # Mark the opening, body, and closing all as frontmatter
+                for j in range(0, i + 1):
+                    in_frontmatter[j] = True
+                break
+
     # Prefilter: only check entities that actually appear in this file
     content_lower = content.lower()
     active_patterns = [
@@ -407,6 +423,10 @@ def add_wikilinks(content: str, file_path: Path, all_entities: dict[str, str]) -
 
     for line_idx, line in enumerate(lines):
         if in_code_block[line_idx]:
+            new_lines.append(line)
+            continue
+
+        if in_frontmatter[line_idx]:
             new_lines.append(line)
             continue
 

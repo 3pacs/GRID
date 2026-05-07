@@ -443,17 +443,17 @@ journal/ (immutable log)           │
 
 ## Key Patterns
 
-- **BasePuller**: All ingestion extends `ingestion/base.py` with `SOURCE_NAME`, `insert_raw_series()`
-- **PIT-correct**: All queries via `store/pit.py` with `DISTINCT ON`, `assert_no_lookahead()`
+- **[[Base Puller|BasePuller]]**: All ingestion extends `ingestion/base.py` with `SOURCE_NAME`, `insert_raw_series()`
+- **[[PIT Store|PIT-correct]]**: All queries via `store/pit.py` with `DISTINCT ON`, `assert_no_lookahead()`
 - **3-tier LLM**: `get_llm(tier=Tier.LOCAL|REASON|ORACLE)` with fallback chains
-- **Actor network**: Named actors with edges (wealth flows, influence, control)
-- **Immutable journal**: `journal/log.py` — decisions logged, never modified
+- **[[Actor Network|Actor network]]**: Named actors with edges (wealth flows, influence, control)
+- **[[Decision Journal|Immutable journal]]**: `journal/log.py` — decisions logged, never modified
 - **Adapter pattern**: `intelligence/adapters/` bridges intelligence modules to API layer
-- **Model governance**: `CANDIDATE → SHADOW → STAGING → PRODUCTION → RETIRED`
+- **[[Model Governance|Model governance]]**: `CANDIDATE → SHADOW → STAGING → PRODUCTION → RETIRED`
 
 ## Related Notes
 
-- [[Overview]] — System architecture layers
+- [[Overview]] — System [[architecture]] layers
 - [[Module-Sizes]] — Module line counts and complexity
 - [[Config-Map]] — All config variables mapped
 - [[Data-Pipeline]] — Detailed data flow

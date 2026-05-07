@@ -13,9 +13,9 @@ promoted_via: OBSIDIAN-2 (task #76)
 1. Sector ETF price action + relative strength (yfinance)
 2. Sector volume profiles and momentum
 3. Cross-border flows (BIS)
-4. FRED monetary aggregates (M2, reserves, bank credit)
+4. [[FRED]] monetary aggregates (M2, reserves, bank credit)
 5. SEC filing velocity by sector
-6. Dark pool activity (FINRA ATS)
+6. [[Dark Pool|Dark pool]] activity (FINRA ATS)
 7. Credit spreads and bond flows
 8. Options positioning (put/call by sector ETFs)
 

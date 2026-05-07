@@ -259,7 +259,7 @@ Full pipeline test: ingestion → [[Conflict Resolution|conflict resolution]] �
 - **`api/main.py`** — No CSRF token validation. Currently acceptable for JWT-based API (CSRF is browser-specific and JWT via Authorization header is immune), but if cookie-based auth is ever added, this becomes critical.
 
 ### 56. Missing `Permissions-Policy` Header
-- **`api/main.py:50-71`** — Security headers middleware is missing `Permissions-Policy` (controls browser features like camera, geolocation, etc.).
+- **`api/main.py:50-71`** — [[Security]] headers middleware is missing `Permissions-Policy` (controls browser features like camera, geolocation, etc.).
 
 ### 57. Pydantic V2 Deprecation Warning
 - **`config.py:24`** — Uses class-based `Config` which is deprecated in Pydantic V2. Should migrate to `model_config = ConfigDict(...)`.

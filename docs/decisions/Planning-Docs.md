@@ -10,7 +10,7 @@ created: 2026-04-04
 
 # Planning & Documentation Index
 
-All planning documents, architecture docs, and audit reports.
+All planning documents, [[architecture]] docs, and audit reports.
 
 Related: [[Config-Map]], [[Frontend-Views]], [[Database-Schema]], [[Module-Sizes]]
 
@@ -22,15 +22,15 @@ The root `CLAUDE.md` is the authoritative guide for Claude Code sessions. Key ru
 
 1. **PIT Correctness is non-negotiable** — every data query MUST use `store/pit.py`
 2. **Never use f-strings for SQL** — parameterized queries only
-3. **Immutable Journal** — `journal/log.py` entries never updated/deleted
+3. **[[Decision Journal|Immutable Journal]]** — `journal/log.py` entries never updated/deleted
 4. **Multi-source conflicts** go through `normalization/resolver.py`
-5. **Model Governance**: CANDIDATE -> SHADOW -> STAGING -> PRODUCTION
-6. **Prediction Causation Standard**: Levers (causes) vs Conditions (amplifiers)
+5. **[[Model Governance]]**: CANDIDATE -> SHADOW -> STAGING -> PRODUCTION
+6. **Prediction [[Causation]] Standard**: Levers (causes) vs Conditions (amplifiers)
 
 ### Gotchas
-- `DISTINCT ON` in `store/pit.py` is PostgreSQL-specific
+- `DISTINCT ON` in `store/pit.py` is [[PostgreSQL]]-specific
 - `assert_no_lookahead()` raises ValueError but does NOT rollback
-- `_resolve_source_id()` auto-creates source_catalog entries silently
+- `_resolve_source_id()` auto-creates [[Source Catalog Table|source_catalog]] entries silently
 - `pd.to_numeric(errors="coerce")` silently converts bad data to NaN
 - Two scheduler files exist — `scheduler.py` is authoritative
 

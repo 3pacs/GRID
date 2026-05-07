@@ -146,7 +146,7 @@ No puller exists for this table. The table schema is defined in `migrations/vers
 The best approach is to add the margin-related [[FRED]] series to the existing FRED puller and then create a small materializer to transform [[Raw Series Table|raw_series]] → margin_debt_monthly.
 
 **[[FRED]] series for margin debt:**
-- `BOGZ1FL663067003Q` — Security brokers/dealers margin accounts (quarterly, level)
+- `BOGZ1FL663067003Q` — [[Security]] brokers/dealers margin accounts (quarterly, level)
 - Already in the pull list for cross-border flows
 
 But this is **quarterly**. The table is `margin_debt_monthly`. For monthly granularity:
@@ -995,7 +995,7 @@ psql -U grid -d griddb -c "
 Report back with:
 1. Branch name and changed files
 2. Row counts for each table (before/after)
-3. Any migrations run
+3. Any [[migrations]] run
 4. Any new puller modules created
 5. Tests added or run
 6. Unresolved issues or blockers

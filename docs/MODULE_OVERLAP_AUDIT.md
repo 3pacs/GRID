@@ -11,7 +11,7 @@ Clusters audited: 18
 - TEMPLATE_CLONES (refactor opportunity): **2**
 
 **Key structural finding:** CLAUDE.md's "14-module intelligence scaffold" was a
-historical artifact. The actor_network and causation modules it described (at 7,002
+historical artifact. The actor_network and [[Causation|causation]] modules it described (at 7,002
 LOC and 2,387 LOC respectively) do **not exist at those sizes** — `actor_network.py`
 is a 153-LOC façade, `causation.py` is a 26-LOC re-export shim. Both delegate to
 submodule packages (`intelligence/actors/*`, `causation_core` + `causation_graph` +
@@ -58,16 +58,16 @@ risks are narrower than the brief suggested, but they still exist.
 
 **Semantic check:**
 - Does causation_graph.py already do upstream→downstream BFS over supply-chain edges? **NO** — it walks `causal_links` across signal sources.
-- Does forensics.py already reconstruct impact cascades? **NO** — it attributes a past move, doesn't forward-simulate.
-- Does event_sequence.py already support scenario simulation? **NO** — pure chronological aggregation.
+- Does [[Forensics|forensics.py]] already reconstruct impact cascades? **NO** — it attributes a past move, doesn't forward-simulate.
+- Does [[Event Sequence|event_sequence.py]] already support scenario simulation? **NO** — pure chronological aggregation.
 
 **Signal overlap:**
 - Shared table reads: *chain_contagion only* reads `supply_chain_edges` + `supply_chain_nodes` + `supply_shock_attributions`; *causation_graph only* reads `causal_chains` + `signal_sources`. Zero DB-level overlap.
 - Shared inputs: both produce a "downstream impact ranking," so their *outputs* conflict for consumers that ask "what's at risk downstream of X?"
 
-**Verdict:** **OVERLAP_PARTIAL** — chain_contagion operates on a fundamentally different graph (physical supply chain) vs. the causation family (actor/signal graph). The risk is output contradiction: a downstream consumer could see a "HIGH impact" from causation_graph and "LOW impact" from chain_contagion for the same (ticker, horizon) and have no way to reconcile.
+**Verdict:** **OVERLAP_PARTIAL** — chain_contagion operates on a fundamentally different graph (physical [[Supply Chain|supply chain]]) vs. the causation family (actor/signal graph). The risk is output contradiction: a downstream consumer could see a "HIGH impact" from causation_graph and "LOW impact" from chain_contagion for the same (ticker, horizon) and have no way to reconcile.
 
-**Resolution task:** SYNTH-1 — Wire `chain_contagion.simulate_contagion` outputs through a unified contagion contract (`contracts/contagion_impact.json`?) that both causation_graph and postmortem.py already consume. `postmortem.py` already reads `contagion_backtest_results` and `contagion_predictions`, so the wiring half-exists. Extend causation_graph to join `supply_shock_attributions` when tracing a downstream impact chain so the two graphs converge at a single ticker-level impact score.
+**Resolution task:** SYNTH-1 — Wire `chain_contagion.simulate_contagion` outputs through a unified contagion contract (`contracts/contagion_impact.json`?) that both causation_graph and [[Postmortem|postmortem.py]] already consume. `postmortem.py` already reads `contagion_backtest_results` and `contagion_predictions`, so the wiring half-exists. Extend causation_graph to join `supply_shock_attributions` when tracing a downstream impact chain so the two graphs converge at a single ticker-level impact score.
 
 ---
 
@@ -76,7 +76,7 @@ risks are narrower than the brief suggested, but they still exist.
 **Session-created:** `intelligence/supply_chokepoints.py` (465 LOC) — scores each `supply_chain_edge` on chokepoint dimensions (substitution, buyer concentration, geography). Public API: `compute_chokepoint_score(edge, context)`, `score_all_edges(engine)`, `flag_chokepoint_nodes(engine, threshold)`. Writes back into `supply_chain_edges`. Imported by `chain_contagion.py`.
 
 **Pre-existing candidates:**
-- `intelligence/cross_reference.py` (1818 LOC) — "lie detector" for government statistics (GDP vs physical). Reads `cross_reference_checks`, `raw_series`, `resolved_series`. **No supply-chain table access.**
+- `intelligence/cross_reference.py` (1818 LOC) — "[[Cross Reference|lie detector]]" for government statistics (GDP vs physical). Reads `cross_reference_checks`, `raw_series`, `resolved_series`. **No supply-chain table access.**
 - `intelligence/source_audit.py` (940 LOC) — data-source taxonomy audit (trust/agreement across catalog sources). **No supply-chain table access.**
 - `intelligence/lever_pullers.py` (1377 LOC) — identifies market-moving *actors* (central banks, whales). **No supply-chain table access.**
 
@@ -86,7 +86,7 @@ risks are narrower than the brief suggested, but they still exist.
 
 **Verdict:** **NOVEL_FOCUS.**
 
-**Resolution task:** SYNTH-2 — Ensure `supply_chokepoints.score_all_edges()` is added to the weekly Hermes schedule (`ingestion/scheduler.py`) so scores stay fresh for `chain_contagion`. No merging.
+**Resolution task:** SYNTH-2 — Ensure `supply_chokepoints.score_all_edges()` is added to the weekly [[Hermes Scheduler|Hermes]] schedule (`ingestion/scheduler.py`) so scores stay fresh for `chain_contagion`. No merging.
 
 ---
 
@@ -97,7 +97,7 @@ risks are narrower than the brief suggested, but they still exist.
 **Pre-existing candidates:**
 - `intelligence/thesis_tracker.py` (1014 LOC) — scores snapshotted thesis hypotheses. Writes `thesis_postmortems`, `thesis_snapshots`. Does not compute upstream-downstream correlation.
 - `intelligence/causation_graph.py` — walks `causal_chains`, not price-series lag correlation.
-- `intelligence/trust_scorer.py` — Bayesian trust on source signals, not return-series correlation.
+- `intelligence/trust_scorer.py` — [[Trust Scorer|Bayesian trust]] on source signals, not return-series correlation.
 
 **Semantic check:** cross_lens is specifically "lagged return correlation between two supply-chain nodes with COGS weighting." No other module computes lagged return correlation on supply-chain pairs.
 
@@ -149,7 +149,7 @@ risks are narrower than the brief suggested, but they still exist.
 
 **Pre-existing candidates:**
 - `alpha_research/*` (20+ modules, 3,426 LOC total) — quant alpha research suite, heartbeat, adapters. `alpha_research/signals/credit_cycle.py`, `signals/quanta_alpha.py`, `signals/macro_regime.py` — all are *signal generators*, none compute a fundamental-vs-price residual.
-- `discovery/orthogonality.py` (549 LOC) — feature orthogonality audit, not divergence detection.
+- `discovery/orthogonality.py` (549 LOC) — feature [[Orthogonality Audit|orthogonality audit]], not divergence detection.
 - `features/lab.py` (671 LOC) — feature transformation engine. Has `spread`, `ratio`, `zscore_normalize` primitives but no fundamental-divergence composite.
 
 **Semantic check:** None touches `capital_flows` + `raw_series` to compute fundamental-vs-price divergence. Novel.
@@ -183,7 +183,7 @@ risks are narrower than the brief suggested, but they still exist.
 **Session-created:** `intelligence/news_contagion_listener.py` (638 LOC) — scans `news_articles`, resolves supply-chain entities via `supply_chain_nodes`, then kicks off `chain_contagion.simulate_contagion`. Writes `contagion_predictions`. Already imports `intelligence.chain_contagion` and `analysis.sector_map`.
 
 **Pre-existing candidates:**
-- `intelligence/breaking_news.py` (341 LOC) — GDELT-based breaking-news monitor, writes `signal_data`. Not supply-chain aware.
+- `intelligence/breaking_news.py` (341 LOC) — [[GDELT]]-based breaking-news monitor, writes `signal_data`. Not supply-chain aware.
 - `intelligence/deal_detector.py` (861 LOC) — news-based M&A detection, writes `deal_pipeline`. Not contagion.
 - `intelligence/business_news_parser.py` (804 LOC) — generic business-event parser, writes `business_events`. Not contagion.
 - `intelligence/news_momentum.py` (903 LOC) — sentiment velocity/acceleration, writes `news_momentum`. Not contagion.
@@ -191,7 +191,7 @@ risks are narrower than the brief suggested, but they still exist.
 
 **Semantic check:** Five pre-existing news scanners exist. None of them resolves entities against `supply_chain_nodes` or triggers a propagation simulator. **But all five scan `news_articles`** — so we have 6 scanners reading the same table independently.
 
-**Verdict:** **OVERLAP_PARTIAL** — not a duplicate of function, but a duplicate of the *scanner pattern*. All 6 modules independently poll `news_articles`. Risk: inconsistent freshness, inconsistent ticker resolution (news_ticker_resolver.py exists and none of them may use it).
+**Verdict:** **OVERLAP_PARTIAL** — not a duplicate of function, but a duplicate of the *scanner pattern*. All 6 modules independently poll `news_articles`. Risk: inconsistent freshness, inconsistent ticker resolution (news_ticker_[[Conflict Resolution|resolver.py]] exists and none of them may use it).
 
 **Resolution task:** SYNTH-8 — Introduce a single news event bus (`intelligence/_news_fanout.py` as a small helper, NOT a new intelligence module — add as a package-private helper inside an existing file). Each of the 6 scanners subscribes instead of polling. Short-term: verify all 6 use `news_ticker_resolver.resolve_tickers` so ticker sets agree.
 
@@ -362,11 +362,11 @@ Total: **~19,000 LOC.** All expose `get_<sector>_network()` + `get_entity(key)` 
 
 **Candidates:**
 - `intelligence/entity_resolver.py` (1411 LOC) — analytical entity resolution: phonetic keys, Levenshtein, Jaro-Winkler, `resolve`, `build_resolution_index`, `find_connections`. Writes `entity_resolution` table. Used in the actor/intelligence domain. Reads `actors`, `signal_data`, `wealth_flows`, `oracle_predictions`.
-- `normalization/entity_map.py` (1055 LOC) — `EntityMap` class for feature-source mapping (BLS codes ↔ feature_id etc.). Writes *nothing directly* — `load_v2_mappings` populates the mapping table via `resolver.py`. Used in the data-ingestion domain. Reads `feature_registry`, `resolved_series`.
+- `normalization/entity_map.py` (1055 LOC) — `EntityMap` class for feature-source mapping ([[BLS]] codes ↔ feature_id etc.). Writes *nothing directly* — `load_v2_mappings` populates the mapping table via `resolver.py`. Used in the data-ingestion domain. Reads `feature_registry`, `resolved_series`.
 - `normalization/resolver.py` (322 LOC) — `Resolver` class, pending-feature-source conflict resolution. Writes `resolved_series`. Imports `normalization.entity_map`.
 
 **Semantic check:**
-- `normalization/*` = feature/source disambiguation (which FRED code maps to which canonical feature).
+- `normalization/*` = feature/source disambiguation (which [[FRED]] code maps to which canonical feature).
 - `intelligence/entity_resolver.py` = actor/person/company name disambiguation (which "Jamie Dimon" row is canonical).
 
 They are **different disambiguation domains**. BUT:
@@ -420,6 +420,6 @@ All other 9 session-created modules are legitimate novel focus or legitimate par
 
 1. **SYNTH-13** — `contagion_to_ticket` vs `options_recommender` duplicated strike/expiry/Kelly logic. Two pricing engines will silently disagree the first time they ship different tickets for the same (ticker, horizon).
 2. **SYNTH-1** — `chain_contagion` (supply-chain graph) vs `causation_graph` (actor-signal graph) will produce contradictory downstream-impact rankings for the same ticker with no reconciliation layer.
-3. **SYNTH-4** — `contagion_backtest.compute_accuracy` and `postmortem` each define "accuracy" independently. Oracle calibration will drift silently if one changes and the other does not.
+3. **SYNTH-4** — `contagion_backtest.compute_accuracy` and `postmortem` each define "accuracy" independently. [[Oracle Calibration|Oracle calibration]] will drift silently if one changes and the other does not.
 
 All three are HIGH priority because they produce contradictory *quantitative* predictions that the oracle feeds on. Everything else is wiring/cosmetic/LOC reduction.

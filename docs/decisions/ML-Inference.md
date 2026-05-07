@@ -5,12 +5,12 @@ promoted_via: OBSIDIAN-2 (task #76)
 ---
 # ML & Inference Layer
 
-Machine learning model training, ensemble classification, live inference, and the self-improving Oracle prediction engine.
+Machine learning model training, ensemble classification, [[Live Inference|live inference]], and the self-improving Oracle prediction engine.
 
 ## Inference Module (`inference/`, 11 files)
 
 ### Core Pipeline
-- **`training.py`** — PIT-correct model training. Builds datasets from [[PIT-Store]], trains with walk-forward validation to prevent lookahead bias. Supports XGBoost, RandomForest, RuleBased.
+- **`training.py`** — PIT-correct model training. Builds datasets from [[PIT-Store]], trains with [[Walk-Forward Backtesting|walk-forward]] validation to prevent [[PIT Store|lookahead bias]]. Supports XGBoost, RandomForest, RuleBased.
 - **`ensemble.py`** — `EnsembleClassifier` combining multiple models via weighted probability averaging. Default weights: XGBoost 0.45, RF 0.30, RuleBased 0.25. Includes disagreement detection — reduces confidence when models conflict.
 - **`live.py`** — `LiveInference` runs production models against latest PIT data. Loads features via [[Feature-Lab]], generates recommendations per layer.
 - **`trained_models.py`** — `TrainedModelBase` ABC and concrete implementations (XGBoost, RandomForest, RuleBased).
@@ -40,7 +40,7 @@ Self-improving prediction loop. Every prediction logged with full provenance, sc
 - **`report.py`** — Formatted prediction digest with anti-signals
 - **`run_cycle.py`** — Runs one Oracle cycle: score → evolve → predict → report
 - **`forecaster_adapter.py`** — Adapts TimesFM/AutoBNN forecasts for oracle use
-- **`astrogrid_universe.py`** — Canonical AstroGrid scoring universe definitions
+- **`astrogrid_universe.py`** — Canonical [[AstroGrid]] scoring universe definitions
 
 ## Alpha Research (`alpha_research/`, 21 files)
 
@@ -81,7 +81,7 @@ Evolutionary factor mining and signal validation.
 
 Market physics analogies for signal generation:
 - **`momentum.py`** — Momentum measurement (velocity, acceleration)
-- **`dealer_gamma.py`** — Dealer gamma exposure calculation
+- **`dealer_gamma.py`** — [[Dealer Gamma|Dealer gamma]] exposure calculation
 - **`news_energy.py`** — News "energy" scoring (kinetic/potential analogy)
 - **`waves.py`** — Wave analysis (interference, resonance)
 - **`transforms.py`** — Signal transforms (Fourier, wavelet)

@@ -14,13 +14,13 @@ How data flows through GRID: from external sources to actionable intelligence.
 External data is pulled by source-specific puller classes, each implementing a standard interface: `pull()` -> `save_to_db()`.
 
 **Source Groups:**
-- [[Ingestion-AltData]] — 56 files: AAII sentiment, CBOE, CFTC COT, dark pools, GDELT, insider filings, prediction markets, etc.
-- [[Ingestion-International]] — 14 files: ECB, BCB, BIS, IMF, OECD, Eurostat, etc.
-- [[Ingestion-Physical]] — 7 files: USDA, VIIRS nightlights, patents, OFR
+- [[Ingestion-AltData]] — 56 files: AAII sentiment, CBOE, [[CFTC COT]], [[Dark Pool|dark pool]]s, [[GDELT]], [[Insider Filings|insider filings]], prediction markets, etc.
+- [[Ingestion-International]] — 14 files: [[ECB]], BCB, BIS, IMF, OECD, Eurostat, etc.
+- [[Ingestion-Physical]] — 7 files: [[USDA]], VIIRS nightlights, patents, OFR
 - [[Ingestion-Celestial]] — 6 files: planetary aspects, lunar cycles, solar activity, Vedic astrology, Chinese calendar
 - [[Ingestion-Trade]] — 5 files: Comtrade, CEPII, WIOD, Atlas ECI
 - [[Ingestion-ML]] — 2 files: FinBERT scoring
-- [[Ingestion-Core]] — 15 files: FRED, yfinance, BLS, Tiingo, CoinGecko, EDGAR, options, web scraper
+- [[Ingestion-Core]] — 15 files: [[FRED]], yfinance, [[BLS]], Tiingo, [[CoinGecko]], [[EDGAR]], options, web scraper
 
 **Scheduling:** Managed by `ingestion/scheduler.py` (unified domestic + international) and the [[Hermes-Operator]] daemon.
 
@@ -29,7 +29,7 @@ External data is pulled by source-specific puller classes, each implementing a s
 Raw series identifiers (e.g., `T10Y2Y`, `YF:^GSPC:close`) are mapped to canonical feature names via [[Entity-Map]].
 
 - `normalization/entity_map.py` — `SEED_MAPPINGS` dict + V2 mappings
-- `normalization/resolver.py` — conflict resolution with per-family thresholds
+- `normalization/resolver.py` — [[Conflict Resolution|conflict resolution]] with per-family thresholds
 - Writes to `raw_series` table first, then resolves to `resolved_series`
 
 ### 3. Resolution
@@ -60,14 +60,14 @@ Features live in `feature_registry` (1,281 entries) with metadata: family, model
 
 - `store/pit.py` — `PITStore` enforces `release_date <= as_of_date`
 - Supports `FIRST_RELEASE` and `LATEST_AS_OF` vintage policies
-- Used by both backtesting and live inference
+- Used by both backtesting and [[Live Inference|live inference]]
 
 ### 6. Analytical Snapshots
 
 Every analytical output is persisted for historical comparison.
 
 - `store/snapshots.py` — saves clustering, regime, options scans with full provenance
-- `store/astrogrid.py` — AstroGrid-specific persistence
+- `store/astrogrid.py` — [[AstroGrid]]-specific persistence
 
 ## Database Tables (Data Pipeline)
 

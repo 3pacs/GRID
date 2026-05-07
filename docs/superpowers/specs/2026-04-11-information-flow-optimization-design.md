@@ -13,8 +13,8 @@
 
 The GRID platform has grown to 97 modules across 14 architectural layers — 50+ pullers, 87 intelligence modules, 79 API routers, 66 frontend views. A systematic audit identified **23 distinct information-flow defects** falling into four categories:
 
-1. **Broken feedback loops** — modules that produce learning signals (postmortem, oracle scoring, backtest verdicts, options trade outcomes) but whose outputs never reach the modules that should learn from them.
-2. **Unsurfaced intelligence** — seven intelligence modules (postmortem, trust_scorer, source_audit, sleuth, thesis_tracker, dollar_flows, conflict resolver) produce rich data that has no API endpoint and is therefore invisible to operators and the oracle.
+1. **Broken feedback loops** — modules that produce learning signals ([[Postmortem|postmortem]], oracle scoring, backtest verdicts, options trade outcomes) but whose outputs never reach the modules that should learn from them.
+2. **Unsurfaced intelligence** — seven intelligence modules (postmortem, trust_scorer, source_audit, [[Sleuth|sleuth]], thesis_tracker, dollar_flows, conflict resolver) produce rich data that has no API endpoint and is therefore invisible to operators and the oracle.
 3. **Missing event emissions** — lifecycle events (puller start/fail, model promotion attempt, investigation progress, prediction invalidation, trade order lifecycle) are never emitted, so the frontend cannot react in real time.
 4. **Entity resolution divergence** — `normalization/entity_map.py` and `intelligence/actor_discovery.py` resolve entities independently with no reconciliation.
 
@@ -33,7 +33,7 @@ This spec defines a non-disruptive fix: a thin **Information Contract Layer** th
 - **G3.** Every emitted event is persisted with a `correlation_id` that allows full lineage tracing from source data to final prediction to post-expiry outcome.
 - **G4.** Failed consumer dispatches fall into a dead-letter store with automatic retry (1 min, 10 min, 1 hr) and manual replay on demand.
 - **G5.** All 13 contracts land incrementally without rewriting the internals of any existing module — producers add one emit call, consumers add one handler.
-- **G6.** Seven new API endpoints expose previously-hidden intelligence (postmortem, trust scores, source audit, sleuth leads, thesis evolution, dollar flows, conflict audit).
+- **G6.** Seven new API endpoints expose previously-hidden intelligence (postmortem, trust scores, [[Source Audit|source audit]], sleuth leads, thesis evolution, [[Dollar Flows|dollar flows]], conflict audit).
 - **G7.** Six new SSE channels broadcast previously-missing lifecycle events to the frontend.
 - **G8.** Observability: every contract dispatch is counted, timed, and surfaced at `/api/v1/contracts/metrics`.
 
@@ -43,7 +43,7 @@ This spec defines a non-disruptive fix: a thin **Information Contract Layer** th
 - **NG2.** Not replacing `events/bus.py` or its Redpanda/PG-NOTIFY fallback. The contracts layer sits on top.
 - **NG3.** Not introducing a new message broker. The existing dual-mode bus is sufficient.
 - **NG4.** Not changing PIT correctness semantics. `assert_no_lookahead()` remains unchanged.
-- **NG5.** Not changing the decision journal immutability contract.
+- **NG5.** Not changing the [[Decision Journal|decision journal]] immutability contract.
 - **NG6.** No synchronous feedback loops. Everything is async with eventual consistency (≤6 hr propagation, bounded by the oracle cycle).
 
 ---
@@ -247,7 +247,7 @@ class Dispatcher:
 
 ### 3.5 Correlation IDs & Lineage
 
-Every puller (the entry point for all data) generates a `correlation_id` on ingest and attaches it to the `raw_series` row. All downstream derivations — conflict resolution, feature computation, regime detection, hypothesis generation, inference, oracle prediction, postmortem — carry the same `correlation_id` through every contract emit. This means:
+Every puller (the entry point for all data) generates a `correlation_id` on ingest and attaches it to the `raw_series` row. All downstream derivations — [[Conflict Resolution|conflict resolution]], feature computation, regime detection, hypothesis generation, inference, oracle prediction, postmortem — carry the same `correlation_id` through every contract emit. This means:
 
 ```sql
 SELECT * FROM contracts_audit
@@ -412,7 +412,7 @@ Each contract fixes one or more of the 23 defects. Mapping:
 
 **Consumers:**
 1. `contracts.handlers.alerts.on_cross_reference_anomaly` → **[EXISTING]** — `alerts.email.alert_on_discovery_insight(title, description, data)`.
-2. `contracts.handlers.canvas.on_cross_reference_anomaly` → **[GLUE]** — the existing `api/routers/canvas_investigate.py::auto_investigate()` is a FastAPI endpoint, not a library function. The handler must call the underlying implementation. We extract the core logic from `auto_investigate()` into a library function:
+2. `contracts.handlers.canvas.on_cross_reference_anomaly` → **[GLUE]** — the existing `api/routers/canvas_investigate.py::auto_investigate()` is a [[FastAPI]] endpoint, not a library function. The handler must call the underlying implementation. We extract the core logic from `auto_investigate()` into a library function:
    ```python
    # api/routers/canvas_investigate.py
    def seed_investigation(engine: Engine, query: str, *, depth: int = 2, max_nodes: int = 50) -> int:
@@ -524,7 +524,7 @@ Wiring each puller is a **one-line change**: wrap the existing pull body in `wit
 **Payload:** `trace_id`, `ticker`, `window`, `reconstructed_sequence[]`, `suspected_levers[]`, `correlation_id`
 
 **Consumers:**
-1. `contracts.handlers.causation.on_forensics_trace` → **[GLUE]** — `intelligence/causation_graph.py` gains a new public function `ingest_forensics_trace(engine, trace) -> None` that merges the forensics trace into the causation graph's storage. The existing `trace_causal_chain()`, `find_longest_chains()`, and `load_causal_chains()` functions continue to work unchanged; the new ingestion function writes the same underlying storage they read. This fixes defect #9 (parallel causation engines) by making the causation graph authoritative.
+1. `contracts.handlers.causation.on_forensics_trace` → **[GLUE]** — `intelligence/causation_graph.py` gains a new public function `ingest_forensics_trace(engine, trace) -> None` that merges the [[Forensics|forensics]] trace into the causation graph's storage. The existing `trace_causal_chain()`, `find_longest_chains()`, and `load_causal_chains()` functions continue to work unchanged; the new ingestion function writes the same underlying storage they read. This fixes defect #9 (parallel causation engines) by making the causation graph authoritative.
 2. `contracts.handlers.sleuth.on_forensics_trace` → **[GLUE]** — `Sleuth` class gains an `ingest_trace(trace) -> list[Lead]` method.
 3. `contracts.handlers.canvas.on_forensics_trace` → **[NEW helper]** — `emit_trace_to_live_boards()` writes into `canvas_traces` for any board pinned to the ticker.
 
@@ -667,7 +667,7 @@ All 13 contracts are in scope, but sequenced to close the highest-value feedback
 - `contracts/correlation.py`
 - `contracts/observability.py`
 - `contracts/replay.py`
-- DB migrations for `contracts_audit`, `contracts_dead_letter`
+- DB [[migrations]] for `contracts_audit`, `contracts_dead_letter`
 - API endpoints `/api/v1/contracts/*`
 - Observability metrics endpoint
 - Unit test scaffolding

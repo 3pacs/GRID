@@ -39,7 +39,7 @@ pwa/src/canvas/
 
 ### 1C. Create `CanvasStore.js`
 
-Zustand store managing:
+[[Zustand]] store managing:
 - `graph` — graphology Graph instance
 - `selectedNode` — currently selected node ID + type
 - `hoveredNode` — currently hovered node ID

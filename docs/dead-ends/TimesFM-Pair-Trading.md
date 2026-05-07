@@ -21,7 +21,7 @@ tags: [dead-end, timesfm, ml]
 TimesFM is useless for cross-asset directional prediction. Use analog engine as primary, TimesFM as comparison signal only.
 
 ## Still Useful For
-- Single-asset walk-forward as a weak signal (~56%)
+- Single-asset [[Walk-Forward Backtesting|walk-forward]] as a weak signal (~56%)
 - Batch forecasting on gridz4 (CPU, 0.42s/window)
 - Comparison/sanity check against other models
 

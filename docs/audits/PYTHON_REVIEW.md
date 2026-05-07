@@ -523,7 +523,7 @@ def _get_db_conn() -> psycopg2.connection:  # <-- REQUIRED
 
 ### 7. Rate Limiting State Loss on Restart
 
-**Severity:** HIGH — Security control ineffective in production
+**Severity:** HIGH — [[Security]] control ineffective in production
 
 **Location:** `api/auth.py:278-305`
 

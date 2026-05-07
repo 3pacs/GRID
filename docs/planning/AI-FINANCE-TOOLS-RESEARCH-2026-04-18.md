@@ -76,7 +76,7 @@ factor recipes.
 - Cherry-pick ~20 factors that are orthogonal to our existing `discovery/orthogonality.py` registry.
 - Port as pure pandas implementations into `features/lab.py` under a
   `qlib_alpha_*` namespace so they're trivially greppable.
-- Route through the normal orthogonality audit before promotion.
+- Route through the normal [[Orthogonality Audit|orthogonality audit]] before promotion.
 
 **Risks:** Orthogonality check is mandatory — otherwise we balloon the feature
 set with correlated redundancy. Respect NaN strategy per the `data-integrity.md` rule.
@@ -107,8 +107,8 @@ Specifically interesting: **DBnomics** (2.6B+ series, ~300 providers) and
 
 **Integration surface:**
 - New pullers `ingestion/international/dbnomics.py` and `ingestion/international/akshare.py`.
-- Each follows the standard `_resolve_source_id()` + Hermes scheduler pattern.
-- DBnomics is high-value because it aggregates FRED, ECB, BIS, IMF, etc. — could
+- Each follows the standard `_resolve_source_id()` + [[Hermes Scheduler|Hermes scheduler]] pattern.
+- DBnomics is high-value because it aggregates [[FRED]], [[ECB]], BIS, IMF, etc. — could
   consolidate several existing pullers.
 
 **Risks:** Watch for overlap with existing sources (FRED, ECB). Entity-map
@@ -117,7 +117,7 @@ lands or we double-count signals.
 
 ## Explicit skips
 
-- **TradingAgents (tauric)** — already built. `agents/runner.py`,
+- **[[TradingAgents]] (tauric)** — already built. `agents/runner.py`,
   `agents/personas.py`, `agents/backtest.py` are our equivalent. Extending
   personas (item #2) is the only useful addition.
 - **TradingAgents-CN** — A-share / Shanghai & Shenzhen specific. Outside scope.

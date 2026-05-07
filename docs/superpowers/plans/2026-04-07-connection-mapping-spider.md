@@ -1,12 +1,12 @@
 # Connection Mapping Spider — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-[[development]] (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a continuous connection mapping spider that discovers actor relationships up to 11 degrees of separation, keeps the full graph in RAM, and serves subgraph queries in microseconds.
 
-**Architecture:** 4-layer system — in-memory graph engine (Python dicts, ~8GB for 5M actors), spider daemon (systemd service, 4-stage pipeline), 13 data sources across 4 confidence tiers, PostgreSQL persistence. Spider runs 24/7 expanding the network.
+**[[architecture|Architecture]]:** 4-layer system — in-memory graph engine (Python dicts, ~8GB for 5M actors), spider daemon (systemd service, 4-stage pipeline), 13 data sources across 4 confidence tiers, [[PostgreSQL]] persistence. Spider runs 24/7 expanding the network.
 
-**Tech Stack:** Python 3.10+, SQLAlchemy, FastAPI, NetworkX (for community detection), loguru, pydantic-settings. Local LLM via existing `llm/router.py`.
+**Tech Stack:** Python 3.10+, [[SQLAlchemy]], [[FastAPI]], NetworkX (for community detection), loguru, pydantic-settings. Local LLM via existing `llm/router.py`.
 
 **Spec:** `docs/superpowers/specs/2026-04-07-connection-mapping-spider-design.md`
 

@@ -1,12 +1,12 @@
 # Hypothesis Kill System + Antithesis Tracking — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-[[development]] (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace the blanket 7-day scoring gate with per-hypothesis test windows, add named kill conditions that auto-invalidate dead theses with postmortem records, and generate thesis/antithesis pairs for every hypothesis so both sides of every bet are tracked.
+**Goal:** Replace the blanket 7-day scoring gate with per-hypothesis test windows, add named kill conditions that auto-invalidate dead theses with [[Postmortem|postmortem]] records, and generate thesis/antithesis pairs for every hypothesis so both sides of every bet are tracked.
 
-**Architecture:** Extend `discovered_hypotheses` with 4 new columns (`role`, `pair_id`, `kill_reason`, `killed_at`). New `hypothesis_postmortems` table stores the full death record. Kill logic lives in a new `_check_kills()` method that runs typed kill checks per `pattern_type`. Antithesis generation happens inline during `_store_hypothesis()` — for every thesis stored, its inverse is auto-generated and linked via `pair_id`. When either side confirms, the other auto-kills with `ANTITHESIS_CONFIRMED`.
+**[[architecture|Architecture]]:** Extend `discovered_hypotheses` with 4 new columns (`role`, `pair_id`, `kill_reason`, `killed_at`). New `hypothesis_postmortems` table stores the full death record. Kill logic lives in a new `_check_kills()` method that runs typed kill checks per `pattern_type`. Antithesis generation happens inline during `_store_hypothesis()` — for every thesis stored, its inverse is auto-generated and linked via `pair_id`. When either side confirms, the other auto-kills with `ANTITHESIS_CONFIRMED`.
 
-**Tech Stack:** Python 3.11, SQLAlchemy 2.0 (raw `text()` queries), PostgreSQL, pytest
+**Tech Stack:** Python 3.11, [[SQLAlchemy]] 2.0 (raw `text()` queries), [[PostgreSQL]], pytest
 
 ---
 
@@ -1074,7 +1074,7 @@ git commit -m "feat: kill stats in get_stats(), postmortems CLI command"
 ### Task 6: Deploy to Server + Migrate Existing Data
 
 **Files:**
-- No code changes — deployment only
+- No code changes — [[deployment]] only
 
 - [ ] **Step 1: Push to origin**
 

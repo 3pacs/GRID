@@ -7,7 +7,7 @@
 
 ## The Problem
 
-The GRID canvas is at **18.5% of its potential**. The backend has 130 intelligence modules, 495+ actors, 5M+ connections, 443K signals, and 28 intelligence modules producing forensics, causation chains, event timelines, and trust-scored evidence. The frontend shows circles on lines. Disconnected views. No investigation workflow. No temporal dimension. D3 Canvas 2D that chokes past 1K nodes.
+The GRID canvas is at **18.5% of its potential**. The backend has 130 intelligence modules, 495+ actors, 5M+ connections, 443K signals, and 28 intelligence modules producing [[Forensics|forensics]], [[Causation|causation]] chains, event timelines, and trust-scored evidence. The frontend shows circles on lines. Disconnected views. No investigation workflow. No temporal dimension. D3 Canvas 2D that chokes past 1K nodes.
 
 This is a Palantir-class data engine with a preschool UI.
 
@@ -27,7 +27,7 @@ This is a Palantir-class data engine with a preschool UI.
 
 ### 1.1 Rendering Engine Upgrade
 
-**Current:** D3.js + Canvas 2D (ActorNetwork.jsx, ~600 LOC). Animated money-flow particles exist but hit performance ceiling at ~500 nodes.
+**Current:** D3.js + Canvas 2D ([[Actor Network View|ActorNetwork]].jsx, ~600 LOC). Animated money-flow particles exist but hit performance ceiling at ~500 nodes.
 
 **Target:** Sigma.js v3 + Graphology + @react-sigma/core
 
@@ -250,7 +250,7 @@ When a node is selected, the right panel shows rich intelligence:
 - Sector/subsector
 - Related actors (insiders, congressional, institutional)
 - Recent signals (sorted by confidence)
-- Options positioning (gamma, vanna, IV percentile)
+- Options positioning (gamma, [[Dealer Gamma|vanna]], IV percentile)
 - Catalyst calendar (upcoming events)
 
 **For signals:**
@@ -286,9 +286,9 @@ A natural language interface embedded in the canvas.
 - "Show me all insider buying before AAPL earnings"
 - "Why did this hypothesis get killed?"
 - "What's the money trail from BlackRock to this ticker?"
-- "Compare congressional trading accuracy vs insider accuracy"
+- "Compare [[Congressional Trading|congressional trading]] accuracy vs insider accuracy"
 
-The AI queries the backend intelligence modules and materializes results as graph additions. Uses existing Hermes/Ollama infrastructure.
+The AI queries the backend intelligence modules and materializes results as graph additions. Uses existing [[Hermes Scheduler|Hermes]]/[[Ollama]] infrastructure.
 
 ### 2.3 Causation Chain Visualization
 
@@ -356,7 +356,7 @@ Use deck.gl as a secondary layer:
 - Actors placed on world map at their headquarters/jurisdiction
 - Flow arcs between locations (thickness = amount)
 - Heat map overlay for regional signal density
-- Country risk scoring from GDELT tension data
+- Country risk scoring from [[GDELT]] tension data
 
 ### 2.8 Multi-Board Workspaces
 
@@ -511,7 +511,7 @@ User searches "BlackRock"
 - Backend intelligence modules stay as-is (they're solid)
 - Existing API endpoints remain (new canvas endpoints are additive)
 - Other views (Dashboard, Regime, Backtest, etc.) remain as separate pages
-- Zustand stays (new canvas store is a separate slice)
+- [[Zustand]] stays (new canvas store is a separate slice)
 - Vite build pipeline stays
 - Authentication stays the same
 

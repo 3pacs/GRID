@@ -106,7 +106,7 @@ Related: [[Frontend-Views]], [[All-Scripts]], [[Config-Map]]
 ## Hotspot Analysis
 
 **Worst offenders by directory:**
-- `intelligence/`: 30+ files over 800 lines. The actor network files alone are 5,500+ lines. This is the largest module cluster.
+- `intelligence/`: 30+ files over 800 lines. The [[Actor Network|actor network]] files alone are 5,500+ lines. This is the largest module cluster.
 - `api/routers/`: 6 files over 800 lines (intel, flows, system, astrogrid_helpers, chat, derivatives)
 - `analysis/`: 6 files over 800 lines
 - `ingestion/altdata/`: 5 files over 800 lines

@@ -185,7 +185,7 @@ See [docs/deployment.md](docs/deployment.md) for production deployment guide cov
 - Environment variables and secrets
 - Reverse proxy configuration
 - systemd service setup
-- Security checklist
+- [[Security]] checklist
 - Monitoring and health checks
 
 ## Development

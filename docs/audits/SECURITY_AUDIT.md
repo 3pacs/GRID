@@ -425,7 +425,7 @@ except Exception as e:
 
 1. **SQL Injection Prevention:** Nearly all database queries use parameterized queries (`text()` + bindparams). No active SQL injection found.
 2. **Password Hashing:** Uses bcrypt via `passlib.context.CryptContext` — strong algorithm.
-3. **Security Headers Middleware:** Well-implemented with CSP, HSTS (in production), X-Frame-Options, etc.
+3. **[[Security]] Headers Middleware:** Well-implemented with CSP, HSTS (in production), X-Frame-Options, etc.
 4. **Role-Based Access Control:** `require_role()` decorator properly enforces admin/contributor roles.
 5. **Input Validation:** Registration validates username length, password length before processing.
 6. **Secret Management:** Uses environment variables via pydantic-settings, no hardcoded API keys in source code.

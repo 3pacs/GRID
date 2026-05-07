@@ -1,12 +1,12 @@
 # V5 Phase 0 + TODO Fixes Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-[[development]] (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship the TODO fixes (cross-reference warm-up, GDELT rate limiting, spider stats widget, valuation migration) then build V5 Phase 0 foundations (event bus + SSE, useAsyncData hook, ViewErrorBoundary, Zustand store decomposition).
+**Goal:** Ship the TODO fixes ([[Cross Reference|cross-reference]] warm-up, [[GDELT]] rate limiting, spider stats widget, valuation migration) then build V5 Phase 0 foundations (event bus + SSE, useAsyncData hook, ViewErrorBoundary, [[Zustand]] store decomposition).
 
-**Architecture:** Two parallel tracks — backend event bus (PG LISTEN/NOTIFY + SSE endpoint) and frontend foundations (shared hooks + store split). TODO fixes are warm-up tasks that ship independently before V5 work begins.
+**[[architecture|Architecture]]:** Two parallel tracks — backend event bus (PG LISTEN/NOTIFY + SSE endpoint) and frontend foundations (shared hooks + store split). TODO fixes are warm-up tasks that ship independently before V5 work begins.
 
-**Tech Stack:** Python 3.11, FastAPI, asyncpg (new), PostgreSQL LISTEN/NOTIFY, SSE, React 18, Zustand
+**Tech Stack:** Python 3.11, [[FastAPI]], asyncpg (new), [[PostgreSQL]] LISTEN/NOTIFY, SSE, React 18, Zustand
 
 ---
 
@@ -179,7 +179,7 @@ Add to `pwa/src/api.js` near the other intelligence methods:
     }
 ```
 
-- [ ] **Step 2: Add spider stats state + fetch to IntelDashboard**
+- [ ] **Step 2: Add spider stats state + fetch to [[Intel Dashboard View|IntelDashboard]]**
 
 In `IntelDashboard.jsx`, add `spiderStats` state alongside the existing state declarations (after line 22):
 

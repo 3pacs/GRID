@@ -5,7 +5,7 @@ promoted_via: OBSIDIAN-2 (task #76)
 ---
 # API Layer
 
-FastAPI application serving at `/api/v1/*` with WebSocket at `/ws`. Entry point: `api/main.py`.
+[[FastAPI]] application serving at `/api/v1/*` with WebSocket at `/ws`. Entry point: `api/main.py`.
 
 ## Architecture
 
@@ -100,7 +100,7 @@ All routers registered in `api/main.py` via a declarative list. See [[API-Endpoi
 Pydantic models for request/response validation:
 - `auth.py` — Login, token, user models
 - `journal.py` — Journal entry models
-- `models.py` — ML model lifecycle models
+- `models.py` — ML [[Model Governance|model lifecycle]] models
 - `regime.py` — Regime state/history models
 - `system.py` — Health, status, freshness models
 - `watchlist.py` — Watchlist item models
@@ -114,7 +114,7 @@ Pydantic models for request/response validation:
 
 ## Dependencies
 
-- [[Database-Schema]] — all routers read from PostgreSQL
+- [[Database-Schema]] — all routers read from [[PostgreSQL]]
 - [[Intelligence-Layer]] — intelligence routers delegate to intelligence modules
 - [[Trading-Layer]] — trading router delegates to trading modules
 - [[Orchestration-Layer]] — LLM task queue router, compute router

@@ -580,7 +580,7 @@ def fetch_features(
 - Validator rejects in production but easy to miss
 - Fix: Require in .env.example with clear instructions
 
-⚠ **Missing Security Headers** (MEDIUM)
+⚠ **Missing [[Security]] Headers** (MEDIUM)
 - No X-Content-Type-Options, X-Frame-Options, HSTS, CSP
 - Add to CORS middleware in api/main.py
 

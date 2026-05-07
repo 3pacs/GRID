@@ -107,7 +107,7 @@ maintained in `intelligence.forced_flow_monitor.FOMC_DATES_2026`.
 
 ## The Daily Routine
 
-Every trading morning, Hermes runs `run_forced_flow_cycle` which does:
+Every trading morning, [[Hermes Scheduler|Hermes]] runs `run_forced_flow_cycle` which does:
 
 1. **Regime check** — reads `physics/dealer_gamma.get_market_gex_summary`
 2. **Calendar check** — enumerates forced-flow events in the next 10 trading days
@@ -170,7 +170,7 @@ dealer-hedging forced flows, and only that.**
 
 ## References
 
-- Cem Karsan — SqueezeMetrics and dealer gamma framework
+- Cem Karsan — SqueezeMetrics and [[Dealer Gamma|dealer gamma]] framework
 - Kris Sidial — tail vol, long-volatility strategy
 - JP Morgan Hedged Equity Fund prospectus — JHEQX roll mechanics
 - SpotGamma / Menthor Q — daily gamma flip publication

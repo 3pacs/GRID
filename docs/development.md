@@ -432,7 +432,7 @@ There is currently no frontend test suite (no Jest, Vitest, or Cypress). This is
 
 ## Database Migrations
 
-[[Alembic]] is configured for schema migrations:
+[[Alembic]] is configured for schema [[migrations]]:
 
 ```bash
 cd grid

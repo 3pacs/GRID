@@ -23,7 +23,7 @@ A "closed loop" in this plan means the detector's output is consumed by at least
 
 A detector is **rotting** if its rows are consumed by none of the six above. A consumer is **starving** if it scores, ranks, or trades on fewer signal families than the producers already populate.
 
-The dedupe pass (SYNTH-1..18 in `MODULE_DEDUPE_PLAN.md`) was defensive — delete/merge/rename. This plan is the offensive counterpart: every rotting detector becomes a subscription into the oracle's signal assembly or the trust scorer's Bayesian update, or both. **Closing these loops is where the alpha lives.**
+The dedupe pass (SYNTH-1..18 in `MODULE_DEDUPE_PLAN.md`) was defensive — delete/merge/rename. This plan is the offensive counterpart: every rotting detector becomes a subscription into the oracle's signal assembly or the [[Trust Scorer|trust scorer]]'s Bayesian update, or both. **Closing these loops is where the alpha lives.**
 
 ### Key architectural lever
 
@@ -93,7 +93,7 @@ Rows = producers. Columns = consumers. Cell legend:
 
 1. `intelligence/holder_deal_overlap.py` — pre-position detection. Filer holds both acquirer and target before announcement. This is the highest-asymmetry signal in the entire tree and nobody reads it.
 2. `intelligence/fundamental_divergence.py` — 202 tickers with long/short classification. The oracle's equity models have no fundamental lens at all right now; this plugs that gap directly.
-3. `intelligence/cross_lens.py` — supply shock attributions are the "explained by" layer. 186 rows waiting. Every causation narrative the system produces could cite these, and oracle's anti-signal engine could use them to downgrade conflicting equity signals.
+3. `intelligence/cross_lens.py` — supply shock attributions are the "explained by" layer. 186 rows waiting. Every [[Causation|causation]] narrative the system produces could cite these, and oracle's anti-signal engine could use them to downgrade conflicting equity signals.
 
 **Severity P1 — loop-closing but lower immediate alpha:**
 
@@ -110,8 +110,8 @@ Rows = producers. Columns = consumers. Cell legend:
 
 - **Oracle weight evolver** (`oracle/engine.py::_update_model_weights`) only sees verdicts on predictions the oracle itself made. Its DEFAULT_MODELS list has no `contagion`, `fundamental_divergence`, `sector_health`, `regulatory`, `holder_overlap`, or `cross_lens` model entries. **Six missing model heads.**
 - **Trust scorer** has 17 signal types but `SIGNAL_TRUST_DELTA` defines only 2 deltas (`sec_filing`, `chokepoint_crossing`). The Bayesian Beta is running but half the producers can't deposit outcomes into it.
-- **Oracle calibration** only reads `oracle_predictions`. Per-detector calibration would let us pause a detector whose ECE blows up without blowing up the whole oracle.
-- **Decision journal** is under-utilized. The only non-oracle writer is `contagion_to_ticket.py`. Every detector firing a scoreable prediction should journal.
+- **[[Oracle Calibration|Oracle calibration]]** only reads `oracle_predictions`. Per-detector calibration would let us pause a detector whose ECE blows up without blowing up the whole oracle.
+- **[[Decision Journal|Decision journal]]** is under-utilized. The only non-oracle writer is `contagion_to_ticket.py`. Every detector firing a scoreable prediction should journal.
 - **Contracts bus** (`ROUTES`) is empty. `DLQ`, `retry_scheduler`, `replay`, `observability` are wired and tested but no events route.
 
 ---
@@ -201,7 +201,7 @@ Producers land before consumers, contracts before their handlers, bus-integrity 
 3. SYNTH-21 — `calibration.on_prediction_scored` handler + migration
 4. **Milestone:** oracle is now closed-loop with itself via the bus. Router has 1 contract type wired.
 
-**Wave B — postmortem + contagion feedback (P0):**
+**Wave B — [[Postmortem|postmortem]] + contagion feedback (P0):**
 
 5. SYNTH-22 — `trust.on_postmortem_completed`
 6. SYNTH-23 — `oracle_weights.on_postmortem_completed`

@@ -24,7 +24,7 @@ The preamble is now stored as numbered fragments under `docs/agent_preamble/` so
 Before creating any new module, script, ingestor, or intelligence component:
 
 1. The dispatcher has already run `scripts/pre_create_check.py "<concept>"` for your primary concept and embedded the output below. READ IT. If it shows existing coverage, the default is to EXTEND the canonical module, not create a new one.
-2. Cross-reference `docs/MODULE_INVENTORY.md` for every module that touches the same table or signal.
+2. [[Cross Reference|Cross-reference]] `docs/MODULE_INVENTORY.md` for every module that touches the same table or signal.
 3. Only create new files when `pre_create_check` exits 1 AND inventory shows no coverage. Document your decision in the return JSON.
 
 ### 2. Deployment — use `scripts/deploy.py` ONLY
@@ -66,7 +66,7 @@ GRANT ALL ON <new_table> TO grid;
 GRANT USAGE, SELECT ON SEQUENCE <new_table>_id_seq TO grid;
 ```
 
-Migrations without this footer break the `grid` runtime role.
+[[migrations|Migrations]] without this footer break the `grid` runtime role.
 
 ### 5. SQL safety
 
@@ -116,7 +116,7 @@ Most prompts should fit under 40 body lines.
 
 ## Why this matters
 
-In the 2026-04-12 session, the main agent dispatched ~35 parallel agents. Every prompt repeated deployment/preamble/verify boilerplate. CLAUDE.md listed 14 intelligence modules (the real count was 143), so every agent operated on a false inventory. Session-created duplicates included chain_contagion, supply_chokepoints, cross_lens, sector_health, fundamental_divergence, holder_deal_overlap, news_contagion_listener, supply_chain_edge_validator — each one a potential overlap with pre-existing canonical modules.
+In the 2026-04-12 session, the main agent dispatched ~35 parallel agents. Every prompt repeated [[deployment]]/preamble/verify boilerplate. CLAUDE.md listed 14 intelligence modules (the real count was 143), so every agent operated on a false inventory. Session-created duplicates included chain_contagion, supply_chokepoints, cross_lens, sector_health, fundamental_divergence, holder_deal_overlap, news_contagion_listener, supply_chain_edge_validator — each one a potential overlap with pre-existing canonical modules.
 
 100+ modules that don't know about each other is worse than 14 that do. Duplicated work at best, contradictory predictions at worst when two modules score the same signal differently.
 

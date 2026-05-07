@@ -99,7 +99,7 @@ The codebase is architecturally sound (grade B, clean 8-layer separation, no cir
 - Fix schema mismatch in intel.py (20 min)
 - Add pagination metadata to list endpoints (1h)
 
-**Phase 2 — Security Hardening (2-3 days):**
+**Phase 2 — [[Security]] Hardening (2-3 days):**
 - Migrate WebSocket auth to first-message pattern
 - Add security headers middleware
 - Validate all API keys at startup
