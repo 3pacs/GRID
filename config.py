@@ -156,16 +156,24 @@ class Settings(BaseSettings):
     OLLAMA_EMBED_MODEL: str = "nomic-embed-text"
 
     # llama.cpp server on grid-svr Blackwell (Qwen3.6 27B GPU + mmproj, port 8081)
+    # Timeout MUST be < HERMES cycle timeout (600s in scripts/hermes_operator.py)
+    # so that when Hermes blacklists a slow cycle, the in-flight HTTP call
+    # also unwinds and the thread exits — otherwise we leak one stuck
+    # thread per timed-out cycle, each holding a parallel slot on the LLM
+    # server. Diagnosed 2026-05-07: 80+ leaked threads after 14h, server
+    # bombarded, every fresh cycle blocked. 300s is plenty for normal
+    # generation; queue depth >300s means the LLM is overloaded and
+    # backing off is the right call.
     LLAMACPP_BASE_URL: str = "http://localhost:8081"
     LLAMACPP_ENABLED: bool = True
-    LLAMACPP_TIMEOUT_SECONDS: int = 900
+    LLAMACPP_TIMEOUT_SECONDS: int = 300
     LLAMACPP_CHAT_MODEL: str = "Qwen3-32B-Q4_K_M"
     LLAMACPP_EMBED_MODEL: str = "Qwen3-32B-Q4_K_M"
 
     # llama.cpp ORACLE server on grid-svr Blackwell.
     LLAMACPP_ORACLE_BASE_URL: str = "http://localhost:8081"
     LLAMACPP_ORACLE_ENABLED: bool = True
-    LLAMACPP_ORACLE_TIMEOUT_SECONDS: int = 900
+    LLAMACPP_ORACLE_TIMEOUT_SECONDS: int = 300
     LLAMACPP_ORACLE_CHAT_MODEL: str = "Qwen3-32B-Q4_K_M"
     LLAMACPP_ORACLE_NUM_PREDICT: int = 15000
     LLAMACPP_ORACLE_MIN_NUM_PREDICT: int = 15000
