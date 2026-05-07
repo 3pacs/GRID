@@ -23,7 +23,7 @@ router = APIRouter(prefix="/api/v1/feed", tags=["feed"])
 
 
 @router.get("/signals")
-async def get_signal_feed(
+def get_signal_feed(
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     signal_type: str | None = None,
@@ -83,7 +83,7 @@ async def get_signal_feed(
 
 
 @router.get("/signals/latest")
-async def get_latest_signals(
+def get_latest_signals(
     hours: int = Query(24, ge=1, le=168),
     _auth=Depends(require_auth),
 ) -> dict[str, Any]:
@@ -131,7 +131,7 @@ async def get_latest_signals(
 
 
 @router.get("/rss", response_class=Response)
-async def get_rss_feed(
+def get_rss_feed(
     limit: int = Query(50, ge=1, le=200),
 ) -> Response:
     """RSS 2.0 feed of GRID signals — no auth required for feed readers."""
@@ -188,7 +188,7 @@ async def get_rss_feed(
 
 
 @router.get("/atom", response_class=Response)
-async def get_atom_feed(
+def get_atom_feed(
     limit: int = Query(50, ge=1, le=200),
 ) -> Response:
     """Atom feed of GRID signals — no auth required for feed readers."""
@@ -238,7 +238,7 @@ async def get_atom_feed(
 
 
 @router.get("/live")
-async def get_live_feed(
+def get_live_feed(
     limit: int = Query(60, ge=1, le=200),
     signal_type: str | None = None,
     entities: str | None = Query(None, description="Comma-separated entity names/tickers to filter by"),

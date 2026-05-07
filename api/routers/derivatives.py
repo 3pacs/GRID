@@ -34,7 +34,7 @@ def _get_gex_engine():
 # ── GET /overview ────────────────────────────────────────────────────
 
 @router.get("/overview")
-async def get_overview() -> dict[str, Any]:
+def get_overview() -> dict[str, Any]:
     """Market-wide dealer positioning summary.
 
     Calls DealerGammaEngine.get_market_gex_summary() for SPY and
@@ -253,7 +253,7 @@ async def get_vanna_charm(ticker: str) -> dict[str, Any]:
 # ── GET /vol-surface/{ticker} ───────────────────────────────────────
 
 @router.get("/vol-surface/{ticker}")
-async def get_vol_surface(ticker: str) -> dict[str, Any]:
+def get_vol_surface(ticker: str) -> dict[str, Any]:
     """Volatility surface data: IV grid by strike x expiry.
 
     Returns array of {strike, expiry, dte, iv, oi, volume, type} from
@@ -309,7 +309,7 @@ async def get_vol_surface(ticker: str) -> dict[str, Any]:
 # ── GET /skew/{ticker} ──────────────────────────────────────────────
 
 @router.get("/skew/{ticker}")
-async def get_skew(ticker: str) -> dict[str, Any]:
+def get_skew(ticker: str) -> dict[str, Any]:
     """Skew curves: IV at each strike for each expiry.
 
     Returns array of {expiry, dte, strikes: [{strike, call_iv, put_iv}]}.
@@ -374,7 +374,7 @@ async def get_skew(ticker: str) -> dict[str, Any]:
 # ── GET /term-structure/{ticker} ─────────────────────────────────────
 
 @router.get("/term-structure/{ticker}")
-async def get_term_structure(ticker: str) -> dict[str, Any]:
+def get_term_structure(ticker: str) -> dict[str, Any]:
     """ATM IV term structure across expiries.
 
     Returns [{expiry, dte, iv_atm, iv_25d_put, iv_25d_call}].
@@ -477,7 +477,7 @@ async def get_term_structure(ticker: str) -> dict[str, Any]:
 # ── GET /oi-heatmap/{ticker} ────────────────────────────────────────
 
 @router.get("/oi-heatmap/{ticker}")
-async def get_oi_heatmap(ticker: str) -> dict[str, Any]:
+def get_oi_heatmap(ticker: str) -> dict[str, Any]:
     """Open interest heatmap: OI by strike x expiry.
 
     Returns grid of [{strike, expiry, call_oi, put_oi, call_vol, put_vol}].
@@ -658,7 +658,7 @@ async def generate_flow_narrative() -> dict[str, Any]:
 # ── GET /signals ─────────────────────────────────────────────────────
 
 @router.get("/signals")
-async def get_signals(
+def get_signals(
     limit: int = Query(50, ge=1, le=500),
 ) -> dict[str, Any]:
     """Latest options daily signals for all tickers."""
@@ -852,7 +852,7 @@ def _generate_catalysts(start_date: date, end_date: date, ticker: str) -> list[d
 
 
 @router.get("/flow-timeline/{ticker}")
-async def get_flow_timeline(
+def get_flow_timeline(
     ticker: str,
     days: int = Query(90, ge=7, le=365),
 ) -> dict[str, Any]:
@@ -951,7 +951,7 @@ async def get_flow_timeline(
 # ── GET /history/{ticker} ───────────────────────────────────────────
 
 @router.get("/history/{ticker}")
-async def get_history(
+def get_history(
     ticker: str,
     days: int = Query(30, ge=1, le=365),
 ) -> dict[str, Any]:

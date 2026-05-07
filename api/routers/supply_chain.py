@@ -35,7 +35,7 @@ _supply_chain_cache: TTLCache = TTLCache(ttl=600.0, max_size=256)
 
 
 @router.get("/{actor_id}/supply_chain")
-async def get_supply_chain(
+def get_supply_chain(
     actor_id: str,
     direction: str = Query("both", pattern="^(upstream|downstream|both)$"),
     depth: int = Query(2, ge=1, le=5),

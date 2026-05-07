@@ -62,7 +62,7 @@ def _systemd_service_active(service_name: str) -> bool:
 
 
 @router.get("/health", response_model=HealthResponse)
-async def health() -> HealthResponse:
+def health() -> HealthResponse:
     """Health check — no auth required.
 
     Checks database connectivity, data freshness, connection pool,
@@ -182,7 +182,7 @@ async def health() -> HealthResponse:
 
 
 @router.get("/status", response_model=SystemStatusResponse)
-async def status(_token: str = Depends(require_auth)) -> SystemStatusResponse:
+def status(_token: str = Depends(require_auth)) -> SystemStatusResponse:
     """Comprehensive system status."""
     engine = get_db_engine()
 
@@ -346,7 +346,7 @@ async def status(_token: str = Depends(require_auth)) -> SystemStatusResponse:
 
 
 @router.get("/freshness", response_model=FreshnessResponse)
-async def freshness(_token: str = Depends(require_auth)) -> FreshnessResponse:
+def freshness(_token: str = Depends(require_auth)) -> FreshnessResponse:
     """Per-family data freshness report.
 
     GREEN = >80% fresh today, YELLOW = 50-80%, RED = <50%.
@@ -474,7 +474,7 @@ _SOURCE_SCHEDULE: dict[str, tuple[str, int]] = {
 
 
 @router.get("/pipeline-health", response_model=PipelineHealthResponse)
-async def pipeline_health(
+def pipeline_health(
     _token: str = Depends(require_auth),
 ) -> PipelineHealthResponse:
     """Comprehensive pipeline health view.
@@ -824,7 +824,7 @@ async def trigger_ux_audit(
 
 
 @router.get("/ux-audits")
-async def list_ux_audits(
+def list_ux_audits(
     limit: int = 10,
     _token: str = Depends(require_auth),
 ) -> list[dict]:
@@ -980,7 +980,7 @@ def _load_hermes_history(limit: int) -> dict:
 
 
 @router.get("/hermes-status", response_model=HermesStatusResponse)
-async def hermes_status(
+def hermes_status(
     limit: int = 20,
     _token: str = Depends(require_auth),
 ) -> HermesStatusResponse:
@@ -1202,7 +1202,7 @@ async def get_api_keys(
 
 
 @router.get("/services")
-async def get_services(
+def get_services(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Check status of all GRID services."""

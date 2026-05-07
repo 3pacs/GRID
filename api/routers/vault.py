@@ -67,7 +67,7 @@ def _now_utc() -> datetime:
 # ---------------------------------------------------------------------------
 
 @router.get("/notes")
-async def list_notes(
+def list_notes(
     domain: str | None = Query(default=None, description="Filter by domain"),
     status_filter: str | None = Query(default=None, alias="status", description="Filter by status"),
     limit: int = Query(default=20, ge=1, le=200),
@@ -110,7 +110,7 @@ async def list_notes(
 # ---------------------------------------------------------------------------
 
 @router.get("/notes/{note_id}")
-async def get_note(note_id: int) -> dict:
+def get_note(note_id: int) -> dict:
     """Return a single vault note by id."""
     engine = get_db_engine()
     with engine.connect() as conn:
@@ -130,7 +130,7 @@ async def get_note(note_id: int) -> dict:
 # ---------------------------------------------------------------------------
 
 @router.post("/notes", status_code=status.HTTP_201_CREATED)
-async def create_note(payload: dict) -> dict:
+def create_note(payload: dict) -> dict:
     """Create a new vault note. Sets pending_write agent flag so sync writes it to disk."""
     vault_path: str | None = payload.get("vault_path")
     if not vault_path:
@@ -188,7 +188,7 @@ async def create_note(payload: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 @router.patch("/notes/{note_id}/status")
-async def update_note_status(note_id: int, payload: dict) -> dict:
+def update_note_status(note_id: int, payload: dict) -> dict:
     """Change a note's status. Sets pending_write flag so sync writes the change to disk."""
     new_status: str | None = payload.get("status")
     if not new_status:
@@ -261,7 +261,7 @@ async def update_note_status(note_id: int, payload: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 @router.get("/search")
-async def search_notes(
+def search_notes(
     q: str = Query(description="Full-text search query"),
     domain: str | None = Query(default=None),
     limit: int = Query(default=20, ge=1, le=100),
@@ -318,7 +318,7 @@ async def search_notes(
 # ---------------------------------------------------------------------------
 
 @router.get("/actions")
-async def list_actions(
+def list_actions(
     note_id: int | None = Query(default=None, description="Filter by note id"),
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
@@ -353,7 +353,7 @@ async def list_actions(
 # ---------------------------------------------------------------------------
 
 @router.get("/dashboard")
-async def get_dashboard() -> dict:
+def get_dashboard() -> dict:
     """Return vault dashboard: review queue, status counts, domain breakdown, recent actions."""
     engine = get_db_engine()
     with engine.connect() as conn:

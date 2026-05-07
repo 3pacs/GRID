@@ -48,7 +48,7 @@ def _safe_iso(v: Any) -> str | None:
 
 
 @router.get("/trust-score")
-async def mcp_trust_score(
+def mcp_trust_score(
     actor: str = Query(..., description="Actor name or ID"),
     window_days: int = Query(default=90, ge=1, le=365),
     _token: str = Depends(require_auth),
@@ -87,7 +87,7 @@ async def mcp_trust_score(
 
 
 @router.get("/actor-profile")
-async def mcp_actor_profile(
+def mcp_actor_profile(
     name: str = Query(..., description="Actor name or ID"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -136,7 +136,7 @@ async def mcp_actor_profile(
 
 
 @router.get("/predictions")
-async def mcp_predictions(
+def mcp_predictions(
     symbol: str = Query(default="", description="Ticker symbol (empty = all)"),
     lookback_days: int = Query(default=14, ge=1, le=90),
     limit: int = Query(default=20, ge=1, le=100),
@@ -197,7 +197,7 @@ async def mcp_predictions(
 
 
 @router.get("/prediction-accuracy")
-async def mcp_prediction_accuracy(
+def mcp_prediction_accuracy(
     group_by: str = Query(default="model", description="model | ticker | direction"),
     lookback_days: int = Query(default=30, ge=1, le=365),
     _token: str = Depends(require_auth),
@@ -250,7 +250,7 @@ async def mcp_prediction_accuracy(
 
 
 @router.get("/data-freshness")
-async def mcp_data_freshness(
+def mcp_data_freshness(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Source staleness report — last pull time for each data source."""
@@ -300,7 +300,7 @@ async def mcp_data_freshness(
 
 
 @router.get("/signal-sources")
-async def mcp_signal_sources(
+def mcp_signal_sources(
     symbol: str = Query(default="", description="Ticker (empty = all recent)"),
     lookback_days: int = Query(default=14, ge=1, le=90),
     _token: str = Depends(require_auth),
@@ -351,7 +351,7 @@ async def mcp_signal_sources(
 
 
 @router.get("/wealth-flows")
-async def mcp_wealth_flows(
+def mcp_wealth_flows(
     actor: str = Query(default="", description="Actor name (empty = all recent)"),
     lookback_days: int = Query(default=30, ge=1, le=365),
     limit: int = Query(default=20, ge=1, le=100),
@@ -405,7 +405,7 @@ async def mcp_wealth_flows(
 
 
 @router.get("/regime")
-async def mcp_regime(
+def mcp_regime(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Current regime classification and recent history."""

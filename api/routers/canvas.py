@@ -840,7 +840,7 @@ class BoardUpdate(BaseModel):
 # ══════════════════════════════════════════════════════════════════════════
 
 @router.get("/graph")
-async def get_canvas_graph(
+def get_canvas_graph(
     center: str = Query(..., description="Actor ID or ticker symbol"),
     depth: int = Query(2, ge=1, le=7, description="BFS depth (1-7 hops)"),
     layers: str = Query("all", description="Comma-separated layers to include"),
@@ -1428,7 +1428,7 @@ async def _signal_detail(engine: Engine, signal_id: str) -> dict[str, Any]:
 # ══════════════════════════════════════════════════════════════════════════
 
 @router.get("/expand/{node_type}/{node_id}")
-async def expand_node(
+def expand_node(
     node_type: str,
     node_id: str,
     depth: int = Query(1, ge=1, le=6, description="Expansion depth"),
@@ -1571,7 +1571,7 @@ async def expand_node(
 # ══════════════════════════════════════════════════════════════════════════
 
 @router.post("/boards")
-async def create_board(
+def create_board(
     body: BoardCreate,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -1598,7 +1598,7 @@ async def create_board(
 
 
 @router.get("/boards")
-async def list_boards(
+def list_boards(
     _token: str = Depends(require_auth),
 ) -> list[dict[str, Any]]:
     """List all investigation boards."""
@@ -1630,7 +1630,7 @@ async def list_boards(
 
 
 @router.get("/boards/{board_id}")
-async def get_board(
+def get_board(
     board_id: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -1659,7 +1659,7 @@ async def get_board(
 
 
 @router.put("/boards/{board_id}")
-async def update_board(
+def update_board(
     board_id: str,
     body: BoardUpdate,
     _token: str = Depends(require_auth),
@@ -1724,7 +1724,7 @@ async def update_board(
 
 
 @router.delete("/boards/{board_id}")
-async def delete_board(
+def delete_board(
     board_id: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, str]:
@@ -1746,7 +1746,7 @@ async def delete_board(
 
 
 @router.post("/boards/{board_id}/fork")
-async def fork_board(
+def fork_board(
     board_id: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -1802,7 +1802,7 @@ async def fork_board(
 # ══════════════════════════════════════════════════════════════════════════
 
 @router.get("/dots")
-async def get_dot_connections(
+def get_dot_connections(
     center: str = Query(..., description="Actor ID, ticker symbol, or 'all'"),
     days: int = Query(30, ge=1, le=365, description="Lookback window"),
     _token: str = Depends(require_auth),

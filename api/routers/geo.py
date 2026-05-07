@@ -93,7 +93,7 @@ def _extract_geo(metadata: Any, name: str) -> dict[str, float] | None:
 
 
 @router.get("/flows")
-async def get_geo_flows(
+def get_geo_flows(
     flow_type: str = Query("capital", description="capital|commodity|military"),
     days: int = Query(90, ge=1, le=365),
     min_amount: float = Query(0, ge=0),
@@ -174,7 +174,7 @@ async def get_geo_flows(
 
 
 @router.get("/actors")
-async def get_geo_actors(
+def get_geo_actors(
     min_influence: float = Query(0, ge=0, le=1),
     category: str | None = None,
     limit: int = Query(200, ge=1, le=1000),
@@ -218,7 +218,7 @@ async def get_geo_actors(
 
 
 @router.get("/signals/density")
-async def get_signal_density(
+def get_signal_density(
     days: int = Query(30, ge=1, le=365),
     engine=Depends(get_db_engine),
     _=Depends(require_auth),

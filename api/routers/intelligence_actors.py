@@ -622,7 +622,7 @@ async def get_attention_alerts(
 # ── DB-Backed Actor Network (enhanced with ICIJ + LLM profiles) ──────
 
 @router.get("/actor-network/db")
-async def get_actor_network_db(
+def get_actor_network_db(
     limit: int = Query(200, ge=10, le=2000, description="Max actors to return"),
     min_degree: int = Query(2, ge=0, description="Minimum connections"),
     include_icij: bool = Query(False, description="Include ICIJ offshore matches"),
@@ -703,7 +703,7 @@ async def get_actor_network_db(
 
 
 @router.get("/actor/{actor_id}/profile")
-async def get_actor_enriched_profile(
+def get_actor_enriched_profile(
     actor_id: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -832,7 +832,7 @@ _RELATIONSHIP_COLORS = {
 
 
 @router.get("/power-map/{sector_name}")
-async def get_sector_power_map(
+def get_sector_power_map(
     sector_name: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -1096,7 +1096,7 @@ async def get_sector_power_map(
 
 
 @router.get("/ego-graph/search")
-async def ego_graph_search(
+def ego_graph_search(
     q: str = Query(..., min_length=1, description="Search query (name or ticker)"),
     limit: int = Query(20, ge=1, le=100),
     _token: str = Depends(require_auth),
@@ -1132,7 +1132,7 @@ async def ego_graph_search(
 
 
 @router.get("/ego-graph/{actor_id}")
-async def get_ego_graph(
+def get_ego_graph(
     actor_id: str,
     depth: int = Query(2, ge=1, le=3, description="Hop depth (1-3)"),
     max_nodes: int = Query(80, ge=10, le=300, description="Max nodes to return"),
@@ -1257,7 +1257,7 @@ async def get_ego_graph(
 
 
 @router.get("/grand-power-map")
-async def get_grand_power_map(
+def get_grand_power_map(
     limit: int = Query(50, ge=10, le=200, description="Max top actors"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:

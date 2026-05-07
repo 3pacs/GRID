@@ -23,7 +23,7 @@ router = APIRouter(tags=["intelligence"])
 
 
 @router.get("/causal-links")
-async def get_causal_links(
+def get_causal_links(
     ticker: str = Query(..., min_length=1, max_length=10, description="Ticker symbol"),
     days: int = Query(90, ge=1, le=730, description="Lookback window in days"),
     _token: str = Depends(require_auth),

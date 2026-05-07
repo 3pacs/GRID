@@ -26,7 +26,7 @@ _sector_narrative_cache: TTLCache = TTLCache(ttl=_SECTOR_NARRATIVE_TTL, max_size
 
 
 @router.get("/sectors")
-async def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
+def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
     """Return the full sector map with live z-scores for each actor's features."""
     cached = _sector_cache.get("sectors")
     if cached is not None:
@@ -224,7 +224,7 @@ async def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
 
 
 @router.get("/sectors/{sector_name}/detail")
-async def get_sector_detail(
+def get_sector_detail(
     sector_name: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -1338,7 +1338,7 @@ _sankey_cache: TTLCache = TTLCache(ttl=_SANKEY_CACHE_TTL, max_size=5)
 
 
 @router.get("/sankey")
-async def get_sankey_data(
+def get_sankey_data(
     as_of: str | None = None,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -1951,7 +1951,7 @@ async def get_flow_map_v2(_token: str = Depends(require_auth)) -> dict:
 
 
 @router.get("/junction-points")
-async def get_junction_points(_token: str = Depends(require_auth)) -> dict:
+def get_junction_points(_token: str = Depends(require_auth)) -> dict:
     """All junction points across 8 layers with current values."""
     from analysis.money_flow_engine import build_flow_map
 

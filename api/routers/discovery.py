@@ -153,7 +153,7 @@ async def get_clustering_results(
 
 
 @router.get("/hypotheses/results")
-async def get_hypothesis_results(
+def get_hypothesis_results(
     verdict: str | None = Query(default=None, description="Filter: PASSED, FAILED, TESTING"),
     sector: str | None = Query(default=None, description="Filter by sector/family"),
     min_correlation: float = Query(default=0.0, ge=0.0, le=1.0),
@@ -259,7 +259,7 @@ async def get_hypothesis_results(
 
 
 @router.get("/hypotheses")
-async def get_hypotheses(
+def get_hypotheses(
     state: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
@@ -356,7 +356,7 @@ async def run_hypothesis_review(
 
 
 @router.post("/hypotheses/{hypothesis_id}/promote")
-async def promote_hypothesis_to_feature(
+def promote_hypothesis_to_feature(
     hypothesis_id: int,
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -435,7 +435,7 @@ async def promote_hypothesis_to_feature(
 
 
 @router.get("/correlation-matrix")
-async def get_correlation_matrix(
+def get_correlation_matrix(
     period: int = Query(default=90, ge=30, le=1000, description="Lookback days"),
     regime: str = Query(default="all", description="Filter: all, GROWTH, FRAGILE, CRISIS"),
     _token: str = Depends(require_auth),
@@ -663,7 +663,7 @@ async def get_correlation_matrix(
 
 
 @router.get("/smart-heatmap")
-async def smart_heatmap(
+def smart_heatmap(
     family: str | None = Query(default=None, description="Filter by feature family (rates, macro, credit, etc.)"),
     orthogonal_only: bool = Query(default=True, description="Filter to orthogonal features only"),
     corr_threshold: float = Query(default=0.8, ge=0.5, le=1.0),

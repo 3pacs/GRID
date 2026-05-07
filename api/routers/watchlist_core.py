@@ -30,7 +30,7 @@ router = APIRouter(tags=["watchlist"])
 
 
 @router.get("/")
-async def list_watchlist(
+def list_watchlist(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     _token: str = Depends(require_auth),
@@ -64,7 +64,7 @@ async def list_watchlist(
 
 
 @router.post("/refresh-prices")
-async def refresh_watchlist_prices(
+def refresh_watchlist_prices(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Batch-fetch live prices for all watchlist tickers.
@@ -115,7 +115,7 @@ async def get_watchlist_prices(
 
 
 @router.get("/portfolio")
-async def get_portfolio(
+def get_portfolio(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Portfolio analytics view — watchlist as a portfolio with P&L, allocation, risk.
@@ -323,7 +323,7 @@ async def get_portfolio(
 
 
 @router.get("/enriched")
-async def list_watchlist_enriched(
+def list_watchlist_enriched(
     limit: int = Query(default=20, ge=1, le=50),
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -529,7 +529,7 @@ async def list_watchlist_enriched(
 
 
 @router.get("/search")
-async def search_tickers(
+def search_tickers(
     q: str = Query(default="", min_length=1, max_length=20),
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -652,7 +652,7 @@ async def search_tickers(
 
 
 @router.post("/", status_code=201)
-async def add_to_watchlist(
+def add_to_watchlist(
     body: WatchlistItemCreate,
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -696,7 +696,7 @@ async def add_to_watchlist(
 
 
 @router.get("/preload")
-async def preload_watchlist(
+def preload_watchlist(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Trigger background loading of analysis data for ALL watchlist tickers.
@@ -758,7 +758,7 @@ async def preload_watchlist(
 
 
 @router.delete("/{ticker}", status_code=200)
-async def remove_from_watchlist(
+def remove_from_watchlist(
     ticker: str,
     _token: str = Depends(require_auth),
 ) -> dict:

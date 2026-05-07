@@ -57,7 +57,7 @@ class OraclePublishRequest(BaseModel):
 # ── GET /predictions ───────────────────────────────────────────────────────
 
 @router.get("/predictions")
-async def get_predictions(
+def get_predictions(
     ticker: str | None = Query(None, description="Filter by ticker"),
     model: str | None = Query(None, description="Filter by model name"),
     status: str | None = Query(None, description="active / expired / scored"),
@@ -182,7 +182,7 @@ async def get_scoreboard(
 # ── GET /latest ────────────────────────────────────────────────────────────
 
 @router.get("/latest")
-async def get_latest(
+def get_latest(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Most recent prediction cycle results — headline predictions."""
@@ -352,7 +352,7 @@ async def trigger_evolve(
 # ── GET /scorecard ────────────────────────────────────────────────────
 
 @router.get("/scorecard")
-async def get_scorecard(
+def get_scorecard(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Per-model performance stats: hits, misses, hit_rate, cumulative_pnl."""

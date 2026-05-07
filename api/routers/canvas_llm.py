@@ -244,7 +244,7 @@ def _call_llm(source: dict, target: dict, context: dict) -> ExplainResponse:
 
 
 @router.post("/explain", response_model=ExplainResponse)
-async def explain_connection(
+def explain_connection(
     req: ExplainRequest,
     engine=Depends(get_db_engine),
     _=Depends(require_auth),

@@ -94,7 +94,7 @@ async def analyze_forensic_move(
 
 
 @router.get("/causation")
-async def get_causation(
+def get_causation(
     ticker: str | None = Query(None, description="Filter by ticker"),
     days: int = Query(30, ge=1, le=365, description="Look-back window in days"),
     _token: str = Depends(require_auth),

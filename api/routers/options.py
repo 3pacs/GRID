@@ -269,7 +269,7 @@ async def refresh_recommendations(
 
 
 @router.get("/recommendations/history")
-async def get_recommendation_history(
+def get_recommendation_history(
     ticker: str | None = Query(None, description="Filter by ticker"),
     outcome: str | None = Query(None, description="Filter by outcome (WIN/LOSS/EXPIRED/OPEN)"),
     limit: int = Query(50, ge=1, le=500),
@@ -341,7 +341,7 @@ async def get_recommendation_history(
 
 
 @router.get("/signals")
-async def get_options_signals(
+def get_options_signals(
     ticker: str | None = Query(None, description="Filter by ticker"),
     limit: int = Query(50, ge=1, le=500),
     _token: str = Depends(require_auth),
@@ -473,7 +473,7 @@ async def get_100x_opportunities(
 
 
 @router.get("/history")
-async def get_scan_history(
+def get_scan_history(
     ticker: str | None = Query(None),
     days: int = Query(30, ge=1, le=365),
     only_100x: bool = Query(False),

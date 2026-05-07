@@ -19,7 +19,7 @@ router = APIRouter(tags=["watchlist"])
 
 
 @router.get("/{ticker}/overview")
-async def get_ticker_overview(
+def get_ticker_overview(
     ticker: str,
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -371,7 +371,7 @@ async def get_ticker_overview(
 # ══════════════════════════════════════════════════════════════════
 
 @router.get("/{ticker}/edge")
-async def get_ticker_edge(
+def get_ticker_edge(
     ticker: str,
     user: dict = Depends(require_auth),
     engine=Depends(get_db_engine),

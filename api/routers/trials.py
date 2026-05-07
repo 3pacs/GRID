@@ -25,7 +25,7 @@ def _row_to_dict(row: Any) -> dict:
 
 
 @router.get("/gems")
-async def get_gems(_token: str = Depends(require_auth)) -> dict:
+def get_gems(_token: str = Depends(require_auth)) -> dict:
     """Return active BUY signals from the trial_gems view."""
     try:
         engine = get_db_engine()
@@ -38,7 +38,7 @@ async def get_gems(_token: str = Depends(require_auth)) -> dict:
 
 
 @router.get("/signals")
-async def get_signals(
+def get_signals(
     _token: str = Depends(require_auth),
     signal_type: str | None = Query(None, description="Filter by signal type: BUY, WATCHLIST, AVOID"),
     limit: int = Query(50, ge=1, le=200, description="Max rows to return"),
@@ -83,7 +83,7 @@ async def get_signals(
 
 
 @router.get("/catalysts")
-async def get_catalysts(_token: str = Depends(require_auth)) -> dict:
+def get_catalysts(_token: str = Depends(require_auth)) -> dict:
     """Return upcoming catalyst events from the upcoming_catalysts view."""
     try:
         engine = get_db_engine()
@@ -98,7 +98,7 @@ async def get_catalysts(_token: str = Depends(require_auth)) -> dict:
 
 
 @router.get("/sponsors")
-async def get_sponsors(_token: str = Depends(require_auth)) -> dict:
+def get_sponsors(_token: str = Depends(require_auth)) -> dict:
     """Return actors categorized as trial sponsors, ordered by influence."""
     try:
         engine = get_db_engine()
@@ -126,7 +126,7 @@ async def get_sponsors(_token: str = Depends(require_auth)) -> dict:
 
 
 @router.get("/stats")
-async def get_stats(_token: str = Depends(require_auth)) -> dict:
+def get_stats(_token: str = Depends(require_auth)) -> dict:
     """Return summary statistics for trial signals."""
     try:
         engine = get_db_engine()

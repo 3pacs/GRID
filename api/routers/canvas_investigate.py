@@ -46,7 +46,7 @@ class InvestigateResponse(BaseModel):
 
 
 @router.post("/investigate")
-async def auto_investigate(
+def auto_investigate(
     req: InvestigateRequest,
     engine=Depends(get_db_engine),
     _=Depends(require_auth),

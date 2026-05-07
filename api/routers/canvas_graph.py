@@ -113,7 +113,7 @@ def _ensure_board_exists(conn: Connection, board_id: str) -> None:
 # ── Node endpoints ───────────────────────────────────────────────────────
 
 @router.post("/boards/{board_id}/nodes", status_code=201)
-async def add_node(
+def add_node(
     board_id: str,
     body: NodeCreate,
     _token: str = Depends(require_auth),
@@ -146,7 +146,7 @@ async def add_node(
 
 
 @router.put("/boards/{board_id}/nodes/{node_id}")
-async def update_node(
+def update_node(
     board_id: str,
     node_id: str,
     body: NodeUpdate,
@@ -183,7 +183,7 @@ async def update_node(
 
 
 @router.delete("/boards/{board_id}/nodes/{node_id}")
-async def delete_node(
+def delete_node(
     board_id: str,
     node_id: str,
     _token: str = Depends(require_auth),
@@ -215,7 +215,7 @@ async def delete_node(
 # ── Edge endpoints ───────────────────────────────────────────────────────
 
 @router.post("/boards/{board_id}/edges", status_code=201)
-async def add_edge(
+def add_edge(
     board_id: str,
     body: EdgeCreate,
     _token: str = Depends(require_auth),
@@ -248,7 +248,7 @@ async def add_edge(
 
 
 @router.delete("/boards/{board_id}/edges/{edge_id}")
-async def delete_edge(
+def delete_edge(
     board_id: str,
     edge_id: str,
     _token: str = Depends(require_auth),
@@ -279,7 +279,7 @@ async def delete_edge(
 # ── Bulk graph save ──────────────────────────────────────────────────────
 
 @router.put("/boards/{board_id}/graph")
-async def bulk_save_graph(
+def bulk_save_graph(
     board_id: str,
     body: BulkGraphSave,
     _token: str = Depends(require_auth),
@@ -336,7 +336,7 @@ async def bulk_save_graph(
 
 
 @router.post("/boards/{board_id}/nodes/{node_id}/evidence", status_code=201)
-async def add_evidence(
+def add_evidence(
     board_id: str,
     node_id: str,
     body: EvidenceCreate,
@@ -405,7 +405,7 @@ async def add_evidence(
 
 
 @router.get("/boards/{board_id}/nodes/{node_id}/evidence")
-async def get_node_evidence(
+def get_node_evidence(
     board_id: str,
     node_id: str,
     _token: str = Depends(require_auth),
@@ -431,7 +431,7 @@ async def get_node_evidence(
 
 
 @router.delete("/boards/{board_id}/evidence/{evidence_id}")
-async def delete_evidence(
+def delete_evidence(
     board_id: str,
     evidence_id: str,
     _token: str = Depends(require_auth),

@@ -38,7 +38,7 @@ async def get_signals(_token: str = Depends(require_auth)) -> dict:
 
 
 @router.get("/snapshot")
-async def get_snapshot(_token: str = Depends(require_auth)) -> dict:
+def get_snapshot(_token: str = Depends(require_auth)) -> dict:
     """Return current feature snapshot with z-scores."""
     try:
         from inference.live import LiveInference
@@ -101,7 +101,7 @@ async def get_snapshot(_token: str = Depends(require_auth)) -> dict:
 
 
 @router.get("/crucix")
-async def crucix_signals(
+def crucix_signals(
     _token: str = Depends(require_auth),
     engine: Engine = Depends(get_db_engine),
 ) -> dict:
@@ -141,7 +141,7 @@ async def crucix_signals(
 
 
 @router.get("/timeseries")
-async def get_timeseries(
+def get_timeseries(
     features: str = Query(..., description="Comma-separated feature names"),
     days: int = Query(default=30, ge=7, le=252),
     _token: str = Depends(require_auth),
@@ -263,7 +263,7 @@ def _conviction_report_to_dict(report) -> dict:
 
 
 @router.get("/timeframes")
-async def get_timeframes(
+def get_timeframes(
     feature: str = Query(..., description="Feature name to compare across timeframes"),
     periods: str = Query(default="5d,5w,3m,1y,5y", description="Comma-separated periods"),
     _token: str = Depends(require_auth),

@@ -216,7 +216,7 @@ def _circular_positions(
 # ── Expand endpoint ──────────────────────────────────────────────────────
 
 @router.post("/boards/{board_id}/expand/{node_id}")
-async def expand_node(
+def expand_node(
     board_id: str,
     node_id: str,
     depth: int = Query(1, ge=1, le=6),
@@ -953,7 +953,7 @@ async def expand_node(
 # ── Shortest path endpoint ──────────────────────────────────────────────
 
 @router.post("/boards/{board_id}/path")
-async def find_path(
+def find_path(
     board_id: str,
     body: PathRequest,
     _token: str = Depends(require_auth),
@@ -1037,7 +1037,7 @@ async def find_path(
 # ── Suggest connections endpoint ─────────────────────────────────────────
 
 @router.post("/boards/{board_id}/suggest-connections")
-async def suggest_connections(
+def suggest_connections(
     board_id: str,
     _token: str = Depends(require_auth),
 ) -> dict:

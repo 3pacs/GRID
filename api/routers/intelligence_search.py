@@ -25,7 +25,7 @@ _VALID_TYPES = frozenset({"actor", "signal", "hypothesis", "snapshot"})
 
 
 @router.get("/intelligence")
-async def search_intelligence(
+def search_intelligence(
     q: str = Query(..., min_length=1, max_length=500, description="Search query"),
     types: str | None = Query(
         default=None,
@@ -132,7 +132,7 @@ async def search_intelligence(
 
 
 @router.post("/intelligence/refresh")
-async def refresh_intelligence_search(
+def refresh_intelligence_search(
     _user: dict = Depends(require_auth),
 ) -> dict:
     """Refresh the intelligence_search materialized view.

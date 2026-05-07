@@ -304,7 +304,7 @@ async def get_correlation_matrix(
 
 
 @router.get("/lag-analysis")
-async def get_lag_analysis(
+def get_lag_analysis(
     feature_a: str = Query(..., description="Name of first feature"),
     feature_b: str = Query(..., description="Name of second feature"),
     max_lag: int = Query(default=10, ge=1, le=60),
@@ -475,7 +475,7 @@ async def get_clusters(
 
 
 @router.get("/regime-features")
-async def get_regime_features(
+def get_regime_features(
     days: int = Query(default=504, ge=60, le=2000),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:

@@ -26,7 +26,7 @@ def _model_row_to_dict(row: Any) -> dict:
 
 
 @router.get("")
-async def get_all(
+def get_all(
     layer: str | None = Query(default=None),
     state: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
@@ -89,7 +89,7 @@ async def get_production(
 
 
 @router.get("/{model_id}")
-async def get_one(
+def get_one(
     model_id: int,
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -186,7 +186,7 @@ async def rollback_model(
 
 
 @router.post("/from-hypothesis/{hypothesis_id}")
-async def create_from_hypothesis(
+def create_from_hypothesis(
     hypothesis_id: int,
     body: ModelFromHypothesisRequest | None = None,
     _token: str = Depends(require_auth),

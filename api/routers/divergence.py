@@ -54,7 +54,7 @@ def _row_to_dict(row: Any) -> dict[str, Any]:
 
 
 @router.get("/divergence/{classification}")
-async def list_divergence(
+def list_divergence(
     classification: str,
     limit: int = Query(20, ge=1, le=200),
     _token: str = Depends(require_auth),
@@ -131,7 +131,7 @@ async def list_divergence(
 
 
 @router.get("/actors/{actor_id}/divergence")
-async def get_actor_divergence(
+def get_actor_divergence(
     actor_id: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:

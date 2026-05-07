@@ -13,7 +13,7 @@ router = APIRouter(prefix="/api/v1/model-comparison", tags=["model-comparison"])
 
 
 @router.get("/shadow-vs-production")
-async def shadow_vs_production(
+def shadow_vs_production(
     layer: str = Query(default="REGIME"),
     days_back: int = Query(default=30, ge=1, le=365),
     _token: str = Depends(require_auth),
@@ -74,7 +74,7 @@ async def drift_report(
 
 
 @router.get("/metrics")
-async def metrics_comparison(
+def metrics_comparison(
     model_ids: str = Query(description="Comma-separated model IDs"),
     _token: str = Depends(require_auth),
 ) -> dict:

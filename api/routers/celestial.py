@@ -48,7 +48,7 @@ def _categorize_feature(name: str) -> str | None:
 
 
 @router.get("")
-async def get_celestial_signals(
+def get_celestial_signals(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Return current celestial feature values from the PIT store.

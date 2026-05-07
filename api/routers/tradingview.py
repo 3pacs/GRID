@@ -182,7 +182,7 @@ async def receive_webhook(
 # ── Query recent signals ────────────────────────────────────────
 
 @router.get("/signals")
-async def get_signals(
+def get_signals(
     limit: int = 50,
     ticker: str | None = None,
     _token: str = Depends(require_auth),

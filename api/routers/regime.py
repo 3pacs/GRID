@@ -31,7 +31,7 @@ class WeightUpdateRequest(BaseModel):
 
 
 @router.get("/weights")
-async def get_weights(_token: str = Depends(require_auth)) -> dict:
+def get_weights(_token: str = Depends(require_auth)) -> dict:
     """Return current FEATURE_WEIGHTS and latest stress index."""
     from scripts.auto_regime import DEFAULT_FEATURE_WEIGHTS, FEATURE_WEIGHTS, WEIGHTS_OVERRIDE_PATH
 
@@ -116,7 +116,7 @@ async def simulate_weights(
 
 
 @router.get("/current", response_model=RegimeCurrentResponse)
-async def get_current(_token: str = Depends(require_auth)) -> RegimeCurrentResponse:
+def get_current(_token: str = Depends(require_auth)) -> RegimeCurrentResponse:
     """Return current inferred regime state."""
     engine = get_db_engine()
 
@@ -184,7 +184,7 @@ async def get_current(_token: str = Depends(require_auth)) -> RegimeCurrentRespo
 
 
 @router.get("/all-active")
-async def get_all_active(_token: str = Depends(require_auth)) -> dict:
+def get_all_active(_token: str = Depends(require_auth)) -> dict:
     """Return all active regime states with their latest readings."""
     engine = get_db_engine()
 
@@ -283,7 +283,7 @@ async def get_all_active(_token: str = Depends(require_auth)) -> dict:
 
 
 @router.get("/synthesis")
-async def get_synthesis(_token: str = Depends(require_auth)) -> dict:
+def get_synthesis(_token: str = Depends(require_auth)) -> dict:
     """LLM-powered regime synthesis — interprets combined signals."""
     engine = get_db_engine()
 
@@ -384,7 +384,7 @@ Be direct, specific, and actionable. No hedging or disclaimers. Reference the ac
 
 
 @router.get("/history", response_model=RegimeHistoryResponse)
-async def get_history(
+def get_history(
     days: int = Query(default=90, ge=1, le=365),
     _token: str = Depends(require_auth),
 ) -> RegimeHistoryResponse:
@@ -416,7 +416,7 @@ async def get_history(
 
 
 @router.get("/transitions", response_model=RegimeTransitionsResponse)
-async def get_transitions(
+def get_transitions(
     _token: str = Depends(require_auth),
 ) -> RegimeTransitionsResponse:
     """Return all detected regime transitions."""

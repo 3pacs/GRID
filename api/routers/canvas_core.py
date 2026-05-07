@@ -42,7 +42,7 @@ def _row_to_dict(row: Any) -> dict:
 # ── Endpoints ────────────────────────────────────────────────────────────
 
 @router.get("/boards")
-async def list_boards(
+def list_boards(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     _token: str = Depends(require_auth),
@@ -75,7 +75,7 @@ async def list_boards(
 
 
 @router.post("/boards", status_code=201)
-async def create_board(
+def create_board(
     body: BoardCreate,
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -273,7 +273,7 @@ def _auto_seed_board(engine, board_id: int, query: str) -> None:
 
 
 @router.get("/boards/{board_id}")
-async def get_board(
+def get_board(
     board_id: str,
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -317,7 +317,7 @@ async def get_board(
 
 
 @router.put("/boards/{board_id}")
-async def update_board(
+def update_board(
     board_id: str,
     body: BoardUpdate,
     _token: str = Depends(require_auth),
@@ -370,7 +370,7 @@ async def update_board(
 
 
 @router.delete("/boards/{board_id}")
-async def delete_board(
+def delete_board(
     board_id: str,
     _token: str = Depends(require_auth),
 ) -> dict:

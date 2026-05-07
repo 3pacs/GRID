@@ -123,7 +123,7 @@ async def close_trade(
 
 
 @router.get("/strategies")
-async def list_strategies(_token: str = Depends(require_auth)) -> dict:
+def list_strategies(_token: str = Depends(require_auth)) -> dict:
     """List all paper strategies with live P&L, open positions, and display names."""
     from datetime import date as _date, datetime as _dt
     from analysis.backtest_scanner import _display_name
@@ -165,7 +165,7 @@ async def list_strategies(_token: str = Depends(require_auth)) -> dict:
 
 
 @router.get("/strategies/{strategy_id}/history")
-async def strategy_trade_history(
+def strategy_trade_history(
     strategy_id: str,
     limit: int = Query(default=100, ge=1, le=500),
     _token: str = Depends(require_auth),
@@ -249,7 +249,7 @@ async def execute_signals_now(_token: str = Depends(require_auth)) -> dict:
 
 
 @router.post("/strategies/{strategy_id}/kill")
-async def kill_strategy(
+def kill_strategy(
     strategy_id: str,
     _token: str = Depends(require_auth),
 ) -> dict:

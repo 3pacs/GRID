@@ -75,7 +75,7 @@ async def update_config(
 
 
 @router.get("/sources")
-async def get_sources(
+def get_sources(
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     _token: str = Depends(require_auth),
@@ -100,7 +100,7 @@ async def get_sources(
 
 
 @router.put("/sources/{source_id}")
-async def update_source(
+def update_source(
     source_id: int,
     body: dict[str, Any],
     _token: str = Depends(require_role("admin")),
@@ -128,7 +128,7 @@ async def update_source(
 
 
 @router.get("/features")
-async def get_features(
+def get_features(
     limit: int = Query(default=200, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     _token: str = Depends(require_auth),
@@ -153,7 +153,7 @@ async def get_features(
 
 
 @router.put("/features/{feature_id}")
-async def update_feature(
+def update_feature(
     feature_id: int,
     body: dict[str, Any],
     _token: str = Depends(require_role("admin")),

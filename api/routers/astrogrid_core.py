@@ -252,7 +252,7 @@ async def get_snapshot(
 
 
 @router.get("/scorecard")
-async def get_scorecard(
+def get_scorecard(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Hybrid AstroGrid market scorecard using existing GRID read paths."""
@@ -339,7 +339,7 @@ async def get_scorecard(
 
 
 @router.get("/universe")
-async def get_scoreable_universe(
+def get_scoreable_universe(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Return the canonical AstroGrid scoreable-universe contract."""

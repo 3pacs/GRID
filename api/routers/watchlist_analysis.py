@@ -55,7 +55,7 @@ def _build_watchlist_item(ticker_upper: str, item: Any) -> tuple[dict[str, Any],
 
 
 @router.get("/{ticker}/analysis")
-async def get_ticker_analysis(
+def get_ticker_analysis(
     ticker: str,
     period: str = Query(default="3M", pattern=r"^(1W|1M|3M|6M|1Y)$"),
     _token: str = Depends(require_auth),

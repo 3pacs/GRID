@@ -40,7 +40,7 @@ router = APIRouter(tags=["astrogrid"])
 
 
 @router.get("/ephemeris")
-async def get_ephemeris(
+def get_ephemeris(
     date_str: str = Query(alias="date", default=None, description="YYYY-MM-DD"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -170,7 +170,7 @@ async def get_correlations(
 
 
 @router.get("/timeline")
-async def get_timeline(
+def get_timeline(
     start: str = Query(default=None, description="YYYY-MM-DD"),
     end: str = Query(default=None, description="YYYY-MM-DD"),
     types: str = Query(
@@ -282,7 +282,7 @@ async def get_timeline(
 
 
 @router.get("/briefing")
-async def get_briefing(
+def get_briefing(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Latest celestial narrative briefing."""
@@ -449,7 +449,7 @@ async def get_retrogrades(
 
 
 @router.get("/eclipses")
-async def get_eclipses(
+def get_eclipses(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Eclipse calendar with optional market impact data."""
@@ -532,7 +532,7 @@ async def get_eclipses(
 
 
 @router.get("/nakshatra")
-async def get_nakshatra(
+def get_nakshatra(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Current nakshatra with market stats if available."""

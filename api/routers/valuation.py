@@ -287,7 +287,7 @@ async def derivatives_support(ticker: str) -> dict[str, Any]:
 # ── GET /catalyst-timeline/{ticker} ──────────────────────────────────
 
 @router.get("/catalyst-timeline/{ticker}")
-async def catalyst_timeline(
+def catalyst_timeline(
     ticker: str,
     months_forward: int = Query(default=12, ge=1, le=36),
     months_back: int = Query(default=6, ge=0, le=24),

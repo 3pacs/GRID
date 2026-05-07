@@ -142,7 +142,7 @@ def _identify_valve(category: str, action: str, tickers: list[str]) -> str:
 # ── 1. Search ─────────────────────────────────────────────────────────────
 
 @router.get("/search")
-async def intel_search(
+def intel_search(
     q: str = Query(..., min_length=1, max_length=200, description="Search query"),
     type: str = Query("all", description="entity | actor | ticker | all"),
     limit: int = Query(25, ge=1, le=100),
@@ -260,7 +260,7 @@ async def intel_search(
 # ── 2. Entity Profile ────────────────────────────────────────────────────
 
 @router.get("/entity/{name:path}")
-async def intel_entity_profile(
+def intel_entity_profile(
     name: str = Path(..., description="Entity name"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -366,7 +366,7 @@ async def intel_entity_profile(
 # ── 3. Actor Dossier ─────────────────────────────────────────────────────
 
 @router.get("/actor/{name:path}")
-async def intel_actor_dossier(
+def intel_actor_dossier(
     name: str = Path(..., description="Actor name or ID"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -509,7 +509,7 @@ async def intel_actor_dossier(
 # ── 4. Ticker Intelligence ───────────────────────────────────────────────
 
 @router.get("/ticker/{symbol}")
-async def intel_ticker(
+def intel_ticker(
     symbol: str = Path(..., description="Ticker symbol"),
     days: int = Query(30, ge=1, le=365, description="Lookback window"),
     _token: str = Depends(require_auth),
@@ -938,7 +938,7 @@ async def intel_deep_dive(
 # ── 7. Network Graph Traversal ───────────────────────────────────────────
 
 @router.get("/network/{entity:path}")
-async def intel_network(
+def intel_network(
     entity: str = Path(..., description="Entity or actor name"),
     depth: int = Query(2, ge=1, le=5, description="Hop depth (1-5)"),
     _token: str = Depends(require_auth),
@@ -1115,7 +1115,7 @@ async def intel_network(
 # ── 8. Market Brief ──────────────────────────────────────────────────────
 
 @router.get("/market-brief")
-async def intel_market_brief(
+def intel_market_brief(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Current market summary: regime, top signals, active predictions,
@@ -1278,7 +1278,7 @@ async def intel_market_brief(
 # ── 9. Active Predictions ────────────────────────────────────────────────
 
 @router.get("/predictions/active")
-async def intel_predictions_active(
+def intel_predictions_active(
     ticker: str | None = Query(None, description="Filter by ticker"),
     model: str | None = Query(None, description="Filter by model"),
     limit: int = Query(50, ge=1, le=200),
@@ -1392,7 +1392,7 @@ async def intel_predictions_active(
 # ── 10. Track Record — Proof We're Worth Paying For ──────────────────────
 
 @router.get("/predictions/track-record")
-async def intel_predictions_track_record(
+def intel_predictions_track_record(
     model: str | None = Query(None, description="Filter by model"),
     ticker: str | None = Query(None, description="Filter by ticker"),
     timeframe: str | None = Query(
@@ -1647,7 +1647,7 @@ async def intel_predictions_track_record(
 # ── 11. BRIEFING — the front door ───────────────────────────────────────
 
 @router.get("/briefing")
-async def intel_briefing(
+def intel_briefing(
     since: str | None = Query(
         None,
         description="ISO timestamp — only return signals newer than this (delta mode)",

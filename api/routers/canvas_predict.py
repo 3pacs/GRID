@@ -69,7 +69,7 @@ def _clamp_confidence(val: float) -> float:
 
 
 @router.post("/predict")
-async def create_prediction(
+def create_prediction(
     req: PredictionRequest,
     _token: str = Depends(require_auth),
 ) -> PredictionResponse:

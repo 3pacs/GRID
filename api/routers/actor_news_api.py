@@ -65,7 +65,7 @@ def _column_set(conn: Any, table_name: str) -> set[str]:
 
 
 @router.get("/{actor_id}/news")
-async def get_actor_news(
+def get_actor_news(
     actor_id: str,
     limit: int = Query(20, ge=1, le=200),
     _token: str = Depends(require_auth),

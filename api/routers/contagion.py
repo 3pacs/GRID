@@ -320,7 +320,7 @@ async def simulate(
 
 
 @router.get("/backtest")
-async def backtest(
+def backtest(
     days: int = Query(90, ge=1, le=365),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
