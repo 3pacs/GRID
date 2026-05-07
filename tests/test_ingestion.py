@@ -126,6 +126,23 @@ class TestFREDPuller:
         assert "API Error" in result["errors"][0]
 
     @patch("ingestion.fred.FredAPI")
+    def test_fred_empty_observations_key_error_is_partial(self, mock_fred_class):
+        """fedfred raises KeyError('date') for empty observation windows."""
+        mock_engine, _mock_conn, execute_calls = _make_raw_series_engine()
+        mock_fred_class.return_value.get_series_observations.side_effect = KeyError(
+            "date"
+        )
+
+        from ingestion.fred import FREDPuller
+
+        puller = FREDPuller(api_key="test_key", db_engine=mock_engine)
+        result = puller.pull_series("GFDEBTN", "2026-05-01", "2026-05-07")
+
+        assert result["status"] == "PARTIAL"
+        assert result["errors"] == ["No data returned"]
+        assert not any("INSERT INTO raw_series" in sql for sql, _ in execute_calls)
+
+    @patch("ingestion.fred.FredAPI")
     def test_fred_permanent_http_error_is_soft_skipped(self, mock_fred_class):
         """Unavailable FRED series should not create fake FAILED rows."""
         mock_engine = MagicMock()
@@ -337,6 +354,34 @@ class TestAltDataPullers:
         puller._api_key = "test"
 
         result = puller._fetch_fred_series("H8B1023NCBCMG", date(2026, 1, 1), date(2026, 1, 2))
+
+        assert list(result.columns) == ["date", "value"]
+        assert result.empty
+
+    def test_fed_liquidity_empty_observations_key_error_returns_empty_frame(
+        self, monkeypatch
+    ):
+        import sys
+
+        from ingestion.altdata.fed_liquidity import FedLiquidityPuller
+
+        class _FakeFred:
+            def __init__(self, _api_key):
+                pass
+
+            def get_series_observations(self, *_args, **_kwargs):
+                raise KeyError("date")
+
+        monkeypatch.setitem(sys.modules, "fedfred", SimpleNamespace(FredAPI=_FakeFred))
+
+        puller = FedLiquidityPuller.__new__(FedLiquidityPuller)
+        puller._api_key = "test"
+
+        result = puller._fetch_fred_series(
+            "TOTRESNS",
+            date(2026, 1, 1),
+            date(2026, 1, 2),
+        )
 
         assert list(result.columns) == ["date", "value"]
         assert result.empty
