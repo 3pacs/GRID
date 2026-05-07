@@ -167,7 +167,7 @@ The codebase is architecturally sound (grade B, clean 8-layer separation, no cir
 
 1. **Now**: Fix SQL injections (6 locations) + NaN bug + schema mismatch = 3-4 hours
 2. **Today**: Add DB indexes + increase pool size + fix pagination = 1 hour
-3. **This week**: Security hardening (WebSocket, headers, rate limiting, secrets) = 2-3 days
+3. **This week**: [[Security]] hardening (WebSocket, headers, rate limiting, secrets) = 2-3 days
 4. **Next sprint**: Test coverage for 8 critical modules = 2-3 weeks
 5. **Following sprint**: Performance optimization + refactoring = 3-4 weeks
 

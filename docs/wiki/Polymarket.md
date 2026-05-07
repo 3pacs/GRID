@@ -19,6 +19,9 @@ Polymarket prediction market — rapid probability shift detection.
 
 - [[CLAUDE]]
 - [[MODULE_CATALOG]]
+- [[MODULE_INVENTORY]]
+- [[Trading-Layer]]
 - [[GSD-OPTIONS-EDGE]]
 - [[NEXT-AGENT-INSTRUCTIONS]]
 - [[ROADMAP]]
+- [[SESSION-ROADMAP-2026-04-13]]

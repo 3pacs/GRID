@@ -18,3 +18,4 @@ FEC campaign contributions and PAC spending mapped to policy outcomes.
 ## Referenced By
 
 - [[MODULE_CATALOG]]
+- [[MODULE_INVENTORY]]

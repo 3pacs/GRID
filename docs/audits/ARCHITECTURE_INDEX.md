@@ -34,7 +34,7 @@ This directory now contains three comprehensive [[architecture]] documents produ
 - Section 3: Scalability bottlenecks (where it breaks at scale)
 - Section 5: Top 5 risks ranked by severity (what to fix first)
 - Section 6: Recommended ADRs (structural improvements)
-- Section 7: Security assessment (compliance readiness)
+- Section 7: [[Security]] assessment (compliance readiness)
 
 **Start here if:** You need to make architectural decisions or understand system limits.
 

@@ -7,7 +7,7 @@
 - Repaired the Trial Gems ticker link from `#/watchlist-analysis?ticker=...` to `#/watchlist/...`.
 - Repaired [[Cross Reference]] ticker chips to open the watchlist analysis child route.
 - Stopped unknown module IDs from silently rendering Canvas. Unknown routes now show an explicit module-missing state.
-- Passed `onNavigate` to routed views consistently so module-level links such as Risk Map -> Cross Reference are live instead of no-ops.
+- Passed `onNavigate` to routed views consistently so module-level links such as Risk Map -> [[Cross Reference]] are live instead of no-ops.
 - Wired the `intelligence-search` drawer item to a routed search view instead of sending users to Canvas under the wrong label.
 - Emitted a `grid:auth-expired` event on API 401 responses so the app store can leave authenticated mode cleanly.
 

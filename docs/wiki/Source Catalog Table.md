@@ -15,5 +15,7 @@ Registry of all external data sources with trust scores, cost tiers, and priorit
 
 - [[CLAUDE]]
 - [[REFACTOR_REPORT]]
+- [[data_pipeline_audit]]
+- [[Planning-Docs]]
 - [[REQUIREMENTS]]
 - [[ARCHITECTURE]]

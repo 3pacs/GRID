@@ -38,7 +38,7 @@ For API-only files, use `--restart --smoke` when practical.
   - `ingestion/fred.py` now normalizes fedfred frames by preferring the observation-date index over realtime-vintage `date` columns. This fixed fresh `H8B1023NCBCMG` and `TOTRESNS` `{'error': "'date'"}` failures.
   - [[FRED]] retry wrappers that only expose `HTTPStatusError` in their string/repr now soft-skip instead of writing `FAILED` rows.
   - `ingestion/international/ecb.py` moved from retired `sdw-wsrest.ecb.europa.eu` to `data-api.ecb.europa.eu`, requests `format=jsondata`, and soft-skips transient [[ECB]] upstream failures.
-  - ECB scheduled keys were updated to current portal keys for M3, NFC loan growth, German sovereign yield proxy, and Italian sovereign yield proxy.
+  - [[ECB]] scheduled keys were updated to current portal keys for M3, NFC loan growth, German sovereign yield proxy, and Italian sovereign yield proxy.
   - Production smoke at `2026-04-18 03:52 UTC`: all 6 ECB scheduled series returned `SUCCESS`; fresh `FAILED` scan since `2026-04-18 03:52 UTC` returned 0 rows.
 
 - `ingestion/smart_scheduler.py`
@@ -56,7 +56,7 @@ For API-only files, use `--restart --smoke` when practical.
   - Public upstream 429/4xx/5xx responses now clean-skip instead of warning/error spam.
 
 - `ingestion/fred.py`
-  - Removed invalid breadth IDs `ADVFN` and `DECFN` from the default FRED pull list.
+  - Removed invalid breadth IDs `ADVFN` and `DECFN` from the default [[FRED]] pull list.
   - FRED HTTP/retry wrapper rejection paths now soft-skip.
   - Malformed dataframe layouts now soft-skip instead of writing fake failed rows.
 
@@ -75,7 +75,7 @@ For API-only files, use `--restart --smoke` when practical.
 
 - Added hourly GRID catch-up script and cron entry.
 - Added separate hourly [[AstroGrid]] catch-up script and cron entry.
-- Kept AstroGrid separate but running on top of the GRID API.
+- Kept [[AstroGrid]] separate but running on top of the GRID API.
 - Hardened FRED permanent 400/404 handling.
 - Hardened solar Kp, [[Fed Liquidity|Fed liquidity]] parsing, Finviz insider URL, prediction odds scan cap, signal convergence parsing.
 - Restored missing oracle ensemble/model-registry/horizon behavior.
@@ -186,7 +186,7 @@ Verified after the redbox merge:
   - `grid-taskrunner.service`
   - `ollama.service`
   - `z4-llama.service`
-- llama.cpp health from `grid-svr`: `curl http://gridz4:8080/health` returns `{"status":"ok"}`.
+- [[llama.cpp]] health from `grid-svr`: `curl http://gridz4:8080/health` returns `{"status":"ok"}`.
 - Current z4 llama model from `/props`:
   - `Qwen3.5-9B-Claude-Opus-Reasoning-v2.Q4_K_M.gguf`
   - Context: `8192`
@@ -219,7 +219,7 @@ Fresh scans after the Qwen3 deploy showed these acting-up modules and fixes:
   - Git pull now skips cleanly when the deployed tree is not a valid git worktree instead of warning every cycle.
   - Added `current_step` labels around post-resolution tasks so future cycle timeouts identify the real stuck module instead of mislabeling stale `resolution`.
 
-Fresh post-deploy scans since `2026-04-18 03:35:00 UTC` returned no scheduler/Hermes errors, timeouts, watchdog failures, Reuters warnings, or pull failures.
+Fresh post-deploy scans since `2026-04-18 03:35:00 UTC` returned no scheduler/[[Hermes Scheduler|Hermes]] errors, timeouts, watchdog failures, Reuters warnings, or pull failures.
 
 ---
 
@@ -291,7 +291,7 @@ Targeted tests added/updated:
 Live production sanity checks performed:
 
 - Tiingo, Tiingo fundamentals, Tiingo news, and QuiverQuant instantiate through `SmartScheduler._build_puller_instance`.
-- GDELT bounded pull returns `SUCCESS` and clean-skips 429.
+- [[GDELT]] bounded pull returns `SUCCESS` and clean-skips 429.
 - FRED `ADVFN` returns `SKIPPED` and is not in default pull list.
 - FRED `H8B1023NCBCMG` and `TOTRESNS` manual pulls returned `SUCCESS`.
 - FedLiquidity `RRPONTSYD`, `H8B1023NCBCMG`, and `TOTRESNS` returned `SUCCESS`.

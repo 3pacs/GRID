@@ -464,7 +464,7 @@ except Exception as e:
    - Concurrent login attempts (rate limiting)
    - CORS preflight requests from different origins
 
-3. **Security Tests (Manual):**
+3. **[[Security]] Tests (Manual):**
    - Attempt WebSocket connection without token → should fail
    - Attempt to forge JWT with default secret (only in dev!)
    - Brute-force login endpoint with 100+ attempts → should be rate limited

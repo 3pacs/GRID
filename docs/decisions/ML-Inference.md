@@ -10,7 +10,7 @@ Machine learning model training, ensemble classification, [[Live Inference|live 
 ## Inference Module (`inference/`, 11 files)
 
 ### Core Pipeline
-- **`training.py`** — PIT-correct model training. Builds datasets from [[PIT-Store]], trains with [[Walk-Forward Backtesting|walk-forward]] validation to prevent [[PIT Store|lookahead bias]]. Supports XGBoost, RandomForest, RuleBased.
+- **`training.py`** — [[PIT Store|PIT-correct]] model training. Builds datasets from [[PIT-Store]], trains with [[Walk-Forward Backtesting|walk-forward]] validation to prevent [[PIT Store|lookahead bias]]. Supports XGBoost, RandomForest, RuleBased.
 - **`ensemble.py`** — `EnsembleClassifier` combining multiple models via weighted probability averaging. Default weights: XGBoost 0.45, RF 0.30, RuleBased 0.25. Includes disagreement detection — reduces confidence when models conflict.
 - **`live.py`** — `LiveInference` runs production models against latest PIT data. Loads features via [[Feature-Lab]], generates recommendations per layer.
 - **`trained_models.py`** — `TrainedModelBase` ABC and concrete implementations (XGBoost, RandomForest, RuleBased).

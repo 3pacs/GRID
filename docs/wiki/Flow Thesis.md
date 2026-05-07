@@ -17,5 +17,7 @@ auto_generated: true
 
 ## Referenced By
 
+- [[MODULE_DEDUPE_PLAN]]
+- [[MODULE_INVENTORY]]
 - [[ROADMAP]]
 - [[SIGNAL-CONNECTIVITY-PLAN]]

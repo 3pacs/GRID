@@ -20,6 +20,7 @@ Feature transformation lab: zscore, rolling_slope, pct_change, ratio, spread. Al
 - [[CLAUDE]]
 - [[FIRST_DAY_REPORT]]
 - [[MODULE_CATALOG]]
+- [[MODULE_INVENTORY]]
 - [[ARCHITECTURE_INDEX]]
 - [[ARCHITECTURE_REVIEW]]
 - [[development]]

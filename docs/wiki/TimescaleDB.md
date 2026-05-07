@@ -22,6 +22,7 @@ Time-series extension for [[PostgreSQL]] — hypertables for time-series data.
 - [[PERFORMANCE_AUDIT]]
 - [[deployment]]
 - [[development]]
+- [[GEX-V2-BUILD-PLAN]]
 - [[INTEGRATIONS]]
 - [[STACK]]
 - [[STRUCTURE]]

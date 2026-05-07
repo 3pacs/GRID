@@ -605,7 +605,7 @@ Plus pending Wave 1 (after one extra grep pass):
 
 ### Wave 5 — Cosmetic / doc fixes
 
-- Update `CLAUDE.md`: remove stale 7002 LOC actor_network and 2387 LOC causation references. Remove `scheduler_v2` gotcha. Add the "14-module adapter farm → 1 base class" pattern.
+- Update `CLAUDE.md`: remove stale 7002 LOC actor_network and 2387 LOC [[Causation|causation]] references. Remove `scheduler_v2` gotcha. Add the "14-module adapter farm → 1 base class" pattern.
 - Update `docs/MODULE_INVENTORY.md` phantom-list to move `flow_aggregator.py`/`flow_thesis.py` from "missing on disk" to "exists at analysis/" with a pointer.
 - Document `_resolve_source_id()` canonical location in `ingestion/base.py` and remove copy-paste from all puller files (~600 LOC cleanup).
 - Document `supply_chain_edges` column ownership matrix (three session writers: pct_cogs_enrichment, supply_chain_edge_validator, supply_chokepoints).

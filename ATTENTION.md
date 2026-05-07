@@ -133,7 +133,7 @@ Still need coverage: [[Walk-Forward Backtesting|validation/gates.py]], [[Model G
 - **`api/routers/system.py`** — Health endpoint now checks both database connectivity AND feature registry population. Returns 'degraded' if registry is empty. Logs actual error on failure.
 
 ### 31. No Alerting System (FIXED)
-- `alerts/health_alerter.py` runs every Hermes cycle, inspects the dict from `check_system_health`, and fires email via the existing `alerts/email.py` when one of these conditions transitions: `db.unhealthy`, `db.failed_pulls_24h>50`, `db.stale_sources>20`, `hermes.unhealthy`, `pool.exhausted` (>80% of capacity). 6-hour per-condition cooldown; state persisted at `.server-logs/alert_state.json` so cooldowns survive restarts. Prometheus + Grafana would be a richer next step but the email pathway covers the audit gap end-to-end.
+- `alerts/health_alerter.py` runs every [[Hermes Scheduler|Hermes]] cycle, inspects the dict from `check_system_health`, and fires email via the existing `alerts/email.py` when one of these conditions transitions: `db.unhealthy`, `db.failed_pulls_24h>50`, `db.stale_sources>20`, `hermes.unhealthy`, `pool.exhausted` (>80% of capacity). 6-hour per-condition cooldown; state persisted at `.server-logs/alert_state.json` so cooldowns survive restarts. Prometheus + Grafana would be a richer next step but the email pathway covers the audit gap end-to-end.
 
 ### 32. Missing Graceful Shutdown (FIXED)
 - **`api/main.py`** — Startup now logs clear warnings about degraded state when database is unavailable, instead of a generic warning.

@@ -19,7 +19,10 @@ auto_generated: true
 
 - [[CLAUDE]]
 - [[MODULE_CATALOG]]
+- [[MODULE_INVENTORY]]
 - [[api-reference]]
 - [[DERIVATIVESGRID-PLAN]]
 - [[FILL-EMPTY-TABLES]]
 - [[GSD-OPTIONS-EDGE]]
+- [[SESSION-ROADMAP-2026-04-13]]
+- [[V5-TRANSFORMATION]]

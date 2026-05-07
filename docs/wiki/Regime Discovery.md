@@ -22,6 +22,7 @@ Unsupervised regime clustering using GMM, KMeans, and Agglomerative methods. Tes
 - [[ARCHITECTURE_FIXES]]
 - [[ARCHITECTURE_REVIEW]]
 - [[DOC_AUDIT]]
+- [[SESSION-ROADMAP-2026-04-13]]
 - [[CONCERNS]]
 - [[INTEGRATIONS]]
 - [[STACK]]

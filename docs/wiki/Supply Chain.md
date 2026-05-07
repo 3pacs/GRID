@@ -18,5 +18,8 @@ Shipping rates, container index, ISM — supply chain health indicators.
 ## Referenced By
 
 - [[MODULE_CATALOG]]
+- [[MODULE_INVENTORY]]
+- [[MODULE_OVERLAP_AUDIT]]
 - [[GSD-OPTIONS-EDGE]]
 - [[GSD-PLAN]]
+- [[PAGEINDEX-INTEGRATION]]

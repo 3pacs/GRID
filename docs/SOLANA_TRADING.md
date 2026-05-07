@@ -295,7 +295,7 @@ through the whole gate.
 AutoHedge pulls in the Swarms framework, OpenAI SDK, and its own CLI. We want to:
 
 * depend only on libraries we already vendor in GRID
-* reuse `trading/paper_engine.py`, the decision journal, and the circuit breaker
+* reuse `trading/paper_engine.py`, the [[Decision Journal|decision journal]], and the circuit breaker
 * honour GRID's PIT correctness rules and 3-tier LLM taxonomy (`LOCAL`, `REASON`, `ORACLE`)
 
 So we ported the 2 pieces of AutoHedge that are actually doing meaningful work

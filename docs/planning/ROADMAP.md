@@ -226,7 +226,7 @@ against the 702-module inventory; items below are net-new capability.
 - OpenBB platform — already integrated (`ingestion/openbb_pipeline.py`)
 - freqtrade — covered by `trading/hyperliquid.py` + `validation/gates.py`
 - daily_stock_analysis — covered by [[Hermes Scheduler|Hermes]] + `oracle/report.py`
-- TradingAgents-CN — A-share only
+- [[TradingAgents]]-CN — A-share only
 - hyperswitch — payments router, unrelated
 
 ---
@@ -360,7 +360,7 @@ against the 702-module inventory; items below are net-new capability.
 - Thesis accuracy: target 60%+ directional
 - Data gap closure: all families >50% coverage
 - [[AstroGrid]] v1 merged from Codex branch
-- Security audit findings all resolved
+- [[Security]] audit findings all resolved
 - Exchange credentials set up (Hyperliquid testnet first)
 
 **Key decisions:**

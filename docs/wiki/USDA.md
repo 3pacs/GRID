@@ -19,5 +19,8 @@ US Department of Agriculture — crop reports, agricultural commodities.
 
 - [[README]]
 - [[MODULE_CATALOG]]
+- [[MODULE_INVENTORY]]
 - [[ARCHITECTURE_REVIEW]]
+- [[Cron-Schedule]]
+- [[Data-Pipeline]]
 - [[GSD-PLAN]]

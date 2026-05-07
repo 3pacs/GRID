@@ -17,5 +17,8 @@ Thesis versioning and scoring engine. Tracks investment theses through their lif
 
 ## Referenced By
 
+- [[MODULE_INVENTORY]]
+- [[Analysis-Layer]]
+- [[Intelligence-Layer]]
 - [[GSD-PLAN]]
 - [[ROADMAP]]

@@ -19,4 +19,6 @@ Congressional insider trading disclosures — political edge signals.
 
 - [[CLAUDE]]
 - [[DATA_GAPS]]
+- [[MODULE_INVENTORY]]
 - [[GSD-OPTIONS-EDGE]]
+- [[2026-04-11-canvas-evolution-design]]

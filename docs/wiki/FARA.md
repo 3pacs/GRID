@@ -20,3 +20,5 @@ DOJ Foreign Agent Registration Act — foreign lobbying disclosures.
 - [[CLAUDE]]
 - [[DATA_GAPS]]
 - [[MODULE_CATALOG]]
+- [[MODULE_INVENTORY]]
+- [[2026-04-07-connection-mapping-spider-design]]

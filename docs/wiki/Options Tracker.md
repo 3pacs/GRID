@@ -18,4 +18,6 @@ Outcome tracking and self-improving scanner weight adjustment. Closes the loop o
 ## Referenced By
 
 - [[MODULE_CATALOG]]
+- [[SESSION_HANDOFF_2026_04_11c]]
+- [[Trading-Layer]]
 - [[ROADMAP]]

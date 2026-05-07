@@ -19,6 +19,7 @@ Entity disambiguation layer that maps the same economic concept across different
 
 - [[CLAUDE]]
 - [[MODULE_CATALOG]]
+- [[MODULE_INVENTORY]]
 - [[ARCHITECTURE_REVIEW]]
 - [[CODE_REVIEW]]
 - [[DOC_AUDIT]]

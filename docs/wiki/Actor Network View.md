@@ -1,5 +1,5 @@
 ---
-title: [[Actor Network]] View
+title: Actor Network View
 category: Frontend
 type: concept
 auto_generated: true
@@ -19,5 +19,7 @@ D3 force graph of financial power structure — actors, connections, influence.
 
 - [[CLAUDE]]
 - [[ROADMAP]]
+- [[V5-TRANSFORMATION]]
 - [[VIEW-ARCHITECTURE]]
+- [[2026-04-11-canvas-evolution-design]]
 - [[viz-integration-instructions]]

@@ -70,7 +70,7 @@ Rows = producers. Columns = consumers. Cell legend:
 ### What "wired" actually covers today
 
 - **Oracle → calibration / journal:** direct. `oracle/engine.py:996-1095` reads `oracle_predictions`, scores them, and upserts back. `journal/log.py` owns the immutable leg.
-- **Trust scorer → oracle (read-only):** `oracle/engine.py::_get_convergence_for_ticker` calls `trust_scorer.detect_convergence` per ticker. One-way consumption only; oracle's verdict never feeds back into `signal_sources.outcome`.
+- **[[Trust Scorer|Trust scorer]] → oracle (read-only):** `oracle/engine.py::_get_convergence_for_ticker` calls `trust_scorer.detect_convergence` per ticker. One-way consumption only; oracle's verdict never feeds back into `signal_sources.outcome`.
 - **Supply chokepoints → trust scorer:** `SIGNAL_TRUST_DELTA["chokepoint_crossing"] = -0.10` exists, but only chokepoint *crossings* are read — not the baseline `chokepoint_score` rows. Partial.
 - **Contagion → options ticket → journal:** `trading/contagion_to_ticket.py` (SYNTH-13 canonical pricer) reads `contagion_predictions`, builds tickets, and logs them. The backward edge (journal verdict → contagion accuracy) exists via `contagion_backtest` but **does not flow through trust_scorer or oracle weight evolver**. The contagion model never earns or loses oracle weight from its trades.
 
@@ -208,7 +208,7 @@ Producers land before consumers, contracts before their handlers, bus-integrity 
 7. SYNTH-37 — `contagion_backtest` emits `PredictionScored`
 8. SYNTH-40 — `contagion_to_ticket` emits `OptionsTradeOutcome`
 9. SYNTH-41 — trade postmortems emit `PostmortemCompleted`
-10. **Milestone:** contagion loop is fully closed. Postmortem decays flow into both trust and weight evolver.
+10. **Milestone:** contagion loop is fully closed. [[Postmortem]] decays flow into both trust and weight evolver.
 
 **Wave C — highest-alpha rotting detectors (P0):**
 

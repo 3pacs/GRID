@@ -525,7 +525,7 @@ ENERGY_NETWORK = yaml.safe_load(
 ## 9. Summary of Findings
 
 ### Code Metrics
-- **Total Python Files:** ~230K LOC (excluding venv/migrations)
+- **Total Python Files:** ~230K LOC (excluding venv/[[migrations]])
 - **Ingestion Modules:** 104 files
 - **Intelligence Modules:** 50+ files
 - **API Routers:** 34 files

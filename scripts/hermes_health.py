@@ -443,6 +443,22 @@ def check_db_health(engine: Any) -> dict[str, Any]:
 
     except Exception as exc:
         result["error"] = str(exc)
+
+    # SQLAlchemy connection pool stats — feeds the pool.exhausted
+    # alert condition in alerts/health_alerter.py. The QueuePool
+    # exposes size(), checkedout(), overflow() at runtime; surface
+    # the three that matter into the health dict.
+    try:
+        pool = getattr(engine, "pool", None)
+        if pool is not None:
+            result["pool"] = {
+                "size": int(pool.size()) if hasattr(pool, "size") else 0,
+                "checked_out": int(pool.checkedout()) if hasattr(pool, "checkedout") else 0,
+                "overflow": int(pool.overflow()) if hasattr(pool, "overflow") else 0,
+            }
+    except Exception as exc:
+        result["pool_error"] = str(exc)
+
     return result
 
 

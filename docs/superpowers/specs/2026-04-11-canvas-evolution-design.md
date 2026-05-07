@@ -19,7 +19,7 @@ This is a Palantir-class data engine with a preschool UI.
 **Goal:** A single unified workspace where every piece of intelligence is one click away. Professional graph visualization that handles 100K nodes. Investigation boards you can save, name, and return to. The canvas IS the product.
 
 ### Level 2: Command Center
-**Goal:** Real-time streaming intelligence. AI-driven investigation. Causation chains. Geographic overlays. Hypothesis boards that evolve. The canvas thinks with you.
+**Goal:** Real-time streaming intelligence. AI-driven investigation. [[Causation]] chains. Geographic overlays. Hypothesis boards that evolve. The canvas thinks with you.
 
 ---
 
@@ -76,7 +76,7 @@ Curved edges via `@sigma/edge-curve` prevent overlap on parallel connections.
 
 ### 1.4 Unified Workspace Layout
 
-Replace the current separate pages (ActorNetwork, Flows, Associations, etc.) with a single canvas workspace.
+Replace the current separate pages ([[Actor Network View|ActorNetwork]], Flows, Associations, etc.) with a single canvas workspace.
 
 ```
 +------------------------------------------------------------------+

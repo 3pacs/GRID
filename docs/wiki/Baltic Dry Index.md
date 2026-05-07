@@ -18,3 +18,5 @@ Baltic Dry Index + shipping costs — global trade activity proxy.
 ## Referenced By
 
 - [[MODULE_CATALOG]]
+- [[MODULE_INVENTORY]]
+- [[Cron-Schedule]]

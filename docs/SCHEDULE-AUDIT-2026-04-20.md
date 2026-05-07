@@ -161,7 +161,7 @@ psql -U grid_user -d grid -c "
 - **Never schedule anything else at exactly 02:00 UTC** without
   accounting for the 02:00–02:10 hermes batch already landing there.
   Prefer 02:45+ or any hour other than 2 UTC.
-- **Walk-forward backtest is systemd-timer-driven, not in-process.**
+- **[[Walk-Forward Backtesting|Walk-forward]] backtest is systemd-timer-driven, not in-process.**
   If `OnCalendar` fires but the unit errors out, `journalctl -u
   grid-walk-forward-daily.service` will show why; the hermes operator
   log will NOT.

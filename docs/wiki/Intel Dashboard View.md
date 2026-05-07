@@ -18,6 +18,8 @@ Unified intelligence command center — all intel modules in one view.
 ## Referenced By
 
 - [[CLAUDE]]
+- [[PAGEINDEX-INTEGRATION]]
 - [[ROADMAP]]
 - [[VIEW-ARCHITECTURE]]
+- [[2026-04-07-v5-phase0-and-todo]]
 - [[viz-integration-instructions]]

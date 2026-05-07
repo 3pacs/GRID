@@ -17,5 +17,8 @@ USD normalization and capital flow quantification. Tracks money movement across 
 
 ## Referenced By
 
+- [[MODULE_INVENTORY]]
+- [[Intelligence-Layer]]
 - [[MASTER-PLAN]]
 - [[ROADMAP]]
+- [[2026-04-11-information-flow-optimization-design]]

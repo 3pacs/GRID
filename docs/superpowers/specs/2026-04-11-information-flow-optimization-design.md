@@ -14,7 +14,7 @@
 The GRID platform has grown to 97 modules across 14 architectural layers — 50+ pullers, 87 intelligence modules, 79 API routers, 66 frontend views. A systematic audit identified **23 distinct information-flow defects** falling into four categories:
 
 1. **Broken feedback loops** — modules that produce learning signals ([[Postmortem|postmortem]], oracle scoring, backtest verdicts, options trade outcomes) but whose outputs never reach the modules that should learn from them.
-2. **Unsurfaced intelligence** — seven intelligence modules (postmortem, trust_scorer, source_audit, [[Sleuth|sleuth]], thesis_tracker, dollar_flows, conflict resolver) produce rich data that has no API endpoint and is therefore invisible to operators and the oracle.
+2. **Unsurfaced intelligence** — seven intelligence modules ([[Postmortem|postmortem]], trust_scorer, source_audit, [[Sleuth|sleuth]], thesis_tracker, dollar_flows, conflict resolver) produce rich data that has no API endpoint and is therefore invisible to operators and the oracle.
 3. **Missing event emissions** — lifecycle events (puller start/fail, model promotion attempt, investigation progress, prediction invalidation, trade order lifecycle) are never emitted, so the frontend cannot react in real time.
 4. **Entity resolution divergence** — `normalization/entity_map.py` and `intelligence/actor_discovery.py` resolve entities independently with no reconciliation.
 
@@ -33,7 +33,7 @@ This spec defines a non-disruptive fix: a thin **Information Contract Layer** th
 - **G3.** Every emitted event is persisted with a `correlation_id` that allows full lineage tracing from source data to final prediction to post-expiry outcome.
 - **G4.** Failed consumer dispatches fall into a dead-letter store with automatic retry (1 min, 10 min, 1 hr) and manual replay on demand.
 - **G5.** All 13 contracts land incrementally without rewriting the internals of any existing module — producers add one emit call, consumers add one handler.
-- **G6.** Seven new API endpoints expose previously-hidden intelligence (postmortem, trust scores, [[Source Audit|source audit]], sleuth leads, thesis evolution, [[Dollar Flows|dollar flows]], conflict audit).
+- **G6.** Seven new API endpoints expose previously-hidden intelligence (postmortem, trust scores, [[Source Audit|source audit]], [[Sleuth|sleuth]] leads, thesis evolution, [[Dollar Flows|dollar flows]], conflict audit).
 - **G7.** Six new SSE channels broadcast previously-missing lifecycle events to the frontend.
 - **G8.** Observability: every contract dispatch is counted, timed, and surfaced at `/api/v1/contracts/metrics`.
 
@@ -539,7 +539,7 @@ Wiring each puller is a **one-line change**: wrap the existing pull body in `wit
 
 ### 4.14 The `events/sse.py::broadcast()` Helper
 
-Several consumers above require an SSE broadcast helper. The existing `api/routers/sse.py` only exposes an endpoint (`event_stream`), not a library function for in-process broadcasting. To avoid importing FastAPI inside handlers, we add one small helper:
+Several consumers above require an SSE broadcast helper. The existing `api/routers/sse.py` only exposes an endpoint (`event_stream`), not a library function for in-process broadcasting. To avoid importing [[FastAPI]] inside handlers, we add one small helper:
 
 ```python
 # events/sse.py (new file, replaces ad-hoc helpers)
