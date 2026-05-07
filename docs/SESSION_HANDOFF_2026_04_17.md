@@ -39,7 +39,7 @@ For API-only files, use `--restart --smoke` when practical.
   - [[FRED]] retry wrappers that only expose `HTTPStatusError` in their string/repr now soft-skip instead of writing `FAILED` rows.
   - `ingestion/international/ecb.py` moved from retired `sdw-wsrest.ecb.europa.eu` to `data-api.ecb.europa.eu`, requests `format=jsondata`, and soft-skips transient [[ECB]] upstream failures.
   - [[ECB]] scheduled keys were updated to current portal keys for M3, NFC loan growth, German sovereign yield proxy, and Italian sovereign yield proxy.
-  - Production smoke at `2026-04-18 03:52 UTC`: all 6 ECB scheduled series returned `SUCCESS`; fresh `FAILED` scan since `2026-04-18 03:52 UTC` returned 0 rows.
+  - Production smoke at `2026-04-18 03:52 UTC`: all 6 [[ECB]] scheduled series returned `SUCCESS`; fresh `FAILED` scan since `2026-04-18 03:52 UTC` returned 0 rows.
 
 - `ingestion/smart_scheduler.py`
   - Made API-key constructor behavior explicit via `api_key_mode`.
@@ -57,7 +57,7 @@ For API-only files, use `--restart --smoke` when practical.
 
 - `ingestion/fred.py`
   - Removed invalid breadth IDs `ADVFN` and `DECFN` from the default [[FRED]] pull list.
-  - FRED HTTP/retry wrapper rejection paths now soft-skip.
+  - [[FRED]] HTTP/retry wrapper rejection paths now soft-skip.
   - Malformed dataframe layouts now soft-skip instead of writing fake failed rows.
 
 - `ingestion/altdata/fed_liquidity.py`
@@ -303,7 +303,7 @@ Live production sanity checks performed:
 
 ### P0 - Keep pullers painless
 
-1. Run a fresh timestamped puller scan after the next scheduler/Hermes cycle.
+1. Run a fresh timestamped puller scan after the next scheduler/[[Hermes Scheduler|Hermes]] cycle.
 
    ```bash
    ssh grid@grid-svr 'date -u'

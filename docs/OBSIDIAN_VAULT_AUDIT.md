@@ -46,7 +46,7 @@ The 3 real design documents are all at the vault root:
 2. `/Users/anikdang/grid_obsidian/GEX GPT notes.md` — **1,337 lines**
 3. `/Users/anikdang/grid_obsidian/Gex Grok MD.md` — **276 lines**
 
-Total active GEX design surface in the vault: **3,323 lines of Markdown**.
+Total active [[Dealer Gamma|GEX]] design surface in the vault: **3,323 lines of Markdown**.
 
 #### 1. `GEX Plan.md` (1,710 lines) — "V1 raw research dump"
 
@@ -79,7 +79,7 @@ Total active GEX design surface in the vault: **3,323 lines of Markdown**.
   1. Executive summary — confidence-scored feature factory, not a prediction claim
   2. Design principles — normalize first, infer second; make units explicit; fail loudly; dealer positioning is a latent model
   3. System scope — **crypto first (Deribit / OKX / Bybit)**, US equity later
-  4. High-level architecture — 5-layer pipeline (Ingestion -> Validation -> Greek Completion -> Exposure Aggregation -> Alpha Layer)
+  4. High-level [[architecture]] — 5-layer pipeline (Ingestion -> Validation -> Greek Completion -> Exposure Aggregation -> Alpha Layer)
   5. **Canonical normalized schema** — 30+ fields per contract (venue, symbol, underlying, expiry_ts_utc, strike, option_type, contract_size, settlement_currency, oi_contracts, iv_decimal, delta, gamma, vanna, charm, vomma, color, zomma, speed, source_ts_utc, ingest_ts_utc, data_quality_flags)
   6. Exposure definitions with **explicit unit conventions** (per-contract, per-1%-move, signed/absolute)
   7. Mathematical layer — Black-Scholes as fallback, upgrade path to SABR/SVI

@@ -188,7 +188,7 @@ class QueryRouter:
 
 **Tasks:**
 - [ ] Add `pageindex_query()` helper to `intelligence/rag.py`
-- [ ] Integrate deep retrieval into cross-reference verification flow
+- [ ] Integrate deep retrieval into [[Cross Reference|cross-reference]] verification flow
 - [ ] Add filing-aware actor extraction to `actor_network.py`
 - [ ] Wire [[PIT Store|PIT-correct]] document retrieval into [[Postmortem|postmortem]] (use `release_date` filtering)
 - [ ] Add document-backed evidence to [[Causation|causation]] chains
@@ -235,7 +235,7 @@ Configure via `llm/router.py` — PageIndex uses LiteLLM internally, so we wrap 
 
 ## PIT Correctness
 
-Document retrieval MUST respect point-in-time constraints:
+Document retrieval MUST respect [[PIT Store|point-in-time]] constraints:
 
 - `document_trees.indexed_at` tracks when we indexed the document
 - `metadata.filing_date` / `metadata.release_date` tracks when the document became public

@@ -118,7 +118,7 @@ risks are narrower than the brief suggested, but they still exist.
 
 **Semantic check:**
 - Does [[Postmortem|postmortem.py]] already score contagion predictions? **PARTIAL** — it *consumes* the backtest results but does not *generate* them. The responsibility split is clean: `contagion_backtest.py` writes the scorecard, `postmortem.py` reads it and produces written analysis.
-- Risk: contagion_backtest computes `compute_accuracy(predicted_margin_impact_pct, actual_price_move_pct)` and postmortem computes its own accuracy from oracle_predictions. **Two accuracy definitions can drift.**
+- Risk: contagion_backtest computes `compute_accuracy(predicted_margin_impact_pct, actual_price_move_pct)` and [[Postmortem|postmortem]] computes its own accuracy from oracle_predictions. **Two accuracy definitions can drift.**
 
 **Verdict:** **OVERLAP_PARTIAL** — clean responsibility split but the accuracy metrics risk divergence.
 
@@ -293,7 +293,7 @@ risks are narrower than the brief suggested, but they still exist.
 - `intelligence/causation_graph.py` (1179 LOC) — `trace_causal_chain`, `find_longest_chains`. Imports `causation_core`, `causation_scoring`, `forensics`, `rag`.
 - `intelligence/causation_scoring.py` (1090 LOC) — `find_causes`, `batch_find_causes`. Imports `causation_core`, `freshness_guard`, `lever_pullers`, `rag`, `actor_signal_bridge`.
 
-**Semantic check:** The three *do* reference each other (via imports). The brief's claim "three causation modules never referencing each other" is **wrong**. This is a clean Strategy-pattern split (dataclasses / graph walker / scorer), plus a 26-line facade. CLAUDE.md's "2,387 LOC causation.py" never existed — that number was stale.
+**Semantic check:** The three *do* reference each other (via imports). The brief's claim "three causation modules never referencing each other" is **wrong**. This is a clean Strategy-pattern split (dataclasses / graph walker / scorer), plus a 26-line facade. CLAUDE.md's "2,387 LOC [[Causation|causation.py]]" never existed — that number was stale.
 
 **Verdict:** **NOT-A-DUPLICATE** — correctly factored. The real problem is that CLAUDE.md still claims a monolithic `causation.py` exists.
 

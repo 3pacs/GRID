@@ -50,7 +50,7 @@ These are the ten things a new session must know **before** proposing any change
 
 8. **[[Dealer Gamma|Vanna]] and charm are computed in `physics/dealer_gamma.py:248-250` but are never used in any prediction or score.** They are "measured but not actionable." Wiring them into the [[Options Scanner|options scanner]] or recommender is a cheap quick win.
 
-9. **`physics/dealer_gamma.py` assumes dealers are net short every option** (`physics/dealer_gamma.py:19-30`). Per-ticker GEX is computed but the dealer positioning inference is crude. Any "improve [[Dealer Gamma|dealer gamma]]" task is really "replace the net-short assumption with a flow-based inference."
+9. **`physics/dealer_gamma.py` assumes dealers are net short every option** (`physics/dealer_gamma.py:19-30`). Per-ticker [[Dealer Gamma|GEX]] is computed but the dealer positioning inference is crude. Any "improve [[Dealer Gamma|dealer gamma]]" task is really "replace the net-short assumption with a flow-based inference."
 
 10. **`features/importance.py` already tracks permutation importance, regime correlation, and rolling stability** — but **not per-horizon or per-regime**. Horizon-conditional feature importance is an extension, not a new build.
 
@@ -121,7 +121,7 @@ Notable crates: `iced 0.14-dev`, `rust_decimal 1.36` (fixed-precision prices), `
 
 ### Key architectural lessons from the jose-donato arc
 
-1. **Second-system rewrite:** He built the ideal form in Rust, hit distribution friction for a native app, then re-did it as browser-accessible Python service covering ~70% of the functionality with ~10% of the code. **Implication for GRID: don't reach for Rust. Python + DuckDB + FastAPI is the right layer.**
+1. **Second-system rewrite:** He built the ideal form in Rust, hit distribution friction for a native app, then re-did it as browser-accessible Python service covering ~70% of the functionality with ~10% of the code. **Implication for GRID: don't reach for Rust. Python + DuckDB + [[FastAPI]] is the right layer.**
 2. **Goroutine-per-venue (Go) → one-task-per-venue (Python asyncio).** Clean separation of WS consumers from aggregation is correct at any language.
 3. **`rust_decimal` for prices:** GRID should audit `trading/options_recommender.py` and `store/pit.py` for `float` drift; `decimal.Decimal` is the right type for money.
 4. **Perceptually uniform colormaps (OKLab/LCH) for heatmaps:** Python equivalent is `colour-science`. Important for any future footprint/heatmap view.
@@ -227,7 +227,7 @@ verdict, actual_price, actual_move_pct, pnl_pct, scored_at, score_notes
 - Single global + optional per-model or per-ticker filters (`calibration.py:66-195`)
 - Returns a `CalibrationReport` with `buckets[]`, `brier_score`, `calibration_error`, `sharpness`, `label`, `overall_accuracy`
 - **Calibration is NOT persisted.** It is computed on-demand from the `oracle_predictions` table each call. This means there is no calibration drift tracking over time.
-- No walk-forward calibration. No per-horizon calibration curves.
+- No [[Walk-Forward Backtesting|walk-forward]] calibration. No per-horizon calibration curves.
 
 ### Report (`oracle/report.py`)
 
@@ -594,7 +594,7 @@ My highest-conviction picks from the session discussion. Each is estimated to de
 26. **Fed reaction function estimator** — Bayesian model over `fed_speeches.py` + FOMC votes + dot plots — ~3% on rates/risk around Fed events
 27. **Dealer options surface (GEX/DEX/VEX/CEX) single-name** — extends `physics/dealer_gamma.py`; replaces crude net-short assumption — ~2% on single-name options
 28. **Cross-source disagreement / [[Cross Reference|lie detector]] (expanded)** — extends `cross_reference.py` to 3+ source consensus — ~2% on macro-release trades
-29. **13F delta clustering across 500 funds** — extends `institutional_flows.py` — ~1.5% on factor + sector trades
+29. **[[Institutional Flows|13F]] delta clustering across 500 funds** — extends `institutional_flows.py` — ~1.5% on factor + sector trades
 30. **Earnings surprise cascade predictor** — leader → follower revisions via `earnings_calendar.py` + `analyst_ratings.py` — ~2% on earnings-season follow-the-leader
 
 **[[Actor Network|Actor network]] extensions:**
@@ -698,7 +698,7 @@ GRID has 104+ intelligence modules and 100+ pullers producing evidence. It has a
 
 1. **Orthogonal stacking with known correlations.** 3 independent signals all pointing the same way >> 10 correlated signals pointing the same way. Measure and track feature correlations; Bayesian-update the posterior.
 
-2. **Mechanism, not correlation.** Trust relationships that have a named actor and a named liquidity valve. Correlations break on regime shifts; mechanisms don't (until the mechanism itself changes). This IS GRID's Prediction Causation Standard — enforce it everywhere.
+2. **Mechanism, not correlation.** Trust relationships that have a named actor and a named liquidity valve. Correlations break on regime shifts; mechanisms don't (until the mechanism itself changes). This IS GRID's Prediction [[Causation]] Standard — enforce it everywhere.
 
 3. **Base-rate conditioning from historical analogs.** "This setup matches 2018 Q4 with 94% similarity; outcome was −15% then +20%" is a far better prior than "momentum is positive." Pattern library with historical outcomes.
 

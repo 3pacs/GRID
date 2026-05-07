@@ -642,7 +642,7 @@ The aggregation engine computes structural maps from the normalized snapshot.
 
 At minimum, for each snapshot:
 
-- net GEX
+- net [[Dealer Gamma|GEX]]
     
 - net CEX
     

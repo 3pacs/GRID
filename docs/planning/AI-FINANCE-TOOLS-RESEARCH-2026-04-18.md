@@ -154,5 +154,5 @@ lands or we double-count signals.
 3. **Week 2–3:** Kronos wrapper + oracle adapter (item #1). Biggest single
    capability add. Ship in SHADOW for at least 2 weeks before counting toward
    live predictions.
-4. **Week 3–4:** qlib factor port (item #3). Gated behind orthogonality audit.
+4. **Week 3–4:** qlib factor port (item #3). Gated behind [[Orthogonality Audit|orthogonality audit]].
 5. **Deferred:** FinGPT evaluation (item #4) pending GPU headroom measurement.

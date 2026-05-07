@@ -551,7 +551,7 @@ cd grid/pwa && npm install \
 ### Level 2 Done When:
 1. Live signals stream into graph via WebSocket
 2. AI assistant answers graph queries in natural language
-3. Causation chains render as directed paths
+3. [[Causation]] chains render as directed paths
 4. Split view (graph + timeline + detail) works
 5. Hypothesis board mode tracks evidence accumulation
 6. Geographic overlay places actors on world map

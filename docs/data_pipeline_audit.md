@@ -54,7 +54,7 @@ Data in [[Raw Series Table|raw_series]] that no thesis model touches:
 
 ## GAP: Thesis Scorer Series Coverage
 
-The 17 models query these series from raw_series:
+The 17 models query these series from [[Raw Series Table|raw_series]]:
 - `WALCL`, `RRPONTSYD`, `WTREGEN` — Fed balance sheet (OK)
 - `FEDFUNDS` — Fed funds rate (OK)
 - `fed_tone_7d_avg`, `fomc_*` — Fed speeches (OK)

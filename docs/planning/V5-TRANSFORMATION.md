@@ -370,7 +370,7 @@ $$) as (source agtype, rels agtype, target agtype);
 
 ### Migration Path
 
-1. Install AGE extension on PostgreSQL 15
+1. Install AGE extension on [[PostgreSQL]] 15
 2. Create graph schema with vertex/edge labels
 3. Sync existing `actors` table → Actor vertices (one-time migration + trigger)
 4. Sync existing connections → edges
@@ -504,7 +504,7 @@ function useAsyncData<T>(
 // Wraps each route — catches D3/Three.js crashes without taking down the app
 ```
 
-Currently one ErrorBoundary wraps the entire app. A D3 crash in ActorNetwork kills everything.
+Currently one ErrorBoundary wraps the entire app. A D3 crash in [[Actor Network View|ActorNetwork]] kills everything.
 
 #### 5C. Store Decomposition
 
@@ -542,7 +542,7 @@ MoneyParticles.tsx        — animated particle system (~200 LOC)
 useActorNetworkData.ts    — data fetching hook (~150 LOC)
 ```
 
-Same pattern for CrossReference, WatchlistAnalysis, ActorUniverse, Timeline.
+Same pattern for [[Cross Reference View|CrossReference]], WatchlistAnalysis, ActorUniverse, Timeline.
 
 #### 5F. Loading Skeletons
 
@@ -698,7 +698,7 @@ events/async_pool.py                  — asyncpg pool manager (~100 LOC)
 | SSE client hook | `hooks/useEventStream.ts` | ~80 | SSE endpoint |
 
 **Integration:**
-- Add "Send to Canvas" context menu to ActorNetwork, MoneyFlow, Timeline views
+- Add "Send to Canvas" context menu to ActorNetwork, [[MoneyFlow View|MoneyFlow]], Timeline views
 - Route: `/canvas` and `/canvas/:boardId`
 - Nav: add Canvas to primary tab bar
 

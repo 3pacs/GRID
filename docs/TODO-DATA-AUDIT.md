@@ -143,5 +143,5 @@ Recommendation: do #1 first (low effort), then #3 as a safety filter.
 - Coverage gap (tickers with signals but no prices) drops below 10
 - `signal_replay_backtest --days 180 --horizon 5` returns ≥10 cells
   across the full landscape (alpha_research, news_intel, feature:*, etc.)
-- The daily walk-forward report includes a freshness section that
+- The daily [[Walk-Forward Backtesting|walk-forward]] report includes a freshness section that
   flags any regression

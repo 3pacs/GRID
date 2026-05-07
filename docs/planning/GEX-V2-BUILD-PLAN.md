@@ -101,7 +101,7 @@ No existing coverage. Safe to create.
 
 ## 4. Wave-by-Wave Execution Plan
 
-Five waves, topologically ordered. Each wave is a separate follow-up task. Waves 1-3 are already queued (GEX-3/4/5); Waves 4-5 queue as new tasks.
+Five waves, topologically ordered. Each wave is a separate follow-up task. Waves 1-3 are already queued ([[Dealer Gamma|GEX]]-3/4/5); Waves 4-5 queue as new tasks.
 
 ### Wave 1 — Port the 7 BS Greeks to a shared module
 **Task**: GEX-3 (#79, already queued)
