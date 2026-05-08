@@ -439,9 +439,16 @@ def compare_sources(engine: Engine, feature_name: str) -> dict[str, Any]:
                         "fn": feature_name,
                         "sa": sa,
                         "sb": sb,
-                        "corr": round(corr, 6),
-                        "md": round(pct_mean_dev, 6),
-                        "mxd": round(pct_max_dev, 6),
+                        # CAST: round() on a numpy.float64 returns numpy.float64
+                        # (numpy preserves dtype). psycopg2 doesn't have an
+                        # adapter for it and falls back to str() → the literal
+                        # 'np.float64(0.272858)' lands in the SQL, parsing as
+                        # schema-qualified identifier "np.float64" → 'schema
+                        # "np" does not exist' on every row. Force Python
+                        # float at the param boundary.
+                        "corr": float(round(corr, 6)),
+                        "md": float(round(pct_mean_dev, 6)),
+                        "mxd": float(round(pct_max_dev, 6)),
                         "tw": timeliness_winner,
                         "cw": completeness_winner,
                         "aw": accuracy_winner,
