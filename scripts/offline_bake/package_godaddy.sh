@@ -49,7 +49,9 @@ if [[ $UPLOAD -eq 1 ]]; then
   echo "[3/4] Uploading via rsync to $SSH_HOST:~/$REMOTE_DIR"
   ssh "$SSH_HOST" "mkdir -p ~/$REMOTE_DIR"
   # --delete-after so we leave the live tree intact until rsync confirms the new tree.
-  rsync -az --delete-after --exclude='cgi-bin' \
+  rsync -az --delete-after \
+    --exclude='cgi-bin' \
+    --exclude='p-*' \
     -e "ssh -o ConnectTimeout=15" \
     "$DIST/" "$SSH_HOST:$REMOTE_DIR/"
   echo "[4/4] Verify"
