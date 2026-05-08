@@ -25,8 +25,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from loguru import logger as _fallback_log
-
 from server_log.sanitizer import Sanitizer, build_sanitizer_from_settings
 
 if TYPE_CHECKING:
@@ -107,10 +105,7 @@ def _clear_stale_index_lock(repo: Path) -> bool:
         if age_s < 60:
             return False
         lock.unlink()
-        _fallback_log.warning(
-            "[server_log] removed stale .git/index.lock (age={age:.0f}s)",
-            age=age_s,
-        )
+        _stderr_warn(f"removed stale .git/index.lock (age={age_s:.0f}s)")
         return True
     except OSError:
         return False
@@ -281,7 +276,7 @@ class GitSink:
         ):
             rc, out = _git(["add", str(self._errors_path)], self._repo)
         if rc != 0:
-            _fallback_log.warning("[server_log] git add failed: {out}", out=out)
+            _stderr_warn(f"git add failed: {out}")
             return
 
         # Commit
@@ -299,7 +294,7 @@ class GitSink:
                 or "nothing added to commit" in out_low
             ):
                 return
-            _fallback_log.warning("[server_log] git commit failed: {out}", out=out)
+            _stderr_warn(f"git commit failed: {out}")
             return
 
         # Push — only if explicitly enabled (default off to prevent
@@ -309,7 +304,7 @@ class GitSink:
 
         branch = self._branch or self._detect_branch()
         if not branch:
-            _fallback_log.warning("[server_log] could not detect git branch; skipping push")
+            _stderr_warn("could not detect git branch; skipping push")
             return
 
         delays = [2, 4, 8, 16]
@@ -361,10 +356,7 @@ class GitSink:
         archive_name = f"errors_{ts}.jsonl"
         archive_path = self._logs_dir / archive_name
         self._errors_path.rename(archive_path)
-        _fallback_log.info(
-            "[server_log] Rotated errors.jsonl ({sz:.1f}MB) -> {a}",
-            sz=size_mb, a=archive_name,
-        )
+        _stderr_warn(f"Rotated errors.jsonl ({size_mb:.1f}MB) -> {archive_name}")
         return True
 
     def cleanup_old_archives(self, max_age_days: int = 90) -> int:
@@ -385,7 +377,5 @@ class GitSink:
             except ValueError:
                 continue
         if deleted:
-            _fallback_log.info(
-                "[server_log] Cleaned up {n} old error archives", n=deleted,
-            )
+            _stderr_warn(f"Cleaned up {deleted} old error archives")
         return deleted

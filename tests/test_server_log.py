@@ -487,8 +487,10 @@ class TestGitSinkCommit:
         assert lock.exists()
 
     @patch("server_log.git_sink._git")
-    def test_commit_failure_logs_warning_not_error(self, mock_git, tmp_path):
-        """Sink git failures should not recursively populate errors.jsonl."""
+    def test_commit_failure_reports_to_stderr_not_loguru(
+        self, mock_git, tmp_path, capsys
+    ):
+        """Sink git failures should bypass loguru and avoid recursion."""
         from loguru import logger
 
         (tmp_path / ".git").mkdir()
@@ -512,10 +514,13 @@ class TestGitSinkCommit:
         finally:
             logger.remove(sink_id)
 
-        assert any(
-            level == "WARNING" and "git commit failed" in message
-            for level, message in seen
-        )
+        captured = capsys.readouterr()
+        assert "[server_log] git commit failed" in captured.err
+        assert seen == []
+
+        errors_file = tmp_path / ".server-logs" / "errors.jsonl"
+        if errors_file.exists():
+            assert "git commit failed" not in errors_file.read_text()
 
     @patch.dict("os.environ", {"GIT_SINK_PUSH_ENABLED": "true"})
     @patch("server_log.git_sink.time.sleep")
