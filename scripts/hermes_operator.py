@@ -104,29 +104,44 @@ def _run_with_timeout(name: str, fn, timeout_s: int, state):
     the orphan eventually finishes (LLM eventually returns) and no destructive
     side-effect is in flight on these read-mostly steps.
 
+    NOTE: do NOT use `with ThreadPoolExecutor(...) as ex:`. The context
+    manager calls `shutdown(wait=True)` on exit, which blocks until the
+    orphan worker finishes — completely defeating the timeout. This bug
+    silently broke every stage timeout in Hermes for months: the cycle
+    appeared to time out at the cycle-level (600s) "stuck on stage X"
+    when actually the stage HAD already passed its budget but the
+    shutdown() call was waiting for the still-running thread.
+
+    Fix: explicit shutdown(wait=False) on timeout so we genuinely hand
+    back control. The orphan thread keeps running but as a true daemon;
+    the next cycle starts on schedule.
+
     Returns:
         (result, ok) — fn's return value (or None on timeout/error), success bool.
     """
     import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        fut = ex.submit(fn)
-        try:
-            return fut.result(timeout=timeout_s), True
-        except concurrent.futures.TimeoutError:
-            # Logged at WARNING (not ERROR) — the timeout is a correctly
-            # handled operational event: the step is blacklisted for
-            # TIMEOUT_BLACKLIST_HOURS and the cycle moves on.  Reserving
-            # ERROR for unhandled failures keeps errors.jsonl signal-rich.
-            log.warning(
-                "Step '{n}' timed out after {s}s — blacklisting for {h}h",
-                n=name, s=timeout_s, h=TIMEOUT_BLACKLIST_HOURS,
-            )
-            state.cooldowns.blacklist_for_timeout(name)
-            return None, False
-        except Exception as exc:
-            log.warning("Step '{n}' raised: {e}", n=name, e=str(exc))
-            state.cooldowns.record_attempt(name, success=False, error=str(exc))
-            return None, False
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    fut = ex.submit(fn)
+    try:
+        result = fut.result(timeout=timeout_s)
+        ex.shutdown(wait=True)  # success path — let the worker tear down cleanly
+        return result, True
+    except concurrent.futures.TimeoutError:
+        log.warning(
+            "Step '{n}' timed out after {s}s — blacklisting for {h}h",
+            n=name, s=timeout_s, h=TIMEOUT_BLACKLIST_HOURS,
+        )
+        state.cooldowns.blacklist_for_timeout(name)
+        # CRITICAL: wait=False so we don't block on the orphan thread.
+        # cancel_futures=True attempts to cancel anything still queued
+        # (no-op here since we only submitted one future).
+        ex.shutdown(wait=False, cancel_futures=True)
+        return None, False
+    except Exception as exc:
+        log.warning("Step '{n}' raised: {e}", n=name, e=str(exc))
+        state.cooldowns.record_attempt(name, success=False, error=str(exc))
+        ex.shutdown(wait=False, cancel_futures=True)
+        return None, False
 
 # Source name → (module_path, class_name, needs_api_key, pull_method)
 # This registry replaces the hardcoded if/elif chain and covers ALL pullers.
