@@ -1186,6 +1186,305 @@ class OracleEngine:
 
     # ── Prediction Generation ───────────────────────────────────────────
 
+    def _oracle_one_ticker(
+        self,
+        idx: int,
+        ticker: str,
+        total_tickers: int,
+        now: datetime,
+        signal_cache: dict,
+    ) -> list["OraclePrediction"]:
+        """Run the per-ticker prediction pipeline once.
+
+        Returns the list of predictions for this ticker. Extracted
+        from generate_predictions in 2026-05-08 to enable parallel
+        ticker fanout (was 25min/cycle sequential).
+        """
+        ticker_predictions: list["OraclePrediction"] = []
+        ticker_started = datetime.now(timezone.utc)
+        log.info("Oracle generating {idx}/{total}: {ticker}", idx=idx, total=total_tickers, ticker=ticker)
+        flow_ctx = self._get_flow_context(ticker)
+        log.info("Oracle {ticker}: flow context ready", ticker=ticker)
+
+        # Get current price
+        spot = self._get_spot_price(ticker)
+        if not spot:
+            log.warning(
+                "Oracle: no spot price for {t} - storing no_data placeholder per model",
+                t=ticker,
+            )
+            for model in self.models:
+                pred_id = hashlib.md5(
+                    f"{ticker}:{model.name}:no_data:{now.isoformat()}".encode()
+                ).hexdigest()[:16]
+                placeholder = OraclePrediction(
+                    id=pred_id,
+                    timestamp=now,
+                    ticker=ticker,
+                    prediction_type=PredictionType.DIRECTION,
+                    direction="NONE",
+                    target_price=None,
+                    current_price=0.0,
+                    expiry=self._next_monthly_expiry(),
+                    confidence=0.0,
+                    expected_move_pct=0.0,
+                    model_name=model.name,
+                    model_version=model.version,
+                    verdict=Verdict.NO_DATA,
+                    score_notes="No spot price available at prediction time",
+                )
+                ticker_predictions.append(placeholder)
+            return ticker_predictions
+        log.info("Oracle {ticker}: spot={spot:.4f}", ticker=ticker, spot=spot)
+
+        # Credit cycle → family weight routing
+        credit_family_boost = self._get_credit_cycle_routing()
+        log.info("Oracle {ticker}: credit routing keys={keys}", ticker=ticker, keys=list(credit_family_boost.keys()))
+
+        # Decision journal feedback: learn from recent hits/misses
+        journal_bias = self._get_journal_feedback(ticker)
+        log.info("Oracle {ticker}: journal feedback={feedback}", ticker=ticker, feedback=journal_bias)
+
+        for model in self.models:
+            try:
+                # ── TimesFM model: use forecaster_adapter ──────────
+                if model.name == "timeseries_enhanced":
+                    try:
+                        from oracle.forecaster_adapter import (
+                            forecast_to_anti_signals,
+                            forecast_to_prediction,
+                            forecast_to_signals,
+                        )
+
+                        fc = self._get_timesfm_forecast(ticker)
+                        if not fc:
+                            continue  # No forecast available for this ticker
+
+                        # Build a lightweight forecast result object
+                        class _ForecastResult:
+                            pass
+
+                        fr = _ForecastResult()
+                        fr.predictions = fc["predictions"]
+                        fr.lower_bound = fc["lower_bound"]
+                        fr.upper_bound = fc["upper_bound"]
+                        fr.forecast_std = fc["forecast_std"]
+                        fr.horizon = fc["horizon"]
+                        fr.model_version = fc["model_version"]
+                        fr.forecast_date = fc["forecast_date"]
+
+                        tsf_signals = forecast_to_signals(fr, current_price=spot)
+                        tsf_anti = forecast_to_anti_signals(fr, [])
+
+                        pred = forecast_to_prediction(
+                            fr, ticker, spot,
+                            signals=tsf_signals,
+                            anti_signals=tsf_anti,
+                        )
+                        if pred is not None:
+                            # Apply journal feedback to confidence
+                            journal_mult = journal_bias.get(
+                                "confidence_multiplier", 1.0,
+                            )
+                            pred = replace(
+                                pred,
+                                confidence=round(
+                                    min(0.95, pred.confidence * journal_mult), 4,
+                                ),
+                                model_weights={
+                                    m.name: m.weight for m in self.models
+                                },
+                            )
+                            ticker_predictions.append(pred)
+                    except Exception as exc:
+                        log.debug(
+                            "TimesFM model skipped for {t}: {e}",
+                            t=ticker, e=str(exc),
+                        )
+                    continue  # Skip standard signal gathering for this model
+
+                # Try signal registry first (when enabled), fall back to legacy
+                signals = self._gather_signals_from_registry(ticker, model) if _USE_SIGNAL_REGISTRY else []
+                if not signals:
+                    family_key = tuple(sorted(str(f) for f in model.signal_families))
+                    cache_key = (ticker, family_key)
+                    if cache_key not in signal_cache:
+                        signal_cache[cache_key] = self._gather_signals(ticker, model.signal_families)
+                    signals = [replace(sig) for sig in signal_cache[cache_key]]
+
+                # ── Actor intelligence injection ──────────────────
+                # Enrich signals with actor trust/influence from the
+                # actor graph. Actors with proven track records get
+                # their signals amplified; unknown actors stay at 0.5.
+                try:
+                    from intelligence.actor_signal_bridge import (
+                        get_actor_signals_for_ticker,
+                    )
+                    actor_sigs = get_actor_signals_for_ticker(self.engine, ticker, days=30)
+                    if actor_sigs:
+                        # Build actor trust lookup
+                        actor_trust_by_type: dict[str, float] = {}
+                        for asig in actor_sigs:
+                            st = asig["signal_type"]
+                            trust = asig["actor_trust"] * asig["actor_influence"]
+                            if st not in actor_trust_by_type or trust > actor_trust_by_type[st]:
+                                actor_trust_by_type[st] = trust
+
+                        # Boost signal weights by actor credibility
+                        for sig in signals:
+                            src = getattr(sig, "source_module", "") or sig.family
+                            actor_boost = actor_trust_by_type.get(src, None)
+                            if actor_boost and actor_boost > 0.5:
+                                # Scale weight: 0.5 trust = 1x, 0.9 trust = 1.8x
+                                boost = 0.5 + actor_boost
+                                if hasattr(sig, '_replace'):
+                                    sig = sig._replace(weight=sig.weight * boost)
+                                elif hasattr(sig, 'weight'):
+                                    sig.weight = sig.weight * boost
+
+                        # Inject high-influence actor signals directly
+                        for asig in actor_sigs[:5]:  # Top 5 by influence
+                            if asig["actor_influence"] > 0.7:
+                                signals.append(Signal(
+                                    name=f"actor:{asig['actor']}",
+                                    family="actor_intelligence",
+                                    value=asig["actor_trust"],
+                                    z_score=1.5 if asig["direction"] in ("buy", "bullish", "long") else -1.5,
+                                    direction="bullish" if asig["direction"] in ("buy", "bullish", "long") else "bearish",
+                                    weight=asig["actor_trust"] * asig["actor_influence"],
+                                    freshness_hours=0,
+                                ))
+                except Exception as exc:
+                    log.debug("Actor signal enrichment skipped for {t}: {e}", t=ticker, e=str(exc))
+
+                # Apply credit-cycle-based family weighting
+                if credit_family_boost:
+                    for sig in signals:
+                        src = getattr(sig, "source_module", "") or ""
+                        for family_key, boost in credit_family_boost.items():
+                            if family_key in src:
+                                sig = sig._replace(weight=sig.weight * boost) if hasattr(sig, '_replace') else sig
+                if len(signals) < 3:
+                    continue  # Not enough data for this model
+
+                # Compute net direction
+                bull_score = sum(s.z_score * s.weight for s in signals if s.direction == "bullish")
+                bear_score = sum(abs(s.z_score) * s.weight for s in signals if s.direction == "bearish")
+
+                if bull_score > bear_score:
+                    direction = "CALL"
+                    net_score = bull_score - bear_score
+                elif bear_score > bull_score:
+                    direction = "PUT"
+                    net_score = bear_score - bull_score
+                else:
+                    continue  # No signal
+
+                # Anti-signals
+                anti_signals = self._find_anti_signals(signals, direction)
+                anti_deduction = sum(a.severity for a in anti_signals) * 0.3
+
+                # Signal strength = net score - anti-signal deduction
+                signal_strength = max(0, net_score - anti_deduction)
+                coherence = self._compute_coherence(signals, direction)
+
+                # ── Convergence amplification ──────────────────────
+                # If trust_scorer detects 3+ independent sources
+                # agreeing on this ticker+direction, boost confidence
+                convergence_boost = 1.0
+                try:
+                    convergence_events = self._get_convergence_for_ticker(ticker)
+                    pred_dir = "BUY" if direction in ("CALL", "LONG") else "SELL"
+                    for evt in convergence_events:
+                        if evt.get("signal_type") == pred_dir:
+                            # Boost: 10% per source above minimum 3
+                            src_count = evt.get("source_count", 0)
+                            combined_conf = evt.get("combined_confidence", 0.5)
+                            convergence_boost = 1.0 + 0.1 * (src_count - 2) * combined_conf
+                            # Inject convergence sources as additional signals
+                            for src in evt.get("sources", []):
+                                signals.append(Signal(
+                                    name=f"convergence:{src['source_type']}",
+                                    family="convergence",
+                                    value=src.get("trust_score", 0.5),
+                                    z_score=1.5 if pred_dir == "BUY" else -1.5,
+                                    direction="bullish" if pred_dir == "BUY" else "bearish",
+                                    weight=src.get("trust_score", 0.5),
+                                    freshness_hours=0,
+                                ))
+                            break  # Use first matching convergence event
+                except Exception as e:
+                    log.debug("Convergence signal skipped for {t}: {e}", t=ticker, e=str(e))
+
+                # Confidence = signal strength × coherence × model weight × convergence
+                raw_confidence = signal_strength * coherence * model.weight * convergence_boost
+
+                # Apply decision journal feedback (learn from recent hit/miss rate)
+                journal_mult = journal_bias.get("confidence_multiplier", 1.0)
+                raw_confidence *= journal_mult
+
+                confidence = min(0.95, max(0.05, raw_confidence / 5.0))  # Normalize to 0-1
+
+                # Expected move (conservative estimate)
+                expected_move = signal_strength * 0.5  # 0.5% per unit of signal strength
+
+                # Target price
+                if direction == "CALL":
+                    target = spot * (1 + expected_move / 100)
+                else:
+                    target = spot * (1 - expected_move / 100)
+
+                # Expiry: next monthly options expiry (3rd Friday)
+                expiry = self._next_monthly_expiry()
+
+                # Create prediction
+                pred_id = hashlib.md5(
+                    f"{ticker}:{model.name}:{direction}:{now.isoformat()}".encode()
+                ).hexdigest()[:16]
+
+                # Clamp expected move to ±30%
+                if expected_move < -30.0 or expected_move > 30.0:
+                    log.debug("Clamping expected_move from {orig} to ±30% for {t}",
+                               orig=expected_move, t=ticker)
+                    expected_move = max(-30.0, min(30.0, expected_move))
+
+                pred = OraclePrediction(
+                    id=pred_id,
+                    timestamp=now,
+                    ticker=ticker,
+                    prediction_type=PredictionType.DIRECTION,
+                    direction=direction,
+                    target_price=round(target, 2),
+                    current_price=spot,
+                    expiry=expiry,
+                    confidence=round(confidence, 4),
+                    expected_move_pct=round(expected_move, 2),
+                    signals=signals[:10],  # Top 10 signals
+                    anti_signals=anti_signals[:5],  # Top 5 anti-signals
+                    signal_strength=round(signal_strength, 3),
+                    coherence=round(coherence, 3),
+                    model_name=model.name,
+                    model_version=model.version,
+                    model_weights={m.name: m.weight for m in self.models},
+                    flow_context=flow_ctx,
+                )
+
+                ticker_predictions.append(pred)
+
+            except Exception as e:
+                log.warning("Model {m} failed for {t}: {e}", m=model.name, t=ticker, e=str(e))
+        elapsed = (datetime.now(timezone.utc) - ticker_started).total_seconds()
+        log.info(
+            "Oracle ticker complete {idx}/{total}: {ticker} in {seconds:.1f}s; cumulative predictions={n}",
+            idx=idx,
+            total=total_tickers,
+            ticker=ticker,
+            seconds=elapsed,
+            n=len(all_predictions),
+        )
+
+        return ticker_predictions
+
     def generate_predictions(
         self, tickers: list[str] | None = None
     ) -> list[OraclePrediction]:
@@ -1202,288 +1501,41 @@ class OracleEngine:
         now = datetime.now(timezone.utc)
 
         total_tickers = len(tickers)
-        for idx, ticker in enumerate(tickers, start=1):
-            ticker_started = datetime.now(timezone.utc)
-            log.info("Oracle generating {idx}/{total}: {ticker}", idx=idx, total=total_tickers, ticker=ticker)
-            flow_ctx = self._get_flow_context(ticker)
-            log.info("Oracle {ticker}: flow context ready", ticker=ticker)
+        # ── Parallel ticker fanout ──────────────────────────────
+        # Was sequential — 41 tickers × 30-50s each = ~25 min/cycle,
+        # blew past ORACLE_CYCLE_TIMEOUT_SECONDS=300s. Now we run up
+        # to GRID_ORACLE_PARALLELISM (default 4) tickers in parallel,
+        # matching the GPU server's --parallel slot count. Each
+        # worker is a full ticker pipeline (flow ctx + spot + N
+        # model predicts). signal_cache keys include ticker so
+        # cross-ticker writes never collide; CPython GIL makes the
+        # dict insert thread-safe. Set GRID_ORACLE_PARALLELISM=1
+        # to fall back to single-threaded behaviour.
+        import concurrent.futures
+        import os as _os
+        _max_workers = max(1, int(_os.getenv("GRID_ORACLE_PARALLELISM", "4")))
+        log.info(
+            "Oracle: dispatching {n} tickers across {w} workers",
+            n=total_tickers, w=_max_workers,
+        )
 
-            # Get current price
-            spot = self._get_spot_price(ticker)
-            if not spot:
-                log.warning(
-                    "Oracle: no spot price for {t} - storing no_data placeholder per model",
-                    t=ticker,
+        def _run_one(args):
+            idx, ticker = args
+            try:
+                return self._oracle_one_ticker(
+                    idx, ticker, total_tickers, now, signal_cache,
                 )
-                for model in self.models:
-                    pred_id = hashlib.md5(
-                        f"{ticker}:{model.name}:no_data:{now.isoformat()}".encode()
-                    ).hexdigest()[:16]
-                    placeholder = OraclePrediction(
-                        id=pred_id,
-                        timestamp=now,
-                        ticker=ticker,
-                        prediction_type=PredictionType.DIRECTION,
-                        direction="NONE",
-                        target_price=None,
-                        current_price=0.0,
-                        expiry=self._next_monthly_expiry(),
-                        confidence=0.0,
-                        expected_move_pct=0.0,
-                        model_name=model.name,
-                        model_version=model.version,
-                        verdict=Verdict.NO_DATA,
-                        score_notes="No spot price available at prediction time",
-                    )
-                    all_predictions.append(placeholder)
-                continue
-            log.info("Oracle {ticker}: spot={spot:.4f}", ticker=ticker, spot=spot)
+            except Exception as exc:
+                log.warning("Oracle ticker {t} failed: {e}", t=ticker, e=str(exc))
+                return []
 
-            # Credit cycle → family weight routing
-            credit_family_boost = self._get_credit_cycle_routing()
-            log.info("Oracle {ticker}: credit routing keys={keys}", ticker=ticker, keys=list(credit_family_boost.keys()))
-
-            # Decision journal feedback: learn from recent hits/misses
-            journal_bias = self._get_journal_feedback(ticker)
-            log.info("Oracle {ticker}: journal feedback={feedback}", ticker=ticker, feedback=journal_bias)
-
-            for model in self.models:
-                try:
-                    # ── TimesFM model: use forecaster_adapter ──────────
-                    if model.name == "timeseries_enhanced":
-                        try:
-                            from oracle.forecaster_adapter import (
-                                forecast_to_anti_signals,
-                                forecast_to_prediction,
-                                forecast_to_signals,
-                            )
-
-                            fc = self._get_timesfm_forecast(ticker)
-                            if not fc:
-                                continue  # No forecast available for this ticker
-
-                            # Build a lightweight forecast result object
-                            class _ForecastResult:
-                                pass
-
-                            fr = _ForecastResult()
-                            fr.predictions = fc["predictions"]
-                            fr.lower_bound = fc["lower_bound"]
-                            fr.upper_bound = fc["upper_bound"]
-                            fr.forecast_std = fc["forecast_std"]
-                            fr.horizon = fc["horizon"]
-                            fr.model_version = fc["model_version"]
-                            fr.forecast_date = fc["forecast_date"]
-
-                            tsf_signals = forecast_to_signals(fr, current_price=spot)
-                            tsf_anti = forecast_to_anti_signals(fr, [])
-
-                            pred = forecast_to_prediction(
-                                fr, ticker, spot,
-                                signals=tsf_signals,
-                                anti_signals=tsf_anti,
-                            )
-                            if pred is not None:
-                                # Apply journal feedback to confidence
-                                journal_mult = journal_bias.get(
-                                    "confidence_multiplier", 1.0,
-                                )
-                                pred = replace(
-                                    pred,
-                                    confidence=round(
-                                        min(0.95, pred.confidence * journal_mult), 4,
-                                    ),
-                                    model_weights={
-                                        m.name: m.weight for m in self.models
-                                    },
-                                )
-                                all_predictions.append(pred)
-                        except Exception as exc:
-                            log.debug(
-                                "TimesFM model skipped for {t}: {e}",
-                                t=ticker, e=str(exc),
-                            )
-                        continue  # Skip standard signal gathering for this model
-
-                    # Try signal registry first (when enabled), fall back to legacy
-                    signals = self._gather_signals_from_registry(ticker, model) if _USE_SIGNAL_REGISTRY else []
-                    if not signals:
-                        family_key = tuple(sorted(str(f) for f in model.signal_families))
-                        cache_key = (ticker, family_key)
-                        if cache_key not in signal_cache:
-                            signal_cache[cache_key] = self._gather_signals(ticker, model.signal_families)
-                        signals = [replace(sig) for sig in signal_cache[cache_key]]
-
-                    # ── Actor intelligence injection ──────────────────
-                    # Enrich signals with actor trust/influence from the
-                    # actor graph. Actors with proven track records get
-                    # their signals amplified; unknown actors stay at 0.5.
-                    try:
-                        from intelligence.actor_signal_bridge import (
-                            get_actor_signals_for_ticker,
-                        )
-                        actor_sigs = get_actor_signals_for_ticker(self.engine, ticker, days=30)
-                        if actor_sigs:
-                            # Build actor trust lookup
-                            actor_trust_by_type: dict[str, float] = {}
-                            for asig in actor_sigs:
-                                st = asig["signal_type"]
-                                trust = asig["actor_trust"] * asig["actor_influence"]
-                                if st not in actor_trust_by_type or trust > actor_trust_by_type[st]:
-                                    actor_trust_by_type[st] = trust
-
-                            # Boost signal weights by actor credibility
-                            for sig in signals:
-                                src = getattr(sig, "source_module", "") or sig.family
-                                actor_boost = actor_trust_by_type.get(src, None)
-                                if actor_boost and actor_boost > 0.5:
-                                    # Scale weight: 0.5 trust = 1x, 0.9 trust = 1.8x
-                                    boost = 0.5 + actor_boost
-                                    if hasattr(sig, '_replace'):
-                                        sig = sig._replace(weight=sig.weight * boost)
-                                    elif hasattr(sig, 'weight'):
-                                        sig.weight = sig.weight * boost
-
-                            # Inject high-influence actor signals directly
-                            for asig in actor_sigs[:5]:  # Top 5 by influence
-                                if asig["actor_influence"] > 0.7:
-                                    signals.append(Signal(
-                                        name=f"actor:{asig['actor']}",
-                                        family="actor_intelligence",
-                                        value=asig["actor_trust"],
-                                        z_score=1.5 if asig["direction"] in ("buy", "bullish", "long") else -1.5,
-                                        direction="bullish" if asig["direction"] in ("buy", "bullish", "long") else "bearish",
-                                        weight=asig["actor_trust"] * asig["actor_influence"],
-                                        freshness_hours=0,
-                                    ))
-                    except Exception as exc:
-                        log.debug("Actor signal enrichment skipped for {t}: {e}", t=ticker, e=str(exc))
-
-                    # Apply credit-cycle-based family weighting
-                    if credit_family_boost:
-                        for sig in signals:
-                            src = getattr(sig, "source_module", "") or ""
-                            for family_key, boost in credit_family_boost.items():
-                                if family_key in src:
-                                    sig = sig._replace(weight=sig.weight * boost) if hasattr(sig, '_replace') else sig
-                    if len(signals) < 3:
-                        continue  # Not enough data for this model
-
-                    # Compute net direction
-                    bull_score = sum(s.z_score * s.weight for s in signals if s.direction == "bullish")
-                    bear_score = sum(abs(s.z_score) * s.weight for s in signals if s.direction == "bearish")
-
-                    if bull_score > bear_score:
-                        direction = "CALL"
-                        net_score = bull_score - bear_score
-                    elif bear_score > bull_score:
-                        direction = "PUT"
-                        net_score = bear_score - bull_score
-                    else:
-                        continue  # No signal
-
-                    # Anti-signals
-                    anti_signals = self._find_anti_signals(signals, direction)
-                    anti_deduction = sum(a.severity for a in anti_signals) * 0.3
-
-                    # Signal strength = net score - anti-signal deduction
-                    signal_strength = max(0, net_score - anti_deduction)
-                    coherence = self._compute_coherence(signals, direction)
-
-                    # ── Convergence amplification ──────────────────────
-                    # If trust_scorer detects 3+ independent sources
-                    # agreeing on this ticker+direction, boost confidence
-                    convergence_boost = 1.0
-                    try:
-                        convergence_events = self._get_convergence_for_ticker(ticker)
-                        pred_dir = "BUY" if direction in ("CALL", "LONG") else "SELL"
-                        for evt in convergence_events:
-                            if evt.get("signal_type") == pred_dir:
-                                # Boost: 10% per source above minimum 3
-                                src_count = evt.get("source_count", 0)
-                                combined_conf = evt.get("combined_confidence", 0.5)
-                                convergence_boost = 1.0 + 0.1 * (src_count - 2) * combined_conf
-                                # Inject convergence sources as additional signals
-                                for src in evt.get("sources", []):
-                                    signals.append(Signal(
-                                        name=f"convergence:{src['source_type']}",
-                                        family="convergence",
-                                        value=src.get("trust_score", 0.5),
-                                        z_score=1.5 if pred_dir == "BUY" else -1.5,
-                                        direction="bullish" if pred_dir == "BUY" else "bearish",
-                                        weight=src.get("trust_score", 0.5),
-                                        freshness_hours=0,
-                                    ))
-                                break  # Use first matching convergence event
-                    except Exception as e:
-                        log.debug("Convergence signal skipped for {t}: {e}", t=ticker, e=str(e))
-
-                    # Confidence = signal strength × coherence × model weight × convergence
-                    raw_confidence = signal_strength * coherence * model.weight * convergence_boost
-
-                    # Apply decision journal feedback (learn from recent hit/miss rate)
-                    journal_mult = journal_bias.get("confidence_multiplier", 1.0)
-                    raw_confidence *= journal_mult
-
-                    confidence = min(0.95, max(0.05, raw_confidence / 5.0))  # Normalize to 0-1
-
-                    # Expected move (conservative estimate)
-                    expected_move = signal_strength * 0.5  # 0.5% per unit of signal strength
-
-                    # Target price
-                    if direction == "CALL":
-                        target = spot * (1 + expected_move / 100)
-                    else:
-                        target = spot * (1 - expected_move / 100)
-
-                    # Expiry: next monthly options expiry (3rd Friday)
-                    expiry = self._next_monthly_expiry()
-
-                    # Create prediction
-                    pred_id = hashlib.md5(
-                        f"{ticker}:{model.name}:{direction}:{now.isoformat()}".encode()
-                    ).hexdigest()[:16]
-
-                    # Clamp expected move to ±30%
-                    if expected_move < -30.0 or expected_move > 30.0:
-                        log.debug("Clamping expected_move from {orig} to ±30% for {t}",
-                                   orig=expected_move, t=ticker)
-                        expected_move = max(-30.0, min(30.0, expected_move))
-
-                    pred = OraclePrediction(
-                        id=pred_id,
-                        timestamp=now,
-                        ticker=ticker,
-                        prediction_type=PredictionType.DIRECTION,
-                        direction=direction,
-                        target_price=round(target, 2),
-                        current_price=spot,
-                        expiry=expiry,
-                        confidence=round(confidence, 4),
-                        expected_move_pct=round(expected_move, 2),
-                        signals=signals[:10],  # Top 10 signals
-                        anti_signals=anti_signals[:5],  # Top 5 anti-signals
-                        signal_strength=round(signal_strength, 3),
-                        coherence=round(coherence, 3),
-                        model_name=model.name,
-                        model_version=model.version,
-                        model_weights={m.name: m.weight for m in self.models},
-                        flow_context=flow_ctx,
-                    )
-
-                    all_predictions.append(pred)
-
-                except Exception as e:
-                    log.warning("Model {m} failed for {t}: {e}", m=model.name, t=ticker, e=str(e))
-            elapsed = (datetime.now(timezone.utc) - ticker_started).total_seconds()
-            log.info(
-                "Oracle ticker complete {idx}/{total}: {ticker} in {seconds:.1f}s; cumulative predictions={n}",
-                idx=idx,
-                total=total_tickers,
-                ticker=ticker,
-                seconds=elapsed,
-                n=len(all_predictions),
-            )
+        if _max_workers <= 1:
+            for idx_t in enumerate(tickers, start=1):
+                all_predictions.extend(_run_one(idx_t))
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=_max_workers) as ex:
+                for preds in ex.map(_run_one, enumerate(tickers, start=1)):
+                    all_predictions.extend(preds)
 
         # Sort by confidence
         all_predictions.sort(key=lambda p: -p.confidence)
