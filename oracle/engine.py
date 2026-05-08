@@ -1475,12 +1475,12 @@ class OracleEngine:
                 log.warning("Model {m} failed for {t}: {e}", m=model.name, t=ticker, e=str(e))
         elapsed = (datetime.now(timezone.utc) - ticker_started).total_seconds()
         log.info(
-            "Oracle ticker complete {idx}/{total}: {ticker} in {seconds:.1f}s; cumulative predictions={n}",
+            "Oracle ticker complete {idx}/{total}: {ticker} in {seconds:.1f}s; predictions={n}",
             idx=idx,
             total=total_tickers,
             ticker=ticker,
             seconds=elapsed,
-            n=len(all_predictions),
+            n=len(ticker_predictions),
         )
 
         return ticker_predictions
