@@ -15,7 +15,7 @@ import pandas as pd
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
-from ingestion.base import BasePuller
+from ingestion.base import BasePuller, log_pull_failure
 
 # IMF IFS series: (search_terms, period, country) -> feature name
 IMF_IFS_SERIES: dict[tuple[str, str, str], str] = {
@@ -130,7 +130,11 @@ class IMFPuller(BasePuller):
             log.info("IMF IFS {fn}: inserted {n} rows", fn=feature_name, n=inserted)
 
         except Exception as exc:
-            log.error("IMF IFS pull failed: {err}", err=str(exc))
+            # Network / DNS failures (NameResolutionError, ConnectionError,
+            # timeouts) get demoted to WARNING by log_pull_failure — these
+            # are transient upstream issues, not GRID bugs. Real code bugs
+            # (KeyError, AttributeError, …) still log ERROR.
+            log_pull_failure("IMF IFS", feature_name, exc)
             result["status"] = "FAILED"
             result["errors"].append(str(exc))
 
@@ -162,7 +166,20 @@ class IMFPuller(BasePuller):
         }
 
         try:
-            from imfdatapy.imf import WEO
+            try:
+                from imfdatapy.imf import WEO
+            except ImportError as imp_exc:
+                # imfdatapy >=0.1.7 dropped the WEO class. Until the
+                # ingestor is rewritten against the new API, treat this
+                # like any other missing optional dep: WARN once per
+                # cycle and skip gracefully so errors.jsonl stays clean.
+                log.warning(
+                    "IMF WEO unavailable from imfdatapy ({e}); skipping",
+                    e=str(imp_exc),
+                )
+                result["status"] = "SKIPPED"
+                result["errors"].append(f"imfdatapy.WEO import: {imp_exc}")
+                return result
 
             weo = WEO()
             df = weo.download_data()
@@ -208,7 +225,10 @@ class IMFPuller(BasePuller):
             log.info("IMF WEO: inserted {n} rows", n=inserted)
 
         except Exception as exc:
-            log.error("IMF WEO pull failed: {err}", err=str(exc))
+            # Network / parse / library-internal failures: demote to
+            # WARNING via log_pull_failure unless it's a real GRID code
+            # bug (KeyError, AttributeError, …).
+            log_pull_failure("IMF WEO", "weo_all", exc)
             result["status"] = "FAILED"
             result["errors"].append(str(exc))
 

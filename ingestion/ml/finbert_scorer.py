@@ -398,6 +398,28 @@ class FinBERTScorer:
         Returns:
             List of per-source summary dicts.
         """
+        # Load the model once up front. If transformers can't import
+        # BertForSequenceClassification (torch/transformers env mismatch)
+        # we previously logged ERROR five times — once per source — even
+        # though every source would hit the identical wall. Surface the
+        # one actionable line and skip the rest with WARNING.
+        try:
+            self._ensure_model()
+        except Exception as exc:
+            log.error(
+                "FinBERT model load failed; skipping all sources this cycle: {e}",
+                e=str(exc),
+            )
+            return [
+                {
+                    "source": source_name,
+                    "rows_scored": 0,
+                    "status": "SKIPPED",
+                    "error": f"model unavailable: {exc}",
+                }
+                for source_name in SOURCE_TEXT_KEYS
+            ]
+
         results = []
         for source_name in SOURCE_TEXT_KEYS:
             try:

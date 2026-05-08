@@ -166,6 +166,19 @@ class TiingoPuller(BasePuller):
             log.warning("Tiingo HTTP error for {t}: {e}", t=ticker, e=str(e))
             result["status"] = "FAILED"
             result["errors"].append(str(e))
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ReadTimeout,
+            requests.exceptions.ConnectTimeout,
+        ) as e:
+            # Network blips (read/connect timeouts, DNS, transient
+            # disconnects) are expected and resolve themselves on the
+            # next cycle. Per CLAUDE.md log-level hygiene, demote to
+            # WARNING so errors.jsonl stays signal-rich.
+            log.warning("Tiingo network blip for {t}: {e}", t=ticker, e=str(e))
+            result["status"] = "FAILED"
+            result["errors"].append(str(e))
         except Exception as exc:
             # Detect IndexCorrupted on uq_raw_series_composite: this is a
             # catastrophic Postgres-level failure that requires an operator

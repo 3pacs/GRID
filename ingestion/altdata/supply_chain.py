@@ -246,14 +246,6 @@ class SupplyChainPuller(BasePuller):
                 timeout=_REQUEST_TIMEOUT,
             )
             resp.raise_for_status()
-            data = resp.json()
-
-            if isinstance(data, list):
-                return data
-            elif isinstance(data, dict):
-                return data.get("history", data.get("data", []))
-            return []
-
         except requests.RequestException as exc:
             log.warning(
                 "Freightos historical fetch failed for {r}: {e}",
@@ -261,13 +253,28 @@ class SupplyChainPuller(BasePuller):
                 e=str(exc),
             )
             raise
+
+        # JSON decode lives outside the RequestException handler because
+        # newer requests (>=2.27) makes JSONDecodeError a subclass of
+        # RequestException. Without this split, the captcha/HTML splash
+        # body that Freightos serves under load would re-raise into the
+        # retry decorator and burn 3 attempts before logging an ERROR.
+        try:
+            data = resp.json()
         except (json.JSONDecodeError, ValueError) as exc:
             log.warning(
-                "Freightos historical parse failed for {r}: {e}",
+                "Freightos historical parse failed for {r} "
+                "(likely HTML/empty body): {e}",
                 r=route,
                 e=str(exc),
             )
             return []
+
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return data.get("history", data.get("data", []))
+        return []
 
     def _pull_freightos(
         self,

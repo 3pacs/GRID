@@ -200,7 +200,24 @@ def forecast_signals(
             freq = [0] * len(inputs)  # 0 = daily
             point_fc, quantile_fc = model.forecast(inputs, freq)
     except Exception as exc:
-        log.error("TimesFM forecast failed: {e}", e=str(exc))
+        # CUDA kernel-image / device-capability mismatches are an
+        # environment problem (torch wheel built for a different
+        # compute capability than the installed GPU), not a GRID code
+        # bug. The hermes scheduler already blacklists timesfm_cycle
+        # after the timeout. Per CLAUDE.md log-level hygiene, demote
+        # the recurring CUDA blow-up to WARNING so errors.jsonl stays
+        # signal-rich. Other forecast failures still log ERROR.
+        msg = str(exc)
+        cuda_env_issue = (
+            "no kernel image is available" in msg
+            or "CUDA error" in msg
+            or "CUDA out of memory" in msg
+            or "cudaErrorNoKernelImageForDevice" in msg
+        )
+        if cuda_env_issue:
+            log.warning("TimesFM forecast skipped (CUDA env issue): {e}", e=msg)
+        else:
+            log.error("TimesFM forecast failed: {e}", e=msg)
         raise
     elapsed = _time.time() - t0
     log.info("TimesFM inference done in {t:.1f}s ({n} signals)",
