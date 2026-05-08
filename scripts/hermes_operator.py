@@ -91,7 +91,8 @@ SIGNAL_CLASSIFICATION_TIMEOUT_SECONDS = 120   # gemma micro classifier batch
 ANOMALY_NARRATION_TIMEOUT_SECONDS = 90        # gemma micro anomaly narrator
 KNOWLEDGE_MAP_TIMEOUT_SECONDS = 120           # gemma micro knowledge mapper
 DIAGNOSE_PULLS_TIMEOUT_SECONDS = 120          # Hermes pull diagnosis/fix step
-SMART_INGESTION_TIMEOUT_SECONDS = 240         # smart_scheduler.tick()
+SMART_INGESTION_TIMEOUT_SECONDS = 300         # smart_scheduler.tick() — matches TICK_TIME_BUDGET_S in ingestion/smart_scheduler.py so Hermes doesn't pull the plug while SmartScheduler is mid-shutdown
+TIMESFM_TIMEOUT_SECONDS = 240                 # oracle/forecaster_adapter.run_timesfm_forecast_cycle
 INTELLIGENCE_TASKS_TIMEOUT_SECONDS = 180      # cross-ref/source-audit/postmortems
 
 
@@ -1513,13 +1514,27 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
             log.info("Running TimesFM forecast cycle...")
             if not dry_run:
                 from oracle.forecaster_adapter import run_timesfm_forecast_cycle
-                tfm_result = run_timesfm_forecast_cycle(engine)
-                cycle_result["timesfm"] = tfm_result
-                state.last_timesfm_cycle = now
-                log.info(
-                    "TimesFM: {n} forecasts generated",
-                    n=tfm_result.get("forecasts", 0),
+                # Wrap with the cycle's stage-timeout pattern. Without
+                # this, run_timesfm_forecast_cycle could hang the entire
+                # Hermes cycle past CYCLE_TIMEOUT_SECONDS — which is
+                # exactly what cycle 292 logged (`TIMED OUT after 600s
+                # stuck on: timesfm_cycle`). The function takes (engine,)
+                # — _run_with_timeout calls fn() so wrap as a thunk.
+                tfm_result, ok = _run_with_timeout(
+                    "timesfm_cycle",
+                    lambda: run_timesfm_forecast_cycle(engine),
+                    TIMESFM_TIMEOUT_SECONDS,
+                    state,
                 )
+                if ok and tfm_result:
+                    cycle_result["timesfm"] = tfm_result
+                    state.last_timesfm_cycle = now
+                    log.info(
+                        "TimesFM: {n} forecasts generated",
+                        n=tfm_result.get("forecasts", 0),
+                    )
+                else:
+                    cycle_result["timesfm"] = {"timeout": True}
             else:
                 log.info("[DRY RUN] Would run TimesFM forecast cycle")
     except Exception as exc:
