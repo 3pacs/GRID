@@ -90,10 +90,10 @@ ORACLE_CYCLE_TIMEOUT_SECONDS = 300            # oracle.run_cycle (LLM-bound)
 SIGNAL_CLASSIFICATION_TIMEOUT_SECONDS = 120   # gemma micro classifier batch
 ANOMALY_NARRATION_TIMEOUT_SECONDS = 90        # gemma micro anomaly narrator
 KNOWLEDGE_MAP_TIMEOUT_SECONDS = 120           # gemma micro knowledge mapper
-DIAGNOSE_PULLS_TIMEOUT_SECONDS = 120          # Hermes pull diagnosis/fix step
+DIAGNOSE_PULLS_TIMEOUT_SECONDS = 240          # Hermes pull diagnosis/fix step — bumped 2026-05-08 because diagnose runs per-source retry which can chain HTTP calls
 SMART_INGESTION_TIMEOUT_SECONDS = 300         # smart_scheduler.tick() — matches TICK_TIME_BUDGET_S in ingestion/smart_scheduler.py so Hermes doesn't pull the plug while SmartScheduler is mid-shutdown
 TIMESFM_TIMEOUT_SECONDS = 240                 # oracle/forecaster_adapter.run_timesfm_forecast_cycle
-INTELLIGENCE_TASKS_TIMEOUT_SECONDS = 180      # cross-ref/source-audit/postmortems
+INTELLIGENCE_TASKS_TIMEOUT_SECONDS = 360      # trust/forecasts/thesis/cross-ref/options + daily-window backtest_scanner.review_existing_hypotheses (LLM-bound). Bumped 2026-05-08 from 180s after the timeout machinery was actually working — 180s was empirical-untested guess; 360s reflects observed daily run length with LLM calls
 
 
 def _run_with_timeout(name: str, fn, timeout_s: int, state):
