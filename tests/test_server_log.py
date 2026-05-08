@@ -199,6 +199,30 @@ class TestGitSinkWrite:
         sink.write(_record("error 2"))
         assert sink._pending_count == 2
 
+    def test_self_prefixed_messages_are_dropped(self, tmp_path):
+        """Sink-internal loguru messages must not recurse into errors.jsonl."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        level = MagicMock()
+        level.name = "ERROR"
+        message = MagicMock()
+        message.record = {
+            "level": level,
+            "name": "server_log.git_sink",
+            "function": "_commit_and_push",
+            "line": 250,
+            "message": "[server_log] git push failed after retries: remote down",
+            "exception": None,
+        }
+
+        sink.write(message)
+
+        errors_file = tmp_path / ".server-logs" / "errors.jsonl"
+        assert not errors_file.exists()
+        assert sink._pending_count == 0
+
 
 class TestGitSinkDedup:
     """The dedup window is the universal backstop against error-log floods.
@@ -492,6 +516,61 @@ class TestGitSinkCommit:
             level == "WARNING" and "git commit failed" in message
             for level, message in seen
         )
+
+    @patch.dict("os.environ", {"GIT_SINK_PUSH_ENABLED": "true"})
+    @patch("server_log.git_sink.time.sleep")
+    @patch("server_log.git_sink._git")
+    def test_push_failure_reports_to_stderr_not_loguru(
+        self,
+        mock_git,
+        mock_sleep,
+        tmp_path,
+        capsys,
+    ):
+        """Push retry exhaustion is sink-internal and must bypass loguru."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+
+        sink = GitSink(
+            repo_root=tmp_path,
+            sanitizer=Sanitizer(),
+            push_interval=9999,
+            branch="main",
+        )
+        sink._pending_count = 1
+        mock_git.side_effect = [
+            (0, "add ok"),
+            (0, "commit ok"),
+            (1, "remote down"),
+            (1, "remote down"),
+            (1, "remote down"),
+            (1, "remote down"),
+        ]
+
+        sink._commit_and_push()
+
+        captured = capsys.readouterr()
+        assert "[server_log] git push failed after retries: remote down" in captured.err
+        assert mock_sleep.call_count == 3
+        errors_file = tmp_path / ".server-logs" / "errors.jsonl"
+        if errors_file.exists():
+            assert "git push failed" not in errors_file.read_text()
+
+    def test_push_cycle_exception_reports_to_stderr(self, tmp_path, capsys):
+        """Timer exceptions should be visible without re-entering GitSink."""
+        (tmp_path / ".git").mkdir()
+        from server_log.git_sink import GitSink
+
+        sink = GitSink(repo_root=tmp_path, sanitizer=Sanitizer(), push_interval=9999)
+        with (
+            patch.object(sink, "_commit_and_push", side_effect=RuntimeError("boom")),
+            patch.object(sink, "_schedule_push") as mock_schedule,
+        ):
+            sink._push_cycle()
+
+        captured = capsys.readouterr()
+        assert "[server_log] git push failed: boom" in captured.err
+        mock_schedule.assert_called_once()
 
 
 # ===================================================================
