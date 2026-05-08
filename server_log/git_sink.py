@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -37,6 +38,7 @@ if TYPE_CHECKING:
 _DEFAULT_PUSH_INTERVAL_SECONDS = 300  # 5 minutes
 _LOGS_DIR_NAME = ".server-logs"
 _ERRORS_FILE = "errors.jsonl"
+_SELF_LOG_PREFIX = "[server_log]"
 
 # Dedup: identical (module, function, line, normalised-message) within this
 # window collapses to one entry that records the suppressed count.  Prevents
@@ -50,6 +52,15 @@ _MAX_FILE_SIZE_MB = 50.0
 # stops the recurring "Author identity unknown" ERROR cascade.
 _DEFAULT_AUTHOR_NAME = "GRID Error Logger"
 _DEFAULT_AUTHOR_EMAIL = "grid-bot@localhost"
+
+
+def _stderr_warn(message: str) -> None:
+    """Report sink-internal failures without sending them back through loguru."""
+    try:
+        sys.stderr.write(f"{_SELF_LOG_PREFIX} {message}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
 
 
 def _repo_root() -> Path:
@@ -154,11 +165,14 @@ class GitSink:
     def write(self, message: Message) -> None:
         """Called by loguru for each log record at the configured level."""
         record = message.record
+        raw_msg = str(record.get("message", ""))
+        if raw_msg.startswith(_SELF_LOG_PREFIX):
+            return
+
         entry = self._format_entry(record)
 
         # Dedup: collapse repeated identical errors into one entry per window.
         # The "raw" message (loguru template, not interpolated) is most stable.
-        raw_msg = str(record.get("message", ""))
         key = (
             record.get("name", ""),
             record.get("function", ""),
@@ -245,7 +259,7 @@ class GitSink:
             self._commit_and_push()
         except Exception as exc:
             # Never let push failures crash the timer
-            _fallback_log.error("[server_log] git push failed: {e}", e=exc)
+            _stderr_warn(f"git push failed: {exc}")
         finally:
             self._schedule_push()
 
@@ -307,7 +321,7 @@ class GitSink:
                 import time
                 time.sleep(delay)
 
-        _fallback_log.error("[server_log] git push failed after retries: {out}", out=out)
+        _stderr_warn(f"git push failed after retries: {out}")
 
     def _detect_branch(self) -> str | None:
         """Return the current git branch name."""
