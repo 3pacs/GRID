@@ -9874,3 +9874,10 @@
 {"ts": "2026-05-09T00:37:36.672333+00:00", "level": "ERROR", "module": "__main__", "function": "<module>", "line": 183, "message": "  FAIL: ETH ETH bounces from $2111 if tested", "exception": null}
 {"ts": "2026-05-09T00:37:36.676228+00:00", "level": "ERROR", "module": "__main__", "function": "<module>", "line": 183, "message": "  FAIL: SOL SOL holds $87 support into tomorrow", "exception": null}
 {"ts": "2026-05-09T00:37:36.702684+00:00", "level": "ERROR", "module": "__main__", "function": "<module>", "line": 183, "message": "  FAIL: BTC BTC closes today above $70800", "exception": null}
+{"ts": "2026-05-09T01:38:08.685177+00:00", "level": "ERROR", "module": "ingestion.base", "function": "wrapper", "line": 213, "message": "[deduped: 5 suppressed in last 28995s] _fetch_freightos_historical failed after 3 attempts: Expecting value: line 2 column 1 (char 1)", "exception": null}
+{"ts": "2026-05-09T01:39:22.957404+00:00", "level": "ERROR", "module": "__main__", "function": "<module>", "line": 183, "message": "  FAIL: BTC BTC holds above $70092 for next 4 hours", "exception": null}
+{"ts": "2026-05-09T01:39:22.966240+00:00", "level": "ERROR", "module": "__main__", "function": "<module>", "line": 183, "message": "  FAIL: BTC BTC dips to $68676 within 12 hours", "exception": null}
+{"ts": "2026-05-09T01:39:22.996625+00:00", "level": "ERROR", "module": "__main__", "function": "<module>", "line": 183, "message": "  FAIL: ETH ETH/BTC ratio continues declining today", "exception": null}
+{"ts": "2026-05-09T01:39:23.003247+00:00", "level": "ERROR", "module": "__main__", "function": "<module>", "line": 183, "message": "  FAIL: ETH ETH bounces from $2111 if tested", "exception": null}
+{"ts": "2026-05-09T01:39:23.007748+00:00", "level": "ERROR", "module": "__main__", "function": "<module>", "line": 183, "message": "  FAIL: SOL SOL holds $87 support into tomorrow", "exception": null}
+{"ts": "2026-05-09T01:39:23.039189+00:00", "level": "ERROR", "module": "__main__", "function": "<module>", "line": 183, "message": "  FAIL: BTC BTC closes today above $70800", "exception": null}
