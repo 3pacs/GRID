@@ -89,7 +89,14 @@ def detect_ram_gb():
 
 
 def detect_gpu():
-    """Detect NVIDIA GPU via nvidia-smi."""
+    """Detect NVIDIA GPU(s) via nvidia-smi.
+
+    Aggregates ALL GPUs on the host:
+      - name: the LARGEST card (used by coordinator for capability filtering).
+      - vram: SUM of every card's VRAM in GB (true total available capacity).
+    Hosts with multiple GPUs (gridz4, panda, ocr-node, grid-svr) previously
+    under-reported by registering only the first row.
+    """
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
@@ -106,10 +113,13 @@ def detect_gpu():
                 except ValueError:
                     continue
             if rows:
-                # Register the largest GPU so the coordinator has a stable,
-                # conservative capability view even on mixed-card hosts.
-                name, vram = max(rows, key=lambda row: row[1])
-                return name, round(vram, 1)
+                # Largest card name for capability filtering by coordinator.
+                largest_name, _ = max(rows, key=lambda row: row[1])
+                # Sum all VRAM so multi-GPU hosts report true total capacity.
+                total_vram = sum(vram for _, vram in rows)
+                if len(rows) > 1:
+                    largest_name = f"{largest_name} (+{len(rows)-1} more)"
+                return largest_name, round(total_vram, 1)
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
     return None, None
@@ -355,6 +365,45 @@ def run_llm_inference(params):
 
 
 def run_backtest(params):
+    """Walk-forward backtest. Branches on params['kind']."""
+    kind = params.get("kind", "model_walkforward")
+    if kind == "rotation_variant":
+        return _run_rotation_variant(params)
+    return _run_model_walkforward(params)
+
+
+def _run_rotation_variant(params):
+    from datetime import date as _date
+    from db import get_engine
+    from alpha_research.strategies.rotation_variant_backtest import (
+        backtest_rotation_variant, RotationConfig,
+    )
+    tunables = (
+        "TREND_WEEKS", "VIX_ZSCORE_THRESHOLD", "DRAWDOWN_THRESHOLD",
+        "DRAWDOWN_WINDOW", "FAST_RISK_OFF_DURATION", "FAST_RISK_OFF_CASH_FLOOR",
+        "RANKING_WEEKS", "ABSOLUTE_STOP", "TRAILING_STOP", "COOLDOWN_DAYS",
+        "MAX_ACTIVE_GROUPS",
+    )
+    cfg_kwargs = {k: params[k] for k in tunables if k in params}
+    cfg = RotationConfig(**cfg_kwargs)
+    ws = _date.fromisoformat(params.get("window_start", "2024-01-01"))
+    we = _date.fromisoformat(params.get("window_end", "2026-03-25"))
+    metrics = backtest_rotation_variant(get_engine(), cfg, ws, we)
+    if "error" in metrics:
+        return {"error": metrics["error"]}
+    return {"output": metrics, "metrics": {
+        "total_return": metrics.get("total_return"),
+        "sharpe": metrics.get("sharpe"),
+        "max_drawdown": metrics.get("max_drawdown"),
+        "alpha_vs_benchmark": metrics.get("alpha_vs_benchmark"),
+        "rebalance_count": metrics.get("rebalance_count"),
+        "config_id": metrics.get("config_id"),
+        "backtest_run_id": metrics.get("backtest_run_id"),
+    }}
+
+
+def _run_model_walkforward(params):
+
     """Run walk-forward backtest for a model/hypothesis.
 
     Parameters (from params dict):

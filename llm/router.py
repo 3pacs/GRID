@@ -81,13 +81,19 @@ def _fallback_chain(tier: Tier, provider: str) -> list[str]:
     Only ``Tier.BATCH`` reaches it.
     """
     if tier == Tier.LOCAL:
-        chain = ["llamacpp_quick", "llamacpp_z4", "llamacpp", "gemma", "ollama", "openrouter", "openai"]
+        # Lightweight tier — koala and ocr-node host the cheap small models;
+        # gridz4 is overkill for LOCAL but still a fast fallback.
+        chain = ["llamacpp_quick", "ollama_koala", "ollama_ocr", "llamacpp_z4", "llamacpp", "gemma", "ollama", "ollama_panda", "openrouter", "openai"]
     elif tier == Tier.ORACLE:
-        chain = ["llamacpp_oracle", "llamacpp", "llamacpp_z4", "gemma", "openrouter", "openai"]
+        # gridz4 (Blackwell + Qwen3.6-35B-A3B Claude-Opus-distill) is now the
+        # primary ORACLE node. grid-svr's Pascal P100+GTX1070 27B (`llamacpp_oracle`)
+        # demoted to fallback 2026-05-09. ollama_panda (qwen2.5:32b on 2×P100)
+        # is the next-strongest tier-3 fallback.
+        chain = ["llamacpp_z4", "llamacpp_oracle", "ollama_panda", "llamacpp", "gemma", "openrouter", "openai"]
     elif tier == Tier.BATCH:
-        chain = ["llamacpp_batch", "llamacpp_oracle", "openrouter", "openai"]
+        chain = ["llamacpp_batch", "llamacpp_oracle", "llamacpp_z4", "ollama_panda", "openrouter", "openai"]
     else:
-        chain = ["llamacpp_quick", "llamacpp", "llamacpp_z4", "gemma", "ollama", "openrouter", "openai"]
+        chain = ["llamacpp_quick", "llamacpp_z4", "ollama_koala", "ollama_ocr", "llamacpp", "gemma", "ollama", "ollama_panda", "openrouter", "openai"]
     return [candidate for candidate in chain if candidate != provider]
 
 
@@ -181,6 +187,12 @@ def _create_client(provider: str) -> Any:
         return _create_anthropic_client(settings)
     elif provider == "ollama":
         return _create_ollama_client(settings)
+    elif provider == "ollama_panda":
+        return _create_ollama_panda_client(settings)
+    elif provider == "ollama_ocr":
+        return _create_ollama_ocr_client(settings)
+    elif provider == "ollama_koala":
+        return _create_ollama_koala_client(settings)
     elif provider == "llamacpp":
         return _create_llamacpp_client(settings)
     elif provider == "openai":
@@ -249,6 +261,66 @@ def _create_ollama_client(settings: Any) -> Any:
         )
     except Exception as exc:
         log.debug("Ollama client init failed: {e}", e=str(exc))
+        return None
+
+
+def _create_ollama_panda_client(settings: Any) -> Any:
+    """Ollama on the panda node (2× P100 16GB) — qwen2.5:32b."""
+    if not getattr(settings, "OLLAMA_PANDA_ENABLED", False):
+        return None
+    try:
+        from ollama.client import OllamaClient
+        return OllamaClient(
+            base_url=getattr(settings, "OLLAMA_PANDA_BASE_URL", "http://panda:11434"),
+            model=getattr(settings, "OLLAMA_PANDA_CHAT_MODEL", "qwen2.5:32b"),
+            timeout=getattr(settings, "OLLAMA_PANDA_TIMEOUT_SECONDS", 240),
+        )
+    except Exception as exc:
+        log.debug("Ollama panda client init failed: {e}", e=str(exc))
+        return None
+
+
+def _create_ollama_koala_client(settings: Any) -> Any:
+    """Ollama on koala (2× GTX TITAN X Maxwell 12GB) — gemma2:9b on card 0.
+
+    Card 1 on koala is reserved for Whisper + Kokoro TTS, served by
+    separate processes. Embeddings are also served from this Ollama
+    instance via OLLAMA_KOALA_EMBED_MODEL.
+    """
+    if not getattr(settings, "OLLAMA_KOALA_ENABLED", False):
+        return None
+    try:
+        from ollama.client import OllamaClient
+        return OllamaClient(
+            base_url=getattr(settings, "OLLAMA_KOALA_BASE_URL", "http://koala:11434"),
+            model=getattr(settings, "OLLAMA_KOALA_CHAT_MODEL", "gemma2:9b"),
+            embed_model=getattr(settings, "OLLAMA_KOALA_EMBED_MODEL", "nomic-embed-text"),
+            timeout=getattr(settings, "OLLAMA_KOALA_TIMEOUT_SECONDS", 120),
+        )
+    except Exception as exc:
+        log.debug("Ollama koala client init failed: {e}", e=str(exc))
+        return None
+
+
+def _create_ollama_ocr_client(settings: Any) -> Any:
+    """Ollama on the ocr-node (2× 8GB Ampere) — gemma2:9b for general use.
+
+    The vision models on ocr-node (qwen2.5vl:7b, minicpm-v:8b) are not
+    routed through the standard chain; vision callers should target
+    ``ollama_ocr`` directly with ``model=`` override or call Ollama
+    directly on this URL.
+    """
+    if not getattr(settings, "OLLAMA_OCR_ENABLED", False):
+        return None
+    try:
+        from ollama.client import OllamaClient
+        return OllamaClient(
+            base_url=getattr(settings, "OLLAMA_OCR_BASE_URL", "http://ocr-node:11434"),
+            model=getattr(settings, "OLLAMA_OCR_CHAT_MODEL", "gemma2:9b"),
+            timeout=getattr(settings, "OLLAMA_OCR_TIMEOUT_SECONDS", 120),
+        )
+    except Exception as exc:
+        log.debug("Ollama ocr client init failed: {e}", e=str(exc))
         return None
 
 

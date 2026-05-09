@@ -21,7 +21,7 @@ from api.dependencies import get_db_engine
 router = APIRouter(prefix="/api/v1/search", tags=["intelligence-search"])
 
 # Valid source types that can appear in the materialized view
-_VALID_TYPES = frozenset({"actor", "signal", "hypothesis", "snapshot"})
+_VALID_TYPES = frozenset({"actor", "signal", "hypothesis", "snapshot", "news"})
 
 
 @router.get("/intelligence")
@@ -29,7 +29,7 @@ def search_intelligence(
     q: str = Query(..., min_length=1, max_length=500, description="Search query"),
     types: str | None = Query(
         default=None,
-        description="Comma-separated source types to search: actor,signal,hypothesis,snapshot",
+        description="Comma-separated source types to search: actor,signal,hypothesis,snapshot,news",
     ),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),

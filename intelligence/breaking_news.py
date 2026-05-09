@@ -35,9 +35,9 @@ if _PROJECT_ROOT not in sys.path:
 POLL_INTERVAL_SECONDS = 60
 SPIKE_MULTIPLIER = 3.0          # articles must exceed baseline * multiplier
 COOLDOWN_SECONDS = 15 * 60      # 15 min cooldown per query after detection
-GDELT_TIMESPAN_MINUTES = 5
+GDELT_TIMESPAN_MINUTES = 60
 GDELT_TIMEOUT_SECONDS = 10
-GDELT_REQUEST_SPACING = 6.0    # seconds between GDELT requests (free tier ~10/min)
+GDELT_REQUEST_SPACING = 12.0   # seconds between GDELT requests (defensive after sustained 429s)
 CACHE_INVALIDATION_FILE = Path("/tmp/grid_cache_invalidation")
 
 # Positive and negative keyword sets for rudimentary direction inference
@@ -94,15 +94,27 @@ def check_gdelt(query: str, minutes: int = GDELT_TIMESPAN_MINUTES) -> int:
     Returns 0 on any error (graceful degradation).
     """
     url = "https://api.gdeltproject.org/api/v2/doc/doc"
+    # GDELT requires OR'd queries to be wrapped in parentheses.
+    safe_query = f"({query})" if " OR " in query and not query.startswith("(") else query
     params = {
-        "query": query,
-        "mode": "artcount",
+        "query": safe_query,
+        "mode": "TimelineVolRaw",
         "timespan": f"{minutes}min",
         "format": "json",
     }
     try:
         resp = requests.get(url, params=params, timeout=GDELT_TIMEOUT_SECONDS)
+        if resp.status_code == 429:
+            log.warning("GDELT 429 rate-limited for '{q}' — backing off", q=query[:40])
+            time.sleep(GDELT_REQUEST_SPACING)
+            return 0
         resp.raise_for_status()
+        # GDELT sometimes returns text body even on 200 (e.g., 'Invalid mode.',
+        # 'Timespan is too short.'). Detect that before json().
+        body = resp.text.lstrip()
+        if not body.startswith('{') and not body.startswith('['):
+            log.warning("GDELT non-JSON 200 for '{q}': {b}", q=query[:40], b=body[:120])
+            return 0
         data = resp.json()
         # GDELT artcount returns {"artcount": N} or a timeline array.
         # Handle both formats.

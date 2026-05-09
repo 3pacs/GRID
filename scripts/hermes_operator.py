@@ -66,7 +66,7 @@ from sqlalchemy import text  # used by run_cycle DB writes
 # ─── Configuration ───────────────────────────────────────────────────
 
 CYCLE_INTERVAL_SECONDS = 300          # 5 minutes between cycles
-CYCLE_TIMEOUT_SECONDS = 600           # 10 min max per cycle — abort if stuck
+CYCLE_TIMEOUT_SECONDS = 4500          # 75 min max per cycle (oracle dominates one in N cycles)
                                        # (per-step timeouts kick in earlier; this
                                        # is a safety net for unforeseen hangs)
 PIPELINE_INTERVAL_HOURS = 6           # run full pipeline every 6 hours
@@ -86,7 +86,7 @@ TIMEOUT_BLACKLIST_HOURS = 24          # blacklist sources that cause cycle timeo
 # Per-step timeouts — caps how long a single step can hold up the cycle.
 # Hung LLM calls used to consume the full 900s cycle budget; these caps + the
 # cooldown blacklist break the loop after a single timeout.
-ORACLE_CYCLE_TIMEOUT_SECONDS = 300            # oracle.run_cycle (LLM-bound)
+ORACLE_CYCLE_TIMEOUT_SECONDS = 4000           # oracle.run_cycle: 41 tickers x ~80s + headroom (was 300, caused 24h blacklist loop)
 SIGNAL_CLASSIFICATION_TIMEOUT_SECONDS = 120   # gemma micro classifier batch
 ANOMALY_NARRATION_TIMEOUT_SECONDS = 90        # gemma micro anomaly narrator
 KNOWLEDGE_MAP_TIMEOUT_SECONDS = 120           # gemma micro knowledge mapper
@@ -1483,6 +1483,10 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         if hours_since_oracle >= 6 and state.cooldowns.can_retry("oracle_cycle"):
             state.current_step = "oracle_cycle"
             log.info("Running Oracle prediction cycle...")
+            # Record cycle start eagerly: even if the inner timeout fires
+            # the orphan thread keeps running and writes predictions to DB.
+            # We must NOT refire oracle for another 6h regardless. (2026-05-09)
+            state.last_oracle_cycle = now
             if not dry_run:
                 from oracle.engine import OracleEngine
                 from oracle.report import send_oracle_report
