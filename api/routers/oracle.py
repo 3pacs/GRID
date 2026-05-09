@@ -89,7 +89,7 @@ def get_predictions(
     elif status == "scored":
         where_clauses.append("verdict IN ('hit', 'miss', 'partial')")
 
-    where_sql = " AND ".join(["1=1"] + where_clauses)
+    where_sql = " AND ".join(["dedup_keep = TRUE"] + where_clauses)
 
     with engine.connect() as conn:
         count_row = conn.execute(
@@ -192,6 +192,7 @@ def get_latest(
         # Get the most recent cycle timestamp
         latest_ts = conn.execute(text("""
             SELECT created_at FROM oracle_predictions
+            WHERE dedup_keep = TRUE
             ORDER BY created_at DESC LIMIT 1
         """)).fetchone()
 
@@ -208,6 +209,7 @@ def get_latest(
                    flow_context, created_at
             FROM oracle_predictions
             WHERE created_at >= :ct - INTERVAL '5 minutes'
+              AND dedup_keep = TRUE
             ORDER BY confidence DESC
             LIMIT 20
         """), {"ct": cycle_time}).fetchall()
@@ -234,6 +236,7 @@ def get_latest(
                    model_name, expiry
             FROM oracle_predictions
             WHERE verdict IN ('hit', 'miss', 'partial')
+              AND dedup_keep = TRUE
             ORDER BY scored_at DESC
             LIMIT 20
         """)).fetchall()
@@ -285,6 +288,7 @@ def _compute_streak(engine) -> dict:
         rows = conn.execute(text("""
             SELECT verdict FROM oracle_predictions
             WHERE verdict IN ('hit', 'miss', 'partial')
+              AND dedup_keep = TRUE
             ORDER BY scored_at DESC
             LIMIT 50
         """)).fetchall()

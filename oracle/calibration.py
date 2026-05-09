@@ -84,6 +84,7 @@ def compute_calibration(
         SELECT confidence, verdict
         FROM oracle_predictions
         WHERE verdict IN ('hit', 'miss', 'partial')
+          AND dedup_keep = TRUE
     """
     params: dict[str, Any] = {}
 

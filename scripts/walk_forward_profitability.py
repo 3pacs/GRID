@@ -126,6 +126,7 @@ _DUP_COUNT_QUERY = text("""
     WHERE verdict IN ('hit', 'miss', 'partial')
       AND created_at >= NOW() - (:days || ' days')::interval
       AND pnl_pct IS NOT NULL
+      AND dedup_keep = TRUE
 """)
 
 

@@ -31,8 +31,8 @@ def _prediction_accuracy(hits: int, misses: int, partials: int) -> float:
 
 def _ticker_filter_sql(tickers: list[str] | None) -> tuple[str, dict[str, Any]]:
     if not tickers:
-        return "", {}
-    return "WHERE ticker = ANY(:tickers)", {"tickers": tickers}
+        return "WHERE dedup_keep = TRUE", {}
+    return "WHERE dedup_keep = TRUE AND ticker = ANY(:tickers)", {"tickers": tickers}
 
 
 def _fetch_overall_stats(engine: Engine, tickers: list[str] | None = None) -> dict[str, Any]:

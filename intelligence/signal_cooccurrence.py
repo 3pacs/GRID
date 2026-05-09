@@ -607,6 +607,7 @@ SELECT id, verdict, signals, signal_strength, confidence, model_weights
 FROM oracle_predictions
 WHERE verdict IN ('hit', 'miss', 'partial')
   AND created_at >= NOW() - (:days || ' days')::INTERVAL
+  AND dedup_keep = TRUE
 ORDER BY created_at ASC
 """
 

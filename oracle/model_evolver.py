@@ -121,7 +121,10 @@ class ModelEvolver:
                     SELECT model_name, COUNT(*) FILTER (WHERE verdict='hit') AS hits,
                            COUNT(*) FILTER (WHERE verdict='miss') AS misses,
                            COUNT(*) FILTER (WHERE verdict='partial') AS partials
-                    FROM oracle_predictions WHERE verdict IN ('hit','miss','partial') GROUP BY model_name
+                    FROM oracle_predictions
+                    WHERE verdict IN ('hit','miss','partial')
+                      AND dedup_keep = TRUE
+                    GROUP BY model_name
                 ) p ON p.model_name=m.name WHERE m.active=TRUE
             """)).fetchall()
         out = []

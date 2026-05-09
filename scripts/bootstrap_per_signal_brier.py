@@ -92,6 +92,7 @@ _ORACLE_QUERY = text(
     FROM oracle_predictions
     WHERE verdict IN ('hit', 'miss', 'partial')
       AND created_at >= NOW() - (:days || ' days')::interval
+      AND dedup_keep = TRUE
     ORDER BY created_at ASC
     """
 )
@@ -345,6 +346,7 @@ def _fetch_scored_predictions(
             FROM oracle_predictions
             WHERE verdict IN ('hit', 'miss', 'partial')
               AND created_at >= NOW() - (:days || ' days')::interval
+              AND dedup_keep = TRUE
             ORDER BY created_at ASC
             """
         )

@@ -253,7 +253,9 @@ class TraceAnalyzer:
                            COUNT(*) AS total,
                            AVG(CASE WHEN pnl_pct IS NOT NULL THEN pnl_pct ELSE 0 END) AS avg_pnl
                     FROM oracle_predictions
-                    WHERE scored_at >= :cutoff AND verdict IS NOT NULL
+                    WHERE scored_at >= :cutoff
+                      AND verdict IS NOT NULL
+                      AND dedup_keep = TRUE
                     GROUP BY model_name
                 """), {"cutoff": cutoff}).fetchall()
             return {
