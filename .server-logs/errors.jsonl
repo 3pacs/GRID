@@ -9868,3 +9868,9 @@
 {"ts": "2026-05-08T23:36:16.830039+00:00", "level": "ERROR", "module": "__main__", "function": "<module>", "line": 183, "message": "  FAIL: ETH ETH bounces from $2111 if tested", "exception": null}
 {"ts": "2026-05-08T23:36:16.834396+00:00", "level": "ERROR", "module": "__main__", "function": "<module>", "line": 183, "message": "  FAIL: SOL SOL holds $87 support into tomorrow", "exception": null}
 {"ts": "2026-05-08T23:36:16.909381+00:00", "level": "ERROR", "module": "__main__", "function": "<module>", "line": 183, "message": "  FAIL: BTC BTC closes today above $70800", "exception": null}
+{"ts": "2026-05-09T00:37:36.644474+00:00", "level": "ERROR", "module": "__main__", "function": "<module>", "line": 183, "message": "  FAIL: BTC BTC holds above $70092 for next 4 hours", "exception": null}
+{"ts": "2026-05-09T00:37:36.648905+00:00", "level": "ERROR", "module": "__main__", "function": "<module>", "line": 183, "message": "  FAIL: BTC BTC dips to $68676 within 12 hours", "exception": null}
+{"ts": "2026-05-09T00:37:36.668620+00:00", "level": "ERROR", "module": "__main__", "function": "<module>", "line": 183, "message": "  FAIL: ETH ETH/BTC ratio continues declining today", "exception": null}
+{"ts": "2026-05-09T00:37:36.672333+00:00", "level": "ERROR", "module": "__main__", "function": "<module>", "line": 183, "message": "  FAIL: ETH ETH bounces from $2111 if tested", "exception": null}
+{"ts": "2026-05-09T00:37:36.676228+00:00", "level": "ERROR", "module": "__main__", "function": "<module>", "line": 183, "message": "  FAIL: SOL SOL holds $87 support into tomorrow", "exception": null}
+{"ts": "2026-05-09T00:37:36.702684+00:00", "level": "ERROR", "module": "__main__", "function": "<module>", "line": 183, "message": "  FAIL: BTC BTC closes today above $70800", "exception": null}
