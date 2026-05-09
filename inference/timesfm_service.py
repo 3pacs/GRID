@@ -39,6 +39,41 @@ FORECAST_TTL_HOURS = 4      # re-forecast if older than this
 STALE_FORECAST_HOURS = 24   # mark forecast as stale after this
 
 
+# ── Severity classification for forecast failures ───────────────────
+
+
+def _is_cuda_kernel_incompat(exc: BaseException) -> bool:
+    """Return True if exc is the known CUDA-kernel-incompat error.
+
+    The prebuilt TimesFM wheel is compiled for a newer compute capability
+    than the host GPU (e.g. P100 sm_60 vs sm_70+). This is a fixed
+    environmental incompatibility, not an application bug, so we route
+    it to WARNING in the error log rather than ERROR.
+    """
+    err_str = str(exc)
+    return (
+        "no kernel image is available" in err_str
+        or "cudaErrorNoKernelImageForDevice" in err_str
+    )
+
+
+def _log_forecast_failure(exc: BaseException) -> None:
+    """Log a forecast failure at the appropriate severity.
+
+    Caller is expected to re-raise; this only writes the log line so that
+    errors.jsonl stays signal-rich (CLAUDE.md: ERROR is reserved for
+    unhandled application bugs).
+    """
+    err_str = str(exc)
+    if _is_cuda_kernel_incompat(exc):
+        log.warning(
+            "TimesFM forecast skipped (GPU/CUDA incompatible): {e}",
+            e=err_str,
+        )
+    else:
+        log.error("TimesFM forecast failed: {e}", e=err_str)
+
+
 # ── Forecast result (immutable) ──────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -200,7 +235,7 @@ def forecast_signals(
             freq = [0] * len(inputs)  # 0 = daily
             point_fc, quantile_fc = model.forecast(inputs, freq)
     except Exception as exc:
-        log.error("TimesFM forecast failed: {e}", e=str(exc))
+        _log_forecast_failure(exc)
         raise
     elapsed = _time.time() - t0
     log.info("TimesFM inference done in {t:.1f}s ({n} signals)",

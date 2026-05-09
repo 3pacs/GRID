@@ -471,14 +471,26 @@ class FREDPuller(BasePuller):
 
         except Exception as exc:
             status_code = _extract_http_status_code(exc)
-            if status_code in (400, 403, 404, 429) or (
+            # Both permanent 4xx (client rejections) and transient 5xx
+            # (upstream sickness) are non-actionable in our codebase.
+            # Downgrade to WARNING and skip writing a FAILED row so
+            # errors.jsonl stays signal-rich (was 5+/cycle on bad days).
+            from ingestion._http_severity import (
+                is_permanent_http,
+                is_transient_http,
+                is_warning_worthy,
+            )
+            if is_warning_worthy(status_code) or (
                 status_code is None and _contains_http_status_error(exc)
             ):
                 status_desc = f"HTTP {status_code}" if status_code else "HTTP rejection"
-                message = (
-                    f"FRED series unavailable or not entitled "
-                    f"({status_desc})"
-                )
+                if is_transient_http(status_code):
+                    message = f"FRED upstream transient error ({status_desc})"
+                else:
+                    message = (
+                        f"FRED series unavailable or not entitled "
+                        f"({status_desc})"
+                    )
                 log.warning(
                     "FRED {sid}: {msg}; skipping without failure row",
                     sid=series_id,

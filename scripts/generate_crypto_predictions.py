@@ -180,7 +180,11 @@ for c in calls:
         log.info("  {} {:5s} {:7s} — {}", c['symbol'], c['horizon'], c['direction'], c['call'][:50])
         stored += 1
     else:
-        log.error("  FAIL: {} {}", c['symbol'], c['call'][:40])
+        # save_prediction returning falsy is a recoverable storage outcome
+        # (e.g. duplicate / schema rejection at the DB layer), not an
+        # unhandled application bug — log at WARNING so errors.jsonl stays
+        # signal-rich (was 13× /day flooding the audit).
+        log.warning("  FAIL: {} {}", c['symbol'], c['call'][:40])
 
 log.info("\nStored {} crypto predictions", stored)
 

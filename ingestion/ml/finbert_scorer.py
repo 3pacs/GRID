@@ -418,11 +418,25 @@ class FinBERTScorer:
                 result = self.score_source(source_name)
                 results.append(result)
             except Exception as exc:
-                log.error("FinBERT scoring failed for {s}: {e}", s=source_name, e=str(exc))
+                # transformers wraps GPU OOM / cache corruption as a generic
+                # "Could not import module 'BertForSequenceClassification'."
+                # That's an environmental issue, not an application bug, so
+                # we route it to WARNING. Genuine bugs still surface at
+                # ERROR. (CLAUDE.md error-log hygiene rule.)
+                from ingestion.ml._finbert_severity import is_transformers_init_wrap
+
+                err_str = str(exc)
+                if is_transformers_init_wrap(exc):
+                    log.warning(
+                        "FinBERT scoring skipped for {s}: {e}",
+                        s=source_name, e=err_str,
+                    )
+                else:
+                    log.error("FinBERT scoring failed for {s}: {e}", s=source_name, e=err_str)
                 results.append({
                     "source": source_name,
                     "rows_scored": 0,
                     "status": "FAILED",
-                    "error": str(exc),
+                    "error": err_str,
                 })
         return results

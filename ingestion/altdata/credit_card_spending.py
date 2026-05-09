@@ -281,11 +281,26 @@ class CreditCardSpendingPuller(BasePuller):
                 )
                 results[label] = obs
             except Exception as exc:
-                log.error(
-                    "CreditCard {sid} fetch failed: {e}",
-                    sid=fred_id,
-                    e=str(exc),
-                )
+                # FRED upstream periodically returns HTTP 5xx — transient
+                # and not actionable in our codebase. Downgrade those to
+                # WARNING so errors.jsonl stays signal-rich; everything
+                # else (auth/permission, parse errors, network bugs) keeps
+                # ERROR severity for the operator.
+                from ingestion._http_severity import is_warning_worthy
+
+                resp = getattr(exc, "response", None)
+                status = getattr(resp, "status_code", None)
+                if is_warning_worthy(status):
+                    log.warning(
+                        "CreditCard {sid} fetch transient HTTP {s}: {e}",
+                        sid=fred_id, s=status, e=str(exc),
+                    )
+                else:
+                    log.error(
+                        "CreditCard {sid} fetch failed: {e}",
+                        sid=fred_id,
+                        e=str(exc),
+                    )
                 results[label] = []
             time.sleep(_RATE_LIMIT_DELAY)
         return results
