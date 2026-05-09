@@ -1998,17 +1998,64 @@ class OracleEngine:
         never raises — missing upstream features fall back to safe defaults
         (see ``oracle.prediction_context``).
         """
+        # 2026-05-09 PERF/CORRECTNESS FIX: previously called
+        # build_prediction_context(self.engine, ...) per prediction inside an
+        # open transaction. With ~5743 predictions per cycle that issued
+        # ~17K DB round-trips on side connections while the outer
+        # `engine.begin()` connection sat idle holding a transaction —
+        # exhausted the pool, never logged, and the cycle was killed by
+        # systemctl before any rows committed (last successful write
+        # 2026-05-08 04:33). The regime / fci / vix lookups are constant
+        # per cycle (same as_of_date for every prediction) so hoist them
+        # out and only do per-row signal_contributions work (pure Python).
         from oracle.prediction_context import (
-            build_prediction_context,
+            DEFAULT_FCI_REGIME,
+            DEFAULT_REGIME,
+            canonical_regime,
             enrich_signals_payload,
+            extract_signal_contributions,
+            fetch_fci_regime,
+            fetch_liquidity_regime,
+            fetch_vix_level,
         )
 
+        # Determine cycle as_of date once (predictions in the same cycle
+        # share a timestamp date).
+        cycle_as_of: date = date.today()
+        if predictions:
+            ts0 = predictions[0].timestamp
+            if isinstance(ts0, datetime):
+                cycle_as_of = ts0.date()
+
+        # Cache regime / fci / vix for the whole batch.
+        try:
+            cached_regime = canonical_regime(
+                fetch_liquidity_regime(self.engine, cycle_as_of)
+            )
+        except Exception as exc:
+            log.warning("regime lookup failed, defaulting to NEUTRAL: {e}", e=str(exc))
+            cached_regime = DEFAULT_REGIME
+        try:
+            cached_fci = canonical_regime(
+                fetch_fci_regime(self.engine, cycle_as_of)
+            )
+        except Exception as exc:
+            log.warning("fci lookup failed, defaulting to NEUTRAL: {e}", e=str(exc))
+            cached_fci = DEFAULT_FCI_REGIME
+        try:
+            cached_vix = fetch_vix_level(self.engine, cycle_as_of)
+        except Exception as exc:
+            log.warning("vix lookup failed, defaulting to None: {e}", e=str(exc))
+            cached_vix = None
+
+        log.info(
+            "_store_predictions: writing {n} predictions (regime={r}, fci={f}, vix={v})",
+            n=len(predictions), r=cached_regime, f=cached_fci, v=cached_vix,
+        )
+
+        written = 0
         with self.engine.begin() as conn:
             for p in predictions:
-                as_of_date = (
-                    p.timestamp.date() if isinstance(p.timestamp, datetime) else date.today()
-                )
-
                 try:
                     model_votes = {
                         s.name: float(s.weight)
@@ -2019,24 +2066,19 @@ class OracleEngine:
                     model_votes = {}
 
                 try:
-                    context = build_prediction_context(
-                        self.engine,
-                        as_of=as_of_date,
+                    contributions = extract_signal_contributions(
                         model_weights=p.model_weights,
                         model_votes=model_votes,
                     )
-                except Exception as exc:
-                    log.warning(
-                        "prediction context enrichment failed for {tid}: {e}",
-                        tid=p.id,
-                        e=str(exc),
-                    )
-                    context = {
-                        "regime": "NEUTRAL",
-                        "fci_regime": "NEUTRAL",
-                        "vix_level": None,
-                        "signal_contributions": {},
-                    }
+                except Exception:
+                    contributions = {}
+
+                context = {
+                    "regime": cached_regime,
+                    "fci_regime": cached_fci,
+                    "vix_level": cached_vix,
+                    "signal_contributions": contributions,
+                }
 
                 raw_signals = [asdict(s) for s in p.signals]
                 enriched_signals = enrich_signals_payload(raw_signals, context)
@@ -2082,6 +2124,12 @@ class OracleEngine:
                     "fc": json.dumps(p.flow_context, default=str),
                     "mw": json.dumps(p.model_weights, default=str),
                 })
+                written += 1
+
+        log.info(
+            "_store_predictions: wrote/upserted {w}/{n} rows",
+            w=written, n=len(predictions),
+        )
 
     def _get_leaderboard(self) -> list[dict]:
         """Get model performance leaderboard."""
