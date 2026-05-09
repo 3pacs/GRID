@@ -155,6 +155,52 @@ class Settings(BaseSettings):
     OLLAMA_CHAT_MODEL: str = "qwen3:8b"
     OLLAMA_EMBED_MODEL: str = "nomic-embed-text"
 
+    # Remote Ollama nodes — added 2026-05-09. Each has its own URL +
+    # default model so the LLM router can fan out across the cluster.
+    # Brought online by the operator: panda (2× P100 16GB Pascal hosting
+    # qwen2.5:32b) and ocr-node (2× 8GB Ampere hosting smaller models +
+    # vision). Each becomes a provider name `ollama_panda` / `ollama_ocr`
+    # in llm/router.py.
+    OLLAMA_PANDA_BASE_URL: str = "http://panda:11434"
+    OLLAMA_PANDA_ENABLED: bool = True
+    OLLAMA_PANDA_TIMEOUT_SECONDS: int = 240
+    # Pascal P100 (sm_60) cannot use bf16 native, mxfp8 (sm_89+), or
+    # nvfp4 (sm_120). Q4_K_M is the highest-quality quant available for
+    # qwen3.6 on Pascal — the coding variant only ships as bf16/mxfp8/
+    # nvfp4 so we use the general 27b model for both general + coding.
+    OLLAMA_PANDA_CHAT_MODEL: str = "qwen3.6:27b-q4_K_M"
+
+    OLLAMA_OCR_BASE_URL: str = "http://ocr-node:11434"
+    OLLAMA_OCR_ENABLED: bool = True
+    OLLAMA_OCR_TIMEOUT_SECONDS: int = 120
+    # ocr-node has 2× 8GB Ampere — gemma3:12b-it-q4_K_M (~7GB) replaces
+    # gemma2:9b after the 2026-05-09 cluster refresh. Vision models on
+    # ocr-node (qwen2.5vl:7b, minicpm-v:8b) are not in the standard chain.
+    OLLAMA_OCR_CHAT_MODEL: str = "gemma3:12b-it-q4_K_M"
+
+    # koala — 2× GTX TITAN X Maxwell 12 GB. Card 0 hosts Ollama
+    # (gemma2:9b chat + nomic-embed-text embeddings); card 1 is reserved
+    # for Whisper transcription + Kokoro TTS. Maxwell sm_52 cannot run
+    # flash-attn or NVFP4, but excels at small dense inference and
+    # embedding generation.
+    OLLAMA_KOALA_BASE_URL: str = "http://koala:11434"
+    OLLAMA_KOALA_ENABLED: bool = True
+    OLLAMA_KOALA_TIMEOUT_SECONDS: int = 120
+    OLLAMA_KOALA_CHAT_MODEL: str = "gemma3:12b-it-q4_K_M"
+    OLLAMA_KOALA_EMBED_MODEL: str = "nomic-embed-text"
+
+    # koala card 1 — Kokoro TTS server (CPU inference, FastAPI on :8091).
+    # OpenAI-compatible /v1/audio/speech endpoint. 54 voices, 24kHz mono WAV.
+    # Useful as a local replacement for OpenAI TTS in audio_briefing.py.
+    KOKORO_TTS_BASE_URL: str = "http://koala:8091"
+    KOKORO_TTS_ENABLED: bool = True
+    KOKORO_TTS_VOICE: str = "af_sarah"
+
+    # koala card 1 — whisper.cpp Vulkan transcription server (port 8092).
+    # whisper-large-v3-turbo model, runs on GTX TITAN X via Vulkan backend.
+    WHISPER_BASE_URL: str = "http://koala:8092"
+    WHISPER_ENABLED: bool = True
+
     # llama.cpp server on grid-svr Blackwell (Qwen3.6 27B GPU + mmproj, port 8081)
     # Timeout MUST be < HERMES cycle timeout (600s in scripts/hermes_operator.py)
     # so that when Hermes blacklists a slow cycle, the in-flight HTTP call
