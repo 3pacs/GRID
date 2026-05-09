@@ -21,6 +21,7 @@ set -a
 source "$ENV_FILE"
 set +a
 
+export GRID_AUDIT_ENV_FILE="$ENV_FILE"
 export PYTHONPATH="$GRID_DIR${PYTHONPATH:+:$PYTHONPATH}"
 cd "$GRID_DIR"
 
