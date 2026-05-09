@@ -406,6 +406,10 @@ def regenerate_dashboard(engine, vault_path: Path | None = None) -> None:
         ]
 
     md = generate_dashboard(notes, actions)
-    dash_path = vault / "00-DASHBOARD.md"
+    # Was 00-DASHBOARD.md (uppercase) which clashed with the user's
+    # curated 00-Dashboard.md (title-case) on case-sensitive ext4.
+    # The auto-generated agent status content is distinct from the
+    # human-curated dashboard, so put it under a non-colliding name.
+    dash_path = vault / "00-AGENT-STATUS.md"
     dash_path.write_text(md, encoding="utf-8")
-    log.info("Dashboard regenerated at {p}", p=dash_path)
+    log.info("Agent status regenerated at {p}", p=dash_path)
