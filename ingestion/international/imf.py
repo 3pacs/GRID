@@ -162,7 +162,24 @@ class IMFPuller(BasePuller):
         }
 
         try:
-            from imfdatapy.imf import WEO
+            # imfdatapy dropped the WEO class sometime before 2026-05.
+            # Available classes today: IFS, DOT, BOP, FSI, GFSR, COFOG,
+            # HPDD, AFRREO. WEO needs a different data source — skip
+            # this puller cleanly until a replacement is wired (e.g.
+            # IMF's Data Mapper API directly via requests, or the
+            # `imfp` package which still ships WEO).
+            try:
+                from imfdatapy.imf import WEO  # type: ignore[attr-defined]
+            except ImportError:
+                log.warning(
+                    "imfdatapy.WEO not available in installed version; "
+                    "WEO pull skipped (no successor wired). See "
+                    "ingestion/international/imf.py:165 to plug in a "
+                    "replacement when needed."
+                )
+                result["status"] = "SKIPPED"
+                result["errors"].append("imfdatapy.WEO not available")
+                return result
 
             weo = WEO()
             df = weo.download_data()

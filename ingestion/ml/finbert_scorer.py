@@ -56,15 +56,29 @@ class FinBERTScorer:
         self.engine = db_engine
         self.batch_size = batch_size
 
-        # Auto-detect device
+        # Auto-detect device. CUDA-by-default fails on grid-svr because
+        # GPU 0 (P100 16GB) is pinned by llama-server using ~12 GB,
+        # leaving FinBERT no room — every score_all_sources call OOMs
+        # and the (misleading) error logged is "Could not import module
+        # 'BertForSequenceClassification'" because transformers wraps
+        # the OOM in its generic init failure.
+        # Override path order:
+        #   1. explicit `device` arg
+        #   2. FINBERT_DEVICE env var ("cpu", "cuda", "cuda:1", …)
+        #   3. CPU by default — model is small (~440 MB), CPU latency
+        #      acceptable for this batch-mode scorer; lets the GPU stay
+        #      reserved for llama-server / oracle work
+        import os as _os
+        env_device = _os.getenv("FINBERT_DEVICE")
         if device is not None:
             self.device = torch.device(device)
-        elif torch.cuda.is_available():
-            self.device = torch.device("cuda")
-            log.info("CUDA available — using GPU: {d}", d=torch.cuda.get_device_name(0))
+            log.info("FinBERT: device={d} (explicit)", d=self.device)
+        elif env_device:
+            self.device = torch.device(env_device)
+            log.info("FinBERT: device={d} (FINBERT_DEVICE env)", d=self.device)
         else:
             self.device = torch.device("cpu")
-            log.info("No CUDA — using CPU")
+            log.info("FinBERT: device=cpu (default; GPU reserved for llama-server)")
 
         self.tokenizer = None
         self.model = None
