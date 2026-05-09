@@ -76,7 +76,7 @@ The 17 models query these series from [[Raw Series Table|raw_series]]:
 - 1,342 features registered, 1,188 model-eligible
 - 2.2M resolved rows
 - But the thesis scorer does NOT use the [[Feature Registry Table|feature_registry]] or [[Resolved Series Table|resolved_series]] AT ALL
-- It queries raw_series directly
+- It queries [[Raw Series Table|raw_series]] directly
 - The entire ML feature pipeline (features → resolution → model training) is separate from the thesis scorer
 
 ## Confidence Issues

@@ -19,7 +19,6 @@ auto_generated: true
 
 - [[MODULE_CATALOG]]
 - [[MODULE_INVENTORY]]
-- [[SESSION_HANDOFF_2026_04_11c]]
 - [[ROADMAP]]
 - [[hallucination-prevention-2604.03173]]
 - [[2026-04-06-realtime-market-listener-design]]

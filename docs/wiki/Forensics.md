@@ -19,7 +19,6 @@ Price move reconstruction from actor signals. Reverse-engineers what caused a sp
 
 - [[MODULE_INVENTORY]]
 - [[MODULE_OVERLAP_AUDIT]]
-- [[SESSION_HANDOFF_2026_04_11c]]
 - [[Intelligence-Layer]]
 - [[ROADMAP]]
 - [[SIGNAL-CONNECTIVITY-PLAN]]

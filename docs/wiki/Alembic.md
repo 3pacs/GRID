@@ -13,9 +13,7 @@ Database migration framework for incremental schema changes.
 
 ## Referenced By
 
-- [[ATTENTION]]
 - [[FIRST_DAY_REPORT]]
-- [[SESSION_HANDOFF_2026_04_11c]]
 - [[deployment]]
 - [[development]]
 - [[CONCERNS]]

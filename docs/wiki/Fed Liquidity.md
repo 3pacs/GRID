@@ -18,5 +18,4 @@ Federal Reserve net liquidity equation — proprietary liquidity measure.
 ## Referenced By
 
 - [[MODULE_INVENTORY]]
-- [[SESSION_HANDOFF_2026_04_17]]
 - [[GSD-PLAN]]

@@ -70,7 +70,6 @@ These were verified with full-tree `Grep` for both `from intelligence.<mod>` and
 
 All 9 modules are hand-curated Python dicts of sector actors. They export `get_<sector>_network()`, `get_entity(key)`, `get_<sector>_lobbying_summary()` — same interface, different static payload. **Zero DB reads, zero DB writes.** The only consumer is `intelligence/adapters/sector_network_adapter.py`, which uses `importlib` to pull a module-level dict from each.
 
-**Canonical:** a new `intelligence/sector_networks/` package (already-allowed subpackage extension) with **one loader + 9 YAML files**. The loader reads `intelligence/sector_networks/<sector>.yaml` and returns the dict.
 
 | Module | LOC | Action | Evidence | Risk |
 |---|---|---|---|---|
@@ -95,7 +94,6 @@ All 9 modules are hand-curated Python dicts of sector actors. They export `get_<
 
 Every adapter under `intelligence/adapters/` is a thin class that: (a) reads the latest rows from one existing domain module's table, (b) emits `RegisteredSignal` objects via `intelligence/signal_registry.py`. They share ~80% boilerplate (same `source_module`, `refresh_interval_hours`, `extract_signals` methods, same hash-SID helper).
 
-**Canonical:** one `intelligence/adapters/base.py` (already 56 LOC) plus a config-table in `adapters/__init__.py` that declares `(source_module, sql, signal_builder_fn)` tuples. The individual adapter classes collapse into data rows in that table.
 
 | Module | LOC | Action | Risk |
 |---|---|---|---|
@@ -116,21 +114,6 @@ Every adapter under `intelligence/adapters/` is a thin class that: (a) reads the
 | `intelligence/adapters/sleuth_adapter.py` | 52 | MERGE INTO base | LOW |
 
 **Subtotal Cluster 3:** 14 files collapsed into 1, **~1,300 LOC → ~400 LOC** = **~900 LOC saved**. Adapter registration becomes a declarative list. Each new adapter is then 3 lines, not 80.
-
----
-
-### Cluster 4 — Causation trio (already clean — documentation fix only)
-
-Prior audit (Cluster 14 of the narrow audit) correctly flagged this as **NOT-A-DUPLICATE**. The three modules form a clean Strategy-pattern split:
-
-| Module | LOC | Role | Action |
-|---|---|---|---|
-| `intelligence/causation.py` | 26 | Re-export facade | **KEEP** as shim |
-| `intelligence/causation_core.py` | 195 | Dataclasses + `ensure_table` | **KEEP** |
-| `intelligence/causation_graph.py` | 1179 | Graph walker (`trace_causal_chain`, `find_longest_chains`) | **KEEP CANONICAL** |
-| `intelligence/causation_scoring.py` | 1090 | Scorer (`find_causes`, `batch_find_causes`) | **KEEP** |
-
-**Action:** zero code changes. Update `CLAUDE.md`'s stale "2,387 LOC [[Causation|causation.py]]" entry to reflect the actual 4-file split. **Doc fix only.**
 
 ---
 
@@ -193,7 +176,6 @@ All read `news_articles`, none share a fanout layer.
 | `intelligence/news_impact.py` | 978 | Price-move attribution → `news_impact_reports` | **KEEP** |
 | `intelligence/news_contagion_listener.py` | 638 | Entity resolve → contagion fanout | **KEEP** |
 | `intelligence/news_intel.py` | 559 | UI-facing query helpers | **KEEP** |
-| `intelligence/news_ticker_resolver.py` | 407 | Ticker extraction helper | **KEEP** (already used by `news_scraper.py`) |
 
 **Action:** No deletes (all wired). **RENAME + doc**: force every scanner to go through `news_ticker_resolver.resolve_tickers()` so ticker sets stay consistent, and add `intelligence/_news_fanout.py` *inside an existing file* (not a new module) that dispatches new `news_articles` rows to all scanners via an event hook. **No LOC saved here**, but the wiring is critical — addressed in prior audit as SYNTH-8.
 
@@ -214,18 +196,6 @@ Scheduler hedges between `<name>.py` and `<name>_puller.py` variants that were c
 **Action:** gdelt trio reduced to one (2 deletes, covered in Cluster 1). Google Trends + Fed Speeches pairs flagged as RECONCILE — one of each pair must die but both paths currently have production schedules. Wave 2 work, requires a 30-minute investigation of which class was the replacement for which.
 
 **Subtotal Cluster 8:** Already counted in Cluster 1 (297 LOC from gdelt pair).
-
----
-
-### Cluster 9 — Flow thesis trio (already clean)
-
-| Module | LOC | Role | Action |
-|---|---|---|---|
-| `analysis/flow_thesis.py` | 22 | Facade, `from ..._data import *; from ..._scoring import *` | **KEEP** as shim |
-| `analysis/flow_thesis_data.py` | 1414 | State + knowledge dicts | **KEEP CANONICAL** |
-| `analysis/flow_thesis_scoring.py` | 333 | Scoring/narrative | **KEEP** |
-
-No action. **Doc fix:** remove the "phantom [[Flow Thesis|flow_thesis.py]]" line from `MODULE_INVENTORY.md` phantom list — the file exists on disk as a legit facade.
 
 ---
 

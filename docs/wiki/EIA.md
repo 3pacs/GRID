@@ -20,7 +20,6 @@ Energy Information Administration — oil, gas, energy data.
 - [[README]]
 - [[MODULE_CATALOG]]
 - [[MODULE_INVENTORY]]
-- [[SESSION_HANDOFF_2026_04_05]]
 - [[ARCHITECTURE_REVIEW]]
 - [[ROADMAP]]
 - [[SESSION-ROADMAP-2026-04-13]]

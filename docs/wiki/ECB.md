@@ -21,8 +21,6 @@ European Central Bank — eurozone rates, monetary aggregates.
 - [[README]]
 - [[MODULE_CATALOG]]
 - [[MODULE_INVENTORY]]
-- [[SESSION_HANDOFF_2026_04_05]]
-- [[SESSION_HANDOFF_2026_04_17]]
 - [[Cron-Schedule]]
 - [[Data-Pipeline]]
 - [[AI-FINANCE-TOOLS-RESEARCH-2026-04-18]]

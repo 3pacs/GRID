@@ -23,8 +23,6 @@ Government statistics vs physical reality 'lie detector'. Flags divergence betwe
 - [[MODULE_DEDUPE_PLAN]]
 - [[MODULE_INVENTORY]]
 - [[MODULE_OVERLAP_AUDIT]]
-- [[SESSION_HANDOFF_2026_04_05]]
-- [[SESSION_HANDOFF_2026_04_17]]
 - [[01_pre_create_check]]
 - [[CONSOLIDATED_AGENT_REPORT]]
 - [[DOC_AUDIT]]

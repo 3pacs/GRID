@@ -17,7 +17,6 @@ Local LLM inference server — market briefings and analysis.
 
 ## Referenced By
 
-- [[ATTENTION]]
 - [[CLAUDE]]
 - [[FIRST_DAY_REPORT]]
 - [[README]]

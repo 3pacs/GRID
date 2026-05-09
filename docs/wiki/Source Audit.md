@@ -18,7 +18,6 @@ Source accuracy comparison and redundancy mapping via pairwise comparison. Auto-
 ## Referenced By
 
 - [[MODULE_INVENTORY]]
-- [[SESSION_HANDOFF_2026_04_05]]
 - [[DATABASE_REVIEW]]
 - [[FRONTEND_NAV_AUDIT_2026-04-16]]
 - [[REFACTOR_REPORT]]

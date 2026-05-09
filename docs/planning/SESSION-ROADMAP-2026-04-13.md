@@ -256,7 +256,7 @@ Returns a DataFrame with `[feature_id, obs_date, value, release_date, vintage_da
 
 `assert_no_lookahead(df, as_of_date)` at `pit.py:129` is the post-query safety net.
 
-**This is what a walk-forward horizon-conditional backtest would use:** set `as_of_date = target_resolution_date - horizon_days`, re-run the oracle at that point, score on actual. **The framework exists — the oracle just doesn't use it yet.**
+**This is what a [[Walk-Forward Backtesting|walk-forward]] horizon-conditional backtest would use:** set `as_of_date = target_resolution_date - horizon_days`, re-run the oracle at that point, score on actual. **The framework exists — the oracle just doesn't use it yet.**
 
 ### Implementation foundation (good news)
 
@@ -399,7 +399,7 @@ The 7 mispricing signals (lines 3-10):
 
 ### `trading/options_recommender.py` + `options_tracker.py`
 
-Recommendation output includes strike, expiry, entry (bid/ask mid), target, stop, time stop, max risk, Kelly fraction, suggested contracts, confidence, thesis with lever/catalyst/conditions, dealer context (GEX/vanna/charm), invalidation threshold.
+Recommendation output includes strike, expiry, entry (bid/ask mid), target, stop, time stop, max risk, Kelly fraction, suggested contracts, confidence, thesis with lever/catalyst/conditions, dealer context ([[Dealer Gamma|GEX]]/[[Dealer Gamma|vanna]]/charm), invalidation threshold.
 
 **Kelly sizing is partially horizon-aware:** `_EARNINGS_MIN_DTE = 3` (line 243) allows short earnings plays vs default `_MIN_DTE`. But Kelly is not dynamically adjusted for theta as expiry nears.
 
@@ -413,18 +413,18 @@ Recommendation output includes strike, expiry, entry (bid/ask mid), target, stop
 
 ### `physics/dealer_gamma.py` — per-ticker but crude positioning
 
-- Computes **per-ticker** GEX, vanna, charm, and gamma walls (lines 375-383 read `options_snapshots`)
+- Computes **per-ticker** [[Dealer Gamma|GEX]], [[Dealer Gamma|vanna]], charm, and [[Dealer Gamma|gamma walls]] (lines 375-383 read `options_snapshots`)
 - **Assumes dealers are net short every option** (lines 19-30) — computes:
   - Dealer short calls → negative gamma
   - Dealer short puts → positive gamma
 - No cross-name dealer net positioning inference
 - No actual market-maker filing data ([[Institutional Flows|13F]], Form 4, Form 606)
-- **Vanna computed** at lines 248-249 (`bs_vanna × OI`, aggregated at line 179)
+- **[[Dealer Gamma|Vanna]] computed** at lines 248-249 (`bs_vanna × OI`, aggregated at line 179)
 - **Charm computed** at line 250 (time decay delta sensitivity, line 180)
 - **Both reported** at lines 205-206 in the output — **but never used** in predictions or scoring. **Free alpha on the floor.**
 
 **Two quick wins:**
-1. Wire vanna/charm into `options_scanner.py` as additional signals (or their own scoring dimension).
+1. Wire [[Dealer Gamma|vanna]]/charm into `options_scanner.py` as additional signals (or their own scoring dimension).
 2. Replace the "net short everything" assumption with a flow-based dealer positioning inference (requires tracking customer flow direction).
 
 ### `ingestion/altdata/earnings_calendar.py` — flat schema, yfinance source
@@ -592,7 +592,7 @@ My highest-conviction picks from the session discussion. Each is estimated to de
 
 **Causality engines:**
 26. **Fed reaction function estimator** — Bayesian model over `fed_speeches.py` + FOMC votes + dot plots — ~3% on rates/risk around Fed events
-27. **Dealer options surface (GEX/DEX/VEX/CEX) single-name** — extends `physics/dealer_gamma.py`; replaces crude net-short assumption — ~2% on single-name options
+27. **Dealer options surface ([[Dealer Gamma|GEX]]/DEX/VEX/CEX) single-name** — extends `physics/dealer_gamma.py`; replaces crude net-short assumption — ~2% on single-name options
 28. **Cross-source disagreement / [[Cross Reference|lie detector]] (expanded)** — extends `cross_reference.py` to 3+ source consensus — ~2% on macro-release trades
 29. **[[Institutional Flows|13F]] delta clustering across 500 funds** — extends `institutional_flows.py` — ~1.5% on factor + sector trades
 30. **Earnings surprise cascade predictor** — leader → follower revisions via `earnings_calendar.py` + `analyst_ratings.py` — ~2% on earnings-season follow-the-leader

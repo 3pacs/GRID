@@ -20,7 +20,6 @@ ETF flows + SEC 13F quarterly holdings — institutional positioning.
 - [[CLAUDE]]
 - [[MODULE_CATALOG]]
 - [[MODULE_INVENTORY]]
-- [[SESSION_HANDOFF_2026_04_05]]
 - [[GSD-PLAN]]
 - [[MASTER-PLAN]]
 - [[NEXT-SESSION]]

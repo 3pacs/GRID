@@ -247,7 +247,7 @@ class Dispatcher:
 
 ### 3.5 Correlation IDs & Lineage
 
-Every puller (the entry point for all data) generates a `correlation_id` on ingest and attaches it to the `raw_series` row. All downstream derivations — [[Conflict Resolution|conflict resolution]], feature computation, regime detection, hypothesis generation, inference, oracle prediction, postmortem — carry the same `correlation_id` through every contract emit. This means:
+Every puller (the entry point for all data) generates a `correlation_id` on ingest and attaches it to the `raw_series` row. All downstream derivations — [[Conflict Resolution|conflict resolution]], feature computation, regime detection, hypothesis generation, inference, oracle prediction, [[Postmortem|postmortem]] — carry the same `correlation_id` through every contract emit. This means:
 
 ```sql
 SELECT * FROM contracts_audit
@@ -732,7 +732,7 @@ All 13 contracts are in scope, but sequenced to close the highest-value feedback
 
 ### 8.3 End-to-End Test
 
-- `tests/e2e/test_full_lineage.py` — simulate a puller emitting a signal, trace correlation_id through normalise → feature → hypothesis → validation → inference → oracle → prediction → scoring → postmortem → trust decay. Verify `contracts_audit` contains every step.
+- `tests/e2e/test_full_lineage.py` — simulate a puller emitting a signal, trace correlation_id through normalise → feature → hypothesis → validation → inference → oracle → prediction → scoring → [[Postmortem|postmortem]] → trust decay. Verify `contracts_audit` contains every step.
 
 Target: 85%+ overall coverage on `contracts/`, 100% on `schemas.py` and `router.py`.
 
@@ -787,7 +787,7 @@ That is the entire procedure. No other file in the codebase needs to change.
 
 Thirty days after full rollout:
 
-- **Feedback loops closed:** `trust_scorer` trust deltas correlate with postmortem verdicts (r > 0.6).
+- **Feedback loops closed:** `trust_scorer` trust deltas correlate with [[Postmortem|postmortem]] verdicts (r > 0.6).
 - **Weight evolution active:** oracle model weights show non-trivial variance over 30 days.
 - **Unsurfaced intelligence visible:** all 7 new intel endpoints return data, frontend views render them.
 - **Real-time lifecycle events:** all 6 new SSE channels broadcasting, frontend receives within 1 s.

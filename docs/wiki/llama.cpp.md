@@ -21,8 +21,6 @@ Direct llama.cpp inference for GPU-accelerated local LLM.
 - [[README]]
 - [[MODULE_CATALOG]]
 - [[MODULE_INVENTORY]]
-- [[SESSION_HANDOFF_2026_04_17]]
-- [[SESSION_HANDOFF_2026_04_17b]]
 - [[astrogrid-next-agent]]
 - [[Overview]]
 - [[deployment]]

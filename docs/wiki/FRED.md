@@ -17,14 +17,13 @@ Federal Reserve Economic Data — macro indicators (rates, GDP, employment).
 
 ## Referenced By
 
+- [[CLAUDE]]
 - [[DATA_SOURCES_CATALOG]]
 - [[FIRST_DAY_REPORT]]
 - [[README]]
 - [[DATA_GAPS]]
 - [[MODULE_INVENTORY]]
 - [[MODULE_OVERLAP_AUDIT]]
-- [[SESSION_HANDOFF_2026_04_05]]
-- [[SESSION_HANDOFF_2026_04_17]]
 - [[TODO-DATA-AUDIT]]
 - [[data_pipeline_audit]]
 - [[Analysis-Layer]]

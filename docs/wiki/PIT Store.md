@@ -17,7 +17,6 @@ Point-in-time query engine ensuring no lookahead bias in data access. Uses [[Pos
 
 ## Referenced By
 
-- [[ATTENTION]]
 - [[CLAUDE]]
 - [[FIRST_DAY_REPORT]]
 - [[README]]

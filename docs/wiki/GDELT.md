@@ -23,8 +23,6 @@ Global Database of Events, Language, and Tone — geopolitical event signals.
 - [[MODULE_CATALOG]]
 - [[MODULE_INVENTORY]]
 - [[MODULE_OVERLAP_AUDIT]]
-- [[SESSION_HANDOFF_2026_04_05]]
-- [[SESSION_HANDOFF_2026_04_17]]
 - [[CODE_REVIEW]]
 - [[data_pipeline_audit]]
 - [[Data-Pipeline]]

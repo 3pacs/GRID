@@ -22,7 +22,6 @@ Bureau of Labor Statistics — employment, CPI, PPI.
 - [[MODULE_CATALOG]]
 - [[MODULE_INVENTORY]]
 - [[MODULE_OVERLAP_AUDIT]]
-- [[SESSION_HANDOFF_2026_04_05]]
 - [[TODO-DATA-AUDIT]]
 - [[Cron-Schedule]]
 - [[Data-Pipeline]]

@@ -268,7 +268,7 @@ Document retrieval MUST respect [[PIT Store|point-in-time]] constraints:
 1. **PDF ingestion works** — Can index a 10-K PDF and retrieve specific sections by query
 2. **Accuracy improvement** — Financial document QA accuracy >90% (vs current ~70% with flat chunking)
 3. **Latency acceptable** — Deep path <5s p95, fast path unchanged
-4. **PIT-correct** — All document retrievals respect temporal boundaries
+4. **[[PIT Store|PIT-correct]]** — All document retrievals respect temporal boundaries
 5. **Cost-controlled** — <$1/day for ongoing indexing, <$0.01/deep query
 
 ## Dependencies

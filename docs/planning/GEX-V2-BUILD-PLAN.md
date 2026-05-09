@@ -104,7 +104,7 @@ No existing coverage. Safe to create.
 Five waves, topologically ordered. Each wave is a separate follow-up task. Waves 1-3 are already queued ([[Dealer Gamma|GEX]]-3/4/5); Waves 4-5 queue as new tasks.
 
 ### Wave 1 — Port the 7 BS Greeks to a shared module
-**Task**: GEX-3 (#79, already queued)
+**Task**: [[Dealer Gamma|GEX]]-3 (#79, already queued)
 **Title**: Create `physics/greeks/black_scholes.py` with vectorized 7-Greek primitives
 **Scope**:
 - New file: `physics/greeks/__init__.py`
@@ -139,12 +139,12 @@ def bs_zomma(S, K, T, r, sigma, q=0.0) -> np.ndarray: ...          # NEW
 - Unit convention comment block at top of file matches §6.2 of spec.
 **LOC estimate**: 250 prod + 150 test = **400 LOC**
 **Risk**: **LOW**. Pure math with closed-form references. The Grok MD file has working Python for all 7 — it's a direct port with vectorization added.
-**Follow-up mapping**: This IS GEX-3 (#79). No new task needed.
+**Follow-up mapping**: This IS [[Dealer Gamma|GEX]]-3 (#79). No new task needed.
 
 ---
 
 ### Wave 2 — Scaffold the `physics/dealer_flow/` subpackage
-**Task**: GEX-4 (#80, already queued)
+**Task**: [[Dealer Gamma|GEX]]-4 (#80, already queued)
 **Title**: Build `physics/dealer_flow/` with schemas, base adapter, Deribit adapter, pipeline, confidence
 **Scope**:
 - New dir: `physics/dealer_flow/`
@@ -202,12 +202,12 @@ def confidence_score(snapshot: pd.DataFrame, metrics: dict) -> float: ...  # ret
 - Mock CCXT client for adapter tests; no network calls.
 **LOC estimate**: 1,470 prod + 400 test = **~1,870 LOC**
 **Risk**: **MED**. CCXT Deribit public endpoints are stable but rate-limited; normalized schema requires careful unit handling (Deribit delivers Greeks per-BTC not per-contract — must multiply by `contract_size`); Pydantic v2 vs v1 mismatch risk with existing `schemas.py` files in GRID.
-**Follow-up mapping**: This IS GEX-4 (#80). No new task needed. **Split into two PRs if >1,500 LOC** (Wave 2a = schemas + base adapter + Deribit adapter; Wave 2b = pipeline + exposures + confidence).
+**Follow-up mapping**: This IS [[Dealer Gamma|GEX]]-4 (#80). No new task needed. **Split into two PRs if >1,500 LOC** (Wave 2a = schemas + base adapter + Deribit adapter; Wave 2b = pipeline + exposures + confidence).
 
 ---
 
 ### Wave 3 — Schema migration for V2 tables
-**Task**: GEX-5 (#81, already queued)
+**Task**: [[Dealer Gamma|GEX]]-5 (#81, already queued)
 **Title**: Migration `migrations/0037_options_v2_schema.sql`
 **Scope**:
 - New file: `migrations/versions/0037_options_v2_schema.sql`
@@ -223,13 +223,13 @@ def confidence_score(snapshot: pd.DataFrame, metrics: dict) -> float: ...  # ret
 - Indexes on `(underlying, source_ts_utc DESC)` for all 3 tables.
 - **No `DROP` of existing `options_snapshots`** — V2 tables are additive, equity path keeps working.
 **LOC estimate**: 150 LOC SQL
-**Risk**: **MED-HIGH**. Production already has `options_snapshots` (equity) with live data flowing through `DealerGammaEngine`. A bad migration could break the existing equity GEX pipeline. Mitigations: (a) V2 tables are **additive**, never touching existing ones; (b) dry-run on server with `psql --set ON_ERROR_STOP=1` before commit; (c) GRANT footer must include `grid_read` for the API service account.
-**Follow-up mapping**: This IS GEX-5 (#81). No new task needed.
+**Risk**: **MED-HIGH**. Production already has `options_snapshots` (equity) with live data flowing through `DealerGammaEngine`. A bad migration could break the existing equity [[Dealer Gamma|GEX]] pipeline. Mitigations: (a) V2 tables are **additive**, never touching existing ones; (b) dry-run on server with `psql --set ON_ERROR_STOP=1` before commit; (c) GRANT footer must include `grid_read` for the API service account.
+**Follow-up mapping**: This IS [[Dealer Gamma|GEX]]-5 (#81). No new task needed.
 
 ---
 
 ### Wave 4 — Refactor `physics/dealer_gamma.py` to share primitives
-**Task**: **NEW** — GEX-6 (queue after Wave 3 lands)
+**Task**: **NEW** — [[Dealer Gamma|GEX]]-6 (queue after Wave 3 lands)
 **Title**: Refactor `DealerGammaEngine` to import shared BS + exposures from `physics/greeks/` and `physics/dealer_flow/`
 **Scope**:
 - Modify `physics/dealer_gamma.py` (~494 → ~350 LOC after dedup)
@@ -255,12 +255,12 @@ from physics.greeks.black_scholes import bs_gamma, bs_delta, bs_vanna, bs_charm
 - `grid/tests/test_dealer_gamma.py` regenerated from a pinned baseline before the refactor, asserted against after.
 **LOC estimate**: -150 LOC (net reduction from dedup)
 **Risk**: **MED**. The equity pipeline is live and consumed by `options_recommender.py`. Any numerical drift breaks trade tickets. Mitigation: snapshot the output of `compute_gex_profile('SPY', date(2026,4,10))` pre-refactor, diff post-refactor, block merge on any delta > 1e-6.
-**Follow-up mapping**: **Queue as new task GEX-6** after GEX-5 merges. Not in the existing queue.
+**Follow-up mapping**: **Queue as new task [[Dealer Gamma|GEX]]-6** after GEX-5 merges. Not in the existing queue.
 
 ---
 
 ### Wave 5 — Wire `physics/dealer_flow.pipeline` into the trade-ticket path
-**Task**: **NEW** — GEX-7 (queue after Wave 4 lands)
+**Task**: **NEW** — [[Dealer Gamma|GEX]]-7 (queue after Wave 4 lands)
 **Title**: Integrate V2 dealer-flow signal into `contagion_to_ticket.py` via `options_recommender.py`
 **Scope**:
 - Modify `trading/contagion_to_ticket.py` — add `crypto_dealer_flow` as a new input signal
@@ -302,7 +302,7 @@ def get_v2_dealer_flow(underlying: str, venue: str = "deribit") -> DealerFlowSig
 - Wave 5 must ship with a **kill switch** feature flag (`ENABLE_V2_CRYPTO_TICKETS=false` default) so we can toggle off without redeploy.
 - All V2 tickets flagged in `decision_journal` with `source='gex_v2'` for [[Postmortem|post-mortem]].
 - Do NOT wire to `scripts/live_trader.py` in this wave — Wave 5 produces tickets, does not execute them.
-**Follow-up mapping**: **Queue as new task GEX-7** after GEX-6 merges. Not in the existing queue.
+**Follow-up mapping**: **Queue as new task [[Dealer Gamma|GEX]]-7** after GEX-6 merges. Not in the existing queue.
 
 ---
 
@@ -333,7 +333,7 @@ Read path: `useAsyncData('/api/derivatives/v2/dealer_flow/BTC')`. Refresh every 
 ## 6. Schema Migration Plan — `migrations/0037_options_v2_schema.sql`
 
 Next migration number confirmed by listing `migrations/versions/`: latest is `0036_user_intel.sql`.
-**Full SQL body below. DO NOT [[DEPLOY]] — Wave 3/GEX-5 executes this.**
+**Full SQL body below. DO NOT [[DEPLOY]] — Wave 3/[[Dealer Gamma|GEX]]-5 executes this.**
 
 ```sql
 -- migrations/versions/0037_options_v2_schema.sql
@@ -493,14 +493,14 @@ Topologically sorted — do NOT reorder. Each step shows the exact command to ru
 - [x] `python3 scripts/pre_create_check.py deribit --verbose`
 - [x] `python3 scripts/pre_create_check.py options_normalized --verbose`
 
-**Wave 1 — GEX-3 (#79)**:
+**Wave 1 — [[Dealer Gamma|GEX]]-3 (#79)**:
 - [ ] Dispatch agent with task #79 body referencing this plan §4.Wave1
 - [ ] Agent creates `physics/greeks/black_scholes.py` + test file
 - [ ] `cd grid && python -m pytest tests/test_black_scholes.py -v` — all pass
 - [ ] `python3 scripts/deploy.py --snapshot physics/greeks/black_scholes.py grid/tests/test_black_scholes.py`
 - [ ] Verify `physics/dealer_gamma.py` still works (no regressions yet — imports unchanged)
 
-**Wave 2 — GEX-4 (#80)**:
+**Wave 2 — [[Dealer Gamma|GEX]]-4 (#80)**:
 - [ ] Dispatch agent with task #80 body referencing this plan §4.Wave2
 - [ ] Add `ccxt>=4.0` to `requirements.txt` if not present
 - [ ] Agent creates `physics/dealer_flow/` subpackage (9 files)
@@ -510,7 +510,7 @@ Topologically sorted — do NOT reorder. Each step shows the exact command to ru
       `python3 -c "from physics.dealer_flow.adapters.deribit import DeribitAdapter; print(DeribitAdapter().fetch_chain_snapshot('BTC', 1))"`
 - [ ] `python3 scripts/deploy.py --snapshot physics/dealer_flow/`
 
-**Wave 3 — GEX-5 (#81)**:
+**Wave 3 — [[Dealer Gamma|GEX]]-5 (#81)**:
 - [ ] Dispatch agent with task #81 body referencing this plan §4.Wave3 and §6
 - [ ] Agent creates `migrations/versions/0037_options_v2_schema.sql`
 - [ ] Dry-run on throwaway container:
@@ -520,8 +520,8 @@ Topologically sorted — do NOT reorder. Each step shows the exact command to ru
 - [ ] Post-deploy verify on grid-svr: `\dt option_*` shows 3 tables, `\d option_snapshots_raw` shows hypertable
 - [ ] Smoke: `SELECT COUNT(*) FROM options_snapshots;` — existing equity count unchanged
 
-**Wave 4 — GEX-6 (NEW, queue now)**:
-- [ ] Queue task GEX-6 in task tracker with body pointing at this plan §4.Wave4
+**Wave 4 — [[Dealer Gamma|GEX]]-6 (NEW, queue now)**:
+- [ ] Queue task [[Dealer Gamma|GEX]]-6 in task tracker with body pointing at this plan §4.Wave4
 - [ ] Pre-refactor: `python3 -c "from physics.dealer_gamma import DealerGammaEngine; import json; ...; json.dump(result, open('/tmp/spy_golden.json','w'))"`
 - [ ] Agent refactors `physics/dealer_gamma.py` to import from `physics/greeks/`
 - [ ] Post-refactor parity test: compare vs `/tmp/spy_golden.json`, abs diff < 1e-9
@@ -529,8 +529,8 @@ Topologically sorted — do NOT reorder. Each step shows the exact command to ru
 - [ ] `python3 scripts/deploy.py --snapshot physics/dealer_gamma.py`
 - [ ] Post-deploy: call `/api/derivatives/gex/SPY` and confirm identical output
 
-**Wave 5 — GEX-7 (NEW, queue after Wave 4)**:
-- [ ] Queue task GEX-7 in task tracker with body pointing at this plan §4.Wave5
+**Wave 5 — [[Dealer Gamma|GEX]]-7 (NEW, queue after Wave 4)**:
+- [ ] Queue task [[Dealer Gamma|GEX]]-7 in task tracker with body pointing at this plan §4.Wave5
 - [ ] Agent adds `crypto_dealer_flow` signal type to `oracle/engine.py`
 - [ ] Agent adds `/v2/dealer_flow/{underlying}` endpoint to `api/routers/derivatives.py`
 - [ ] Agent patches `trading/contagion_to_ticket.py` branch for `asset_class=='crypto'`
@@ -540,7 +540,7 @@ Topologically sorted — do NOT reorder. Each step shows the exact command to ru
 - [ ] `python3 scripts/deploy.py --snapshot ...`
 - [ ] Post-deploy: flip feature flag to `true` **only after 24h parallel-run validation**
 
-**Post-Wave-5 hardening (not in this plan — queue as GEX-8)**:
+**Post-Wave-5 hardening (not in this plan — queue as [[Dealer Gamma|GEX]]-8)**:
 - [ ] Add OKXAdapter
 - [ ] Add BybitAdapter
 - [ ] Cross-venue consensus scoring
@@ -567,8 +567,8 @@ Total net LOC across V2 build: **~2,670** (ignoring the Wave 4 dedup reduction).
 ## 10. Non-Goals (explicit)
 
 - **No execution code.** V2 produces signals and trade tickets; it does NOT place orders. Wave 5 stops at ticket emission; execution is gated by the existing `trading/signal_executor.py` which stays behind `ENABLE_V2_CRYPTO_TICKETS=false` until [[Postmortem|post-mortem]] data exists.
-- **No OKX / Bybit adapters in this plan.** Deribit-only through Wave 5; other venues are GEX-8 backlog.
-- **No ML / [[Walk-Forward Backtesting|walk-forward]] backtests.** Phase 3 of the spec (§19 "Research alpha layer") is out of scope for GEX V2 build. V2 ships the feature factory; ML is a separate follow-up.
+- **No OKX / Bybit adapters in this plan.** Deribit-only through Wave 5; other venues are [[Dealer Gamma|GEX]]-8 backlog.
+- **No ML / [[Walk-Forward Backtesting|walk-forward]] backtests.** Phase 3 of the spec (§19 "Research alpha layer") is out of scope for [[Dealer Gamma|GEX]] V2 build. V2 ships the feature factory; ML is a separate follow-up.
 - **No retirement of `options_snapshots`**. The existing equity table and its pipeline stay live forever. V2 is purely additive.
 
 ---

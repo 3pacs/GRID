@@ -170,13 +170,6 @@ uk_companies_house, world_news, yield_curve_full
 | ~~WebSocket token leak~~ | First-message auth (5s timeout, no query params) | api/main.py |
 | ~~DB default password~~ | Empty default + crash if unset in non-dev | config.py |
 
-### Remaining
-| Issue | Severity | File | Description |
-|-------|----------|------|-------------|
-| Rate limit resets | HIGH | api/auth.py:43 | File-based /tmp, lost on restart |
-| CORS misconfiguration | HIGH | api/main.py:392 | `allow_credentials=True` with dev origins |
-| Incomplete key validation | MEDIUM | config.py:208 | Only FRED key validated at startup |
-
 ### Not An Issue (stop re-flagging)
 | Item | Why It's Fine |
 |------|--------------|
@@ -221,7 +214,6 @@ against the 702-module inventory; items below are net-new capability.
 | AkShare puller | LOW | ~2d | `ingestion/international/akshare.py`. Global + Chinese data. Gated on whether we expand A-share coverage. |
 | FinGPT sentiment LLM tier | DEFERRED | ~1w | Benchmark vs Nemotron on held-out sentiment set before adding a 4th process to `llm/router.py`. Requires GPU headroom audit. |
 
-**Explicitly rejected (already covered or unrelated):**
 - TauricResearch/[[TradingAgents]] — `agents/` is already this pattern
 - OpenBB platform — already integrated (`ingestion/openbb_pipeline.py`)
 - freqtrade — covered by `trading/hyperliquid.py` + `validation/gates.py`
@@ -315,7 +307,6 @@ against the 702-module inventory; items below are net-new capability.
 - [ ] **Apr 5+: Score Oracle predictions** (10,893 pending, earliest expiry Apr 5 — pipeline verified)
 - [ ] Run calibration report ([[Oracle Calibration|Brier score]], ECE) — calibration.py verified working
 - [ ] [[Postmortem|Post-mortem]]: weight adjustment blocked until scoring (all 5 models at weight=1.0)
-- [x] Score thesis accuracy — lookback widened 7→90 days, 1 scored (partial), remaining <3 days old
 - [x] [[Trust Scorer|Trust scorer]] baselines — fixed 3 bugs (NULL outcomes, JSONB extraction, COALESCE type), 20 signals scored, 15 sources updated
 - [x] Paper trading P&L review — 8 OPEN trades, combined unrealized P&L: -$194.31
 - [x] Forensic reports — threshold lowered 3%→1.5%, 5 reports generated (SPY 2, QQQ 2, AAPL 1)

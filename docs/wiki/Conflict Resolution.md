@@ -17,14 +17,12 @@ Multi-source conflict resolver that picks the highest-priority source when the s
 
 ## Referenced By
 
-- [[ATTENTION]]
 - [[CLAUDE]]
 - [[FIRST_DAY_REPORT]]
 - [[MODULE_CATALOG]]
 - [[MODULE_INVENTORY]]
 - [[MODULE_OVERLAP_AUDIT]]
 - [[OBSIDIAN_VAULT_AUDIT]]
-- [[SESSION_POSTMORTEM_2026-04-13]]
 - [[ARCHITECTURE_FIXES]]
 - [[ARCHITECTURE_INDEX]]
 - [[ARCHITECTURE_REVIEW]]

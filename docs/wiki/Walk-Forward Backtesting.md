@@ -17,7 +17,6 @@ Promotion gate enforcement via walk-forward backtesting with strict temporal bou
 
 ## Referenced By
 
-- [[ATTENTION]]
 - [[CLAUDE]]
 - [[README]]
 - [[MODULE_CATALOG]]

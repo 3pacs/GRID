@@ -109,7 +109,7 @@ python3 scripts/audit_error_log.py --hours 168 --top 25  # weekly top 25
 python3 scripts/audit_error_log.py --new-only            # only patterns absent in baseline week
 ```
 
-The script normalizes volatile noise (timestamps, FRED series IDs, hex addresses, request IDs) so similar-but-not-identical errors bucket together. Run it before declaring "all green" — it catches regressions that the test suite can't.
+The script normalizes volatile noise (timestamps, [[FRED]] series IDs, hex addresses, request IDs) so similar-but-not-identical errors bucket together. Run it before declaring "all green" — it catches regressions that the test suite can't.
 
 ## Gotchas
 

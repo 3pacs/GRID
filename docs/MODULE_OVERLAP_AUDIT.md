@@ -122,7 +122,7 @@ risks are narrower than the brief suggested, but they still exist.
 
 **Verdict:** **OVERLAP_PARTIAL** — clean responsibility split but the accuracy metrics risk divergence.
 
-**Resolution task:** SYNTH-4 — Extract a shared `intelligence/_accuracy.py` helper (keep the file small, no new intelligence module) or move `compute_accuracy` from contagion_backtest into postmortem's public API. All callers reference one function. Ensures "failed contagion prediction" means the same thing to both modules.
+**Resolution task:** SYNTH-4 — Extract a shared `intelligence/_accuracy.py` helper (keep the file small, no new intelligence module) or move `compute_accuracy` from contagion_backtest into [[Postmortem|postmortem]]'s public API. All callers reference one function. Ensures "failed contagion prediction" means the same thing to both modules.
 
 ---
 
@@ -293,11 +293,11 @@ risks are narrower than the brief suggested, but they still exist.
 - `intelligence/causation_graph.py` (1179 LOC) — `trace_causal_chain`, `find_longest_chains`. Imports `causation_core`, `causation_scoring`, `forensics`, `rag`.
 - `intelligence/causation_scoring.py` (1090 LOC) — `find_causes`, `batch_find_causes`. Imports `causation_core`, `freshness_guard`, `lever_pullers`, `rag`, `actor_signal_bridge`.
 
-**Semantic check:** The three *do* reference each other (via imports). The brief's claim "three causation modules never referencing each other" is **wrong**. This is a clean Strategy-pattern split (dataclasses / graph walker / scorer), plus a 26-line facade. CLAUDE.md's "2,387 LOC [[Causation|causation.py]]" never existed — that number was stale.
+**Semantic check:** The three *do* reference each other (via imports). The brief's claim "three [[Causation|causation]] modules never referencing each other" is **wrong**. This is a clean Strategy-pattern split (dataclasses / graph walker / scorer), plus a 26-line facade. CLAUDE.md's "2,387 LOC [[Causation|causation.py]]" never existed — that number was stale.
 
 **Verdict:** **NOT-A-DUPLICATE** — correctly factored. The real problem is that CLAUDE.md still claims a monolithic `causation.py` exists.
 
-**Resolution task:** SYNTH-14 — Update CLAUDE.md's intelligence section to reflect the actual split (core/graph/scoring/facade). Already flagged as generally stale, but fix the causation entry explicitly. No code changes.
+**Resolution task:** SYNTH-14 — Update CLAUDE.md's intelligence section to reflect the actual split (core/graph/scoring/facade). Already flagged as generally stale, but fix the [[Causation|causation]] entry explicitly. No code changes.
 
 ---
 
@@ -397,7 +397,7 @@ Format: **SYNTH-N**: [canonical] [action] — [why]
 - **SYNTH-11** [LOW]: `pct_cogs_enrichment.py` — label LLM-derived values with `confidence='derived'` per confidence-labels feedback rule.
 - **SYNTH-12** [MEDIUM]: `features/lab.py` — move `compute_sector_percentiles` + `get_percentile` from `ratio_percentiles.py` into `features/lab.py`; shrink ratio_percentiles to a cron shim.
 - **SYNTH-13** [HIGH]: `trading/contagion_to_ticket.py` — gut its strike/expiry/Kelly math and delegate to `options_recommender.OptionsRecommender` — #1 contradiction risk: two Kelly implementations, two strike pickers.
-- **SYNTH-14** [LOW]: `CLAUDE.md` — update intelligence section to reflect actual causation split (core/graph/scoring/facade) and actor_network façade pattern; stop quoting phantom LOC counts.
+- **SYNTH-14** [LOW]: `CLAUDE.md` — update intelligence section to reflect actual [[Causation|causation]] split (core/graph/scoring/facade) and actor_network façade pattern; stop quoting phantom LOC counts.
 - **SYNTH-15** [MEDIUM]: `intelligence/actors/writes.py` (inside existing package) — establish canonical writer for `actors` + `actor_connections`; add `writer_source` audit column; migrate 6+ current writers to call through it.
 - **SYNTH-16** [LOW]: `intelligence/institutional_map.py` — emit `build_institutional_graph` results via SYNTH-15 canonical writer — converge the two actor graphs in one DB.
 - **SYNTH-17** [MEDIUM]: 9 sector network modules — convert to YAML/JSON data files + single loader; target ~19K → ~3K LOC.

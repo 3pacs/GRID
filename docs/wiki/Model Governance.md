@@ -17,7 +17,6 @@ Model lifecycle state machine: CANDIDATE -> SHADOW -> STAGING -> PRODUCTION -> F
 
 ## Referenced By
 
-- [[ATTENTION]]
 - [[CLAUDE]]
 - [[FIRST_DAY_REPORT]]
 - [[README]]

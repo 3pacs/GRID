@@ -17,6 +17,5 @@ Base class for all data ingestion modules. Provides shared `_resolve_source_id()
 
 ## Referenced By
 
-- [[ATTENTION]]
 - [[MODULE_INVENTORY]]
 - [[Project-Structure]]

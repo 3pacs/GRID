@@ -20,5 +20,4 @@ Freedom of Information Act — declassified State Dept and NSA diplomatic cables
 - [[CLAUDE]]
 - [[DATA_GAPS]]
 - [[MODULE_INVENTORY]]
-- [[SESSION_HANDOFF_2026_04_05]]
 - [[PAGEINDEX-INTEGRATION]]

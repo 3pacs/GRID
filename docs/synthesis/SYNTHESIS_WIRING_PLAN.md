@@ -109,7 +109,7 @@ Rows = producers. Columns = consumers. Cell legend:
 ### Starving consumers (sinks with unread upstream volume)
 
 - **Oracle weight evolver** (`oracle/engine.py::_update_model_weights`) only sees verdicts on predictions the oracle itself made. Its DEFAULT_MODELS list has no `contagion`, `fundamental_divergence`, `sector_health`, `regulatory`, `holder_overlap`, or `cross_lens` model entries. **Six missing model heads.**
-- **Trust scorer** has 17 signal types but `SIGNAL_TRUST_DELTA` defines only 2 deltas (`sec_filing`, `chokepoint_crossing`). The Bayesian Beta is running but half the producers can't deposit outcomes into it.
+- **[[Trust Scorer|Trust scorer]]** has 17 signal types but `SIGNAL_TRUST_DELTA` defines only 2 deltas (`sec_filing`, `chokepoint_crossing`). The Bayesian Beta is running but half the producers can't deposit outcomes into it.
 - **[[Oracle Calibration|Oracle calibration]]** only reads `oracle_predictions`. Per-detector calibration would let us pause a detector whose ECE blows up without blowing up the whole oracle.
 - **[[Decision Journal|Decision journal]]** is under-utilized. The only non-oracle writer is `contagion_to_ticket.py`. Every detector firing a scoreable prediction should journal.
 - **Contracts bus** (`ROUTES`) is empty. `DLQ`, `retry_scheduler`, `replay`, `observability` are wired and tested but no events route.

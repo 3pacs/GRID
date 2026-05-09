@@ -53,10 +53,10 @@ Total active [[Dealer Gamma|GEX]] design surface in the vault: **3,323 lines of 
 - **Origin:** Looks like an LLM-generated deep-dive (ChatGPT or similar), pasted in raw with `\(...\)` LaTeX artifacts.
 - **Concepts covered (in order):**
   1. Open-source stack shopping list (Polygon.io, fintools-ai/mcp-options-order-flow-server, KaranChavan21/GEX_Dashboard, NavnoorBawa/Options-Flow-Predictor, py_vollib, QuantLib, Lumibot)
-  2. Full GEX formula + Black-Scholes gamma + Python sketch (`calculate_gex`)
+  2. Full [[Dealer Gamma|GEX]] formula + Black-Scholes gamma + Python sketch (`calculate_gex`)
   3. Gamma flip point: simple linear interpolation method AND full simulation method, with code
   4. Call walls / put walls (`compute_call_put_walls`)
-  5. Vanna Exposure (VEX) — formula, dealer sign convention, `compute_vex_and_vanna_walls`
+  5. [[Dealer Gamma|Vanna]] Exposure (VEX) — formula, dealer sign convention, `compute_vex_and_vanna_walls`
   6. Charm Exposure (CEX) — `black_scholes_charm`, `compute_cex_and_charm_walls`
   7. Vomma / Volga Exposure (VOEX) — `black_scholes_vomma`, `compute_voex_and_vomma_walls`
   8. Speed Exposure (SPEX = DGammaDSpot) — `black_scholes_speed`, `compute_spex_and_speed_walls`
@@ -80,13 +80,13 @@ Total active [[Dealer Gamma|GEX]] design surface in the vault: **3,323 lines of 
   2. Design principles — normalize first, infer second; make units explicit; fail loudly; dealer positioning is a latent model
   3. System scope — **crypto first (Deribit / OKX / Bybit)**, US equity later
   4. High-level [[architecture]] — 5-layer pipeline (Ingestion -> Validation -> Greek Completion -> Exposure Aggregation -> Alpha Layer)
-  5. **Canonical normalized schema** — 30+ fields per contract (venue, symbol, underlying, expiry_ts_utc, strike, option_type, contract_size, settlement_currency, oi_contracts, iv_decimal, delta, gamma, vanna, charm, vomma, color, zomma, speed, source_ts_utc, ingest_ts_utc, data_quality_flags)
+  5. **Canonical normalized schema** — 30+ fields per contract (venue, symbol, underlying, expiry_ts_utc, strike, option_type, contract_size, settlement_currency, oi_contracts, iv_decimal, delta, gamma, [[Dealer Gamma|vanna]], charm, vomma, color, zomma, speed, source_ts_utc, ingest_ts_utc, data_quality_flags)
   6. Exposure definitions with **explicit unit conventions** (per-contract, per-1%-move, signed/absolute)
   7. Mathematical layer — Black-Scholes as fallback, upgrade path to SABR/SVI
   8. **Venue adapter spec** — `BaseOptionsVenueAdapter` abstract class + `DeribitAdapter`, `OKXAdapter`, `BybitAdapter`
   9. **Validation pipeline** — hard rejects, soft warnings, sanity bounds, data_quality_flags output
   10. **Greek completion layer** — exchange Greeks preferred, recompute missing/invalid, vectorized, provenance-tagged
-  11. **Exposure aggregation engine** — net GEX/CEX/VEX/VOEX/COLEX, gamma flip, walls, concentration, profiles
+  11. **Exposure aggregation engine** — net [[Dealer Gamma|GEX]]/CEX/VEX/VOEX/COLEX, gamma flip, walls, concentration, profiles
   12. **Confidence score framework** — completeness, freshness, venue agreement, persistence, spread quality
   13. Alpha layer spec — feature categories (structural, drift, vol-sensitivity, stability)
   14. Historical storage — raw payloads / normalized snapshots / features / signals, partitioned by venue + date, Parquet
@@ -103,7 +103,7 @@ Total active [[Dealer Gamma|GEX]] design surface in the vault: **3,323 lines of 
 
 - **Origin:** Labeled "built from the complete conversation" by Grok. Contains a **single-file, working Python implementation** (`dealer_flow_engine.py`) using CCXT + Deribit + on-the-fly Black-Scholes.
 - **Concrete deliverable:** A ~200-line Python script with:
-  - Every Black-Scholes helper (gamma, delta, vanna, charm, vomma, speed, color, zomma)
+  - Every Black-Scholes helper (gamma, delta, [[Dealer Gamma|vanna]], charm, vomma, speed, color, zomma)
   - `compute_missing_greeks` fallback path
   - `compute_gamma_flip`, `compute_call_put_walls`, `compute_cex_and_charm_walls`
   - `full_dealer_exposure` one-shot orchestrator
@@ -118,14 +118,14 @@ Total active [[Dealer Gamma|GEX]] design surface in the vault: **3,323 lines of 
 
 - A crypto-first (Deribit/OKX/Bybit via CCXT) options dealer-flow engine
 - A normalized per-contract schema with unit-explicit exposures
-- Full higher-order Greeks suite: **Gamma, Vanna, Charm, Vomma, Speed, Color, Zomma** — 7 exposures, each with walls + flips + per-strike profiles
+- Full higher-order Greeks suite: **Gamma, [[Dealer Gamma|Vanna]], Charm, Vomma, Speed, Color, Zomma** — 7 exposures, each with walls + flips + per-strike profiles
 - A 5-layer pipeline (Ingest -> Validate -> Complete Greeks -> Aggregate -> Alpha)
 - Confidence scoring on every snapshot, every metric, every signal
 - Three-tier historical storage (raw payloads / normalized snapshots / aggregated features) in Parquet
 - Venue-agreement cross-checks and persistence-weighted wall selection (not "single max strike")
 - Phase 4 roadmap with production hardening (alerting, anomaly detection, config versioning)
 
-**Big picture:** The vault contains a complete production-grade V2 specification for a crypto options dealer-flow engine that does **not yet exist in any form inside the GRID repo**. The closest GRID analog is `physics/dealer_gamma.py` (494 lines, equity-only, single-venue, no higher-order Greeks beyond vanna+charm, no normalized schema, no validation pipeline, no confidence scoring, no snapshot storage).
+**Big picture:** The vault contains a complete production-grade V2 specification for a crypto options dealer-flow engine that does **not yet exist in any form inside the GRID repo**. The closest GRID analog is `physics/dealer_gamma.py` (494 lines, equity-only, single-venue, no higher-order Greeks beyond [[Dealer Gamma|vanna]]+charm, no normalized schema, no validation pipeline, no confidence scoring, no snapshot storage).
 
 **What's done vs missing vs stub:**
 
@@ -173,7 +173,7 @@ Total active [[Dealer Gamma|GEX]] design surface in the vault: **3,323 lines of 
 - `Intelligence-Layer.md` — 89 intelligence modules
 - `Analysis-Layer.md`, `Trading-Layer.md`, `ML-Inference.md`, `Orchestration-Layer.md`, `Cron-Schedule.md`, `Planning-Docs.md`, `Module-Sizes.md`, `Config-Map.md`
 
-Most architecture notes are **documentation stubs** summarizing code that already exists. They are reference material, not proposals.
+Most [[architecture]] notes are **documentation stubs** summarizing code that already exists. They are reference material, not proposals.
 
 ---
 
@@ -243,7 +243,7 @@ Vault sessions stop at S22 (2026-04-07). The `.claude` memory has handoffs throu
 
 **This is where the signal is.** These are things the user designed in the vault but never built:
 
-1. **The entire V2 GEX engine** (`GEX GPT notes.md`) — 0% of spec exists as code. **Biggest proposal in the vault.**
+1. **The entire V2 [[Dealer Gamma|GEX]] engine** (`GEX GPT notes.md`) — 0% of spec exists as code. **Biggest proposal in the vault.**
 2. **The single-file Deribit/CCXT reference build** (`Gex Grok MD.md`) — 0 files in GRID match `*deribit*`. No CCXT usage anywhere.
 3. **`version 5 - Stack & Visualization Architecture.md`** — Proposes Apache AGE (graph extension), Elasticsearch (document store), Redpanda (event stream), MinIO (blob store), Temporal.io (durable orchestration), deck.gl geo layer, React Flow canvas. Per the `.claude` memory, MinIO + Redpanda + Prefect were "shipped" in V5 Phase 4 (handoff 2026-04-08d), so this one is PARTIALLY built. Canvas view is also built. But Apache AGE, Elasticsearch, and Temporal are not confirmed live in the latest memory snapshots.
 4. **Palantir-style Canvas View** — called out as "THE killer feature" in the version 5 doc. Per memory this shipped as `Gotham Canvas` in handoff 2026-04-09c (6 commits, 12 intelligence tables wired). **Vault is stale on this — still describes it as "Missing".**
@@ -265,7 +265,7 @@ Top drift items (vault says one thing, code does another):
 
 1. **LLM stack** — `Decisions/LLM-Model-Selection.md` says "FINAL — Nemotron-Super-49B v1.5, 60/81 GPU, ~1 tok/s. Don't revisit unless hardware changes." The decision file is marked `status: FINAL`. Reality (per S21 and the `.claude` CLAUDE.md): **Gemma 4 31B is the sole local LLM as of 2026-04-06.** The Decisions file is stale by at least one major migration.
 2. **`00-Dashboard.md` "System Status" table** — Lists "LLM (31B) ONLINE | [[Hermes Scheduler|Hermes]] 8B -> Gemma 4 31B". That's half right but says `Gemma 4` in one column and `Hermes` in another; also lists `Nemotron-Super-49B` as live in `Infrastructure/LLM-Stack` row. Three different LLMs claimed as active in the same dashboard.
-3. **`Modules/Trading/Options-Analytics.md`** — Lists `physics/dealer_gamma.py` as "Dealer gamma exposure calculation (GEX)" without mentioning vanna, charm, gamma flip, walls, dealer_delta, profile curves, or the vectorized refactor from S22. The note is 60 lines covering ~6 files; the actual `dealer_gamma.py` alone is 494 lines. **Massive undersell.**
+3. **`Modules/Trading/Options-Analytics.md`** — Lists `physics/dealer_gamma.py` as "[[Dealer Gamma|Dealer gamma]] exposure calculation ([[Dealer Gamma|GEX]])" without mentioning [[Dealer Gamma|vanna]], charm, gamma flip, walls, dealer_delta, profile curves, or the vectorized refactor from S22. The note is 60 lines covering ~6 files; the actual `dealer_gamma.py` alone is 494 lines. **Massive undersell.**
 4. **Canvas / Gotham view** — version 5 doc says "Investigation canvas: Missing". Per `.claude` memory handoff 2026-04-09c, Gotham Canvas shipped with 6 commits, 12 intelligence tables wired, dedup, tiered depth, auto-seed, intel feed. Vault is >2 sessions behind.
 5. **`Modules/Intelligence/Actor Network.md`** references the old monolith. Per GRID CLAUDE.md: "`intelligence/actor_network.py` (153 LOC facade) — thin re-export shim; the real actor network now lives in the `intelligence/actors/` subpackage". Note is out of date.
 
@@ -292,13 +292,13 @@ Full drift audit would take another ~2 hours. These 5 are the most load-bearing.
 
 Concretely:
 
-1. **Vault stays as the planning surface** — the V2 GEX spec, the version 5 stack doc, and the TOP ASAP FIXES list are the right kind of content for an Obsidian vault. Wikilinks between notes are already heavily used. Don't force this into GRID's doc tree.
+1. **Vault stays as the planning surface** — the V2 [[Dealer Gamma|GEX]] spec, the version 5 stack doc, and the TOP ASAP FIXES list are the right kind of content for an Obsidian vault. Wikilinks between notes are already heavily used. Don't force this into GRID's doc tree.
 
 2. **GRID stays as the execution surface** — code + machine-verified inventories (`docs/MODULE_INVENTORY.md`, `docs/CODEBASE_INDEX.md`, migration files, schema.sql). Don't pollute this with prose design docs.
 
 3. **Build a one-way promotion lane** for 3-5 specific artifact types only:
     - **Design specs** (like `GEX GPT notes.md`) get promoted to `docs/planning/<slug>.md` **when they're ready to execute**. The vault version stays as the living doc; the GRID copy is a frozen snapshot with a front-matter `source_vault_note:` reference. This is how `GEX GPT notes.md` should flow into `docs/planning/GEX-V2-SPEC.md` (superseding the stale `GSD-OPTIONS-EDGE.md` and `DERIVATIVESGRID-PLAN.md`).
-    - **Architecture decision records** (`Decisions/*.md`) get promoted to `docs/decisions/<slug>.md` with date stamps. Makes them discoverable to agents that don't read the vault.
+    - **[[architecture|Architecture]] decision records** (`Decisions/*.md`) get promoted to `docs/decisions/<slug>.md` with date stamps. Makes them discoverable to agents that don't read the vault.
     - **Dead-end notes** promoted to `docs/dead-ends/` so agents stop rediscovering 49.9% TimesFM.
     - **Session logs** stay vault-only. The `.claude` memory is the authoritative session record; vault sessions are a thinner second copy and should not be the source of truth.
     - **Module notes** (`Modules/**/*.md`) stay vault-only. They systematically drift, they're at the wrong granularity, and `docs/MODULE_INVENTORY.md` already does this job better with code generation.
@@ -322,7 +322,7 @@ Concretely:
 
 2. **Scaffold `physics/dealer_flow/` subpackage** matching the V2 spec repository structure (`adapters/`, `schemas/`, `validation/`, `greeks/`, `exposures/`, `alpha/`, `storage/`). Port the 7 Black-Scholes helpers from `Gex Grok MD.md` into `greeks/black_scholes.py` (extending, not replacing, the existing `physics/dealer_gamma.py` helpers). This unblocks vomma/speed/color/zomma which are missing from GRID today.
 
-3. **Build the `DeribitAdapter` first, end-to-end.** The V2 spec explicitly recommends starting with Deribit-only, getting GEX + flip + call wall + put wall + CEX working, saving every snapshot, then building tests from frozen snapshots. No venue-agnostic abstraction until you have one working adapter. New module: `ingestion/altdata/crypto_options/deribit.py`.
+3. **Build the `DeribitAdapter` first, end-to-end.** The V2 spec explicitly recommends starting with Deribit-only, getting [[Dealer Gamma|GEX]] + flip + call wall + put wall + CEX working, saving every snapshot, then building tests from frozen snapshots. No venue-agnostic abstraction until you have one working adapter. New module: `ingestion/altdata/crypto_options/deribit.py`.
 
 4. **Migrate or deprecate `options_snapshots` (0 rows).** The 14-column equity table doesn't match the V2 normalized schema (30+ fields, venue-aware, contract-size aware). Create `option_contracts_normalized` + `option_snapshots_raw` + `option_exposures` tables per V2 spec section 14. Add migration file.
 
@@ -338,8 +338,8 @@ Concretely:
 
 Three things the main agent should know immediately:
 
-1. **The new GEX build is 95% designed and 0% coded.** `GEX GPT notes.md` is a 1,337-line production spec for a crypto-first dealer-flow engine with 7 higher-order Greeks, normalized schema, venue adapters, confidence scoring, and a 4-phase roadmap. None of it exists in GRID. `options_snapshots` (the only table the spec would write to) has 0 rows. `docs/planning/GSD-OPTIONS-EDGE.md` predates V2 and does not mention Deribit, CCXT, vomma, zomma, speed, color, confidence scoring, venue adapters, or normalized schemas. **This is the build the user was asking about.**
+1. **The new [[Dealer Gamma|GEX]] build is 95% designed and 0% coded.** `GEX GPT notes.md` is a 1,337-line production spec for a crypto-first dealer-flow engine with 7 higher-order Greeks, normalized schema, venue adapters, confidence scoring, and a 4-phase roadmap. None of it exists in GRID. `options_snapshots` (the only table the spec would write to) has 0 rows. `docs/planning/GSD-OPTIONS-EDGE.md` predates V2 and does not mention Deribit, CCXT, vomma, zomma, speed, color, confidence scoring, venue adapters, or normalized schemas. **This is the build the user was asking about.**
 
-2. **There is a working single-file reference implementation in `Gex Grok MD.md`** (276 lines) that uses CCXT -> Deribit -> on-the-fly Black-Scholes to compute GEX + gamma flip + charm walls on BTC 0DTE chains. It won't ship as-is, but it's a usable skeleton — all 7 Black-Scholes helpers are implemented. Port these into `physics/greeks/black_scholes.py` on day 1 and you've closed the "missing 5 Greeks" gap in GRID immediately.
+2. **There is a working single-file reference implementation in `Gex Grok MD.md`** (276 lines) that uses CCXT -> Deribit -> on-the-fly Black-Scholes to compute [[Dealer Gamma|GEX]] + gamma flip + charm walls on BTC 0DTE chains. It won't ship as-is, but it's a usable skeleton — all 7 Black-Scholes helpers are implemented. Port these into `physics/greeks/black_scholes.py` on day 1 and you've closed the "missing 5 Greeks" gap in GRID immediately.
 
-3. **`physics/dealer_gamma.py` (494 LOC, GRID) is load-bearing, well-built, and completely undocumented in the vault.** The module has `DealerGammaEngine` with vectorized GEX profile, gamma flip via bisection, walls, vanna, charm, dealer delta, regime classification (LONG_GAMMA / SHORT_GAMMA / NEUTRAL). S22 vectorized it (37s -> 1.6s per ticker, logged in the session note as a one-liner). The vault module note (`Modules/Trading/Options-Analytics.md`) describes it as one bullet point: "Dealer gamma exposure calculation (GEX)". **The existing GRID code is ~60% of the way to the V2 spec already** for equity. The V2 build doesn't need to start from scratch — it needs to be refactored into the new normalized-schema + crypto-first shape, with the missing 5 Greeks bolted on.
+3. **`physics/dealer_gamma.py` (494 LOC, GRID) is load-bearing, well-built, and completely undocumented in the vault.** The module has `DealerGammaEngine` with vectorized [[Dealer Gamma|GEX]] profile, gamma flip via bisection, walls, [[Dealer Gamma|vanna]], charm, dealer delta, regime classification (LONG_GAMMA / SHORT_GAMMA / NEUTRAL). S22 vectorized it (37s -> 1.6s per ticker, logged in the session note as a one-liner). The vault module note (`Modules/Trading/Options-Analytics.md`) describes it as one bullet point: "[[Dealer Gamma|Dealer gamma]] exposure calculation (GEX)". **The existing GRID code is ~60% of the way to the V2 spec already** for equity. The V2 build doesn't need to start from scratch — it needs to be refactored into the new normalized-schema + crypto-first shape, with the missing 5 Greeks bolted on.

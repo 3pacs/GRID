@@ -17,13 +17,11 @@ Central scheduler orchestrating all 48 data pullers, agent loops, and background
 
 ## Referenced By
 
-- [[ATTENTION]]
 - [[CLAUDE]]
 - [[MODULE_CATALOG]]
 - [[MODULE_DEDUPE_PLAN]]
 - [[MODULE_OVERLAP_AUDIT]]
 - [[OBSIDIAN_VAULT_AUDIT]]
-- [[SESSION_HANDOFF_2026_04_17]]
 - [[SPRINTS_SELF_LEARNING]]
 - [[TONIGHT-CHECKLIST]]
 - [[Cron-Schedule]]

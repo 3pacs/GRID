@@ -778,7 +778,7 @@ The alpha layer sits on top of exposures and turns them into testable features.
 
 #### Structural positioning features
 
-- signed net GEX
+- signed net [[Dealer Gamma|GEX]]
     
 - spot distance to gamma flip
     
@@ -786,7 +786,7 @@ The alpha layer sits on top of exposures and turns them into testable features.
     
 - spot distance to major put wall
     
-- GEX concentration ratio
+- [[Dealer Gamma|GEX]] concentration ratio
     
 - expiry concentration ratio
     
@@ -934,7 +934,7 @@ Must cover:
 
 Use frozen chain snapshots and verify:
 
-- net GEX
+- net [[Dealer Gamma|GEX]]
     
 - top walls
     
@@ -1132,7 +1132,7 @@ Deliverables:
     
 - vectorized gamma/delta/charm
     
-- clean GEX / CEX / wall / flip outputs
+- clean [[Dealer Gamma|GEX]] / CEX / wall / flip outputs
     
 - snapshot persistence
     
@@ -1145,7 +1145,7 @@ Deliverables:
 
 - Deribit + OKX + Bybit adapters
     
-- vanna / vomma / color / zomma / speed implementations
+- [[Dealer Gamma|vanna]] / vomma / color / zomma / speed implementations
     
 - confidence scoring
     
@@ -1238,7 +1238,7 @@ options-dealer-flow/
 
 │ │ ├─ charm.py
 
-│ │ ├─ vanna.py
+│ │ ├─ [[Dealer Gamma|vanna]].py
 
 │ │ ├─ vomma.py
 
@@ -1291,7 +1291,7 @@ If you are building this now, the smartest order is:
     
 2. Build the normalized schema and validation pipeline.
     
-3. Get **GEX, flip, call wall, put wall, CEX** working correctly.
+3. Get **[[Dealer Gamma|GEX]], flip, call wall, put wall, CEX** working correctly.
     
 4. Save every snapshot.
     

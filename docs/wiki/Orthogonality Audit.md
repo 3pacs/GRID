@@ -17,7 +17,6 @@ Feature independence audit using PCA, correlation heatmaps, and scree plots. Ens
 
 ## Referenced By
 
-- [[ATTENTION]]
 - [[CLAUDE]]
 - [[MODULE_CATALOG]]
 - [[MODULE_INVENTORY]]

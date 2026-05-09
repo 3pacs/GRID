@@ -398,7 +398,7 @@ Investigators need to search across the entire intelligence corpus: filings, dip
 
 ### Solution: PostgreSQL Full-Text Search (tsvector/tsquery)
 
-**Why not Elasticsearch?** Same reason as AGE — keep it in PostgreSQL. FTS with GIN indexes handles GRID's corpus size (millions of documents) with sub-second queries. No new infrastructure.
+**Why not Elasticsearch?** Same reason as AGE — keep it in [[PostgreSQL]]. FTS with GIN indexes handles GRID's corpus size (millions of documents) with sub-second queries. No new infrastructure.
 
 ### Implementation
 
@@ -532,7 +532,7 @@ Phase 4: God components last (with decomposition)
 
 #### 5E. God Component Decomposition
 
-**ActorNetwork.jsx (1959 LOC) → 6 files:**
+**[[Actor Network View|ActorNetwork]].jsx (1959 LOC) → 6 files:**
 ```
 ActorNetwork.tsx          — orchestrator (~300 LOC)
 ActorGraph.tsx            — D3 force simulation (~400 LOC)
@@ -698,7 +698,7 @@ events/async_pool.py                  — asyncpg pool manager (~100 LOC)
 | SSE client hook | `hooks/useEventStream.ts` | ~80 | SSE endpoint |
 
 **Integration:**
-- Add "Send to Canvas" context menu to ActorNetwork, [[MoneyFlow View|MoneyFlow]], Timeline views
+- Add "Send to Canvas" context menu to [[Actor Network View|ActorNetwork]], [[MoneyFlow View|MoneyFlow]], Timeline views
 - Route: `/canvas` and `/canvas/:boardId`
 - Nav: add Canvas to primary tab bar
 
@@ -901,10 +901,10 @@ Phase 6: Geo-Spatial (OPTIONAL) ◄┘
 
 ## What v5 DOESN'T Do (Explicit Non-Goals)
 
-1. **No Kafka/Redpanda** — PostgreSQL LISTEN/NOTIFY is sufficient for single-server
-2. **No Neo4j** — Apache AGE gives Cypher on the same PostgreSQL instance
-3. **No Elasticsearch** — PostgreSQL FTS with GIN indexes handles the corpus
-4. **No Redis** — In-process caching + PostgreSQL materialized views are enough
+1. **No Kafka/Redpanda** — [[PostgreSQL]] LISTEN/NOTIFY is sufficient for single-server
+2. **No Neo4j** — Apache AGE gives Cypher on the same [[PostgreSQL]] instance
+3. **No Elasticsearch** — [[PostgreSQL]] FTS with GIN indexes handles the corpus
+4. **No Redis** — In-process caching + [[PostgreSQL]] materialized views are enough
 5. **No microservices** — GRID is a single-operator system. Monolith is correct.
 6. **No React Native** — PWA with Capacitor wrapper (already planned for Q4 2026)
 7. **No full TypeScript rewrite** — Incremental migration, new files only

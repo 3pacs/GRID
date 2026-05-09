@@ -19,7 +19,6 @@ Celestial mechanics and astronomical cycle overlay for market timing.
 
 - [[MODULE_CATALOG]]
 - [[MODULE_INVENTORY]]
-- [[SESSION_HANDOFF_2026_04_17]]
 - [[SHARED-READ-CONTRACT]]
 - [[astrogrid-5-day-execution-plan]]
 - [[astrogrid-agent-handoff-week]]

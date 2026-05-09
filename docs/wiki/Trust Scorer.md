@@ -22,7 +22,6 @@ Bayesian trust scoring with 90-day recency half-life for all signal sources. Eva
 - [[MODULE_DEDUPE_PLAN]]
 - [[MODULE_INVENTORY]]
 - [[MODULE_OVERLAP_AUDIT]]
-- [[SESSION_HANDOFF_2026_04_05]]
 - [[CODE_REVIEW]]
 - [[DOC_AUDIT]]
 - [[Analysis-Layer]]

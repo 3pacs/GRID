@@ -134,7 +134,7 @@ After deploy:
 
 1. Watch new INSERTs. Count `total_rows / unique_events` for predictions
    created since the deploy timestamp. Should be ~1.0.
-2. Daily walk-forward `dup_factor` field (added 2026-04-28) should drop
+2. Daily [[Walk-Forward Backtesting|walk-forward]] `dup_factor` field (added 2026-04-28) should drop
    from 180/23 → ~1.0 within 7 days as old data ages out of the 90d window.
 3. `walk_forward_profitability` log line warns when `dup_factor > 2.0` —
    absence of that warning = fix landed correctly.
@@ -160,7 +160,7 @@ performance. Two protective moves:
 
 ## Notes for the agent picking this up
 
-- The dedup-aware walk-forward report is already live (2026-04-28). It will
+- The dedup-aware [[Walk-Forward Backtesting|walk-forward]] report is already live (2026-04-28). It will
   print honest numbers as soon as it runs. So you can iterate on the
   dup-write fix WITHOUT first fixing the report — they're decoupled.
 - Don't drop the existing UUID primary key. Add the natural-key UNIQUE

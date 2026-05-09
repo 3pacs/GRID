@@ -21,7 +21,6 @@ Automated failure analysis for every bad trade. Mandatory post-mortems that feed
 - [[MODULE_INVENTORY]]
 - [[MODULE_OVERLAP_AUDIT]]
 - [[OBSIDIAN_VAULT_AUDIT]]
-- [[SESSION_HANDOFF_2026_04_11c]]
 - [[TODO-DUP-WRITES]]
 - [[astrogrid-5-day-execution-plan]]
 - [[astrogrid-agent-handoff-week]]

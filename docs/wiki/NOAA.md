@@ -20,6 +20,5 @@ National Oceanic and Atmospheric Administration — weather data for commodity s
 - [[README]]
 - [[MODULE_CATALOG]]
 - [[MODULE_INVENTORY]]
-- [[SESSION_HANDOFF_2026_04_05]]
 - [[ARCHITECTURE_REVIEW]]
 - [[ASTROGRID-PLAN]]

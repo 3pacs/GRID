@@ -13,7 +13,6 @@ Primary database: PostgreSQL 15 with [[TimescaleDB]] extension.
 
 ## Referenced By
 
-- [[ATTENTION]]
 - [[CLAUDE]]
 - [[DEV-NOTES-DATA-INTEGRITY]]
 - [[HOSTING]]
