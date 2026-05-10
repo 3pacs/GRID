@@ -75,9 +75,27 @@ _OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 _OUTPUT_DIR = Path("/data/grid_v4/grid_repo/output/briefings")
 
 # TTS settings
+#
+# TTS_PROVIDER selects backend:
+#   "openai" (default) — OpenAI tts-1-hd, requires OPENAI_API_KEY, MP3 output
+#   "kokoro_koala"     — local Kokoro server on koala:8091, 54 voices, WAV
+#                        output transcoded to MP3 via ffmpeg
+#
+# To use Kokoro: set TTS_PROVIDER=kokoro_koala, optionally TTS_VOICE
+# (e.g. "af_sarah", "am_michael", "bf_emma" — see /v1/voices on the
+# Kokoro server for the full list).
+#
+# F5-TTS is installed on koala but requires a reference audio clip per
+# voice (it's a voice-cloning model, not a default-voice TTS). Wired in
+# a follow-up once we have approved character voice references.
+TTS_PROVIDER = os.getenv("TTS_PROVIDER", "openai").strip().lower()
 TTS_MODEL = "tts-1-hd"
-TTS_VOICE = "shimmer"
+TTS_VOICE = os.getenv("TTS_VOICE", "shimmer").strip()
 TTS_FORMAT = "mp3"
+
+# Kokoro server (local TTS, no API cost)
+KOKORO_TTS_BASE_URL = os.getenv("KOKORO_TTS_BASE_URL", "http://koala:8091").strip()
+KOKORO_TTS_TIMEOUT = int(os.getenv("KOKORO_TTS_TIMEOUT_SECONDS", "120"))
 
 # Gemini model for script generation
 GEMINI_SCRIPT_MODEL = "gemini-2.5-flash"
@@ -469,14 +487,26 @@ def _ensure_output_dir() -> Path:
 
 
 def _generate_audio_file(script_text: str, briefing_date: str) -> str:
+    """Convert script text to MP3.
+
+    Routes by TTS_PROVIDER env var:
+      "openai" (default) — OpenAI tts-1-hd
+      "kokoro_koala"     — local Kokoro server on koala:8091
+
+    Returns the file path of the saved audio.
+    """
+    if TTS_PROVIDER == "kokoro_koala":
+        return _generate_audio_file_kokoro(script_text, briefing_date)
+    return _generate_audio_file_openai(script_text, briefing_date)
+
+
+def _generate_audio_file_openai(script_text: str, briefing_date: str) -> str:
     """Convert script text to MP3 via OpenAI TTS.
 
     The router does not yet expose audio synthesis, so this still calls
     the OpenAI SDK directly. We tag the call with a manual Langfuse
     generation observation so the cost shows up in the same dashboard
     as routed chat traffic.
-
-    Returns the file path of the saved audio.
     """
     client = _get_openai_client()
     output_dir = _ensure_output_dir()
@@ -485,7 +515,7 @@ def _generate_audio_file(script_text: str, briefing_date: str) -> str:
     file_path = output_dir / filename
 
     log.info(
-        "Generating audio: model={m}, voice={v}, format={f}",
+        "Generating audio (openai): model={m}, voice={v}, format={f}",
         m=TTS_MODEL, v=TTS_VOICE, f=TTS_FORMAT,
     )
 
@@ -519,6 +549,83 @@ def _generate_audio_file(script_text: str, briefing_date: str) -> str:
         },
     )
     return str(file_path)
+
+
+def _generate_audio_file_kokoro(script_text: str, briefing_date: str) -> str:
+    """Convert script text to MP3 via local Kokoro TTS server.
+
+    Kokoro returns WAV (24kHz mono PCM 16-bit). We transcode to MP3 via
+    ffmpeg so the rest of the pipeline (which expects MP3 from
+    audio_briefing) is unchanged.
+
+    Server endpoint: ``POST {KOKORO_TTS_BASE_URL}/v1/audio/speech`` with
+    JSON ``{"input": <text>, "voice": <voice_id>, "response_format":
+    "wav", "speed": 1.0}``. Returns audio/wav bytes.
+    """
+    import requests
+
+    output_dir = _ensure_output_dir()
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    wav_path = output_dir / f"briefing_{briefing_date}_{timestamp}.wav"
+    mp3_path = output_dir / f"briefing_{briefing_date}_{timestamp}.mp3"
+
+    voice = TTS_VOICE if TTS_VOICE.startswith(("af_", "am_", "bf_", "bm_")) else "af_sarah"
+    log.info(
+        "Generating audio (kokoro_koala): voice={v} server={s}",
+        v=voice, s=KOKORO_TTS_BASE_URL,
+    )
+
+    t0 = time.monotonic()
+    resp = requests.post(
+        f"{KOKORO_TTS_BASE_URL}/v1/audio/speech",
+        json={
+            "input": script_text,
+            "voice": voice,
+            "response_format": "wav",
+            "speed": 1.0,
+        },
+        timeout=KOKORO_TTS_TIMEOUT,
+    )
+    resp.raise_for_status()
+    wav_path.write_bytes(resp.content)
+    duration_hdr = resp.headers.get("X-Audio-Duration-Seconds")
+
+    # Transcode WAV -> MP3 to keep downstream compatible
+    subprocess.run(
+        [
+            "ffmpeg", "-loglevel", "error", "-y",
+            "-i", str(wav_path),
+            "-codec:a", "libmp3lame", "-q:a", "2",
+            str(mp3_path),
+        ],
+        check=True,
+    )
+    wav_path.unlink(missing_ok=True)
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    file_size = mp3_path.stat().st_size
+    log.info(
+        "Audio saved: {p} ({kb}KB, {d}s)",
+        p=mp3_path, kb=file_size // 1024, d=duration_hdr or "?",
+    )
+
+    _lf_emit_generation(
+        name="audio_briefing.tts",
+        model=f"kokoro:{voice}",
+        provider="kokoro_koala",
+        input_payload={"voice": voice, "format": TTS_FORMAT,
+                       "script_chars": len(script_text)},
+        output_payload={"path": str(mp3_path), "bytes": file_size,
+                        "audio_duration_s": duration_hdr},
+        usage_details={"input": len(script_text), "output": 0},
+        metadata={
+            "module": "audio_briefing.tts",
+            "briefing_date": briefing_date,
+            "latency_ms": latency_ms,
+            "server": KOKORO_TTS_BASE_URL,
+        },
+    )
+    return str(mp3_path)
 
 
 # -- Title Card Generation via Gemini Imagen ---------------------------------
