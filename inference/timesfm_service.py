@@ -200,7 +200,11 @@ def forecast_signals(
             freq = [0] * len(inputs)  # 0 = daily
             point_fc, quantile_fc = model.forecast(inputs, freq)
     except Exception as exc:
-        log.error("TimesFM forecast failed: {e}", e=str(exc))
+        # Forecast failures (CUDA kernel mismatches on shared GPUs, OOMs,
+        # transient model-load issues) are caught and handled by every
+        # caller of forecast_signals. Log as WARNING — the re-raise still
+        # surfaces the failure to the caller for its own decision-making.
+        log.warning("TimesFM forecast failed: {e}", e=str(exc))
         raise
     elapsed = _time.time() - t0
     log.info("TimesFM inference done in {t:.1f}s ({n} signals)",

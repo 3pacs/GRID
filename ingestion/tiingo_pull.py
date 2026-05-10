@@ -194,7 +194,20 @@ class TiingoPuller(BasePuller):
                 result["status"] = "FAILED"
                 result["errors"].append("index corruption — see prior ERROR")
                 return result
-            log.error("Tiingo pull failed for {t}: {err}", t=ticker, err=err_str)
+            # Transient network failures (read timeouts, connection resets,
+            # DNS blips) are recovered by the next ingestion cycle. Per
+            # CLAUDE.md log-hygiene rule, downgrade them to WARNING so
+            # errors.jsonl stays focused on unhandled bugs.
+            is_transient = isinstance(
+                exc,
+                (
+                    requests.exceptions.Timeout,
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.ChunkedEncodingError,
+                ),
+            )
+            log_fn = log.warning if is_transient else log.error
+            log_fn("Tiingo pull failed for {t}: {err}", t=ticker, err=err_str)
             result["status"] = "FAILED"
             result["errors"].append(err_str)
 

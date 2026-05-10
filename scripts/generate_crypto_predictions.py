@@ -180,7 +180,10 @@ for c in calls:
         log.info("  {} {:5s} {:7s} — {}", c['symbol'], c['horizon'], c['direction'], c['call'][:50])
         stored += 1
     else:
-        log.error("  FAIL: {} {}", c['symbol'], c['call'][:40])
+        # save_prediction returns falsy on dedupe / no-op (script runs on a
+        # cron and re-submits the same calls). That's expected operational
+        # behaviour, not an unhandled bug — keep errors.jsonl signal-rich.
+        log.warning("  skipped (dup/no-op): {} {}", c['symbol'], c['call'][:40])
 
 log.info("\nStored {} crypto predictions", stored)
 

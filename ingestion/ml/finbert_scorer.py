@@ -418,7 +418,10 @@ class FinBERTScorer:
                 result = self.score_source(source_name)
                 results.append(result)
             except Exception as exc:
-                log.error("FinBERT scoring failed for {s}: {e}", s=source_name, e=str(exc))
+                # Per-source failure is handled (other sources continue, the
+                # outer scheduler caller already wraps in try/except). Log as
+                # WARNING so errors.jsonl stays focused on unhandled bugs.
+                log.warning("FinBERT scoring failed for {s}: {e}", s=source_name, e=str(exc))
                 results.append({
                     "source": source_name,
                     "rows_scored": 0,
