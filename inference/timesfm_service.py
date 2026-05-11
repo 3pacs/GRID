@@ -38,6 +38,13 @@ MIN_SERIES_LENGTH = 64      # skip signals shorter than this
 FORECAST_TTL_HOURS = 4      # re-forecast if older than this
 STALE_FORECAST_HOURS = 24   # mark forecast as stale after this
 
+# Process-scoped breaker for fatal CUDA-kernel mismatch ("no kernel image is
+# available for execution on the device"). This means the installed PyTorch
+# wheel was built for a different compute capability than the host GPU —
+# every subsequent forecast will hit the same wall. Flip once, log a single
+# actionable ERROR, then return empty silently for the rest of the process.
+_CUDA_KERNEL_BREAKER: bool = False
+
 
 # ── Forecast result (immutable) ──────────────────────────────────────
 
@@ -161,6 +168,11 @@ def forecast_signals(
     Returns:
         List of SignalForecast objects.
     """
+    global _CUDA_KERNEL_BREAKER
+    if _CUDA_KERNEL_BREAKER:
+        log.debug("TimesFM: CUDA kernel breaker tripped — skipping forecast")
+        return []
+
     model = _load_model(context=context, horizon=horizon)
     signals = _extract_signals(engine, feature_ids=feature_ids)
 
@@ -200,7 +212,28 @@ def forecast_signals(
             freq = [0] * len(inputs)  # 0 = daily
             point_fc, quantile_fc = model.forecast(inputs, freq)
     except Exception as exc:
-        log.error("TimesFM forecast failed: {e}", e=str(exc))
+        err_str = str(exc)
+        # Fatal CUDA kernel mismatch: PyTorch build incompatible with the
+        # host GPU's compute capability. Every subsequent call will fail
+        # identically — flip a process-wide breaker so we surface ONE
+        # actionable line instead of burning ERROR rows every cycle.
+        if (
+            "no kernel image is available" in err_str
+            or "cudaErrorNoKernelImageForDevice" in err_str
+        ):
+            if not _CUDA_KERNEL_BREAKER:
+                _CUDA_KERNEL_BREAKER = True
+                log.error(
+                    "TimesFM: CUDA kernel mismatch — installed torch wheel "
+                    "is not built for this GPU's compute capability. "
+                    "Operator must reinstall torch with matching CUDA "
+                    "arch (see inference/timesfm_service.py). Disabling "
+                    "TimesFM for the rest of this process to avoid log "
+                    "flood. Original: {e}",
+                    e=err_str[:200],
+                )
+            return []
+        log.error("TimesFM forecast failed: {e}", e=err_str)
         raise
     elapsed = _time.time() - t0
     log.info("TimesFM inference done in {t:.1f}s ({n} signals)",

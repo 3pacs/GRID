@@ -206,10 +206,15 @@ def retry_on_failure(
                         )
                         time.sleep(delay)
                     else:
-                        # Final attempt failed. If it was an HTTP error of any
-                        # flavour, the upstream is wedged — log WARN so it
-                        # doesn't drown out genuine bugs.
-                        log_fn = log.warning if status is not None else log.error
+                        # Final attempt failed. HTTP errors (status != None)
+                        # AND transient network failures (DNS, connect,
+                        # timeout, OSError without status) are upstream
+                        # problems — log WARNING so genuine code bugs stay
+                        # visible. Only true code bugs (KeyError, etc.,
+                        # caught here because retryable_exceptions is
+                        # permissive) get ERROR.
+                        is_bug = isinstance(exc, _CODE_BUG_EXC_TYPES)
+                        log_fn = log.error if is_bug else log.warning
                         log_fn(
                             "{f} failed after {m} attempts: {e}",
                             f=func.__name__,

@@ -84,6 +84,8 @@ def audit(
     top: int,
     new_only: bool = False,
     baseline_hours: int = 168,
+    fail_on_new: int | None = None,
+    fail_on_total: int | None = None,
 ) -> int:
     if not log_path.exists():
         print(f"no error log at {log_path}")
@@ -146,7 +148,28 @@ def audit(
             f"           first={first}  last={last}\n"
             f"           {message}"
         )
-    return 0
+
+    # Regression gates — let this script trip CI / a systemd alert when
+    # the error log degrades. Compares the recent window to the baseline.
+    exit_code = 0
+    new_keys = [k for k in recent if k not in baseline]
+    if fail_on_new is not None and len(new_keys) > fail_on_new:
+        print()
+        print(
+            f"REGRESSION: {len(new_keys)} NEW error patterns "
+            f"(threshold: {fail_on_new})",
+            file=sys.stderr,
+        )
+        exit_code = 1
+    if fail_on_total is not None and total_recent > fail_on_total:
+        print()
+        print(
+            f"REGRESSION: {total_recent} total error rows "
+            f"(threshold: {fail_on_total})",
+            file=sys.stderr,
+        )
+        exit_code = 1
+    return exit_code
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -175,6 +198,14 @@ def main(argv: list[str] | None = None) -> int:
         "--baseline-hours", type=float, default=168.0,
         help="Baseline window for --new-only comparison (default: 168 = 1 week)",
     )
+    parser.add_argument(
+        "--fail-on-new", type=int, default=None,
+        help="Exit non-zero if more than N NEW patterns appear vs baseline",
+    )
+    parser.add_argument(
+        "--fail-on-total", type=int, default=None,
+        help="Exit non-zero if total error rows in window exceed this count",
+    )
     args = parser.parse_args(argv)
 
     if args.since:
@@ -194,6 +225,8 @@ def main(argv: list[str] | None = None) -> int:
         top=args.top,
         new_only=args.new_only,
         baseline_hours=int(args.baseline_hours),
+        fail_on_new=args.fail_on_new,
+        fail_on_total=args.fail_on_total,
     )
 
 

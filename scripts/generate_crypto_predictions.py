@@ -180,7 +180,10 @@ for c in calls:
         log.info("  {} {:5s} {:7s} — {}", c['symbol'], c['horizon'], c['direction'], c['call'][:50])
         stored += 1
     else:
-        log.error("  FAIL: {} {}", c['symbol'], c['call'][:40])
+        # save_prediction returns falsy for benign cases (duplicate of an
+        # active call, invalid payload). Not an unhandled application bug,
+        # so log at WARNING to keep errors.jsonl signal-rich.
+        log.warning("  prediction not stored: {} {}", c['symbol'], c['call'][:40])
 
 log.info("\nStored {} crypto predictions", stored)
 
