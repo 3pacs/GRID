@@ -94,6 +94,7 @@ class TestValidTypes:
         assert "signal" in _VALID_TYPES
         assert "hypothesis" in _VALID_TYPES
         assert "snapshot" in _VALID_TYPES
+        assert "news" in _VALID_TYPES
 
     def test_valid_types_is_frozen(self):
         from api.routers.intelligence_search import _VALID_TYPES
@@ -101,7 +102,7 @@ class TestValidTypes:
 
     def test_valid_types_count(self):
         from api.routers.intelligence_search import _VALID_TYPES
-        assert len(_VALID_TYPES) == 4
+        assert len(_VALID_TYPES) == 5
 
 
 # ── Database integration tests (require PostgreSQL) ──────────────────────
