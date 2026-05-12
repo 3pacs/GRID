@@ -359,6 +359,42 @@ def test_measure_stress_test_calibration_backwards_negative_lift():
     assert cal["lift"] < 0.0
 
 
+def test_measure_stress_test_calibration_empty_fragile_returns_none_lift():
+    # When n_fragile == 0 the lift is undefined — must NOT report
+    # `lift = -robust_failure_rate`, which historically masqueraded as
+    # "stress test is inverted" in 2026-05-11 backtest reports.
+    trades = [
+        _make_trade("high", False, robustness_label="robust"),
+        _make_trade("high", False, robustness_label="robust"),
+        _make_trade("high", True, robustness_label="robust"),
+        _make_trade("high", True, robustness_label="moderate"),
+    ]
+    cal = wfv.measure_stress_test_calibration(trades)
+    assert cal["n_fragile"] == 0
+    assert cal["n_robust"] == 3
+    assert cal["fragile_failure_rate"] is None
+    assert cal["lift"] is None, (
+        "lift must be None when one bucket is empty — a real-valued lift "
+        "with an empty fragile bucket is the 'stress test inverted' bug"
+    )
+    # robust_failure_rate is still measurable on its own
+    assert cal["robust_failure_rate"] == pytest.approx(2 / 3)
+
+
+def test_measure_stress_test_calibration_empty_robust_returns_none_lift():
+    # Symmetric: empty robust bucket also blocks lift.
+    trades = [
+        _make_trade("high", False, robustness_label="fragile"),
+        _make_trade("high", True, robustness_label="fragile"),
+        _make_trade("high", True, robustness_label="moderate"),
+    ]
+    cal = wfv.measure_stress_test_calibration(trades)
+    assert cal["n_fragile"] == 2
+    assert cal["n_robust"] == 0
+    assert cal["robust_failure_rate"] is None
+    assert cal["lift"] is None
+
+
 # ── _reconstruct_historical_scorecards (NO LOOKAHEAD) ─────────────────────
 
 
