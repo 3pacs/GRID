@@ -260,15 +260,22 @@ class TestHermesCycleTimeout:
             "hermes_operator.py must define CYCLE_TIMEOUT_SECONDS"
 
     def test_cycle_timeout_is_reasonable(self):
-        """Cycle timeout must be between 5 and 30 minutes."""
+        """Cycle timeout must be within a sane range.
+
+        Note: bumped 2026-05-09 from 600s to 4500s after oracle.run_cycle
+        was extended to walk all 41 tickers (~80s each + headroom). The old
+        300-1800s ceiling caused the 24h-blacklist loop. Upper bound widened
+        to 5400s (90 min) — that leaves headroom over the current 4500s
+        without removing the regression guard entirely.
+        """
         with open(os.path.join(os.path.dirname(__file__), "..", "scripts", "hermes_operator.py")) as f:
             source = f.read()
         match = re.search(r'CYCLE_TIMEOUT_SECONDS\s*=\s*(\d+)', source)
         assert match, "CYCLE_TIMEOUT_SECONDS must be defined as an integer"
         timeout = int(match.group(1))
-        assert 300 <= timeout <= 1800, \
-            f"CYCLE_TIMEOUT_SECONDS = {timeout} is unreasonable. " \
-            f"Should be 300-1800 (5-30 minutes)."
+        assert 300 <= timeout <= 5400, \
+            f"CYCLE_TIMEOUT_SECONDS = {timeout} is outside the sane range. " \
+            f"Should be 300-5400 (5-90 minutes)."
 
     def test_cycle_uses_timeout(self):
         """The main loop must use the timeout when running cycles."""
