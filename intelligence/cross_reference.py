@@ -503,9 +503,23 @@ _BILATERAL_TRADE_PAIRS: list[dict[str, str]] = [
     },
 ]
 
+_TRADE_FLOW_SERIES_IDS: tuple[str, ...] = (
+    "us_china_bilateral",
+    "us_exports_total",
+    "korea_exports_total",
+)
+
 
 _TRADE_BILATERAL_CACHE: dict[str, Any] = {"data": None, "ts": 0.0}
 _TRADE_BILATERAL_TTL: float = 3600.0  # 1 hour
+
+
+def _configured_trade_series_ids() -> list[str]:
+    series_ids = set(_TRADE_FLOW_SERIES_IDS)
+    for pair in _BILATERAL_TRADE_PAIRS:
+        series_ids.add(pair["reporter_exports"])
+        series_ids.add(pair["partner_imports"])
+    return sorted(series_ids)
 
 
 def check_trade_bilateral(engine: Engine) -> list[CrossRefCheck]:
@@ -519,8 +533,9 @@ def check_trade_bilateral(engine: Engine) -> list[CrossRefCheck]:
     ``LIKE '%...%'`` patterns that can't use the btree index on
     raw_series — they're always full-table scans. On the live corpus each
     takes minutes and can exhaust the DB pool if called concurrently.
-    Cache the result for an hour so the slow path runs at most once per
-    TTL regardless of how many callers come through.
+    Avoid that discovery path entirely in dashboard checks and use the
+    configured trade series ids instead; cache the result for an hour so
+    exact series history fetches also fan out at most once per TTL.
     """
     import time as _time
     _now = _time.time()
@@ -531,37 +546,7 @@ def check_trade_bilateral(engine: Engine) -> list[CrossRefCheck]:
         return _TRADE_BILATERAL_CACHE["data"]
 
     checks: list[CrossRefCheck] = []
-
-    # Check all bilateral pairs we have Comtrade data for.
-    # Hard statement_timeout so a degraded DB can't hang the whole API on
-    # these full-table scans — return [] and let the caller degrade.
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SET LOCAL statement_timeout = '15s'"))
-            # Find all bilateral trade series in raw_series
-            trade_rows = conn.execute(
-                text(
-                    "SELECT DISTINCT series_id FROM raw_series "
-                    "WHERE series_id LIKE :pattern AND pull_status = 'SUCCESS'"
-                ),
-                {"pattern": "%bilateral%"},
-            ).fetchall()
-
-            # Also check total exports vs global data
-            export_rows = conn.execute(
-                text(
-                    "SELECT DISTINCT series_id FROM raw_series "
-                    "WHERE series_id LIKE :pattern AND pull_status = 'SUCCESS'"
-                ),
-                {"pattern": "%exports_total%"},
-            ).fetchall()
-    except Exception as exc:
-        log.warning("check_trade_bilateral degraded: {e}", e=str(exc))
-        _TRADE_BILATERAL_CACHE["data"] = []
-        _TRADE_BILATERAL_CACHE["ts"] = _now
-        return []
-
-    all_trade_series = [r[0] for r in trade_rows] + [r[0] for r in export_rows]
+    all_trade_series = _configured_trade_series_ids()
 
     # For each trade series, check for mirror discrepancies
     for series_id in all_trade_series:

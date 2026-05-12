@@ -314,6 +314,79 @@ def test_oracle_candidate_carries_signal_calibration_context():
     }
 
 
+def test_fetch_oracle_candidates_handles_legacy_schema_without_prediction_type():
+    from api.routers.surfacer import _fetch_oracle_candidates
+
+    class _Result:
+        def __init__(self, value=None, rows=None):
+            self._value = value
+            self._rows = rows or []
+
+        def scalar(self):
+            return self._value
+
+        def fetchall(self):
+            return self._rows
+
+    class _Conn:
+        def __init__(self):
+            self.statements: list[str] = []
+
+        def execute(self, statement, params=None):
+            sql = str(statement)
+            self.statements.append(sql)
+            if "to_regclass" in sql:
+                return _Result(value=True)
+            if "information_schema.columns" in sql:
+                return _Result(rows=[
+                    _row(column_name=column)
+                    for column in (
+                        "id",
+                        "created_at",
+                        "ticker",
+                        "direction",
+                        "expiry",
+                        "confidence",
+                        "expected_move_pct",
+                        "signal_strength",
+                        "coherence",
+                        "model_name",
+                        "signals",
+                        "anti_signals",
+                        "flow_context",
+                        "verdict",
+                    )
+                ])
+            if "prediction_type" in sql and "NULL::text AS prediction_type" not in sql:
+                raise AssertionError("legacy oracle_predictions has no prediction_type column")
+            return _Result(rows=[
+                _row(
+                    id=9,
+                    created_at=datetime.now(timezone.utc),
+                    ticker="NVDA",
+                    prediction_type=None,
+                    direction="up",
+                    expiry=datetime.now(timezone.utc) + timedelta(days=14),
+                    confidence=0.68,
+                    expected_move_pct=6.0,
+                    signal_strength=0.7,
+                    coherence=0.75,
+                    model_name="legacy",
+                    signals={},
+                    anti_signals=[],
+                    flow_context={},
+                    verdict="pending",
+                )
+            ])
+
+    conn = _Conn()
+    candidates = _fetch_oracle_candidates(conn, 5)
+
+    assert candidates[0]["id"] == "oracle-9"
+    assert candidates[0]["direction"] == "bullish"
+    assert any("NULL::text AS prediction_type" in sql for sql in conn.statements)
+
+
 def test_signal_brier_history_fills_track_record_gap():
     from api.routers.surfacer import _merge_track_records
 

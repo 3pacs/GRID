@@ -109,6 +109,37 @@ def _table_exists(conn: Any, table_name: str) -> bool:
         return False
 
 
+def _table_columns(conn: Any, table_name: str) -> set[str]:
+    try:
+        rows = conn.execute(
+            text(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = :table_name
+                """
+            ),
+            {"table_name": table_name},
+        ).fetchall()
+    except Exception as exc:
+        log.debug("surfacer column check failed for {table}: {err}", table=table_name, err=exc)
+        return set()
+
+    columns: set[str] = set()
+    for row in rows:
+        mapping = getattr(row, "_mapping", None)
+        if mapping is not None:
+            value = mapping.get("column_name")
+        elif isinstance(row, (tuple, list)):
+            value = row[0] if row else None
+        else:
+            value = getattr(row, "column_name", None)
+        if value:
+            columns.add(str(value))
+    return columns
+
+
 def _slug(value: Any) -> str:
     return "-".join(str(value or "candidate").lower().replace(":", "-").split())
 
@@ -1747,13 +1778,15 @@ def _hypothesis_candidate(row: Any) -> dict[str, Any]:
 def _fetch_oracle_candidates(conn: Any, limit: int) -> list[dict[str, Any]]:
     if not _table_exists(conn, "oracle_predictions"):
         return []
+    columns = _table_columns(conn, "oracle_predictions")
+    prediction_type_expr = "prediction_type" if not columns or "prediction_type" in columns else "NULL::text AS prediction_type"
     rows = conn.execute(
         text(
-            """
+            f"""
             SELECT *
             FROM (
                 SELECT DISTINCT ON (ticker, direction)
-                    id, created_at, ticker, prediction_type, direction, expiry,
+                    id, created_at, ticker, {prediction_type_expr}, direction, expiry,
                     confidence, expected_move_pct, signal_strength, coherence,
                     model_name, signals, anti_signals, flow_context, verdict
                 FROM oracle_predictions

@@ -591,9 +591,9 @@ def _build_dashboard_snapshot() -> dict[str, Any]:
             find_lever_convergence,
         )
 
-        events = get_active_lever_events(engine, days=14)
         pullers = identify_lever_pullers(engine)
-        lever_convergence = find_lever_convergence(engine)
+        events = get_active_lever_events(engine, days=14, pullers=pullers)
+        lever_convergence = find_lever_convergence(engine, pullers=pullers)
 
         event_dicts = []
         for ev in events[:10]:
