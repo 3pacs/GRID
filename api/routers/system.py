@@ -87,13 +87,17 @@ def health() -> HealthResponse:
             if feature_count == 0:
                 degraded_reasons.append("no features registered")
 
+            # raw_series has ~1.9B rows; the EXISTS-with-filter form makes
+            # the planner pick a seq scan (~280s), ignoring the DESC index.
+            # Pulling max(pull_timestamp) via the DESC index is an Index
+            # Only Scan (sub-ms) — compare that to the freshness window.
             recent = bool(conn.execute(
                 text(
-                    "SELECT EXISTS ("
-                    "  SELECT 1 FROM raw_series "
-                    "  WHERE pull_timestamp >= NOW() - INTERVAL '7 days' "
+                    "SELECT ("
+                    "  SELECT pull_timestamp FROM raw_series "
+                    "  ORDER BY pull_timestamp DESC "
                     "  LIMIT 1"
-                    ")"
+                    ") >= NOW() - INTERVAL '7 days'"
                 )
             ).scalar())
             checks["recent_data"] = recent
