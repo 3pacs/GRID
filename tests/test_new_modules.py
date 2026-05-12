@@ -70,9 +70,17 @@ class TestGemmaRouter:
     def test_fallback_chain_puts_remote_nodes_on_matching_tiers(self):
         from llm.router import Tier, _fallback_chain
 
-        assert _fallback_chain(Tier.LOCAL, "gemma")[:2] == ["llamacpp_quick", "llamacpp_z4"]
+        # LOCAL tier leads with quick + koala for redundancy on lightweight work
+        assert _fallback_chain(Tier.LOCAL, "gemma")[:2] == ["llamacpp_quick", "ollama_koala"]
+        assert "llamacpp_z4" in _fallback_chain(Tier.LOCAL, "gemma")
+        # ORACLE was reshaped 2026-05-09: gridz4 (Blackwell + Qwen3.6-35B-A3B) is
+        # the new primary; grid-svr's llamacpp_oracle is fallback 2.
+        assert _fallback_chain(Tier.ORACLE, "gemma")[0] == "llamacpp_z4"
+        assert _fallback_chain(Tier.ORACLE, "gemma")[1] == "llamacpp_oracle"
+        # BATCH alone may reach llamacpp_batch (interactive tiers skip it; ~5 tok/sec on CPU)
+        assert _fallback_chain(Tier.BATCH, "gemma")[0] == "llamacpp_batch"
+        # REASON (catch-all "else" branch) leads with quick then z4
         assert _fallback_chain(Tier.REASON, "gemma")[0] == "llamacpp_quick"
-        assert _fallback_chain(Tier.ORACLE, "gemma")[0] == "llamacpp_oracle"
 
 
 # ============================================================
