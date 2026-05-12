@@ -166,6 +166,20 @@ class TiingoPuller(BasePuller):
             log.warning("Tiingo HTTP error for {t}: {e}", t=ticker, e=str(e))
             result["status"] = "FAILED"
             result["errors"].append(str(e))
+        except (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+        ) as exc:
+            # Transient network failures (read timeouts, DNS hiccups, TCP
+            # resets). Next cycle retries — keep errors.jsonl focused on
+            # actionable issues by logging at WARNING level.
+            log.warning(
+                "Tiingo transient network failure for {t}: {err}",
+                t=ticker, err=str(exc),
+            )
+            result["status"] = "FAILED"
+            result["errors"].append(str(exc))
+            return result
         except Exception as exc:
             # Detect IndexCorrupted on uq_raw_series_composite: this is a
             # catastrophic Postgres-level failure that requires an operator

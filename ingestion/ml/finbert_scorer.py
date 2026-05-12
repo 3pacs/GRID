@@ -37,6 +37,13 @@ MODEL_NAME = "ProsusAI/finbert"
 # Cache dir follows existing model path pattern
 MODEL_CACHE_DIR = "/data/grid_v4/grid_repo/grid/models/finbert"
 
+# Process-scoped breaker for fatal FinBERT load failures (missing wheel,
+# corrupted cache, OOM during init). Each cycle iterates every source —
+# without a breaker, one bad init turns into N×sources ERROR rows. Flip
+# once, surface ONE actionable line, downgrade later attempts to debug.
+_FINBERT_LOAD_BREAKER: bool = False
+_FINBERT_LOAD_BREAKER_REASON: str = ""
+
 
 class FinBERTScorer:
     """Batch FinBERT sentiment scorer for GRID raw_series text data.
@@ -412,17 +419,53 @@ class FinBERTScorer:
         Returns:
             List of per-source summary dicts.
         """
+        global _FINBERT_LOAD_BREAKER, _FINBERT_LOAD_BREAKER_REASON
         results = []
         for source_name in SOURCE_TEXT_KEYS:
+            if _FINBERT_LOAD_BREAKER:
+                log.debug(
+                    "FinBERT: load breaker tripped ({r}) — skipping {s}",
+                    r=_FINBERT_LOAD_BREAKER_REASON, s=source_name,
+                )
+                results.append({
+                    "source": source_name,
+                    "rows_scored": 0,
+                    "status": "SKIPPED",
+                    "error": _FINBERT_LOAD_BREAKER_REASON,
+                })
+                continue
             try:
                 result = self.score_source(source_name)
                 results.append(result)
             except Exception as exc:
-                log.error("FinBERT scoring failed for {s}: {e}", s=source_name, e=str(exc))
+                err_str = str(exc)
+                # Model load failures (missing module, corrupted cache,
+                # OOM at init) repeat for every source in the iteration.
+                # Flip the breaker, surface one ERROR, skip the rest.
+                is_load_failure = (
+                    "Could not import module" in err_str
+                    or "BertForSequenceClassification" in err_str
+                    or "out of memory" in err_str.lower()
+                    or "CUDA out of memory" in err_str
+                )
+                if is_load_failure:
+                    _FINBERT_LOAD_BREAKER = True
+                    _FINBERT_LOAD_BREAKER_REASON = err_str[:200]
+                    log.error(
+                        "FinBERT: fatal load failure — disabling scorer "
+                        "for the rest of this process. First source "
+                        "affected: {s}. Reason: {e}",
+                        s=source_name, e=err_str[:200],
+                    )
+                else:
+                    log.error(
+                        "FinBERT scoring failed for {s}: {e}",
+                        s=source_name, e=err_str,
+                    )
                 results.append({
                     "source": source_name,
                     "rows_scored": 0,
                     "status": "FAILED",
-                    "error": str(exc),
+                    "error": err_str,
                 })
         return results

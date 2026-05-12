@@ -87,3 +87,59 @@ def test_audit_new_only_suppresses_baseline_patterns(tmp_path, capsys):
 
     output = capsys.readouterr().out
     assert "no NEW patterns" in output
+
+
+def test_audit_fail_on_new_trips_when_threshold_exceeded(tmp_path, capsys):
+    log_path = tmp_path / "errors.jsonl"
+    cutoff = datetime(2026, 5, 7, tzinfo=timezone.utc)
+    _write_jsonl(
+        log_path,
+        [
+            {
+                "ts": "2026-05-07T01:00:00+00:00",
+                "level": "ERROR",
+                "module": "ingestion.new_one",
+                "function": "pull",
+                "message": "first new pattern",
+            },
+            {
+                "ts": "2026-05-07T02:00:00+00:00",
+                "level": "ERROR",
+                "module": "ingestion.new_two",
+                "function": "pull",
+                "message": "second new pattern",
+            },
+        ],
+    )
+
+    # Both rows are NEW (no baseline). Threshold 0 should trip.
+    assert audit(log_path, cutoff=cutoff, top=5, fail_on_new=0) == 1
+    err = capsys.readouterr().err
+    assert "REGRESSION" in err
+
+    # Threshold 10 should pass cleanly.
+    assert audit(log_path, cutoff=cutoff, top=5, fail_on_new=10) == 0
+
+
+def test_audit_fail_on_total_trips_when_count_exceeded(tmp_path, capsys):
+    log_path = tmp_path / "errors.jsonl"
+    cutoff = datetime(2026, 5, 7, tzinfo=timezone.utc)
+    _write_jsonl(
+        log_path,
+        [
+            {
+                "ts": "2026-05-07T01:00:00+00:00",
+                "level": "ERROR",
+                "module": "ingestion.fred",
+                "function": "pull",
+                "message": f"failure {i}",
+            }
+            for i in range(5)
+        ],
+    )
+
+    assert audit(log_path, cutoff=cutoff, top=5, fail_on_total=3) == 1
+    err = capsys.readouterr().err
+    assert "5 total error rows" in err
+
+    assert audit(log_path, cutoff=cutoff, top=5, fail_on_total=100) == 0
