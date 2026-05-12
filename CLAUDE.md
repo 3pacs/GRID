@@ -1,5 +1,9 @@
 # GRID — Claude Code Guidelines
 
+## Standing rule — session-end reporting (mandatory)
+
+Every agent session on every host calls `agent-report <agent> <slug> <body.md>` (or `~/scripts/agent_hub/report_to_hub.sh` on Mac mini) before terminating. Body must summarize: what changed, what was verified, what is blocked, what is left. Reports land in `00-Agent-Reports/YYYY-MM-DD/` in `~/dev/obsidian-vault` (GitHub `3pacs/obsidian-vault`). Wrapper paths: `/usr/local/bin/agent-report` on grid-svr/gridz4/redbox/panda/koala; `~/bin/agent-report` on ocr-node. Token in `/etc/agent-hub/token` (0600) or `~/.config/agent-hub/token`. Full ruleset: `~/dev/obsidian-vault/AGENTS.md`.
+
 ## Project Overview
 
 GRID is a systematic, multi-agent trading intelligence platform. It ingests macroeconomic/market data from 48 data pullers (all registered in [[Hermes Scheduler|Hermes scheduler]]), resolves multi-source conflicts using [[PIT Store|point-in-time]] (PIT) correct methodology, performs unsupervised [[Regime Discovery|regime discovery]], and runs [[Walk-Forward Backtesting|walk-forward backtesting]] with an immutable [[Decision Journal|decision journal]].
