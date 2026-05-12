@@ -674,26 +674,36 @@ def compute_confusion_matrix(
 
 def measure_stress_test_calibration(
     trades: list[BacktestTrade],
-) -> dict[str, float]:
+) -> dict[str, float | None]:
     """Return {fragile_failure_rate, robust_failure_rate, lift}.
 
     The lift is ``fragile_failure_rate - robust_failure_rate``; a positive
     value means the stress test correctly identifies trades more likely
     to fail. A zero/negative value means it is uncalibrated or backwards
     and we need to retune.
+
+    When either bucket is empty, the corresponding failure rate and the
+    lift are ``None`` — historically (pre-2026-05-12) the function
+    returned ``0.0`` for the empty bucket, which made ``lift =
+    -robust_failure_rate`` and surfaced in backtest reports as a
+    spurious "stress test is inverted, lift -72.5%" finding when in
+    reality every prediction had landed in a single bucket.
     """
     fragile = [t for t in trades if t.robustness_label == "fragile"]
     robust = [t for t in trades if t.robustness_label == "robust"]
-    fragile_fail_rate = (
-        sum(1 for t in fragile if not t.hit) / len(fragile) if fragile else 0.0
+    fragile_fail_rate: float | None = (
+        sum(1 for t in fragile if not t.hit) / len(fragile) if fragile else None
     )
-    robust_fail_rate = (
-        sum(1 for t in robust if not t.hit) / len(robust) if robust else 0.0
+    robust_fail_rate: float | None = (
+        sum(1 for t in robust if not t.hit) / len(robust) if robust else None
     )
-    lift = float(fragile_fail_rate - robust_fail_rate)
+    if fragile_fail_rate is None or robust_fail_rate is None:
+        lift: float | None = None
+    else:
+        lift = float(fragile_fail_rate - robust_fail_rate)
     return {
-        "fragile_failure_rate": float(fragile_fail_rate),
-        "robust_failure_rate": float(robust_fail_rate),
+        "fragile_failure_rate": fragile_fail_rate,
+        "robust_failure_rate": robust_fail_rate,
         "lift": lift,
         "n_fragile": float(len(fragile)),
         "n_robust": float(len(robust)),
@@ -730,8 +740,8 @@ _NARRATIVE_TEMPLATE = (
     "HIGH verdict hit rate: {high_hr:.1%} (n={high_n}). "
     "MEDIUM verdict hit rate: {medium_hr:.1%} (n={medium_n}). "
     "LOW verdict hit rate: {low_hr:.1%} (n={low_n}). "
-    "Stress-test calibration lift: {lift:+.1%} "
-    "(fragile failure rate {fragile_fail:.1%} vs robust {robust_fail:.1%}). "
+    "Stress-test calibration lift: {lift} "
+    "(fragile failure rate {fragile_fail} vs robust {robust_fail}). "
     "Verdict is {empirical_call}."
 )
 
@@ -770,7 +780,12 @@ def _build_narrative(
     medium_hr = medium.hit_rate if medium else 0.0
     low_hr = low.hit_rate if low else 0.0
 
-    lift = float(calibration.get("lift", 0.0) or 0.0)
+    lift_raw = calibration.get("lift")
+    fragile_raw = calibration.get("fragile_failure_rate")
+    robust_raw = calibration.get("robust_failure_rate")
+    lift_str = f"{lift_raw:+.1%}" if lift_raw is not None else "N/A (one bucket empty)"
+    fragile_str = f"{fragile_raw:.1%}" if fragile_raw is not None else "N/A"
+    robust_str = f"{robust_raw:.1%}" if robust_raw is not None else "N/A"
     # The acid test: HIGH should beat MEDIUM should beat LOW.
     if high_n > 0 and medium_n > 0 and high_hr > medium_hr + 0.05:
         call = "STACK CALIBRATED — HIGH meaningfully beats MEDIUM"
@@ -789,9 +804,9 @@ def _build_narrative(
         medium_n=medium_n,
         low_hr=low_hr,
         low_n=low_n,
-        lift=lift,
-        fragile_fail=float(calibration.get("fragile_failure_rate", 0.0) or 0.0),
-        robust_fail=float(calibration.get("robust_failure_rate", 0.0) or 0.0),
+        lift=lift_str,
+        fragile_fail=fragile_str,
+        robust_fail=robust_str,
         empirical_call=call,
     )
 
