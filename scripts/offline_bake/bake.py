@@ -423,19 +423,6 @@ RewriteCond %{REQUEST_URI} !^/api/
 RewriteCond %{REQUEST_FILENAME} !-f
 RewriteCond %{REQUEST_FILENAME} !-d
 RewriteRule ^ /index.html [L]
-
-# Basic-auth perimeter on the SHELL. The /api/ subdir overrides this
-# with its own .htaccess that grants public access -- the PWA sends
-# `Authorization: Bearer <jwt>` for those calls and HTTP allows only
-# one Authorization header per request, so the PWA's Bearer overrides
-# Basic, Apache 401s, the PWA assumes its token is dead, clears
-# localStorage, and bounces to /login. Splitting auth keeps the PWA
-# functional. Static JSON snapshots are reachable to anyone who guesses
-# the URL, but the HTML/JS shell still requires the basic-auth gate.
-AuthType Basic
-AuthName "GRID Mirror"
-AuthUserFile /home/h2hb4v1an7lh/.htpasswds/stepdadfi.com/.htpasswd
-Require valid-user
 """
     write(".htaccess", body)
     # /api/ subdir: drop the basic-auth perimeter so PWA Bearer requests work.
@@ -491,16 +478,38 @@ def bust_asset_caches() -> None:
     idx.write_text(html, encoding="utf-8")
 
 
+_API_BASE_SCRIPT = (
+    '<script>\n'
+    '  // Tell the SPA to call the live API. Falls back to baked snapshots only on failure.\n'
+    '  window.GRID_API_BASE = "https://grid.stepdad.finance";\n'
+    '</script>\n'
+)
+
+
 def inject_banner_and_token(token: str) -> None:
     """Inject the snapshot banner AND pre-populate the auth token in
     localStorage so the PWA boots already-logged-in. Login POST doesn't
     work in mirror mode, so the user would otherwise be stuck on the
     login form. The token is the same admin JWT the bake minted; it's
-    valid for 24h against the live server's GRID_JWT_SECRET."""
+    valid for 24h against the live server's GRID_JWT_SECRET.
+
+    Also injects ``window.GRID_API_BASE`` into <head> BEFORE the Vite
+    bundle scripts so the SPA can call the live API directly (with
+    baked-snapshot fallback only on failure). The SPA itself must read
+    this global; if it doesn't, this is a no-op until the upstream
+    code is updated to honor it."""
     idx = OUT / "index.html"
     if not idx.exists():
         return
     html = idx.read_text(encoding="utf-8")
+
+    # (1) Inject GRID_API_BASE script as the first child of <head>, BEFORE
+    # any Vite bundle <script> tags. The SPA's API client must read this
+    # global at construct time; baked snapshots remain as the .htaccess
+    # fallback if the live call fails.
+    if "<head" in html and _API_BASE_SCRIPT.strip() not in html:
+        html = re.sub(r"(<head[^>]*>)", r"\1\n" + _API_BASE_SCRIPT, html, count=1)
+
     snapshot_at = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
     banner = _BANNER_TEMPLATE.format(snapshot_at=snapshot_at)
     # Token-injection script must run BEFORE the PWA module loads so that

@@ -39,7 +39,9 @@ class GRIDApi {
     private _wsShouldReconnect: boolean;
 
     constructor() {
-        this.baseUrl = typeof window !== 'undefined' ? window.location.origin : '';
+        this.baseUrl =
+            (typeof window !== 'undefined' && (window as unknown as { GRID_API_BASE?: string }).GRID_API_BASE) ||
+            (typeof window !== 'undefined' ? window.location.origin : '');
         this._ws = null;
         this._wsReconnectDelay = 1000;
         this._wsMaxDelay = 30000;

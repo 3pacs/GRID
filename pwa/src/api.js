@@ -15,7 +15,7 @@ class GRIDApiError extends Error {
 
 class GRIDApi {
     constructor() {
-        this.baseUrl = window.location.origin;
+        this.baseUrl = (typeof window !== 'undefined' && window.GRID_API_BASE) || window.location.origin;
         this._ws = null;
         this._wsReconnectDelay = 1000;
         this._wsMaxDelay = 30000;

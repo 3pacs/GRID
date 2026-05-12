@@ -28,6 +28,7 @@ pwa_dist/
 data/icij/
 models/.cache/
 .server-logs/alert_state.json
+output/deploy/
 
 # BMC / IPMI credentials — fill in bmc-env.example, save as bmc-env, never commit
 server_setup/bmc/bmc-env
