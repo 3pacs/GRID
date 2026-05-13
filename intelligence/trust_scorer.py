@@ -1591,14 +1591,23 @@ class TrustScorer:
         if not signals:
             return 0
 
-        # Translate contract verdicts (HIT/MISS/PARTIAL) into the
-        # trust_scorer outcome enum (CORRECT/WRONG) used by signal_sources.
+        # Translate contract verdicts (HIT/MISS/PARTIAL/UNKNOWN) into the
+        # signal_sources outcome enum. Case-insensitive — historically the
+        # event-bus emitted uppercase but oracle_predictions.verdict
+        # writes lowercase, and this lookup defaulting every non-match to
+        # "WRONG" silently fed the 99.3% WRONG inflation that broke
+        # downstream calibration (see #119 for the score_pending_signals
+        # half of the same family of bugs).
         outcome_map = {
             "HIT": "CORRECT",
             "PARTIAL": "CORRECT",
             "MISS": "WRONG",
         }
-        outcome = outcome_map.get(str(verdict), "WRONG")
+        outcome = outcome_map.get(str(verdict or "").strip().upper())
+        if outcome is None:
+            # Unknown / no_data / pending — leave the row PENDING for the
+            # next scoring cycle. Forcing WRONG here is the bug.
+            return 0
         now = datetime.now(timezone.utc)
 
         ids: list[str] = []
@@ -1614,27 +1623,32 @@ class TrustScorer:
 
         updated = 0
         try:
+            # NOTE: signal_sources has no ``outcome_notes`` column (see
+            # information_schema). Pre-2026-05-13 the UPDATE referenced
+            # one, so every call raised ``UndefinedColumn`` and was
+            # caught + DEBUG-logged below, making the entire contract-
+            # driven feedback path silently dead.
             with self.engine.begin() as conn:
                 result = conn.execute(
                     text(
                         "UPDATE signal_sources "
                         "SET outcome = :o, "
-                        "    scored_at = :now, "
-                        "    outcome_notes = :notes "
+                        "    scored_at = :now "
                         "WHERE id::text = ANY(:ids) "
                         "  AND (outcome IS NULL OR outcome = 'PENDING')"
                     ),
                     {
                         "o": outcome,
                         "now": now,
-                        "notes": f"prediction={prediction_id} verdict={verdict}",
                         "ids": ids,
                     },
                 )
                 updated = result.rowcount or 0
         except Exception as exc:
-            log.debug(
-                "trust_scorer.score_prediction_signals: {e}", e=str(exc)
+            log.warning(
+                "trust_scorer.score_prediction_signals failed "
+                "(pred={p}, n_ids={n}): {e}",
+                p=prediction_id, n=len(ids), e=str(exc),
             )
             return 0
 
