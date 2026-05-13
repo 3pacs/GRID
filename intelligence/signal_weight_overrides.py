@@ -102,13 +102,26 @@ SIGNAL_WEIGHT_OVERRIDES: dict[str, float] = {
 }
 
 
-# Signals that DO appear in trade_postmortems but NOT in
-# signal_evidence at this layer — listed here so the next wiring pass
-# (at oracle/engine.py signal roll-up) can pick them up. Documented in
-# code so it doesn't get lost.
+# Deferred overrides — signals that appear in trade_postmortems but NOT
+# in compute_aggregate_conviction's signal_evidence loop. They live
+# in oracle/engine.py's ``signals.items[]`` instead. Applied there at
+# the per-signal weight multiplication step (see engine.py around
+# line 1372 — the bull/bear score calc).
+#
+# AUDIT NOTE (2026-05-13): alpha_research:vix_exposure and
+# alpha_research:credit_cycle are NEUTRAL-direction REGIME signals
+# since the 2026-04-28 fix in
+# alpha_research/adapters/signal_adapter.py:156-180. Their old
+# directional output produced the 1826r/0w pattern in pre-2026-04-28
+# postmortems, which made them look like perfect predictors. They are
+# NOT directional bets — credit_cycle routes signal-family weights via
+# _get_credit_cycle_routing (already wired at engine.py:1242), and
+# vix_exposure scales position size, not direction. Removed from the
+# deferred set; the auto_improve advisory now filters its corpus to
+# postmortems >= 2026-04-28 so these don't re-surface.
+#
+# news_intel is the remaining one — directional, 102r/204w, mild cut.
 DEFERRED_SIGNAL_OVERRIDES: dict[str, float] = {
-    "alpha_research:vix_exposure": 1.40,
-    "alpha_research:credit_cycle": 0.20,
     "news_intel": 0.60,
 }
 

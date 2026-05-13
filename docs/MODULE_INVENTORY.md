@@ -2,7 +2,7 @@
 
 Generated: 2026-05-18
 Total modules: 750
-Total LOC: 330,528
+Total LOC: 330,597
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycache__/`, `build/`, `dist/`, `docs/`, `node_modules/`, `notebooks/`, `pwa/`, `pwa_dist/`, `tests/`, `venv/`.
@@ -11,12 +11,12 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 
 | Directory | Module count | LOC |
 |---|---|---|
-| `intelligence/` | 172 | 102,065 |
+| `intelligence/` | 172 | 102,086 |
 | `ingestion/` | 207 | 85,797 |
 | `api/` | 107 | 48,466 |
 | `analysis/` | 33 | 18,973 |
 | `trading/` | 34 | 14,158 |
-| `oracle/` | 29 | 10,542 |
+| `oracle/` | 29 | 10,590 |
 | `subnet/` | 10 | 5,381 |
 | `physics/` | 18 | 4,824 |
 | `features/` | 7 | 4,443 |
@@ -865,7 +865,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`, `datetime`, `loguru`, `math`, `sqlalchemy`, `typing`
 **Imported by:** `api/routers/conviction.py`
 
-#### `intelligence/signal_provenance.py` — 821 LOC
+#### `intelligence/signal_provenance.py` — 829 LOC
 **Docstring:** Signal provenance — the per-ticker "why" report.
 **Functions:** `SignalEvidence`, `CausationChain`, `TradeProvenanceReport`, `compute_aggregate_conviction`, `build_provenance_report`
 **Reads:** `__future__`, `dataclasses`, `datetime`, `features`, `intelligence`, `loguru`, `sqlalchemy`, `typing`
@@ -877,10 +877,11 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`, `datetime`, `enum`, `json`, `loguru`, `sqlalchemy`, `typing`, `uuid`
 **Imported by:** `alpha_research/adapters/signal_adapter.py`, `api/routers/signal_registry.py`, `intelligence/adapters/ai_trader_adapter.py`, `intelligence/adapters/base.py`, `intelligence/adapters/cross_reference_adapter.py`, `intelligence/adapters/dollar_flows_adapter.py`, `intelligence/adapters/earnings_adapter.py`, `intelligence/adapters/feature_adapter.py`, … (+9)
 
-#### `intelligence/signal_weight_overrides.py` — 141 LOC
+#### `intelligence/signal_weight_overrides.py` — 154 LOC
 **Docstring:** Per-signal conviction multipliers derived from the auto-improve corpus.
 **Functions:** `get_override`, `set_enabled`
 **Reads:** `__future__`, `loguru`, `os`, `typing`
+**Imported by:** `intelligence/signal_provenance.py`, `oracle/engine.py`
 
 #### `intelligence/sleuth.py` — 1277 LOC
 **Docstring:** GRID Intelligence — Investigative Research Engine (Sleuth).
@@ -3186,7 +3187,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`, `math`, `typing`
 **Imported by:** `oracle/engine.py`
 
-#### `oracle/engine.py` — 2807 LOC
+#### `oracle/engine.py` — 2855 LOC
 **Docstring:** GRID Oracle Engine — Self-improving prediction loop.
 **Functions:** `PredictionType`, `Verdict`, `Signal`, `AntiSignal`, `OraclePrediction`, `OracleModel`, `ModelRegistry`, `OracleEngine`, `EnsemblePrediction`, `EnsemblePredictor`
 **Reads:** `__future__`, `ast`, `concurrent`, `dataclasses`, `datetime`, `enum`, `hashlib`, `intelligence`, `json`, `llm`, `loguru`, `numpy`, `oracle`, `os`, `schema_guard`, `sqlalchemy`, `typing`
