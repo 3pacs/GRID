@@ -53,6 +53,35 @@ _VAULT_SESSIONS = Path("/data/grid_obsidian/Sessions")
 _MIN_OCCURRENCES_FOR_SIGNAL = 50  # ignore tail noise
 
 
+def _is_per_ticker_feature(signal_name: str) -> bool:
+    """Per-ticker Shapley features (e.g. ``aapl_full``, ``brazil_selic_rate``)
+    appear in signals_wrong only as a TAUTOLOGY of the postmortem corpus:
+    postmortems run on failures, and a ticker's own feature is always
+    aligned with the prediction on that ticker. So a 0r/358w ratio just
+    means "AAPL predictions failed sometimes" — not that the AAPL feature
+    is bad.
+
+    Excluding these from the star/bad lists is the right move; the
+    cross-cutting signals (``feature:equity``, ``alpha_research:vix_exposure``,
+    ``news_intel``, ...) are the ones whose ratios actually reflect signal
+    quality.
+    """
+    if not signal_name:
+        return False
+    s = signal_name.lower()
+    # Pattern: lowercase ticker followed by _full / _signal / etc.
+    if s.endswith("_full") or s.endswith("_signal"):
+        return True
+    # Patterns like brazil_selic_rate are country/regional features, not
+    # cross-cutting — same selection bias.
+    if any(s.startswith(p) for p in (
+        "brazil_", "china_", "japan_", "korea_", "germany_",
+        "uk_", "france_", "india_", "russia_", "mexico_",
+    )):
+        return True
+    return False
+
+
 def _signal_ratios(conn) -> list[dict[str, Any]]:
     """For each distinct signal name, count appearances in signals_right
     vs signals_wrong. Returns rows sorted by absolute imbalance.
@@ -163,9 +192,20 @@ def build_advisory(engine) -> dict[str, Any]:
     """Run all the queries and assemble the advisory dict."""
     with engine.connect() as conn:
         signal_ratios = _signal_ratios(conn)
+        # Filter out per-ticker / regional features — their right/wrong
+        # ratios are tautologies of postmortems-only-run-on-failures.
+        # Only cross-cutting signals get meaningful ratios.
+        cross_cutting = [
+            s for s in signal_ratios
+            if not _is_per_ticker_feature(s["signal"])
+        ]
+        per_ticker_excluded = [
+            s for s in signal_ratios
+            if _is_per_ticker_feature(s["signal"])
+        ]
         # split into stars (right/wrong >= 2) and underperformers (<= 0.5)
-        stars = [s for s in signal_ratios if s["right_to_wrong_ratio"] >= 2.0]
-        bad = [s for s in signal_ratios if s["right_to_wrong_ratio"] <= 0.5]
+        stars = [s for s in cross_cutting if s["right_to_wrong_ratio"] >= 2.0]
+        bad = [s for s in cross_cutting if s["right_to_wrong_ratio"] <= 0.5]
         wrong_tickers = _wrong_direction_tickers(conn)
         anti = _anti_signal_override_clusters(conn)
         hypo = _hypothesis_kill_reasons(conn)
@@ -182,6 +222,10 @@ def build_advisory(engine) -> dict[str, Any]:
         "star_signals_to_uplift": stars[:15],
         "bad_signals_to_downweight": bad[:15],
         "wrong_direction_ticker_clusters_30d": wrong_tickers,
+        "per_ticker_features_excluded": [
+            {"signal": s["signal"], "right_count": s["right_count"], "wrong_count": s["wrong_count"]}
+            for s in per_ticker_excluded[:20]
+        ],
     }
 
 
