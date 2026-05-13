@@ -453,9 +453,18 @@ def run_intelligence_tasks(
     if _hours_since(state.last_trust_cycle) >= 4:
         try:
             from intelligence.trust_scorer import run_trust_cycle
-            results["trust_cycle"] = _run_intel_task(
+            tc_result = _run_intel_task(
                 "trust_cycle", run_trust_cycle, state, engine,
             )
+            results["trust_cycle"] = tc_result
+            # Mirror to Obsidian session log (best-effort).
+            try:
+                from intelligence.obsidian_log import log_trust_cycle
+                scoring = (tc_result or {}).get("scoring") or {}
+                if isinstance(scoring, dict):
+                    log_trust_cycle(scoring)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("Obsidian log_trust_cycle skipped: {e}", e=str(exc))
         except Exception as exc:
             log.warning("Trust cycle import failed: {e}", e=str(exc))
 

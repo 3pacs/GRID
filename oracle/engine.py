@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
@@ -1386,6 +1387,46 @@ class OracleEngine:
 
                 # Signal strength = net score - anti-signal deduction
                 signal_strength = max(0, net_score - anti_deduction)
+
+                # ── Anti-signal VETO ─────────────────────────────────
+                # Per intelligence/postmortem.py:1326-1343, the system
+                # classifies a prediction as "Anti-signals warned but
+                # were overridden" when 2+ anti-signals with severity
+                # > 0.5 fired and the prediction was emitted anyway.
+                # The trade_postmortems table has 29,973 such rows
+                # (top 30%+ of all wrong_signal failures); they
+                # disproportionately cluster on PUT calls for tickers
+                # in long uptrends (V, PYPL, CI, CRM, BLK, MA, PFE...
+                # all went UP after the PUT call).
+                #
+                # Pre-2026-05-13 these only attenuated signal_strength
+                # by ``anti_deduction`` (max 0.3) — not enough to flip
+                # the call. Now: 2+ high-severity anti-signals (>0.5)
+                # OR cumulative severity >= ANTI_SIGNAL_VETO_SUM is a
+                # hard veto. Configurable via env so the operator can
+                # tune; default ON.
+                _veto_min_count = int(os.environ.get("GRID_ANTI_VETO_HIGH_COUNT", "2"))
+                _veto_high_sev = float(os.environ.get("GRID_ANTI_VETO_HIGH_SEVERITY", "0.5"))
+                _veto_sum_threshold = float(os.environ.get("GRID_ANTI_VETO_SUM", "1.2"))
+                _veto_enabled = os.environ.get("GRID_ANTI_VETO_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+                if _veto_enabled and anti_signals:
+                    high_sev_count = sum(
+                        1 for a in anti_signals if a.severity > _veto_high_sev
+                    )
+                    total_severity = sum(a.severity for a in anti_signals)
+                    if (
+                        high_sev_count >= _veto_min_count
+                        or total_severity >= _veto_sum_threshold
+                    ):
+                        log.info(
+                            "oracle: VETO {dir} on {tk} — "
+                            "{hc} high-severity anti-signals (>{thr}), "
+                            "total severity {ts:.2f}",
+                            dir=direction, tk=ticker,
+                            hc=high_sev_count, thr=_veto_high_sev,
+                            ts=total_severity,
+                        )
+                        continue  # skip this prediction entirely
                 coherence = self._compute_coherence(signals, direction)
 
                 # ── Convergence amplification ──────────────────────
