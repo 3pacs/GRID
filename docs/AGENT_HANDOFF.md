@@ -1,3 +1,32 @@
+## 2026-05-13 20:13 UTC — 2026-05-13-2007
+**Why this matters next run:** H9 audit on `intelligence/hypothesis_engine.py` is now half-done — 3 silent passes fixed (1702/1719/1737, all inside `_check_intelligence_kills`), 4 remain in the same file. Inspected them; here's the triage so the next agent doesn't waste a context window.
+
+PR #155 fixes the inner three silent `except: pass` blocks in `_check_intelligence_kills` (LEVER_DIVERGED / FORENSIC_CONTRADICTION / TRUST_COLLAPSED subchecks). Each routes the swallowed exception through `log.debug` while preserving the `return None` graceful-degradation flow. Uses the canonical loguru→stdlib `caplog` bridge from `tests/test_redfin_puller.py` (also used in PR #154's test file).
+
+**Remaining H9 sites in this file (4) — triage:**
+
+- **Line 972 (`_apply_intelligence_boost` wrapper around `_check_intelligence_kills`)**: outer try/except guarding the same function PR #155 just fixed internally. Same shape, same severity, same fix pattern (`except Exception as exc: log.debug("hypothesis_engine: intelligence_kills wrapper failed: {e}", e=exc)`). Cleanest next pick. ~3 LOC + 1 test that monkeypatches `_check_intelligence_kills` to raise.
+- **Line 853 (`_apply_intelligence_boost` around `_get_intelligence_boost`)**: same sibling-shape as 972. Could be combined with 972 into one PR ("log boost+kill wrapper failures") if you want to keep PR count low — same method, same pattern. ~6 LOC total.
+- **Line 1518 (`_log_boost` SQL INSERT into `hypothesis_boost_log`)**: silent DB write failure. Should probably be `log.warning` not `log.debug` — losing boost-tracking rows degrades calibration. ~3 LOC.
+- **Line 1530 (`_update_boost_outcomes` SQL UPDATE on `hypothesis_boost_log`)**: same shape as 1518, same severity. Could be combined with 1518 ("log boost-table write failures") — both in the same boost-logging cluster. ~6 LOC total.
+
+**One thing NOT to do:** The protected lever-pullers density block at lines 1553-1591 (env-flagged on `LEVER_PULLERS_MODE`) is OFF-LIMITS per CLAUDE.md. None of the 4 remaining H9 sites are inside it (853/972 < 1509, 1518/1530 < 1553), so any of the four is safe to touch — just don't expand scope into the block.
+
+**One related #13 site still survives** (carried forward from previous handoffs):
+- `ingestion/altdata/redfin_puller.py::_store_metrics` (lines 384-390): silently skips rows where `pd.isna(val)` or `float(val)` fails. Per-row `log.warning` would be noisy; right shape is a summary counter at end of the function. **PR #153 (redfin_puller _detect_inventory_anomalies) still open** — wait for it to merge before touching this same file, otherwise file-claim overlap.
+
+**H9 elsewhere — canonical detector + filters:**
+```bash
+grep -rnB1 "^\s*pass\s*$" --include='*.py' api/ ingestion/ intelligence/ orchestration/ analysis/ oracle/ | grep -B1 "except"
+```
+Filter out: Langfuse observability shims (commented "Never raises"), `try A; except: try B` fallback patterns. The actually-silent ones tend to cluster in legacy intelligence/* code and in API router caches.
+
+**Env quirks (unchanged, still in force):**
+- `git push origin routine-bookkeeping` returns HTTP 403 on receive-pack. Use MCP `create_or_update_file` for both `.grid_backups/routine_log.jsonl` and this file. Push of `claude-routine/...` work branches works fine.
+- `python3 -m pytest` can't collect (conftest imports pandas + psycopg2 + python-jose at module top). For an actual local smoke run on a logging fix, write a `python3 -c '...'` script that bypasses conftest — see PR #155's smoke run for the recipe (install pandas + loguru + sqlalchemy via `pip install`, then monkeypatch the import target and assert the bridged caplog records). Works without DB.
+- Loguru → stdlib bridge in `tests/test_redfin_puller.py::test_logs_when_inventory_silently_coerced` remains the canonical pytest pattern for asserting `log.warning(...)` / `log.debug(...)` via `caplog`. Mirrored verbatim into `tests/test_indeed_hiring_puller.py` (PR #154) and `tests/test_hypothesis_engine_intelligence_kills_logging.py` (this PR).
+
+---
 ## 2026-05-13 19:11 UTC — 2026-05-13-1907
 **Why this matters next run:** The `pd.to_numeric(errors="coerce")` audit (ATTENTION.md #13) in `ingestion/altdata/*.py` is now **fully closed** — every site has a coerce-count log. Don't re-grep this directory.
 
