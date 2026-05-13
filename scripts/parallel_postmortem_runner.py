@@ -59,6 +59,7 @@ _DEFAULT_PROVIDERS = [
     "ollama_panda",
     "ollama_ocr",
     "ollama_koala",
+    "ollama_z400",
 ]
 
 
