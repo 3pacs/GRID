@@ -1,3 +1,25 @@
+## 2026-05-13 16:08 UTC — 2026-05-13-1608
+**Why this matters next run:** DEV-NOTES-DATA-INTEGRITY.md is no longer misleading — annotations on main reflect actual state. H13 and H14 are DONE, not next-up.
+
+PR #150 annotates DEV-NOTES with `Status` columns. Verified against origin/main on 2026-05-13:
+- Phase 1 (C1-C5) all done. Phase 2 (H1-H8) all done. H13, H14, H15, H17, H21 all done.
+- H12 has 5 PRs in flight (#145-#149) covering 6 caches. The 3 remaining caches need arch decisions:
+  - `intel_cross_reference.py:25` already has per-key lock map (different shape; may not need migration)
+  - `canvas.py:92` uses tuple key (TTLCache types `key: str`)
+  - `surfacer.py:1507-1510` are function-locals, not globals — likely not a thread issue at all
+
+**Genuinely open work, in scope-order:**
+- H9: 281 swallowed exceptions across 82 files. Biggest concentrations: llm_taskqueue.py (26), mcp_server.py (24), system.py (19), chat.py (17). Each file is a clean single-PR slice. Replace `pass` with `log.warning(...)` — don't change behaviour.
+- H10: 1,217 print() statements. BUT — most prints in `intelligence/*.py` are inside `if __name__ == "__main__":` CLI blocks (entity_resolver: 37, cross_reference: 12, source_audit: 9, trust_scorer: 4, sleuth: 8, universe_ranker: 3 — all guarded by `__main__`). Those are legitimate stdout — leave them. The genuine targets are library-code prints; the routine on this box found very few. Search with `grep -B1 -A0 '^\s*print(' file.py | grep -B1 __main__` style to filter, or check `ingestion/` which the doc says has bulk prints.
+- H11: Several files already split (flow_thesis.py → flow_thesis_data + flow_thesis_scoring; causation.py → causation_core + causation_graph + causation_scoring). Remaining big targets: `llm_taskqueue.py`, `hermes_operator.py`. Splits are architectural — coordinate with operator before opening.
+- H12: tapped for routine pattern. The three remaining caches are architectural.
+
+**Don't repeat my detour:** I verified H13 and H14 (the previous handoff's "next-up" suggestions) and both are already implemented on main with batched `ANY(:fids)` / `ANY(:aids)` queries. The DEV-NOTES annotations now record that — don't re-investigate.
+
+**Test-env note (unchanged):** `python3 -m pytest` and `python3 -m ruff` absent on this routine box; rely on CI to verify lint + tests.
+
+---
+
 ## 2026-05-13 15:15 UTC — 2026-05-13-1510
 **Why this matters next run:** H12 (TTLCache migrations) — both "simple-pattern" router targets are now done; what remains in H12 is non-trivial.
 
