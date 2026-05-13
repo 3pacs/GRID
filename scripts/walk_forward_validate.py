@@ -566,12 +566,23 @@ def build_time_frozen_provenance(
     disagreement_score = float(signals.get("disagreement_score", 0.0) or 0.0)
     red_team_risk = float(signals.get("red_team_epistemic_risk", 0.0) or 0.0)
 
+    # EDGE-table multiplier — no-op (returns 1.0) when
+    # ``GRID_EDGE_SIGNALS_ENABLED`` is off, so production behaviour is
+    # unchanged until the operator opts in. When on, rolls up the
+    # backtest's per-(source, ticker) IC into a geomean conviction
+    # adjustment for the contributing signals.
+    from intelligence.edge_signals import compute_aggregate_edge_multiplier
+    edge_signal_multiplier = compute_aggregate_edge_multiplier(
+        signal_evidence, prediction_row.get("ticker") or "",
+    )
+
     aggregate = compute_aggregate_conviction(
         signal_evidence,
         fragility_multiplier=fragility_multiplier,
         disagreement_score=disagreement_score,
         red_team_epistemic_risk=red_team_risk,
         fudge_alert_count=fudge_alert_count,
+        edge_signal_multiplier=edge_signal_multiplier,
     )
     verdict = _verdict_from_aggregate(aggregate, confidence)
 
