@@ -23,6 +23,7 @@ from intelligence.cross_reference import (
     _compute_divergence_zscore,
     _make_check,
     _generate_narrative,
+    check_trade_bilateral,
     check_gdp_vs_physical,
     get_cross_ref_for_ticker,
     run_all_checks,
@@ -237,6 +238,49 @@ class TestTickerCrossRef:
         engine = MagicMock()
         result = get_cross_ref_for_ticker(engine, "ZZZZ")
         assert result["mapped"] is False
+
+
+class TestTradeBilateral:
+    @patch("intelligence.cross_reference._get_series_history")
+    @patch("intelligence.cross_reference._get_latest_value")
+    def test_uses_configured_series_without_wildcard_discovery(self, mock_latest, mock_hist):
+        from intelligence import cross_reference as cr
+
+        cr._TRADE_BILATERAL_CACHE["data"] = None
+        cr._TRADE_BILATERAL_CACHE["ts"] = 0.0
+        mock_hist.return_value = pd.Series(dtype=float)
+        mock_latest.return_value = (None, None)
+
+        class _Result:
+            def fetchall(self):
+                return []
+
+        class _Conn:
+            def __init__(self):
+                self.statements: list[str] = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def execute(self, statement, params=None):
+                self.statements.append(str(statement))
+                return _Result()
+
+        class _Engine:
+            def __init__(self):
+                self.conn = _Conn()
+
+            def connect(self):
+                return self.conn
+
+        engine = _Engine()
+        checks = check_trade_bilateral(engine)
+
+        assert checks == []
+        assert not any("LIKE :pattern" in sql for sql in engine.conn.statements)
 
 
 class TestRunAllChecks:

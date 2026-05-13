@@ -429,29 +429,31 @@ def update_trust_scores(engine: Engine) -> dict[str, Any]:
 
     sources_updated: list[dict[str, Any]] = []
 
-    with engine.connect() as conn:
-        # Get all unique sources that have scored signals
-        source_keys = conn.execute(text("""
-            SELECT DISTINCT source_type, source_id
+    with engine.begin() as conn:
+        scored_rows = conn.execute(text("""
+            SELECT source_type, source_id, outcome, outcome_return, signal_date, ticker
             FROM signal_sources
             WHERE outcome IN ('CORRECT', 'WRONG')
+            ORDER BY source_type, source_id, signal_date DESC
         """)).fetchall()
 
-    if not source_keys:
-        log.info("No scored sources to update trust for")
-        return {"sources": [], "total": 0}
+        if not scored_rows:
+            log.info("No scored sources to update trust for")
+            return {"sources": [], "total": 0}
 
-    log.info("Updating trust scores for {n} sources", n=len(source_keys))
+        rows_by_source: dict[tuple[str, str], list[tuple[Any, Any, Any, Any]]] = {}
+        source_keys: list[tuple[str, str]] = []
+        for src_type, src_id, outcome, ret, sig_date, ticker in scored_rows:
+            key = (src_type, src_id)
+            if key not in rows_by_source:
+                rows_by_source[key] = []
+                source_keys.append(key)
+            rows_by_source[key].append((outcome, ret, sig_date, ticker))
 
-    with engine.begin() as conn:
+        log.info("Updating trust scores for {n} sources", n=len(source_keys))
+
         for src_type, src_id in source_keys:
-            rows = conn.execute(text("""
-                SELECT outcome, outcome_return, signal_date, ticker
-                FROM signal_sources
-                WHERE source_type = :st AND source_id = :si
-                  AND outcome IN ('CORRECT', 'WRONG')
-                ORDER BY signal_date DESC
-            """), {"st": src_type, "si": src_id}).fetchall()
+            rows = rows_by_source.get((src_type, src_id), [])
 
             if not rows:
                 continue

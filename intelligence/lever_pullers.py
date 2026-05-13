@@ -712,6 +712,7 @@ def _assess_institutional_motivation(
 def get_active_lever_events(
     engine: Engine,
     days: int = DEFAULT_EVENT_LOOKBACK_DAYS,
+    pullers: list[LeverPuller] | None = None,
 ) -> list[LeverEvent]:
     """Fetch recent actions from identified lever pullers.
 
@@ -728,9 +729,10 @@ def get_active_lever_events(
     """
     _ensure_lever_table(engine)
 
-    # First, get known lever pullers
-    pullers = identify_lever_pullers(engine)
-    puller_map: dict[str, LeverPuller] = {p.id: p for p in pullers}
+    # First, get known lever pullers. Dashboard callers can pass the list
+    # they already fetched so this helper does not rescan signal_sources.
+    known_pullers = pullers if pullers is not None else identify_lever_pullers(engine)
+    puller_map: dict[str, LeverPuller] = {p.id: p for p in known_pullers}
 
     cutoff = date.today() - timedelta(days=days)
     events: list[LeverEvent] = []
@@ -874,7 +876,7 @@ def _build_event_context(details: dict[str, Any]) -> str:
 
 # ── 4. Find Lever Convergence ────────────────────────────────────────────
 
-def find_lever_convergence(engine: Engine) -> list[dict]:
+def find_lever_convergence(engine: Engine, pullers: list[LeverPuller] | None = None) -> list[dict]:
     """Detect when multiple lever pullers act on the same ticker simultaneously.
 
     This is the highest-conviction signal the system can produce. When 2+
@@ -894,8 +896,8 @@ def find_lever_convergence(engine: Engine) -> list[dict]:
 
     cutoff = date.today() - timedelta(days=CONVERGENCE_WINDOW_DAYS)
 
-    pullers = identify_lever_pullers(engine)
-    puller_map: dict[str, LeverPuller] = {p.id: p for p in pullers}
+    known_pullers = pullers if pullers is not None else identify_lever_pullers(engine)
+    puller_map: dict[str, LeverPuller] = {p.id: p for p in known_pullers}
 
     convergences: list[dict] = []
 
