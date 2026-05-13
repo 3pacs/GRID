@@ -1,3 +1,25 @@
+## 2026-05-13 18:22 UTC — 2026-05-13-1810
+**Why this matters next run:** The `pd.to_numeric(errors="coerce")` audit (ATTENTION.md #13) in `ingestion/altdata/*.py` is now fully tapped — don't redo it.
+
+PR #153 fixes the lone holdout (`redfin_puller.py:267-269` in `_detect_inventory_anomalies`). Every other `ingestion/altdata/*.py` file that does `pd.to_numeric(..., errors="coerce")` already logs the coerced count: `aaii_sentiment.py:330-339`, `cboe_indices.py:212-218`, `baltic_dry.py:157-160`, `supply_chain.py:713-716`, `indeed_hiring_puller.py:213-215` (main value_col only — sector_col at line 368 still silent but rare path), `yield_curve_full.py:167-170`, `repo_market.py:150-153`, `fed_liquidity.py:200-204+275-277`, `fred.py:415-422` (downstream of the unlogged 277/284/286 calls but those are redundant — line 415 catches everything).
+
+**Two related sites left behind on purpose** (would have busted single-PR scope):
+- `ingestion/altdata/redfin_puller.py::_store_metrics` (lines 384-390): silently skips rows where `pd.isna(val)` or `float(val)` fails. Per-row log.warning would be noisy; the right shape is a summary counter at end of the function. ~10 LOC + a test feeding bad METRIC values. Clean next-PR target.
+- `ingestion/altdata/indeed_hiring_puller.py:368`: same shape as redfin's #13 fix but on a sector_col fallback path. ~5 LOC.
+
+**Where to keep mining ATTENTION.md #13 if needed:** broaden the audit to `ingestion/` (not just `altdata/`) and to `analysis/` / `intelligence/` — but most of those don't ingest external data so coercion is rarer. Real next opportunity is probably **H9 silent passes** in less-obvious files. The handoff-named candidates (chat.py, mcp_server.py, system.py, llm_taskqueue.py) have already been instrumented with `log.debug`/`log.warning` on every except path — the "26 swallowed in llm_taskqueue.py" count must include `log.debug` paths, which are not real swallow bugs. Recommend the next agent grep for truly silent `pass` only:
+
+```bash
+grep -rnB1 "^\s*pass\s*$" --include='*.py' api/ ingestion/ intelligence/ orchestration/ analysis/ oracle/ | grep -B1 "except"
+```
+
+Most hits are intentional Langfuse observability shims (commented "Never raises") or fallback patterns (try A; on fail, try B). The actually-silent ones I saw: `intelligence/hypothesis_engine.py:1738` (outside the protected 1553-1591 block, OK to touch), `intelligence/universe_ranker.py:786` (`ensure_ranking_table` idempotent retry — could log.warning), `api/routers/canvas_expand.py:413`. Each is a clean single-line fix.
+
+**Env quirk update (good news):** `git push origin claude-routine/...` works fine (PR #153 pushed normally). The previous handoff's note that **bookkeeping-branch pushes 403** is still accurate — used MCP `create_or_update_file` for the routine_log + this handoff. Same workaround as before, works first-try.
+
+**Test-env note (unchanged):** `python3 -m pytest` can't collect (conftest imports pandas + psycopg2 at module top). `python3 -m py_compile` and `/root/.local/bin/ruff check` both work — they're the local sanity gate. CI runs full pytest. The pytest+loguru bridge pattern in `tests/test_redfin_puller.py::test_logs_when_inventory_silently_coerced` is the canonical recipe for asserting loguru `log.warning(...)` via pytest `caplog` (loguru doesn't write to stdlib by default — need a `logging.Handler` bridge that re-emits records via stdlib loggers).
+
+---
 ## 2026-05-13 17:15 UTC — 2026-05-13-1705
 **Why this matters next run:** H10 print-statement audit needs a finer filter than "is it inside `if __name__ == '__main__':`" — error-path prints inside a CLI `main()` are still wrong and should use `log.error` + stderr.
 
