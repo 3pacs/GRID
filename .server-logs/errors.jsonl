@@ -9919,3 +9919,4 @@
 {"ts": "2026-05-12T02:52:49.299117+00:00", "level": "ERROR", "module": "__main__", "function": "<module>", "line": 183, "message": "  FAIL: ETH ETH bounces from $2111 if tested", "exception": null}
 {"ts": "2026-05-12T02:52:49.303839+00:00", "level": "ERROR", "module": "__main__", "function": "<module>", "line": 183, "message": "  FAIL: SOL SOL holds $87 support into tomorrow", "exception": null}
 {"ts": "2026-05-12T02:52:49.375945+00:00", "level": "ERROR", "module": "__main__", "function": "<module>", "line": 183, "message": "  FAIL: BTC BTC closes today above $70800", "exception": null}
+{"ts": "2026-05-13T02:05:56.064183+00:00", "level": "ERROR", "module": "ingestion.tiingo_pull", "function": "pull_ticker", "line": 197, "message": "Tiingo pull failed for CASY: HTTPSConnectionPool(host='api.tiingo.com', port=443): Read timed out. (read timeout=30)", "exception": null}
