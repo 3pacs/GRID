@@ -17,6 +17,7 @@ import socket
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
@@ -249,6 +250,94 @@ def execute_job(job, coordinator_url):
         return {"error": str(e)}
 
 
+def available_claim_slots(max_concurrent: int, active_jobs: int) -> int:
+    max_workers = max(int(max_concurrent or 1), 1)
+    return max(max_workers - active_jobs, 0)
+
+
+def drain_finished_futures(active_futures):
+    remaining = set()
+    for future in active_futures:
+        if future.done():
+            try:
+                future.result()
+            except Exception as exc:
+                log.error("Worker job future failed: {e}", e=exc)
+        else:
+            remaining.add(future)
+    return remaining
+
+
+def send_heartbeat(coordinator, worker_id, active_jobs=0):
+    try:
+        r = requests.post(
+            f"{coordinator}/workers/{worker_id}/heartbeat",
+            params={"active_jobs": active_jobs},
+            timeout=5,
+        )
+        r.raise_for_status()
+        return True
+    except Exception as exc:
+        log.warning("Heartbeat failed: {e}", e=exc)
+        return False
+
+
+def claim_next_job(coordinator, worker_id, gpu_available, ollama_available, exclude_types):
+    r = requests.post(f"{coordinator}/jobs/claim", params={
+        "worker_id": worker_id,
+        "gpu_available": gpu_available,
+        "ollama_available": ollama_available,
+        "exclude_types": exclude_types,
+    }, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
+def run_claimed_job(job, coordinator, worker_id):
+    job_id = job["id"]
+
+    try:
+        requests.post(f"{coordinator}/jobs/{job_id}/start",
+                      params={"worker_id": worker_id}, timeout=10)
+    except Exception as exc:
+        log.warning("Failed to mark job #{j} as started: {e}", j=job_id, e=exc)
+
+    start_time = time.time()
+    result = execute_job(job, coordinator)
+    elapsed_ms = int((time.time() - start_time) * 1000)
+
+    output = result.get("output", {})
+    metrics = result.get("metrics", {})
+    metrics["compute_time_ms"] = elapsed_ms
+    error = result.get("error")
+
+    payload = {
+        "job_id": job_id,
+        "worker_id": worker_id,
+        "output": output,
+        "metrics": metrics,
+        "error": error,
+    }
+    reported = False
+    for attempt in range(1, 4):
+        try:
+            r = requests.post(f"{coordinator}/jobs/{job_id}/complete", json=payload, timeout=30)
+            r.raise_for_status()
+            reported = True
+            break
+        except Exception as exc:
+            log.error("Failed to report result for job #{id} attempt {a}: {e}",
+                      id=job_id, a=attempt, e=exc)
+            time.sleep(min(attempt * 2, 5))
+
+    if error:
+        log.warning("Job #{id} failed: {e}", id=job_id, e=error)
+    elif reported:
+        log.info("Job #{id} completed in {ms}ms", id=job_id, ms=elapsed_ms)
+
+    return reported
+
+
 def run_hypothesis_test(params):
     """Test a hypothesis against historical data."""
     hypothesis_id = params.get("hypothesis_id")
@@ -323,8 +412,10 @@ def run_regime_detect(params):
     engine = get_engine()
     pit = PITStore(engine)
 
-    rows = execute_sql("SELECT id FROM feature_registry WHERE model_eligible=TRUE ORDER BY id")
-    fids = [r["id"] for r in rows]
+    fids = requested_feature_ids(params)
+    if not fids:
+        rows = execute_sql("SELECT id FROM feature_registry WHERE model_eligible=TRUE ORDER BY id LIMIT 50")
+        fids = [r["id"] for r in rows]
 
     df = pit.get_feature_matrix(fids, date.fromisoformat(start_date), date.today(), date.today())
     df = df.ffill().bfill().dropna(axis=1, how="all").dropna()
@@ -351,6 +442,20 @@ def run_regime_detect(params):
         },
         "metrics": {"n_components": n_components},
     }
+
+
+def requested_feature_ids(params):
+    feature_ids = []
+    seen = set()
+    for value in params.get("feature_ids") or []:
+        try:
+            feature_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if feature_id and feature_id not in seen:
+            seen.add(feature_id)
+            feature_ids.append(feature_id)
+    return feature_ids
 
 
 def run_llm_inference(params):
@@ -741,82 +846,50 @@ def main():
 
     # Main loop
     last_heartbeat = time.time()
+    max_workers = max(int(args.max_concurrent or 1), 1)
+    active_futures = set()
 
-    while True:
-        try:
-            # Heartbeat
-            if time.time() - last_heartbeat >= HEARTBEAT_INTERVAL:
-                try:
-                    requests.post(f"{coordinator}/workers/{worker_id}/heartbeat", timeout=5)
-                    last_heartbeat = time.time()
-                except Exception:
-                    log.warning("Heartbeat failed")
-
-            if args.heartbeat_only:
-                time.sleep(POLL_INTERVAL)
-                continue
-
-            # Try to claim a job (skip human-only jobs)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        while True:
             try:
-                r = requests.post(f"{coordinator}/jobs/claim", params={
-                    "worker_id": worker_id,
-                    "gpu_available": gpu_model is not None,
-                    "ollama_available": has_ollama,
-                    "exclude_types": args.exclude_types,
-                }, timeout=10)
-                r.raise_for_status()
-                job = r.json()
+                active_futures = drain_finished_futures(active_futures)
+
+                # Heartbeat from the main thread even while jobs are running.
+                if time.time() - last_heartbeat >= HEARTBEAT_INTERVAL:
+                    if send_heartbeat(coordinator, worker_id, active_jobs=len(active_futures)):
+                        last_heartbeat = time.time()
+
+                if args.heartbeat_only:
+                    time.sleep(POLL_INTERVAL)
+                    continue
+
+                slots = available_claim_slots(max_workers, len(active_futures))
+                for _ in range(slots):
+                    try:
+                        job = claim_next_job(
+                            coordinator,
+                            worker_id,
+                            gpu_model is not None,
+                            has_ollama,
+                            args.exclude_types,
+                        )
+                    except Exception as e:
+                        log.debug("Claim failed: {e}", e=e)
+                        break
+
+                    if job.get("status") in {"no_jobs", "no_capacity"}:
+                        break
+
+                    active_futures.add(executor.submit(run_claimed_job, job, coordinator, worker_id))
+
+                time.sleep(1 if active_futures else POLL_INTERVAL)
+
+            except KeyboardInterrupt:
+                log.info("Worker shutting down")
+                break
             except Exception as e:
-                log.debug("Claim failed: {e}", e=e)
+                log.error("Worker loop error: {e}", e=e)
                 time.sleep(POLL_INTERVAL)
-                continue
-
-            if job.get("status") == "no_jobs":
-                time.sleep(POLL_INTERVAL)
-                continue
-
-            job_id = job["id"]
-
-            # Mark job as started
-            try:
-                requests.post(f"{coordinator}/jobs/{job_id}/start",
-                              params={"worker_id": worker_id}, timeout=10)
-            except Exception as exc:
-                log.warning("Failed to mark job #{j} as started: {e}", j=job_id, e=exc)
-
-            # Execute
-            start_time = time.time()
-            result = execute_job(job, coordinator)
-            elapsed_ms = int((time.time() - start_time) * 1000)
-
-            # Report result
-            output = result.get("output", {})
-            metrics = result.get("metrics", {})
-            metrics["compute_time_ms"] = elapsed_ms
-            error = result.get("error")
-
-            try:
-                requests.post(f"{coordinator}/jobs/{job_id}/complete", json={
-                    "job_id": job_id,
-                    "worker_id": worker_id,
-                    "output": output,
-                    "metrics": metrics,
-                    "error": error,
-                }, timeout=30)
-            except Exception as e:
-                log.error("Failed to report result for job #{id}: {e}", id=job_id, e=e)
-
-            if error:
-                log.warning("Job #{id} failed: {e}", id=job_id, e=error)
-            else:
-                log.info("Job #{id} completed in {ms}ms", id=job_id, ms=elapsed_ms)
-
-        except KeyboardInterrupt:
-            log.info("Worker shutting down")
-            break
-        except Exception as e:
-            log.error("Worker loop error: {e}", e=e)
-            time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
