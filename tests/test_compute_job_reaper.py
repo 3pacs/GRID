@@ -48,3 +48,8 @@ def test_reconcile_worker_counts_preserves_offline_state():
 
 def test_stale_job_query_locks_jobs_not_outer_joined_workers():
     assert "FOR UPDATE OF j SKIP LOCKED" in reaper.STALE_JOB_SELECT_SQL
+
+
+def test_reaper_query_reclaims_capability_incompatible_jobs():
+    assert "j.requires_ollama = TRUE AND COALESCE(w.has_ollama, FALSE) = FALSE" in reaper.STALE_JOB_SELECT_SQL
+    assert "j.requires_gpu = TRUE AND w.gpu_model IS NULL" in reaper.STALE_JOB_SELECT_SQL

@@ -22,12 +22,18 @@ STALE_JOB_SELECT_SQL = """
         FROM compute_jobs j
         LEFT JOIN compute_workers w ON w.id = j.assigned_worker
         WHERE j.state IN ('DISPATCHED', 'IN_PROGRESS')
-          AND COALESCE(j.started_at, j.dispatched_at, j.queued_at, j.created_at)
-              < NOW() - ((j.timeout_seconds + %s) * INTERVAL '1 second')
           AND (
-              j.assigned_worker IS NULL
-              OR COALESCE(w.active_jobs, 0) = 0
-              OR w.last_heartbeat < NOW() - (%s * INTERVAL '1 second')
+              (
+                  COALESCE(j.started_at, j.dispatched_at, j.queued_at, j.created_at)
+                      < NOW() - ((j.timeout_seconds + %s) * INTERVAL '1 second')
+                  AND (
+                      j.assigned_worker IS NULL
+                      OR COALESCE(w.active_jobs, 0) = 0
+                      OR w.last_heartbeat < NOW() - (%s * INTERVAL '1 second')
+                  )
+              )
+              OR (j.requires_ollama = TRUE AND COALESCE(w.has_ollama, FALSE) = FALSE)
+              OR (j.requires_gpu = TRUE AND w.gpu_model IS NULL)
           )
         ORDER BY j.id
         LIMIT %s
