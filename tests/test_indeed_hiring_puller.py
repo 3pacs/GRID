@@ -271,6 +271,92 @@ class TestPullSectors:
         result = puller._pull_sectors(date(2024, 1, 1))
         assert result["status"] == "PARTIAL"
 
+    @patch("ingestion.altdata.indeed_hiring_puller.ingest_actor")
+    @patch.object(IndeedHiringPuller, "_fetch_csv")
+    def test_logs_when_sector_values_silently_coerced(
+        self, mock_fetch, mock_ingest, caplog
+    ):
+        """ATTENTION.md #13: bad sector values must not be silently dropped.
+
+        Mixed numeric + garbage in a sector column should trigger a
+        log.warning naming the coerced count and the sector, so an
+        operator sees a malformed CSV instead of a silently shrunken
+        dataset.
+        """
+        from loguru import logger
+        import logging
+
+        # Loguru -> stdlib bridge so pytest's caplog captures messages.
+        class _Bridge(logging.Handler):
+            def emit(self, record):  # noqa: D401
+                logging.getLogger(record.name).handle(record)
+
+        handler_id = logger.add(_Bridge(), level="WARNING", format="{message}")
+        try:
+            caplog.set_level(logging.WARNING)
+            engine = _make_mock_engine()
+            conn_mock = engine.begin.return_value.__enter__.return_value
+            row_check = MagicMock()
+            row_check.fetchone.return_value = None
+            row_check.fetchall.return_value = []
+            conn_mock.execute.return_value = row_check
+
+            puller = IndeedHiringPuller(db_engine=engine)
+            dates = pd.date_range("2024-01-01", periods=4, freq="W")
+            mock_fetch.return_value = pd.DataFrame({
+                "date": dates,
+                # Two valid floats, two unparseable strings → coerce to NaN.
+                "Software Development": ["120", "n/a", "118", "--"],
+            })
+
+            puller._pull_sectors(date(2024, 1, 1))
+        finally:
+            logger.remove(handler_id)
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(
+            "non-numeric values to NaN for indeed sector" in m
+            and "Software Development" in m
+            and "2" in m
+            for m in messages
+        ), messages
+
+    @patch("ingestion.altdata.indeed_hiring_puller.ingest_actor")
+    @patch.object(IndeedHiringPuller, "_fetch_csv")
+    def test_no_log_when_all_sector_values_valid(
+        self, mock_fetch, mock_ingest, caplog
+    ):
+        """Conversely, a clean DataFrame must not emit a coerce warning."""
+        from loguru import logger
+        import logging
+
+        class _Bridge(logging.Handler):
+            def emit(self, record):  # noqa: D401
+                logging.getLogger(record.name).handle(record)
+
+        handler_id = logger.add(_Bridge(), level="WARNING", format="{message}")
+        try:
+            caplog.set_level(logging.WARNING)
+            engine = _make_mock_engine()
+            conn_mock = engine.begin.return_value.__enter__.return_value
+            row_check = MagicMock()
+            row_check.fetchone.return_value = None
+            row_check.fetchall.return_value = []
+            conn_mock.execute.return_value = row_check
+
+            puller = IndeedHiringPuller(db_engine=engine)
+            mock_fetch.return_value = _sample_sector_df()
+
+            puller._pull_sectors(date(2024, 1, 1))
+        finally:
+            logger.remove(handler_id)
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert not any(
+            "non-numeric values to NaN for indeed sector" in m
+            for m in messages
+        ), messages
+
 
 # ---------------------------------------------------------------------------
 # pull_all integration (mocked)
