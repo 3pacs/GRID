@@ -93,6 +93,41 @@ def ollama_models():
     ]
 
 
+def ollama_active_models():
+    try:
+        req = urllib.request.Request("http://127.0.0.1:11434/api/ps")
+        with urllib.request.urlopen(req, timeout=3) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+        return []
+    out = []
+    for model in payload.get("models", []):
+        name = model.get("name") or model.get("model")
+        if name:
+            out.append({"name": name})
+    return out
+
+
+def llm_processes():
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "command"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    needles = ("llama-server", "llama.cpp", "ollama runner")
+    return [
+        line.strip()[:220]
+        for line in result.stdout.splitlines()
+        if any(needle in line for needle in needles)
+        and "python3 -c" not in line
+    ][:20]
+
+
 def choose_model(models):
     for size_hint in ("3b", "7b", "8b", "9b", "12b"):
         for model in models:
@@ -148,6 +183,7 @@ def benchmark_ollama(model):
 
 gpu_model, gpu_vram = gpu()
 models = ollama_models()
+active_models = ollama_active_models()
 out = {
     "hostname": socket.gethostname(),
     "cpu_cores": os.cpu_count() or 1,
@@ -156,11 +192,22 @@ out = {
     "gpu_vram_gb": gpu_vram,
     "ollama_available": bool(models),
     "ollama_models": models,
+    "ollama_active_models": active_models,
+    "llm_processes": llm_processes(),
 }
 if os.environ.get("GRID_LLM_BENCHMARK") == "1":
     out["benchmarks"] = []
     model = choose_model(models)
-    if model:
+    if active_models:
+        out["benchmarks"].append({
+            "provider": "ollama",
+            "model": model or "unknown",
+            "ok": False,
+            "skipped": True,
+            "reason": "active_models",
+            "active_models": active_models,
+        })
+    elif model:
         out["benchmarks"].append(benchmark_ollama(model))
 print(json.dumps(out, sort_keys=True))
 """
@@ -355,6 +402,129 @@ def _choose_ollama_model(models: list[str]) -> str | None:
     return models[0] if models else None
 
 
+def _ollama_active_models(base_url: str, timeout: float) -> list[dict[str, str]]:
+    response = requests.get(f"{base_url.rstrip('/')}/api/ps", timeout=timeout)
+    response.raise_for_status()
+    out: list[dict[str, str]] = []
+    for model in response.json().get("models", []):
+        name = model.get("name") or model.get("model")
+        if name:
+            out.append({"name": str(name)})
+    return out
+
+
+def _llm_processes() -> list[str]:
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "command"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    needles = ("llama-server", "llama.cpp", "ollama runner")
+    return [
+        line.strip()[:220]
+        for line in result.stdout.splitlines()
+        if any(needle in line for needle in needles)
+        and "python3 -c" not in line
+    ][:20]
+
+
+def assess_idle_state(inventory: dict[str, Any]) -> dict[str, Any]:
+    active_models = []
+    for model in inventory.get("ollama_active_models") or []:
+        if isinstance(model, dict):
+            name = model.get("name") or model.get("model")
+        else:
+            name = str(model)
+        if name:
+            active_models.append(str(name))
+    if active_models:
+        return {
+            "idle": False,
+            "reason": "active Ollama models: " + ", ".join(active_models),
+            "active_models": active_models,
+        }
+    return {
+        "idle": True,
+        "reason": "no active Ollama models reported",
+        "active_models": [],
+    }
+
+
+def _benchmark_for_model(inventory: dict[str, Any], model: str) -> dict[str, Any] | None:
+    for metric in inventory.get("benchmarks") or []:
+        if not isinstance(metric, dict) or not metric.get("ok"):
+            continue
+        if metric.get("model") == model:
+            return metric
+    for metric in inventory.get("benchmarks") or []:
+        if isinstance(metric, dict) and metric.get("ok"):
+            return metric
+    return None
+
+
+def build_tuning_plan(inventory: dict[str, Any]) -> dict[str, Any]:
+    idle_state = assess_idle_state(inventory)
+    hostname = str(inventory.get("hostname") or inventory.get("ssh_host") or "unknown")
+    base = {
+        "hostname": hostname,
+        "idle_state": idle_state,
+        "experiments": [],
+        "rollback_notes": [],
+        "applied": False,
+    }
+    if not idle_state["idle"]:
+        return {**base, "status": "blocked_active"}
+
+    models = list(inventory.get("ollama_models") or [])
+    model = _choose_ollama_model(models)
+    if not model:
+        return {**base, "status": "no_models", "notes": "No non-embedding Ollama models found."}
+
+    metric = _benchmark_for_model(inventory, model)
+    if metric and metric.get("model"):
+        model = str(metric["model"])
+    before_tps = metric.get("tokens_per_second") if metric else None
+    vram = inventory.get("gpu_vram_gb")
+    batch_hint = "small-batch"
+    if isinstance(vram, (int, float)) and vram >= 32:
+        batch_hint = "moderate-batch"
+
+    experiment = {
+        "provider": "ollama",
+        "model": model,
+        "apply": False,
+        "phase": "plan-only",
+        "before_tokens_per_second": before_tps,
+        "quality_gate": "same prompt must stay non-empty and under 300 chars",
+        "tuning_knobs": [
+            "repeat baseline with warm model",
+            f"compare OLLAMA_NUM_PARALLEL=1 vs 2 using {batch_hint} prompt batches",
+            "compare num_ctx and num_batch settings only if memory headroom stays stable",
+            "record eval_count/eval_duration before and after each candidate",
+        ],
+        "commands": [
+            "python -m scripts.local_llm_autotune --benchmark --idle-autotune --report <path>",
+            "apply candidate env only in a temporary shell or drop-in, then rerun the same report command",
+        ],
+        "rollback": [
+            "remove the temporary env/drop-in",
+            "restart only the affected Ollama or llama.cpp service",
+            "restore previous worker max_concurrent if it was reduced for the experiment",
+        ],
+    }
+    return {
+        **base,
+        "status": "candidate" if metric else "needs_baseline",
+        "experiments": [experiment],
+        "rollback_notes": experiment["rollback"],
+    }
+
+
 def benchmark_ollama(base_url: str, prompt: str, timeout: float) -> BenchmarkMetrics:
     models = _ollama_models(base_url, timeout)
     model = _choose_ollama_model(models)
@@ -410,6 +580,10 @@ def inventory_host() -> dict[str, Any]:
         ollama_available = bool(ollama_models)
     except requests.RequestException:
         pass
+    try:
+        active_models = _ollama_active_models(DEFAULT_OLLAMA_URL, timeout=3)
+    except requests.RequestException:
+        active_models = []
     cpu_cores = os.cpu_count() or 1
     ram_gb = _detect_ram_gb()
     hostname = socket.gethostname()
@@ -421,6 +595,8 @@ def inventory_host() -> dict[str, Any]:
         "gpu_vram_gb": gpu_vram,
         "ollama_available": ollama_available,
         "ollama_models": ollama_models,
+        "ollama_active_models": active_models,
+        "llm_processes": _llm_processes(),
         "recommendation": recommend_worker_profile(
             hostname=hostname,
             cpu_cores=cpu_cores,
@@ -479,30 +655,52 @@ def _metric_error(provider: str, error: Exception) -> BenchmarkMetrics:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    idle_autotune = bool(getattr(args, "idle_autotune", False))
     report: dict[str, Any] = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "mode": "idle-autotune-plan" if idle_autotune else "inventory",
         "inventory": inventory_host(),
         "remote_inventory": [],
         "benchmarks": [],
     }
     for host in args.ssh_host or []:
         report["remote_inventory"].append(inventory_ssh_host(host, args.timeout, benchmark=args.benchmark))
+    if idle_autotune:
+        report["inventory"]["tuning_plan"] = build_tuning_plan(report["inventory"])
+        for inventory in report["remote_inventory"]:
+            if inventory.get("ok", True):
+                inventory["tuning_plan"] = build_tuning_plan(inventory)
     if args.benchmark:
-        for provider, func, url in (
-            ("llamacpp", benchmark_llamacpp, args.llamacpp_url),
-            ("ollama", benchmark_ollama, args.ollama_url),
-        ):
-            try:
-                metric = func(url, args.prompt, args.timeout)
-            except Exception as exc:  # noqa: BLE001 - benchmark reports failures per provider.
-                metric = _metric_error(provider, exc)
-            report["benchmarks"].append(asdict(metric))
+        idle_state = assess_idle_state(report["inventory"])
+        if idle_autotune and not idle_state["idle"]:
+            report["benchmarks"].append({
+                "provider": "local",
+                "model": "unknown",
+                "ok": False,
+                "skipped": True,
+                "reason": idle_state["reason"],
+            })
+        else:
+            for provider, func, url in (
+                ("llamacpp", benchmark_llamacpp, args.llamacpp_url),
+                ("ollama", benchmark_ollama, args.ollama_url),
+            ):
+                try:
+                    metric = func(url, args.prompt, args.timeout)
+                except Exception as exc:  # noqa: BLE001 - benchmark reports failures per provider.
+                    metric = _metric_error(provider, exc)
+                report["benchmarks"].append(asdict(metric))
     return report
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="local_llm_autotune")
     parser.add_argument("--benchmark", action="store_true", help="Run short local LLM throughput probes.")
+    parser.add_argument(
+        "--idle-autotune",
+        action="store_true",
+        help="Attach idle-aware, report-only tuning plans. Never applies changes.",
+    )
     parser.add_argument("--llamacpp-url", default=os.getenv("GRID_LLAMACPP_URL", DEFAULT_LLAMA_URL))
     parser.add_argument("--ollama-url", default=os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_URL))
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
