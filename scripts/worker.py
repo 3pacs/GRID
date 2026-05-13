@@ -152,11 +152,14 @@ def detect_gpu():
 
 
 def detect_ollama():
-    """Check if Ollama is running."""
+    """Check if Ollama can actually generate with an installed model."""
     try:
-        r = requests.get("http://localhost:11434/api/tags", timeout=5)
-        return r.status_code == 200
-    except Exception:
+        model = _resolve_ollama_model(os.environ.get("GRID_WORKER_OLLAMA_PROBE_MODEL", "llama3.2"))
+        if os.environ.get("GRID_WORKER_SKIP_OLLAMA_GENERATE_PROBE") == "1":
+            return True
+        return _ollama_generation_probe(model)
+    except Exception as exc:
+        log.warning("Ollama generate probe failed: {e}", e=exc)
         return False
 
 
@@ -191,6 +194,19 @@ def _ollama_model_catalog():
         if name:
             models.append(name)
     return models
+
+
+def _ollama_generation_probe(model: str) -> bool:
+    payload = {
+        "model": model,
+        "prompt": "OK",
+        "stream": False,
+        "options": {"num_predict": 1},
+    }
+    r = requests.post("http://localhost:11434/api/generate", json=payload, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    return bool(data.get("done") or data.get("response") is not None)
 
 
 def _resolve_ollama_model(requested_model: str) -> str:
