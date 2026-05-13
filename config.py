@@ -189,6 +189,19 @@ class Settings(BaseSettings):
     OLLAMA_KOALA_CHAT_MODEL: str = "gemma3:12b-it-q4_K_M"
     OLLAMA_KOALA_EMBED_MODEL: str = "nomic-embed-text"
 
+    # z400 — workstation with a 12GB GPU running Ollama. 7B Q4 model
+    # (qwen2.5:7b-instruct-q4_K_M, ~5GB resident) leaves room on the
+    # card for fast inference. Best fit for high-throughput narrative
+    # tasks (postmortem narration, signal interpretation) where 7B is
+    # enough and we want low per-request latency. Vision models
+    # (minicpm-v:8b, qwen2.5vl:7b) also present but not routed through
+    # the standard chain — callers override ``model=`` for vision.
+    OLLAMA_Z400_BASE_URL: str = "http://z400:11434"
+    OLLAMA_Z400_ENABLED: bool = True
+    OLLAMA_Z400_TIMEOUT_SECONDS: int = 120
+    OLLAMA_Z400_CHAT_MODEL: str = "qwen2.5:7b-instruct-q4_K_M"
+    OLLAMA_Z400_EMBED_MODEL: str = "nomic-embed-text"
+
     # koala card 1 — Kokoro TTS server (CPU inference, FastAPI on :8091).
     # OpenAI-compatible /v1/audio/speech endpoint. 54 voices, 24kHz mono WAV.
     # Useful as a local replacement for OpenAI TTS in audio_briefing.py.
