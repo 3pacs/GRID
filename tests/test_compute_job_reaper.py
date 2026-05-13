@@ -53,3 +53,8 @@ def test_stale_job_query_locks_jobs_not_outer_joined_workers():
 def test_reaper_query_reclaims_capability_incompatible_jobs():
     assert "j.requires_ollama = TRUE AND COALESCE(w.has_ollama, FALSE) = FALSE" in reaper.STALE_JOB_SELECT_SQL
     assert "j.requires_gpu = TRUE AND w.gpu_model IS NULL" in reaper.STALE_JOB_SELECT_SQL
+
+
+def test_reaper_query_reclaims_orphans_after_worker_reports_zero_active_jobs():
+    assert "COALESCE(w.active_jobs, 0) = 0" in reaper.STALE_JOB_SELECT_SQL
+    assert "COALESCE(j.started_at, j.dispatched_at)" in reaper.STALE_JOB_SELECT_SQL

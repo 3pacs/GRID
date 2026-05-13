@@ -34,6 +34,12 @@ STALE_JOB_SELECT_SQL = """
               )
               OR (j.requires_ollama = TRUE AND COALESCE(w.has_ollama, FALSE) = FALSE)
               OR (j.requires_gpu = TRUE AND w.gpu_model IS NULL)
+              OR (
+                  j.assigned_worker IS NOT NULL
+                  AND COALESCE(w.active_jobs, 0) = 0
+                  AND COALESCE(j.started_at, j.dispatched_at)
+                      < NOW() - (%s * INTERVAL '1 second')
+              )
           )
         ORDER BY j.id
         LIMIT %s
@@ -101,7 +107,7 @@ def _dict_rows(rows):
 
 
 def select_stale_jobs(cur, *, grace_seconds: int, limit: int):
-    cur.execute(STALE_JOB_SELECT_SQL, (grace_seconds, grace_seconds, limit))
+    cur.execute(STALE_JOB_SELECT_SQL, (grace_seconds, grace_seconds, grace_seconds, limit))
     return _dict_rows(cur.fetchall())
 
 
