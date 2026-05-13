@@ -61,14 +61,52 @@ _DEFAULT_EDGE_TABLE_PATH = (
 _EDGE_TABLE_PATH_ENV = "GRID_EDGE_TABLE_PATH"
 
 
-# How much to scale the IC into the multiplier. The defaults below land
-# +0.62 IC at ~1.50× and -0.53 IC at ~0.58×.
-EDGE_BOOST_GAIN: float = 0.8
-EDGE_PENALTY_GAIN: float = 0.8
+# ── Tuning knobs (all readable via env so the operator can adjust
+# without code changes) ──────────────────────────────────────────────────
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float env var or return default. Tolerant of empty / junk."""
+    raw = os.environ.get(name, "")
+    if not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        log.warning(
+            "edge_signals: env {n}={v!r} is not a float; using default {d}",
+            n=name, v=raw, d=default,
+        )
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "")
+    if not raw.strip():
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on", "enabled")
+
+
+# Master kill-switch. Defaults to FALSE so production behaviour is
+# unchanged until the operator opts in. Flip to true (env or set_enabled)
+# once you're confident the multiplier semantics fit your conviction
+# stack.
+EDGE_SIGNALS_ENABLED: bool = _env_bool("GRID_EDGE_SIGNALS_ENABLED", False)
+
+# How much to scale the IC into the multiplier. Defaults: +0.62 IC at
+# ~1.50× and -0.53 IC at ~0.58×.
+EDGE_BOOST_GAIN: float = _env_float("GRID_EDGE_BOOST_GAIN", 0.8)
+EDGE_PENALTY_GAIN: float = _env_float("GRID_EDGE_PENALTY_GAIN", 0.8)
 
 # Hard bounds so no single edge can blow up the aggregate.
-EDGE_MULTIPLIER_MIN: float = 0.4
-EDGE_MULTIPLIER_MAX: float = 1.8
+EDGE_MULTIPLIER_MIN: float = _env_float("GRID_EDGE_MULT_MIN", 0.4)
+EDGE_MULTIPLIER_MAX: float = _env_float("GRID_EDGE_MULT_MAX", 1.8)
+
+
+def set_enabled(value: bool) -> None:
+    """Toggle the master switch at runtime (mostly for tests + REPL)."""
+    global EDGE_SIGNALS_ENABLED
+    EDGE_SIGNALS_ENABLED = bool(value)
 
 # Only honour rows the backtest itself flagged as ``EDGE``. Other
 # verdicts (e.g. NOISE, INCONCLUSIVE) stay out of the multiplier path
@@ -195,6 +233,14 @@ def lookup_edge(
     return cache.get(_normalize_key(source_type, ticker, signal_direction))
 
 
+def _ic_to_multiplier(ic: float) -> float:
+    if ic >= 0:
+        mult = 1.0 + EDGE_BOOST_GAIN * ic
+    else:
+        mult = 1.0 - EDGE_PENALTY_GAIN * abs(ic)
+    return max(EDGE_MULTIPLIER_MIN, min(EDGE_MULTIPLIER_MAX, mult))
+
+
 def edge_multiplier(
     source_type: str,
     ticker: str,
@@ -202,18 +248,92 @@ def edge_multiplier(
 ) -> float:
     """Return the conviction multiplier to apply for this signal triple.
 
-    Returns ``1.0`` when no edge is known. Otherwise scales by IC with
-    sign-aware gain and clips to ``[EDGE_MULTIPLIER_MIN, EDGE_MULTIPLIER_MAX]``.
+    Returns ``1.0`` when:
+      * the master switch ``EDGE_SIGNALS_ENABLED`` is False, or
+      * no edge has been identified for the (source, ticker, direction)
+        triple in the loaded edge_table.
+
+    Otherwise scales by IC with sign-aware gain and clips to
+    ``[EDGE_MULTIPLIER_MIN, EDGE_MULTIPLIER_MAX]``.
     """
+    if not EDGE_SIGNALS_ENABLED:
+        return 1.0
     edge = lookup_edge(source_type, ticker, signal_direction)
     if edge is None:
         return 1.0
-    ic = edge.information_coefficient
-    if ic >= 0:
-        mult = 1.0 + EDGE_BOOST_GAIN * ic
-    else:
-        mult = 1.0 - EDGE_PENALTY_GAIN * abs(ic)
-    return max(EDGE_MULTIPLIER_MIN, min(EDGE_MULTIPLIER_MAX, mult))
+    return _ic_to_multiplier(edge.information_coefficient)
+
+
+def multiplier_for_source_ticker(source_type: str, ticker: str) -> float:
+    """Variant that only knows ``(source_type, ticker)``.
+
+    When direction isn't available at the call site (e.g. consumers
+    walking ``SignalEvidence`` which carries only ``signal_source``),
+    we still want the conviction calibration. Strategy: among all EDGE
+    rows for this ``(source_type, ticker)`` pair, pick the one with the
+    strongest ``|IC|`` and return its multiplier. Degenerates to 1.0
+    when no edges match or the master switch is off.
+    """
+    if not EDGE_SIGNALS_ENABLED:
+        return 1.0
+    cache = _ensure_loaded()
+    if not cache:
+        return 1.0
+    src_norm = str(source_type or "").strip()
+    tkr_norm = str(ticker or "").strip().upper()
+    if not src_norm or not tkr_norm:
+        return 1.0
+    candidates = [
+        rec for (s, t, _d), rec in cache.items()
+        if s == src_norm and t == tkr_norm
+    ]
+    if not candidates:
+        return 1.0
+    strongest = max(candidates, key=lambda r: abs(r.information_coefficient))
+    return _ic_to_multiplier(strongest.information_coefficient)
+
+
+def compute_aggregate_edge_multiplier(
+    signal_evidence: list[Any],
+    ticker: str,
+) -> float:
+    """Roll up the per-signal edge multipliers into one scalar.
+
+    Iterates the provided ``signal_evidence`` (each item is expected to
+    have a ``signal_source`` attribute — duck-typed against the canonical
+    ``intelligence.signal_provenance.SignalEvidence``), looks each one up
+    by ``(signal_source, ticker)`` via :func:`multiplier_for_source_ticker`,
+    and returns the **geometric mean** of the resulting per-signal
+    multipliers — so 10 signals each with ~1.1× boost don't compound to
+    2.6×; instead the aggregate stays near 1.1×.
+
+    Returns 1.0 when the master switch is off or no evidence is
+    provided. The geometric mean is also clipped to
+    ``[EDGE_MULTIPLIER_MIN, EDGE_MULTIPLIER_MAX]`` so the aggregate is
+    bounded the same way as a single edge.
+    """
+    if not EDGE_SIGNALS_ENABLED or not signal_evidence or not ticker:
+        return 1.0
+    multipliers: list[float] = []
+    for ev in signal_evidence:
+        source = getattr(ev, "signal_source", None)
+        if not source:
+            continue
+        m = multiplier_for_source_ticker(source, ticker)
+        if m != 1.0:
+            multipliers.append(m)
+    if not multipliers:
+        return 1.0
+    # Geometric mean: nth root of the product.
+    log_sum = 0.0
+    for m in multipliers:
+        # log only defined for positive — multipliers always > 0 by
+        # construction (min bound > 0).
+        from math import log as _log
+        log_sum += _log(m)
+    from math import exp as _exp
+    geomean = _exp(log_sum / len(multipliers))
+    return max(EDGE_MULTIPLIER_MIN, min(EDGE_MULTIPLIER_MAX, geomean))
 
 
 def apply_multiplier(
