@@ -422,12 +422,59 @@ def apply_multiplier(
     return float(base_conviction) * edge_multiplier(source_type, ticker, signal_direction)
 
 
+# Per-source-type "information half-life" in days. Encodes how long
+# a signal of each type stays directionally informative. Pulled from
+# trust_scorer.EVALUATION_WINDOWS conceptually but inlined so this
+# module has no upstream import.
+# Operator guidance: a social HEAT_SPIKE from 14 days ago shouldn't
+# meaningfully influence today's 3-day prediction. A gov_contracts
+# announcement from 30 days ago still informs the next 30 days.
+_SIGNAL_HALF_LIFE_DAYS: dict[str, int] = {
+    "social": 3,
+    "smart_money": 3,
+    "options_flow": 5,
+    "quiverquant:wsb": 3,
+    "quiverquant:offexchange": 5,
+    "scanner": 7,
+    "insider": 14,
+    "quiverquant:insider": 14,
+    "quiverquant:house": 30,
+    "quiverquant:senate": 30,
+    "congressional": 30,
+    "legislative": 30,
+    "quiverquant:lobbying": 60,
+    "quiverquant:gov_contracts": 90,
+    "lobbying": 60,
+    "foreign_lobbying": 60,
+}
+_DEFAULT_HALF_LIFE_DAYS: int = 14
+_MAX_LOOKBACK_DAYS: int = 90   # hard upper bound; cuts off ancient signals entirely
+
+
+def _signal_recency_weight(source_type: str, signal_age_days: float) -> float:
+    """Exponential-decay weight for a signal of age ``signal_age_days``.
+
+    weight = 0.5 ** (age / half_life)
+
+    A signal at exactly its half-life is weighted 0.5. A signal at 3×
+    half-life is weighted 0.125. Returns 0.0 for signals older than
+    ``_MAX_LOOKBACK_DAYS`` regardless of half-life (avoids long-tail
+    drag from ancient rows).
+    """
+    if signal_age_days < 0:
+        return 0.0
+    if signal_age_days > _MAX_LOOKBACK_DAYS:
+        return 0.0
+    half_life = _SIGNAL_HALF_LIFE_DAYS.get(source_type, _DEFAULT_HALF_LIFE_DAYS)
+    return 0.5 ** (signal_age_days / half_life)
+
+
 def edge_multiplier_for_prediction(
     engine: Any,
     ticker: str,
     signal_date: Any,
     *,
-    lookback_days: int = 30,
+    lookback_days: int = _MAX_LOOKBACK_DAYS,
     prediction_direction: str = "",
 ) -> float:
     """Aggregate EDGE multiplier for a prediction at a given (ticker, date).
@@ -467,7 +514,7 @@ def edge_multiplier_for_prediction(
             rows = conn.execute(
                 text(
                     """
-                    SELECT DISTINCT source_type, signal_type
+                    SELECT source_type, signal_type, signal_date
                     FROM signal_sources
                     WHERE ticker = :t
                       AND signal_date BETWEEN :start AND :end
@@ -487,14 +534,25 @@ def edge_multiplier_for_prediction(
         return 1.0
 
     pred_dir = _normalize_prediction_direction(prediction_direction)
-    multipliers: list[float] = []
+
+    # Recency-weighted aggregation. Each signal_sources row produces a
+    # multiplier ``m`` and a recency weight ``w``; we combine into the
+    # geomean as ``Π m_i^(w_i / Σw)``.  Old signals (beyond their
+    # source-type's half-life) automatically shrink toward neutral via
+    # the exponential decay; ancient signals (>_MAX_LOOKBACK_DAYS) drop
+    # out entirely (weight=0).
+    log_weighted_sum = 0.0
+    total_weight = 0.0
+    from math import exp as _exp, log as _log
+
     for r in rows or []:
         try:
             src_type = str(r[0] or "").strip()
             sig_type = str(r[1] or "").strip()
+            row_date = r[2]
         except (TypeError, IndexError):
             continue
-        if not src_type or not sig_type:
+        if not src_type or not sig_type or row_date is None:
             continue
         edge = lookup_edge(src_type, ticker, sig_type)
         if edge is None:
@@ -506,13 +564,22 @@ def edge_multiplier_for_prediction(
             pred_dir,
         )
         m = _ic_to_multiplier(ic)
-        if m != 1.0:
-            multipliers.append(m)
+        if m == 1.0:
+            continue
+        # Recency: how many days back is this signal from the prediction
+        try:
+            row_d = row_date.date() if hasattr(row_date, "date") else row_date
+            age_days = float((sd - row_d).days)
+        except Exception:  # noqa: BLE001
+            continue
+        w = _signal_recency_weight(src_type, age_days)
+        if w <= 0:
+            continue
+        log_weighted_sum += w * _log(m)
+        total_weight += w
 
-    if not multipliers:
+    if total_weight <= 0:
         return 1.0
 
-    from math import exp as _exp, log as _log
-    log_sum = sum(_log(m) for m in multipliers)
-    geomean = _exp(log_sum / len(multipliers))
+    geomean = _exp(log_weighted_sum / total_weight)
     return max(EDGE_MULTIPLIER_MIN, min(EDGE_MULTIPLIER_MAX, geomean))

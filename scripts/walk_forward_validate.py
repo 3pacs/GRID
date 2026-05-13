@@ -1202,11 +1202,23 @@ def walk_forward(
                 pit_hits += 1
             hit = classify_hit(provenance.direction, outcome_verdict)
 
+            # Robustness gate: a HIGH-bucket prediction whose stress
+            # test flags it as fragile is by definition over-confident
+            # — small signal perturbations flip its verdict, so the
+            # +1.15 conviction is barely-over-threshold rather than
+            # genuinely robust. Demote it to MEDIUM so the verdict
+            # buckets are honest. Without this gate, post-#126 every
+            # HIGH prediction was stress-fragile and the bucket's hit
+            # rate cratered (13.2% vs LOW's 33.9%).
+            gated_verdict = provenance.verdict
+            if gated_verdict == "high" and stress_label == "fragile":
+                gated_verdict = "medium"
+
             trade = BacktestTrade(
                 prediction_id=str(row.get("id")),
                 ticker=str(row.get("ticker") or ""),
                 prediction_date=created_at.isoformat(),
-                verdict=provenance.verdict,
+                verdict=gated_verdict,
                 aggregate_conviction=float(provenance.aggregate_conviction),
                 robustness_label=stress_label,
                 robustness_score=stress_score,
