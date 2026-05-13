@@ -90,6 +90,21 @@ def detect_ram_gb():
             return round(bytes_total / 1e9, 1)
     except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
         pass
+    try:
+        result = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory",
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            bytes_total = int(result.stdout.strip())
+            return round(bytes_total / 1e9, 1)
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+        pass
     # Fallback for non-Linux
     try:
         import psutil

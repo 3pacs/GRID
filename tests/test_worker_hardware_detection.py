@@ -20,3 +20,27 @@ def test_detect_ram_gb_uses_macos_sysctl_when_proc_is_missing(monkeypatch):
     monkeypatch.setattr(worker.subprocess, "run", fake_run)
 
     assert worker.detect_ram_gb() == 17.2
+
+
+def test_detect_ram_gb_uses_windows_powershell_when_proc_and_sysctl_are_missing(monkeypatch):
+    from scripts import worker
+
+    def missing_proc(*_args, **_kwargs):
+        raise FileNotFoundError("/proc/meminfo")
+
+    def fake_run(args, **_kwargs):
+        if args == ["sysctl", "-n", "hw.memsize"]:
+            raise FileNotFoundError("sysctl")
+        assert args == [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory",
+        ]
+        return subprocess.CompletedProcess(args, 0, stdout="34359738368\r\n", stderr="")
+
+    monkeypatch.setattr(builtins, "open", missing_proc)
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+
+    assert worker.detect_ram_gb() == 34.4
