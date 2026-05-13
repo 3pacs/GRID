@@ -44,3 +44,7 @@ def test_reconcile_worker_counts_preserves_offline_state():
         2: {"active_jobs": 1, "state": "OFFLINE"},
         3: {"active_jobs": 0, "state": "IDLE"},
     }
+
+
+def test_stale_job_query_locks_jobs_not_outer_joined_workers():
+    assert "FOR UPDATE OF j SKIP LOCKED" in reaper.STALE_JOB_SELECT_SQL

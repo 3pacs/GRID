@@ -14,6 +14,26 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 ACTIVE_JOB_STATES = ("DISPATCHED", "IN_PROGRESS")
 
+STALE_JOB_SELECT_SQL = """
+        SELECT j.id, j.state, j.assigned_worker, j.timeout_seconds,
+               j.created_at, j.queued_at, j.dispatched_at, j.started_at,
+               w.active_jobs AS worker_active_jobs,
+               w.last_heartbeat AS worker_last_heartbeat
+        FROM compute_jobs j
+        LEFT JOIN compute_workers w ON w.id = j.assigned_worker
+        WHERE j.state IN ('DISPATCHED', 'IN_PROGRESS')
+          AND COALESCE(j.started_at, j.dispatched_at, j.queued_at, j.created_at)
+              < NOW() - ((j.timeout_seconds + %s) * INTERVAL '1 second')
+          AND (
+              j.assigned_worker IS NULL
+              OR COALESCE(w.active_jobs, 0) = 0
+              OR w.last_heartbeat < NOW() - (%s * INTERVAL '1 second')
+          )
+        ORDER BY j.id
+        LIMIT %s
+        FOR UPDATE OF j SKIP LOCKED
+        """
+
 
 def _as_utc(dt):
     if dt is None:
@@ -75,28 +95,7 @@ def _dict_rows(rows):
 
 
 def select_stale_jobs(cur, *, grace_seconds: int, limit: int):
-    cur.execute(
-        """
-        SELECT j.id, j.state, j.assigned_worker, j.timeout_seconds,
-               j.created_at, j.queued_at, j.dispatched_at, j.started_at,
-               w.active_jobs AS worker_active_jobs,
-               w.last_heartbeat AS worker_last_heartbeat
-        FROM compute_jobs j
-        LEFT JOIN compute_workers w ON w.id = j.assigned_worker
-        WHERE j.state IN ('DISPATCHED', 'IN_PROGRESS')
-          AND COALESCE(j.started_at, j.dispatched_at, j.queued_at, j.created_at)
-              < NOW() - ((j.timeout_seconds + %s) * INTERVAL '1 second')
-          AND (
-              j.assigned_worker IS NULL
-              OR COALESCE(w.active_jobs, 0) = 0
-              OR w.last_heartbeat < NOW() - (%s * INTERVAL '1 second')
-          )
-        ORDER BY j.id
-        LIMIT %s
-        FOR UPDATE SKIP LOCKED
-        """,
-        (grace_seconds, grace_seconds, limit),
-    )
+    cur.execute(STALE_JOB_SELECT_SQL, (grace_seconds, grace_seconds, limit))
     return _dict_rows(cur.fetchall())
 
 
