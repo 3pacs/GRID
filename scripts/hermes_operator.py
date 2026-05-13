@@ -1112,16 +1112,20 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     cycle_result: dict[str, Any] = {
         "cycle": state.cycle_count,
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "dry_run": bool(dry_run),
     }
 
     log.info("═══ Hermes Operator — Cycle {n} ═══", n=state.cycle_count)
 
     # 0. Git pull — sync latest code/config
-    try:
-        pull_result = git_pull()
-        cycle_result["git_pull"] = pull_result
-    except Exception as exc:
-        log.warning("Git pull failed: {e}", e=str(exc))
+    if dry_run:
+        cycle_result["git_pull"] = {"skipped": "dry_run"}
+    else:
+        try:
+            pull_result = git_pull()
+            cycle_result["git_pull"] = pull_result
+        except Exception as exc:
+            log.warning("Git pull failed: {e}", e=str(exc))
 
     # 1. Health check
     try:
@@ -1160,10 +1164,13 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         return cycle_result
 
     # Ensure issues table exists (first cycle only)
-    try:
-        _ensure_issues_table(engine)
-    except Exception as exc:
-        log.debug("Hermes: issues table ensure failed: {e}", e=str(exc))
+    if dry_run:
+        cycle_result["issues_table"] = {"skipped": "dry_run"}
+    else:
+        try:
+            _ensure_issues_table(engine)
+        except Exception as exc:
+            log.debug("Hermes: issues table ensure failed: {e}", e=str(exc))
 
     state.consecutive_failures = 0
 
@@ -1222,58 +1229,66 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         cycle_result["stale_refreshed"] = stale_repulled
 
     # 3. Smart ingestion — run only due/stale pullers (replaces full pipeline)
-    try:
-        state.current_step = "smart_ingestion"
-        from ingestion.smart_scheduler import SmartScheduler
-        if not hasattr(state, "_smart_sched") or state._smart_sched is None:
-            state._smart_sched = SmartScheduler(engine)
-        tick_result, ok = _run_with_timeout(
-            "smart_ingestion",
-            state._smart_sched.tick,
-            SMART_INGESTION_TIMEOUT_SECONDS,
-            state,
-        )
-        if ok and tick_result:
-            cycle_result["ingestion"] = tick_result
-            log.info(
-                "Smart ingestion: {ok}/{ran} succeeded, {due} still due",
-                ok=tick_result["succeeded"], ran=tick_result["ran"],
-                due=len(tick_result.get("still_due", [])),
+    if dry_run:
+        cycle_result["ingestion"] = {"skipped": "dry_run"}
+        log.info("[DRY RUN] Would run smart ingestion")
+    else:
+        try:
+            state.current_step = "smart_ingestion"
+            from ingestion.smart_scheduler import SmartScheduler
+            if not hasattr(state, "_smart_sched") or state._smart_sched is None:
+                state._smart_sched = SmartScheduler(engine)
+            tick_result, ok = _run_with_timeout(
+                "smart_ingestion",
+                state._smart_sched.tick,
+                SMART_INGESTION_TIMEOUT_SECONDS,
+                state,
             )
-        else:
-            cycle_result["ingestion"] = {"timeout": True}
-    except Exception as exc:
-        log.error("Smart ingestion failed: {e}", e=str(exc))
-        cycle_result["ingestion"] = {"error": str(exc)}
+            if ok and tick_result:
+                cycle_result["ingestion"] = tick_result
+                log.info(
+                    "Smart ingestion: {ok}/{ran} succeeded, {due} still due",
+                    ok=tick_result["succeeded"], ran=tick_result["ran"],
+                    due=len(tick_result.get("still_due", [])),
+                )
+            else:
+                cycle_result["ingestion"] = {"timeout": True}
+        except Exception as exc:
+            log.error("Smart ingestion failed: {e}", e=str(exc))
+            cycle_result["ingestion"] = {"error": str(exc)}
 
     # 3b. Fast SQL resolution (skip slow Python resolver — use INSERT SELECT)
-    try:
-        state.current_step = "resolution"
-        with engine.begin() as conn:
-            # Set statement timeout to avoid blocking the cycle
-            conn.execute(text("SET LOCAL statement_timeout = '120s'"))
-            # Fast bulk resolve: INSERT into resolved_series from raw_series
-            # for any rows pulled in the last hour that don't have resolved entries
-            result = conn.execute(text("""
-                INSERT INTO resolved_series (feature_id, obs_date, value, source_id, resolved_at)
-                SELECT em.feature_id, rs.obs_date, rs.value, rs.source_id, NOW()
-                FROM raw_series rs
-                JOIN entity_map em ON em.series_id = rs.series_id
-                WHERE rs.pull_timestamp > NOW() - INTERVAL '1 hour'
-                AND rs.pull_status = 'SUCCESS'
-                AND NOT EXISTS (
-                    SELECT 1 FROM resolved_series res
-                    WHERE res.feature_id = em.feature_id
-                    AND res.obs_date = rs.obs_date
-                )
-                ON CONFLICT (feature_id, obs_date) DO NOTHING
-            """))
-            res_count = result.rowcount
-        cycle_result["resolution"] = {"rows_resolved": res_count}
-        if res_count:
-            log.info("Fast resolution: {n} new rows", n=res_count)
-    except Exception as exc:
-        log.debug("Resolution: {e}", e=str(exc))
+    if dry_run:
+        cycle_result["resolution"] = {"skipped": "dry_run"}
+        log.info("[DRY RUN] Would run fast resolution")
+    else:
+        try:
+            state.current_step = "resolution"
+            with engine.begin() as conn:
+                # Set statement timeout to avoid blocking the cycle
+                conn.execute(text("SET LOCAL statement_timeout = '120s'"))
+                # Fast bulk resolve: INSERT into resolved_series from raw_series
+                # for any rows pulled in the last hour that don't have resolved entries
+                result = conn.execute(text("""
+                    INSERT INTO resolved_series (feature_id, obs_date, value, source_id, resolved_at)
+                    SELECT em.feature_id, rs.obs_date, rs.value, rs.source_id, NOW()
+                    FROM raw_series rs
+                    JOIN entity_map em ON em.series_id = rs.series_id
+                    WHERE rs.pull_timestamp > NOW() - INTERVAL '1 hour'
+                    AND rs.pull_status = 'SUCCESS'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM resolved_series res
+                        WHERE res.feature_id = em.feature_id
+                        AND res.obs_date = rs.obs_date
+                    )
+                    ON CONFLICT (feature_id, obs_date) DO NOTHING
+                """))
+                res_count = result.rowcount
+            cycle_result["resolution"] = {"rows_resolved": res_count}
+            if res_count:
+                log.info("Fast resolution: {n} new rows", n=res_count)
+        except Exception as exc:
+            log.debug("Resolution: {e}", e=str(exc))
 
     # 4. Fill data gaps — SKIP: SmartScheduler handles freshness now
     # The old gap filler re-pulled entire sources which was slow.
@@ -1749,7 +1764,6 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     try:
         state.current_step = "alpha_heartbeat"
         from alpha_research.heartbeat import run_heartbeat, format_alerts
-        from alpha_research.adapters.signal_adapter import publish_all_alpha_signals
 
         hb_alerts = run_heartbeat(engine)
         if hb_alerts:
@@ -1760,6 +1774,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         }
 
         if not dry_run:
+            from alpha_research.adapters.signal_adapter import publish_all_alpha_signals
             pub_result = publish_all_alpha_signals(engine)
             cycle_result["alpha_signals_published"] = pub_result
             log.info("Alpha signals published: {r}", r=pub_result)
@@ -1841,12 +1856,15 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         log.warning("Tiingo bulk pull failed: {e}", e=str(exc))
 
     # 8. Git push — commit and push any new outputs
-    try:
-        state.current_step = "git_push"
-        push_result = git_push_outputs()
-        cycle_result["git_push"] = push_result
-    except Exception as exc:
-        log.warning("Git push failed: {e}", e=str(exc))
+    if dry_run:
+        cycle_result["git_push"] = {"skipped": "dry_run"}
+    else:
+        try:
+            state.current_step = "git_push"
+            push_result = git_push_outputs()
+            cycle_result["git_push"] = push_result
+        except Exception as exc:
+            log.warning("Git push failed: {e}", e=str(exc))
 
     # 8b. LLM Task Queue status — report throughput and queue depth
     try:
@@ -1861,11 +1879,17 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     elapsed = time.monotonic() - cycle_start
     cycle_result["elapsed_seconds"] = round(elapsed, 1)
     cycle_result["operator_state"] = state.to_dict()
-    save_cycle_snapshot(engine, cycle_result)
+    if dry_run:
+        cycle_result["snapshot"] = {"skipped": "dry_run"}
+        cycle_result["obsidian_report"] = {"skipped": "dry_run"}
+    else:
+        save_cycle_snapshot(engine, cycle_result)
+        cycle_result["snapshot"] = {"status": "attempted"}
 
-    # Fan a heartbeat / event report into the fleet-wide Obsidian agent-hub.
-    # Idempotent: skips on quiet cycles unless the hourly heartbeat is due.
-    _emit_obsidian_cycle_report(state, cycle_result)
+        # Fan a heartbeat / event report into the fleet-wide Obsidian agent-hub.
+        # Idempotent: skips on quiet cycles unless the hourly heartbeat is due.
+        _emit_obsidian_cycle_report(state, cycle_result)
+        cycle_result["obsidian_report"] = {"status": "attempted"}
 
     log.info(
         "═══ Cycle {n} complete — {t:.1f}s ═══",

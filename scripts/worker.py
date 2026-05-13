@@ -80,6 +80,16 @@ def detect_ram_gb():
                     return round(kb / 1024 / 1024, 1)
     except Exception as exc:
         log.warning("Failed to read /proc/meminfo: {e}", e=exc)
+    try:
+        result = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            bytes_total = int(result.stdout.strip())
+            return round(bytes_total / 1e9, 1)
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+        pass
     # Fallback for non-Linux
     try:
         import psutil
