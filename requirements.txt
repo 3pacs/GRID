@@ -69,7 +69,7 @@ tqdm>=4.66.0
 tenacity>=8.2.0
 websockets>=12.0
 pyarrow>=14.0.0
-polars>=0.20.0
+polars>=1.40.1
 
 # ML model training
 xgboost>=3.2.0
