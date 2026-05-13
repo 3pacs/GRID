@@ -685,6 +685,11 @@ def main():
     parser.add_argument("--coordinator", default=DEFAULT_COORDINATOR, help="Coordinator URL")
     parser.add_argument("--max-concurrent", type=int, default=2, help="Max concurrent jobs")
     parser.add_argument(
+        "--hostname",
+        default=None,
+        help="Override the hostname used for coordinator registration.",
+    )
+    parser.add_argument(
         "--heartbeat-only",
         action="store_true",
         help="Register and heartbeat without claiming jobs; useful for fresh node bootstrap.",
@@ -705,7 +710,7 @@ def main():
     gpu_model, gpu_vram = detect_gpu()
     has_ollama = detect_ollama()
     has_docker = detect_docker()
-    hostname = socket.gethostname()
+    hostname = args.hostname or socket.gethostname()
     ts_ip = get_tailscale_ip()
 
     log.info("Hardware: {cores} cores, {ram}GB RAM, GPU={gpu}, Ollama={oll}, Docker={dock}",
