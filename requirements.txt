@@ -83,7 +83,7 @@ xgboost>=3.2.0
 
 # API
 fastapi>=0.109.0
-uvicorn>=0.27.0
+uvicorn>=0.46.0
 python-jose[cryptography]>=3.3.0
 passlib[bcrypt]>=1.7.4
 bcrypt>=4.0,<4.1
