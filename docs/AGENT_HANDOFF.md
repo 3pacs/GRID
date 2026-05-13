@@ -1,18 +1,17 @@
-## 2026-05-13 13:04 UTC — 2026-05-13-1304
-**Why this matters next run:** H12 (TTLCache migrations) — two simple targets remain after PR #147.
+## 2026-05-13 15:15 UTC — 2026-05-13-1510
+**Why this matters next run:** H12 (TTLCache migrations) — both "simple-pattern" router targets are now done; what remains in H12 is non-trivial.
 
-After PR #145 (`_thesis_cache`), PR #146 (`_lever_cache`), and PR #147 (`_risk_map_cache` + `_globe_cache`), the remaining simple `dict[str, Any] = {"data": None, "ts": ...}` cache dicts in `api/routers/` that can use the same TTLCache pattern verbatim:
+After PR #148 (`_actor_graph_cache`) and PR #149 (`_influence_graph_cache`, this run), the two "drop-in TTLCache, copy the test template" targets from the previous handoff are both shipped. Five PRs landed in this thread: #145, #146, #147, #148, #149. The cycle of "1 cache per PR, ~20 LOC, ~100 LOC of tests" still works fine if you find another instance — `grep -rn 'dict\[str, Any\] = {"data": None, "ts":' api/routers/` is the canonical detector.
 
-- `api/routers/intelligence_forensics.py:299` — `_influence_graph_cache`
-- `api/routers/intelligence_actors.py:24` — `_actor_graph_cache`
+**Remaining H12 cache dicts — DO NOT just copy the pattern:**
 
-Each is one PR, ~20 LOC delta. Mirror PR #147's regression-test layout — `tests/test_intelligence_risk_cache.py` is the closest template (single-key cache, no DB calls in the test). The pattern: declare the TTL constant first, then the TTLCache with `max_size=1`, then a `_*_CACHE_KEY = "default"` (or domain-appropriate) constant; replace the inline `from datetime import...` + `(now - ts).total_seconds() < TTL` logic with `_cache.get(KEY)` / `_cache.set(KEY, result)`.
+- `api/routers/intel_cross_reference.py:25-26` — `_cache` + `_cache_locks: dict[str, threading.Lock]`. Already has a per-key lock map, so it's NOT racy in the same way. May not need migrating, or may need a different shape. Read the call sites before touching.
+- `api/routers/canvas.py:92` — `_canvas_graph_cache: dict[tuple[str, int, str, str | None, int], tuple[datetime, dict[str, Any]]]`. Key is a tuple, not a string. `utils.ttl_cache.TTLCache.get/set` types `key: str` — would need either a string-encoded key (`"|".join(map(str, tup))`) or broadening the TTLCache key type. Skip unless willing to do one or the other.
 
-Non-trivial cases (still untouched — do NOT just copy the pattern — verify first):
+Both of those would need an architectural decision, not a routine fix-PR.
 
-- `api/routers/intel_cross_reference.py:25-26` — `_cache` + `_cache_locks: dict[str, threading.Lock]`. This file already has a per-key lock map, so it's NOT racy in the same way as the others. May not need migrating, or may need a different shape. Read the call sites before touching.
-- `api/routers/canvas.py:92` — `_canvas_graph_cache: dict[tuple[str, int, str, str | None, int], tuple[datetime, dict[str, Any]]]`. Key is a tuple, not a string. `utils.ttl_cache.TTLCache.get/set` types `key: str` — would need either a string-encoded key or a small `TTLCache` generic. Skip unless willing to broaden the cache's key type.
+**Test-env note (unchanged from previous handoff, still true):** `tests/conftest.py` pulls in pandas + psycopg2 + python-jose + cryptography>=48 at collection time, so even pure unit tests under `tests/` fail to collect without those installed. On this routine box `python3 -m pytest` and `python3 -m ruff` are both absent — I shipped relying on the visual diff matching PR #148 + AST-parse of both files. CI will pick up real lint + pytest. If you need local runs: previous handoff's pip recipe still applies.
 
-Test-env note: `tests/conftest.py` requires pandas + psycopg2 + python-jose + cryptography>=48 at collection time, so even pure unit tests under `tests/` fail to collect without those installed. If your routine box has `python3 -m pip` available, `pip install pandas pytest fastapi loguru sqlalchemy pydantic-settings psycopg2-binary python-jose passlib bcrypt` plus `pip install --ignore-installed cffi cryptography` was enough to run the new `test_intelligence_risk_cache.py` (the existing debian-shipped cryptography 41.0.7 is too old for `python-jose`).
+**DEV-NOTES-DATA-INTEGRITY.md staleness (unchanged):** Phase 1 (C1-C5) and most of Phase 2 (H1-H4, H7, H8) are already fixed on main even though the doc still lists them. Re-grep the cited file:line before starting work on a Phase 1/2 item.
 
-DEV-NOTES-DATA-INTEGRITY.md Phase 1 (C1-C5) and most of Phase 2 (H1-H4, H7, H8) are already fixed on main even though the doc still lists them. Re-grep the cited file:line before starting work on a Phase 1/2 item — the line numbers are stale and the fix is usually already there. The doc itself is overdue for a refresh, but that requires reading each callout against current code and is a bigger task than a single routine PR.
+**Suggestion for next run if H12 is genuinely tapped out:** H13 (`intelligence/actor_discovery.py:1416` N+1 in actor enrichment) or H14 (`api/routers/chat.py:118` N+1 in watchlist gatherer). Both are single-file batch-query fixes — same shape of PR as the H12 thread, just touching a different layer.
