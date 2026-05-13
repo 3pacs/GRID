@@ -119,6 +119,93 @@ def test_extract_layer1_dict_with_zero_weights_falls_through():
     assert out == {"x": 0.5, "y": 0.5}
 
 
+# ── Nested-blob Layer 1 (the 2026-05-13 fix) ──────────────────────────────
+
+
+def test_extract_layer1_reads_nested_signal_contributions_from_signals_blob():
+    # Pre-2026-05-13 Layer 1 only looked at the top-level key. The live
+    # oracle writes its per-individual-signal breakdown inside the
+    # ``signals`` JSONB column at signals["signal_contributions"], so
+    # Layer 1 always returned empty and the cascade fell through to
+    # the family-level uniform split — producing scorecards keyed by
+    # ``vol``/``macro``/... rather than ``aapl_pcr``/``aapl_iv_atm``/...
+    row = {
+        "id": "p1",
+        "signal_contributions": None,       # top-level absent (current schema)
+        "signals": {
+            "items": [{"name": "aapl_pcr", "family": "vol"}],
+            "regime": "NEUTRAL",
+            "signal_contributions": {
+                "aapl_pcr": 0.4,
+                "aapl_iv_atm": 0.3,
+                "aapl_iv_skew": 0.3,
+            },
+        },
+        "model_name": "ignored",
+    }
+    out = boot.extract_signal_contributions(
+        row, oracle_models_lookup={"ignored": ["vol", "macro"]}
+    )
+    assert set(out) == {"aapl_pcr", "aapl_iv_atm", "aapl_iv_skew"}
+    assert pytest.approx(sum(out.values()), abs=1e-9) == 1.0
+
+
+def test_extract_layer1_top_level_wins_over_nested_when_both_present():
+    # If both are present (legacy + new adapters coexisting), the
+    # top-level breakdown wins. That matches the docstring's "direct
+    # breakdown stored on the prediction row" framing.
+    row = {
+        "signal_contributions": {"top_level": 1.0},
+        "signals": {
+            "signal_contributions": {"nested_a": 0.5, "nested_b": 0.5},
+        },
+        "model_name": None,
+    }
+    out = boot.extract_signal_contributions(row, oracle_models_lookup={})
+    assert out == {"top_level": 1.0}
+
+
+def test_extract_layer1_nested_signals_as_json_string_is_parsed():
+    # signals JSONB may arrive as a string (older psycopg2 paths or
+    # legacy serializers); _parse_jsonb handles it transparently.
+    row = {
+        "signal_contributions": None,
+        "signals": json.dumps({
+            "signal_contributions": {"a": 1.0, "b": 1.0}
+        }),
+        "model_name": None,
+    }
+    out = boot.extract_signal_contributions(row, oracle_models_lookup={})
+    assert out == {"a": 0.5, "b": 0.5}
+
+
+def test_extract_layer1_nested_empty_falls_through_to_layer2():
+    # An empty ``signal_contributions`` inside signals must not be
+    # treated as a successful Layer 1 — keep walking the cascade.
+    row = {
+        "signal_contributions": None,
+        "signals": {"signal_contributions": {}},
+        "model_name": "MACRO_MAESTRO",
+    }
+    out = boot.extract_signal_contributions(
+        row, oracle_models_lookup={"MACRO_MAESTRO": ["rates", "credit"]}
+    )
+    assert out == {"rates": 0.5, "credit": 0.5}
+
+
+def test_extract_layer1_signals_non_dict_falls_through_safely():
+    # signals can be None, a list, a stringly-typed non-JSON value —
+    # none of those should crash; just fall through.
+    for bad in (None, "not-a-dict", "{not json", ["list"], 42):
+        row = {
+            "signal_contributions": None,
+            "signals": bad,
+            "model_name": None,
+        }
+        out = boot.extract_signal_contributions(row, oracle_models_lookup={})
+        assert out == {boot.ORACLE_AGGREGATE_SOURCE: 1.0}, f"failed for {bad!r}"
+
+
 # ── _compose_summary ──────────────────────────────────────────────────────
 
 
