@@ -241,6 +241,77 @@ def _ic_to_multiplier(ic: float) -> float:
     return max(EDGE_MULTIPLIER_MIN, min(EDGE_MULTIPLIER_MAX, mult))
 
 
+# Signal_type → directional implication. Mirrors
+# ``intelligence.trust_scorer._infer_signal_direction`` but inlined
+# here so edge_signals doesn't depend on trust_scorer's import chain.
+# Inferring direction is what lets us flip the IC sign when the
+# oracle's prediction direction opposes the signal's natural direction
+# — see ``_directional_ic`` below.
+_SIGNAL_DIRECTION_BULLISH: frozenset[str] = frozenset({
+    "BUY", "CLUSTER_BUY", "insider_buy", "wsb_bullish", "trade_idea_long",
+    "gov_contracts", "CONTRACT_AWARD",
+})
+_SIGNAL_DIRECTION_BEARISH: frozenset[str] = frozenset({
+    "SELL", "UNUSUAL_SELL", "insider_sell", "wsb_bearish", "trade_idea_short",
+})
+
+
+def _infer_signal_dir(signal_type: str) -> str:
+    """Return 'bullish' / 'bearish' / 'unknown' for a signal_type."""
+    if signal_type in _SIGNAL_DIRECTION_BULLISH:
+        return "bullish"
+    if signal_type in _SIGNAL_DIRECTION_BEARISH:
+        return "bearish"
+    lower = signal_type.lower() if signal_type else ""
+    if any(tok in lower for tok in ("bull", "_buy", "long_", "_long")):
+        return "bullish"
+    if any(tok in lower for tok in ("bear", "_sell", "short_", "_short")):
+        return "bearish"
+    return "unknown"
+
+
+def _normalize_prediction_direction(direction: str) -> str:
+    """Map CALL/PUT/bullish/bearish/long/short to {bullish, bearish, unknown}."""
+    d = (direction or "").strip().lower()
+    if d in ("call", "bullish", "long", "up", "buy"):
+        return "bullish"
+    if d in ("put", "bearish", "short", "down", "sell"):
+        return "bearish"
+    return "unknown"
+
+
+def _directional_ic(
+    ic: float,
+    signal_direction: str,
+    prediction_direction: str,
+) -> float:
+    """Flip IC sign when the signal's natural direction opposes the
+    oracle's prediction direction.
+
+    Semantics:
+      * Aligned (signal direction matches prediction direction):
+        +IC → boost (signal confirms our call AND predictions hit
+        more often when this signal fires).
+        -IC → penalty (signal fires when predictions miss; we're going
+        the same way, so we share the failure mode).
+      * Opposed (signal points the other way from our prediction):
+        +IC → strong penalty. The signal's positive IC was earned by
+        predictions that went the OPPOSITE way of us; our prediction
+        is statistically the minority case here.
+        -IC → boost. The signal historically misfires when present;
+        if it points opposite to us, we're in the "doing the right
+        thing" position relative to the signal's failure mode.
+      * Unknown direction on either side: leave IC as-is — fall back
+        to direction-agnostic boost/penalty (the pre-2026-05-13 path).
+    """
+    if signal_direction == "unknown" or prediction_direction == "unknown":
+        return ic
+    if signal_direction == prediction_direction:
+        return ic
+    # Opposed → flip the sign on the multiplier
+    return -ic
+
+
 def edge_multiplier(
     source_type: str,
     ticker: str,
@@ -357,6 +428,7 @@ def edge_multiplier_for_prediction(
     signal_date: Any,
     *,
     lookback_days: int = 30,
+    prediction_direction: str = "",
 ) -> float:
     """Aggregate EDGE multiplier for a prediction at a given (ticker, date).
 
@@ -414,6 +486,7 @@ def edge_multiplier_for_prediction(
         )
         return 1.0
 
+    pred_dir = _normalize_prediction_direction(prediction_direction)
     multipliers: list[float] = []
     for r in rows or []:
         try:
@@ -423,7 +496,16 @@ def edge_multiplier_for_prediction(
             continue
         if not src_type or not sig_type:
             continue
-        m = edge_multiplier(src_type, ticker, sig_type)
+        edge = lookup_edge(src_type, ticker, sig_type)
+        if edge is None:
+            continue
+        signal_dir = _infer_signal_dir(sig_type)
+        ic = _directional_ic(
+            edge.information_coefficient,
+            signal_dir,
+            pred_dir,
+        )
+        m = _ic_to_multiplier(ic)
         if m != 1.0:
             multipliers.append(m)
 

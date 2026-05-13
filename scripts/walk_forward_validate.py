@@ -582,10 +582,21 @@ def build_time_frozen_provenance(
     # signal_sources lookup costs one short SELECT per prediction
     # and lets the multiplier actually fire.
     from intelligence.edge_signals import edge_multiplier_for_prediction
+    # Pass the prediction's direction so the multiplier flips IC sign
+    # when the signal's natural direction opposes the prediction. Pre-
+    # 2026-05-13 the lookup was direction-agnostic and would happily
+    # boost CALL predictions that had a strongly-bearish insider-SELL
+    # signal on their ticker — which is the inversion that put HIGH
+    # bucket at 14% hit rate.
+    _pred_dir = (
+        str(prediction_row.get("direction") or "")
+        or str(signals.get("direction") or "")
+    )
     edge_signal_multiplier = edge_multiplier_for_prediction(
         engine,
         prediction_row.get("ticker") or "",
         prediction_row.get("created_at"),
+        prediction_direction=_pred_dir,
     )
 
     aggregate = compute_aggregate_conviction(
