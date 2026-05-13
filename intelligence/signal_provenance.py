@@ -249,6 +249,7 @@ def compute_aggregate_conviction(
     convergence_multiplier: float = 1.0,
     money_flow_multiplier: float = 1.0,
     memory_lesson_multiplier: float = 1.0,
+    edge_signal_multiplier: float = 1.0,
 ) -> float:
     """Combine per-signal conviction weights into a single scalar.
 
@@ -309,6 +310,14 @@ def compute_aggregate_conviction(
         MEMORY_LESSON_MULT_MIN,
         min(MEMORY_LESSON_MULT_MAX, float(memory_lesson_multiplier or 1.0)),
     )
+    # 16th layer — EDGE multipliers from the backtest edge_table. Default
+    # 1.0 means "no effect"; non-1.0 only when the caller has computed
+    # the aggregate via ``intelligence.edge_signals
+    # .compute_aggregate_edge_multiplier`` AND
+    # ``GRID_EDGE_SIGNALS_ENABLED`` is on. Bounded the same as a single
+    # edge ([EDGE_MULTIPLIER_MIN, EDGE_MULTIPLIER_MAX]) at the source so
+    # we just need a defensive clamp here matching the existing layers.
+    penalty *= max(0.40, min(1.80, float(edge_signal_multiplier or 1.0)))
 
     return max(0.0, min(1.5, base * penalty))
 
