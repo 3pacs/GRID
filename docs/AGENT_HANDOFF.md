@@ -1,3 +1,33 @@
+## 2026-05-13 19:11 UTC — 2026-05-13-1907
+**Why this matters next run:** The `pd.to_numeric(errors="coerce")` audit (ATTENTION.md #13) in `ingestion/altdata/*.py` is now **fully closed** — every site has a coerce-count log. Don't re-grep this directory.
+
+PR #154 fixes the lone remaining holdout (`indeed_hiring_puller.py::_pull_sectors`, line 368, the per-sector loop). Pattern matches the existing aggregate logger at lines 213-218 of the same file: capture pre/post-NaN delta, emit `log.warning` naming the count + sector. The bookkeeping → MCP `create_or_update_file` workaround is still in force (git push to `routine-bookkeeping` 403s on this box; PR push to `claude-routine/...` works fine).
+
+**One related #13 site survives** (would have busted single-PR scope, both noted in PR #153 handoff):
+- `ingestion/altdata/redfin_puller.py::_store_metrics` (lines 384-390): silently skips rows where `pd.isna(val)` or `float(val)` fails. Per-row `log.warning` would be noisy; the right shape is a summary counter at end of the function. ~10 LOC + a test feeding bad METRIC values. Clean next-PR target — but only after PR #153 lands (otherwise file-claim overlap with the in-flight redfin branch).
+
+**H9 silent-pass candidates — corrections after this run's investigation:**
+
+The previous handoff's three "clean single-line fix" candidates need triage:
+- ✅ `intelligence/hypothesis_engine.py:1738` — outside the protected 1553-1591 block, OK to touch. Genuine silent except. Confirmed.
+- ❌ `intelligence/universe_ranker.py:786` — **OFF LIMITS this routine cycle**. PR #152 just touched this file (different line, 871). Per orchestrator rules ("Read their last-touched files via `git diff --name-only main...<branch>` and AVOID those files this run"), wait until #152 lands.
+- ⚠️  `api/routers/canvas_expand.py:413` — **NOT a silent except**. It's an `else: pass` after `if all_board_nodes:`. The actual bug here is dead code at lines 410-411 (`board_max_x - board_min_x` and `board_max_y - board_min_y` evaluate-and-discard — local vars never used elsewhere). Refactor-cleanup candidate, not an H9 logging fix. Recommend running `refactor-cleaner` agent on this block, not a routine logging PR.
+
+**Next-up routine candidates (order by easiest):**
+1. `intelligence/hypothesis_engine.py:1738` H9 silent except — single-line `pass` → `log.debug(...)` + module's existing test scaffolding. Note the protected block at 1553-1591 (`LEVER_PULLERS_MODE` env-flagged) is OFF-LIMITS per CLAUDE.md.
+2. `ingestion/altdata/redfin_puller.py::_store_metrics` summary counter — only after PR #153 merges.
+3. Broaden H9 grep beyond the 4 named files. The canonical detector from the previous handoff:
+   ```bash
+   grep -rnB1 "^\s*pass\s*$" --include='*.py' api/ ingestion/ intelligence/ orchestration/ analysis/ oracle/ | grep -B1 "except"
+   ```
+   Filter out Langfuse observability shims (commented "Never raises") and `try A; except: try B` fallback patterns — those are intentional.
+
+**Env quirks (unchanged, still in force):**
+- `git push origin routine-bookkeeping` returns HTTP 403 on the receive-pack endpoint. Use MCP `create_or_update_file` for `.grid_backups/routine_log.jsonl` and this file. Push of `claude-routine/...` work branches works fine.
+- `python3 -m pytest` can't collect (conftest imports pandas + psycopg2 + python-jose at module top). `python3 -m py_compile` and `/root/.local/bin/ruff check` both work — use them as the local sanity gate. CI runs full pytest.
+- Loguru → stdlib bridge in `tests/test_redfin_puller.py::test_logs_when_inventory_silently_coerced` is the canonical pattern for asserting `log.warning(...)` via pytest `caplog`. Mirrored verbatim into `tests/test_indeed_hiring_puller.py::test_logs_when_sector_values_silently_coerced` this run; copy it forward for any future H9/H13 logging-test PRs.
+
+---
 ## 2026-05-13 18:22 UTC — 2026-05-13-1810
 **Why this matters next run:** The `pd.to_numeric(errors="coerce")` audit (ATTENTION.md #13) in `ingestion/altdata/*.py` is now fully tapped — don't redo it.
 
