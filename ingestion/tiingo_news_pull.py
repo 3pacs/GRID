@@ -24,7 +24,12 @@ from ingestion.base import BasePuller
 _TIINGO_API_KEY = os.getenv("TIINGO_API_KEY", "")
 _BASE_URL = "https://api.tiingo.com/tiingo/news"
 _REQUEST_TIMEOUT = 30
-_RATE_LIMIT_DELAY = 0.3  # Pro tier
+# Tiingo's /tiingo/news endpoint enforces a per-IP burst limit tighter than
+# the Pro tier overall quota. At 0.3s/call we were hitting 429s constantly
+# (164 errors in 4h on 2026-05-12). 1.1s/call (~55 req/min) stays well under.
+_RATE_LIMIT_DELAY = 1.1
+# 429 backoff: wait this many seconds, then double on each retry (max 3).
+_RATE_LIMIT_BACKOFF_BASE = 5
 
 
 def _tiingo_headers() -> dict[str, str]:
@@ -81,10 +86,22 @@ class TiingoNewsPuller(BasePuller):
         }
 
         try:
-            resp = requests.get(
-                _BASE_URL, headers=_tiingo_headers(),
-                params=params, timeout=_REQUEST_TIMEOUT,
-            )
+            # Retry on 429 with exponential backoff (5s, 10s, 20s).
+            resp = None
+            for attempt in range(3):
+                resp = requests.get(
+                    _BASE_URL, headers=_tiingo_headers(),
+                    params=params, timeout=_REQUEST_TIMEOUT,
+                )
+                if resp.status_code != 429:
+                    break
+                if attempt < 2:
+                    delay = _RATE_LIMIT_BACKOFF_BASE * (2 ** attempt)
+                    log.warning(
+                        "Tiingo 429 on {t} (attempt {a}/3) — backing off {d}s",
+                        t=ticker, a=attempt + 1, d=delay,
+                    )
+                    time.sleep(delay)
             resp.raise_for_status()
             articles = resp.json()
 
