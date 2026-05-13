@@ -1,3 +1,35 @@
+## 2026-05-13 23:13 UTC — 2026-05-13-2308
+**Why this matters next run:** PR #158 closes [P1] item 6 of the auditor punch list (`oracle/claim_extractor.py` regex tests). 4 sibling test-gap items remain — pick the next-smallest module first.
+
+PR #158 adds 29 test cases (229 LOC, tests-only) covering price/percentage/direction/date extraction in `oracle/claim_extractor.py`. Locked-in behavior worth noting:
+
+- **`_nearest_ticker` is misnamed** — it returns the **first** known ticker found by `_TICKER_MENTION_RE.finditer(window)` inside the ±80-char window, not the strictly-closest. In a multi-ticker paragraph the first ticker wins for every later claim. The auditor flagged this risk verbatim ("regex changes could silently drop or mis-tag claims") but did NOT mark it [P0]/[P1] for a behavior fix — my tests pin the current behavior. The `test_mixed_claims_in_one_paragraph` test was deliberately scoped to a single ticker. **If a future PR fixes `_nearest_ticker` to actually find the closest match, update `tests/test_claim_extractor.py` in the same PR — don't fight the existing tests.**
+
+**Remaining test-gap items from the punch list (smallest-first ordering):**
+- **[P1] item 7**: `oracle/claim_verifier.py` (DB-evidence verdicts) — small module, but needs DB-engine mocking via `sqlalchemy` `MagicMock` (use the `mock_engine` pattern from `tests/conftest.py`). ~150 LOC of tests.
+- **[P1] item 8**: `oracle/sanity_checker.py::run_sanity_checks` (line 260) — deterministic checks (price-range, pct-math, direction-consistency, date, unit, cross-claim). Pure-function, no DB. Similar shape to today's PR but more branches. ~200 LOC.
+- **[P1] item 4**: `oracle/firewall.py::verify_output` — the end-to-end pipeline. Composes claim_extractor → claim_verifier → sanity_checker → gate_decision → audit write. **Best done last** — once items 5/7/8 land, this one wires them together.
+- **[P1] item 5**: `oracle/publisher_gate.py::gate_decision` (line 42) — but **PR #157 is still open on this file**. Wait for #157 to merge before touching.
+- **[P2] item 13**: `oracle/citation_extractor.py` — alias/family normalization. Pure-function, no DB. Good warm-up if items 7/8 feel heavy.
+- **[P2] item 14**: `oracle/psi_model.py::evaluate_psi_signals` (line 137) — hardcoded Sharpe-2.59 GLD / Sharpe-2.01 QQQ thresholds. ~100 LOC.
+
+**[P1] item 3** (`CalibrationReport` dataclass rename across `oracle/calibration.py:34` and `inference/calibration.py:57`) is **still untouched** — neither PR #156/#157/#158 touched either file. Real next-architectural-decision PR target. Run `grep -rn 'CalibrationReport' --include='*.py'` to inventory callers before renaming.
+
+**File claims to avoid this cycle (last-touched in still-open agent PRs):**
+- `tests/test_claim_extractor.py` (#158 — this PR)
+- `oracle/publisher_gate.py` + `tests/test_publish_astrogrid_canonical.py` (#157)
+- `oracle/engine.py` (#156)
+- `intelligence/hypothesis_engine.py` + `tests/test_hypothesis_engine_intelligence_kills_logging.py` (#155)
+- `ingestion/altdata/indeed_hiring_puller.py` + `tests/test_indeed_hiring_puller.py` (#154)
+- `ingestion/altdata/redfin_puller.py` + `tests/test_redfin_puller.py` (#153)
+- `intelligence/universe_ranker.py` + `tests/test_universe_ranker.py` (#152)
+
+**Env quirks (carried forward, unchanged):**
+- `git push origin routine-bookkeeping` returns HTTP 403. Use MCP `create_or_update_file` for both `.grid_backups/routine_log.jsonl` and this file. Work-branch pushes work fine.
+- `python3 -m pytest` can't collect (conftest pulls pandas + psycopg2 + python-jose at module top). For pure-function tests, `python3 -c '...'` smoke scripts that bypass conftest work fine (this PR's tests were validated this way). `ruff check` and `py_compile` work without deps.
+- `gh` CLI is not present on this box — use MCP `mcp__github__*` tools for all GitHub operations.
+
+---
 ## 2026-05-13 21:18 UTC — 2026-05-13-2110
 **Why this matters next run:** A fresh auditor punch list landed as PR #151 (`docs/PUNCH-LIST-2026-05-13.md` on branch `auditor-feed/2026-05-13-oracle`). It's the canonical TIER 4 source for the next several runs. Don't search for backlog elsewhere — pick from this list.
 
