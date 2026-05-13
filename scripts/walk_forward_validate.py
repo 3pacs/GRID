@@ -499,6 +499,8 @@ class _FrozenPrediction:
 def build_time_frozen_provenance(
     prediction_row: dict[str, Any],
     scorecards_at_time: dict[str, SignalScorecard],
+    *,
+    engine: Any = None,
 ) -> TradeProvenanceReport:
     """Reconstruct a ``TradeProvenanceReport`` using only data that existed
     at the prediction's ``created_at``.
@@ -567,13 +569,23 @@ def build_time_frozen_provenance(
     red_team_risk = float(signals.get("red_team_epistemic_risk", 0.0) or 0.0)
 
     # EDGE-table multiplier — no-op (returns 1.0) when
-    # ``GRID_EDGE_SIGNALS_ENABLED`` is off, so production behaviour is
-    # unchanged until the operator opts in. When on, rolls up the
-    # backtest's per-(source, ticker) IC into a geomean conviction
-    # adjustment for the contributing signals.
-    from intelligence.edge_signals import compute_aggregate_edge_multiplier
-    edge_signal_multiplier = compute_aggregate_edge_multiplier(
-        signal_evidence, prediction_row.get("ticker") or "",
+    # ``GRID_EDGE_SIGNALS_ENABLED`` is off (or no engine passed), so
+    # production behaviour is unchanged until the operator opts in.
+    #
+    # We route through ``edge_multiplier_for_prediction`` rather than
+    # ``compute_aggregate_edge_multiplier(signal_evidence, ticker)``
+    # because the edge_table keys on signal-source ``source_type``
+    # (insider / quiverquant:offexchange / smart_money / ...), which
+    # is the ``signal_sources`` table's schema — not the Shapley
+    # feature names that ``signal_evidence.signal_source`` carries
+    # (equity / vol / ci_full / aapl_pcr / ...). Bridging via a
+    # signal_sources lookup costs one short SELECT per prediction
+    # and lets the multiplier actually fire.
+    from intelligence.edge_signals import edge_multiplier_for_prediction
+    edge_signal_multiplier = edge_multiplier_for_prediction(
+        engine,
+        prediction_row.get("ticker") or "",
+        prediction_row.get("created_at"),
     )
 
     aggregate = compute_aggregate_conviction(
@@ -1247,7 +1259,7 @@ def walk_forward(
                 as_of=created_at,
                 horizon_days=row_horizon,
             )
-            provenance = build_time_frozen_provenance(enriched, scorecards)
+            provenance = build_time_frozen_provenance(enriched, scorecards, engine=engine)
 
             try:
                 stress = run_stress_test(provenance)

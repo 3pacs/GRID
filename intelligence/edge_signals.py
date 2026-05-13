@@ -349,3 +349,88 @@ def apply_multiplier(
     multiplier shape. Pure — no side effects.
     """
     return float(base_conviction) * edge_multiplier(source_type, ticker, signal_direction)
+
+
+def edge_multiplier_for_prediction(
+    engine: Any,
+    ticker: str,
+    signal_date: Any,
+    *,
+    lookback_days: int = 30,
+) -> float:
+    """Aggregate EDGE multiplier for a prediction at a given (ticker, date).
+
+    The walk_forward / decision_gateway callsites that work in terms of
+    Shapley feature names cannot match the edge_table directly — the
+    edge_table is keyed by signal-source ``source_type`` (e.g. ``insider``,
+    ``quiverquant:offexchange``, ``smart_money``), which is the schema of
+    the raw ``signal_sources`` table, not of the Shapley contribution
+    breakdown. This helper bridges that gap:
+
+      1. Pull all ``signal_sources`` rows for ``ticker`` whose
+         ``signal_date`` lies in ``[signal_date - lookback_days, signal_date]``.
+      2. For each (source_type, signal_type), look up the matching EDGE.
+      3. Return the geomean of per-row multipliers, clipped to bounds.
+
+    Returns 1.0 when the master switch is off, no engine is provided, the
+    query fails, or no signal_sources rows fall in the window.
+    """
+    if not EDGE_SIGNALS_ENABLED or engine is None or not ticker or signal_date is None:
+        return 1.0
+
+    # Lazy SQLAlchemy import — keeps the module loadable in test harnesses
+    # that don't have a DB.
+    try:
+        from sqlalchemy import text  # noqa: WPS433
+    except Exception:  # noqa: BLE001
+        return 1.0
+
+    try:
+        sd = signal_date.date() if hasattr(signal_date, "date") else signal_date
+    except Exception:  # noqa: BLE001
+        return 1.0
+
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT DISTINCT source_type, signal_type
+                    FROM signal_sources
+                    WHERE ticker = :t
+                      AND signal_date BETWEEN :start AND :end
+                    """
+                ),
+                {
+                    "t": str(ticker).upper().strip(),
+                    "start": sd - __import__("datetime").timedelta(days=int(lookback_days)),
+                    "end": sd,
+                },
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        log.debug(
+            "edge_signals.edge_multiplier_for_prediction: query failed "
+            "({t}, {d}): {e}", t=ticker, d=sd, e=str(exc),
+        )
+        return 1.0
+
+    multipliers: list[float] = []
+    for r in rows or []:
+        try:
+            src_type = str(r[0] or "").strip()
+            sig_type = str(r[1] or "").strip()
+        except (TypeError, IndexError):
+            continue
+        if not src_type or not sig_type:
+            continue
+        m = edge_multiplier(src_type, ticker, sig_type)
+        if m != 1.0:
+            multipliers.append(m)
+
+    if not multipliers:
+        return 1.0
+
+    from math import exp as _exp, log as _log
+    log_sum = sum(_log(m) for m in multipliers)
+    geomean = _exp(log_sum / len(multipliers))
+    return max(EDGE_MULTIPLIER_MIN, min(EDGE_MULTIPLIER_MAX, geomean))
