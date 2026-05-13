@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -51,6 +52,42 @@ from db import get_engine
 
 _VAULT_SESSIONS = Path("/data/grid_obsidian/Sessions")
 _MIN_OCCURRENCES_FOR_SIGNAL = 50  # ignore tail noise
+
+# Postmortems written before this date used the pre-fix signal_adapter
+# that emitted regime signals (credit_cycle, vix_exposure, etc.) with
+# directional mappings — those mappings inflated their appearance in
+# signals_right/wrong arrays and would push the advisory to mis-prescribe
+# directional weight overrides on signals that are now NEUTRAL by design.
+# See alpha_research/adapters/signal_adapter.py:156-180.
+# Default corpus cutoff is permissive — the postmortem flow is largely
+# dormant since 2026-05-01 (only 14 rows since vs ~85K in the
+# Apr 27-May 1 batch), so a tight cutoff yields an empty advisory.
+# The regime-signal NAME filter (_REGIME_SIGNAL_NAMES) is what
+# actually keeps stale directional rows from poisoning the result.
+# Override via env if you want a tighter window once new postmortems
+# start flowing.
+_POSTMORTEM_CORPUS_CUTOFF = os.environ.get(
+    "GRID_AUTOIMPROVE_CUTOFF", "2025-01-01",
+)
+
+# Regime-class signals: ticker-agnostic state classifiers that route
+# OTHER signals' weights (per the credit_cycle routing in
+# oracle/engine.py:_get_credit_cycle_routing). Should never appear in
+# the directional star/bad advisory; if they do, the corpus has stale
+# rows. Filter unconditionally.
+_REGIME_SIGNAL_NAMES: frozenset[str] = frozenset({
+    "alpha_research:vix_exposure",
+    "alpha_research:credit_cycle",
+    "alpha_research:dual_horizon_equity",
+})
+
+
+def _is_regime_signal(signal_name: str) -> bool:
+    """Regime signals are state classifiers, not directional bets. They
+    appear in old postmortems with the pre-2026-04-28 directional
+    mappings; exclude them so the advisory doesn't mis-prescribe.
+    """
+    return signal_name in _REGIME_SIGNAL_NAMES
 
 
 def _is_per_ticker_feature(signal_name: str) -> bool:
@@ -92,13 +129,17 @@ def _signal_ratios(conn) -> list[dict[str, Any]]:
                 WHEN jsonb_typeof(signals_right::jsonb) = 'array'
                 THEN signals_right::jsonb ELSE '[]'::jsonb END) AS sig,
                 'right' AS side
-            FROM trade_postmortems WHERE signals_right IS NOT NULL
+            FROM trade_postmortems
+            WHERE signals_right IS NOT NULL
+              AND generated_at >= CAST(:cutoff AS date)
             UNION ALL
             SELECT jsonb_array_elements_text(CASE
                 WHEN jsonb_typeof(signals_wrong::jsonb) = 'array'
                 THEN signals_wrong::jsonb ELSE '[]'::jsonb END) AS sig,
                 'wrong' AS side
-            FROM trade_postmortems WHERE signals_wrong IS NOT NULL
+            FROM trade_postmortems
+            WHERE signals_wrong IS NOT NULL
+              AND generated_at >= CAST(:cutoff AS date)
         )
         SELECT sig,
                SUM(CASE WHEN side='right' THEN 1 ELSE 0 END) AS right_ct,
@@ -108,7 +149,10 @@ def _signal_ratios(conn) -> list[dict[str, Any]]:
              + SUM(CASE WHEN side='wrong' THEN 1 ELSE 0 END) >= :min_n
         ORDER BY ABS(SUM(CASE WHEN side='right' THEN 1 ELSE 0 END)
                   - SUM(CASE WHEN side='wrong' THEN 1 ELSE 0 END)) DESC
-    """), {"min_n": _MIN_OCCURRENCES_FOR_SIGNAL}).fetchall()
+    """), {
+        "min_n": _MIN_OCCURRENCES_FOR_SIGNAL,
+        "cutoff": _POSTMORTEM_CORPUS_CUTOFF,
+    }).fetchall()
     out: list[dict[str, Any]] = []
     for r in rows:
         right_ct, wrong_ct = int(r[1] or 0), int(r[2] or 0)
@@ -192,16 +236,23 @@ def build_advisory(engine) -> dict[str, Any]:
     """Run all the queries and assemble the advisory dict."""
     with engine.connect() as conn:
         signal_ratios = _signal_ratios(conn)
-        # Filter out per-ticker / regional features — their right/wrong
-        # ratios are tautologies of postmortems-only-run-on-failures.
-        # Only cross-cutting signals get meaningful ratios.
+        # Filter out per-ticker / regional features — tautologies of
+        # postmortems-only-run-on-failures. Also filter regime signals
+        # which are state classifiers that route OTHER signals'
+        # weights, NOT directional bets — their old appearances in
+        # signals_right/wrong reflect a pre-2026-04-28 bug.
         cross_cutting = [
             s for s in signal_ratios
             if not _is_per_ticker_feature(s["signal"])
+            and not _is_regime_signal(s["signal"])
         ]
         per_ticker_excluded = [
             s for s in signal_ratios
             if _is_per_ticker_feature(s["signal"])
+        ]
+        regime_excluded = [
+            s for s in signal_ratios
+            if _is_regime_signal(s["signal"])
         ]
         # split into stars (right/wrong >= 2) and underperformers (<= 0.5)
         stars = [s for s in cross_cutting if s["right_to_wrong_ratio"] >= 2.0]
@@ -225,6 +276,11 @@ def build_advisory(engine) -> dict[str, Any]:
         "per_ticker_features_excluded": [
             {"signal": s["signal"], "right_count": s["right_count"], "wrong_count": s["wrong_count"]}
             for s in per_ticker_excluded[:20]
+        ],
+        "regime_signals_excluded": [
+            {"signal": s["signal"], "right_count": s["right_count"], "wrong_count": s["wrong_count"],
+             "note": "regime signal (routes other signals' weights, not directional)"}
+            for s in regime_excluded[:20]
         ],
     }
 
