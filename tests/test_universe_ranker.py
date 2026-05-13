@@ -556,3 +556,32 @@ class TestPersistRanking:
         )
         result = persist_ranking(engine, report)
         assert result == -1
+
+
+# ── main() CLI entrypoint ────────────────────────────────────────────────
+
+
+class TestMainCli:
+    def test_engine_bootstrap_failure_logs_and_writes_stderr(
+        self, monkeypatch, capsys
+    ) -> None:
+        """Engine bootstrap failure must surface as log.error AND stderr
+        (not silent stdout) so it lands in errors.jsonl and the CLI user
+        sees the failure on the proper stream."""
+        fake_db = types.ModuleType("db")
+
+        def _boom() -> object:
+            raise RuntimeError("engine offline")
+
+        fake_db.get_engine = _boom  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "db", fake_db)
+
+        rc = ur.main(["--universe", "AAPL"])
+
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert "engine offline" in captured.err
+        assert "engine bootstrap failed" in captured.err
+        # The error message must not leak to stdout — stdout is reserved
+        # for the narrative/ranking report.
+        assert "engine bootstrap failed" not in captured.out
