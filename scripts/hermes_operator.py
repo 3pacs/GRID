@@ -1863,12 +1863,142 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     cycle_result["operator_state"] = state.to_dict()
     save_cycle_snapshot(engine, cycle_result)
 
+    # Fan a heartbeat / event report into the fleet-wide Obsidian agent-hub.
+    # Idempotent: skips on quiet cycles unless the hourly heartbeat is due.
+    _emit_obsidian_cycle_report(state, cycle_result)
+
     log.info(
         "═══ Cycle {n} complete — {t:.1f}s ═══",
         n=state.cycle_count, t=elapsed,
     )
     state.current_step = "idle"
     return cycle_result
+
+
+# ─── Obsidian fan-out ────────────────────────────────────────────────
+
+# How often Hermes emits a "everything's fine" heartbeat report to the
+# agent hub. Default 12 cycles ≈ 60 minutes at the 5-min cycle interval.
+# Override with HERMES_OBSIDIAN_REPORT_EVERY_N_CYCLES env var; set 0 to
+# disable cadence-based heartbeats entirely (event-only reports remain on).
+HERMES_OBSIDIAN_REPORT_EVERY_N_CYCLES = int(
+    os.environ.get("HERMES_OBSIDIAN_REPORT_EVERY_N_CYCLES", "12") or "0"
+)
+HERMES_OBSIDIAN_REPORT_CMD = os.environ.get(
+    "HERMES_OBSIDIAN_REPORT_CMD", "/usr/local/bin/agent-report"
+)
+
+
+def _cycle_did_something(cycle_result: dict[str, Any]) -> tuple[bool, list[str]]:
+    """Returns (did_something, event_labels). Used to decide whether to
+    file an event-driven Obsidian report on top of the cadence heartbeat."""
+    events: list[str] = []
+    health = cycle_result.get("health") or {}
+    if health.get("overall_healthy") is False:
+        events.append("health-degraded")
+    pull_fixer = cycle_result.get("pull_fixer") or {}
+    retried = int(pull_fixer.get("retried") or 0)
+    if retried > 0:
+        events.append(f"pulls-retried={retried}")
+    if cycle_result.get("pipeline"):
+        events.append("pipeline-ran")
+    weekly = cycle_result.get("weekly_intelligence_reports")
+    if weekly:
+        events.append(f"weekly-reports={len(weekly)}")
+    autoresearch = cycle_result.get("autoresearch") or {}
+    hypotheses = autoresearch.get("hypotheses_generated") or 0
+    if hypotheses:
+        events.append(f"hypotheses={hypotheses}")
+    return (bool(events), events)
+
+
+def _build_obsidian_cycle_body(
+    cycle_result: dict[str, Any], events: list[str]
+) -> str:
+    """Build a short Markdown body for the agent-hub report. Cycle context
+    + health snapshot + any noteworthy events. Kept under ~30 lines so the
+    Obsidian feed stays scannable."""
+    health = cycle_result.get("health") or {}
+    db = health.get("db") or {}
+    hermes = health.get("hermes") or {}
+    cycle_n = cycle_result.get("cycle", "?")
+    elapsed = cycle_result.get("elapsed_seconds", "?")
+    raw_count = db.get("raw_series_count")
+    latest_pull = db.get("latest_pull")
+    failed_24h = db.get("failed_pulls_24h")
+    failed_1h = db.get("failed_pulls_1h")
+    overall = health.get("overall_healthy")
+    overall_str = "healthy" if overall else "degraded"
+
+    lines = [
+        f"# Hermes cycle {cycle_n} — {overall_str}",
+        "",
+        f"- elapsed: {elapsed}s",
+        f"- db.healthy: {db.get('healthy')!r}",
+        f"- hermes.healthy: {hermes.get('healthy')!r}",
+    ]
+    if raw_count is not None:
+        lines.append(f"- raw_series rows: {raw_count:,}")
+    if latest_pull:
+        lines.append(f"- latest pull: {latest_pull}")
+    if failed_1h is not None:
+        lines.append(f"- failed pulls (1h / 24h): {failed_1h} / {failed_24h}")
+    if events:
+        lines.append("")
+        lines.append("## Events this cycle")
+        for ev in events:
+            lines.append(f"- {ev}")
+    return "\n".join(lines) + "\n"
+
+
+def _emit_obsidian_cycle_report(state: Any, cycle_result: dict[str, Any]) -> None:
+    """Fan a hermes-cycle report into the agent hub. Fail-soft: any error
+    is logged and swallowed so a broken hub never breaks the operator loop."""
+    try:
+        cycle_n = int(cycle_result.get("cycle") or state.cycle_count)
+        did_something, events = _cycle_did_something(cycle_result)
+
+        cadence = HERMES_OBSIDIAN_REPORT_EVERY_N_CYCLES
+        cadence_due = (cadence > 0 and cycle_n % cadence == 0)
+
+        if not did_something and not cadence_due:
+            return  # quiet cycle, skip to keep the feed scannable
+
+        if not os.path.exists(HERMES_OBSIDIAN_REPORT_CMD):
+            log.debug(
+                "obsidian-report wrapper missing at {p}; skipping fan-out",
+                p=HERMES_OBSIDIAN_REPORT_CMD,
+            )
+            return
+
+        body = _build_obsidian_cycle_body(cycle_result, events)
+        # Slug: short, sortable, low-collision. Hub dedups on
+        # (date, agent, host, slug).
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%MZ")
+        slug = f"hermes-cycle-{cycle_n}-{timestamp}"
+
+        # Write body to /tmp and invoke agent-report. Cap stdout / stderr
+        # at 2KB each so any noisy wrapper output doesn't fill the log.
+        body_path = f"/tmp/hermes-{slug}.md"
+        with open(body_path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+
+        rc = subprocess.run(
+            [HERMES_OBSIDIAN_REPORT_CMD, "hermes-operator", slug, body_path],
+            capture_output=True, text=True, timeout=20,
+        )
+        if rc.returncode == 0:
+            log.info(
+                "obsidian-report: filed hermes-cycle-{n} ({events})",
+                n=cycle_n, events=",".join(events) or "heartbeat",
+            )
+        else:
+            log.warning(
+                "obsidian-report: agent-report rc={rc} stderr={se}",
+                rc=rc.returncode, se=(rc.stderr or "")[:512],
+            )
+    except Exception as exc:
+        log.warning("obsidian-report fan-out failed: {e}", e=str(exc))
 
 
 def main(args: list[str] | None = None) -> None:
