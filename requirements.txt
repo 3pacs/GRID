@@ -4,7 +4,7 @@
 # ============================================================
 
 # Database
-psycopg2-binary>=2.9.9
+psycopg2-binary>=2.9.12
 sqlalchemy>=2.0.0
 alembic>=1.13.0
 
