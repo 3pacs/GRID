@@ -277,6 +277,10 @@ def worker_complete_update_sql() -> str:
     )
 
 
+def clear_job_error_sql() -> str:
+    return "UPDATE compute_jobs SET error_message=NULL WHERE id=%s"
+
+
 # ── Endpoints ──────────────────────────────────────────────────
 
 @app.on_event("startup")
@@ -487,6 +491,7 @@ async def claim_job(
 
         job_id = row["id"]
         transition_job(cur, job_id, JobState.DISPATCHED, f"claimed by worker {worker_id}", worker_id)
+        cur.execute(clear_job_error_sql(), (job_id,))
 
         # Update worker active count and heartbeat in the same transaction as the claim.
         cur.execute(worker_claim_update_sql(), (worker_id,))
@@ -526,6 +531,7 @@ async def complete_job(job_id: int, result: JobResult):
             cur.execute("UPDATE compute_jobs SET error_message=%s WHERE id=%s", (result.error, job_id))
         else:
             transition_job(cur, job_id, JobState.COMPLETED, "worker reported completion", result.worker_id)
+            cur.execute(clear_job_error_sql(), (job_id,))
 
         # Store result
         cur.execute(

@@ -31,3 +31,9 @@ def test_completion_update_decrements_and_sets_state_atomically():
     assert "CASE WHEN GREATEST(active_jobs-1,0) > 0 THEN 'BUSY' ELSE 'IDLE' END" in sql
     assert "last_heartbeat=NOW()" in sql
     assert "WHERE id=%s" in sql
+
+
+def test_job_error_clear_sql_is_scoped_to_one_job():
+    sql = coordinator.clear_job_error_sql()
+
+    assert sql == "UPDATE compute_jobs SET error_message=NULL WHERE id=%s"
