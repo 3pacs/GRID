@@ -88,10 +88,22 @@ def _spawn_worker(
     days: int,
     max_rows: int | None,
     log_dir: Path,
+    sub_idx: int = 0,
+    workers_per_provider: int = 1,
 ) -> subprocess.Popen[bytes]:
-    """Fork a single-worker subprocess pinned to ``provider``."""
+    """Fork a single-worker subprocess pinned to ``provider``.
+
+    When ``workers_per_provider`` > 1, sub_idx identifies which sub-worker
+    on this provider (0..workers_per_provider-1). Each worker still owns
+    a unique partition slice — partitions are P × workers_per_provider
+    where P is the number of providers. So fanning out 5 providers × 2
+    workers = 10 parallel partitions, served by 5 LLM endpoints with 2
+    concurrent requests each (requires OLLAMA_NUM_PARALLEL >= 2 on the
+    endpoint side).
+    """
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"worker-{partition_idx}-{provider}.log"
+    suffix = f"-sub{sub_idx}" if workers_per_provider > 1 else ""
+    log_path = log_dir / f"worker-{partition_idx}-{provider}{suffix}.log"
 
     env = os.environ.copy()
     env["LLM_ORACLE_PROVIDER"] = provider
@@ -189,6 +201,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="Internal: this process is one partition worker.")
     ap.add_argument("--providers", nargs="+", default=_DEFAULT_PROVIDERS,
                     help="LLM provider names to fan out across.")
+    ap.add_argument("--workers-per-provider", type=int, default=1,
+                    help="Sub-workers per provider. Useful when an LLM "
+                         "endpoint serves multiple concurrent requests "
+                         "(e.g., OLLAMA_NUM_PARALLEL=2 on the server "
+                         "side). Each sub-worker still gets its own "
+                         "modulus partition. Default 1.")
     ap.add_argument("--days", type=int, default=30)
     ap.add_argument("--max-rows", type=int, default=None,
                     help="Cap total rows processed across all workers.")
@@ -207,10 +225,14 @@ def main(argv: list[str] | None = None) -> int:
     providers = list(args.providers)
     partitions = len(providers)
 
+    wpp = max(1, int(args.workers_per_provider))
+    n_workers = partitions * wpp
     print(f"=== parallel_postmortem_runner ===")
     print(f"  candidates: {n_trade:,} trades + {n_pred:,} predictions = {total:,}")
-    print(f"  partitions: {partitions} (providers: {', '.join(providers)})")
-    print(f"  per worker (approx): {total // max(partitions, 1):,} candidates")
+    print(f"  providers ({partitions}): {', '.join(providers)}")
+    print(f"  workers per provider: {wpp}")
+    print(f"  total parallel workers: {n_workers}")
+    print(f"  per worker (approx): {total // max(n_workers, 1):,} candidates")
     print(f"  max-rows total: {args.max_rows if args.max_rows is not None else 'unlimited'}")
     print(f"  log dir: {args.log_dir}")
 
@@ -225,11 +247,19 @@ def main(argv: list[str] | None = None) -> int:
     log_dir = Path(args.log_dir)
     started = time.time()
     procs: list[tuple[subprocess.Popen[bytes], str, int]] = []
-    for idx, provider in enumerate(providers):
-        p = _spawn_worker(provider, idx, partitions, args.days, args.max_rows, log_dir)
-        procs.append((p, provider, idx))
 
-    print(f"\n{len(procs)} workers spawned. Tailing logs in {log_dir}/")
+    total_partitions = partitions * wpp
+    for prov_idx, provider in enumerate(providers):
+        for sub_idx in range(wpp):
+            partition_idx = prov_idx * wpp + sub_idx
+            p = _spawn_worker(
+                provider, partition_idx, total_partitions,
+                args.days, args.max_rows, log_dir,
+                sub_idx=sub_idx, workers_per_provider=wpp,
+            )
+            procs.append((p, provider, partition_idx))
+
+    print(f"\n{len(procs)} workers spawned ({wpp} per provider × {partitions} providers). Tailing logs in {log_dir}/")
 
     # Wait for all workers
     exit_codes = []
