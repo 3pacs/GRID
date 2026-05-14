@@ -1,3 +1,26 @@
+## 2026-05-14 06:20 UTC — 2026-05-14-0605
+**Why this matters next run:** PR #165 closes [P1] item 5 (`gate_decision` tests). The prior two handoffs said item 5 was "blocked on #157 merge" — **that was wrong, and the next agent should not trust 'blocked on file claim' reasoning without checking the actual diff.**
+
+Why it wasn't blocked: #157's branch diff to `oracle/publisher_gate.py` only *removes* the `publish_astrogrid_prediction` block (lines 156+) and rewrites the imports — `gate_decision` (lines 42–153) is byte-identical on both `main` and #157's branch. Item 5 adds a brand-new file `tests/test_publisher_gate.py`; #157's only test-file claim is `tests/test_publish_astrogrid_canonical.py`. Zero overlap. The STEP-1 "avoid files touched by open agent branches" rule is about *files you would edit*, not files that merely share a module name with your new test. Check `git diff --name-only main...<branch>` and confirm real overlap before self-blocking.
+
+PR #165 adds 22 tests (tests-only). `pytest --noconftest tests/test_publisher_gate.py` → 22 passed in 0.26s. Ruff clean. Behavior pinned worth noting:
+- **Auto-publish threshold is inclusive `>=` 0.85** — avg confidence exactly 0.85 auto-publishes; 0.84 falls through to the *default* publish branch ("Mixed verdicts...") with `score=avg_confidence`, NOT to review. A fully-supported, no-flag, low-confidence set still publishes.
+- **Reject precedence**: `contradicted` is checked before `critical_fail`, and both before any flag/review logic. A claim that is both contradicted and critical-fail returns the contradicted branch.
+- **`flagged > 0` always routes to review** regardless of the `_REVIEW_REWRITE_RATIO` (0.30) threshold — the ratio comparison is effectively dead code given the `or flagged > 0`. Pinned but not "fixed" (out of scope).
+- **`avg_confidence` is over ALL claims** including `insufficient` ones (default conf 0.5), so an insufficient claim can drag a supported set below the auto-publish line.
+
+**PUNCH-LIST-2026-05-13 status — oracle test-gap chain is now FULLY CLOSED:**
+- DONE: items 1–8, 13, 14 (PRs #156–165). Items 3/4/5/6/7/8/13/14 all merged-or-open as test/fix PRs.
+- **REMAINING, genuinely blocked/architectural:**
+  - [P1] item 9 — Signal positional-arg bug, `oracle/engine.py:812`. Real bug. *Actually* blocked: the fix edits `oracle/engine.py` directly, and #156 holds a file claim on that exact file. Wait for #156 to merge.
+  - [P2] items 10/11/12 — split/refactor `oracle/engine.py`. Architectural, needs operator, also #156-blocked.
+- **Next run will almost certainly be no-work on the punch list.** Fallback: a DEV-NOTES H10 non-CLI `print()` → `log` conversion in an unclaimed module (see the 2026-05-14-0413 leave-alone list below), or a clean no-work entry. Do not thrash.
+
+**File claims to avoid next cycle (new this run):** `tests/test_publisher_gate.py` (#165). Prior still-open claims unchanged — see the 2026-05-14-0413 list below; #152–164 all still open.
+
+**Env note:** unchanged from 05:25 entry — no python deps preinstalled (`pip install loguru sqlalchemy pytest ruff`, ~30s), `gh` absent (MCP only), `routine-bookkeeping` push 403 → use `create_or_update_file`, `mcp__github__list_pull_requests` output exceeds the tool-result limit (delegate the slice to a subagent or use `search_pull_requests`).
+
+---
 ## 2026-05-14 05:25 UTC — 2026-05-14-0510
 **Why this matters next run:** PR #164 closes [P1] item 3 (`CalibrationReport` dataclass-name collision) — the LAST non-blocked PUNCH-LIST-2026-05-13 item. The routine queue is now genuinely empty/stuck: all remaining oracle/ items are blocked behind un-merged agent PRs or need operator input. Next agent should expect to log a no-work entry unless #156/#157 have merged.
 
