@@ -1,3 +1,45 @@
+## 2026-05-14 02:14 UTC — 2026-05-14-0210
+**Why this matters next run:** PR #161 closes [P2] item 14 (`oracle/psi_model.py` PSI+VIX gating tests). With items 13 & 14 done, the remaining test-gap items are **[P1] item 7** (`oracle/claim_verifier.py` — DB-mock-required, heaviest) and **[P1] item 4** (`oracle/firewall.py::verify_output` — best done LAST after 5/7 land). [P1] item 5 (`oracle/publisher_gate.py`) is still file-claimed by PR #157.
+
+PR #161 adds 33 test cases (385 LOC, tests-only) covering every behavior of `oracle/psi_model.py`: `_check_psi_condition` lt/gt strict-comparison at threshold + unknown-op fallback; `_load_latest_value` happy/empty/coercion paths via a MagicMock engine that mirrors `engine.connect().__enter__().execute().fetchone()`; `evaluate_psi_signals` with `_load_latest_value` monkeypatched across 6 PSI/VIX combinations (PSI-missing, all-lt-triggered, qqq-only, VIX-at-threshold, VIX-required-but-None, no-mans-land); confidence scaling cap/floor; `build_astrogrid_prediction_payload` required-keys / UUID validity / static fields / signal-field threading / uniqueness; `run_psi_oracle` glue; `_PSI_CONFIGS` structural integrity. Smoke-run: `pytest --noconftest` → 33 passed in 0.26s. Ruff clean.
+
+Behavior locked in by tests worth noting for any future refactor:
+
+- **Both PSI and VIX gates are strict (`<` / `>`)** — value equal to threshold does NOT trigger. Pinned by `test_check_psi_condition_lt_and_gt` (5.25 fails lt 5.25; 2.0 fails gt 2.0) and `test_evaluate_vix_at_threshold_does_not_trigger` (VIX=22.0 skips `vix_lt22` config). A future "use <=" flip should update these tests in the same PR.
+- **`_check_psi_condition` silently returns False on unknown op** (no exception). Pinned by `test_check_psi_condition_unknown_op_returns_false`. If a future PR adds an `eq`/`ne`/`gte` op, update the parametrise and add an explicit raise if you want strict validation.
+- **Confidence formula is `min(0.95, max(0.3, (sharpe-1)/3 + 0.3))`** — cap 0.95 above Sharpe ≈ 2.95; floor 0.3 below Sharpe = 1.0. Pinned by `test_confidence_scaling_matches_formula` (parametrised on 4 Sharpe values).
+- **`_PSI_CONFIGS` integrity test rejects duplicate names** — adding a new config with a name collision will fail `test_psi_configs_names_are_unique`. Adding a new `psi_op` (e.g. `lte`) or `direction` (e.g. `flat`) without updating `_check_psi_condition` AND the dataclass-field set will fail `test_psi_configs_have_required_keys`. Update both in the same PR.
+- **`build_astrogrid_prediction_payload` is non-deterministic** (uses `uuid4()` and `datetime.now(timezone.utc)`). Tests assert UUID validity, not equality between calls. Pinned by `test_payloads_have_unique_prediction_ids`.
+
+**Remaining unclaimed punch-list items (smallest-first ordering):**
+
+- **[P1] item 7**: `oracle/claim_verifier.py` (DB-evidence verdicts). Needs DB-engine `MagicMock` per #161 pattern (`engine.connect().__enter__().execute()` chain, `side_effect` keyed on `params["name"]`). ~150 LOC. Heaviest remaining test item.
+- **[P1] item 4**: `oracle/firewall.py::verify_output` — end-to-end pipeline. Composes claim_extractor → claim_verifier → sanity_checker → gate_decision → audit write. **Best done last** — wait for items 5/7 to land first.
+- **[P1] item 5**: `oracle/publisher_gate.py::gate_decision` (line 42) — **PR #157 still open on this file**. Wait for #157 to merge before touching `publisher_gate.py` to avoid file-claim overlap.
+- **[P1] item 3**: `CalibrationReport` dataclass rename across `oracle/calibration.py:34` and `inference/calibration.py:57`. **Still untouched through PRs #156-161.** Real next-architectural-decision PR target — needs operator input on which name wins. Run `grep -rn 'CalibrationReport' --include='*.py'` to inventory callers before renaming.
+- **[P1] item 9**: Signal positional-arg mismatch in `_gather_signals_from_registry` (`oracle/engine.py:812`). Real bug — z-score stored in `value` field, `z_score=0` → registry-sourced signals contribute zero downstream at line 1371. **Still blocked on PR #156 merge** (file claim on `oracle/engine.py`).
+- **[P2] items 10-12**: Splits/refactors of `oracle/engine.py`. Architectural; coordinate with operator.
+
+**File claims to avoid this cycle (last-touched in still-open agent PRs):**
+- `tests/test_psi_model.py` (#161 — this PR)
+- `tests/test_citation_extractor.py` (#160)
+- `tests/test_sanity_checker.py` (#159)
+- `tests/test_claim_extractor.py` (#158)
+- `oracle/publisher_gate.py` + `tests/test_publish_astrogrid_canonical.py` (#157)
+- `oracle/engine.py` (#156)
+- `intelligence/hypothesis_engine.py` + `tests/test_hypothesis_engine_intelligence_kills_logging.py` (#155)
+- `ingestion/altdata/indeed_hiring_puller.py` + `tests/test_indeed_hiring_puller.py` (#154)
+- `ingestion/altdata/redfin_puller.py` + `tests/test_redfin_puller.py` (#153)
+- `intelligence/universe_ranker.py` + `tests/test_universe_ranker.py` (#152)
+
+**Env quirks (carried forward, unchanged):**
+- `git push origin routine-bookkeeping` returns HTTP 403. Use MCP `create_or_update_file` for both `.grid_backups/routine_log.jsonl` and this file. Work-branch pushes work fine.
+- `python3 -m pytest` fails at conftest collection (pandas + psycopg2 + python-jose imported at module top). Use `pytest tests/test_X.py --noconftest` for pure-function test files. Needs `pip install pytest loguru sqlalchemy` (sqlalchemy only if the module imports it — `psi_model.py` does). `ruff check` and `py_compile` work after `pip install ruff`.
+- `gh` CLI is not present on this box — use MCP `mcp__github__*` tools for all GitHub operations.
+- `mcp__github__list_pull_requests` returns >220KB which exceeds tool-result limits; slice with python via the saved tool-result file, or use `search_pull_requests` with a tighter query.
+- `pytest --noconftest` is the cleanest way to bypass the conftest pandas import — `--rootdir=/tmp` and `cd /tmp` are not enough; pytest still walks up to find conftest.py.
+
+---
 ## 2026-05-14 01:15 UTC — 2026-05-14-0109
 **Why this matters next run:** PR #160 closes [P2] item 13 of the auditor punch list (`oracle/citation_extractor.py` alias/family tests). Next-smallest unclaimed punch-list item is **[P2] item 14** (`oracle/psi_model.py::evaluate_psi_signals` PSI+VIX gating thresholds, ~100 LOC, pure-function). After that, the remaining test-gap is [P1] item 7 (`oracle/claim_verifier.py` — heavier, needs DB-engine `MagicMock` per #158 handoff).
 
@@ -104,62 +146,3 @@ PR #158 adds 29 test cases (229 LOC, tests-only) covering price/percentage/direc
 - `git push origin routine-bookkeeping` returns HTTP 403. Use MCP `create_or_update_file` for both `.grid_backups/routine_log.jsonl` and this file. Work-branch pushes work fine.
 - `python3 -m pytest` can't collect (conftest pulls pandas + psycopg2 + python-jose at module top). For pure-function tests, `python3 -c '...'` smoke scripts that bypass conftest work fine (this PR's tests were validated this way). `ruff check` and `py_compile` work without deps.
 - `gh` CLI is not present on this box — use MCP `mcp__github__*` tools for all GitHub operations.
-
----
-## 2026-05-13 21:18 UTC — 2026-05-13-2110
-**Why this matters next run:** A fresh auditor punch list landed as PR #151 (`docs/PUNCH-LIST-2026-05-13.md` on branch `auditor-feed/2026-05-13-oracle`). It's the canonical TIER 4 source for the next several runs. Don't search for backlog elsewhere — pick from this list.
-
-PR #156 closes its first [P0] item (oracle/engine.py duplicate horizon helpers). The auditor's claim that the second `_horizon_key` had a divergent `canonical[days]` shortcut absent in the first is **stale** — both copies are now byte-identical (`difflib.unified_diff` returned empty). I verified this before deleting the second block. If you read the punch list verbatim, do **not** spend a context window investigating "which version is correct" — they're equal.
-
-**Remaining items in the auditor punch list, in priority order:**
-- **[P0] item 2**: Collapse the two `publish_astrogrid_prediction` implementations (`oracle/publish.py:51` vs `oracle/publisher_gate.py:195`). Astrogrid path via `api/routers/astrogrid_helpers.py:77` skips the conviction-stack enrichment that `oracle/publish.py` does. This is **not** a byte-identical dedupe like #156 — the two functions diverge in behavior. Real architectural decision: which signature wins? Consider opening as a discussion before a fix-PR, or scope it as "have `astrogrid_helpers` route through `oracle.publish.publish_astrogrid_prediction` and delete the un-enriched copy."
-- **[P1] item 3**: Duplicate `CalibrationReport` dataclass (`oracle/calibration.py:34` vs `inference/calibration.py:57`). Same name, different field shapes. Cross-import is a footgun. Cleanest: rename one to `OracleCalibrationReport` or `InferenceCalibrationReport`; check callers first.
-- **[P1] items 4–8**: 5 separate "add unit tests for X" items, each scoped to a different oracle/ module (firewall, publisher_gate, claim_extractor, claim_verifier, sanity_checker, citation_extractor, psi_model). Each is a clean single-PR target. Pick the smallest module first — `oracle/claim_extractor.py` regex testing is a good starter.
-- **[P1] item 9**: Signal positional-arg mismatch at `oracle/engine.py:812`. `Signal(name, family, z, 0, sig_dir, conf, 0)` puts z-score in the `value` field and sets `z_score=0`, so registry-sourced signals contribute zero downstream at `oracle/engine.py:1371` whenever `GRID_SIGNAL_REGISTRY=1` is enabled. This is a real bug, not just hygiene. Check the `Signal` dataclass field order before fixing.
-- **[P2] items 10–14**: Splits/refactors of `oracle/engine.py` (now 2,721 LOC after #156). These are architectural; coordinate with operator before opening.
-
-**File claims to avoid this cycle (last-touched in still-open agent PRs):**
-- `intelligence/hypothesis_engine.py` + `tests/test_hypothesis_engine_intelligence_kills_logging.py` (#155)
-- `ingestion/altdata/indeed_hiring_puller.py` + `tests/test_indeed_hiring_puller.py` (#154)
-- `ingestion/altdata/redfin_puller.py` + `tests/test_redfin_puller.py` (#153)
-- `intelligence/universe_ranker.py` + `tests/test_universe_ranker.py` (#152)
-
-`oracle/engine.py` was just touched by this run (#156). If the next agent picks [P1] item 9 (Signal positional-arg mismatch, line 812), wait for #156 to merge first to avoid file-claim overlap.
-
-**Env quirk discovered this run:** On this routine box, `git checkout main` followed by `git reset --soft origin/main` left the working tree showing the *old* local-main state as "modified" files (23-commit drift). `git restore --source=HEAD --worktree --staged .` cleanly synced the tree without touching any real user work. Use that instead of `git reset --hard` (which is blacklisted by orchestrator rules). Numpy/pandas/loguru/sqlalchemy are not pre-installed but `pip install` works for local smoke tests.
-
-**Env quirks (carried forward, unchanged):**
-- `git push origin routine-bookkeeping` returns HTTP 403. Use MCP `create_or_update_file` for `.grid_backups/routine_log.jsonl` and this file. Work-branch pushes work fine.
-- `python3 -m pytest` can't collect (conftest pulls pandas + psycopg2 + python-jose at module top). Use `python3 -c '...'` smoke scripts that bypass conftest, plus `py_compile` and `ruff` as the local gate. CI runs full pytest.
-- `gh` CLI is not present on this box — use MCP `mcp__github__*` tools for all GitHub operations.
-
----
-## 2026-05-13 20:13 UTC — 2026-05-13-2007
-**Why this matters next run:** H9 audit on `intelligence/hypothesis_engine.py` is now half-done — 3 silent passes fixed (1702/1719/1737, all inside `_check_intelligence_kills`), 4 remain in the same file. Inspected them; here's the triage so the next agent doesn't waste a context window.
-
-PR #155 fixes the inner three silent `except: pass` blocks in `_check_intelligence_kills` (LEVER_DIVERGED / FORENSIC_CONTRADICTION / TRUST_COLLAPSED subchecks). Each routes the swallowed exception through `log.debug` while preserving the `return None` graceful-degradation flow. Uses the canonical loguru→stdlib `caplog` bridge from `tests/test_redfin_puller.py` (also used in PR #154's test file).
-
-**Remaining H9 sites in this file (4) — triage:**
-
-- **Line 972 (`_apply_intelligence_boost` wrapper around `_check_intelligence_kills`)**: outer try/except guarding the same function PR #155 just fixed internally. Same shape, same severity, same fix pattern (`except Exception as exc: log.debug("hypothesis_engine: intelligence_kills wrapper failed: {e}", e=exc)`). Cleanest next pick. ~3 LOC + 1 test that monkeypatches `_check_intelligence_kills` to raise.
-- **Line 853 (`_apply_intelligence_boost` around `_get_intelligence_boost`)**: same sibling-shape as 972. Could be combined with 972 into one PR ("log boost+kill wrapper failures") if you want to keep PR count low — same method, same pattern. ~6 LOC total.
-- **Line 1518 (`_log_boost` SQL INSERT into `hypothesis_boost_log`)**: silent DB write failure. Should probably be `log.warning` not `log.debug` — losing boost-tracking rows degrades calibration. ~3 LOC.
-- **Line 1530 (`_update_boost_outcomes` SQL UPDATE on `hypothesis_boost_log`)**: same shape as 1518, same severity. Could be combined with 1518 ("log boost-table write failures") — both in the same boost-logging cluster. ~6 LOC total.
-
-**One thing NOT to do:** The protected lever-pullers density block at lines 1553-1591 (env-flagged on `LEVER_PULLERS_MODE`) is OFF-LIMITS per CLAUDE.md. None of the 4 remaining H9 sites are inside it (853/972 < 1509, 1518/1530 < 1553), so any of the four is safe to touch — just don't expand scope into the block.
-
-**One related #13 site still survives** (carried forward from previous handoffs):
-- `ingestion/altdata/redfin_puller.py::_store_metrics` (lines 384-390): silently skips rows where `pd.isna(val)` or `float(val)` fails. Per-row `log.warning` would be noisy; right shape is a summary counter at end of the function. **PR #153 (redfin_puller _detect_inventory_anomalies) still open** — wait for it to merge before touching this same file, otherwise file-claim overlap.
-
-**H9 elsewhere — canonical detector + filters:**
-```bash
-grep -rnB1 "^\s*pass\s*$" --include='*.py' api/ ingestion/ intelligence/ orchestration/ analysis/ oracle/ | grep -B1 "except"
-```
-Filter out: Langfuse observability shims (commented "Never raises"), `try A; except: try B` fallback patterns. The actually-silent ones tend to cluster in legacy intelligence/* code and in API router caches.
-
-**Env quirks (unchanged, still in force):**
-- `git push origin routine-bookkeeping` returns HTTP 403 on receive-pack. Use MCP `create_or_update_file` for both `.grid_backups/routine_log.jsonl` and this file. Push of `claude-routine/...` work branches works fine.
-- `python3 -m pytest` can't collect (conftest imports pandas + psycopg2 + python-jose at module top). For an actual local smoke run on a logging fix, write a `python3 -c '...'` script that bypasses conftest — see PR #155's smoke run for the recipe (install pandas + loguru + sqlalchemy via `pip install`, then monkeypatch the import target and assert the bridged caplog records). Works without DB.
-- Loguru → stdlib bridge in `tests/test_redfin_puller.py::test_logs_when_inventory_silently_coerced` remains the canonical pytest pattern for asserting `log.warning(...)` / `log.debug(...)` via `caplog`. Mirrored verbatim into `tests/test_indeed_hiring_puller.py` (PR #154) and `tests/test_hypothesis_engine_intelligence_kills_logging.py` (this PR).
-
----
