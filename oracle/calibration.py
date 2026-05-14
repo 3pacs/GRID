@@ -31,8 +31,13 @@ class CalibrationBucket:
 
 
 @dataclass
-class CalibrationReport:
-    """Full calibration report for the Oracle."""
+class OracleCalibrationReport:
+    """Full calibration report for the Oracle.
+
+    Named ``OracleCalibrationReport`` (not ``CalibrationReport``) to avoid a
+    silent collision with :class:`inference.calibration.CalibrationReport`,
+    which has a different field shape (Brier decomposition + recommendations).
+    """
     buckets: list[CalibrationBucket]
     brier_score: float         # 0 = perfect, 1 = worst
     calibration_error: float   # Mean absolute calibration error (ECE)
@@ -68,7 +73,7 @@ def compute_calibration(
     n_bins: int = 10,
     model_name: str | None = None,
     ticker: str | None = None,
-) -> CalibrationReport:
+) -> OracleCalibrationReport:
     """Compute calibration curve from scored predictions.
 
     Args:
@@ -78,7 +83,7 @@ def compute_calibration(
         ticker: Optional filter by ticker.
 
     Returns:
-        CalibrationReport with buckets, Brier score, ECE, and label.
+        OracleCalibrationReport with buckets, Brier score, ECE, and label.
     """
     query = """
         SELECT confidence, verdict
@@ -99,7 +104,7 @@ def compute_calibration(
         rows = conn.execute(text(query), params).fetchall()
 
     if not rows:
-        return CalibrationReport(
+        return OracleCalibrationReport(
             buckets=[], brier_score=0.0, calibration_error=0.0,
             sharpness=0.0, label="insufficient_data",
             total_predictions=0, overall_accuracy=0.0,
@@ -178,7 +183,7 @@ def compute_calibration(
         else:
             label = "underconfident"
 
-    report = CalibrationReport(
+    report = OracleCalibrationReport(
         buckets=buckets,
         brier_score=brier,
         calibration_error=ece,
