@@ -1,3 +1,39 @@
+## 2026-05-14 00:22 UTC — 2026-05-14-0016
+**Why this matters next run:** PR #159 closes [P1] item 8 of the auditor punch list (`oracle/sanity_checker.py` deterministic checks). 3 sibling test-gap items remain — see ordering below.
+
+PR #159 adds 41 test cases (367 LOC, tests-only) covering every check in `oracle/sanity_checker.py`: price_range, pct_math, direction_consistency, date_sanity, unit_sanity, cross_claim, plus the `run_sanity_checks` composer (input order, critical_fail flag, warn-vs-fail handling). Pure-function tests; smoke-ran via `python3 -c '...'` outside conftest (numpy/pandas/psycopg2 not installed, loguru + sqlalchemy were pip-installed for the smoke run only).
+
+Behavior locked in by tests worth noting for any future refactor:
+
+- **Direction `verdict="ambiguous"` is currently un-asserted**: `_check_direction_consistency` returns `pass` for everything except `"contradicted"`. Tested with `supported` and `insufficient`; `ambiguous` (the 4th `Verdict` literal) isn't covered because the current code-shape doesn't branch on it — a refactor that adds an `ambiguous` branch should update the test in the same PR.
+- **`_check_pct_math` tolerance is ±3 percentage-points**, not ±3% relative. Test `test_pct_math_tolerates_within_three_points` pins this (claimed 12% vs actual 10% → diff 2.0 ≤ 3.0 → pass). If the tolerance is ever tightened, this test will fail loudly.
+- **Cross-claim warn does NOT mark `critical_fail`** — only `fail` does. Test `test_run_sanity_checks_warn_does_not_mark_critical` pins this. Important if the gate ever wants warns to gate publishing.
+
+**Remaining test-gap items from the punch list (smallest-first ordering):**
+- **[P1] item 7**: `oracle/claim_verifier.py` (DB-evidence verdicts) — needs DB-engine mocking via `sqlalchemy` `MagicMock` (use the `mock_engine` pattern from `tests/conftest.py` if present, else assemble a `MagicMock` whose `.connect().__enter__().execute()` returns parametrised rows). ~150 LOC of tests. This is the heaviest remaining item.
+- **[P1] item 4**: `oracle/firewall.py::verify_output` — the end-to-end pipeline. Composes claim_extractor → claim_verifier → sanity_checker → gate_decision → audit write. **Best done last** — once items 5/7 land, this one wires them together.
+- **[P1] item 5**: `oracle/publisher_gate.py::gate_decision` (line 42) — **PR #157 collapse-duplicate is still open**; wait for it to merge before touching `publisher_gate.py` to avoid file-claim overlap.
+- **[P2] item 13**: `oracle/citation_extractor.py` — alias/family normalization. Pure-function, no DB. Same shape as #158 + #159 (regex-style + small composer). Best warm-up if claim_verifier feels heavy.
+- **[P2] item 14**: `oracle/psi_model.py::evaluate_psi_signals` (line 137) — hardcoded Sharpe-2.59 GLD / Sharpe-2.01 QQQ thresholds. ~100 LOC.
+
+**[P1] item 3** (`CalibrationReport` dataclass rename across `oracle/calibration.py:34` and `inference/calibration.py:57`) is **still untouched** through PRs #156/#157/#158/#159. Real next-architectural-decision PR target — needs operator input on which name wins. Run `grep -rn 'CalibrationReport' --include='*.py'` to inventory callers before renaming.
+
+**File claims to avoid this cycle (last-touched in still-open agent PRs):**
+- `tests/test_sanity_checker.py` (#159 — this PR)
+- `tests/test_claim_extractor.py` (#158)
+- `oracle/publisher_gate.py` + `tests/test_publish_astrogrid_canonical.py` (#157)
+- `oracle/engine.py` (#156)
+- `intelligence/hypothesis_engine.py` + `tests/test_hypothesis_engine_intelligence_kills_logging.py` (#155)
+- `ingestion/altdata/indeed_hiring_puller.py` + `tests/test_indeed_hiring_puller.py` (#154)
+- `ingestion/altdata/redfin_puller.py` + `tests/test_redfin_puller.py` (#153)
+- `intelligence/universe_ranker.py` + `tests/test_universe_ranker.py` (#152)
+
+**Env quirks (carried forward, unchanged):**
+- `git push origin routine-bookkeeping` returns HTTP 403. Use MCP `create_or_update_file` for both `.grid_backups/routine_log.jsonl` and this file. Work-branch pushes work fine.
+- `python3 -m pytest` can't collect (conftest pulls pandas + psycopg2 + python-jose at module top). For pure-function tests, `python3 -c '...'` smoke scripts that bypass conftest work fine (this PR's tests were validated this way — `pip install loguru sqlalchemy` was needed; pandas/psycopg2 were not since sanity_checker has no DB calls). `ruff check` and `py_compile` work without deps.
+- `gh` CLI is not present on this box — use MCP `mcp__github__*` tools for all GitHub operations.
+
+---
 ## 2026-05-13 23:13 UTC — 2026-05-13-2308
 **Why this matters next run:** PR #158 closes [P1] item 6 of the auditor punch list (`oracle/claim_extractor.py` regex tests). 4 sibling test-gap items remain — pick the next-smallest module first.
 
@@ -160,43 +196,3 @@ The two narrative prints at lines 887, 889 of `universe_ranker.py` are still the
 **Env quirk discovered this run:** `git push origin routine-bookkeeping` returns HTTP 403 on the receive-pack endpoint in this routine box (info/refs succeeds — only the actual upload is denied). Push of the **work branch** (`claude-routine/...`) worked fine in the same session, so it's specific to the bookkeeping branch via git CLI. Workaround that worked: write the log entry / handoff via the GitHub MCP `create_or_update_file` tool — those land server-side and bypass the proxy. If `git push routine-bookkeeping` fails for the next agent too, switch to MCP immediately rather than retrying with exponential backoff.
 
 ---
-
-## 2026-05-13 16:08 UTC — 2026-05-13-1608
-**Why this matters next run:** DEV-NOTES-DATA-INTEGRITY.md is no longer misleading — annotations on main reflect actual state. H13 and H14 are DONE, not next-up.
-
-PR #150 annotates DEV-NOTES with `Status` columns. Verified against origin/main on 2026-05-13:
-- Phase 1 (C1-C5) all done. Phase 2 (H1-H8) all done. H13, H14, H15, H17, H21 all done.
-- H12 has 5 PRs in flight (#145-#149) covering 6 caches. The 3 remaining caches need arch decisions:
-  - `intel_cross_reference.py:25` already has per-key lock map (different shape; may not need migration)
-  - `canvas.py:92` uses tuple key (TTLCache types `key: str`)
-  - `surfacer.py:1507-1510` are function-locals, not globals — likely not a thread issue at all
-
-**Genuinely open work, in scope-order:**
-- H9: 281 swallowed exceptions across 82 files. Biggest concentrations: llm_taskqueue.py (26), mcp_server.py (24), system.py (19), chat.py (17). Each file is a clean single-PR slice. Replace `pass` with `log.warning(...)` — don't change behaviour.
-- H10: 1,217 print() statements. BUT — most prints in `intelligence/*.py` are inside `if __name__ == "__main__":` CLI blocks (entity_resolver: 37, cross_reference: 12, source_audit: 9, trust_scorer: 4, sleuth: 8, universe_ranker: 3 — all guarded by `__main__`). Those are legitimate stdout — leave them. The genuine targets are library-code prints; the routine on this box found very few. Search with `grep -B1 -A0 '^\s*print(' file.py | grep -B1 __main__` style to filter, or check `ingestion/` which the doc says has bulk prints.
-- H11: Several files already split (flow_thesis.py → flow_thesis_data + flow_thesis_scoring; causation.py → causation_core + causation_graph + causation_scoring). Remaining big targets: `llm_taskqueue.py`, `hermes_operator.py`. Splits are architectural — coordinate with operator before opening.
-- H12: tapped for routine pattern. The three remaining caches are architectural.
-
-**Don't repeat my detour:** I verified H13 and H14 (the previous handoff's "next-up" suggestions) and both are already implemented on main with batched `ANY(:fids)` / `ANY(:aids)` queries. The DEV-NOTES annotations now record that — don't re-investigate.
-
-**Test-env note (unchanged):** `python3 -m pytest` and `python3 -m ruff` absent on this routine box; rely on CI to verify lint + tests.
-
----
-
-## 2026-05-13 15:15 UTC — 2026-05-13-1510
-**Why this matters next run:** H12 (TTLCache migrations) — both "simple-pattern" router targets are now done; what remains in H12 is non-trivial.
-
-After PR #148 (`_actor_graph_cache`) and PR #149 (`_influence_graph_cache`, this run), the two "drop-in TTLCache, copy the test template" targets from the previous handoff are both shipped. Five PRs landed in this thread: #145, #146, #147, #148, #149. The cycle of "1 cache per PR, ~20 LOC, ~100 LOC of tests" still works fine if you find another instance — `grep -rn 'dict\[str, Any\] = {"data": None, "ts":' api/routers/` is the canonical detector.
-
-**Remaining H12 cache dicts — DO NOT just copy the pattern:**
-
-- `api/routers/intel_cross_reference.py:25-26` — `_cache` + `_cache_locks: dict[str, threading.Lock]`. Already has a per-key lock map, so it's NOT racy in the same way. May not need migrating, or may need a different shape. Read the call sites before touching.
-- `api/routers/canvas.py:92` — `_canvas_graph_cache: dict[tuple[str, int, str, str | None, int], tuple[datetime, dict[str, Any]]]`. Key is a tuple, not a string. `utils.ttl_cache.TTLCache.get/set` types `key: str` — would need either a string-encoded key (`"|".join(map(str, tup))`) or broadening the TTLCache key type. Skip unless willing to do one or the other.
-
-Both of those would need an architectural decision, not a routine fix-PR.
-
-**Test-env note (unchanged from previous handoff, still true):** `tests/conftest.py` pulls in pandas + psycopg2 + python-jose + cryptography>=48 at collection time, so even pure unit tests under `tests/` fail to collect without those installed. On this routine box `python3 -m pytest` and `python3 -m ruff` are both absent — I shipped relying on the visual diff matching PR #148 + AST-parse of both files. CI will pick up real lint + pytest. If you need local runs: previous handoff's pip recipe still applies.
-
-**DEV-NOTES-DATA-INTEGRITY.md staleness (unchanged):** Phase 1 (C1-C5) and most of Phase 2 (H1-H4, H7, H8) are already fixed on main even though the doc still lists them. Re-grep the cited file:line before starting work on a Phase 1/2 item.
-
-**Suggestion for next run if H12 is genuinely tapped out:** H13 (`intelligence/actor_discovery.py:1416` N+1 in actor enrichment) or H14 (`api/routers/chat.py:118` N+1 in watchlist gatherer). Both are single-file batch-query fixes — same shape of PR as the H12 thread, just touching a different layer.
