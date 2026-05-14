@@ -1,3 +1,17 @@
+## 2026-05-14 23:24 UTC — 2026-05-14-2304
+**Why this matters next run:** The routine queue is empty AND the standing print()->log fallback is now exhausted too — do NOT re-scan `intelligence/*.py` for print conversions, it's all CLI output.
+
+No-work run. Walked all 7 tiers: TIER0 main-CI fix is claimed by branch `claude/fix-backend-tests-main-ci`; TIER1 no codex-authored PRs (the 3 `codex/*` branches have no open PR); TIER2/3 no AUTO_IMPROVE/hermes/TOP docs; TIER4 PUNCH-LIST-2026-05-13 is fully worked — items 1-9,13,14 → PRs #156-166; items 10-12 are architectural `oracle/engine.py` splits/refactors, file-claimed by #156/#166 and need operator sign-off; TIER5 TODO-DUP-WRITES is blocked on an operator product decision (Step 1 picks A/B/C) and TODO-DATA-AUDIT needs DB access this box does not have; TIER6 no labeled issues.
+
+**DEV-NOTES H10 print->log fallback is exhausted — verified, do not retry:** every remaining `print()` in `intelligence/*.py` sits inside an `if __name__ == "__main__"` CLI block (entity_resolver, rag, cross_reference, source_audit, sleuth, trust_scorer, market_diary all confirmed — legitimate CLI output, leave them). `ingestion/*.py` has zero non-CLI prints. `hypothesis_engine.py` still has 26 indented prints but is file-claimed by #155. Remaining print work would need a different dir (scripts/, dashboard.py, api/) — out of the handoff's intended scope and not clean routine material.
+
+**H9 DEV-NOTES counts are stale:** DEV-NOTES lists "mcp_server.py (24)" swallowed exceptions — checked, all 28 except-blocks there already `log.debug(...)` or `return {error}`. Not an H9 target. Don't trust DEV-NOTES H9 file counts without grepping the file first.
+
+**Bottom line:** unless #156/#157 have merged (and the operator has signed off on the engine.py split for items 10-12), or a fresh PUNCH-LIST / TOP / AUTO_IMPROVE doc has landed on main, expect another no-work. Log it fast — don't thrash hunting for cleanup.
+
+**Env (carried forward, all still true):** no python deps preinstalled (`pip install ...` as needed, ~30s-2min); `gh` CLI absent — MCP `mcp__github__*` only; `git push origin routine-bookkeeping` → 403, use `create_or_update_file`; `mcp__github__list_pull_requests` / `search_pull_requests` output exceeds the tool-result limit — parse the saved tool-result file with python, or scope the query tighter.
+
+---
 ## 2026-05-14 06:20 UTC — 2026-05-14-0605
 **Why this matters next run:** PR #165 closes [P1] item 5 (`gate_decision` tests). The prior two handoffs said item 5 was "blocked on #157 merge" — **that was wrong, and the next agent should not trust 'blocked on file claim' reasoning without checking the actual diff.**
 
