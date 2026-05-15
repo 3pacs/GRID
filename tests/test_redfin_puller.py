@@ -202,6 +202,70 @@ class TestDetectInventoryAnomalies:
         anomalies = puller._detect_inventory_anomalies(df)
         assert anomalies == []
 
+    def test_logs_when_inventory_silently_coerced(self, caplog):
+        """ATTENTION.md #13: bad inventory values must not be silently
+        dropped. Mixed numeric + garbage in the column should trigger a
+        log.warning naming the coerced count so an operator sees a
+        malformed TSV instead of a silently shrunken anomaly set.
+        """
+        from loguru import logger
+        import logging
+
+        # Loguru -> stdlib bridge so pytest's caplog captures messages.
+        class _Bridge(logging.Handler):
+            def emit(self, record):  # noqa: D401
+                logging.getLogger(record.name).handle(record)
+
+        handler_id = logger.add(_Bridge(), level="WARNING", format="{message}")
+        try:
+            caplog.set_level(logging.WARNING)
+            engine = _make_mock_engine()
+            puller = RedfinPuller(db_engine=engine)
+
+            df = pd.DataFrame({
+                "region": ["National"] * 4,
+                "period_begin": [
+                    "2024-01-01", "2024-02-01",
+                    "2024-03-01", "2024-04-01",
+                ],
+                # Two rows are valid; two are unparseable strings that
+                # pd.to_numeric will silently coerce to NaN.
+                "inventory": ["500000", "n/a", "510000", "--"],
+            })
+            puller._detect_inventory_anomalies(df)
+        finally:
+            logger.remove(handler_id)
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(
+            "inventory values coerced to NaN" in m and "2" in m
+            for m in messages
+        ), messages
+
+    def test_no_log_when_all_inventory_valid(self, caplog):
+        """Conversely, a clean DataFrame must not emit a coerce warning."""
+        from loguru import logger
+        import logging
+
+        class _Bridge(logging.Handler):
+            def emit(self, record):  # noqa: D401
+                logging.getLogger(record.name).handle(record)
+
+        handler_id = logger.add(_Bridge(), level="WARNING", format="{message}")
+        try:
+            caplog.set_level(logging.WARNING)
+            engine = _make_mock_engine()
+            puller = RedfinPuller(db_engine=engine)
+            df = _sample_tsv_df()
+            puller._detect_inventory_anomalies(df)
+        finally:
+            logger.remove(handler_id)
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert not any(
+            "inventory values coerced to NaN" in m for m in messages
+        ), messages
+
 
 # ---------------------------------------------------------------------------
 # _fetch_tsv tests (mocked HTTP)

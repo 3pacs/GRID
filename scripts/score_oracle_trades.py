@@ -6,10 +6,17 @@ Steps:
 1. Fetch historical prices via yfinance for all prediction tickers
 2. Backfill entry_price where it's 0
 3. Map BULLISH→CALL, NEUTRAL→no_data verdict
-4. Score expired predictions (expiry <= today)
+4. Score expired predictions (expiry <= today)  ← CHUNKED since 2026-05-13
 5. Print scorecard
+
+Step 4 (the only one that touches large row counts) runs in chunks of
+``--chunk-size`` rows, each chunk in its own short transaction. This
+prevents the single-transaction lock-and-OOM failure mode that would
+otherwise hit when scoring large expiry waves (e.g. the 2026-05-15
+window where ~2.27M predictions expire at once).
 """
 
+import argparse
 import json
 import sys
 from typing import Any
@@ -181,7 +188,154 @@ def _record_success_lesson_safe(
                   p=prediction_id, e=str(exc))
 
 
-def main():
+_ALLOWED_VERDICT_COLS: frozenset[str] = frozenset({"hits", "partials", "misses"})
+
+
+def score_one_chunk(
+    conn,
+    *,
+    engine: Engine,
+    prices: dict,
+    today: date,
+    chunk_size: int,
+) -> dict[str, int]:
+    """Score one chunk of expired-and-scoreable pending predictions.
+
+    Returns counters {scored, hits, misses, partials, skipped, no_data}
+    for the chunk. The caller accumulates across chunks.
+
+    Each call must run inside its own ``engine.begin()`` block — that
+    way the row-level locks released between chunks instead of being
+    held for the entire 2.27M-row scoring run.
+    """
+    chunk = conn.execute(text("""
+        SELECT id, ticker, direction, target_price, entry_price, expiry,
+               confidence, expected_move_pct, model_name,
+               signals, created_at
+        FROM oracle_predictions
+        WHERE verdict = 'pending'
+          AND expiry <= :today
+          AND entry_price > 0
+        ORDER BY expiry
+        LIMIT :chunk_size
+    """), {"today": today, "chunk_size": int(chunk_size)}).fetchall()
+
+    counters = {"scored": 0, "hits": 0, "misses": 0, "partials": 0,
+                "skipped": 0, "no_data": 0, "fetched": len(chunk)}
+
+    for r in chunk:
+        (
+            pred_id, ticker, direction, target, entry, expiry,
+            conf, expected, model, signals_blob, created_at,
+        ) = r
+
+        if direction not in ("CALL", "PUT"):
+            counters["skipped"] += 1
+            continue
+
+        actual = get_price_for_date(prices, ticker, expiry)
+        if actual is None:
+            conn.execute(text("""
+                UPDATE oracle_predictions
+                SET verdict = 'no_data', scored_at = NOW(),
+                    score_notes = 'No price data at expiry'
+                WHERE id = :id
+            """), {"id": pred_id})
+            counters["no_data"] += 1
+            continue
+
+        actual_move = (actual - entry) / entry * 100
+
+        if direction == "CALL":
+            hit = actual > entry
+            pnl = actual_move
+        elif direction == "PUT":
+            hit = actual < entry
+            pnl = -actual_move
+        else:
+            counters["skipped"] += 1
+            continue
+
+        exp_move = expected if expected else 1.0
+        if hit and abs(actual_move) >= abs(exp_move) * 0.5:
+            verdict = "hit"
+            counters["hits"] += 1
+        elif hit:
+            verdict = "partial"
+            counters["partials"] += 1
+        else:
+            verdict = "miss"
+            counters["misses"] += 1
+
+        conn.execute(text("""
+            UPDATE oracle_predictions
+            SET verdict = :v, actual_price = :ap, actual_move_pct = :am,
+                pnl_pct = :pnl, scored_at = NOW(),
+                score_notes = :notes
+            WHERE id = :id
+        """), {
+            "v": verdict, "ap": actual, "am": round(actual_move, 2),
+            "pnl": round(pnl, 2), "id": pred_id,
+            "notes": f"Entry ${entry:.2f} → Actual ${actual:.2f} ({actual_move:+.1f}%)",
+        })
+        counters["scored"] += 1
+
+        if verdict in ("hit", "partial"):
+            _record_success_lesson_safe(
+                engine=engine,
+                prediction_id=pred_id,
+                ticker=ticker,
+                direction=direction,
+                verdict=verdict,
+                confidence=conf,
+                expected_move_pct=expected,
+                actual_move_pct=actual_move,
+                pnl_pct=pnl,
+                signals_blob=signals_blob,
+                created_at=created_at,
+                expiry=expiry,
+                model=model,
+            )
+
+        col_map = {"hit": "hits", "partial": "partials", "miss": "misses"}
+        verdict_col = col_map.get(verdict)
+        if verdict_col:
+            assert verdict_col in _ALLOWED_VERDICT_COLS, \
+                f"Blocked DDL: verdict_col '{verdict_col}' not in allowed set"
+            conn.execute(text(f"""
+                UPDATE oracle_models
+                SET {verdict_col} = {verdict_col} + 1,
+                    predictions_made = predictions_made + 1,
+                    cumulative_pnl = cumulative_pnl + :pnl,
+                    last_updated = NOW()
+                WHERE name = :model
+            """), {"pnl": pnl, "model": model})
+
+    return counters
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(
+        "--chunk-size", type=int, default=5000,
+        help="Rows processed per transaction (default 5000). Lower for less "
+             "lock pressure on a busy DB; higher for fewer round-trips.",
+    )
+    ap.add_argument(
+        "--max-rows", type=int, default=None,
+        help="Stop after scoring this many rows (default: score every "
+             "expired-and-scoreable pending). Useful for a probe run "
+             "before the full sweep.",
+    )
+    ap.add_argument(
+        "--progress-every", type=int, default=10,
+        help="Log progress every N chunks (default 10).",
+    )
+    return ap.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = _parse_args(argv)
     engine = create_engine(DB_URL)
 
     with engine.begin() as conn:
@@ -281,124 +435,76 @@ def main():
         """))
         log.info("  entry_price=0 → no_data: {}", res.rowcount)
 
-        # ── Step 4: Score expired predictions ──
-        log.info("\n--- STEP 4: Score Expired Predictions ---")
+    # ── Step 4: Score expired predictions (CHUNKED) ──
+    log.info("\n--- STEP 4: Score Expired Predictions ---")
 
-        expired = conn.execute(text("""
-            SELECT id, ticker, direction, target_price, entry_price, expiry,
-                   confidence, expected_move_pct, model_name,
-                   signals, created_at
-            FROM oracle_predictions
-            WHERE verdict = 'pending' AND expiry <= :today AND entry_price > 0
-            ORDER BY expiry
-        """), {"today": today}).fetchall()
+    # Pre-count so progress logs have a denominator.
+    with engine.connect() as conn:
+        total_scoreable = int(conn.execute(text("""
+            SELECT COUNT(*) FROM oracle_predictions
+            WHERE verdict = 'pending'
+              AND expiry <= :today
+              AND entry_price > 0
+        """), {"today": today}).scalar() or 0)
 
-        log.info("  Expired & scoreable: {}", len(expired))
+    log.info("  Expired & scoreable: {:,}", total_scoreable)
+    log.info(
+        "  Chunked: chunk-size={:,}, max-rows={}",
+        args.chunk_size,
+        args.max_rows if args.max_rows is not None else "all",
+    )
 
-        hits = misses = partials = skipped = 0
+    totals = {"scored": 0, "hits": 0, "misses": 0, "partials": 0,
+              "skipped": 0, "no_data": 0}
+    processed = 0
+    chunk_idx = 0
+    while True:
+        chunk_size = args.chunk_size
+        if args.max_rows is not None:
+            remaining = args.max_rows - processed
+            if remaining <= 0:
+                break
+            chunk_size = min(chunk_size, remaining)
 
-        for r in expired:
-            (
-                pred_id, ticker, direction, target, entry, expiry,
-                conf, expected, model, signals_blob, created_at,
-            ) = r
+        with engine.begin() as chunk_conn:
+            chunk_counters = score_one_chunk(
+                chunk_conn,
+                engine=engine,
+                prices=prices,
+                today=today,
+                chunk_size=chunk_size,
+            )
 
-            if direction not in ("CALL", "PUT"):
-                skipped += 1
-                continue
+        chunk_idx += 1
+        fetched = chunk_counters.pop("fetched", 0)
+        for k, v in chunk_counters.items():
+            totals[k] += v
+        processed += fetched
 
-            # Get actual price at expiry
-            actual = get_price_for_date(prices, ticker, expiry)
-            if actual is None:
-                conn.execute(text("""
-                    UPDATE oracle_predictions
-                    SET verdict = 'no_data', scored_at = NOW(),
-                        score_notes = 'No price data at expiry'
-                    WHERE id = :id
-                """), {"id": pred_id})
-                skipped += 1
-                continue
+        # No more pending rows — done.
+        if fetched == 0:
+            break
 
-            actual_move = (actual - entry) / entry * 100
+        if chunk_idx % args.progress_every == 0 or fetched < chunk_size:
+            pct = (processed / total_scoreable * 100) if total_scoreable else 0.0
+            log.info(
+                "  chunk {} done: processed {:,}/{:,} ({:.1f}%) "
+                "[hits={:,}, partials={:,}, misses={:,}, no_data={:,}, skipped={:,}]",
+                chunk_idx, processed, total_scoreable, pct,
+                totals["hits"], totals["partials"], totals["misses"],
+                totals["no_data"], totals["skipped"],
+            )
 
-            if direction == "CALL":
-                hit = actual > entry
-                pnl = actual_move
-            elif direction == "PUT":
-                hit = actual < entry
-                pnl = -actual_move
-            else:
-                skipped += 1
-                continue
+    total_scored = totals["hits"] + totals["misses"] + totals["partials"]
+    log.info(
+        "  Scored: {:,} (Hits: {:,}, Miss: {:,}, Partial: {:,}, "
+        "No-data: {:,}, Skipped: {:,}) across {} chunks",
+        total_scored, totals["hits"], totals["misses"], totals["partials"],
+        totals["no_data"], totals["skipped"], chunk_idx,
+    )
 
-            # Determine verdict
-            exp_move = expected if expected else 1.0
-            if hit and abs(actual_move) >= abs(exp_move) * 0.5:
-                verdict = "hit"
-                hits += 1
-            elif hit:
-                verdict = "partial"
-                partials += 1
-            else:
-                verdict = "miss"
-                misses += 1
-
-            # Update prediction
-            conn.execute(text("""
-                UPDATE oracle_predictions
-                SET verdict = :v, actual_price = :ap, actual_move_pct = :am,
-                    pnl_pct = :pnl, scored_at = NOW(),
-                    score_notes = :notes
-                WHERE id = :id
-            """), {
-                "v": verdict, "ap": actual, "am": round(actual_move, 2),
-                "pnl": round(pnl, 2), "id": pred_id,
-                "notes": f"Entry ${entry:.2f} → Actual ${actual:.2f} ({actual_move:+.1f}%)",
-            })
-
-            # ReasoningBank success-side capture: record what worked when a
-            # prediction lands as hit/partial so future predictions on the same
-            # fingerprint inherit the prior win. Defensive — never breaks scoring.
-            if verdict in ("hit", "partial"):
-                _record_success_lesson_safe(
-                    engine=engine,
-                    prediction_id=pred_id,
-                    ticker=ticker,
-                    direction=direction,
-                    verdict=verdict,
-                    confidence=conf,
-                    expected_move_pct=expected,
-                    actual_move_pct=actual_move,
-                    pnl_pct=pnl,
-                    signals_blob=signals_blob,
-                    created_at=created_at,
-                    expiry=expiry,
-                    model=model,
-                )
-
-            # Update model stats
-            col_map = {"hit": "hits", "partial": "partials", "miss": "misses"}
-            verdict_col = col_map.get(verdict)
-            if verdict_col:
-                # Security: verdict_col is derived from col_map whose values are
-                # hardcoded literals, but verdict itself originates from DB data that
-                # could be attacker-influenced.  Assert against a frozen set before
-                # interpolating into the UPDATE statement so any unexpected value
-                # raises immediately rather than executing arbitrary SQL.
-                _ALLOWED_VERDICT_COLS: frozenset[str] = frozenset({"hits", "partials", "misses"})
-                assert verdict_col in _ALLOWED_VERDICT_COLS, \
-                    f"Blocked DDL: verdict_col '{verdict_col}' not in allowed set"
-                conn.execute(text(f"""
-                    UPDATE oracle_models
-                    SET {verdict_col} = {verdict_col} + 1,
-                        predictions_made = predictions_made + 1,
-                        cumulative_pnl = cumulative_pnl + :pnl,
-                        last_updated = NOW()
-                    WHERE name = :model
-                """), {"pnl": pnl, "model": model})
-
-        total_scored = hits + misses + partials
-        log.info("  Scored: {} (Hits: {}, Miss: {}, Partial: {}, Skipped: {})", total_scored, hits, misses, partials, skipped)
+    # Re-open a connection for the scorecard reads.
+    with engine.connect() as conn:
 
         # ── Step 5: Scorecard ──
         log.info("\n{}", '='*60)

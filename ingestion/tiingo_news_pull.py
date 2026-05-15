@@ -31,6 +31,40 @@ _RATE_LIMIT_DELAY = 1.1
 # 429 backoff: wait this many seconds, then double on each retry (max 3).
 _RATE_LIMIT_BACKOFF_BASE = 5
 
+# Tiingo Pro = 40GB/month. When we exhaust the monthly cap, every subsequent
+# request returns 429 with "monthly bandwidth allocation" in the body — NOT
+# a rate-limit issue. The right action is to stop calling until the quota
+# resets on the 1st. Persisted to disk so a hermes restart doesn't re-burn
+# discovery work + log noise on the way in.
+_BANDWIDTH_PAUSE_FILE = os.path.expanduser("~/.tiingo-bandwidth-cap-until")
+_BANDWIDTH_MARKER_TEXT = "monthly bandwidth allocation"
+
+
+def _bandwidth_paused_until() -> date | None:
+    """Return the date until which we should skip Tiingo entirely, or None."""
+    try:
+        with open(_BANDWIDTH_PAUSE_FILE) as fh:
+            iso = fh.read().strip()
+        if not iso:
+            return None
+        return date.fromisoformat(iso)
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def _record_bandwidth_pause(until: date) -> None:
+    try:
+        with open(_BANDWIDTH_PAUSE_FILE, "w") as fh:
+            fh.write(until.isoformat())
+    except OSError as exc:
+        log.warning("Could not persist Tiingo bandwidth pause: {e}", e=str(exc))
+
+
+def _next_month_first(today: date) -> date:
+    if today.month == 12:
+        return date(today.year + 1, 1, 1)
+    return date(today.year, today.month + 1, 1)
+
 
 def _tiingo_headers() -> dict[str, str]:
     return {
@@ -78,6 +112,14 @@ class TiingoNewsPuller(BasePuller):
         if start_date is None:
             start_date = (date.today() - timedelta(days=7)).isoformat()
 
+        # Bandwidth-cap short-circuit: if we previously hit the monthly
+        # quota, skip until the persisted reset date.
+        paused_until = _bandwidth_paused_until()
+        if paused_until and date.today() < paused_until:
+            result["status"] = "SKIPPED"
+            result["error"] = f"tiingo bandwidth cap until {paused_until.isoformat()}"
+            return result
+
         params: dict[str, Any] = {
             "tickers": ticker,
             "startDate": str(start_date),
@@ -87,6 +129,8 @@ class TiingoNewsPuller(BasePuller):
 
         try:
             # Retry on 429 with exponential backoff (5s, 10s, 20s).
+            # Special case: if 429 body declares monthly bandwidth cap,
+            # there's nothing to back off to — pause until next month.
             resp = None
             for attempt in range(3):
                 resp = requests.get(
@@ -95,6 +139,18 @@ class TiingoNewsPuller(BasePuller):
                 )
                 if resp.status_code != 429:
                     break
+                body = (resp.text or "").lower()
+                if _BANDWIDTH_MARKER_TEXT in body:
+                    until = _next_month_first(date.today())
+                    _record_bandwidth_pause(until)
+                    log.error(
+                        "Tiingo monthly bandwidth cap hit — pausing all "
+                        "Tiingo pulls until {d}. Email support@tiingo.com "
+                        "to lift, or upgrade plan.", d=until.isoformat(),
+                    )
+                    result["status"] = "SKIPPED"
+                    result["error"] = f"bandwidth cap; paused until {until.isoformat()}"
+                    return result
                 if attempt < 2:
                     delay = _RATE_LIMIT_BACKOFF_BASE * (2 ** attempt)
                     log.warning(
