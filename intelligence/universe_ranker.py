@@ -43,6 +43,7 @@ Design rules
 
 from __future__ import annotations
 
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -868,7 +869,8 @@ def main(argv: list[str] | None = None) -> int:
         from db import get_engine
         engine = get_engine()
     except Exception as exc:  # noqa: BLE001
-        print(f"universe_ranker: engine bootstrap failed: {exc}")
+        log.error("universe_ranker: engine bootstrap failed: {e}", e=exc)
+        print(f"universe_ranker: engine bootstrap failed: {exc}", file=sys.stderr)
         return 1
 
     if args.universe.upper() in _NAMED_UNIVERSES:

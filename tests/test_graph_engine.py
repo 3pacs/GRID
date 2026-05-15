@@ -112,12 +112,20 @@ def test_load_from_db_populates_graph():
 
     # Mock actors query
     mock_conn.execute.side_effect = [
-        # First call: actors
+        # First call: actor column discovery
+        MagicMock(fetchall=lambda: [(name,) for name in [
+            "id", "name", "tier", "category", "title",
+            "net_worth_estimate", "aum", "influence_score",
+            "trust_score", "motivation_model", "connections",
+            "known_positions", "board_seats", "political_affiliations",
+            "data_sources", "credibility", "degree", "source",
+        ]]),
+        # Second call: actors
         MagicMock(fetchall=lambda: [
             ("a1", "Actor One", "sovereign", "central_bank", "Chair", None, None, 0.9, 0.8, "informed", "[]", "[]", "[]", "[]", '["fed"]', "hard_data", 0, "seed"),
             ("a2", "Actor Two", "institutional", "fund", "CEO", None, None, 0.7, 0.6, "profit", "[]", "[]", "[]", "[]", '["sec"]', "hard_data", 1, "form4"),
         ]),
-        # Second call: connections
+        # Third call: connections
         MagicMock(fetchall=lambda: [
             ("a1", "a2", "policy_influence", 0.8, '[{"source": "fed"}]', 1),
         ]),
@@ -128,3 +136,33 @@ def test_load_from_db_populates_graph():
     assert ge.connection_count == 1
     assert ge.has_actor("a1")
     assert "a2" in ge.get_neighbors("a1")
+
+
+def test_load_from_db_tolerates_legacy_actor_columns_without_degree_or_source():
+    ge = GraphEngine()
+
+    mock_engine = MagicMock()
+    mock_conn = MagicMock()
+    mock_engine.connect.return_value.__enter__ = lambda s: mock_conn
+    mock_engine.connect.return_value.__exit__ = MagicMock(return_value=False)
+
+    mock_conn.execute.side_effect = [
+        MagicMock(fetchall=lambda: [(name,) for name in [
+            "id", "name", "tier", "category", "title",
+            "net_worth_estimate", "aum", "influence_score",
+            "trust_score", "motivation_model", "connections",
+            "known_positions", "board_seats", "political_affiliations",
+            "data_sources", "credibility",
+        ]]),
+        MagicMock(fetchall=lambda: [
+            ("a1", "Actor One", "sovereign", "central_bank", "Chair", None, None, 0.9, 0.8, "informed", "[]", "[]", "[]", "[]", '["fed"]', "hard_data", 0, "legacy"),
+        ]),
+        MagicMock(fetchall=lambda: []),
+    ]
+
+    ge.load_from_db(mock_engine)
+
+    assert ge.actor_count == 1
+    actor = ge.get_actor("a1")
+    assert actor["degree"] == 0
+    assert actor["source"] == "legacy"
