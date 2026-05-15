@@ -96,7 +96,7 @@ kafka-python-ng>=2.2.0
 minio>=7.2.0
 
 # Workflow orchestration
-prefect>=3.0.0
+prefect>=3.7.0
 
 # Testing
 pytest>=9.0.3
