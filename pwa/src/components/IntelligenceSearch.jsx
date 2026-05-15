@@ -1,7 +1,22 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
+import DOMPurify from 'dompurify';
 import { Search, Plus, X, Loader2, Database, Zap, Lightbulb, Camera, ExternalLink } from 'lucide-react';
 import { api } from '../api.js';
 import { NODE_COLORS } from './canvas/nodeStyles.js';
+
+// Snippets from /search/intelligence are produced by Postgres ts_headline,
+// which wraps matched terms in <mark>…</mark> but does NOT escape any other
+// HTML embedded in the underlying body text. Underlying bodies are aggregated
+// from signal_registry, actors, hypotheses, snapshots — fields populated by
+// LLM output and external feeds — so the snippet must be treated as untrusted
+// and sanitized before dangerouslySetInnerHTML. We allow only <mark> so the
+// highlight survives the round-trip.
+function sanitizeSnippet(html) {
+    return DOMPurify.sanitize(html || '', {
+        ALLOWED_TAGS: ['mark'],
+        ALLOWED_ATTR: [],
+    });
+}
 
 const TYPE_META = {
     actor: { label: 'Actor', color: NODE_COLORS.actor, Icon: Database },
@@ -424,7 +439,7 @@ function IntelligenceSearch({ onClose, onAddToCanvas, onOpenResult, stacked = fa
                                         </div>
                                         <div
                                             style={styles.cardSnippet}
-                                            dangerouslySetInnerHTML={{ __html: item.snippet || '' }}
+                                            dangerouslySetInnerHTML={{ __html: sanitizeSnippet(item.snippet) }}
                                         />
                                         <div style={styles.cardFooter}>
                                             <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>

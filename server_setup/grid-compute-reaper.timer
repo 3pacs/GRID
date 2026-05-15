@@ -1,0 +1,12 @@
+[Unit]
+Description=Run GRID compute reaper frequently
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+Persistent=true
+Unit=grid-compute-reaper.service
+
+[Install]
+WantedBy=timers.target
