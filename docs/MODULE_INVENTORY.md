@@ -1,8 +1,8 @@
 # GRID Module Inventory
 
 Generated: 2026-05-15
-Total modules: 737
-Total LOC: 324,144
+Total modules: 738
+Total LOC: 324,336
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycache__/`, `build/`, `dist/`, `docs/`, `node_modules/`, `notebooks/`, `pwa/`, `pwa_dist/`, `tests/`, `venv/`.
@@ -11,12 +11,12 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 
 | Directory | Module count | LOC |
 |---|---|---|
-| `intelligence/` | 167 | 99,152 |
-| `ingestion/` | 204 | 83,915 |
+| `intelligence/` | 168 | 99,294 |
+| `ingestion/` | 204 | 83,924 |
 | `api/` | 105 | 47,756 |
 | `analysis/` | 33 | 18,973 |
 | `trading/` | 34 | 14,158 |
-| `oracle/` | 29 | 10,441 |
+| `oracle/` | 29 | 10,482 |
 | `subnet/` | 10 | 5,381 |
 | `physics/` | 18 | 4,824 |
 | `features/` | 7 | 4,428 |
@@ -359,7 +359,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`, `datetime`, `loguru`, `numpy`, `pandas`, `sqlalchemy`, `typing`
 **Imported by:** `api/routers/attributions.py`, `intelligence/supply_chain_edge_validator.py`
 
-#### `intelligence/cross_reference.py` — 1832 LOC
+#### `intelligence/cross_reference.py` — 1838 LOC
 **Docstring:** GRID Cross-Reference Engine — Lie Detector for Government Statistics.
 **Functions:** `CrossRefCheck`, `LieDetectorReport`, `ensure_tables`, `check_gdp_vs_physical`, `check_trade_bilateral`, `check_inflation_vs_inputs`, `check_central_bank_actions_vs_words`, `check_employment_reality`, `get_cross_ref_for_ticker`, `check_liquidity_reality`, `check_credit_housing`, `check_insider_divergence`, `run_all_checks`, `get_historical_checks`
 **Reads:** `__future__`, `dataclasses`, `datetime`, `db`, `intelligence`, `llm`, `loguru`, `math`, `pandas`, `sqlalchemy`, `time`, `typing`
@@ -648,6 +648,11 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Docstring:** Obsidian Agent — active intelligence loop for the vault.
 **Functions:** `extract_entities`, `rank_for_review`, `should_escalate_to_paid`, `enrich_note`, `act_on_approval`, `compute_preferences`, `build_proactive_note`, `create_proactive_note`, `run_agent_cycle`
 **Reads:** `__future__`, `datetime`, `ingestion`, `json`, `loguru`, `re`, `sqlalchemy`, `typing`
+
+#### `intelligence/obsidian_log.py` — 136 LOC
+**Docstring:** Write hermes activity to the Obsidian vault session log.
+**Functions:** `append_cycle_entry`, `log_trust_cycle`, `log_intelligence_task`
+**Reads:** `__future__`, `datetime`, `loguru`, `os`, `pathlib`, `typing`
 
 #### `intelligence/opsec.py` — 456 LOC
 **Docstring:** GRID Intelligence Operations Security (OPSEC) Module.
@@ -1318,7 +1323,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `csv`, `ingestion`, `intelligence`, `loguru`, `pathlib`, `requests`, `sqlalchemy`, `typing`, `zipfile`
 **Imported by:** `ingestion/scheduler.py`
 
-#### `ingestion/altdata/indeed_hiring_puller.py` — 510 LOC
+#### `ingestion/altdata/indeed_hiring_puller.py` — 519 LOC
 **Docstring:** GRID Indeed Hiring Lab ingestion module.
 **Functions:** `IndeedHiringPuller`
 **Reads:** `__future__`, `datetime`, `db`, `ingestion`, `intelligence`, `io`, `loguru`, `pandas`, `requests`, `sqlalchemy`, `typing`
@@ -3136,7 +3141,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`, `math`, `typing`
 **Imported by:** `oracle/engine.py`
 
-#### `oracle/engine.py` — 2721 LOC
+#### `oracle/engine.py` — 2762 LOC
 **Docstring:** GRID Oracle Engine — Self-improving prediction loop.
 **Functions:** `PredictionType`, `Verdict`, `Signal`, `AntiSignal`, `OraclePrediction`, `OracleModel`, `ModelRegistry`, `OracleEngine`, `EnsemblePrediction`, `EnsemblePredictor`
 **Reads:** `__future__`, `ast`, `concurrent`, `dataclasses`, `datetime`, `enum`, `hashlib`, `intelligence`, `json`, `llm`, `loguru`, `numpy`, `oracle`, `os`, `schema_guard`, `sqlalchemy`, `typing`
