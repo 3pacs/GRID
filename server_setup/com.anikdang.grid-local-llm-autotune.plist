@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.anikdang.grid-local-llm-autotune</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/anikdang/dev/GRID/scripts/run_local_llm_autotune_idle.sh</string>
+  </array>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>20</integer>
+  </dict>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>GRID_LLM_AUTOTUNE_REPORT_DIR</key>
+    <string>/Users/anikdang/dev/GRID/outputs/local_llm_autotune</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/anikdang/dev/GRID/outputs/local_llm_autotune/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/anikdang/dev/GRID/outputs/local_llm_autotune/launchd.err.log</string>
+</dict>
+</plist>

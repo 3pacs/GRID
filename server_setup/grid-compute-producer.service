@@ -1,0 +1,17 @@
+[Unit]
+Description=GRID compute producer — keep capability-aware coordinator queue supplied
+After=network.target postgresql.service grid-coordinator.service
+Wants=grid-coordinator.service
+
+[Service]
+Type=oneshot
+User=grid
+WorkingDirectory=/home/grid/grid_v4/grid_repo
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+ExecStart=/usr/bin/flock -n /tmp/grid-compute-producer.lock /usr/bin/python3 scripts/compute_job_producer.py --coordinator http://localhost:8100 --max-create 24
+TimeoutStartSec=5min
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

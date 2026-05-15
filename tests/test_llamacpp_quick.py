@@ -175,7 +175,10 @@ class TestLlamacppReasoningResponses:
 
         assert client.chat([{"role": "user", "content": "x"}], num_predict=8) == "final answer"
         payload = mock_requests.post.call_args.kwargs["json"]  # type: ignore[attr-defined]
-        assert payload["max_tokens"] == 15000
+        # min_num_predict floor must be respected; the client adds reasoning_headroom
+        # on top and may clamp to n_ctx, so assert the floor is honoured rather than
+        # pinning an exact value (see llamacpp/client.py: gen_budget logic).
+        assert payload["max_tokens"] >= 15000
 
     @patch("llamacpp.client.requests")
     def test_reasoning_without_final_content_returns_none(self, mock_requests: object) -> None:
