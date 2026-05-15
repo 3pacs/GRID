@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import threading
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -13,6 +15,58 @@ from api.dependencies import get_db_engine
 router = APIRouter(prefix="/api/v1/intelligence", tags=["spider"])
 
 _graph_engine = None
+_graph_load_error: str | None = None
+_graph_load_lock = threading.Lock()
+
+
+def _stats_limits() -> tuple[int, int]:
+    actor_limit = int(os.getenv("GRID_SPIDER_STATS_ACTOR_LIMIT", "5000"))
+    connection_limit = int(os.getenv("GRID_SPIDER_STATS_CONNECTION_LIMIT", "20000"))
+    return actor_limit, connection_limit
+
+
+def _load_stats_graph_from_db(engine):
+    from intelligence.spider.graph_engine import GraphEngine
+
+    actor_limit, connection_limit = _stats_limits()
+    graph = GraphEngine()
+    graph.load_from_db(
+        engine,
+        actor_limit=actor_limit,
+        connection_limit=connection_limit,
+        allow_missing_connections=True,
+    )
+    return graph
+
+
+def _get_or_load_stats_graph(engine):
+    global _graph_engine, _graph_load_error
+    if _graph_engine is not None:
+        return _graph_engine
+    with _graph_load_lock:
+        if _graph_engine is not None:
+            return _graph_engine
+        try:
+            _graph_engine = _load_stats_graph_from_db(engine)
+            _graph_load_error = None
+            return _graph_engine
+        except Exception as exc:  # noqa: BLE001 - stats endpoint must report degraded state.
+            _graph_load_error = str(exc)
+            return None
+
+
+def _empty_stats(status: str, error: str | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "status": status,
+        "total_actors": 0,
+        "total_connections": 0,
+        "by_degree": {},
+        "by_source": {},
+        "max_degree": 0,
+    }
+    if error:
+        payload["error"] = error
+    return payload
 
 
 def get_graph():
@@ -118,10 +172,13 @@ async def get_actor_connections(
 
 @router.get("/spider/stats")
 async def get_spider_stats(
+    engine=Depends(get_db_engine),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Get overall graph statistics."""
-    graph = get_graph()
+    graph = _get_or_load_stats_graph(engine)
+    if graph is None:
+        return _empty_stats("unavailable", _graph_load_error)
 
     by_degree: dict[int, int] = {}
     by_source: dict[str, int] = {}
@@ -131,13 +188,19 @@ async def get_spider_stats(
         src = data.get("source", "unknown")
         by_source[src] = by_source.get(src, 0) + 1
 
-    return {
+    warnings = list(getattr(graph, "load_warnings", []) or [])
+    status = "degraded" if warnings else "ready"
+    payload: dict[str, Any] = {
+        "status": status,
         "total_actors": graph.actor_count,
         "total_connections": graph.connection_count,
         "by_degree": dict(sorted(by_degree.items())),
         "by_source": dict(sorted(by_source.items(), key=lambda kv: -kv[1])),
         "max_degree": max(by_degree.keys()) if by_degree else 0,
     }
+    if warnings:
+        payload["warnings"] = warnings
+    return payload
 
 
 @router.post("/spider/inject")
