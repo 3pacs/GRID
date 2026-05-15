@@ -365,7 +365,16 @@ class IndeedHiringPuller(BasePuller):
                 sector_norm = _normalise_sector(sector_col)
                 series_id = f"indeed:us:sector:{sector_norm}"
 
+                pre_nan = int(df[sector_col].isna().sum())
                 df[sector_col] = pd.to_numeric(df[sector_col], errors="coerce")
+                post_nan = int(df[sector_col].isna().sum())
+                coerced_count = post_nan - pre_nan
+                if coerced_count > 0:
+                    log.warning(
+                        "Coerced {n} non-numeric values to NaN for indeed sector {sector}",
+                        n=coerced_count,
+                        sector=sector_col,
+                    )
                 sector_data = df.dropna(subset=[sector_col])
 
                 if sector_data.empty:
