@@ -300,13 +300,19 @@ def _make_check(
 _GDP_CHECKS: dict[str, list[dict[str, str]]] = {
     "US": [
         {
-            "name": "US GDP vs ISM Manufacturing",
+            "name": "US GDP vs Manufacturers' New Orders",
             "official": "INDPRO",              # FRED industrial production
-            "physical": "NAPM",                # FRED ISM/PMI
+            "physical": "NEWORDER",            # FRED Manufacturers' New Orders
+            # NAPM was the original ISM/PMI series here but FRED revoked ISM
+            # redistribution in Jan 2024 — the series returns "does not exist"
+            # and the check always produced an empty divergence. NEWORDER is
+            # already in the active FRED pull list and is a published
+            # leading indicator for industrial output.
             "relationship": "positive_correlation",
             "implication": (
-                "ISM diverging from industrial production suggests the official "
-                "output data may lag reality. ISM leads by 1-2 months."
+                "Manufacturers' new orders diverging from industrial production "
+                "suggests the official output data may lag reality. New orders "
+                "lead production by 1-2 months."
             ),
         },
         {
