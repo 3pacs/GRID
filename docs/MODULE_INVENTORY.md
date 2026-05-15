@@ -2,7 +2,7 @@
 
 Generated: 2026-05-15
 Total modules: 738
-Total LOC: 324,336
+Total LOC: 324,372
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycache__/`, `build/`, `dist/`, `docs/`, `node_modules/`, `notebooks/`, `pwa/`, `pwa_dist/`, `tests/`, `venv/`.
@@ -11,7 +11,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 
 | Directory | Module count | LOC |
 |---|---|---|
-| `intelligence/` | 168 | 99,294 |
+| `intelligence/` | 168 | 99,330 |
 | `ingestion/` | 204 | 83,924 |
 | `api/` | 105 | 47,756 |
 | `analysis/` | 33 | 18,973 |
@@ -510,7 +510,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `contracts`, `dataclasses`, `datetime`, `loguru`, `sqlalchemy`, `typing`, `uuid`
 **Imported by:** `api/routers/actor_detail.py`
 
-#### `intelligence/hypothesis_engine.py` — 2147 LOC
+#### `intelligence/hypothesis_engine.py` — 2183 LOC
 **Docstring:** GRID Intelligence — Hypothesis Discovery Engine.
 **Functions:** `DiscoveredPattern`, `Anomaly`, `Hypothesis`, `ensure_tables`, `TemporalPatternDetector`, `AnomalyHunter`, `HypothesisGenerator`, `cleanup_hypotheses`, `get_stats`, `main`
 **Reads:** `__future__`, `collections`, `dataclasses`, `datetime`, `db`, `hashlib`, `intelligence`, `json`, `loguru`, `math`, `numpy`, `re`, `scipy`, `sqlalchemy`, `sys`, `typing`
