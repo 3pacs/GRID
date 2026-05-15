@@ -33,10 +33,15 @@ def _write_csv(path: Path, rows: list[tuple[str, ...]]) -> None:
 
 @pytest.fixture(autouse=True)
 def _isolate_cache(monkeypatch, tmp_path):
-    """Point edge_signals at a fresh tmp CSV per test and reset its cache."""
+    """Point edge_signals at a fresh tmp CSV per test and reset its cache.
+
+    Also force the master switch ON for these tests — production
+    default is OFF, but tests need to exercise the multiplier path.
+    """
     csv_path = tmp_path / "edge_table.csv"
     monkeypatch.setenv("GRID_EDGE_TABLE_PATH", str(csv_path))
     monkeypatch.setattr(edge_signals, "_CACHE", None)
+    monkeypatch.setattr(edge_signals, "EDGE_SIGNALS_ENABLED", True)
     yield csv_path
     monkeypatch.setattr(edge_signals, "_CACHE", None)
 
@@ -189,3 +194,132 @@ def test_real_edge_table_loads_with_124_rows(monkeypatch, tmp_path):
     edge = edge_signals.lookup_edge("insider", "AMZN", "SELL")
     assert edge is not None
     assert edge.information_coefficient > 0.6
+
+
+# ── Master kill-switch ────────────────────────────────────────────────────
+
+
+def test_disabled_master_switch_short_circuits_every_lookup(_isolate_cache, monkeypatch):
+    _write_csv(_isolate_cache, [
+        ("insider", "AMZN", "SELL", 100, 100, 0.8, 0.2, 0.0, 0.0, 0.6234, 0.0, "EDGE"),
+    ])
+    # Toggle off — every call should now be a no-op (1.0 multiplier).
+    monkeypatch.setattr(edge_signals, "EDGE_SIGNALS_ENABLED", False)
+    assert edge_signals.edge_multiplier("insider", "AMZN", "SELL") == 1.0
+    assert edge_signals.multiplier_for_source_ticker("insider", "AMZN") == 1.0
+    # ``lookup_edge`` still works — it's a data access, not a multiplier.
+    # Operator using lookup_edge directly knows what they're doing.
+    assert edge_signals.lookup_edge("insider", "AMZN", "SELL") is not None
+
+
+def test_set_enabled_toggles_at_runtime(_isolate_cache):
+    _write_csv(_isolate_cache, [
+        ("insider", "AMZN", "SELL", 100, 100, 0.8, 0.2, 0.0, 0.0, 0.6234, 0.0, "EDGE"),
+    ])
+    edge_signals.set_enabled(False)
+    assert edge_signals.edge_multiplier("insider", "AMZN", "SELL") == 1.0
+    edge_signals.set_enabled(True)
+    assert edge_signals.edge_multiplier("insider", "AMZN", "SELL") > 1.0
+
+
+# ── multiplier_for_source_ticker (direction-agnostic) ─────────────────────
+
+
+def test_multiplier_for_source_ticker_finds_match_without_direction(_isolate_cache):
+    _write_csv(_isolate_cache, [
+        ("insider", "AMZN", "SELL", 100, 100, 0.8, 0.2, 0.0, 0.0, 0.6, 0.0, "EDGE"),
+    ])
+    # Should hit even though we didn't pass signal_direction.
+    mult = edge_signals.multiplier_for_source_ticker("insider", "AMZN")
+    assert mult == pytest.approx(1.0 + 0.8 * 0.6, abs=1e-6)
+
+
+def test_multiplier_for_source_ticker_picks_strongest_ic_when_multiple(_isolate_cache):
+    # Two EDGE rows on the same (source, ticker) pair but different
+    # directions — the lookup should return the one with the strongest
+    # |IC| since direction isn't known here.
+    _write_csv(_isolate_cache, [
+        ("insider", "AMZN", "SELL", 100, 100, 0.7, 0.3, 0, 0, 0.30, 0, "EDGE"),
+        ("insider", "AMZN", "BUY", 100, 100, 0.7, 0.3, 0, 0, -0.50, 0, "EDGE"),
+    ])
+    mult = edge_signals.multiplier_for_source_ticker("insider", "AMZN")
+    # Stronger |IC| is -0.50 → penalty multiplier ≈ 1 - 0.8 * 0.5 = 0.6
+    assert mult == pytest.approx(1.0 - 0.8 * 0.5, abs=1e-6)
+
+
+def test_multiplier_for_source_ticker_neutral_on_no_match(_isolate_cache):
+    _write_csv(_isolate_cache, [
+        ("insider", "AMZN", "SELL", 100, 100, 0.8, 0.2, 0, 0, 0.5, 0, "EDGE"),
+    ])
+    assert edge_signals.multiplier_for_source_ticker("xyz_source", "ZZZZ") == 1.0
+
+
+# ── compute_aggregate_edge_multiplier ─────────────────────────────────────
+
+
+class _Evidence:
+    """Duck-typed SignalEvidence stand-in for these tests."""
+
+    def __init__(self, signal_source: str) -> None:
+        self.signal_source = signal_source
+
+
+def test_aggregate_geomean_combines_two_edges(_isolate_cache):
+    _write_csv(_isolate_cache, [
+        ("insider", "AMZN", "SELL", 100, 100, 0.8, 0.2, 0, 0, 0.5, 0, "EDGE"),
+        ("quiverquant:house", "AMZN", "house_trading", 100, 100, 0.8, 0.2, 0, 0, 0.5, 0, "EDGE"),
+    ])
+    evidence = [_Evidence("insider"), _Evidence("quiverquant:house")]
+    out = edge_signals.compute_aggregate_edge_multiplier(evidence, "AMZN")
+    # Both contribute 1.4× → geomean = 1.4.
+    assert out == pytest.approx(1.4, abs=1e-6)
+
+
+def test_aggregate_ignores_evidence_without_known_edge(_isolate_cache):
+    _write_csv(_isolate_cache, [
+        ("insider", "AMZN", "SELL", 100, 100, 0.8, 0.2, 0, 0, 0.5, 0, "EDGE"),
+    ])
+    evidence = [
+        _Evidence("insider"),         # has edge → 1.4×
+        _Evidence("unrelated_source"),  # no edge → ignored
+    ]
+    out = edge_signals.compute_aggregate_edge_multiplier(evidence, "AMZN")
+    assert out == pytest.approx(1.4, abs=1e-6)
+
+
+def test_aggregate_neutral_when_no_evidence_has_edge(_isolate_cache):
+    evidence = [_Evidence("x"), _Evidence("y")]
+    assert edge_signals.compute_aggregate_edge_multiplier(evidence, "AMZN") == 1.0
+
+
+def test_aggregate_neutral_when_master_switch_off(_isolate_cache, monkeypatch):
+    _write_csv(_isolate_cache, [
+        ("insider", "AMZN", "SELL", 100, 100, 0.8, 0.2, 0, 0, 0.5, 0, "EDGE"),
+    ])
+    monkeypatch.setattr(edge_signals, "EDGE_SIGNALS_ENABLED", False)
+    evidence = [_Evidence("insider")]
+    assert edge_signals.compute_aggregate_edge_multiplier(evidence, "AMZN") == 1.0
+
+
+def test_aggregate_mixed_boost_and_penalty(_isolate_cache):
+    _write_csv(_isolate_cache, [
+        ("a", "X", "_", 0, 0, 0, 0, 0, 0, 0.5, 0, "EDGE"),   # → 1.4
+        ("b", "X", "_", 0, 0, 0, 0, 0, 0, -0.5, 0, "EDGE"),  # → 0.6
+    ])
+    evidence = [_Evidence("a"), _Evidence("b")]
+    out = edge_signals.compute_aggregate_edge_multiplier(evidence, "X")
+    # geomean(1.4, 0.6) = sqrt(0.84) ≈ 0.917
+    import math
+    assert out == pytest.approx(math.sqrt(1.4 * 0.6), abs=1e-6)
+
+
+def test_aggregate_clipped_when_many_strong_boosts(_isolate_cache):
+    _write_csv(_isolate_cache, [
+        ("a", "X", "_", 0, 0, 0, 0, 0, 0, 5.0, 0, "EDGE"),  # mult clipped to MAX
+        ("b", "X", "_", 0, 0, 0, 0, 0, 0, 5.0, 0, "EDGE"),
+        ("c", "X", "_", 0, 0, 0, 0, 0, 0, 5.0, 0, "EDGE"),
+    ])
+    evidence = [_Evidence(s) for s in "abc"]
+    out = edge_signals.compute_aggregate_edge_multiplier(evidence, "X")
+    # All three multipliers are at MAX (1.8) → geomean is also 1.8.
+    assert out == pytest.approx(edge_signals.EDGE_MULTIPLIER_MAX)
