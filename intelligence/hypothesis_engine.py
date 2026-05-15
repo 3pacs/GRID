@@ -1699,8 +1699,12 @@ class HypothesisGenerator:
                     )
                     if opposed >= 3:
                         return "LEVER_DIVERGED"
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug(
+                    "hypothesis_engine: LEVER_DIVERGED check failed for "
+                    "ticker={t}: {e}",
+                    t=ticker, e=exc,
+                )
 
         # 2. FORENSIC_CONTRADICTION: Price moved hard opposite to hypothesis
         if ptype == "convergence" and ticker:
@@ -1716,8 +1720,12 @@ class HypothesisGenerator:
                     ]
                     if len(opposed_big) >= 2:
                         return "WRONG_DIRECTION"  # Use existing kill, backed by forensic evidence
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug(
+                    "hypothesis_engine: FORENSIC_CONTRADICTION check failed "
+                    "for ticker={t}: {e}",
+                    t=ticker, e=exc,
+                )
 
         # 3. TRUST_COLLAPSED: Signal sources that generated this hypothesis
         #    have lost credibility
@@ -1734,8 +1742,12 @@ class HypothesisGenerator:
                 )
                 if actor_source and actor_source.trust_score < 0.15:
                     return "TRUST_COLLAPSED"
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug(
+                    "hypothesis_engine: TRUST_COLLAPSED check failed for "
+                    "actor={a}: {e}",
+                    a=actor, e=exc,
+                )
 
         return None
 

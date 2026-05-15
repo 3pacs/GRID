@@ -292,7 +292,26 @@ def _git(args: list[str], cwd: str | Path | None = None) -> tuple[int, str]:
 
 
 def git_pull() -> dict[str, Any]:
-    """Pull latest changes from remote."""
+    """Pull latest changes from remote.
+
+    Safe-by-default semantics — never overwrites operator-applied local
+    commits or uncommitted edits:
+
+      1. **Skip on non-target branch.** If the operator has checked out
+         a feature branch (e.g. mid-hotfix), auto-pulling ``main`` over
+         it is almost never what they want. We bail with a clear log
+         line and let them merge/rebase manually when ready.
+
+      2. **Fast-forward only.** We use ``git pull --ff-only`` so the pull
+         either applies cleanly (no divergence) or refuses (returns
+         non-zero). Prior implementation used ``--rebase`` plus a
+         ``pull`` fallback, both of which could silently rewrite local
+         commits or merge ``main`` into a feature branch.
+
+    The pre-2026-05-13 implementation lost a session's worth of
+    cherry-picked hot-fixes once (caught in time because the working
+    tree happened to be dirty); this guards against the next time.
+    """
     if not GIT_SYNC_ENABLED:
         return {"skipped": "disabled"}
 
@@ -301,18 +320,28 @@ def git_pull() -> dict[str, Any]:
         log.info("Git pull skipped: {o}", o=out_repo[:200])
         return {"skipped": "not_a_git_worktree", "output": out_repo[:200]}
 
-    log.info("Git pull — syncing latest changes")
-    rc, out = _git(["pull", "--rebase", GIT_REMOTE, GIT_BRANCH])
+    rc_branch, current_branch = _git(["rev-parse", "--abbrev-ref", "HEAD"])
+    branch_name = current_branch.strip() if rc_branch == 0 else ""
+    if branch_name and branch_name != GIT_BRANCH:
+        log.info(
+            "Git pull skipped: on branch {b}, not {target}. "
+            "Merge or rebase to {target} manually when ready.",
+            b=branch_name, target=GIT_BRANCH,
+        )
+        return {"skipped": "non_target_branch", "branch": branch_name}
+
+    log.info("Git pull — syncing latest changes (--ff-only)")
+    rc, out = _git(["pull", "--ff-only", GIT_REMOTE, GIT_BRANCH])
     if rc == 0:
         log.info("Git pull OK: {o}", o=out[:200])
         return {"status": "ok", "output": out[:200]}
-    else:
-        log.warning("Git pull failed: {o}", o=out[:300])
-        # Try without rebase
-        rc2, out2 = _git(["pull", GIT_REMOTE, GIT_BRANCH])
-        if rc2 == 0:
-            return {"status": "ok", "output": out2[:200], "fallback": True}
-        return {"status": "failed", "output": out[:300]}
+
+    log.warning(
+        "Git pull failed (not fast-forward — local branch has unique "
+        "commits or working tree dirty): {o}",
+        o=out[:300],
+    )
+    return {"status": "failed_non_ff", "output": out[:300]}
 
 
 def git_push_outputs() -> dict[str, Any]:

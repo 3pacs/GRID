@@ -9,6 +9,7 @@ from loguru import logger as log
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from utils.ttl_cache import TTLCache
 
 router = APIRouter(tags=["intelligence"])
 
@@ -296,8 +297,9 @@ async def get_active_causal_chains(
 
 # ── Influence Network Endpoints ─────────────────────────────────────────
 
-_influence_graph_cache: dict[str, Any] = {"data": None, "ts": None}
 _INFLUENCE_GRAPH_TTL = 1800  # 30 minutes
+_influence_graph_cache: TTLCache = TTLCache(ttl=_INFLUENCE_GRAPH_TTL, max_size=1)
+_INFLUENCE_GRAPH_CACHE_KEY = "default"
 
 
 @router.get("/influence")
@@ -310,8 +312,6 @@ async def get_influence_network(
     Without ticker parameter: returns the full influence graph (cached 30 min).
     With ticker parameter: returns influence data for that specific company.
     """
-    from datetime import datetime, timezone
-
     try:
         engine = get_db_engine()
 
@@ -319,18 +319,13 @@ async def get_influence_network(
             from intelligence.influence_network import get_influence_for_ticker
             return get_influence_for_ticker(engine, ticker.strip().upper())
 
-        now = datetime.now(timezone.utc)
-        if (
-            _influence_graph_cache["data"]
-            and _influence_graph_cache["ts"]
-            and (now - _influence_graph_cache["ts"]).total_seconds() < _INFLUENCE_GRAPH_TTL
-        ):
-            return _influence_graph_cache["data"]
+        cached = _influence_graph_cache.get(_INFLUENCE_GRAPH_CACHE_KEY)
+        if cached is not None:
+            return cached
 
         from intelligence.influence_network import build_influence_graph
         result = build_influence_graph(engine)
-        _influence_graph_cache["data"] = result
-        _influence_graph_cache["ts"] = now
+        _influence_graph_cache.set(_INFLUENCE_GRAPH_CACHE_KEY, result)
         return result
 
     except Exception as exc:

@@ -359,6 +359,42 @@ def test_measure_stress_test_calibration_backwards_negative_lift():
     assert cal["lift"] < 0.0
 
 
+def test_measure_stress_test_calibration_empty_fragile_returns_none_lift():
+    # When n_fragile == 0 the lift is undefined — must NOT report
+    # `lift = -robust_failure_rate`, which historically masqueraded as
+    # "stress test is inverted" in 2026-05-11 backtest reports.
+    trades = [
+        _make_trade("high", False, robustness_label="robust"),
+        _make_trade("high", False, robustness_label="robust"),
+        _make_trade("high", True, robustness_label="robust"),
+        _make_trade("high", True, robustness_label="moderate"),
+    ]
+    cal = wfv.measure_stress_test_calibration(trades)
+    assert cal["n_fragile"] == 0
+    assert cal["n_robust"] == 3
+    assert cal["fragile_failure_rate"] is None
+    assert cal["lift"] is None, (
+        "lift must be None when one bucket is empty — a real-valued lift "
+        "with an empty fragile bucket is the 'stress test inverted' bug"
+    )
+    # robust_failure_rate is still measurable on its own
+    assert cal["robust_failure_rate"] == pytest.approx(2 / 3)
+
+
+def test_measure_stress_test_calibration_empty_robust_returns_none_lift():
+    # Symmetric: empty robust bucket also blocks lift.
+    trades = [
+        _make_trade("high", False, robustness_label="fragile"),
+        _make_trade("high", True, robustness_label="fragile"),
+        _make_trade("high", True, robustness_label="moderate"),
+    ]
+    cal = wfv.measure_stress_test_calibration(trades)
+    assert cal["n_fragile"] == 2
+    assert cal["n_robust"] == 0
+    assert cal["robust_failure_rate"] is None
+    assert cal["lift"] is None
+
+
 # ── _reconstruct_historical_scorecards (NO LOOKAHEAD) ─────────────────────
 
 
@@ -377,6 +413,36 @@ def test_reconstruct_no_lookahead_filters_future_rows():
     assert "alpha" in out
     assert "beta" not in out, "Lookahead leak — future scorecard returned"
     assert "gamma" not in out
+
+
+def test_reconstruct_snaps_raw_horizon_to_canonical_bucket():
+    # features.per_signal_brier._canonical_horizon snaps 3/4/5d → 7d when
+    # writing per_signal_brier_history rows. The reader MUST snap too —
+    # otherwise oracle predictions with horizon=3..6 day never find their
+    # scorecards, which made the 2026-05-11 backtest produce identical
+    # output before/after the bootstrap (the bug: filter rejected every
+    # bootstrap row because they live at canonical h=7).
+    as_of = datetime(2026, 3, 1, tzinfo=timezone.utc)
+    earlier = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    engine = FakeEngine(
+        scorecard_rows=[
+            _make_scorecard_row("alpha", 7, earlier),   # canonical 7d bucket
+            _make_scorecard_row("beta", 1, earlier),    # canonical 1d bucket
+            _make_scorecard_row("gamma", 30, earlier),  # canonical 30d
+        ]
+    )
+    # Prediction with horizon=4 days → canonical 7d → "alpha" should be hit.
+    out_4d = wfv._reconstruct_historical_scorecards(engine, as_of=as_of, horizon_days=4)
+    assert "alpha" in out_4d, (
+        "horizon_days=4 must snap to canonical 7d bucket and find the "
+        "alpha scorecard — see features.per_signal_brier._canonical_horizon"
+    )
+    assert "beta" not in out_4d
+    assert "gamma" not in out_4d
+    # Sanity: horizon=2 days → canonical 1d bucket → "beta".
+    out_2d = wfv._reconstruct_historical_scorecards(engine, as_of=as_of, horizon_days=2)
+    assert "beta" in out_2d
+    assert "alpha" not in out_2d
 
 
 # ── walk_forward (end-to-end against FakeEngine) ──────────────────────────

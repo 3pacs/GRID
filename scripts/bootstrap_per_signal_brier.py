@@ -182,7 +182,27 @@ def extract_signal_contributions(
     ``{ORACLE_AGGREGATE_SOURCE: 1.0}`` rather than ever yielding empty.
     """
     # Layer 1 — direct breakdown stored on the prediction row.
+    #
+    # The blob lives in one of two places depending on schema vintage:
+    #   * Top-level ``signal_contributions`` column (legacy adapters; absent
+    #     on the current schema — _fetch_scored_predictions injects NULL
+    #     in that case).
+    #   * Nested inside the ``signals`` JSONB column at
+    #     ``signals["signal_contributions"]`` — this is where the live
+    #     oracle has been writing them. Until 2026-05-13 only the
+    #     top-level path was checked, so Layer 1 always returned empty
+    #     and the cascade fell through to the model-family uniform
+    #     split (Layer 2), producing family-level scorecards
+    #     (``vol``/``macro``/``insider``/...) instead of the
+    #     per-individual-signal scorecards (``aapl_pcr``/``aapl_iv_atm``/
+    #     ...) the oracle actually emits.
     layer1 = _normalize_contributions(prediction_row.get("signal_contributions"))
+    if not layer1:
+        signals_blob = _parse_jsonb(prediction_row.get("signals"))
+        if isinstance(signals_blob, dict):
+            layer1 = _normalize_contributions(
+                signals_blob.get("signal_contributions")
+            )
     if layer1:
         return layer1
 

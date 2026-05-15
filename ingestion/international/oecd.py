@@ -15,7 +15,7 @@ import requests
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
-from ingestion.base import BasePuller
+from ingestion.base import BasePuller, log_pull_failure
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 # CLI country codes
@@ -159,7 +159,10 @@ class OECDPuller(BasePuller):
             log.info("OECD CLI {cc}: inserted {n} rows", cc=country_code, n=result["rows_inserted"])
 
         except Exception as exc:
-            log.error("OECD CLI pull failed for {cc}: {err}", cc=country_code, err=str(exc))
+            # tenacity RetryError wrapping HTTPError after 3 attempts is a
+            # transient upstream wedge, not a GRID bug — demote to WARNING
+            # via log_pull_failure so real bugs stay visible.
+            log_pull_failure("OECD CLI", country_code, exc)
             result["status"] = "FAILED"
             result["errors"].append(str(exc))
 
@@ -242,7 +245,9 @@ class OECDPuller(BasePuller):
             log.info("OECD MEI {fn}: inserted {n} rows", fn=feature_name, n=inserted)
 
         except Exception as exc:
-            log.error("OECD MEI pull failed for {sk}: {err}", sk=series_key, err=str(exc))
+            # See OECD CLI rationale above — RetryError[HTTPError] is
+            # transient upstream noise, not a code bug.
+            log_pull_failure("OECD MEI", series_key, exc)
             result["status"] = "FAILED"
             result["errors"].append(str(exc))
 

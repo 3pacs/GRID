@@ -26,7 +26,7 @@ import yfinance as yf
 from loguru import logger as log
 from sqlalchemy.engine import Engine
 
-from ingestion.base import BasePuller, retry_on_failure
+from ingestion.base import BasePuller, log_pull_failure, retry_on_failure
 
 # ── Ticker Universe ────────────────────────────────────────────────────────
 
@@ -144,20 +144,35 @@ class EarningsPuller(BasePuller):
     ) -> bool:
         """Store a single earnings data point in raw_series.
 
-        Uses dedup via _get_existing_dates for efficiency.
+        Uses dedup via _get_existing_dates for efficiency. The INSERT is
+        wrapped in a SAVEPOINT so a constraint violation or other row-
+        level failure only rolls back the savepoint — the surrounding
+        per-ticker transaction stays healthy. Without this, one bad row
+        would poison the rest of the ticker with
+        ``psycopg2.errors.InFailedSqlTransaction``.
 
         Returns:
-            True if inserted, False if skipped (duplicate).
+            True if inserted, False if the savepoint rolled back.
         """
         series_id = f"earnings:{ticker}:{field}"
-        self._insert_raw(
-            conn=conn,
-            series_id=series_id,
-            obs_date=obs_date,
-            value=value,
-            raw_payload=raw_payload,
-        )
-        return True
+        sp = conn.begin_nested()
+        try:
+            self._insert_raw(
+                conn=conn,
+                series_id=series_id,
+                obs_date=obs_date,
+                value=value,
+                raw_payload=raw_payload,
+            )
+            sp.commit()
+            return True
+        except Exception as exc:
+            sp.rollback()
+            log.debug(
+                "earnings insert savepoint rollback {sid} @ {d}: {e}",
+                sid=series_id, d=obs_date, e=str(exc),
+            )
+            return False
 
     def _process_earnings_dates(
         self,
@@ -408,17 +423,29 @@ class EarningsPuller(BasePuller):
             stock = self._fetch_ticker_data(ticker)
 
             with self.engine.begin() as conn:
-                # 1. Earnings dates (EPS estimates/actuals/surprise)
-                n1 = self._process_earnings_dates(conn, ticker, stock)
-                result["rows_inserted"] += n1
-
-                # 2. Quarterly earnings (revenue + earnings)
-                n2 = self._process_quarterly_earnings(conn, ticker, stock)
-                result["rows_inserted"] += n2
-
-                # 3. Earnings history (historical surprise data)
-                n3 = self._process_earnings_history(conn, ticker, stock)
-                result["rows_inserted"] += n3
+                # Each phase runs inside a SAVEPOINT so a poisoned
+                # statement in one phase doesn't cascade into
+                # InFailedSqlTransaction errors on the next phase.
+                for label, phase_fn in (
+                    ("earnings_dates", self._process_earnings_dates),
+                    ("quarterly_earnings", self._process_quarterly_earnings),
+                    ("earnings_history", self._process_earnings_history),
+                ):
+                    sp = conn.begin_nested()
+                    try:
+                        n = phase_fn(conn, ticker, stock)
+                        sp.commit()
+                        result["rows_inserted"] += n
+                    except Exception as phase_exc:
+                        sp.rollback()
+                        # Phase failures are upstream/data-shape issues
+                        # for individual tickers; demote to WARNING so
+                        # one bad ticker doesn't drown errors.jsonl.
+                        log.warning(
+                            "earnings phase {p} failed for {t}: {e}",
+                            p=label, t=ticker, e=str(phase_exc),
+                        )
+                        result["errors"].append(f"{label}: {phase_exc}")
 
             # Detect significant surprises for reporting
             result["significant_surprises"] = self._detect_significant_surprises(
@@ -430,7 +457,11 @@ class EarningsPuller(BasePuller):
                 result["errors"].append("No earnings data available")
 
         except Exception as exc:
-            log.error("Earnings pull failed for {t}: {err}", t=ticker, err=str(exc))
+            # yfinance throws plain RuntimeError/HTTPError on rate-limit
+            # and JSON parse failures — those are upstream noise.
+            # Genuine code bugs (KeyError, AttributeError, ImportError)
+            # still escalate to ERROR via log_pull_failure.
+            log_pull_failure("Earnings", ticker, exc)
             result["status"] = "FAILED"
             result["errors"].append(str(exc))
 
