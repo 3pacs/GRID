@@ -809,7 +809,7 @@ class OracleEngine:
                 name = s.get("source_module", "unknown")
                 family = name.split(":")[1] if ":" in name else name
                 sig_dir = "bullish" if direction == "bullish" else ("bearish" if direction == "bearish" else "neutral")
-                signals.append(Signal(name, family, z, 0, sig_dir, conf, 0))
+                signals.append(Signal(name, family, z, z, sig_dir, conf, 0))
             return signals
         except Exception as exc:
             log.debug("_gather_signals_from_registry failed for {m}: {e}", m=model.name, e=str(exc))
