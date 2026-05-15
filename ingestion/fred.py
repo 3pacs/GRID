@@ -488,6 +488,22 @@ class FREDPuller(BasePuller):
                 result["errors"].append(message)
                 return result
 
+            # FRED's upstream periodically returns 5xx (server error /
+            # gateway timeout / service unavailable). Tenacity already
+            # retried — this is a transient infra blip, not an app bug.
+            # Per CLAUDE.md log-level hygiene, demote to WARNING so
+            # errors.jsonl stays signal-rich.
+            if status_code in (500, 502, 503, 504):
+                log.warning(
+                    "FRED {sid}: transient HTTP {sc} after retries; "
+                    "skipping this cycle",
+                    sid=series_id,
+                    sc=status_code,
+                )
+                result["status"] = "SKIPPED"
+                result["errors"].append(f"transient HTTP {status_code}")
+                return result
+
             # KeyError on 'date' / 'value' indicates fedfred returned a frame
             # shape we didn't anticipate — log a WARNING with the actual
             # column layout so we can fix the normaliser, but don't flood
