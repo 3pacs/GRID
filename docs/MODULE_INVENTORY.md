@@ -1,8 +1,8 @@
 # GRID Module Inventory
 
 Generated: 2026-05-15
-Total modules: 737
-Total LOC: 324,144
+Total modules: 738
+Total LOC: 324,369
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycache__/`, `build/`, `dist/`, `docs/`, `node_modules/`, `notebooks/`, `pwa/`, `pwa_dist/`, `tests/`, `venv/`.
@@ -11,12 +11,12 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 
 | Directory | Module count | LOC |
 |---|---|---|
-| `intelligence/` | 167 | 99,152 |
-| `ingestion/` | 204 | 83,915 |
+| `intelligence/` | 168 | 99,320 |
+| `ingestion/` | 204 | 83,924 |
 | `api/` | 105 | 47,756 |
 | `analysis/` | 33 | 18,973 |
 | `trading/` | 34 | 14,158 |
-| `oracle/` | 29 | 10,441 |
+| `oracle/` | 29 | 10,489 |
 | `subnet/` | 10 | 5,381 |
 | `physics/` | 18 | 4,824 |
 | `features/` | 7 | 4,428 |
@@ -359,7 +359,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`, `datetime`, `loguru`, `numpy`, `pandas`, `sqlalchemy`, `typing`
 **Imported by:** `api/routers/attributions.py`, `intelligence/supply_chain_edge_validator.py`
 
-#### `intelligence/cross_reference.py` — 1832 LOC
+#### `intelligence/cross_reference.py` — 1838 LOC
 **Docstring:** GRID Cross-Reference Engine — Lie Detector for Government Statistics.
 **Functions:** `CrossRefCheck`, `LieDetectorReport`, `ensure_tables`, `check_gdp_vs_physical`, `check_trade_bilateral`, `check_inflation_vs_inputs`, `check_central_bank_actions_vs_words`, `check_employment_reality`, `get_cross_ref_for_ticker`, `check_liquidity_reality`, `check_credit_housing`, `check_insider_divergence`, `run_all_checks`, `get_historical_checks`
 **Reads:** `__future__`, `dataclasses`, `datetime`, `db`, `intelligence`, `llm`, `loguru`, `math`, `pandas`, `sqlalchemy`, `time`, `typing`
@@ -849,7 +849,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`, `datetime`, `loguru`, `math`, `sqlalchemy`, `typing`
 **Imported by:** `api/routers/conviction.py`
 
-#### `intelligence/signal_provenance.py` — 785 LOC
+#### `intelligence/signal_provenance.py` — 793 LOC
 **Docstring:** Signal provenance — the per-ticker "why" report.
 **Functions:** `SignalEvidence`, `CausationChain`, `TradeProvenanceReport`, `compute_aggregate_conviction`, `build_provenance_report`
 **Reads:** `__future__`, `dataclasses`, `datetime`, `features`, `intelligence`, `loguru`, `sqlalchemy`, `typing`
@@ -860,6 +860,12 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Functions:** `SignalType`, `Direction`, `RegisteredSignal`, `make_signal_id`, `SignalRegistry`
 **Reads:** `__future__`, `dataclasses`, `datetime`, `enum`, `json`, `loguru`, `sqlalchemy`, `typing`, `uuid`
 **Imported by:** `alpha_research/adapters/signal_adapter.py`, `api/routers/signal_registry.py`, `intelligence/adapters/ai_trader_adapter.py`, `intelligence/adapters/base.py`, `intelligence/adapters/cross_reference_adapter.py`, `intelligence/adapters/dollar_flows_adapter.py`, `intelligence/adapters/earnings_adapter.py`, `intelligence/adapters/feature_adapter.py`, … (+9)
+
+#### `intelligence/signal_weight_overrides.py` — 154 LOC
+**Docstring:** Per-signal conviction multipliers derived from the auto-improve corpus.
+**Functions:** `get_override`, `set_enabled`
+**Reads:** `__future__`, `loguru`, `os`, `typing`
+**Imported by:** `intelligence/signal_provenance.py`, `oracle/engine.py`
 
 #### `intelligence/sleuth.py` — 1277 LOC
 **Docstring:** GRID Intelligence — Investigative Research Engine (Sleuth).
@@ -1318,7 +1324,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `csv`, `ingestion`, `intelligence`, `loguru`, `pathlib`, `requests`, `sqlalchemy`, `typing`, `zipfile`
 **Imported by:** `ingestion/scheduler.py`
 
-#### `ingestion/altdata/indeed_hiring_puller.py` — 510 LOC
+#### `ingestion/altdata/indeed_hiring_puller.py` — 519 LOC
 **Docstring:** GRID Indeed Hiring Lab ingestion module.
 **Functions:** `IndeedHiringPuller`
 **Reads:** `__future__`, `datetime`, `db`, `ingestion`, `intelligence`, `io`, `loguru`, `pandas`, `requests`, `sqlalchemy`, `typing`
@@ -3136,7 +3142,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`, `math`, `typing`
 **Imported by:** `oracle/engine.py`
 
-#### `oracle/engine.py` — 2721 LOC
+#### `oracle/engine.py` — 2769 LOC
 **Docstring:** GRID Oracle Engine — Self-improving prediction loop.
 **Functions:** `PredictionType`, `Verdict`, `Signal`, `AntiSignal`, `OraclePrediction`, `OracleModel`, `ModelRegistry`, `OracleEngine`, `EnsemblePrediction`, `EnsemblePredictor`
 **Reads:** `__future__`, `ast`, `concurrent`, `dataclasses`, `datetime`, `enum`, `hashlib`, `intelligence`, `json`, `llm`, `loguru`, `numpy`, `oracle`, `os`, `schema_guard`, `sqlalchemy`, `typing`
