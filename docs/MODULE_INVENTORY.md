@@ -1,8 +1,8 @@
 # GRID Module Inventory
 
-Generated: 2026-05-15
+Generated: 2026-05-18
 Total modules: 737
-Total LOC: 324,144
+Total LOC: 324,159
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycache__/`, `build/`, `dist/`, `docs/`, `node_modules/`, `notebooks/`, `pwa/`, `pwa_dist/`, `tests/`, `venv/`.
@@ -11,8 +11,8 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 
 | Directory | Module count | LOC |
 |---|---|---|
-| `intelligence/` | 167 | 99,152 |
-| `ingestion/` | 204 | 83,915 |
+| `intelligence/` | 167 | 99,158 |
+| `ingestion/` | 204 | 83,924 |
 | `api/` | 105 | 47,756 |
 | `analysis/` | 33 | 18,973 |
 | `trading/` | 34 | 14,158 |
@@ -359,7 +359,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`, `datetime`, `loguru`, `numpy`, `pandas`, `sqlalchemy`, `typing`
 **Imported by:** `api/routers/attributions.py`, `intelligence/supply_chain_edge_validator.py`
 
-#### `intelligence/cross_reference.py` — 1832 LOC
+#### `intelligence/cross_reference.py` — 1838 LOC
 **Docstring:** GRID Cross-Reference Engine — Lie Detector for Government Statistics.
 **Functions:** `CrossRefCheck`, `LieDetectorReport`, `ensure_tables`, `check_gdp_vs_physical`, `check_trade_bilateral`, `check_inflation_vs_inputs`, `check_central_bank_actions_vs_words`, `check_employment_reality`, `get_cross_ref_for_ticker`, `check_liquidity_reality`, `check_credit_housing`, `check_insider_divergence`, `run_all_checks`, `get_historical_checks`
 **Reads:** `__future__`, `dataclasses`, `datetime`, `db`, `intelligence`, `llm`, `loguru`, `math`, `pandas`, `sqlalchemy`, `time`, `typing`
@@ -1318,7 +1318,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `csv`, `ingestion`, `intelligence`, `loguru`, `pathlib`, `requests`, `sqlalchemy`, `typing`, `zipfile`
 **Imported by:** `ingestion/scheduler.py`
 
-#### `ingestion/altdata/indeed_hiring_puller.py` — 510 LOC
+#### `ingestion/altdata/indeed_hiring_puller.py` — 519 LOC
 **Docstring:** GRID Indeed Hiring Lab ingestion module.
 **Functions:** `IndeedHiringPuller`
 **Reads:** `__future__`, `datetime`, `db`, `ingestion`, `intelligence`, `io`, `loguru`, `pandas`, `requests`, `sqlalchemy`, `typing`
