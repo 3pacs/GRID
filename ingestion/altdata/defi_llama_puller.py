@@ -28,7 +28,7 @@ import requests
 from loguru import logger as log
 from sqlalchemy.engine import Engine
 
-from ingestion.base import BasePuller, retry_on_failure
+from ingestion.base import BasePuller, log_pull_failure, retry_on_failure
 from intelligence.actor_ingest import ingest_actors_batch
 
 # ---- API URLs ----
@@ -178,7 +178,10 @@ class DefiLlamaPuller(BasePuller):
         try:
             protocols = self._fetch_json(_PROTOCOLS_URL)
         except Exception as exc:
-            log.error("DeFi Llama protocols pull failed: {e}", e=str(exc))
+            # Upstream 4xx/5xx and DNS/timeout failures route through
+            # log_pull_failure → WARNING; only true code bugs (KeyError,
+            # ImportError, …) escalate to ERROR.
+            log_pull_failure("DeFi Llama", "protocols", exc)
             return {
                 "status": "FAILED",
                 "rows_inserted": 0,
@@ -424,7 +427,7 @@ class DefiLlamaPuller(BasePuller):
         try:
             data = self._fetch_json(_STABLECOINS_URL)
         except Exception as exc:
-            log.error("DeFi Llama stablecoins pull failed: {e}", e=str(exc))
+            log_pull_failure("DeFi Llama", "stablecoins", exc)
             return {
                 "status": "FAILED",
                 "rows_inserted": 0,
@@ -510,7 +513,7 @@ class DefiLlamaPuller(BasePuller):
         try:
             data = self._fetch_json(_BRIDGES_URL)
         except Exception as exc:
-            log.error("DeFi Llama bridges pull failed: {e}", e=str(exc))
+            log_pull_failure("DeFi Llama", "bridges", exc)
             return {
                 "status": "FAILED",
                 "rows_inserted": 0,
