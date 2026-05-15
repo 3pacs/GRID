@@ -1327,6 +1327,36 @@ class HypothesisGenerator:
 
         return "inconclusive"
 
+    @staticmethod
+    def _normalize_direction(direction: str) -> str:
+        """Map the various direction vocabularies produced across the pipeline
+        to a canonical {"up", "down", "neutral", "ambiguous"} space.
+
+        The producer side writes direction labels in several dialects:
+        - ``_hypothesis_from_convergence`` reads ``anomaly.direction`` which is
+          typically ``"CALL"``/``"PUT"``/``"opposite"``/``"neutral"`` from the
+          options/convergence detector.
+        - ``_hypothesis_from_lead_lag`` writes ``"increases"``/``"decreases"``.
+        - Some upstream callers also pass ``"bullish"``/``"bearish"``/``"long"``/``"short"``.
+
+        Before this normalization, ``_check_ticker_move`` only matched
+        ``("bullish","up")`` and ``("bearish","down")``, so every convergence
+        hypothesis (~4,000 in the last 14 days) silently fell through the
+        if-ladder and returned ``"inconclusive"`` regardless of how big the
+        actual move was. The boost calibration log, the lever_pullers_density
+        eval, and the auto_improve STAR/NET-MISLEADING advisory all degenerated
+        into all-INCONCLUSIVE noise as a result.
+        """
+        d = (direction or "").strip().lower()
+        if d in ("up", "bullish", "long", "call", "increase", "increases", "rising"):
+            return "up"
+        if d in ("down", "bearish", "short", "put", "decrease", "decreases", "falling"):
+            return "down"
+        if d in ("neutral", "flat", "sideways"):
+            return "neutral"
+        # "opposite", "unknown", "" and anything else we don't recognize
+        return "ambiguous"
+
     def _check_ticker_move(
         self,
         ticker: str,
@@ -1336,6 +1366,12 @@ class HypothesisGenerator:
         min_move_pct: float,
     ) -> str:
         """Check if a ticker moved in the expected direction since hypothesis creation."""
+        norm = self._normalize_direction(direction)
+        if norm in ("neutral", "ambiguous"):
+            # No directional bet to evaluate — record the boost but don't
+            # pretend we have a signal. Calibration ignores these by design.
+            return "inconclusive"
+
         q = text("""
             SELECT actual_move_pct, direction AS pred_dir
             FROM oracle_predictions
@@ -1365,13 +1401,13 @@ class HypothesisGenerator:
             move = row[0]
             if move is None:
                 continue
-            if direction in ("bullish", "up") and move > min_move_pct:
+            if norm == "up" and move > min_move_pct:
                 return "confirmed"
-            if direction in ("bearish", "down") and move < -min_move_pct:
+            if norm == "down" and move < -min_move_pct:
                 return "confirmed"
-            if direction in ("bullish", "up") and move < -min_move_pct:
+            if norm == "up" and move < -min_move_pct:
                 return "invalidated"
-            if direction in ("bearish", "down") and move > min_move_pct:
+            if norm == "down" and move > min_move_pct:
                 return "invalidated"
 
         return "inconclusive"
