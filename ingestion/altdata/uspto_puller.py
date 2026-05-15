@@ -22,7 +22,7 @@ import requests
 from loguru import logger as log
 from sqlalchemy.engine import Engine
 
-from ingestion.base import BasePuller, retry_on_failure
+from ingestion.base import BasePuller, log_pull_failure, retry_on_failure
 
 _USPTO_BASE = "https://developer.uspto.gov/ibd-api/v1/application/publications"
 _SERIES_PREFIX = "uspto"
@@ -82,7 +82,11 @@ class USPTOPuller(BasePuller):
                 try:
                     data = self._search(keyword)
                 except Exception as exc:
-                    log.error("USPTO search failed for '{kw}': {e}", kw=keyword, e=str(exc))
+                    # USPTO's IBD API frequently returns 503 during their
+                    # maintenance windows. Route through log_pull_failure
+                    # so transient upstream issues stay WARNING and only
+                    # code bugs surface as ERROR.
+                    log_pull_failure("USPTO", keyword, exc)
                     continue
 
                 num = data.get("numFound", 0)

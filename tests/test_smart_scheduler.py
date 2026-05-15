@@ -127,3 +127,81 @@ class _NullContext:
 
     def __exit__(self, exc_type, exc, tb):
         return False
+
+
+class _HangingPuller:
+    """Puller whose method blocks past the scheduler timeout."""
+
+    def __init__(self, db_engine):
+        self.db_engine = db_engine
+
+    def pull(self, **_kwargs):
+        import time
+
+        time.sleep(2.0)
+        return "should-not-return"
+
+
+def test_run_puller_timeout_increments_orphan_counter(monkeypatch) -> None:
+    """A puller that exceeds its timeout must increment the orphan counter
+    and surface the cumulative total via get_status().
+    """
+    import importlib
+
+    from ingestion import smart_scheduler as ss
+
+    sched = SmartScheduler.__new__(SmartScheduler)
+    sched.engine = object()
+    sched._state = {}
+    sched._thread_semaphore = ss.threading.Semaphore(2)
+    sched._active_threads = set()
+    sched._threads_lock = ss.threading.Lock()
+    sched._orphan_thread_count = 0
+
+    monkeypatch.setattr(
+        importlib,
+        "import_module",
+        lambda _modpath: types.SimpleNamespace(_HangingPuller=_HangingPuller),
+    )
+
+    puller_entry = {
+        "name": "hanging_puller",
+        "mod": "fake.module",
+        "cls": "_HangingPuller",
+        "method": "pull",
+        "timeout_s": 0.05,
+    }
+
+    result = sched._run_puller(puller_entry)
+
+    assert result["status"] == "TIMEOUT"
+    assert sched._orphan_thread_count == 1
+
+    # A second timeout further increments the counter
+    result2 = sched._run_puller(puller_entry)
+    assert result2["status"] == "TIMEOUT"
+    assert sched._orphan_thread_count == 2
+
+
+def test_get_status_reports_orphan_thread_count() -> None:
+    """get_status() must surface the cumulative orphan-thread count and
+    the active-thread snapshot for operator observability.
+    """
+    from ingestion import smart_scheduler as ss
+
+    sched = SmartScheduler.__new__(SmartScheduler)
+    sched.engine = object()
+    sched._state = {}
+    sched._thread_semaphore = ss.threading.Semaphore(1)
+    sched._active_threads = {"foo"}
+    sched._threads_lock = ss.threading.Lock()
+    sched._orphan_thread_count = 7
+
+    # _get_due_pullers reads PULLER_REGISTRY; stub it out to avoid DB calls
+    sched._get_due_pullers = lambda: []  # type: ignore[method-assign]
+
+    status = sched.get_status()
+
+    assert status["orphan_thread_count_total"] == 7
+    assert status["active_threads"] == ["foo"]
+    assert status["max_concurrent_threads"] == SmartScheduler.MAX_CONCURRENT_THREADS
