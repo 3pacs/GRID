@@ -17,8 +17,9 @@ router = APIRouter(tags=["intelligence"])
 
 # ── Risk Map ─────────────────────────────────────────────────────────────
 
-_risk_map_cache: dict[str, Any] = {"data": None, "ts": None}
 _RISK_MAP_TTL = 300  # 5 minutes
+_risk_map_cache: TTLCache = TTLCache(ttl=_RISK_MAP_TTL, max_size=1)
+_RISK_MAP_CACHE_KEY = "default"
 
 
 def _compute_risk_level(score: float) -> str:
@@ -496,22 +497,15 @@ async def get_risk_map(
     liquidity risk assessments with an overall risk score and narrative.
     Cached for 5 minutes.
     """
-    from datetime import datetime, timezone
-
-    now = datetime.now(timezone.utc)
-    if (
-        _risk_map_cache["data"]
-        and _risk_map_cache["ts"]
-        and (now - _risk_map_cache["ts"]).total_seconds() < _RISK_MAP_TTL
-    ):
-        return _risk_map_cache["data"]
+    cached = _risk_map_cache.get(_RISK_MAP_CACHE_KEY)
+    if cached is not None:
+        return cached
 
     import asyncio
 
     try:
         result = await asyncio.to_thread(_build_risk_map)
-        _risk_map_cache["data"] = result
-        _risk_map_cache["ts"] = now
+        _risk_map_cache.set(_RISK_MAP_CACHE_KEY, result)
         return result
     except Exception as exc:
         log.error("Risk map build failed: {e}", e=str(exc))
@@ -785,8 +779,9 @@ def _build_dashboard_snapshot() -> dict[str, Any]:
     return snapshot
 
 
-_globe_cache: dict[str, Any] = {"data": None, "ts": None}
 _GLOBE_TTL = 600  # 10 minutes
+_globe_cache: TTLCache = TTLCache(ttl=_GLOBE_TTL, max_size=1)
+_GLOBE_CACHE_KEY = "default"
 
 
 @router.get("/globe")
@@ -801,22 +796,16 @@ async def get_globe_data(
     Cached for 10 minutes. Heavy computation runs in a thread pool.
     """
     import asyncio
-    from datetime import datetime, timezone
 
-    now = datetime.now(timezone.utc)
-    if (
-        _globe_cache["data"]
-        and _globe_cache["ts"]
-        and (now - _globe_cache["ts"]).total_seconds() < _GLOBE_TTL
-    ):
-        return _globe_cache["data"]
+    cached = _globe_cache.get(_GLOBE_CACHE_KEY)
+    if cached is not None:
+        return cached
 
     def _build_globe():
         return _build_globe_data()
 
     result = await asyncio.to_thread(_build_globe)
-    _globe_cache["data"] = result
-    _globe_cache["ts"] = now
+    _globe_cache.set(_GLOBE_CACHE_KEY, result)
     return result
 
 

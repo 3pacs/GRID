@@ -40,6 +40,8 @@ services=(
 )
 timers=(
     grid-spider
+    grid-compute-producer
+    grid-compute-reaper
 )
 
 for svc in "${services[@]}"; do
@@ -75,12 +77,14 @@ systemctl daemon-reload
 echo "Enabling services..."
 systemctl enable "${services[@]}"
 systemctl enable grid-spider.timer
+systemctl enable grid-compute-producer.timer
+systemctl enable grid-compute-reaper.timer
 
 echo ""
 echo "=== Services installed and enabled ==="
 echo ""
-echo "Start core: sudo systemctl start grid-db grid-llamacpp grid-crucix grid-api grid-hermes grid-extractor grid-backlinker grid-spider.timer"
-echo "Stop core:  sudo systemctl stop grid-spider.timer grid-backlinker grid-extractor grid-hermes grid-api grid-crucix grid-llamacpp grid-db"
-echo "Status:     sudo systemctl status grid-db grid-api grid-hermes grid-extractor grid-backlinker grid-spider.timer"
+echo "Start core: sudo systemctl start grid-db grid-llamacpp grid-crucix grid-api grid-hermes grid-extractor grid-backlinker grid-spider.timer grid-compute-producer.timer grid-compute-reaper.timer"
+echo "Stop core:  sudo systemctl stop grid-compute-reaper.timer grid-compute-producer.timer grid-spider.timer grid-backlinker grid-extractor grid-hermes grid-api grid-crucix grid-llamacpp grid-db"
+echo "Status:     sudo systemctl status grid-db grid-api grid-hermes grid-extractor grid-backlinker grid-spider.timer grid-compute-producer.timer grid-compute-reaper.timer"
 echo ""
 echo "Boot order: grid-db -> grid-llamacpp + grid-crucix -> grid-api -> grid-hermes + grid-extractor + grid-backlinker; grid-spider runs by timer"
