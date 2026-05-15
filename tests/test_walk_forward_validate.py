@@ -415,6 +415,36 @@ def test_reconstruct_no_lookahead_filters_future_rows():
     assert "gamma" not in out
 
 
+def test_reconstruct_snaps_raw_horizon_to_canonical_bucket():
+    # features.per_signal_brier._canonical_horizon snaps 3/4/5d → 7d when
+    # writing per_signal_brier_history rows. The reader MUST snap too —
+    # otherwise oracle predictions with horizon=3..6 day never find their
+    # scorecards, which made the 2026-05-11 backtest produce identical
+    # output before/after the bootstrap (the bug: filter rejected every
+    # bootstrap row because they live at canonical h=7).
+    as_of = datetime(2026, 3, 1, tzinfo=timezone.utc)
+    earlier = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    engine = FakeEngine(
+        scorecard_rows=[
+            _make_scorecard_row("alpha", 7, earlier),   # canonical 7d bucket
+            _make_scorecard_row("beta", 1, earlier),    # canonical 1d bucket
+            _make_scorecard_row("gamma", 30, earlier),  # canonical 30d
+        ]
+    )
+    # Prediction with horizon=4 days → canonical 7d → "alpha" should be hit.
+    out_4d = wfv._reconstruct_historical_scorecards(engine, as_of=as_of, horizon_days=4)
+    assert "alpha" in out_4d, (
+        "horizon_days=4 must snap to canonical 7d bucket and find the "
+        "alpha scorecard — see features.per_signal_brier._canonical_horizon"
+    )
+    assert "beta" not in out_4d
+    assert "gamma" not in out_4d
+    # Sanity: horizon=2 days → canonical 1d bucket → "beta".
+    out_2d = wfv._reconstruct_historical_scorecards(engine, as_of=as_of, horizon_days=2)
+    assert "beta" in out_2d
+    assert "alpha" not in out_2d
+
+
 # ── walk_forward (end-to-end against FakeEngine) ──────────────────────────
 
 

@@ -62,6 +62,7 @@ from sqlalchemy.engine import Engine
 from features.per_signal_brier import (
     MIN_CALIBRATED_SAMPLES,
     SignalScorecard,
+    _canonical_horizon,
     compute_conviction_weight,
 )
 from intelligence.counterfactual_stress import run_stress_test
@@ -924,10 +925,15 @@ def _reconstruct_historical_scorecards(
     provenance reconstructor falls through to cold-start weights (neutral
     conviction = 1.0) via the ``scorecard=None`` branch.
 
-    Only scorecards whose ``horizon_days`` matches the target horizon are
-    returned — the provenance report is horizon-specific.
+    Only scorecards whose ``horizon_days`` matches the target horizon
+    (after snapping to the canonical {1, 7, 30, 90} bucket) are returned —
+    ``record_scored_prediction`` writes scorecards under canonical
+    horizons, so a raw ``horizon_days=4`` prediction must be snapped to 7
+    before lookup or no scorecard ever joins (this was the 2026-05-11
+    "bootstrap had no effect" bug).
     """
     out: dict[str, SignalScorecard] = {}
+    canonical_target = _canonical_horizon(horizon_days)
     try:
         with engine.connect() as conn:
             rows = conn.execute(
@@ -946,7 +952,7 @@ def _reconstruct_historical_scorecards(
             row_horizon = int(row[1] or 0)
         except (IndexError, TypeError, ValueError):
             continue
-        if not source or row_horizon != int(horizon_days):
+        if not source or row_horizon != canonical_target:
             continue
         count = int(row[2] or 0)
         brier = float(row[3] or 0.0)
