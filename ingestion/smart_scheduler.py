@@ -165,7 +165,19 @@ class MissingPullerApiKey(Exception):
 
 
 class SmartScheduler:
-    """Runs only due/stale pullers each tick, with per-source cooldowns."""
+    """Runs only due/stale pullers each tick, with per-source cooldowns.
+
+    Thread-leak caveat (DEV-NOTES H17): a puller that exceeds its
+    ``timeout_s`` budget is daemon-detached and reported as ``TIMEOUT``,
+    but the underlying ``threading.Thread`` keeps running in the
+    background until the process exits. The semaphore is released on
+    timeout so a single hung puller cannot starve the others, which
+    means orphaned threads do NOT count against
+    ``MAX_CONCURRENT_THREADS``. ``self._orphan_thread_count`` tracks the
+    cumulative number of orphans for operator-side observability and is
+    surfaced through :meth:`get_status` so persistent leaks become
+    visible without needing to inspect ``ps``/``/proc``.
+    """
 
     # Maximum number of concurrent puller threads
     MAX_CONCURRENT_THREADS = 10
@@ -178,6 +190,9 @@ class SmartScheduler:
         self._thread_semaphore = threading.Semaphore(self.MAX_CONCURRENT_THREADS)
         self._active_threads: set[str] = set()
         self._threads_lock = threading.Lock()
+        # Cumulative count of daemon threads that exceeded their timeout
+        # and were left running in the background. See class docstring.
+        self._orphan_thread_count: int = 0
         self._load_state_from_db()
 
     def _load_state_from_db(self) -> None:
@@ -302,11 +317,20 @@ class SmartScheduler:
             t.join(timeout=timeout_s)
 
             if t.is_alive():
+                # The daemon thread keeps running in the background — we
+                # release the semaphore on the way out so other pullers
+                # are not starved, but the orphan is not joinable. Track
+                # the cumulative count so operators can detect a slow
+                # leak via get_status() without resorting to /proc.
+                with self._threads_lock:
+                    self._orphan_thread_count += 1
+                    orphan_total = self._orphan_thread_count
                 result["status"] = "TIMEOUT"
                 result["error"] = f"Exceeded {timeout_s}s timeout"
                 log.warning(
-                    "SmartScheduler: {n} TIMEOUT after {s}s — skipping",
-                    n=name, s=timeout_s,
+                    "SmartScheduler: {n} TIMEOUT after {s}s — daemon "
+                    "thread orphaned (cumulative orphans={c})",
+                    n=name, s=timeout_s, c=orphan_total,
                 )
                 return result
 
@@ -464,6 +488,9 @@ class SmartScheduler:
             for name, s in self._state.items()
             if s.get("cooldown_until") and datetime.now(timezone.utc) < s["cooldown_until"]
         ]
+        with self._threads_lock:
+            orphan_total = self._orphan_thread_count
+            active_thread_names = sorted(self._active_threads)
         return {
             "total_registered": len(PULLER_REGISTRY),
             "total_due": len(due),
@@ -471,4 +498,7 @@ class SmartScheduler:
             "in_cooldown": in_cooldown,
             "max_per_tick": MAX_PULLERS_PER_TICK,
             "tick_budget_s": TICK_TIME_BUDGET_S,
+            "active_threads": active_thread_names,
+            "max_concurrent_threads": self.MAX_CONCURRENT_THREADS,
+            "orphan_thread_count_total": orphan_total,
         }

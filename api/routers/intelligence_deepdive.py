@@ -15,14 +15,16 @@ from api.lf_helpers import (
     set_input as _lf_set_input,
     user_id_from_token as _lf_user_id_from_token,
 )
+from utils.ttl_cache import TTLCache
 
 router = APIRouter(tags=["intelligence"])
 
 
 # ── Global Lever Map Endpoints ──────────────────────────────────────────
 
-_lever_cache: dict[str, Any] = {"data": None, "ts": None}
 _LEVER_CACHE_TTL = 600  # 10 minutes
+_lever_cache: TTLCache = TTLCache(ttl=_LEVER_CACHE_TTL, max_size=1)
+_LEVER_CACHE_KEY = "hierarchy"
 
 
 @router.get("/levers")
@@ -34,15 +36,9 @@ async def get_levers(
     Cached for 10 minutes.  Includes hierarchy, summaries, and cross-domain
     actor index.
     """
-    from datetime import datetime, timezone
-
-    now = datetime.now(timezone.utc)
-    if (
-        _lever_cache["data"]
-        and _lever_cache["ts"]
-        and (now - _lever_cache["ts"]).total_seconds() < _LEVER_CACHE_TTL
-    ):
-        return _lever_cache["data"]
+    cached = _lever_cache.get(_LEVER_CACHE_KEY)
+    if cached is not None:
+        return cached
 
     try:
         from intelligence.global_levers import (
@@ -59,8 +55,7 @@ async def get_levers(
             "cross_domain_actors": cross_domain[:20],
         }
 
-        _lever_cache["data"] = result
-        _lever_cache["ts"] = now
+        _lever_cache.set(_LEVER_CACHE_KEY, result)
         return result
 
     except Exception as exc:

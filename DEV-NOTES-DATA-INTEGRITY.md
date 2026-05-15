@@ -1,5 +1,7 @@
 # Data Integrity Fix Plan — For Incoming Dev
 
+> **Status audit 2026-05-13:** Phase 1 (C1–C5) and most of Phase 2 (H1–H8) have shipped to main. H13, H14, H15, H17, H21 are also done. H12 has five PRs in flight (#145–#149) covering the six drop-in TTLCache targets; the remaining three cache dicts in H12 need architectural decisions (see notes inline). H9, H10, H11 (and the remaining hard parts of H12) are the real open work. Always `git grep` the cited file:line before starting — anything tagged DONE below was verified against main on 2026-05-13.
+
 ## Your Mission
 
 Fix the broken data integrity layer across GRID. This is separate from the LLM/inference work happening on main. Work in your own worktree/branch.
@@ -17,47 +19,47 @@ GRID is a trading intelligence platform. It pulls data from 48+ sources (market 
 
 ## Priority Order
 
-### Phase 1: CRITICAL Security (do first)
+### Phase 1: CRITICAL Security (do first) — ✅ ALL DONE
 
-| ID | Issue | File | Fix |
-|----|-------|------|-----|
-| C1 | Unauthenticated SSRF — push notification accepts arbitrary URL | `api/routers/notifications.py:21,75-90` | Add `Depends(require_auth)`, whitelist https:// URLs |
-| C2 | No auth on notification routes | `api/routers/notifications.py:21` | Add auth dependency to router |
-| C3 | CORS wildcard default `"*"` | `config.py:137` | Change default to `""` |
-| C4 | Relative path subprocess | `api/routers/system.py:762` | Use `Path(__file__).resolve()` |
-| C5 | f-string DDL injection | `oracle/model_factory.py:88` | Whitelist column names, validate with regex |
+| ID | Status | Issue | File | Fix |
+|----|--------|-------|------|-----|
+| C1 | ✅ DONE | Unauthenticated SSRF — push notification accepts arbitrary URL | `api/routers/notifications.py:21,75-90` | Add `Depends(require_auth)`, whitelist https:// URLs |
+| C2 | ✅ DONE | No auth on notification routes | `api/routers/notifications.py:21` | Add auth dependency to router |
+| C3 | ✅ DONE | CORS wildcard default `"*"` | `config.py:137` | Change default to `""` |
+| C4 | ✅ DONE | Relative path subprocess | `api/routers/system.py:762` | Use `Path(__file__).resolve()` |
+| C5 | ✅ DONE | f-string DDL injection | `oracle/model_factory.py:88` | Whitelist column names, validate with regex |
 
-### Phase 2: HIGH Security
+### Phase 2: HIGH Security — ✅ ALL DONE
 
-| ID | Issue | File | Fix |
-|----|-------|------|-----|
-| H1 | No input validation on ChatAskRequest | `api/routers/chat.py:37-41` | Add Pydantic validators |
-| H2 | Prompt injection via history role | `api/routers/chat.py:793-795` | Restrict to {"user","assistant"} |
-| H3 | Sleuth lead ID collision + raw user input | `api/routers/chat.py:643-655` | Use uuid, truncate input |
-| H4 | Race condition on _timesfm_last_run | `api/routers/chat.py:685-741` | Add threading.Lock |
-| H5 | f-string SQL (3 locations) | `chat.py:285`, `flows.py:326-365`, `sleuth.py:392-425` | Parameterized queries |
-| H6 | XSS via dangerouslySetInnerHTML | `Briefings.jsx:210`, `MarketDiary.jsx:510` | Install + use DOMPurify |
-| H7 | Payment middleware silently bypasses | `api/main.py:454-456` | Log error, return 500 |
-| H8 | Path traversal in AstroGrid | `scripts/astrogrid_web_smoke.py:43-48` | Add .resolve() + boundary check |
+| ID | Status | Issue | File | Fix |
+|----|--------|-------|------|-----|
+| H1 | ✅ DONE | No input validation on ChatAskRequest | `api/routers/chat.py` | Pydantic `field_validator` on `context_ticker`, `timeframe`, `session_id` |
+| H2 | ✅ DONE | Prompt injection via history role | `api/routers/chat.py` | `_VALID_ROLES = {"user","assistant"}` + validator |
+| H3 | ✅ DONE | Sleuth lead ID collision + raw user input | `api/routers/chat.py` | `uuid.uuid4().hex[:12]` for lead IDs |
+| H4 | ✅ DONE | Race condition on _timesfm_last_run | `api/routers/chat.py` | `_timesfm_lock = threading.Lock()` wraps get/set |
+| H5 | ✅ DONE | f-string SQL (3 locations) | `chat.py`, `flows.py`, `sleuth.py` | No `execute(f"...")` patterns remain |
+| H6 | ✅ DONE | XSS via dangerouslySetInnerHTML | `Briefings.jsx`, `MarketDiary.jsx`, `IntelligenceSearch.jsx` (PR #143) | DOMPurify on all three |
+| H7 | ✅ DONE | Payment middleware silently bypasses | `api/main.py` | Returns 500 on middleware error (no silent bypass) |
+| H8 | ✅ DONE | Path traversal in AstroGrid | `scripts/astrogrid_web_smoke.py` | `.resolve()` + archive-root boundary check |
 
 ### Phase 3: Systemic Quality
 
-| ID | Issue | Scope | Fix |
-|----|-------|-------|-----|
-| H9 | 281 swallowed exceptions | 82 files | Replace `pass` with `log.warning()` — start with mcp_server.py (24), llm_taskqueue.py (26), system.py (19), chat.py (17) |
-| H10 | 1,217 print() statements | 129 files | Replace with structured logging — start with intelligence/ (112), ingestion/ (bulk) |
-| H12 | 9 unprotected global cache dicts | 7 router files | Create `utils/ttl_cache.py` with thread-safe TTLCache class |
-| H13 | N+1 in actor enrichment | `intelligence/actor_discovery.py:1416` | Batch queries |
-| H14 | N+1 in watchlist gatherer | `api/routers/chat.py:118` | Batch queries |
+| ID | Status | Issue | Scope | Fix |
+|----|--------|-------|-------|-----|
+| H9 | OPEN | 281 swallowed exceptions | 82 files | Replace `pass` with `log.warning()` — start with mcp_server.py (24), llm_taskqueue.py (26), system.py (19), chat.py (17) |
+| H10 | OPEN (partial) | print() statements in library code | many | Most intelligence/ prints are inside `if __name__ == "__main__":` CLI blocks — those are legitimate stdout, leave them. Target prints outside `__main__`/`_cli()` blocks first (e.g. `intelligence/universe_ranker.py:871` engine-bootstrap print). |
+| H12 | IN FLIGHT (5 PRs) | 9 unprotected global cache dicts | 7 router files | Six `{"data": None, "ts": …}` caches covered by open PRs #145–#149 (`_thesis_cache`, `_lever_cache`, `_risk_map_cache` + `_globe_cache`, `_actor_graph_cache`, `_influence_graph_cache`). Remaining: `intel_cross_reference.py:25` (already has per-key lock map — needs design call), `canvas.py:92` (tuple key — needs TTLCache key-type widening or string encoding), `surfacer.py:1507-1510` (function-local, not global — likely not a thread-safety issue). |
+| H13 | ✅ DONE | N+1 in actor enrichment | `intelligence/actor_discovery.py` | `enrich_all_actors` now uses 4 batched queries (actors, trust, connections, flows) with `= ANY(:aids)` |
+| H14 | ✅ DONE | N+1 in watchlist gatherer | `api/routers/chat.py` | `_gather_watchlist_context` batch-fetches latest values with `feature_id = ANY(:fids)` |
 
 ### Phase 4: Structural
 
-| ID | Issue | Fix |
-|----|-------|-----|
-| H11 | 16 files over 800 lines | Split largest: flow_thesis.py (1695), causation.py, llm_taskqueue.py, hermes_operator.py |
-| H15 | Global FLOW_KNOWLEDGE mutation | Return new dict instead of mutating |
-| H17 | Smart scheduler thread leaks | `ingestion/smart_scheduler.py:235` — add counter, document |
-| H21 | _intelligence_loop 150+ lines nested in lifespan | Extract to intelligence/scheduler.py |
+| ID | Status | Issue | Fix |
+|----|--------|-------|-----|
+| H11 | OPEN | 16 files over 800 lines | Split largest: flow_thesis.py (note: already split — `flow_thesis_data.py` + `flow_thesis_scoring.py`), causation.py (now split into `causation_core.py` + `causation_graph.py` + `causation_scoring.py`), llm_taskqueue.py, hermes_operator.py |
+| H15 | ✅ DONE | Global FLOW_KNOWLEDGE mutation | `analysis/flow_thesis_data.py:415` — exposed as `types.MappingProxyType` (immutable view) |
+| H17 | ✅ DONE | Smart scheduler thread leaks | `ingestion/smart_scheduler.py` — `_active_threads` set + counter, surfaced via `get_status` (PR #144) |
+| H21 | ✅ DONE | _intelligence_loop 150+ lines nested in lifespan | No `_intelligence_loop` definition in `api/main.py` — extracted |
 
 ## Architecture Notes
 
