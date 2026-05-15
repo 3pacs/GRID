@@ -15,14 +15,16 @@ from api.lf_helpers import (
     set_input as _lf_set_input,
     user_id_from_token as _lf_user_id_from_token,
 )
+from utils.ttl_cache import TTLCache
 
 router = APIRouter(tags=["intelligence"])
 
 
 # ── Actor Network Endpoints ──────────────────────────────────────────────
 
-_actor_graph_cache: dict[str, Any] = {"data": None, "ts": None}
 _ACTOR_GRAPH_TTL = 1800  # 30 minutes
+_actor_graph_cache: TTLCache = TTLCache(ttl=_ACTOR_GRAPH_TTL, max_size=1)
+_ACTOR_GRAPH_CACHE_KEY = "full"
 
 
 _DEFAULT_SECTORS = [
@@ -49,26 +51,21 @@ async def get_actor_network(
     now = datetime.now(timezone.utc)
 
     # Build/refresh graph (ICIJ excluded, ~5K actors instead of 1.6M)
-    if (
-        not _actor_graph_cache["data"]
-        or not _actor_graph_cache["ts"]
-        or (now - _actor_graph_cache["ts"]).total_seconds() >= _ACTOR_GRAPH_TTL
-    ):
+    full = _actor_graph_cache.get(_ACTOR_GRAPH_CACHE_KEY)
+    if full is None:
         try:
-            _build_full_actor_cache(now)
+            full = _build_full_actor_cache(now)
         except Exception as exc:
             log.warning("Actor network build failed: {e}", e=str(exc))
-            if not _actor_graph_cache["data"]:
-                return {
-                    "nodes": [], "links": [], "metadata": {},
-                    "wealth_flows": [], "pocket_lining_alerts": [],
-                    "flows": [], "circular_flows": [],
-                    "flow_summary": {"total_tracked": "$0", "top_flow": None, "active_loops": 0},
-                    "sectors": [],
-                    "error": str(exc),
-                }
+            return {
+                "nodes": [], "links": [], "metadata": {},
+                "wealth_flows": [], "pocket_lining_alerts": [],
+                "flows": [], "circular_flows": [],
+                "flow_summary": {"total_tracked": "$0", "top_flow": None, "active_loops": 0},
+                "sectors": [],
+                "error": str(exc),
+            }
 
-    full = _actor_graph_cache["data"]
     nodes = full.get("nodes", [])
 
     # Sector filtering
@@ -117,12 +114,14 @@ async def get_actor_network(
     }
 
 
-def _build_full_actor_cache(now=None):
-    """Build the full actor graph and store in RAM. Called at startup and on cache miss."""
-    from datetime import datetime, timezone
+def _build_full_actor_cache(now=None) -> dict[str, Any]:
+    """Build the full actor graph and store in RAM. Called at startup and on cache miss.
 
-    if now is None:
-        now = datetime.now(timezone.utc)
+    Returns the freshly built graph payload. The ``now`` parameter is
+    accepted for backwards compatibility but is no longer used — TTLCache
+    manages expiry internally.
+    """
+    del now  # unused; TTLCache handles expiry
 
     from intelligence.actor_network import (
         build_actor_graph,
@@ -261,10 +260,10 @@ def _build_full_actor_cache(now=None):
         "circular_flows": circular_flows_data,
         "flow_summary": flow_summary,
     }
-    _actor_graph_cache["data"] = result
-    _actor_graph_cache["ts"] = now
+    _actor_graph_cache.set(_ACTOR_GRAPH_CACHE_KEY, result)
     log.info("Actor network cached: {s:.1f}MB in RAM",
              s=len(str(result)) / 1_000_000)
+    return result
 
 
 @router.get("/actor/{actor_id}")

@@ -46,6 +46,8 @@ from orchestration.llm_task_models import (  # noqa: F401
     BACKGROUND_BATCH_SIZE,
     BACKGROUND_REFILL_COOLDOWN,
     MAX_HISTORY,
+    TASK_TYPE_TIERS,
+    DEFAULT_TASK_TIER,
 )
 
 # Re-export workers/router for backward compatibility
@@ -73,6 +75,7 @@ class LLMTaskQueue:
     def __init__(self, engine: Any) -> None:
         self._engine = engine
         self._client = None  # lazy — import heavy
+        self._clients_by_tier: dict[str, Any] = {}  # tier-string → client
 
         # Priority queue (min-heap on _sort_key)
         self._queue: list[LLMTask] = []
@@ -104,15 +107,36 @@ class LLMTaskQueue:
     # ------------------------------------------------------------------
     # Client init (lazy — avoids import at module load)
     # ------------------------------------------------------------------
-    def _get_client(self):
-        """Return the LlamaCppClient singleton, creating it on first call."""
-        if self._client is None:
-            try:
-                from llm.router import get_llm, Tier
-                self._client = get_llm(Tier.ORACLE)
-            except Exception as exc:
-                log.warning("LLM client init failed: {e}", e=str(exc))
-        return self._client
+    def _get_client(self, task_type: str | None = None):
+        """Return an LLM client sized to the task's tier.
+
+        Routine analysis (hypothesis_generation, company_analysis, …) routes
+        through Tier.REASON; extraction/summarisation through Tier.LOCAL;
+        only high-stakes signals and deep investigations hit Tier.ORACLE.
+        See ``TASK_TYPE_TIERS`` in llm_task_models. Clients are cached per
+        tier so each tier keeps a warm connection. ``task_type=None`` keeps
+        the legacy ORACLE behaviour for any caller that hasn't been updated.
+        """
+        tier_str = (
+            TASK_TYPE_TIERS.get(task_type, DEFAULT_TASK_TIER)
+            if task_type is not None
+            else "oracle"
+        )
+        cached = self._clients_by_tier.get(tier_str)
+        if cached is not None and getattr(cached, "is_available", True):
+            return cached
+        try:
+            from llm.router import get_llm, Tier
+            client = get_llm(Tier(tier_str))
+            self._clients_by_tier[tier_str] = client
+            # Keep the legacy attribute pointed at something usable.
+            self._client = client
+            return client
+        except Exception as exc:
+            log.warning(
+                "LLM client init failed (tier={t}): {e}", t=tier_str, e=str(exc)
+            )
+            return self._client
 
     # ------------------------------------------------------------------
     # Enqueue
@@ -185,7 +209,7 @@ class LLMTaskQueue:
             id=task.id, p=task.priority, t=task.task_type,
         )
 
-        client = self._get_client()
+        client = self._get_client(task.task_type)
         if client is None or not client.is_available:
             task.error = "LLM client unavailable"
             task.completed_at = datetime.now(timezone.utc).isoformat()

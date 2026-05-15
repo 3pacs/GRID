@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
@@ -16,14 +15,16 @@ from api.lf_helpers import (
     set_input as _lf_set_input,
     user_id_from_token as _lf_user_id_from_token,
 )
+from utils.ttl_cache import TTLCache
 
 router = APIRouter(tags=["intelligence"])
 
 
 # ── Unified Thesis Endpoint ───────────────────────────────────────────────
 
-_thesis_cache: dict[str, Any] = {"data": None, "ts": 0.0}
 _THESIS_CACHE_TTL = 600  # 10 minutes
+_thesis_cache: TTLCache = TTLCache(ttl=_THESIS_CACHE_TTL, max_size=1)
+_THESIS_CACHE_KEY = "unified"
 
 
 @router.get("/thesis")
@@ -41,9 +42,9 @@ async def get_unified_thesis(
     """
     import asyncio
 
-    now = time.time()
-    if _thesis_cache["data"] and (now - _thesis_cache["ts"]) < _THESIS_CACHE_TTL:
-        return _thesis_cache["data"]
+    cached = _thesis_cache.get(_THESIS_CACHE_KEY)
+    if cached is not None:
+        return cached
 
     def _build_thesis():
         from analysis.thesis_scorer import score_thesis, snapshot_thesis, _build_narrative
@@ -81,8 +82,7 @@ async def get_unified_thesis(
 
     try:
         thesis = await asyncio.to_thread(_build_thesis)
-        _thesis_cache["data"] = thesis
-        _thesis_cache["ts"] = now
+        _thesis_cache.set(_THESIS_CACHE_KEY, thesis)
         return thesis
     except Exception as exc:
         log.error("Thesis scoring failed: {e}", e=str(exc))

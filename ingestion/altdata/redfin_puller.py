@@ -266,6 +266,24 @@ class RedfinPuller(BasePuller):
         df_work = df[[region_col, date_col, "inventory"]].copy()
         df_work["inventory"] = pd.to_numeric(df_work["inventory"], errors="coerce")
         df_work[date_col] = pd.to_datetime(df_work[date_col], errors="coerce")
+
+        # ATTENTION.md #13: pd.to_numeric/to_datetime silently coerce bad
+        # values to NaN. Surface counts so a malformed TSV doesn't quietly
+        # shrink the anomaly-detection set.
+        inv_coerced = int(df_work["inventory"].isna().sum())
+        date_coerced = int(df_work[date_col].isna().sum())
+        if inv_coerced > 0:
+            log.warning(
+                "Redfin: {n} inventory values coerced to NaN (will be dropped)",
+                n=inv_coerced,
+            )
+        if date_coerced > 0:
+            log.warning(
+                "Redfin: {n} {c} values coerced to NaN (will be dropped)",
+                n=date_coerced,
+                c=date_col,
+            )
+
         df_work = df_work.dropna(subset=["inventory", date_col])
 
         if df_work.empty:

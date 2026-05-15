@@ -82,8 +82,10 @@ def _fallback_chain(tier: Tier, provider: str) -> list[str]:
     """
     if tier == Tier.LOCAL:
         # Lightweight tier — koala and ocr-node host the cheap small models;
-        # gridz4 is overkill for LOCAL but still a fast fallback.
-        chain = ["llamacpp_quick", "ollama_koala", "ollama_ocr", "llamacpp_z4", "llamacpp", "gemma", "ollama", "ollama_panda", "openrouter", "openai"]
+        # z400 (RTX A2000 12GB / GTX 1660S 6GB, qwen2.5:7b-instruct) is
+        # another cluster ollama node, added as a load-spreading fallback
+        # 2026-05-13; gridz4 is overkill for LOCAL but still a fast fallback.
+        chain = ["llamacpp_quick", "ollama_koala", "ollama_ocr", "ollama_z400", "llamacpp_z4", "llamacpp", "gemma", "ollama", "ollama_panda", "openrouter", "openai"]
     elif tier == Tier.ORACLE:
         # gridz4 (Blackwell + Qwen3.6-35B-A3B Claude-Opus-distill) is now the
         # primary ORACLE node. grid-svr's Pascal P100+GTX1070 27B (`llamacpp_oracle`)
@@ -93,7 +95,9 @@ def _fallback_chain(tier: Tier, provider: str) -> list[str]:
     elif tier == Tier.BATCH:
         chain = ["llamacpp_batch", "llamacpp_oracle", "llamacpp_z4", "ollama_panda", "openrouter", "openai"]
     else:
-        chain = ["llamacpp_quick", "llamacpp_z4", "ollama_koala", "ollama_ocr", "llamacpp", "gemma", "ollama", "ollama_panda", "openrouter", "openai"]
+        # REASON / DEFAULT — z400's qwen2.5:7b is a capable analysis-grade
+        # fallback after the redbox/gridz4/koala/ocr nodes (added 2026-05-13).
+        chain = ["llamacpp_quick", "llamacpp_z4", "ollama_koala", "ollama_ocr", "ollama_z400", "llamacpp", "gemma", "ollama", "ollama_panda", "openrouter", "openai"]
     return [candidate for candidate in chain if candidate != provider]
 
 

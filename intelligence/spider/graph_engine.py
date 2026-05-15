@@ -36,6 +36,12 @@ def _parse_json(val: Any) -> list:
     return []
 
 
+def _actor_select_expr(column: str, actor_columns: set[str], fallback: str) -> str:
+    if column in actor_columns:
+        return column
+    return f"{fallback} AS {column}"
+
+
 class GraphEngine:
     """In-memory actor graph engine.
 
@@ -50,6 +56,7 @@ class GraphEngine:
         self._adj: dict[str, dict[str, ConnectionMeta]] = defaultdict(dict)
         self._names: dict[str, str] = {}
         self._lock = threading.RLock()
+        self.load_warnings: list[str] = []
 
     # -- Mutation (called by spider daemon, behind lock) ---------------
 
@@ -203,6 +210,7 @@ class GraphEngine:
         engine: Any,
         connection_limit: int | None = None,
         actor_limit: int | None = None,
+        allow_missing_connections: bool = False,
     ) -> None:
         """Load actor graph from Postgres into RAM.
 
@@ -217,16 +225,26 @@ class GraphEngine:
             self._actors.clear()
             self._adj.clear()
             self._names.clear()
+            self.load_warnings.clear()
 
         actor_count = 0
         with engine.connect() as conn:
-            actor_sql = """
+            actor_columns = {
+                row[0]
+                for row in conn.execute(text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'actors'"
+                )).fetchall()
+            }
+            degree_expr = _actor_select_expr("degree", actor_columns, "0")
+            source_expr = _actor_select_expr("source", actor_columns, "'legacy'")
+            actor_sql = f"""
                 SELECT id, name, tier, category, title,
                        net_worth_estimate, aum, influence_score,
                        trust_score, motivation_model,
                        connections, known_positions, board_seats,
                        political_affiliations, data_sources, credibility,
-                       degree, source
+                       {degree_expr}, {source_expr}
                 FROM actors
                 ORDER BY influence_score DESC
             """
@@ -254,36 +272,47 @@ class GraphEngine:
                 actor_count += 1
 
         conn_count = 0
-        with engine.connect() as conn:
-            connection_sql = """
-                SELECT actor_a, actor_b, relationship, strength, evidence,
-                       CASE
-                           WHEN evidence::text LIKE '%hard_data%' THEN 1
-                           WHEN evidence::text LIKE '%public_record%' THEN 2
-                           WHEN evidence::text LIKE '%inferred%' THEN 3
-                           ELSE 4
-                       END AS confidence_tier
-                FROM actor_connections
-                ORDER BY strength DESC NULLS LAST
-            """
-            params: dict[str, Any] = {}
-            if connection_limit and connection_limit > 0:
-                connection_sql += " LIMIT :limit"
-                params["limit"] = connection_limit
-            rows = conn.execute(text(connection_sql), params).fetchall()
-            for r in rows:
-                evidence = _parse_json(r[4])
-                sources = list({e.get("source", "unknown") for e in evidence if isinstance(e, dict)})
-                self.add_connection(
-                    r[0], r[1],
-                    ConnectionMeta(
-                        relationship=r[2],
-                        strength=float(r[3]) if r[3] is not None else 0.5,
-                        confidence_tier=int(r[5]) if r[5] is not None else 3,
-                        sources=sources,
-                    ),
-                )
-                conn_count += 1
+        try:
+            with engine.connect() as conn:
+                connection_sql = """
+                    SELECT actor_a, actor_b, relationship, strength, evidence,
+                           CASE
+                               WHEN evidence::text LIKE '%hard_data%' THEN 1
+                               WHEN evidence::text LIKE '%public_record%' THEN 2
+                               WHEN evidence::text LIKE '%inferred%' THEN 3
+                               ELSE 4
+                           END AS confidence_tier
+                    FROM actor_connections
+                    ORDER BY strength DESC NULLS LAST
+                """
+                params: dict[str, Any] = {}
+                if connection_limit and connection_limit > 0:
+                    connection_sql += " LIMIT :limit"
+                    params["limit"] = connection_limit
+                rows = conn.execute(text(connection_sql), params).fetchall()
+                for r in rows:
+                    evidence = _parse_json(r[4])
+                    sources = list({e.get("source", "unknown") for e in evidence if isinstance(e, dict)})
+                    self.add_connection(
+                        r[0], r[1],
+                        ConnectionMeta(
+                            relationship=r[2],
+                            strength=float(r[3]) if r[3] is not None else 0.5,
+                            confidence_tier=int(r[5]) if r[5] is not None else 3,
+                            sources=sources,
+                        ),
+                    )
+                    conn_count += 1
+        except Exception as exc:  # noqa: BLE001 - DB drivers expose table-missing differently.
+            if not allow_missing_connections:
+                raise
+            log.warning(
+                "Graph actor load succeeded but actor_connections could not load; "
+                "continuing with actor-only stats: {e}",
+                e=str(exc),
+            )
+            compact = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+            self.load_warnings.append(f"actor_connections unavailable: {compact}")
 
         log.info(
             "Graph loaded from DB: {a} actors (limit={actor_limit}), "

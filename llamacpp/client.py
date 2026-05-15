@@ -46,6 +46,7 @@ class LlamaCppClient:
         timeout: int = 120,
         default_num_predict: int = 2000,
         min_num_predict: int = 0,
+        reasoning_headroom: int = 4096,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -53,6 +54,15 @@ class LlamaCppClient:
         self.timeout = timeout
         self.default_num_predict = default_num_predict
         self.min_num_predict = min_num_predict
+        # llama-server's --reasoning-budget lets reasoning models burn this
+        # many tokens *thinking* before they emit any final content. The
+        # OpenAI `max_tokens` field caps reasoning + content combined, so a
+        # caller asking for max_tokens=2000 against a model with a 4096
+        # reasoning budget gets 2000 tokens of reasoning and zero content.
+        # We add this headroom on top of the caller's requested content
+        # length so the answer always has room. Keep this >= the server's
+        # --reasoning-budget flag in /etc/default/z4-llama.
+        self.reasoning_headroom = reasoning_headroom
         self.is_available: bool = False
         self._knowledge_cache: dict[str, str] = {}
 
@@ -148,11 +158,15 @@ class LlamaCppClient:
             if num_predict is None
             else max(num_predict, self.min_num_predict)
         )
+        # Budget reasoning tokens on top of the requested content length —
+        # otherwise a reasoning model spends the whole max_tokens thinking
+        # and returns empty content (finish_reason=length, content="").
+        gen_budget = requested_num_predict + self.reasoning_headroom
 
         payload: dict[str, Any] = {
             "model": model or self.model,
             "messages": messages,
-            "max_tokens": requested_num_predict,
+            "max_tokens": gen_budget,
             "temperature": temperature,
             "stream": False,
         }
