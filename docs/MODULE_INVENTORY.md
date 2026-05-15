@@ -2,7 +2,7 @@
 
 Generated: 2026-05-18
 Total modules: 750
-Total LOC: 330,084
+Total LOC: 330,447
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycache__/`, `build/`, `dist/`, `docs/`, `node_modules/`, `notebooks/`, `pwa/`, `pwa_dist/`, `tests/`, `venv/`.
@@ -11,7 +11,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 
 | Directory | Module count | LOC |
 |---|---|---|
-| `intelligence/` | 172 | 101,658 |
+| `intelligence/` | 172 | 102,021 |
 | `ingestion/` | 207 | 85,797 |
 | `api/` | 107 | 48,466 |
 | `analysis/` | 33 | 18,973 |
@@ -418,10 +418,10 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`, `datetime`, `hashlib`, `json`, `loguru`, `re`, `sqlalchemy`, `typing`
 **Imported by:** `api/routers/intelligence_news.py`, `ingestion/scheduler.py`
 
-#### `intelligence/edge_signals.py` — 231 LOC
+#### `intelligence/edge_signals.py` — 585 LOC
 **Docstring:** EDGE-signal multipliers derived from the backtest edge_table.
-**Functions:** `EdgeRecord`, `reload`, `lookup_edge`, `edge_multiplier`, `apply_multiplier`
-**Reads:** `__future__`, `csv`, `dataclasses`, `loguru`, `os`, `pathlib`, `threading`, `typing`
+**Functions:** `set_enabled`, `EdgeRecord`, `reload`, `lookup_edge`, `edge_multiplier`, `multiplier_for_source_ticker`, `compute_aggregate_edge_multiplier`, `apply_multiplier`, `edge_multiplier_for_prediction`
+**Reads:** `__future__`, `csv`, `dataclasses`, `loguru`, `math`, `os`, `pathlib`, `sqlalchemy`, `threading`, `typing`
 
 #### `intelligence/eight_k_clustering.py` — 298 LOC
 **Docstring:** CAT-61 — 8-K unusual clustering + item category tracker.
@@ -865,7 +865,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`, `datetime`, `loguru`, `math`, `sqlalchemy`, `typing`
 **Imported by:** `api/routers/conviction.py`
 
-#### `intelligence/signal_provenance.py` — 812 LOC
+#### `intelligence/signal_provenance.py` — 821 LOC
 **Docstring:** Signal provenance — the per-ticker "why" report.
 **Functions:** `SignalEvidence`, `CausationChain`, `TradeProvenanceReport`, `compute_aggregate_conviction`, `build_provenance_report`
 **Reads:** `__future__`, `dataclasses`, `datetime`, `features`, `intelligence`, `loguru`, `sqlalchemy`, `typing`
