@@ -43,8 +43,7 @@ from sqlalchemy import text
 # Allow `python3 scripts/...` from repo root
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from config import settings  # noqa: E402
-from db.session import make_engine  # noqa: E402
+from db import get_engine  # noqa: E402
 
 SCORING_DOC = Path(__file__).resolve().parents[1] / "docs" / "scoring" / "boost_log_scoring_v1.md"
 
@@ -205,7 +204,7 @@ def _fetch_batch(engine, batch_size: int) -> list[dict[str, Any]]:
           WHERE bl.outcome = 'inconclusive'
             AND bl.opus_outcome IS NULL
             AND dh.pattern_type = 'convergence'
-          ORDER BY bl.created_at DESC
+          ORDER BY bl.created_at ASC
           LIMIT :batch_size
         )
         SELECT i.*,
@@ -235,6 +234,9 @@ def _fetch_batch(engine, batch_size: int) -> list[dict[str, Any]]:
 
 def _attach_parent_direction(engine, rows: list[dict[str, Any]]) -> None:
     """Look up parent_expected_direction for _anti rows."""
+    for r in rows:
+        r["is_anti"] = bool(r.get("parent_hypothesis_id"))
+        r.setdefault("parent_expected_direction", None)
     parent_ids = [r["parent_hypothesis_id"] for r in rows if r.get("parent_hypothesis_id")]
     if not parent_ids:
         return
@@ -250,9 +252,6 @@ def _attach_parent_direction(engine, rows: list[dict[str, Any]]) -> None:
     for r in rows:
         if r.get("parent_hypothesis_id"):
             r["parent_expected_direction"] = parents.get(r["parent_hypothesis_id"])
-            r["is_anti"] = True
-        else:
-            r["is_anti"] = False
 
 
 def _score_one(row: dict[str, Any], llm_client, scorer_model: str) -> dict[str, str] | None:
@@ -340,7 +339,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     scorer_model = getattr(llm, "model", f"tier-{args.tier.lower()}")
 
-    engine = make_engine(settings.DATABASE_URL)
+    engine = get_engine()
     rows = _fetch_batch(engine, args.batch_size)
     if not rows:
         log.info("Nothing to score — all inconclusive convergence rows have opus_outcome.")
