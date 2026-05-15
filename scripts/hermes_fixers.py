@@ -259,7 +259,23 @@ def diagnose_and_fix_pulls(
         for r in failed
     ]
     failed_sources = [f["source"] for f in failed_info]
-    log.warning("Failed sources in last 24h: {s}", s=failed_sources)
+    # Surface the actual upstream error alongside the source name so operators
+    # can diagnose without DB access. Previously this line only listed the
+    # source names, forcing a psql query to figure out *why* FRED (or any
+    # other source) was failing.
+    summary_lines = []
+    for f in failed_info:
+        err = (f.get("last_error") or "").strip().replace("\n", " ")[:160]
+        last_iso = f.get("last_fail") or "?"
+        last_short = last_iso.split("T")[1][:8] if "T" in last_iso else last_iso
+        summary_lines.append(
+            f"{f['source']} (n={f['fail_count']}, last={last_short}, err={err!r})"
+        )
+    log.warning(
+        "Failed sources in last 24h: {sources}\n  {detail}",
+        sources=failed_sources,
+        detail="\n  ".join(summary_lines),
+    )
 
     # If Hermes is available, get structured diagnosis with fix actions
     diagnosis_text: str | None = None
