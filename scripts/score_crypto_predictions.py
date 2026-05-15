@@ -17,16 +17,23 @@ from loguru import logger as log
 
 engine = get_engine()
 
+CRYPTO_TICKER_URL = "https://api.crypto.com/v2/public/get-ticker"
+
 # Fetch live prices from Crypto.com
 def get_live_price(symbol):
-    """Get live price from Crypto.com API."""
+    """Get live price from Crypto.com API.
+
+    Uses the v2 public endpoint — the v1 path (``/exchange/v1/public/...``)
+    returns 404 as of 2026-05-12.
+    """
     ticker_map = {"BTC": "BTC_USDT", "ETH": "ETH_USDT", "SOL": "SOL_USDT"}
     instrument = ticker_map.get(symbol)
     if not instrument:
         return None
     try:
         resp = requests.get(
-            f"https://api.crypto.com/exchange/v1/public/get-ticker?instrument_name={instrument}",
+            CRYPTO_TICKER_URL,
+            params={"instrument_name": instrument},
             timeout=10,
         )
         resp.raise_for_status()
@@ -36,7 +43,10 @@ def get_live_price(symbol):
         elif isinstance(data, dict):
             return float(data.get("a", 0))
         return None
-    except Exception:
+    except Exception as exc:
+        # Surface the actual error — previously swallowed, leaving the
+        # operator with just "Failed to fetch live prices" and no clue.
+        log.warning("crypto live-price fetch failed for {s}: {e}", s=symbol, e=str(exc))
         return None
 
 # Get live prices

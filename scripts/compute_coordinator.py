@@ -241,6 +241,46 @@ def transition_job(cur, job_id, new_state, reason="", worker_id=None):
     )
 
 
+def worker_state_for_active_jobs(active_jobs: int) -> str:
+    """Return the coordinator-visible worker state for an active job count."""
+    return "BUSY" if active_jobs > 0 else "IDLE"
+
+
+def worker_heartbeat_update_sql() -> str:
+    return (
+        "UPDATE compute_workers SET last_heartbeat=NOW(), "
+        "state=CASE WHEN active_jobs > 0 THEN 'BUSY' ELSE 'IDLE' END "
+        "WHERE id=%s"
+    )
+
+
+def worker_heartbeat_with_active_jobs_update_sql() -> str:
+    return (
+        "UPDATE compute_workers SET active_jobs=GREATEST(%s,0), last_heartbeat=NOW(), "
+        "state=CASE WHEN GREATEST(%s,0) > 0 THEN 'BUSY' ELSE 'IDLE' END "
+        "WHERE id=%s"
+    )
+
+
+def worker_claim_update_sql() -> str:
+    return (
+        "UPDATE compute_workers SET active_jobs=active_jobs+1, "
+        "state='BUSY', last_heartbeat=NOW() WHERE id=%s"
+    )
+
+
+def worker_complete_update_sql() -> str:
+    return (
+        "UPDATE compute_workers SET active_jobs=GREATEST(active_jobs-1,0), "
+        "state=CASE WHEN GREATEST(active_jobs-1,0) > 0 THEN 'BUSY' ELSE 'IDLE' END, "
+        "last_heartbeat=NOW() WHERE id=%s"
+    )
+
+
+def clear_job_error_sql() -> str:
+    return "UPDATE compute_jobs SET error_message=NULL WHERE id=%s"
+
+
 # ── Endpoints ──────────────────────────────────────────────────
 
 @app.on_event("startup")
@@ -266,7 +306,8 @@ async def register_worker(w: WorkerRegister):
         "cpu_cores=EXCLUDED.cpu_cores, ram_gb=EXCLUDED.ram_gb, gpu_model=EXCLUDED.gpu_model, "
         "gpu_vram_gb=EXCLUDED.gpu_vram_gb, has_ollama=EXCLUDED.has_ollama, "
         "has_docker=EXCLUDED.has_docker, max_concurrent=EXCLUDED.max_concurrent, "
-        "last_heartbeat=NOW(), state='IDLE' RETURNING *",
+        "active_jobs=0, last_heartbeat=NOW(), state='IDLE' "
+        "RETURNING *",
         (w.hostname, w.tailscale_ip, w.cpu_cores, w.ram_gb, w.gpu_model,
          w.gpu_vram_gb, w.has_ollama, w.has_docker, w.max_concurrent),
     )
@@ -287,11 +328,14 @@ async def list_workers():
 
 
 @app.post("/workers/{worker_id}/heartbeat")
-async def worker_heartbeat(worker_id: int):
+async def worker_heartbeat(worker_id: int, active_jobs: Optional[int] = None):
     conn = get_conn()
     conn.autocommit = True
     cur = conn.cursor()
-    cur.execute("UPDATE compute_workers SET last_heartbeat=NOW() WHERE id=%s", (worker_id,))
+    if active_jobs is None:
+        cur.execute(worker_heartbeat_update_sql(), (worker_id,))
+    else:
+        cur.execute(worker_heartbeat_with_active_jobs_update_sql(), (active_jobs, active_jobs, worker_id))
     conn.close()
     return {"status": "ok"}
 
@@ -351,6 +395,28 @@ async def get_job(job_id: int):
     return dict(row)
 
 
+@app.get("/metadata/compute-inputs")
+async def compute_inputs(model_limit: int = 16, feature_limit: int = 20):
+    """Return coordinator-DB-valid IDs for external job producers."""
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
+        "SELECT id FROM model_registry "
+        "WHERE feature_set IS NOT NULL AND cardinality(feature_set) > 0 "
+        "ORDER BY id LIMIT %s",
+        (model_limit,),
+    )
+    model_ids = [int(row["id"]) for row in cur.fetchall()]
+    cur.execute(
+        "SELECT id FROM feature_registry "
+        "WHERE model_eligible=TRUE ORDER BY id LIMIT %s",
+        (feature_limit,),
+    )
+    feature_ids = [int(row["id"]) for row in cur.fetchall()]
+    conn.close()
+    return {"model_ids": model_ids, "feature_ids": feature_ids}
+
+
 @app.post("/jobs/{job_id}/cancel")
 async def cancel_job(job_id: int):
     conn = get_conn()
@@ -376,48 +442,70 @@ async def claim_job(
         exclude_types: Comma-separated job types to skip (e.g. HUMAN_LLM_QUERY).
     """
     conn = get_conn()
-    conn.autocommit = True
+    conn.autocommit = False
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    # Find best matching job
-    query = "SELECT id FROM compute_jobs WHERE state='QUEUED'"
-    conditions = []
-    params_list = []
-    if not gpu_available:
-        conditions.append("requires_gpu = FALSE")
-    if not ollama_available:
-        conditions.append("requires_ollama = FALSE")
-    if job_type:
-        conditions.append("job_type = %s")
-        params_list.append(job_type)
-    if exclude_types:
-        for et in exclude_types.split(","):
-            et = et.strip()
-            if et:
-                conditions.append("job_type != %s")
-                params_list.append(et)
-    if conditions:
-        query += " AND " + " AND ".join(conditions)
-    query += " ORDER BY priority DESC, created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED"
+    try:
+        cur.execute(
+            "SELECT active_jobs,max_concurrent FROM compute_workers WHERE id=%s FOR UPDATE",
+            (worker_id,),
+        )
+        worker = cur.fetchone()
+        if not worker:
+            raise HTTPException(404, f"Worker {worker_id} not found")
 
-    cur.execute(query, params_list if params_list else None)
-    row = cur.fetchone()
+        max_concurrent = max(int(worker["max_concurrent"] or 1), 1)
+        if int(worker["active_jobs"] or 0) >= max_concurrent:
+            cur.execute(worker_heartbeat_update_sql(), (worker_id,))
+            conn.commit()
+            return {"status": "no_capacity"}
 
-    if not row:
+        # Find best matching job
+        query = "SELECT id FROM compute_jobs WHERE state='QUEUED'"
+        conditions = []
+        params_list = []
+        if not gpu_available:
+            conditions.append("requires_gpu = FALSE")
+        if not ollama_available:
+            conditions.append("requires_ollama = FALSE")
+        if job_type:
+            conditions.append("job_type = %s")
+            params_list.append(job_type)
+        if exclude_types:
+            for et in exclude_types.split(","):
+                et = et.strip()
+                if et:
+                    conditions.append("job_type != %s")
+                    params_list.append(et)
+        if conditions:
+            query += " AND " + " AND ".join(conditions)
+        query += " ORDER BY priority DESC, created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED"
+
+        cur.execute(query, params_list if params_list else None)
+        row = cur.fetchone()
+
+        if not row:
+            cur.execute(worker_heartbeat_update_sql(), (worker_id,))
+            conn.commit()
+            return {"status": "no_jobs"}
+
+        job_id = row["id"]
+        transition_job(cur, job_id, JobState.DISPATCHED, f"claimed by worker {worker_id}", worker_id)
+        cur.execute(clear_job_error_sql(), (job_id,))
+
+        # Update worker active count and heartbeat in the same transaction as the claim.
+        cur.execute(worker_claim_update_sql(), (worker_id,))
+
+        cur.execute("SELECT * FROM compute_jobs WHERE id=%s", (job_id,))
+        job = dict(cur.fetchone())
+        conn.commit()
+        log.info("Job #{id} claimed by worker {w}", id=job_id, w=worker_id)
+        return job
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
         conn.close()
-        return {"status": "no_jobs"}
-
-    job_id = row["id"]
-    transition_job(cur, job_id, JobState.DISPATCHED, f"claimed by worker {worker_id}", worker_id)
-
-    # Update worker active count
-    cur.execute("UPDATE compute_workers SET active_jobs=active_jobs+1, state='BUSY' WHERE id=%s", (worker_id,))
-
-    cur.execute("SELECT * FROM compute_jobs WHERE id=%s", (job_id,))
-    job = dict(cur.fetchone())
-    conn.close()
-    log.info("Job #{id} claimed by worker {w}", id=job_id, w=worker_id)
-    return job
 
 
 @app.post("/jobs/{job_id}/start")
@@ -426,6 +514,7 @@ async def start_job(job_id: int, worker_id: int):
     conn.autocommit = True
     cur = conn.cursor()
     transition_job(cur, job_id, JobState.IN_PROGRESS, "worker started execution", worker_id)
+    cur.execute(worker_heartbeat_update_sql(), (worker_id,))
     conn.close()
     return {"status": "started", "job_id": job_id}
 
@@ -433,35 +522,35 @@ async def start_job(job_id: int, worker_id: int):
 @app.post("/jobs/{job_id}/complete")
 async def complete_job(job_id: int, result: JobResult):
     conn = get_conn()
-    conn.autocommit = True
+    conn.autocommit = False
     cur = conn.cursor()
 
-    if result.error:
-        transition_job(cur, job_id, JobState.FAILED, result.error, result.worker_id)
-        cur.execute("UPDATE compute_jobs SET error_message=%s WHERE id=%s", (result.error, job_id))
-    else:
-        transition_job(cur, job_id, JobState.COMPLETED, "worker reported completion", result.worker_id)
+    try:
+        if result.error:
+            transition_job(cur, job_id, JobState.FAILED, result.error, result.worker_id)
+            cur.execute("UPDATE compute_jobs SET error_message=%s WHERE id=%s", (result.error, job_id))
+        else:
+            transition_job(cur, job_id, JobState.COMPLETED, "worker reported completion", result.worker_id)
+            cur.execute(clear_job_error_sql(), (job_id,))
 
-    # Store result
-    cur.execute(
-        "INSERT INTO compute_results (job_id,worker_id,output,metrics,error) VALUES (%s,%s,%s,%s,%s)",
-        (job_id, result.worker_id, json.dumps(result.output),
-         json.dumps(result.metrics), result.error),
-    )
+        # Store result
+        cur.execute(
+            "INSERT INTO compute_results (job_id,worker_id,output,metrics,error) VALUES (%s,%s,%s,%s,%s)",
+            (job_id, result.worker_id, json.dumps(result.output),
+             json.dumps(result.metrics), result.error),
+        )
 
-    # Decrement worker active count
-    cur.execute(
-        "UPDATE compute_workers SET active_jobs=GREATEST(active_jobs-1,0) WHERE id=%s",
-        (result.worker_id,),
-    )
-    cur.execute(
-        "UPDATE compute_workers SET state='IDLE' WHERE id=%s AND active_jobs=0",
-        (result.worker_id,),
-    )
+        # Decrement worker active count and derive state atomically.
+        cur.execute(worker_complete_update_sql(), (result.worker_id,))
 
-    conn.close()
-    log.info("Job #{id} completed by worker {w}", id=job_id, w=result.worker_id)
-    return {"status": "completed" if not result.error else "failed", "job_id": job_id}
+        conn.commit()
+        log.info("Job #{id} completed by worker {w}", id=job_id, w=result.worker_id)
+        return {"status": "completed" if not result.error else "failed", "job_id": job_id}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 @app.post("/jobs/{job_id}/validate")

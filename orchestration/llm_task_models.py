@@ -47,6 +47,52 @@ BACKGROUND_TYPES = frozenset({
 
 
 # ---------------------------------------------------------------------------
+# Task type → LLM tier mapping
+# ---------------------------------------------------------------------------
+# The queue used to route *every* task through Tier.ORACLE, which sent
+# routine analysis (hypothesis_generation, company_analysis) to the
+# heaviest model in the cluster. That both wasted the strongest node on
+# cheap work and serialised the queue behind multi-minute reasoning calls.
+#
+# This map honours the router's documented 3-tier taxonomy (see
+# llm/router.py): LOCAL for extraction/summarisation, REASON for
+# analysis/synthesis, ORACLE for high-stakes signals + deep
+# investigations. Values are the Tier enum's string values so this
+# module stays import-light (no llm.router dependency at load time).
+# Unmapped task types fall back to "reason" — the router's own default.
+TASK_TYPE_TIERS: dict[str, str] = {
+    # LOCAL — extraction, summarisation, transforms
+    "web_scrape_summarize": "local",
+    "feature_interpretation": "local",
+    "surfacer_data_backfill": "local",
+    "narrative_history": "local",
+    # REASON — analysis, synthesis, thesis, regime, postmortem
+    "hypothesis_generation": "reason",
+    "hypothesis_review": "reason",
+    "company_analysis": "reason",
+    "thesis_narrative": "reason",
+    "cross_reference_narrative": "reason",
+    "postmortem_analysis": "reason",
+    "correlation_discovery": "reason",
+    "prediction_refinement": "reason",
+    "anomaly_detection": "reason",
+    "actor_research": "reason",
+    "knowledge_building": "reason",
+    "market_briefing": "reason",
+    "regime_change_explanation": "reason",
+    # ORACLE — high-stakes signals, sleuth investigations, interactive
+    "trade_review": "oracle",
+    "convergence_alert": "oracle",
+    "offshore_leak_investigation": "oracle",
+    "panama_papers_research": "oracle",
+    "user_chat": "oracle",
+}
+
+# Tier used when a task_type has no explicit entry above.
+DEFAULT_TASK_TIER: str = "reason"
+
+
+# ---------------------------------------------------------------------------
 # Task dataclass
 # ---------------------------------------------------------------------------
 
