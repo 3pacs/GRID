@@ -52,6 +52,43 @@ describe('IntelligenceSearch navigation', () => {
         });
     });
 
+    it('sanitizes snippet HTML so script tags and event handlers cannot execute', async () => {
+        api.get.mockResolvedValue({
+            total: 1,
+            results: [
+                {
+                    source_type: 'actor',
+                    source_id: '1',
+                    title: 'Warren Buffett',
+                    snippet: 'safe text <mark>buffett</mark> <script>window.__pwned=1;</script> <img src=x onerror="window.__pwned=2">',
+                    relevance: 0.91,
+                },
+            ],
+        });
+
+        const { container } = render(
+            <IntelligenceSearch
+                onClose={vi.fn()}
+                onAddToCanvas={vi.fn()}
+                onOpenResult={vi.fn()}
+            />
+        );
+
+        fireEvent.change(
+            screen.getByPlaceholderText('Search actors, signals, hypotheses...'),
+            { target: { value: 'buffett' } }
+        );
+
+        await screen.findByText('Warren Buffett');
+
+        // <mark> is preserved so the highlight still renders.
+        expect(container.querySelector('mark')).not.toBeNull();
+        // <script> and event-handler-bearing <img> must be stripped.
+        expect(container.querySelector('script')).toBeNull();
+        expect(container.querySelector('img')).toBeNull();
+        expect(window.__pwned).toBeUndefined();
+    });
+
     it('renders an Open action that routes matching results', async () => {
         api.get.mockResolvedValue({
             total: 1,
