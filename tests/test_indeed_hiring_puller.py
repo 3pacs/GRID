@@ -316,7 +316,7 @@ class TestPullSectors:
         messages = [r.getMessage() for r in caplog.records]
         assert any(
             "non-numeric values to NaN for indeed sector" in m
-            and "Software Development" in m
+            and "software development" in m
             and "2" in m
             for m in messages
         ), messages
