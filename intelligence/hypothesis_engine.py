@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+import time
 from dataclasses import dataclass, asdict, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -1949,6 +1950,127 @@ def cleanup_hypotheses(engine: Engine, dry_run: bool = False) -> dict:
         log.info("Hypothesis cleanup: {r}", r=results)
 
     return results
+
+
+# ── Periodic batch scoring of overdue active hypotheses ─────────────────────
+
+
+def score_due_active_hypotheses(
+    engine: Engine,
+    batch_size: int = 200,
+    max_runtime_s: int = 600,
+) -> dict:
+    """Score active hypotheses whose evaluation window has closed.
+
+    "Eval window closed" = ``created_at + (test_criteria->>'window_days')::int days < now()``.
+    Falls back to a 7-day window when the JSONB key is missing, matching the
+    default used by ``_check_kills`` and ``_evaluate_criteria``.
+
+    Iterates at most ``batch_size`` rows (oldest ``last_tested`` first, NULLs
+    first) and stops early if ``max_runtime_s`` elapses. Each row is scored
+    via ``HypothesisGenerator.score_hypothesis``, which handles boost-log
+    backfill, postmortem writes, Bayesian confidence updates, status
+    transitions, and kill criteria internally.
+
+    Returns a dict with per-batch counts so the caller (hermes_operator) can
+    log the distribution and surface it via the hermes-status endpoint.
+
+    Wired into the hermes operator at a 30-minute cadence (see
+    ``scripts/hermes_operator.py``). The companion gap memo:
+    ``project-active-hypo-scoring-gap``.
+    """
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if max_runtime_s <= 0:
+        raise ValueError(f"max_runtime_s must be positive, got {max_runtime_s}")
+
+    start = time.monotonic()
+    counts = {
+        "scanned": 0,
+        "scored": 0,
+        "confirmed": 0,
+        "invalidated": 0,
+        "inconclusive": 0,
+        "errors": 0,
+        "skipped_non_active": 0,
+        "timed_out": False,
+        "batch_size": batch_size,
+        "max_runtime_s": max_runtime_s,
+    }
+
+    # Fetch overdue active hypos. We compute eval_window_end on the fly from
+    # the JSONB criteria because the schema doesn't carry a separate column.
+    due_q = text("""
+        SELECT id
+        FROM discovered_hypotheses
+        WHERE status = 'active'
+          AND (
+              created_at + make_interval(
+                  days => COALESCE((test_criteria->>'window_days')::int, 7)
+              ) < NOW()
+          )
+        ORDER BY last_tested ASC NULLS FIRST, created_at ASC
+        LIMIT :batch_size
+    """)
+
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(due_q, {"batch_size": batch_size}).fetchall()
+    except Exception as exc:
+        log.warning("score_due_active_hypotheses: due-query failed: {e}", e=str(exc))
+        counts["errors"] += 1
+        return counts
+
+    counts["scanned"] = len(rows)
+    if not rows:
+        log.info("score_due_active_hypotheses: no overdue active hypotheses")
+        return counts
+
+    generator = HypothesisGenerator(engine)
+    for (hid,) in rows:
+        elapsed = time.monotonic() - start
+        if elapsed >= max_runtime_s:
+            counts["timed_out"] = True
+            log.info(
+                "score_due_active_hypotheses: hit max_runtime_s={t}s after {n} rows",
+                t=max_runtime_s, n=counts["scored"],
+            )
+            break
+        try:
+            result = generator.score_hypothesis(hid)
+        except Exception as exc:
+            counts["errors"] += 1
+            log.warning(
+                "score_due_active_hypotheses: score_hypothesis({hid}) raised: {e}",
+                hid=hid, e=str(exc),
+            )
+            continue
+
+        if "error" in result:
+            counts["errors"] += 1
+            continue
+        if result.get("message") == "not active, skipping":
+            counts["skipped_non_active"] += 1
+            continue
+
+        outcome = (result.get("outcome") or "inconclusive").lower()
+        if outcome == "confirmed":
+            counts["confirmed"] += 1
+        elif outcome == "invalidated":
+            counts["invalidated"] += 1
+        else:
+            counts["inconclusive"] += 1
+        counts["scored"] += 1
+
+    counts["runtime_s"] = round(time.monotonic() - start, 2)
+    log.info(
+        "score_due_active_hypotheses: scored={s} confirmed={c} invalidated={i} "
+        "inconclusive={n} errors={e} runtime={r}s timed_out={t}",
+        s=counts["scored"], c=counts["confirmed"], i=counts["invalidated"],
+        n=counts["inconclusive"], e=counts["errors"],
+        r=counts["runtime_s"], t=counts["timed_out"],
+    )
+    return counts
 
 
 # ── Stats ────────────────────────────────────────────────────────────────────

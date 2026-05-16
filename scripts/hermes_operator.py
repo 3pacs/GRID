@@ -95,6 +95,14 @@ SMART_INGESTION_TIMEOUT_SECONDS = 300         # smart_scheduler.tick() — match
 TIMESFM_TIMEOUT_SECONDS = 240                 # oracle/forecaster_adapter.run_timesfm_forecast_cycle
 INTELLIGENCE_TASKS_TIMEOUT_SECONDS = 360      # trust/forecasts/thesis/cross-ref/options + daily-window backtest_scanner.review_existing_hypotheses (LLM-bound). Bumped 2026-05-08 from 180s after the timeout machinery was actually working — 180s was empirical-untested guess; 360s reflects observed daily run length with LLM calls
 
+# Active-hypothesis scoring — periodic batch that closes the loop on the
+# auto_discover() pipeline. The bottleneck is per-row score_hypothesis()
+# calls which the 2026-05-15 manual run timed at ~15/sec on grid-svr;
+# 200 rows / 600s leaves ample headroom (~3 rows/sec budget).
+ACTIVE_HYPO_SCORING_BATCH_SIZE = 200
+ACTIVE_HYPO_SCORING_MAX_RUNTIME_S = 600
+ACTIVE_HYPO_SCORING_INTERVAL_MINUTES = 30
+
 
 def _run_with_timeout(name: str, fn, timeout_s: int, state):
     """Execute fn() with a hard timeout. On timeout, blacklist via cooldown.
@@ -410,6 +418,18 @@ from scripts.hermes_fixers import (  # noqa: E402, F401
 
 # ─── Intelligence task runner (remains in this file) ────────────────────
 
+
+def _minutes_since(ts: datetime | None) -> float:
+    """Return minutes elapsed since *ts*, or a large sentinel if ts is None.
+
+    Mirrors the ``_hours_since`` semantics in scripts/hermes_fixers.py for use
+    by sub-hour cadences like the periodic active-hypothesis scorer.
+    """
+    if ts is None:
+        return 1e9
+    return (datetime.now(timezone.utc) - ts).total_seconds() / 60.0
+
+
 def run_intelligence_tasks(
     engine: Any,
     state: OperatorState,
@@ -669,6 +689,27 @@ def run_intelligence_tasks(
             except Exception as exc:
                 log.warning("Hypothesis discovery failed: {e}", e=str(exc))
             state.last_hypothesis_discovery = now
+
+        # Periodic active-hypothesis scoring — every 30 minutes, batch up to
+        # 200 overdue hypos per tick. Closes the loop that auto_discover() above
+        # was creating but nothing was scoring (the gap documented in the memo
+        # ``project-active-hypo-scoring-gap`` and the 2026-05-15 handoff).
+        # Cadence kept short so the ~16k current overdue backlog drains across
+        # the next ~2-3 days at ~15 scored/sec sustained on grid-svr.
+        if _minutes_since(state.last_active_hypo_scoring) >= 30:
+            try:
+                from intelligence.hypothesis_engine import score_due_active_hypotheses
+                results["active_hypo_scoring"] = _run_intel_task(
+                    "active_hypo_scoring",
+                    score_due_active_hypotheses,
+                    state,
+                    engine,
+                    batch_size=ACTIVE_HYPO_SCORING_BATCH_SIZE,
+                    max_runtime_s=ACTIVE_HYPO_SCORING_MAX_RUNTIME_S,
+                )
+            except Exception as exc:
+                log.warning("Active hypothesis scoring failed: {e}", e=str(exc))
+            state.last_active_hypo_scoring = now
 
         # RAG index refresh — re-embed latest intelligence data
         if _hours_since(state.last_rag_index) >= 20:
