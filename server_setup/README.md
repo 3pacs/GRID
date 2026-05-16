@@ -12,8 +12,28 @@ server_setup/
 ├── grid-*.service                  # one unit per long-running grid component
 ├── grid-*.timer                    # timer companions (spider, walk-forward)
 ├── grid-*.service.d/cgroup.conf    # per-service cgroup drop-ins (memory caps, OOM bias)
-└── ssh.service.d/oom-protect.conf  # protects sshd from the OOM killer
+├── ssh.service.d/oom-protect.conf  # protects sshd from the OOM killer
+├── windows-to-mac-remote-access.md            # Windows ANIK -> home Mac mini runbook
+└── windows-to-mac-remote-access-preflight.ps1 # read-only PowerShell preflight
 ```
+
+## Windows-to-Mac remote access
+
+See [`windows-to-mac-remote-access.md`](./windows-to-mac-remote-access.md) for the
+runbook covering Tailscale reachability, SSH to the Mac mini, and the GUI/RDP
+decision boundary for re-enabling Windows ANIK-PC as a GRID worker.
+
+Run the read-only preflight on Windows before opening a remote-access session:
+
+```powershell
+.\server_setup\windows-to-mac-remote-access-preflight.ps1 `
+  -MacTailscaleIp 100.120.20.120 `
+  -MacSshUser anikdang `
+  -ExpectedWindowsTailscaleIp 100.94.80.45
+```
+
+The script never starts services, edits firewall rules, enables RDP, or writes
+SSH keys. All credential and admin-console steps stay manual.
 
 ## cgroup / OOM model
 
