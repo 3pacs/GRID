@@ -11,7 +11,6 @@ from loguru import logger as log
 from api.auth import require_auth
 from api.dependencies import get_db_engine
 from utils.ttl_cache import TTLCache
-from utils.timing import timed_section
 
 router = APIRouter(tags=["intelligence"])
 
@@ -536,15 +535,9 @@ def _build_dashboard_snapshot() -> dict[str, Any]:
     Calls each intelligence module, catches failures individually so
     partial data is still returned, and computes an overall confidence.
     """
-    with timed_section("dashboard.total", log):
-        return _build_dashboard_snapshot_inner()
-
-
-def _build_dashboard_snapshot_inner() -> dict[str, Any]:
     from datetime import datetime, timezone
 
-    with timed_section("dashboard.get_db_engine", log):
-        engine = get_db_engine()
+    engine = get_db_engine()
     snapshot: dict[str, Any] = {
         "trust": {"top_sources": [], "convergence_events": []},
         "levers": {"active_events": [], "top_pullers": []},
@@ -561,15 +554,28 @@ def _build_dashboard_snapshot_inner() -> dict[str, Any]:
 
     # ── Trust & Convergence ──────────────────────────────────────────
     try:
-        with timed_section("dashboard.trust.import", log):
-            from intelligence.trust_scorer import update_trust_scores, detect_convergence
+        # Perf 2026-05-16: read from source_trust_scores_cached (populated
+        # nightly by flows/refresh_trust_scores.py) instead of recomputing
+        # 2,771 sources on every cold dashboard hit (was ~12s, now ~50ms).
+        # Stale-while-revalidate: if cache is empty or >24h old, fall back
+        # to a live recompute so the dashboard still renders correctly
+        # before/after the nightly flow has run.
+        from intelligence.trust_scorer import (
+            load_trust_scores_cached,
+            update_trust_scores,
+            detect_convergence,
+        )
 
-        with timed_section("dashboard.trust.update_trust_scores", log):
+        trust_data = load_trust_scores_cached(engine)
+        if trust_data is None:
+            log.warning(
+                "Dashboard trust cache miss — falling back to live recompute "
+                "(slow). Run flows/refresh_trust_scores.py to repopulate."
+            )
             trust_data = update_trust_scores(engine)
         all_sources = trust_data.get("sources", [])
         top_5 = all_sources[:5]
-        with timed_section("dashboard.trust.detect_convergence", log):
-            convergence = detect_convergence(engine)
+        convergence = detect_convergence(engine)
 
         snapshot["trust"] = {
             "top_sources": top_5,
@@ -589,19 +595,15 @@ def _build_dashboard_snapshot_inner() -> dict[str, Any]:
 
     # ── Lever Pullers ────────────────────────────────────────────────
     try:
-        with timed_section("dashboard.levers.import", log):
-            from intelligence.lever_pullers import (
-                get_active_lever_events,
-                identify_lever_pullers,
-                find_lever_convergence,
-            )
+        from intelligence.lever_pullers import (
+            get_active_lever_events,
+            identify_lever_pullers,
+            find_lever_convergence,
+        )
 
-        with timed_section("dashboard.levers.identify_lever_pullers", log):
-            pullers = identify_lever_pullers(engine)
-        with timed_section("dashboard.levers.get_active_lever_events", log):
-            events = get_active_lever_events(engine, days=14, pullers=pullers)
-        with timed_section("dashboard.levers.find_lever_convergence", log):
-            lever_convergence = find_lever_convergence(engine, pullers=pullers)
+        pullers = identify_lever_pullers(engine)
+        events = get_active_lever_events(engine, days=14, pullers=pullers)
+        lever_convergence = find_lever_convergence(engine, pullers=pullers)
 
         event_dicts = []
         for ev in events[:10]:
@@ -640,14 +642,12 @@ def _build_dashboard_snapshot_inner() -> dict[str, Any]:
 
     # ── Cross-Reference (Lie Detector) ───────────────────────────────
     try:
-        with timed_section("dashboard.cross_ref.import", log):
-            from intelligence.cross_reference import run_all_checks
+        from intelligence.cross_reference import run_all_checks
 
-        # NOTE(perf 2026-05-16): currently called WITHOUT skip_narrative=True,
-        # so this includes LLM router init + narrative generation. Timing
-        # block exists so we can prove that cost before changing the call.
-        with timed_section("dashboard.cross_ref.run_all_checks", log):
-            report = run_all_checks(engine)
+        # Perf 2026-05-16: skip the LLM narrative generation on the cold
+        # dashboard render — the dashboard only displays red_flags + counts
+        # from the report, never the narrative. Saves ~2-5s on cold load.
+        report = run_all_checks(engine, skip_narrative=True)
         red_flags = [asdict(c) for c in report.red_flags[:10]]
 
         snapshot["cross_ref"] = {
@@ -665,11 +665,9 @@ def _build_dashboard_snapshot_inner() -> dict[str, Any]:
 
     # ── Source Audit ─────────────────────────────────────────────────
     try:
-        with timed_section("dashboard.source_audit.import", log):
-            from intelligence.source_audit import get_latest_audit_summary
+        from intelligence.source_audit import get_latest_audit_summary
 
-        with timed_section("dashboard.source_audit.get_latest_audit_summary", log):
-            audit = get_latest_audit_summary(engine)
+        audit = get_latest_audit_summary(engine)
 
         snapshot["source_audit"] = {
             "discrepancies": audit.get("recent_discrepancies", [])[:10],
@@ -691,55 +689,27 @@ def _build_dashboard_snapshot_inner() -> dict[str, Any]:
 
     # ── Post-Mortems ─────────────────────────────────────────────────
     try:
-        with timed_section("dashboard.postmortems.import", log):
-            from intelligence.postmortem import load_postmortems
+        # Perf 2026-05-16: dashboard only displays the top-5 most recent
+        # post-mortems plus a total count, but the previous code hydrated
+        # ALL rows in the 30d window (93K+ on grid-svr → 24-31s cold).
+        # Use the fast path (LIMIT 5 + no full_analysis JSONB) plus a cheap
+        # COUNT(*) for the badge. The LLM-generated `lessons` narrative is
+        # also dropped from the cold path — it costs ~6-8s and the frontend
+        # can load it via a separate async fetch from a dedicated endpoint
+        # if/when a Lessons widget needs it.
+        from intelligence.postmortem import load_postmortems_top_n, count_postmortems
 
-        with timed_section("dashboard.postmortems.load_postmortems", log):
-            records = load_postmortems(engine, days=30)
-        recent = records[:5]
-
-        lessons = ""
-        if recent:
-            try:
-                from intelligence.postmortem import generate_lessons_learned, PostMortem
-                pms = []
-                for r in records[:10]:
-                    full = r.get("full_analysis", {})
-                    if full:
-                        try:
-                            pms.append(PostMortem(
-                                trade_id=full.get("trade_id", 0),
-                                ticker=full.get("ticker", r.get("ticker", "")),
-                                direction=full.get("direction", ""),
-                                outcome=full.get("outcome", r.get("outcome", "")),
-                                actual_return=full.get("actual_return", 0.0),
-                                data_at_decision=full.get("data_at_decision", {}),
-                                thesis_at_decision=full.get("thesis_at_decision", ""),
-                                sanity_results_at_decision=full.get("sanity_results_at_decision", {}),
-                                what_actually_happened=full.get("what_actually_happened", ""),
-                                price_path=full.get("price_path", []),
-                                failure_category=full.get("failure_category", ""),
-                                root_cause=full.get("root_cause", ""),
-                                which_signals_were_wrong=full.get("which_signals_were_wrong", []),
-                                which_signals_were_right=full.get("which_signals_were_right", []),
-                                what_we_missed=full.get("what_we_missed", ""),
-                                recommended_fix=full.get("recommended_fix", ""),
-                                confidence_in_analysis=full.get("confidence_in_analysis", 0.5),
-                                generated_at=full.get("generated_at", ""),
-                            ))
-                        except Exception as e:
-                            log.debug("Risk dashboard: postmortem parse failed: {e}", e=str(e))
-                            continue
-                if pms:
-                    with timed_section("dashboard.postmortems.generate_lessons_learned", log):
-                        lessons = generate_lessons_learned(engine, pms)
-            except Exception as e:
-                log.warning("Risk dashboard: postmortem analysis failed: {e}", e=str(e))
+        recent = load_postmortems_top_n(engine, n=5, days=30)
+        total_count = count_postmortems(engine, days=30)
 
         snapshot["postmortems"] = {
             "recent_failures": recent,
-            "lessons": lessons,
-            "total_count": len(records),
+            # NOTE(perf 2026-05-16): cold dashboard no longer runs the LLM
+            # lessons synthesis. Empty string is the agreed contract; a
+            # follow-up PR will expose lessons via /api/v1/intelligence/
+            # postmortem-lessons for the (planned) async Lessons widget.
+            "lessons": "",
+            "total_count": total_count,
         }
     except Exception as exc:
         log.warning("Dashboard: postmortem module failed: {e}", e=str(exc))

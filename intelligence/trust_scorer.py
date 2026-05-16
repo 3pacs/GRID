@@ -289,7 +289,28 @@ def _ensure_tables(engine: Engine) -> None:
             CREATE INDEX IF NOT EXISTS idx_signal_sources_trust
                 ON signal_sources (trust_score DESC)
         """))
-    log.debug("signal_sources table ensured")
+        # 2026-05-16 perf: cache table for nightly trust score refresh so the
+        # dashboard cold path doesn't recompute 2,771 sources on every hit.
+        # Populated by flows/refresh_trust_scores.py (Prefect nightly).
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS source_trust_scores_cached (
+                source_type   TEXT NOT NULL,
+                source_id     TEXT NOT NULL,
+                trust_score   DOUBLE PRECISION NOT NULL,
+                breakdown     JSONB NOT NULL,
+                updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (source_type, source_id)
+            )
+        """))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_stsc_trust_desc
+                ON source_trust_scores_cached (trust_score DESC)
+        """))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_stsc_updated_at
+                ON source_trust_scores_cached (updated_at DESC)
+        """))
+    log.debug("signal_sources + source_trust_scores_cached tables ensured")
 
 
 # ── Value Extraction ──────────────────────────────────────────────────────
@@ -667,6 +688,110 @@ def update_trust_scores(engine: Engine) -> dict[str, Any]:
     )
 
     return {"sources": sources_updated, "total": len(sources_updated)}
+
+
+# ── 2b. Cached Trust Score Read Path (perf 2026-05-16) ─────────────────────
+
+# Stale-while-revalidate threshold — if cache is older than this, fall back to
+# live recompute (heavy). Nightly flow refreshes well within this window.
+_TRUST_CACHE_MAX_AGE_HOURS: int = 24
+
+
+def write_trust_scores_cache(engine: Engine, payload: dict[str, Any]) -> int:
+    """Persist the output of update_trust_scores() to source_trust_scores_cached.
+
+    Called by the nightly Prefect flow (flows/refresh_trust_scores.py). The
+    dashboard cold path then reads via load_trust_scores_cached() instead of
+    recomputing 2,771 sources on every hit (was ~12s).
+
+    Returns number of rows upserted.
+    """
+    _ensure_tables(engine)
+    sources = payload.get("sources", [])
+    if not sources:
+        log.warning("write_trust_scores_cache: empty payload, skipping")
+        return 0
+
+    written = 0
+    with engine.begin() as conn:
+        # Truncate-and-insert is simpler than per-row UPSERT for ~3K rows and
+        # avoids stale entries for sources that disappeared from signal_sources.
+        conn.execute(text("DELETE FROM source_trust_scores_cached"))
+        for s in sources:
+            conn.execute(text("""
+                INSERT INTO source_trust_scores_cached
+                    (source_type, source_id, trust_score, breakdown, updated_at)
+                VALUES (:st, :si, :ts, CAST(:bd AS JSONB), NOW())
+            """), {
+                "st": s["source_type"],
+                "si": s["source_id"],
+                "ts": float(s["trust_score"]),
+                "bd": json.dumps(s),
+            })
+            written += 1
+    log.info("write_trust_scores_cache: wrote {n} rows", n=written)
+    return written
+
+
+def load_trust_scores_cached(
+    engine: Engine,
+    max_age_hours: int = _TRUST_CACHE_MAX_AGE_HOURS,
+) -> dict[str, Any] | None:
+    """Read pre-computed trust scores from cache table.
+
+    Returns the same shape as update_trust_scores() — {"sources": [...], "total": N}
+    — so the dashboard call site can be a drop-in swap.
+
+    Returns None if the cache is empty or staler than max_age_hours so the
+    caller can fall back to a live recompute (stale-while-revalidate).
+
+    Perf 2026-05-16: this replaces the 11-15s update_trust_scores() call on
+    the dashboard cold path with a single indexed SELECT (~50ms).
+    """
+    _ensure_tables(engine)
+    with engine.connect() as conn:
+        # Reject the whole cache if the freshest row is older than the
+        # threshold — we don't want to serve a stale snapshot when the
+        # nightly flow has been failing for a week.
+        freshest = conn.execute(text("""
+            SELECT MAX(updated_at) FROM source_trust_scores_cached
+        """)).scalar()
+        if freshest is None:
+            log.info("load_trust_scores_cached: cache empty, signal fallback")
+            return None
+        age_hours = (datetime.now(timezone.utc) - freshest).total_seconds() / 3600.0
+        if age_hours > max_age_hours:
+            log.warning(
+                "load_trust_scores_cached: cache stale ({h:.1f}h > {m}h), signal fallback",
+                h=age_hours, m=max_age_hours,
+            )
+            return None
+
+        rows = conn.execute(text("""
+            SELECT source_type, source_id, trust_score, breakdown
+            FROM source_trust_scores_cached
+            ORDER BY trust_score DESC
+        """)).fetchall()
+
+    sources: list[dict[str, Any]] = []
+    for rank, (src_type, src_id, ts, bd) in enumerate(rows, 1):
+        # breakdown JSONB stores the full dict written by update_trust_scores;
+        # JSONB columns come back as dict already on psycopg2/asyncpg.
+        if isinstance(bd, str):
+            try:
+                bd = json.loads(bd)
+            except (json.JSONDecodeError, TypeError):
+                bd = {}
+        if not isinstance(bd, dict):
+            bd = {}
+        bd.setdefault("source_type", src_type)
+        bd.setdefault("source_id", src_id)
+        bd.setdefault("trust_score", float(ts))
+        bd["rank"] = rank
+        sources.append(bd)
+
+    log.info("load_trust_scores_cached: served {n} sources from cache", n=len(sources))
+    return {"sources": sources, "total": len(sources)}
 
 
 # ── 3. Get Trusted Sources ────────────────────────────────────────────────
