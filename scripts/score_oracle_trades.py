@@ -81,13 +81,31 @@ def fetch_prices(tickers: list[str], start: str, end: str) -> dict[str, pd.DataF
 
 
 def get_price_for_date(prices: dict, ticker: str, target_date: date) -> float | None:
-    """Get close price for a ticker on a date, with lookback for weekends/holidays."""
+    """Get close price for a ticker on a date, with lookback for weekends/holidays.
+
+    For ``target_date >= today`` we REFUSE to fall back to prior closes — if the
+    market hasn't closed on the expiry day, the prediction must remain pending
+    rather than be locked in against the wrong (earlier) close. Without this
+    guard, predictions expiring on day T get "scored" against day T-1 at hermes
+    cycles that fire before T's close, then frozen with verdict='hit/miss' so
+    the post-close rerun is skipped. (2026-05-15: caught after 2.27M predictions
+    expiring on Friday got scored Thursday night with Thursday's close.)
+    """
     if ticker not in prices:
         return None
 
     ticker_prices = prices[ticker]
+    today = date.today()
 
-    # Try exact date, then look back up to 5 days
+    if target_date >= today:
+        # Same-day-only: refuse to substitute an earlier close.
+        if target_date in ticker_prices:
+            val = ticker_prices[target_date]
+            if pd.notna(val) and val > 0:
+                return float(val)
+        return None
+
+    # Historical expiry — fall back up to 5 days for weekends/holidays.
     for offset in range(6):
         check_date = target_date - timedelta(days=offset)
         if check_date in ticker_prices:

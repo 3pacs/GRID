@@ -37,6 +37,26 @@ import {
 
 export const routes = [
     /* ── World View: primary tab bar ─────────────────────────────── */
+    /*
+     * TPS (Trump-Proximity Score) — Phase 0 of the GRID-4-product pivot.
+     * docs/planning/GRID-4-PRODUCT-PIVOT.md section 5 designates this the
+     * NEW default landing route. The PWA has no feature-flag pattern yet,
+     * so per the build brief we list TPS first (the tab bar uses route
+     * order for default selection in worldView). Promotion to literal
+     * default — the route renderer in app.jsx still falls back to its
+     * stored last-view on hard reload — lands in a follow-up PR once 24h
+     * of snapshot data exists. See TPS.jsx for the feature-flag TODO.
+     */
+    {
+        id: 'tps',
+        label: 'TPS',
+        labelShort: 'TPS',
+        icon: Crosshair,
+        component: './views/TPS.jsx',
+        group: 'worldView',
+        nav: 'tab',
+        desc: 'Daily Trump-Proximity Score watchlist with full evidence chain',
+    },
     {
         id: 'surfacer',
         label: 'Surfacer',

@@ -1975,11 +1975,24 @@ class OracleEngine:
             return None
 
     def _get_price_at_date(self, ticker: str, target_date: date) -> float | None:
-        """Get price at or near a specific date for scoring."""
+        """Get price at or near a specific date for scoring.
+
+        For ``target_date >= today`` we use an EQUALITY match instead of
+        ``<=`` — the market hasn't closed on the expiry day yet, so falling
+        back to an earlier close would lock in the wrong actual_price and
+        flip the verdict to a final state that the post-close scorer would
+        then skip (verdict != 'pending'). When the same-day close hasn't
+        been ingested, return None and leave the prediction pending.
+        (2026-05-15: caught after 2.27M Friday-expiry predictions got scored
+        Thursday night against Thursday's close.)
+        """
+        same_day_only = target_date >= date.today()
+        date_filter = "signal_date = :d" if same_day_only else "signal_date <= :d"
+        raw_date_filter = "obs_date = :d" if same_day_only else "obs_date <= :d"
         with self.engine.connect() as conn:
-            row = conn.execute(text("""
+            row = conn.execute(text(f"""
                 SELECT spot_price FROM options_daily_signals
-                WHERE ticker = :t AND signal_date <= :d AND spot_price > 0
+                WHERE ticker = :t AND {date_filter} AND spot_price > 0
                 ORDER BY signal_date DESC LIMIT 1
             """), {"t": ticker, "d": target_date}).fetchone()
             if row:
@@ -1987,19 +2000,19 @@ class OracleEngine:
             # Fallback: try direct ticker, then USD suffix (for crypto)
             for sid in [f"YF:{ticker}:adj_close", f"YF:{ticker}:close",
                        f"YF:{ticker}-USD:adj_close", f"YF:{ticker}-USD:close"]:
-                row = conn.execute(text("""
+                row = conn.execute(text(f"""
                     SELECT value FROM raw_series
-                    WHERE series_id = :sid AND obs_date <= :d AND pull_status = 'SUCCESS'
+                    WHERE series_id = :sid AND {raw_date_filter} AND pull_status = 'SUCCESS'
                     ORDER BY obs_date DESC LIMIT 1
                 """), {"sid": sid, "d": target_date}).fetchone()
                 if row:
                     return float(row[0])
             # Last resort: resolved_series
-            row = conn.execute(text("""
+            row = conn.execute(text(f"""
                 SELECT rs.value FROM resolved_series rs
                 JOIN feature_registry fr ON fr.id = rs.feature_id
                 WHERE (fr.name = :n1 OR fr.name = :n2)
-                AND rs.obs_date <= :d AND rs.value IS NOT NULL
+                AND {raw_date_filter} AND rs.value IS NOT NULL
                 ORDER BY rs.obs_date DESC LIMIT 1
             """), {
                 "n1": f"{ticker.lower()}_full",
