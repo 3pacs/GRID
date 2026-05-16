@@ -1,8 +1,8 @@
 # GRID Module Inventory
 
 Generated: 2026-05-16
-Total modules: 740
-Total LOC: 325,315
+Total modules: 741
+Total LOC: 326,014
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycache__/`, `build/`, `dist/`, `docs/`, `node_modules/`, `notebooks/`, `pwa/`, `pwa_dist/`, `tests/`, `venv/`.
@@ -11,7 +11,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 
 | Directory | Module count | LOC |
 |---|---|---|
-| `intelligence/` | 169 | 100,021 |
+| `intelligence/` | 170 | 100,720 |
 | `ingestion/` | 204 | 83,948 |
 | `api/` | 106 | 47,971 |
 | `analysis/` | 33 | 18,973 |
@@ -481,6 +481,11 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `collections`, `copy`, `intelligence`, `loguru`, `sqlalchemy`, `typing`
 **Imported by:** `api/routers/intelligence_deepdive.py`
 
+#### `intelligence/goal_queue.py` — 577 LOC
+**Docstring:** Goal queue — Day 1 of the idle-fleet agent-loop PoC.
+**Functions:** `Goal`, `enqueue_goal`, `enqueue_many`, `claim_goal`, `submit_result`, `mark_failed`, `extend_lease`, `reap_expired_leases`, `queue_stats`, `recent_results`
+**Reads:** `__future__`, `dataclasses`, `datetime`, `json`, `loguru`, `sqlalchemy`, `typing`
+
 #### `intelligence/gov_intel.py` — 296 LOC
 **Docstring:** GRID Intelligence — Government Contract Analysis.
 **Functions:** `ContractRecord`, `InsiderContractOverlap`, `get_recent_contracts`, `get_contracts_for_ticker`, `detect_contract_insider_overlap`
@@ -510,10 +515,10 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `contracts`, `dataclasses`, `datetime`, `loguru`, `sqlalchemy`, `typing`, `uuid`
 **Imported by:** `api/routers/actor_detail.py`
 
-#### `intelligence/hypothesis_engine.py` — 2183 LOC
+#### `intelligence/hypothesis_engine.py` — 2305 LOC
 **Docstring:** GRID Intelligence — Hypothesis Discovery Engine.
-**Functions:** `DiscoveredPattern`, `Anomaly`, `Hypothesis`, `ensure_tables`, `TemporalPatternDetector`, `AnomalyHunter`, `HypothesisGenerator`, `cleanup_hypotheses`, `get_stats`, `main`
-**Reads:** `__future__`, `collections`, `dataclasses`, `datetime`, `db`, `hashlib`, `intelligence`, `json`, `loguru`, `math`, `numpy`, `re`, `scipy`, `sqlalchemy`, `sys`, `typing`
+**Functions:** `DiscoveredPattern`, `Anomaly`, `Hypothesis`, `ensure_tables`, `TemporalPatternDetector`, `AnomalyHunter`, `HypothesisGenerator`, `cleanup_hypotheses`, `score_due_active_hypotheses`, `get_stats`, `main`
+**Reads:** `__future__`, `collections`, `dataclasses`, `datetime`, `db`, `hashlib`, `intelligence`, `json`, `loguru`, `math`, `numpy`, `re`, `scipy`, `sqlalchemy`, `sys`, `time`, `typing`
 **Imported by:** `ingestion/scheduler.py`
 
 #### `intelligence/icij_linker.py` — 196 LOC
