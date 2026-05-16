@@ -168,3 +168,7 @@ def test_db_connect_info_accepts_sqlalchemy_url_and_pg_env(monkeypatch):
         "user": "grid",
         "password": "secret",
     }
+
+
+def test_default_hosts_include_known_stale_worker_nodes():
+    assert "panda" in fleet_audit.DEFAULT_HOSTS

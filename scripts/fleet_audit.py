@@ -26,7 +26,7 @@ import requests
 
 
 DEFAULT_COORDINATOR = os.getenv("GRID_COORDINATOR_URL", "http://100.75.185.36:8100")
-DEFAULT_HOSTS = ("grid-svr", "gridz4", "koala", "redbox", "ocr-node", "p9d", "z400")
+DEFAULT_HOSTS = ("grid-svr", "gridz4", "koala", "redbox", "ocr-node", "p9d", "z400", "panda")
 SERVICE_NEEDLES = ("grid-", "storymill-", "llama", "ollama", "comfyui", "topaz", "surya")
 REMOTE_PROBE = r"""
 import json
