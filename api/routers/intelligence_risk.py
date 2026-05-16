@@ -11,6 +11,7 @@ from loguru import logger as log
 from api.auth import require_auth
 from api.dependencies import get_db_engine
 from utils.ttl_cache import TTLCache
+from utils.timing import timed_section
 
 router = APIRouter(tags=["intelligence"])
 
@@ -535,9 +536,15 @@ def _build_dashboard_snapshot() -> dict[str, Any]:
     Calls each intelligence module, catches failures individually so
     partial data is still returned, and computes an overall confidence.
     """
+    with timed_section("dashboard.total", log):
+        return _build_dashboard_snapshot_inner()
+
+
+def _build_dashboard_snapshot_inner() -> dict[str, Any]:
     from datetime import datetime, timezone
 
-    engine = get_db_engine()
+    with timed_section("dashboard.get_db_engine", log):
+        engine = get_db_engine()
     snapshot: dict[str, Any] = {
         "trust": {"top_sources": [], "convergence_events": []},
         "levers": {"active_events": [], "top_pullers": []},
@@ -554,12 +561,15 @@ def _build_dashboard_snapshot() -> dict[str, Any]:
 
     # ── Trust & Convergence ──────────────────────────────────────────
     try:
-        from intelligence.trust_scorer import update_trust_scores, detect_convergence
+        with timed_section("dashboard.trust.import", log):
+            from intelligence.trust_scorer import update_trust_scores, detect_convergence
 
-        trust_data = update_trust_scores(engine)
+        with timed_section("dashboard.trust.update_trust_scores", log):
+            trust_data = update_trust_scores(engine)
         all_sources = trust_data.get("sources", [])
         top_5 = all_sources[:5]
-        convergence = detect_convergence(engine)
+        with timed_section("dashboard.trust.detect_convergence", log):
+            convergence = detect_convergence(engine)
 
         snapshot["trust"] = {
             "top_sources": top_5,
@@ -579,15 +589,19 @@ def _build_dashboard_snapshot() -> dict[str, Any]:
 
     # ── Lever Pullers ────────────────────────────────────────────────
     try:
-        from intelligence.lever_pullers import (
-            get_active_lever_events,
-            identify_lever_pullers,
-            find_lever_convergence,
-        )
+        with timed_section("dashboard.levers.import", log):
+            from intelligence.lever_pullers import (
+                get_active_lever_events,
+                identify_lever_pullers,
+                find_lever_convergence,
+            )
 
-        pullers = identify_lever_pullers(engine)
-        events = get_active_lever_events(engine, days=14, pullers=pullers)
-        lever_convergence = find_lever_convergence(engine, pullers=pullers)
+        with timed_section("dashboard.levers.identify_lever_pullers", log):
+            pullers = identify_lever_pullers(engine)
+        with timed_section("dashboard.levers.get_active_lever_events", log):
+            events = get_active_lever_events(engine, days=14, pullers=pullers)
+        with timed_section("dashboard.levers.find_lever_convergence", log):
+            lever_convergence = find_lever_convergence(engine, pullers=pullers)
 
         event_dicts = []
         for ev in events[:10]:
@@ -626,9 +640,14 @@ def _build_dashboard_snapshot() -> dict[str, Any]:
 
     # ── Cross-Reference (Lie Detector) ───────────────────────────────
     try:
-        from intelligence.cross_reference import run_all_checks
+        with timed_section("dashboard.cross_ref.import", log):
+            from intelligence.cross_reference import run_all_checks
 
-        report = run_all_checks(engine)
+        # NOTE(perf 2026-05-16): currently called WITHOUT skip_narrative=True,
+        # so this includes LLM router init + narrative generation. Timing
+        # block exists so we can prove that cost before changing the call.
+        with timed_section("dashboard.cross_ref.run_all_checks", log):
+            report = run_all_checks(engine)
         red_flags = [asdict(c) for c in report.red_flags[:10]]
 
         snapshot["cross_ref"] = {
@@ -646,9 +665,11 @@ def _build_dashboard_snapshot() -> dict[str, Any]:
 
     # ── Source Audit ─────────────────────────────────────────────────
     try:
-        from intelligence.source_audit import get_latest_audit_summary
+        with timed_section("dashboard.source_audit.import", log):
+            from intelligence.source_audit import get_latest_audit_summary
 
-        audit = get_latest_audit_summary(engine)
+        with timed_section("dashboard.source_audit.get_latest_audit_summary", log):
+            audit = get_latest_audit_summary(engine)
 
         snapshot["source_audit"] = {
             "discrepancies": audit.get("recent_discrepancies", [])[:10],
@@ -670,9 +691,11 @@ def _build_dashboard_snapshot() -> dict[str, Any]:
 
     # ── Post-Mortems ─────────────────────────────────────────────────
     try:
-        from intelligence.postmortem import load_postmortems
+        with timed_section("dashboard.postmortems.import", log):
+            from intelligence.postmortem import load_postmortems
 
-        records = load_postmortems(engine, days=30)
+        with timed_section("dashboard.postmortems.load_postmortems", log):
+            records = load_postmortems(engine, days=30)
         recent = records[:5]
 
         lessons = ""
@@ -708,7 +731,8 @@ def _build_dashboard_snapshot() -> dict[str, Any]:
                             log.debug("Risk dashboard: postmortem parse failed: {e}", e=str(e))
                             continue
                 if pms:
-                    lessons = generate_lessons_learned(engine, pms)
+                    with timed_section("dashboard.postmortems.generate_lessons_learned", log):
+                        lessons = generate_lessons_learned(engine, pms)
             except Exception as e:
                 log.warning("Risk dashboard: postmortem analysis failed: {e}", e=str(e))
 
