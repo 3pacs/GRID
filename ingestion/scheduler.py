@@ -1494,6 +1494,30 @@ def start_scheduler() -> None:
 
     schedule.every().sunday.at("02:30").do(_cleanup_hypotheses)
 
+    # Daily Trump-Proximity Score refresh — 06:00 ET (10:00 UTC EDT,
+    # 11:00 UTC EST). We register both so the watchlist is on the
+    # operator's desk before the cash open year-round. The downstream
+    # ``refresh_top_universe`` is idempotent on (ticker, as_of_date), so
+    # the duplicate fire-time during the EDT/EST transition is harmless.
+    # See docs/planning/GRID-4-PRODUCT-PIVOT.md Phase 0.
+    def _run_tps_refresh() -> None:
+        try:
+            from db import get_engine
+            from intelligence.trump_proximity import refresh_top_universe
+
+            results = refresh_top_universe(get_engine())
+            scored = sum(1 for r in results if r.score is not None)
+            log.info(
+                "TPS daily refresh — {n} tickers, {s} scored",
+                n=len(results), s=scored,
+            )
+        except Exception as exc:
+            log.warning("TPS daily refresh failed: {e}", e=str(exc))
+
+    schedule.every().day.at("10:00").do(_run_tps_refresh)  # 06:00 ET (EDT)
+    schedule.every().day.at("11:00").do(_run_tps_refresh)  # 06:00 ET (EST)
+    log.info("TPS daily refresh registered (10:00 + 11:00 UTC)")
+
     log.info(
         "Unified scheduler configured — entering run loop (Ctrl+C to stop)"
     )
