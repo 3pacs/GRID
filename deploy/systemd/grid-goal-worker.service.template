@@ -1,0 +1,50 @@
+[Unit]
+Description=GRID idle-fleet goal worker (%i)
+Documentation=file:///opt/grid/docs/planning/IDLE-FLEET-AGENT-LOOP.md
+After=network-online.target
+Wants=network-online.target
+
+# This is a templated unit. Instantiate per-node with:
+#   sudo systemctl enable --now grid-goal-worker@gridz4.service
+# The %i instance string is informational only — the actual node
+# identity, hardware tier, and duty-cycle cap come from the env file
+# at /etc/grid/goal-worker-%i.env (see deploy/systemd/README.md).
+
+[Service]
+Type=simple
+User=grid
+Group=grid
+WorkingDirectory=/opt/grid
+EnvironmentFile=/etc/grid/goal-worker-%i.env
+
+# Sensible defaults; override in the env file per host.
+Environment=GRID_GOAL_WORKER_POLL_SECONDS=30
+Environment=GRID_GOAL_WORKER_LEASE_SECONDS=600
+Environment=GRID_GOAL_WORKER_MAX_DUTY_CYCLE=0.5
+Environment=GRID_GOAL_WORKER_DUTY_WINDOW_S=300
+Environment=GRID_GOAL_WORKER_HEARTBEAT_SEC=60
+Environment=GRID_GOAL_WORKER_ALLOW_CLOUD=0
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/opt/grid/.venv/bin/python -m scripts.goal_worker
+
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+
+# Kernel-level deprioritisation so a hot goal cannot starve protected
+# services (Nemotron @ :8080, ComfyUI @ :8188, storymill @ :7860).
+Nice=19
+IOSchedulingClass=idle
+IOSchedulingPriority=7
+CPUSchedulingPolicy=batch
+
+# Tighten the blast radius — worker only needs the repo and DB socket.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/var/log/grid /opt/grid/.server-logs
+
+[Install]
+WantedBy=multi-user.target
