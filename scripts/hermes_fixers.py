@@ -86,7 +86,6 @@ _CATALOG_TO_REGISTRY: dict[str, str] = {
     "NewsScraperRSS": "news_scraper",
     "USASPENDING_GOV": "gov_contracts",
     "BIS_EXPORT_CONTROLS": "export_controls",
-    "NOAA_AIS": "noaa_ais",
     "STOCKTWITS": "stocktwits",
     "OppInsights": "fred",
     "yfinance_earnings": "earnings_calendar",
