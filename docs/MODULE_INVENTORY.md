@@ -1,8 +1,8 @@
 # GRID Module Inventory
 
-Generated: 2026-05-17
+Generated: 2026-05-18
 Total modules: 746
-Total LOC: 327,249
+Total LOC: 327,275
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycache__/`, `build/`, `dist/`, `docs/`, `node_modules/`, `notebooks/`, `pwa/`, `pwa_dist/`, `tests/`, `venv/`.
@@ -11,7 +11,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 
 | Directory | Module count | LOC |
 |---|---|---|
-| `intelligence/` | 171 | 101,005 |
+| `intelligence/` | 171 | 101,031 |
 | `ingestion/` | 204 | 83,951 |
 | `api/` | 107 | 48,162 |
 | `analysis/` | 33 | 18,973 |
@@ -700,7 +700,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `datetime`, `ingestion`, `loguru`, `re`, `sqlalchemy`, `threading`, `typing`
 **Imported by:** `api/routers/chat.py`, `intelligence/freshness_guard.py`
 
-#### `intelligence/postmortem.py` — 2232 LOC
+#### `intelligence/postmortem.py` — 2258 LOC
 **Docstring:** GRID Intelligence — Automated Post-Mortem Analysis for Failed Trades & Predictions.
 **Functions:** `PostMortem`, `generate_postmortem`, `generate_prediction_postmortem`, `batch_postmortem`, `generate_lessons_learned`, `record_success_lesson`, `load_postmortems_top_n`, `count_postmortems`, `load_postmortems`, `apply_contagion_feedback`
 **Reads:** `__future__`, `collections`, `contracts`, `dataclasses`, `datetime`, `db`, `decimal`, `intelligence`, `json`, `llm`, `loguru`, `sqlalchemy`, `typing`, `uuid`

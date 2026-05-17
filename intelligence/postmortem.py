@@ -430,7 +430,11 @@ def generate_prediction_postmortem(engine: Engine, prediction_id: str) -> PostMo
 
 # ── 3. Batch Post-Mortem ──────────────────────────────────────────────────
 
-def batch_postmortem(engine: Engine, days: int = 30) -> list[PostMortem]:
+def batch_postmortem(
+    engine: Engine,
+    days: int = 30,
+    limit: int | None = None,
+) -> list[PostMortem]:
     """Generate post-mortems for all failed trades and predictions in the last N days.
 
     Aggregates patterns across failures and logs systemic issues.
@@ -438,6 +442,18 @@ def batch_postmortem(engine: Engine, days: int = 30) -> list[PostMortem]:
     Args:
         engine: SQLAlchemy engine.
         days: Lookback window in days.
+        limit: Optional cap on rows pulled from EACH source (trades +
+            predictions). When set, the loop processes the most-recent
+            ``limit`` rows from each pool, deferring older rows to a
+            subsequent batch. The standard incremental loop is the
+            ``id NOT IN (SELECT ... FROM trade_postmortems ...)``
+            de-duplication — each invocation picks up the most-recent
+            still-unprocessed failures. With ``limit`` you get
+            interruptible bounded-runtime batches; without it, the
+            function still processes everything but may run for many
+            minutes on the live corpus (2026-05-16 audit observed 256
+            new rows in 30 min on the LLM-narrative path). Cron-friendly
+            pattern: schedule every 15 min with ``limit=20``.
 
     Returns:
         list of PostMortem objects.
@@ -446,29 +462,37 @@ def batch_postmortem(engine: Engine, days: int = 30) -> list[PostMortem]:
     cutoff = date.today() - timedelta(days=days)
     postmortems: list[PostMortem] = []
 
+    # When limit is provided, append SQL LIMIT to bound each batch.
+    trade_sql = """
+        SELECT id FROM options_recommendations
+        WHERE outcome IN ('LOSS', 'EXPIRED')
+          AND closed_at >= :cutoff
+          AND id NOT IN (
+              SELECT trade_id FROM trade_postmortems
+              WHERE trade_id IS NOT NULL
+          )
+        ORDER BY closed_at DESC
+    """
+    pred_sql = """
+        SELECT id FROM oracle_predictions
+        WHERE verdict = 'miss'
+          AND scored_at >= :cutoff
+          AND id NOT IN (
+              SELECT prediction_id FROM trade_postmortems
+              WHERE prediction_id IS NOT NULL
+          )
+        ORDER BY scored_at DESC
+    """
+    params: dict[str, Any] = {"cutoff": cutoff}
+    if limit is not None and int(limit) > 0:
+        trade_sql += "\n        LIMIT :lim"
+        pred_sql += "\n        LIMIT :lim"
+        params["lim"] = int(limit)
+
     # Failed trades
     with engine.connect() as conn:
-        trade_rows = conn.execute(text("""
-            SELECT id FROM options_recommendations
-            WHERE outcome IN ('LOSS', 'EXPIRED')
-              AND closed_at >= :cutoff
-              AND id NOT IN (
-                  SELECT trade_id FROM trade_postmortems
-                  WHERE trade_id IS NOT NULL
-              )
-            ORDER BY closed_at DESC
-        """), {"cutoff": cutoff}).fetchall()
-
-        pred_rows = conn.execute(text("""
-            SELECT id FROM oracle_predictions
-            WHERE verdict = 'miss'
-              AND scored_at >= :cutoff
-              AND id NOT IN (
-                  SELECT prediction_id FROM trade_postmortems
-                  WHERE prediction_id IS NOT NULL
-              )
-            ORDER BY scored_at DESC
-        """), {"cutoff": cutoff}).fetchall()
+        trade_rows = conn.execute(text(trade_sql), params).fetchall()
+        pred_rows = conn.execute(text(pred_sql), params).fetchall()
 
     # Generate trade post-mortems
     for (trade_id,) in trade_rows:
@@ -493,8 +517,10 @@ def batch_postmortem(engine: Engine, days: int = 30) -> list[PostMortem]:
         _log_aggregate_patterns(postmortems, days)
 
     log.info(
-        "Batch post-mortem complete: {n} failures analysed over {d} days",
+        "Batch post-mortem complete: {n} failures analysed over {d} days"
+        "{lim_note}",
         n=len(postmortems), d=days,
+        lim_note=f" (limit={limit} per source)" if limit else "",
     )
     return postmortems
 
