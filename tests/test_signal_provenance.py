@@ -153,16 +153,30 @@ class TestVerdict:
         assert _verdict_from_aggregate(0.5, 0.8) == "low"
         assert _verdict_from_aggregate(0.9, 0.5) == "low"  # low confidence
 
-    def test_high_verdict_requires_both(self):
+    def test_high_verdict_calibrated_zone(self):
+        # Post-2026-05-17b: HIGH gate is confidence in [0.55, 0.85] —
+        # the calibrated zone. Excludes the saturated 0.9+ cluster
+        # (612 of 677 trades at exactly 0.950, hit=16.8%, mean_pnl=-1.69%).
         assert _verdict_from_aggregate(1.2, 0.8) == "high"
         assert _verdict_from_aggregate(1.4, 0.75) == "high"
-        # Just confidence isn't enough
-        assert _verdict_from_aggregate(1.0, 0.9) == "medium"
-        # Just conviction isn't enough
-        assert _verdict_from_aggregate(1.3, 0.65) == "medium"
+        assert _verdict_from_aggregate(1.0, 0.7) == "high"
+        assert _verdict_from_aggregate(1.0, 0.55) == "high"
+        assert _verdict_from_aggregate(1.0, 0.85) == "high"
+
+    def test_saturated_confidence_falls_to_medium(self):
+        # Confidence > 0.85 (the saturated 0.95-cap cluster) currently
+        # lands MEDIUM — keeps HIGH bucket measurement honest until the
+        # upstream confidence caps get replaced with per-model reliability.
+        assert _verdict_from_aggregate(1.0, 0.90) == "medium"
+        assert _verdict_from_aggregate(1.0, 0.95) == "medium"
+        assert _verdict_from_aggregate(1.4, 0.99) == "medium"
 
     def test_medium_default(self):
-        assert _verdict_from_aggregate(0.8, 0.65) == "medium"
+        # Confidence just above the calibrated ceiling lands MEDIUM.
+        assert _verdict_from_aggregate(0.8, 0.86) == "medium"
+        # Conf in [0.55, 0.85] now lands HIGH; conf<0.55 still LOW.
+        assert _verdict_from_aggregate(1.0, 0.55) == "high"
+        assert _verdict_from_aggregate(1.0, 0.54) == "low"
 
 
 # ── _extract_signal_contributions ────────────────────────────────────────
