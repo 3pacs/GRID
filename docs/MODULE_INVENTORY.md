@@ -1,8 +1,8 @@
 # GRID Module Inventory
 
-Generated: 2026-05-16
-Total modules: 741
-Total LOC: 326,014
+Generated: 2026-05-17
+Total modules: 746
+Total LOC: 327,249
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycache__/`, `build/`, `dist/`, `docs/`, `node_modules/`, `notebooks/`, `pwa/`, `pwa_dist/`, `tests/`, `venv/`.
@@ -11,9 +11,9 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 
 | Directory | Module count | LOC |
 |---|---|---|
-| `intelligence/` | 170 | 100,720 |
-| `ingestion/` | 204 | 83,948 |
-| `api/` | 106 | 47,971 |
+| `intelligence/` | 171 | 101,005 |
+| `ingestion/` | 204 | 83,951 |
+| `api/` | 107 | 48,162 |
 | `analysis/` | 33 | 18,973 |
 | `trading/` | 34 | 14,158 |
 | `oracle/` | 29 | 10,495 |
@@ -24,10 +24,10 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 | `alpha_research/` | 21 | 3,592 |
 | `alerts/` | 8 | 3,351 |
 | `ollama/` | 7 | 3,153 |
+| `contracts/` | 23 | 2,663 |
 | `inference/` | 8 | 2,584 |
 | `discovery/` | 5 | 2,509 |
 | `gemma/` | 7 | 2,470 |
-| `contracts/` | 20 | 1,907 |
 | `agents/` | 9 | 1,858 |
 | `backtest/` | 4 | 1,569 |
 | `normalization/` | 3 | 1,396 |
@@ -700,11 +700,11 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `datetime`, `ingestion`, `loguru`, `re`, `sqlalchemy`, `threading`, `typing`
 **Imported by:** `api/routers/chat.py`, `intelligence/freshness_guard.py`
 
-#### `intelligence/postmortem.py` — 2147 LOC
+#### `intelligence/postmortem.py` — 2232 LOC
 **Docstring:** GRID Intelligence — Automated Post-Mortem Analysis for Failed Trades & Predictions.
-**Functions:** `PostMortem`, `generate_postmortem`, `generate_prediction_postmortem`, `batch_postmortem`, `generate_lessons_learned`, `record_success_lesson`, `load_postmortems`, `apply_contagion_feedback`
+**Functions:** `PostMortem`, `generate_postmortem`, `generate_prediction_postmortem`, `batch_postmortem`, `generate_lessons_learned`, `record_success_lesson`, `load_postmortems_top_n`, `count_postmortems`, `load_postmortems`, `apply_contagion_feedback`
 **Reads:** `__future__`, `collections`, `contracts`, `dataclasses`, `datetime`, `db`, `decimal`, `intelligence`, `json`, `llm`, `loguru`, `sqlalchemy`, `typing`, `uuid`
-**Imported by:** `api/routers/intelligence_actors.py`, `api/routers/intelligence_risk.py`
+**Imported by:** `api/routers/intelligence_actors.py`, `api/routers/intelligence_risk.py`, `api/routers/postmortem_lessons.py`
 
 #### `intelligence/power_mapper.py` — 91 LOC
 **Docstring:** Power Mapper — unified power-mapping layer over multiple relationship sources.
@@ -848,7 +848,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`, `datetime`, `itertools`, `loguru`, `sqlalchemy`, `typing`
 **Imported by:** `intelligence/signal_provenance.py`
 
-#### `intelligence/signal_extractor.py` — 318 LOC
+#### `intelligence/signal_extractor.py` — 334 LOC
 **Docstring:** Signal Extractor — bridges raw_series → signal_data with actor attribution.
 **Functions:** `extract_from_raw_series`, `extract_from_signal_sources`, `run_extractor`
 **Reads:** `__future__`, `db`, `json`, `loguru`, `sqlalchemy`, `sys`, `time`
@@ -859,7 +859,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`, `datetime`, `loguru`, `math`, `sqlalchemy`, `typing`
 **Imported by:** `api/routers/conviction.py`
 
-#### `intelligence/signal_provenance.py` — 785 LOC
+#### `intelligence/signal_provenance.py` — 812 LOC
 **Docstring:** Signal provenance — the per-ticker "why" report.
 **Functions:** `SignalEvidence`, `CausationChain`, `TradeProvenanceReport`, `compute_aggregate_conviction`, `build_provenance_report`
 **Reads:** `__future__`, `dataclasses`, `datetime`, `features`, `intelligence`, `loguru`, `sqlalchemy`, `typing`
@@ -870,6 +870,11 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Functions:** `SignalType`, `Direction`, `RegisteredSignal`, `make_signal_id`, `SignalRegistry`
 **Reads:** `__future__`, `dataclasses`, `datetime`, `enum`, `json`, `loguru`, `sqlalchemy`, `typing`, `uuid`
 **Imported by:** `alpha_research/adapters/signal_adapter.py`, `api/routers/signal_registry.py`, `intelligence/adapters/ai_trader_adapter.py`, `intelligence/adapters/base.py`, `intelligence/adapters/cross_reference_adapter.py`, `intelligence/adapters/dollar_flows_adapter.py`, `intelligence/adapters/earnings_adapter.py`, `intelligence/adapters/feature_adapter.py`, … (+9)
+
+#### `intelligence/signal_weight_overrides.py` — 141 LOC
+**Docstring:** Per-signal conviction multipliers derived from the auto-improve corpus.
+**Functions:** `get_override`, `set_enabled`
+**Reads:** `__future__`, `loguru`, `os`, `typing`
 
 #### `intelligence/sleuth.py` — 1277 LOC
 **Docstring:** GRID Intelligence — Investigative Research Engine (Sleuth).
@@ -1003,9 +1008,9 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`, `datetime`, `json`, `loguru`, `math`, `sqlalchemy`, `typing`
 **Imported by:** `api/routers/tps.py`, `ingestion/scheduler.py`
 
-#### `intelligence/trust_scorer.py` — 1888 LOC
+#### `intelligence/trust_scorer.py` — 1904 LOC
 **Docstring:** GRID Intelligence — Source Trust Scoring Framework.
-**Functions:** `SourceScore`, `ConvergenceEvent`, `score_pending_signals`, `update_trust_scores`, `get_trusted_sources`, `get_insider_edge`, `detect_convergence`, `generate_trust_report`, `run_trust_cycle`, `register_signal`, `TrustScorer`
+**Functions:** `SourceScore`, `ConvergenceEvent`, `score_pending_signals`, `update_trust_scores`, `write_trust_scores_cache`, `load_trust_scores_cached`, `get_trusted_sources`, `get_insider_edge`, `detect_convergence`, `generate_trust_report`, `run_trust_cycle`, `register_signal`, `TrustScorer`
 **Reads:** `__future__`, `api`, `dataclasses`, `datetime`, `db`, `intelligence`, `json`, `llm`, `loguru`, `math`, `sqlalchemy`, `typing`, `yfinance`
 **Imported by:** `analysis/flow_thesis_data.py`, `analysis/money_flow.py`, `analysis/thesis_scorer.py`, `api/routers/actor_detail.py`, `api/routers/flows.py`, `api/routers/intelligence_risk.py`, `api/routers/watchlist_overview.py`, `contracts/handlers/trust.py`, … (+10)
 
@@ -2038,7 +2043,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `asyncio`, `datetime`, `ingestion`, `json`, `loguru`, `websockets`
 **Imported by:** `ingestion/realtime/ws_listener.py`
 
-#### `ingestion/realtime/feeds/dex_scanner.py` — 226 LOC
+#### `ingestion/realtime/feeds/dex_scanner.py` — 229 LOC
 **Docstring:** DEX token scanner — GeckoTerminal + DexScreener liquidity spike detection.
 **Functions:** `PoolData`, `detect_spikes`, `run_dex_scanner`
 **Reads:** `__future__`, `aiohttp`, `asyncio`, `dataclasses`, `datetime`, `db`, `ingestion`, `json`, `loguru`
@@ -2178,13 +2183,13 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Docstring:** GRID JWT authentication with role-based access control.
 **Functions:** `hash_password`, `verify_password`, `create_token`, `verify_token`, `decode_token`, `get_token_expiry`, `require_auth`, `require_role`, `login`, `register`, `logout`, `verify`, `create_user`, `list_users`, `delete_user`
 **Reads:** `__future__`, `api`, `config`, `datetime`, `fastapi`, `jose`, `loguru`, `os`, `passlib`, `pathlib`, `psycopg2`, `shelve`, `tempfile`, `threading`, `time`, `typing`
-**Imported by:** `api/lf_helpers.py`, `api/main.py`, `api/routers/a2a.py`, `api/routers/actor_detail.py`, `api/routers/actor_news_api.py`, `api/routers/agents.py`, `api/routers/associations.py`, `api/routers/astrogrid_celestial.py`, … (+81)
+**Imported by:** `api/lf_helpers.py`, `api/main.py`, `api/routers/a2a.py`, `api/routers/actor_detail.py`, `api/routers/actor_news_api.py`, `api/routers/agents.py`, `api/routers/associations.py`, `api/routers/astrogrid_celestial.py`, … (+82)
 
 #### `api/dependencies.py` — 79 LOC
 **Docstring:** Shared FastAPI dependencies.
 **Functions:** `get_db_engine`, `get_pit_store`, `get_journal`, `get_model_registry`, `get_astrogrid_store`, `clear_singletons`
 **Reads:** `__future__`, `db`, `governance`, `journal`, `sqlalchemy`, `store`
-**Imported by:** `api/main.py`, `api/routers/actor_detail.py`, `api/routers/actor_news_api.py`, `api/routers/associations.py`, `api/routers/astrogrid.py`, `api/routers/astrogrid_celestial.py`, `api/routers/astrogrid_core.py`, `api/routers/astrogrid_helpers.py`, … (+75)
+**Imported by:** `api/main.py`, `api/routers/actor_detail.py`, `api/routers/actor_news_api.py`, `api/routers/associations.py`, `api/routers/astrogrid.py`, `api/routers/astrogrid_celestial.py`, `api/routers/astrogrid_core.py`, `api/routers/astrogrid_helpers.py`, … (+76)
 
 #### `api/lf_helpers.py` — 124 LOC
 **Docstring:** Best-effort Langfuse helpers shared by API routers.
@@ -2192,7 +2197,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `api`, `contextlib`, `langfuse`, `typing`
 **Imported by:** `api/routers/intelligence_actors.py`, `api/routers/intelligence_deepdive.py`, `api/routers/intelligence_thesis.py`
 
-#### `api/main.py` — 723 LOC
+#### `api/main.py` — 724 LOC
 **Docstring:** GRID Intelligence API — FastAPI application entry point.
 **Functions:** `lifespan`, `SecurityHeadersMiddleware`, `RateLimitMiddleware`, `X402PaymentMiddleware`, `broadcast_event`, `recent_realtime_events`, `websocket_endpoint`
 **Reads:** `__future__`, `agents`, `alerts`, `api`, `asyncio`, `collections`, `config`, `contextlib`, `contracts`, `datetime`, `db`, `events`, `fastapi`, `importlib`, `json`, `loguru`, `oracle`, `orchestration`, `os`, `pathlib`, `payments`, `starlette`, `subnet`, `threading`, `time`, `typing`
@@ -2477,7 +2482,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Functions:** `get_regime`, `get_regime_analogs`, `get_regime_history`
 **Reads:** `__future__`, `api`, `datetime`, `fastapi`, `intelligence`, `loguru`, `numpy`, `sqlalchemy`, `timesfm`, `torch`, `typing`
 
-#### `api/routers/intelligence_risk.py` — 1125 LOC
+#### `api/routers/intelligence_risk.py` — 1119 LOC
 **Docstring:** Intelligence sub-router: Risk map, dashboard, and globe endpoints.
 **Functions:** `get_risk_map`, `get_globe_data`, `get_intelligence_dashboard`
 **Reads:** `__future__`, `api`, `asyncio`, `dataclasses`, `datetime`, `fastapi`, `intelligence`, `loguru`, `numpy`, `pandas`, `physics`, `sqlalchemy`, `typing`, `utils`
@@ -2548,6 +2553,11 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Docstring:** GRID API — Market physics endpoints.
 **Functions:** `verify`, `momentum`, `list_conventions`, `get_convention`, `ou_parameters`, `hurst`, `energy_decomposition`, `news_energy`, `physics_dashboard`
 **Reads:** `__future__`, `api`, `datetime`, `db`, `fastapi`, `features`, `loguru`, `physics`, `store`, `typing`
+
+#### `api/routers/postmortem_lessons.py` — 196 LOC
+**Docstring:** Async post-mortem lessons endpoint with 6h DB cache.
+**Functions:** `get_postmortem_lessons`
+**Reads:** `__future__`, `api`, `datetime`, `fastapi`, `intelligence`, `json`, `loguru`, `sqlalchemy`, `typing`
 
 #### `api/routers/prediction_backtest.py` — 183 LOC
 **Docstring:** GRID API — Prediction Market Backtesting endpoints.
@@ -3624,7 +3634,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Docstring:** GRID Intelligence — Premium newsletter email system.
 **Functions:** `send_alert`, `alert_on_failure`, `alert_on_regime_change`, `alert_on_100x_opportunity`, `send_insight`, `send_agent_report`, `send_weekly_review`, `daily_digest`, `alert_on_failure_with_fix`, `alert_on_transition_leaders`, `alert_on_discovery_insight`, `send_test_email`
 **Reads:** `__future__`, `config`, `datetime`, `db`, `email`, `loguru`, `smtplib`, `sqlalchemy`, `threading`, `typing`
-**Imported by:** `agents/runner.py`, `alerts/health_alerter.py`, `alerts/hundredx_digest.py`, `alerts/push_notify.py`, `alerts/scheduler.py`, `alerts/supply_chain_alerts.py`, `alerts/waterfall_watch.py`, `api/routers/associations.py`, … (+6)
+**Imported by:** `agents/runner.py`, `alerts/health_alerter.py`, `alerts/hundredx_digest.py`, `alerts/push_notify.py`, `alerts/scheduler.py`, `alerts/supply_chain_alerts.py`, `alerts/waterfall_watch.py`, `api/routers/associations.py`, … (+7)
 
 #### `alerts/health_alerter.py` — 278 LOC
 **Docstring:** Health-derived alerting (audit item #31).
@@ -3640,7 +3650,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Docstring:** GRID Intelligence — Web Push notification system.
 **Functions:** `save_subscription`, `remove_subscription`, `get_all_subscriptions`, `get_preferences`, `update_preferences`, `send_push`, `broadcast_push`, `notify_trade_recommendation`, `notify_convergence_alert`, `notify_regime_change`, `notify_red_flag`, `notify_price_alert`, `integrate_with_email_alerts`
 **Reads:** `__future__`, `alerts`, `config`, `datetime`, `db`, `json`, `loguru`, `pywebpush`, `sqlalchemy`, `threading`, `typing`
-**Imported by:** `api/main.py`, `api/routers/notifications.py`
+**Imported by:** `api/main.py`, `api/routers/notifications.py`, `contracts/handlers/alerts.py`
 
 #### `alerts/scheduler.py` — 69 LOC
 **Docstring:** GRID alert scheduler.
@@ -3697,6 +3707,130 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Docstring:** Dual-LLM task router for GRID.
 **Functions:** `TaskComplexity`, `classify_task`, `TaskRouter`, `get_router`
 **Reads:** `__future__`, `config`, `enum`, `gemma`, `llamacpp`, `loguru`, `ollama`, `re`, `typing`
+
+## `contracts/`
+
+#### `contracts/__init__.py` — 22 LOC
+**Docstring:** GRID contracts infrastructure.
+**Reads:** `__future__`, `contracts`
+**Imported by:** `api/routers/contracts.py`, `contracts/dispatcher.py`, `contracts/emit.py`
+
+#### `contracts/channels.py` — 34 LOC
+**Docstring:** Contract-type → event-bus channel mapping.
+**Functions:** `channel_for`, `contract_for_channel`
+**Reads:** `__future__`, `contracts`, `re`
+**Imported by:** `contracts/dispatcher.py`, `contracts/emit.py`
+
+#### `contracts/correlation.py` — 41 LOC
+**Docstring:** Correlation id propagation for the contracts layer.
+**Functions:** `new_correlation_id`, `get_current_correlation_id`, `correlation_scope`
+**Reads:** `__future__`, `contextlib`, `contextvars`, `typing`, `uuid`
+**Imported by:** `contracts/__init__.py`, `contracts/emit.py`, `intelligence/chain_contagion.py`, `intelligence/contagion_backtest.py`, `intelligence/fundamental_divergence.py`, `intelligence/holder_deal_overlap.py`, `intelligence/news_contagion_listener.py`, `intelligence/postmortem.py`, … (+3)
+
+#### `contracts/dead_letter.py` — 161 LOC
+**Docstring:** Dead-letter store for the contracts layer.
+**Functions:** `DeadLetterEntry`, `record_failure`, `pending_retries`, `mark_resolved`, `bump_retry`, `schedule_next_retry`
+**Reads:** `__future__`, `dataclasses`, `datetime`, `json`, `sqlalchemy`, `typing`, `uuid`
+**Imported by:** `api/main.py`, `contracts/replay.py`, `contracts/retry_scheduler.py`
+
+#### `contracts/dispatcher.py` — 150 LOC
+**Docstring:** Contract dispatcher.
+**Functions:** `Dispatcher`
+**Reads:** `__future__`, `concurrent`, `contracts`, `loguru`, `pydantic`, `threading`, `time`, `typing`, `uuid`
+**Imported by:** `api/main.py`, `contracts/__init__.py`
+
+#### `contracts/emit.py` — 171 LOC
+**Docstring:** Emit helpers for the contracts layer.
+**Functions:** `emit`, `pull_lifecycle`
+**Reads:** `__future__`, `api`, `contextlib`, `contracts`, `events`, `hashlib`, `json`, `loguru`, `sqlalchemy`, `time`, `typing`, `uuid`
+**Imported by:** `contracts/__init__.py`, `intelligence/chain_contagion.py`, `intelligence/contagion_backtest.py`, `intelligence/fundamental_divergence.py`, `intelligence/holder_deal_overlap.py`, `intelligence/news_contagion_listener.py`, `intelligence/postmortem.py`, `intelligence/supply_chain_edge_validator.py`, … (+2)
+
+#### `contracts/handlers/__init__.py` — 1 LOC
+**Docstring:** Phase 2 contract handlers — empty in Phase 1.
+
+#### `contracts/handlers/alerts.py` — 158 LOC
+**Docstring:** Operator-alert handlers (SYNTH-31 / Wave-D, §7.3 closure).
+**Functions:** `on_cross_reference_anomaly`, `on_regime_transition`
+**Reads:** `__future__`, `alerts`, `contracts`, `loguru`, `sqlalchemy`, `typing`
+
+#### `contracts/handlers/calibration.py` — 111 LOC
+**Docstring:** Calibration metrics handler (SYNTH-21).
+**Functions:** `on_prediction_scored`, `on_options_trade_outcome`
+**Reads:** `__future__`, `contracts`, `loguru`, `oracle`, `sqlalchemy`, `typing`
+
+#### `contracts/handlers/edges.py` — 93 LOC
+**Docstring:** Edge-validation handler (SYNTH-39).
+**Functions:** `on_edge_validated`
+**Reads:** `__future__`, `contracts`, `loguru`, `sqlalchemy`, `typing`
+
+#### `contracts/handlers/journal.py` — 231 LOC
+**Docstring:** Provisional decision_journal handler (SYNTH-42).
+**Functions:** `on_signal_fired`, `on_prediction_scored`
+**Reads:** `__future__`, `contracts`, `datetime`, `json`, `loguru`, `sqlalchemy`, `typing`
+
+#### `contracts/handlers/oracle_anti_signals.py` — 146 LOC
+**Docstring:** Oracle anti-signal handler (SYNTH-28 / SYNTH-32 follow-up).
+**Functions:** `on_cross_reference_anomaly`
+**Reads:** `__future__`, `contracts`, `datetime`, `json`, `loguru`, `sqlalchemy`, `typing`
+
+#### `contracts/handlers/oracle_regime.py` — 120 LOC
+**Docstring:** Oracle regime handler (SYNTH-30 closure, §7.3).
+**Functions:** `on_regime_transition`
+**Reads:** `__future__`, `contracts`, `json`, `loguru`, `sqlalchemy`, `typing`
+
+#### `contracts/handlers/oracle_signals.py` — 126 LOC
+**Docstring:** Oracle SignalFired fanout handler (SYNTH-24..27).
+**Functions:** `on_signal_fired`
+**Reads:** `__future__`, `contracts`, `datetime`, `json`, `loguru`, `sqlalchemy`, `typing`
+
+#### `contracts/handlers/oracle_weights.py` — 59 LOC
+**Docstring:** Oracle weight evolver handlers (SYNTH-20, SYNTH-23).
+**Functions:** `on_prediction_scored`, `on_postmortem_completed`
+**Reads:** `__future__`, `contracts`, `loguru`, `oracle`, `sqlalchemy`, `typing`
+
+#### `contracts/handlers/pull_lifecycle.py` — 37 LOC
+**Docstring:** Pull lifecycle contract handler.
+**Functions:** `on_pull_lifecycle`
+**Reads:** `__future__`, `contracts`, `loguru`, `sqlalchemy`, `typing`
+
+#### `contracts/handlers/trade_outcomes.py` — 102 LOC
+**Docstring:** Options trade outcome handler (SYNTH-40).
+**Functions:** `on_options_trade_outcome`
+**Reads:** `__future__`, `contracts`, `loguru`, `oracle`, `sqlalchemy`, `typing`
+
+#### `contracts/handlers/trust.py` — 236 LOC
+**Docstring:** Trust scorer handlers for dispatched contract events.
+**Functions:** `on_prediction_scored`, `on_postmortem_completed`, `on_signal_fired`, `on_edge_validated`
+**Reads:** `__future__`, `contracts`, `intelligence`, `loguru`, `sqlalchemy`, `typing`
+
+#### `contracts/observability.py` — 107 LOC
+**Docstring:** In-process contracts metrics.
+**Functions:** `emitted`, `dispatched`, `failed`, `record_duration`, `snapshot`, `reset`, `render_prometheus`
+**Reads:** `__future__`, `collections`, `threading`, `typing`
+
+#### `contracts/replay.py` — 139 LOC
+**Docstring:** Manual replay for dead-letter entries.
+**Functions:** `replay_entry`, `replay_many`, `replay_filtered`, `build_parser`, `main`
+**Reads:** `__future__`, `api`, `argparse`, `contracts`, `json`, `loguru`, `sqlalchemy`, `typing`, `uuid`
+**Imported by:** `api/routers/contracts.py`
+
+#### `contracts/retry_scheduler.py` — 81 LOC
+**Docstring:** Background retry scheduler for dead-letter entries.
+**Functions:** `RetryScheduler`
+**Reads:** `__future__`, `contracts`, `loguru`, `threading`, `typing`
+**Imported by:** `api/main.py`
+
+#### `contracts/router.py` — 109 LOC
+**Docstring:** Contract routing table.
+**Functions:** `resolve_handler`
+**Reads:** `__future__`, `contracts`, `importlib`, `typing`
+**Imported by:** `contracts/dispatcher.py`, `contracts/replay.py`, `contracts/retry_scheduler.py`
+
+#### `contracts/schemas.py` — 228 LOC
+**Docstring:** Contract schemas for the GRID information-flow layer.
+**Functions:** `SignalRef`, `BaseContract`, `PostmortemCompleted`, `PredictionScored`, `BacktestGateVerdict`, `OptionsTradeOutcome`, `CrossReferenceAnomaly`, `LeverageRiskUpdate`, `RegimeTransition`, `SignalFired`, `HypothesisGenerated`, `ActorMaterialized`, `PullLifecycle`, `ForensicsTrace`, `InvestigationProgress`, `EdgeValidated`
+**Reads:** `__future__`, `datetime`, `decimal`, `pydantic`, `typing`, `uuid`
+**Imported by:** `contracts/channels.py`, `contracts/dispatcher.py`, `contracts/emit.py`, `contracts/handlers/alerts.py`, `contracts/handlers/calibration.py`, `contracts/handlers/edges.py`, `contracts/handlers/journal.py`, `contracts/handlers/oracle_anti_signals.py`, … (+18)
 
 ## `inference/`
 
@@ -3810,115 +3944,6 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Docstring:** GRID Gemma Fine-Tuning with Unsloth.
 **Functions:** `train`, `export_gguf`, `merge_and_save`, `test_inference`, `main`
 **Reads:** `__future__`, `argparse`, `gemma`, `loguru`, `pathlib`, `torch`, `transformers`, `trl`, `typing`, `unsloth`
-
-## `contracts/`
-
-#### `contracts/__init__.py` — 22 LOC
-**Docstring:** GRID contracts infrastructure.
-**Reads:** `__future__`, `contracts`
-**Imported by:** `api/routers/contracts.py`, `contracts/dispatcher.py`, `contracts/emit.py`
-
-#### `contracts/channels.py` — 34 LOC
-**Docstring:** Contract-type → event-bus channel mapping.
-**Functions:** `channel_for`, `contract_for_channel`
-**Reads:** `__future__`, `contracts`, `re`
-**Imported by:** `contracts/dispatcher.py`, `contracts/emit.py`
-
-#### `contracts/correlation.py` — 41 LOC
-**Docstring:** Correlation id propagation for the contracts layer.
-**Functions:** `new_correlation_id`, `get_current_correlation_id`, `correlation_scope`
-**Reads:** `__future__`, `contextlib`, `contextvars`, `typing`, `uuid`
-**Imported by:** `contracts/__init__.py`, `contracts/emit.py`, `intelligence/chain_contagion.py`, `intelligence/contagion_backtest.py`, `intelligence/fundamental_divergence.py`, `intelligence/holder_deal_overlap.py`, `intelligence/news_contagion_listener.py`, `intelligence/postmortem.py`, … (+3)
-
-#### `contracts/dead_letter.py` — 161 LOC
-**Docstring:** Dead-letter store for the contracts layer.
-**Functions:** `DeadLetterEntry`, `record_failure`, `pending_retries`, `mark_resolved`, `bump_retry`, `schedule_next_retry`
-**Reads:** `__future__`, `dataclasses`, `datetime`, `json`, `sqlalchemy`, `typing`, `uuid`
-**Imported by:** `api/main.py`, `contracts/replay.py`, `contracts/retry_scheduler.py`
-
-#### `contracts/dispatcher.py` — 150 LOC
-**Docstring:** Contract dispatcher.
-**Functions:** `Dispatcher`
-**Reads:** `__future__`, `concurrent`, `contracts`, `loguru`, `pydantic`, `threading`, `time`, `typing`, `uuid`
-**Imported by:** `api/main.py`, `contracts/__init__.py`
-
-#### `contracts/emit.py` — 171 LOC
-**Docstring:** Emit helpers for the contracts layer.
-**Functions:** `emit`, `pull_lifecycle`
-**Reads:** `__future__`, `api`, `contextlib`, `contracts`, `events`, `hashlib`, `json`, `loguru`, `sqlalchemy`, `time`, `typing`, `uuid`
-**Imported by:** `contracts/__init__.py`, `intelligence/chain_contagion.py`, `intelligence/contagion_backtest.py`, `intelligence/fundamental_divergence.py`, `intelligence/holder_deal_overlap.py`, `intelligence/news_contagion_listener.py`, `intelligence/postmortem.py`, `intelligence/supply_chain_edge_validator.py`, … (+2)
-
-#### `contracts/handlers/__init__.py` — 1 LOC
-**Docstring:** Phase 2 contract handlers — empty in Phase 1.
-
-#### `contracts/handlers/calibration.py` — 58 LOC
-**Docstring:** Calibration metrics handler (SYNTH-21).
-**Functions:** `on_prediction_scored`
-**Reads:** `__future__`, `contracts`, `loguru`, `oracle`, `sqlalchemy`, `typing`
-
-#### `contracts/handlers/edges.py` — 93 LOC
-**Docstring:** Edge-validation handler (SYNTH-39).
-**Functions:** `on_edge_validated`
-**Reads:** `__future__`, `contracts`, `loguru`, `sqlalchemy`, `typing`
-
-#### `contracts/handlers/journal.py` — 157 LOC
-**Docstring:** Provisional decision_journal handler (SYNTH-42).
-**Functions:** `on_signal_fired`
-**Reads:** `__future__`, `contracts`, `datetime`, `json`, `loguru`, `sqlalchemy`, `typing`
-
-#### `contracts/handlers/oracle_signals.py` — 126 LOC
-**Docstring:** Oracle SignalFired fanout handler (SYNTH-24..27).
-**Functions:** `on_signal_fired`
-**Reads:** `__future__`, `contracts`, `datetime`, `json`, `loguru`, `sqlalchemy`, `typing`
-
-#### `contracts/handlers/oracle_weights.py` — 59 LOC
-**Docstring:** Oracle weight evolver handlers (SYNTH-20, SYNTH-23).
-**Functions:** `on_prediction_scored`, `on_postmortem_completed`
-**Reads:** `__future__`, `contracts`, `loguru`, `oracle`, `sqlalchemy`, `typing`
-
-#### `contracts/handlers/pull_lifecycle.py` — 37 LOC
-**Docstring:** Pull lifecycle contract handler.
-**Functions:** `on_pull_lifecycle`
-**Reads:** `__future__`, `contracts`, `loguru`, `sqlalchemy`, `typing`
-
-#### `contracts/handlers/trade_outcomes.py` — 102 LOC
-**Docstring:** Options trade outcome handler (SYNTH-40).
-**Functions:** `on_options_trade_outcome`
-**Reads:** `__future__`, `contracts`, `loguru`, `oracle`, `sqlalchemy`, `typing`
-
-#### `contracts/handlers/trust.py` — 69 LOC
-**Docstring:** Trust scorer handlers for dispatched contract events.
-**Functions:** `on_prediction_scored`, `on_postmortem_completed`
-**Reads:** `__future__`, `contracts`, `intelligence`, `loguru`, `sqlalchemy`, `typing`
-
-#### `contracts/observability.py` — 107 LOC
-**Docstring:** In-process contracts metrics.
-**Functions:** `emitted`, `dispatched`, `failed`, `record_duration`, `snapshot`, `reset`, `render_prometheus`
-**Reads:** `__future__`, `collections`, `threading`, `typing`
-
-#### `contracts/replay.py` — 139 LOC
-**Docstring:** Manual replay for dead-letter entries.
-**Functions:** `replay_entry`, `replay_many`, `replay_filtered`, `build_parser`, `main`
-**Reads:** `__future__`, `api`, `argparse`, `contracts`, `json`, `loguru`, `sqlalchemy`, `typing`, `uuid`
-**Imported by:** `api/routers/contracts.py`
-
-#### `contracts/retry_scheduler.py` — 81 LOC
-**Docstring:** Background retry scheduler for dead-letter entries.
-**Functions:** `RetryScheduler`
-**Reads:** `__future__`, `contracts`, `loguru`, `threading`, `typing`
-**Imported by:** `api/main.py`
-
-#### `contracts/router.py` — 71 LOC
-**Docstring:** Contract routing table.
-**Functions:** `resolve_handler`
-**Reads:** `__future__`, `contracts`, `importlib`, `typing`
-**Imported by:** `contracts/dispatcher.py`, `contracts/replay.py`, `contracts/retry_scheduler.py`
-
-#### `contracts/schemas.py` — 228 LOC
-**Docstring:** Contract schemas for the GRID information-flow layer.
-**Functions:** `SignalRef`, `BaseContract`, `PostmortemCompleted`, `PredictionScored`, `BacktestGateVerdict`, `OptionsTradeOutcome`, `CrossReferenceAnomaly`, `LeverageRiskUpdate`, `RegimeTransition`, `SignalFired`, `HypothesisGenerated`, `ActorMaterialized`, `PullLifecycle`, `ForensicsTrace`, `InvestigationProgress`, `EdgeValidated`
-**Reads:** `__future__`, `datetime`, `decimal`, `pydantic`, `typing`, `uuid`
-**Imported by:** `contracts/channels.py`, `contracts/dispatcher.py`, `contracts/emit.py`, `contracts/handlers/calibration.py`, `contracts/handlers/edges.py`, `contracts/handlers/journal.py`, `contracts/handlers/oracle_signals.py`, `contracts/handlers/oracle_weights.py`, … (+15)
 
 ## `agents/`
 
