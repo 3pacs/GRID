@@ -226,6 +226,43 @@ def test_classify_hit_directional_truth_table():
     assert wfv.classify_hit("bullish", "partial") is True
 
 
+def test_canonical_direction_handles_production_vocabulary():
+    # Bullish vocabulary
+    for raw in ("bullish", "BULL", "Call", "long", "buy", "up", " CALL "):
+        assert wfv._canonical_direction(raw) == "bullish", raw
+    # Bearish vocabulary
+    for raw in ("bearish", "BEAR", "Put", "short", "sell", "down", " PUT "):
+        assert wfv._canonical_direction(raw) == "bearish", raw
+    # Unknown / empty collapse to ""
+    for raw in (None, "", "neutral", "sideways", "n/a", "wat"):
+        assert wfv._canonical_direction(raw) == "", repr(raw)
+
+
+def test_classify_hit_options_vocabulary():
+    # The oracle stores CALL/PUT in production. classify_hit must treat
+    # them identically to bullish/bearish; partial counts as a hit for
+    # both. Regression for #137-followup walk-forward calibration bug.
+    assert wfv.classify_hit("CALL", "hit") is True
+    assert wfv.classify_hit("CALL", "partial") is True
+    assert wfv.classify_hit("CALL", "miss") is False
+    assert wfv.classify_hit("PUT", "hit") is True
+    assert wfv.classify_hit("PUT", "partial") is True
+    assert wfv.classify_hit("PUT", "miss") is False
+
+
+def test_realized_return_from_outcome_options_vocabulary():
+    # Pre-fix: CALL/PUT → sign=0 → return=0 for every outcome, which
+    # silently zeroed out mean/std/sharpe/drawdown for every bucket.
+    hit_call = wfv._realized_return_from_outcome("CALL", "hit")
+    hit_put = wfv._realized_return_from_outcome("PUT", "hit")
+    miss_call = wfv._realized_return_from_outcome("CALL", "miss")
+    assert hit_call > 0.0
+    assert hit_put < 0.0
+    assert miss_call < 0.0
+    assert wfv._realized_return_from_outcome("CALL", "partial") > 0.0
+    assert wfv._realized_return_from_outcome("PUT", "partial") < 0.0
+
+
 # ── build_time_frozen_provenance ──────────────────────────────────────────
 
 

@@ -255,25 +255,47 @@ def compute_max_drawdown(returns: list[float]) -> float:
     return float(max(0.0, worst))
 
 
+# Direction vocabulary the oracle, options pipeline, and gem-hunter all
+# emit. ``oracle_predictions.direction`` in production is dominated by
+# CALL/PUT (options-flavored); legacy rows use bullish/bearish; some
+# upstream paths use long/short/buy/sell. Canonicalize to two strings so
+# every downstream measurement (classify_hit, realized-return proxy, PIT
+# replay) treats them identically.
+_BULLISH_DIRECTIONS: frozenset[str] = frozenset({
+    "bullish", "bull", "call", "long", "buy", "up",
+})
+_BEARISH_DIRECTIONS: frozenset[str] = frozenset({
+    "bearish", "bear", "put", "short", "sell", "down",
+})
+
+
+def _canonical_direction(raw: str | None) -> str:
+    """Return ``"bullish"`` / ``"bearish"`` / ``""`` from any production
+    direction label. Unknown / empty inputs collapse to ``""`` so callers
+    can branch on a non-empty result.
+    """
+    norm = str(raw or "").strip().lower()
+    if norm in _BULLISH_DIRECTIONS:
+        return "bullish"
+    if norm in _BEARISH_DIRECTIONS:
+        return "bearish"
+    return ""
+
+
 def classify_hit(verdict: str, outcome: str) -> bool:
     """A trade is a 'hit' when the directional call was correct.
 
-    Bullish direction + outcome in {'hit', 'partial'} → True
-    Bearish direction + outcome == 'miss' → True (a correct short)
-    Everything else → False
-
-    The oracle's ``outcome_verdict`` field is always written relative to
-    the PREDICTED direction ('hit' = the prediction was right, 'miss' = it
-    was wrong), so for the realized-hit check we fold bearish misses into
-    hits to reward correct shorts. Partial counts as a half-hit for
-    bullish but as a miss for bearish (asymmetry intentional — shorts
-    aren't half-right).
+    Direction is canonicalized via ``_canonical_direction`` so CALL/PUT,
+    long/short, buy/sell, and bullish/bearish all route to the same
+    measurement. Partial counts as a half-hit for both directions —
+    the oracle's ``outcome_verdict`` is already written relative to the
+    predicted direction, so a 'partial' on a bearish call is the same
+    asymmetry as on a bullish call (the underlying moved most of the
+    way, just not all the way).
     """
-    direction = str(verdict or "").strip().lower()
+    direction = _canonical_direction(verdict)
     outcome_norm = str(outcome or "").strip().lower()
-    if direction == "bullish":
-        return outcome_norm in ("hit", "partial")
-    if direction == "bearish":
+    if direction in ("bullish", "bearish"):
         return outcome_norm in ("hit", "partial")
     return outcome_norm == "hit"
 
@@ -288,7 +310,7 @@ def _realized_return_from_outcome(
     (e.g. the ticker has no feature_registry entry). The PIT path in
     ``_realized_return_from_pit`` is preferred and always tried first.
     """
-    dir_norm = str(direction or "").strip().lower()
+    dir_norm = _canonical_direction(direction)
     out_norm = str(outcome or "").strip().lower()
     sign = 1.0 if dir_norm == "bullish" else (-1.0 if dir_norm == "bearish" else 0.0)
     if out_norm == "hit":
@@ -412,7 +434,7 @@ def _realized_return_from_pit(
         return None
 
     raw = (exit_px - entry) / entry
-    dir_norm = str(direction or "").strip().lower()
+    dir_norm = _canonical_direction(direction)
     if dir_norm == "bearish":
         raw = -raw
     elif dir_norm != "bullish":
@@ -815,6 +837,26 @@ def _build_narrative(
 # ── DB layer ──────────────────────────────────────────────────────────────
 
 
+# Walk replay must be chronological (PIT integrity), but when --limit is
+# given the caller wants the MOST RECENT N predictions, not the oldest N.
+# Selecting the recent slice in DESC order then re-sorting ASC in Python
+# preserves both invariants. Without LIMIT the second query (ASC) is used.
+_WALK_QUERY_LIMITED = text(
+    """
+    SELECT * FROM (
+        SELECT id, ticker, created_at, expiry, confidence, verdict,
+               model_name, signals, model_weights, pnl_pct, direction
+        FROM oracle_predictions
+        WHERE verdict IN ('hit', 'miss', 'partial')
+          AND created_at >= NOW() - (:days || ' days')::interval
+          AND dedup_keep = TRUE
+        ORDER BY created_at DESC
+        LIMIT :lim
+    ) recent
+    ORDER BY created_at ASC
+    """
+)
+
 _WALK_QUERY = text(
     """
     SELECT id, ticker, created_at, expiry, confidence, verdict,
@@ -860,7 +902,13 @@ def _load_scored_predictions(
     """
     try:
         with engine.connect() as conn:
-            rows = conn.execute(_WALK_QUERY, {"days": int(days)}).fetchall()
+            if limit is not None and int(limit) > 0:
+                rows = conn.execute(
+                    _WALK_QUERY_LIMITED,
+                    {"days": int(days), "lim": int(limit)},
+                ).fetchall()
+            else:
+                rows = conn.execute(_WALK_QUERY, {"days": int(days)}).fetchall()
     except Exception as exc:  # noqa: BLE001
         # Loud-fail: previously this swallowed schema mismatches silently and
         # produced misleading "no predictions found" reports. Now we log the
