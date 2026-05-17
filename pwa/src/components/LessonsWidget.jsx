@@ -3,7 +3,7 @@
  *
  * Background: on 2026-05-16 the cold dashboard payload dropped the LLM
  * `generate_lessons_learned` synthesis (saved 8.5s on cold load). The lessons
- * are now exposed via the async `/api/v1/intelligence/postmortem-lessons`
+ * are now exposed via the async `/api/v1/postmortem-lessons`
  * endpoint (task #63, 3-tier cached). This widget fetches them after the
  * main dashboard payload arrives, shows a loading state, and exposes a
  * Refresh button that forces regeneration (~30s on cold).
