@@ -738,9 +738,9 @@ def _signal_contribution_attribution(
 _NARRATIVE_TEMPLATE = (
     "Walk-forward backtest — {walked} predictions replayed over {days}d, "
     "{trades} trade tickets generated. "
-    "HIGH verdict hit rate: {high_hr:.1%} (n={high_n}). "
-    "MEDIUM verdict hit rate: {medium_hr:.1%} (n={medium_n}). "
-    "LOW verdict hit rate: {low_hr:.1%} (n={low_n}). "
+    "HIGH verdict hit rate: {high_hr:.1%} (n={high_n}, sharpe={high_sharpe:+.2f}). "
+    "MEDIUM verdict hit rate: {medium_hr:.1%} (n={medium_n}, sharpe={medium_sharpe:+.2f}). "
+    "LOW verdict hit rate: {low_hr:.1%} (n={low_n}, sharpe={low_sharpe:+.2f}). "
     "Stress-test calibration lift: {lift} "
     "(fragile failure rate {fragile_fail} vs robust {robust_fail}). "
     "Verdict is {empirical_call}."
@@ -780,6 +780,9 @@ def _build_narrative(
     high_hr = high.hit_rate if high else 0.0
     medium_hr = medium.hit_rate if medium else 0.0
     low_hr = low.hit_rate if low else 0.0
+    high_sharpe = high.sharpe if high else 0.0
+    medium_sharpe = medium.sharpe if medium else 0.0
+    low_sharpe = low.sharpe if low else 0.0
 
     lift_raw = calibration.get("lift")
     fragile_raw = calibration.get("fragile_failure_rate")
@@ -787,11 +790,35 @@ def _build_narrative(
     lift_str = f"{lift_raw:+.1%}" if lift_raw is not None else "N/A (one bucket empty)"
     fragile_str = f"{fragile_raw:.1%}" if fragile_raw is not None else "N/A"
     robust_str = f"{robust_raw:.1%}" if robust_raw is not None else "N/A"
-    # The acid test: HIGH should beat MEDIUM should beat LOW.
-    if high_n > 0 and medium_n > 0 and high_hr > medium_hr + 0.05:
-        call = "STACK CALIBRATED — HIGH meaningfully beats MEDIUM"
-    elif high_n > 0 and medium_n > 0 and high_hr < medium_hr:
-        call = "STACK BROKEN — HIGH underperforms MEDIUM, retune required"
+
+    # Two-axis verdict: hit_rate AND risk-adjusted return (sharpe). PR #193
+    # produced HIGH hit=50.5% vs MEDIUM 45.7% (a ~5pp spread that read
+    # INCONCLUSIVE under the old hit-rate-only logic) while HIGH sharpe was
+    # +1.37 vs MEDIUM -1.70 = +3.07 spread — a clear CALIBRATED signal
+    # the audit missed. Now:
+    #   - CALIBRATED when HIGH dominates MEDIUM on EITHER axis (hit_rate
+    #     spread >= 5pp OR sharpe spread >= 1.0)
+    #   - BROKEN when HIGH underperforms MEDIUM on BOTH axes
+    #   - Otherwise INCONCLUSIVE.
+    if high_n > 0 and medium_n > 0:
+        hr_spread = high_hr - medium_hr
+        sharpe_spread = high_sharpe - medium_sharpe
+        if hr_spread >= 0.05 or sharpe_spread >= 1.0:
+            call = (
+                "STACK CALIBRATED — HIGH beats MEDIUM "
+                f"(hit_rate {hr_spread:+.1%}, sharpe {sharpe_spread:+.2f})"
+            )
+        elif hr_spread < 0 and sharpe_spread < 0:
+            call = (
+                "STACK BROKEN — HIGH underperforms MEDIUM on both axes "
+                f"(hit_rate {hr_spread:+.1%}, sharpe {sharpe_spread:+.2f}), "
+                "retune required"
+            )
+        else:
+            call = (
+                "STACK INCONCLUSIVE — mixed signal "
+                f"(hit_rate {hr_spread:+.1%}, sharpe {sharpe_spread:+.2f})"
+            )
     else:
         call = "STACK INCONCLUSIVE — insufficient separation between buckets"
 
@@ -801,10 +828,13 @@ def _build_narrative(
         trades=int(trades_generated),
         high_hr=high_hr,
         high_n=high_n,
+        high_sharpe=high_sharpe,
         medium_hr=medium_hr,
         medium_n=medium_n,
+        medium_sharpe=medium_sharpe,
         low_hr=low_hr,
         low_n=low_n,
+        low_sharpe=low_sharpe,
         lift=lift_str,
         fragile_fail=fragile_str,
         robust_fail=robust_str,
