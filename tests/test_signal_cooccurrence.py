@@ -15,6 +15,7 @@ from intelligence.signal_cooccurrence import (
     MIN_LIFT_MULTIPLIER,
     CooccurrenceStats,
     SignalPair,
+    _extract_signal_contributions,
     bootstrap_from_oracle_predictions,
     canonical_pair,
     compute_independence_baseline,
@@ -642,3 +643,69 @@ class TestBootstrapFromOraclePredictions:
         summary = bootstrap_from_oracle_predictions(engine)
         assert summary["rows_scanned"] == 0
         assert summary["pairs_updated"] == 0
+
+
+# ── _extract_signal_contributions: dict-list pollution regression ─────────
+
+
+class TestExtractSignalContributionsListHandling:
+    """The 2026-05-17 audit found all 410 rows of
+    ``signal_cooccurrence_history`` were stringified-dict pairs like
+    ``{'name': 'astrogrid_grid', 'detail': 'leader:GOOGL'}``. The bug was
+    ``str(s)`` on a dict entry from ``signals`` lists emitted by
+    ``oracle/publish.py:publish_astrogrid_prediction``. The cooccurrence_
+    lift adjuster matched zero pairs against real predictions as a result.
+    """
+
+    def _make_row(self, signals_field):
+        # Minimal duck-typed prediction row.
+        return {
+            "signals": signals_field,
+            "signal_strength": 0.5,
+            "model_weights": None,
+        }
+
+    def test_list_of_dicts_extracts_name(self):
+        # astrogrid_grid / astrogrid_mystical emit dict entries
+        row = self._make_row([
+            {"name": "astrogrid_grid", "detail": "leader:GOOGL / laggard:AAPL"},
+            {"name": "astrogrid_mystical", "detail": "moon:Quarter"},
+        ])
+        contributions = _extract_signal_contributions(row)
+        assert set(contributions.keys()) == {"astrogrid_grid", "astrogrid_mystical"}
+        # No stringified-dict keys
+        for k in contributions:
+            assert not k.startswith("{")
+
+    def test_list_of_strings_still_works(self):
+        row = self._make_row(["sentiment", "equity", "vol"])
+        contributions = _extract_signal_contributions(row)
+        assert set(contributions.keys()) == {"sentiment", "equity", "vol"}
+
+    def test_list_with_dict_signal_field_falls_back(self):
+        # Dict entries with `signal` instead of `name` are still extracted.
+        row = self._make_row([
+            {"signal": "vol", "detail": "x"},
+            {"id": "rates", "weight": 1.0},
+        ])
+        contributions = _extract_signal_contributions(row)
+        assert set(contributions.keys()) == {"vol", "rates"}
+
+    def test_list_with_invalid_dicts_skips_not_pollutes(self):
+        # Dict entries without name/signal/id are dropped, not stringified.
+        row = self._make_row([
+            {"foo": "bar", "baz": 1},  # no name/signal/id
+            {"name": "good_signal"},
+        ])
+        contributions = _extract_signal_contributions(row)
+        assert set(contributions.keys()) == {"good_signal"}
+
+    def test_mixed_string_and_dict_entries(self):
+        row = self._make_row([
+            "macro",
+            {"name": "astrogrid_grid", "detail": "x"},
+            None,  # skipped
+            "",    # skipped
+        ])
+        contributions = _extract_signal_contributions(row)
+        assert set(contributions.keys()) == {"macro", "astrogrid_grid"}

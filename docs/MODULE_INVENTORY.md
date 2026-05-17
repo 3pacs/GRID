@@ -2,7 +2,7 @@
 
 Generated: 2026-05-18
 Total modules: 750
-Total LOC: 330,494
+Total LOC: 330,513
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycache__/`, `build/`, `dist/`, `docs/`, `node_modules/`, `notebooks/`, `pwa/`, `pwa_dist/`, `tests/`, `venv/`.
@@ -11,7 +11,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 
 | Directory | Module count | LOC |
 |---|---|---|
-| `intelligence/` | 172 | 102,046 |
+| `intelligence/` | 172 | 102,065 |
 | `ingestion/` | 207 | 85,797 |
 | `api/` | 107 | 48,466 |
 | `analysis/` | 33 | 18,973 |
@@ -848,7 +848,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`, `datetime`, `intelligence`, `json`, `loguru`, `math`, `sqlalchemy`, `typing`
 **Imported by:** `intelligence/signal_provenance.py`
 
-#### `intelligence/signal_cooccurrence.py` — 773 LOC
+#### `intelligence/signal_cooccurrence.py` — 792 LOC
 **Docstring:** Pairwise signal co-occurrence tracker.
 **Functions:** `SignalPair`, `CooccurrenceStats`, `ensure_cooccurrence_table`, `canonical_pair`, `compute_independence_baseline`, `compute_lift`, `get_firing_signals`, `compute_pair_lift_multiplier`, `record_joint_prediction`, `get_cooccurrence_stats`, `get_stats_for_signal`, `get_lift_multiplier`, `bootstrap_from_oracle_predictions`
 **Reads:** `__future__`, `dataclasses`, `datetime`, `itertools`, `loguru`, `sqlalchemy`, `typing`
