@@ -25,7 +25,7 @@ from sqlalchemy import text
 if TYPE_CHECKING:
     from sqlalchemy.engine import Engine
 
-    from contracts.schemas import SignalFired
+    from contracts.schemas import PredictionScored, SignalFired
 
 
 #: Minimum absolute strength for a signal to earn a provisional journal row.
@@ -154,4 +154,78 @@ def on_signal_fired(evt: "SignalFired", *, engine: "Engine") -> None:
         "journal.on_signal_fired: provisional row for {st} {t} "
         "strength={s:+.3f}",
         st=signal_type, t=ticker, s=strength,
+    )
+
+
+#: Outcome string written to ``decision_journal.outcome`` for each verdict.
+_VERDICT_TO_OUTCOME = {
+    "HIT": "PROFIT",
+    "PARTIAL": "PARTIAL",
+    "MISS": "LOSS",
+}
+
+
+def on_prediction_scored(
+    evt: "PredictionScored", *, engine: "Engine"
+) -> None:
+    """Close out the provisional journal row when its prediction is scored.
+
+    §7.3 names this as the fourth handler on ``PredictionScored`` (after
+    trust, oracle_weights, calibration). It walks every journal row whose
+    ``source_contract_id`` matches an event_id in the prediction's
+    correlation chain and stamps the realised verdict/outcome.
+
+    Best-effort: a missing journal row (oracle made the prediction
+    directly without a provisional row) is a no-op.
+    """
+    prediction_id = str(getattr(evt, "prediction_id", ""))
+    verdict = getattr(evt, "verdict", "") or ""
+    ticker = getattr(evt, "ticker", "") or ""
+    correlation_id = str(getattr(evt, "correlation_id", "") or "") or None
+    outcome = _VERDICT_TO_OUTCOME.get(verdict, "UNKNOWN")
+    confidence = float(getattr(evt, "confidence", 0.0) or 0.0)
+
+    if not prediction_id:
+        return
+
+    # Brier-style outcome for the realised side. HIT=1 on the expected
+    # direction, MISS=0, PARTIAL=0.5. Matches the calibration handler.
+    if verdict == "HIT":
+        realised = 1.0
+    elif verdict == "PARTIAL":
+        realised = 0.5
+    else:
+        realised = 0.0
+
+    try:
+        with engine.begin() as conn:
+            # 1) Stamp every provisional row tied to the same correlation_id.
+            result = conn.execute(
+                text(
+                    """
+                    UPDATE decision_journal
+                    SET outcome = :oc,
+                        realized_value = :rv,
+                        outcome_recorded_at = now()
+                    WHERE source_contract_id IN (
+                        SELECT event_id FROM contracts_audit
+                        WHERE correlation_id = CAST(:cid AS UUID)
+                    )
+                    AND outcome IS NULL
+                    """
+                ),
+                {"oc": outcome, "rv": realised, "cid": correlation_id},
+            )
+            closed = getattr(result, "rowcount", 0) or 0
+    except Exception as exc:
+        log.warning(
+            "journal.on_prediction_scored({pid}): {e}",
+            pid=prediction_id, e=str(exc),
+        )
+        return
+
+    log.info(
+        "journal.on_prediction_scored: prediction={pid} t={t} verdict={v} "
+        "closed_provisional={n} conf={c:.3f}",
+        pid=prediction_id, t=ticker, v=verdict, n=closed, c=confidence,
     )

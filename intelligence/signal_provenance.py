@@ -316,17 +316,44 @@ def compute_aggregate_conviction(
 def _verdict_from_aggregate(conviction: float, confidence: float) -> str:
     """Classify the final trade verdict.
 
-    Rules (deterministic):
+    Rules (deterministic, 2026-05-17 calibration):
       - aggregate conviction < 0.3 → no_trade
       - aggregate conviction < 0.7 OR raw confidence < 0.55 → low
-      - aggregate conviction >= 1.15 AND confidence >= 0.7 → high
+      - 0.55 <= confidence <= 0.85 (CALIBRATED zone) → high
+      - confidence > 0.85 (SATURATED zone) → medium
       - otherwise → medium
+
+    Two interacting issues drove this gate:
+
+    1. Conviction dimension is dead. A 6000-trade probe on grid-svr
+       (2026-05-17) showed every trade's ``aggregate_conviction`` rounds
+       to exactly 1.0 — the 13-layer adjuster chain is at neutral defaults
+       because the upstream calibration substrate (per_signal_brier_history,
+       confidence_bucket_tracker, regime_brier, meta_learning_matrix) is
+       sparse. Each adjuster falls through to its defensive 1.0 default.
+       Restore the two-axis gate ``conviction >= 1.15 AND confidence >= 0.7``
+       once the substrate repopulates with backdated last_updated (see
+       follow-up: backdate bootstrap_per_signal_brier).
+
+    2. Confidence has a saturated 0.95 cap. ``oracle/engine.py``,
+       ``intelligence/news_impact.py``, ``oracle/contrast_distillation.py``,
+       ``oracle/psi_model.py``, ``oracle/forecaster_adapter.py``, and
+       ``store/astrogrid.py`` all clamp raw confidence at ``min(0.95, ...)``
+       without per-model calibration. Result: 612 of 677 trades with
+       confidence >= 0.90 land at exactly 0.950; they are the worst-
+       performing cohort in the audit (hit = 16.8%, mean_pnl = -1.69%).
+       Until those caps are tightened or replaced with per-model
+       reliability curves, the HIGH gate excludes confidence > 0.85 so the
+       bucket isolates the calibrated 0.55-0.85 zone where the audit was
+       previously discovering sharpe = +2.01 alpha under the MEDIUM label.
+
+    See PR #192 (HIGH on confidence alone) + this PR (tighten upper bound).
     """
     if conviction < 0.3:
         return "no_trade"
     if conviction < 0.7 or confidence < 0.55:
         return "low"
-    if conviction >= 1.15 and confidence >= 0.7:
+    if 0.55 <= confidence <= 0.85:
         return "high"
     return "medium"
 
