@@ -7,6 +7,7 @@ import { colors, tokens } from '../styles/shared.js';
 import { useDevice } from '../hooks/useDevice.js';
 import { useWebSocket } from '../hooks/useWebSocket.js';
 import DashboardFlows from '../components/DashboardFlows.jsx';
+import LessonsWidget from '../components/LessonsWidget.jsx';
 import { formatUtcClock } from '../utils/formatTime.js';
 
 const MONO = "'JetBrains Mono', 'IBM Plex Mono', monospace";
@@ -560,6 +561,9 @@ export default function Dashboard({ onNavigate }) {
                     </div>
                 }
             </div>
+
+            {/* ═══ LESSONS LEARNED (async — task #68) ═══ */}
+            <LessonsWidget isMobile={isMobile} />
 
             {/* ═══ 4. MARKET PULSE ═══ */}
             <div style={{ ...card, display: 'flex', alignItems: 'center', gap: isMobile ? '6px' : '0',

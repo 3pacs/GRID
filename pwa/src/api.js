@@ -618,6 +618,24 @@ class GRIDApi {
     // Intelligence Dashboard (unified)
     async getIntelDashboard() { return this._fetch('/api/v1/intelligence/dashboard'); }
 
+    /**
+     * Async post-mortem lessons (LLM synthesis of recent failures).
+     *
+     * Dropped from the cold dashboard payload on 2026-05-16 (saved 8.5s).
+     * Backend endpoint (task #63) is 3-tier cached: cold ~30s, in-proc 27ms,
+     * DB-backed 37ms. Pass `refresh=true` to force regeneration (~30s).
+     *
+     * @param {number} n   max number of lessons to return (default 5)
+     * @param {number} days lookback window in days (default 30)
+     * @param {boolean} refresh force regeneration (bypasses cache)
+     * @returns {Promise<{lessons: string[], generated_at: string} | {error: true, status: number, message: string}>}
+     */
+    async getPostmortemLessons(n = 5, days = 30, refresh = false) {
+        const params = new URLSearchParams({ n: String(n), days: String(days) });
+        if (refresh) params.set('refresh', '1');
+        return this._fetch(`/api/v1/postmortem-lessons?${params.toString()}`);
+    }
+
     async getTrustScores() {
         const data = await this._fetch('/api/v1/intelligence/dashboard');
         if (data?.error) return data;
