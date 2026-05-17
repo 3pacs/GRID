@@ -166,6 +166,9 @@ class _FakeEngine:
                 key = (params["s"], int(params["h"]))
                 if key in self.parent.store:
                     return MagicMock()
+                # Mirror SQL ``COALESCE(:scored_at, NOW())`` — backdated
+                # value wins when provided, else fall back to wall clock.
+                stamp = params.get("scored_at") or datetime.now(timezone.utc)
                 self.parent.store[key] = {
                     "signal_source": params["s"],
                     "horizon_days": int(params["h"]),
@@ -173,7 +176,7 @@ class _FakeEngine:
                     "running_brier": float(params["b"]),
                     "running_ece": float(params["e"]),
                     "hit_count": int(params["hit"]),
-                    "last_updated": datetime.now(timezone.utc),
+                    "last_updated": stamp,
                 }
                 return MagicMock()
 
@@ -181,13 +184,18 @@ class _FakeEngine:
                 key = (params["s"], int(params["hz"]))
                 if key not in self.parent.store:
                     return MagicMock()
+                # Mirror SQL ``GREATEST(last_updated, COALESCE(:scored_at, NOW()))``.
+                proposed = params.get("scored_at") or datetime.now(timezone.utc)
+                existing = self.parent.store[key].get("last_updated")
+                if existing is not None and proposed < existing:
+                    proposed = existing
                 self.parent.store[key].update(
                     {
                         "scored_count": int(params["n"]),
                         "running_brier": float(params["b"]),
                         "running_ece": float(params["e"]),
                         "hit_count": int(params["h"]),
-                        "last_updated": datetime.now(timezone.utc),
+                        "last_updated": proposed,
                     }
                 )
                 return MagicMock()
@@ -493,3 +501,81 @@ class TestScorecardDataclass:
             assert k in d
         assert d["signal_source"] == "jodi_oil"
         assert d["is_calibrated"] is True
+
+
+# ── record_scored_prediction: backdated last_updated ──────────────────────
+
+
+class TestRecordScoredPredictionBackdated:
+    """The bootstrap replays historical predictions in chronological order.
+    Walk-forward audits later filter scorecards by ``last_updated <= as_of``
+    to prevent lookahead leak. If the bootstrap stamps every row with NOW(),
+    every historical replay sees zero scorecards (the substrate is invisible
+    to the very replay it was built for). The ``scored_at`` parameter
+    backdates the per-bucket ``last_updated`` to when the prediction was
+    actually scored against reality so the substrate becomes consumable.
+    """
+
+    def test_insert_uses_scored_at_when_provided(self):
+        engine = _FakeEngine()
+        backdate = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
+        record_scored_prediction(
+            engine,
+            horizon_days=7,
+            confidence=0.7,
+            outcome=1.0,
+            signal_contributions={"jodi_oil": 1.0},
+            scored_at=backdate,
+        )
+        row = engine.store[("jodi_oil", 7)]
+        assert row["last_updated"] == backdate
+
+    def test_insert_defaults_to_now_when_scored_at_none(self):
+        engine = _FakeEngine()
+        before = datetime.now(timezone.utc)
+        record_scored_prediction(
+            engine,
+            horizon_days=7,
+            confidence=0.7,
+            outcome=1.0,
+            signal_contributions={"jodi_oil": 1.0},
+        )
+        after = datetime.now(timezone.utc)
+        stamp = engine.store[("jodi_oil", 7)]["last_updated"]
+        assert before <= stamp <= after
+
+    def test_update_takes_greatest_of_existing_and_scored_at(self):
+        engine = _FakeEngine()
+        older = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        newer = datetime(2026, 2, 1, tzinfo=timezone.utc)
+        # First call backdates to NEWER (so the bucket carries that)
+        record_scored_prediction(
+            engine,
+            horizon_days=7,
+            confidence=0.7,
+            outcome=1.0,
+            signal_contributions={"jodi_oil": 1.0},
+            scored_at=newer,
+        )
+        # Second call tries to backdate to OLDER — must not go backwards
+        record_scored_prediction(
+            engine,
+            horizon_days=7,
+            confidence=0.8,
+            outcome=0.0,
+            signal_contributions={"jodi_oil": 1.0},
+            scored_at=older,
+        )
+        row = engine.store[("jodi_oil", 7)]
+        assert row["last_updated"] == newer
+        # And conversely, when the new scored_at is strictly later, it wins
+        latest = datetime(2026, 3, 1, tzinfo=timezone.utc)
+        record_scored_prediction(
+            engine,
+            horizon_days=7,
+            confidence=0.6,
+            outcome=1.0,
+            signal_contributions={"jodi_oil": 1.0},
+            scored_at=latest,
+        )
+        assert engine.store[("jodi_oil", 7)]["last_updated"] == latest
