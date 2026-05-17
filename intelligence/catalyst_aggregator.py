@@ -143,8 +143,15 @@ def _opex_dates_for_year(year: int) -> list[tuple[date, str]]:
 def _read_earnings_events(
     engine: Engine, *, start: date, end: date,
 ) -> list[CatalystEvent]:
-    """Read earnings dates from earnings_calendar within [start, end]."""
+    """Read earnings catalysts from BOTH earnings_calendar and earnings_events.
+
+    Task #186: earnings_calendar (961 rows, EPS+revenue) remains primary.
+    earnings_events (#151 puller) adds 10-K/10-Q/EARNINGS_CALL filing dates
+    that may not yet be in the calendar.  We dedupe on (ticker, date).
+    """
     events: list[CatalystEvent] = []
+    seen: set[tuple[str | None, date]] = set()
+
     try:
         with engine.connect() as conn:
             rows = conn.execute(
@@ -158,11 +165,12 @@ def _read_earnings_events(
             ).fetchall()
     except Exception as exc:  # noqa: BLE001
         log.debug("earnings_calendar read failed: {e}", e=str(exc))
-        return events
+        rows = []
 
     for r in rows:
+        ticker = str(r[0]).upper() if r[0] else None
         events.append(CatalystEvent(
-            ticker=str(r[0]).upper() if r[0] else None,
+            ticker=ticker,
             event_type=CATALYST_EARNINGS,
             event_date=r[1],
             confidence_window_days=1,
@@ -170,6 +178,46 @@ def _read_earnings_events(
             notes=f"FQ {r[2]}" if r[2] else "",
             impact=_CATALYST_IMPACT[CATALYST_EARNINGS],
         ))
+        if r[1] is not None:
+            seen.add((ticker, r[1]))
+
+    # Additive: pull filings-level events from earnings_events that the
+    # calendar puller hasn't materialised yet.  Use period_end as the
+    # canonical "earnings event date" — same semantic as earnings_date.
+    try:
+        with engine.connect() as conn:
+            ev_rows = conn.execute(
+                text(
+                    """
+                    SELECT ticker, period_end, fiscal_quarter, event_type
+                    FROM earnings_events
+                    WHERE event_type IN ('10-K', '10-Q', 'EARNINGS_CALL')
+                      AND period_end BETWEEN :s AND :e
+                      AND ticker IS NOT NULL
+                      AND period_end IS NOT NULL
+                    """
+                ).bindparams(s=start, e=end),
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        log.debug("earnings_events read failed: {e}", e=str(exc))
+        ev_rows = []
+
+    for r in ev_rows:
+        ticker = str(r[0]).upper() if r[0] else None
+        key = (ticker, r[1])
+        if key in seen:
+            continue
+        seen.add(key)
+        events.append(CatalystEvent(
+            ticker=ticker,
+            event_type=CATALYST_EARNINGS,
+            event_date=r[1],
+            confidence_window_days=1,
+            source="earnings_events",
+            notes=f"{r[3]} FQ {r[2]}" if r[2] else (r[3] or ""),
+            impact=_CATALYST_IMPACT[CATALYST_EARNINGS],
+        ))
+
     return events
 
 
