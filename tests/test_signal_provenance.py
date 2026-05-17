@@ -153,23 +153,30 @@ class TestVerdict:
         assert _verdict_from_aggregate(0.5, 0.8) == "low"
         assert _verdict_from_aggregate(0.9, 0.5) == "low"  # low confidence
 
-    def test_high_verdict_on_confidence(self):
-        # Post-2026-05-17: HIGH gate is confidence>=0.7 only, until the
-        # conviction stack varies again. See _verdict_from_aggregate
-        # docstring for the 6000-trade conviction-collapse rationale.
+    def test_high_verdict_calibrated_zone(self):
+        # Post-2026-05-17b: HIGH gate is confidence in [0.55, 0.85] —
+        # the calibrated zone. Excludes the saturated 0.9+ cluster
+        # (612 of 677 trades at exactly 0.950, hit=16.8%, mean_pnl=-1.69%).
         assert _verdict_from_aggregate(1.2, 0.8) == "high"
         assert _verdict_from_aggregate(1.4, 0.75) == "high"
-        # Confidence>=0.7 with neutral conviction (1.0) now lands HIGH —
-        # this is the bucketing that lights up the daily audit again.
-        assert _verdict_from_aggregate(1.0, 0.9) == "high"
         assert _verdict_from_aggregate(1.0, 0.7) == "high"
+        assert _verdict_from_aggregate(1.0, 0.55) == "high"
+        assert _verdict_from_aggregate(1.0, 0.85) == "high"
+
+    def test_saturated_confidence_falls_to_medium(self):
+        # Confidence > 0.85 (the saturated 0.95-cap cluster) currently
+        # lands MEDIUM — keeps HIGH bucket measurement honest until the
+        # upstream confidence caps get replaced with per-model reliability.
+        assert _verdict_from_aggregate(1.0, 0.90) == "medium"
+        assert _verdict_from_aggregate(1.0, 0.95) == "medium"
+        assert _verdict_from_aggregate(1.4, 0.99) == "medium"
 
     def test_medium_default(self):
-        # Confidence 0.55-0.70 lands MEDIUM regardless of conviction
-        # (so long as conviction>=0.7).
-        assert _verdict_from_aggregate(0.8, 0.65) == "medium"
-        assert _verdict_from_aggregate(1.3, 0.65) == "medium"
-        assert _verdict_from_aggregate(1.0, 0.55) == "medium"
+        # Confidence just above the calibrated ceiling lands MEDIUM.
+        assert _verdict_from_aggregate(0.8, 0.86) == "medium"
+        # Conf in [0.55, 0.85] now lands HIGH; conf<0.55 still LOW.
+        assert _verdict_from_aggregate(1.0, 0.55) == "high"
+        assert _verdict_from_aggregate(1.0, 0.54) == "low"
 
 
 # ── _extract_signal_contributions ────────────────────────────────────────

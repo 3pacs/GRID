@@ -1,8 +1,8 @@
 # GRID Module Inventory
 
-Generated: 2026-05-16
+Generated: 2026-05-18
 Total modules: 741
-Total LOC: 326,014
+Total LOC: 326,087
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycache__/`, `build/`, `dist/`, `docs/`, `node_modules/`, `notebooks/`, `pwa/`, `pwa_dist/`, `tests/`, `venv/`.
@@ -11,9 +11,9 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 
 | Directory | Module count | LOC |
 |---|---|---|
-| `intelligence/` | 170 | 100,720 |
+| `intelligence/` | 170 | 100,747 |
 | `ingestion/` | 204 | 83,948 |
-| `api/` | 106 | 47,971 |
+| `api/` | 106 | 48,017 |
 | `analysis/` | 33 | 18,973 |
 | `trading/` | 34 | 14,158 |
 | `oracle/` | 29 | 10,495 |
@@ -859,7 +859,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`, `datetime`, `loguru`, `math`, `sqlalchemy`, `typing`
 **Imported by:** `api/routers/conviction.py`
 
-#### `intelligence/signal_provenance.py` — 785 LOC
+#### `intelligence/signal_provenance.py` — 812 LOC
 **Docstring:** Signal provenance — the per-ticker "why" report.
 **Functions:** `SignalEvidence`, `CausationChain`, `TradeProvenanceReport`, `compute_aggregate_conviction`, `build_provenance_report`
 **Reads:** `__future__`, `dataclasses`, `datetime`, `features`, `intelligence`, `loguru`, `sqlalchemy`, `typing`
@@ -2410,9 +2410,9 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Functions:** `Tier`, `intel_search`, `intel_entity_profile`, `intel_actor_dossier`, `intel_ticker`, `intel_cross_reference`, `intel_deep_dive`, `intel_network`, `intel_market_brief`, `intel_predictions_active`, `intel_predictions_track_record`, `intel_briefing`
 **Reads:** `__future__`, `api`, `dataclasses`, `datetime`, `enum`, `fastapi`, `intelligence`, `json`, `loguru`, `sqlalchemy`, `time`, `typing`
 
-#### `api/routers/intel_cross_reference.py` — 220 LOC
+#### `api/routers/intel_cross_reference.py` — 266 LOC
 **Docstring:** Cross-reference intelligence endpoints — lie detector for government statistics.
-**Functions:** `get_cross_reference`, `get_cross_reference_by_category`, `get_cross_reference_for_ticker`, `get_cross_reference_history`
+**Functions:** `get_cross_reference`, `get_cross_reference_narrative`, `get_cross_reference_by_category`, `get_cross_reference_for_ticker`, `get_cross_reference_history`
 **Reads:** `__future__`, `api`, `dataclasses`, `fastapi`, `intelligence`, `loguru`, `threading`, `time`, `typing`
 
 #### `api/routers/intel_source_audit.py` — 120 LOC
