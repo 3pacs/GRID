@@ -26,6 +26,7 @@ vi.mock('../api.js', () => ({
         getWatchlistEnriched: vi.fn(),
         listFlowBriefings: vi.fn(),
         getFlowBriefingAudioUrl: vi.fn((name) => `/audio/${name}`),
+        getPostmortemLessons: vi.fn(),
     },
 }));
 
@@ -79,6 +80,8 @@ describe('Dashboard watchlist loading', () => {
         api.refreshWatchlistPrices.mockResolvedValue({ prices: { SPY: { price: 501, pct_1d: 0.02 } } });
         api.getWatchlistEnriched.mockResolvedValue({ items: [] });
         api.listFlowBriefings.mockResolvedValue({ briefings: [] });
+        api.getPostmortemLessons.mockReset();
+        api.getPostmortemLessons.mockResolvedValue({ lessons: [], generated_at: null });
     });
 
     it('uses cached watchlist prices on mount and avoids the refresh endpoint', async () => {
