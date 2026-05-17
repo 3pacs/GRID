@@ -319,14 +319,29 @@ def _verdict_from_aggregate(conviction: float, confidence: float) -> str:
     Rules (deterministic):
       - aggregate conviction < 0.3 → no_trade
       - aggregate conviction < 0.7 OR raw confidence < 0.55 → low
-      - aggregate conviction >= 1.15 AND confidence >= 0.7 → high
+      - confidence >= 0.7 (conviction stack neutral-collapse fallback) → high
       - otherwise → medium
+
+    Historical HIGH gate (kept for reference): ``conviction >= 1.15 AND
+    confidence >= 0.7``. As of 2026-05-17 a 6000-trade conviction-distribution
+    probe on grid-svr showed every trade's ``aggregate_conviction`` rounds
+    to exactly 1.0 — the 13-layer adjuster chain is at the neutral defaults
+    because the per_signal_brier_history, confidence_bucket_tracker,
+    regime_brier, and meta_learning calibration tables are largely empty
+    (see CLAUDE.md "Data state" note for the gap inventory). With the
+    conviction dimension dead, the original HIGH gate is unreachable and
+    every confidence>=0.7 trade gets demoted to MEDIUM. This collapses
+    HIGH-bucket measurement on the daily audit (n=0 for 3 weeks running).
+    Until calibration substrate fills, use confidence alone for HIGH.
+    When ``aggregate_conviction`` starts varying again (e.g., per-signal
+    Brier history accumulates past MIN_CALIBRATED_SAMPLES for enough
+    signals), restore the two-axis gate.
     """
     if conviction < 0.3:
         return "no_trade"
     if conviction < 0.7 or confidence < 0.55:
         return "low"
-    if conviction >= 1.15 and confidence >= 0.7:
+    if confidence >= 0.7:
         return "high"
     return "medium"
 

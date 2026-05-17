@@ -153,16 +153,23 @@ class TestVerdict:
         assert _verdict_from_aggregate(0.5, 0.8) == "low"
         assert _verdict_from_aggregate(0.9, 0.5) == "low"  # low confidence
 
-    def test_high_verdict_requires_both(self):
+    def test_high_verdict_on_confidence(self):
+        # Post-2026-05-17: HIGH gate is confidence>=0.7 only, until the
+        # conviction stack varies again. See _verdict_from_aggregate
+        # docstring for the 6000-trade conviction-collapse rationale.
         assert _verdict_from_aggregate(1.2, 0.8) == "high"
         assert _verdict_from_aggregate(1.4, 0.75) == "high"
-        # Just confidence isn't enough
-        assert _verdict_from_aggregate(1.0, 0.9) == "medium"
-        # Just conviction isn't enough
-        assert _verdict_from_aggregate(1.3, 0.65) == "medium"
+        # Confidence>=0.7 with neutral conviction (1.0) now lands HIGH —
+        # this is the bucketing that lights up the daily audit again.
+        assert _verdict_from_aggregate(1.0, 0.9) == "high"
+        assert _verdict_from_aggregate(1.0, 0.7) == "high"
 
     def test_medium_default(self):
+        # Confidence 0.55-0.70 lands MEDIUM regardless of conviction
+        # (so long as conviction>=0.7).
         assert _verdict_from_aggregate(0.8, 0.65) == "medium"
+        assert _verdict_from_aggregate(1.3, 0.65) == "medium"
+        assert _verdict_from_aggregate(1.0, 0.55) == "medium"
 
 
 # ── _extract_signal_contributions ────────────────────────────────────────
