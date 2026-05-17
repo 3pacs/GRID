@@ -183,11 +183,27 @@ def _verdict_call(buckets: dict[str, BucketStats]) -> str:
         return "INCONCLUSIVE — empty HIGH or MEDIUM bucket"
     hr_lift_pp = (high.hit_rate - medium.hit_rate) * 100.0
     pnl_lift_pp = high.mean_pnl - medium.mean_pnl
-    if hr_lift_pp >= 5.0 and pnl_lift_pp > 0:
-        return f"CALIBRATED — HIGH beats MEDIUM by {hr_lift_pp:.1f}pp hit rate and {pnl_lift_pp:+.2f}% mean PnL"
-    if hr_lift_pp <= -5.0 or pnl_lift_pp < 0:
-        return f"BROKEN — HIGH underperforms MEDIUM ({hr_lift_pp:+.1f}pp hit rate, {pnl_lift_pp:+.2f}% PnL)"
-    return f"INCONCLUSIVE — HIGH vs MEDIUM gap is small ({hr_lift_pp:+.1f}pp, {pnl_lift_pp:+.2f}%)"
+    sharpe_lift = high.sharpe - medium.sharpe
+    # Three-axis verdict — hit_rate, mean_pnl, AND sharpe. Adding sharpe
+    # catches the case where HIGH and MEDIUM have similar hit/pnl but
+    # very different risk-adjusted returns (e.g., HIGH=tight winners,
+    # MEDIUM=fat-tailed losses). Mirrors the same change in
+    # walk_forward_validate._build_narrative.
+    if hr_lift_pp >= 5.0 and pnl_lift_pp > 0 and sharpe_lift > 0:
+        return (
+            f"CALIBRATED — HIGH beats MEDIUM by {hr_lift_pp:.1f}pp hit rate, "
+            f"{pnl_lift_pp:+.2f}% mean PnL, sharpe lift {sharpe_lift:+.2f}"
+        )
+    if hr_lift_pp <= -5.0 or pnl_lift_pp < 0 or sharpe_lift < -0.5:
+        return (
+            f"BROKEN — HIGH underperforms MEDIUM "
+            f"({hr_lift_pp:+.1f}pp hit rate, {pnl_lift_pp:+.2f}% PnL, "
+            f"sharpe {sharpe_lift:+.2f})"
+        )
+    return (
+        f"INCONCLUSIVE — HIGH vs MEDIUM gap is small "
+        f"({hr_lift_pp:+.1f}pp, {pnl_lift_pp:+.2f}%, sharpe {sharpe_lift:+.2f})"
+    )
 
 
 def _slice_stats(rows: list[dict[str, Any]], group_key: str) -> dict[str, dict[str, Any]]:
