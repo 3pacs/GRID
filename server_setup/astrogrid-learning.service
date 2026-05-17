@@ -1,0 +1,14 @@
+[Unit]
+Description=AstroGrid learning loop catchup
+After=network.target postgresql.service astrogrid-api.service
+Wants=postgresql.service astrogrid-api.service
+
+[Service]
+Type=oneshot
+User=grid
+Group=grid
+WorkingDirectory=/data/grid_v4/astrogrid_dedup
+EnvironmentFile=/data/grid_v4/astrogrid_dedup/.env
+ExecStart=/usr/bin/flock -n /tmp/astrogrid-learning.lock /bin/bash /data/grid_v4/astrogrid_dedup/scripts/astrogrid_hourly_catchup.sh
+StandardOutput=append:/data/grid/logs/astrogrid-learning.log
+StandardError=append:/data/grid/logs/astrogrid-learning.log

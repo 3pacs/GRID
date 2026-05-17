@@ -1,0 +1,23 @@
+# AstroGrid isolated frontend/backend route.
+#
+# This keeps AstroGrid service changes off the main GRID app process. The main
+# GRID site can continue to use localhost:8000 while AstroGrid moves to its own
+# uvicorn on localhost:8010.
+
+astrogrid.yourdomain.com {
+    reverse_proxy localhost:8010
+
+    encode gzip
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy strict-origin-when-cross-origin
+    }
+
+    log {
+        output file /var/log/caddy-astrogrid.log
+        format json
+    }
+}
+
