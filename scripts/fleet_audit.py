@@ -27,7 +27,32 @@ import requests
 
 DEFAULT_COORDINATOR = os.getenv("GRID_COORDINATOR_URL", "http://100.75.185.36:8100")
 DEFAULT_HOSTS = ("grid-svr", "gridz4", "koala", "redbox", "ocr-node", "p9d", "z400", "panda")
-SERVICE_NEEDLES = ("grid-", "storymill-", "llama", "ollama", "comfyui", "topaz", "surya")
+SERVICE_NEEDLES = (
+    "grid-",
+    "storymill-",
+    "llama",
+    "ollama",
+    "comfyui",
+    "topaz",
+    "surya",
+    # Fleet-Hermes v0.5 expansion (task #38) — cover grid-svr intelligence/infra
+    # units the v0 needles missed. "micro" catches the gemma micros (gemma-micro-1..4).
+    "hermes",
+    "oracle",
+    "prefect",
+    "redpanda",
+    "minio",
+    "langfuse",
+    "postgres",
+    "micro",
+    "embed-worker",
+    "embed-enqueue",
+    "gem-hunter",
+    "permutation-worker",
+    "kill-predictor",
+    "llm-groundtruth",
+    "prefect-trust-scores",
+)
 REMOTE_PROBE = r"""
 import json
 import os
@@ -471,11 +496,199 @@ def _db_connect_info(db_url: str | None = None) -> str | dict[str, Any] | None:
     return None
 
 
-def write_fleet_state(conninfo: str | dict[str, Any], snapshots: list[HostSnapshot], depths: dict[str, int]) -> int:
+def audit_intelligence_state(conn: Any) -> dict[str, Any]:
+    """Read-only snapshot of the GRID intelligence pipeline (task #39).
+
+    Probes the hypothesis / kill-predictor / gem / permutation / shadow tables.
+    Returns a dict suitable for stuffing into ``fleet_state.state`` against
+    ``host='intelligence'``. Never writes; raises nothing on missing tables
+    (each section is wrapped so a single missing table does not break the rest).
+    """
+    state: dict[str, Any] = {
+        "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+    # discovered_hypotheses — status mix + scoring lag (the gap that bit us 2026-05-16).
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT status, COUNT(*) FROM discovered_hypotheses GROUP BY status")
+            status_counts = {str(row[0] or "unknown"): int(row[1]) for row in cur.fetchall()}
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM discovered_hypotheses
+                WHERE status = 'active'
+                  AND (last_tested IS NULL OR last_tested < NOW() - INTERVAL '7 days')
+                """
+            )
+            overdue_active = int(cur.fetchone()[0])
+        state["discovered_hypotheses"] = {
+            "status_counts": status_counts,
+            "active_overdue_7d": overdue_active,
+        }
+    except Exception as exc:  # noqa: BLE001 - per-section fault tolerance
+        state["discovered_hypotheses"] = {"error": str(exc)}
+        conn.rollback()
+
+    # hypothesis_asic_decisions — predictor versions + recent throughput.
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(predictor_version, 'unknown'), COUNT(*)
+                FROM hypothesis_asic_decisions
+                GROUP BY predictor_version
+                """
+            )
+            by_version = {str(row[0]): int(row[1]) for row in cur.fetchall()}
+            cur.execute(
+                "SELECT COUNT(*) FROM hypothesis_asic_decisions WHERE decided_at > NOW() - INTERVAL '1 hour'"
+            )
+            last_1h = int(cur.fetchone()[0])
+            cur.execute("SELECT MAX(decided_at) FROM hypothesis_asic_decisions")
+            max_decided = cur.fetchone()[0]
+        state["kill_predictor_decisions"] = {
+            "by_predictor_version": by_version,
+            "decisions_last_1h": last_1h,
+            "max_decided_at": max_decided.isoformat() if max_decided else None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        state["kill_predictor_decisions"] = {"error": str(exc)}
+        conn.rollback()
+
+    # gem_alerts — alert rate + freshness. NOTE: live schema uses subject_kind
+    # (not gem_kind); group on that. Stale > 1h gets flagged as a warning bit
+    # so callers/finding rules can pick it up later.
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(subject_kind, 'unknown'), COUNT(*)
+                FROM gem_alerts
+                WHERE detected_at > NOW() - INTERVAL '24 hours'
+                GROUP BY subject_kind
+                """
+            )
+            by_kind_24h = {str(row[0]): int(row[1]) for row in cur.fetchall()}
+            cur.execute("SELECT MAX(detected_at) FROM gem_alerts")
+            max_detected = cur.fetchone()[0]
+            cur.execute(
+                "SELECT EXTRACT(EPOCH FROM (NOW() - MAX(detected_at)))::BIGINT FROM gem_alerts"
+            )
+            stale_seconds_row = cur.fetchone()[0]
+            stale_seconds = int(stale_seconds_row) if stale_seconds_row is not None else None
+        state["gem_alerts"] = {
+            "by_subject_kind_24h": by_kind_24h,
+            "max_detected_at": max_detected.isoformat() if max_detected else None,
+            "stale_seconds": stale_seconds,
+            "stale_alert": (stale_seconds or 0) > 3600,
+        }
+    except Exception as exc:  # noqa: BLE001
+        state["gem_alerts"] = {"error": str(exc)}
+        conn.rollback()
+
+    # hypothesis_pvalue_history — confirm the permutation engine is producing.
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM hypothesis_pvalue_history WHERE computed_at > NOW() - INTERVAL '24 hours'"
+            )
+            new_24h = int(cur.fetchone()[0])
+            cur.execute("SELECT MAX(computed_at) FROM hypothesis_pvalue_history")
+            max_computed = cur.fetchone()[0]
+        state["hypothesis_pvalue_history"] = {
+            "new_rows_last_24h": new_24h,
+            "max_computed_at": max_computed.isoformat() if max_computed else None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        state["hypothesis_pvalue_history"] = {"error": str(exc)}
+        conn.rollback()
+
+    # hypothesis_asic_shadow — confirm the shadow A/B is running.
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM hypothesis_asic_shadow WHERE decided_at > NOW() - INTERVAL '24 hours'"
+            )
+            shadow_24h = int(cur.fetchone()[0])
+            cur.execute("SELECT MAX(decided_at) FROM hypothesis_asic_shadow")
+            max_shadow = cur.fetchone()[0]
+        state["hypothesis_asic_shadow"] = {
+            "decisions_last_24h": shadow_24h,
+            "max_decided_at": max_shadow.isoformat() if max_shadow else None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        state["hypothesis_asic_shadow"] = {"error": str(exc)}
+        conn.rollback()
+
+    return state
+
+
+def write_intelligence_state(conn: Any, state: dict[str, Any]) -> int:
+    """Append a single intelligence-state row to fleet_state (task #39).
+
+    Uses ``host='intelligence'``, NULL GPU fields, and stuffs the full JSON
+    blob into the new ``state`` JSONB column. Returns 1 on success.
+    """
+    import psycopg2.extras
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO fleet_state
+                (host, ok, error, gpu_index, gpu_name, gpu_uuid, util_pct,
+                 mem_used_mb, mem_total_mb, procs, services_running, queue_depths, state)
+            VALUES (%s,%s,%s,NULL,NULL,NULL,NULL,NULL,NULL,%s,%s,%s,%s)
+            """,
+            (
+                "intelligence",
+                True,
+                None,
+                psycopg2.extras.Json([]),
+                psycopg2.extras.Json([]),
+                psycopg2.extras.Json({}),
+                psycopg2.extras.Json(state),
+            ),
+        )
+    return 1
+
+
+def prune_fleet_state(conn: Any, keep_days: int = 90) -> int:
+    """Delete fleet_state rows older than ``keep_days`` (task #40).
+
+    Called from the end of every audit run. Read-only-ish: this is the only
+    DELETE the v0.5 audit performs, and it is bounded by a documented retention
+    window (see scripts/fleet/README.md and fleet_state_init.sql). Returns the
+    number of rows deleted.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM fleet_state WHERE ts < NOW() - (%s || ' days')::INTERVAL",
+            (str(int(keep_days)),),
+        )
+        return cur.rowcount or 0
+
+
+def write_fleet_state(
+    conninfo: str | dict[str, Any],
+    snapshots: list[HostSnapshot],
+    depths: dict[str, int],
+    *,
+    include_intelligence: bool = True,
+    prune_keep_days: int = 90,
+) -> dict[str, Any]:
+    """Persist host snapshots + intelligence-state row, then prune old rows.
+
+    Returns a dict with ``host_rows``, ``intel_rows``, ``intel_state`` (the
+    actual JSON written, for the report), and ``pruned_rows`` (task #40).
+    """
     import psycopg2
     import psycopg2.extras
 
-    rows = 0
+    host_rows = 0
+    intel_rows = 0
+    intel_state: dict[str, Any] | None = None
+    pruned_rows = 0
+
     if isinstance(conninfo, dict):
         conn = psycopg2.connect(**conninfo)
     else:
@@ -503,7 +716,7 @@ def write_fleet_state(conninfo: str | dict[str, Any], snapshots: list[HostSnapsh
                             psycopg2.extras.Json(depths),
                         ),
                     )
-                    rows += 1
+                    host_rows += 1
                     continue
                 for gpu in snapshot.gpus:
                     cur.execute(
@@ -528,8 +741,22 @@ def write_fleet_state(conninfo: str | dict[str, Any], snapshots: list[HostSnapsh
                             psycopg2.extras.Json(depths),
                         ),
                     )
-                    rows += 1
-    return rows
+                    host_rows += 1
+
+        # Task #39 — intelligence-layer snapshot.
+        if include_intelligence:
+            intel_state = audit_intelligence_state(conn)
+            intel_rows = write_intelligence_state(conn, intel_state)
+
+        # Task #40 — retention prune. Run last so today's writes survive.
+        pruned_rows = prune_fleet_state(conn, keep_days=prune_keep_days)
+
+    return {
+        "host_rows": host_rows,
+        "intel_rows": intel_rows,
+        "intel_state": intel_state,
+        "pruned_rows": pruned_rows,
+    }
 
 
 def report_payload(
@@ -538,8 +765,9 @@ def report_payload(
     coordinator_state: dict[str, Any],
     findings: list[Finding],
     wrote_rows: int | None = None,
+    write_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "mode": "read-only",
         "coordinator": coordinator_state,
@@ -548,6 +776,12 @@ def report_payload(
         "findings": [asdict(finding) for finding in findings],
         "wrote_fleet_state_rows": wrote_rows,
     }
+    if write_summary is not None:
+        # Tasks #39/#40 — surface intelligence + prune counts in the report.
+        payload["intelligence_state"] = write_summary.get("intel_state")
+        payload["wrote_intelligence_rows"] = write_summary.get("intel_rows")
+        payload["pruned_fleet_state_rows"] = write_summary.get("pruned_rows")
+    return payload
 
 
 def markdown_report(payload: dict[str, Any]) -> str:
@@ -585,8 +819,56 @@ def markdown_report(payload: dict[str, Any]) -> str:
             f"- `{snapshot.get('host')}` ok={snapshot.get('ok')} "
             f"gpus={'; '.join(gpu_bits) or 'none'} services={', '.join(services) or 'none'}"
         )
+    intel = payload.get("intelligence_state")
+    if intel:
+        lines.extend(["", "## Intelligence-layer snapshot", ""])
+        dh = intel.get("discovered_hypotheses") or {}
+        if "error" not in dh:
+            lines.append(
+                f"- discovered_hypotheses: status={dh.get('status_counts')} "
+                f"active_overdue_7d={dh.get('active_overdue_7d')}"
+            )
+        else:
+            lines.append(f"- discovered_hypotheses: error={dh.get('error')}")
+        kp = intel.get("kill_predictor_decisions") or {}
+        if "error" not in kp:
+            lines.append(
+                f"- kill_predictor_decisions: by_version={kp.get('by_predictor_version')} "
+                f"last_1h={kp.get('decisions_last_1h')} max_decided_at={kp.get('max_decided_at')}"
+            )
+        else:
+            lines.append(f"- kill_predictor_decisions: error={kp.get('error')}")
+        ga = intel.get("gem_alerts") or {}
+        if "error" not in ga:
+            lines.append(
+                f"- gem_alerts: by_subject_kind_24h={ga.get('by_subject_kind_24h')} "
+                f"max_detected_at={ga.get('max_detected_at')} stale_seconds={ga.get('stale_seconds')} "
+                f"stale_alert={ga.get('stale_alert')}"
+            )
+        else:
+            lines.append(f"- gem_alerts: error={ga.get('error')}")
+        ph = intel.get("hypothesis_pvalue_history") or {}
+        if "error" not in ph:
+            lines.append(
+                f"- hypothesis_pvalue_history: new_rows_24h={ph.get('new_rows_last_24h')} "
+                f"max_computed_at={ph.get('max_computed_at')}"
+            )
+        else:
+            lines.append(f"- hypothesis_pvalue_history: error={ph.get('error')}")
+        sh = intel.get("hypothesis_asic_shadow") or {}
+        if "error" not in sh:
+            lines.append(
+                f"- hypothesis_asic_shadow: decisions_24h={sh.get('decisions_last_24h')} "
+                f"max_decided_at={sh.get('max_decided_at')}"
+            )
+        else:
+            lines.append(f"- hypothesis_asic_shadow: error={sh.get('error')}")
+    pruned = payload.get("pruned_fleet_state_rows")
+    if pruned is not None:
+        lines.extend(["", f"- fleet_state retention prune: deleted {pruned} rows older than the configured window."])
+
     lines.extend(["", "## Guardrails", ""])
-    lines.append("- This v0 audit is read-only. It does not restart, install, rebind, or retime services.")
+    lines.append("- This v0.5 audit is read-only against services. The only DB writes are fleet_state INSERTs and the documented retention DELETE.")
     lines.append("- Producer cadence and OCR/topaz GPU bindings require separate evidence before mutation.")
     return "\n".join(lines) + "\n"
 
@@ -626,17 +908,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         coordinator_state = fetch_coordinator_state(args.coordinator, args.timeout)
 
     findings = build_findings(snapshots, coordinator_state)
-    wrote_rows = None
+    wrote_rows: int | None = None
+    write_summary: dict[str, Any] | None = None
     if args.write_db:
         conninfo = _db_connect_info(args.db_url)
         if not conninfo:
             raise SystemExit("--write-db requires --db-url, GRID_DB_URL, DATABASE_URL, or DB_HOST/DB_NAME/DB_USER")
-        wrote_rows = write_fleet_state(conninfo, snapshots, queue_depths(dict(coordinator_state.get("stats") or {})))
+        write_summary = write_fleet_state(
+            conninfo,
+            snapshots,
+            queue_depths(dict(coordinator_state.get("stats") or {})),
+            include_intelligence=not args.skip_intelligence,
+            prune_keep_days=args.prune_keep_days,
+        )
+        wrote_rows = int(write_summary.get("host_rows") or 0)
     return report_payload(
         snapshots=snapshots,
         coordinator_state=coordinator_state,
         findings=findings,
         wrote_rows=wrote_rows,
+        write_summary=write_summary,
     )
 
 
@@ -652,6 +943,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json-only", action="store_true", help="Print compact JSON only.")
     parser.add_argument("--write-db", action="store_true", help="Persist snapshots to fleet_state after probing.")
     parser.add_argument("--db-url", help="Postgres DSN for --write-db.")
+    parser.add_argument(
+        "--skip-intelligence",
+        action="store_true",
+        help="Do not write an intelligence-state row (task #39). Default: write one per --write-db pass.",
+    )
+    parser.add_argument(
+        "--prune-keep-days",
+        type=int,
+        default=90,
+        help="fleet_state retention window in days (task #40). Default 90.",
+    )
     parser.add_argument(
         "--apply",
         action="store_true",

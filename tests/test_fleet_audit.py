@@ -26,13 +26,50 @@ def test_parse_compute_apps_and_services_filters_relevant_units():
     )
     services = fleet_audit.parse_systemd_services(
         "grid-worker.service loaded active running GRID worker\n"
-        "postgresql.service loaded active running PostgreSQL\n"
+        "cron.service loaded active running cron\n"
         "ollama.service loaded failed failed Ollama\n"
     )
 
     assert [app.pid for app in apps] == [1234, 2222]
+    # v0.5: postgres is now in SERVICE_NEEDLES, so the noise unit was switched
+    # to a non-matched one (cron) to keep the parity assertion meaningful.
     assert [service.name for service in services] == ["grid-worker.service", "ollama.service"]
     assert services[1].active_state == "failed"
+
+
+def test_service_needles_v05_covers_grid_svr_stack():
+    """v0.5 task #38 — needles must catch hermes/oracle/prefect/postgres/etc."""
+    services = fleet_audit.parse_systemd_services(
+        "grid-hermes.service loaded active running Hermes operator\n"
+        "grid-oracle.service loaded active running Oracle\n"
+        "prefect-trust-scores.service loaded active running Prefect trust scores\n"
+        "redpanda.service loaded active running Redpanda broker\n"
+        "minio.service loaded active running MinIO\n"
+        "langfuse-web.service loaded active running Langfuse\n"
+        "postgresql.service loaded active running PostgreSQL\n"
+        "gemma-micro-1.service loaded active running Gemma micro 1\n"
+        "embed-worker.service loaded active running embedding worker\n"
+        "gem-hunter.service loaded active running gem hunter\n"
+        "permutation-worker.service loaded active running permutation worker\n"
+        "kill-predictor.service loaded active running kill predictor\n"
+        "llm-groundtruth.service loaded active running llm groundtruth\n"
+        "cron.service loaded active running cron\n"  # must NOT match
+    )
+    names = [service.name for service in services]
+    assert "cron.service" not in names
+    assert "grid-hermes.service" in names
+    assert "grid-oracle.service" in names
+    assert "prefect-trust-scores.service" in names
+    assert "redpanda.service" in names
+    assert "minio.service" in names
+    assert "langfuse-web.service" in names
+    assert "postgresql.service" in names
+    assert "gemma-micro-1.service" in names
+    assert "embed-worker.service" in names
+    assert "gem-hunter.service" in names
+    assert "permutation-worker.service" in names
+    assert "kill-predictor.service" in names
+    assert "llm-groundtruth.service" in names
 
 
 def test_build_findings_detects_queue_starvation_and_failed_service():
