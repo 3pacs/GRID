@@ -173,10 +173,10 @@ def infer_direction(query: str, titles: list[str] | None = None) -> str:
     bear_hits = sum(1 for w in _BEARISH_WORDS if w in combined)
 
     if bull_hits > bear_hits:
-        return "buy"
+        return "BULL"
     if bear_hits > bull_hits:
-        return "sell"
-    return "neutral"
+        return "BEAR"
+    return "NEUTRAL"
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +210,7 @@ def inject_signal(engine: Engine, event: dict[str, Any]) -> None:
             "signal_date": date.today(),
             "ticker": "MACRO",
             "actor": f"gdelt:{event['category']}",
-            "direction": event.get("direction", "neutral"),
+            "direction": event.get("direction", "NEUTRAL"),
             "magnitude": magnitude,
             "description": (
                 f"Breaking: {event['category']} spike "

@@ -39,7 +39,7 @@ EXTRACTORS = [
             "parts": sid.split(":"),
             "actor": sid.split(":")[2].replace("_", " ").title() if len(sid.split(":")) > 2 else None,
             "ticker": sid.split(":")[3] if len(sid.split(":")) > 3 else None,
-            "direction": "sell" if "SALE" in sid.upper() else "buy",
+            "direction": "BEAR" if "SALE" in sid.upper() else "BULL",
         },
     },
     {
@@ -50,7 +50,7 @@ EXTRACTORS = [
             "parts": sid.split(":"),
             "actor": None,  # Anonymous whale
             "ticker": sid.split(":")[1] if len(sid.split(":")) > 1 else None,
-            "direction": "bullish" if "CALL" in sid.upper() else "bearish",
+            "direction": "BULL" if "CALL" in sid.upper() else "BEAR",
         },
     },
     {
@@ -62,7 +62,8 @@ EXTRACTORS = [
             # gdelt_actor_powell_tone → "Powell"
             "actor": " ".join(sid.replace("gdelt_actor_", "").replace("_tone", "").split("_")).title(),
             "ticker": "MACRO",
-            "direction": "neutral",  # direction comes from value (positive/negative tone)
+            "direction": "NEUTRAL",  # default; downstream may rewrite from tone value
+            "signal_subtype": "geopolitical_tone",
         },
     },
     {
@@ -74,7 +75,8 @@ EXTRACTORS = [
             # gdelt_tension_us_russia → actor="Us Russia" (country pair)
             "actor": " ".join(sid.replace("gdelt_tension_", "").split("_")).upper(),
             "ticker": "MACRO",
-            "direction": "risk",
+            "direction": None,
+            "signal_subtype": "geopolitical_tension",
         },
     },
     {
@@ -84,7 +86,7 @@ EXTRACTORS = [
             "parts": sid.split(":"),
             "actor": sid.split(":")[2].replace("_", " ").title() if len(sid.split(":")) > 2 else None,
             "ticker": sid.split(":")[1] if len(sid.split(":")) > 1 else None,
-            "direction": "buy" if "purchase" in sid.lower() or "buy" in sid.lower() else "sell",
+            "direction": "BULL" if "purchase" in sid.lower() or "buy" in sid.lower() else "BEAR",
         },
     },
     {
@@ -95,7 +97,7 @@ EXTRACTORS = [
             "parts": sid.split(":"),
             "actor": sid.split(":")[2].replace("_", " ").title() if len(sid.split(":")) > 2 else None,
             "ticker": sid.split(":")[1] if len(sid.split(":")) > 1 else None,
-            "direction": "buy" if any(w in sid.upper() for w in ("BUY", "PURCHASE", "GRANT")) else "sell",
+            "direction": "BULL" if any(w in sid.upper() for w in ("BUY", "PURCHASE", "GRANT")) else "BEAR",
         },
     },
     {
@@ -105,7 +107,8 @@ EXTRACTORS = [
             "parts": sid.split(":"),
             "actor": sid.split(":")[2].replace("_", " ").title() if len(sid.split(":")) > 2 else None,
             "ticker": sid.split(":")[1] if len(sid.split(":")) > 1 else None,
-            "direction": "influence",
+            "direction": None,
+            "signal_subtype": "foreign_lobbying",
         },
     },
     {
@@ -115,7 +118,7 @@ EXTRACTORS = [
             "parts": sid.split(":"),
             "actor": None,  # Dark pool = anonymous
             "ticker": sid.split(":")[1] if len(sid.split(":")) > 1 else None,
-            "direction": "buy" if "buy" in sid.lower() else "sell",
+            "direction": "BULL" if "buy" in sid.lower() else "BEAR",
         },
     },
     {
@@ -125,7 +128,8 @@ EXTRACTORS = [
             "parts": sid.split(":"),
             "actor": sid.split(":")[1].replace("_", " ").title() if len(sid.split(":")) > 1 else None,
             "ticker": sid.split(":")[2] if len(sid.split(":")) > 2 else None,
-            "direction": "influence",
+            "direction": None,
+            "signal_subtype": "lobbying",
         },
     },
     {
@@ -135,7 +139,8 @@ EXTRACTORS = [
             "parts": sid.split(":"),
             "actor": sid.split(":")[1].replace("_", " ").title() if len(sid.split(":")) > 1 else None,
             "ticker": sid.split(":")[2] if len(sid.split(":")) > 2 else None,
-            "direction": "donation",
+            "direction": None,
+            "signal_subtype": "campaign_donation",
         },
     },
 ]
@@ -172,7 +177,12 @@ def extract_from_raw_series(engine: Engine, batch_size: int = 5000) -> dict[str,
                     parsed = parse_fn(series_id)
                     actor = parsed.get("actor")
                     ticker = parsed.get("ticker")
-                    direction = parsed.get("direction", "unknown")
+                    direction = parsed.get("direction")  # None means non-directional
+                    subtype = parsed.get("signal_subtype")
+                    # Direction must be canonical {BULL,BEAR,NEUTRAL,None}; anything
+                    # else is dropped to None to avoid polluting signal_data.direction.
+                    if direction not in ("BULL", "BEAR", "NEUTRAL", None):
+                        direction = None
 
                     if not ticker:
                         stats["skipped"] += 1
@@ -181,9 +191,9 @@ def extract_from_raw_series(engine: Engine, batch_size: int = 5000) -> dict[str,
                     conn.execute(text("""
                         INSERT INTO signal_data
                             (signal_type, signal_date, ticker, actor, direction,
-                             magnitude, confidence, source_id, data, created_at)
+                             signal_subtype, magnitude, confidence, source_id, data, created_at)
                         VALUES (:stype, :sdate, :ticker, :actor, :dir,
-                                :mag, :conf, :src, :data, NOW())
+                                :sub, :mag, :conf, :src, :data, NOW())
                         ON CONFLICT DO NOTHING
                     """), {
                         "stype": sig_type,
@@ -191,6 +201,7 @@ def extract_from_raw_series(engine: Engine, batch_size: int = 5000) -> dict[str,
                         "ticker": ticker,
                         "actor": actor,
                         "dir": direction,
+                        "sub": subtype,
                         "mag": float(value) if value else 0.0,
                         "conf": "confirmed",
                         "src": series_id,
@@ -242,7 +253,11 @@ def extract_from_signal_sources(engine: Engine, batch_size: int = 5000) -> dict[
             try:
                 # source_id in signal_sources IS the actor name (e.g., "Nancy Pelosi")
                 actor = source_id
-                direction = signal_type.lower() if signal_type else "unknown"
+                # signal_type.lower() is a categorical leak, not a direction.
+                # Stash it as subtype; leave direction NULL since we cannot
+                # derive bull/bear from the source_type alone.
+                subtype = signal_type.lower() if signal_type else None
+                direction = None
 
                 # Parse signal_value JSON for extra context
                 extra = {}
@@ -259,9 +274,9 @@ def extract_from_signal_sources(engine: Engine, batch_size: int = 5000) -> dict[
                 conn.execute(text("""
                     INSERT INTO signal_data
                         (signal_type, signal_date, ticker, actor, direction,
-                         magnitude, confidence, source_id, data, created_at)
+                         signal_subtype, magnitude, confidence, source_id, data, created_at)
                     VALUES (:stype, :sdate, :ticker, :actor, :dir,
-                            :mag, :conf, :src, :data, NOW())
+                            :sub, :mag, :conf, :src, :data, NOW())
                     ON CONFLICT DO NOTHING
                 """), {
                     "stype": source_type,
@@ -269,6 +284,7 @@ def extract_from_signal_sources(engine: Engine, batch_size: int = 5000) -> dict[
                     "ticker": ticker,
                     "actor": actor,
                     "dir": direction,
+                    "sub": subtype,
                     "mag": float(magnitude) if magnitude else 0.0,
                     "conf": "confirmed",
                     "src": composite_src,
