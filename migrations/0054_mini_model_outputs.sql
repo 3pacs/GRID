@@ -1,6 +1,6 @@
--- Migration: 0050_mini_model_outputs.sql
+-- Migration: 0054_mini_model_outputs.sql
 -- Author: feat/wire-mini-models
--- Applies via: sudo -u postgres psql griddb -f migrations/0050_mini_model_outputs.sql
+-- Applies via: sudo -u postgres psql griddb -f migrations/0054_mini_model_outputs.sql
 --
 -- Persists outputs from the Gemma 270M mini-models that were running but had
 -- no production caller wired in:
