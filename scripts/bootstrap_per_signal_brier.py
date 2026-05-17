@@ -80,6 +80,7 @@ _ORACLE_COLUMNS: tuple[str, ...] = (
     "signals",
     "signal_contributions",
     "model_weights",
+    "scored_at",
 )
 
 # Walks oracle_predictions in chronological order — replaying in time
@@ -88,12 +89,13 @@ _ORACLE_COLUMNS: tuple[str, ...] = (
 _ORACLE_QUERY = text(
     """
     SELECT id, ticker, created_at, expiry, confidence, verdict,
-           model_name, signals, signal_contributions, model_weights
+           model_name, signals, signal_contributions, model_weights,
+           COALESCE(scored_at, expiry, created_at) AS scored_at
     FROM oracle_predictions
     WHERE verdict IN ('hit', 'miss', 'partial')
       AND created_at >= NOW() - (:days || ' days')::interval
       AND dedup_keep = TRUE
-    ORDER BY created_at ASC
+    ORDER BY scored_at ASC NULLS LAST, created_at ASC
     """
 )
 
@@ -362,12 +364,13 @@ def _fetch_scored_predictions(
             """
             SELECT id, ticker, created_at, expiry, confidence, verdict,
                    model_name, signals, NULL::text AS signal_contributions,
-                   model_weights
+                   model_weights,
+                   COALESCE(scored_at, expiry, created_at) AS scored_at
             FROM oracle_predictions
             WHERE verdict IN ('hit', 'miss', 'partial')
               AND created_at >= NOW() - (:days || ' days')::interval
               AND dedup_keep = TRUE
-            ORDER BY created_at ASC
+            ORDER BY scored_at ASC NULLS LAST, created_at ASC
             """
         )
         try:
@@ -469,12 +472,22 @@ def replay_predictions(
                 )
 
             if not dry_run:
+                # Pass scored_at so the per-bucket ``last_updated`` reflects
+                # WHEN this prediction was actually scored, not when the
+                # bootstrap ran. Walk-forward audits filter by
+                # ``last_updated <= as_of`` to prevent lookahead leak; a
+                # bootstrap that stamps every row with NOW() makes the
+                # scorecards invisible to every historical replay. With
+                # ``scored_at`` plumbed through, replaying the corpus in
+                # chronological order produces a per_signal_brier_history
+                # that the walk-forward harness can actually consume.
                 record_scored_prediction(
                     engine,
                     horizon_days=horizon_days,
                     confidence=confidence,
                     outcome=outcome,
                     signal_contributions=contributions,
+                    scored_at=row.get("scored_at"),
                 )
 
             for source in contributions:
