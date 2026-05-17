@@ -107,86 +107,6 @@ CHOKEPOINT_CROSSING_MIN_DELTA: float = 0.15
 # Minimum price move to count as a signal_typeal outcome
 MOVE_THRESHOLD_PCT: float = 1.0
 
-# Direction inference for ``score_pending_signals``. Pre-2026-05-13 the
-# scorer only recognised literal "BUY" and "SELL" — every other
-# signal_type (insider_sell, wsb_bullish, gov_contracts, NET_POSITION_DELTA,
-# HEAT_SPIKE, UNUSUAL_SELL, …) defaulted to WRONG regardless of price.
-# That inflated the WRONG count to 167K / 168K scored = 99.3% and made
-# every downstream consumer (trust_scorer, lever_pullers) treat every
-# source as untrustworthy.
-#
-# Each entry maps a signal_type → directional intent. Types absent from
-# both maps require ``signal_value`` to declare the direction (e.g.
-# UNUSUAL_OPTIONS sets ``"direction"`` in the payload). Anything we still
-# can't classify stays PENDING — better than counting it as WRONG.
-_BULLISH_SIGNAL_TYPES: frozenset[str] = frozenset({
-    "BUY",
-    "CLUSTER_BUY",
-    "insider_buy",
-    "wsb_bullish",
-    "trade_idea_long",
-    "gov_contracts",       # company being awarded a contract → bullish for them
-    "CONTRACT_AWARD",
-})
-_BEARISH_SIGNAL_TYPES: frozenset[str] = frozenset({
-    "SELL",
-    "UNUSUAL_SELL",
-    "insider_sell",
-    "wsb_bearish",
-    "trade_idea_short",
-})
-
-
-def _infer_signal_direction(
-    signal_type: str | None,
-    signal_value: Any,
-) -> str:
-    """Classify a signal into bullish / bearish / unknown.
-
-    Direction precedence:
-      1. Explicit name match (``_BULLISH_SIGNAL_TYPES`` / ``_BEARISH_SIGNAL_TYPES``)
-      2. Substring fallback on the type name (handles future additions
-         like ``cluster_long`` / ``short_squeeze_alert`` without code change)
-      3. ``signal_value["direction"]`` — used by NET_POSITION_DELTA,
-         HEAT_SPIKE, UNUSUAL_OPTIONS, etc.
-      4. Transaction text on house_trading / senate_trading rows.
-      5. ``unknown`` — caller must leave the row PENDING rather than
-         force a WRONG.
-    """
-    if not signal_type:
-        return "unknown"
-    if signal_type in _BULLISH_SIGNAL_TYPES:
-        return "bullish"
-    if signal_type in _BEARISH_SIGNAL_TYPES:
-        return "bearish"
-
-    name_lower = signal_type.lower()
-    # Substring tells you direction without enumerating every future type.
-    if any(tok in name_lower for tok in ("bull", "_buy", "long")):
-        if "bullish" in name_lower or name_lower.startswith("buy") or name_lower.endswith("_buy") or "_long" in name_lower or "long_" in name_lower:
-            return "bullish"
-    if any(tok in name_lower for tok in ("bear", "_sell", "short")):
-        if "bearish" in name_lower or name_lower.startswith("sell") or name_lower.endswith("_sell") or "_short" in name_lower or "short_" in name_lower:
-            return "bearish"
-
-    payload: dict[str, Any] = signal_value if isinstance(signal_value, dict) else {}
-
-    direction = str(payload.get("direction", "") or "").lower()
-    if direction in ("up", "long", "bull", "bullish", "buy"):
-        return "bullish"
-    if direction in ("down", "short", "bear", "bearish", "sell"):
-        return "bearish"
-
-    # Congressional trading: direction is on the Transaction text.
-    if signal_type in ("house_trading", "senate_trading"):
-        tx = str(payload.get("Transaction", "") or "").lower()
-        if any(tok in tx for tok in ("purchase", "buy")):
-            return "bullish"
-        if any(tok in tx for tok in ("sale", "sell")):
-            return "bearish"
-
-    return "unknown"
-
 # Recency weighting half-life in days
 RECENCY_HALF_LIFE_DAYS: int = 90
 
@@ -475,30 +395,15 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
             # Compute return
             pct_change = (current_price - entry_price) / entry_price * 100.0
 
-            # Classify — direction-aware. The pre-2026-05-13 scorer only
-            # recognised literal "BUY"/"SELL" and defaulted every other
-            # signal_type to WRONG; that produced 99.3% WRONG (167K of
-            # 168K scored) and made every downstream calibration call the
-            # whole signal universe untrustworthy. Now we infer direction
-            # from the type name + signal_value, and leave rows whose
-            # direction is genuinely ambiguous as PENDING rather than
-            # forcing a WRONG.
-            direction = _infer_signal_direction(signal_type, signal_value)
-            if direction == "bullish":
-                outcome = "CORRECT" if pct_change > MOVE_THRESHOLD_PCT else "WRONG"
-            elif direction == "bearish":
-                outcome = "CORRECT" if pct_change < -MOVE_THRESHOLD_PCT else "WRONG"
-            else:
-                # Unknown direction → can't score this one. Leave PENDING
-                # so it's eligible for re-scoring once the inference
-                # rules grow.
-                summary.setdefault("unscoreable", 0)
-                summary["unscoreable"] += 1
-                continue
-
-            if outcome == "CORRECT":
+            # Classify
+            if signal_type == "BUY" and pct_change > MOVE_THRESHOLD_PCT:
+                outcome = "CORRECT"
+                summary["correct"] += 1
+            elif signal_type == "SELL" and pct_change < -MOVE_THRESHOLD_PCT:
+                outcome = "CORRECT"
                 summary["correct"] += 1
             else:
+                outcome = "WRONG"
                 summary["wrong"] += 1
 
             conn.execute(text("""
@@ -1813,23 +1718,14 @@ class TrustScorer:
         if not signals:
             return 0
 
-        # Translate contract verdicts (HIT/MISS/PARTIAL/UNKNOWN) into the
-        # signal_sources outcome enum. Case-insensitive — historically the
-        # event-bus emitted uppercase but oracle_predictions.verdict
-        # writes lowercase, and this lookup defaulting every non-match to
-        # "WRONG" silently fed the 99.3% WRONG inflation that broke
-        # downstream calibration (see #119 for the score_pending_signals
-        # half of the same family of bugs).
+        # Translate contract verdicts (HIT/MISS/PARTIAL) into the
+        # trust_scorer outcome enum (CORRECT/WRONG) used by signal_sources.
         outcome_map = {
             "HIT": "CORRECT",
             "PARTIAL": "CORRECT",
             "MISS": "WRONG",
         }
-        outcome = outcome_map.get(str(verdict or "").strip().upper())
-        if outcome is None:
-            # Unknown / no_data / pending — leave the row PENDING for the
-            # next scoring cycle. Forcing WRONG here is the bug.
-            return 0
+        outcome = outcome_map.get(str(verdict), "WRONG")
         now = datetime.now(timezone.utc)
 
         ids: list[str] = []
@@ -1845,32 +1741,27 @@ class TrustScorer:
 
         updated = 0
         try:
-            # NOTE: signal_sources has no ``outcome_notes`` column (see
-            # information_schema). Pre-2026-05-13 the UPDATE referenced
-            # one, so every call raised ``UndefinedColumn`` and was
-            # caught + DEBUG-logged below, making the entire contract-
-            # driven feedback path silently dead.
             with self.engine.begin() as conn:
                 result = conn.execute(
                     text(
                         "UPDATE signal_sources "
                         "SET outcome = :o, "
-                        "    scored_at = :now "
+                        "    scored_at = :now, "
+                        "    outcome_notes = :notes "
                         "WHERE id::text = ANY(:ids) "
                         "  AND (outcome IS NULL OR outcome = 'PENDING')"
                     ),
                     {
                         "o": outcome,
                         "now": now,
+                        "notes": f"prediction={prediction_id} verdict={verdict}",
                         "ids": ids,
                     },
                 )
                 updated = result.rowcount or 0
         except Exception as exc:
-            log.warning(
-                "trust_scorer.score_prediction_signals failed "
-                "(pred={p}, n_ids={n}): {e}",
-                p=prediction_id, n=len(ids), e=str(exc),
+            log.debug(
+                "trust_scorer.score_prediction_signals: {e}", e=str(exc)
             )
             return 0
 

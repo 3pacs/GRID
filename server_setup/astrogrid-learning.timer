@@ -1,0 +1,11 @@
+[Unit]
+Description=Run AstroGrid learning loop hourly
+
+[Timer]
+OnBootSec=7min
+OnUnitActiveSec=1h
+RandomizedDelaySec=3min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

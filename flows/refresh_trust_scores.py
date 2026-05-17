@@ -92,36 +92,6 @@ def refresh_trust_scores_flow() -> dict:
     return result
 
 
-def register_deployment() -> dict | None:
-    """Register the nightly deployment with Prefect (cron 02:30 UTC).
-
-    Mirrors the pattern in ``orchestration/flows.py::register_deployments``.
-    """
-    try:
-        from prefect.client.schemas.schedules import CronSchedule
-
-        deployment = {
-            "flow": refresh_trust_scores_flow,
-            "name": "refresh-trust-scores-nightly",
-            "schedule": CronSchedule(cron="30 2 * * *"),  # 02:30 UTC daily
-            "description": (
-                "Recompute source trust scores and write to "
-                "source_trust_scores_cached so the intelligence dashboard "
-                "can serve them in <100ms instead of recomputing on every "
-                "cold cache hit (~12s)."
-            ),
-        }
-        log.info("Registered deployment: {n}", n=deployment["name"])
-        return deployment
-    except ImportError:
-        log.warning("Prefect not installed — deployment not registered")
-        return None
-
 
 if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) > 1 and sys.argv[1] == "register":
-        register_deployment()
-    else:
-        refresh_trust_scores_flow()
+    refresh_trust_scores_flow()
