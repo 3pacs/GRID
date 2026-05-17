@@ -47,7 +47,8 @@ def detect_spikes(pools: list[PoolData]) -> list[dict]:
             signals.append({
                 "signal_type": "dex_liquidity_spike",
                 "ticker": p.symbol,
-                "direction": "spike_volume",
+                "direction": None,
+                "signal_subtype": "spike_volume",
                 "magnitude": round(p.volume_24h / p.volume_avg_24h, 1),
                 "data": _pool_metadata(p),
             })
@@ -56,7 +57,8 @@ def detect_spikes(pools: list[PoolData]) -> list[dict]:
             signals.append({
                 "signal_type": "dex_liquidity_spike",
                 "ticker": p.symbol,
-                "direction": "new_pool",
+                "direction": None,
+                "signal_subtype": "new_pool",
                 "magnitude": p.liquidity,
                 "data": _pool_metadata(p),
             })
@@ -65,7 +67,8 @@ def detect_spikes(pools: list[PoolData]) -> list[dict]:
             signals.append({
                 "signal_type": "dex_liquidity_spike",
                 "ticker": p.symbol,
-                "direction": "price_surge",
+                "direction": None,
+                "signal_subtype": "price_surge",
                 "magnitude": round(p.price_change_1h, 1),
                 "data": _pool_metadata(p),
             })
@@ -218,8 +221,8 @@ def _write_signals(signals: list[dict]) -> None:
             with conn.cursor() as cur:
                 for s in signals:
                     cur.execute(
-                        "INSERT INTO signal_data (signal_type, signal_date, ticker, direction, magnitude, data, confidence) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                        (s["signal_type"], date.today(), s["ticker"], s["direction"], s["magnitude"], json.dumps(s["data"]), "derived"),
+                        "INSERT INTO signal_data (signal_type, signal_date, ticker, direction, signal_subtype, magnitude, data, confidence) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                        (s["signal_type"], date.today(), s["ticker"], s["direction"], s.get("signal_subtype"), s["magnitude"], json.dumps(s["data"]), "derived"),
                     )
         log.debug("Wrote {n} DEX signals to signal_data", n=len(signals))
     except Exception as exc:

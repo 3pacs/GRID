@@ -33,3 +33,9 @@ output/deploy/
 # BMC / IPMI credentials — fill in bmc-env.example, save as bmc-env, never commit
 server_setup/bmc/bmc-env
 /etc/grid/bmc-env
+
+# Audio briefing build artifacts
+output/briefings/
+
+# Local .env snapshots — must never go to GitHub
+.env.bak*

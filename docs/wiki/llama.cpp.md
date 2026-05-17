@@ -17,6 +17,7 @@ Direct llama.cpp inference for GPU-accelerated local LLM.
 
 ## Referenced By
 
+- [[AGENTS]]
 - [[FIRST_DAY_REPORT]]
 - [[README]]
 - [[MODULE_CATALOG]]

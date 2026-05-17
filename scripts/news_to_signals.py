@@ -223,6 +223,25 @@ def _to_date(val: Any) -> date | None:
         return None
 
 
+_DIR_UP = {"bullish", "buy", "long", "call", "up", "positive", "BULL"}
+_DIR_DOWN = {"bearish", "sell", "short", "put", "down", "negative", "BEAR"}
+_DIR_NEUTRAL = {"neutral", "flat", "sideways", "NEUTRAL"}
+
+def _canon_direction(d: str | None) -> str | None:
+    """Normalize raw direction string to BULL/BEAR/NEUTRAL or None."""
+    if d is None:
+        return None
+    s = str(d).strip().lower()
+    if not s:
+        return None
+    if s in {x.lower() for x in _DIR_UP}:
+        return "BULL"
+    if s in {x.lower() for x in _DIR_DOWN}:
+        return "BEAR"
+    if s in {x.lower() for x in _DIR_NEUTRAL}:
+        return "NEUTRAL"
+    return None  # leak; drop
+
 def _insert_signal(
     conn: Any,
     *,
@@ -237,7 +256,13 @@ def _insert_signal(
     confidence: str,
     source_id: str,
 ) -> bool:
-    """Insert a single signal_data row with dedup. Returns True if inserted."""
+    """Insert a single signal_data row with dedup. Returns True if inserted.
+
+    `direction` is normalized to {BULL,BEAR,NEUTRAL,None} via _canon_direction;
+    anything non-directional (e.g. a leaked signal_type) becomes None so we
+    do not pollute signal_data.direction.
+    """
+    canon_dir = _canon_direction(direction)
     conn.execute(text("""
         INSERT INTO signal_data
             (signal_type, signal_date, ticker, actor, direction,
@@ -250,7 +275,7 @@ def _insert_signal(
         "sdate": signal_date,
         "ticker": ticker,
         "actor": actor,
-        "dir": direction,
+        "dir": canon_dir,
         "mag": magnitude,
         "desc": description,
         "data": json.dumps(data),

@@ -524,7 +524,7 @@ class DatasetParser:
 
                     # Signal for large trades
                     if midpoint >= 250000 and ticker:
-                        direction = "buy" if "purchase" in tx_type.lower() else "sell"
+                        direction = "BULL" if "purchase" in tx_type.lower() else "BEAR"
                         sig_batch.append({
                             "signal_type": "congressional_large_trade",
                             "signal_date": tx_date.date() if tx_date else None,
@@ -532,8 +532,7 @@ class DatasetParser:
                             "actor": senator,
                             "direction": direction,
                             "magnitude": midpoint,
-                            "description": (f"Senator {senator} {direction} {ticker} "
-                                            f"({amount_str})"),
+                            "description": (f"Senator {senator} {('bought' if direction=='BULL' else 'sold')} {ticker} ({amount_str})"),
                             "data": json.dumps({
                                 "chamber": "senate",
                                 "type": tx_type,
@@ -614,7 +613,7 @@ class DatasetParser:
                         })
 
                         if midpoint >= 250000 and ticker:
-                            direction = "buy" if "purchase" in tx_type.lower() else "sell"
+                            direction = "BULL" if "purchase" in tx_type.lower() else "BEAR"
                             sig_batch.append({
                                 "signal_type": "congressional_large_trade",
                                 "signal_date": tx_date.date() if tx_date else None,
@@ -622,7 +621,7 @@ class DatasetParser:
                                 "actor": rep,
                                 "direction": direction,
                                 "magnitude": midpoint,
-                                "description": f"Rep {rep} {direction} {ticker} ({amount_str})",
+                                "description": f"Rep {rep} {('bought' if direction=='BULL' else 'sold')} {ticker} ({amount_str})",
                                 "data": json.dumps({
                                     "chamber": "house",
                                     "type": tx_type,

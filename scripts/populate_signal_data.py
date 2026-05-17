@@ -24,9 +24,9 @@ from sqlalchemy import text
 # Shared INSERT statement for all signal_data inserts
 _INSERT_SIGNAL = text("""
     INSERT INTO signal_data
-        (signal_type, signal_date, ticker, actor, direction,
+        (signal_type, signal_date, ticker, actor, direction, signal_subtype,
          magnitude, description, data, confidence, source_id)
-    VALUES (:st, :sd, :tk, :act, :dir, :mag, :desc,
+    VALUES (:st, :sd, :tk, :act, :dir, :sub, :mag, :desc,
             CAST(:data AS jsonb), :conf, :src)
 """)
 
@@ -61,7 +61,8 @@ def populate_from_whale_flows(engine) -> int:
                 "sd": r[1],
                 "tk": ticker,
                 "act": "whale",
-                "dir": "buy" if r[2] > 0 else "sell",
+                "dir": "BULL" if r[2] > 0 else "BEAR",
+                "sub": "whale_flow",
                 "mag": abs(r[2]),
                 "desc": f"Whale flow {ticker}: {r[2]:+.2f}",
                 "data": _jsonify(r[3]),
@@ -92,7 +93,8 @@ def populate_from_gov_contracts(engine) -> int:
                 "sd": r[1],
                 "tk": ticker,
                 "act": payload.get("agency", "US Government"),
-                "dir": "buy",
+                "dir": None,
+                "sub": "gov_contract",
                 "mag": r[2],
                 "desc": f"Gov contract {ticker}: ${r[2]:,.0f}",
                 "data": _jsonify(r[3]),
@@ -123,7 +125,8 @@ def populate_from_legislation(engine) -> int:
                 "sd": r[1],
                 "tk": ticker,
                 "act": payload.get("sponsor", "Congress"),
-                "dir": "neutral",
+                "dir": None,
+                "sub": "legislation",
                 "mag": r[2],
                 "desc": f"Legislation affecting {ticker}",
                 "data": _jsonify(r[3]),
@@ -149,7 +152,7 @@ def populate_from_options_flow(engine) -> int:
         for r in rows:
             sv = r[4] or {}
             direction_raw = sv.get("direction", "neutral")
-            direction = "buy" if direction_raw == "CALL" else "sell" if direction_raw == "PUT" else "neutral"
+            direction = "BULL" if direction_raw == "CALL" else "BEAR" if direction_raw == "PUT" else "NEUTRAL"
             notional = sv.get("notional", 0)
             signals = sv.get("signals", [])
 
@@ -159,6 +162,7 @@ def populate_from_options_flow(engine) -> int:
                 "tk": r[2],
                 "act": "options_market",
                 "dir": direction,
+                "sub": "unusual_options",
                 "mag": notional,
                 "desc": f"Unusual options {r[2]}: {direction_raw} ${notional:,.0f} ({', '.join(signals)})",
                 "data": _jsonify(sv),
@@ -192,7 +196,8 @@ def populate_from_social(engine) -> int:
                 "sd": r[1],
                 "tk": ticker,
                 "act": user,
-                "dir": "buy" if sentiment == "BULLISH" else "sell" if sentiment == "BEARISH" else "neutral",
+                "dir": "BULL" if sentiment == "BULLISH" else "BEAR" if sentiment == "BEARISH" else "NEUTRAL",
+                "sub": "social_sentiment",
                 "mag": abs(r[2]),
                 "desc": f"Social {sentiment.lower()} on {ticker} by {user}",
                 "data": _jsonify(r[3]),
@@ -226,7 +231,8 @@ def populate_from_congressional_raw(engine) -> int:
                 "sd": r[1],
                 "tk": ticker,
                 "act": actor,
-                "dir": payload.get("type", "buy").lower() if payload else "buy",
+                "dir": ("BULL" if (payload.get("type", "buy") or "buy").lower() in ("buy","purchase") else "BEAR") if payload else "BULL",
+                "sub": "congressional_trade",
                 "mag": r[2],
                 "desc": f"Congressional trade: {actor} on {ticker}",
                 "data": _jsonify(r[3]),
@@ -258,7 +264,8 @@ def populate_from_lobbying(engine) -> int:
                 "sd": r[1],
                 "tk": None,
                 "act": entity,
-                "dir": "neutral",
+                "dir": None,
+                "sub": "lobbying",
                 "mag": r[2],
                 "desc": f"Lobbying activity: {entity}",
                 "data": _jsonify(r[3]),
@@ -291,7 +298,8 @@ def populate_from_insider(engine) -> int:
                 "sd": r[1],
                 "tk": ticker,
                 "act": insider,
-                "dir": "buy" if r[2] > 0 else "sell",
+                "dir": "BULL" if r[2] > 0 else "BEAR",
+                "sub": "insider_trade",
                 "mag": abs(r[2]),
                 "desc": f"Insider {('buy' if r[2] > 0 else 'sell')} {ticker} by {insider}",
                 "data": _jsonify(r[3]),
@@ -323,7 +331,8 @@ def populate_from_news(engine) -> int:
                 "sd": r[1],
                 "tk": ticker,
                 "act": payload.get("source", "news"),
-                "dir": "buy" if r[2] > 0 else "sell" if r[2] < 0 else "neutral",
+                "dir": "BULL" if r[2] > 0 else "BEAR" if r[2] < 0 else "NEUTRAL",
+                "sub": "news_event",
                 "mag": abs(r[2]),
                 "desc": payload.get("title", f"News event for {ticker}"),
                 "data": _jsonify(r[3]),
