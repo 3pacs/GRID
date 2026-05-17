@@ -604,15 +604,47 @@ def test_resolve_ticker_feature_id_missing_caches_none():
     assert cache["zzzz"] is None
 
 
-def test_pit_price_on_or_before_returns_value():
+def test_pit_price_on_or_before_returns_value_and_obs_date():
     d = datetime(2026, 3, 15).date()
     store = _FakePITStore({(42, d): 215.5})
-    assert wfv._pit_price_on_or_before(store, 42, d) == 215.5
+    result = wfv._pit_price_on_or_before(store, 42, d)
+    assert result is not None
+    price, obs_date = result
+    assert price == 215.5
+    assert obs_date == d
 
 
 def test_pit_price_on_or_before_empty_returns_none():
     store = _FakePITStore({})
     assert wfv._pit_price_on_or_before(store, 42, datetime(2026, 3, 15).date()) is None
+
+
+def test_realized_return_from_pit_stale_feed_returns_none():
+    """When the price feed has not been refreshed past the prediction's
+    exit date, PIT serves the same observation row for both endpoints.
+    The audit must surface that as missing (caller falls back to outcome
+    proxy) instead of computing a synthetic zero return that pollutes
+    mean/std/sharpe across the bucket. Regression for the post-#187
+    PIT-zero-return investigation.
+    """
+    entry = datetime(2026, 3, 15).date()
+    exit_ = datetime(2026, 3, 22).date()
+    last_stale = datetime(2026, 3, 14).date()  # both lookups collapse here
+    store = _FakePITStore({(42, last_stale): 100.0})
+    # Both PIT calls hit the only available row (2026-03-14), so PIT
+    # returns 100.0 for both — but the obs_date is identical, so the
+    # stale-feed guard fires.
+    # Patch _FakePITStore to serve last_stale's price for any as_of:
+    class _StaleStore(_FakePITStore):
+        def get_pit(self, feature_ids, as_of_date, vintage_policy="LATEST_AS_OF"):
+            import pandas as pd
+            return pd.DataFrame([
+                {"feature_id": fid, "obs_date": last_stale, "value": 100.0,
+                 "release_date": last_stale, "vintage_date": last_stale}
+                for fid in feature_ids
+            ])
+    stale = _StaleStore({})
+    assert wfv._realized_return_from_pit(stale, 42, "bullish", entry, exit_) is None
 
 
 def test_realized_return_from_pit_bullish_up():

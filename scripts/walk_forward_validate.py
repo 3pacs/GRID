@@ -379,12 +379,16 @@ def _pit_price_on_or_before(
     pit_store: PITStore,
     feature_id: int,
     as_of: date,
-) -> float | None:
-    """Return the PIT-correct price for ``feature_id`` at ``as_of``.
+) -> tuple[float, date] | None:
+    """Return the PIT-correct ``(price, obs_date)`` pair for ``feature_id``
+    at ``as_of``.
 
     Uses ``LATEST_AS_OF`` vintage so later revisions win, and picks the
     most recent ``obs_date`` that was already released. Returns ``None``
-    if no row qualifies.
+    if no row qualifies. The obs_date is surfaced so the caller can
+    detect stale-data collapse (entry obs_date == exit obs_date implies
+    PIT is serving the same observation for both endpoints because the
+    underlying price feed hasn't been refreshed past the exit date).
     """
     try:
         df = pit_store.get_pit(
@@ -402,13 +406,25 @@ def _pit_price_on_or_before(
     try:
         latest = df.sort_values("obs_date").iloc[-1]
         value = float(latest["value"])
+        obs_date_raw = latest["obs_date"]
     except Exception as exc:  # noqa: BLE001
         log.debug("walk_forward: PIT frame parse failed fid={f}: {e}", f=feature_id, e=str(exc))
         return None
 
     if not math.isfinite(value) or value <= 0.0:
         return None
-    return value
+
+    # Normalize obs_date to a plain ``date``; PIT may return a Timestamp.
+    if isinstance(obs_date_raw, datetime):
+        obs_date_norm = obs_date_raw.date()
+    elif isinstance(obs_date_raw, date):
+        obs_date_norm = obs_date_raw
+    else:
+        try:
+            obs_date_norm = datetime.fromisoformat(str(obs_date_raw)).date()
+        except (ValueError, TypeError):
+            return None
+    return value, obs_date_norm
 
 
 def _realized_return_from_pit(
@@ -423,14 +439,32 @@ def _realized_return_from_pit(
     Entry price is the latest PIT value at ``entry_as_of`` (prediction
     created_at). Exit price is the latest PIT value at
     ``entry_as_of + horizon``. Bearish directions flip the sign so a
-    profitable short shows up positive. Returns ``None`` if either price
-    is missing — the caller then falls back to the outcome proxy.
+    profitable short shows up positive.
+
+    Returns ``None`` (caller falls back to outcome proxy) when:
+      - either price lookup is missing
+      - PIT serves the same observation row for both endpoints, which
+        means the price feed hasn't been refreshed past the prediction's
+        exit date (six-week stale ``resolved_series`` is the most common
+        cause as of 2026-05-17). Without this guard the audit would
+        silently zero out every realized return for affected tickers.
     """
-    entry = _pit_price_on_or_before(pit_store, feature_id, entry_as_of)
-    if entry is None:
+    entry_pair = _pit_price_on_or_before(pit_store, feature_id, entry_as_of)
+    if entry_pair is None:
         return None
-    exit_px = _pit_price_on_or_before(pit_store, feature_id, exit_as_of)
-    if exit_px is None:
+    exit_pair = _pit_price_on_or_before(pit_store, feature_id, exit_as_of)
+    if exit_pair is None:
+        return None
+    entry, entry_obs_date = entry_pair
+    exit_px, exit_obs_date = exit_pair
+
+    # Stale-feed guard: if the most-recent observation as-of the entry
+    # date is the same row as the most-recent observation as-of the exit
+    # date, PIT is necessarily serving the same price (entry == exit).
+    # That is not a real "flat return" — the feed simply has no data in
+    # the horizon window. Surface this as missing so the outcome proxy
+    # fills in instead of polluting mean/std/sharpe with synthetic zeros.
+    if exit_obs_date <= entry_obs_date:
         return None
 
     raw = (exit_px - entry) / entry
