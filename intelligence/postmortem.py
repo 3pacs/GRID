@@ -911,6 +911,91 @@ def record_success_lesson(
     return write_reasoning_lesson(engine, lesson)
 
 
+def load_postmortems_top_n(
+    engine: Engine,
+    n: int = 5,
+    days: int = 30,
+) -> list[dict[str, Any]]:
+    """Fast path: top-N most recent post-mortems for the dashboard.
+
+    Perf 2026-05-16: the dashboard only displays the top-5, but
+    ``load_postmortems`` hydrates every matching row (93K+ in last 30 days
+    on grid-svr → 24-31s on cold cache). This variant SELECTs LIMIT n
+    rows server-side and skips the heavy ``full_analysis`` JSONB column,
+    cutting the call from tens of seconds to <100ms.
+
+    Use ``load_postmortems`` (full hydration) only when the consumer
+    genuinely needs every field — e.g. the standalone Postmortems
+    widget or analytic exports. Always prefer this fast path on the
+    cold dashboard render.
+
+    Args:
+        engine: SQLAlchemy engine.
+        n: Maximum rows to return (default 5 — what the dashboard displays).
+        days: Lookback window in days.
+
+    Returns:
+        List of post-mortem dicts (without ``full_analysis``) ordered by
+        generated_at DESC.
+    """
+    _ensure_tables(engine)
+    cutoff = date.today() - timedelta(days=days)
+
+    query = """
+        SELECT id, trade_id, prediction_id, ticker, outcome,
+               failure_category, root_cause, signals_wrong, signals_right,
+               what_we_missed, recommended_fix,
+               confidence, generated_at
+        FROM trade_postmortems
+        WHERE generated_at >= :cutoff
+        ORDER BY generated_at DESC
+        LIMIT :n
+    """
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(query), {"cutoff": cutoff, "n": int(n)}).fetchall()
+
+    results: list[dict[str, Any]] = []
+    for r in rows:
+        results.append({
+            "id": r[0],
+            "trade_id": r[1],
+            "prediction_id": r[2],
+            "ticker": r[3],
+            "outcome": r[4],
+            "failure_category": r[5],
+            "root_cause": r[6],
+            "signals_wrong": _parse_json(r[7]),
+            "signals_right": _parse_json(r[8]),
+            "what_we_missed": r[9],
+            "recommended_fix": r[10],
+            # full_analysis intentionally omitted — heavy JSONB blob, not
+            # used by the dashboard's top-5 widget. Callers that need it
+            # should use load_postmortems() instead.
+            "full_analysis": {},
+            "confidence": float(r[11]) if r[11] is not None else None,
+            "generated_at": r[12].isoformat() if r[12] else None,
+        })
+
+    return results
+
+
+def count_postmortems(engine: Engine, days: int = 30) -> int:
+    """Cheap COUNT(*) for the dashboard's "total in last N days" widget.
+
+    Avoids hydrating rows just to call len(). Pairs with
+    ``load_postmortems_top_n`` on the dashboard cold path.
+    """
+    _ensure_tables(engine)
+    cutoff = date.today() - timedelta(days=days)
+    with engine.connect() as conn:
+        n = conn.execute(text("""
+            SELECT COUNT(*) FROM trade_postmortems
+            WHERE generated_at >= :cutoff
+        """), {"cutoff": cutoff}).scalar()
+    return int(n or 0)
+
+
 def load_postmortems(
     engine: Engine,
     days: int = 30,
