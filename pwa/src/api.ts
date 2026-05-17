@@ -666,6 +666,7 @@ class GRIDApi {
     // ── Cross-Reference (Lie Detector) ────────────────────────
 
     async getCrossReference() { return this._fetch('/api/v1/intelligence/cross-reference'); }
+    async getCrossReferenceNarrative() { return this._fetch('/api/v1/intelligence/cross-reference/narrative'); }
     async getCrossRefHistory() { return this._fetch('/api/v1/intelligence/cross-reference/history'); }
 
     // ── Regime Analog Engine ──────────────────────────────────
