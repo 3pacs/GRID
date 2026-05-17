@@ -87,7 +87,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "imf",               "mod": "ingestion.international.imf",         "cls": "IMFPuller",                "method": "pull_all",      "freq_h": 168, "timeout_s": 180},
     {"name": "dark_pool",         "mod": "ingestion.altdata.dark_pool",         "cls": "DarkPoolPuller",           "method": "pull_weekly",   "freq_h": 168, "timeout_s": 60},
     {"name": "gov_contracts",     "mod": "ingestion.altdata.gov_contracts",     "cls": "GovContractsPuller",       "method": "pull_all",      "freq_h": 168, "timeout_s": 120},
-    {"name": "supply_chain",      "mod": "ingestion.altdata.supply_chain",      "cls": "SupplyChainPuller",        "method": "pull_all",      "freq_h": 168, "timeout_s": 60},
+    {"name": "supply_chain",      "mod": "ingestion.altdata.supply_chain",      "cls": "SupplyChainPuller",        "method": "pull_all",      "freq_h": 168, "timeout_s": 60, "api_key": "FRED_API_KEY"},
 
     # ── Monthly / slow (run rarely) ──
     {"name": "campaign_finance",  "mod": "ingestion.altdata.campaign_finance",  "cls": "CampaignFinancePuller",    "method": "pull_all",      "freq_h": 720, "timeout_s": 300},
@@ -123,7 +123,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "pumpfun",           "mod": "ingestion.pumpfun",                 "cls": "PumpFunPuller",            "method": "pull_all",      "freq_h": 6,  "timeout_s": 60},
 
     # ── Government / regulatory ──
-    {"name": "bls",               "mod": "ingestion.bls",                     "cls": "BLSPuller",                "method": "pull_all",      "freq_h": 168, "timeout_s": 120},
+    {"name": "bls",               "mod": "ingestion.bls",                     "cls": "BLSPuller",                "method": "pull_all",      "freq_h": 168, "timeout_s": 120, "api_key": "BLS_API_KEY"},
     {"name": "edgar",             "mod": "ingestion.edgar",                   "cls": "EDGARPuller",              "method": "pull_all",      "freq_h": 24, "timeout_s": 180},
     {"name": "cftc_cot",          "mod": "ingestion.altdata.cftc_cot",        "cls": "CFTCCOTPuller",            "method": "pull_all",      "freq_h": 168, "timeout_s": 120},
 
@@ -239,21 +239,30 @@ class SmartScheduler:
     def _warn_registry_divergence(self) -> None:
         """Detect & log orphan pullers across hermes_operator and this registry.
 
-        Task #170 (2026-05-17). A silent orphan is a puller registered in one
-        place (advertised / runtime) but not the other. The #161 bug
-        (sec_xbrl_shares missing here) and the family of orphans audited in
-        task #170 (24 entries) were both this pattern. Fail loud at startup
-        rather than discover them weeks later when a downstream table
-        stops getting writes.
+        Task #170 (2026-05-17) added this guard. Task #179 (2026-05-17)
+        consolidated ``_SOURCE_REGISTRY`` to be DERIVED from PULLER_REGISTRY
+        + a small explicit ``_SOURCE_EXTRAS`` overlay, so the only remaining
+        divergence sources are intentional (fn-based pullers, audit-only
+        skip_runtime stubs, and historical alias names). Those live in
+        ``hermes_operator._SOURCE_EXTRAS`` and ``_SOURCE_ALIASES`` and are
+        filtered out before warning — anything left over IS a regression.
         """
         try:
-            from scripts.hermes_operator import _SOURCE_REGISTRY as _CFG
+            from scripts.hermes_operator import (
+                _SOURCE_REGISTRY as _CFG,
+                _SOURCE_EXTRAS,
+                _SOURCE_ALIASES,
+            )
         except Exception as exc:
             log.debug("Registry-divergence check skipped: {e}", e=str(exc))
             return
         cfg = set(_CFG.keys())
         reg = {p["name"] for p in PULLER_REGISTRY}
-        only_cfg = cfg - reg
+        # Intentional cfg-only entries (fn-based, skip_runtime, not-yet-wired
+        # class pullers) live in _SOURCE_EXTRAS, and alias names alias onto
+        # a canonical PULLER_REGISTRY entry — neither indicates a bug.
+        intentional_cfg_only = set(_SOURCE_EXTRAS.keys()) | set(_SOURCE_ALIASES.keys())
+        only_cfg = (cfg - reg) - intentional_cfg_only
         only_reg = reg - cfg
         if only_cfg:
             log.warning(
@@ -268,6 +277,13 @@ class SmartScheduler:
                 "but not in hermes_operator._SOURCE_REGISTRY (running but "
                 "undocumented in operator): {names}",
                 n=len(only_reg), names=sorted(only_reg),
+            )
+        if not only_cfg and not only_reg:
+            log.info(
+                "SmartScheduler registry consolidated — _SOURCE_REGISTRY "
+                "derived from PULLER_REGISTRY ({n} entries) + {ne} extras "
+                "+ {na} aliases. No divergence.",
+                n=len(reg), ne=len(_SOURCE_EXTRAS), na=len(_SOURCE_ALIASES),
             )
 
     def _load_state_from_db(self) -> None:
