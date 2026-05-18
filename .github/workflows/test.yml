@@ -56,31 +56,16 @@ jobs:
           set -e
           head -20 /tmp/grid-pytest-collection.txt
           if [ "$collection_status" -ne 0 ]; then
-            # pytest writes collection errors (ImportError, etc.) to stdout — the
-            # .txt file — and the `=== ERRORS ===` block lives at the tail, past
-            # the 20-line head. Surface the tail of stdout AND the (usually empty)
-            # stderr so future collection failures aren't invisible like the
-            # 2026-05-17 trust_scorer import regression.
-            echo "::group::pytest collection error (tail of stdout)"
-            tail -200 /tmp/grid-pytest-collection.txt
-            echo "::endgroup::"
-            echo "::group::pytest collection stderr"
             cat /tmp/grid-pytest-collection.err
-            echo "::endgroup::"
             exit "$collection_status"
           fi
 
           set +e
-          python -m pytest tests/ -v --tb=short --maxfail=50 --timeout=60 > /tmp/grid-pytest-output.txt 2>&1
+          python -m pytest tests/ -v --tb=short -x --timeout=60 > /tmp/grid-pytest-output.txt 2>&1
           pytest_status=$?
           set -e
 
-          # tail -30 truncated 2 of 16 failures from the 2026-05-17 run.
-          # Bump to 300 lines + wrap in a collapsed group so the full
-          # pytest summary (FAILED list + short tracebacks) survives.
-          echo "::group::pytest output (tail -300)"
-          tail -300 /tmp/grid-pytest-output.txt
-          echo "::endgroup::"
+          tail -30 /tmp/grid-pytest-output.txt
           exit "$pytest_status"
 
       - name: Check for SQL injection patterns

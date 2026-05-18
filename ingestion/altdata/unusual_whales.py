@@ -19,7 +19,6 @@ Schedule: Daily (market hours)
 from __future__ import annotations
 
 import json
-import math
 import time
 from datetime import date
 from typing import Any
@@ -29,45 +28,6 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, retry_on_failure
-
-
-# ── NaN / Inf sanitisation ───────────────────────────────────────────
-#
-# yfinance returns NaN floats for fields like ``volume`` or
-# ``openInterest`` when a strike has no recorded activity yet.
-# These propagate into our ``signal`` dicts and break two things:
-#   1. ``json.dumps`` emits the literal token ``NaN``, which is not
-#      valid JSON — Postgres' JSONB parser raises
-#      ``ValueError: Out of range float values are not JSON compliant``.
-#   2. NaN passed as a numeric bind parameter to ``raw_series.value``
-#      gets stored as NaN and trips the downstream sanity validator.
-#
-# The helper below recursively replaces every NaN/Inf float in a
-# nested dict / list with ``None`` (which serialises to JSON ``null``
-# and Postgres ``NULL``).  Apply it to a row **before** passing the
-# row to ``_insert_raw`` / ``json.dumps`` / ``cursor.execute``.
-def _clean_nans(d: Any) -> Any:
-    """Recursively replace NaN / Inf floats with None.
-
-    Walks dicts, lists, and tuples.  Scalars that are not NaN or Inf
-    floats are returned unchanged.
-
-    Parameters:
-        d: Any value (dict, list, tuple, or scalar).
-
-    Returns:
-        A structurally-identical value with NaN/Inf floats replaced
-        by ``None``.
-    """
-    if isinstance(d, dict):
-        return {k: _clean_nans(v) for k, v in d.items()}
-    if isinstance(d, list):
-        return [_clean_nans(v) for v in d]
-    if isinstance(d, tuple):
-        return tuple(_clean_nans(v) for v in d)
-    if isinstance(d, float) and (math.isnan(d) or math.isinf(d)):
-        return None
-    return d
 
 # ── Configuration ────────────────────────────────────────────────────
 
@@ -331,11 +291,6 @@ class UnusualWhalesPuller(BasePuller):
         Returns:
             True if inserted, False if duplicate.
         """
-        # Defensive: callers should already have sanitised, but
-        # _clean_nans is cheap and guarantees no NaN/Inf leaks to
-        # json.dumps or numeric bind params.
-        signal = _clean_nans(signal)
-
         strike_str = f"{signal['strike']:.0f}"
         series_id = (
             f"WHALE:{signal['ticker']}:{strike_str}"
@@ -343,12 +298,6 @@ class UnusualWhalesPuller(BasePuller):
         )
 
         if self._row_exists(series_id, obs_date, conn):
-            return False
-
-        if signal.get("notional_premium") is None:
-            # ``raw_series.value`` cannot store NULL via the helper's
-            # ``float(value)`` coercion, and a NaN notional has no
-            # downstream meaning — skip silently.
             return False
 
         self._insert_raw(
@@ -388,10 +337,6 @@ class UnusualWhalesPuller(BasePuller):
             signal: Whale activity detection result.
             obs_date: Signal date.
         """
-        # Defensive sanitisation — ``json.dumps`` below would emit
-        # the bare token ``NaN`` for any NaN float and corrupt JSONB.
-        signal = _clean_nans(signal)
-
         conn.execute(
             text(
                 "INSERT INTO signal_sources "
@@ -473,57 +418,24 @@ class UnusualWhalesPuller(BasePuller):
 
         inserted = 0
         with self.engine.begin() as conn:
-            for raw_signal in all_signals:
-                # Strip NaN/Inf floats up-front so they never reach
-                # ``json.dumps`` or a bound numeric parameter.
-                signal = _clean_nans(raw_signal)
-
-                # If the value column itself (notional_premium) was
-                # NaN, there's nothing meaningful to store — skip.
-                if signal.get("notional_premium") is None:
-                    log.debug(
-                        "Whale: skipping {t} strike={s} exp={e} — "
-                        "notional_premium was NaN after sanitisation",
-                        t=ticker,
-                        s=raw_signal.get("strike"),
-                        e=raw_signal.get("expiration"),
-                    )
-                    continue
-
-                # Per-row SAVEPOINT so a single bad row only rolls
-                # back itself — the outer transaction commits
-                # everything that survived.  ``begin_nested`` issues a
-                # SAVEPOINT on entry and RELEASE / ROLLBACK TO on exit
-                # depending on whether the block raised.
+            for signal in all_signals:
                 try:
-                    with conn.begin_nested():
-                        stored = self._store_whale_signal(
-                            conn, signal, today,
-                        )
-                    if stored:
+                    if self._store_whale_signal(conn, signal, today):
                         inserted += 1
                 except Exception as exc:
                     log.warning(
-                        "Whale: row insert failed — "
-                        "date={d} ticker={t} strike={s} exp={e} dir={dir}: {err}",
-                        d=today,
+                        "Whale: failed to store signal for {t} {s}: {e}",
                         t=ticker,
                         s=signal.get("strike"),
-                        e=signal.get("expiration"),
-                        dir=signal.get("direction"),
-                        err=str(exc),
+                        e=str(exc),
                     )
-                    # SAVEPOINT already rolled back; carry on with the
-                    # next signal under the same outer transaction.
 
                 try:
-                    with conn.begin_nested():
-                        self._emit_whale_signal(conn, signal, today)
+                    self._emit_whale_signal(conn, signal, today)
                 except Exception as exc:
                     log.debug(
-                        "Whale: signal emission failed for {t} strike={s}: {e}",
+                        "Whale: signal emission failed for {t}: {e}",
                         t=ticker,
-                        s=signal.get("strike"),
                         e=str(exc),
                     )
 

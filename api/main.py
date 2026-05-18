@@ -147,18 +147,6 @@ def _sync_deferred_startup(app: FastAPI) -> None:
     except Exception as exc:  # noqa: BLE001
         log.warning("oracle_models migration skipped: {e}", e=str(exc))
 
-    # Spider graph engine bridge (task #154): load the full actor graph
-    # from Postgres into the in-memory ``GraphEngine`` so neighborhood /
-    # path / connections endpoints serve from RAM (10-100ms) instead of
-    # hitting the DB on every request (500-5000ms). Also starts the
-    # periodic refresher so spider-persisted edges show up automatically.
-    try:
-        from api.routers.intelligence_spider import warm_graph_async
-        warm_graph_async()
-        log.info("Spider graph engine bridge: warmer thread started")
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Spider graph engine warmup skipped: {e}", e=str(exc))
-
     # Pre-warm the intelligence dashboard cache so first user request is instant
     try:
         from api.routers.intelligence_risk import _build_dashboard_snapshot, _dashboard_cache

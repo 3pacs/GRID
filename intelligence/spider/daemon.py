@@ -6,51 +6,15 @@ results to Postgres, and updates the in-memory graph.
 
 Usage:
     python -m intelligence.spider.daemon
-
-Bridge to API (task #154):
-    After a successful run (oneshot or continuous), the daemon POSTs
-    /api/v1/intelligence/spider/graph/reload so the long-running API
-    process re-reads the freshly persisted actors and connections into
-    its in-memory ``GraphEngine``. The ping is best-effort: a failure
-    only logs a warning. Set ``GRID_SPIDER_API_URL`` to override the
-    default (http://127.0.0.1:8000) and ``GRID_SPIDER_API_TOKEN`` for
-    the bearer token.
 """
 
 from __future__ import annotations
 
-import os
 import sys
 import time
 from typing import Any
 
 from loguru import logger as log
-
-
-def _ping_api_reload() -> None:
-    """Best-effort notify the API process to refresh its in-memory graph."""
-    url = os.getenv("GRID_SPIDER_API_URL", "http://127.0.0.1:8000").rstrip("/")
-    token = os.getenv("GRID_SPIDER_API_TOKEN") or os.getenv("GRID_API_TOKEN")
-    endpoint = f"{url}/api/v1/intelligence/spider/graph/reload"
-    try:
-        import urllib.request
-        req = urllib.request.Request(endpoint, method="POST", data=b"")
-        if token:
-            req.add_header("Authorization", f"Bearer {token}")
-        req.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            log.info(
-                "Spider bridge: API reload ping → {s} ({body})",
-                s=resp.status,
-                body=(resp.read(512) or b"").decode("utf-8", errors="replace"),
-            )
-    except Exception as exc:  # noqa: BLE001 - notify is advisory only.
-        log.warning(
-            "Spider bridge: API reload ping failed ({u}): {e} — "
-            "API will pick up the new graph on its next periodic refresh.",
-            u=endpoint,
-            e=str(exc),
-        )
 
 
 def run_spider(
@@ -118,10 +82,6 @@ def run_spider(
     log.info("Spider queue seeded: {d} actors pending", d=queue.depth)
 
     rounds = 0
-    persisted_since_ping = 0
-    last_ping_at = 0.0
-    ping_interval = float(os.getenv("GRID_SPIDER_API_PING_INTERVAL_SEC", "300"))
-    ping_threshold = int(os.getenv("GRID_SPIDER_API_PING_AFTER_N", "25"))
     while True:
         actor_id = queue.pop()
         if actor_id is None:
@@ -129,10 +89,6 @@ def run_spider(
                 log.info("Queue empty — bounded spider run complete after {r} rounds", r=rounds)
                 break
             log.info("Queue empty — spider sleeping {s}s before re-seeding", s=idle_sleep)
-            if persisted_since_ping > 0:
-                _ping_api_reload()
-                persisted_since_ping = 0
-                last_ping_at = time.time()
             time.sleep(idle_sleep)
             _seed_queue(graph, queue, limit=seed_limit)
             continue
@@ -167,7 +123,6 @@ def run_spider(
                     ))
 
             queue.mark_done(actor_id, connections_found=len(new_connections), actors_created=len(new_actors))
-            persisted_since_ping += len(new_connections)
 
         except Exception as exc:
             log.error("Spider expansion failed for {a}: {e}", a=actor_id, e=str(exc))
@@ -178,22 +133,7 @@ def run_spider(
             log.info("Spider completed {r} rounds, stopping", r=rounds)
             break
 
-        # Throttled API reload ping in continuous mode: after N persisted
-        # edges AND at least ping_interval seconds since last ping.
-        now = time.time()
-        if (
-            persisted_since_ping >= ping_threshold
-            and (now - last_ping_at) >= ping_interval
-        ):
-            _ping_api_reload()
-            persisted_since_ping = 0
-            last_ping_at = now
-
         time.sleep(sleep_between)
-
-    # Final ping at the end of any bounded run (or break out of loop).
-    if persisted_since_ping > 0:
-        _ping_api_reload()
 
 
 def _seed_queue(graph: Any, queue: Any, limit: int = 5000) -> None:

@@ -606,67 +606,6 @@ def _pull_earnings_events(
                 ))
     except Exception as exc:
         log.debug("earnings_calendar pull for {t} failed: {e}", t=ticker, e=str(exc))
-
-    # Task #186: additive pull from earnings_events (#151 puller) for
-    # filing-level coverage (10-K/10-Q/8-K/EARNINGS_CALL/DEF 14A/S-1)
-    # that earnings_calendar may not yet have.  Dedupe on YYYY-MM-DD prefix
-    # (Event.timestamp is an ISO-8601 string per _parse_ts).
-    seen_dates: set[str] = {
-        str(ev.timestamp)[:10] for ev in events if ev.timestamp
-    }
-    try:
-        with engine.connect() as conn:
-            ev_rows = conn.execute(text("""
-                SELECT period_end, fiscal_quarter, event_type, summary,
-                       sentiment, confidence, filing_date
-                FROM earnings_events
-                WHERE ticker = :t AND period_end >= :c
-                ORDER BY period_end DESC
-                LIMIT :lim
-            """), {
-                "t": ticker, "c": cutoff.date(), "lim": MAX_EVENTS_PER_QUERY,
-            }).fetchall()
-
-            for r in ev_rows:
-                period_end = r[0]
-                if period_end is None:
-                    continue
-                pe_key = str(period_end)[:10]
-                if pe_key in seen_dates:
-                    continue
-                seen_dates.add(pe_key)
-
-                quarter = r[1] or ""
-                ev_type = r[2] or "filing"
-                summary = r[3] or ""
-                sentiment = (r[4] or "").lower()
-
-                if sentiment in ("positive", "bullish"):
-                    direction = "bullish"
-                elif sentiment in ("negative", "bearish"):
-                    direction = "bearish"
-                else:
-                    direction = "neutral"
-
-                desc = f"{ev_type} {quarter}".strip()
-                if summary:
-                    desc += f": {summary[:160]}"
-
-                events.append(Event(
-                    timestamp=_parse_ts(period_end),
-                    event_type="earnings_filing",
-                    actor=None,
-                    ticker=ticker,
-                    direction=direction,
-                    amount_usd=None,
-                    description=desc,
-                    source="earnings_events",
-                    confidence="confirmed",
-                    lead_time_to_next_move=None,
-                ))
-    except Exception as exc:
-        log.debug("earnings_events pull for {t} failed: {e}", t=ticker, e=str(exc))
-
     return events
 
 

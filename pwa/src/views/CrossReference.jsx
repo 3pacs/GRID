@@ -1290,26 +1290,6 @@ export default function CrossReference({ onNavigate }) {
             if (crossRef && Array.isArray(crossRef.checks) && crossRef.checks.length > 0) {
                 const transformed = transformApiChecks(crossRef);
                 setData(transformed);
-
-                // Lazy-load the LLM narrative when the fast endpoint
-                // returned narrative_pending=true (PR #189 split). Fires
-                // the slow ~10s narrative endpoint in the background and
-                // merges into the existing data once it lands so the
-                // matrix paints first and the prose layer fills in.
-                if (crossRef.narrative_pending) {
-                    api.getCrossReferenceNarrative()
-                        .then((res) => {
-                            const text = res && typeof res.narrative === 'string'
-                                ? res.narrative
-                                : '';
-                            if (!text) return;
-                            setData((prev) => prev ? {
-                                ...prev,
-                                narrative: { summary: text, bullets: [], watchFor: [] },
-                            } : prev);
-                        })
-                        .catch(() => { /* narrative is optional — silently drop */ });
-                }
             } else {
                 setData(generatePlaceholderData());
             }
