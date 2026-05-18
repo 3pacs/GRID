@@ -760,6 +760,41 @@ def run_intelligence_tasks(
                 log.warning("Active hypothesis scoring failed: {e}", e=str(exc))
             state.last_active_hypo_scoring = now
 
+        # Earnings events → earnings_calendar back-compat sync — every
+        # 30 minutes. Calls the DB-side ``sync_earnings_events_to_calendar()``
+        # function which mirrors new ``earnings_events`` rows into the
+        # legacy ``earnings_calendar`` table (see migration
+        # ``20260517_earnings_events_compat.sql``). Function returns a
+        # 1-row table (inserted_count, total_events) we log for visibility.
+        if _minutes_since(state.last_earnings_calendar_sync) >= EARNINGS_CALENDAR_SYNC_INTERVAL_MINUTES:
+            def _sync_earnings_events_to_calendar(eng: Any) -> dict[str, Any]:
+                with eng.begin() as conn:
+                    row = conn.execute(
+                        text("SELECT inserted_count, total_events "
+                             "FROM sync_earnings_events_to_calendar()")
+                    ).fetchone()
+                inserted = int(row[0]) if row and row[0] is not None else 0
+                total = int(row[1]) if row and row[1] is not None else 0
+                return {"inserted": inserted, "total_events": total}
+
+            try:
+                sync_result = _run_intel_task(
+                    "earnings_events_to_calendar_sync",
+                    _sync_earnings_events_to_calendar,
+                    state,
+                    engine,
+                )
+                if sync_result:
+                    results["earnings_events_to_calendar_sync"] = sync_result
+                    log.info(
+                        "earnings_events → earnings_calendar sync: {i} inserted, {t} total source rows",
+                        i=sync_result.get("inserted", 0),
+                        t=sync_result.get("total_events", 0),
+                    )
+            except Exception as exc:
+                log.warning("earnings_events_to_calendar sync failed: {e}", e=str(exc))
+            state.last_earnings_calendar_sync = now
+
         # RAG index refresh — re-embed latest intelligence data
         if _hours_since(state.last_rag_index) >= 20:
             try:
