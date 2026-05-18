@@ -633,7 +633,7 @@ class GRIDApi {
     async getPostmortemLessons(n = 5, days = 30, refresh = false) {
         const params = new URLSearchParams({ n: String(n), days: String(days) });
         if (refresh) params.set('refresh', '1');
-        return this._fetch(`/api/v1/postmortem-lessons?${params.toString()}`);
+        return this._fetch(`/api/v1/intelligence/postmortem-lessons?${params.toString()}`);
     }
 
     async getTrustScores() {
@@ -650,7 +650,6 @@ class GRIDApi {
 
     // Cross-Reference (Lie Detector)
     async getCrossReference() { return this._fetch('/api/v1/intelligence/cross-reference'); }
-    async getCrossReferenceNarrative() { return this._fetch('/api/v1/intelligence/cross-reference/narrative'); }
     async getCrossRefHistory() { return this._fetch('/api/v1/intelligence/cross-reference/history'); }
 
     // Regime Analog Engine

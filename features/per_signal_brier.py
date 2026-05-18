@@ -170,6 +170,7 @@ def record_scored_prediction(
     confidence: float,
     outcome: float,
     signal_contributions: dict[str, float],
+    scored_at: datetime | None = None,
 ) -> dict[str, Any]:
     """Update per-signal running Brier / ECE / hit counters after a
     prediction is scored.
@@ -186,6 +187,16 @@ def record_scored_prediction(
     signal_contributions
         Normalized Shapley contribution per contributing signal source,
         summing to 1.0. Produced by ``intelligence.shapley_attribution``.
+    scored_at
+        Optional timestamp marking when this prediction's outcome became
+        known. When provided, ``last_updated`` on the bucket row is set
+        to ``scored_at`` (or ``GREATEST(existing, scored_at)`` on UPDATE)
+        instead of ``NOW()``. This is the critical knob for the historical
+        bootstrap: walk-forward audits filter scorecards by
+        ``last_updated <= as_of`` (PIT-lookahead guard), so a bootstrap
+        run that stamps every row with NOW() produces scorecards that
+        are invisible to every historical replay until the next scored
+        prediction lands.
 
     Returns
     -------
@@ -234,7 +245,8 @@ def record_scored_prediction(
                                 (signal_source, horizon_days, scored_count,
                                  running_brier, running_ece, hit_count,
                                  last_updated)
-                            VALUES (:s, :h, 1, :b, :e, :hit, NOW())
+                            VALUES (:s, :h, 1, :b, :e, :hit,
+                                    COALESCE(:scored_at, NOW()))
                             ON CONFLICT (signal_source, horizon_days) DO NOTHING
                             """
                         ),
@@ -244,6 +256,7 @@ def record_scored_prediction(
                             "b": weighted_brier,
                             "e": weighted_ece,
                             "hit": directional_hit,
+                            "scored_at": scored_at,
                         },
                     )
                     updates[source] = {
@@ -270,7 +283,8 @@ def record_scored_prediction(
                             running_brier = :b,
                             running_ece   = :e,
                             hit_count     = :h,
-                            last_updated  = NOW()
+                            last_updated  = GREATEST(last_updated,
+                                                     COALESCE(:scored_at, NOW()))
                         WHERE signal_source = :s AND horizon_days = :hz
                         """
                     ),
@@ -281,6 +295,7 @@ def record_scored_prediction(
                         "h": new_hits,
                         "s": source,
                         "hz": horizon,
+                        "scored_at": scored_at,
                     },
                 )
                 updates[source] = {
