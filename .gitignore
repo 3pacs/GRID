@@ -28,6 +28,15 @@ pwa_dist/
 data/icij/
 models/.cache/
 .server-logs/alert_state.json
+# Auto-committed by server_log.git_sink — left tracked previously, but
+# every machine running grid-api writes its own error stream into the
+# same path, so committing across the fleet causes branch divergence
+# between grid-svr / z400 / koala / etc. when GIT_SINK_PUSH_ENABLED is
+# turned on. Untracked here so each machine keeps its own local copy
+# without conflict; per-machine aggregation lives outside git.
+# (Resolves "Hermes auto-commit divergence" follow-up in Inbox/Agent-TODO.)
+.server-logs/errors.jsonl
+.server-logs/errors.*.jsonl
 output/deploy/
 
 # BMC / IPMI credentials — fill in bmc-env.example, save as bmc-env, never commit
