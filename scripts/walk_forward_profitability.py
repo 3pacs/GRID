@@ -56,11 +56,19 @@ DEFAULT_DAYS = 90
 class BucketStats:
     bucket: str  # "HIGH" | "MEDIUM" | "LOW"
     n: int
-    hit_rate: float
+    hit_rate: float                  # verdict='hit' / n. Kept for back-compat.
     mean_pnl: float
     std_pnl: float
     sharpe: float
     max_drawdown: float
+    # hit-or-partial rate: counts both 'hit' and 'partial' as successes.
+    # The oracle's outcome vocabulary is {hit, partial, miss}; 'partial' means
+    # "predicted direction was the right direction and the underlying moved
+    # most of the way, just not all the way to the price target". Dropping
+    # partials into the miss bucket halves the apparent calibration of the
+    # CALL stack (CALL_HIGH hit=16.7% but hit_or_partial=59.5% on n=425 as of
+    # 2026-05-17). Hit_rate stays in the schema for ratchet compatibility.
+    hit_or_partial_rate: float = 0.0
 
 
 @dataclass
@@ -161,10 +169,12 @@ def _max_drawdown(returns: list[float]) -> float:
 def _bucket_stats(name: str, rows: list[dict[str, Any]]) -> BucketStats:
     n = len(rows)
     if n == 0:
-        return BucketStats(name, 0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        return BucketStats(name, 0, 0.0, 0.0, 0.0, 0.0, 0.0, hit_or_partial_rate=0.0)
     pnls = [float(r["pnl_pct"]) for r in rows]
     hits = sum(1 for r in rows if str(r.get("verdict") or "").lower() == "hit")
+    partials = sum(1 for r in rows if str(r.get("verdict") or "").lower() == "partial")
     hit_rate = hits / n
+    hit_or_partial_rate = (hits + partials) / n
     mean_pnl = statistics.fmean(pnls)
     std_pnl = statistics.pstdev(pnls) if n > 1 else 0.0
     sharpe = (mean_pnl / std_pnl) if std_pnl > 0 else 0.0
@@ -173,6 +183,7 @@ def _bucket_stats(name: str, rows: list[dict[str, Any]]) -> BucketStats:
         bucket=name, n=n,
         hit_rate=hit_rate, mean_pnl=mean_pnl, std_pnl=std_pnl,
         sharpe=sharpe, max_drawdown=max_dd,
+        hit_or_partial_rate=hit_or_partial_rate,
     )
 
 
@@ -181,7 +192,11 @@ def _verdict_call(buckets: dict[str, BucketStats]) -> str:
     medium = buckets.get("MEDIUM")
     if not high or not medium or high.n == 0 or medium.n == 0:
         return "INCONCLUSIVE — empty HIGH or MEDIUM bucket"
-    hr_lift_pp = (high.hit_rate - medium.hit_rate) * 100.0
+    # Use hit_or_partial_rate as the primary calibration metric; the
+    # 'partial' outcome means the direction was right but the price
+    # target wasn't fully hit, which is still a calibration win — see
+    # docstring on BucketStats.hit_or_partial_rate.
+    hr_lift_pp = (high.hit_or_partial_rate - medium.hit_or_partial_rate) * 100.0
     pnl_lift_pp = high.mean_pnl - medium.mean_pnl
     sharpe_lift = high.sharpe - medium.sharpe
     # Three-axis verdict — hit_rate, mean_pnl, AND sharpe. Adding sharpe
@@ -191,19 +206,57 @@ def _verdict_call(buckets: dict[str, BucketStats]) -> str:
     # walk_forward_validate._build_narrative.
     if hr_lift_pp >= 5.0 and pnl_lift_pp > 0 and sharpe_lift > 0:
         return (
-            f"CALIBRATED — HIGH beats MEDIUM by {hr_lift_pp:.1f}pp hit rate, "
+            f"CALIBRATED — HIGH beats MEDIUM by {hr_lift_pp:.1f}pp hit-or-partial, "
             f"{pnl_lift_pp:+.2f}% mean PnL, sharpe lift {sharpe_lift:+.2f}"
         )
     if hr_lift_pp <= -5.0 or pnl_lift_pp < 0 or sharpe_lift < -0.5:
         return (
             f"BROKEN — HIGH underperforms MEDIUM "
-            f"({hr_lift_pp:+.1f}pp hit rate, {pnl_lift_pp:+.2f}% PnL, "
+            f"({hr_lift_pp:+.1f}pp hit-or-partial, {pnl_lift_pp:+.2f}% PnL, "
             f"sharpe {sharpe_lift:+.2f})"
         )
     return (
         f"INCONCLUSIVE — HIGH vs MEDIUM gap is small "
-        f"({hr_lift_pp:+.1f}pp, {pnl_lift_pp:+.2f}%, sharpe {sharpe_lift:+.2f})"
+        f"({hr_lift_pp:+.1f}pp hit-or-partial, {pnl_lift_pp:+.2f}%, sharpe {sharpe_lift:+.2f})"
     )
+
+
+def _direction_asymmetry_note(
+    by_direction: dict[str, dict[str, Any]],
+) -> str:
+    """Return a one-line note when one direction systematically loses
+    across every confidence bucket while the other wins — that's a
+    macro/regime asymmetry, not a per-bucket calibration story, and
+    deserves its own line in the report so the verdict is read in
+    context.
+    """
+    call_pnls = [
+        float(by_direction.get(f"CALL_{b}", {}).get("mean_pnl", 0.0))
+        for b in ("LOW", "MEDIUM", "HIGH")
+        if by_direction.get(f"CALL_{b}", {}).get("n", 0) >= 30
+    ]
+    put_pnls = [
+        float(by_direction.get(f"PUT_{b}", {}).get("mean_pnl", 0.0))
+        for b in ("LOW", "MEDIUM", "HIGH")
+        if by_direction.get(f"PUT_{b}", {}).get("n", 0) >= 30
+    ]
+    if len(call_pnls) >= 2 and all(p > 0 for p in call_pnls) and \
+       len(put_pnls) >= 2 and all(p < 0 for p in put_pnls):
+        return (
+            f"DIRECTION ASYMMETRY: CALL wins every bucket "
+            f"(mean +{statistics.fmean(call_pnls):.2f}% across {len(call_pnls)} buckets), "
+            f"PUT loses every bucket (mean {statistics.fmean(put_pnls):.2f}% across {len(put_pnls)} buckets). "
+            f"Macro regime is the dominant signal, not per-confidence calibration."
+        )
+    if len(put_pnls) >= 2 and all(p > 0 for p in put_pnls) and \
+       len(call_pnls) >= 2 and all(p < 0 for p in call_pnls):
+        return (
+            f"DIRECTION ASYMMETRY: PUT wins every bucket "
+            f"(mean +{statistics.fmean(put_pnls):.2f}% across {len(put_pnls)} buckets), "
+            f"CALL loses every bucket (mean {statistics.fmean(call_pnls):.2f}% across {len(call_pnls)} buckets). "
+            f"Macro regime is the dominant signal, not per-confidence calibration."
+        )
+    return ""
 
 
 def _slice_stats(rows: list[dict[str, Any]], group_key: str) -> dict[str, dict[str, Any]]:
@@ -286,6 +339,9 @@ def run(engine, days: int = DEFAULT_DAYS) -> ProfitabilityReport:
     profitable, bleeding = _classify_slices(combined)
 
     verdict = _verdict_call(buckets)
+    asymmetry_note = _direction_asymmetry_note(by_dir)
+    if asymmetry_note:
+        verdict = f"{verdict} | {asymmetry_note}"
 
     report = ProfitabilityReport(
         days=days,
@@ -362,7 +418,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"verdict: {report.verdict}")
     for name in ("HIGH", "MEDIUM", "LOW"):
         b = report.buckets[name]
+        hp = b.get('hit_or_partial_rate', 0.0)
         print(f"  {name:6s} n={b['n']:6d}  hit={b['hit_rate']:6.1%}  "
+              f"hit+partial={hp:6.1%}  "
               f"pnl={b['mean_pnl']:+7.2f}%  sharpe={b['sharpe']:+6.2f}  "
               f"dd={b['max_drawdown']:5.1%}")
 
