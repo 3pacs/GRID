@@ -5,6 +5,7 @@ Builds conversation-format training data for each micro model task:
   - signal_classifier: (signal text) → CATEGORY / URGENCY / REASON
   - anomaly_narrator: (anomaly data) → one-line narrative
   - edgar_extractor: (filing text + fields) → JSON extraction
+  - hermes_operator: (operator/fleet request) → safe action plan
 
 Data sources:
   - Synthetic examples hand-crafted from GRID domain knowledge
@@ -550,6 +551,30 @@ _KNOWLEDGE_MAPPER_EXAMPLES: list[tuple[str, str]] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Hermes Operator training data
+# ---------------------------------------------------------------------------
+
+_HERMES_OPERATOR_EXAMPLES: list[tuple[str, str]] = [
+    (
+        "/fleet panda render lane",
+        "I will run a read-only fleet audit scoped to panda, compare GPU/service state with queued render work, and write findings to the durable report path. I will not restart or rebind services without explicit approval.",
+    ),
+    (
+        "/restart grid-hermes",
+        "That is a risky command. I need an approval token from the same allowlisted sender before queueing the restart, and I will only target the allowlisted grid-hermes unit.",
+    ),
+    (
+        "Several sessions crashed. What should Hermes do first?",
+        "Start from durable state: Obsidian agent reports, the central Agent-TODO file, current git worktrees, and live service health. Mark completed items off the list before opening new work, then leave a synced handoff report.",
+    ),
+    (
+        "/render Storymill Sia walk cycle",
+        "Queue the render request with the approved reference set attached, keep generated assets on grid-svr or scratch storage, record provenance, and route candidates through the fail-closed QC gate before promotion.",
+    ),
+]
+
+
 def build_signal_classifier_dataset() -> list[dict[str, Any]]:
     """Build training conversations for signal classification."""
     system = TASK_SYSTEM_PROMPTS[TaskType.SIGNAL_CLASSIFIER]
@@ -586,11 +611,21 @@ def build_knowledge_mapper_dataset() -> list[dict[str, Any]]:
     ]
 
 
+def build_hermes_operator_dataset() -> list[dict[str, Any]]:
+    """Build seed training conversations for safe Hermes operator behavior."""
+    system = TASK_SYSTEM_PROMPTS[TaskType.HERMES_OPERATOR]
+    return [
+        {"conversations": _conv(system, inp, out)}
+        for inp, out in _HERMES_OPERATOR_EXAMPLES
+    ]
+
+
 _DATASET_BUILDERS = {
     TaskType.SIGNAL_CLASSIFIER: build_signal_classifier_dataset,
     TaskType.ANOMALY_NARRATOR: build_anomaly_narrator_dataset,
     TaskType.EDGAR_EXTRACTOR: build_edgar_extractor_dataset,
     TaskType.KNOWLEDGE_MAPPER: build_knowledge_mapper_dataset,
+    TaskType.HERMES_OPERATOR: build_hermes_operator_dataset,
 }
 
 

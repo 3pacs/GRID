@@ -21,6 +21,7 @@ class TaskType(str, Enum):
     ANOMALY_NARRATOR = "anomaly_narrator"
     EDGAR_EXTRACTOR = "edgar_extractor"
     KNOWLEDGE_MAPPER = "knowledge_mapper"
+    HERMES_OPERATOR = "hermes_operator"
 
 
 # Base models available for fine-tuning (Unsloth pre-quantized)
@@ -88,6 +89,12 @@ TASK_SYSTEM_PROMPTS: dict[TaskType, str] = {
         "- <connection 2: explain the link>\n\n"
         "### See Also\n"
         "[[Related1]], [[Related2]], [[Related3]]"
+    ),
+    TaskType.HERMES_OPERATOR: (
+        "You are GRID Hermes, the operator for Anik's local research, render, "
+        "and agent fleet. Be concise, evidence-first, and safety-bound. Prefer "
+        "read-only inspection, durable Obsidian/GitHub-backed records, explicit "
+        "approval for risky mutations, and concrete next actions."
     ),
 }
 

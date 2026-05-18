@@ -24,6 +24,9 @@ Usage:
     # Export to GGUF after training
     python -m gemma.training.train --task signal_classifier --export-gguf q8_0
 
+    # Train Hermes operator behavior from generated command/report data
+    python -m gemma.training.train --task hermes_operator --dataset /data/agent-home/anikdang/hermes_finetune/hermes_sft.jsonl
+
 Best Practices Applied:
   - train_on_responses_only: Masks instruction tokens so the model only
     learns to generate responses, not parrot system/user prompts.
@@ -424,7 +427,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--task",
         type=str,
-        choices=["signal_classifier", "anomaly_narrator", "edgar_extractor", "knowledge_mapper"],
+        choices=["signal_classifier", "anomaly_narrator", "edgar_extractor", "knowledge_mapper", "hermes_operator"],
         default="signal_classifier",
         help="Which micro model task to train.",
     )
