@@ -272,12 +272,20 @@ def compute_aggregate_conviction(
     down get a discount. Neutral (1.0) when fewer than two firing
     signals or no calibrated pair history.
     """
+    # Per-signal overrides from intelligence.signal_weight_overrides.
+    # Default-ON, env-gated. Multiplier of 1.0 = no effect.
+    try:
+        from intelligence.signal_weight_overrides import get_override as _signal_override
+    except Exception:  # noqa: BLE001
+        _signal_override = lambda _s: 1.0  # noqa: E731
+
     base = 0.0
     for ev in signal_evidence:
+        override = _signal_override(getattr(ev, "signal_source", ""))
         if ev.scorecard is None:
-            base += ev.shapley_weight * 1.0  # neutral on no-history
+            base += ev.shapley_weight * 1.0 * override  # neutral on no-history
         else:
-            base += ev.shapley_weight * ev.scorecard.conviction_weight
+            base += ev.shapley_weight * ev.scorecard.conviction_weight * override
 
     penalty = 1.0
     penalty *= max(0.0, 1.0 - 0.4 * max(0.0, min(1.0, disagreement_score)))

@@ -1385,6 +1385,54 @@ class OracleEngine:
                 if len(signals) < 3:
                     continue  # Not enough data for this model
 
+                # ── Per-signal weight overrides ──────────────────────
+                # Multipliers from intelligence.signal_weight_overrides
+                # derived from the trade_postmortems corpus. This is
+                # where the DEFERRED set (alpha_research:vix_exposure,
+                # alpha_research:credit_cycle, news_intel, ...) actually
+                # bites — these signals live in signals.items[] (here)
+                # and don't reach signal_provenance's evidence loop.
+                # Per 2026-05-13 advisory:
+                #   alpha_research:vix_exposure  ×1.40 (1826r/0w)
+                #   alpha_research:credit_cycle  ×0.20 (0r/1826w, suspected sign-inverted)
+                #   news_intel                    ×0.60 (102r/204w)
+                # Master switch GRID_SIGNAL_OVERRIDES_ENABLED (default ON).
+                try:
+                    from intelligence.signal_weight_overrides import (
+                        SIGNAL_WEIGHT_OVERRIDES,
+                        DEFERRED_SIGNAL_OVERRIDES,
+                        SIGNAL_OVERRIDES_ENABLED,
+                        SIGNAL_OVERRIDE_MIN,
+                        SIGNAL_OVERRIDE_MAX,
+                    )
+                    if SIGNAL_OVERRIDES_ENABLED:
+                        # Merge bare-name + full-name overrides — bare
+                        # for asset families (equity/vol/...), full for
+                        # the deferred research signals (alpha_research:*,
+                        # news_intel).
+                        _merged_overrides = {
+                            **SIGNAL_WEIGHT_OVERRIDES,
+                            **DEFERRED_SIGNAL_OVERRIDES,
+                        }
+                        for i, sig in enumerate(signals):
+                            mult = _merged_overrides.get(sig.name)
+                            if mult is None:
+                                # Try the bare family name too (signals
+                                # sometimes carry just "vol" instead of
+                                # "feature:vol").
+                                mult = _merged_overrides.get(
+                                    getattr(sig, "family", "")
+                                )
+                            if mult is None:
+                                continue
+                            mult = max(
+                                SIGNAL_OVERRIDE_MIN,
+                                min(SIGNAL_OVERRIDE_MAX, float(mult)),
+                            )
+                            signals[i] = replace(sig, weight=sig.weight * mult)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("signal_weight_overrides skipped: {e}", e=str(exc))
+
                 # Compute net direction
                 bull_score = sum(s.z_score * s.weight for s in signals if s.direction == "bullish")
                 bear_score = sum(abs(s.z_score) * s.weight for s in signals if s.direction == "bearish")
