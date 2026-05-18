@@ -517,6 +517,44 @@ def run_intelligence_tasks(
         log.info("[DRY RUN] Would run intelligence tasks")
         return {"skipped": "dry_run"}
 
+    # ── Earnings events → earnings_calendar back-compat sync ────────
+    # Cheap (~50ms single SQL call) so runs FIRST — before the
+    # intelligence_tasks 360s budget can be consumed by slow LLM jobs
+    # later in this function. Calls DB-side
+    # ``sync_earnings_events_to_calendar()`` (see migration
+    # ``20260517_earnings_events_compat.sql``) which mirrors new
+    # ``earnings_events`` rows into the legacy ``earnings_calendar``
+    # table. Function returns (inserted_count, total_events) — logged
+    # for visibility on each fire.
+    if _minutes_since(state.last_earnings_calendar_sync) >= EARNINGS_CALENDAR_SYNC_INTERVAL_MINUTES:
+        def _sync_earnings_events_to_calendar(eng: Any) -> dict[str, Any]:
+            with eng.begin() as conn:
+                row = conn.execute(
+                    text("SELECT inserted_count, total_events "
+                         "FROM sync_earnings_events_to_calendar()")
+                ).fetchone()
+            inserted = int(row[0]) if row and row[0] is not None else 0
+            total = int(row[1]) if row and row[1] is not None else 0
+            return {"inserted": inserted, "total_events": total}
+
+        try:
+            sync_result = _run_intel_task(
+                "earnings_events_to_calendar_sync",
+                _sync_earnings_events_to_calendar,
+                state,
+                engine,
+            )
+            if sync_result:
+                results["earnings_events_to_calendar_sync"] = sync_result
+                log.info(
+                    "earnings_events → earnings_calendar sync: {i} inserted, {t} total source rows",
+                    i=sync_result.get("inserted", 0),
+                    t=sync_result.get("total_events", 0),
+                )
+        except Exception as exc:
+            log.warning("earnings_events_to_calendar sync failed: {e}", e=str(exc))
+        state.last_earnings_calendar_sync = now
+
     # ── Every 4 hours ────────────────────────────────────────────────
 
     if _hours_since(state.last_trust_cycle) >= 4:
@@ -956,45 +994,6 @@ def run_intelligence_tasks(
             log.warning("errors.jsonl rotation failed: {e}", e=str(exc))
 
         state.last_daily_intel = now
-
-    # ── Earnings events → earnings_calendar back-compat sync ────────
-    # Every 30 minutes (top-level, NOT inside daily_due). Calls the
-    # DB-side ``sync_earnings_events_to_calendar()`` function which
-    # mirrors new ``earnings_events`` rows into the legacy
-    # ``earnings_calendar`` table (see migration
-    # ``20260517_earnings_events_compat.sql``). Function returns a
-    # 1-row table (inserted_count, total_events) we log for visibility.
-    # NOTE: this lives at the same indent as other independent sub-hour
-    # cadences (sector_health, etc.) — earlier sub-hour jobs inside
-    # ``if daily_due:`` are effectively daily, not 30-min. See report.
-    if _minutes_since(state.last_earnings_calendar_sync) >= EARNINGS_CALENDAR_SYNC_INTERVAL_MINUTES:
-        def _sync_earnings_events_to_calendar(eng: Any) -> dict[str, Any]:
-            with eng.begin() as conn:
-                row = conn.execute(
-                    text("SELECT inserted_count, total_events "
-                         "FROM sync_earnings_events_to_calendar()")
-                ).fetchone()
-            inserted = int(row[0]) if row and row[0] is not None else 0
-            total = int(row[1]) if row and row[1] is not None else 0
-            return {"inserted": inserted, "total_events": total}
-
-        try:
-            sync_result = _run_intel_task(
-                "earnings_events_to_calendar_sync",
-                _sync_earnings_events_to_calendar,
-                state,
-                engine,
-            )
-            if sync_result:
-                results["earnings_events_to_calendar_sync"] = sync_result
-                log.info(
-                    "earnings_events → earnings_calendar sync: {i} inserted, {t} total source rows",
-                    i=sync_result.get("inserted", 0),
-                    t=sync_result.get("total_events", 0),
-                )
-        except Exception as exc:
-            log.warning("earnings_events_to_calendar sync failed: {e}", e=str(exc))
-        state.last_earnings_calendar_sync = now
 
     # ── Daily at 3:00 AM UTC — sector health snapshot ───────────────
     # Computes the composite health score for every sector in SECTOR_MAP
