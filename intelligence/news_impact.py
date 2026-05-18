@@ -383,6 +383,7 @@ class PriceDecomposer:
         total_explained = macro_bps + sector_bps + sum(c.estimated_bps for c in aligned)
         unexplained = max(0, move_bps - total_explained)
 
+        from intelligence.confidence_calibration import calibrate_confidence_default
         return MoveAttribution(
             ticker=ticker,
             move_date=move_date,
@@ -393,7 +394,10 @@ class PriceDecomposer:
             catalysts=aligned + opposed,
             macro_contribution_bps=round(macro_bps, 1),
             sector_contribution_bps=round(sector_bps, 1),
-            confidence=min(0.95, total_explained / max(move_bps, 1)),
+            confidence=calibrate_confidence_default(
+                min(0.95, total_explained / max(move_bps, 1)),
+                "news_impact_attribution",
+            ),
         )
 
     def decompose_history(self, ticker: str, days: int = 90,

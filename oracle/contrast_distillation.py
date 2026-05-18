@@ -270,8 +270,13 @@ def distill_contrast(
         return None
 
     # Confidence: scale with divergence sharpness — disagreement that is sharp
-    # (high divergence) yields a more actionable lesson. Bounded to [0.3, 0.95].
-    confidence = max(0.3, min(0.95, 0.3 + 0.65 * divergence))
+    # (high divergence) yields a more actionable lesson. Bounded to [0.3, 0.95]
+    # then routed through per-model reliability curve when calibrated.
+    from intelligence.confidence_calibration import calibrate_confidence_default
+    confidence = calibrate_confidence_default(
+        max(0.3, min(0.95, 0.3 + 0.65 * divergence)),
+        "contrast_distillation",
+    )
 
     try:
         return ContrastResult(

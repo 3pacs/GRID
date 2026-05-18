@@ -2,7 +2,7 @@
 
 Generated: 2026-05-18
 Total modules: 750
-Total LOC: 330,447
+Total LOC: 330,494
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycache__/`, `build/`, `dist/`, `docs/`, `node_modules/`, `notebooks/`, `pwa/`, `pwa_dist/`, `tests/`, `venv/`.
@@ -11,16 +11,16 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 
 | Directory | Module count | LOC |
 |---|---|---|
-| `intelligence/` | 172 | 102,021 |
+| `intelligence/` | 172 | 102,046 |
 | `ingestion/` | 207 | 85,797 |
 | `api/` | 107 | 48,466 |
 | `analysis/` | 33 | 18,973 |
 | `trading/` | 34 | 14,158 |
-| `oracle/` | 29 | 10,527 |
+| `oracle/` | 29 | 10,542 |
 | `subnet/` | 10 | 5,381 |
 | `physics/` | 18 | 4,824 |
 | `features/` | 7 | 4,428 |
-| `store/` | 6 | 4,148 |
+| `store/` | 6 | 4,155 |
 | `alpha_research/` | 21 | 3,592 |
 | `alerts/` | 8 | 3,351 |
 | `ollama/` | 7 | 3,153 |
@@ -312,11 +312,11 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`, `datetime`, `features`, `loguru`, `scripts`, `sqlalchemy`, `typing`
 **Imported by:** `intelligence/signal_provenance.py`
 
-#### `intelligence/confidence_calibration.py` — 371 LOC
+#### `intelligence/confidence_calibration.py` — 392 LOC
 **Docstring:** Per-model confidence reliability curves.
-**Functions:** `ensure_tables`, `CalibrationCurve`, `invalidate_cache`, `calibrate_confidence`, `build_reliability_curves`, `main`
+**Functions:** `ensure_tables`, `CalibrationCurve`, `invalidate_cache`, `calibrate_confidence`, `calibrate_confidence_default`, `build_reliability_curves`, `main`
 **Reads:** `__future__`, `argparse`, `dataclasses`, `db`, `loguru`, `sqlalchemy`, `sys`, `typing`
-**Imported by:** `oracle/engine.py`
+**Imported by:** `intelligence/news_impact.py`, `oracle/contrast_distillation.py`, `oracle/engine.py`, `oracle/forecaster_adapter.py`, `oracle/psi_model.py`, `store/astrogrid.py`
 
 #### `intelligence/consensus_crowdedness.py` — 425 LOC
 **Docstring:** CAT-182 — Consensus crowdedness detector.
@@ -625,10 +625,10 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Functions:** `Candidate`, `detect_patterns`, `resolve_entity`, `scan_news`, `run_once`
 **Reads:** `__future__`, `analysis`, `contracts`, `dataclasses`, `datetime`, `intelligence`, `json`, `loguru`, `re`, `sqlalchemy`, `typing`, `uuid`
 
-#### `intelligence/news_impact.py` — 975 LOC
+#### `intelligence/news_impact.py` — 979 LOC
 **Docstring:** GRID News Impact Attribution Engine.
 **Functions:** `Catalyst`, `MoveAttribution`, `Expectation`, `DeepDiveReport`, `CatalystClassifier`, `PriceDecomposer`, `ExpectationTracker`, `DeepDiveEngine`, `generate_deep_dive_tasks`, `run_deep_dive_task`, `ensure_tables`
-**Reads:** `__future__`, `dataclasses`, `datetime`, `hashlib`, `json`, `llm`, `loguru`, `re`, `sqlalchemy`, `statistics`, `typing`
+**Reads:** `__future__`, `dataclasses`, `datetime`, `hashlib`, `intelligence`, `json`, `llm`, `loguru`, `re`, `sqlalchemy`, `statistics`, `typing`
 **Imported by:** `api/routers/intel.py`, `api/routers/intelligence_deepdive.py`
 
 #### `intelligence/news_intel.py` — 558 LOC
@@ -3174,10 +3174,10 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`, `loguru`, `oracle`, `sqlalchemy`, `typing`
 **Imported by:** `oracle/firewall.py`, `oracle/sanity_checker.py`
 
-#### `oracle/contrast_distillation.py` — 293 LOC
+#### `oracle/contrast_distillation.py` — 298 LOC
 **Docstring:** Oracle Contrast-Distillation — ReasoningBank-style strategic lesson extraction.
 **Functions:** `ContrastResult`, `compute_divergence`, `distill_contrast`
-**Reads:** `__future__`, `dataclasses`, `json`, `loguru`, `re`, `typing`
+**Reads:** `__future__`, `dataclasses`, `intelligence`, `json`, `loguru`, `re`, `typing`
 **Imported by:** `oracle/engine.py`
 
 #### `oracle/disagreement.py` — 182 LOC
@@ -3204,10 +3204,10 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`, `json`, `loguru`, `oracle`, `sqlalchemy`
 **Imported by:** `api/routers/chat.py`
 
-#### `oracle/forecaster_adapter.py` — 418 LOC
+#### `oracle/forecaster_adapter.py` — 423 LOC
 **Docstring:** Oracle ↔ TimesFM Adapter.
 **Functions:** `forecast_to_signals`, `forecast_to_anti_signals`, `forecast_to_prediction`, `run_timesfm_forecast_cycle`
-**Reads:** `__future__`, `datetime`, `hashlib`, `loguru`, `numpy`, `oracle`, `sqlalchemy`, `timeseries`, `typing`
+**Reads:** `__future__`, `datetime`, `hashlib`, `intelligence`, `loguru`, `numpy`, `oracle`, `sqlalchemy`, `timeseries`, `typing`
 **Imported by:** `oracle/engine.py`
 
 #### `oracle/hallucination_guard.py` — 639 LOC
@@ -3239,10 +3239,10 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Functions:** `PruningThresholds`
 **Reads:** `__future__`, `dataclasses`
 
-#### `oracle/psi_model.py` — 264 LOC
+#### `oracle/psi_model.py` — 269 LOC
 **Docstring:** PSI Oracle — Planetary Stress Index market timing oracle.
 **Functions:** `PSISignal`, `evaluate_psi_signals`, `build_astrogrid_prediction_payload`, `run_psi_oracle`
-**Reads:** `__future__`, `dataclasses`, `datetime`, `loguru`, `sqlalchemy`, `typing`, `uuid`
+**Reads:** `__future__`, `dataclasses`, `datetime`, `intelligence`, `loguru`, `sqlalchemy`, `typing`, `uuid`
 
 #### `oracle/publish.py` — 177 LOC
 **Docstring:** Explicit publish contract for comparable AstroGrid oracle records.
@@ -3516,10 +3516,10 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 #### `store/__init__.py` — 6 LOC
 **Docstring:** GRID point-in-time store.
 
-#### `store/astrogrid.py` — 2795 LOC
+#### `store/astrogrid.py` — 2802 LOC
 **Docstring:** AstroGrid persistence helpers.
 **Functions:** `AstroGridStore`
-**Reads:** `__future__`, `collections`, `config`, `datetime`, `json`, `loguru`, `ollama`, `oracle`, `re`, `sqlalchemy`, `typing`, `uuid`
+**Reads:** `__future__`, `collections`, `config`, `datetime`, `intelligence`, `json`, `loguru`, `ollama`, `oracle`, `re`, `sqlalchemy`, `typing`, `uuid`
 **Imported by:** `api/dependencies.py`
 
 #### `store/blob.py` — 213 LOC

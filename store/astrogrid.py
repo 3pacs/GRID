@@ -1082,7 +1082,14 @@ class AstroGridStore:
             confidence += 0.15
         if top_grid:
             confidence += 0.05
-        confidence = round(min(0.95, confidence), 3)
+        from intelligence.confidence_calibration import calibrate_confidence_default
+        confidence = round(
+            calibrate_confidence_default(
+                min(0.95, confidence),
+                "astrogrid_mystical",
+            ),
+            3,
+        )
 
         what_worked = []
         if top_grid:

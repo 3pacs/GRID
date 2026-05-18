@@ -168,8 +168,13 @@ def evaluate_psi_signals(engine: Engine) -> list[PSISignal]:
                 continue
 
         # Signal triggered — compute confidence from historical Sharpe
-        # Scale: Sharpe 1.5 → 0.5 confidence, Sharpe 3.0 → 0.9
-        base_confidence = min(0.95, max(0.3, (config["sharpe"] - 1.0) / 3.0 + 0.3))
+        # Scale: Sharpe 1.5 → 0.5 confidence, Sharpe 3.0 → 0.9. Raw value
+        # then routed through per-model reliability curve when calibrated.
+        from intelligence.confidence_calibration import calibrate_confidence_default
+        base_confidence = calibrate_confidence_default(
+            min(0.95, max(0.3, (config["sharpe"] - 1.0) / 3.0 + 0.3)),
+            f"psi_{config['name']}",
+        )
 
         op_str = "<" if config["psi_op"] == "lt" else ">"
         vix_str = f", VIX={vix_value:.1f}<{vix_thresh}" if vix_thresh else ""

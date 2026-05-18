@@ -231,6 +231,27 @@ def calibrate_confidence(
     return max(0.0, min(1.0, entry[2]))
 
 
+def calibrate_confidence_default(
+    raw_confidence: float,
+    model_name: str | None,
+) -> float:
+    """Engine-less wrapper for hot call sites that don't already have an
+    Engine in scope.
+
+    Pulls the global engine lazily via ``db.get_engine`` and delegates.
+    Falls back to the raw value on any failure (engine unavailable,
+    table missing, import error). Designed as a drop-in replacement for
+    a bare ``min(0.95, raw)`` cap.
+    """
+    if not model_name:
+        return float(raw_confidence)
+    try:
+        from db import get_engine  # local import to avoid circular deps at module load
+        return calibrate_confidence(float(raw_confidence), model_name, get_engine())
+    except Exception:
+        return float(raw_confidence)
+
+
 def build_reliability_curves(
     engine: Engine,
     days: int = 365,
