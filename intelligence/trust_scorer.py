@@ -1835,15 +1835,13 @@ class TrustScorer:
                     text(
                         "UPDATE signal_sources "
                         "SET outcome = :o, "
-                        "    scored_at = :now, "
-                        "    outcome_notes = :notes "
+                        "    scored_at = :now "
                         "WHERE id::text = ANY(:ids) "
                         "  AND (outcome IS NULL OR outcome = 'PENDING')"
                     ),
                     {
                         "o": outcome,
                         "now": now,
-                        "notes": f"prediction={prediction_id} verdict={verdict}",
                         "ids": ids,
                     },
                 )
