@@ -20,6 +20,7 @@ from intelligence.confidence_calibration import (
     _bucket_for,
     build_reliability_curves,
     calibrate_confidence,
+    calibrate_confidence_default,
     invalidate_cache,
 )
 
@@ -260,3 +261,28 @@ class TestBuildReliabilityCurves:
         # The old curve is gone (TRUNCATE cleared the table)
         assert ("old_model", 0.50) not in engine.curves
         assert ("new_model", 0.50) in engine.curves
+
+
+# ── calibrate_confidence_default (engine-less wrapper) ───────────────────
+
+
+class TestCalibrateConfidenceDefault:
+    def test_no_model_name_returns_raw(self):
+        assert calibrate_confidence_default(0.72, None) == pytest.approx(0.72)
+        assert calibrate_confidence_default(0.42, "") == pytest.approx(0.42)
+
+    def test_engine_import_failure_falls_back_to_raw(self, monkeypatch):
+        # Simulate `db.get_engine` raising — the wrapper must swallow and
+        # return the raw value, never crash the hot path.
+        import intelligence.confidence_calibration as mod
+
+        def _boom(*a, **kw):
+            raise RuntimeError("db unavailable")
+
+        # Patch the lazy import target so the wrapper's try/except catches it.
+        monkeypatch.setitem(
+            __import__("sys").modules,
+            "db",
+            type("M", (), {"get_engine": _boom})(),
+        )
+        assert calibrate_confidence_default(0.81, "any_model") == pytest.approx(0.81)
