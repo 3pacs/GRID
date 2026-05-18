@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>finance.stepdad.fleet-audit</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/anikdang/dev/GRID/scripts/fleet/run_audit.sh</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>900</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/grid-fleet-audit.launchd.out</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/grid-fleet-audit.launchd.err</string>
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>
