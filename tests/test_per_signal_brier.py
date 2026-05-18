@@ -99,6 +99,8 @@ class _FakeEngine:
 
     def __init__(self) -> None:
         self.store: dict[tuple[str, int], dict] = {}
+        # Append-only snapshot rows in insert order.
+        self.snapshots: list[dict] = []
         self._ddl_seen: list[str] = []
 
     def begin(self) -> "_FakeEngine._Ctx":
@@ -124,6 +126,49 @@ class _FakeEngine:
             if sql.startswith("CREATE TABLE") or sql.startswith("CREATE INDEX"):
                 self.parent._ddl_seen.append(sql)
                 return MagicMock()
+
+            # NEW SNAPSHOT PATHS — must fire BEFORE the generic
+            # "SELECT signal_source, horizon_days, scored_count" branch
+            # below; otherwise the legacy full-table-scan returns rows
+            # without honouring the horizon filter.
+            if "FROM per_signal_brier_snapshots" in sql:
+                horizon = int(params["h"])
+                as_of = params["as_of"]
+                eligible = [
+                    s for s in self.parent.snapshots
+                    if s["horizon_days"] == horizon and s["snapshot_at"] <= as_of
+                ]
+                eligible.sort(key=lambda s: s["snapshot_at"], reverse=True)
+                latest: dict[str, dict] = {}
+                for s in eligible:
+                    src = s["signal_source"]
+                    if src not in latest:
+                        latest[src] = s
+                rows = [
+                    (
+                        s["signal_source"], s["horizon_days"], s["scored_count"],
+                        s["running_brier"], s["running_ece"], s["hit_count"],
+                        s["snapshot_at"],
+                    )
+                    for s in latest.values()
+                ]
+                return _FakeResult(fetchall_value=rows)
+
+            if (
+                "FROM per_signal_brier_history" in sql
+                and "WHERE horizon_days" in sql
+                and "last_updated <=" in sql
+            ):
+                horizon = int(params["h"])
+                as_of = params["as_of"]
+                rows = [
+                    _row_tuple(v)
+                    for (src, h), v in self.parent.store.items()
+                    if h == horizon
+                    and v.get("last_updated")
+                    and v["last_updated"] <= as_of
+                ]
+                return _FakeResult(fetchall_value=rows)
 
             if sql.startswith("SELECT signal_source, horizon_days, scored_count"):
                 # Read path — either one row or all rows
@@ -199,6 +244,39 @@ class _FakeEngine:
                     }
                 )
                 return MagicMock()
+
+            if sql.startswith("INSERT INTO per_signal_brier_snapshots"):
+                # Append-only-ish: ON CONFLICT DO UPDATE overwrites the
+                # row when the (source, horizon, snapshot_at) tuple
+                # collides (batch-scored predictions sharing scored_at).
+                # The overwrite keeps the LATEST running state at that
+                # moment, which is the correct PIT semantic.
+                stamp = params.get("scored_at") or datetime.now(timezone.utc)
+                snap = {
+                    "signal_source": params["s"],
+                    "horizon_days": int(params["h"]),
+                    "snapshot_at": stamp,
+                    "scored_count": int(params.get("n", 1)),
+                    "running_brier": float(params["b"]),
+                    "running_ece": float(params["e"]),
+                    "hit_count": int(params.get("hit_count", params.get("hit", 0))),
+                }
+                key = (snap["signal_source"], snap["horizon_days"], snap["snapshot_at"])
+                for i, existing in enumerate(self.parent.snapshots):
+                    if (
+                        existing["signal_source"],
+                        existing["horizon_days"],
+                        existing["snapshot_at"],
+                    ) == key:
+                        self.parent.snapshots[i] = snap
+                        break
+                else:
+                    self.parent.snapshots.append(snap)
+                return MagicMock()
+
+            # Snapshot read + history fallback are dispatched earlier
+            # in this method (above the generic SELECT branch) so they
+            # honour the horizon filter before the legacy full-scan kicks in.
 
             return MagicMock()
 
@@ -579,3 +657,112 @@ class TestRecordScoredPredictionBackdated:
             scored_at=latest,
         )
         assert engine.store[("jodi_oil", 7)]["last_updated"] == latest
+
+
+# ── per_signal_brier_snapshots: append + PIT reconstruction ───────────────
+
+
+class TestSnapshotWritePath:
+    """Each ``record_scored_prediction`` invocation must append a row to
+    ``per_signal_brier_snapshots`` so historical audits can reconstruct
+    the running state at any prediction's ``scored_at``.
+    """
+
+    def test_first_prediction_writes_initial_snapshot(self):
+        engine = _FakeEngine()
+        t0 = datetime(2026, 1, 15, 9, 0, tzinfo=timezone.utc)
+        record_scored_prediction(
+            engine,
+            horizon_days=7,
+            confidence=0.7,
+            outcome=1.0,
+            signal_contributions={"jodi_oil": 1.0},
+            scored_at=t0,
+        )
+        assert len(engine.snapshots) == 1
+        s = engine.snapshots[0]
+        assert s["signal_source"] == "jodi_oil"
+        assert s["horizon_days"] == 7
+        assert s["snapshot_at"] == t0
+        assert s["scored_count"] == 1
+
+    def test_subsequent_predictions_append_running_state(self):
+        engine = _FakeEngine()
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        t1 = datetime(2026, 1, 2, tzinfo=timezone.utc)
+        t2 = datetime(2026, 1, 3, tzinfo=timezone.utc)
+        for stamp in (t0, t1, t2):
+            record_scored_prediction(
+                engine,
+                horizon_days=7,
+                confidence=0.6,
+                outcome=1.0,
+                signal_contributions={"jodi_oil": 1.0},
+                scored_at=stamp,
+            )
+        # 3 snapshots, monotonically increasing scored_count
+        assert len(engine.snapshots) == 3
+        counts = [s["scored_count"] for s in engine.snapshots]
+        assert counts == [1, 2, 3]
+
+
+class TestGetScorecardsAsOf:
+    """``get_scorecards_as_of`` must return the PIT-correct running
+    state for each (signal_source, horizon_days) bucket.
+    """
+
+    def test_returns_state_as_of_timestamp(self):
+        from features.per_signal_brier import get_scorecards_as_of
+        engine = _FakeEngine()
+        # Three predictions: t0 (count=1), t1 (count=2), t2 (count=3)
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        t1 = datetime(2026, 1, 5, tzinfo=timezone.utc)
+        t2 = datetime(2026, 1, 10, tzinfo=timezone.utc)
+        for stamp in (t0, t1, t2):
+            record_scored_prediction(
+                engine, horizon_days=7, confidence=0.7, outcome=1.0,
+                signal_contributions={"jodi_oil": 1.0}, scored_at=stamp,
+            )
+        # Query as_of t1: should see only the t0+t1 contributions → count=2
+        midpoint = datetime(2026, 1, 6, tzinfo=timezone.utc)
+        cards = get_scorecards_as_of(engine, midpoint, horizon_days=7)
+        assert "jodi_oil" in cards
+        assert cards["jodi_oil"].scored_count == 2
+        # Query as_of long-before: nothing
+        before = datetime(2025, 12, 1, tzinfo=timezone.utc)
+        assert get_scorecards_as_of(engine, before, horizon_days=7) == {}
+        # Query as_of long-after: latest state
+        after = datetime(2026, 12, 1, tzinfo=timezone.utc)
+        assert get_scorecards_as_of(engine, after, horizon_days=7)["jodi_oil"].scored_count == 3
+
+    def test_horizon_snapping(self):
+        from features.per_signal_brier import get_scorecards_as_of
+        engine = _FakeEngine()
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        # Raw h=10 snaps to 7
+        record_scored_prediction(
+            engine, horizon_days=10, confidence=0.7, outcome=1.0,
+            signal_contributions={"jodi_oil": 1.0}, scored_at=t0,
+        )
+        midpoint = datetime(2026, 1, 5, tzinfo=timezone.utc)
+        # Query with raw 9 — should snap to 7 and find the snapshot
+        cards = get_scorecards_as_of(engine, midpoint, horizon_days=9)
+        assert "jodi_oil" in cards
+        # Query with 30 — different bucket, empty
+        assert get_scorecards_as_of(engine, midpoint, horizon_days=30) == {}
+
+    def test_falls_back_to_history_table_when_snapshots_empty(self):
+        from features.per_signal_brier import get_scorecards_as_of
+        engine = _FakeEngine()
+        # Manually populate history but NOT snapshots — simulates a
+        # legacy state where the snapshot table hasn't been backfilled.
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        engine.store[("jodi_oil", 7)] = {
+            "signal_source": "jodi_oil", "horizon_days": 7,
+            "scored_count": 50, "running_brier": 0.1, "running_ece": 0.1,
+            "hit_count": 30, "last_updated": t0,
+        }
+        midpoint = datetime(2026, 1, 5, tzinfo=timezone.utc)
+        cards = get_scorecards_as_of(engine, midpoint, horizon_days=7)
+        assert "jodi_oil" in cards
+        assert cards["jodi_oil"].scored_count == 50

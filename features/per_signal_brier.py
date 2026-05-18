@@ -130,6 +130,31 @@ CREATE INDEX IF NOT EXISTS idx_psbh_horizon
     ON per_signal_brier_history (horizon_days, running_brier ASC);
 CREATE INDEX IF NOT EXISTS idx_psbh_source
     ON per_signal_brier_history (signal_source, horizon_days);
+
+-- Append-only snapshot of the running state after each scored prediction.
+-- The single-row-per-bucket history table above is fine for live reads
+-- (current calibration of a signal) but useless for walk-forward audits
+-- because the PIT filter last_updated less-than-as-of excludes any
+-- bucket touched after the prediction's created_at — i.e., the live row
+-- always reflects state AFTER the historical prediction being replayed.
+-- The snapshot table captures the running state at the TIME OF EACH
+-- scored prediction so audits can query the most-recent snapshot
+-- per (signal_source, horizon_days) with snapshot_at <= the audit
+-- as_of timestamp and get the PIT-correct calibration for any point.
+-- See features.per_signal_brier.get_scorecards_as_of for the read path.
+CREATE TABLE IF NOT EXISTS per_signal_brier_snapshots (
+    signal_source    TEXT             NOT NULL,
+    horizon_days     INTEGER          NOT NULL,
+    snapshot_at      TIMESTAMPTZ      NOT NULL,
+    scored_count     INTEGER          NOT NULL,
+    running_brier    DOUBLE PRECISION NOT NULL,
+    running_ece      DOUBLE PRECISION NOT NULL,
+    hit_count        INTEGER          NOT NULL,
+    PRIMARY KEY (signal_source, horizon_days, snapshot_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_psbs_lookup
+    ON per_signal_brier_snapshots (signal_source, horizon_days, snapshot_at DESC);
 """
 
 
@@ -259,6 +284,34 @@ def record_scored_prediction(
                             "scored_at": scored_at,
                         },
                     )
+                    # Append-only snapshot: captures the running state
+                    # AFTER this prediction's contribution. PIT readers
+                    # query the most-recent snapshot with snapshot_at
+                    # <= as_of to reconstruct calibration at any point.
+                    conn.execute(
+                        text(
+                            """
+                            INSERT INTO per_signal_brier_snapshots
+                                (signal_source, horizon_days, snapshot_at,
+                                 scored_count, running_brier, running_ece, hit_count)
+                            VALUES (:s, :h, COALESCE(:scored_at, NOW()),
+                                    1, :b, :e, :hit)
+                            ON CONFLICT (signal_source, horizon_days, snapshot_at) DO UPDATE
+                              SET scored_count  = EXCLUDED.scored_count,
+                                  running_brier = EXCLUDED.running_brier,
+                                  running_ece   = EXCLUDED.running_ece,
+                                  hit_count     = EXCLUDED.hit_count
+                            """
+                        ),
+                        {
+                            "s": source,
+                            "h": horizon,
+                            "b": weighted_brier,
+                            "e": weighted_ece,
+                            "hit": directional_hit,
+                            "scored_at": scored_at,
+                        },
+                    )
                     updates[source] = {
                         "scored_count": 1,
                         "running_brier": weighted_brier,
@@ -295,6 +348,32 @@ def record_scored_prediction(
                         "h": new_hits,
                         "s": source,
                         "hz": horizon,
+                        "scored_at": scored_at,
+                    },
+                )
+                # Append-only snapshot for this Welford step.
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO per_signal_brier_snapshots
+                            (signal_source, horizon_days, snapshot_at,
+                             scored_count, running_brier, running_ece, hit_count)
+                        VALUES (:s, :h, COALESCE(:scored_at, NOW()),
+                                :n, :b, :e, :hit_count)
+                        ON CONFLICT (signal_source, horizon_days, snapshot_at) DO UPDATE
+                          SET scored_count  = EXCLUDED.scored_count,
+                              running_brier = EXCLUDED.running_brier,
+                              running_ece   = EXCLUDED.running_ece,
+                              hit_count     = EXCLUDED.hit_count
+                        """
+                    ),
+                    {
+                        "s": source,
+                        "h": horizon,
+                        "n": new_count,
+                        "b": new_brier,
+                        "e": new_ece,
+                        "hit_count": new_hits,
                         "scored_at": scored_at,
                     },
                 )
@@ -343,6 +422,77 @@ def compute_conviction_weight(
 
 
 # ── Read path ─────────────────────────────────────────────────────────────
+
+
+def get_scorecards_as_of(
+    engine: Engine,
+    as_of: datetime,
+    horizon_days: int,
+) -> dict[str, SignalScorecard]:
+    """Reconstruct calibrated scorecards as they stood at ``as_of``.
+
+    PIT-correct query against ``per_signal_brier_snapshots``: for each
+    ``(signal_source, horizon_days)`` bucket, returns the most-recent
+    snapshot row whose ``snapshot_at <= :as_of``. This is the read path
+    walk-forward audits use to time-freeze the calibration substrate
+    without lookahead leak.
+
+    Returns ``{signal_source: SignalScorecard}`` keyed on source for
+    lookup by the provenance reconstructor. Empty dict when no
+    snapshot exists ≤ as_of (cold-start case — caller falls through to
+    neutral 1.0 conviction weights).
+
+    Falls back to ``per_signal_brier_history`` with the legacy
+    ``last_updated <= as_of`` filter when the snapshot table is empty
+    (e.g., before any backfill has populated it). That fallback exists
+    so the new schema can land safely before the bootstrap rerun.
+    """
+    horizon = _canonical_horizon(horizon_days)
+    out: dict[str, SignalScorecard] = {}
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT DISTINCT ON (signal_source)
+                           signal_source, horizon_days, scored_count,
+                           running_brier, running_ece, hit_count,
+                           snapshot_at
+                      FROM per_signal_brier_snapshots
+                     WHERE horizon_days = :h
+                       AND snapshot_at <= :as_of
+                     ORDER BY signal_source, snapshot_at DESC
+                    """
+                ),
+                {"h": horizon, "as_of": as_of},
+            ).fetchall()
+            for r in rows:
+                card = _row_to_scorecard(r)
+                out[card.signal_source] = card
+            if out:
+                return out
+
+            # Fallback: snapshot table is empty. Read from the live
+            # history with the legacy lookahead filter. Same call shape.
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT signal_source, horizon_days, scored_count,
+                           running_brier, running_ece, hit_count,
+                           last_updated
+                      FROM per_signal_brier_history
+                     WHERE horizon_days = :h
+                       AND last_updated <= :as_of
+                    """
+                ),
+                {"h": horizon, "as_of": as_of},
+            ).fetchall()
+            for r in rows:
+                card = _row_to_scorecard(r)
+                out[card.signal_source] = card
+    except Exception as exc:  # noqa: BLE001
+        log.debug("get_scorecards_as_of failed: {e}", e=str(exc))
+    return out
 
 
 def _row_to_scorecard(row: Any) -> SignalScorecard:

@@ -84,12 +84,24 @@ class FakeEngine:
                 for p in self.predictions
             ]
             return FakeResult(rows)
+        if "per_signal_brier_snapshots" in sql and "SELECT" in sql.upper():
+            # The new snapshot-based reader (features.per_signal_brier.
+            # get_scorecards_as_of) checks snapshots first; tests use
+            # the legacy scorecard_rows fixture against the history
+            # table, so snapshots are intentionally empty here and the
+            # caller falls back to the per_signal_brier_history path
+            # below.
+            return FakeResult([])
         if "per_signal_brier_history" in sql and "SELECT" in sql.upper():
             as_of = params.get("as_of")
+            # New reader fallback also passes horizon (:h) — filter on
+            # it when present so the row[1] horizon column matches.
+            horizon = params.get("h")
             rows = [
                 r
                 for r in self.scorecard_rows
-                if as_of is None or (r[6] is not None and r[6] <= as_of)
+                if (as_of is None or (r[6] is not None and r[6] <= as_of))
+                and (horizon is None or int(r[1]) == int(horizon))
             ]
             return FakeResult(rows)
         if "FROM oracle_models" in sql:

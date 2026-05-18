@@ -64,6 +64,7 @@ from features.per_signal_brier import (
     SignalScorecard,
     _canonical_horizon,
     compute_conviction_weight,
+    get_scorecards_as_of,
 )
 from intelligence.counterfactual_stress import run_stress_test
 from intelligence.signal_provenance import (
@@ -979,85 +980,31 @@ def _load_scored_predictions(
     return out
 
 
-_SCORECARD_HISTORY_QUERY = text(
-    """
-    SELECT signal_source, horizon_days, scored_count, running_brier,
-           running_ece, hit_count, last_updated
-    FROM per_signal_brier_history
-    WHERE last_updated <= :as_of
-    """
-)
-
-
 def _reconstruct_historical_scorecards(
     engine: Engine,
     as_of: datetime,
     horizon_days: int,
 ) -> dict[str, SignalScorecard]:
-    """Return the ``per_signal_brier_history`` snapshot as-of ``as_of``.
+    """Return the per-signal scorecards as they stood at ``as_of``.
 
-    CRITICAL: the SQL filter ``last_updated <= :as_of`` is the only thing
-    preventing lookahead leak — every scorecard used in the time-frozen
-    provenance reconstruction must have been updated at or before the
-    prediction's own timestamp. Any change that weakens this filter
-    invalidates the entire backtest.
+    Reads from ``per_signal_brier_snapshots`` (append-only, indexed
+    on ``(signal_source, horizon_days, snapshot_at DESC)``) via
+    ``features.per_signal_brier.get_scorecards_as_of``. For each
+    ``(signal_source, horizon_days)`` bucket the helper picks the
+    most-recent snapshot whose ``snapshot_at <= :as_of`` — that's
+    the PIT-correct running state of the calibration substrate.
 
-    When the per_signal_brier_history table is empty (e.g. predictions
-    preceded the bootstrap script), the returned dict is empty and the
-    provenance reconstructor falls through to cold-start weights (neutral
-    conviction = 1.0) via the ``scorecard=None`` branch.
+    Falls back to the legacy ``per_signal_brier_history`` table with
+    the original ``last_updated <= :as_of`` filter when the snapshot
+    table is empty (pre-backfill case). Same lookahead guard, same
+    semantic, just the keyspace mechanic is different.
 
-    Only scorecards whose ``horizon_days`` matches the target horizon
-    (after snapping to the canonical {1, 7, 30, 90} bucket) are returned —
-    ``record_scored_prediction`` writes scorecards under canonical
-    horizons, so a raw ``horizon_days=4`` prediction must be snapped to 7
-    before lookup or no scorecard ever joins (this was the 2026-05-11
-    "bootstrap had no effect" bug).
+    ``record_scored_prediction`` writes both tables on every scored
+    prediction; the snapshot row captures the state AFTER the
+    contribution, so reading the latest snapshot ≤ as_of gives the
+    correct "what would have been known at as_of" answer.
     """
-    out: dict[str, SignalScorecard] = {}
-    canonical_target = _canonical_horizon(horizon_days)
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(
-                _SCORECARD_HISTORY_QUERY, {"as_of": as_of}
-            ).fetchall()
-    except Exception as exc:  # noqa: BLE001
-        log.debug(
-            "walk_forward_validate: scorecard history read failed: {e}",
-            e=str(exc),
-        )
-        return out
-
-    for row in rows or []:
-        try:
-            source = row[0]
-            row_horizon = int(row[1] or 0)
-        except (IndexError, TypeError, ValueError):
-            continue
-        if not source or row_horizon != canonical_target:
-            continue
-        count = int(row[2] or 0)
-        brier = float(row[3] or 0.0)
-        ece = float(row[4] or 0.0)
-        hits = int(row[5] or 0)
-        last_updated = row[6]
-        hit_rate = (hits / count) if count > 0 else 0.0
-        is_calibrated = count >= MIN_CALIBRATED_SAMPLES
-        conviction = (
-            compute_conviction_weight(brier, count) if is_calibrated else 1.0
-        )
-        out[str(source)] = SignalScorecard(
-            signal_source=str(source),
-            horizon_days=row_horizon,
-            scored_count=count,
-            running_brier=brier,
-            running_ece=ece,
-            hit_rate=hit_rate,
-            last_updated=last_updated,
-            is_calibrated=is_calibrated,
-            conviction_weight=conviction,
-        )
-    return out
+    return get_scorecards_as_of(engine, as_of, horizon_days)
 
 
 _ENSURE_TABLE_SQL = """
