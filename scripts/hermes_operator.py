@@ -2058,10 +2058,6 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         _emit_obsidian_cycle_report(state, cycle_result)
         cycle_result["obsidian_report"] = {"status": "attempted"}
 
-    # Fan a heartbeat / event report into the fleet-wide Obsidian agent-hub.
-    # Idempotent: skips on quiet cycles unless the hourly heartbeat is due.
-    _emit_obsidian_cycle_report(state, cycle_result)
-
     log.info(
         "═══ Cycle {n} complete — {t:.1f}s ═══",
         n=state.cycle_count, t=elapsed,
