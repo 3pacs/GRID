@@ -499,6 +499,8 @@ class _FrozenPrediction:
 def build_time_frozen_provenance(
     prediction_row: dict[str, Any],
     scorecards_at_time: dict[str, SignalScorecard],
+    *,
+    engine: Any = None,
 ) -> TradeProvenanceReport:
     """Reconstruct a ``TradeProvenanceReport`` using only data that existed
     at the prediction's ``created_at``.
@@ -566,12 +568,44 @@ def build_time_frozen_provenance(
     disagreement_score = float(signals.get("disagreement_score", 0.0) or 0.0)
     red_team_risk = float(signals.get("red_team_epistemic_risk", 0.0) or 0.0)
 
+    # EDGE-table multiplier — no-op (returns 1.0) when
+    # ``GRID_EDGE_SIGNALS_ENABLED`` is off (or no engine passed), so
+    # production behaviour is unchanged until the operator opts in.
+    #
+    # We route through ``edge_multiplier_for_prediction`` rather than
+    # ``compute_aggregate_edge_multiplier(signal_evidence, ticker)``
+    # because the edge_table keys on signal-source ``source_type``
+    # (insider / quiverquant:offexchange / smart_money / ...), which
+    # is the ``signal_sources`` table's schema — not the Shapley
+    # feature names that ``signal_evidence.signal_source`` carries
+    # (equity / vol / ci_full / aapl_pcr / ...). Bridging via a
+    # signal_sources lookup costs one short SELECT per prediction
+    # and lets the multiplier actually fire.
+    from intelligence.edge_signals import edge_multiplier_for_prediction
+    # Pass the prediction's direction so the multiplier flips IC sign
+    # when the signal's natural direction opposes the prediction. Pre-
+    # 2026-05-13 the lookup was direction-agnostic and would happily
+    # boost CALL predictions that had a strongly-bearish insider-SELL
+    # signal on their ticker — which is the inversion that put HIGH
+    # bucket at 14% hit rate.
+    _pred_dir = (
+        str(prediction_row.get("direction") or "")
+        or str(signals.get("direction") or "")
+    )
+    edge_signal_multiplier = edge_multiplier_for_prediction(
+        engine,
+        prediction_row.get("ticker") or "",
+        prediction_row.get("created_at"),
+        prediction_direction=_pred_dir,
+    )
+
     aggregate = compute_aggregate_conviction(
         signal_evidence,
         fragility_multiplier=fragility_multiplier,
         disagreement_score=disagreement_score,
         red_team_epistemic_risk=red_team_risk,
         fudge_alert_count=fudge_alert_count,
+        edge_signal_multiplier=edge_signal_multiplier,
     )
     verdict = _verdict_from_aggregate(aggregate, confidence)
 
@@ -1236,7 +1270,7 @@ def walk_forward(
                 as_of=created_at,
                 horizon_days=row_horizon,
             )
-            provenance = build_time_frozen_provenance(enriched, scorecards)
+            provenance = build_time_frozen_provenance(enriched, scorecards, engine=engine)
 
             try:
                 stress = run_stress_test(provenance)
@@ -1301,11 +1335,23 @@ def walk_forward(
                 pit_hits += 1
             hit = classify_hit(provenance.direction, outcome_verdict)
 
+            # Robustness gate: a HIGH-bucket prediction whose stress
+            # test flags it as fragile is by definition over-confident
+            # — small signal perturbations flip its verdict, so the
+            # +1.15 conviction is barely-over-threshold rather than
+            # genuinely robust. Demote it to MEDIUM so the verdict
+            # buckets are honest. Without this gate, post-#126 every
+            # HIGH prediction was stress-fragile and the bucket's hit
+            # rate cratered (13.2% vs LOW's 33.9%).
+            gated_verdict = provenance.verdict
+            if gated_verdict == "high" and stress_label == "fragile":
+                gated_verdict = "medium"
+
             trade = BacktestTrade(
                 prediction_id=str(row.get("id")),
                 ticker=str(row.get("ticker") or ""),
                 prediction_date=created_at.isoformat(),
-                verdict=provenance.verdict,
+                verdict=gated_verdict,
                 aggregate_conviction=float(provenance.aggregate_conviction),
                 robustness_label=stress_label,
                 robustness_score=stress_score,
