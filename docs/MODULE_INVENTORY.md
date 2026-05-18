@@ -1,8 +1,8 @@
 # GRID Module Inventory
 
 Generated: 2026-05-18
-Total modules: 749
-Total LOC: 329,681
+Total modules: 750
+Total LOC: 330,084
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycache__/`, `build/`, `dist/`, `docs/`, `node_modules/`, `notebooks/`, `pwa/`, `pwa_dist/`, `tests/`, `venv/`.
@@ -11,12 +11,12 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 
 | Directory | Module count | LOC |
 |---|---|---|
-| `intelligence/` | 171 | 101,287 |
+| `intelligence/` | 172 | 101,658 |
 | `ingestion/` | 207 | 85,797 |
 | `api/` | 107 | 48,466 |
 | `analysis/` | 33 | 18,973 |
 | `trading/` | 34 | 14,158 |
-| `oracle/` | 29 | 10,495 |
+| `oracle/` | 29 | 10,527 |
 | `subnet/` | 10 | 5,381 |
 | `physics/` | 18 | 4,824 |
 | `features/` | 7 | 4,428 |
@@ -311,6 +311,12 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Functions:** `BucketCalibration`, `record_scored_prediction`, `get_bucket_calibration`, `conviction_multiplier_for_bucket`, `rank_buckets_by_calibration`, `bootstrap_from_oracle_predictions`
 **Reads:** `__future__`, `dataclasses`, `datetime`, `features`, `loguru`, `scripts`, `sqlalchemy`, `typing`
 **Imported by:** `intelligence/signal_provenance.py`
+
+#### `intelligence/confidence_calibration.py` — 371 LOC
+**Docstring:** Per-model confidence reliability curves.
+**Functions:** `ensure_tables`, `CalibrationCurve`, `invalidate_cache`, `calibrate_confidence`, `build_reliability_curves`, `main`
+**Reads:** `__future__`, `argparse`, `dataclasses`, `db`, `loguru`, `sqlalchemy`, `sys`, `typing`
+**Imported by:** `oracle/engine.py`
 
 #### `intelligence/consensus_crowdedness.py` — 425 LOC
 **Docstring:** CAT-182 — Consensus crowdedness detector.
@@ -3180,7 +3186,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`, `math`, `typing`
 **Imported by:** `oracle/engine.py`
 
-#### `oracle/engine.py` — 2775 LOC
+#### `oracle/engine.py` — 2807 LOC
 **Docstring:** GRID Oracle Engine — Self-improving prediction loop.
 **Functions:** `PredictionType`, `Verdict`, `Signal`, `AntiSignal`, `OraclePrediction`, `OracleModel`, `ModelRegistry`, `OracleEngine`, `EnsemblePrediction`, `EnsemblePredictor`
 **Reads:** `__future__`, `ast`, `concurrent`, `dataclasses`, `datetime`, `enum`, `hashlib`, `intelligence`, `json`, `llm`, `loguru`, `numpy`, `oracle`, `os`, `schema_guard`, `sqlalchemy`, `typing`
