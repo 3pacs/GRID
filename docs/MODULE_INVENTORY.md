@@ -2,7 +2,7 @@
 
 Generated: 2026-05-18
 Total modules: 750
-Total LOC: 330,494
+Total LOC: 330,480
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycache__/`, `build/`, `dist/`, `docs/`, `node_modules/`, `notebooks/`, `pwa/`, `pwa_dist/`, `tests/`, `venv/`.
@@ -36,8 +36,8 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 | `timeseries/` | 4 | 1,017 |
 | `outputs/` | 3 | 704 |
 | `a2a/` | 4 | 670 |
-| `llamacpp/` | 2 | 521 |
 | `events/` | 5 | 517 |
+| `llamacpp/` | 2 | 507 |
 | `journal/` | 2 | 347 |
 | `governance/` | 2 | 319 |
 
@@ -4177,17 +4177,6 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `a2a`, `loguru`, `typing`, `uuid`
 **Imported by:** `a2a/__init__.py`, `api/routers/a2a.py`
 
-## `llamacpp/`
-
-#### `llamacpp/__init__.py` — 7 LOC
-**Docstring:** GRID llama.cpp integration.
-
-#### `llamacpp/client.py` — 514 LOC
-**Docstring:** GRID llama.cpp server client.
-**Functions:** `LlamaCppClient`, `get_client`
-**Reads:** `__future__`, `config`, `knowledge`, `llm`, `loguru`, `re`, `requests`, `time`, `typing`
-**Imported by:** `ollama/client.py`, `ollama/router.py`
-
 ## `events/`
 
 #### `events/__init__.py` — 15 LOC
@@ -4217,6 +4206,17 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Functions:** `emit`, `emit_async`, `flush`, `close`
 **Reads:** `__future__`, `config`, `datetime`, `db`, `json`, `kafka`, `loguru`, `time`
 **Imported by:** `api/routers/canvas_investigate.py`, `api/routers/sse.py`, `events/__init__.py`, `events/consumer.py`
+
+## `llamacpp/`
+
+#### `llamacpp/__init__.py` — 7 LOC
+**Docstring:** GRID llama.cpp integration.
+
+#### `llamacpp/client.py` — 500 LOC
+**Docstring:** GRID llama.cpp server client.
+**Functions:** `LlamaCppClient`, `get_client`
+**Reads:** `__future__`, `config`, `knowledge`, `llm`, `loguru`, `re`, `requests`, `time`, `typing`
+**Imported by:** `ollama/client.py`, `ollama/router.py`
 
 ## `journal/`
 
