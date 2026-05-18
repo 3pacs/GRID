@@ -294,19 +294,6 @@ class TestRunStressTest:
         assert result.robustness_score > 0.0
         assert result.original_verdict == "high"
 
-    @pytest.mark.xfail(
-        reason=(
-            "PR #192 made HIGH verdict depend on confidence alone "
-            "(0.55 <= confidence <= 0.85) until the conviction substrate "
-            "(per_signal_brier_history, confidence_bucket_tracker, regime_brier, "
-            "meta_learning_matrix) repopulates. Perturbing a signal's brier "
-            "only moves aggregate_conviction, which the current verdict "
-            "classifier ignores — so knife-edge fragility detection is "
-            "temporarily blunted. Restore once two-axis gate "
-            "(conviction>=1.15 AND confidence>=0.7) returns."
-        ),
-        strict=False,
-    )
     def test_knife_edge_report_is_fragile(self):
         # One dominant signal carrying the call. Perturbing it must flip.
         evs = [

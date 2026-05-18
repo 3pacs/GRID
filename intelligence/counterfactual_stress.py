@@ -68,6 +68,12 @@ BRIER_PERTURBATION_DELTA: float = 0.05
 FRAGILITY_THRESHOLD: float = 0.7   # below → fragile
 ROBUST_THRESHOLD: float = 0.9      # above → robust
 
+# ``signal_provenance._verdict_from_aggregate`` temporarily routes HIGH by
+# calibrated confidence bucket alone while the calibration substrate refills.
+# Stress testing still needs an evidence-sensitive support floor, or holding
+# confidence fixed makes every 0.55-0.85 HIGH immune to signal perturbations.
+HIGH_STRESS_CONVICTION_FLOOR: float = 1.15
+
 
 # ── Data classes ──────────────────────────────────────────────────────────
 
@@ -201,6 +207,29 @@ def classify_robustness(score: float) -> str:
     if score < FRAGILITY_THRESHOLD:
         return "fragile"
     return "moderate"
+
+
+def _stress_verdict_from_aggregate(
+    conviction: float,
+    confidence: float,
+    original_verdict: str,
+) -> str:
+    """Return the verdict used for counterfactual break detection.
+
+    Live provenance owns the final trade bucket. Counterfactual stress asks a
+    narrower question: does this HIGH call still have single-signal evidence
+    support after the perturbation? The 1.15 floor is the documented high
+    conviction support boundary that provenance plans to restore once the
+    calibration substrate is populated again.
+    """
+    verdict = _verdict_from_aggregate(conviction, confidence)
+    if (
+        str(original_verdict).lower() == "high"
+        and verdict == "high"
+        and conviction < HIGH_STRESS_CONVICTION_FLOOR
+    ):
+        return "medium"
+    return verdict
 
 
 def identify_fragility_flags(
@@ -439,7 +468,11 @@ def run_stress_test(report: TradeProvenanceReport) -> StressTestReport:
                 red_team_epistemic_risk=report.red_team_epistemic_risk,
                 fudge_alert_count=len(report.shipping_fudge_alerts),
             )
-            new_verdict = _verdict_from_aggregate(new_aggregate, report.confidence)
+            new_verdict = _stress_verdict_from_aggregate(
+                new_aggregate,
+                report.confidence,
+                report.verdict,
+            )
             perturbations.append(
                 SignalPerturbation(
                     signal_source=ev.signal_source,
