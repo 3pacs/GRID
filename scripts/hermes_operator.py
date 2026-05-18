@@ -95,24 +95,6 @@ SMART_INGESTION_TIMEOUT_SECONDS = 300         # smart_scheduler.tick() — match
 TIMESFM_TIMEOUT_SECONDS = 240                 # oracle/forecaster_adapter.run_timesfm_forecast_cycle
 INTELLIGENCE_TASKS_TIMEOUT_SECONDS = 360      # trust/forecasts/thesis/cross-ref/options + daily-window backtest_scanner.review_existing_hypotheses (LLM-bound). Bumped 2026-05-08 from 180s after the timeout machinery was actually working — 180s was empirical-untested guess; 360s reflects observed daily run length with LLM calls
 
-# Active-hypothesis scoring — periodic batch that closes the loop on the
-# auto_discover() pipeline. The bottleneck is per-row score_hypothesis()
-# calls which the 2026-05-15 manual run timed at ~15/sec on grid-svr;
-# 200 rows / 600s leaves ample headroom (~3 rows/sec budget).
-ACTIVE_HYPO_SCORING_BATCH_SIZE = 200
-ACTIVE_HYPO_SCORING_MAX_RUNTIME_S = 600
-ACTIVE_HYPO_SCORING_INTERVAL_MINUTES = 30
-
-# Earnings events → earnings_calendar back-compat sync. The DB-side
-# function ``sync_earnings_events_to_calendar()`` (installed
-# 2026-05-17 via migration ``20260517_earnings_events_compat.sql``)
-# mirrors rows from the new ``earnings_events`` table into the legacy
-# ``earnings_calendar`` table so old consumers keep working. The
-# function exists but nothing was calling it on a schedule; this job
-# runs it every 30 minutes from Hermes alongside the active-hypothesis
-# scorer (same cadence, same scheduling mechanism).
-EARNINGS_CALENDAR_SYNC_INTERVAL_MINUTES = 30
-
 
 def _run_with_timeout(name: str, fn, timeout_s: int, state):
     """Execute fn() with a hard timeout. On timeout, blacklist via cooldown.
@@ -161,172 +143,133 @@ def _run_with_timeout(name: str, fn, timeout_s: int, state):
         ex.shutdown(wait=False, cancel_futures=True)
         return None, False
 
-# ─── Source registry (DERIVED from PULLER_REGISTRY — task #179) ────────────
-#
-# Historical bug class (#161, #170): _SOURCE_REGISTRY and PULLER_REGISTRY were
-# maintained as two independent literals. Items in one but not the other were
-# silently dropped — either a puller ran but had no operator-side catalog
-# entry, or it was catalogued but never actually scheduled. The #170 startup
-# divergence-guard logged warnings; #179 (this block) removes the bug class.
-#
-# Single source of truth: ``ingestion.smart_scheduler.PULLER_REGISTRY``.
-# _SOURCE_REGISTRY is computed at import time from PULLER_REGISTRY plus a
-# small explicit ``_SOURCE_EXTRAS`` overlay for entries PULLER_REGISTRY
-# structurally cannot represent (module-level ``fn`` pullers, ``skip_runtime``
-# audit-only stubs, and a few class-based entries that exist as pullers but
-# have not yet been wired into the SmartScheduler tick loop).
-#
-# Aliases (``_SOURCE_ALIASES``): historical operator-side names that map to
-# the same underlying (mod, cls) as a PULLER_REGISTRY entry but with a
-# different key. These are exposed in _SOURCE_REGISTRY so existing consumers
-# (``hermes_fixers._resolve_puller``, ``_CATALOG_TO_REGISTRY``) keep working.
-#
-# Field translation (PULLER_REGISTRY → _SOURCE_REGISTRY):
-#   mod    → mod       (1:1)
-#   cls    → cls       (1:1)
-#   method → pull_method (omitted when default "pull_all")
-#   kwargs → pull_kwargs (omitted when empty)
-#   api_key → api_key   (1:1)
-#   freq_h → interval_h (1:1)
-#
-# Consumers (``scripts.hermes_fixers._resolve_puller``,
-# ``hermes_fixers._CATALOG_TO_REGISTRY``) read these fields by name and ignore
-# unknown ones, so the resulting dict is shape-compatible with the previous
-# static literal.
+# Source name → (module_path, class_name, needs_api_key, pull_method)
+# This registry replaces the hardcoded if/elif chain and covers ALL pullers.
+_SOURCE_REGISTRY: dict[str, dict[str, Any]] = {
+    "fred":              {"mod": "ingestion.fred",                "cls": "FREDPuller",             "api_key": "FRED_API_KEY"},
+    "yfinance":          {"mod": "ingestion.yfinance_pull",       "cls": "YFinancePuller"},
+    "yfinance_options":  {"mod": "ingestion.options",             "cls": "OptionsPuller"},
+    "edgar":             {"mod": "ingestion.edgar",               "cls": "EDGARPuller",            "pull_method": "pull_form4_transactions", "pull_kwargs": {"days_back": 3}},
+    "crucix":            {"mod": "ingestion.crucix_bridge",       "cls": "CrucixBridgePuller"},
+    "bls":               {"mod": "ingestion.bls",                 "cls": "BLSPuller",              "api_key": "BLS_API_KEY"},
+    "googletrends":      {"mod": "ingestion.altdata.google_trends", "cls": "GoogleTrendsPuller",   "pull_kwargs": {"days_back": 30}},
+    "cboe":              {"mod": "ingestion.altdata.cboe_indices", "cls": "CBOEIndicesPuller",     "pull_kwargs": {"days_back": 30}},
+    "fedspeeches":       {"mod": "ingestion.altdata.fed_speeches", "cls": "FedSpeechPuller",      "pull_kwargs": {"days_back": 30}},
+    "fear_greed":        {"mod": "ingestion.altdata.fear_greed",   "cls": "FearGreedPuller"},
+    "baltic_exchange":   {"mod": "ingestion.altdata.baltic_dry",   "cls": "BalticDryPuller"},
+    "ny_fed":            {"mod": "ingestion.altdata.nyfed",        "cls": "NYFedPuller"},
+    "aaii_sentiment":    {"mod": "ingestion.altdata.aaii_sentiment", "cls": "AAIISentimentPuller"},
+    "cftc_cot":          {"mod": "ingestion.altdata.cftc_cot",     "cls": "CFTCCOTPuller"},
+    "finra_ats":         {"mod": "ingestion.altdata.finra_ats",    "cls": "FINRAATSPuller"},
+    "kalshi":            {"mod": "ingestion.altdata.kalshi",       "cls": "KalshiPuller"},
+    "ads_index":         {"mod": "ingestion.altdata.ads_index",    "cls": "ADSIndexPuller"},
+    "noaa_swpc":         {"mod": "ingestion.celestial.solar",      "cls": "SolarActivityPuller"},
+    "lunar_ephemeris":   {"mod": "ingestion.celestial.lunar",      "cls": "LunarCyclePuller"},
+    "planetary_ephemeris": {"mod": "ingestion.celestial.planetary", "cls": "PlanetaryAspectPuller"},
+    "vedic_jyotish":     {"mod": "ingestion.celestial.vedic",      "cls": "VedicAstroPuller"},
+    "chinese_calendar":  {"mod": "ingestion.celestial.chinese",    "cls": "ChineseCalendarPuller"},
 
-_SOURCE_ALIASES: dict[str, str] = {
-    # cfg-side name → PULLER_REGISTRY name (same mod+cls)
-    "yfinance_options":     "options",
-    "crucix":               "crucix_bridge",
-    "fedspeeches":          "fed_speeches",
-    "noaa_swpc":            "solar",
-    "lunar_ephemeris":      "lunar",
-    "planetary_ephemeris":  "planetary",
-    "institutional_flows":  "etf_flows",
+    # -- High-priority altdata pullers (previously dormant) --
+
+    "congressional":          {"mod": "ingestion.altdata.congressional",          "cls": "CongressionalTradingPuller"},
+    "insider_filings":        {"mod": "ingestion.altdata.insider_filings",        "cls": "InsiderFilingsPuller",
+                               "pull_kwargs": {"days_back": 3}},
+    "dark_pool":              {"mod": "ingestion.altdata.dark_pool",              "cls": "DarkPoolPuller"},
+    "fed_liquidity":          {"mod": "ingestion.altdata.fed_liquidity",          "cls": "FedLiquidityPuller",
+                               "api_key": "FRED_API_KEY"},
+    "institutional_flows":    {"mod": "ingestion.altdata.institutional_flows",    "cls": "InstitutionalFlowsPuller"},
+    "ag_commodity_futures":   {"mod": "ingestion.altdata.ag_commodity_futures",   "cls": "AgCommodityFuturesPuller",
+                               "interval_h": 24},
+    "sec_13f_live":           {"mod": "ingestion.altdata.sec_13f_live",           "fn": "run",
+                               "interval_h": 168},
+    "sec_xbrl_financials":    {"mod": "ingestion.altdata.sec_xbrl_financials",    "cls": "SECXBRLFinancialsPuller",
+                               "pull_kwargs": {"limit": 200}},
+    "sec_xbrl_shares":        {"mod": "ingestion.altdata.sec_xbrl_shares",        "cls": "SECXBRLSharesPuller",
+                               "pull_kwargs": {"limit": 200, "backfill_days": 90}},
+    "gov_contracts":          {"mod": "ingestion.altdata.gov_contracts",          "cls": "GovContractsPuller",
+                               "pull_kwargs": {"days_back": 7}},
+    "legislation":            {"mod": "ingestion.altdata.legislation",            "cls": "LegislationPuller",
+                               "pull_kwargs": {"days_back": 7}},
+    "gdelt":                  {"mod": "ingestion.altdata.gdelt",                  "cls": "GDELTPuller"},
+    "alphavantage_sentiment": {"mod": "ingestion.altdata.alphavantage_sentiment", "cls": "AlphaVantageSentimentPuller"},
+    "prediction_odds":        {"mod": "ingestion.altdata.prediction_odds",        "cls": "PredictionOddsPuller"},
+    "unusual_whales":         {"mod": "ingestion.altdata.unusual_whales",         "cls": "UnusualWhalesPuller"},
+    "smart_money":            {"mod": "ingestion.altdata.smart_money",            "cls": "SmartMoneyPuller"},
+    "supply_chain":           {"mod": "ingestion.altdata.supply_chain",           "cls": "SupplyChainPuller",
+                               "api_key": "FRED_API_KEY"},
+    "supply_chain_parser":    {"mod": "ingestion.altdata.supply_chain_parser",    "fn": "run_weekly",
+                               "interval_h": 168},
+    "pct_cogs_enrichment":    {"mod": "intelligence.pct_cogs_enrichment",         "fn": "run_weekly",
+                               "interval_h": 168},
+    "supply_chain_edge_validator": {"mod": "intelligence.supply_chain_edge_validator", "fn": "run_weekly",
+                               "interval_h": 168},
+    "apple_supplier_list":    {"mod": "ingestion.altdata.apple_supplier_list",    "fn": "run_annual",
+                               "interval_h": 8760},
+    "sec_item_1c_cyber":      {"mod": "ingestion.altdata.sec_item_1c_cyber",      "fn": "run_weekly",
+                               "interval_h": 168},
+    "regulatory_events":      {"mod": "ingestion.altdata.regulatory_events",      "fn": "run_weekly",
+                               "interval_h": 168},
+
+    # -- Lower-priority altdata pullers (batch 2) --
+
+    "earnings_calendar":  {"mod": "ingestion.altdata.earnings_calendar",  "cls": "EarningsCalendarPuller"},
+    "lobbying":           {"mod": "ingestion.altdata.lobbying",           "cls": "LobbyingPuller"},
+    "repo_market":        {"mod": "ingestion.altdata.repo_market",        "cls": "RepoMarketPuller",         "api_key": "FRED_API_KEY"},
+    "yield_curve_full":   {"mod": "ingestion.altdata.yield_curve_full",   "cls": "FullYieldCurvePuller",     "api_key": "FRED_API_KEY"},
+    "world_news":         {"mod": "ingestion.altdata.world_news",         "cls": "WorldNewsPuller"},
+    "social_attention":   {"mod": "ingestion.altdata.social_attention",   "cls": "WikipediaAttentionPuller"},
+    "hf_financial_news":  {"mod": "ingestion.altdata.hf_financial_news",  "cls": "HFFinancialNewsPuller"},
+    "news_scraper":       {"mod": "ingestion.altdata.news_scraper",       "cls": "NewsScraperPuller"},
+    "noaa_ais":           {"mod": "ingestion.altdata.noaa_ais",           "cls": "NOAAAISPuller"},
+    "foia_cables":        {"mod": "ingestion.altdata.foia_cables",        "cls": "FOIACablesPuller"},
+    "offshore_leaks":     {"mod": "ingestion.altdata.offshore_leaks",     "cls": "OffshoreLeaksPuller"},
+    "export_controls":    {"mod": "ingestion.altdata.export_controls",    "cls": "ExportControlsPuller"},
+    "fara":               {"mod": "ingestion.altdata.fara",               "cls": "FARAPuller"},
+
+    # -- Margin debt materializer --
+    "margin_debt":        {"mod": "ingestion.altdata.margin_debt",   "cls": "MarginDebtPuller"},
+
+    # -- DeFi Llama (TVL, stablecoin flows, yields) --
+    "defillama":          {"mod": "ingestion.altdata.defi_llama_puller", "cls": "DefiLlamaPuller"},
+
+    # -- Dune Analytics (smart money, CEX flows, narrative heat) --
+    "dune":               {"mod": "ingestion.altdata.dune_puller",       "cls": "DunePuller",
+                           "api_key": "DUNE_API_KEY", "interval_h": 6},
+
+    # -- New upgraded data sources (2026-03-31) --
+
+    "nyfed_gscpi":        {"mod": "ingestion.altdata.nyfed_gscpi",       "cls": "NYFedGSCPIPuller"},
+    "polymarket":         {"mod": "ingestion.altdata.polymarket",        "cls": "PolymarketPuller"},
+    "kalshi_markets":     {"mod": "ingestion.altdata.kalshi_markets",    "cls": "KalshiMarketsPuller"},
+    "stocktwits":         {"mod": "ingestion.altdata.stocktwits",        "cls": "StockTwitsPuller"},
+    "pmxt_archive":       {"mod": "ingestion.altdata.pmxt_archive",      "cls": "PmxtArchivePuller"},
+    "tiingo":             {"mod": "ingestion.tiingo_pull",               "cls": "TiingoPuller"},
+
+    # -- Historical prediction market dataset (Jon Becker, one-time bulk load) --
+    "pm_history":         {"mod": "ingestion.altdata.prediction_market_history", "cls": "PredictionMarketHistoryPuller"},
+
+    # -- Obsidian vault sync (every ~5 min) --
+    "obsidian":           {"mod": "ingestion.altdata.obsidian_sync",     "fn": "run_sync",                "interval_h": 0.083},
+
+    # -- Clinical trial signal ingestor (daily) --
+    "trial_ingestor":     {"mod": "grid.ingestors.trial_ingestor",      "fn": "main",                    "interval_h": 24},
+
+    # -- Dark alt-data pullers adopted from orphan triage (2026-04-14) --
+    # BasePuller-compatible (instantiated via _resolve_puller with db_engine=engine, pull_all default).
+    "fx_rates":           {"mod": "ingestion.altdata.fx_rates",            "cls": "FXRatesPuller",         "interval_h": 24},
+    "tiingo_news":        {"mod": "ingestion.altdata.tiingo_news",         "cls": "TiingoNewsPuller",      "interval_h": 1},
+    "warn_layoffs":       {"mod": "ingestion.altdata.warn_layoffs",        "cls": "WARNLayoffsPuller",     "interval_h": 24},
+    "wikidata_persons":   {"mod": "ingestion.altdata.wikidata_persons",    "cls": "WikidataPersonPuller",  "interval_h": 168},
+    # Module-level fn entry — pull_all(engine) at module scope.
+    "quiverquant":        {"mod": "ingestion.altdata.quiverquant",         "fn": "pull_all",                "interval_h": 24},
+    # SKIPPED at runtime: these classes use __init__(self, engine) (not db_engine=) and pull() (not pull_all),
+    # so _resolve_puller will fail. Registered for audit/discovery; needs a wrapper or _resolve_puller upgrade
+    # before runtime execution. Track via TODO.
+    "crypto_etf_flows":   {"mod": "ingestion.altdata.crypto_etf_flows",    "cls": "CryptoETFPuller",       "interval_h": 24,  "skip_runtime": "engine= ctor / pull() method mismatch"},
+    "hyperliquid_puller": {"mod": "ingestion.altdata.hyperliquid_puller",  "cls": "HyperliquidPuller",     "interval_h": 1,   "skip_runtime": "engine= ctor / pull() method mismatch"},
+    "onchain_rpc":        {"mod": "ingestion.altdata.onchain_rpc",         "cls": "OnChainRPCPoller",      "interval_h": 1,   "skip_runtime": "engine= ctor / pull() method mismatch"},
+    "whale_alert":        {"mod": "ingestion.altdata.whale_alert",         "cls": "WhaleAlertPuller",      "interval_h": 1,   "skip_runtime": "engine= ctor / pull() method mismatch"},
 }
-
-# Entries that PULLER_REGISTRY structurally cannot carry (fn-based, audit-only
-# skip_runtime stubs) or that simply haven't been wired into the scheduler yet
-# but are catalogued for ``hermes_fixers._resolve_puller`` consumers.
-_SOURCE_EXTRAS: dict[str, dict[str, Any]] = {
-    # ── Module-level fn pullers (not class-based, scheduled via dedicated paths)
-    "sec_13f_live":                {"mod": "ingestion.altdata.sec_13f_live",            "fn": "run",          "interval_h": 168},
-    "supply_chain_parser":         {"mod": "ingestion.altdata.supply_chain_parser",     "fn": "run_weekly",   "interval_h": 168},
-    "pct_cogs_enrichment":         {"mod": "intelligence.pct_cogs_enrichment",          "fn": "run_weekly",   "interval_h": 168},
-    "supply_chain_edge_validator": {"mod": "intelligence.supply_chain_edge_validator",  "fn": "run_weekly",   "interval_h": 168},
-    "apple_supplier_list":         {"mod": "ingestion.altdata.apple_supplier_list",     "fn": "run_annual",   "interval_h": 8760},
-    "sec_item_1c_cyber":           {"mod": "ingestion.altdata.sec_item_1c_cyber",       "fn": "run_weekly",   "interval_h": 168},
-    "regulatory_events":           {"mod": "ingestion.altdata.regulatory_events",       "fn": "run_weekly",   "interval_h": 168},
-    "obsidian":                    {"mod": "ingestion.altdata.obsidian_sync",           "fn": "run_sync",     "interval_h": 0.083},
-    "trial_ingestor":              {"mod": "grid.ingestors.trial_ingestor",             "fn": "main",         "interval_h": 24},
-
-    # ── Class-based pullers catalogued but not yet scheduler-wired
-    # (Adding to PULLER_REGISTRY is the eventual fix; tracking here so
-    # _resolve_puller still finds them when called directly via hermes_fixers.)
-    "vedic_jyotish":   {"mod": "ingestion.celestial.vedic",                    "cls": "VedicAstroPuller"},
-    "chinese_calendar":{"mod": "ingestion.celestial.chinese",                  "cls": "ChineseCalendarPuller"},
-    "pmxt_archive":    {"mod": "ingestion.altdata.pmxt_archive",               "cls": "PmxtArchivePuller"},
-    "pm_history":      {"mod": "ingestion.altdata.prediction_market_history",  "cls": "PredictionMarketHistoryPuller"},
-    "warn_layoffs":    {"mod": "ingestion.altdata.warn_layoffs",               "cls": "WARNLayoffsPuller",     "interval_h": 24},
-
-    # ── skip_runtime stubs (ctor/method signature mismatch — needs wrapper
-    # or _resolve_puller upgrade before they can actually run).
-    "crypto_etf_flows":   {"mod": "ingestion.altdata.crypto_etf_flows",   "cls": "CryptoETFPuller",     "interval_h": 24, "skip_runtime": "engine= ctor / pull() method mismatch"},
-    "hyperliquid_puller": {"mod": "ingestion.altdata.hyperliquid_puller", "cls": "HyperliquidPuller",   "interval_h": 1,  "skip_runtime": "engine= ctor / pull() method mismatch"},
-    "onchain_rpc":        {"mod": "ingestion.altdata.onchain_rpc",        "cls": "OnChainRPCPoller",    "interval_h": 1,  "skip_runtime": "engine= ctor / pull() method mismatch"},
-    "whale_alert":        {"mod": "ingestion.altdata.whale_alert",        "cls": "WhaleAlertPuller",    "interval_h": 1,  "skip_runtime": "engine= ctor / pull() method mismatch"},
-}
-
-# Partial overrides applied AFTER PULLER_REGISTRY derivation. Operator-side
-# retry path (``hermes_fixers._retry_source``) needs fields that differ from
-# the scheduler-side ``method``/``kwargs``. ``edgar`` is the prototypical
-# case: the scheduler runs ``pull_all`` once a day; the retry path runs
-# ``pull_form4_transactions(days_back=3)`` for a fast, scoped recovery.
-# Values are merged on top of the derived entry; pass ``None`` to clear a
-# key set by PULLER_REGISTRY.
-_SOURCE_OVERRIDES: dict[str, dict[str, Any]] = {
-    "edgar":           {"pull_method": "pull_form4_transactions",
-                        "pull_kwargs": {"days_back": 3}},
-    "insider_filings": {"pull_kwargs": {"days_back": 3}},
-    "gov_contracts":   {"pull_kwargs": {"days_back": 7}},
-    "legislation":     {"pull_kwargs": {"days_back": 7}},
-    "fed_speeches":    {"pull_kwargs": {"days_back": 30}},  # alias 'fedspeeches' inherits
-    "cboe":            {"pull_kwargs": {"days_back": 30}},
-    # gdelt retry path uses the default pull_all + no kwargs (faster than the
-    # scheduler's bounded pull_recent path which is tuned for breaking-news
-    # cadence, not for catch-up after a failure).
-    "gdelt":           {"pull_method": None, "pull_kwargs": None},
-}
-
-
-def _build_source_registry() -> dict[str, dict[str, Any]]:
-    """Derive _SOURCE_REGISTRY from PULLER_REGISTRY + extras + aliases.
-
-    Pure function — no I/O. Idempotent: importing this module N times
-    produces N identical dicts.
-
-    Strategy:
-        1. Pull each ``PULLER_REGISTRY`` entry and translate fields.
-        2. Layer ``_SOURCE_EXTRAS`` on top (fn-based + skip_runtime + cls-but-
-           not-scheduler-wired entries).
-        3. Add ``_SOURCE_ALIASES`` so historical cfg-side names continue to
-           resolve to the same underlying entry as their PULLER_REGISTRY twin.
-
-    Returns:
-        dict[str, dict[str, Any]] — same shape as the previous static literal.
-    """
-    # Local import to avoid circular import at module load
-    from ingestion.smart_scheduler import PULLER_REGISTRY
-
-    registry: dict[str, dict[str, Any]] = {}
-    for entry in PULLER_REGISTRY:
-        name = entry["name"]
-        cfg: dict[str, Any] = {"mod": entry["mod"], "cls": entry["cls"]}
-        if "api_key" in entry:
-            cfg["api_key"] = entry["api_key"]
-        method = entry.get("method")
-        if method and method != "pull_all":
-            cfg["pull_method"] = method
-        kwargs = entry.get("kwargs")
-        if kwargs:
-            cfg["pull_kwargs"] = dict(kwargs)
-        freq_h = entry.get("freq_h")
-        if freq_h is not None:
-            cfg["interval_h"] = freq_h
-        registry[name] = cfg
-
-    # Operator-side overrides for ``hermes_fixers._retry_source`` paths that
-    # need different method/kwargs than the scheduler's normal run.
-    for name, override in _SOURCE_OVERRIDES.items():
-        if name in registry:
-            entry = registry[name]
-            for field, value in override.items():
-                if value is None:
-                    entry.pop(field, None)
-                else:
-                    entry[field] = value
-
-    # Extras fill in gaps — PULLER_REGISTRY entries win when a name appears
-    # in both (so that future class-puller additions don't get silently
-    # shadowed by a stale extras stub).
-    for name, cfg in _SOURCE_EXTRAS.items():
-        registry.setdefault(name, dict(cfg))
-
-    # Aliases: cfg-side names that point at the same underlying entry as a
-    # PULLER_REGISTRY name. We share-reference deliberately so that runtime
-    # mutations (none today, defensive for the future) stay in lock-step.
-    for alias, canonical in _SOURCE_ALIASES.items():
-        if canonical in registry:
-            registry[alias] = registry[canonical]
-
-    return registry
-
-
-# Source name → (module_path, class_name, needs_api_key, pull_method).
-# COMPUTED at import time from PULLER_REGISTRY. To add or change a puller,
-# edit ``ingestion/smart_scheduler.py::PULLER_REGISTRY`` (class-based) or
-# ``_SOURCE_EXTRAS`` (fn-based / audit-only) above — NOT a separate literal.
-_SOURCE_REGISTRY: dict[str, dict[str, Any]] = _build_source_registry()
 
 
 # ─── Git sync ────────────────────────────────────────────────────────
@@ -467,18 +410,6 @@ from scripts.hermes_fixers import (  # noqa: E402, F401
 
 # ─── Intelligence task runner (remains in this file) ────────────────────
 
-
-def _minutes_since(ts: datetime | None) -> float:
-    """Return minutes elapsed since *ts*, or a large sentinel if ts is None.
-
-    Mirrors the ``_hours_since`` semantics in scripts/hermes_fixers.py for use
-    by sub-hour cadences like the periodic active-hypothesis scorer.
-    """
-    if ts is None:
-        return 1e9
-    return (datetime.now(timezone.utc) - ts).total_seconds() / 60.0
-
-
 def run_intelligence_tasks(
     engine: Any,
     state: OperatorState,
@@ -517,83 +448,14 @@ def run_intelligence_tasks(
         log.info("[DRY RUN] Would run intelligence tasks")
         return {"skipped": "dry_run"}
 
-    # ── Earnings events → earnings_calendar back-compat sync ────────
-    # Cheap (~50ms single SQL call) so runs FIRST — before the
-    # intelligence_tasks 360s budget can be consumed by slow LLM jobs
-    # later in this function. Calls DB-side
-    # ``sync_earnings_events_to_calendar()`` (see migration
-    # ``20260517_earnings_events_compat.sql``) which mirrors new
-    # ``earnings_events`` rows into the legacy ``earnings_calendar``
-    # table. Function returns (inserted_count, total_events) — logged
-    # for visibility on each fire.
-    if _minutes_since(state.last_earnings_calendar_sync) >= EARNINGS_CALENDAR_SYNC_INTERVAL_MINUTES:
-        def _sync_earnings_events_to_calendar(eng: Any) -> dict[str, Any]:
-            with eng.begin() as conn:
-                row = conn.execute(
-                    text("SELECT inserted_count, total_events "
-                         "FROM sync_earnings_events_to_calendar()")
-                ).fetchone()
-            inserted = int(row[0]) if row and row[0] is not None else 0
-            total = int(row[1]) if row and row[1] is not None else 0
-            return {"inserted": inserted, "total_events": total}
-
-        try:
-            sync_result = _run_intel_task(
-                "earnings_events_to_calendar_sync",
-                _sync_earnings_events_to_calendar,
-                state,
-                engine,
-            )
-            if sync_result:
-                results["earnings_events_to_calendar_sync"] = sync_result
-                log.info(
-                    "earnings_events → earnings_calendar sync: {i} inserted, {t} total source rows",
-                    i=sync_result.get("inserted", 0),
-                    t=sync_result.get("total_events", 0),
-                )
-        except Exception as exc:
-            log.warning("earnings_events_to_calendar sync failed: {e}", e=str(exc))
-        state.last_earnings_calendar_sync = now
-
-    # Periodic active-hypothesis scoring — every 30 minutes, batch up to
-    # 200 overdue hypos per tick. Closes the loop that auto_discover() in
-    # the daily batch was creating but nothing was scoring (the gap
-    # documented in the memo ``project-active-hypo-scoring-gap`` and the
-    # 2026-05-15 handoff). Cadence kept short so the ~25k current overdue
-    # backlog drains across the next ~2-3 days at ~15 scored/sec on grid-svr.
-    # Dedented out of daily_due — was only firing 2:00-2:10 UTC, now every loop
-    if _minutes_since(state.last_active_hypo_scoring) >= ACTIVE_HYPO_SCORING_INTERVAL_MINUTES:
-        try:
-            from intelligence.hypothesis_engine import score_due_active_hypotheses
-            results["active_hypo_scoring"] = _run_intel_task(
-                "active_hypo_scoring",
-                score_due_active_hypotheses,
-                state,
-                engine,
-                batch_size=ACTIVE_HYPO_SCORING_BATCH_SIZE,
-                max_runtime_s=ACTIVE_HYPO_SCORING_MAX_RUNTIME_S,
-            )
-        except Exception as exc:
-            log.warning("Active hypothesis scoring failed: {e}", e=str(exc))
-        state.last_active_hypo_scoring = now
-
     # ── Every 4 hours ────────────────────────────────────────────────
 
     if _hours_since(state.last_trust_cycle) >= 4:
         try:
             from intelligence.trust_scorer import run_trust_cycle
-            tc_result = _run_intel_task(
+            results["trust_cycle"] = _run_intel_task(
                 "trust_cycle", run_trust_cycle, state, engine,
             )
-            results["trust_cycle"] = tc_result
-            # Mirror to Obsidian session log (best-effort).
-            try:
-                from intelligence.obsidian_log import log_trust_cycle
-                scoring = (tc_result or {}).get("scoring") or {}
-                if isinstance(scoring, dict):
-                    log_trust_cycle(scoring)
-            except Exception as exc:  # noqa: BLE001
-                log.debug("Obsidian log_trust_cycle skipped: {e}", e=str(exc))
         except Exception as exc:
             log.warning("Trust cycle import failed: {e}", e=str(exc))
 
@@ -2057,6 +1919,10 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         # Idempotent: skips on quiet cycles unless the hourly heartbeat is due.
         _emit_obsidian_cycle_report(state, cycle_result)
         cycle_result["obsidian_report"] = {"status": "attempted"}
+
+    # Fan a heartbeat / event report into the fleet-wide Obsidian agent-hub.
+    # Idempotent: skips on quiet cycles unless the hourly heartbeat is due.
+    _emit_obsidian_cycle_report(state, cycle_result)
 
     log.info(
         "═══ Cycle {n} complete — {t:.1f}s ═══",

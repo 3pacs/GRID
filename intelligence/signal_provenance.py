@@ -249,7 +249,6 @@ def compute_aggregate_conviction(
     convergence_multiplier: float = 1.0,
     money_flow_multiplier: float = 1.0,
     memory_lesson_multiplier: float = 1.0,
-    edge_signal_multiplier: float = 1.0,
 ) -> float:
     """Combine per-signal conviction weights into a single scalar.
 
@@ -272,12 +271,20 @@ def compute_aggregate_conviction(
     down get a discount. Neutral (1.0) when fewer than two firing
     signals or no calibrated pair history.
     """
+    # Per-signal overrides from intelligence.signal_weight_overrides.
+    # Default-ON, env-gated. Multiplier of 1.0 = no effect.
+    try:
+        from intelligence.signal_weight_overrides import get_override as _signal_override
+    except Exception:  # noqa: BLE001
+        _signal_override = lambda _s: 1.0  # noqa: E731
+
     base = 0.0
     for ev in signal_evidence:
+        override = _signal_override(getattr(ev, "signal_source", ""))
         if ev.scorecard is None:
-            base += ev.shapley_weight * 1.0  # neutral on no-history
+            base += ev.shapley_weight * 1.0 * override  # neutral on no-history
         else:
-            base += ev.shapley_weight * ev.scorecard.conviction_weight
+            base += ev.shapley_weight * ev.scorecard.conviction_weight * override
 
     penalty = 1.0
     penalty *= max(0.0, 1.0 - 0.4 * max(0.0, min(1.0, disagreement_score)))
@@ -310,14 +317,6 @@ def compute_aggregate_conviction(
         MEMORY_LESSON_MULT_MIN,
         min(MEMORY_LESSON_MULT_MAX, float(memory_lesson_multiplier or 1.0)),
     )
-    # 16th layer — EDGE multipliers from the backtest edge_table. Default
-    # 1.0 means "no effect"; non-1.0 only when the caller has computed
-    # the aggregate via ``intelligence.edge_signals
-    # .compute_aggregate_edge_multiplier`` AND
-    # ``GRID_EDGE_SIGNALS_ENABLED`` is on. Bounded the same as a single
-    # edge ([EDGE_MULTIPLIER_MIN, EDGE_MULTIPLIER_MAX]) at the source so
-    # we just need a defensive clamp here matching the existing layers.
-    penalty *= max(0.40, min(1.80, float(edge_signal_multiplier or 1.0)))
 
     return max(0.0, min(1.5, base * penalty))
 
@@ -325,44 +324,17 @@ def compute_aggregate_conviction(
 def _verdict_from_aggregate(conviction: float, confidence: float) -> str:
     """Classify the final trade verdict.
 
-    Rules (deterministic, 2026-05-17 calibration):
+    Rules (deterministic):
       - aggregate conviction < 0.3 → no_trade
       - aggregate conviction < 0.7 OR raw confidence < 0.55 → low
-      - 0.55 <= confidence <= 0.85 (CALIBRATED zone) → high
-      - confidence > 0.85 (SATURATED zone) → medium
+      - aggregate conviction >= 1.15 AND confidence >= 0.7 → high
       - otherwise → medium
-
-    Two interacting issues drove this gate:
-
-    1. Conviction dimension is dead. A 6000-trade probe on grid-svr
-       (2026-05-17) showed every trade's ``aggregate_conviction`` rounds
-       to exactly 1.0 — the 13-layer adjuster chain is at neutral defaults
-       because the upstream calibration substrate (per_signal_brier_history,
-       confidence_bucket_tracker, regime_brier, meta_learning_matrix) is
-       sparse. Each adjuster falls through to its defensive 1.0 default.
-       Restore the two-axis gate ``conviction >= 1.15 AND confidence >= 0.7``
-       once the substrate repopulates with backdated last_updated (see
-       follow-up: backdate bootstrap_per_signal_brier).
-
-    2. Confidence has a saturated 0.95 cap. ``oracle/engine.py``,
-       ``intelligence/news_impact.py``, ``oracle/contrast_distillation.py``,
-       ``oracle/psi_model.py``, ``oracle/forecaster_adapter.py``, and
-       ``store/astrogrid.py`` all clamp raw confidence at ``min(0.95, ...)``
-       without per-model calibration. Result: 612 of 677 trades with
-       confidence >= 0.90 land at exactly 0.950; they are the worst-
-       performing cohort in the audit (hit = 16.8%, mean_pnl = -1.69%).
-       Until those caps are tightened or replaced with per-model
-       reliability curves, the HIGH gate excludes confidence > 0.85 so the
-       bucket isolates the calibrated 0.55-0.85 zone where the audit was
-       previously discovering sharpe = +2.01 alpha under the MEDIUM label.
-
-    See PR #192 (HIGH on confidence alone) + this PR (tighten upper bound).
     """
     if conviction < 0.3:
         return "no_trade"
     if conviction < 0.7 or confidence < 0.55:
         return "low"
-    if 0.55 <= confidence <= 0.85:
+    if conviction >= 1.15 and confidence >= 0.7:
         return "high"
     return "medium"
 

@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
@@ -1287,27 +1286,10 @@ class OracleEngine:
                             journal_mult = journal_bias.get(
                                 "confidence_multiplier", 1.0,
                             )
-                            # Per-model reliability calibration — see
-                            # intelligence.confidence_calibration for why the
-                            # old blanket min(0.95, ...) was demoted in favour
-                            # of an empirical lookup against
-                            # confidence_reliability_curves.
-                            adjusted = pred.confidence * journal_mult
-                            try:
-                                from intelligence.confidence_calibration import (
-                                    calibrate_confidence,
-                                )
-                                adjusted = calibrate_confidence(
-                                    adjusted,
-                                    getattr(pred, "model_name", "") or "",
-                                    self.engine,
-                                )
-                            except Exception:  # pragma: no cover — defensive
-                                adjusted = min(0.95, adjusted)
                             pred = replace(
                                 pred,
                                 confidence=round(
-                                    max(0.0, min(0.95, adjusted)), 4,
+                                    min(0.95, pred.confidence * journal_mult), 4,
                                 ),
                                 model_weights={
                                     m.name: m.weight for m in self.models
@@ -1385,6 +1367,54 @@ class OracleEngine:
                 if len(signals) < 3:
                     continue  # Not enough data for this model
 
+                # ── Per-signal weight overrides ──────────────────────
+                # Multipliers from intelligence.signal_weight_overrides
+                # derived from the trade_postmortems corpus. This is
+                # where the DEFERRED set (alpha_research:vix_exposure,
+                # alpha_research:credit_cycle, news_intel, ...) actually
+                # bites — these signals live in signals.items[] (here)
+                # and don't reach signal_provenance's evidence loop.
+                # Per 2026-05-13 advisory:
+                #   alpha_research:vix_exposure  ×1.40 (1826r/0w)
+                #   alpha_research:credit_cycle  ×0.20 (0r/1826w, suspected sign-inverted)
+                #   news_intel                    ×0.60 (102r/204w)
+                # Master switch GRID_SIGNAL_OVERRIDES_ENABLED (default ON).
+                try:
+                    from intelligence.signal_weight_overrides import (
+                        SIGNAL_WEIGHT_OVERRIDES,
+                        DEFERRED_SIGNAL_OVERRIDES,
+                        SIGNAL_OVERRIDES_ENABLED,
+                        SIGNAL_OVERRIDE_MIN,
+                        SIGNAL_OVERRIDE_MAX,
+                    )
+                    if SIGNAL_OVERRIDES_ENABLED:
+                        # Merge bare-name + full-name overrides — bare
+                        # for asset families (equity/vol/...), full for
+                        # the deferred research signals (alpha_research:*,
+                        # news_intel).
+                        _merged_overrides = {
+                            **SIGNAL_WEIGHT_OVERRIDES,
+                            **DEFERRED_SIGNAL_OVERRIDES,
+                        }
+                        for i, sig in enumerate(signals):
+                            mult = _merged_overrides.get(sig.name)
+                            if mult is None:
+                                # Try the bare family name too (signals
+                                # sometimes carry just "vol" instead of
+                                # "feature:vol").
+                                mult = _merged_overrides.get(
+                                    getattr(sig, "family", "")
+                                )
+                            if mult is None:
+                                continue
+                            mult = max(
+                                SIGNAL_OVERRIDE_MIN,
+                                min(SIGNAL_OVERRIDE_MAX, float(mult)),
+                            )
+                            signals[i] = replace(sig, weight=sig.weight * mult)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("signal_weight_overrides skipped: {e}", e=str(exc))
+
                 # Compute net direction
                 bull_score = sum(s.z_score * s.weight for s in signals if s.direction == "bullish")
                 bear_score = sum(abs(s.z_score) * s.weight for s in signals if s.direction == "bearish")
@@ -1404,46 +1434,6 @@ class OracleEngine:
 
                 # Signal strength = net score - anti-signal deduction
                 signal_strength = max(0, net_score - anti_deduction)
-
-                # ── Anti-signal VETO ─────────────────────────────────
-                # Per intelligence/postmortem.py:1326-1343, the system
-                # classifies a prediction as "Anti-signals warned but
-                # were overridden" when 2+ anti-signals with severity
-                # > 0.5 fired and the prediction was emitted anyway.
-                # The trade_postmortems table has 29,973 such rows
-                # (top 30%+ of all wrong_signal failures); they
-                # disproportionately cluster on PUT calls for tickers
-                # in long uptrends (V, PYPL, CI, CRM, BLK, MA, PFE...
-                # all went UP after the PUT call).
-                #
-                # Pre-2026-05-13 these only attenuated signal_strength
-                # by ``anti_deduction`` (max 0.3) — not enough to flip
-                # the call. Now: 2+ high-severity anti-signals (>0.5)
-                # OR cumulative severity >= ANTI_SIGNAL_VETO_SUM is a
-                # hard veto. Configurable via env so the operator can
-                # tune; default ON.
-                _veto_min_count = int(os.environ.get("GRID_ANTI_VETO_HIGH_COUNT", "2"))
-                _veto_high_sev = float(os.environ.get("GRID_ANTI_VETO_HIGH_SEVERITY", "0.5"))
-                _veto_sum_threshold = float(os.environ.get("GRID_ANTI_VETO_SUM", "1.2"))
-                _veto_enabled = os.environ.get("GRID_ANTI_VETO_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
-                if _veto_enabled and anti_signals:
-                    high_sev_count = sum(
-                        1 for a in anti_signals if a.severity > _veto_high_sev
-                    )
-                    total_severity = sum(a.severity for a in anti_signals)
-                    if (
-                        high_sev_count >= _veto_min_count
-                        or total_severity >= _veto_sum_threshold
-                    ):
-                        log.info(
-                            "oracle: VETO {dir} on {tk} — "
-                            "{hc} high-severity anti-signals (>{thr}), "
-                            "total severity {ts:.2f}",
-                            dir=direction, tk=ticker,
-                            hc=high_sev_count, thr=_veto_high_sev,
-                            ts=total_severity,
-                        )
-                        continue  # skip this prediction entirely
                 coherence = self._compute_coherence(signals, direction)
 
                 # ── Convergence amplification ──────────────────────
@@ -1481,22 +1471,7 @@ class OracleEngine:
                 journal_mult = journal_bias.get("confidence_multiplier", 1.0)
                 raw_confidence *= journal_mult
 
-                # Per-model reliability curve (intelligence.confidence_calibration):
-                # the prior cap was a blanket min(0.95, ...) regardless of how
-                # the model historically performs at this raw range. That produced
-                # the saturated 612-trade cluster pinned at 0.950 with hit-rate
-                # 16.8% that PRs #187/#192/#193 surfaced. Calibrating routes the
-                # raw value through the model's empirical reliability curve so a
-                # model that hits 0% at raw>=0.9 is downgraded to ~0 instead of
-                # being clamped to 0.95. Falls back to the raw value when the
-                # model has no curve data (cold start).
-                raw_capped = max(0.05, min(1.0, raw_confidence / 5.0))
-                try:
-                    from intelligence.confidence_calibration import calibrate_confidence
-                    confidence = calibrate_confidence(raw_capped, model.name, self.engine)
-                    confidence = max(0.05, min(0.95, confidence))
-                except Exception:  # pragma: no cover — defensive fallback
-                    confidence = min(0.95, raw_capped)
+                confidence = min(0.95, max(0.05, raw_confidence / 5.0))  # Normalize to 0-1
 
                 # Expected move (conservative estimate)
                 expected_move = signal_strength * 0.5  # 0.5% per unit of signal strength
@@ -2007,24 +1982,11 @@ class OracleEngine:
             return None
 
     def _get_price_at_date(self, ticker: str, target_date: date) -> float | None:
-        """Get price at or near a specific date for scoring.
-
-        For ``target_date >= today`` we use an EQUALITY match instead of
-        ``<=`` — the market hasn't closed on the expiry day yet, so falling
-        back to an earlier close would lock in the wrong actual_price and
-        flip the verdict to a final state that the post-close scorer would
-        then skip (verdict != 'pending'). When the same-day close hasn't
-        been ingested, return None and leave the prediction pending.
-        (2026-05-15: caught after 2.27M Friday-expiry predictions got scored
-        Thursday night against Thursday's close.)
-        """
-        same_day_only = target_date >= date.today()
-        date_filter = "signal_date = :d" if same_day_only else "signal_date <= :d"
-        raw_date_filter = "obs_date = :d" if same_day_only else "obs_date <= :d"
+        """Get price at or near a specific date for scoring."""
         with self.engine.connect() as conn:
-            row = conn.execute(text(f"""
+            row = conn.execute(text("""
                 SELECT spot_price FROM options_daily_signals
-                WHERE ticker = :t AND {date_filter} AND spot_price > 0
+                WHERE ticker = :t AND signal_date <= :d AND spot_price > 0
                 ORDER BY signal_date DESC LIMIT 1
             """), {"t": ticker, "d": target_date}).fetchone()
             if row:
@@ -2032,19 +1994,19 @@ class OracleEngine:
             # Fallback: try direct ticker, then USD suffix (for crypto)
             for sid in [f"YF:{ticker}:adj_close", f"YF:{ticker}:close",
                        f"YF:{ticker}-USD:adj_close", f"YF:{ticker}-USD:close"]:
-                row = conn.execute(text(f"""
+                row = conn.execute(text("""
                     SELECT value FROM raw_series
-                    WHERE series_id = :sid AND {raw_date_filter} AND pull_status = 'SUCCESS'
+                    WHERE series_id = :sid AND obs_date <= :d AND pull_status = 'SUCCESS'
                     ORDER BY obs_date DESC LIMIT 1
                 """), {"sid": sid, "d": target_date}).fetchone()
                 if row:
                     return float(row[0])
             # Last resort: resolved_series
-            row = conn.execute(text(f"""
+            row = conn.execute(text("""
                 SELECT rs.value FROM resolved_series rs
                 JOIN feature_registry fr ON fr.id = rs.feature_id
                 WHERE (fr.name = :n1 OR fr.name = :n2)
-                AND {raw_date_filter} AND rs.value IS NOT NULL
+                AND rs.obs_date <= :d AND rs.value IS NOT NULL
                 ORDER BY rs.obs_date DESC LIMIT 1
             """), {
                 "n1": f"{ticker.lower()}_full",
