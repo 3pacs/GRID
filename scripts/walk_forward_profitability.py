@@ -206,18 +206,18 @@ def _verdict_call(buckets: dict[str, BucketStats]) -> str:
     # walk_forward_validate._build_narrative.
     if hr_lift_pp >= 5.0 and pnl_lift_pp > 0 and sharpe_lift > 0:
         return (
-            f"CALIBRATED — HIGH beats MEDIUM by {hr_lift_pp:.1f}pp hit rate, "
+            f"CALIBRATED — HIGH beats MEDIUM by {hr_lift_pp:.1f}pp hit-or-partial, "
             f"{pnl_lift_pp:+.2f}% mean PnL, sharpe lift {sharpe_lift:+.2f}"
         )
     if hr_lift_pp <= -5.0 or pnl_lift_pp < 0 or sharpe_lift < -0.5:
         return (
             f"BROKEN — HIGH underperforms MEDIUM "
-            f"({hr_lift_pp:+.1f}pp hit rate, {pnl_lift_pp:+.2f}% PnL, "
+            f"({hr_lift_pp:+.1f}pp hit-or-partial, {pnl_lift_pp:+.2f}% PnL, "
             f"sharpe {sharpe_lift:+.2f})"
         )
     return (
         f"INCONCLUSIVE — HIGH vs MEDIUM gap is small "
-        f"({hr_lift_pp:+.1f}pp, {pnl_lift_pp:+.2f}%, sharpe {sharpe_lift:+.2f})"
+        f"({hr_lift_pp:+.1f}pp hit-or-partial, {pnl_lift_pp:+.2f}%, sharpe {sharpe_lift:+.2f})"
     )
 
 
