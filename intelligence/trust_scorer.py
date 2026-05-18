@@ -1801,12 +1801,20 @@ class TrustScorer:
 
         # Translate contract verdicts (HIT/MISS/PARTIAL) into the
         # trust_scorer outcome enum (CORRECT/WRONG) used by signal_sources.
+        # oracle_predictions.verdict is lowercase; the contract enum is
+        # uppercase. Normalize to lowercase + strip whitespace so both
+        # producers map correctly, and short-circuit unknown/empty/None
+        # verdicts so we never overwrite a PENDING row with "WRONG" by
+        # accident (the historical #119-family bug).
         outcome_map = {
-            "HIT": "CORRECT",
-            "PARTIAL": "CORRECT",
-            "MISS": "WRONG",
+            "hit": "CORRECT",
+            "partial": "CORRECT",
+            "miss": "WRONG",
         }
-        outcome = outcome_map.get(str(verdict), "WRONG")
+        verdict_key = str(verdict).strip().lower() if verdict is not None else ""
+        if verdict_key not in outcome_map:
+            return 0
+        outcome = outcome_map[verdict_key]
         now = datetime.now(timezone.utc)
 
         ids: list[str] = []
