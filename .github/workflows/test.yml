@@ -71,7 +71,7 @@ jobs:
           fi
 
           set +e
-          python -m pytest tests/ -v --tb=short -x --timeout=60 > /tmp/grid-pytest-output.txt 2>&1
+          python -m pytest tests/ -v --tb=short --maxfail=50 --timeout=60 > /tmp/grid-pytest-output.txt 2>&1
           pytest_status=$?
           set -e
 
