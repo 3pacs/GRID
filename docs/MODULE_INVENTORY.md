@@ -1,8 +1,8 @@
 # GRID Module Inventory
 
-Generated: 2026-05-17
-Total modules: 746
-Total LOC: 327,249
+Generated: 2026-05-18
+Total modules: 749
+Total LOC: 329,681
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycache__/`, `build/`, `dist/`, `docs/`, `node_modules/`, `notebooks/`, `pwa/`, `pwa_dist/`, `tests/`, `venv/`.
@@ -11,9 +11,9 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 
 | Directory | Module count | LOC |
 |---|---|---|
-| `intelligence/` | 171 | 101,005 |
-| `ingestion/` | 204 | 83,951 |
-| `api/` | 107 | 48,162 |
+| `intelligence/` | 171 | 101,287 |
+| `ingestion/` | 207 | 85,797 |
+| `api/` | 107 | 48,466 |
 | `analysis/` | 33 | 18,973 |
 | `trading/` | 34 | 14,158 |
 | `oracle/` | 29 | 10,495 |
@@ -248,7 +248,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`, `datetime`, `hashlib`, `json`, `loguru`, `re`, `sqlalchemy`, `typing`
 **Imported by:** `api/routers/intelligence_news.py`, `ingestion/scheduler.py`
 
-#### `intelligence/catalyst_aggregator.py` — 416 LOC
+#### `intelligence/catalyst_aggregator.py` — 464 LOC
 **Docstring:** ALPHA-4 — Unified catalyst calendar + catalyst-aware scoring.
 **Functions:** `CatalystEvent`, `events_for_window`, `nearest_catalyst`, `proximity_score`, `upcoming_catalysts_summary`
 **Reads:** `__future__`, `dataclasses`, `datetime`, `loguru`, `math`, `sqlalchemy`, `typing`
@@ -429,7 +429,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `collections`, `dataclasses`, `datetime`, `db`, `hashlib`, `json`, `loguru`, `pathlib`, `re`, `sqlalchemy`, `sys`, `typing`, `unicodedata`
 **Imported by:** `api/routers/intelligence_spider.py`, `intelligence/spider/__init__.py`, `intelligence/spider/daemon.py`, `intelligence/spider/discovery.py`
 
-#### `intelligence/event_sequence.py` — 997 LOC
+#### `intelligence/event_sequence.py` — 1058 LOC
 **Docstring:** GRID Intelligence — Event Sequence Builder.
 **Functions:** `Event`, `build_sequence`, `build_sector_sequence`, `compute_lead_times`, `find_recurring_patterns`, `build_sequence_with_lead_times`, `events_to_dicts`
 **Reads:** `__future__`, `analysis`, `collections`, `dataclasses`, `datetime`, `intelligence`, `json`, `loguru`, `sqlalchemy`, `typing`
@@ -700,7 +700,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `datetime`, `ingestion`, `loguru`, `re`, `sqlalchemy`, `threading`, `typing`
 **Imported by:** `api/routers/chat.py`, `intelligence/freshness_guard.py`
 
-#### `intelligence/postmortem.py` — 2232 LOC
+#### `intelligence/postmortem.py` — 2258 LOC
 **Docstring:** GRID Intelligence — Automated Post-Mortem Analysis for Failed Trades & Predictions.
 **Functions:** `PostMortem`, `generate_postmortem`, `generate_prediction_postmortem`, `batch_postmortem`, `generate_lessons_learned`, `record_success_lesson`, `load_postmortems_top_n`, `count_postmortems`, `load_postmortems`, `apply_contagion_feedback`
 **Reads:** `__future__`, `collections`, `contracts`, `dataclasses`, `datetime`, `db`, `decimal`, `intelligence`, `json`, `llm`, `loguru`, `sqlalchemy`, `typing`, `uuid`
@@ -897,10 +897,10 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Docstring:** GRID Connection Mapping Spider — discovers and maps actor relationships.
 **Reads:** `intelligence`
 
-#### `intelligence/spider/daemon.py` — 190 LOC
+#### `intelligence/spider/daemon.py` — 250 LOC
 **Docstring:** Spider daemon — continuous connection mapping loop.
 **Functions:** `run_spider`
-**Reads:** `__future__`, `argparse`, `db`, `intelligence`, `loguru`, `sys`, `time`, `typing`
+**Reads:** `__future__`, `argparse`, `db`, `intelligence`, `loguru`, `os`, `sys`, `time`, `typing`, `urllib`
 
 #### `intelligence/spider/discovery.py` — 99 LOC
 **Docstring:** Discovery orchestrator — fans out to source adapters and deduplicates results.
@@ -1008,7 +1008,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`, `datetime`, `json`, `loguru`, `math`, `sqlalchemy`, `typing`
 **Imported by:** `api/routers/tps.py`, `ingestion/scheduler.py`
 
-#### `intelligence/trust_scorer.py` — 1904 LOC
+#### `intelligence/trust_scorer.py` — 1991 LOC
 **Docstring:** GRID Intelligence — Source Trust Scoring Framework.
 **Functions:** `SourceScore`, `ConvergenceEvent`, `score_pending_signals`, `update_trust_scores`, `write_trust_scores_cache`, `load_trust_scores_cached`, `get_trusted_sources`, `get_insider_edge`, `detect_convergence`, `generate_trust_report`, `run_trust_cycle`, `register_signal`, `TrustScorer`
 **Reads:** `__future__`, `api`, `dataclasses`, `datetime`, `db`, `intelligence`, `json`, `llm`, `loguru`, `math`, `sqlalchemy`, `typing`, `yfinance`
@@ -1033,6 +1033,13 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 
 #### `ingestion/altdata/__init__.py` — 13 LOC
 **Docstring:** GRID alternative data ingestion modules.
+
+#### `ingestion/altdata/_deprecated/__init__.py` — 0 LOC
+
+#### `ingestion/altdata/_deprecated/noaa_ais.py` — 251 LOC
+**Docstring:** GRID NOAA AIS vessel traffic ingestion module.
+**Functions:** `NOAAAISPuller`
+**Reads:** `__future__`, `datetime`, `ingestion`, `io`, `loguru`, `pandas`, `requests`, `sqlalchemy`, `tenacity`, `time`, `typing`
 
 #### `ingestion/altdata/aaii_sentiment.py` — 509 LOC
 **Docstring:** GRID AAII Sentiment Survey ingestion module.
@@ -1439,12 +1446,6 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`, `datetime`, `hashlib`, `ingestion`, `intelligence`, `json`, `llm`, `loguru`, `re`, `requests`, `sqlalchemy`, `time`, `typing`, `xml`
 **Imported by:** `ingestion/scheduler.py`
 
-#### `ingestion/altdata/noaa_ais.py` — 251 LOC
-**Docstring:** GRID NOAA AIS vessel traffic ingestion module.
-**Functions:** `NOAAAISPuller`
-**Reads:** `__future__`, `datetime`, `ingestion`, `io`, `loguru`, `pandas`, `requests`, `sqlalchemy`, `tenacity`, `time`, `typing`
-**Imported by:** `ingestion/scheduler.py`
-
 #### `ingestion/altdata/nyfed.py` — 635 LOC
 **Docstring:** GRID NY Fed data ingestion module.
 **Functions:** `NYFedPermanentError`, `NYFedPuller`
@@ -1590,7 +1591,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `analysis`, `datetime`, `db`, `json`, `loguru`, `os`, `pathlib`, `requests`, `sqlalchemy`, `time`, `typing`
 **Imported by:** `ingestion/altdata/sec_xbrl_shares.py`, `ingestion/scheduler.py`
 
-#### `ingestion/altdata/sec_xbrl_shares.py` — 480 LOC
+#### `ingestion/altdata/sec_xbrl_shares.py` — 514 LOC
 **Docstring:** SEC XBRL shares-outstanding ingestor for daily market_cap computation.
 **Functions:** `SECXBRLSharesPuller`
 **Reads:** `__future__`, `datetime`, `db`, `ingestion`, `loguru`, `sqlalchemy`, `time`, `typing`
@@ -1613,10 +1614,10 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `datetime`, `db`, `hashlib`, `ingestion`, `json`, `loguru`, `re`, `requests`, `sqlalchemy`, `time`, `typing`
 **Imported by:** `ingestion/scheduler.py`
 
-#### `ingestion/altdata/social_attention.py` — 378 LOC
+#### `ingestion/altdata/social_attention.py` — 937 LOC
 **Docstring:** GRID social attention data ingestion.
-**Functions:** `WikipediaAttentionPuller`, `EdgarViewsPuller`, `GoogleTrendsPuller`
-**Reads:** `__future__`, `datetime`, `ingestion`, `loguru`, `pytrends`, `requests`, `time`, `typing`
+**Functions:** `WikipediaAttentionPuller`, `EdgarViewsPuller`, `GoogleTrendsPuller`, `main`
+**Reads:** `__future__`, `argparse`, `datetime`, `db`, `ingestion`, `loguru`, `pytrends`, `requests`, `sqlalchemy`, `time`, `typing`, `urllib`
 
 #### `ingestion/altdata/social_port_activity.py` — 879 LOC
 **Docstring:** Ground-truth social-feed observation layer for port activity.
@@ -1682,10 +1683,10 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Functions:** `UKCompaniesHousePuller`
 **Reads:** `__future__`, `datetime`, `ingestion`, `json`, `loguru`, `os`, `re`, `requests`, `sqlalchemy`, `time`, `typing`
 
-#### `ingestion/altdata/unusual_whales.py` — 521 LOC
+#### `ingestion/altdata/unusual_whales.py` — 609 LOC
 **Docstring:** GRID Unusual Options Flow (Whale Tracking) ingestion module.
 **Functions:** `UnusualWhalesPuller`
-**Reads:** `__future__`, `datetime`, `db`, `ingestion`, `json`, `loguru`, `sqlalchemy`, `time`, `typing`, `yfinance`
+**Reads:** `__future__`, `datetime`, `db`, `ingestion`, `json`, `loguru`, `math`, `sqlalchemy`, `time`, `typing`, `yfinance`
 **Imported by:** `ingestion/scheduler.py`
 
 #### `ingestion/altdata/usaspending_puller.py` — 89 LOC
@@ -1755,7 +1756,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Docstring:** Base puller class for GRID data ingestion.
 **Functions:** `log_pull_failure`, `retry_on_failure`, `BasePuller`
 **Reads:** `__future__`, `datetime`, `functools`, `ingestion`, `json`, `loguru`, `math`, `random`, `sqlalchemy`, `time`, `typing`
-**Imported by:** `ingestion/altdata/aaii_sentiment.py`, `ingestion/altdata/actor_news_puller.py`, `ingestion/altdata/ads_index.py`, `ingestion/altdata/ag_commodity_futures.py`, `ingestion/altdata/ais_ground_truth.py`, `ingestion/altdata/alphavantage_sentiment.py`, `ingestion/altdata/analyst_ratings.py`, `ingestion/altdata/asset_registries.py`, … (+150)
+**Imported by:** `ingestion/altdata/_deprecated/noaa_ais.py`, `ingestion/altdata/aaii_sentiment.py`, `ingestion/altdata/actor_news_puller.py`, `ingestion/altdata/ads_index.py`, `ingestion/altdata/ag_commodity_futures.py`, `ingestion/altdata/ais_ground_truth.py`, `ingestion/altdata/alphavantage_sentiment.py`, `ingestion/altdata/analyst_ratings.py`, … (+151)
 
 #### `ingestion/bls.py` — 284 LOC
 **Docstring:** GRID BLS data ingestion module.
@@ -1817,6 +1818,11 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Docstring:** GRID DexScreener data ingestion module.
 **Functions:** `DexScreenerPuller`
 **Reads:** `__future__`, `datetime`, `db`, `ingestion`, `loguru`, `requests`, `sqlalchemy`, `time`, `typing`
+
+#### `ingestion/earnings_events_puller.py` — 860 LOC
+**Docstring:** SEC EDGAR + AlphaVantage earnings events puller (Task #151).
+**Functions:** `EarningsEventsPuller`, `main`
+**Reads:** `__future__`, `argparse`, `datetime`, `db`, `ingestion`, `json`, `loguru`, `os`, `re`, `requests`, `sqlalchemy`, `sys`, `time`, `typing`
 
 #### `ingestion/edgar.py` — 531 LOC
 **Docstring:** GRID SEC EDGAR data ingestion module.
@@ -2072,7 +2078,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`
 **Imported by:** `ingestion/base.py`, `oracle/sanity_checker.py`
 
-#### `ingestion/scheduler.py` — 1555 LOC
+#### `ingestion/scheduler.py` — 1549 LOC
 **Docstring:** GRID unified ingestion scheduler.
 **Functions:** `run_pull_group`, `backfill_all`, `run_pushshift_backfill`, `run_daily_pulls`, `run_monthly_pulls`, `start_scheduler`
 **Reads:** `__future__`, `alerts`, `config`, `datetime`, `db`, `discovery`, `ingestion`, `intelligence`, `loguru`, `schedule`, `scripts`, `sqlalchemy`, `sys`, `time`, `tqdm`, `typing`
@@ -2093,10 +2099,10 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Functions:** `ClassificationResult`, `classify_signal_text`, `classify_recent_signals`, `narrate_anomalies`, `map_signal_knowledge`
 **Reads:** `__future__`, `dataclasses`, `gemma`, `loguru`, `sqlalchemy`, `typing`
 
-#### `ingestion/smart_scheduler.py` — 504 LOC
+#### `ingestion/smart_scheduler.py` — 594 LOC
 **Docstring:** GRID Smart Scheduler — runs only due/stale pullers per cycle.
 **Functions:** `MissingPullerApiKey`, `SmartScheduler`
-**Reads:** `__future__`, `datetime`, `importlib`, `loguru`, `os`, `sqlalchemy`, `threading`, `time`, `typing`
+**Reads:** `__future__`, `datetime`, `importlib`, `loguru`, `os`, `scripts`, `sqlalchemy`, `threading`, `time`, `typing`
 
 #### `ingestion/social_sentiment.py` — 294 LOC
 **Docstring:** Social sentiment ingestor — Reddit, Bluesky, Google Trends.
@@ -2157,6 +2163,12 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `datetime`, `ingestion`, `loguru`, `numpy`, `os`, `pandas`, `requests`, `sqlalchemy`, `tenacity`, `time`, `typing`
 **Imported by:** `ingestion/scheduler.py`
 
+#### `ingestion/watchlist_resolver.py` — 221 LOC
+**Docstring:** Shared ticker-universe resolver for ingestion pullers (Tasks #185 + #182).
+**Functions:** `resolve_universe`
+**Reads:** `__future__`, `loguru`, `sqlalchemy`, `typing`
+**Imported by:** `ingestion/altdata/social_attention.py`, `ingestion/earnings_events_puller.py`
+
 #### `ingestion/web_scraper.py` — 786 LOC
 **Docstring:** GRID Web Scraper — multi-source data collection with cross-verification.
 **Functions:** `WebScraperPuller`
@@ -2197,7 +2209,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `api`, `contextlib`, `langfuse`, `typing`
 **Imported by:** `api/routers/intelligence_actors.py`, `api/routers/intelligence_deepdive.py`, `api/routers/intelligence_thesis.py`
 
-#### `api/main.py` — 724 LOC
+#### `api/main.py` — 736 LOC
 **Docstring:** GRID Intelligence API — FastAPI application entry point.
 **Functions:** `lifespan`, `SecurityHeadersMiddleware`, `RateLimitMiddleware`, `X402PaymentMiddleware`, `broadcast_event`, `recent_realtime_events`, `websocket_endpoint`
 **Reads:** `__future__`, `agents`, `alerts`, `api`, `asyncio`, `collections`, `config`, `contextlib`, `contracts`, `datetime`, `db`, `events`, `fastapi`, `importlib`, `json`, `loguru`, `oracle`, `orchestration`, `os`, `pathlib`, `payments`, `starlette`, `subnet`, `threading`, `time`, `typing`
@@ -2415,9 +2427,9 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Functions:** `Tier`, `intel_search`, `intel_entity_profile`, `intel_actor_dossier`, `intel_ticker`, `intel_cross_reference`, `intel_deep_dive`, `intel_network`, `intel_market_brief`, `intel_predictions_active`, `intel_predictions_track_record`, `intel_briefing`
 **Reads:** `__future__`, `api`, `dataclasses`, `datetime`, `enum`, `fastapi`, `intelligence`, `json`, `loguru`, `sqlalchemy`, `time`, `typing`
 
-#### `api/routers/intel_cross_reference.py` — 220 LOC
+#### `api/routers/intel_cross_reference.py` — 266 LOC
 **Docstring:** Cross-reference intelligence endpoints — lie detector for government statistics.
-**Functions:** `get_cross_reference`, `get_cross_reference_by_category`, `get_cross_reference_for_ticker`, `get_cross_reference_history`
+**Functions:** `get_cross_reference`, `get_cross_reference_narrative`, `get_cross_reference_by_category`, `get_cross_reference_for_ticker`, `get_cross_reference_history`
 **Reads:** `__future__`, `api`, `dataclasses`, `fastapi`, `intelligence`, `loguru`, `threading`, `time`, `typing`
 
 #### `api/routers/intel_source_audit.py` — 120 LOC
@@ -2493,10 +2505,11 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Functions:** `search_intelligence`, `refresh_intelligence_search`
 **Reads:** `__future__`, `api`, `fastapi`, `loguru`, `sqlalchemy`
 
-#### `api/routers/intelligence_spider.py` — 240 LOC
+#### `api/routers/intelligence_spider.py` — 486 LOC
 **Docstring:** Spider API endpoints — status, stats, inject, neighborhood, path finding.
-**Functions:** `get_graph`, `InjectActorRequest`, `get_neighborhood`, `get_shortest_path`, `get_actor_connections`, `get_spider_stats`, `inject_actor`
-**Reads:** `__future__`, `api`, `fastapi`, `intelligence`, `os`, `pydantic`, `threading`, `typing`
+**Functions:** `refresh_graph`, `warm_graph_async`, `get_graph_info`, `get_graph`, `InjectActorRequest`, `get_neighborhood`, `get_shortest_path`, `get_actor_connections`, `get_spider_stats`, `graph_health`, `graph_reload`, `inject_actor`
+**Reads:** `__future__`, `api`, `fastapi`, `intelligence`, `loguru`, `os`, `pydantic`, `threading`, `time`, `typing`
+**Imported by:** `api/main.py`
 
 #### `api/routers/intelligence_thesis.py` — 565 LOC
 **Docstring:** Intelligence sub-router: Thesis, sleuth/leads, and market diary endpoints.
