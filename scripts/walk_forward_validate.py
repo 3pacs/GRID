@@ -499,8 +499,6 @@ class _FrozenPrediction:
 def build_time_frozen_provenance(
     prediction_row: dict[str, Any],
     scorecards_at_time: dict[str, SignalScorecard],
-    *,
-    engine: Any = None,
 ) -> TradeProvenanceReport:
     """Reconstruct a ``TradeProvenanceReport`` using only data that existed
     at the prediction's ``created_at``.
@@ -568,44 +566,12 @@ def build_time_frozen_provenance(
     disagreement_score = float(signals.get("disagreement_score", 0.0) or 0.0)
     red_team_risk = float(signals.get("red_team_epistemic_risk", 0.0) or 0.0)
 
-    # EDGE-table multiplier — no-op (returns 1.0) when
-    # ``GRID_EDGE_SIGNALS_ENABLED`` is off (or no engine passed), so
-    # production behaviour is unchanged until the operator opts in.
-    #
-    # We route through ``edge_multiplier_for_prediction`` rather than
-    # ``compute_aggregate_edge_multiplier(signal_evidence, ticker)``
-    # because the edge_table keys on signal-source ``source_type``
-    # (insider / quiverquant:offexchange / smart_money / ...), which
-    # is the ``signal_sources`` table's schema — not the Shapley
-    # feature names that ``signal_evidence.signal_source`` carries
-    # (equity / vol / ci_full / aapl_pcr / ...). Bridging via a
-    # signal_sources lookup costs one short SELECT per prediction
-    # and lets the multiplier actually fire.
-    from intelligence.edge_signals import edge_multiplier_for_prediction
-    # Pass the prediction's direction so the multiplier flips IC sign
-    # when the signal's natural direction opposes the prediction. Pre-
-    # 2026-05-13 the lookup was direction-agnostic and would happily
-    # boost CALL predictions that had a strongly-bearish insider-SELL
-    # signal on their ticker — which is the inversion that put HIGH
-    # bucket at 14% hit rate.
-    _pred_dir = (
-        str(prediction_row.get("direction") or "")
-        or str(signals.get("direction") or "")
-    )
-    edge_signal_multiplier = edge_multiplier_for_prediction(
-        engine,
-        prediction_row.get("ticker") or "",
-        prediction_row.get("created_at"),
-        prediction_direction=_pred_dir,
-    )
-
     aggregate = compute_aggregate_conviction(
         signal_evidence,
         fragility_multiplier=fragility_multiplier,
         disagreement_score=disagreement_score,
         red_team_epistemic_risk=red_team_risk,
         fudge_alert_count=fudge_alert_count,
-        edge_signal_multiplier=edge_signal_multiplier,
     )
     verdict = _verdict_from_aggregate(aggregate, confidence)
 
@@ -828,9 +794,9 @@ def _signal_contribution_attribution(
 _NARRATIVE_TEMPLATE = (
     "Walk-forward backtest — {walked} predictions replayed over {days}d, "
     "{trades} trade tickets generated. "
-    "HIGH verdict hit rate: {high_hr:.1%} (n={high_n}, sharpe={high_sharpe:+.2f}). "
-    "MEDIUM verdict hit rate: {medium_hr:.1%} (n={medium_n}, sharpe={medium_sharpe:+.2f}). "
-    "LOW verdict hit rate: {low_hr:.1%} (n={low_n}, sharpe={low_sharpe:+.2f}). "
+    "HIGH verdict hit rate: {high_hr:.1%} (n={high_n}). "
+    "MEDIUM verdict hit rate: {medium_hr:.1%} (n={medium_n}). "
+    "LOW verdict hit rate: {low_hr:.1%} (n={low_n}). "
     "Stress-test calibration lift: {lift} "
     "(fragile failure rate {fragile_fail} vs robust {robust_fail}). "
     "Verdict is {empirical_call}."
@@ -870,9 +836,6 @@ def _build_narrative(
     high_hr = high.hit_rate if high else 0.0
     medium_hr = medium.hit_rate if medium else 0.0
     low_hr = low.hit_rate if low else 0.0
-    high_sharpe = high.sharpe if high else 0.0
-    medium_sharpe = medium.sharpe if medium else 0.0
-    low_sharpe = low.sharpe if low else 0.0
 
     lift_raw = calibration.get("lift")
     fragile_raw = calibration.get("fragile_failure_rate")
@@ -880,35 +843,11 @@ def _build_narrative(
     lift_str = f"{lift_raw:+.1%}" if lift_raw is not None else "N/A (one bucket empty)"
     fragile_str = f"{fragile_raw:.1%}" if fragile_raw is not None else "N/A"
     robust_str = f"{robust_raw:.1%}" if robust_raw is not None else "N/A"
-
-    # Two-axis verdict: hit_rate AND risk-adjusted return (sharpe). PR #193
-    # produced HIGH hit=50.5% vs MEDIUM 45.7% (a ~5pp spread that read
-    # INCONCLUSIVE under the old hit-rate-only logic) while HIGH sharpe was
-    # +1.37 vs MEDIUM -1.70 = +3.07 spread — a clear CALIBRATED signal
-    # the audit missed. Now:
-    #   - CALIBRATED when HIGH dominates MEDIUM on EITHER axis (hit_rate
-    #     spread >= 5pp OR sharpe spread >= 1.0)
-    #   - BROKEN when HIGH underperforms MEDIUM on BOTH axes
-    #   - Otherwise INCONCLUSIVE.
-    if high_n > 0 and medium_n > 0:
-        hr_spread = high_hr - medium_hr
-        sharpe_spread = high_sharpe - medium_sharpe
-        if hr_spread >= 0.05 or sharpe_spread >= 1.0:
-            call = (
-                "STACK CALIBRATED — HIGH beats MEDIUM "
-                f"(hit_rate {hr_spread:+.1%}, sharpe {sharpe_spread:+.2f})"
-            )
-        elif hr_spread < 0 and sharpe_spread < 0:
-            call = (
-                "STACK BROKEN — HIGH underperforms MEDIUM on both axes "
-                f"(hit_rate {hr_spread:+.1%}, sharpe {sharpe_spread:+.2f}), "
-                "retune required"
-            )
-        else:
-            call = (
-                "STACK INCONCLUSIVE — mixed signal "
-                f"(hit_rate {hr_spread:+.1%}, sharpe {sharpe_spread:+.2f})"
-            )
+    # The acid test: HIGH should beat MEDIUM should beat LOW.
+    if high_n > 0 and medium_n > 0 and high_hr > medium_hr + 0.05:
+        call = "STACK CALIBRATED — HIGH meaningfully beats MEDIUM"
+    elif high_n > 0 and medium_n > 0 and high_hr < medium_hr:
+        call = "STACK BROKEN — HIGH underperforms MEDIUM, retune required"
     else:
         call = "STACK INCONCLUSIVE — insufficient separation between buckets"
 
@@ -918,13 +857,10 @@ def _build_narrative(
         trades=int(trades_generated),
         high_hr=high_hr,
         high_n=high_n,
-        high_sharpe=high_sharpe,
         medium_hr=medium_hr,
         medium_n=medium_n,
-        medium_sharpe=medium_sharpe,
         low_hr=low_hr,
         low_n=low_n,
-        low_sharpe=low_sharpe,
         lift=lift_str,
         fragile_fail=fragile_str,
         robust_fail=robust_str,
@@ -1270,7 +1206,7 @@ def walk_forward(
                 as_of=created_at,
                 horizon_days=row_horizon,
             )
-            provenance = build_time_frozen_provenance(enriched, scorecards, engine=engine)
+            provenance = build_time_frozen_provenance(enriched, scorecards)
 
             try:
                 stress = run_stress_test(provenance)
@@ -1335,23 +1271,11 @@ def walk_forward(
                 pit_hits += 1
             hit = classify_hit(provenance.direction, outcome_verdict)
 
-            # Robustness gate: a HIGH-bucket prediction whose stress
-            # test flags it as fragile is by definition over-confident
-            # — small signal perturbations flip its verdict, so the
-            # +1.15 conviction is barely-over-threshold rather than
-            # genuinely robust. Demote it to MEDIUM so the verdict
-            # buckets are honest. Without this gate, post-#126 every
-            # HIGH prediction was stress-fragile and the bucket's hit
-            # rate cratered (13.2% vs LOW's 33.9%).
-            gated_verdict = provenance.verdict
-            if gated_verdict == "high" and stress_label == "fragile":
-                gated_verdict = "medium"
-
             trade = BacktestTrade(
                 prediction_id=str(row.get("id")),
                 ticker=str(row.get("ticker") or ""),
                 prediction_date=created_at.isoformat(),
-                verdict=gated_verdict,
+                verdict=provenance.verdict,
                 aggregate_conviction=float(provenance.aggregate_conviction),
                 robustness_label=stress_label,
                 robustness_score=stress_score,

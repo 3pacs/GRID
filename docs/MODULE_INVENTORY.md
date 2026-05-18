@@ -2,7 +2,7 @@
 
 Generated: 2026-05-18
 Total modules: 750
-Total LOC: 330,494
+Total LOC: 330,500
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycache__/`, `build/`, `dist/`, `docs/`, `node_modules/`, `notebooks/`, `pwa/`, `pwa_dist/`, `tests/`, `venv/`.
@@ -11,7 +11,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 
 | Directory | Module count | LOC |
 |---|---|---|
-| `intelligence/` | 172 | 102,046 |
+| `intelligence/` | 172 | 102,037 |
 | `ingestion/` | 207 | 85,797 |
 | `api/` | 107 | 48,466 |
 | `analysis/` | 33 | 18,973 |
@@ -19,7 +19,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 | `oracle/` | 29 | 10,542 |
 | `subnet/` | 10 | 5,381 |
 | `physics/` | 18 | 4,824 |
-| `features/` | 7 | 4,428 |
+| `features/` | 7 | 4,443 |
 | `store/` | 6 | 4,155 |
 | `alpha_research/` | 21 | 3,592 |
 | `alerts/` | 8 | 3,351 |
@@ -865,7 +865,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`, `datetime`, `loguru`, `math`, `sqlalchemy`, `typing`
 **Imported by:** `api/routers/conviction.py`
 
-#### `intelligence/signal_provenance.py` — 821 LOC
+#### `intelligence/signal_provenance.py` — 812 LOC
 **Docstring:** Signal provenance — the per-ticker "why" report.
 **Functions:** `SignalEvidence`, `CausationChain`, `TradeProvenanceReport`, `compute_aggregate_conviction`, `build_provenance_report`
 **Reads:** `__future__`, `dataclasses`, `datetime`, `features`, `intelligence`, `loguru`, `sqlalchemy`, `typing`
@@ -3494,7 +3494,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `analysis`, `datetime`, `db`, `loguru`, `numpy`, `pandas`, `physics`, `scipy`, `sqlalchemy`, `store`, `tsfresh`, `typing`, `utils`
 **Imported by:** `api/routers/capital_flow.py`, `api/routers/physics.py`, `inference/live.py`
 
-#### `features/per_signal_brier.py` — 443 LOC
+#### `features/per_signal_brier.py` — 458 LOC
 **Docstring:** Per-signal per-horizon Brier tracker (ALPHA-15 / #118).
 **Functions:** `SignalScorecard`, `ensure_tables`, `record_scored_prediction`, `compute_conviction_weight`, `get_signal_scorecard`, `rank_signals_by_horizon`, `get_full_scorecard_table`
 **Reads:** `__future__`, `dataclasses`, `datetime`, `loguru`, `sqlalchemy`, `typing`
