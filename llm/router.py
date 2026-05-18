@@ -197,6 +197,8 @@ def _create_client(provider: str) -> Any:
         return _create_ollama_ocr_client(settings)
     elif provider == "ollama_koala":
         return _create_ollama_koala_client(settings)
+    elif provider == "ollama_z400":
+        return _create_ollama_z400_client(settings)
     elif provider == "llamacpp":
         return _create_llamacpp_client(settings)
     elif provider == "openai":
@@ -325,6 +327,31 @@ def _create_ollama_ocr_client(settings: Any) -> Any:
         )
     except Exception as exc:
         log.debug("Ollama ocr client init failed: {e}", e=str(exc))
+        return None
+
+
+def _create_ollama_z400_client(settings: Any) -> Any:
+    """Ollama on the z400 node (12GB GPU) — qwen2.5:7b-instruct-q4_K_M.
+
+    z400 sits in the cluster alongside panda/ocr/koala. Its 12GB card
+    holds a 7B Q4 model comfortably (~5GB resident). Best fit for
+    high-throughput narrative tasks (postmortem narration, signal
+    interpretation) where the 7B class is enough and we want low
+    per-request latency. minicpm-v / qwen2.5vl are also present for
+    vision tasks (callers must override ``model=``).
+    """
+    if not getattr(settings, "OLLAMA_Z400_ENABLED", False):
+        return None
+    try:
+        from ollama.client import OllamaClient
+        return OllamaClient(
+            base_url=getattr(settings, "OLLAMA_Z400_BASE_URL", "http://z400:11434"),
+            model=getattr(settings, "OLLAMA_Z400_CHAT_MODEL", "qwen2.5:7b-instruct-q4_K_M"),
+            embed_model=getattr(settings, "OLLAMA_Z400_EMBED_MODEL", "nomic-embed-text"),
+            timeout=getattr(settings, "OLLAMA_Z400_TIMEOUT_SECONDS", 120),
+        )
+    except Exception as exc:
+        log.debug("Ollama z400 client init failed: {e}", e=str(exc))
         return None
 
 
