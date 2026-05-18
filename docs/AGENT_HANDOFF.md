@@ -1,5 +1,29 @@
+## 2026-05-18 23:03 UTC — 2026-05-18-2303
+**Why this matters next run:** The 2026-05-14 + 2026-05-15 "queue exhausted / no-work" entries are STALE. A fresh API audit (PUNCH-LIST-2026-05-13.md, "Auditor 2026-05-17 — api/" section, lines 34-52) landed on main in PR #190 (commit `40e7e6b5`) and has **13 unclaimed items**. Walk that section before declaring no-work.
+
+PR #239 closes line-39 [P1] (has_more in `search_intelligence`). Four other `has_more` items remain on the same auditor list, all the same shape and very small:
+- line 40 — `api/routers/oracle.py:168` `get_predictions`
+- line 41 — `api/routers/models.py:67` `get_all`
+- line 42 — `api/routers/intel.py:252` `intel_search` (the `_ok(...)` envelope, needs `total`+`limit`+`offset`+`has_more`)
+- line 43 — `api/routers/intel.py:1384` `intel_predictions_active` meta (just add `has_more` to the existing `meta`)
+
+The canonical pattern is `api/routers/journal.py:77` (`has_more: (offset + limit) < total`). Same one-key-add fix in each case. **Don't bundle these into one PR** — the orchestrator's hard rule is one PR per run; pick one and ship.
+
+Other unclaimed 2026-05-17 audit items worth noting:
+- line 44 [P1] — direct test coverage for `api/routers/system.py` (1,686-LOC router, only `/health` + `/status` tested in `tests/test_api.py:47`). Bigger lift; tests-only.
+- line 45 [P1] — switch `prediction_backtest.py:20` import from `get_engine` → `get_db_engine` for clearable-singleton consistency.
+- line 46 [P2] — `clear_singletons()` bug at `api/dependencies.py:67`: clears the api-level pointer but NOT `db._engine`, so next call returns a disposed engine. Real bug, but touches dep-injection plumbing — read both files first.
+- line 47 [P2] — f-string SQL in `prediction_backtest.py:116` (rule-violation, currently-safe because values come from a literal). Same file as line 45; consider claiming both in sequence after line-45 lands.
+
+**Env (unchanged from 2026-05-15 handoff, all still true):** no python deps preinstalled (`pip install pytest fastapi loguru sqlalchemy pydantic ruff` ~ 30s); `gh` CLI absent — `mcp__github__*` only; `git push origin routine-bookkeeping` → HTTP 403, use `mcp__github__create_or_update_file` against that branch; `mcp__github__list_pull_requests` output exceeds tool-result token cap — use `search_pull_requests` with tighter scope.
+
+**Pattern that worked this run:** mocking `get_db_engine` via `monkeypatch.setattr(mod, "get_db_engine", lambda: <MagicMock>)` + a per-test `side_effect` list on `conn.execute` for count-then-search lets you regression-test the response envelope without PostgreSQL. Copy this pattern for the next four has_more PRs — it adds 3 tests in ~80 LOC and keeps them in the no-DB block of the existing test file.
+
+---
 ## 2026-05-15 23:02 UTC — 2026-05-15-2302
 **Why this matters next run:** Queue is STILL empty 24h after the 2026-05-14-2304 no-work. PUNCH-LIST-2026-05-13 is fully closed (#155-166 all merged), no new feed docs have landed, and the remaining oracle/engine.py architectural items (10-12, 2,793-LOC splits/refactors) need operator sign-off. Don't thrash — log no-work fast.
+
+> **2026-05-18 update:** This is now stale — the 2026-05-17 API audit landed in PR #190 after this entry was written and added 13 new items to PUNCH-LIST-2026-05-13.md. See the 2026-05-18-2303 entry above.
 
 Confirmed walk this run: TIER0 main HEAD `59e12375` (PR #173) is CI-green (Lint + claude-review + Frontend Build + Backend Tests all success). TIER1 `search_pull_requests author:app/openai-codex` returns 0 hits — the 3 `codex/*` branches (`agent-reporting-hub`, `astrogrid-dedup`, `edge-scanner-reload-guard`) have NO open PRs attached to them, so they aren't reviewable. TIER2/3 still no AUTO_IMPROVE/hermes/TOP docs. TIER4 PUNCH-LIST-2026-05-13 is fully closed except items 10-12 (architectural). TIER5/6 unchanged from 2026-05-14-2304.
 
@@ -13,6 +37,8 @@ Open-PR landscape (10 total): #170-172 + #174-175 are 3pacs cherry-picks/fixes (
 ## 2026-05-14 23:24 UTC — 2026-05-14-2304
 **Why this matters next run:** The routine queue is empty AND the standing print()->log fallback is now exhausted too — do NOT re-scan `intelligence/*.py` for print conversions, it's all CLI output.
 
+> **2026-05-18 update:** API audit on 2026-05-17 added new work — see top entry. Other text below is still accurate context.
+
 No-work run. Walked all 7 tiers: TIER0 main-CI fix is claimed by branch `claude/fix-backend-tests-main-ci`; TIER1 no codex-authored PRs (the 3 `codex/*` branches have no open PR); TIER2/3 no AUTO_IMPROVE/hermes/TOP docs; TIER4 PUNCH-LIST-2026-05-13 is fully worked — items 1-9,13,14 → PRs #156-166; items 10-12 are architectural `oracle/engine.py` splits/refactors, file-claimed by #156/#166 and need operator sign-off; TIER5 TODO-DUP-WRITES is blocked on an operator product decision (Step 1 picks A/B/C) and TODO-DATA-AUDIT needs DB access this box does not have; TIER6 no labeled issues.
 
 **DEV-NOTES H10 print->log fallback is exhausted — verified, do not retry:** every remaining `print()` in `intelligence/*.py` sits inside an `if __name__ == "__main__"` CLI block (entity_resolver, rag, cross_reference, source_audit, sleuth, trust_scorer, market_diary all confirmed — legitimate CLI output, leave them). `ingestion/*.py` has zero non-CLI prints. `hypothesis_engine.py` still has 26 indented prints but is file-claimed by #155. Remaining print work would need a different dir (scripts/, dashboard.py, api/) — out of the handoff's intended scope and not clean routine material.
@@ -22,128 +48,3 @@ No-work run. Walked all 7 tiers: TIER0 main-CI fix is claimed by branch `claude/
 **Bottom line:** unless #156/#157 have merged (and the operator has signed off on the engine.py split for items 10-12), or a fresh PUNCH-LIST / TOP / AUTO_IMPROVE doc has landed on main, expect another no-work. Log it fast — don't thrash hunting for cleanup.
 
 **Env (carried forward, all still true):** no python deps preinstalled (`pip install ...` as needed, ~30s-2min); `gh` CLI absent — MCP `mcp__github__*` only; `git push origin routine-bookkeeping` → 403, use `create_or_update_file`; `mcp__github__list_pull_requests` / `search_pull_requests` output exceeds the tool-result limit — parse the saved tool-result file with python, or scope the query tighter.
-
----
-## 2026-05-14 06:20 UTC — 2026-05-14-0605
-**Why this matters next run:** PR #165 closes [P1] item 5 (`gate_decision` tests). The prior two handoffs said item 5 was "blocked on #157 merge" — **that was wrong, and the next agent should not trust 'blocked on file claim' reasoning without checking the actual diff.**
-
-Why it wasn't blocked: #157's branch diff to `oracle/publisher_gate.py` only *removes* the `publish_astrogrid_prediction` block (lines 156+) and rewrites the imports — `gate_decision` (lines 42–153) is byte-identical on both `main` and #157's branch. Item 5 adds a brand-new file `tests/test_publisher_gate.py`; #157's only test-file claim is `tests/test_publish_astrogrid_canonical.py`. Zero overlap. The STEP-1 "avoid files touched by open agent branches" rule is about *files you would edit*, not files that merely share a module name with your new test. Check `git diff --name-only main...<branch>` and confirm real overlap before self-blocking.
-
-PR #165 adds 22 tests (tests-only). `pytest --noconftest tests/test_publisher_gate.py` → 22 passed in 0.26s. Ruff clean. Behavior pinned worth noting:
-- **Auto-publish threshold is inclusive `>=` 0.85** — avg confidence exactly 0.85 auto-publishes; 0.84 falls through to the *default* publish branch ("Mixed verdicts...") with `score=avg_confidence`, NOT to review. A fully-supported, no-flag, low-confidence set still publishes.
-- **Reject precedence**: `contradicted` is checked before `critical_fail`, and both before any flag/review logic. A claim that is both contradicted and critical-fail returns the contradicted branch.
-- **`flagged > 0` always routes to review** regardless of the `_REVIEW_REWRITE_RATIO` (0.30) threshold — the ratio comparison is effectively dead code given the `or flagged > 0`. Pinned but not "fixed" (out of scope).
-- **`avg_confidence` is over ALL claims** including `insufficient` ones (default conf 0.5), so an insufficient claim can drag a supported set below the auto-publish line.
-
-**PUNCH-LIST-2026-05-13 status — oracle test-gap chain is now FULLY CLOSED:**
-- DONE: items 1–8, 13, 14 (PRs #156–165). Items 3/4/5/6/7/8/13/14 all merged-or-open as test/fix PRs.
-- **REMAINING, genuinely blocked/architectural:**
-  - [P1] item 9 — Signal positional-arg bug, `oracle/engine.py:812`. Real bug. *Actually* blocked: the fix edits `oracle/engine.py` directly, and #156 holds a file claim on that exact file. Wait for #156 to merge.
-  - [P2] items 10/11/12 — split/refactor `oracle/engine.py`. Architectural, needs operator, also #156-blocked.
-- **Next run will almost certainly be no-work on the punch list.** Fallback: a DEV-NOTES H10 non-CLI `print()` → `log` conversion in an unclaimed module (see the 2026-05-14-0413 leave-alone list below), or a clean no-work entry. Do not thrash.
-
-**File claims to avoid next cycle (new this run):** `tests/test_publisher_gate.py` (#165). Prior still-open claims unchanged — see the 2026-05-14-0413 list below; #152–164 all still open.
-
-**Env note:** unchanged from 05:25 entry — no python deps preinstalled (`pip install loguru sqlalchemy pytest ruff`, ~30s), `gh` absent (MCP only), `routine-bookkeeping` push 403 → use `create_or_update_file`, `mcp__github__list_pull_requests` output exceeds the tool-result limit (delegate the slice to a subagent or use `search_pull_requests`).
-
----
-## 2026-05-14 05:25 UTC — 2026-05-14-0510
-**Why this matters next run:** PR #164 closes [P1] item 3 (`CalibrationReport` dataclass-name collision) — the LAST non-blocked PUNCH-LIST-2026-05-13 item. The routine queue is now genuinely empty/stuck: all remaining oracle/ items are blocked behind un-merged agent PRs or need operator input. Next agent should expect to log a no-work entry unless #156/#157 have merged.
-
-Fix: renamed `oracle.calibration.CalibrationReport` → `OracleCalibrationReport`. The prior handoff flagged this as "needs operator input on which name wins" — it does NOT. Merging was off the table (the two dataclasses have genuinely different field shapes), and the oracle copy had **zero external importers** (verified `grep -rn 'CalibrationReport'`), so renaming it is a fully-contained 1-file change with no decision required. `inference.calibration.CalibrationReport` is left as the sole `CalibrationReport`. Added `tests/test_oracle_calibration_report_naming.py` (5 tests, `pytest --noconftest` green, ruff clean).
-
-**PUNCH-LIST-2026-05-13 status — queue is now exhausted of unblocked work:**
-- [P0] items 1, 2 → PRs #156, #157 still open (file claims on `oracle/engine.py`, `oracle/publisher_gate.py`).
-- [P1] item 5 (`gate_decision` tests) → blocked on #157 merge.
-- [P1] item 9 (Signal positional-arg bug, `oracle/engine.py:812`) → blocked on #156 merge.
-- [P2] items 10/11/12 (split/refactor `oracle/engine.py`) → architectural, need operator + blocked on #156.
-- Everything else (3/4/6/7/8/13/14) → DONE (PRs #158-164).
-
-**If #156/#157 still open next run:** the queue is stuck. Per the standing fallback, either pick a DEV-NOTES H10 non-CLI `print()` → `log` conversion in an unclaimed module (`grep -nE '^\s+print\(' intelligence/*.py`, excluding `__main__` blocks — see 2026-05-14-0413 handoff for the leave-alone list), or log a clean no-work entry. Do not thrash on the blocked items.
-
-**Env note (carried forward):** this box ships with NO python deps preinstalled — had to `pip install ruff numpy loguru sqlalchemy pytest pandas` to import `oracle.calibration` + `inference.calibration` and run the regression test. Budget for ~2 min of pip installs if your test needs to import SUT modules. `gh` CLI absent — MCP `mcp__github__*` only. `git push origin routine-bookkeeping` → 403, use MCP `create_or_update_file`.
-
-## 2026-05-14 04:48 UTC — 2026-05-14-0413
-**Why this matters next run:** PR #163 closes [P1] item 4 (`oracle/firewall.py::verify_output` end-to-end pipeline tests). The 2026-05-14-0306 handoff explicitly said wait until #157 + item 5 landed before tackling item 4 — I deviated because #157 has been open 24h+ without merging and item 5 is blocked behind it on the same file claim, so the test-gap chain was indefinitely stuck. The deviation cost is small: firewall tests patch `gate_decision` at the import site, so they don't care about its internals; a future item 5 PR can pick whatever `gate_decision` mocking convention it likes without breaking these tests.
-
-PR #163 adds 32 test cases (473 LOC, tests-only) across 7 test classes. Mocks `extract_claims` / `verify_claims` / `run_sanity_checks` / `gate_decision` at the `oracle.firewall.*` import site; `_audit_claims` uses a MagicMock engine with the `connect().__enter__().execute()` chain established in PR #161/162. Smoke-run: `pytest --noconftest tests/test_firewall.py` → 32 passed in 0.34s. Ruff clean.
-
-Behavior locked in by tests worth noting for any future refactor:
-
-- **`flagged_count = contradicted + critical_fail`** (line 77) is a DIFFERENT predicate than the `_mark_unverified` flagging set (which also flags `ambiguous` and any `warn` sanity result). The two diverge on `ambiguous` verdicts and on `warn`-flagged-but-supported claims. Pinned by `TestFlaggedCountSemantics` + `TestMarkUnverified`. If you ever align them, update BOTH classes in the same PR.
-- **`_mark_unverified` reverse-span ordering** — flagged claims sorted by `source_span[0]` DESC so later-position inserts don't shift earlier spans. Pinned by `test_multiple_flagged_inserted_in_reverse_order_preserves_spans`. A future LTR insertion would silently corrupt second-and-onwards marker positions.
-- **`_mark_unverified` silently skips `span_start > len(text)`** (the `0 < span_start <= len(result)` guard at line 110). Pinned by `test_span_start_past_end_of_text_silently_skipped`. A future strict-mode would need to update this test.
-- **`_audit_claims` is non-blocking** — `engine.connect()` raising is logged at `warning` and swallowed. The chat firewall must stay up even if `claim_audit` is unreachable. Pinned by `test_db_failure_is_swallowed_and_logged`.
-- **Empty-claims short-circuit at line 54** skips `verify_claims` / `run_sanity_checks` / `_audit_claims` entirely — `gate_decision([])` is called but the four import-site patches confirm zero calls to the downstream three. Pinned by `test_no_claims_skips_verify_sanity_and_audit`. A future "always audit" change must update this test.
-- **Materiality table** — `claim_type in ("price", "percentage")` → `"high"`, else `"medium"`. Adding a new claim_type silently defaults to `"medium"`. Pinned via parametrise across all 6 `ClaimType` values.
-- **`claim_text` truncated at 500 chars** before insert. Defensive cap for the `claim_audit.claim_text` column. Pinned by `test_claim_text_truncated_at_500_chars`.
-
-**Remaining unclaimed punch-list items (smallest-first ordering):**
-
-- **[P1] item 5**: `oracle/publisher_gate.py::gate_decision` (line 42) — **PR #157 still open on this file**. Wait for #157 to merge, then write ~120 LOC of tests for the auto-publish (>0.85 confidence), reject (contradicted/critical-fail), and review (>30% flagged) branches. **The PR #163 firewall tests now pin `gate_decision`'s call shape at the boundary** (`list[CheckedClaim]` → `PublishDecision(decision, score, claims, reasons)`), so item 5 can use that contract as its starting point.
-- **[P1] item 3**: DONE in PR #164 (2026-05-14-0510). Renamed `oracle.calibration.CalibrationReport` → `OracleCalibrationReport`.
-- **[P1] item 9**: Signal positional-arg mismatch in `_gather_signals_from_registry` (`oracle/engine.py:812`). Real bug — z-score stored in `value` field, `z_score=0` → registry-sourced signals contribute zero downstream at line 1371. **Still blocked on PR #156 merge** (file claim on `oracle/engine.py`).
-- **[P2] items 10-12**: Splits/refactors of `oracle/engine.py`. Architectural; coordinate with operator.
-
-With items 4/6/7/8/13/14 all done, the **oracle test-gap chain is effectively closed for now**. Item 5 (gate_decision) is the only outstanding test-gap item and it's blocked on #157.
-
-**If both blocked items stay closed to the next agent, the routine queue is empty. Options:**
-- Pick a DEV-NOTES H10 print() → log conversion in a NON-claimed module. Most `__main__` block prints are legitimate CLI output and should NOT be converted (intelligence/sleuth.py:1261-1277, intelligence/source_audit.py:969-979, intelligence/trust_scorer.py:1776-1779, intelligence/cross_reference.py:1808-1832, intelligence/market_diary.py:801-809, intelligence/actors/trial_bridge.py:454-456 are all CLI-output, leave them). The non-CLI prints to look for live INSIDE function bodies — `grep -nE '^\s+print\(' intelligence/*.py` after excluding `__main__` blocks.
-- Log a no-work entry. The chain is genuinely stuck on operator-merge of #156 + #157.
-
-**File claims to avoid this cycle (last-touched in still-open agent PRs):**
-- `oracle/calibration.py` + `tests/test_oracle_calibration_report_naming.py` (#164)
-- `tests/test_firewall.py` (#163)
-- `tests/test_claim_verifier.py` (#162)
-- `tests/test_psi_model.py` (#161)
-- `tests/test_citation_extractor.py` (#160)
-- `tests/test_sanity_checker.py` (#159)
-- `tests/test_claim_extractor.py` (#158)
-- `oracle/publisher_gate.py` + `tests/test_publish_astrogrid_canonical.py` (#157)
-- `oracle/engine.py` (#156)
-- `intelligence/hypothesis_engine.py` + `tests/test_hypothesis_engine_intelligence_kills_logging.py` (#155)
-- `ingestion/altdata/indeed_hiring_puller.py` + `tests/test_indeed_hiring_puller.py` (#154)
-- `ingestion/altdata/redfin_puller.py` + `tests/test_redfin_puller.py` (#153)
-- `intelligence/universe_ranker.py` + `tests/test_universe_ranker.py` (#152)
-
-**Env quirks (carried forward, unchanged):**
-- `git push origin routine-bookkeeping` returns HTTP 403. Use MCP `create_or_update_file` for both `.grid_backups/routine_log.jsonl` and this file. Work-branch pushes work fine.
-- `python3 -m pytest` fails at conftest collection (pandas + psycopg2 + python-jose imported at module top). Use `pytest tests/test_X.py --noconftest` for pure-function test files. Needs `pip install pytest loguru sqlalchemy` (sqlalchemy only when the SUT imports it). `ruff check` and `py_compile` work after `pip install ruff`.
-- `gh` CLI is not present on this box — use MCP `mcp__github__*` tools for all GitHub operations.
-- `mcp__github__list_pull_requests` returns >220KB which exceeds tool-result limits; slice with python via the saved tool-result file, or use `search_pull_requests` with a tighter query.
-- `pytest --noconftest` is the cleanest way to bypass the conftest pandas import — `--rootdir=/tmp` and `cd /tmp` are not enough; pytest still walks up to find conftest.py.
-- **The 25-min routine budget is tight when discovery is needed.** This run took ~37 min total because the prior handoff's "wait" instruction made me re-scope twice before deciding to deviate. If the next agent inherits a "queue stuck" state, scope down faster — pick a small no-work or a single doc-cleanup rather than thrashing on the blocked items.
-
----
-## 2026-05-14 03:25 UTC — 2026-05-14-0306
-**Why this matters next run:** PR #162 closes [P1] item 7 (`oracle/claim_verifier.py` DB-evidence verdict tests). With items 6/7/8/13/14 done, the **remaining test-gap item is [P1] item 4** (`oracle/firewall.py::verify_output` end-to-end pipeline) — but **wait until [P1] item 5 lands** (`oracle/publisher_gate.py::gate_decision`, PR #157 still open on this file). The firewall composes claim_extractor → claim_verifier → sanity_checker → gate_decision → audit write, so testing it before #157 merges risks re-doing the gate-decision mocking from scratch. After #157 lands, item 5 (gate_decision unit tests, ~120 LOC) becomes the safer next pick — then item 4 (firewall composition, ~150 LOC).
-
-PR #162 adds 34 test cases (380 LOC, tests-only) covering every branch of `oracle/claim_verifier.py`: each candidate-name fall-through (`<ticker>` → `<ticker>_full` → `<ticker>_usd_full`) for `_lookup_latest_value` + `_lookup_price_change`; NULL-value filter, engine-exception → None-triple/pair fallthrough; `_verify_price` insufficient/supported/contradicted at the 5% boundary; `_verify_percentage` insufficient/supported/contradicted at the 3pp boundary; `_verify_direction` both-up / both-down / mismatch; `_verify_generic` ambiguous fallback; `verify_claims` dispatcher (known-type routing, unknown-type → generic, order/length preservation). Reuses the PR #161 `MagicMock(engine.connect().__enter__().execute())` chain, with separate `side_effect` builders for `.fetchone()` (single-row lookups) vs `.fetchall()` (price-change window). Smoke-run: `pytest --noconftest tests/test_claim_verifier.py` → 34 passed in 0.33s. Ruff clean.
-
-Behavior locked in by tests worth noting for any future refactor:
-
-- **`actual=0.0` short-circuits to `verdict="supported"`** — `_lookup_latest_value`'s guard is `row[0] is not None`, not truthy. A stored 0.0 passes through; `_verify_price`'s `if actual != 0 else 0` ternary then sets `pct_diff=0`, satisfying `0 <= 5.0`. Pinned by `test_verify_price_zero_actual_short_circuits_to_supported`. A future "0.0 means missing data" guard MUST update this test in the same PR.
-- **Tolerances are inclusive `<=`** — claim 105 vs actual 100 (exactly 5% diff) is **supported**, not contradicted; claim 8% vs actual 5% (exactly 3pp diff) is also supported. Pinned by `test_verify_price_boundary_at_5_percent_is_supported` and `test_verify_percentage_boundary_at_3pp_is_supported`. A future tightening to strict `<` must update both.
-- **`_lookup_price_change` returns `rows[0]` vs `rows[-1]`** — i.e. latest vs OLDEST in the DESC window, not latest vs second-newest. With `periods=2` (the default for `_verify_percentage`/`_verify_direction`) this is latest-vs-previous, but if a future caller passes `periods=5` the "previous" silently becomes 5 days ago. Pinned by `test_lookup_price_change_returns_latest_and_oldest_when_enough_rows`. If you ever extend the window, consider renaming or adding a separate `_lookup_price_window` helper instead.
-- **`_verify_generic` is the catch-all for any unknown `claim_type`** — adding a new `claim_type` to `oracle/claim_extractor.ClaimType` without adding an entry to `_VERIFIERS` will silently route to `_verify_generic` → "ambiguous". Pinned by `test_verify_claims_unknown_type_falls_through_to_generic`.
-
-**Env quirks (carried forward, unchanged):**
-- `git push origin routine-bookkeeping` returns HTTP 403. Use MCP `create_or_update_file` for both `.grid_backups/routine_log.jsonl` and this file. Work-branch pushes work fine.
-- `python3 -m pytest` fails at conftest collection (pandas + psycopg2 + python-jose imported at module top). Use `pytest tests/test_X.py --noconftest` for pure-function test files. Needs `pip install pytest loguru sqlalchemy`. `ruff check` and `py_compile` work after `pip install ruff`.
-- `gh` CLI is not present on this box — use MCP `mcp__github__*` tools for all GitHub operations.
-- `mcp__github__list_pull_requests` returns >220KB which exceeds tool-result limits; slice with python via the saved tool-result file, or use `search_pull_requests` with a tighter query.
-- `pytest --noconftest` is the cleanest way to bypass the conftest pandas import — `--rootdir=/tmp` and `cd /tmp` are not enough; pytest still walks up to find conftest.py.
-
----
-## 2026-05-14 02:14 UTC — 2026-05-14-0210
-**Why this matters next run:** PR #161 closes [P2] item 14 (`oracle/psi_model.py` PSI+VIX gating tests). With items 13 & 14 done, the remaining test-gap items are **[P1] item 7** (`oracle/claim_verifier.py` — DB-mock-required, heaviest) and **[P1] item 4** (`oracle/firewall.py::verify_output` — best done LAST after 5/7 land). [P1] item 5 (`oracle/publisher_gate.py`) is still file-claimed by PR #157.
-
-PR #161 adds 33 test cases (385 LOC, tests-only) covering every behavior of `oracle/psi_model.py`: `_check_psi_condition` lt/gt strict-comparison at threshold + unknown-op fallback; `_load_latest_value` happy/empty/coercion paths via a MagicMock engine that mirrors `engine.connect().__enter__().execute().fetchone()`; `evaluate_psi_signals` with `_load_latest_value` monkeypatched across 6 PSI/VIX combinations (PSI-missing, all-lt-triggered, qqq-only, VIX-at-threshold, VIX-required-but-None, no-mans-land); confidence scaling cap/floor; `build_astrogrid_prediction_payload` required-keys / UUID validity / static fields / signal-field threading / uniqueness; `run_psi_oracle` glue; `_PSI_CONFIGS` structural integrity. Smoke-run: `pytest --noconftest` → 33 passed in 0.26s. Ruff clean.
-
-Behavior locked in by tests worth noting for any future refactor:
-
-- **Both PSI and VIX gates are strict (`<` / `>`)** — value equal to threshold does NOT trigger. Pinned by `test_check_psi_condition_lt_and_gt` (5.25 fails lt 5.25; 2.0 fails gt 2.0) and `test_evaluate_vix_at_threshold_does_not_trigger` (VIX=22.0 skips `vix_lt22` config). A future "use <=" flip should update these tests in the same PR.
-- **`_check_psi_condition` silently returns False on unknown op** (no exception). Pinned by `test_check_psi_condition_unknown_op_returns_false`. If a future PR adds an `eq`/`ne`/`gte` op, update the parametrise and add an explicit raise if you want strict validation.
-- **Confidence formula is `min(0.95, max(0.3, (sharpe-1)/3 + 0.3))`** — cap 0.95 above Sharpe ≈ 2.95; floor 0.3 below Sharpe = 1.0. Pinned by `test_confidence_scaling_matches_formula` (parametrised on 4 Sharpe values).
-- **`_PSI_CONFIGS` integrity test rejects duplicate names** — adding a new config with a name collision will fail `test_psi_configs_names_are_unique`. Adding a new `psi_op` (e.g. `lte`) or `direction` (e.g. `flat`) without updating `_check_psi_condition` AND the dataclass-field set will fail `test_psi_configs_have_required_keys`. Update both in the same PR.
-- **`build_astrogrid_prediction_payload` is non-deterministic** (uses `uuid4()` and `datetime.now(timezone.utc)`). Tests assert UUID validity, not equality between calls. Pinned by `test_payloads_have_unique_prediction_ids`.
