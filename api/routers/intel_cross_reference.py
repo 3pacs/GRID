@@ -60,14 +60,6 @@ def _cached(key: str, fn):
 
 @router.get("/cross-reference")
 async def get_cross_reference(
-    fast: bool = Query(
-        True,
-        description=(
-            "Skip the LLM narrative generation. Default True — the narrative "
-            "is the slow part (20s+ cold), the checks themselves are ~1s. "
-            "Fetch the narrative separately from /cross-reference/narrative."
-        ),
-    ),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Run all cross-reference checks and return the LieDetectorReport.
@@ -75,32 +67,23 @@ async def get_cross_reference(
     Compares government statistics against physical reality indicators
     across GDP, trade, inflation, central bank, and employment categories.
     Red flags indicate where official data diverges from ground truth.
-
-    The narrative is gated behind ``fast=False`` because LLM generation
-    dominates cold-call latency (22.6s observed in the 2026-05-16 audit
-    vs ~1s for checks-only). Frontend should call this endpoint with the
-    default ``fast=true`` for the data, then load ``/cross-reference/narrative``
-    lazily for the prose layer. Mirrors the postmortem-lessons async
-    pattern shipped earlier in PR for dashboard cold-load.
     """
     try:
         from intelligence.cross_reference import run_all_checks
 
         engine = get_db_engine()
-        cache_key = "cross_ref_all_fast" if fast else "cross_ref_all"
 
         def _compute():
-            report = run_all_checks(engine, skip_narrative=fast)
+            report = run_all_checks(engine)
             return {
                 "checks": [asdict(c) for c in report.checks],
                 "red_flags": [asdict(c) for c in report.red_flags],
                 "narrative": report.narrative,
                 "summary": report.summary,
                 "generated_at": report.generated_at,
-                "narrative_pending": fast,  # signals to frontend to fetch separately
             }
 
-        return _cached(cache_key, _compute)
+        return _cached("cross_ref_all", _compute)
     except Exception as exc:
         log.warning("Cross-reference engine failed: {e}", e=str(exc))
         return {
@@ -111,35 +94,6 @@ async def get_cross_reference(
             "generated_at": None,
             "error": str(exc),
         }
-
-
-@router.get("/cross-reference/narrative")
-async def get_cross_reference_narrative(
-    _token: str = Depends(require_auth),
-) -> dict[str, Any]:
-    """Return only the LLM-generated narrative.
-
-    Split from the main ``/cross-reference`` endpoint so the data layer
-    can load fast (~1s) and the prose layer can load lazily (~20s).
-    The narrative is cached separately so a hit on this endpoint doesn't
-    re-run the checks.
-    """
-    try:
-        from intelligence.cross_reference import run_all_checks
-
-        engine = get_db_engine()
-
-        def _compute_narrative():
-            report = run_all_checks(engine, skip_narrative=False)
-            return {
-                "narrative": report.narrative,
-                "generated_at": report.generated_at,
-            }
-
-        return _cached("cross_ref_narrative", _compute_narrative)
-    except Exception as exc:
-        log.warning("Cross-reference narrative failed: {e}", e=str(exc))
-        return {"narrative": "", "error": str(exc)}
 
 
 @router.get("/cross-reference/category/{category}")

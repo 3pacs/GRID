@@ -59,22 +59,22 @@ class TestInferDirection:
     """Direction inference from query and title keywords."""
 
     def test_bullish_query(self):
-        assert infer_direction("ceasefire OR peace deal") == "BULL"
+        assert infer_direction("ceasefire OR peace deal") == "buy"
 
     def test_bearish_query(self):
-        assert infer_direction("crash OR circuit breaker") == "BEAR"
+        assert infer_direction("crash OR circuit breaker") == "sell"
 
     def test_neutral_query(self):
-        assert infer_direction("earthquake OR hurricane") == "NEUTRAL"
+        assert infer_direction("earthquake OR hurricane") == "neutral"
 
     def test_titles_override_neutral_query(self):
         result = infer_direction("some neutral topic", titles=["market crash", "stocks plunge"])
-        assert result == "BEAR"
+        assert result == "sell"
 
     def test_mixed_leans_on_count(self):
         # More bearish words
         result = infer_direction("crash plunge war", titles=["rally"])
-        assert result == "BEAR"
+        assert result == "sell"
 
 
 # ---------------------------------------------------------------------------

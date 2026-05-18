@@ -12,10 +12,7 @@ class TestDetectSpikes:
         )
         spikes = detect_spikes([pool])
         assert len(spikes) == 1
-        # PR #185: direction column is reserved for {BULL,BEAR,NEUTRAL,NULL};
-        # categorical spike type lives in signal_subtype.
-        assert spikes[0]["direction"] is None
-        assert spikes[0]["signal_subtype"] == "spike_volume"
+        assert spikes[0]["direction"] == "spike_volume"
         assert spikes[0]["magnitude"] == 5.0
 
     def test_no_spike_normal_volume(self):
@@ -35,8 +32,7 @@ class TestDetectSpikes:
         )
         spikes = detect_spikes([pool])
         assert len(spikes) == 1
-        assert spikes[0]["direction"] is None
-        assert spikes[0]["signal_subtype"] == "new_pool"
+        assert spikes[0]["direction"] == "new_pool"
 
     def test_price_surge(self):
         pool = PoolData(
@@ -46,8 +42,7 @@ class TestDetectSpikes:
         )
         spikes = detect_spikes([pool])
         assert len(spikes) == 1
-        assert spikes[0]["direction"] is None
-        assert spikes[0]["signal_subtype"] == "price_surge"
+        assert spikes[0]["direction"] == "price_surge"
 
     def test_volume_spike_takes_priority_over_price_surge(self):
         pool = PoolData(
@@ -57,8 +52,7 @@ class TestDetectSpikes:
         )
         spikes = detect_spikes([pool])
         assert len(spikes) == 1
-        assert spikes[0]["direction"] is None
-        assert spikes[0]["signal_subtype"] == "spike_volume"  # volume spike fires first due to continue
+        assert spikes[0]["direction"] == "spike_volume"  # volume spike fires first due to continue
 
     def test_empty_pools(self):
         assert detect_spikes([]) == []

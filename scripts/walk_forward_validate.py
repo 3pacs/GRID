@@ -255,47 +255,25 @@ def compute_max_drawdown(returns: list[float]) -> float:
     return float(max(0.0, worst))
 
 
-# Direction vocabulary the oracle, options pipeline, and gem-hunter all
-# emit. ``oracle_predictions.direction`` in production is dominated by
-# CALL/PUT (options-flavored); legacy rows use bullish/bearish; some
-# upstream paths use long/short/buy/sell. Canonicalize to two strings so
-# every downstream measurement (classify_hit, realized-return proxy, PIT
-# replay) treats them identically.
-_BULLISH_DIRECTIONS: frozenset[str] = frozenset({
-    "bullish", "bull", "call", "long", "buy", "up",
-})
-_BEARISH_DIRECTIONS: frozenset[str] = frozenset({
-    "bearish", "bear", "put", "short", "sell", "down",
-})
-
-
-def _canonical_direction(raw: str | None) -> str:
-    """Return ``"bullish"`` / ``"bearish"`` / ``""`` from any production
-    direction label. Unknown / empty inputs collapse to ``""`` so callers
-    can branch on a non-empty result.
-    """
-    norm = str(raw or "").strip().lower()
-    if norm in _BULLISH_DIRECTIONS:
-        return "bullish"
-    if norm in _BEARISH_DIRECTIONS:
-        return "bearish"
-    return ""
-
-
 def classify_hit(verdict: str, outcome: str) -> bool:
     """A trade is a 'hit' when the directional call was correct.
 
-    Direction is canonicalized via ``_canonical_direction`` so CALL/PUT,
-    long/short, buy/sell, and bullish/bearish all route to the same
-    measurement. Partial counts as a half-hit for both directions —
-    the oracle's ``outcome_verdict`` is already written relative to the
-    predicted direction, so a 'partial' on a bearish call is the same
-    asymmetry as on a bullish call (the underlying moved most of the
-    way, just not all the way).
+    Bullish direction + outcome in {'hit', 'partial'} → True
+    Bearish direction + outcome == 'miss' → True (a correct short)
+    Everything else → False
+
+    The oracle's ``outcome_verdict`` field is always written relative to
+    the PREDICTED direction ('hit' = the prediction was right, 'miss' = it
+    was wrong), so for the realized-hit check we fold bearish misses into
+    hits to reward correct shorts. Partial counts as a half-hit for
+    bullish but as a miss for bearish (asymmetry intentional — shorts
+    aren't half-right).
     """
-    direction = _canonical_direction(verdict)
+    direction = str(verdict or "").strip().lower()
     outcome_norm = str(outcome or "").strip().lower()
-    if direction in ("bullish", "bearish"):
+    if direction == "bullish":
+        return outcome_norm in ("hit", "partial")
+    if direction == "bearish":
         return outcome_norm in ("hit", "partial")
     return outcome_norm == "hit"
 
@@ -310,7 +288,7 @@ def _realized_return_from_outcome(
     (e.g. the ticker has no feature_registry entry). The PIT path in
     ``_realized_return_from_pit`` is preferred and always tried first.
     """
-    dir_norm = _canonical_direction(direction)
+    dir_norm = str(direction or "").strip().lower()
     out_norm = str(outcome or "").strip().lower()
     sign = 1.0 if dir_norm == "bullish" else (-1.0 if dir_norm == "bearish" else 0.0)
     if out_norm == "hit":
@@ -379,16 +357,12 @@ def _pit_price_on_or_before(
     pit_store: PITStore,
     feature_id: int,
     as_of: date,
-) -> tuple[float, date] | None:
-    """Return the PIT-correct ``(price, obs_date)`` pair for ``feature_id``
-    at ``as_of``.
+) -> float | None:
+    """Return the PIT-correct price for ``feature_id`` at ``as_of``.
 
     Uses ``LATEST_AS_OF`` vintage so later revisions win, and picks the
     most recent ``obs_date`` that was already released. Returns ``None``
-    if no row qualifies. The obs_date is surfaced so the caller can
-    detect stale-data collapse (entry obs_date == exit obs_date implies
-    PIT is serving the same observation for both endpoints because the
-    underlying price feed hasn't been refreshed past the exit date).
+    if no row qualifies.
     """
     try:
         df = pit_store.get_pit(
@@ -406,25 +380,13 @@ def _pit_price_on_or_before(
     try:
         latest = df.sort_values("obs_date").iloc[-1]
         value = float(latest["value"])
-        obs_date_raw = latest["obs_date"]
     except Exception as exc:  # noqa: BLE001
         log.debug("walk_forward: PIT frame parse failed fid={f}: {e}", f=feature_id, e=str(exc))
         return None
 
     if not math.isfinite(value) or value <= 0.0:
         return None
-
-    # Normalize obs_date to a plain ``date``; PIT may return a Timestamp.
-    if isinstance(obs_date_raw, datetime):
-        obs_date_norm = obs_date_raw.date()
-    elif isinstance(obs_date_raw, date):
-        obs_date_norm = obs_date_raw
-    else:
-        try:
-            obs_date_norm = datetime.fromisoformat(str(obs_date_raw)).date()
-        except (ValueError, TypeError):
-            return None
-    return value, obs_date_norm
+    return value
 
 
 def _realized_return_from_pit(
@@ -439,36 +401,18 @@ def _realized_return_from_pit(
     Entry price is the latest PIT value at ``entry_as_of`` (prediction
     created_at). Exit price is the latest PIT value at
     ``entry_as_of + horizon``. Bearish directions flip the sign so a
-    profitable short shows up positive.
-
-    Returns ``None`` (caller falls back to outcome proxy) when:
-      - either price lookup is missing
-      - PIT serves the same observation row for both endpoints, which
-        means the price feed hasn't been refreshed past the prediction's
-        exit date (six-week stale ``resolved_series`` is the most common
-        cause as of 2026-05-17). Without this guard the audit would
-        silently zero out every realized return for affected tickers.
+    profitable short shows up positive. Returns ``None`` if either price
+    is missing — the caller then falls back to the outcome proxy.
     """
-    entry_pair = _pit_price_on_or_before(pit_store, feature_id, entry_as_of)
-    if entry_pair is None:
+    entry = _pit_price_on_or_before(pit_store, feature_id, entry_as_of)
+    if entry is None:
         return None
-    exit_pair = _pit_price_on_or_before(pit_store, feature_id, exit_as_of)
-    if exit_pair is None:
-        return None
-    entry, entry_obs_date = entry_pair
-    exit_px, exit_obs_date = exit_pair
-
-    # Stale-feed guard: if the most-recent observation as-of the entry
-    # date is the same row as the most-recent observation as-of the exit
-    # date, PIT is necessarily serving the same price (entry == exit).
-    # That is not a real "flat return" — the feed simply has no data in
-    # the horizon window. Surface this as missing so the outcome proxy
-    # fills in instead of polluting mean/std/sharpe with synthetic zeros.
-    if exit_obs_date <= entry_obs_date:
+    exit_px = _pit_price_on_or_before(pit_store, feature_id, exit_as_of)
+    if exit_px is None:
         return None
 
     raw = (exit_px - entry) / entry
-    dir_norm = _canonical_direction(direction)
+    dir_norm = str(direction or "").strip().lower()
     if dir_norm == "bearish":
         raw = -raw
     elif dir_norm != "bullish":
@@ -499,8 +443,6 @@ class _FrozenPrediction:
 def build_time_frozen_provenance(
     prediction_row: dict[str, Any],
     scorecards_at_time: dict[str, SignalScorecard],
-    *,
-    engine: Any = None,
 ) -> TradeProvenanceReport:
     """Reconstruct a ``TradeProvenanceReport`` using only data that existed
     at the prediction's ``created_at``.
@@ -568,44 +510,12 @@ def build_time_frozen_provenance(
     disagreement_score = float(signals.get("disagreement_score", 0.0) or 0.0)
     red_team_risk = float(signals.get("red_team_epistemic_risk", 0.0) or 0.0)
 
-    # EDGE-table multiplier — no-op (returns 1.0) when
-    # ``GRID_EDGE_SIGNALS_ENABLED`` is off (or no engine passed), so
-    # production behaviour is unchanged until the operator opts in.
-    #
-    # We route through ``edge_multiplier_for_prediction`` rather than
-    # ``compute_aggregate_edge_multiplier(signal_evidence, ticker)``
-    # because the edge_table keys on signal-source ``source_type``
-    # (insider / quiverquant:offexchange / smart_money / ...), which
-    # is the ``signal_sources`` table's schema — not the Shapley
-    # feature names that ``signal_evidence.signal_source`` carries
-    # (equity / vol / ci_full / aapl_pcr / ...). Bridging via a
-    # signal_sources lookup costs one short SELECT per prediction
-    # and lets the multiplier actually fire.
-    from intelligence.edge_signals import edge_multiplier_for_prediction
-    # Pass the prediction's direction so the multiplier flips IC sign
-    # when the signal's natural direction opposes the prediction. Pre-
-    # 2026-05-13 the lookup was direction-agnostic and would happily
-    # boost CALL predictions that had a strongly-bearish insider-SELL
-    # signal on their ticker — which is the inversion that put HIGH
-    # bucket at 14% hit rate.
-    _pred_dir = (
-        str(prediction_row.get("direction") or "")
-        or str(signals.get("direction") or "")
-    )
-    edge_signal_multiplier = edge_multiplier_for_prediction(
-        engine,
-        prediction_row.get("ticker") or "",
-        prediction_row.get("created_at"),
-        prediction_direction=_pred_dir,
-    )
-
     aggregate = compute_aggregate_conviction(
         signal_evidence,
         fragility_multiplier=fragility_multiplier,
         disagreement_score=disagreement_score,
         red_team_epistemic_risk=red_team_risk,
         fudge_alert_count=fudge_alert_count,
-        edge_signal_multiplier=edge_signal_multiplier,
     )
     verdict = _verdict_from_aggregate(aggregate, confidence)
 
@@ -828,9 +738,9 @@ def _signal_contribution_attribution(
 _NARRATIVE_TEMPLATE = (
     "Walk-forward backtest — {walked} predictions replayed over {days}d, "
     "{trades} trade tickets generated. "
-    "HIGH verdict hit rate: {high_hr:.1%} (n={high_n}, sharpe={high_sharpe:+.2f}). "
-    "MEDIUM verdict hit rate: {medium_hr:.1%} (n={medium_n}, sharpe={medium_sharpe:+.2f}). "
-    "LOW verdict hit rate: {low_hr:.1%} (n={low_n}, sharpe={low_sharpe:+.2f}). "
+    "HIGH verdict hit rate: {high_hr:.1%} (n={high_n}). "
+    "MEDIUM verdict hit rate: {medium_hr:.1%} (n={medium_n}). "
+    "LOW verdict hit rate: {low_hr:.1%} (n={low_n}). "
     "Stress-test calibration lift: {lift} "
     "(fragile failure rate {fragile_fail} vs robust {robust_fail}). "
     "Verdict is {empirical_call}."
@@ -870,9 +780,6 @@ def _build_narrative(
     high_hr = high.hit_rate if high else 0.0
     medium_hr = medium.hit_rate if medium else 0.0
     low_hr = low.hit_rate if low else 0.0
-    high_sharpe = high.sharpe if high else 0.0
-    medium_sharpe = medium.sharpe if medium else 0.0
-    low_sharpe = low.sharpe if low else 0.0
 
     lift_raw = calibration.get("lift")
     fragile_raw = calibration.get("fragile_failure_rate")
@@ -880,35 +787,11 @@ def _build_narrative(
     lift_str = f"{lift_raw:+.1%}" if lift_raw is not None else "N/A (one bucket empty)"
     fragile_str = f"{fragile_raw:.1%}" if fragile_raw is not None else "N/A"
     robust_str = f"{robust_raw:.1%}" if robust_raw is not None else "N/A"
-
-    # Two-axis verdict: hit_rate AND risk-adjusted return (sharpe). PR #193
-    # produced HIGH hit=50.5% vs MEDIUM 45.7% (a ~5pp spread that read
-    # INCONCLUSIVE under the old hit-rate-only logic) while HIGH sharpe was
-    # +1.37 vs MEDIUM -1.70 = +3.07 spread — a clear CALIBRATED signal
-    # the audit missed. Now:
-    #   - CALIBRATED when HIGH dominates MEDIUM on EITHER axis (hit_rate
-    #     spread >= 5pp OR sharpe spread >= 1.0)
-    #   - BROKEN when HIGH underperforms MEDIUM on BOTH axes
-    #   - Otherwise INCONCLUSIVE.
-    if high_n > 0 and medium_n > 0:
-        hr_spread = high_hr - medium_hr
-        sharpe_spread = high_sharpe - medium_sharpe
-        if hr_spread >= 0.05 or sharpe_spread >= 1.0:
-            call = (
-                "STACK CALIBRATED — HIGH beats MEDIUM "
-                f"(hit_rate {hr_spread:+.1%}, sharpe {sharpe_spread:+.2f})"
-            )
-        elif hr_spread < 0 and sharpe_spread < 0:
-            call = (
-                "STACK BROKEN — HIGH underperforms MEDIUM on both axes "
-                f"(hit_rate {hr_spread:+.1%}, sharpe {sharpe_spread:+.2f}), "
-                "retune required"
-            )
-        else:
-            call = (
-                "STACK INCONCLUSIVE — mixed signal "
-                f"(hit_rate {hr_spread:+.1%}, sharpe {sharpe_spread:+.2f})"
-            )
+    # The acid test: HIGH should beat MEDIUM should beat LOW.
+    if high_n > 0 and medium_n > 0 and high_hr > medium_hr + 0.05:
+        call = "STACK CALIBRATED — HIGH meaningfully beats MEDIUM"
+    elif high_n > 0 and medium_n > 0 and high_hr < medium_hr:
+        call = "STACK BROKEN — HIGH underperforms MEDIUM, retune required"
     else:
         call = "STACK INCONCLUSIVE — insufficient separation between buckets"
 
@@ -918,13 +801,10 @@ def _build_narrative(
         trades=int(trades_generated),
         high_hr=high_hr,
         high_n=high_n,
-        high_sharpe=high_sharpe,
         medium_hr=medium_hr,
         medium_n=medium_n,
-        medium_sharpe=medium_sharpe,
         low_hr=low_hr,
         low_n=low_n,
-        low_sharpe=low_sharpe,
         lift=lift_str,
         fragile_fail=fragile_str,
         robust_fail=robust_str,
@@ -934,26 +814,6 @@ def _build_narrative(
 
 # ── DB layer ──────────────────────────────────────────────────────────────
 
-
-# Walk replay must be chronological (PIT integrity), but when --limit is
-# given the caller wants the MOST RECENT N predictions, not the oldest N.
-# Selecting the recent slice in DESC order then re-sorting ASC in Python
-# preserves both invariants. Without LIMIT the second query (ASC) is used.
-_WALK_QUERY_LIMITED = text(
-    """
-    SELECT * FROM (
-        SELECT id, ticker, created_at, expiry, confidence, verdict,
-               model_name, signals, model_weights, pnl_pct, direction
-        FROM oracle_predictions
-        WHERE verdict IN ('hit', 'miss', 'partial')
-          AND created_at >= NOW() - (:days || ' days')::interval
-          AND dedup_keep = TRUE
-        ORDER BY created_at DESC
-        LIMIT :lim
-    ) recent
-    ORDER BY created_at ASC
-    """
-)
 
 _WALK_QUERY = text(
     """
@@ -1000,13 +860,7 @@ def _load_scored_predictions(
     """
     try:
         with engine.connect() as conn:
-            if limit is not None and int(limit) > 0:
-                rows = conn.execute(
-                    _WALK_QUERY_LIMITED,
-                    {"days": int(days), "lim": int(limit)},
-                ).fetchall()
-            else:
-                rows = conn.execute(_WALK_QUERY, {"days": int(days)}).fetchall()
+            rows = conn.execute(_WALK_QUERY, {"days": int(days)}).fetchall()
     except Exception as exc:  # noqa: BLE001
         # Loud-fail: previously this swallowed schema mismatches silently and
         # produced misleading "no predictions found" reports. Now we log the
@@ -1270,7 +1124,7 @@ def walk_forward(
                 as_of=created_at,
                 horizon_days=row_horizon,
             )
-            provenance = build_time_frozen_provenance(enriched, scorecards, engine=engine)
+            provenance = build_time_frozen_provenance(enriched, scorecards)
 
             try:
                 stress = run_stress_test(provenance)
@@ -1335,23 +1189,11 @@ def walk_forward(
                 pit_hits += 1
             hit = classify_hit(provenance.direction, outcome_verdict)
 
-            # Robustness gate: a HIGH-bucket prediction whose stress
-            # test flags it as fragile is by definition over-confident
-            # — small signal perturbations flip its verdict, so the
-            # +1.15 conviction is barely-over-threshold rather than
-            # genuinely robust. Demote it to MEDIUM so the verdict
-            # buckets are honest. Without this gate, post-#126 every
-            # HIGH prediction was stress-fragile and the bucket's hit
-            # rate cratered (13.2% vs LOW's 33.9%).
-            gated_verdict = provenance.verdict
-            if gated_verdict == "high" and stress_label == "fragile":
-                gated_verdict = "medium"
-
             trade = BacktestTrade(
                 prediction_id=str(row.get("id")),
                 ticker=str(row.get("ticker") or ""),
                 prediction_date=created_at.isoformat(),
-                verdict=gated_verdict,
+                verdict=provenance.verdict,
                 aggregate_conviction=float(provenance.aggregate_conviction),
                 robustness_label=stress_label,
                 robustness_score=stress_score,

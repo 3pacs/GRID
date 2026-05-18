@@ -226,43 +226,6 @@ def test_classify_hit_directional_truth_table():
     assert wfv.classify_hit("bullish", "partial") is True
 
 
-def test_canonical_direction_handles_production_vocabulary():
-    # Bullish vocabulary
-    for raw in ("bullish", "BULL", "Call", "long", "buy", "up", " CALL "):
-        assert wfv._canonical_direction(raw) == "bullish", raw
-    # Bearish vocabulary
-    for raw in ("bearish", "BEAR", "Put", "short", "sell", "down", " PUT "):
-        assert wfv._canonical_direction(raw) == "bearish", raw
-    # Unknown / empty collapse to ""
-    for raw in (None, "", "neutral", "sideways", "n/a", "wat"):
-        assert wfv._canonical_direction(raw) == "", repr(raw)
-
-
-def test_classify_hit_options_vocabulary():
-    # The oracle stores CALL/PUT in production. classify_hit must treat
-    # them identically to bullish/bearish; partial counts as a hit for
-    # both. Regression for #137-followup walk-forward calibration bug.
-    assert wfv.classify_hit("CALL", "hit") is True
-    assert wfv.classify_hit("CALL", "partial") is True
-    assert wfv.classify_hit("CALL", "miss") is False
-    assert wfv.classify_hit("PUT", "hit") is True
-    assert wfv.classify_hit("PUT", "partial") is True
-    assert wfv.classify_hit("PUT", "miss") is False
-
-
-def test_realized_return_from_outcome_options_vocabulary():
-    # Pre-fix: CALL/PUT → sign=0 → return=0 for every outcome, which
-    # silently zeroed out mean/std/sharpe/drawdown for every bucket.
-    hit_call = wfv._realized_return_from_outcome("CALL", "hit")
-    hit_put = wfv._realized_return_from_outcome("PUT", "hit")
-    miss_call = wfv._realized_return_from_outcome("CALL", "miss")
-    assert hit_call > 0.0
-    assert hit_put < 0.0
-    assert miss_call < 0.0
-    assert wfv._realized_return_from_outcome("CALL", "partial") > 0.0
-    assert wfv._realized_return_from_outcome("PUT", "partial") < 0.0
-
-
 # ── build_time_frozen_provenance ──────────────────────────────────────────
 
 
@@ -604,47 +567,15 @@ def test_resolve_ticker_feature_id_missing_caches_none():
     assert cache["zzzz"] is None
 
 
-def test_pit_price_on_or_before_returns_value_and_obs_date():
+def test_pit_price_on_or_before_returns_value():
     d = datetime(2026, 3, 15).date()
     store = _FakePITStore({(42, d): 215.5})
-    result = wfv._pit_price_on_or_before(store, 42, d)
-    assert result is not None
-    price, obs_date = result
-    assert price == 215.5
-    assert obs_date == d
+    assert wfv._pit_price_on_or_before(store, 42, d) == 215.5
 
 
 def test_pit_price_on_or_before_empty_returns_none():
     store = _FakePITStore({})
     assert wfv._pit_price_on_or_before(store, 42, datetime(2026, 3, 15).date()) is None
-
-
-def test_realized_return_from_pit_stale_feed_returns_none():
-    """When the price feed has not been refreshed past the prediction's
-    exit date, PIT serves the same observation row for both endpoints.
-    The audit must surface that as missing (caller falls back to outcome
-    proxy) instead of computing a synthetic zero return that pollutes
-    mean/std/sharpe across the bucket. Regression for the post-#187
-    PIT-zero-return investigation.
-    """
-    entry = datetime(2026, 3, 15).date()
-    exit_ = datetime(2026, 3, 22).date()
-    last_stale = datetime(2026, 3, 14).date()  # both lookups collapse here
-    store = _FakePITStore({(42, last_stale): 100.0})
-    # Both PIT calls hit the only available row (2026-03-14), so PIT
-    # returns 100.0 for both — but the obs_date is identical, so the
-    # stale-feed guard fires.
-    # Patch _FakePITStore to serve last_stale's price for any as_of:
-    class _StaleStore(_FakePITStore):
-        def get_pit(self, feature_ids, as_of_date, vintage_policy="LATEST_AS_OF"):
-            import pandas as pd
-            return pd.DataFrame([
-                {"feature_id": fid, "obs_date": last_stale, "value": 100.0,
-                 "release_date": last_stale, "vintage_date": last_stale}
-                for fid in feature_ids
-            ])
-    stale = _StaleStore({})
-    assert wfv._realized_return_from_pit(stale, 42, "bullish", entry, exit_) is None
 
 
 def test_realized_return_from_pit_bullish_up():
@@ -713,96 +644,3 @@ def test_walk_forward_falls_back_to_proxy_when_feature_missing():
     assert report.trades_generated == 1
     rr = [s for s in report.verdict_stats.values() if s.n_trades == 1][0].mean_return
     assert pytest.approx(rr, abs=1e-9) == 0.02
-
-
-# ── sharpe-aware narrative verdict ────────────────────────────────────────
-
-
-class _FakeVerdictStats:
-    """Minimal duck-typed VerdictStats stand-in for narrative tests.
-    Sharpe + hit_rate + n_trades is all the verdict logic reads.
-    """
-
-    def __init__(self, n_trades: int, hit_rate: float, sharpe: float) -> None:
-        self.n_trades = n_trades
-        self.hit_rate = hit_rate
-        self.sharpe = sharpe
-
-
-def test_narrative_verdict_calibrated_on_sharpe_alone():
-    """PR #193's live audit had HIGH hit=50.5% vs MEDIUM 45.7%
-    (only +4.8pp — under the old 5pp threshold) but sharpe was +1.37
-    vs -1.70 (+3.07 spread). The new two-axis verdict catches this
-    and reports CALIBRATED instead of INCONCLUSIVE.
-    """
-    stats = {
-        "high":   _FakeVerdictStats(n_trades=754,  hit_rate=0.505, sharpe=1.37),
-        "medium": _FakeVerdictStats(n_trades=678,  hit_rate=0.457, sharpe=-1.70),
-        "low":    _FakeVerdictStats(n_trades=4632, hit_rate=0.505, sharpe=-0.28),
-    }
-    narrative = wfv._build_narrative(
-        days=365, walked=6064, trades_generated=6064,
-        verdict_stats=stats,
-        calibration={"lift": None, "fragile_failure_rate": None, "robust_failure_rate": 0.50},
-    )
-    assert "STACK CALIBRATED" in narrative
-    assert "sharpe" in narrative
-    # The legacy phrasing should not be emitted on this slice.
-    assert "STACK INCONCLUSIVE" not in narrative
-
-
-def test_narrative_verdict_calibrated_on_hit_rate_alone():
-    # Sharpe roughly equal; hit_rate spread alone (>= 5pp) → CALIBRATED.
-    stats = {
-        "high":   _FakeVerdictStats(n_trades=100, hit_rate=0.60, sharpe=0.5),
-        "medium": _FakeVerdictStats(n_trades=100, hit_rate=0.50, sharpe=0.4),
-        "low":    _FakeVerdictStats(n_trades=100, hit_rate=0.45, sharpe=0.3),
-    }
-    narrative = wfv._build_narrative(
-        days=365, walked=300, trades_generated=300, verdict_stats=stats,
-        calibration={},
-    )
-    assert "STACK CALIBRATED" in narrative
-
-
-def test_narrative_verdict_broken_only_when_both_axes_negative():
-    # HIGH worse on BOTH hit_rate AND sharpe → BROKEN.
-    stats = {
-        "high":   _FakeVerdictStats(n_trades=100, hit_rate=0.40, sharpe=-1.0),
-        "medium": _FakeVerdictStats(n_trades=100, hit_rate=0.50, sharpe=0.5),
-        "low":    _FakeVerdictStats(n_trades=100, hit_rate=0.45, sharpe=0.2),
-    }
-    narrative = wfv._build_narrative(
-        days=365, walked=300, trades_generated=300, verdict_stats=stats,
-        calibration={},
-    )
-    assert "STACK BROKEN" in narrative
-
-
-def test_narrative_verdict_inconclusive_on_mixed_signal():
-    # Mixed: HIGH slightly worse on hit, slightly better on sharpe.
-    stats = {
-        "high":   _FakeVerdictStats(n_trades=100, hit_rate=0.48, sharpe=0.6),
-        "medium": _FakeVerdictStats(n_trades=100, hit_rate=0.50, sharpe=0.3),
-        "low":    _FakeVerdictStats(n_trades=100, hit_rate=0.45, sharpe=0.2),
-    }
-    narrative = wfv._build_narrative(
-        days=365, walked=300, trades_generated=300, verdict_stats=stats,
-        calibration={},
-    )
-    assert "INCONCLUSIVE" in narrative
-
-
-def test_narrative_includes_per_bucket_sharpe():
-    stats = {
-        "high":   _FakeVerdictStats(n_trades=10, hit_rate=0.60, sharpe=1.234),
-        "medium": _FakeVerdictStats(n_trades=10, hit_rate=0.50, sharpe=-0.567),
-        "low":    _FakeVerdictStats(n_trades=10, hit_rate=0.40, sharpe=0.0),
-    }
-    narrative = wfv._build_narrative(
-        days=365, walked=30, trades_generated=30, verdict_stats=stats,
-        calibration={},
-    )
-    assert "sharpe=+1.23" in narrative
-    assert "sharpe=-0.57" in narrative
-    assert "sharpe=+0.00" in narrative

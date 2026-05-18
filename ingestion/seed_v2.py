@@ -45,7 +45,7 @@ VALUES
   ('USDA_NASS',   'https://quickstats.nass.usda.gov/api',     'FREE', 'WEEKLY',  FALSE, 'RARE',   'HIGH', 32, TRUE),
   ('OFR',         'https://financialresearch.gov/data',       'FREE', 'WEEKLY',  FALSE, 'NEVER',  'HIGH', 33, TRUE),
   ('OppInsights', 'https://github.com/OpportunityInsights',  'FREE', 'WEEKLY',  FALSE, 'RARE',   'HIGH', 34, TRUE),
-  -- ('NOAA_AIS', ...) deprecated 2026-05-17: upstream NOAA AIS_Zone_Summary CSV retired; ais_ground_truth (id 1122) is the AIS canonical source.
+  ('NOAA_AIS',    'https://marinecadastre.gov/ais',           'FREE', 'ANNUAL',  FALSE, 'NEVER',  'HIGH', 35, TRUE),
   ('GDELT',       'https://api.gdeltproject.org/api/v2',      'FREE', 'DAILY',   FALSE, 'NEVER',  'MED',  36, FALSE)
 ON CONFLICT (name) DO NOTHING;
 """

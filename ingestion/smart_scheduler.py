@@ -87,7 +87,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "imf",               "mod": "ingestion.international.imf",         "cls": "IMFPuller",                "method": "pull_all",      "freq_h": 168, "timeout_s": 180},
     {"name": "dark_pool",         "mod": "ingestion.altdata.dark_pool",         "cls": "DarkPoolPuller",           "method": "pull_weekly",   "freq_h": 168, "timeout_s": 60},
     {"name": "gov_contracts",     "mod": "ingestion.altdata.gov_contracts",     "cls": "GovContractsPuller",       "method": "pull_all",      "freq_h": 168, "timeout_s": 120},
-    {"name": "supply_chain",      "mod": "ingestion.altdata.supply_chain",      "cls": "SupplyChainPuller",        "method": "pull_all",      "freq_h": 168, "timeout_s": 60, "api_key": "FRED_API_KEY"},
+    {"name": "supply_chain",      "mod": "ingestion.altdata.supply_chain",      "cls": "SupplyChainPuller",        "method": "pull_all",      "freq_h": 168, "timeout_s": 60},
 
     # ── Monthly / slow (run rarely) ──
     {"name": "campaign_finance",  "mod": "ingestion.altdata.campaign_finance",  "cls": "CampaignFinancePuller",    "method": "pull_all",      "freq_h": 720, "timeout_s": 300},
@@ -123,7 +123,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "pumpfun",           "mod": "ingestion.pumpfun",                 "cls": "PumpFunPuller",            "method": "pull_all",      "freq_h": 6,  "timeout_s": 60},
 
     # ── Government / regulatory ──
-    {"name": "bls",               "mod": "ingestion.bls",                     "cls": "BLSPuller",                "method": "pull_all",      "freq_h": 168, "timeout_s": 120, "api_key": "BLS_API_KEY"},
+    {"name": "bls",               "mod": "ingestion.bls",                     "cls": "BLSPuller",                "method": "pull_all",      "freq_h": 168, "timeout_s": 120},
     {"name": "edgar",             "mod": "ingestion.edgar",                   "cls": "EDGARPuller",              "method": "pull_all",      "freq_h": 24, "timeout_s": 180},
     {"name": "cftc_cot",          "mod": "ingestion.altdata.cftc_cot",        "cls": "CFTCCOTPuller",            "method": "pull_all",      "freq_h": 168, "timeout_s": 120},
 
@@ -147,45 +147,6 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "kalshi_markets",        "mod": "ingestion.altdata.kalshi_markets",           "cls": "KalshiMarketsPuller",      "method": "pull_all",  "freq_h": 12,  "timeout_s": 60},
     {"name": "fed_speeches",          "mod": "ingestion.altdata.fed_speeches",             "cls": "FedSpeechPuller",          "method": "pull_all",  "freq_h": 24,  "timeout_s": 60},
     {"name": "crucix_bridge",         "mod": "ingestion.crucix_bridge",                    "cls": "CrucixBridgePuller",       "method": "pull_all",  "freq_h": 1,   "timeout_s": 60},
-
-    # ── ticker_metrics_daily writer (task #161 fix, 2026-05-17) ──
-    # sec_xbrl_shares reads YF:{ticker}:close from raw_series and writes
-    # market_cap to ticker_metrics_daily. Was registered in hermes_operator
-    # PULLER_CONFIG but missing from this registry, so it never ran from
-    # 2026-04-12 onward — leaving blue-chip rows stuck at 03-31/04-08.
-    {"name": "sec_xbrl_shares",     "mod": "ingestion.altdata.sec_xbrl_shares",      "cls": "SECXBRLSharesPuller",   "method": "pull_all",  "freq_h": 24,  "timeout_s": 1800, "kwargs": {"limit": 400, "backfill_days": 90}},
-
-    # ── Silent-orphan additions (task #170 fix, 2026-05-17) ──
-    # Pullers that were registered in hermes_operator.py _SOURCE_REGISTRY but
-    # never made it into this runtime registry. Same class of bug as #161
-    # (sec_xbrl_shares). Audited via /tmp/audit_v2.py — all entries are
-    # BasePuller-compatible (db_engine=engine ctor + pull/pull_all method).
-    # Module-level fn entries (e.g. obsidian, apple_supplier_list, sec_13f_live)
-    # are NOT added here because smart_scheduler._build_puller_instance
-    # requires a class. Those need their own scheduler path or class wrappers.
-    {"name": "cboe",                  "mod": "ingestion.altdata.cboe_indices",       "cls": "CBOEIndicesPuller",          "method": "pull_all",  "freq_h": 24,  "timeout_s": 120},
-    {"name": "googletrends",          "mod": "ingestion.altdata.google_trends",      "cls": "GoogleTrendsPuller",         "method": "pull_all",  "freq_h": 24,  "timeout_s": 180, "kwargs": {"days_back": 30}},
-    {"name": "hf_financial_news",     "mod": "ingestion.altdata.hf_financial_news",  "cls": "HFFinancialNewsPuller",      "method": "pull_all",  "freq_h": 24,  "timeout_s": 300},
-    {"name": "ny_fed",                "mod": "ingestion.altdata.nyfed",              "cls": "NYFedPuller",                "method": "pull_all",  "freq_h": 24,  "timeout_s": 120},
-    {"name": "nyfed_gscpi",           "mod": "ingestion.altdata.nyfed_gscpi",        "cls": "NYFedGSCPIPuller",           "method": "pull_all",  "freq_h": 24,  "timeout_s": 60},
-    {"name": "stocktwits",            "mod": "ingestion.altdata.stocktwits",         "cls": "StockTwitsPuller",           "method": "pull_all",  "freq_h": 12,  "timeout_s": 60},
-    {"name": "defillama",             "mod": "ingestion.altdata.defi_llama_puller",  "cls": "DefiLlamaPuller",            "method": "pull_all",  "freq_h": 24,  "timeout_s": 180},
-    {"name": "dune",                  "mod": "ingestion.altdata.dune_puller",        "cls": "DunePuller",                 "method": "pull_all",  "freq_h": 6,   "timeout_s": 180, "api_key": "DUNE_API_KEY", "api_key_mode": "keyword"},
-    {"name": "repo_market",           "mod": "ingestion.altdata.repo_market",        "cls": "RepoMarketPuller",           "method": "pull_all",  "freq_h": 168, "timeout_s": 120, "api_key": "FRED_API_KEY", "api_key_mode": "first"},
-    {"name": "legislation",           "mod": "ingestion.altdata.legislation",        "cls": "LegislationPuller",          "method": "pull_all",  "freq_h": 24,  "timeout_s": 180},
-    {"name": "earnings_calendar",     "mod": "ingestion.altdata.earnings_calendar",  "cls": "EarningsCalendarPuller",     "method": "pull_all",  "freq_h": 24,  "timeout_s": 120},
-    {"name": "social_attention",      "mod": "ingestion.altdata.social_attention",   "cls": "WikipediaAttentionPuller",   "method": "pull_all",  "freq_h": 24,  "timeout_s": 1800,  "kwargs": {"max_tickers": 100}},
-    {"name": "yield_curve_full",      "mod": "ingestion.altdata.yield_curve_full",   "cls": "FullYieldCurvePuller",       "method": "pull_all",  "freq_h": 24,  "timeout_s": 120, "api_key": "FRED_API_KEY", "api_key_mode": "first"},
-    {"name": "sec_xbrl_financials",   "mod": "ingestion.altdata.sec_xbrl_financials","cls": "SECXBRLFinancialsPuller",    "method": "pull_all",  "freq_h": 168, "timeout_s": 1800, "kwargs": {"limit": 200}},
-    {"name": "fx_rates",              "mod": "ingestion.altdata.fx_rates",           "cls": "FXRatesPuller",              "method": "pull",      "freq_h": 24,  "timeout_s": 120, "kwargs": {"days_back": 7}},
-    {"name": "margin_debt",           "mod": "ingestion.altdata.margin_debt",        "cls": "MarginDebtPuller",           "method": "pull",      "freq_h": 168, "timeout_s": 60},
-    {"name": "ag_commodity_futures",  "mod": "ingestion.altdata.ag_commodity_futures","cls": "AgCommodityFuturesPuller",  "method": "pull_all",  "freq_h": 24,  "timeout_s": 180},
-    {"name": "alphavantage_sentiment","mod": "ingestion.altdata.alphavantage_sentiment","cls": "AlphaVantageSentimentPuller","method": "pull_all","freq_h": 24,  "timeout_s": 180},
-    {"name": "ads_index",             "mod": "ingestion.altdata.ads_index",          "cls": "ADSIndexPuller",             "method": "pull_all",  "freq_h": 168, "timeout_s": 60},
-    {"name": "baltic_exchange",       "mod": "ingestion.altdata.baltic_dry",         "cls": "BalticDryPuller",            "method": "pull_all",  "freq_h": 24,  "timeout_s": 60,  "api_key": "FRED_API_KEY", "api_key_mode": "first"},
-    {"name": "finra_ats",             "mod": "ingestion.altdata.finra_ats",          "cls": "FINRAATSPuller",             "method": "pull_all",  "freq_h": 168, "timeout_s": 120},
-    {"name": "offshore_leaks",        "mod": "ingestion.altdata.offshore_leaks",     "cls": "OffshoreLeaksPuller",        "method": "pull",      "freq_h": 720, "timeout_s": 600},
-    {"name": "wikidata_persons",      "mod": "ingestion.altdata.wikidata_persons",   "cls": "WikidataPersonPuller",       "method": "pull_all",  "freq_h": 168, "timeout_s": 1800},
 ]
 
 # How many pullers to run per tick (keeps cycles short)
@@ -233,57 +194,6 @@ class SmartScheduler:
         # and were left running in the background. See class docstring.
         self._orphan_thread_count: int = 0
         self._load_state_from_db()
-        self._warn_registry_divergence()
-
-    def _warn_registry_divergence(self) -> None:
-        """Detect & log orphan pullers across hermes_operator and this registry.
-
-        Task #170 (2026-05-17) added this guard. Task #179 (2026-05-17)
-        consolidated ``_SOURCE_REGISTRY`` to be DERIVED from PULLER_REGISTRY
-        + a small explicit ``_SOURCE_EXTRAS`` overlay, so the only remaining
-        divergence sources are intentional (fn-based pullers, audit-only
-        skip_runtime stubs, and historical alias names). Those live in
-        ``hermes_operator._SOURCE_EXTRAS`` and ``_SOURCE_ALIASES`` and are
-        filtered out before warning — anything left over IS a regression.
-        """
-        try:
-            from scripts.hermes_operator import (
-                _SOURCE_REGISTRY as _CFG,
-                _SOURCE_EXTRAS,
-                _SOURCE_ALIASES,
-            )
-        except Exception as exc:
-            log.debug("Registry-divergence check skipped: {e}", e=str(exc))
-            return
-        cfg = set(_CFG.keys())
-        reg = {p["name"] for p in PULLER_REGISTRY}
-        # Intentional cfg-only entries (fn-based, skip_runtime, not-yet-wired
-        # class pullers) live in _SOURCE_EXTRAS, and alias names alias onto
-        # a canonical PULLER_REGISTRY entry — neither indicates a bug.
-        intentional_cfg_only = set(_SOURCE_EXTRAS.keys()) | set(_SOURCE_ALIASES.keys())
-        only_cfg = (cfg - reg) - intentional_cfg_only
-        only_reg = reg - cfg
-        if only_cfg:
-            log.warning(
-                "SmartScheduler registry divergence — {n} pullers in "
-                "hermes_operator._SOURCE_REGISTRY but NOT in PULLER_REGISTRY "
-                "(silent orphans, won't run): {names}",
-                n=len(only_cfg), names=sorted(only_cfg),
-            )
-        if only_reg:
-            log.info(
-                "SmartScheduler registry note — {n} pullers in PULLER_REGISTRY "
-                "but not in hermes_operator._SOURCE_REGISTRY (running but "
-                "undocumented in operator): {names}",
-                n=len(only_reg), names=sorted(only_reg),
-            )
-        if not only_cfg and not only_reg:
-            log.info(
-                "SmartScheduler registry consolidated — _SOURCE_REGISTRY "
-                "derived from PULLER_REGISTRY ({n} entries) + {ne} extras "
-                "+ {na} aliases. No divergence.",
-                n=len(reg), ne=len(_SOURCE_EXTRAS), na=len(_SOURCE_ALIASES),
-            )
 
     def _load_state_from_db(self) -> None:
         """Bootstrap state from source_catalog.last_pull_at."""

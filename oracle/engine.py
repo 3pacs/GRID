@@ -1287,27 +1287,10 @@ class OracleEngine:
                             journal_mult = journal_bias.get(
                                 "confidence_multiplier", 1.0,
                             )
-                            # Per-model reliability calibration — see
-                            # intelligence.confidence_calibration for why the
-                            # old blanket min(0.95, ...) was demoted in favour
-                            # of an empirical lookup against
-                            # confidence_reliability_curves.
-                            adjusted = pred.confidence * journal_mult
-                            try:
-                                from intelligence.confidence_calibration import (
-                                    calibrate_confidence,
-                                )
-                                adjusted = calibrate_confidence(
-                                    adjusted,
-                                    getattr(pred, "model_name", "") or "",
-                                    self.engine,
-                                )
-                            except Exception:  # pragma: no cover — defensive
-                                adjusted = min(0.95, adjusted)
                             pred = replace(
                                 pred,
                                 confidence=round(
-                                    max(0.0, min(0.95, adjusted)), 4,
+                                    min(0.95, pred.confidence * journal_mult), 4,
                                 ),
                                 model_weights={
                                     m.name: m.weight for m in self.models
@@ -1481,22 +1464,7 @@ class OracleEngine:
                 journal_mult = journal_bias.get("confidence_multiplier", 1.0)
                 raw_confidence *= journal_mult
 
-                # Per-model reliability curve (intelligence.confidence_calibration):
-                # the prior cap was a blanket min(0.95, ...) regardless of how
-                # the model historically performs at this raw range. That produced
-                # the saturated 612-trade cluster pinned at 0.950 with hit-rate
-                # 16.8% that PRs #187/#192/#193 surfaced. Calibrating routes the
-                # raw value through the model's empirical reliability curve so a
-                # model that hits 0% at raw>=0.9 is downgraded to ~0 instead of
-                # being clamped to 0.95. Falls back to the raw value when the
-                # model has no curve data (cold start).
-                raw_capped = max(0.05, min(1.0, raw_confidence / 5.0))
-                try:
-                    from intelligence.confidence_calibration import calibrate_confidence
-                    confidence = calibrate_confidence(raw_capped, model.name, self.engine)
-                    confidence = max(0.05, min(0.95, confidence))
-                except Exception:  # pragma: no cover — defensive fallback
-                    confidence = min(0.95, raw_capped)
+                confidence = min(0.95, max(0.05, raw_confidence / 5.0))  # Normalize to 0-1
 
                 # Expected move (conservative estimate)
                 expected_move = signal_strength * 0.5  # 0.5% per unit of signal strength

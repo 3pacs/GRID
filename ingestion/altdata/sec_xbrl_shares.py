@@ -247,42 +247,8 @@ def _fetch_close_prices(
 
 
 # ── DB writer ───────────────────────────────────────────────────────────
-#
-# Source-precedence policy (task #171, decided 2026-05-17):
-# ---------------------------------------------------------
-# Two writers target ticker_metrics_daily:
-#   1. sec_xbrl_shares (this module) — writes all 5 columns
-#      (shares_outstanding, close_price, market_cap_usd, source, as_of)
-#      for a ~90-day rolling window where XBRL facts + raw_series prices
-#      are both available. Source label: ``sec_xbrl + yfinance``.
-#   2. scripts/td_backfill_universe.py — writes close_price ONLY for the
-#      full freshness-audit ticker universe (365d window for DEAD bucket,
-#      down to 60d for STALE_7_30). Source label: ``twelvedata_universe_backfill``.
-#
-# Decision: (c) Coalesce with SEC XBRL preference for the columns it owns.
-#   - SEC XBRL is the canonical writer for shares_outstanding + market_cap_usd
-#     (they are computed from regulator-filed facts, immune to data-provider
-#     ticker mapping drift).
-#   - Twelve Data is the canonical writer for close_price IN THE GAP
-#     (older than XBRL's window OR more recent than XBRL's last raw_series
-#     observation by 1-3 days).
-#   - When the windows overlap on (ticker, obs_date), this SEC XBRL writer
-#     wins on every column because XBRL's close_price comes from the same
-#     raw_series row the rest of the pipeline reads, so the resulting
-#     market_cap = shares × close stays internally consistent. TD's
-#     close_price floating ~0.5% different would silently shift market_cap.
-#   - TD must never overwrite shares_outstanding or market_cap_usd. Its
-#     UPSERT clause has only ``close_price, source, as_of`` in the DO UPDATE
-#     SET list, so those columns stay XBRL-set even after a TD overwrite.
-#
-# Trade-ticket extractor (#118) reads market_cap_usd from this table.
-# Keeping XBRL as the canonical writer for that column means the trade
-# ticket sizing logic always sees a regulator-grounded market cap, not
-# a TD-API value that could lag a corporate action by a day.
-#
-# Tested by live PG smoke 2026-05-17 (task #164 sibling): with current
-# writer ordering there are zero rows where TD has overwritten a
-# market_cap-bearing XBRL row, confirming the policy holds in practice.
+
+
 _UPSERT_SQL = text(
     """
     INSERT INTO ticker_metrics_daily (

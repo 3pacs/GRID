@@ -170,10 +170,7 @@ class TestRouterIntegrity:
                 assert callable(handler), f"{path} is not callable"
 
     def test_prediction_scored_has_three_handlers(self):
-        # Wave A handlers (trust, oracle_weights, calibration) + SYNTH-42b
-        # journal.on_prediction_scored = 4 handlers. Test name preserved
-        # for grep continuity; assertion updated to reflect §7.3 reality.
-        assert len(ROUTES[PredictionScored]) == 4
+        assert len(ROUTES[PredictionScored]) == 3
 
     def test_postmortem_completed_has_two_handlers(self):
         assert len(ROUTES[PostmortemCompleted]) == 2

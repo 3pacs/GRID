@@ -731,8 +731,14 @@ def _get_pullers_for_group(
             pullers.append(("Eurostat", EurostatPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("Eurostat puller init failed: {err}", err=str(exc))
-        # noaa_ais deprecated 2026-05-17: NOAA retired AIS_Zone_Summary CSV upstream;
-        # ais_ground_truth (source id 1122) is the canonical AIS replacement.
+        try:
+            from ingestion.altdata.noaa_ais import NOAAAISPuller
+            today = date.today()
+            m = today.month - 1 if today.month > 1 else 12
+            y = today.year if today.month > 1 else today.year - 1
+            pullers.append(("NOAA_AIS", NOAAAISPuller(db_engine), "pull_monthly_summary", {"year": y, "month": m}))
+        except Exception as exc:
+            log.warning("NOAA AIS puller init failed: {err}", err=str(exc))
         try:
             from ingestion.physical.viirs import VIIRSPuller
             pullers.append(("VIIRS", VIIRSPuller(db_engine), "pull_all", {}))
