@@ -555,6 +555,28 @@ def run_intelligence_tasks(
             log.warning("earnings_events_to_calendar sync failed: {e}", e=str(exc))
         state.last_earnings_calendar_sync = now
 
+    # Periodic active-hypothesis scoring — every 30 minutes, batch up to
+    # 200 overdue hypos per tick. Closes the loop that auto_discover() in
+    # the daily batch was creating but nothing was scoring (the gap
+    # documented in the memo ``project-active-hypo-scoring-gap`` and the
+    # 2026-05-15 handoff). Cadence kept short so the ~25k current overdue
+    # backlog drains across the next ~2-3 days at ~15 scored/sec on grid-svr.
+    # Dedented out of daily_due — was only firing 2:00-2:10 UTC, now every loop
+    if _minutes_since(state.last_active_hypo_scoring) >= ACTIVE_HYPO_SCORING_INTERVAL_MINUTES:
+        try:
+            from intelligence.hypothesis_engine import score_due_active_hypotheses
+            results["active_hypo_scoring"] = _run_intel_task(
+                "active_hypo_scoring",
+                score_due_active_hypotheses,
+                state,
+                engine,
+                batch_size=ACTIVE_HYPO_SCORING_BATCH_SIZE,
+                max_runtime_s=ACTIVE_HYPO_SCORING_MAX_RUNTIME_S,
+            )
+        except Exception as exc:
+            log.warning("Active hypothesis scoring failed: {e}", e=str(exc))
+        state.last_active_hypo_scoring = now
+
     # ── Every 4 hours ────────────────────────────────────────────────
 
     if _hours_since(state.last_trust_cycle) >= 4:
@@ -694,28 +716,6 @@ def run_intelligence_tasks(
             log.warning("Power mapping failed: {e}", e=str(exc))
 
         state.last_actor_wealth = now
-
-    # Periodic active-hypothesis scoring — every 30 minutes, batch up to
-    # 200 overdue hypos per tick. Closes the loop that auto_discover() in
-    # the daily batch was creating but nothing was scoring (the gap
-    # documented in the memo ``project-active-hypo-scoring-gap`` and the
-    # 2026-05-15 handoff). Cadence kept short so the ~25k current overdue
-    # backlog drains across the next ~2-3 days at ~15 scored/sec on grid-svr.
-    # Dedented out of daily_due — was only firing 2:00-2:10 UTC, now every loop
-    if _minutes_since(state.last_active_hypo_scoring) >= ACTIVE_HYPO_SCORING_INTERVAL_MINUTES:
-        try:
-            from intelligence.hypothesis_engine import score_due_active_hypotheses
-            results["active_hypo_scoring"] = _run_intel_task(
-                "active_hypo_scoring",
-                score_due_active_hypotheses,
-                state,
-                engine,
-                batch_size=ACTIVE_HYPO_SCORING_BATCH_SIZE,
-                max_runtime_s=ACTIVE_HYPO_SCORING_MAX_RUNTIME_S,
-            )
-        except Exception as exc:
-            log.warning("Active hypothesis scoring failed: {e}", e=str(exc))
-        state.last_active_hypo_scoring = now
 
     # ── Daily at 2:00 AM (with catch-up) ─────────────────────────────
     # Fires if (a) we're in the 2:00-2:10 UTC window, OR (b) we're past 2 AM
