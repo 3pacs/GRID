@@ -75,7 +75,12 @@ jobs:
           pytest_status=$?
           set -e
 
-          tail -30 /tmp/grid-pytest-output.txt
+          # tail -30 truncated 2 of 16 failures from the 2026-05-17 run.
+          # Bump to 300 lines + wrap in a collapsed group so the full
+          # pytest summary (FAILED list + short tracebacks) survives.
+          echo "::group::pytest output (tail -300)"
+          tail -300 /tmp/grid-pytest-output.txt
+          echo "::endgroup::"
           exit "$pytest_status"
 
       - name: Check for SQL injection patterns
