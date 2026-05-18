@@ -174,7 +174,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "repo_market",           "mod": "ingestion.altdata.repo_market",        "cls": "RepoMarketPuller",           "method": "pull_all",  "freq_h": 168, "timeout_s": 120, "api_key": "FRED_API_KEY", "api_key_mode": "first"},
     {"name": "legislation",           "mod": "ingestion.altdata.legislation",        "cls": "LegislationPuller",          "method": "pull_all",  "freq_h": 24,  "timeout_s": 180},
     {"name": "earnings_calendar",     "mod": "ingestion.altdata.earnings_calendar",  "cls": "EarningsCalendarPuller",     "method": "pull_all",  "freq_h": 24,  "timeout_s": 120},
-    {"name": "social_attention",      "mod": "ingestion.altdata.social_attention",   "cls": "WikipediaAttentionPuller",   "method": "pull_all",  "freq_h": 24,  "timeout_s": 180},
+    {"name": "social_attention",      "mod": "ingestion.altdata.social_attention",   "cls": "WikipediaAttentionPuller",   "method": "pull_all",  "freq_h": 24,  "timeout_s": 1800,  "kwargs": {"max_tickers": 100}},
     {"name": "yield_curve_full",      "mod": "ingestion.altdata.yield_curve_full",   "cls": "FullYieldCurvePuller",       "method": "pull_all",  "freq_h": 24,  "timeout_s": 120, "api_key": "FRED_API_KEY", "api_key_mode": "first"},
     {"name": "sec_xbrl_financials",   "mod": "ingestion.altdata.sec_xbrl_financials","cls": "SECXBRLFinancialsPuller",    "method": "pull_all",  "freq_h": 168, "timeout_s": 1800, "kwargs": {"limit": 200}},
     {"name": "fx_rates",              "mod": "ingestion.altdata.fx_rates",           "cls": "FXRatesPuller",              "method": "pull",      "freq_h": 24,  "timeout_s": 120, "kwargs": {"days_back": 7}},
