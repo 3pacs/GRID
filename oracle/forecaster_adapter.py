@@ -229,10 +229,15 @@ def forecast_to_prediction(
     else:
         return None  # Too flat to predict
 
-    # Confidence from interval width
+    # Confidence from interval width; routed through per-model reliability
+    # curve when calibrated, falls back to the raw cap otherwise.
+    from intelligence.confidence_calibration import calibrate_confidence_default
     avg_std = np.mean(forecast_result.forecast_std) if forecast_result.forecast_std else 1.0
     interval_pct = avg_std / current_price * 100 if current_price > 0 else 50
-    confidence = max(0.1, min(0.95, 1.0 - interval_pct / 10.0))
+    confidence = calibrate_confidence_default(
+        max(0.1, min(0.95, 1.0 - interval_pct / 10.0)),
+        "forecaster_adapter",
+    )
 
     # Expiry from horizon
     expiry = date.today() + timedelta(days=forecast_result.horizon)
