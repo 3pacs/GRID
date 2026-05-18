@@ -91,7 +91,7 @@ def _fallback_chain(tier: Tier, provider: str) -> list[str]:
         # primary ORACLE node. grid-svr's Pascal P100+GTX1070 27B (`llamacpp_oracle`)
         # demoted to fallback 2026-05-09. ollama_panda (qwen2.5:32b on 2×P100)
         # is the next-strongest tier-3 fallback.
-        chain = ["llamacpp_z4", "llamacpp_quick", "llamacpp_oracle", "ollama_panda", "llamacpp", "gemma", "openrouter", "openai"]
+        chain = ["llamacpp_z4", "llamacpp_oracle", "ollama_panda", "llamacpp", "gemma", "openrouter", "openai"]
     elif tier == Tier.BATCH:
         chain = ["llamacpp_batch", "llamacpp_oracle", "llamacpp_z4", "ollama_panda", "openrouter", "openai"]
     else:
