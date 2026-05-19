@@ -165,7 +165,13 @@ def get_predictions(
             "tracking_pnl": round(tracking_pnl, 2) if tracking_pnl is not None else None,
         })
 
-    return {"predictions": predictions, "total": total, "limit": limit, "offset": offset}
+    return {
+        "predictions": predictions,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "has_more": (offset + limit) < total,
+    }
 
 
 # ── GET /scoreboard ────────────────────────────────────────────────────────
