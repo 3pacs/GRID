@@ -1,8 +1,29 @@
+## 2026-05-19 23:08 UTC — 2026-05-19-2308
+**Why this matters next run:** Line 40 (`oracle.get_predictions` has_more) is now closed by PR #240. Three sibling has_more items remain on the 2026-05-17 API audit — same one-key-add shape, very small PRs:
+- line 41 — `api/routers/models.py:67` `get_all`
+- line 42 — `api/routers/intel.py:252` `intel_search` (this one is the bigger of the three — the `_ok(...)` envelope returns NO `total`/`limit`/`offset`/`has_more` at all, so it's an "add all 4 keys" not just "add 1")
+- line 43 — `api/routers/intel.py:1384` `intel_predictions_active` (just add `has_more` to existing `meta`)
+
+Then the remaining un-claimed 2026-05-17 audit items (unchanged from 2026-05-18 entry):
+- line 44 [P1] — direct test coverage for `api/routers/system.py` (1,686-LOC, tests-only, bigger lift)
+- line 45 [P1] — switch `prediction_backtest.py:20` import `get_engine` → `get_db_engine`
+- line 46 [P2] — `clear_singletons()` doesn't actually clear `db._engine` (real bug, dep-injection plumbing)
+- line 47 [P2] — f-string SQL in `prediction_backtest.py:116`
+
+**Env gotcha discovered this run — copy the fix into your prelude:** the sandbox's `cryptography` install panics with `_cffi_backend` ModuleNotFoundError when `api.auth` is imported (transitive via `python-jose`). The `try: import api.auth except: stub` pattern from `tests/test_intelligence_search.py` does NOT catch this — `pyo3_runtime.PanicException` extends `BaseException`, not `Exception`. Fix: run `pip install --quiet --force-reinstall cffi` (the system `cryptography` 41.0.7 is fine, the `cffi` shared lib is the broken half). After that, `import api.routers.oracle` works and tests collect cleanly. Total deps for this kind of has_more PR: `pip install --quiet fastapi pydantic sqlalchemy loguru pytest ruff psycopg2-binary python-jose passlib numpy pandas && pip install --quiet --force-reinstall cffi` (~ 45s).
+
+**Pattern that worked this run:** for `oracle.get_predictions` (and likely `models.get_all`), use `patch.object(mod, "get_db_engine", return_value=...)` with a `MagicMock` whose `engine.connect().__enter__` yields a `conn` with `conn.execute.side_effect = [count_result, rows_result]`. **Important:** oracle.py line 124 opens a SECOND `engine.connect()` for `tracking_pnl` lookup when `verdict == "pending"` — set the fake row's `verdict` to `"hit"` or `"miss"` (column index 17) so that branch stays inert and you only need 2 entries in the side_effect list. Same trap probably exists in any router that does conditional sub-queries inside the result-formatting loop.
+
+**Don't bundle has_more siblings.** The orchestrator's hard rule is one PR per run.
+
+**Env (unchanged):** no python deps preinstalled; `gh` CLI absent — `mcp__github__*` only; `git push origin routine-bookkeeping` → HTTP 403, use `mcp__github__create_or_update_file` against that branch; `mcp__github__list_pull_requests` output truncates — use `search_pull_requests` or scope by branch.
+
+---
 ## 2026-05-18 23:03 UTC — 2026-05-18-2303
 **Why this matters next run:** The 2026-05-14 + 2026-05-15 "queue exhausted / no-work" entries are STALE. A fresh API audit (PUNCH-LIST-2026-05-13.md, "Auditor 2026-05-17 — api/" section, lines 34-52) landed on main in PR #190 (commit `40e7e6b5`) and has **13 unclaimed items**. Walk that section before declaring no-work.
 
 PR #239 closes line-39 [P1] (has_more in `search_intelligence`). Four other `has_more` items remain on the same auditor list, all the same shape and very small:
-- line 40 — `api/routers/oracle.py:168` `get_predictions`
+- line 40 — `api/routers/oracle.py:168` `get_predictions` *(done in PR #240, 2026-05-19-2308)*
 - line 41 — `api/routers/models.py:67` `get_all`
 - line 42 — `api/routers/intel.py:252` `intel_search` (the `_ok(...)` envelope, needs `total`+`limit`+`offset`+`has_more`)
 - line 43 — `api/routers/intel.py:1384` `intel_predictions_active` meta (just add `has_more` to the existing `meta`)
