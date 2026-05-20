@@ -48,7 +48,7 @@ openai>=1.12.0
 langfuse>=3.0.0
 
 # International data
-akshare>=1.14.0
+akshare>=1.18.63
 imfdatapy>=0.1.1
 dbnomics>=0.2.6
 eurostat>=0.2.1
