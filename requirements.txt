@@ -9,7 +9,7 @@ sqlalchemy>=2.0.0
 alembic>=1.13.0
 
 # Data
-aiohttp>=3.9
+aiohttp>=3.13.5
 pandas>=2.1.0
 numpy>=1.26.0
 fedfred>=1.2.9
