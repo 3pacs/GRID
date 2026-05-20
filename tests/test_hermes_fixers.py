@@ -66,6 +66,7 @@ def test_repair_skill_catalog_exposes_existing_and_new_fixers() -> None:
     assert "RUN_WIRING_AUDIT" in catalog
     assert "SCOUT_FREE_DATA:<source_name>" in catalog
     assert "CHECK_SOURCE_QUALITY" in catalog
+    assert "CHECK_STORAGE" in catalog
     assert "LOG_FOLLOWUP:<category>:<severity>:<title>" in catalog
     assert "LIST_SUBAGENTS" in catalog
     assert "DISPATCH_SUBAGENT:<role>:<target_id>[:priority]" in catalog
@@ -190,6 +191,7 @@ def test_list_subagents_skill_exposes_dedicated_roles() -> None:
     assert "source_doctor" in roles
     assert "free_data_scout" in roles
     assert "wiring_auditor" in roles
+    assert "storage_maintainer" in roles
     assert "hypothesis_scorer" in roles
 
 
@@ -242,6 +244,63 @@ def test_dispatch_free_data_scout_enqueues_known_role(monkeypatch) -> None:
     assert calls[0]["goal_type"] == "hermes_scout_free_data"
     assert calls[0]["target_id"] == "Tiingo"
     assert calls[0]["allow_cloud"] is False
+
+
+def test_dispatch_storage_maintainer_enqueues_known_role(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    def fake_enqueue_goal(_engine, **kwargs):
+        calls.append(kwargs)
+        return 203
+
+    import intelligence.goal_queue as goal_queue
+
+    monkeypatch.setattr(goal_queue, "enqueue_goal", fake_enqueue_goal)
+
+    result = hermes_fixers._execute_hermes_repair_command(
+        "DISPATCH_SUBAGENT:storage_maintainer:grid-svr-data:165",
+        engine=object(),
+        health={},
+        state=_FakeState(),
+    )
+
+    assert result["status"] == "queued"
+    assert result["goal_type"] == "hermes_storage_maintenance"
+    assert calls[0]["goal_type"] == "hermes_storage_maintenance"
+    assert calls[0]["target_id"] == "grid-svr-data"
+    assert calls[0]["hardware_tier"] == "cpu"
+    assert calls[0]["allow_cloud"] is False
+
+
+def test_check_storage_skill_runs_storage_curator(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    def fake_run(engine, **kwargs):
+        calls.append({"engine": engine, **kwargs})
+        return {
+            "status": "ingest_gap",
+            "target_id": kwargs["target_id"],
+            "cleanup_candidates": 2,
+            "ingest_actions": 1,
+            "summary": {"gdelt": {"ingest_status": "tables_empty"}},
+        }
+
+    from scripts import storage_curator
+
+    monkeypatch.setattr(storage_curator, "run_storage_maintenance", fake_run)
+    monkeypatch.setattr(hermes_fixers, "log_issue", lambda *_args, **_kwargs: 404)
+
+    engine = object()
+    result = hermes_fixers._execute_hermes_repair_command(
+        "CHECK_STORAGE:grid-svr-data",
+        engine=engine,
+        health={},
+        state=_FakeState(),
+    )
+
+    assert result["status"] == "ingest_gap"
+    assert result["cmd"] == "CHECK_STORAGE:grid-svr-data"
+    assert calls == [{"engine": engine, "target_id": "grid-svr-data"}]
 
 
 def test_scout_free_data_skill_logs_public_candidates(monkeypatch) -> None:

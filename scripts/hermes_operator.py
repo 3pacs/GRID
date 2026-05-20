@@ -461,6 +461,7 @@ from scripts.hermes_fixers import (  # noqa: E402, F401
     save_cycle_snapshot,
     _run_intel_task,
     _hours_since,
+    _execute_hermes_repair_command,
     _refresh_signal_registry,
 )
 
@@ -477,6 +478,16 @@ def _minutes_since(ts: datetime | None) -> float:
     if ts is None:
         return 1e9
     return (datetime.now(timezone.utc) - ts).total_seconds() / 60.0
+
+
+def _dispatch_daily_storage_maintenance(engine: Any, state: OperatorState) -> dict[str, Any]:
+    """Queue the bounded storage-maintenance subagent during Hermes daily work."""
+    return _execute_hermes_repair_command(
+        "DISPATCH_SUBAGENT:storage_maintainer:grid-svr-data:130",
+        engine=engine,
+        health={},
+        state=state,
+    )
 
 
 def run_intelligence_tasks(
@@ -735,6 +746,11 @@ def run_intelligence_tasks(
             "Running daily intelligence batch (window={w} catch_up={c})",
             w=is_daily_window, c=(is_catch_up and not is_daily_window),
         )
+
+        try:
+            results["storage_maintenance_subagent"] = _dispatch_daily_storage_maintenance(engine, state)
+        except Exception as exc:
+            log.warning("Storage maintenance subagent dispatch failed: {e}", e=str(exc))
 
         try:
             from intelligence.source_audit import run_full_audit
