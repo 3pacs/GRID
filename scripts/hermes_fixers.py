@@ -66,6 +66,7 @@ HERMES_REPAIR_SKILLS: tuple[tuple[str, str], ...] = (
     ("RUN_WIRING_AUDIT", "Run the read-only GRID wiring audit and return dark router/puller/module counts."),
     ("SCOUT_FREE_DATA:<source_name>", "Find public/free fallback candidates for a failing or low-value source."),
     ("CHECK_SOURCE_QUALITY[:days]", "Run paid-vs-free source quality ablation and write a bounded report."),
+    ("CHECK_STORAGE[:target_id]", "Run bounded grid-svr storage maintenance scan and write a cleanup/ingest plan."),
     ("LOG_FOLLOWUP:<category>:<severity>:<title>", "Record a pending operator issue for human or agent follow-up."),
     ("LIST_SUBAGENTS", "List Hermes' dedicated subagent roles and queue contracts."),
     ("DISPATCH_SUBAGENT:<role>:<target_id>[:priority]", "Queue a bounded goal for a dedicated Hermes subagent role."),
@@ -94,6 +95,13 @@ HERMES_SUBAGENTS: dict[str, dict[str, Any]] = {
         "priority": 120,
         "allow_cloud": False,
         "description": "Run the read-only wiring audit and report dark routers/pullers/modules.",
+    },
+    "storage_maintainer": {
+        "goal_type": "hermes_storage_maintenance",
+        "hardware_tier": "cpu",
+        "priority": 130,
+        "allow_cloud": False,
+        "description": "Inventory GRID data roots, flag un-ingested archives, and plan cold-storage cleanup.",
     },
     "hypothesis_scorer": {
         "goal_type": "score_active_hypothesis",
@@ -633,6 +641,36 @@ def _run_wiring_audit_summary() -> dict[str, Any]:
     }
 
 
+def _inspect_storage_maintenance(
+    engine: Any,
+    target_id: str = "grid-svr-data",
+    state: OperatorState | None = None,
+) -> dict[str, Any]:
+    """Run bounded storage maintenance in report-first mode."""
+    from scripts import storage_curator
+
+    target_id = (target_id or "grid-svr-data").strip()
+    if not target_id:
+        target_id = "grid-svr-data"
+    result = storage_curator.run_storage_maintenance(
+        _require_engine(engine, "CHECK_STORAGE"),
+        target_id=target_id,
+    )
+    if result.get("status") != "ok":
+        log_issue(
+            engine,
+            category="storage",
+            severity="WARNING" if result.get("status") == "ingest_gap" else "ERROR",
+            source=target_id,
+            title=f"Storage maintenance status — {result.get('status')}",
+            detail=json.dumps(result.get("summary", {}), default=str)[:4000],
+            fix_applied="storage_maintainer",
+            fix_result="PENDING",
+            cycle_number=getattr(state, "cycle_count", None) if state else None,
+        )
+    return {"cmd": f"CHECK_STORAGE:{target_id}", **result}
+
+
 def _log_followup_issue(raw_cmd: str, engine: Any, state: OperatorState) -> dict[str, Any]:
     parts = raw_cmd.split(":", 3)
     if len(parts) != 4:
@@ -894,6 +932,10 @@ def _execute_hermes_repair_command(
                 prediction_days=max(90, min(365, days * 6)),
             ),
         }
+
+    if upper_cmd == "CHECK_STORAGE" or upper_cmd.startswith("CHECK_STORAGE:"):
+        target_id = raw_cmd.split(":", 1)[1].strip() if ":" in raw_cmd else "grid-svr-data"
+        return _inspect_storage_maintenance(engine, target_id, state)
 
     if upper_cmd.startswith("LOG_FOLLOWUP:"):
         return _log_followup_issue(raw_cmd, engine, state)

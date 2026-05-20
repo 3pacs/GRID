@@ -237,11 +237,22 @@ def handle_hermes_wiring_audit(engine: Engine, goal: Goal) -> HandlerResult:
     return result
 
 
+def handle_hermes_storage_maintenance(engine: Engine, goal: Goal) -> HandlerResult:
+    """Run the Hermes storage-maintenance subagent."""
+    from scripts.hermes_fixers import _inspect_storage_maintenance
+    from scripts.hermes_health import OperatorState
+
+    state = OperatorState()
+    state.cycle_count = int(goal.payload.get("requested_cycle") or 0)
+    return _inspect_storage_maintenance(engine, goal.target_id, state)
+
+
 HANDLERS: dict[str, HandlerFn] = {
     "score_active_hypothesis": handle_score_active_hypothesis,
     "hermes_diagnose_source": handle_hermes_diagnose_source,
     "hermes_scout_free_data": handle_hermes_scout_free_data,
     "hermes_wiring_audit": handle_hermes_wiring_audit,
+    "hermes_storage_maintenance": handle_hermes_storage_maintenance,
 }
 
 
