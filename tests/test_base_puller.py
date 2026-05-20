@@ -216,6 +216,19 @@ class TestResolveSourceId:
 
         puller = TestPuller(engine)
         assert puller.source_id == 42
+        assert "LOWER(name) = LOWER(:name)" in str(conn.execute.call_args.args[0])
+
+    def test_resolve_uses_case_insensitive_lookup(self):
+        """Avoids duplicate inserts when only name casing differs."""
+        engine, conn = _mock_engine(source_id=187)
+
+        class TestPuller(BasePuller):
+            SOURCE_NAME = "Polymarket"
+
+        puller = TestPuller(engine)
+
+        assert puller.source_id == 187
+        assert conn.execute.call_args.args[1] == {"name": "Polymarket"}
 
     def test_resolve_raises_when_missing(self):
         """Raises RuntimeError when source not in catalog."""

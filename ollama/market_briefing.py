@@ -19,6 +19,7 @@ from typing import Any
 
 import schedule
 from loguru import logger as log
+from outputs.path_utils import ensure_output_dir
 
 # Output directory for saved briefings
 _BRIEFING_DIR = Path(__file__).parent.parent / "outputs" / "market_briefings"
@@ -48,7 +49,7 @@ class MarketBriefingEngine:
             from ollama.client import get_client
             self.ollama = get_client()
 
-        _BRIEFING_DIR.mkdir(parents=True, exist_ok=True)
+        self.output_dir = ensure_output_dir(_BRIEFING_DIR)
         log.info("MarketBriefingEngine initialised")
 
     # ------------------------------------------------------------------
@@ -643,7 +644,7 @@ class MarketBriefingEngine:
         """
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{result['type']}_{ts}.md"
-        filepath = _BRIEFING_DIR / filename
+        filepath = self.output_dir / filename
 
         with filepath.open("w", encoding="utf-8") as f:
             f.write(result["content"])
@@ -658,7 +659,8 @@ class MarketBriefingEngine:
 
         cutoff = datetime.now() - timedelta(days=max_age_days)
         deleted = 0
-        for f in _BRIEFING_DIR.glob("*.md"):
+        output_dir = ensure_output_dir(_BRIEFING_DIR)
+        for f in output_dir.glob("*.md"):
             parts = f.stem.rsplit("_", 2)
             if len(parts) >= 3:
                 try:
@@ -685,7 +687,7 @@ class MarketBriefingEngine:
             str: Briefing content, or None if not found.
         """
         pattern = f"{briefing_type}_*.md"
-        files = sorted(_BRIEFING_DIR.glob(pattern), reverse=True)
+        files = sorted(self.output_dir.glob(pattern), reverse=True)
         if not files:
             return None
         return files[0].read_text(encoding="utf-8")

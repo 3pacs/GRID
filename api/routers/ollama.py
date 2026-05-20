@@ -22,6 +22,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger as log
+from outputs.path_utils import ensure_output_dir
 from pydantic import BaseModel
 
 from api.auth import require_auth
@@ -80,6 +81,10 @@ def _get_briefing_engine():
 def _get_reasoner():
     from ollama.reasoner import OllamaReasoner
     return OllamaReasoner()
+
+
+def _get_briefing_dir() -> Path:
+    return ensure_output_dir(_BRIEFING_DIR)
 
 
 def _backend_name(client: Any) -> str:
@@ -152,10 +157,8 @@ async def list_briefings(
     limit: int = Query(default=20, ge=1, le=100),
 ) -> dict[str, Any]:
     """List saved briefing files."""
-    _BRIEFING_DIR.mkdir(parents=True, exist_ok=True)
-
     pattern = f"{briefing_type}*.md" if briefing_type else "*.md"
-    files = sorted(_BRIEFING_DIR.glob(pattern), reverse=True)[:limit]
+    files = sorted(_get_briefing_dir().glob(pattern), reverse=True)[:limit]
 
     briefings = []
     for f in files:
@@ -175,7 +178,7 @@ async def list_briefings(
 @router.get("/briefings/{filename}")
 async def read_briefing(filename: str) -> dict[str, Any]:
     """Read a specific saved briefing file."""
-    filepath = _BRIEFING_DIR / filename
+    filepath = _get_briefing_dir() / filename
     if not filepath.exists() or not filepath.is_file():
         raise HTTPException(status_code=404, detail="Briefing not found")
     content = filepath.read_text(encoding="utf-8")

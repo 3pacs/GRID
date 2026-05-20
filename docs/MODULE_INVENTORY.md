@@ -1,8 +1,8 @@
 # GRID Module Inventory
 
-Generated: 2026-05-18
-Total modules: 750
-Total LOC: 330,597
+Generated: 2026-05-20
+Total modules: 752
+Total LOC: 331,889
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycache__/`, `build/`, `dist/`, `docs/`, `node_modules/`, `notebooks/`, `pwa/`, `pwa_dist/`, `tests/`, `venv/`.
@@ -11,11 +11,11 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 
 | Directory | Module count | LOC |
 |---|---|---|
-| `intelligence/` | 172 | 102,086 |
-| `ingestion/` | 207 | 85,797 |
-| `api/` | 107 | 48,466 |
+| `intelligence/` | 173 | 103,069 |
+| `ingestion/` | 207 | 86,032 |
+| `api/` | 107 | 48,475 |
 | `analysis/` | 33 | 18,973 |
-| `trading/` | 34 | 14,158 |
+| `trading/` | 34 | 14,178 |
 | `oracle/` | 29 | 10,590 |
 | `subnet/` | 10 | 5,381 |
 | `physics/` | 18 | 4,824 |
@@ -23,18 +23,18 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 | `store/` | 6 | 4,155 |
 | `alpha_research/` | 21 | 3,592 |
 | `alerts/` | 8 | 3,351 |
-| `ollama/` | 7 | 3,153 |
+| `ollama/` | 7 | 3,155 |
 | `contracts/` | 23 | 2,663 |
 | `inference/` | 8 | 2,584 |
 | `discovery/` | 5 | 2,509 |
 | `gemma/` | 7 | 2,470 |
 | `agents/` | 9 | 1,858 |
-| `backtest/` | 4 | 1,569 |
+| `backtest/` | 4 | 1,571 |
 | `normalization/` | 3 | 1,396 |
 | `hyperspace/` | 6 | 1,309 |
 | `validation/` | 4 | 1,175 |
 | `timeseries/` | 4 | 1,017 |
-| `outputs/` | 3 | 704 |
+| `outputs/` | 4 | 745 |
 | `a2a/` | 4 | 670 |
 | `llamacpp/` | 2 | 521 |
 | `events/` | 5 | 517 |
@@ -347,7 +347,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `dataclasses`, `datetime`, `loguru`, `numpy`, `sqlalchemy`, `typing`
 **Imported by:** `intelligence/scheduler.py`
 
-#### `intelligence/counterfactual_stress.py` — 485 LOC
+#### `intelligence/counterfactual_stress.py` — 518 LOC
 **Docstring:** Counterfactual stress test engine (CAT-175).
 **Functions:** `SignalPerturbation`, `FragilityFlag`, `StressTestReport`, `perturb_brier`, `perturbed_conviction_weight`, `compute_robustness_score`, `classify_robustness`, `identify_fragility_flags`, `build_advisory`, `run_stress_test`
 **Reads:** `__future__`, `dataclasses`, `datetime`, `features`, `intelligence`, `typing`
@@ -895,6 +895,11 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `collections`, `datetime`, `db`, `itertools`, `loguru`, `normalization`, `pandas`, `sqlalchemy`, `typing`
 **Imported by:** `api/routers/intel_source_audit.py`, `api/routers/intelligence_risk.py`
 
+#### `intelligence/source_quality_ablation.py` — 950 LOC
+**Docstring:** Bounded source quality ablation for paid-vs-free data decisions.
+**Functions:** `SourceOperationalStats`, `SourcePredictionStats`, `SourceRedundancyStats`, `SourceQualityAssessment`, `SourceQualityReport`, `cost_bucket`, `extract_prediction_source_names`, `aggregate_prediction_metrics`, `build_source_quality_report`, `load_source_operational_stats`, `load_prediction_metrics`, `load_prediction_rows`, `count_attributed_prediction_rows`, `load_redundancy_metrics`, `run_source_quality_ablation`, `write_source_quality_report`, `markdown_report`, `scrub_secret_text`
+**Reads:** `__future__`, `dataclasses`, `datetime`, `json`, `loguru`, `math`, `outputs`, `pathlib`, `re`, `scripts`, `sqlalchemy`, `typing`
+
 #### `intelligence/source_trust_config.py` — 147 LOC
 **Docstring:** GRID Source Trust Configuration.
 **Functions:** `get_trust`, `trust_color`, `trust_label`
@@ -1098,10 +1103,10 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Functions:** `AssetRegistryPuller`
 **Reads:** `__future__`, `datetime`, `ingestion`, `json`, `loguru`, `re`, `requests`, `sqlalchemy`, `time`, `typing`
 
-#### `ingestion/altdata/baltic_dry.py` — 326 LOC
+#### `ingestion/altdata/baltic_dry.py` — 545 LOC
 **Docstring:** GRID Baltic Dry Index and shipping indices ingestion module.
 **Functions:** `BalticDryPuller`
-**Reads:** `__future__`, `config`, `datetime`, `db`, `fedfred`, `ingestion`, `json`, `loguru`, `pandas`, `sqlalchemy`, `time`, `typing`
+**Reads:** `__future__`, `config`, `datetime`, `db`, `fedfred`, `ingestion`, `json`, `loguru`, `pandas`, `requests`, `sqlalchemy`, `time`, `typing`
 
 #### `ingestion/altdata/binance_puller.py` — 178 LOC
 **Docstring:** GRID Binance public market data ingestion module.
@@ -1208,10 +1213,10 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `datetime`, `db`, `ingestion`, `json`, `loguru`, `math`, `sqlalchemy`, `typing`, `yfinance`
 **Imported by:** `api/routers/earnings.py`
 
-#### `ingestion/altdata/earnings_puller.py` — 625 LOC
+#### `ingestion/altdata/earnings_puller.py` — 636 LOC
 **Docstring:** GRID earnings data puller — fills the 'earnings' feature family in raw_series.
 **Functions:** `compute_surprise_pct`, `classify_beat_miss`, `EarningsPuller`
-**Reads:** `__future__`, `datetime`, `db`, `ingestion`, `loguru`, `math`, `pandas`, `sqlalchemy`, `time`, `typing`, `yfinance`
+**Reads:** `__future__`, `datetime`, `db`, `ingestion`, `logging`, `loguru`, `math`, `pandas`, `sqlalchemy`, `time`, `typing`, `yfinance`
 **Imported by:** `ingestion/scheduler.py`
 
 #### `ingestion/altdata/ecb_tltro.py` — 515 LOC
@@ -1365,10 +1370,10 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `datetime`, `ingestion`, `json`, `loguru`, `os`, `re`, `requests`, `sqlalchemy`, `time`, `typing`, `xml`
 **Imported by:** `ingestion/scheduler.py`
 
-#### `ingestion/altdata/institutional_flows.py` — 902 LOC
+#### `ingestion/altdata/institutional_flows.py` — 907 LOC
 **Docstring:** GRID institutional money flow data ingestion module.
 **Functions:** `InstitutionalFlowsPuller`
-**Reads:** `__future__`, `datetime`, `db`, `ingestion`, `json`, `loguru`, `pandas`, `requests`, `sqlalchemy`, `time`, `typing`, `xml`, `yfinance`
+**Reads:** `__future__`, `datetime`, `db`, `ingestion`, `json`, `logging`, `loguru`, `pandas`, `requests`, `sqlalchemy`, `time`, `typing`, `xml`, `yfinance`
 **Imported by:** `ingestion/scheduler.py`
 
 #### `ingestion/altdata/iron_ore_ports.py` — 779 LOC
@@ -2285,10 +2290,10 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Functions:** `get_actor_attributions`
 **Reads:** `__future__`, `api`, `fastapi`, `intelligence`, `loguru`, `typing`
 
-#### `api/routers/backtest.py` — 172 LOC
+#### `api/routers/backtest.py` — 178 LOC
 **Docstring:** GRID API — Backtest & paper trade endpoints.
 **Functions:** `BacktestRequest`, `run_backtest`, `get_results`, `get_summary`, `generate_charts`, `get_chart`, `create_paper_trade`, `list_paper_trades`, `get_paper_trade`, `score_predictions`
-**Reads:** `__future__`, `api`, `backtest`, `datetime`, `fastapi`, `pathlib`, `pydantic`, `re`, `typing`
+**Reads:** `__future__`, `api`, `backtest`, `datetime`, `fastapi`, `outputs`, `pathlib`, `pydantic`, `re`, `typing`
 
 #### `api/routers/blob.py` — 107 LOC
 **Docstring:** Blob store API — upload, download, and manage stored files.
@@ -2554,10 +2559,10 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Functions:** `SubscriptionKeys`, `SubscribeRequest`, `UnsubscribeRequest`, `PreferencesUpdate`, `PreferencesQuery`, `get_vapid_key`, `subscribe`, `unsubscribe`, `get_preferences`, `update_preferences`, `test_push`
 **Reads:** `__future__`, `alerts`, `api`, `config`, `fastapi`, `pydantic`, `urllib`
 
-#### `api/routers/ollama.py` — 339 LOC
+#### `api/routers/ollama.py` — 342 LOC
 **Docstring:** GRID API — LLM integration endpoints.
 **Functions:** `BriefingRequest`, `AskRequest`, `ExplainRequest`, `HypothesisRequest`, `RegimeAnalysisRequest`, `ollama_status`, `generate_briefing`, `get_latest_briefing`, `list_briefings`, `read_briefing`, `ask_ollama`, `explain_relationship`, `generate_hypotheses`, `analyze_regime`, `CapitalFlowRequest`, `capital_flow_research`
-**Reads:** `__future__`, `analysis`, `api`, `config`, `datetime`, `db`, `fastapi`, `knowledge`, `loguru`, `ollama`, `pathlib`, `pydantic`, `typing`
+**Reads:** `__future__`, `analysis`, `api`, `config`, `datetime`, `db`, `fastapi`, `knowledge`, `loguru`, `ollama`, `outputs`, `pathlib`, `pydantic`, `typing`
 
 #### `api/routers/options.py` — 526 LOC
 **Docstring:** Options scanner API endpoints.
@@ -2965,7 +2970,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `config`, `datetime`, `eth_account`, `hyperliquid`, `loguru`, `typing`
 **Imported by:** `api/routers/trading.py`
 
-#### `trading/options_recommender.py` — 1692 LOC
+#### `trading/options_recommender.py` — 1712 LOC
 **Docstring:** GRID — Options trade recommendation engine.
 **Functions:** `compute_kelly_fraction`, `compute_kelly_with_bounds`, `round_to_nickel`, `pick_strike`, `pick_expiry`, `estimate_premium`, `OptionsRecommendation`, `OptionsRecommender`
 **Reads:** `__future__`, `api`, `config`, `dataclasses`, `datetime`, `db`, `discovery`, `json`, `loguru`, `math`, `pandas`, `physics`, `re`, `requests`, `scipy`, `sqlalchemy`, `typing`
@@ -3711,10 +3716,10 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `calendar`, `datetime`, `json`, `loguru`, `ollama`, `physics`, `sqlalchemy`, `typing`
 **Imported by:** `api/routers/derivatives.py`, `intelligence/scheduler.py`
 
-#### `ollama/market_briefing.py` — 790 LOC
+#### `ollama/market_briefing.py` — 792 LOC
 **Docstring:** GRID Hourly Market Briefing Engine.
 **Functions:** `MarketBriefingEngine`, `start_hourly_briefings`
-**Reads:** `__future__`, `analysis`, `datetime`, `db`, `ingestion`, `intelligence`, `json`, `loguru`, `ollama`, `pathlib`, `schedule`, `sqlalchemy`, `sys`, `time`, `typing`
+**Reads:** `__future__`, `analysis`, `datetime`, `db`, `ingestion`, `intelligence`, `json`, `loguru`, `ollama`, `outputs`, `pathlib`, `schedule`, `sqlalchemy`, `sys`, `time`, `typing`
 **Imported by:** `api/routers/briefing.py`, `api/routers/ollama.py`, `intelligence/scheduler.py`
 
 #### `ollama/reasoner.py` — 297 LOC
@@ -4023,22 +4028,22 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 #### `backtest/__init__.py` — 1 LOC
 **Docstring:** GRID pitch backtest engine.
 
-#### `backtest/charts.py` — 331 LOC
+#### `backtest/charts.py` — 333 LOC
 **Docstring:** GRID Backtest Chart Generator.
 **Functions:** `generate_all_charts`
-**Reads:** `__future__`, `backtest`, `json`, `matplotlib`, `numpy`, `pathlib`, `typing`
+**Reads:** `__future__`, `backtest`, `json`, `matplotlib`, `numpy`, `outputs`, `pathlib`, `typing`
 **Imported by:** `api/routers/backtest.py`
 
-#### `backtest/engine.py` — 795 LOC
+#### `backtest/engine.py` — 794 LOC
 **Docstring:** GRID Pitch Backtest Engine.
 **Functions:** `half_kelly_fraction`, `regime_adjusted_size`, `compute_metrics`, `compute_regime_stats`, `compute_transition_returns`, `PitchBacktester`
-**Reads:** `__future__`, `datetime`, `db`, `json`, `loguru`, `numpy`, `pandas`, `pathlib`, `sklearn`, `sqlalchemy`, `store`, `sys`, `typing`, `yfinance`
+**Reads:** `__future__`, `datetime`, `db`, `json`, `loguru`, `numpy`, `outputs`, `pandas`, `pathlib`, `sklearn`, `sqlalchemy`, `store`, `sys`, `typing`, `yfinance`
 **Imported by:** `api/routers/backtest.py`, `backtest/charts.py`, `backtest/paper_trade.py`
 
-#### `backtest/paper_trade.py` — 442 LOC
+#### `backtest/paper_trade.py` — 443 LOC
 **Docstring:** GRID Live Paper Trade System.
 **Functions:** `PaperTradeTracker`
-**Reads:** `__future__`, `backtest`, `datetime`, `db`, `json`, `loguru`, `pathlib`, `sqlalchemy`, `sys`, `typing`, `yfinance`
+**Reads:** `__future__`, `backtest`, `datetime`, `db`, `json`, `loguru`, `outputs`, `pathlib`, `sqlalchemy`, `sys`, `typing`, `yfinance`
 **Imported by:** `api/routers/backtest.py`
 
 ## `normalization/`
@@ -4153,6 +4158,12 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Functions:** `log_insight`, `log_agent_deliberation`, `cleanup_old_insights`, `get_recent_insights`
 **Reads:** `__future__`, `alerts`, `asyncio`, `config`, `datetime`, `json`, `loguru`, `pathlib`, `typing`, `verification`
 **Imported by:** `agents/runner.py`, `analysis/capital_flows.py`, `hyperspace/reasoner.py`, `intelligence/market_diary.py`, `ollama/reasoner.py`
+
+#### `outputs/path_utils.py` — 41 LOC
+**Docstring:** Helpers for output directories that may be dangling symlinks locally.
+**Functions:** `ensure_output_dir`
+**Reads:** `__future__`, `loguru`, `pathlib`
+**Imported by:** `api/routers/backtest.py`, `api/routers/ollama.py`, `backtest/charts.py`, `backtest/engine.py`, `backtest/paper_trade.py`, `intelligence/source_quality_ablation.py`, `ollama/market_briefing.py`
 
 ## `a2a/`
 

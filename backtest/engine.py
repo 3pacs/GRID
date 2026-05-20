@@ -21,6 +21,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from loguru import logger as log
+from outputs.path_utils import ensure_output_dir
 
 # Output directory
 _OUTPUT_DIR = Path(__file__).parent.parent / "outputs" / "backtest"
@@ -299,7 +300,7 @@ class PitchBacktester:
     def __init__(self, db_engine: Any = None, pit_store: Any = None) -> None:
         self.engine = db_engine
         self.pit_store = pit_store
-        _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        self.output_dir = ensure_output_dir(_OUTPUT_DIR)
 
     def _init_db(self) -> None:
         """Lazy-init database connections."""
@@ -693,17 +694,15 @@ class PitchBacktester:
 
     def _save_results(self, result: dict[str, Any]) -> None:
         """Save backtest results to disk."""
-        _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
         # Save full JSON
-        json_path = _OUTPUT_DIR / "backtest_results.json"
+        json_path = self.output_dir / "backtest_results.json"
         with json_path.open("w") as f:
             json.dump(result, f, indent=2, default=str)
         log.info("Results saved to {p}", p=json_path)
 
     def get_latest_results(self) -> dict[str, Any] | None:
         """Load latest saved backtest results."""
-        json_path = _OUTPUT_DIR / "backtest_results.json"
+        json_path = self.output_dir / "backtest_results.json"
         if not json_path.exists():
             return None
         with json_path.open() as f:

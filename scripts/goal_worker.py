@@ -211,8 +211,37 @@ def handle_score_active_hypothesis(engine: Engine, goal: Goal) -> HandlerResult:
     return summary
 
 
+def handle_hermes_diagnose_source(engine: Engine, goal: Goal) -> HandlerResult:
+    """Run the Hermes source-doctor subagent for one source."""
+    from scripts.hermes_fixers import _inspect_source
+
+    return _inspect_source(engine, goal.target_id)
+
+
+def handle_hermes_scout_free_data(engine: Engine, goal: Goal) -> HandlerResult:
+    """Run the Hermes free-data scout subagent for one source."""
+    from scripts.hermes_fixers import _scout_free_data_sources
+    from scripts.hermes_health import OperatorState
+
+    state = OperatorState()
+    state.cycle_count = int(goal.payload.get("requested_cycle") or 0)
+    return _scout_free_data_sources(engine, goal.target_id, state)
+
+
+def handle_hermes_wiring_audit(engine: Engine, goal: Goal) -> HandlerResult:
+    """Run the Hermes wiring-auditor subagent."""
+    from scripts.hermes_fixers import _run_wiring_audit_summary
+
+    result = _run_wiring_audit_summary()
+    result["target_id"] = goal.target_id
+    return result
+
+
 HANDLERS: dict[str, HandlerFn] = {
     "score_active_hypothesis": handle_score_active_hypothesis,
+    "hermes_diagnose_source": handle_hermes_diagnose_source,
+    "hermes_scout_free_data": handle_hermes_scout_free_data,
+    "hermes_wiring_audit": handle_hermes_wiring_audit,
 }
 
 
