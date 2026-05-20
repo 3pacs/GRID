@@ -30,7 +30,7 @@
     "graphology-layout-forceatlas2": "^0.10.1",
     "graphology-types": "^0.24.8",
     "lucide-react": "^0.344.0",
-    "maplibre-gl": "^5.22.0",
+    "maplibre-gl": "^5.24.0",
     "react": "^18.3.0",
     "react-dom": "^18.3.0",
     "sigma": "^3.0.2",
