@@ -29,6 +29,7 @@ Data stored:
 from __future__ import annotations
 
 import json
+import logging
 import time
 from datetime import date, timedelta
 from typing import Any
@@ -40,6 +41,10 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, retry_on_failure
+
+# yfinance logs expected missing/delisted ticker misses at ERROR internally.
+# This module treats those as upstream data absence, not Hermes/app failures.
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 # ── ETF flow proxy configuration ──────────────────────────────────────────────
 

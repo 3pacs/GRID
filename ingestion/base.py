@@ -257,7 +257,7 @@ class BasePuller:
         """
         with self.engine.connect() as conn:
             row = conn.execute(
-                text("SELECT id FROM source_catalog WHERE name = :name"),
+                text("SELECT id FROM source_catalog WHERE LOWER(name) = LOWER(:name)"),
                 {"name": self.SOURCE_NAME},
             ).fetchone()
 
@@ -300,7 +300,7 @@ class BasePuller:
         # If ON CONFLICT hit, re-fetch
         with self.engine.connect() as conn:
             row = conn.execute(
-                text("SELECT id FROM source_catalog WHERE name = :name"),
+                text("SELECT id FROM source_catalog WHERE LOWER(name) = LOWER(:name)"),
                 {"name": self.SOURCE_NAME},
             ).fetchone()
         return row[0]

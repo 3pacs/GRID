@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from outputs.path_utils import ensure_output_dir
 
 _OUTPUT_DIR = Path(__file__).parent.parent / "outputs" / "backtest"
 _CHART_DIR = _OUTPUT_DIR / "charts"
@@ -40,13 +41,14 @@ def generate_all_charts(result: dict[str, Any] | None = None) -> dict[str, str]:
         dict: Map of chart name → file path.
     """
     if result is None:
-        results_path = _OUTPUT_DIR / "backtest_results.json"
+        output_dir = ensure_output_dir(_OUTPUT_DIR)
+        results_path = output_dir / "backtest_results.json"
         if not results_path.exists():
             return {"error": "No backtest results found. Run backtest first."}
         with results_path.open() as f:
             result = json.load(f)
 
-    _CHART_DIR.mkdir(parents=True, exist_ok=True)
+    chart_dir = ensure_output_dir(_CHART_DIR)
 
     try:
         import matplotlib
@@ -60,24 +62,24 @@ def generate_all_charts(result: dict[str, Any] | None = None) -> dict[str, str]:
     charts = {}
 
     # 1. Equity Curve with Regime Bands
-    charts["equity_curve"] = _chart_equity_curve(result, plt, mdates, Patch)
+    charts["equity_curve"] = _chart_equity_curve(result, plt, mdates, Patch, chart_dir)
 
     # 2. Regime Timeline
-    charts["regime_timeline"] = _chart_regime_timeline(result, plt, mdates, Patch)
+    charts["regime_timeline"] = _chart_regime_timeline(result, plt, mdates, Patch, chart_dir)
 
     # 3. Rolling Sharpe
-    charts["rolling_sharpe"] = _chart_rolling_sharpe(result, plt, mdates)
+    charts["rolling_sharpe"] = _chart_rolling_sharpe(result, plt, mdates, chart_dir)
 
     # 4. Allocation Pies
-    charts["allocation_pies"] = _chart_allocation_pies(plt)
+    charts["allocation_pies"] = _chart_allocation_pies(plt, chart_dir)
 
     # 5. Performance Comparison Table
-    charts["comparison_table"] = _chart_comparison_table(result, plt)
+    charts["comparison_table"] = _chart_comparison_table(result, plt, chart_dir)
 
     return charts
 
 
-def _chart_equity_curve(result, plt, mdates, Patch) -> str:
+def _chart_equity_curve(result, plt, mdates, Patch, chart_dir: Path) -> str:
     """Equity curve: GRID vs SPY vs 60/40 with regime bands."""
     ec = result.get("equity_curve", {})
     dates = [np.datetime64(d) for d in ec.get("dates", [])]
@@ -129,13 +131,13 @@ def _chart_equity_curve(result, plt, mdates, Patch) -> str:
     ax2.spines["top"].set_visible(False)
     ax2.spines["right"].set_visible(False)
 
-    path = str(_CHART_DIR / "equity_curve.png")
+    path = str(chart_dir / "equity_curve.png")
     fig.savefig(path, dpi=150, bbox_inches="tight", facecolor="#080C10")
     plt.close(fig)
     return path
 
 
-def _chart_regime_timeline(result, plt, mdates, Patch) -> str:
+def _chart_regime_timeline(result, plt, mdates, Patch, chart_dir: Path) -> str:
     """Regime timeline with S&P overlay."""
     rt = result.get("regime_timeline", {})
     dates = [np.datetime64(d) for d in rt.get("dates", [])]
@@ -178,13 +180,13 @@ def _chart_regime_timeline(result, plt, mdates, Patch) -> str:
                facecolor="#0D1520", edgecolor="#1A2840", labelcolor="#C8D8E8",
                bbox_to_anchor=(0.5, -0.6))
 
-    path = str(_CHART_DIR / "regime_timeline.png")
+    path = str(chart_dir / "regime_timeline.png")
     fig.savefig(path, dpi=150, bbox_inches="tight", facecolor="#080C10")
     plt.close(fig)
     return path
 
 
-def _chart_rolling_sharpe(result, plt, mdates) -> str:
+def _chart_rolling_sharpe(result, plt, mdates, chart_dir: Path) -> str:
     """Rolling 1-year Sharpe ratio."""
     rs = result.get("rolling_sharpe", {})
     dates = [np.datetime64(d) for d in rs.get("dates", [])]
@@ -210,13 +212,13 @@ def _chart_rolling_sharpe(result, plt, mdates) -> str:
     ax.spines["bottom"].set_color("#1A2840")
     ax.grid(axis="y", alpha=0.1, color="#5A7080")
 
-    path = str(_CHART_DIR / "rolling_sharpe.png")
+    path = str(chart_dir / "rolling_sharpe.png")
     fig.savefig(path, dpi=150, bbox_inches="tight", facecolor="#080C10")
     plt.close(fig)
     return path
 
 
-def _chart_allocation_pies(plt) -> str:
+def _chart_allocation_pies(plt, chart_dir: Path) -> str:
     """Four allocation pie charts, one per regime."""
     from backtest.engine import POSTURE_ALLOCATIONS, REGIME_TO_POSTURE
 
@@ -259,13 +261,13 @@ def _chart_allocation_pies(plt) -> str:
 
         ax.set_title(f"{regime}", color=REGIME_COLORS[regime], fontsize=12, fontweight="bold", pad=8)
 
-    path = str(_CHART_DIR / "allocation_pies.png")
+    path = str(chart_dir / "allocation_pies.png")
     fig.savefig(path, dpi=150, bbox_inches="tight", facecolor="#080C10")
     plt.close(fig)
     return path
 
 
-def _chart_comparison_table(result, plt) -> str:
+def _chart_comparison_table(result, plt, chart_dir: Path) -> str:
     """Performance comparison table as an image."""
     gm = result.get("grid_metrics", {})
     bm = result.get("benchmark_metrics", {})
@@ -316,7 +318,7 @@ def _chart_comparison_table(result, plt) -> str:
     ax.set_title("Performance Comparison", color="#E8F0F8", fontsize=14,
                  fontweight="bold", pad=20, y=0.95)
 
-    path = str(_CHART_DIR / "comparison_table.png")
+    path = str(chart_dir / "comparison_table.png")
     fig.savefig(path, dpi=150, bbox_inches="tight", facecolor="#080C10")
     plt.close(fig)
     return path

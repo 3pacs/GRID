@@ -1,6 +1,7 @@
 """Tests for intelligence/signal_provenance.py."""
 from __future__ import annotations
 
+import inspect
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -571,3 +572,7 @@ class TestBuildReport:
         assert d["verdict"] == "high"
         assert d["causation"]["complete"] is True
         assert len(d["signal_evidence"]) == 1
+
+    def test_trade_provenance_report_init_stays_py39_compatible(self):
+        params = inspect.signature(TradeProvenanceReport).parameters.values()
+        assert all(param.kind is not inspect.Parameter.KEYWORD_ONLY for param in params)

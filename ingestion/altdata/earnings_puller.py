@@ -17,16 +17,25 @@ Schedule: daily pull via hermes operator.
 from __future__ import annotations
 
 import math
+import logging
 import time
 from datetime import date
 from typing import Any
 
 import pandas as pd
-import yfinance as yf
 from loguru import logger as log
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, log_pull_failure, retry_on_failure
+
+try:
+    import yfinance as yf
+except Exception as exc:  # yfinance can fail if optional websocket deps drift.
+    yf = None  # type: ignore[assignment]
+    _YFINANCE_IMPORT_ERROR: Exception | None = exc
+else:
+    _YFINANCE_IMPORT_ERROR = None
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 # ── Ticker Universe ────────────────────────────────────────────────────────
 
@@ -131,6 +140,8 @@ class EarningsPuller(BasePuller):
     @retry_on_failure(max_attempts=3, backoff=2.0)
     def _fetch_ticker_data(self, ticker: str) -> yf.Ticker:
         """Fetch yfinance Ticker object with retry on failure."""
+        if yf is None:
+            raise RuntimeError(f"yfinance unavailable: {_YFINANCE_IMPORT_ERROR}")
         return yf.Ticker(ticker)
 
     def _store_series_point(

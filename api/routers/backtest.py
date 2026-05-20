@@ -20,6 +20,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
+from outputs.path_utils import ensure_output_dir
 from pydantic import BaseModel
 
 from api.auth import require_auth
@@ -31,6 +32,10 @@ router = APIRouter(
 )
 
 _CHART_DIR = Path(__file__).parent.parent.parent / "outputs" / "backtest" / "charts"
+
+
+def _get_chart_dir() -> Path:
+    return ensure_output_dir(_CHART_DIR)
 
 
 class BacktestRequest(BaseModel):
@@ -118,9 +123,10 @@ async def get_chart(name: str) -> FileResponse:
 
     safe_name = name if name.endswith(".png") else name + ".png"
 
-    filepath = (_CHART_DIR / safe_name).resolve()
+    chart_dir = _get_chart_dir()
+    filepath = (chart_dir / safe_name).resolve()
     # Ensure resolved path is still inside _CHART_DIR
-    if not filepath.is_relative_to(_CHART_DIR.resolve()):
+    if not filepath.is_relative_to(chart_dir.resolve()):
         raise HTTPException(status_code=400, detail="Invalid chart name")
     if not filepath.exists():
         raise HTTPException(status_code=404, detail=f"Chart '{name}' not found")
