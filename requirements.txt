@@ -67,7 +67,7 @@ boto3>=1.34.0
 # Utilities (extended)
 tqdm>=4.66.0
 tenacity>=8.2.0
-websockets>=12.0
+websockets>=16.0
 pyarrow>=14.0.0
 polars>=1.40.1
 
