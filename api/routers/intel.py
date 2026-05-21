@@ -1383,7 +1383,12 @@ def intel_predictions_active(
 
     return _ok(
         predictions,
-        meta={"total": total, "limit": limit, "offset": offset},
+        meta={
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_more": (offset + limit) < total,
+        },
         tier_required=Tier.BASIC,
         query_start=t0,
     )
