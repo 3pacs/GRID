@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from loguru import logger as log
@@ -136,13 +136,50 @@ def act_on_approval(conn, note: dict[str, Any]) -> list[str]:
     if domain == "alpha":
         entities = extract_entities(note["body"])
         for ticker in entities["tickers"][:1]:
+            prediction_id = f"vault_alpha:{ticker}:{now.date().isoformat()}"
+            expiry = (now + timedelta(days=7)).date()
             conn.execute(text("""
                 INSERT INTO oracle_predictions
-                    (ticker, model_name, direction, confidence, created_at, verdict)
+                    (id, ticker, prediction_type, direction, target_price, entry_price,
+                     expiry, confidence, model_name, model_version, signals, flow_context,
+                     created_at, verdict)
                 VALUES
-                    (:ticker, 'vault_alpha', 'pending_analysis', 0.5, :now, 'pending')
-                ON CONFLICT DO NOTHING
-            """), {"ticker": ticker, "now": now})
+                    (:id, :ticker, :prediction_type, :direction, NULL, :entry_price,
+                     :expiry, :confidence, :model_name, :model_version,
+                     CAST(:signals AS jsonb), CAST(:flow_context AS jsonb), :now, 'pending')
+                ON CONFLICT (
+                    ticker, direction, expiry, prediction_type,
+                    (COALESCE(model_version, '')),
+                    ((created_at AT TIME ZONE 'UTC')::date)
+                ) WHERE dedup_keep = TRUE
+                DO UPDATE SET
+                    confidence = GREATEST(EXCLUDED.confidence, oracle_predictions.confidence),
+                    signals = EXCLUDED.signals,
+                    flow_context = EXCLUDED.flow_context,
+                    verdict = EXCLUDED.verdict
+            """), {
+                "id": prediction_id,
+                "ticker": ticker,
+                "prediction_type": "vault_alpha",
+                "direction": "pending_analysis",
+                "entry_price": 0.0,
+                "expiry": expiry,
+                "confidence": 0.5,
+                "model_name": "vault_alpha",
+                "model_version": "obsidian-agent-v1",
+                "signals": json.dumps([
+                    {
+                        "name": "obsidian_alpha_note",
+                        "detail": title,
+                    }
+                ]),
+                "flow_context": json.dumps({
+                    "source": "obsidian_agent",
+                    "note_title": title,
+                    "domain": domain,
+                }),
+                "now": now,
+            })
             actions.append(f"Created prediction stub for {ticker} from alpha note '{title}'")
 
     if domain == "tools":

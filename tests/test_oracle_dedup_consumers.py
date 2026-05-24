@@ -21,6 +21,12 @@ CRITICAL_SCORED_HISTORY_FILES = (
     "oracle/trace_evolver.py",
 )
 
+DIRECT_ORACLE_PREDICTION_WRITER_FILES = (
+    "oracle/engine.py",
+    "oracle/publish.py",
+    "intelligence/obsidian_agent.py",
+)
+
 
 def _scored_oracle_query_blocks(source: str) -> list[str]:
     blocks: list[str] = []
@@ -37,6 +43,16 @@ def _scored_oracle_query_blocks(source: str) -> list[str]:
     return blocks
 
 
+def _oracle_prediction_insert_blocks(source: str) -> list[str]:
+    blocks: list[str] = []
+    for match in re.finditer(r"INSERT INTO\s+oracle_predictions\b", source):
+        end = source.find('"""', match.end())
+        if end == -1:
+            end = len(source)
+        blocks.append(source[match.start():end])
+    return blocks
+
+
 def test_critical_scored_history_queries_ignore_soft_duplicates() -> None:
     missing: list[str] = []
     for relpath in CRITICAL_SCORED_HISTORY_FILES:
@@ -49,6 +65,38 @@ def test_critical_scored_history_queries_ignore_soft_duplicates() -> None:
                 break
 
     assert missing == []
+
+
+def test_direct_oracle_prediction_writers_use_natural_key_upsert() -> None:
+    missing: list[str] = []
+    for relpath in DIRECT_ORACLE_PREDICTION_WRITER_FILES:
+        source = (ROOT / relpath).read_text()
+        blocks = _oracle_prediction_insert_blocks(source)
+        assert blocks, f"{relpath} has no direct oracle_predictions insert blocks"
+        for block in blocks:
+            if not all(
+                needle in block
+                for needle in (
+                    "ON CONFLICT (",
+                    "ticker, direction, expiry, prediction_type",
+                    "(COALESCE(model_version, ''))",
+                    "created_at AT TIME ZONE 'UTC'",
+                    "WHERE dedup_keep = TRUE",
+                    "DO UPDATE SET",
+                )
+            ):
+                missing.append(relpath)
+                break
+
+    assert missing == []
+
+
+def test_oracle_engine_bootstrap_defines_dedup_keep_and_unique_index() -> None:
+    source = (ROOT / "oracle/engine.py").read_text()
+
+    assert "dedup_keep BOOLEAN NOT NULL DEFAULT TRUE" in source
+    assert "oracle_predictions_dedup_unique" in source
+    assert "created_at AT TIME ZONE 'UTC'" in source
 
 
 class _FakeResult:

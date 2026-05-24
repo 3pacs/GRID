@@ -3,6 +3,47 @@
 from __future__ import annotations
 
 
+class _RecordingConn:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    def execute(self, clause, params=None):
+        self.calls.append((str(clause), dict(params or {})))
+
+
+class TestActOnApproval:
+    def test_alpha_note_writes_complete_deduped_oracle_stub(self):
+        from intelligence.obsidian_agent import act_on_approval
+
+        conn = _RecordingConn()
+        actions = act_on_approval(
+            conn,
+            {
+                "domain": "alpha",
+                "title": "NVDA setup",
+                "body": "Watching $NVDA for earnings momentum.",
+            },
+        )
+
+        assert actions == ["Created prediction stub for NVDA from alpha note 'NVDA setup'"]
+        assert len(conn.calls) == 1
+        sql, params = conn.calls[0]
+        assert "INSERT INTO oracle_predictions" in sql
+        assert "prediction_type" in sql
+        assert "entry_price" in sql
+        assert "expiry" in sql
+        assert "model_version" in sql
+        assert "ON CONFLICT (" in sql
+        assert "ticker, direction, expiry, prediction_type" in sql
+        assert "(COALESCE(model_version, ''))" in sql
+        assert "created_at AT TIME ZONE 'UTC'" in sql
+        assert "WHERE dedup_keep = TRUE" in sql
+        assert "DO UPDATE SET" in sql
+        assert params["ticker"] == "NVDA"
+        assert params["prediction_type"] == "vault_alpha"
+        assert params["model_name"] == "vault_alpha"
+        assert params["model_version"] == "obsidian-agent-v1"
+
 
 class TestExtractEntities:
     def test_extracts_cashtag_tickers(self):
