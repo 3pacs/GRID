@@ -12,33 +12,48 @@ Sub-routers:
   intelligence_forensics.py — Forensics, causation, influence, export controls
   intelligence_companies.py — Company analyzer, deep graph, institutional map
   intelligence_deepdive.py  — Levers, deep dive, expectations
+  intelligence_causation.py — Causation chains
   intelligence_edges.py     — Structural market-edge scanner
+
+Sub-routers are included DEFENSIVELY: a single missing or broken sub-module must
+not take down the entire /api/v1/intelligence surface. Previously these were
+hard top-level imports, so one missing module (api.lf_helpers, then
+intelligence_edges/market_edge_scanner) raised at import time, _load_router in
+api/main.py swallowed it (required=False), and EVERY facade route — /news,
+/events, /patterns, actors, risk, thesis, … — silently 404'd. Per-sub-router
+try/except keeps the healthy routes serving and logs the gap. (2026-05-24)
 """
 
 from __future__ import annotations
 
-from fastapi import APIRouter
+from importlib import import_module
 
-from api.routers.intelligence_actors import router as _actors_router
-from api.routers.intelligence_risk import router as _risk_router
-from api.routers.intelligence_thesis import router as _thesis_router
-from api.routers.intelligence_news import router as _news_router
-from api.routers.intelligence_govflow import router as _govflow_router
-from api.routers.intelligence_forensics import router as _forensics_router
-from api.routers.intelligence_companies import router as _companies_router
-from api.routers.intelligence_deepdive import router as _deepdive_router
-from api.routers.intelligence_causation import router as _causation_router
-from api.routers.intelligence_edges import router as _edges_router
+from fastapi import APIRouter
+from loguru import logger as log
 
 router = APIRouter(prefix="/api/v1/intelligence", tags=["intelligence"])
 
-router.include_router(_actors_router)
-router.include_router(_risk_router)
-router.include_router(_thesis_router)
-router.include_router(_news_router)
-router.include_router(_govflow_router)
-router.include_router(_forensics_router)
-router.include_router(_companies_router)
-router.include_router(_deepdive_router)
-router.include_router(_causation_router)
-router.include_router(_edges_router)
+# Order preserved from the original facade; first match wins on path collisions.
+_SUB_ROUTERS = (
+    "intelligence_actors",
+    "intelligence_risk",
+    "intelligence_thesis",
+    "intelligence_news",
+    "intelligence_govflow",
+    "intelligence_forensics",
+    "intelligence_companies",
+    "intelligence_deepdive",
+    "intelligence_causation",
+    "intelligence_edges",
+)
+
+for _modname in _SUB_ROUTERS:
+    try:
+        _mod = import_module(f"api.routers.{_modname}")
+        router.include_router(_mod.router)
+    except Exception as _exc:  # pragma: no cover - degrade gracefully
+        log.warning(
+            "intelligence facade: sub-router '{m}' unavailable, skipping: {e}",
+            m=_modname,
+            e=str(_exc),
+        )
