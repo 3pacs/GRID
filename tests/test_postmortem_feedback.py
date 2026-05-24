@@ -483,3 +483,13 @@ def test_batch_postmortem_limit_param_caps_per_source():
                         or "FROM oracle_predictions" in c["sql"]]
         for call in select_calls:
             assert "LIMIT" not in call["sql"].upper()
+
+
+def test_hermes_daily_postmortem_batch_is_bounded():
+    import inspect
+    import scripts.hermes_operator as hermes_operator
+
+    source = inspect.getsource(hermes_operator.run_intelligence_tasks)
+
+    assert "POSTMORTEM_BATCH_LIMIT" in source
+    assert "limit=POSTMORTEM_BATCH_LIMIT" in source

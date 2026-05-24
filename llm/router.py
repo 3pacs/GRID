@@ -60,6 +60,32 @@ class Tier(str, Enum):
 
 # Cache clients to avoid re-init on every call
 _client_cache: dict[str, Any] = {}
+_PROVIDER_BACKOFF_UNTIL: dict[str, float] = {}
+_PROVIDER_BACKOFF_REASONS: dict[str, str] = {}
+_PROVIDER_AUTH_BACKOFF_S = 1800.0
+_PROVIDER_RATE_BACKOFF_S = 300.0
+
+
+def _mark_provider_unavailable(provider: str, reason: str, cooldown_s: float) -> None:
+    """Temporarily suppress providers that are known-bad for this process."""
+    until = time.time() + cooldown_s
+    _PROVIDER_BACKOFF_UNTIL[provider] = until
+    _PROVIDER_BACKOFF_REASONS[provider] = reason
+    log.warning(
+        "LLM provider {p} disabled for {s:.0f}s: {r}",
+        p=provider, s=cooldown_s, r=reason,
+    )
+
+
+def _provider_in_backoff(provider: str) -> bool:
+    until = _PROVIDER_BACKOFF_UNTIL.get(provider)
+    if not until:
+        return False
+    if time.time() >= until:
+        _PROVIDER_BACKOFF_UNTIL.pop(provider, None)
+        _PROVIDER_BACKOFF_REASONS.pop(provider, None)
+        return False
+    return True
 
 
 def _gemma_or_default(settings: Any, key: str, legacy_key: str, default: str) -> str:
@@ -131,17 +157,21 @@ def get_llm(
             provider = _gemma_or_default(settings, "LLM_REASON_PROVIDER", "LLM_DEFAULT_PROVIDER", "llamacpp")
 
     # Return cached client if available and still healthy
-    if provider in _client_cache:
+    if provider in _client_cache and not _provider_in_backoff(provider):
         client = _client_cache[provider]
         if getattr(client, "is_available", True):
             return client
 
-    client = _create_client(provider)
-    if client is not None and getattr(client, "is_available", True):
-        _client_cache[provider] = client
-        return client
+    client = None
+    if not _provider_in_backoff(provider):
+        client = _create_client(provider)
+        if client is not None and getattr(client, "is_available", True):
+            _client_cache[provider] = client
+            return client
 
     for fallback in _fallback_chain(tier, provider):
+        if _provider_in_backoff(fallback):
+            continue
         if fallback in _client_cache:
             fb_client = _client_cache[fallback]
         else:
@@ -587,6 +617,20 @@ class _OpenAICompatibleClient:
                     status=resp.status_code, l=latency_ms,
                     body=resp.text[:300],
                 )
+                if resp.status_code in {401, 402, 403}:
+                    self.is_available = False
+                    _mark_provider_unavailable(
+                        self._health_provider,
+                        f"HTTP {resp.status_code}",
+                        _PROVIDER_AUTH_BACKOFF_S,
+                    )
+                elif resp.status_code == 429:
+                    self.is_available = False
+                    _mark_provider_unavailable(
+                        self._health_provider,
+                        "HTTP 429",
+                        _PROVIDER_RATE_BACKOFF_S,
+                    )
                 return None
 
             data = resp.json()

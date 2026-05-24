@@ -21,6 +21,8 @@ from knowledge.loader import inject_knowledge, load_all_knowledge_docs, load_kno
 
 # Module-level cached singleton
 _client_instance: LlamaCppClient | None = None
+_ENDPOINT_BACKOFF_UNTIL: dict[str, float] = {}
+_ENDPOINT_BACKOFF_SECONDS = 300.0
 
 
 class LlamaCppClient:
@@ -65,6 +67,17 @@ class LlamaCppClient:
         self.reasoning_headroom = reasoning_headroom
         self.is_available: bool = False
         self._knowledge_cache: dict[str, str] = {}
+        self._backoff_key = f"{self.base_url}|{self.model}"
+
+        backoff_until = _ENDPOINT_BACKOFF_UNTIL.get(self._backoff_key)
+        if backoff_until and time.time() < backoff_until:
+            log.debug(
+                "llama.cpp endpoint in chat-failure backoff — {url}",
+                url=self.base_url,
+            )
+            return
+        if backoff_until:
+            _ENDPOINT_BACKOFF_UNTIL.pop(self._backoff_key, None)
 
         # Health probe
         try:
@@ -205,6 +218,8 @@ class LlamaCppClient:
                     "llama.cpp chat {status} ({l:.0f}ms): {body}",
                     status=resp.status_code, l=latency_ms, body=error_body,
                 )
+                if resp.status_code >= 500:
+                    self._mark_chat_failure(f"HTTP {resp.status_code}")
                 return None
 
             data = resp.json()
@@ -272,7 +287,19 @@ class LlamaCppClient:
                 l=latency_ms,
                 err=str(exc),
             )
+            self._mark_chat_failure(str(exc))
             return None
+
+    def _mark_chat_failure(self, reason: str) -> None:
+        """Back off endpoints that pass /health but fail real chat calls."""
+        self.is_available = False
+        _ENDPOINT_BACKOFF_UNTIL[self._backoff_key] = time.time() + _ENDPOINT_BACKOFF_SECONDS
+        log.warning(
+            "llama.cpp endpoint disabled for {s:.0f}s after chat failure — {url}: {reason}",
+            s=_ENDPOINT_BACKOFF_SECONDS,
+            url=self.base_url,
+            reason=reason[:200],
+        )
 
     # ------------------------------------------------------------------
     # Generate (single-turn — mapped to chat with one message)
