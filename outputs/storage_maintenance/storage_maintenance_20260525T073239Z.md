@@ -1,4 +1,4 @@
-# GRID Storage Maintenance — 2026-05-25T07:36:23.968876+00:00
+# GRID Storage Maintenance — 2026-05-25T07:32:39.555341+00:00
 
 - Status: `ingest_gap`
 - Target: `grid-svr-data`
@@ -6,8 +6,8 @@
 
 ## Filesystems
 
-- `/data` exists=True used=8586.77GiB free=2500.046GiB use_pct=77.5
-- `/mirror` exists=True used=8064.145GiB free=8632.022GiB use_pct=48.3
+- `/data` exists=True used=8586.768GiB free=2500.048GiB use_pct=77.5
+- `/mirror` exists=True used=8064.056GiB free=8632.111GiB use_pct=48.3
 
 ## GDELT
 
