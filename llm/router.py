@@ -463,7 +463,13 @@ def _create_llamacpp_quick_client(settings: Any) -> Any:
 
 
 def _create_llamacpp_z4_client(settings: Any) -> Any:
-    """Create a llama.cpp client for the gridz4 REASON-tier remote server."""
+    """Create a llama.cpp client for the gridz4 REASON-tier remote server.
+
+    z4 runs the no-thinking Qwen3.6-35B-A3B GGUF.  Keep this client bounded:
+    the generic llama.cpp client adds reasoning headroom for thinking models,
+    which turns default calls into 6K-token generations and can monopolize
+    both gridz4 slots.
+    """
     if not getattr(settings, "LLAMACPP_Z4_ENABLED", False):
         return None
     try:
@@ -473,9 +479,12 @@ def _create_llamacpp_z4_client(settings: Any) -> Any:
             model=getattr(
                 settings,
                 "LLAMACPP_Z4_CHAT_MODEL",
-                "Qwen3.5-9B-Claude-Opus-Reasoning-v2.Q4_K_M.gguf",
+                "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
             ),
             timeout=getattr(settings, "LLAMACPP_Z4_TIMEOUT_SECONDS", 180),
+            default_num_predict=getattr(settings, "LLAMACPP_Z4_NUM_PREDICT", 512),
+            min_num_predict=getattr(settings, "LLAMACPP_Z4_MIN_NUM_PREDICT", 0),
+            reasoning_headroom=getattr(settings, "LLAMACPP_Z4_REASONING_HEADROOM", 0),
         )
     except Exception as exc:
         log.debug("llama.cpp z4 client init failed: {e}", e=str(exc))

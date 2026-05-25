@@ -243,11 +243,14 @@ class Settings(BaseSettings):
     LLAMACPP_QUICK_TIMEOUT_SECONDS: int = 120
     LLAMACPP_QUICK_CHAT_MODEL: str = "qwen3-14b"
 
-    # llama.cpp REASON-tier remote server (gridz4 node — Qwen3.5 9B, Tailscale-reachable)
+    # llama.cpp REASON-tier remote server (gridz4 node — Qwen3.6 35B A3B, Tailscale-reachable)
     LLAMACPP_Z4_BASE_URL: str = "http://gridz4:8080"
     LLAMACPP_Z4_ENABLED: bool = True
     LLAMACPP_Z4_TIMEOUT_SECONDS: int = 180
-    LLAMACPP_Z4_CHAT_MODEL: str = "Qwen3.5-9B-Claude-Opus-Reasoning-v2.Q4_K_M.gguf"
+    LLAMACPP_Z4_CHAT_MODEL: str = "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+    LLAMACPP_Z4_NUM_PREDICT: int = 512
+    LLAMACPP_Z4_MIN_NUM_PREDICT: int = 0
+    LLAMACPP_Z4_REASONING_HEADROOM: int = 0
 
     # llama.cpp BATCH-tier CPU server on grid-svr (DeepSeek-V4-Flash 158B Q4_K_M, port 8082).
     # Non-interactive heavy reasoning only — slow (~5 tok/sec) but free + powerful.

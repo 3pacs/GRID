@@ -74,7 +74,7 @@ class TestLlamacppZ4Factory:
 
     @patch("llamacpp.client.requests")
     def test_z4_factory_builds_client_when_enabled(self, mock_requests: object) -> None:
-        """Factory returns a LlamaCppClient pointed at the configured gridz4 URL."""
+        """Factory returns a bounded LlamaCppClient pointed at gridz4."""
         from unittest.mock import MagicMock
 
         ok = MagicMock()
@@ -90,7 +90,7 @@ class TestLlamacppZ4Factory:
             {
                 "LLAMACPP_Z4_ENABLED": True,
                 "LLAMACPP_Z4_BASE_URL": "http://gridz4:8080",
-                "LLAMACPP_Z4_CHAT_MODEL": "Qwen3.5-9B-Claude-Opus-Reasoning-v2.Q4_K_M.gguf",
+                "LLAMACPP_Z4_CHAT_MODEL": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
                 "LLAMACPP_Z4_TIMEOUT_SECONDS": 180,
             },
         )()
@@ -98,8 +98,11 @@ class TestLlamacppZ4Factory:
         client = _create_llamacpp_z4_client(settings)
         assert client is not None
         assert client.base_url == "http://gridz4:8080"
-        assert client.model == "Qwen3.5-9B-Claude-Opus-Reasoning-v2.Q4_K_M.gguf"
+        assert client.model == "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
         assert client.timeout == 180
+        assert client.default_num_predict == 512
+        assert client.min_num_predict == 0
+        assert client.reasoning_headroom == 0
 
 
 class TestLlamacppOracleFactory:
