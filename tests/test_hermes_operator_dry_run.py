@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import sys
 from types import SimpleNamespace
 
@@ -235,3 +236,16 @@ def test_hermes_dry_run_does_not_send_health_alerts(monkeypatch):
     hermes.run_cycle(_FakeState(), dry_run=True)
 
     assert "health_alert" not in calls
+
+
+def test_signal_classification_limit_matches_timeout_budget():
+    import scripts.hermes_operator as hermes
+
+    assert 1 <= hermes.SIGNAL_CLASSIFICATION_LIMIT <= 8
+    assert (
+        hermes.SIGNAL_CLASSIFICATION_LIMIT * 15
+        <= hermes.SIGNAL_CLASSIFICATION_TIMEOUT_SECONDS
+    )
+
+    source = inspect.getsource(hermes.run_cycle)
+    assert "limit=SIGNAL_CLASSIFICATION_LIMIT" in source

@@ -114,6 +114,10 @@ ACTIVE_HYPO_SCORING_INTERVAL_MINUTES = 30
 # scorer (same cadence, same scheduling mechanism).
 EARNINGS_CALENDAR_SYNC_INTERVAL_MINUTES = 30
 
+# Keep signal classification under its per-step timeout. The classifier makes
+# one local LLM call per signal and live calls can approach 15s each.
+SIGNAL_CLASSIFICATION_LIMIT = int(os.getenv("GRID_SIGNAL_CLASSIFICATION_LIMIT", "5"))
+
 
 def _run_with_timeout(name: str, fn, timeout_s: int, state):
     """Execute fn() with a hard timeout. On timeout, blacklist via cooldown.
@@ -1801,7 +1805,10 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
                 from ingestion.signal_classifier import classify_recent_signals
 
                 def _classify_call():
-                    return classify_recent_signals(engine, limit=30)
+                    return classify_recent_signals(
+                        engine,
+                        limit=SIGNAL_CLASSIFICATION_LIMIT,
+                    )
 
                 cls_result, ok = _run_with_timeout(
                     "signal_classification", _classify_call,
