@@ -188,6 +188,7 @@ class GemmaMicroClient:
             "max_tokens": self.config.max_tokens,
             "temperature": self.config.temperature,
             "stream": False,
+            "chat_template_kwargs": {"enable_thinking": False},
         }
 
         start = time.monotonic()
