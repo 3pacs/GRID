@@ -196,6 +196,35 @@ class TestForecasterForecast:
         assert isinstance(result, ForecastResult)
         assert result.series_id == "PD_TEST"
 
+    def test_forecast_uses_timesfm_25_signature(
+        self,
+        forecaster: TimesFMForecaster,
+        sample_series: np.ndarray,
+        mock_timesfm_module: tuple,
+    ) -> None:
+        mock_module, mock_model = mock_timesfm_module
+
+        horizon = 7
+        point_forecasts = np.array([[100.0] * horizon])
+        mock_model.forecast.return_value = (point_forecasts, None)
+
+        with patch.dict("sys.modules", {"timesfm": mock_module}):
+            forecaster._available = True
+            forecaster._model = mock_model
+            forecaster._model_version_token = "v2.5:google/timesfm-2.5-200m-pytorch"
+
+            forecaster.forecast(
+                series=sample_series,
+                horizon=horizon,
+                series_id="V25",
+            )
+
+        mock_model.forecast.assert_called_once()
+        assert mock_model.forecast.call_args.args == ()
+        assert mock_model.forecast.call_args.kwargs["horizon"] == horizon
+        inputs = mock_model.forecast.call_args.kwargs["inputs"]
+        assert len(inputs) == 1
+
     def test_forecast_truncates_long_series(
         self,
         forecaster: TimesFMForecaster,
@@ -335,6 +364,31 @@ class TestForecasterBatch:
             result = forecaster.batch_forecast(series_dict)
 
         assert len(result.forecasts) == 2
+
+    def test_batch_forecast_uses_timesfm_25_signature(
+        self,
+        forecaster: TimesFMForecaster,
+        sample_series: np.ndarray,
+        mock_timesfm_module: tuple,
+    ) -> None:
+        mock_module, mock_model = mock_timesfm_module
+
+        series_dict = {"A": sample_series, "B": sample_series * 1.1}
+        horizon = 7
+        point_forecasts = np.random.randn(2, horizon).astype(np.float32) + 100
+        mock_model.forecast.return_value = (point_forecasts, None)
+
+        with patch.dict("sys.modules", {"timesfm": mock_module}):
+            forecaster._available = True
+            forecaster._model = mock_model
+            forecaster._model_version_token = "v2.5:google/timesfm-2.5-200m-pytorch"
+
+            forecaster.batch_forecast(series_dict, horizon=horizon)
+
+        mock_model.forecast.assert_called_once()
+        assert mock_model.forecast.call_args.args == ()
+        assert mock_model.forecast.call_args.kwargs["horizon"] == horizon
+        assert len(mock_model.forecast.call_args.kwargs["inputs"]) == 2
 
 
 # ---------------------------------------------------------------------------
