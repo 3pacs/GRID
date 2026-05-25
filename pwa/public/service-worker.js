@@ -1,4 +1,6 @@
 const CACHE_NAME = 'grid-v1';
+const ASSET_VERSION = '20260525-1';
+const versionedIcon = (name) => `/icons/${name}.png?v=${ASSET_VERSION}`;
 const PRECACHE_URLS = [
     '/',
     '/manifest.json',
@@ -182,8 +184,8 @@ self.addEventListener('push', (event) => {
     let title = 'GRID Intelligence';
     let options = {
         body: 'New notification',
-        icon: '/icons/icon-192.png',
-        badge: '/icons/icon-76.png',
+        icon: versionedIcon('icon-192'),
+        badge: versionedIcon('icon-76'),
     };
 
     if (event.data) {
@@ -192,8 +194,8 @@ self.addEventListener('push', (event) => {
             title = data.title || title;
             options = {
                 body: data.body || options.body,
-                icon: data.icon || '/icons/icon-192.png',
-                badge: data.badge || '/icons/icon-76.png',
+                icon: data.icon || versionedIcon('icon-192'),
+                badge: data.badge || versionedIcon('icon-76'),
                 tag: data.tag || undefined,
                 data: { url: data.url || '/' },
                 vibrate: [100, 50, 100],
