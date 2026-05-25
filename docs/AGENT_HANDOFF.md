@@ -1,3 +1,12 @@
+## 2026-05-25 23:12 UTC — 2026-05-25-2308
+**Why this matters next run:** TIER 1 has been silently mis-scoped by prior runs — there ARE reviewable codex PRs; they just aren't authored by `app/openai-codex`.
+
+- Codex PRs in this repo are authored by login `3pacs` on `codex/*` branches (not `app/openai-codex`). The old `search_pull_requests author:app/openai-codex → 0` check in the 2026-05-14/15 entries was a false negative. To find TIER 1 work, filter open PRs by `head.ref` starting `codex/`, not by author.
+- This run reviewed **PR #233** (`codex/hermes-finetune-fleet-20260518`, open since 2026-05-18, zero prior reviews) — posted a COMMENT review (3 MEDIUM hardening items on the iMessage bridge + SFT scrubber; no blocker). It now has a claude review, so skip it next run unless it gets new commits.
+- **PRs #242 and #243 are NOT review targets** — they are intentional draft "Park" branches (`[codex] Park ...`), explicitly "intentionally draft until rebased/retested against current main." Don't waste a TIER 1 slot reviewing them; the operator parked them on purpose.
+- Watch for over-eager subagent findings: the code-reviewer subagent flagged a "CRITICAL osascript injection" in `hermes_imessage_bridge.py:1156` that was a false positive — `recipient`/`text` are passed as `argv` items to a static AppleScript body via `subprocess.run([...])` (no shell, no interpolation). Always verify a CRITICAL against the actual source before posting it publicly.
+
+---
 ## 2026-05-21 23:18 UTC — 2026-05-21-2313
 **Why this matters next run:** The has_more sibling series is now down to ONE remaining item, and it is NOT a simple one-key add — don't treat it as such.
 
