@@ -26,11 +26,15 @@ import argparse
 import json
 import sys
 
+import json as _json
+
 from llm.autoresearch import (
     AutoResearchLoop,
     TrialConfig,
+    detect_local_profile,
     discover_endpoints,
     eligible_endpoints,
+    recommend_for_host,
 )
 from llm.autoresearch.hosts import HOST_PROFILES
 
@@ -53,6 +57,36 @@ def _audit(include_below_bar: bool, qwen_bar: float) -> None:
             prof = HOST_PROFILES.get(e.host)
             vram = f"{prof.total_vram_gb:.0f}GB {prof.arch}" if prof else "unknown VRAM"
             print(f"  - {e.host} ({vram}): {e.model}")
+
+
+def _detect(host_name: str) -> None:
+    """Print this host's detected GPU profile as a host_profiles.json snippet."""
+    prof = detect_local_profile(host_name)
+    if prof is None:
+        print("No GPU detected here (nvidia-smi unavailable or CPU-only node).")
+        return
+    print(f"Detected on '{host_name}': {prof.gpus}x {prof.gpu_name} "
+          f"@ {prof.vram_gb}GB ({prof.arch}, flash_attn={prof.flash_attn}, fp8={prof.fp8})")
+    print("\nAdd to llm/autoresearch/host_profiles.json:")
+    snippet = {host_name: {"vram_gb": prof.vram_gb, "gpus": prof.gpus, "gpu_name": prof.gpu_name}}
+    print(_json.dumps(snippet, indent=2))
+
+
+def _plan(qwen_bar: float) -> None:
+    """Print the VRAM-tier Qwen 3.6+ recommendation for each known host."""
+    print(f"{'HOST':<10} {'SRC':<9} {'VRAM':<7} {'MODEL':<26} {'QUANT':<8} RATIONALE")
+    print("-" * 110)
+    for host, prof in HOST_PROFILES.items():
+        rec = recommend_for_host(prof)
+        model = rec.get("model") or "(none — repurpose)"
+        quant = rec.get("quant") or "-"
+        vram = f"{prof.total_vram_gb:.0f}GB"
+        print(f"{host:<10} {prof.source:<9} {vram:<7} {model:<26} {quant:<8} {rec['rationale']}")
+        if rec.get("flags"):
+            print(f"{'':<10} flags: {rec['flags']}")
+    if any(p.source == "fallback" for p in HOST_PROFILES.values()):
+        print("\nWARNING: some profiles are STALE fallbacks. Run --detect on each host "
+              "and populate llm/autoresearch/host_profiles.json for accurate planning.")
 
 
 def _baseline(args: argparse.Namespace) -> int:
@@ -96,6 +130,8 @@ def _baseline(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="GRID LLM autoresearch (quality + tok/sec)")
     p.add_argument("--audit", action="store_true", help="List endpoints and quality-bar status, then exit")
+    p.add_argument("--detect", metavar="HOST", help="Detect this machine's GPU profile (run on each host)")
+    p.add_argument("--plan", action="store_true", help="Print VRAM-tier Qwen 3.6+ recommendation per host")
     p.add_argument("--baseline", action="store_true", help="Measure quality + tok/sec for eligible endpoints")
     p.add_argument("--include-below-bar", action="store_true", help="Include models below the Qwen-3.6 bar")
     p.add_argument("--quality-floor", type=float, default=0.6, help="Hard quality gate (eval pass fraction)")
@@ -104,6 +140,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-trials", type=int, default=None, help="Maximum number of trials")
     args = p.parse_args(argv)
 
+    if args.detect:
+        _detect(args.detect)
+        return 0
+    if args.plan:
+        _plan(args.qwen_bar)
+        return 0
     if args.audit:
         _audit(args.include_below_bar, args.qwen_bar)
         return 0

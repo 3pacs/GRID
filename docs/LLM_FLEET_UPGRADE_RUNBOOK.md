@@ -21,90 +21,112 @@ Both support **native MTP (Multi-Token Prediction)** — the tok/sec lever. Enab
 
 ---
 
-## 1. Per-host plan
+## 1. Detect the real hardware first — do NOT trust hardcoded specs
 
-VRAM/arch from `llm/autoresearch/hosts.py`. Estimated VRAM = weights + ~2.5 GB overhead.
+Card configs go stale the moment hardware is swapped. **Resolve each host's
+GPUs at runtime**, then let the planner derive recommendations from the
+*actual* VRAM/arch. Run this once per host (it shells out to `nvidia-smi`):
 
-| Host | HW | Today (below bar) | Deploy | Quant | tok/sec levers |
-|---|---|---|---|---|---|
-| **grid-svr** | Blackwell ~48 GB, FP8+FA | `Qwen3-32B` (3.0<3.6) | **Qwen3.6-27B** (dense) | **Q6_K** (~22 GB) | `-fa`, MTP, FP8 KV cache, big ctx |
-| **panda** | 24 GB Ampere | `qwen3.6:27b-q4` ✅ on bar | keep 27B, **bump quant** | **Q5_K_M** (~19 GB) | `-fa`, MTP |
-| **ocr-node** | 16 GB Ampere | `gemma3:12b` | **Qwen3.6-35B-A3B** (MoE) | **Q4_K_M** + expert offload | `-fa`, MTP, `-ot` expert→CPU |
-| **koala** | 2× 12 GB **Maxwell** | `gemma3:12b` | **Qwen3.6-27B** tensor-split | **Q4_K_M** (~17 GB / 24 GB) | MTP, `-ts 1,1`; **no `-fa`** (Maxwell) |
-| **z400** | single 12 GB | `qwen2.5:7b` | **Qwen3.6-35B-A3B** (MoE) | **IQ4_XS** + heavy offload | MTP, `-ot` expert→CPU |
+```bash
+# On each box (grid-svr, panda, ocr-node, koala, z400, ...):
+python -m scripts.run_llm_autoresearch --detect "$(hostname)"
+```
 
-**Honest constraints:**
-- **z400 (12 GB) cannot hold a Qwen 3.6 model fully in VRAM** — the smallest on-bar model is 27B dense (~17 GB at Q4) or the 35B MoE (~21 GB at Q4). Only the **MoE with expert-offload** is viable, and it will be slow. Consider repurposing z400 as an embeddings / draft / utility node instead of a reasoning endpoint.
-- **koala is Maxwell (sm_52)** — no Flash Attention, no FP8, slow compute. Tensor-split 27B across both cards works but expect modest tok/sec. It is the weakest reasoning box; weigh effort vs. retiring it.
-- **ocr-node at 16 GB** fits the 35B-A3B MoE only with partial expert-offload to CPU; the MoE tolerates this far better than a dense model because only 3B params are active per token.
+Paste each snippet into `llm/autoresearch/host_profiles.json`:
+
+```json
+{
+  "grid-svr": {"vram_gb": 48, "gpus": 1, "gpu_name": "NVIDIA RTX PRO 6000 Blackwell"},
+  "panda":    {"vram_gb": 24, "gpus": 1, "gpu_name": "NVIDIA GeForce RTX 3090"},
+  "koala":    {"vram_gb": 12, "gpus": 2, "gpu_name": "NVIDIA GeForce GTX TITAN X"}
+}
+```
+
+`arch`, `flash_attn`, and `fp8` are inferred from `gpu_name` automatically.
+Then print the plan derived from the resolved profiles:
+
+```bash
+python -m scripts.run_llm_autoresearch --plan
+```
+
+If a row shows `SRC = fallback` or you see the STALE warning, the override
+file is missing/incomplete — fix it before planning. Never plan off the
+baked-in fallback table; those numbers are wrong by design.
 
 ---
 
-## 2. Exact `llama-server` launch lines
+## 2. VRAM-tier decision tree (what `--plan` applies)
 
-### grid-svr — Qwen3.6-27B dense, max quality + MTP (Blackwell)
+Recommendations key on **resolved total VRAM** + arch, so they stay correct
+no matter which cards are in a box. Estimated need = weights + ~2.5 GB.
+
+| Resolved VRAM | Model | Quant | Extra flags | Why |
+|---|---|---|---|---|
+| **≥ 40 GB** | Qwen3.6-27B dense | Q6_K | — | room for high quant + big ctx |
+| **24–40 GB** | Qwen3.6-27B dense | Q5_K_M | — | dense at near-lossless quant |
+| **16–24 GB** | Qwen3.6-35B-A3B MoE | Q4_K_M | `-ot ".ffn_.*_exps.=CPU"` | MoE (3B active) + expert-offload fits |
+| **12–16 GB, multi-GPU ≥ 20 total** | Qwen3.6-27B dense | Q4_K_M | `-ts 1,1 -sm layer` | tensor-split dense across cards |
+| **12–16 GB, single card** | Qwen3.6-35B-A3B MoE | IQ4_XS | `-ot ...` (heavy) | only on-bar option; expect lower tok/s |
+| **< 12 GB** | — | — | — | **can't meet the Qwen 3.6 floor in VRAM — repurpose as embeddings/draft/utility node** |
+
+Arch overrides applied automatically: **Maxwell/Pascal drop `-fa`** (no
+Flash-Attention kernels); **Ada/Blackwell/Hopper** add FP8 KV cache.
+
+---
+
+## 3. `llama-server` launch lines by VRAM tier
+
+Substitute the model/quant/flags `--plan` printed for the host. Templates:
+
+### ≥ 24 GB — dense 27B (Blackwell/Ampere, Flash-Attention on)
 ```bash
-llama-server \
-  -m /models/Qwen3.6-27B-Q6_K.gguf \
-  --spec-type draft-mtp \
-  -fa \
-  -ngl 99 \
+llama-server -m /models/Qwen3.6-27B-Q6_K.gguf \
+  --spec-type draft-mtp -fa -ngl 99 \
   --cache-type-k q8_0 --cache-type-v q8_0 \
   -c 16384 -b 2048 -ub 512 \
   --host 0.0.0.0 --port 8081 --metrics
 ```
+(Use Q5_K_M in the 24–40 GB tier. Staying on Ollama instead: `ollama pull qwen3.6:27b-q5_K_M` — MTP is automatic.)
 
-### panda — Qwen3.6-27B dense, quality bump + MTP (Ampere, Ollama today)
-If staying on Ollama: pull the higher quant tag (`ollama pull qwen3.6:27b-q5_K_M`) — MTP is automatic for Qwen3.6 in current Ollama. If moving to llama-server:
+### 12–16 GB single card — 35B-A3B MoE with expert-offload
+The `-ot` regex keeps attention on the GPU and pushes the big expert FFN
+tensors to CPU RAM — the trick that fits a 35B MoE on a small card:
 ```bash
-llama-server -m /models/Qwen3.6-27B-Q5_K_M.gguf \
+llama-server -m /models/Qwen3.6-35B-A3B-Q4_K_M.gguf \
   --spec-type draft-mtp -fa -ngl 99 \
-  --cache-type-k q8_0 --cache-type-v q8_0 \
-  -c 12288 --host 0.0.0.0 --port 11434 --metrics
-```
-
-### ocr-node / z400 — Qwen3.6-35B-A3B MoE with expert offload (fit 12–16 GB)
-The `-ot` regex keeps attention on the GPU and pushes the big expert FFN tensors to CPU RAM — the trick that makes a 35B MoE fit a small card:
-```bash
-llama-server \
-  -m /models/Qwen3.6-35B-A3B-Q4_K_M.gguf \
-  --spec-type draft-mtp \
-  -fa -ngl 99 \
   -ot ".ffn_.*_exps.=CPU" \
   -c 8192 -b 1024 -ub 256 \
   --host 0.0.0.0 --port 8081 --metrics
 ```
-On z400 (tighter) use `IQ4_XS` and, if still OOM, lower `-ngl` to offload some attention layers too.
+Tighter than ~14 GB: use `IQ4_XS` and lower `-ngl` to offload some attention layers too.
 
-### koala — Qwen3.6-27B tensor-split across 2× Maxwell (no Flash Attention)
+### multi-GPU (e.g. 2 cards) — tensor-split dense 27B; drop `-fa` on Maxwell
 ```bash
-llama-server \
-  -m /models/Qwen3.6-27B-Q4_K_M.gguf \
-  --spec-type draft-mtp \
-  -ngl 99 -ts 1,1 -sm layer \
+llama-server -m /models/Qwen3.6-27B-Q4_K_M.gguf \
+  --spec-type draft-mtp -ngl 99 -ts 1,1 -sm layer \
   -c 8192 --host 0.0.0.0 --port 11434 --metrics
 ```
-Note: **no `-fa`** — Maxwell lacks the kernels; adding it will fail or fall back.
+**No `-fa`** on Maxwell/Pascal — the kernels don't exist; it will fail or silently fall back.
 
 > Wire whichever flags win into the host's systemd unit / `/etc/default/*-llama` so they survive restarts.
 
 ---
 
-## 3. Speculative-decoding / KV tuning quick reference
+## 4. Speculative-decoding / KV tuning quick reference
 
 | Flag | Effect | When |
 |---|---|---|
 | `--spec-type draft-mtp` | Native multi-token prediction | **Always** for Qwen 3.6 |
 | `-fa` | Flash Attention (faster, less KV VRAM) | Ampere/Blackwell; **not** Maxwell |
 | `--cache-type-k/v q8_0` | Quantize KV cache → more ctx / less VRAM | Any; q8_0 is near-lossless |
-| `-ot ".ffn_.*_exps.=CPU"` | Offload MoE experts to CPU | MoE on tight VRAM (ocr/z400) |
-| `-ts a,b -sm layer` | Tensor-split across GPUs | koala (2 cards) |
+| `-ot ".ffn_.*_exps.=CPU"` | Offload MoE experts to CPU | MoE on tight VRAM (12–16 GB) |
+| `-ts a,b -sm layer` | Tensor-split across GPUs | any multi-GPU host |
 | `-ngl N` | Layers on GPU (99 = all) | Lower to trade speed for fit |
 | `-b / -ub` | Batch / micro-batch | Lower on tight VRAM |
 
 ---
 
-## 4. Verify every change with the harness (before / after)
+## 5. Verify every change with the harness (before / after)
 
 ```bash
 # 1. See which endpoints are below the Qwen-3.6 bar right now:
@@ -133,7 +155,7 @@ Keep the winning launch line in the systemd unit and record the journal path in 
 
 ---
 
-## 5. Sources
+## 6. Sources
 - Qwen3.6 lineup & MTP: <https://github.com/QwenLM/Qwen3.6>, <https://unsloth.ai/docs/models/qwen3.6>
 - GGUFs: `unsloth/Qwen3.6-27B-GGUF`, `unsloth/Qwen3.6-35B-A3B-GGUF`
 - MTP merged / `--spec-type draft-mtp`; classic-draft "no net speedup on Ampere + A3B MoE": <https://github.com/thc1006/qwen3.6-speculative-decoding-rtx3090>

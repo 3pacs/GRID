@@ -8,7 +8,13 @@ from pathlib import Path
 import pytest
 
 from llm.autoresearch.bench import QualityResult, ThroughputResult, _grade, load_eval_cases
-from llm.autoresearch.hosts import HOST_PROFILES, ModelSpec, fits_on
+from llm.autoresearch.hosts import (
+    HostProfile,
+    ModelSpec,
+    arch_from_name,
+    fits_on,
+    recommend_for_host,
+)
 from llm.autoresearch.loop import (
     AutoResearchLoop,
     RunningEndpointApplier,
@@ -61,26 +67,76 @@ def test_fitness_quality_breaks_ties():
 
 
 # --------------------------------------------------------------------------
-# Host fit estimation
+# Architecture detection (capability flags from GPU name)
 # --------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "name,arch,fa,fp8",
+    [
+        ("NVIDIA GeForce GTX TITAN X", "maxwell", False, False),
+        ("NVIDIA TITAN Xp", "pascal", False, False),       # Pascal before Maxwell
+        ("NVIDIA GeForce RTX 3090", "ampere", True, False),
+        ("NVIDIA RTX PRO 6000 Blackwell", "blackwell", True, True),
+        ("NVIDIA H100 80GB", "hopper", True, True),
+        ("Some Future Card", "unknown", True, False),
+    ],
+)
+def test_arch_from_name(name, arch, fa, fp8):
+    a, f, q = arch_from_name(name)
+    assert (a, f, q) == (arch, fa, fp8)
+
+
+# --------------------------------------------------------------------------
+# Host fit estimation (explicit profiles — independent of any stale table)
+# --------------------------------------------------------------------------
+def _profile(vram, gpus=1, arch="pascal", fa=False):
+    return HostProfile("test", vram_gb=vram, gpus=gpus, arch=arch, flash_attn=fa)
+
+
 def test_small_model_fits_12gb():
     spec = ModelSpec("qwen3.6-7b", params_b=7.0, quant="q4_k_m")
-    ok, note = fits_on(spec, HOST_PROFILES["z400"])
+    ok, note = fits_on(spec, _profile(12.0))
     assert ok
     assert "fits" in note
 
 
 def test_large_model_rejected_on_12gb_single_card():
     spec = ModelSpec("qwen3.6-32b", params_b=32.0, quant="q4_k_m")
-    ok, _ = fits_on(spec, HOST_PROFILES["z400"], allow_multi_gpu=False)
+    ok, _ = fits_on(spec, _profile(12.0), allow_multi_gpu=False)
     assert not ok
 
 
 def test_maxwell_flags_no_flash_attn():
     spec = ModelSpec("qwen3.6-7b", params_b=7.0, quant="q4_k_m")
-    ok, note = fits_on(spec, HOST_PROFILES["koala"])
+    ok, note = fits_on(spec, _profile(12.0, gpus=2, arch="maxwell", fa=False))
     assert ok
     assert "flash-attn" in note
+
+
+# --------------------------------------------------------------------------
+# VRAM-tier recommendation tree
+# --------------------------------------------------------------------------
+def test_recommend_high_vram_picks_dense_high_quant():
+    rec = recommend_for_host(_profile(48.0, arch="blackwell", fa=True))
+    assert "27B" in rec["model"]
+    assert rec["quant"] == "Q6_K"
+    assert "draft-mtp" in rec["flags"]
+
+
+def test_recommend_16gb_picks_moe_with_offload():
+    rec = recommend_for_host(_profile(16.0, arch="ampere", fa=True))
+    assert "A3B" in rec["model"]
+    assert "exps.=CPU" in rec["flags"]
+
+
+def test_recommend_tiny_vram_says_repurpose():
+    rec = recommend_for_host(_profile(8.0, arch="pascal", fa=False))
+    assert rec["model"] is None
+    assert "repurpose" in rec["rationale"]
+
+
+def test_recommend_no_flash_attn_arch_omits_fa():
+    rec = recommend_for_host(_profile(48.0, arch="maxwell", fa=False))
+    assert "no -fa" in rec["flags"]
 
 
 # --------------------------------------------------------------------------

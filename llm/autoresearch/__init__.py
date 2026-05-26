@@ -17,7 +17,16 @@ from llm.autoresearch.bench import (
     measure_quality,
     measure_throughput,
 )
-from llm.autoresearch.hosts import HOST_PROFILES, HostProfile, ModelSpec, fits_on
+from llm.autoresearch.hosts import (
+    HOST_PROFILES,
+    HostProfile,
+    ModelSpec,
+    arch_from_name,
+    detect_local_profile,
+    fits_on,
+    load_host_profiles,
+    recommend_for_host,
+)
 from llm.autoresearch.loop import (
     AutoResearchLoop,
     ConfigApplier,
@@ -45,11 +54,15 @@ __all__ = [
     "ThroughputResult",
     "TrialConfig",
     "TrialResult",
+    "arch_from_name",
     "assess_model",
     "compute_fitness",
+    "detect_local_profile",
     "discover_endpoints",
     "eligible_endpoints",
     "fits_on",
+    "load_host_profiles",
     "measure_quality",
     "measure_throughput",
+    "recommend_for_host",
 ]
