@@ -52,25 +52,25 @@ Discover the live list anytime: `python -m scripts.run_llm_autoresearch --audit`
 
 ## 3. Task sequence
 
-### Step 1 — Detect real hardware, commit profiles
-On **each** host (SSH in / run locally):
+### Step 1 — Resolve real hardware (now self-updating)
+Profiles auto-resolve from the live fleet dashboard
+(`network.stepdad.finance/api/snapshot`, which SSH-polls every host on a fixed
+cycle). `--plan` / `--audit` pull it live each run, so in the normal case you
+**don't build `host_profiles.json` by hand** — just verify:
 ```bash
-python -m scripts.run_llm_autoresearch --detect "$(hostname)"
+python -m scripts.run_llm_autoresearch --plan   # rows show SRC=snapshot
+python -m scripts.run_llm_autoresearch --refresh-profiles   # optional: cache an offline copy
 ```
-Collect the JSON snippets into `llm/autoresearch/host_profiles.json`, e.g.:
-```json
-{
-  "grid-svr": {"vram_gb": 96, "gpus": 1, "gpu_name": "NVIDIA RTX PRO 6000 Blackwell"},
-  "panda":    {"vram_gb": 24, "gpus": 1, "gpu_name": "NVIDIA GeForce RTX 3090"},
-  "ocr-node": {"vram_gb": 16, "gpus": 1, "gpu_name": "..."},
-  "koala":    {"vram_gb": 12, "gpus": 2, "gpu_name": "NVIDIA GeForce GTX TITAN X"},
-  "z400":     {"vram_gb": 12, "gpus": 1, "gpu_name": "..."}
-}
-```
-`arch`/`flash_attn`/`fp8` are inferred from `gpu_name`. Commit this file. Verify:
-```bash
-python -m scripts.run_llm_autoresearch --plan   # must NOT show SRC=fallback / STALE warning
-```
+Any host the dashboard didn't cover this poll shows `SRC=fallback` / the STALE
+warning — for those, SSH in and `--detect "$(hostname)"`, then paste the
+emitted snippet (which now includes explicit `arch`/`flash_attn`/`fp8`, needed
+for mixed-card boxes) into `host_profiles.json`.
+
+Real fleet as detected 2026-05-26 (all mixed-card): grid-svr A2000+Blackwell
+**28 GB / Ampere+Blackwell**, panda **3× P100 = 48 GB / Pascal** (was 4 — one
+dropped), ocr-node 3060+3050 **20 GB / Ampere**, koala 2070S+2060 **20 GB /
+Turing** (NOT Maxwell), gridz4 Blackwell+A2000 **36 GB**, redbox 1070+1660S
+**14 GB**, z400 **GPU driver down**.
 
 ### Step 2 — Baseline (the "before")
 ```bash

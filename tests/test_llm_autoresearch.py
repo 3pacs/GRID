@@ -11,8 +11,13 @@ from llm.autoresearch.bench import QualityResult, ThroughputResult, _grade, load
 from llm.autoresearch.hosts import (
     HostProfile,
     ModelSpec,
+    _aggregate_profile,
+    _snapshot_cards,
+    arch_caps,
     arch_from_name,
     fits_on,
+    load_host_profiles,
+    profiles_from_snapshot,
     recommend_for_host,
 )
 from llm.autoresearch.loop import (
@@ -218,3 +223,163 @@ def test_running_endpoint_applier_is_noop():
     applier = RunningEndpointApplier()
     cfg = TrialConfig("e1", "http://host:8081", "qwen3.6")
     assert applier.apply(cfg) == ("http://host:8081", "qwen3.6")
+
+
+# --------------------------------------------------------------------------
+# Architecture capability map (label -> flash_attn / fp8)
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "arch,fa,fp8",
+    [
+        ("Blackwell", True, True),
+        ("Hopper", True, True),
+        ("Ampere", True, False),
+        ("Turing", True, False),
+        ("Pascal", False, False),
+        ("Maxwell", False, False),
+        ("SomethingNew", True, False),  # unknown -> modern assumption
+    ],
+)
+def test_arch_caps(arch, fa, fp8):
+    assert arch_caps(arch) == (fa, fp8)
+
+
+# --------------------------------------------------------------------------
+# Heterogeneous GPU aggregation (the fleet is all mixed-card boxes)
+# --------------------------------------------------------------------------
+def test_aggregate_sums_vram_across_mixed_cards():
+    # grid-svr: A2000 12GB (Ampere) + RTX PRO 2000 Blackwell 16GB.
+    prof = _aggregate_profile(
+        "grid-svr",
+        [("NVIDIA RTX A2000 12GB", 12.0, "Ampere"),
+         ("NVIDIA RTX PRO 2000 Blackwell", 16.0, "Blackwell")],
+        "snapshot",
+    )
+    assert prof.total_vram_gb == 28.0   # summed, not first*count
+    assert prof.gpus == 2
+    assert prof.flash_attn is True      # both support FA
+    assert prof.fp8 is False            # Ampere lacks fp8 -> conservative AND
+    assert prof.arch == "mixed:ampere+blackwell"
+
+
+def test_aggregate_pascal_disables_flash_attn():
+    # panda: 3x P100 Pascal -> no flash-attn, 48GB total.
+    prof = _aggregate_profile(
+        "panda",
+        [("Tesla P100-PCIE-16GB", 16.0, "Pascal")] * 3,
+        "snapshot",
+    )
+    assert prof.total_vram_gb == 48.0
+    assert prof.gpus == 3
+    assert prof.flash_attn is False
+    assert prof.arch == "pascal"
+    assert "3x" in prof.gpu_name
+
+
+def test_aggregate_mixed_arch_uses_least_capable():
+    # koala is Turing (fa yes); a hypothetical Pascal sibling would gate FA off.
+    prof = _aggregate_profile(
+        "mixed",
+        [("NVIDIA GeForce RTX 2070 SUPER", 8.0, "Turing"),
+         ("NVIDIA GeForce GTX 1070", 8.0, "Pascal")],
+        "detected",
+    )
+    assert prof.flash_attn is False  # one Pascal card forces it off
+
+
+def test_aggregate_infers_arch_from_name_when_label_blank():
+    prof = _aggregate_profile(
+        "k", [("NVIDIA GeForce RTX 2070 SUPER", 8.0, "")], "detected"
+    )
+    assert prof.arch == "turing"
+    assert prof.flash_attn is True
+
+
+# --------------------------------------------------------------------------
+# Snapshot parsing — filter display adapters, gate on status
+# --------------------------------------------------------------------------
+def test_snapshot_cards_filters_display_adapters():
+    host = {"gpus": [
+        {"name": "NVIDIA RTX A2000 12GB", "uuid": "GPU-abc",
+         "memoryTotalMiB": 12282, "architecture": "Ampere"},
+        {"name": "Matrox MGA G200eW", "uuid": "",
+         "memoryTotalMiB": None, "architecture": ""},   # display adapter -> drop
+        {"name": "NVIDIA RTX PRO 2000 Blackwell", "uuid": "GPU-def",
+         "memoryTotalMiB": 16311, "architecture": "Blackwell"},
+    ]}
+    cards = _snapshot_cards(host)
+    assert len(cards) == 2
+    assert {c[0] for c in cards} == {"NVIDIA RTX A2000 12GB", "NVIDIA RTX PRO 2000 Blackwell"}
+
+
+def _fake_snapshot_response(payload):
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return payload
+
+    return _Resp()
+
+
+def test_profiles_from_snapshot_skips_non_ok_and_builds_totals(monkeypatch):
+    payload = {"snapshot": {"hosts": [
+        {"id": "grid-svr", "status": "ok", "gpus": [
+            {"name": "NVIDIA RTX A2000 12GB", "uuid": "g1",
+             "memoryTotalMiB": 12282, "architecture": "Ampere"},
+            {"name": "NVIDIA RTX PRO 2000 Blackwell", "uuid": "g2",
+             "memoryTotalMiB": 16311, "architecture": "Blackwell"},
+        ]},
+        {"id": "z400", "status": "inactive", "gpus": []},     # skipped
+        {"id": "ocr-node", "status": "error", "gpus": []},    # skipped
+        {"id": "panda", "status": "ok", "gpus": [
+            {"name": "Tesla P100-PCIE-16GB", "uuid": "p1",
+             "memoryTotalMiB": 16384, "architecture": "Pascal"},
+            {"name": "Tesla P100-PCIE-16GB", "uuid": "p2",
+             "memoryTotalMiB": 16384, "architecture": "Pascal"},
+        ]},
+    ]}}
+    monkeypatch.setattr("requests.get", lambda *a, **k: _fake_snapshot_response(payload))
+
+    profiles = profiles_from_snapshot("http://fake/api/snapshot")
+    assert set(profiles) == {"grid-svr", "panda"}            # non-ok dropped
+    assert round(profiles["grid-svr"].total_vram_gb) == 28   # 12282+16311 MiB
+    assert profiles["grid-svr"].source == "snapshot"
+    assert profiles["panda"].flash_attn is False             # Pascal
+
+
+# --------------------------------------------------------------------------
+# Layered resolution: fallback < override < snapshot; import stays offline
+# --------------------------------------------------------------------------
+def test_load_host_profiles_offline_skips_network(monkeypatch, tmp_path):
+    def _boom(*a, **k):
+        raise AssertionError("network must not be touched when use_snapshot=False")
+
+    monkeypatch.setattr("requests.get", _boom)
+    profiles = load_host_profiles(override_path=tmp_path / "missing.json", use_snapshot=False)
+    assert profiles  # falls back to the baked-in table
+    assert all(p.source == "fallback" for p in profiles.values())
+
+
+def test_load_host_profiles_snapshot_overrides_override_file(monkeypatch, tmp_path):
+    override = tmp_path / "host_profiles.json"
+    override.write_text(json.dumps({
+        "grid-svr": {"vram_gb": 99.0, "gpus": 1, "gpu_name": "stale", "arch": "ampere"},
+        "koala": {"vram_gb": 10.0, "gpus": 2, "gpu_name": "from-file", "arch": "turing"},
+    }))
+    payload = {"snapshot": {"hosts": [
+        {"id": "grid-svr", "status": "ok", "gpus": [
+            {"name": "NVIDIA RTX A2000 12GB", "uuid": "g1",
+             "memoryTotalMiB": 12282, "architecture": "Ampere"},
+        ]},
+    ]}}
+    monkeypatch.setattr("requests.get", lambda *a, **k: _fake_snapshot_response(payload))
+
+    profiles = load_host_profiles(override_path=override, use_snapshot=True)
+    # grid-svr comes from the live snapshot (wins over the stale override file)...
+    assert profiles["grid-svr"].source == "snapshot"
+    assert profiles["grid-svr"].total_vram_gb == 12.0
+    # ...koala isn't in the snapshot, so the override-file value survives.
+    assert profiles["koala"].source == "override"
+    assert profiles["koala"].gpu_name == "from-file"

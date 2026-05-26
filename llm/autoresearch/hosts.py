@@ -16,7 +16,9 @@ flash-attention / FP8 capability flags.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,12 @@ QUANT_BPW: dict[str, float] = {
 
 DEFAULT_OVERHEAD_GB = 2.5
 PROFILE_OVERRIDE_PATH = Path(__file__).parent / "host_profiles.json"
+
+# Live fleet inventory dashboard. It SSH-polls every host on a fixed cycle and
+# publishes per-GPU name/VRAM/architecture, so it is the self-updating source
+# of truth for host profiles (overridable via env for a different deployment).
+DEFAULT_SNAPSHOT_URL = "http://network.stepdad.finance/api/snapshot"
+SNAPSHOT_TIMEOUT_SECONDS = 6.0
 
 
 @dataclass(frozen=True)
@@ -87,6 +95,71 @@ def arch_from_name(gpu_name: str) -> tuple[str, bool, bool]:
     return "unknown", True, False
 
 
+# Capability map keyed on an architecture *label* (e.g. from the dashboard's
+# `architecture` field), as opposed to a full GPU name. -> (flash_attn, fp8).
+_ARCH_CAPS: dict[str, tuple[bool, bool]] = {
+    "blackwell": (True, True), "hopper": (True, True),
+    "ada": (True, True), "ada lovelace": (True, True),
+    "ampere": (True, False), "turing": (True, False), "volta": (True, False),
+    "pascal": (False, False), "maxwell": (False, False),
+}
+
+
+def arch_caps(arch: str) -> tuple[bool, bool]:
+    """Infer ``(flash_attn, fp8)`` from an architecture label.
+
+    Unknown architectures default to a modern assumption (flash-attn on,
+    fp8 off) to avoid wrongly disabling a capable card.
+    """
+    return _ARCH_CAPS.get(arch.strip().lower(), (True, False))
+
+
+def _aggregate_profile(
+    host: str, cards: list[tuple[str, float, str]], source: str
+) -> HostProfile:
+    """Fold a host's GPUs into one HostProfile.
+
+    ``cards`` is ``[(gpu_name, vram_gb, arch_label), ...]``; an empty
+    ``arch_label`` falls back to inferring arch/caps from the name. VRAM is
+    summed across *all* cards (so heterogeneous boxes report their true
+    total), capabilities are the conservative intersection (a feature is
+    only claimed if every card supports it), and ``vram_gb`` is the per-card
+    average so that ``vram_gb * gpus == total``.
+    """
+    archs: list[str] = []
+    fa_flags: list[bool] = []
+    fp8_flags: list[bool] = []
+    for name, _vram, arch_label in cards:
+        if arch_label:
+            arch = arch_label.strip().lower()
+            fa, fp8 = arch_caps(arch)
+        else:
+            arch, fa, fp8 = arch_from_name(name)
+        archs.append(arch)
+        fa_flags.append(fa)
+        fp8_flags.append(fp8)
+
+    total_vram = sum(v for _, v, _ in cards)
+    count = len(cards)
+    unique_archs = sorted(set(archs))
+    arch_label = unique_archs[0] if len(unique_archs) == 1 else "mixed:" + "+".join(unique_archs)
+    name_counts = Counter(name for name, _, _ in cards)
+    gpu_name = ", ".join(
+        f"{n}x {nm}" if n > 1 else nm for nm, n in name_counts.items()
+    )
+    return HostProfile(
+        host=host,
+        vram_gb=round(total_vram / count, 1) if count else 0.0,
+        gpus=count,
+        arch=arch_label,
+        flash_attn=all(fa_flags),
+        fp8=all(fp8_flags),
+        gpu_name=gpu_name,
+        source=source,
+        notes=f"{source}: {count}x [{gpu_name}] = {total_vram:.0f}GB total",
+    )
+
+
 def detect_local_gpus() -> list[tuple[str, float]]:
     """Return ``[(gpu_name, vram_gb), ...]`` for the local machine.
 
@@ -118,19 +191,15 @@ def detect_local_gpus() -> list[tuple[str, float]]:
 def detect_local_profile(host: str) -> HostProfile | None:
     """Build a HostProfile for the local machine via nvidia-smi.
 
-    Groups identical cards (vram per card + count). Returns None if no GPU
-    is detected. Run this *on each host* to populate ``host_profiles.json``.
+    Sums VRAM across *all* detected cards (heterogeneous boxes are common on
+    this fleet, so first-card-times-count would undercount), and takes the
+    conservative capability intersection. Returns None if no GPU is detected.
     """
     gpus = detect_local_gpus()
     if not gpus:
         return None
-    name, vram = gpus[0][0], gpus[0][1]
-    arch, fa, fp8 = arch_from_name(name)
-    return HostProfile(
-        host=host, vram_gb=vram, gpus=len(gpus), arch=arch,
-        flash_attn=fa, fp8=fp8, gpu_name=name, source="detected",
-        notes=f"detected {len(gpus)}x {name}",
-    )
+    cards = [(name, vram, "") for name, vram in gpus]
+    return _aggregate_profile(host, cards, "detected")
 
 
 # Baked-in fallback — STALE by nature. Used only when neither runtime
@@ -145,19 +214,14 @@ _FALLBACK_PROFILES: dict[str, HostProfile] = {
 }
 
 
-def load_host_profiles(override_path: Path = PROFILE_OVERRIDE_PATH) -> dict[str, HostProfile]:
-    """Load operator-maintained host profiles from JSON, else the fallback.
-
-    JSON schema: ``{"<host>": {"vram_gb": 24, "gpus": 1, "gpu_name": "...",
-    "arch": "ampere", ...}}``. ``arch``/``flash_attn``/``fp8`` are inferred
-    from ``gpu_name`` when omitted.
-    """
+def _parse_override(override_path: Path) -> dict[str, HostProfile]:
+    """Parse the operator-maintained JSON override file (or ``{}``)."""
     if not override_path.exists():
-        return dict(_FALLBACK_PROFILES)
+        return {}
     try:
         raw = json.loads(override_path.read_text(encoding="utf-8"))
     except Exception:
-        return dict(_FALLBACK_PROFILES)
+        return {}
 
     profiles: dict[str, HostProfile] = {}
     for host, spec in raw.items():
@@ -179,8 +243,88 @@ def load_host_profiles(override_path: Path = PROFILE_OVERRIDE_PATH) -> dict[str,
     return profiles
 
 
-# Resolved at import: override file if present, else stale fallback.
-HOST_PROFILES: dict[str, HostProfile] = load_host_profiles()
+def _snapshot_cards(host_entry: dict[str, Any]) -> list[tuple[str, float, str]]:
+    """Extract real NVIDIA GPUs from one dashboard host entry.
+
+    The snapshot's ``gpus`` list also contains display adapters (Matrox,
+    Intel iGPU) with no UUID / null memory / blank architecture — those are
+    filtered out so only inference-capable cards count.
+    """
+    cards: list[tuple[str, float, str]] = []
+    for gpu in host_entry.get("gpus") or []:
+        mib = gpu.get("memoryTotalMiB")
+        uuid = gpu.get("uuid") or ""
+        arch = (gpu.get("architecture") or "").strip()
+        if not mib or not uuid or not arch:
+            continue
+        name = (gpu.get("name") or "").strip()
+        cards.append((name, round(float(mib) / 1024.0, 1), arch))
+    return cards
+
+
+def profiles_from_snapshot(
+    url: str = DEFAULT_SNAPSHOT_URL, *, timeout: float = SNAPSHOT_TIMEOUT_SECONDS
+) -> dict[str, HostProfile]:
+    """Build host profiles from the live fleet inventory dashboard.
+
+    Only hosts reporting ``status == "ok"`` with at least one real NVIDIA GPU
+    are returned. Requires ``requests``; raises on network/parse failure so
+    the caller can decide whether to fall back.
+    """
+    import requests  # lazy: keep this module importable without requests
+
+    resp = requests.get(url, timeout=timeout)
+    resp.raise_for_status()
+    hosts = ((resp.json() or {}).get("snapshot") or {}).get("hosts") or []
+    profiles: dict[str, HostProfile] = {}
+    for host_entry in hosts:
+        if host_entry.get("status") != "ok":
+            continue
+        cards = _snapshot_cards(host_entry)
+        if not cards:
+            continue
+        host = host_entry.get("id") or host_entry.get("hostname")
+        if host:
+            profiles[host] = _aggregate_profile(host, cards, "snapshot")
+    return profiles
+
+
+def _snapshot_enabled(use_snapshot: bool | None) -> bool:
+    if use_snapshot is not None:
+        return use_snapshot
+    return os.environ.get("GRID_FLEET_SNAPSHOT_DISABLE", "").lower() not in ("1", "true", "yes")
+
+
+def load_host_profiles(
+    override_path: Path = PROFILE_OVERRIDE_PATH,
+    *,
+    use_snapshot: bool | None = None,
+    snapshot_url: str | None = None,
+) -> dict[str, HostProfile]:
+    """Resolve host profiles, highest-priority source winning per host.
+
+    Layering (later overrides earlier): baked-in fallback -> operator JSON
+    override -> live dashboard snapshot. The snapshot is only consulted when
+    ``use_snapshot`` is True (default reads ``GRID_FLEET_SNAPSHOT_DISABLE``);
+    a network/parse failure degrades gracefully to the lower layers. JSON
+    schema: ``{"<host>": {"vram_gb": 24, "gpus": 1, "gpu_name": "...",
+    "arch": "ampere", ...}}`` (arch/flash_attn/fp8 inferred when omitted).
+    """
+    profiles: dict[str, HostProfile] = dict(_FALLBACK_PROFILES)
+    profiles.update(_parse_override(override_path))
+    if _snapshot_enabled(use_snapshot):
+        url = snapshot_url or os.environ.get("GRID_FLEET_SNAPSHOT_URL", DEFAULT_SNAPSHOT_URL)
+        try:
+            profiles.update(profiles_from_snapshot(url))
+        except Exception:
+            pass  # graceful degradation — keep override/fallback layers
+    return profiles
+
+
+# Resolved at import: offline layers only (override file, else stale fallback)
+# so importing the package never does network I/O. Pass use_snapshot=True (the
+# CLI does) to fold in the live dashboard at runtime.
+HOST_PROFILES: dict[str, HostProfile] = load_host_profiles(use_snapshot=False)
 
 
 @dataclass(frozen=True)

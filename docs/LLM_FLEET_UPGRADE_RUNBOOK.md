@@ -25,24 +25,40 @@ Both support **native MTP (Multi-Token Prediction)** — the tok/sec lever. Enab
 
 Card configs go stale the moment hardware is swapped. **Resolve each host's
 GPUs at runtime**, then let the planner derive recommendations from the
-*actual* VRAM/arch. Run this once per host (it shells out to `nvidia-smi`):
+*actual* VRAM/arch.
+
+> **Profiles are now self-updating from the live fleet dashboard.** The
+> dashboard (`network.stepdad.finance/api/snapshot`, override via
+> `GRID_FLEET_SNAPSHOT_URL`) SSH-polls every host on a fixed cycle and
+> publishes per-GPU name/VRAM/architecture. `--plan` / `--audit` pull it live
+> each run, so you usually **don't hand-edit `host_profiles.json` at all** —
+> just run `--plan`. To cache a copy (offline fallback): `--refresh-profiles`.
+> Heterogeneous boxes (the norm on this fleet — grid-svr A2000+Blackwell=28GB,
+> koala 2070S+2060 Turing=20GB, panda 3×P100 Pascal=48GB) are summed and given
+> the conservative capability intersection automatically. The hand-edit path
+> below is only for hosts the dashboard can't reach.
+
+Per-host manual detection (shells out to `nvidia-smi`):
 
 ```bash
 # On each box (grid-svr, panda, ocr-node, koala, z400, ...):
 python -m scripts.run_llm_autoresearch --detect "$(hostname)"
 ```
 
-Paste each snippet into `llm/autoresearch/host_profiles.json`:
+Paste each snippet into `llm/autoresearch/host_profiles.json` (real values as
+detected 2026-05-26 — note these are mixed-card boxes, so set `arch`/
+`flash_attn`/`fp8` explicitly; they can't be inferred from a single name):
 
 ```json
 {
-  "grid-svr": {"vram_gb": 48, "gpus": 1, "gpu_name": "NVIDIA RTX PRO 6000 Blackwell"},
-  "panda":    {"vram_gb": 24, "gpus": 1, "gpu_name": "NVIDIA GeForce RTX 3090"},
-  "koala":    {"vram_gb": 12, "gpus": 2, "gpu_name": "NVIDIA GeForce GTX TITAN X"}
+  "grid-svr": {"vram_gb": 14, "gpus": 2, "gpu_name": "RTX A2000 12GB, RTX PRO 2000 Blackwell", "arch": "mixed:ampere+blackwell", "flash_attn": true, "fp8": false},
+  "panda":    {"vram_gb": 16, "gpus": 3, "gpu_name": "3x Tesla P100-PCIE-16GB", "arch": "pascal", "flash_attn": false, "fp8": false},
+  "koala":    {"vram_gb": 10, "gpus": 2, "gpu_name": "RTX 2070 SUPER, RTX 2060", "arch": "turing", "flash_attn": true, "fp8": false}
 }
 ```
 
-`arch`, `flash_attn`, and `fp8` are inferred from `gpu_name` automatically.
+For single-name single-arch hosts, `arch`/`flash_attn`/`fp8` are inferred from
+`gpu_name`; for mixed boxes pin them as above (`vram_gb * gpus` = total VRAM).
 Then print the plan derived from the resolved profiles:
 
 ```bash

@@ -21,10 +21,12 @@ from llm.autoresearch.hosts import (
     HOST_PROFILES,
     HostProfile,
     ModelSpec,
+    arch_caps,
     arch_from_name,
     detect_local_profile,
     fits_on,
     load_host_profiles,
+    profiles_from_snapshot,
     recommend_for_host,
 )
 from llm.autoresearch.loop import (
@@ -54,6 +56,7 @@ __all__ = [
     "ThroughputResult",
     "TrialConfig",
     "TrialResult",
+    "arch_caps",
     "arch_from_name",
     "assess_model",
     "compute_fitness",
@@ -62,6 +65,7 @@ __all__ = [
     "eligible_endpoints",
     "fits_on",
     "load_host_profiles",
+    "profiles_from_snapshot",
     "measure_quality",
     "measure_throughput",
     "recommend_for_host",

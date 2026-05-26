@@ -36,10 +36,11 @@ from llm.autoresearch import (
     eligible_endpoints,
     recommend_for_host,
 )
-from llm.autoresearch.hosts import HOST_PROFILES
+from llm.autoresearch.hosts import PROFILE_OVERRIDE_PATH, load_host_profiles, profiles_from_snapshot
 
 
 def _audit(include_below_bar: bool, qwen_bar: float) -> None:
+    profiles = load_host_profiles(use_snapshot=True)
     eps = discover_endpoints(qwen_bar)
     if not eps:
         print("No endpoints configured (check config.settings URLs).")
@@ -54,7 +55,7 @@ def _audit(include_below_bar: bool, qwen_bar: float) -> None:
         print()
         print(f"{len(below)} endpoint(s) below the quality bar — recommend upgrading to Qwen 3.6+:")
         for e in below:
-            prof = HOST_PROFILES.get(e.host)
+            prof = profiles.get(e.host)
             vram = f"{prof.total_vram_gb:.0f}GB {prof.arch}" if prof else "unknown VRAM"
             print(f"  - {e.host} ({vram}): {e.model}")
 
@@ -65,18 +66,48 @@ def _detect(host_name: str) -> None:
     if prof is None:
         print("No GPU detected here (nvidia-smi unavailable or CPU-only node).")
         return
-    print(f"Detected on '{host_name}': {prof.gpus}x {prof.gpu_name} "
-          f"@ {prof.vram_gb}GB ({prof.arch}, flash_attn={prof.flash_attn}, fp8={prof.fp8})")
+    print(f"Detected on '{host_name}': {prof.gpu_name} "
+          f"@ {prof.total_vram_gb:.0f}GB total ({prof.arch}, flash_attn={prof.flash_attn}, fp8={prof.fp8})")
     print("\nAdd to llm/autoresearch/host_profiles.json:")
-    snippet = {host_name: {"vram_gb": prof.vram_gb, "gpus": prof.gpus, "gpu_name": prof.gpu_name}}
+    # Emit the resolved arch/caps too — for mixed-card hosts these can't be
+    # re-derived from a single gpu_name, so they must be pinned explicitly.
+    snippet = {host_name: {
+        "vram_gb": prof.vram_gb, "gpus": prof.gpus, "gpu_name": prof.gpu_name,
+        "arch": prof.arch, "flash_attn": prof.flash_attn, "fp8": prof.fp8,
+    }}
     print(_json.dumps(snippet, indent=2))
+
+
+def _refresh_profiles(snapshot_url: str | None) -> int:
+    """Write a cached host_profiles.json from the live fleet dashboard."""
+    try:
+        profiles = profiles_from_snapshot(snapshot_url) if snapshot_url else profiles_from_snapshot()
+    except Exception as exc:  # network/parse failure — report, don't overwrite
+        print(f"Snapshot fetch failed ({exc}); host_profiles.json left unchanged.")
+        return 1
+    if not profiles:
+        print("Snapshot returned no usable GPU hosts; host_profiles.json left unchanged.")
+        return 1
+    out = {
+        host: {
+            "vram_gb": p.vram_gb, "gpus": p.gpus, "gpu_name": p.gpu_name,
+            "arch": p.arch, "flash_attn": p.flash_attn, "fp8": p.fp8, "notes": p.notes,
+        }
+        for host, p in sorted(profiles.items())
+    }
+    PROFILE_OVERRIDE_PATH.write_text(_json.dumps(out, indent=2) + "\n", encoding="utf-8")
+    print(f"Wrote {len(out)} host profile(s) to {PROFILE_OVERRIDE_PATH}:")
+    for host, p in sorted(profiles.items()):
+        print(f"  {host:<10} {p.total_vram_gb:.0f}GB {p.arch:<22} {p.gpu_name}")
+    return 0
 
 
 def _plan(qwen_bar: float) -> None:
     """Print the VRAM-tier Qwen 3.6+ recommendation for each known host."""
+    profiles = load_host_profiles(use_snapshot=True)
     print(f"{'HOST':<10} {'SRC':<9} {'VRAM':<7} {'MODEL':<26} {'QUANT':<8} RATIONALE")
     print("-" * 110)
-    for host, prof in HOST_PROFILES.items():
+    for host, prof in profiles.items():
         rec = recommend_for_host(prof)
         model = rec.get("model") or "(none — repurpose)"
         quant = rec.get("quant") or "-"
@@ -84,9 +115,9 @@ def _plan(qwen_bar: float) -> None:
         print(f"{host:<10} {prof.source:<9} {vram:<7} {model:<26} {quant:<8} {rec['rationale']}")
         if rec.get("flags"):
             print(f"{'':<10} flags: {rec['flags']}")
-    if any(p.source == "fallback" for p in HOST_PROFILES.values()):
-        print("\nWARNING: some profiles are STALE fallbacks. Run --detect on each host "
-              "and populate llm/autoresearch/host_profiles.json for accurate planning.")
+    if any(p.source == "fallback" for p in profiles.values()):
+        print("\nWARNING: some profiles are STALE fallbacks (live snapshot didn't cover them). "
+              "Run --detect on those hosts, or --refresh-profiles to re-pull the dashboard.")
 
 
 def _baseline(args: argparse.Namespace) -> int:
@@ -131,6 +162,10 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="GRID LLM autoresearch (quality + tok/sec)")
     p.add_argument("--audit", action="store_true", help="List endpoints and quality-bar status, then exit")
     p.add_argument("--detect", metavar="HOST", help="Detect this machine's GPU profile (run on each host)")
+    p.add_argument("--refresh-profiles", action="store_true",
+                   help="Re-pull the live fleet dashboard and cache host_profiles.json")
+    p.add_argument("--snapshot-url", default=None,
+                   help="Override the fleet inventory snapshot URL (else env / default)")
     p.add_argument("--plan", action="store_true", help="Print VRAM-tier Qwen 3.6+ recommendation per host")
     p.add_argument("--baseline", action="store_true", help="Measure quality + tok/sec for eligible endpoints")
     p.add_argument("--include-below-bar", action="store_true", help="Include models below the Qwen-3.6 bar")
@@ -143,6 +178,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.detect:
         _detect(args.detect)
         return 0
+    if args.refresh_profiles:
+        return _refresh_profiles(args.snapshot_url)
     if args.plan:
         _plan(args.qwen_bar)
         return 0
