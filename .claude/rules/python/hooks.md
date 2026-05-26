@@ -5,7 +5,7 @@ paths:
 ---
 # Python Hooks
 
-> This file extends [common/hooks.md](../common/hooks.md) with Python specific content.
+> Python-specific hook configuration layer for Claude Code PostToolUse hooks.
 
 ## PostToolUse Hooks
 
