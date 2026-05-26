@@ -16,6 +16,7 @@ from llm.autoresearch.bench import (
     ThroughputResult,
     measure_quality,
     measure_throughput,
+    warm_up,
 )
 from llm.autoresearch.hosts import (
     HOST_PROFILES,
@@ -69,4 +70,5 @@ __all__ = [
     "measure_quality",
     "measure_throughput",
     "recommend_for_host",
+    "warm_up",
 ]

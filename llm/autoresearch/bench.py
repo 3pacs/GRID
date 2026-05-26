@@ -28,6 +28,12 @@ from loguru import logger as log
 
 EVAL_PATH = Path(__file__).parent / "evals" / "grid_eval.jsonl"
 
+# (connect, read) timeouts. Cold model loads on slow nodes (e.g. a 17 GB GGUF
+# off a spinning disk on Pascal) can take minutes, so the warm-up read timeout
+# is generous; per-request reads on an already-warm model are bounded tighter.
+WARMUP_TIMEOUT: tuple[float, float] = (15.0, 600.0)
+DEFAULT_TIMEOUT: tuple[float, float] = (15.0, 180.0)
+
 # Default throughput probes — short, deterministic, generation-heavy.
 DEFAULT_THROUGHPUT_PROMPTS: tuple[str, ...] = (
     "List the 12 months of the year, one per line.",
@@ -58,16 +64,21 @@ class QualityResult:
     """Outcome of a quality eval.
 
     Attributes:
-        score: Fraction of eval cases passed, in [0, 1].
+        score: Fraction of *answered* cases passed, in [0, 1] (passed/answered)
+            — timeouts are excluded so a slow endpoint isn't scored as wrong.
         passed: Number of cases passed.
-        total: Number of cases run.
-        reachable: Whether the endpoint responded.
+        total: Number of cases in the eval set.
+        reachable: Whether the endpoint answered at least one case.
+        answered: Number of cases that returned a gradeable response
+            (``total - answered`` = unmeasured timeouts/errors). Coverage =
+            ``answered / total``; a low value means the score is unreliable.
     """
 
     score: float
     passed: int
     total: int
     reachable: bool = False
+    answered: int = 0
 
 
 def _post_chat(
@@ -77,9 +88,14 @@ def _post_chat(
     *,
     max_tokens: int,
     temperature: float,
-    timeout: float,
-) -> dict[str, Any] | None:
-    """POST a chat completion; return parsed JSON or None on any failure."""
+    timeout: float | tuple[float, float],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """POST a chat completion.
+
+    Returns ``(data, error)``: ``error`` is None on success, else one of
+    ``"timeout"`` (slow/cold endpoint — *not* a quality signal), ``"http_<n>"``
+    (server rejected the request), or ``"unreachable"`` (connection failed).
+    """
     payload = {
         "model": model,
         "messages": messages,
@@ -100,11 +116,33 @@ def _post_chat(
         )
         if resp.status_code >= 400:
             log.debug("bench chat {s} @ {u}", s=resp.status_code, u=base_url)
-            return None
-        return resp.json()
+            return None, f"http_{resp.status_code}"
+        return resp.json(), None
+    except requests.exceptions.Timeout:
+        log.debug("bench chat timeout @ {u}", u=base_url)
+        return None, "timeout"
     except Exception as exc:
         log.debug("bench chat failed @ {u}: {e}", u=base_url, e=str(exc))
-        return None
+        return None, "unreachable"
+
+
+def warm_up(
+    base_url: str,
+    model: str,
+    *,
+    timeout: float | tuple[float, float] = WARMUP_TIMEOUT,
+) -> bool:
+    """Load the model into VRAM with one tiny request before measuring.
+
+    Slow/cold endpoints otherwise time out the first real eval case, which
+    corrupts the score. Returns True if the endpoint answered (warm). A long
+    read timeout absorbs multi-minute cold loads off slow storage.
+    """
+    _data, err = _post_chat(
+        base_url, model, [{"role": "user", "content": "ready?"}],
+        max_tokens=1, temperature=0.0, timeout=timeout,
+    )
+    return err is None
 
 
 def _completion_tokens(data: dict[str, Any]) -> int:
@@ -142,15 +180,18 @@ def measure_throughput(
     *,
     prompts: tuple[str, ...] = DEFAULT_THROUGHPUT_PROMPTS,
     max_tokens: int = 160,
-    timeout: float = 120.0,
+    timeout: float | tuple[float, float] = DEFAULT_TIMEOUT,
+    warm: bool = True,
 ) -> ThroughputResult:
     """Measure generation throughput (tok/sec) for an endpoint."""
+    if warm:
+        warm_up(base_url, model)
     samples: list[float] = []
     source = "wallclock"
     reachable = False
     for prompt in prompts:
         start = time.monotonic()
-        data = _post_chat(
+        data, _err = _post_chat(
             base_url, model,
             [{"role": "user", "content": prompt}],
             max_tokens=max_tokens, temperature=0.0, timeout=timeout,
@@ -224,34 +265,42 @@ def measure_quality(
     *,
     cases: list[dict[str, Any]] | None = None,
     max_tokens: int = 512,
-    timeout: float = 120.0,
+    timeout: float | tuple[float, float] = DEFAULT_TIMEOUT,
     grader: Callable[[dict[str, Any], str], bool] = _grade,
+    warm: bool = True,
 ) -> QualityResult:
-    """Run the quality eval set against an endpoint."""
+    """Run the quality eval set against an endpoint.
+
+    Score is ``passed / answered`` — cases that time out (or otherwise return
+    no content) are *unmeasured*, not counted as failures, so a slow endpoint
+    isn't mistaken for a low-quality one. ``answered`` exposes coverage.
+    """
     cases = cases if cases is not None else load_eval_cases()
     if not cases:
-        return QualityResult(0.0, 0, 0, False)
+        return QualityResult(0.0, 0, 0, False, 0)
+
+    if warm:
+        warm_up(base_url, model)
 
     passed = 0
-    reachable = False
+    answered = 0
     for case in cases:
         messages: list[dict[str, str]] = []
         if case.get("system"):
             messages.append({"role": "system", "content": case["system"]})
         messages.append({"role": "user", "content": case["prompt"]})
-        data = _post_chat(
+        data, _err = _post_chat(
             base_url, model, messages,
             max_tokens=max_tokens,
             temperature=0.0,
             timeout=timeout,
         )
         if data is None:
-            continue
-        reachable = True
-        answer = _content(data)
-        if grader(case, answer):
+            continue  # timeout / unreachable / http error -> unmeasured
+        answered += 1
+        if grader(case, _content(data)):
             passed += 1
 
     total = len(cases)
-    score = passed / total if total else 0.0
-    return QualityResult(round(score, 4), passed, total, reachable)
+    score = passed / answered if answered else 0.0
+    return QualityResult(round(score, 4), passed, total, answered > 0, answered)

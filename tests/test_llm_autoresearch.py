@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+import requests as _requests
+
 from llm.autoresearch.bench import (
     QualityResult,
     ThroughputResult,
@@ -15,6 +17,8 @@ from llm.autoresearch.bench import (
     _post_chat,
     _strip_think,
     load_eval_cases,
+    measure_quality,
+    warm_up,
 )
 from llm.autoresearch.hosts import (
     HostProfile,
@@ -202,6 +206,114 @@ def test_post_chat_disables_thinking(monkeypatch):
                max_tokens=8, temperature=0.0, timeout=5.0)
     assert captured["payload"]["chat_template_kwargs"] == {"enable_thinking": False}
     assert captured["url"].endswith("/v1/chat/completions")
+
+
+def test_post_chat_classifies_timeout(monkeypatch):
+    def _raise_timeout(*a, **k):
+        raise _requests.exceptions.Timeout("read timed out")
+
+    monkeypatch.setattr("requests.post", _raise_timeout)
+    data, err = _post_chat("http://x", "m", [{"role": "user", "content": "hi"}],
+                           max_tokens=8, temperature=0.0, timeout=(5.0, 5.0))
+    assert data is None and err == "timeout"
+
+
+def test_post_chat_classifies_unreachable(monkeypatch):
+    def _raise_conn(*a, **k):
+        raise _requests.exceptions.ConnectionError("refused")
+
+    monkeypatch.setattr("requests.post", _raise_conn)
+    _data, err = _post_chat("http://x", "m", [{"role": "user", "content": "hi"}],
+                            max_tokens=8, temperature=0.0, timeout=5.0)
+    assert err == "unreachable"
+
+
+def _seq_responder(answers):
+    """Build a fake requests.post that returns/raises per call in sequence.
+
+    Each item is either an answer string (-> 200 with that content) or the
+    sentinel "TIMEOUT" (-> raises requests Timeout).
+    """
+    it = iter(answers)
+
+    class _Resp:
+        def __init__(self, content):
+            self.status_code = 200
+            self._c = content
+
+        def json(self):
+            return {"choices": [{"message": {"content": self._c}}]}
+
+    def _post(url, json, timeout):
+        nxt = next(it)
+        if nxt == "TIMEOUT":
+            raise _requests.exceptions.Timeout("slow")
+        return _Resp(nxt)
+
+    return _post
+
+
+def test_measure_quality_excludes_timeouts_from_score(monkeypatch):
+    # 1 warm-up call, then 4 eval cases: 2 correct, 2 time out.
+    cases = [
+        {"id": "a", "prompt": "p", "check": "contains", "expect": ["25"]},
+        {"id": "b", "prompt": "p", "check": "contains", "expect": ["250"]},
+        {"id": "c", "prompt": "p", "check": "contains", "expect": ["x"]},
+        {"id": "d", "prompt": "p", "check": "contains", "expect": ["y"]},
+    ]
+    # warm-up "ok", then per case a,b,c,d: "25"(pass a), "250"(pass b), TIMEOUT(c), TIMEOUT(d)
+    monkeypatch.setattr("requests.post",
+                        _seq_responder(["ok", "25", "250", "TIMEOUT", "TIMEOUT"]))
+    r = measure_quality("http://x", "m", cases=cases)
+    assert r.total == 4
+    assert r.answered == 2          # two timed out -> unmeasured
+    assert r.passed == 2
+    assert r.score == 1.0           # passed/answered, NOT passed/total (0.5)
+    assert r.reachable is True
+
+
+def test_warm_up_true_on_answer_false_on_timeout(monkeypatch):
+    monkeypatch.setattr("requests.post", _seq_responder(["ok"]))
+    assert warm_up("http://x", "m") is True
+    monkeypatch.setattr("requests.post", _seq_responder(["TIMEOUT"]))
+    assert warm_up("http://x", "m") is False
+
+
+def test_loop_marks_low_coverage_unmeasured(tmp_path: Path):
+    # Quality answered only 1 of 10 cases -> coverage 10% < 50% -> unmeasured,
+    # NOT rejected as low-quality, even though score itself is high.
+    def quality_fn(base_url, model, **kw):
+        return QualityResult(score=1.0, passed=1, total=10, reachable=True, answered=1)
+
+    loop = AutoResearchLoop(
+        quality_floor=0.6,
+        quality_fn=quality_fn,
+        throughput_fn=_fake_throughput(30.0),
+        journal_path=tmp_path / "j.jsonl",
+    )
+    loop.run([TrialConfig("e1", "http://x", "slowpoke")])
+    r = loop.history[0]
+    assert r.accepted is False
+    assert "unmeasured" in r.note
+    assert "weak LLM" not in r.note      # must not be scored as a quality failure
+    assert loop.champion is None
+
+
+def test_loop_unset_answered_treated_as_full_coverage(tmp_path: Path):
+    # Back-compat: QualityResult without `answered` (==0) must behave as before
+    # (fully covered), so a passing config is still accepted.
+    def quality_fn(base_url, model, **kw):
+        return QualityResult(score=0.9, passed=9, total=10, reachable=True)  # answered defaults 0
+
+    loop = AutoResearchLoop(
+        quality_floor=0.6,
+        quality_fn=quality_fn,
+        throughput_fn=_fake_throughput(30.0),
+        journal_path=tmp_path / "j.jsonl",
+    )
+    champ = loop.run([TrialConfig("e1", "http://x", "good")])
+    assert champ is not None
+    assert loop.history[0].accepted is True
 
 
 def test_eval_set_loads_and_is_wellformed():

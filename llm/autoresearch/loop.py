@@ -40,6 +40,12 @@ from llm.autoresearch.bench import (
 
 RUNS_DIR = Path(__file__).parent / "runs"
 
+# Minimum fraction of eval cases that must return a gradeable answer before a
+# quality score is treated as a real verdict. Below this, the endpoint was too
+# slow/cold to measure — we report "unmeasured" rather than rejecting it as
+# low-quality (which is what corrupted the early panda baselines).
+MIN_COVERAGE = 0.5
+
 
 @dataclass(frozen=True)
 class TrialConfig:
@@ -74,6 +80,7 @@ class TrialResult:
     fitness: float
     note: str
     ts: str
+    quality_answered: int = 0
 
     def to_journal(self) -> dict[str, Any]:
         d = asdict(self)
@@ -189,11 +196,22 @@ class AutoResearchLoop:
         q = self.quality_fn(base_url, model)
         t = self.throughput_fn(base_url, model)
         reachable = q.reachable or t.reachable
-        fitness = compute_fitness(q.score, t.tok_per_sec, self.quality_floor)
-        accepted = q.score >= self.quality_floor and reachable
+
+        # Coverage gate: how much of the eval actually returned an answer.
+        # `answered == 0` (older/injected QualityResults) means "unknown" — treat
+        # as fully covered so existing callers/tests behave as before.
+        answered = q.answered if q.answered else q.total
+        coverage = (answered / q.total) if q.total else 1.0
+        measured = reachable and coverage >= MIN_COVERAGE
+
+        fitness = compute_fitness(q.score, t.tok_per_sec, self.quality_floor) if measured else float("-inf")
+        accepted = measured and q.score >= self.quality_floor
 
         if not reachable:
             note = "endpoint unreachable"
+        elif not measured:
+            note = (f"unmeasured — only {answered}/{q.total} eval cases answered "
+                    f"(coverage {coverage:.0%} < {MIN_COVERAGE:.0%}); endpoint too slow/cold, not a quality verdict")
         elif not accepted:
             note = f"quality {q.score:.2f} < floor {self.quality_floor:.2f} — rejected (a weak LLM does more harm than good)"
         else:
@@ -203,6 +221,7 @@ class AutoResearchLoop:
             config=config, quality=q.score, tok_per_sec=t.tok_per_sec,
             quality_passed=q.passed, quality_total=q.total, reachable=reachable,
             accepted=accepted, is_champion=False, fitness=fitness, note=note, ts=ts,
+            quality_answered=answered,
         )
 
         is_champion = False
