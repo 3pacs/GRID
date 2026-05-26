@@ -7,7 +7,15 @@ from pathlib import Path
 
 import pytest
 
-from llm.autoresearch.bench import QualityResult, ThroughputResult, _grade, load_eval_cases
+from llm.autoresearch.bench import (
+    QualityResult,
+    ThroughputResult,
+    _content,
+    _grade,
+    _post_chat,
+    _strip_think,
+    load_eval_cases,
+)
 from llm.autoresearch.hosts import (
     HostProfile,
     ModelSpec,
@@ -154,6 +162,46 @@ def test_grade_contains_and_regex_and_json():
     assert _grade({"check": "json_keys", "expect": ["a", "b"]}, 'noise {"a":1,"b":2} tail')
     assert not _grade({"check": "json_keys", "expect": ["a", "b"]}, "not json")
     assert _grade({"check": "contains_any", "expect": ["recession", "slowdown"]}, "signals a recession")
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("<think>weighing options</think>The answer is 25 bp", "The answer is 25 bp"),
+        ("<THINK>x\ny</THINK>\nACK", "ACK"),                       # case-insensitive, multiline
+        ("reasoning blah</think>final answer", "final answer"),    # dangling close tag
+        ("no thinking here", "no thinking here"),                  # untouched
+        ("a<think>1</think>b<think>2</think>c", "abc"),            # multiple blocks
+    ],
+)
+def test_strip_think(raw, expected):
+    assert _strip_think(raw).strip() == expected
+
+
+def test_content_strips_think_from_chat_payload():
+    data = {"choices": [{"message": {"content": "<think>hmm</think>  42  "}}]}
+    assert _content(data) == "42"
+
+
+def test_post_chat_disables_thinking(monkeypatch):
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    def _fake_post(url, json, timeout):
+        captured["url"] = url
+        captured["payload"] = json
+        return _Resp()
+
+    monkeypatch.setattr("requests.post", _fake_post)
+    _post_chat("http://x", "qwen3.6:27b", [{"role": "user", "content": "hi"}],
+               max_tokens=8, temperature=0.0, timeout=5.0)
+    assert captured["payload"]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert captured["url"].endswith("/v1/chat/completions")
 
 
 def test_eval_set_loads_and_is_wellformed():

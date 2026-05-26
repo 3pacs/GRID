@@ -86,6 +86,11 @@ def _post_chat(
         "max_tokens": max_tokens,
         "temperature": temperature,
         "stream": False,
+        # Disable chain-of-thought for eval/throughput. Qwen3.6's chat template
+        # emits <think>…</think> unless told otherwise, which blows the token
+        # budget and breaks exact-match grading (the answer never arrives or is
+        # buried in reasoning). Non-thinking models ignore this field.
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     try:
         resp = requests.post(
@@ -107,10 +112,26 @@ def _completion_tokens(data: dict[str, Any]) -> int:
     return int(usage.get("completion_tokens") or 0)
 
 
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_think(text: str) -> str:
+    """Remove reasoning so grading sees only the final answer.
+
+    Belt-and-suspenders for endpoints that don't honor ``enable_thinking``:
+    drops paired ``<think>…</think>`` blocks, and if a dangling ``</think>``
+    remains (truncated/unclosed reasoning) keeps only what follows it.
+    """
+    text = _THINK_RE.sub("", text)
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[-1]
+    return text
+
+
 def _content(data: dict[str, Any]) -> str:
     try:
         msg = data["choices"][0]["message"]
-        return (msg.get("content") or "").strip()
+        return _strip_think(msg.get("content") or "").strip()
     except Exception:
         return ""
 
