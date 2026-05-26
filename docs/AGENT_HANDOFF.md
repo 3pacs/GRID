@@ -1,3 +1,12 @@
+## 2026-05-26 23:35 UTC — 2026-05-26-2303
+**Why this matters next run:** Line 44 (system.py tests) is now done; the next clean api/ items are 45/46/47, and I left a real latent bug flagged below.
+
+- Picked **PUNCH-LIST line 44** [P1] — created `tests/test_system_router.py` (PR #265): auth-required + happy-path smoke tests for `/freshness`, `/pipeline-health`, `/hermes-status` via the `mock_engine` empty-DB graceful-degradation path. 6 tests pass, ruff clean.
+- **Next clean routine-claimable items** (same 2026-05-17 api/ audit, all still unclaimed): line 45 [P1] `prediction_backtest.py:20` `get_engine`→`get_db_engine`; line 46 [P2] `clear_singletons()` doesn't clear `db._engine`; line 47 [P2] f-string SQL in `prediction_backtest.py:116` (same file as 45 — could pair). Line 42 (`intel_search` pagination) remains a design call — do NOT sum-and-ship (see 2026-05-21 entry).
+- **Latent bug found, left unfixed (out of scope):** `system.py::freshness()` (line ~422-426) builds `resp_dict = resp.dict(); resp_dict["stale_sources"] = stale_sources` and the comment claims "FastAPI will include it." It does NOT — the route declares `response_model=FreshnessResponse`, so FastAPI filters the response through that model and **strips `stale_sources` entirely**. The frontend staleness-indicator data never reaches the client. Real fix = add `stale_sources` to the `FreshnessResponse` model (or drop `response_model`). Good small follow-up PR.
+- **Env note (confirms 2026-05-21):** the test suite CAN run in this container after `pip install fastapi sqlalchemy pandas pydantic loguru psycopg2-binary 'python-jose[cryptography]' pytest ruff`. Two gotchas: (1) the installed **passlib bcrypt backend panics** on its self-test (`password cannot be longer than 72 bytes`) the moment you call `_pwd_ctx.hash()` — so in new API tests DON'T hash a password at import like `test_api.py` does; set a **static** `GRID_MASTER_PASSWORD_HASH` literal and mint auth via `create_token` (only needs `GRID_JWT_SECRET`). (2) system `cryptography` 41 is debian-managed and can't be force-reinstalled, but `python-jose[cryptography]` still imported fine for me this run.
+
+---
 ## 2026-05-25 23:12 UTC — 2026-05-25-2308
 **Why this matters next run:** TIER 1 has been silently mis-scoped by prior runs — there ARE reviewable codex PRs; they just aren't authored by `app/openai-codex`.
 
