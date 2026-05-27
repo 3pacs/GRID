@@ -832,3 +832,23 @@
 2026-05-27 11:55:14 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction eb501e4ae205faa2 (AON CALL): wrong_signal
 2026-05-27 11:55:44 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 633a9cc404680b63 (AMT CALL): wrong_signal
 2026-05-27 11:56:14 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 191849efcfb895a3 (ALNY CALL): wrong_signal
+2026-05-27 11:56:39 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 384589cdfeef3074 (ORCL PUT): right_signal_wrong_timing
+2026-05-27 11:57:07 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 3a81bceda343f1f4 (ORCL PUT): right_signal_wrong_timing
+2026-05-27 11:57:34 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 3274352299f8bd2e (AJG CALL): wrong_signal
+2026-05-27 11:58:07 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 56bb889f55d22e0f (ORCL PUT): right_signal_wrong_timing
+2026-05-27 11:58:36 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4ebbd9edf7cd4808 (ORCL PUT): right_signal_wrong_timing
+2026-05-27 11:59:07 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 2d63c558dfc663c0 (AAL CALL): wrong_signal
+2026-05-27 11:59:36 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction f8e7478a027eb79d (AA CALL): wrong_signal
+2026-05-27 12:00:02 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4fc2ff7ab75c0f82 (OKE PUT): wrong_signal
+2026-05-27 12:00:30 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction cf8c0ab3cdca196b (OKE PUT): wrong_signal
+2026-05-27 12:00:56 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction ba95414318bc34ef (WMT PUT): wrong_signal
+2026-05-27 12:00:58 | WARNING  | ollama.client:generate:264 — Ollama generate failed (2109ms): 500 Server Error: Internal Server Error for url: http://koala:11434/api/generate
+2026-05-27 12:00:58 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 61b9bbf7571cab8b (WELL PUT): right_signal_wrong_timing
+2026-05-27 12:01:10 | WARNING  | ollama.client:generate:264 — Ollama generate failed (12405ms): 500 Server Error: Internal Server Error for url: http://koala:11434/api/generate
+2026-05-27 12:01:10 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4f21bd6428b5431c (NXPI PUT): external_shock
+2026-05-27 12:01:47 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 710210271b70e75e (NVO PUT): right_signal_wrong_timing
+2026-05-27 12:02:11 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 06990dd814302224 (CRDO PUT): wrong_signal
+2026-05-27 12:02:44 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction ab26e41b8f11ad1f (RKLB PUT): right_signal_wrong_timing
+2026-05-27 12:03:08 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 911a73ced6498966 (MS PUT): wrong_signal
+2026-05-27 12:03:32 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 9ab1c5759162ee5e (LIN PUT): wrong_signal
+2026-05-27 12:04:04 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4856e73a7db592cf (MU PUT): external_shock
