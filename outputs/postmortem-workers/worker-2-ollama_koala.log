@@ -1178,3 +1178,18 @@
 2026-05-27 14:45:53 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 14b3d29360481d63 (CMI PUT): external_shock
 2026-05-27 14:46:21 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 2c699ad06c1be623 (CMI PUT): external_shock
 2026-05-27 14:46:51 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 8acef6b7f3f4bcd6 (CMI PUT): external_shock
+2026-05-27 14:47:27 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 88f042bf137c7ff4 (CNQ PUT): wrong_signal
+2026-05-27 14:47:52 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 8f5c68b44ea96777 (TRGP PUT): wrong_signal
+2026-05-27 14:47:54 | WARNING  | ollama.client:generate:264 — Ollama generate failed (2142ms): 500 Server Error: Internal Server Error for url: http://koala:11434/api/generate
+2026-05-27 14:47:54 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d265dc9267ae74ee (TRGP PUT): wrong_signal
+2026-05-27 14:48:31 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b28213e3f64b6c0a (KMI PUT): right_signal_wrong_timing
+2026-05-27 14:48:54 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction e9dda0dbccb28f51 (LIN PUT): wrong_signal
+2026-05-27 14:49:21 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 127141f0fceac275 (LIN PUT): wrong_signal
+2026-05-27 14:49:47 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 79a676ab747cfe86 (LIN PUT): wrong_signal
+2026-05-27 14:50:15 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 077cfa85bc7afc10 (LIN PUT): wrong_signal
+2026-05-27 14:50:37 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction ae1449bd36d97c71 (LIN PUT): wrong_signal
+2026-05-27 14:51:08 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d8359aecf9e6d86a (LIN PUT): wrong_signal
+2026-05-27 14:51:29 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction ffda8414fdf9e58e (LIN PUT): wrong_signal
+2026-05-27 14:51:55 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b14d0192c6baf7a2 (APA PUT): external_shock
+2026-05-27 14:52:31 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 25f04a2d6d867e25 (AMAT PUT): right_signal_wrong_timing
+2026-05-27 14:53:02 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction cc5c1e3d145c7c4c (AMAT PUT): right_signal_wrong_timing
