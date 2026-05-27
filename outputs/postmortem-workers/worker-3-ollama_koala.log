@@ -154,3 +154,6 @@ Notes:
 2026-05-27 05:08:44 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction a26d9cb4c571cb6f (ORCL PUT): right_signal_wrong_timing
 2026-05-27 05:09:07 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 9178aa44ce30c25f (HPE PUT): external_shock
 2026-05-27 05:09:37 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction f29263825bdf4f56 (APLD PUT): wrong_signal
+2026-05-27 05:10:05 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 33d35e9d218c2556 (ASML PUT): right_signal_wrong_timing
+2026-05-27 05:10:33 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 2850eea4481134e1 (LYB PUT): external_shock
+2026-05-27 05:11:06 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 78f86d8f87a5b9e0 (MRVL PUT): external_shock

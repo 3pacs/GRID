@@ -504,3 +504,60 @@ Notes:
 2026-05-27 05:09:47 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 2de753b29f696c56 (QCOM PUT): external_shock
 2026-05-27 05:09:47 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
 2026-05-27 05:09:47 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:09:52 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 7d85d457b1623195 (PDD CALL): wrong_signal
+2026-05-27 05:09:52 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:09:52 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:09:56 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction dcd8b7075576614b (PLTR CALL): wrong_signal
+2026-05-27 05:09:56 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:09:56 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:10:01 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction cdb1e1350b70404b (GOOG PUT): wrong_signal
+2026-05-27 05:10:01 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:10:01 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:10:06 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction a29fe8d77fc0f971 (SHW CALL): wrong_signal
+2026-05-27 05:10:06 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:10:06 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:10:11 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 757126e1bf5e8658 (HPQ PUT): external_shock
+2026-05-27 05:10:11 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:10:11 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:10:15 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction ba4fd4f80a79dba0 (DDOG PUT): external_shock
+2026-05-27 05:10:15 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:10:15 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:10:19 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 1f0814b5f726e26a (SOXS CALL): wrong_signal
+2026-05-27 05:10:19 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:10:19 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:10:24 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 47187ea645bd2cd1 (SOXS CALL): wrong_signal
+2026-05-27 05:10:24 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:10:24 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:10:29 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b2f84c8e093c6123 (SRE CALL): wrong_signal
+2026-05-27 05:10:29 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:10:29 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:10:33 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction fa15d069e575aa5d (TEL CALL): wrong_signal
+2026-05-27 05:10:33 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:10:33 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:10:37 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction be4fd66ff0e7d0a7 (TJX CALL): wrong_signal
+2026-05-27 05:10:37 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:10:37 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:10:41 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction a0d94141eb7ad318 (PSX PUT): external_shock
+2026-05-27 05:10:41 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:10:41 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:10:44 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 47263eabe40ecb2d (PSX PUT): external_shock
+2026-05-27 05:10:44 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:10:44 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:10:49 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction e5e614c23126ade3 (QCOM PUT): external_shock
+2026-05-27 05:10:49 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:10:49 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:10:54 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 2863a9b63303347e (SBUX PUT): right_signal_wrong_timing
+2026-05-27 05:10:54 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:10:54 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:10:59 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 0a84fadf98636662 (SBUX PUT): right_signal_wrong_timing
+2026-05-27 05:10:59 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:10:59 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:11:02 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction cabfe638cc6274f1 (SMCI PUT): right_signal_wrong_timing
+2026-05-27 05:11:02 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:11:02 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:11:06 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 9edd4accc23d71af (SNDK PUT): wrong_signal
+2026-05-27 05:11:06 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:11:06 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:11:11 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction ad3077ea04456a94 (TERN PUT): wrong_signal
+2026-05-27 05:11:11 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:11:11 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4

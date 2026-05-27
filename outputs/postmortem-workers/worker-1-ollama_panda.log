@@ -95,3 +95,19 @@ Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
 2026-05-27 05:08:06 | INFO     | __main__:_worker_main:147 — postmortem_worker 1/5 starting on provider=ollama_panda, days=30, max=None
 2026-05-27 05:08:13 | INFO     | __main__:_worker_main:172 — worker 1: 0 trade candidates, 203576 pred candidates
 2026-05-27 05:08:13 | INFO     | ollama.client:__init__:61 — Ollama client connected — http://panda:11434
+2026-05-27 05:11:24 | INFO     | config:<module>:593 — GitSink attached — errors land in .server-logs/errors.jsonl (push_enabled=False)
+2026-05-27 05:11:24 | INFO     | config:<module>:603 — GRID config loaded — environment=development, db=localhost:5432/griddb
+2026-05-27 05:11:24 | INFO     | db:get_engine:69 — Creating SQLAlchemy engine — postgresql://grid:***@localhost:5432/griddb
+2026-05-27 05:11:24 | INFO     | db:get_engine:117 — SQLAlchemy engine created — pool_size=20, max_overflow=30
+2026-05-27 05:11:24 | INFO     | __main__:_worker_main:145 — postmortem_worker 1/3 starting on provider=ollama_panda, days=30, max=None
+2026-05-27 05:11:27 | INFO     | __main__:_worker_main:170 — worker 1: 0 trade candidates, 336926 pred candidates
+2026-05-27 05:11:27 | INFO     | ollama.client:__init__:61 — Ollama client connected — http://panda:11434
+2026-05-27 05:15:28 | WARNING  | ollama.client:generate:264 — Ollama generate failed (240103ms): HTTPConnectionPool(host='panda', port=11434): Read timed out. (read timeout=240)
+2026-05-27 05:15:28 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4793d8a180e514f4 (LRCX PUT): right_signal_wrong_timing
+2026-05-27 05:15:45 | INFO     | config:<module>:593 — GitSink attached — errors land in .server-logs/errors.jsonl (push_enabled=False)
+2026-05-27 05:15:45 | INFO     | config:<module>:603 — GRID config loaded — environment=development, db=localhost:5432/griddb
+2026-05-27 05:15:45 | INFO     | db:get_engine:69 — Creating SQLAlchemy engine — postgresql://grid:***@localhost:5432/griddb
+2026-05-27 05:15:45 | INFO     | db:get_engine:117 — SQLAlchemy engine created — pool_size=20, max_overflow=30
+2026-05-27 05:15:45 | INFO     | __main__:_worker_main:145 — postmortem_worker 1/3 starting on provider=ollama_panda, days=30, max=None
+2026-05-27 05:15:51 | INFO     | __main__:_worker_main:170 — worker 1: 0 trade candidates, 338376 pred candidates
+2026-05-27 05:15:51 | INFO     | ollama.client:__init__:61 — Ollama client connected — http://panda:11434
