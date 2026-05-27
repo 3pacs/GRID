@@ -70,11 +70,17 @@ def test_resolves_garbage_ticker_via_sponsor_in_notes():
     assert out == "MRNA"
 
 
-def test_resolves_using_garbage_value_as_last_resort_name():
-    # No notes; fall back to resolving the (truncated) ticker text itself.
+def test_does_not_resolve_using_garbage_value_as_last_resort_name():
+    # No sponsor metadata; truncated ticker text is unsafe SEC substring input.
     r = _resolver({"genentech": "DNA"})
     out = resolve_catalyst_ticker("genentech", None, None, r)
-    assert out == "DNA"
+    assert out is None
+
+
+def test_does_not_resolve_institution_fragment_without_sponsor_metadata():
+    r = _resolver({"university": "UNIB"})
+    out = resolve_catalyst_ticker("University", None, None, r)
+    assert out is None
 
 
 def test_explicit_sponsor_name_takes_priority():
@@ -113,9 +119,9 @@ def test_parses_leadsponsor_equals_notes_format():
 
 def test_run_dry_run_makes_no_writes():
     fake_rows = [
-        (1, "Moderna, I", "Sponsor: Moderna, Inc."),  # needs fix, resolvable
-        (2, "AAPL", None),                              # already valid
-        (3, "Unknown Bi", None),                        # unresolvable
+        (1, "Moderna, I", "Study title", "Moderna, Inc."),  # resolvable
+        (2, "AAPL", None, None),                             # already valid
+        (3, "Unknown Bi", None, None),                       # unresolvable
     ]
     engine = MagicMock()
     conn = MagicMock()
@@ -143,9 +149,9 @@ def test_run_dry_run_makes_no_writes():
 
 def test_run_apply_writes_resolved_and_deactivates_unresolved():
     fake_rows = [
-        (1, "Moderna, I", "Sponsor: Moderna, Inc."),  # resolvable -> update
-        (2, "AAPL", None),                              # valid -> skip
-        (3, "Unknown Bi", None),                        # unresolvable -> deactivate
+        (1, "Moderna, I", "Study title", "Moderna, Inc."),  # update
+        (2, "AAPL", None, None),                            # valid -> skip
+        (3, "Unknown Bi", None, None),                      # deactivate
     ]
     engine = MagicMock()
     conn = MagicMock()

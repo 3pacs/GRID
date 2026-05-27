@@ -9,12 +9,12 @@ SPONSOR NAME (e.g. ``"Moderna, I"``) in the ticker column. The
 trial_signals.ticker`` on that garbage and returns nothing.
 
 This script finds rows whose ``ticker`` is not a plausible exchange symbol,
-re-resolves the sponsor (preferring ``notes``, which the ingestor seeds with
-the sponsor name, then the ticker column itself) through the canonical
-``grid.signals.trial_signal._resolve_ticker_sec`` resolver, and updates the
-row ONLY when a confident ticker is found. Unresolvable rows are left
-untouched (we never overwrite with another guess), and rows are optionally
-deactivated via ``--deactivate-unresolved`` so the view stops joining on junk.
+re-resolves the sponsor from the original ClinicalTrials.gov payload
+(``trial_cache``) or ``trial_signals.sponsor_name`` through the canonical
+``grid.signals.trial_signal._resolve_ticker_sec`` resolver, and updates the row
+ONLY when a confident ticker is found. Unresolvable rows are left untouched (we
+never overwrite with another guess), and rows are optionally deactivated via
+``--deactivate-unresolved`` so the view stops joining on junk.
 
 Usage:
     python3 scripts/backfill_catalyst_tickers.py --dry-run        # default: no writes
@@ -78,9 +78,11 @@ def resolve_catalyst_ticker(
         * If ``current_ticker`` already looks like a real ticker, keep it
           (return None — no update needed).
         * Otherwise try to resolve a sponsor name. The sponsor name is taken
-          from ``sponsor_name`` if given, else parsed from ``notes`` (the
-          ingestor writes ``"Sponsor: <name>"``-style notes), else the
-          (garbage) ``current_ticker`` value itself as a last resort.
+          from ``sponsor_name`` if given, else parsed from ``notes`` only when
+          the notes explicitly contain a sponsor marker.
+        * Never resolve the current garbage ticker fragment as a company name;
+          fragments like ``"University"`` or ``"National C"`` produce unsafe
+          SEC substring matches.
         * Return the resolved ticker only if it differs from the current
           value and looks like a ticker; otherwise None (leave row alone).
 
@@ -97,8 +99,6 @@ def resolve_catalyst_ticker(
         m = re.search(r"(?:sponsor|leadsponsor)\s*[:=]\s*(.+)", notes, re.I)
         if m:
             candidate_name = m.group(1).strip().rstrip(".")
-    if not candidate_name:
-        candidate_name = (current_ticker or "").strip()
     if not candidate_name:
         return None
 
@@ -145,7 +145,28 @@ def run(
         "dry_run": not apply,
     }
 
-    sql = "SELECT id, ticker, notes FROM catalyst_calendar"
+    sql = """
+        SELECT
+            cc.id,
+            cc.ticker,
+            cc.notes,
+            COALESCE(
+                ts.sponsor_name,
+                tc.raw_json #>> '{protocolSection,sponsorCollaboratorsModule,leadSponsor,name}',
+                tc.raw_json #>> '{protocolSection,identificationModule,organization,fullName}'
+            ) AS sponsor_name
+        FROM catalyst_calendar cc
+        LEFT JOIN LATERAL (
+            SELECT sponsor_name
+            FROM trial_signals
+            WHERE nct_id = cc.nct_id
+              AND sponsor_name IS NOT NULL
+              AND sponsor_name <> ''
+            ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+            LIMIT 1
+        ) ts ON TRUE
+        LEFT JOIN trial_cache tc ON tc.nct_id = cc.nct_id
+    """
     if limit:
         sql += f" LIMIT {int(limit)}"
 
@@ -155,12 +176,14 @@ def run(
     pending_updates: list[tuple[int, str]] = []
     pending_deactivate: list[int] = []
 
-    for row_id, ticker, notes in rows:
+    for row_id, ticker, notes, sponsor_name in rows:
         summary["scanned"] += 1
         if looks_like_ticker(ticker):
             continue
         summary["needs_fix"] += 1
-        new_ticker = resolve_catalyst_ticker(ticker, None, notes, _resolve_ticker_sec)
+        new_ticker = resolve_catalyst_ticker(
+            ticker, sponsor_name, notes, _resolve_ticker_sec
+        )
         if new_ticker:
             summary["resolved"] += 1
             pending_updates.append((row_id, new_ticker))
