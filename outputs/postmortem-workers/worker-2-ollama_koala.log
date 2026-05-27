@@ -2353,3 +2353,14 @@ Failed to export span batch code: None, reason: HTTPConnectionPool(host='grid-sv
 2026-05-27 23:19:18 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction dbdf71e4d8266537 (BX CALL): wrong_signal
 2026-05-27 23:19:56 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction c3d61237ead29065 (BX CALL): wrong_signal
 2026-05-27 23:20:28 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 37ab3dd7892581c5 (BP CALL): wrong_signal
+2026-05-27 23:21:00 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 43bbf34e88ed39bb (BP CALL): wrong_signal
+2026-05-27 23:21:34 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction f6dcf4f5de008a15 (EQIX CALL): wrong_signal
+2026-05-27 23:22:10 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 7c4b35f3bb828395 (ED CALL): wrong_signal
+2026-05-27 23:22:45 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d4f0d8521fb4d95c (FITB CALL): wrong_signal
+2026-05-27 23:23:23 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction a0f2d64e478f21c5 (ED CALL): wrong_signal
+2026-05-27 23:23:53 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 8e3380e64603e323 (ED CALL): wrong_signal
+2026-05-27 23:24:29 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction c8e72f5b80b261f8 (ED CALL): wrong_signal
+2026-05-27 23:25:03 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction beb209bcea5bc11d (FITB CALL): wrong_signal
+2026-05-27 23:25:38 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 0124b17f6db37836 (FITB CALL): wrong_signal
+2026-05-27 23:26:13 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction c3fc07072b9d5904 (ED CALL): wrong_signal
+2026-05-27 23:26:47 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 086f5fecf7eac9d4 (ED CALL): wrong_signal
