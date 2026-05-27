@@ -132,6 +132,7 @@ class PriceFallbackPuller:
         from sqlalchemy import text
         saved = 0
         with self.engine.begin() as conn:
+            source_id = self._resolve_source_id(conn)
             for r in results:
                 tk = r["ticker"].lower().replace("-", "_")
                 feature_name = f"{tk}_full"
@@ -145,11 +146,51 @@ class PriceFallbackPuller:
                 conn.execute(
                     text(
                         "INSERT INTO resolved_series (feature_id, obs_date, release_date, value, source_priority_used) "
-                        "VALUES (:fid, :d, :d, :v, 'price_fallback') "
+                        "VALUES (:fid, :d, :d, :v, :src) "
                         "ON CONFLICT (feature_id, obs_date, vintage_date) DO UPDATE SET value = :v"
                     ),
-                    {"fid": feat[0], "d": r["date"], "v": r["price"]},
+                    {"fid": feat[0], "d": r["date"], "v": r["price"], "src": source_id},
                 )
                 saved += 1
         log.info("Saved {n} fallback prices to resolved_series", n=saved)
         return saved
+
+    def _resolve_source_id(self, conn: Any) -> int:
+        """Return a source_catalog id for fallback prices, creating it if needed."""
+        from sqlalchemy import text
+
+        row = conn.execute(
+            text("SELECT id FROM source_catalog WHERE name = :name"),
+            {"name": "PriceFallback"},
+        ).fetchone()
+        if row:
+            return int(row[0])
+
+        try:
+            created = conn.execute(
+                text(
+                    "INSERT INTO source_catalog "
+                    "(name, base_url, cost_tier, latency_class, pit_available, "
+                    "revision_behavior, trust_score, priority_rank) "
+                    "VALUES (:name, :base_url, 'FREE', 'REALTIME', FALSE, "
+                    "'NEVER', 'MED', 90) "
+                    "RETURNING id"
+                ),
+                {
+                    "name": "PriceFallback",
+                    "base_url": "stooq/alphavantage/twelvedata",
+                },
+            ).fetchone()
+            if created:
+                return int(created[0])
+        except Exception as exc:
+            log.debug("PriceFallback source_catalog create failed: {e}", e=str(exc))
+            row = conn.execute(
+                text("SELECT id FROM source_catalog WHERE name = :name"),
+                {"name": "PriceFallback"},
+            ).fetchone()
+            if row:
+                return int(row[0])
+            raise
+
+        raise RuntimeError("PriceFallback source_catalog id could not be resolved")
