@@ -22,6 +22,33 @@ from sqlalchemy import text
 from api.dependencies import get_db_engine
 
 
+# These enrichment passes scan signal_data (152K+ rows) with DISTINCT
+# sorts and self-JOINs on ABS(date - date) (insider/congress clusters,
+# congress-insider overlap). On the live corpus those single statements
+# blow past the default 120s per-statement timeout (db.get_engine) and
+# get killed by postgres mid-job. This is exactly the case the db.py
+# docstring calls out: "Override per-call with `SET LOCAL
+# statement_timeout = 0` for jobs that legitimately need longer."
+#
+# `0` = no limit. This is a one-shot batch job (run from cron / the
+# Hermes operator), not a request path, so it is safe to let these
+# statements run to completion. SET LOCAL only affects the current
+# transaction, so the global default is untouched for everyone else.
+_ENRICH_STATEMENT_TIMEOUT_MS: int = 0  # 0 = unlimited (heavy batch job)
+
+
+def _lift_statement_timeout(conn) -> None:
+    """Disable the per-statement timeout for the current transaction.
+
+    Must be called as the FIRST statement inside an ``engine.begin()``
+    block so the ``SET LOCAL`` applies to the heavy scan that follows
+    and is rolled back automatically when the transaction ends.
+    """
+    conn.execute(
+        text(f"SET LOCAL statement_timeout = {_ENRICH_STATEMENT_TIMEOUT_MS}")
+    )
+
+
 def _ensure_actor(conn, actor_id: str, name: str, category: str, tier: str = "individual"):
     """Upsert an actor into the actors table."""
     conn.execute(text("""
@@ -61,6 +88,7 @@ def enrich_insider_connections(engine) -> dict:
     stats = {"actors_created": 0, "connections": 0, "flows": 0}
 
     with engine.begin() as conn:
+        _lift_statement_timeout(conn)
         # Get all insider signals with actor + ticker
         rows = conn.execute(text("""
             SELECT DISTINCT actor, ticker, direction, magnitude, signal_date, confidence
@@ -130,6 +158,7 @@ def enrich_congressional_connections(engine) -> dict:
     stats = {"actors_created": 0, "connections": 0, "flows": 0}
 
     with engine.begin() as conn:
+        _lift_statement_timeout(conn)
         rows = conn.execute(text("""
             SELECT DISTINCT actor, ticker, direction, magnitude, signal_date, confidence
             FROM signal_data
@@ -199,6 +228,7 @@ def enrich_gov_contracts(engine) -> dict:
     stats = {"connections": 0, "flows": 0}
 
     with engine.begin() as conn:
+        _lift_statement_timeout(conn)
         # Broader query — pull data JSON to parse agency from multiple fields
         rows = conn.execute(text("""
             SELECT ticker,
@@ -277,6 +307,7 @@ def enrich_lobbying(engine) -> dict:
     stats = {"connections": 0}
 
     with engine.begin() as conn:
+        _lift_statement_timeout(conn)
         rows = conn.execute(text("""
             SELECT DISTINCT ticker, data->>'Client' as client, data->>'Amount' as amount
             FROM signal_data
@@ -317,6 +348,7 @@ def enrich_insider_clusters(engine) -> dict:
     stats = {"clusters": 0, "cluster_connections": 0}
 
     with engine.begin() as conn:
+        _lift_statement_timeout(conn)
         # Find pairs of different insiders trading the same ticker within 7 days
         rows = conn.execute(text("""
             WITH insider_trades AS (
@@ -370,6 +402,7 @@ def enrich_fara_foreign_lobbying(engine) -> dict:
     stats = {"connections": 0, "flows": 0}
 
     with engine.begin() as conn:
+        _lift_statement_timeout(conn)
         rows = conn.execute(text("""
             SELECT actor, ticker,
                    COALESCE(data->>'Foreign Principal', data->>'foreign_principal') as principal,
@@ -426,6 +459,7 @@ def enrich_darkpool_signals(engine) -> dict:
     stats = {"connections": 0}
 
     with engine.begin() as conn:
+        _lift_statement_timeout(conn)
         rows = conn.execute(text("""
             SELECT ticker, magnitude, signal_date, direction
             FROM signal_data
@@ -468,6 +502,7 @@ def enrich_institutional_flows(engine) -> dict:
     stats = {"connections": 0, "flows": 0}
 
     with engine.begin() as conn:
+        _lift_statement_timeout(conn)
         rows = conn.execute(text("""
             SELECT actor, ticker, direction, magnitude, signal_date, confidence
             FROM signal_data
@@ -534,6 +569,7 @@ def enrich_congress_insider_overlap(engine) -> dict:
     stats = {"connections": 0}
 
     with engine.begin() as conn:
+        _lift_statement_timeout(conn)
         rows = conn.execute(text("""
             WITH congress_trades AS (
                 SELECT DISTINCT actor, ticker, signal_date
