@@ -34,6 +34,7 @@ from llm.autoresearch.hosts import (
 )
 from llm.autoresearch.loop import (
     AutoResearchLoop,
+    OllamaPullApplier,
     RunningEndpointApplier,
     TrialConfig,
     compute_fitness,
@@ -383,6 +384,28 @@ def test_running_endpoint_applier_is_noop():
     applier = RunningEndpointApplier()
     cfg = TrialConfig("e1", "http://host:8081", "qwen3.6")
     assert applier.apply(cfg) == ("http://host:8081", "qwen3.6")
+
+
+def test_ollama_pull_applier_pulls_and_returns_url():
+    pulled = []
+    applier = OllamaPullApplier(
+        host_urls={"koala": "http://koala:11434"},
+        pull_fn=lambda host, model: pulled.append((host, model)),
+    )
+    base_url, model = applier.apply(TrialConfig("e", "", "qwen3.6:27b", host="koala"))
+    assert base_url == "http://koala:11434"
+    assert model == "qwen3.6:27b"
+    assert pulled == [("koala", "qwen3.6:27b")]
+
+
+def test_ollama_pull_applier_refuses_protected_host():
+    applier = OllamaPullApplier(
+        host_urls={"ocr-node": "http://ocr-node:11434"},
+        protected=frozenset({"ocr-node"}),
+        pull_fn=lambda host, model: (_ for _ in ()).throw(AssertionError("must not pull")),
+    )
+    with pytest.raises(RuntimeError, match="protected"):
+        applier.apply(TrialConfig("e", "", "qwen3.6:27b", host="ocr-node"))
 
 
 # --------------------------------------------------------------------------

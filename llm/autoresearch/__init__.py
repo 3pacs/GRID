@@ -33,6 +33,7 @@ from llm.autoresearch.hosts import (
 from llm.autoresearch.loop import (
     AutoResearchLoop,
     ConfigApplier,
+    OllamaPullApplier,
     RunningEndpointApplier,
     TrialConfig,
     TrialResult,
@@ -52,6 +53,7 @@ __all__ = [
     "HOST_PROFILES",
     "HostProfile",
     "ModelSpec",
+    "OllamaPullApplier",
     "QualityResult",
     "RunningEndpointApplier",
     "ThroughputResult",

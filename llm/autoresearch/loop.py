@@ -109,6 +109,52 @@ class RunningEndpointApplier:
         return config.base_url, config.model
 
 
+@dataclass
+class OllamaPullApplier:
+    """Applier for a *model-selection* search on Ollama hosts.
+
+    For each candidate, ensures the model is present (``ollama pull`` over SSH,
+    idempotent) and returns the host's endpoint to measure it. This does NOT
+    restart any service or change what the coordinator routes to — it only
+    finds the best model per host; deploying the winner is a separate,
+    deliberate step. Low blast radius: the only side effects are a model
+    download and loading it into VRAM (the harness warms gently).
+
+    Hosts in ``protected`` raise on apply so the loop never pulls/loads on a
+    node whose models are load-bearing (e.g. ocr-node's OCMRI pipeline).
+    """
+
+    host_urls: dict[str, str] = field(default_factory=dict)
+    protected: frozenset[str] = field(default_factory=frozenset)
+    pull: bool = True
+    pull_timeout: float = 1800.0  # model downloads can be large
+    # Injectable so tests don't shell out; real default SSHes `ollama pull`.
+    pull_fn: Callable[[str, str], None] | None = None
+
+    def _do_pull(self, host: str, model: str) -> None:
+        if self.pull_fn is not None:
+            self.pull_fn(host, model)
+            return
+        import subprocess
+        subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", host, "ollama", "pull", model],
+            check=True, timeout=self.pull_timeout,
+            capture_output=True, text=True,
+        )
+
+    def apply(self, config: TrialConfig) -> tuple[str, str]:
+        if config.host in self.protected:
+            raise RuntimeError(
+                f"host '{config.host}' is protected (load-bearing models) — refusing to pull/measure"
+            )
+        base_url = self.host_urls.get(config.host) or config.base_url
+        if not base_url:
+            raise RuntimeError(f"no base_url for host '{config.host}'")
+        if self.pull:
+            self._do_pull(config.host, config.model)
+        return base_url, config.model
+
+
 def _dominates(a: TrialResult, b: TrialResult) -> bool:
     """True if ``a`` Pareto-dominates ``b`` on (quality, tok/sec)."""
     return (
