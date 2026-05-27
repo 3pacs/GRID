@@ -2040,3 +2040,15 @@
 2026-05-27 20:41:32 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b079cd4e38121d4c (FAST CALL): wrong_signal
 2026-05-27 20:42:01 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 7b0534c8119d1fd8 (FCX CALL): wrong_signal
 2026-05-27 20:42:37 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 31649e26f574963e (FCX CALL): wrong_signal
+2026-05-27 20:43:15 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d268aa11a3b3b11f (FCX CALL): wrong_signal
+2026-05-27 20:43:43 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction dc18193fc40b7d40 (FCX CALL): wrong_signal
+2026-05-27 20:44:12 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 7e4aaa85b8bdfb6b (FDS CALL): wrong_signal
+2026-05-27 20:44:51 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 1e72fcf54fd0322f (FDS CALL): wrong_signal
+2026-05-27 20:45:34 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 43448f3b67a7766f (FDS CALL): wrong_signal
+2026-05-27 20:46:00 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction ecc19de53151fa97 (FDS CALL): wrong_signal
+2026-05-27 20:46:31 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 8f7b8c896ce60b70 (PM PUT): external_shock
+2026-05-27 20:47:11 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 27c8ee8e1c245dae (FDS CALL): wrong_signal
+2026-05-27 20:47:42 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 89eaec655b1defea (FDS CALL): wrong_signal
+2026-05-27 20:48:07 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 210006f6bd8c319a (FDS CALL): wrong_signal
+2026-05-27 20:48:43 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 3f39dd54fb324a5a (FDX CALL): wrong_signal
+2026-05-27 20:49:13 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction c4b52956373b80d4 (FDX CALL): wrong_signal
