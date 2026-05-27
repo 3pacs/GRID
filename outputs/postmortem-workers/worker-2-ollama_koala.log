@@ -57,3 +57,51 @@
 2026-05-27 05:29:17 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 79eb9ae526c9e1c2 (CMI PUT): external_shock
 2026-05-27 05:29:50 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d21a091c1b0fc251 (COHR PUT): wrong_signal
 2026-05-27 05:30:21 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 26d20cf1f2830164 (EBAY PUT): right_signal_wrong_timing
+2026-05-27 05:30:51 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 084bfae4dcf764ca (EXPE CALL): wrong_signal
+2026-05-27 05:31:22 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction af6611512d3c0d85 (FCX CALL): wrong_signal
+2026-05-27 05:31:33 | INFO     | config:<module>:593 — GitSink attached — errors land in .server-logs/errors.jsonl (push_enabled=False)
+2026-05-27 05:31:33 | INFO     | config:<module>:603 — GRID config loaded — environment=development, db=localhost:5432/griddb
+2026-05-27 05:31:33 | INFO     | db:get_engine:69 — Creating SQLAlchemy engine — postgresql://grid:***@localhost:5432/griddb
+2026-05-27 05:31:33 | INFO     | db:get_engine:117 — SQLAlchemy engine created — pool_size=20, max_overflow=30
+2026-05-27 05:31:33 | INFO     | __main__:_worker_main:145 — postmortem_worker 2/3 starting on provider=ollama_koala, days=30, max=None
+2026-05-27 05:31:39 | INFO     | __main__:_worker_main:170 — worker 2: 0 trade candidates, 338274 pred candidates
+2026-05-27 05:31:39 | INFO     | ollama.client:__init__:61 — Ollama client connected — http://koala:11434
+2026-05-27 05:32:17 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4f0046a9276c6a72 (KKR CALL): wrong_signal
+2026-05-27 05:33:20 | INFO     | config:<module>:593 — GitSink attached — errors land in .server-logs/errors.jsonl (push_enabled=False)
+2026-05-27 05:33:20 | INFO     | config:<module>:603 — GRID config loaded — environment=development, db=localhost:5432/griddb
+2026-05-27 05:33:20 | INFO     | db:get_engine:69 — Creating SQLAlchemy engine — postgresql://grid:***@localhost:5432/griddb
+2026-05-27 05:33:20 | INFO     | db:get_engine:117 — SQLAlchemy engine created — pool_size=20, max_overflow=30
+2026-05-27 05:33:20 | INFO     | __main__:_worker_main:145 — postmortem_worker 2/3 starting on provider=ollama_koala, days=30, max=None
+2026-05-27 05:33:21 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction ac675d1d66482b92 (STRC CALL): wrong_signal
+2026-05-27 05:33:26 | INFO     | __main__:_worker_main:170 — worker 2: 0 trade candidates, 338273 pred candidates
+2026-05-27 05:33:26 | INFO     | ollama.client:__init__:61 — Ollama client connected — http://koala:11434
+2026-05-27 05:34:00 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 59479f841efa858d (LOW CALL): wrong_signal
+2026-05-27 05:34:32 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction cf80db4c770164fe (CVS PUT): external_shock
+2026-05-27 05:35:08 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 13aad2bbc4d2b95c (DDOG PUT): external_shock
+2026-05-27 05:35:32 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d2821b141f446411 (LIN PUT): wrong_signal
+2026-05-27 05:36:07 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 883a4287200561fa (WELL PUT): right_signal_wrong_timing
+2026-05-27 05:36:33 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 5708eca2f8c329db (DOW PUT): external_shock
+2026-05-27 05:37:08 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 96917c9b0b83d4ee (CL PUT): right_signal_wrong_timing
+2026-05-27 05:37:34 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 926c310279e75ee4 (ELV PUT): wrong_signal
+2026-05-27 05:38:11 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 7e9cb88cf284d370 (SATS PUT): right_signal_wrong_timing
+2026-05-27 05:38:41 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 2341a9b833029068 (CRWD PUT): external_shock
+2026-05-27 05:39:06 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction a3d220a50fe9259c (CRWD PUT): external_shock
+2026-05-27 05:39:38 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 81289a5a65102c85 (CVX PUT): right_signal_wrong_timing
+2026-05-27 05:40:08 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 779801617f70cb76 (GDX CALL): wrong_signal
+2026-05-27 05:40:38 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 507fd9c3386be5a3 (TERN PUT): wrong_signal
+2026-05-27 05:41:09 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 0867841866c20fc8 (TERN PUT): wrong_signal
+2026-05-27 05:41:43 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 224d13cd001fe254 (SU PUT): external_shock
+2026-05-27 05:42:06 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 48e59d1b52bee0f9 (SNPS PUT): wrong_signal
+2026-05-27 05:42:33 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 1d3d4b824694ae62 (SBUX PUT): right_signal_wrong_timing
+2026-05-27 05:43:06 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 551578d0a20782b4 (QCOM PUT): external_shock
+2026-05-27 05:43:36 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 631f5ebf1482e517 (PWR PUT): external_shock
+2026-05-27 05:43:58 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction eacaf24bfc4e1a42 (ELV PUT): wrong_signal
+2026-05-27 05:44:27 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 0fb18cdccac48f00 (PM PUT): external_shock
+2026-05-27 05:45:00 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 181503e8a104592d (OXY PUT): right_signal_wrong_timing
+2026-05-27 05:45:33 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 964f68102b17d52e (ELV PUT): wrong_signal
+2026-05-27 05:46:07 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction f8700851afd6b1df (ORCL PUT): right_signal_wrong_timing
+2026-05-27 05:46:39 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction aecd2bcb52671f43 (ON PUT): external_shock
+2026-05-27 05:47:13 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 57bec3d58bc15822 (ON PUT): external_shock
+2026-05-27 05:47:41 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 8d74f3d2b5be6d0b (OKE PUT): wrong_signal
+2026-05-27 05:48:20 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction f33b2692d4ba4ccf (MU PUT): external_shock
+2026-05-27 05:48:44 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 9c50aef8e6705adb (ELV PUT): wrong_signal
