@@ -1452,3 +1452,15 @@
 2026-05-27 17:04:43 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction c0c4cca674b28a2c (SOXS CALL): wrong_signal
 2026-05-27 17:05:12 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 083b52782f2cc7f1 (SOXS CALL): wrong_signal
 2026-05-27 17:05:40 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 0570a3ea0ca69a45 (SOXS CALL): wrong_signal
+2026-05-27 17:06:15 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 0e4c68933c8ab9d4 (SOXS CALL): wrong_signal
+2026-05-27 17:06:44 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction a652f4da290eb430 (SOXS CALL): wrong_signal
+2026-05-27 17:07:13 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 8419a45f09c7e7b1 (TER CALL): wrong_signal
+2026-05-27 17:08:01 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction f3f008d59027a579 (TER CALL): wrong_signal
+2026-05-27 17:08:27 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 637e33c2f66dd5f5 (TER CALL): wrong_signal
+2026-05-27 17:08:58 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction e0b34c63d4ea6400 (SOFI CALL): wrong_signal
+2026-05-27 17:09:25 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction ce3c1c60cdea1850 (TER CALL): wrong_signal
+2026-05-27 17:09:54 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 96dc14e5fb849d6c (SOFI CALL): wrong_signal
+2026-05-27 17:10:39 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 9b3c225b8b0970cf (SOFI CALL): wrong_signal
+2026-05-27 17:11:06 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction eb47f497cc7f1fd3 (TER CALL): wrong_signal
+2026-05-27 17:11:35 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction aea21a7448ada441 (TER CALL): wrong_signal
+2026-05-27 17:12:07 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 1f315522284bdd2f (SOFI CALL): wrong_signal
