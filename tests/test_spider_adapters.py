@@ -238,3 +238,57 @@ class TestWikidataAdapter:
     def test_discover_handles_error(self, mock_get):
         mock_get.side_effect = Exception("Network error")
         assert self._make().discover("Test", {}) == []
+
+    # ── SPARQL query rendering (regression: double-brace 500s) ──
+
+    def test_build_query_has_no_literal_double_braces(self):
+        from intelligence.spider.sources.wikidata import build_query
+
+        query = build_query("Jerome Powell")
+        # The classic bug: f-string/.format escaping leaves literal {{ / }}
+        # in the wire query, which WDQS rejects with HTTP 500.
+        assert "{{" not in query
+        assert "}}" not in query
+
+    def test_build_query_is_well_formed_sparql(self):
+        from intelligence.spider.sources.wikidata import build_query
+
+        query = build_query("Christine Lagarde")
+        # Balanced single braces and the required SPARQL skeleton.
+        assert query.count("{") == query.count("}")
+        assert query.count("{") >= 1
+        assert query.startswith("SELECT ")
+        assert "WHERE {" in query
+        assert "LIMIT 50" in query
+        # Predicate variable must use the direct-claim prefix (wdt:), not the
+        # bare entity prefix (wd:) which is invalid in predicate position.
+        assert "wdt:P108" in query
+        assert "VALUES ?prop {" in query
+
+    def test_build_query_escapes_quotes_in_actor_name(self):
+        from intelligence.spider.sources.wikidata import build_query
+
+        # A name with a double-quote must not break out of the SPARQL literal.
+        query = build_query('Robert "Bob" Smith')
+        assert "{{" not in query and "}}" not in query
+        assert query.count("{") == query.count("}")
+        assert '\\"Bob\\"' in query
+
+    def test_discover_renders_query_to_request(self):
+        from intelligence.spider.sources import wikidata as wd
+
+        captured = {}
+
+        def fake_get(url, params=None, headers=None, timeout=None):
+            captured["query"] = params["query"]
+            return MagicMock(
+                status_code=200,
+                json=lambda: {"results": {"bindings": []}},
+            )
+
+        with patch.object(wd.requests, "get", side_effect=fake_get):
+            wd.WikidataAdapter().discover("Tim Cook", {})
+
+        assert "{{" not in captured["query"]
+        assert "}}" not in captured["query"]
+        assert captured["query"].count("{") == captured["query"].count("}")
