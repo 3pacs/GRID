@@ -437,6 +437,13 @@ def run_agent_cycle(engine) -> dict[str, Any]:
     """Run one full agent cycle: react, enrich, prioritize, act."""
     stats = {"enriched": 0, "flagged": 0, "acted": 0}
 
+    # Pre-migration safety: act_on_approval below inserts into oracle_predictions
+    # with an ON CONFLICT targeting the partial unique index
+    # oracle_predictions_dedup_unique. Ensure it exists (once/process) so that
+    # insert can't raise 42P10 on a not-yet-migrated DB.
+    from oracle.dedup_index import ensure_dedup_index
+    ensure_dedup_index(engine)
+
     with engine.begin() as conn:
         recent = conn.execute(text("""
             SELECT n.id, n.vault_path, n.domain, n.status, n.title, n.body,
