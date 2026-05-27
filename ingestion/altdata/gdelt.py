@@ -229,6 +229,12 @@ class GDELTPuller(BasePuller):
         self._doc_throttle = _TokenBucket()
         log.info("GDELTPuller initialised — source_id={sid}", sid=self.source_id)
 
+    def _acquire_doc_token(self) -> float:
+        """Consume a GDELT DOC API token, creating the throttle for test shims."""
+        if not hasattr(self, "_doc_throttle"):
+            self._doc_throttle = _TokenBucket()
+        return self._doc_throttle.acquire()
+
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=10))
     def _fetch_gkg_day(self, target_date: date) -> pd.DataFrame | None:
         """Download and parse a daily GKG file.
@@ -367,7 +373,7 @@ class GDELTPuller(BasePuller):
             "format": "json",
             "maxrecords": 250,
         }
-        self._doc_throttle.acquire()
+        self._acquire_doc_token()
         resp = requests.get(_GDELT_API_URL, params=params, timeout=10)
         if resp.status_code in {400, 403, 404, 429, 500, 502, 503, 504}:
             log.info(
