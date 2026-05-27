@@ -1340,3 +1340,16 @@
 2026-05-27 16:04:31 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction e1fac9733802ec9e (TER CALL): wrong_signal
 2026-05-27 16:05:01 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 91d2ab3140015c27 (TER CALL): wrong_signal
 2026-05-27 16:05:30 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction e8a940010f94bc68 (TER CALL): wrong_signal
+2026-05-27 16:05:56 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 8ae23c1f308440b3 (TER CALL): wrong_signal
+2026-05-27 16:06:19 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 6248832c88bb38ed (ELV PUT): wrong_signal
+2026-05-27 16:06:53 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b25df890e60dd49b (TEL CALL): wrong_signal
+2026-05-27 16:07:25 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction dbac6b482cf61e66 (TEL CALL): wrong_signal
+2026-05-27 16:08:15 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b9e70964af95fdca (TEL CALL): wrong_signal
+2026-05-27 16:08:40 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 8ea8d9be15d0cd38 (TEL CALL): wrong_signal
+2026-05-27 16:09:23 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction e18acf6f088e0661 (CVS PUT): external_shock
+2026-05-27 16:10:00 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 03c8402680d1676a (TEL CALL): wrong_signal
+2026-05-27 16:10:34 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 0e1bea49999b3110 (TEL CALL): wrong_signal
+2026-05-27 16:11:09 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 9eb55db5375192bb (CVS PUT): external_shock
+2026-05-27 16:11:42 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction c4d2ece1849a2147 (CVS PUT): external_shock
+2026-05-27 16:12:21 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 82bf91838635bea1 (CVS PUT): external_shock
+2026-05-27 16:12:49 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction bbdb16b31d55fad6 (CVE PUT): wrong_signal
