@@ -1078,3 +1078,16 @@
 2026-05-27 13:58:32 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 05a8f1471dd851b6 (BE PUT): external_shock
 2026-05-27 13:58:58 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction cecf898bf1ea74cd (APLD PUT): wrong_signal
 2026-05-27 13:59:45 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction c8e2e68575409e8a (APA PUT): external_shock
+2026-05-27 14:00:17 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 215a81234e10b2f0 (APA PUT): external_shock
+2026-05-27 14:00:51 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 425b5ccba684833c (BE PUT): external_shock
+2026-05-27 14:01:24 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b64740a0c7aca42f (BE PUT): external_shock
+2026-05-27 14:02:01 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 6b6edcd1ba15b3dc (BE PUT): external_shock
+2026-05-27 14:02:31 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction a73dba5028eb8488 (ASML PUT): right_signal_wrong_timing
+2026-05-27 14:03:01 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction dc95140f57a5780f (WELL PUT): right_signal_wrong_timing
+2026-05-27 14:03:32 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 171e8aeeaa2cc46b (VG PUT): external_shock
+2026-05-27 14:04:03 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 81d0812d199a63a8 (MRVL PUT): external_shock
+2026-05-27 14:04:28 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 11974a23750f8593 (MPWR PUT): wrong_signal
+2026-05-27 14:04:59 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 49ad261eb88257ed (AMAT PUT): right_signal_wrong_timing
+2026-05-27 14:05:31 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4de729ff52bea124 (AMAT PUT): right_signal_wrong_timing
+2026-05-27 14:05:56 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 3a65e4fdc332ed69 (AMAT PUT): right_signal_wrong_timing
+2026-05-27 14:06:21 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 14e715c6335940d9 (ELV PUT): wrong_signal
