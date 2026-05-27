@@ -1,0 +1,156 @@
+2026-05-27 05:02:04 | INFO     | config:<module>:593 — GitSink attached — errors land in .server-logs/errors.jsonl (push_enabled=False)
+2026-05-27 05:02:04 | INFO     | config:<module>:603 — GRID config loaded — environment=development, db=localhost:5432/griddb
+2026-05-27 05:02:04 | INFO     | db:get_engine:69 — Creating SQLAlchemy engine — postgresql://grid:***@localhost:5432/griddb
+2026-05-27 05:02:04 | INFO     | db:get_engine:117 — SQLAlchemy engine created — pool_size=20, max_overflow=30
+2026-05-27 05:02:04 | INFO     | __main__:_worker_main:142 — postmortem_worker 3/5 starting on provider=ollama_koala, days=30, max=None
+2026-05-27 05:02:11 | INFO     | __main__:_worker_main:167 — worker 3: 0 trade candidates, 203736 pred candidates
+2026-05-27 05:02:11 | INFO     | llamacpp.client:__init__:95 — llama.cpp ctx_size=8192
+2026-05-27 05:02:11 | INFO     | llamacpp.client:__init__:100 — llama.cpp server connected — http://gridz4:8080
+Skipping import of cpp extensions due to incompatible torch version. Please upgrade to torch >= 2.11.0 (found 2.10.0+cu128).
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights:  25%|██▌       | 26/103 [00:00<00:00, 243.28it/s]Loading weights:  50%|████▉     | 51/103 [00:00<00:00, 193.14it/s]Loading weights:  81%|████████  | 83/103 [00:00<00:00, 177.01it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 203.63it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:03:11 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 46.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 43.81 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Including non-PyTorch memory, this process has 122.00 MiB memory in use. Process 4118815 has 122.00 MiB memory in use. Process 4118816 has 168.00 MiB memory in use. Of the allocated memory 0 bytes is allocated by PyTorch, and 0 bytes is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:03:14 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 55cf66953a4eecaf (FTNT PUT): external_shock
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2692.02it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:03:16 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 46.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 9.81 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Including non-PyTorch memory, this process has 122.00 MiB memory in use. Process 4118815 has 122.00 MiB memory in use. Process 4118816 has 202.00 MiB memory in use. Of the allocated memory 0 bytes is allocated by PyTorch, and 0 bytes is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:03:26 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction cdf9f21b9fe15d2a (MSTR PUT): right_signal_wrong_timing
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2991.28it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:03:28 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 46.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 9.81 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Including non-PyTorch memory, this process has 122.00 MiB memory in use. Process 4118815 has 122.00 MiB memory in use. Process 4118816 has 202.00 MiB memory in use. Of the allocated memory 0 bytes is allocated by PyTorch, and 0 bytes is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:03:37 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 00903ceae3e47ed7 (NXPI PUT): external_shock
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2673.53it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:03:38 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 46.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 9.81 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Including non-PyTorch memory, this process has 122.00 MiB memory in use. Process 4118815 has 122.00 MiB memory in use. Process 4118816 has 202.00 MiB memory in use. Of the allocated memory 0 bytes is allocated by PyTorch, and 0 bytes is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:03:49 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction dbff1de66cd72633 (DOW PUT): external_shock
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 3648.18it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:03:51 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 46.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 9.81 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Including non-PyTorch memory, this process has 122.00 MiB memory in use. Process 4118815 has 122.00 MiB memory in use. Process 4118816 has 202.00 MiB memory in use. Of the allocated memory 0 bytes is allocated by PyTorch, and 0 bytes is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:04:00 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction b9a1ad3975661e83 (OXY PUT): right_signal_wrong_timing
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2716.76it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:04:02 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 46.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 9.81 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Including non-PyTorch memory, this process has 122.00 MiB memory in use. Process 4118815 has 122.00 MiB memory in use. Process 4118816 has 202.00 MiB memory in use. Of the allocated memory 0 bytes is allocated by PyTorch, and 0 bytes is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:04:25 | INFO     | config:<module>:593 — GitSink attached — errors land in .server-logs/errors.jsonl (push_enabled=False)
+2026-05-27 05:04:25 | INFO     | config:<module>:603 — GRID config loaded — environment=development, db=localhost:5432/griddb
+2026-05-27 05:04:25 | INFO     | db:get_engine:69 — Creating SQLAlchemy engine — postgresql://grid:***@localhost:5432/griddb
+2026-05-27 05:04:25 | INFO     | db:get_engine:117 — SQLAlchemy engine created — pool_size=20, max_overflow=30
+2026-05-27 05:04:25 | INFO     | __main__:_worker_main:146 — postmortem_worker 3/5 starting on provider=ollama_koala, days=30, max=None
+2026-05-27 05:04:32 | INFO     | __main__:_worker_main:171 — worker 3: 0 trade candidates, 203731 pred candidates
+2026-05-27 05:04:32 | INFO     | ollama.client:__init__:61 — Ollama client connected — http://koala:11434
+Skipping import of cpp extensions due to incompatible torch version. Please upgrade to torch >= 2.11.0 (found 2.10.0+cu128).
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 3288.17it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:04:43 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA error: out of memory
+Search for `cudaErrorMemoryAllocation' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+2026-05-27 05:05:16 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction fd263faa9542f98e (CTVA PUT): right_signal_wrong_timing
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 3196.31it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:05:18 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA error: out of memory
+Search for `cudaErrorMemoryAllocation' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+2026-05-27 05:05:43 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 1e33cc3b5cab01cb (CVS PUT): external_shock
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2923.14it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:05:45 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA error: out of memory
+Search for `cudaErrorMemoryAllocation' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+2026-05-27 05:06:18 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction c23743fa42008d78 (FTNT PUT): external_shock
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2512.14it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:06:20 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA error: out of memory
+Search for `cudaErrorMemoryAllocation' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+2026-05-27 05:06:45 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction c22a9aebba45c45c (GOOG PUT): wrong_signal
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2529.77it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:06:47 | INFO     | intelligence.rag:<module>:57 — RAG using sentence-transformers backend (384-dim)
+2026-05-27 05:07:18 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 8de46a5b2bb31548 (HPE PUT): external_shock
+2026-05-27 05:08:06 | INFO     | config:<module>:593 — GitSink attached — errors land in .server-logs/errors.jsonl (push_enabled=False)
+2026-05-27 05:08:06 | INFO     | config:<module>:603 — GRID config loaded — environment=development, db=localhost:5432/griddb
+2026-05-27 05:08:06 | INFO     | db:get_engine:69 — Creating SQLAlchemy engine — postgresql://grid:***@localhost:5432/griddb
+2026-05-27 05:08:06 | INFO     | db:get_engine:117 — SQLAlchemy engine created — pool_size=20, max_overflow=30
+2026-05-27 05:08:06 | INFO     | __main__:_worker_main:147 — postmortem_worker 3/5 starting on provider=ollama_koala, days=30, max=None
+2026-05-27 05:08:13 | INFO     | __main__:_worker_main:172 — worker 3: 0 trade candidates, 203726 pred candidates
+2026-05-27 05:08:13 | INFO     | ollama.client:__init__:61 — Ollama client connected — http://koala:11434
+2026-05-27 05:08:44 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction a26d9cb4c571cb6f (ORCL PUT): right_signal_wrong_timing
+2026-05-27 05:09:07 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 9178aa44ce30c25f (HPE PUT): external_shock
+2026-05-27 05:09:37 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction f29263825bdf4f56 (APLD PUT): wrong_signal

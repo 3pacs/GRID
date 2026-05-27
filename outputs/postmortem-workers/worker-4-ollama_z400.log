@@ -1,0 +1,506 @@
+2026-05-27 05:02:04 | INFO     | config:<module>:593 — GitSink attached — errors land in .server-logs/errors.jsonl (push_enabled=False)
+2026-05-27 05:02:04 | INFO     | config:<module>:603 — GRID config loaded — environment=development, db=localhost:5432/griddb
+2026-05-27 05:02:04 | INFO     | db:get_engine:69 — Creating SQLAlchemy engine — postgresql://grid:***@localhost:5432/griddb
+2026-05-27 05:02:05 | INFO     | db:get_engine:117 — SQLAlchemy engine created — pool_size=20, max_overflow=30
+2026-05-27 05:02:05 | INFO     | __main__:_worker_main:142 — postmortem_worker 4/5 starting on provider=ollama_z400, days=30, max=None
+2026-05-27 05:02:12 | INFO     | __main__:_worker_main:167 — worker 4: 0 trade candidates, 203333 pred candidates
+2026-05-27 05:02:12 | INFO     | llamacpp.client:__init__:95 — llama.cpp ctx_size=8192
+2026-05-27 05:02:12 | INFO     | llamacpp.client:__init__:100 — llama.cpp server connected — http://gridz4:8080
+Skipping import of cpp extensions due to incompatible torch version. Please upgrade to torch >= 2.11.0 (found 2.10.0+cu128).
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights:  11%|█         | 11/103 [00:00<00:01, 85.81it/s]Loading weights:  29%|██▉       | 30/103 [00:00<00:00, 140.48it/s]Loading weights:  77%|███████▋  | 79/103 [00:00<00:00, 269.78it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 206.42it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:03:11 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA error: out of memory
+Search for `cudaErrorMemoryAllocation' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+2026-05-27 05:03:22 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 10180525e7695dce (CVE PUT): wrong_signal
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2894.08it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:03:24 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA error: out of memory
+Search for `cudaErrorMemoryAllocation' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+2026-05-27 05:03:29 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction d9b016b6b391f50d (CVS PUT): external_shock
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 3030.80it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:03:31 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA error: out of memory
+Search for `cudaErrorMemoryAllocation' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+2026-05-27 05:03:41 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction f4f36f99f74b8462 (MO PUT): external_shock
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2266.64it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:03:43 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA error: out of memory
+Search for `cudaErrorMemoryAllocation' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+2026-05-27 05:03:55 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction af38709df1e78e78 (MO PUT): external_shock
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2805.39it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:03:56 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA error: out of memory
+Search for `cudaErrorMemoryAllocation' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+2026-05-27 05:04:02 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction e55e761aa9af2b5b (MO PUT): external_shock
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2554.51it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:04:04 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA error: out of memory
+Search for `cudaErrorMemoryAllocation' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+2026-05-27 05:04:25 | INFO     | config:<module>:593 — GitSink attached — errors land in .server-logs/errors.jsonl (push_enabled=False)
+2026-05-27 05:04:25 | INFO     | config:<module>:603 — GRID config loaded — environment=development, db=localhost:5432/griddb
+2026-05-27 05:04:25 | INFO     | db:get_engine:69 — Creating SQLAlchemy engine — postgresql://grid:***@localhost:5432/griddb
+2026-05-27 05:04:25 | INFO     | db:get_engine:117 — SQLAlchemy engine created — pool_size=20, max_overflow=30
+2026-05-27 05:04:25 | INFO     | __main__:_worker_main:146 — postmortem_worker 4/5 starting on provider=ollama_z400, days=30, max=None
+2026-05-27 05:04:32 | INFO     | __main__:_worker_main:171 — worker 4: 0 trade candidates, 203328 pred candidates
+2026-05-27 05:04:32 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:04:32 | INFO     | llamacpp.client:__init__:95 — llama.cpp ctx_size=8192
+2026-05-27 05:04:32 | INFO     | llamacpp.client:__init__:100 — llama.cpp server connected — http://gridz4:8080
+2026-05-27 05:04:32 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+Skipping import of cpp extensions due to incompatible torch version. Please upgrade to torch >= 2.11.0 (found 2.10.0+cu128).
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 3846.58it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:04:43 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 20.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 14.06 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Process 4130269 has 262.00 MiB memory in use. Including non-PyTorch memory, this process has 172.00 MiB memory in use. Process 4130270 has 10.00 MiB memory in use. Of the allocated memory 47.73 MiB is allocated by PyTorch, and 2.27 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:04:46 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 3a71999be3fa9654 (LYV PUT): right_signal_wrong_timing
+2026-05-27 05:04:46 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:04:46 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2884.05it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:04:47 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 2.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 2.94 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Process 4130269 has 262.00 MiB memory in use. Including non-PyTorch memory, this process has 198.00 MiB memory in use. Of the allocated memory 66.91 MiB is allocated by PyTorch, and 9.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:04:52 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction c56fb917022068fb (MDLZ PUT): wrong_signal
+2026-05-27 05:04:52 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:04:52 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2962.40it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:04:54 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 2.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 2.94 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Process 4130269 has 262.00 MiB memory in use. Including non-PyTorch memory, this process has 198.00 MiB memory in use. Of the allocated memory 66.91 MiB is allocated by PyTorch, and 9.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:04:56 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction fd4bd57df9c01470 (MDLZ PUT): wrong_signal
+2026-05-27 05:04:56 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:04:56 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 3423.95it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:04:58 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 2.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 2.94 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Process 4130269 has 262.00 MiB memory in use. Including non-PyTorch memory, this process has 198.00 MiB memory in use. Of the allocated memory 66.91 MiB is allocated by PyTorch, and 9.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:05:02 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction d6aef0446ddcacec (CNQ PUT): wrong_signal
+2026-05-27 05:05:02 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:05:02 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2894.87it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:05:04 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 2.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 2.94 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Process 4130269 has 262.00 MiB memory in use. Including non-PyTorch memory, this process has 198.00 MiB memory in use. Of the allocated memory 66.91 MiB is allocated by PyTorch, and 9.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:05:06 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 445bbb6b82f09b06 (COHR PUT): wrong_signal
+2026-05-27 05:05:06 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:05:06 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2472.46it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:05:08 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 2.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 2.94 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Process 4130269 has 262.00 MiB memory in use. Including non-PyTorch memory, this process has 198.00 MiB memory in use. Of the allocated memory 66.91 MiB is allocated by PyTorch, and 9.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:05:10 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 2dc5918e1e324023 (COHR PUT): wrong_signal
+2026-05-27 05:05:10 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:05:10 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 3294.59it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:05:13 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 2.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 2.94 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Process 4130269 has 262.00 MiB memory in use. Including non-PyTorch memory, this process has 198.00 MiB memory in use. Of the allocated memory 66.91 MiB is allocated by PyTorch, and 9.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:05:16 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 9d21f66fc663bf70 (MNST PUT): right_signal_wrong_timing
+2026-05-27 05:05:16 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:05:16 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2936.91it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:05:17 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 2.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 2.94 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Process 4130269 has 262.00 MiB memory in use. Including non-PyTorch memory, this process has 198.00 MiB memory in use. Of the allocated memory 66.91 MiB is allocated by PyTorch, and 9.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:05:22 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 4760854302d2fa4d (CRWD PUT): external_shock
+2026-05-27 05:05:22 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:05:22 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2772.84it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:05:24 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 2.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 2.94 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Process 4130269 has 262.00 MiB memory in use. Including non-PyTorch memory, this process has 198.00 MiB memory in use. Of the allocated memory 66.91 MiB is allocated by PyTorch, and 9.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:05:27 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction f87ff87aa976e77a (CRWD PUT): external_shock
+2026-05-27 05:05:27 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:05:27 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2642.56it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:05:29 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 2.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 2.94 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Process 4130269 has 262.00 MiB memory in use. Including non-PyTorch memory, this process has 198.00 MiB memory in use. Of the allocated memory 66.91 MiB is allocated by PyTorch, and 9.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:05:32 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction e4f021826c75ac67 (CRWD PUT): external_shock
+2026-05-27 05:05:32 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:05:32 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2097.37it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:05:34 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 2.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 2.94 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Process 4130269 has 262.00 MiB memory in use. Including non-PyTorch memory, this process has 198.00 MiB memory in use. Of the allocated memory 66.91 MiB is allocated by PyTorch, and 9.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:05:37 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction e8cd010dc9f02595 (MO PUT): external_shock
+2026-05-27 05:05:37 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:05:37 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2205.48it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:05:39 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 2.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 2.94 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Process 4130269 has 262.00 MiB memory in use. Including non-PyTorch memory, this process has 198.00 MiB memory in use. Of the allocated memory 66.91 MiB is allocated by PyTorch, and 9.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:05:46 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 6d385aeae48375da (CVS PUT): external_shock
+2026-05-27 05:05:46 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:05:46 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2500.31it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:05:48 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 2.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 2.94 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Process 4130269 has 262.00 MiB memory in use. Including non-PyTorch memory, this process has 198.00 MiB memory in use. Of the allocated memory 66.91 MiB is allocated by PyTorch, and 9.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:05:50 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction e083bf30eccb1a13 (MPWR PUT): wrong_signal
+2026-05-27 05:05:50 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:05:50 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 3035.25it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:05:52 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 2.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 2.94 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Process 4130269 has 262.00 MiB memory in use. Including non-PyTorch memory, this process has 198.00 MiB memory in use. Of the allocated memory 66.91 MiB is allocated by PyTorch, and 9.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:05:54 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction f1308e0e11bf5383 (MPWR PUT): wrong_signal
+2026-05-27 05:05:54 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:05:54 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 3158.20it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:05:56 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 2.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 2.94 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Process 4130269 has 262.00 MiB memory in use. Including non-PyTorch memory, this process has 198.00 MiB memory in use. Of the allocated memory 66.91 MiB is allocated by PyTorch, and 9.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:06:00 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction fdb5589fcc4fc74a (DDOG PUT): external_shock
+2026-05-27 05:06:00 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:06:00 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 3150.48it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:06:01 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 2.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 2.94 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Process 4130269 has 262.00 MiB memory in use. Including non-PyTorch memory, this process has 198.00 MiB memory in use. Of the allocated memory 66.91 MiB is allocated by PyTorch, and 9.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:06:05 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 7863aad47996d872 (MCHP PUT): external_shock
+2026-05-27 05:06:05 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:06:05 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2971.78it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:06:07 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 2.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 2.94 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Process 4130269 has 262.00 MiB memory in use. Including non-PyTorch memory, this process has 198.00 MiB memory in use. Of the allocated memory 66.91 MiB is allocated by PyTorch, and 9.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:06:13 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 371579ef57fd3735 (MPWR PUT): wrong_signal
+2026-05-27 05:06:13 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:06:13 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2456.62it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:06:15 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 2.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 2.94 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Process 4130269 has 262.00 MiB memory in use. Including non-PyTorch memory, this process has 198.00 MiB memory in use. Of the allocated memory 66.91 MiB is allocated by PyTorch, and 9.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:06:18 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 13824f00bbc95190 (MRVL PUT): external_shock
+2026-05-27 05:06:18 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:06:18 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2717.66it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:06:19 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 2.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 2.94 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Process 4130269 has 262.00 MiB memory in use. Including non-PyTorch memory, this process has 198.00 MiB memory in use. Of the allocated memory 66.91 MiB is allocated by PyTorch, and 9.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:06:22 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 9f0f3440c311a79b (MO PUT): external_shock
+2026-05-27 05:06:22 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:06:22 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2160.27it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:06:23 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 2.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 2.94 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Process 4130269 has 262.00 MiB memory in use. Including non-PyTorch memory, this process has 198.00 MiB memory in use. Of the allocated memory 66.91 MiB is allocated by PyTorch, and 9.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:06:26 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction d39b8c0f91131542 (MPWR PUT): wrong_signal
+2026-05-27 05:06:26 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:06:26 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2421.38it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:06:28 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 2.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 2.94 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Process 4130269 has 262.00 MiB memory in use. Including non-PyTorch memory, this process has 198.00 MiB memory in use. Of the allocated memory 66.91 MiB is allocated by PyTorch, and 9.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:06:31 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction a29550e500a50fca (MRVL PUT): external_shock
+2026-05-27 05:06:31 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:06:31 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 3089.74it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:06:32 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 2.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 2.94 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Process 4130269 has 262.00 MiB memory in use. Including non-PyTorch memory, this process has 198.00 MiB memory in use. Of the allocated memory 66.91 MiB is allocated by PyTorch, and 9.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:06:35 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction d89d94f6b4a70129 (MS PUT): wrong_signal
+2026-05-27 05:06:35 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:06:35 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2357.11it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:06:37 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 2.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 2.94 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Process 4130269 has 262.00 MiB memory in use. Including non-PyTorch memory, this process has 198.00 MiB memory in use. Of the allocated memory 66.91 MiB is allocated by PyTorch, and 9.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:06:42 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction fcd6d4eb2337753b (BKR PUT): wrong_signal
+2026-05-27 05:06:42 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:06:42 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2319.06it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:06:44 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA out of memory. Tried to allocate 2.00 MiB. GPU 0 has a total capacity of 15.48 GiB of which 2.88 MiB is free. Process 1342 has 594.00 MiB memory in use. Process 2975173 has 1.81 GiB memory in use. Process 3945730 has 11.94 GiB memory in use. Process 4117218 has 674.00 MiB memory in use. Process 4130269 has 262.00 MiB memory in use. Including non-PyTorch memory, this process has 198.00 MiB memory in use. Of the allocated memory 66.91 MiB is allocated by PyTorch, and 9.09 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+2026-05-27 05:06:47 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction b97c073d93a8f3df (BKR PUT): wrong_signal
+2026-05-27 05:06:47 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:06:47 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2526.78it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:06:49 | INFO     | intelligence.rag:<module>:57 — RAG using sentence-transformers backend (384-dim)
+2026-05-27 05:06:56 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction d35facb097d23bc7 (BE PUT): external_shock
+2026-05-27 05:06:56 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:06:56 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:07:01 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 2796c7f47be75ee1 (BE PUT): external_shock
+2026-05-27 05:07:01 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:07:01 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:07:03 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 2a3d1c18e736607e (BE PUT): external_shock
+2026-05-27 05:07:03 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:07:03 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:07:05 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 4c3a6be82ee30d5b (BE PUT): external_shock
+2026-05-27 05:07:05 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:07:05 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:07:12 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 44f84649be23e6a0 (BE PUT): external_shock
+2026-05-27 05:07:12 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:07:12 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:07:17 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction eef54eeb8566a86d (ASML PUT): right_signal_wrong_timing
+2026-05-27 05:07:17 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:07:17 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:07:31 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 48aac0f1cd6eebde (APLS PUT): wrong_signal
+2026-05-27 05:07:31 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:07:31 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:07:33 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 9f40e794972c0e64 (APLS PUT): wrong_signal
+2026-05-27 05:07:33 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:07:33 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:07:36 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 81a20e22e7135bb9 (APLS PUT): wrong_signal
+2026-05-27 05:07:36 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:07:36 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:07:44 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction d7b8b9d1dfc78008 (APLD PUT): wrong_signal
+2026-05-27 05:07:44 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:07:44 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:08:06 | INFO     | config:<module>:593 — GitSink attached — errors land in .server-logs/errors.jsonl (push_enabled=False)
+2026-05-27 05:08:06 | INFO     | config:<module>:603 — GRID config loaded — environment=development, db=localhost:5432/griddb
+2026-05-27 05:08:06 | INFO     | db:get_engine:69 — Creating SQLAlchemy engine — postgresql://grid:***@localhost:5432/griddb
+2026-05-27 05:08:06 | INFO     | db:get_engine:117 — SQLAlchemy engine created — pool_size=20, max_overflow=30
+2026-05-27 05:08:06 | INFO     | __main__:_worker_main:147 — postmortem_worker 4/5 starting on provider=ollama_z400, days=30, max=None
+2026-05-27 05:08:13 | INFO     | __main__:_worker_main:172 — worker 4: 0 trade candidates, 203294 pred candidates
+2026-05-27 05:08:13 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:08:13 | INFO     | llamacpp.client:__init__:95 — llama.cpp ctx_size=8192
+2026-05-27 05:08:13 | INFO     | llamacpp.client:__init__:100 — llama.cpp server connected — http://gridz4:8080
+2026-05-27 05:08:13 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:08:18 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 1ae137ce4dfb20a5 (ECL CALL): wrong_signal
+2026-05-27 05:08:19 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:08:19 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:08:23 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b0ee6e69c9c06dbb (HBAN CALL): wrong_signal
+2026-05-27 05:08:23 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:08:23 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:08:28 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d173dd5ca67e2e48 (IAU CALL): wrong_signal
+2026-05-27 05:08:28 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:08:28 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:08:32 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction e42e9dca86be7419 (DELL PUT): external_shock
+2026-05-27 05:08:32 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:08:32 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:08:36 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction bf3a54578d46128f (ORLY CALL): wrong_signal
+2026-05-27 05:08:36 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:08:36 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:08:41 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction cbdad7bb7ce4bfef (SPXS CALL): wrong_signal
+2026-05-27 05:08:41 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:08:41 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:08:46 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b16260648c0198fd (BE PUT): external_shock
+2026-05-27 05:08:46 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:08:46 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:08:51 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction dd4a9aa5c95f25e6 (CDNS PUT): wrong_signal
+2026-05-27 05:08:51 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:08:51 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:08:56 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 754c1828ff275526 (TRGP PUT): wrong_signal
+2026-05-27 05:08:56 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:08:56 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:09:01 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction f24cd11d35769ac7 (BKR PUT): wrong_signal
+2026-05-27 05:09:01 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:09:01 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:09:05 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 26a9c7fa7129647f (CTVA PUT): right_signal_wrong_timing
+2026-05-27 05:09:06 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:09:06 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:09:11 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 819b445ca9ac4fbb (GOOG PUT): wrong_signal
+2026-05-27 05:09:11 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:09:11 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:09:16 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 7f57d2be4888044c (ASML PUT): right_signal_wrong_timing
+2026-05-27 05:09:16 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:09:16 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:09:20 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 7cfb3db94d64af7c (OXY PUT): right_signal_wrong_timing
+2026-05-27 05:09:20 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:09:20 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:09:25 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 96cdd9d681a26163 (CRDO PUT): wrong_signal
+2026-05-27 05:09:25 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:09:25 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:09:30 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d214ebb8e037572c (MNST PUT): right_signal_wrong_timing
+2026-05-27 05:09:30 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:09:30 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:09:35 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 9686992d70a9361d (MRVL PUT): external_shock
+2026-05-27 05:09:35 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:09:35 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:09:39 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 16ff41a0a3531082 (DELL PUT): external_shock
+2026-05-27 05:09:39 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:09:39 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:09:44 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 268a50965c51bc01 (CMI PUT): external_shock
+2026-05-27 05:09:44 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:09:44 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4
+2026-05-27 05:09:47 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 2de753b29f696c56 (QCOM PUT): external_shock
+2026-05-27 05:09:47 | WARNING  | ollama.client:__init__:63 — Ollama not available at http://z400:11434 — GRID will operate without it
+2026-05-27 05:09:47 | WARNING  | llm.router:get_llm:180 — LLM provider ollama_z400 unavailable, falling back to llamacpp_z4

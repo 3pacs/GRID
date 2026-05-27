@@ -1,0 +1,163 @@
+2026-05-27 05:02:04 | INFO     | config:<module>:593 — GitSink attached — errors land in .server-logs/errors.jsonl (push_enabled=False)
+2026-05-27 05:02:04 | INFO     | config:<module>:603 — GRID config loaded — environment=development, db=localhost:5432/griddb
+2026-05-27 05:02:04 | INFO     | db:get_engine:69 — Creating SQLAlchemy engine — postgresql://grid:***@localhost:5432/griddb
+2026-05-27 05:02:04 | INFO     | db:get_engine:117 — SQLAlchemy engine created — pool_size=20, max_overflow=30
+2026-05-27 05:02:04 | INFO     | __main__:_worker_main:142 — postmortem_worker 0/5 starting on provider=llamacpp_z4, days=30, max=None
+2026-05-27 05:02:07 | INFO     | __main__:_worker_main:167 — worker 0: 0 trade candidates, 202811 pred candidates
+2026-05-27 05:02:08 | INFO     | llamacpp.client:__init__:95 — llama.cpp ctx_size=8192
+2026-05-27 05:02:08 | INFO     | llamacpp.client:__init__:100 — llama.cpp server connected — http://gridz4:8080
+Skipping import of cpp extensions due to incompatible torch version. Please upgrade to torch >= 2.11.0 (found 2.10.0+cu128).
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights:  15%|█▍        | 15/103 [00:00<00:00, 113.36it/s]Loading weights:  37%|███▋      | 38/103 [00:00<00:00, 151.05it/s]Loading weights:  76%|███████▌  | 78/103 [00:00<00:00, 232.39it/s]Loading weights:  99%|█████████▉| 102/103 [00:00<00:00, 199.89it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 194.00it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:03:11 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA error: out of memory
+Search for `cudaErrorMemoryAllocation' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+2026-05-27 05:03:23 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 24aa3fb0e32ece42 (IAU CALL): wrong_signal
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2539.36it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:03:25 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA error: out of memory
+Search for `cudaErrorMemoryAllocation' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+2026-05-27 05:03:32 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 263bcb868345f0d1 (BABA CALL): wrong_signal
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2325.38it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:03:33 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA error: out of memory
+Search for `cudaErrorMemoryAllocation' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+2026-05-27 05:03:44 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 403a769ce7f7ca41 (COP PUT): right_signal_wrong_timing
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2513.63it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:03:46 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA error: out of memory
+Search for `cudaErrorMemoryAllocation' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+2026-05-27 05:03:57 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 7a2120158d16a20d (ECL CALL): wrong_signal
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2758.53it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:03:58 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA error: out of memory
+Search for `cudaErrorMemoryAllocation' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+2026-05-27 05:04:04 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 20614692b8a7b4cc (HPE PUT): external_shock
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2957.54it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:04:06 | WARNING  | intelligence.postmortem:_get_llm_postmortem:1615 — RAG context retrieval failed in postmortem: CUDA error: out of memory
+Search for `cudaErrorMemoryAllocation' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+2026-05-27 05:04:25 | INFO     | config:<module>:593 — GitSink attached — errors land in .server-logs/errors.jsonl (push_enabled=False)
+2026-05-27 05:04:25 | INFO     | config:<module>:603 — GRID config loaded — environment=development, db=localhost:5432/griddb
+2026-05-27 05:04:25 | INFO     | db:get_engine:69 — Creating SQLAlchemy engine — postgresql://grid:***@localhost:5432/griddb
+2026-05-27 05:04:25 | INFO     | db:get_engine:117 — SQLAlchemy engine created — pool_size=20, max_overflow=30
+2026-05-27 05:04:25 | INFO     | __main__:_worker_main:146 — postmortem_worker 0/5 starting on provider=llamacpp_z4, days=30, max=None
+2026-05-27 05:04:28 | INFO     | __main__:_worker_main:171 — worker 0: 0 trade candidates, 202806 pred candidates
+2026-05-27 05:04:28 | INFO     | llamacpp.client:__init__:95 — llama.cpp ctx_size=8192
+2026-05-27 05:04:28 | INFO     | llamacpp.client:__init__:100 — llama.cpp server connected — http://gridz4:8080
+Skipping import of cpp extensions due to incompatible torch version. Please upgrade to torch >= 2.11.0 (found 2.10.0+cu128).
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 3426.12it/s]
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+2026-05-27 05:04:39 | INFO     | intelligence.rag:<module>:57 — RAG using sentence-transformers backend (384-dim)
+2026-05-27 05:04:50 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 10431b68574cbab5 (MCHP PUT): external_shock
+2026-05-27 05:04:58 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 5e28e97249ee017f (MDLZ PUT): wrong_signal
+2026-05-27 05:05:04 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 02321ab18376fe77 (ASML PUT): right_signal_wrong_timing
+2026-05-27 05:05:20 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 195e975bea5af853 (WMT PUT): wrong_signal
+2026-05-27 05:05:25 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 60b9be98a8591076 (STX PUT): wrong_signal
+2026-05-27 05:05:30 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction eaff2f202081e687 (SNPS PUT): external_shock
+2026-05-27 05:05:35 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 73dafa218451a38c (IONQ PUT): wrong_signal
+2026-05-27 05:05:44 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 2439a70394dcf3cf (KMI PUT): right_signal_wrong_timing
+2026-05-27 05:05:48 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 13295704959b6cd7 (IREN PUT): right_signal_wrong_timing
+2026-05-27 05:05:57 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 5c86e6a32f807753 (GOOG PUT): wrong_signal
+2026-05-27 05:06:03 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction a8fd7840a52b137e (ELV PUT): wrong_signal
+2026-05-27 05:06:11 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 222a5dce2b79a1c1 (VG PUT): external_shock
+2026-05-27 05:06:28 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 84916805b7f925a6 (SMCI PUT): right_signal_wrong_timing
+2026-05-27 05:06:39 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 547007ec4e42cf2e (DELL PUT): external_shock
+2026-05-27 05:06:45 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 2df1168df93a91fc (MRVL PUT): external_shock
+2026-05-27 05:06:58 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction 14d1cc949ddc3aae (LYV PUT): right_signal_wrong_timing
+2026-05-27 05:07:15 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction e26a095179d45abb (DOW PUT): external_shock
+2026-05-27 05:07:29 | INFO     | intelligence.postmortem:generate_prediction_postmortem:424 — Post-mortem generated for prediction ed6135eb58ad2f45 (WELL PUT): right_signal_wrong_timing
+2026-05-27 05:08:06 | INFO     | config:<module>:593 — GitSink attached — errors land in .server-logs/errors.jsonl (push_enabled=False)
+2026-05-27 05:08:06 | INFO     | config:<module>:603 — GRID config loaded — environment=development, db=localhost:5432/griddb
+2026-05-27 05:08:06 | INFO     | db:get_engine:69 — Creating SQLAlchemy engine — postgresql://grid:***@localhost:5432/griddb
+2026-05-27 05:08:06 | INFO     | db:get_engine:117 — SQLAlchemy engine created — pool_size=20, max_overflow=30
+2026-05-27 05:08:06 | INFO     | __main__:_worker_main:147 — postmortem_worker 0/5 starting on provider=llamacpp_z4, days=30, max=None
+2026-05-27 05:08:13 | INFO     | __main__:_worker_main:172 — worker 0: 0 trade candidates, 202788 pred candidates
+2026-05-27 05:08:13 | INFO     | llamacpp.client:__init__:95 — llama.cpp ctx_size=8192
+2026-05-27 05:08:13 | INFO     | llamacpp.client:__init__:100 — llama.cpp server connected — http://gridz4:8080
+2026-05-27 05:08:16 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction ddf88abb4b217112 (F PUT): right_signal_wrong_timing
+2026-05-27 05:08:20 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d5b39eecf7bc2062 (APA PUT): external_shock
+2026-05-27 05:08:25 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction a6ca6d18abee9239 (IREN PUT): right_signal_wrong_timing
+2026-05-27 05:08:30 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 88cf8384062eb28a (PSX PUT): external_shock
+2026-05-27 05:08:36 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 1918632a909a6822 (EXPE CALL): wrong_signal
+2026-05-27 05:08:39 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction a56dec1f2e3de9de (CDNS PUT): external_shock
+2026-05-27 05:08:43 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 8e2a34278bed703b (OKE PUT): wrong_signal
+2026-05-27 05:08:48 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 384628a68f04aac1 (VG PUT): external_shock
+2026-05-27 05:08:53 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 0bf8cde5f5071915 (SU PUT): external_shock
+2026-05-27 05:08:58 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction e4c25a0330bdf574 (PSX PUT): external_shock
+2026-05-27 05:09:03 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 83154f8006b517c4 (FSLR PUT): external_shock
+2026-05-27 05:09:08 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction e304adc24171eca9 (QCOM PUT): right_signal_wrong_timing
+2026-05-27 05:09:13 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction f8d618abf589d351 (ELV PUT): wrong_signal
+2026-05-27 05:09:19 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4164eec1c598f229 (OXY PUT): right_signal_wrong_timing
+2026-05-27 05:09:23 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b8bd4d974caaba11 (VGT CALL): wrong_signal
+2026-05-27 05:09:27 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d0ad744ccce262e9 (UVIX CALL): wrong_signal
+2026-05-27 05:09:32 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 777176a7efc014a8 (UL CALL): wrong_signal
+2026-05-27 05:09:36 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 43c508800f8489eb (TT CALL): wrong_signal
+2026-05-27 05:09:41 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d58d24e8e1f817c0 (BE PUT): external_shock
+2026-05-27 05:09:45 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction ebdb4b3b52c6d4af (APA PUT): external_shock
+2026-05-27 05:09:50 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction c4ef19260a1e8b65 (APLS PUT): wrong_signal
