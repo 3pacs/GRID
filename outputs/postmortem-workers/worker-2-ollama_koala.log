@@ -1739,3 +1739,17 @@
 2026-05-27 18:05:09 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction cd35de67cd409b1f (PCG CALL): wrong_signal
 2026-05-27 18:05:40 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d601926beaa6520e (RDDT CALL): wrong_signal
 2026-05-27 18:06:11 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 912ef6596052113b (RDDT CALL): wrong_signal
+2026-05-27 18:06:40 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 0bbe24aadcec04fd (RCL CALL): wrong_signal
+2026-05-27 18:07:11 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction eb939f7cc9e67f21 (PCG CALL): wrong_signal
+2026-05-27 18:07:41 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction da552cafe2f52874 (RCL CALL): wrong_signal
+2026-05-27 18:08:17 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 61571bea4631583f (RCL CALL): wrong_signal
+2026-05-27 18:08:48 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 3e804fe11653f6cf (RCL CALL): wrong_signal
+2026-05-27 18:09:22 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 87503c855e148e2a (PBR-A CALL): wrong_signal
+2026-05-27 18:09:50 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 6cf1598a7cc7cfc5 (PBR-A CALL): wrong_signal
+2026-05-27 18:10:16 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction bbab34f66abf9f09 (PBR-A CALL): wrong_signal
+2026-05-27 18:10:44 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction bad3095083b51d6b (PBR-A CALL): wrong_signal
+2026-05-27 18:11:14 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction de051e1fb625439c (RCL CALL): wrong_signal
+2026-05-27 18:11:45 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4f53a0c7328fc088 (PBR-A CALL): wrong_signal
+2026-05-27 18:12:14 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 88fedc23e4569a0b (PBR-A CALL): wrong_signal
+2026-05-27 18:12:45 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 85d146115c51450e (PBR CALL): wrong_signal
+2026-05-27 18:13:06 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 51b33f52d36547e7 (PBR CALL): wrong_signal
