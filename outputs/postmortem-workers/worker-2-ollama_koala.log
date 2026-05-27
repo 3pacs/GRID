@@ -724,3 +724,15 @@
 2026-05-27 10:59:28 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 2e8c81daf7a7b1a6 (RKLB PUT): right_signal_wrong_timing
 2026-05-27 10:59:51 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 1cd0b89039447695 (GOOG PUT): wrong_signal
 2026-05-27 11:00:18 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 01ede746442d531c (MDLZ PUT): wrong_signal
+2026-05-27 11:00:50 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 7a6ac83eda0a14bd (SBUX PUT): right_signal_wrong_timing
+2026-05-27 11:01:21 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 211221f384f4cf19 (SMCI PUT): right_signal_wrong_timing
+2026-05-27 11:01:54 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4536c348d184ccf8 (AMAT PUT): right_signal_wrong_timing
+2026-05-27 11:02:22 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 29278597c68e412a (MSTR PUT): right_signal_wrong_timing
+2026-05-27 11:02:51 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction e9b4266a2e0a7f3b (BE PUT): external_shock
+2026-05-27 11:03:28 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 98751d99e4ceaf99 (VG PUT): external_shock
+2026-05-27 11:04:03 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction da040d949e2a3e66 (VG PUT): external_shock
+2026-05-27 11:04:40 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 0793e7bc7f8cf380 (VG PUT): external_shock
+2026-05-27 11:05:16 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d2f6cb9558f22e44 (VG PUT): external_shock
+2026-05-27 11:05:50 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 041baa16b768864c (BE PUT): external_shock
+2026-05-27 11:06:18 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction ce26a295c8017eb2 (VLO PUT): external_shock
+2026-05-27 11:06:44 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 272bd52e41051fe6 (VLO PUT): external_shock
