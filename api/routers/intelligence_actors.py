@@ -386,17 +386,98 @@ async def get_top_actors_endpoint(
         return {"actors": [], "metric": metric, "count": 0, "error": str(exc)}
 
 
+# ── Community list cache ────────────────────────────────────────────────
+#
+# The live aggregation (store.graph.get_community_list) groups ~2.7M
+# actor_analytics rows into ~44K communities AND runs one extra "top member"
+# query PER community — a 44K-query N+1 that is far too slow for an
+# interactive request. We read the materialized ``community_summary`` table
+# (migration 0055_community_summary.sql) instead, with two layers of
+# protection: a short in-process TTL cache, and graceful fallback to the live
+# aggregation when the table is missing or empty.
+_COMMUNITY_LIST_TTL = 300  # 5 minutes
+_community_list_cache: TTLCache = TTLCache(ttl=_COMMUNITY_LIST_TTL, max_size=1)
+_COMMUNITY_LIST_CACHE_KEY = "all"
+
+
+def _read_community_summary(engine: Any) -> tuple[list[dict[str, Any]], str] | None:
+    """Read communities from the cached ``community_summary`` table.
+
+    Returns ``(communities, "cache")`` on a hit, or ``None`` when the table is
+    absent/empty so the caller can fall back to the live aggregation. Never
+    raises — a query failure is treated as a miss.
+    """
+    from sqlalchemy import text
+
+    try:
+        with engine.connect() as conn:
+            if not _table_exists(conn, "community_summary"):
+                return None
+            rows = conn.execute(text(
+                "SELECT community_id, member_count, max_pagerank, "
+                "top_member, top_category "
+                "FROM community_summary "
+                "ORDER BY member_count DESC"
+            )).fetchall()
+    except Exception as exc:
+        log.debug("community_summary read failed, falling back: {e}", e=str(exc))
+        return None
+
+    if not rows:
+        return None
+
+    communities = [
+        {
+            "community_id": r[0],
+            "member_count": int(r[1]) if r[1] is not None else 0,
+            "max_pagerank": float(r[2]) if r[2] is not None else 0.0,
+            "top_member": r[3],
+            "top_category": r[4],
+        }
+        for r in rows
+    ]
+    return communities, "cache"
+
+
+def _load_community_list(engine: Any) -> tuple[list[dict[str, Any]], str]:
+    """Cached-first community list with graceful fallback to live aggregation.
+
+    Order: in-process TTL cache → ``community_summary`` table → live
+    ``get_community_list`` aggregation. Returns ``(communities, source)`` where
+    source is one of ``ttl`` / ``cache`` / ``live``.
+    """
+    cached = _community_list_cache.get(_COMMUNITY_LIST_CACHE_KEY)
+    if cached is not None:
+        return cached, "ttl"
+
+    summary = _read_community_summary(engine)
+    if summary is not None:
+        communities, source = summary
+        _community_list_cache.set(_COMMUNITY_LIST_CACHE_KEY, communities)
+        return communities, source
+
+    # Fallback: the slow live aggregation (table not yet materialized).
+    from store.graph import get_community_list
+
+    communities = get_community_list(engine=engine)
+    _community_list_cache.set(_COMMUNITY_LIST_CACHE_KEY, communities)
+    return communities, "live"
+
+
 @router.get("/analytics/communities")
 async def get_communities_endpoint(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
-    """Return list of all communities with member counts and top member."""
-    try:
-        from store.graph import get_community_list
+    """Return list of all communities with member counts and top member.
 
+    Reads the materialized ``community_summary`` cache when available (see
+    migration 0055), falling back to the live aggregation. The ``source``
+    field reports which path served the request.
+    """
+    try:
         engine = get_db_engine()
-        communities = get_community_list(engine=engine)
-        return {"communities": communities, "count": len(communities)}
+        communities, source = _load_community_list(engine)
+        return {"communities": communities, "count": len(communities), "source": source}
     except Exception as exc:
         log.warning("Community list failed: {e}", e=str(exc))
         return {"communities": [], "count": 0, "error": str(exc)}
