@@ -224,7 +224,7 @@ def test_helper_index_ddl_matches_engine_and_publish_predicate():
     root = Path(__file__).resolve().parents[1]
     engine_src = (root / "oracle/engine.py").read_text()
     migration_src = (
-        root / "migrations/0055_oracle_predictions_dedup_guard_index.sql"
+        root / "migrations/0056_oracle_predictions_dedup_guard_index.sql"
     ).read_text()
 
     predicate_lines = (
