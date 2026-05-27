@@ -1768,3 +1768,16 @@
 2026-05-27 18:19:44 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d769b154384f2a2b (OMC CALL): wrong_signal
 2026-05-27 18:20:13 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b738c9d8dc548c43 (OMC CALL): wrong_signal
 2026-05-27 18:20:41 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 412ca9c628d9a22d (OMC CALL): wrong_signal
+2026-05-27 18:21:11 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d9fbe6991867315c (OKLO CALL): wrong_signal
+2026-05-27 18:21:47 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction bdb1ac3d27a937d8 (OKLO CALL): wrong_signal
+2026-05-27 18:22:14 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 59f7b01d48e43864 (OKLO CALL): wrong_signal
+2026-05-27 18:22:31 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 33826ac944cdeb8a (OKLO CALL): wrong_signal
+2026-05-27 18:22:58 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d31ebaeec0f552a9 (OKLO CALL): wrong_signal
+2026-05-27 18:23:30 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 84a914e800c9ef53 (OKLO CALL): wrong_signal
+2026-05-27 18:24:01 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction bcda754bf7ef6608 (OKLO CALL): wrong_signal
+2026-05-27 18:24:30 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 34754259d501ea7e (PLTR CALL): wrong_signal
+2026-05-27 18:25:02 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4ad13726affad5a2 (PLTR CALL): wrong_signal
+2026-05-27 18:25:33 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d8f144f5b7cdc1b2 (PLTR CALL): wrong_signal
+2026-05-27 18:26:01 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction c37200bc27d218c7 (PLTR CALL): wrong_signal
+2026-05-27 18:26:37 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction f186f570b39a9018 (SOFI CALL): wrong_signal
+2026-05-27 18:27:11 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 9b664f5a5659642a (SO CALL): wrong_signal
