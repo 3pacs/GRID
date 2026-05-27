@@ -28,6 +28,7 @@ import LayerControls from './LayerControls.jsx';
 import TemporalScrubber from './TemporalScrubber.jsx';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts.js';
 import { useCommunities } from './hooks/useCommunities.js';
+import { EDGE_LEGEND } from '../components/canvas/nodeStyles.js';
 
 // ── Lens lenses — lazy-loaded to keep the graph bundle lean ──
 const CanvasSupplyLens = React.lazy(() => import('../views/canvas_lenses/SupplyLens.jsx'));
@@ -576,7 +577,68 @@ const S = {
         overflow: 'hidden',
         background: colors.bg,
     },
+    // ── Edge color legend (bottom-left of graph) ──
+    legend: {
+        position: 'absolute',
+        bottom: '12px',
+        left: '12px',
+        zIndex: 20,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '4px',
+        padding: '8px 10px',
+        borderRadius: tokens.radius.sm,
+        background: 'rgba(13, 17, 23, 0.78)',
+        border: `1px solid ${colors.border}`,
+        backdropFilter: 'blur(6px)',
+        pointerEvents: 'none',
+        maxWidth: '160px',
+    },
+    legendTitle: {
+        fontSize: '9px',
+        fontWeight: 700,
+        letterSpacing: '1px',
+        color: colors.textMuted,
+        fontFamily: MONO,
+        marginBottom: '2px',
+    },
+    legendRow: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: '7px',
+    },
+    legendSwatch: (color) => ({
+        width: '14px',
+        height: '3px',
+        borderRadius: '2px',
+        background: color,
+        flexShrink: 0,
+        boxShadow: `0 0 5px ${color}99`,
+    }),
+    legendLabel: {
+        fontSize: '10px',
+        color: colors.textDim,
+        fontFamily: MONO,
+        whiteSpace: 'nowrap',
+    },
 };
+
+// ── Edge color legend ──
+// Reads the canonical EDGE_LEGEND so the canvas legend and the actual edge
+// colours never drift apart (single source of truth in nodeStyles.js).
+function EdgeLegend() {
+    return (
+        <div style={S.legend} aria-label="Edge relationship legend" data-testid="edge-legend">
+            <div style={S.legendTitle}>EDGE TYPE</div>
+            {EDGE_LEGEND.map((entry) => (
+                <div key={entry.key} style={S.legendRow}>
+                    <span style={S.legendSwatch(entry.color)} />
+                    <span style={S.legendLabel}>{entry.label}</span>
+                </div>
+            ))}
+        </div>
+    );
+}
 
 // ── Mobile detection ──
 function useIsMobile() {
@@ -1247,13 +1309,16 @@ export default function GothamCanvas() {
                 {/* Graph */}
                 <div style={{ ...S.graphContainer, visibility: lens === LENS_GRAPH ? 'visible' : 'hidden' }}>
                     {nodeCount > 0 ? (
-                        <SigmaGraph
-                            ref={sigmaRef}
-                            communities={communities}
-                            communityColors={communityColors}
-                            communityLabels={communityLabels}
-                            showCommunities={showCommunities}
-                        />
+                        <>
+                            <SigmaGraph
+                                ref={sigmaRef}
+                                communities={communities}
+                                communityColors={communityColors}
+                                communityLabels={communityLabels}
+                                showCommunities={showCommunities}
+                            />
+                            {!isMobile && edgeCount > 0 && <EdgeLegend />}
+                        </>
                     ) : !loading ? (
                         <div style={S.emptyState}>
                             <div style={S.emptyIcon}>
