@@ -1,3 +1,11 @@
+## 2026-05-27 23:23 UTC — 2026-05-27-2309
+**Why this matters next run:** line 45 is now DONE; the next top-down P1 (line 42 `intel_search`) is double-blocked — don't pick it.
+- Shipped PUNCH-LIST line 45 [P1] (`prediction_backtest.py` `get_engine`→`get_db_engine`, all 4 Depends sites) as **PR #275**, plus a static wiring regression `tests/test_prediction_backtest_engine_dep.py` (3 tests, pass via `pytest --noconftest`; ruff clean).
+- **Line 42 (`intel.intel_search` pagination) is now blocked two ways:** (1) the per-source LIMIT/OFFSET design problem documented in the 2026-05-21 entry below, AND (2) `api/routers/intel.py` is currently modified by **open PR #256** — editing it now risks a conflict. Skip until #256 merges and the operator decides pagination semantics.
+- **Best clean next pick: line 46 [P2]** — `clear_singletons()` (`api/dependencies.py:67`) disposes/None's the api-level `_db_engine` but never resets `db._engine`, so the next `get_db_engine()` returns a *disposed* engine. This is the underlying bug that makes PR #275 fully effective. Isolated ~2-line fix (`import db; db._engine = None`, or add a `db.clear_engine()` helper) + a small regression test. Not file-blocked.
+- **Env note:** this sandbox lacks `fastapi`/`pandas`; the repo `tests/conftest.py` imports pandas so router-import tests can't collect here. For pure-stdlib static tests use `pytest --noconftest`; otherwise rely on CI (full deps present). `pytest`/`ruff` installed via `pip install --user`.
+
+---
 ## 2026-05-26 23:35 UTC — 2026-05-26-2303
 **Why this matters next run:** Line 44 (system.py tests) is now done; the next clean api/ items are 45/46/47, and I left a real latent bug flagged below.
 
