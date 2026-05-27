@@ -1210,3 +1210,24 @@
 2026-05-27 14:59:51 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction a70d942d76e80d32 (WELL PUT): right_signal_wrong_timing
 2026-05-27 15:00:25 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction cab4d64f49df8cc3 (VLO PUT): external_shock
 2026-05-27 15:00:56 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 092082e8ee95888b (MNST PUT): right_signal_wrong_timing
+2026-05-27 15:01:19 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4400187f34be3832 (CL PUT): right_signal_wrong_timing
+2026-05-27 15:01:46 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 72c20701f995ccc3 (VLO PUT): external_shock
+2026-05-27 15:02:20 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 95d9b08a39264d30 (LYB PUT): external_shock
+2026-05-27 15:03:19 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b79eab028fbcf816 (MS PUT): wrong_signal
+2026-05-27 15:04:08 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 3c19cede4dba011c (MRVL PUT): external_shock
+2026-05-27 15:04:17 | WARNING  | ollama.client:generate:264 — Ollama generate failed (8826ms): 500 Server Error: Internal Server Error for url: http://koala:11434/api/generate
+2026-05-27 15:04:17 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 9c4058bee1c4e74a (MRVL PUT): external_shock
+2026-05-27 15:05:01 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4f60a0d866716e8c (MPWR PUT): wrong_signal
+2026-05-27 15:05:23 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction e3d9961b3e559e29 (MPWR PUT): wrong_signal
+2026-05-27 15:05:25 | WARNING  | ollama.client:generate:264 — Ollama generate failed (2424ms): 500 Server Error: Internal Server Error for url: http://koala:11434/api/generate
+2026-05-27 15:05:25 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 831f0ef30e6fa72a (MO PUT): external_shock
+2026-05-27 15:06:01 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 72a278557801bfff (MO PUT): external_shock
+2026-05-27 15:06:31 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 392d6afc19c86e20 (MO PUT): external_shock
+2026-05-27 15:06:54 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 73dfd69f2f968eee (WMT PUT): wrong_signal
+2026-05-27 15:07:24 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 07d70ad713d5de22 (MNST PUT): right_signal_wrong_timing
+2026-05-27 15:07:54 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction ecb310889e389dcc (WMT PUT): wrong_signal
+2026-05-27 15:08:20 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 2693b811312e1d66 (MNST PUT): right_signal_wrong_timing
+2026-05-27 15:08:43 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction aa3953e68d208714 (WMT PUT): wrong_signal
+2026-05-27 15:09:09 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d48702b402bf9075 (MNST PUT): right_signal_wrong_timing
+2026-05-27 15:09:33 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 60d717cf98cf3f0f (WMT PUT): wrong_signal
+2026-05-27 15:09:57 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction e3b801e7ebf52d0a (MNST PUT): right_signal_wrong_timing
