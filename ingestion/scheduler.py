@@ -13,6 +13,7 @@ with exponential backoff.
 
 from __future__ import annotations
 
+import socket
 import time
 from datetime import date, timedelta
 from typing import Any
@@ -70,6 +71,178 @@ def _with_db_retry(fn, *args, max_retries: int = 3, **kwargs):
 
 
 # ── International/extended pull group infrastructure ──────────────────
+
+
+_SOURCE_NAME_ALIASES: dict[str, tuple[str, ...]] = {
+    # Scheduler display names drifted from source_catalog names over time.
+    # Keep aliases narrow so one puller only advances its own source row.
+    "Binance_Crypto": ("binance",),
+    "Congress_Legislation": ("CONGRESS_GOV",),
+    "Congress_Trading": ("CONGRESS_TRADING",),
+    "DarkPool": ("DARKPOOL",),
+    "EIA_Energy": ("EIA",),
+    "Etherscan": ("etherscan",),
+    "Export_Controls": ("BIS_EXPORT_CONTROLS",),
+    "FEC_Campaign_Finance": ("FEC_CAMPAIGN_FINANCE",),
+    "FINRA_Margin": ("FINRA_MARGIN",),
+    "FMP_Earnings": ("fmp",),
+    "Gov_Contracts": ("USASPENDING_GOV",),
+    "Google_Trends_Daily": ("Google_Trends",),
+    "Kalshi_Markets": ("Kalshi",),
+    "NASA_FIRMS": ("nasa_firms",),
+    "News_Scraper_RSS": ("NewsScraperRSS",),
+    "NYFed": ("NY_Fed",),
+    "Open_Meteo": ("open_meteo",),
+    "Polygon": ("polygon",),
+    "Prediction_Odds": ("Polymarket",),
+    "Redfin_Housing": ("Redfin",),
+    "SEC_Insider": ("SEC_INSIDER",),
+    "Smart_Money": ("Social_Smart_Money",),
+    "Tiingo_Fundamentals": ("TIINGO_FUNDAMENTALS",),
+    "Tiingo_News": ("tiingo_news",),
+    "Tiingo_Prices": ("TIINGO",),
+    "USASpending": ("USASPENDING_GOV",),
+    "Wikipedia_Pageviews": ("wikipedia_pageviews",),
+    "WorldNews": ("WorldNewsAPI",),
+    "yfinance_Earnings": ("yfinance_earnings",),
+}
+
+
+def _append_unique(values: list[str], value: Any) -> None:
+    if not isinstance(value, str):
+        return
+    candidate = value.strip()
+    if candidate and candidate.lower() not in {v.lower() for v in values}:
+        values.append(candidate)
+
+
+def _source_catalog_candidates(
+    puller_name: str,
+    puller_instance: Any | None = None,
+) -> list[str]:
+    """Return source_catalog name candidates for a scheduled puller."""
+    candidates: list[str] = []
+    _append_unique(candidates, puller_name)
+
+    for attr in ("SOURCE_NAME", "source_name", "_source_name"):
+        _append_unique(candidates, getattr(puller_instance, attr, None))
+
+    for alias in _SOURCE_NAME_ALIASES.get(puller_name, ()):
+        _append_unique(candidates, alias)
+
+    if "_" in puller_name:
+        _append_unique(candidates, puller_name.lower())
+    return candidates
+
+
+def _source_matches_skip(
+    puller_name: str,
+    puller_instance: Any,
+    skip_sources: set[str],
+) -> bool:
+    """Return True when the puller or any canonical source alias is skipped."""
+    skipped = {source.lower() for source in skip_sources}
+    if not skipped:
+        return False
+    return any(
+        candidate.lower() in skipped
+        for candidate in _source_catalog_candidates(puller_name, puller_instance)
+    )
+
+
+def _resolve_source_catalog_entry(
+    db_engine: Engine,
+    puller_name: str,
+    puller_instance: Any | None = None,
+) -> tuple[int | None, str | None]:
+    """Resolve a scheduled puller to source_catalog.id/name, best effort."""
+    for source_name in _source_catalog_candidates(puller_name, puller_instance):
+        try:
+            with db_engine.connect() as conn:
+                row = conn.execute(
+                    text(
+                        "SELECT id, name FROM source_catalog "
+                        "WHERE LOWER(name) = LOWER(:name) LIMIT 1"
+                    ),
+                    {"name": source_name},
+                ).fetchone()
+            if row:
+                return int(row[0]), str(row[1])
+        except Exception as exc:
+            log.debug(
+                "Scheduler: source_catalog lookup failed for {p}/{s}: {e}",
+                p=puller_name,
+                s=source_name,
+                e=str(exc),
+            )
+            break
+    return None, None
+
+
+def _touch_source_catalog_last_pull(
+    db_engine: Engine,
+    source_id: int | None,
+    source_name: str | None,
+    puller_name: str,
+) -> None:
+    """Advance source_catalog.last_pull_at after a successful pull."""
+    if source_id is None:
+        log.debug(
+            "Scheduler: no source_catalog row resolved for {p}; last_pull_at not updated",
+            p=puller_name,
+        )
+        return
+    try:
+        with db_engine.begin() as conn:
+            conn.execute(
+                text("UPDATE source_catalog SET last_pull_at = NOW() WHERE id = :id"),
+                {"id": source_id},
+            )
+        log.debug(
+            "Scheduler: touched source_catalog.last_pull_at for {p} -> {s}",
+            p=puller_name,
+            s=source_name or source_id,
+        )
+    except Exception as exc:
+        log.warning(
+            "Scheduler: failed to touch source_catalog.last_pull_at for {p}: {e}",
+            p=puller_name,
+            e=str(exc),
+        )
+
+
+def _extract_rows_inserted(result: Any) -> int:
+    """Best-effort row count extraction from varied puller result shapes."""
+    if result is None:
+        return 0
+    if isinstance(result, bool):
+        return 0
+    if isinstance(result, int):
+        return max(result, 0)
+    if isinstance(result, dict):
+        for key in (
+            "rows_inserted",
+            "total_inserted",
+            "rows_written",
+            "rows_upserted",
+            "rows",
+            "records_inserted",
+            "records_written",
+            "articles_inserted",
+            "events_inserted",
+            "count",
+        ):
+            value = result.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int):
+                return max(value, 0)
+            if isinstance(value, (list, tuple, set)):
+                return len(value)
+        return 0
+    if isinstance(result, (list, tuple, set)):
+        return len(result)
+    return 0
 
 
 def _get_incremental_start(db_engine: Engine, source_name: str, overlap_days: int = 30) -> str:
@@ -139,15 +312,22 @@ def run_pull_group(
 
     pullers = _get_pullers_for_group(group_name, db_engine, config)
 
+    node_name = socket.gethostname()
+
     for puller_name, puller_instance, method_name, kwargs in pullers:
         # Skip blacklisted sources
-        if puller_name.lower() in {s.lower() for s in skip_sources}:
+        if _source_matches_skip(puller_name, puller_instance, skip_sources):
             log.info("Skipping {p} (blacklisted/cooldown)", p=puller_name)
             summary["results"].append({"puller": puller_name, "status": "SKIPPED", "reason": "blacklisted"})
             summary["skipped_count"] += 1
             continue
 
         try:
+            source_id, source_name = _resolve_source_catalog_entry(
+                db_engine,
+                puller_name,
+                puller_instance,
+            )
             if step_callback:
                 step_callback(puller_name)
             log.info("Running {p}.{m}()", p=puller_name, m=method_name)
@@ -156,10 +336,29 @@ def run_pull_group(
             resolved_kwargs = dict(kwargs)
             for k, v in resolved_kwargs.items():
                 if v == "incremental":
-                    resolved_kwargs[k] = _get_incremental_start(db_engine, puller_name)
+                    resolved_kwargs[k] = _get_incremental_start(
+                        db_engine,
+                        source_name or puller_name,
+                    )
 
             method = getattr(puller_instance, method_name)
-            result = method(**resolved_kwargs)
+            from ingestion.pull_context import PullContext
+
+            with PullContext(
+                db_engine,
+                puller_name,
+                source_id=source_id,
+                node_name=node_name,
+            ) as ctx:
+                result = method(**resolved_kwargs)
+                ctx.record_rows(_extract_rows_inserted(result))
+
+            _touch_source_catalog_last_pull(
+                db_engine,
+                source_id,
+                source_name,
+                puller_name,
+            )
             summary["results"].append({"puller": puller_name, "status": "SUCCESS", "result": result})
             summary["success_count"] += 1
             log.info("{p} complete", p=puller_name)
