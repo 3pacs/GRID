@@ -821,3 +821,14 @@
 2026-05-27 11:48:03 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 8f35b5009943e045 (EQIX CALL): wrong_signal
 2026-05-27 11:48:35 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 00e69493911fb111 (ECL CALL): wrong_signal
 2026-05-27 11:49:05 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction be61e59a47f5b53e (PSX PUT): external_shock
+2026-05-27 11:49:34 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 461702a8da17c7ed (PSX PUT): external_shock
+2026-05-27 11:50:27 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction e623f73b4491d39a (DE CALL): wrong_signal
+2026-05-27 11:51:19 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 18cadbbf69f9a80f (DE CALL): wrong_signal
+2026-05-27 11:52:05 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 1b896796ef54f36a (PM PUT): external_shock
+2026-05-27 11:52:55 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 0c3a9a1e51d5f8fe (PM PUT): external_shock
+2026-05-27 11:53:46 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 9184be9fe44c77af (CMG CALL): wrong_signal
+2026-05-27 11:54:15 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 56b367fdfa97749d (CCL CALL): wrong_signal
+2026-05-27 11:54:44 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 5254ceedc01acf44 (ASTS CALL): wrong_signal
+2026-05-27 11:55:14 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction eb501e4ae205faa2 (AON CALL): wrong_signal
+2026-05-27 11:55:44 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 633a9cc404680b63 (AMT CALL): wrong_signal
+2026-05-27 11:56:14 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 191849efcfb895a3 (ALNY CALL): wrong_signal
