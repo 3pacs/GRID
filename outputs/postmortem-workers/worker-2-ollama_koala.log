@@ -2307,3 +2307,18 @@ Failed to export span batch code: None, reason: HTTPConnectionPool(host='grid-sv
 2026-05-27 22:57:25 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d4d36b44d2457514 (EXC CALL): wrong_signal
 2026-05-27 22:57:53 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 7de87de6e6ee37f9 (NIO CALL): wrong_signal
 2026-05-27 22:58:22 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 5a0a4f16b7fff5bb (NIO CALL): wrong_signal
+2026-05-27 22:58:50 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b891f5e4db1c1719 (EXPE CALL): wrong_signal
+2026-05-27 22:59:19 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 40a45fc01c9b3bba (NOW CALL): wrong_signal
+2026-05-27 22:59:47 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction edf6316370041b2c (NOW CALL): wrong_signal
+2026-05-27 23:00:26 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 3fb790b070c60d33 (NOW CALL): wrong_signal
+2026-05-27 23:00:53 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 27603073a7ad688e (NOW CALL): wrong_signal
+2026-05-27 23:01:29 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 332d0faca45b1b21 (NOW CALL): wrong_signal
+2026-05-27 23:02:10 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 88c463be04118f9f (NOW CALL): wrong_signal
+2026-05-27 23:02:41 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction c84e23e6226edaa2 (NOW CALL): wrong_signal
+2026-05-27 23:03:13 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 62c68417d394c08d (RKLB PUT): right_signal_wrong_timing
+2026-05-27 23:03:47 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 179cc4fad7c625c2 (ED CALL): wrong_signal
+2026-05-27 23:04:20 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4a79089bc9b6797f (NRG CALL): wrong_signal
+2026-05-27 23:04:56 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4d5c5568548042da (NRG CALL): wrong_signal
+2026-05-27 23:04:59 | WARNING  | ollama.client:generate:264 — Ollama generate failed (3322ms): 500 Server Error: Internal Server Error for url: http://koala:11434/api/generate
+2026-05-27 23:04:59 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d6be2f21b9d9fcb3 (NRG CALL): wrong_signal
+2026-05-27 23:05:40 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 7a47ff7b86a038c5 (RKLB PUT): right_signal_wrong_timing
