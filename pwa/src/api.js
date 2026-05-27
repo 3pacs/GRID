@@ -600,6 +600,8 @@ class GRIDApi {
     async getPowerMap(sectorName) { return this._fetch(`/api/v1/intelligence/power-map/${encodeURIComponent(sectorName)}`); }
     async getEgoGraphSearch(q) { return this._fetch(`/api/v1/intelligence/ego-graph/search?q=${encodeURIComponent(q)}`); }
     async getEgoGraph(actorId, depth = 2, maxNodes = 80) { return this._fetch(`/api/v1/intelligence/ego-graph/${encodeURIComponent(actorId)}?depth=${depth}&max_nodes=${maxNodes}`); }
+    /** Cross-domain expansion for a ticker: supplier → causation → committee → member trades. */
+    async getIntelExpand(ticker) { return this._fetch(`/api/v1/intelligence/intel-expand/${encodeURIComponent(ticker)}`); }
     async getGrandPowerMap(limit = 50) { return this._fetch(`/api/v1/intelligence/grand-power-map?limit=${limit}`); }
     async getActorDetail(id) { return this._fetch(`/api/v1/intelligence/actor/${encodeURIComponent(id)}`); }
     async getActorNeighborhood(id, depth = 3, maxNodes = 2000) {
