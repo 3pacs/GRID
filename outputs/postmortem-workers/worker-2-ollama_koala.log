@@ -1923,3 +1923,15 @@
 2026-05-27 19:39:19 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 24d81ca8dc364264 (EQT CALL): wrong_signal
 2026-05-27 19:39:48 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction c264d69c387e3e72 (EQT CALL): wrong_signal
 2026-05-27 19:40:20 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction de62b3f3587d6823 (EQT CALL): wrong_signal
+2026-05-27 19:40:53 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 930b6bcad5f366fa (BP CALL): wrong_signal
+2026-05-27 19:41:24 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b57c6323b287a7da (EQT CALL): wrong_signal
+2026-05-27 19:41:53 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction ee06a153e2e7d53b (EQT CALL): wrong_signal
+2026-05-27 19:42:22 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b5be7bd06968a255 (BP CALL): wrong_signal
+2026-05-27 19:42:58 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction bbe41882189b8724 (ETHA CALL): wrong_signal
+2026-05-27 19:43:34 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction a3c112e7df883ebe (BX CALL): wrong_signal
+2026-05-27 19:43:59 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction afd054690a3df292 (ETN CALL): wrong_signal
+2026-05-27 19:44:30 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 98952e9ee7801da7 (ETN CALL): wrong_signal
+2026-05-27 19:45:06 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 56536138c63585ad (BX CALL): wrong_signal
+2026-05-27 19:45:31 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 62ba0b2abbd25a74 (ETN CALL): wrong_signal
+2026-05-27 19:46:02 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 506ccf56f12a2f32 (BX CALL): wrong_signal
+2026-05-27 19:46:36 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction f00065860b9f0151 (BX CALL): wrong_signal
