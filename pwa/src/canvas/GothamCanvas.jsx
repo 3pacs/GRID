@@ -774,24 +774,66 @@ export default function GothamCanvas() {
     // Community detection
     const { communities, communityColors, communityLabels } = useCommunities(graph, showCommunities);
 
+    // Resolve the ticker symbol for a node, if any (company/ticker nodes).
+    const _tickerForNode = useCallback((nodeType, nodeId, attrs = {}) => {
+        const data = attrs.data || {};
+        if (nodeType === 'ticker') return String(_canvasApiId('ticker', nodeId)).toUpperCase();
+        if (nodeType === 'company') {
+            const ticker = attrs.ticker || data.ticker;
+            return ticker ? String(ticker).toUpperCase() : null;
+        }
+        return null;
+    }, []);
+
+    // Fetch the typed cross-domain chain (supplier → causation → committee →
+    // member trades) for a ticker and merge it into an expansion payload.
+    const _mergeIntelExpand = useCallback(async (ticker, base) => {
+        if (!ticker) return base;
+        try {
+            const intel = await api.getIntelExpand(ticker);
+            if (!intel || intel.error) return base;
+            const baseNodes = base?.nodes || base?.new_nodes || [];
+            const baseEdges = base?.edges || base?.new_edges || [];
+            return {
+                nodes: [...baseNodes, ...(intel.nodes || [])],
+                edges: [...baseEdges, ...(intel.edges || [])],
+            };
+        } catch {
+            return base;
+        }
+    }, []);
+
     const expandCanvasNode = useCallback(async (nodeId, requestedType, depth = 1) => {
         if (!nodeId) return null;
         const attrs = _nodeAttrs(graph, nodeId);
         const nodeType = requestedType || attrs.nodeType || attrs.type || 'actor';
+        const ticker = _tickerForNode(nodeType, nodeId, attrs);
 
+        let result;
         if (boardId) {
-            const result = await api.expandCanvasNode(boardId, nodeId, depth);
-            if (result && !result.error) return result;
+            const boardResult = await api.expandCanvasNode(boardId, nodeId, depth);
+            if (boardResult && !boardResult.error) result = boardResult;
         }
 
-        const existingIds = [];
-        graph.forEachNode((id) => existingIds.push(id));
-        const legacyTarget = _legacyExpandTarget(nodeType, nodeId, attrs);
-        if (!legacyTarget) {
-            return { error: true, message: `Cannot expand ${nodeType} without a saved board.` };
+        if (!result) {
+            const existingIds = [];
+            graph.forEachNode((id) => existingIds.push(id));
+            const legacyTarget = _legacyExpandTarget(nodeType, nodeId, attrs);
+            if (!legacyTarget) {
+                // No structural expand available — still surface the typed chain
+                // for a ticker so the node isn't a dead end.
+                if (ticker) return _mergeIntelExpand(ticker, { nodes: [], edges: [] });
+                return { error: true, message: `Cannot expand ${nodeType} without a saved board.` };
+            }
+            result = await api.expandNode(legacyTarget.type, legacyTarget.id, depth, existingIds);
         }
-        return api.expandNode(legacyTarget.type, legacyTarget.id, depth, existingIds);
-    }, [boardId, graph]);
+
+        // Enrich ticker/company expansions with the cross-domain typed chain.
+        if (ticker && result && !result.error) {
+            return _mergeIntelExpand(ticker, result);
+        }
+        return result;
+    }, [boardId, graph, _tickerForNode, _mergeIntelExpand]);
 
     // Wire keyboard shortcuts
     useKeyboardShortcuts({
