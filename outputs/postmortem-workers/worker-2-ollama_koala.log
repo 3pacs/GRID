@@ -5285,3 +5285,17 @@ Failed to export span batch code: None, reason: HTTPConnectionPool(host='grid-sv
 2026-05-28 22:35:38 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction f961bc396c77b6f3 (CTVA PUT): right_signal_wrong_timing
 2026-05-28 22:36:10 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 0081c593c2f47438 (CTVA PUT): right_signal_wrong_timing
 2026-05-28 22:36:41 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 5acfc4429b1646b2 (CTVA PUT): right_signal_wrong_timing
+2026-05-28 22:37:15 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 9907e972db2e08d8 (CTVA PUT): right_signal_wrong_timing
+2026-05-28 22:37:48 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 7e48054d38c7ef2a (CVS PUT): external_shock
+2026-05-28 22:38:23 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction acf2d97ad7660a65 (SATS PUT): right_signal_wrong_timing
+2026-05-28 22:38:59 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 8b3f3ef96e32791e (XRT CALL): wrong_signal
+2026-05-28 22:39:30 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 8a9285c1103fc41f (XRT CALL): wrong_signal
+2026-05-28 22:40:00 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 0a6991d85380b1d5 (XRT CALL): wrong_signal
+2026-05-28 22:40:39 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 644cb77e8411a1fe (SATS PUT): right_signal_wrong_timing
+2026-05-28 22:41:09 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 8454da8f01bb286e (SBUX PUT): right_signal_wrong_timing
+2026-05-28 22:41:38 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction c351740f9abd240c (XRT CALL): wrong_signal
+2026-05-28 22:42:08 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 6c34570500bf492e (XRT CALL): wrong_signal
+2026-05-28 22:42:42 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 6dfa26b814043ccc (XRT CALL): wrong_signal
+2026-05-28 22:43:14 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 5f82374cf02b6aff (SBUX PUT): right_signal_wrong_timing
+2026-05-28 22:43:47 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 8167ee1e75eb2866 (XRT CALL): wrong_signal
+2026-05-28 22:44:13 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 3e3b39b8c9c54b94 (CVE PUT): wrong_signal
