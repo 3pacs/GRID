@@ -5420,3 +5420,17 @@ Failed to export span batch code: None, reason: HTTPConnectionPool(host='grid-sv
 2026-05-28 23:46:07 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 45ed94f1cadd9d81 (DDOG PUT): external_shock
 2026-05-28 23:46:34 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 38490938851b9f3c (IONQ PUT): wrong_signal
 2026-05-28 23:47:01 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 00a58750e1074b4a (IONQ PUT): wrong_signal
+2026-05-28 23:47:36 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4a199da8b411146f (IREN PUT): right_signal_wrong_timing
+2026-05-28 23:48:06 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 5979c91c75bf926a (IREN PUT): right_signal_wrong_timing
+2026-05-28 23:48:40 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 451bd5846913f240 (IREN PUT): right_signal_wrong_timing
+2026-05-28 23:49:09 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 03031bf578afa585 (APA PUT): external_shock
+2026-05-28 23:49:42 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d73d532599f1b9ba (APA PUT): external_shock
+2026-05-28 23:50:13 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 29af9e98090714fa (APA PUT): external_shock
+2026-05-28 23:50:44 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 0a0c6ea9fbab1201 (IREN PUT): right_signal_wrong_timing
+2026-05-28 23:51:13 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction f91fbe8b7bd9370f (IREN PUT): right_signal_wrong_timing
+2026-05-28 23:51:43 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction ec45e4e9f626defa (APA PUT): external_shock
+2026-05-28 23:52:19 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 658d32ff1e6c6cab (APA PUT): external_shock
+2026-05-28 23:52:50 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 25a2bfb02417a102 (IREN PUT): right_signal_wrong_timing
+2026-05-28 23:53:18 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b58ee5b0347f7087 (APA PUT): external_shock
+2026-05-28 23:53:52 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 01947dc97cb15983 (DELL PUT): external_shock
+2026-05-28 23:54:20 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction a865999a65f7cc6e (IREN PUT): right_signal_wrong_timing
