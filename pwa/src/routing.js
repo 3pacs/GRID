@@ -47,10 +47,10 @@ const TICKER_FOCUS_ROUTE_IDS = new Set([
 ]);
 
 export function parseHashRoute(hash = '') {
-    const raw = readHashPath(hash) || 'surfacer';
-    const [path = 'surfacer', search = ''] = raw.split('?');
+    const raw = readHashPath(hash) || 'ten-year';
+    const [path = 'ten-year', search = ''] = raw.split('?');
     const segments = path.split('/').filter(Boolean).map(safeDecode);
-    const route = segments[0] || 'surfacer';
+    const route = segments[0] || 'ten-year';
     const originView = readOriginView(search);
 
     if (route === 'login') {
