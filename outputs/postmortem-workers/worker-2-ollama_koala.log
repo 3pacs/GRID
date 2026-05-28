@@ -2503,3 +2503,15 @@ Failed to export span batch code: None, reason: HTTPConnectionPool(host='grid-sv
 2026-05-28 00:10:23 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction cd42e272bd4f7282 (APH CALL): wrong_signal
 2026-05-28 00:10:52 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction af08c942eaa0e550 (APH CALL): wrong_signal
 2026-05-28 00:11:21 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b4e7655eab2efd3d (APH CALL): wrong_signal
+2026-05-28 00:11:51 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction f7744e40a2a77195 (APH CALL): wrong_signal
+2026-05-28 00:12:20 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 98e49090a1f3a43b (APH CALL): wrong_signal
+2026-05-28 00:12:49 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction a9578177587503b7 (APH CALL): wrong_signal
+2026-05-28 00:13:16 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 5ae37eae737a28b7 (APH CALL): wrong_signal
+2026-05-28 00:13:57 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 87182415909f9a68 (ADI PUT): wrong_signal
+2026-05-28 00:14:45 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 7c2c1a89046b9a58 (AJG CALL): wrong_signal
+2026-05-28 00:15:23 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 5770db4b991590cc (AJG CALL): wrong_signal
+2026-05-28 00:15:52 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 3f65ffd4d3daf23f (AJG CALL): wrong_signal
+2026-05-28 00:16:27 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 845da962199a927c (AEM CALL): wrong_signal
+2026-05-28 00:17:03 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 382636079c34c113 (MDLZ PUT): wrong_signal
+2026-05-28 00:17:32 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b80ebc9963c89995 (AAL CALL): wrong_signal
+2026-05-28 00:17:49 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d99f5d9ea737eaf7 (AAL CALL): wrong_signal
