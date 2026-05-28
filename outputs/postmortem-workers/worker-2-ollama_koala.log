@@ -5056,3 +5056,15 @@ Failed to export span batch code: None, reason: HTTPConnectionPool(host='grid-sv
 2026-05-28 20:39:04 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 8fdad02c23d4c7a6 (XRT CALL): wrong_signal
 2026-05-28 20:39:34 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4aab5ab0ac8a16b6 (XRT CALL): wrong_signal
 2026-05-28 20:40:05 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b097ae7748ea9a5a (XRT CALL): wrong_signal
+2026-05-28 20:40:36 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 3650aa523a0c1d4f (XYZ CALL): wrong_signal
+2026-05-28 20:41:06 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction ba04e895211f1bf8 (XYZ CALL): wrong_signal
+2026-05-28 20:41:42 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction fc997ce16740fdfa (XYZ CALL): wrong_signal
+2026-05-28 20:42:08 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 45b61fe048a6e73a (XYZ CALL): wrong_signal
+2026-05-28 20:42:46 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 5e80029c6bd8deb1 (PDD CALL): wrong_signal
+2026-05-28 20:43:19 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 04ff4ffc1be429fc (PDD CALL): wrong_signal
+2026-05-28 20:43:49 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction c0a2a2c224bae545 (TER CALL): wrong_signal
+2026-05-28 20:44:21 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 65d9fb265ade0403 (TFC CALL): wrong_signal
+2026-05-28 20:44:53 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 2f140823b82fff8b (OXY PUT): right_signal_wrong_timing
+2026-05-28 20:45:25 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 3957d32a0aa35740 (PLD CALL): wrong_signal
+2026-05-28 20:45:55 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 5bd92c70efecd63e (UDOW CALL): wrong_signal
+2026-05-28 20:46:25 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 440ad7022d051723 (UDOW CALL): wrong_signal
