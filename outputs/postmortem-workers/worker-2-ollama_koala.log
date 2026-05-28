@@ -5186,3 +5186,16 @@ Failed to export span batch code: None, reason: HTTPConnectionPool(host='grid-sv
 2026-05-28 21:46:04 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction fe44e79e2a102d55 (TEL CALL): wrong_signal
 2026-05-28 21:46:40 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 508dc170b8ab6de4 (PDD CALL): wrong_signal
 2026-05-28 21:47:11 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction c7bdcdf6711ab7f5 (TER CALL): wrong_signal
+2026-05-28 21:47:42 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction c578161328db1ec3 (TER CALL): wrong_signal
+2026-05-28 21:48:13 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 75a388ce30b094f1 (PDD CALL): wrong_signal
+2026-05-28 21:48:46 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d6f15ff779a66889 (TER CALL): wrong_signal
+2026-05-28 21:49:25 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 66c620706905d362 (TER CALL): wrong_signal
+2026-05-28 21:49:58 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction be98ffe418a54109 (TER CALL): wrong_signal
+2026-05-28 21:50:31 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 18dd065bea9efe3b (TFC CALL): wrong_signal
+2026-05-28 21:51:01 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 6872ab3e17191011 (GOOG PUT): wrong_signal
+2026-05-28 21:51:38 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 67e290db6cb2ca9e (TFC CALL): wrong_signal
+2026-05-28 21:52:10 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction be7b46d5ce13bbff (TFC CALL): wrong_signal
+2026-05-28 21:52:37 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction ddafeab5eda64163 (TFC CALL): wrong_signal
+2026-05-28 21:53:13 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 62cb3bc09a8f9b6d (TFC CALL): wrong_signal
+2026-05-28 21:53:41 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 50128ad428dd8896 (TFC CALL): wrong_signal
+2026-05-28 21:54:20 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 583c0e07026ecf20 (TFC CALL): wrong_signal
