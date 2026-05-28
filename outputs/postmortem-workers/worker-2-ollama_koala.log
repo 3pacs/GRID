@@ -5274,3 +5274,14 @@ Failed to export span batch code: None, reason: HTTPConnectionPool(host='grid-sv
 2026-05-28 22:29:40 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 59a7367b755a8658 (CVS PUT): external_shock
 2026-05-28 22:30:12 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 939f0a7c27f50bed (CVS PUT): external_shock
 2026-05-28 22:30:47 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 1f82ab263f9eb72f (CVX PUT): right_signal_wrong_timing
+2026-05-28 22:31:18 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 85a02f1ec27d406d (CVX PUT): right_signal_wrong_timing
+2026-05-28 22:31:54 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 523c84ae04ce8df4 (CVX PUT): right_signal_wrong_timing
+2026-05-28 22:32:29 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 438936e20ca47ae5 (CVX PUT): right_signal_wrong_timing
+2026-05-28 22:33:01 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction e8f2a1cbf340e770 (RKLB PUT): right_signal_wrong_timing
+2026-05-28 22:33:27 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction c899072c85ddcc01 (CSX PUT): wrong_signal
+2026-05-28 22:33:57 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b47775c4f1c0ff53 (RKLB PUT): right_signal_wrong_timing
+2026-05-28 22:34:30 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction c7752cd37bacd9a8 (CTVA PUT): right_signal_wrong_timing
+2026-05-28 22:35:03 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 53876aab66bebb2a (RKLB PUT): right_signal_wrong_timing
+2026-05-28 22:35:38 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction f961bc396c77b6f3 (CTVA PUT): right_signal_wrong_timing
+2026-05-28 22:36:10 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 0081c593c2f47438 (CTVA PUT): right_signal_wrong_timing
+2026-05-28 22:36:41 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 5acfc4429b1646b2 (CTVA PUT): right_signal_wrong_timing
