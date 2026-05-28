@@ -3906,3 +3906,17 @@ Failed to export span batch code: None, reason: HTTPConnectionPool(host='grid-sv
 2026-05-28 11:53:32 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 71a0c8829b434ea1 (CVS PUT): external_shock
 2026-05-28 11:54:01 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 3d1704092f00009b (DDOG PUT): external_shock
 2026-05-28 11:54:34 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 447816d7ffaae0d0 (NIO CALL): wrong_signal
+2026-05-28 11:55:01 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 7c4a827f4b85f2b2 (CVS PUT): external_shock
+2026-05-28 11:55:35 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4b536bc17509481c (CVS PUT): external_shock
+2026-05-28 11:56:10 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 0ad43dcd7ab7dfc5 (O CALL): wrong_signal
+2026-05-28 11:56:44 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 88cf40984c99a421 (CVX PUT): right_signal_wrong_timing
+2026-05-28 11:57:04 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 6cf5b721b4b86bef (IONQ PUT): wrong_signal
+2026-05-28 11:57:32 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b2b7cdec568a08f8 (IREN PUT): right_signal_wrong_timing
+2026-05-28 11:58:05 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 949eaa983c2087c2 (HPE PUT): external_shock
+2026-05-28 11:58:32 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction c6022206b478f391 (CVX PUT): right_signal_wrong_timing
+2026-05-28 11:59:05 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction a9046b6abfb804ae (CVX PUT): right_signal_wrong_timing
+2026-05-28 11:59:35 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4589fcf5cabbda15 (HPE PUT): external_shock
+2026-05-28 12:00:04 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 89dd49d1338aa200 (CVX PUT): right_signal_wrong_timing
+2026-05-28 12:00:38 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 701af98cf1368236 (CVX PUT): right_signal_wrong_timing
+2026-05-28 12:01:06 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction ca52c6fb4c18fa1b (CVX PUT): right_signal_wrong_timing
+2026-05-28 12:01:33 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 2d3db7fef4751823 (CVX PUT): right_signal_wrong_timing
