@@ -3030,3 +3030,17 @@ Failed to export span batch code: None, reason: HTTPConnectionPool(host='grid-sv
 2026-05-28 04:36:48 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 9f70ba46edf49b69 (APLD PUT): wrong_signal
 2026-05-28 04:37:19 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 622bcdfd027e819c (PANW PUT): external_shock
 2026-05-28 04:37:46 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 0da65926ad48bbda (ADI PUT): wrong_signal
+2026-05-28 04:38:15 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d6a730053ba6e0fd (CVS PUT): external_shock
+2026-05-28 04:38:46 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 1e5f58afbc9e0fe6 (NVO PUT): right_signal_wrong_timing
+2026-05-28 04:39:16 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 81ceaa8c0789a773 (NVO PUT): right_signal_wrong_timing
+2026-05-28 04:39:44 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 0508871cc4343ccf (NVO PUT): right_signal_wrong_timing
+2026-05-28 04:40:13 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction cc2208e9befc0bc5 (NVO PUT): right_signal_wrong_timing
+2026-05-28 04:40:40 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4c7661bbc1fa2ddf (CL PUT): right_signal_wrong_timing
+2026-05-28 04:41:14 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b80f3e0ce0872c87 (DOW PUT): external_shock
+2026-05-28 04:41:41 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 82503fbafafbeb47 (NVO PUT): right_signal_wrong_timing
+2026-05-28 04:42:14 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 1a0c675c6f8dfde7 (NXPI PUT): external_shock
+2026-05-28 04:42:50 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b2a34b2677774f02 (NXPI PUT): external_shock
+2026-05-28 04:43:22 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction a948d91528f2fa6c (APA PUT): external_shock
+2026-05-28 04:43:50 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b2fa2d083f875289 (LIN PUT): wrong_signal
+2026-05-28 04:44:22 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 701458c08b5263b5 (NXPI PUT): external_shock
+2026-05-28 04:44:53 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d174947f15d7580d (NXPI PUT): external_shock
