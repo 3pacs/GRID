@@ -2970,3 +2970,16 @@ Failed to export span batch code: None, reason: HTTPConnectionPool(host='grid-sv
 2026-05-28 04:06:57 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 844cddee46c72f8f (MDLZ PUT): wrong_signal
 2026-05-28 04:06:59 | WARNING  | ollama.client:generate:264 — Ollama generate failed (2186ms): 500 Server Error: Internal Server Error for url: http://koala:11434/api/generate
 2026-05-28 04:06:59 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 04beaf3a650ef5c7 (MDLZ PUT): wrong_signal
+2026-05-28 04:07:41 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 431d1d64a14465e3 (HWM PUT): right_signal_wrong_timing
+2026-05-28 04:08:14 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 3fba36c1aa640e5e (FSLR PUT): external_shock
+2026-05-28 04:08:47 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 7d85bf1011b45cd8 (FSLR PUT): external_shock
+2026-05-28 04:09:19 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction cf5760a6eaeacaf6 (MU PUT): external_shock
+2026-05-28 04:09:45 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 9fbbb5c5c374fcbf (NVO PUT): right_signal_wrong_timing
+2026-05-28 04:10:22 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 3920948618cefb4e (FSLR PUT): external_shock
+2026-05-28 04:10:48 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 7a09df0f72362736 (CDNS PUT): external_shock
+2026-05-28 04:11:19 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction dc03b179330cc006 (FTNT PUT): external_shock
+2026-05-28 04:11:52 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 87edd758294f9d6c (DOW PUT): external_shock
+2026-05-28 04:12:27 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 2b2f333b21efe06a (LRCX PUT): right_signal_wrong_timing
+2026-05-28 04:12:56 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction c370ad8bb3469285 (LYB PUT): external_shock
+2026-05-28 04:13:28 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 02560d6d27c1a4f8 (FTNT PUT): external_shock
+2026-05-28 04:14:01 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b772c93ff58a7dee (MNST PUT): right_signal_wrong_timing
