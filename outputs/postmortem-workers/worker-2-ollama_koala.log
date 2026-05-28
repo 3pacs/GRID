@@ -3073,3 +3073,17 @@ Failed to export span batch code: None, reason: HTTPConnectionPool(host='grid-sv
 2026-05-28 04:57:41 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 9fa6b8d09c18b5d7 (SNDK PUT): wrong_signal
 2026-05-28 04:58:20 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d2079c3a8985877d (LYB PUT): external_shock
 2026-05-28 04:58:54 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 3ec6312d1fa3d661 (LYB PUT): external_shock
+2026-05-28 04:59:25 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction ae8fa6028cc29618 (ON PUT): external_shock
+2026-05-28 04:59:59 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction f2ee1ee68fc272b7 (LYB PUT): external_shock
+2026-05-28 05:00:33 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 2f9f9bf0fbb0758c (LYB PUT): external_shock
+2026-05-28 05:01:06 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 6a6731d4c467d072 (LYB PUT): external_shock
+2026-05-28 05:01:42 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 99fa50aae0e9b9be (TERN PUT): wrong_signal
+2026-05-28 05:02:18 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 51af8bf07c05b090 (ON PUT): external_shock
+2026-05-28 05:02:48 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 49263ea52d041d4e (ON PUT): external_shock
+2026-05-28 05:03:21 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 645d3a8dd800d4e3 (ORCL PUT): right_signal_wrong_timing
+2026-05-28 05:03:50 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction e588d24360f0a98c (CNQ PUT): wrong_signal
+2026-05-28 05:04:20 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 573ffc607925dde9 (ORCL PUT): right_signal_wrong_timing
+2026-05-28 05:04:49 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 28980b4c8c8bbd76 (LYV PUT): right_signal_wrong_timing
+2026-05-28 05:05:19 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4013b15700258942 (ORCL PUT): right_signal_wrong_timing
+2026-05-28 05:05:44 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 3631f779c0fbe33d (ORCL PUT): right_signal_wrong_timing
+2026-05-28 05:06:14 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction bc5c8dc5254ae840 (OXY PUT): right_signal_wrong_timing
