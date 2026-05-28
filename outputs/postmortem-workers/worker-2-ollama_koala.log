@@ -5343,3 +5343,16 @@ Failed to export span batch code: None, reason: HTTPConnectionPool(host='grid-sv
 2026-05-28 23:06:03 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 9596ffdc39fdb183 (SNPS PUT): external_shock
 2026-05-28 23:06:37 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction dd74da898bc9e071 (SNPS PUT): external_shock
 2026-05-28 23:07:14 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 04fc42d963065f2d (SNPS PUT): external_shock
+2026-05-28 23:07:46 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 5aa27461b1b4022f (PM PUT): external_shock
+2026-05-28 23:08:15 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 0b60b2b560aef9fd (DELL PUT): external_shock
+2026-05-28 23:08:48 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 197696106e110838 (APA PUT): external_shock
+2026-05-28 23:09:24 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b82d0a696b7ccbfc (EBAY PUT): right_signal_wrong_timing
+2026-05-28 23:09:56 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4d6b16015ce3b94c (APA PUT): external_shock
+2026-05-28 23:10:26 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 0ac2636b57125742 (APA PUT): external_shock
+2026-05-28 23:10:57 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction a88a7faf0c52afc9 (STX PUT): wrong_signal
+2026-05-28 23:11:32 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 9b5425b5eaf83062 (EBAY PUT): right_signal_wrong_timing
+2026-05-28 23:12:02 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 670db9c562a4b519 (STX PUT): wrong_signal
+2026-05-28 23:12:27 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction a4b6eb05ccd9f06b (STX PUT): wrong_signal
+2026-05-28 23:13:04 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction ab9a4955a6547666 (EBAY PUT): right_signal_wrong_timing
+2026-05-28 23:13:33 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 2b881dcabdf99ff1 (APLD PUT): wrong_signal
+2026-05-28 23:13:58 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4fac490d5c9e3ab2 (SNDK PUT): wrong_signal
