@@ -3044,3 +3044,17 @@ Failed to export span batch code: None, reason: HTTPConnectionPool(host='grid-sv
 2026-05-28 04:43:50 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b2fa2d083f875289 (LIN PUT): wrong_signal
 2026-05-28 04:44:22 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 701458c08b5263b5 (NXPI PUT): external_shock
 2026-05-28 04:44:53 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d174947f15d7580d (NXPI PUT): external_shock
+2026-05-28 04:45:19 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction e3f7cfae8a3361c0 (APLD PUT): wrong_signal
+2026-05-28 04:45:46 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction cabfc3613843250a (APLD PUT): wrong_signal
+2026-05-28 04:46:14 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction f3ef06575ee64347 (LIN PUT): wrong_signal
+2026-05-28 04:46:39 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 86179abb62160e2a (LIN PUT): wrong_signal
+2026-05-28 04:47:09 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4e0a65f80774b9a6 (MS PUT): wrong_signal
+2026-05-28 04:47:38 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 016ac8a5f4fd7ab8 (COP PUT): right_signal_wrong_timing
+2026-05-28 04:48:04 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction a224f544cb1e937d (LIN PUT): wrong_signal
+2026-05-28 04:48:32 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction f83bd71e640b4cb2 (OKE PUT): wrong_signal
+2026-05-28 04:49:00 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 3c6ca987465768cb (OKE PUT): wrong_signal
+2026-05-28 04:49:27 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction a49d54772bc2d28c (OKE PUT): wrong_signal
+2026-05-28 04:49:55 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 50d2c2e59a3bf23b (OKE PUT): wrong_signal
+2026-05-28 04:50:24 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 8348d97af5754bc5 (OKE PUT): wrong_signal
+2026-05-28 04:50:58 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction bf2904353a90b32d (OKE PUT): wrong_signal
+2026-05-28 04:51:30 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction eebc4c023fa70160 (MCHP PUT): external_shock
