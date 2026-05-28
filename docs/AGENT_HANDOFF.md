@@ -1,3 +1,14 @@
+## 2026-05-28 23:08 UTC — 2026-05-28-2308
+**Why this matters next run:** Line 46 is now DONE (PR #277). The 2026-05-17 api/ audit is down to ONE remaining unclaimed item — line 47 [P2] — plus the stale latent bug from 2026-05-26 still standing as an easy follow-up.
+
+- Shipped PUNCH-LIST [P2] line 46 (`clear_singletons()` cascade to `db._engine`) as **PR #277**. Added `db.clear_engine()` helper + routed `api.dependencies.clear_singletons()` through it. 5 regression tests in `tests/test_dependencies_clear_singletons.py` cover db._engine reset, dispose count, fresh-engine-on-next-call, dependent-store reset, and cold-state idempotency. Tests pass via `pytest --noconftest`; ruff clean.
+- **Companion bug spotted, NOT in this PR:** `astrogrid_api/dependencies.py:59` has its own `clear_singletons()` with the same shape — almost certainly has the same disposed-engine bug. Skipped because the PUNCH-LIST item names `api/dependencies.py:67` specifically and bundling violates the one-PR rule. Good standalone follow-up (~2 LOC, same pattern: `import db; db.clear_engine()`).
+- **Best clean next pick: line 47 [P2]** — f-string SQL in `api/routers/prediction_backtest.py:116` (`text(f"SELECT COUNT(*) FROM {table}")`). Currently safe because `table` comes from a hardcoded literal list, but rule-violation (`.claude/rules/security.md`). Switch to explicit per-table queries or an allowlist+validate helper like `api/routers/config.py:27`. Same file as PR #275 (now merged) but a separate function — no file-claim conflict.
+- **Watch for: PR #277 itself** — if a reviewer says the `import db` shadows the existing `from db import get_engine`, that's expected (and intentional — needed to reach `db.clear_engine`). It's a stylistic call; can be reworked to `from db import clear_engine as _clear_db_engine` if desired, but the current form is clearer about the cross-module coupling.
+- **Latent bug carried forward from 2026-05-26** (still unfixed): `system.py::freshness()` (~line 422-426) attaches `stale_sources` to `resp.dict()` but the `response_model=FreshnessResponse` filters it out before serialization — frontend never sees `stale_sources`. Real fix: add the field to the model or drop `response_model`. Still a good ~5 LOC follow-up PR.
+- **Env note (confirmed this run):** `pip install --user sqlalchemy loguru pydantic pydantic-settings psycopg2-binary pandas numpy pytest ruff` is enough to run a dep-injection test like `test_dependencies_clear_singletons.py` via `pytest --noconftest` (`tests/conftest.py` pulls in too much). Total install ~30s. No `cffi` panic this run — only the cryptography panic hits when `api.auth` is imported, which this test avoids.
+
+---
 ## 2026-05-27 23:23 UTC — 2026-05-27-2309
 **Why this matters next run:** line 45 is now DONE; the next top-down P1 (line 42 `intel_search`) is double-blocked — don't pick it.
 - Shipped PUNCH-LIST line 45 [P1] (`prediction_backtest.py` `get_engine`→`get_db_engine`, all 4 Depends sites) as **PR #275**, plus a static wiring regression `tests/test_prediction_backtest_engine_dep.py` (3 tests, pass via `pytest --noconftest`; ruff clean).
@@ -84,33 +95,3 @@ Other unclaimed 2026-05-17 audit items worth noting:
 **Env (unchanged from 2026-05-15 handoff, all still true):** no python deps preinstalled (`pip install pytest fastapi loguru sqlalchemy pydantic ruff` ~ 30s); `gh` CLI absent — `mcp__github__*` only; `git push origin routine-bookkeeping` → HTTP 403, use `mcp__github__create_or_update_file` against that branch; `mcp__github__list_pull_requests` output exceeds tool-result token cap — use `search_pull_requests` with tighter scope.
 
 **Pattern that worked this run:** mocking `get_db_engine` via `monkeypatch.setattr(mod, "get_db_engine", lambda: <MagicMock>)` + a per-test `side_effect` list on `conn.execute` for count-then-search lets you regression-test the response envelope without PostgreSQL. Copy this pattern for the next four has_more PRs — it adds 3 tests in ~80 LOC and keeps them in the no-DB block of the existing test file.
-
----
-## 2026-05-15 23:02 UTC — 2026-05-15-2302
-**Why this matters next run:** Queue is STILL empty 24h after the 2026-05-14-2304 no-work. PUNCH-LIST-2026-05-13 is fully closed (#155-166 all merged), no new feed docs have landed, and the remaining oracle/engine.py architectural items (10-12, 2,793-LOC splits/refactors) need operator sign-off. Don't thrash — log no-work fast.
-
-> **2026-05-18 update:** This is now stale — the 2026-05-17 API audit landed in PR #190 after this entry was written and added 13 new items to PUNCH-LIST-2026-05-13.md. See the 2026-05-18-2303 entry above.
-
-Confirmed walk this run: TIER0 main HEAD `59e12375` (PR #173) is CI-green (Lint + claude-review + Frontend Build + Backend Tests all success). TIER1 `search_pull_requests author:app/openai-codex` returns 0 hits — the 3 `codex/*` branches (`agent-reporting-hub`, `astrogrid-dedup`, `edge-scanner-reload-guard`) have NO open PRs attached to them, so they aren't reviewable. TIER2/3 still no AUTO_IMPROVE/hermes/TOP docs. TIER4 PUNCH-LIST-2026-05-13 is fully closed except items 10-12 (architectural). TIER5/6 unchanged from 2026-05-14-2304.
-
-Open-PR landscape (10 total): #170-172 + #174-175 are 3pacs cherry-picks/fixes (operator owns these — DO NOT touch); #133-139 are dependabot. No routine-claimable items.
-
-**Carried-forward leave-alone list (still all true):** the standing `print()` → `log` fallback inside `intelligence/*.py` is EXHAUSTED — every remaining `print()` is in a `__main__` CLI block (verified 2026-05-14-2304); H9 mcp_server.py count is stale; DEV-NOTES H12 cache-dict migration items are also done.
-
-**Env (unchanged):** no Python deps preinstalled (`pip install pytest loguru sqlalchemy ruff`, ~30s-2min); `gh` CLI absent — `mcp__github__*` only; `git push origin routine-bookkeeping` → HTTP 403, use `create_or_update_file`; `mcp__github__list_pull_requests` output exceeds tool-result token cap — parse the saved tool-result file with python, or use `search_pull_requests` with a tighter scope.
-
----
-## 2026-05-14 23:24 UTC — 2026-05-14-2304
-**Why this matters next run:** The routine queue is empty AND the standing print()->log fallback is now exhausted too — do NOT re-scan `intelligence/*.py` for print conversions, it's all CLI output.
-
-> **2026-05-18 update:** API audit on 2026-05-17 added new work — see top entry. Other text below is still accurate context.
-
-No-work run. Walked all 7 tiers: TIER0 main-CI fix is claimed by branch `claude/fix-backend-tests-main-ci`; TIER1 no codex-authored PRs (the 3 `codex/*` branches have no open PR); TIER2/3 no AUTO_IMPROVE/hermes/TOP docs; TIER4 PUNCH-LIST-2026-05-13 is fully worked — items 1-9,13,14 → PRs #156-166; items 10-12 are architectural `oracle/engine.py` splits/refactors, file-claimed by #156/#166 and need operator sign-off; TIER5 TODO-DUP-WRITES is blocked on an operator product decision (Step 1 picks A/B/C) and TODO-DATA-AUDIT needs DB access this box does not have; TIER6 no labeled issues.
-
-**DEV-NOTES H10 print->log fallback is exhausted — verified, do not retry:** every remaining `print()` in `intelligence/*.py` sits inside an `if __name__ == "__main__"` CLI block (entity_resolver, rag, cross_reference, source_audit, sleuth, trust_scorer, market_diary all confirmed — legitimate CLI output, leave them). `ingestion/*.py` has zero non-CLI prints. `hypothesis_engine.py` still has 26 indented prints but is file-claimed by #155. Remaining print work would need a different dir (scripts/, dashboard.py, api/) — out of the handoff's intended scope and not clean routine material.
-
-**H9 DEV-NOTES counts are stale:** DEV-NOTES lists "mcp_server.py (24)" swallowed exceptions — checked, all 28 except-blocks there already `log.debug(...)` or `return {error}`. Not an H9 target. Don't trust DEV-NOTES H9 file counts without grepping the file first.
-
-**Bottom line:** unless #156/#157 have merged (and the operator has signed off on the engine.py split for items 10-12), or a fresh PUNCH-LIST / TOP / AUTO_IMPROVE doc has landed on main, expect another no-work. Log it fast — don't thrash hunting for cleanup.
-
-**Env (carried forward, all still true):** no python deps preinstalled (`pip install ...` as needed, ~30s-2min); `gh` CLI absent — MCP `mcp__github__*` only; `git push origin routine-bookkeeping` → 403, use `create_or_update_file`; `mcp__github__list_pull_requests` / `search_pull_requests` output exceeds the tool-result limit — parse the saved tool-result file with python, or scope the query tighter.
