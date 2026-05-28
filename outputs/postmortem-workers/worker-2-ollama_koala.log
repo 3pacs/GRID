@@ -3938,3 +3938,19 @@ Failed to export span batch code: None, reason: HTTPConnectionPool(host='grid-sv
 2026-05-28 12:08:41 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 663cef4bea43b899 (DOW PUT): external_shock
 2026-05-28 12:09:05 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 2baeaf012bf5debd (APLD PUT): wrong_signal
 2026-05-28 12:09:32 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 8bd6e5123bd4aa56 (OMC CALL): wrong_signal
+2026-05-28 12:09:58 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction a04d2a2d26b4f265 (OKE PUT): wrong_signal
+2026-05-28 12:10:30 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction ab25a04ae6f46e41 (OXY PUT): right_signal_wrong_timing
+2026-05-28 12:10:56 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction e764ced458abece5 (ADI PUT): wrong_signal
+2026-05-28 12:11:27 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 45fe2a925cbbf67c (ADI PUT): wrong_signal
+2026-05-28 12:12:07 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction a620f752f0c2a837 (LIN PUT): wrong_signal
+2026-05-28 12:12:36 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction e9698dacde760630 (MO PUT): external_shock
+2026-05-28 12:13:07 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 9d74a84ecf89cd74 (F PUT): right_signal_wrong_timing
+2026-05-28 12:13:34 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 81dda4ac35dbb8fa (ELV PUT): wrong_signal
+2026-05-28 12:13:37 | WARNING  | ollama.client:generate:264 — Ollama generate failed (2434ms): 500 Server Error: Internal Server Error for url: http://koala:11434/api/generate
+2026-05-28 12:13:37 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction a2670dd021e47353 (ELV PUT): wrong_signal
+2026-05-28 12:14:15 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 53c040605281f391 (EBAY PUT): right_signal_wrong_timing
+2026-05-28 12:14:42 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 74e9ca8d7c581045 (CVE PUT): wrong_signal
+2026-05-28 12:15:12 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d60aac14905d1557 (ASML PUT): right_signal_wrong_timing
+2026-05-28 12:15:43 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction bca63e03c5360e2f (HPE PUT): external_shock
+2026-05-28 12:16:16 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction a46d2819c25f2c61 (CRDO PUT): wrong_signal
+2026-05-28 12:16:44 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 37c588fb5c813c7f (MDLZ PUT): wrong_signal
