@@ -2482,3 +2482,24 @@ Failed to export span batch code: None, reason: HTTPConnectionPool(host='grid-sv
 2026-05-28 00:00:18 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 674fcfa2ecaae032 (AZN CALL): wrong_signal
 2026-05-28 00:00:21 | WARNING  | ollama.client:generate:264 — Ollama generate failed (3330ms): 500 Server Error: Internal Server Error for url: http://koala:11434/api/generate
 2026-05-28 00:00:21 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction cab841898c2c5acd (AZN CALL): wrong_signal
+2026-05-28 00:01:05 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 3d9a641c49b659df (OXY PUT): right_signal_wrong_timing
+2026-05-28 00:01:31 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4bd04ae30447c075 (AZN CALL): wrong_signal
+2026-05-28 00:02:02 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 73b8768bc904365a (HPE PUT): external_shock
+2026-05-28 00:02:36 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 4dffe47dfae542ba (ASTS CALL): wrong_signal
+2026-05-28 00:03:07 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 0143f1bc15a44fae (ASTS CALL): wrong_signal
+2026-05-28 00:03:40 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 5a9c1f9006781c70 (ASTS CALL): wrong_signal
+2026-05-28 00:04:07 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 7d54dfdbdbea0f4c (ASTS CALL): wrong_signal
+2026-05-28 00:04:43 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 78214fe130b216ed (VLO PUT): external_shock
+2026-05-28 00:05:16 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 45aacbfa61fc6b40 (DOW PUT): external_shock
+2026-05-28 00:05:46 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 3611779680c06b42 (IONQ PUT): wrong_signal
+2026-05-28 00:06:15 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 834b6c035f71e144 (IONQ PUT): wrong_signal
+2026-05-28 00:06:53 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 803478d33029d8dc (HWM PUT): right_signal_wrong_timing
+2026-05-28 00:07:23 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 612c17a8520e935f (DDOG PUT): external_shock
+2026-05-28 00:07:55 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 8692fff3a8a1e235 (CVS PUT): external_shock
+2026-05-28 00:08:27 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction f8b722ccc458ea81 (DELL PUT): external_shock
+2026-05-28 00:08:55 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction a60f29bfff29e395 (BE PUT): external_shock
+2026-05-28 00:09:25 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 77a6bdce41fb4859 (APH CALL): wrong_signal
+2026-05-28 00:09:51 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction e6b574c72b77b1f5 (APH CALL): wrong_signal
+2026-05-28 00:10:23 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction cd42e272bd4f7282 (APH CALL): wrong_signal
+2026-05-28 00:10:52 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction af08c942eaa0e550 (APH CALL): wrong_signal
+2026-05-28 00:11:21 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction b4e7655eab2efd3d (APH CALL): wrong_signal
