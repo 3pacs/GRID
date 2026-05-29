@@ -5612,3 +5612,17 @@ Failed to export span batch code: None, reason: HTTPConnectionPool(host='grid-sv
 2026-05-29 01:24:10 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction c2698e5dfbbb5a70 (VALE CALL): wrong_signal
 2026-05-29 01:24:36 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction bcad8f203488e12b (VEA CALL): wrong_signal
 2026-05-29 01:25:02 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 5f11e442c4caef09 (VEA CALL): wrong_signal
+2026-05-29 01:25:35 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 5737c2aa4849538f (VEA CALL): wrong_signal
+2026-05-29 01:26:07 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction ad5654682ddca2f4 (VEA CALL): wrong_signal
+2026-05-29 01:26:36 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 7ed7e9f6875bd6f6 (VEA CALL): wrong_signal
+2026-05-29 01:27:04 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d3af18baa1a76a74 (VEA CALL): wrong_signal
+2026-05-29 01:27:34 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction ec642b4b87623006 (VEA CALL): wrong_signal
+2026-05-29 01:28:05 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 7f71ed899af4d8fd (VGT CALL): wrong_signal
+2026-05-29 01:28:33 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 09a2efa8bb4ca70f (VGT CALL): wrong_signal
+2026-05-29 01:29:08 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 8468f4da531d5cda (XRT CALL): wrong_signal
+2026-05-29 01:29:35 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction e4696b833bf40071 (XRT CALL): wrong_signal
+2026-05-29 01:30:06 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction e42b07c51aa06492 (XRT CALL): wrong_signal
+2026-05-29 01:30:39 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction ad407875330e8305 (BE PUT): external_shock
+2026-05-29 01:31:16 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction d4d47a22bb369c5e (BE PUT): external_shock
+2026-05-29 01:31:47 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 76a0b2c0d2fdd9c4 (BE PUT): external_shock
+2026-05-29 01:32:23 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 1c8fd14d7f420ff7 (BE PUT): external_shock
