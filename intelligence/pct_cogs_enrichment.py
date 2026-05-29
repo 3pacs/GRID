@@ -204,7 +204,28 @@ def _call_ollama(cfg: dict[str, Any], prompt: str) -> str | None:
             )
             return None
         data = resp.json()
-        return (data.get("response") or "").strip() or None
+        output = (data.get("response") or "").strip() or None
+        if output:
+            try:
+                from llm.feedback_loop import log_llm_call
+
+                log_llm_call(
+                    module="pct_cogs_enrichment",
+                    tier="extract",
+                    system_prompt=PROMPT_SYSTEM[:2000],
+                    user_prompt=prompt[:2000],
+                    output=output[:2000],
+                    context_tokens=data.get("prompt_eval_count", 0) or 0,
+                    output_tokens=data.get("eval_count", 0) or 0,
+                    latency_ms=int(data.get("total_duration", 0) / 1_000_000)
+                    if data.get("total_duration") else 0,
+                    model=data.get("model", cfg["model"]),
+                    provider=cfg["name"],
+                    metadata={"endpoint": cfg["url"], "kind": cfg["kind"]},
+                )
+            except Exception:
+                pass
+        return output
     except Exception as exc:
         log.debug("ollama {m} call failed: {e}", m=cfg["model"], e=str(exc))
         return None
@@ -231,6 +252,26 @@ def _call_llamacpp_text(cfg: dict[str, Any], prompt: str) -> str | None:
         if not choices:
             return None
         text_out = (choices[0].get("text") or "").strip()
+        if text_out:
+            try:
+                from llm.feedback_loop import log_llm_call
+
+                usage = data.get("usage", {}) if isinstance(data, dict) else {}
+                log_llm_call(
+                    module="pct_cogs_enrichment",
+                    tier="extract",
+                    system_prompt=PROMPT_SYSTEM[:2000],
+                    user_prompt=prompt[:2000],
+                    output=text_out[:2000],
+                    context_tokens=usage.get("prompt_tokens", 0) or 0,
+                    output_tokens=usage.get("completion_tokens", 0) or 0,
+                    latency_ms=0,
+                    model=data.get("model", cfg["model"]),
+                    provider=cfg["name"],
+                    metadata={"endpoint": cfg["url"], "kind": cfg["kind"]},
+                )
+            except Exception:
+                pass
         return text_out or None
     except Exception as exc:
         log.debug("llamacpp {m} call failed: {e}", m=cfg["model"], e=str(exc))
