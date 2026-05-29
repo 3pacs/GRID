@@ -234,8 +234,12 @@ class Settings(BaseSettings):
     LLAMACPP_ORACLE_ENABLED: bool = True
     LLAMACPP_ORACLE_TIMEOUT_SECONDS: int = 300
     LLAMACPP_ORACLE_CHAT_MODEL: str = "Qwen3-32B-Q4_K_M"
-    LLAMACPP_ORACLE_NUM_PREDICT: int = 15000
-    LLAMACPP_ORACLE_MIN_NUM_PREDICT: int = 15000
+    # Must fit inside LLAMACPP_ORACLE_TIMEOUT_SECONDS at the server's real
+    # throughput (~27 tok/s) or every full-length call orphans mid-generation
+    # and holds the single llama slot, bombarding the server. 6000 tok ~= 220s.
+    # min=0 drops the forced floor so short tasks finish fast. (.env overrides these)
+    LLAMACPP_ORACLE_NUM_PREDICT: int = 6000
+    LLAMACPP_ORACLE_MIN_NUM_PREDICT: int = 0
 
     # llama.cpp QUICK-tier remote server (redbox node — Qwen3-14B, Tailscale-reachable)
     LLAMACPP_QUICK_BASE_URL: str = "http://100.126.129.45:8080"
