@@ -1,3 +1,16 @@
+## 2026-05-29 23:10 UTC — 2026-05-29-2310
+**Why this matters next run:** TIER 1 burned on codex PR #276 review — don't re-review it. The standing PUNCH-LIST line 47 [P2] is still the best clean code pick, BUT the stale "PR #275 now merged" note in the 2026-05-28 handoff is wrong — #275 is still OPEN, so `prediction_backtest.py` remains file-claimed.
+
+- Posted COMMENT review on **PR #276** (`codex/ten-year-portfolio-landing-20260527`, opened 2026-05-28, 24 files +3141/-51, zero prior reviews). 0 CRITICAL, 3 HIGH, 3 MEDIUM, 3 LOW. The 3 HIGH are operator-actionable one-liners: (1) `openpyxl` missing from `requirements.txt` despite top-level import in `strategy/portfolio_workbook_plan.py:18` — fresh-deploy `ModuleNotFoundError`; (2) `api/routers/ten_year_portfolio.py:211-269` `/export.xlsx` GET handler has no `try/except` while sibling POST at :271 does; (3) `:183-185` `/weekly` returns raw `str(exc)` to client (violates `.claude/rules/security.md`). MEDIUM #4 is a PIT bypass to flag for the operator: `_load_price_history` reads `raw_series`/`resolved_series` directly anchored on `CURRENT_DATE` — fine for live UI, lookahead landmine if ever reused in a backtest.
+- **PR #275 status: still OPEN as of this run** (the 2026-05-28 handoff said "now merged" but it isn't). So PUNCH-LIST **line 47 [P2]** (f-string SQL in `api/routers/prediction_backtest.py:116`) is STILL file-blocked by #275's open diff. Either wait for #275 to merge, or pick a different item. If you do pick line 47, the conflict is mechanical (your edit hits the function body; #275 only touches `Depends()` signatures) — but the file-claim rule is conservative for a reason.
+- **Alternative clean picks (no file conflicts) if #275 hasn't merged:**
+   - **PUNCH-LIST line 52 [P2]** — viz smoke test (`api/routers/viz.py`, 9 unauth routes). Brand new test file, no existing file touched, tiny diff. Easiest available item.
+   - **Companion bug from 2026-05-28 handoff** — `astrogrid_api/dependencies.py:59` `clear_singletons()` has the same disposed-engine bug PR #277 just fixed in `api/dependencies.py`. ~2 LOC + matching test. Verify `astrogrid_api/` isn't touched by another open branch first.
+   - **2026-05-26 latent bug** — `system.py::freshness()` (~line 422-426) attaches `stale_sources` to `resp.dict()` but `response_model=FreshnessResponse` strips it before serialization. Add the field to the model or drop `response_model`. ~5 LOC.
+- **PRs #242, #243 are still parked drafts** — don't review (confirmed by 2026-05-25 handoff). Other codex/* branches (#233 already reviewed, #276 reviewed this run) are the only codex PRs visible in TIER 1.
+- **Env note (verified this run):** Direct `git push origin routine-bookkeeping` still fails (HTTP 403) — `mcp__github__push_files` against branch `routine-bookkeeping` works fine. `mcp__github__list_pull_requests` still exceeds tool-result token cap (26 open PRs → 154k chars); save-to-file + slice via python is the standard workaround.
+
+---
 ## 2026-05-28 23:08 UTC — 2026-05-28-2308
 **Why this matters next run:** Line 46 is now DONE (PR #277). The 2026-05-17 api/ audit is down to ONE remaining unclaimed item — line 47 [P2] — plus the stale latent bug from 2026-05-26 still standing as an easy follow-up.
 
