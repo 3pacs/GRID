@@ -5998,3 +5998,15 @@ Failed to export span batch code: None, reason: HTTPConnectionPool(host='grid-sv
 2026-05-29 02:50:28 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 7a2101f7def7363c (DUK CALL): wrong_signal
 2026-05-29 02:51:01 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction c3200985ebed1fac (O CALL): wrong_signal
 2026-05-29 02:51:30 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 81cf4c16a27485a3 (IJR CALL): wrong_signal
+2026-05-29 02:52:02 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction fa6a97ba05baf7f5 (O CALL): wrong_signal
+2026-05-29 02:52:28 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 0ca3d62eb4c7e9c5 (IJR CALL): wrong_signal
+2026-05-29 02:52:55 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 03509b470a04d79f (IJR CALL): wrong_signal
+2026-05-29 02:53:32 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction fe4a277d2ce3aa01 (ODFL CALL): wrong_signal
+2026-05-29 02:53:59 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 665b44518220eaa0 (ODFL CALL): wrong_signal
+2026-05-29 02:54:32 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction be7e903c8664fd30 (ECL CALL): wrong_signal
+2026-05-29 02:54:57 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 3593a84d1a70b206 (ECL CALL): wrong_signal
+2026-05-29 02:55:33 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 478527a54ee46e6b (ED CALL): wrong_signal
+2026-05-29 02:56:03 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction f46139cc3831cb3a (ISRG CALL): wrong_signal
+2026-05-29 02:56:35 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 8118d1800e870175 (ISRG CALL): wrong_signal
+2026-05-29 02:57:07 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction def2b23b521a01ba (OMC CALL): wrong_signal
+2026-05-29 02:57:39 | INFO     | intelligence.postmortem:generate_prediction_postmortem:425 — Post-mortem generated for prediction 8bd6bd3df38a604c (OMC CALL): wrong_signal
