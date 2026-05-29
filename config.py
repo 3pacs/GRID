@@ -157,12 +157,10 @@ class Settings(BaseSettings):
 
     # Remote Ollama nodes — added 2026-05-09. Each has its own URL +
     # default model so the LLM router can fan out across the cluster.
-    # Brought online by the operator: panda (2× P100 16GB Pascal hosting
-    # qwen2.5:32b) and ocr-node (2× 8GB Ampere hosting smaller models +
-    # vision). Each becomes a provider name `ollama_panda` / `ollama_ocr`
-    # in llm/router.py.
-    OLLAMA_PANDA_BASE_URL: str = "http://panda:11434"
-    OLLAMA_PANDA_ENABLED: bool = True
+    # panda is offline for the foreseeable future; keep this provider
+    # disabled by default and out of automatic fallback chains.
+    OLLAMA_PANDA_BASE_URL: str = ""
+    OLLAMA_PANDA_ENABLED: bool = False
     OLLAMA_PANDA_TIMEOUT_SECONDS: int = 240
     # Pascal P100 (sm_60) cannot use bf16 native, mxfp8 (sm_89+), or
     # nvfp4 (sm_120). Q4_K_M is the highest-quality quant available for
