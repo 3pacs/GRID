@@ -111,19 +111,19 @@ def _fallback_chain(tier: Tier, provider: str) -> list[str]:
         # z400 (RTX A2000 12GB / GTX 1660S 6GB, qwen2.5:7b-instruct) is
         # another cluster ollama node, added as a load-spreading fallback
         # 2026-05-13; gridz4 is overkill for LOCAL but still a fast fallback.
-        chain = ["llamacpp_quick", "ollama_koala", "ollama_ocr", "ollama_z400", "llamacpp_z4", "llamacpp", "gemma", "ollama", "ollama_panda", "openrouter", "openai"]
+        chain = ["llamacpp_quick", "ollama_koala", "ollama_ocr", "ollama_z400", "llamacpp_z4", "llamacpp", "gemma", "ollama", "openrouter", "openai"]
     elif tier == Tier.ORACLE:
         # gridz4 (Blackwell + Qwen3.6-35B-A3B Claude-Opus-distill) is now the
         # primary ORACLE node. grid-svr's Pascal P100+GTX1070 27B (`llamacpp_oracle`)
-        # demoted to fallback 2026-05-09. ollama_panda (qwen2.5:32b on 2×P100)
-        # is the next-strongest tier-3 fallback.
-        chain = ["llamacpp_z4", "llamacpp_oracle", "ollama_panda", "llamacpp", "gemma", "openrouter", "openai"]
+        # demoted to fallback 2026-05-09. panda is offline for the foreseeable
+        # future, so ORACLE fallback stays on live llama.cpp/cloud providers.
+        chain = ["llamacpp_z4", "llamacpp_oracle", "llamacpp", "gemma", "openrouter", "openai"]
     elif tier == Tier.BATCH:
-        chain = ["llamacpp_batch", "llamacpp_oracle", "llamacpp_z4", "ollama_panda", "openrouter", "openai"]
+        chain = ["llamacpp_batch", "llamacpp_oracle", "llamacpp_z4", "openrouter", "openai"]
     else:
         # REASON / DEFAULT — z400's qwen2.5:7b is a capable analysis-grade
         # fallback after the redbox/gridz4/koala/ocr nodes (added 2026-05-13).
-        chain = ["llamacpp_quick", "llamacpp_z4", "ollama_koala", "ollama_ocr", "ollama_z400", "llamacpp", "gemma", "ollama", "ollama_panda", "openrouter", "openai"]
+        chain = ["llamacpp_quick", "llamacpp_z4", "ollama_koala", "ollama_ocr", "ollama_z400", "llamacpp", "gemma", "ollama", "openrouter", "openai"]
     return [candidate for candidate in chain if candidate != provider]
 
 
@@ -304,10 +304,13 @@ def _create_ollama_panda_client(settings: Any) -> Any:
     """Ollama on the panda node (2× P100 16GB) — qwen2.5:32b."""
     if not getattr(settings, "OLLAMA_PANDA_ENABLED", False):
         return None
+    base_url = getattr(settings, "OLLAMA_PANDA_BASE_URL", "")
+    if not base_url:
+        return None
     try:
         from ollama.client import OllamaClient
         return OllamaClient(
-            base_url=getattr(settings, "OLLAMA_PANDA_BASE_URL", "http://panda:11434"),
+            base_url=base_url,
             model=getattr(settings, "OLLAMA_PANDA_CHAT_MODEL", "qwen2.5:32b"),
             timeout=getattr(settings, "OLLAMA_PANDA_TIMEOUT_SECONDS", 240),
         )

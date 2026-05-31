@@ -37,10 +37,10 @@ Run the tests once to confirm the env is sane: `python -m pytest tests/test_llm_
 
 From `config.py` (URLs are probably still valid; **hardware specs are stale**):
 
-| Host | Endpoint | Served today (all below bar except panda) |
+| Host | Endpoint | Served today |
 |---|---|---|
 | grid-svr | llama.cpp `:8081` | `Qwen3-32B` (3.0 < 3.6 → **below**) |
-| panda | ollama `panda:11434` | `qwen3.6:27b-q4_K_M` (**on bar**) |
+| panda | retired from GRID routing | down for the foreseeable future; do not target `panda:11434` |
 | ocr-node | ollama `ocr-node:11434` | `gemma3:12b` (below) |
 | koala | ollama `koala:11434` | `gemma3:12b` (below) |
 | z400 | ollama `z400:11434` | `qwen2.5:7b` (below) |
