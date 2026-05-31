@@ -1,128 +1,144 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { api } from '../api.js';
-import useStore from '../store.js';
-import { colors, tokens } from '../styles/shared.js';
+import { colors } from '../styles/shared.js';
+import { WidgetGrid } from '../components/home/widgets.jsx';
 
-const MONO = "'JetBrains Mono', 'IBM Plex Mono', monospace";
+const MONO = "'IBM Plex Mono', monospace";
 const SANS = "'IBM Plex Sans', -apple-system, sans-serif";
 
-function formatAnswer(text) {
-    return text.split('\n').map((line, i) => {
-        const isData = /^\s*([-*]|\w[\w\s]*:)/.test(line) && line.includes(':');
-        return (
-            <div key={i} style={isData ? { fontFamily: MONO, fontSize: '12px', color: colors.textDim } : undefined}>
-                {line || '\u00A0'}
-            </div>
-        );
-    });
-}
+const SUGGESTIONS = [
+    'Show me Apple and Tesla, and should I worry this week?',
+    "What's the market doing right now?",
+    'My watchlist and where the money is moving',
+    "What's happening with gold and bitcoin?",
+];
 
+/**
+ * stepdad.finance home page. Plain-language in → live dashboard out.
+ * The user describes what they want to see; /chat/compose returns a layout
+ * of widgets that each fetch their own data. Verdict cards reuse the full
+ * GRID synthesis pipeline (with the publishing firewall).
+ */
 export default function Home() {
-    const messages = useStore(s => s.chatMessages);
-    const addChatMessage = useStore(s => s.addChatMessage);
     const [input, setInput] = useState('');
+    const [layout, setLayout] = useState(null); // { spoken, widgets, allocation }
+    const [history, setHistory] = useState([]); // [{role, content}] for context
     const [loading, setLoading] = useState(false);
-    const messagesRef = useRef(null);
+    const [error, setError] = useState(null);
     const inputRef = useRef(null);
+    const topRef = useRef(null);
 
-    useEffect(() => {
-        if (messagesRef.current) {
-            messagesRef.current.scrollTop = messagesRef.current.scrollHeight;
-        }
-    }, [messages, loading]);
+    useEffect(() => { inputRef.current?.focus(); }, [layout]);
 
-    useEffect(() => { inputRef.current?.focus(); }, []);
-
-    const send = useCallback(async (text) => {
-        const q = (text || input).trim();
+    const compose = useCallback(async (text) => {
+        const q = (text ?? input).trim();
         if (!q || loading) return;
         setInput('');
-        addChatMessage({ role: 'user', content: q });
+        setError(null);
         setLoading(true);
+        const nextHistory = [...history, { role: 'user', content: q }];
         try {
-            const history = messages.map(m => ({ role: m.role, content: m.content }));
-            const result = await api.askGRID(q, null, history);
-            addChatMessage({
-                role: 'assistant',
-                content: result.error ? `Error: ${result.message || 'Failed'}` : result.answer,
-                sources: result.sources_used || [],
-                confidence: result.confidence || 0,
-            });
+            const res = await api.compose(q, history);
+            if (res?.error) {
+                setError(res.message || 'Could not build that. Try rewording it.');
+            } else {
+                setLayout({
+                    spoken: res.spoken_reply || '',
+                    widgets: res.widgets || [],
+                    allocation: res.allocation || [],
+                });
+                setHistory([...nextHistory, { role: 'assistant', content: res.spoken_reply || '' }]);
+                topRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
         } catch (err) {
-            addChatMessage({ role: 'assistant', content: `Connection error: ${err.message}`, sources: [], confidence: 0 });
+            setError(`Connection problem: ${err.message}`);
         } finally {
             setLoading(false);
         }
-    }, [input, loading, messages]);
+    }, [input, loading, history]);
 
     const handleKeyDown = (e) => {
-        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); compose(); }
     };
 
-    const hasMessages = messages.length > 0;
+    const reset = () => { setLayout(null); setHistory([]); setError(null); setInput(''); };
+
+    const hasLayout = !!layout;
 
     return (
         <div style={S.page}>
-            {/* Centered state — logo + input */}
-            {!hasMessages && (
+            {/* ── Empty state: brand + big ask box ── */}
+            {!hasLayout && (
                 <div style={S.center}>
-                    <span style={S.logo}>GRID</span>
+                    <div style={S.brand}>
+                        <span style={S.brandStep}>stepdad</span><span style={S.brandDot}>.</span><span style={S.brandFin}>finance</span>
+                    </div>
+                    <div style={S.tagline}>Tell me what you want to see.</div>
+
                     <div style={S.boxWrap}>
                         <input
                             ref={inputRef}
                             style={S.box}
-                            placeholder="Ask anything..."
+                            placeholder="e.g. Show me Apple, Tesla, and tell me if I should worry…"
                             value={input}
                             onChange={e => setInput(e.target.value)}
                             onKeyDown={handleKeyDown}
                         />
-                        <button onClick={() => send()} disabled={!input.trim() || loading}
+                        <button onClick={() => compose()} disabled={!input.trim() || loading}
                             style={{ ...S.btn, opacity: (!input.trim() || loading) ? 0.35 : 1 }}>
-                            {loading ? '\u2026' : '\u2192'}
+                            {loading ? '…' : '→'}
                         </button>
                     </div>
+
+                    {error && <div style={S.error}>{error}</div>}
+
+                    <div style={S.suggestions}>
+                        {SUGGESTIONS.map((s, i) => (
+                            <button key={i} style={S.chip} onClick={() => compose(s)} disabled={loading}>
+                                {s}
+                            </button>
+                        ))}
+                    </div>
+                    {loading && <div style={S.building}>Building your page…</div>}
                 </div>
             )}
 
-            {/* Conversation state */}
-            {hasMessages && (
+            {/* ── Composed state: layout + bottom ask bar ── */}
+            {hasLayout && (
                 <>
-                    <div style={S.messages} ref={messagesRef}>
-                        {messages.map((msg, i) => {
-                            if (msg.role === 'user') {
-                                return <div key={i} style={S.msgUser}>{msg.content}</div>;
-                            }
-                            return (
-                                <div key={i} style={S.msgGrid}>
-                                    <div>{formatAnswer(msg.content)}</div>
-                                    {msg.sources?.length > 0 && (
-                                        <div style={S.sources}>
-                                            {msg.sources.map((s, j) => (
-                                                <span key={j} style={S.tag}>{s}</span>
-                                            ))}
-                                        </div>
-                                    )}
-                                </div>
-                            );
-                        })}
-                        {loading && (
-                            <div style={S.thinking}>
-                                <span style={S.thinkDot} /><span style={S.thinkDot} /><span style={S.thinkDot} />
+                    <div style={S.scroll}>
+                        <div ref={topRef} />
+                        <div style={S.header}>
+                            <button style={S.home} onClick={reset} title="Start over">
+                                <span style={S.brandStepSm}>stepdad</span><span style={S.brandDotSm}>.</span><span style={S.brandFinSm}>finance</span>
+                            </button>
+                        </div>
+                        {layout.spoken && <div style={S.spoken}>{layout.spoken}</div>}
+                        {layout.allocation?.length > 0 && (
+                            <div style={S.alloc}>
+                                {layout.allocation.map((a, i) => (
+                                    <span key={i} style={S.allocItem}>
+                                        {a.ticker}{a.weight ? ` ${Math.round(a.weight * 100)}%` : ''}
+                                    </span>
+                                ))}
                             </div>
                         )}
+                        <WidgetGrid widgets={layout.widgets} />
+                        {error && <div style={S.error}>{error}</div>}
                     </div>
+
                     <div style={S.bottomBar}>
                         <input
                             ref={inputRef}
                             style={S.boxSmall}
-                            placeholder="Follow up..."
+                            placeholder="Change it — ask for something else…"
                             value={input}
                             onChange={e => setInput(e.target.value)}
                             onKeyDown={handleKeyDown}
                         />
-                        <button onClick={() => send()} disabled={!input.trim() || loading}
+                        <button onClick={() => compose()} disabled={!input.trim() || loading}
                             style={{ ...S.btnSmall, opacity: (!input.trim() || loading) ? 0.35 : 1 }}>
-                            {'\u2192'}
+                            {loading ? '…' : '→'}
                         </button>
                     </div>
                 </>
@@ -132,157 +148,67 @@ export default function Home() {
 }
 
 const S = {
-    page: {
-        display: 'flex',
-        flexDirection: 'column',
-        height: '100vh',
-        width: '100%',
-    },
+    page: { display: 'flex', flexDirection: 'column', height: '100vh', width: '100%' },
     center: {
-        flex: 1,
-        display: 'flex',
-        flexDirection: 'column',
-        alignItems: 'center',
-        justifyContent: 'center',
-        gap: '32px',
-        padding: '20px',
+        flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center',
+        justifyContent: 'center', gap: '20px', padding: '20px', maxWidth: '640px',
+        margin: '0 auto', width: '100%',
     },
-    logo: {
-        fontFamily: MONO,
-        fontSize: '42px',
-        fontWeight: 800,
-        letterSpacing: '10px',
-        color: colors.accent,
-    },
+    brand: { fontFamily: MONO, fontSize: '34px', fontWeight: 800, letterSpacing: '-0.5px' },
+    brandStep: { color: colors.text },
+    brandDot: { color: colors.accent },
+    brandFin: { color: colors.accent },
+    tagline: { fontFamily: SANS, fontSize: '16px', color: colors.textDim, marginTop: '-8px' },
     boxWrap: {
-        display: 'flex',
-        width: '100%',
-        maxWidth: '560px',
-        gap: '0',
-        border: `1px solid ${colors.border}`,
-        borderRadius: '12px',
-        overflow: 'hidden',
-        background: colors.card,
+        display: 'flex', width: '100%', border: `1px solid ${colors.border}`,
+        borderRadius: '14px', overflow: 'hidden', background: colors.card,
     },
     box: {
-        flex: 1,
-        background: 'transparent',
-        border: 'none',
-        color: colors.text,
-        padding: '14px 18px',
-        fontSize: '15px',
-        fontFamily: SANS,
-        outline: 'none',
+        flex: 1, background: 'transparent', border: 'none', color: colors.text,
+        padding: '16px 18px', fontSize: '15px', fontFamily: SANS, outline: 'none',
     },
     btn: {
-        width: '52px',
-        background: colors.accent,
-        border: 'none',
-        color: '#fff',
-        fontSize: '18px',
-        cursor: 'pointer',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        transition: 'opacity 0.15s',
+        width: '56px', background: colors.accent, border: 'none', color: '#fff',
+        fontSize: '20px', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
     },
-    messages: {
-        flex: 1,
-        overflowY: 'auto',
-        padding: '20px',
-        maxWidth: '720px',
-        width: '100%',
-        margin: '0 auto',
-        display: 'flex',
-        flexDirection: 'column',
-        gap: '14px',
+    suggestions: { display: 'flex', flexWrap: 'wrap', gap: '8px', justifyContent: 'center' },
+    chip: {
+        fontFamily: SANS, fontSize: '13px', color: colors.textDim, background: colors.card,
+        border: `1px solid ${colors.border}`, borderRadius: '20px', padding: '8px 14px',
+        cursor: 'pointer', textAlign: 'left',
+    },
+    building: { fontFamily: SANS, fontSize: '14px', color: colors.textMuted },
+    error: { fontFamily: SANS, fontSize: '14px', color: colors.red, textAlign: 'center' },
+
+    scroll: {
+        flex: 1, overflowY: 'auto', padding: '20px', maxWidth: '1100px', width: '100%',
+        margin: '0 auto', display: 'flex', flexDirection: 'column', gap: '14px',
         WebkitOverflowScrolling: 'touch',
     },
-    msgUser: {
-        alignSelf: 'flex-end',
-        background: colors.accent,
-        color: '#fff',
-        borderRadius: '16px 16px 4px 16px',
-        padding: '10px 16px',
-        maxWidth: '75%',
-        fontSize: '14px',
-        fontFamily: SANS,
-        lineHeight: 1.5,
-    },
-    msgGrid: {
-        alignSelf: 'flex-start',
-        background: colors.card,
-        border: `1px solid ${colors.border}`,
-        color: colors.text,
-        borderRadius: '16px 16px 16px 4px',
-        padding: '14px 18px',
-        maxWidth: '88%',
-        fontSize: '14px',
-        fontFamily: SANS,
-        lineHeight: 1.65,
-    },
-    sources: {
-        marginTop: '10px',
-        display: 'flex',
-        gap: '4px',
-        flexWrap: 'wrap',
-    },
-    tag: {
-        fontSize: '9px',
-        fontFamily: MONO,
-        background: colors.bg,
-        color: colors.textDim,
-        padding: '2px 7px',
-        borderRadius: '3px',
-        border: `1px solid ${colors.border}`,
-    },
-    thinking: {
-        alignSelf: 'flex-start',
-        display: 'flex',
-        gap: '5px',
-        padding: '14px 18px',
-        background: colors.card,
-        border: `1px solid ${colors.border}`,
-        borderRadius: '16px 16px 16px 4px',
-    },
-    thinkDot: {
-        width: '7px',
-        height: '7px',
-        borderRadius: '50%',
-        background: colors.textMuted,
-        animation: 'chatPulse 1.4s ease-in-out infinite',
+    header: { display: 'flex', alignItems: 'center' },
+    home: { background: 'none', border: 'none', cursor: 'pointer', padding: 0, fontFamily: MONO, fontSize: '18px', fontWeight: 800 },
+    brandStepSm: { color: colors.text },
+    brandDotSm: { color: colors.accent },
+    brandFinSm: { color: colors.accent },
+    spoken: { fontFamily: SANS, fontSize: '17px', color: colors.text, lineHeight: 1.5, fontWeight: 500 },
+    alloc: { display: 'flex', flexWrap: 'wrap', gap: '8px' },
+    allocItem: {
+        fontFamily: MONO, fontSize: '12px', color: colors.accent, background: `${colors.accent}1A`,
+        border: `1px solid ${colors.accent}44`, borderRadius: '6px', padding: '3px 9px',
     },
     bottomBar: {
-        display: 'flex',
-        gap: '0',
-        padding: '10px 20px calc(10px + env(safe-area-inset-bottom, 0px))',
-        borderTop: `1px solid ${colors.border}`,
-        maxWidth: '720px',
-        width: '100%',
-        margin: '0 auto',
-        background: colors.bg,
+        display: 'flex', padding: '10px 20px calc(10px + env(safe-area-inset-bottom, 0px))',
+        borderTop: `1px solid ${colors.border}`, maxWidth: '1100px', width: '100%',
+        margin: '0 auto', background: colors.bg, gap: '0',
     },
     boxSmall: {
-        flex: 1,
-        background: colors.card,
-        border: `1px solid ${colors.border}`,
-        borderRadius: '10px 0 0 10px',
-        color: colors.text,
-        padding: '12px 16px',
-        fontSize: '14px',
-        fontFamily: SANS,
-        outline: 'none',
+        flex: 1, background: colors.card, border: `1px solid ${colors.border}`,
+        borderRadius: '10px 0 0 10px', color: colors.text, padding: '13px 16px',
+        fontSize: '14px', fontFamily: SANS, outline: 'none',
     },
     btnSmall: {
-        width: '48px',
-        background: colors.accent,
-        border: 'none',
-        borderRadius: '0 10px 10px 0',
-        color: '#fff',
-        fontSize: '16px',
-        cursor: 'pointer',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
+        width: '50px', background: colors.accent, border: 'none', borderRadius: '0 10px 10px 0',
+        color: '#fff', fontSize: '17px', cursor: 'pointer', display: 'flex',
+        alignItems: 'center', justifyContent: 'center',
     },
 };

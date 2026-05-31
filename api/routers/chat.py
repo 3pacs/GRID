@@ -264,6 +264,51 @@ class ChatAskResponse(BaseModel):
     sanity_warnings: list[str] | None = None  # Data integrity warnings
 
 
+# ── Compose: natural language → live dashboard layout ───────────────────
+# stepdad.finance home page. The user describes what they want to see (typed
+# or, later, spoken via Whisper) and the LLM assembles a layout from a fixed
+# catalog of widgets, each of which maps to an existing GRID data endpoint.
+
+class ComposeWidget(BaseModel):
+    """One card in the composed layout. `props` carries widget-specific
+    parameters (e.g. ticker, question). Kept permissive so the catalog can
+    grow without a schema migration; the router validates `type`."""
+    type: str = Field(..., max_length=40)
+    title: str = Field(default="", max_length=120)
+    props: dict[str, Any] = Field(default_factory=dict)
+
+
+class ComposeAllocationItem(BaseModel):
+    ticker: str = Field(..., max_length=15)
+    weight: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class ChatComposeRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=2000)
+    history: list[ChatMessage] = Field(default_factory=list, max_length=50)
+    session_id: str | None = Field(default=None, max_length=64)
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v):
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            return None
+        if not _SESSION_ID_RE.match(v):
+            raise ValueError("session_id must be alphanumeric or hyphen, max 64 chars")
+        return v
+
+
+class ChatComposeResponse(BaseModel):
+    spoken_reply: str
+    widgets: list[ComposeWidget]
+    allocation: list[ComposeAllocationItem] = Field(default_factory=list)
+    generated_at: str
+    model_used: str | None = None
+
+
 # ── Helpers: gather context from various GRID subsystems ────────────────
 
 def _get_db_engine():
@@ -1493,4 +1538,297 @@ async def _ask_grid_impl(
         sources_used=sources,
         confidence=confidence,
         generated_at=now.isoformat(),
+    )
+
+
+# ── Compose endpoint: NL → dashboard layout ─────────────────────────────
+
+# The widget catalog. Each entry: required prop keys + a one-line description
+# the planner LLM uses to choose widgets. To add a widget, add it here AND
+# register a matching component in the frontend widget registry.
+_WIDGET_CATALOG: dict[str, dict[str, Any]] = {
+    "verdict": {
+        "required": ["question"],
+        "desc": "GRID's plain-English call on a question. Use for 'what should I do', "
+                "'is X going up', 'should I worry'. props.question = the question to answer.",
+    },
+    "ticker_pulse": {
+        "required": ["ticker"],
+        "desc": "Price + signal snapshot for ONE ticker. props.ticker = symbol "
+                "(AAPL, TSLA, GLD for gold, BTC-USD for bitcoin). One card per ticker.",
+    },
+    "watchlist": {
+        "required": [],
+        "desc": "The user's full watchlist overview. Use for 'my stocks', 'my watchlist'.",
+    },
+    "macro_regime": {
+        "required": [],
+        "desc": "Overall market regime (risk-on/off). Use for 'the market', 'overall', 'macro'.",
+    },
+    "news": {
+        "required": [],
+        "desc": "Recent news momentum across the market. Use for 'what's happening', 'news'.",
+    },
+    "money_flow": {
+        "required": [],
+        "desc": "Where money is flowing across sectors. Use for 'flows', 'where's the money'.",
+    },
+}
+
+_MAX_COMPOSE_WIDGETS = 12
+
+
+def _compose_system_prompt() -> str:
+    """Build the planner prompt that maps a request to a widget layout."""
+    lines = [
+        f"- {name}: {spec['desc']}"
+        + (f" Required: {', '.join(spec['required'])}." if spec["required"] else "")
+        for name, spec in _WIDGET_CATALOG.items()
+    ]
+    catalog = "\n".join(lines)
+    return (
+        "You are the stepdad.finance layout planner. The user describes what they "
+        "want to see on their home page, in plain language. Turn it into a dashboard "
+        "layout by choosing widgets from the catalog below. You do NOT answer the "
+        "question yourself — you only build the layout; the widgets fetch their own data.\n\n"
+        f"WIDGET CATALOG:\n{catalog}\n\n"
+        "RULES:\n"
+        "- Pick the smallest set of widgets that satisfies the request. Order them by importance.\n"
+        "- One ticker_pulse per ticker mentioned. Map names to symbols (Apple→AAPL, gold→GLD, bitcoin→BTC-USD).\n"
+        "- If they ask for an opinion/decision/worry, include ONE verdict widget with a clear props.question.\n"
+        "- If they state holdings or weights (e.g. 'half in Apple'), fill `allocation` with {ticker, weight} (weights 0-1, sum ~1). Otherwise leave allocation empty.\n"
+        "- Give each widget a short human title (e.g. 'Apple', 'Should you worry this week?').\n"
+        "- `spoken_reply` is one warm, plain sentence confirming what you built. No jargon.\n\n"
+        "Respond with ONLY a JSON object, no markdown, no prose:\n"
+        '{"spoken_reply": "...", "widgets": [{"type": "...", "title": "...", "props": {...}}], '
+        '"allocation": [{"ticker": "...", "weight": 0.0}]}'
+    )
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    """Pull the first JSON object out of an LLM response, tolerating code
+    fences and surrounding prose. Returns None if nothing parses."""
+    import json
+
+    if not text:
+        return None
+    cleaned = text.strip()
+    # Strip ```json ... ``` fences if present.
+    if cleaned.startswith("```"):
+        cleaned = _re.sub(r"^```[a-zA-Z]*\n?", "", cleaned)
+        cleaned = _re.sub(r"\n?```$", "", cleaned).strip()
+    # Fast path.
+    try:
+        obj = json.loads(cleaned)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        pass
+    # Fallback: first balanced {...} span.
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end > start:
+        try:
+            obj = json.loads(cleaned[start : end + 1])
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def _validate_compose_layout(raw: dict[str, Any], question: str) -> tuple[
+    list[ComposeWidget], list[ComposeAllocationItem], str
+]:
+    """Coerce a raw planner dict into validated widgets/allocation, dropping
+    anything unknown or malformed. Always returns at least one widget so the
+    page is never blank — falls back to a verdict on the original question."""
+    widgets: list[ComposeWidget] = []
+    for item in (raw.get("widgets") or [])[:_MAX_COMPOSE_WIDGETS]:
+        if not isinstance(item, dict):
+            continue
+        wtype = str(item.get("type", "")).strip()
+        spec = _WIDGET_CATALOG.get(wtype)
+        if spec is None:
+            continue
+        props = item.get("props") if isinstance(item.get("props"), dict) else {}
+        # Required props present?
+        if any(not str(props.get(k, "")).strip() for k in spec["required"]):
+            continue
+        # Normalize tickers.
+        if "ticker" in props and isinstance(props["ticker"], str):
+            props["ticker"] = props["ticker"].strip().upper()
+        title = str(item.get("title", "")).strip()[:120]
+        widgets.append(ComposeWidget(type=wtype, title=title, props=props))
+
+    if not widgets:
+        widgets.append(
+            ComposeWidget(type="verdict", title="Your read", props={"question": question})
+        )
+
+    allocation: list[ComposeAllocationItem] = []
+    for item in (raw.get("allocation") or [])[:50]:
+        if not isinstance(item, dict):
+            continue
+        tkr = str(item.get("ticker", "")).strip().upper()
+        if not tkr or not _TICKER_RE.match(tkr):
+            continue
+        try:
+            weight = float(item.get("weight", 0.0))
+        except (TypeError, ValueError):
+            weight = 0.0
+        weight = max(0.0, min(1.0, weight))
+        allocation.append(ComposeAllocationItem(ticker=tkr, weight=weight))
+
+    spoken = str(raw.get("spoken_reply", "")).strip()[:500]
+    if not spoken:
+        spoken = "Here's what you asked for."
+    return widgets, allocation, spoken
+
+
+@router.post("/compose", response_model=ChatComposeResponse)
+async def compose_layout(
+    req: ChatComposeRequest,
+    token: str = Depends(require_auth),
+) -> ChatComposeResponse:
+    """Turn a plain-language request into a stepdad.finance dashboard layout.
+
+    The planner LLM only chooses widgets + params; each widget fetches its own
+    data on the frontend (verdict cards call /chat/ask, reusing the full
+    synthesis + firewall pipeline). On any failure we still return a usable
+    single-verdict layout so the page is never blank.
+    """
+    now = datetime.now(timezone.utc)
+    question = req.question.strip()
+
+    raw: dict[str, Any] | None = None
+    model_used: str | None = None
+
+    client, backend = _get_llm_client()
+    if client is not None:
+        try:
+            messages: list[dict[str, str]] = [
+                {"role": "system", "content": _compose_system_prompt()},
+            ]
+            for msg in req.history[-6:]:
+                messages.append(
+                    {"role": msg.role, "content": _sanitize_history_content(msg.content)}
+                )
+            messages.append({"role": "user", "content": question})
+            answer = client.chat(messages, temperature=0.2, num_predict=800)
+            raw = _extract_json_object(answer or "")
+            model_used = getattr(client, "model", backend)
+        except Exception as exc:
+            log.warning("Compose LLM failed, using fallback layout: {e}", e=str(exc))
+
+    if raw is None:
+        raw = {}
+
+    widgets, allocation, spoken = _validate_compose_layout(raw, question)
+
+    return ChatComposeResponse(
+        spoken_reply=spoken,
+        widgets=widgets,
+        allocation=allocation,
+        generated_at=now.isoformat(),
+        model_used=model_used,
+    )
+
+
+# ── Streaming verdict: token-by-token SSE for the stepdad.finance tile ──
+# Same synthesis prompt + live GRID context as /chat/ask, but streams the
+# primary model's tokens so the home verdict renders live instead of after
+# ~57s. The inline A/B Opus eval and the publishing firewall are intentionally
+# NOT run here — they need the full text and are for *published* claims; this
+# is a private read-only tile. Use /chat/ask for the firewalled path.
+
+def _sse(obj: dict) -> str:
+    import json
+    return f"data: {json.dumps(obj)}\n\n"
+
+
+def _stream_llm_tokens(messages: list[dict[str, str]], client):
+    """Yield SSE events streaming the LLM completion token-by-token."""
+    import json
+    import requests
+
+    base_url = getattr(client, "base_url", "").rstrip("/")
+    payload: dict[str, Any] = {
+        "model": getattr(client, "model", None),
+        "messages": messages,
+        "max_tokens": 2000,
+        "temperature": 0.3,
+        "stream": True,
+    }
+    try:
+        payload.update(client._extra_payload_fields())
+    except Exception:
+        pass
+    headers = {
+        "Authorization": f"Bearer {getattr(client, 'api_key', '')}",
+        "Content-Type": "application/json",
+    }
+    timeout = getattr(client, "timeout", 300)
+    try:
+        with requests.post(
+            f"{base_url}/chat/completions",
+            json=payload, headers=headers, stream=True, timeout=timeout,
+        ) as resp:
+            if resp.status_code >= 400:
+                yield _sse({"error": True, "message": f"LLM HTTP {resp.status_code}"})
+                return
+            for raw in resp.iter_lines(decode_unicode=True):
+                if not raw:
+                    continue
+                line = raw[6:] if raw.startswith("data: ") else raw
+                if line.strip() == "[DONE]":
+                    break
+                try:
+                    delta = json.loads(line)["choices"][0]["delta"].get("content", "")
+                except Exception:
+                    continue
+                if delta:
+                    yield _sse({"delta": delta})
+        yield _sse({"done": True})
+    except Exception as exc:
+        log.warning("Verdict stream failed: {e}", e=str(exc))
+        yield _sse({"error": True, "message": "stream interrupted"})
+
+
+@router.post("/ask/stream")
+async def ask_grid_stream(
+    req: ChatAskRequest,
+    token: str = Depends(require_auth),
+):
+    """Streaming sibling of /chat/ask for the stepdad.finance verdict tile.
+
+    Streams the same synthesis (same system prompt + live GRID context) as
+    Server-Sent Events so the verdict renders as it is written. Falls back to
+    a single rule-based chunk when no LLM is online.
+    """
+    from fastapi.responses import StreamingResponse
+
+    question = req.question.strip()
+    ticker = req.context_ticker.strip().upper() if req.context_ticker else None
+    context_text, sources = _build_context_block(question, ticker)
+
+    client, backend = _get_llm_client()
+
+    if client is None:
+        def _fallback():
+            answer = _build_rule_based_response(context_text, question, sources)
+            yield _sse({"delta": answer})
+            yield _sse({"done": True})
+        return StreamingResponse(_fallback(), media_type="text/event-stream")
+
+    system_content = _build_system_prompt()
+    if context_text:
+        system_content += f"\n\n## Current GRID Context\n\n{context_text}"
+    messages: list[dict[str, str]] = [{"role": "system", "content": system_content}]
+    for msg in req.history[-10:]:
+        messages.append({"role": msg.role, "content": _sanitize_history_content(msg.content)})
+    messages.append({"role": "user", "content": question})
+
+    return StreamingResponse(
+        _stream_llm_tokens(messages, client),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
