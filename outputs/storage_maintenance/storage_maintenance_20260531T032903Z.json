@@ -153,20 +153,20 @@
     {
       "error": null,
       "exists": true,
-      "free_bytes": 2676056424448,
+      "free_bytes": 2677183926272,
       "path": "/data",
       "total_bytes": 11904377847808,
-      "use_pct": 0.7752040082514053,
-      "used_bytes": 9228321423360
+      "use_pct": 0.775109295042667,
+      "used_bytes": 9227193921536
     },
     {
       "error": null,
       "exists": true,
-      "free_bytes": 9154709987328,
+      "free_bytes": 9155424247808,
       "path": "/mirror",
       "total_bytes": 17927372771328,
-      "use_pct": 0.4893445847252358,
-      "used_bytes": 8772662784000
+      "use_pct": 0.4893047428315512,
+      "used_bytes": 8771948523520
     }
   ],
   "gdelt": {
@@ -202,7 +202,7 @@
       "v2_translation.done": 1133693
     }
   },
-  "generated_at": "2026-05-31T03:41:16.476271+00:00",
+  "generated_at": "2026-05-31T03:29:03.674797+00:00",
   "ingest_plan": [
     {
       "action": "run_gdelt_parser_smoke",
