@@ -70,6 +70,7 @@ export default function Home() {
             {/* ── Empty state: brand + big ask box ── */}
             {!hasLayout && (
                 <div style={S.center}>
+                    <img src="/stepdad-mascot.png" alt="stepdad" style={S.mascot} />
                     <div style={S.brand}>
                         <span style={S.brandStep}>stepdad</span><span style={S.brandDot}>.</span><span style={S.brandFin}>finance</span>
                     </div>
@@ -154,6 +155,7 @@ const S = {
         justifyContent: 'center', gap: '20px', padding: '20px', maxWidth: '640px',
         margin: '0 auto', width: '100%',
     },
+    mascot: { width: 'auto', height: '132px', objectFit: 'contain', marginBottom: '-6px', filter: 'drop-shadow(0 6px 16px rgba(0,0,0,0.45))' },
     brand: { fontFamily: MONO, fontSize: '34px', fontWeight: 800, letterSpacing: '-0.5px' },
     brandStep: { color: colors.text },
     brandDot: { color: colors.accent },
