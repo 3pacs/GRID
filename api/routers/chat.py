@@ -1206,61 +1206,238 @@ def _build_rule_based_response(context_text: str, question: str, sources: list[s
 
 # ── Research chain — active investigation for user queries ─────────────
 
-def _research_chain(question: str, ticker: str | None) -> tuple[str, str]:
-    """Fire the Sleuth engine to actively investigate a user question.
+# How long a cached Sleuth finding stays fresh for chat purposes.
+# Intraday investigations (run by hermes every 6h) are stable enough for
+# a full trading day; there is no value in re-running the same LLM call
+# on every user chat request.
+_RESEARCH_CACHE_HOURS: int = 6
 
-    Creates an ad-hoc lead from the user's question, investigates it
-    (LLM + data), and returns synthesized findings. This turns the
-    chatbot from a passive context reader into an active researcher.
+# Maximum seconds to wait for a background investigation before detaching
+# and letting it finish asynchronously (result lands in the DB for the
+# next caller).
+_RESEARCH_BACKGROUND_TIMEOUT_S: float = 4.5
+
+
+def _fetch_cached_research(
+    question: str,
+    ticker: str | None,
+) -> tuple[str, str]:
+    """Query investigation_leads for a recent resolved lead that matches.
+
+    Matching strategy (pure SQL, no embedding model):
+    1. Ticker exact-match leads resolved in the last _RESEARCH_CACHE_HOURS h.
+    2. Keyword overlap: any word from the question appears in the lead question.
+    3. Fall back to the single most-recently-resolved lead as broad market context.
+
+    Returns (findings_text, source_label) or ("", "") on miss.
+    """
+    try:
+        from sqlalchemy import text as _sql
+        engine = _get_db_engine()
+        cutoff_expr = f"NOW() - INTERVAL '{_RESEARCH_CACHE_HOURS} hours'"
+
+        with engine.connect() as conn:
+            # 1. Ticker-specific recent resolved lead
+            if ticker:
+                row = conn.execute(_sql(
+                    "SELECT question, findings, hypotheses, follow_up_leads "
+                    "FROM investigation_leads "
+                    "WHERE status = 'resolved' "
+                    f"AND created_at >= {cutoff_expr} "
+                    "AND (question ILIKE :tpat OR evidence::text ILIKE :tpat) "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ), {"tpat": f"%{ticker}%"}).fetchone()
+                if row and row[1] and row[1] != "LLM unavailable — investigation deferred.":
+                    return _format_cached_lead(row), "sleuth/cache"
+
+            # 2. Keyword-overlap: extract meaningful words from question
+            import re as _re
+            _STOP = frozenset({
+                "the", "is", "are", "was", "how", "what", "why", "does",
+                "do", "did", "will", "can", "market", "stock", "price",
+                "ok", "good", "bad", "it", "in", "at", "to", "for",
+                "and", "or", "a", "an",
+            })
+            keywords = [
+                w for w in _re.findall(r"[a-z]{3,}", question.lower())
+                if w not in _STOP
+            ]
+            if keywords:
+                # Build a ILIKE OR chain for the top 4 keywords
+                kw_clauses = " OR ".join(
+                    f"question ILIKE :kw{i}" for i in range(min(4, len(keywords)))
+                )
+                kw_params: dict = {
+                    f"kw{i}": f"%{keywords[i]}%"
+                    for i in range(min(4, len(keywords)))
+                }
+                row = conn.execute(_sql(
+                    "SELECT question, findings, hypotheses, follow_up_leads "
+                    "FROM investigation_leads "
+                    "WHERE status = 'resolved' "
+                    f"AND created_at >= {cutoff_expr} "
+                    f"AND ({kw_clauses}) "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ), kw_params).fetchone()
+                if row and row[1] and row[1] != "LLM unavailable — investigation deferred.":
+                    return _format_cached_lead(row), "sleuth/cache"
+
+            # 3. Broadest fallback: most recent resolved lead as macro context
+            row = conn.execute(_sql(
+                "SELECT question, findings, hypotheses, follow_up_leads "
+                "FROM investigation_leads "
+                "WHERE status = 'resolved' "
+                f"AND created_at >= {cutoff_expr} "
+                "ORDER BY priority DESC, created_at DESC LIMIT 1"
+            )).fetchone()
+            if row and row[1] and row[1] != "LLM unavailable — investigation deferred.":
+                return _format_cached_lead(row), "sleuth/cache"
+
+    except Exception as exc:
+        log.debug("Research cache lookup failed: {e}", e=str(exc))
+
+    return "", ""
+
+
+def _format_cached_lead(row) -> str:
+    """Format a cached investigation_leads DB row into context text."""
+    import json as _json
+    lines = ["Research findings (cached):"]
+    lines.append(f"  Conclusion: {row[1]}")
+
+    hypotheses = row[2]
+    if isinstance(hypotheses, str):
+        try:
+            hypotheses = _json.loads(hypotheses)
+        except Exception:
+            hypotheses = []
+    if hypotheses and isinstance(hypotheses, list):
+        lines.append("  Hypotheses:")
+        for h in hypotheses[:3]:
+            if isinstance(h, dict):
+                lines.append(
+                    f"    - {h.get('hypothesis', '?')} "
+                    f"({h.get('confidence', '?')} confidence)"
+                )
+    return "\n".join(lines)
+
+
+def _fire_background_investigation(question: str, ticker: str | None) -> None:
+    """Launch a Sleuth investigation in a daemon thread.
+
+    Saves the result to investigation_leads so the next caller gets a cache hit.
+    Never blocks the calling request — any failure is logged at DEBUG level only.
+    """
+    import uuid as _uuid
+
+    def _run() -> None:
+        try:
+            from intelligence.sleuth import Sleuth, Lead
+            engine = _get_db_engine()
+            sleuth = Sleuth(engine)
+            _safe_question = question[:500]
+            lead = Lead(
+                id=f"chat-{_uuid.uuid4().hex[:12]}",
+                question=_safe_question,
+                category="connection_found" if ticker else "data_anomaly",
+                priority=0.9,
+                evidence=[{
+                    "source": "user_query",
+                    "ticker": ticker,
+                    "question": _safe_question,
+                }],
+            )
+            sleuth.investigate_lead(lead)
+            log.debug("Background research investigation completed for: {q}", q=_safe_question[:80])
+        except Exception as exc:
+            log.debug("Background research investigation failed: {e}", e=str(exc))
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+
+def _research_chain(question: str, ticker: str | None) -> tuple[str, str]:
+    """Return Sleuth research context for a user question.
+
+    Fast path (cache-first, target < 50ms):
+    1. Check investigation_leads for a recent resolved lead that matches the
+       question/ticker (keyword overlap, no embedding model needed).
+    2. On cache hit: return immediately — no LLM, no SentenceTransformer.
+    3. On cache miss: launch a background investigation (daemon thread) so the
+       DB gets populated for the next caller, then return ("", "") immediately.
+
+    The background thread may complete within _RESEARCH_BACKGROUND_TIMEOUT_S; if
+    so its result is included in this response. Otherwise it finishes after the
+    response has been sent and seeds the cache for subsequent requests.
+
+    Why this is still analytically valuable:
+    - Cached leads are produced by the same full Sleuth pipeline (LLM + RAG +
+      context_provider + data gathering) — the output quality is identical.
+    - Hermes runs daily_investigation every 6h, so the cache is continuously
+      warmed with fresh market-relevant findings.
+    - Per-request live investigations were creating LLM queue contention: the
+      same Qwen3.6-27B that answers the chat question was being asked to *also*
+      run a 1500-token investigation, doubling queue depth and causing 35-300s
+      latency. Cache-serving eliminates this self-competition.
 
     Returns (findings_text, source_label).
     """
-    try:
-        from intelligence.sleuth import Sleuth, Lead
-        engine = _get_db_engine()
-        sleuth = Sleuth(engine)
+    # Fast path: serve from cache
+    cached_text, cached_source = _fetch_cached_research(question, ticker)
+    if cached_text:
+        log.debug("Research chain: cache hit for question={q!r}", q=question[:60])
+        return cached_text, cached_source
 
-        # Create an ad-hoc lead from the user's question.
-        # Truncate user input at both the top-level question field and inside
-        # the evidence dict to prevent unbounded raw input from reaching Sleuth.
-        import uuid as _uuid
-        _safe_question = question[:500]
-        lead = Lead(
-            id=f"chat-{_uuid.uuid4().hex[:12]}",
-            question=_safe_question,
-            category="connection_found" if ticker else "data_anomaly",
-            priority=0.9,  # user queries are high priority
-            evidence=[{
-                "source": "user_query",
-                "ticker": ticker,
-                "question": _safe_question,
-            }],
-        )
+    # Cache miss: fire background investigation and wait briefly
+    log.debug("Research chain: cache miss — launching background investigation")
+    import uuid as _uuid
+    result_holder: list[tuple[str, str]] = []
 
-        # Investigate (LLM + data gathering + context)
-        investigated = sleuth.investigate_lead(lead)
+    def _run_and_capture() -> None:
+        try:
+            from intelligence.sleuth import Sleuth, Lead
+            engine = _get_db_engine()
+            sleuth = Sleuth(engine)
+            _safe_question = question[:500]
+            lead = Lead(
+                id=f"chat-{_uuid.uuid4().hex[:12]}",
+                question=_safe_question,
+                category="connection_found" if ticker else "data_anomaly",
+                priority=0.9,
+                evidence=[{
+                    "source": "user_query",
+                    "ticker": ticker,
+                    "question": _safe_question,
+                }],
+            )
+            investigated = sleuth.investigate_lead(lead)
+            if (
+                investigated.findings
+                and investigated.findings != "LLM unavailable — investigation deferred."
+            ):
+                result_holder.append((_format_cached_lead(
+                    (
+                        investigated.question,
+                        investigated.findings,
+                        investigated.hypotheses,
+                        investigated.follow_up_leads,
+                    )
+                ), "sleuth/investigation"))
+        except Exception as exc:
+            log.debug("Research chain background run failed: {e}", e=str(exc))
 
-        if investigated.findings and investigated.findings != "LLM unavailable — investigation deferred.":
-            lines = ["Research findings:"]
-            lines.append(f"  Conclusion: {investigated.findings}")
+    bg_thread = threading.Thread(target=_run_and_capture, daemon=True)
+    bg_thread.start()
+    bg_thread.join(timeout=_RESEARCH_BACKGROUND_TIMEOUT_S)
 
-            if investigated.hypotheses:
-                lines.append("  Hypotheses:")
-                for h in investigated.hypotheses[:3]:
-                    if isinstance(h, dict):
-                        lines.append(f"    - {h.get('hypothesis', '?')} ({h.get('confidence', '?')} confidence)")
+    if result_holder:
+        log.debug("Research chain: background investigation completed within budget")
+        return result_holder[0]
 
-            if investigated.follow_up_leads:
-                # Load follow-up questions for additional context
-                for fu_id in investigated.follow_up_leads[:2]:
-                    child = sleuth._load_lead(fu_id)
-                    if child:
-                        lines.append(f"  Follow-up: {child.question}")
-
-            return "\n".join(lines), "sleuth/investigation"
-    except Exception as exc:
-        log.debug("Research chain failed: {e}", e=str(exc))
-
+    # Background is still running (or failed fast) — return empty so
+    # _build_context_block is not held up. The thread will finish and
+    # persist the lead to the DB for the next caller.
+    log.debug("Research chain: background investigation still running — returning empty")
     return "", ""
 
 
