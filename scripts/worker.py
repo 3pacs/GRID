@@ -495,12 +495,35 @@ def run_llm_inference(params):
     )
     r.raise_for_status()
     data = r.json()
+    response_text = data.get("response", "")
+    try:
+        from llm.feedback_loop import log_llm_call
+
+        log_llm_call(
+            module="grid_worker.llm_inference",
+            tier="worker",
+            system_prompt=system_prompt[:2000],
+            user_prompt=prompt[:2000],
+            output=response_text[:2000],
+            context_tokens=data.get("prompt_eval_count", 0) or 0,
+            output_tokens=data.get("eval_count", 0) or 0,
+            latency_ms=int(data.get("total_duration", 0) / 1_000_000)
+            if data.get("total_duration") else 0,
+            model=model,
+            provider="ollama",
+            metadata={
+                "endpoint": "http://localhost:11434/api/generate",
+                "requested_model": requested_model,
+            },
+        )
+    except Exception:
+        pass
 
     return {
         "output": {
             "model": model,
             "requested_model": requested_model,
-            "response": data.get("response", ""),
+            "response": response_text,
             "done": data.get("done", False),
         },
         "metrics": {

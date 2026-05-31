@@ -5,7 +5,7 @@ import { create } from 'zustand';
 
 const useUiStore = create((set) => ({
     theme: localStorage.getItem('grid_theme') || 'dark',
-    activeView: 'surfacer',
+    activeView: 'ten-year',
     loading: {},
     errors: {},
     notifications: [],

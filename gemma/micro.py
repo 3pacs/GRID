@@ -216,6 +216,28 @@ class GemmaMicroClient:
                 name=self.config.name,
                 l=latency_ms,
             )
+            try:
+                from llm.feedback_loop import log_llm_call
+
+                usage = data.get("usage", {}) if isinstance(data, dict) else {}
+                log_llm_call(
+                    module=f"gemma_micro.{self.config.name}",
+                    tier="micro",
+                    system_prompt=self.config.system_prompt[:2000],
+                    user_prompt=input_text[:2000],
+                    output=(content or "")[:2000],
+                    context_tokens=usage.get("prompt_tokens", 0) or 0,
+                    output_tokens=usage.get("completion_tokens", 0) or 0,
+                    latency_ms=int(latency_ms),
+                    model=data.get("model", self.config.model),
+                    provider="gemma_micro",
+                    metadata={
+                        "endpoint": self.config.base_url,
+                        "micro_model": self.config.name,
+                    },
+                )
+            except Exception:
+                pass  # never let observability break micro inference
             return content
 
         except Exception as exc:

@@ -117,7 +117,6 @@ _KNOWN_ENDPOINTS: tuple[tuple[str, str, str, str, str, str], ...] = (
     ("grid-svr-llamacpp", "LLAMACPP_BASE_URL", "LLAMACPP_CHAT_MODEL", "grid-svr", "llamacpp", "chat"),
     ("grid-svr-llamacpp-oracle", "LLAMACPP_ORACLE_BASE_URL", "LLAMACPP_CHAT_MODEL", "grid-svr", "llamacpp", "oracle"),
     ("ollama-local", "OLLAMA_BASE_URL", "OLLAMA_CHAT_MODEL", "grid-svr", "ollama", "chat"),
-    ("ollama-panda", "OLLAMA_PANDA_BASE_URL", "OLLAMA_PANDA_CHAT_MODEL", "panda", "ollama", "chat"),
     ("ollama-ocr", "OLLAMA_OCR_BASE_URL", "OLLAMA_OCR_CHAT_MODEL", "ocr-node", "ollama", "chat"),
     ("ollama-koala", "OLLAMA_KOALA_BASE_URL", "OLLAMA_KOALA_CHAT_MODEL", "koala", "ollama", "chat"),
     ("ollama-z400", "OLLAMA_Z400_BASE_URL", "OLLAMA_Z400_CHAT_MODEL", "z400", "ollama", "chat"),

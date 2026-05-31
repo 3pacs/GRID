@@ -1,8 +1,8 @@
 # GRID Module Inventory
 
-Generated: 2026-05-27
-Total modules: 754
-Total LOC: 333,190
+Generated: 2026-05-28
+Total modules: 755
+Total LOC: 333,729
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycache__/`, `build/`, `dist/`, `docs/`, `node_modules/`, `notebooks/`, `pwa/`, `pwa_dist/`, `tests/`, `venv/`.
@@ -12,8 +12,8 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 | Directory | Module count | LOC |
 |---|---|---|
 | `intelligence/` | 173 | 103,324 |
-| `ingestion/` | 208 | 86,546 |
-| `api/` | 107 | 48,851 |
+| `ingestion/` | 208 | 86,793 |
+| `api/` | 108 | 49,143 |
 | `analysis/` | 33 | 18,973 |
 | `trading/` | 34 | 14,178 |
 | `oracle/` | 30 | 10,690 |
@@ -1322,7 +1322,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Functions:** `FXRatesPuller`
 **Reads:** `__future__`, `api`, `datetime`, `ingestion`, `loguru`, `pandas`, `sqlalchemy`, `typing`, `yfinance`
 
-#### `ingestion/altdata/gdelt.py` — 744 LOC
+#### `ingestion/altdata/gdelt.py` — 750 LOC
 **Docstring:** GRID GDELT news event data ingestion module.
 **Functions:** `GDELTPuller`
 **Reads:** `__future__`, `datetime`, `ingestion`, `io`, `loguru`, `os`, `pandas`, `requests`, `sqlalchemy`, `tenacity`, `time`, `typing`, `zipfile`
@@ -2034,16 +2034,17 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `datetime`, `ingestion`, `loguru`, `requests`, `sqlalchemy`, `typing`
 **Imported by:** `ingestion/scheduler.py`
 
-#### `ingestion/price_fallback.py` — 155 LOC
+#### `ingestion/price_fallback.py` — 196 LOC
 **Docstring:** Backup price data puller — runs when yfinance is unreliable.
 **Functions:** `PriceFallbackPuller`
 **Reads:** `__future__`, `datetime`, `loguru`, `os`, `requests`, `sqlalchemy`, `time`, `typing`
 **Imported by:** `ingestion/scheduler.py`, `intelligence/post_query_scanner.py`, `intelligence/scheduler.py`
 
-#### `ingestion/pull_context.py` — 320 LOC
+#### `ingestion/pull_context.py` — 321 LOC
 **Docstring:** GRID — Pull Context Manager.
 **Functions:** `PullContext`, `should_run_pull`
-**Reads:** `__future__`, `datetime`, `loguru`, `sqlalchemy`, `typing`
+**Reads:** `__future__`, `datetime`, `json`, `loguru`, `sqlalchemy`, `typing`
+**Imported by:** `ingestion/scheduler.py`
 
 #### `ingestion/pumpfun.py` — 236 LOC
 **Docstring:** GRID Pump.fun data ingestion module.
@@ -2095,10 +2096,10 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`
 **Imported by:** `ingestion/base.py`, `oracle/sanity_checker.py`
 
-#### `ingestion/scheduler.py` — 1549 LOC
+#### `ingestion/scheduler.py` — 1748 LOC
 **Docstring:** GRID unified ingestion scheduler.
 **Functions:** `run_pull_group`, `backfill_all`, `run_pushshift_backfill`, `run_daily_pulls`, `run_monthly_pulls`, `start_scheduler`
-**Reads:** `__future__`, `alerts`, `config`, `datetime`, `db`, `discovery`, `ingestion`, `intelligence`, `loguru`, `schedule`, `scripts`, `sqlalchemy`, `sys`, `time`, `tqdm`, `typing`
+**Reads:** `__future__`, `alerts`, `config`, `datetime`, `db`, `discovery`, `ingestion`, `intelligence`, `loguru`, `schedule`, `scripts`, `socket`, `sqlalchemy`, `sys`, `time`, `tqdm`, `typing`
 
 #### `ingestion/sec_velocity.py` — 426 LOC
 **Docstring:** GRID SEC 8-K filing velocity module.
@@ -2212,13 +2213,13 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Docstring:** GRID JWT authentication with role-based access control.
 **Functions:** `hash_password`, `verify_password`, `create_token`, `verify_token`, `decode_token`, `get_token_expiry`, `require_auth`, `require_role`, `login`, `register`, `logout`, `verify`, `create_user`, `list_users`, `delete_user`
 **Reads:** `__future__`, `api`, `config`, `datetime`, `fastapi`, `jose`, `loguru`, `os`, `passlib`, `pathlib`, `psycopg2`, `shelve`, `tempfile`, `threading`, `time`, `typing`
-**Imported by:** `api/lf_helpers.py`, `api/main.py`, `api/routers/a2a.py`, `api/routers/actor_detail.py`, `api/routers/actor_news_api.py`, `api/routers/agents.py`, `api/routers/associations.py`, `api/routers/astrogrid_celestial.py`, … (+82)
+**Imported by:** `api/lf_helpers.py`, `api/main.py`, `api/routers/a2a.py`, `api/routers/actor_detail.py`, `api/routers/actor_news_api.py`, `api/routers/agents.py`, `api/routers/associations.py`, `api/routers/astrogrid_celestial.py`, … (+83)
 
 #### `api/dependencies.py` — 79 LOC
 **Docstring:** Shared FastAPI dependencies.
 **Functions:** `get_db_engine`, `get_pit_store`, `get_journal`, `get_model_registry`, `get_astrogrid_store`, `clear_singletons`
 **Reads:** `__future__`, `db`, `governance`, `journal`, `sqlalchemy`, `store`
-**Imported by:** `api/main.py`, `api/routers/actor_detail.py`, `api/routers/actor_news_api.py`, `api/routers/associations.py`, `api/routers/astrogrid.py`, `api/routers/astrogrid_celestial.py`, `api/routers/astrogrid_core.py`, `api/routers/astrogrid_helpers.py`, … (+76)
+**Imported by:** `api/main.py`, `api/routers/actor_detail.py`, `api/routers/actor_news_api.py`, `api/routers/associations.py`, `api/routers/astrogrid.py`, `api/routers/astrogrid_celestial.py`, `api/routers/astrogrid_core.py`, `api/routers/astrogrid_helpers.py`, … (+77)
 
 #### `api/lf_helpers.py` — 124 LOC
 **Docstring:** Best-effort Langfuse helpers shared by API routers.
@@ -2226,7 +2227,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `api`, `contextlib`, `langfuse`, `typing`
 **Imported by:** `api/routers/intelligence_actors.py`, `api/routers/intelligence_deepdive.py`, `api/routers/intelligence_thesis.py`
 
-#### `api/main.py` — 736 LOC
+#### `api/main.py` — 737 LOC
 **Docstring:** GRID Intelligence API — FastAPI application entry point.
 **Functions:** `lifespan`, `SecurityHeadersMiddleware`, `RateLimitMiddleware`, `X402PaymentMiddleware`, `broadcast_event`, `recent_realtime_events`, `websocket_endpoint`
 **Reads:** `__future__`, `agents`, `alerts`, `api`, `asyncio`, `collections`, `config`, `contextlib`, `contracts`, `datetime`, `db`, `events`, `fastapi`, `importlib`, `json`, `loguru`, `oracle`, `orchestration`, `os`, `pathlib`, `payments`, `starlette`, `subnet`, `threading`, `time`, `typing`
@@ -2644,6 +2645,11 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Docstring:** System status and health endpoints.
 **Functions:** `health`, `status`, `freshness`, `pipeline_health`, `get_logs`, `alerts`, `restart_hyperspace`, `trigger_ux_audit`, `list_ux_audits`, `trigger_daily_digest`, `run_taxonomy_audit_endpoint`, `set_hermes_state`, `hermes_status`, `get_settings`, `update_settings`, `get_api_keys`, `get_services`, `get_hermes_history`, `architecture`, `get_resolution_audit`, `run_resolution_audit`
 **Reads:** `__future__`, `analysis`, `api`, `config`, `datetime`, `fastapi`, `glob`, `hyperspace`, `intelligence`, `json`, `llm`, `loguru`, `os`, `pathlib`, `psutil`, `scripts`, `shutil`, `sqlalchemy`, `subprocess`, `threading`, `time`, `urllib`
+
+#### `api/routers/ten_year_portfolio.py` — 291 LOC
+**Docstring:** Ten-year portfolio query endpoints.
+**Functions:** `list_profiles`, `weekly_ten_year_portfolio`, `analyze_private_workbook`, `export_current_model_workbook`, `export_private_workbook_plan`
+**Reads:** `__future__`, `api`, `collections`, `datetime`, `fastapi`, `loguru`, `sqlalchemy`, `strategy`, `typing`
 
 #### `api/routers/tps.py` — 214 LOC
 **Docstring:** Trump-Proximity Score (TPS) endpoints — Phase 0.

@@ -18,7 +18,7 @@ const TEXT_ACTIVE = '#E8F0F8';
 const MONO = "'JetBrains Mono', monospace";
 const SANS = "'IBM Plex Sans', sans-serif";
 const DESKTOP_BP = 1024;
-const MOBILE_PRIMARY_IDS = new Set(['surfacer', 'dashboard', 'money-flow', 'risk']);
+const MOBILE_PRIMARY_IDS = new Set(['ten-year', 'surfacer', 'dashboard', 'money-flow']);
 
 function useIsDesktop() {
     const [isDesktop, setIsDesktop] = useState(
