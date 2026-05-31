@@ -452,17 +452,21 @@ class TestAPIEndpoints:
     def test_communities_endpoint(self):
         """GET /analytics/communities should return community list."""
         import asyncio
+        from api.routers import intelligence_actors as router
         from api.routers.intelligence_actors import get_communities_endpoint
+
+        router._community_list_cache.clear()
 
         mock_communities = [
             {"community_id": 0, "member_count": 50, "max_pagerank": 0.1, "top_member": "Alpha", "top_category": "finance"},
         ]
 
         with patch("api.routers.intelligence_actors.get_db_engine"):
-            with patch("store.graph.get_community_list", return_value=mock_communities):
-                result = asyncio.new_event_loop().run_until_complete(
-                    get_communities_endpoint(_token="test")
-                )
+            with patch("api.routers.intelligence_actors._read_community_summary", return_value=None):
+                with patch("store.graph.get_community_list", return_value=mock_communities):
+                    result = asyncio.new_event_loop().run_until_complete(
+                        get_communities_endpoint(_token="test")
+                    )
 
         assert "communities" in result
         assert result["count"] == 1

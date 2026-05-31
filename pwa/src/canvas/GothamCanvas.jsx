@@ -28,6 +28,7 @@ import LayerControls from './LayerControls.jsx';
 import TemporalScrubber from './TemporalScrubber.jsx';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts.js';
 import { useCommunities } from './hooks/useCommunities.js';
+import { EDGE_LEGEND } from '../components/canvas/nodeStyles.js';
 
 // ── Lens lenses — lazy-loaded to keep the graph bundle lean ──
 const CanvasSupplyLens = React.lazy(() => import('../views/canvas_lenses/SupplyLens.jsx'));
@@ -576,7 +577,68 @@ const S = {
         overflow: 'hidden',
         background: colors.bg,
     },
+    // ── Edge color legend (bottom-left of graph) ──
+    legend: {
+        position: 'absolute',
+        bottom: '12px',
+        left: '12px',
+        zIndex: 20,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '4px',
+        padding: '8px 10px',
+        borderRadius: tokens.radius.sm,
+        background: 'rgba(13, 17, 23, 0.78)',
+        border: `1px solid ${colors.border}`,
+        backdropFilter: 'blur(6px)',
+        pointerEvents: 'none',
+        maxWidth: '160px',
+    },
+    legendTitle: {
+        fontSize: '9px',
+        fontWeight: 700,
+        letterSpacing: '1px',
+        color: colors.textMuted,
+        fontFamily: MONO,
+        marginBottom: '2px',
+    },
+    legendRow: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: '7px',
+    },
+    legendSwatch: (color) => ({
+        width: '14px',
+        height: '3px',
+        borderRadius: '2px',
+        background: color,
+        flexShrink: 0,
+        boxShadow: `0 0 5px ${color}99`,
+    }),
+    legendLabel: {
+        fontSize: '10px',
+        color: colors.textDim,
+        fontFamily: MONO,
+        whiteSpace: 'nowrap',
+    },
 };
+
+// ── Edge color legend ──
+// Reads the canonical EDGE_LEGEND so the canvas legend and the actual edge
+// colours never drift apart (single source of truth in nodeStyles.js).
+function EdgeLegend() {
+    return (
+        <div style={S.legend} aria-label="Edge relationship legend" data-testid="edge-legend">
+            <div style={S.legendTitle}>EDGE TYPE</div>
+            {EDGE_LEGEND.map((entry) => (
+                <div key={entry.key} style={S.legendRow}>
+                    <span style={S.legendSwatch(entry.color)} />
+                    <span style={S.legendLabel}>{entry.label}</span>
+                </div>
+            ))}
+        </div>
+    );
+}
 
 // ── Mobile detection ──
 function useIsMobile() {
@@ -712,24 +774,66 @@ export default function GothamCanvas() {
     // Community detection
     const { communities, communityColors, communityLabels } = useCommunities(graph, showCommunities);
 
+    // Resolve the ticker symbol for a node, if any (company/ticker nodes).
+    const _tickerForNode = useCallback((nodeType, nodeId, attrs = {}) => {
+        const data = attrs.data || {};
+        if (nodeType === 'ticker') return String(_canvasApiId('ticker', nodeId)).toUpperCase();
+        if (nodeType === 'company') {
+            const ticker = attrs.ticker || data.ticker;
+            return ticker ? String(ticker).toUpperCase() : null;
+        }
+        return null;
+    }, []);
+
+    // Fetch the typed cross-domain chain (supplier → causation → committee →
+    // member trades) for a ticker and merge it into an expansion payload.
+    const _mergeIntelExpand = useCallback(async (ticker, base) => {
+        if (!ticker) return base;
+        try {
+            const intel = await api.getIntelExpand(ticker);
+            if (!intel || intel.error) return base;
+            const baseNodes = base?.nodes || base?.new_nodes || [];
+            const baseEdges = base?.edges || base?.new_edges || [];
+            return {
+                nodes: [...baseNodes, ...(intel.nodes || [])],
+                edges: [...baseEdges, ...(intel.edges || [])],
+            };
+        } catch {
+            return base;
+        }
+    }, []);
+
     const expandCanvasNode = useCallback(async (nodeId, requestedType, depth = 1) => {
         if (!nodeId) return null;
         const attrs = _nodeAttrs(graph, nodeId);
         const nodeType = requestedType || attrs.nodeType || attrs.type || 'actor';
+        const ticker = _tickerForNode(nodeType, nodeId, attrs);
 
+        let result;
         if (boardId) {
-            const result = await api.expandCanvasNode(boardId, nodeId, depth);
-            if (result && !result.error) return result;
+            const boardResult = await api.expandCanvasNode(boardId, nodeId, depth);
+            if (boardResult && !boardResult.error) result = boardResult;
         }
 
-        const existingIds = [];
-        graph.forEachNode((id) => existingIds.push(id));
-        const legacyTarget = _legacyExpandTarget(nodeType, nodeId, attrs);
-        if (!legacyTarget) {
-            return { error: true, message: `Cannot expand ${nodeType} without a saved board.` };
+        if (!result) {
+            const existingIds = [];
+            graph.forEachNode((id) => existingIds.push(id));
+            const legacyTarget = _legacyExpandTarget(nodeType, nodeId, attrs);
+            if (!legacyTarget) {
+                // No structural expand available — still surface the typed chain
+                // for a ticker so the node isn't a dead end.
+                if (ticker) return _mergeIntelExpand(ticker, { nodes: [], edges: [] });
+                return { error: true, message: `Cannot expand ${nodeType} without a saved board.` };
+            }
+            result = await api.expandNode(legacyTarget.type, legacyTarget.id, depth, existingIds);
         }
-        return api.expandNode(legacyTarget.type, legacyTarget.id, depth, existingIds);
-    }, [boardId, graph]);
+
+        // Enrich ticker/company expansions with the cross-domain typed chain.
+        if (ticker && result && !result.error) {
+            return _mergeIntelExpand(ticker, result);
+        }
+        return result;
+    }, [boardId, graph, _tickerForNode, _mergeIntelExpand]);
 
     // Wire keyboard shortcuts
     useKeyboardShortcuts({
@@ -1247,13 +1351,16 @@ export default function GothamCanvas() {
                 {/* Graph */}
                 <div style={{ ...S.graphContainer, visibility: lens === LENS_GRAPH ? 'visible' : 'hidden' }}>
                     {nodeCount > 0 ? (
-                        <SigmaGraph
-                            ref={sigmaRef}
-                            communities={communities}
-                            communityColors={communityColors}
-                            communityLabels={communityLabels}
-                            showCommunities={showCommunities}
-                        />
+                        <>
+                            <SigmaGraph
+                                ref={sigmaRef}
+                                communities={communities}
+                                communityColors={communityColors}
+                                communityLabels={communityLabels}
+                                showCommunities={showCommunities}
+                            />
+                            {!isMobile && edgeCount > 0 && <EdgeLegend />}
+                        </>
                     ) : !loading ? (
                         <div style={S.emptyState}>
                             <div style={S.emptyIcon}>

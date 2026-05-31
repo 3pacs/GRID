@@ -136,6 +136,76 @@ _GDELT_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data", "g
 _CONFLICT_CODES = {14, 15, 16, 17, 18, 19, 20}
 _RATE_LIMIT_DELAY: float = 1.0
 
+# GDELT DOC API rate limit. The public DOC 2.0 endpoint starts returning
+# HTTP 429 above ~12 requests / 60s. We enforce that sustained rate with a
+# shared token bucket (≈ 5s between requests, small burst allowance) across
+# every DOC-API call — theme queries, actor tones, and tension scores —
+# regardless of which loop or retry attempt issues the request.
+_GDELT_DOC_MAX_PER_WINDOW: int = 12
+_GDELT_DOC_WINDOW_SECONDS: float = 60.0
+
+
+class _TokenBucket:
+    """Thread-unsafe token-bucket throttle for sustained request spacing.
+
+    Refills ``rate`` tokens per second up to ``capacity``. ``acquire()``
+    blocks (via the injected ``sleep`` callable) until a token is available,
+    then consumes one. The clock and sleep are injectable so the throttle can
+    be unit-tested deterministically without real time.
+
+    Parameters:
+        max_per_window: Tokens allowed per ``window_seconds`` (sustained rate).
+        window_seconds: Length of the rate window.
+        capacity: Max burst size (defaults to a single request — strict
+            spacing, which is what GDELT needs).
+        clock: Monotonic time source (default ``time.monotonic``).
+        sleep: Blocking sleep callable (default ``time.sleep``).
+    """
+
+    def __init__(
+        self,
+        max_per_window: int = _GDELT_DOC_MAX_PER_WINDOW,
+        window_seconds: float = _GDELT_DOC_WINDOW_SECONDS,
+        capacity: float = 1.0,
+        clock: Any = time.monotonic,
+        sleep: Any = time.sleep,
+    ) -> None:
+        if max_per_window <= 0 or window_seconds <= 0:
+            raise ValueError("max_per_window and window_seconds must be > 0")
+        self._rate: float = max_per_window / window_seconds  # tokens/sec
+        self._capacity: float = max(1.0, capacity)
+        self._tokens: float = self._capacity
+        self._clock = clock
+        self._sleep = sleep
+        self._last: float = clock()
+
+    def _refill(self) -> None:
+        now = self._clock()
+        elapsed = now - self._last
+        if elapsed > 0:
+            self._tokens = min(
+                self._capacity, self._tokens + elapsed * self._rate
+            )
+            self._last = now
+
+    def acquire(self) -> float:
+        """Block until a token is available, then consume it.
+
+        Returns:
+            Seconds spent sleeping (0.0 if a token was immediately available).
+        """
+        self._refill()
+        slept = 0.0
+        if self._tokens < 1.0:
+            deficit = 1.0 - self._tokens
+            wait_s = deficit / self._rate
+            if wait_s > 0:
+                self._sleep(wait_s)
+                slept = wait_s
+            self._refill()
+        self._tokens -= 1.0
+        return slept
+
 
 class GDELTPuller(BasePuller):
     """Pulls news event data from the GDELT Project."""
@@ -154,7 +224,16 @@ class GDELTPuller(BasePuller):
     def __init__(self, db_engine: Engine) -> None:
         super().__init__(db_engine)
         os.makedirs(_GDELT_DATA_DIR, exist_ok=True)
+        # Shared throttle for all DOC-API requests so we stay under GDELT's
+        # ~12 req/60s ceiling even across retries and the three query loops.
+        self._doc_throttle = _TokenBucket()
         log.info("GDELTPuller initialised — source_id={sid}", sid=self.source_id)
+
+    def _acquire_doc_token(self) -> float:
+        """Consume a GDELT DOC API token, creating the throttle for test shims."""
+        if not hasattr(self, "_doc_throttle"):
+            self._doc_throttle = _TokenBucket()
+        return self._doc_throttle.acquire()
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=10))
     def _fetch_gkg_day(self, target_date: date) -> pd.DataFrame | None:
@@ -294,6 +373,7 @@ class GDELTPuller(BasePuller):
             "format": "json",
             "maxrecords": 250,
         }
+        self._acquire_doc_token()
         resp = requests.get(_GDELT_API_URL, params=params, timeout=10)
         if resp.status_code in {400, 403, 404, 429, 500, 502, 503, 504}:
             log.info(
@@ -331,6 +411,7 @@ class GDELTPuller(BasePuller):
             "format": "json",
             "maxrecords": 250,
         }
+        self._doc_throttle.acquire()
         resp = requests.get(GDELT_DOC_API_URL, params=params, timeout=30)
         resp.raise_for_status()
         return resp.json()

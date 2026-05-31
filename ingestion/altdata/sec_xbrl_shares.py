@@ -52,21 +52,76 @@ from ingestion.altdata.sec_xbrl_financials import (
 # the canonical financial taxonomy; dei is the entity-info taxonomy which
 # is used by many smaller filers that report shares under a DEI fact
 # rather than a full us-gaap capital-stock fact.
+# IFRS taxonomy tags for foreign issuers (20-F / 6-K filers).
+#
+# Foreign private issuers (TSM, NVO, BP, etc.) file on Form 20-F (annual)
+# and 6-K (interim) and report share counts under the ``ifrs-full`` taxonomy,
+# NOT us-gaap — so the us-gaap/dei specs above find nothing and the puller
+# returned 0 rows for them. Verified live against SEC Company Facts:
+#   * NVO  → ifrs-full:NumberOfSharesOutstanding
+#   * TSM  → ifrs-full:NumberOfSharesIssuedAndFullyPaid (6-K/20-F, ~25.9B)
+# These all report under the same "shares" unit as us-gaap, so the existing
+# extraction path handles them once the tags are queried. Listed AFTER the
+# us-gaap/dei specs so a dual-filer (e.g. BHP/RIO/AZN, which also expose
+# dei:EntityCommonStockSharesOutstanding) still prefers the canonical tag.
+_IFRS_SHARES_TAG_SPECS: list[tuple[str, str]] = [
+    ("ifrs-full", "NumberOfSharesOutstanding"),
+    ("ifrs-full", "NumberOfSharesIssuedAndFullyPaid"),
+    ("ifrs-full", "NumberOfSharesIssued"),
+    # Weighted-average fallback for IFRS filers that omit a point-in-time
+    # count (mirrors the us-gaap weighted-average fallback below).
+    ("ifrs-full", "WeightedAverageShares"),
+    ("ifrs-full", "AdjustedWeightedAverageShares"),
+]
+
+# XBRL tags we try, in priority order. us-gaap comes first because it's the
+# canonical financial taxonomy; dei is the entity-info taxonomy used by many
+# smaller filers; ifrs-full covers foreign 20-F/6-K issuers.
 _SHARES_TAG_SPECS: list[tuple[str, str]] = [
     # Highest-priority exact point-in-time tags.
     ("us-gaap", "CommonStockSharesOutstanding"),
     ("us-gaap", "CommonStockSharesIssued"),
     ("dei", "EntityCommonStockSharesOutstanding"),
+    # IFRS point-in-time tags for foreign issuers.
+    ("ifrs-full", "NumberOfSharesOutstanding"),
+    ("ifrs-full", "NumberOfSharesIssuedAndFullyPaid"),
+    ("ifrs-full", "NumberOfSharesIssued"),
     # Fallback: weighted-average basic/diluted shares. Modern tech
     # filers (META, etc.) only report these in Company Facts, not a
     # point-in-time outstanding count. They understate slightly
     # (weighted-average over the period) but beat having no value.
     ("us-gaap", "WeightedAverageNumberOfSharesOutstandingBasic"),
     ("us-gaap", "WeightedAverageNumberOfDilutedSharesOutstanding"),
+    # IFRS weighted-average fallbacks (e.g. TSM AdjustedWeightedAverageShares).
+    ("ifrs-full", "WeightedAverageShares"),
+    ("ifrs-full", "AdjustedWeightedAverageShares"),
 ]
 
 # Units. XBRL reports shares as "shares" (a count unit, not USD).
 _SHARES_UNIT: str = "shares"
+
+# Foreign-issuer forms that report shares under IFRS. Exposed for the runner
+# and for callers that want to confirm 20-F/6-K coverage.
+_FOREIGN_ISSUER_FORMS: frozenset[str] = frozenset({"20-F", "6-K", "40-F"})
+
+# Known foreign private issuers (ADRs) that file 20-F/6-K. Many are absent
+# from the domestic sector map, so they're never attempted by default and
+# show 0 rows. The runner's --foreign-issuers flag seeds this list so their
+# IFRS (or dei) share counts get ingested.
+FOREIGN_ISSUER_TICKERS: tuple[str, ...] = (
+    "TSM", "ASML", "BHP", "RIO", "NVO", "AZN", "BP", "BABA", "JD",
+    "SAP", "SHEL", "UL", "DEO", "SAN", "TD", "RY", "SNY", "GSK",
+    "NVS", "TM", "SONY", "BTI", "FMX", "NSRGY", "BUD",
+)
+
+
+def ifrs_shares_tag_map() -> dict[str, tuple[str, ...]]:
+    """Return the IFRS share-count tag map (taxonomy → tags), for inspection.
+
+    Pure accessor so the foreign-issuer tag coverage can be unit-tested.
+    """
+    tags = tuple(tag for _tax, tag in _IFRS_SHARES_TAG_SPECS)
+    return {"ifrs-full": tags}
 
 _DEFAULT_BACKFILL_DAYS: int = 90
 _MAX_RUNTIME_SECS: int = 3600

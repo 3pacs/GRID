@@ -77,6 +77,119 @@ _HTTP_PERMANENT_CODES = frozenset({400, 403, 404, 410})
 _DEAD_ENDPOINTS: set[str] = set()
 
 
+def _quarter_sort_key(label: str) -> tuple[int, int] | None:
+    """Parse a NY Fed reference-quarter column label into a (year, quarter) key.
+
+    The Nowcast sheet is wide: one numeric column per reference quarter from
+    2002 to the present, labelled e.g. ``2026q1``, ``2026:q1``, ``q1-2026``,
+    ``q1 2026``. Returns ``None`` for non-quarter columns (so they're ignored).
+    """
+    import re
+
+    s = label.strip().lower()
+    # year-first: 2026q1 / 2026:q1 / 2026 q1 / 2026-q1
+    m = re.search(r"(19|20)(\d{2})\D*q\s*([1-4])", s)
+    if m:
+        return (int(m.group(1) + m.group(2)), int(m.group(3)))
+    # quarter-first: q1-2026 / q1 2026 / q1:2026
+    m = re.search(r"q\s*([1-4])\D*(19|20)(\d{2})", s)
+    if m:
+        return (int(m.group(2) + m.group(3)), int(m.group(1)))
+    return None
+
+
+def _extract_nowcast_series(
+    df: Any, date_col: str
+) -> list[tuple[Any, float | None, float | None, str, str]]:
+    """Extract (obs_date, q1_value, q2_value, q1_col, q2_col) per forecast row.
+
+    For each vintage row, the *current-quarter* nowcast is the value in the
+    latest (most recent) reference-quarter column that is populated at that
+    date; the *next-quarter* nowcast is the column one quarter ahead, if it
+    too is populated. This replaces the previous (buggy) ``numeric_cols[0]``/
+    ``[1]`` heuristic, which always picked the oldest quarter (2002) and so
+    stored garbage as the current GDP nowcast.
+
+    Falls back to "first/second numeric column" only when NO quarter-labelled
+    columns are present (e.g. a simplified two-column ``date, value`` sheet).
+
+    Parameters:
+        df: Parsed DataFrame with lowercased column names.
+        date_col: Name of the (already datetime-coerced) date column.
+
+    Returns:
+        List of tuples, one per row with a usable current-quarter value.
+    """
+    import pandas as pd
+
+    # Ordered list of (quarter_key, column_name) for quarter-labelled columns.
+    quarter_cols: list[tuple[tuple[int, int], str]] = []
+    for col in df.columns:
+        if col == date_col:
+            continue
+        key = _quarter_sort_key(str(col))
+        if key is not None and pd.api.types.is_numeric_dtype(df[col]):
+            quarter_cols.append((key, col))
+    quarter_cols.sort(key=lambda kc: kc[0])
+    ordered_cols = [c for _, c in quarter_cols]
+
+    rows: list[tuple[Any, float | None, float | None, str, str]] = []
+
+    # Fallback: no quarter labels — keep legacy first/second numeric column.
+    if not ordered_cols:
+        numeric_cols = [
+            c for c in df.columns
+            if c != date_col and pd.api.types.is_numeric_dtype(df[c])
+        ]
+        if not numeric_cols:
+            return []
+        q1_col = numeric_cols[0]
+        q2_col = numeric_cols[1] if len(numeric_cols) > 1 else ""
+        for _, row in df.iterrows():
+            v1 = row[q1_col]
+            if pd.isna(v1) or math.isinf(v1):
+                continue
+            v2 = row[q2_col] if q2_col else None
+            if v2 is not None and (pd.isna(v2) or math.isinf(v2)):
+                v2 = None
+            rows.append((
+                row[date_col].date(), float(v1),
+                float(v2) if v2 is not None else None, q1_col, q2_col,
+            ))
+        return rows
+
+    # Wide format: per vintage row, only a small window of quarters near
+    # "now" is populated (earlier quarters are already realized, later ones
+    # not yet forecast). The NY Fed publishes the current quarter and, late
+    # in a quarter, the next one too. So among the populated quarter columns
+    # in a row:
+    #   - current quarter (Q1) = the second-latest populated quarter when two
+    #     or more are populated, otherwise the single populated quarter;
+    #   - next quarter (Q2)    = the latest populated quarter, only when two
+    #     or more are populated.
+    # This is the inverse of "first numeric column" — that old heuristic
+    # always grabbed the 2002 quarter and stored it as today's nowcast.
+    for _, row in df.iterrows():
+        populated: list[str] = [
+            c for c in ordered_cols
+            if not (pd.isna(row[c]) or math.isinf(row[c]))
+        ]
+        if not populated:
+            continue
+
+        if len(populated) >= 2:
+            q1_col, q2_col = populated[-2], populated[-1]
+            v1 = float(row[q1_col])
+            v2: float | None = float(row[q2_col])
+        else:
+            q1_col = populated[-1]
+            q2_col = ""
+            v1 = float(row[q1_col])
+            v2 = None
+        rows.append((row[date_col].date(), v1, v2, q1_col, q2_col))
+    return rows
+
+
 class NYFedPermanentError(RuntimeError):
     """Raised when an NY Fed endpoint returns a permanent 4xx."""
 
@@ -254,24 +367,20 @@ class NYFedPuller(BasePuller):
             df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
             df = df.dropna(subset=[date_col])
 
-            # Identify GDP forecast columns (Q1 = current, Q2 = next quarter)
-            # Common patterns: "gdp", "nowcast", quarter labels
-            numeric_cols = [
-                c for c in df.columns
-                if c != date_col and pd.api.types.is_numeric_dtype(df[c])
-            ]
-
-            if len(numeric_cols) == 0:
-                log.warning("Nowcast: no numeric columns found")
+            # Extract (date, q1, q2, q1_col, q2_col) per vintage row. This
+            # correctly picks the latest populated reference-quarter column
+            # as the current-quarter nowcast (instead of the oldest 2002
+            # column the old first/second-numeric heuristic always grabbed).
+            extracted = _extract_nowcast_series(df, date_col)
+            if not extracted:
+                log.warning("Nowcast: no usable forecast columns found")
                 for sid in (q1_sid, q2_sid):
                     results.append({
                         "feature": sid, "status": "NO_DATA", "rows_inserted": 0,
                     })
                 return results
 
-            # Use first numeric column for Q1, second for Q2 (if available)
-            q1_col = numeric_cols[0]
-            q2_col = numeric_cols[1] if len(numeric_cols) > 1 else None
+            any_q2 = any(q2v is not None for _, _, q2v, _, _ in extracted)
 
             with self.engine.begin() as conn:
                 existing_q1 = self._get_existing_dates(q1_sid, conn)
@@ -280,35 +389,26 @@ class NYFedPuller(BasePuller):
                 q1_inserted = 0
                 q2_inserted = 0
 
-                for _, row in df.iterrows():
-                    obs_date = row[date_col].date()
+                for obs_date, v1, v2, q1_col, q2_col in extracted:
+                    if v1 is not None and obs_date not in existing_q1:
+                        self._insert_raw(
+                            conn=conn,
+                            series_id=q1_sid,
+                            obs_date=obs_date,
+                            value=v1,
+                            raw_payload={"source_col": q1_col},
+                        )
+                        q1_inserted += 1
 
-                    # Q1 nowcast
-                    val = row[q1_col]
-                    if not (pd.isna(val) or math.isinf(val)):
-                        if obs_date not in existing_q1:
-                            self._insert_raw(
-                                conn=conn,
-                                series_id=q1_sid,
-                                obs_date=obs_date,
-                                value=float(val),
-                                raw_payload={"source_col": q1_col},
-                            )
-                            q1_inserted += 1
-
-                    # Q2 nowcast
-                    if q2_col is not None:
-                        val2 = row[q2_col]
-                        if not (pd.isna(val2) or math.isinf(val2)):
-                            if obs_date not in existing_q2:
-                                self._insert_raw(
-                                    conn=conn,
-                                    series_id=q2_sid,
-                                    obs_date=obs_date,
-                                    value=float(val2),
-                                    raw_payload={"source_col": q2_col},
-                                )
-                                q2_inserted += 1
+                    if v2 is not None and obs_date not in existing_q2:
+                        self._insert_raw(
+                            conn=conn,
+                            series_id=q2_sid,
+                            obs_date=obs_date,
+                            value=v2,
+                            raw_payload={"source_col": q2_col},
+                        )
+                        q2_inserted += 1
 
             log.info(
                 "Nowcast GDP -- Q1: {q1} rows, Q2: {q2} rows",
@@ -320,7 +420,7 @@ class NYFedPuller(BasePuller):
             })
             results.append({
                 "feature": q2_sid,
-                "status": "SUCCESS" if q2_col else "NO_DATA",
+                "status": "SUCCESS" if any_q2 else "NO_DATA",
                 "rows_inserted": q2_inserted,
             })
 

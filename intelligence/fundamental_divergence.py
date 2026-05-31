@@ -152,10 +152,17 @@ def _load_ticker_fundamentals(conn: Any, ticker: str) -> dict[str, Any] | None:
     """Return ``{revenue_cagr, margin_trend, shareholder_yield, periods}``
     or ``None`` if the ticker has fewer than ``MIN_PERIODS`` annual rows.
 
-    Queries ``capital_flows`` directly mirroring the logic in
-    ``api/routers/capital_flow.py``. Summed across source_filings — the
-    approximation is good enough for ranking purposes and avoids the
-    full dedup pipeline the API applies.
+    Queries ``capital_flows`` applying the same SEC-over-seed dedup the
+    API read path uses (``api/routers/capital_flow.py::_DEDUP_SQL``).
+
+    The base table carries multiple ``source_filing`` variants for the
+    same logical (actor, fiscal_period, flow_type, counterparty) — a SEC
+    10-K row AND a seed row, where seed used *total* revenue and SEC uses
+    *net sales*. Naively ``SUM``-ing across them double-counts and is
+    exactly what made WMT show a -16.6% and JPM a -10.8% 3y revenue CAGR.
+    So we first pick ONE row per natural key (SEC 10-* > 20-* > 8-* >
+    other > seed, then confidence, then most-recent ``as_of``), THEN sum
+    over counterparties within each (fiscal_period, flow_type).
     """
     if not _table_exists(conn, "public.capital_flows"):
         return None
@@ -164,13 +171,45 @@ def _load_ticker_fundamentals(conn: Any, ticker: str) -> dict[str, Any] | None:
     rows = conn.execute(
         text(
             """
+            WITH ranked AS (
+                SELECT
+                    fiscal_period,
+                    flow_type,
+                    amount_usd,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY actor_id, fiscal_period, period_type,
+                                     flow_type, direction,
+                                     COALESCE(NULLIF(counterparty_id, ''), '__none__')
+                        ORDER BY
+                            -- Prefer SEC filings, then other regulatory,
+                            -- then seed/other. Mirrors capital_flow._DEDUP_SQL.
+                            CASE
+                                WHEN source_filing LIKE '10-%' THEN 1
+                                WHEN source_filing LIKE '20-%' THEN 2
+                                WHEN source_filing LIKE '8-%'  THEN 3
+                                WHEN source_filing LIKE 'seed%' THEN 5
+                                ELSE 4
+                            END,
+                            CASE confidence
+                                WHEN 'confirmed' THEN 1
+                                WHEN 'derived'   THEN 2
+                                WHEN 'estimated' THEN 3
+                                WHEN 'rumored'   THEN 4
+                                WHEN 'inferred'  THEN 5
+                                ELSE 6
+                            END,
+                            as_of DESC NULLS LAST
+                    ) AS rk
+                FROM capital_flows
+                WHERE actor_id = ANY(:ids)
+                  AND period_type = 'annual'
+                  AND flow_type IN (
+                    'revenue', 'cogs', 'dividends', 'buybacks'
+                  )
+            )
             SELECT fiscal_period, flow_type, SUM(amount_usd) AS amt
-            FROM capital_flows
-            WHERE actor_id = ANY(:ids)
-              AND period_type = 'annual'
-              AND flow_type IN (
-                'revenue', 'cogs', 'dividends', 'buybacks'
-              )
+            FROM ranked
+            WHERE rk = 1
             GROUP BY fiscal_period, flow_type
             ORDER BY fiscal_period DESC
             """

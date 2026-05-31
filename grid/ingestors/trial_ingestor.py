@@ -166,7 +166,14 @@ def upsert_catalyst_calendar(conn, events: list[dict]) -> int:
     cur = conn.cursor()
     count = 0
     for ev in events:
-        ticker = _resolve_ticker_sec(ev["sponsor"]) or ev["sponsor"][:10]
+        ticker = _resolve_ticker_sec(ev["sponsor"])
+        if not ticker:
+            log.info(
+                "Skipping catalyst_calendar row for unresolved sponsor %r (%s)",
+                ev["sponsor"],
+                ev["nct_id"],
+            )
+            continue
         try:
             cur.execute("""
                 INSERT INTO catalyst_calendar
