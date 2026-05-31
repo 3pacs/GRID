@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from typing import Any
 
+import psycopg2
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from loguru import logger as log
@@ -38,53 +40,160 @@ router = APIRouter(
 
 EXCEL_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
+# Tickers from DEFAULT_CHART_UNIVERSE + QQQ that have a deduped `<ticker>_full`
+# entry in feature_registry / resolved_series.  These bypass the expensive
+# DISTINCT-ON scan on raw_series (1.9B rows, ~100 re-pulls per date) and hit
+# the cheap resolved_series index instead (cost ~20K vs ~3.6M).
+# The 11 FRONTIER_RAW_HISTORY_TICKERS are NOT in this set and still use raw_series.
+_RESOLVED_TICKER_TO_FEATURE: dict[str, str] = {
+    "AAPL":  "aapl_full",
+    "AMD":   "amd_full",
+    "AMZN":  "amzn_full",
+    "AVGO":  "avgo_full",
+    "BRK-B": "brk-b_full",
+    "CAT":   "cat_full",
+    "COST":  "cost_full",
+    "GE":    "ge_full",
+    "GOOGL": "googl_full",
+    "HD":    "hd_full",
+    "JPM":   "jpm_full",
+    "LLY":   "lly_full",
+    "MA":    "ma_full",
+    "META":  "meta_full",
+    "MSFT":  "msft_full",
+    "NFLX":  "nflx_full",
+    "NVDA":  "nvda_full",
+    "QQQ":   "qqq_full",
+    "TSLA":  "tsla_full",
+    "V":     "v_full",
+}
+
+
+def _fetch_resolved_rows(
+    dsn: str,
+    feature_names: list[str],
+    lookback_days: int,
+) -> list[tuple[Any, ...]]:
+    """Query resolved_series for a list of feature names.
+
+    Uses its own psycopg2 connection so it can run concurrently with
+    _fetch_raw_rows without sharing a SQLAlchemy connection.
+    """
+    conn = psycopg2.connect(dsn)
+    try:
+        cur = conn.cursor()
+        cur.execute("SET statement_timeout='30000'")
+        cur.execute(
+            """
+            SELECT DISTINCT ON (fr.name, rs.obs_date)
+                   fr.name, rs.obs_date, rs.value, rs.vintage_date
+            FROM feature_registry fr
+            JOIN resolved_series rs ON rs.feature_id = fr.id
+            WHERE fr.name = ANY(%s)
+              AND rs.obs_date >= CURRENT_DATE - make_interval(days => %s)
+              AND rs.value > 0
+            ORDER BY fr.name, rs.obs_date ASC, rs.vintage_date DESC
+            """,
+            (feature_names, lookback_days),
+        )
+        return cur.fetchall()
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+def _fetch_raw_rows(
+    dsn: str,
+    series_ids: list[str],
+    lookback_days: int,
+) -> list[tuple[Any, ...]]:
+    """Query raw_series for a list of series_ids.
+
+    Restricted to the 11 FRONTIER_RAW_HISTORY_TICKERS that have no resolved
+    equivalent, keeping the scan to ~2M rows instead of ~7M.
+    """
+    if not series_ids:
+        return []
+    conn = psycopg2.connect(dsn)
+    try:
+        cur = conn.cursor()
+        cur.execute("SET statement_timeout='30000'")
+        cur.execute(
+            """
+            SELECT DISTINCT ON (series_id, obs_date)
+                   series_id, obs_date, value, pull_timestamp
+            FROM raw_series
+            WHERE pull_status = 'SUCCESS'
+              AND series_id = ANY(%s)
+              AND obs_date >= CURRENT_DATE - make_interval(days => %s)
+              AND value > 0
+            ORDER BY series_id, obs_date ASC, pull_timestamp DESC
+            """,
+            (series_ids, lookback_days),
+        )
+        return cur.fetchall()
+    finally:
+        conn.rollback()
+        conn.close()
+
 
 def _load_price_history(engine: Engine, *, years: int) -> dict[str, list[tuple[date, float]]]:
-    """Load deduped Yahoo adjusted-close history for chart candidate universes."""
+    """Load deduped Yahoo adjusted-close history for chart candidate universes.
+
+    Performance design
+    ------------------
+    The original query ran a single DISTINCT ON across 31 series_ids in
+    raw_series (~7M rows, each date re-pulled ~30-50 times), producing a sort
+    cost of ~3.6M planner units and timing out under the 120s statement_timeout.
+
+    Fix: split into three concurrent queries.
+
+    1. resolved_series (20 tickers) — hits idx_resolved_series_feature_obs with
+       a nested-loop index scan; planner cost ~20K, measured ~0.17s.
+    2. resolved_series (6 frontier thematic tickers) — same path, already existed.
+    3. raw_series (11 FRONTIER_RAW_HISTORY_TICKERS only) — no _full feature
+       exists for these; still uses DISTINCT ON but on ~2M rows instead of ~7M.
+
+    Queries 1+2 are merged into a single resolved_series call.  All three run
+    concurrently via ThreadPoolExecutor.  Wall time measured ~3.5s vs >120s.
+    """
     lookback_days = max(365, int(years * 365.25) + 45)
-    raw_tickers = sorted({*DEFAULT_CHART_UNIVERSE, *FRONTIER_RAW_HISTORY_TICKERS, "QQQ"})
-    series_ids = [f"YF:{ticker}:adj_close" for ticker in raw_tickers]
-    resolved_tickers = sorted(set(FRONTIER_THEMATIC_UNIVERSE) - set(raw_tickers))
-    feature_to_ticker = {f"{ticker.lower()}_full": ticker for ticker in resolved_tickers}
-    with engine.connect() as conn:
-        raw_rows = conn.execute(
-            text(
-                """
-                SELECT DISTINCT ON (series_id, obs_date)
-                       series_id, obs_date, value, pull_timestamp
-                FROM raw_series
-                WHERE pull_status = 'SUCCESS'
-                  AND series_id IN :series_ids
-                  AND obs_date >= CURRENT_DATE - make_interval(days => :lookback_days)
-                  AND value > 0
-                ORDER BY series_id, obs_date ASC, pull_timestamp DESC
-                """
-            ).bindparams(bindparam("series_ids", expanding=True)),
-            {
-                "lookback_days": lookback_days,
-                "series_ids": series_ids,
-            },
-        ).fetchall()
-        resolved_rows = conn.execute(
-            text(
-                """
-                SELECT DISTINCT ON (fr.name, rs.obs_date)
-                       fr.name, rs.obs_date, rs.value, rs.vintage_date
-                FROM feature_registry fr
-                JOIN resolved_series rs ON rs.feature_id = fr.id
-                WHERE fr.name IN :feature_names
-                  AND rs.obs_date >= CURRENT_DATE - make_interval(days => :lookback_days)
-                  AND rs.value > 0
-                ORDER BY fr.name, rs.obs_date ASC, rs.vintage_date DESC
-                """
-            ).bindparams(bindparam("feature_names", expanding=True)),
-            {
-                "lookback_days": lookback_days,
-                "feature_names": list(feature_to_ticker),
-            },
-        ).fetchall()
+
+    # Tickers that have no _full resolved equivalent — must use raw_series.
+    raw_only_tickers: list[str] = sorted(FRONTIER_RAW_HISTORY_TICKERS)
+    raw_series_ids = [f"YF:{t}:adj_close" for t in raw_only_tickers]
+
+    # All feature names for resolved_series:
+    # (a) the 20 main tickers with _full equivalents
+    # (b) the 6 frontier thematic tickers that were already using resolved_series
+    frontier_thematic_tickers = sorted(set(FRONTIER_THEMATIC_UNIVERSE) - set(raw_only_tickers))
+    frontier_feature_to_ticker = {f"{t.lower()}_full": t for t in frontier_thematic_tickers}
+    resolved_feature_names: list[str] = (
+        list(_RESOLVED_TICKER_TO_FEATURE.values())
+        + list(frontier_feature_to_ticker.keys())
+    )
+
+    dsn = engine.url.render_as_string(hide_password=False)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_resolved = pool.submit(
+            _fetch_resolved_rows, dsn, resolved_feature_names, lookback_days
+        )
+        fut_raw = pool.submit(
+            _fetch_raw_rows, dsn, raw_series_ids, lookback_days
+        )
+        resolved_rows = fut_resolved.result()
+        raw_rows = fut_raw.result()
+
+    # Build a reversed lookup: feature_name -> ticker for all resolved rows.
+    feature_to_ticker: dict[str, str] = {
+        **{v: k for k, v in _RESOLVED_TICKER_TO_FEATURE.items()},
+        **frontier_feature_to_ticker,
+    }
 
     by_ticker_date: dict[tuple[str, date], tuple[Any, float]] = {}
+
+    # Process raw_series rows (frontier tickers only).
     for row in raw_rows:
         parsed = parse_yf_series_id(row[0])
         if parsed is None:
@@ -95,6 +204,8 @@ def _load_price_history(engine: Engine, *, years: int) -> dict[str, list[tuple[d
         candidate = (row[3], float(row[2]))
         if current is None or candidate[0] >= current[0]:
             by_ticker_date[key] = candidate
+
+    # Process resolved_series rows (main 20 + frontier thematic 6).
     for row in resolved_rows:
         ticker = feature_to_ticker.get(row[0])
         if ticker is None:
