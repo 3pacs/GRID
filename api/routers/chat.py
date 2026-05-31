@@ -809,8 +809,20 @@ def _extract_feature_names_from_context(context_text: str) -> list[str]:
     return sorted(set(m for m in matches if m not in _STOP_WORDS))
 
 
-def _build_context_block(question: str, ticker: str | None) -> tuple[str, list[str]]:
-    """Gather all context and return (context_text, list_of_sources)."""
+def _build_context_block(
+    question: str,
+    ticker: str | None,
+    *,
+    include_research: bool = True,
+    budget_s: int = 15,
+) -> tuple[str, list[str]]:
+    """Gather all context and return (context_text, list_of_sources).
+
+    include_research: when False, skip `_research_chain` (a deep multi-hop step
+    measured at ~35s). The realtime streaming verdict passes False so the home
+    page renders promptly; the firewalled /chat/ask path keeps it.
+    budget_s: overall wall-clock cap for the concurrent gather.
+    """
     blocks: list[str] = []
     sources: list[str] = []
 
@@ -829,18 +841,46 @@ def _build_context_block(question: str, ticker: str | None) -> tuple[str, list[s
         _gather_thesis,
         _gather_money_flows,
         _gather_deep_dive,
-        lambda: _research_chain(question, ticker),
     ]
+    if include_research:
+        gatherers.append(lambda: _research_chain(question, ticker))
 
-    for fn in gatherers:
+    # Gatherers are independent DB reads — run them concurrently and bound the
+    # total wait, instead of summing 15 serial queries (which hit 24-77s and
+    # made the streaming verdict appear broken: nothing streams until context
+    # is built). Order is preserved for a deterministic prompt; a gatherer that
+    # overruns the budget is abandoned (it finishes harmlessly in the
+    # background) and its slice is simply omitted from this turn's context.
+    import concurrent.futures
+
+    _CONTEXT_GATHER_BUDGET_S = budget_s
+
+    def _run(fn):
         try:
-            text, source = fn()
-            if text:
-                blocks.append(text)
-            if source:
-                sources.append(source)
+            return fn()
         except Exception as exc:
             log.debug("Context gather failed: {e}", e=str(exc))
+            return None
+
+    results: list[tuple[str, str] | None] = [None] * len(gatherers)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(gatherers)))
+    futures = {executor.submit(_run, fn): i for i, fn in enumerate(gatherers)}
+    try:
+        for fut in concurrent.futures.as_completed(futures, timeout=_CONTEXT_GATHER_BUDGET_S):
+            results[futures[fut]] = fut.result()
+    except concurrent.futures.TimeoutError:
+        log.debug("Context gather hit {s}s budget; using partial context", s=_CONTEXT_GATHER_BUDGET_S)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    for result in results:
+        if not result:
+            continue
+        text, source = result
+        if text:
+            blocks.append(text)
+        if source:
+            sources.append(source)
 
     return "\n\n".join(blocks), sources
 
@@ -1808,7 +1848,11 @@ async def ask_grid_stream(
 
     question = req.question.strip()
     ticker = req.context_ticker.strip().upper() if req.context_ticker else None
-    context_text, sources = _build_context_block(question, ticker)
+    # Fast context for the realtime home verdict: skip the ~35s research chain
+    # and cap the concurrent gather so tokens start streaming within seconds.
+    context_text, sources = _build_context_block(
+        question, ticker, include_research=False, budget_s=8
+    )
 
     client, backend = _get_llm_client()
 
