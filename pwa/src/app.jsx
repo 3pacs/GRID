@@ -3,6 +3,12 @@ import { createRoot } from 'react-dom/client';
 import useStore from './store.js';
 import { api } from './api.js';
 import NavBar from './components/NavBar.jsx';
+import DadNav from './components/DadNav.jsx';
+import { isSimpleUser } from './authSession.js';
+
+// Views a simple/dad user is allowed to see. Everything else (the operator
+// cockpit) is hidden and redirects back to the composer.
+const DAD_VIEWS = new Set(['home', 'ten-year']);
 import ViewErrorBoundary from './components/ViewErrorBoundary.jsx';
 import Login from './views/Login.jsx';
 import ChatPanel from './components/ChatPanel.jsx';
@@ -115,6 +121,8 @@ export function App() {
     } = useStore();
 
     const isDesktop = useIsDesktop();
+    const simple = isAuthenticated && isSimpleUser();
+    const dadInitRef = React.useRef(false);
     const [entryId, setEntryId] = useState(null);
     const [selectedTicker, setSelectedTicker] = useState(null);
     const [selectedSector, setSelectedSector] = useState(null);
@@ -197,6 +205,24 @@ export function App() {
         document.addEventListener('visibilitychange', handleVisibilityChange);
         return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
     }, []);
+
+    // Dad opens to the composer ("Ask"), once per login — regardless of the
+    // operator default (ten-year).
+    useEffect(() => {
+        if (!isAuthenticated) { dadInitRef.current = false; return; }
+        if (simple && !dadInitRef.current) {
+            dadInitRef.current = true;
+            setActiveView('home');
+        }
+    }, [isAuthenticated, simple, setActiveView]);
+
+    // Keep dad inside his two pages — any stray navigation to an operator view
+    // bounces back to the composer.
+    useEffect(() => {
+        if (simple && activeView && !DAD_VIEWS.has(activeView)) {
+            setActiveView('home');
+        }
+    }, [simple, activeView, setActiveView]);
 
     useEffect(() => {
         if (!shouldUseRealtimeSocket) return undefined;
@@ -363,8 +389,8 @@ export function App() {
 
     const appStyle = {
         ...styles.app,
-        paddingTop: isDesktop ? '48px' : 0,
-        paddingBottom: isDesktop ? 0 : 'calc(60px + env(safe-area-inset-bottom, 0px))',
+        paddingTop: simple ? '64px' : (isDesktop ? '48px' : 0),
+        paddingBottom: simple ? 0 : (isDesktop ? 0 : 'calc(60px + env(safe-area-inset-bottom, 0px))'),
     };
 
     return (
@@ -391,22 +417,32 @@ export function App() {
                     </Suspense>
                 </ViewErrorBoundary>
             </div>
-            <NavBar
-                activeView={activeView}
-                onNavigate={navigate}
-                onSearchOpen={() => setPaletteOpen(true)}
-                onChatOpen={() => setChatOpen(true)}
-            />
-            <ChatPanel open={chatOpen} onOpenChange={setChatOpen} />
-            <CommandPalette
-                open={paletteOpen}
-                onClose={() => setPaletteOpen(false)}
-                onNavigate={(view, id) => { navigate(view, id); setPaletteOpen(false); }}
-            />
-            <Onboarding
-                forceShow={showTour}
-                onDismiss={() => setShowTour(false)}
-            />
+            {simple ? (
+                <DadNav
+                    activeView={activeView}
+                    onNavigate={navigate}
+                    onSignOut={() => clearAuth()}
+                />
+            ) : (
+                <>
+                    <NavBar
+                        activeView={activeView}
+                        onNavigate={navigate}
+                        onSearchOpen={() => setPaletteOpen(true)}
+                        onChatOpen={() => setChatOpen(true)}
+                    />
+                    <ChatPanel open={chatOpen} onOpenChange={setChatOpen} />
+                    <CommandPalette
+                        open={paletteOpen}
+                        onClose={() => setPaletteOpen(false)}
+                        onNavigate={(view, id) => { navigate(view, id); setPaletteOpen(false); }}
+                    />
+                    <Onboarding
+                        forceShow={showTour}
+                        onDismiss={() => setShowTour(false)}
+                    />
+                </>
+            )}
         </div>
     );
 }
