@@ -1,7 +1,8 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { api } from '../../api.js';
 import { colors } from '../../styles/shared.js';
 import { AnswerView } from './answerFormat.jsx';
+import { tickerLabel, tickerName, plainSentiment, plainRegime, warmError } from './plain.js';
 
 const SANS = "'IBM Plex Sans', -apple-system, sans-serif";
 const MONO = "'IBM Plex Mono', monospace";
@@ -17,32 +18,59 @@ function Shell({ title, children, accent }) {
     );
 }
 
-function Loading() {
-    return <div style={CS.dim}>Loading…</div>;
+function Loading({ msg }) {
+    return <div style={CS.dim}>{msg || 'One moment…'}</div>;
 }
 
 function Empty({ msg }) {
-    return <div style={CS.dim}>{msg || 'No data yet.'}</div>;
+    return <div style={CS.dim}>{msg || 'Nothing to show here yet.'}</div>;
 }
 
-/** Generic data-fetching hook with loading/error/empty handling. */
+/** Calm error line + a big "Try again" button so he's never stuck. */
+function ErrorState({ msg, onRetry }) {
+    return (
+        <div style={CS.col}>
+            <div style={CS.err}>{msg}</div>
+            {onRetry && (
+                <button style={CS.retry} onClick={onRetry}>Try again</button>
+            )}
+        </div>
+    );
+}
+
+/** Data-fetching hook with a reload() for retry. */
 function useFetch(fn, deps) {
     const [state, setState] = useState({ loading: true, error: null, data: null });
+    const [n, setN] = useState(0);
+    const reload = useCallback(() => setN((x) => x + 1), []);
     useEffect(() => {
         let alive = true;
         setState({ loading: true, error: null, data: null });
         Promise.resolve()
             .then(fn)
             .then((data) => { if (alive) setState({ loading: false, error: null, data }); })
-            .catch((err) => { if (alive) setState({ loading: false, error: err?.message || 'Failed', data: null }); });
+            .catch(() => { if (alive) setState({ loading: false, error: true, data: null }); });
         return () => { alive = false; };
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, deps);
-    return state;
+    }, [...deps, n]);
+    return { ...state, reload };
 }
 
-const fmtPct = (v) => (typeof v === 'number' ? `${v >= 0 ? '+' : ''}${(v * (Math.abs(v) < 1 ? 100 : 1)).toFixed(2)}%` : null);
+const fmtPct = (v) => (typeof v === 'number' ? `${v >= 0 ? '+' : ''}${(v * (Math.abs(v) < 1 ? 100 : 1)).toFixed(1)}%` : null);
 const fmtNum = (v) => (typeof v === 'number' ? v.toLocaleString(undefined, { maximumFractionDigits: 2 }) : null);
+
+function toneColor(tone) {
+    return tone === 'up' ? colors.green : tone === 'down' ? colors.red : colors.textDim;
+}
+function toneBg(tone) {
+    return tone === 'up' ? colors.greenBg : tone === 'down' ? colors.redBg : colors.card;
+}
+
+/** A plain "Looking up / shaky / calm" badge with a word, not a trader label. */
+function MoodBadge({ raw }) {
+    const { label, tone } = plainSentiment(raw);
+    return <div style={{ ...CS.badge, background: toneBg(tone), color: toneColor(tone) }}>{label}</div>;
+}
 
 // ── Verdict ────────────────────────────────────────────────────────────
 
@@ -50,29 +78,32 @@ function VerdictCard({ title, props }) {
     const question = props?.question || title || '';
     const [text, setText] = useState('');
     const [status, setStatus] = useState('loading'); // loading | streaming | done | error
-    const [errMsg, setErrMsg] = useState('');
+    const [n, setN] = useState(0);
+    const retry = useCallback(() => setN((x) => x + 1), []);
 
     useEffect(() => {
         if (!question) { setStatus('done'); return undefined; }
         const controller = new AbortController();
-        setText(''); setErrMsg(''); setStatus('loading');
+        setText(''); setStatus('loading');
         api.askStream(question, {
             history: [],
             signal: controller.signal,
             onDelta: (full) => { setText(full); setStatus('streaming'); },
         })
             .then(() => setStatus('done'))
-            .catch((e) => {
-                if (e?.name === 'AbortError') return;
-                setErrMsg(e?.message || 'Failed'); setStatus('error');
-            });
+            .catch((e) => { if (e?.name !== 'AbortError') setStatus('error'); });
         return () => controller.abort();
-    }, [question]);
+    }, [question, n]);
 
     return (
         <Shell title={title || 'Your read'} accent>
-            {status === 'loading' && <div style={CS.dim}>Thinking…</div>}
-            {status === 'error' && <div style={CS.err}>Couldn’t reach GRID: {errMsg}</div>}
+            {status === 'loading' && (
+                <div style={CS.thinking}>
+                    <span style={CS.thinkDots}><i style={CS.dot} /><i style={{ ...CS.dot, animationDelay: '.2s' }} /><i style={{ ...CS.dot, animationDelay: '.4s' }} /></span>
+                    Reading the market for you…
+                </div>
+            )}
+            {status === 'error' && <ErrorState msg={warmError('verdict')} onRetry={retry} />}
             {(status === 'streaming' || status === 'done') && text && (
                 <div>
                     <AnswerView text={text} />
@@ -87,28 +118,34 @@ function VerdictCard({ title, props }) {
 
 function TickerPulseCard({ title, props }) {
     const ticker = (props?.ticker || '').toUpperCase();
-    const { loading, error, data } = useFetch(
+    const { loading, error, data, reload } = useFetch(
         () => (ticker ? api.getTickerQuote(ticker) : Promise.resolve(null)),
         [ticker],
     );
     const price = data?.price;
     const change = data?.change_pct;
-    const sentiment = data?.sentiment;
-    const levels = data ? {
-        'put/call': data.put_call_ratio,
-        'max pain': data.max_pain,
-        'IV': data.iv_atm,
-    } : null;
-    const hasLevels = levels && Object.values(levels).some((v) => v != null);
+    // One plain sentence: what does today look like for this stock?
+    const moodWord = data ? plainSentiment(data.sentiment).label.toLowerCase() : '';
+    const line = (() => {
+        if (!data || typeof price !== 'number') return null;
+        const dir = typeof change === 'number'
+            ? (change > 0.3 ? 'up' : change < -0.3 ? 'down' : 'about flat')
+            : null;
+        const name = tickerName(ticker);
+        if (dir === 'up') return `${name} is up today — ${moodWord}.`;
+        if (dir === 'down') return `${name} is down today — ${moodWord}.`;
+        return `${name} is steady today — ${moodWord}.`;
+    })();
+
     return (
-        <Shell title={title || ticker}>
-            {!ticker && <Empty msg="No ticker." />}
+        <Shell title={title || tickerLabel(ticker)}>
+            {!ticker && <Empty msg="No stock picked." />}
             {ticker && loading && <Loading />}
-            {ticker && error && <div style={CS.err}>No live data for {ticker}.</div>}
+            {ticker && error && <ErrorState msg={warmError('price')} onRetry={reload} />}
             {ticker && data && (
                 <div style={CS.col}>
                     <div style={CS.priceRow}>
-                        <span style={CS.ticker}>{ticker}</span>
+                        <span style={CS.ticker}>{tickerName(ticker)}</span>
                         {typeof price === 'number' && <span style={CS.price}>${fmtNum(price)}</span>}
                         {typeof change === 'number' && (
                             <span style={{ ...CS.change, color: change >= 0 ? colors.green : colors.red }}>
@@ -116,50 +153,31 @@ function TickerPulseCard({ title, props }) {
                             </span>
                         )}
                     </div>
-                    {sentiment && (
-                        <div style={{ ...CS.badge, ...sentimentStyle(sentiment) }}>
-                            {String(sentiment).toUpperCase()}
-                        </div>
-                    )}
-                    {typeof price !== 'number' && <Empty msg={`Watching ${ticker} — no price yet.`} />}
-                    {hasLevels && (
-                        <div style={CS.levels}>
-                            {Object.entries(levels).filter(([, v]) => v != null).map(([k, v]) => (
-                                <span key={k} style={CS.level}>
-                                    <span style={CS.levelK}>{k}</span> {fmtNum(v) ?? String(v)}
-                                </span>
-                            ))}
-                        </div>
-                    )}
+                    {data?.sentiment && <MoodBadge raw={data.sentiment} />}
+                    {line ? <div style={CS.body}>{line}</div>
+                        : <Empty msg={`${tickerName(ticker)}'s price isn’t updating right now (the market may be closed).`} />}
                 </div>
             )}
         </Shell>
     );
 }
 
-function sentimentStyle(s) {
-    const v = String(s).toLowerCase();
-    if (/bull|positive|up|risk.?on|green/.test(v)) return { background: colors.greenBg, color: colors.green };
-    if (/bear|negative|down|risk.?off|red/.test(v)) return { background: colors.redBg, color: colors.red };
-    return { background: colors.card, color: colors.textDim };
-}
-
 // ── Watchlist ──────────────────────────────────────────────────────────
 
 function WatchlistCard({ title }) {
-    const { loading, error, data } = useFetch(() => api.getWatchlist(), []);
+    const { loading, error, data, reload } = useFetch(() => api.getWatchlist(), []);
     const items = Array.isArray(data) ? data : (data?.items || data?.watchlist || data?.tickers || []);
     return (
-        <Shell title={title || 'My watchlist'}>
+        <Shell title={title || 'My stocks'}>
             {loading && <Loading />}
-            {error && <div style={CS.err}>Couldn’t load watchlist.</div>}
+            {error && <ErrorState msg={warmError()} onRetry={reload} />}
             {data && (items.length === 0
-                ? <Empty msg="Watchlist is empty." />
+                ? <Empty msg="No stocks saved yet." />
                 : (
                     <div style={CS.chips}>
                         {items.slice(0, 30).map((it, i) => {
                             const t = (it.ticker || it.symbol || it.name || it) ?? '';
-                            return <span key={i} style={CS.chip}>{String(t).toUpperCase()}</span>;
+                            return <span key={i} style={CS.chip}>{tickerName(t)}</span>;
                         })}
                     </div>
                 ))}
@@ -170,25 +188,22 @@ function WatchlistCard({ title }) {
 // ── Macro regime ───────────────────────────────────────────────────────
 
 function MacroRegimeCard({ title }) {
-    const { loading, error, data } = useFetch(() => api.getCurrent(), []);
+    const { loading, error, data, reload } = useFetch(() => api.getCurrent(), []);
     const regime = data?.regime;
-    const conf = data?.confidence;
-    const stress = data?.stress_index;
+    const r = regime ? plainRegime(regime) : null;
     return (
         <Shell title={title || 'The market right now'}>
             {loading && <Loading />}
-            {error && <div style={CS.err}>Couldn’t load regime.</div>}
-            {data && (regime
+            {error && <ErrorState msg={warmError()} onRetry={reload} />}
+            {data && (r
                 ? (
                     <div style={CS.col}>
-                        <div style={{ ...CS.regime, ...sentimentStyle(regime) }}>{String(regime).replace(/_/g, ' ')}</div>
-                        <div style={CS.meta}>
-                            {typeof conf === 'number' && <span>Confidence {(conf * (conf <= 1 ? 100 : 1)).toFixed(0)}%</span>}
-                            {typeof stress === 'number' && <span>Stress {stress.toFixed(2)}</span>}
+                        <div style={{ ...CS.regime, background: toneBg(r.tone), color: toneColor(r.tone) }}>
+                            {r.sentence}
                         </div>
                     </div>
                 )
-                : <Empty msg="No regime read yet." />)}
+                : <Empty msg="The market read isn’t ready yet — check back shortly." />)}
         </Shell>
     );
 }
@@ -196,17 +211,17 @@ function MacroRegimeCard({ title }) {
 // ── News momentum ──────────────────────────────────────────────────────
 
 function NewsCard({ title }) {
-    const { loading, error, data } = useFetch(() => api.getNewsMomentum(), []);
+    const { loading, error, data, reload } = useFetch(() => api.getNewsMomentum(), []);
     const direction = data?.direction || data?.momentum_direction || data?.trend || data?.state;
     const summary = data?.summary || data?.headline || data?.description;
     return (
-        <Shell title={title || "What's moving the news"}>
+        <Shell title={title || "What's in the news"}>
             {loading && <Loading />}
-            {error && <div style={CS.err}>Couldn’t load news.</div>}
+            {error && <ErrorState msg={warmError()} onRetry={reload} />}
             {data && (
                 <div style={CS.col}>
-                    {direction && <div style={{ ...CS.badge, ...sentimentStyle(direction) }}>{String(direction).toUpperCase()}</div>}
-                    {summary ? <div style={CS.body}>{summary}</div> : (!direction && <Empty msg="Quiet news flow." />)}
+                    {direction && <MoodBadge raw={direction} />}
+                    {summary ? <div style={CS.body}>{summary}</div> : (!direction && <Empty msg="It’s quiet — no big news right now." />)}
                 </div>
             )}
         </Shell>
@@ -216,28 +231,28 @@ function NewsCard({ title }) {
 // ── Money flow (sectors) ───────────────────────────────────────────────
 
 function MoneyFlowCard({ title }) {
-    const { loading, error, data } = useFetch(() => api.getSectorFlows(), []);
+    const { loading, error, data, reload } = useFetch(() => api.getSectorFlows(), []);
     const sectors = data?.sectors || [];
     const ranked = [...sectors]
         .filter((s) => typeof s?.sector_stress === 'number')
         .sort((a, b) => Math.abs(b.sector_stress) - Math.abs(a.sector_stress))
         .slice(0, 6);
     return (
-        <Shell title={title || 'Where the money is moving'}>
+        <Shell title={title || 'Where attention is going'}>
             {loading && <Loading />}
-            {error && <div style={CS.err}>Couldn’t load flows.</div>}
+            {error && <ErrorState msg={warmError()} onRetry={reload} />}
             {data && (ranked.length === 0
-                ? <Empty msg="No flow data yet." />
+                ? <Empty msg="Nothing notable moving right now." />
                 : (
                     <div style={CS.col}>
                         {ranked.map((s, i) => {
-                            const name = s.name || s.sector || s.etf || `Sector ${i + 1}`;
-                            const z = s.sector_stress;
+                            const name = s.name || s.sector || s.etf || `Group ${i + 1}`;
+                            const inflow = s.sector_stress >= 0;
                             return (
                                 <div key={i} style={CS.flowRow}>
-                                    <span style={CS.flowName}>{name}</span>
-                                    <span style={{ ...CS.flowZ, color: z >= 0 ? colors.green : colors.red }}>
-                                        {z >= 0 ? '▲' : '▼'} {Math.abs(z).toFixed(2)}
+                                    <span style={CS.flowName}>{String(name).replace(/_/g, ' ')}</span>
+                                    <span style={{ ...CS.flowWord, color: inflow ? colors.green : colors.red }}>
+                                        {inflow ? '▲ money coming in' : '▼ money pulling out'}
                                     </span>
                                 </div>
                             );
@@ -264,7 +279,7 @@ export function WidgetGrid({ widgets }) {
     if (!Array.isArray(widgets) || widgets.length === 0) return null;
     return (
         <div style={CS.grid}>
-            <style>{'@keyframes chatPulse{0%,100%{opacity:1}50%{opacity:0.25}}'}</style>
+            <style>{'@keyframes chatPulse{0%,100%{opacity:1}50%{opacity:0.25}}@keyframes sdBounce{0%,80%,100%{transform:translateY(0);opacity:.5}40%{transform:translateY(-5px);opacity:1}}'}</style>
             {widgets.map((w, i) => {
                 const Comp = REGISTRY[w.type];
                 if (!Comp) return null;
@@ -282,8 +297,8 @@ export function WidgetGrid({ widgets }) {
 const CS = {
     grid: {
         display: 'grid',
-        gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))',
-        gap: '14px',
+        gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))',
+        gap: '16px',
         width: '100%',
     },
     cell: { minWidth: 0 },
@@ -292,43 +307,46 @@ const CS = {
         background: colors.card,
         border: `1px solid ${colors.border}`,
         borderRadius: '14px',
-        padding: '16px 18px',
+        padding: '18px 20px',
         height: '100%',
         boxSizing: 'border-box',
     },
     title: {
-        fontSize: '12px', fontWeight: 700, textTransform: 'uppercase',
-        letterSpacing: '0.06em', color: colors.textMuted, marginBottom: '10px',
+        fontSize: '15px', fontWeight: 700, color: colors.text, marginBottom: '12px',
     },
-    col: { display: 'flex', flexDirection: 'column', gap: '10px' },
-    body: { fontSize: '15px', lineHeight: 1.55, color: colors.text, fontFamily: SANS },
-    dim: { fontSize: '13px', color: colors.textMuted, fontFamily: SANS },
+    col: { display: 'flex', flexDirection: 'column', gap: '12px' },
+    body: { fontSize: '17px', lineHeight: 1.55, color: colors.text, fontFamily: SANS },
+    dim: { fontSize: '15px', color: colors.textDim, fontFamily: SANS, lineHeight: 1.5 },
+    thinking: { display: 'flex', alignItems: 'center', gap: '10px', fontSize: '17px', color: colors.text, fontFamily: SANS },
+    thinkDots: { display: 'inline-flex', gap: '4px' },
+    dot: { width: '8px', height: '8px', borderRadius: '50%', background: colors.accentLight || colors.accent, animation: 'sdBounce 1.2s infinite' },
     caret: {
-        display: 'inline-block', width: '8px', height: '15px', marginLeft: '3px',
+        display: 'inline-block', width: '9px', height: '18px', marginLeft: '3px',
         background: colors.accent, verticalAlign: 'text-bottom', borderRadius: '1px',
         animation: 'chatPulse 1s ease-in-out infinite',
     },
-    err: { fontSize: '13px', color: colors.red, fontFamily: SANS },
-    priceRow: { display: 'flex', alignItems: 'baseline', gap: '10px', flexWrap: 'wrap' },
-    ticker: { fontSize: '22px', fontWeight: 800, color: colors.text, fontFamily: MONO, letterSpacing: '1px' },
-    price: { fontSize: '20px', fontWeight: 700, color: colors.text, fontFamily: MONO },
-    change: { fontSize: '14px', fontWeight: 700, fontFamily: MONO },
+    err: { fontSize: '16px', color: colors.red, fontFamily: SANS, lineHeight: 1.5 },
+    retry: {
+        alignSelf: 'flex-start', fontSize: '16px', fontWeight: 600, fontFamily: SANS,
+        color: '#fff', background: colors.accent, border: 'none', borderRadius: '10px',
+        padding: '12px 20px', minHeight: '48px', cursor: 'pointer',
+    },
+    priceRow: { display: 'flex', alignItems: 'baseline', gap: '12px', flexWrap: 'wrap' },
+    ticker: { fontSize: '22px', fontWeight: 800, color: colors.text, fontFamily: SANS },
+    price: { fontSize: '22px', fontWeight: 700, color: colors.text, fontFamily: MONO },
+    change: { fontSize: '18px', fontWeight: 700, fontFamily: MONO },
     badge: {
-        alignSelf: 'flex-start', fontSize: '11px', fontWeight: 700,
-        padding: '3px 9px', borderRadius: '6px', letterSpacing: '0.04em',
+        alignSelf: 'flex-start', fontSize: '15px', fontWeight: 700,
+        padding: '6px 14px', borderRadius: '8px',
     },
-    levels: { display: 'flex', flexWrap: 'wrap', gap: '8px', marginTop: '2px' },
-    level: { fontSize: '12px', fontFamily: MONO, color: colors.textDim },
-    levelK: { color: colors.textMuted },
-    chips: { display: 'flex', flexWrap: 'wrap', gap: '6px' },
+    chips: { display: 'flex', flexWrap: 'wrap', gap: '8px' },
     chip: {
-        fontSize: '12px', fontFamily: MONO, color: colors.text,
+        fontSize: '16px', fontFamily: SANS, color: colors.text,
         background: colors.bg, border: `1px solid ${colors.border}`,
-        padding: '4px 9px', borderRadius: '6px',
+        padding: '8px 14px', borderRadius: '8px',
     },
-    regime: { alignSelf: 'flex-start', fontSize: '18px', fontWeight: 800, padding: '6px 14px', borderRadius: '8px', textTransform: 'capitalize' },
-    meta: { display: 'flex', gap: '14px', fontSize: '12px', color: colors.textDim, fontFamily: MONO },
-    flowRow: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '14px' },
-    flowName: { color: colors.text, fontFamily: SANS, textTransform: 'capitalize' },
-    flowZ: { fontFamily: MONO, fontWeight: 700, fontSize: '13px' },
+    regime: { fontSize: '18px', fontWeight: 700, padding: '12px 16px', borderRadius: '10px', lineHeight: 1.4 },
+    flowRow: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', fontSize: '17px' },
+    flowName: { color: colors.text, fontFamily: SANS, textTransform: 'capitalize', fontWeight: 500 },
+    flowWord: { fontFamily: SANS, fontWeight: 600, fontSize: '15px', whiteSpace: 'nowrap' },
 };

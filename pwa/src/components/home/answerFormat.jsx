@@ -106,31 +106,33 @@ export function AnswerView({ text }) {
 }
 
 const S = {
-    wrap: { display: 'flex', flexDirection: 'column', gap: '14px', fontFamily: SANS },
+    wrap: { display: 'flex', flexDirection: 'column', gap: '16px', fontFamily: SANS },
     breaking: {
-        background: colors.redBg, color: colors.red, fontWeight: 700,
-        padding: '8px 12px', borderRadius: '8px', fontSize: '14px',
+        background: colors.redBg, color: colors.text, fontWeight: 700,
+        padding: '10px 14px', borderRadius: '8px', fontSize: '16px',
+        borderLeft: `4px solid ${colors.red}`,
     },
+    // The plain-English verdict must dominate the card — it's the answer he came for.
     headline: {
-        fontSize: '20px', fontWeight: 700, lineHeight: 1.35, color: colors.text,
-        letterSpacing: '-0.01em',
+        fontSize: '26px', fontWeight: 800, lineHeight: 1.3, color: colors.text,
+        letterSpacing: 0,
     },
-    list: { margin: 0, paddingLeft: '20px', display: 'flex', flexDirection: 'column', gap: '7px' },
-    li: { fontSize: '15px', lineHeight: 1.5, color: colors.textDim },
-    liAction: { fontSize: '15px', lineHeight: 1.5, color: colors.text, fontWeight: 500 },
-    body: { display: 'flex', flexDirection: 'column', gap: '8px' },
-    p: { margin: 0, fontSize: '15px', lineHeight: 1.6, color: colors.textDim },
+    list: { margin: 0, paddingLeft: '22px', display: 'flex', flexDirection: 'column', gap: '9px' },
+    li: { fontSize: '17px', lineHeight: 1.55, color: colors.text },
+    liAction: { fontSize: '17px', lineHeight: 1.55, color: colors.text, fontWeight: 600 },
+    body: { display: 'flex', flexDirection: 'column', gap: '9px' },
+    p: { margin: 0, fontSize: '17px', lineHeight: 1.6, color: colors.text },
     conflicts: {
-        fontSize: '14px', lineHeight: 1.5, color: colors.textDim,
-        borderLeft: `3px solid ${colors.yellow}`, paddingLeft: '12px',
+        fontSize: '17px', lineHeight: 1.55, color: colors.text,
+        borderLeft: `4px solid ${colors.yellow}`, paddingLeft: '14px',
     },
-    conflictsTag: { color: colors.yellow, fontWeight: 700, marginRight: '4px' },
+    conflictsTag: { color: colors.yellow, fontWeight: 700, marginRight: '5px' },
     actions: {
-        background: colors.greenBg, borderRadius: '10px', padding: '12px 14px',
+        background: colors.greenBg, borderRadius: '10px', padding: '14px 16px',
         border: `1px solid ${colors.green}33`,
     },
     actionsTitle: {
-        fontSize: '11px', fontWeight: 700, textTransform: 'uppercase',
-        letterSpacing: '0.08em', color: colors.green, marginBottom: '8px',
+        fontSize: '15px', fontWeight: 700, textTransform: 'none',
+        letterSpacing: 0, color: colors.green, marginBottom: '9px',
     },
 };
