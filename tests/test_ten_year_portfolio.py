@@ -11,34 +11,43 @@ from strategy.ten_year_portfolio import (
 from api.routers.ten_year_portfolio import _load_price_history
 
 
-class _FakeConnection:
-    def __init__(self):
-        self.sql = ""
-        self.params = {}
-        self.calls = []
+class _FakeCursor:
+    def __init__(self, calls: list):
+        self._calls = calls
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_):
-        return False
-
-    def execute(self, sql, params):
-        self.sql = str(sql)
-        self.params = params
-        self.calls.append((str(sql), params))
-        return self
+    def execute(self, sql, params=None):
+        self._calls.append((str(sql), params))
 
     def fetchall(self):
         return []
 
 
+class _FakeConnection:
+    def __init__(self, calls: list):
+        self._calls = calls
+
+    def cursor(self):
+        return _FakeCursor(self._calls)
+
+    def rollback(self):
+        return None
+
+    def close(self):
+        return None
+
+
+class _FakeURL:
+    def render_as_string(self, hide_password: bool = False) -> str:
+        return "postgresql://test:test@localhost:5432/test"
+
+
 class _FakeEngine:
     def __init__(self):
-        self.connection = _FakeConnection()
+        self.calls: list[tuple[str, object]] = []
+        self.url = _FakeURL()
 
-    def connect(self):
-        return self.connection
+    def make_connection(self):
+        return _FakeConnection(self.calls)
 
 
 def _weekly_growth(start: date, weeks: int, first: float, weekly_rate: float):
@@ -66,22 +75,46 @@ def test_parse_yf_series_id_accepts_close_fields_only():
     assert parse_yf_series_id("YF:AAPL:volume") is None
 
 
-def test_price_history_loader_uses_core_yahoo_adjusted_close_universe():
+def test_price_history_loader_uses_core_yahoo_adjusted_close_universe(monkeypatch):
     engine = _FakeEngine()
+
+    import api.routers.ten_year_portfolio as mod
+
+    monkeypatch.setattr(
+        mod.psycopg2,
+        "connect",
+        lambda dsn: engine.make_connection(),
+    )
 
     result = _load_price_history(engine, years=10)
 
     assert result == {}
-    raw_sql, raw_params = engine.connection.calls[0]
-    resolved_sql, resolved_params = engine.connection.calls[1]
-    assert "FROM raw_series" in raw_sql
-    assert "series_id IN" in raw_sql
-    assert "YF:AAPL:adj_close" in raw_params["series_ids"]
-    assert "YF:QQQ:adj_close" in raw_params["series_ids"]
-    assert "YF:CCJ:adj_close" in raw_params["series_ids"]
-    assert "YF:HPE:adj_close" in raw_params["series_ids"]
-    assert "JOIN resolved_series rs" in resolved_sql
-    assert "tsm_full" in resolved_params["feature_names"]
+    select_calls = [
+        (sql, params)
+        for sql, params in engine.calls
+        if "SET statement_timeout" not in sql
+    ]
+    raw_call = next(
+        (sql, params) for sql, params in select_calls if "FROM raw_series" in sql
+    )
+    resolved_call = next(
+        (sql, params)
+        for sql, params in select_calls
+        if "JOIN resolved_series rs" in sql
+    )
+    raw_sql, raw_params = raw_call
+    resolved_sql, resolved_params = resolved_call
+    raw_series_ids = raw_params[0]
+    resolved_feature_names = resolved_params[0]
+    # Frontier tickers without a *_full resolved equivalent hit raw_series.
+    assert "series_id = ANY" in raw_sql
+    assert "YF:CCJ:adj_close" in raw_series_ids
+    assert "YF:HPE:adj_close" in raw_series_ids
+    # Main 20 + thematic frontier tickers route through resolved_series.
+    assert "fr.name = ANY" in resolved_sql
+    assert "aapl_full" in resolved_feature_names
+    assert "qqq_full" in resolved_feature_names
+    assert "tsm_full" in resolved_feature_names
 
 
 def test_chart_metrics_reward_smooth_up_right_relative_to_qqq():
