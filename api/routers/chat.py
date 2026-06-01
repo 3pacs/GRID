@@ -11,6 +11,7 @@ when no LLM is available.
 
 from __future__ import annotations
 
+import concurrent.futures as _futures
 import inspect
 import re as _re
 import threading
@@ -311,6 +312,10 @@ class ChatComposeResponse(BaseModel):
     # shows the graceful "I'll build it for you" message + a ping opt-in.
     cannot_fulfill: bool = False
     request_id: int | None = None
+    # Set when the request created a price alert. The frontend shows a plain
+    # confirmation card instead of a dashboard layout.
+    alert_created: bool = False
+    alert: dict[str, Any] | None = None
 
 
 # ── Helpers: gather context from various GRID subsystems ────────────────
@@ -1069,6 +1074,97 @@ def _get_llm_client():
     return None, None
 
 
+# ── Resilient chat: local card first, PAID cloud when it's busy ─────────────
+# A busy llama.cpp server accepts the connection and then stalls (no token) —
+# which still looks "available" to a health check. So we bound every call with a
+# wall-clock timeout and, on timeout/error, fail over to a PAID cloud model to
+# keep dad's answers high quality (never a dumber local model). If even paid is
+# unreachable we return None so the caller can tell him honestly the card is
+# busy instead of faking an answer.
+
+_RESILIENT_EXEC = _futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="llm-failover")
+
+_LOCAL_CHAT_TIMEOUT_S = 18.0
+_PAID_CHAT_TIMEOUT_S = 45.0
+
+# Honest message when the card is busy AND no paid model answered.
+CARD_BUSY_MESSAGE = (
+    "The computer that does the deep thinking is busy right now. "
+    "Give me a couple of minutes and ask again — your price alerts keep working in the meantime."
+)
+
+
+def _call_with_timeout(fn, timeout_s: float):
+    """Run fn() with a wall-clock timeout. On timeout the underlying call is
+    abandoned (left to finish in the background), never cancelled."""
+    return _RESILIENT_EXEC.submit(fn).result(timeout=timeout_s)
+
+
+def _get_local_oracle():
+    """Best available LOCAL chat client (no cloud), or (None, None)."""
+    try:
+        from llm.router import get_llm, Tier
+        client = get_llm(Tier.ORACLE)
+        if client and getattr(client, "is_available", False):
+            return client, "qwen3.6-local"
+    except Exception as exc:
+        log.debug("Local ORACLE init failed: {e}", e=str(exc))
+    return None, None
+
+
+# PAID cloud providers tried (in order) when the local card is busy. OpenAI
+# first — it's funded; OpenRouter is a backup and can run dry (returns HTTP 402).
+_PAID_PROVIDERS = ("openai", "openrouter")
+
+
+def _paid_clients():
+    """Available PAID cloud clients, in priority order: [(client, label), ...]."""
+    from llm.router import get_llm
+    out = []
+    for prov in _PAID_PROVIDERS:
+        try:
+            client = get_llm(provider=prov)
+            if client and getattr(client, "is_available", False):
+                out.append((client, prov))
+        except Exception as exc:
+            log.debug("Paid client {p} unavailable: {e}", p=prov, e=str(exc))
+    return out
+
+
+def _resilient_chat(messages, *, temperature: float = 0.3, num_predict: int = 800):
+    """Local card first; on busy/slow/error, fail over through the paid cloud
+    models. Returns (text, label), or (None, None) when nothing responds."""
+    local, label = _get_local_oracle()
+    if local is not None:
+        try:
+            txt = _call_with_timeout(
+                lambda: local.chat(messages, temperature=temperature, num_predict=num_predict),
+                _LOCAL_CHAT_TIMEOUT_S,
+            )
+            if txt and txt.strip():
+                return txt, label
+            log.warning("Local LLM returned empty — failing over to paid")
+        except _futures.TimeoutError:
+            log.warning("Local card busy (>{t}s) — failing over to paid model", t=_LOCAL_CHAT_TIMEOUT_S)
+        except Exception as exc:
+            log.warning("Local LLM error ({e}) — failing over to paid", e=str(exc))
+
+    for paid, plabel in _paid_clients():
+        try:
+            txt = _call_with_timeout(
+                lambda p=paid: p.chat(messages, temperature=temperature, num_predict=num_predict),
+                _PAID_CHAT_TIMEOUT_S,
+            )
+            if txt and txt.strip():
+                log.info("Answered via paid model {l} (local card busy)", l=plabel)
+                return txt, plabel
+            log.warning("Paid model {l} returned empty — trying next", l=plabel)
+        except Exception as exc:
+            log.warning("Paid LLM {l} failed: {e} — trying next", l=plabel, e=str(exc))
+
+    return None, None
+
+
 # ── LLM response sanity checking ───────────────────────────────────────
 
 _PRICE_PATTERN = _re.compile(
@@ -1820,17 +1916,24 @@ def _compose_system_prompt() -> str:
         "- If they state holdings or weights (e.g. 'half in Apple'), fill `allocation` with {ticker, weight} (weights 0-1, sum ~1). Otherwise leave allocation empty.\n"
         "- Give each widget a short human title (e.g. 'Apple', 'Should you worry this week?').\n"
         "- `spoken_reply` is one warm, plain sentence confirming what you built. No jargon.\n"
+        "- PRICE ALERTS: if the user wants to be told/notified/texted when a stock crosses a "
+        "price (e.g. 'tell me when Apple hits 250', 'alert me if Tesla drops below 200', "
+        "'let me know when bitcoin goes above 100k'), return EXACTLY: "
+        '{"alert": {"ticker": "AAPL", "direction": "above"|"below", "threshold": 250, '
+        '"human": "Apple rises above $250"}}. Map the name to a symbol. Use "above" for '
+        "hits/reaches/rises/over/goes up to; \"below\" for drops/falls/under/goes down to. "
+        "Parse k/thousand and m/million into the number (100k -> 100000).\n"
         "- ACCURACY OVER EVERYTHING: if the request needs something you genuinely CANNOT do "
-        "with these widgets — e.g. set a price alert, connect/show his REAL brokerage or "
-        "account positions, place or recommend a trade, send a text/email, compare to his "
-        "personal holdings, anything not covered by the catalog — DO NOT fake it or substitute "
-        "a vaguely-related widget. Instead return EXACTLY: "
+        "with these widgets — e.g. connect/show his REAL brokerage or "
+        "account positions, place or recommend a trade, compare to his "
+        "personal holdings, anything not covered by the catalog or the alert action above — "
+        "DO NOT fake it or substitute a vaguely-related widget. Instead return EXACTLY: "
         '{"cannot_fulfill": true, "what_he_wanted": "<short plain description of the missing '
         'capability>", "reason": "<one plain sentence on why it is not available yet>"}.\n\n'
         "Respond with ONLY a JSON object, no markdown, no prose. Either a layout:\n"
         '{"spoken_reply": "...", "widgets": [{"type": "...", "title": "...", "props": {...}}], '
         '"allocation": [{"ticker": "...", "weight": 0.0}]}\n'
-        "or a cannot_fulfill object as described above."
+        "or an alert object, or a cannot_fulfill object as described above."
     )
 
 
@@ -1928,9 +2031,25 @@ async def compose_layout(
     now = datetime.now(timezone.utc)
     question = req.question.strip()
 
+    # Fast deterministic price alert — works instantly and even when the LLM is
+    # down (a price alert is a precise instruction, no 35B model required).
+    _alert = _parse_alert_intent(question)
+    if _alert:
+        owner = _user_id_from_token(token) or "dad"
+        from api.routers.price_alerts import create_alert_record
+        res = create_alert_record(
+            owner, _alert["ticker"], _alert["direction"], _alert["threshold"],
+            note=question[:280],
+        )
+        if res.get("ok"):
+            return _alert_confirmation_response(res, now.isoformat(), "rule-based")
+        # Ambiguous (e.g. unknown ticker) — fall through to the LLM planner.
+
     # Deterministic refusal for obvious "can't do that yet" requests — logs the
-    # build request + tells the user gracefully, no LLM call needed.
-    _gap = _obvious_capability_gap(question)
+    # build request + tells the user gracefully, no LLM call needed. Skipped when
+    # the request looks like a price alert (a real feature): the planner LLM
+    # structures it below instead of it being mistaken for a capability gap.
+    _gap = None if _looks_like_price_alert(question) else _obvious_capability_gap(question)
     if _gap:
         owner = _user_id_from_token(token) or "dad"
         rid = _log_capability_gap(owner=owner, request_text=question, want=_gap[0], reason=_gap[1])
@@ -1947,25 +2066,49 @@ async def compose_layout(
     raw: dict[str, Any] | None = None
     model_used: str | None = None
 
-    client, backend = _get_llm_client()
-    if client is not None:
-        try:
-            messages: list[dict[str, str]] = [
-                {"role": "system", "content": _compose_system_prompt()},
-            ]
-            for msg in req.history[-6:]:
-                messages.append(
-                    {"role": msg.role, "content": _sanitize_history_content(msg.content)}
-                )
-            messages.append({"role": "user", "content": question})
-            answer = client.chat(messages, temperature=0.2, num_predict=800)
-            raw = _extract_json_object(answer or "")
-            model_used = getattr(client, "model", backend)
-        except Exception as exc:
-            log.warning("Compose LLM failed, using fallback layout: {e}", e=str(exc))
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": _compose_system_prompt()},
+    ]
+    for msg in req.history[-6:]:
+        messages.append(
+            {"role": msg.role, "content": _sanitize_history_content(msg.content)}
+        )
+    messages.append({"role": "user", "content": question})
+
+    # Local card first; fail over to a paid model if it's busy. None means even
+    # paid was unreachable — be honest rather than fake a layout.
+    answer, model_used = _resilient_chat(messages, temperature=0.2, num_predict=800)
+    if answer is None:
+        return ChatComposeResponse(
+            spoken_reply=CARD_BUSY_MESSAGE,
+            widgets=[], allocation=[],
+            generated_at=now.isoformat(), model_used=None,
+        )
+    raw = _extract_json_object(answer or "")
 
     if raw is None:
         raw = {}
+
+    # Price alert: the planner structured a "tell me when X crosses $Y" request.
+    # Create it and confirm in plain language (no dashboard for this intent).
+    if isinstance(raw.get("alert"), dict):
+        owner = _user_id_from_token(token) or "dad"
+        spec = raw["alert"]
+        from api.routers.price_alerts import create_alert_record
+        res = create_alert_record(
+            owner,
+            str(spec.get("ticker") or ""),
+            str(spec.get("direction") or ""),
+            spec.get("threshold"),
+            note=str(spec.get("human") or question)[:280],
+        )
+        if res.get("ok"):
+            return _alert_confirmation_response(res, now.isoformat(), model_used)
+        # Couldn't build it (missing ticker/price) — ask plainly, don't fake it.
+        return ChatComposeResponse(
+            spoken_reply=res.get("error") or "I need a stock and a price to watch — try 'tell me when Apple hits $250'.",
+            widgets=[], allocation=[], generated_at=now.isoformat(), model_used=model_used,
+        )
 
     # Honest refusal: the planner flagged a capability we don't have yet. Log it
     # as a build request, email the operator, and tell the user gracefully.
@@ -2023,7 +2166,33 @@ def _ensure_capability_table(engine) -> None:
         conn.execute(text(_CAPABILITY_DDL))
 
 
+# Operator gets a real iMessage via the Mac mini's notify-anik script (which
+# drives Messages.app). grid-svr (user `grid`) can ssh to anikdang@aniks-mac-mini.
+_MAC_MINI_SSH = "anikdang@aniks-mac-mini"
+
+
+def _imessage_operator(message: str) -> bool:
+    try:
+        import subprocess
+        subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=8", "-o", "BatchMode=yes",
+             _MAC_MINI_SSH, "~/bin/notify-anik"],
+            input=message, text=True, timeout=25,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True,
+        )
+        return True
+    except Exception as exc:
+        log.debug("Operator iMessage failed (non-fatal): {e}", e=str(exc))
+        return False
+
+
 def _email_capability_gap(rid, owner, request_text, want, reason) -> None:
+    # Text the operator (fast ping) — this is the "ping me so I build it asap".
+    _imessage_operator(
+        f"stepdad.finance — {owner} asked for \"{want or request_text}\" "
+        f"(can't do it yet). Build request #{rid}."
+    )
+    # Email too (full detail).
     try:
         from scripts.notify import send_insight_email
         subject = f"[stepdad.finance] {owner} asked for something new (#{rid})"
@@ -2032,7 +2201,8 @@ def _email_capability_gap(rid, owner, request_text, want, reason) -> None:
             f"Capability needed: {want or '(unspecified)'}\n"
             f"Why we couldn't do it: {reason or '(unspecified)'}\n\n"
             f"Logged as build request #{rid} (sd_capability_requests, status=new).\n"
-            f"Build it, set status='ready', and {owner} gets pinged if they opted in."
+            f"Build it, then POST /api/v1/chat/capability/{rid}/ready "
+            f"and {owner} gets pinged if they opted in."
         )
         send_insight_email(subject, body)
     except Exception as exc:
@@ -2043,10 +2213,11 @@ def _email_capability_gap(rid, owner, request_text, want, reason) -> None:
 # obvious cases are reliable (and skip the LLM call entirely). The planner LLM
 # still handles nuanced refusals via the cannot_fulfill path.
 _GAP_PATTERNS = [
-    (r"\b(price\s+)?alerts?\b|\balert me\b|\bwatch (the )?price\b",
-     "set a price alert", "stepdad.finance can't set price alerts yet"),
-    (r"\b(text|sms|message|e-?mail|call|notify|ping|remind|tell)\s+me\b",
-     "send you a notification (text or email)", "stepdad.finance can't send you messages yet"),
+    # NOTE: price alerts are a real feature now (see _looks_like_price_alert +
+    # the compose alert path). Only NON-alert notification asks fall through to
+    # this gap (e.g. "email me a daily summary").
+    (r"\b(text|sms|message|e-?mail|call|notify|ping|remind)\s+me\b.{0,40}\b(daily|weekly|every|summary|digest|report|morning|recap)\b",
+     "send you scheduled notifications (text or email)", "stepdad.finance can't send scheduled digests yet"),
     (r"\b(connect|link|sync|log\s*in to|hook\s*up)\b.{0,30}\b(account|brokerage|broker|schwab|fidelity|thinkorswim|robinhood|e-?trade|vanguard|coinbase|webull|interactive brokers)\b",
      "connect your real brokerage account", "stepdad.finance can't link to brokerage accounts yet"),
     (r"\b(place|execute|enter|put in|make|submit)\b.{0,20}\b(trade|order)\b|\b(buy|sell)\b.{0,20}\bfor me\b|\bactually (buy|sell)\b",
@@ -2062,6 +2233,104 @@ def _obvious_capability_gap(question: str) -> tuple[str, str] | None:
         if _re.search(pat, q):
             return want, reason
     return None
+
+
+# Price-alert intent: a number/price plus a threshold or notify cue. Used only
+# to STEER routing — when true we skip the capability-gap check and let the
+# planner LLM structure the alert (it maps company names to symbols reliably).
+_ALERT_NUMBER = _re.compile(r"\$?\d[\d,]*\.?\d*\s*[kmKM]?\b")
+_ALERT_THRESHOLD_CUE = _re.compile(
+    r"\b(above|below|over|under|hits?|reach(es)?|drops?|falls?|rises?|crosses?|"
+    r"goes?\s+(to|above|below|up|down)|gets?\s+(to|above|below)|when\s+it)\b", _re.I)
+_ALERT_NOTIFY_CUE = _re.compile(
+    r"\b(alert|notify|tell me|text me|let me know|ping me|remind me|warn me|watch)\b", _re.I)
+
+
+def _looks_like_price_alert(question: str) -> bool:
+    q = question or ""
+    if not _ALERT_NUMBER.search(q):
+        return False
+    return bool(_ALERT_THRESHOLD_CUE.search(q) or _ALERT_NOTIFY_CUE.search(q))
+
+
+# Common names dad would actually type → tickers. Keeps the fast deterministic
+# alert path working without an LLM. Unknown names fall through to the planner.
+_ALERT_NAME_TO_TICKER = {
+    "apple": "AAPL", "tesla": "TSLA", "nvidia": "NVDA", "microsoft": "MSFT",
+    "google": "GOOGL", "alphabet": "GOOGL", "amazon": "AMZN", "meta": "META",
+    "facebook": "META", "netflix": "NFLX", "disney": "DIS", "walmart": "WMT",
+    "coca cola": "KO", "coke": "KO", "boeing": "BA", "ford": "F",
+    "gold": "GLD", "silver": "SLV", "bitcoin": "BTC-USD", "ethereum": "ETH-USD",
+    "s&p 500": "SPY", "s&p500": "SPY", "s&p": "SPY", "sp500": "SPY",
+    "nasdaq": "QQQ", "dow": "DIA", "oil": "USO", "natural gas": "UNG",
+}
+_ALERT_ABOVE = _re.compile(
+    r"\b(above|over|hits?|reach(es)?|rise[sn]?|rising|tops?|breaks?|exceeds?|"
+    r"up to|goes?\s*up|climbs?|past|crosses?)\b", _re.I)
+_ALERT_BELOW = _re.compile(
+    r"\b(below|under|drops?|falls?|dips?|down to|goes?\s*down|sinks?|loses?)\b", _re.I)
+_ALERT_NUM = _re.compile(r"\$?\s*([\d,]+(?:\.\d+)?)\s*([kKmM])?\b")
+
+
+def _parse_alert_intent(question: str) -> dict | None:
+    """Deterministically extract {ticker, direction, threshold} from a plain
+    request. Returns None when anything is ambiguous (then the LLM handles it).
+    Works with the LLM down — a price alert is a precise instruction."""
+    q = question or ""
+    ql = q.lower()
+
+    m = _ALERT_NUM.search(q)
+    if not m:
+        return None
+    try:
+        num = float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    suffix = (m.group(2) or "").lower()
+    if suffix == "k":
+        num *= 1_000
+    elif suffix == "m":
+        num *= 1_000_000
+    if num <= 0:
+        return None
+
+    if _ALERT_BELOW.search(ql):
+        direction = "below"
+    elif _ALERT_ABOVE.search(ql):
+        direction = "above"
+    else:
+        return None
+
+    ticker = None
+    for name, sym in sorted(_ALERT_NAME_TO_TICKER.items(), key=lambda kv: -len(kv[0])):
+        if name in ql:
+            ticker = sym
+            break
+    if ticker is None:
+        explicit = _re.search(r"\$([A-Za-z]{1,6})\b", q) or _re.search(r"\b([A-Z]{2,5})\b", q)
+        if explicit:
+            ticker = explicit.group(1).upper()
+    if not ticker:
+        return None
+
+    return {"ticker": ticker, "direction": direction, "threshold": num}
+
+
+def _alert_confirmation_response(res: dict, now_iso: str, model_used: str | None) -> "ChatComposeResponse":
+    """Plain-language confirmation card for a created price alert."""
+    tk, direction, thr = res["ticker"], res["direction"], res["threshold"]
+    px = res.get("current_price")
+    word = "rises above" if direction == "above" else "drops below"
+    reply = f"Done — I'll text you the moment {tk} {word} ${thr:,.2f}."
+    if res.get("already_met") and px is not None:
+        reply += f" Heads up: it's already there (${px:,.2f} right now), so you'll hear from me shortly."
+    elif px is not None:
+        reply += f" It's ${px:,.2f} right now."
+    return ChatComposeResponse(
+        spoken_reply=reply, widgets=[], allocation=[],
+        generated_at=now_iso, model_used=model_used,
+        alert_created=True, alert=res,
+    )
 
 
 def _log_capability_gap(*, owner: str, request_text: str, want: str, reason: str) -> int | None:
@@ -2114,6 +2383,27 @@ async def set_capability_ping(
     except Exception as exc:
         log.warning("Set capability ping pref failed: {e}", e=str(exc))
         return {"ok": False}
+
+
+@router.post("/capability/{request_id}/ready")
+async def mark_capability_ready(request_id: int, token: str = Depends(require_auth)) -> dict:
+    """Operator marks a 'TODO for dad' request built. The owner then sees the
+    in-app 'it's ready' banner next time they load (via /capability/ready)."""
+    from sqlalchemy import text
+    try:
+        engine = _get_db_engine()
+        _ensure_capability_table(engine)
+        with engine.begin() as conn:
+            row = conn.execute(text(
+                "UPDATE sd_capability_requests SET status = 'ready', built_at = now() "
+                "WHERE id = :id RETURNING owner, want"
+            ), {"id": request_id}).fetchone()
+        if not row:
+            return {"ok": False, "error": "not found"}
+        return {"ok": True, "request_id": request_id, "owner": row[0], "want": row[1]}
+    except Exception as exc:
+        log.warning("Mark capability ready failed: {e}", e=str(exc))
+        return {"ok": False, "error": str(exc)}
 
 
 @router.get("/capability")
@@ -2170,8 +2460,20 @@ def _sse(obj: dict) -> str:
     return f"data: {json.dumps(obj)}\n\n"
 
 
-def _stream_llm_tokens(messages: list[dict[str, str]], client):
-    """Yield SSE events streaming the LLM completion token-by-token."""
+# If the local card sends no token within this window it's busy — fail over to
+# a paid model rather than letting dad watch a dead spinner for minutes.
+_STREAM_FIRST_TOKEN_S = 15.0
+
+
+def _chunk_text(s: str, n: int = 64):
+    for i in range(0, len(s), n):
+        yield s[i:i + n]
+
+
+def _stream_local_tokens(messages, client):
+    """Stream the local card token-by-token. Yields ('delta', text) tuples and a
+    final ('end', None). The first element of the first yield is ('started', None)
+    once any token arrives, so the caller knows local actually produced output."""
     import json
     import requests
 
@@ -2191,31 +2493,67 @@ def _stream_llm_tokens(messages: list[dict[str, str]], client):
         "Authorization": f"Bearer {getattr(client, 'api_key', '')}",
         "Content-Type": "application/json",
     }
-    timeout = getattr(client, "timeout", 300)
-    try:
-        with requests.post(
-            f"{base_url}/chat/completions",
-            json=payload, headers=headers, stream=True, timeout=timeout,
-        ) as resp:
-            if resp.status_code >= 400:
-                yield _sse({"error": True, "message": f"LLM HTTP {resp.status_code}"})
-                return
-            for raw in resp.iter_lines(decode_unicode=True):
-                if not raw:
-                    continue
-                line = raw[6:] if raw.startswith("data: ") else raw
-                if line.strip() == "[DONE]":
-                    break
-                try:
-                    delta = json.loads(line)["choices"][0]["delta"].get("content", "")
-                except Exception:
-                    continue
-                if delta:
-                    yield _sse({"delta": delta})
+    with requests.post(
+        f"{base_url}/chat/completions",
+        json=payload, headers=headers, stream=True,
+        timeout=(5, _STREAM_FIRST_TOKEN_S),
+    ) as resp:
+        if resp.status_code >= 400:
+            raise RuntimeError(f"local LLM HTTP {resp.status_code}")
+        for raw in resp.iter_lines(decode_unicode=True):
+            if not raw:
+                continue
+            line = raw[6:] if raw.startswith("data: ") else raw
+            if line.strip() == "[DONE]":
+                break
+            try:
+                delta = json.loads(line)["choices"][0]["delta"].get("content", "")
+            except Exception:
+                continue
+            if delta:
+                yield ("delta", delta)
+    yield ("end", None)
+
+
+def _stream_verdict(messages):
+    """SSE generator: stream from the local card; if it's busy/slow/down, fail
+    over to a paid model (emitted in chunks). If even paid is unreachable, tell
+    dad honestly the card is busy rather than faking an answer."""
+    got_any = False
+    local, _label = _get_local_oracle()
+    if local is not None:
+        try:
+            for kind, val in _stream_local_tokens(messages, local):
+                if kind == "delta":
+                    got_any = True
+                    yield _sse({"delta": val})
+        except Exception as exc:
+            log.warning("Local verdict stream failed ({e}) — failing over", e=str(exc))
+
+    if got_any:
         yield _sse({"done": True})
-    except Exception as exc:
-        log.warning("Verdict stream failed: {e}", e=str(exc))
-        yield _sse({"error": True, "message": "stream interrupted"})
+        return
+
+    # Local produced nothing (busy/down) — paid models keep the answer smart.
+    for paid, plabel in _paid_clients():
+        try:
+            txt = _call_with_timeout(
+                lambda p=paid: p.chat(messages, temperature=0.3, num_predict=2000),
+                _PAID_CHAT_TIMEOUT_S,
+            )
+            if txt and txt.strip():
+                log.info("Verdict via paid model {l} (local card busy)", l=plabel)
+                for chunk in _chunk_text(txt, 64):
+                    yield _sse({"delta": chunk})
+                yield _sse({"done": True})
+                return
+            log.warning("Paid verdict {l} empty — trying next", l=plabel)
+        except Exception as exc:
+            log.warning("Paid verdict {l} failed: {e} — trying next", l=plabel, e=str(exc))
+
+    # Nothing answered — honest, no fake.
+    yield _sse({"delta": CARD_BUSY_MESSAGE})
+    yield _sse({"done": True})
 
 
 @router.post("/ask/stream")
@@ -2239,15 +2577,6 @@ async def ask_grid_stream(
         question, ticker, include_research=False, budget_s=8
     )
 
-    client, backend = _get_llm_client()
-
-    if client is None:
-        def _fallback():
-            answer = _build_rule_based_response(context_text, question, sources)
-            yield _sse({"delta": answer})
-            yield _sse({"done": True})
-        return StreamingResponse(_fallback(), media_type="text/event-stream")
-
     system_content = _build_system_prompt()
     if context_text:
         system_content += f"\n\n## Current GRID Context\n\n{context_text}"
@@ -2256,8 +2585,10 @@ async def ask_grid_stream(
         messages.append({"role": msg.role, "content": _sanitize_history_content(msg.content)})
     messages.append({"role": "user", "content": question})
 
+    # _stream_verdict handles the whole resilience chain: local card → paid model
+    # → honest "card busy". No separate client-None branch needed.
     return StreamingResponse(
-        _stream_llm_tokens(messages, client),
+        _stream_verdict(messages),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

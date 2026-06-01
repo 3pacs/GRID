@@ -412,6 +412,7 @@ for _label, _module_path, _required in [
     ("postmortem_lessons", "api.routers.postmortem_lessons", False),
     ("tps", "api.routers.tps", False),
     ("ten_year_portfolio", "api.routers.ten_year_portfolio", False),
+    ("price_alerts", "api.routers.price_alerts", False),
 ]:
     _router = _load_router(_module_path, label=_label, required=_required)
     if _router is not None:

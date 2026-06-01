@@ -13,7 +13,7 @@ const SUGGESTIONS = [
     'How are my stocks doing?',
     "What's the market doing right now?",
     'Should I worry about Apple and Tesla this week?',
-    "What's happening with gold and Bitcoin?",
+    'Tell me when Apple hits $250',
 ];
 
 /**
@@ -28,6 +28,8 @@ export default function Home() {
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
     const [gap, setGap] = useState(null); // { message, requestId, answered: null|'yes'|'no' }
+    const [alertNote, setAlertNote] = useState(null); // confirmation after creating a price alert
+    const [alerts, setAlerts] = useState([]); // active price alerts — what we're watching for him
     const inputRef = useRef(null);
     const topRef = useRef(null);
 
@@ -37,17 +39,37 @@ export default function Home() {
     // after an answer arrives (it would cover the answer he just asked for).
     useEffect(() => { if (!hasLayout) inputRef.current?.focus(); }, [hasLayout]);
 
+    // Load the alerts he's already set so he can see (and cancel) them.
+    const loadAlerts = useCallback(async () => {
+        try {
+            const res = await api.listAlerts();
+            setAlerts((res?.alerts || []).filter((a) => a.active));
+        } catch { /* non-fatal — alerts panel just stays empty */ }
+    }, []);
+    useEffect(() => { loadAlerts(); }, [loadAlerts]);
+
+    const removeAlert = useCallback(async (id) => {
+        setAlerts((list) => list.filter((a) => a.id !== id)); // optimistic
+        try { await api.cancelAlert(id); } catch { /* non-fatal */ } finally { loadAlerts(); }
+    }, [loadAlerts]);
+
     const compose = useCallback(async (text) => {
         const q = (text ?? input).trim();
         if (!q || loading) return;
         setInput('');
         setError(null);
         setGap(null);
+        setAlertNote(null);
         setLoading(true);
         const nextHistory = [...history, { role: 'user', content: q }];
         try {
             const res = await api.compose(q, history);
-            if (res?.cannot_fulfill) {
+            if (res?.alert_created) {
+                // He set a price alert — confirm plainly + refresh the watching list.
+                setAlertNote(res.spoken_reply);
+                loadAlerts();
+                topRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            } else if (res?.cannot_fulfill) {
                 // Honest "can't do that yet" — show the graceful message + ping opt-in.
                 setGap({ message: res.spoken_reply, requestId: res.request_id, answered: null });
                 topRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -69,14 +91,14 @@ export default function Home() {
         } finally {
             setLoading(false);
         }
-    }, [input, loading, history]);
+    }, [input, loading, history, loadAlerts]);
 
     // Single-line inputs: any Enter submits.
     const handleKeyDown = (e) => {
         if (e.key === 'Enter') { e.preventDefault(); compose(); }
     };
 
-    const reset = () => { setLayout(null); setHistory([]); setError(null); setInput(''); setGap(null); };
+    const reset = () => { setLayout(null); setHistory([]); setError(null); setInput(''); setGap(null); setAlertNote(null); };
 
     const answerGap = useCallback(async (wants) => {
         const rid = gap?.requestId;
@@ -110,6 +132,7 @@ export default function Home() {
                     ) : (
                         <>
                             {gap && <GapCard gap={gap} onAnswer={answerGap} />}
+                            {alertNote && <AlertCard message={alertNote} />}
                             <div style={S.tagline}>Tap a question below, or type your own.</div>
                             <div style={S.boxWrap}>
                                 <input ref={inputRef} style={S.box} placeholder="Ask me anything…" {...inputProps} />
@@ -124,6 +147,7 @@ export default function Home() {
                                     <button key={i} style={S.chip} onClick={() => compose(s)}>{s}</button>
                                 ))}
                             </div>
+                            <AlertsPanel alerts={alerts} onCancel={removeAlert} />
                         </>
                     )}
                 </div>
@@ -138,6 +162,7 @@ export default function Home() {
                             <button style={S.startOver} onClick={reset}>← Start over</button>
                         </div>
                         {gap && <GapCard gap={gap} onAnswer={answerGap} />}
+                        {alertNote && <AlertCard message={alertNote} />}
                         {layout.spoken && <div style={S.spoken}>{layout.spoken}</div>}
                         {layout.allocation?.length > 0 && (
                             <div style={S.allocWrap}>
@@ -152,6 +177,7 @@ export default function Home() {
                             </div>
                         )}
                         <WidgetGrid widgets={layout.widgets} />
+                        <AlertsPanel alerts={alerts} onCancel={removeAlert} />
                         {error && <div style={S.error}>{error}</div>}
                         {loading && <div style={S.workingInline}><Dots /> Working on it…</div>}
                     </div>
@@ -206,12 +232,45 @@ function GapCard({ gap, onAnswer }) {
     );
 }
 
+// Confirmation shown right after he sets a price alert.
+function AlertCard({ message }) {
+    return (
+        <div style={S.alertCard}>
+            <div style={S.alertCardMsg}>🔔 {message}</div>
+        </div>
+    );
+}
+
+// The standing list of price alerts we're watching for him, each cancelable.
+function AlertsPanel({ alerts, onCancel }) {
+    if (!alerts || alerts.length === 0) return null;
+    return (
+        <div style={S.alertsPanel}>
+            <div style={S.alertsTitle}>🔔 I’m watching these for you</div>
+            {alerts.map((a) => (
+                <div key={a.id} style={S.alertRow}>
+                    <span style={S.alertRowText}>
+                        {tickerName(a.ticker)} {a.direction === 'above' ? 'goes above' : 'drops below'}{' '}
+                        ${Number(a.threshold).toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                    </span>
+                    <button style={S.alertCancel} onClick={() => onCancel(a.id)}>Cancel</button>
+                </div>
+            ))}
+            <div style={S.alertsFoot}>I’ll text you the moment it happens.</div>
+        </div>
+    );
+}
+
 const S = {
     page: { display: 'flex', flexDirection: 'column', height: '100vh', width: '100%' },
     center: {
         flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center',
-        justifyContent: 'center', gap: '22px', padding: '24px', maxWidth: '660px',
-        margin: '0 auto', width: '100%',
+        // `safe center` keeps content centered when it fits but aligns to the
+        // top (instead of clipping) once the confirmation + watching list make
+        // it taller than the screen — so nothing is ever unreachable.
+        justifyContent: 'safe center', overflowY: 'auto', WebkitOverflowScrolling: 'touch',
+        gap: '22px', padding: '24px', maxWidth: '660px',
+        margin: '0 auto', width: '100%', boxSizing: 'border-box',
     },
     mascot: { width: 'auto', height: '140px', objectFit: 'contain', marginBottom: '-6px', filter: 'drop-shadow(0 6px 16px rgba(0,0,0,0.45))' },
     brand: { fontFamily: MONO, fontSize: '36px', fontWeight: 800, letterSpacing: '-0.5px' },
@@ -259,6 +318,29 @@ const S = {
         background: 'transparent', border: `2px solid ${colors.border}`, borderRadius: '12px',
         padding: '14px 22px', minHeight: '52px', cursor: 'pointer', flex: '1 1 auto',
     },
+
+    alertCard: {
+        width: '100%', boxSizing: 'border-box', background: `${colors.accent}14`,
+        border: `2px solid ${colors.accent}66`, borderRadius: '16px', padding: '20px',
+    },
+    alertCardMsg: { fontFamily: SANS, fontSize: '19px', lineHeight: 1.5, color: colors.text, fontWeight: 600 },
+    alertsPanel: {
+        width: '100%', boxSizing: 'border-box', background: colors.card,
+        border: `2px solid ${colors.border}`, borderRadius: '16px', padding: '18px',
+        display: 'flex', flexDirection: 'column', gap: '12px',
+    },
+    alertsTitle: { fontFamily: SANS, fontSize: '17px', fontWeight: 700, color: colors.text },
+    alertRow: {
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        gap: '12px', padding: '12px 0', borderTop: `1px solid ${colors.border}`,
+    },
+    alertRowText: { fontFamily: SANS, fontSize: '18px', fontWeight: 600, color: colors.text },
+    alertCancel: {
+        fontFamily: SANS, fontSize: '15px', fontWeight: 600, color: colors.text,
+        background: 'transparent', border: `2px solid ${colors.border}`, borderRadius: '10px',
+        padding: '10px 16px', minHeight: '44px', cursor: 'pointer', flexShrink: 0,
+    },
+    alertsFoot: { fontFamily: SANS, fontSize: '15px', color: colors.textDim || colors.text, opacity: 0.75 },
 
     working: { display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '14px', padding: '20px' },
     workingText: { fontFamily: SANS, fontSize: '19px', color: colors.text, fontWeight: 600 },
