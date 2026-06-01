@@ -307,6 +307,10 @@ class ChatComposeResponse(BaseModel):
     allocation: list[ComposeAllocationItem] = Field(default_factory=list)
     generated_at: str
     model_used: str | None = None
+    # Set when the request needs a capability we don't have yet. The frontend
+    # shows the graceful "I'll build it for you" message + a ping opt-in.
+    cannot_fulfill: bool = False
+    request_id: int | None = None
 
 
 # ── Helpers: gather context from various GRID subsystems ────────────────
@@ -1815,10 +1819,18 @@ def _compose_system_prompt() -> str:
         "- If they ask for an opinion/decision/worry, include ONE verdict widget with a clear props.question.\n"
         "- If they state holdings or weights (e.g. 'half in Apple'), fill `allocation` with {ticker, weight} (weights 0-1, sum ~1). Otherwise leave allocation empty.\n"
         "- Give each widget a short human title (e.g. 'Apple', 'Should you worry this week?').\n"
-        "- `spoken_reply` is one warm, plain sentence confirming what you built. No jargon.\n\n"
-        "Respond with ONLY a JSON object, no markdown, no prose:\n"
+        "- `spoken_reply` is one warm, plain sentence confirming what you built. No jargon.\n"
+        "- ACCURACY OVER EVERYTHING: if the request needs something you genuinely CANNOT do "
+        "with these widgets — e.g. set a price alert, connect/show his REAL brokerage or "
+        "account positions, place or recommend a trade, send a text/email, compare to his "
+        "personal holdings, anything not covered by the catalog — DO NOT fake it or substitute "
+        "a vaguely-related widget. Instead return EXACTLY: "
+        '{"cannot_fulfill": true, "what_he_wanted": "<short plain description of the missing '
+        'capability>", "reason": "<one plain sentence on why it is not available yet>"}.\n\n'
+        "Respond with ONLY a JSON object, no markdown, no prose. Either a layout:\n"
         '{"spoken_reply": "...", "widgets": [{"type": "...", "title": "...", "props": {...}}], '
-        '"allocation": [{"ticker": "...", "weight": 0.0}]}'
+        '"allocation": [{"ticker": "...", "weight": 0.0}]}\n'
+        "or a cannot_fulfill object as described above."
     )
 
 
@@ -1916,6 +1928,22 @@ async def compose_layout(
     now = datetime.now(timezone.utc)
     question = req.question.strip()
 
+    # Deterministic refusal for obvious "can't do that yet" requests — logs the
+    # build request + tells the user gracefully, no LLM call needed.
+    _gap = _obvious_capability_gap(question)
+    if _gap:
+        owner = _user_id_from_token(token) or "dad"
+        rid = _log_capability_gap(owner=owner, request_text=question, want=_gap[0], reason=_gap[1])
+        return ChatComposeResponse(
+            spoken_reply="I can't do that yet — but I'll build it for you. Want me to ping you when it's ready?",
+            widgets=[],
+            allocation=[],
+            generated_at=now.isoformat(),
+            model_used=None,
+            cannot_fulfill=True,
+            request_id=rid,
+        )
+
     raw: dict[str, Any] | None = None
     model_used: str | None = None
 
@@ -1939,6 +1967,23 @@ async def compose_layout(
     if raw is None:
         raw = {}
 
+    # Honest refusal: the planner flagged a capability we don't have yet. Log it
+    # as a build request, email the operator, and tell the user gracefully.
+    if raw.get("cannot_fulfill"):
+        owner = _user_id_from_token(token) or "dad"
+        what = str(raw.get("what_he_wanted") or question).strip()[:500]
+        reason = str(raw.get("reason") or "").strip()[:500]
+        req_id = _log_capability_gap(owner=owner, request_text=question, want=what, reason=reason)
+        return ChatComposeResponse(
+            spoken_reply="I can't do that yet — but I'll build it for you. Want me to ping you when it's ready?",
+            widgets=[],
+            allocation=[],
+            generated_at=now.isoformat(),
+            model_used=model_used,
+            cannot_fulfill=True,
+            request_id=req_id,
+        )
+
     widgets, allocation, spoken = _validate_compose_layout(raw, question)
 
     return ChatComposeResponse(
@@ -1948,6 +1993,169 @@ async def compose_layout(
         generated_at=now.isoformat(),
         model_used=model_used,
     )
+
+
+# ── Capability gaps: "I can't do that yet" → logged as a build request ──────
+# When the planner honestly refuses (accuracy over faking it), we record what
+# the user wanted in `sd_capability_requests` (the operator's "TODO for dad"
+# queue) and email the operator so it gets built ASAP. The user is told
+# gracefully and can opt into a ping when it ships.
+
+_CAPABILITY_DDL = """
+CREATE TABLE IF NOT EXISTS sd_capability_requests (
+    id             BIGSERIAL PRIMARY KEY,
+    owner          TEXT NOT NULL DEFAULT 'dad',
+    request_text   TEXT NOT NULL,
+    want           TEXT,
+    reason         TEXT,
+    status         TEXT NOT NULL DEFAULT 'new',   -- new | building | ready
+    dad_wants_ping BOOLEAN NOT NULL DEFAULT false,
+    created_at     TIMESTAMPTZ DEFAULT now(),
+    built_at       TIMESTAMPTZ,
+    notified_at    TIMESTAMPTZ
+)
+"""
+
+
+def _ensure_capability_table(engine) -> None:
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text(_CAPABILITY_DDL))
+
+
+def _email_capability_gap(rid, owner, request_text, want, reason) -> None:
+    try:
+        from scripts.notify import send_insight_email
+        subject = f"[stepdad.finance] {owner} asked for something new (#{rid})"
+        body = (
+            f'{owner} asked: "{request_text}"\n\n'
+            f"Capability needed: {want or '(unspecified)'}\n"
+            f"Why we couldn't do it: {reason or '(unspecified)'}\n\n"
+            f"Logged as build request #{rid} (sd_capability_requests, status=new).\n"
+            f"Build it, set status='ready', and {owner} gets pinged if they opted in."
+        )
+        send_insight_email(subject, body)
+    except Exception as exc:
+        log.debug("Capability gap email failed (non-fatal): {e}", e=str(exc))
+
+
+# Unambiguous "we can't do this yet" patterns — caught deterministically so the
+# obvious cases are reliable (and skip the LLM call entirely). The planner LLM
+# still handles nuanced refusals via the cannot_fulfill path.
+_GAP_PATTERNS = [
+    (r"\b(price\s+)?alerts?\b|\balert me\b|\bwatch (the )?price\b",
+     "set a price alert", "stepdad.finance can't set price alerts yet"),
+    (r"\b(text|sms|message|e-?mail|call|notify|ping|remind|tell)\s+me\b",
+     "send you a notification (text or email)", "stepdad.finance can't send you messages yet"),
+    (r"\b(connect|link|sync|log\s*in to|hook\s*up)\b.{0,30}\b(account|brokerage|broker|schwab|fidelity|thinkorswim|robinhood|e-?trade|vanguard|coinbase|webull|interactive brokers)\b",
+     "connect your real brokerage account", "stepdad.finance can't link to brokerage accounts yet"),
+    (r"\b(place|execute|enter|put in|make|submit)\b.{0,20}\b(trade|order)\b|\b(buy|sell)\b.{0,20}\bfor me\b|\bactually (buy|sell)\b",
+     "place a real trade for you", "stepdad.finance can't place trades yet"),
+    (r"\bmy (real|actual|live)\s+(positions|holdings|account|balance|portfolio|shares)\b",
+     "show your real account / live positions", "stepdad.finance can't see your real brokerage holdings yet"),
+]
+
+
+def _obvious_capability_gap(question: str) -> tuple[str, str] | None:
+    q = (question or "").lower()
+    for pat, want, reason in _GAP_PATTERNS:
+        if _re.search(pat, q):
+            return want, reason
+    return None
+
+
+def _log_capability_gap(*, owner: str, request_text: str, want: str, reason: str) -> int | None:
+    try:
+        from sqlalchemy import text
+        engine = _get_db_engine()
+        _ensure_capability_table(engine)
+        with engine.begin() as conn:
+            rid = conn.execute(
+                text(
+                    "INSERT INTO sd_capability_requests (owner, request_text, want, reason) "
+                    "VALUES (:o, :rt, :w, :rs) RETURNING id"
+                ),
+                {"o": owner, "rt": request_text, "w": want, "rs": reason},
+            ).scalar()
+        import threading
+        threading.Thread(
+            target=_email_capability_gap,
+            args=(rid, owner, request_text, want, reason),
+            daemon=True,
+        ).start()
+        log.info("Capability gap logged #{rid} for {o}: {w}", rid=rid, o=owner, w=want)
+        return int(rid) if rid is not None else None
+    except Exception as exc:
+        log.warning("Capability gap log failed: {e}", e=str(exc))
+        return None
+
+
+class CapabilityPingRequest(BaseModel):
+    wants: bool = True
+
+
+@router.post("/capability/{request_id}/ping")
+async def set_capability_ping(
+    request_id: int,
+    req: CapabilityPingRequest,
+    token: str = Depends(require_auth),
+) -> dict:
+    """Record whether the user wants a ping when this request is built."""
+    from sqlalchemy import text
+    try:
+        engine = _get_db_engine()
+        _ensure_capability_table(engine)
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE sd_capability_requests SET dad_wants_ping = :w WHERE id = :id"),
+                {"w": bool(req.wants), "id": request_id},
+            )
+        return {"ok": True, "request_id": request_id, "wants_ping": bool(req.wants)}
+    except Exception as exc:
+        log.warning("Set capability ping pref failed: {e}", e=str(exc))
+        return {"ok": False}
+
+
+@router.get("/capability")
+async def list_capability_requests(token: str = Depends(require_auth)) -> dict:
+    """Operator view of the 'TODO for dad' build queue."""
+    from sqlalchemy import text
+    cols = ["id", "owner", "request_text", "want", "reason", "status", "dad_wants_ping", "created_at", "built_at"]
+    try:
+        engine = _get_db_engine()
+        _ensure_capability_table(engine)
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                f"SELECT {', '.join(cols)} FROM sd_capability_requests ORDER BY created_at DESC LIMIT 200"
+            )).fetchall()
+        return {"requests": [dict(zip(cols, r)) for r in rows]}
+    except Exception as exc:
+        return {"requests": [], "error": str(exc)}
+
+
+@router.get("/capability/ready")
+async def capability_ready_for_me(token: str = Depends(require_auth)) -> dict:
+    """Requests this user opted into that are now built — shown once as a banner."""
+    from sqlalchemy import text
+    owner = _user_id_from_token(token) or "dad"
+    try:
+        engine = _get_db_engine()
+        _ensure_capability_table(engine)
+        with engine.begin() as conn:
+            rows = conn.execute(text(
+                "SELECT id, want FROM sd_capability_requests "
+                "WHERE owner = :o AND status = 'ready' AND dad_wants_ping = true "
+                "AND notified_at IS NULL ORDER BY built_at DESC LIMIT 5"
+            ), {"o": owner}).fetchall()
+            ids = [r[0] for r in rows]
+            if ids:
+                conn.execute(
+                    text("UPDATE sd_capability_requests SET notified_at = now() WHERE id = ANY(:ids)"),
+                    {"ids": ids},
+                )
+        return {"ready": [{"id": r[0], "want": r[1]} for r in rows]}
+    except Exception as exc:
+        return {"ready": [], "error": str(exc)}
 
 
 # ── Streaming verdict: token-by-token SSE for the stepdad.finance tile ──

@@ -27,6 +27,7 @@ export default function Home() {
     const [history, setHistory] = useState([]); // [{role, content}] for context
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
+    const [gap, setGap] = useState(null); // { message, requestId, answered: null|'yes'|'no' }
     const inputRef = useRef(null);
     const topRef = useRef(null);
 
@@ -41,11 +42,16 @@ export default function Home() {
         if (!q || loading) return;
         setInput('');
         setError(null);
+        setGap(null);
         setLoading(true);
         const nextHistory = [...history, { role: 'user', content: q }];
         try {
             const res = await api.compose(q, history);
-            if (res?.error) {
+            if (res?.cannot_fulfill) {
+                // Honest "can't do that yet" — show the graceful message + ping opt-in.
+                setGap({ message: res.spoken_reply, requestId: res.request_id, answered: null });
+                topRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            } else if (res?.error) {
                 setInput(q); // restore so he doesn't have to retype
                 setError('I couldn’t do that just now. Please try again.');
             } else {
@@ -70,7 +76,13 @@ export default function Home() {
         if (e.key === 'Enter') { e.preventDefault(); compose(); }
     };
 
-    const reset = () => { setLayout(null); setHistory([]); setError(null); setInput(''); };
+    const reset = () => { setLayout(null); setHistory([]); setError(null); setInput(''); setGap(null); };
+
+    const answerGap = useCallback(async (wants) => {
+        const rid = gap?.requestId;
+        setGap((g) => (g ? { ...g, answered: wants ? 'yes' : 'no' } : g));
+        if (rid != null) { try { await api.setCapabilityPing(rid, wants); } catch { /* non-fatal */ } }
+    }, [gap]);
 
     const inputProps = {
         value: input,
@@ -97,6 +109,7 @@ export default function Home() {
                         <Working />
                     ) : (
                         <>
+                            {gap && <GapCard gap={gap} onAnswer={answerGap} />}
                             <div style={S.tagline}>Tap a question below, or type your own.</div>
                             <div style={S.boxWrap}>
                                 <input ref={inputRef} style={S.box} placeholder="Ask me anything…" {...inputProps} />
@@ -124,6 +137,7 @@ export default function Home() {
                         <div style={S.header}>
                             <button style={S.startOver} onClick={reset}>← Start over</button>
                         </div>
+                        {gap && <GapCard gap={gap} onAnswer={answerGap} />}
                         {layout.spoken && <div style={S.spoken}>{layout.spoken}</div>}
                         {layout.allocation?.length > 0 && (
                             <div style={S.allocWrap}>
@@ -172,6 +186,26 @@ function Working() {
     );
 }
 
+// Shown when dad asks for something we can't do yet: a calm message + a
+// ping opt-in. His answer is recorded so he gets told when it ships.
+function GapCard({ gap, onAnswer }) {
+    if (gap.answered === 'yes') {
+        return <div style={S.gap}><div style={S.gapMsg}>👍 Great — I’ll let you know the moment it’s ready.</div></div>;
+    }
+    if (gap.answered === 'no') {
+        return <div style={S.gap}><div style={S.gapMsg}>No problem — I’ll still build it for you.</div></div>;
+    }
+    return (
+        <div style={S.gap}>
+            <div style={S.gapMsg}>{gap.message}</div>
+            <div style={S.gapBtns}>
+                <button style={S.gapYes} onClick={() => onAnswer(true)}>Yes, ping me</button>
+                <button style={S.gapNo} onClick={() => onAnswer(false)}>No thanks</button>
+            </div>
+        </div>
+    );
+}
+
 const S = {
     page: { display: 'flex', flexDirection: 'column', height: '100vh', width: '100%' },
     center: {
@@ -206,6 +240,25 @@ const S = {
         cursor: 'pointer', textAlign: 'left', minHeight: '56px', width: '100%',
     },
     error: { fontFamily: SANS, fontSize: '17px', color: colors.red, textAlign: 'center', lineHeight: 1.5 },
+
+    gap: {
+        width: '100%', boxSizing: 'border-box',
+        background: colors.card, border: `2px solid ${colors.accent}66`,
+        borderRadius: '16px', padding: '20px', display: 'flex',
+        flexDirection: 'column', gap: '16px',
+    },
+    gapMsg: { fontFamily: SANS, fontSize: '19px', lineHeight: 1.5, color: colors.text, fontWeight: 500 },
+    gapBtns: { display: 'flex', gap: '12px', flexWrap: 'wrap' },
+    gapYes: {
+        fontFamily: SANS, fontSize: '17px', fontWeight: 700, color: '#fff',
+        background: colors.accent, border: 'none', borderRadius: '12px',
+        padding: '14px 22px', minHeight: '52px', cursor: 'pointer', flex: '1 1 auto',
+    },
+    gapNo: {
+        fontFamily: SANS, fontSize: '17px', fontWeight: 600, color: colors.text,
+        background: 'transparent', border: `2px solid ${colors.border}`, borderRadius: '12px',
+        padding: '14px 22px', minHeight: '52px', cursor: 'pointer', flex: '1 1 auto',
+    },
 
     working: { display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '14px', padding: '20px' },
     workingText: { fontFamily: SANS, fontSize: '19px', color: colors.text, fontWeight: 600 },

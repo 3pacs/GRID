@@ -683,6 +683,14 @@ class GRIDApi {
         });
     }
 
+    /** Record whether dad wants a ping when a not-yet-built request ships. */
+    async setCapabilityPing(requestId, wants) {
+        return this._fetch(`/api/v1/chat/capability/${encodeURIComponent(requestId)}/ping`, {
+            method: 'POST',
+            body: JSON.stringify({ wants: !!wants }),
+        });
+    }
+
     /**
      * Streaming verdict (SSE). onDelta(fullTextSoFar) fires per chunk so the UI
      * can render the answer as it's written. Returns the final text. Pass an
