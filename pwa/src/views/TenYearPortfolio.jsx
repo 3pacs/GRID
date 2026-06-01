@@ -19,6 +19,8 @@ import {
     Upload,
 } from 'lucide-react';
 import { api } from '../api.js';
+import { isSimpleUser } from '../authSession.js';
+import { tickerName } from '../components/home/plain.js';
 
 const SANS = "'IBM Plex Sans', -apple-system, BlinkMacSystemFont, sans-serif";
 const MONO = "'JetBrains Mono', 'IBM Plex Mono', monospace";
@@ -28,6 +30,15 @@ const PROFILE_ICONS = {
     conservative_compounder: Shield,
     nasdaq_plus: Activity,
     sleep_well_growth: PieChart,
+};
+
+// Plain one-line descriptions of each profile, written for a non-technical
+// reader. Keyed by profile id; falls back to the backend description.
+const SIMPLE_PROFILE_BLURBS = {
+    dad_chartist: 'Steady big companies with strong long-term charts.',
+    conservative_compounder: 'Reliable companies that grow slowly and steadily, with less buying and selling.',
+    nasdaq_plus: 'Aims to do a bit better than the big tech market over time.',
+    sleep_well_growth: 'Smoother, calmer mix with smaller bets so it is easier to hold.',
 };
 
 const API_SETUP_KEY = 'grid_ten_year_api_setup';
@@ -269,6 +280,7 @@ function CandidateTable({ candidates }) {
 }
 
 export default function TenYearPortfolio() {
+    const simple = isSimpleUser();
     const [data, setData] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
@@ -397,6 +409,116 @@ export default function TenYearPortfolio() {
         setChatInput('');
         setHeartbeatAt(new Date());
     };
+
+    if (simple) {
+        const picks = activeProfile?.allocations || [];
+        const blurb = SIMPLE_PROFILE_BLURBS[activeProfile?.id] || activeProfile?.description || '';
+        const mc = monteCarlo;
+        const benchCagr = data?.benchmark?.cagr;
+        return (
+            <div className="ty-page ty-simple">
+                <style>{CSS}</style>
+                <header className="tys-header">
+                    <h1>10-Year Plan</h1>
+                    <p>A simple, long-term mix of strong, steady companies — checked every week.</p>
+                    <div className="tys-controls">
+                        <button onClick={load} disabled={loading} className="tys-btn">
+                            <RefreshCw size={20} />
+                            {loading ? 'Updating…' : 'Update'}
+                        </button>
+                    </div>
+                </header>
+
+                {error && <div className="tys-error">We could not load the plan just now. Please try Update again in a moment.</div>}
+
+                <section className="tys-block">
+                    <h2>Choose a style</h2>
+                    <div className="tys-profiles">
+                        {(data?.profiles || []).map(profile => (
+                            <button
+                                key={profile.id}
+                                className={`tys-profile ${profile.id === activeProfileId ? 'active' : ''}`}
+                                onClick={() => setActiveProfileId(profile.id)}
+                            >
+                                <strong>{profile.label}</strong>
+                                <span>{SIMPLE_PROFILE_BLURBS[profile.id] || profile.description}</span>
+                            </button>
+                        ))}
+                        {!data && [0, 1, 2, 3].map(item => <div key={item} className="tys-skel" />)}
+                    </div>
+                </section>
+
+                <section className="tys-block">
+                    <h2>{activeProfile?.label || 'Your mix'}</h2>
+                    {blurb && <p className="tys-lead">{blurb}</p>}
+                    <p className="tys-note-line">This is a sample mix to learn from — not advice.</p>
+                    {loading && !data ? (
+                        <div className="tys-loading">Loading the plan…</div>
+                    ) : picks.length ? (
+                        <ul className="tys-holdings">
+                            {picks.map(pick => (
+                                <li key={pick.ticker}>
+                                    <span className="tys-name">{tickerName(pick.ticker)}</span>
+                                    <span className="tys-weight">{pct(pick.target_weight, 0)}</span>
+                                </li>
+                            ))}
+                        </ul>
+                    ) : (
+                        <p className="tys-lead">Press Update to build the plan.</p>
+                    )}
+                </section>
+
+                <section className="tys-block">
+                    <h2>How it might do over 10 years</h2>
+                    <p className="tys-lead">
+                        If you put in {money(capital)} today, here is a rough range of what it
+                        could be worth in 10 years.
+                    </p>
+                    <div className="tys-outcomes">
+                        <div className="tys-outcome tys-low">
+                            <span>If it goes poorly</span>
+                            <strong>{money(mc?.p10)}</strong>
+                        </div>
+                        <div className="tys-outcome tys-mid">
+                            <span>Most likely</span>
+                            <strong>{money(mc?.p50)}</strong>
+                        </div>
+                        <div className="tys-outcome tys-high">
+                            <span>If it goes well</span>
+                            <strong>{money(mc?.p90)}</strong>
+                        </div>
+                    </div>
+                    <p className="tys-summary">
+                        In about {pct(mc?.probability_above_start, 0)} of the outcomes it ends up
+                        worth more than you started with. Nobody can promise the future — this is
+                        only a guide, not advice.
+                    </p>
+                </section>
+
+                <section className="tys-block">
+                    <h2>The simple picture</h2>
+                    <ul className="tys-facts">
+                        <li>
+                            <span>Yearly growth (rough)</span>
+                            <strong>{pct(mc?.expected_annual_return, 1)}</strong>
+                        </li>
+                        <li>
+                            <span>How bumpy the ride is</span>
+                            <strong>{pct(mc?.annual_volatility, 0)}</strong>
+                        </li>
+                        <li>
+                            <span>Compared to the big tech market</span>
+                            <strong>{benchCagr != null ? `about ${pct(benchCagr, 0)} a year` : 'n/a'}</strong>
+                        </li>
+                    </ul>
+                    <p className="tys-summary">
+                        “How bumpy” means how much the value can swing up and down along the way.
+                        A higher number means a rougher ride, even if it ends up fine.
+                    </p>
+                </section>
+            </div>
+        );
+    }
 
     return (
         <div className="ty-page">
@@ -1344,5 +1466,213 @@ const CSS = `
         max-width: none;
     }
     .ty-monte-grid { grid-template-columns: 1fr; }
+}
+
+/* ---- Simple (dad) view: large type, high contrast, big tap targets ---- */
+.ty-simple {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 28px 20px 64px;
+}
+.tys-header {
+    padding-bottom: 22px;
+    border-bottom: 2px solid rgba(132, 154, 166, 0.3);
+    margin-bottom: 26px;
+}
+.tys-header h1 {
+    margin: 0;
+    font-size: 40px;
+    line-height: 1.1;
+    color: #FFFFFF;
+    font-weight: 800;
+}
+.tys-header p {
+    margin: 12px 0 0;
+    font-size: 19px;
+    line-height: 1.5;
+    color: #DCE8EE;
+}
+.tys-controls {
+    margin-top: 20px;
+}
+.tys-btn {
+    min-height: 56px;
+    min-width: 160px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    border-radius: 12px;
+    border: 2px solid #5CC9A7;
+    background: #14463C;
+    color: #FFFFFF;
+    font-size: 20px;
+    font-weight: 800;
+    cursor: pointer;
+    padding: 0 24px;
+}
+.tys-btn:disabled { opacity: 0.6; cursor: default; }
+.tys-block {
+    background: #0E1D22;
+    border: 1px solid rgba(132, 154, 166, 0.3);
+    border-radius: 14px;
+    padding: 22px 22px 24px;
+    margin-bottom: 22px;
+}
+.tys-block h2 {
+    margin: 0 0 14px;
+    font-size: 26px;
+    color: #FFFFFF;
+    font-weight: 800;
+}
+.tys-lead {
+    font-size: 18px;
+    line-height: 1.55;
+    color: #E4EEF2;
+    margin: 0 0 8px;
+}
+.tys-note-line {
+    font-size: 16px;
+    color: #C7D6DD;
+    margin: 0 0 14px;
+}
+.tys-profiles {
+    display: grid;
+    gap: 12px;
+}
+.tys-profile {
+    text-align: left;
+    min-height: 56px;
+    padding: 16px 18px;
+    border-radius: 12px;
+    border: 2px solid rgba(132, 154, 166, 0.4);
+    background: #11242A;
+    color: #E4EEF2;
+    cursor: pointer;
+    display: grid;
+    gap: 5px;
+}
+.tys-profile strong {
+    font-size: 19px;
+    color: #FFFFFF;
+    font-weight: 800;
+}
+.tys-profile span {
+    font-size: 16px;
+    line-height: 1.45;
+    color: #C7D6DD;
+}
+.tys-profile.active {
+    border-color: #5CC9A7;
+    background: #173F37;
+}
+.tys-skel {
+    height: 78px;
+    border-radius: 12px;
+    background: #11242A;
+}
+.tys-holdings {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 0;
+}
+.tys-holdings li {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 14px;
+    padding: 16px 4px;
+    border-bottom: 1px solid rgba(132, 154, 166, 0.22);
+    font-size: 19px;
+}
+.tys-holdings li:last-child { border-bottom: none; }
+.tys-name { color: #FFFFFF; font-weight: 700; }
+.tys-weight {
+    color: #7FE3C4;
+    font-weight: 800;
+    font-size: 20px;
+    white-space: nowrap;
+}
+.tys-outcomes {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+    margin: 14px 0 16px;
+}
+.tys-outcome {
+    border-radius: 12px;
+    padding: 18px 14px;
+    text-align: center;
+    border: 2px solid rgba(132, 154, 166, 0.35);
+    background: #11242A;
+    display: grid;
+    gap: 8px;
+}
+.tys-outcome span {
+    font-size: 16px;
+    color: #DCE8EE;
+    line-height: 1.3;
+}
+.tys-outcome strong {
+    font-size: 24px;
+    color: #FFFFFF;
+    font-weight: 800;
+    overflow-wrap: anywhere;
+}
+.tys-low { border-color: rgba(224, 139, 109, 0.55); }
+.tys-mid { border-color: rgba(92, 201, 167, 0.6); background: #143A33; }
+.tys-high { border-color: rgba(127, 227, 196, 0.55); }
+.tys-summary {
+    font-size: 16px;
+    line-height: 1.55;
+    color: #D2E0E6;
+    margin: 10px 0 0;
+}
+.tys-facts {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+.tys-facts li {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 14px;
+    padding: 16px 4px;
+    border-bottom: 1px solid rgba(132, 154, 166, 0.22);
+}
+.tys-facts li:last-child { border-bottom: none; }
+.tys-facts span {
+    font-size: 18px;
+    color: #E4EEF2;
+}
+.tys-facts strong {
+    font-size: 20px;
+    color: #FFFFFF;
+    font-weight: 800;
+    white-space: nowrap;
+}
+.tys-error {
+    border: 2px solid rgba(224, 139, 109, 0.6);
+    background: rgba(224, 139, 109, 0.14);
+    color: #FFE3D8;
+    border-radius: 12px;
+    padding: 16px 18px;
+    margin-bottom: 22px;
+    font-size: 18px;
+    line-height: 1.5;
+}
+.tys-loading {
+    color: #DCE8EE;
+    font-size: 18px;
+    padding: 8px 0;
+}
+@media (max-width: 520px) {
+    .ty-simple { padding: 20px 14px 48px; }
+    .tys-header h1 { font-size: 32px; }
+    .tys-outcomes { grid-template-columns: 1fr; }
+    .tys-btn { width: 100%; }
 }
 `;
