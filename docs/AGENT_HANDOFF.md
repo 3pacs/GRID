@@ -1,3 +1,25 @@
+## 2026-06-02 23:30 UTC — 2026-06-02-2308
+**Why this matters next run:** PUNCH-LIST-2026-05-13.md is heavily stale — multiple P0/P1 items are already fixed in main. Skip them before walking the punch list. PR #291 (TIER 0 CI fix) is still open and unmerged — leave alone unless you have new info.
+
+- Shipped PUNCH-LIST line 52 [P2] — `tests/test_viz_router.py` smoke tests for the 9 unauthenticated `/api/v1/viz/*` routes (12 tests, all pass, ruff clean). **PR #292.**
+- **Verified STALE in `docs/PUNCH-LIST-2026-05-13.md` (no code change needed — confirmed against main HEAD `9cd73faa`):**
+   - Line 19 [P0] `oracle/engine.py` horizon helpers duplication — only one definition of each at lines 137 / 152 / 185. No second copy at line 2158.
+   - Line 20 [P0] Two `publish_astrogrid_prediction` implementations — `oracle/publisher_gate.py` is now a pure re-export shim (`from oracle.publish import publish_astrogrid_prediction`).
+   - Line 21 [P1] Duplicate `CalibrationReport` dataclass — only defined in `inference/calibration.py:57`; `oracle/calibration.py` no longer defines it.
+   - Lines 22–26 [P1] Missing tests for `oracle/firewall.py`, `oracle/publisher_gate.py`, `oracle/claim_extractor.py`, `oracle/claim_verifier.py`, `oracle/sanity_checker.py` — **all 5 test files exist** in `tests/`.
+   - Line 27 [P1] `Signal(name, family, z, 0, ...)` z_score=0 bug — `oracle/engine.py:835` now correctly passes `z` for both `value` AND `z_score`.
+- **Files still blocked by open PRs (don't edit this run, you'll merge-conflict yourself):** `api/routers/intel.py` (#256), `api/routers/oracle.py` (#240), `api/routers/intelligence_search.py` (#239), `api/routers/models.py` (#255), `api/routers/prediction_backtest.py` (#275), `api/dependencies.py` + `db.py` (#277), `tests/test_ten_year_portfolio.py` (#291), `tests/test_system_router.py` (#265).
+- **Remaining unclaimed punch-list items** (all P2 refactors, all 400–700 LOC — likely exceed the 25-min and 200-LOC budgets):
+   - Line 48: Split `canvas_expand.expand_node` (737 LOC) — `api/routers/canvas_expand.py`
+   - Line 49: Split `intel.intel_briefing` (509 LOC) — blocked by #256 anyway
+   - Line 50: Split `intelligence_risk._build_risk_map` (448 LOC) — `api/routers/intelligence_risk.py`
+   - Line 51: Split `flows._build_sector_connections` (464 LOC) — `api/routers/flows.py`
+- **TODO docs (`TODO-DATA-AUDIT.md`, `TODO-DUP-WRITES.md`) are multi-PR campaigns**, not single-PR items — skip for the routine flow.
+- **Latent bug still standing from 2026-05-26 handoff** (verified unfixed): `system.py::freshness()` (~line 422-426) attaches `stale_sources` to `resp.dict()` but `response_model=FreshnessResponse` strips it before serialization. ~5 LOC follow-up PR. `api/routers/system.py` is NOT currently file-claimed by any open PR.
+- **Env note:** This run's full bootstrap that worked for the viz smoke test: `pip install pytest fastapi httpx pydantic-settings sqlalchemy loguru python-dotenv passlib bcrypt pandas psycopg2-binary python-jose ruff && pip install --upgrade --ignore-installed cryptography` (the system `cryptography` 41 is debian-managed; `--ignore-installed` bypasses the "RECORD file not found" uninstall failure). Total ~90s. `tests/conftest.py` does load (pandas required) — tests collect after the cryptography upgrade.
+
+---
+
 ## 2026-06-01 23:10 UTC — 2026-06-01-2310
 **Why this matters next run:** main CI has been red since 2026-05-30 (PR #282 perf refactor broke `tests/test_ten_year_portfolio.py`). PR #291 fixes it — verify CI on the PR is green and request merge before doing anything else, then the alternative-pick list from 2026-05-29 is still the best queue.
 
