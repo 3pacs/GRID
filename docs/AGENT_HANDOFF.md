@@ -1,3 +1,18 @@
+## 2026-06-03 23:30 UTC — 2026-06-03-2308
+**Why this matters next run:** The standing latent bug from 2026-05-26 (`system.py::freshness()` stripping `stale_sources`) is now DONE in PR #293 — stop carrying it forward. Also: PR #291 (TIER 0 CI fix) is STILL open and unmerged after a full week. CI on `main` is still red against HEAD `9cd73faa` for the same `_FakeEngine` bug that #291 already fixes — DO NOT re-diagnose; ping the operator instead.
+
+- Shipped the named-target latent bug — **PR #293**. Added `StaleSource` model + `stale_sources: list[StaleSource] = []` to `FreshnessResponse` in `api/schemas/system.py`; refactored `freshness()` in `api/routers/system.py` to construct the typed model directly (dropped the `resp.dict()` attach pattern). New `tests/test_freshness_stale_sources.py` (2 tests, both pass: empty-default + populated-rows shape). 99 ins / 13 del across 3 files. Ruff clean.
+- **TIER 0 status:** `main` CI is still red — `GRID Tests` workflow run `26750529072` on `9cd73faa` failed with the same psycopg2 `_FakeEngine` shape issue PR #291 fixes. **PR #291 CI itself is green** (Backend Tests + Lint + Frontend Build + claude-review all success). The blocker is operator merge, not code. Do NOT open a duplicate fix.
+- **TIER 1 status:** Zero unreviewed codex PRs. `#233`, `#276` already reviewed; `#242`, `#243` are intentional parked drafts (don't touch). The only `codex/*` branches still open as PRs are those three.
+- **Files still blocked by open PRs** (don't edit, will merge-conflict): `api/routers/intel.py` (#256), `api/routers/oracle.py` (#240), `api/routers/intelligence_search.py` (#239), `api/routers/models.py` (#255), `api/routers/prediction_backtest.py` (#275), `api/dependencies.py` + `db.py` (#277), `tests/test_ten_year_portfolio.py` (#291), `tests/test_system_router.py` (#265), and **now** `api/routers/system.py` + `api/schemas/system.py` + `tests/test_freshness_stale_sources.py` (#293).
+- **Best remaining quick-pick after #293**:
+   - `astrogrid_api/dependencies.py:59` `clear_singletons()` — same disposed-engine bug PR #277 fixes in `api/dependencies.py`. ~2 LOC + a test. **CAVEAT (still unresolved from 2026-06-01 handoff):** verify `astrogrid_api/` isn't being retired before picking — the 2026-05-29 codex review of PR #276 noted "panda-node retirement cleanup." Run `git log --oneline -5 astrogrid_api/` first.
+   - `requirements.txt` 1-line addition for `openpyxl` — PR #276 HIGH finding from 2026-05-29 still open as of this run; module is top-level imported in `strategy/portfolio_workbook_plan.py:18`, ModuleNotFoundError on fresh deploy. Verify it hasn't landed via another PR before opening.
+- **Remaining unclaimed PUNCH-LIST items** (all P2 refactors, 400–700 LOC — exceed routine budget): line 48 `canvas_expand.expand_node` (737 LOC), line 49 `intel.intel_briefing` (also blocked by #256), line 50 `intelligence_risk._build_risk_map` (448 LOC), line 51 `flows._build_sector_connections` (464 LOC).
+- **Env note (this run):** `pip install pytest fastapi httpx pydantic-settings sqlalchemy loguru python-dotenv passlib bcrypt pandas psycopg2-binary python-jose python-multipart ruff && pip install --upgrade --ignore-installed cryptography` was sufficient to run the new `tests/test_freshness_stale_sources.py` (2 passing, ~5s). `tests/test_api.py` still fails collection with `passlib` bcrypt panic (`password cannot be longer than 72 bytes`) on import — pre-existing, NOT touched by this PR; new API tests must NOT hash a password at import-time (use a static `GRID_MASTER_PASSWORD_HASH` literal + `create_token`).
+
+---
+
 ## 2026-06-02 23:30 UTC — 2026-06-02-2308
 **Why this matters next run:** PUNCH-LIST-2026-05-13.md is heavily stale — multiple P0/P1 items are already fixed in main. Skip them before walking the punch list. PR #291 (TIER 0 CI fix) is still open and unmerged — leave alone unless you have new info.
 
@@ -102,45 +117,3 @@ Next clean routine-claimable items on the same 2026-05-17 audit list (all unclai
 
 **Env note (this container):** no python deps preinstalled and **even after `pip install` the full test suite won't collect** — `tests/conftest.py` imports `pandas` and routers import `fastapi`; this routine box had neither and installing the whole chain wasn't worth it for a 6-line diff. I verified the change via `py_compile` + `ruff check` (clean) and confirmed the arithmetic is byte-identical to the merged `journal.get_all` pattern. The added test (`tests/test_intel_predictions_active_pagination.py`) is self-contained (stubs `api.auth`/`api.dependencies`, fakes the engine) and will run in CI. If you need to actually execute pytest locally: `pip install fastapi pydantic sqlalchemy loguru pytest ruff pandas numpy python-jose passlib psycopg2-binary` then `pip install --force-reinstall cffi` (per 2026-05-19 entry's cffi-panic note).
 
----
-## 2026-05-19 23:08 UTC — 2026-05-19-2308
-**Why this matters next run:** Line 40 (`oracle.get_predictions` has_more) is now closed by PR #240. Three sibling has_more items remain on the 2026-05-17 API audit — same one-key-add shape, very small PRs:
-- line 41 — `api/routers/models.py:67` `get_all`
-- line 42 — `api/routers/intel.py:252` `intel_search` (this one is the bigger of the three — the `_ok(...)` envelope returns NO `total`/`limit`/`offset`/`has_more` at all, so it's an "add all 4 keys" not just "add 1")
-- line 43 — `api/routers/intel.py:1384` `intel_predictions_active` (just add `has_more` to existing `meta`)
-
-Then the remaining un-claimed 2026-05-17 audit items (unchanged from 2026-05-18 entry):
-- line 44 [P1] — direct test coverage for `api/routers/system.py` (1,686-LOC, tests-only, bigger lift)
-- line 45 [P1] — switch `prediction_backtest.py:20` import `get_engine` → `get_db_engine`
-- line 46 [P2] — `clear_singletons()` doesn't actually clear `db._engine` (real bug, dep-injection plumbing)
-- line 47 [P2] — f-string SQL in `prediction_backtest.py:116`
-
-**Env gotcha discovered this run — copy the fix into your prelude:** the sandbox's `cryptography` install panics with `_cffi_backend` ModuleNotFoundError when `api.auth` is imported (transitive via `python-jose`). The `try: import api.auth except: stub` pattern from `tests/test_intelligence_search.py` does NOT catch this — `pyo3_runtime.PanicException` extends `BaseException`, not `Exception`. Fix: run `pip install --quiet --force-reinstall cffi` (the system `cryptography` 41.0.7 is fine, the `cffi` shared lib is the broken half). After that, `import api.routers.oracle` works and tests collect cleanly. Total deps for this kind of has_more PR: `pip install --quiet fastapi pydantic sqlalchemy loguru pytest ruff psycopg2-binary python-jose passlib numpy pandas && pip install --quiet --force-reinstall cffi` (~ 45s).
-
-**Pattern that worked this run:** for `oracle.get_predictions` (and likely `models.get_all`), use `patch.object(mod, "get_db_engine", return_value=...)` with a `MagicMock` whose `engine.connect().__enter__` yields a `conn` with `conn.execute.side_effect = [count_result, rows_result]`. **Important:** oracle.py line 124 opens a SECOND `engine.connect()` for `tracking_pnl` lookup when `verdict == "pending"` — set the fake row's `verdict` to `"hit"` or `"miss"` (column index 17) so that branch stays inert and you only need 2 entries in the side_effect list. Same trap probably exists in any router that does conditional sub-queries inside the result-formatting loop.
-
-**Don't bundle has_more siblings.** The orchestrator's hard rule is one PR per run.
-
-**Env (unchanged):** no python deps preinstalled; `gh` CLI absent — `mcp__github__*` only; `git push origin routine-bookkeeping` → HTTP 403, use `mcp__github__create_or_update_file` against that branch; `mcp__github__list_pull_requests` output truncates — use `search_pull_requests` or scope by branch.
-
----
-## 2026-05-18 23:03 UTC — 2026-05-18-2303
-**Why this matters next run:** The 2026-05-14 + 2026-05-15 "queue exhausted / no-work" entries are STALE. A fresh API audit (PUNCH-LIST-2026-05-13.md, "Auditor 2026-05-17 — api/" section, lines 34-52) landed on main in PR #190 (commit `40e7e6b5`) and has **13 unclaimed items**. Walk that section before declaring no-work.
-
-PR #239 closes line-39 [P1] (has_more in `search_intelligence`). Four other `has_more` items remain on the same auditor list, all the same shape and very small:
-- line 40 — `api/routers/oracle.py:168` `get_predictions` *(done in PR #240, 2026-05-19-2308)*
-- line 41 — `api/routers/models.py:67` `get_all`
-- line 42 — `api/routers/intel.py:252` `intel_search` (the `_ok(...)` envelope, needs `total`+`limit`+`offset`+`has_more`)
-- line 43 — `api/routers/intel.py:1384` `intel_predictions_active` meta (just add `has_more` to the existing `meta`)
-
-The canonical pattern is `api/routers/journal.py:77` (`has_more: (offset + limit) < total`). Same one-key-add fix in each case. **Don't bundle these into one PR** — the orchestrator's hard rule is one PR per run; pick one and ship.
-
-Other unclaimed 2026-05-17 audit items worth noting:
-- line 44 [P1] — direct test coverage for `api/routers/system.py` (1,686-LOC router, only `/health` + `/status` tested in `tests/test_api.py:47`). Bigger lift; tests-only.
-- line 45 [P1] — switch `prediction_backtest.py:20` import from `get_engine` → `get_db_engine` for clearable-singleton consistency.
-- line 46 [P2] — `clear_singletons()` bug at `api/dependencies.py:67`: clears the api-level pointer but NOT `db._engine`, so next call returns a disposed engine. Real bug, but touches dep-injection plumbing — read both files first.
-- line 47 [P2] — f-string SQL in `prediction_backtest.py:116` (rule-violation, currently-safe because values come from a literal). Same file as line 45; consider claiming both in sequence after line-45 lands.
-
-**Env (unchanged from 2026-05-15 handoff, all still true):** no python deps preinstalled (`pip install pytest fastapi loguru sqlalchemy pydantic ruff` ~ 30s); `gh` CLI absent — `mcp__github__*` only; `git push origin routine-bookkeeping` → HTTP 403, use `mcp__github__create_or_update_file` against that branch; `mcp__github__list_pull_requests` output exceeds tool-result token cap — use `search_pull_requests` with tighter scope.
-
-**Pattern that worked this run:** mocking `get_db_engine` via `monkeypatch.setattr(mod, "get_db_engine", lambda: <MagicMock>)` + a per-test `side_effect` list on `conn.execute` for count-then-search lets you regression-test the response envelope without PostgreSQL. Copy this pattern for the next four has_more PRs — it adds 3 tests in ~80 LOC and keeps them in the no-DB block of the existing test file.
