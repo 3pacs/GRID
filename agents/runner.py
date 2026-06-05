@@ -243,10 +243,12 @@ class AgentRunner:
     ) -> dict[str, Any]:
         """Run a single-model analysis via the best available LLM fallback.
 
-        Sends the GRID regime context to the local Hermes model and asks
-        for a structured BUY/SELL/HOLD decision with reasoning.  This
-        provides useful analysis even without the full multi-agent
-        TradingAgents framework.
+        Routes through the Hermes analyst bridge (intelligence/hermes/),
+        which prefers the cloud reasoning model and falls back to the local
+        analyst (pinned to Tier.LOCAL here) so the path never hard-depends on
+        the network. Asks for a structured BUY/SELL/HOLD decision with
+        reasoning, and provides useful analysis even without the full
+        multi-agent TradingAgents framework.
 
         Parameters:
             ticker: Stock ticker to analyse.
@@ -256,21 +258,9 @@ class AgentRunner:
         Returns:
             dict: Decision with reasoning, analyst reports, and risk assessment.
         """
-        from llm.router import get_llm, Tier
+        from dataclasses import replace
 
-        client = get_llm(Tier.LOCAL)
-        if not client.is_available:
-            log.warning("No LLM backend available — returning default HOLD")
-            return {
-                "action": "HOLD",
-                "reasoning": (
-                    "No LLM backend is available. "
-                    "Set OPENAI_API_KEY or start llama.cpp/Ollama to enable agent analysis."
-                ),
-                "analyst_reports": {"note": "LLM unavailable"},
-                "debate": {"note": "LLM unavailable"},
-                "risk": {"note": "LLM unavailable"},
-            }
+        from intelligence.hermes import HermesAgent, load_hermes_config
 
         emit_progress(None, "llm", ticker, "Sending analysis prompt to configured LLM", 0.4)
 
@@ -294,18 +284,36 @@ class AgentRunner:
             f"Consider the current regime state, confidence level, and macro features."
         )
 
-        response = client.chat(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+        # Hermes analyst bridge: prefers the cloud reasoning model and falls
+        # back to the local analyst internally. The fallback tier is pinned to
+        # LOCAL here so that, until a HERMES/OPENAI key is configured, this path
+        # behaves exactly like the prior get_llm(Tier.LOCAL) call.
+        agent = HermesAgent(replace(load_hermes_config(), fallback_tier="local"))
+        analysis = agent.analyze(
+            user_prompt,
+            system=system_prompt,
             temperature=0.3,
-            num_predict=1500,
+            max_completion_tokens=1500,
         )
 
         emit_progress(None, "parsing", ticker, "Parsing LLM response", 0.7)
 
-        if response is None:
+        if not analysis.ok:
+            log.warning("No LLM backend available — returning default HOLD")
+            return {
+                "action": "HOLD",
+                "reasoning": (
+                    "No LLM backend is available. "
+                    "Set HERMES_API_KEY/OPENAI_API_KEY or start llama.cpp/Ollama "
+                    "to enable agent analysis."
+                ),
+                "analyst_reports": {"note": "LLM unavailable"},
+                "debate": {"note": "LLM unavailable"},
+                "risk": {"note": "LLM unavailable"},
+            }
+
+        response = analysis.text
+        if not response:
             log.warning("LLM returned no response — defaulting to HOLD")
             return {
                 "action": "HOLD",
@@ -316,12 +324,12 @@ class AgentRunner:
             }
 
         # Parse structured sections from the response
-        result = self._parse_single_model_response(response)
+        parsed = self._parse_single_model_response(response)
         log.info(
-            "Single-model analysis complete — decision={d}",
-            d=result.get("action", "HOLD"),
+            "Single-model analysis complete — decision={d} (served by {s})",
+            d=parsed.get("action", "HOLD"), s=analysis.source,
         )
-        return result
+        return parsed
 
     @staticmethod
     def _parse_single_model_response(response: str) -> dict[str, Any]:
