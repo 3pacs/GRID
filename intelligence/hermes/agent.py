@@ -16,6 +16,7 @@ from typing import Any
 
 from loguru import logger as log
 
+from .codex_provider import CodexProvider
 from .config import HermesConfig, load_hermes_config
 from .prompts import build_messages
 from .provider import HermesProvider, HermesResponse
@@ -26,7 +27,7 @@ class AnalysisResult:
     """Outcome of an analyst call, annotated with which path served it."""
 
     text: str | None
-    source: str  # "hermes" | "local" | "unavailable"
+    source: str  # "hermes" | "codex" | "local" | "unavailable"
     model: str | None = None
     cost_usd: float = 0.0
     latency_ms: float = 0.0
@@ -37,16 +38,23 @@ class AnalysisResult:
         return self.text is not None
 
 
+def _make_provider(config: HermesConfig) -> HermesProvider | CodexProvider:
+    """Pick the analyst provider for the configured backend."""
+    if config.backend == "codex":
+        return CodexProvider(config)
+    return HermesProvider(config)
+
+
 class HermesAgent:
     """Analyst that prefers Hermes (cloud reasoning) and falls back to local."""
 
     def __init__(
         self,
         config: HermesConfig | None = None,
-        provider: HermesProvider | None = None,
+        provider: HermesProvider | CodexProvider | None = None,
     ) -> None:
         self.config = config or load_hermes_config()
-        self.provider = provider or HermesProvider(self.config)
+        self.provider = provider or _make_provider(self.config)
 
     # -- core -----------------------------------------------------------------
     def analyze(
@@ -74,7 +82,7 @@ class HermesAgent:
         )
         if resp is not None:
             return AnalysisResult(
-                text=resp.text, source="hermes", model=resp.model,
+                text=resp.text, source=resp.provider, model=resp.model,
                 cost_usd=resp.cost_usd, latency_ms=resp.latency_ms,
                 reasoning_tokens=resp.usage.reasoning_tokens,
             )

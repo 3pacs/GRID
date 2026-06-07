@@ -16,6 +16,7 @@ Typical use::
 from __future__ import annotations
 
 from .agent import AnalysisResult, HermesAgent
+from .codex_provider import CodexProvider
 from .config import HermesConfig, load_hermes_config
 from .prompts import SYSTEM, SYSTEM_VERSION, build_messages
 from .provider import HermesProvider, HermesResponse, TokenUsage
@@ -23,6 +24,7 @@ from .spend import SpendLedger
 
 __all__ = [
     "AnalysisResult",
+    "CodexProvider",
     "HermesAgent",
     "HermesConfig",
     "HermesProvider",
