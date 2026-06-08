@@ -1,3 +1,36 @@
+## 2026-06-08 23:15 UTC — 2026-06-08-2305
+**Why this matters next run:** Both **PR #276 HIGH findings #2 and #3 are now DONE** in **PR #300** (10-day-old review queue item shipped). **Stop suggesting them.** With this, every concrete clean-pick named in the 2026-06-04/05 handoffs is closed. The routine queue is now genuinely bone-dry — no PUNCH-LIST P1 items remain in budget, the PR #276 review backlog is cleared, and Tier 0 (PR #291) has now been unmerged for **12 days**. Next run will most likely be a no-work entry unless something new lands in PUNCH-LIST, codex authors a new PR, or main CI breaks again. Don't fabricate work.
+
+- Shipped PR #276 HIGH #2 (no try/except on `/export.xlsx` GET) + HIGH #3 (raw `str(exc)` leak on `/weekly` GET) as **PR #300**. Single file `api/routers/ten_year_portfolio.py` + new test file `tests/test_ten_year_portfolio_error_handling.py` (4 cases, all pass, ruff clean). Created the test file fresh rather than extending `tests/test_ten_year_portfolio.py` because that file is **still file-blocked by open PR #291**.
+- **TIER 0 status (carried for the 12th day):** `main` CI still red. **PR #291** fixes it; its own CI is green. **Operator-merge blocker, not code.** Do NOT open a duplicate fix. This is the single biggest operational drag on the routine — every day it sits unmerged, file `tests/test_ten_year_portfolio.py` stays blocked, which forces any router-error-path test against ten_year_portfolio.py into a separate file (as this run did).
+- **Files still file-blocked by open PRs** (use line-range check per 2026-06-05 handoff correction, not blanket file-block):
+   - `api/routers/intel.py::intel_predictions_active` (#256)
+   - `api/routers/intel.py::intel_search` (#297, this-week's run)
+   - `api/routers/oracle.py` (#240)
+   - `api/routers/intelligence_search.py` (#239)
+   - `api/routers/models.py` (#255)
+   - `api/routers/prediction_backtest.py` (#275)
+   - `api/dependencies.py` + `db.py` (#277)
+   - `tests/test_ten_year_portfolio.py` (#291)
+   - `tests/test_system_router.py` (#265)
+   - `api/routers/system.py` + `api/schemas/system.py` + `tests/test_freshness_stale_sources.py` (#293)
+   - `requirements.txt` + `tests/test_requirements.py` (#294)
+   - **NEW this run:** `api/routers/ten_year_portfolio.py::weekly_ten_year_portfolio` + `::export_current_model_workbook` + `tests/test_ten_year_portfolio_error_handling.py` (#300)
+- **TIER 1 status:** Zero unreviewed codex PRs. The 4 codex/* branches with open PRs are #233 (reviewed 2026-05-25), #276 (reviewed 2026-05-29, the HIGHs are now ALL shipped: #294 + #300), and #242/#243 (intentional parked drafts — leave alone).
+- **Remaining unclaimed PUNCH-LIST items** — all P2 refactors >400 LOC, exceed routine budget. **The 2026-05-13 punch list is structurally exhausted for the routine flow.**
+   - line 48: `canvas_expand.expand_node` (737 LOC) — `api/routers/canvas_expand.py`
+   - line 49: `intel.intel_briefing` (509 LOC) — `api/routers/intel.py::intel_briefing` at ~line 1650, NOT overlapping #256 or #297
+   - line 50: `intelligence_risk._build_risk_map` (448 LOC) — `api/routers/intelligence_risk.py`
+   - line 51: `flows._build_sector_connections` (464 LOC) — `api/routers/flows.py`
+- **Speculative next picks if the queue stays dry (in priority order):**
+   1. **`docs/PUNCH-LIST-2026-05-13.md` staleness sweep, lines 28–41 / 47.** The 2026-06-02 entry verified lines 19/20/21/22–26/27 as STALE. Lines 28–32 are oracle P2 splits that mostly predate the engine.py de-dup work in PR #156 — high chance they're stale. Line 47 (f-string SQL in `prediction_backtest.py:116`) — `api/routers/prediction_backtest.py` is still file-blocked by #275, so just verify on disk and either annotate or skip. Pure doc PR, low risk, advances no code.
+   2. **`tests/test_requirements.py` extension** — verify whether `xgboost` / `kafka-python-ng` / `prefect` / `minio` get reached via a top-level import like `openpyxl` did. If yes, add a regression guard. **`tests/test_requirements.py` is file-blocked by #294** — would have to wait for #294 to merge or create a sibling test file.
+   3. **`docs/PUNCH-LIST` refresh PR.** The 2026-05-13 punch list is structurally exhausted for routine-budget items. The auditor produces these; ping the operator to re-run the api/ auditor and produce a new list of small-budget items.
+- **`mcp__github__list_pull_requests` still truncates** (167k chars for default page) — save-to-file + `python3 -c "import json; ...json.load(open(...))"` is the canonical workaround. Saved-file path: `/root/.claude/projects/<sid>/tool-results/mcp-github-list_pull_requests-*.txt`.
+- **Env note (this run):** Full bootstrap was `pip install pytest fastapi pydantic pydantic-settings sqlalchemy loguru python-dotenv psycopg2-binary pandas numpy passlib bcrypt python-jose python-multipart openpyxl ruff && pip install --upgrade --ignore-installed cryptography cffi` — total ~90s. The cryptography/cffi `--upgrade --ignore-installed` is the 2026-06-02 fix; still required as of today. 4 tests pass in 1.39s.
+
+---
+
 ## 2026-06-05 23:10 UTC — 2026-06-05-2305
 **Why this matters next run:** PUNCH-LIST line 42 (intel.intel_search pagination) is now done — **PR #297**. The 2026-06-02 handoff incorrectly added `api/routers/intel.py` to the "file-blocked" list because PR #256 touches it; that's overly conservative. Different functions in the same file do NOT conflict in a 3-way merge — verify with `git log -p PR-#NNN -- <file>` before adding a file to the blocked list. Routine queue is now genuinely down to P2 refactors > 400 LOC (out of budget) or the still-open PR #276 ten_year_portfolio HIGH findings.
 
@@ -130,23 +163,3 @@
 - This run reviewed **PR #233** (`codex/hermes-finetune-fleet-20260518`, open since 2026-05-18, zero prior reviews) — posted a COMMENT review (3 MEDIUM hardening items on the iMessage bridge + SFT scrubber; no blocker). It now has a claude review, so skip it next run unless it gets new commits.
 - **PRs #242 and #243 are NOT review targets** — they are intentional draft "Park" branches (`[codex] Park ...`), explicitly "intentionally draft until rebased/retested against current main." Don't waste a TIER 1 slot reviewing them; the operator parked them on purpose.
 - Watch for over-eager subagent findings: the code-reviewer subagent flagged a "CRITICAL osascript injection" in `hermes_imessage_bridge.py:1156` that was a false positive — `recipient`/`text` are passed as `argv` items to a static AppleScript body via `subprocess.run([...])` (no shell, no interpolation). Always verify a CRITICAL against the actual source before posting it publicly.
-
----
-## 2026-05-21 23:18 UTC — 2026-05-21-2313
-**Why this matters next run:** The has_more sibling series is now down to ONE remaining item, and it is NOT a simple one-key add — don't treat it as such.
-
-Status of the 2026-05-17 audit has_more group:
-- line 39 `search_intelligence` → PR #239 (done)
-- line 40 `oracle.get_predictions` → PR #240 (done)
-- line 41 `models.get_all` → PR #255 (done, opened 2026-05-20)
-- line 43 `intel.intel_predictions_active` → **PR #256 (this run, done)** — was a clean one-key add; `total/limit/offset` already present, added `has_more: (offset+limit)<total` matching `journal.py:77`.
-- line 42 `intel.intel_search` (`api/routers/intel.py:252`) → **STILL OPEN, but it's a design decision, not a quick add.** I deliberately skipped it. Reason: `intel_search` is a UNION of up to 3 independent sub-queries (actors / icij_relationships / oracle_predictions), and **each sub-query applies the SAME `LIMIT :lim OFFSET :off` separately** (lines 175, 204, 231). So with `type="all"` the result list can hold up to 3×limit rows, and there is no single coherent `total` — summing three COUNT(*)s doesn't match how offset is applied per-source. Adding `total`/`has_more` here requires picking a pagination semantics (per-type totals? cap type="all"? paginate only single-type queries?) — that's an operator/product call, not a mechanical fix. If you pick it up, propose the semantics in the PR body and flag it for operator review; do NOT just sum-and-ship a misleading `total`.
-
-Next clean routine-claimable items on the same 2026-05-17 audit list (all unclaimed):
-- line 45 [P1] — switch `prediction_backtest.py:20` import `get_engine` → `get_db_engine` (small, clean).
-- line 44 [P1] — direct test coverage for `api/routers/system.py` (tests-only, bigger lift).
-- line 46 [P2] — `clear_singletons()` doesn't clear `db._engine` (`api/dependencies.py:67`) — real bug, dep-injection plumbing.
-- line 47 [P2] — f-string SQL in `prediction_backtest.py:116` (same file as line 45).
-
-**Env note (this container):** no python deps preinstalled and **even after `pip install` the full test suite won't collect** — `tests/conftest.py` imports `pandas` and routers import `fastapi`; this routine box had neither and installing the whole chain wasn't worth it for a 6-line diff. I verified the change via `py_compile` + `ruff check` (clean) and confirmed the arithmetic is byte-identical to the merged `journal.get_all` pattern. The added test (`tests/test_intel_predictions_active_pagination.py`) is self-contained (stubs `api.auth`/`api.dependencies`, fakes the engine) and will run in CI. If you need to actually execute pytest locally: `pip install fastapi pydantic sqlalchemy loguru pytest ruff pandas numpy python-jose passlib psycopg2-binary` then `pip install --force-reinstall cffi` (per 2026-05-19 entry's cffi-panic note).
-
