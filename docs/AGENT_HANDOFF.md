@@ -1,3 +1,38 @@
+## 2026-06-09 23:15 UTC — 2026-06-09-2303
+**Why this matters next run:** the `oracle/` section of
+`docs/PUNCH-LIST-2026-05-13.md` is now annotated with `[x]` on the 11
+items that were already shipped. Don't re-investigate them. This was a
+pure-docs PR (PR #301, single-file markdown change, ~22 LOC).
+
+- **PUNCH-LIST is now structurally exhausted for the routine flow**
+  (matches the 2026-06-08 entry's prediction). Oracle/ section has only
+  two unresolved `[P2]` engine-split items left (`oracle/engine.py`
+  2,877 LOC; `OracleEngine.predict` 405 lines;
+  `OracleEngine._oracle_one_ticker` 299 lines) — all too large for a
+  single 25-min routine PR. API/ section has the 4 same-size refactor
+  items (`canvas_expand.expand_node` 737 LOC, `intel.intel_briefing`
+  509 LOC, `intelligence_risk._build_risk_map` 448 LOC,
+  `flows._build_sector_connections` 464 LOC) — also too big. The one
+  P2 small item (`f-string SQL in prediction_backtest.dataset_stats`)
+  is file-blocked by open PR #275.
+- **The next free queue is PR #299 (alpha_research auditor feed)
+  once it merges.** It appends 14 items to `docs/PUNCH-LIST-2026-05-13.md`
+  including one `[P0]` (synthetic-random VIX history feeding live
+  regime detection — `alpha_research/strategies/adaptive_rotation.py:321`)
+  and 7 `[P1]`s. Most look routine-budget-sized. Don't reach across
+  the PR to pick from items not yet on main.
+- **TIER 0 status (carried for the 13th day):** `main` CI still red
+  unless something has changed since 2026-06-08. PR #291 is still the
+  one fix; do NOT open a duplicate.
+- **File-block list (no change this run):** see the 2026-06-08 entry
+  for the full list. This PR only touched `docs/PUNCH-LIST-2026-05-13.md`,
+  which is not in any other PR's diff.
+- **Env note:** no installs needed (docs-only PR, no tests run).
+  Verified each resolution claim by spot-grep + `wc -l` on the
+  corresponding test file. The `mcp__github__list_pull_requests`
+  truncation workaround (save-to-file + python slice) is still
+  required as of this run.
+
 ## 2026-06-08 23:15 UTC — 2026-06-08-2305
 **Why this matters next run:** Both **PR #276 HIGH findings #2 and #3 are now DONE** in **PR #300** (10-day-old review queue item shipped). **Stop suggesting them.** With this, every concrete clean-pick named in the 2026-06-04/05 handoffs is closed. The routine queue is now genuinely bone-dry — no PUNCH-LIST P1 items remain in budget, the PR #276 review backlog is cleared, and Tier 0 (PR #291) has now been unmerged for **12 days**. Next run will most likely be a no-work entry unless something new lands in PUNCH-LIST, codex authors a new PR, or main CI breaks again. Don't fabricate work.
 
@@ -156,10 +191,8 @@
 - **Env note (confirms 2026-05-21):** the test suite CAN run in this container after `pip install fastapi sqlalchemy pandas pydantic loguru psycopg2-binary 'python-jose[cryptography]' pytest ruff`. Two gotchas: (1) the installed **passlib bcrypt backend panics** on its self-test (`password cannot be longer than 72 bytes`) the moment you call `_pwd_ctx.hash()` — so in new API tests DON'T hash a password at import like `test_api.py` does; set a **static** `GRID_MASTER_PASSWORD_HASH` literal and mint auth via `create_token` (only needs `GRID_JWT_SECRET`). (2) system `cryptography` 41 is debian-managed and can't be force-reinstalled, but `python-jose[cryptography]` still imported fine for me this run.
 
 ---
-## 2026-05-25 23:12 UTC — 2026-05-25-2308
-**Why this matters next run:** TIER 1 has been silently mis-scoped by prior runs — there ARE reviewable codex PRs; they just aren't authored by `app/openai-codex`.
-
-- Codex PRs in this repo are authored by login `3pacs` on `codex/*` branches (not `app/openai-codex`). The old `search_pull_requests author:app/openai-codex → 0` check in the 2026-05-14/15 entries was a false negative. To find TIER 1 work, filter open PRs by `head.ref` starting `codex/`, not by author.
-- This run reviewed **PR #233** (`codex/hermes-finetune-fleet-20260518`, open since 2026-05-18, zero prior reviews) — posted a COMMENT review (3 MEDIUM hardening items on the iMessage bridge + SFT scrubber; no blocker). It now has a claude review, so skip it next run unless it gets new commits.
-- **PRs #242 and #243 are NOT review targets** — they are intentional draft "Park" branches (`[codex] Park ...`), explicitly "intentionally draft until rebased/retested against current main." Don't waste a TIER 1 slot reviewing them; the operator parked them on purpose.
-- Watch for over-eager subagent findings: the code-reviewer subagent flagged a "CRITICAL osascript injection" in `hermes_imessage_bridge.py:1156` that was a false positive — `recipient`/`text` are passed as `argv` items to a static AppleScript body via `subprocess.run([...])` (no shell, no interpolation). Always verify a CRITICAL against the actual source before posting it publicly.
+_Entries older than 14 days were trimmed per the routine rules. The
+2026-05-25 entry's standing insight — codex PRs in this repo are
+authored by login `3pacs` on `codex/*` branches (not `app/openai-codex`),
+so filter TIER 1 by `head.ref` starting `codex/` not by author — is
+preserved here as a permanent note._
