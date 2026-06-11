@@ -1,3 +1,80 @@
+## 2026-06-11 23:25 UTC — 2026-06-11-2305
+**Why this matters next run:** the "don't reach across PR #299"
+guidance from the 2026-06-09 handoff was overly broad. PR #299 only
+modifies `docs/PUNCH-LIST-2026-05-13.md` — fixing the underlying
+code-bugs it documents is **independent and unblocked**. This run
+shipped the P0 (synthetic-random VIX in `adaptive_rotation.py:321`) as
+**PR #302** without conflicting with PR #299.
+
+- **Pickable alpha_research findings still on the table from PR #299** —
+  all reference code already on `main`, all small enough for a single
+  routine PR. In rough order of leverage:
+  - **[P1]** `alpha_research/conviction_scorer.py:54` — add `as_of_date`
+    + `release_date <= :as_of` to `_load_latest`, `_load_raw_latest`,
+    `_load_raw_series`, `_load_price`. PIT-fix prerequisite to using
+    the scorer in any backtest. **Caveat: changes the public signatures
+    of `score_ticker` / `scan_all`, which are wired through
+    `api/routers/signals.py:194,226` — needs a default `as_of_date=date.today()`
+    to stay backward-compatible, otherwise the API breaks.**
+  - **[P1]** `alpha_research/validation/gauntlet.py:64,136` — seed
+    `np.random.default_rng(seed)` for `permutation_test` and
+    `subsample_stability`. Thread `seed: int = 42` through
+    `run_gauntlet`. Same determinism class as this PR.
+  - **[P1]** Add unit tests for `conviction_scorer.py` 7 layer scorers
+    (`score_setup`/`score_company`/`score_smart_money`/`score_crowd`/
+    `score_narrative`/`score_flow`/`score_confirmation`/`score_ticker`/
+    `scan_all`). Mock `conn.execute(...).fetchone/fetchall`. Same
+    pattern as the oracle test PRs (#158/#159/#160).
+  - **[P1]** Add unit tests for `signal_adapter.py` publish functions
+    (`publish_factor_signals`/`publish_regime_signal`/
+    `publish_all_alpha_signals`). The bug-fix postmortem at line 26-30
+    is the regression target.
+  - **[P1]** Add unit tests for
+    `rotation_variant_backtest.backtest_rotation_variant`. Writes to
+    `astrogrid.backtest_run`/`backtest_result`; lock the metric-payload
+    schema.
+  - **[P1]** Add unit tests for `credit_cycle.compute_credit_cycle` and
+    `exposure_scaler.compute_vix_exposure_scalar`. Both drive
+    `oracle/engine.py::_get_credit_cycle_routing` weights.
+  - **[P1]** Add unit tests for `data/split_adjuster.py` —
+    `detect_splits`/`adjust_splits`/`adjust_panel`/
+    `compute_real_drawdown`. TSLA 5:1→3:1 compounding case is the
+    docstring's named target.
+  - **[P2]** Delete dead module `alpha_research/data/shares_tracker.py`
+    (183 LOC, zero callers). Verify with `grep -r` first.
+  - **[P2]** Delete dead helpers `compute_vix_exposure_series` and
+    `build_returns_panel` — but **NOTE this PR's fix uses
+    `panel_builder.get_vix_series` not `compute_vix_exposure_series`,
+    so the auditor's "zero callers" claim for the latter still holds**.
+    `get_vix_series` is now actively called by `adaptive_rotation.run_rotation`.
+  - **[P2]** `alpha_research/heartbeat.py:111,137` — convert
+    `except: pass` to `log.warning(...)` per CLAUDE.md log-level rule.
+  - **[P2]** `alpha_research/strategies/rotation_variant_backtest.py:153`
+    — log skipped rebalances. One-liner.
+  - **[P2]** `alpha_research/adapters/signal_adapter.py:174` — fix or
+    delete the dangling `docs/TODO-REGIME-SIGNAL-USAGE.md` reference.
+- **`alpha_research/strategies/adaptive_rotation.py` is now file-blocked
+  by PR #302.** `tests/test_adaptive_rotation.py` likewise. The 11 items
+  above don't touch either file, so unblocked.
+- **TIER 0 status:** `main` CI is **GREEN** on HEAD `0a41753a` (GRID
+  Tests success). The 13-day red streak from the 2026-06-08 handoff is
+  resolved — PR #291 must have landed. Deploy-to-Grid-Server still
+  fails but that's operator-side (no SSH).
+- **Env note:** `pip install pytest pandas numpy sqlalchemy loguru ruff`
+  + the file uses no DB connection (engine is mocked via monkeypatch).
+  15 tests in 0.65s. No cryptography/passlib needed.
+- **`mcp__github__list_pull_requests` and `mcp__github__actions_list`
+  still truncate** at 167k / 346k chars. Save-to-file + python slice or
+  json.load is the workaround.
+
+## 2026-06-10 23:08 UTC — 2026-06-10-2307
+**Why this matters next run:** queue was bone-dry, logged no-work. See
+the 2026-06-11 entry above — the "don't reach across PR #299" guard
+that informed this no-work decision was overly broad. Future runs
+should distinguish "fixing the code PR #299 documents" (always
+unblocked) from "adding more items to the queue from PR #299" (blocked
+until #299 lands).
+
 ## 2026-06-09 23:15 UTC — 2026-06-09-2303
 **Why this matters next run:** the `oracle/` section of
 `docs/PUNCH-LIST-2026-05-13.md` is now annotated with `[x]` on the 11
