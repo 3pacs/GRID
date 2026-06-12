@@ -47,6 +47,7 @@ def permutation_test(
     n_shuffles: int = 1000,
     top_n: int = 5,
     cost_bps: float = 10.0,
+    seed: int = 42,
 ) -> tuple[float, float]:
     """
     Shuffle date labels on signal, recompute Sharpe. If real model's Sharpe
@@ -59,9 +60,10 @@ def permutation_test(
 
     null_sharpes = []
     dates = signal.index.tolist()
+    rng = np.random.default_rng(seed)
 
     for _ in range(n_shuffles):
-        shuffled_idx = np.random.permutation(dates)
+        shuffled_idx = rng.permutation(dates)
         shuffled_signal = signal.copy()
         shuffled_signal.index = shuffled_idx
         shuffled_signal.sort_index(inplace=True)
@@ -119,6 +121,7 @@ def subsample_stability(
     n_splits: int = 20,
     top_n: int = 5,
     cost_bps: float = 10.0,
+    seed: int = 42,
 ) -> float:
     """
     Split tickers into random halves N times. Compute RankIC on each half.
@@ -131,9 +134,10 @@ def subsample_stability(
         return 0.0
 
     stable_count = 0
+    rng = np.random.default_rng(seed)
 
     for _ in range(n_splits):
-        np.random.shuffle(tickers)
+        rng.shuffle(tickers)
         mid = len(tickers) // 2
         half_a = tickers[:mid]
         half_b = tickers[mid:]
@@ -219,6 +223,7 @@ def run_gauntlet(
     cost_bps: float = 10.0,
     n_permutations: int = 1000,
     n_subsample_splits: int = 20,
+    seed: int = 42,
 ) -> GauntletResult:
     """
     Run the full 5-test False Discovery Gauntlet.
@@ -227,7 +232,7 @@ def run_gauntlet(
     """
     # 1. Permutation test
     perm_p, observed_sr = permutation_test(
-        signal, forward_returns, n_permutations, top_n, cost_bps
+        signal, forward_returns, n_permutations, top_n, cost_bps, seed=seed
     )
 
     # 2. Deflated Sharpe
@@ -241,7 +246,7 @@ def run_gauntlet(
 
     # 3. Subsample stability
     sub_stab = subsample_stability(
-        signal, forward_returns, n_subsample_splits, top_n, cost_bps
+        signal, forward_returns, n_subsample_splits, top_n, cost_bps, seed=seed
     )
 
     # 4. Decay analysis
