@@ -2,7 +2,7 @@
 
 Generated: 2026-06-14
 Total modules: 765
-Total LOC: 336,317
+Total LOC: 336,325
 
 This is the authoritative inventory of every `.py` file in the GRID intelligence/data/serving stack.
 Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycache__/`, `build/`, `dist/`, `docs/`, `node_modules/`, `notebooks/`, `pwa/`, `pwa_dist/`, `tests/`, `venv/`.
@@ -11,7 +11,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 
 | Directory | Module count | LOC |
 |---|---|---|
-| `intelligence/` | 182 | 104,362 |
+| `intelligence/` | 182 | 104,370 |
 | `ingestion/` | 208 | 86,793 |
 | `api/` | 109 | 50,663 |
 | `analysis/` | 33 | 18,973 |
@@ -527,7 +527,7 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Functions:** `CodexProvider`
 **Reads:** `__future__`, `config`, `loguru`, `os`, `provider`, `shlex`, `shutil`, `subprocess`, `tempfile`, `time`
 
-#### `intelligence/hermes/config.py` — 123 LOC
+#### `intelligence/hermes/config.py` — 131 LOC
 **Docstring:** Configuration for the Hermes analyst bridge.
 **Functions:** `HermesConfig`, `load_hermes_config`
 **Reads:** `__future__`, `config`, `dataclasses`, `os`, `typing`
