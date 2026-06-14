@@ -140,6 +140,7 @@ def test_load_config_maps_settings(monkeypatch):
         HERMES_DAILY_SPEND_CAP_USD=5.0, HERMES_LEDGER_PATH="x.json",
         HERMES_PRICE_INPUT_PER_MTOK=1.0, HERMES_PRICE_OUTPUT_PER_MTOK=3.0,
         HERMES_FALLBACK_TIER="reason",
+        GRID_ALLOW_PAID_LLM=True,  # opt in so the openai-backend key isn't zeroed by the paid gate
     )
     monkeypatch.setattr(hconfig, "_settings", lambda: ns)
     cfg = hconfig.load_hermes_config()
@@ -149,6 +150,31 @@ def test_load_config_maps_settings(monkeypatch):
     assert cfg.temperature is None           # blank -> omitted
     assert cfg.reasoning_effort == "high"
     assert cfg.configured is True
+
+
+def test_openai_backend_key_zeroed_without_optin(monkeypatch):
+    # local-first gate: the per-token openai backend must NOT carry a key unless opted in,
+    # so a stray OPENAI_API_KEY can't silently bill via the hermes bridge.
+    ns = SimpleNamespace(HERMES_BACKEND="openai", OPENAI_API_KEY="sk-leak", GRID_ALLOW_PAID_LLM=False)
+    monkeypatch.setattr(hconfig, "_settings", lambda: ns)
+    cfg = hconfig.load_hermes_config()
+    assert cfg.api_key == ""           # zeroed by the gate
+    assert cfg.configured is False     # -> agent falls back to local
+
+
+def test_openai_backend_key_kept_with_optin(monkeypatch):
+    ns = SimpleNamespace(HERMES_BACKEND="openai", OPENAI_API_KEY="sk-ok", GRID_ALLOW_PAID_LLM=True)
+    monkeypatch.setattr(hconfig, "_settings", lambda: ns)
+    assert hconfig.load_hermes_config().api_key == "sk-ok"
+
+
+def test_codex_backend_unaffected_by_paid_gate(monkeypatch):
+    # the codex backend is subscription-based (no per-token billing); the gate must not touch it.
+    ns = SimpleNamespace(HERMES_BACKEND="codex", OPENAI_API_KEY="sk-x", GRID_ALLOW_PAID_LLM=False)
+    monkeypatch.setattr(hconfig, "_settings", lambda: ns)
+    cfg = hconfig.load_hermes_config()
+    assert cfg.backend == "codex"
+    assert cfg.api_key == "sk-x"       # untouched; codex provider ignores it anyway
 
 
 def test_config_temperature_parsed_when_set(monkeypatch):
