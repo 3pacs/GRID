@@ -1,3 +1,35 @@
+## 2026-06-15 23:35 UTC — 2026-06-15-2305
+**Why this matters next run:** A second auditor-feed PR (#305, physics/, opened 2026-06-14) is now on the queue alongside still-open PR #299 (alpha_research/). Same posture as #299: the PR only modifies `docs/PUNCH-LIST-2026-05-13.md`, so picking from its 11 underlying findings directly is unblocked — verify via `mcp__github__pull_request_read get_files` (this run did exactly that).
+
+- Shipped the **compute_credit_cycle / compute_vix_exposure_scalar tests** named in the 2026-06-11 handoff as **PR #306** (`tests/test_alpha_research_signals.py`, 17 tests, ruff clean, 0.14s). Strike that item from the pickable list below.
+- **NEW backlog source: PR #305 (auditor-feed physics/, 2026-06-14).** 11 items total. In rough leverage order:
+   - **[P1]** `physics/verify.py:354` — replace the N+1 in `check_dimensional_consistency` (one `engine.connect()` + JOIN per feature, ~2.4k roundtrips per `verify_all`) with one CTE returning name→latest_value for all `model_eligible` features. High value (live-path perf fix). Caveat: must preserve the `_get_latest_value(name, ...)` signature for the few callers that still call it individually.
+   - **[P1]** `physics/transforms.py:627` vs `analysis/transfer_entropy.py:135` — `transfer_entropy` exists in both with divergent bodies; only the `analysis/` copy has callers. Two clean options: delete the `physics/` body, OR re-export from `analysis.transfer_entropy`. Mechanical, ~10 LOC.
+   - **[P1]** Tests for `physics/transforms.py` energy + OU helpers (`kinetic_energy`, `potential_energy`, `total_energy`, `market_temperature`, `estimate_ou_parameters`, `hurst_exponent` — the 6 actually wired into prod via `features/lab.py:374-412` + `api/routers/physics.py:140-293`). Pattern: reference-value tests on deterministic series.
+   - **[P1]** Tests for `physics/conventions.py:197` validators (`validate_convention`, `validate_feature_set`, `check_unit_compatibility`). Called per-feature from `physics/verify.py:381` — uncovered range/heuristic branches.
+   - **[P1]** Tests for `physics/waves.py:41` `build_execution_waves` — topo-sort used by `cli.py:312` + `api/routers/workflows.py:124`. Cover cycle detection, isolated-task wave assignment, `WaveTask` defaults.
+   - **[P1]** Direct tests for `physics/dealer_gamma.py:118` `DealerGammaEngine.compute_gex_profile`. Today it's only mocked with a pre-computed dict — actual per-strike GEX aggregation, `_find_gamma_flip` interpolation, gamma/put/call wall selection have zero direct coverage.
+   - **[P1]** Tests for `physics/verify.py:322` `check_dimensional_consistency` / `check_regime_boundaries` / `check_stationarity`. `verify_all` swallows their exceptions at line 96-108 so silent regressions don't surface in CI.
+   - **[P2]** Delete 9 unused public functions from `physics/transforms.py` (`entropy_rate`/`phase_velocity`/`ou_mean_reversion_signal`/`ou_displacement`/`langevin_drift`/`langevin_diffusion`/`fokker_planck_density`/`relaxation_time`/`rolling_hurst`). Caveat: rerun `grep -rn` first (auditor noted string-import edge case).
+   - **[P2]** Delete `execute_waves` + `build_grid_pipeline_waves` from `physics/waves.py:107,227` (~145 LOC + unused `concurrent.futures` import).
+   - **[P2]** Split `physics/news_energy.py:320` `NewsEnergyEngine.analyze` (185 LOC).
+   - **[P2]** Split `physics/verify.py:404` `check_regime_boundaries` (126 LOC).
+- **Remaining unworked alpha_research items from PR #299** (one struck off this run):
+   - **[P1]** `alpha_research/conviction_scorer.py:54` — add `as_of_date` + `release_date <= :as_of` PIT plumbing. Public-signature change → API-router-aware.
+   - **[P1]** Add unit tests for `conviction_scorer.py` 7 layer scorers + `score_ticker` / `scan_all`.
+   - **[P1]** Add unit tests for `signal_adapter.py` publish functions.
+   - **[P1]** Add unit tests for `rotation_variant_backtest.backtest_rotation_variant`.
+   - **[P1]** Add unit tests for `data/split_adjuster.py` (TSLA 5:1→3:1 compounding case).
+   - **[P2]** Delete dead module `alpha_research/data/shares_tracker.py` (183 LOC).
+   - **[P2]** Delete dead helpers `compute_vix_exposure_series` + `build_returns_panel`.
+   - **[P2]** `alpha_research/heartbeat.py:111,137` — `except: pass` → `log.warning(...)`.
+   - **[P2]** `alpha_research/strategies/rotation_variant_backtest.py:153` — log skipped rebalances.
+   - **[P2]** `alpha_research/adapters/signal_adapter.py:174` — dangling `docs/TODO-REGIME-SIGNAL-USAGE.md` reference.
+- **TIER 0 status:** `main` CI **GREEN** on HEAD `e5a0eafe` (GRID Tests success). Deploy-to-Grid-Server still red, operator-side.
+- **TIER 1 status:** zero codex-authored PRs on the open list. All 30 open PRs are 3pacs (24) or dependabot (6). Don't churn on dependabot PRs.
+- **Env note:** Fresh container needs `pip install pytest pandas sqlalchemy numpy ruff` (~10s). The new test file (`tests/test_alpha_research_signals.py`) imports `alpha_research.signals.*` directly — does NOT require the heavy `tests/conftest.py` chain.
+- **`mcp__github__list_pull_requests` and `mcp__github__actions_list` still truncate** at 167k / 346k chars. Save-to-file + python slice / json.load is the canonical workaround.
+
 ## 2026-06-11 23:25 UTC — 2026-06-11-2305
 **Why this matters next run:** the "don't reach across PR #299"
 guidance from the 2026-06-09 handoff was overly broad. PR #299 only
@@ -227,7 +259,13 @@ pure-docs PR (PR #301, single-file markdown change, ~22 LOC).
 - **`mcp__github__list_pull_requests` still truncates** (156k chars for 27 open PRs as of this run); save-to-file + python slice still works. **`mcp__github__actions_list list_workflow_runs` ALSO truncates now** (347k chars for the default page); save-to-file + json.load + iterate is the workaround. New `actions_list` + `get_job_logs` is the canonical way to grab failing-CI tracebacks; works fine — pass `tail_lines: 200` to stay under the cap.
 
 ---
-## 2026-05-29 23:10 UTC — 2026-05-29-2310
+_Entries older than 14 days were trimmed per the routine rules. The
+2026-05-25 entry's standing insight — codex PRs in this repo are
+authored by login `3pacs` on `codex/*` branches (not `app/openai-codex`),
+so filter TIER 1 by `head.ref` starting `codex/` not by author — is
+preserved here as a permanent note._
+
+<!-- TRIMMED 2026-05-29 23:10 UTC — 2026-05-29-2310
 **Why this matters next run:** TIER 1 burned on codex PR #276 review — don't re-review it. The standing PUNCH-LIST line 47 [P2] is still the best clean code pick, BUT the stale "PR #275 now merged" note in the 2026-05-28 handoff is wrong — #275 is still OPEN, so `prediction_backtest.py` remains file-claimed.
 
 - Posted COMMENT review on **PR #276** (`codex/ten-year-portfolio-landing-20260527`, opened 2026-05-28, 24 files +3141/-51, zero prior reviews). 0 CRITICAL, 3 HIGH, 3 MEDIUM, 3 LOW. The 3 HIGH are operator-actionable one-liners: (1) `openpyxl` missing from `requirements.txt` despite top-level import in `strategy/portfolio_workbook_plan.py:18` — fresh-deploy `ModuleNotFoundError`; (2) `api/routers/ten_year_portfolio.py:211-269` `/export.xlsx` GET handler has no `try/except` while sibling POST at :271 does; (3) `:183-185` `/weekly` returns raw `str(exc)` to client (violates `.claude/rules/security.md`). MEDIUM #4 is a PIT bypass to flag for the operator: `_load_price_history` reads `raw_series`/`resolved_series` directly anchored on `CURRENT_DATE` — fine for live UI, lookahead landmine if ever reused in a backtest.
@@ -266,10 +304,5 @@ pure-docs PR (PR #301, single-file markdown change, ~22 LOC).
 - **Next clean routine-claimable items** (same 2026-05-17 api/ audit, all still unclaimed): line 45 [P1] `prediction_backtest.py:20` `get_engine`→`get_db_engine`; line 46 [P2] `clear_singletons()` doesn't clear `db._engine`; line 47 [P2] f-string SQL in `prediction_backtest.py:116` (same file as 45 — could pair). Line 42 (`intel_search` pagination) remains a design call — do NOT sum-and-ship (see 2026-05-21 entry).
 - **Latent bug found, left unfixed (out of scope):** `system.py::freshness()` (line ~422-426) builds `resp_dict = resp.dict(); resp_dict["stale_sources"] = stale_sources` and the comment claims "FastAPI will include it." It does NOT — the route declares `response_model=FreshnessResponse`, so FastAPI filters the response through that model and **strips `stale_sources` entirely**. The frontend staleness-indicator data never reaches the client. Real fix = add `stale_sources` to the `FreshnessResponse` model (or drop `response_model`). Good small follow-up PR.
 - **Env note (confirms 2026-05-21):** the test suite CAN run in this container after `pip install fastapi sqlalchemy pandas pydantic loguru psycopg2-binary 'python-jose[cryptography]' pytest ruff`. Two gotchas: (1) the installed **passlib bcrypt backend panics** on its self-test (`password cannot be longer than 72 bytes`) the moment you call `_pwd_ctx.hash()` — so in new API tests DON'T hash a password at import like `test_api.py` does; set a **static** `GRID_MASTER_PASSWORD_HASH` literal and mint auth via `create_token` (only needs `GRID_JWT_SECRET`). (2) system `cryptography` 41 is debian-managed and can't be force-reinstalled, but `python-jose[cryptography]` still imported fine for me this run.
+-->
 
----
-_Entries older than 14 days were trimmed per the routine rules. The
-2026-05-25 entry's standing insight — codex PRs in this repo are
-authored by login `3pacs` on `codex/*` branches (not `app/openai-codex`),
-so filter TIER 1 by `head.ref` starting `codex/` not by author — is
-preserved here as a permanent note._
