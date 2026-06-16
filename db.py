@@ -121,6 +121,18 @@ def get_engine() -> Engine:
     return _engine
 
 
+def clear_engine() -> None:
+    """Dispose the cached SQLAlchemy engine and clear the singleton.
+
+    The next call to :func:`get_engine` will build a fresh engine from
+    current ``settings``. Safe to call when no engine has been created.
+    """
+    global _engine
+    if _engine is not None:
+        _engine.dispose()
+    _engine = None
+
+
 def _connect_with_retry(max_attempts: int = 5) -> psycopg2.extensions.connection:
     """Open a raw psycopg2 connection with retry-on-slot-exhaustion.
 
