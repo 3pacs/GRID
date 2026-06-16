@@ -29,6 +29,48 @@ _RELATIONSHIP_PROPS = [
 ]
 
 
+def _escape_literal(value: str) -> str:
+    r"""Escape a string for safe inclusion in a SPARQL string literal.
+
+    Wikidata's WDQS rejects unescaped double-quotes/backslashes/newlines
+    inside a ``"..."@en`` literal with an HTTP 500. Escape them so an actor
+    name like ``Robert "Bob" Smith`` renders a well-formed query.
+    """
+    return (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", " ")
+        .replace("\r", " ")
+        .strip()
+    )
+
+
+def build_query(actor_name: str) -> str:
+    """Render the relationship-discovery SPARQL query for ``actor_name``.
+
+    Extracted so the rendered query can be unit-tested for valid SPARQL
+    (no literal ``{{``/``}}`` braces, balanced braces, escaped literals).
+
+    The property variable is bound to the *direct-claim* prefix ``wdt:``
+    rather than the entity prefix ``wd:`` — only ``wdt:Pxxx`` IRIs are valid
+    predicates in ``?person ?prop ?related``; binding the bare ``wd:Pxxx``
+    entity matched nothing and is malformed for predicate position.
+    """
+    props_filter = " ".join(f"wdt:{p}" for p in _RELATIONSHIP_PROPS)
+    safe_name = _escape_literal(actor_name)
+    # Use str.format with doubled braces ONLY in the template so the final
+    # string carries single SPARQL braces. Build via concatenation to avoid
+    # f-string/.format brace-escaping foot-guns entirely.
+    return (
+        "SELECT ?relatedLabel ?relatedDescription ?propLabel WHERE { "
+        '?person rdfs:label "' + safe_name + '"@en . '
+        "VALUES ?prop { " + props_filter + " } "
+        "?person ?prop ?related . "
+        'SERVICE wikibase:label { bd:serviceParam wikibase:language "en" . } '
+        "} LIMIT 50"
+    )
+
+
 class WikidataAdapter:
     """Discover actor connections via Wikidata SPARQL."""
 
@@ -37,16 +79,7 @@ class WikidataAdapter:
     def discover(
         self, actor_name: str, actor_hint: dict[str, Any]
     ) -> list[DiscoveredConnection]:
-        props_filter = " ".join(f"wd:{p}" for p in _RELATIONSHIP_PROPS)
-        query = f"""
-        SELECT ?relatedLabel ?relatedDescription ?propLabel WHERE {{
-          ?person rdfs:label "{actor_name}"@en .
-          VALUES ?prop {{ {props_filter} }}
-          ?person ?prop ?related .
-          SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
-        }}
-        LIMIT 50
-        """
+        query = build_query(actor_name)
         try:
             resp = requests.get(
                 WIKIDATA_SPARQL,

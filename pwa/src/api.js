@@ -177,6 +177,82 @@ class GRIDApi {
         });
     }
 
+    // Ten-year portfolio query
+    async getTenYearPortfolio({ capital = 1000000, years = 10, profile = null } = {}) {
+        const params = new URLSearchParams({
+            capital: String(capital),
+            years: String(years),
+        });
+        if (profile) params.set('profile', profile);
+        return this._fetch(`/api/v1/ten-year-portfolio/weekly?${params.toString()}`);
+    }
+
+    async uploadTenYearWorkbook(file, { capital = 1000000, years = 10 } = {}) {
+        const params = new URLSearchParams({ capital: String(capital), years: String(years) });
+        const form = new FormData();
+        form.append('file', file);
+        return this._fetchForm(`/api/v1/ten-year-portfolio/workbook/analyze?${params.toString()}`, form);
+    }
+
+    async exportTenYearWorkbook(file, { capital = 1000000, years = 10 } = {}) {
+        const params = new URLSearchParams({ capital: String(capital), years: String(years) });
+        const form = new FormData();
+        form.append('file', file);
+        return this._download(`/api/v1/ten-year-portfolio/workbook/export.xlsx?${params.toString()}`, {
+            method: 'POST',
+            body: form,
+        });
+    }
+
+    async exportTenYearModel({ capital = 1000000, years = 10 } = {}) {
+        const params = new URLSearchParams({ capital: String(capital), years: String(years) });
+        return this._download(`/api/v1/ten-year-portfolio/export.xlsx?${params.toString()}`);
+    }
+
+    async _fetchForm(path, form) {
+        const headers = {};
+        if (this.token) {
+            headers['Authorization'] = `Bearer ${this.token}`;
+        }
+        try {
+            const response = await fetch(`${this.baseUrl}${path}`, {
+                method: 'POST',
+                body: form,
+                headers,
+            });
+            if (!response.ok) {
+                const body = await response.text().catch(() => '');
+                let message = response.statusText;
+                try {
+                    const parsed = JSON.parse(body);
+                    message = parsed.detail || parsed.message || message;
+                } catch (_) {
+                    if (body) message = body;
+                }
+                return { error: true, status: response.status, message };
+            }
+            return await response.json();
+        } catch (networkErr) {
+            return { error: true, status: 0, message: networkErr.message || 'Network error' };
+        }
+    }
+
+    async _download(path, options = {}) {
+        const headers = { ...(options.headers || {}) };
+        if (this.token) {
+            headers['Authorization'] = `Bearer ${this.token}`;
+        }
+        const response = await fetch(`${this.baseUrl}${path}`, { ...options, headers });
+        if (!response.ok) {
+            const message = await response.text().catch(() => response.statusText);
+            throw new GRIDApiError(response.status, message || response.statusText);
+        }
+        const blob = await response.blob();
+        const disposition = response.headers.get('content-disposition') || '';
+        const match = disposition.match(/filename="([^"]+)"/);
+        return { blob, filename: match?.[1] || 'grid-export.xlsx' };
+    }
+
     // Journal
     async getJournal(params = {}) {
         const qs = new URLSearchParams(params).toString();
@@ -297,6 +373,10 @@ class GRIDApi {
     }
     async getTickerOverview(ticker) {
         return this._fetch(`/api/v1/watchlist/${encodeURIComponent(ticker)}/overview`);
+    }
+    /** Fast, LLM-free price/options snapshot — powers the stepdad.finance pulse tile. */
+    async getTickerQuote(ticker) {
+        return this._fetch(`/api/v1/watchlist/${encodeURIComponent(ticker)}/quote`);
     }
     async refreshWatchlistPrices() {
         return this._fetch('/api/v1/watchlist/refresh-prices', { method: 'POST' });
@@ -595,11 +675,87 @@ class GRIDApi {
         });
     }
 
+    /** stepdad.finance composer: NL request -> dashboard layout (widgets + allocation). */
+    async compose(question, history = []) {
+        return this._fetch('/api/v1/chat/compose', {
+            method: 'POST',
+            body: JSON.stringify({ question, history }),
+        });
+    }
+
+    /** Record whether dad wants a ping when a not-yet-built request ships. */
+    async setCapabilityPing(requestId, wants) {
+        return this._fetch(`/api/v1/chat/capability/${encodeURIComponent(requestId)}/ping`, {
+            method: 'POST',
+            body: JSON.stringify({ wants: !!wants }),
+        });
+    }
+
+    /** Price alerts: text me when a stock crosses a price. */
+    async createAlert(ticker, direction, threshold, note = null) {
+        return this._fetch('/api/v1/alerts', {
+            method: 'POST',
+            body: JSON.stringify({ ticker, direction, threshold, note }),
+        });
+    }
+
+    /** List the current user's active + recently triggered price alerts. */
+    async listAlerts() {
+        return this._fetch('/api/v1/alerts');
+    }
+
+    /** Cancel (deactivate) a price alert. */
+    async cancelAlert(alertId) {
+        return this._fetch(`/api/v1/alerts/${encodeURIComponent(alertId)}`, {
+            method: 'DELETE',
+        });
+    }
+
+    /**
+     * Streaming verdict (SSE). onDelta(fullTextSoFar) fires per chunk so the UI
+     * can render the answer as it's written. Returns the final text. Pass an
+     * AbortSignal to cancel (e.g. on unmount).
+     */
+    async askStream(question, { history = [], onDelta, signal } = {}) {
+        const res = await fetch(`${this.baseUrl}/api/v1/chat/ask/stream`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
+            },
+            body: JSON.stringify({ question, history }),
+            signal,
+        });
+        if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        let full = '';
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            const events = buf.split('\n\n');
+            buf = events.pop() || '';
+            for (const evt of events) {
+                const line = evt.trim();
+                if (!line.startsWith('data:')) continue;
+                let obj;
+                try { obj = JSON.parse(line.slice(5).trim()); } catch { continue; }
+                if (obj.error) throw new Error(obj.message || 'stream error');
+                if (obj.delta) { full += obj.delta; if (onDelta) onDelta(full); }
+            }
+        }
+        return full;
+    }
+
     // Actor Network
     async getActorNetwork() { return this._fetch('/api/v1/intelligence/actor-network'); }
     async getPowerMap(sectorName) { return this._fetch(`/api/v1/intelligence/power-map/${encodeURIComponent(sectorName)}`); }
     async getEgoGraphSearch(q) { return this._fetch(`/api/v1/intelligence/ego-graph/search?q=${encodeURIComponent(q)}`); }
     async getEgoGraph(actorId, depth = 2, maxNodes = 80) { return this._fetch(`/api/v1/intelligence/ego-graph/${encodeURIComponent(actorId)}?depth=${depth}&max_nodes=${maxNodes}`); }
+    /** Cross-domain expansion for a ticker: supplier → causation → committee → member trades. */
+    async getIntelExpand(ticker) { return this._fetch(`/api/v1/intelligence/intel-expand/${encodeURIComponent(ticker)}`); }
     async getGrandPowerMap(limit = 50) { return this._fetch(`/api/v1/intelligence/grand-power-map?limit=${limit}`); }
     async getActorDetail(id) { return this._fetch(`/api/v1/intelligence/actor/${encodeURIComponent(id)}`); }
     async getActorNeighborhood(id, depth = 3, maxNodes = 2000) {

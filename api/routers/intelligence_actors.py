@@ -386,17 +386,98 @@ async def get_top_actors_endpoint(
         return {"actors": [], "metric": metric, "count": 0, "error": str(exc)}
 
 
+# ── Community list cache ────────────────────────────────────────────────
+#
+# The live aggregation (store.graph.get_community_list) groups ~2.7M
+# actor_analytics rows into ~44K communities AND runs one extra "top member"
+# query PER community — a 44K-query N+1 that is far too slow for an
+# interactive request. We read the materialized ``community_summary`` table
+# (migration 0055_community_summary.sql) instead, with two layers of
+# protection: a short in-process TTL cache, and graceful fallback to the live
+# aggregation when the table is missing or empty.
+_COMMUNITY_LIST_TTL = 300  # 5 minutes
+_community_list_cache: TTLCache = TTLCache(ttl=_COMMUNITY_LIST_TTL, max_size=1)
+_COMMUNITY_LIST_CACHE_KEY = "all"
+
+
+def _read_community_summary(engine: Any) -> tuple[list[dict[str, Any]], str] | None:
+    """Read communities from the cached ``community_summary`` table.
+
+    Returns ``(communities, "cache")`` on a hit, or ``None`` when the table is
+    absent/empty so the caller can fall back to the live aggregation. Never
+    raises — a query failure is treated as a miss.
+    """
+    from sqlalchemy import text
+
+    try:
+        with engine.connect() as conn:
+            if not _table_exists(conn, "community_summary"):
+                return None
+            rows = conn.execute(text(
+                "SELECT community_id, member_count, max_pagerank, "
+                "top_member, top_category "
+                "FROM community_summary "
+                "ORDER BY member_count DESC"
+            )).fetchall()
+    except Exception as exc:
+        log.debug("community_summary read failed, falling back: {e}", e=str(exc))
+        return None
+
+    if not rows:
+        return None
+
+    communities = [
+        {
+            "community_id": r[0],
+            "member_count": int(r[1]) if r[1] is not None else 0,
+            "max_pagerank": float(r[2]) if r[2] is not None else 0.0,
+            "top_member": r[3],
+            "top_category": r[4],
+        }
+        for r in rows
+    ]
+    return communities, "cache"
+
+
+def _load_community_list(engine: Any) -> tuple[list[dict[str, Any]], str]:
+    """Cached-first community list with graceful fallback to live aggregation.
+
+    Order: in-process TTL cache → ``community_summary`` table → live
+    ``get_community_list`` aggregation. Returns ``(communities, source)`` where
+    source is one of ``ttl`` / ``cache`` / ``live``.
+    """
+    cached = _community_list_cache.get(_COMMUNITY_LIST_CACHE_KEY)
+    if cached is not None:
+        return cached, "ttl"
+
+    summary = _read_community_summary(engine)
+    if summary is not None:
+        communities, source = summary
+        _community_list_cache.set(_COMMUNITY_LIST_CACHE_KEY, communities)
+        return communities, source
+
+    # Fallback: the slow live aggregation (table not yet materialized).
+    from store.graph import get_community_list
+
+    communities = get_community_list(engine=engine)
+    _community_list_cache.set(_COMMUNITY_LIST_CACHE_KEY, communities)
+    return communities, "live"
+
+
 @router.get("/analytics/communities")
 async def get_communities_endpoint(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
-    """Return list of all communities with member counts and top member."""
-    try:
-        from store.graph import get_community_list
+    """Return list of all communities with member counts and top member.
 
+    Reads the materialized ``community_summary`` cache when available (see
+    migration 0055), falling back to the live aggregation. The ``source``
+    field reports which path served the request.
+    """
+    try:
         engine = get_db_engine()
-        communities = get_community_list(engine=engine)
-        return {"communities": communities, "count": len(communities)}
+        communities, source = _load_community_list(engine)
+        return {"communities": communities, "count": len(communities), "source": source}
     except Exception as exc:
         log.warning("Community list failed: {e}", e=str(exc))
         return {"communities": [], "count": 0, "error": str(exc)}
@@ -827,6 +908,15 @@ _RELATIONSHIP_COLORS = {
     "institutional_holding": "#2DD4BF",
     "co_traded_insider": "#FB923C",
     "co_traded_congress": "#F472B6",
+    # ── Multi-domain intel-expand chain types ──
+    # (mirrored by EDGE_TYPE_COLORS in pwa/src/components/canvas/nodeStyles.js)
+    "supplier": "#3B82F6",       # blue — supply chain (AAPL ← TSMC)
+    "supply_chain": "#3B82F6",
+    "customer": "#60A5FA",
+    "causation": "#F97316",      # orange — causal lever (tariff → ticker)
+    "jurisdiction": "#EAB308",   # gold — committee oversees ticker/sector
+    "committee": "#EAB308",
+    "member_trade": "#EC4899",   # pink — committee member's disclosed trade
 }
 
 
@@ -1250,6 +1340,258 @@ def get_ego_graph(
     except Exception as exc:
         log.warning("Ego-graph for {a} failed: {e}", a=actor_id, e=str(exc))
         return {"nodes": [], "edges": [], "error": str(exc)}
+
+
+# ── Multi-domain Intel Expansion ───────────────────────────────────────────
+#
+# Turns a flat ticker into a *typed* cross-domain chain so a canvas expansion
+# can walk: TICKER → supplier (supply_chain_edges) → causal lever
+# (causal_links) → congressional committee with jurisdiction → that committee's
+# members' disclosed trades (congressional_trades). Each edge carries a
+# discrete ``relationship``/``type`` so the frontend colours it by kind
+# (supplier=blue, causation=orange, jurisdiction=gold, member_trade=pink).
+#
+# Example reachable chain:
+#   AAPL → TSMC (supplier) → tariff (causation) → Ways & Means (jurisdiction)
+#        → Rep. X: BUY (member_trade)
+
+
+def _table_exists(conn: Any, table_name: str) -> bool:
+    """True if a relation exists (schema-qualified or bare). Safe on error."""
+    try:
+        from sqlalchemy import text
+
+        row = conn.execute(
+            text("SELECT to_regclass(:n)").bindparams(n=table_name)
+        ).fetchone()
+        return bool(row and row[0])
+    except Exception:
+        return False
+
+
+def _committees_for_ticker(ticker: str) -> list[str]:
+    """Return congressional committees whose jurisdiction covers ``ticker``.
+
+    Pure (no DB): inverts ``COMMITTEE_SECTOR_MAP`` from the legislation puller
+    so a ticker maps back to the committees that oversee its sector. Falls
+    back to an empty list if the map can't be imported.
+    """
+    t = (ticker or "").strip().upper()
+    if not t:
+        return []
+    try:
+        from ingestion.altdata.legislation import COMMITTEE_SECTOR_MAP
+    except Exception:
+        return []
+    matches: list[str] = []
+    for committee, tickers in COMMITTEE_SECTOR_MAP.items():
+        if t in {str(x).upper() for x in tickers}:
+            matches.append(committee)
+    return sorted(matches)
+
+
+def _intel_expand_graph(engine: Any, ticker: str, max_per_hop: int = 6) -> dict[str, Any]:
+    """Build a typed cross-domain expansion graph centered on ``ticker``.
+
+    Returns ``{nodes, edges, center, relationship_colors}``. Each table is
+    probed defensively — a missing table degrades that hop rather than failing
+    the whole response.
+    """
+    from sqlalchemy import text
+
+    t = (ticker or "").strip().upper()
+    center_id = f"t:{t}"
+    nodes: dict[str, dict[str, Any]] = {
+        center_id: {"id": center_id, "label": t, "type": "ticker", "ticker": t, "ring": 0},
+    }
+    edges: list[dict[str, Any]] = []
+
+    def _add_node(nid: str, node: dict[str, Any]) -> None:
+        if nid not in nodes:
+            nodes[nid] = node
+
+    def _add_edge(src: str, tgt: str, relationship: str, **extra: Any) -> None:
+        edges.append({
+            "source": src,
+            "target": tgt,
+            "relationship": relationship,
+            "type": relationship,
+            "color": _RELATIONSHIP_COLORS.get(relationship, "#64748B"),
+            **extra,
+        })
+
+    with engine.connect() as conn:
+        # ── Hop 1: suppliers (ticker is the DOWNSTREAM consumer) ──
+        if _table_exists(conn, "supply_chain_edges"):
+            try:
+                sup_rows = conn.execute(text("""
+                    SELECT upstream_id, relationship, annual_usd,
+                           pct_downstream_cogs, chokepoint_score, confidence
+                    FROM supply_chain_edges
+                    WHERE UPPER(downstream_id) = :t
+                    ORDER BY COALESCE(annual_usd, 0) DESC
+                    LIMIT :lim
+                """), {"t": t, "lim": max_per_hop}).fetchall()
+            except Exception as exc:
+                log.debug("intel-expand supplier hop failed: {e}", e=str(exc))
+                sup_rows = []
+
+            sup_ids = [r[0] for r in sup_rows]
+            labels: dict[str, str] = {}
+            if sup_ids and _table_exists(conn, "supply_chain_nodes"):
+                try:
+                    lab_rows = conn.execute(text(
+                        "SELECT id, name FROM supply_chain_nodes WHERE id = ANY(:ids)"
+                    ), {"ids": sup_ids}).fetchall()
+                    labels = {lr[0]: lr[1] for lr in lab_rows}
+                except Exception as exc:
+                    log.debug("intel-expand supplier labels failed: {e}", e=str(exc))
+
+            for r in sup_rows:
+                up_id = r[0]
+                nid = f"sc:{up_id}"
+                _add_node(nid, {
+                    "id": nid,
+                    "label": labels.get(up_id) or str(up_id).replace("_", " ").title(),
+                    "type": "company",
+                    "ring": 1,
+                    "chokepoint_score": float(r[4]) if r[4] is not None else None,
+                })
+                _add_edge(
+                    nid, center_id, "supplier",
+                    strength=min(1.0, float(r[4]) if r[4] is not None else 0.6),
+                    annual_usd=float(r[2]) if r[2] is not None else None,
+                    input_type=r[1],
+                )
+
+        # ── Hop 2: causal levers affecting the ticker ──
+        cause_nodes: list[str] = []
+        if _table_exists(conn, "causal_links"):
+            try:
+                cause_rows = conn.execute(text("""
+                    SELECT cause_type, probable_cause, MAX(probability) AS prob
+                    FROM causal_links
+                    WHERE UPPER(ticker) = :t
+                    GROUP BY cause_type, probable_cause
+                    ORDER BY prob DESC NULLS LAST
+                    LIMIT :lim
+                """), {"t": t, "lim": max_per_hop}).fetchall()
+            except Exception as exc:
+                log.debug("intel-expand causation hop failed: {e}", e=str(exc))
+                cause_rows = []
+
+            for r in cause_rows:
+                ctype = (r[0] or "cause").strip()
+                cnid = f"cause:{t}:{ctype}"
+                cause_nodes.append(cnid)
+                _add_node(cnid, {
+                    "id": cnid,
+                    "label": (r[1] or ctype)[:80],
+                    "type": "event",
+                    "category": "macro",
+                    "cause_type": ctype,
+                    "ring": 1,
+                })
+                _add_edge(
+                    cnid, center_id, "causation",
+                    strength=float(r[2]) if r[2] is not None else 0.5,
+                )
+
+        # ── Hop 3: committees with jurisdiction over the ticker ──
+        committees = _committees_for_ticker(t)
+        committee_nodes: dict[str, str] = {}
+        for committee in committees:
+            cmid = f"committee:{committee}"
+            committee_nodes[committee] = cmid
+            _add_node(cmid, {
+                "id": cmid,
+                "label": committee.title() + " Cmte.",
+                "type": "actor",
+                "category": "government",
+                "tier": "regional",
+                "ring": 2,
+            })
+            # Link jurisdiction from each causal lever (policy → committee) when
+            # present, else straight from the ticker.
+            anchors = cause_nodes or [center_id]
+            for anchor in anchors:
+                _add_edge(cmid, anchor, "jurisdiction", strength=0.5)
+
+        # ── Hop 4: committee members' disclosed trades in the ticker ──
+        if committees and _table_exists(conn, "congressional_trades"):
+            try:
+                trade_rows = conn.execute(text("""
+                    SELECT representative, party, state, transaction_type,
+                           amount_midpoint, committee, disclosure_date
+                    FROM congressional_trades
+                    WHERE UPPER(ticker) = :t AND committee IS NOT NULL
+                    ORDER BY disclosure_date DESC NULLS LAST
+                    LIMIT :lim
+                """), {"t": t, "lim": max_per_hop * 2}).fetchall()
+            except Exception as exc:
+                log.debug("intel-expand member-trade hop failed: {e}", e=str(exc))
+                trade_rows = []
+
+            for r in trade_rows:
+                rep = r[0] or "Unknown"
+                committee_raw = (r[5] or "").lower()
+                # Attach to a matching jurisdiction committee node when possible.
+                matched = next(
+                    (committee_nodes[c] for c in committees if c in committee_raw),
+                    None,
+                )
+                mid = f"member:{rep}"
+                party_tag = f" ({r[1]}-{r[2]})" if r[1] and r[2] else ""
+                _add_node(mid, {
+                    "id": mid,
+                    "label": f"Rep. {rep}{party_tag}",
+                    "type": "actor",
+                    "category": "politician",
+                    "tier": "individual",
+                    "ring": 3,
+                })
+                if matched:
+                    _add_edge(matched, mid, "member_trade", strength=0.55)
+                # The disclosed trade itself ties the member back to the ticker.
+                amt = float(r[4]) if r[4] is not None else None
+                _add_edge(
+                    mid, center_id, "congressional_trade",
+                    strength=0.5,
+                    transaction_type=r[3],
+                    amount=amt,
+                )
+
+    return {
+        "nodes": list(nodes.values()),
+        "edges": edges,
+        "center": center_id,
+        "ticker": t,
+        "relationship_colors": _RELATIONSHIP_COLORS,
+    }
+
+
+@router.get("/intel-expand/{ticker}")
+def get_intel_expand(
+    ticker: str,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Cross-domain expansion for a ticker into typed supply/causation/committee edges.
+
+    Surfaces the chain TICKER → supplier → causal lever → committee
+    (jurisdiction) → committee members' disclosed trades. Each edge is typed so
+    the canvas colours it by relationship kind. Returns ``{nodes, edges}`` in
+    the same shape the canvas store consumes; degrades gracefully (empty hops)
+    when a backing table is absent.
+    """
+    t = (ticker or "").strip().upper()
+    if not t:
+        return {"nodes": [], "edges": [], "error": "ticker required"}
+    try:
+        engine = get_db_engine()
+        return _intel_expand_graph(engine, t)
+    except Exception as exc:
+        log.warning("Intel-expand for {t} failed: {e}", t=t, e=str(exc))
+        return {"nodes": [], "edges": [], "center": f"t:{t}", "error": str(exc)}
 
 
 # ── Grand Power Map ────────────────────────────────────────────────────────

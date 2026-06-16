@@ -629,8 +629,13 @@ class OracleEngine:
                     actual_move_pct DOUBLE PRECISION,
                     pnl_pct DOUBLE PRECISION,
                     scored_at TIMESTAMPTZ,
-                    score_notes TEXT
+                    score_notes TEXT,
+                    dedup_keep BOOLEAN NOT NULL DEFAULT TRUE
                 )
+            """))
+            conn.execute(text("""
+                ALTER TABLE oracle_predictions
+                ADD COLUMN IF NOT EXISTS dedup_keep BOOLEAN NOT NULL DEFAULT TRUE
             """))
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS oracle_models (
@@ -669,6 +674,23 @@ class OracleEngine:
             conn.execute(text("""
                 CREATE INDEX IF NOT EXISTS idx_oracle_pred_ticker
                 ON oracle_predictions (ticker, created_at DESC)
+            """))
+            conn.execute(text("""
+                CREATE UNIQUE INDEX IF NOT EXISTS oracle_predictions_dedup_unique
+                ON oracle_predictions (
+                    ticker,
+                    direction,
+                    expiry,
+                    prediction_type,
+                    (COALESCE(model_version, '')),
+                    ((created_at AT TIME ZONE 'UTC')::date)
+                )
+                WHERE dedup_keep = TRUE
+            """))
+            conn.execute(text("""
+                CREATE INDEX IF NOT EXISTS oracle_predictions_dedup_keep_created
+                ON oracle_predictions (created_at DESC)
+                WHERE dedup_keep = TRUE
             """))
             # TimesFM forecast storage (used by forecaster_adapter)
             conn.execute(text("""

@@ -6,6 +6,7 @@ outputs/llm_insights/
 outputs/market_briefings/
 outputs/insight_reviews/
 outputs/capital_flow_research/
+outputs/hermes/
 log/
 *.egg-info/
 dist/
@@ -48,3 +49,8 @@ output/briefings/
 
 # Local .env snapshots — must never go to GitHub
 .env.bak*
+
+# LLM autoresearch host profile cache — written by `--refresh-profiles` from
+# the live fleet dashboard. Runtime artifact; the live snapshot is the source
+# of truth, so don't freeze a (possibly partial) snapshot into git.
+llm/autoresearch/host_profiles.json

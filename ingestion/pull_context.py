@@ -15,6 +15,7 @@ Usage:
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -263,16 +264,16 @@ def _emit_pull_event(
             conn.execute(
                 text("""
                     INSERT INTO event_bus (event_type, source_node, payload)
-                    VALUES ('pull_completed', :node, :payload)
+                    VALUES ('pull_completed', :node, CAST(:payload AS jsonb))
                 """),
                 {
                     "node": node,
-                    "payload": {
+                    "payload": json.dumps({
                         "puller": puller_name,
                         "status": status,
                         "rows_inserted": rows,
                         "features_affected": features,
-                    },
+                    }),
                 },
             )
     except Exception as exc:

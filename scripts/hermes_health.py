@@ -22,6 +22,7 @@ DATA_FRESHNESS_THRESHOLD_HOURS = 26
 SOURCE_COOLDOWN_MINUTES = 30
 SOURCE_MAX_CONSECUTIVE_FAILS = 5
 TIMEOUT_BLACKLIST_HOURS = 24
+OPERATOR_ISSUE_DEDUPE_HOURS = 20
 
 
 def _ensure_issues_table(engine: Any) -> None:
@@ -88,6 +89,34 @@ def log_issue(
     _ensure_issues_table(engine)
     try:
         with engine.begin() as conn:
+            if fix_result != "SUCCESS":
+                existing = conn.execute(
+                    text(
+                        "SELECT id FROM operator_issues "
+                        "WHERE category = :cat "
+                        "AND severity = :sev "
+                        "AND source IS NOT DISTINCT FROM :src "
+                        "AND title = :title "
+                        "AND resolved_at IS NULL "
+                        "AND created_at >= NOW() - :hours * INTERVAL '1 hour' "
+                        "ORDER BY created_at DESC LIMIT 1"
+                    ),
+                    {
+                        "cat": category,
+                        "sev": severity,
+                        "src": source,
+                        "title": title,
+                        "hours": OPERATOR_ISSUE_DEDUPE_HOURS,
+                    },
+                ).fetchone()
+                if existing:
+                    issue_id = existing[0]
+                    log.info(
+                        "duplicate issue suppressed — existing #{id} [{sev}] {title}",
+                        id=issue_id, sev=severity, title=title[:80],
+                    )
+                    return issue_id
+
             row = conn.execute(
                 text(
                     "INSERT INTO operator_issues "
@@ -337,6 +366,10 @@ class OperatorState:
         return {
             "last_pipeline_run": self.last_pipeline_run.isoformat() if self.last_pipeline_run else None,
             "last_autoresearch": self.last_autoresearch.isoformat() if self.last_autoresearch else None,
+            "last_ux_audit": self.last_ux_audit.isoformat() if self.last_ux_audit else None,
+            "last_daily_digest": self.last_daily_digest.isoformat() if self.last_daily_digest else None,
+            "last_100x_digest": self.last_100x_digest.isoformat() if self.last_100x_digest else None,
+            "last_oracle_cycle": self.last_oracle_cycle.isoformat() if self.last_oracle_cycle else None,
             "consecutive_failures": self.consecutive_failures,
             "cycle_count": self.cycle_count,
             "fixes_applied": self.fixes_applied,
@@ -402,7 +435,8 @@ class OperatorState:
             "last_signal_forecasts", "last_enrich_connections",
             "last_contagion_backtest", "last_contagion_feedback",
             "last_sector_health", "last_active_hypo_scoring",
-            "last_earnings_calendar_sync",
+            "last_earnings_calendar_sync", "last_ux_audit",
+            "last_daily_digest", "last_100x_digest", "last_oracle_cycle",
         ]
         hydrated_any = False
         for field in restorable:

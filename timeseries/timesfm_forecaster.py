@@ -115,6 +115,7 @@ class TimesFMForecaster:
         self.default_horizon = horizon
         self.quantiles = quantiles
         self._model: Any = None
+        self._model_version_token: str | None = None
         self._available: bool | None = None  # None = not yet checked
 
     @property
@@ -157,10 +158,33 @@ class TimesFMForecaster:
             batch_size=32,
         )
         self._model = model
+        self._model_version_token = version
         self.model_name = version.split(":", 1)[-1] if ":" in version else version
 
         log.info("TimesFM model loaded via shared pool: {v}", v=version)
         return self._model
+
+    def _run_model_forecast(
+        self,
+        model: Any,
+        inputs: list[np.ndarray],
+        *,
+        horizon: int,
+        freq_type: int,
+    ) -> tuple[Any, Any]:
+        """Call the loaded TimesFM model across supported package APIs."""
+        if self._model_version_token and self._model_version_token.startswith("v2.5"):
+            return model.forecast(horizon=horizon, inputs=inputs)
+
+        freq = [freq_type] * len(inputs)
+        try:
+            return model.forecast(inputs, freq=freq)
+        except TypeError as exc:
+            # TimesFM 2.5 removed the `freq` argument and now accepts
+            # `forecast(horizon=..., inputs=...)`.
+            if "unexpected keyword argument 'freq'" in str(exc):
+                return model.forecast(horizon=horizon, inputs=inputs)
+            raise
 
     def forecast(
         self,
@@ -202,9 +226,11 @@ class TimesFMForecaster:
         )
 
         # TimesFM expects list of arrays for batch interface
-        point_forecasts, quantile_forecasts = model.forecast(
+        point_forecasts, quantile_forecasts = self._run_model_forecast(
+            model,
             [series.astype(np.float32)],
-            freq=[freq_type],
+            horizon=horizon,
+            freq_type=freq_type,
         )
 
         # Extract results for this single series
@@ -284,9 +310,11 @@ class TimesFMForecaster:
         )
 
         # Run batch inference
-        point_forecasts, quantile_forecasts = model.forecast(
+        point_forecasts, quantile_forecasts = self._run_model_forecast(
+            model,
             arrays,
-            freq=[freq_type] * len(arrays),
+            horizon=horizon,
+            freq_type=freq_type,
         )
 
         elapsed = _time.monotonic() - start

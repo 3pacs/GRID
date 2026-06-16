@@ -94,6 +94,7 @@ DIAGNOSE_PULLS_TIMEOUT_SECONDS = 240          # Hermes pull diagnosis/fix step �
 SMART_INGESTION_TIMEOUT_SECONDS = 300         # smart_scheduler.tick() — matches TICK_TIME_BUDGET_S in ingestion/smart_scheduler.py so Hermes doesn't pull the plug while SmartScheduler is mid-shutdown
 TIMESFM_TIMEOUT_SECONDS = 240                 # oracle/forecaster_adapter.run_timesfm_forecast_cycle
 INTELLIGENCE_TASKS_TIMEOUT_SECONDS = 360      # trust/forecasts/thesis/cross-ref/options + daily-window backtest_scanner.review_existing_hypotheses (LLM-bound). Bumped 2026-05-08 from 180s after the timeout machinery was actually working — 180s was empirical-untested guess; 360s reflects observed daily run length with LLM calls
+POSTMORTEM_BATCH_LIMIT = 20                   # Drain postmortem backlog in bounded chunks instead of orphaning long LLM loops.
 
 # Active-hypothesis scoring — periodic batch that closes the loop on the
 # auto_discover() pipeline. The bottleneck is per-row score_hypothesis()
@@ -112,6 +113,10 @@ ACTIVE_HYPO_SCORING_INTERVAL_MINUTES = 30
 # runs it every 30 minutes from Hermes alongside the active-hypothesis
 # scorer (same cadence, same scheduling mechanism).
 EARNINGS_CALENDAR_SYNC_INTERVAL_MINUTES = 30
+
+# Keep signal classification under its per-step timeout. The classifier makes
+# one local LLM call per signal and live calls can approach 15s each.
+SIGNAL_CLASSIFICATION_LIMIT = int(os.getenv("GRID_SIGNAL_CLASSIFICATION_LIMIT", "5"))
 
 
 def _run_with_timeout(name: str, fn, timeout_s: int, state):
@@ -772,6 +777,7 @@ def run_intelligence_tasks(
             from intelligence.postmortem import batch_postmortem
             results["postmortem_batch"] = _run_intel_task(
                 "postmortem_batch", batch_postmortem, state, engine,
+                limit=POSTMORTEM_BATCH_LIMIT,
             )
         except Exception as exc:
             log.warning("Postmortem import failed: {e}", e=str(exc))
@@ -1328,10 +1334,13 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         # cooldown-throttled (6h default), email via alerts.email.
         try:
             from alerts.health_alerter import check_and_alert
-            fired = check_and_alert(health)
-            if fired:
-                log.warning("Health alerts fired: {f}", f=", ".join(fired))
-                cycle_result["alerts_fired"] = fired
+            if dry_run:
+                cycle_result["alerts_fired"] = {"skipped": "dry_run"}
+            else:
+                fired = check_and_alert(health)
+                if fired:
+                    log.warning("Health alerts fired: {f}", f=", ".join(fired))
+                    cycle_result["alerts_fired"] = fired
         except Exception as exc:
             log.debug("Health alerter skipped: {e}", e=str(exc))
     except Exception as exc:
@@ -1796,7 +1805,10 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
                 from ingestion.signal_classifier import classify_recent_signals
 
                 def _classify_call():
-                    return classify_recent_signals(engine, limit=30)
+                    return classify_recent_signals(
+                        engine,
+                        limit=SIGNAL_CLASSIFICATION_LIMIT,
+                    )
 
                 cls_result, ok = _run_with_timeout(
                     "signal_classification", _classify_call,

@@ -5,6 +5,7 @@
 
 import { create } from 'zustand';
 import Graph from 'graphology';
+import { edgeColorForType } from '../components/canvas/nodeStyles.js';
 
 const useCanvasStore = create((set, get) => ({
     // ── Graph state ──
@@ -352,13 +353,20 @@ function _applyVisibleDepth(graph, visibleDepth) {
 function _edgeAttributes(edge) {
     const data = _safeObject(edge.data);
     const strength = edge.strength || edge.weight || data.strength || 0.3;
+    // edgeKind carries the domain relationship type. `type` is reserved by Sigma v3.
+    // Backend graphs use `relationship` (actor_connections); canvas/board edges
+    // use `type`/`edgeKind` — accept all so colours resolve regardless of source.
+    const edgeKind =
+        edge.type || edge.edgeKind || edge.edge_type ||
+        edge.relationship || data.type || data.relationship || 'connection';
+    const label = edge.label || data.label || '';
     return {
         ...edge.attributes,
-        label: edge.label || data.label || '',
+        label,
+        // Colour = relationship TYPE; thickness (size) = strength.
         color: _edgeColor(edge),
         size: strength * 3 + 0.5,
-        // edgeKind carries the domain type. `type` is reserved by Sigma v3.
-        edgeKind: edge.type || edge.edgeKind || edge.edge_type || data.type || 'connection',
+        edgeKind,
         strength,
         data,
     };
@@ -406,15 +414,16 @@ function _nodeColor(node) {
 }
 
 // ── Edge color helper ──
+// Colour encodes the *relationship type* (competitor/supplier/investor/
+// government/…). Thickness (`size`, set in _edgeAttributes) still encodes
+// strength. Falls back to keyword matching on the label, then a neutral grey.
 function _edgeColor(edge) {
-    const type = edge.type || edge.edgeKind || edge.edge_type || 'connection';
-    switch (type) {
-        case 'connection': return '#1A2332';
-        case 'signal_link': return '#1A6EBF';
-        case 'flow': return '#10B981';
-        case 'co_traded': return '#8B5CF6';
-        default: return '#1A2332';
-    }
+    const data = _safeObject(edge.data);
+    const type =
+        edge.type || edge.edgeKind || edge.edge_type ||
+        edge.relationship || data.type || data.relationship || 'connection';
+    const label = edge.label || data.label || '';
+    return edgeColorForType(type, label);
 }
 
 export default useCanvasStore;

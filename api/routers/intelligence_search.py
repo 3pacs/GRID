@@ -81,7 +81,14 @@ def search_intelligence(
             total = total_row[0] if total_row else 0
 
             if total == 0:
-                return {"results": [], "total": 0, "query": q}
+                return {
+                    "results": [],
+                    "total": 0,
+                    "limit": limit,
+                    "offset": offset,
+                    "has_more": False,
+                    "query": q,
+                }
 
             # Fetch ranked results with snippets
             search_sql = text(f"""
@@ -121,14 +128,29 @@ def search_intelligence(
             log.warning(
                 "intelligence_search materialized view not found — run migration or POST /refresh"
             )
-            return {"results": [], "total": 0, "query": q, "error": "Materialized view not yet created. Run the migration or POST /api/v1/search/intelligence/refresh."}
+            return {
+                "results": [],
+                "total": 0,
+                "limit": limit,
+                "offset": offset,
+                "has_more": False,
+                "query": q,
+                "error": "Materialized view not yet created. Run the migration or POST /api/v1/search/intelligence/refresh.",
+            }
         log.error("Intelligence FTS failed: {e}", e=error_msg)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Intelligence search failed",
         )
 
-    return {"results": results, "total": total, "query": q}
+    return {
+        "results": results,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "has_more": (offset + limit) < total,
+        "query": q,
+    }
 
 
 @router.post("/intelligence/refresh")

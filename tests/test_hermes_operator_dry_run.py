@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import sys
 from types import SimpleNamespace
 
@@ -175,3 +176,76 @@ def test_hermes_dry_run_skips_mutating_cycle_steps(monkeypatch):
     assert "snapshot" not in calls
     assert "obsidian_report" not in calls
     assert "publish_alpha" not in calls
+
+
+def test_hermes_dry_run_does_not_send_health_alerts(monkeypatch):
+    import scripts.hermes_operator as hermes
+
+    calls: list[str] = []
+    fake_engine = _FakeEngine(calls)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "db",
+        SimpleNamespace(get_engine=lambda: fake_engine),
+    )
+    monkeypatch.setattr(
+        hermes,
+        "check_system_health",
+        lambda _engine: {
+            "db": {
+                "healthy": True,
+                "stale_sources": [{"source": f"s{i}", "last_pull": None} for i in range(30)],
+                "failed_pulls_24h": 500,
+            },
+            "hermes": {"healthy": True},
+            "overall_healthy": False,
+        },
+    )
+    monkeypatch.setattr(
+        hermes,
+        "diagnose_and_fix_pulls",
+        lambda *_args, **_kwargs: {"retried": 0, "fixed": 0, "diagnosed": 0},
+    )
+    monkeypatch.setattr(
+        hermes,
+        "_run_with_timeout",
+        lambda _name, fn, _timeout, _state: (fn(), True),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "alerts.health_alerter",
+        SimpleNamespace(check_and_alert=lambda _health: calls.append("health_alert")),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "scripts.daily_digest",
+        SimpleNamespace(maybe_send_daily_digest=lambda *_args, **_kwargs: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "alpha_research.heartbeat",
+        SimpleNamespace(run_heartbeat=lambda _engine: []),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "alpha_research.adapters.signal_adapter",
+        SimpleNamespace(publish_all_alpha_signals=lambda _engine: None),
+    )
+
+    hermes.run_cycle(_FakeState(), dry_run=True)
+
+    assert "health_alert" not in calls
+
+
+def test_signal_classification_limit_matches_timeout_budget():
+    import scripts.hermes_operator as hermes
+
+    assert 1 <= hermes.SIGNAL_CLASSIFICATION_LIMIT <= 8
+    assert (
+        hermes.SIGNAL_CLASSIFICATION_LIMIT * 15
+        <= hermes.SIGNAL_CLASSIFICATION_TIMEOUT_SECONDS
+    )
+
+    source = inspect.getsource(hermes.run_cycle)
+    assert "limit=SIGNAL_CLASSIFICATION_LIMIT" in source
