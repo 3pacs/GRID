@@ -6,6 +6,7 @@ outputs/llm_insights/
 outputs/market_briefings/
 outputs/insight_reviews/
 outputs/capital_flow_research/
+outputs/hermes/
 log/
 *.egg-info/
 dist/

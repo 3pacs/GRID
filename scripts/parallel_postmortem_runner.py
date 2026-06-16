@@ -10,7 +10,6 @@ worker processes, each pinned to a different cluster LLM provider via
 to:
 
   llamacpp_z4    — gridz4 Blackwell (RTX PRO 4000 24GB)
-  ollama_panda   — panda Ollama (2×P100, qwen3.6:27b)
   ollama_ocr     — ocr-node (2×Ampere 8GB, gemma3:12b-it-q4_K_M)
   ollama_koala   — koala (2× Titan X 12GB, gemma3:12b)
 
@@ -28,7 +27,7 @@ CLI
     python -m scripts.parallel_postmortem_runner
 
     # explicit provider list (in order of preference)
-    python -m scripts.parallel_postmortem_runner --providers llamacpp_z4 ollama_panda ollama_ocr
+    python -m scripts.parallel_postmortem_runner --providers llamacpp_z4 llamacpp_oracle ollama_koala
 
     # dry-run (count candidates, print plan, don't fork)
     python -m scripts.parallel_postmortem_runner --dry-run
@@ -56,7 +55,7 @@ from db import get_engine
 
 _DEFAULT_PROVIDERS = [
     "llamacpp_z4",
-    "ollama_panda",
+    "llamacpp_oracle",
     "ollama_ocr",
     "ollama_koala",
     "ollama_z400",

@@ -17,7 +17,7 @@ from loguru import logger as log
 from pydantic import BaseModel
 
 from api.auth import require_auth
-from api.dependencies import get_engine
+from api.dependencies import get_db_engine
 
 router = APIRouter(
     prefix="/api/v1/pm-backtest",
@@ -54,7 +54,7 @@ def search_markets(
     platform: str | None = Query(None),
     search: str | None = Query(None),
     limit: int = Query(50, ge=1, le=500),
-    engine=Depends(get_engine),
+    engine=Depends(get_db_engine),
 ):
     """Search available prediction markets for backtesting."""
     from trading.prediction_backtest import list_available_markets
@@ -63,7 +63,7 @@ def search_markets(
 
 
 @router.post("/run")
-def run_hypothesis(req: HypothesisRequest, engine=Depends(get_engine)):
+def run_hypothesis(req: HypothesisRequest, engine=Depends(get_db_engine)):
     """Run a prediction market hypothesis backtest."""
     from trading.prediction_backtest import run_hypothesis as _run
 
@@ -105,7 +105,7 @@ def run_hypothesis(req: HypothesisRequest, engine=Depends(get_engine)):
 
 
 @router.get("/stats")
-def dataset_stats(engine=Depends(get_engine)):
+def dataset_stats(engine=Depends(get_db_engine)):
     """Get prediction market dataset statistics."""
     from sqlalchemy import text
 
@@ -155,7 +155,7 @@ def dataset_stats(engine=Depends(get_engine)):
 
 
 @router.post("/export")
-def export_trades(req: ExportRequest, engine=Depends(get_engine)):
+def export_trades(req: ExportRequest, engine=Depends(get_db_engine)):
     """Export prediction market trades to Parquet for external backtester."""
     from trading.prediction_backtest import (
         export_kalshi_trades,

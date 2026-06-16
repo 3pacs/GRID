@@ -1,0 +1,19 @@
+2026-05-29 06:05:26 | INFO     | config:<module>:591 — GitSink attached — errors land in .server-logs/errors.jsonl (push_enabled=False)
+2026-05-29 06:05:26 | INFO     | config:<module>:601 — GRID config loaded — environment=development, db=localhost:5432/griddb
+2026-05-29 06:05:26 | INFO     | db:get_engine:69 — Creating SQLAlchemy engine — postgresql://grid:***@localhost:5432/griddb
+2026-05-29 06:05:27 | INFO     | db:get_engine:117 — SQLAlchemy engine created — pool_size=20, max_overflow=30
+=== parallel_postmortem_runner ===
+  candidates: 0 trades + 939,094 predictions = 939,094
+  providers (5): llamacpp_z4, llamacpp_oracle, ollama_ocr, ollama_koala, ollama_z400
+  workers per provider: 1
+  total parallel workers: 5
+  per worker (approx): 187,818 candidates
+  max-rows total: unlimited
+  log dir: /data/grid_v4/grid_repo/outputs/postmortem-workers
+2026-05-29 06:05:28 | INFO     | __main__:_spawn_worker:115 — parallel_postmortem: spawning worker 0/5 on provider=llamacpp_z4 → /data/grid_v4/grid_repo/outputs/postmortem-workers/worker-0-llamacpp_z4.log
+2026-05-29 06:05:28 | INFO     | __main__:_spawn_worker:115 — parallel_postmortem: spawning worker 1/5 on provider=llamacpp_oracle → /data/grid_v4/grid_repo/outputs/postmortem-workers/worker-1-llamacpp_oracle.log
+2026-05-29 06:05:28 | INFO     | __main__:_spawn_worker:115 — parallel_postmortem: spawning worker 2/5 on provider=ollama_ocr → /data/grid_v4/grid_repo/outputs/postmortem-workers/worker-2-ollama_ocr.log
+2026-05-29 06:05:28 | INFO     | __main__:_spawn_worker:115 — parallel_postmortem: spawning worker 3/5 on provider=ollama_koala → /data/grid_v4/grid_repo/outputs/postmortem-workers/worker-3-ollama_koala.log
+2026-05-29 06:05:28 | INFO     | __main__:_spawn_worker:115 — parallel_postmortem: spawning worker 4/5 on provider=ollama_z400 → /data/grid_v4/grid_repo/outputs/postmortem-workers/worker-4-ollama_z400.log
+
+5 workers spawned (1 per provider × 5 providers). Tailing logs in /data/grid_v4/grid_repo/outputs/postmortem-workers/
