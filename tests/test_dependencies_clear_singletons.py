@@ -8,6 +8,7 @@ clearing now cascades to the underlying `db._engine` singleton.
 
 from __future__ import annotations
 
+import importlib
 import sys
 import types
 from unittest.mock import MagicMock, patch
@@ -41,8 +42,28 @@ def fake_db_module(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
     fake.clear_engine = _clear_engine  # type: ignore[attr-defined]
 
     monkeypatch.setitem(sys.modules, "db", fake)
-    # Drop any cached import of api.dependencies so it re-binds against `fake`.
-    sys.modules.pop("api.dependencies", None)
+
+    # Force `api.dependencies` to be re-executed so it re-binds `import db`
+    # and `from db import get_engine` against `fake`. Popping the
+    # `sys.modules["api.dependencies"]` entry alone is NOT enough when the
+    # full suite has already imported the real module: the parent `api`
+    # package object retains a `dependencies` attribute pointing at the
+    # stale module, so `from api import dependencies` would resolve to that
+    # cached (real-db-bound) module instead of re-importing. We must drop
+    # both the sys.modules entry AND the package attribute, then re-import.
+    # All mutations go through monkeypatch so teardown restores the real
+    # module and prevents this fixture from polluting later tests.
+    api_pkg = importlib.import_module("api")
+    if "api.dependencies" in sys.modules:
+        monkeypatch.delitem(sys.modules, "api.dependencies")
+    if hasattr(api_pkg, "dependencies"):
+        monkeypatch.delattr(api_pkg, "dependencies")
+    # Re-import now (against `fake`) and register it so subsequent
+    # `from api import dependencies` calls in the test bodies see the
+    # freshly-bound module; monkeypatch restores the original on teardown.
+    fresh = importlib.import_module("api.dependencies")
+    monkeypatch.setitem(sys.modules, "api.dependencies", fresh)
+    monkeypatch.setattr(api_pkg, "dependencies", fresh)
     return fake
 
 
