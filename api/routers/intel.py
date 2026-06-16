@@ -159,11 +159,21 @@ def intel_search(
     results: list[dict[str, Any]] = []
     query_upper = q.upper()
     query_like = f"%{q}%"
+    total = 0
 
     with engine.connect() as conn:
         # -- Actors --
         if type in ("all", "actor"):
             try:
+                count_row = conn.execute(
+                    text(
+                        "SELECT COUNT(*) FROM actors "
+                        "WHERE UPPER(name) LIKE UPPER(:q) "
+                        "   OR UPPER(id) LIKE UPPER(:q)"
+                    ),
+                    {"q": query_like},
+                ).fetchone()
+                total += int(count_row[0]) if count_row and count_row[0] else 0
                 rows = conn.execute(
                     text(
                         "SELECT id, name, tier, category, aum, trust_score, "
@@ -193,6 +203,17 @@ def intel_search(
         # -- Entities (ICIJ offshore) --
         if type in ("all", "entity"):
             try:
+                count_row = conn.execute(
+                    text(
+                        "SELECT COUNT(*) FROM ( "
+                        "SELECT DISTINCT entity_name FROM icij_relationships "
+                        "WHERE UPPER(entity_name) LIKE UPPER(:q) "
+                        "   OR UPPER(linked_to) LIKE UPPER(:q) "
+                        ") sub"
+                    ),
+                    {"q": query_like},
+                ).fetchone()
+                total += int(count_row[0]) if count_row and count_row[0] else 0
                 rows = conn.execute(
                     text(
                         "SELECT DISTINCT entity_name, jurisdiction, source_dataset, "
@@ -221,6 +242,15 @@ def intel_search(
         # -- Tickers --
         if type in ("all", "ticker"):
             try:
+                count_row = conn.execute(
+                    text(
+                        "SELECT COUNT(DISTINCT (ticker, model_name, direction, "
+                        "confidence, verdict, created_at)) "
+                        "FROM oracle_predictions WHERE UPPER(ticker) = :q"
+                    ),
+                    {"q": query_upper},
+                ).fetchone()
+                total += int(count_row[0]) if count_row and count_row[0] else 0
                 rows = conn.execute(
                     text(
                         "SELECT DISTINCT ticker, model_name, direction, confidence, "
@@ -246,12 +276,23 @@ def intel_search(
             except Exception as exc:
                 log.debug("Ticker search skipped: {e}", e=str(exc))
 
+    pagination_meta = {
+        "query": q,
+        "type": type,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "has_more": (offset + limit) < total,
+    }
+
     if not results:
-        return _empty("No matches found", query_start=t0)
+        empty = _empty("No matches found", query_start=t0)
+        empty["meta"].update(pagination_meta)
+        return empty
 
     return _ok(
         results,
-        meta={"query": q, "type": type},
+        meta=pagination_meta,
         tier_required=Tier.BASIC,
         query_start=t0,
     )
