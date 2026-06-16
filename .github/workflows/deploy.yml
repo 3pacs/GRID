@@ -1,19 +1,20 @@
 name: Deploy to Grid Server
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       skip_tests:
         description: 'Skip test verification'
         required: false
         default: 'false'
+      do_restart:
+        description: 'Restart grid-api after deploy (opt-in; default is no-restart verification only)'
+        type: boolean
+        required: false
+        default: false
 
 env:
-  SERVER_HOST: grid-svr
-  SERVER_USER: grid
-  DEPLOY_PATH: /data/grid_v4/grid_repo
+  DEPLOY_PATH: /data/grid_v4/grid_release
 
 jobs:
   verify:
@@ -57,48 +58,32 @@ jobs:
 
   deploy:
     name: Deploy
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, grid-svr]
     needs: [verify]
     if: always() && (needs.verify.result == 'success' || needs.verify.result == 'skipped')
 
     steps:
-      - uses: actions/checkout@v6
+      - name: Build release tree (no restart)
+        run: |
+          set -euo pipefail
+          cd "$DEPLOY_PATH"
+          git fetch origin && git reset --hard origin/main
+          pip install -r requirements.txt
+          cd pwa && npm ci && npm run build && cd ..
+          python -m alembic upgrade head || echo "no migrations"
 
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ env.SERVER_HOST }}
-          username: ${{ env.SERVER_USER }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          script: |
-            set -e
-            cd ${{ env.DEPLOY_PATH }}
+      - name: Restart grid-api (opt-in only)
+        if: ${{ inputs.do_restart == true }}
+        run: |
+          set -euo pipefail
+          sudo systemctl restart grid-api
+          sleep 3
 
-            echo "=== Pre-deploy state ==="
-            git status --short
-            git log --oneline -1
-
-            echo "=== Pulling latest ==="
-            git pull origin main
-
-            echo "=== Installing Python deps ==="
-            pip install -r requirements.txt --quiet
-
-            echo "=== Building frontend ==="
-            cd pwa && npm ci --quiet && npm run build && cd ..
-
-            echo "=== Running migrations ==="
-            python -m alembic upgrade head 2>/dev/null || echo "No pending migrations"
-
-            echo "=== Restarting services ==="
-            sudo systemctl restart grid-api
-
-            echo "=== Health check ==="
-            sleep 3
-            curl -sf http://localhost:8000/api/v1/system/health || echo "Health check pending..."
-
-            echo "=== Deploy complete ==="
-            git log --oneline -1
+      - name: Verify running API (health + OpenAPI)
+        run: |
+          set -euo pipefail
+          curl -fsS http://localhost:8000/api/v1/system/health
+          curl -fsS http://localhost:8000/openapi.json | grep -F '"/api/v1/intelligence/actor-network"'
 
       - name: Notify success
         if: success()
@@ -106,4 +91,4 @@ jobs:
 
       - name: Notify failure
         if: failure()
-        run: echo "Deployment FAILED — check server logs"
+        run: echo "Deployment FAILED - check server logs"
