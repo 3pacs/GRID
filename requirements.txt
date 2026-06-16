@@ -17,6 +17,11 @@ yfinance>=0.2.36
 requests>=2.31.0
 beautifulsoup4>=4.14.3
 edgartools>=4.6.3
+# strategy.portfolio_workbook_plan imports openpyxl at module load (Workbook,
+# load_workbook, styles), and pandas .to_excel/.read_excel paths in
+# ingestion/altdata (aaii_sentiment, nyfed_gscpi) + ingestion/trade (wiod)
+# also default to the openpyxl engine for .xlsx.
+openpyxl>=3.1.0
 
 # Analysis
 scikit-learn>=1.4.0
