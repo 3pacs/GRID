@@ -1,14 +1,17 @@
 name: Deploy to Grid Server
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       skip_tests:
         description: 'Skip test verification'
         required: false
         default: 'false'
+      do_restart:
+        description: 'Restart grid-api after deploy (opt-in; default is no-restart verification only)'
+        type: boolean
+        required: false
+        default: false
 
 env:
   DEPLOY_PATH: /data/grid_v4/grid_release
@@ -60,7 +63,7 @@ jobs:
     if: always() && (needs.verify.result == 'success' || needs.verify.result == 'skipped')
 
     steps:
-      - name: Deploy from clean release tree
+      - name: Build release tree (no restart)
         run: |
           set -euo pipefail
           cd "$DEPLOY_PATH"
@@ -68,8 +71,18 @@ jobs:
           pip install -r requirements.txt
           cd pwa && npm ci && npm run build && cd ..
           python -m alembic upgrade head || echo "no migrations"
+
+      - name: Restart grid-api (opt-in only)
+        if: ${{ inputs.do_restart == true }}
+        run: |
+          set -euo pipefail
           sudo systemctl restart grid-api
-          sleep 3 && curl -fsS http://localhost:8000/api/v1/system/health
+          sleep 3
+
+      - name: Verify running API (health + OpenAPI)
+        run: |
+          set -euo pipefail
+          curl -fsS http://localhost:8000/api/v1/system/health
           curl -fsS http://localhost:8000/openapi.json | grep -F '"/api/v1/intelligence/actor-network"'
 
       - name: Notify success
