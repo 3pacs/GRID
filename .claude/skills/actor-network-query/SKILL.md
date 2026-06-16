@@ -1,3 +1,8 @@
+---
+name: actor-network-query
+description: Query GRID's actor network to understand who moves markets and why. Use when building predictions that cite specific actor levers, analyzing cross-border money flows or regulatory arbitrage, identifying conflicted interests (SEC/Fed/Congress), tracking wealth concentration, or running intelligence sweeps before major market events. Covers 475+ named actors and 250K+ discovery scale across sector networks.
+---
+
 # actor-network-query
 
 Query and analyze GRID's actor network intelligence layer to understand who moves markets, why they move them, and which actors control critical money flows. Combines 475+ named actors, 250K+ discovery scale, and intelligence networks across energy, real estate, commodities, and media sectors.

@@ -148,6 +148,35 @@ class Settings(BaseSettings):
     OPENROUTER_CHAT_MODEL: str = "anthropic/claude-sonnet-4"
     OPENAI_EMBED_MODEL: str = "text-embedding-3-small"
 
+    # Hermes analyst bridge — hosted OpenAI reasoning model wrapped with spend
+    # accounting + local fallback (intelligence/hermes/). This is the bridge to
+    # the future fine-tuned grid-analyst-v1; not the hermes_operator daemon nor
+    # the gridz4 llama node. HERMES_API_KEY falls back to OPENAI_API_KEY when
+    # blank. Leave HERMES_TEMPERATURE/REASONING_EFFORT empty for reasoning
+    # models (o-series / gpt-5) which reject a non-default temperature.
+    HERMES_ENABLED: bool = True
+    HERMES_API_KEY: str = ""
+    HERMES_BASE_URL: str = ""                       # blank -> OPENAI_BASE_URL
+    HERMES_MODEL: str = "gpt-4o"                     # switch to gpt-5.4 / o-series for batch reasoning
+    HERMES_TIMEOUT_SECONDS: int = 120
+    HERMES_MAX_COMPLETION_TOKENS: int = 4096
+    HERMES_TEMPERATURE: str = ""                     # "" -> omit (required for reasoning models)
+    HERMES_REASONING_EFFORT: str = ""               # "", "low", "medium", "high"
+    HERMES_DAILY_SPEND_CAP_USD: float = 0.0         # 0 -> no cap (set before scheduler wiring)
+    HERMES_LEDGER_PATH: str = "outputs/hermes/spend_ledger.json"
+    HERMES_PRICE_INPUT_PER_MTOK: float = 2.50       # USD/1M input tokens (estimate for cap)
+    HERMES_PRICE_OUTPUT_PER_MTOK: float = 10.00     # USD/1M output tokens (incl. reasoning)
+    HERMES_FALLBACK_TIER: str = "reason"            # llm.router tier for offline fallback
+    # Backend: "openai" (API key, per-token) or "codex" (Codex CLI, ChatGPT-
+    # subscription auth — the only path to GPT-5.5). The codex backend shells
+    # out to `codex exec`; auth is whatever `codex login` set on the host, so
+    # no key lives in .env and there is no per-token USD cap (plan rate limits).
+    HERMES_BACKEND: str = "openai"                  # openai | codex
+    HERMES_CODEX_BIN: str = "codex"                 # Codex CLI binary (PATH or absolute)
+    HERMES_CODEX_MODEL: str = ""                    # blank -> Codex default (GPT-5.5)
+    HERMES_CODEX_TIMEOUT_SECONDS: int = 240
+    HERMES_CODEX_EXTRA_ARGS: str = ""               # extra `codex exec` flags (shlex-split)
+
     # Ollama (local lightweight LLM — Qwen 7B)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_ENABLED: bool = True

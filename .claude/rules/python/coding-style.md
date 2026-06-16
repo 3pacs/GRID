@@ -5,7 +5,7 @@ paths:
 ---
 # Python Coding Style
 
-> This file extends [common/coding-style.md](../common/coding-style.md) with Python specific content.
+> Python-specific layer. General coding-style guidance lives in the `coding-standards` skill.
 
 ## Standards
 
