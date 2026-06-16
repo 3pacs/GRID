@@ -211,9 +211,29 @@ def get_llm(
     return _NullClient()
 
 
+# Paid/hosted LLM providers — billed per token. Disabled by default per the local-first rule:
+# GRID's fallback chains end in openrouter/openai, so a redeploy that restored API keys would
+# silently re-leak. This choke-point keeps paid OFF even if a key reappears. To intentionally
+# re-enable, set GRID_ALLOW_PAID_LLM=1 in the environment.
+_PAID_PROVIDERS = frozenset({"openai", "openrouter", "anthropic", "huggingface"})
+
+
+def _paid_llm_allowed() -> bool:
+    """True only if paid LLM use is explicitly opted in via GRID_ALLOW_PAID_LLM."""
+    from config import settings
+    return bool(getattr(settings, "GRID_ALLOW_PAID_LLM", False))
+
+
 def _create_client(provider: str) -> Any:
     """Instantiate an LLM client for the given provider."""
     from config import settings
+
+    if provider in _PAID_PROVIDERS and not _paid_llm_allowed():
+        log.warning(
+            "Paid LLM provider {p} blocked — GRID_ALLOW_PAID_LLM not set (local-first)",
+            p=provider,
+        )
+        return None
 
     if provider == "huggingface":
         return _create_hf_client(settings)

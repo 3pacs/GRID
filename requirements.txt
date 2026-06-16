@@ -9,7 +9,7 @@ sqlalchemy>=2.0.0
 alembic>=1.13.0
 
 # Data
-aiohttp>=3.9
+aiohttp>=3.13.5
 pandas>=2.1.0
 numpy>=1.26.0
 fedfred>=1.2.9
@@ -17,6 +17,11 @@ yfinance>=0.2.36
 requests>=2.31.0
 beautifulsoup4>=4.14.3
 edgartools>=4.6.3
+# strategy.portfolio_workbook_plan imports openpyxl at module load (Workbook,
+# load_workbook, styles), and pandas .to_excel/.read_excel paths in
+# ingestion/altdata (aaii_sentiment, nyfed_gscpi) + ingestion/trade (wiod)
+# also default to the openpyxl engine for .xlsx.
+openpyxl>=3.1.0
 
 # Analysis
 scikit-learn>=1.4.0
@@ -40,8 +45,9 @@ pydantic-settings>=2.1.0
 eval_type_backport>=0.2.0
 loguru>=0.7.2
 
-# Hyperspace (OpenAI-compatible API client)
-openai>=1.12.0
+# Hyperspace (OpenAI-compatible API client) + Hermes analyst bridge
+# (intelligence/hermes/ relies on the reasoning-token usage fields)
+openai>=1.40.0
 
 # LLM observability — pipes every LLM call into Langfuse for trace/eval/regression
 # Self-hosted at http://grid-svr:3000; configured via LANGFUSE_HOST/PUBLIC_KEY/SECRET_KEY env
@@ -82,7 +88,7 @@ xgboost>=3.2.0
 # langchain-anthropic>=0.1.0
 
 # API
-fastapi>=0.109.0
+fastapi>=0.109.0,<0.137.0
 uvicorn>=0.46.0
 python-multipart>=0.0.6
 python-jose[cryptography]>=3.3.0

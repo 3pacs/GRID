@@ -1,3 +1,8 @@
+---
+name: resolver-patterns
+description: Resolve raw_series into resolved_series in GRID. Use when adding new data sources or tickers, debugging why data isn't appearing in resolved_series, adding entity mappings (SEED_MAPPINGS), optimizing resolver performance for bulk loads, or understanding the PIT data pipeline.
+---
+
 # resolver-patterns
 
 Patterns for resolving raw_series into resolved_series in GRID. Covers the entity mapping system, multi-source conflict detection, and performance optimization.

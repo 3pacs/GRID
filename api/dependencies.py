@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from sqlalchemy.engine import Engine
 
+import db
 from db import get_engine
 from governance.registry import ModelRegistry
 from journal.log import DecisionJournal
@@ -70,8 +71,11 @@ def clear_singletons() -> None:
     Call this when configuration changes at runtime (e.g. database URL).
     """
     global _db_engine, _pit_store, _journal, _model_registry, _astrogrid_store
-    if _db_engine is not None:
-        _db_engine.dispose()
+    # `_db_engine` and `db._engine` point to the same Engine instance, so
+    # disposing one without resetting the other leaves `db.get_engine()`
+    # handing back a disposed engine on the next call. Route through
+    # `db.clear_engine()` so both module-level pointers drop together.
+    db.clear_engine()
     _db_engine = None
     _pit_store = None
     _journal = None

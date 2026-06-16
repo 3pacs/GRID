@@ -683,6 +683,34 @@ class GRIDApi {
         });
     }
 
+    /** Record whether dad wants a ping when a not-yet-built request ships. */
+    async setCapabilityPing(requestId, wants) {
+        return this._fetch(`/api/v1/chat/capability/${encodeURIComponent(requestId)}/ping`, {
+            method: 'POST',
+            body: JSON.stringify({ wants: !!wants }),
+        });
+    }
+
+    /** Price alerts: text me when a stock crosses a price. */
+    async createAlert(ticker, direction, threshold, note = null) {
+        return this._fetch('/api/v1/alerts', {
+            method: 'POST',
+            body: JSON.stringify({ ticker, direction, threshold, note }),
+        });
+    }
+
+    /** List the current user's active + recently triggered price alerts. */
+    async listAlerts() {
+        return this._fetch('/api/v1/alerts');
+    }
+
+    /** Cancel (deactivate) a price alert. */
+    async cancelAlert(alertId) {
+        return this._fetch(`/api/v1/alerts/${encodeURIComponent(alertId)}`, {
+            method: 'DELETE',
+        });
+    }
+
     /**
      * Streaming verdict (SSE). onDelta(fullTextSoFar) fires per chunk so the UI
      * can render the answer as it's written. Returns the final text. Pass an
