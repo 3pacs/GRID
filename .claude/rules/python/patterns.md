@@ -5,7 +5,7 @@ paths:
 ---
 # Python Patterns
 
-> This file extends [common/patterns.md](../common/patterns.md) with Python specific content.
+> Python-specific layer. Comprehensive patterns live in the `python-patterns` skill.
 
 ## Protocol (Duck Typing)
 
