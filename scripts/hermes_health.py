@@ -22,6 +22,7 @@ DATA_FRESHNESS_THRESHOLD_HOURS = 26
 SOURCE_COOLDOWN_MINUTES = 30
 SOURCE_MAX_CONSECUTIVE_FAILS = 5
 TIMEOUT_BLACKLIST_HOURS = 24
+OPERATOR_ISSUE_DEDUPE_HOURS = 20
 
 
 def _ensure_issues_table(engine: Any) -> None:
@@ -88,6 +89,34 @@ def log_issue(
     _ensure_issues_table(engine)
     try:
         with engine.begin() as conn:
+            if fix_result != "SUCCESS":
+                existing = conn.execute(
+                    text(
+                        "SELECT id FROM operator_issues "
+                        "WHERE category = :cat "
+                        "AND severity = :sev "
+                        "AND source IS NOT DISTINCT FROM :src "
+                        "AND title = :title "
+                        "AND resolved_at IS NULL "
+                        "AND created_at >= NOW() - :hours * INTERVAL '1 hour' "
+                        "ORDER BY created_at DESC LIMIT 1"
+                    ),
+                    {
+                        "cat": category,
+                        "sev": severity,
+                        "src": source,
+                        "title": title,
+                        "hours": OPERATOR_ISSUE_DEDUPE_HOURS,
+                    },
+                ).fetchone()
+                if existing:
+                    issue_id = existing[0]
+                    log.info(
+                        "duplicate issue suppressed — existing #{id} [{sev}] {title}",
+                        id=issue_id, sev=severity, title=title[:80],
+                    )
+                    return issue_id
+
             row = conn.execute(
                 text(
                     "INSERT INTO operator_issues "
@@ -121,6 +150,45 @@ def log_issue(
     except Exception as exc:
         log.warning("Failed to log issue: {e}", e=str(exc))
         return None
+
+
+def resolve_source_issues(engine: Any, source: str, cycle_number: int | None = None) -> int:
+    """Mark unresolved WARNING/ERROR/CRITICAL issues for a recovered source resolved."""
+    from sqlalchemy import text
+
+    if not source:
+        return 0
+    _ensure_issues_table(engine)
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(
+                text(
+                    "UPDATE operator_issues "
+                    "SET resolved_at = NOW(), "
+                    "    fix_result = COALESCE(fix_result, 'SUCCESS'), "
+                    "    detail = COALESCE(detail, '') || "
+                    "        CASE WHEN detail IS NULL OR detail = '' THEN '' ELSE E'\\n' END || "
+                    "        :note "
+                    "WHERE source = :source "
+                    "  AND resolved_at IS NULL "
+                    "  AND severity IN ('WARNING', 'ERROR', 'CRITICAL') "
+                    "RETURNING id"
+                ),
+                {
+                    "source": source,
+                    "note": (
+                        f"Resolved by successful Hermes recovery"
+                        f"{f' in cycle {cycle_number}' if cycle_number is not None else ''}."
+                    ),
+                },
+            ).fetchall()
+        resolved = len(row)
+        if resolved:
+            log.info("Resolved {n} prior operator issues for {source}", n=resolved, source=source)
+        return resolved
+    except Exception as exc:
+        log.warning("Failed to resolve source issues for {source}: {e}", source=source, e=str(exc))
+        return 0
 
 
 def export_issues(engine: Any, days_back: int = 30) -> list[dict[str, Any]]:
@@ -298,6 +366,10 @@ class OperatorState:
         return {
             "last_pipeline_run": self.last_pipeline_run.isoformat() if self.last_pipeline_run else None,
             "last_autoresearch": self.last_autoresearch.isoformat() if self.last_autoresearch else None,
+            "last_ux_audit": self.last_ux_audit.isoformat() if self.last_ux_audit else None,
+            "last_daily_digest": self.last_daily_digest.isoformat() if self.last_daily_digest else None,
+            "last_100x_digest": self.last_100x_digest.isoformat() if self.last_100x_digest else None,
+            "last_oracle_cycle": self.last_oracle_cycle.isoformat() if self.last_oracle_cycle else None,
             "consecutive_failures": self.consecutive_failures,
             "cycle_count": self.cycle_count,
             "fixes_applied": self.fixes_applied,
@@ -363,7 +435,8 @@ class OperatorState:
             "last_signal_forecasts", "last_enrich_connections",
             "last_contagion_backtest", "last_contagion_feedback",
             "last_sector_health", "last_active_hypo_scoring",
-            "last_earnings_calendar_sync",
+            "last_earnings_calendar_sync", "last_ux_audit",
+            "last_daily_digest", "last_100x_digest", "last_oracle_cycle",
         ]
         hydrated_any = False
         for field in restorable:
@@ -401,12 +474,22 @@ def check_db_health(engine: Any) -> dict[str, Any]:
     result: dict[str, Any] = {"healthy": False}
     try:
         with engine.connect() as conn:
+            conn.execute(text("SET LOCAL statement_timeout = '10s'"))
             conn.execute(text("SELECT 1"))
             result["healthy"] = True
 
-            # Raw series count
-            row = conn.execute(text("SELECT COUNT(*) FROM raw_series")).fetchone()
+            # Avoid a full raw_series scan during health checks. On the live
+            # GRID DB this table is large enough that COUNT(*) can consume the
+            # whole Hermes cycle before any repair work starts.
+            row = conn.execute(text(
+                "SELECT COALESCE(("
+                "  SELECT reltuples::bigint "
+                "  FROM pg_class "
+                "  WHERE oid = to_regclass('public.raw_series')"
+                "), 0)"
+            )).fetchone()
             result["raw_series_count"] = row[0] if row else 0
+            result["raw_series_count_estimated"] = True
 
             # Latest pull
             row = conn.execute(
@@ -435,16 +518,15 @@ def check_db_health(engine: Any) -> dict[str, Any]:
             ).fetchone()
             result["failed_pulls_1h"] = row[0] if row else 0
 
-            # Source freshness — scan ALL active sources, not just 20
+            # Source freshness from source_catalog only. The old fallback
+            # joined every active source to raw_series and did an aggregate
+            # over the entire table, which made Hermes dry-runs exceed 90s.
             rows = conn.execute(
                 text(
-                    "SELECT sc.name, "
-                    "  COALESCE(sc.last_pull_at, MAX(rs.pull_timestamp)) AS last_pull "
-                    "FROM source_catalog sc "
-                    "LEFT JOIN raw_series rs ON rs.source_id = sc.id AND rs.pull_status = 'SUCCESS' "
-                    "WHERE sc.active = TRUE "
-                    "GROUP BY sc.name, sc.last_pull_at "
-                    "ORDER BY last_pull ASC NULLS FIRST"
+                    "SELECT name, last_pull_at "
+                    "FROM source_catalog "
+                    "WHERE active = TRUE "
+                    "ORDER BY last_pull_at ASC NULLS FIRST"
                 )
             ).fetchall()
             stale: list[dict[str, Any]] = []

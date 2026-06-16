@@ -30,6 +30,8 @@ from sqlalchemy import text
 
 DIGEST_HOUR_UTC = 8    # send digest at ~8am UTC
 DIGEST_MIN_GAP_HOURS = 20  # don't send more often than every 20 hours
+_DIGEST_ALERT_TYPE = "hermes_daily_digest"
+_DIGEST_ENTITY_ID = "daily"
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +166,55 @@ def _collect_system_stats(engine: Any) -> dict[str, Any]:
     except Exception as exc:
         log.debug("Could not collect system stats: {e}", e=str(exc))
     return stats
+
+
+def _latest_digest_sent_at(engine: Any) -> datetime | None:
+    """Return the last persisted digest send timestamp, if available."""
+    if engine is None:
+        return None
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT seen_at FROM alert_state "
+                    "WHERE alert_type = :t AND entity_id = :e "
+                    "ORDER BY seen_at DESC LIMIT 1"
+                ),
+                {"t": _DIGEST_ALERT_TYPE, "e": _DIGEST_ENTITY_ID},
+            ).fetchone()
+        if not row or not row[0]:
+            return None
+        ts = row[0]
+        if isinstance(ts, datetime):
+            return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+        return datetime.fromisoformat(str(ts))
+    except Exception as exc:
+        log.debug("Could not read persisted daily digest timestamp: {e}", e=str(exc))
+        return None
+
+
+def _record_digest_sent(engine: Any, sent_at: datetime) -> None:
+    """Persist digest send state so Hermes restarts do not resend it."""
+    if engine is None:
+        return
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO alert_state (alert_type, entity_id, seen_at, payload) "
+                    "VALUES (:t, :e, :seen_at, :payload) "
+                    "ON CONFLICT (alert_type, entity_id) DO UPDATE SET "
+                    "seen_at = EXCLUDED.seen_at, payload = EXCLUDED.payload"
+                ),
+                {
+                    "t": _DIGEST_ALERT_TYPE,
+                    "e": _DIGEST_ENTITY_ID,
+                    "seen_at": sent_at,
+                    "payload": json.dumps({"source": "scripts.daily_digest"}),
+                },
+            )
+    except Exception as exc:
+        log.debug("Could not persist daily digest timestamp: {e}", e=str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +448,7 @@ def maybe_send_daily_digest(
     state: Any,
     engine: Any,
     dry_run: bool = False,
+    now: datetime | None = None,
 ) -> dict[str, Any] | None:
     """Send daily digest if it's time.
 
@@ -410,9 +462,18 @@ def maybe_send_daily_digest(
     Returns:
         dict: Digest result, or None if skipped.
     """
-    now = datetime.now(timezone.utc)
+    now = now or datetime.now(timezone.utc)
 
     last_digest = getattr(state, "last_daily_digest", None)
+    persisted_digest = _latest_digest_sent_at(engine)
+    if persisted_digest is not None and (
+        last_digest is None or persisted_digest > last_digest
+    ):
+        last_digest = persisted_digest
+        try:
+            state.last_daily_digest = persisted_digest  # type: ignore[attr-defined]
+        except Exception:
+            pass
     if last_digest is not None:
         hours_since = (now - last_digest).total_seconds() / 3600
         if hours_since < DIGEST_MIN_GAP_HOURS:
@@ -420,14 +481,13 @@ def maybe_send_daily_digest(
 
     # Send around the configured hour (within a 1-hour window)
     if not (DIGEST_HOUR_UTC <= now.hour < DIGEST_HOUR_UTC + 1):
-        # Allow first-ever digest at any time
-        if last_digest is not None:
-            return None
+        return None
 
     try:
         result = send_daily_digest(engine, dry_run=dry_run)
-        if not dry_run:
+        if not dry_run and result.get("sent"):
             state.last_daily_digest = now  # type: ignore[attr-defined]
+            _record_digest_sent(engine, now)
         return result
     except Exception as exc:
         log.warning("Daily digest failed: {e}", e=str(exc))

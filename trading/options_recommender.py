@@ -188,6 +188,26 @@ def round_to_nickel(value: float) -> float:
     return round(round(value / step) * step, 2)
 
 
+def _db_scalar(value: Any) -> Any:
+    """Convert pandas/numpy scalar values before handing them to SQLAlchemy."""
+    if value is None or isinstance(value, (str, bytes, dict, list, tuple)):
+        return value
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            value = item()
+        except Exception:
+            pass
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
 def pick_strike(
     spot: float,
     direction: str,
@@ -656,7 +676,7 @@ class OptionsRecommender:
                         "WHERE ticker = :ticker AND strike = :strike AND expiry = :expiry "
                         "LIMIT 1"
                     ),
-                    {"ticker": rec.ticker, "strike": rec.strike, "expiry": rec.expiry},
+                    {"ticker": rec.ticker, "strike": _db_scalar(rec.strike), "expiry": rec.expiry},
                 ).fetchone()
                 if exists:
                     continue
@@ -675,14 +695,14 @@ class OptionsRecommender:
                     {
                         "ticker": rec.ticker,
                         "direction": rec.direction,
-                        "strike": rec.strike,
+                        "strike": _db_scalar(rec.strike),
                         "expiry": rec.expiry,
-                        "entry_price": rec.entry_price,
-                        "target_price": rec.target_price,
-                        "stop_loss": rec.stop_loss,
-                        "expected_return": getattr(rec, "expected_return", 0),
-                        "kelly_fraction": rec.kelly_fraction,
-                        "confidence": rec.confidence,
+                        "entry_price": _db_scalar(rec.entry_price),
+                        "target_price": _db_scalar(rec.target_price),
+                        "stop_loss": _db_scalar(rec.stop_loss),
+                        "expected_return": _db_scalar(getattr(rec, "expected_return", 0)),
+                        "kelly_fraction": _db_scalar(rec.kelly_fraction),
+                        "confidence": _db_scalar(rec.confidence),
                         "thesis": rec.thesis,
                         "dealer_context": rec.dealer_context,
                         "sanity_status": json.dumps(rec.sanity_status),

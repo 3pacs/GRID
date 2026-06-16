@@ -174,3 +174,14 @@ class TestEarningsErrorDemotion:
         )
         sp.rollback.assert_called_once()
         sp.commit.assert_not_called()
+
+
+@pytest.mark.unit
+class TestInstitutionalFlowsLogHygiene:
+    def test_yfinance_internal_logger_is_suppressed(self):
+        import inspect
+        from ingestion.altdata import institutional_flows
+
+        source = inspect.getsource(institutional_flows)
+
+        assert 'logging.getLogger("yfinance").setLevel(logging.CRITICAL)' in source

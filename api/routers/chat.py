@@ -11,6 +11,7 @@ when no LLM is available.
 
 from __future__ import annotations
 
+import concurrent.futures as _futures
 import inspect
 import re as _re
 import threading
@@ -262,6 +263,59 @@ class ChatAskResponse(BaseModel):
     answer_b: str | None = None  # A/B test: second model response
     model_b: str | None = None   # A/B test: second model name
     sanity_warnings: list[str] | None = None  # Data integrity warnings
+
+
+# ── Compose: natural language → live dashboard layout ───────────────────
+# stepdad.finance home page. The user describes what they want to see (typed
+# or, later, spoken via Whisper) and the LLM assembles a layout from a fixed
+# catalog of widgets, each of which maps to an existing GRID data endpoint.
+
+class ComposeWidget(BaseModel):
+    """One card in the composed layout. `props` carries widget-specific
+    parameters (e.g. ticker, question). Kept permissive so the catalog can
+    grow without a schema migration; the router validates `type`."""
+    type: str = Field(..., max_length=40)
+    title: str = Field(default="", max_length=120)
+    props: dict[str, Any] = Field(default_factory=dict)
+
+
+class ComposeAllocationItem(BaseModel):
+    ticker: str = Field(..., max_length=15)
+    weight: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class ChatComposeRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=2000)
+    history: list[ChatMessage] = Field(default_factory=list, max_length=50)
+    session_id: str | None = Field(default=None, max_length=64)
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v):
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            return None
+        if not _SESSION_ID_RE.match(v):
+            raise ValueError("session_id must be alphanumeric or hyphen, max 64 chars")
+        return v
+
+
+class ChatComposeResponse(BaseModel):
+    spoken_reply: str
+    widgets: list[ComposeWidget]
+    allocation: list[ComposeAllocationItem] = Field(default_factory=list)
+    generated_at: str
+    model_used: str | None = None
+    # Set when the request needs a capability we don't have yet. The frontend
+    # shows the graceful "I'll build it for you" message + a ping opt-in.
+    cannot_fulfill: bool = False
+    request_id: int | None = None
+    # Set when the request created a price alert. The frontend shows a plain
+    # confirmation card instead of a dashboard layout.
+    alert_created: bool = False
+    alert: dict[str, Any] | None = None
 
 
 # ── Helpers: gather context from various GRID subsystems ────────────────
@@ -764,8 +818,20 @@ def _extract_feature_names_from_context(context_text: str) -> list[str]:
     return sorted(set(m for m in matches if m not in _STOP_WORDS))
 
 
-def _build_context_block(question: str, ticker: str | None) -> tuple[str, list[str]]:
-    """Gather all context and return (context_text, list_of_sources)."""
+def _build_context_block(
+    question: str,
+    ticker: str | None,
+    *,
+    include_research: bool = True,
+    budget_s: int = 15,
+) -> tuple[str, list[str]]:
+    """Gather all context and return (context_text, list_of_sources).
+
+    include_research: when False, skip `_research_chain` (a deep multi-hop step
+    measured at ~35s). The realtime streaming verdict passes False so the home
+    page renders promptly; the firewalled /chat/ask path keeps it.
+    budget_s: overall wall-clock cap for the concurrent gather.
+    """
     blocks: list[str] = []
     sources: list[str] = []
 
@@ -784,18 +850,46 @@ def _build_context_block(question: str, ticker: str | None) -> tuple[str, list[s
         _gather_thesis,
         _gather_money_flows,
         _gather_deep_dive,
-        lambda: _research_chain(question, ticker),
     ]
+    if include_research:
+        gatherers.append(lambda: _research_chain(question, ticker))
 
-    for fn in gatherers:
+    # Gatherers are independent DB reads — run them concurrently and bound the
+    # total wait, instead of summing 15 serial queries (which hit 24-77s and
+    # made the streaming verdict appear broken: nothing streams until context
+    # is built). Order is preserved for a deterministic prompt; a gatherer that
+    # overruns the budget is abandoned (it finishes harmlessly in the
+    # background) and its slice is simply omitted from this turn's context.
+    import concurrent.futures
+
+    _CONTEXT_GATHER_BUDGET_S = budget_s
+
+    def _run(fn):
         try:
-            text, source = fn()
-            if text:
-                blocks.append(text)
-            if source:
-                sources.append(source)
+            return fn()
         except Exception as exc:
             log.debug("Context gather failed: {e}", e=str(exc))
+            return None
+
+    results: list[tuple[str, str] | None] = [None] * len(gatherers)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(gatherers)))
+    futures = {executor.submit(_run, fn): i for i, fn in enumerate(gatherers)}
+    try:
+        for fut in concurrent.futures.as_completed(futures, timeout=_CONTEXT_GATHER_BUDGET_S):
+            results[futures[fut]] = fut.result()
+    except concurrent.futures.TimeoutError:
+        log.debug("Context gather hit {s}s budget; using partial context", s=_CONTEXT_GATHER_BUDGET_S)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    for result in results:
+        if not result:
+            continue
+        text, source = result
+        if text:
+            blocks.append(text)
+        if source:
+            sources.append(source)
 
     return "\n\n".join(blocks), sources
 
@@ -980,6 +1074,97 @@ def _get_llm_client():
     return None, None
 
 
+# ── Resilient chat: local card first, PAID cloud when it's busy ─────────────
+# A busy llama.cpp server accepts the connection and then stalls (no token) —
+# which still looks "available" to a health check. So we bound every call with a
+# wall-clock timeout and, on timeout/error, fail over to a PAID cloud model to
+# keep dad's answers high quality (never a dumber local model). If even paid is
+# unreachable we return None so the caller can tell him honestly the card is
+# busy instead of faking an answer.
+
+_RESILIENT_EXEC = _futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="llm-failover")
+
+_LOCAL_CHAT_TIMEOUT_S = 18.0
+_PAID_CHAT_TIMEOUT_S = 45.0
+
+# Honest message when the card is busy AND no paid model answered.
+CARD_BUSY_MESSAGE = (
+    "The computer that does the deep thinking is busy right now. "
+    "Give me a couple of minutes and ask again — your price alerts keep working in the meantime."
+)
+
+
+def _call_with_timeout(fn, timeout_s: float):
+    """Run fn() with a wall-clock timeout. On timeout the underlying call is
+    abandoned (left to finish in the background), never cancelled."""
+    return _RESILIENT_EXEC.submit(fn).result(timeout=timeout_s)
+
+
+def _get_local_oracle():
+    """Best available LOCAL chat client (no cloud), or (None, None)."""
+    try:
+        from llm.router import get_llm, Tier
+        client = get_llm(Tier.ORACLE)
+        if client and getattr(client, "is_available", False):
+            return client, "qwen3.6-local"
+    except Exception as exc:
+        log.debug("Local ORACLE init failed: {e}", e=str(exc))
+    return None, None
+
+
+# PAID cloud providers tried (in order) when the local card is busy. OpenAI
+# first — it's funded; OpenRouter is a backup and can run dry (returns HTTP 402).
+_PAID_PROVIDERS = ("openai", "openrouter")
+
+
+def _paid_clients():
+    """Available PAID cloud clients, in priority order: [(client, label), ...]."""
+    from llm.router import get_llm
+    out = []
+    for prov in _PAID_PROVIDERS:
+        try:
+            client = get_llm(provider=prov)
+            if client and getattr(client, "is_available", False):
+                out.append((client, prov))
+        except Exception as exc:
+            log.debug("Paid client {p} unavailable: {e}", p=prov, e=str(exc))
+    return out
+
+
+def _resilient_chat(messages, *, temperature: float = 0.3, num_predict: int = 800):
+    """Local card first; on busy/slow/error, fail over through the paid cloud
+    models. Returns (text, label), or (None, None) when nothing responds."""
+    local, label = _get_local_oracle()
+    if local is not None:
+        try:
+            txt = _call_with_timeout(
+                lambda: local.chat(messages, temperature=temperature, num_predict=num_predict),
+                _LOCAL_CHAT_TIMEOUT_S,
+            )
+            if txt and txt.strip():
+                return txt, label
+            log.warning("Local LLM returned empty — failing over to paid")
+        except _futures.TimeoutError:
+            log.warning("Local card busy (>{t}s) — failing over to paid model", t=_LOCAL_CHAT_TIMEOUT_S)
+        except Exception as exc:
+            log.warning("Local LLM error ({e}) — failing over to paid", e=str(exc))
+
+    for paid, plabel in _paid_clients():
+        try:
+            txt = _call_with_timeout(
+                lambda p=paid: p.chat(messages, temperature=temperature, num_predict=num_predict),
+                _PAID_CHAT_TIMEOUT_S,
+            )
+            if txt and txt.strip():
+                log.info("Answered via paid model {l} (local card busy)", l=plabel)
+                return txt, plabel
+            log.warning("Paid model {l} returned empty — trying next", l=plabel)
+        except Exception as exc:
+            log.warning("Paid LLM {l} failed: {e} — trying next", l=plabel, e=str(exc))
+
+    return None, None
+
+
 # ── LLM response sanity checking ───────────────────────────────────────
 
 _PRICE_PATTERN = _re.compile(
@@ -1121,61 +1306,238 @@ def _build_rule_based_response(context_text: str, question: str, sources: list[s
 
 # ── Research chain — active investigation for user queries ─────────────
 
-def _research_chain(question: str, ticker: str | None) -> tuple[str, str]:
-    """Fire the Sleuth engine to actively investigate a user question.
+# How long a cached Sleuth finding stays fresh for chat purposes.
+# Intraday investigations (run by hermes every 6h) are stable enough for
+# a full trading day; there is no value in re-running the same LLM call
+# on every user chat request.
+_RESEARCH_CACHE_HOURS: int = 6
 
-    Creates an ad-hoc lead from the user's question, investigates it
-    (LLM + data), and returns synthesized findings. This turns the
-    chatbot from a passive context reader into an active researcher.
+# Maximum seconds to wait for a background investigation before detaching
+# and letting it finish asynchronously (result lands in the DB for the
+# next caller).
+_RESEARCH_BACKGROUND_TIMEOUT_S: float = 4.5
+
+
+def _fetch_cached_research(
+    question: str,
+    ticker: str | None,
+) -> tuple[str, str]:
+    """Query investigation_leads for a recent resolved lead that matches.
+
+    Matching strategy (pure SQL, no embedding model):
+    1. Ticker exact-match leads resolved in the last _RESEARCH_CACHE_HOURS h.
+    2. Keyword overlap: any word from the question appears in the lead question.
+    3. Fall back to the single most-recently-resolved lead as broad market context.
+
+    Returns (findings_text, source_label) or ("", "") on miss.
+    """
+    try:
+        from sqlalchemy import text as _sql
+        engine = _get_db_engine()
+        cutoff_expr = f"NOW() - INTERVAL '{_RESEARCH_CACHE_HOURS} hours'"
+
+        with engine.connect() as conn:
+            # 1. Ticker-specific recent resolved lead
+            if ticker:
+                row = conn.execute(_sql(
+                    "SELECT question, findings, hypotheses, follow_up_leads "
+                    "FROM investigation_leads "
+                    "WHERE status = 'resolved' "
+                    f"AND created_at >= {cutoff_expr} "
+                    "AND (question ILIKE :tpat OR evidence::text ILIKE :tpat) "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ), {"tpat": f"%{ticker}%"}).fetchone()
+                if row and row[1] and row[1] != "LLM unavailable — investigation deferred.":
+                    return _format_cached_lead(row), "sleuth/cache"
+
+            # 2. Keyword-overlap: extract meaningful words from question
+            import re as _re
+            _STOP = frozenset({
+                "the", "is", "are", "was", "how", "what", "why", "does",
+                "do", "did", "will", "can", "market", "stock", "price",
+                "ok", "good", "bad", "it", "in", "at", "to", "for",
+                "and", "or", "a", "an",
+            })
+            keywords = [
+                w for w in _re.findall(r"[a-z]{3,}", question.lower())
+                if w not in _STOP
+            ]
+            if keywords:
+                # Build a ILIKE OR chain for the top 4 keywords
+                kw_clauses = " OR ".join(
+                    f"question ILIKE :kw{i}" for i in range(min(4, len(keywords)))
+                )
+                kw_params: dict = {
+                    f"kw{i}": f"%{keywords[i]}%"
+                    for i in range(min(4, len(keywords)))
+                }
+                row = conn.execute(_sql(
+                    "SELECT question, findings, hypotheses, follow_up_leads "
+                    "FROM investigation_leads "
+                    "WHERE status = 'resolved' "
+                    f"AND created_at >= {cutoff_expr} "
+                    f"AND ({kw_clauses}) "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ), kw_params).fetchone()
+                if row and row[1] and row[1] != "LLM unavailable — investigation deferred.":
+                    return _format_cached_lead(row), "sleuth/cache"
+
+            # 3. Broadest fallback: most recent resolved lead as macro context
+            row = conn.execute(_sql(
+                "SELECT question, findings, hypotheses, follow_up_leads "
+                "FROM investigation_leads "
+                "WHERE status = 'resolved' "
+                f"AND created_at >= {cutoff_expr} "
+                "ORDER BY priority DESC, created_at DESC LIMIT 1"
+            )).fetchone()
+            if row and row[1] and row[1] != "LLM unavailable — investigation deferred.":
+                return _format_cached_lead(row), "sleuth/cache"
+
+    except Exception as exc:
+        log.debug("Research cache lookup failed: {e}", e=str(exc))
+
+    return "", ""
+
+
+def _format_cached_lead(row) -> str:
+    """Format a cached investigation_leads DB row into context text."""
+    import json as _json
+    lines = ["Research findings (cached):"]
+    lines.append(f"  Conclusion: {row[1]}")
+
+    hypotheses = row[2]
+    if isinstance(hypotheses, str):
+        try:
+            hypotheses = _json.loads(hypotheses)
+        except Exception:
+            hypotheses = []
+    if hypotheses and isinstance(hypotheses, list):
+        lines.append("  Hypotheses:")
+        for h in hypotheses[:3]:
+            if isinstance(h, dict):
+                lines.append(
+                    f"    - {h.get('hypothesis', '?')} "
+                    f"({h.get('confidence', '?')} confidence)"
+                )
+    return "\n".join(lines)
+
+
+def _fire_background_investigation(question: str, ticker: str | None) -> None:
+    """Launch a Sleuth investigation in a daemon thread.
+
+    Saves the result to investigation_leads so the next caller gets a cache hit.
+    Never blocks the calling request — any failure is logged at DEBUG level only.
+    """
+    import uuid as _uuid
+
+    def _run() -> None:
+        try:
+            from intelligence.sleuth import Sleuth, Lead
+            engine = _get_db_engine()
+            sleuth = Sleuth(engine)
+            _safe_question = question[:500]
+            lead = Lead(
+                id=f"chat-{_uuid.uuid4().hex[:12]}",
+                question=_safe_question,
+                category="connection_found" if ticker else "data_anomaly",
+                priority=0.9,
+                evidence=[{
+                    "source": "user_query",
+                    "ticker": ticker,
+                    "question": _safe_question,
+                }],
+            )
+            sleuth.investigate_lead(lead)
+            log.debug("Background research investigation completed for: {q}", q=_safe_question[:80])
+        except Exception as exc:
+            log.debug("Background research investigation failed: {e}", e=str(exc))
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+
+def _research_chain(question: str, ticker: str | None) -> tuple[str, str]:
+    """Return Sleuth research context for a user question.
+
+    Fast path (cache-first, target < 50ms):
+    1. Check investigation_leads for a recent resolved lead that matches the
+       question/ticker (keyword overlap, no embedding model needed).
+    2. On cache hit: return immediately — no LLM, no SentenceTransformer.
+    3. On cache miss: launch a background investigation (daemon thread) so the
+       DB gets populated for the next caller, then return ("", "") immediately.
+
+    The background thread may complete within _RESEARCH_BACKGROUND_TIMEOUT_S; if
+    so its result is included in this response. Otherwise it finishes after the
+    response has been sent and seeds the cache for subsequent requests.
+
+    Why this is still analytically valuable:
+    - Cached leads are produced by the same full Sleuth pipeline (LLM + RAG +
+      context_provider + data gathering) — the output quality is identical.
+    - Hermes runs daily_investigation every 6h, so the cache is continuously
+      warmed with fresh market-relevant findings.
+    - Per-request live investigations were creating LLM queue contention: the
+      same Qwen3.6-27B that answers the chat question was being asked to *also*
+      run a 1500-token investigation, doubling queue depth and causing 35-300s
+      latency. Cache-serving eliminates this self-competition.
 
     Returns (findings_text, source_label).
     """
-    try:
-        from intelligence.sleuth import Sleuth, Lead
-        engine = _get_db_engine()
-        sleuth = Sleuth(engine)
+    # Fast path: serve from cache
+    cached_text, cached_source = _fetch_cached_research(question, ticker)
+    if cached_text:
+        log.debug("Research chain: cache hit for question={q!r}", q=question[:60])
+        return cached_text, cached_source
 
-        # Create an ad-hoc lead from the user's question.
-        # Truncate user input at both the top-level question field and inside
-        # the evidence dict to prevent unbounded raw input from reaching Sleuth.
-        import uuid as _uuid
-        _safe_question = question[:500]
-        lead = Lead(
-            id=f"chat-{_uuid.uuid4().hex[:12]}",
-            question=_safe_question,
-            category="connection_found" if ticker else "data_anomaly",
-            priority=0.9,  # user queries are high priority
-            evidence=[{
-                "source": "user_query",
-                "ticker": ticker,
-                "question": _safe_question,
-            }],
-        )
+    # Cache miss: fire background investigation and wait briefly
+    log.debug("Research chain: cache miss — launching background investigation")
+    import uuid as _uuid
+    result_holder: list[tuple[str, str]] = []
 
-        # Investigate (LLM + data gathering + context)
-        investigated = sleuth.investigate_lead(lead)
+    def _run_and_capture() -> None:
+        try:
+            from intelligence.sleuth import Sleuth, Lead
+            engine = _get_db_engine()
+            sleuth = Sleuth(engine)
+            _safe_question = question[:500]
+            lead = Lead(
+                id=f"chat-{_uuid.uuid4().hex[:12]}",
+                question=_safe_question,
+                category="connection_found" if ticker else "data_anomaly",
+                priority=0.9,
+                evidence=[{
+                    "source": "user_query",
+                    "ticker": ticker,
+                    "question": _safe_question,
+                }],
+            )
+            investigated = sleuth.investigate_lead(lead)
+            if (
+                investigated.findings
+                and investigated.findings != "LLM unavailable — investigation deferred."
+            ):
+                result_holder.append((_format_cached_lead(
+                    (
+                        investigated.question,
+                        investigated.findings,
+                        investigated.hypotheses,
+                        investigated.follow_up_leads,
+                    )
+                ), "sleuth/investigation"))
+        except Exception as exc:
+            log.debug("Research chain background run failed: {e}", e=str(exc))
 
-        if investigated.findings and investigated.findings != "LLM unavailable — investigation deferred.":
-            lines = ["Research findings:"]
-            lines.append(f"  Conclusion: {investigated.findings}")
+    bg_thread = threading.Thread(target=_run_and_capture, daemon=True)
+    bg_thread.start()
+    bg_thread.join(timeout=_RESEARCH_BACKGROUND_TIMEOUT_S)
 
-            if investigated.hypotheses:
-                lines.append("  Hypotheses:")
-                for h in investigated.hypotheses[:3]:
-                    if isinstance(h, dict):
-                        lines.append(f"    - {h.get('hypothesis', '?')} ({h.get('confidence', '?')} confidence)")
+    if result_holder:
+        log.debug("Research chain: background investigation completed within budget")
+        return result_holder[0]
 
-            if investigated.follow_up_leads:
-                # Load follow-up questions for additional context
-                for fu_id in investigated.follow_up_leads[:2]:
-                    child = sleuth._load_lead(fu_id)
-                    if child:
-                        lines.append(f"  Follow-up: {child.question}")
-
-            return "\n".join(lines), "sleuth/investigation"
-    except Exception as exc:
-        log.debug("Research chain failed: {e}", e=str(exc))
-
+    # Background is still running (or failed fast) — return empty so
+    # _build_context_block is not held up. The thread will finish and
+    # persist the lead to the DB for the next caller.
+    log.debug("Research chain: background investigation still running — returning empty")
     return "", ""
 
 
@@ -1493,4 +1855,740 @@ async def _ask_grid_impl(
         sources_used=sources,
         confidence=confidence,
         generated_at=now.isoformat(),
+    )
+
+
+# ── Compose endpoint: NL → dashboard layout ─────────────────────────────
+
+# The widget catalog. Each entry: required prop keys + a one-line description
+# the planner LLM uses to choose widgets. To add a widget, add it here AND
+# register a matching component in the frontend widget registry.
+_WIDGET_CATALOG: dict[str, dict[str, Any]] = {
+    "verdict": {
+        "required": ["question"],
+        "desc": "GRID's plain-English call on a question. Use for 'what should I do', "
+                "'is X going up', 'should I worry'. props.question = the question to answer.",
+    },
+    "ticker_pulse": {
+        "required": ["ticker"],
+        "desc": "Price + signal snapshot for ONE ticker. props.ticker = symbol "
+                "(AAPL, TSLA, GLD for gold, BTC-USD for bitcoin). One card per ticker.",
+    },
+    "watchlist": {
+        "required": [],
+        "desc": "The user's full watchlist overview. Use for 'my stocks', 'my watchlist'.",
+    },
+    "macro_regime": {
+        "required": [],
+        "desc": "Overall market regime (risk-on/off). Use for 'the market', 'overall', 'macro'.",
+    },
+    "news": {
+        "required": [],
+        "desc": "Recent news momentum across the market. Use for 'what's happening', 'news'.",
+    },
+    "money_flow": {
+        "required": [],
+        "desc": "Where money is flowing across sectors. Use for 'flows', 'where's the money'.",
+    },
+}
+
+_MAX_COMPOSE_WIDGETS = 12
+
+
+def _compose_system_prompt() -> str:
+    """Build the planner prompt that maps a request to a widget layout."""
+    lines = [
+        f"- {name}: {spec['desc']}"
+        + (f" Required: {', '.join(spec['required'])}." if spec["required"] else "")
+        for name, spec in _WIDGET_CATALOG.items()
+    ]
+    catalog = "\n".join(lines)
+    return (
+        "You are the stepdad.finance layout planner. The user describes what they "
+        "want to see on their home page, in plain language. Turn it into a dashboard "
+        "layout by choosing widgets from the catalog below. You do NOT answer the "
+        "question yourself — you only build the layout; the widgets fetch their own data.\n\n"
+        f"WIDGET CATALOG:\n{catalog}\n\n"
+        "RULES:\n"
+        "- Pick the smallest set of widgets that satisfies the request. Order them by importance.\n"
+        "- One ticker_pulse per ticker mentioned. Map names to symbols (Apple→AAPL, gold→GLD, bitcoin→BTC-USD).\n"
+        "- If they ask for an opinion/decision/worry, include ONE verdict widget with a clear props.question.\n"
+        "- If they state holdings or weights (e.g. 'half in Apple'), fill `allocation` with {ticker, weight} (weights 0-1, sum ~1). Otherwise leave allocation empty.\n"
+        "- Give each widget a short human title (e.g. 'Apple', 'Should you worry this week?').\n"
+        "- `spoken_reply` is one warm, plain sentence confirming what you built. No jargon.\n"
+        "- PRICE ALERTS: if the user wants to be told/notified/texted when a stock crosses a "
+        "price (e.g. 'tell me when Apple hits 250', 'alert me if Tesla drops below 200', "
+        "'let me know when bitcoin goes above 100k'), return EXACTLY: "
+        '{"alert": {"ticker": "AAPL", "direction": "above"|"below", "threshold": 250, '
+        '"human": "Apple rises above $250"}}. Map the name to a symbol. Use "above" for '
+        "hits/reaches/rises/over/goes up to; \"below\" for drops/falls/under/goes down to. "
+        "Parse k/thousand and m/million into the number (100k -> 100000).\n"
+        "- ACCURACY OVER EVERYTHING: if the request needs something you genuinely CANNOT do "
+        "with these widgets — e.g. connect/show his REAL brokerage or "
+        "account positions, place or recommend a trade, compare to his "
+        "personal holdings, anything not covered by the catalog or the alert action above — "
+        "DO NOT fake it or substitute a vaguely-related widget. Instead return EXACTLY: "
+        '{"cannot_fulfill": true, "what_he_wanted": "<short plain description of the missing '
+        'capability>", "reason": "<one plain sentence on why it is not available yet>"}.\n\n'
+        "Respond with ONLY a JSON object, no markdown, no prose. Either a layout:\n"
+        '{"spoken_reply": "...", "widgets": [{"type": "...", "title": "...", "props": {...}}], '
+        '"allocation": [{"ticker": "...", "weight": 0.0}]}\n'
+        "or an alert object, or a cannot_fulfill object as described above."
+    )
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    """Pull the first JSON object out of an LLM response, tolerating code
+    fences and surrounding prose. Returns None if nothing parses."""
+    import json
+
+    if not text:
+        return None
+    cleaned = text.strip()
+    # Strip ```json ... ``` fences if present.
+    if cleaned.startswith("```"):
+        cleaned = _re.sub(r"^```[a-zA-Z]*\n?", "", cleaned)
+        cleaned = _re.sub(r"\n?```$", "", cleaned).strip()
+    # Fast path.
+    try:
+        obj = json.loads(cleaned)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        pass
+    # Fallback: first balanced {...} span.
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end > start:
+        try:
+            obj = json.loads(cleaned[start : end + 1])
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def _validate_compose_layout(raw: dict[str, Any], question: str) -> tuple[
+    list[ComposeWidget], list[ComposeAllocationItem], str
+]:
+    """Coerce a raw planner dict into validated widgets/allocation, dropping
+    anything unknown or malformed. Always returns at least one widget so the
+    page is never blank — falls back to a verdict on the original question."""
+    widgets: list[ComposeWidget] = []
+    for item in (raw.get("widgets") or [])[:_MAX_COMPOSE_WIDGETS]:
+        if not isinstance(item, dict):
+            continue
+        wtype = str(item.get("type", "")).strip()
+        spec = _WIDGET_CATALOG.get(wtype)
+        if spec is None:
+            continue
+        props = item.get("props") if isinstance(item.get("props"), dict) else {}
+        # Required props present?
+        if any(not str(props.get(k, "")).strip() for k in spec["required"]):
+            continue
+        # Normalize tickers.
+        if "ticker" in props and isinstance(props["ticker"], str):
+            props["ticker"] = props["ticker"].strip().upper()
+        title = str(item.get("title", "")).strip()[:120]
+        widgets.append(ComposeWidget(type=wtype, title=title, props=props))
+
+    if not widgets:
+        widgets.append(
+            ComposeWidget(type="verdict", title="Your read", props={"question": question})
+        )
+
+    allocation: list[ComposeAllocationItem] = []
+    for item in (raw.get("allocation") or [])[:50]:
+        if not isinstance(item, dict):
+            continue
+        tkr = str(item.get("ticker", "")).strip().upper()
+        if not tkr or not _TICKER_RE.match(tkr):
+            continue
+        try:
+            weight = float(item.get("weight", 0.0))
+        except (TypeError, ValueError):
+            weight = 0.0
+        weight = max(0.0, min(1.0, weight))
+        allocation.append(ComposeAllocationItem(ticker=tkr, weight=weight))
+
+    spoken = str(raw.get("spoken_reply", "")).strip()[:500]
+    if not spoken:
+        spoken = "Here's what you asked for."
+    return widgets, allocation, spoken
+
+
+@router.post("/compose", response_model=ChatComposeResponse)
+async def compose_layout(
+    req: ChatComposeRequest,
+    token: str = Depends(require_auth),
+) -> ChatComposeResponse:
+    """Turn a plain-language request into a stepdad.finance dashboard layout.
+
+    The planner LLM only chooses widgets + params; each widget fetches its own
+    data on the frontend (verdict cards call /chat/ask, reusing the full
+    synthesis + firewall pipeline). On any failure we still return a usable
+    single-verdict layout so the page is never blank.
+    """
+    now = datetime.now(timezone.utc)
+    question = req.question.strip()
+
+    # Fast deterministic price alert — works instantly and even when the LLM is
+    # down (a price alert is a precise instruction, no 35B model required).
+    _alert = _parse_alert_intent(question)
+    if _alert:
+        owner = _user_id_from_token(token) or "dad"
+        from api.routers.price_alerts import create_alert_record
+        res = create_alert_record(
+            owner, _alert["ticker"], _alert["direction"], _alert["threshold"],
+            note=question[:280],
+        )
+        if res.get("ok"):
+            return _alert_confirmation_response(res, now.isoformat(), "rule-based")
+        # Ambiguous (e.g. unknown ticker) — fall through to the LLM planner.
+
+    # Deterministic refusal for obvious "can't do that yet" requests — logs the
+    # build request + tells the user gracefully, no LLM call needed. Skipped when
+    # the request looks like a price alert (a real feature): the planner LLM
+    # structures it below instead of it being mistaken for a capability gap.
+    _gap = None if _looks_like_price_alert(question) else _obvious_capability_gap(question)
+    if _gap:
+        owner = _user_id_from_token(token) or "dad"
+        rid = _log_capability_gap(owner=owner, request_text=question, want=_gap[0], reason=_gap[1])
+        return ChatComposeResponse(
+            spoken_reply="I can't do that yet — but I'll build it for you. Want me to ping you when it's ready?",
+            widgets=[],
+            allocation=[],
+            generated_at=now.isoformat(),
+            model_used=None,
+            cannot_fulfill=True,
+            request_id=rid,
+        )
+
+    raw: dict[str, Any] | None = None
+    model_used: str | None = None
+
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": _compose_system_prompt()},
+    ]
+    for msg in req.history[-6:]:
+        messages.append(
+            {"role": msg.role, "content": _sanitize_history_content(msg.content)}
+        )
+    messages.append({"role": "user", "content": question})
+
+    # Local card first; fail over to a paid model if it's busy. None means even
+    # paid was unreachable — be honest rather than fake a layout.
+    answer, model_used = _resilient_chat(messages, temperature=0.2, num_predict=800)
+    if answer is None:
+        return ChatComposeResponse(
+            spoken_reply=CARD_BUSY_MESSAGE,
+            widgets=[], allocation=[],
+            generated_at=now.isoformat(), model_used=None,
+        )
+    raw = _extract_json_object(answer or "")
+
+    if raw is None:
+        raw = {}
+
+    # Price alert: the planner structured a "tell me when X crosses $Y" request.
+    # Create it and confirm in plain language (no dashboard for this intent).
+    if isinstance(raw.get("alert"), dict):
+        owner = _user_id_from_token(token) or "dad"
+        spec = raw["alert"]
+        from api.routers.price_alerts import create_alert_record
+        res = create_alert_record(
+            owner,
+            str(spec.get("ticker") or ""),
+            str(spec.get("direction") or ""),
+            spec.get("threshold"),
+            note=str(spec.get("human") or question)[:280],
+        )
+        if res.get("ok"):
+            return _alert_confirmation_response(res, now.isoformat(), model_used)
+        # Couldn't build it (missing ticker/price) — ask plainly, don't fake it.
+        return ChatComposeResponse(
+            spoken_reply=res.get("error") or "I need a stock and a price to watch — try 'tell me when Apple hits $250'.",
+            widgets=[], allocation=[], generated_at=now.isoformat(), model_used=model_used,
+        )
+
+    # Honest refusal: the planner flagged a capability we don't have yet. Log it
+    # as a build request, email the operator, and tell the user gracefully.
+    if raw.get("cannot_fulfill"):
+        owner = _user_id_from_token(token) or "dad"
+        what = str(raw.get("what_he_wanted") or question).strip()[:500]
+        reason = str(raw.get("reason") or "").strip()[:500]
+        req_id = _log_capability_gap(owner=owner, request_text=question, want=what, reason=reason)
+        return ChatComposeResponse(
+            spoken_reply="I can't do that yet — but I'll build it for you. Want me to ping you when it's ready?",
+            widgets=[],
+            allocation=[],
+            generated_at=now.isoformat(),
+            model_used=model_used,
+            cannot_fulfill=True,
+            request_id=req_id,
+        )
+
+    widgets, allocation, spoken = _validate_compose_layout(raw, question)
+
+    return ChatComposeResponse(
+        spoken_reply=spoken,
+        widgets=widgets,
+        allocation=allocation,
+        generated_at=now.isoformat(),
+        model_used=model_used,
+    )
+
+
+# ── Capability gaps: "I can't do that yet" → logged as a build request ──────
+# When the planner honestly refuses (accuracy over faking it), we record what
+# the user wanted in `sd_capability_requests` (the operator's "TODO for dad"
+# queue) and email the operator so it gets built ASAP. The user is told
+# gracefully and can opt into a ping when it ships.
+
+_CAPABILITY_DDL = """
+CREATE TABLE IF NOT EXISTS sd_capability_requests (
+    id             BIGSERIAL PRIMARY KEY,
+    owner          TEXT NOT NULL DEFAULT 'dad',
+    request_text   TEXT NOT NULL,
+    want           TEXT,
+    reason         TEXT,
+    status         TEXT NOT NULL DEFAULT 'new',   -- new | building | ready
+    dad_wants_ping BOOLEAN NOT NULL DEFAULT false,
+    created_at     TIMESTAMPTZ DEFAULT now(),
+    built_at       TIMESTAMPTZ,
+    notified_at    TIMESTAMPTZ
+)
+"""
+
+
+def _ensure_capability_table(engine) -> None:
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text(_CAPABILITY_DDL))
+
+
+# Operator gets a real iMessage via the Mac mini's notify-anik script (which
+# drives Messages.app). grid-svr (user `grid`) can ssh to anikdang@aniks-mac-mini.
+_MAC_MINI_SSH = "anikdang@aniks-mac-mini"
+
+
+def _imessage_operator(message: str) -> bool:
+    try:
+        import subprocess
+        subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=8", "-o", "BatchMode=yes",
+             _MAC_MINI_SSH, "~/bin/notify-anik"],
+            input=message, text=True, timeout=25,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True,
+        )
+        return True
+    except Exception as exc:
+        log.debug("Operator iMessage failed (non-fatal): {e}", e=str(exc))
+        return False
+
+
+def _email_capability_gap(rid, owner, request_text, want, reason) -> None:
+    # Text the operator (fast ping) — this is the "ping me so I build it asap".
+    _imessage_operator(
+        f"stepdad.finance — {owner} asked for \"{want or request_text}\" "
+        f"(can't do it yet). Build request #{rid}."
+    )
+    # Email too (full detail).
+    try:
+        from scripts.notify import send_insight_email
+        subject = f"[stepdad.finance] {owner} asked for something new (#{rid})"
+        body = (
+            f'{owner} asked: "{request_text}"\n\n'
+            f"Capability needed: {want or '(unspecified)'}\n"
+            f"Why we couldn't do it: {reason or '(unspecified)'}\n\n"
+            f"Logged as build request #{rid} (sd_capability_requests, status=new).\n"
+            f"Build it, then POST /api/v1/chat/capability/{rid}/ready "
+            f"and {owner} gets pinged if they opted in."
+        )
+        send_insight_email(subject, body)
+    except Exception as exc:
+        log.debug("Capability gap email failed (non-fatal): {e}", e=str(exc))
+
+
+# Unambiguous "we can't do this yet" patterns — caught deterministically so the
+# obvious cases are reliable (and skip the LLM call entirely). The planner LLM
+# still handles nuanced refusals via the cannot_fulfill path.
+_GAP_PATTERNS = [
+    # NOTE: price alerts are a real feature now (see _looks_like_price_alert +
+    # the compose alert path). Only NON-alert notification asks fall through to
+    # this gap (e.g. "email me a daily summary").
+    (r"\b(text|sms|message|e-?mail|call|notify|ping|remind)\s+me\b.{0,40}\b(daily|weekly|every|summary|digest|report|morning|recap)\b",
+     "send you scheduled notifications (text or email)", "stepdad.finance can't send scheduled digests yet"),
+    (r"\b(connect|link|sync|log\s*in to|hook\s*up)\b.{0,30}\b(account|brokerage|broker|schwab|fidelity|thinkorswim|robinhood|e-?trade|vanguard|coinbase|webull|interactive brokers)\b",
+     "connect your real brokerage account", "stepdad.finance can't link to brokerage accounts yet"),
+    (r"\b(place|execute|enter|put in|make|submit)\b.{0,20}\b(trade|order)\b|\b(buy|sell)\b.{0,20}\bfor me\b|\bactually (buy|sell)\b",
+     "place a real trade for you", "stepdad.finance can't place trades yet"),
+    (r"\bmy (real|actual|live)\s+(positions|holdings|account|balance|portfolio|shares)\b",
+     "show your real account / live positions", "stepdad.finance can't see your real brokerage holdings yet"),
+]
+
+
+def _obvious_capability_gap(question: str) -> tuple[str, str] | None:
+    q = (question or "").lower()
+    for pat, want, reason in _GAP_PATTERNS:
+        if _re.search(pat, q):
+            return want, reason
+    return None
+
+
+# Price-alert intent: a number/price plus a threshold or notify cue. Used only
+# to STEER routing — when true we skip the capability-gap check and let the
+# planner LLM structure the alert (it maps company names to symbols reliably).
+_ALERT_NUMBER = _re.compile(r"\$?\d[\d,]*\.?\d*\s*[kmKM]?\b")
+_ALERT_THRESHOLD_CUE = _re.compile(
+    r"\b(above|below|over|under|hits?|reach(es)?|drops?|falls?|rises?|crosses?|"
+    r"goes?\s+(to|above|below|up|down)|gets?\s+(to|above|below)|when\s+it)\b", _re.I)
+_ALERT_NOTIFY_CUE = _re.compile(
+    r"\b(alert|notify|tell me|text me|let me know|ping me|remind me|warn me|watch)\b", _re.I)
+
+
+def _looks_like_price_alert(question: str) -> bool:
+    q = question or ""
+    if not _ALERT_NUMBER.search(q):
+        return False
+    return bool(_ALERT_THRESHOLD_CUE.search(q) or _ALERT_NOTIFY_CUE.search(q))
+
+
+# Common names dad would actually type → tickers. Keeps the fast deterministic
+# alert path working without an LLM. Unknown names fall through to the planner.
+_ALERT_NAME_TO_TICKER = {
+    "apple": "AAPL", "tesla": "TSLA", "nvidia": "NVDA", "microsoft": "MSFT",
+    "google": "GOOGL", "alphabet": "GOOGL", "amazon": "AMZN", "meta": "META",
+    "facebook": "META", "netflix": "NFLX", "disney": "DIS", "walmart": "WMT",
+    "coca cola": "KO", "coke": "KO", "boeing": "BA", "ford": "F",
+    "gold": "GLD", "silver": "SLV", "bitcoin": "BTC-USD", "ethereum": "ETH-USD",
+    "s&p 500": "SPY", "s&p500": "SPY", "s&p": "SPY", "sp500": "SPY",
+    "nasdaq": "QQQ", "dow": "DIA", "oil": "USO", "natural gas": "UNG",
+}
+_ALERT_ABOVE = _re.compile(
+    r"\b(above|over|hits?|reach(es)?|rise[sn]?|rising|tops?|breaks?|exceeds?|"
+    r"up to|goes?\s*up|climbs?|past|crosses?)\b", _re.I)
+_ALERT_BELOW = _re.compile(
+    r"\b(below|under|drops?|falls?|dips?|down to|goes?\s*down|sinks?|loses?)\b", _re.I)
+_ALERT_NUM = _re.compile(r"\$?\s*([\d,]+(?:\.\d+)?)\s*([kKmM])?\b")
+
+
+def _parse_alert_intent(question: str) -> dict | None:
+    """Deterministically extract {ticker, direction, threshold} from a plain
+    request. Returns None when anything is ambiguous (then the LLM handles it).
+    Works with the LLM down — a price alert is a precise instruction."""
+    q = question or ""
+    ql = q.lower()
+
+    m = _ALERT_NUM.search(q)
+    if not m:
+        return None
+    try:
+        num = float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    suffix = (m.group(2) or "").lower()
+    if suffix == "k":
+        num *= 1_000
+    elif suffix == "m":
+        num *= 1_000_000
+    if num <= 0:
+        return None
+
+    if _ALERT_BELOW.search(ql):
+        direction = "below"
+    elif _ALERT_ABOVE.search(ql):
+        direction = "above"
+    else:
+        return None
+
+    ticker = None
+    for name, sym in sorted(_ALERT_NAME_TO_TICKER.items(), key=lambda kv: -len(kv[0])):
+        if name in ql:
+            ticker = sym
+            break
+    if ticker is None:
+        explicit = _re.search(r"\$([A-Za-z]{1,6})\b", q) or _re.search(r"\b([A-Z]{2,5})\b", q)
+        if explicit:
+            ticker = explicit.group(1).upper()
+    if not ticker:
+        return None
+
+    return {"ticker": ticker, "direction": direction, "threshold": num}
+
+
+def _alert_confirmation_response(res: dict, now_iso: str, model_used: str | None) -> "ChatComposeResponse":
+    """Plain-language confirmation card for a created price alert."""
+    tk, direction, thr = res["ticker"], res["direction"], res["threshold"]
+    px = res.get("current_price")
+    word = "rises above" if direction == "above" else "drops below"
+    reply = f"Done — I'll text you the moment {tk} {word} ${thr:,.2f}."
+    if res.get("already_met") and px is not None:
+        reply += f" Heads up: it's already there (${px:,.2f} right now), so you'll hear from me shortly."
+    elif px is not None:
+        reply += f" It's ${px:,.2f} right now."
+    return ChatComposeResponse(
+        spoken_reply=reply, widgets=[], allocation=[],
+        generated_at=now_iso, model_used=model_used,
+        alert_created=True, alert=res,
+    )
+
+
+def _log_capability_gap(*, owner: str, request_text: str, want: str, reason: str) -> int | None:
+    try:
+        from sqlalchemy import text
+        engine = _get_db_engine()
+        _ensure_capability_table(engine)
+        with engine.begin() as conn:
+            rid = conn.execute(
+                text(
+                    "INSERT INTO sd_capability_requests (owner, request_text, want, reason) "
+                    "VALUES (:o, :rt, :w, :rs) RETURNING id"
+                ),
+                {"o": owner, "rt": request_text, "w": want, "rs": reason},
+            ).scalar()
+        import threading
+        threading.Thread(
+            target=_email_capability_gap,
+            args=(rid, owner, request_text, want, reason),
+            daemon=True,
+        ).start()
+        log.info("Capability gap logged #{rid} for {o}: {w}", rid=rid, o=owner, w=want)
+        return int(rid) if rid is not None else None
+    except Exception as exc:
+        log.warning("Capability gap log failed: {e}", e=str(exc))
+        return None
+
+
+class CapabilityPingRequest(BaseModel):
+    wants: bool = True
+
+
+@router.post("/capability/{request_id}/ping")
+async def set_capability_ping(
+    request_id: int,
+    req: CapabilityPingRequest,
+    token: str = Depends(require_auth),
+) -> dict:
+    """Record whether the user wants a ping when this request is built."""
+    from sqlalchemy import text
+    try:
+        engine = _get_db_engine()
+        _ensure_capability_table(engine)
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE sd_capability_requests SET dad_wants_ping = :w WHERE id = :id"),
+                {"w": bool(req.wants), "id": request_id},
+            )
+        return {"ok": True, "request_id": request_id, "wants_ping": bool(req.wants)}
+    except Exception as exc:
+        log.warning("Set capability ping pref failed: {e}", e=str(exc))
+        return {"ok": False}
+
+
+@router.post("/capability/{request_id}/ready")
+async def mark_capability_ready(request_id: int, token: str = Depends(require_auth)) -> dict:
+    """Operator marks a 'TODO for dad' request built. The owner then sees the
+    in-app 'it's ready' banner next time they load (via /capability/ready)."""
+    from sqlalchemy import text
+    try:
+        engine = _get_db_engine()
+        _ensure_capability_table(engine)
+        with engine.begin() as conn:
+            row = conn.execute(text(
+                "UPDATE sd_capability_requests SET status = 'ready', built_at = now() "
+                "WHERE id = :id RETURNING owner, want"
+            ), {"id": request_id}).fetchone()
+        if not row:
+            return {"ok": False, "error": "not found"}
+        return {"ok": True, "request_id": request_id, "owner": row[0], "want": row[1]}
+    except Exception as exc:
+        log.warning("Mark capability ready failed: {e}", e=str(exc))
+        return {"ok": False, "error": str(exc)}
+
+
+@router.get("/capability")
+async def list_capability_requests(token: str = Depends(require_auth)) -> dict:
+    """Operator view of the 'TODO for dad' build queue."""
+    from sqlalchemy import text
+    cols = ["id", "owner", "request_text", "want", "reason", "status", "dad_wants_ping", "created_at", "built_at"]
+    try:
+        engine = _get_db_engine()
+        _ensure_capability_table(engine)
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                f"SELECT {', '.join(cols)} FROM sd_capability_requests ORDER BY created_at DESC LIMIT 200"
+            )).fetchall()
+        return {"requests": [dict(zip(cols, r)) for r in rows]}
+    except Exception as exc:
+        return {"requests": [], "error": str(exc)}
+
+
+@router.get("/capability/ready")
+async def capability_ready_for_me(token: str = Depends(require_auth)) -> dict:
+    """Requests this user opted into that are now built — shown once as a banner."""
+    from sqlalchemy import text
+    owner = _user_id_from_token(token) or "dad"
+    try:
+        engine = _get_db_engine()
+        _ensure_capability_table(engine)
+        with engine.begin() as conn:
+            rows = conn.execute(text(
+                "SELECT id, want FROM sd_capability_requests "
+                "WHERE owner = :o AND status = 'ready' AND dad_wants_ping = true "
+                "AND notified_at IS NULL ORDER BY built_at DESC LIMIT 5"
+            ), {"o": owner}).fetchall()
+            ids = [r[0] for r in rows]
+            if ids:
+                conn.execute(
+                    text("UPDATE sd_capability_requests SET notified_at = now() WHERE id = ANY(:ids)"),
+                    {"ids": ids},
+                )
+        return {"ready": [{"id": r[0], "want": r[1]} for r in rows]}
+    except Exception as exc:
+        return {"ready": [], "error": str(exc)}
+
+
+# ── Streaming verdict: token-by-token SSE for the stepdad.finance tile ──
+# Same synthesis prompt + live GRID context as /chat/ask, but streams the
+# primary model's tokens so the home verdict renders live instead of after
+# ~57s. The inline A/B Opus eval and the publishing firewall are intentionally
+# NOT run here — they need the full text and are for *published* claims; this
+# is a private read-only tile. Use /chat/ask for the firewalled path.
+
+def _sse(obj: dict) -> str:
+    import json
+    return f"data: {json.dumps(obj)}\n\n"
+
+
+# If the local card sends no token within this window it's busy — fail over to
+# a paid model rather than letting dad watch a dead spinner for minutes.
+_STREAM_FIRST_TOKEN_S = 15.0
+
+
+def _chunk_text(s: str, n: int = 64):
+    for i in range(0, len(s), n):
+        yield s[i:i + n]
+
+
+def _stream_local_tokens(messages, client):
+    """Stream the local card token-by-token. Yields ('delta', text) tuples and a
+    final ('end', None). The first element of the first yield is ('started', None)
+    once any token arrives, so the caller knows local actually produced output."""
+    import json
+    import requests
+
+    base_url = getattr(client, "base_url", "").rstrip("/")
+    payload: dict[str, Any] = {
+        "model": getattr(client, "model", None),
+        "messages": messages,
+        "max_tokens": 2000,
+        "temperature": 0.3,
+        "stream": True,
+    }
+    try:
+        payload.update(client._extra_payload_fields())
+    except Exception:
+        pass
+    headers = {
+        "Authorization": f"Bearer {getattr(client, 'api_key', '')}",
+        "Content-Type": "application/json",
+    }
+    with requests.post(
+        f"{base_url}/chat/completions",
+        json=payload, headers=headers, stream=True,
+        timeout=(5, _STREAM_FIRST_TOKEN_S),
+    ) as resp:
+        if resp.status_code >= 400:
+            raise RuntimeError(f"local LLM HTTP {resp.status_code}")
+        for raw in resp.iter_lines(decode_unicode=True):
+            if not raw:
+                continue
+            line = raw[6:] if raw.startswith("data: ") else raw
+            if line.strip() == "[DONE]":
+                break
+            try:
+                delta = json.loads(line)["choices"][0]["delta"].get("content", "")
+            except Exception:
+                continue
+            if delta:
+                yield ("delta", delta)
+    yield ("end", None)
+
+
+def _stream_verdict(messages):
+    """SSE generator: stream from the local card; if it's busy/slow/down, fail
+    over to a paid model (emitted in chunks). If even paid is unreachable, tell
+    dad honestly the card is busy rather than faking an answer."""
+    got_any = False
+    local, _label = _get_local_oracle()
+    if local is not None:
+        try:
+            for kind, val in _stream_local_tokens(messages, local):
+                if kind == "delta":
+                    got_any = True
+                    yield _sse({"delta": val})
+        except Exception as exc:
+            log.warning("Local verdict stream failed ({e}) — failing over", e=str(exc))
+
+    if got_any:
+        yield _sse({"done": True})
+        return
+
+    # Local produced nothing (busy/down) — paid models keep the answer smart.
+    for paid, plabel in _paid_clients():
+        try:
+            txt = _call_with_timeout(
+                lambda p=paid: p.chat(messages, temperature=0.3, num_predict=2000),
+                _PAID_CHAT_TIMEOUT_S,
+            )
+            if txt and txt.strip():
+                log.info("Verdict via paid model {l} (local card busy)", l=plabel)
+                for chunk in _chunk_text(txt, 64):
+                    yield _sse({"delta": chunk})
+                yield _sse({"done": True})
+                return
+            log.warning("Paid verdict {l} empty — trying next", l=plabel)
+        except Exception as exc:
+            log.warning("Paid verdict {l} failed: {e} — trying next", l=plabel, e=str(exc))
+
+    # Nothing answered — honest, no fake.
+    yield _sse({"delta": CARD_BUSY_MESSAGE})
+    yield _sse({"done": True})
+
+
+@router.post("/ask/stream")
+async def ask_grid_stream(
+    req: ChatAskRequest,
+    token: str = Depends(require_auth),
+):
+    """Streaming sibling of /chat/ask for the stepdad.finance verdict tile.
+
+    Streams the same synthesis (same system prompt + live GRID context) as
+    Server-Sent Events so the verdict renders as it is written. Falls back to
+    a single rule-based chunk when no LLM is online.
+    """
+    from fastapi.responses import StreamingResponse
+
+    question = req.question.strip()
+    ticker = req.context_ticker.strip().upper() if req.context_ticker else None
+    # Fast context for the realtime home verdict: skip the ~35s research chain
+    # and cap the concurrent gather so tokens start streaming within seconds.
+    context_text, sources = _build_context_block(
+        question, ticker, include_research=False, budget_s=8
+    )
+
+    system_content = _build_system_prompt()
+    if context_text:
+        system_content += f"\n\n## Current GRID Context\n\n{context_text}"
+    messages: list[dict[str, str]] = [{"role": "system", "content": system_content}]
+    for msg in req.history[-10:]:
+        messages.append({"role": msg.role, "content": _sanitize_history_content(msg.content)})
+    messages.append({"role": "user", "content": question})
+
+    # _stream_verdict handles the whole resilience chain: local card → paid model
+    # → honest "card busy". No separate client-None branch needed.
+    return StreamingResponse(
+        _stream_verdict(messages),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

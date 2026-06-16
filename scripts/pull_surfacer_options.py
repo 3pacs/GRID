@@ -33,9 +33,11 @@ from scripts.pull_options import compute_iv_skew, compute_max_pain, create_table
 
 try:
     import yfinance as yf
-except ImportError:  # pragma: no cover
-    log.error("yfinance not installed")
-    raise
+except ImportError as exc:  # pragma: no cover
+    yf = None
+    _YFINANCE_IMPORT_ERROR = exc
+else:
+    _YFINANCE_IMPORT_ERROR = None
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -186,6 +188,15 @@ def _spot_price(stock: Any) -> float | None:
     return None
 
 
+def _require_yfinance() -> Any:
+    if yf is None:
+        raise RuntimeError(
+            "yfinance is unavailable; install/update yfinance and its dependencies "
+            f"before running the Surfacer options puller ({_YFINANCE_IMPORT_ERROR})"
+        )
+    return yf
+
+
 def _atm_iv(calls: Any, puts: Any, spot: float) -> float | None:
     ivs = []
     for df in (calls, puts):
@@ -204,7 +215,8 @@ def _pull_one(
     today: str,
     max_expirations: int = 3,
 ) -> dict[str, Any]:
-    stock = yf.Ticker(ticker)
+    yfinance = _require_yfinance()
+    stock = yfinance.Ticker(ticker)
     spot = _spot_price(stock)
     if not spot:
         return {"status": "deferred", "reason": "no spot price from provider"}

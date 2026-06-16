@@ -37,15 +37,19 @@ import {
 
 export const routes = [
     /* ── World View: primary tab bar ─────────────────────────────── */
+    {
+        id: 'ten-year',
+        label: '10-Year',
+        labelShort: '10Y',
+        icon: LineChart,
+        component: './views/TenYearPortfolio.jsx',
+        group: 'worldView',
+        nav: 'tab',
+        desc: 'Weekly long-horizon stock allocations from 10-year chart quality',
+    },
     /*
-     * TPS (Trump-Proximity Score) — Phase 0 of the GRID-4-product pivot.
-     * docs/planning/GRID-4-PRODUCT-PIVOT.md section 5 designates this the
-     * NEW default landing route. The PWA has no feature-flag pattern yet,
-     * so per the build brief we list TPS first (the tab bar uses route
-     * order for default selection in worldView). Promotion to literal
-     * default — the route renderer in app.jsx still falls back to its
-     * stored last-view on hard reload — lands in a follow-up PR once 24h
-     * of snapshot data exists. See TPS.jsx for the feature-flag TODO.
+     * TPS (Trump-Proximity Score) remains in the primary world-view strip,
+     * but the default landing route now starts on the 10-year portfolio query.
      */
     {
         id: 'tps',
@@ -615,6 +619,7 @@ export const routes = [
 /* ── Derived helpers consumed by NavBar and app.jsx ─────────────── */
 
 const PRIMARY_TAB_IDS = new Set([
+    'ten-year',
     'surfacer',
     'dashboard',
     'money-flow',

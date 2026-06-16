@@ -60,6 +60,32 @@ class Tier(str, Enum):
 
 # Cache clients to avoid re-init on every call
 _client_cache: dict[str, Any] = {}
+_PROVIDER_BACKOFF_UNTIL: dict[str, float] = {}
+_PROVIDER_BACKOFF_REASONS: dict[str, str] = {}
+_PROVIDER_AUTH_BACKOFF_S = 1800.0
+_PROVIDER_RATE_BACKOFF_S = 300.0
+
+
+def _mark_provider_unavailable(provider: str, reason: str, cooldown_s: float) -> None:
+    """Temporarily suppress providers that are known-bad for this process."""
+    until = time.time() + cooldown_s
+    _PROVIDER_BACKOFF_UNTIL[provider] = until
+    _PROVIDER_BACKOFF_REASONS[provider] = reason
+    log.warning(
+        "LLM provider {p} disabled for {s:.0f}s: {r}",
+        p=provider, s=cooldown_s, r=reason,
+    )
+
+
+def _provider_in_backoff(provider: str) -> bool:
+    until = _PROVIDER_BACKOFF_UNTIL.get(provider)
+    if not until:
+        return False
+    if time.time() >= until:
+        _PROVIDER_BACKOFF_UNTIL.pop(provider, None)
+        _PROVIDER_BACKOFF_REASONS.pop(provider, None)
+        return False
+    return True
 
 
 def _gemma_or_default(settings: Any, key: str, legacy_key: str, default: str) -> str:
@@ -85,19 +111,19 @@ def _fallback_chain(tier: Tier, provider: str) -> list[str]:
         # z400 (RTX A2000 12GB / GTX 1660S 6GB, qwen2.5:7b-instruct) is
         # another cluster ollama node, added as a load-spreading fallback
         # 2026-05-13; gridz4 is overkill for LOCAL but still a fast fallback.
-        chain = ["llamacpp_quick", "ollama_koala", "ollama_ocr", "ollama_z400", "llamacpp_z4", "llamacpp", "gemma", "ollama", "ollama_panda", "openrouter", "openai"]
+        chain = ["llamacpp_quick", "ollama_koala", "ollama_ocr", "ollama_z400", "llamacpp_z4", "llamacpp", "gemma", "ollama", "openrouter", "openai"]
     elif tier == Tier.ORACLE:
         # gridz4 (Blackwell + Qwen3.6-35B-A3B Claude-Opus-distill) is now the
         # primary ORACLE node. grid-svr's Pascal P100+GTX1070 27B (`llamacpp_oracle`)
-        # demoted to fallback 2026-05-09. ollama_panda (qwen2.5:32b on 2×P100)
-        # is the next-strongest tier-3 fallback.
-        chain = ["llamacpp_z4", "llamacpp_oracle", "ollama_panda", "llamacpp", "gemma", "openrouter", "openai"]
+        # demoted to fallback 2026-05-09. panda is offline for the foreseeable
+        # future, so ORACLE fallback stays on live llama.cpp/cloud providers.
+        chain = ["llamacpp_z4", "llamacpp_oracle", "llamacpp", "gemma", "openrouter", "openai"]
     elif tier == Tier.BATCH:
-        chain = ["llamacpp_batch", "llamacpp_oracle", "llamacpp_z4", "ollama_panda", "openrouter", "openai"]
+        chain = ["llamacpp_batch", "llamacpp_oracle", "llamacpp_z4", "openrouter", "openai"]
     else:
         # REASON / DEFAULT — z400's qwen2.5:7b is a capable analysis-grade
         # fallback after the redbox/gridz4/koala/ocr nodes (added 2026-05-13).
-        chain = ["llamacpp_quick", "llamacpp_z4", "ollama_koala", "ollama_ocr", "ollama_z400", "llamacpp", "gemma", "ollama", "ollama_panda", "openrouter", "openai"]
+        chain = ["llamacpp_quick", "llamacpp_z4", "ollama_koala", "ollama_ocr", "ollama_z400", "llamacpp", "gemma", "ollama", "openrouter", "openai"]
     return [candidate for candidate in chain if candidate != provider]
 
 
@@ -131,17 +157,21 @@ def get_llm(
             provider = _gemma_or_default(settings, "LLM_REASON_PROVIDER", "LLM_DEFAULT_PROVIDER", "llamacpp")
 
     # Return cached client if available and still healthy
-    if provider in _client_cache:
+    if provider in _client_cache and not _provider_in_backoff(provider):
         client = _client_cache[provider]
         if getattr(client, "is_available", True):
             return client
 
-    client = _create_client(provider)
-    if client is not None and getattr(client, "is_available", True):
-        _client_cache[provider] = client
-        return client
+    client = None
+    if not _provider_in_backoff(provider):
+        client = _create_client(provider)
+        if client is not None and getattr(client, "is_available", True):
+            _client_cache[provider] = client
+            return client
 
     for fallback in _fallback_chain(tier, provider):
+        if _provider_in_backoff(fallback):
+            continue
         if fallback in _client_cache:
             fb_client = _client_cache[fallback]
         else:
@@ -181,9 +211,29 @@ def get_llm(
     return _NullClient()
 
 
+# Paid/hosted LLM providers — billed per token. Disabled by default per the local-first rule:
+# GRID's fallback chains end in openrouter/openai, so a redeploy that restored API keys would
+# silently re-leak. This choke-point keeps paid OFF even if a key reappears. To intentionally
+# re-enable, set GRID_ALLOW_PAID_LLM=1 in the environment.
+_PAID_PROVIDERS = frozenset({"openai", "openrouter", "anthropic", "huggingface"})
+
+
+def _paid_llm_allowed() -> bool:
+    """True only if paid LLM use is explicitly opted in via GRID_ALLOW_PAID_LLM."""
+    from config import settings
+    return bool(getattr(settings, "GRID_ALLOW_PAID_LLM", False))
+
+
 def _create_client(provider: str) -> Any:
     """Instantiate an LLM client for the given provider."""
     from config import settings
+
+    if provider in _PAID_PROVIDERS and not _paid_llm_allowed():
+        log.warning(
+            "Paid LLM provider {p} blocked — GRID_ALLOW_PAID_LLM not set (local-first)",
+            p=provider,
+        )
+        return None
 
     if provider == "huggingface":
         return _create_hf_client(settings)
@@ -197,6 +247,8 @@ def _create_client(provider: str) -> Any:
         return _create_ollama_ocr_client(settings)
     elif provider == "ollama_koala":
         return _create_ollama_koala_client(settings)
+    elif provider == "ollama_z400":
+        return _create_ollama_z400_client(settings)
     elif provider == "llamacpp":
         return _create_llamacpp_client(settings)
     elif provider == "openai":
@@ -272,10 +324,13 @@ def _create_ollama_panda_client(settings: Any) -> Any:
     """Ollama on the panda node (2× P100 16GB) — qwen2.5:32b."""
     if not getattr(settings, "OLLAMA_PANDA_ENABLED", False):
         return None
+    base_url = getattr(settings, "OLLAMA_PANDA_BASE_URL", "")
+    if not base_url:
+        return None
     try:
         from ollama.client import OllamaClient
         return OllamaClient(
-            base_url=getattr(settings, "OLLAMA_PANDA_BASE_URL", "http://panda:11434"),
+            base_url=base_url,
             model=getattr(settings, "OLLAMA_PANDA_CHAT_MODEL", "qwen2.5:32b"),
             timeout=getattr(settings, "OLLAMA_PANDA_TIMEOUT_SECONDS", 240),
         )
@@ -325,6 +380,31 @@ def _create_ollama_ocr_client(settings: Any) -> Any:
         )
     except Exception as exc:
         log.debug("Ollama ocr client init failed: {e}", e=str(exc))
+        return None
+
+
+def _create_ollama_z400_client(settings: Any) -> Any:
+    """Ollama on the z400 node (12GB GPU) — qwen2.5:7b-instruct-q4_K_M.
+
+    z400 sits in the cluster alongside panda/ocr/koala. Its 12GB card
+    holds a 7B Q4 model comfortably (~5GB resident). Best fit for
+    high-throughput narrative tasks (postmortem narration, signal
+    interpretation) where the 7B class is enough and we want low
+    per-request latency. minicpm-v / qwen2.5vl are also present for
+    vision tasks (callers must override ``model=``).
+    """
+    if not getattr(settings, "OLLAMA_Z400_ENABLED", False):
+        return None
+    try:
+        from ollama.client import OllamaClient
+        return OllamaClient(
+            base_url=getattr(settings, "OLLAMA_Z400_BASE_URL", "http://z400:11434"),
+            model=getattr(settings, "OLLAMA_Z400_CHAT_MODEL", "qwen2.5:7b-instruct-q4_K_M"),
+            embed_model=getattr(settings, "OLLAMA_Z400_EMBED_MODEL", "nomic-embed-text"),
+            timeout=getattr(settings, "OLLAMA_Z400_TIMEOUT_SECONDS", 120),
+        )
+    except Exception as exc:
+        log.debug("Ollama z400 client init failed: {e}", e=str(exc))
         return None
 
 
@@ -406,7 +486,13 @@ def _create_llamacpp_quick_client(settings: Any) -> Any:
 
 
 def _create_llamacpp_z4_client(settings: Any) -> Any:
-    """Create a llama.cpp client for the gridz4 REASON-tier remote server."""
+    """Create a llama.cpp client for the gridz4 REASON-tier remote server.
+
+    z4 runs the no-thinking Qwen3.6-35B-A3B GGUF.  Keep this client bounded:
+    the generic llama.cpp client adds reasoning headroom for thinking models,
+    which turns default calls into 6K-token generations and can monopolize
+    both gridz4 slots.
+    """
     if not getattr(settings, "LLAMACPP_Z4_ENABLED", False):
         return None
     try:
@@ -416,9 +502,12 @@ def _create_llamacpp_z4_client(settings: Any) -> Any:
             model=getattr(
                 settings,
                 "LLAMACPP_Z4_CHAT_MODEL",
-                "Qwen3.5-9B-Claude-Opus-Reasoning-v2.Q4_K_M.gguf",
+                "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
             ),
             timeout=getattr(settings, "LLAMACPP_Z4_TIMEOUT_SECONDS", 180),
+            default_num_predict=getattr(settings, "LLAMACPP_Z4_NUM_PREDICT", 512),
+            min_num_predict=getattr(settings, "LLAMACPP_Z4_MIN_NUM_PREDICT", 0),
+            reasoning_headroom=getattr(settings, "LLAMACPP_Z4_REASONING_HEADROOM", 0),
         )
     except Exception as exc:
         log.debug("llama.cpp z4 client init failed: {e}", e=str(exc))
@@ -560,6 +649,20 @@ class _OpenAICompatibleClient:
                     status=resp.status_code, l=latency_ms,
                     body=resp.text[:300],
                 )
+                if resp.status_code in {401, 402, 403}:
+                    self.is_available = False
+                    _mark_provider_unavailable(
+                        self._health_provider,
+                        f"HTTP {resp.status_code}",
+                        _PROVIDER_AUTH_BACKOFF_S,
+                    )
+                elif resp.status_code == 429:
+                    self.is_available = False
+                    _mark_provider_unavailable(
+                        self._health_provider,
+                        "HTTP 429",
+                        _PROVIDER_RATE_BACKOFF_S,
+                    )
                 return None
 
             data = resp.json()

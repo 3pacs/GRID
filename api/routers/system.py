@@ -30,6 +30,7 @@ from api.schemas.system import (
     ResolverStatus,
     RestartResponse,
     ServerHealth,
+    StaleSource,
     SystemStatusResponse,
 )
 
@@ -396,8 +397,8 @@ def freshness(_token: str = Depends(require_auth)) -> FreshnessResponse:
     else:
         overall = "GREEN"
 
-    # Add blacklisted/stale source info for frontend staleness indicators
-    stale_sources: list[dict] = []
+    # Blacklisted/stale source info for frontend staleness indicators.
+    stale_sources: list[StaleSource] = []
     try:
         with engine.connect() as conn:
             rows = conn.execute(text(
@@ -409,22 +410,21 @@ def freshness(_token: str = Depends(require_auth)) -> FreshnessResponse:
                 "LIMIT 20"
             )).fetchall()
             stale_sources = [
-                {
-                    "source": r[0],
-                    "last_pull": r[1].isoformat() if r[1] else None,
-                    "stale": True,
-                }
+                StaleSource(
+                    source=r[0],
+                    last_pull=r[1].isoformat() if r[1] else None,
+                    stale=True,
+                )
                 for r in rows
             ]
     except Exception as exc:
         log.debug("System: stale sources query failed: {e}", e=str(exc))
 
-    resp = FreshnessResponse(families=families, overall_status=overall)
-    # Attach stale sources as extra field (not in the pydantic model,
-    # but FastAPI will include it in the response)
-    resp_dict = resp.dict()
-    resp_dict["stale_sources"] = stale_sources
-    return resp_dict
+    return FreshnessResponse(
+        families=families,
+        overall_status=overall,
+        stale_sources=stale_sources,
+    )
 
 
 # ── Source type classification ─────────────────────────────────────

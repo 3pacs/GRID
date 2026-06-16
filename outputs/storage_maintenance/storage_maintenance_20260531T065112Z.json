@@ -1,0 +1,1181 @@
+{
+  "active_roots": [
+    "/data/gdelt",
+    "/data/bulk_data",
+    "/data/datasets",
+    "/data/grid/bulk",
+    "/data/archive"
+  ],
+  "cleanup_plan": [
+    {
+      "action": "verify_existing_cold_copy_then_consider_active_removal",
+      "cold_storage_exists": true,
+      "cold_storage_size_match": true,
+      "delete_source": false,
+      "destination": "/mirror/gdelt/v1/events/GDELT.MASTERREDUCEDV2.1979-2013.zip",
+      "reason": "Large archive appears to already have a same-size cold copy. Do not remove source until checksum and ingest manifest are verified.",
+      "size_bytes": 1088704384,
+      "source": "/data/gdelt/v1/events/GDELT.MASTERREDUCEDV2.1979-2013.zip"
+    },
+    {
+      "action": "copy_to_cold_storage_then_verify_manifest",
+      "cold_storage_exists": false,
+      "cold_storage_size_match": false,
+      "delete_source": false,
+      "destination": "/mirror/bulk_data/gdelt/master_1979_2013.zip",
+      "reason": "Large archive on active data disk. Keep source until an ingest record and checksum manifest prove cold copy is safe.",
+      "size_bytes": 1088704384,
+      "source": "/data/bulk_data/gdelt/master_1979_2013.zip"
+    },
+    {
+      "action": "copy_to_cold_storage_then_verify_manifest",
+      "cold_storage_exists": false,
+      "cold_storage_size_match": false,
+      "delete_source": false,
+      "destination": "/mirror/bulk_data/fnspid/full_history.zip",
+      "reason": "Large archive on active data disk. Keep source until an ingest record and checksum manifest prove cold copy is safe.",
+      "size_bytes": 589525596,
+      "source": "/data/bulk_data/fnspid/full_history.zip"
+    },
+    {
+      "action": "copy_to_cold_storage_then_verify_manifest",
+      "cold_storage_exists": false,
+      "cold_storage_size_match": false,
+      "delete_source": false,
+      "destination": "/mirror/bulk_data/wikipedia/pageviews-20260101-automated.bz2",
+      "reason": "Large archive on active data disk. Keep source until an ingest record and checksum manifest prove cold copy is safe.",
+      "size_bytes": 541520723,
+      "source": "/data/bulk_data/wikipedia/pageviews-20260101-automated.bz2"
+    },
+    {
+      "action": "copy_to_cold_storage_then_verify_manifest",
+      "cold_storage_exists": false,
+      "cold_storage_size_match": false,
+      "delete_source": false,
+      "destination": "/mirror/datasets/layline_insider/layline-insider-trading.zip",
+      "reason": "Large archive on active data disk. Keep source until an ingest record and checksum manifest prove cold copy is safe.",
+      "size_bytes": 4398631378,
+      "source": "/data/datasets/layline_insider/layline-insider-trading.zip"
+    },
+    {
+      "action": "copy_to_cold_storage_then_verify_manifest",
+      "cold_storage_exists": false,
+      "cold_storage_size_match": false,
+      "delete_source": false,
+      "destination": "/mirror/datasets/fec_contributions_2024.zip",
+      "reason": "Large archive on active data disk. Keep source until an ingest record and checksum manifest prove cold copy is safe.",
+      "size_bytes": 4244259029,
+      "source": "/data/datasets/fec_contributions_2024.zip"
+    },
+    {
+      "action": "copy_to_cold_storage_then_verify_manifest",
+      "cold_storage_exists": false,
+      "cold_storage_size_match": false,
+      "delete_source": false,
+      "destination": "/mirror/datasets/patentsview/g_persistent_assignee.tsv.zip",
+      "reason": "Large archive on active data disk. Keep source until an ingest record and checksum manifest prove cold copy is safe.",
+      "size_bytes": 4090293710,
+      "source": "/data/datasets/patentsview/g_persistent_assignee.tsv.zip"
+    },
+    {
+      "action": "copy_to_cold_storage_then_verify_manifest",
+      "cold_storage_exists": false,
+      "cold_storage_size_match": false,
+      "delete_source": false,
+      "destination": "/mirror/datasets/clinicaltrials_full.zip",
+      "reason": "Large archive on active data disk. Keep source until an ingest record and checksum manifest prove cold copy is safe.",
+      "size_bytes": 2831878154,
+      "source": "/data/datasets/clinicaltrials_full.zip"
+    },
+    {
+      "action": "copy_to_cold_storage_then_verify_manifest",
+      "cold_storage_exists": false,
+      "cold_storage_size_match": false,
+      "delete_source": false,
+      "destination": "/mirror/datasets/uk_psc/psc-snapshot-2026-03-30.zip",
+      "reason": "Large archive on active data disk. Keep source until an ingest record and checksum manifest prove cold copy is safe.",
+      "size_bytes": 2105238944,
+      "source": "/data/datasets/uk_psc/psc-snapshot-2026-03-30.zip"
+    },
+    {
+      "action": "copy_to_cold_storage_then_verify_manifest",
+      "cold_storage_exists": false,
+      "cold_storage_size_match": false,
+      "delete_source": false,
+      "destination": "/mirror/datasets/sec_submissions.zip",
+      "reason": "Large archive on active data disk. Keep source until an ingest record and checksum manifest prove cold copy is safe.",
+      "size_bytes": 1515248942,
+      "source": "/data/datasets/sec_submissions.zip"
+    },
+    {
+      "action": "copy_to_cold_storage_then_verify_manifest",
+      "cold_storage_exists": false,
+      "cold_storage_size_match": false,
+      "delete_source": false,
+      "destination": "/mirror/datasets/sec_submissions2.zip",
+      "reason": "Large archive on active data disk. Keep source until an ingest record and checksum manifest prove cold copy is safe.",
+      "size_bytes": 1515248942,
+      "source": "/data/datasets/sec_submissions2.zip"
+    },
+    {
+      "action": "copy_to_cold_storage_then_verify_manifest",
+      "cold_storage_exists": false,
+      "cold_storage_size_match": false,
+      "delete_source": false,
+      "destination": "/mirror/datasets/sec_companyfacts.zip",
+      "reason": "Large archive on active data disk. Keep source until an ingest record and checksum manifest prove cold copy is safe.",
+      "size_bytes": 1363770508,
+      "source": "/data/datasets/sec_companyfacts.zip"
+    },
+    {
+      "action": "copy_to_cold_storage_then_verify_manifest",
+      "cold_storage_exists": false,
+      "cold_storage_size_match": false,
+      "delete_source": false,
+      "destination": "/mirror/datasets/patentsview/g_persistent_inventor.tsv.zip",
+      "reason": "Large archive on active data disk. Keep source until an ingest record and checksum manifest prove cold copy is safe.",
+      "size_bytes": 958915925,
+      "source": "/data/datasets/patentsview/g_persistent_inventor.tsv.zip"
+    },
+    {
+      "action": "copy_to_cold_storage_then_verify_manifest",
+      "cold_storage_exists": false,
+      "cold_storage_size_match": false,
+      "delete_source": false,
+      "destination": "/mirror/datasets/patentsview/g_inventor_disambiguated.tsv.zip",
+      "reason": "Large archive on active data disk. Keep source until an ingest record and checksum manifest prove cold copy is safe.",
+      "size_bytes": 699147889,
+      "source": "/data/datasets/patentsview/g_inventor_disambiguated.tsv.zip"
+    }
+  ],
+  "cold_storage_root": "/mirror",
+  "filesystems": [
+    {
+      "error": null,
+      "exists": true,
+      "free_bytes": 2678942167040,
+      "path": "/data",
+      "total_bytes": 11904377847808,
+      "use_pct": 0.7749615980533343,
+      "used_bytes": 9225435680768
+    },
+    {
+      "error": null,
+      "exists": true,
+      "free_bytes": 9153811587072,
+      "path": "/mirror",
+      "total_bytes": 17927372771328,
+      "use_pct": 0.4893946980501195,
+      "used_bytes": 8773561184256
+    }
+  ],
+  "gdelt": {
+    "base_path": "/data/gdelt",
+    "db_tables": {
+      "gdelt_daily_summary": {
+        "exists": false,
+        "rows": null
+      },
+      "gdelt_events": {
+        "exists": false,
+        "rows": null
+      }
+    },
+    "directory_file_counts": {
+      "parser_root": 755,
+      "v1_events": 4848,
+      "v1_gkg": 9468,
+      "v2_english": 1149248,
+      "v2_translation": 1133693
+    },
+    "exists": true,
+    "ingest_status": "archives_present_db_tables_missing",
+    "recommendations": [
+      "Create/extend a GDELT bulk parser job before moving archives; live DB lacks gdelt_events/gdelt_daily_summary.",
+      "scripts/parse_gdelt.py only reads /data/grid/bulk/gdelt; /data/gdelt/v1/events has more files and needs parser coverage or a curated ingest symlink.",
+      "GDELT v2 English/translation archives are massive; keep them on /mirror after parser/index coverage is proven."
+    ],
+    "state_counts": {
+      "v1_events.done": 4848,
+      "v1_gkg.done": 9470,
+      "v2_english.done": 1149248,
+      "v2_translation.done": 1133693
+    }
+  },
+  "generated_at": "2026-05-31T06:51:12.532097+00:00",
+  "ingest_plan": [
+    {
+      "action": "run_gdelt_parser_smoke",
+      "blocked_by": "Parser currently ignores /data/gdelt/v1/events and GDELT v2 roots; extend parser or intentionally symlink a bounded subset first.",
+      "command": "python3 scripts/parse_gdelt.py",
+      "current_parser_root": "/data/grid/bulk/gdelt"
+    }
+  ],
+  "json_path": null,
+  "markdown_path": null,
+  "roots": [
+    {
+      "archive_bytes_seen": 276835943341,
+      "archives_seen": 24999,
+      "dirs_seen": 7,
+      "exists": true,
+      "files_seen": 25000,
+      "largest_archives": [
+        {
+          "cold_storage_exists": true,
+          "cold_storage_path": "/mirror/gdelt/v1/events/GDELT.MASTERREDUCEDV2.1979-2013.zip",
+          "cold_storage_size_match": true,
+          "path": "/data/gdelt/v1/events/GDELT.MASTERREDUCEDV2.1979-2013.zip",
+          "recommendation": "verify_existing_cold_copy_after_ingest_proof",
+          "size_bytes": 1088704384,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": true,
+          "cold_storage_path": "/mirror/gdelt/v1/events/2003.zip",
+          "cold_storage_size_match": true,
+          "path": "/data/gdelt/v1/events/2003.zip",
+          "recommendation": "verify_existing_cold_copy_after_ingest_proof",
+          "size_bytes": 193990838,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": true,
+          "cold_storage_path": "/mirror/gdelt/v1/events/2001.zip",
+          "cold_storage_size_match": true,
+          "path": "/data/gdelt/v1/events/2001.zip",
+          "recommendation": "verify_existing_cold_copy_after_ingest_proof",
+          "size_bytes": 176208388,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": true,
+          "cold_storage_path": "/mirror/gdelt/v1/events/1999.zip",
+          "cold_storage_size_match": true,
+          "path": "/data/gdelt/v1/events/1999.zip",
+          "recommendation": "verify_existing_cold_copy_after_ingest_proof",
+          "size_bytes": 164889467,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": true,
+          "cold_storage_path": "/mirror/gdelt/v1/events/2004.zip",
+          "cold_storage_size_match": true,
+          "path": "/data/gdelt/v1/events/2004.zip",
+          "recommendation": "verify_existing_cold_copy_after_ingest_proof",
+          "size_bytes": 163638643,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": true,
+          "cold_storage_path": "/mirror/gdelt/v1/events/2000.zip",
+          "cold_storage_size_match": true,
+          "path": "/data/gdelt/v1/events/2000.zip",
+          "recommendation": "verify_existing_cold_copy_after_ingest_proof",
+          "size_bytes": 159578516,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": true,
+          "cold_storage_path": "/mirror/gdelt/v1/events/2002.zip",
+          "cold_storage_size_match": true,
+          "path": "/data/gdelt/v1/events/2002.zip",
+          "recommendation": "verify_existing_cold_copy_after_ingest_proof",
+          "size_bytes": 156447374,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": true,
+          "cold_storage_path": "/mirror/gdelt/v1/events/1998.zip",
+          "cold_storage_size_match": true,
+          "path": "/data/gdelt/v1/events/1998.zip",
+          "recommendation": "verify_existing_cold_copy_after_ingest_proof",
+          "size_bytes": 146398733,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": true,
+          "cold_storage_path": "/mirror/gdelt/v1/events/201203.zip",
+          "cold_storage_size_match": true,
+          "path": "/data/gdelt/v1/events/201203.zip",
+          "recommendation": "verify_existing_cold_copy_after_ingest_proof",
+          "size_bytes": 126322817,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": true,
+          "cold_storage_path": "/mirror/gdelt/v1/events/1997.zip",
+          "cold_storage_size_match": true,
+          "path": "/data/gdelt/v1/events/1997.zip",
+          "recommendation": "verify_existing_cold_copy_after_ingest_proof",
+          "size_bytes": 126156942,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": true,
+          "cold_storage_path": "/mirror/gdelt/v1/events/2005.zip",
+          "cold_storage_size_match": true,
+          "path": "/data/gdelt/v1/events/2005.zip",
+          "recommendation": "verify_existing_cold_copy_after_ingest_proof",
+          "size_bytes": 125894903,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": true,
+          "cold_storage_path": "/mirror/gdelt/v1/events/201202.zip",
+          "cold_storage_size_match": true,
+          "path": "/data/gdelt/v1/events/201202.zip",
+          "recommendation": "verify_existing_cold_copy_after_ingest_proof",
+          "size_bytes": 119392596,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": true,
+          "cold_storage_path": "/mirror/gdelt/v1/events/201103.zip",
+          "cold_storage_size_match": true,
+          "path": "/data/gdelt/v1/events/201103.zip",
+          "recommendation": "verify_existing_cold_copy_after_ingest_proof",
+          "size_bytes": 118977599,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": true,
+          "cold_storage_path": "/mirror/gdelt/v1/events/201205.zip",
+          "cold_storage_size_match": true,
+          "path": "/data/gdelt/v1/events/201205.zip",
+          "recommendation": "verify_existing_cold_copy_after_ingest_proof",
+          "size_bytes": 116811929,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": true,
+          "cold_storage_path": "/mirror/gdelt/v1/events/201204.zip",
+          "cold_storage_size_match": true,
+          "path": "/data/gdelt/v1/events/201204.zip",
+          "recommendation": "verify_existing_cold_copy_after_ingest_proof",
+          "size_bytes": 112070585,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": true,
+          "cold_storage_path": "/mirror/gdelt/v1/events/201104.zip",
+          "cold_storage_size_match": true,
+          "path": "/data/gdelt/v1/events/201104.zip",
+          "recommendation": "verify_existing_cold_copy_after_ingest_proof",
+          "size_bytes": 109768635,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": true,
+          "cold_storage_path": "/mirror/gdelt/v1/events/201009.zip",
+          "cold_storage_size_match": true,
+          "path": "/data/gdelt/v1/events/201009.zip",
+          "recommendation": "verify_existing_cold_copy_after_ingest_proof",
+          "size_bytes": 107000391,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": true,
+          "cold_storage_path": "/mirror/gdelt/v1/events/201108.zip",
+          "cold_storage_size_match": true,
+          "path": "/data/gdelt/v1/events/201108.zip",
+          "recommendation": "verify_existing_cold_copy_after_ingest_proof",
+          "size_bytes": 106398513,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": true,
+          "cold_storage_path": "/mirror/gdelt/v1/events/201206.zip",
+          "cold_storage_size_match": true,
+          "path": "/data/gdelt/v1/events/201206.zip",
+          "recommendation": "verify_existing_cold_copy_after_ingest_proof",
+          "size_bytes": 104918829,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": true,
+          "cold_storage_path": "/mirror/gdelt/v1/events/201109.zip",
+          "cold_storage_size_match": true,
+          "path": "/data/gdelt/v1/events/201109.zip",
+          "recommendation": "verify_existing_cold_copy_after_ingest_proof",
+          "size_bytes": 103742218,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": true,
+          "cold_storage_path": "/mirror/gdelt/v1/events/201303.zip",
+          "cold_storage_size_match": true,
+          "path": "/data/gdelt/v1/events/201303.zip",
+          "recommendation": "verify_existing_cold_copy_after_ingest_proof",
+          "size_bytes": 103210987,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": true,
+          "cold_storage_path": "/mirror/gdelt/v1/events/201107.zip",
+          "cold_storage_size_match": true,
+          "path": "/data/gdelt/v1/events/201107.zip",
+          "recommendation": "verify_existing_cold_copy_after_ingest_proof",
+          "size_bytes": 102959521,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": true,
+          "cold_storage_path": "/mirror/gdelt/v1/events/201207.zip",
+          "cold_storage_size_match": true,
+          "path": "/data/gdelt/v1/events/201207.zip",
+          "recommendation": "verify_existing_cold_copy_after_ingest_proof",
+          "size_bytes": 102404556,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": true,
+          "cold_storage_path": "/mirror/gdelt/v1/events/201211.zip",
+          "cold_storage_size_match": true,
+          "path": "/data/gdelt/v1/events/201211.zip",
+          "recommendation": "verify_existing_cold_copy_after_ingest_proof",
+          "size_bytes": 100826534,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": true,
+          "cold_storage_path": "/mirror/gdelt/v1/events/201008.zip",
+          "cold_storage_size_match": true,
+          "path": "/data/gdelt/v1/events/201008.zip",
+          "recommendation": "verify_existing_cold_copy_after_ingest_proof",
+          "size_bytes": 100589880,
+          "suffix": ".zip"
+        }
+      ],
+      "notes": [
+        "bounded_scan_truncated_at_25000_files"
+      ],
+      "path": "/data/gdelt",
+      "truncated": true
+    },
+    {
+      "archive_bytes_seen": 4450704478,
+      "archives_seen": 183,
+      "dirs_seen": 741,
+      "exists": true,
+      "files_seen": 2686,
+      "largest_archives": [
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/bulk_data/gdelt/master_1979_2013.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/bulk_data/gdelt/master_1979_2013.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 1088704384,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/bulk_data/fnspid/full_history.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/bulk_data/fnspid/full_history.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 589525596,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/bulk_data/wikipedia/pageviews-20260101-automated.bz2",
+          "cold_storage_size_match": false,
+          "path": "/data/bulk_data/wikipedia/pageviews-20260101-automated.bz2",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 541520723,
+          "suffix": ".bz2"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/bulk_data/wikipedia/pageviews-20260301-automated.bz2",
+          "cold_storage_size_match": false,
+          "path": "/data/bulk_data/wikipedia/pageviews-20260301-automated.bz2",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 472342847,
+          "suffix": ".bz2"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/bulk_data/wikipedia/pageviews-20260201-automated.bz2",
+          "cold_storage_size_match": false,
+          "path": "/data/bulk_data/wikipedia/pageviews-20260201-automated.bz2",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 439780729,
+          "suffix": ".bz2"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/bulk_data/world_bank/wdi_csv.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/bulk_data/world_bank/wdi_csv.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 282934281,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/bulk_data/eia/elec_bulk.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/bulk_data/eia/elec_bulk.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 229068179,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/bulk_data/bis/banking_stats.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/bulk_data/bis/banking_stats.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 120047203,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/bulk_data/eia/petroleum_bulk.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/bulk_data/eia/petroleum_bulk.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 61166398,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/bulk_data/gdelt/daily/20260305.export.CSV.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/bulk_data/gdelt/daily/20260305.export.CSV.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 9415009,
+          "suffix": ".CSV.zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/bulk_data/gdelt/daily/20260303.export.CSV.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/bulk_data/gdelt/daily/20260303.export.CSV.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 9179904,
+          "suffix": ".CSV.zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/bulk_data/gdelt/daily/20260304.export.CSV.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/bulk_data/gdelt/daily/20260304.export.CSV.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 9105154,
+          "suffix": ".CSV.zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/bulk_data/gdelt/daily/20260121.export.CSV.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/bulk_data/gdelt/daily/20260121.export.CSV.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 8683129,
+          "suffix": ".CSV.zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/bulk_data/gdelt/daily/20260226.export.CSV.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/bulk_data/gdelt/daily/20260226.export.CSV.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 8682119,
+          "suffix": ".CSV.zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/bulk_data/gdelt/daily/20260122.export.CSV.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/bulk_data/gdelt/daily/20260122.export.CSV.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 8659994,
+          "suffix": ".CSV.zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/bulk_data/gdelt/daily/20260211.export.CSV.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/bulk_data/gdelt/daily/20260211.export.CSV.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 8632287,
+          "suffix": ".CSV.zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/bulk_data/gdelt/daily/20260312.export.CSV.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/bulk_data/gdelt/daily/20260312.export.CSV.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 8628949,
+          "suffix": ".CSV.zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/bulk_data/gdelt/daily/20260306.export.CSV.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/bulk_data/gdelt/daily/20260306.export.CSV.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 8572961,
+          "suffix": ".CSV.zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/bulk_data/gdelt/daily/20260115.export.CSV.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/bulk_data/gdelt/daily/20260115.export.CSV.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 8572576,
+          "suffix": ".CSV.zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/bulk_data/gdelt/daily/20260219.export.CSV.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/bulk_data/gdelt/daily/20260219.export.CSV.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 8551963,
+          "suffix": ".CSV.zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/bulk_data/gdelt/daily/20260114.export.CSV.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/bulk_data/gdelt/daily/20260114.export.CSV.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 8505788,
+          "suffix": ".CSV.zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/bulk_data/gdelt/daily/20260318.export.CSV.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/bulk_data/gdelt/daily/20260318.export.CSV.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 8471313,
+          "suffix": ".CSV.zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/bulk_data/gdelt/daily/20260224.export.CSV.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/bulk_data/gdelt/daily/20260224.export.CSV.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 8458060,
+          "suffix": ".CSV.zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/bulk_data/gdelt/daily/20260311.export.CSV.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/bulk_data/gdelt/daily/20260311.export.CSV.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 8392990,
+          "suffix": ".CSV.zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/bulk_data/gdelt/daily/20260204.export.CSV.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/bulk_data/gdelt/daily/20260204.export.CSV.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 8391145,
+          "suffix": ".CSV.zip"
+        }
+      ],
+      "notes": [],
+      "path": "/data/bulk_data",
+      "truncated": false
+    },
+    {
+      "archive_bytes_seen": 26651142491,
+      "archives_seen": 303,
+      "dirs_seen": 1912,
+      "exists": true,
+      "files_seen": 7157,
+      "largest_archives": [
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/datasets/layline_insider/layline-insider-trading.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/datasets/layline_insider/layline-insider-trading.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 4398631378,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/datasets/fec_contributions_2024.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/datasets/fec_contributions_2024.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 4244259029,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/datasets/patentsview/g_persistent_assignee.tsv.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/datasets/patentsview/g_persistent_assignee.tsv.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 4090293710,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/datasets/clinicaltrials_full.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/datasets/clinicaltrials_full.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 2831878154,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/datasets/uk_psc/psc-snapshot-2026-03-30.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/datasets/uk_psc/psc-snapshot-2026-03-30.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 2105238944,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/datasets/sec_submissions.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/datasets/sec_submissions.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 1515248942,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/datasets/sec_submissions2.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/datasets/sec_submissions2.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 1515248942,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/datasets/sec_companyfacts.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/datasets/sec_companyfacts.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 1363770508,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/datasets/patentsview/g_persistent_inventor.tsv.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/datasets/patentsview/g_persistent_inventor.tsv.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 958915925,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/datasets/patentsview/g_inventor_disambiguated.tsv.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/datasets/patentsview/g_inventor_disambiguated.tsv.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 699147889,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/datasets/patentsview/g_cpc_current.tsv.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/datasets/patentsview/g_cpc_current.tsv.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 495497999,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/datasets/gleif/gleif-lei2-golden-copy-latest.csv.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/datasets/gleif/gleif-lei2-golden-copy-latest.csv.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 475827782,
+          "suffix": ".csv.zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/datasets/patentsview/g_assignee_disambiguated.tsv.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/datasets/patentsview/g_assignee_disambiguated.tsv.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 358936767,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/datasets/worldbank_indicators.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/datasets/worldbank_indicators.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 282934281,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/datasets/worldbank_wdi.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/datasets/worldbank_wdi.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 282934281,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/datasets/patentsview/g_patent.tsv.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/datasets/patentsview/g_patent.tsv.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 229891939,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/datasets/eia_elec_bulk.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/datasets/eia_elec_bulk.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 229068179,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/datasets/icij_full_oldb.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/datasets/icij_full_oldb.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 73043531,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/datasets/patentsview/g_application.tsv.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/datasets/patentsview/g_application.tsv.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 70883999,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/datasets/eia_petroleum_bulk.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/datasets/eia_petroleum_bulk.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 61166398,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/datasets/gleif/gleif-repex-golden-copy-latest.csv.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/datasets/gleif/gleif-repex-golden-copy-latest.csv.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 58366319,
+          "suffix": ".csv.zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/datasets/opportunity_insights/data/COVID - County - Daily 2022.csv.gz",
+          "cold_storage_size_match": false,
+          "path": "/data/datasets/opportunity_insights/data/COVID - County - Daily 2022.csv.gz",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 51349930,
+          "suffix": ".gz"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/datasets/opportunity_insights/data/COVID - County - Daily 2021.csv.gz",
+          "cold_storage_size_match": false,
+          "path": "/data/datasets/opportunity_insights/data/COVID - County - Daily 2021.csv.gz",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 41596324,
+          "suffix": ".gz"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/datasets/patentsview/g_us_term_of_grant.tsv.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/datasets/patentsview/g_us_term_of_grant.tsv.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 35470125,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/datasets/icij_github/csv_leaks/csv_paradise_papers.2018-02-14.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/datasets/icij_github/csv_leaks/csv_paradise_papers.2018-02-14.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 29566643,
+          "suffix": ".zip"
+        }
+      ],
+      "notes": [],
+      "path": "/data/datasets",
+      "truncated": false
+    },
+    {
+      "archive_bytes_seen": 11708144285,
+      "archives_seen": 830,
+      "dirs_seen": 8,
+      "exists": true,
+      "files_seen": 1027,
+      "largest_archives": [
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/grid/bulk/eia/electricity.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/grid/bulk/eia/electricity.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 238299947,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/grid/bulk/edgar/financials_2025q3.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/grid/bulk/edgar/financials_2025q3.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 127842298,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/grid/bulk/edgar/financials_2025q1.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/grid/bulk/edgar/financials_2025q1.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 127765057,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/grid/bulk/edgar/financials_2024q1.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/grid/bulk/edgar/financials_2024q1.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 124336804,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/grid/bulk/edgar/financials_2024q4.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/grid/bulk/edgar/financials_2024q4.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 122932548,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/grid/bulk/edgar/financials_2023q4.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/grid/bulk/edgar/financials_2023q4.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 120272357,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/grid/bulk/edgar/financials_2024q2.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/grid/bulk/edgar/financials_2024q2.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 119119954,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/grid/bulk/edgar/financials_2024q3.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/grid/bulk/edgar/financials_2024q3.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 118280418,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/grid/bulk/edgar/financials_2023q3.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/grid/bulk/edgar/financials_2023q3.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 117776944,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/grid/bulk/edgar/financials_2023q2.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/grid/bulk/edgar/financials_2023q2.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 116914392,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/grid/bulk/edgar/financials_2023q1.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/grid/bulk/edgar/financials_2023q1.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 113974946,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/grid/bulk/edgar/financials_2022q4.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/grid/bulk/edgar/financials_2022q4.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 111091525,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/grid/bulk/edgar/financials_2022q1.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/grid/bulk/edgar/financials_2022q1.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 103669919,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/grid/bulk/edgar/financials_2014q1.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/grid/bulk/edgar/financials_2014q1.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 102843522,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/grid/bulk/edgar/financials_2021q4.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/grid/bulk/edgar/financials_2021q4.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 102642081,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/grid/bulk/edgar/financials_2013q1.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/grid/bulk/edgar/financials_2013q1.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 99173442,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/grid/bulk/edgar/financials_2015q1.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/grid/bulk/edgar/financials_2015q1.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 98944359,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/grid/bulk/edgar/financials_2019q4.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/grid/bulk/edgar/financials_2019q4.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 98753299,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/grid/bulk/edgar/financials_2013q3.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/grid/bulk/edgar/financials_2013q3.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 98355005,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/grid/bulk/edgar/financials_2021q1.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/grid/bulk/edgar/financials_2021q1.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 97900752,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/grid/bulk/edgar/financials_2022q3.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/grid/bulk/edgar/financials_2022q3.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 97589396,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/grid/bulk/edgar/financials_2021q3.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/grid/bulk/edgar/financials_2021q3.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 97252395,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/grid/bulk/edgar/financials_2022q2.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/grid/bulk/edgar/financials_2022q2.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 97089251,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/grid/bulk/edgar/financials_2013q2.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/grid/bulk/edgar/financials_2013q2.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 96917655,
+          "suffix": ".zip"
+        },
+        {
+          "cold_storage_exists": false,
+          "cold_storage_path": "/mirror/grid/bulk/edgar/financials_2020q1.zip",
+          "cold_storage_size_match": false,
+          "path": "/data/grid/bulk/edgar/financials_2020q1.zip",
+          "recommendation": "copy_to_cold_after_ingest_proof",
+          "size_bytes": 96584608,
+          "suffix": ".zip"
+        }
+      ],
+      "notes": [],
+      "path": "/data/grid/bulk",
+      "truncated": false
+    },
+    {
+      "archive_bytes_seen": 0,
+      "archives_seen": 0,
+      "dirs_seen": 6157,
+      "exists": true,
+      "files_seen": 192,
+      "largest_archives": [],
+      "notes": [],
+      "path": "/data/archive",
+      "truncated": false
+    }
+  ],
+  "status": "ingest_gap",
+  "target_id": "grid-svr-data"
+}

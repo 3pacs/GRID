@@ -657,9 +657,28 @@ def _extract_signal_contributions(row: Any) -> dict[str, float]:
         if numeric:
             return numeric
 
-    # Layer 2b: signals is a list of names — distribute strength evenly
+    # Layer 2b: signals is a list of names — distribute strength evenly.
+    # Entries may be plain strings OR {"name": <str>, "detail": ...} dicts
+    # (oracle/publish.py:publish_astrogrid_prediction emits the dict form).
+    # Without the dict-aware path we used to ``str(dict)`` the entry and
+    # store ``"{'name': 'astrogrid_grid', 'detail': ...}"`` as the signal
+    # name — polluting every pair in signal_cooccurrence_history (verified
+    # 2026-05-17: all 410 historical rows were dict-str pairs, so the
+    # cooccurrence_lift adjuster matched nothing and silently returned
+    # neutral 1.0 forever).
     if isinstance(signals_field, list) and signals_field:
-        names = [str(s) for s in signals_field if s]
+        names: list[str] = []
+        for s in signals_field:
+            if not s:
+                continue
+            if isinstance(s, dict):
+                # Prefer ``name`` then ``signal`` then ``id``; skip on miss
+                # so we don't pollute downstream tables with stringified dicts.
+                cand = s.get("name") or s.get("signal") or s.get("id")
+                if isinstance(cand, str) and cand.strip():
+                    names.append(cand.strip())
+            elif isinstance(s, str) and s.strip():
+                names.append(s.strip())
         if names:
             w = (
                 max(signal_strength, COOCCURRENCE_MIN_SHAPLEY)

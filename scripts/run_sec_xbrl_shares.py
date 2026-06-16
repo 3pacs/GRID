@@ -25,6 +25,7 @@ from loguru import logger as log  # noqa: E402
 
 from db import get_engine  # noqa: E402
 from ingestion.altdata.sec_xbrl_shares import (  # noqa: E402
+    FOREIGN_ISSUER_TICKERS,
     SECXBRLSharesPuller,
 )
 
@@ -51,6 +52,16 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Comma-separated explicit ticker list (overrides sector map).",
     )
+    parser.add_argument(
+        "--foreign-issuers",
+        action="store_true",
+        help=(
+            "Include the known 20-F/6-K foreign-issuer tickers (TSM, ASML, "
+            "BHP, RIO, NVO, AZN, BP, ...) which report shares under IFRS and "
+            "are usually absent from the domestic sector map. Merged with "
+            "--tickers when both are given."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -60,11 +71,33 @@ def _split_tickers(raw: str | None) -> list[str] | None:
     return [tk.strip().upper() for tk in raw.split(",") if tk.strip()]
 
 
+def _resolve_universe(
+    raw_tickers: str | None, include_foreign: bool
+) -> list[str] | None:
+    """Build the explicit ticker list from --tickers and --foreign-issuers.
+
+    Returns None when neither is supplied (puller falls back to sector map).
+    Deduplicates while preserving order (explicit tickers first).
+    """
+    explicit = _split_tickers(raw_tickers) or []
+    if include_foreign:
+        explicit = list(explicit) + list(FOREIGN_ISSUER_TICKERS)
+    if not explicit:
+        return None
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for tk in explicit:
+        if tk not in seen:
+            seen.add(tk)
+            ordered.append(tk)
+    return ordered
+
+
 def main() -> int:
     args = _parse_args()
     engine = get_engine()
     puller = SECXBRLSharesPuller(db_engine=engine)
-    tickers = _split_tickers(args.tickers)
+    tickers = _resolve_universe(args.tickers, args.foreign_issuers)
     results = puller.pull_all(
         limit=args.limit,
         backfill_days=args.backfill_days,

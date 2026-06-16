@@ -84,13 +84,12 @@ async def get_cross_reference(
     pattern shipped earlier in PR for dashboard cold-load.
     """
     try:
-        from intelligence.cross_reference import run_all_checks
+        from intelligence.cross_reference import load_recent_report, run_all_checks
 
         engine = get_db_engine()
         cache_key = "cross_ref_all_fast" if fast else "cross_ref_all"
 
-        def _compute():
-            report = run_all_checks(engine, skip_narrative=fast)
+        def _serialize(report) -> dict[str, Any]:
             return {
                 "checks": [asdict(c) for c in report.checks],
                 "red_flags": [asdict(c) for c in report.red_flags],
@@ -99,6 +98,26 @@ async def get_cross_reference(
                 "generated_at": report.generated_at,
                 "narrative_pending": fast,  # signals to frontend to fetch separately
             }
+
+        def _compute():
+            # Stored-results fast path: ``run_all_checks`` persists every
+            # check to ``cross_reference_checks`` with a timestamp. On the
+            # checks-only (fast) call we can reconstruct the most recent
+            # fresh batch from the DB instead of re-running the slow
+            # physical-reality scans — so a cold process / fresh worker
+            # (whose in-memory cache is empty) doesn't pay full compute on
+            # first hit. The stored result has no narrative, so it only
+            # serves the fast path; ``fast=False`` always recomputes to
+            # regenerate the LLM prose.
+            if fast:
+                stored = load_recent_report(engine, max_age_seconds=_CACHE_TTL)
+                if stored is not None:
+                    log.debug("cross-reference served from stored results")
+                    return _serialize(stored)
+            # Miss (or narrative requested) → full compute, which persists
+            # for the next cold hit.
+            report = run_all_checks(engine, skip_narrative=fast)
+            return _serialize(report)
 
         return _cached(cache_key, _compute)
     except Exception as exc:

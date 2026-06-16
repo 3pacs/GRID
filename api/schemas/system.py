@@ -79,9 +79,16 @@ class FamilyFreshness(BaseModel):
     status: str  # GREEN, YELLOW, RED
 
 
+class StaleSource(BaseModel):
+    source: str
+    last_pull: str | None = None
+    stale: bool = True
+
+
 class FreshnessResponse(BaseModel):
     families: list[FamilyFreshness]
     overall_status: str  # GREEN, YELLOW, RED
+    stale_sources: list[StaleSource] = []
 
 
 class HermesTaskStatus(BaseModel):

@@ -1443,8 +1443,8 @@ class HypothesisGenerator:
             q = text("""
                 SELECT COUNT(*) FROM signal_data
                 WHERE actor = :actor
-                  AND signal_date >= :since::date
-                  AND signal_date <= (:since::date + :window * INTERVAL '1 day')
+                  AND signal_date >= CAST(:since AS date)
+                  AND signal_date <= (CAST(:since AS date) + :window * INTERVAL '1 day')
             """)
             with self.engine.connect() as conn:
                 cnt = conn.execute(q, {
@@ -1456,8 +1456,8 @@ class HypothesisGenerator:
             q = text("""
                 SELECT COUNT(*) FROM analytical_snapshots
                 WHERE category = :cat
-                  AND snapshot_date >= :since::date
-                  AND snapshot_date <= (:since::date + :window * INTERVAL '1 day')
+                  AND snapshot_date >= CAST(:since AS date)
+                  AND snapshot_date <= (CAST(:since AS date) + :window * INTERVAL '1 day')
             """)
             with self.engine.connect() as conn:
                 cnt = conn.execute(q, {

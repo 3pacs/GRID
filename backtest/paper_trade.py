@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger as log
+from outputs.path_utils import ensure_output_dir
 
 _PAPER_DIR = Path(__file__).parent.parent / "outputs" / "paper_trades"
 
@@ -38,7 +39,7 @@ class PaperTradeTracker:
 
     def __init__(self, db_engine: Any = None) -> None:
         self.engine = db_engine
-        _PAPER_DIR.mkdir(parents=True, exist_ok=True)
+        self.paper_dir = ensure_output_dir(_PAPER_DIR)
 
     def _init_db(self) -> None:
         if self.engine is None:
@@ -216,7 +217,7 @@ class PaperTradeTracker:
     def _save_snapshot(self, snapshot: dict[str, Any]) -> None:
         """Save snapshot to disk as immutable record."""
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        filepath = _PAPER_DIR / f"snapshot_{ts}.json"
+        filepath = self.paper_dir / f"snapshot_{ts}.json"
         with filepath.open("w") as f:
             json.dump(snapshot, f, indent=2, default=str)
         log.info("Paper trade snapshot saved to {p}", p=filepath)
@@ -270,7 +271,7 @@ class PaperTradeTracker:
         Returns:
             list: Snapshot summaries sorted by date (newest first).
         """
-        files = sorted(_PAPER_DIR.glob("snapshot_*.json"), reverse=True)
+        files = sorted(self.paper_dir.glob("snapshot_*.json"), reverse=True)
         snapshots = []
         for f in files:
             try:
@@ -290,7 +291,7 @@ class PaperTradeTracker:
 
     def get_snapshot(self, filename: str) -> dict[str, Any] | None:
         """Load a specific snapshot by filename."""
-        filepath = _PAPER_DIR / filename
+        filepath = self.paper_dir / filename
         if not filepath.exists():
             return None
         with filepath.open() as f:
@@ -308,7 +309,7 @@ class PaperTradeTracker:
         today = date.today()
         scored = []
 
-        for snapshot_file in sorted(_PAPER_DIR.glob("snapshot_*.json")):
+        for snapshot_file in sorted(self.paper_dir.glob("snapshot_*.json")):
             try:
                 with snapshot_file.open() as f:
                     snapshot = json.load(f)
@@ -413,7 +414,7 @@ if __name__ == "__main__":
             for k, v in snapshot["scoring_dates"].items():
                 print(f"  {k}: {v}")
             print()
-            print(f"Saved to {_PAPER_DIR}")
+            print(f"Saved to {tracker.paper_dir}")
 
     elif len(sys.argv) > 1 and sys.argv[1] == "--score":
         scored = tracker.score_predictions()

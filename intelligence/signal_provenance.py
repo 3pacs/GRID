@@ -146,12 +146,12 @@ class CausationChain:
         }
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(frozen=True)
 class TradeProvenanceReport:
     """Full per-ticker evidence report. Serialized to the API layer.
 
-    ``kw_only=True`` so future conviction-stack layers can be added with
-    a default without forcing every caller to update positional ordering.
+    Keep the single defaulted field at the end so Python 3.9 can import
+    this dataclass on the live audit host.
     """
 
     ticker: str
@@ -185,9 +185,9 @@ class TradeProvenanceReport:
     arbitrage_multiplier: float           # ∈ [0.95, 1.10] (CAT-183 prediction_market_arbitrage)
     convergence_multiplier: float         # ∈ [0.92, 1.25] (dots-connector — signal_convergence_scanner)
     money_flow_multiplier: float          # ∈ [0.70, 1.30] (14th layer — money_flow_adapter)
-    memory_lesson_multiplier: float = 1.0  # ∈ [0.85, 1.15] (15th layer — reasoning_bank). Default 1.0 (neutral) so new layers can be added without breaking every caller.
     aggregate_conviction: float
     verdict: str  # 'high' / 'medium' / 'low' / 'no_trade'
+    memory_lesson_multiplier: float = 1.0  # ∈ [0.85, 1.15] (15th layer — reasoning_bank). Default 1.0 (neutral) so older callers remain valid.
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -272,12 +272,20 @@ def compute_aggregate_conviction(
     down get a discount. Neutral (1.0) when fewer than two firing
     signals or no calibrated pair history.
     """
+    # Per-signal overrides from intelligence.signal_weight_overrides.
+    # Default-ON, env-gated. Multiplier of 1.0 = no effect.
+    try:
+        from intelligence.signal_weight_overrides import get_override as _signal_override
+    except Exception:  # noqa: BLE001
+        _signal_override = lambda _s: 1.0  # noqa: E731
+
     base = 0.0
     for ev in signal_evidence:
+        override = _signal_override(getattr(ev, "signal_source", ""))
         if ev.scorecard is None:
-            base += ev.shapley_weight * 1.0  # neutral on no-history
+            base += ev.shapley_weight * 1.0 * override  # neutral on no-history
         else:
-            base += ev.shapley_weight * ev.scorecard.conviction_weight
+            base += ev.shapley_weight * ev.scorecard.conviction_weight * override
 
     penalty = 1.0
     penalty *= max(0.0, 1.0 - 0.4 * max(0.0, min(1.0, disagreement_score)))

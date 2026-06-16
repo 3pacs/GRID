@@ -148,6 +148,35 @@ class Settings(BaseSettings):
     OPENROUTER_CHAT_MODEL: str = "anthropic/claude-sonnet-4"
     OPENAI_EMBED_MODEL: str = "text-embedding-3-small"
 
+    # Hermes analyst bridge — hosted OpenAI reasoning model wrapped with spend
+    # accounting + local fallback (intelligence/hermes/). This is the bridge to
+    # the future fine-tuned grid-analyst-v1; not the hermes_operator daemon nor
+    # the gridz4 llama node. HERMES_API_KEY falls back to OPENAI_API_KEY when
+    # blank. Leave HERMES_TEMPERATURE/REASONING_EFFORT empty for reasoning
+    # models (o-series / gpt-5) which reject a non-default temperature.
+    HERMES_ENABLED: bool = True
+    HERMES_API_KEY: str = ""
+    HERMES_BASE_URL: str = ""                       # blank -> OPENAI_BASE_URL
+    HERMES_MODEL: str = "gpt-4o"                     # switch to gpt-5.4 / o-series for batch reasoning
+    HERMES_TIMEOUT_SECONDS: int = 120
+    HERMES_MAX_COMPLETION_TOKENS: int = 4096
+    HERMES_TEMPERATURE: str = ""                     # "" -> omit (required for reasoning models)
+    HERMES_REASONING_EFFORT: str = ""               # "", "low", "medium", "high"
+    HERMES_DAILY_SPEND_CAP_USD: float = 0.0         # 0 -> no cap (set before scheduler wiring)
+    HERMES_LEDGER_PATH: str = "outputs/hermes/spend_ledger.json"
+    HERMES_PRICE_INPUT_PER_MTOK: float = 2.50       # USD/1M input tokens (estimate for cap)
+    HERMES_PRICE_OUTPUT_PER_MTOK: float = 10.00     # USD/1M output tokens (incl. reasoning)
+    HERMES_FALLBACK_TIER: str = "reason"            # llm.router tier for offline fallback
+    # Backend: "openai" (API key, per-token) or "codex" (Codex CLI, ChatGPT-
+    # subscription auth — the only path to GPT-5.5). The codex backend shells
+    # out to `codex exec`; auth is whatever `codex login` set on the host, so
+    # no key lives in .env and there is no per-token USD cap (plan rate limits).
+    HERMES_BACKEND: str = "openai"                  # openai | codex
+    HERMES_CODEX_BIN: str = "codex"                 # Codex CLI binary (PATH or absolute)
+    HERMES_CODEX_MODEL: str = ""                    # blank -> Codex default (GPT-5.5)
+    HERMES_CODEX_TIMEOUT_SECONDS: int = 240
+    HERMES_CODEX_EXTRA_ARGS: str = ""               # extra `codex exec` flags (shlex-split)
+
     # Ollama (local lightweight LLM — Qwen 7B)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_ENABLED: bool = True
@@ -157,12 +186,10 @@ class Settings(BaseSettings):
 
     # Remote Ollama nodes — added 2026-05-09. Each has its own URL +
     # default model so the LLM router can fan out across the cluster.
-    # Brought online by the operator: panda (2× P100 16GB Pascal hosting
-    # qwen2.5:32b) and ocr-node (2× 8GB Ampere hosting smaller models +
-    # vision). Each becomes a provider name `ollama_panda` / `ollama_ocr`
-    # in llm/router.py.
-    OLLAMA_PANDA_BASE_URL: str = "http://panda:11434"
-    OLLAMA_PANDA_ENABLED: bool = True
+    # panda is offline for the foreseeable future; keep this provider
+    # disabled by default and out of automatic fallback chains.
+    OLLAMA_PANDA_BASE_URL: str = ""
+    OLLAMA_PANDA_ENABLED: bool = False
     OLLAMA_PANDA_TIMEOUT_SECONDS: int = 240
     # Pascal P100 (sm_60) cannot use bf16 native, mxfp8 (sm_89+), or
     # nvfp4 (sm_120). Q4_K_M is the highest-quality quant available for
@@ -188,6 +215,19 @@ class Settings(BaseSettings):
     OLLAMA_KOALA_TIMEOUT_SECONDS: int = 120
     OLLAMA_KOALA_CHAT_MODEL: str = "gemma3:12b-it-q4_K_M"
     OLLAMA_KOALA_EMBED_MODEL: str = "nomic-embed-text"
+
+    # z400 — workstation with a 12GB GPU running Ollama. 7B Q4 model
+    # (qwen2.5:7b-instruct-q4_K_M, ~5GB resident) leaves room on the
+    # card for fast inference. Best fit for high-throughput narrative
+    # tasks (postmortem narration, signal interpretation) where 7B is
+    # enough and we want low per-request latency. Vision models
+    # (minicpm-v:8b, qwen2.5vl:7b) also present but not routed through
+    # the standard chain — callers override ``model=`` for vision.
+    OLLAMA_Z400_BASE_URL: str = "http://z400:11434"
+    OLLAMA_Z400_ENABLED: bool = True
+    OLLAMA_Z400_TIMEOUT_SECONDS: int = 120
+    OLLAMA_Z400_CHAT_MODEL: str = "qwen2.5:7b-instruct-q4_K_M"
+    OLLAMA_Z400_EMBED_MODEL: str = "nomic-embed-text"
 
     # koala card 1 — Kokoro TTS server (CPU inference, FastAPI on :8091).
     # OpenAI-compatible /v1/audio/speech endpoint. 54 voices, 24kHz mono WAV.
@@ -221,8 +261,12 @@ class Settings(BaseSettings):
     LLAMACPP_ORACLE_ENABLED: bool = True
     LLAMACPP_ORACLE_TIMEOUT_SECONDS: int = 300
     LLAMACPP_ORACLE_CHAT_MODEL: str = "Qwen3-32B-Q4_K_M"
-    LLAMACPP_ORACLE_NUM_PREDICT: int = 15000
-    LLAMACPP_ORACLE_MIN_NUM_PREDICT: int = 15000
+    # Must fit inside LLAMACPP_ORACLE_TIMEOUT_SECONDS at the server's real
+    # throughput (~27 tok/s) or every full-length call orphans mid-generation
+    # and holds the single llama slot, bombarding the server. 6000 tok ~= 220s.
+    # min=0 drops the forced floor so short tasks finish fast. (.env overrides these)
+    LLAMACPP_ORACLE_NUM_PREDICT: int = 6000
+    LLAMACPP_ORACLE_MIN_NUM_PREDICT: int = 0
 
     # llama.cpp QUICK-tier remote server (redbox node — Qwen3-14B, Tailscale-reachable)
     LLAMACPP_QUICK_BASE_URL: str = "http://100.126.129.45:8080"
@@ -230,11 +274,14 @@ class Settings(BaseSettings):
     LLAMACPP_QUICK_TIMEOUT_SECONDS: int = 120
     LLAMACPP_QUICK_CHAT_MODEL: str = "qwen3-14b"
 
-    # llama.cpp REASON-tier remote server (gridz4 node — Qwen3.5 9B, Tailscale-reachable)
+    # llama.cpp REASON-tier remote server (gridz4 node — Qwen3.6 35B A3B, Tailscale-reachable)
     LLAMACPP_Z4_BASE_URL: str = "http://gridz4:8080"
     LLAMACPP_Z4_ENABLED: bool = True
     LLAMACPP_Z4_TIMEOUT_SECONDS: int = 180
-    LLAMACPP_Z4_CHAT_MODEL: str = "Qwen3.5-9B-Claude-Opus-Reasoning-v2.Q4_K_M.gguf"
+    LLAMACPP_Z4_CHAT_MODEL: str = "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+    LLAMACPP_Z4_NUM_PREDICT: int = 512
+    LLAMACPP_Z4_MIN_NUM_PREDICT: int = 0
+    LLAMACPP_Z4_REASONING_HEADROOM: int = 0
 
     # llama.cpp BATCH-tier CPU server on grid-svr (DeepSeek-V4-Flash 158B Q4_K_M, port 8082).
     # Non-interactive heavy reasoning only — slow (~5 tok/sec) but free + powerful.

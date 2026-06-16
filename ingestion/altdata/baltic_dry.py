@@ -1,12 +1,10 @@
 """
 GRID Baltic Dry Index and shipping indices ingestion module.
 
-Pulls the Baltic Dry Index (BDI) and related sub-indices from the FRED API.
-The BDI is a key global trade activity and commodity demand indicator issued
-by the Baltic Exchange. FRED mirrors the series with IDs DBDI, BCPI, BPTI,
-and BSI.
-
-Data source: FRED (Federal Reserve Economic Data) via the fedfred library.
+Pulls the Baltic Dry Index (BDI) and related sub-indices. FRED used to mirror
+the Baltic series, but the historical IDs have gone dark. The puller therefore
+keeps FRED as a legacy primary and falls back to a current public Baltic
+snapshot without logging noisy per-series failures for known-dead FRED IDs.
 """
 
 from __future__ import annotations
@@ -17,6 +15,7 @@ from datetime import date, timedelta
 from typing import Any
 
 import pandas as pd
+import requests
 from fedfred import FredAPI
 from loguru import logger as log
 from sqlalchemy import text
@@ -24,29 +23,146 @@ from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller
 
-# Baltic Exchange series available on FRED
-# Maps internal GRID series_id -> FRED series code
+# Public daily snapshot used by https://balticdryindex.com/. The frontend's
+# historical chart uses synthetic history; only latest.json is trusted here.
+BALTIC_PUBLIC_SNAPSHOT_URL = (
+    "https://raw.githubusercontent.com/balticdryindex/"
+    "balticdryindex/gh-pages/data/latest.json"
+)
+
+# Maps internal GRID series_id -> legacy FRED code + public snapshot key.
 BALTIC_SERIES: dict[str, dict[str, str]] = {
     "baltic.bdi": {
         "fred_id": "DBDI",
+        "public_key": "bdi",
         "description": "Baltic Dry Index — composite shipping cost benchmark",
     },
     "baltic.capesize": {
         "fred_id": "BCPI",
+        "public_key": "bci",
         "description": "Baltic Capesize Index — large bulk carriers (100K+ DWT)",
     },
     "baltic.panamax": {
         "fred_id": "BPTI",
+        "public_key": "bpi",
         "description": "Baltic Panamax Index — mid-size bulk carriers (60-80K DWT)",
     },
     "baltic.supramax": {
         "fred_id": "BSI",
+        "public_key": "bsi",
         "description": "Baltic Supramax Index — handymax bulk carriers (45-60K DWT)",
+    },
+    "baltic.handysize": {
+        "fred_id": "BHSI",
+        "public_key": "bhsi",
+        "description": "Baltic Handysize Index — smaller bulk carriers",
     },
 }
 
 # Minimum delay between FRED API calls (seconds)
 _RATE_LIMIT_DELAY: float = 0.25
+_HTTP_TIMEOUT_SECONDS: float = 15.0
+
+
+def _coerce_date(value: str | date | None) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value)[:10])
+
+
+def _date_in_requested_range(
+    obs_date: date,
+    start_date: str | date,
+    end_date: str | date | None,
+) -> bool:
+    start = _coerce_date(start_date)
+    end = _coerce_date(end_date)
+    if start is not None and obs_date < start:
+        return False
+    if end is not None and obs_date > end:
+        return False
+    return True
+
+
+def _fred_series_is_known_dead(exc: BaseException) -> bool:
+    """Return True for FRED responses saying a legacy Baltic ID no longer exists."""
+    parts: list[str] = []
+    seen: set[int] = set()
+    queue: list[Any] = [exc]
+    while queue:
+        cur = queue.pop()
+        if id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        parts.append(str(cur))
+
+        response = getattr(cur, "response", None)
+        if response is not None:
+            parts.append(str(getattr(response, "text", "") or ""))
+
+        for attr in ("__cause__", "__context__"):
+            inner = getattr(cur, attr, None)
+            if inner is not None:
+                queue.append(inner)
+
+        last_attempt = getattr(cur, "last_attempt", None)
+        exception_fn = getattr(last_attempt, "exception", None)
+        if callable(exception_fn):
+            try:
+                inner_exc = exception_fn()
+            except Exception:
+                inner_exc = None
+            if inner_exc is not None:
+                queue.append(inner_exc)
+
+    text_blob = " ".join(part.lower() for part in parts if part)
+    return "series does not exist" in text_blob
+
+
+def _parse_public_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate and normalize the public Baltic latest.json snapshot."""
+    obs_date = _coerce_date(payload.get("date"))
+    if obs_date is None:
+        raise ValueError("Baltic public snapshot missing date")
+
+    values: dict[str, dict[str, Any]] = {}
+    for meta in BALTIC_SERIES.values():
+        public_key = meta["public_key"]
+        raw_entry = payload.get(public_key)
+        if not isinstance(raw_entry, dict):
+            continue
+        raw_value = raw_entry.get("value")
+        if raw_value is None:
+            continue
+        values[public_key] = {
+            "value": float(raw_value),
+            "prev": raw_entry.get("prev"),
+            "change": raw_entry.get("change"),
+            "pct": raw_entry.get("pct"),
+        }
+
+    if not values:
+        raise ValueError("Baltic public snapshot contained no usable index values")
+
+    return {
+        "date": obs_date,
+        "updated": payload.get("updated"),
+        "source": payload.get("source") or "Baltic Exchange",
+        "values": values,
+        "stats": payload.get("stats") if isinstance(payload.get("stats"), dict) else {},
+    }
+
+
+def _fetch_public_snapshot() -> dict[str, Any]:
+    response = requests.get(
+        BALTIC_PUBLIC_SNAPSHOT_URL,
+        timeout=_HTTP_TIMEOUT_SECONDS,
+        headers={"User-Agent": "GRID/1.0"},
+    )
+    response.raise_for_status()
+    return _parse_public_snapshot(response.json())
 
 
 class BalticDryPuller(BasePuller):
@@ -81,6 +197,7 @@ class BalticDryPuller(BasePuller):
             db_engine: SQLAlchemy engine connected to the GRID database.
         """
         self.fred = FredAPI(api_key)
+        self._public_snapshot_cache: dict[str, Any] | None = None
         super().__init__(db_engine)
         log.info("BalticDryPuller initialised — source_id={sid}", sid=self.source_id)
 
@@ -109,7 +226,8 @@ class BalticDryPuller(BasePuller):
                 "errors": [f"Unknown series: {grid_series_id}"],
             }
 
-        fred_id = BALTIC_SERIES[grid_series_id]["fred_id"]
+        series_meta = BALTIC_SERIES[grid_series_id]
+        fred_id = series_meta["fred_id"]
         log.info(
             "Pulling {gsid} (FRED {fid}) from {sd}",
             gsid=grid_series_id,
@@ -164,50 +282,24 @@ class BalticDryPuller(BasePuller):
                 )
             data = data.dropna(subset=["value"])
 
-            inserted = 0
+            observations = []
+            for _, row in data.iterrows():
+                obs_date_val = (
+                    row["date"].date()
+                    if hasattr(row["date"], "date") and callable(row["date"].date)
+                    else pd.Timestamp(row["date"]).date()
+                )
+                observations.append({
+                    "obs_date": obs_date_val,
+                    "value": float(row["value"]),
+                    "payload": {
+                        "fred_series": fred_id,
+                        "source": "Baltic_Exchange_via_FRED",
+                        "provider": "fred_legacy",
+                    },
+                })
 
-            with self.engine.begin() as conn:
-                # Batch dedup: one query instead of per-row checks
-                existing_dates = self._get_existing_dates(grid_series_id, conn)
-                skipped = 0
-
-                for _, row in data.iterrows():
-                    obs_date_val = (
-                        row["date"].date()
-                        if hasattr(row["date"], "date") and callable(row["date"].date)
-                        else pd.Timestamp(row["date"]).date()
-                    )
-                    if obs_date_val in existing_dates:
-                        skipped += 1
-                        continue
-
-                    conn.execute(
-                        text(
-                            "INSERT INTO raw_series "
-                            "(series_id, source_id, obs_date, value, "
-                            "raw_payload, pull_status) "
-                            "VALUES (:sid, :src, :od, :val, :payload, 'SUCCESS')"
-                        ),
-                        {
-                            "sid": grid_series_id,
-                            "src": self.source_id,
-                            "od": obs_date_val,
-                            "val": float(row["value"]),
-                            "payload": json.dumps({
-                                "fred_series": fred_id,
-                                "source": "Baltic_Exchange_via_FRED",
-                            }),
-                        },
-                    )
-                    inserted += 1
-
-                if skipped:
-                    log.debug(
-                        "{gsid}: skipped {n} existing rows",
-                        gsid=grid_series_id,
-                        n=skipped,
-                    )
-
+            inserted = self._insert_observations(grid_series_id, observations)
             result["rows_inserted"] = inserted
             log.info(
                 "{gsid}: inserted {n} rows",
@@ -216,6 +308,18 @@ class BalticDryPuller(BasePuller):
             )
 
         except Exception as exc:
+            if _fred_series_is_known_dead(exc):
+                log.warning(
+                    "Legacy FRED Baltic series {fid} is unavailable; using public snapshot fallback",
+                    fid=fred_id,
+                )
+                return self._pull_public_snapshot_series(
+                    grid_series_id,
+                    start_date=start_date,
+                    end_date=end_date,
+                    fred_error=str(exc),
+                )
+
             log.error(
                 "Baltic pull failed for {gsid} (FRED {fid}): {err}",
                 gsid=grid_series_id,
@@ -252,6 +356,121 @@ class BalticDryPuller(BasePuller):
         # Rate limiting between FRED API calls
         time.sleep(_RATE_LIMIT_DELAY)
         return result
+
+    def _pull_public_snapshot_series(
+        self,
+        grid_series_id: str,
+        start_date: str | date = "2000-01-01",
+        end_date: str | date | None = None,
+        fred_error: str | None = None,
+    ) -> dict[str, Any]:
+        """Fetch one current Baltic value from the public snapshot fallback."""
+        result: dict[str, Any] = {
+            "series_id": grid_series_id,
+            "rows_inserted": 0,
+            "status": "SUCCESS",
+            "errors": [],
+            "source": "public_snapshot",
+        }
+        try:
+            snapshot = self._get_public_snapshot()
+            obs_date = snapshot["date"]
+            if not _date_in_requested_range(obs_date, start_date, end_date):
+                result["status"] = "PARTIAL"
+                result["errors"].append(
+                    f"Public snapshot date {obs_date} outside requested range"
+                )
+                return result
+
+            public_key = BALTIC_SERIES[grid_series_id]["public_key"]
+            value_info = snapshot["values"].get(public_key)
+            if not value_info:
+                result["status"] = "PARTIAL"
+                result["errors"].append(
+                    f"Public snapshot missing key {public_key!r}"
+                )
+                return result
+
+            payload = {
+                "source": "Baltic_Exchange_public_snapshot",
+                "provider": "balticdryindex_github_latest",
+                "upstream_url": BALTIC_PUBLIC_SNAPSHOT_URL,
+                "snapshot_source": snapshot.get("source"),
+                "snapshot_updated": snapshot.get("updated"),
+                "index_key": public_key,
+                "prev": value_info.get("prev"),
+                "change": value_info.get("change"),
+                "pct": value_info.get("pct"),
+            }
+            if fred_error:
+                payload["legacy_fred_error"] = fred_error[:500]
+
+            inserted = self._insert_observations(
+                grid_series_id,
+                [{
+                    "obs_date": obs_date,
+                    "value": value_info["value"],
+                    "payload": payload,
+                }],
+            )
+            result["rows_inserted"] = inserted
+            return result
+        except Exception as exc:
+            log.error(
+                "Baltic public snapshot fallback failed for {gsid}: {err}",
+                gsid=grid_series_id,
+                err=str(exc),
+            )
+            result["status"] = "FAILED"
+            result["errors"].append(str(exc))
+            return result
+
+    def _get_public_snapshot(self) -> dict[str, Any]:
+        if self._public_snapshot_cache is None:
+            self._public_snapshot_cache = _fetch_public_snapshot()
+        return self._public_snapshot_cache
+
+    def _insert_observations(
+        self,
+        grid_series_id: str,
+        observations: list[dict[str, Any]],
+    ) -> int:
+        inserted = 0
+        with self.engine.begin() as conn:
+            # Batch dedup: one query instead of per-row checks
+            existing_dates = self._get_existing_dates(grid_series_id, conn)
+            skipped = 0
+
+            for row in observations:
+                obs_date_val = row["obs_date"]
+                if obs_date_val in existing_dates:
+                    skipped += 1
+                    continue
+
+                conn.execute(
+                    text(
+                        "INSERT INTO raw_series "
+                        "(series_id, source_id, obs_date, value, "
+                        "raw_payload, pull_status) "
+                        "VALUES (:sid, :src, :od, :val, :payload, 'SUCCESS')"
+                    ),
+                    {
+                        "sid": grid_series_id,
+                        "src": self.source_id,
+                        "od": obs_date_val,
+                        "val": float(row["value"]),
+                        "payload": json.dumps(row["payload"], default=str),
+                    },
+                )
+                inserted += 1
+
+            if skipped:
+                log.debug(
+                    "{gsid}: skipped {n} existing rows",
+                    gsid=grid_series_id,
+                    n=skipped,
+                )
+        return inserted
 
     def pull_all(
         self,
