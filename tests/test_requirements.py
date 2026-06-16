@@ -2,6 +2,7 @@ from pathlib import Path
 
 
 REQUIREMENTS_PATH = Path(__file__).resolve().parents[1] / "requirements.txt"
+REQUIREMENTS_API_PATH = Path(__file__).resolve().parents[1] / "requirements-api.txt"
 
 
 def _read_non_comment_lines(path: Path) -> list[str]:
@@ -10,6 +11,14 @@ def _read_non_comment_lines(path: Path) -> list[str]:
         for line in path.read_text().splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     ]
+
+
+def _requirement_line(path: Path, package: str) -> str:
+    prefix = f"{package.lower()}"
+    for line in _read_non_comment_lines(path):
+        if line.lower().startswith(prefix):
+            return line
+    raise AssertionError(f"{package} missing from {path.name}")
 
 
 def test_base_requirements_do_not_mix_edgar_and_patent_client() -> None:
@@ -23,3 +32,13 @@ def test_base_requirements_do_not_mix_edgar_and_patent_client() -> None:
         "Base requirements must not include patent-client while edgartools is present. "
         "These packages require incompatible hishel versions."
     )
+
+
+def test_fastapi_upper_bound_blocks_unreviewed_route_introspection_drift() -> None:
+    for path in (REQUIREMENTS_PATH, REQUIREMENTS_API_PATH):
+        fastapi_req = _requirement_line(path, "fastapi")
+
+        assert "<0.137.0" in fastapi_req, (
+            f"{path.name} must keep FastAPI below 0.137 until route "
+            "introspection is modernized for the new router behavior."
+        )

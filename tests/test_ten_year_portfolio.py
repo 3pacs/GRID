@@ -1,44 +1,74 @@
 from __future__ import annotations
 
+import threading
 from datetime import date, timedelta
 
 from strategy.ten_year_portfolio import (
+    FRONTIER_RAW_HISTORY_TICKERS,
     FRONTIER_THEME_CANDIDATES,
     build_weekly_recommendation,
     compute_chart_metrics,
     parse_yf_series_id,
 )
-from api.routers.ten_year_portfolio import _load_price_history
+from api.routers.ten_year_portfolio import (
+    _RESOLVED_TICKER_TO_FEATURE,
+    _load_price_history,
+)
 
 
-class _FakeConnection:
-    def __init__(self):
-        self.sql = ""
-        self.params = {}
-        self.calls = []
+class _FakeCursor:
+    """Records executed SQL + positional params; returns no rows.
 
-    def __enter__(self):
-        return self
+    Shared across the two psycopg2 connections the loader opens (one per
+    fetch thread), so a lock guards the recorder list.
+    """
 
-    def __exit__(self, *_):
-        return False
+    def __init__(self, recorder: list, lock: threading.Lock):
+        self._recorder = recorder
+        self._lock = lock
 
-    def execute(self, sql, params):
-        self.sql = str(sql)
-        self.params = params
-        self.calls.append((str(sql), params))
-        return self
+    def execute(self, sql, params=None):
+        with self._lock:
+            self._recorder.append((str(sql), params))
 
     def fetchall(self):
         return []
 
+    def close(self):
+        pass
+
+
+class _FakePgConnection:
+    """Stand-in for the psycopg2 connection used by the threaded fetchers."""
+
+    def __init__(self, recorder: list, lock: threading.Lock):
+        self._recorder = recorder
+        self._lock = lock
+
+    def cursor(self):
+        return _FakeCursor(self._recorder, self._lock)
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class _FakeURL:
+    def render_as_string(self, hide_password: bool = False) -> str:
+        return "postgresql://grid:testpass@localhost:5432/griddb_test"
+
 
 class _FakeEngine:
-    def __init__(self):
-        self.connection = _FakeConnection()
+    """Minimal SQLAlchemy Engine stand-in exposing only ``.url``.
 
-    def connect(self):
-        return self.connection
+    The loader derives a DSN via ``engine.url.render_as_string`` and then
+    opens its own psycopg2 connections, so the engine needs nothing else.
+    """
+
+    def __init__(self):
+        self.url = _FakeURL()
 
 
 def _weekly_growth(start: date, weeks: int, first: float, weekly_rate: float):
@@ -66,22 +96,47 @@ def test_parse_yf_series_id_accepts_close_fields_only():
     assert parse_yf_series_id("YF:AAPL:volume") is None
 
 
-def test_price_history_loader_uses_core_yahoo_adjusted_close_universe():
-    engine = _FakeEngine()
+def test_price_history_loader_uses_core_yahoo_adjusted_close_universe(monkeypatch):
+    executed: list[tuple[str, object]] = []
+    lock = threading.Lock()
 
-    result = _load_price_history(engine, years=10)
+    def _fake_connect(dsn):
+        assert dsn == "postgresql://grid:testpass@localhost:5432/griddb_test"
+        return _FakePgConnection(executed, lock)
 
+    monkeypatch.setattr(
+        "api.routers.ten_year_portfolio.psycopg2.connect", _fake_connect
+    )
+
+    result = _load_price_history(_FakeEngine(), years=10)
+
+    # No rows from either query -> empty history.
     assert result == {}
-    raw_sql, raw_params = engine.connection.calls[0]
-    resolved_sql, resolved_params = engine.connection.calls[1]
-    assert "FROM raw_series" in raw_sql
-    assert "series_id IN" in raw_sql
-    assert "YF:AAPL:adj_close" in raw_params["series_ids"]
-    assert "YF:QQQ:adj_close" in raw_params["series_ids"]
-    assert "YF:CCJ:adj_close" in raw_params["series_ids"]
-    assert "YF:HPE:adj_close" in raw_params["series_ids"]
-    assert "JOIN resolved_series rs" in resolved_sql
-    assert "tsm_full" in resolved_params["feature_names"]
+
+    # Both analytical queries ran (the SET statement_timeout calls carry no
+    # params and are ignored here).
+    resolved = next((c for c in executed if "resolved_series" in c[0]), None)
+    raw = next((c for c in executed if "FROM raw_series" in c[0]), None)
+    assert resolved is not None, "resolved_series query was not issued"
+    assert raw is not None, "raw_series query was not issued"
+
+    resolved_features, resolved_lookback = resolved[1]
+    raw_series_ids, raw_lookback = raw[1]
+
+    # raw_series covers exactly the frontier raw-history tickers; the resolved
+    # universe covers the deduped <ticker>_full features (AAPL/QQQ live there,
+    # NOT in raw_series).
+    assert set(raw_series_ids) == {
+        f"YF:{t}:adj_close" for t in FRONTIER_RAW_HISTORY_TICKERS
+    }
+    assert set(_RESOLVED_TICKER_TO_FEATURE.values()).issubset(set(resolved_features))
+    assert "aapl_full" in resolved_features
+    assert "qqq_full" in resolved_features
+
+    # years=10 -> lookback_days = max(365, int(10 * 365.25) + 45) = 3697,
+    # passed to both queries.
+    assert resolved_lookback == 3697
+    assert raw_lookback == 3697
 
 
 def test_chart_metrics_reward_smooth_up_right_relative_to_qqq():

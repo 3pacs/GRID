@@ -105,6 +105,93 @@ class TestValidTypes:
         assert len(_VALID_TYPES) == 5
 
 
+# ── Pagination envelope (no DB needed) ────────────────────────────────────
+
+class TestPaginationEnvelope:
+    """Verify the response shape carries limit/offset/has_more per
+    `.claude/rules/security.md` list-endpoint contract (canonical pattern in
+    `api/routers/journal.py:77`)."""
+
+    @staticmethod
+    def _patched_engine(*, total: int, rows: list | None = None):
+        """Mock the engine.connect() context manager for both the count and
+        results queries. `count_sql` runs first via .fetchone(); the results
+        query (only reached when total > 0) returns `rows or []`."""
+        from unittest.mock import MagicMock
+
+        conn = MagicMock()
+        count_result = MagicMock()
+        count_result.fetchone.return_value = (total,)
+        rows_result = MagicMock()
+        rows_result.fetchall.return_value = rows or []
+        # First execute() is the count, second is the search.
+        conn.execute.side_effect = [count_result, rows_result]
+        engine = MagicMock()
+        engine.connect.return_value.__enter__.return_value = conn
+        engine.connect.return_value.__exit__.return_value = False
+        return engine
+
+    def test_empty_result_envelope_includes_pagination_fields(self, monkeypatch):
+        from api.routers import intelligence_search as mod
+
+        monkeypatch.setattr(
+            mod, "get_db_engine", lambda: self._patched_engine(total=0)
+        )
+
+        result = mod.search_intelligence(q="nothingmatches", types=None, limit=25, offset=10, _user={})
+
+        assert result["results"] == []
+        assert result["total"] == 0
+        assert result["limit"] == 25
+        assert result["offset"] == 10
+        assert result["has_more"] is False
+        assert result["query"] == "nothingmatches"
+
+    def test_paginated_response_has_more_true_when_more_pages_exist(self, monkeypatch):
+        from api.routers import intelligence_search as mod
+
+        # 1 page of results, but total=100 so has_more must be True for offset=0/limit=10.
+        fake_rows = [
+            MockRow(source_type="actor", source_id="a1", title="A", snippet="s", relevance=0.5),
+        ]
+        monkeypatch.setattr(
+            mod, "get_db_engine", lambda: self._patched_engine(total=100, rows=fake_rows)
+        )
+
+        result = mod.search_intelligence(q="x", types=None, limit=10, offset=0, _user={})
+
+        assert result["total"] == 100
+        assert result["limit"] == 10
+        assert result["offset"] == 0
+        assert result["has_more"] is True
+        assert len(result["results"]) == 1
+
+    def test_has_more_false_on_last_page(self, monkeypatch):
+        from api.routers import intelligence_search as mod
+
+        # total=20, offset=10, limit=10 → (10+10) < 20 is False, last page.
+        fake_rows = [
+            MockRow(source_type="signal", source_id="s1", title="t", snippet="s", relevance=0.1),
+        ]
+        monkeypatch.setattr(
+            mod, "get_db_engine", lambda: self._patched_engine(total=20, rows=fake_rows)
+        )
+
+        result = mod.search_intelligence(q="x", types=None, limit=10, offset=10, _user={})
+
+        assert result["total"] == 20
+        assert result["has_more"] is False
+
+
+class MockRow:
+    """Tiny row stand-in matching the attribute access pattern in
+    `search_intelligence` (`row.source_type`, etc.)."""
+
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
 # ── Database integration tests (require PostgreSQL) ──────────────────────
 
 class TestFTSSearch:

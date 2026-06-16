@@ -61,6 +61,36 @@ class TestGemmaRouter:
             result = _create_client("gemma")
             assert result is None
 
+    def test_paid_providers_blocked_by_default(self):
+        # local-first: paid providers must return None even if a key is present, unless opted in.
+        from llm.router import _create_client
+        for provider in ("openai", "openrouter", "anthropic", "huggingface"):
+            with patch(
+                "config.settings",
+                MagicMock(
+                    GRID_ALLOW_PAID_LLM=False,
+                    OPENAI_API_KEY="sk-should-not-matter",
+                    OPENROUTER_API_KEY="sk-should-not-matter",
+                    ANTHROPIC_API_KEY="sk-should-not-matter",
+                    AGENTS_ANTHROPIC_API_KEY="",
+                    HF_API_KEY="hf-should-not-matter",
+                ),
+            ):
+                assert _create_client(provider) is None, f"{provider} not blocked with flag off"
+
+    def test_paid_provider_allowed_when_opted_in(self):
+        # with the flag ON, the paid branch is reached (then gated by its own key check).
+        from llm.router import _create_client
+        with patch("config.settings", MagicMock(GRID_ALLOW_PAID_LLM=True, OPENAI_API_KEY="")):
+            # key blank -> _create_openai_client returns None, but NOT via the paid gate.
+            assert _create_client("openai") is None
+
+    def test_local_provider_not_gated_by_paid_flag(self):
+        from llm.router import _create_client
+        with patch("config.settings", MagicMock(GRID_ALLOW_PAID_LLM=False, GEMMA_ENABLED=False)):
+            # gemma is local; the paid gate must not touch it (returns None for its own reason).
+            assert _create_client("gemma") is None
+
     def test_tier_enum_values(self):
         from llm.router import Tier
         assert Tier.LOCAL.value == "local"

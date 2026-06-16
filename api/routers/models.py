@@ -68,6 +68,7 @@ def get_all(
         "total": total,
         "limit": limit,
         "offset": offset,
+        "has_more": (offset + limit) < total,
     }
 
 
