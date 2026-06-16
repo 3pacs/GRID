@@ -292,8 +292,11 @@ async def weekly_ten_year_portfolio(
             }
         return result
     except Exception as exc:
+        # Log full detail server-side; return a generic message to the client
+        # so internal SQL / DSN / stacktrace fragments don't leak into the
+        # response body (see .claude/rules/common/security.md).
         log.warning("Ten-year portfolio query failed: {e}", e=str(exc))
-        return {"status": "error", "error": str(exc)}
+        return {"status": "error", "error": "Ten-year portfolio query failed."}
 
 
 @router.post("/workbook/analyze")
@@ -326,55 +329,61 @@ async def export_current_model_workbook(
     engine: Engine = Depends(get_db_engine),
 ) -> Response:
     """Export the current sanitized model portfolio and candidate boards as Excel."""
-    history = _load_price_history(engine, years=years)
-    recommendation = build_weekly_recommendation(history, capital=capital, years=years)
-    plan = {
-        "status": "ok",
-        "generated_at": recommendation.get("as_of"),
-        "file_type": "grid-model",
-        "privacy": {
-            "status": "sanitized",
-            "raw_holdings_returned": False,
-            "raw_account_values_returned": False,
-            "raw_sheet_names_returned": False,
-            "policy": "Export contains only GRID model allocations and candidate boards.",
-        },
-        "workbook_summary": {
-            "method_signals": [
-                {"label": "Long Term Chart", "strength": 1},
-                {"label": "Relative Strength", "strength": 1},
-                {"label": "Risk", "strength": 1},
-                {"label": "Portfolio Rules", "strength": 1},
-            ],
-            "formula_functions": [],
-        },
-        "master_plan": {
-            "objective": "Run the preloaded $1M 10-year GRID plan and review candidate boards weekly.",
-            "steps": [
-                {"step": "Run weekly query", "action": "Refresh Dad Chartist and Frontier Infrastructure boards."},
-                {"step": "Review Monte Carlo", "action": "Use p10/p50/p90 ranges as risk context, not a guarantee."},
-                {"step": "Export packet", "action": "Save this workbook for weekly review."},
-            ],
-        },
-        "candidate_boards": [
-            {
-                "id": board.get("id"),
-                "label": board.get("label"),
-                "top_candidates": [
-                    {
-                        "ticker": row.get("ticker"),
-                        "score": row.get("score"),
-                        "themes": row.get("themes", []),
-                        "years": row.get("years"),
-                    }
-                    for row in board.get("ranked", [])[:25]
+    try:
+        history = _load_price_history(engine, years=years)
+        recommendation = build_weekly_recommendation(history, capital=capital, years=years)
+        plan = {
+            "status": "ok",
+            "generated_at": recommendation.get("as_of"),
+            "file_type": "grid-model",
+            "privacy": {
+                "status": "sanitized",
+                "raw_holdings_returned": False,
+                "raw_account_values_returned": False,
+                "raw_sheet_names_returned": False,
+                "policy": "Export contains only GRID model allocations and candidate boards.",
+            },
+            "workbook_summary": {
+                "method_signals": [
+                    {"label": "Long Term Chart", "strength": 1},
+                    {"label": "Relative Strength", "strength": 1},
+                    {"label": "Risk", "strength": 1},
+                    {"label": "Portfolio Rules", "strength": 1},
                 ],
-            }
-            for board in recommendation.get("candidate_boards", [])
-        ],
-    }
-    content = build_plan_export_workbook(plan, recommendation)
-    return _excel_response(content, "grid-10-year-master-plan.xlsx")
+                "formula_functions": [],
+            },
+            "master_plan": {
+                "objective": "Run the preloaded $1M 10-year GRID plan and review candidate boards weekly.",
+                "steps": [
+                    {"step": "Run weekly query", "action": "Refresh Dad Chartist and Frontier Infrastructure boards."},
+                    {"step": "Review Monte Carlo", "action": "Use p10/p50/p90 ranges as risk context, not a guarantee."},
+                    {"step": "Export packet", "action": "Save this workbook for weekly review."},
+                ],
+            },
+            "candidate_boards": [
+                {
+                    "id": board.get("id"),
+                    "label": board.get("label"),
+                    "top_candidates": [
+                        {
+                            "ticker": row.get("ticker"),
+                            "score": row.get("score"),
+                            "themes": row.get("themes", []),
+                            "years": row.get("years"),
+                        }
+                        for row in board.get("ranked", [])[:25]
+                    ],
+                }
+                for board in recommendation.get("candidate_boards", [])
+            ],
+        }
+        content = build_plan_export_workbook(plan, recommendation)
+        return _excel_response(content, "grid-10-year-master-plan.xlsx")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.warning("Ten-year portfolio export failed: {e}", e=str(exc))
+        raise HTTPException(status_code=500, detail="Workbook export failed.") from exc
 
 
 @router.post("/workbook/export.xlsx")

@@ -147,3 +147,70 @@ class TestRunnerSingleModelParsing:
 
         result = AgentRunner._parse_single_model_response("")
         assert result["action"] == "HOLD"
+
+
+# ---------------------------------------------------------------------------
+# runner single-model analysis — Hermes bridge redirect
+# ---------------------------------------------------------------------------
+
+class TestRunnerSingleModelAnalysis:
+    """The analyst path routes through HermesAgent with a LOCAL-pinned fallback."""
+
+    @staticmethod
+    def _runner():
+        from agents.runner import AgentRunner
+
+        # Bypass __init__ (and its GRIDContext/DB wiring) — the method under
+        # test only needs the static response parser.
+        return object.__new__(AgentRunner)
+
+    def test_routes_through_hermes_and_parses_decision(self):
+        from datetime import date
+
+        structured = (
+            "DECISION: BUY\nCONFIDENCE: HIGH\n\n"
+            "FUNDAMENTAL ANALYSIS:\nGrowth indicators strong.\n\n"
+            "RISK ASSESSMENT:\nRate path uncertain.\n\n"
+            "REASONING:\nGrowth regime supports equity exposure."
+        )
+
+        class _Analysis:
+            ok = True
+            text = structured
+            source = "hermes"
+            model = "gpt-4o"
+
+        with patch("intelligence.hermes.HermesAgent") as MockAgent:
+            MockAgent.return_value.analyze.return_value = _Analysis()
+            out = self._runner()._run_single_model_analysis(
+                "SPY", date(2026, 6, 5), "regime: GROWTH (HIGH confidence)"
+            )
+
+        assert out["action"] == "BUY"
+        assert "Growth indicators" in out["analyst_reports"]["fundamental"]
+
+        # Fallback tier pinned to LOCAL so behavior is unchanged until a key is
+        # configured; the analyst system prompt + budget are passed through.
+        cfg = MockAgent.call_args.args[0]
+        assert cfg.fallback_tier == "local"
+        _, kwargs = MockAgent.return_value.analyze.call_args
+        assert kwargs["system"].startswith("You are a senior macro trading analyst")
+        assert kwargs["max_completion_tokens"] == 1500
+
+    def test_returns_hold_when_no_backend(self):
+        from datetime import date
+
+        class _Analysis:
+            ok = False
+            text = None
+            source = "unavailable"
+            model = None
+
+        with patch("intelligence.hermes.HermesAgent") as MockAgent:
+            MockAgent.return_value.analyze.return_value = _Analysis()
+            out = self._runner()._run_single_model_analysis(
+                "SPY", date(2026, 6, 5), "ctx"
+            )
+
+        assert out["action"] == "HOLD"
+        assert out["analyst_reports"]["note"] == "LLM unavailable"

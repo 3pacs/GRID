@@ -1,3 +1,8 @@
+---
+name: trading-pipeline
+description: End-to-end GRID trading pipeline from alpha signals to live execution. Use when setting up trading strategies, debugging paper-trading P&L, moving from paper to live (Hyperliquid), understanding regime-to-allocation mapping, or configuring risk controls and kill switches.
+---
+
 # trading-pipeline
 
 End-to-end trading pipeline from alpha signals to live execution. Covers paper trading, live Hyperliquid integration, position sizing, risk controls, and the proof chain to live money.

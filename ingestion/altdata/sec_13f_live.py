@@ -64,6 +64,25 @@ _EDGAR_HEADERS: dict[str, str] = {
 _REQUEST_TIMEOUT: int = 30
 _EDGAR_RATE_DELAY: float = 0.15
 
+# edgartools identity. The SEC requires a contact UA; edgartools enforces this
+# globally via set_identity(). We mirror the UA used for the raw-HTTP fallback
+# so both code paths present the same identity to EDGAR.
+_EDGAR_IDENTITY: str = os.environ.get(
+    "SEC_USER_AGENT", "GRID-Research research@grid.local"
+)
+_identity_set: bool = False
+
+
+def _ensure_identity() -> None:
+    """Set the edgartools global identity exactly once per process."""
+    global _identity_set
+    if _identity_set:
+        return
+    from edgar import set_identity
+
+    set_identity(_EDGAR_IDENTITY)
+    _identity_set = True
+
 # ── Filer universe ────────────────────────────────────────────────────────────
 # Curated set of ~35 high-signal 13F filers. CIKs are the canonical SEC
 # Central Index Keys. We keep a human-friendly short key for CLI
@@ -371,13 +390,116 @@ def find_latest_13f(cik: str) -> LatestFiling | None:
     return best
 
 
-def fetch_infotable(cik: str, filing: LatestFiling) -> list[dict[str, Any]]:
-    """Download and parse the infotable XML for a specific filing.
+def _infotable_df_to_positions(df: Any) -> list[dict[str, Any]]:
+    """Convert an edgartools 13F infotable DataFrame into position dicts.
 
-    Walks the filing's ``index.json`` directory listing to find the
-    structured positions XML. Many modern 13F filings use randomised
-    filenames (e.g. ``50240.xml``) rather than the canonical
-    ``informationtable.xml``, so we use a multi-step strategy:
+    edgartools returns one row per ``<infoTable>`` entry. Column names
+    differ across edgartools major versions (4.x emits lower-case
+    ``value``/``cusip``; 5.x emits ``Value``/``Cusip``), so we resolve
+    every column case-insensitively to stay version-tolerant.
+
+    Parameters:
+        df: A pandas DataFrame as produced by ``ThirteenF.infotable``.
+
+    Returns:
+        Position dicts matching :func:`parse_infotable_xml`'s output shape:
+        ``name_of_issuer``, ``cusip``, ``value`` (USD), ``shares``,
+        ``share_type``.
+    """
+    cols = {str(c).lower(): c for c in df.columns}
+
+    def pick(*names: str) -> str | None:
+        for n in names:
+            hit = cols.get(n.lower())
+            if hit is not None:
+                return hit
+        return None
+
+    issuer_c = pick("Issuer", "nameOfIssuer", "name_of_issuer")
+    cusip_c = pick("Cusip", "cusip")
+    value_c = pick("Value", "value")
+    shares_c = pick("SharesPrnAmount", "sshPrnamt", "shares")
+    type_c = pick("Type", "SharesPrnType", "sshPrnamtType", "share_type")
+
+    def as_int(val: Any) -> int | None:
+        try:
+            if val is None:
+                return None
+            return int(float(val))
+        except (ValueError, TypeError):
+            return None
+
+    positions: list[dict[str, Any]] = []
+    for record in df.to_dict("records"):
+        cusip = str(record.get(cusip_c) or "").strip().upper() if cusip_c else ""
+        issuer = str(record.get(issuer_c) or "").strip() if issuer_c else ""
+        if not cusip or not issuer:
+            continue
+        positions.append(
+            {
+                "name_of_issuer": issuer,
+                "cusip": cusip,
+                "value": as_int(record.get(value_c)) if value_c else None,
+                "shares": as_int(record.get(shares_c)) if shares_c else None,
+                "share_type": (
+                    str(record.get(type_c) or "").strip() if type_c else ""
+                ),
+            }
+        )
+    return positions
+
+
+def _fetch_infotable_edgartools(filing: LatestFiling) -> list[dict[str, Any]]:
+    """Parse a 13F infotable via edgartools.
+
+    Resolves the filing by accession number and reads the already-parsed
+    ``infotable`` DataFrame, replacing the manual ``index.json`` directory
+    walk and namespace-agnostic XML parsing of the raw path. Raises on any
+    failure so the caller can fall back to the raw path.
+    """
+    _ensure_identity()
+    from edgar import find
+
+    resolved = find(filing.accession)
+    thirteenf = resolved.obj() if hasattr(resolved, "obj") else resolved
+    table = getattr(thirteenf, "infotable", None)
+    if table is None or getattr(table, "empty", False):
+        return []
+    return _infotable_df_to_positions(table)
+
+
+def fetch_infotable(cik: str, filing: LatestFiling) -> list[dict[str, Any]]:
+    """Download and parse the infotable for a specific 13F filing.
+
+    Primary path uses edgartools, which resolves the filing and parses the
+    structured positions table for us. If edgartools is unavailable or
+    errors (e.g. an API change or transient resolution failure), we fall
+    back to the raw-HTTP path in :func:`_fetch_infotable_raw`, so a live
+    pull never loses data over a library hiccup.
+    """
+    try:
+        positions = _fetch_infotable_edgartools(filing)
+        if positions:
+            return positions
+        log.debug(
+            "edgartools returned no positions for {a}; trying raw path",
+            a=filing.accession,
+        )
+    except Exception as exc:
+        log.warning(
+            "edgartools 13F parse failed for {a}; falling back to raw XML: {e}",
+            a=filing.accession,
+            e=str(exc),
+        )
+    return _fetch_infotable_raw(cik, filing)
+
+
+def _fetch_infotable_raw(cik: str, filing: LatestFiling) -> list[dict[str, Any]]:
+    """Raw-HTTP fallback: walk ``index.json`` and parse the infotable XML.
+
+    Many modern 13F filings use randomised filenames (e.g. ``50240.xml``)
+    rather than the canonical ``informationtable.xml``, so we use a
+    multi-step strategy:
 
     1. Prefer files whose names contain ``infotable`` / ``information``.
     2. Otherwise probe any non-``primary_doc`` XML in the directory and

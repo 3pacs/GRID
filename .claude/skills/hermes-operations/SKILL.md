@@ -1,3 +1,8 @@
+---
+name: hermes-operations
+description: Operate the Hermes autonomous daemon — the 24/7 self-healing scheduler for all GRID background tasks. Use when adding scheduled tasks, debugging why a puller or pipeline step isn't running, understanding the Hermes cycle structure, or diagnosing stale data and failed cycles.
+---
+
 # hermes-operations
 
 Operating the Hermes autonomous daemon — the 24/7 self-healing system that runs all GRID background tasks. Covers the cycle structure, step scheduling, data gathering, and troubleshooting.
