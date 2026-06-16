@@ -1739,6 +1739,145 @@ def run_all_checks(
     return report
 
 
+def _summarize_checks(checks: list[CrossRefCheck]) -> dict[str, Any]:
+    """Build the same summary dict ``run_all_checks`` emits.
+
+    Pulled out so the stored-results fast path produces a byte-identical
+    summary shape without re-running any DB checks.
+    """
+    category_breakdown: dict[str, dict[str, int]] = {}
+    for c in checks:
+        if c.category not in category_breakdown:
+            category_breakdown[c.category] = {
+                "total": 0, "consistent": 0, "minor": 0, "major": 0, "contradiction": 0,
+            }
+        category_breakdown[c.category]["total"] += 1
+        if c.assessment == "consistent":
+            category_breakdown[c.category]["consistent"] += 1
+        elif c.assessment == "minor_divergence":
+            category_breakdown[c.category]["minor"] += 1
+        elif c.assessment == "major_divergence":
+            category_breakdown[c.category]["major"] += 1
+        elif c.assessment == "contradiction":
+            category_breakdown[c.category]["contradiction"] += 1
+
+    return {
+        "total_checks": len(checks),
+        "red_flag_count": sum(
+            1 for c in checks
+            if c.assessment in ("major_divergence", "contradiction")
+        ),
+        "consistent_count": sum(1 for c in checks if c.assessment == "consistent"),
+        "categories": category_breakdown,
+    }
+
+
+def load_recent_report(
+    engine: Engine,
+    max_age_seconds: float = 600.0,
+) -> LieDetectorReport | None:
+    """Reconstruct the most recent persisted report from the DB, or None.
+
+    ``run_all_checks`` persists every check to ``cross_reference_checks``
+    with a ``checked_at`` timestamp. This reads back the latest batch
+    (the rows sharing the newest ``checked_at``) and rebuilds a
+    ``LieDetectorReport`` *without* re-running any of the slow physical-
+    reality scans. It is the cheap fast path for the API endpoint: a
+    cold process / fresh worker can serve a recent precomputed result
+    instead of paying the full compute on first hit.
+
+    Returns ``None`` (caller should fall back to ``run_all_checks``) when:
+      * the table is empty,
+      * the freshest batch is older than ``max_age_seconds``,
+      * anything goes wrong (defensive — never break the live path).
+
+    The reconstructed report carries an empty ``narrative`` (the LLM
+    prose is not persisted), which matches the endpoint's default
+    ``fast=True`` / ``narrative_pending`` contract exactly.
+    """
+    if max_age_seconds <= 0:
+        return None
+    try:
+        ensure_tables(engine)
+        with engine.connect() as conn:
+            latest = conn.execute(
+                text("SELECT MAX(checked_at) FROM cross_reference_checks")
+            ).scalar()
+            if latest is None:
+                return None
+
+            # Freshness gate. On Postgres ``checked_at`` is TIMESTAMPTZ so
+            # MAX() returns a tz-aware datetime; some drivers (and SQLite
+            # in tests) hand back an ISO string. Coerce either to a
+            # tz-aware datetime, then compare in UTC.
+            now = datetime.now(timezone.utc)
+            if isinstance(latest, str):
+                latest_dt = datetime.fromisoformat(latest)
+            else:
+                latest_dt = latest
+            if getattr(latest_dt, "tzinfo", None) is None:
+                latest_dt = latest_dt.replace(tzinfo=timezone.utc)
+            age = (now - latest_dt).total_seconds()
+            if age > max_age_seconds:
+                log.debug(
+                    "cross_reference stored result stale ({a:.0f}s > {m:.0f}s)",
+                    a=age, m=max_age_seconds,
+                )
+                return None
+
+            rows = conn.execute(
+                text(
+                    "SELECT name, category, official_source, official_value, "
+                    "physical_source, physical_value, divergence_zscore, "
+                    "assessment, implication, confidence, checked_at "
+                    "FROM cross_reference_checks "
+                    "WHERE checked_at = :ts"
+                ),
+                {"ts": latest},
+            ).fetchall()
+    except Exception as exc:
+        log.warning("cross_reference.load_recent_report failed: {e}", e=str(exc))
+        return None
+
+    if not rows:
+        return None
+
+    checks: list[CrossRefCheck] = []
+    for r in rows:
+        checks.append(
+            CrossRefCheck(
+                name=r[0],
+                category=r[1],
+                official_source=r[2] or "",
+                official_value=float(r[3]) if r[3] is not None else 0.0,
+                physical_source=r[4] or "",
+                physical_value=float(r[5]) if r[5] is not None else 0.0,
+                # expected_relationship is not persisted; it is descriptive
+                # metadata, not consumed by the lie-detector frontend.
+                expected_relationship="",
+                actual_divergence=float(r[6]) if r[6] is not None else 0.0,
+                assessment=r[7] or "",
+                implication=r[8] or "",
+                confidence=float(r[9]) if r[9] is not None else 0.0,
+                checked_at=r[10].isoformat() if hasattr(r[10], "isoformat") else str(r[10]),
+            )
+        )
+
+    red_flags = [
+        c for c in checks
+        if c.assessment in ("major_divergence", "contradiction")
+    ]
+    return LieDetectorReport(
+        checks=checks,
+        red_flags=red_flags,
+        narrative="",  # not persisted — served lazily via /narrative
+        generated_at=(
+            latest.isoformat() if hasattr(latest, "isoformat") else str(latest)
+        ),
+        summary=_summarize_checks(checks),
+    )
+
+
 def get_historical_checks(
     engine: Engine,
     category: str | None = None,

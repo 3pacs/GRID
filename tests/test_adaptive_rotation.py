@@ -11,6 +11,7 @@ from alpha_research.strategies.adaptive_rotation import (
     PositionState,
     check_stops,
     detect_regime,
+    run_rotation,
     score_groups,
 )
 from alpha_research.heartbeat import HeartbeatAlert, format_alerts
@@ -165,3 +166,82 @@ class TestHeartbeat:
         warn_pos = formatted.index("WARNING")
         info_pos = formatted.index("INFO")
         assert crit_pos < warn_pos < info_pos
+
+
+# ── run_rotation Determinism (regression for synthetic-random VIX bug) ────────
+
+
+class TestRunRotationDeterministicVix:
+    """run_rotation previously fabricated a 20-day VIX history via
+    np.random.normal(...) when only the current value was known — every call
+    produced a different vix_zscore and could flip the regime label.
+    """
+
+    def test_run_rotation_source_has_no_np_random(self):
+        import inspect
+        from alpha_research.strategies import adaptive_rotation
+
+        src = inspect.getsource(adaptive_rotation.run_rotation)
+        assert "np.random" not in src, (
+            "run_rotation must not call np.random — feeds non-deterministic "
+            "VIX history into detect_regime (P0, auditor 2026-06-07)."
+        )
+
+    def test_run_rotation_uses_pit_correct_vix_query(self, monkeypatch, multi_ticker_prices):
+        from alpha_research.strategies import adaptive_rotation
+
+        captured_vix_calls = []
+
+        def fake_get_vix_series(engine, start_date=None, end_date=None, as_of_date=None):
+            captured_vix_calls.append({
+                "start_date": start_date,
+                "end_date": end_date,
+                "as_of_date": as_of_date,
+            })
+            # Return deterministic 30-day VIX series
+            idx = pd.bdate_range(end=as_of_date, periods=30)
+            return pd.Series(np.linspace(18.0, 22.0, 30), index=idx, name="VIX")
+
+        def fake_build_price_panel(engine, tickers=None, start_date=None, end_date=None):
+            return multi_ticker_prices.loc[:pd.Timestamp(end_date)]
+
+        monkeypatch.setattr(adaptive_rotation, "get_vix_series", fake_get_vix_series)
+        monkeypatch.setattr(adaptive_rotation, "build_price_panel", fake_build_price_panel)
+
+        as_of = date(2025, 5, 1)
+        r1 = run_rotation(engine=object(), as_of_date=as_of)
+        r2 = run_rotation(engine=object(), as_of_date=as_of)
+
+        # Determinism: identical inputs -> identical regime.vix_zscore
+        assert r1.regime.vix_zscore == r2.regime.vix_zscore
+        # PIT contract: as_of_date is plumbed through
+        assert captured_vix_calls[0]["as_of_date"] == as_of
+        # No silent random fallback: vix_zscore is computed from the real series
+        assert r1.regime.vix_zscore != 0.0
+
+    def test_run_rotation_falls_back_safely_when_vix_unavailable(self, monkeypatch, multi_ticker_prices):
+        from alpha_research.strategies import adaptive_rotation
+
+        monkeypatch.setattr(
+            adaptive_rotation,
+            "get_vix_series",
+            lambda *a, **kw: pd.Series(dtype=float, name="VIX"),
+        )
+        monkeypatch.setattr(
+            adaptive_rotation,
+            "build_price_panel",
+            lambda *a, **kw: multi_ticker_prices,
+        )
+        # compute_vix_exposure_scalar is imported lazily inside run_rotation;
+        # patch its module so the lazy import resolves to our stub.
+        import alpha_research.signals.exposure_scaler as exposure_scaler
+
+        monkeypatch.setattr(
+            exposure_scaler,
+            "compute_vix_exposure_scalar",
+            lambda *a, **kw: {"vix": 21.5, "vix_ma": 20.0},
+        )
+
+        result = run_rotation(engine=object(), as_of_date=date(2025, 5, 1))
+        # With <20 obs, detect_regime returns vix_zscore=0 (deterministic).
+        assert result.regime.vix_zscore == 0.0

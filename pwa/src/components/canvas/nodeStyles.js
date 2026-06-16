@@ -118,6 +118,104 @@ export const edgeColorForLabel = (label) => {
     return '#3B82F6';
 };
 
+/** Neutral fallback for unknown/structural edges. */
+export const EDGE_DEFAULT_COLOR = '#64748B';
+
+/**
+ * Canonical relationship-type → color map for the Sigma canvas.
+ *
+ * Keyed by the discrete ``edge.type`` / ``relationship`` value emitted by the
+ * backend (``actor_connections.relationship``, ``_RELATIONSHIP_COLORS`` in
+ * ``api/routers/intelligence_actors.py``, and the intel-expand typed edges).
+ * Thickness still encodes strength — this map encodes *what kind* of tie it is.
+ *
+ * The four headline families requested by the spec:
+ *   competitor  → red    (#EF4444)
+ *   supplier    → blue   (#3B82F6)
+ *   investor    → green  (#22C55E)
+ *   government  → gold   (#EAB308)
+ * plus the remaining relationship types the backend already produces.
+ */
+export const EDGE_TYPE_COLORS = {
+    // ── Competitors (red) ──
+    competitor: '#EF4444',
+    industry_peer: '#3B82F6',
+    // ── Suppliers / supply chain (blue) ──
+    supplier: '#3B82F6',
+    supply_chain: '#3B82F6',
+    customer: '#60A5FA',
+    // ── Investors / capital (green) ──
+    investor: '#22C55E',
+    co_investor: '#22C55E',
+    co_investment: '#22C55E',
+    institutional_holding: '#2DD4BF',
+    business_partner: '#14B8A6',
+    wealth_management: '#6366F1',
+    // ── Government / political (gold) ──
+    government: '#EAB308',
+    committee: '#EAB308',
+    jurisdiction: '#EAB308',
+    gov_contract: '#10B981',
+    co_contractor: '#059669',
+    lobbying: '#A78BFA',
+    lobbying_influence: '#7C3AED',
+    foreign_lobbying: '#C084FC',
+    congressional_trade: '#EC4899',
+    congress_insider_overlap: '#F43F5E',
+    // ── Insider / officer (pink/violet) ──
+    insider_trade: '#F59E0B',
+    insider_cluster: '#FBBF24',
+    officer_of: '#8B5CF6',
+    co_traded_insider: '#FB923C',
+    co_traded_congress: '#F472B6',
+    // ── Causal / market mechanics ──
+    causation: '#F97316',
+    member_trade: '#EC4899',
+    // ── Structural / generic graph edges ──
+    signal_linked: '#06B6D4',
+    signal_link: '#1A6EBF',
+    flow: '#10B981',
+    co_traded: '#8B5CF6',
+    filing_related: '#64748B',
+    darkpool_activity: '#38BDF8',
+    connection: '#1A2332',
+};
+
+/**
+ * Get edge stroke color for a discrete relationship type.
+ *
+ * Tries the exact type first, then falls back to keyword matching on the
+ * (optional) human label, then to the neutral default. This keeps typed
+ * backend edges crisp while still colouring older label-only edges.
+ *
+ * @param {string} [type] discrete relationship/edge type
+ * @param {string} [label] human-readable edge label (fallback)
+ * @returns {string} hex color
+ */
+export const edgeColorForType = (type, label) => {
+    if (type && EDGE_TYPE_COLORS[type]) return EDGE_TYPE_COLORS[type];
+    if (label) {
+        for (const [re, color] of EDGE_RELATIONSHIP_COLORS) {
+            if (re.test(label)) return color;
+        }
+    }
+    return EDGE_DEFAULT_COLOR;
+};
+
+/**
+ * Legend entries for the canvas edge-color encoding.
+ * One row per headline relationship family (label + representative color).
+ */
+export const EDGE_LEGEND = [
+    { key: 'competitor', label: 'Competitor', color: EDGE_TYPE_COLORS.competitor },
+    { key: 'supplier', label: 'Supplier', color: EDGE_TYPE_COLORS.supplier },
+    { key: 'investor', label: 'Investor', color: EDGE_TYPE_COLORS.investor },
+    { key: 'government', label: 'Government', color: EDGE_TYPE_COLORS.government },
+    { key: 'causation', label: 'Causation', color: EDGE_TYPE_COLORS.causation },
+    { key: 'insider_trade', label: 'Insider', color: EDGE_TYPE_COLORS.insider_trade },
+    { key: 'connection', label: 'Other', color: EDGE_DEFAULT_COLOR },
+];
+
 /** Handle dot style with glow. */
 export const handleStyle = (color) => ({
     background: color,

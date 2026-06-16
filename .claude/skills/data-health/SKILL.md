@@ -1,3 +1,8 @@
+---
+name: data-health
+description: Monitor GRID data-source freshness, detect ingestion anomalies, and validate API-key availability across 37+ sources. Use on startup or after restarts, before running inference (verify critical data is fresh), when investigating unexpected model behavior that staleness could explain, or when adding/modifying ingestion sources.
+---
+
 # data-health
 
 Monitors GRID data source freshness, detects ingestion anomalies, and validates API key availability. Provides health dashboards for all 37+ data sources and flags stale data before it affects inference or trading decisions.

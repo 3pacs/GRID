@@ -1,3 +1,8 @@
+---
+name: alpha-validation
+description: Validate GRID predictions against the Prediction Causation Standard (levers vs conditions). Use before logging any prediction to the immutable journal, when reviewing model output quality, debugging why a backtest prediction failed, or running post-mortems on failed trades. Rejects predictions built on conditions alone.
+---
+
 # alpha-validation
 
 Validates GRID predictions against the Prediction Causation Standard (SOP). Ensures every prediction is mechanically sound, identifies the specific levers (actors + actions) that move markets, and rejects predictions built on conditions alone.

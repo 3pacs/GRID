@@ -46,6 +46,7 @@ describe('route registry', () => {
 
     it('surfaces only the core alpha views as top tabs', () => {
         expect(tabRoutes.map(route => route.id)).toEqual([
+            'ten-year',
             'surfacer',
             'dashboard',
             'money-flow',

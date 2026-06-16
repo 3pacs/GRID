@@ -1,0 +1,9 @@
+2026-05-27 05:02:01 | INFO     | config:<module>:593 — GitSink attached — errors land in .server-logs/errors.jsonl (push_enabled=False)
+2026-05-27 05:02:01 | INFO     | config:<module>:603 — GRID config loaded — environment=development, db=localhost:5432/griddb
+2026-05-27 05:02:01 | INFO     | db:get_engine:69 — Creating SQLAlchemy engine — postgresql://grid:***@localhost:5432/griddb
+2026-05-27 05:02:01 | INFO     | db:get_engine:117 — SQLAlchemy engine created — pool_size=20, max_overflow=30
+2026-05-27 05:02:03 | INFO     | __main__:_spawn_worker:116 — parallel_postmortem: spawning worker 0/5 on provider=llamacpp_z4 → outputs/postmortem-workers/worker-0-llamacpp_z4.log
+2026-05-27 05:02:03 | INFO     | __main__:_spawn_worker:116 — parallel_postmortem: spawning worker 1/5 on provider=ollama_panda → outputs/postmortem-workers/worker-1-ollama_panda.log
+2026-05-27 05:02:03 | INFO     | __main__:_spawn_worker:116 — parallel_postmortem: spawning worker 2/5 on provider=ollama_ocr → outputs/postmortem-workers/worker-2-ollama_ocr.log
+2026-05-27 05:02:03 | INFO     | __main__:_spawn_worker:116 — parallel_postmortem: spawning worker 3/5 on provider=ollama_koala → outputs/postmortem-workers/worker-3-ollama_koala.log
+2026-05-27 05:02:03 | INFO     | __main__:_spawn_worker:116 — parallel_postmortem: spawning worker 4/5 on provider=ollama_z400 → outputs/postmortem-workers/worker-4-ollama_z400.log

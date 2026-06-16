@@ -146,6 +146,7 @@ class TestGemmaMicroClient:
         assert payload["messages"][0]["role"] == "system"
         assert payload["messages"][0]["content"] == "You are a test assistant."
         assert payload["messages"][1]["role"] == "user"
+        assert payload["chat_template_kwargs"] == {"enable_thinking": False}
 
 
 # ---------------------------------------------------------------------------

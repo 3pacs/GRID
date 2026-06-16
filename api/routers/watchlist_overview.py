@@ -366,6 +366,96 @@ def get_ticker_overview(
     }
 
 
+@router.get("/{ticker}/quote")
+def get_ticker_quote(
+    ticker: str,
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Fast, LLM-free price/options snapshot for a single ticker.
+
+    Powers the stepdad.finance ticker_pulse widget. Pure DB reads + rule-based
+    sentiment so the home page populates instantly (the /overview narrative is
+    far too slow for a tile). Prefers the cached GRID price; only falls back to
+    a live fetch when nothing is stored.
+
+    Returns: ticker, price, change_pct, put_call_ratio, max_pain, iv_atm,
+    sentiment, source, as_of.
+    """
+    from datetime import date
+
+    _init_table()
+    engine = get_db_engine()
+    ticker_upper = ticker.strip().upper()
+    feature_names = _resolve_feature_names(ticker_upper)
+
+    price: float | None = None
+    change_pct: float | None = None
+    as_of: str | None = None
+    source = "grid"
+    put_call_ratio = max_pain = iv_atm = None
+
+    with engine.connect() as conn:
+        try:
+            row = conn.execute(text(
+                "SELECT rs.value, rs.obs_date FROM resolved_series rs "
+                "JOIN feature_registry fr ON fr.id = rs.feature_id "
+                "WHERE fr.name = ANY(:names) "
+                "ORDER BY rs.obs_date DESC LIMIT 1"
+            ), {"names": feature_names}).fetchone()
+            if row:
+                price = float(row[0])
+                as_of = str(row[1])
+        except Exception as exc:
+            log.debug("Quote: price query failed for {t}: {e}", t=ticker_upper, e=str(exc))
+
+        try:
+            opt = conn.execute(text(
+                "SELECT put_call_ratio, max_pain, iv_atm, signal_date "
+                "FROM options_daily_signals WHERE ticker = :ticker "
+                "ORDER BY signal_date DESC LIMIT 1"
+            ), {"ticker": ticker_upper}).fetchone()
+            if opt:
+                put_call_ratio, max_pain, iv_atm = opt[0], opt[1], opt[2]
+        except Exception as exc:
+            log.debug("Quote: options query failed for {t}: {e}", t=ticker_upper, e=str(exc))
+
+    # Live fallback only when nothing is stored (kept off the hot path).
+    if price is None:
+        try:
+            live = _fetch_live_price(ticker_upper)
+            if live:
+                price = live.get("price")
+                change_pct = live.get("pct_1d")
+                source = "live"
+                if price is not None:
+                    _cache_price_to_db(engine, ticker_upper, price, date.today())
+        except Exception as exc:
+            log.debug("Quote: live price failed for {t}: {e}", t=ticker_upper, e=str(exc))
+
+    # Rule-based sentiment from options positioning (same logic as /overview).
+    score = 0
+    if put_call_ratio is not None:
+        if put_call_ratio < 0.7:
+            score += 1
+        elif put_call_ratio > 1.3:
+            score -= 1
+    if iv_atm is not None and iv_atm > 0.4:
+        score -= 1
+    sentiment = "bullish" if score > 0 else "bearish" if score < 0 else "neutral"
+
+    return {
+        "ticker": ticker_upper,
+        "price": price,
+        "change_pct": change_pct,
+        "put_call_ratio": put_call_ratio,
+        "max_pain": max_pain,
+        "iv_atm": iv_atm,
+        "sentiment": sentiment,
+        "source": source,
+        "as_of": as_of,
+    }
+
+
 # ══════════════════════════════════════════════════════════════════
 # Insider Edge — aggregated intelligence for a single ticker
 # ══════════════════════════════════════════════════════════════════

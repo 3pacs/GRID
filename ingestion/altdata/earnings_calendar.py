@@ -20,12 +20,28 @@ import json
 from datetime import date, timedelta
 from typing import Any
 
-import yfinance as yf
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller
+
+
+class _UnavailableYFinance:
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    def Ticker(self, *_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError(
+            "yfinance is unavailable; install/update yfinance and its dependencies "
+            f"before running earnings calendar pulls ({self._error})"
+        )
+
+
+try:
+    import yfinance as yf
+except Exception as exc:  # yfinance can fail if optional websocket deps drift.
+    yf = _UnavailableYFinance(exc)
 
 
 # Surprise classification thresholds

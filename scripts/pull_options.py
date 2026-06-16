@@ -24,9 +24,11 @@ from loguru import logger as log
 
 try:
     import yfinance as yf
-except ImportError:
-    log.error("yfinance not installed: pip install yfinance")
-    sys.exit(1)
+except ImportError as exc:
+    yf = None
+    _YFINANCE_IMPORT_ERROR = exc
+else:
+    _YFINANCE_IMPORT_ERROR = None
 
 TICKERS = [
     "SPY", "QQQ", "IWM",  # Indices
@@ -40,6 +42,15 @@ TICKERS = [
 
 # Filter to tickers that actually have options
 EQUITY_TICKERS = [t for t in TICKERS if not t.endswith("-USD")]
+
+
+def _require_yfinance():
+    if yf is None:
+        raise RuntimeError(
+            "yfinance is unavailable; install/update yfinance and its dependencies "
+            f"before running the options puller ({_YFINANCE_IMPORT_ERROR})"
+        )
+    return yf
 
 
 def connect():
@@ -146,7 +157,8 @@ def compute_iv_skew(puts_df, spot_price):
 def pull_ticker(ticker, cur, src_id, today_str):
     """Pull options chain for a single ticker and compute signals."""
     try:
-        stock = yf.Ticker(ticker)
+        yfinance = _require_yfinance()
+        stock = yfinance.Ticker(ticker)
         spot_price = stock.info.get("regularMarketPrice") or stock.info.get("previousClose")
         if not spot_price:
             log.warning("{t}: no spot price available", t=ticker)
@@ -263,6 +275,10 @@ def pull_ticker(ticker, cur, src_id, today_str):
 
 
 def main():
+    if yf is None:
+        log.error("yfinance unavailable: {e}", e=_YFINANCE_IMPORT_ERROR)
+        return 1
+
     conn = connect()
     conn.autocommit = True
     cur = conn.cursor()
@@ -298,4 +314,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

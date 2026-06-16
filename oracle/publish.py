@@ -9,6 +9,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from oracle.dedup_index import ensure_dedup_index
 from oracle.prediction_context import (
     build_prediction_context,
     enrich_signals_payload,
@@ -90,6 +91,10 @@ def publish_astrogrid_prediction(engine: Engine, payload: dict[str, Any]) -> dic
             "signal_contributions": {},
         }
     signals = enrich_signals_payload(signals_list, context)
+    # Pre-migration safety: the ON CONFLICT below targets the partial unique
+    # index oracle_predictions_dedup_unique. Ensure it exists (once/process)
+    # so this insert can't raise 42P10 on a not-yet-migrated DB.
+    ensure_dedup_index(engine)
     with engine.begin() as conn:
         conn.execute(
             text(

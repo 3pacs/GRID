@@ -251,9 +251,14 @@ class TestGDELTEnhanced:
         mock_resp.json.return_value = {"timeline": []}
         mock_get.return_value = mock_resp
 
-        from ingestion.altdata.gdelt import GDELTPuller
+        from ingestion.altdata.gdelt import GDELTPuller, _TokenBucket
 
         puller = GDELTPuller(engine)
+        puller._doc_throttle = _TokenBucket(
+            max_per_window=10_000,
+            capacity=10_000,
+            sleep=lambda _seconds: None,
+        )
         result = puller.pull_recent(days_back=2)
 
         assert result["source"] == "GDELT"
