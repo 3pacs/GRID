@@ -74,7 +74,8 @@ DATA_FRESHNESS_THRESHOLD_HOURS = 26   # flag stale sources after 26h
 MAX_PULL_RETRIES = 3                  # retry failed pulls up to 3 times
 AUTORESEARCH_MAX_ITER = 5             # hypothesis iterations per cycle
 HERMES_TEMPERATURE = 0.3              # LLM temperature for diagnostics
-GIT_SYNC_ENABLED = True               # pull/push on each cycle
+# git-sync committed analytical outputs into the repo (data-exhaust pollution) and the pushes were failing; disabled by default. Set GRID_HERMES_GIT_SYNC=true only with a proper external sync target.
+GIT_SYNC_ENABLED = os.getenv("GRID_HERMES_GIT_SYNC", "false").lower() in ("1", "true", "yes")  # pull/push on each cycle
 GIT_REMOTE = "origin"
 GIT_BRANCH = "main"
 
