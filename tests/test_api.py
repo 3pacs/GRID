@@ -132,7 +132,8 @@ class TestProtectedRouteWithToken:
 
     def test_actor_network_route_is_not_double_prefixed(self):
         """Actor-network should exist only on the canonical intelligence path."""
-        paths = {route.path for route in app.routes if hasattr(route, "path")}
+        paths = [route.path for route in app.routes if hasattr(route, "path")]
+        assert paths.count("/api/v1/intelligence/actor-network") == 1
         assert "/api/v1/intelligence/actor-network" in paths
         assert "/api/v1/intelligence/edges" in paths
         assert "/api/v1/intelligence/api/v1/intelligence/actor-network" not in paths

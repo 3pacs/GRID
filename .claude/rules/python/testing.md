@@ -5,7 +5,7 @@ paths:
 ---
 # Python Testing
 
-> This file extends [common/testing.md](../common/testing.md) with Python specific content.
+> Python-specific layer. Detailed pytest patterns live in the `python-testing` skill.
 
 ## Framework
 

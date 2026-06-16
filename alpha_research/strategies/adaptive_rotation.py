@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 from sqlalchemy.engine import Engine
 
-from alpha_research.data.panel_builder import build_price_panel
+from alpha_research.data.panel_builder import build_price_panel, get_vix_series
 
 # ── Asset Groups (tickers GRID has data for) ──────────────────────────
 
@@ -307,20 +307,20 @@ def run_rotation(
 
     prices = prices.ffill(limit=5)
 
-    # Get VIX
-    from alpha_research.signals.exposure_scaler import compute_vix_exposure_scalar
-    vix_result = compute_vix_exposure_scalar(engine, as_of_date)
-    vix_value = vix_result.get("vix", 20.0)
-    vix_ma = vix_result.get("vix_ma", 20.0)
-
-    # Build a synthetic VIX series for z-score calc
-    vix_series = pd.Series([vix_value], index=[pd.Timestamp(as_of_date)])
-    if vix_ma and vix_ma > 0:
-        # Approximate historical VIX for z-score
-        vix_series = pd.Series(
-            np.random.normal(vix_ma, vix_ma * 0.15, 20).tolist() + [vix_value],
-            index=pd.bdate_range(end=as_of_date, periods=21),
-        )
+    # Pull the real VIX series PIT-correctly. detect_regime() needs >=20 obs to
+    # compute a non-zero z-score; with fewer obs it deterministically returns 0.
+    vix_series = get_vix_series(
+        engine,
+        start_date=as_of_date - timedelta(days=60),
+        end_date=as_of_date,
+        as_of_date=as_of_date,
+    )
+    if vix_series.empty:
+        # Fall back to a single-element series — yields vix_zscore=0 downstream.
+        from alpha_research.signals.exposure_scaler import compute_vix_exposure_scalar
+        vix_result = compute_vix_exposure_scalar(engine, as_of_date)
+        vix_value = vix_result.get("vix") or 20.0
+        vix_series = pd.Series([vix_value], index=[pd.Timestamp(as_of_date)])
 
     # 1. Detect regime
     regime = detect_regime(prices["SPY"], vix_series, as_of_date)
