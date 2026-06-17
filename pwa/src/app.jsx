@@ -1,4 +1,4 @@
-import React, { useState, useEffect, Suspense } from 'react';
+import React, { useState, useEffect, Suspense, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
 import useStore from './store.js';
 import { api } from './api.js';
@@ -8,7 +8,7 @@ import { isSimpleUser } from './authSession.js';
 
 // Views a simple/dad user is allowed to see. Everything else (the operator
 // cockpit) is hidden and redirects back to the composer.
-const DAD_VIEWS = new Set(['home', 'ten-year']);
+const DAD_VIEWS = new Set(['home', 'ten-year', 'ticker-lookup']);
 import ViewErrorBoundary from './components/ViewErrorBoundary.jsx';
 import Login from './views/Login.jsx';
 import ChatPanel from './components/ChatPanel.jsx';
@@ -30,6 +30,15 @@ function lazyView(path) {
     return React.lazy(loader);
 }
 
+const routeLoaders = Object.fromEntries(
+    routes.map(route => [
+        route.id,
+        route.id === 'surfacer'
+            ? () => Promise.resolve({ default: Surfacer })
+            : viewModules[route.component],
+    ]),
+);
+
 const routeComponents = Object.fromEntries(
     routes.map(route => [
         route.id,
@@ -39,8 +48,16 @@ const routeComponents = Object.fromEntries(
 
 const extraRouteComponents = {
     home: lazyView('./views/Home.jsx'),
+    'ticker-lookup': lazyView('./views/TickerLookup.jsx'),
     'intel-mod': lazyView('./views/IntelModeration.jsx'),
     'intel-submit': lazyView('./views/IntelSubmit.jsx'),
+};
+
+const extraRouteLoaders = {
+    home: viewModules['./views/Home.jsx'],
+    'ticker-lookup': viewModules['./views/TickerLookup.jsx'],
+    'intel-mod': viewModules['./views/IntelModeration.jsx'],
+    'intel-submit': viewModules['./views/IntelSubmit.jsx'],
 };
 
 const REALTIME_SOCKET_VIEWS = new Set([
@@ -59,10 +76,85 @@ function isDocumentVisible() {
 }
 
 // Sub-routes — not in routes.js because they are child views with bespoke props.
-const JournalEntry      = React.lazy(() => import('./views/JournalEntry.jsx'));
-const WatchlistAnalysis = React.lazy(() => import('./views/WatchlistAnalysis.jsx'));
-const SectorDive        = React.lazy(() => import('./views/SectorDive.jsx'));
-const AssociationsLegacy = React.lazy(() => import('./views/AssociationsLegacy.jsx'));
+const journalEntryLoader = () => import('./views/JournalEntry.jsx');
+const watchlistAnalysisLoader = () => import('./views/WatchlistAnalysis.jsx');
+const sectorDiveLoader = () => import('./views/SectorDive.jsx');
+const associationsLegacyLoader = () => import('./views/AssociationsLegacy.jsx');
+
+const JournalEntry      = React.lazy(journalEntryLoader);
+const WatchlistAnalysis = React.lazy(watchlistAnalysisLoader);
+const SectorDive        = React.lazy(sectorDiveLoader);
+const AssociationsLegacy = React.lazy(associationsLegacyLoader);
+
+const childRouteLoaders = {
+    'journal-entry': journalEntryLoader,
+    'watchlist-analysis': watchlistAnalysisLoader,
+    'sector-dive': sectorDiveLoader,
+    'associations-legacy': associationsLegacyLoader,
+};
+
+const DAD_PRELOAD_VIEW_IDS = ['home', 'ticker-lookup', 'ten-year'];
+const OPERATOR_HOT_PRELOAD_VIEW_IDS = [
+    'ten-year',
+    'dashboard',
+    'surfacer',
+    'money-flow',
+    'actor-network',
+    'risk',
+    'intelligence',
+    'regime',
+    'signals',
+    'options',
+    'flows',
+    'heatmap',
+    'architecture',
+    'pipeline-health',
+];
+const ALL_PRELOAD_VIEW_IDS = [
+    ...OPERATOR_HOT_PRELOAD_VIEW_IDS,
+    ...routes.map(route => route.id),
+    ...Object.keys(extraRouteLoaders),
+    ...Object.keys(childRouteLoaders),
+];
+
+const OPERATOR_PRELOAD_API_PATHS = [
+    '/api/v1/regime/current',
+    '/api/v1/system/status',
+    '/api/v1/watchlist/prices',
+    '/api/v1/watchlist/enriched?limit=8',
+    '/api/v1/ten-year-portfolio/weekly?capital=1000000&years=10',
+    '/api/v1/intelligence/dashboard',
+    '/api/v1/intelligence/thesis',
+    '/api/v1/intelligence/risk-map',
+    '/api/v1/intelligence/actor-network',
+    '/api/v1/intelligence/levers',
+    '/api/v1/flows/aggregated?period=weekly&days=30',
+    '/api/v1/flows/money-map',
+    '/api/v1/flows/sectors',
+    '/api/v1/flows/sankey',
+    '/api/v1/signals',
+    '/api/v1/signals/snapshot',
+    '/api/v1/options/recommendations',
+    '/api/v1/options/signals?limit=50',
+    '/api/v1/discovery/smart-heatmap?orthogonal_only=true',
+    '/api/v1/associations/correlation-matrix?days=252',
+    '/api/v1/system/pipeline-health',
+    '/api/v1/system/architecture',
+];
+
+const DAD_PRELOAD_API_PATHS = [
+    '/api/v1/ten-year-portfolio/weekly?capital=1000000&years=10',
+];
+
+function scheduleIdleTask(callback, timeout = 1200) {
+    if (typeof window === 'undefined') return undefined;
+    if (typeof window.requestIdleCallback === 'function') {
+        const id = window.requestIdleCallback(callback, { timeout });
+        return () => window.cancelIdleCallback?.(id);
+    }
+    const id = window.setTimeout(callback, 250);
+    return () => window.clearTimeout(id);
+}
 
 const styles = {
     app: {
@@ -135,7 +227,11 @@ export function App() {
     const [chatOpen, setChatOpen] = useState(false);
     const [showTour, setShowTour] = useState(false);
     const [documentVisible, setDocumentVisible] = useState(isDocumentVisible);
+    const [refreshVersion, setRefreshVersion] = useState(0);
+    const [isRefreshingVisuals, setIsRefreshingVisuals] = useState(false);
+    const [preloadStatus, setPreloadStatus] = useState({ state: 'idle', completed: 0, total: 0 });
     const lastSocketEventAtRef = React.useRef(lastSocketEventAt);
+    const preloadRunRef = React.useRef(0);
 
     const shouldUseRealtimeSocket = isAuthenticated
         && documentVisible
@@ -223,6 +319,83 @@ export function App() {
             setActiveView('home');
         }
     }, [simple, activeView, setActiveView]);
+
+    const preloadViewModules = useCallback(async (viewIds, { onProgress = null } = {}) => {
+        const uniqueViewIds = [...new Set(viewIds)];
+        let completed = 0;
+        for (const viewId of uniqueViewIds) {
+            const loader = routeLoaders[viewId] || extraRouteLoaders[viewId] || childRouteLoaders[viewId];
+            if (loader) {
+                await loader().catch(() => null);
+            }
+            completed += 1;
+            onProgress?.({ completed, total: uniqueViewIds.length, viewId });
+        }
+        return { completed, total: uniqueViewIds.length };
+    }, []);
+
+    const warmVisualizations = useCallback(async ({ force = false, hotOnly = false } = {}) => {
+        const runId = preloadRunRef.current + 1;
+        preloadRunRef.current = runId;
+
+        const viewIds = simple
+            ? DAD_PRELOAD_VIEW_IDS
+            : hotOnly
+                ? OPERATOR_HOT_PRELOAD_VIEW_IDS
+                : ALL_PRELOAD_VIEW_IDS;
+        const paths = simple ? DAD_PRELOAD_API_PATHS : OPERATOR_PRELOAD_API_PATHS;
+        const total = viewIds.length + paths.length;
+
+        setPreloadStatus({ state: force ? 'refreshing' : 'warming', completed: 0, total });
+
+        let completed = 0;
+        const tick = () => {
+            completed += 1;
+            if (preloadRunRef.current === runId) {
+                setPreloadStatus({ state: force ? 'refreshing' : 'warming', completed, total });
+            }
+        };
+
+        await preloadViewModules(viewIds, { onProgress: tick });
+        await api.preload(paths, {
+            ttlMs: force ? 5_000 : 90_000,
+            force,
+            concurrency: simple ? 2 : 4,
+            onProgress: tick,
+        });
+
+        if (preloadRunRef.current === runId) {
+            setPreloadStatus({ state: 'ready', completed: total, total });
+        }
+    }, [preloadViewModules, simple]);
+
+    useEffect(() => {
+        if (!isAuthenticated || !documentVisible) {
+            return undefined;
+        }
+        return scheduleIdleTask(() => {
+            warmVisualizations({ hotOnly: false }).catch(() => {
+                setPreloadStatus(status => ({ ...status, state: 'idle' }));
+            });
+        });
+    }, [documentVisible, isAuthenticated, warmVisualizations]);
+
+    const refreshVisualizations = useCallback(async () => {
+        if (isRefreshingVisuals) return;
+        setIsRefreshingVisuals(true);
+        api.clearCache();
+        if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+            window.dispatchEvent(new CustomEvent('grid:visualizations-refresh', {
+                detail: { view: activeView, at: new Date().toISOString() },
+            }));
+        }
+        setRefreshVersion(version => version + 1);
+        try {
+            await warmVisualizations({ force: true, hotOnly: true });
+        } finally {
+            setIsRefreshingVisuals(false);
+        }
+    }, [activeView, isRefreshingVisuals, warmVisualizations]);
 
     useEffect(() => {
         if (!shouldUseRealtimeSocket) return undefined;
@@ -411,7 +584,7 @@ export function App() {
                 ))}
             </div>
             <div style={styles.content}>
-                <ViewErrorBoundary key={activeView} viewName={activeView} onNavigateHome={() => navigate('canvas')}>
+                <ViewErrorBoundary key={`${activeView}:${refreshVersion}`} viewName={activeView} onNavigateHome={() => navigate('canvas')}>
                     <Suspense fallback={<div style={{ padding: '60px 20px', textAlign: 'center', color: '#5A7080', fontFamily: "'IBM Plex Mono', monospace", fontSize: '13px' }}>Loading view...</div>}>
                         {renderView()}
                     </Suspense>
@@ -422,6 +595,9 @@ export function App() {
                     activeView={activeView}
                     onNavigate={navigate}
                     onSignOut={() => clearAuth()}
+                    onRefreshVisuals={refreshVisualizations}
+                    isRefreshingVisuals={isRefreshingVisuals}
+                    preloadStatus={preloadStatus}
                 />
             ) : (
                 <>
@@ -430,6 +606,9 @@ export function App() {
                         onNavigate={navigate}
                         onSearchOpen={() => setPaletteOpen(true)}
                         onChatOpen={() => setChatOpen(true)}
+                        onRefreshVisuals={refreshVisualizations}
+                        isRefreshingVisuals={isRefreshingVisuals}
+                        preloadStatus={preloadStatus}
                     />
                     <ChatPanel open={chatOpen} onOpenChange={setChatOpen} />
                     <CommandPalette

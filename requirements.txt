@@ -12,6 +12,7 @@ alembic>=1.13.0
 aiohttp>=3.13.5
 pandas>=2.1.0
 numpy>=1.26.0
+duckdb>=1.5.0
 fedfred>=1.2.9
 yfinance>=0.2.36
 requests>=2.31.0
