@@ -399,7 +399,9 @@ VALUES
     ('UnusualWhales',  'https://api.unusualwhales.com',             'FREE', 'EOD',      FALSE, 'NEVER',  'MED',  7, FALSE),
     ('Reddit',         'https://oauth.reddit.com',                  'FREE', 'REALTIME', FALSE, 'NEVER',  'LOW',  8, FALSE),
     ('DexScreener',    'https://api.dexscreener.com',               'FREE', 'EOD',      FALSE, 'NEVER',  'MED',  20, TRUE),
-    ('PumpFun',        'https://frontend-api-v3.pump.fun',          'FREE', 'REALTIME', FALSE, 'NEVER',  'LOW',  21, TRUE)
+    ('PumpFun',        'https://frontend-api-v3.pump.fun',          'FREE', 'REALTIME', FALSE, 'NEVER',  'LOW',  21, TRUE),
+    ('finviz_fundamentals', 'https://finviz.com/quote.ashx',        'FREE', 'EOD',      FALSE, 'NEVER',  'MED',  45, TRUE),
+    ('TradingView',    'https://tradingview.com',                   'FREE', 'REALTIME', FALSE, 'NEVER',  'MED',  25, TRUE)
 ON CONFLICT (name) DO NOTHING;
 
 -- ============================================================
