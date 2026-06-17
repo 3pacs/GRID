@@ -78,6 +78,9 @@ jobs:
         if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
         run: |
           set -euo pipefail
+          sudo mkdir -p /etc/systemd/system/grid-api.service.d
+          printf '%s\n' '[Service]' "WorkingDirectory=$DEPLOY_PATH" | sudo tee /etc/systemd/system/grid-api.service.d/zz-release-worktree.conf >/dev/null
+          sudo systemctl daemon-reload
           sudo systemctl restart grid-api
 
       - name: Verify running API (health + OpenAPI)
@@ -95,6 +98,13 @@ jobs:
             fi
             sleep 2
           done
+          api_pid="$(systemctl show -p MainPID --value grid-api)"
+          test "$(readlink "/proc/${api_pid}/cwd")" = "$DEPLOY_PATH"
+          curl -fsS http://localhost:8000/ > /tmp/grid-index.html
+          index_js="$(grep -o '/assets/index-[^"]*\.js' /tmp/grid-index.html | head -1)"
+          test -n "$index_js"
+          curl -fsS "http://localhost:8000${index_js}" > /tmp/grid-index.js
+          grep -F '/gold/stream' /tmp/grid-index.js
           curl -fsS http://localhost:8000/openapi.json > /tmp/grid-openapi.json
           grep -F '"/api/v1/intelligence/actor-network"' /tmp/grid-openapi.json
           grep -F '"/api/v1/dad/ticker/{ticker}/gold/stream"' /tmp/grid-openapi.json
