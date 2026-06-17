@@ -10,11 +10,13 @@ from __future__ import annotations
 import json
 import os
 import re
-from datetime import date, datetime, timezone
+import time
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
 from loguru import logger as log
 from sqlalchemy import text
 
@@ -28,8 +30,14 @@ DEFAULT_RESEARCH_DB = (
     "extract-20260617/dad_stock_research.duckdb"
 )
 MAX_EVIDENCE_ROWS = 18
+COMPACT_EVIDENCE_ROWS = 5
 MAX_FILE_ROWS = 12
+COMPACT_FILE_ROWS = 5
 MAX_SNIPPET_CHARS = 360
+SUMMARY_CACHE_TTL_SECONDS = 300
+DAD_CACHE_VERSION = "dad-ticker-v2"
+DEFAULT_CHART_POINTS = 220
+MAX_CHART_POINTS = 800
 FINVIZ_SOURCE_NAME = "finviz_fundamentals"
 FINVIZ_BASE_URL = "https://finviz.com/quote.ashx"
 
@@ -122,8 +130,35 @@ def _research_db_path() -> Path:
     return Path(os.getenv("GRID_DAD_STOCK_RESEARCH_DB", DEFAULT_RESEARCH_DB)).expanduser()
 
 
+def _perf_ms(start: float) -> float:
+    return round((time.perf_counter() - start) * 1000, 1)
+
+
+def _timed(name: str, timings: dict[str, float], fn):
+    start = time.perf_counter()
+    try:
+        return fn()
+    finally:
+        timings[name] = _perf_ms(start)
+
+
+def _log_slow_ticker(ticker: str, timings: dict[str, float], *, route: str) -> None:
+    total = round(sum(timings.values()), 1)
+    if total >= 500:
+        log.info(
+            "Dad ticker timing {route} {ticker}: total={total}ms sections={sections}",
+            route=route,
+            ticker=ticker,
+            total=total,
+            sections=timings,
+        )
+
+
 def _normalize_ticker(ticker: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9.^-]", "", ticker or "").strip().upper()
+    match = re.search(r"\$?([A-Za-z0-9^.][A-Za-z0-9.^-]{0,11})", ticker or "")
+    if not match:
+        return ""
+    cleaned = re.sub(r"[^A-Za-z0-9.^-]", "", match.group(1)).strip().upper()
     return cleaned.replace("-", ".")[:12]
 
 
@@ -144,6 +179,105 @@ def _keyword_hits(text: str) -> list[str]:
     }
     lower = text.lower()
     return [label for label, pattern in checks.items() if re.search(pattern, lower)]
+
+
+def _downsample_points(points: list[dict[str, Any]], max_points: int | None = None) -> list[dict[str, Any]]:
+    if not max_points or max_points <= 0 or len(points) <= max_points:
+        return points
+    if max_points == 1:
+        return [points[-1]]
+    step = (len(points) - 1) / (max_points - 1)
+    sampled: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for idx in range(max_points):
+        source_idx = round(idx * step)
+        if source_idx in seen:
+            continue
+        seen.add(source_idx)
+        sampled.append(points[source_idx])
+    if sampled[-1] is not points[-1]:
+        sampled[-1] = points[-1]
+    return sampled
+
+
+def _range_to_days(range_name: str | None) -> int:
+    key = (range_name or "1Y").strip().upper()
+    return {
+        "1M": 31,
+        "3M": 92,
+        "6M": 183,
+        "1Y": 365,
+        "2Y": 730,
+        "5Y": 1825,
+        "10Y": 3650,
+        "MAX": 3650,
+    }.get(key, 365)
+
+
+def _detail_urls(ticker: str) -> dict[str, str]:
+    enc = ticker
+    return {
+        "stream": f"/api/v1/dad/ticker/{enc}/gold/stream",
+        "evidence": f"/api/v1/dad/ticker/{enc}/evidence?limit=50&offset=0",
+        "chart": f"/api/v1/dad/ticker/{enc}/chart?range=1Y&points={DEFAULT_CHART_POINTS}",
+        "finviz": f"/api/v1/dad/ticker/{enc}/finviz",
+        "options": f"/api/v1/dad/ticker/{enc}/options?days=90&limit=90",
+    }
+
+
+def _compact_finviz(finviz: dict[str, Any], *, include_fields: bool = False) -> dict[str, Any]:
+    compact = {
+        "status": finviz.get("status", "unavailable"),
+        "source": finviz.get("source", "postgres"),
+        "freshness": finviz.get("freshness", _freshness_state(None)),
+        "latest_pull": finviz.get("latest_pull"),
+        "latest_obs_date": finviz.get("latest_obs_date"),
+        "field_count": finviz.get("field_count", 0),
+        "rows_inserted": finviz.get("rows_inserted", 0),
+        "live_refresh_requested": finviz.get("live_refresh_requested", False),
+        "refresh_available": finviz.get("refresh_available", True),
+        "stats": finviz.get("stats", []),
+        "error": finviz.get("error"),
+    }
+    if include_fields:
+        compact["fields"] = finviz.get("fields", {})
+    return compact
+
+
+def _compact_grid(
+    grid: dict[str, Any],
+    *,
+    include_price_history: bool = False,
+    max_points: int | None = None,
+) -> dict[str, Any]:
+    original_history = grid.get("price_history") or []
+    price_history = _downsample_points(original_history, max_points) if include_price_history else []
+    total_points = int(grid.get("price_points_total") or len(original_history))
+    return {
+        "status": grid.get("status", "missing"),
+        "feature_names": grid.get("feature_names", []),
+        "metrics": grid.get("metrics", {}),
+        "freshness": grid.get("freshness", _freshness_state(None)),
+        "source_freshness": grid.get("source_freshness", []),
+        "features": grid.get("features", []),
+        "price_history": price_history,
+        "price_points_total": total_points,
+        "price_points_returned": len(price_history),
+    }
+
+
+def _compact_signals(signals: dict[str, Any], *, include_rows: bool = False) -> dict[str, Any]:
+    signal_rows = signals.get("signal_sources", []) or []
+    tv_rows = signals.get("tradingview_signals", []) or []
+    payload = {
+        "signal_count": len(signal_rows),
+        "tradingview_count": len(tv_rows),
+        "regime": signals.get("regime"),
+    }
+    if include_rows:
+        payload["signal_sources"] = signal_rows
+        payload["tradingview_signals"] = tv_rows
+    return payload
 
 
 def _source_lane(file_name: str | None, sheet_name: str | None) -> str:
@@ -290,6 +424,113 @@ def _freshness_state(value: Any, *, stale_hours: int = 48) -> dict[str, Any]:
     if age <= stale_hours * 2:
         return {"state": "aging", "age_hours": round(age, 2), "label": "aging"}
     return {"state": "stale", "age_hours": round(age, 2), "label": "stale"}
+
+
+def _research_db_fingerprint(db_path: Path) -> tuple[str, float | None]:
+    try:
+        return str(db_path), db_path.stat().st_mtime if db_path.exists() else None
+    except Exception:
+        return str(db_path), None
+
+
+def _ensure_summary_cache_table(engine: Any) -> None:
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS dad_ticker_summary_cache (
+                    ticker             TEXT PRIMARY KEY,
+                    payload_version    TEXT NOT NULL,
+                    generated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    research_db_path   TEXT,
+                    research_db_mtime  DOUBLE PRECISION,
+                    payload            JSONB NOT NULL,
+                    timings            JSONB NOT NULL DEFAULT '{}'::jsonb
+                )
+            """))
+            conn.execute(text("""
+                CREATE INDEX IF NOT EXISTS idx_dad_summary_cache_generated
+                    ON dad_ticker_summary_cache (generated_at DESC)
+            """))
+    except Exception as exc:
+        log.debug("Dad summary cache table unavailable: {e}", e=str(exc))
+
+
+def _read_summary_cache(engine: Any, ticker: str, db_path: Path) -> dict[str, Any] | None:
+    path, mtime = _research_db_fingerprint(db_path)
+    try:
+        _ensure_summary_cache_table(engine)
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT payload, generated_at, timings "
+                    "FROM dad_ticker_summary_cache "
+                    "WHERE ticker = :ticker "
+                    "AND payload_version = :version "
+                    "AND research_db_path = :path "
+                    "AND research_db_mtime IS NOT DISTINCT FROM :mtime "
+                    f"AND generated_at >= NOW() - INTERVAL '{SUMMARY_CACHE_TTL_SECONDS} seconds' "
+                    "LIMIT 1"
+                ),
+                {
+                    "ticker": ticker,
+                    "version": DAD_CACHE_VERSION,
+                    "path": path,
+                    "mtime": mtime,
+                },
+            ).fetchone()
+    except Exception as exc:
+        log.debug("Dad summary cache read failed for {t}: {e}", t=ticker, e=str(exc))
+        return None
+    if not row:
+        return None
+    payload = row[0]
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            return None
+    if not isinstance(payload, dict):
+        return None
+    payload = dict(payload)
+    payload["cache"] = {
+        "hit": True,
+        "generated_at": _as_utc(row[1]).isoformat() if _as_utc(row[1]) else str(row[1]),
+        "ttl_seconds": SUMMARY_CACHE_TTL_SECONDS,
+    }
+    return payload
+
+
+def _write_summary_cache(engine: Any, ticker: str, db_path: Path, payload: dict[str, Any], timings: dict[str, float]) -> None:
+    path, mtime = _research_db_fingerprint(db_path)
+    to_store = dict(payload)
+    to_store["cache"] = {"hit": False, "ttl_seconds": SUMMARY_CACHE_TTL_SECONDS}
+    try:
+        _ensure_summary_cache_table(engine)
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO dad_ticker_summary_cache "
+                    "(ticker, payload_version, generated_at, research_db_path, research_db_mtime, payload, timings) "
+                    "VALUES (:ticker, :version, NOW(), :path, :mtime, CAST(:payload AS JSONB), CAST(:timings AS JSONB)) "
+                    "ON CONFLICT (ticker) DO UPDATE SET "
+                    "payload_version = EXCLUDED.payload_version, "
+                    "generated_at = EXCLUDED.generated_at, "
+                    "research_db_path = EXCLUDED.research_db_path, "
+                    "research_db_mtime = EXCLUDED.research_db_mtime, "
+                    "payload = EXCLUDED.payload, "
+                    "timings = EXCLUDED.timings"
+                ),
+                {
+                    "ticker": ticker,
+                    "version": DAD_CACHE_VERSION,
+                    "path": path,
+                    "mtime": mtime,
+                    "payload": json.dumps(to_store, default=str),
+                    "timings": json.dumps(timings, default=str),
+                },
+            )
+    except Exception as exc:
+        log.debug("Dad summary cache write failed for {t}: {e}", t=ticker, e=str(exc))
 
 
 def _ensure_finviz_source_id(engine: Any) -> int:
@@ -672,7 +913,15 @@ def _source_freshness(engine: Any, source_names: list[str]) -> list[dict[str, An
     return freshness
 
 
-def _grid_market_context(engine: Any, ticker: str) -> dict[str, Any]:
+def _grid_market_context(
+    engine: Any,
+    ticker: str,
+    *,
+    days: int = 365,
+    include_price_history: bool = True,
+    max_points: int | None = None,
+    feature_limit: int = 20,
+) -> dict[str, Any]:
     try:
         from api.routers.watchlist_helpers import _get_display_name, _interpret_feature, _resolve_feature_names
     except Exception as exc:
@@ -682,6 +931,7 @@ def _grid_market_context(engine: Any, ticker: str) -> dict[str, Any]:
     feature_names = _resolve_feature_names(ticker)
     prices: list[dict[str, Any]] = []
     features: list[dict[str, Any]] = []
+    cutoff = date.today() - timedelta(days=max(1, min(days, 3650)))
 
     try:
         with engine.connect() as conn:
@@ -691,10 +941,10 @@ def _grid_market_context(engine: Any, ticker: str) -> dict[str, Any]:
                     "FROM resolved_series rs "
                     "JOIN feature_registry fr ON fr.id = rs.feature_id "
                     "WHERE fr.name = ANY(:names) "
-                    "AND rs.obs_date >= CURRENT_DATE - INTERVAL '1 year' "
+                    "AND rs.obs_date >= :cutoff "
                     "ORDER BY rs.obs_date"
                 ),
-                {"names": feature_names},
+                {"names": feature_names, "cutoff": cutoff},
             ).fetchall()
             prices = [{"date": str(row[0]), "value": float(row[1])} for row in price_rows]
 
@@ -706,10 +956,13 @@ def _grid_market_context(engine: Any, ticker: str) -> dict[str, Any]:
                         "JOIN source_catalog sc ON sc.id = rs.source_id "
                         "WHERE sc.name = 'yfinance' "
                         "AND rs.series_id = ANY(:series_ids) "
-                        "AND rs.obs_date >= CURRENT_DATE - INTERVAL '1 year' "
+                        "AND rs.obs_date >= :cutoff "
                         "ORDER BY rs.obs_date"
                     ),
-                    {"series_ids": [f"yf_{ticker.lower()}_close", f"YF:{ticker}:close"]},
+                    {
+                        "series_ids": [f"yf_{ticker.lower()}_close", f"YF:{ticker}:close"],
+                        "cutoff": cutoff,
+                    },
                 ).fetchall()
                 prices = [{"date": str(row[0]), "value": float(row[1])} for row in raw_rows]
 
@@ -736,9 +989,12 @@ def _grid_market_context(engine: Any, ticker: str) -> dict[str, Any]:
                     "  WHERE rs2.feature_id = rs.feature_id"
                     ") "
                     "ORDER BY fr.family, fr.name "
-                    "LIMIT 20"
+                    "LIMIT :feature_limit"
                 ),
-                {f"p{i}": pattern for i, pattern in enumerate(like_patterns)},
+                {
+                    **{f"p{i}": pattern for i, pattern in enumerate(like_patterns)},
+                    "feature_limit": max(1, min(feature_limit, 50)),
+                },
             ).fetchall()
     except Exception as exc:
         log.debug("Dad GRID market context failed for {t}: {e}", t=ticker, e=str(exc))
@@ -778,7 +1034,8 @@ def _grid_market_context(engine: Any, ticker: str) -> dict[str, Any]:
     return {
         "status": "ready" if prices or features else "missing",
         "feature_names": feature_names,
-        "price_history": prices,
+        "price_history": _downsample_points(prices, max_points) if include_price_history else [],
+        "price_points_total": len(prices),
         "metrics": metrics,
         "features": features,
         "freshness": _freshness_state(metrics.get("as_of"), stale_hours=96),
@@ -815,6 +1072,53 @@ def _latest_options_context(engine: Any, ticker: str) -> dict[str, Any] | None:
         "term_slope": row[8],
         "oi_concentration": row[9],
         "freshness": _freshness_state(row[0], stale_hours=96),
+    }
+
+
+def _options_history_context(engine: Any, ticker: str, *, days: int = 90, limit: int = 90) -> dict[str, Any]:
+    bounded_days = max(1, min(days, 365))
+    bounded_limit = max(1, min(limit, 250))
+    cutoff = date.today() - timedelta(days=bounded_days)
+    rows: list[dict[str, Any]] = []
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(
+                text(
+                    "SELECT signal_date, put_call_ratio, max_pain, iv_skew, "
+                    "total_oi, total_volume, spot_price, iv_atm, term_structure_slope, oi_concentration "
+                    "FROM options_daily_signals "
+                    "WHERE ticker = :ticker "
+                    "AND signal_date >= :cutoff "
+                    "ORDER BY signal_date DESC "
+                    "LIMIT :limit"
+                ),
+                {"ticker": ticker, "cutoff": cutoff, "limit": bounded_limit},
+            ).fetchall()
+    except Exception as exc:
+        log.debug("Dad options history failed for {t}: {e}", t=ticker, e=str(exc))
+        result = []
+
+    for row in result:
+        rows.append({
+            "date": str(row[0]),
+            "put_call_ratio": row[1],
+            "max_pain": row[2],
+            "iv_skew": row[3],
+            "total_oi": row[4],
+            "total_volume": row[5],
+            "spot_price": row[6],
+            "iv_atm": row[7],
+            "term_slope": row[8],
+            "oi_concentration": row[9],
+        })
+    latest = rows[0] if rows else _latest_options_context(engine, ticker)
+    return {
+        "status": "ready" if rows or latest else "missing",
+        "latest": latest,
+        "history": list(reversed(rows)),
+        "days": bounded_days,
+        "limit": bounded_limit,
+        "freshness": _freshness_state(latest.get("date") if latest else None, stale_hours=96),
     }
 
 
@@ -1109,11 +1413,27 @@ def _empty_grid_payload(message: str) -> dict[str, Any]:
     }
 
 
-def _load_grid_payload(ticker: str, *, refresh_finviz: bool = False) -> dict[str, Any]:
+def _load_grid_payload(
+    ticker: str,
+    *,
+    refresh_finviz: bool = False,
+    engine: Any | None = None,
+    grid_days: int = 365,
+    include_price_history: bool = False,
+    chart_points: int | None = None,
+    feature_limit: int = 8,
+) -> dict[str, Any]:
     try:
-        engine = get_db_engine()
+        engine = engine or get_db_engine()
         finviz = _get_finviz_profile(engine, ticker, refresh=refresh_finviz)
-        grid = _grid_market_context(engine, ticker)
+        grid = _grid_market_context(
+            engine,
+            ticker,
+            days=grid_days,
+            include_price_history=include_price_history,
+            max_points=chart_points,
+            feature_limit=feature_limit,
+        )
         grid["source_freshness"] = _source_freshness(
             engine,
             [
@@ -1147,8 +1467,552 @@ def _connect_duckdb(db_path: Path):
     return duckdb.connect(str(db_path), read_only=True)
 
 
+def _empty_workbook_context(ticker: str, db_path: Path, *, attached: bool, status: str, message: str) -> dict[str, Any]:
+    return {
+        "ticker": ticker,
+        "status": status,
+        "message": message,
+        "source": {"attached": attached, "db_path": str(db_path)},
+        "summary": None,
+        "workbook": {"files": [], "sheets": [], "evidence": []},
+        "source_lanes": [],
+        "dad_stats": _dad_stat_cards([], [], []),
+        "fit_signals": [],
+        "page": {"limit": 0, "offset": 0, "returned": 0},
+    }
+
+
+def _load_workbook_context(
+    ticker: str,
+    *,
+    evidence_limit: int = MAX_EVIDENCE_ROWS,
+    evidence_offset: int = 0,
+    file_limit: int = MAX_FILE_ROWS,
+) -> dict[str, Any]:
+    db_path = _research_db_path()
+    limit = max(0, min(evidence_limit, 100))
+    offset = max(0, evidence_offset)
+    files_limit = max(0, min(file_limit, 50))
+
+    if not db_path.exists():
+        return _empty_workbook_context(
+            ticker,
+            db_path,
+            attached=False,
+            status="unavailable",
+            message="Workbook DuckDB database is not attached yet.",
+        )
+
+    try:
+        conn = _connect_duckdb(db_path)
+    except RuntimeError as exc:
+        return _empty_workbook_context(
+            ticker,
+            db_path,
+            attached=False,
+            status="unavailable",
+            message=str(exc),
+        )
+
+    try:
+        summary_row = conn.execute(
+            """
+            SELECT ticker, mentions, file_count, sheet_count, evidence_score, source_types
+            FROM ticker_summary
+            WHERE ticker = ?
+            """,
+            [ticker],
+        ).fetchone()
+        summary = None
+        if summary_row:
+            summary = {
+                "ticker": summary_row[0],
+                "mentions": summary_row[1],
+                "file_count": summary_row[2],
+                "sheet_count": summary_row[3],
+                "evidence_score": summary_row[4],
+                "source_types": summary_row[5],
+            }
+
+        evidence_rows = conn.execute(
+            """
+            SELECT
+              source_type,
+              evidence_text,
+              context_score,
+              rel_path,
+              sheet_name,
+              cell_ref,
+              row_context,
+              col_header
+            FROM ticker_best_evidence
+            WHERE ticker = ?
+            ORDER BY evidence_rank
+            LIMIT ? OFFSET ?
+            """,
+            [ticker, limit, offset],
+        ).fetchall()
+
+        file_rows = conn.execute(
+            """
+            SELECT rel_path, mentions, score
+            FROM ticker_file_summary
+            WHERE ticker = ?
+            ORDER BY score DESC, mentions DESC, rel_path
+            LIMIT ?
+            """,
+            [ticker, files_limit],
+        ).fetchall()
+
+        sheet_rows = conn.execute(
+            """
+            SELECT rel_path, sheet_name, mentions, score
+            FROM ticker_sheet_summary
+            WHERE ticker = ?
+            ORDER BY score DESC, mentions DESC, rel_path, sheet_name
+            LIMIT ?
+            """,
+            [ticker, files_limit],
+        ).fetchall()
+    except Exception as exc:
+        log.warning("Dad ticker workbook lookup failed for {ticker}: {error}", ticker=ticker, error=str(exc))
+        return _empty_workbook_context(
+            ticker,
+            db_path,
+            attached=True,
+            status="unavailable",
+            message="Workbook DuckDB database is present but not queryable yet.",
+        ) | {"error": str(exc)}
+    finally:
+        conn.close()
+
+    evidence = [
+        {
+            "source_type": row[0],
+            "evidence_text": _shorten(row[1]),
+            "context_score": float(row[2] or 0),
+            "file": row[3],
+            "sheet": row[4],
+            "cell": row[5],
+            "row_context": _shorten(row[6], 220),
+            "column_header": _shorten(row[7], 120),
+        }
+        for row in evidence_rows
+    ]
+    files = [
+        {"file": row[0], "mentions": int(row[1] or 0), "score": float(row[2] or 0)}
+        for row in file_rows
+    ]
+    sheets = [
+        {"file": row[0], "sheet": row[1], "mentions": int(row[2] or 0), "score": float(row[3] or 0)}
+        for row in sheet_rows
+    ]
+
+    return {
+        "ticker": ticker,
+        "status": "ready" if summary else "not_found",
+        "message": None,
+        "source": {"attached": True, "db_path": str(db_path)},
+        "summary": summary,
+        "workbook": {"files": files, "sheets": sheets, "evidence": evidence},
+        "source_lanes": _lane_counts(evidence, files, sheets),
+        "dad_stats": _dad_stat_cards(evidence, files, sheets),
+        "fit_signals": _fit_signals(summary, evidence),
+        "page": {"limit": limit, "offset": offset, "returned": len(evidence)},
+    }
+
+
+def _response_risks_and_actions(
+    workbook: dict[str, Any],
+    grid_payload: dict[str, Any],
+    decision_stack: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    summary = workbook.get("summary")
+    risks = [
+        "Workbook footprint is historical evidence, not a live buy/sell recommendation.",
+        "Current price, fundamentals, news, and liquidity still need a fresh market check.",
+    ]
+    next_actions = [
+        "Compare the workbook evidence against a current chart and fundamentals pass.",
+        "Check whether Dad's workbook language is buy, watch, hold, or sell before acting.",
+    ]
+
+    if workbook.get("status") == "unavailable":
+        risks.insert(0, workbook.get("message") or "Workbook research is unavailable.")
+        next_actions.insert(0, "Attach or regenerate the workbook DuckDB research database.")
+    elif summary:
+        next_actions.insert(0, "Open the top workbook evidence rows and confirm the context.")
+        if int(summary.get("file_count") or 0) <= 1:
+            risks.append("Evidence is concentrated in one workbook, so treat it as low confidence.")
+    else:
+        risks.append("Regex extraction found no confident workbook footprint for this ticker.")
+        next_actions.insert(0, "Try the company name or related ticker if this was renamed, delisted, or crypto-like.")
+
+    if grid_payload["finviz"].get("status") in {"unavailable", "stale"}:
+        next_actions.append("Use Refresh Finviz to populate or update cached fundamentals for this ticker.")
+    for blocker in decision_stack.get("blockers", []):
+        if blocker not in risks:
+            risks.append(blocker)
+    return risks, next_actions
+
+
+def _assemble_dad_response(
+    ticker: str,
+    workbook: dict[str, Any],
+    grid_payload: dict[str, Any],
+    *,
+    timings: dict[str, float] | None = None,
+    compact: bool = True,
+) -> dict[str, Any]:
+    summary = workbook.get("summary")
+    gold = _gold_from_summary(summary)
+    decision_stack = _grid_decision_stack(
+        summary,
+        gold,
+        grid_payload["grid"],
+        grid_payload["finviz"],
+        grid_payload["options"],
+        grid_payload["signals"],
+    )
+    risks, next_actions = _response_risks_and_actions(workbook, grid_payload, decision_stack)
+    timings = timings or {}
+    return {
+        "ticker": ticker,
+        "status": workbook.get("status", "unavailable"),
+        "payload_mode": "compact" if compact else "detail",
+        "gold": gold,
+        "decision_stack": decision_stack,
+        "source": {
+            "attached": bool(workbook.get("source", {}).get("attached")),
+            "db_path": workbook.get("source", {}).get("db_path") if not compact else None,
+        },
+        "message": workbook.get("message"),
+        "summary": summary,
+        "workbook": workbook.get("workbook", {"files": [], "sheets": [], "evidence": []}),
+        "source_lanes": workbook.get("source_lanes", []),
+        "dad_stats": workbook.get("dad_stats", []),
+        "finviz": _compact_finviz(grid_payload["finviz"], include_fields=not compact),
+        "grid_data": _compact_grid(
+            grid_payload["grid"],
+            include_price_history=not compact,
+            max_points=DEFAULT_CHART_POINTS if not compact else None,
+        ),
+        "options": grid_payload["options"],
+        "signals": _compact_signals(grid_payload["signals"], include_rows=not compact),
+        "tradingview": _tradingview_payload(ticker),
+        "fit_signals": workbook.get("fit_signals", []),
+        "risks": risks,
+        "next_actions": next_actions,
+        "detail_urls": _detail_urls(ticker),
+        "hydration": {
+            "compact": True,
+            "evidence": "inline_sample" if compact else "complete",
+            "chart": "detail_endpoint" if compact else "inline",
+            "finviz": "summary" if compact else "complete",
+            "options": "latest" if compact else "complete",
+        },
+        "performance": {"timings_ms": timings, "total_ms": round(sum(timings.values()), 1)},
+        "cache": {"hit": False, "ttl_seconds": SUMMARY_CACHE_TTL_SECONDS},
+    }
+
+
+def _build_compact_dad_response(ticker: str, *, refresh_finviz: bool = False, use_cache: bool = True) -> dict[str, Any]:
+    timings: dict[str, float] = {}
+    engine = get_db_engine()
+    db_path = _research_db_path()
+    if use_cache and not refresh_finviz:
+        cached = _timed("cache_read", timings, lambda: _read_summary_cache(engine, ticker, db_path))
+        if cached:
+            cached.setdefault("performance", {})["cache_read_ms"] = timings["cache_read"]
+            return cached
+
+    workbook = _timed(
+        "workbook_compact",
+        timings,
+        lambda: _load_workbook_context(
+            ticker,
+            evidence_limit=COMPACT_EVIDENCE_ROWS,
+            file_limit=COMPACT_FILE_ROWS,
+        ),
+    )
+    grid_payload = _timed(
+        "grid_compact",
+        timings,
+        lambda: _load_grid_payload(
+            ticker,
+            refresh_finviz=refresh_finviz,
+            engine=engine,
+            include_price_history=False,
+            chart_points=None,
+            feature_limit=8,
+        ),
+    )
+    payload = _assemble_dad_response(ticker, workbook, grid_payload, timings=timings, compact=True)
+    _timed("cache_write", timings, lambda: _write_summary_cache(engine, ticker, db_path, payload, timings))
+    payload["performance"] = {"timings_ms": timings, "total_ms": round(sum(timings.values()), 1)}
+    _log_slow_ticker(ticker, timings, route="gold_compact")
+    return payload
+
+
+def _sse_event(event: str, payload: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, default=str)}\n\n"
+
+
+def _build_evidence_payload(
+    ticker: str,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    timings: dict[str, float] = {}
+    workbook = _timed(
+        "workbook_evidence",
+        timings,
+        lambda: _load_workbook_context(
+            ticker,
+            evidence_limit=limit,
+            evidence_offset=offset,
+            file_limit=MAX_FILE_ROWS,
+        ),
+    )
+    payload = {
+        "ticker": ticker,
+        "status": workbook.get("status", "unavailable"),
+        "summary": workbook.get("summary"),
+        "workbook": workbook.get("workbook", {"files": [], "sheets": [], "evidence": []}),
+        "source_lanes": workbook.get("source_lanes", []),
+        "dad_stats": workbook.get("dad_stats", []),
+        "fit_signals": workbook.get("fit_signals", []),
+        "page": workbook.get("page", {"limit": limit, "offset": offset, "returned": 0}),
+        "performance": {"timings_ms": timings, "total_ms": round(sum(timings.values()), 1)},
+    }
+    return payload
+
+
+def _build_chart_payload(
+    ticker: str,
+    *,
+    range_name: str = "1Y",
+    points: int = DEFAULT_CHART_POINTS,
+) -> dict[str, Any]:
+    timings: dict[str, float] = {}
+    bounded_points = max(20, min(points, MAX_CHART_POINTS))
+    engine = get_db_engine()
+    grid = _timed(
+        "grid_chart",
+        timings,
+        lambda: _grid_market_context(
+            engine,
+            ticker,
+            days=_range_to_days(range_name),
+            include_price_history=True,
+            max_points=bounded_points,
+            feature_limit=12,
+        ),
+    )
+    grid["source_freshness"] = _timed(
+        "source_freshness",
+        timings,
+        lambda: _source_freshness(
+            engine,
+            [
+                "yfinance",
+                FINVIZ_SOURCE_NAME,
+                "TradingView",
+                "Social_Smart_Money",
+                "SEC_INSIDER",
+                "Unusual_Whales",
+            ],
+        ),
+    )
+    signals = _timed("signals", timings, lambda: _latest_signal_context(engine, ticker))
+    compact_grid = _compact_grid(
+        grid,
+        include_price_history=True,
+        max_points=bounded_points,
+    )
+    return {
+        "ticker": ticker,
+        "status": compact_grid.get("status", "missing"),
+        "payload_mode": "chart",
+        "range": (range_name or "1Y").upper(),
+        "points": bounded_points,
+        "grid_data": compact_grid,
+        "price_history": compact_grid.get("price_history", []),
+        "metrics": compact_grid.get("metrics", {}),
+        "features": compact_grid.get("features", []),
+        "source_freshness": compact_grid.get("source_freshness", []),
+        "tradingview_signals": signals.get("tradingview_signals", []),
+        "regime": signals.get("regime"),
+        "signals": _compact_signals(signals, include_rows=True),
+        "performance": {"timings_ms": timings, "total_ms": round(sum(timings.values()), 1)},
+    }
+
+
+def _build_finviz_payload(
+    ticker: str,
+    *,
+    refresh_finviz: bool = False,
+) -> dict[str, Any]:
+    timings: dict[str, float] = {}
+    engine = get_db_engine()
+    finviz = _timed(
+        "finviz",
+        timings,
+        lambda: _compact_finviz(
+            _get_finviz_profile(engine, ticker, refresh=refresh_finviz),
+            include_fields=True,
+        ),
+    )
+    return {
+        "ticker": ticker,
+        "status": finviz.get("status", "unavailable"),
+        "payload_mode": "finviz",
+        "finviz": finviz,
+        "performance": {"timings_ms": timings, "total_ms": round(sum(timings.values()), 1)},
+    }
+
+
+def _build_options_payload(
+    ticker: str,
+    *,
+    days: int = 90,
+    limit: int = 90,
+) -> dict[str, Any]:
+    timings: dict[str, float] = {}
+    engine = get_db_engine()
+    options = _timed(
+        "options",
+        timings,
+        lambda: _options_history_context(engine, ticker, days=days, limit=limit),
+    )
+    return {
+        "ticker": ticker,
+        "status": options.get("status", "missing"),
+        "payload_mode": "options",
+        "options": options,
+        "latest": options.get("latest"),
+        "history": options.get("history", []),
+        "freshness": options.get("freshness", _freshness_state(None)),
+        "performance": {"timings_ms": timings, "total_ms": round(sum(timings.values()), 1)},
+    }
+
+
 @router.get("/ticker/{ticker}/gold")
 def get_dad_ticker_gold(
+    ticker: str,
+    refresh_finviz: bool = Query(
+        default=False,
+        description="Explicitly refresh the ticker's Finviz snapshot before returning cached rows.",
+    ),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return the compact first-screen Dad ticker payload."""
+    ticker_upper = _normalize_ticker(ticker)
+    if not ticker_upper:
+        return {"ticker": "", "status": "invalid", "message": "Enter a ticker symbol."}
+    return _build_compact_dad_response(
+        ticker_upper,
+        refresh_finviz=refresh_finviz,
+        use_cache=not refresh_finviz,
+    )
+
+
+@router.get("/ticker/{ticker}/evidence")
+def get_dad_ticker_evidence(
+    ticker: str,
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return paged workbook evidence rows and workbook source lanes."""
+    ticker_upper = _normalize_ticker(ticker)
+    if not ticker_upper:
+        return {"ticker": "", "status": "invalid", "message": "Enter a ticker symbol."}
+    return _build_evidence_payload(ticker_upper, limit=limit, offset=offset)
+
+
+@router.get("/ticker/{ticker}/chart")
+def get_dad_ticker_chart(
+    ticker: str,
+    range: str = Query("1Y", description="Chart range: 1M, 3M, 6M, 1Y, 2Y, 5Y, 10Y, MAX."),
+    points: int = Query(DEFAULT_CHART_POINTS, ge=20, le=MAX_CHART_POINTS),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return bounded price history and chart-adjacent GRID signals."""
+    ticker_upper = _normalize_ticker(ticker)
+    if not ticker_upper:
+        return {"ticker": "", "status": "invalid", "message": "Enter a ticker symbol."}
+    return _build_chart_payload(ticker_upper, range_name=range, points=points)
+
+
+@router.get("/ticker/{ticker}/finviz")
+def get_dad_ticker_finviz(
+    ticker: str,
+    refresh_finviz: bool = Query(False),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return the full cached Finviz snapshot, optionally refreshing stale rows."""
+    ticker_upper = _normalize_ticker(ticker)
+    if not ticker_upper:
+        return {"ticker": "", "status": "invalid", "message": "Enter a ticker symbol."}
+    return _build_finviz_payload(ticker_upper, refresh_finviz=refresh_finviz)
+
+
+@router.get("/ticker/{ticker}/options")
+def get_dad_ticker_options(
+    ticker: str,
+    days: int = Query(90, ge=1, le=365),
+    limit: int = Query(90, ge=1, le=250),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return bounded options daily signal history for the ticker."""
+    ticker_upper = _normalize_ticker(ticker)
+    if not ticker_upper:
+        return {"ticker": "", "status": "invalid", "message": "Enter a ticker symbol."}
+    return _build_options_payload(ticker_upper, days=days, limit=limit)
+
+
+@router.get("/ticker/{ticker}/gold/stream")
+def stream_dad_ticker_gold(
+    ticker: str,
+    refresh_finviz: bool = Query(False),
+    _token: str = Depends(require_auth),
+) -> StreamingResponse:
+    """Stream compact payload first, then hydrate evidence, chart, Finviz, and options."""
+    ticker_upper = _normalize_ticker(ticker)
+
+    def generate():
+        if not ticker_upper:
+            yield _sse_event("error", {"ticker": "", "message": "Enter a ticker symbol."})
+            return
+        try:
+            yield _sse_event("start", {"ticker": ticker_upper})
+            yield _sse_event(
+                "compact",
+                _build_compact_dad_response(
+                    ticker_upper,
+                    refresh_finviz=refresh_finviz,
+                    use_cache=not refresh_finviz,
+                ),
+            )
+            yield _sse_event("evidence", _build_evidence_payload(ticker_upper, limit=50, offset=0))
+            yield _sse_event("chart", _build_chart_payload(ticker_upper, range_name="1Y", points=DEFAULT_CHART_POINTS))
+            yield _sse_event("finviz", _build_finviz_payload(ticker_upper, refresh_finviz=refresh_finviz))
+            yield _sse_event("options", _build_options_payload(ticker_upper, days=90, limit=90))
+            yield _sse_event("done", {"ticker": ticker_upper})
+        except Exception as exc:
+            log.exception("Dad ticker stream failed for {t}", t=ticker_upper)
+            yield _sse_event("error", {"ticker": ticker_upper, "message": str(exc)})
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _get_dad_ticker_gold_legacy(
     ticker: str,
     refresh_finviz: bool = Query(
         default=False,

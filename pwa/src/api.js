@@ -336,6 +336,76 @@ class GRIDApi {
         });
     }
 
+    async getDadTickerEvidence(ticker, { limit = 50, offset = 0 } = {}) {
+        const params = new URLSearchParams({
+            limit: String(limit),
+            offset: String(offset),
+        });
+        return this._fetch(`/api/v1/dad/ticker/${encodeURIComponent(ticker)}/evidence?${params.toString()}`);
+    }
+
+    async getDadTickerChart(ticker, { range = '1Y', points = 220 } = {}) {
+        const params = new URLSearchParams({
+            range,
+            points: String(points),
+        });
+        return this._fetch(`/api/v1/dad/ticker/${encodeURIComponent(ticker)}/chart?${params.toString()}`);
+    }
+
+    async getDadTickerFinviz(ticker, { refreshFinviz = false } = {}) {
+        const qs = refreshFinviz ? '?refresh_finviz=true' : '';
+        return this._fetch(`/api/v1/dad/ticker/${encodeURIComponent(ticker)}/finviz${qs}`, {
+            gridForce: refreshFinviz,
+        });
+    }
+
+    async getDadTickerOptions(ticker, { days = 90, limit = 90 } = {}) {
+        const params = new URLSearchParams({
+            days: String(days),
+            limit: String(limit),
+        });
+        return this._fetch(`/api/v1/dad/ticker/${encodeURIComponent(ticker)}/options?${params.toString()}`);
+    }
+
+    streamDadTickerGold(ticker, {
+        refreshFinviz = false,
+        onEvent = null,
+        onError = null,
+        onDone = null,
+    } = {}) {
+        const params = new URLSearchParams();
+        if (refreshFinviz) params.set('refresh_finviz', 'true');
+        if (this.token) params.set('token', this.token);
+        const suffix = params.toString() ? `?${params.toString()}` : '';
+        const source = new EventSource(`${this.baseUrl}/api/v1/dad/ticker/${encodeURIComponent(ticker)}/gold/stream${suffix}`);
+        const eventNames = ['start', 'compact', 'evidence', 'chart', 'finviz', 'options', 'done'];
+        const handleNamedEvent = (name, event) => {
+            let payload = {};
+            try {
+                payload = event?.data ? JSON.parse(event.data) : {};
+            } catch (_) {
+                payload = { raw: event?.data || '' };
+            }
+            onEvent?.(name, payload);
+            if (name === 'done') {
+                onDone?.(payload);
+                source.close();
+            }
+        };
+
+        eventNames.forEach(name => {
+            source.addEventListener(name, event => handleNamedEvent(name, event));
+        });
+        source.addEventListener('error', event => {
+            if (event?.data) {
+                handleNamedEvent('error', event);
+            } else {
+                onError?.(event);
+            }
+        });
+        return source;
+    }
+
     async _fetchForm(path, form) {
         const headers = {};
         if (this.token) {

@@ -472,6 +472,80 @@ class GRIDApi {
             gridForce: refreshFinviz,
         });
     }
+    async getDadTickerEvidence(ticker: string, { limit = 50, offset = 0 }: { limit?: number; offset?: number } = {}) {
+        const params = new URLSearchParams({
+            limit: String(limit),
+            offset: String(offset),
+        });
+        return this._fetch(`/api/v1/dad/ticker/${encodeURIComponent(ticker)}/evidence?${params.toString()}`);
+    }
+    async getDadTickerChart(ticker: string, { range = '1Y', points = 220 }: { range?: string; points?: number } = {}) {
+        const params = new URLSearchParams({
+            range,
+            points: String(points),
+        });
+        return this._fetch(`/api/v1/dad/ticker/${encodeURIComponent(ticker)}/chart?${params.toString()}`);
+    }
+    async getDadTickerFinviz(ticker: string, { refreshFinviz = false }: { refreshFinviz?: boolean } = {}) {
+        const qs = refreshFinviz ? '?refresh_finviz=true' : '';
+        return this._fetch(`/api/v1/dad/ticker/${encodeURIComponent(ticker)}/finviz${qs}`, {
+            gridForce: refreshFinviz,
+        });
+    }
+    async getDadTickerOptions(ticker: string, { days = 90, limit = 90 }: { days?: number; limit?: number } = {}) {
+        const params = new URLSearchParams({
+            days: String(days),
+            limit: String(limit),
+        });
+        return this._fetch(`/api/v1/dad/ticker/${encodeURIComponent(ticker)}/options?${params.toString()}`);
+    }
+    streamDadTickerGold(
+        ticker: string,
+        {
+            refreshFinviz = false,
+            onEvent = null,
+            onError = null,
+            onDone = null,
+        }: {
+            refreshFinviz?: boolean;
+            onEvent?: ((eventName: string, payload: unknown) => void) | null;
+            onError?: ((event: Event) => void) | null;
+            onDone?: ((payload: unknown) => void) | null;
+        } = {},
+    ): EventSource {
+        const params = new URLSearchParams();
+        if (refreshFinviz) params.set('refresh_finviz', 'true');
+        if (this.token) params.set('token', this.token);
+        const suffix = params.toString() ? `?${params.toString()}` : '';
+        const source = new EventSource(`${this.baseUrl}/api/v1/dad/ticker/${encodeURIComponent(ticker)}/gold/stream${suffix}`);
+        const eventNames = ['start', 'compact', 'evidence', 'chart', 'finviz', 'options', 'done'];
+        const handleNamedEvent = (name: string, event: MessageEvent) => {
+            let payload: unknown = {};
+            try {
+                payload = event?.data ? JSON.parse(event.data) : {};
+            } catch (_) {
+                payload = { raw: event?.data || '' };
+            }
+            onEvent?.(name, payload);
+            if (name === 'done') {
+                onDone?.(payload);
+                source.close();
+            }
+        };
+
+        eventNames.forEach(name => {
+            source.addEventListener(name, event => handleNamedEvent(name, event as MessageEvent));
+        });
+        source.addEventListener('error', event => {
+            const maybeMessage = event as MessageEvent;
+            if (maybeMessage.data) {
+                handleNamedEvent('error', maybeMessage);
+            } else {
+                onError?.(event);
+            }
+        });
+        return source;
+    }
     async getWatchlistEnriched(limit: number = 20) {
         return this._fetch(`/api/v1/watchlist/enriched?limit=${limit}`);
     }

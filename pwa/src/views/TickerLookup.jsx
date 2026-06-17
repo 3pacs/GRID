@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
     AlertTriangle,
     BarChart3,
@@ -17,6 +17,8 @@ import { api } from '../api.js';
 import PriceChart from '../components/PriceChart.jsx';
 
 const QUICK_TICKERS = ['RXT', 'PURR'];
+const DETAIL_STATUS_IDLE = { evidence: 'idle', chart: 'idle', finviz: 'idle', options: 'idle' };
+const DETAIL_STATUS_LOADING = { evidence: 'loading', chart: 'loading', finviz: 'loading', options: 'loading' };
 
 function cleanTicker(value) {
     return String(value || '').replace(/[^A-Za-z0-9.^-]/g, '').toUpperCase().slice(0, 12);
@@ -75,6 +77,44 @@ function stateClass(state) {
     if (state === 'watch' || state === 'aging') return 'tl-state-watch';
     if (state === 'caution' || state === 'stale') return 'tl-state-caution';
     return 'tl-state-muted';
+}
+
+function normalizeChartPayload(payload) {
+    const grid = payload?.grid_data || {};
+    return {
+        ...grid,
+        price_history: payload?.price_history || grid.price_history || [],
+        metrics: payload?.metrics || grid.metrics || {},
+        features: payload?.features || grid.features || [],
+        source_freshness: payload?.source_freshness || grid.source_freshness || [],
+        tradingview_signals: payload?.tradingview_signals || payload?.signals?.tradingview_signals || [],
+        regime: payload?.regime || payload?.signals?.regime || null,
+    };
+}
+
+function mergeTickerData(current, patch) {
+    if (!patch) return current;
+    const base = current || {};
+    const next = {
+        ...base,
+        ...patch,
+    };
+    if (base.workbook || patch.workbook) {
+        next.workbook = { ...(base.workbook || {}), ...(patch.workbook || {}) };
+    }
+    if (base.grid_data || patch.grid_data) {
+        next.grid_data = { ...(base.grid_data || {}), ...(patch.grid_data || {}) };
+    }
+    if (base.signals || patch.signals) {
+        next.signals = { ...(base.signals || {}), ...(patch.signals || {}) };
+    }
+    if (patch.finviz?.finviz) {
+        next.finviz = patch.finviz.finviz;
+    }
+    if (patch.options?.options) {
+        next.options = patch.options.options;
+    }
+    return next;
 }
 
 function DecisionStack({ decision }) {
@@ -223,6 +263,7 @@ function EvidenceTable({ rows }) {
 }
 
 export default function TickerLookup() {
+    const streamRef = useRef(null);
     const [query, setQuery] = useState('RXT');
     const [activeTicker, setActiveTicker] = useState('RXT');
     const [data, setData] = useState(null);
@@ -230,6 +271,7 @@ export default function TickerLookup() {
     const [period, setPeriod] = useState('1Y');
     const [loading, setLoading] = useState(false);
     const [marketLoading, setMarketLoading] = useState(false);
+    const [sectionStatus, setSectionStatus] = useState(DETAIL_STATUS_IDLE);
     const [error, setError] = useState('');
 
     const summary = data?.summary || {};
@@ -242,7 +284,7 @@ export default function TickerLookup() {
     const gridData = data?.grid_data || {};
     const dadStats = data?.dad_stats || [];
     const sourceLanes = data?.source_lanes || [];
-    const tvSignals = marketData?.tradingview_signals || [];
+    const tvSignals = marketData?.tradingview_signals || data?.signals?.tradingview_signals || [];
     const prices = marketData?.price_history || [];
     const latestPrice = prices.length ? prices[prices.length - 1]?.value : marketData?.live_price?.price;
     const firstPrice = prices.length ? prices[0]?.value : null;
@@ -260,14 +302,22 @@ export default function TickerLookup() {
         return values.map(value => Math.max(6, Math.round((value / max) * 100)));
     }, [summary]);
 
+    function updateSectionStatus(section, status) {
+        setSectionStatus(current => ({ ...current, [section]: status }));
+    }
+
     async function loadMarket(nextTicker, nextPeriod = period) {
         setMarketLoading(true);
-        const result = await api.getTickerAnalysis(nextTicker, nextPeriod);
+        updateSectionStatus('chart', 'loading');
+        const result = await api.getDadTickerChart(nextTicker, { range: nextPeriod, points: 260 });
         setMarketLoading(false);
         if (!result?.error) {
-            setMarketData(result);
+            setMarketData(normalizeChartPayload(result));
+            setData(current => mergeTickerData(current, { grid_data: result.grid_data, signals: result.signals }));
+            updateSectionStatus('chart', 'ready');
         } else {
             setMarketData(null);
+            updateSectionStatus('chart', 'error');
         }
     }
 
@@ -276,32 +326,118 @@ export default function TickerLookup() {
         await loadMarket(activeTicker, nextPeriod);
     }
 
+    async function hydrateDetails(ticker, { refreshFinviz = false } = {}) {
+        setSectionStatus(DETAIL_STATUS_LOADING);
+        setMarketLoading(true);
+        const [evidenceResult, chartResult, finvizResult, optionsResult] = await Promise.all([
+            api.getDadTickerEvidence(ticker, { limit: 50, offset: 0 }),
+            api.getDadTickerChart(ticker, { range: period, points: 260 }),
+            api.getDadTickerFinviz(ticker, { refreshFinviz }),
+            api.getDadTickerOptions(ticker, { days: 90, limit: 90 }),
+        ]);
+
+        setMarketLoading(false);
+        if (!evidenceResult?.error) {
+            setData(current => mergeTickerData(current, evidenceResult));
+        }
+        if (!chartResult?.error) {
+            setMarketData(normalizeChartPayload(chartResult));
+            setData(current => mergeTickerData(current, { grid_data: chartResult.grid_data, signals: chartResult.signals }));
+        }
+        if (!finvizResult?.error) {
+            setData(current => mergeTickerData(current, { finviz: finvizResult.finviz }));
+        }
+        if (!optionsResult?.error) {
+            setData(current => mergeTickerData(current, { options: optionsResult.options }));
+        }
+        setSectionStatus({
+            evidence: evidenceResult?.error ? 'error' : 'ready',
+            chart: chartResult?.error ? 'error' : 'ready',
+            finviz: finvizResult?.error ? 'error' : 'ready',
+            options: optionsResult?.error ? 'error' : 'ready',
+        });
+    }
+
+    function startDetailStream(ticker, { refreshFinviz = false } = {}) {
+        streamRef.current?.close();
+        let completed = false;
+        streamRef.current = api.streamDadTickerGold(ticker, {
+            refreshFinviz,
+            onEvent: (eventName, payload) => {
+                if (eventName === 'compact') {
+                    setData(current => mergeTickerData(current, payload));
+                }
+                if (eventName === 'evidence') {
+                    setData(current => mergeTickerData(current, payload));
+                    updateSectionStatus('evidence', 'ready');
+                }
+                if (eventName === 'chart') {
+                    setMarketData(normalizeChartPayload(payload));
+                    setMarketLoading(false);
+                    setData(current => mergeTickerData(current, { grid_data: payload.grid_data, signals: payload.signals }));
+                    updateSectionStatus('chart', 'ready');
+                }
+                if (eventName === 'finviz') {
+                    setData(current => mergeTickerData(current, { finviz: payload.finviz }));
+                    updateSectionStatus('finviz', 'ready');
+                }
+                if (eventName === 'options') {
+                    setData(current => mergeTickerData(current, { options: payload.options }));
+                    updateSectionStatus('options', 'ready');
+                }
+                if (eventName === 'error') {
+                    completed = true;
+                    setError(payload?.message || 'Ticker detail stream failed.');
+                    setMarketLoading(false);
+                }
+            },
+            onDone: () => {
+                completed = true;
+                setMarketLoading(false);
+                streamRef.current = null;
+            },
+            onError: () => {
+                if (completed) return;
+                completed = true;
+                streamRef.current?.close();
+                streamRef.current = null;
+                hydrateDetails(ticker, { refreshFinviz });
+            },
+        });
+    }
+
     async function lookup(nextTicker = query, { refreshFinviz = false } = {}) {
         const ticker = cleanTicker(nextTicker);
         if (!ticker) return;
+        streamRef.current?.close();
+        streamRef.current = null;
         setQuery(ticker);
         setActiveTicker(ticker);
         setLoading(true);
         setMarketLoading(true);
+        setSectionStatus(DETAIL_STATUS_LOADING);
         setError('');
-        const [result, market] = await Promise.all([
-            api.getDadTickerGold(ticker, { refreshFinviz }),
-            api.getTickerAnalysis(ticker, period),
-        ]);
+        const result = await api.getDadTickerGold(ticker, { refreshFinviz });
         setLoading(false);
-        setMarketLoading(false);
         if (result?.error) {
             setError(result.message || 'Ticker lookup failed.');
             setData(null);
-            setMarketData(market?.error ? null : market);
+            setMarketData(null);
+            setMarketLoading(false);
+            setSectionStatus(DETAIL_STATUS_IDLE);
             return;
         }
         setData(result);
-        setMarketData(market?.error ? null : market);
+        setMarketData(normalizeChartPayload({ grid_data: result.grid_data, signals: result.signals }));
+        startDetailStream(ticker, { refreshFinviz });
     }
 
     useEffect(() => {
         lookup('RXT');
+        return () => {
+            streamRef.current?.close();
+            streamRef.current = null;
+        };
     }, []);
 
     return (
@@ -342,6 +478,17 @@ export default function TickerLookup() {
                         <button key={ticker} onClick={() => lookup(ticker)}>{ticker}</button>
                     ))}
                 </div>
+
+                {data ? (
+                    <div className="tl-hydration-strip" aria-label="Ticker detail hydration">
+                        {Object.entries(sectionStatus).map(([section, status]) => (
+                            <span key={section} className={`tl-hydration-${status}`}>
+                                <strong>{section}</strong>
+                                {status}
+                            </span>
+                        ))}
+                    </div>
+                ) : null}
             </section>
 
             {error ? (
@@ -406,7 +553,7 @@ export default function TickerLookup() {
             <section className="tl-two tl-wide tl-stack-grid">
                 <FinvizPanel
                     finviz={finviz}
-                    refreshing={loading}
+                    refreshing={loading || sectionStatus.finviz === 'loading'}
                     onRefresh={() => lookup(activeTicker, { refreshFinviz: true })}
                 />
                 <SourceFreshness sources={gridData?.source_freshness || []} />
@@ -673,6 +820,32 @@ const CSS = `
     color: #e7f1eb;
     border: 1px solid #274238;
 }
+.tl-hydration-strip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+.tl-hydration-strip span {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    min-height: 30px;
+    padding: 0 9px;
+    border: 1px solid #263a31;
+    border-radius: 8px;
+    background: #0b1511;
+    color: #a9bbb1;
+    font-size: 12px;
+    text-transform: uppercase;
+}
+.tl-hydration-strip strong {
+    color: #f4fbf6;
+    font-family: 'IBM Plex Mono', monospace;
+    letter-spacing: 0;
+}
+.tl-hydration-ready { border-color: #2a8c61 !important; color: #a9f3c9 !important; }
+.tl-hydration-loading { border-color: #b78a2b !important; color: #ffd98a !important; }
+.tl-hydration-error { border-color: #9b4a48 !important; color: #ffb0aa !important; }
 .tl-error {
     max-width: 1280px;
     margin: 0 auto 16px;

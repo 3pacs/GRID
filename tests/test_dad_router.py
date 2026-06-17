@@ -1,10 +1,15 @@
 from api.routers.dad import (
+    _compact_finviz,
+    _compact_grid,
+    _downsample_points,
     _fit_signals,
     _gold_from_summary,
     _grid_decision_stack,
     _normalize_ticker,
     _parse_finviz_value,
+    _range_to_days,
     _shorten,
+    _sse_event,
 )
 
 
@@ -71,6 +76,71 @@ def test_parse_finviz_value_handles_suffixes_and_text():
     assert _parse_finviz_value("14.5%") == 14.5
     assert _parse_finviz_value("-") is None
     assert _parse_finviz_value("Technology") == "Technology"
+
+
+def test_downsample_points_preserves_edges():
+    points = [{"date": f"2026-01-{idx:02d}", "value": idx} for idx in range(1, 101)]
+
+    sampled = _downsample_points(points, 12)
+
+    assert len(sampled) <= 12
+    assert sampled[0] == points[0]
+    assert sampled[-1] == points[-1]
+
+
+def test_compact_grid_omits_history_by_default():
+    grid = {
+        "status": "ready",
+        "price_history": [{"date": "2026-01-01", "value": 10.0}],
+        "price_points_total": 250,
+        "metrics": {"latest_price": 10.0},
+    }
+
+    compact = _compact_grid(grid)
+
+    assert compact["price_history"] == []
+    assert compact["price_points_total"] == 250
+    assert compact["price_points_returned"] == 0
+
+
+def test_compact_grid_can_return_bounded_history():
+    grid = {
+        "status": "ready",
+        "price_history": [{"date": f"2026-01-{idx:02d}", "value": idx} for idx in range(1, 31)],
+    }
+
+    compact = _compact_grid(grid, include_price_history=True, max_points=7)
+
+    assert len(compact["price_history"]) <= 7
+    assert compact["price_points_returned"] == len(compact["price_history"])
+    assert compact["price_history"][0]["value"] == 1
+    assert compact["price_history"][-1]["value"] == 30
+
+
+def test_compact_finviz_omits_fields_unless_requested():
+    finviz = {
+        "status": "ready",
+        "field_count": 1,
+        "stats": [{"id": "pe_ratio", "label": "P/E", "raw_value": "20"}],
+        "fields": {"pe_ratio": {"parsed": 20.0}},
+    }
+
+    assert "fields" not in _compact_finviz(finviz)
+    assert _compact_finviz(finviz, include_fields=True)["fields"]["pe_ratio"]["parsed"] == 20.0
+
+
+def test_range_to_days_defaults_and_maps_long_ranges():
+    assert _range_to_days("1M") == 31
+    assert _range_to_days("10Y") == 3650
+    assert _range_to_days("unknown") == 365
+
+
+def test_sse_event_formats_named_json_event():
+    frame = _sse_event("chart", {"ticker": "RXT"})
+
+    assert frame.startswith("event: chart\ndata: ")
+    assert frame.endswith("\n\n")
+    assert '"ticker": "RXT"' in frame
 
 
 def test_grid_decision_stack_uses_workbook_grid_and_fundamentals():
