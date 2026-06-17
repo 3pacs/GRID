@@ -35,6 +35,8 @@ _TRUST_REGISTER_MIN_STRENGTH: float = 0.0  # always register
 _BUY_SIGNAL_TYPES: frozenset = frozenset({"BUY", "buy", "LONG", "long"})
 _SELL_SIGNAL_TYPES: frozenset = frozenset({"SELL", "sell", "SHORT", "short"})
 
+_CROSS_LENS_SUPPLY_SHOCK_SOURCE_TYPE: str = "cross_lens_supply_shock"
+
 
 #: Multiplicative trust factor applied to ``cross_lens_supply_shock`` rows
 #: that cite an edge which just turned weak. Mirrors the value used in
@@ -205,7 +207,7 @@ def on_edge_validated(
                             :floor,
                             COALESCE(s.trust_score, 0.5) * :factor
                         )
-                    WHERE s.source_type = 'cross_lens'
+                    WHERE s.source_type = :source_type
                       AND s.id IN (
                           SELECT s2.id
                           FROM signal_sources s2
@@ -219,6 +221,7 @@ def on_edge_validated(
                     "floor": _MIN_TRUST_FLOOR,
                     "factor": _WEAK_EDGE_TRUST_FACTOR,
                     "eid": edge_id,
+                    "source_type": _CROSS_LENS_SUPPLY_SHOCK_SOURCE_TYPE,
                 },
             )
             downgraded = getattr(result, "rowcount", 0) or 0
