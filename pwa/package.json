@@ -13,7 +13,7 @@
   },
   "dependencies": {
     "@deck.gl/aggregation-layers": "^9.2.11",
-    "@deck.gl/core": "^9.2.11",
+    "@deck.gl/core": "^9.3.4",
     "@deck.gl/layers": "^9.2.11",
     "@deck.gl/react": "^9.2.11",
     "@react-sigma/core": "^5.0.6",
