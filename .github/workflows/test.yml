@@ -143,6 +143,9 @@ jobs:
       - name: Ruff lint
         run: ruff check . --select E,W,F --ignore E501 --exit-zero
 
+      - name: Obsidian wikilink integrity
+        run: python scripts/obsidian_backlinks.py --check
+
       - name: Security scan (high severity)
         run: bandit -r api/ store/ intelligence/ -lll
 
