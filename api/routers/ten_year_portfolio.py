@@ -35,7 +35,6 @@ from strategy.portfolio_workbook_plan import (
 router = APIRouter(
     prefix="/api/v1/ten-year-portfolio",
     tags=["ten-year-portfolio"],
-    dependencies=[Depends(require_auth)],
 )
 
 EXCEL_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -299,7 +298,7 @@ async def weekly_ten_year_portfolio(
         return {"status": "error", "error": "Ten-year portfolio query failed."}
 
 
-@router.post("/workbook/analyze")
+@router.post("/workbook/analyze", dependencies=[Depends(require_auth)])
 async def analyze_private_workbook(
     file: UploadFile = File(...),
     capital: float = Query(default=1_000_000.0, ge=10_000.0, le=100_000_000.0),
@@ -322,7 +321,7 @@ async def analyze_private_workbook(
         raise HTTPException(status_code=500, detail="Workbook analysis failed.") from exc
 
 
-@router.get("/export.xlsx")
+@router.get("/export.xlsx", dependencies=[Depends(require_auth)])
 async def export_current_model_workbook(
     capital: float = Query(default=1_000_000.0, ge=10_000.0, le=100_000_000.0),
     years: int = Query(default=10, ge=3, le=20),
@@ -386,7 +385,7 @@ async def export_current_model_workbook(
         raise HTTPException(status_code=500, detail="Workbook export failed.") from exc
 
 
-@router.post("/workbook/export.xlsx")
+@router.post("/workbook/export.xlsx", dependencies=[Depends(require_auth)])
 async def export_private_workbook_plan(
     file: UploadFile = File(...),
     capital: float = Query(default=1_000_000.0, ge=10_000.0, le=100_000_000.0),

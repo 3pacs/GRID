@@ -234,6 +234,7 @@ _EXPENSIVE_PATHS = {
     "/api/v1/intel/ask", "/api/v1/intel/briefing",
     "/api/v1/intelligence/risk-map", "/api/v1/intelligence/globe",
     "/api/v1/intelligence/dashboard",
+    "/api/v1/ten-year-portfolio/weekly",
 }
 
 
