@@ -1,6 +1,8 @@
 name: Deploy to Grid Server
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       skip_tests:
@@ -8,10 +10,10 @@ on:
         required: false
         default: 'false'
       do_restart:
-        description: 'Restart grid-api after deploy (opt-in; default is no-restart verification only)'
+        description: 'Restart grid-api after deploy'
         type: boolean
         required: false
-        default: false
+        default: true
 
 env:
   DEPLOY_PATH: /data/grid_v4/grid_release
@@ -63,7 +65,7 @@ jobs:
     if: always() && (needs.verify.result == 'success' || needs.verify.result == 'skipped')
 
     steps:
-      - name: Build release tree (no restart)
+      - name: Build release tree
         run: |
           set -euo pipefail
           cd "$DEPLOY_PATH"
@@ -72,8 +74,8 @@ jobs:
           cd pwa && npm ci && npm run build && cd ..
           python -m alembic upgrade head || echo "no migrations"
 
-      - name: Restart grid-api (opt-in only)
-        if: ${{ inputs.do_restart == true }}
+      - name: Restart grid-api
+        if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
         run: |
           set -euo pipefail
           sudo systemctl restart grid-api
@@ -84,6 +86,7 @@ jobs:
           set -euo pipefail
           curl -fsS http://localhost:8000/api/v1/system/health
           curl -fsS http://localhost:8000/openapi.json | grep -F '"/api/v1/intelligence/actor-network"'
+          curl -fsS http://localhost:8000/openapi.json | grep -F '"/api/v1/dad/ticker/{ticker}/gold/stream"'
 
       - name: Notify success
         if: success()
