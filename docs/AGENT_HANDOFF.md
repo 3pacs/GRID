@@ -1,3 +1,12 @@
+## 2026-06-18 23:10 UTC — 2026-06-18-2304
+**Why this matters next run:** Two items from the 2026-06-15 handoff "Remaining unworked alpha_research items from PR #299" list are now shipped — strike them off before re-picking:
+- **[P1] split_adjuster.py tests** → shipped as **PR #339** (`tests/test_split_adjuster.py`, 31 cases, 393 LOC, ruff clean, 0.48s).
+- **[P2] heartbeat.py `except: pass` → log.warning** → already shipped yesterday as **PR #338** (the 2026-06-15 handoff was written before that pick landed).
+
+Next pickable from alpha_research is **[P1] conviction_scorer.py 7 layer scorer tests** or the larger **[P1] conviction_scorer.py PIT plumbing** (caveat: changes public signatures wired through `api/routers/signals.py:194,226` — needs default `as_of_date=date.today()` to stay backward-compat). The physics/ PR #305 list from 2026-06-15 is fully untouched and the top item (`physics/verify.py:354` N+1 batch fix) is the highest-leverage single-PR pick on the queue.
+
+One small test-data gotcha worth recording: when fabricating pre-split price history for `split_adjuster` tests, the older prices must NOT drop >40% relative to the next bar with a ratio ≥ 2 to the next bar, or `detect_splits` will catch a phantom 3rd split. Run `detect_splits(prices)` as a sanity assertion before any compounding assertion (the TSLA test in PR #339 does this).
+
 ## 2026-06-15 23:35 UTC — 2026-06-15-2305
 **Why this matters next run:** A second auditor-feed PR (#305, physics/, opened 2026-06-14) is now on the queue alongside still-open PR #299 (alpha_research/). Same posture as #299: the PR only modifies `docs/PUNCH-LIST-2026-05-13.md`, so picking from its 11 underlying findings directly is unblocked — verify via `mcp__github__pull_request_read get_files` (this run did exactly that).
 
