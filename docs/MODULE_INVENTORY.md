@@ -3519,9 +3519,9 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `datetime`, `loguru`, `numpy`, `pandas`, `sqlalchemy`, `store`, `typing`
 **Imported by:** `api/routers/flows.py`, `api/routers/physics.py`
 
-#### `physics/transforms.py` — 679 LOC
+#### `physics/transforms.py` — 626 LOC
 **Docstring:** GRID physics-inspired market transforms.
-**Functions:** `kinetic_energy`, `potential_energy`, `total_energy`, `market_temperature`, `entropy_rate`, `phase_velocity`, `estimate_ou_parameters`, `ou_mean_reversion_signal`, `ou_displacement`, `langevin_drift`, `langevin_diffusion`, `fokker_planck_density`, `relaxation_time`, `half_life`, `hurst_exponent`, `rolling_hurst`, `transfer_entropy`
+**Functions:** `kinetic_energy`, `potential_energy`, `total_energy`, `market_temperature`, `entropy_rate`, `phase_velocity`, `estimate_ou_parameters`, `ou_mean_reversion_signal`, `ou_displacement`, `langevin_drift`, `langevin_diffusion`, `fokker_planck_density`, `relaxation_time`, `half_life`, `hurst_exponent`, `rolling_hurst`
 **Reads:** `__future__`, `loguru`, `numpy`, `pandas`, `scipy`, `sklearn`
 **Imported by:** `api/routers/physics.py`, `features/lab.py`
 
