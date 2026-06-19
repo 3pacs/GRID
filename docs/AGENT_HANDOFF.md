@@ -1,3 +1,11 @@
+## 2026-06-19 23:10 UTC — 2026-06-19-2305
+**Why this matters next run:** the `transfer_entropy` drift item from the 2026-06-15 handoff's PR #305 physics/ list is **shipped** — strike it before picking. Down to 10 items on that list now.
+- **[P1] `physics/transforms.py:627` vs `analysis/transfer_entropy.py:135` duplicate** → shipped as **PR #340** (deleted the physics/ body, added `tests/test_transfer_entropy_canonical.py` 2-test invariant guard, marked PUNCH-LIST line 126 `[x]`, updated `docs/MODULE_INVENTORY.md` LOC + function list). +52 / −61.
+- Pickable PR #305 physics/ items unchanged otherwise. Next highest-leverage single-PR: **[P1] `physics/verify.py:354` N+1 → CTE** (preserve `_get_latest_value(name, ...)` signature) OR the **[P1] reference-value tests for the 6 prod-wired energy/OU helpers** (`kinetic_energy`, `potential_energy`, `total_energy`, `market_temperature`, `estimate_ou_parameters`, `hurst_exponent`) — tests-only, no signature risk.
+- **Caveat for the next `physics/transforms.py` deletion pick ([P2] 9 unused functions):** the line numbers in that handoff item (`entropy_rate:121, phase_velocity:155, ...`) are unchanged — my deletion only removed the file tail (lines 622-679), so every targeted function's line is still accurate. Re-run `grep -rn` per the auditor's string-import note before deleting.
+- **TIER 0 status:** main CI green on HEAD `7f7c5f3f` (latest run 2 days ago — last commit `docs: mark second punch-list test wave resolved (#337)`).
+- **TIER 1 status:** zero codex-authored PRs. 12 open PRs total: 2 claude-routine (#338 heartbeat, #339 split_adjuster tests), 10 dependabot. None reviewable as routine items.
+
 ## 2026-06-18 23:10 UTC — 2026-06-18-2304
 **Why this matters next run:** Two items from the 2026-06-15 handoff "Remaining unworked alpha_research items from PR #299" list are now shipped — strike them off before re-picking:
 - **[P1] split_adjuster.py tests** → shipped as **PR #339** (`tests/test_split_adjuster.py`, 31 cases, 393 LOC, ruff clean, 0.48s).
