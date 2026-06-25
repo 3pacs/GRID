@@ -51,54 +51,99 @@ class ConvictionReport:
     timestamp: str
 
 
-def _load_latest(conn, feature_name: str) -> float | None:
+def _resolve_as_of_date(as_of_date: date | None) -> date:
+    return as_of_date or date.today()
+
+
+def _load_latest(
+    conn,
+    feature_name: str,
+    as_of_date: date | None = None,
+) -> float | None:
+    as_of = _resolve_as_of_date(as_of_date)
     row = conn.execute(text("""
         SELECT rs.value FROM resolved_series rs
         JOIN feature_registry fr ON rs.feature_id = fr.id
-        WHERE fr.name = :n ORDER BY rs.obs_date DESC LIMIT 1
-    """), {"n": feature_name}).fetchone()
+        WHERE fr.name = :n
+          AND rs.obs_date <= :as_of
+          AND rs.release_date <= :as_of
+        ORDER BY rs.obs_date DESC, rs.release_date DESC, rs.vintage_date DESC
+        LIMIT 1
+    """), {"n": feature_name, "as_of": as_of}).fetchone()
     return float(row[0]) if row else None
 
 
-def _load_raw_latest(conn, series_pattern: str, source_id: int | None = None) -> float | None:
+def _load_raw_latest(
+    conn,
+    series_pattern: str,
+    source_id: int | None = None,
+    as_of_date: date | None = None,
+) -> float | None:
+    as_of = _resolve_as_of_date(as_of_date)
     # Use >= / < range scan instead of LIKE for index efficiency
     prefix = series_pattern.replace("%", "")
     upper = prefix[:-1] + chr(ord(prefix[-1]) + 1) if prefix else "~"
-    if source_id:
+    # raw_series does not carry release_date in live griddb; use pull_timestamp
+    # as the conservative availability proxy for PIT reads.
+    if source_id is not None:
         row = conn.execute(text("""
             SELECT value FROM raw_series
-            WHERE series_id >= :lo AND series_id < :hi AND source_id = :s
-            ORDER BY obs_date DESC LIMIT 1
-        """), {"lo": prefix, "hi": upper, "s": source_id}).fetchone()
+            WHERE series_id >= :lo AND series_id < :hi
+              AND source_id = :s
+              AND obs_date <= :as_of
+              AND pull_timestamp::date <= :as_of
+            ORDER BY obs_date DESC, pull_timestamp DESC
+            LIMIT 1
+        """), {"lo": prefix, "hi": upper, "s": source_id, "as_of": as_of}).fetchone()
     else:
         row = conn.execute(text("""
             SELECT value FROM raw_series
             WHERE series_id >= :lo AND series_id < :hi
-            ORDER BY obs_date DESC LIMIT 1
-        """), {"lo": prefix, "hi": upper}).fetchone()
+              AND obs_date <= :as_of
+              AND pull_timestamp::date <= :as_of
+            ORDER BY obs_date DESC, pull_timestamp DESC
+            LIMIT 1
+        """), {"lo": prefix, "hi": upper, "as_of": as_of}).fetchone()
     return float(row[0]) if row else None
 
 
-def _load_raw_series(conn, series_id: str, days: int = 90) -> pd.Series:
-    cutoff = date.today() - timedelta(days=days)
+def _load_raw_series(
+    conn,
+    series_id: str,
+    days: int = 90,
+    as_of_date: date | None = None,
+) -> pd.Series:
+    as_of = _resolve_as_of_date(as_of_date)
+    cutoff = as_of - timedelta(days=days)
     # Use exact match — series_id must be exact, no wildcards
     rows = conn.execute(text("""
         SELECT obs_date, value FROM raw_series
-        WHERE series_id = :s AND obs_date >= :d
-        ORDER BY obs_date
-    """), {"s": series_id, "d": cutoff}).fetchall()
+        WHERE series_id = :s
+          AND obs_date >= :d
+          AND obs_date <= :as_of
+          AND pull_timestamp::date <= :as_of
+        ORDER BY obs_date, pull_timestamp
+    """), {"s": series_id, "d": cutoff, "as_of": as_of}).fetchall()
     if not rows:
         return pd.Series(dtype=float)
     return pd.Series([r[1] for r in rows], index=pd.to_datetime([r[0] for r in rows]))
 
 
-def _load_price(conn, ticker: str) -> pd.Series:
+def _load_price(
+    conn,
+    ticker: str,
+    as_of_date: date | None = None,
+) -> pd.Series:
+    as_of = _resolve_as_of_date(as_of_date)
     feat = f"{ticker.lower()}_full"
     rows = conn.execute(text("""
         SELECT rs.obs_date, rs.value FROM resolved_series rs
         JOIN feature_registry fr ON rs.feature_id = fr.id
-        WHERE fr.name = :n ORDER BY rs.obs_date
-    """), {"n": feat}).fetchall()
+        WHERE fr.name = :n
+          AND rs.obs_date <= :as_of
+          AND rs.release_date <= :as_of
+        ORDER BY rs.obs_date, rs.release_date, rs.vintage_date
+    """), {"n": feat, "as_of": as_of}).fetchall()
     if not rows:
         return pd.Series(dtype=float)
     s = pd.Series([r[1] for r in rows], index=pd.to_datetime([r[0] for r in rows]))
@@ -110,16 +155,21 @@ def _load_price(conn, ticker: str) -> pd.Series:
 # LAYER SCORERS
 # ═══════════════════════════════════════════════════════════════
 
-def score_setup(conn, ticker: str, price: pd.Series) -> LayerResult:
+def score_setup(
+    conn,
+    ticker: str,
+    price: pd.Series,
+    as_of_date: date | None = None,
+) -> LayerResult:
     """Layer 1: Macro setup — is this the right moment?"""
     score = 0.0
     signals = []
 
-    vix = _load_latest(conn, "vix_spot")
-    hy = _load_latest(conn, "hy_oas_spread")
-    _load_latest(conn, "ofr_financial_stress")
-    psi = _load_latest(conn, "planetary_stress_index")
-    yc = _load_latest(conn, "yld_curve_2s10s")
+    vix = _load_latest(conn, "vix_spot", as_of_date=as_of_date)
+    hy = _load_latest(conn, "hy_oas_spread", as_of_date=as_of_date)
+    _load_latest(conn, "ofr_financial_stress", as_of_date=as_of_date)
+    psi = _load_latest(conn, "planetary_stress_index", as_of_date=as_of_date)
+    yc = _load_latest(conn, "yld_curve_2s10s", as_of_date=as_of_date)
 
     if price.empty:
         return LayerResult("SETUP", 0, 20, 0.95, (), False)
@@ -130,63 +180,100 @@ def score_setup(conn, ticker: str, price: pd.Series) -> LayerResult:
 
     # Drawdown severity (0-5 pts)
     if dd < -70:
-        score += 5; signals.append(f"DD={dd:.0f}% [EXTREME]")
+        score += 5
+        signals.append(f"DD={dd:.0f}% [EXTREME]")
     elif dd < -50:
-        score += 4; signals.append(f"DD={dd:.0f}% [DEEP]")
+        score += 4
+        signals.append(f"DD={dd:.0f}% [DEEP]")
     elif dd < -30:
-        score += 2; signals.append(f"DD={dd:.0f}%")
+        score += 2
+        signals.append(f"DD={dd:.0f}%")
 
     # VIX (0-5 pts)
     if vix is not None:
         if vix > 35:
-            score += 5; signals.append(f"VIX={vix:.0f} [PANIC]")
+            score += 5
+            signals.append(f"VIX={vix:.0f} [PANIC]")
         elif vix > 25:
-            score += 3; signals.append(f"VIX={vix:.0f} [FEAR]")
+            score += 3
+            signals.append(f"VIX={vix:.0f} [FEAR]")
         elif vix > 20:
-            score += 1; signals.append(f"VIX={vix:.0f}")
+            score += 1
+            signals.append(f"VIX={vix:.0f}")
 
     # Credit stress (0-4 pts)
     if hy is not None:
         if hy > 5.0:
-            score += 4; signals.append(f"HY={hy:.1f} [CRISIS]")
+            score += 4
+            signals.append(f"HY={hy:.1f} [CRISIS]")
         elif hy > 4.0:
-            score += 2; signals.append(f"HY={hy:.1f} [STRESS]")
+            score += 2
+            signals.append(f"HY={hy:.1f} [STRESS]")
 
     # PSI (0-3 pts)
     if psi is not None and 0.5 < psi < 4.0:
-        score += 3; signals.append(f"PSI={psi:.1f} [FAVORABLE]")
+        score += 3
+        signals.append(f"PSI={psi:.1f} [FAVORABLE]")
 
     # Yield curve (0-3 pts)
     if yc is not None and yc < 0:
-        score += 3; signals.append(f"YC={yc:.2f} [INVERTED]")
+        score += 3
+        signals.append(f"YC={yc:.2f} [INVERTED]")
 
     return LayerResult("SETUP", min(score, 20), 20, 0.95, tuple(signals), True)
 
 
-def score_company(conn, ticker: str) -> LayerResult:
+def score_company(
+    conn,
+    ticker: str,
+    as_of_date: date | None = None,
+) -> LayerResult:
     """Layer 2: Is the company healthy? Revenue, EPS, shares, cash."""
     score = 0.0
     signals = []
     has_data = False
 
     # XBRL data
-    rev = _load_raw_series(conn, f"XBRL:{ticker}:Revenues", 730)
-    eps = _load_raw_series(conn, f"XBRL:{ticker}:EarningsPerShareDiluted", 730)
-    shares = _load_raw_series(conn, f"XBRL:{ticker}:CommonStockSharesOutstanding", 730)
-    cash = _load_raw_series(conn, f"XBRL:{ticker}:CashAndCashEquivalentsAtCarryingValue", 730)
-    _load_raw_series(conn, f"XBRL:{ticker}:Assets", 730)
-    liabilities = _load_raw_series(conn, f"XBRL:{ticker}:Liabilities", 730)
+    rev = _load_raw_series(conn, f"XBRL:{ticker}:Revenues", 730, as_of_date=as_of_date)
+    eps = _load_raw_series(
+        conn,
+        f"XBRL:{ticker}:EarningsPerShareDiluted",
+        730,
+        as_of_date=as_of_date,
+    )
+    shares = _load_raw_series(
+        conn,
+        f"XBRL:{ticker}:CommonStockSharesOutstanding",
+        730,
+        as_of_date=as_of_date,
+    )
+    cash = _load_raw_series(
+        conn,
+        f"XBRL:{ticker}:CashAndCashEquivalentsAtCarryingValue",
+        730,
+        as_of_date=as_of_date,
+    )
+    _load_raw_series(conn, f"XBRL:{ticker}:Assets", 730, as_of_date=as_of_date)
+    liabilities = _load_raw_series(
+        conn,
+        f"XBRL:{ticker}:Liabilities",
+        730,
+        as_of_date=as_of_date,
+    )
 
     # Revenue trend (0-4 pts)
     if len(rev) >= 2:
         has_data = True
         rev_chg = (rev.iloc[-1] / rev.iloc[0] - 1) * 100 if rev.iloc[0] != 0 else 0
         if rev_chg > 10:
-            score += 4; signals.append(f"Rev growing +{rev_chg:.0f}%")
+            score += 4
+            signals.append(f"Rev growing +{rev_chg:.0f}%")
         elif rev_chg > 0:
-            score += 2; signals.append(f"Rev stable +{rev_chg:.0f}%")
+            score += 2
+            signals.append(f"Rev stable +{rev_chg:.0f}%")
         elif rev_chg > -20:
-            score += 1; signals.append(f"Rev declining {rev_chg:.0f}%")
+            score += 1
+            signals.append(f"Rev declining {rev_chg:.0f}%")
         else:
             signals.append(f"Rev collapsing {rev_chg:.0f}% [WARNING]")
 
@@ -194,9 +281,11 @@ def score_company(conn, ticker: str) -> LayerResult:
     if len(eps) >= 2:
         has_data = True
         if eps.iloc[-1] > 0:
-            score += 3; signals.append(f"EPS positive ${eps.iloc[-1]:.2f}")
+            score += 3
+            signals.append(f"EPS positive ${eps.iloc[-1]:.2f}")
         elif eps.iloc[-1] > eps.iloc[0]:
-            score += 1; signals.append(f"EPS improving ${eps.iloc[-1]:.2f}")
+            score += 1
+            signals.append(f"EPS improving ${eps.iloc[-1]:.2f}")
         else:
             signals.append(f"EPS negative ${eps.iloc[-1]:.2f}")
 
@@ -205,22 +294,28 @@ def score_company(conn, ticker: str) -> LayerResult:
         has_data = True
         share_chg = (shares.iloc[-1] / shares.iloc[0] - 1) * 100 if shares.iloc[0] != 0 else 0
         if share_chg < -5:
-            score += 4; signals.append(f"Shares -{abs(share_chg):.0f}% [BUYBACK]")
+            score += 4
+            signals.append(f"Shares -{abs(share_chg):.0f}% [BUYBACK]")
         elif share_chg < 2:
-            score += 2; signals.append(f"Shares stable {share_chg:+.0f}%")
+            score += 2
+            signals.append(f"Shares stable {share_chg:+.0f}%")
         elif share_chg < 20:
-            score += 0; signals.append(f"Shares +{share_chg:.0f}% [DILUTION]")
+            score += 0
+            signals.append(f"Shares +{share_chg:.0f}% [DILUTION]")
         else:
-            score -= 2; signals.append(f"Shares +{share_chg:.0f}% [HEAVY DILUTION]")
+            score -= 2
+            signals.append(f"Shares +{share_chg:.0f}% [HEAVY DILUTION]")
 
     # Cash position (0-4 pts)
     if len(cash) > 0 and len(liabilities) > 0:
         has_data = True
         cash_ratio = cash.iloc[-1] / liabilities.iloc[-1] if liabilities.iloc[-1] != 0 else 0
         if cash_ratio > 0.5:
-            score += 4; signals.append(f"Cash/Liab={cash_ratio:.2f} [STRONG]")
+            score += 4
+            signals.append(f"Cash/Liab={cash_ratio:.2f} [STRONG]")
         elif cash_ratio > 0.2:
-            score += 2; signals.append(f"Cash/Liab={cash_ratio:.2f}")
+            score += 2
+            signals.append(f"Cash/Liab={cash_ratio:.2f}")
         else:
             signals.append(f"Cash/Liab={cash_ratio:.2f} [WEAK]")
 
@@ -228,29 +323,36 @@ def score_company(conn, ticker: str) -> LayerResult:
     return LayerResult("COMPANY", max(score, 0), 15, trust, tuple(signals), has_data)
 
 
-def score_smart_money(conn, ticker: str) -> LayerResult:
+def score_smart_money(
+    conn,
+    ticker: str,
+    as_of_date: date | None = None,
+) -> LayerResult:
     """Layer 3: Are insiders/institutions buying?"""
     score = 0.0
     signals = []
     has_data = False
 
     # Form 4 monthly filing count (increasing = more insider activity)
-    f4 = _load_raw_series(conn, f"SEC_FORM4:{ticker}:monthly", 365)
+    f4 = _load_raw_series(conn, f"SEC_FORM4:{ticker}:monthly", 365, as_of_date=as_of_date)
     if len(f4) >= 3:
         has_data = True
         recent = f4.tail(3).mean()
         older = f4.head(3).mean() if len(f4) >= 6 else recent
         if recent > older * 1.5:
-            score += 5; signals.append(f"Insider activity surging ({recent:.0f}/mo vs {older:.0f})")
+            score += 5
+            signals.append(f"Insider activity surging ({recent:.0f}/mo vs {older:.0f})")
         elif recent > 3:
-            score += 2; signals.append(f"Active insider trading ({recent:.0f}/mo)")
+            score += 2
+            signals.append(f"Active insider trading ({recent:.0f}/mo)")
 
     # Institutional flows (if available)
-    inst = _load_raw_series(conn, f"INST_FLOW:{ticker}:%", 90)
+    inst = _load_raw_series(conn, f"INST_FLOW:{ticker}:%", 90, as_of_date=as_of_date)
     if not inst.empty:
         has_data = True
         if inst.iloc[-1] > 0:
-            score += 5; signals.append("Institutional net inflow")
+            score += 5
+            signals.append("Institutional net inflow")
         else:
             signals.append("Institutional net outflow")
 
@@ -258,81 +360,107 @@ def score_smart_money(conn, ticker: str) -> LayerResult:
     return LayerResult("SMART_MONEY", min(score, 15), 15, trust, tuple(signals), has_data)
 
 
-def score_crowd(conn, ticker: str) -> LayerResult:
+def score_crowd(
+    conn,
+    ticker: str,
+    as_of_date: date | None = None,
+) -> LayerResult:
     """Layer 4: Is the crowd wrong? Short interest, FTD, PCR."""
     score = 0.0
     signals = []
     has_data = False
 
     # Short ratio
-    short = _load_raw_series(conn, f"SHORT:{ticker}:ratio", 30)
+    short = _load_raw_series(conn, f"SHORT:{ticker}:ratio", 30, as_of_date=as_of_date)
     if not short.empty:
         has_data = True
         avg_short = short.mean()
         if avg_short > 0.5:
-            score += 5; signals.append(f"Short ratio {avg_short:.0%} [HEAVILY SHORTED]")
+            score += 5
+            signals.append(f"Short ratio {avg_short:.0%} [HEAVILY SHORTED]")
         elif avg_short > 0.3:
-            score += 3; signals.append(f"Short ratio {avg_short:.0%} [ELEVATED]")
+            score += 3
+            signals.append(f"Short ratio {avg_short:.0%} [ELEVATED]")
         elif avg_short > 0:
-            score += 1; signals.append(f"Short ratio {avg_short:.0%}")
+            score += 1
+            signals.append(f"Short ratio {avg_short:.0%}")
 
     # Fails-to-deliver
-    ftd = _load_raw_series(conn, f"FTD:{ticker}:qty", 90)
+    ftd = _load_raw_series(conn, f"FTD:{ticker}:qty", 90, as_of_date=as_of_date)
     if not ftd.empty:
         has_data = True
         recent_ftd = ftd.tail(10).mean()
         older_ftd = ftd.head(30).mean() if len(ftd) > 30 else recent_ftd
         if recent_ftd > older_ftd * 2 and recent_ftd > 10000:
-            score += 5; signals.append(f"FTD surging ({recent_ftd:,.0f} vs {older_ftd:,.0f}) [SQUEEZE SETUP]")
+            score += 5
+            signals.append(
+                f"FTD surging ({recent_ftd:,.0f} vs {older_ftd:,.0f}) [SQUEEZE SETUP]"
+            )
         elif recent_ftd > 10000:
-            score += 2; signals.append(f"FTD elevated ({recent_ftd:,.0f})")
+            score += 2
+            signals.append(f"FTD elevated ({recent_ftd:,.0f})")
 
     # Put/Call ratio (market-wide)
-    pcr = _load_raw_latest(conn, "CBOE:totalpc", 5)
+    pcr = _load_raw_latest(conn, "CBOE:totalpc", 5, as_of_date=as_of_date)
     if pcr is not None:
         if pcr > 1.2:
-            score += 3; signals.append(f"PCR={pcr:.2f} [MAX BEARISH]")
+            score += 3
+            signals.append(f"PCR={pcr:.2f} [MAX BEARISH]")
         elif pcr > 1.0:
-            score += 1; signals.append(f"PCR={pcr:.2f} [BEARISH]")
+            score += 1
+            signals.append(f"PCR={pcr:.2f} [BEARISH]")
 
     trust = 0.75 if has_data else 0.15
     return LayerResult("CROWD", min(score, 15), 15, trust, tuple(signals), has_data)
 
 
-def score_narrative(conn, ticker: str) -> LayerResult:
+def score_narrative(
+    conn,
+    ticker: str,
+    as_of_date: date | None = None,
+) -> LayerResult:
     """Layer 5: Is there a narrative catalyst?"""
     score = 0.0
     signals = []
     has_data = False
 
     # News article count trend
-    news = _load_raw_series(conn, f"NEWS:{ticker}:daily_count", 90)
+    news = _load_raw_series(conn, f"NEWS:{ticker}:daily_count", 90, as_of_date=as_of_date)
     if not news.empty:
         has_data = True
         recent = news.tail(7).mean() if len(news) >= 7 else news.mean()
         older = news.head(30).mean() if len(news) >= 30 else recent
         if recent > older * 2:
-            score += 5; signals.append(f"News volume surging ({recent:.0f}/day vs {older:.0f})")
+            score += 5
+            signals.append(f"News volume surging ({recent:.0f}/day vs {older:.0f})")
         elif recent > 3:
-            score += 2; signals.append(f"Moderate news coverage ({recent:.0f}/day)")
+            score += 2
+            signals.append(f"Moderate news coverage ({recent:.0f}/day)")
 
     # Wiki attention (if available)
     wiki_name = f"wiki_{ticker.lower()}"
-    wiki = _load_latest(conn, wiki_name)
+    wiki = _load_latest(conn, wiki_name, as_of_date=as_of_date)
     if wiki is not None:
         has_data = True
-        score += 2; signals.append("Wiki attention tracked")
+        score += 2
+        signals.append("Wiki attention tracked")
 
     # GDELT (market-wide narrative)
-    gdelt = _load_latest(conn, "gdelt_article_count")
+    gdelt = _load_latest(conn, "gdelt_article_count", as_of_date=as_of_date)
     if gdelt is not None and gdelt > 1000:
-        score += 1; signals.append(f"GDELT high ({gdelt:.0f} articles)")
+        score += 1
+        signals.append(f"GDELT high ({gdelt:.0f} articles)")
 
     trust = 0.50 if has_data else 0.10
     return LayerResult("NARRATIVE", min(score, 10), 10, trust, tuple(signals), has_data)
 
 
-def score_flow(conn, ticker: str, price: pd.Series) -> LayerResult:
+def score_flow(
+    conn,
+    ticker: str,
+    price: pd.Series,
+    as_of_date: date | None = None,
+) -> LayerResult:
     """Layer 6: Is money actually moving?"""
     score = 0.0
     signals = []
@@ -348,23 +476,27 @@ def score_flow(conn, ticker: str, price: pd.Series) -> LayerResult:
 
     if avg_vol > 0 and recent_vol > avg_vol * 2:
         has_data = True
-        score += 5; signals.append(f"Volatility spike ({recent_vol/avg_vol:.1f}x normal)")
+        score += 5
+        signals.append(f"Volatility spike ({recent_vol/avg_vol:.1f}x normal)")
     elif avg_vol > 0 and recent_vol > avg_vol * 1.5:
         has_data = True
-        score += 2; signals.append(f"Elevated activity ({recent_vol/avg_vol:.1f}x)")
+        score += 2
+        signals.append(f"Elevated activity ({recent_vol/avg_vol:.1f}x)")
 
     # Check for whale options activity
-    whale = _load_raw_latest(conn, f"WHALE:{ticker}:%")
+    whale = _load_raw_latest(conn, f"WHALE:{ticker}:%", as_of_date=as_of_date)
     if whale is not None:
         has_data = True
-        score += 5; signals.append("Unusual options activity detected")
+        score += 5
+        signals.append("Unusual options activity detected")
 
     # CBOE equity PCR
-    epcr = _load_raw_latest(conn, "CBOE:equitypc", 5)
+    epcr = _load_raw_latest(conn, "CBOE:equitypc", 5, as_of_date=as_of_date)
     if epcr is not None:
         has_data = True
         if epcr > 0.8:
-            score += 3; signals.append(f"Equity PCR={epcr:.2f} [BEARISH - contrarian buy]")
+            score += 3
+            signals.append(f"Equity PCR={epcr:.2f} [BEARISH - contrarian buy]")
 
     trust = 0.60 if has_data else 0.15
     return LayerResult("FLOW", min(score, 15), 15, trust, tuple(signals), has_data)
@@ -384,9 +516,11 @@ def score_confirmation(price: pd.Series) -> LayerResult:
     if len(price) >= 6:
         mom5 = (current / price.iloc[-6] - 1) * 100
         if mom5 > 3:
-            score += 3; signals.append(f"5d momentum +{mom5:.1f}% [STRONG]")
+            score += 3
+            signals.append(f"5d momentum +{mom5:.1f}% [STRONG]")
         elif mom5 > 0:
-            score += 1; signals.append(f"5d momentum +{mom5:.1f}%")
+            score += 1
+            signals.append(f"5d momentum +{mom5:.1f}%")
         else:
             signals.append(f"5d momentum {mom5:.1f}% [NO TURN YET]")
 
@@ -395,15 +529,18 @@ def score_confirmation(price: pd.Series) -> LayerResult:
         mom30 = (current / price.iloc[-31] - 1) * 100
         mom90 = (current / price.iloc[-91] - 1) * 100
         if mom30 > 0 and mom90 < 0:
-            score += 4; signals.append(f"Momentum TURNING (30d={mom30:+.1f}%, 90d={mom90:+.1f}%)")
+            score += 4
+            signals.append(f"Momentum TURNING (30d={mom30:+.1f}%, 90d={mom90:+.1f}%)")
         elif mom30 > 0:
-            score += 2; signals.append(f"30d positive +{mom30:.1f}%")
+            score += 2
+            signals.append(f"30d positive +{mom30:.1f}%")
 
     # Higher low forming (current > 30d low)
     if len(price) >= 30:
         low_30d = price.tail(30).min()
         if current > low_30d * 1.05:
-            score += 3; signals.append(f"Higher low forming (${current:.2f} vs 30d low ${low_30d:.2f})")
+            score += 3
+            signals.append(f"Higher low forming (${current:.2f} vs 30d low ${low_30d:.2f})")
 
     return LayerResult("CONFIRM", min(score, 10), 10, 0.90, tuple(signals), True)
 
@@ -412,28 +549,33 @@ def score_confirmation(price: pd.Series) -> LayerResult:
 # MAIN SCORER
 # ═══════════════════════════════════════════════════════════════
 
-def score_ticker(engine: Engine, ticker: str) -> ConvictionReport:
+def score_ticker(
+    engine: Engine,
+    ticker: str,
+    as_of_date: date | None = None,
+) -> ConvictionReport:
     """Score a single ticker across all 7 layers."""
+    as_of = _resolve_as_of_date(as_of_date)
     with engine.connect() as conn:
-        price = _load_price(conn, ticker)
+        price = _load_price(conn, ticker, as_of_date=as_of)
 
         layers = [
-            score_setup(conn, ticker, price),
-            score_company(conn, ticker),
-            score_smart_money(conn, ticker),
-            score_crowd(conn, ticker),
-            score_narrative(conn, ticker),
-            score_flow(conn, ticker, price),
+            score_setup(conn, ticker, price, as_of_date=as_of),
+            score_company(conn, ticker, as_of_date=as_of),
+            score_smart_money(conn, ticker, as_of_date=as_of),
+            score_crowd(conn, ticker, as_of_date=as_of),
+            score_narrative(conn, ticker, as_of_date=as_of),
+            score_flow(conn, ticker, price, as_of_date=as_of),
             score_confirmation(price),
         ]
 
     # Weighted score
-    weighted_score = sum(l.score * l.trust for l in layers)
-    weighted_max = sum(l.max_score * l.trust for l in layers)
+    weighted_score = sum(layer.score * layer.trust for layer in layers)
+    weighted_max = sum(layer.max_score * layer.trust for layer in layers)
     total = int(round(weighted_score / weighted_max * 100)) if weighted_max > 0 else 0
 
     # Confidence = how much data we actually have
-    data_coverage = sum(1 for l in layers if l.data_available) / len(layers)
+    data_coverage = sum(1 for layer in layers if layer.data_available) / len(layers)
     confidence = total * data_coverage
 
     # Alert level
@@ -460,20 +602,28 @@ def score_ticker(engine: Engine, ticker: str) -> ConvictionReport:
     )
 
 
-def scan_all(engine: Engine, min_score: int = 20) -> list[ConvictionReport]:
+def scan_all(
+    engine: Engine,
+    min_score: int = 20,
+    as_of_date: date | None = None,
+) -> list[ConvictionReport]:
     """Score all tickers with price data."""
+    as_of = _resolve_as_of_date(as_of_date)
     with engine.connect() as conn:
         rows = conn.execute(text("""
             SELECT UPPER(REPLACE(fr.name, '_full', ''))
             FROM feature_registry fr JOIN resolved_series rs ON fr.id = rs.feature_id
-            WHERE fr.name LIKE '%%_full' GROUP BY fr.name HAVING COUNT(*) > 50
-        """)).fetchall()
+            WHERE fr.name LIKE '%%_full'
+              AND rs.obs_date <= :as_of
+              AND rs.release_date <= :as_of
+            GROUP BY fr.name HAVING COUNT(*) > 50
+        """), {"as_of": as_of}).fetchall()
 
     tickers = [r[0] for r in rows]
     reports = []
 
     for ticker in tickers:
-        report = score_ticker(engine, ticker)
+        report = score_ticker(engine, ticker, as_of_date=as_of)
         if report.total_score >= min_score:
             reports.append(report)
 
