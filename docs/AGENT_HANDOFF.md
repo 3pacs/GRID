@@ -1,3 +1,11 @@
+## 2026-06-26 23:15 UTC — 2026-06-26-2304
+**Why this matters next run:** the 2026-06-25 handoff's #1 next-pickable item (PUNCH-LIST line 148 — `analysis/ephemeris.py` core solver tests) is **shipped** as **PR #352**. Strike it before re-picking. The pure-math tests dodged the PYTHONPATH/scipy dance that prior vol_surface work needed — no third-party deps so `pytest --noconftest` worked straight up (the top-level `tests/conftest.py` still imports pandas which isn't in the routine env).
+
+- Remaining "next pickable small items" from prior handoff are unchanged: PUNCH-LIST line 95 (`contracts/handlers/__init__.py:1` stale docstring), line 117 (drop `docs/TODO-REGIME-SIGNAL-USAGE.md` ref in `alpha_research/adapters/signal_adapter.py:174`), line 150 (rewrite stale `LeadLagBacktest` docstring), line 88 verify-first (alerts handler tests likely already in `tests/contracts/test_alerts_handler.py`).
+- **Stale-PUNCH-LIST sweep PR is still a great no-test-deps pick.** Items shipped via PRs #348/#349/#350 still show `[ ]` in `docs/PUNCH-LIST-2026-05-13.md`: lines 69 (global_levers), 70 (deep_graph), 88 (alerts), 91 (trust.on_signal_fired), 92 (journal.on_prediction_scored), 108 (conviction_scorer), 109 (signal_adapter), 110 (rotation_variant_backtest), 127 (physics/transforms), 128 (physics/conventions), 130 (DealerGammaEngine), 131 (check_dimensional_consistency). Verify each test file exists in `tests/` before flipping. Cleanup PR is pure docs — no PYTHONPATH dance needed.
+- **TIER 0 status:** main CI **GREEN** on HEAD `840cdc28` (no new merges since the 2026-06-25 run — 35h staleness; same head as yesterday).
+- **TIER 1 status:** zero codex-authored PRs. 11 open PRs: 1 claude-routine (#351 vol_surface tests, my #352 just opened makes 2), 9 dependabot.
+
 ## 2026-06-25 23:30 UTC — 2026-06-25-2304
 **Why this matters next run:** the pytest interpreter is uv-managed and
 doesn't share site-packages with `python3 -m pip install --user`. Also `scipy`
