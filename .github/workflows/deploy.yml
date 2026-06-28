@@ -22,23 +22,48 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event.inputs.skip_tests != 'true'
 
-    services:
-      postgres:
-        image: postgres:15
-        env:
-          POSTGRES_USER: grid
-          POSTGRES_PASSWORD: testpass
-          POSTGRES_DB: griddb_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
     steps:
       - uses: actions/checkout@v6
+
+      - name: Start Postgres (resilient pull)
+        run: |
+          set -euo pipefail
+          # GitHub-hosted runners pull service-container images from Docker Hub
+          # *before any step runs*, so a flaky pull (registry-1.docker.io:
+          # "context deadline exceeded") fails the whole job with no retry path.
+          # Start Postgres manually instead, retrying the pull with backoff.
+          for attempt in 1 2 3 4 5; do
+            if docker pull postgres:15; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "::error::docker pull postgres:15 failed after 5 attempts"
+              exit 1
+            fi
+            backoff=$(( attempt * 5 ))
+            echo "::warning::docker pull postgres:15 failed (attempt ${attempt}/5); retrying in ${backoff}s"
+            sleep "${backoff}"
+          done
+          docker run -d --name grid-postgres \
+            -e POSTGRES_USER=grid \
+            -e POSTGRES_PASSWORD=testpass \
+            -e POSTGRES_DB=griddb_test \
+            -p 5432:5432 \
+            postgres:15
+
+      - name: Wait for Postgres
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 30); do
+            if docker exec grid-postgres pg_isready -U grid -d griddb_test >/dev/null 2>&1; then
+              echo "Postgres is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Postgres did not become ready in time"
+          docker logs grid-postgres || true
+          exit 1
 
       - name: Set up Python
         uses: actions/setup-python@v6
