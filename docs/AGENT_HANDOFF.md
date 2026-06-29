@@ -1,3 +1,17 @@
+## 2026-06-29 23:05 UTC — 2026-06-29-2305
+**Why this matters next run:** the 2026-06-26 handoff's next-pickable list named PUNCH-LIST line 150 (`LeadLagBacktest` docstring) — that's **shipped as PR #355**. Strike it before re-picking. The fix was pure docstring + 2 regression tests; the 16-line example was rewritten to `run_walk_forward(...)` with required `leader_name`/`follower_name` kwargs, and new `TestPublicSurface` locks the example to the public API so a future rename can't silently re-orphan the docs. Total 3 files +37/-5 LOC.
+
+- **Still pickable from the 2026-06-26 list (in rough leverage order):**
+   - PUNCH-LIST line 95 [P2] — one-line stale-docstring fix in `contracts/handlers/__init__.py:1` ("Phase 2 contract handlers — empty in Phase 1"). 11 handler modules now ship; just rewrite to match reality. ~10 LOC + 1 regression test.
+   - PUNCH-LIST line 117 [P2] — drop dangling `docs/TODO-REGIME-SIGNAL-USAGE.md` reference at `alpha_research/adapters/signal_adapter.py:174`. ~3 LOC.
+   - PUNCH-LIST line 88 [P1] **VERIFY FIRST**: `tests/contracts/test_alerts_handler.py` already exists (195 LOC per 2026-06-25 handoff). If it covers both `on_cross_reference_anomaly` and `on_regime_transition`, just flip the punch-list item `[x]` — that alone is a clean docs-only PR.
+- **Stale-PUNCH-LIST sweep is still on the table.** Same list as 2026-06-26 handoff (lines 69, 70, 88, 91, 92, 108, 109, 110, 127, 128, 130, 131 all marked `[ ]` but shipped via PRs #348/#349/#350). Pure-docs cleanup PR, no PYTHONPATH dance.
+- **Env note (worked this run):** `pip install --user ruff numpy` then `PYTHONPATH=/root/.local/lib/python3.11/site-packages:/usr/lib/python3/dist-packages:/home/user/GRID /root/.local/bin/pytest tests/<file> --noconftest`. Pure-math tests with only numpy don't need scipy/pandas/sqlalchemy.
+- **TIER 0 status:** main CI **GREEN** on HEAD `840cdc28` — same as 2026-06-26 (no new main commits in 3 days; routine PRs piling up).
+- **TIER 1 status:** zero codex-authored PRs. 14 open PRs at run start (counting): 4 claude-routine (#351, #352, #353, #354) + 10 dependabot (#322-331). PR #354 is an auditor-feed for `tests/` findings 2026-06-28 — fresh backlog source the next agent should scan for picks.
+- **PR #354 is new** (auditor-feed/2026-06-28-tests, opened 2026-06-28). If the underlying findings file is only `docs/PUNCH-LIST-2026-05-13.md` or a new auditor doc, picking from its items directly is unblocked the same way prior auditor-feeds (#299/#305) were — verify via `mcp__github__pull_request_read get_files` before reaching across.
+- `mcp__github__list_pull_requests` and `mcp__github__actions_list` still truncate (157k / 334k chars for current repo size). Same save-to-file + python slice / json.load workaround as prior runs.
+
 ## 2026-06-26 23:15 UTC — 2026-06-26-2304
 **Why this matters next run:** the 2026-06-25 handoff's #1 next-pickable item (PUNCH-LIST line 148 — `analysis/ephemeris.py` core solver tests) is **shipped** as **PR #352**. Strike it before re-picking. The pure-math tests dodged the PYTHONPATH/scipy dance that prior vol_surface work needed — no third-party deps so `pytest --noconftest` worked straight up (the top-level `tests/conftest.py` still imports pandas which isn't in the routine env).
 
@@ -108,32 +122,6 @@ One small test-data gotcha worth recording: when fabricating pre-split price his
 - **TIER 1 status:** zero codex-authored PRs on the open list. All 30 open PRs are 3pacs (24) or dependabot (6). Don't churn on dependabot PRs.
 - **Env note:** Fresh container needs `pip install pytest pandas sqlalchemy numpy ruff` (~10s). The new test file (`tests/test_alpha_research_signals.py`) imports `alpha_research.signals.*` directly — does NOT require the heavy `tests/conftest.py` chain.
 - **`mcp__github__list_pull_requests` and `mcp__github__actions_list` still truncate** at 167k / 346k chars. Save-to-file + python slice / json.load is the canonical workaround.
-
-## 2026-06-11 23:25 UTC — 2026-06-11-2305
-**Why this matters next run:** the "don't reach across PR #299"
-guidance from the 2026-06-09 handoff was overly broad. PR #299 only
-modifies `docs/PUNCH-LIST-2026-05-13.md` — fixing the underlying
-code-bugs it documents is **independent and unblocked**. This run
-shipped the P0 (synthetic-random VIX in `adaptive_rotation.py:321`) as
-**PR #302** without conflicting with PR #299.
-
-- **Pickable alpha_research findings still on the table from PR #299** —
-  all reference code already on `main`, all small enough for a single
-  routine PR. Same body as 2026-06-15's stripped list above; see that
-  entry for the full breakdown.
-- **`alpha_research/strategies/adaptive_rotation.py` is now file-blocked
-  by PR #302.** `tests/test_adaptive_rotation.py` likewise. The 11 items
-  above don't touch either file, so unblocked.
-- **TIER 0 status:** `main` CI is **GREEN** on HEAD `0a41753a` (GRID
-  Tests success). The 13-day red streak from the 2026-06-08 handoff is
-  resolved — PR #291 must have landed. Deploy-to-Grid-Server still
-  fails but that's operator-side (no SSH).
-- **Env note:** `pip install pytest pandas numpy sqlalchemy loguru ruff`
-  + the file uses no DB connection (engine is mocked via monkeypatch).
-  15 tests in 0.65s. No cryptography/passlib needed.
-- **`mcp__github__list_pull_requests` and `mcp__github__actions_list`
-  still truncate** at 167k / 346k chars. Save-to-file + python slice or
-  json.load is the workaround.
 
 ---
 _Entries older than 14 days were trimmed per the routine rules. The
