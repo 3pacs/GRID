@@ -173,3 +173,34 @@ class TestDataclassRoundtrip:
         d = fold.to_dict()
         assert d["fold_idx"] == 0
         assert d["train_correlation"] == 0.5
+
+
+class TestPublicSurface:
+    def test_module_docstring_example_imports(self):
+        # Locks the module docstring example to the public API: the
+        # `run_walk_forward` symbol it advertises must remain importable.
+        # Prior docstring referenced a non-existent `LeadLagBacktest` class
+        # which would crash any copy-paste.
+        import analysis.lead_lag_backtest as mod
+
+        assert hasattr(mod, "run_walk_forward")
+        assert not hasattr(mod, "LeadLagBacktest")
+
+    def test_module_docstring_example_runs(self):
+        # Executes the exact call shape shown in the module docstring's
+        # Usage block to keep the example honest.
+        rng = _seeded_random()
+        n = 400
+        x = rng.standard_normal(n).cumsum().tolist()
+        y = rng.standard_normal(n).cumsum().tolist()
+        result = run_walk_forward(
+            leader_name="X",
+            leader_series=x,
+            follower_name="Y",
+            follower_series=y,
+            lag_days=3,
+            train_window=252,
+            test_window=63,
+        )
+        assert type(result).__name__ == "WalkForwardResult"
+        assert result.lag_days == 3
