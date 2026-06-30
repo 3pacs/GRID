@@ -1,3 +1,21 @@
+## 2026-06-30 23:05 UTC — 2026-06-30-2305
+**Why this matters next run:** PUNCH-LIST line 116 (alpha_research log-skipped-rebalances) shipped as PR #358. Same pattern as PR #338 (heartbeat) — `from loguru import logger as log` + `log.warning` on the exception path + 2 regression cases via `monkeypatch.setattr(module.log, "warning", capture)`. Strike line 116 from any unchecked-item walk.
+
+- **PUNCH-LIST staleness is real and worth a separate cleanup PR.** I verified mid-walk that lines 88, 108, 109, 110, 127, 128, 130, 131 all already have test files (listed in the prior 2026-06-29 + 2026-06-26 + 2026-06-25 handoffs); they're still showing `[ ]` because nobody reconciled. A pure-docs PR that flips them `[x]` with PR/file evidence would save every future routine ~5 minutes of grep work. Did NOT bundle that into PR #358 (scope guard — one fix, one PR).
+- **Still pickable from prior handoffs' "small items" lists (in priority order):**
+   - line 95 [P2] — `contracts/handlers/__init__.py:1` stale "empty in Phase 1" docstring (~10 LOC + 1 test).
+   - line 117 [P2] — drop dangling `docs/TODO-REGIME-SIGNAL-USAGE.md` ref at `alpha_research/adapters/signal_adapter.py:174` (~3 LOC).
+   - line 151 [P2] — `analysis/viz_intelligence.py:517,535` `except Exception: pass` → `log.warning` (same pattern as PR #358 / #338).
+   - line 152 [P2] — `analysis/money_flow_engine/layer_credit.py:162` same `except: pass` → `log.warning`.
+   - line 94 [P2] — preserve Decimal precision in `oracle_anti_signals.on_cross_reference_anomaly` (`float()` truncates NUMERIC binding).
+   - line 96 [P2] — drop dead defensive branch in `oracle_anti_signals` severity check (Literal already rejects the path).
+   - line 118 [P2] — drop unnecessary `object.__setattr__` workaround on `PositionState` (dataclass is mutable, not frozen).
+- **Env note (worked this run):** pytest is uv-managed at `/root/.local/share/uv/tools/pytest/bin/python` (no pip). Install deps via `uv pip install --python /root/.local/share/uv/tools/pytest/bin/python numpy pandas sqlalchemy loguru` — finishes in <10s. Then run `/root/.local/bin/pytest tests/<file> -v --noconftest`. The repo's top-level `tests/conftest.py` requires more deps; `--noconftest` is the fast escape hatch when only the new test file matters.
+- **TIER 0 status:** main CI **GREEN** on HEAD `44d8db41` (latest commit `Merge pull request #357 from 3pacs/coord/grid-w1-final-proof-20260630`). Both GRID Tests and Deploy success.
+- **TIER 1 status:** zero codex-authored PRs (`mcp__github__search_pull_requests author:app/openai-codex` returns 0). 15 open PRs total: 5 claude-routine (#351-355) + 1 claude/* (#353) + 9 dependabot. None reviewable as routine items.
+- **Tool-result truncation still hits** `mcp__github__list_pull_requests` (160k chars) and `mcp__github__actions_list` (335k chars). Save-to-file + `python3 -c "json.loads(open(p).read())"` is the canonical workaround — same as prior runs.
+- **Pre-existing lint debt** in `alpha_research/strategies/rotation_variant_backtest.py`: unused `dataclasses.field` import + unused `pandas as pd` import + unused `excess` local (F401/F401/F841). I did NOT fix in PR #358 (out of scope). If a future agent picks anything else in this file, fix these in the same PR.
+
 ## 2026-06-29 23:05 UTC — 2026-06-29-2305
 **Why this matters next run:** the 2026-06-26 handoff's next-pickable list named PUNCH-LIST line 150 (`LeadLagBacktest` docstring) — that's **shipped as PR #355**. Strike it before re-picking. The fix was pure docstring + 2 regression tests; the 16-line example was rewritten to `run_walk_forward(...)` with required `leader_name`/`follower_name` kwargs, and new `TestPublicSurface` locks the example to the public API so a future rename can't silently re-orphan the docs. Total 3 files +37/-5 LOC.
 
