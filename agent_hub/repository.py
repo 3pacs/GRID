@@ -14,6 +14,9 @@ class ReportRepository(Protocol):
     def insert_report(self, report: dict[str, Any]) -> dict[str, Any]:
         """Insert a new report row and return its id + report URI."""
 
+    def check_health(self) -> bool:
+        """Check database connection health."""
+
 
 class PostgresReportRepository:
     def _connect(self):
@@ -76,4 +79,17 @@ class PostgresReportRepository:
             raise RuntimeError(
                 "agent_reports table is missing; run migrations/0050_agent_reports.sql"
             ) from exc
+
+    def check_health(self) -> bool:
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1;")
+                    cur.fetchone()
+            return True
+        except Exception as exc:
+            import logging
+            logging.error(f"Postgres database health check failed: {exc}")
+            return False
+
 
