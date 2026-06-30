@@ -23,7 +23,7 @@ import sys
 import json
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 import psycopg2
 import psycopg2.extras
@@ -86,6 +86,14 @@ class JobCreate(BaseModel):
     timeout_seconds: int = 3600
     requires_gpu: bool = False
     requires_ollama: bool = False
+    tenant: Optional[str] = None
+    labels: Optional[dict] = None
+    workload: Optional[dict] = None
+    yield_policy: Optional[dict] = None
+    preemption: Optional[dict] = None
+    kill_switch: Optional[dict] = None
+    isolation: Optional[dict] = None
+    audit: Optional[dict] = None
 
 
 class WorkerRegister(BaseModel):
@@ -281,6 +289,171 @@ def clear_job_error_sql() -> str:
     return "UPDATE compute_jobs SET error_message=NULL WHERE id=%s"
 
 
+BOOGERBOTS_ALLOWED_PRIORITY_CLASSES = {"boogerbots-low", "boogerbots-background"}
+BOOGERBOTS_ALLOWED_WORKLOAD_TYPES = {
+    "tts",
+    "render",
+    "video",
+    "lora_training",
+    "whisper_qc",
+    "eval",
+}
+BOOGERBOTS_GPU_WORKLOADS = {"render", "video", "lora_training", "whisper_qc"}
+BOOGERBOTS_REQUIRED_AUDIT_EVENTS = {
+    "submitted",
+    "leased",
+    "yielded_or_preempted",
+    "completed_or_failed",
+}
+
+
+def _is_mapping(value: Any) -> bool:
+    return isinstance(value, dict)
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
+def boogerbots_contract_errors(payload: dict[str, Any]) -> list[str]:
+    """Validate the Storymill Boogerbots W1 contract without touching the DB."""
+
+    errors: list[str] = []
+
+    if payload.get("tenant") != "boogerbots":
+        errors.append("tenant must be 'boogerbots'")
+
+    labels = payload.get("labels")
+    if not _is_mapping(labels):
+        errors.append("labels must be an object")
+    else:
+        if labels.get("owner") != "boogerbots":
+            errors.append("labels.owner must be 'boogerbots'")
+        if labels.get("repo") != "3pacs/storymill":
+            errors.append("labels.repo must be '3pacs/storymill'")
+
+    workload = payload.get("workload")
+    workload_type = workload.get("type") if _is_mapping(workload) else None
+    if workload_type not in BOOGERBOTS_ALLOWED_WORKLOAD_TYPES:
+        errors.append(
+            "workload.type must be one of "
+            f"{sorted(BOOGERBOTS_ALLOWED_WORKLOAD_TYPES)}"
+        )
+
+    priority = payload.get("priority")
+    if not _is_mapping(priority):
+        errors.append("priority must be an object")
+    else:
+        priority_class = priority.get("class")
+        priority_value = priority.get("value")
+        if priority_class not in BOOGERBOTS_ALLOWED_PRIORITY_CLASSES:
+            errors.append(
+                "priority.class must be 'boogerbots-low' or "
+                "'boogerbots-background'"
+            )
+        if (
+            not isinstance(priority_value, int)
+            or priority_value < 0
+            or priority_value > 30
+        ):
+            errors.append("priority.value must be an integer from 0 through 30")
+
+    resources = payload.get("resources")
+    resources = resources if _is_mapping(resources) else {}
+    gpu = resources.get("gpu", {})
+    if workload_type in BOOGERBOTS_GPU_WORKLOADS:
+        if not _is_mapping(gpu):
+            errors.append("resources.gpu must be an object for GPU workloads")
+        elif gpu.get("required") is not True:
+            errors.append("GPU workloads must set resources.gpu.required=true")
+        if workload_type == "lora_training" and resources.get("off_hours_only") is not True:
+            errors.append("lora_training jobs must set resources.off_hours_only=true")
+
+    yield_policy = payload.get("yield_policy")
+    if not _is_mapping(yield_policy):
+        errors.append("yield_policy must be an object")
+    else:
+        if "ocmri" not in set(_string_list(yield_policy.get("yield_to"))):
+            errors.append("yield_policy.yield_to must include 'ocmri'")
+        check_interval = yield_policy.get("check_interval_seconds")
+        if not isinstance(check_interval, int) or check_interval < 5 or check_interval > 60:
+            errors.append("yield_policy.check_interval_seconds must be between 5 and 60")
+        if (
+            workload_type in BOOGERBOTS_GPU_WORKLOADS
+            and yield_policy.get("idle_window_required") is not True
+        ):
+            errors.append("GPU workloads must set yield_policy.idle_window_required=true")
+        if yield_policy.get("on_ocmri_demand") not in {
+            "checkpoint_and_exit",
+            "exit_without_start",
+            "pause_and_resume",
+        }:
+            errors.append("yield_policy.on_ocmri_demand has an unsupported action")
+
+    preemption = payload.get("preemption")
+    if not _is_mapping(preemption):
+        errors.append("preemption must be an object")
+    else:
+        if preemption.get("enabled") is not True:
+            errors.append("preemption.enabled must be true")
+        max_yield = preemption.get("max_seconds_to_yield")
+        if not isinstance(max_yield, int) or max_yield < 1 or max_yield > 120:
+            errors.append("preemption.max_seconds_to_yield must be between 1 and 120")
+        if workload_type in {"lora_training", "video"} and not preemption.get(
+            "checkpoint_path"
+        ):
+            errors.append(
+                "lora_training and video jobs must declare "
+                "preemption.checkpoint_path"
+            )
+
+    kill_switch = payload.get("kill_switch")
+    if not _is_mapping(kill_switch):
+        errors.append("kill_switch must be an object")
+    else:
+        has_tripwire = any(kill_switch.get(key) for key in ("path", "env", "endpoint"))
+        if not has_tripwire:
+            errors.append("kill_switch must declare path, env, or endpoint")
+        if kill_switch.get("action") != "stop_new_work_and_release_leases":
+            errors.append(
+                "kill_switch.action must be "
+                "'stop_new_work_and_release_leases'"
+            )
+
+    isolation = payload.get("isolation")
+    if not _is_mapping(isolation):
+        errors.append("isolation must be an object")
+    else:
+        if isolation.get("vm_user") != "boogerbots":
+            errors.append("isolation.vm_user must be 'boogerbots'")
+        if isolation.get("no_sudo") is not True:
+            errors.append("isolation.no_sudo must be true")
+        if isolation.get("phi_network_blocked") is not True:
+            errors.append("isolation.phi_network_blocked must be true")
+        if isolation.get("separate_log_sink") is not True:
+            errors.append("isolation.separate_log_sink must be true")
+
+    audit = payload.get("audit")
+    if not _is_mapping(audit):
+        errors.append("audit must be an object")
+    else:
+        log_sink = str(audit.get("log_sink", ""))
+        if not log_sink:
+            errors.append("audit.log_sink is required")
+        if "ocmri" in log_sink.lower() or "sentry" in log_sink.lower():
+            errors.append("audit.log_sink must be separate from OCMRI/Sentry")
+        events = set(_string_list(audit.get("events")))
+        missing_events = BOOGERBOTS_REQUIRED_AUDIT_EVENTS - events
+        if missing_events:
+            errors.append(f"audit.events missing {sorted(missing_events)}")
+        if not audit.get("correlation_id"):
+            errors.append("audit.correlation_id is required")
+
+    return errors
+
+
 # ── Endpoints ──────────────────────────────────────────────────
 
 @app.on_event("startup")
@@ -342,6 +515,12 @@ async def worker_heartbeat(worker_id: int, active_jobs: Optional[int] = None):
 
 @app.post("/jobs")
 async def create_job(job: JobCreate):
+    if job.tenant == "boogerbots":
+        raise HTTPException(
+            400,
+            "Boogerbots contract payloads must pass /jobs/dry-run before live "
+            "submission is enabled",
+        )
     conn = get_conn()
     conn.autocommit = True
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -361,6 +540,21 @@ async def create_job(job: JobCreate):
     conn.close()
     log.info("Job created: #{id} {name} ({type})", id=result["id"], name=job.name, type=job.job_type.value)
     return result
+
+
+@app.post("/jobs/dry-run")
+async def dry_run_job(payload: dict):
+    """Validate a proposed job without writing compute_jobs or claiming work."""
+
+    errors = boogerbots_contract_errors(payload)
+    return {
+        "status": "accepted" if not errors else "rejected",
+        "dry_run": True,
+        "would_enqueue": False,
+        "mutating_actions_performed": [],
+        "tenant": payload.get("tenant"),
+        "errors": errors,
+    }
 
 
 @app.get("/jobs")
