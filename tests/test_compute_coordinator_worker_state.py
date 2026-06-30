@@ -116,19 +116,100 @@ def test_openapi_exposes_boogerbots_contract_fields_and_dry_run_path():
     ]:
         assert field in job_properties
     assert "/jobs/dry-run" in openapi["paths"]
+    priority_schema = job_properties["priority"]
+    assert "anyOf" in priority_schema
 
 
 def test_boogerbots_dry_run_accepts_valid_contract_without_mutation():
     response = asyncio.run(coordinator.dry_run_job(boogerbots_job()))
 
-    assert response == {
-        "status": "accepted",
-        "dry_run": True,
-        "would_enqueue": False,
-        "mutating_actions_performed": [],
-        "tenant": "boogerbots",
-        "errors": [],
-    }
+    assert response["status"] == "accepted"
+    assert response["dry_run"] is True
+    assert response["would_enqueue"] is False
+    assert response["would_accept_new_work"] is True
+    assert response["would_release_leases"] is False
+    assert response["mutating_actions_performed"] == []
+    assert response["tenant"] == "boogerbots"
+    assert response["errors"] == []
+    assert response["w1_proof"]["ready"] is True
+    assert response["w1_proof"]["non_mutating"] is True
+
+
+def test_boogerbots_w1_proof_shows_ocmri_priority_wins_and_audit_is_separate():
+    proof = coordinator.boogerbots_w1_proof(boogerbots_job())
+
+    scheduler = proof["scheduler"]
+    assert scheduler["boogerbots_priority_value"] == 10
+    assert scheduler["boogerbots_priority_ceiling"] == 30
+    assert scheduler["ocmri_priority_floor"] == 31
+    assert scheduler["ocmri_priority_wins"] is True
+    assert scheduler["yield_to_ocmri"] is True
+    assert scheduler["preemption_enabled"] is True
+    assert scheduler["claim_order_proof"] == [
+        {"tenant": "ocmri", "priority": 31},
+        {"tenant": "boogerbots", "priority": 10},
+    ]
+
+    audit = proof["audit"]
+    assert audit["log_sink"] == "/data/storymill/logs/compute-coordinator-audit.jsonl"
+    assert audit["separate_from_ocmri_sentry"] is True
+    assert audit["required_events_present"] is True
+    assert audit["missing_events"] == []
+
+
+def test_boogerbots_kill_switch_env_stops_new_work_and_releases_leases(monkeypatch):
+    monkeypatch.setenv("BOOGERBOTS_W1_KILL", "1")
+    response = asyncio.run(
+        coordinator.dry_run_job(
+            boogerbots_job(
+                kill_switch={
+                    "env": "BOOGERBOTS_W1_KILL",
+                    "action": "stop_new_work_and_release_leases",
+                }
+            )
+        )
+    )
+
+    assert response["status"] == "accepted"
+    assert response["would_accept_new_work"] is False
+    assert response["would_release_leases"] is True
+    kill_switch = response["w1_proof"]["kill_switch"]
+    assert kill_switch["configured"] is True
+    assert kill_switch["active"] is True
+    assert kill_switch["would_accept_new_work"] is False
+    assert kill_switch["would_release_leases"] is True
+
+
+def test_boogerbots_kill_switch_path_stops_new_work_and_releases_leases(tmp_path):
+    tripwire = tmp_path / "boogerbots.kill"
+    tripwire.write_text("stop", encoding="utf-8")
+
+    state = coordinator.boogerbots_kill_switch_state(
+        boogerbots_job(
+            kill_switch={
+                "path": str(tripwire),
+                "action": "stop_new_work_and_release_leases",
+            }
+        )
+    )
+
+    assert state["configured"] is True
+    assert state["active"] is True
+    assert state["would_accept_new_work"] is False
+    assert state["would_release_leases"] is True
+    assert state["tripwires"] == [
+        {"type": "path", "value": str(tripwire), "active": True}
+    ]
+
+
+def test_non_boogerbots_live_jobs_must_use_integer_priority():
+    assert coordinator.db_priority_value(7) == 7
+
+    with pytest.raises(HTTPException) as exc:
+        coordinator.db_priority_value({"class": "boogerbots-background", "value": 10})
+
+    assert exc.value.status_code == 400
+    assert "/jobs/dry-run" in exc.value.detail
 
 
 def test_boogerbots_dry_run_rejects_ocmri_escalation_and_missing_audit():
@@ -160,6 +241,7 @@ def test_boogerbots_live_submit_is_blocked_until_w1_enabled():
                     job_type=coordinator.JobType.LLM_INFERENCE,
                     name="boogerbots live submit should fail closed",
                     tenant="boogerbots",
+                    priority={"class": "boogerbots-background", "value": 10},
                 )
             )
         )

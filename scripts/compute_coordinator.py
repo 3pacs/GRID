@@ -23,6 +23,7 @@ import sys
 import json
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Any, Optional
 
 import psycopg2
@@ -82,7 +83,7 @@ class JobCreate(BaseModel):
     name: str
     description: str = ""
     params: dict = {}
-    priority: int = 5
+    priority: int | dict[str, Any] = 5
     timeout_seconds: int = 3600
     requires_gpu: bool = False
     requires_ollama: bool = False
@@ -305,6 +306,10 @@ BOOGERBOTS_REQUIRED_AUDIT_EVENTS = {
     "yielded_or_preempted",
     "completed_or_failed",
 }
+BOOGERBOTS_PRIORITY_CEILING = 30
+OCMRI_PRIORITY_FLOOR = BOOGERBOTS_PRIORITY_CEILING + 1
+KILL_SWITCH_TRUTHY_VALUES = {"1", "true", "yes", "on", "active", "stop"}
+KILL_SWITCH_FALSEY_VALUES = {"", "0", "false", "no", "off", "inactive"}
 
 
 def _is_mapping(value: Any) -> bool:
@@ -315,6 +320,167 @@ def _string_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [item for item in value if isinstance(item, str)]
+
+
+def _priority_value(payload: dict[str, Any]) -> int | None:
+    priority = payload.get("priority")
+    if isinstance(priority, int):
+        return priority
+    if _is_mapping(priority) and isinstance(priority.get("value"), int):
+        return int(priority["value"])
+    return None
+
+
+def db_priority_value(priority: int | dict[str, Any]) -> int:
+    """Return an integer DB priority for non-Boogerbots live jobs."""
+
+    if isinstance(priority, int):
+        return priority
+    if _is_mapping(priority) and isinstance(priority.get("value"), int):
+        raise HTTPException(
+            400,
+            "object priority is reserved for Boogerbots /jobs/dry-run until "
+            "live submission is explicitly enabled",
+        )
+    raise HTTPException(400, "priority must be an integer")
+
+
+def _env_tripwire_active(env_name: str) -> bool:
+    value = os.environ.get(env_name)
+    if value is None:
+        return False
+    normalized = value.strip().lower()
+    if normalized in KILL_SWITCH_FALSEY_VALUES:
+        return False
+    return normalized in KILL_SWITCH_TRUTHY_VALUES or bool(normalized)
+
+
+def boogerbots_kill_switch_state(payload: dict[str, Any]) -> dict[str, Any]:
+    """Inspect the declared Boogerbots kill switch without mutating work."""
+
+    kill_switch = payload.get("kill_switch")
+    if not _is_mapping(kill_switch):
+        return {
+            "configured": False,
+            "active": False,
+            "tripwires": [],
+            "would_accept_new_work": False,
+            "would_release_leases": False,
+        }
+
+    tripwires: list[dict[str, Any]] = []
+
+    path = kill_switch.get("path")
+    if isinstance(path, str) and path:
+        active = Path(path).exists()
+        tripwires.append({"type": "path", "value": path, "active": active})
+
+    env_name = kill_switch.get("env")
+    if isinstance(env_name, str) and env_name:
+        active = _env_tripwire_active(env_name)
+        tripwires.append({"type": "env", "value": env_name, "active": active})
+
+    endpoint = kill_switch.get("endpoint")
+    if isinstance(endpoint, str) and endpoint:
+        # The coordinator does not call arbitrary endpoints from validation.
+        # Path/env tripwires are the supported live proof mechanism.
+        tripwires.append({
+            "type": "endpoint",
+            "value": endpoint,
+            "active": False,
+            "checked": False,
+        })
+
+    active = any(bool(tripwire.get("active")) for tripwire in tripwires)
+    action_ok = kill_switch.get("action") == "stop_new_work_and_release_leases"
+    return {
+        "configured": bool(tripwires) and action_ok,
+        "active": active,
+        "tripwires": tripwires,
+        "action": kill_switch.get("action"),
+        "would_accept_new_work": not active,
+        "would_release_leases": active and action_ok,
+    }
+
+
+def boogerbots_scheduler_proof(payload: dict[str, Any]) -> dict[str, Any]:
+    priority_value = _priority_value(payload)
+    yield_policy = payload.get("yield_policy")
+    yield_targets = (
+        set(_string_list(yield_policy.get("yield_to")))
+        if _is_mapping(yield_policy)
+        else set()
+    )
+    preemption = payload.get("preemption")
+    preemption_enabled = _is_mapping(preemption) and preemption.get("enabled") is True
+    priority_in_range = (
+        isinstance(priority_value, int)
+        and 0 <= priority_value <= BOOGERBOTS_PRIORITY_CEILING
+    )
+    ocmri_priority_wins = (
+        priority_in_range
+        and "ocmri" in yield_targets
+        and preemption_enabled
+        and priority_value < OCMRI_PRIORITY_FLOOR
+    )
+    return {
+        "boogerbots_priority_value": priority_value,
+        "boogerbots_priority_ceiling": BOOGERBOTS_PRIORITY_CEILING,
+        "ocmri_priority_floor": OCMRI_PRIORITY_FLOOR,
+        "ocmri_priority_wins": ocmri_priority_wins,
+        "yield_to_ocmri": "ocmri" in yield_targets,
+        "preemption_enabled": preemption_enabled,
+        "claim_order_proof": [
+            {"tenant": "ocmri", "priority": OCMRI_PRIORITY_FLOOR},
+            {"tenant": "boogerbots", "priority": priority_value},
+        ],
+    }
+
+
+def boogerbots_audit_sink_proof(payload: dict[str, Any]) -> dict[str, Any]:
+    audit = payload.get("audit")
+    if not _is_mapping(audit):
+        return {
+            "log_sink": "",
+            "separate_from_ocmri_sentry": False,
+            "required_events_present": False,
+            "missing_events": sorted(BOOGERBOTS_REQUIRED_AUDIT_EVENTS),
+            "would_record_events": [],
+        }
+
+    log_sink = str(audit.get("log_sink", ""))
+    events = set(_string_list(audit.get("events")))
+    missing_events = BOOGERBOTS_REQUIRED_AUDIT_EVENTS - events
+    separate = bool(log_sink) and "ocmri" not in log_sink.lower() and "sentry" not in log_sink.lower()
+    return {
+        "log_sink": log_sink,
+        "separate_from_ocmri_sentry": separate,
+        "required_events_present": not missing_events,
+        "missing_events": sorted(missing_events),
+        "would_record_events": sorted(BOOGERBOTS_REQUIRED_AUDIT_EVENTS),
+        "correlation_id": audit.get("correlation_id"),
+    }
+
+
+def boogerbots_w1_proof(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return non-mutating W1 scheduling, kill switch, and audit evidence."""
+
+    scheduler = boogerbots_scheduler_proof(payload)
+    kill_switch = boogerbots_kill_switch_state(payload)
+    audit = boogerbots_audit_sink_proof(payload)
+    ready = (
+        scheduler["ocmri_priority_wins"]
+        and kill_switch["configured"]
+        and audit["separate_from_ocmri_sentry"]
+        and audit["required_events_present"]
+    )
+    return {
+        "ready": ready,
+        "non_mutating": True,
+        "scheduler": scheduler,
+        "kill_switch": kill_switch,
+        "audit": audit,
+    }
 
 
 def boogerbots_contract_errors(payload: dict[str, Any]) -> list[str]:
@@ -521,6 +687,7 @@ async def create_job(job: JobCreate):
             "Boogerbots contract payloads must pass /jobs/dry-run before live "
             "submission is enabled",
         )
+    db_priority = db_priority_value(job.priority)
     conn = get_conn()
     conn.autocommit = True
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -529,7 +696,7 @@ async def create_job(job: JobCreate):
         "timeout_seconds,requires_gpu,requires_ollama,state) "
         "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'CREATED') RETURNING *",
         (job.job_type.value, job.name, job.description, json.dumps(job.params),
-         job.priority, job.timeout_seconds, job.requires_gpu, job.requires_ollama),
+         db_priority, job.timeout_seconds, job.requires_gpu, job.requires_ollama),
     )
     created = dict(cur.fetchone())
 
@@ -547,13 +714,17 @@ async def dry_run_job(payload: dict):
     """Validate a proposed job without writing compute_jobs or claiming work."""
 
     errors = boogerbots_contract_errors(payload)
+    w1_proof = boogerbots_w1_proof(payload)
     return {
         "status": "accepted" if not errors else "rejected",
         "dry_run": True,
         "would_enqueue": False,
+        "would_accept_new_work": not errors and w1_proof["kill_switch"]["would_accept_new_work"],
+        "would_release_leases": w1_proof["kill_switch"]["would_release_leases"],
         "mutating_actions_performed": [],
         "tenant": payload.get("tenant"),
         "errors": errors,
+        "w1_proof": w1_proof,
     }
 
 
