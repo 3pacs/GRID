@@ -163,8 +163,10 @@ def test_insert_params_carry_event_payload():
     assert params["stat"] == "cpi_yoy"
     assert params["sev"] == "HIGH"
     assert params["prod"] == "intelligence.cross_reference"
-    assert params["ov"] == pytest.approx(3.2)
-    assert params["rv"] == pytest.approx(5.8)
+    # Decimal values are bound as strings + CAST(... AS NUMERIC) so the
+    # DB driver never floors precision. See _decimal_bind in the handler.
+    assert params["ov"] == "3.2"
+    assert params["rv"] == "5.8"
     assert params["cd"] == pytest.approx(-0.42)
     # evidence_links is JSON-encoded so the DB driver can bind it to JSONB
     # via CAST(:el AS JSONB).
@@ -181,22 +183,62 @@ def test_empty_evidence_links_encodes_as_empty_json_array():
     assert json.loads(params["el"]) == []
 
 
-def test_decimal_values_coerced_to_float_for_numeric_bind():
+def test_decimal_values_preserved_as_string_for_numeric_cast():
+    """High-precision Decimals must not be silently truncated through float().
+
+    PUNCH-LIST-2026-05-13 contracts/ [P2] line 94: ``official_value`` and
+    ``reality_proxy_value`` are Decimal on the schema and NUMERIC in the
+    DB. Coercing through float() drops significant digits past ~15; the
+    handler now serializes via ``str(Decimal)`` and CASTs to NUMERIC in
+    SQL so the full precision reaches the column.
+    """
     engine = RecordingEngine()
 
+    high_precision = Decimal("1.0000000000000012345678901234567890")
     on_cross_reference_anomaly(
         _event(
-            official_value=Decimal("1.000000001"),
+            official_value=high_precision,
             reality_proxy_value=Decimal("2.5"),
         ),
         engine=engine,
     )
 
     _, params = engine.conn.calls[1]
-    assert isinstance(params["ov"], float)
-    assert isinstance(params["rv"], float)
-    assert params["ov"] == pytest.approx(1.000000001)
-    assert params["rv"] == pytest.approx(2.5)
+    # Bind values are strings that reconstruct the Decimal losslessly.
+    assert isinstance(params["ov"], str)
+    assert isinstance(params["rv"], str)
+    assert Decimal(params["ov"]) == high_precision
+    assert Decimal(params["rv"]) == Decimal("2.5")
+    # A round-trip through float() would irretrievably lose precision:
+    assert Decimal(str(float(high_precision))) != high_precision
+
+
+def test_missing_or_none_numeric_defaults_to_zero_numeric_string():
+    """None values must not blow up the NUMERIC bind path.
+
+    Existing handler contract preserved: absent/None official/reality
+    values coerce to zero. The zero must arrive as a NUMERIC-castable
+    string so ``CAST(:ov AS NUMERIC)`` succeeds.
+    """
+    engine = RecordingEngine()
+
+    class _NoneEvent:
+        event_id = UUID("33333333-3333-3333-3333-333333333333")
+        producer_module = "intelligence.cross_reference"
+        correlation_id = None
+        statistic = "cpi_yoy"
+        official_value = None
+        reality_proxy_value = None
+        confidence_delta = 0.0
+        evidence_links = []
+        severity = "HIGH"
+
+    on_cross_reference_anomaly(_NoneEvent(), engine=engine)
+
+    _, params = engine.conn.calls[1]
+    assert params["ov"] == "0"
+    assert params["rv"] == "0"
+    assert Decimal(params["ov"]) == Decimal(0)
 
 
 # ---- non-fatal contract ----
