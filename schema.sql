@@ -60,6 +60,23 @@ CREATE INDEX IF NOT EXISTS idx_raw_series_series_id
     ON raw_series (series_id);
 
 -- ============================================================
+-- TABLE: dad_ticker_summary_cache
+-- Short-lived compact payload cache for Dad ticker first paint.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS dad_ticker_summary_cache (
+    ticker             TEXT PRIMARY KEY,
+    payload_version    TEXT NOT NULL,
+    generated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    research_db_path   TEXT,
+    research_db_mtime  DOUBLE PRECISION,
+    payload            JSONB NOT NULL,
+    timings            JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS idx_dad_summary_cache_generated
+    ON dad_ticker_summary_cache (generated_at DESC);
+
+-- ============================================================
 -- TABLE: feature_registry
 -- Canonical list of all features with transformation metadata.
 -- ============================================================
@@ -399,7 +416,9 @@ VALUES
     ('UnusualWhales',  'https://api.unusualwhales.com',             'FREE', 'EOD',      FALSE, 'NEVER',  'MED',  7, FALSE),
     ('Reddit',         'https://oauth.reddit.com',                  'FREE', 'REALTIME', FALSE, 'NEVER',  'LOW',  8, FALSE),
     ('DexScreener',    'https://api.dexscreener.com',               'FREE', 'EOD',      FALSE, 'NEVER',  'MED',  20, TRUE),
-    ('PumpFun',        'https://frontend-api-v3.pump.fun',          'FREE', 'REALTIME', FALSE, 'NEVER',  'LOW',  21, TRUE)
+    ('PumpFun',        'https://frontend-api-v3.pump.fun',          'FREE', 'REALTIME', FALSE, 'NEVER',  'LOW',  21, TRUE),
+    ('finviz_fundamentals', 'https://finviz.com/quote.ashx',        'FREE', 'EOD',      FALSE, 'NEVER',  'MED',  45, TRUE),
+    ('TradingView',    'https://tradingview.com',                   'FREE', 'REALTIME', FALSE, 'NEVER',  'MED',  25, TRUE)
 ON CONFLICT (name) DO NOTHING;
 
 -- ============================================================

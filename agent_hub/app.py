@@ -82,11 +82,35 @@ def create_app(
     bucket = os.getenv("AGENT_HUB_BUCKET", DEFAULT_BUCKET)
     app = FastAPI(title="GRID Agent Reporting Hub", version="1.0.0")
 
-    @app.get("/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok", "service": "agent-hub"}
+    @app.api_route("/health", methods=["GET", "HEAD"])
+    def health() -> dict[str, Any]:
+        db_ok = repo.check_health() if hasattr(repo, "check_health") else True
+        s3_ok = store.check_health(bucket) if hasattr(store, "check_health") else True
+
+        if not db_ok or not s3_ok:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "status": "error",
+                    "service": "agent-hub",
+                    "details": {
+                        "postgres": "ok" if db_ok else "error",
+                        "minio": "ok" if s3_ok else "error",
+                    }
+                }
+            )
+
+        return {
+            "status": "ok",
+            "service": "agent-hub",
+            "details": {
+                "postgres": "ok",
+                "minio": "ok"
+            }
+        }
 
     @app.post("/report", response_model=AgentReportOut)
+
     def ingest_report(
         payload: AgentReportIn,
         authorization: str | None = Header(default=None),
