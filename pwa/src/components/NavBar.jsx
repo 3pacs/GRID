@@ -3,6 +3,7 @@ import {
     Menu, X, ChevronRight, Search,
     Sun, Moon,
     MessageSquare,
+    RefreshCw,
 } from 'lucide-react';
 import useStore from '../store.js';
 import { tabRoutes, tabRouteIds, drawerSections } from '../routes.js';
@@ -43,7 +44,7 @@ const s = {
     },
     mobileTabRow: {
         display: 'grid',
-        gridTemplateColumns: 'repeat(7, minmax(0, 1fr))',
+        gridTemplateColumns: 'repeat(8, minmax(0, 1fr))',
         minWidth: 0,
         width: '100%',
         overflow: 'hidden',
@@ -175,7 +176,15 @@ const s = {
 
 /* ─────────────── Component ─────────────── */
 
-export default function NavBar({ activeView, onNavigate, onSearchOpen, onChatOpen }) {
+export default function NavBar({
+    activeView,
+    onNavigate,
+    onSearchOpen,
+    onChatOpen,
+    onRefreshVisuals,
+    isRefreshingVisuals = false,
+    preloadStatus = null,
+}) {
     const [showDrawer, setShowDrawer] = useState(false);
     const isDesktop = useIsDesktop();
     const theme = useStore(s => s.theme);
@@ -202,6 +211,13 @@ export default function NavBar({ activeView, onNavigate, onSearchOpen, onChatOpe
     };
 
     const toggleDrawer = () => setShowDrawer(prev => !prev);
+    const refreshTitle = isRefreshingVisuals
+        ? 'Refreshing visualizations'
+        : preloadStatus?.state === 'ready'
+            ? `Refresh visualizations. Warm cache ${preloadStatus.completed}/${preloadStatus.total}`
+            : preloadStatus?.state === 'warming'
+                ? `Warming visualizations ${preloadStatus.completed}/${preloadStatus.total}`
+                : 'Refresh visualizations';
 
     // Determine if "More" button should look active (current view is in the drawer)
     const isDrawerViewActive = !tabRouteIds.has(activeView)
@@ -328,6 +344,21 @@ export default function NavBar({ activeView, onNavigate, onSearchOpen, onChatOpe
                             : <Moon size={16} color={TEXT_DIM} />}
                     </button>
                     <button
+                        onClick={() => onRefreshVisuals?.()}
+                        disabled={isRefreshingVisuals}
+                        style={{
+                            ...s.desktopMore,
+                            marginLeft: '0',
+                            marginRight: '0',
+                            padding: '8px 10px',
+                            opacity: isRefreshingVisuals ? 0.62 : 1,
+                        }}
+                        aria-label="Refresh visualizations"
+                        title={refreshTitle}
+                    >
+                        <RefreshCw size={16} color={isRefreshingVisuals ? ACCENT : TEXT_DIM} />
+                    </button>
+                    <button
                         onClick={() => onSearchOpen?.()}
                         style={{
                             ...s.desktopMore,
@@ -408,6 +439,23 @@ export default function NavBar({ activeView, onNavigate, onSearchOpen, onChatOpe
                         );
                     })}
                     {/* More / drawer toggle */}
+                    <button
+                        onClick={() => onRefreshVisuals?.()}
+                        disabled={isRefreshingVisuals}
+                        style={{
+                            ...s.mobileTab,
+                            borderTop: isRefreshingVisuals ? `2px solid ${ACCENT}` : '2px solid transparent',
+                            opacity: isRefreshingVisuals ? 0.62 : 1,
+                        }}
+                        aria-label="Refresh visualizations"
+                        title={refreshTitle}
+                    >
+                        <RefreshCw size={20} color={isRefreshingVisuals ? ACCENT : TEXT_DIM} />
+                        <span style={{
+                            ...s.mobileTabLabel,
+                            color: isRefreshingVisuals ? ACCENT : TEXT_DIM,
+                        }}>REFRESH</span>
+                    </button>
                     <button
                         onClick={() => onSearchOpen?.()}
                         style={{

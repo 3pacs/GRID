@@ -20,7 +20,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from ingestion.base import BasePuller, retry_on_failure
+from ingestion.base import BasePuller, log_pull_failure, retry_on_failure
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -270,7 +270,7 @@ class WorldBankPuller(BasePuller):
             log.info("WB {sid}: inserted {n} rows", sid=series_id, n=inserted)
 
         except Exception as exc:
-            log.error("WB pull failed for {sid}: {err}", sid=series_id, err=str(exc))
+            log_pull_failure("WB", series_id, exc)
             result["status"] = "FAILED"
             result["errors"].append(str(exc))
             self._record_failure(series_id, exc)

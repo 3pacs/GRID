@@ -1,6 +1,8 @@
 name: Deploy to Grid Server
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       skip_tests:
@@ -8,10 +10,10 @@ on:
         required: false
         default: 'false'
       do_restart:
-        description: 'Restart grid-api after deploy (opt-in; default is no-restart verification only)'
+        description: 'Restart grid-api after deploy'
         type: boolean
         required: false
-        default: false
+        default: true
 
 env:
   DEPLOY_PATH: /data/grid_v4/grid_release
@@ -22,23 +24,48 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event.inputs.skip_tests != 'true'
 
-    services:
-      postgres:
-        image: postgres:15
-        env:
-          POSTGRES_USER: grid
-          POSTGRES_PASSWORD: testpass
-          POSTGRES_DB: griddb_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+
+      - name: Start Postgres (resilient pull)
+        run: |
+          set -euo pipefail
+          # GitHub-hosted runners pull service-container images from Docker Hub
+          # *before any step runs*, so a flaky pull (registry-1.docker.io:
+          # "context deadline exceeded") fails the whole job with no retry path.
+          # Start Postgres manually instead, retrying the pull with backoff.
+          for attempt in 1 2 3 4 5; do
+            if docker pull postgres:15; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "::error::docker pull postgres:15 failed after 5 attempts"
+              exit 1
+            fi
+            backoff=$(( attempt * 5 ))
+            echo "::warning::docker pull postgres:15 failed (attempt ${attempt}/5); retrying in ${backoff}s"
+            sleep "${backoff}"
+          done
+          docker run -d --name grid-postgres \
+            -e POSTGRES_USER=grid \
+            -e POSTGRES_PASSWORD=testpass \
+            -e POSTGRES_DB=griddb_test \
+            -p 5432:5432 \
+            postgres:15
+
+      - name: Wait for Postgres
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 30); do
+            if docker exec grid-postgres pg_isready -U grid -d griddb_test >/dev/null 2>&1; then
+              echo "Postgres is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Postgres did not become ready in time"
+          docker logs grid-postgres || true
+          exit 1
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -63,27 +90,49 @@ jobs:
     if: always() && (needs.verify.result == 'success' || needs.verify.result == 'skipped')
 
     steps:
-      - name: Build release tree (no restart)
+      - name: Build release tree
         run: |
           set -euo pipefail
           cd "$DEPLOY_PATH"
           git fetch origin && git reset --hard origin/main
           pip install -r requirements.txt
           cd pwa && npm ci && npm run build && cd ..
-          python -m alembic upgrade head || echo "no migrations"
+          python3 -m alembic upgrade head || echo "no migrations"
 
-      - name: Restart grid-api (opt-in only)
-        if: ${{ inputs.do_restart == true }}
+      - name: Restart grid-api
+        if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
         run: |
           set -euo pipefail
+          sudo mkdir -p /etc/systemd/system/grid-api.service.d
+          printf '%s\n' '[Service]' "WorkingDirectory=$DEPLOY_PATH" | sudo tee /etc/systemd/system/grid-api.service.d/zz-release-worktree.conf >/dev/null
+          sudo systemctl daemon-reload
           sudo systemctl restart grid-api
-          sleep 3
 
       - name: Verify running API (health + OpenAPI)
         run: |
           set -euo pipefail
-          curl -fsS http://localhost:8000/api/v1/system/health
-          curl -fsS http://localhost:8000/openapi.json | grep -F '"/api/v1/intelligence/actor-network"'
+          for attempt in {1..45}; do
+            if curl -fsS http://localhost:8000/api/v1/system/health; then
+              break
+            fi
+            if [ "$attempt" -eq 45 ]; then
+              echo "grid-api did not pass health check after restart"
+              sudo systemctl status grid-api --no-pager -l || true
+              journalctl -u grid-api -n 120 --no-pager || true
+              exit 1
+            fi
+            sleep 2
+          done
+          api_pid="$(systemctl show -p MainPID --value grid-api)"
+          test "$(readlink "/proc/${api_pid}/cwd")" = "$DEPLOY_PATH"
+          curl -fsS http://localhost:8000/ > /tmp/grid-index.html
+          index_js="$(grep -o '/assets/index-[^"]*\.js' /tmp/grid-index.html | head -1)"
+          test -n "$index_js"
+          curl -fsS "http://localhost:8000${index_js}" > /tmp/grid-index.js
+          grep -F '/gold/stream' /tmp/grid-index.js
+          curl -fsS http://localhost:8000/openapi.json > /tmp/grid-openapi.json
+          grep -F '"/api/v1/intelligence/actor-network"' /tmp/grid-openapi.json
+          grep -F '"/api/v1/dad/ticker/{ticker}/gold/stream"' /tmp/grid-openapi.json
 
       - name: Notify success
         if: success()

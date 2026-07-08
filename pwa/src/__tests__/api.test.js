@@ -336,6 +336,107 @@ describe('GRIDApi', () => {
         });
     });
 
+    describe('GET cache', () => {
+        it('serves repeated cacheable GETs from memory', async () => {
+            global.fetch.mockResolvedValue({
+                ok: true,
+                status: 200,
+                json: () => Promise.resolve({ state: 'risk-on' }),
+            });
+
+            const first = await api._fetch('/api/v1/regime/current');
+            const second = await api._fetch('/api/v1/regime/current');
+
+            expect(first).toEqual({ state: 'risk-on' });
+            expect(second).toEqual({ state: 'risk-on' });
+            expect(global.fetch).toHaveBeenCalledTimes(1);
+        });
+
+        it('deduplicates concurrent cacheable GETs', async () => {
+            let resolveFetch;
+            global.fetch.mockReturnValue(new Promise(resolve => { resolveFetch = resolve; }));
+
+            const first = api._fetch('/api/v1/intelligence/dashboard');
+            const second = api._fetch('/api/v1/intelligence/dashboard');
+            expect(global.fetch).toHaveBeenCalledTimes(1);
+            resolveFetch({
+                ok: true,
+                status: 200,
+                json: () => Promise.resolve({ ok: true }),
+            });
+
+            await expect(first).resolves.toEqual({ ok: true });
+            await expect(second).resolves.toEqual({ ok: true });
+            expect(global.fetch).toHaveBeenCalledTimes(1);
+        });
+
+        it('bypasses cache when gridForce is set', async () => {
+            global.fetch
+                .mockResolvedValueOnce({
+                    ok: true,
+                    status: 200,
+                    json: () => Promise.resolve({ version: 1 }),
+                })
+                .mockResolvedValueOnce({
+                    ok: true,
+                    status: 200,
+                    json: () => Promise.resolve({ version: 2 }),
+                });
+
+            await api._fetch('/api/v1/regime/current');
+            const refreshed = await api._fetch('/api/v1/regime/current', { gridForce: true });
+
+            expect(refreshed).toEqual({ version: 2 });
+            expect(global.fetch).toHaveBeenCalledTimes(2);
+        });
+
+        it('clears cached GETs after a mutation', async () => {
+            global.fetch
+                .mockResolvedValueOnce({
+                    ok: true,
+                    status: 200,
+                    json: () => Promise.resolve({ version: 1 }),
+                })
+                .mockResolvedValueOnce({
+                    ok: true,
+                    status: 200,
+                    json: () => Promise.resolve({ saved: true }),
+                })
+                .mockResolvedValueOnce({
+                    ok: true,
+                    status: 200,
+                    json: () => Promise.resolve({ version: 2 }),
+                });
+
+            await api._fetch('/api/v1/regime/current');
+            await api._fetch('/api/v1/config', { method: 'PUT', body: JSON.stringify({}) });
+            const afterMutation = await api._fetch('/api/v1/regime/current');
+
+            expect(afterMutation).toEqual({ version: 2 });
+            expect(global.fetch).toHaveBeenCalledTimes(3);
+        });
+
+        it('does not cache explicit Dad Finviz refreshes', async () => {
+            global.fetch
+                .mockResolvedValueOnce({
+                    ok: true,
+                    status: 200,
+                    json: () => Promise.resolve({ finviz: { field_count: 10 } }),
+                })
+                .mockResolvedValueOnce({
+                    ok: true,
+                    status: 200,
+                    json: () => Promise.resolve({ finviz: { field_count: 11 } }),
+                });
+
+            await api.getDadTickerGold('AAPL', { refreshFinviz: true });
+            const refreshed = await api.getDadTickerGold('AAPL', { refreshFinviz: true });
+
+            expect(refreshed).toEqual({ finviz: { field_count: 11 } });
+            expect(global.fetch).toHaveBeenCalledTimes(2);
+        });
+    });
+
     describe('API methods', () => {
         beforeEach(() => {
             global.fetch.mockResolvedValue({

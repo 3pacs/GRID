@@ -191,7 +191,7 @@ risks are narrower than the brief suggested, but they still exist.
 
 **Semantic check:** Five pre-existing news scanners exist. None of them resolves entities against `supply_chain_nodes` or triggers a propagation simulator. **But all five scan `news_articles`** — so we have 6 scanners reading the same table independently.
 
-**Verdict:** **OVERLAP_PARTIAL** — not a duplicate of function, but a duplicate of the *scanner pattern*. All 6 modules independently poll `news_articles`. Risk: inconsistent freshness, inconsistent ticker resolution (news_ticker_[[Conflict Resolution|resolver.py]] exists and none of them may use it).
+**Verdict:** **OVERLAP_PARTIAL** — not a duplicate of function, but a duplicate of the *scanner pattern*. All 6 modules independently poll `news_articles`. Risk: inconsistent freshness, inconsistent ticker resolution (`news_ticker_resolver.py` exists and none of them may use it).
 
 **Resolution task:** SYNTH-8 — Introduce a single news event bus (`intelligence/_news_fanout.py` as a small helper, NOT a new intelligence module — add as a package-private helper inside an existing file). Each of the 6 scanners subscribes instead of polling. Short-term: verify all 6 use `news_ticker_resolver.resolve_tickers` so ticker sets agree.
 
