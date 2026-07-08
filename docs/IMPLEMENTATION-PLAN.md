@@ -21,7 +21,7 @@
 
 ## Item 1: GRID MCP Server (HIGHEST PRIORITY)
 
-**Purpose**: Wrap grid.stepdad.finance API so Claude queries live trust scores, [[Actor Network|actor network]]s, predictions, and data freshness directly.
+**Purpose**: Wrap grid.stepdad.finance API so Claude queries live trust scores, [[Actor Network|actor networks]], predictions, and data freshness directly.
 
 ### Files to Create
 - `mcp_server_http.py` — FastMCP server (HTTP client to REST API)

@@ -13,6 +13,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
+from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
@@ -108,8 +109,9 @@ def _check_puller_health(engine: Engine) -> list[HeartbeatAlert]:
                     message=f"Puller '{row[0]}' has {row[1]} failures in last 6h",
                     data={"puller": row[0], "failures": row[1]},
                 ))
-    except Exception:
-        pass  # Table structure may differ, don't crash heartbeat
+    except Exception as exc:
+        # Surface the failure in errors.jsonl so "all clear" doesn't hide a broken check.
+        log.warning("heartbeat puller_health check failed: {}", exc)
 
     return alerts
 
@@ -134,8 +136,8 @@ def _check_pit_freshness(engine: Engine) -> list[HeartbeatAlert]:
                         message=f"PIT store is {staleness} days stale (last data: {max_date})",
                         data={"last_date": str(max_date), "staleness_days": staleness},
                     ))
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("heartbeat pit_freshness check failed: {}", exc)
 
     return alerts
 

@@ -159,8 +159,12 @@ def _build_money_market_node(engine: Engine = None, as_of: date = None) -> FlowN
                     value = float(row[0]) * 1_000_000
                     source = "FRED:MMMFFAQ027S"
                     confidence = "observed"
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning(
+                "money_market_funds FRED lookup failed; using ~$6T fallback estimate",
+                series="MMMFFAQ027S",
+                err=str(exc),
+            )
 
     return FlowNode(
         id="money_market_funds",
