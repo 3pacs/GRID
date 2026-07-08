@@ -11,7 +11,7 @@
 This document provides a comprehensive inventory of every Python module in the GRID trading intelligence platform. The system is organized into seven functional layers:
 
 1. **Ingestion Layer** (104 modules) — 50+ data sources (macro, crypto, celestial, intelligence)
-2. **Intelligence Layer** (46 modules) — [[Actor Network|Actor network]]s, [[Trust Scorer|trust scoring]], [[Causation|causation]] analysis
+2. **Intelligence Layer** (46 modules) — [[Actor Network|Actor networks]], [[Trust Scorer|trust scoring]], [[Causation|causation]] analysis
 3. **Analysis Layer** (16 modules) — Correlation engines, hypothesis testing, sector mapping
 4. **Trading & Execution** (11 modules) — [[Options Scanner|Options scanner]], signal executor, paper trading
 5. **LLM & Reasoning** (22 modules) — [[Ollama]], [[Hyperspace]], [[TradingAgents]], Hyperspace P2P
@@ -549,7 +549,7 @@ Utility and operational scripts in `scripts/`:
 - `ux_auditor.py` — UX testing + improvement
 - `edge_ui.py` — Human-in-the-loop edge worker with web UI
 - `export_astrogrid_local_data.py` — [[AstroGrid]] data export
-- `activate_v2_mappings.py` — Activate V2 [[Entity Map|entity map]]pings
+- `activate_v2_mappings.py` — Activate V2 [[Entity Map|entity mappings]]
 - `assimilator.py** — Human LLM response assimilation
 - `fix_model_eligible.py` — Fix model_eligible flags
 - `scrape_missing_features.py` — Background feature scraper

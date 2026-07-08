@@ -14,7 +14,7 @@ How data flows through GRID: from external sources to actionable intelligence.
 External data is pulled by source-specific puller classes, each implementing a standard interface: `pull()` -> `save_to_db()`.
 
 **Source Groups:**
-- [[Ingestion-AltData]] — 56 files: AAII sentiment, CBOE, [[CFTC COT]], [[Dark Pool|dark pool]]s, [[GDELT]], [[Insider Filings|insider filings]], prediction markets, etc.
+- [[Ingestion-AltData]] — 56 files: AAII sentiment, CBOE, [[CFTC COT]], [[Dark Pool|dark pools]], [[GDELT]], [[Insider Filings|insider filings]], prediction markets, etc.
 - [[Ingestion-International]] — 14 files: [[ECB]], BCB, BIS, IMF, OECD, Eurostat, etc.
 - [[Ingestion-Physical]] — 7 files: [[USDA]], VIIRS nightlights, patents, OFR
 - [[Ingestion-Celestial]] — 6 files: planetary aspects, lunar cycles, solar activity, Vedic astrology, Chinese calendar

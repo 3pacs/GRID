@@ -21,9 +21,13 @@ class FakeObjectStore:
         self.put_calls.append((bucket, key, data, content_type))
         return True
 
+    def check_health(self, bucket: str) -> bool:
+        return not self.fail
+
 
 class FakeReportRepository:
-    def __init__(self):
+    def __init__(self, db_fail: bool = False):
+        self.db_fail = db_fail
         self.rows_by_key: dict[str, dict] = {}
         self.insert_calls: list[dict] = []
 
@@ -39,6 +43,10 @@ class FakeReportRepository:
         }
         self.rows_by_key[report["idempotency_key"]] = row
         return row
+
+    def check_health(self) -> bool:
+        return not self.db_fail
+
 
 
 def _client(repo=None, store=None) -> TestClient:
@@ -158,3 +166,37 @@ def test_report_ingest_does_not_insert_when_object_store_write_fails():
 
     assert response.status_code == 503
     assert repo.insert_calls == []
+
+
+def test_health_check_returns_200_on_success():
+    client = _client()
+    # test GET
+    response_get = client.get("/health")
+    assert response_get.status_code == 200
+    assert response_get.json()["status"] == "ok"
+    assert response_get.json()["details"]["postgres"] == "ok"
+    assert response_get.json()["details"]["minio"] == "ok"
+
+    # test HEAD
+    response_head = client.head("/health")
+    assert response_head.status_code == 200
+    assert response_head.text == ""
+
+
+def test_health_check_returns_503_on_db_failure():
+    repo = FakeReportRepository(db_fail=True)
+    client = _client(repo=repo)
+    response = client.get("/health")
+    assert response.status_code == 503
+    assert response.json()["detail"]["details"]["postgres"] == "error"
+    assert response.json()["detail"]["details"]["minio"] == "ok"
+
+
+def test_health_check_returns_503_on_s3_failure():
+    store = FakeObjectStore(fail=True)
+    client = _client(store=store)
+    response = client.get("/health")
+    assert response.status_code == 503
+    assert response.json()["detail"]["details"]["postgres"] == "ok"
+    assert response.json()["detail"]["details"]["minio"] == "error"
+

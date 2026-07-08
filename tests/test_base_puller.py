@@ -241,6 +241,24 @@ class TestResolveSourceId:
         with pytest.raises(RuntimeError, match="MissingSource source not found"):
             TestPuller(engine)
 
+    def test_auto_create_normalizes_revision_behavior_alias(self):
+        """SOURCE_CONFIG aliases must not violate source_catalog checks."""
+        engine, conn = _mock_engine()
+        conn.execute.return_value.fetchone.side_effect = [None, (99,)]
+
+        class TestPuller(BasePuller):
+            SOURCE_NAME = "AliasSource"
+            SOURCE_CONFIG = {
+                "base_url": "https://example.test",
+                "revision_behavior": "RARELY",
+            }
+
+        puller = TestPuller(engine)
+
+        assert puller.source_id == 99
+        insert_params = conn.execute.call_args_list[1].args[1]
+        assert insert_params["rev"] == "RARE"
+
 
 # ---------------------------------------------------------------------------
 # BasePuller._row_exists tests
