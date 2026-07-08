@@ -4,7 +4,7 @@
 
 ## The Problem
 
-GRID has 14 intelligence modules (22,354 lines), 48 pullers, 10 sector network modules, and 5 Oracle models. But connectivity is sparse — most intelligence output only serves API endpoints. The Oracle reads from raw [[Resolved Series Table|resolved_series]], ignoring [[Forensics|forensics]], [[Causation|causation]], [[Event Sequence|event sequence]]s, patterns, sector networks, and the unified thesis.
+GRID has 14 intelligence modules (22,354 lines), 48 pullers, 10 sector network modules, and 5 Oracle models. But connectivity is sparse — most intelligence output only serves API endpoints. The Oracle reads from raw [[Resolved Series Table|resolved_series]], ignoring [[Forensics|forensics]], [[Causation|causation]], [[Event Sequence|event sequences]], patterns, sector networks, and the unified thesis.
 
 ## The Vision
 

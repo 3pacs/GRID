@@ -2,7 +2,7 @@
 
 ## Pattern
 
-GRID follows a **pipeline architecture** with a shared [[PostgreSQL]] database as the integration backbone. Data flows through a series of transformation stages — ingestion, normalization/resolution, [[PIT Store|PIT-correct]] storage, [[Feature Engineering|feature engineering]], unsupervised discovery, inference, and [[Decision Journal|decision journal]]ing. Each stage is implemented as an independent Python module with its own domain class, all communicating through the shared database via [[SQLAlchemy]] engine passing.
+GRID follows a **pipeline architecture** with a shared [[PostgreSQL]] database as the integration backbone. Data flows through a series of transformation stages — ingestion, normalization/resolution, [[PIT Store|PIT-correct]] storage, [[Feature Engineering|feature engineering]], unsupervised discovery, inference, and [[Decision Journal|decision journaling]]. Each stage is implemented as an independent Python module with its own domain class, all communicating through the shared database via [[SQLAlchemy]] engine passing.
 
 A secondary **layered architecture** governs the API: thin [[FastAPI]] route handlers delegate to domain modules, which in turn depend on shared abstractions (`PITStore`, `FeatureLab`, `DecisionJournal`, `ModelRegistry`). A [[Model Governance|model governance]] state machine (`CANDIDATE -> SHADOW -> STAGING -> PRODUCTION -> FLAGGED -> RETIRED`) gates promotions with validation checks.
 

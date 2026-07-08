@@ -5,6 +5,9 @@
 import { clearAuthSession, getStoredToken } from './authSession.js';
 import useRealtimeStore from './stores/realtimeStore.js';
 
+const DEFAULT_GET_CACHE_TTL_MS = 60_000;
+const PRELOAD_CONCURRENCY = 4;
+
 class GRIDApiError extends Error {
     constructor(status, message, detail) {
         super(message);
@@ -22,6 +25,8 @@ class GRIDApi {
         this._wsReconnectTimer = null;
         this._wsGeneration = 0;
         this._wsShouldReconnect = false;
+        this._cache = new Map();
+        this._inflight = new Map();
     }
 
     get token() {
@@ -29,6 +34,7 @@ class GRIDApi {
     }
 
     set token(val) {
+        this.clearCache();
         if (val) {
             localStorage.setItem('grid_token', val);
         } else {
@@ -46,49 +52,163 @@ class GRIDApi {
         return this._fetch(path, { method: 'POST', body: JSON.stringify(body) });
     }
 
+    _cacheKey(path) {
+        return path;
+    }
+
+    _isCacheableGet(path) {
+        if (typeof path !== 'string') return false;
+        if (!path.startsWith('/api/v1/')) return false;
+        if (
+            path.startsWith('/api/v1/auth/')
+            || path.startsWith('/api/v1/realtime/')
+            || path.startsWith('/api/v1/chat/')
+            || path.startsWith('/api/v1/alerts')
+            || path.startsWith('/api/v1/system/logs')
+            || path.includes('/stream')
+            || path.includes('live=true')
+            || path.includes('refresh=true')
+            || path.includes('refresh=1')
+            || path.includes('refresh_finviz=true')
+        ) {
+            return false;
+        }
+        return true;
+    }
+
+    clearCache({ prefix = null } = {}) {
+        if (!prefix) {
+            this._cache?.clear();
+            this._inflight?.clear();
+            return;
+        }
+        for (const key of this._cache.keys()) {
+            if (key.startsWith(prefix)) this._cache.delete(key);
+        }
+        for (const key of this._inflight.keys()) {
+            if (key.startsWith(prefix)) this._inflight.delete(key);
+        }
+    }
+
+    invalidate(prefix = null) {
+        this.clearCache({ prefix });
+    }
+
+    async preload(paths = [], { ttlMs = DEFAULT_GET_CACHE_TTL_MS, concurrency = PRELOAD_CONCURRENCY, force = false, onProgress = null } = {}) {
+        const queue = [...new Set(paths.filter(Boolean))];
+        let completed = 0;
+        let index = 0;
+
+        const worker = async () => {
+            while (index < queue.length) {
+                const path = queue[index];
+                index += 1;
+                await this._fetch(path, {
+                    gridTtlMs: ttlMs,
+                    gridForce: force,
+                    gridPreload: true,
+                }).catch(() => null);
+                completed += 1;
+                onProgress?.({ completed, total: queue.length, path });
+            }
+        };
+
+        const workers = Array.from(
+            { length: Math.min(concurrency, queue.length) },
+            () => worker(),
+        );
+        await Promise.all(workers);
+        return { completed, total: queue.length };
+    }
+
     async _fetch(path, options = {}) {
-        const headers = { 'Content-Type': 'application/json', ...options.headers };
+        const {
+            gridTtlMs = DEFAULT_GET_CACHE_TTL_MS,
+            gridForce = false,
+            gridPreload = false,
+            ...fetchOptions
+        } = options;
+        const method = String(fetchOptions.method || 'GET').toUpperCase();
+        const cacheable = method === 'GET' && this._isCacheableGet(path);
+        const cacheKey = this._cacheKey(path);
+        const now = Date.now();
+
+        if (cacheable && !gridForce) {
+            const cached = this._cache.get(cacheKey);
+            if (cached && cached.expiresAt > now) {
+                return cached.value;
+            }
+            const inflight = this._inflight.get(cacheKey);
+            if (inflight) {
+                return inflight;
+            }
+        }
+
+        const headers = { 'Content-Type': 'application/json', ...fetchOptions.headers };
         if (this.token) {
             headers['Authorization'] = `Bearer ${this.token}`;
         }
 
-        let response;
-        try {
-            response = await fetch(`${this.baseUrl}${path}`, {
-                ...options,
-                headers,
-            });
-        } catch (networkErr) {
-            // Network error (offline, CORS, DNS) — return error object, don't throw
-            return { error: true, status: 0, message: networkErr.message || 'Network error' };
-        }
-
-        if (!response.ok) {
-            const body = await response.text().catch(() => '');
-            let message = response.statusText;
+        const request = (async () => {
+            let response;
             try {
-                const parsed = JSON.parse(body);
-                message = parsed.detail || parsed.message || message;
-            } catch (_) {
-                if (body) message = body;
+                response = await fetch(`${this.baseUrl}${path}`, {
+                    ...fetchOptions,
+                    headers,
+                });
+            } catch (networkErr) {
+                // Network error (offline, CORS, DNS) — return error object, don't throw
+                return { error: true, status: 0, message: networkErr.message || 'Network error' };
             }
 
-            // Only treat 401 as session expiry for non-auth endpoints
-            if (response.status === 401 && !path.startsWith('/api/v1/auth/login') && !path.startsWith('/api/v1/auth/register')) {
-                this.token = null;
-                if (typeof window.dispatchEvent === 'function') {
-                    window.dispatchEvent(new Event('grid:auth-expired'));
+            if (!response.ok) {
+                const body = await response.text().catch(() => '');
+                let message = response.statusText;
+                try {
+                    const parsed = JSON.parse(body);
+                    message = parsed.detail || parsed.message || message;
+                } catch (_) {
+                    if (body) message = body;
                 }
-                window.location.hash = '#/login';
+
+                // Only treat 401 as session expiry for non-auth endpoints
+                if (response.status === 401 && !path.startsWith('/api/v1/auth/login') && !path.startsWith('/api/v1/auth/register')) {
+                    this.token = null;
+                    if (typeof window.dispatchEvent === 'function') {
+                        window.dispatchEvent(new Event('grid:auth-expired'));
+                    }
+                    window.location.hash = '#/login';
+                }
+
+                return { error: true, status: response.status, message };
             }
 
-            return { error: true, status: response.status, message };
+            try {
+                const data = await response.json();
+                if (method !== 'GET') {
+                    this.clearCache();
+                } else if (cacheable && !data?.error) {
+                    this._cache.set(cacheKey, {
+                        value: data,
+                        expiresAt: Date.now() + gridTtlMs,
+                    });
+                }
+                return data;
+            } catch (parseErr) {
+                return { error: true, status: response.status, message: 'Invalid JSON response' };
+            }
+        })();
+
+        if (cacheable && !gridForce && !gridPreload) {
+            this._inflight.set(cacheKey, request);
         }
 
         try {
-            return await response.json();
-        } catch (parseErr) {
-            return { error: true, status: response.status, message: 'Invalid JSON response' };
+            return await request;
+        } finally {
+            if (cacheable) {
+                this._inflight.delete(cacheKey);
+            }
         }
     }
 
@@ -207,6 +327,83 @@ class GRIDApi {
     async exportTenYearModel({ capital = 1000000, years = 10 } = {}) {
         const params = new URLSearchParams({ capital: String(capital), years: String(years) });
         return this._download(`/api/v1/ten-year-portfolio/export.xlsx?${params.toString()}`);
+    }
+
+    async getDadTickerGold(ticker, { refreshFinviz = false } = {}) {
+        const qs = refreshFinviz ? '?refresh_finviz=true' : '';
+        return this._fetch(`/api/v1/dad/ticker/${encodeURIComponent(ticker)}/gold${qs}`, {
+            gridForce: refreshFinviz,
+        });
+    }
+
+    async getDadTickerEvidence(ticker, { limit = 50, offset = 0 } = {}) {
+        const params = new URLSearchParams({
+            limit: String(limit),
+            offset: String(offset),
+        });
+        return this._fetch(`/api/v1/dad/ticker/${encodeURIComponent(ticker)}/evidence?${params.toString()}`);
+    }
+
+    async getDadTickerChart(ticker, { range = '1Y', points = 220 } = {}) {
+        const params = new URLSearchParams({
+            range,
+            points: String(points),
+        });
+        return this._fetch(`/api/v1/dad/ticker/${encodeURIComponent(ticker)}/chart?${params.toString()}`);
+    }
+
+    async getDadTickerFinviz(ticker, { refreshFinviz = false } = {}) {
+        const qs = refreshFinviz ? '?refresh_finviz=true' : '';
+        return this._fetch(`/api/v1/dad/ticker/${encodeURIComponent(ticker)}/finviz${qs}`, {
+            gridForce: refreshFinviz,
+        });
+    }
+
+    async getDadTickerOptions(ticker, { days = 90, limit = 90 } = {}) {
+        const params = new URLSearchParams({
+            days: String(days),
+            limit: String(limit),
+        });
+        return this._fetch(`/api/v1/dad/ticker/${encodeURIComponent(ticker)}/options?${params.toString()}`);
+    }
+
+    streamDadTickerGold(ticker, {
+        refreshFinviz = false,
+        onEvent = null,
+        onError = null,
+        onDone = null,
+    } = {}) {
+        const params = new URLSearchParams();
+        if (refreshFinviz) params.set('refresh_finviz', 'true');
+        if (this.token) params.set('token', this.token);
+        const suffix = params.toString() ? `?${params.toString()}` : '';
+        const source = new EventSource(`${this.baseUrl}/api/v1/dad/ticker/${encodeURIComponent(ticker)}/gold/stream${suffix}`);
+        const eventNames = ['start', 'compact', 'evidence', 'chart', 'finviz', 'options', 'done'];
+        const handleNamedEvent = (name, event) => {
+            let payload = {};
+            try {
+                payload = event?.data ? JSON.parse(event.data) : {};
+            } catch (_) {
+                payload = { raw: event?.data || '' };
+            }
+            onEvent?.(name, payload);
+            if (name === 'done') {
+                onDone?.(payload);
+                source.close();
+            }
+        };
+
+        eventNames.forEach(name => {
+            source.addEventListener(name, event => handleNamedEvent(name, event));
+        });
+        source.addEventListener('error', event => {
+            if (event?.data) {
+                handleNamedEvent('error', event);
+            } else {
+                onError?.(event);
+            }
+        });
+        return source;
     }
 
     async _fetchForm(path, form) {

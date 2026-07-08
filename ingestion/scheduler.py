@@ -85,6 +85,7 @@ _SOURCE_NAME_ALIASES: dict[str, tuple[str, ...]] = {
     "Export_Controls": ("BIS_EXPORT_CONTROLS",),
     "FEC_Campaign_Finance": ("FEC_CAMPAIGN_FINANCE",),
     "FINRA_Margin": ("FINRA_MARGIN",),
+    "Finviz_Fundamentals": ("finviz_fundamentals",),
     "FMP_Earnings": ("fmp",),
     "Gov_Contracts": ("USASPENDING_GOV",),
     "Google_Trends_Daily": ("Google_Trends",),

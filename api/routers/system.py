@@ -37,6 +37,8 @@ from api.schemas.system import (
 router = APIRouter(prefix="/api/v1/system", tags=["system"])
 
 _start_time = time.time()
+_SERIES_COUNT_SAMPLE_LIMIT = 50_000
+_RESOLVER_PENDING_SAMPLE_LIMIT = 100_000
 
 
 def _systemd_service_active(service_name: str) -> bool:
@@ -88,16 +90,14 @@ def health() -> HealthResponse:
             if feature_count == 0:
                 degraded_reasons.append("no features registered")
 
-            # raw_series has ~1.9B rows; the EXISTS-with-filter form makes
-            # the planner pick a seq scan (~280s), ignoring the DESC index.
-            # Pulling max(pull_timestamp) via the DESC index is an Index
-            # Only Scan (sub-ms) — compare that to the freshness window.
+            # Keep unauthenticated health bounded. raw_series is very large,
+            # so prefer the source catalog heartbeat and only fall back to the
+            # newest inserted raw row by primary key order.
             recent = bool(conn.execute(
                 text(
-                    "SELECT ("
-                    "  SELECT pull_timestamp FROM raw_series "
-                    "  ORDER BY pull_timestamp DESC "
-                    "  LIMIT 1"
+                    "SELECT COALESCE("
+                    "  (SELECT MAX(last_pull_at) FROM source_catalog), "
+                    "  (SELECT pull_timestamp FROM raw_series ORDER BY id DESC LIMIT 1)"
                     ") >= NOW() - INTERVAL '7 days'"
                 )
             ).scalar())
@@ -436,12 +436,14 @@ _SOURCE_TYPE_MAP: dict[str, str] = {
     "Eurostat": "macro", "DBnomics": "macro", "NYFed": "macro", "OFR": "macro",
     "Fed_Liquidity": "macro",
     "JQuants": "market", "EDINET": "market", "yfinance": "market",
+    "finviz_fundamentals": "market", "TradingView": "market",
     "ETF_Flows": "flows", "SEC_13F": "flows", "DarkPool": "flows",
     "Unusual_Whales": "flows",
     "WorldNews": "sentiment", "GDELT": "sentiment", "OppInsights": "sentiment",
     "alphavantage_news_sentiment": "sentiment", "hf_financial_news": "sentiment",
-    "Smart_Money": "sentiment",
-    "Congress_Trading": "altdata", "SEC_Insider": "altdata",
+    "Smart_Money": "sentiment", "Social_Smart_Money": "sentiment",
+    "Congress_Trading": "altdata", "CONGRESS_TRADING": "altdata",
+    "SEC_Insider": "altdata", "SEC_INSIDER": "altdata",
     "Prediction_Odds": "altdata", "Supply_Chain": "altdata",
     "Comtrade": "trade", "CEPII_BACI": "trade", "Atlas_ECI": "trade",
     "WIOD": "trade",
@@ -458,9 +460,12 @@ _SOURCE_SCHEDULE: dict[str, tuple[str, int]] = {
     "WorldNews": ("daily", 48), "OFR": ("daily", 48), "JQuants": ("daily", 48),
     "EDINET": ("daily", 48), "alphavantage_news_sentiment": ("daily", 48),
     "NYFed": ("daily", 48), "Congress_Trading": ("daily", 48),
-    "SEC_Insider": ("daily", 48), "Unusual_Whales": ("daily", 48),
+    "CONGRESS_TRADING": ("daily", 48), "SEC_Insider": ("daily", 48),
+    "SEC_INSIDER": ("daily", 48), "Unusual_Whales": ("daily", 48),
     "Prediction_Odds": ("daily", 48), "Smart_Money": ("daily", 48),
-    "Fed_Liquidity": ("daily", 48), "ETF_Flows": ("daily", 48),
+    "Social_Smart_Money": ("daily", 48), "Fed_Liquidity": ("daily", 48),
+    "ETF_Flows": ("daily", 48), "yfinance": ("daily", 48),
+    "finviz_fundamentals": ("daily", 48), "TradingView": ("daily", 48),
     # weekly sources: stale after 10 days
     "OECD_SDMX": ("weekly", 240), "BIS": ("weekly", 240), "IMF_IFS": ("weekly", 240),
     "RBI": ("weekly", 240), "ABS_AU": ("weekly", 240), "KOSIS": ("weekly", 240),
@@ -497,16 +502,40 @@ def pipeline_health(
     try:
         with engine.connect() as conn:
             # ── Per-source pull status ─────────────────────────────────
-            source_rows = conn.execute(text(
-                "SELECT sc.name, "
-                "  MAX(rs.pull_timestamp) AS last_pull, "
-                "  COUNT(*) FILTER (WHERE rs.pull_timestamp >= NOW() - INTERVAL '48 hours') AS recent_rows, "
-                "  COUNT(DISTINCT rs.series_key) AS series_count "
-                "FROM source_catalog sc "
-                "LEFT JOIN raw_series rs ON rs.source_id = sc.id "
-                "GROUP BY sc.name "
-                "ORDER BY sc.name"
-            )).fetchall()
+            source_rows = conn.execute(
+                text(
+                    "SELECT sc.name, "
+                    "  COALESCE(latest.last_pull, sc.last_pull_at) AS last_pull, "
+                    "  COALESCE(recent.recent_rows, 0) AS recent_rows, "
+                    "  COALESCE(series.series_count, 0) AS series_count "
+                    "FROM source_catalog sc "
+                    "LEFT JOIN LATERAL ("
+                    "  SELECT rs.pull_timestamp AS last_pull "
+                    "  FROM raw_series rs "
+                    "  WHERE rs.source_id = sc.id "
+                    "  ORDER BY rs.pull_timestamp DESC "
+                    "  LIMIT 1"
+                    ") latest ON TRUE "
+                    "LEFT JOIN LATERAL ("
+                    "  SELECT COUNT(*) AS recent_rows "
+                    "  FROM raw_series rs "
+                    "  WHERE rs.source_id = sc.id "
+                    "  AND rs.pull_timestamp >= NOW() - INTERVAL '48 hours'"
+                    ") recent ON TRUE "
+                    "LEFT JOIN LATERAL ("
+                    "  SELECT COUNT(DISTINCT sampled.series_id) AS series_count "
+                    "  FROM ("
+                    "    SELECT rs.series_id "
+                    "    FROM raw_series rs "
+                    "    WHERE rs.source_id = sc.id "
+                    "    ORDER BY rs.pull_timestamp DESC "
+                    "    LIMIT :series_limit"
+                    "  ) sampled"
+                    ") series ON TRUE "
+                    "ORDER BY sc.name"
+                ),
+                {"series_limit": _SERIES_COUNT_SAMPLE_LIMIT},
+            ).fetchall()
 
             for row in source_rows:
                 src_name = row[0]
@@ -615,22 +644,33 @@ def pipeline_health(
 
             # ── Resolver status ────────────────────────────────────────
             try:
-                r = conn.execute(text(
-                    "SELECT COUNT(*) FROM raw_series "
-                    "WHERE pull_status = 'SUCCESS' "
-                    "AND series_key NOT IN (SELECT DISTINCT series_key FROM resolved_series)"
-                )).fetchone()
+                r = conn.execute(
+                    text(
+                        "WITH recent_raw AS ("
+                        "  SELECT series_id "
+                        "  FROM raw_series "
+                        "  WHERE pull_status = 'SUCCESS' "
+                        "  ORDER BY id DESC "
+                        "  LIMIT :pending_limit"
+                        ") "
+                        "SELECT COUNT(DISTINCT rr.series_id) "
+                        "FROM recent_raw rr "
+                        "LEFT JOIN feature_registry fr ON fr.name = rr.series_id "
+                        "WHERE fr.id IS NULL"
+                    ),
+                    {"pending_limit": _RESOLVER_PENDING_SAMPLE_LIMIT},
+                ).fetchone()
                 resolver.pending = r[0] if r else 0
 
                 r = conn.execute(text(
-                    "SELECT MAX(resolved_at) FROM resolved_series"
+                    "SELECT MAX(vintage_date) FROM resolved_series"
                 )).fetchone()
                 if r and r[0]:
                     resolver.last_run = r[0].isoformat()
 
                 r = conn.execute(text(
                     "SELECT COUNT(*) FROM resolved_series "
-                    "WHERE resolved_at >= NOW() - INTERVAL '24 hours'"
+                    "WHERE vintage_date >= CURRENT_DATE - INTERVAL '1 day'"
                 )).fetchone()
                 resolver.last_resolved = r[0] if r else 0
             except Exception as exc:
@@ -1380,16 +1420,40 @@ def _get_puller_stats(engine) -> list[dict]:
     pullers = []
     try:
         with engine.connect() as conn:
-            rows = conn.execute(text(
-                "SELECT sc.name, "
-                "  COUNT(rs.id) AS row_count, "
-                "  MAX(rs.pull_timestamp) AS last_pull, "
-                "  COUNT(DISTINCT rs.series_key) AS series_count "
-                "FROM source_catalog sc "
-                "LEFT JOIN raw_series rs ON rs.source_id = sc.id "
-                "GROUP BY sc.name "
-                "ORDER BY sc.name"
-            )).fetchall()
+            rows = conn.execute(
+                text(
+                    "SELECT sc.name, "
+                    "  COALESCE(recent.recent_rows, 0) AS row_count, "
+                    "  COALESCE(latest.last_pull, sc.last_pull_at) AS last_pull, "
+                    "  COALESCE(series.series_count, 0) AS series_count "
+                    "FROM source_catalog sc "
+                    "LEFT JOIN LATERAL ("
+                    "  SELECT rs.pull_timestamp AS last_pull "
+                    "  FROM raw_series rs "
+                    "  WHERE rs.source_id = sc.id "
+                    "  ORDER BY rs.pull_timestamp DESC "
+                    "  LIMIT 1"
+                    ") latest ON TRUE "
+                    "LEFT JOIN LATERAL ("
+                    "  SELECT COUNT(*) AS recent_rows "
+                    "  FROM raw_series rs "
+                    "  WHERE rs.source_id = sc.id "
+                    "  AND rs.pull_timestamp >= NOW() - INTERVAL '48 hours'"
+                    ") recent ON TRUE "
+                    "LEFT JOIN LATERAL ("
+                    "  SELECT COUNT(DISTINCT sampled.series_id) AS series_count "
+                    "  FROM ("
+                    "    SELECT rs.series_id "
+                    "    FROM raw_series rs "
+                    "    WHERE rs.source_id = sc.id "
+                    "    ORDER BY rs.pull_timestamp DESC "
+                    "    LIMIT :series_limit"
+                    "  ) sampled"
+                    ") series ON TRUE "
+                    "ORDER BY sc.name"
+                ),
+                {"series_limit": _SERIES_COUNT_SAMPLE_LIMIT},
+            ).fetchall()
             for row in rows:
                 name = row[0]
                 row_count = row[1] or 0

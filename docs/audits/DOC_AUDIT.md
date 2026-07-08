@@ -309,7 +309,7 @@ def resolve_conflict(series_a, series_b, ref_val, family=None):
 7. **Update [[ATTENTION]].md with verification status**
    - Mark items as "FIXED + TESTED", "FIXED + UNTESTED", or "IN PROGRESS"
    - [[Cross Reference|Cross-reference]] test coverage
-   - Example: Item #8 "PIT Lookahead Safety" — mark as "FIXED + TESTED (test_[[PIT Store|pit.py]])" or "FIXED + UNTESTED"
+   - Example: Item #8 "PIT Lookahead Safety" — mark as "FIXED + TESTED (`test_pit.py`)" or "FIXED + UNTESTED"
    - **Impact:** Prevents false confidence in "fixed" items without test coverage
 
 8. **Create data-source pullers index**
@@ -490,4 +490,3 @@ Config:
 **Key Insight:** GRID has *surface* documentation (quick start, [[architecture]] overview, API listing) but lacks *depth* documentation (module guides, individual router docs, test guides). The codebase has grown significantly (33 routers, 48+ intelligence modules) but documentation has not kept pace. The comprehensive audit reports generated today ([[BUILD_HEALTH]].md, [[CODE_REVIEW]].md, etc.) are not yet integrated into the main documentation narrative.
 
 **Recommendation:** Prioritize Tier 1 items (glossary, [[api-reference]].md update, intelligence README, orchestration README) before expanding documentation depth. These will provide coherent scaffolding for all future module-level documentation.
-
