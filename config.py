@@ -176,6 +176,11 @@ class Settings(BaseSettings):
     HERMES_CODEX_MODEL: str = ""                    # blank -> Codex default (GPT-5.5)
     HERMES_CODEX_TIMEOUT_SECONDS: int = 240
     HERMES_CODEX_EXTRA_ARGS: str = ""               # extra `codex exec` flags (shlex-split)
+    # LLM second-opinion review of active hypotheses (scripts/hermes_llm_hypothesis_review.py).
+    # DORMANT by default — advisory layer on top of the free deterministic 30-min scorer.
+    # Use the API-key lane + HERMES_DAILY_SPEND_CAP_USD for unattended runs.
+    HERMES_HYPO_LLM_ENABLED: bool = False           # gate the LLM hypothesis second-opinion
+    HERMES_HYPO_LLM_LIMIT: int = 10                 # top-N highest-conviction active hypos per run
 
     # Ollama (local lightweight LLM — Qwen 7B)
     OLLAMA_BASE_URL: str = "http://localhost:11434"

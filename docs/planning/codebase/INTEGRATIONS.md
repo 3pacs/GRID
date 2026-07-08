@@ -132,11 +132,11 @@
 ### Domain Modules
 - **[[PIT Store]]:** `grid/store/pit.py` — [[PIT Store|point-in-time]] query engine (critical path)
 - **[[Conflict Resolution]]:** `grid/normalization/resolver.py` — multi-source conflict resolution
-- **[[Entity Map]]ping:** `grid/normalization/entity_map.py` — [[Entity Map|entity disambiguation]] across sources
+- **[[Entity Map|Entity mapping]]:** `grid/normalization/entity_map.py` — [[Entity Map|entity disambiguation]] across sources
 - **[[Feature Engineering]]:** `grid/features/lab.py` — z-score, slopes, ratios
 - **[[Regime Discovery]]:** `grid/discovery/clustering.py` — unsupervised [[Regime Discovery|regime clustering]]
 - **[[Orthogonality Audit|Orthogonality]] Audit:** `grid/discovery/orthogonality.py` — feature independence checks
-- **Validation Gates:** `grid/validation/gates.py` — [[Walk-Forward Backtesting|walk-forward backtesting]] [[Walk-Forward Backtesting|promotion gate]]s
+- **Validation Gates:** `grid/validation/gates.py` — [[Walk-Forward Backtesting|walk-forward backtesting]] [[Walk-Forward Backtesting|promotion gates]]
 - **[[Model Governance]]:** `grid/governance/registry.py` — CANDIDATE -> SHADOW -> STAGING -> PRODUCTION lifecycle
 - **[[Live Inference]]:** `grid/inference/live.py` — model scoring engine
 - **[[Decision Journal]]:** `grid/journal/log.py` — immutable recommendation log with full provenance

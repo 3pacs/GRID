@@ -185,3 +185,26 @@ class TestInstitutionalFlowsLogHygiene:
         source = inspect.getsource(institutional_flows)
 
         assert 'logging.getLogger("yfinance").setLevel(logging.CRITICAL)' in source
+
+
+@pytest.mark.unit
+class TestWorldBankErrorDemotion:
+    def test_upstream_400_logs_warning_not_error(self):
+        from ingestion.international.world_bank_puller import WorldBankPuller
+
+        puller = WorldBankPuller(db_engine=_mock_engine_with_source())
+
+        with patch.object(puller, "_fetch_indicator", side_effect=_http_error(400)), \
+             patch.object(puller, "_record_failure") as mock_record_failure, \
+             patch("ingestion.international.world_bank_puller.time.sleep", return_value=None):
+            records = _capture_levels(
+                lambda: puller.pull_indicator("PH", "FI.RES.TOTL.CD")
+            )
+
+        levels = {lvl for lvl, _ in records}
+        assert "ERROR" not in levels, (
+            "World Bank 400s can be upstream/no-data noise; logging them at "
+            f"ERROR re-introduces Sentry/errors.jsonl noise. Got: {records}"
+        )
+        assert "WARNING" in levels
+        mock_record_failure.assert_called_once()

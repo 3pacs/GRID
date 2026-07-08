@@ -31,6 +31,28 @@ _NON_RETRYABLE_HTTP = frozenset({400, 401, 403, 404, 405, 410, 422, 451})
 # pullers run on a tight cycle; we'd rather skip than block.
 _MAX_RETRY_AFTER_SECONDS = 30.0
 
+_VALID_REVISION_BEHAVIORS = frozenset({"NEVER", "RARE", "FREQUENT", "OVERWRITE"})
+_REVISION_BEHAVIOR_ALIASES = {
+    "RARELY": "RARE",
+    "SMALL": "RARE",
+    "SOMETIMES": "RARE",
+    "REVISED": "FREQUENT",
+}
+
+
+def _normalize_revision_behavior(value: Any) -> str:
+    """Normalize puller SOURCE_CONFIG aliases to source_catalog enum values."""
+    normalized = str(value or "NEVER").strip().upper()
+    normalized = _REVISION_BEHAVIOR_ALIASES.get(normalized, normalized)
+    if normalized in _VALID_REVISION_BEHAVIORS:
+        return normalized
+
+    log.warning(
+        "Unknown revision_behavior {v!r}; using NEVER for source_catalog",
+        v=value,
+    )
+    return "NEVER"
+
 
 def _http_status_from_exc(exc: BaseException) -> int | None:
     """Extract an HTTP status code from any exception we recognise.
@@ -288,7 +310,9 @@ class BasePuller:
                     "cost": self.SOURCE_CONFIG.get("cost_tier", "FREE"),
                     "latency": self.SOURCE_CONFIG.get("latency_class", "EOD"),
                     "pit": self.SOURCE_CONFIG.get("pit_available", False),
-                    "rev": self.SOURCE_CONFIG.get("revision_behavior", "NEVER"),
+                    "rev": _normalize_revision_behavior(
+                        self.SOURCE_CONFIG.get("revision_behavior", "NEVER")
+                    ),
                     "trust": self.SOURCE_CONFIG.get("trust_score", "MED"),
                     "rank": self.SOURCE_CONFIG.get("priority_rank", 50),
                 },

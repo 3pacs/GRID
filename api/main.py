@@ -234,6 +234,7 @@ _EXPENSIVE_PATHS = {
     "/api/v1/intel/ask", "/api/v1/intel/briefing",
     "/api/v1/intelligence/risk-map", "/api/v1/intelligence/globe",
     "/api/v1/intelligence/dashboard",
+    "/api/v1/dad/ticker",
     "/api/v1/ten-year-portfolio/weekly",
 }
 
@@ -413,6 +414,7 @@ for _label, _module_path, _required in [
     ("postmortem_lessons", "api.routers.postmortem_lessons", False),
     ("tps", "api.routers.tps", False),
     ("ten_year_portfolio", "api.routers.ten_year_portfolio", False),
+    ("dad", "api.routers.dad", False),
     ("price_alerts", "api.routers.price_alerts", False),
 ]:
     _router = _load_router(_module_path, label=_label, required=_required)
