@@ -619,61 +619,8 @@ def rolling_hurst(
     return result
 
 
-# ===================================================================
-# Information-theoretic measures
-# ===================================================================
-
-
-def transfer_entropy(
-    source: pd.Series,
-    target: pd.Series,
-    lag: int = 1,
-    bins: int = 10,
-) -> float:
-    """Estimate transfer entropy from source to target.
-
-    TE(X→Y) measures the reduction in uncertainty of Y's future
-    given the past of both X and Y, compared to the past of Y alone.
-
-    Positive TE → X provides predictive information about Y.
-
-    Parameters:
-        source: Potential causal series.
-        target: Target series.
-        lag: Time lag.
-        bins: Discretization bins.
-
-    Returns:
-        float: Transfer entropy in bits.
-    """
-    x = source.dropna().values
-    y = target.dropna().values
-    n = min(len(x), len(y)) - lag
-
-    if n < 50:
-        return np.nan
-
-    x = x[:n]
-    y_past = y[:n]
-    y_future = y[lag : n + lag]
-
-    # Discretize
-    x_d = np.digitize(x, np.linspace(x.min(), x.max(), bins + 1)[1:-1])
-    yp_d = np.digitize(y_past, np.linspace(y_past.min(), y_past.max(), bins + 1)[1:-1])
-    yf_d = np.digitize(y_future, np.linspace(y_future.min(), y_future.max(), bins + 1)[1:-1])
-
-    # Joint and marginal probabilities
-    def _entropy(*arrays):
-        combined = np.column_stack(arrays)
-        _, counts = np.unique(combined, axis=0, return_counts=True)
-        p = counts / counts.sum()
-        return -np.sum(p * np.log2(np.clip(p, 1e-10, 1.0)))
-
-    # TE = H(Y_future, Y_past) + H(Y_past, X) - H(Y_past) - H(Y_future, Y_past, X)
-    h_yf_yp = _entropy(yf_d, yp_d)
-    h_yp_x = _entropy(yp_d, x_d)
-    h_yp = _entropy(yp_d)
-    h_yf_yp_x = _entropy(yf_d, yp_d, x_d)
-
-    te = h_yf_yp + h_yp_x - h_yp - h_yf_yp_x
-    return float(max(0.0, te))  # TE is non-negative in theory
+# Information-theoretic measures (transfer_entropy, mutual_information, etc.)
+# live in `analysis/transfer_entropy.py` — the canonical implementation that
+# `analysis/lead_lag_backtest.py` and tests/test_transfer_entropy.py consume.
+# A duplicate body previously lived here; it had zero callers and was removed
+# to eliminate drift. Import from `analysis.transfer_entropy` instead.

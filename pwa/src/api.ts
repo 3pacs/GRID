@@ -8,6 +8,9 @@
 import { clearAuthSession, getStoredToken } from './authSession.js';
 import useRealtimeStore from './stores/realtimeStore.js';
 
+const DEFAULT_GET_CACHE_TTL_MS = 60_000;
+const PRELOAD_CONCURRENCY = 4;
+
 // ── Error class ───────────────────────────────────────────────
 
 export class GRIDApiError extends Error {
@@ -25,6 +28,9 @@ export class GRIDApiError extends Error {
 
 interface FetchOptions extends Omit<RequestInit, 'headers'> {
     headers?: Record<string, string>;
+    gridTtlMs?: number;
+    gridForce?: boolean;
+    gridPreload?: boolean;
 }
 
 // ── API client class ──────────────────────────────────────────
@@ -37,6 +43,8 @@ class GRIDApi {
     private _wsReconnectTimer: ReturnType<typeof setTimeout> | null;
     private _wsGeneration: number;
     private _wsShouldReconnect: boolean;
+    private _cache: Map<string, { value: unknown; expiresAt: number }>;
+    private _inflight: Map<string, Promise<unknown>>;
 
     constructor() {
         this.baseUrl =
@@ -48,6 +56,8 @@ class GRIDApi {
         this._wsReconnectTimer = null;
         this._wsGeneration = 0;
         this._wsShouldReconnect = false;
+        this._cache = new Map();
+        this._inflight = new Map();
     }
 
     get token(): string | null {
@@ -55,6 +65,7 @@ class GRIDApi {
     }
 
     set token(val: string | null) {
+        this.clearCache();
         if (val) {
             localStorage.setItem('grid_token', val);
         } else {
@@ -74,40 +85,167 @@ class GRIDApi {
         return this._fetch<T>(path, { method: 'POST', body: JSON.stringify(body) });
     }
 
+    private _cacheKey(path: string): string {
+        return path;
+    }
+
+    private _isCacheableGet(path: string): boolean {
+        if (typeof path !== 'string') return false;
+        if (!path.startsWith('/api/v1/')) return false;
+        if (
+            path.startsWith('/api/v1/auth/')
+            || path.startsWith('/api/v1/realtime/')
+            || path.startsWith('/api/v1/chat/')
+            || path.startsWith('/api/v1/alerts')
+            || path.startsWith('/api/v1/system/logs')
+            || path.includes('/stream')
+            || path.includes('live=true')
+            || path.includes('refresh=true')
+            || path.includes('refresh=1')
+            || path.includes('refresh_finviz=true')
+        ) {
+            return false;
+        }
+        return true;
+    }
+
+    clearCache({ prefix = null }: { prefix?: string | null } = {}): void {
+        if (!prefix) {
+            this._cache.clear();
+            this._inflight.clear();
+            return;
+        }
+        for (const key of this._cache.keys()) {
+            if (key.startsWith(prefix)) this._cache.delete(key);
+        }
+        for (const key of this._inflight.keys()) {
+            if (key.startsWith(prefix)) this._inflight.delete(key);
+        }
+    }
+
+    invalidate(prefix: string | null = null): void {
+        this.clearCache({ prefix });
+    }
+
+    async preload(
+        paths: string[] = [],
+        {
+            ttlMs = DEFAULT_GET_CACHE_TTL_MS,
+            concurrency = PRELOAD_CONCURRENCY,
+            force = false,
+            onProgress = null,
+        }: {
+            ttlMs?: number;
+            concurrency?: number;
+            force?: boolean;
+            onProgress?: ((progress: { completed: number; total: number; path: string }) => void) | null;
+        } = {},
+    ): Promise<{ completed: number; total: number }> {
+        const queue = [...new Set(paths.filter(Boolean))];
+        let completed = 0;
+        let index = 0;
+
+        const worker = async () => {
+            while (index < queue.length) {
+                const path = queue[index];
+                index += 1;
+                await this._fetch(path, {
+                    gridTtlMs: ttlMs,
+                    gridForce: force,
+                    gridPreload: true,
+                }).catch(() => null);
+                completed += 1;
+                onProgress?.({ completed, total: queue.length, path });
+            }
+        };
+
+        const workers = Array.from(
+            { length: Math.min(concurrency, queue.length) },
+            () => worker(),
+        );
+        await Promise.all(workers);
+        return { completed, total: queue.length };
+    }
+
     async _fetch<T = unknown>(path: string, options: FetchOptions = {}): Promise<T> {
-        const headers: Record<string, string> = { 'Content-Type': 'application/json', ...options.headers };
+        const {
+            gridTtlMs = DEFAULT_GET_CACHE_TTL_MS,
+            gridForce = false,
+            gridPreload = false,
+            ...fetchOptions
+        } = options;
+        const method = String(fetchOptions.method || 'GET').toUpperCase();
+        const cacheable = method === 'GET' && this._isCacheableGet(path);
+        const cacheKey = this._cacheKey(path);
+        const now = Date.now();
+
+        if (cacheable && !gridForce) {
+            const cached = this._cache.get(cacheKey);
+            if (cached && cached.expiresAt > now) {
+                return cached.value as T;
+            }
+            const inflight = this._inflight.get(cacheKey);
+            if (inflight) {
+                return inflight as Promise<T>;
+            }
+        }
+
+        const headers: Record<string, string> = { 'Content-Type': 'application/json', ...fetchOptions.headers };
         if (this.token) {
             headers['Authorization'] = `Bearer ${this.token}`;
         }
 
-        const response = await fetch(`${this.baseUrl}${path}`, {
-            ...options,
-            headers,
-        });
+        const request = (async () => {
+            const response = await fetch(`${this.baseUrl}${path}`, {
+                ...fetchOptions,
+                headers,
+            });
 
-        if (!response.ok) {
-            const body = await response.text().catch(() => '');
-            let message = response.statusText;
-            try {
-                const parsed = JSON.parse(body);
-                message = parsed.detail || parsed.message || message;
-            } catch (_) {
-                if (body) message = body;
-            }
-
-            // Only treat 401 as session expiry for non-auth endpoints
-            if (response.status === 401 && !path.startsWith('/api/v1/auth/login') && !path.startsWith('/api/v1/auth/register')) {
-                this.token = null;
-                if (typeof window.dispatchEvent === 'function') {
-                    window.dispatchEvent(new Event('grid:auth-expired'));
+            if (!response.ok) {
+                const body = await response.text().catch(() => '');
+                let message = response.statusText;
+                try {
+                    const parsed = JSON.parse(body);
+                    message = parsed.detail || parsed.message || message;
+                } catch (_) {
+                    if (body) message = body;
                 }
-                window.location.hash = '#/login';
+
+                // Only treat 401 as session expiry for non-auth endpoints
+                if (response.status === 401 && !path.startsWith('/api/v1/auth/login') && !path.startsWith('/api/v1/auth/register')) {
+                    this.token = null;
+                    if (typeof window.dispatchEvent === 'function') {
+                        window.dispatchEvent(new Event('grid:auth-expired'));
+                    }
+                    window.location.hash = '#/login';
+                }
+
+                throw new GRIDApiError(response.status, message);
             }
 
-            throw new GRIDApiError(response.status, message);
+            const data = await response.json();
+            if (method !== 'GET') {
+                this.clearCache();
+            } else if (cacheable && !(data as { error?: boolean })?.error) {
+                this._cache.set(cacheKey, {
+                    value: data,
+                    expiresAt: Date.now() + gridTtlMs,
+                });
+            }
+            return data as T;
+        })();
+
+        if (cacheable && !gridForce && !gridPreload) {
+            this._inflight.set(cacheKey, request);
         }
 
-        return await response.json();
+        try {
+            return await request;
+        } finally {
+            if (cacheable) {
+                this._inflight.delete(cacheKey);
+            }
+        }
     }
 
     // ── Auth ──────────────────────────────────────────────────
@@ -327,6 +465,86 @@ class GRIDApi {
     async getTickerAnalysis(ticker: string, period: string = '3M') {
         const qs = period && period !== '3M' ? `?period=${encodeURIComponent(period)}` : '';
         return this._fetch(`/api/v1/watchlist/${encodeURIComponent(ticker)}/analysis${qs}`);
+    }
+    async getDadTickerGold(ticker: string, { refreshFinviz = false }: { refreshFinviz?: boolean } = {}) {
+        const qs = refreshFinviz ? '?refresh_finviz=true' : '';
+        return this._fetch(`/api/v1/dad/ticker/${encodeURIComponent(ticker)}/gold${qs}`, {
+            gridForce: refreshFinviz,
+        });
+    }
+    async getDadTickerEvidence(ticker: string, { limit = 50, offset = 0 }: { limit?: number; offset?: number } = {}) {
+        const params = new URLSearchParams({
+            limit: String(limit),
+            offset: String(offset),
+        });
+        return this._fetch(`/api/v1/dad/ticker/${encodeURIComponent(ticker)}/evidence?${params.toString()}`);
+    }
+    async getDadTickerChart(ticker: string, { range = '1Y', points = 220 }: { range?: string; points?: number } = {}) {
+        const params = new URLSearchParams({
+            range,
+            points: String(points),
+        });
+        return this._fetch(`/api/v1/dad/ticker/${encodeURIComponent(ticker)}/chart?${params.toString()}`);
+    }
+    async getDadTickerFinviz(ticker: string, { refreshFinviz = false }: { refreshFinviz?: boolean } = {}) {
+        const qs = refreshFinviz ? '?refresh_finviz=true' : '';
+        return this._fetch(`/api/v1/dad/ticker/${encodeURIComponent(ticker)}/finviz${qs}`, {
+            gridForce: refreshFinviz,
+        });
+    }
+    async getDadTickerOptions(ticker: string, { days = 90, limit = 90 }: { days?: number; limit?: number } = {}) {
+        const params = new URLSearchParams({
+            days: String(days),
+            limit: String(limit),
+        });
+        return this._fetch(`/api/v1/dad/ticker/${encodeURIComponent(ticker)}/options?${params.toString()}`);
+    }
+    streamDadTickerGold(
+        ticker: string,
+        {
+            refreshFinviz = false,
+            onEvent = null,
+            onError = null,
+            onDone = null,
+        }: {
+            refreshFinviz?: boolean;
+            onEvent?: ((eventName: string, payload: unknown) => void) | null;
+            onError?: ((event: Event) => void) | null;
+            onDone?: ((payload: unknown) => void) | null;
+        } = {},
+    ): EventSource {
+        const params = new URLSearchParams();
+        if (refreshFinviz) params.set('refresh_finviz', 'true');
+        if (this.token) params.set('token', this.token);
+        const suffix = params.toString() ? `?${params.toString()}` : '';
+        const source = new EventSource(`${this.baseUrl}/api/v1/dad/ticker/${encodeURIComponent(ticker)}/gold/stream${suffix}`);
+        const eventNames = ['start', 'compact', 'evidence', 'chart', 'finviz', 'options', 'done'];
+        const handleNamedEvent = (name: string, event: MessageEvent) => {
+            let payload: unknown = {};
+            try {
+                payload = event?.data ? JSON.parse(event.data) : {};
+            } catch (_) {
+                payload = { raw: event?.data || '' };
+            }
+            onEvent?.(name, payload);
+            if (name === 'done') {
+                onDone?.(payload);
+                source.close();
+            }
+        };
+
+        eventNames.forEach(name => {
+            source.addEventListener(name, event => handleNamedEvent(name, event as MessageEvent));
+        });
+        source.addEventListener('error', event => {
+            const maybeMessage = event as MessageEvent;
+            if (maybeMessage.data) {
+                handleNamedEvent('error', maybeMessage);
+            } else {
+                onError?.(event);
+            }
+        });
+        return source;
     }
     async getWatchlistEnriched(limit: number = 20) {
         return this._fetch(`/api/v1/watchlist/enriched?limit=${limit}`);

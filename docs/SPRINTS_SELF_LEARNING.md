@@ -108,7 +108,7 @@ shared `scripts/audit_self_learning.py` is read-only for this sprint.
 
 **Goal:** Put the `LLMHarness` between live code and 3 LLM call sites.
 These 3 are chosen because they already have scorable outcomes: oracle
-arena has [[Oracle Calibration|brier score]]s, news_impact has forward returns,
+arena has [[Oracle Calibration|brier scores]], news_impact has forward returns,
 earnings_transcript_analyzer has EPS surprise numbers.
 
 | Agent | Owns | Call site |

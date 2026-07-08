@@ -12,6 +12,7 @@ alembic>=1.13.0
 aiohttp>=3.13.5
 pandas>=2.1.0
 numpy>=1.26.0
+duckdb>=1.5.0
 fedfred>=1.2.9
 yfinance>=0.2.36
 requests>=2.31.0
@@ -26,7 +27,7 @@ openpyxl>=3.1.0
 # Analysis
 scikit-learn>=1.4.0
 scipy>=1.12.0
-statsmodels>=0.14.0
+statsmodels>=0.14.6
 tsfresh>=0.20.0
 
 # Graph analytics
@@ -35,7 +36,7 @@ python-louvain>=0.16
 
 # Visualization (for orthogonality audit outputs)
 matplotlib>=3.8.0
-seaborn>=0.13.0
+seaborn>=0.13.2
 
 # Utilities
 python-dotenv>=1.0.0
@@ -89,7 +90,7 @@ xgboost>=3.2.0
 
 # API
 fastapi>=0.109.0,<0.137.0
-uvicorn>=0.46.0
+uvicorn>=0.49.0
 python-multipart>=0.0.6
 python-jose[cryptography]>=3.3.0
 passlib[bcrypt]>=1.7.4
@@ -100,12 +101,12 @@ httpx>=0.26.0
 kafka-python-ng>=2.2.0
 
 # Object storage
-minio>=7.2.0
+minio>=7.2.20
 
 # Workflow orchestration
 prefect>=3.7.0
 
 # Testing
-pytest>=9.0.3
+pytest>=9.1.0
 pytest-timeout>=2.4.0
 pytrends>=4.9.0
