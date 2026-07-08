@@ -5,7 +5,7 @@ paths:
 ---
 # Python Security
 
-> This file extends [common/security.md](../common/security.md) with Python specific content.
+> Python-specific layer. General security checklist lives in the `security-review` skill.
 
 ## Secret Management
 

@@ -103,11 +103,14 @@ class Dispatcher:
             )
             return
 
-        for handler_path in ROUTES.get(contract_cls, []):
-            self._submit(contract, handler_path)
+        handler_paths = ROUTES.get(contract_cls, [])
+        if handler_paths:
+            self._submit_route(contract, handler_paths)
 
-    def _submit(self, contract: BaseContract, handler_path: str) -> None:
-        fut = self._pool.submit(self._invoke, contract, handler_path)
+    def _submit_route(
+        self, contract: BaseContract, handler_paths: list[str]
+    ) -> None:
+        fut = self._pool.submit(self._invoke_route, contract, handler_paths)
         with self._pending_lock:
             self._pending.add(fut)
         fut.add_done_callback(self._drop_pending)
@@ -115,6 +118,12 @@ class Dispatcher:
     def _drop_pending(self, fut) -> None:
         with self._pending_lock:
             self._pending.discard(fut)
+
+    def _invoke_route(
+        self, contract: BaseContract, handler_paths: list[str]
+    ) -> None:
+        for handler_path in handler_paths:
+            self._invoke(contract, handler_path)
 
     def _invoke(self, contract: BaseContract, handler_path: str) -> None:
         started = time.time()

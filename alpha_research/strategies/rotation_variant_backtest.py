@@ -39,6 +39,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
@@ -151,7 +152,11 @@ def backtest_rotation_variant(
             try:
                 result = ar.run_rotation(engine, as_of_date=asof, positions={})
             except Exception as exc:
-                # Skip this rebalance, log to outcome
+                log.warning(
+                    "rotation_variant_backtest: run_rotation failed asof={asof}: {err}",
+                    asof=asof,
+                    err=str(exc),
+                )
                 continue
             new_weights = dict(result.weights)
 

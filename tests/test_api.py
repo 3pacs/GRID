@@ -26,7 +26,9 @@ _TEST_HASH = _pwd_ctx.hash(_TEST_PASSWORD)
 os.environ["GRID_MASTER_PASSWORD_HASH"] = _TEST_HASH
 
 from api.auth import create_token
+from api.dependencies import get_db_engine
 from api.main import _recent_ws_events, _recent_ws_events_lock, app
+from api.routers import ten_year_portfolio as ten_year_router
 
 client = TestClient(app)
 
@@ -60,6 +62,44 @@ class TestProtectedRouteRequiresAuth:
     def test_protected_route_requires_auth(self):
         """GET /api/v1/system/status without token returns 401."""
         response = client.get("/api/v1/system/status")
+        assert response.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# 2b. Dad-facing ten-year chart data stays public
+# ---------------------------------------------------------------------------
+
+
+class TestTenYearPortfolioPublicRead:
+    def test_weekly_without_token_returns_payload(self, monkeypatch):
+        """The Dad 10-year chart endpoint must not bounce to login."""
+        monkeypatch.setattr(
+            ten_year_router,
+            "_load_price_history",
+            lambda _engine, *, years: {},
+        )
+        app.dependency_overrides[get_db_engine] = lambda: object()
+        try:
+            response = client.get(
+                "/api/v1/ten-year-portfolio/weekly?capital=1000000&years=10"
+            )
+        finally:
+            app.dependency_overrides.pop(get_db_engine, None)
+
+        assert response.status_code == 200
+        assert response.json()["status"] in {"ok", "empty"}
+
+    def test_profiles_without_token_returns_payload(self):
+        """Profile labels/descriptions are public UI metadata."""
+        response = client.get("/api/v1/ten-year-portfolio/profiles")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+
+    def test_export_without_token_still_requires_auth(self):
+        """Workbook exports stay protected even though weekly reads are public."""
+        response = client.get("/api/v1/ten-year-portfolio/export.xlsx")
+
         assert response.status_code == 401
 
 
@@ -132,7 +172,8 @@ class TestProtectedRouteWithToken:
 
     def test_actor_network_route_is_not_double_prefixed(self):
         """Actor-network should exist only on the canonical intelligence path."""
-        paths = {route.path for route in app.routes if hasattr(route, "path")}
+        paths = [route.path for route in app.routes if hasattr(route, "path")]
+        assert paths.count("/api/v1/intelligence/actor-network") == 1
         assert "/api/v1/intelligence/actor-network" in paths
         assert "/api/v1/intelligence/edges" in paths
         assert "/api/v1/intelligence/api/v1/intelligence/actor-network" not in paths

@@ -18,20 +18,20 @@ if TYPE_CHECKING:
 
 def on_pull_lifecycle(evt: "PullLifecycle", *, engine: "Engine") -> None:
     """Observe puller lifecycle events without blocking the puller path."""
-    status = str(getattr(evt, "status", "") or "").upper()
+    state = str(getattr(evt, "state", "") or "").upper()
     puller = getattr(evt, "puller_name", "unknown")
-    rows = getattr(evt, "rows", None)
-    if status == "FAILED":
+    row_count = getattr(evt, "row_count", None)
+    if state == "FAILED":
         log.warning(
-            "pull_lifecycle: {puller} failed rows={rows} error={error}",
+            "pull_lifecycle: {puller} failed row_count={row_count} error={error}",
             puller=puller,
-            rows=rows,
+            row_count=row_count,
             error=getattr(evt, "error", None),
         )
     else:
         log.debug(
-            "pull_lifecycle: {puller} status={status} rows={rows}",
+            "pull_lifecycle: {puller} state={state} row_count={row_count}",
             puller=puller,
-            status=status,
-            rows=rows,
+            state=state,
+            row_count=row_count,
         )

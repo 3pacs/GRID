@@ -72,6 +72,13 @@ class HermesConfig:
     price_input_per_mtok: float
     price_output_per_mtok: float
     fallback_tier: str
+    # Backend selection: "openai" (API key, per-token) or "codex" (the Codex
+    # CLI, ChatGPT-subscription auth — the only path to GPT-5.5).
+    backend: str = "openai"
+    codex_bin: str = "codex"
+    codex_model: str = ""          # blank -> Codex CLI default (GPT-5.5)
+    codex_timeout_seconds: int = 240
+    codex_extra_args: str = ""     # extra `codex exec` flags (shlex-split)
     extra_params: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -85,6 +92,14 @@ def load_hermes_config() -> HermesConfig:
     # The Hermes key falls back to the shared OPENAI key so operators only set
     # it once unless they want a dedicated billing key for the analyst bridge.
     api_key = _get("HERMES_API_KEY", "") or _get("OPENAI_API_KEY", "")
+
+    backend = str(_get("HERMES_BACKEND", "openai")).strip().lower() or "openai"
+    # Local-first gate: the "openai" backend is per-token paid and builds its OWN OpenAI
+    # client, bypassing llm/router's paid gate. Refuse it unless explicitly opted in via
+    # GRID_ALLOW_PAID_LLM, so a stray HERMES_API_KEY/OPENAI_API_KEY can't silently bill.
+    # Zeroing the key makes `configured` False -> HermesAgent falls back to local.
+    if backend == "openai" and not bool(_get("GRID_ALLOW_PAID_LLM", False)):
+        api_key = ""
 
     temp_raw = _get("HERMES_TEMPERATURE", "")
     try:
@@ -108,4 +123,9 @@ def load_hermes_config() -> HermesConfig:
         price_input_per_mtok=float(_get("HERMES_PRICE_INPUT_PER_MTOK", _DEFAULT_PRICE_INPUT_PER_MTOK)),
         price_output_per_mtok=float(_get("HERMES_PRICE_OUTPUT_PER_MTOK", _DEFAULT_PRICE_OUTPUT_PER_MTOK)),
         fallback_tier=str(_get("HERMES_FALLBACK_TIER", "reason")),
+        backend=backend,
+        codex_bin=str(_get("HERMES_CODEX_BIN", "codex")) or "codex",
+        codex_model=str(_get("HERMES_CODEX_MODEL", "")),
+        codex_timeout_seconds=int(_get("HERMES_CODEX_TIMEOUT_SECONDS", 240)),
+        codex_extra_args=str(_get("HERMES_CODEX_EXTRA_ARGS", "")),
     )

@@ -10,6 +10,7 @@ Usage:
     python scripts/obsidian_backlinks.py              # Dry run (shows changes)
     python scripts/obsidian_backlinks.py --apply       # Apply changes
     python scripts/obsidian_backlinks.py --report      # Show link report only
+    python scripts/obsidian_backlinks.py --check       # Fail on malformed links
 """
 
 import re
@@ -279,44 +280,51 @@ CONCEPT_LINKS = {
 
 
 def is_inside_link(text: str, match_start: int, match_end: int) -> bool:
-    """Check if a match position is already inside a [[wikilink]], URL, or code block."""
-    # Inside [[...]]
-    before = text[:match_start]
-    text[match_end:]
+    """Check if a match overlaps an existing link, URL, or inline code span."""
+    return _overlaps_protected_span(text, match_start, match_end)
 
-    # Check if inside [[...]]
-    last_open = before.rfind("[[")
-    last_close = before.rfind("]]")
-    if last_open > last_close:
-        return True
 
-    # Check if inside backtick code span
-    backtick_count = before.count("`")
-    if backtick_count % 2 == 1:
-        return True
+def _inline_code_spans(text: str) -> list[tuple[int, int]]:
+    """Return inline backtick code spans for a single markdown line."""
+    spans: list[tuple[int, int]] = []
+    i = 0
+    while i < len(text):
+        start = text.find("`", i)
+        if start == -1:
+            break
 
-    # Check if inside markdown link [text](url) or ![img](url)
-    # Look for unmatched [ before us
-    bracket_depth = 0
-    for i in range(match_start - 1, max(match_start - 200, -1), -1):
-        if text[i] == "]":
-            bracket_depth += 1
-        elif text[i] == "[":
-            if bracket_depth > 0:
-                bracket_depth -= 1
-            else:
-                # We're inside a [link text] — check if followed by (
-                return True
+        ticks = 1
+        while start + ticks < len(text) and text[start + ticks] == "`":
+            ticks += 1
 
-    # Check if inside a URL (http:// or https://)
-    url_region = before[-200:] if len(before) > 200 else before
-    last_http = max(url_region.rfind("http://"), url_region.rfind("https://"))
-    if last_http >= 0:
-        # Check if URL hasn't ended (no space/newline since http)
-        url_tail = url_region[last_http:]
-        if " " not in url_tail and "\n" not in url_tail:
+        marker = "`" * ticks
+        end = text.find(marker, start + ticks)
+        if end == -1:
+            spans.append((start, len(text)))
+            break
+
+        spans.append((start, end + ticks))
+        i = end + ticks
+    return spans
+
+
+def _protected_spans(text: str) -> list[tuple[int, int]]:
+    """Ranges that backlink insertion must never touch."""
+    spans: list[tuple[int, int]] = []
+    spans.extend((m.start(), m.end()) for m in re.finditer(r"\[\[[^\n]*?\]\]", text))
+    spans.extend(
+        (m.start(), m.end())
+        for m in re.finditer(r"!?\[[^\]\n]*\]\([^\)\n]*\)", text)
+    )
+    spans.extend((m.start(), m.end()) for m in re.finditer(r"https?://[^\s)]+", text))
+    spans.extend(_inline_code_spans(text))
+    return sorted(spans)
+
+
+def _overlaps_protected_span(text: str, start: int, end: int) -> bool:
+    for span_start, span_end in _protected_spans(text):
+        if start < span_end and end > span_start:
             return True
-
     return False
 
 
@@ -346,14 +354,18 @@ def _compile_entity_patterns(
 ) -> list[tuple[re.Pattern, str, str]]:
     """Pre-compile regex patterns for all entities. Sorted longest-first."""
     compiled = []
+    left_edge_chars = r"A-Za-z0-9_./-"
+    right_edge_chars = r"A-Za-z0-9_/-"
     for plain_text, target in sorted(all_entities.items(), key=lambda x: -len(x[0])):
         if len(plain_text) < 3:
             continue
         escaped = re.escape(plain_text)
-        if " " in plain_text or "/" in plain_text or "." in plain_text:
-            pattern = escaped
-        else:
-            pattern = r"\b" + escaped + r"\b"
+        pattern = (
+            rf"(?<![{left_edge_chars}])"
+            rf"{escaped}"
+            rf"(?![{right_edge_chars}])"
+            rf"(?!\.[A-Za-z0-9_])"
+        )
         flags = 0
         if plain_text.isupper() and len(plain_text) <= 5:
             flags = 0
@@ -361,6 +373,77 @@ def _compile_entity_patterns(
             flags = re.IGNORECASE
         compiled.append((re.compile(pattern, flags), plain_text, target))
     return compiled
+
+
+def _existing_wikilink_targets(content: str) -> set[str]:
+    """Return page targets already linked in the file.
+
+    One link to a page is enough for Obsidian's graph/backlink layer. Counting
+    existing links prevents later runs from adding duplicate links to the same
+    target and eliminates the nested-link failure mode.
+    """
+    targets: set[str] = set()
+    for match in re.finditer(r"\[\[([^\]\n]+)\]\]", content):
+        target = match.group(1).split("|", 1)[0].split("#", 1)[0].strip()
+        if target:
+            targets.add(target.lower())
+    return targets
+
+
+def _first_linkable_match(rx: re.Pattern, line: str) -> re.Match | None:
+    """Find the first regex match that does not overlap protected markdown."""
+    for match in rx.finditer(line):
+        if not is_inside_link(line, match.start(), match.end()):
+            return match
+    return None
+
+
+def _line_masks(lines: list[str]) -> tuple[list[bool], list[bool]]:
+    """Return (in_code_block, in_frontmatter) masks for markdown lines."""
+    in_code_block = [False] * len(lines)
+    fence_open = False
+    for i, ln in enumerate(lines):
+        is_fence = ln.strip().startswith("```")
+        in_code_block[i] = fence_open or is_fence
+        if is_fence:
+            fence_open = not fence_open
+
+    in_frontmatter = [False] * len(lines)
+    if lines and lines[0].strip() == "---":
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                for j in range(0, i + 1):
+                    in_frontmatter[j] = True
+                break
+
+    return in_code_block, in_frontmatter
+
+
+def find_malformed_wikilinks(content: str) -> list[tuple[int, str, str]]:
+    """Find wikilinks that are malformed for Obsidian graph use."""
+    lines = content.split("\n")
+    in_code_block, in_frontmatter = _line_masks(lines)
+    findings: list[tuple[int, str, str]] = []
+
+    for idx, line in enumerate(lines):
+        if in_code_block[idx] or in_frontmatter[idx]:
+            continue
+
+        if re.search(r"\[\[[^\]\n]*\[\[", line):
+            findings.append((idx + 1, "nested wikilink", line))
+            continue
+
+        if re.search(r"\[\[[^\]\n]+\]\][A-Za-z0-9_]", line):
+            findings.append((idx + 1, "wikilink has attached suffix", line))
+            continue
+
+        if re.search(r"[A-Za-z0-9_]\[\[[^\]\n]+\]\]", line):
+            findings.append((idx + 1, "wikilink has attached prefix", line))
+
+    if re.search(r"\[\[[^\]]*\n[^\]]*\]\]", content):
+        findings.append((0, "wikilink spans multiple lines", "<whole file>"))
+
+    return findings
 
 
 # Module-level cache so patterns compile once across calls
@@ -381,33 +464,18 @@ def add_wikilinks(content: str, file_path: Path, all_entities: dict[str, str]) -
     changes = []
     lines = content.split("\n")
     new_lines = []
-    linked_targets = set()
+    linked_targets = _existing_wikilink_targets(content)
     file_stem = file_path.stem
     file_stem_lower = file_stem.lower().replace(" ", "-")
 
-    # Pre-compute code block membership once (O(n) instead of O(n²))
-    in_code_block = [False] * len(lines)
-    fence_open = False
-    for i, ln in enumerate(lines):
-        if ln.strip().startswith("```"):
-            fence_open = not fence_open
-        in_code_block[i] = fence_open
-
-    # Pre-compute YAML frontmatter membership. The frontmatter is the
+    # Pre-compute markdown masks. The frontmatter is the
     # block bracketed by `---` markers at the very top of the file. The
     # backlinker used to wrap path values inside `source:` and other
     # frontmatter keys, breaking them as filesystem references — e.g.
     # `source: /path/Architecture/x.md` became
     # `source: /path/[[architecture|Architecture]]/x.md`. Frontmatter is
     # structured data, not prose, so skip it wholesale.
-    in_frontmatter = [False] * len(lines)
-    if lines and lines[0].strip() == "---":
-        for i in range(1, len(lines)):
-            if lines[i].strip() == "---":
-                # Mark the opening, body, and closing all as frontmatter
-                for j in range(0, i + 1):
-                    in_frontmatter[j] = True
-                break
+    in_code_block, in_frontmatter = _line_masks(lines)
 
     # Prefilter: only check entities that actually appear in this file
     content_lower = content.lower()
@@ -445,14 +513,12 @@ def add_wikilinks(content: str, file_path: Path, all_entities: dict[str, str]) -
 
         modified_line = line
         for rx, plain_text, target in active_patterns:
-            if target in linked_targets:
+            target_key = target.lower()
+            if target_key in linked_targets:
                 continue
 
-            m = rx.search(modified_line)
+            m = _first_linkable_match(rx, modified_line)
             if not m:
-                continue
-
-            if is_inside_link(modified_line, m.start(), m.end()):
                 continue
 
             matched_text = m.group()
@@ -462,7 +528,7 @@ def add_wikilinks(content: str, file_path: Path, all_entities: dict[str, str]) -
                 replacement = f"[[{target}|{matched_text}]]"
 
             modified_line = modified_line[:m.start()] + replacement + modified_line[m.end():]
-            linked_targets.add(target)
+            linked_targets.add(target_key)
             changes.append(f"  L{line_idx + 1}: '{matched_text}' → [[{target}]]")
 
         new_lines.append(modified_line)
@@ -519,11 +585,30 @@ def generate_report(all_changes: dict[str, list[str]], files: list[Path]):
 def main():
     apply = "--apply" in sys.argv
     report_only = "--report" in sys.argv
+    check_only = "--check" in sys.argv
 
     print("Scanning GRID docs for backlink opportunities...\n")
 
     files = collect_markdown_files()
     print(f"Found {len(files)} markdown files to process")
+
+    if check_only:
+        malformed: list[tuple[Path, int, str, str]] = []
+        for f in files:
+            content = f.read_text(encoding="utf-8", errors="replace")
+            for line_no, reason, line in find_malformed_wikilinks(content):
+                malformed.append((f, line_no, reason, line))
+
+        if malformed:
+            print("\nMalformed wikilinks:")
+            for f, line_no, reason, line in malformed:
+                rel = f.relative_to(GRID_ROOT)
+                location = f"{rel}:{line_no}" if line_no else str(rel)
+                print(f"  {location}: {reason}: {line.strip()}")
+            raise SystemExit(1)
+
+        print("No malformed wikilinks found.")
+        return
 
     # Build entity registry
     doc_registry = build_doc_registry(files)

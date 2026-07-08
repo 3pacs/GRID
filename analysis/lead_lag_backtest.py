@@ -15,15 +15,16 @@ entropy-discovered pairs from ``analysis/transfer_entropy.py`` (CAT-111).
 
 Usage
 -----
-    from analysis.lead_lag_backtest import LeadLagBacktest
-    bt = LeadLagBacktest(
+    from analysis.lead_lag_backtest import run_walk_forward
+    result = run_walk_forward(
+        leader_name="X",
         leader_series=[...],
+        follower_name="Y",
         follower_series=[...],
         lag_days=3,
         train_window=252,
         test_window=63,
-    )
-    result = bt.run()   # → WalkForwardResult
+    )   # → WalkForwardResult
 
 ``WalkForwardResult`` carries the per-fold hit rates, realized
 half-life, and an aggregate Sharpe for the leader → follower signal.

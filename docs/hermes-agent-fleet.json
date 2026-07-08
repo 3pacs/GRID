@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "agents": [
+    {
+      "id": "fleet-audit",
+      "description": "Read-only host/GPU/service audit lane for GRID and Storymill worker machines.",
+      "max_age_days": 14,
+      "watch": [
+        ".claude/agents/fleet-audit.md",
+        "scripts/fleet_audit.py",
+        "scripts/fleet/run_audit.sh",
+        "tests/test_fleet_audit.py"
+      ]
+    },
+    {
+      "id": "loop-operator",
+      "description": "Autonomous loop monitor that watches agent progress, stalls, quality gates, and retry storms.",
+      "max_age_days": 21,
+      "watch": [
+        ".claude/agents/loop-operator.md",
+        "scripts/hermes_operator.py",
+        "scripts/audit_wiring.py",
+        "tests/test_hermes_operator_dry_run.py"
+      ]
+    },
+    {
+      "id": "hermes-imessage-bridge",
+      "description": "Owner-only iMessage command ingress for Hermes with approval-gated risky commands.",
+      "max_age_days": 21,
+      "watch": [
+        "scripts/hermes_imessage_bridge.py",
+        "tests/test_hermes_imessage_bridge.py",
+        "docs/hermes-imessage-bridge.md"
+      ]
+    },
+    {
+      "id": "hermes-finetune-dataset",
+      "description": "Privacy-scrubbed SFT dataset builder for Hermes operator behavior.",
+      "max_age_days": 21,
+      "watch": [
+        "scripts/hermes_finetune_dataset.py",
+        "gemma/training/config.py",
+        "gemma/training/datasets.py",
+        "gemma/training/train.py",
+        "tests/test_hermes_finetune_dataset.py",
+        "tests/test_hermes_operator_training_task.py",
+        "docs/hermes-finetune-and-agent-fleet.md"
+      ]
+    },
+    {
+      "id": "agent-fleet-audit",
+      "description": "Registry-driven audit that keeps Hermes agent prompts, runbooks, tests, and units current.",
+      "max_age_days": 21,
+      "watch": [
+        "docs/hermes-agent-fleet.json",
+        "scripts/hermes_agent_fleet_audit.py",
+        "tests/test_hermes_agent_fleet_audit.py",
+        "server_setup/hermes-agent-fleet-audit.service",
+        "server_setup/hermes-agent-fleet-audit.timer"
+      ]
+    }
+  ]
+}

@@ -259,6 +259,10 @@ def execute_job(job, coordinator_url):
             return run_simulation(params)
         elif job_type == "DATA_PULL":
             return run_data_pull(params)
+        elif job_type == "KILL_PREDICTOR_SCORE":
+            return run_kill_predictor_score(params)
+        elif job_type == "EMBEDDING_BATCH":
+            return run_embedding_batch(params)
         else:
             return {"error": f"Unknown job type: {job_type}"}
     except Exception as e:
@@ -929,6 +933,335 @@ def main():
             except Exception as e:
                 log.error("Worker loop error: {e}", e=e)
                 time.sleep(POLL_INTERVAL)
+
+
+
+# ── KILL_PREDICTOR_SCORE handler (task #50, 2026-05-16) ─────────────────
+# Claims KILL_PREDICTOR_SCORE jobs, POSTs the thesis to the kill-predictor
+# ASIC (default http://koala:8090/score), and UPSERTs the result into
+# hypothesis_asic_decisions with source='backfill_v1' so we can distinguish
+# coordinator-driven backfills from live hermes_operator calls.
+KILL_PREDICTOR_URL = os.environ.get(
+    "GRID_KILL_PREDICTOR_URL", "http://koala:8090/score"
+)
+KILL_PREDICTOR_TIMEOUT = float(os.environ.get("GRID_KILL_PREDICTOR_TIMEOUT", "10"))
+KILL_PREDICTOR_THRESHOLD = float(os.environ.get("GRID_KILL_PREDICTOR_THRESHOLD", "0.5"))
+
+
+def run_kill_predictor_score(params):
+    """Score a hypothesis via the kill-predictor ASIC and persist the decision.
+
+    Expected params:
+        hypothesis_id (or hypothesis_uuid): text id of a row in
+            discovered_hypotheses.
+        source: optional override (default 'backfill_v1').
+        predictor_version: optional override (default 'v1').
+    """
+    import psycopg2
+    import psycopg2.extras
+
+    hypothesis_id = (
+        params.get("hypothesis_id")
+        or params.get("hypothesis_uuid")
+        or params.get("id")
+    )
+    if not hypothesis_id:
+        return {"error": "missing hypothesis_id in params"}
+
+    source = params.get("source") or "backfill_v1"
+    predictor_version = params.get("predictor_version") or "v1"
+
+    # Fetch thesis row.
+    pg_dsn = (
+        "host=" + os.environ.get("PG_HOST", "100.75.185.36")
+        + " port=" + os.environ.get("PG_PORT", "5432")
+        + " dbname=" + os.environ.get("PG_DATABASE", "griddb")
+        + " user=" + os.environ.get("PG_USER", "grid")
+        + " password=" + os.environ.get("PG_PASSWORD", "gridmaster2026")
+    )
+    conn = psycopg2.connect(pg_dsn)
+    conn.autocommit = True
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            "SELECT id, thesis, pattern_type, evidence, invalidation, confidence, "
+            "       status, times_tested, times_correct "
+            "FROM discovered_hypotheses WHERE id=%s",
+            (hypothesis_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {"error": f"hypothesis_id {hypothesis_id} not found"}
+
+        evidence = row.get("evidence") or {}
+        try:
+            evidence_keys_count = len(evidence) if isinstance(evidence, dict) else 0
+        except Exception:
+            evidence_keys_count = 0
+
+        payload = {
+            "thesis": row["thesis"] or "",
+            "pattern_type": row.get("pattern_type") or "unknown",
+            "times_tested": int(row.get("times_tested") or 0),
+            "times_correct": int(row.get("times_correct") or 0),
+            "confidence": float(row.get("confidence") or 0.5),
+            "evidence_keys_count": evidence_keys_count,
+        }
+
+        try:
+            resp = requests.post(
+                KILL_PREDICTOR_URL,
+                json=payload,
+                timeout=KILL_PREDICTOR_TIMEOUT,
+            )
+            resp.raise_for_status()
+            scored = resp.json()
+        except Exception as e:
+            return {"error": f"kill-predictor POST failed: {e}"}
+
+        kill_prob = scored.get("kill_probability")
+        if kill_prob is None:
+            return {"error": f"kill-predictor returned no kill_probability: {scored}"}
+        kill_prob = float(kill_prob)
+        decision = "KILL" if kill_prob >= KILL_PREDICTOR_THRESHOLD else "KEEP"
+        # Honour a kill-predictor-supplied `decision` if present, else use threshold.
+        if scored.get("decision"):
+            decision = str(scored["decision"]).upper()
+
+        cur.execute(
+            """
+            INSERT INTO hypothesis_asic_decisions
+                (hypothesis_id, decided_at, asic_kill_prob, decision,
+                 predictor_version, source)
+            VALUES (%s, NOW(), %s, %s, %s, %s)
+            ON CONFLICT (hypothesis_id) DO UPDATE
+              SET decided_at = EXCLUDED.decided_at,
+                  asic_kill_prob = EXCLUDED.asic_kill_prob,
+                  decision = EXCLUDED.decision,
+                  predictor_version = EXCLUDED.predictor_version,
+                  source = EXCLUDED.source
+            """,
+            (hypothesis_id, kill_prob, decision, predictor_version, source),
+        )
+    finally:
+        conn.close()
+
+    return {
+        "output": {
+            "hypothesis_id": hypothesis_id,
+            "kill_probability": kill_prob,
+            "decision": decision,
+            "predictor_version": predictor_version,
+            "source": source,
+            "model_version": scored.get("model_version"),
+            "logit": scored.get("logit"),
+            "latency_ms": scored.get("latency_ms"),
+        },
+        "metrics": {
+            "compute_time_ms": 0,  # filled by caller
+            "kill_predictor_latency_ms": scored.get("latency_ms"),
+        },
+    }
+
+
+
+
+# ── EMBEDDING_BATCH handler (task #49, 2026-05-16) ──────────────────────
+# Claims EMBEDDING_BATCH jobs from the coordinator and enqueues the
+# requested (source_type, source_id) rows into embedding_queue. The four
+# embed workers (grid-svr P1000, koala TITAN X x2, ocr-node 2070 Super)
+# continue to drain embedding_queue directly; this handler is purely an
+# additional way to ENQUEUE work, not consume it.
+#
+# Payload shapes (either form is valid):
+#   {"items": [
+#       {"source_type": "news_article", "source_id": "123"},
+#       {"source_type": "actor", "source_id": "foo"}],
+#    "priority": 10}
+#
+#   {"predicate": {
+#       "source_type": "news_article",
+#       "since": "2026-05-15T00:00:00Z",  # optional
+#       "until": "2026-05-16T00:00:00Z",  # optional
+#       "limit": 1000                     # required, capped at 100000
+#    },
+#    "priority": 10}
+#
+# Returns {"output": {"enqueued": N, "skipped_existing": M, ...}}.
+
+EMBEDDING_BATCH_MAX_LIMIT = int(os.environ.get("GRID_EMBED_BATCH_MAX_LIMIT", "100000"))
+EMBEDDING_BATCH_MAX_ITEMS = int(os.environ.get("GRID_EMBED_BATCH_MAX_ITEMS", "50000"))
+
+# Map source_type -> (table_name, id_column, timestamp_column_or_None)
+# Used for predicate-form queries. Add new source types here.
+EMBEDDING_BATCH_PREDICATE_TABLES = {
+    "news_article": ("news_articles", "id", "published_at"),
+    "actor":        ("actors", "id", "updated_at"),
+    "signal_data":  ("signal_data", "id", "created_at"),
+    "sec_fact":     ("sec_material_facts", "id", "created_at"),
+}
+
+
+def _pg_connect_for_embedding_batch():
+    import psycopg2
+    pg_dsn = (
+        "host=" + os.environ.get("PG_HOST", "100.75.185.36")
+        + " port=" + os.environ.get("PG_PORT", "5432")
+        + " dbname=" + os.environ.get("PG_DATABASE", "griddb")
+        + " user=" + os.environ.get("PG_USER", "grid")
+        + " password=" + os.environ.get("PG_PASSWORD", "gridmaster2026")
+    )
+    conn = psycopg2.connect(pg_dsn)
+    conn.autocommit = False
+    return conn
+
+
+def run_embedding_batch(params):
+    """Enqueue a batch of items into embedding_queue.
+
+    Either `items` or `predicate` must be provided. `priority` is optional
+    (default 0, same as the timer-driven enqueuer).
+    """
+    import psycopg2  # noqa: F401  (ensure driver present)
+    import psycopg2.extras
+
+    items = params.get("items")
+    predicate = params.get("predicate")
+    priority = int(params.get("priority") or 0)
+
+    if not items and not predicate:
+        return {"error": "EMBEDDING_BATCH requires either 'items' or 'predicate' in params"}
+    if items and predicate:
+        return {"error": "EMBEDDING_BATCH accepts 'items' OR 'predicate', not both"}
+
+    rows_to_insert = []
+    predicate_meta = None
+
+    conn = _pg_connect_for_embedding_batch()
+    try:
+        cur = conn.cursor()
+
+        if items:
+            if not isinstance(items, list):
+                return {"error": "'items' must be a list of {source_type, source_id} objects"}
+            if len(items) > EMBEDDING_BATCH_MAX_ITEMS:
+                return {
+                    "error": (
+                        f"'items' length {len(items)} exceeds max "
+                        f"{EMBEDDING_BATCH_MAX_ITEMS} (set GRID_EMBED_BATCH_MAX_ITEMS to override)"
+                    )
+                }
+            for it in items:
+                if not isinstance(it, dict):
+                    return {"error": f"item is not an object: {it!r}"}
+                st = it.get("source_type")
+                sid = it.get("source_id")
+                if not st or sid is None:
+                    return {"error": f"item missing source_type/source_id: {it!r}"}
+                rows_to_insert.append((str(st), str(sid)))
+
+        else:  # predicate form
+            if not isinstance(predicate, dict):
+                return {"error": "'predicate' must be an object"}
+            st = predicate.get("source_type")
+            if st not in EMBEDDING_BATCH_PREDICATE_TABLES:
+                return {
+                    "error": (
+                        f"predicate.source_type '{st}' not supported. "
+                        f"Known: {sorted(EMBEDDING_BATCH_PREDICATE_TABLES)}"
+                    )
+                }
+            limit = predicate.get("limit")
+            if not isinstance(limit, int) or limit <= 0:
+                return {"error": "predicate.limit must be a positive integer"}
+            if limit > EMBEDDING_BATCH_MAX_LIMIT:
+                limit = EMBEDDING_BATCH_MAX_LIMIT
+
+            table, id_col, ts_col = EMBEDDING_BATCH_PREDICATE_TABLES[st]
+            sql_parts = [f"SELECT {id_col}::text FROM {table}"]
+            where = []
+            sql_params = []
+            since = predicate.get("since")
+            until = predicate.get("until")
+            if since and ts_col:
+                where.append(f"{ts_col} >= %s")
+                sql_params.append(since)
+            if until and ts_col:
+                where.append(f"{ts_col} < %s")
+                sql_params.append(until)
+            if where:
+                sql_parts.append("WHERE " + " AND ".join(where))
+            order_col = ts_col or id_col
+            sql_parts.append(f"ORDER BY {order_col} DESC NULLS LAST LIMIT %s")
+            sql_params.append(int(limit))
+            cur.execute(" ".join(sql_parts), sql_params)
+            for (sid,) in cur.fetchall():
+                if sid is None:
+                    continue
+                rows_to_insert.append((st, sid))
+            predicate_meta = {
+                "source_type": st,
+                "table": table,
+                "matched": len(rows_to_insert),
+                "limit_applied": limit,
+                "since": since,
+                "until": until,
+            }
+
+        if not rows_to_insert:
+            conn.commit()
+            return {
+                "output": {
+                    "enqueued": 0,
+                    "skipped_existing": 0,
+                    "candidates": 0,
+                    "priority": priority,
+                    "predicate": predicate_meta,
+                }
+            }
+
+        # Batch INSERT ... ON CONFLICT DO NOTHING. RETURNING id tells us
+        # how many rows were actually inserted (i.e. not already queued).
+        psycopg2.extras.execute_values(
+            cur,
+            (
+                "INSERT INTO embedding_queue (source_type, source_id, priority, status) "
+                "VALUES %s "
+                "ON CONFLICT (source_type, source_id) DO NOTHING "
+                "RETURNING id"
+            ),
+            [(st, sid, priority, "pending") for (st, sid) in rows_to_insert],
+            page_size=1000,
+        )
+        inserted = len(cur.fetchall())
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        return {"error": f"EMBEDDING_BATCH failed: {exc}"}
+    finally:
+        conn.close()
+
+    candidates = len(rows_to_insert)
+    skipped = max(candidates - inserted, 0)
+    log.info(
+        "EMBEDDING_BATCH: enqueued {n}/{c} (skipped_existing={s}, priority={p})",
+        n=inserted, c=candidates, s=skipped, p=priority,
+    )
+    return {
+        "output": {
+            "enqueued": inserted,
+            "skipped_existing": skipped,
+            "candidates": candidates,
+            "priority": priority,
+            "predicate": predicate_meta,
+        },
+        "metrics": {
+            "compute_time_ms": 0,  # filled by caller
+            "rows_enqueued": inserted,
+            "rows_skipped_existing": skipped,
+        },
+    }
+
 
 
 if __name__ == "__main__":

@@ -161,7 +161,7 @@ GRID's signal logic is never sent to external networks. All LLM calls use local 
 CANDIDATE → SHADOW → STAGING → PRODUCTION → FLAGGED → RETIRED
 ```
 
-- **[[Walk-Forward Backtesting|Promotion gate]]s** enforced at each transition (validation run, hypothesis state, journal count)
+- **[[Walk-Forward Backtesting|Promotion gates]]** enforced at each transition (validation run, hypothesis state, journal count)
 - **One PRODUCTION model per layer** — existing model auto-demoted when new one promoted
 - **Flagging** is automatic (monitoring-driven), unflagging requires operator action
 - **Rollback** retires current model and promotes predecessor

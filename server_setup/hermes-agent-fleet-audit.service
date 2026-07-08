@@ -1,0 +1,12 @@
+[Unit]
+Description=Hermes Agent Fleet Audit
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=grid
+WorkingDirectory=/home/grid/grid_v4/grid_repo
+ExecStart=/usr/bin/python3 scripts/hermes_agent_fleet_audit.py --registry docs/hermes-agent-fleet.json --output-json /data/grid/reports/hermes-agent-fleet-audit.json --output-md /data/grid/reports/hermes-agent-fleet-audit.md
+StandardOutput=append:/data/grid/logs/hermes-agent-fleet-audit.log
+StandardError=append:/data/grid/logs/hermes-agent-fleet-audit.log

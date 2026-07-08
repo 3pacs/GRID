@@ -167,6 +167,20 @@ class Settings(BaseSettings):
     HERMES_PRICE_INPUT_PER_MTOK: float = 2.50       # USD/1M input tokens (estimate for cap)
     HERMES_PRICE_OUTPUT_PER_MTOK: float = 10.00     # USD/1M output tokens (incl. reasoning)
     HERMES_FALLBACK_TIER: str = "reason"            # llm.router tier for offline fallback
+    # Backend: "openai" (API key, per-token) or "codex" (Codex CLI, ChatGPT-
+    # subscription auth — the only path to GPT-5.5). The codex backend shells
+    # out to `codex exec`; auth is whatever `codex login` set on the host, so
+    # no key lives in .env and there is no per-token USD cap (plan rate limits).
+    HERMES_BACKEND: str = "openai"                  # openai | codex
+    HERMES_CODEX_BIN: str = "codex"                 # Codex CLI binary (PATH or absolute)
+    HERMES_CODEX_MODEL: str = ""                    # blank -> Codex default (GPT-5.5)
+    HERMES_CODEX_TIMEOUT_SECONDS: int = 240
+    HERMES_CODEX_EXTRA_ARGS: str = ""               # extra `codex exec` flags (shlex-split)
+    # LLM second-opinion review of active hypotheses (scripts/hermes_llm_hypothesis_review.py).
+    # DORMANT by default — advisory layer on top of the free deterministic 30-min scorer.
+    # Use the API-key lane + HERMES_DAILY_SPEND_CAP_USD for unattended runs.
+    HERMES_HYPO_LLM_ENABLED: bool = False           # gate the LLM hypothesis second-opinion
+    HERMES_HYPO_LLM_LIMIT: int = 10                 # top-N highest-conviction active hypos per run
 
     # Ollama (local lightweight LLM — Qwen 7B)
     OLLAMA_BASE_URL: str = "http://localhost:11434"

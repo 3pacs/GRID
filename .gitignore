@@ -54,3 +54,6 @@ output/briefings/
 # the live fleet dashboard. Runtime artifact; the live snapshot is the source
 # of truth, so don't freeze a (possibly partial) snapshot into git.
 llm/autoresearch/host_profiles.json
+
+# Hermes-generated wiki reports (regenerated each cycle; not source)
+docs/wiki/
