@@ -101,7 +101,7 @@ httpx>=0.26.0
 kafka-python-ng>=2.2.0
 
 # Object storage
-minio>=7.2.0
+minio>=7.2.20
 
 # Workflow orchestration
 prefect>=3.7.0
