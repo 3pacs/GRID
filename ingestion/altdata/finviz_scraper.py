@@ -81,7 +81,7 @@ class FinvizScraperPuller(BasePuller):
         "cost_tier": "FREE",
         "latency_class": "EOD",
         "pit_available": False,
-        "revision_behavior": "OVERWRITE",
+        "revision_behavior": "NEVER",
         "trust_score": "MED",
         "priority_rank": 45,
     }

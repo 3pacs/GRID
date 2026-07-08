@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from loguru import logger as log
@@ -26,6 +27,21 @@ if TYPE_CHECKING:
     from sqlalchemy.engine import Engine
 
     from contracts.schemas import CrossReferenceAnomaly
+
+
+def _decimal_bind(value) -> str:
+    """Serialize a Decimal-shaped value as a string for NUMERIC binding.
+
+    NUMERIC columns preserve arbitrary precision; going through ``float()``
+    would silently truncate cross-reference deltas past ~15 significant
+    digits (PUNCH-LIST-2026-05-13 contracts/ [P2] line 94). Passing the
+    string form + ``CAST(... AS NUMERIC)`` sidesteps DBAPI float coercion.
+    """
+    if value is None:
+        return "0"
+    if isinstance(value, Decimal):
+        return str(value)
+    return str(Decimal(str(value)))
 
 
 #: Severity floor — LOW anomalies are routed but not persisted so we don't
@@ -114,7 +130,8 @@ def on_cross_reference_anomaly(
                         producer_module, correlation_id
                     ) VALUES (
                         CAST(:eid AS UUID), :stat, :sev,
-                        :ov, :rv, :cd, CAST(:el AS JSONB),
+                        CAST(:ov AS NUMERIC), CAST(:rv AS NUMERIC),
+                        :cd, CAST(:el AS JSONB),
                         :prod, CAST(:cid AS UUID)
                     )
                     ON CONFLICT (event_id) DO NOTHING
@@ -124,8 +141,8 @@ def on_cross_reference_anomaly(
                     "eid": event_id,
                     "stat": statistic,
                     "sev": severity,
-                    "ov": float(getattr(evt, "official_value", 0) or 0),
-                    "rv": float(getattr(evt, "reality_proxy_value", 0) or 0),
+                    "ov": _decimal_bind(getattr(evt, "official_value", None)),
+                    "rv": _decimal_bind(getattr(evt, "reality_proxy_value", None)),
                     "cd": float(getattr(evt, "confidence_delta", 0.0) or 0.0),
                     "el": json.dumps(evidence_links),
                     "prod": producer,

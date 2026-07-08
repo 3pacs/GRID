@@ -11,6 +11,9 @@ class ReportObjectStore(Protocol):
     def put(self, bucket: str, key: str, data: bytes, content_type: str) -> bool:
         """Store bytes at bucket/key."""
 
+    def check_health(self, bucket: str) -> bool:
+        """Check object store connection health."""
+
 
 class MinioReportObjectStore:
     """Small MinIO writer for agent report markdown + JSON sidecars."""
@@ -55,3 +58,15 @@ class MinioReportObjectStore:
                 err=str(exc),
             )
             return False
+
+    def check_health(self, bucket: str) -> bool:
+        try:
+            self._client.bucket_exists(bucket)
+            return True
+        except Exception as exc:
+            log.error(
+                "agent_hub MinIO health check failed: {err}",
+                err=str(exc),
+            )
+            return False
+

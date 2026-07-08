@@ -28,11 +28,12 @@ Wrapper paths: `/usr/local/bin/agent-report` on grid-svr/gridz4/redbox/panda/koa
 ## Project Overview
 
 GRID is a systematic, multi-agent trading intelligence platform. It ingests
-macroeconomic/market data from 48 data pullers (all registered in [[Hermes Scheduler|Hermes
-scheduler]]), resolves multi-source conflicts using [[PIT Store|point-in-time]] (PIT)
-correct methodology, performs unsupervised [[Regime Discovery|regime discovery]], and runs
-[[Walk-Forward Backtesting|walk-forward backtesting]] with an immutable [[Decision
-Journal|decision journal]].
+macroeconomic/market data from 48 data pullers (all registered in
+[[Hermes Scheduler|Hermes scheduler]]), resolves multi-source conflicts using
+[[PIT Store|point-in-time]] (PIT) correct methodology, performs unsupervised
+[[Regime Discovery|regime discovery]], and runs
+[[Walk-Forward Backtesting|walk-forward backtesting]] with an immutable
+[[Decision Journal|decision journal]].
 
 **See `docs/planning/ROADMAP.md` for the full 4-week tactical plan and 4-quarter strategic plan.**
 
@@ -120,8 +121,8 @@ inference paths.
 
 <important if="adding or modifying data sources">
 **Multi-source [[Conflict Resolution|conflict resolution]]** goes through
-`normalization/resolver.py`. Every new data source needs: an ingestion module, [[Entity
-Map|entity map]]ping in `entity_map.py`, and PIT-compatible timestamps. Use the scheduler
+`normalization/resolver.py`. Every new data source needs: an ingestion module,
+[[Entity Map|entity mapping]] in `entity_map.py`, and PIT-compatible timestamps. Use the scheduler
 pattern from `ingestion/scheduler.py`.
 </important>
 

@@ -24,6 +24,7 @@ from typing import Any
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError
 
 # ── Amount range mapping (mirrors congressional.py / dollar_flows.py) ────
 
@@ -67,9 +68,9 @@ _DDL_STATEMENTS: list[str] = [
         trade_type  TEXT NOT NULL,
         shares      DOUBLE PRECISION,
         value       DOUBLE PRECISION,
-        price       DOUBLE PRECISION,
+        price_per_share DOUBLE PRECISION,
         insider_title TEXT,
-        is_unusual  BOOLEAN DEFAULT FALSE,
+        is_cluster_buy BOOLEAN DEFAULT FALSE,
         created_at  TIMESTAMPTZ DEFAULT NOW(),
         UNIQUE (ticker, trade_date, insider_name, trade_type)
     )
@@ -146,6 +147,21 @@ def _ensure_tables(engine: Engine) -> None:
         for stmt in _DDL_STATEMENTS:
             conn.execute(text(stmt.strip()))
     log.debug("flow_materializer: target tables ensured")
+
+
+def _is_statement_timeout(exc: Exception) -> bool:
+    """Return True when Postgres canceled a materializer query by timeout."""
+    if isinstance(exc, OperationalError):
+        orig = getattr(exc, "orig", None)
+        if getattr(orig, "pgcode", None) == "57014":
+            return True
+
+    msg = str(exc).lower()
+    return (
+        "statement timeout" in msg
+        or "canceling statement due to statement timeout" in msg
+        or "querycanceled" in msg
+    )
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -703,7 +719,8 @@ def sync_all(engine: Engine) -> dict[str, Any]:
             count = func(engine)
             results[table_name] = count
         except Exception as exc:
-            log.error(
+            log_fn = log.warning if _is_statement_timeout(exc) else log.error
+            log_fn(
                 "flow_materializer: {t} sync failed: {e}",
                 t=table_name, e=str(exc),
             )
