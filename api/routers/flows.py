@@ -1939,24 +1939,38 @@ async def get_flow_momentum(
 # Expanded capital flows: 8-layer junction point flow map
 # ---------------------------------------------------------------------------
 
+_FLOW_MAP_CACHE_TTL: float = 300.0  # 5 minutes
+_flow_map_cache: TTLCache = TTLCache(ttl=_FLOW_MAP_CACHE_TTL, max_size=5)
+
+
+def _get_flow_map(engine, as_of=None):
+    from datetime import date
+    from analysis.money_flow_engine import build_flow_map
+
+    cache_key = str(as_of) if as_of else "today"
+    cached = _flow_map_cache.get(cache_key)
+    if cached is not None:
+        log.debug("Flow map cache hit for key={}", cache_key)
+        return cached
+    log.info("Flow map cache miss for key={}, building flow map...", cache_key)
+    flow_map = build_flow_map(engine, as_of=as_of)
+    _flow_map_cache.set(cache_key, flow_map)
+    return flow_map
+
 
 @router.get("/flow-map-v2")
 async def get_flow_map_v2(_token: str = Depends(require_auth)) -> dict:
     """8-layer junction point flow map with edges."""
-    from analysis.money_flow_engine import build_flow_map
-
     engine = get_db_engine()
-    flow_map = build_flow_map(engine)
+    flow_map = _get_flow_map(engine)
     return flow_map.to_dict()
 
 
 @router.get("/junction-points")
 def get_junction_points(_token: str = Depends(require_auth)) -> dict:
     """All junction points across 8 layers with current values."""
-    from analysis.money_flow_engine import build_flow_map
-
     engine = get_db_engine()
-    flow_map = build_flow_map(engine)
+    flow_map = _get_flow_map(engine)
 
     # Fetch latest updated_at per junction point from DB
     jp_timestamps: dict[str, str] = {}
@@ -2034,10 +2048,8 @@ def _infer_trend(node) -> str:
 @router.get("/layers")
 async def get_flow_layers(_token: str = Depends(require_auth)) -> dict:
     """Summary of all 8 junction point layers."""
-    from analysis.money_flow_engine import build_flow_map
-
     engine = get_db_engine()
-    flow_map = build_flow_map(engine)
+    flow_map = _get_flow_map(engine)
     return {
         "layers": [layer.to_dict() for layer in flow_map.layers],
         "edges": [edge.to_dict() for edge in flow_map.edges],
@@ -2050,10 +2062,8 @@ async def get_flow_layers(_token: str = Depends(require_auth)) -> dict:
 @router.get("/layers/{layer_id}")
 async def get_flow_layer_detail(layer_id: str, _token: str = Depends(require_auth)) -> dict:
     """Detailed view of a single junction point layer."""
-    from analysis.money_flow_engine import build_flow_map
-
     engine = get_db_engine()
-    flow_map = build_flow_map(engine)
+    flow_map = _get_flow_map(engine)
 
     layer = next(
         (flow_layer for flow_layer in flow_map.layers if flow_layer.id == layer_id),
@@ -2085,10 +2095,8 @@ async def get_flow_waterfall(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Trace money from a source node through all layers."""
-    from analysis.money_flow_engine import build_flow_map
-
     engine = get_db_engine()
-    flow_map = build_flow_map(engine)
+    flow_map = _get_flow_map(engine)
 
     # Find starting node
     start_node = None
@@ -2186,11 +2194,10 @@ async def get_flow_waterfall(
 @router.get("/orthogonality")
 async def get_flow_orthogonality(_token: str = Depends(require_auth)) -> dict:
     """PCA decomposition and correlation matrix of junction point flows."""
-    from analysis.money_flow_engine import build_flow_map
     import numpy as np
 
     engine = get_db_engine()
-    flow_map = build_flow_map(engine)
+    flow_map = _get_flow_map(engine)
 
     # Collect nodes with numeric values for PCA
     nodes_with_data = []

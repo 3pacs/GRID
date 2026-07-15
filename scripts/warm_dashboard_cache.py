@@ -22,6 +22,10 @@ ENDPOINTS = [
     "/api/v1/flows/aggregated",
     "/api/v1/regime/current",
     "/api/v1/system/status",
+    "/api/v1/flows/layers",
+    "/api/v1/flows/junction-points",
+    "/api/v1/flows/waterfall",
+    "/api/v1/flows/orthogonality",
 ]
 
 
