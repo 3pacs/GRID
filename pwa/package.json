@@ -22,7 +22,7 @@
     "@xyflow/react": "^12.10.2",
     "d3": "^7.9.0",
     "d3-sankey": "^0.12.3",
-    "deck.gl": "^9.3.2",
+    "deck.gl": "^9.3.6",
     "dompurify": "^3.4.5",
     "graphology": "^0.26.0",
     "graphology-communities-louvain": "^2.0.2",
