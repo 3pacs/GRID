@@ -12,10 +12,23 @@ from db import get_engine
 
 
 def _esc(val):
-    """Escape for Cypher string literal."""
+    """Escape for Cypher string literal embedded in a Postgres $$-quoted block.
+
+    Escapes backslash and single-quote for the Cypher string literal itself.
+    Rejects values containing '$' because the Cypher body is wrapped in
+    ``cypher('grid_graph', $$ ... $$)`` — a stray ``$$`` inside a value would
+    close the outer dollar-quote and let the remainder execute as Postgres SQL.
+    Fail loud rather than silently ship an injectable payload.
+    """
     if val is None:
         return ""
-    return str(val).replace("\\", "\\\\").replace("'", "\\'")
+    s = str(val)
+    if "$" in s:
+        raise ValueError(
+            "value contains '$' which cannot be safely embedded in a "
+            "dollar-quoted Cypher block; reject upstream or strip before sync"
+        )
+    return s.replace("\\", "\\\\").replace("'", "\\'")
 
 
 def sync():
@@ -38,25 +51,25 @@ def sync():
 
     for row in rows:
         r = dict(row._mapping)
-        aid = _esc(r["id"])
-        name = _esc(r["name"])
-        tier = _esc(r["tier"] or "unknown")
-        cat = _esc(r["category"] or "unknown")
-        title = _esc(r["title"])
-        inf = float(r["inf"] or 0)
-        trust = float(r["trust"] or 0.5)
-        cred = _esc(r["cred"])
-
-        cypher = (
-            f"MERGE (a:Actor {{actor_id: '{aid}'}}) "
-            f"SET a.name = '{name}', a.tier = '{tier}', a.category = '{cat}', "
-            f"a.title = '{title}', a.influence_score = {inf}, "
-            f"a.trust_score = {trust}, a.credibility = '{cred}' "
-            f"RETURN a"
-        )
-        sql = f"SELECT * FROM cypher('grid_graph', $$ {cypher} $$) AS (result agtype)"
-
         try:
+            aid = _esc(r["id"])
+            name = _esc(r["name"])
+            tier = _esc(r["tier"] or "unknown")
+            cat = _esc(r["category"] or "unknown")
+            title = _esc(r["title"])
+            inf = float(r["inf"] or 0)
+            trust = float(r["trust"] or 0.5)
+            cred = _esc(r["cred"])
+
+            cypher = (
+                f"MERGE (a:Actor {{actor_id: '{aid}'}}) "
+                f"SET a.name = '{name}', a.tier = '{tier}', a.category = '{cat}', "
+                f"a.title = '{title}', a.influence_score = {inf}, "
+                f"a.trust_score = {trust}, a.credibility = '{cred}' "
+                f"RETURN a"
+            )
+            sql = f"SELECT * FROM cypher('grid_graph', $$ {cypher} $$) AS (result agtype)"
+
             with engine.begin() as conn:
                 conn.execute(text("SET search_path = ag_catalog, public"))
                 conn.execute(text(sql))
@@ -89,19 +102,19 @@ def sync():
 
     for row in conn_rows:
         r = dict(row._mapping)
-        a = _esc(r["actor_a"])
-        b = _esc(r["actor_b"])
-        rel = _esc(r["relationship"] or "CONNECTS")
-        strength = float(r["strength"] or 0.5)
-
-        cypher = (
-            f"MATCH (a:Actor {{actor_id: '{a}'}}), (b:Actor {{actor_id: '{b}'}}) "
-            f"MERGE (a)-[r:CONNECTS {{relationship: '{rel}', strength: {strength}}}]->(b) "
-            f"RETURN r"
-        )
-        sql = f"SELECT * FROM cypher('grid_graph', $$ {cypher} $$) AS (result agtype)"
-
         try:
+            a = _esc(r["actor_a"])
+            b = _esc(r["actor_b"])
+            rel = _esc(r["relationship"] or "CONNECTS")
+            strength = float(r["strength"] or 0.5)
+
+            cypher = (
+                f"MATCH (a:Actor {{actor_id: '{a}'}}), (b:Actor {{actor_id: '{b}'}}) "
+                f"MERGE (a)-[r:CONNECTS {{relationship: '{rel}', strength: {strength}}}]->(b) "
+                f"RETURN r"
+            )
+            sql = f"SELECT * FROM cypher('grid_graph', $$ {cypher} $$) AS (result agtype)"
+
             with engine.begin() as conn:
                 conn.execute(text("SET search_path = ag_catalog, public"))
                 conn.execute(text(sql))
