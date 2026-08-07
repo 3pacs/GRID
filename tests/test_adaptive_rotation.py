@@ -137,6 +137,18 @@ class TestStops:
         stopped = check_stops(pos, {"AAPL": 108.0}, date(2025, 2, 1))
         assert stopped == []
 
+    def test_update_peak_advances_on_new_high(self):
+        pos = PositionState("AAPL", date(2025, 1, 1), 100.0, 110.0, date(2025, 1, 15))
+        pos.update_peak(125.0, date(2025, 2, 1))
+        assert pos.peak_price == 125.0
+        assert pos.peak_date == date(2025, 2, 1)
+
+    def test_update_peak_ignores_lower_price(self):
+        pos = PositionState("AAPL", date(2025, 1, 1), 100.0, 130.0, date(2025, 1, 15))
+        pos.update_peak(120.0, date(2025, 2, 1))
+        assert pos.peak_price == 130.0
+        assert pos.peak_date == date(2025, 1, 15)
+
 
 # ── Heartbeat Tests ───────────────────────────────────────────────────
 
