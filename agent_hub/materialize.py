@@ -15,9 +15,7 @@ import psycopg2.extras
 
 
 DEFAULT_OUT_ROOT = "/tmp/agent-reports-out"
-DEFAULT_DEST = (
-    "anikdang@100.120.20.120:/Users/anikdang/Documents/Obsidian Vault/00-Agent-Reports"
-)
+DEFAULT_DEST = "mini24@100.125.97.81:/Users/mini24/dev/obsidian-vault/00-Agent-Reports"
 _SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -126,7 +124,7 @@ def rsync_to_obsidian(day_dir: Path, dest_base: str) -> None:
         dest = f"{host}:{remote_path}"
 
     subprocess.run(
-        ["rsync", "-az", f"{day_dir}/", dest],
+        ["rsync", "-az", "--ignore-existing", f"{day_dir}/", dest],
         check=True,
     )
 
