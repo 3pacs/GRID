@@ -23,7 +23,7 @@
     "d3": "^7.9.0",
     "d3-sankey": "^0.12.3",
     "deck.gl": "^9.3.2",
-    "dompurify": "^3.4.5",
+    "dompurify": "^3.4.12",
     "graphology": "^0.26.0",
     "graphology-communities-louvain": "^2.0.2",
     "graphology-layout": "^0.6.1",
