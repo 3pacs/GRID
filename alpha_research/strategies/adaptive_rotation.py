@@ -92,8 +92,8 @@ class PositionState:
 
     def update_peak(self, price: float, dt: date) -> None:
         if price > self.peak_price:
-            object.__setattr__(self, "peak_price", price)
-            object.__setattr__(self, "peak_date", dt)
+            self.peak_price = price
+            self.peak_date = dt
 
 
 @dataclass(frozen=True)
