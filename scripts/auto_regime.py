@@ -365,6 +365,27 @@ def compute_regime_at(
     }
 
 
+# Two complete literal statements rather than one assembled from a fragment.
+# The fragment was constant, so there was no injection path, but
+# .claude/rules/security.md bans f-strings, .format() and concatenation in SQL
+# outright — a rule worth keeping absolute, because the moment a fragment stops
+# being constant the review that would have caught it has already happened.
+_REGIME_HISTORY_UPSERT_SQL = text(
+    "INSERT INTO regime_history (obs_date, regime, confidence, source) "
+    "VALUES (:obs_date, :regime, :confidence, :source) "
+    "ON CONFLICT (obs_date) DO UPDATE SET "
+    "regime = EXCLUDED.regime, "
+    "confidence = EXCLUDED.confidence, "
+    "source = EXCLUDED.source"
+)
+
+_REGIME_HISTORY_INSERT_IGNORE_SQL = text(
+    "INSERT INTO regime_history (obs_date, regime, confidence, source) "
+    "VALUES (:obs_date, :regime, :confidence, :source) "
+    "ON CONFLICT (obs_date) DO NOTHING"
+)
+
+
 def persist_regime_history(
     engine,
     obs_date: date,
@@ -403,19 +424,10 @@ def persist_regime_history(
     if not np.isfinite(conf) or not (0.0 <= conf <= 1.0):
         raise ValueError(f"regime confidence must be finite and in [0, 1], got {confidence!r}")
 
-    conflict = (
-        "DO UPDATE SET regime = EXCLUDED.regime, "
-        "confidence = EXCLUDED.confidence, source = EXCLUDED.source"
-        if overwrite
-        else "DO NOTHING"
-    )
+    stmt = _REGIME_HISTORY_UPSERT_SQL if overwrite else _REGIME_HISTORY_INSERT_IGNORE_SQL
     with engine.begin() as conn:
         result = conn.execute(
-            text(
-                "INSERT INTO regime_history (obs_date, regime, confidence, source) "
-                "VALUES (:obs_date, :regime, :confidence, :source) "
-                f"ON CONFLICT (obs_date) {conflict}"
-            ),
+            stmt,
             {
                 "obs_date": obs_date,
                 "regime": label,

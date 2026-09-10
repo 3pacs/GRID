@@ -127,6 +127,35 @@ class TestPersistRegimeHistory:
             "source": REGIME_HISTORY_SOURCE,
         }
 
+    def test_statements_are_whole_literals_not_assembled(self):
+        """.claude/rules/security.md bans f-strings, .format() and concatenation
+        in SQL. The repo's own guard (tests/test_regression_20260329.py) only
+        scans api/routers and intelligence and only warns, so scripts/ needs its
+        own pin."""
+        import inspect
+
+        import scripts.auto_regime as auto
+
+        source = inspect.getsource(auto.persist_regime_history)
+        # No SQL is built in the function body at all — the statements come from
+        # module constants, so there is no fragment to interpolate into. (The
+        # f-strings that remain are exception messages, which the rule allows.)
+        assert "text(" not in source
+        assert ".format(" not in source
+        for line in source.splitlines():
+            if line.lstrip().startswith(("f\"", "f'")):
+                assert not any(
+                    kw in line.upper()
+                    for kw in ("SELECT", "INSERT", "UPDATE", "DELETE", "CONFLICT")
+                ), f"SQL assembled in an f-string: {line.strip()}"
+        # The two statements are module-level literals, selected by a flag.
+        for stmt in (auto._REGIME_HISTORY_UPSERT_SQL, auto._REGIME_HISTORY_INSERT_IGNORE_SQL):
+            sql = str(stmt)
+            assert "INSERT INTO regime_history" in sql
+            assert ":obs_date" in sql and ":regime" in sql
+        assert "DO UPDATE SET" in str(auto._REGIME_HISTORY_UPSERT_SQL)
+        assert "DO NOTHING" in str(auto._REGIME_HISTORY_INSERT_IGNORE_SQL)
+
     def test_stamps_its_own_provenance(self):
         """So a reader can tell these rows from the 2026-03 one-off load,
         which used source='decision_journal'."""
