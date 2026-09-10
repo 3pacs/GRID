@@ -146,9 +146,19 @@ jobs:
           set +e
           if [ -f /etc/grid/gemini.env ]; then set -a; . /etc/grid/gemini.env; set +a; fi
           cd "$WORKDIR"
-          extra=""; [ "$YOLO" = "true" ] && extra="--yolo"
+          # Flag set differs by CLI: agy (Antigravity CLI) takes --model/-p/--output-format
+          # and --dangerously-skip-permissions instead of gemini-cli's -m/--yolo.
+          cli_name="$(basename "$RESOLVED_CLI")"
+          if [ "$cli_name" = "agy" ] || [ "$cli_name" = "agy.real" ]; then
+            args=(--model "$MODEL" -p "$PROMPT" --output-format text)
+            [ "$YOLO" = "true" ] && args+=(--dangerously-skip-permissions)
+          else
+            args=(-m "$MODEL")
+            [ "$YOLO" = "true" ] && args+=(--yolo)
+            args+=(-p "$PROMPT")
+          fi
           echo "----- prompt (first 40 lines) -----"; printf '%s\n' "$PROMPT" | head -40; echo "-----"
-          timeout 80m "$RESOLVED_CLI" -m "$MODEL" $extra -p "$PROMPT" > /tmp/gemini_task.log 2>&1
+          timeout 80m "$RESOLVED_CLI" "${args[@]}" > /tmp/gemini_task.log 2>&1
           rc=$?
           echo "exit=$rc"
           tail -c 60000 /tmp/gemini_task.log
