@@ -90,6 +90,7 @@ def compute_calibration(
         FROM oracle_predictions
         WHERE verdict IN ('hit', 'miss', 'partial')
           AND dedup_keep = TRUE
+          AND id NOT LIKE 'astrogrid:%'
     """
     params: dict[str, Any] = {}
 
