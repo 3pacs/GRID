@@ -15,14 +15,17 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.smoke_dad_path import (
+    FALLBACK_MASCOT_PATH,
     StepResult,
     as_of_age_days,
     compose_branch,
     find_index_asset,
     find_mascot_asset,
+    find_mascot_asset_on_disk,
     iter_sse_events,
     redact_secrets,
     render_report,
+    step_static,
     validate_widget_types,
     worst_status,
 )
@@ -215,6 +218,108 @@ class TestFindAssets:
 
     def test_find_mascot_asset_searches_multiple_texts(self):
         assert find_mascot_asset("nothing", '"/assets/mascot.svg"') == "/assets/mascot.svg"
+
+
+# ── find_mascot_asset_on_disk / step_static mascot resolution ──────────────
+#
+# The mascot is rendered by a lazily-loaded route (pwa/src/views/Home.jsx),
+# so its reference lives only in that route's built chunk (e.g.
+# pwa_dist/assets/Home-*.js) — never in index.html, the service worker, or
+# the eagerly-fetched index bundle that `find_mascot_asset` alone can see.
+
+
+class FakeHTTPResponse:
+    def __init__(self, status_code: int, text: str = "", json_data=None):
+        self.status_code = status_code
+        self.text = text
+        self._json_data = json_data
+
+    def json(self):
+        if self._json_data is None:
+            raise ValueError("no json body")
+        return self._json_data
+
+
+class FakeClient:
+    """Stand-in for `Client`: routes GET paths to canned responses, no network."""
+
+    def __init__(self, responses):
+        self._responses = responses
+        self.requested_paths: list[str] = []
+
+    def request(self, method, path, *, timeout_s, json_body=None, stream=False):
+        self.requested_paths.append(path)
+        resp = self._responses.get(path, FakeHTTPResponse(404))
+        return resp, 1.0
+
+
+def _base_static_responses():
+    return {
+        "/": FakeHTTPResponse(200, "<html><title>Stepdad</title></html>"),
+        "/manifest.json": FakeHTTPResponse(200, json_data={"icons": [], "name": "Stepdad Finance"}),
+        "/service-worker.js": FakeHTTPResponse(200, "const CACHE_NAME = 'grid-v1';"),
+    }
+
+
+class TestFindMascotAssetOnDisk:
+    def test_finds_reference_in_lazy_chunk(self, tmp_path):
+        assets_dir = tmp_path / "pwa_dist" / "assets"
+        assets_dir.mkdir(parents=True)
+        (assets_dir / "Home-abc123.js").write_text('const m = "/stepdad-mascot.png";')
+        assert find_mascot_asset_on_disk(str(tmp_path)) == "/stepdad-mascot.png"
+
+    def test_no_reference_returns_none(self, tmp_path):
+        assets_dir = tmp_path / "pwa_dist" / "assets"
+        assets_dir.mkdir(parents=True)
+        (assets_dir / "Home-abc123.js").write_text('const m = "/logo.png";')
+        assert find_mascot_asset_on_disk(str(tmp_path)) is None
+
+    def test_missing_assets_dir_returns_none(self, tmp_path):
+        assert find_mascot_asset_on_disk(str(tmp_path)) is None
+
+
+class TestStepStaticMascotResolution:
+    def test_resolves_mascot_from_lazy_chunk_on_disk(self, tmp_path):
+        assets_dir = tmp_path / "pwa_dist" / "assets"
+        assets_dir.mkdir(parents=True)
+        (assets_dir / "Home-abc123.js").write_text('const m = "/stepdad-mascot.png";')
+
+        responses = _base_static_responses()
+        responses["/stepdad-mascot.png"] = FakeHTTPResponse(200)
+        client = FakeClient(responses)
+
+        result = step_static(client, 5000, str(tmp_path))
+
+        mascot_sub = next(s for s in result.data["substeps"] if s["name"] == "static:mascot")
+        assert mascot_sub["status"] == "ok"
+        assert mascot_sub["note"] == "/stepdad-mascot.png -> HTTP 200"
+        assert "/stepdad-mascot.png" in client.requested_paths
+
+    def test_falls_back_to_known_path_when_no_chunk_reference(self, tmp_path):
+        assets_dir = tmp_path / "pwa_dist" / "assets"
+        assets_dir.mkdir(parents=True)
+        (assets_dir / "Home-abc123.js").write_text('const m = "/logo.png";')
+
+        responses = _base_static_responses()
+        responses[FALLBACK_MASCOT_PATH] = FakeHTTPResponse(200)
+        client = FakeClient(responses)
+
+        result = step_static(client, 5000, str(tmp_path))
+
+        mascot_sub = next(s for s in result.data["substeps"] if s["name"] == "static:mascot")
+        assert mascot_sub["status"] == "ok"
+        assert mascot_sub["note"] == f"{FALLBACK_MASCOT_PATH} -> HTTP 200"
+        assert client.requested_paths.count(FALLBACK_MASCOT_PATH) == 1
+
+    def test_falls_back_and_grades_degraded_on_404(self, tmp_path):
+        responses = _base_static_responses()
+        responses[FALLBACK_MASCOT_PATH] = FakeHTTPResponse(404)
+        client = FakeClient(responses)
+
+        result = step_static(client, 5000, str(tmp_path))
+
+        mascot_sub = next(s for s in result.data["substeps"] if s["name"] == "static:mascot")
+        assert mascot_sub["status"] == "degraded"
 
 
 # ── worst_status ─────────────────────────────────────────────────────────

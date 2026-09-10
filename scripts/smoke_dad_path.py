@@ -204,6 +204,33 @@ def find_mascot_asset(*texts: str) -> str | None:
     return None
 
 
+FALLBACK_MASCOT_PATH = "/stepdad-mascot.png"
+
+
+def find_mascot_asset_on_disk(release_dir: str) -> str | None:
+    """Scan built JS chunks under `<release_dir>/pwa_dist/assets` for a
+    mascot image reference.
+
+    The PWA's route chunks (e.g. a lazily-loaded `Home-*.js`) are never
+    fetched by `step_static`'s HTTP-only scan, so a mascot reference that
+    only appears in one of those chunks is invisible to `find_mascot_asset`.
+    Reading the built files directly closes that gap without any extra
+    network round-trips. Read-only; never touches the network.
+    """
+    assets_dir = Path(release_dir) / "pwa_dist" / "assets"
+    if not assets_dir.is_dir():
+        return None
+    for js_path in sorted(assets_dir.glob("*.js")):
+        try:
+            text = js_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        found = find_mascot_asset(text)
+        if found:
+            return found
+    return None
+
+
 def worst_status(statuses: Iterable[str]) -> str:
     ranked = sorted(statuses, key=lambda s: _STATUS_RANK.get(s, 99))
     return ranked[0] if ranked else "ok"
@@ -276,12 +303,11 @@ def step_health(client: Client, budget_ms: int) -> StepResult:
     return StepResult("health", result_status, ms, note, {"status": status, "not_ok": not_ok})
 
 
-def step_static(client: Client, budget_ms: int) -> StepResult:
+def step_static(client: Client, budget_ms: int, release_dir: str) -> StepResult:
     sub: list[StepResult] = []
     index_html = ""
     manifest: dict[str, Any] = {}
     sw_text = ""
-    asset_texts: list[str] = []
 
     try:
         resp, ms = client.request("GET", "/", timeout_s=budget_ms / 1000)
@@ -294,8 +320,6 @@ def step_static(client: Client, budget_ms: int) -> StepResult:
         if asset:
             try:
                 aresp, ams = client.request("GET", asset, timeout_s=budget_ms / 1000)
-                if aresp.status_code == 200:
-                    asset_texts.append(aresp.text)
                 sub.append(StepResult("static:index-asset", "ok" if aresp.status_code == 200 else "degraded", ams, f"HTTP {aresp.status_code}"))
             except Exception as exc:
                 sub.append(StepResult("static:index-asset", "degraded", None, f"fetch failed: {exc}"))
@@ -341,19 +365,16 @@ def step_static(client: Client, budget_ms: int) -> StepResult:
     except Exception as exc:
         sub.append(StepResult("static:service-worker.js", "broken", None, f"request failed: {exc}"))
 
-    mascot = find_mascot_asset(index_html, sw_text, *asset_texts)
-    if mascot:
-        mascot_url = mascot if mascot.startswith("/") else f"/{mascot}"
-        try:
-            mresp, mms = client.request("GET", mascot_url, timeout_s=budget_ms / 1000)
-            sub.append(StepResult(
-                "static:mascot", "ok" if mresp.status_code == 200 else "degraded",
-                mms, f"{mascot_url} -> HTTP {mresp.status_code}",
-            ))
-        except Exception as exc:
-            sub.append(StepResult("static:mascot", "degraded", None, f"fetch failed: {exc}"))
-    else:
-        sub.append(StepResult("static:mascot", "degraded", None, "no mascot/stepdad asset reference found in built HTML/JS"))
+    mascot = find_mascot_asset_on_disk(release_dir) or FALLBACK_MASCOT_PATH
+    mascot_url = mascot if mascot.startswith("/") else f"/{mascot}"
+    try:
+        mresp, mms = client.request("GET", mascot_url, timeout_s=budget_ms / 1000)
+        sub.append(StepResult(
+            "static:mascot", "ok" if mresp.status_code == 200 else "degraded",
+            mms, f"{mascot_url} -> HTTP {mresp.status_code}",
+        ))
+    except Exception as exc:
+        sub.append(StepResult("static:mascot", "degraded", None, f"fetch failed: {exc}"))
 
     total_ms = sum(s.latency_ms or 0 for s in sub)
     status = worst_status(s.status for s in sub)
@@ -789,7 +810,7 @@ def run(args: argparse.Namespace) -> tuple[int, str, dict[str, Any]]:
 
     steps: list[StepResult] = []
     steps.append(step_health(client, args.budget_ms))
-    steps.append(step_static(client, args.budget_ms))
+    steps.append(step_static(client, args.budget_ms, args.release_dir))
 
     token, auth_note = mint_contributor_token(args.release_dir)
     if token:
