@@ -232,8 +232,11 @@ function NewsCard({ title }) {
 
 function MoneyFlowCard({ title }) {
     const { loading, error, data, reload } = useFetch(() => api.getSectorFlows(), []);
-    const sectors = data?.sectors || [];
-    const ranked = [...sectors]
+    const sectors = data?.sectors || {};
+    const sectorEntries = Object.entries(sectors);
+    const warming = Boolean(data?.unavailable) || (sectorEntries.length === 0 && Boolean(data?.stale));
+    const ranked = sectorEntries
+        .map(([key, s]) => ({ ...s, name: s?.name || s?.sector || key }))
         .filter((s) => typeof s?.sector_stress === 'number')
         .sort((a, b) => Math.abs(b.sector_stress) - Math.abs(a.sector_stress))
         .slice(0, 6);
@@ -241,24 +244,25 @@ function MoneyFlowCard({ title }) {
         <Shell title={title || 'Where attention is going'}>
             {loading && <Loading />}
             {error && <ErrorState msg={warmError()} onRetry={reload} />}
-            {data && (ranked.length === 0
-                ? <Empty msg="Nothing notable moving right now." />
-                : (
-                    <div style={CS.col}>
-                        {ranked.map((s, i) => {
-                            const name = s.name || s.sector || s.etf || `Group ${i + 1}`;
-                            const inflow = s.sector_stress >= 0;
-                            return (
-                                <div key={i} style={CS.flowRow}>
-                                    <span style={CS.flowName}>{String(name).replace(/_/g, ' ')}</span>
-                                    <span style={{ ...CS.flowWord, color: inflow ? colors.green : colors.red }}>
-                                        {inflow ? '▲ money coming in' : '▼ money pulling out'}
-                                    </span>
-                                </div>
-                            );
-                        })}
-                    </div>
-                ))}
+            {data && (warming
+                ? <Empty msg="Money-flow data is still warming up. Try again in a minute." />
+                : (ranked.length === 0
+                    ? <Empty msg="Nothing notable moving right now." />
+                    : (
+                        <div style={CS.col}>
+                            {ranked.map((s, i) => {
+                                const inflow = s.sector_stress >= 0;
+                                return (
+                                    <div key={i} style={CS.flowRow}>
+                                        <span style={CS.flowName}>{String(s.name).replace(/_/g, ' ')}</span>
+                                        <span style={{ ...CS.flowWord, color: inflow ? colors.green : colors.red }}>
+                                            {inflow ? '▲ money coming in' : '▼ money pulling out'}
+                                        </span>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    )))}
         </Shell>
     );
 }
