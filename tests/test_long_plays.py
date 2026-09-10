@@ -650,7 +650,7 @@ def test_daily_digest_has_a_guarded_long_plays_section() -> None:
     src = _read("alerts/email.py")
     i_def = src.index("def daily_digest")
     block = src[i_def : src.index("def _section_code_block")]
-    assert "from intelligence.long_plays import load_latest_board" in block
+    assert "from intelligence.long_plays import entry_first, load_latest_board" in block
     assert '"Long plays"' in block
     assert "not forecasts" in block
 

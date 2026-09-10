@@ -53,16 +53,42 @@ Stance (``classify_stance``)
        ``trial_strength_score >= 0.6``;
     2. max drawdown over the chart window shallower than -75 %
        (drawdown is stored as a signed negative fraction: -0.62 = -62 %);
-    3. the latest sweep verdict for the ticker is ``high`` or ``moderate``
-       (the coverage-gated stack agrees), OR the ticker has no sweep
-       coverage AND ``options_asymmetry.max_payoff_multiple >= 20``.
+    3. the coverage gate passes by one of three routes (below).
 * ``avoid`` if p10 3y multiple < 0.25 and there is no catalyst at all.
 * otherwise ``watch``.
+
+Coverage routes (``coverage_route`` on every board row)
+-------------------------------------------------------
+The coverage gate asks one question — *does an independent surface agree
+this name is worth an entry?* — and answers it by one of three routes.
+The route that answered is recorded on the row so the digest can say why
+a name qualified.
+
+* ``sweep`` — the ticker is in the latest persisted 90 d sweep and its
+  verdict is high/medium (``universe_ranking_history``). **Sweep coverage
+  is authoritative**: a ticker the sweep covered with a weaker verdict
+  cannot be rescued by the other two routes — the coverage-gated stack
+  looked at it and said no.
+* ``options`` — the ticker has no sweep coverage and
+  ``options_asymmetry.max_payoff_multiple >= 20``.
+* ``trial`` — the ticker has no sweep coverage and no options depth (the
+  normal case for a sub-$2 B trial gem) but the trial surface is live on
+  it: a ``trial_signals`` row inside 30 days with signal BUY or
+  WATCHLIST, ``cash_runway_score >= 0.4`` (the unit score, not months),
+  and a catalyst inside 18 months. Route added 2026-09-10 — before it,
+  the gate was unreachable for exactly the small caps this board exists
+  to surface: they are never in the sweep's playbook universe and rarely
+  have listed options depth.
+
+The return and drawdown gates are unchanged by the route.
 
 Public API
 ----------
 ``build_long_plays_board(engine, *, as_of=None, horizons_years=(1, 3, 5), top_k=25)``
-``classify_stance(...)``, ``asymmetry_score(...)``, ``multiple_math(...)``
+``long_plays_universe(engine, *, as_of=None)`` — the ticker pool the board
+scores, exported so the weekly 90 d sweep can cover the same names.
+``classify_stance(...)``, ``evaluate_gate(...)``, ``coverage_route(...)``,
+``trial_route_qualifies(...)``, ``asymmetry_score(...)``, ``multiple_math(...)``
 ``ensure_long_plays_table(engine)``, ``persist_board(engine, board)``,
 ``load_latest_board(engine)``
 """
@@ -116,7 +142,22 @@ ENTRY_P50_3Y_MULTIPLE: float = 1.5
 ENTRY_MAX_DRAWDOWN: float = -0.75
 ENTRY_OPTIONS_PAYOFF_MULTIPLE: float = 20.0
 AVOID_P10_3Y_MULTIPLE: float = 0.25
-ENTRY_SWEEP_VERDICTS: frozenset[str] = frozenset({"high", "moderate"})
+# ``intelligence/universe_ranker.py`` is the only producer of sweep verdicts
+# and its vocabulary is ("no_trade", "low", "medium", "high") — "moderate"
+# was never written by anything. Until 2026-09-10 this set spelled the
+# passing tier "moderate", so a ticker the sweep ranked *medium* silently
+# failed the coverage gate. Both spellings are accepted; "medium" is canonical.
+ENTRY_SWEEP_VERDICTS: frozenset[str] = frozenset({"high", "medium", "moderate"})
+
+# Trial coverage route (2026-09-10).
+TRIAL_ROUTE_LOOKBACK_DAYS: int = 30
+TRIAL_ROUTE_SIGNALS: frozenset[str] = frozenset({"BUY", "WATCHLIST"})
+TRIAL_ROUTE_MIN_RUNWAY_SCORE: float = 0.4
+TRIAL_ROUTE_CATALYST_MAX_DAYS: int = 548  # 18 months
+
+COVERAGE_ROUTE_SWEEP: str = "sweep"
+COVERAGE_ROUTE_OPTIONS: str = "options"
+COVERAGE_ROUTE_TRIAL: str = "trial"
 
 STANCE_ENTRY: str = "entry_candidate"
 STANCE_WATCH: str = "watch"
@@ -193,6 +234,123 @@ def asymmetry_score(
     return round(clamp(score), 4)
 
 
+def trial_route_qualifies(
+    *,
+    signal_type: str | None,
+    signal_age_days: float | None,
+    cash_runway_score: float | None,
+    catalyst_days_out: float | None,
+) -> bool:
+    """The ``trial`` coverage route: is the trial surface live on this name?
+
+    All four must hold:
+
+    * ``signal_type`` is BUY or WATCHLIST (AVOID and anything else fail);
+    * the signal is at most ``TRIAL_ROUTE_LOOKBACK_DAYS`` old and not
+      stamped in the future relative to the board's ``as_of``;
+    * ``cash_runway_score >= 0.4`` — the **unit** score written by
+      ``grid/signals/trial_signal.py`` (``min(1, months / 24)``), never
+      a month count;
+    * a catalyst falls inside ``TRIAL_ROUTE_CATALYST_MAX_DAYS`` (18 months)
+      and is not in the past.
+
+    A missing input fails the route: no runway score means the runway is
+    unknown, not acceptable.
+    """
+    signal = (signal_type or "").strip().upper()
+    if signal not in TRIAL_ROUTE_SIGNALS:
+        return False
+    age = _finite(signal_age_days)
+    if age is None or age < 0 or age > TRIAL_ROUTE_LOOKBACK_DAYS:
+        return False
+    runway = _finite(cash_runway_score)
+    if runway is None or runway < TRIAL_ROUTE_MIN_RUNWAY_SCORE:
+        return False
+    days_out = _finite(catalyst_days_out)
+    if days_out is None or days_out < 0 or days_out > TRIAL_ROUTE_CATALYST_MAX_DAYS:
+        return False
+    return True
+
+
+def coverage_route(
+    *,
+    sweep_verdict: str | None,
+    has_sweep_coverage: bool,
+    options_payoff_multiple: float | None = None,
+    has_trial_route: bool = False,
+) -> str | None:
+    """Which coverage route passes, or ``None`` when the gate fails.
+
+    Sweep coverage is authoritative: when the ticker is in the latest
+    sweep, only its verdict decides — the options and trial routes cannot
+    rescue a name the coverage-gated stack already looked at and ranked
+    below high/medium.
+    """
+    if has_sweep_coverage:
+        verdict = (sweep_verdict or "").strip().lower()
+        return COVERAGE_ROUTE_SWEEP if verdict in ENTRY_SWEEP_VERDICTS else None
+    payoff = _finite(options_payoff_multiple)
+    if payoff is not None and payoff >= ENTRY_OPTIONS_PAYOFF_MULTIPLE:
+        return COVERAGE_ROUTE_OPTIONS
+    if has_trial_route:
+        return COVERAGE_ROUTE_TRIAL
+    return None
+
+
+def evaluate_gate(
+    *,
+    p50_3y_multiple: float | None,
+    p10_3y_multiple: float | None,
+    max_drawdown: float | None,
+    sweep_verdict: str | None,
+    has_sweep_coverage: bool,
+    catalyst_strength_12m: float | None = None,
+    options_payoff_multiple: float | None = None,
+    has_catalyst: bool = False,
+    has_trial_route: bool = False,
+) -> dict[str, Any]:
+    """The whole stance rule as data: the three gates, the route, the stance.
+
+    ``max_drawdown`` is the signed drawdown of the chart window
+    (``-0.62`` means a 62 % peak-to-trough loss). A missing chart
+    (``None``) fails the drawdown gate — a name with no price history
+    cannot be an entry candidate on this board.
+
+    Returns ``{"stance", "return_gate", "drawdown_gate", "coverage_gate",
+    "coverage_route"}``. ``classify_stance`` is the ``stance`` field of
+    this; both are pure.
+    """
+    p50 = _finite(p50_3y_multiple)
+    p10 = _finite(p10_3y_multiple)
+    drawdown = _finite(max_drawdown)
+    strength_12m = _finite(catalyst_strength_12m)
+
+    catalyst_override = strength_12m is not None and strength_12m >= CATALYST_OVERRIDE_STRENGTH
+    return_gate = (p50 is not None and p50 > ENTRY_P50_3Y_MULTIPLE) or catalyst_override
+    drawdown_gate = drawdown is not None and drawdown > ENTRY_MAX_DRAWDOWN
+    route = coverage_route(
+        sweep_verdict=sweep_verdict,
+        has_sweep_coverage=has_sweep_coverage,
+        options_payoff_multiple=options_payoff_multiple,
+        has_trial_route=has_trial_route,
+    )
+
+    if return_gate and drawdown_gate and route is not None:
+        stance = STANCE_ENTRY
+    elif p10 is not None and p10 < AVOID_P10_3Y_MULTIPLE and not has_catalyst:
+        stance = STANCE_AVOID
+    else:
+        stance = STANCE_WATCH
+
+    return {
+        "stance": stance,
+        "return_gate": return_gate,
+        "drawdown_gate": drawdown_gate,
+        "coverage_gate": route is not None,
+        "coverage_route": route,
+    }
+
+
 def classify_stance(
     *,
     p50_3y_multiple: float | None,
@@ -203,34 +361,22 @@ def classify_stance(
     catalyst_strength_12m: float | None = None,
     options_payoff_multiple: float | None = None,
     has_catalyst: bool = False,
+    has_trial_route: bool = False,
 ) -> str:
-    """Pure stance rule (documented in the module docstring).
-
-    ``max_drawdown`` is the signed drawdown of the chart window
-    (``-0.62`` means a 62 % peak-to-trough loss). A missing chart
-    (``None``) fails the drawdown gate — a name with no price history
-    cannot be an entry candidate on this board.
-    """
-    p50 = _finite(p50_3y_multiple)
-    p10 = _finite(p10_3y_multiple)
-    drawdown = _finite(max_drawdown)
-    strength_12m = _finite(catalyst_strength_12m)
-    payoff = _finite(options_payoff_multiple)
-    verdict = (sweep_verdict or "").strip().lower() or None
-
-    catalyst_override = strength_12m is not None and strength_12m >= CATALYST_OVERRIDE_STRENGTH
-    return_gate = (p50 is not None and p50 > ENTRY_P50_3Y_MULTIPLE) or catalyst_override
-    drawdown_gate = drawdown is not None and drawdown > ENTRY_MAX_DRAWDOWN
-    if has_sweep_coverage:
-        coverage_gate = verdict in ENTRY_SWEEP_VERDICTS
-    else:
-        coverage_gate = payoff is not None and payoff >= ENTRY_OPTIONS_PAYOFF_MULTIPLE
-
-    if return_gate and drawdown_gate and coverage_gate:
-        return STANCE_ENTRY
-    if p10 is not None and p10 < AVOID_P10_3Y_MULTIPLE and not has_catalyst:
-        return STANCE_AVOID
-    return STANCE_WATCH
+    """Pure stance rule (documented in the module docstring)."""
+    return str(
+        evaluate_gate(
+            p50_3y_multiple=p50_3y_multiple,
+            p10_3y_multiple=p10_3y_multiple,
+            max_drawdown=max_drawdown,
+            sweep_verdict=sweep_verdict,
+            has_sweep_coverage=has_sweep_coverage,
+            catalyst_strength_12m=catalyst_strength_12m,
+            options_payoff_multiple=options_payoff_multiple,
+            has_catalyst=has_catalyst,
+            has_trial_route=has_trial_route,
+        )["stance"]
+    )
 
 
 def _years_to_multiple(cagr: float | None, target_multiple: float = 10.0) -> float | None:
@@ -303,6 +449,45 @@ def _what_must_be_true(math_block: dict[str, Any]) -> str:
     return f"{head}; {tail}."
 
 
+def _next_catalyst(
+    catalysts: Sequence[dict[str, Any]],
+    trial_meta: dict[str, Any] | None,
+    as_of: date,
+) -> tuple[float | None, str | None]:
+    """Nearest catalyst as ``(days_out, iso_date)``; ``(None, None)`` when none.
+
+    ``upcoming_catalysts`` (the ``catalyst_calendar`` join) is the primary
+    source. Its coverage is thinner than ``trial_signals``, so a trial's
+    own ``primary_completion_date`` is the fallback — for a Phase 2/3
+    name that date *is* the readout the board cares about.
+    """
+    best_days: float | None = None
+    best_date: str | None = None
+    for event in catalysts:
+        days = _finite(event.get("days_out"))
+        if days is None or days < 0:
+            continue
+        if best_days is None or days < best_days:
+            best_days = days
+            best_date = event.get("expected_date")
+    if best_days is not None:
+        return best_days, best_date
+
+    completion = (trial_meta or {}).get("primary_completion_date")
+    if not completion:
+        return None, None
+    try:
+        completion_date = (
+            completion if isinstance(completion, date) else date.fromisoformat(str(completion))
+        )
+    except (TypeError, ValueError):
+        return None, None
+    days = float((completion_date - as_of).days)
+    if days < 0:
+        return None, None
+    return days, completion_date.isoformat()
+
+
 def _why(
     *,
     themes: Sequence[str],
@@ -312,6 +497,7 @@ def _why(
     options: dict[str, Any] | None,
     catalysts: Sequence[dict[str, Any]],
     runway_months: float | None = None,
+    coverage_route: str | None = None,
 ) -> str:
     """Two-sentence rationale: tailwind, multiple math, coverage gate (+ runway when known)."""
     if themes:
@@ -341,6 +527,9 @@ def _why(
         gate_bits.append(
             f"next catalyst {first.get('event_type')} in {first.get('days_out')} d"
         )
+    gate_bits.append(
+        f"route {coverage_route}" if coverage_route else "no coverage route passes"
+    )
     return f"Tailwind: {tailwind}. Multiple math: {math_part}; coverage gate: {'; '.join(gate_bits)}."
 
 
@@ -416,7 +605,9 @@ _CATALYSTS_SQL = text(
 
 _TRIAL_TICKERS_SQL = text(
     """
-    SELECT DISTINCT ON (ticker) ticker, company_name, primary_indication, market_cap_mm
+    SELECT DISTINCT ON (ticker) ticker, company_name, primary_indication, market_cap_mm,
+           signal_type, cash_runway_score, cash_runway_months, trial_strength_score,
+           primary_completion_date, created_at
     FROM trial_signals
     WHERE created_at >= :start
       AND created_at <= :as_of_ts
@@ -604,21 +795,48 @@ def _load_catalysts(engine: Engine, as_of: date) -> dict[str, list[dict[str, Any
 
 
 def _load_trial_tickers(engine: Engine, as_of: date) -> dict[str, dict[str, Any]]:
-    """Tickers with a ``trial_signals`` row in the last 180 days (latest row each)."""
-    start = _as_of_timestamp(as_of) - timedelta(days=TRIAL_LOOKBACK_DAYS)
+    """Tickers with a ``trial_signals`` row in the last 180 days (latest row each).
+
+    The 180-day window is universe membership. The ``trial`` coverage
+    route is stricter and reads ``signal_age_days`` (computed here from
+    ``created_at``) against ``TRIAL_ROUTE_LOOKBACK_DAYS`` — one query
+    serves both. ``cash_runway_score`` is the unit score (0..1);
+    ``cash_runway_months`` is the raw month count and is never used as
+    the score.
+    """
+    as_of_ts = _as_of_timestamp(as_of)
+    start = as_of_ts - timedelta(days=TRIAL_LOOKBACK_DAYS)
     with engine.connect() as conn:
         rows = conn.execute(
-            _TRIAL_TICKERS_SQL, {"start": start, "as_of_ts": _as_of_timestamp(as_of)}
+            _TRIAL_TICKERS_SQL, {"start": start, "as_of_ts": as_of_ts}
         ).fetchall()
     out: dict[str, dict[str, Any]] = {}
     for row in rows:
         ticker = _normalize_ticker(row[0])
-        if ticker:
-            out[ticker] = {
-                "company_name": row[1],
-                "primary_indication": row[2],
-                "market_cap_mm": _finite(row[3]),
-            }
+        if not ticker:
+            continue
+        completion = row[8]
+        completion_date = completion.date() if isinstance(completion, datetime) else completion
+        age_days: float | None = None
+        created = row[9]
+        if created is not None:
+            try:
+                age_days = (as_of_ts - _parse_iso_datetime(created)).total_seconds() / 86400.0
+            except (TypeError, ValueError):
+                age_days = None
+        out[ticker] = {
+            "company_name": row[1],
+            "primary_indication": row[2],
+            "market_cap_mm": _finite(row[3]),
+            "signal_type": (str(row[4]).strip().upper() if row[4] else None),
+            "cash_runway_score": _finite(row[5]),
+            "cash_runway_months": _finite(row[6]),
+            "trial_strength_score": _finite(row[7]),
+            "primary_completion_date": (
+                completion_date.isoformat() if hasattr(completion_date, "isoformat") else completion_date
+            ),
+            "signal_age_days": round(age_days, 2) if age_days is not None else None,
+        }
     return out
 
 
@@ -866,6 +1084,22 @@ def build_universe(
     return tickers, trial_meta, catalysts, options
 
 
+def long_plays_universe(engine: Engine, *, as_of: date | None = None) -> list[str]:
+    """The ticker pool this board scores — trial gems and enriched small caps included.
+
+    The weekly 90 d sweep (``intelligence/scheduler.py``) ran over the
+    edge scanner's playbook universe only, so the names this board exists
+    to surface could never earn sweep coverage. The sweep unions this
+    pool in; keeping the definition here means the two universes cannot
+    drift apart. Never raises — a failing source drops out of the union.
+    """
+    as_of = as_of or date.today()
+    notes: list[str] = []
+    profiles = _safe("company_profiles", lambda: _load_company_profiles(engine, as_of), notes, {})
+    tickers, _, _, _ = build_universe(engine, as_of=as_of, notes=notes, profiles=profiles)
+    return tickers
+
+
 def _candidate(
     ticker: str,
     *,
@@ -984,8 +1218,16 @@ def _candidate(
         if days_out is not None and days_out <= CATALYST_OVERRIDE_DAYS:
             strength_12m = strength if strength_12m is None else max(strength_12m, strength)
 
+    next_catalyst_days, next_catalyst_date = _next_catalyst(catalysts, trial_meta, as_of)
+    trial_route = trial_route_qualifies(
+        signal_type=(trial_meta or {}).get("signal_type"),
+        signal_age_days=(trial_meta or {}).get("signal_age_days"),
+        cash_runway_score=(trial_meta or {}).get("cash_runway_score"),
+        catalyst_days_out=next_catalyst_days,
+    )
+
     payoff = (options or {}).get("max_payoff_multiple") if options else None
-    stance = classify_stance(
+    gate = evaluate_gate(
         p50_3y_multiple=p50_3y,
         p10_3y_multiple=p10_3y,
         max_drawdown=(chart or {}).get("max_drawdown") if chart else None,
@@ -994,7 +1236,15 @@ def _candidate(
         catalyst_strength_12m=strength_12m,
         options_payoff_multiple=payoff,
         has_catalyst=bool(catalysts),
+        has_trial_route=trial_route,
     )
+    stance = gate["stance"]
+    # Runway months: the enriched profile is the richer source; the trial
+    # signal's own snapshot is the fallback for names with no profile yet.
+    runway_months = _finite(fundamentals.get("cash_runway_months"))
+    if runway_months is None:
+        runway_months = (trial_meta or {}).get("cash_runway_months")
+        fundamentals["cash_runway_months"] = runway_months
     score = asymmetry_score(
         p90_3y_multiple=p90_3y,
         catalyst_strength=strength_any,
@@ -1027,6 +1277,23 @@ def _candidate(
         "realized_alpha_context": realized_alpha,
         "asymmetry_score": score,
         "stance": stance,
+        "coverage_route": gate["coverage_route"],
+        "trial_signal": trial_meta or None,
+        # Why this row is (or is not) an entry candidate, plus the facts an
+        # entry candidate is judged on: cap is ``market_cap_usd`` above and
+        # the multiples are in ``projection``/``multiple_math``.
+        "gate": {
+            "return_gate": gate["return_gate"],
+            "drawdown_gate": gate["drawdown_gate"],
+            "coverage_gate": gate["coverage_gate"],
+            "coverage_route": gate["coverage_route"],
+            "cash_runway_months": runway_months,
+            "next_catalyst_date": next_catalyst_date,
+            "next_catalyst_days_out": next_catalyst_days,
+            "p50_3y_multiple": p50_3y,
+            "p90_3y_multiple": p90_3y,
+            "max_drawdown": (chart or {}).get("max_drawdown") if chart else None,
+        },
         "why": _why(
             themes=themes,
             thesis_sources=thesis_sources,
@@ -1034,7 +1301,8 @@ def _candidate(
             sweep=sweep,
             options=options,
             catalysts=catalysts,
-            runway_months=fundamentals.get("cash_runway_months"),
+            runway_months=runway_months,
+            coverage_route=gate["coverage_route"],
         ),
         "what_must_be_true_for_10x": _what_must_be_true(math_block),
     }
@@ -1049,7 +1317,10 @@ def build_long_plays_board(
 ) -> dict[str, Any]:
     """Compose the multi-year board (shape documented in the module docstring).
 
-    Sorted by ``asymmetry_score`` descending, truncated to ``top_k``.
+    Sorted by ``asymmetry_score`` descending, truncated to ``top_k`` —
+    except that an ``entry_candidate`` ranking below the cut is kept
+    anyway (a name that cleared all three gates is never dropped for a
+    higher-scoring ``watch``).
     ``stand_down_reason`` is set when no candidate reaches
     ``entry_candidate``. Every source read is wrapped so a failing table
     degrades its field to ``None`` and adds a ``method_notes`` line.
@@ -1064,6 +1335,12 @@ def build_long_plays_board(
         "multiple_math: arithmetic on the proxy projection and latest market cap; not a forecast",
         f"prices: PIT cut-off as_of={as_of.isoformat()} on every read (resolved_series via PITStore, raw_series via pull_timestamp)",
         "sweep coverage: only the persisted top_k of the latest 90 d sweep is visible; names outside it count as uncovered",
+        (
+            f"coverage routes: sweep (verdict high/medium) is authoritative when present; otherwise "
+            f"options (payoff >= {ENTRY_OPTIONS_PAYOFF_MULTIPLE:.0f}x) or trial (BUY/WATCHLIST inside "
+            f"{TRIAL_ROUTE_LOOKBACK_DAYS} d, cash_runway_score >= {TRIAL_ROUTE_MIN_RUNWAY_SCORE}, "
+            f"catalyst inside {TRIAL_ROUTE_CATALYST_MAX_DAYS} d)"
+        ),
     ]
 
     profiles = _safe("company_profiles", lambda: _load_company_profiles(engine, as_of), notes, {})
@@ -1116,18 +1393,39 @@ def build_long_plays_board(
             notes.append(f"{ticker}: candidate assembly failed ({type(exc).__name__}); skipped")
 
     candidates.sort(key=lambda c: (-float(c.get("asymmetry_score") or 0.0), c["ticker"]))
+    # top_k by asymmetry score, plus every entry candidate that ranked below
+    # the cut. Truncating on score alone can drop a name that cleared all
+    # three gates in favour of a higher-scoring "watch", and the board would
+    # then report zero entry candidates while one exists — the operator must
+    # see everything that passed the gate. Ordering stays by score.
     board_candidates = candidates[:top_k]
+    overflow_entries = [c for c in candidates[top_k:] if c["stance"] == STANCE_ENTRY]
+    if overflow_entries:
+        board_candidates = board_candidates + overflow_entries
+        board_candidates.sort(key=lambda c: (-float(c.get("asymmetry_score") or 0.0), c["ticker"]))
+        notes.append(
+            f"board: +{len(overflow_entries)} entry candidate(s) kept past top_k={top_k} "
+            "(a gated name is never truncated away by score)"
+        )
     n_entry = sum(1 for c in board_candidates if c["stance"] == STANCE_ENTRY)
     stand_down_reason: str | None = None
     if n_entry == 0:
         if not board_candidates:
             stand_down_reason = "no candidates: universe empty or every source unavailable"
         else:
+            failed = {"return_gate": 0, "drawdown_gate": 0, "coverage_gate": 0}
+            for cand in board_candidates:
+                for key in failed:
+                    if not (cand.get("gate") or {}).get(key):
+                        failed[key] += 1
             stand_down_reason = (
                 f"no entry candidates among {len(board_candidates)}: none clears p50 3y multiple > "
                 f"{ENTRY_P50_3Y_MULTIPLE} (or a >= {CATALYST_OVERRIDE_STRENGTH} catalyst inside 12 months), "
-                f"drawdown shallower than {ENTRY_MAX_DRAWDOWN:.0%}, and sweep high/moderate "
-                f"(or uncovered with options payoff >= {ENTRY_OPTIONS_PAYOFF_MULTIPLE:.0f}x) together"
+                f"drawdown shallower than {ENTRY_MAX_DRAWDOWN:.0%}, and a coverage route "
+                f"(sweep high/medium, or uncovered with options payoff >= "
+                f"{ENTRY_OPTIONS_PAYOFF_MULTIPLE:.0f}x, or a live trial signal) together. "
+                f"Failing: return {failed['return_gate']}, drawdown {failed['drawdown_gate']}, "
+                f"coverage {failed['coverage_gate']}"
             )
 
     return {
@@ -1137,9 +1435,44 @@ def build_long_plays_board(
         "universe_size": len(tickers),
         "candidates": board_candidates,
         "entry_candidates": n_entry,
+        "entry_candidates_by_route": _route_counts(board_candidates),
         "stand_down_reason": stand_down_reason,
         "method_notes": notes,
     }
+
+
+def entry_first(candidates: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Board rows with ``entry_candidate`` first, then by asymmetry score.
+
+    The board itself stays sorted by ``asymmetry_score`` (that ordering is
+    the ranking). Digests read for "what can I act on", where a name that
+    cleared the gate outranks a higher-scoring name that did not — so both
+    digest surfaces sort through here rather than each rolling their own.
+    """
+
+    def _score(cand: dict[str, Any]) -> float:
+        return _finite(cand.get("asymmetry_score")) or 0.0
+
+    return sorted(
+        (c for c in candidates if isinstance(c, dict)),
+        key=lambda c: (
+            0 if c.get("stance") == STANCE_ENTRY else 1,
+            -_score(c),
+            str(c.get("ticker") or ""),
+        ),
+    )
+
+
+def _route_counts(candidates: Sequence[dict[str, Any]]) -> dict[str, int]:
+    """Entry candidates per coverage route (``sweep``/``options``/``trial``)."""
+    counts = {COVERAGE_ROUTE_SWEEP: 0, COVERAGE_ROUTE_OPTIONS: 0, COVERAGE_ROUTE_TRIAL: 0}
+    for cand in candidates:
+        if not isinstance(cand, dict) or cand.get("stance") != STANCE_ENTRY:
+            continue
+        route = cand.get("coverage_route")
+        if route in counts:
+            counts[route] += 1
+    return counts
 
 
 # ── Persistence ───────────────────────────────────────────────────────────
@@ -1249,6 +1582,9 @@ def _board_row_to_dict(row: Any) -> dict[str, Any]:
         "universe_size": int(row[3] or 0),
         "candidates": candidates,
         "entry_candidates": sum(1 for c in candidates if isinstance(c, dict) and c.get("stance") == STANCE_ENTRY),
+        "entry_candidates_by_route": _route_counts(
+            [c for c in candidates if isinstance(c, dict)]
+        ),
         "stand_down_reason": row[5],
         "method_notes": _j(row[6], []),
     }

@@ -321,28 +321,48 @@ def run_intelligence_loop() -> None:
         The long-horizon stack (edge-scanner playbooks → ``should_i_trade``
         with the coverage-gated conviction stack) existed but nothing ran
         it, and the oracle only ever wrote ~35-day predictions. This sweep
-        runs ``rank_universe`` at 90 days over the edge scanner's playbook
-        universe and persists the report to ``universe_ranking_history``
-        so multi-month verdicts accumulate a track record.
+        runs ``rank_universe`` at 90 days and persists the report to
+        ``universe_ranking_history`` so multi-month verdicts accumulate a
+        track record.
+
+        Universe (2026-09-10): the edge scanner's playbook pool — 33
+        mid/large caps — **plus** the Long Plays pool
+        (``intelligence.long_plays.long_plays_universe``: trial gems,
+        catalyst names and enriched sub-$2 B small caps). The two had
+        drifted apart, so the names the Long Plays board exists to
+        surface could never earn sweep coverage: the board's coverage
+        gate asked the sweep about tickers the sweep had never scored.
         """
         try:
             from db import get_engine as _ge
+            from intelligence.long_plays import long_plays_universe
             from intelligence.market_edge_scanner import TARGET_UNIVERSE
             from intelligence.universe_ranker import persist_ranking, rank_universe
 
             engine = _ge()
+            playbook_pool = {str(t).strip().upper() for t in TARGET_UNIVERSE if t}
+            try:
+                board_pool = {str(t).strip().upper() for t in long_plays_universe(engine) if t}
+            except Exception as exc:  # noqa: BLE001
+                log.warning("long-horizon sweep: long_plays_universe unavailable: {e}", e=str(exc))
+                board_pool = set()
+            universe = sorted(playbook_pool | board_pool)
+
             report = rank_universe(
                 engine,
-                list(TARGET_UNIVERSE),
+                universe,
                 horizon_days=90,
                 parallel=True,
                 top_k=25,
             )
             row_id = persist_ranking(engine, report)
             log.info(
-                "long-horizon sweep: {s}/{a} tickers, regime={r}, top={t}, row={row}",
+                "long-horizon sweep: {s}/{a} tickers ({p} playbook + {b} long-plays), "
+                "regime={r}, verdicts={v}, top={t}, row={row}",
                 s=report.tickers_succeeded, a=report.tickers_attempted,
+                p=len(playbook_pool), b=len(board_pool - playbook_pool),
                 r=report.regime_signature,
+                v=report.verdict_counts,
                 t=[x.ticker for x in report.top_k[:5]],
                 row=row_id,
             )
