@@ -141,3 +141,75 @@ Installed via `bash scripts/setup_cron.sh`:
 - **06:30 weekdays** — AI analyst daily report
 - **07:00 Monday** — Weekly market briefing
 - **17:00 weekdays** — [[TradingAgents]] (if enabled)
+
+## Alien Runner (Self-Hosted CI, Dell Precision 5810)
+
+`alien` is a second GitHub Actions self-hosted runner, separate from `grid-svr`.
+It runs only the test lane (`test.yml`: Lint, Backend Tests, Frontend Build) so
+CI stops paying the ~10-minute `ubuntu-latest` pip-install / Postgres-pull tax
+on every PR, and so a `grid-svr` runner stall (it has stalled before — see
+`00-COMMON.md`) doesn't take out CI too. It never gets deploy credentials —
+`deploy.yml`, `ops-exec.yml`, and `gemini-task.yml` stay pinned to
+`[self-hosted, grid-svr]`.
+
+Workflow jobs opt in via the `TEST_RUNNER` repository variable (Settings →
+Secrets and variables → Actions → Variables): when set to any non-empty value,
+`test.yml` targets `[self-hosted, alien, tests]`; when unset, jobs fall back to
+`ubuntu-latest` so CI never blocks on the Dell being offline.
+
+### One-time setup (run as the operator, on alien)
+
+```bash
+# 1. PostgreSQL 15 + TimescaleDB — persistent, not a per-run container.
+#    The test job resets the schema (DROP SCHEMA public CASCADE; CREATE SCHEMA
+#    public) instead of spinning up a fresh instance every run.
+sudo apt-get update
+sudo sh -c "echo 'deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main' > /etc/apt/sources.list.d/pgdg.list"
+curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+sudo apt-get update && sudo apt-get install -y postgresql-15 postgresql-15-timescaledb
+sudo timescaledb-tune --quiet --yes
+sudo systemctl enable --now postgresql
+sudo -u postgres psql -c "CREATE ROLE grid LOGIN PASSWORD 'testpass';"
+sudo -u postgres psql -c "CREATE DATABASE griddb_test OWNER grid;"
+sudo -u postgres psql -d griddb_test -c "CREATE EXTENSION IF NOT EXISTS timescaledb;"
+# matches the DB_URL the CI job already uses:
+# postgresql://grid:testpass@localhost:5432/griddb_test
+
+# 2. Python 3.11 + Node 20
+sudo apt-get install -y software-properties-common
+sudo add-apt-repository -y ppa:deadsnakes/ppa && sudo apt-get update
+sudo apt-get install -y python3.11 python3.11-venv python3.11-dev
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt-get install -y nodejs
+
+# 3. GitHub Actions runner — get a fresh download URL and registration token
+#    from https://github.com/3pacs/GRID/settings/actions/runners/new (token
+#    is single-use and expires in ~1 hour, so pull both values at install
+#    time rather than hardcoding them here).
+mkdir -p ~/actions-runner && cd ~/actions-runner
+curl -o actions-runner-linux-x64.tar.gz -L <DOWNLOAD_URL_FROM_RUNNERS_PAGE>
+tar xzf actions-runner-linux-x64.tar.gz
+./config.sh --url https://github.com/3pacs/GRID \
+  --token <REGISTRATION_TOKEN_FROM_RUNNERS_PAGE> \
+  --name alien --labels self-hosted,alien,tests --unattended
+sudo ./svc.sh install
+sudo ./svc.sh start
+# registers as systemd unit actions.runner.3pacs-GRID.alien
+systemctl status actions.runner.3pacs-GRID.alien --no-pager
+
+# 4. Flip CI over once the runner shows "Idle" on the runners page:
+#    gh variable set TEST_RUNNER --body alien -R 3pacs/GRID
+#    (or Settings → Secrets and variables → Actions → Variables → New)
+```
+
+### Health / recovery
+
+```bash
+systemctl status actions.runner.3pacs-GRID.alien --no-pager   # runner service
+sudo systemctl restart actions.runner.3pacs-GRID.alien        # if it drops off "Idle"
+pg_isready -U grid -d griddb_test                              # persistent test DB
+```
+
+To pull CI off alien without touching the workflow file, unset (or delete) the
+`TEST_RUNNER` repository variable — jobs fall back to `ubuntu-latest` on the
+next run.
