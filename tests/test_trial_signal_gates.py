@@ -29,6 +29,8 @@ class _Cursor:
         self._sql = sql
         if "trial_signals" in sql and "INSERT" in sql:
             self.rowcount = 0 if self.conn.signal_exists else 1
+        elif "UPDATE trial_signals" in sql:
+            self.rowcount = 1 if self.conn.signal_exists else 0
         elif "catalyst_calendar" in sql and "INSERT" in sql:
             self.rowcount = 1
 
@@ -329,3 +331,25 @@ def test_cash_runway_score_is_the_unit_component_not_months(monkeypatch: pytest.
 )
 def test_unit_score_clamps_into_the_numeric_5_4_range(value: Any, expected: float) -> None:
     assert ts._unit_score(value) == expected
+
+
+def test_write_to_db_refreshes_the_same_day_row_instead_of_skipping(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The morning cap-unknown WATCHLIST row must be replaced by the post-enrichment score."""
+    sig, conn, _ = _signal(monkeypatch, [_trial("NCT1")], {"market_cap_mm": 500.0, "cash_runway_months": 12.0})
+    conn.signal_exists = True
+    results = sig.generate()
+    assert sig.write_to_db(results, run_id="t2") == 0
+    sqls = [s for s, _ in conn.executed]
+    assert "INSERT INTO trial_signals" in sqls[0]
+    assert "UPDATE trial_signals SET" in sqls[1] and "created_at >= CURRENT_DATE" in sqls[1]
+    _, uparams = conn.executed[1]
+    assert uparams["nct_id"] == "NCT1" and uparams["ticker"] == "ACME" and uparams["run_id"] == "t2"
+    assert uparams["market_cap_mm"] == 500.0 and uparams["cash_runway_months"] == 12.0 and uparams["cash_runway_score"] == 0.5
+    assert sig.stats["updated"] == 1
+    # calendar row still attempted after the refresh
+    assert "INSERT INTO catalyst_calendar" in sqls[2]
+
+    # Fresh row -> insert only, no update statement, updated == 0.
+    sig, conn, _ = _signal(monkeypatch, [_trial("NCT2")], {"market_cap_mm": 500.0})
+    assert sig.write_to_db(sig.generate(), run_id="t3") == 1
+    assert not any("UPDATE trial_signals" in s for s, _ in conn.executed) and sig.stats["updated"] == 0
