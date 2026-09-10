@@ -2,6 +2,9 @@ import React, { useState, useEffect } from 'react';
 import { api } from '../api.js';
 import { shared, colors } from '../styles/shared.js';
 import ViewHelp from '../components/ViewHelp.jsx';
+import { useAsyncData } from '../hooks/useAsyncData.js';
+import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
+import ErrorState from '../components/ErrorState.jsx';
 
 const groupColors = {
     ingestion: '#1A6EBF',
@@ -13,7 +16,6 @@ const groupColors = {
 };
 
 export default function Workflows() {
-    const [workflows, setWorkflows] = useState([]);
     const [waves, setWaves] = useState(null);
     const [schedule, setSchedule] = useState(null);
     const [running, setRunning] = useState({});
@@ -21,17 +23,15 @@ export default function Workflows() {
     const [activeTab, setActiveTab] = useState('all');
 
     useEffect(() => {
-        loadWorkflows();
         api.getWorkflowWaves().then(setWaves).catch(() => {});
         api.getWorkflowSchedule().then(setSchedule).catch(() => {});
     }, []);
 
-    const loadWorkflows = async () => {
-        try {
-            const result = await api.getWorkflows();
-            setWorkflows(result.workflows || []);
-        } catch (e) { console.warn('[GRID] Workflows:', e.message); }
-    };
+    const { data: workflows, loading, error, refetch: loadWorkflows } = useAsyncData(async () => {
+        const result = await api.getWorkflows();
+        if (result?.error) throw new Error(result.message || 'Failed to load workflows');
+        return result.workflows || [];
+    }, { fallback: [] });
 
     const toggleWorkflow = async (name, enabled) => {
         try {
@@ -69,6 +69,12 @@ export default function Workflows() {
                 <ViewHelp id="workflows" />
             </div>
 
+            {loading && !workflows?.length ? (
+                <LoadingSkeleton variant="card" count={3} />
+            ) : error ? (
+                <ErrorState error={error} onRetry={loadWorkflows} title="Workflows unavailable" />
+            ) : (
+            <>
             {/* Summary */}
             <div style={shared.metricGrid}>
                 <div style={shared.metric}>
@@ -157,6 +163,8 @@ export default function Workflows() {
                     </div>
                 )}
             </div>
+            </>
+            )}
 
             {/* Wave Plan */}
             {waves?.waves?.length > 0 && (
