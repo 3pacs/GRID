@@ -251,12 +251,20 @@ ssh grid@100.75.185.36 'cd /home/grid/grid_v4/grid_repo && python3 -c "from aler
 ssh grid@100.75.185.36 'sudo -u postgres psql griddb -c "SELECT alert_type, entity_id, seen_at FROM alert_state WHERE alert_type = '"'"'hermes_daily_digest'"'"' ORDER BY seen_at DESC LIMIT 5"'
 ```
 
-Decision (Anik, 2026-09-10): regardless of what `mail.log` says, GRID sends as
-**`hermes@stepdad.finance`** through its provider's authenticated SMTP, not through local
-Postfix. The mailbox already exists (ROADMAP Phase 15). The app password for it is
-Anik's; **the executor never receives, requests, or prints it**. Anik edits the server
-`.env` (next to `config.py`, both trees if both have one) himself, or pastes the values
-into a terminal he controls:
+Decision (Anik, 2026-09-10): GRID sends as **`hermes@stepdad.finance`** through its
+provider's authenticated SMTP, not through local Postfix. Anik says the mailbox and its
+credentials are **already set up on the server**, so verify before changing anything:
+
+```bash
+ssh grid@100.75.185.36 'cd /home/grid/grid_v4/grid_repo && grep -E "^ALERT_(EMAIL_FROM|SMTP_HOST|SMTP_PORT|SMTP_USE_TLS|SMTP_USER)=" .env; grep -c "^ALERT_SMTP_PASSWORD=.\+" .env'   # values of the five keys + "1" if a password is set; never print the password line itself
+```
+
+Expected: FROM and USER are `hermes@stepdad.finance`, host is the provider's SMTP
+(`smtp.gmail.com` for Google Workspace), port 587, TLS true, password count 1. If all
+five match, skip straight to the executor steps below. If any is missing or still points
+at `localhost`/`grid-alerts@grid-svr`, the values are these; the app password is Anik's
+and **the executor never receives, requests, or prints it** — Anik edits the server
+`.env` (next to `config.py`, both trees if both have one) himself:
 
 ```
 ALERT_EMAIL_FROM=hermes@stepdad.finance
