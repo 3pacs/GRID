@@ -113,6 +113,9 @@ MAX_PER_CATEGORY: int = 10
 # A puller needs this many scored signals before its trust means anything.
 MIN_SCORED_SIGNALS: int = 3
 
+# Events from pullers below this Bayesian trust are not surfaced.
+MIN_EVENT_TRUST: float = 0.02
+
 _IDENTITY_SQL = """
     CASE
         WHEN source_type = 'options_flow' THEN regexp_replace(source_id, '_[0-9.]+$', '')
@@ -192,6 +195,7 @@ class LeverPuller:
     total_signals: int = 0      # scored signals (CORRECT + WRONG) behind trust_score
     correct_signals: int = 0
     motivation_mix: dict[str, int] = field(default_factory=dict)  # label -> count over recent actions
+    aliases: list[str] = field(default_factory=list)  # other <source_type>:<identity> ids for the same actor
 
 
 @dataclass
@@ -528,8 +532,51 @@ def build_puller_index(engine: Engine) -> list[LeverPuller]:
             total_signals=int(r[2]),
             correct_signals=correct,
         ))
+    pullers = merge_cross_feed_duplicates(pullers)
     log.info("Lever puller index: {n} qualified actors", n=len(pullers))
     return pullers
+
+
+def _actor_key(puller: LeverPuller) -> tuple[str, str]:
+    """Same person across feeds: (category, normalised name)."""
+    name = " ".join(puller.name.lower().replace(".", " ").replace(",", " ").split())
+    return puller.category, name
+
+
+def merge_cross_feed_duplicates(pullers: list[LeverPuller]) -> list[LeverPuller]:
+    """Fold the same actor reported by two feeds into one puller.
+
+    John Fetterman arrives as ``congressional:John Fetterman`` and
+    ``quiverquant:senate:John Fetterman``; counted twice he doubles a
+    convergence. The higher-trust record wins, the other id becomes an
+    alias so its rows still resolve to the same puller, and the scored
+    counts are summed.
+    """
+    by_key: dict[tuple[str, str], LeverPuller] = {}
+    order: list[tuple[str, str]] = []
+    for p in sorted(pullers, key=lambda p: (-p.trust_score, -p.total_signals, p.id)):
+        key = _actor_key(p)
+        keep = by_key.get(key)
+        if keep is None:
+            by_key[key] = p
+            order.append(key)
+            continue
+        keep.aliases.append(p.id)
+        keep.aliases.extend(a for a in p.aliases if a not in keep.aliases)
+        keep.total_signals += p.total_signals
+        keep.correct_signals += p.correct_signals
+        keep.recent_actions = (keep.recent_actions + p.recent_actions)[:10]
+    return [by_key[k] for k in order]
+
+
+def puller_map_of(pullers: list[LeverPuller]) -> dict[str, LeverPuller]:
+    """id -> puller, including every alias id."""
+    out: dict[str, LeverPuller] = {}
+    for p in pullers:
+        out[p.id] = p
+        for a in p.aliases:
+            out.setdefault(a, p)
+    return out
 
 
 def identify_lever_pullers(engine: Engine) -> list[LeverPuller]:
@@ -1012,7 +1059,7 @@ def get_active_lever_events(
     # Every qualified actor, not just the top-50 display list. Dashboard
     # callers can pass the list they already fetched to skip the rescan.
     known_pullers = pullers if pullers is not None else build_puller_index(engine)
-    puller_map: dict[str, LeverPuller] = {p.id: p for p in known_pullers}
+    puller_map = puller_map_of(known_pullers)
 
     cutoff = date.today() - timedelta(days=days)
     events: list[LeverEvent] = []
@@ -1031,7 +1078,10 @@ def get_active_lever_events(
             puller_id = puller_id_for(src_type, src_id, sig_val)
             puller = puller_map.get(puller_id)
 
-            if puller is None:
+            if puller is None or puller.trust_score < MIN_EVENT_TRUST:
+                # Below the floor the source has never been right (options
+                # tapes score 0/1,900 under the current outcome rule); its
+                # rows would drown the event list without adding information.
                 continue
 
             # Parse signal value metadata
@@ -1191,7 +1241,7 @@ def find_lever_convergence(engine: Engine, pullers: list[LeverPuller] | None = N
     # Convergence is about how many independent qualified actors line up on
     # a ticker, so it keys on the full puller index, not the display top-50.
     known_pullers = pullers if pullers is not None else build_puller_index(engine)
-    puller_map: dict[str, LeverPuller] = {p.id: p for p in known_pullers}
+    puller_map = puller_map_of(known_pullers)
 
     convergences: list[dict] = []
 
@@ -1214,8 +1264,10 @@ def find_lever_convergence(engine: Engine, pullers: list[LeverPuller] | None = N
         if puller_id not in puller_map:
             continue
 
+        # Canonical id: an alias (same person from another feed) must not
+        # count as a second independent puller.
         ticker_actions[ticker].append({
-            "puller_id": puller_id,
+            "puller_id": puller_map[puller_id].id,
             "puller": puller_map[puller_id],
             "signal_type": sig_type,
             "signal_date": sig_date,
@@ -1559,7 +1611,7 @@ def get_lever_context_for_ticker(engine: Engine, ticker: str) -> dict:
     ticker = ticker.upper().strip()
 
     pullers = identify_lever_pullers(engine)
-    puller_map: dict[str, LeverPuller] = {p.id: p for p in pullers}
+    puller_map = puller_map_of(pullers)
 
     result: dict[str, Any] = {
         "ticker": ticker,

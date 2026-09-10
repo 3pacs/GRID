@@ -525,3 +525,82 @@ def test_curated_edges_exclude_feed_artefact_nodes() -> None:
     sql, params = ex.call_args_list[0].args
     assert "a.id NOT LIKE %s AND b.id NOT LIKE %s" in sql and "a.name NOT LIKE %s AND b.name NOT LIKE %s" in sql
     assert params[4:] == ("qq_%", "qq_%", "qq_%", "qq_%")
+
+
+# ── stale-row purge, cross-feed aliases, event trust floor ────────────────
+
+
+@needs_networkx
+def test_store_results_purges_rows_older_than_the_run() -> None:
+    from scripts import graph_analytics as ga
+
+    G = nx.DiGraph()
+    G.add_edge("a", "b", weight=1.0)
+    conn = MagicMock()
+    cur = MagicMock()
+    conn.__enter__ = MagicMock(return_value=conn)
+    conn.__exit__ = MagicMock(return_value=False)
+    cur.__enter__ = MagicMock(return_value=cur)
+    cur.__exit__ = MagicMock(return_value=False)
+    cur.rowcount = 7
+    conn.cursor.return_value = cur
+    with patch("scripts.graph_analytics.get_connection", return_value=conn):
+        ga.store_results(G, {"a": 0.6, "b": 0.4}, {"a": 0, "b": 0}, {}, {}, {}, {}, {}, scope="curated")
+    calls = [c.args for c in cur.execute.call_args_list]
+    deletes = [c for c in calls if c[0].startswith("DELETE FROM actor_analytics_curated WHERE computed_at < %s")]
+    assert len(deletes) == 1 and deletes[0][1][0].tzinfo is not None
+    # the purge comes after the upserts
+    assert calls.index(deletes[0]) > max(i for i, c in enumerate(calls) if c[0].startswith("INSERT INTO"))
+
+
+def test_cross_feed_duplicates_merge_into_one_puller_with_aliases() -> None:
+    a = _puller("congress"); a.id, a.name, a.trust_score, a.total_signals, a.correct_signals = "congressional:John Fetterman", "John Fetterman", 0.9, 8, 8
+    b = _puller("congress"); b.id, b.name, b.trust_score, b.total_signals, b.correct_signals = "quiverquant:senate:John Fetterman", "John Fetterman", 0.875, 6, 6
+    c = _puller("insider"); c.id, c.name = "insider:John Fetterman", "John Fetterman"  # different category: not the same lever
+    d = _puller("congress"); d.id, d.name = "congressional:Angus King", "Angus King"
+    merged = lp.merge_cross_feed_duplicates([b, a, c, d])
+    ids = [p.id for p in merged]
+    assert set(ids) == {"congressional:John Fetterman", "insider:John Fetterman", "congressional:Angus King"}
+    assert ids[0] == "congressional:John Fetterman"  # highest trust first; the 0.875 feed row is folded in
+    jf = merged[0]
+    assert jf.aliases == ["quiverquant:senate:John Fetterman"] and jf.total_signals == 14 and jf.correct_signals == 14
+    pm = lp.puller_map_of(merged)
+    assert pm["quiverquant:senate:John Fetterman"] is jf and pm["congressional:John Fetterman"] is jf and len(pm) == 4
+
+
+def test_convergence_counts_an_aliased_actor_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(lp, "_ensure_lever_table", lambda engine: None)
+    jf = _puller("congress"); jf.id, jf.name, jf.aliases = "congressional:John Fetterman", "John Fetterman", ["quiverquant:senate:John Fetterman"]
+    other = _puller("congress"); other.id, other.name = "congressional:Angus King", "Angus King"
+    day = __import__("datetime").date(2026, 9, 7)
+    rows = [
+        ("LRCX", "congressional", "John Fetterman", "BUY", day, 0.9, {}),
+        ("LRCX", "quiverquant:senate", "qq_senate_trading", "senate_trading BUY", day, 0.9, {"Senator": "John Fetterman"}),
+    ]
+
+    class E:
+        def connect(self):
+            return _FakeRows(rows)
+
+    assert lp.find_lever_convergence(E(), pullers=[jf, other]) == []  # one person, two feeds: no convergence
+    rows.append(("LRCX", "congressional", "Angus King", "BUY", day, 0.8, {}))
+    conv = lp.find_lever_convergence(E(), pullers=[jf, other])
+    assert len(conv) == 1 and conv[0]["puller_count"] == 2
+
+
+def test_events_skip_pullers_below_the_trust_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(lp, "_ensure_lever_table", lambda engine: None)
+    tape = _puller("options_flow"); tape.id, tape.name, tape.trust_score = "options_flow:whale_hyg", "whale_hyg", 0.001
+    ins = _puller("insider"); ins.id, ins.name = "insider:Altman Peter", "Altman Peter"
+    rows = [
+        ("options_flow", "whale_hyg_80", "HYG", "2026-09-07", "UNUSUAL_OPTIONS", {"direction": "PUT"}, 0.5),
+        ("insider", "Altman Peter", "BCDA", "2026-09-07", "BUY", {}, 0.84),
+    ]
+
+    class E:
+        def connect(self):
+            return _FakeRows(rows)
+
+    events = lp.get_active_lever_events(E(), days=30, pullers=[tape, ins])
+    assert [e.puller.id for e in events] == ["insider:Altman Peter"]
+    assert lp.MIN_EVENT_TRUST == 0.02
