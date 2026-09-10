@@ -29,6 +29,19 @@ const TRANSITION_MS = 600;
 const REGIME_TABS = ['ALL', 'GROWTH', 'FRAGILE', 'CRISIS'];
 const PERIOD_OPTIONS = [30, 60, 90, 180, 365];
 
+// Reverse of DISPLAY_NAMES in api/routers/discovery.py::get_correlation_matrix --
+// the correlation matrix only returns display names, so pair-scatter lookups
+// against /api/v1/signals/timeseries (which keys on feature_registry names)
+// need this mapping back to the raw feature name.
+const RAW_FEATURE_NAME_BY_DISPLAY = {
+    'SPY': 'spy_close', 'QQQ': 'qqq_close', 'IWM': 'iwm_close',
+    'TLT (10Y)': 'treasury_10y', 'UST 2Y': 'treasury_2y',
+    'Curve 10-2': 'yield_curve_10y2y',
+    'GLD': 'gold_price', 'OIL': 'crude_oil',
+    'BTC': 'btc_price', 'DXY': 'dollar_index',
+    'VIX': 'vix', 'HYG (spread)': 'hy_spread', 'IG (spread)': 'ig_spread',
+};
+
 const MONO = "'JetBrains Mono', monospace";
 const SANS = "'IBM Plex Sans', sans-serif";
 
@@ -67,7 +80,7 @@ function corrExplain(v) {
 }
 
 /* ─── Scatter Plot Mini-Modal ─── */
-function ScatterModal({ pair, onClose }) {
+function ScatterModal({ pair, onClose, days }) {
     if (!pair) return null;
     return (
         <div onClick={onClose} style={{
@@ -92,7 +105,7 @@ function ScatterModal({ pair, onClose }) {
                     fontFamily: SANS }}>
                     {corrExplain(pair[2])}
                 </div>
-                <ScatterPlot featureA={pair[0]} featureB={pair[1]} />
+                <ScatterPlot featureA={pair[0]} featureB={pair[1]} days={days} />
                 <button onClick={onClose} style={{
                     ...shared.buttonSmall, marginTop: '10px', width: '100%',
                 }}>Close</button>
@@ -101,30 +114,72 @@ function ScatterModal({ pair, onClose }) {
     );
 }
 
-function ScatterPlot({ featureA, featureB }) {
+function ScatterPlot({ featureA, featureB, days = 90 }) {
     const svgRef = useRef(null);
+    const [status, setStatus] = useState('loading'); // 'loading' | 'error' | 'empty' | 'ready'
+    const [errorMessage, setErrorMessage] = useState('');
+    const [points, setPoints] = useState([]);
+
+    // Fetch real paired time series from the signals timeseries endpoint.
+    useEffect(() => {
+        let cancelled = false;
+        setStatus('loading');
+        setPoints([]);
+
+        const rawA = RAW_FEATURE_NAME_BY_DISPLAY[featureA];
+        const rawB = RAW_FEATURE_NAME_BY_DISPLAY[featureB];
+        if (!rawA || !rawB) {
+            setStatus('empty');
+            return undefined;
+        }
+
+        api.getTimeseries([rawA, rawB], Math.min(Math.max(days, 7), 252)).then(result => {
+            if (cancelled) return;
+            if (result?.error) {
+                setErrorMessage(result.message || 'Failed to load pair time series');
+                setStatus('error');
+                return;
+            }
+            const seriesA = result?.series?.[rawA];
+            const seriesB = result?.series?.[rawB];
+            if (!seriesA?.length || !seriesB?.length) {
+                setStatus('empty');
+                return;
+            }
+            const n = Math.min(seriesA.length, seriesB.length);
+            const pairs = [];
+            for (let i = 0; i < n; i++) {
+                pairs.push({ x: seriesA[i], y: seriesB[i] });
+            }
+            setPoints(pairs);
+            setStatus('ready');
+        }).catch(err => {
+            if (cancelled) return;
+            setErrorMessage(err.message || 'Failed to load pair time series');
+            setStatus('error');
+        });
+
+        return () => { cancelled = true; };
+    }, [featureA, featureB, days]);
 
     useEffect(() => {
-        // Minimal placeholder scatter -- real data would need timeseries fetch
         if (!svgRef.current) return;
         const svg = d3.select(svgRef.current);
         svg.selectAll('*').remove();
 
+        if (status !== 'ready' || points.length < 2) {
+            svg.attr('width', 360).attr('height', 0);
+            return;
+        }
+
         const w = 360, h = 200, m = { t: 10, r: 10, b: 30, l: 40 };
         svg.attr('width', w).attr('height', h);
 
-        // Generate synthetic scatter from random walk (placeholder until timeseries endpoint)
-        const n = 60;
-        const data = Array.from({ length: n }, (_, i) => ({
-            x: Math.sin(i * 0.1) + Math.random() * 0.5,
-            y: Math.sin(i * 0.1 + 0.3) + Math.random() * 0.5,
-        }));
-
         const xScale = d3.scaleLinear()
-            .domain(d3.extent(data, d => d.x)).nice()
+            .domain(d3.extent(points, d => d.x)).nice()
             .range([m.l, w - m.r]);
         const yScale = d3.scaleLinear()
-            .domain(d3.extent(data, d => d.y)).nice()
+            .domain(d3.extent(points, d => d.y)).nice()
             .range([h - m.b, m.t]);
 
         const g = svg.append('g');
@@ -142,7 +197,7 @@ function ScatterPlot({ featureA, featureB }) {
             .attr('font-size', '8px').attr('font-family', MONO);
 
         g.selectAll('circle')
-            .data(data).enter().append('circle')
+            .data(points).enter().append('circle')
             .attr('cx', d => xScale(d.x))
             .attr('cy', d => yScale(d.y))
             .attr('r', 3)
@@ -159,9 +214,31 @@ function ScatterPlot({ featureA, featureB }) {
             .attr('text-anchor', 'middle').attr('font-size', '9px')
             .attr('font-family', MONO).attr('fill', colors.textMuted)
             .text(featureB);
-    }, [featureA, featureB]);
+    }, [status, points, featureA, featureB]);
 
-    return <svg ref={svgRef} style={{ display: 'block', width: '100%', marginTop: '10px' }} />;
+    return (
+        <>
+            <svg ref={svgRef} style={{ display: 'block', width: '100%' }} />
+            {status === 'loading' && (
+                <div style={{ fontSize: '10px', color: colors.textMuted, fontFamily: MONO,
+                    textAlign: 'center', padding: '16px 0' }}>
+                    Loading pair time series...
+                </div>
+            )}
+            {status === 'error' && (
+                <div style={{ fontSize: '10px', color: colors.red, fontFamily: MONO,
+                    textAlign: 'center', padding: '16px 0' }}>
+                    {errorMessage}
+                </div>
+            )}
+            {status === 'empty' && (
+                <div style={{ fontSize: '10px', color: colors.textMuted, fontFamily: MONO,
+                    textAlign: 'center', padding: '16px 0' }}>
+                    Pair time series not available yet
+                </div>
+            )}
+        </>
+    );
 }
 
 /* ─── Main Component ─── */
@@ -627,7 +704,7 @@ export default function CorrelationMatrix() {
             </div>
 
             {/* Scatter plot modal */}
-            <ScatterModal pair={scatterPair} onClose={() => setScatterPair(null)} />
+            <ScatterModal pair={scatterPair} onClose={() => setScatterPair(null)} days={period} />
         </div>
     );
 }
