@@ -382,7 +382,7 @@ Three defects keep them out of the decision path:
 |---|---|---|---|
 | **Exact-key entity map.** `EntityMap.get_feature_id` is `SEED_MAPPINGS.get(series_id)` — 520 literal keys, no prefix or pattern | `normalization/entity_map.py:884-894` | Every per-entity series (`GOV_CONTRACT:{agency}:{ticker}:{amount}`, `INSIDER:{ticker}:{name}:{type}`, `13F:{cik}:{ticker}:{action}`, `LEGISLATION:*`, `EXPORT_CONTROL:*`, `DARKPOOL:*`) can never become a `resolved_series` feature, so `PITStore`, `oracle/`, `alpha_research/`, and `features/alpha101.py` cannot see any company-level structural signal. 91 registered pullers write into this void | a pattern table in `entity_map` (medium) |
 | **Rolling windows starve long-horizon consumers.** `gov_contracts.py` pulls 7 days (`:42`), `legislation.py` 7–30, `export_controls.py` 90, `insider_filings.py` 1 | pullers | `market_edge_scanner` looks back 540 days into tables filled a week at a time | one-time backfill (`pull_all(days_back=1095)`) — small |
-| **Nine prefix-mismatch bugs** where a mapping exists but the puller writes a different key (EIA 16 features, weather 10, Binance 8, NY Fed SOMA 6, OECD 3, DeFiLlama 2, Nowcast 2, USPTO 2, AlphaVantage) | `entity_map.py` vs each puller | ~49 features from code that already runs, silently dropped | nine one-line edits |
+| **Prefix mismatches** where a mapping exists but the puller writes a different key. *Corrected 2026-09-10 after reading each puller:* only **Binance** (`binance.{SYM}.{field}`, 6 features) and **DeFiLlama** (`defillama.chain_tvl.solana`, 1) are true aliases and are now added. NY Fed and OECD already write the mapped keys. EIA writes only Brent/WTI spot (the 16 mapped `eia_*` names are a different dataset never pulled), the weather puller writes temperatures not degree-days, USPTO keyword counts are a different series from the CPC-class patent features, and Nowcast/AlphaVantage need registry entries or pattern mapping | `entity_map.py` vs each puller | 7 features recovered by aliasing; the rest need registry work, not aliases | done for the two real cases |
 
 Best five families by history × wiring for a company-level thesis (from the data audit):
 **government contracts** (540-day scorer window, three consumers, but 7-day pulls),
@@ -528,6 +528,19 @@ agent wave.
 > and R3.4 canvas in the operator tab bar. Not yet: T0.2 journal-outcome scheduling, T0.4
 > calibration read-out (needs the server), T0.7 paid-LLM flag, T1.x data reachability.
 > Deploy is the operator's step (`scripts/deploy.py --snapshot --restart --smoke`).
+>
+> **Sprint 2 status (2026-09-10, same branch, second PR):** landed — T0.2 journal verdicts
+> scored daily at 06:45 (after realized alpha), T0.7 `GRID_ALLOW_PAID_LLM` is a real
+> `Settings` field (port collision left for the operator), T1.1 Binance/DeFiLlama aliases
+> (see the row below), T1.4 `flow_materializer.sync_all` in the Hermes daily block, T2.1
+> `horizon_days` on `oracle_predictions` (`run_cycle(horizon_days=)` → `expiry = today +
+> N`; legacy rows derive it from expiry), T2.2 Sunday 05:00 long-horizon sweep
+> (`rank_universe(TARGET_UNIVERSE, horizon_days=90)` → `universe_ranking_history` with a
+> `horizon_days` column), the canvas **conviction card** (click a ticker node → run the
+> decision stack at 7/30/90/180 d → verdict, `verdict_reason`, layer and evidence
+> coverage, Kelly size, top evidence, partial-stage errors), CI now runs vitest, and the
+> dead React Flow node set, `@xyflow/react`, and the TypeScript shadow files are gone (V5
+> R0). Not yet: T0.4 (server), T1.2/T1.3, T2.3–T2.6, and the cron entries in T3.
 
 ### T0 — Truth gates first (3–4 days). Nothing else can be believed until these exist.
 
@@ -545,7 +558,7 @@ agent wave.
 
 | # | Item | Module |
 |---|---|---|
-| T1.1 | Nine prefix fixes → ~49 features from pullers that already run | `normalization/entity_map.py` (or the nine pullers) |
+| T1.1 | Prefix aliases for pullers that already run — **done 2026-09-10 for the two real cases** (Binance 6 features, DeFiLlama 1); the other "mismatches" in the audit were different-series cases (see §5.2) | `normalization/entity_map.py` |
 | T1.2 | **Pattern mapping** in `EntityMap.get_feature_id` — exact key first, then a pattern table (`GOV_CONTRACT:*:{ticker}:*` → `gov_contract_{ticker}_usd_30d` etc.) so company-level structural series become PIT features | `entity_map.py:884-894`; add tests to `test_resolver*.py` |
 | T1.3 | Backfill: `gov_contracts.pull_all(days_back=1095)`, legislation, export controls, Form 4 bulk (Harvard Dataverse, `DATA_SOURCES_CATALOG.md:126`) | pullers; one-off scripts under `scripts/` |
 | T1.4 | Wire `ingestion/flow_materializer.py` (zero callers) into the daily block — it gates `dark_pool_weekly`, `etf_flows`, `insider_trades`, `congressional_trades`, `junction_point_readings` | `scripts/hermes_operator.py` daily block |
