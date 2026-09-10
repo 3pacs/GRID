@@ -1,7 +1,7 @@
 {
-  "name": "GRID Intelligence",
-  "short_name": "GRID",
-  "description": "Private trading intelligence engine",
+  "name": "stepdad.finance",
+  "short_name": "stepdad",
+  "description": "Ask a plain-language question about your money and get a straight answer.",
   "start_url": "/",
   "display": "standalone",
   "orientation": "portrait",
