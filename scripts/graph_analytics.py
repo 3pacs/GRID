@@ -49,13 +49,20 @@ DUMP_CATEGORIES: tuple[str, ...] = (
 )
 DUMP_CATEGORY_PREFIX = "icij"
 
+# Feed constants that were ingested as if they were actors (qq_insider_trading,
+# qq_house_trading, ...). They connect to every ticker they ever reported on
+# and would otherwise be the highest-PageRank "actor" in the curated graph.
+ARTEFACT_ID_PREFIX = "qq_"
+
 _CURATED_EDGE_SQL = (
     "SELECT c.actor_a, c.actor_b, c.relationship, c.strength "
     "FROM actor_connections c "
     "JOIN actors a ON a.id = c.actor_a "
     "JOIN actors b ON b.id = c.actor_b "
     "WHERE a.category NOT LIKE %s AND b.category NOT LIKE %s "
-    "  AND NOT (a.category = ANY(%s)) AND NOT (b.category = ANY(%s))"
+    "  AND NOT (a.category = ANY(%s)) AND NOT (b.category = ANY(%s)) "
+    "  AND a.id NOT LIKE %s AND b.id NOT LIKE %s "
+    "  AND a.name NOT LIKE %s AND b.name NOT LIKE %s"
 )
 
 
@@ -77,9 +84,11 @@ def load_actor_graph(scope: str = "full") -> nx.DiGraph:
     log.info("Loading actor connections from database (scope={s})...", s=scope)
     if scope == "curated":
         prefix = f"{DUMP_CATEGORY_PREFIX}%"
+        artefact = f"{ARTEFACT_ID_PREFIX}%"
         edges = execute_sql(
             _CURATED_EDGE_SQL,
-            (prefix, prefix, list(DUMP_CATEGORIES), list(DUMP_CATEGORIES)),
+            (prefix, prefix, list(DUMP_CATEGORIES), list(DUMP_CATEGORIES),
+             artefact, artefact, artefact, artefact),
         )
     else:
         edges = execute_sql(

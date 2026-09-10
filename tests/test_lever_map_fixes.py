@@ -436,3 +436,92 @@ def test_curated_graph_analytics_is_scheduled_weekly() -> None:
     src = (ROOT / "intelligence" / "scheduler.py").read_text(encoding="utf-8")
     assert '_sched.every().sunday.at("04:30").do(_curated_graph_analytics_weekly)' in src
     assert 'run_graph_analytics(scope="curated")' in src
+
+
+# ── qualified-actor index: convergence and events see every actor, not the top 50 ──
+
+
+def test_aggregate_query_has_no_trust_ordered_limit() -> None:
+    import inspect
+
+    src = inspect.getsource(lp._aggregate_scored_sources)
+    assert "LIMIT" not in src.split("ORDER BY")[-1]  # a LIMIT here dropped every options tape before the quota
+    assert "HAVING COUNT(*) >= :min_scored" in src and "NOT (source_type = ANY(:excluded))" in src
+
+
+def test_build_puller_index_covers_every_qualified_actor_without_lookups() -> None:
+    rows = [_agg("insider", f"Insider {i}", 9, 1) for i in range(30)]
+    rows += [_agg("options_flow", "whale_spy", 20, 180), _agg("quiverquant:offexchange", "qq_off_exchange", 5, 0)]
+    engine = _Engine(rows)
+    index = lp.build_puller_index(engine)
+    assert len(index) == 31  # aggregate feed mapped to "unknown" is dropped, nothing else is capped
+    spy = next(p for p in index if p.id == "options_flow:whale_spy")
+    assert spy.category == "options_flow" and spy.influence_rank == 0.8 and spy.trust_score == round(21 / 202, 4)
+    assert spy.total_signals == 200 and spy.correct_signals == 20 and spy.position == "Options tape — SPY"
+    # one aggregate query, no per-source enrichment
+    assert len(engine.calls) == 1 and "GROUP BY source_type" in engine.calls[0][0]
+
+
+def test_events_and_convergence_default_to_the_index_not_the_display_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(lp, "_ensure_lever_table", lambda engine: None)
+    monkeypatch.setattr(lp, "identify_lever_pullers",
+                        lambda engine: (_ for _ in ()).throw(AssertionError("display list must not be used")))
+    tsm_insiders = []
+    for i in range(3):
+        p = _puller("insider")
+        p.id, p.name = f"insider:TSM Insider {i}", f"TSM Insider {i}"
+        tsm_insiders.append(p)
+    monkeypatch.setattr(lp, "build_puller_index", lambda engine: tsm_insiders)
+    rows = [("TSM", "insider", f"TSM Insider {i}", "BUY", __import__("datetime").date(2026, 9, 7), 0.9, {}) for i in range(3)]
+
+    class E:
+        def connect(self):
+            return _FakeRows(rows)
+
+    conv = lp.find_lever_convergence(E())
+    assert len(conv) == 1 and conv[0]["ticker"] == "TSM" and conv[0]["puller_count"] == 3
+
+    ev_rows = [("insider", f"TSM Insider {i}", "TSM", "2026-09-07", "BUY", {}, 0.9) for i in range(3)]
+
+    class E2:
+        def connect(self):
+            return _FakeRows(ev_rows)
+
+    assert len(lp.get_active_lever_events(E2(), days=30)) == 3
+
+
+@pytest.mark.parametrize(
+    "action,expected",
+    [
+        ({"signal_type": "BUY"}, "BUY"),
+        ({"signal_type": "UNUSUAL_SELL"}, "SELL"),
+        ({"signal_type": "HEAT_SPIKE", "details": {"direction": "BEARISH"}}, "SELL"),
+        ({"signal_type": "wsb_bullish", "details": {}}, "BUY"),
+        ({"signal_type": "UNUSUAL_OPTIONS", "details": {"direction": "PUT"}}, "SELL"),
+        ({"signal_type": "NET_POSITION_DELTA", "details": {}}, None),
+    ],
+)
+def test_direction_of_normalises_feed_vocabularies(action: dict, expected: str | None) -> None:
+    assert lp._direction_of(action) == expected
+
+
+def test_social_motivation_uses_reddit_direction() -> None:
+    p = _puller("social", recent=[
+        {"signal_type": "HEAT_SPIKE", "details": {"direction": "BULLISH"}},
+        {"signal_type": "HEAT_SPIKE", "details": {"direction": "BULLISH"}},
+        {"signal_type": "HEAT_SPIKE", "details": {"direction": "BEARISH"}},
+    ])
+    assert lp.assess_motivation(p, {"signal_type": "HEAT_SPIKE", "details": {"direction": "BEARISH"}}, engine=object()) == "contrarian"
+    assert lp.assess_motivation(p, {"signal_type": "HEAT_SPIKE", "details": {"direction": "BULLISH"}}, engine=object()) == "routine"
+    assert lp.derive_motivation_model(p, engine=object()) == "routine"
+
+
+@needs_networkx
+def test_curated_edges_exclude_feed_artefact_nodes() -> None:
+    from scripts import graph_analytics as ga
+
+    with patch("scripts.graph_analytics.execute_sql", return_value=[]) as ex:
+        ga.load_actor_graph(scope="curated")
+    sql, params = ex.call_args_list[0].args
+    assert "a.id NOT LIKE %s AND b.id NOT LIKE %s" in sql and "a.name NOT LIKE %s AND b.name NOT LIKE %s" in sql
+    assert params[4:] == ("qq_%", "qq_%", "qq_%", "qq_%")
