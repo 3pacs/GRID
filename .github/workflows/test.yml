@@ -6,29 +6,22 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   PYTHON_VERSION: "3.11"
   NODE_VERSION: "20"
+  # Non-empty -> target the alien self-hosted runner; empty/unset -> ubuntu-latest.
+  # Set via Settings > Secrets and variables > Actions > Variables > TEST_RUNNER.
+  ON_ALIEN: ${{ vars.TEST_RUNNER != '' }}
 
 jobs:
   backend-tests:
     name: Backend Tests
-    runs-on: ubuntu-latest
-
-    services:
-      postgres:
-        image: postgres:15
-        env:
-          POSTGRES_USER: grid
-          POSTGRES_PASSWORD: testpass
-          POSTGRES_DB: griddb_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","alien","tests"]') || 'ubuntu-latest' }}
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v7
@@ -38,6 +31,29 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
+
+      # ubuntu-latest is a fresh VM every run, so bring up an ephemeral
+      # Postgres container. alien keeps a persistent PostgreSQL 15 +
+      # TimescaleDB service (see docs/SERVER-SERVICES.md, "Alien Runner")
+      # that the next step resets instead of pulling+starting a container.
+      - name: Start ephemeral Postgres (hosted runner)
+        if: env.ON_ALIEN != 'true'
+        run: |
+          docker run -d --name grid-test-pg \
+            -e POSTGRES_USER=grid -e POSTGRES_PASSWORD=testpass -e POSTGRES_DB=griddb_test \
+            -p 5432:5432 postgres:15
+          for i in $(seq 1 30); do
+            docker exec grid-test-pg pg_isready -U grid > /dev/null 2>&1 && break
+            sleep 1
+          done
+
+      - name: Reset persistent Postgres (alien)
+        if: env.ON_ALIEN == 'true'
+        env:
+          PGPASSWORD: testpass
+        run: |
+          psql -h localhost -U grid -d griddb_test -c \
+            'DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;'
 
       - name: Install dependencies
         run: |
@@ -92,9 +108,14 @@ jobs:
             echo "No SQL injection patterns detected"
           fi
 
+      - name: Stop ephemeral Postgres (hosted runner)
+        if: always() && env.ON_ALIEN != 'true'
+        run: docker rm -f grid-test-pg 2>/dev/null || true
+
   frontend-build:
     name: Frontend Build
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","alien","tests"]') || 'ubuntu-latest' }}
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v7
@@ -134,7 +155,8 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","alien","tests"]') || 'ubuntu-latest' }}
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v7
@@ -143,6 +165,7 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
 
       - name: Install linters
         run: pip install ruff bandit
