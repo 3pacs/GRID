@@ -42,6 +42,10 @@ const useCanvasStore = create((set, get) => ({
     // ── Visible depth ──
     visibleDepth: 4,
 
+    // ── Sweep verdicts (latest persisted universe_ranking_history row) ──
+    sweep: null,
+    verdictsByTicker: {},
+
     // ── Actions ──
 
     /**
@@ -73,6 +77,7 @@ const useCanvasStore = create((set, get) => ({
         });
 
         _applyVisibleDepth(g, get().visibleDepth);
+        _applyVerdictLayer(g, get().verdictsByTicker, get().activeLayers.has('verdicts'));
         set({ graph: g, loading: false });
     },
 
@@ -104,6 +109,7 @@ const useCanvasStore = create((set, get) => ({
         });
 
         _applyVisibleDepth(g, get().visibleDepth);
+        _applyVerdictLayer(g, get().verdictsByTicker, get().activeLayers.has('verdicts'));
         set({ graph: g });
     },
 
@@ -155,7 +161,22 @@ const useCanvasStore = create((set, get) => ({
         } else {
             layers.add(name);
         }
+        if (name === 'verdicts') {
+            // In-place mutation (same reason as markActivity): a new graph
+            // object would re-run the layout.
+            _applyVerdictLayer(get().graph, get().verdictsByTicker, layers.has('verdicts'));
+        }
         set({ activeLayers: layers });
+    },
+
+    /**
+     * setSweep — remember the latest persisted sweep and paint its verdicts
+     * onto matching ticker nodes when the 'verdicts' layer is active.
+     */
+    setSweep: (sweep) => {
+        const verdictsByTicker = verdictMapFromSweep(sweep);
+        _applyVerdictLayer(get().graph, verdictsByTicker, get().activeLayers.has('verdicts'));
+        set({ sweep: sweep || null, verdictsByTicker });
     },
 
     /**
@@ -318,6 +339,103 @@ const useCanvasStore = create((set, get) => ({
         return changed;
     },
 }));
+
+// ── Sweep verdict layer ──
+//
+// Verdict vocabulary from intelligence/signal_provenance.py::_verdict_from_aggregate
+// ('high' | 'moderate' | 'low' | 'no_trade'); the ranker also carries
+// 'error' rows. Colours are deliberately not the node-type palette so a
+// painted node reads as "the engine has an opinion", not "a different kind
+// of entity".
+export const VERDICT_COLORS = {
+    high: '#22C55E',
+    moderate: '#F59E0B',
+    low: '#64748B',
+    no_trade: '#7F1D1D',
+    error: '#3F3F46',
+};
+
+export function normalizeVerdict(verdict) {
+    const v = String(verdict || '').trim().toLowerCase();
+    return VERDICT_COLORS[v] ? v : (v ? 'error' : 'no_trade');
+}
+
+/**
+ * verdictMapFromSweep — { TICKER: { verdict, composite, conviction, robustness, rank } }
+ * from a /conviction/sweeps/latest payload. Tolerates a null/empty sweep.
+ */
+export function verdictMapFromSweep(sweep) {
+    const rows = Array.isArray(sweep?.top_k) ? sweep.top_k : [];
+    const out = {};
+    rows.forEach((row, i) => {
+        const ticker = String(row?.ticker || '').trim().toUpperCase();
+        if (!ticker || out[ticker]) return;
+        out[ticker] = {
+            verdict: normalizeVerdict(row.error ? 'error' : row.verdict),
+            composite: Number(row.composite_score ?? 0) || 0,
+            conviction: Number(row.aggregate_conviction ?? 0) || 0,
+            robustness: row.robustness_label || null,
+            rank: i + 1,
+        };
+    });
+    return out;
+}
+
+/**
+ * tickerOfNode — the ticker a canvas node stands for, or null. Mirrors
+ * panels/DetailPanel.jsx::tickerFromNode but works on graphology attributes
+ * and only answers for ticker-shaped nodes so actors named like tickers
+ * (e.g. an actor called "F") are not painted.
+ */
+export function tickerOfNode(id, attrs) {
+    const data = attrs?.data || {};
+    const explicit = attrs?.ticker || data.ticker;
+    if (explicit) return String(explicit).trim().toUpperCase();
+    const kind = String(attrs?.nodeType || data.nodeType || '').toLowerCase();
+    const sid = String(id || '');
+    if (sid.startsWith('t:')) return sid.slice(2).trim().toUpperCase();
+    if (kind === 'ticker' || kind === 'company' || kind === 'stock') {
+        const label = attrs?.label || data.label || data.name || sid;
+        const candidate = String(label).trim().toUpperCase();
+        return /^[A-Z.\-]{1,6}$/.test(candidate) ? candidate : null;
+    }
+    return null;
+}
+
+/**
+ * _applyVerdictLayer — paint (active) or restore (inactive) verdict colours
+ * on every node whose ticker appears in the map. Mutates in place; returns
+ * the number of painted nodes.
+ */
+function _applyVerdictLayer(graph, verdictsByTicker, active) {
+    if (!graph || typeof graph.forEachNode !== 'function') return 0;
+    let painted = 0;
+    graph.forEachNode((id, attrs) => {
+        const ticker = tickerOfNode(id, attrs);
+        const entry = ticker && active ? verdictsByTicker?.[ticker] : null;
+        if (entry) {
+            const baseColor = attrs.baseColor ?? attrs.color;
+            graph.mergeNodeAttributes(id, {
+                baseColor,
+                color: VERDICT_COLORS[entry.verdict],
+                verdict: entry.verdict,
+                verdictRank: entry.rank,
+                verdictComposite: entry.composite,
+            });
+            painted += 1;
+        } else if (attrs.verdict) {
+            graph.mergeNodeAttributes(id, {
+                color: attrs.baseColor ?? attrs.color,
+                verdict: null,
+                verdictRank: null,
+                verdictComposite: null,
+            });
+        }
+    });
+    return painted;
+}
+
+export { _applyVerdictLayer as applyVerdictLayer };
 
 // ── Live activity helpers ──
 export const ACTIVITY_TTL_MS = 45000;

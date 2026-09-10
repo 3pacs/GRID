@@ -18,6 +18,9 @@ const LAYERS = [
     { key: 'macro', label: 'Macro', abbr: 'MAC', color: '#FFD700' },
     { key: 'offshore', label: 'Offshore', abbr: 'OFF', color: '#EF4444' },
     { key: 'predictions', label: 'Predictions', abbr: 'PRED', color: '#EC4899' },
+    // Paints ticker nodes with the latest persisted sweep verdict
+    // (universe_ranking_history via /api/v1/conviction/sweeps/latest).
+    { key: 'verdicts', label: 'Verdicts', abbr: 'VERD', color: '#F97316' },
 ];
 
 /* ── Styles ──────────────────────────────────────────────────── */

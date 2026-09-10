@@ -65,7 +65,11 @@ from intelligence.pair_conviction import (
     scan_candidate_pairs,
 )
 from intelligence.signal_health_monitor import audit_all_series
-from intelligence.universe_ranker import rank_universe
+from intelligence.universe_ranker import (
+    list_rankings,
+    load_latest_ranking,
+    rank_universe,
+)
 
 
 # ── Router ────────────────────────────────────────────────────────────────
@@ -163,6 +167,60 @@ def _error(status_code: int, stage: str, exc: Exception) -> HTTPException:
             "error": str(exc),
             "error_type": type(exc).__name__,
         },
+    )
+
+
+# ── GET /sweeps, /sweeps/latest ──────────────────────────────────────────
+#
+# Read-back of the persisted universe sweeps (``universe_ranking_history``).
+# The Sunday 05:00 long-horizon job in ``intelligence/scheduler.py`` writes
+# 90 d rankings here; the canvas paints those verdicts without re-running
+# the decision stack. Declared before ``/ticker/{ticker}`` for clarity only —
+# the prefixes do not collide.
+
+
+@router.get("/sweeps/latest")
+async def get_latest_sweep(
+    horizon_days: int | None = Query(
+        None,
+        ge=1,
+        le=365,
+        description="Only sweeps run at this horizon (e.g. 90 for the weekly long-horizon sweep).",
+    ),
+    universe: str | None = Query(
+        None,
+        description="Only sweeps over this universe name (e.g. 'custom', 'SP500').",
+    ),
+    engine: Engine = Depends(get_db_engine),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Most recent persisted sweep. 404 when none has run yet."""
+    universe_name = universe.strip() if universe and universe.strip() else None
+    row = load_latest_ranking(engine, horizon_days=horizon_days, universe_name=universe_name)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "stage": "load_latest_ranking",
+                "error": "no persisted sweep matches; the weekly job has not run yet",
+                "horizon_days": horizon_days,
+                "universe": universe_name,
+            },
+        )
+    return _to_serializable(row)
+
+
+@router.get("/sweeps")
+async def list_sweeps(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    horizon_days: int | None = Query(None, ge=1, le=365),
+    engine: Engine = Depends(get_db_engine),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Persisted sweeps, newest first (``entries``/``total``/``has_more``)."""
+    return _to_serializable(
+        list_rankings(engine, limit=limit, offset=offset, horizon_days=horizon_days)
     )
 
 

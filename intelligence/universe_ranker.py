@@ -861,6 +861,135 @@ def persist_ranking(engine: Engine, report: UniverseRankingReport) -> int:
         return -1
 
 
+# ── Read-back (2026-09-10) ──────────────────────────────────────────────
+#
+# The Sunday long-horizon sweep persists here; until now nothing read the
+# table back. These two helpers are the domain layer behind
+# ``GET /api/v1/conviction/sweeps`` so the canvas can paint the latest
+# verdicts without re-running the (slow) decision stack.
+
+_LATEST_RANKING_SQL = text(
+    """
+    SELECT id, generated_at, universe_name, horizon_days, tickers_attempted,
+           tickers_succeeded, regime_signature, top_k, sector_distributions,
+           concentration_alerts, narrative
+    FROM universe_ranking_history
+    WHERE (CAST(:horizon_days AS INTEGER) IS NULL OR horizon_days = :horizon_days)
+      AND (CAST(:universe_name AS TEXT) IS NULL OR universe_name = :universe_name)
+    ORDER BY generated_at DESC, id DESC
+    LIMIT 1
+    """
+)
+
+_COUNT_RANKINGS_SQL = text(
+    """
+    SELECT COUNT(*) FROM universe_ranking_history
+    WHERE (CAST(:horizon_days AS INTEGER) IS NULL OR horizon_days = :horizon_days)
+    """
+)
+
+_PAGE_RANKINGS_SQL = text(
+    """
+    SELECT id, generated_at, universe_name, horizon_days, tickers_attempted,
+           tickers_succeeded, regime_signature, top_k, sector_distributions,
+           concentration_alerts, narrative
+    FROM universe_ranking_history
+    WHERE (CAST(:horizon_days AS INTEGER) IS NULL OR horizon_days = :horizon_days)
+    ORDER BY generated_at DESC, id DESC
+    LIMIT :limit OFFSET :offset
+    """
+)
+
+
+def _ranking_row_to_dict(row: Any) -> dict[str, Any]:
+    import json
+
+    def _j(v: Any) -> Any:
+        if v is None:
+            return []
+        if isinstance(v, (list, dict)):
+            return v
+        try:
+            return json.loads(v)
+        except (TypeError, ValueError):
+            return []
+
+    generated_at = row[1]
+    return {
+        "id": int(row[0]),
+        "generated_at": (
+            generated_at.isoformat() if hasattr(generated_at, "isoformat") else generated_at
+        ),
+        "universe_name": row[2],
+        "horizon_days": int(row[3]) if row[3] is not None else DEFAULT_HORIZON_DAYS,
+        "tickers_attempted": int(row[4] or 0),
+        "tickers_succeeded": int(row[5] or 0),
+        "regime_signature": row[6],
+        "top_k": _j(row[7]),
+        "sector_distributions": _j(row[8]),
+        "concentration_alerts": _j(row[9]),
+        "narrative": row[10] or "",
+    }
+
+
+def load_latest_ranking(
+    engine: Engine,
+    *,
+    horizon_days: int | None = None,
+    universe_name: str | None = None,
+) -> dict[str, Any] | None:
+    """Most recent persisted sweep, optionally filtered by horizon/universe.
+
+    Returns the row as a JSON-safe dict (``top_k`` already parsed), or
+    ``None`` when nothing matches or the table does not exist yet.
+    """
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                _LATEST_RANKING_SQL,
+                {"horizon_days": horizon_days, "universe_name": universe_name},
+            ).first()
+    except Exception as exc:  # noqa: BLE001
+        log.debug("universe_ranker: load_latest_ranking failed: {e}", e=exc)
+        return None
+    return _ranking_row_to_dict(row) if row is not None else None
+
+
+def list_rankings(
+    engine: Engine,
+    *,
+    limit: int = 20,
+    offset: int = 0,
+    horizon_days: int | None = None,
+) -> dict[str, Any]:
+    """Page through persisted sweeps, newest first.
+
+    Returns ``{"entries", "total", "limit", "offset", "has_more"}`` (the
+    list-endpoint contract in ``.claude/rules/security.md``). ``top_k`` is
+    returned per row so a client can diff verdicts across sweeps.
+    """
+    limit = max(1, int(limit))
+    offset = max(0, int(offset))
+    params: dict[str, Any] = {"horizon_days": horizon_days}
+    try:
+        with engine.connect() as conn:
+            total = int(conn.execute(_COUNT_RANKINGS_SQL, params).scalar() or 0)
+            rows = conn.execute(
+                _PAGE_RANKINGS_SQL, {**params, "limit": limit, "offset": offset}
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        log.debug("universe_ranker: list_rankings failed: {e}", e=exc)
+        total, rows = 0, []
+    entries = [_ranking_row_to_dict(r) for r in rows]
+    return {
+        "entries": entries,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "has_more": offset + len(entries) < total,
+    }
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────
 
 

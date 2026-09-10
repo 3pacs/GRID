@@ -633,6 +633,23 @@ class GRIDApi {
         });
         return this._fetch(`/api/v1/conviction/ticker/${encodeURIComponent(ticker)}?${params.toString()}`);
     }
+    /**
+     * Latest persisted universe sweep (the Sunday 90 d long-horizon job writes
+     * these). Cheap: a single row read, no decision-stack run. 404 when the
+     * job has not run yet at that horizon.
+     */
+    async getLatestSweep({ horizonDays = null, universe = null } = {}) {
+        const params = new URLSearchParams();
+        if (horizonDays) params.set('horizon_days', String(horizonDays));
+        if (universe) params.set('universe', universe);
+        const qs = params.toString();
+        return this._fetch(`/api/v1/conviction/sweeps/latest${qs ? `?${qs}` : ''}`);
+    }
+    async listSweeps({ limit = 20, offset = 0, horizonDays = null } = {}) {
+        const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+        if (horizonDays) params.set('horizon_days', String(horizonDays));
+        return this._fetch(`/api/v1/conviction/sweeps?${params.toString()}`);
+    }
 
     // Options
     async getOptionsSignals(ticker = '', limit = 50) {

@@ -541,6 +541,20 @@ agent wave.
 > coverage, Kelly size, top evidence, partial-stage errors), CI now runs vitest, and the
 > dead React Flow node set, `@xyflow/react`, and the TypeScript shadow files are gone (V5
 > R0). Not yet: T0.4 (server), T1.2/T1.3, T2.3–T2.6, and the cron entries in T3.
+>
+> **Sprint 3 status (2026-09-10, third PR):** landed — the sweep **read-back**
+> (`GET /api/v1/conviction/sweeps` + `/sweeps/latest` over `universe_ranking_history`,
+> paginated) and the canvas **Verdicts layer**: the latest 90 d sweep paints ticker nodes
+> by verdict and a ranked sweep panel takes the side slot (click a row → the canvas
+> centres on that ticker; click the node → the conviction card runs the stack live);
+> T2.3 `validation/backtest.py::run_hold_validation` — single-name hold test on PIT
+> prices vs SPY net of costs with hit rate, mean/median alpha, t-stat and a
+> pass/fail/insufficient verdict (`python -m validation.backtest hold --ticker NVDA
+> --entries ... --hold-days 90`); T2.5 `paper_strategies.horizon_days` — the executor
+> closes trades after the strategy's own horizon instead of the 1-day hypothesis lag
+> (`PaperTradingEngine.register_strategy(..., horizon_days=90)`). Not yet: T0.4 (server),
+> T1.2/T1.3, T2.4, T2.6, T3 cron entries, and the persisted global circuit breaker that
+> must precede real money.
 
 ### T0 — Truth gates first (3–4 days). Nothing else can be believed until these exist.
 
