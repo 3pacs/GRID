@@ -366,9 +366,11 @@ class RobinhoodCryptoTrader:
         Cached on the instance: the venue routing paths ask once per run
         instead of once per signal. An empty set means "Robinhood told us
         nothing" (unconfigured, or the call failed) — callers must treat that
-        as "route nothing", never as "everything allowed".
+        as "we do not know", never as "everything allowed" and never as "the
+        universe is empty". An empty answer is deliberately not cached, so a
+        transient failure is retried rather than pinned for the run.
         """
-        if self._tradable_assets is not None and not refresh:
+        if self._tradable_assets and not refresh:
             return self._tradable_assets
         assets: set[str] = set()
         for pair in self.get_trading_pairs():
@@ -379,7 +381,8 @@ class RobinhoodCryptoTrader:
             code = symbol.split("-")[0].strip().upper()
             if code:
                 assets.add(code)
-        self._tradable_assets = assets
+        if assets:
+            self._tradable_assets = assets
         return assets
 
     def is_tradable(self, ticker: str) -> bool:

@@ -129,20 +129,26 @@ def _log_trade_to_journal(engine, coin: str, direction: str, size_usd: float,
         pass  # Journal is optional — don't block trading
 
 
-def _tradable_targets(trader: Any, target: dict[str, float], venue: str) -> dict[str, float]:
+def _tradable_targets(trader: Any, target: dict[str, float], venue: str) -> dict[str, float] | None:
     """Drop target coins the venue does not report tradable.
 
     Robinhood lists a different universe than Hyperliquid perps, so a weight
     on a pair it does not carry has to be dropped rather than sent and
     rejected. Weights of the survivors are left untouched — the shortfall
     stays in cash, which is the conservative reading of the regime.
+
+    Returns ``None`` when the venue reported no tradable pairs at all. That is
+    "we could not find out", not "the universe is empty": an empty *target*
+    means risk-off and liquidates the book, so an API blip must never be
+    allowed to wear that costume.
     """
     if venue not in SPOT_VENUES:
         return target
     tradable = trader.tradable_assets()
     if not tradable:
-        log.warning("{v} reported no tradable pairs — allocating nothing", v=venue)
-        return {}
+        log.warning("{v} reported no tradable pairs — skipping the cycle rather than "
+                    "reading a failed lookup as risk-off", v=venue)
+        return None
     kept = {c: w for c, w in target.items() if c.upper() in tradable}
     for coin in target:
         if coin not in kept:
@@ -263,6 +269,10 @@ def execute_rotation_live(mainnet: bool = False, venue: str = "hyperliquid") -> 
 
     # 2. Get target crypto allocation (venue may not list every coin)
     target = _tradable_targets(trader, REGIME_ALLOCATIONS.get(regime, {}), venue)
+    if target is None:
+        return {"status": "VENUE_UNAVAILABLE", "venue": venue, "mode": mode, "regime": regime,
+                "error": f"{venue} reported no tradable pairs — positions left untouched",
+                "timestamp": datetime.now(timezone.utc).isoformat()}
     log.info("Target allocation: {a}", a={k: f"{v:.0%}" for k, v in target.items()} or "100% CASH")
 
     # 3. Check current balance

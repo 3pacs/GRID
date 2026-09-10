@@ -161,6 +161,16 @@ class TestTradablePairs:
         trader.tradable_assets(refresh=True)
         assert len(session.calls) == 4
 
+    def test_a_failed_lookup_is_not_cached(self):
+        """A blip must not pin an empty universe for the rest of the run."""
+        session = FakeSession({})  # everything 404s
+        trader = _trader(session=session)
+        assert trader.tradable_assets() == set()
+        assert trader.tradable_assets() == set()
+        assert len(session.calls) == 2  # retried, not served from cache
+        trader._session = FakeSession(_paged_pairs())
+        assert trader.tradable_assets() == {"BTC", "ETH", "SOL", "DOGE"}
+
     def test_paging_is_bounded(self):
         """A cursor that never terminates stops at max_pages instead of spinning."""
         loop = {("GET", rh.PATH_TRADING_PAIRS): {
@@ -404,9 +414,17 @@ class TestRotationVenue:
         # Perps are unaffected — Hyperliquid lists its own universe.
         assert mod._tradable_targets(trader, target, "hyperliquid") == target
 
-    def test_no_tradable_pairs_allocates_nothing(self):
+    def test_no_tradable_pairs_is_unknown_not_risk_off(self):
+        """An empty universe means the lookup failed — never liquidate on it."""
         mod = self._module()
-        assert mod._tradable_targets(StubTrader(tradable=()), {"BTC": 1.0}, "robinhood") == {}
+        assert mod._tradable_targets(StubTrader(tradable=()), {"BTC": 1.0}, "robinhood") is None
+
+    def test_failed_pair_lookup_leaves_positions_untouched(self, monkeypatch):
+        trader = StubTrader(tradable=())
+        held = [{"coin": "BTC", "size_usd": 60.0, "direction": "LONG"}]
+        out = self._run_rotation(monkeypatch, "risk-on", trader, positions=held)
+        assert out["status"] == "VENUE_UNAVAILABLE"
+        assert trader.closed == [] and trader.orders == []
 
     def test_spot_rebalance_buys_the_delta(self, mock_engine):
         mod = self._module()

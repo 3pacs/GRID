@@ -116,7 +116,10 @@ Same regime → target-weight map as Hyperliquid, executed as **spot**: long
 only, risk-off sells everything to cash, and a rebalance trades the delta
 (buy up, or sell part of the holding) instead of closing and re-opening.
 Target coins Robinhood does not list as tradable are dropped and stay in cash.
-Hyperliquid remains the default venue; Hermes step 7g stays paper.
+If the pair lookup comes back empty the cycle is skipped (`status:
+VENUE_UNAVAILABLE`) with positions untouched — an API blip must not be read as
+risk-off and liquidate the book. Hyperliquid remains the default venue; Hermes
+step 7g stays paper.
 
 ### 3. Signal executor venue tag
 
