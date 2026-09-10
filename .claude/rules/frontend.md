@@ -19,8 +19,8 @@ These rules apply when working on the React PWA in `grid/pwa/`.
 
 ### Gotchas
 
-- PWA static serving in `api/main.py:156-177` assumes `pwa_dist/` or `pwa/` exists — returns 404 silently if not built (#37)
-- No frontend test suite exists (no Jest, Vitest, or Cypress) — #38
+- PWA static serving in `api/main.py:719-761` assumes `pwa_dist/` or `pwa/` exists — falls back to serving `pwa/` source directly in dev if `pwa_dist/` is missing, and silently serves `index.html` for any unmatched path once one of the two exists (#37)
+- 16 Vitest suites (109 tests) exist under `pwa/src/__tests__/` and run in CI (`.github/workflows/test.yml`'s `frontend-build` job: `npm ci`, `npx tsc --noEmit`, `npm run test`, `npm run build`) — run locally with `npm run test`
 - Service worker (`service-worker.js`) and manifest (`manifest.json`) are at the PWA root
 
 ## Commands
