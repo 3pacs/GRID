@@ -122,49 +122,34 @@ DERIVATIVE_WINDOW = 5
 # which is what the 252-day rolling window needs to warm up plus headroom.
 LOOKBACK_DAYS = 756
 
-# ── regime_history canonical labels ─────────────────────────────
+# ── regime_history vocabulary ───────────────────────────────────
 #
-# ``regime_history`` is the cross-lane contract table (see the "Canonical
-# Historical Regime Contract" section of .coordination.md, 2026-03-29). Its
-# vocabulary is fixed at four labels and downstream readers reject anything
-# else outright — store/astrogrid.py::_normalize_regime_label returns None for
-# an unrecognized label and the caller silently falls back. So the writer maps
-# this module's stress-index states onto that vocabulary rather than writing
-# GROWTH/NEUTRAL/FRAGILE/CRISIS directly.
+# ``regime_history`` is the cross-lane table read by the chat regime context,
+# api/routers/intel.py, the oracle prediction context, AstroGrid and the trial
+# signal. Its ``regime`` column carries this module's own state names.
 #
-#   risk_on     growth, low stress
-#   neutral     mixed signals, no directional read
-#   transition  regime changing — stress is still low but deteriorating fast
-#   risk_off    fragile or crisis conditions
+# That is what the rows already on griddb contain — the 2026-03 load wrote
+# ``decision_journal.inferred_state`` verbatim with ``source='decision_journal'``
+# — and it is what the readers that act on the value expect:
 #
-# FRAGILE splits across two labels because _classify_regime reaches it from two
-# different branches: elevated stress (s > 0.6) is genuinely risk_off, while a
-# calm tape deteriorating fast (ds > 0.15 with s <= 0.6) is a regime in
-# transition, not yet risk_off.
-CANONICAL_REGIME_LABELS = ("risk_on", "risk_off", "neutral", "transition")
+#   grid/signals/trial_signal.py gates BUY on {"GROWTH", "NEUTRAL"} and stores
+#   the label into a CHECK-constrained column accepting only these four plus
+#   UNKNOWN. oracle/prediction_context.py::canonical_regime folds all four into
+#   its five-state bucket. api/routers/intel.py passes the label straight to the
+#   briefing.
+#
+# The "Canonical Historical Regime Contract" in .coordination.md describes a
+# different four-label vocabulary (risk_on / risk_off / neutral / transition).
+# No writer has ever produced it — the 12 loaded rows are all 'NEUTRAL', which
+# happens to read as valid under both — and adopting it here would collapse
+# CRISIS into FRAGILE and silently turn every trial-signal BUY into a WATCHLIST.
+# store/astrogrid.py::_normalize_regime_label is the one reader written against
+# that document; it now folds these states into its own labels instead.
+REGIME_HISTORY_LABELS = ("GROWTH", "NEUTRAL", "FRAGILE", "CRISIS")
 
-_STATE_TO_CANONICAL = {
-    "GROWTH": "risk_on",
-    "NEUTRAL": "neutral",
-    "FRAGILE": "risk_off",
-    "CRISIS": "risk_off",
-}
-
-
-def canonical_label(state: str, stress_index: float) -> str:
-    """Map a stress-index state onto the four-label regime_history vocabulary.
-
-    Parameters:
-        state: One of GROWTH / NEUTRAL / FRAGILE / CRISIS.
-        stress_index: The stress index S the state was classified from.
-
-    Returns:
-        One of ``CANONICAL_REGIME_LABELS``.
-    """
-    if state == "FRAGILE" and stress_index <= 0.6:
-        # Reached FRAGILE on the derivative alone — calm but deteriorating.
-        return "transition"
-    return _STATE_TO_CANONICAL.get(state, "neutral")
+# Provenance recorded in regime_history.source, distinguishing rows this writer
+# produced from the 2026-03 one-off load that used source='decision_journal'.
+REGIME_HISTORY_SOURCE = "auto_regime"
 
 
 def _compute_stress_index(
@@ -333,8 +318,8 @@ def compute_regime_at(
             feature_registry once per day in a backfill loop.
 
     Returns:
-        Dict with regime, canonical_label, confidence, stress_index,
-        stress_derivative and n_observations — or an ``error`` key when there
+        Dict with regime, confidence, stress_index, stress_derivative and
+        n_observations — or an ``error`` key when there
         is not enough point-in-time data to classify.
     """
     active_weights = weights if weights is not None else FEATURE_WEIGHTS
@@ -370,7 +355,6 @@ def compute_regime_at(
 
     return {
         "regime": regime,
-        "canonical_label": canonical_label(regime, s_current),
         "confidence": round(confidence, 4),
         "posture": POSTURE_MAP.get(regime, "BALANCED"),
         "stress_index": round(s_current, 4),
@@ -390,14 +374,13 @@ def persist_regime_history(
 ) -> bool:
     """Upsert one row into ``regime_history``.
 
-    ``regime_history`` is the cross-lane contract table read by the chat regime
-    context, the oracle prediction context, AstroGrid and the HMM transition
-    model. One row per observation date.
+    One row per observation date, stamped with ``source`` so a reader can tell
+    a row this writer produced from one the 2026-03 one-off load left behind.
 
     Parameters:
         engine: SQLAlchemy engine.
         obs_date: The date the label describes.
-        label: One of ``CANONICAL_REGIME_LABELS``.
+        label: One of ``REGIME_HISTORY_LABELS``.
         confidence: 0-1 confidence score.
         overwrite: When False, an existing row for ``obs_date`` is left alone.
 
@@ -405,31 +388,40 @@ def persist_regime_history(
         True if a row was written or updated.
 
     Raises:
-        ValueError: If ``label`` is outside the canonical vocabulary or
-            ``confidence`` is not a finite number in [0, 1].
+        ValueError: If ``label`` is outside the vocabulary, or ``confidence``
+            is not a finite number in [0, 1]. A label the readers do not
+            recognize is worse than no row — trial_signal would store it as
+            UNKNOWN and downgrade every BUY — so this refuses rather than
+            writing something downstream will misread.
     """
-    if label not in CANONICAL_REGIME_LABELS:
+    if label not in REGIME_HISTORY_LABELS:
         raise ValueError(
-            f"regime_history label {label!r} is outside the canonical vocabulary "
-            f"{CANONICAL_REGIME_LABELS}"
+            f"regime_history label {label!r} is outside the vocabulary "
+            f"{REGIME_HISTORY_LABELS}"
         )
     conf = float(confidence)
     if not np.isfinite(conf) or not (0.0 <= conf <= 1.0):
         raise ValueError(f"regime confidence must be finite and in [0, 1], got {confidence!r}")
 
     conflict = (
-        "DO UPDATE SET regime = EXCLUDED.regime, confidence = EXCLUDED.confidence"
+        "DO UPDATE SET regime = EXCLUDED.regime, "
+        "confidence = EXCLUDED.confidence, source = EXCLUDED.source"
         if overwrite
         else "DO NOTHING"
     )
     with engine.begin() as conn:
         result = conn.execute(
             text(
-                "INSERT INTO regime_history (obs_date, regime, confidence) "
-                "VALUES (:obs_date, :regime, :confidence) "
+                "INSERT INTO regime_history (obs_date, regime, confidence, source) "
+                "VALUES (:obs_date, :regime, :confidence, :source) "
                 f"ON CONFLICT (obs_date) {conflict}"
             ),
-            {"obs_date": obs_date, "regime": label, "confidence": conf},
+            {
+                "obs_date": obs_date,
+                "regime": label,
+                "confidence": conf,
+                "source": REGIME_HISTORY_SOURCE,
+            },
         )
     return bool(result.rowcount)
 
@@ -518,11 +510,11 @@ def backfill_regime_history(
                 persist_regime_history(
                     engine,
                     current,
-                    result["canonical_label"],
+                    result["regime"],
                     result["confidence"],
                     overwrite=True,
                 )
-                labels[current.isoformat()] = result["canonical_label"]
+                labels[current.isoformat()] = result["regime"]
                 written += 1
         except Exception as exc:
             log.warning(
@@ -754,12 +746,11 @@ def run() -> dict[str, Any]:
     # HMM transition model read. Until this call existed, auto_regime wrote only
     # decision_journal and analytical_snapshots, so regime_history froze at
     # whatever a one-off load had put there.
-    label = canonical_label(regime, s_current)
     regime_history_written = False
     regime_history_error: str | None = None
     try:
-        regime_history_written = persist_regime_history(engine, today, label, confidence)
-        log.info("regime_history updated — {d} = {l}", d=today.isoformat(), l=label)
+        regime_history_written = persist_regime_history(engine, today, regime, confidence)
+        log.info("regime_history updated — {d} = {l}", d=today.isoformat(), l=regime)
     except Exception as exc:
         regime_history_error = str(exc)
         log.warning("regime_history persistence failed: {e}", e=regime_history_error)
@@ -799,7 +790,6 @@ def run() -> dict[str, Any]:
 
     result = {
         "regime": regime,
-        "canonical_label": label,
         "regime_history_written": regime_history_written,
         "regime_history_error": regime_history_error,
         "confidence": confidence,

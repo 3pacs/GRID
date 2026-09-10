@@ -16,10 +16,10 @@ import pandas as pd
 import pytest
 
 from scripts.auto_regime import (
-    CANONICAL_REGIME_LABELS,
     LOOKBACK_DAYS,
+    REGIME_HISTORY_LABELS,
+    REGIME_HISTORY_SOURCE,
     backfill_regime_history,
-    canonical_label,
     compute_regime_at,
     persist_regime_history,
 )
@@ -62,28 +62,47 @@ def _engine_with_features(fids=((1, "vix"), (2, "hy_spread"), (3, "sp500"))):
     return engine, conn
 
 
-# ── Canonical label mapping ─────────────────────────────────────────────
+# ── Vocabulary the readers agree on ─────────────────────────────────────
 
 
-class TestCanonicalLabel:
-    def test_every_state_maps_into_the_contract_vocabulary(self):
-        for state in ("GROWTH", "NEUTRAL", "FRAGILE", "CRISIS"):
-            assert canonical_label(state, 0.0) in CANONICAL_REGIME_LABELS
-            assert canonical_label(state, 2.0) in CANONICAL_REGIME_LABELS
+class TestVocabulary:
+    def test_writer_vocabulary_is_the_classifier_state_names(self):
+        assert set(REGIME_HISTORY_LABELS) == {"GROWTH", "NEUTRAL", "FRAGILE", "CRISIS"}
 
-    def test_growth_is_risk_on_and_crisis_is_risk_off(self):
-        assert canonical_label("GROWTH", -1.2) == "risk_on"
-        assert canonical_label("CRISIS", 2.0) == "risk_off"
+    def test_every_label_passes_the_trial_signal_buy_gate_check(self):
+        """trial_signal stores the label into a CHECK-constrained column and
+        gates BUY on it — a label outside its set silently downgrades every
+        BUY to WATCHLIST."""
+        from grid.signals.trial_signal import ALLOWED_REGIMES
 
-    def test_fragile_on_elevated_stress_is_risk_off(self):
-        assert canonical_label("FRAGILE", 1.0) == "risk_off"
+        assert set(REGIME_HISTORY_LABELS) <= ALLOWED_REGIMES
 
-    def test_fragile_on_derivative_alone_is_transition(self):
-        # Reached FRAGILE with calm stress — deteriorating, not yet risk_off.
-        assert canonical_label("FRAGILE", 0.1) == "transition"
+    def test_every_label_folds_into_the_oracle_five_state_bucket(self):
+        from oracle.prediction_context import VALID_REGIMES, canonical_regime
 
-    def test_unknown_state_falls_back_to_neutral(self):
-        assert canonical_label("UNKNOWN", 0.0) == "neutral"
+        for label in REGIME_HISTORY_LABELS:
+            assert canonical_regime(label) in VALID_REGIMES
+        # And the distinction the four-label contract vocabulary would lose.
+        assert canonical_regime("CRISIS") != canonical_regime("FRAGILE")
+
+    def test_every_label_survives_the_astrogrid_normalizer(self):
+        """Before this change the normalizer returned None for every state but
+        NEUTRAL, so AstroGrid dropped the regime on any non-neutral day."""
+        from store.astrogrid import _normalize_regime_label
+
+        for label in REGIME_HISTORY_LABELS:
+            assert _normalize_regime_label(label) in {
+                "risk_on", "risk_off", "neutral", "transition"
+            }
+        assert _normalize_regime_label("GROWTH") == "risk_on"
+        assert _normalize_regime_label("CRISIS") == "risk_off"
+        assert _normalize_regime_label("NEUTRAL") == "neutral"
+        # Unrelated junk is still rejected.
+        assert _normalize_regime_label("banana") is None
+
+    def test_the_legacy_loaded_rows_are_still_valid(self):
+        """griddb's 12 existing rows are 'NEUTRAL' with source='decision_journal'."""
+        assert "NEUTRAL" in REGIME_HISTORY_LABELS
 
 
 # ── Persistence guards ──────────────────────────────────────────────────
@@ -92,7 +111,7 @@ class TestCanonicalLabel:
 class TestPersistRegimeHistory:
     def test_writes_parameterized_upsert_on_obs_date(self):
         engine, conn = _engine_with_features()
-        assert persist_regime_history(engine, AS_OF, "risk_on", 0.8) is True
+        assert persist_regime_history(engine, AS_OF, "GROWTH", 0.8) is True
 
         sql = str(conn.execute.call_args[0][0])
         params = conn.execute.call_args[0][1]
@@ -100,24 +119,40 @@ class TestPersistRegimeHistory:
         assert "ON CONFLICT (obs_date)" in sql
         # Values are bound, never interpolated.
         assert ":obs_date" in sql and ":regime" in sql and ":confidence" in sql
-        assert "risk_on" not in sql
-        assert params == {"obs_date": AS_OF, "regime": "risk_on", "confidence": 0.8}
+        assert "GROWTH" not in sql
+        assert params == {
+            "obs_date": AS_OF,
+            "regime": "GROWTH",
+            "confidence": 0.8,
+            "source": REGIME_HISTORY_SOURCE,
+        }
+
+    def test_stamps_its_own_provenance(self):
+        """So a reader can tell these rows from the 2026-03 one-off load,
+        which used source='decision_journal'."""
+        engine, conn = _engine_with_features()
+        persist_regime_history(engine, AS_OF, "NEUTRAL", 0.5)
+        assert conn.execute.call_args[0][1]["source"] == "auto_regime"
+        assert "source" in str(conn.execute.call_args[0][0])
 
     def test_overwrite_false_leaves_existing_row_alone(self):
         engine, conn = _engine_with_features()
-        persist_regime_history(engine, AS_OF, "neutral", 0.5, overwrite=False)
+        persist_regime_history(engine, AS_OF, "NEUTRAL", 0.5, overwrite=False)
         assert "DO NOTHING" in str(conn.execute.call_args[0][0])
 
-    def test_rejects_label_outside_the_contract(self):
+    def test_rejects_label_outside_the_vocabulary(self):
+        """A label the readers do not recognize is worse than no row —
+        trial_signal would store UNKNOWN and downgrade every BUY."""
         engine, _ = _engine_with_features()
-        with pytest.raises(ValueError, match="canonical vocabulary"):
-            persist_regime_history(engine, AS_OF, "FRAGILE", 0.5)
+        for bad in ("risk_on", "growth", "EXPANSION", ""):
+            with pytest.raises(ValueError, match="outside the vocabulary"):
+                persist_regime_history(engine, AS_OF, bad, 0.5)
 
     @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -0.1, 1.5])
     def test_rejects_non_finite_or_out_of_range_confidence(self, bad):
         engine, _ = _engine_with_features()
         with pytest.raises(ValueError, match=r"\[0, 1\]"):
-            persist_regime_history(engine, AS_OF, "neutral", bad)
+            persist_regime_history(engine, AS_OF, "NEUTRAL", bad)
 
 
 # ── PIT boundaries ──────────────────────────────────────────────────────
@@ -142,8 +177,7 @@ class TestComputeRegimeAtIsPointInTime:
         # revised vintage that only exists today.
         assert captured["policy"] == "FIRST_RELEASE"
         assert sorted(captured["fids"]) == [1, 2, 3]
-        assert result["regime"] in ("GROWTH", "NEUTRAL", "FRAGILE", "CRISIS")
-        assert result["canonical_label"] in CANONICAL_REGIME_LABELS
+        assert result["regime"] in REGIME_HISTORY_LABELS
 
     def test_asserts_no_lookahead_before_returning(self):
         engine, _ = _engine_with_features()
@@ -211,7 +245,7 @@ class TestBackfill:
 
         def fake_compute(eng, as_of, weights=None, fid_to_name=None):
             seen_as_of.append(as_of)
-            return {"canonical_label": "neutral", "confidence": 0.5}
+            return {"regime": "NEUTRAL", "confidence": 0.5}
 
         with patch("scripts.auto_regime.compute_regime_at", side_effect=fake_compute), \
              patch("scripts.auto_regime.persist_regime_history", return_value=True) as writer:
@@ -243,7 +277,7 @@ class TestBackfill:
         conn.execute.side_effect = [feats, existing]
 
         with patch("scripts.auto_regime.compute_regime_at",
-                   return_value={"canonical_label": "neutral", "confidence": 0.5}), \
+                   return_value={"regime": "NEUTRAL", "confidence": 0.5}), \
              patch("scripts.auto_regime.persist_regime_history", return_value=True):
             result = backfill_regime_history(
                 engine, date(2026, 9, 1), date(2026, 9, 4), overwrite=False
@@ -293,7 +327,6 @@ class TestSchedulerRegistration:
 
         source = inspect.getsource(auto.run)
         assert "persist_regime_history" in source
-        assert "canonical_label" in source
 
 
 # ── Additive staleness fields ───────────────────────────────────────────
@@ -343,7 +376,7 @@ class TestStalenessFields:
         conn.__enter__.return_value = conn
         conn.__exit__.return_value = False
         result = MagicMock()
-        result.fetchone.return_value = (obs_date, "risk_off", 0.7, datetime(2026, 3, 29, 20, 10))
+        result.fetchone.return_value = (obs_date, "FRAGILE", 0.7, datetime(2026, 3, 29, 20, 10))
         conn.execute.return_value = result
         engine.connect.return_value = conn
 
@@ -379,7 +412,7 @@ class TestStalenessFields:
         conn.__enter__.return_value = conn
         conn.__exit__.return_value = False
         result = MagicMock()
-        result.fetchone.return_value = (date.today(), "neutral", 0.6, datetime.now())
+        result.fetchone.return_value = (date.today(), "NEUTRAL", 0.6, datetime.now())
         conn.execute.return_value = result
         engine.connect.return_value = conn
 

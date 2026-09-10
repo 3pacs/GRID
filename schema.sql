@@ -293,22 +293,26 @@ CREATE INDEX IF NOT EXISTS idx_decision_journal_outcome_recorded
     ON decision_journal (outcome_recorded_at);
 
 -- ---------------------------------------------------------------------------
--- regime_history — the cross-lane canonical regime label, one row per date.
+-- regime_history — the daily regime label, one row per observation date.
 --
 -- Written by scripts/auto_regime.py (daily via ingestion/scheduler.py, and by
--- its --backfill entry point). Read by the chat regime context, the oracle
--- prediction context, AstroGrid, the HMM transition model and the trial
--- signal. The label vocabulary is the fixed four-label contract published in
--- .coordination.md; readers reject anything outside it.
+-- its --backfill entry point). Read by api/routers/chat.py, api/routers/intel.py,
+-- oracle/prediction_context.py, store/astrogrid.py and grid/signals/trial_signal.py.
+--
+-- ``regime`` carries auto_regime's own state names. That is what the 2026-03
+-- rows on griddb hold (the load wrote decision_journal.inferred_state verbatim)
+-- and what the readers that act on the value expect — trial_signal gates BUY on
+-- {GROWTH, NEUTRAL} and stores the label into a CHECK-constrained column.
 --
 -- The table existed on griddb long before it was declared here, which is how
 -- it came to have no writer in the repository at all.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS regime_history (
     obs_date    DATE PRIMARY KEY,
-    regime      TEXT NOT NULL CHECK (regime IN (
-                    'risk_on', 'risk_off', 'neutral', 'transition')),
+    regime      TEXT NOT NULL CHECK (upper(regime) IN (
+                    'GROWTH', 'NEUTRAL', 'FRAGILE', 'CRISIS')),
     confidence  DOUBLE PRECISION CHECK (confidence BETWEEN 0 AND 1),
+    source      TEXT,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

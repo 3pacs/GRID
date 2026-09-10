@@ -31,14 +31,16 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # Fresh databases: create the table as documented in the canonical regime
-    # contract (.coordination.md, 2026-03-29). A no-op where it already exists.
+    # Fresh databases: create the table with the shape the live griddb table
+    # has — (obs_date, regime, confidence, source, created_at). A no-op where
+    # it already exists.
     op.execute(
         """
         CREATE TABLE IF NOT EXISTS regime_history (
             obs_date    DATE PRIMARY KEY,
             regime      TEXT NOT NULL,
             confidence  DOUBLE PRECISION,
+            source      TEXT,
             created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
         """

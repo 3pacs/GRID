@@ -1185,7 +1185,7 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
             "Auto regime detection — state={s}, confidence={c}, regime_history={rh}",
             s=result.get("regime", "?"),
             c=result.get("confidence", "?"),
-            rh=result.get("canonical_label", "?") if result.get("regime_history_written")
+            rh=result.get("regime", "?") if result.get("regime_history_written")
             else "NOT WRITTEN",
         )
         if result.get("regime_history_error"):
