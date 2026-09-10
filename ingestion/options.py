@@ -39,6 +39,59 @@ EQUITY_TICKERS: list[str] = [
 # Maximum expirations to pull per ticker
 MAX_EXPIRATIONS = 12
 
+# Catalyst-universe coverage (2026-09-10).
+#
+# EQUITY_TICKERS above is 41 hand-listed mega caps. Measured on 2026-09-10,
+# options_daily_signals held zero rows for every sub-$2B catalyst name the Long
+# Plays board tracks — OLMA, TECX, OCGN, MLTX, RNAC, ANNX, DNTH, BLTE, APGE,
+# MESO among them. That single gap disabled two things at once: the options
+# expression of a catalyst bet, and the IV surface that
+# ``intelligence.catalyst_ev.upside_multiple_from_iv`` inverts for its upside
+# anchor. The names with the most convex payoff were the only ones with no
+# chain data.
+#
+# Yahoo lists chains for most of these, so the fix is coverage, not a vendor:
+# union the hand-list with the tickers that actually have a dated catalyst.
+CATALYST_UNIVERSE_HORIZON_DAYS: int = 560
+CATALYST_UNIVERSE_MAX_TICKERS: int = 200
+
+_CATALYST_UNIVERSE_SQL = text(
+    """
+    SELECT DISTINCT cc.ticker
+    FROM catalyst_calendar cc
+    WHERE cc.is_active
+      AND cc.expected_date >= CURRENT_DATE
+      AND cc.expected_date <= CURRENT_DATE + :horizon_days
+      AND cc.ticker ~ '^[A-Z.-]{1,6}$'
+    ORDER BY cc.ticker
+    LIMIT :max_tickers
+    """
+)
+
+
+def catalyst_options_universe(
+    engine: Engine,
+    *,
+    horizon_days: int = CATALYST_UNIVERSE_HORIZON_DAYS,
+    max_tickers: int = CATALYST_UNIVERSE_MAX_TICKERS,
+) -> list[str]:
+    """Tickers with a dated catalyst inside ``horizon_days``.
+
+    Bounded on both sides and capped, because this list drives an outbound
+    fetch loop. Never raises — a missing ``catalyst_calendar`` just means no
+    extra coverage this cycle.
+    """
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                _CATALYST_UNIVERSE_SQL,
+                {"horizon_days": int(horizon_days), "max_tickers": int(max_tickers)},
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("options: catalyst universe unavailable: {e}", e=str(exc))
+        return []
+    return [str(r[0]).strip().upper() for r in rows if r[0] and str(r[0]).strip()]
+
 
 # ── Yahoo Finance direct API client ────────────────────────────
 
@@ -180,11 +233,22 @@ class OptionsPuller(BasePuller):
                 ON options_daily_signals (ticker, signal_date)
             """))
 
-    def pull_all(self, tickers: list[str] | None = None) -> list[dict[str, Any]]:
+    def pull_all(
+        self,
+        tickers: list[str] | None = None,
+        *,
+        include_catalyst_universe: bool = True,
+    ) -> list[dict[str, Any]]:
         """Pull options chains for all tickers and compute signals.
 
         Parameters:
-            tickers: Override ticker list (default: EQUITY_TICKERS).
+            tickers: Override ticker list. When given it is used verbatim and
+                ``include_catalyst_universe`` is ignored.
+            include_catalyst_universe: Union ``EQUITY_TICKERS`` with the
+                tickers carrying a dated catalyst (see
+                ``catalyst_options_universe``). On by default: without it the
+                sub-$2B names the Long Plays board gates on have no chain and
+                no IV surface, which is the state measured on 2026-09-10.
 
         Returns:
             list[dict]: Per-ticker results with status and row counts.
@@ -194,7 +258,16 @@ class OptionsPuller(BasePuller):
             log.error("Yahoo options client unavailable — cannot pull options")
             return [{"ticker": "N/A", "status": "FAILED", "error": "Yahoo auth failed"}]
 
-        tickers = tickers or EQUITY_TICKERS
+        if tickers is None:
+            tickers = list(EQUITY_TICKERS)
+            if include_catalyst_universe:
+                extra = [t for t in catalyst_options_universe(self.engine) if t not in set(tickers)]
+                if extra:
+                    log.info(
+                        "options: +{n} catalyst-universe tickers beyond the {b} hand-listed",
+                        n=len(extra), b=len(tickers),
+                    )
+                    tickers = tickers + extra
         today_str = date.today().isoformat()
         results: list[dict[str, Any]] = []
 

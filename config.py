@@ -499,6 +499,14 @@ class Settings(BaseSettings):
     HYPERLIQUID_MAX_POSITION_USD: float = 100.0
     HYPERLIQUID_MAX_DRAWDOWN_PCT: float = 0.20
 
+    # Compute coordinator tenant order (scripts/compute_coordinator.py).
+    # Inverted 2026-09-10 on the operator's call: OCMRI is the lowest-priority
+    # tenant "for now", capped at 0 while Boogerbots runs 1-30, so GRID and
+    # Boogerbots work outranks it and no yield declaration is required.
+    # Set true to restore the old order, where OCMRI sat above the Boogerbots
+    # band and every Boogerbots job had to declare that it yielded.
+    COMPUTE_YIELD_TO_OCMRI: bool = False
+
     # Robinhood crypto trading — official key-signed Crypto Trading API
     # (trading/robinhood.py). Dry-run until ROBINHOOD_LIVE_TRADING=true.
     # Generate the keypair with `python -m trading.robinhood keygen`; the

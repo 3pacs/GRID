@@ -1,7 +1,10 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { api } from '../api.js';
 import { shared, colors } from '../styles/shared.js';
 import ViewHelp from '../components/ViewHelp.jsx';
+import { useAsyncData } from '../hooks/useAsyncData.js';
+import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
+import ErrorState from '../components/ErrorState.jsx';
 
 // Energy level color coding
 const energyColor = (level) => {
@@ -92,14 +95,14 @@ function ForceArrow({ item, maxEnergy }) {
 }
 
 // Dashboard tab
-function DashboardTab({ dashboard, loading, onLoad }) {
-    if (loading) return <div style={{ color: colors.textMuted, padding: '20px', textAlign: 'center' }}>Loading dashboard...</div>;
+function DashboardTab({ dashboard, loading, error, onLoad }) {
+    if (loading) return <LoadingSkeleton variant="card" count={3} />;
+    if (error) return <ErrorState error={error} onRetry={onLoad} title="Physics dashboard unavailable" />;
     if (!dashboard) return (
         <div style={shared.card}>
             <button style={shared.button} onClick={onLoad}>Load Physics Dashboard</button>
         </div>
     );
-    if (dashboard.error) return <div style={{ ...shared.card, borderColor: colors.red }}><div style={shared.error}>{dashboard.error}</div></div>;
 
     const { market_energy, news_energy, hurst_exponents, ou_parameters, energy_conservation, summary } = dashboard;
 
@@ -204,14 +207,14 @@ function DashboardTab({ dashboard, loading, onLoad }) {
 }
 
 // News Energy tab
-function NewsEnergyTab({ data, loading, onLoad }) {
-    if (loading) return <div style={{ color: colors.textMuted, padding: '20px', textAlign: 'center' }}>Loading news energy...</div>;
+function NewsEnergyTab({ data, loading, error, onLoad }) {
+    if (loading) return <LoadingSkeleton variant="card" count={3} />;
+    if (error) return <ErrorState error={error} onRetry={onLoad} title="News energy data unavailable" />;
     if (!data) return (
         <div style={shared.card}>
             <button style={shared.button} onClick={onLoad}>Load News Energy</button>
         </div>
     );
-    if (data.error) return <div style={{ ...shared.card, borderColor: colors.red }}><div style={shared.error}>{data.error}</div></div>;
 
     const { energy_by_source, total_news_energy, coherence, force_vector, regime_signal, summary } = data;
     const maxEnergy = Math.max(...(energy_by_source || []).map(s => s.total_energy), 1);
@@ -315,10 +318,6 @@ export default function Physics() {
     const [featureAnalysis, setFeatureAnalysis] = useState(null);
     const [analysing, setAnalysing] = useState(false);
     const [activeTab, setActiveTab] = useState('dashboard');
-    const [dashboard, setDashboard] = useState(null);
-    const [dashboardLoading, setDashboardLoading] = useState(false);
-    const [newsEnergy, setNewsEnergy] = useState(null);
-    const [newsEnergyLoading, setNewsEnergyLoading] = useState(false);
 
     const runVerify = async () => {
         setVerifying(true);
@@ -353,27 +352,13 @@ export default function Physics() {
         setAnalysing(false);
     };
 
-    const loadDashboard = async () => {
-        setDashboardLoading(true);
-        try {
-            const result = await api.getPhysicsDashboard();
-            setDashboard(result);
-        } catch (e) {
-            setDashboard({ error: e.message });
-        }
-        setDashboardLoading(false);
-    };
+    const {
+        data: dashboard, loading: dashboardLoading, error: dashboardError, refetch: loadDashboard,
+    } = useAsyncData(() => api.getPhysicsDashboard(), { fallback: null, skip: true });
 
-    const loadNewsEnergy = async () => {
-        setNewsEnergyLoading(true);
-        try {
-            const result = await api.getNewsEnergy(30);
-            setNewsEnergy(result);
-        } catch (e) {
-            setNewsEnergy({ error: e.message });
-        }
-        setNewsEnergyLoading(false);
-    };
+    const {
+        data: newsEnergy, loading: newsEnergyLoading, error: newsEnergyError, refetch: loadNewsEnergy,
+    } = useAsyncData(() => api.getNewsEnergy(30), { fallback: null, skip: true });
 
     return (
         <div style={shared.container}>
@@ -398,6 +383,7 @@ export default function Physics() {
                 <DashboardTab
                     dashboard={dashboard}
                     loading={dashboardLoading}
+                    error={dashboardError}
                     onLoad={loadDashboard}
                 />
             )}
@@ -406,6 +392,7 @@ export default function Physics() {
                 <NewsEnergyTab
                     data={newsEnergy}
                     loading={newsEnergyLoading}
+                    error={newsEnergyError}
                     onLoad={loadNewsEnergy}
                 />
             )}

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import threading
+import time
 from typing import Any
 
 from fastapi import APIRouter, Depends
@@ -16,8 +18,20 @@ from utils.ttl_cache import TTLCache
 router = APIRouter(prefix="/api/v1/flows", tags=["flows"])
 
 
-_SECTOR_CACHE_TTL: float = 300.0  # 5 minutes
+_SECTOR_CACHE_TTL: float = 300.0  # 5 minutes — "fresh" window
 _sector_cache: TTLCache = TTLCache(ttl=_SECTOR_CACHE_TTL, max_size=5)
+
+# Stale-while-revalidate tier: holds the last successfully computed payload
+# well past the fresh TTL so a request never blocks on the full computation
+# (measured 40s cold / 20ms warm — AGENTS.md 2026-05-30). ``_sector_warm_loop``
+# keeps both tiers populated from a background thread; the request path only
+# ever reads from cache and never runs the computation inline.
+_SECTOR_STALE_TTL: float = 21600.0  # 6 hours
+_sector_stale_cache: TTLCache = TTLCache(ttl=_SECTOR_STALE_TTL, max_size=5)
+_SECTOR_CACHE_KEY = "sectors"
+
+_sector_warm_lock = threading.Lock()
+_sector_warm_thread_started = False
 
 # Narrative LLM calls are expensive (1-5s). Cache per-sector for 1 hour so
 # sector-dive requests don't pay the ollama round-trip on every pageview.
@@ -25,13 +39,14 @@ _SECTOR_NARRATIVE_TTL: float = 3600.0
 _sector_narrative_cache: TTLCache = TTLCache(ttl=_SECTOR_NARRATIVE_TTL, max_size=32)
 
 
-@router.get("/sectors")
-def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
-    """Return the full sector map with live z-scores for each actor's features."""
-    cached = _sector_cache.get("sectors")
-    if cached is not None:
-        return cached
+def _compute_sectors_payload() -> dict[str, Any]:
+    """Build the full sector map with live z-scores for each actor's features.
 
+    This is the expensive path (~40s cold per AGENTS.md 2026-05-30, driven
+    mostly by the batched price/z-score DB work below). It must never be
+    called directly from the request handler — only from the background
+    warm loop — so a cold cache can never block a request.
+    """
     from analysis.sector_map import SECTOR_MAP, get_actor_influence
 
     engine = get_db_engine()
@@ -120,39 +135,64 @@ def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
         from datetime import date, timedelta
         today = date.today()
         d30 = today - timedelta(days=30)
-
-        # Build all possible series_ids
-        sid_to_ticker: dict[str, str] = {}
-        for t in all_tickers:
-            sid_to_ticker[f"YF:{t}:close"] = t
-            sid_to_ticker[f"YF:{t}-USD:close"] = t
+        # Bound the "latest price" scan too — without this, DISTINCT ON
+        # over series_id IN (...) has to sort the *entire* history of every
+        # matching series. 180 days is generous slack for even slow-updating
+        # sources while keeping the query index-friendly.
+        lookback = today - timedelta(days=180)
 
         if all_tickers:
+            # Two possible series_id spellings per ticker (plain equities vs
+            # the "-USD" crypto/fx style). One batched round trip covers all
+            # tickers x both spellings instead of the previous per-ticker,
+            # per-spelling loop (up to 4 sequential queries x N tickers,
+            # which is what made this endpoint 40s on a cold DB connection
+            # pool — see AGENTS.md 2026-05-30).
+            series_ids: list[str] = []
+            sid_to_ticker: dict[str, str] = {}
+            for t in sorted(all_tickers):
+                for sid in (f"YF:{t}:close", f"YF:{t}-USD:close"):
+                    series_ids.append(sid)
+                    sid_to_ticker[sid] = t
+
+            placeholders = ", ".join(f":s{i}" for i in range(len(series_ids)))
+            params = {f"s{i}": s for i, s in enumerate(series_ids)}
+            params["d30"] = d30
+            params["lookback"] = lookback
+
             with engine.connect() as conn:
-                for ticker in all_tickers:
-                    # Try YF:TICKER:close, then YF:TICKER-USD:close
-                    for sid in [f"YF:{ticker}:close", f"YF:{ticker}-USD:close"]:
-                        # Use MEDIAN-like approach: get the most common value for latest date
-                        # to avoid volume/adj_close contamination in the :close series
-                        row = conn.execute(text(
-                            "SELECT value FROM raw_series "
-                            "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
-                            "AND value > 0.01 AND value < 999999 "
-                            "ORDER BY obs_date DESC, pull_timestamp DESC LIMIT 1"
-                        ), {"sid": sid}).fetchone()
-                        if row:
-                            price_map[ticker] = float(row[0])
-                            prev = conn.execute(text(
-                                "SELECT value FROM raw_series "
-                                "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
-                                "AND value > 0.01 AND value < 999999 "
-                                "AND obs_date <= :d30 "
-                                "ORDER BY obs_date DESC, pull_timestamp DESC LIMIT 1"
-                            ), {"sid": sid, "d30": d30}).fetchone()
-                            if prev and float(prev[0]) != 0:
-                                change_30d_map[ticker] = round(
-                                    (price_map[ticker] - float(prev[0])) / float(prev[0]), 5)
-                            break
+                # Use MEDIAN-like approach: get the most common value for latest date
+                # to avoid volume/adj_close contamination in the :close series
+                latest_rows = conn.execute(text(
+                    "SELECT DISTINCT ON (series_id) series_id, value "
+                    "FROM raw_series "
+                    "WHERE series_id IN (" + placeholders + ") "
+                    "AND pull_status = 'SUCCESS' AND value > 0.01 AND value < 999999 "
+                    "AND obs_date >= :lookback "
+                    "ORDER BY series_id, obs_date DESC, pull_timestamp DESC"
+                ), params).fetchall()
+                latest_by_sid = {r[0]: float(r[1]) for r in latest_rows}
+
+                prev_rows = conn.execute(text(
+                    "SELECT DISTINCT ON (series_id) series_id, value "
+                    "FROM raw_series "
+                    "WHERE series_id IN (" + placeholders + ") "
+                    "AND pull_status = 'SUCCESS' AND value > 0.01 AND value < 999999 "
+                    "AND obs_date >= :lookback AND obs_date <= :d30 "
+                    "ORDER BY series_id, obs_date DESC, pull_timestamp DESC"
+                ), params).fetchall()
+                prev_by_sid = {r[0]: float(r[1]) for r in prev_rows}
+
+            for ticker in all_tickers:
+                # Prefer YF:TICKER:close, then YF:TICKER-USD:close
+                for sid in (f"YF:{ticker}:close", f"YF:{ticker}-USD:close"):
+                    if sid in latest_by_sid:
+                        price_map[ticker] = latest_by_sid[sid]
+                        prev = prev_by_sid.get(sid)
+                        if prev:
+                            change_30d_map[ticker] = round(
+                                (price_map[ticker] - prev) / prev, 5)
+                        break
     except Exception as exc:
         log.warning("Batch price fetch failed: {e}", e=str(exc))
 
@@ -218,9 +258,79 @@ def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
             "subsectors": list(sector.get("subsectors", {}).keys()),
         }
 
-    result = {"sectors": sectors}
-    _sector_cache.set("sectors", result)
-    return result
+    return {"sectors": sectors}
+
+
+_SECTOR_WARM_RETRY_SECONDS = 30.0
+
+
+def _sector_warm_cycle() -> float:
+    """Run one warm cycle: compute and populate both cache tiers.
+
+    Returns the number of seconds to sleep before the next cycle — short on
+    failure (quick retry after a transient DB blip), comfortably inside the
+    fresh TTL on success (so steady traffic never sees a fresh-cache miss).
+    Split out from `_sector_warm_loop` so it can be exercised directly by
+    tests without needing to run (or break out of) an infinite loop.
+    """
+    try:
+        result = _compute_sectors_payload()
+        _sector_cache.set(_SECTOR_CACHE_KEY, result)
+        _sector_stale_cache.set(_SECTOR_CACHE_KEY, result)
+        log.info(
+            "Sector flow cache warmed ({n} sectors)",
+            n=len(result.get("sectors", {})),
+        )
+        return max(_SECTOR_CACHE_TTL - 60.0, _SECTOR_WARM_RETRY_SECONDS)
+    except Exception as exc:
+        log.warning("Sector flow cache warm failed: {e}", e=str(exc))
+        return _SECTOR_WARM_RETRY_SECONDS
+
+
+def _sector_warm_loop() -> None:
+    """Background loop that keeps the sector cache warm for the process lifetime."""
+    while True:
+        time.sleep(_sector_warm_cycle())
+
+
+def _ensure_sector_warm_thread() -> None:
+    """Start the background warm loop once, lazily, on first request.
+
+    Not started at module import time — import can happen in contexts
+    (tests, tooling) that shouldn't trigger DB traffic or long-lived
+    threads as a side effect.
+    """
+    global _sector_warm_thread_started
+    with _sector_warm_lock:
+        if _sector_warm_thread_started:
+            return
+        _sector_warm_thread_started = True
+    threading.Thread(
+        target=_sector_warm_loop, daemon=True, name="sector-flow-warm",
+    ).start()
+
+
+@router.get("/sectors")
+def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
+    """Return the full sector map with live z-scores for each actor's features.
+
+    Never computes inline: a fresh cache hit returns immediately, a stale
+    hit returns the last good payload immediately (stale-while-revalidate —
+    the background warm loop keeps refreshing it), and a true cold process
+    (nothing computed yet) returns an explicit empty/unavailable payload
+    instead of blocking the request for the ~40s cold compute.
+    """
+    _ensure_sector_warm_thread()
+
+    cached = _sector_cache.get(_SECTOR_CACHE_KEY)
+    if cached is not None:
+        return cached
+
+    stale = _sector_stale_cache.get(_SECTOR_CACHE_KEY)
+    if stale is not None:
+        return stale
+
+    return {"sectors": {}, "stale": True, "unavailable": True}
 
 
 @router.get("/sectors/{sector_name}/detail")

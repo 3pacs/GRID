@@ -307,7 +307,27 @@ BOOGERBOTS_REQUIRED_AUDIT_EVENTS = {
     "completed_or_failed",
 }
 BOOGERBOTS_PRIORITY_CEILING = 30
+
+# Tenant order, inverted 2026-09-10 on the operator's call ("flip it around,
+# ocmri defers"; "ocmri is lowest priority for now").
+#
+# Claims are served `ORDER BY priority DESC`, so a higher number wins. Until
+# today OCMRI sat on a floor of 31, above the 0-30 Boogerbots band, and every
+# Boogerbots job had to declare that it yielded to OCMRI. Now OCMRI is capped
+# at 0 — the bottom of the scale — and the Boogerbots band starts at 1, so any
+# GRID or Boogerbots work outranks it.
+#
+# `COMPUTE_YIELD_TO_OCMRI=true` in the environment restores the old order
+# without a code change, which is what "for now" buys.
+OCMRI_PRIORITY_CEILING = 0
+BOOGERBOTS_PRIORITY_FLOOR = OCMRI_PRIORITY_CEILING + 1
+#: Legacy floor, only meaningful when yielding to OCMRI is re-enabled.
 OCMRI_PRIORITY_FLOOR = BOOGERBOTS_PRIORITY_CEILING + 1
+
+
+def yields_to_ocmri() -> bool:
+    """True when the deprecated OCMRI-wins tenant order is re-enabled."""
+    return bool(getattr(settings, "COMPUTE_YIELD_TO_OCMRI", False))
 KILL_SWITCH_TRUTHY_VALUES = {"1", "true", "yes", "on", "active", "stop"}
 KILL_SWITCH_FALSEY_VALUES = {"", "0", "false", "no", "off", "inactive"}
 
@@ -413,27 +433,45 @@ def boogerbots_scheduler_proof(payload: dict[str, Any]) -> dict[str, Any]:
     )
     preemption = payload.get("preemption")
     preemption_enabled = _is_mapping(preemption) and preemption.get("enabled") is True
+    legacy = yields_to_ocmri()
+    floor = 0 if legacy else BOOGERBOTS_PRIORITY_FLOOR
     priority_in_range = (
         isinstance(priority_value, int)
-        and 0 <= priority_value <= BOOGERBOTS_PRIORITY_CEILING
+        and floor <= priority_value <= BOOGERBOTS_PRIORITY_CEILING
     )
+    # Legacy order: OCMRI outranks Boogerbots, which must declare the yield.
     ocmri_priority_wins = (
         priority_in_range
         and "ocmri" in yield_targets
         and preemption_enabled
         and priority_value < OCMRI_PRIORITY_FLOOR
     )
+    # Current order: OCMRI is capped at the bottom, so Boogerbots outranks it
+    # on priority alone — no yield declaration required.
+    ocmri_defers = priority_in_range and priority_value > OCMRI_PRIORITY_CEILING
+    claim_order = (
+        [
+            {"tenant": "ocmri", "priority": OCMRI_PRIORITY_FLOOR},
+            {"tenant": "boogerbots", "priority": priority_value},
+        ]
+        if legacy
+        else [
+            {"tenant": "boogerbots", "priority": priority_value},
+            {"tenant": "ocmri", "priority": OCMRI_PRIORITY_CEILING},
+        ]
+    )
     return {
         "boogerbots_priority_value": priority_value,
         "boogerbots_priority_ceiling": BOOGERBOTS_PRIORITY_CEILING,
+        "boogerbots_priority_floor": floor,
         "ocmri_priority_floor": OCMRI_PRIORITY_FLOOR,
+        "ocmri_priority_ceiling": OCMRI_PRIORITY_CEILING,
         "ocmri_priority_wins": ocmri_priority_wins,
+        "ocmri_defers": ocmri_defers,
+        "yields_to_ocmri": legacy,
         "yield_to_ocmri": "ocmri" in yield_targets,
         "preemption_enabled": preemption_enabled,
-        "claim_order_proof": [
-            {"tenant": "ocmri", "priority": OCMRI_PRIORITY_FLOOR},
-            {"tenant": "boogerbots", "priority": priority_value},
-        ],
+        "claim_order_proof": claim_order,
     }
 
 
@@ -469,7 +507,8 @@ def boogerbots_w1_proof(payload: dict[str, Any]) -> dict[str, Any]:
     kill_switch = boogerbots_kill_switch_state(payload)
     audit = boogerbots_audit_sink_proof(payload)
     ready = (
-        scheduler["ocmri_priority_wins"]
+        (scheduler["ocmri_priority_wins"] if yields_to_ocmri()
+         else scheduler["ocmri_defers"])
         and kill_switch["configured"]
         and audit["separate_from_ocmri_sentry"]
         and audit["required_events_present"]
@@ -519,12 +558,16 @@ def boogerbots_contract_errors(payload: dict[str, Any]) -> list[str]:
                 "priority.class must be 'boogerbots-low' or "
                 "'boogerbots-background'"
             )
+        band_floor = 0 if yields_to_ocmri() else BOOGERBOTS_PRIORITY_FLOOR
         if (
             not isinstance(priority_value, int)
-            or priority_value < 0
-            or priority_value > 30
+            or priority_value < band_floor
+            or priority_value > BOOGERBOTS_PRIORITY_CEILING
         ):
-            errors.append("priority.value must be an integer from 0 through 30")
+            errors.append(
+                "priority.value must be an integer from "
+                f"{band_floor} through {BOOGERBOTS_PRIORITY_CEILING}"
+            )
 
     resources = payload.get("resources")
     resources = resources if _is_mapping(resources) else {}
@@ -541,7 +584,9 @@ def boogerbots_contract_errors(payload: dict[str, Any]) -> list[str]:
     if not _is_mapping(yield_policy):
         errors.append("yield_policy must be an object")
     else:
-        if "ocmri" not in set(_string_list(yield_policy.get("yield_to"))):
+        if yields_to_ocmri() and "ocmri" not in set(
+            _string_list(yield_policy.get("yield_to"))
+        ):
             errors.append("yield_policy.yield_to must include 'ocmri'")
         check_interval = yield_policy.get("check_interval_seconds")
         if not isinstance(check_interval, int) or check_interval < 5 or check_interval > 60:
@@ -551,11 +596,17 @@ def boogerbots_contract_errors(payload: dict[str, Any]) -> list[str]:
             and yield_policy.get("idle_window_required") is not True
         ):
             errors.append("GPU workloads must set yield_policy.idle_window_required=true")
-        if yield_policy.get("on_ocmri_demand") not in {
+        on_demand = yield_policy.get("on_ocmri_demand")
+        allowed_on_demand = {
             "checkpoint_and_exit",
             "exit_without_start",
             "pause_and_resume",
-        }:
+        }
+        # Only required while Boogerbots yields; if declared anyway it must
+        # still name a supported action.
+        if (yields_to_ocmri() or on_demand is not None) and (
+            on_demand not in allowed_on_demand
+        ):
             errors.append("yield_policy.on_ocmri_demand has an unsupported action")
 
     preemption = payload.get("preemption")
