@@ -24,7 +24,7 @@ on:
           GPT-OSS 120B (Medium). API-style ids such as "gemini-flash-latest" are
           rejected: `agy` matches on the display name, not the API id.
         type: string
-        default: "Gemini 3.8 Flash (Medium)"
+        default: "Gemini 3.8 Flash (High)"
       workdir:
         description: "Working directory on the server"
         type: string
