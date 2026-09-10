@@ -192,7 +192,9 @@ class TestScorePendingMemo:
 
         lookups: list[tuple[str, date]] = []
 
-        def fake_price(engine_, ticker, d):
+        def fake_price(engine_, ticker, d, as_of=None):
+            # _get_price_near_date grew an as_of bound (PIT snapshot per
+            # cycle); the double must accept it or the scorer TypeErrors.
             lookups.append((ticker, d))
             if ticker == "ZZZZ":
                 ts._remember_yf_no_data("ZZZZ")  # what the live fetch does on no data
