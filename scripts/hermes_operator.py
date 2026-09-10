@@ -774,6 +774,19 @@ def run_intelligence_tasks(
         except Exception as exc:
             log.warning("Source audit import failed: {e}", e=str(exc))
 
+        # Flow materialization — projects signal_sources into the relational
+        # flow tables (dark_pool_weekly, etf_flows, insider_trades,
+        # congressional_trades, junction_point_readings). The module existed
+        # with zero callers, which is why those tables were documented empty
+        # (docs/planning/FILL-EMPTY-TABLES.md; LEVER-PACKAGE.md §7 T1.4).
+        try:
+            from ingestion.flow_materializer import sync_all as _flow_sync_all
+            results["flow_materialize"] = _run_intel_task(
+                "flow_materialize", _flow_sync_all, state, engine,
+            )
+        except Exception as exc:
+            log.warning("Flow materializer import failed: {e}", e=str(exc))
+
         try:
             from analysis.backtest_scanner import run_full_scan
             results["backtest_scan"] = _run_intel_task(
