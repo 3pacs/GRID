@@ -1,7 +1,7 @@
 """regime_history — declare the table and guarantee the obs_date upsert key.
 
 Revision ID: regime_history_writer
-Revises: idle_fleet_goal_queue_day1
+Revises: merge_heads_20260910
 Create Date: 2026-09-10 00:00:00.000000
 
 ``regime_history`` has been read by the chat regime context, the oracle
@@ -25,7 +25,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "regime_history_writer"
-down_revision: Union[str, Sequence[str], None] = "idle_fleet_goal_queue_day1"
+down_revision: Union[str, Sequence[str], None] = "merge_heads_20260910"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -77,6 +77,24 @@ def upgrade() -> None:
                 END IF;
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_regime_history_obs_date
                     ON regime_history (obs_date);
+            END IF;
+        END
+        $$
+        """
+    )
+
+    # The raw-SQL migration series requires a GRANT footer on every new table
+    # (migrations/_TEMPLATE.sql): alembic runs as the owner role, so a freshly
+    # created table is unusable by the `grid` application role until it is
+    # granted. On griddb the table predates this migration and already carries
+    # its privileges, so this is a no-op there. Guarded on the role existing so
+    # a developer database without a `grid` role still migrates.
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'grid') THEN
+                EXECUTE 'GRANT ALL ON regime_history TO grid';
             END IF;
         END
         $$
