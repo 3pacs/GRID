@@ -22,11 +22,13 @@ The matcher is deliberately narrow so it stays quiet on ordinary code:
 
 * the value must be 16+ alphanumerics mixing at least two of lower / upper /
   digit (placeholders like ``your_key_here``, hyphenated test values, and
-  snake_case constants never qualify);
+  snake_case constants never qualify; shorter service passwords are out of
+  reach of this heuristic and stay a review item);
 * it must sit in a key-shaped slot — a ``*KEY / *TOKEN / *SECRET / *PASSWORD``
-  assignment (Python, shell, Dockerfile ``ENV``, YAML, prose ``Key:``), an
-  ``apikey= / api_key= / token=`` query-string parameter, or the default
-  argument of ``os.getenv`` / ``os.environ.get``.
+  assignment (Python, a typed pydantic-settings field, shell, Dockerfile
+  ``ENV``, YAML, prose ``Key:``), a shell / docker-compose ``${VAR:-default}``
+  fallback, an ``apikey= / api_key= / token=`` query-string parameter, or the
+  default argument of ``os.getenv`` / ``os.environ.get``.
 
 Findings never print the full value — only a 4-character prefix and the
 length — so running the audit does not itself copy a secret into a log.
@@ -66,9 +68,16 @@ _MAX_FILE_BYTES = 2_000_000
 _VALUE = r"([A-Za-z0-9]{16,})"
 _PATTERNS: tuple[re.Pattern[str], ...] = (
     # NAME_KEY = 'literal' | export X_TOKEN="literal" | ENV X_KEY=literal | Key: literal
+    # | MINIO_SECRET_KEY: str = "literal" (pydantic-settings field with a type annotation)
     re.compile(
         r"(?:^|[\s(,])(?:export\s+|ENV\s+)?[A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)"
+        r"(?:\s*:\s*[A-Za-z_][A-Za-z0-9_.\[\], |]*)?"
         r"\s*[=:]\s*[\"']?" + _VALUE + r"[\"']?(?=[\s,;)]|$)",
+        re.IGNORECASE,
+    ),
+    # ${MINIO_ROOT_PASSWORD:-literal} — a shell / docker-compose default fallback
+    re.compile(
+        r"\$\{[A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Za-z0-9_]*:?-" + _VALUE + r"\}",
         re.IGNORECASE,
     ),
     # ?apikey=literal | &api_key=literal | token=literal inside a URL

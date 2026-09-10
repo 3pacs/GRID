@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 import uuid
+from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
+from loguru import logger as log
 
 from agent_hub.app import create_app
 
@@ -199,4 +203,58 @@ def test_health_check_returns_503_on_s3_failure():
     assert response.status_code == 503
     assert response.json()["detail"]["details"]["postgres"] == "ok"
     assert response.json()["detail"]["details"]["minio"] == "error"
+
+
+# ── MinioReportObjectStore credential sourcing ───────────────────────────────
+
+
+def _fake_minio(monkeypatch) -> types.ModuleType:
+    module = types.ModuleType("minio")
+    module.Minio = MagicMock(name="Minio")
+    monkeypatch.setitem(sys.modules, "minio", module)
+    return module
+
+
+def _clear_minio_env(monkeypatch) -> None:
+    for name in ("MINIO_ENDPOINT", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "MINIO_SECURE", "MINIO_REGION"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_minio_object_store_has_no_builtin_credentials(monkeypatch):
+    from config import settings
+    from agent_hub.object_store import MinioReportObjectStore
+
+    fake = _fake_minio(monkeypatch)
+    _clear_minio_env(monkeypatch)
+    monkeypatch.setattr(settings, "MINIO_ACCESS_KEY", "")
+    monkeypatch.setattr(settings, "MINIO_SECRET_KEY", "")
+    warnings: list[str] = []
+    handler = log.add(lambda m: warnings.append(m.record["message"]), level="WARNING")
+    try:
+        MinioReportObjectStore()
+    finally:
+        log.remove(handler)
+
+    _, kwargs = fake.Minio.call_args
+    assert kwargs["access_key"] == ""  # no literal fallback anywhere
+    assert kwargs["secret_key"] == ""
+    assert any("MINIO_ACCESS_KEY / MINIO_SECRET_KEY not set" in m for m in warnings)
+
+
+def test_minio_object_store_prefers_process_env_over_config(monkeypatch):
+    from config import settings
+    from agent_hub.object_store import MinioReportObjectStore
+
+    fake = _fake_minio(monkeypatch)
+    _clear_minio_env(monkeypatch)
+    monkeypatch.setattr(settings, "MINIO_ACCESS_KEY", "cfg-access")
+    monkeypatch.setattr(settings, "MINIO_SECRET_KEY", "cfg-secret")
+    monkeypatch.setenv("MINIO_ACCESS_KEY", "env-access")
+    monkeypatch.setenv("MINIO_SECRET_KEY", "env-secret")
+
+    MinioReportObjectStore()
+
+    _, kwargs = fake.Minio.call_args
+    assert kwargs["access_key"] == "env-access"  # /etc/agent-hub/minio.env wins
+    assert kwargs["secret_key"] == "env-secret"
 

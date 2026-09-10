@@ -531,10 +531,11 @@ class Settings(BaseSettings):
     REDPANDA_BROKER: str = "localhost:19092"
     REDPANDA_ENABLED: bool = True
 
-    # MinIO / S3 blob store
+    # MinIO / S3 blob store. Credentials come from .env (or /etc/agent-hub/minio.env
+    # for the hub) — never defaults; empty keys leave the blob store disabled.
     MINIO_ENDPOINT: str = "localhost:9000"
-    MINIO_ACCESS_KEY: str = "gridminio"
-    MINIO_SECRET_KEY: str = "gridminio2026"
+    MINIO_ACCESS_KEY: str = ""
+    MINIO_SECRET_KEY: str = ""
     MINIO_SECURE: bool = False
     MINIO_REGION: str = "us-east-1"
 

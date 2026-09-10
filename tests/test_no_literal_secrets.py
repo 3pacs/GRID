@@ -17,6 +17,7 @@ from scripts.audit_literal_secrets import (
 
 # Assembled from short fragments so this file never contains a key-shaped literal itself.
 FAKE_KEY = "".join(("QWERTYUIOP", "12345678"))  # 18 chars, upper + digit
+MINIO_LIKE_KEY = "".join(("MinioPass", "20260910"))  # 17 chars, mixed case + digits
 
 
 @pytest.mark.unit
@@ -34,6 +35,9 @@ FAKE_KEY = "".join(("QWERTYUIOP", "12345678"))  # 18 chars, upper + digit
         f'run_download "x" "https://x.gov/v2?apikey={FAKE_KEY}" out.json',
         f'FRED_KEY = os.environ.get("FRED_API_KEY", "{FAKE_KEY}")',  # getenv default
         f'KEY = os.getenv("ALPHA_VANTAGE_KEY", "{FAKE_KEY}")',
+        f'    MINIO_SECRET_KEY: str = "{MINIO_LIKE_KEY}"',  # typed pydantic-settings default
+        f"      MINIO_ROOT_PASSWORD: ${{MINIO_ROOT_PASSWORD:-{MINIO_LIKE_KEY}}}",  # compose default
+        f'mc alias set grid http://minio:9000 root "{MINIO_LIKE_KEY}"; echo PASSWORD={MINIO_LIKE_KEY}',
     ],
 )
 def test_detects_key_shaped_literals(line: str) -> None:
@@ -41,6 +45,7 @@ def test_detects_key_shaped_literals(line: str) -> None:
     assert len(findings) == 1
     assert findings[0].line_no == 1
     assert FAKE_KEY not in str(findings[0]), "findings must be redacted"
+    assert MINIO_LIKE_KEY not in str(findings[0]), "findings must be redacted"
 
 
 @pytest.mark.unit
