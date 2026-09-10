@@ -1,0 +1,361 @@
+name: Ops — GRID bring-up
+
+# Runs docs/planning/BRING-UP-RUNBOOK-2026-09-10.md on the grid-svr self-hosted
+# runner (the same runner deploy.yml uses). Idempotent and additive: starts
+# units, fast-forwards the Hermes tree, applies the numbered SQL migrations,
+# restarts the background services, runs the smoke gate, kicks the scheduled
+# jobs once, tests the digest email, and writes the state-of-affairs report to
+# the job summary + an artifact. Never prints .env contents or tokens.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_sweep:
+        description: "Run the 90 d long-horizon sweep now (can take 10-20 min)"
+        type: boolean
+        default: true
+      send_email:
+        description: "Send the test email and force one daily digest"
+        type: boolean
+        default: true
+      hermes_dry_run:
+        description: "Run one Hermes cycle in --dry-run (diagnose only, ~5 min)"
+        type: boolean
+        default: false
+
+env:
+  RELEASE: /data/grid_v4/grid_release
+  HERMES_TREE: /home/grid/grid_v4/grid_repo
+  REPORT: /tmp/grid_bringup_report.md
+
+jobs:
+  bringup:
+    name: Bring-up on grid-svr
+    runs-on: [self-hosted, grid-svr]
+    timeout-minutes: 120
+
+    steps:
+      - name: Phase 0 — inventory (read-only)
+        shell: bash
+        run: |
+          set +e
+          : > "$REPORT"
+          {
+            echo "# GRID bring-up — $(date -u +'%Y-%m-%d %H:%M UTC') — $(hostname)"
+            echo
+            echo "## Phase 0 — inventory"
+            echo '```'
+            uptime
+            df -h /data | tail -1
+            free -g | head -2
+            nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader 2>/dev/null || echo "nvidia-smi unavailable"
+            echo
+            echo "units BEFORE:"
+            for u in grid-db grid-llamacpp grid-crucix grid-api grid-hermes grid-intelligence grid-coordinator grid-worker cloudflared grid-micro-classifier grid-micro-narrator grid-micro-extractor grid-micro-mapper; do
+              printf "  %-24s %s\n" "$u" "$(systemctl is-active "$u" 2>/dev/null)"
+            done
+            echo
+            for t in "$RELEASE" "$HERMES_TREE" /data/grid_v4/astrogrid_dedup; do
+              printf "%-40s " "$t"
+              if [ -f "$t/api/main.py" ]; then
+                printf "code root  %s  dirty=%s\n" "$(git -C "$t" log --oneline -1 2>/dev/null || echo 'not-git')" "$(git -C "$t" status --short 2>/dev/null | wc -l)"
+              else
+                echo "no api/main.py"
+              fi
+            done
+            echo '```'
+          } | tee -a "$REPORT"
+
+      - name: Phase 1 — core services up (boot order)
+        shell: bash
+        run: |
+          set +e
+          {
+            echo "## Phase 1 — services"
+            echo '```'
+            sudo systemctl start grid-db 2>&1; sleep 3
+            pg_isready -h localhost -U grid -d griddb 2>&1 || docker exec grid_db pg_isready -U grid -d griddb 2>&1 || echo "pg_isready: not reachable by either path"
+            sudo systemctl start grid-llamacpp 2>&1; sleep 15
+            printf "llama.cpp /health: "; curl -s -m 5 localhost:8080/health || echo "no answer"; echo
+            sudo systemctl start grid-crucix 2>&1; sleep 3
+            printf "crucix :3117 -> "; curl -s -m 5 -o /dev/null -w "%{http_code}\n" localhost:3117
+            sudo systemctl start grid-api 2>&1; sleep 8
+            printf "grid-api /health status: "; curl -s -m 10 localhost:8000/api/v1/system/health | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('status'), '| db:', d.get('database', d.get('db')), '| llm:', d.get('llm'))" 2>/dev/null || echo "no JSON"
+            sudo systemctl start grid-hermes grid-intelligence grid-coordinator grid-worker cloudflared 2>&1
+            sudo systemctl start grid-micro-classifier grid-micro-narrator grid-micro-extractor grid-micro-mapper 2>&1
+            for p in 8082 8083 8084 8085; do printf "micro %s: " "$p"; curl -s -m 3 "localhost:$p/health" | head -c 60; echo; done
+            echo
+            echo "units AFTER start:"
+            for u in grid-db grid-llamacpp grid-crucix grid-api grid-hermes grid-intelligence grid-coordinator grid-worker cloudflared grid-micro-classifier grid-micro-narrator grid-micro-extractor grid-micro-mapper; do
+              printf "  %-24s %s\n" "$u" "$(systemctl is-active "$u" 2>/dev/null)"
+            done
+            for u in grid-llamacpp grid-crucix grid-hermes grid-intelligence grid-coordinator grid-worker; do
+              if [ "$(systemctl is-active "$u")" != "active" ]; then
+                echo; echo "--- journal $u (last 25) ---"; sudo journalctl -u "$u" -n 25 --no-pager 2>&1 | tail -25
+              fi
+            done
+            echo '```'
+          } | tee -a "$REPORT"
+
+      - name: Phase 2 — bring the Hermes tree to main
+        shell: bash
+        run: |
+          set +e
+          {
+            echo "## Phase 2 — code trees"
+            echo '```'
+            echo "release tree: $(git -C "$RELEASE" log --oneline -1) (deploy.yml keeps this at origin/main)"
+            cd "$HERMES_TREE" || { echo "no Hermes tree at $HERMES_TREE"; exit 0; }
+            git fetch -q origin main 2>&1
+            before="$(git log --oneline -1)"
+            dirty="$(git status --short | wc -l)"
+            echo "hermes tree before: $before  dirty=$dirty  branch=$(git rev-parse --abbrev-ref HEAD)"
+            if [ "$dirty" -eq 0 ]; then
+              git merge --ff-only origin/main 2>&1 | tail -2
+            else
+              echo "tree dirty (Hermes commits analytical outputs here) — stashing, fast-forwarding, restoring"
+              git stash push -u -q -m "ops-bringup $(date -u +%FT%TZ)" 2>&1
+              git merge --ff-only origin/main 2>&1 | tail -2
+              git stash pop 2>&1 | tail -3 || echo "STASH POP CONFLICT — resolve by hand: git -C $HERMES_TREE status"
+            fi
+            echo "hermes tree after:  $(git log --oneline -1)"
+            python3 -m pip install -q -r requirements.txt 2>&1 | tail -2
+            python3 -c "import asyncpg; print('asyncpg', asyncpg.__version__)" 2>&1
+            cd "$RELEASE" && python3 -c "import asyncpg; print('release asyncpg', asyncpg.__version__)" 2>&1
+            echo '```'
+          } | tee -a "$REPORT"
+
+      - name: Phase 3 — SQL migrations 0057 + 0058
+        shell: bash
+        run: |
+          set +e
+          pg() {  # run psql args against griddb by whichever path works
+            if sudo -n -u postgres psql griddb -c "select 1" >/dev/null 2>&1; then sudo -n -u postgres psql griddb "$@"
+            elif docker exec grid_db psql -U grid -d griddb -c "select 1" >/dev/null 2>&1; then docker exec -i grid_db psql -U grid -d griddb "$@"
+            else echo "NO PSQL PATH (neither sudo -u postgres nor docker exec grid_db)"; return 9; fi
+          }
+          {
+            echo "## Phase 3 — migrations"
+            echo '```'
+            for f in 0057_realized_alpha.sql 0058_horizon_days.sql; do
+              echo "--- $f"
+              if sudo -n -u postgres psql griddb -c "select 1" >/dev/null 2>&1; then
+                sudo -n -u postgres psql griddb -v ON_ERROR_STOP=0 -f "$RELEASE/migrations/$f" 2>&1 | grep -v "^$" | tail -8
+              else
+                docker exec -i grid_db psql -U grid -d griddb -v ON_ERROR_STOP=0 < "$RELEASE/migrations/$f" 2>&1 | grep -v "^$" | tail -8
+              fi
+            done
+            echo "--- verify"
+            pg -At -c "SELECT 'realized_alpha_daily', COUNT(*) FROM realized_alpha_daily" 2>&1
+            pg -At -c "SELECT 'oracle_predictions.horizon_days present', COUNT(*) FROM information_schema.columns WHERE table_name='oracle_predictions' AND column_name='horizon_days'" 2>&1
+            pg -At -c "SELECT 'universe_ranking_history.horizon_days present', COUNT(*) FROM information_schema.columns WHERE table_name='universe_ranking_history' AND column_name='horizon_days'" 2>&1
+            pg -At -c "SELECT 'oracle rows with horizon_days', COUNT(*) FROM oracle_predictions WHERE horizon_days IS NOT NULL" 2>&1
+            echo '```'
+          } | tee -a "$REPORT"
+
+      - name: Phase 4 — restart background services, smoke, health
+        shell: bash
+        run: |
+          set +e
+          {
+            echo "## Phase 4 — restart + smoke"
+            echo '```'
+            sudo systemctl restart grid-hermes grid-intelligence 2>&1; sleep 10
+            for u in grid-api grid-hermes grid-intelligence; do printf "  %-18s %s\n" "$u" "$(systemctl is-active "$u")"; done
+            echo "--- smoke (scripts/smoke_endpoints.sh --quiet)"
+            cd "$RELEASE" && timeout 600 bash scripts/smoke_endpoints.sh --quiet 2>&1 | tail -20; echo "smoke exit=${PIPESTATUS[0]}"
+            echo "--- /api/v1/system/health"
+            curl -s -m 15 localhost:8000/api/v1/system/health | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          for k,v in d.items():
+              s=json.dumps(v, default=str)
+              print(f'{k}: {s[:300]}')" 2>&1 | head -40
+            echo "--- new endpoints (unauthenticated probes: 401/403 = route exists)"
+            for p in /api/v1/alpha/realized "/api/v1/conviction/sweeps/latest?horizon_days=90" "/api/v1/conviction/ticker/NVDA?horizon_days=90"; do printf "%-60s %s\n" "$p" "$(curl -s -m 10 -o /dev/null -w '%{http_code}' "localhost:8000$p")"; done
+            echo "--- error log, last 2h (release tree)"
+            cd "$RELEASE" && python3 scripts/audit_error_log.py --hours 2 --top 10 2>&1 | tail -15
+            echo '```'
+          } | tee -a "$REPORT"
+
+      - name: Phase 5 — kick the scheduled jobs once
+        shell: bash
+        run: |
+          set +e
+          cd "$RELEASE"
+          {
+            echo "## Phase 5 — jobs"
+            echo '```'
+            echo "--- realized alpha (run_daily)"
+            timeout 900 python3 -c "
+          from db import get_engine
+          from alpha_research.realized_alpha import run_daily
+          import json
+          print(json.dumps(run_daily(get_engine()), default=str)[:1500])" 2>&1 | tail -12
+            echo "--- journal verdicts (backfill_journal_verdicts)"
+            timeout 600 python3 scripts/backfill_journal_verdicts.py 2>&1 | tail -6
+            if [ "${{ inputs.run_sweep }}" = "true" ]; then
+              echo "--- 90 d long-horizon sweep (rank_universe over market_edge_scanner.TARGET_UNIVERSE)"
+              timeout 1800 python3 -c "
+          from db import get_engine
+          from intelligence.market_edge_scanner import TARGET_UNIVERSE
+          from intelligence.universe_ranker import persist_ranking, rank_universe
+          e = get_engine()
+          r = rank_universe(e, list(TARGET_UNIVERSE), horizon_days=90, parallel=True, top_k=25)
+          print('scored', r.tickers_succeeded, '/', r.tickers_attempted, 'regime', r.regime_signature)
+          for t in r.top_k[:15]:
+              print(f'  {t.ticker:6s} {t.verdict:9s} composite={t.composite_score:.3f} conviction={t.aggregate_conviction:.3f} robust={t.robustness_label} err={t.error or \"\"}')
+          print('persisted row', persist_ranking(e, r))" 2>&1 | tail -22
+            else
+              echo "sweep skipped by input"
+            fi
+            if [ "${{ inputs.hermes_dry_run }}" = "true" ]; then
+              echo "--- hermes --once --dry-run"
+              cd "$HERMES_TREE" && timeout 900 python3 scripts/hermes_operator.py --once --dry-run 2>&1 | tail -30
+            fi
+            echo '```'
+          } | tee -a "$REPORT"
+
+      - name: Phase 6 — email (hermes@stepdad.finance)
+        shell: bash
+        run: |
+          set +e
+          cd "$RELEASE"
+          {
+            echo "## Phase 6 — email"
+            echo '```'
+            envf=".env"; [ -f "$envf" ] || envf="$HERMES_TREE/.env"
+            echo "env file: $envf (values shown for non-secret keys only)"
+            grep -E "^ALERT_(EMAIL_ENABLED|EMAIL_TO|EMAIL_FROM|SMTP_HOST|SMTP_PORT|SMTP_USE_TLS|SMTP_USER)=" "$envf" 2>/dev/null || echo "no ALERT_* keys in $envf — code defaults apply (From hermes@stepdad.finance, host localhost:25)"
+            printf "ALERT_SMTP_PASSWORD set: "; grep -cE "^ALERT_SMTP_PASSWORD=.+" "$envf" 2>/dev/null || echo 0
+            python3 -c "
+          from config import settings as s
+          print('effective:', 'from=', s.ALERT_EMAIL_FROM, 'to=', s.ALERT_EMAIL_TO, 'host=', s.ALERT_SMTP_HOST, 'port=', s.ALERT_SMTP_PORT, 'tls=', s.ALERT_SMTP_USE_TLS, 'user=', s.ALERT_SMTP_USER, 'password_set=', bool(s.ALERT_SMTP_PASSWORD))" 2>&1
+            if [ "${{ inputs.send_email }}" = "true" ]; then
+              echo "--- send_test_email()"
+              timeout 120 python3 -c "
+          import time
+          from alerts.email import send_test_email
+          print('queued:', send_test_email()); time.sleep(20)" 2>&1 | tail -5
+              echo "--- daily digest (scripts/daily_digest.py, sends now)"
+              timeout 300 python3 scripts/daily_digest.py 2>&1 | tail -8
+              echo "--- mail log / journal (smtp lines)"
+              sudo tail -n 40 /var/log/mail.log 2>/dev/null | tail -12 || echo "no /var/log/mail.log"
+              sudo journalctl --since "10 min ago" --no-pager 2>/dev/null | grep -iE "newsletter|digest|smtp" | tail -10
+            else
+              echo "email sending skipped by input"
+            fi
+            echo '```'
+          } | tee -a "$REPORT"
+
+      - name: Phase 7 — state of affairs and gems
+        shell: bash
+        run: |
+          set +e
+          cd "$RELEASE"
+          pg() {
+            if sudo -n -u postgres psql griddb -c "select 1" >/dev/null 2>&1; then sudo -n -u postgres psql griddb "$@"
+            elif docker exec grid_db psql -U grid -d griddb -c "select 1" >/dev/null 2>&1; then docker exec -i grid_db psql -U grid -d griddb "$@"
+            else echo "NO PSQL PATH"; return 9; fi
+          }
+          {
+            echo "## Phase 7 — state of affairs"
+            echo "### Data health"
+            echo '```'
+            python3 -c "
+          import json
+          from db import get_engine
+          from sqlalchemy import text
+          e = get_engine()
+          with e.connect() as c:
+              rows = c.execute(text('''
+                  SELECT sc.source_name, COUNT(*) AS rows_24h, MAX(rs.pull_timestamp) AS latest
+                  FROM raw_series rs JOIN source_catalog sc ON sc.id = rs.source_id
+                  WHERE rs.pull_timestamp >= NOW() - INTERVAL '48 hours'
+                  GROUP BY 1 ORDER BY 3 DESC LIMIT 40''')).fetchall()
+              print('sources with rows in last 48h:', len(rows))
+              for r in rows: print(f'  {str(r[0])[:28]:28s} {r[1]:8d}  {str(r[2])[:16]}')
+              n = c.execute(text('''SELECT COUNT(DISTINCT source_id) FROM raw_series WHERE pull_timestamp >= NOW() - INTERVAL '7 days' ''')).scalar()
+              print('distinct sources, 7d:', n)" 2>&1 | head -50
+            python3 scripts/audit_error_log.py --hours 24 --top 12 2>&1 | tail -16
+            echo '```'
+            echo "### Realized alpha (truth gate)"
+            echo '```'
+            pg -c "SELECT as_of, source, horizon_days, n_trades, ROUND(mean_alpha::numeric,4) AS mean_alpha, ROUND(mean_alpha_annualized::numeric,4) AS ann FROM realized_alpha_daily ORDER BY as_of DESC, source, horizon_days LIMIT 24" 2>&1
+            echo '```'
+            echo "### Latest 90 d sweep (verdicts)"
+            echo '```'
+            python3 -c "
+          from db import get_engine
+          from intelligence.universe_ranker import load_latest_ranking
+          r = load_latest_ranking(get_engine(), horizon_days=90)
+          if not r: print('no 90 d sweep persisted yet')
+          else:
+              print(r['generated_at'], r['universe_name'], r['regime_signature'], f\"{r['tickers_succeeded']}/{r['tickers_attempted']}\")
+              for t in r['top_k'][:20]: print(f\"  {t['ticker']:6s} {t['verdict']:9s} composite={t['composite_score']} robust={t.get('robustness_label')} err={t.get('error') or ''}\")
+              print('narrative:', (r['narrative'] or '')[:600])" 2>&1
+            echo '```'
+            echo "### Gems — clinical-trial catalysts"
+            echo '```'
+            pg -c "SELECT * FROM trial_gems LIMIT 15" 2>&1 | cut -c1-220
+            pg -c "SELECT * FROM upcoming_catalysts LIMIT 15" 2>&1 | cut -c1-220
+            echo '```'
+            echo "### Gems — 100x options hits (last 3 days)"
+            echo '```'
+            pg -c "SELECT ticker, direction, ROUND(score::numeric,2) AS score, payoff_multiple, LEFT(thesis,90) AS thesis, scan_date FROM options_mispricing_scans WHERE is_100x AND scan_date >= CURRENT_DATE - 3 ORDER BY score DESC LIMIT 12" 2>&1
+            echo '```'
+            echo "### Oracle — open predictions by horizon and calibration"
+            echo '```'
+            pg -c "SELECT horizon_days, verdict, COUNT(*) FROM oracle_predictions WHERE created_at >= NOW() - INTERVAL '30 days' AND id NOT LIKE 'astrogrid:%' GROUP BY 1,2 ORDER BY 1,2" 2>&1
+            pg -c "SELECT * FROM oracle_calibration_history ORDER BY 1 DESC LIMIT 5" 2>&1 | cut -c1-220
+            echo '```'
+            echo "### Hold-validator proof for the top sweep names (90 d, 5 monthly entries)"
+            echo '```'
+            python3 -c "
+          import json
+          from datetime import date
+          from db import get_engine
+          from intelligence.universe_ranker import load_latest_ranking
+          from validation.backtest import run_hold_validation
+          e = get_engine()
+          r = load_latest_ranking(e, horizon_days=90) or {}
+          names = [t['ticker'] for t in r.get('top_k', []) if t.get('verdict') in ('high','moderate') and not t.get('error')][:4] or ['NVDA','SPY']
+          entries = [date(2026,2,2), date(2026,3,2), date(2026,4,1), date(2026,5,1), date(2026,6,1)]
+          for tk in names:
+              try:
+                  d = run_hold_validation(e, tk, entries, 90)
+                  print(f\"{tk:6s} {d['verdict']:12s} hit={d['hit_rate']} mean_alpha={d['mean_alpha']} t={d['alpha_t_stat']} scored/open/skipped={d['n_scored']}/{d['n_open']}/{d['n_skipped']}  {d['verdict_reason']}\")
+              except Exception as ex:
+                  print(f'{tk:6s} ERROR {ex}')" 2>&1 | tail -8
+            echo '```'
+          } | tee -a "$REPORT"
+
+      - name: Phase 8 — leave it running
+        shell: bash
+        run: |
+          set +e
+          {
+            echo "## Phase 8 — persistence"
+            echo '```'
+            for u in grid-db grid-llamacpp grid-crucix grid-api grid-hermes grid-intelligence grid-coordinator grid-worker cloudflared; do sudo systemctl enable -q "$u" 2>&1; printf "  %-20s enabled=%s active=%s\n" "$u" "$(systemctl is-enabled "$u" 2>/dev/null)" "$(systemctl is-active "$u" 2>/dev/null)"; done
+            echo "timers:"; systemctl list-timers "grid-*" --no-pager 2>/dev/null | head -8
+            printf "crontab entries mentioning grid: "; crontab -l 2>/dev/null | grep -c grid || echo 0
+            printf "paper_trading_review in crontab: "; crontab -l 2>/dev/null | grep -c paper_trading_review || echo 0
+            echo '```'
+          } | tee -a "$REPORT"
+
+      - name: Publish report
+        if: always()
+        shell: bash
+        run: |
+          cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p /tmp/bringup-artifact && cp "$REPORT" /tmp/bringup-artifact/report.md
+          echo "report lines: $(wc -l < "$REPORT")"
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grid-bringup-report
+          path: /tmp/bringup-artifact/report.md
+          retention-days: 30
