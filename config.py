@@ -443,6 +443,17 @@ class Settings(BaseSettings):
     HYPERLIQUID_MAX_POSITION_USD: float = 100.0
     HYPERLIQUID_MAX_DRAWDOWN_PCT: float = 0.20
 
+    # Robinhood crypto trading — official key-signed Crypto Trading API
+    # (trading/robinhood.py). Dry-run until ROBINHOOD_LIVE_TRADING=true.
+    # Generate the keypair with `python -m trading.robinhood keygen`; the
+    # public half goes into the Robinhood API-credential form.
+    ROBINHOOD_API_KEY: str = ""
+    ROBINHOOD_PRIVATE_KEY_B64: str = ""      # base64 Ed25519 seed; server .env only
+    ROBINHOOD_LIVE_TRADING: bool = False     # Must be True to send orders
+    ROBINHOOD_MAX_POSITION_USD: float = 100.0
+    ROBINHOOD_MAX_DRAWDOWN_PCT: float = 0.20
+    ROBINHOOD_BASE_URL: str = "https://trading.robinhood.com"
+
     # Solana trading (AutoHedge-derived 4-agent pipeline)
     JUPITER_API_KEY: str = ""              # Unlocks Jupiter rate limits
     SOLANA_PRIVATE_KEY: str = ""           # Base58 wallet key; required for live
