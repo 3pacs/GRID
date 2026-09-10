@@ -25,3 +25,4 @@ Append-only record of dispatched agent tasks.
 - **2026-04-13T10:23:22.866056+00:00** — task #106 — concept: `horizon conditional oracle per horizon calibration model weights` — coverage: extend — files: 4
 - **2026-04-13T16:25:09.774972+00:00** — task #116 — concept: `regime router sub oracle per regime weights` — coverage: extend — files: 7
 - **2026-09-10T03:44:08.789261+00:00** — task #15 — concept: `realized alpha` — coverage: new — files: 6
+- **2026-09-10T05:06:07.293451+00:00** — task #24 — concept: `hold validation` — coverage: new — files: 2
