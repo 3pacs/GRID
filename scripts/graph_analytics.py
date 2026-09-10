@@ -261,6 +261,10 @@ def store_results(
     log.info("Storing analytics for {n} actors into {t}...", n=total, t=table)
     t0 = time.time()
     stored = 0
+    purged = 0
+    from datetime import datetime, timezone
+
+    run_started_at = datetime.now(timezone.utc)
 
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -284,8 +288,9 @@ def store_results(
                 batch = nodes[i : i + batch_size]
                 values_list = []
                 params = []
-                for idx, node_id in enumerate(batch):
-                    idx * 8
+                for node_id in batch:
+                    # computed_at = NOW() is >= run_started_at, so the purge
+                    # below never removes a row written by this run.
                     values_list.append(
                         "(%s, %s, %s, %s, %s, %s, %s, %s, NOW())"
                     )
@@ -322,8 +327,18 @@ def store_results(
                 if pct % 10 < (batch_size / total * 100) or i == 0:
                     log.info("Stored {s}/{t} actors ({p:.0f}%)", s=stored, t=total, p=pct)
 
+            # Rows for actors that left the graph (or, for the curated scope,
+            # were excluded as feed artefacts) must not survive the run,
+            # otherwise a stale node keeps leading its old community.
+            cur.execute(
+                f"DELETE FROM {table} WHERE computed_at < %s",
+                (run_started_at,),
+            )
+            rc = getattr(cur, "rowcount", None)
+            purged = rc if isinstance(rc, int) and rc >= 0 else 0
+
     elapsed = time.time() - t0
-    log.info("All {n} actors stored in {t:.1f}s", n=stored, t=elapsed)
+    log.info("All {n} actors stored in {t:.1f}s ({p} stale rows purged)", n=stored, t=elapsed, p=purged)
     return stored
 
 
