@@ -389,6 +389,40 @@ def daily_digest() -> None:
             except Exception:
                 pass
 
+        # Long plays (multi-year board; every multiple is a labelled proxy)
+        try:
+            from intelligence.long_plays import load_latest_board
+
+            board = load_latest_board(engine)
+            if board:
+                lines: list[str] = []
+                for cand in board.get("candidates") or []:
+                    if cand.get("stance") not in ("entry_candidate", "watch"):
+                        continue
+                    proj = ((cand.get("projection") or {}).get("3y") or {})
+                    p50 = proj.get("p50_multiple")
+                    p50_txt = f"{p50:.2f}x" if isinstance(p50, (int, float)) else "n/a"
+                    cats = cand.get("catalysts") or []
+                    first_cat = (
+                        f"{cats[0].get('event_type')} {cats[0].get('expected_date')}"
+                        if cats else "no catalyst"
+                    )
+                    lines.append(
+                        f"{cand.get('ticker')} — {cand.get('stance')} — p50 3y {p50_txt} (proxy) — {first_cat}"
+                    )
+                    if len(lines) >= 5:
+                        break
+                if lines:
+                    sections.append(_section_text(
+                        "Long plays",
+                        "\n".join(lines) + "\n(proxy multiples from historical CAGR/vol; not forecasts)",
+                        accent="#7c5cff",
+                    ))
+                elif board.get("stand_down_reason"):
+                    sections.append(_section_text("Long plays", str(board["stand_down_reason"])))
+        except Exception:
+            pass
+
         if not sections:
             sections.append(_section_text("Status", "All systems operational. No notable events in the last 24 hours."))
 
