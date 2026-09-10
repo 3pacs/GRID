@@ -125,3 +125,18 @@ class TestPersistence:
 
     def test_schema_guard_adds_column(self) -> None:
         assert "ADD COLUMN IF NOT EXISTS horizon_days INTEGER" in SRC
+
+
+class TestDistinctPositionCounts:
+    """4,340 model votes upserted onto 14 rows must be reported as 14 (task #29)."""
+
+    def test_store_returns_inserted_vs_updated_and_cycle_exposes_them(self) -> None:
+        assert "RETURNING (xmax = 0) AS inserted" in SRC
+        assert "self._last_store_counts = {" in SRC
+        assert '"distinct_positions_written": _counts.get("inserted")' in SRC
+        assert '"upsert_statements": _counts.get("upsert_statements")' in SRC
+
+    def test_report_subject_prefers_distinct_positions(self) -> None:
+        rsrc = (ROOT / "oracle" / "report.py").read_text(encoding="utf-8")
+        assert 'cycle_result.get("distinct_positions_written", n_votes)' in rsrc
+        assert "Positions (" in rsrc and "model votes" in rsrc

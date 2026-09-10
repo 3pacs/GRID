@@ -101,6 +101,14 @@ CATALYST_OVERRIDE_DAYS: int = 365
 CATALYST_OVERRIDE_STRENGTH: float = 0.6
 OPTIONS_LOOKBACK_DAYS: int = 30
 TRIAL_LOOKBACK_DAYS: int = 180
+PROFILE_ENRICHMENT_MAX_AGE_DAYS: int = 30
+PROFILE_SMALL_CAP_MAX_USD: float = 2e9
+FUNDAMENTALS_KEYS: tuple[str, ...] = (
+    "cash", "cash_runway_months", "revenue_ttm", "net_income_ttm",
+    "shares_outstanding", "sector", "industry", "description",
+)
+SWEEP_NOTE_MISSING: str = "no persisted 90 d sweep; coverage gate falls back to options payoff"
+SWEEP_NOTE_EMPTY: str = "sweep exists but produced no rankable verdicts; coverage gate falls back to options payoff"
 SWEEP_HORIZON_DAYS: int = 90
 REALIZED_ALPHA_HORIZON_DAYS: int = 60
 
@@ -303,14 +311,18 @@ def _why(
     sweep: dict[str, Any] | None,
     options: dict[str, Any] | None,
     catalysts: Sequence[dict[str, Any]],
+    runway_months: float | None = None,
 ) -> str:
-    """Two-sentence rationale: tailwind, multiple math, coverage gate."""
+    """Two-sentence rationale: tailwind, multiple math, coverage gate (+ runway when known)."""
     if themes:
         tailwind = ", ".join(themes[:3])
     elif thesis_sources:
         tailwind = str(thesis_sources[0].get("text") or thesis_sources[0].get("kind"))[:120]
     else:
         tailwind = "no named tailwind"
+    runway = _finite(runway_months)
+    if runway is not None and runway > 0:
+        tailwind = f"{tailwind}; runway {runway:.0f} mo"
     if projection_3y:
         p50 = projection_3y.get("p50_multiple")
         p90 = projection_3y.get("p90_multiple")
@@ -333,6 +345,10 @@ def _why(
 
 
 # ── Degrade-to-None wrapper ───────────────────────────────────────────────
+
+# Sentinel for "the sweep loader itself failed" (distinct from "no sweep
+# persisted" = None and "sweep persisted but empty" = {}).
+_SWEEP_FAILED: dict[str, dict[str, Any]] = {}
 
 
 def _safe(
@@ -423,6 +439,16 @@ _REALIZED_ALPHA_SQL = text(
     SELECT source, horizon_days, mean_alpha, n_trades
     FROM realized_alpha_daily
     WHERE as_of = (SELECT MAX(as_of) FROM realized_alpha_daily)
+    """
+)
+
+_PROFILES_SQL = text(
+    """
+    SELECT ticker, name, sector, profile
+    FROM company_profiles
+    WHERE ticker IS NOT NULL
+      AND profile IS NOT NULL
+      AND (last_analyzed IS NULL OR last_analyzed <= :as_of_ts)
     """
 )
 
@@ -618,13 +644,71 @@ def _load_options_asymmetry(engine: Engine, as_of: date) -> dict[str, dict[str, 
     return out
 
 
-def _load_sweep(engine: Engine) -> dict[str, dict[str, Any]]:
-    """Latest persisted 90 d sweep, keyed by ticker (``top_k`` entries only)."""
+def _load_company_profiles(engine: Engine, as_of: date) -> dict[str, dict[str, Any]]:
+    """``company_profiles`` fundamentals keyed by ticker (PIT: ``last_analyzed <= as_of``).
+
+    Each entry carries ``market_cap`` (USD), the ``FUNDAMENTALS_KEYS`` and
+    ``enriched_at`` (ISO string or None). Values absent from the JSONB are
+    ``None``; the JSONB may arrive parsed or as text.
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(_PROFILES_SQL, {"as_of_ts": _as_of_timestamp(as_of)}).fetchall()
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        ticker = _normalize_ticker(row[0])
+        if not ticker:
+            continue
+        profile = row[3]
+        if isinstance(profile, (str, bytes)):
+            try:
+                profile = json.loads(profile)
+            except (TypeError, ValueError):
+                profile = {}
+        if not isinstance(profile, dict):
+            profile = {}
+        entry: dict[str, Any] = {key: profile.get(key) for key in FUNDAMENTALS_KEYS}
+        for key in ("cash", "cash_runway_months", "revenue_ttm", "net_income_ttm", "shares_outstanding"):
+            entry[key] = _finite(entry[key])
+        entry["sector"] = entry.get("sector") or row[2] or None
+        entry["market_cap"] = _finite(profile.get("market_cap"))
+        entry["name"] = row[1] or profile.get("name")
+        entry["enriched_at"] = profile.get("enriched_at") or None
+        out[ticker] = entry
+    return out
+
+
+def _recently_enriched_small_caps(profiles: dict[str, dict[str, Any]], as_of: date) -> set[str]:
+    """Tickers with ``market_cap < 2e9`` and ``enriched_at`` within 30 d of ``as_of`` (and not after it)."""
+    cutoff = _as_of_timestamp(as_of) - timedelta(days=PROFILE_ENRICHMENT_MAX_AGE_DAYS)
+    ceiling = _as_of_timestamp(as_of)
+    out: set[str] = set()
+    for ticker, entry in profiles.items():
+        mcap = entry.get("market_cap")
+        if mcap is None or mcap <= 0 or mcap >= PROFILE_SMALL_CAP_MAX_USD:
+            continue
+        raw = entry.get("enriched_at")
+        if not raw:
+            continue
+        try:
+            enriched = _parse_iso_datetime(raw)
+        except (TypeError, ValueError):
+            continue
+        if cutoff <= enriched <= ceiling:
+            out.add(ticker)
+    return out
+
+
+def _load_sweep(engine: Engine) -> dict[str, dict[str, Any]] | None:
+    """Latest persisted 90 d sweep, keyed by ticker (``top_k`` entries only).
+
+    ``None`` when no sweep row is persisted at all; ``{}`` when a row exists
+    but its ``top_k`` is empty (the two cases get different board notes).
+    """
     from intelligence.universe_ranker import load_latest_ranking
 
     ranking = load_latest_ranking(engine, horizon_days=SWEEP_HORIZON_DAYS)
     if not ranking:
-        return {}
+        return None
     out: dict[str, dict[str, Any]] = {}
     for entry in ranking.get("top_k") or []:
         ticker = _normalize_ticker(entry.get("ticker"))
@@ -747,16 +831,20 @@ def build_universe(
     *,
     as_of: date,
     notes: list[str],
+    profiles: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[list[str], dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]]]:
-    """Union of the thematic, playbook, trial and options universes (stocks only).
+    """Union of the thematic, playbook, trial, options and enriched small-cap universes (stocks only).
 
-    Returns ``(tickers, trial_meta, catalysts, options)`` so the callers do
-    not re-read the trial/catalyst/options tables.
+    ``profiles`` is the ``_load_company_profiles`` map (loaded once by the
+    caller); tickers with ``market_cap < 2e9`` enriched within 30 d join
+    the pool. Returns ``(tickers, trial_meta, catalysts, options)`` so the
+    callers do not re-read the trial/catalyst/options tables.
     """
     playbooks = _safe("playbooks", _playbook_index, notes, {})
     trial_meta = _safe("trial_signals", lambda: _load_trial_tickers(engine, as_of), notes, {})
     catalysts = _safe("upcoming_catalysts", lambda: _load_catalysts(engine, as_of), notes, {})
     options = _safe("options_mispricing_scans", lambda: _load_options_asymmetry(engine, as_of), notes, {})
+    small_caps = _recently_enriched_small_caps(profiles or {}, as_of)
 
     pool: set[str] = set()
     pool.update(_normalize_ticker(t) or "" for t in FRONTIER_THEMATIC_UNIVERSE)
@@ -764,7 +852,13 @@ def build_universe(
     pool.update(trial_meta)
     pool.update(catalysts)
     pool.update(options)
+    pool.update(small_caps)
     pool.discard("")
+    if small_caps:
+        notes.append(
+            f"universe: +{len(small_caps)} company_profiles small caps (market_cap < $2 B, "
+            f"enriched within {PROFILE_ENRICHMENT_MAX_AGE_DAYS} d)"
+        )
     tickers = sorted(t for t in pool if is_common_stock_candidate(t))
     skipped = len(pool) - len(tickers)
     if skipped:
@@ -787,9 +881,12 @@ def _candidate(
     playbooks: list[dict[str, Any]],
     realized_alpha: dict[str, Any] | None,
     notes: list[str],
+    profile: dict[str, Any] | None = None,
+    sweep_note_when_uncovered: str = SWEEP_NOTE_MISSING,
 ) -> dict[str, Any]:
     """Assemble one JSON-safe candidate row."""
     themes: list[str] = list(FRONTIER_THEME_CANDIDATES.get(ticker, ()))
+    fundamentals: dict[str, Any] = {key: (profile or {}).get(key) for key in FUNDAMENTALS_KEYS}
     thesis_sources: list[dict[str, Any]] = []
     if themes:
         thesis_sources.append({"kind": "frontier_theme", "id": ticker, "text": ", ".join(themes)})
@@ -832,14 +929,18 @@ def _candidate(
 
     name = _safe(f"name:{ticker}", lambda: _company_name(ticker), notes, None) or (
         (trial_meta or {}).get("company_name")
-    )
+    ) or (profile or {}).get("name")
 
-    # Market cap: ticker_metrics_daily, then trial_signals.market_cap_mm.
+    # Market cap: ticker_metrics_daily, then company_profiles.profile.market_cap,
+    # then trial_signals.market_cap_mm (the latest signal row, else a catalyst row).
     mcap_usd: float | None = None
     mcap_source: str | None = None
     if market_cap and market_cap.get("market_cap_usd"):
         mcap_usd = market_cap["market_cap_usd"]
         mcap_source = "ticker_metrics_daily"
+    elif profile and _finite(profile.get("market_cap")) and float(profile["market_cap"]) > 0:
+        mcap_usd = float(profile["market_cap"])
+        mcap_source = "company_profiles.market_cap"
     else:
         mm = (trial_meta or {}).get("market_cap_mm") or next(
             (c.get("market_cap_mm") for c in catalysts if c.get("market_cap_mm")), None
@@ -903,12 +1004,13 @@ def _candidate(
     math_block = multiple_math(
         p50_3y_multiple=p50_3y, p90_3y_multiple=p90_3y, market_cap_usd=mcap_usd
     )
-    sweep_note = None if sweep_available else "no persisted 90 d sweep; coverage gate falls back to options payoff"
+    sweep_note = None if sweep_available else sweep_note_when_uncovered
     return {
         "ticker": ticker,
         "name": name,
         "themes": themes,
         "thesis_sources": thesis_sources,
+        "fundamentals": fundamentals,
         "market_cap_usd": mcap_usd,
         "market_cap_bucket": market_cap_bucket(mcap_usd),
         "market_cap_source": mcap_source,
@@ -932,6 +1034,7 @@ def _candidate(
             sweep=sweep,
             options=options,
             catalysts=catalysts,
+            runway_months=fundamentals.get("cash_runway_months"),
         ),
         "what_must_be_true_for_10x": _what_must_be_true(math_block),
     }
@@ -963,7 +1066,8 @@ def build_long_plays_board(
         "sweep coverage: only the persisted top_k of the latest 90 d sweep is visible; names outside it count as uncovered",
     ]
 
-    tickers, trial_meta, catalysts, options = build_universe(engine, as_of=as_of, notes=notes)
+    profiles = _safe("company_profiles", lambda: _load_company_profiles(engine, as_of), notes, {})
+    tickers, trial_meta, catalysts, options = build_universe(engine, as_of=as_of, notes=notes, profiles=profiles)
     playbooks = _safe("playbooks", _playbook_index, notes, {})
     prices = _safe(
         "price_history",
@@ -972,12 +1076,17 @@ def build_long_plays_board(
         {},
     )
     market_caps = _safe("ticker_metrics_daily", lambda: _load_market_caps(engine, tickers, as_of), notes, {})
-    sweep_by_ticker = _safe("universe_ranking_history", lambda: _load_sweep(engine), notes, None)
-    sweep_available = bool(sweep_by_ticker)
-    if sweep_by_ticker is None:
+    sweep_by_ticker = _safe("universe_ranking_history", lambda: _load_sweep(engine), notes, _SWEEP_FAILED)
+    sweep_available = bool(sweep_by_ticker) and sweep_by_ticker is not _SWEEP_FAILED
+    sweep_note_uncovered = SWEEP_NOTE_MISSING
+    if sweep_by_ticker is _SWEEP_FAILED or sweep_by_ticker is None:
+        if sweep_by_ticker is None:
+            notes.append(f"universe_ranking_history: {SWEEP_NOTE_MISSING}")
         sweep_by_ticker = {}
     elif not sweep_by_ticker:
-        notes.append("universe_ranking_history: no persisted 90 d sweep; coverage gate falls back to options payoff")
+        # A sweep row exists but its top_k is empty — say so, do not claim it is missing.
+        sweep_note_uncovered = SWEEP_NOTE_EMPTY
+        notes.append(f"universe_ranking_history: {SWEEP_NOTE_EMPTY}")
     realized_alpha = _safe("realized_alpha_daily", lambda: _load_realized_alpha(engine), notes, None)
 
     candidates: list[dict[str, Any]] = []
@@ -998,6 +1107,8 @@ def build_long_plays_board(
                     playbooks=list(playbooks.get(ticker, [])),
                     realized_alpha=realized_alpha,
                     notes=notes,
+                    profile=profiles.get(ticker),
+                    sweep_note_when_uncovered=sweep_note_uncovered,
                 )
             )
         except Exception as exc:  # noqa: BLE001
