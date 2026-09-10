@@ -298,11 +298,17 @@ def _infer_signal_direction(
 
     payload = _payload_dict(signal_value)
 
+    # Token match so compound labels (CALL_SWEEP, BULLISH_CALL, PUT_SWEEP)
+    # classify too; a label naming both sides (PUT_CALL_RATIO) is no bet.
     direction = str(payload.get("direction", "") or "").strip().lower()
-    if direction in _BULLISH_DIRECTION_WORDS:
-        return "bullish"
-    if direction in _BEARISH_DIRECTION_WORDS:
-        return "bearish"
+    if direction:
+        tokens = set(re.split(r"[^a-z0-9]+", direction)) - {""}
+        bull = bool(tokens & _BULLISH_DIRECTION_WORDS)
+        bear = bool(tokens & _BEARISH_DIRECTION_WORDS)
+        if bull and not bear:
+            return "bullish"
+        if bear and not bull:
+            return "bearish"
 
     # Congressional trading: direction is on the Transaction text.
     if signal_type in ("house_trading", "senate_trading"):
@@ -467,6 +473,43 @@ def _extract_price(signal_value: Any) -> float | None:
         return val if val > 0 else None
     except (TypeError, ValueError):
         return None
+
+
+#: Payload keys that carry the underlying's spot at signal time.
+_SPOT_PRICE_KEYS: tuple[str, ...] = ("spot", "spot_price", "underlying_price")
+
+#: Sources whose payload ``price`` (when present) is an option premium or a
+#: strike, never the underlying — those rows price off the PIT close.
+_OPTION_SOURCE_TYPES: frozenset[str] = frozenset({"options_flow", "whale_options"})
+
+
+def _extract_entry_price(source_type: str | None, signal_value: Any) -> float | None:
+    """Entry price for the outcome return, or ``None`` to use the PIT close.
+
+    ``register_signal`` writers store the close as a bare number and the
+    payload writers may carry the underlying under a spot key; both are
+    honoured. On an options row (``options_flow`` / ``whale_options``) a
+    ``price`` key is the premium or the strike, so it is ignored and the
+    underlying comes from ``_get_price_near_date``. Non-positive values are
+    treated as missing so the caller falls back to the lookup.
+    """
+    payload = _payload_dict(signal_value)
+    if not payload:
+        return _extract_price(signal_value)
+    for key in _SPOT_PRICE_KEYS:
+        value = payload.get(key)
+        if value is None:
+            continue
+        try:
+            spot = float(value)
+        except (TypeError, ValueError):
+            continue
+        if spot > 0:
+            return spot
+    if (source_type or "") in _OPTION_SOURCE_TYPES:
+        return None
+    price = _extract_price(payload)
+    return price if price is not None and price > 0 else None
 
 
 # ── Price Helpers ──────────────────────────────────────────────────────────
@@ -644,8 +687,9 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
                 summary["skipped_no_price"] += 1
                 continue
 
-            # Get price at signal time if not stored
-            entry_price = _extract_price(signal_value)
+            # Entry: the stored close / spot when the writer kept one, else
+            # the PIT close at signal_date (always, for options rows).
+            entry_price = _extract_entry_price(src_type, signal_value)
             if entry_price is None:
                 entry_price = _price(ticker, signal_dt)
             if entry_price is None or entry_price <= 0:

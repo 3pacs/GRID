@@ -284,6 +284,58 @@ def test_options_rows_use_the_seven_day_window_and_one_pit_snapshot(prices):
     assert isinstance(as_of, datetime) and as_of.tzinfo is not None
 
 
+def test_options_row_never_uses_payload_price_as_entry(prices):
+    """A ``price`` on an options row is the premium (or the strike); the
+    entry must be the underlying's PIT close at signal_date."""
+    _set_move(prices, "AAPL", 100.0, 105.0, OPTIONS_WINDOW)
+    row = _row(
+        1, "options_flow", "UNUSUAL_OPTIONS",
+        {"direction": "CALL", "price": 2.35, "strike": 200.0, "oi_ratio": 4.05},
+    )
+
+    conn, _ = _run([row])
+
+    assert [(u["outcome"], u["ret"]) for u in conn.outcome_updates()] == [
+        ("CORRECT", pytest.approx(5.0)),
+    ]
+    assert [(t, d) for t, d, _ in prices.lookups] == [
+        ("AAPL", SIGNAL_DAY),
+        ("AAPL", SIGNAL_DAY + timedelta(days=OPTIONS_WINDOW)),
+    ]
+
+
+def test_options_row_with_explicit_spot_skips_the_entry_lookup(prices):
+    prices.table[("AAPL", SIGNAL_DAY + timedelta(days=OPTIONS_WINDOW))] = 95.0
+    row = _row(
+        1, "options_flow", "UNUSUAL_OPTIONS",
+        {"direction": "PUT", "spot": 100.0, "price": 3.10},
+    )
+
+    conn, _ = _run([row])
+
+    assert [(u["outcome"], u["ret"]) for u in conn.outcome_updates()] == [
+        ("CORRECT", pytest.approx(-5.0)),
+    ]
+    assert [(t, d) for t, d, _ in prices.lookups] == [
+        ("AAPL", SIGNAL_DAY + timedelta(days=OPTIONS_WINDOW)),
+    ]
+
+
+def test_non_options_payload_price_still_serves_as_entry(prices):
+    prices.table[("XOM", SIGNAL_DAY + timedelta(days=INSIDER_WINDOW))] = 90.0
+    row = _row(
+        1, "insider", "insider_sell", {"price": 100.0, "shares": 5000},
+        ticker="XOM", source_id="Jane Doe",
+    )
+
+    conn, _ = _run([row])
+
+    assert [(u["outcome"], u["ret"]) for u in conn.outcome_updates()] == [
+        ("CORRECT", pytest.approx(-10.0)),
+    ]
+    assert len(prices.lookups) == 1
+
+
 def test_many_tapes_score_independently(prices):
     """A mixed batch — the whole options_flow shape on grid-svr — no longer
     collapses to all-WRONG."""

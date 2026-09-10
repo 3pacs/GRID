@@ -101,6 +101,21 @@ def test_unusual_options_without_a_readable_direction_is_unknown(signal_value):
     assert _infer_signal_direction("UNUSUAL_OPTIONS", signal_value) == "unknown"
 
 
+@pytest.mark.parametrize(
+    "direction, expected",
+    [
+        ("CALL_SWEEP", "bullish"),
+        ("BULLISH_CALL", "bullish"),
+        ("PUT_SWEEP", "bearish"),
+        ("BEARISH_PUT", "bearish"),
+        ("call/put", "unknown"),        # both sides named → no bet
+        ("PUT_CALL_RATIO", "unknown"),
+    ],
+)
+def test_compound_option_direction_labels(direction, expected):
+    assert _infer_signal_direction("UNUSUAL_OPTIONS", {"direction": direction}) == expected
+
+
 def test_heat_spike_uses_value_direction():
     assert _infer_signal_direction("HEAT_SPIKE", {"direction": "bullish"}) == "bullish"
     assert _infer_signal_direction("HEAT_SPIKE", {"direction": "bearish"}) == "bearish"
