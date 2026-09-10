@@ -58,6 +58,9 @@ from sqlalchemy.engine import Engine
 
 
 DEFAULT_TOP_K: int = 20
+# Horizon (days) handed to should_i_trade for every ticker in a sweep. The
+# weekday sweep keeps the legacy 7d; the Sunday long-horizon sweep passes 90.
+DEFAULT_HORIZON_DAYS: int = 7
 
 # Regime signature cutoffs (pct of succeeded tickers with verdict='high')
 TRENDING_HIGH_FRACTION: float = 0.20   # > 20% → trending
@@ -224,10 +227,13 @@ class UniverseRankingReport:
     generated_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
+    # Forecast horizon every should_i_trade call in this sweep used (days).
+    horizon_days: int = 7
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "universe_name": self.universe_name,
+            "horizon_days": self.horizon_days,
             "tickers_attempted": self.tickers_attempted,
             "tickers_succeeded": self.tickers_succeeded,
             "top_k": [r.to_dict() for r in self.top_k],
@@ -446,6 +452,7 @@ def _run_one_ticker(
     ticker: str,
     *,
     account_size_usd: float,
+    horizon_days: int = DEFAULT_HORIZON_DAYS,
 ) -> TickerRanking:
     """Call ``should_i_trade`` for a single ticker defensively.
 
@@ -477,6 +484,7 @@ def _run_one_ticker(
             engine,
             ticker,
             account_size_usd=account_size_usd,
+            horizon_days=horizon_days,
         )
     except Exception as exc:  # noqa: BLE001
         log.debug(
@@ -600,9 +608,15 @@ def rank_universe(
     account_size_usd: float = 100_000.0,
     top_k: int = DEFAULT_TOP_K,
     parallel: bool = False,
+    horizon_days: int = DEFAULT_HORIZON_DAYS,
 ) -> UniverseRankingReport:
     """Run ``should_i_trade`` across a ticker universe and rank by
     composite score.
+
+    ``horizon_days`` (2026-09-10) is passed to every ``should_i_trade``
+    call and recorded on the report; the weekly long-horizon sweep in
+    ``intelligence/scheduler.py`` runs this at 90 days so multi-month
+    verdicts are persisted in ``universe_ranking_history``.
 
     Sequential by default; ``parallel=True`` fans out over a
     ``ThreadPoolExecutor`` with at most ``MAX_PARALLEL_WORKERS`` workers
@@ -642,6 +656,7 @@ def rank_universe(
                         engine,
                         t,
                         account_size_usd=account_size_usd,
+                        horizon_days=horizon_days,
                     ): t
                     for t in tickers
                 }
@@ -667,7 +682,9 @@ def rank_universe(
             for t in tickers:
                 rankings.append(
                     _run_one_ticker(
-                        engine, t, account_size_usd=account_size_usd
+                        engine, t,
+                        account_size_usd=account_size_usd,
+                        horizon_days=horizon_days,
                     )
                 )
     except Exception as exc:  # noqa: BLE001
@@ -718,6 +735,7 @@ def rank_universe(
         concentration_alerts=alerts,
         regime_signature=regime,
         narrative="",
+        horizon_days=horizon_days,
     )
     return _with_narrative(report)
 
@@ -740,6 +758,7 @@ def _with_narrative(report: UniverseRankingReport) -> UniverseRankingReport:
         regime_signature=report.regime_signature,
         narrative=text_,
         generated_at=report.generated_at,
+        horizon_days=report.horizon_days,
     )
 
 
@@ -768,9 +787,17 @@ def ensure_ranking_table(engine: Engine) -> None:
         )
         """
     )
+    # 2026-09-10: horizon of the sweep. Existing rows were all 7 d.
+    alter = text(
+        """
+        ALTER TABLE universe_ranking_history
+        ADD COLUMN IF NOT EXISTS horizon_days INTEGER NOT NULL DEFAULT 7
+        """
+    )
     try:
         with engine.begin() as conn:
             conn.execute(ddl)
+            conn.execute(alter)
     except Exception as exc:  # noqa: BLE001
         log.debug("universe_ranker: ensure_ranking_table failed: {e}", e=exc)
 
@@ -789,12 +816,12 @@ def persist_ranking(engine: Engine, report: UniverseRankingReport) -> int:
     insert_sql = text(
         """
         INSERT INTO universe_ranking_history (
-            generated_at, universe_name,
+            generated_at, universe_name, horizon_days,
             tickers_attempted, tickers_succeeded,
             regime_signature, top_k,
             sector_distributions, concentration_alerts, narrative
         ) VALUES (
-            :generated_at, :universe_name,
+            :generated_at, :universe_name, :horizon_days,
             :tickers_attempted, :tickers_succeeded,
             :regime_signature, :top_k,
             :sector_distributions, :concentration_alerts, :narrative
@@ -810,6 +837,7 @@ def persist_ranking(engine: Engine, report: UniverseRankingReport) -> int:
                 {
                     "generated_at": report.generated_at,
                     "universe_name": report.universe_name,
+                    "horizon_days": int(report.horizon_days),
                     "tickers_attempted": report.tickers_attempted,
                     "tickers_succeeded": report.tickers_succeeded,
                     "regime_signature": report.regime_signature,

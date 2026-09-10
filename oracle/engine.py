@@ -116,6 +116,12 @@ class OraclePrediction:
     scored_at: datetime | None = None
     score_notes: str = ""
 
+    # Forecast horizon in calendar days (2026-09-10). Until now every
+    # prediction expired at the next monthly options expiry (~35 d max), so
+    # the 90 d calibration bucket could never fill (LEVER-PACKAGE.md §5.1).
+    # None on legacy rows; derived from expiry when not explicitly requested.
+    horizon_days: int | None = None
+
     def to_dict(self) -> dict:
         d = asdict(self)
         d["prediction_type"] = self.prediction_type.value
@@ -636,6 +642,10 @@ class OracleEngine:
             conn.execute(text("""
                 ALTER TABLE oracle_predictions
                 ADD COLUMN IF NOT EXISTS dedup_keep BOOLEAN NOT NULL DEFAULT TRUE
+            """))
+            conn.execute(text("""
+                ALTER TABLE oracle_predictions
+                ADD COLUMN IF NOT EXISTS horizon_days INTEGER
             """))
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS oracle_models (
@@ -1244,6 +1254,24 @@ class OracleEngine:
 
     # ── Prediction Generation ───────────────────────────────────────────
 
+    def _expiry_for_horizon(self, now: datetime, horizon_days: int | None) -> date:
+        """Expiry date for a prediction.
+
+        ``horizon_days`` set → ``now + horizon_days`` (calendar days), which is
+        how the weekly long-horizon sweep writes 90 d and 180 d predictions.
+        ``None`` → the legacy behaviour, the next monthly options expiry.
+        """
+        if horizon_days is not None and int(horizon_days) > 0:
+            return now.date() + timedelta(days=int(horizon_days))
+        return self._next_monthly_expiry()
+
+    @staticmethod
+    def _horizon_days_for(now: datetime, expiry: date, horizon_days: int | None) -> int:
+        """The horizon to record: the explicit request, else expiry minus today."""
+        if horizon_days is not None and int(horizon_days) > 0:
+            return int(horizon_days)
+        return max(1, (expiry - now.date()).days)
+
     def _oracle_one_ticker(
         self,
         idx: int,
@@ -1251,6 +1279,7 @@ class OracleEngine:
         total_tickers: int,
         now: datetime,
         signal_cache: dict,
+        horizon_days: int | None = None,
     ) -> list["OraclePrediction"]:
         """Run the per-ticker prediction pipeline once.
 
@@ -1275,6 +1304,7 @@ class OracleEngine:
                 pred_id = hashlib.md5(
                     f"{ticker}:{model.name}:no_data:{now.isoformat()}".encode()
                 ).hexdigest()[:16]
+                placeholder_expiry = self._expiry_for_horizon(now, horizon_days)
                 placeholder = OraclePrediction(
                     id=pred_id,
                     timestamp=now,
@@ -1283,13 +1313,14 @@ class OracleEngine:
                     direction="NONE",
                     target_price=None,
                     current_price=0.0,
-                    expiry=self._next_monthly_expiry(),
+                    expiry=placeholder_expiry,
                     confidence=0.0,
                     expected_move_pct=0.0,
                     model_name=model.name,
                     model_version=model.version,
                     verdict=Verdict.NO_DATA,
                     score_notes="No spot price available at prediction time",
+                    horizon_days=self._horizon_days_for(now, placeholder_expiry, horizon_days),
                 )
                 ticker_predictions.append(placeholder)
             return ticker_predictions
@@ -1612,8 +1643,9 @@ class OracleEngine:
                 else:
                     target = spot * (1 - expected_move / 100)
 
-                # Expiry: next monthly options expiry (3rd Friday)
-                expiry = self._next_monthly_expiry()
+                # Expiry: explicit horizon when requested (long-horizon sweep),
+                # else the next monthly options expiry (3rd Friday).
+                expiry = self._expiry_for_horizon(now, horizon_days)
 
                 # Create prediction
                 pred_id = hashlib.md5(
@@ -1645,6 +1677,7 @@ class OracleEngine:
                     model_version=model.version,
                     model_weights={m.name: m.weight for m in self.models},
                     flow_context=flow_ctx,
+                    horizon_days=self._horizon_days_for(now, expiry, horizon_days),
                 )
 
                 ticker_predictions.append(pred)
@@ -1664,12 +1697,17 @@ class OracleEngine:
         return ticker_predictions
 
     def generate_predictions(
-        self, tickers: list[str] | None = None
+        self, tickers: list[str] | None = None, horizon_days: int | None = None
     ) -> list[OraclePrediction]:
         """Generate predictions for all tickers using all models.
 
         Each model produces a prediction for each ticker. Predictions
         with low confidence are still logged — they're how we learn.
+
+        ``horizon_days`` (2026-09-10): when given, every prediction expires
+        ``horizon_days`` calendar days out instead of at the next monthly
+        options expiry, and the value is stored in ``oracle_predictions.
+        horizon_days``. ``None`` keeps the legacy behaviour.
         """
         if tickers is None:
             tickers = self._get_active_tickers()
@@ -1702,6 +1740,7 @@ class OracleEngine:
             try:
                 return self._oracle_one_ticker(
                     idx, ticker, total_tickers, now, signal_cache,
+                    horizon_days=horizon_days,
                 )
             except Exception as exc:
                 log.warning("Oracle ticker {t} failed: {e}", t=ticker, e=str(exc))
@@ -2012,8 +2051,16 @@ class OracleEngine:
 
     # ── Full Cycle ──────────────────────────────────────────────────────
 
-    def run_cycle(self, tickers: list[str] | None = None) -> dict[str, Any]:
-        """Run one full oracle cycle: score → evolve → predict → report."""
+    def run_cycle(
+        self,
+        tickers: list[str] | None = None,
+        horizon_days: int | None = None,
+    ) -> dict[str, Any]:
+        """Run one full oracle cycle: score → evolve → predict → report.
+
+        ``horizon_days`` overrides the default monthly-expiry horizon for the
+        predictions generated in this cycle (long-horizon sweeps pass 90+).
+        """
         log.info("═══ Oracle Cycle Starting ═══")
 
         # 1. Score expired predictions
@@ -2047,7 +2094,7 @@ class OracleEngine:
             log.debug("Trace evolver failed: {e}", e=str(exc))
 
         # 3. Generate new predictions
-        predictions = self.generate_predictions(tickers)
+        predictions = self.generate_predictions(tickers, horizon_days=horizon_days)
 
         # 4. Get model leaderboard
         leaderboard = self._get_leaderboard()
@@ -2285,9 +2332,10 @@ class OracleEngine:
                     INSERT INTO oracle_predictions
                     (id, ticker, prediction_type, direction, target_price, entry_price,
                      expiry, confidence, expected_move_pct, signal_strength, coherence,
-                     model_name, model_version, signals, anti_signals, flow_context, model_weights)
+                     model_name, model_version, signals, anti_signals, flow_context, model_weights,
+                     horizon_days)
                     VALUES (:id, :t, :pt, :d, :tp, :ep, :exp, :conf, :em, :ss, :coh,
-                            :mn, :mv, :sig, :anti, :fc, :mw)
+                            :mn, :mv, :sig, :anti, :fc, :mw, :hd)
                     ON CONFLICT (
                         ticker, direction, expiry, prediction_type,
                         (COALESCE(model_version, '')),
@@ -2314,6 +2362,7 @@ class OracleEngine:
                     "anti": json.dumps([asdict(a) for a in p.anti_signals], default=str),
                     "fc": json.dumps(p.flow_context, default=str),
                     "mw": json.dumps(p.model_weights, default=str),
+                    "hd": int(p.horizon_days) if p.horizon_days is not None else None,
                 })
                 written += 1
 

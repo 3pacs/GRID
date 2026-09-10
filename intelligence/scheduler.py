@@ -293,6 +293,64 @@ def run_intelligence_loop() -> None:
     _sched.every().day.at("03:30").do(_actor_news_top200)
     _sched.every().sunday.at("04:00").do(_actor_news_weekly_tail)
 
+    def _journal_verdicts_daily() -> None:
+        """Close the decision-journal loop on a schedule (LEVER-PACKAGE §7 T0.2).
+
+        ``DecisionJournal.record_outcome`` had no scheduled caller — verdicts
+        only arrived when someone ran ``scripts/backfill_journal_verdicts.py``
+        by hand, so the oracle's journal-feedback multiplier
+        (``oracle/engine.py::_get_journal_feedback``) learned from whatever
+        happened to be backfilled. Runs after the 06:30 realized-alpha job.
+        """
+        try:
+            from scripts.backfill_journal_verdicts import run as _score_journal
+            summary = _score_journal(dry_run=False)
+            log.info(
+                "journal verdicts daily: scored={s} skipped={k}",
+                s=summary.get("scored", summary.get("updated", 0)),
+                k=summary.get("skipped", 0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("journal verdicts daily failed: {e}", e=str(exc))
+
+    _sched.every().day.at("06:45").do(_journal_verdicts_daily)
+
+    def _long_horizon_sweep() -> None:
+        """Weekly 90-day decision sweep (LEVER-PACKAGE §7 T2.2).
+
+        The long-horizon stack (edge-scanner playbooks → ``should_i_trade``
+        with the coverage-gated conviction stack) existed but nothing ran
+        it, and the oracle only ever wrote ~35-day predictions. This sweep
+        runs ``rank_universe`` at 90 days over the edge scanner's playbook
+        universe and persists the report to ``universe_ranking_history``
+        so multi-month verdicts accumulate a track record.
+        """
+        try:
+            from db import get_engine as _ge
+            from intelligence.market_edge_scanner import TARGET_UNIVERSE
+            from intelligence.universe_ranker import persist_ranking, rank_universe
+
+            engine = _ge()
+            report = rank_universe(
+                engine,
+                list(TARGET_UNIVERSE),
+                horizon_days=90,
+                parallel=True,
+                top_k=25,
+            )
+            row_id = persist_ranking(engine, report)
+            log.info(
+                "long-horizon sweep: {s}/{a} tickers, regime={r}, top={t}, row={row}",
+                s=report.tickers_succeeded, a=report.tickers_attempted,
+                r=report.regime_signature,
+                t=[x.ticker for x in report.top_k[:5]],
+                row=row_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("long-horizon sweep failed: {e}", e=str(exc))
+
+    _sched.every().sunday.at("05:00").do(_long_horizon_sweep)
+
     def _actor_trust_cog_recompute() -> None:
         """INTEL-2: recompute trust-vs-cog classification for every lever puller."""
         try:
