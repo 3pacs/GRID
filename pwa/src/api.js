@@ -621,6 +621,18 @@ class GRIDApi {
     async getCrucixSignals() { return this._fetch('/api/v1/signals/crucix'); }
     async getConvictionScores(minScore = 20) { return this._fetch(`/api/v1/signals/conviction?min_score=${minScore}`); }
     async getConvictionTicker(ticker) { return this._fetch(`/api/v1/signals/conviction/${encodeURIComponent(ticker)}`); }
+    /**
+     * Full decision stack for one ticker (oracle → red team → provenance with
+     * coverage → base rates → stress → Kelly ticket). Synchronous on the server
+     * and can take several seconds; callers should show progress.
+     */
+    async getConvictionDecision(ticker, { horizonDays = 30, accountSizeUsd = 100000 } = {}) {
+        const params = new URLSearchParams({
+            horizon_days: String(horizonDays),
+            account_size_usd: String(accountSizeUsd),
+        });
+        return this._fetch(`/api/v1/conviction/ticker/${encodeURIComponent(ticker)}?${params.toString()}`);
+    }
 
     // Options
     async getOptionsSignals(ticker = '', limit = 50) {
