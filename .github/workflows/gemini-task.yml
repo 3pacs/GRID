@@ -42,6 +42,14 @@ on:
         type: choice
         options: [run, help, diag]
         default: "run"
+      print_timeout:
+        description: >-
+          agy print-mode wait timeout, passed as --print-timeout (Go duration
+          syntax, e.g. "75m"). Only applies when the resolved CLI is
+          agy/agy.real (ignored for gemini-cli). Must stay below the step's
+          outer `timeout 80m` wrapper.
+        type: string
+        default: "75m"
 
 jobs:
   gemini:
@@ -55,6 +63,7 @@ jobs:
       YOLO: ${{ inputs.yolo }}
       CLI: ${{ inputs.cli }}
       MODE: ${{ inputs.mode }}
+      PRINT_TIMEOUT: ${{ inputs.print_timeout }}
     steps:
       - name: Diag
         if: ${{ inputs.mode == 'diag' }}
@@ -155,7 +164,10 @@ jobs:
           # and --dangerously-skip-permissions instead of gemini-cli's -m/--yolo.
           cli_name="$(basename "$RESOLVED_CLI")"
           if [ "$cli_name" = "agy" ] || [ "$cli_name" = "agy.real" ]; then
-            args=(--model "$MODEL" -p "$PROMPT" --output-format text)
+            # agy's print-mode wait defaults to --print-timeout 5m0s, which silently
+            # truncates any task longer than 5 minutes (exit 0, partial output) well
+            # before the outer `timeout 80m` below ever kicks in.
+            args=(--model "$MODEL" -p "$PROMPT" --output-format text --print-timeout "$PRINT_TIMEOUT")
             [ "$YOLO" = "true" ] && args+=(--dangerously-skip-permissions)
           else
             args=(-m "$MODEL")
