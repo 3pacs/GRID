@@ -315,6 +315,35 @@ def run_intelligence_loop() -> None:
 
     _sched.every().day.at("06:45").do(_journal_verdicts_daily)
 
+    def _trial_outcomes_daily() -> None:
+        """Score what each trial readout actually did (2026-09-10).
+
+        ``trial_signals`` shipped with ``fwd_return_30d`` and a comment
+        saying a post-hoc job filled it. None existed — 135 rows, 0 scored.
+        Without this GRID has no record of any readout it flagged, so
+        ``intelligence/catalyst_ev.py`` can only offer a borrowed industry
+        base rate for P(success). This is the job that replaces that
+        borrowed number with GRID's own tape.
+
+        Runs daily and only over windows that have fully elapsed, so a
+        readout is scored once, ~30 days after it lands.
+        """
+        try:
+            from db import get_engine as _ge
+            from intelligence.trial_outcomes import score_trial_outcomes
+
+            summary = score_trial_outcomes(_ge())
+            log.info(
+                "trial outcomes: {r}/{rc} readouts, {s}/{sc} signals scored, {u} unpriced",
+                r=summary.get("readouts_scored"), rc=summary.get("readouts_considered"),
+                s=summary.get("signals_scored"), sc=summary.get("signals_considered"),
+                u=summary.get("unpriced"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("trial outcomes scoring failed: {e}", e=str(exc))
+
+    _sched.every().day.at("07:15").do(_trial_outcomes_daily)
+
     def _long_horizon_sweep() -> None:
         """Weekly 90-day decision sweep (LEVER-PACKAGE §7 T2.2).
 
