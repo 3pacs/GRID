@@ -62,6 +62,26 @@ from intelligence.company_analyzer import ensure_table
 
 SEC_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 SEC_UA = "GRID Intelligence ops@stepdad.finance"
+SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
+
+# Coarse SIC → sector map for the small-cap universe (FMP's v3 profile
+# endpoint is deprecated and returns nothing on the free tier, so sector
+# comes from the SEC submissions feed). Industry = the SIC description.
+_SIC_SECTORS: tuple[tuple[range, str], ...] = (
+    (range(2833, 2837), "Healthcare"),          # pharmaceutical preparations, biologicals
+    (range(3826, 3827), "Healthcare"),          # laboratory analytical instruments
+    (range(3841, 3852), "Healthcare"),          # surgical/medical/ophthalmic devices
+    (range(8000, 8100), "Healthcare"),          # health services, labs
+    (range(3570, 3580), "Technology"),          # computers, storage
+    (range(3660, 3680), "Technology"),          # communications, semiconductors
+    (range(7370, 7380), "Technology"),          # software, services
+    (range(1000, 1100), "Materials"),           # metal mining (incl. uranium 1090)
+    (range(1200, 1400), "Energy"),              # coal, oil & gas extraction
+    (range(2800, 2900), "Materials"),           # chemicals (pharma 2833–2836 matched above first)
+    (range(3700, 3800), "Industrials"),         # transportation equipment
+    (range(4900, 5000), "Utilities"),
+    (range(6000, 6800), "Financials"),
+)
 SEC_TIMEOUT_S = 30
 CALL_PAUSE_S = 0.3                 # between every external call (SEC limit is 10 req/s)
 
@@ -133,6 +153,36 @@ def compute_runway_months(cash: float | None, quarterly_burn: float | None) -> f
     if c is None or c < 0 or b is None or b <= 0:
         return None
     return round(c / max(b / 3.0, 1.0), 1)
+
+
+def derive_market_cap(shares_outstanding: float | None, price: float | None) -> float | None:
+    """shares × latest close, or None when either side is missing/non-positive.
+
+    Used when no source reports a market cap directly (FMP v3 is deprecated;
+    SEC XBRL has shares but no price). The price is a PIT close from
+    ``raw_series``, so this is as-of, not live.
+    """
+    if shares_outstanding is None or price is None:
+        return None
+    try:
+        s, p = float(shares_outstanding), float(price)
+    except (TypeError, ValueError):
+        return None
+    if s <= 0 or p <= 0 or s != s or p != p:
+        return None
+    return round(s * p, 2)
+
+
+def sector_from_sic(sic: Any) -> str | None:
+    """Coarse GICS-like sector for an SEC SIC code; None when unknown."""
+    try:
+        code = int(str(sic).strip())
+    except (TypeError, ValueError):
+        return None
+    for rng, sector in _SIC_SECTORS:
+        if code in rng:
+            return sector
+    return None
 
 
 def _entries(facts: dict[str, Any], taxonomy: str, concept: str) -> list[dict[str, Any]]:
@@ -488,6 +538,77 @@ class SmallCapEnrichmentPuller:
             return {}
         return parse_sec_companyfacts(facts if isinstance(facts, dict) else {})
 
+    def sec_submissions(self, ticker: str) -> dict[str, Any]:
+        """``{sic, sic_description, sector, industry, name}`` from the SEC submissions feed ({} on failure)."""
+        try:
+            from grid.signals.sponsor_resolver import sec_cik_for_ticker
+
+            cik = sec_cik_for_ticker(ticker)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("small_cap_enrichment: CIK map unavailable: {e}", e=str(exc))
+            return {}
+        if not cik:
+            return {}
+        try:
+            resp = self._http_get(
+                SEC_SUBMISSIONS_URL.format(cik=cik),
+                headers={"User-Agent": SEC_UA, "Accept": "application/json"},
+                timeout=SEC_TIMEOUT_S,
+            )
+            self._sleep(CALL_PAUSE_S)
+            if getattr(resp, "status_code", 200) != 200:
+                log.debug("small_cap_enrichment: SEC submissions {t} HTTP {s}", t=ticker, s=resp.status_code)
+                return {}
+            sub = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("small_cap_enrichment: SEC submissions {t} failed: {e}", t=ticker, e=str(exc))
+            return {}
+        if not isinstance(sub, dict):
+            return {}
+        sic = sub.get("sic")
+        desc = (sub.get("sicDescription") or "").strip() or None
+        return {
+            "sic": sic,
+            "sic_description": desc,
+            "sector": sector_from_sic(sic),
+            "industry": desc.title() if desc else None,
+            "name": (sub.get("name") or "").strip().title() or None,
+        }
+
+    # ── Latest PIT close (raw_series) ─────────────────────────────────────
+
+    _LATEST_PRICE_SQL = text(
+        """
+        SELECT value
+        FROM raw_series
+        WHERE series_id = ANY(:series_ids)
+          AND obs_date <= :as_of
+          AND pull_timestamp <= :as_of_ts
+          AND value IS NOT NULL AND value > 0
+        ORDER BY obs_date DESC, pull_timestamp DESC
+        LIMIT 1
+        """
+    )
+
+    def latest_price(self, ticker: str, as_of: date) -> float | None:
+        """Most recent close on or before ``as_of`` known by ``as_of`` (PIT), or None."""
+        t = ticker.upper()
+        series_ids = [f"YF:{t}:adj_close", f"YF:{t}:close", f"TIINGO:{t}:adj_close", f"TIINGO:{t}:close"]
+        try:
+            with self.engine.connect() as conn:
+                row = conn.execute(
+                    self._LATEST_PRICE_SQL,
+                    {
+                        "series_ids": series_ids,
+                        "as_of": as_of,
+                        "as_of_ts": datetime.combine(as_of, datetime.max.time()).replace(tzinfo=timezone.utc),
+                    },
+                ).first()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("small_cap_enrichment: latest_price {t} failed: {e}", t=t, e=str(exc))
+            return None
+        return _to_float(row[0]) if row is not None else None
+
     # ── Universe ──────────────────────────────────────────────────────────
 
     def _distinct(self, sql: Any, params: dict[str, Any]) -> set[str]:
@@ -566,6 +687,27 @@ class SmallCapEnrichmentPuller:
         need_sec = any(fmp.get(f) is None for f in ("cash", "revenue_ttm", "net_income_ttm", "shares_outstanding", "quarterly_burn"))
         sec = self.sec_fields(ticker) if need_sec else {}
         merged = merge_sources(fmp, tiingo, sec)
+        contributors = [c for c in (merged.get("enrichment_source") or "").split(",") if c]
+        # Market cap from SEC shares × PIT close when no source reports one.
+        if merged.get("market_cap") is None and merged.get("shares_outstanding") is not None:
+            price = self.latest_price(ticker, as_of)
+            derived = derive_market_cap(merged.get("shares_outstanding"), price)
+            if derived is not None:
+                merged["market_cap"] = derived
+                merged["market_cap_price"] = price
+                contributors.append("derived_shares_x_price")
+        # Sector / industry from the SEC submissions feed when the profile has none.
+        if merged.get("sector") is None or merged.get("industry") is None:
+            sub = self.sec_submissions(ticker)
+            if sub:
+                merged["sector"] = merged.get("sector") or sub.get("sector")
+                merged["industry"] = merged.get("industry") or sub.get("industry")
+                merged["sic"] = sub.get("sic")
+                if merged.get("name") is None:
+                    merged["name"] = sub.get("name")
+                if sub.get("sector") or sub.get("industry"):
+                    contributors.append("sec_submissions")
+        merged["enrichment_source"] = ",".join(dict.fromkeys(contributors)) or None
         return shape_enrichment_row(ticker, merged)
 
     def pull_all(

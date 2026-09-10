@@ -64,10 +64,10 @@ def test_react_flow_dependency_and_dead_node_set_are_gone() -> None:
 def test_trial_gem_chain_is_scheduled_daily_before_realized_alpha() -> None:
     src = _read("intelligence/scheduler.py")
     assert '_sched.every().day.at("05:40").do(_trial_ingestor_daily)' in src
-    assert '_sched.every().day.at("05:55").do(_trial_signal_daily)' in src
-    assert '_sched.every().day.at("06:05").do(_small_cap_enrichment_daily)' in src
+    assert '_sched.every().day.at("05:52").do(_small_cap_enrichment_daily)' in src
+    assert '_sched.every().day.at("06:05").do(_trial_signal_daily)' in src
     assert "from grid.ingestors.trial_ingestor import run as _ingest" in src
     assert "from grid.signals.trial_signal import run_daily as _score" in src
     assert "from ingestion.altdata.small_cap_enrichment import pull_all as _enrich" in src
-    # ingest → score → enrich → (06:30) realized alpha, by clock time
-    assert "05:40" < "05:55" < "06:05" < "06:30"
+    # ingest → enrich (writes market caps) → score (reads them) → (06:30) realized alpha
+    assert "05:40" < "05:52" < "06:05" < "06:30"
