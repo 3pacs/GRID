@@ -123,6 +123,22 @@ def _patch_loaders(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> None:
             "as_of": None,
         },
         "_company_name": lambda ticker: {"CCJ": "Cameco", "NVDA": "NVIDIA"}.get(ticker),
+        "_load_company_profiles": lambda engine, as_of: {
+            # enriched small cap (joins the universe; cap from company_profiles)
+            "SMLX": {
+                "market_cap": 900e6, "cash": 150e6, "cash_runway_months": 14.0, "revenue_ttm": 12e6,
+                "net_income_ttm": -40e6, "shares_outstanding": 50e6, "sector": "Healthcare",
+                "industry": "Biotechnology", "description": "Small biotech.", "name": "Smallex Bio",
+                "enriched_at": (as_of - timedelta(days=3)).isoformat(),
+            },
+            # fundamentals but no cap -> cap chain falls through to trial_signals
+            "BIOX": {
+                "market_cap": None, "cash": 80e6, "cash_runway_months": 9.0, "revenue_ttm": None,
+                "net_income_ttm": -25e6, "shares_outstanding": None, "sector": "Healthcare",
+                "industry": "Biotechnology", "description": None, "name": None,
+                "enriched_at": (as_of - timedelta(days=1)).isoformat(),
+            },
+        },
     }
     defaults.update(overrides)
     for name, fn in defaults.items():
@@ -373,6 +389,120 @@ def test_board_survives_total_price_outage(monkeypatch: pytest.MonkeyPatch) -> N
     assert any(n.startswith("price_history: unavailable") for n in board["method_notes"])
     assert all(c["chart"] is None and c["projection"] is None for c in board["candidates"])
     assert board["stand_down_reason"] is not None
+
+
+# ── fundamentals / cap fallback chain / sweep note (task #28) ─────────────
+
+
+def test_candidates_carry_fundamentals_and_cap_fallback_chain(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_loaders(monkeypatch)
+    board = lp.build_long_plays_board(MagicMock(), as_of=AS_OF, top_k=100)
+    by_ticker = {c["ticker"]: c for c in board["candidates"]}
+
+    # enriched small cap joined the universe with a note
+    assert "SMLX" in by_ticker
+    assert any("company_profiles small caps" in n for n in board["method_notes"])
+    smlx = by_ticker["SMLX"]
+    assert set(smlx["fundamentals"]) == set(lp.FUNDAMENTALS_KEYS)
+    assert smlx["fundamentals"]["cash_runway_months"] == 14.0 and smlx["fundamentals"]["sector"] == "Healthcare"
+    assert smlx["market_cap_usd"] == 900e6 and smlx["market_cap_source"] == "company_profiles.market_cap"
+    assert smlx["market_cap_bucket"] == "small" and smlx["name"] == "Smallex Bio"
+    assert "runway 14 mo" in smlx["why"]
+
+    # profile without cap: fundamentals attach, cap falls back to trial_signals.market_cap_mm
+    biox = by_ticker["BIOX"]
+    assert biox["fundamentals"]["cash"] == 80e6 and biox["fundamentals"]["revenue_ttm"] is None
+    assert biox["market_cap_usd"] == 450e6 and biox["market_cap_source"] == "trial_signals.market_cap_mm"
+    assert "oncology" in biox["themes"]  # trial primary_indication is a theme
+    assert "runway 9 mo" in biox["why"]
+
+    # ticker_metrics_daily still wins over everything; no profile -> None fundamentals, no runway text
+    ccj = by_ticker["CCJ"]
+    assert ccj["market_cap_source"] == "ticker_metrics_daily"
+    assert all(v is None for v in ccj["fundamentals"].values())
+    assert "runway" not in ccj["why"]
+    for cand in board["candidates"]:
+        json.dumps(cand["fundamentals"])
+
+
+def test_small_cap_universe_requires_recent_enrichment_and_small_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    profiles = {
+        "STALE": {"market_cap": 500e6, "enriched_at": (AS_OF - timedelta(days=45)).isoformat()},
+        "BIGCO": {"market_cap": 5e9, "enriched_at": (AS_OF - timedelta(days=1)).isoformat()},
+        "FUTUR": {"market_cap": 500e6, "enriched_at": (AS_OF + timedelta(days=2)).isoformat()},  # after as_of
+        "NOCAP": {"market_cap": None, "enriched_at": (AS_OF - timedelta(days=1)).isoformat()},
+        "GOOD": {"market_cap": 500e6, "enriched_at": (AS_OF - timedelta(days=29)).isoformat()},
+        "BADTS": {"market_cap": 500e6, "enriched_at": "not-a-date"},
+    }
+    assert lp._recently_enriched_small_caps(profiles, AS_OF) == {"GOOD"}
+    _patch_loaders(monkeypatch, _load_company_profiles=lambda engine, as_of: profiles)
+    board = lp.build_long_plays_board(MagicMock(), as_of=AS_OF, top_k=100)
+    tickers = {c["ticker"] for c in board["candidates"]}
+    assert "GOOD" in tickers and not ({"STALE", "BIGCO", "FUTUR", "NOCAP", "BADTS"} & tickers)
+
+
+def test_company_profiles_failure_degrades_with_note(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*a: Any, **k: Any) -> Any:
+        raise RuntimeError("relation does not exist")
+
+    _patch_loaders(monkeypatch, _load_company_profiles=boom)
+    board = lp.build_long_plays_board(MagicMock(), as_of=AS_OF)
+    assert any(n.startswith("company_profiles: unavailable") for n in board["method_notes"])
+    assert all(all(v is None for v in c["fundamentals"].values()) for c in board["candidates"])
+    biox = next(c for c in board["candidates"] if c["ticker"] == "BIOX")
+    assert biox["market_cap_usd"] == 450e6  # trial_signals fallback still works
+
+
+def test_sweep_note_distinguishes_missing_from_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_loaders(monkeypatch, _load_sweep=lambda engine: None)
+    board = lp.build_long_plays_board(MagicMock(), as_of=AS_OF, top_k=3)
+    assert f"universe_ranking_history: {lp.SWEEP_NOTE_MISSING}" in board["method_notes"]
+    assert all(c["sweep_note"] == lp.SWEEP_NOTE_MISSING for c in board["candidates"])
+
+    _patch_loaders(monkeypatch, _load_sweep=lambda engine: {})
+    board = lp.build_long_plays_board(MagicMock(), as_of=AS_OF, top_k=3)
+    assert f"universe_ranking_history: {lp.SWEEP_NOTE_EMPTY}" in board["method_notes"]
+    assert "no rankable verdicts" in lp.SWEEP_NOTE_EMPTY
+    assert all(c["sweep_note"] == lp.SWEEP_NOTE_EMPTY for c in board["candidates"])
+    assert not any(lp.SWEEP_NOTE_MISSING in n for n in board["method_notes"])
+
+    # a covered board has no per-candidate note
+    _patch_loaders(monkeypatch)
+    board = lp.build_long_plays_board(MagicMock(), as_of=AS_OF, top_k=3)
+    assert all(c["sweep_note"] is None for c in board["candidates"])
+
+
+def test_load_sweep_returns_none_for_no_row_and_empty_dict_for_empty_top_k(monkeypatch: pytest.MonkeyPatch) -> None:
+    import intelligence.universe_ranker as ur
+
+    monkeypatch.setattr(ur, "load_latest_ranking", lambda engine, horizon_days: None)
+    assert lp._load_sweep(MagicMock()) is None
+    monkeypatch.setattr(ur, "load_latest_ranking", lambda engine, horizon_days: {"top_k": [], "horizon_days": 90})
+    assert lp._load_sweep(MagicMock()) == {}
+    monkeypatch.setattr(
+        ur, "load_latest_ranking",
+        lambda engine, horizon_days: {"top_k": [{"ticker": "ccj", "verdict": "high", "composite_score": "1.1"}], "horizon_days": 90, "generated_at": "g"},
+    )
+    assert lp._load_sweep(MagicMock()) == {"CCJ": {"verdict": "high", "composite_score": 1.1, "horizon_days": 90, "generated_at": "g"}}
+
+
+def test_load_company_profiles_parses_jsonb_and_is_pit_bounded() -> None:
+    rows = [
+        ("smlx", "Smallex Bio", "Healthcare", json.dumps({"market_cap": 9e8, "cash": "1.5e8", "enriched_at": "2026-09-01T00:00:00+00:00"})),
+        ("BIOX", None, None, {"cash_runway_months": 9, "industry": "Biotechnology"}),
+        (None, "x", None, {}),
+        ("BAD", None, None, "not json"),
+    ]
+    engine, conn = _engine(rows=rows)
+    out = lp._load_company_profiles(engine, AS_OF)
+    assert set(out) == {"SMLX", "BIOX", "BAD"}
+    assert out["SMLX"]["market_cap"] == 9e8 and out["SMLX"]["cash"] == 1.5e8 and out["SMLX"]["name"] == "Smallex Bio"
+    assert out["SMLX"]["sector"] == "Healthcare" and out["SMLX"]["enriched_at"] == "2026-09-01T00:00:00+00:00"
+    assert out["BIOX"]["cash_runway_months"] == 9.0 and out["BIOX"]["industry"] == "Biotechnology" and out["BIOX"]["market_cap"] is None
+    assert all(out["BAD"][k] is None for k in lp.FUNDAMENTALS_KEYS)
+    stmt, params = conn.execute.call_args.args
+    assert "FROM company_profiles" in str(stmt) and "last_analyzed <= :as_of_ts" in str(stmt)
+    assert params["as_of_ts"].date() == AS_OF and params["as_of_ts"].tzinfo is not None
 
 
 # ── price loader: PIT cut-off on both paths ───────────────────────────────

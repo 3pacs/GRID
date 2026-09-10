@@ -233,6 +233,11 @@ _SOURCE_EXTRAS: dict[str, dict[str, Any]] = {
     "regulatory_events":           {"mod": "ingestion.altdata.regulatory_events",       "fn": "run_weekly",   "interval_h": 168},
     "obsidian":                    {"mod": "ingestion.altdata.obsidian_sync",           "fn": "run_sync",     "interval_h": 0.083},
     "trial_ingestor":              {"mod": "grid.ingestors.trial_ingestor",             "fn": "main",         "interval_h": 24},
+    # Trial-gem feed for the Long Plays board (task #28). Order matters:
+    # ingestor (CT.gov → trial_cache/catalyst_calendar) → signal (trial_signals)
+    # → small-cap enrichment (company_profiles cash / burn / runway / mcap).
+    "trial_signal":                {"mod": "grid.signals.trial_signal",                 "fn": "run_daily",    "interval_h": 24},
+    "small_cap_enrichment":        {"mod": "ingestion.altdata.small_cap_enrichment",    "fn": "pull_all",     "interval_h": 24},
 
     # ── Class-based pullers catalogued but not yet scheduler-wired
     # (Adding to PULLER_REGISTRY is the eventual fix; tracking here so
@@ -242,6 +247,8 @@ _SOURCE_EXTRAS: dict[str, dict[str, Any]] = {
     "pmxt_archive":    {"mod": "ingestion.altdata.pmxt_archive",               "cls": "PmxtArchivePuller"},
     "pm_history":      {"mod": "ingestion.altdata.prediction_market_history",  "cls": "PredictionMarketHistoryPuller"},
     "warn_layoffs":    {"mod": "ingestion.altdata.warn_layoffs",               "cls": "WARNLayoffsPuller",     "interval_h": 24},
+    # FMP market-cap refresh for trial tickers (pull(), not pull_all()).
+    "company_profiles_puller": {"mod": "ingestion.altdata.company_profiles_puller", "cls": "CompanyProfilesPuller", "pull_method": "pull", "interval_h": 24},
 
     # ── skip_runtime stubs (ctor/method signature mismatch — needs wrapper
     # or _resolve_puller upgrade before they can actually run).
