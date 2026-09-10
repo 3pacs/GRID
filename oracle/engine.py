@@ -2109,17 +2109,24 @@ class OracleEngine:
         except Exception:
             pass
 
+        _counts = getattr(self, "_last_store_counts", {}) or {}
         result = {
             "scoring": score_result,
             "evolution": evolve_result,
             "trace_evolution": trace_evolve_result,
             "new_predictions": len(predictions),
+            "distinct_positions_written": _counts.get("inserted"),
+            "positions_updated": _counts.get("updated"),
+            "upsert_statements": _counts.get("upsert_statements"),
             "top_predictions": [p.to_dict() for p in predictions[:10]],
             "leaderboard": leaderboard,
             "hallucination_guard": guard_result,
         }
 
-        log.info("═══ Oracle Cycle Complete: {n} new predictions ═══", n=len(predictions))
+        log.info(
+            "═══ Oracle Cycle Complete: {n} model votes → {d} new positions ═══",
+            n=len(predictions), d=_counts.get("inserted", "?"),
+        )
         return result
 
     # ── Helpers ──────────────────────────────────────────────────────────
@@ -2292,6 +2299,8 @@ class OracleEngine:
         )
 
         written = 0
+        inserted = 0   # rows that did not exist (xmax = 0 on RETURNING)
+        updated = 0    # rows that collided with a kept row and were upserted
         with self.engine.begin() as conn:
             for p in predictions:
                 try:
@@ -2328,7 +2337,7 @@ class OracleEngine:
                 # (dedup_keep=FALSE) stay in the table for audit. New inserts
                 # that collide with an existing keep=TRUE row update the
                 # confidence (highest wins) instead of writing a fresh duplicate.
-                conn.execute(text("""
+                _res = conn.execute(text("""
                     INSERT INTO oracle_predictions
                     (id, ticker, prediction_type, direction, target_price, entry_price,
                      expiry, confidence, expected_move_pct, signal_strength, coherence,
@@ -2347,6 +2356,7 @@ class OracleEngine:
                         signal_strength = EXCLUDED.signal_strength,
                         coherence  = EXCLUDED.coherence,
                         model_weights = EXCLUDED.model_weights
+                    RETURNING (xmax = 0) AS inserted
                 """), {
                     "id": p.id, "t": p.ticker, "pt": p.prediction_type.value,
                     "d": p.direction,
@@ -2365,10 +2375,27 @@ class OracleEngine:
                     "hd": int(p.horizon_days) if p.horizon_days is not None else None,
                 })
                 written += 1
+                try:
+                    _row = _res.fetchone() if hasattr(_res, "fetchone") else None
+                    if _row is not None and bool(_row[0]):
+                        inserted += 1
+                    elif _row is not None:
+                        updated += 1
+                except Exception:  # noqa: BLE001 — counting is best-effort
+                    pass
 
+        # Model votes vs positions: N models x M tickers collapse onto one row
+        # per (ticker, direction, expiry, type, day). Report both so a cycle
+        # that upserts 4,340 statements onto 14 rows is described as 14.
+        self._last_store_counts = {
+            "upsert_statements": written,
+            "inserted": inserted,
+            "updated": updated,
+            "predictions": len(predictions),
+        }
         log.info(
-            "_store_predictions: wrote/upserted {w}/{n} rows",
-            w=written, n=len(predictions),
+            "_store_predictions: {w}/{n} upserts → {i} new positions, {u} updated",
+            w=written, n=len(predictions), i=inserted, u=updated,
         )
 
     def _get_leaderboard(self) -> list[dict]:
