@@ -31,6 +31,7 @@ Key entry points:
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -106,6 +107,67 @@ IDENTITY_FIELDS: dict[str, tuple[str, ...]] = {
 # options_flow source ids are whale_<ticker>_<strike>; the puller is the
 # underlying's options tape, so the strike suffix is dropped.
 OPTIONS_STRIKE_SUFFIX_RE = r"_[0-9.]+$"
+
+# ── Insider (Form 4) motivation inputs ───────────────────────────────────
+#
+# Two feeds land in signal_sources as category "insider" and they spell the
+# same facts differently: the SEC Form 4 puller writes snake_case keys and
+# BUY/SELL/UNUSUAL_* signal types, QuiverQuant echoes its own PascalCase
+# record and insider_buy/insider_sell. Read both through one alias table so a
+# rule is written once.
+INSIDER_CODE_KEYS: tuple[str, ...] = (
+    "transaction_code", "TransactionCode", "transactionCode", "Code",
+)
+INSIDER_PLAN_KEYS: tuple[str, ...] = (
+    "is_10b5_1", "aff10b5One", "Is10b5One", "plan_10b5_1",
+)
+INSIDER_TITLE_KEYS: tuple[str, ...] = (
+    "insider_title", "officerTitle", "Title", "insiderTitle",
+)
+# QuiverQuant carries no pre-multiplied value, so Shares x PricePerShare is
+# computed from the two keys it does carry (see INSIDER_SHARE_KEYS below).
+INSIDER_VALUE_KEYS: tuple[str, ...] = ("value", "Value", "total_value")
+INSIDER_SHARE_KEYS: tuple[str, ...] = ("shares", "Shares")
+INSIDER_PRICE_KEYS: tuple[str, ...] = ("price", "PricePerShare")
+# 'A' acquired / 'D' disposed. On the QuiverQuant feed this is the only
+# trustworthy direction: that feed derives signal_type from a TransactionType
+# field its API does not return, so every row lands as "insider_sell".
+INSIDER_ACQ_DISP_KEYS: tuple[str, ...] = (
+    "AcquiredDisposedCode", "acquired_disposed_code",
+)
+# Booleans the QuiverQuant feed sets for reporting-owner relationships.
+INSIDER_SENIOR_FLAG_KEYS: tuple[str, ...] = ("isDirector", "isOfficer")
+
+# Form 4 codes whose motivation is mechanical, not an opinion on the stock:
+# M exercise of a derivative, A award/grant, F shares withheld for tax,
+# G gift, X in-the-money option exercise. Everything discretionary flows
+# through P (open-market purchase) and S (open-market sale).
+#
+# X is not in the hand-off's M/A/F/G list but is the same kind of event as M
+# and is live in the QuiverQuant feed; without it an exercise that acquires
+# shares would rank as an informed purchase.
+INSIDER_ROUTINE_CODES: frozenset[str] = frozenset({"M", "A", "F", "G", "X"})
+
+# A purchase this size is a considered bet rather than a token buy.
+INSIDER_INFORMED_BUY_VALUE: float = 100_000.0
+# A discretionary sale below this is noise: diversification, a house, tuition.
+INSIDER_INFORMED_SELL_VALUE: float = 250_000.0
+
+# Seniority that makes a purchase materially more informative.
+INSIDER_SENIOR_TITLE_RE: re.Pattern[str] = re.compile(
+    r"\b(chief|ceo|cfo|coo|cto|c\.e\.o|c\.f\.o|president|director|chair)",
+    re.IGNORECASE,
+)
+# ... but "Vice President" and "Assistant Secretary" are middle management,
+# and matching them on the word "president" would call every one of them a
+# C-suite buy.
+INSIDER_JUNIOR_TITLE_RE: re.Pattern[str] = re.compile(
+    r"\b(vice|assistant|deputy|associate|asst\.?|vp)\b",
+    re.IGNORECASE,
+)
+
+# Values a JSON/JSONB boolean-ish field can take across the two feeds.
+_TRUE_STRINGS: frozenset[str] = frozenset({"1", "true", "t", "y", "yes"})
 
 # Per-category cap so 400 insiders cannot crowd every other lever out of the top 50.
 MAX_PER_CATEGORY: int = 10
@@ -883,24 +945,7 @@ def assess_motivation(
 
     # ── Insider motivation ──
     if puller.category == "insider":
-        # Buys are almost always informed (insiders buy for one reason)
-        if signal_type in ("BUY", "UNUSUAL_BUY"):
-            return "likely_informed"
-
-        # Large unusual sells = informed or hedging
-        is_unusual = details.get("is_unusual_size", False)
-        if is_unusual and signal_type in ("SELL", "UNUSUAL_SELL"):
-            return "hedging"
-
-        # Derivative transactions often routine
-        if details.get("is_derivative", False):
-            return "routine"
-
-        # Default sells to routine (many reasons to sell)
-        if "SELL" in signal_type:
-            return "routine"
-
-        return "unknown"
+        return _assess_insider_motivation(details, signal_type)
 
     # ── Fed motivation ──
     if puller.category == "fed":
@@ -948,6 +993,162 @@ def _to_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return f if f == f else None
+
+
+def _first_present(details: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    """Return the first non-empty value among *keys*, else None."""
+    for key in keys:
+        value = details.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _to_bool(value: Any) -> bool:
+    """Coerce a JSON/JSONB boolean-ish value to bool."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in _TRUE_STRINGS
+    return False
+
+
+def insider_transaction_code(details: dict[str, Any]) -> str:
+    """Extract the Form 4 transaction code from either insider feed.
+
+    Parameters:
+        details: Parsed ``signal_value`` for an insider row.
+
+    Returns:
+        Single upper-case code letter (``"P"``, ``"S"``, ``"M"``, ...), or
+        ``""`` when the row predates the code being carried through.
+    """
+    raw = _first_present(details, INSIDER_CODE_KEYS)
+    if raw is None:
+        return ""
+    return str(raw).strip().upper()[:1]
+
+
+def _insider_direction(details: dict[str, Any], signal_type: str) -> str:
+    """Decide whether an insider acquired or disposed of shares.
+
+    The Form 4 acquired/disposed code is authoritative and is preferred over
+    ``signal_type``: the QuiverQuant feed labels every insider row
+    "insider_sell" because it reads a TransactionType field the API does not
+    return, so its signal_type says nothing about direction. The Form 4
+    puller's own BUY/UNUSUAL_BUY/CLUSTER_BUY/SELL labels are reliable and are
+    used when no code is present.
+
+    Parameters:
+        details: Parsed ``signal_value`` for the row.
+        signal_type: ``signal_sources.signal_type``.
+
+    Returns:
+        ``"BUY"``, ``"SELL"`` or ``""``.
+    """
+    acq_disp = str(_first_present(details, INSIDER_ACQ_DISP_KEYS) or "").upper()[:1]
+    if acq_disp == "A":
+        return "BUY"
+    if acq_disp == "D":
+        return "SELL"
+
+    upper = (signal_type or "").upper()
+    if "BUY" in upper:
+        return "BUY"
+    if "SELL" in upper:
+        return "SELL"
+    return ""
+
+
+def _insider_value(details: dict[str, Any]) -> float:
+    """Dollar size of an insider transaction, across both feeds.
+
+    Parameters:
+        details: Parsed ``signal_value`` for the row.
+
+    Returns:
+        Trade value in dollars; 0.0 when neither feed supplies enough to
+        compute one.
+    """
+    value = _to_float(_first_present(details, INSIDER_VALUE_KEYS))
+    if value is not None:
+        return abs(value)
+
+    shares = _to_float(_first_present(details, INSIDER_SHARE_KEYS))
+    price = _to_float(_first_present(details, INSIDER_PRICE_KEYS))
+    if shares is not None and price is not None:
+        return abs(shares * price)
+    return 0.0
+
+
+def _insider_is_senior(details: dict[str, Any]) -> bool:
+    """True when the reporting owner is an officer or a director.
+
+    Parameters:
+        details: Parsed ``signal_value`` for the row.
+
+    Returns:
+        True for a C-suite or board-level reporting owner.
+    """
+    for key in INSIDER_SENIOR_FLAG_KEYS:
+        if _to_bool(details.get(key)):
+            return True
+    title = str(_first_present(details, INSIDER_TITLE_KEYS) or "")
+    if INSIDER_JUNIOR_TITLE_RE.search(title):
+        return False
+    return bool(INSIDER_SENIOR_TITLE_RE.search(title))
+
+
+def _assess_insider_motivation(details: dict[str, Any], signal_type: str) -> str:
+    """Classify one insider transaction from its Form 4 transaction code.
+
+    A Form 4 says *why* mechanically: a 10b5-1 plan sale was scheduled months
+    ago, an M is an option exercise, an A is a grant, an F is tax withholding,
+    a G is a gift — none of them is a market opinion. Only discretionary
+    open-market purchases (P) and sales (S) carry information, and only above
+    a size that makes them a considered bet.
+
+    Parameters:
+        details: Parsed ``signal_value`` for the row.
+        signal_type: ``signal_sources.signal_type``.
+
+    Returns:
+        "likely_informed", "routine" or "unknown".
+    """
+    if _to_bool(_first_present(details, INSIDER_PLAN_KEYS)):
+        return "routine"
+
+    code = insider_transaction_code(details)
+    if code in INSIDER_ROUTINE_CODES:
+        return "routine"
+
+    # P and S are open-market trades and state their own direction; anything
+    # else falls back to the acquired/disposed code or the signal type.
+    if code == "P":
+        direction = "BUY"
+    elif code == "S":
+        direction = "SELL"
+    else:
+        direction = _insider_direction(details, signal_type)
+
+    if not direction:
+        # An unranked code (C, D, I, J, K, V, W) with nothing else to go on.
+        return "unknown"
+
+    value = _insider_value(details)
+
+    if direction == "BUY":
+        if value >= INSIDER_INFORMED_BUY_VALUE or _insider_is_senior(details):
+            return "likely_informed"
+        return "routine"
+
+    # Discretionary (no plan flag, checked above) and large enough to be a
+    # decision rather than housekeeping.
+    if value >= INSIDER_INFORMED_SELL_VALUE:
+        return "likely_informed"
+    return "routine"
 
 
 def derive_motivation_model(puller: LeverPuller, engine: Engine) -> str:
@@ -1155,7 +1356,11 @@ def _motivation_narrative(
                 return f"Likely informed — {committee} has jurisdiction over {ticker}'s sector"
             return "Likely informed — large position or unusual timing"
         if puller.category == "insider":
-            return "Likely informed — insider buying own stock (skin in the game)"
+            return _insider_narrative(
+                "Likely informed",
+                "discretionary open-market trade",
+                details,
+            )
         if puller.category == "options_flow":
             return f"Likely informed — sized call positioning with an open-interest spike in {ticker}"
         if puller.category == "lobbyist":
@@ -1164,7 +1369,9 @@ def _motivation_narrative(
 
     if motivation == "routine":
         if puller.category == "insider":
-            return "Routine — likely scheduled 10b5-1 plan or diversification"
+            return _insider_narrative(
+                "Routine", "not a discretionary market bet", details
+            )
         if puller.category == "options_flow":
             return "Routine — ordinary options tape, no size or OI anomaly"
         return "Routine rebalancing"
@@ -1184,7 +1391,67 @@ def _motivation_narrative(
             return "Institutional mandate — regulatory rule"
         return "Institutional mandate — policy role"
 
+    if motivation == "unknown" and puller.category == "insider":
+        return _insider_narrative(
+            "Unknown motivation", "no ranked transaction code", details
+        )
+
     return "Unknown motivation — insufficient data"
+
+
+# Plain-English gloss for the Form 4 codes the narrative can encounter.
+INSIDER_CODE_LABELS: dict[str, str] = {
+    "P": "open-market purchase",
+    "S": "open-market sale",
+    "A": "grant or award",
+    "M": "option exercise",
+    "F": "shares withheld for tax",
+    "G": "gift",
+    "D": "disposition to the issuer",
+    "C": "conversion of a derivative",
+    "I": "discretionary transaction",
+    "J": "other",
+    "K": "equity swap",
+    "V": "voluntary early report",
+    "W": "acquisition by will or descent",
+    "X": "in-the-money option exercise",
+}
+
+
+def _insider_narrative(
+    verdict: str,
+    reason: str,
+    details: dict[str, Any],
+) -> str:
+    """Build an insider motivation narrative that names its evidence.
+
+    The old text asserted "likely scheduled 10b5-1 plan" for every routine
+    sell whether or not the filing said so. This prints what the Form 4
+    actually reported: the transaction code and the Rule 10b5-1 plan flag.
+
+    Parameters:
+        verdict: Leading verdict phrase ("Routine", "Likely informed", ...).
+        reason: Fallback clause when the row carries no transaction code.
+        details: Parsed ``signal_value`` for the row.
+
+    Returns:
+        Narrative motivation string.
+    """
+    code = insider_transaction_code(details)
+    is_plan = _to_bool(_first_present(details, INSIDER_PLAN_KEYS))
+
+    if code:
+        label = INSIDER_CODE_LABELS.get(code, "unclassified code")
+        clause = f"Form 4 code {code} ({label})"
+    else:
+        clause = f"{reason}; Form 4 code not recorded"
+
+    plan_clause = (
+        "under a Rule 10b5-1 plan"
+        if is_plan
+        else "no Rule 10b5-1 plan flag"
+    )
+    return f"{verdict} — {clause}, {plan_clause}"
 
 
 def _build_event_context(details: dict[str, Any]) -> str:

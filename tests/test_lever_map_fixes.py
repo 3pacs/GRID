@@ -186,7 +186,11 @@ def test_identify_applies_per_category_quota_and_persists_real_counts(monkeypatc
     assert json.loads(persisted_tsm["meta"])["motivation_mix"] == {"likely_informed": 1}
 
     ins = next(p for p in pullers if p.id == "insider:Insider 0")
-    assert ins.motivation_model == "likely_informed" and ins.motivation_mix == {"likely_informed": 2}
+    # The CEO's buy is informed; the second carries neither a size nor a title,
+    # so the Form 4 rules call it routine rather than assuming every buy is a
+    # signal. The majority label still resolves to likely_informed on priority.
+    assert ins.motivation_model == "likely_informed"
+    assert ins.motivation_mix == {"likely_informed": 1, "routine": 1}
     quiet = next(p for p in pullers if p.category == "congress")
     assert quiet.motivation_model == "unknown" and quiet.motivation_mix == {}
 
@@ -219,7 +223,9 @@ def _puller(category: str, recent: list[dict] | None = None) -> lp.LeverPuller:
         ("lobbyist", {"signal_type": "lobbying", "details": {"Amount": "220000.0"}}, "likely_informed"),
         ("lobbyist", {"signal_type": "lobbying", "details": {"Amount": "20000"}}, "routine"),
         ("insider", {"signal_type": "SELL", "details": {"is_unusual_size": False}}, "routine"),
-        ("insider", {"signal_type": "CLUSTER_BUY", "details": {}}, "unknown"),  # unchanged legacy rule
+        # Was "unknown" under the legacy rule; the Form 4 code / direction
+        # rules now rank a cluster buy on its size (see test_insider_form4.py).
+        ("insider", {"signal_type": "CLUSTER_BUY", "details": {}}, "routine"),
     ],
 )
 def test_assess_motivation_new_categories(category: str, action: dict, expected: str) -> None:
@@ -232,20 +238,25 @@ def test_social_uses_pattern_deviation() -> None:
     assert lp.assess_motivation(p, {"signal_type": "BUY", "details": {}}, engine=object()) == "routine"
 
 
+# Small trades are routine; a sized purchase is informed. Under the Form 4
+# rules the amounts, not the BUY/SELL label alone, decide.
+_SMALL_SELL = {"signal_type": "SELL", "details": {"value": 4_000}}
+_BIG_BUY = {"signal_type": "BUY", "details": {"value": 500_000}}
+# A code with no ranked direction is the only insider row left unknown.
+_UNRANKED = {"signal_type": "insider_activity", "details": {"transaction_code": "J"}}
+
+
 def test_derive_motivation_model_majority_priority_and_unknown() -> None:
-    p = _puller("insider", recent=[
-        {"signal_type": "SELL", "details": {}}, {"signal_type": "SELL", "details": {}},
-        {"signal_type": "BUY", "details": {}},
-    ])
+    p = _puller("insider", recent=[_SMALL_SELL, _SMALL_SELL, _BIG_BUY])
     assert lp.derive_motivation_model(p, engine=object()) == "routine"
     assert p.motivation_model == "routine" and p.motivation_mix == {"routine": 2, "likely_informed": 1}
 
     # Tie -> priority order puts likely_informed ahead of routine
-    p = _puller("insider", recent=[{"signal_type": "SELL", "details": {}}, {"signal_type": "BUY", "details": {}}])
+    p = _puller("insider", recent=[_SMALL_SELL, _BIG_BUY])
     assert lp.derive_motivation_model(p, engine=object()) == "likely_informed"
 
     # "unknown" only wins when nothing else was observed
-    p = _puller("insider", recent=[{"signal_type": "CLUSTER_BUY", "details": {}}, {"signal_type": "BUY", "details": {}}])
+    p = _puller("insider", recent=[_UNRANKED, _BIG_BUY])
     assert lp.derive_motivation_model(p, engine=object()) == "likely_informed"
     p = _puller("analyst", recent=[{"signal_type": "trade_idea_long", "details": {}}])
     assert lp.derive_motivation_model(p, engine=object()) == "unknown" and p.motivation_mix == {"unknown": 1}
