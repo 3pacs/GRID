@@ -30,13 +30,14 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import sys
 import time
 import uuid
 from datetime import datetime, timezone
 from decimal import ROUND_DOWN, Decimal
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
 from loguru import logger as log
@@ -52,6 +53,19 @@ PATH_BEST_BID_ASK = f"{_API}/marketdata/best_bid_ask/"
 
 #: Quantity precision when a trading pair does not advertise an increment.
 _DEFAULT_INCREMENT = Decimal("0.00000001")
+
+#: Pair statuses Robinhood uses for "you can trade this right now".
+_TRADABLE_STATUSES = frozenset({"tradable", "active"})
+
+#: Price-field and quote suffixes that trail a crypto asset code in GRID
+#: feature names (``btc_close``, ``eth_usd_full``, ``sol_usd_full``).
+_FEATURE_SUFFIXES = frozenset({
+    "FULL", "CLOSE", "OPEN", "HIGH", "LOW", "PRICE", "VOLUME", "ADJ", "MID",
+    "LAST", "SPOT", "INDEX", "USD", "USDT", "USDC",
+})
+
+#: Quote currencies glued onto an asset code without a separator (``BTCUSDT``).
+_GLUED_QUOTES = ("USDT", "USDC", "USD")
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +88,44 @@ def normalize_symbol(ticker: str) -> str:
     if not base:
         raise ValueError(f"Cannot derive a crypto symbol from {ticker!r}")
     return f"{base}-USD"
+
+
+def crypto_asset_code(name: str) -> str | None:
+    """Best-effort crypto asset code from a GRID feature name or ticker.
+
+    ``btc_close`` → ``BTC``; ``eth_usd_full`` → ``ETH``; ``BTC-USD`` → ``BTC``;
+    ``BTCUSDT`` → ``BTC``. Returns ``None`` when *name* carries no plausible
+    asset code. A non-``None`` answer is a *candidate* only — the caller must
+    confirm it against :meth:`RobinhoodCryptoTrader.tradable_assets`, which is
+    the authority on what Robinhood will actually trade (``sp500_close``
+    yields ``SP500``, and no such pair exists).
+    """
+    tokens = [t for t in re.split(r"[^A-Za-z0-9]+", (name or "").upper()) if t]
+    while tokens and tokens[-1] in _FEATURE_SUFFIXES:
+        tokens.pop()
+    if not tokens:
+        return None
+    candidate = tokens[0]
+    for quote in _GLUED_QUOTES:
+        if candidate.endswith(quote) and len(candidate) > len(quote):
+            candidate = candidate[: -len(quote)]
+            break
+    if not re.fullmatch(r"[A-Z][A-Z0-9]{1,9}", candidate):
+        return None
+    return candidate
+
+
+def cursor_from_next(next_link: Any) -> str | None:
+    """Pull the ``cursor`` query parameter out of a paginated ``next`` link.
+
+    Robinhood pages its list endpoints with a full URL in ``next``; the only
+    part that matters is the opaque cursor. Returns ``None`` when there is no
+    further page.
+    """
+    if not isinstance(next_link, str) or not next_link:
+        return None
+    values = parse_qs(urlparse(next_link).query).get("cursor") or []
+    return values[0] if values and values[0] else None
 
 
 def load_signing_key(private_key_b64: str):
@@ -176,6 +228,7 @@ class RobinhoodCryptoTrader:
         self._session = session or requests.Session()
         self.timeout = timeout
         self._high_water_mark: float | None = None
+        self._tradable_assets: set[str] | None = None
 
         log.info(
             "RobinhoodCryptoTrader initialized — mode={mode} cap=${cap} dd={dd:.0%}",
@@ -227,6 +280,31 @@ class RobinhoodCryptoTrader:
         except ValueError:
             return {"error": "non-JSON response"}
 
+    def _paged_results(
+        self,
+        path: str,
+        params: list[tuple[str, Any]] | None = None,
+        max_pages: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Read every page of a list endpoint, following Robinhood's ``next``.
+
+        Bounded at *max_pages* so a broken cursor cannot spin. A truncated
+        read is logged rather than raised — callers treat the result as "what
+        Robinhood reported", never as a closed-world guarantee.
+        """
+        base = list(params or [])
+        rows: list[dict[str, Any]] = []
+        page = base
+        for _ in range(max_pages):
+            payload = self._request("GET", path, params=page or None)
+            rows.extend(self._results(payload))
+            cursor = cursor_from_next(payload.get("next") if isinstance(payload, dict) else None)
+            if not cursor:
+                return rows
+            page = base + [("cursor", cursor)]
+        log.warning("Robinhood {p}: stopped after {n} pages, more remain", p=path, n=max_pages)
+        return rows
+
     @staticmethod
     def _results(payload: Any) -> list[dict[str, Any]]:
         if isinstance(payload, dict):
@@ -277,6 +355,41 @@ class RobinhoodCryptoTrader:
         """Pair metadata: min/max order size, quantity increment, status."""
         rows = self._results(self._request("GET", PATH_TRADING_PAIRS, params={"symbol": symbol}))
         return rows[0] if rows else {}
+
+    def get_trading_pairs(self) -> list[dict[str, Any]]:
+        """Every trading pair Robinhood lists for this account, all pages."""
+        return self._paged_results(PATH_TRADING_PAIRS)
+
+    def tradable_assets(self, refresh: bool = False) -> set[str]:
+        """Asset codes Robinhood currently reports tradable (``{"BTC", "ETH", …}``).
+
+        Cached on the instance: the venue routing paths ask once per run
+        instead of once per signal. An empty set means "Robinhood told us
+        nothing" (unconfigured, or the call failed) — callers must treat that
+        as "route nothing", never as "everything allowed".
+        """
+        if self._tradable_assets is not None and not refresh:
+            return self._tradable_assets
+        assets: set[str] = set()
+        for pair in self.get_trading_pairs():
+            symbol = str(pair.get("symbol", ""))
+            status = str(pair.get("status", "")).lower()
+            if not symbol or status not in _TRADABLE_STATUSES:
+                continue
+            code = symbol.split("-")[0].strip().upper()
+            if code:
+                assets.add(code)
+        self._tradable_assets = assets
+        return assets
+
+    def is_tradable(self, ticker: str) -> bool:
+        """True when *ticker* maps to a pair Robinhood reports tradable.
+
+        Accepts GRID feature spellings (``btc_close``) as well as plain
+        tickers (``BTC``, ``BTC-USD``).
+        """
+        code = crypto_asset_code(ticker)
+        return bool(code) and code in self.tradable_assets()
 
     def get_positions(self) -> list[dict[str, Any]]:
         """Holdings with quantity > 0, valued at the current mid."""

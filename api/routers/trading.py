@@ -256,10 +256,29 @@ async def promote_to_strategy(
 
 
 @router.post("/execute-signals")
-async def execute_signals_now(_token: str = Depends(require_auth)) -> dict:
-    """Manually trigger signal execution."""
-    from trading.signal_executor import execute_signals
-    return execute_signals(get_db_engine())
+async def execute_signals_now(
+    venue: str | None = Query(
+        None, description="Optional exchange venue to mirror BUY signals to (e.g. robinhood)"
+    ),
+    wallet_id: str | None = Query(
+        None, description="trading_wallets row that sizes and risk-gates the venue orders"
+    ),
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Manually trigger signal execution.
+
+    Paper-only by default. With *venue* set, LONG signals on tickers the venue
+    reports tradable are also sent to that connector — dry-run until the
+    venue's live-trading flag is on.
+    """
+    from trading.signal_executor import SUPPORTED_VENUES, execute_signals
+
+    if venue and venue.strip().lower() not in SUPPORTED_VENUES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported venue {venue!r}. Known venues: {', '.join(SUPPORTED_VENUES)}",
+        )
+    return execute_signals(get_db_engine(), venue=venue, venue_wallet_id=wallet_id)
 
 
 @router.post("/strategies/{strategy_id}/kill")

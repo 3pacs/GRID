@@ -81,10 +81,52 @@ small size. Risk rails that stay on regardless:
 
 All endpoints require the normal GRID bearer token.
 
+`GET /api/v1/system/health` carries a `checks.robinhood` block (mode,
+configured, live_trading, caps). It reads local config only — health never
+calls Robinhood — and reports `mode: ERROR` plus a degraded reason when the
+key in `.env` cannot be loaded.
+
 ## Wiring into the paper → live chain
 
 The same proof chain as Hyperliquid applies (`.claude/skills/trading-pipeline`):
-paper P&L positive, oracle scoring positive, then a wallet row
-(`POST /api/v1/trading/wallets` with `exchange: "robinhood"`) and a small live
-allocation. The rotation trader can target Robinhood for BTC/ETH/SOL spot the
-same way it targets Hyperliquid perps once the account is verified.
+paper P&L positive, oracle scoring positive, then a small live allocation.
+Every step below stays dry-run until `ROBINHOOD_LIVE_TRADING=true`.
+
+### 1. Tracking wallet
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"exchange":"robinhood","wallet_type":"live","initial_capital":100,
+       "risk_limit_pct":0.05,"max_drawdown_limit":0.20}' \
+  http://localhost:8000/api/v1/trading/wallets
+```
+
+`trading/wallet_manager.py` then tracks P&L, high-water mark and drawdown for
+that pool and auto-kills it at 20 %. It shows up in
+`GET /api/v1/trading/wallets/dashboard` under `per_exchange.robinhood`.
+
+### 2. Rotation trader
+
+```bash
+python3 scripts/live_rotation_trader.py --venue robinhood --status
+python3 scripts/live_rotation_trader.py --venue robinhood
+```
+
+Same regime → target-weight map as Hyperliquid, executed as **spot**: long
+only, risk-off sells everything to cash, and a rebalance trades the delta
+(buy up, or sell part of the holding) instead of closing and re-opening.
+Target coins Robinhood does not list as tradable are dropped and stay in cash.
+Hyperliquid remains the default venue; Hermes step 7g stays paper.
+
+### 3. Signal executor venue tag
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8000/api/v1/trading/execute-signals?venue=robinhood&wallet_id=<wallet>"
+```
+
+The paper trade is opened exactly as before; on top of it a LONG signal whose
+follower resolves to a tradable crypto pair is sent to Robinhood, sized as
+`wallet capital × Kelly fraction` and capped by `ROBINHOOD_MAX_POSITION_USD`.
+SHORT signals, non-crypto tickers, dust orders and non-ACTIVE wallets route
+nothing. The run summary carries `venue`, `venue_mode` and `venue_orders`.
