@@ -292,6 +292,26 @@ CREATE INDEX IF NOT EXISTS idx_decision_journal_confidence
 CREATE INDEX IF NOT EXISTS idx_decision_journal_outcome_recorded
     ON decision_journal (outcome_recorded_at);
 
+-- ---------------------------------------------------------------------------
+-- regime_history — the cross-lane canonical regime label, one row per date.
+--
+-- Written by scripts/auto_regime.py (daily via ingestion/scheduler.py, and by
+-- its --backfill entry point). Read by the chat regime context, the oracle
+-- prediction context, AstroGrid, the HMM transition model and the trial
+-- signal. The label vocabulary is the fixed four-label contract published in
+-- .coordination.md; readers reject anything outside it.
+--
+-- The table existed on griddb long before it was declared here, which is how
+-- it came to have no writer in the repository at all.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS regime_history (
+    obs_date    DATE PRIMARY KEY,
+    regime      TEXT NOT NULL CHECK (regime IN (
+                    'risk_on', 'risk_off', 'neutral', 'transition')),
+    confidence  DOUBLE PRECISION CHECK (confidence BETWEEN 0 AND 1),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Partial index for conflict reporting
 CREATE INDEX IF NOT EXISTS idx_resolved_series_conflict_detail
     ON resolved_series (feature_id, obs_date) WHERE conflict_flag = TRUE;

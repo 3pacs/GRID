@@ -1173,15 +1173,26 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
     except Exception as exc:
         log.warning("FinBERT scoring failed: {err}", err=str(exc))
 
-    # Regime detection (runs after all data is fresh)
+    # Regime detection (runs after all data is fresh). This is the only writer
+    # of regime_history — the table the chat regime context, oracle prediction
+    # context and AstroGrid read — so a silent failure here shows up on dad's
+    # surfaces as a frozen market read. Log the write outcome, don't just log
+    # the classification.
     try:
         from scripts.auto_regime import run
         result = run()
         log.info(
-            "Auto regime detection — state={s}, confidence={c}",
+            "Auto regime detection — state={s}, confidence={c}, regime_history={rh}",
             s=result.get("regime", "?"),
             c=result.get("confidence", "?"),
+            rh=result.get("canonical_label", "?") if result.get("regime_history_written")
+            else "NOT WRITTEN",
         )
+        if result.get("regime_history_error"):
+            log.warning(
+                "Auto regime detection could not update regime_history: {e}",
+                e=result["regime_history_error"],
+            )
     except Exception as exc:
         log.error("Auto regime detection failed: {err}", err=str(exc))
         try:
