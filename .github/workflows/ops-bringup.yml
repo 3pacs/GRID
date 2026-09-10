@@ -317,7 +317,7 @@ jobs:
           e = get_engine()
           with e.connect() as c:
               rows = c.execute(text('''
-                  SELECT sc.source_name, COUNT(*) AS rows_24h, MAX(rs.pull_timestamp) AS latest
+                  SELECT sc.name, COUNT(*) AS rows_48h, MAX(rs.pull_timestamp) AS latest
                   FROM raw_series rs JOIN source_catalog sc ON sc.id = rs.source_id
                   WHERE rs.pull_timestamp >= NOW() - INTERVAL '48 hours'
                   GROUP BY 1 ORDER BY 3 DESC LIMIT 40''')).fetchall()
@@ -326,6 +326,16 @@ jobs:
               n = c.execute(text('''SELECT COUNT(DISTINCT source_id) FROM raw_series WHERE pull_timestamp >= NOW() - INTERVAL '7 days' ''')).scalar()
               print('distinct sources, 7d:', n)" 2>&1 | head -50
             (cd "$HERMES_TREE" && python3 scripts/audit_error_log.py --hours 24 --top 12 2>&1 | tail -16)
+            echo '```'
+            echo "### Engine freshness (is it interpreting the tapes?)"
+            echo '```'
+            pg -At -c "SELECT 'oracle_predictions: last created', MAX(created_at), COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') AS last_24h FROM oracle_predictions WHERE id NOT LIKE 'astrogrid:%'" 2>&1
+            pg -At -c "SELECT 'operator_issues: last', MAX(created_at), COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') FROM operator_issues" 2>&1
+            pg -At -c "SELECT 'decision_journal: last', MAX(decision_timestamp), COUNT(*) FILTER (WHERE decision_timestamp >= NOW() - INTERVAL '24 hours') FROM decision_journal" 2>&1
+            pg -At -c "SELECT 'universe_ranking_history: last', MAX(generated_at), COUNT(*) FROM universe_ranking_history" 2>&1
+            pg -At -c "SELECT 'raw_series rows last 24h', COUNT(*), COUNT(DISTINCT source_id) FROM raw_series WHERE pull_timestamp >= NOW() - INTERVAL '24 hours'" 2>&1
+            echo "grid-hermes active since: $(systemctl show grid-hermes -p ActiveEnterTimestamp --value)"
+            sudo journalctl -u grid-hermes --since "6 hours ago" --no-pager 2>/dev/null | grep -iE "oracle_cycle|Oracle Cycle|cycle complete|CRITICAL|Traceback" | tail -8
             echo '```'
             echo "### Realized alpha (truth gate)"
             echo '```'

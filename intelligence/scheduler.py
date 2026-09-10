@@ -351,6 +351,36 @@ def run_intelligence_loop() -> None:
 
     _sched.every().sunday.at("05:00").do(_long_horizon_sweep)
 
+    def _long_plays_weekly() -> None:
+        """Weekly Long Plays board (multi-year 10x/100x candidates).
+
+        Composes frontier themes, edge-scanner playbooks, trial catalysts,
+        options asymmetry, the 90 d sweep verdicts and the engine's realized
+        alpha into ``long_plays_board`` (``intelligence/long_plays.py``).
+        Runs 30 min after the 05:00 sweep so the coverage gate sees this
+        week's verdicts. Every number on the board is a labelled proxy.
+        """
+        try:
+            from db import get_engine as _ge
+            from intelligence.long_plays import build_long_plays_board, persist_board
+
+            engine = _ge()
+            board = build_long_plays_board(engine, top_k=25)
+            row_id = persist_board(engine, board)
+            log.info(
+                "long plays weekly: universe={u}, candidates={c}, entry={e}, top5={t}, row={row}, stand_down={sd}",
+                u=board.get("universe_size"),
+                c=len(board.get("candidates") or []),
+                e=board.get("entry_candidates"),
+                t=[(c["ticker"], c["stance"]) for c in (board.get("candidates") or [])[:5]],
+                row=row_id,
+                sd=board.get("stand_down_reason"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("long plays weekly failed: {e}", e=str(exc))
+
+    _sched.every().sunday.at("05:30").do(_long_plays_weekly)
+
     def _actor_trust_cog_recompute() -> None:
         """INTEL-2: recompute trust-vs-cog classification for every lever puller."""
         try:
