@@ -1,0 +1,95 @@
+name: Ops — Gemini task on grid-svr
+
+# Dispatch a prompt to Gemini CLI running ON the server (self-hosted runner),
+# so an orchestrating session can hand Flash-class agents server-side work and
+# read their output as job logs / summary. Requires the "lanes" from
+# docs/planning/BRING-UP-RUNBOOK-2026-09-10.md Phase 9:
+#   - gemini CLI installed for the runner user (npm i -g @google/gemini-cli)
+#   - /etc/grid/gemini.env (0600, runner user) containing GEMINI_API_KEY=...
+# The prompt is passed through an environment variable, never interpolated into
+# the script, so it cannot inject shell.
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Task for the agent (it runs with cwd = workdir on grid-svr)"
+        type: string
+        required: true
+      model:
+        description: "Gemini model id (e.g. the Flash model enabled on the account)"
+        type: string
+        default: "gemini-flash-latest"
+      workdir:
+        description: "Working directory on the server"
+        type: string
+        default: "/data/grid_v4/grid_release"
+      yolo:
+        description: "Let the agent run tools without confirmation (non-interactive runs need this for any action)"
+        type: boolean
+        default: true
+      cli:
+        description: "CLI command on the server (agy = the installed Gemini/Antigravity CLI; or gemini)"
+        type: string
+        default: "agy"
+      mode:
+        description: "run = execute the prompt; help = only print the CLI's version and --help so the caller learns its flags"
+        type: choice
+        options: [run, help]
+        default: "run"
+
+jobs:
+  gemini:
+    name: Gemini on grid-svr
+    runs-on: [self-hosted, grid-svr]
+    timeout-minutes: 90
+    env:
+      PROMPT: ${{ inputs.prompt }}
+      MODEL: ${{ inputs.model }}
+      WORKDIR: ${{ inputs.workdir }}
+      YOLO: ${{ inputs.yolo }}
+      CLI: ${{ inputs.cli }}
+      MODE: ${{ inputs.mode }}
+    steps:
+      - name: Lanes check
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f /etc/grid/gemini.env ]; then set -a; . /etc/grid/gemini.env; set +a; fi
+          [ -n "${GEMINI_API_KEY:-}" ] && echo "GEMINI_API_KEY: set via /etc/grid/gemini.env" || echo "GEMINI_API_KEY: not in /etc/grid/gemini.env (fine if $CLI is logged in with the runner user's own credentials)"
+          command -v "$CLI" >/dev/null || { echo "$CLI not on PATH for the runner user ($(id -un)); PATH=$PATH"; ls -la /usr/local/bin /usr/bin 2>/dev/null | grep -iE "agy|gemini" ; exit 2; }
+          echo "cli=$(command -v "$CLI") version=$("$CLI" --version 2>&1 | head -1) | model=$MODEL | workdir=$WORKDIR | yolo=$YOLO | mode=$MODE"
+          test -d "$WORKDIR"
+          if [ "$MODE" = "help" ]; then
+            echo "----- $CLI --help -----"; "$CLI" --help 2>&1 | head -120
+            { echo "## $CLI --help"; echo '```'; "$CLI" --help 2>&1 | head -120; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Run task
+        if: ${{ inputs.mode == 'run' }}
+        shell: bash
+        run: |
+          set +e
+          if [ -f /etc/grid/gemini.env ]; then set -a; . /etc/grid/gemini.env; set +a; fi
+          cd "$WORKDIR"
+          extra=""; [ "$YOLO" = "true" ] && extra="--yolo"
+          echo "----- prompt (first 40 lines) -----"; printf '%s\n' "$PROMPT" | head -40; echo "-----"
+          timeout 80m "$CLI" -m "$MODEL" $extra -p "$PROMPT" > /tmp/gemini_task.log 2>&1
+          rc=$?
+          echo "exit=$rc"
+          tail -c 60000 /tmp/gemini_task.log
+          {
+            echo "## Gemini task — model $MODEL — exit $rc"
+            echo '```'
+            tail -c 40000 /tmp/gemini_task.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+
+      - name: Upload transcript
+        if: ${{ always() && inputs.mode == 'run' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gemini-task-${{ github.run_id }}
+          path: /tmp/gemini_task.log
+          retention-days: 14
