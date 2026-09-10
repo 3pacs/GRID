@@ -737,55 +737,40 @@ class OracleEngine:
 
     # ── Signal Assembly ─────────────────────────────────────────────────
 
+    def _pit_store(self) -> Any:
+        """Lazily construct the point-in-time store on this engine's connection."""
+        store = getattr(self, "_pit_store_instance", None)
+        if store is None:
+            from store.pit import PITStore  # local import keeps oracle import-light
+            store = PITStore(self.engine)
+            self._pit_store_instance = store
+        return store
+
     def _gather_signals(self, ticker: str, families: list[str]) -> list[Signal]:
-        """Gather all available signals for a ticker across specified families."""
-        signals = []
+        """Gather all available signals for a ticker across specified families.
+
+        Feature history is read through ``store.pit.PITStore`` so only
+        observations *released* on or before today are visible
+        (``release_date <= as_of``, ``LATEST_AS_OF`` vintage) and the
+        ``assert_no_lookahead`` safety net runs. Until 2026-09-10 this read
+        ``resolved_series`` directly with no vintage filter — the lookahead
+        CLAUDE.md forbids on inference paths (LEVER-PACKAGE.md §4.1 item 3).
+        Options signals still come from ``options_daily_signals``, which is
+        same-day data with no revision history.
+        """
+        from datetime import timedelta
+
+        signals: list[Signal] = []
+        today = date.today()
+        window_start = today - timedelta(days=30)
+
         with self.engine.connect() as conn:
-            # Get latest z-scores for relevant features
-            rows = conn.execute(text("""
-                SELECT fr.name, fr.family, rs.value, rs.obs_date
-                FROM resolved_series rs
-                JOIN feature_registry fr ON rs.feature_id = fr.id
-                WHERE fr.family = ANY(:fams)
-                AND fr.model_eligible = TRUE
-                AND rs.obs_date >= CURRENT_DATE - 30
-                ORDER BY fr.name, rs.obs_date DESC
+            feat_rows = conn.execute(text("""
+                SELECT id, name, family
+                FROM feature_registry
+                WHERE family = ANY(:fams)
+                AND model_eligible = TRUE
             """), {"fams": families}).fetchall()
-
-            # Group by feature, compute z-score from recent history
-            feature_data: dict[str, list] = {}
-            for r in rows:
-                feature_data.setdefault(r[0], []).append({"value": r[2], "date": r[3], "family": r[1]})
-
-            for fname, data_points in feature_data.items():
-                if len(data_points) < 5:
-                    continue
-                values = [d["value"] for d in data_points if d["value"] is not None]
-                if not values:
-                    continue
-                latest = values[0]
-                mean = np.mean(values)
-                std = np.std(values) if len(values) > 1 else 1.0
-                z = (latest - mean) / std if std > 0 else 0.0
-
-                # Determine direction
-                if z > 0.5:
-                    direction = "bullish"
-                elif z < -0.5:
-                    direction = "bearish"
-                else:
-                    direction = "neutral"
-
-                # Freshness
-                latest_date = data_points[0]["date"]
-                hours_old = (date.today() - latest_date).days * 24
-
-                signals.append(Signal(
-                    name=fname, family=data_points[0]["family"],
-                    value=latest, z_score=round(z, 3),
-                    direction=direction, weight=1.0,
-                    freshness_hours=hours_old,
-                ))
 
             # Add options signals if available
             opt_row = conn.execute(text("""
@@ -796,17 +781,67 @@ class OracleEngine:
                 ORDER BY signal_date DESC LIMIT 1
             """), {"t": ticker}).fetchone()
 
-            if opt_row:
-                pcr, iv, skew, mp, spot, oi, term, conc = opt_row
-                if pcr is not None:
-                    pcr_dir = "bearish" if pcr > 1.2 else "bullish" if pcr < 0.7 else "neutral"
-                    signals.append(Signal("pcr", "sentiment", pcr, 0, pcr_dir, 1.0, 0))
-                if iv is not None:
-                    signals.append(Signal("iv_atm", "vol", iv, 0, "neutral", 1.0, 0))
-                if mp is not None and spot:
-                    mp_pct = (spot - mp) / spot * 100
-                    mp_dir = "bearish" if mp_pct > 3 else "bullish" if mp_pct < -3 else "neutral"
-                    signals.append(Signal("max_pain_gap", "sentiment", mp_pct, 0, mp_dir, 1.0, 0))
+        # Feature z-scores over the trailing window, PIT-correct as of today.
+        meta = {int(r[0]): (str(r[1]), str(r[2])) for r in feat_rows}
+        if meta:
+            try:
+                matrix = self._pit_store().get_feature_matrix(
+                    list(meta),
+                    start_date=window_start,
+                    end_date=today,
+                    as_of_date=today,
+                    vintage_policy="LATEST_AS_OF",
+                )
+            except Exception as exc:  # noqa: BLE001 — degrade to options-only, never lookahead
+                log.warning("Oracle signal gather: PIT feature matrix failed — {e}", e=str(exc))
+                matrix = None
+
+            if matrix is not None and not matrix.empty:
+                for fid in matrix.columns:
+                    fname, family = meta.get(int(fid), (None, None))
+                    if fname is None:
+                        continue
+                    series = matrix[fid].dropna()
+                    if len(series) < 5:
+                        continue
+                    values = [float(v) for v in series.values]
+                    latest = values[-1]
+                    mean = float(np.mean(values))
+                    std = float(np.std(values)) if len(values) > 1 else 1.0
+                    z = (latest - mean) / std if std > 0 else 0.0
+
+                    # Determine direction
+                    if z > 0.5:
+                        direction = "bullish"
+                    elif z < -0.5:
+                        direction = "bearish"
+                    else:
+                        direction = "neutral"
+
+                    # Freshness
+                    latest_date = series.index[-1]
+                    if hasattr(latest_date, "date"):
+                        latest_date = latest_date.date()
+                    hours_old = (today - latest_date).days * 24
+
+                    signals.append(Signal(
+                        name=fname, family=family,
+                        value=latest, z_score=round(z, 3),
+                        direction=direction, weight=1.0,
+                        freshness_hours=hours_old,
+                    ))
+
+        if opt_row:
+            pcr, iv, skew, mp, spot, oi, term, conc = opt_row
+            if pcr is not None:
+                pcr_dir = "bearish" if pcr > 1.2 else "bullish" if pcr < 0.7 else "neutral"
+                signals.append(Signal("pcr", "sentiment", pcr, 0, pcr_dir, 1.0, 0))
+            if iv is not None:
+                signals.append(Signal("iv_atm", "vol", iv, 0, "neutral", 1.0, 0))
+            if mp is not None and spot:
+                mp_pct = (spot - mp) / spot * 100
+                mp_dir = "bearish" if mp_pct > 3 else "bullish" if mp_pct < -3 else "neutral"
+                signals.append(Signal("max_pain_gap", "sentiment", mp_pct, 0, mp_dir, 1.0, 0))
 
         return signals
 
