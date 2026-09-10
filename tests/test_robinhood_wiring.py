@@ -446,6 +446,53 @@ class TestRotationVenue:
                                       held, "robinhood")
         assert results == [] and trader.orders == [] and trader.closed == []
 
+    def _run_rotation(self, monkeypatch, regime_label, trader, positions=()):
+        """Drive execute_rotation_live end to end with the DB and venue stubbed."""
+        mod = self._module()
+        trader.get_positions = lambda: list(positions)
+        trader.get_balance = lambda: {"equity_usd": 100.0, "buying_power_usd": 100.0}
+        trader.check_risk_limits = lambda: {"drawdown_breached": False,
+                                            "current_drawdown_pct": 0.0, "max_drawdown_pct": 0.2}
+
+        regime = MagicMock()
+        regime.regime.label = regime_label
+        regime.regime.spy_trend = 0.01
+        regime.regime.vix_zscore = -0.5
+
+        monkeypatch.setattr(mod, "get_engine", lambda: MagicMock())
+        monkeypatch.setattr(mod, "run_rotation", lambda *_a, **_k: regime)
+        monkeypatch.setattr(mod, "_get_trader", lambda *_a, **_k: trader)
+        monkeypatch.setattr(mod, "_log_trade_to_journal", lambda *_a, **_k: None)
+        return mod.execute_rotation_live(venue="robinhood")
+
+    def test_risk_on_prints_a_spot_allocation(self, monkeypatch):
+        trader = StubTrader()
+        out = self._run_rotation(monkeypatch, "risk-on", trader)
+        assert out["status"] == "OK" and out["venue"] == "robinhood"
+        assert out["mode"] == "DRY_RUN" and out["regime"] == "risk-on"
+        assert out["target_allocation"] == {"BTC": 0.60, "ETH": 0.25, "SOL": 0.15}
+        # $100 capital → 60/25/15, each a LONG buy on spot.
+        assert trader.orders == [
+            {"ticker": "BTC", "direction": "LONG", "size_usd": 60.0},
+            {"ticker": "ETH", "direction": "LONG", "size_usd": 25.0},
+            {"ticker": "SOL", "direction": "LONG", "size_usd": 15.0},
+        ]
+        assert [t["action"] for t in out["trades"]] == ["OPEN", "OPEN", "OPEN"]
+
+    def test_risk_off_run_liquidates_to_cash(self, monkeypatch):
+        trader = StubTrader()
+        held = [{"coin": "BTC", "size_usd": 60.0, "direction": "LONG"}]
+        out = self._run_rotation(monkeypatch, "risk-off", trader, positions=held)
+        assert out["target_allocation"] == {}
+        assert trader.closed == ["BTC"] and trader.orders == []
+
+    def test_summary_survives_spot_positions_without_unrealized_pnl(self, monkeypatch):
+        """Spot holdings carry no cost basis — the summary must not KeyError."""
+        trader = StubTrader()
+        held = [{"coin": "BTC", "size_usd": 60.0, "direction": "LONG", "mid_price": 60000.0}]
+        out = self._run_rotation(monkeypatch, "neutral", trader, positions=held)
+        assert out["final_positions"] == held  # printed without unrealized_pnl
+
     def test_mode_label_reports_the_connector_mode_for_spot(self):
         mod = self._module()
         assert mod._mode_label("robinhood", False, StubTrader(mode="DRY_RUN")) == "DRY_RUN"
