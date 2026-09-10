@@ -1079,9 +1079,12 @@ def get_active_lever_events(
             puller = puller_map.get(puller_id)
 
             if puller is None or puller.trust_score < MIN_EVENT_TRUST:
-                # Below the floor the source has never been right (options
-                # tapes score 0/1,900 under the current outcome rule); its
-                # rows would drown the event list without adding information.
+                # Below the floor the source has (almost) never been right;
+                # its rows would drown the event list without adding
+                # information. Options tapes sat here at 0/1,900 while the
+                # scorer ignored the CALL/PUT payload direction (fixed in
+                # trust_scorer.score_pending_signals, 2026-09-10); they
+                # climb out once their WRONG rows are re-scored.
                 continue
 
             # Parse signal value metadata

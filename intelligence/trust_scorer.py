@@ -203,6 +203,14 @@ def _last_close(frame: Any, target_date: date) -> float | None:
 # every downstream consumer (trust_scorer, lever_pullers) treat every
 # source as untrustworthy.
 #
+# 2026-09-10: the inference below existed but ``score_pending_signals``
+# never called it — the classifier still compared ``signal_type`` to the
+# literals, so every options_flow UNUSUAL_OPTIONS row (223K, direction
+# CALL/PUT in the payload) scored WRONG and the options tapes sat at
+# Bayesian trust 0.001 in lever_pullers. The scorer now routes every row
+# through ``_infer_signal_direction`` and the option vocabulary (CALL/PUT)
+# is part of the payload direction words.
+#
 # Each entry maps a signal_type → directional intent. Types absent from
 # both maps require ``signal_value`` to declare the direction (e.g.
 # UNUSUAL_OPTIONS sets ``"direction"`` in the payload). Anything we still
@@ -224,6 +232,36 @@ _BEARISH_SIGNAL_TYPES: frozenset[str] = frozenset({
     "trade_idea_short",
 })
 
+# ``signal_value["direction"]`` vocabularies across feeds: smart_money /
+# social write BULLISH / BEARISH / NEUTRAL, NET_POSITION_DELTA writes
+# up / down, unusual_whales writes the option side CALL / PUT. A CALL tape
+# expects the underlying to rise over the evaluation window, a PUT tape
+# expects it to fall. NEUTRAL (and anything else) stays unknown.
+_BULLISH_DIRECTION_WORDS: frozenset[str] = frozenset({
+    "up", "long", "bull", "bullish", "buy", "call", "calls",
+})
+_BEARISH_DIRECTION_WORDS: frozenset[str] = frozenset({
+    "down", "short", "bear", "bearish", "sell", "put", "puts",
+})
+
+
+def _payload_dict(signal_value: Any) -> dict[str, Any]:
+    """Return ``signal_value`` as a dict.
+
+    JSONB comes back from psycopg2 as a dict already; a text column (or a
+    test double) may hand us the JSON document as a string. Scalars, lists
+    and unparsable text give an empty dict so callers can ``.get`` safely.
+    """
+    if isinstance(signal_value, dict):
+        return signal_value
+    if isinstance(signal_value, (str, bytes, bytearray)):
+        try:
+            parsed = json.loads(signal_value)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
 
 def _infer_signal_direction(
     signal_type: str | None,
@@ -235,8 +273,9 @@ def _infer_signal_direction(
       1. Explicit name match (``_BULLISH_SIGNAL_TYPES`` / ``_BEARISH_SIGNAL_TYPES``)
       2. Substring fallback on the type name (handles future additions
          like ``cluster_long`` / ``short_squeeze_alert`` without code change)
-      3. ``signal_value["direction"]`` — used by NET_POSITION_DELTA,
-         HEAT_SPIKE, UNUSUAL_OPTIONS, etc.
+      3. ``signal_value["direction"]`` — used by NET_POSITION_DELTA
+         (up/down), HEAT_SPIKE (BULLISH/BEARISH), UNUSUAL_OPTIONS
+         (CALL/PUT), etc.
       4. Transaction text on house_trading / senate_trading rows.
       5. ``unknown`` — caller must leave the row PENDING rather than
          force a WRONG.
@@ -257,12 +296,12 @@ def _infer_signal_direction(
         if "bearish" in name_lower or name_lower.startswith("sell") or name_lower.endswith("_sell") or "_short" in name_lower or "short_" in name_lower:
             return "bearish"
 
-    payload: dict[str, Any] = signal_value if isinstance(signal_value, dict) else {}
+    payload = _payload_dict(signal_value)
 
-    direction = str(payload.get("direction", "") or "").lower()
-    if direction in ("up", "long", "bull", "bullish", "buy"):
+    direction = str(payload.get("direction", "") or "").strip().lower()
+    if direction in _BULLISH_DIRECTION_WORDS:
         return "bullish"
-    if direction in ("down", "short", "bear", "bearish", "sell"):
+    if direction in _BEARISH_DIRECTION_WORDS:
         return "bearish"
 
     # Congressional trading: direction is on the Transaction text.
@@ -434,14 +473,23 @@ def _extract_price(signal_value: Any) -> float | None:
 
 def _get_price_near_date(
     engine: Engine, ticker: str, target_date: date,
+    as_of: datetime | None = None,
 ) -> float | None:
-    """Get closing price at or near *target_date*.
+    """Get the closing price at or before *target_date*, as known at *as_of*.
+
+    Point-in-time bounded on both axes: every candidate row has
+    ``obs_date <= target_date`` (no close from after the day we are
+    pricing) and ``pull_timestamp <= as_of`` (no row that landed after the
+    caller's decision instant). *as_of* defaults to now, which is what the
+    outcome scorer wants — the cycle's start time, so a re-run reproduces
+    the same closes.
 
     Checks (in order):
       1. options_daily_signals.spot_price
-      2. raw_series YF close data
-      3. yfinance live fetch (last resort)
+      2. raw_series YF close data (latest vintage pulled by *as_of*)
+      3. yfinance live fetch (last resort, closes <= target_date only)
     """
+    as_of = as_of or datetime.now(timezone.utc)
     with engine.connect() as conn:
         row = conn.execute(text("""
             SELECT spot_price FROM options_daily_signals
@@ -456,12 +504,14 @@ def _get_price_near_date(
         row = conn.execute(text("""
             SELECT value FROM raw_series
             WHERE series_id = :sid AND obs_date <= :d AND obs_date >= :lo
+              AND pull_timestamp <= :as_of
               AND pull_status = 'SUCCESS'
-            ORDER BY obs_date DESC LIMIT 1
+            ORDER BY obs_date DESC, pull_timestamp DESC LIMIT 1
         """), {
             "sid": f"YF:{ticker}:close",
             "d": target_date,
             "lo": target_date - timedelta(days=PRICE_LOOKBACK_DAYS),
+            "as_of": as_of,
         }).fetchone()
         if row:
             return float(row[0])
@@ -506,9 +556,15 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
     """Evaluate pending signals against actual price moves.
 
     For each pending signal whose evaluation window has elapsed:
-      - Fetch actual price change from signal_date to now.
-      - BUY + price up >1%  -> CORRECT
-      - SELL + price down >1% -> CORRECT
+      - Infer the call's direction with ``_infer_signal_direction``:
+        BUY/SELL names, bullish/bearish type names, or the payload's
+        ``direction`` (CALL/PUT on UNUSUAL_OPTIONS, BULLISH/BEARISH on
+        HEAT_SPIKE, up/down on NET_POSITION_DELTA). A row with no
+        inferable direction stays PENDING — it is never forced WRONG.
+      - Fetch the point-in-time close at signal_date and at the end of the
+        source's ``EVALUATION_WINDOWS`` window (options_flow / scanner: 7 d).
+      - bullish + price up   > MOVE_THRESHOLD_PCT -> CORRECT
+      - bearish + price down > MOVE_THRESHOLD_PCT -> CORRECT
       - Otherwise -> WRONG
       - Signals too old (>90 days pending) -> EXPIRED
 
@@ -521,18 +577,21 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "scored": 0, "correct": 0, "wrong": 0, "expired": 0,
         "skipped_no_price": 0, "skipped_unpriceable": 0,
+        "skipped_unknown_direction": 0,
     }
 
     # One price lookup per (ticker, date) per cycle, and once a ticker has
     # proven unpriceable in this cycle its remaining signals are skipped
-    # without touching the DB or yfinance again.
+    # without touching the DB or yfinance again. Every lookup is bounded
+    # at the cycle's start instant so the whole run prices off one
+    # point-in-time snapshot.
     price_memo: dict[tuple[str, date], float | None] = {}
     dead_tickers: set[str] = set()
 
     def _price(ticker: str, d: date) -> float | None:
         key = (ticker, d)
         if key not in price_memo:
-            price_memo[key] = _get_price_near_date(engine, ticker, d)
+            price_memo[key] = _get_price_near_date(engine, ticker, d, as_of=now)
         return price_memo[key]
 
     with engine.begin() as conn:
@@ -571,6 +630,13 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
                 summary["expired"] += 1
                 continue
 
+            # Direction first, before any price lookup: a row we cannot
+            # classify stays PENDING and must not spend a yfinance call.
+            direction = _infer_signal_direction(signal_type, signal_value)
+            if direction == "unknown":
+                summary["skipped_unknown_direction"] += 1
+                continue
+
             if not is_priceable_ticker(ticker):
                 summary["skipped_unpriceable"] += 1
                 continue
@@ -602,16 +668,15 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
             # Compute return
             pct_change = (current_price - entry_price) / entry_price * 100.0
 
-            # Classify
-            if signal_type == "BUY" and pct_change > MOVE_THRESHOLD_PCT:
-                outcome = "CORRECT"
-                summary["correct"] += 1
-            elif signal_type == "SELL" and pct_change < -MOVE_THRESHOLD_PCT:
-                outcome = "CORRECT"
-                summary["correct"] += 1
+            # Classify against the call's own direction: a CALL tape or a
+            # BULLISH heat spike is right when the underlying rose, a PUT
+            # tape or a BEARISH spike when it fell. Anything inside the
+            # threshold band is a miss for either side.
+            if direction == "bullish":
+                outcome = "CORRECT" if pct_change > MOVE_THRESHOLD_PCT else "WRONG"
             else:
-                outcome = "WRONG"
-                summary["wrong"] += 1
+                outcome = "CORRECT" if pct_change < -MOVE_THRESHOLD_PCT else "WRONG"
+            summary["correct" if outcome == "CORRECT" else "wrong"] += 1
 
             conn.execute(text("""
                 UPDATE signal_sources
@@ -630,10 +695,11 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
     log.info(
         "Signal scoring complete: {s} scored ({c} correct, {w} wrong, {e} expired), "
         "{sk} skipped (no price), {su} skipped (unpriceable ticker), "
-        "{dead} tickers dead this cycle",
+        "{ud} skipped (no direction), {dead} tickers dead this cycle",
         s=summary["scored"], c=summary["correct"], w=summary["wrong"],
         e=summary["expired"], sk=summary["skipped_no_price"],
-        su=summary["skipped_unpriceable"], dead=len(dead_tickers),
+        su=summary["skipped_unpriceable"], ud=summary["skipped_unknown_direction"],
+        dead=len(dead_tickers),
     )
     return summary
 

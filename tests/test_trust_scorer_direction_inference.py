@@ -12,6 +12,8 @@ inference can grow safely as new sources land.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from intelligence.trust_scorer import _infer_signal_direction
@@ -68,9 +70,57 @@ def test_unusual_options_uses_value_direction_short_to_bearish():
     ) == "bearish"
 
 
+# unusual_whales writes the option side, not a long/short word. A CALL tape
+# expects the underlying up over the window, a PUT tape expects it down.
+@pytest.mark.parametrize("direction", ["CALL", "call", " Call ", "CALLS"])
+def test_unusual_options_call_is_bullish(direction):
+    assert _infer_signal_direction(
+        "UNUSUAL_OPTIONS",
+        {"signals": ["OI_SPIKE"], "notional": 5416.0, "oi_ratio": 4.05,
+         "direction": direction, "volume_ratio": 0.0006},
+    ) == "bullish"
+
+
+@pytest.mark.parametrize("direction", ["PUT", "put", "PUTS"])
+def test_unusual_options_put_is_bearish(direction):
+    assert _infer_signal_direction(
+        "UNUSUAL_OPTIONS", {"direction": direction, "notional": 250_000}
+    ) == "bearish"
+
+
+@pytest.mark.parametrize(
+    "signal_value",
+    [
+        {"notional": 5416.0, "oi_ratio": 4.05},   # direction key missing
+        {"direction": ""},
+        {"direction": None},
+        {"direction": "STRADDLE"},                # no directional bet
+    ],
+)
+def test_unusual_options_without_a_readable_direction_is_unknown(signal_value):
+    assert _infer_signal_direction("UNUSUAL_OPTIONS", signal_value) == "unknown"
+
+
 def test_heat_spike_uses_value_direction():
     assert _infer_signal_direction("HEAT_SPIKE", {"direction": "bullish"}) == "bullish"
     assert _infer_signal_direction("HEAT_SPIKE", {"direction": "bearish"}) == "bearish"
+
+
+def test_heat_spike_feed_vocabulary_is_upper_case():
+    # smart_money writes BULLISH / BEARISH / NEUTRAL verbatim.
+    assert _infer_signal_direction("HEAT_SPIKE", {"direction": "BULLISH"}) == "bullish"
+    assert _infer_signal_direction("HEAT_SPIKE", {"direction": "BEARISH"}) == "bearish"
+    assert _infer_signal_direction("HEAT_SPIKE", {"direction": "NEUTRAL"}) == "unknown"
+
+
+def test_json_text_payload_is_parsed():
+    # A text column (or a caller that bound json.dumps(...)) hands the
+    # document back as a string; it must classify like the dict.
+    assert _infer_signal_direction(
+        "UNUSUAL_OPTIONS", json.dumps({"direction": "PUT", "oi_ratio": 3.0})
+    ) == "bearish"
+    assert _infer_signal_direction("UNUSUAL_OPTIONS", "[1, 2, 3]") == "unknown"
+    assert _infer_signal_direction("UNUSUAL_OPTIONS", "{not json") == "unknown"
 
 
 def test_net_position_delta_uses_value_direction():
