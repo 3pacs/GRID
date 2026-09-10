@@ -75,14 +75,16 @@ function MoodBadge({ raw }) {
 // ── Verdict ────────────────────────────────────────────────────────────
 
 function VerdictCard({ title, props }) {
-    const question = props?.question || title || '';
+    // `title` is the card's label, not a question — a blank/missing props.question
+    // means there is nothing to ask, never a fallback to stream the title itself.
+    const question = (props?.question || '').trim();
     const [text, setText] = useState('');
-    const [status, setStatus] = useState('loading'); // loading | streaming | done | error
+    const [status, setStatus] = useState(question ? 'loading' : 'idle'); // idle | loading | streaming | done | error
     const [n, setN] = useState(0);
     const retry = useCallback(() => setN((x) => x + 1), []);
 
     useEffect(() => {
-        if (!question) { setStatus('done'); return undefined; }
+        if (!question) { setStatus('idle'); return undefined; }
         const controller = new AbortController();
         setText(''); setStatus('loading');
         api.askStream(question, {
@@ -97,6 +99,7 @@ function VerdictCard({ title, props }) {
 
     return (
         <Shell title={title || 'Your read'} accent>
+            {status === 'idle' && <Empty msg="Ask a question to get a read on it." />}
             {status === 'loading' && (
                 <div style={CS.thinking}>
                     <span style={CS.thinkDots}><i style={CS.dot} /><i style={{ ...CS.dot, animationDelay: '.2s' }} /><i style={{ ...CS.dot, animationDelay: '.4s' }} /></span>
