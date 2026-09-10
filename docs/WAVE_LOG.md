@@ -27,3 +27,4 @@ Append-only record of dispatched agent tasks.
 - **2026-09-10T03:44:08.789261+00:00** — task #15 — concept: `realized alpha` — coverage: new — files: 6
 - **2026-09-10T05:06:07.293451+00:00** — task #24 — concept: `hold validation` — coverage: new — files: 2
 - **2026-09-10T06:43:34.845860+00:00** — task #27 — concept: `long horizon plays` — coverage: new — files: 7
+- **2026-09-10T07:30:46.594601+00:00** — task #28 — concept: `sponsor ticker resolver` — coverage: extend — files: 11
