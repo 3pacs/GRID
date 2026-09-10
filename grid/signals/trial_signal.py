@@ -163,6 +163,9 @@ class SignalResult:
     red_flags: list[str] = field(default_factory=list)
     catalysts: list[str] = field(default_factory=list)
     penalty_factors: dict = field(default_factory=dict)
+    # 0-1 score component (min(1, runway_months / 24)); the persisted
+    # ``cash_runway_score`` column is NUMERIC(5,4), so months must never land here.
+    cash_runway_score: float = 0.5
 
 
 # ── Sponsor → ticker (moved to grid.signals.sponsor_resolver) ─────────────────
@@ -313,6 +316,7 @@ class TrialGemSignal:
                 red_flags              = red_flags,
                 catalysts              = self._extract_catalysts(trial),
                 penalty_factors        = penalties,
+                cash_runway_score      = score_components.get("cash_runway", 0.5),
             )
             results.append(result)
 
@@ -418,7 +422,7 @@ class TrialGemSignal:
                     "trial_strength_score": r.trial_strength_score,
                     "endpoint_clarity": r.endpoint_clarity, "phase_weight": r.phase_weight,
                     "disease_priority": r.disease_priority_score,
-                    "cash_runway_score": r.cash_runway_months,
+                    "cash_runway_score": _unit_score(r.cash_runway_score),
                     "penalty_factors": json.dumps(r.penalty_factors),
                     "signal_type": r.signal_type,
                     "regime_at_signal": _storage_regime(r.regime_at_signal),
@@ -908,6 +912,22 @@ def _storage_regime(regime: Optional[str]) -> str:
     """Map any regime label onto the trial_signals CHECK set (unknown labels → UNKNOWN)."""
     r = str(regime or "UNKNOWN").strip().upper()
     return r if r in ALLOWED_REGIMES else "UNKNOWN"
+
+
+def _unit_score(value: Any, default: float = 0.5) -> float:
+    """Clamp a score component into [0, 1] for the NUMERIC(5,4) score columns.
+
+    A runway in months written here overflowed the column ("must round to an
+    absolute value less than 10^1") and dropped every signal with a known
+    runway, so the write path never trusts the caller's range.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    if v != v:  # NaN
+        return default
+    return round(min(1.0, max(0.0, v)), 4)
 
 
 def _rowcount(cur: Any) -> int:
