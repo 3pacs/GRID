@@ -51,6 +51,12 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Functions:** `enrich_actor`, `discover_connections`, `enrich_all_actors`, `auto_discover_actors`, `auto_discover_connections`, `run_discovery_cycle`, `get_actor_stats`, `batch_discover_insiders`, `discover_all_13f_filers`, `discover_all_congress`, `import_icij_offshore`, `discover_board_interlocks`, `run_3_degree_expansion`, `run_scale_discovery`, `hermes_daily_actor_discovery`
 **Reads:** `__future__`, `csv`, `datetime`, `ingestion`, `json`, `loguru`, `orchestration`, `pathlib`, `re`, `sqlalchemy`, `typing`
 
+#### `intelligence/actor_identity.py` — 343 LOC
+**Docstring:** Canonical actor identity for SEC filer names.
+**Functions:** `ticker_actor_id`, `ticker_actor_name`, `parse_filer_display_name`, `person_name_key`, `propose_canonical`, `build_person_index`, `resolve_canonical_actor_id`, `ensure_merged_into_column`
+**Reads:** `__future__`, `dataclasses`, `db`, `grid`, `loguru`, `re`, `typing`
+**Imported by:** `intelligence/spider/discovery.py`, `scripts/fold_actor_aliases.py`, `scripts/graph_analytics.py`
+
 #### `intelligence/actor_ingest.py` — 227 LOC
 **Docstring:** Universal Actor Ingestion — auto-discover and log actors from ANY data source.
 **Functions:** `ingest_actor`, `ingest_actors_batch`, `extract_actors_from_payload`, `get_actor_count`, `get_actor_sources`
