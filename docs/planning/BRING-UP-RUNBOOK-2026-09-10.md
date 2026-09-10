@@ -353,7 +353,37 @@ ssh grid@100.75.185.36 'for u in grid-db grid-llamacpp grid-crucix grid-api grid
 ssh grid@100.75.185.36 'crontab -l | grep -c grid || echo "no grid cron entries"; grep -n "paper_trading_review\|setup_cron" /home/grid/grid_v4/grid_repo/scripts/grid_cron.sh | head -3'
 ```
 
-Pass: all units enabled; note in the report whether `scripts/paper_trading_review.py` is
+## Phase 9 — Open the lanes (so the orchestrating Claude session can drive Flash agents on the server)
+
+Context: `.github/workflows/deploy.yml` and `.github/workflows/ops-bringup.yml` already
+run on a **self-hosted GitHub Actions runner on grid-svr**. The orchestrating session can
+dispatch those from anywhere. Two more lanes make Flash-class agents dispatchable too
+(`.github/workflows/gemini-task.yml`, input = a prompt; output = job summary + artifact):
+
+```bash
+# Lane 1 — Gemini CLI for the runner user (the user the Actions runner service runs as;
+# check with: systemctl cat 'actions.runner.*' | grep -m1 '^User=' ; default is `grid`)
+ssh grid@100.75.185.36 'command -v gemini || sudo npm i -g @google/gemini-cli; gemini --version'
+
+# Lane 2 — API key file the workflow sources. Anik supplies the key; type it, never paste it in chat.
+ssh grid@100.75.185.36 'sudo mkdir -p /etc/grid && sudo touch /etc/grid/gemini.env && sudo chown grid:grid /etc/grid/gemini.env && sudo chmod 600 /etc/grid/gemini.env && echo ready'
+ssh -t grid@100.75.185.36 'read -s -p "GEMINI_API_KEY: " K; echo; printf "GEMINI_API_KEY=%s\n" "$K" > /etc/grid/gemini.env; unset K; wc -c /etc/grid/gemini.env'
+
+# Lane 3 — confirm the runner user can do what the workflows need without a prompt
+ssh grid@100.75.185.36 'sudo -n systemctl is-active grid-api && sudo -n -u postgres psql griddb -Atc "select 1" && echo "sudo lanes ok"'
+```
+
+Then Anik (or the orchestrating session, via the GitHub API) dispatches
+**Actions → "Ops — Gemini task on grid-svr" → Run workflow** with a prompt, and reads the
+result in the run summary. The prompt reaches the CLI through an environment variable,
+never the shell, so it cannot inject commands.
+
+Pass: `gemini --version` prints; `/etc/grid/gemini.env` is 0600 and non-empty; the three
+`sudo -n` checks print `sudo lanes ok`; a first dispatch with prompt `Say READY and print
+the output of: git -C /data/grid_v4/grid_release log --oneline -1` returns READY and the
+commit.
+
+Pass (Phase 8): all units enabled; note in the report whether `scripts/paper_trading_review.py` is
 installed in cron (LEVER-PACKAGE §7 T3 says `setup_cron.sh` installs only 7 of the entries
 and this is not one of them — installing it is a one-line follow-up, not part of this
 bring-up).

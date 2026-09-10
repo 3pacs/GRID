@@ -63,10 +63,18 @@ jobs:
               printf "%-40s " "$t"
               if [ -f "$t/api/main.py" ]; then
                 printf "code root  %s  dirty=%s\n" "$(git -C "$t" log --oneline -1 2>/dev/null || echo 'not-git')" "$(git -C "$t" status --short 2>/dev/null | wc -l)"
+                printf "%-40s   remote: %s\n" "" "$(git -C "$t" remote get-url origin 2>/dev/null | sed -E 's#(https?://)[^@/]+@#\1<redacted>@#')"
+                printf "%-40s   origin/main: %s   HEAD branch: %s\n" "" "$(git -C "$t" log -1 --format='%h %ci' origin/main 2>/dev/null)" "$(git -C "$t" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+                printf "%-40s   .env present: %s\n" "" "$( [ -f "$t/.env" ] && echo yes || echo no )"
               else
                 echo "no api/main.py"
               fi
             done
+            echo
+            echo "grid-api unit: $(systemctl show grid-api -p WorkingDirectory -p EnvironmentFiles -p MainPID --value | tr '\n' ' ')"
+            echo "grid-hermes unit: $(systemctl show grid-hermes -p WorkingDirectory -p EnvironmentFiles --value | tr '\n' ' ')"
+            api_pid="$(systemctl show -p MainPID --value grid-api)"; [ -n "$api_pid" ] && [ "$api_pid" != 0 ] && echo "grid-api cwd: $(sudo -n readlink /proc/$api_pid/cwd 2>/dev/null)"
+            echo "runner user: $(id -un)  python: $(python3 --version 2>&1)"
             echo '```'
           } | tee -a "$REPORT"
 
@@ -102,32 +110,44 @@ jobs:
             echo '```'
           } | tee -a "$REPORT"
 
-      - name: Phase 2 — bring the Hermes tree to main
+      - name: Phase 2 — bring both code trees to main (authenticated fetch from GitHub)
         if: ${{ !inputs.inventory_only }}
         shell: bash
+        env:
+          SRC_URL: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git
+          TARGET_SHA: ${{ github.sha }}
         run: |
           set +e
           {
-            echo "## Phase 2 — code trees"
+            echo "## Phase 2 — code trees (target main = $TARGET_SHA)"
             echo '```'
-            echo "release tree: $(git -C "$RELEASE" log --oneline -1) (deploy.yml keeps this at origin/main)"
-            cd "$HERMES_TREE" || { echo "no Hermes tree at $HERMES_TREE"; exit 0; }
-            git fetch -q origin main 2>&1
-            before="$(git log --oneline -1)"
-            dirty="$(git status --short | wc -l)"
-            echo "hermes tree before: $before  dirty=$dirty  branch=$(git rev-parse --abbrev-ref HEAD)"
-            if [ "$dirty" -eq 0 ]; then
-              git merge --ff-only origin/main 2>&1 | tail -2
-            else
-              echo "tree dirty (Hermes commits analytical outputs here) — stashing, fast-forwarding, restoring"
-              git stash push -u -q -m "ops-bringup $(date -u +%FT%TZ)" 2>&1
-              git merge --ff-only origin/main 2>&1 | tail -2
-              git stash pop 2>&1 | tail -3 || echo "STASH POP CONFLICT — resolve by hand: git -C $HERMES_TREE status"
-            fi
-            echo "hermes tree after:  $(git log --oneline -1)"
+            # --- release tree (grid-api runs here): exactly what deploy.yml intends, but fetched from GitHub itself
+            cd "$RELEASE" || { echo "no release tree"; exit 0; }
+            echo "release before: $(git log --oneline -1)  origin=$(git remote get-url origin 2>/dev/null | sed -E 's#(https?://)[^@/]+@#\1<redacted>@#')"
+            git fetch -q "$SRC_URL" main 2>&1 | tail -2 && git reset -q --hard FETCH_HEAD 2>&1 | tail -1
+            echo "release after:  $(git log --oneline -1)"
+            if [ "$(git rev-parse HEAD)" = "$TARGET_SHA" ]; then echo "release tree == main: OK"; else echo "release tree != main: MISMATCH"; fi
             python3 -m pip install -q -r requirements.txt 2>&1 | tail -2
-            python3 -c "import asyncpg; print('asyncpg', asyncpg.__version__)" 2>&1
-            cd "$RELEASE" && python3 -c "import asyncpg; print('release asyncpg', asyncpg.__version__)" 2>&1
+            python3 -c "import asyncpg; print('release asyncpg', asyncpg.__version__)" 2>&1
+            ( cd pwa && npm ci --silent 2>&1 | tail -2 && npm run build 2>&1 | tail -3 ) && ls -la pwa_dist/index.html 2>&1
+            echo
+            # --- Hermes tree (grid-hermes / grid-intelligence run here): merge main in, keep its local outputs
+            cd "$HERMES_TREE" || { echo "no Hermes tree at $HERMES_TREE"; exit 0; }
+            echo "hermes before: $(git log --oneline -1)  branch=$(git rev-parse --abbrev-ref HEAD)  dirty=$(git status --short | wc -l)"
+            git fetch -q "$SRC_URL" main 2>&1 | tail -2
+            stashed=0
+            if [ "$(git status --short | wc -l)" -gt 0 ]; then
+              git stash push -u -q -m "ops-bringup $(date -u +%FT%TZ)" 2>&1 && stashed=1 && echo "stashed local changes"
+            fi
+            if git merge --no-edit FETCH_HEAD 2>&1 | tail -3; then
+              echo "hermes merged main: $(git log --oneline -1)"
+            else
+              git merge --abort 2>/dev/null; echo "HERMES MERGE CONFLICT — left at $(git log --oneline -1); resolve by hand (git -C $HERMES_TREE status)"
+            fi
+            [ "$stashed" = 1 ] && { git stash pop 2>&1 | tail -2 || echo "STASH POP CONFLICT — git -C $HERMES_TREE stash list"; }
+            printf "hermes contains main? "; git merge-base --is-ancestor "$TARGET_SHA" HEAD && echo yes || echo NO
+            python3 -m pip install -q -r requirements.txt 2>&1 | tail -2
+            python3 -c "import asyncpg; print('hermes asyncpg', asyncpg.__version__)" 2>&1
             echo '```'
           } | tee -a "$REPORT"
 
@@ -165,11 +185,17 @@ jobs:
         shell: bash
         run: |
           set +e
+          # GRID .env lives next to config.py in the tree the services run from; the runner shell has none.
+          for f in "$RELEASE/.env" "$HERMES_TREE/.env" "$HERMES_TREE/grid/.env" /data/grid_v4/astrogrid_dedup/.env; do
+            if [ -f "$f" ]; then set -a; . "$f"; set +a; echo "(env sourced from $f)"; break; fi
+          done
           {
             echo "## Phase 4 — restart + smoke"
             echo '```'
-            sudo systemctl restart grid-hermes grid-intelligence 2>&1; sleep 10
+            sudo systemctl restart grid-api grid-hermes grid-intelligence 2>&1; sleep 12
             for u in grid-api grid-hermes grid-intelligence; do printf "  %-18s %s\n" "$u" "$(systemctl is-active "$u")"; done
+            api_pid="$(systemctl show -p MainPID --value grid-api)"; echo "grid-api cwd: $(sudo -n readlink /proc/$api_pid/cwd 2>/dev/null)  release HEAD: $(git -C "$RELEASE" log --oneline -1)"
+            for u in grid-hermes grid-intelligence; do [ "$(systemctl is-active $u)" = active ] || { echo "--- journal $u"; sudo journalctl -u $u -n 30 --no-pager | tail -30; }; done
             echo "--- smoke (scripts/smoke_endpoints.sh --quiet)"
             cd "$RELEASE" && timeout 600 bash scripts/smoke_endpoints.sh --quiet 2>&1 | tail -20; echo "smoke exit=${PIPESTATUS[0]}"
             echo "--- /api/v1/system/health"
@@ -181,8 +207,8 @@ jobs:
               print(f'{k}: {s[:300]}')" 2>&1 | head -40
             echo "--- new endpoints (unauthenticated probes: 401/403 = route exists)"
             for p in /api/v1/alpha/realized "/api/v1/conviction/sweeps/latest?horizon_days=90" "/api/v1/conviction/ticker/NVDA?horizon_days=90"; do printf "%-60s %s\n" "$p" "$(curl -s -m 10 -o /dev/null -w '%{http_code}' "localhost:8000$p")"; done
-            echo "--- error log, last 2h (release tree)"
-            cd "$RELEASE" && python3 scripts/audit_error_log.py --hours 2 --top 10 2>&1 | tail -15
+            echo "--- error log, last 2h (Hermes tree — where the services write .server-logs)"
+            cd "$HERMES_TREE" && python3 scripts/audit_error_log.py --hours 2 --top 10 2>&1 | tail -15
             echo '```'
           } | tee -a "$REPORT"
 
@@ -191,6 +217,10 @@ jobs:
         shell: bash
         run: |
           set +e
+          # GRID .env lives next to config.py in the tree the services run from; the runner shell has none.
+          for f in "$RELEASE/.env" "$HERMES_TREE/.env" "$HERMES_TREE/grid/.env" /data/grid_v4/astrogrid_dedup/.env; do
+            if [ -f "$f" ]; then set -a; . "$f"; set +a; echo "(env sourced from $f)"; break; fi
+          done
           cd "$RELEASE"
           {
             echo "## Phase 5 — jobs"
@@ -230,6 +260,10 @@ jobs:
         shell: bash
         run: |
           set +e
+          # GRID .env lives next to config.py in the tree the services run from; the runner shell has none.
+          for f in "$RELEASE/.env" "$HERMES_TREE/.env" "$HERMES_TREE/grid/.env" /data/grid_v4/astrogrid_dedup/.env; do
+            if [ -f "$f" ]; then set -a; . "$f"; set +a; echo "(env sourced from $f)"; break; fi
+          done
           cd "$RELEASE"
           {
             echo "## Phase 6 — email"
@@ -262,6 +296,10 @@ jobs:
         shell: bash
         run: |
           set +e
+          # GRID .env lives next to config.py in the tree the services run from; the runner shell has none.
+          for f in "$RELEASE/.env" "$HERMES_TREE/.env" "$HERMES_TREE/grid/.env" /data/grid_v4/astrogrid_dedup/.env; do
+            if [ -f "$f" ]; then set -a; . "$f"; set +a; echo "(env sourced from $f)"; break; fi
+          done
           cd "$RELEASE"
           pg() {
             if sudo -n -u postgres psql griddb -c "select 1" >/dev/null 2>&1; then sudo -n -u postgres psql griddb "$@"
@@ -287,7 +325,7 @@ jobs:
               for r in rows: print(f'  {str(r[0])[:28]:28s} {r[1]:8d}  {str(r[2])[:16]}')
               n = c.execute(text('''SELECT COUNT(DISTINCT source_id) FROM raw_series WHERE pull_timestamp >= NOW() - INTERVAL '7 days' ''')).scalar()
               print('distinct sources, 7d:', n)" 2>&1 | head -50
-            python3 scripts/audit_error_log.py --hours 24 --top 12 2>&1 | tail -16
+            (cd "$HERMES_TREE" && python3 scripts/audit_error_log.py --hours 24 --top 12 2>&1 | tail -16)
             echo '```'
             echo "### Realized alpha (truth gate)"
             echo '```'

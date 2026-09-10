@@ -91,10 +91,19 @@ jobs:
 
     steps:
       - name: Build release tree
+        env:
+          SRC_URL: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git
         run: |
           set -euo pipefail
           cd "$DEPLOY_PATH"
-          git fetch origin && git reset --hard origin/main
+          echo "before: $(git log --oneline -1)"
+          # Fetch from GitHub itself with the job token, not from whatever `origin`
+          # points at: the clone's origin went stale in 2026 and every deploy after
+          # #364 reset to the same old commit while reporting success.
+          git fetch "$SRC_URL" main
+          git reset --hard FETCH_HEAD
+          echo "after:  $(git log --oneline -1)"
+          test "$(git rev-parse HEAD)" = "${{ github.sha }}" || { echo "::error::release tree is not at the pushed commit ${{ github.sha }}"; exit 1; }
           pip install -r requirements.txt
           cd pwa && npm ci && npm run build && cd ..
           python3 -m alembic upgrade head || echo "no migrations"
