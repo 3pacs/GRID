@@ -228,7 +228,7 @@ def _embed_chain() -> list[str]:
 
     raw = getattr(settings, "EMBED_PROVIDER_CHAIN", "") or ""
     chain = [name.strip() for name in raw.split(",") if name.strip()]
-    return chain or ["ollama_koala", "ollama_z400", "ollama"]
+    return chain or ["ollama_z4", "ollama_koala", "ollama_z400", "ollama"]
 
 
 def embed(
@@ -237,10 +237,11 @@ def embed(
 ) -> list[list[float]] | None:
     """Embed ``texts`` on the first tailnet GPU node that answers.
 
-    Walks ``EMBED_PROVIDER_CHAIN`` (default koala → z400 → grid-svr Ollama).
-    grid-svr is deliberately last: its Ollama shares the RTX 3090 with the
-    REASON/ORACLE llama-server, so embedding batches there would evict the
-    27B chat model.
+    Walks ``EMBED_PROVIDER_CHAIN`` (default gridz4 → koala → z400 → grid-svr
+    Ollama). gridz4 leads because it is the only separate tailnet machine
+    verified to serve ``nomic-embed-text``; grid-svr is deliberately last
+    because its Ollama shares the RTX 3090 with the REASON/ORACLE
+    llama-server, so embedding batches there would evict the 27B chat model.
 
     Before 2026-09-10 embeddings went to the CPU-only llama.cpp unit on
     grid-svr :8080, which was never started with ``--embeddings`` and answered
@@ -334,6 +335,8 @@ def _create_client(provider: str) -> Any:
         return _create_ollama_koala_client(settings)
     elif provider == "ollama_z400":
         return _create_ollama_z400_client(settings)
+    elif provider == "ollama_z4":
+        return _create_ollama_z4_client(settings)
     elif provider == "llamacpp":
         return _create_llamacpp_client(settings)
     elif provider == "openai":
@@ -492,6 +495,33 @@ def _create_ollama_z400_client(settings: Any) -> Any:
         )
     except Exception as exc:
         log.debug("Ollama z400 client init failed: {e}", e=str(exc))
+        return None
+
+
+def _create_ollama_z4_client(settings: Any) -> Any:
+    """Ollama on gridz4 (:11434) — the primary embedding node.
+
+    Distinct from ``llamacpp_z4``, which is the llama.cpp chat server on the
+    same box at ``gridz4:8080``. This is the Ollama daemon beside it, serving
+    ``nomic-embed-text`` (verified from grid-svr 2026-09-10: peer active on a
+    direct connection).
+
+    It heads ``EMBED_PROVIDER_CHAIN`` because it is the only separate tailnet
+    machine currently answering with an embedding model — koala went offline
+    48 days ago and z400 is no longer a peer.
+    """
+    if not getattr(settings, "OLLAMA_Z4_ENABLED", False):
+        return None
+    try:
+        from ollama.client import OllamaClient
+        return OllamaClient(
+            base_url=getattr(settings, "OLLAMA_Z4_BASE_URL", "http://gridz4:11434"),
+            model=getattr(settings, "OLLAMA_Z4_CHAT_MODEL", "qwen3:8b"),
+            embed_model=getattr(settings, "OLLAMA_Z4_EMBED_MODEL", "nomic-embed-text"),
+            timeout=getattr(settings, "OLLAMA_Z4_TIMEOUT_SECONDS", 120),
+        )
+    except Exception as exc:
+        log.debug("Ollama gridz4 client init failed: {e}", e=str(exc))
         return None
 
 

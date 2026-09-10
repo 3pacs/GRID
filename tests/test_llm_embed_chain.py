@@ -69,19 +69,37 @@ class TestEmbedChainConfig:
     def test_setting_is_declared_with_gpu_node_order(self) -> None:
         assert "EMBED_PROVIDER_CHAIN" in config.Settings.model_fields
         default = config.Settings.model_fields["EMBED_PROVIDER_CHAIN"].default
-        # koala and z400 have their own GPUs; grid-svr's Ollama shares the
-        # 3090 with the REASON/ORACLE llama-server, so it must come last.
-        assert default == "ollama_koala,ollama_z400,ollama"
+        # gridz4 is the only separate tailnet box verified serving
+        # nomic-embed-text, so it leads. grid-svr's Ollama shares the 3090
+        # with the REASON/ORACLE llama-server, so it must come last.
+        assert default == "ollama_z4,ollama_koala,ollama_z400,ollama"
+
+    def test_grid_svr_ollama_is_last_resort(self) -> None:
+        """Embedding batches must not evict the 27B chat model on the 3090."""
+        chain = config.Settings.model_fields["EMBED_PROVIDER_CHAIN"].default.split(",")
+        assert chain[-1] == "ollama"
+        assert chain[0] == "ollama_z4"
 
     def test_chain_parses_to_provider_names(self, monkeypatch) -> None:
         monkeypatch.setattr(
-            config.settings, "EMBED_PROVIDER_CHAIN", "ollama_koala, ollama_z400 ,ollama"
+            config.settings, "EMBED_PROVIDER_CHAIN", "ollama_z4, ollama_koala ,ollama"
         )
-        assert router._embed_chain() == ["ollama_koala", "ollama_z400", "ollama"]
+        assert router._embed_chain() == ["ollama_z4", "ollama_koala", "ollama"]
 
     def test_empty_chain_falls_back_to_defaults(self, monkeypatch) -> None:
         monkeypatch.setattr(config.settings, "EMBED_PROVIDER_CHAIN", "")
-        assert router._embed_chain() == ["ollama_koala", "ollama_z400", "ollama"]
+        assert router._embed_chain() == [
+            "ollama_z4", "ollama_koala", "ollama_z400", "ollama"
+        ]
+
+    def test_gridz4_ollama_is_distinct_from_gridz4_llamacpp(self) -> None:
+        """ollama_z4 (:11434) and llamacpp_z4 (:8080) are different daemons."""
+        assert config.Settings.model_fields["OLLAMA_Z4_BASE_URL"].default.endswith(
+            ":11434"
+        )
+        assert config.Settings.model_fields["LLAMACPP_Z4_BASE_URL"].default.endswith(
+            ":8080"
+        )
 
     def test_chain_contains_no_retired_cpu_providers(self) -> None:
         """The :8080 providers must never reappear in the embed chain."""
@@ -96,13 +114,13 @@ class TestEmbedChainConfig:
 
 class TestEmbed:
     def test_first_healthy_provider_wins(self, monkeypatch) -> None:
-        koala = _FakeEmbedProvider(vectors=[[0.1, 0.2]])
-        z400 = _FakeEmbedProvider(vectors=[[9.9, 9.9]])
-        _install(monkeypatch, {"ollama_koala": koala, "ollama_z400": z400})
+        z4 = _FakeEmbedProvider(vectors=[[0.1, 0.2]])
+        koala = _FakeEmbedProvider(vectors=[[9.9, 9.9]])
+        _install(monkeypatch, {"ollama_z4": z4, "ollama_koala": koala})
 
         assert router.embed(["hello"]) == [[0.1, 0.2]]
-        assert koala.calls == [["hello"]]
-        assert z400.calls == []  # never reached
+        assert z4.calls == [["hello"]]
+        assert koala.calls == []  # never reached
 
     def test_falls_through_to_z400_when_koala_offline(self, monkeypatch) -> None:
         koala = _FakeEmbedProvider(available=False)

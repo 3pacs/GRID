@@ -119,13 +119,32 @@ Where its traffic went:
 
 | Old consumer of :8080 | Now |
 |---|---|
-| Embeddings (`hyperspace/embeddings.py`) | `llm.router.embed()` → `EMBED_PROVIDER_CHAIN` (koala → z400 → grid-svr Ollama, all `nomic-embed-text`) |
+| Embeddings (`hyperspace/embeddings.py`) | `llm.router.embed()` → `EMBED_PROVIDER_CHAIN` (gridz4 → koala → z400 → grid-svr Ollama, all `nomic-embed-text`) |
 | `gemma` provider (`GEMMA_BASE_URL`) | Removed from every `_fallback_chain`; it had been `GEMMA_ENABLED=false` and dead already |
 | Chat/REASON | Unaffected — `LLAMACPP_BASE_URL` already pointed at the RTX 3090 (`:8086`), not `:8080` |
+
+### Embedding nodes — reachability probed 2026-09-10
+
+| Node | Endpoint | State | Role |
+|---|---|---|---|
+| gridz4 | `gridz4:11434` | active, direct | **primary** — the "another machine on the tailnet" |
+| koala | `koala:11434` | **offline, last seen 48d ago** | in chain, resumes automatically if it returns |
+| z400 | `z400:11434` | **not a tailnet peer** | in chain, resumes automatically if it returns |
+| grid-svr | `localhost:11434` | active | last resort — shares the RTX 3090 with the chat model |
+
+`redbox:11434` has no Ollama (it serves llama.cpp on `:8080`); `ocr-node` and
+`panda` have been offline 31 and 18 days.
+
+Note `ollama_z4` (gridz4 **:11434**, Ollama) is a different daemon from
+`llamacpp_z4` (gridz4 **:8080**, llama.cpp). Both live on gridz4.
 
 Embedding health check:
 
 ```bash
+# primary
+curl -s -m 10 http://gridz4:11434/api/embeddings \
+  -d '{"model":"nomic-embed-text","prompt":"probe"}' | head -c 80
+# last resort
 curl -s -m 10 http://localhost:11434/api/embeddings \
   -d '{"model":"nomic-embed-text","prompt":"probe"}' | head -c 80
 ```
