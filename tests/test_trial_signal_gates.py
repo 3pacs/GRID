@@ -300,3 +300,32 @@ def test_hermes_registry_schedules_trial_signal_after_the_ingestor() -> None:
     assert keys.index("trial_ingestor") < keys.index("trial_signal") < keys.index("small_cap_enrichment")
     # _FunctionPuller injects the engine by parameter name
     assert "engine" in inspect.signature(ts.run_daily).parameters
+
+
+# ── NUMERIC(5,4) score columns never receive months ───────────────────────
+
+
+def test_cash_runway_score_is_the_unit_component_not_months(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 37-month runway written into cash_runway_score overflowed NUMERIC(5,4) and dropped the row."""
+    sig, conn, _ = _signal(monkeypatch, [_trial("NCT1")], {"market_cap_mm": 500.0, "cash_runway_months": 37.0})
+    results = sig.generate()
+    assert results[0].cash_runway_months == 37.0
+    assert results[0].cash_runway_score == 1.0  # min(1, 37 / 24)
+    sig.write_to_db(results, run_id="t")
+    _, params = conn.executed[0]
+    assert params["cash_runway_months"] == 37.0
+    assert 0.0 <= params["cash_runway_score"] <= 1.0 and params["cash_runway_score"] == 1.0
+
+    sig, conn, _ = _signal(monkeypatch, [_trial("NCT2")], {"market_cap_mm": 500.0, "cash_runway_months": 6.0})
+    results = sig.generate()
+    assert results[0].cash_runway_score == 0.25
+    sig.write_to_db(results, run_id="t")
+    assert conn.executed[0][1]["cash_runway_score"] == 0.25
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [(0.25, 0.25), (37.0, 1.0), (-3, 0.0), (None, 0.5), ("abc", 0.5), (float("nan"), 0.5), ("0.7", 0.7), (0.123456, 0.1235)],
+)
+def test_unit_score_clamps_into_the_numeric_5_4_range(value: Any, expected: float) -> None:
+    assert ts._unit_score(value) == expected
