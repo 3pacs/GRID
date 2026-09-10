@@ -94,15 +94,23 @@ KNOWLEDGE_MAP_TIMEOUT_SECONDS = 120           # gemma micro knowledge mapper
 DIAGNOSE_PULLS_TIMEOUT_SECONDS = 240          # Hermes pull diagnosis/fix step — bumped 2026-05-08 because diagnose runs per-source retry which can chain HTTP calls
 SMART_INGESTION_TIMEOUT_SECONDS = 300         # smart_scheduler.tick() — matches TICK_TIME_BUDGET_S in ingestion/smart_scheduler.py so Hermes doesn't pull the plug while SmartScheduler is mid-shutdown
 TIMESFM_TIMEOUT_SECONDS = 240                 # oracle/forecaster_adapter.run_timesfm_forecast_cycle
-INTELLIGENCE_TASKS_TIMEOUT_SECONDS = 360      # trust/forecasts/thesis/cross-ref/options + daily-window backtest_scanner.review_existing_hypotheses (LLM-bound). Bumped 2026-05-08 from 180s after the timeout machinery was actually working — 180s was empirical-untested guess; 360s reflects observed daily run length with LLM calls
+DAILY_INTEL_BATCH_OBSERVED_S = 360            # observed run length of the 02:00 daily block (source_audit → backtest_scan → postmortem → options_improvement → hypothesis_review → auto_discover) with LLM calls, measured 2026-05-08
+INTELLIGENCE_TASKS_TIMEOUT_SECONDS = 900      # whole run_intelligence_tasks() step. MUST exceed ACTIVE_HYPO_SCORING_MAX_RUNTIME_S + DAILY_INTEL_BATCH_OBSERVED_S: the 30-min active-hypothesis scorer runs FIRST inside this step, so if its budget alone exceeds this cap the step times out before the daily block — and auto_discover() — is ever reached. That inversion (360s cap vs 600s scorer) is how hypothesis discovery starved from 2026-05-15 onward. Was 360 (2026-05-08); raised 2026-09-10. tests/test_hermes_timeout_budgets.py pins the invariant.
 POSTMORTEM_BATCH_LIMIT = 20                   # Drain postmortem backlog in bounded chunks instead of orphaning long LLM loops.
 
 # Active-hypothesis scoring — periodic batch that closes the loop on the
 # auto_discover() pipeline. The bottleneck is per-row score_hypothesis()
 # calls which the 2026-05-15 manual run timed at ~15/sec on grid-svr;
-# 200 rows / 600s leaves ample headroom (~3 rows/sec budget).
+# 200 rows / 240s is still ~1 row/sec of budget against a ~15 rows/sec
+# engine, so a full batch completes in ~15s and the cap only matters when
+# the DB is contended. The cap was 600s until 2026-09-10 — larger than the
+# 360s INTELLIGENCE_TASKS_TIMEOUT_SECONDS that wrapped it, which orphaned
+# the step twice an hour and could starve the daily block (see the note on
+# INTELLIGENCE_TASKS_TIMEOUT_SECONDS above). Runtime budget must satisfy
+# ACTIVE_HYPO_SCORING_MAX_RUNTIME_S + DAILY_INTEL_BATCH_OBSERVED_S
+# <= INTELLIGENCE_TASKS_TIMEOUT_SECONDS.
 ACTIVE_HYPO_SCORING_BATCH_SIZE = 200
-ACTIVE_HYPO_SCORING_MAX_RUNTIME_S = 600
+ACTIVE_HYPO_SCORING_MAX_RUNTIME_S = 240
 ACTIVE_HYPO_SCORING_INTERVAL_MINUTES = 30
 
 # Earnings events → earnings_calendar back-compat sync. The DB-side
@@ -765,6 +773,19 @@ def run_intelligence_tasks(
             )
         except Exception as exc:
             log.warning("Source audit import failed: {e}", e=str(exc))
+
+        # Flow materialization — projects signal_sources into the relational
+        # flow tables (dark_pool_weekly, etf_flows, insider_trades,
+        # congressional_trades, junction_point_readings). The module existed
+        # with zero callers, which is why those tables were documented empty
+        # (docs/planning/FILL-EMPTY-TABLES.md; LEVER-PACKAGE.md §7 T1.4).
+        try:
+            from ingestion.flow_materializer import sync_all as _flow_sync_all
+            results["flow_materialize"] = _run_intel_task(
+                "flow_materialize", _flow_sync_all, state, engine,
+            )
+        except Exception as exc:
+            log.warning("Flow materializer import failed: {e}", e=str(exc))
 
         try:
             from analysis.backtest_scanner import run_full_scan

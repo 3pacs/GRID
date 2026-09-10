@@ -30,9 +30,9 @@ classification (strong/neutral/weak/anti).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from loguru import logger as log
 from sqlalchemy import text
@@ -188,6 +188,15 @@ class TradeProvenanceReport:
     aggregate_conviction: float
     verdict: str  # 'high' / 'medium' / 'low' / 'no_trade'
     memory_lesson_multiplier: float = 1.0  # ∈ [0.85, 1.15] (15th layer — reasoning_bank). Default 1.0 (neutral) so older callers remain valid.
+    # Coverage (2026-09-10, GRID-4 pivot §2.2/§7): which adjuster layers
+    # actually computed a value, and how much Shapley weight sits on signals
+    # with a calibrated scorecard. A layer that failed or was never attempted
+    # is reported as absent instead of silently reading as neutral 1.0.
+    layer_coverage: dict[str, bool] = field(default_factory=dict)
+    layers_present: int = 0
+    layers_total: int = 0
+    evidence_coverage: float = 0.0
+    verdict_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -225,52 +234,129 @@ class TradeProvenanceReport:
             "memory_lesson_multiplier": round(self.memory_lesson_multiplier, 4),
             "aggregate_conviction": round(self.aggregate_conviction, 4),
             "verdict": self.verdict,
+            "layer_coverage": dict(self.layer_coverage),
+            "layers_present": self.layers_present,
+            "layers_total": self.layers_total,
+            "evidence_coverage": round(self.evidence_coverage, 4),
+            "verdict_reason": self.verdict_reason,
         }
 
 
 # ── Aggregate conviction ──────────────────────────────────────────────────
 
 
-def compute_aggregate_conviction(
+# The adjuster layers, in the order they were added. A layer is *present*
+# when its caller computed a real value; ``None`` means the upstream lookup
+# failed, had no data, or was never attempted. Presence is reported as
+# coverage so the verdict can distinguish "checked and neutral" from "not
+# checked" — the distinction whose absence produced the 11.9%-hit-rate HIGH
+# bucket (docs/planning/GRID-4-PRODUCT-PIVOT.md §2.2 and §7; LEVER-PACKAGE.md
+# §3D / §7 T0.3). Before 2026-09-10 every missing layer read as 1.0.
+CONVICTION_LAYERS: tuple[str, ...] = (
+    "disagreement",
+    "fragility",
+    "red_team",
+    "fudge_alerts",
+    "cooccurrence",
+    "confidence_bucket",
+    "scenario",
+    "null_hypothesis",
+    "meta_learning",
+    "contra_indicator",
+    "short_squeeze",
+    "prediction_market_arb",
+    "convergence",
+    "money_flow",
+    "memory_lesson",
+    "edge_signal",
+)
+
+# Evidence rows whose scorecard has enough history to mean something.
+_CALIBRATED_CLASSIFICATIONS = frozenset({"strong", "neutral", "weak", "anti_predictive"})
+
+
+@dataclass(frozen=True)
+class ConvictionAggregate:
+    """Aggregate conviction plus the coverage that produced it."""
+
+    value: float
+    layer_coverage: dict[str, bool]
+    evidence_coverage: float
+
+    @property
+    def layers_present(self) -> int:
+        return sum(1 for present in self.layer_coverage.values() if present)
+
+    @property
+    def layers_total(self) -> int:
+        return len(self.layer_coverage)
+
+    @property
+    def layer_coverage_ratio(self) -> float:
+        return self.layers_present / self.layers_total if self.layers_total else 0.0
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, float(value)))
+
+
+def compute_evidence_coverage(signal_evidence: list[SignalEvidence]) -> float:
+    """Share of Shapley weight resting on signals with a calibrated scorecard.
+
+    ``no_history`` and ``cold_start`` rows contribute a neutral 1.0 to the
+    base term, so a report built entirely from them has an aggregate of
+    exactly 1.0 that carries no information. This ratio is what lets the
+    verdict see that.
+    """
+    total = sum(max(0.0, float(ev.shapley_weight)) for ev in signal_evidence)
+    if total <= 0.0:
+        return 0.0
+    covered = sum(
+        max(0.0, float(ev.shapley_weight))
+        for ev in signal_evidence
+        if ev.classification in _CALIBRATED_CLASSIFICATIONS
+    )
+    return covered / total
+
+
+def aggregate_conviction_with_coverage(
     signal_evidence: list[SignalEvidence],
     *,
-    fragility_multiplier: float = 1.0,
-    disagreement_score: float = 0.0,
-    red_team_epistemic_risk: float = 0.0,
-    fudge_alert_count: int = 0,
-    cooccurrence_lift: float = 1.0,
-    confidence_bucket_multiplier: float = 1.0,
-    scenario_multiplier: float = 1.0,
-    null_hypothesis_penalty_value: float = 1.0,
-    meta_learning_multiplier: float = 1.0,
-    contra_indicator_multiplier: float = 1.0,
-    squeeze_multiplier: float = 1.0,
-    arbitrage_multiplier: float = 1.0,
-    convergence_multiplier: float = 1.0,
-    money_flow_multiplier: float = 1.0,
-    memory_lesson_multiplier: float = 1.0,
-    edge_signal_multiplier: float = 1.0,
-) -> float:
-    """Combine per-signal conviction weights into a single scalar.
+    fragility_multiplier: float | None = None,
+    disagreement_score: float | None = None,
+    red_team_epistemic_risk: float | None = None,
+    fudge_alert_count: int | None = None,
+    cooccurrence_lift: float | None = None,
+    confidence_bucket_multiplier: float | None = None,
+    scenario_multiplier: float | None = None,
+    null_hypothesis_penalty_value: float | None = None,
+    meta_learning_multiplier: float | None = None,
+    contra_indicator_multiplier: float | None = None,
+    squeeze_multiplier: float | None = None,
+    arbitrage_multiplier: float | None = None,
+    convergence_multiplier: float | None = None,
+    money_flow_multiplier: float | None = None,
+    memory_lesson_multiplier: float | None = None,
+    edge_signal_multiplier: float | None = None,
+) -> ConvictionAggregate:
+    """Combine per-signal conviction weights into a single scalar, and say
+    which layers actually contributed.
 
     Formula (pure, deterministic):
 
         base = Σ (shapley_weight_i × conviction_weight_i)
-        penalty = (1 - 0.4 × disagreement_score)
-                × fragility_multiplier
-                × (1 - 0.5 × red_team_epistemic_risk)
-                × max(0.1, 1 - 0.15 × fudge_alert_count)
-                × clamp(cooccurrence_lift, 0.75, 1.25)
-        aggregate = base × penalty
+        penalty = Π over PRESENT layers of that layer's clamped multiplier
+        aggregate = clamp(base × penalty, 0.0, 1.5)
 
-    Clamped to [0.0, 1.5]. Callers use this as the single conviction
-    number to drive Kelly sizing downstream.
+    A layer passed as ``None`` is absent: it multiplies nothing (the value is
+    identical to the old neutral-1.0 behaviour) but is reported as
+    ``layer_coverage[name] = False``. Callers that want the scalar only use
+    :func:`compute_aggregate_conviction`.
 
     ``cooccurrence_lift`` comes from ``intelligence.signal_cooccurrence.
     get_lift_multiplier`` (CAT-177): pairs of firing signals that
     historically hit together get a boost; pairs that dragged each other
-    down get a discount. Neutral (1.0) when fewer than two firing
-    signals or no calibrated pair history.
+    down get a discount.
     """
     # Per-signal overrides from intelligence.signal_weight_overrides.
     # Default-ON, env-gated. Multiplier of 1.0 = no effect.
@@ -287,50 +373,116 @@ def compute_aggregate_conviction(
         else:
             base += ev.shapley_weight * ev.scorecard.conviction_weight * override
 
+    coverage: dict[str, bool] = {}
     penalty = 1.0
-    penalty *= max(0.0, 1.0 - 0.4 * max(0.0, min(1.0, disagreement_score)))
-    penalty *= max(0.0, min(1.5, fragility_multiplier))
-    penalty *= max(0.0, 1.0 - 0.5 * max(0.0, min(1.0, red_team_epistemic_risk)))
-    penalty *= max(0.1, 1.0 - 0.15 * max(0, int(fudge_alert_count)))
-    penalty *= max(0.75, min(1.25, float(cooccurrence_lift or 1.0)))
+
+    def layer(name: str, value: Any, multiplier_of: Callable[[Any], float]) -> None:
+        nonlocal penalty
+        present = value is not None
+        coverage[name] = present
+        if present:
+            penalty *= multiplier_of(value)
+
+    layer("disagreement", disagreement_score,
+          lambda v: max(0.0, 1.0 - 0.4 * _clamp(v, 0.0, 1.0)))
+    layer("fragility", fragility_multiplier, lambda v: _clamp(v, 0.0, 1.5))
+    layer("red_team", red_team_epistemic_risk,
+          lambda v: max(0.0, 1.0 - 0.5 * _clamp(v, 0.0, 1.0)))
+    layer("fudge_alerts", fudge_alert_count,
+          lambda v: max(0.1, 1.0 - 0.15 * max(0, int(v))))
+    layer("cooccurrence", cooccurrence_lift, lambda v: _clamp(v, 0.75, 1.25))
     # Closing-the-loop calibration layers — each clamped to its own range
-    # by the upstream module so we only need a defensive float cast here.
-    penalty *= max(0.50, min(1.10, float(confidence_bucket_multiplier or 1.0)))
-    penalty *= max(0.60, min(1.15, float(scenario_multiplier or 1.0)))
-    penalty *= max(0.40, min(1.00, float(null_hypothesis_penalty_value or 1.0)))
+    # by the upstream module so we only need a defensive clamp here.
+    layer("confidence_bucket", confidence_bucket_multiplier, lambda v: _clamp(v, 0.50, 1.10))
+    layer("scenario", scenario_multiplier, lambda v: _clamp(v, 0.60, 1.15))
+    layer("null_hypothesis", null_hypothesis_penalty_value, lambda v: _clamp(v, 0.40, 1.00))
     # Second-wave amplifiers: meta-learning edge, contra-indicator crowd,
     # per-ticker squeeze loadedness, and oracle-vs-market arbitrage.
-    penalty *= max(0.40, min(1.50, float(meta_learning_multiplier or 1.0)))
-    penalty *= max(0.80, min(1.20, float(contra_indicator_multiplier or 1.0)))
-    penalty *= max(0.85, min(1.20, float(squeeze_multiplier or 1.0)))
-    penalty *= max(0.90, min(1.15, float(arbitrage_multiplier or 1.0)))
-    # The dots-connector: rewards orthogonal multi-stream convergence
-    # (insider + congress + whales + dark-pool + smart-money lined up).
-    penalty *= max(0.90, min(1.30, float(convergence_multiplier or 1.0)))
-    # 14th layer — money-flow engine: 8-layer junction-point aggregate.
-    # Trade aligned with inferred capital rotation gets a boost; opposed
-    # gets a haircut. Clamped hard to [0.70, 1.30].
-    penalty *= max(0.70, min(1.30, float(money_flow_multiplier or 1.0)))
-    # 15th layer — ReasoningBank memory prior: distilled lessons from
-    # past trades / postmortems / oracle disagreements at this fingerprint.
-    # Narrow range: this is a prior, not direct evidence.
-    penalty *= max(
-        MEMORY_LESSON_MULT_MIN,
-        min(MEMORY_LESSON_MULT_MAX, float(memory_lesson_multiplier or 1.0)),
+    layer("meta_learning", meta_learning_multiplier, lambda v: _clamp(v, 0.40, 1.50))
+    layer("contra_indicator", contra_indicator_multiplier, lambda v: _clamp(v, 0.80, 1.20))
+    layer("short_squeeze", squeeze_multiplier, lambda v: _clamp(v, 0.85, 1.20))
+    layer("prediction_market_arb", arbitrage_multiplier, lambda v: _clamp(v, 0.90, 1.15))
+    # The dots-connector: rewards orthogonal multi-stream convergence.
+    layer("convergence", convergence_multiplier, lambda v: _clamp(v, 0.90, 1.30))
+    # 14th layer — money-flow engine, clamped hard to [0.70, 1.30].
+    layer("money_flow", money_flow_multiplier, lambda v: _clamp(v, 0.70, 1.30))
+    # 15th layer — ReasoningBank memory prior; a prior, not direct evidence.
+    layer("memory_lesson", memory_lesson_multiplier,
+          lambda v: _clamp(v, MEMORY_LESSON_MULT_MIN, MEMORY_LESSON_MULT_MAX))
+    # 16th layer — EDGE multipliers from the backtest edge_table, bounded at
+    # the source ([EDGE_MULTIPLIER_MIN, EDGE_MULTIPLIER_MAX]).
+    layer("edge_signal", edge_signal_multiplier, lambda v: _clamp(v, 0.40, 1.80))
+
+    return ConvictionAggregate(
+        value=max(0.0, min(1.5, base * penalty)),
+        layer_coverage=coverage,
+        evidence_coverage=compute_evidence_coverage(signal_evidence),
     )
-    # 16th layer — EDGE multipliers from the backtest edge_table. Default
-    # 1.0 means "no effect"; non-1.0 only when the caller has computed
-    # the aggregate via ``intelligence.edge_signals
-    # .compute_aggregate_edge_multiplier`` AND
-    # ``GRID_EDGE_SIGNALS_ENABLED`` is on. Bounded the same as a single
-    # edge ([EDGE_MULTIPLIER_MIN, EDGE_MULTIPLIER_MAX]) at the source so
-    # we just need a defensive clamp here matching the existing layers.
-    penalty *= max(0.40, min(1.80, float(edge_signal_multiplier or 1.0)))
-
-    return max(0.0, min(1.5, base * penalty))
 
 
-def _verdict_from_aggregate(conviction: float, confidence: float) -> str:
+def compute_aggregate_conviction(
+    signal_evidence: list[SignalEvidence],
+    *,
+    fragility_multiplier: float | None = None,
+    disagreement_score: float | None = None,
+    red_team_epistemic_risk: float | None = None,
+    fudge_alert_count: int | None = None,
+    cooccurrence_lift: float | None = None,
+    confidence_bucket_multiplier: float | None = None,
+    scenario_multiplier: float | None = None,
+    null_hypothesis_penalty_value: float | None = None,
+    meta_learning_multiplier: float | None = None,
+    contra_indicator_multiplier: float | None = None,
+    squeeze_multiplier: float | None = None,
+    arbitrage_multiplier: float | None = None,
+    convergence_multiplier: float | None = None,
+    money_flow_multiplier: float | None = None,
+    memory_lesson_multiplier: float | None = None,
+    edge_signal_multiplier: float | None = None,
+) -> float:
+    """Scalar form of :func:`aggregate_conviction_with_coverage`.
+
+    Kept for callers that only need the number (counterfactual stress,
+    walk-forward validation, ``scripts/call_a_trade.py``). Values are
+    identical to the pre-coverage implementation; only the reporting of
+    which layers were present is new.
+    """
+    return aggregate_conviction_with_coverage(
+        signal_evidence,
+        fragility_multiplier=fragility_multiplier,
+        disagreement_score=disagreement_score,
+        red_team_epistemic_risk=red_team_epistemic_risk,
+        fudge_alert_count=fudge_alert_count,
+        cooccurrence_lift=cooccurrence_lift,
+        confidence_bucket_multiplier=confidence_bucket_multiplier,
+        scenario_multiplier=scenario_multiplier,
+        null_hypothesis_penalty_value=null_hypothesis_penalty_value,
+        meta_learning_multiplier=meta_learning_multiplier,
+        contra_indicator_multiplier=contra_indicator_multiplier,
+        squeeze_multiplier=squeeze_multiplier,
+        arbitrage_multiplier=arbitrage_multiplier,
+        convergence_multiplier=convergence_multiplier,
+        money_flow_multiplier=money_flow_multiplier,
+        memory_lesson_multiplier=memory_lesson_multiplier,
+        edge_signal_multiplier=edge_signal_multiplier,
+    ).value
+
+
+# HIGH requires at least this share of adjuster layers to have computed a
+# real value, and at least this share of Shapley weight on calibrated
+# scorecards. Both are deliberately modest floors: they reject "nothing was
+# checked", not "some layers were quiet".
+MIN_LAYER_COVERAGE_FOR_HIGH: float = 0.6
+MIN_EVIDENCE_COVERAGE_FOR_HIGH: float = 0.5
+
+
+def _verdict_from_aggregate(
+    conviction: float,
+    confidence: float,
+    *,
+    layer_coverage_ratio: float = 1.0,
+    evidence_coverage: float = 1.0,
+) -> str:
     """Classify the final trade verdict.
 
     Rules (deterministic, 2026-05-17 calibration):
@@ -365,14 +517,58 @@ def _verdict_from_aggregate(conviction: float, confidence: float) -> str:
        previously discovering sharpe = +2.01 alpha under the MEDIUM label.
 
     See PR #192 (HIGH on confidence alone) + this PR (tighten upper bound).
+
+    3. Coverage gate (2026-09-10). HIGH additionally requires that enough of
+       the adjuster layers actually computed a value
+       (``layer_coverage_ratio >= MIN_LAYER_COVERAGE_FOR_HIGH``) and that
+       enough Shapley weight sits on calibrated scorecards
+       (``evidence_coverage >= MIN_EVIDENCE_COVERAGE_FOR_HIGH``). A report
+       whose layers silently defaulted to neutral is demoted to LOW — the
+       pivot's rule that a signal whose layers cannot compute is not
+       surfaced. Callers that pass no coverage keep the pre-gate behaviour.
     """
     if conviction < 0.3:
         return "no_trade"
     if conviction < 0.7 or confidence < 0.55:
         return "low"
     if 0.55 <= confidence <= 0.85:
+        if (
+            layer_coverage_ratio < MIN_LAYER_COVERAGE_FOR_HIGH
+            or evidence_coverage < MIN_EVIDENCE_COVERAGE_FOR_HIGH
+        ):
+            return "low"
         return "high"
     return "medium"
+
+
+def _verdict_reason(
+    verdict: str,
+    conviction: float,
+    confidence: float,
+    *,
+    layer_coverage_ratio: float,
+    evidence_coverage: float,
+) -> str:
+    """One-line, operator-readable reason for the verdict."""
+    if conviction < 0.3:
+        return f"aggregate conviction {conviction:.2f} < 0.30"
+    if conviction < 0.7:
+        return f"aggregate conviction {conviction:.2f} < 0.70"
+    if confidence < 0.55:
+        return f"confidence {confidence:.2f} < 0.55"
+    if confidence > 0.85:
+        return f"confidence {confidence:.2f} in the saturated > 0.85 zone"
+    if layer_coverage_ratio < MIN_LAYER_COVERAGE_FOR_HIGH:
+        return (
+            f"only {layer_coverage_ratio:.0%} of adjuster layers computed "
+            f"(floor {MIN_LAYER_COVERAGE_FOR_HIGH:.0%})"
+        )
+    if evidence_coverage < MIN_EVIDENCE_COVERAGE_FOR_HIGH:
+        return (
+            f"only {evidence_coverage:.0%} of signal weight has a calibrated "
+            f"scorecard (floor {MIN_EVIDENCE_COVERAGE_FOR_HIGH:.0%})"
+        )
+    return f"{verdict}: conviction {conviction:.2f}, confidence {confidence:.2f}, coverage ok"
 
 
 # ── Shapley contribution extraction ───────────────────────────────────────
@@ -563,7 +759,7 @@ def build_provenance_report(
         log.debug(
             "signal_provenance: cooccurrence lift lookup failed: {e}", e=str(exc)
         )
-        cooccurrence_lift = 1.0
+        cooccurrence_lift = None
 
     # Confidence-bucket calibration (CAT-180): does the oracle's claimed
     # probability match reality in this bucket historically? Over-confident
@@ -579,7 +775,7 @@ def build_provenance_report(
         log.debug(
             "signal_provenance: confidence bucket lookup failed: {e}", e=str(exc)
         )
-        confidence_bucket_mult = 1.0
+        confidence_bucket_mult = None
 
     # Historical scenario analog multiplier (CAT-176): how did setups that
     # looked like TODAY'S macro snapshot actually play out? Uses PIT price
@@ -597,7 +793,7 @@ def build_provenance_report(
         log.debug(
             "signal_provenance: scenario multiplier lookup failed: {e}", e=str(exc)
         )
-        scenario_mult = 1.0
+        scenario_mult = None
 
     # Null hypothesis skeptic penalty (CAT-186): if the oracle barely
     # beats a dumb baseline on its recent history, haircut the conviction.
@@ -609,7 +805,7 @@ def build_provenance_report(
         log.debug(
             "signal_provenance: null-hypothesis penalty lookup failed: {e}", e=str(exc)
         )
-        null_penalty = 1.0
+        null_penalty = None
 
     today = date.today()
     direction_str = str(getattr(prediction, "direction", "") or "")
@@ -638,7 +834,7 @@ def build_provenance_report(
         log.debug(
             "signal_provenance: meta_learning lookup failed: {e}", e=str(exc)
         )
-        meta_mult = 1.0
+        meta_mult = None
 
     # Contra-indicator ensemble (CAT-184): is retail/sell-side extreme in
     # a direction that favors (or opposes) this trade?
@@ -652,7 +848,7 @@ def build_provenance_report(
         log.debug(
             "signal_provenance: contra lookup failed: {e}", e=str(exc)
         )
-        contra_mult = 1.0
+        contra_mult = None
 
     # Short squeeze composite (CAT-138): per-ticker squeeze loadedness —
     # bullish calls on high-squeeze names get a boost, bearish gets a
@@ -670,7 +866,7 @@ def build_provenance_report(
         log.debug(
             "signal_provenance: squeeze lookup failed: {e}", e=str(exc)
         )
-        squeeze_mult = 1.0
+        squeeze_mult = None
 
     # Prediction-market arbitrage (CAT-183): oracle-vs-Polymarket edge.
     try:
@@ -688,7 +884,7 @@ def build_provenance_report(
         log.debug(
             "signal_provenance: arbitrage lookup failed: {e}", e=str(exc)
         )
-        arb_mult = 1.0
+        arb_mult = None
 
     # Convergence scanner — the dots-connector. Scans congressional /
     # insider / dark-pool / options-flow / smart-money / 13F / social /
@@ -709,7 +905,7 @@ def build_provenance_report(
         log.debug(
             "signal_provenance: convergence scan failed: {e}", e=str(exc)
         )
-        convergence_mult = 1.0
+        convergence_mult = None
 
     # Money flow engine (14th adjuster layer). Walks the 8-layer
     # junction-point graph and returns [0.70, 1.30] based on whether
@@ -726,7 +922,7 @@ def build_provenance_report(
         log.debug(
             "signal_provenance: money flow lookup failed: {e}", e=str(exc)
         )
-        money_flow_mult = 1.0
+        money_flow_mult = None
 
     # ReasoningBank prior (15th adjuster layer). Counts outcome classes
     # of past distilled lessons matching this (ticker, direction, regime,
@@ -755,16 +951,17 @@ def build_provenance_report(
         log.debug(
             "signal_provenance: memory lesson lookup failed: {e}", e=str(exc)
         )
-        memory_lesson_mult = 1.0
+        memory_lesson_mult = None
 
-    aggregate = compute_aggregate_conviction(
+    # Prediction-level adjusters are absent (None) when the prediction object
+    # does not carry them, instead of reading as neutral.
+    fragility_raw = getattr(prediction, "fragility_multiplier", None)
+    disagreement_raw = getattr(prediction, "disagreement_score", None)
+
+    agg = aggregate_conviction_with_coverage(
         signal_evidence,
-        fragility_multiplier=float(
-            getattr(prediction, "fragility_multiplier", 1.0) or 1.0
-        ),
-        disagreement_score=float(
-            getattr(prediction, "disagreement_score", 0.0) or 0.0
-        ),
+        fragility_multiplier=(None if fragility_raw is None else float(fragility_raw)),
+        disagreement_score=(None if disagreement_raw is None else float(disagreement_raw)),
         red_team_epistemic_risk=float(red_team_epistemic_risk or 0.0),
         fudge_alert_count=len(fudge_alerts),
         cooccurrence_lift=cooccurrence_lift,
@@ -779,11 +976,26 @@ def build_provenance_report(
         money_flow_multiplier=money_flow_mult,
         memory_lesson_multiplier=memory_lesson_mult,
     )
+    aggregate = agg.value
 
     verdict = _verdict_from_aggregate(
         aggregate,
-        float(getattr(prediction, "confidence", 0.0) or 0.0),
+        conf_value,
+        layer_coverage_ratio=agg.layer_coverage_ratio,
+        evidence_coverage=agg.evidence_coverage,
     )
+    reason = _verdict_reason(
+        verdict,
+        aggregate,
+        conf_value,
+        layer_coverage_ratio=agg.layer_coverage_ratio,
+        evidence_coverage=agg.evidence_coverage,
+    )
+
+    def _or1(value: float | None) -> float:
+        # Report fields stay floats for API compatibility; absence is carried
+        # by layer_coverage, not by the number.
+        return 1.0 if value is None else float(value)
 
     return TradeProvenanceReport(
         ticker=ticker,
@@ -799,12 +1011,8 @@ def build_provenance_report(
         signal_evidence=signal_evidence,
         top_shapley_contributor=getattr(prediction, "shapley_top_contributor", "") or "",
         top_shapley_share=float(getattr(prediction, "shapley_top_share", 0.0) or 0.0),
-        fragility_multiplier=float(
-            getattr(prediction, "fragility_multiplier", 1.0) or 1.0
-        ),
-        disagreement_score=float(
-            getattr(prediction, "disagreement_score", 0.0) or 0.0
-        ),
+        fragility_multiplier=_or1(fragility_raw),
+        disagreement_score=(0.0 if disagreement_raw is None else float(disagreement_raw)),
         crowd_aligned=bool(getattr(prediction, "crowd_aligned", False)),
         market_implied_prob=float(
             getattr(prediction, "market_implied_prob", 0.0) or 0.0
@@ -812,18 +1020,23 @@ def build_provenance_report(
         red_team_epistemic_risk=float(red_team_epistemic_risk or 0.0),
         shipping_fudge_alerts=fudge_alerts,
         causation=causation,
-        cooccurrence_lift=cooccurrence_lift,
+        cooccurrence_lift=_or1(cooccurrence_lift),
         regime_calibrated_signal_count=regime_calibrated_count,
-        confidence_bucket_multiplier=confidence_bucket_mult,
-        scenario_multiplier=scenario_mult,
-        null_hypothesis_penalty=null_penalty,
-        meta_learning_multiplier=meta_mult,
-        contra_indicator_multiplier=contra_mult,
-        squeeze_multiplier=squeeze_mult,
-        arbitrage_multiplier=arb_mult,
-        convergence_multiplier=convergence_mult,
-        money_flow_multiplier=money_flow_mult,
-        memory_lesson_multiplier=memory_lesson_mult,
+        confidence_bucket_multiplier=_or1(confidence_bucket_mult),
+        scenario_multiplier=_or1(scenario_mult),
+        null_hypothesis_penalty=_or1(null_penalty),
+        meta_learning_multiplier=_or1(meta_mult),
+        contra_indicator_multiplier=_or1(contra_mult),
+        squeeze_multiplier=_or1(squeeze_mult),
+        arbitrage_multiplier=_or1(arb_mult),
+        convergence_multiplier=_or1(convergence_mult),
+        money_flow_multiplier=_or1(money_flow_mult),
+        memory_lesson_multiplier=_or1(memory_lesson_mult),
         aggregate_conviction=aggregate,
         verdict=verdict,
+        layer_coverage=dict(agg.layer_coverage),
+        layers_present=agg.layers_present,
+        layers_total=agg.layers_total,
+        evidence_coverage=agg.evidence_coverage,
+        verdict_reason=reason,
     )

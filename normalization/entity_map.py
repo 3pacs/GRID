@@ -640,6 +640,16 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "BINANCE:SOLUSDT:volume": "sol_total_volume",
     "BINANCE:TAOUSDT:close": "tao_chain_market_cap",
     "BINANCE:TAOUSDT:volume": "tao_chain_total_volume",
+    # Aliases for what ingestion/altdata/binance_puller.py actually writes
+    # (``binance.{SYMBOL}.{field}``, binance_puller.py:96). The colon-form keys
+    # above never matched a live row, so BTC/ETH/SOL klines sat in raw_series
+    # unresolved (LEVER-PACKAGE.md §5.2, data-plane audit Q1). Added 2026-09-10.
+    "binance.BTCUSDT.close": "btc_full",
+    "binance.BTCUSDT.volume": "btc_total_volume",
+    "binance.ETHUSDT.close": "eth_full",
+    "binance.ETHUSDT.volume": "eth_total_volume",
+    "binance.SOLUSDT.close": "sol_full",
+    "binance.SOLUSDT.volume": "sol_total_volume",
 
     # CoinGecko bulk
     "CG:bitcoin:close": "btc_full",            # TYPO-FIX: btc_close not in registry, btc_full exists
@@ -654,6 +664,9 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     # DeFi (DeFiLlama + DexScreener)
     "DEFILLAMA:solana_dex_volume": "dex_sol_volume_24h",
     "DEFILLAMA:solana_tvl": "dex_sol_liquidity",
+    # Alias for what ingestion/altdata/defi_llama_puller.py actually writes
+    # (``defillama.chain_tvl.{chain}``, defi_llama_puller.py:363). Added 2026-09-10.
+    "defillama.chain_tvl.solana": "dex_sol_liquidity",
     "DEXSCR:sol_txn_count": "dex_sol_txn_count_24h",
     "DEXSCR:sol_buy_sell_ratio": "dex_sol_buy_sell_ratio",
     "DEXSCR:sol_momentum_24h": "dex_sol_momentum_24h",

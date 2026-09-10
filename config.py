@@ -339,6 +339,15 @@ class Settings(BaseSettings):
     CIRCUIT_BREAKER_THRESHOLD: int = 3       # consecutive failures before halting
     CIRCUIT_BREAKER_COOLDOWN_HOURS: int = 24  # hours before probation
 
+    # Paid LLM providers (openai, openrouter, anthropic, huggingface) are hard-gated
+    # OFF unless this is explicitly True. Declared here because llm/router.py reads
+    # it via getattr(settings, ...) and pydantic-settings only binds env vars to
+    # declared fields (extra="ignore") — until 2026-09-10 the flag could never be
+    # turned on for the router. Set GRID_ALLOW_PAID_LLM=true in the environment to
+    # opt in; the Hermes bridge (intelligence/hermes/config.py) reads os.getenv
+    # directly and already honoured it.
+    GRID_ALLOW_PAID_LLM: bool = False
+
     # Gemma 4 main server is disabled until a live port-8080 Gemma service is restored.
     # The Gemma micro endpoints below remain separate and active.
     GEMMA_BASE_URL: str = "http://localhost:8080"

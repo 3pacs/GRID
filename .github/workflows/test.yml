@@ -114,6 +114,13 @@ jobs:
         working-directory: pwa
         run: npx tsc --noEmit
 
+      # The vitest suites (routes registry, canvas store, live activity,
+      # intelligence search, …) never ran in CI before 2026-09-10; tsc with
+      # checkJs=false validates almost nothing, so this is the real gate.
+      - name: Unit tests (vitest)
+        working-directory: pwa
+        run: npm run test
+
       - name: Build
         working-directory: pwa
         run: npm run build

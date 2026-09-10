@@ -112,10 +112,29 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as _c_exc:
         log.warning("Contracts subsystem startup skipped: {e}", e=str(_c_exc))
 
+    # ── Event bus PG LISTEN (cross-process → SSE) ──
+    # Contracts emitted in other processes (grid-hermes, grid-scheduler)
+    # reach this process only through pg_notify; the listener fans them out
+    # to SSE subscribers registered with remote=True (events/bus.py). Runs
+    # as a task so a slow connect never delays the first request.
+    try:
+        from events.bus import bus as _event_bus
+        from api.routers.sse import STREAM_CHANNELS as _stream_channels
+        from config import settings as _bus_settings
+
+        asyncio.create_task(_event_bus.start(_bus_settings.DB_URL, channels=_stream_channels))
+    except Exception as _bus_exc:
+        log.warning("Event bus listener not started: {e}", e=str(_bus_exc))
+
     log.info("GRID API accepting requests — background subsystems launching in thread")
     yield
 
     log.info("GRID API shutting down")
+    try:
+        from events.bus import bus as _event_bus_stop
+        await _event_bus_stop.stop()
+    except Exception:
+        pass
     if hasattr(app.state, "contracts_retry"):
         try:
             app.state.contracts_retry.stop()
@@ -409,6 +428,7 @@ for _label, _module_path, _required in [
     ("attributions", "api.routers.attributions", False),
     ("explain", "api.routers.explain", False),
     ("sector_health", "api.routers.sector_health", False),
+    ("realized_alpha", "api.routers.realized_alpha", False),
     ("user_intel", "api.routers.user_intel", False),
     ("snapshots", "api.routers.snapshots", False),
     ("postmortem_lessons", "api.routers.postmortem_lessons", False),
