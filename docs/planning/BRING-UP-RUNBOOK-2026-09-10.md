@@ -25,8 +25,9 @@ commands pass through unchanged.
 > files by hand. Never print or paste secrets (the DB password lives in
 > `docs/server-config.md` and the server `.env` next to `config.py`; refer to the file, never
 > echo the value; never echo `$GRID_API_TOKEN`). Use parameterized SQL only; never write
-> to `decision_journal`. Ask Anik only for the Gmail app password (Phase 6) and the admin
-> login (Phase 4). When you finish, or if you stop, file the session report on the
+> to `decision_journal`. Ask Anik only for the admin login (Phase 4). Never ask for, read, or print the
+> `hermes@stepdad.finance` app password: Anik writes it into the server `.env` himself
+> (Phase 6) and tells you when it is there. When you finish, or if you stop, file the session report on the
 > server: write the body to `/tmp/bringup_report.md` and run `ssh grid@100.75.185.36
 > agent-report gemini bring-up-2026-09-10 /tmp/bringup_report.md` (wrapper at
 > `/usr/local/bin/agent-report`; body = what changed, what was verified with the actual
@@ -250,24 +251,42 @@ ssh grid@100.75.185.36 'cd /home/grid/grid_v4/grid_repo && python3 -c "from aler
 ssh grid@100.75.185.36 'sudo -u postgres psql griddb -c "SELECT alert_type, entity_id, seen_at FROM alert_state WHERE alert_type = '"'"'hermes_daily_digest'"'"' ORDER BY seen_at DESC LIMIT 5"'
 ```
 
-Decision: if `mail.log` shows `deferred`/`bounced`/`relay access denied`, switch to an
-authenticated relay in the server `.env` (the documented fallback):
+Decision (Anik, 2026-09-10): regardless of what `mail.log` says, GRID sends as
+**`hermes@stepdad.finance`** through its provider's authenticated SMTP, not through local
+Postfix. The mailbox already exists (ROADMAP Phase 15). The app password for it is
+Anik's; **the executor never receives, requests, or prints it**. Anik edits the server
+`.env` (next to `config.py`, both trees if both have one) himself, or pastes the values
+into a terminal he controls:
 
 ```
-ALERT_SMTP_HOST=smtp.gmail.com
+ALERT_EMAIL_FROM=hermes@stepdad.finance
+ALERT_SMTP_HOST=smtp.gmail.com      # Google Workspace. If the domain's mail is Zoho use smtp.zoho.com; Fastmail smtp.fastmail.com — port and TLS stay the same
 ALERT_SMTP_PORT=587
 ALERT_SMTP_USE_TLS=true
-ALERT_SMTP_USER=stepdadfinance@gmail.com
-ALERT_SMTP_PASSWORD=<Gmail app password — Anik creates it at myaccount.google.com/apppasswords; never paste it in chat or a report>
-ALERT_EMAIL_FROM=stepdadfinance@gmail.com
+ALERT_SMTP_USER=hermes@stepdad.finance
+ALERT_SMTP_PASSWORD=<the app password Anik already has saved — Anik types it, nobody else>
+ALERT_EMAIL_TO=stepdadfinance@gmail.com   # keep; add a second recipient only if Anik says so
 ```
 
-Then `sudo systemctl restart grid-api grid-hermes`, re-run `send_test_email()`, and force
-one real digest: `curl -s -X POST -H "Authorization: Bearer $GRID_API_TOKEN"
-https://grid.stepdad.finance/api/v1/system/send-digest`.
+Executor steps once Anik confirms the `.env` is saved:
 
-Pass: the test email and the forced digest are in the stepdadfinance inbox (Anik confirms
-or forwards it); `alert_state` gains a `hermes_daily_digest` row with today's timestamp.
+```bash
+ssh grid@100.75.185.36 'cd /home/grid/grid_v4/grid_repo && grep -c "^ALERT_SMTP_USER=hermes@stepdad.finance" .env'   # expect 1; do NOT cat the file
+ssh grid@100.75.185.36 'sudo systemctl restart grid-api grid-hermes && sleep 8 && systemctl is-active grid-api grid-hermes'
+ssh grid@100.75.185.36 'cd /home/grid/grid_v4/grid_repo && python3 -c "from alerts.email import send_test_email; print(send_test_email())"'
+curl -s -X POST -H "Authorization: Bearer $GRID_API_TOKEN" https://grid.stepdad.finance/api/v1/system/send-digest
+ssh grid@100.75.185.36 'sudo journalctl -u grid-api --since "5 min ago" --no-pager | grep -i "newsletter\|digest\|smtp" | tail -10'
+```
+
+`alerts/email.py` forces STARTTLS for any non-localhost host and logs in only when
+`ALERT_SMTP_USER`/`PASSWORD` are set, so these six lines are the whole change. If the
+journal shows `535` (auth failed) the app password is wrong or 2-step verification is off
+for that account; if it shows `550`/`553` the From address is not allowed for that login
+(Workspace: the mailbox itself, or an alias registered under "Send mail as").
+
+Pass: the test email and the forced digest are in the stepdadfinance inbox from
+`hermes@stepdad.finance` (Anik confirms); `alert_state` gains a `hermes_daily_digest` row
+with today's timestamp; the 07:00 UTC and 08:00 UTC digests arrive the next morning.
 
 ## Phase 7 — State of affairs and gems (the report Anik asked for)
 

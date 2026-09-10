@@ -503,7 +503,10 @@ class Settings(BaseSettings):
     # Email alerts
     ALERT_EMAIL_ENABLED: bool = True
     ALERT_EMAIL_TO: str = "stepdadfinance@gmail.com"
-    ALERT_EMAIL_FROM: str = "grid-alerts@grid-svr"
+    # 2026-09-10: GRID sends as the Hermes mailbox (ROADMAP Phase 15). A bare
+    # "@grid-svr" sender through local Postfix is what Gmail dropped silently.
+    # Auth (ALERT_SMTP_USER/PASSWORD, host smtp.<provider>, 587, TLS) lives in .env.
+    ALERT_EMAIL_FROM: str = "hermes@stepdad.finance"
     ALERT_SMTP_HOST: str = "localhost"
     ALERT_SMTP_PORT: int = 25
     ALERT_SMTP_USER: str = ""
