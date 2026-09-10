@@ -234,6 +234,21 @@ class Settings(BaseSettings):
     OLLAMA_Z400_CHAT_MODEL: str = "qwen2.5:7b-instruct-q4_K_M"
     OLLAMA_Z400_EMBED_MODEL: str = "nomic-embed-text"
 
+    # Ollama on gridz4 (:11434) — distinct from the llama.cpp server on the
+    # same box (LLAMACPP_Z4_BASE_URL, gridz4:8080). Verified 2026-09-10 from
+    # grid-svr: peer active on a direct connection, serving
+    # `nomic-embed-text:latest` alongside qwen3-vl/qwen3:8b.
+    #
+    # This is the primary embedding node. It is the only *separate* tailnet
+    # machine currently answering with an embedding model — koala has been
+    # offline 48 days and z400 is no longer a tailnet peer at all — so it is
+    # what satisfies the operator's "use another machine on the tailnet".
+    OLLAMA_Z4_BASE_URL: str = "http://gridz4:11434"
+    OLLAMA_Z4_ENABLED: bool = True
+    OLLAMA_Z4_TIMEOUT_SECONDS: int = 120
+    OLLAMA_Z4_CHAT_MODEL: str = "qwen3:8b"
+    OLLAMA_Z4_EMBED_MODEL: str = "nomic-embed-text"
+
     # koala card 1 — Kokoro TTS server (CPU inference, FastAPI on :8091).
     # OpenAI-compatible /v1/audio/speech endpoint. 54 voices, 24kHz mono WAV.
     # Useful as a local replacement for OpenAI TTS in audio_briefing.py.
@@ -301,6 +316,47 @@ class Settings(BaseSettings):
     LLAMACPP_BATCH_ENABLED: bool = False
     LLAMACPP_BATCH_TIMEOUT_SECONDS: int = 600
     LLAMACPP_BATCH_CHAT_MODEL: str = "DeepSeekV4-Flash-158B-Q4_K_M"
+
+    # ------------------------------------------------------------------
+    # Embeddings — tailnet GPU Ollama nodes only.
+    #
+    # Until 2026-09-10 embeddings went to the CPU-only llama.cpp unit on
+    # grid-svr :8080 (via HYPERSPACE_BASE_URL), which was never started with
+    # ``--embeddings`` — every call returned HTTP 501 and the error log filled
+    # with `POST /v1/embeddings … 501`. Per the operator directive of the same
+    # day ("no CPU-only Qwens — use another machine on the tailnet"), that unit
+    # is retired and embeddings resolve through EMBED_PROVIDER_CHAIN instead.
+    #
+    # Order is by verified reachability, then by GPU contention.
+    #
+    # Probed from grid-svr 2026-09-10 (`tailscale status` + /api/tags):
+    #   ollama_z4     gridz4:11434  ACTIVE, direct, nomic-embed-text  <- primary
+    #   ollama_koala  koala:11434   offline, last seen 48 days ago
+    #   ollama_z400   z400:11434    not a tailnet peer at all
+    #   ollama        localhost     ACTIVE, nomic-embed-text        <- last resort
+    #
+    # gridz4 is what satisfies the operator's "use another machine on the
+    # tailnet" — it is the only *separate* box currently serving an embedding
+    # model. koala and z400 stay in the chain ahead of grid-svr so they resume
+    # duty automatically if they come back; both are ENABLED=false in the live
+    # .env, so a dead entry costs nothing (the factory returns None before any
+    # socket is opened). grid-svr is last because its Ollama shares the RTX
+    # 3090 with the REASON/ORACLE llama-server, and embedding batches there
+    # would evict the 27B chat model.
+    #
+    # ``llm.router.embed()`` walks this list and returns None when no node
+    # answers (graceful degradation — never raises). Per-node embed models are
+    # declared with their nodes above (OLLAMA_Z4_EMBED_MODEL, etc.).
+    EMBED_PROVIDER_CHAIN: str = "ollama_z4,ollama_koala,ollama_z400,ollama"
+    EMBED_MODEL: str = "nomic-embed-text"
+
+    # Google Gemini (paid frontier — gated by GRID_ALLOW_PAID_LLM like every
+    # other paid provider). Placed ahead of openrouter in the chat fallback
+    # chains per the operator's "if you can make Gemini do the work, that is
+    # best". Key lives in /etc/grid/gemini.env on grid-svr; never commit it.
+    GEMINI_BASE_URL: str = "https://generativelanguage.googleapis.com/v1beta"
+    GEMINI_CHAT_MODEL: str = "gemini-2.5-flash"
+    GEMINI_TIMEOUT_SECONDS: int = 120
 
     # Auth
     GRID_MASTER_PASSWORD_HASH: str = ""

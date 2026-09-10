@@ -30,7 +30,7 @@ debugging on the server).
 | # | Service | Port | Process | Location |
 |---|---------|------|---------|----------|
 | 1 | **PostgreSQL + TimescaleDB** | 5432 | Docker container `grid_db` | `~/grid_v4/grid_repo/grid/docker-compose.yml` |
-| 2 | **llama.cpp (Hermes 8B)** | 8080 | `llama-server` (CUDA, RTX PRO 4000) | `~/grid_v4/grid_repo/grid/vendor/llama.cpp/build/bin/llama-server` |
+| 2 | **llama.cpp (Qwen3.8-27B, RTX 3090)** | 8086 (shim on 8081) | `llama-server` (CUDA) | `/data/vendor/llama.cpp/build/bin/llama-server` |
 | 3 | **Crucix** | 3117 | Node.js app | `~/grid_v4/Crucix/` (has own `.env`) |
 | 4 | **GRID API (uvicorn)** | 8000 | `python3 -m uvicorn api.main:app` | `/data/grid_v4/grid_release` (deployed tree — see [Deploy Pipeline](#deploy-pipeline-grid-api) below) |
 | 5 | **Hermes Operator** | — | `python3 scripts/hermes_operator.py` | `~/grid_v4/grid_repo/grid/` |
@@ -61,7 +61,7 @@ cd ~/grid_v4/grid_repo/grid && python3 scripts/hermes_operator.py &
 
 ```bash
 pg_isready -U grid -d griddb                           # PostgreSQL
-curl -s localhost:8080/health                           # llama.cpp
+curl -s localhost:8081/health                           # llama.cpp shim -> :8086 (RTX 3090)
 curl -s localhost:3117                                  # Crucix
 curl -s localhost:8000/api/v1/system/health             # GRID API
 ps aux | grep hermes_operator                           # Hermes Operator
@@ -112,10 +112,64 @@ Service files in `server_setup/` — install with:
 ```bash
 sudo cp server_setup/grid-*.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable grid-db grid-api grid-llamacpp grid-hermes grid-crucix \
+sudo systemctl enable grid-db grid-api grid-hermes grid-crucix \
   grid-micro-classifier grid-micro-narrator grid-micro-extractor grid-micro-mapper
-sudo systemctl start grid-db grid-llamacpp grid-crucix grid-api grid-hermes \
+sudo systemctl start grid-db grid-crucix grid-api grid-hermes \
   grid-micro-classifier grid-micro-narrator grid-micro-extractor grid-micro-mapper
+```
+
+## Retired: `grid-llamacpp` on :8080 (2026-09-10)
+
+`grid-llamacpp.service` ran `Qwen3.6-27B-Q4_K_M.gguf` with `LLAMACPP_NGL=0` —
+CPU-only inference holding **17.9 GB of RAM**. It was also the only thing GRID
+ever asked for embeddings, via `HYPERSPACE_BASE_URL` defaulting to
+`http://localhost:8080/v1`; llama-server was never started with `--embeddings`,
+so every one of those calls returned **HTTP 501** and the unit's journal
+contained nothing else.
+
+The operator's directive of 2026-09-10 — *"there should be no CPU-only Qwens —
+use another machine on the tailnet"* — retired it:
+
+```bash
+sudo systemctl disable --now grid-llamacpp
+```
+
+`server_setup/grid-llamacpp.service` was deleted from the repo so a future
+`cp server_setup/grid-*.service` cannot resurrect it. **Do not recreate it.**
+GPU inference is unaffected — it lives on :8086 behind the :8081 shim.
+
+Where its traffic went:
+
+| Old consumer of :8080 | Now |
+|---|---|
+| Embeddings (`hyperspace/embeddings.py`) | `llm.router.embed()` → `EMBED_PROVIDER_CHAIN` (gridz4 → koala → z400 → grid-svr Ollama, all `nomic-embed-text`) |
+| `gemma` provider (`GEMMA_BASE_URL`) | Removed from every `_fallback_chain`; it had been `GEMMA_ENABLED=false` and dead already |
+| Chat/REASON | Unaffected — `LLAMACPP_BASE_URL` already pointed at the RTX 3090 (`:8086`), not `:8080` |
+
+### Embedding nodes — reachability probed 2026-09-10
+
+| Node | Endpoint | State | Role |
+|---|---|---|---|
+| gridz4 | `gridz4:11434` | active, direct | **primary** — the "another machine on the tailnet" |
+| koala | `koala:11434` | **offline, last seen 48d ago** | in chain, resumes automatically if it returns |
+| z400 | `z400:11434` | **not a tailnet peer** | in chain, resumes automatically if it returns |
+| grid-svr | `localhost:11434` | active | last resort — shares the RTX 3090 with the chat model |
+
+`redbox:11434` has no Ollama (it serves llama.cpp on `:8080`); `ocr-node` and
+`panda` have been offline 31 and 18 days.
+
+Note `ollama_z4` (gridz4 **:11434**, Ollama) is a different daemon from
+`llamacpp_z4` (gridz4 **:8080**, llama.cpp). Both live on gridz4.
+
+Embedding health check:
+
+```bash
+# primary
+curl -s -m 10 http://gridz4:11434/api/embeddings \
+  -d '{"model":"nomic-embed-text","prompt":"probe"}' | head -c 80
+# last resort
+curl -s -m 10 http://localhost:11434/api/embeddings \
+  -d '{"model":"nomic-embed-text","prompt":"probe"}' | head -c 80
 ```
 
 ## Public Access (Cloudflare Tunnel)
