@@ -353,6 +353,31 @@ def run_intelligence_loop() -> None:
 
     _sched.every().day.at("02:15").do(_calibration_snapshot_and_drift)
 
+    def _realized_alpha_daily() -> None:
+        """GRID-4 §8.1 truth gate: rolling realized alpha vs SPY, net of
+        5 bp/side, for every paper trade and scored oracle prediction.
+
+        Runs 06:30 UTC — after the 02:15 calibration snapshot and the 06:00
+        daily context, before US cash open — and upserts one row per
+        (as_of, source, horizon) into realized_alpha_daily plus the
+        per-trade decomposition into realized_alpha_trades.
+        """
+        try:
+            from db import get_engine as _ge
+            from alpha_research.realized_alpha import run_daily
+            summary = run_daily(_ge())
+            log.info(
+                "realized alpha daily: {s} scored, {k} skipped, spy={spy}, "
+                "headline={h}",
+                s=summary.get("scored", 0), k=summary.get("skipped", 0),
+                spy=summary.get("spy_feature"),
+                h=summary.get("headline_annualized"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("realized alpha daily failed: {e}", e=str(exc))
+
+    _sched.every().day.at("06:30").do(_realized_alpha_daily)
+
     # ── SWEEP: new puller hooks (CAT-25/27/30/49/71/81) ────────────────
 
     def _fed_h8_weekly() -> None:
