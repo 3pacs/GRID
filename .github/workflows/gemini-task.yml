@@ -29,13 +29,13 @@ on:
         type: boolean
         default: true
       cli:
-        description: "CLI command on the server (agy = the installed Gemini/Antigravity CLI; or gemini)"
+        description: "CLI command on the server (agy = the installed Gemini/Antigravity CLI; or gemini). An absolute path is used as-is."
         type: string
         default: "agy"
       mode:
-        description: "run = execute the prompt; help = only print the CLI's version and --help so the caller learns its flags"
+        description: "run = execute the prompt; help = only print the CLI's version and --help; diag = print PATH/CLI discovery info without needing the CLI"
         type: choice
-        options: [run, help]
+        options: [run, help, diag]
         default: "run"
 
 jobs:
@@ -51,18 +51,92 @@ jobs:
       CLI: ${{ inputs.cli }}
       MODE: ${{ inputs.mode }}
     steps:
+      - name: Diag
+        if: ${{ inputs.mode == 'diag' }}
+        shell: bash
+        run: |
+          set +e
+          {
+            echo "## Gemini runner diag"
+            echo '```'
+            echo "id -un: $(id -un)"
+            echo "HOME: $HOME"
+            echo "PATH: $PATH"
+            echo "--- nvm node bin dirs ---"
+            ls -d "$HOME"/.nvm/versions/node/*/bin 2>/dev/null
+            echo "--- candidate bins (npm-global, .local, /usr/local/bin) ---"
+            ls "$HOME"/.npm-global/bin "$HOME"/.local/bin /usr/local/bin 2>/dev/null | grep -iE 'agy|gemini|antigravity|node|npm'
+            echo "--- command -v -a ---"
+            command -v -a agy gemini node npm 2>/dev/null
+            echo "--- gemini.env ---"
+            test -r /etc/grid/gemini.env && echo "gemini.env: present" || echo "gemini.env: missing"
+            echo "--- /etc/grid listing ---"
+            ls -la /etc/grid 2>/dev/null
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Lanes check
+        if: ${{ inputs.mode != 'diag' }}
         shell: bash
         run: |
           set -euo pipefail
           if [ -f /etc/grid/gemini.env ]; then set -a; . /etc/grid/gemini.env; set +a; fi
           [ -n "${GEMINI_API_KEY:-}" ] && echo "GEMINI_API_KEY: set via /etc/grid/gemini.env" || echo "GEMINI_API_KEY: not in /etc/grid/gemini.env (fine if $CLI is logged in with the runner user's own credentials)"
-          command -v "$CLI" >/dev/null || { echo "$CLI not on PATH for the runner user ($(id -un)); PATH=$PATH"; ls -la /usr/local/bin /usr/bin 2>/dev/null | grep -iE "agy|gemini" ; exit 2; }
-          echo "cli=$(command -v "$CLI") version=$("$CLI" --version 2>&1 | head -1) | model=$MODEL | workdir=$WORKDIR | yolo=$YOLO | mode=$MODE"
+
+          # Resolve the CLI: accept an absolute path as-is, otherwise widen PATH
+          # to cover the places an interactively-installed CLI is likely to live
+          # (nvm, npm-global, ~/.local/bin) before giving up.
+          RESOLVED_CLI=""
+          case "$CLI" in
+            /*)
+              if [ -x "$CLI" ]; then RESOLVED_CLI="$CLI"; fi
+              ;;
+          esac
+          if [ -z "$RESOLVED_CLI" ]; then
+            if [ -f "$HOME/.nvm/nvm.sh" ]; then
+              # shellcheck disable=SC1091
+              . "$HOME/.nvm/nvm.sh"
+              nvm use default >/dev/null 2>&1 || true
+            fi
+            for d in "$HOME/.npm-global/bin" "$HOME/.local/bin" "$HOME"/.nvm/versions/node/*/bin; do
+              if [ -d "$d" ]; then PATH="$d:$PATH"; fi
+            done
+            export PATH
+            if command -v "$CLI" >/dev/null 2>&1; then
+              RESOLVED_CLI="$(command -v "$CLI")"
+            fi
+          fi
+
+          if [ -z "$RESOLVED_CLI" ]; then
+            echo "$CLI not on PATH for the runner user ($(id -un)) even after checking nvm/.npm-global/.local/bin; PATH=$PATH"
+            {
+              echo "## Gemini runner diag (CLI not found)"
+              echo '```'
+              echo "id -un: $(id -un)"
+              echo "HOME: $HOME"
+              echo "PATH: $PATH"
+              echo "--- nvm node bin dirs ---"
+              ls -d "$HOME"/.nvm/versions/node/*/bin 2>/dev/null
+              echo "--- candidate bins (npm-global, .local, /usr/local/bin) ---"
+              ls "$HOME"/.npm-global/bin "$HOME"/.local/bin /usr/local/bin 2>/dev/null | grep -iE 'agy|gemini|antigravity|node|npm'
+              echo "--- command -v -a ---"
+              command -v -a agy gemini node npm 2>/dev/null
+              echo "--- gemini.env ---"
+              test -r /etc/grid/gemini.env && echo "gemini.env: present" || echo "gemini.env: missing"
+              echo "--- /etc/grid listing ---"
+              ls -la /etc/grid 2>/dev/null
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 2
+          fi
+
+          echo "RESOLVED_CLI=$RESOLVED_CLI" >> "$GITHUB_ENV"
+          echo "PATH=$PATH" >> "$GITHUB_ENV"
+          echo "cli=$RESOLVED_CLI version=$("$RESOLVED_CLI" --version 2>&1 | head -1) | model=$MODEL | workdir=$WORKDIR | yolo=$YOLO | mode=$MODE"
           test -d "$WORKDIR"
           if [ "$MODE" = "help" ]; then
-            echo "----- $CLI --help -----"; "$CLI" --help 2>&1 | head -120
-            { echo "## $CLI --help"; echo '```'; "$CLI" --help 2>&1 | head -120; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            echo "----- $RESOLVED_CLI --help -----"; "$RESOLVED_CLI" --help 2>&1 | head -120
+            { echo "## $RESOLVED_CLI --help"; echo '```'; "$RESOLVED_CLI" --help 2>&1 | head -120; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Run task
@@ -72,9 +146,19 @@ jobs:
           set +e
           if [ -f /etc/grid/gemini.env ]; then set -a; . /etc/grid/gemini.env; set +a; fi
           cd "$WORKDIR"
-          extra=""; [ "$YOLO" = "true" ] && extra="--yolo"
+          # Flag set differs by CLI: agy (Antigravity CLI) takes --model/-p/--output-format
+          # and --dangerously-skip-permissions instead of gemini-cli's -m/--yolo.
+          cli_name="$(basename "$RESOLVED_CLI")"
+          if [ "$cli_name" = "agy" ] || [ "$cli_name" = "agy.real" ]; then
+            args=(--model "$MODEL" -p "$PROMPT" --output-format text)
+            [ "$YOLO" = "true" ] && args+=(--dangerously-skip-permissions)
+          else
+            args=(-m "$MODEL")
+            [ "$YOLO" = "true" ] && args+=(--yolo)
+            args+=(-p "$PROMPT")
+          fi
           echo "----- prompt (first 40 lines) -----"; printf '%s\n' "$PROMPT" | head -40; echo "-----"
-          timeout 80m "$CLI" -m "$MODEL" $extra -p "$PROMPT" > /tmp/gemini_task.log 2>&1
+          timeout 80m "$RESOLVED_CLI" "${args[@]}" > /tmp/gemini_task.log 2>&1
           rc=$?
           echo "exit=$rc"
           tail -c 60000 /tmp/gemini_task.log
