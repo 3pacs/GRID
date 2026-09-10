@@ -383,6 +383,42 @@ def test_curated_run_ensures_the_merged_into_column_and_full_scope_does_not() ->
         assert result["nodes"] == 0        # empty graph short-circuits, no writes
 
 
+def test_ensure_merged_into_column_never_takes_down_its_caller() -> None:
+    """ALTER TABLE needs ownership even as a no-op, and the weekly curated job
+    runs as the unprivileged `grid` role — a convenience DDL must not fail it."""
+    calls: list[str] = []
+
+    def ok(sql: str, params=None):
+        calls.append(sql)
+        return []
+
+    with patch.dict("sys.modules", {"db": MagicMock(execute_sql=ok)}):
+        ai.ensure_merged_into_column()
+    assert calls == [ai.MERGED_INTO_DDL, ai.MERGED_INTO_INDEX_DDL]
+
+    def denied(sql: str, params=None):
+        raise RuntimeError("permission denied: must be owner of table actors")
+
+    with patch.dict("sys.modules", {"db": MagicMock(execute_sql=denied)}):
+        ai.ensure_merged_into_column()      # warns, does not raise
+
+
+@needs_networkx
+def test_curated_run_survives_a_denied_ensure() -> None:
+    """The point of the tolerance: the real curated path still runs when the
+    role cannot ALTER the table (the column is already there via the migration)."""
+    from scripts import graph_analytics as ga
+
+    def denied(sql: str, params=None):
+        raise RuntimeError("permission denied: must be owner of table actors")
+
+    # The real ensure_merged_into_column runs, hits the denial, warns, returns.
+    with patch.dict("sys.modules", {"db": MagicMock(execute_sql=denied)}), \
+         patch.object(ga, "load_actor_graph", return_value=nx.DiGraph()) as load:
+        result = ga.run_graph_analytics(scope="curated")
+    assert load.call_count == 1 and result["nodes"] == 0
+
+
 def test_merged_into_ddl_is_idempotent_and_matches_the_migration() -> None:
     from pathlib import Path
 

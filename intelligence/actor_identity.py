@@ -336,8 +336,33 @@ MERGED_INTO_INDEX_DDL = (
 
 
 def ensure_merged_into_column() -> None:
-    """Idempotently ensure ``actors.merged_into`` and its partial index exist."""
+    """Best-effort: ensure ``actors.merged_into`` and its partial index exist.
+
+    The migration is the contract; this is the convenience that lets a tree
+    which has not applied it keep working. It must therefore never take down
+    its callers — ``run_graph_analytics(scope="curated")`` is a read path, and
+    the weekly Hermes job runs it as the unprivileged ``grid`` role.
+
+    PostgreSQL requires table ownership for ``ALTER TABLE``, even when
+    ``ADD COLUMN IF NOT EXISTS`` is a no-op. So if the migration created the
+    column as ``postgres`` and ``grid`` does not own ``actors``, this DDL
+    raises on a database that is in fact perfectly set up. Swallowing that is
+    strictly better than failing: when the column really is missing, the query
+    that needs it fails next with ``column a.merged_into does not exist``,
+    which names the problem more precisely than a permission error would, and
+    the warning below names the remedy.
+    """
     from db import execute_sql
 
-    execute_sql(MERGED_INTO_DDL)
-    execute_sql(MERGED_INTO_INDEX_DDL)
+    for statement in (MERGED_INTO_DDL, MERGED_INTO_INDEX_DDL):
+        try:
+            execute_sql(statement)
+        except Exception as exc:  # noqa: BLE001 - convenience DDL, never fatal
+            log.warning(
+                "actor_identity: could not ensure actors.merged_into ({e}) — "
+                "harmless if migrations/0061_actors_merged_into.sql has been "
+                "applied as the postgres role; apply it if the curated graph "
+                "query then reports the column missing",
+                e=str(exc).strip()[:200],
+            )
+            return
