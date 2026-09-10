@@ -28,6 +28,7 @@ import LayerControls from './LayerControls.jsx';
 import TemporalScrubber from './TemporalScrubber.jsx';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts.js';
 import { useCommunities } from './hooks/useCommunities.js';
+import { useEventStream } from '../hooks/useEventStream.js';
 import { EDGE_LEGEND } from '../components/canvas/nodeStyles.js';
 
 // ── Lens lenses — lazy-loaded to keep the graph bundle lean ──
@@ -728,6 +729,19 @@ export default function GothamCanvas() {
     const [canvasStatus, setCanvasStatus] = useState(null);
     const nameInputRef = useRef(null);
     const sigmaRef = useRef(null);
+
+    // ── Live signal pulses ──
+    // Typed contracts (SignalFired, ActorMaterialized, PredictionScored,
+    // RegimeTransition…) arrive over /api/v1/events/stream; any node the
+    // payload names pulses in place for ACTIVITY_TTL_MS. Layout is untouched.
+    const onLiveEvent = useCallback((evt) => {
+        useCanvasStore.getState().markActivity(evt);
+    }, []);
+    useEventStream({ onEvent: onLiveEvent });
+    useEffect(() => {
+        const timer = setInterval(() => useCanvasStore.getState().decayActivity(), 5000);
+        return () => clearInterval(timer);
+    }, []);
 
     const getBoardIdFromHash = useCallback(() => parseCanvasHash().boardId, []);
 

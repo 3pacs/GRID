@@ -247,7 +247,127 @@ const useCanvasStore = create((set, get) => ({
      * setBoards — update the list of saved boards.
      */
     setBoards: (boards) => set({ boards }),
+
+    // ── Live activity (contracts → SSE → node pulse) ──
+    activity: {},              // nodeId → { at, channel, count }
+    lastActivityEvent: null,   // { channel, timestamp, matched: [nodeId] }
+
+    /**
+     * markActivity — pulse every node the event refers to.
+     *
+     * Mutates node attributes on the existing graphology instance instead of
+     * replacing the graph: Sigma re-renders from attribute events, and a new
+     * graph object would re-run ForceAtlas2 and move the layout on every
+     * pulse. Returns the matched node ids.
+     */
+    markActivity: (event) => {
+        const keys = activityKeysFromEvent(event);
+        if (!keys.size) return [];
+        const g = get().graph;
+        const now = Date.now();
+        const hits = [];
+        g.forEachNode((id, attrs) => {
+            if (!_nodeMatchesKeys(id, attrs, keys)) return;
+            const baseSize = attrs.baseSize ?? attrs.size ?? 5;
+            g.mergeNodeAttributes(id, {
+                baseSize,
+                size: baseSize * ACTIVITY_SIZE_BOOST,
+                highlighted: true,
+                activityAt: now,
+                activityChannel: event?.channel || null,
+            });
+            hits.push(id);
+        });
+        if (!hits.length) return [];
+        const activity = { ...get().activity };
+        hits.forEach((id) => {
+            const prev = activity[id];
+            activity[id] = { at: now, channel: event?.channel || null, count: (prev?.count || 0) + 1 };
+        });
+        set({
+            activity,
+            lastActivityEvent: { channel: event?.channel || null, timestamp: event?.timestamp || null, matched: hits },
+        });
+        return hits;
+    },
+
+    /**
+     * decayActivity — restore nodes whose pulse is older than maxAgeMs.
+     * Returns true when anything changed.
+     */
+    decayActivity: (maxAgeMs = ACTIVITY_TTL_MS) => {
+        const g = get().graph;
+        const now = Date.now();
+        const activity = { ...get().activity };
+        let changed = false;
+        Object.keys(activity).forEach((id) => {
+            if (now - activity[id].at < maxAgeMs) return;
+            delete activity[id];
+            changed = true;
+            if (g.hasNode(id)) {
+                const attrs = g.getNodeAttributes(id);
+                g.mergeNodeAttributes(id, {
+                    size: attrs.baseSize ?? attrs.size,
+                    highlighted: false,
+                    activityAt: null,
+                    activityChannel: null,
+                });
+            }
+        });
+        if (changed) set({ activity });
+        return changed;
+    },
 }));
+
+// ── Live activity helpers ──
+export const ACTIVITY_TTL_MS = 45000;
+export const ACTIVITY_SIZE_BOOST = 1.6;
+
+// Contract payload fields that name an entity (contracts/schemas.py).
+const ACTIVITY_KEY_FIELDS = ['ticker', 'actor_id', 'actor_hint', 'canonical_name'];
+
+function _norm(value) {
+    if (value === null || value === undefined) return null;
+    const s = String(value).trim().toLowerCase();
+    return s.length ? s : null;
+}
+
+/**
+ * activityKeysFromEvent — the lowercased identity strings an SSE event
+ * carries. Accepts the Event envelope ({channel, payload, timestamp}) or a
+ * bare payload.
+ */
+export function activityKeysFromEvent(event) {
+    const payload = event?.payload && typeof event.payload === 'object' ? event.payload : (event || {});
+    const keys = new Set();
+    ACTIVITY_KEY_FIELDS.forEach((field) => {
+        const k = _norm(payload[field]);
+        if (k) keys.add(k);
+    });
+    if (Array.isArray(payload.aliases)) {
+        payload.aliases.forEach((alias) => {
+            const k = _norm(alias);
+            if (k) keys.add(k);
+        });
+    }
+    return keys;
+}
+
+function _nodeMatchesKeys(id, attrs, keys) {
+    const candidates = [
+        id,
+        attrs?.entityId,
+        attrs?.ticker,
+        attrs?.label,
+        attrs?.data?.name,
+        attrs?.data?.id,
+        attrs?.data?.actor_id,
+    ];
+    return candidates.some((c) => {
+        const k = _norm(c);
+        return k !== null && keys.has(k);
+    });
+}
 
 // ── Node size helper ──
 // Returns size in range 3-12px. Actors scale by influence, others are smaller.

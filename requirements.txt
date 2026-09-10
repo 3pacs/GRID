@@ -5,6 +5,7 @@
 
 # Database
 psycopg2-binary>=2.9.12
+asyncpg>=0.29.0  # LISTEN only: cross-process contract events → SSE (events/bus.py); the sync engine stays psycopg2
 sqlalchemy>=2.0.0
 alembic>=1.13.0
 
