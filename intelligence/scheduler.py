@@ -381,6 +381,24 @@ def run_intelligence_loop() -> None:
 
     _sched.every().sunday.at("05:30").do(_long_plays_weekly)
 
+    def _curated_graph_analytics_weekly() -> None:
+        """Louvain communities / PageRank on the curated (named market actor) subgraph.
+
+        The full actor graph is 3.4M nodes dominated by the ICIJ / PEP /
+        sanctions dumps, so its communities describe offshore service
+        providers. This weekly pass writes ``actor_analytics_curated``, which
+        the lever map reads for its actor-community section.
+        """
+        try:
+            from scripts.graph_analytics import run_graph_analytics
+
+            result = run_graph_analytics(scope="curated")
+            log.info("curated graph analytics weekly: {r}", r=result)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("curated graph analytics weekly failed: {e}", e=str(exc))
+
+    _sched.every().sunday.at("04:30").do(_curated_graph_analytics_weekly)
+
     # ── Trial gems → enriched small caps → board (daily chain, 2026-09-10) ──
     # Hermes' _SOURCE_REGISTRY carries interval_h for these but nothing runs
     # fn-based entries on that interval, and the 06:00 cron for the ingestor
