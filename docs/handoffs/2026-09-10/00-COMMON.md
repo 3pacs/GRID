@@ -65,7 +65,17 @@ runner (`runs-on: [self-hosted, grid-svr]`):
 
 `gemini-task.yml` (workflow_dispatch; inputs `prompt`, `model`, `workdir`,
 `yolo`, `cli`) runs the Gemini CLI (`agy`) on grid-svr with the repo as cwd and
-returns the transcript as the job log and an artifact. Use it for anything that
+returns the transcript as the job log and an artifact.
+
+Two corrections from first real use:
+
+- **`/etc/grid/gemini.env` does not exist** on the box. `GEMINI_API_KEY` lives in
+  the repo `.env`. The workflow's Lanes check tolerates the missing file.
+- **`agy` matches models on display name, not API id.** `gemini-flash-latest` is
+  rejected. Its catalog: Gemini 3.8 / 3.7 / 3.6 Flash (High, Medium, Low),
+  Gemini 3.1 Pro (High, Low), Claude Sonnet 4.6 (Thinking), Claude Opus 4.6
+  (Thinking), GPT-OSS 120B (Medium). The workflow defaults to
+  `Gemini 3.8 Flash (High)`. Use it for anything that
 is mostly "run things on the box and report": log audits, FRED lookups, service
 checks, data probes. Keep code changes that need review in your own PR.
 
@@ -75,8 +85,26 @@ checks, data probes. Keep code changes that need review in your own PR.
   the :8081 shim; REASON + ORACLE), redbox `qwen3.8-27b` (100.126.129.45:8080, LOCAL),
   gridz4 `Qwen3.8-27B-Q4_K_M` (gridz4:8080), Ollama on grid-svr :11434
   (`qwen3.8:27b`, `gemma3:12b-it-q4_K_M`, `qwen3-vl`, `nomic-embed-text`).
-  Tailnet Ollama nodes with `nomic-embed-text`: koala:11434, z400:11434
-  (ocr-node:11434 has gemma3 + vision).
+  Tailnet embed nodes — **corrected 2026-09-10 after probing from grid-svr**;
+  the earlier claim that koala and z400 carry `nomic-embed-text` was wrong:
+
+  | host | tailnet | state |
+  |---|---|---|
+  | gridz4 | 100.68.9.27 | **ACTIVE**, `nomic-embed-text:latest` on **:11434** — the only live one |
+  | koala | 100.123.236.28 | offline, last seen 48 d ago |
+  | z400 | — | not a tailnet peer at all |
+  | ocr-node | — | offline 31 d (anything routing to `ollama_ocr` is dead) |
+  | panda | — | offline 18 d |
+  | redbox | 100.126.129.45 | llama.cpp on :8080, **no** Ollama on :11434 |
+
+  Note gridz4 runs two different servers: Ollama on **:11434** (`ollama_z4`,
+  embeddings) and llama.cpp on **:8080** (`llamacpp_z4`, chat). Don't conflate them.
+- `llamacpp` is **not** a :8080 provider. `config.py` points it at :8081 and the
+  live `.env` at 100.75.185.36:8086 — both the RTX 3090. The dead :8080 provider
+  was `gemma` (already disabled), now removed from the fallback chains.
+- The CPU-only `grid-llamacpp` unit on :8080 is **retired** (#427): disabled,
+  inactive, :8080 free, and `server_setup/grid-llamacpp.service` deleted so it
+  cannot be resurrected by copying the unit files back.
 - Operator directive 2026-09-10: **no CPU-only Qwen servers.** Use another GPU
   machine on the tailnet or a frontier model (Gemini preferred).
 - DB: PostgreSQL 15 + TimescaleDB, `griddb` on localhost:5432, app role `grid`.
