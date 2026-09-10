@@ -633,7 +633,7 @@ async def health():
 
 
 @app.post("/workers/register")
-async def register_worker(w: WorkerRegister):
+def register_worker(w: WorkerRegister):
     conn = get_conn()
     conn.autocommit = True
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -657,7 +657,7 @@ async def register_worker(w: WorkerRegister):
 
 
 @app.get("/workers")
-async def list_workers():
+def list_workers():
     conn = get_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT * FROM compute_workers ORDER BY id")
@@ -667,7 +667,7 @@ async def list_workers():
 
 
 @app.post("/workers/{worker_id}/heartbeat")
-async def worker_heartbeat(worker_id: int, active_jobs: Optional[int] = None):
+def worker_heartbeat(worker_id: int, active_jobs: Optional[int] = None):
     conn = get_conn()
     conn.autocommit = True
     cur = conn.cursor()
@@ -729,7 +729,7 @@ async def dry_run_job(payload: dict):
 
 
 @app.get("/jobs")
-async def list_jobs(state: Optional[str] = None, job_type: Optional[str] = None, limit: int = 50):
+def list_jobs(state: Optional[str] = None, job_type: Optional[str] = None, limit: int = 50):
     conn = get_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     query = "SELECT * FROM compute_jobs WHERE TRUE"
@@ -749,7 +749,7 @@ async def list_jobs(state: Optional[str] = None, job_type: Optional[str] = None,
 
 
 @app.get("/jobs/{job_id}")
-async def get_job(job_id: int):
+def get_job(job_id: int):
     conn = get_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT * FROM compute_jobs WHERE id=%s", (job_id,))
@@ -761,7 +761,7 @@ async def get_job(job_id: int):
 
 
 @app.get("/metadata/compute-inputs")
-async def compute_inputs(model_limit: int = 16, feature_limit: int = 20):
+def compute_inputs(model_limit: int = 16, feature_limit: int = 20):
     """Return coordinator-DB-valid IDs for external job producers."""
     conn = get_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -783,7 +783,7 @@ async def compute_inputs(model_limit: int = 16, feature_limit: int = 20):
 
 
 @app.post("/jobs/{job_id}/cancel")
-async def cancel_job(job_id: int):
+def cancel_job(job_id: int):
     conn = get_conn()
     conn.autocommit = True
     cur = conn.cursor()
@@ -793,7 +793,7 @@ async def cancel_job(job_id: int):
 
 
 @app.post("/jobs/claim")
-async def claim_job(
+def claim_job(
     worker_id: int,
     gpu_available: bool = False,
     ollama_available: bool = False,
@@ -874,7 +874,7 @@ async def claim_job(
 
 
 @app.post("/jobs/{job_id}/start")
-async def start_job(job_id: int, worker_id: int):
+def start_job(job_id: int, worker_id: int):
     conn = get_conn()
     conn.autocommit = True
     cur = conn.cursor()
@@ -884,13 +884,38 @@ async def start_job(job_id: int, worker_id: int):
     return {"status": "started", "job_id": job_id}
 
 
+def completion_already_recorded(cur, job_id: int) -> str | None:
+    """Return the job's terminal state when a result row already exists.
+
+    Workers retry ``/complete`` after a slow first response; without this
+    check the retry raised ``Invalid transition: COMPLETED -> COMPLETED``.
+    """
+    cur.execute("SELECT state FROM compute_jobs WHERE id=%s", (job_id,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    state = row["state"] if isinstance(row, dict) else row[0]
+    if state not in (JobState.COMPLETED.value, JobState.FAILED.value,
+                     JobState.VALID.value, JobState.ASSIMILATED.value):
+        return None
+    cur.execute("SELECT 1 FROM compute_results WHERE job_id=%s LIMIT 1", (job_id,))
+    return state if cur.fetchone() else None
+
+
 @app.post("/jobs/{job_id}/complete")
-async def complete_job(job_id: int, result: JobResult):
+def complete_job(job_id: int, result: JobResult):
     conn = get_conn()
     conn.autocommit = False
     cur = conn.cursor()
 
     try:
+        recorded = completion_already_recorded(cur, job_id)
+        if recorded:
+            conn.rollback()
+            log.info("Job #{id} completion already recorded (state={s}) — idempotent ack",
+                     id=job_id, s=recorded)
+            return {"status": "already_recorded", "job_id": job_id, "state": recorded}
+
         if result.error:
             transition_job(cur, job_id, JobState.FAILED, result.error, result.worker_id)
             cur.execute("UPDATE compute_jobs SET error_message=%s WHERE id=%s", (result.error, job_id))
@@ -919,7 +944,7 @@ async def complete_job(job_id: int, result: JobResult):
 
 
 @app.post("/jobs/{job_id}/validate")
-async def validate_job(job_id: int):
+def validate_job(job_id: int):
     conn = get_conn()
     conn.autocommit = True
     cur = conn.cursor()
@@ -929,7 +954,7 @@ async def validate_job(job_id: int):
 
 
 @app.post("/jobs/{job_id}/assimilate")
-async def assimilate_job(job_id: int):
+def assimilate_job(job_id: int):
     conn = get_conn()
     conn.autocommit = True
     cur = conn.cursor()
@@ -939,7 +964,7 @@ async def assimilate_job(job_id: int):
 
 
 @app.get("/stats")
-async def coordinator_stats():
+def coordinator_stats():
     conn = get_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 

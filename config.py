@@ -182,11 +182,11 @@ class Settings(BaseSettings):
     HERMES_HYPO_LLM_ENABLED: bool = False           # gate the LLM hypothesis second-opinion
     HERMES_HYPO_LLM_LIMIT: int = 10                 # top-N highest-conviction active hypos per run
 
-    # Ollama (local lightweight LLM — Qwen 7B)
+    # Ollama on grid-svr (qwen3.8:27b, gemma3:12b, qwen3-vl, nomic-embed-text)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_ENABLED: bool = True
     OLLAMA_TIMEOUT_SECONDS: int = 120
-    OLLAMA_CHAT_MODEL: str = "qwen3:8b"
+    OLLAMA_CHAT_MODEL: str = "qwen3.8:27b"
     OLLAMA_EMBED_MODEL: str = "nomic-embed-text"
 
     # Remote Ollama nodes — added 2026-05-09. Each has its own URL +
@@ -246,7 +246,10 @@ class Settings(BaseSettings):
     WHISPER_BASE_URL: str = "http://koala:8092"
     WHISPER_ENABLED: bool = True
 
-    # llama.cpp server on grid-svr Blackwell (Qwen3.6 27B GPU + mmproj, port 8081)
+    # llama.cpp on grid-svr (RTX 3090 24 GB): Qwen3.8-27B Q4_K_M + mmproj,
+    # llama-server on 100.75.185.36:8086 fronted by the :8081 shim. Verified
+    # 2026-09-10 — every GPU tier (this box, gridz4, redbox) serves Qwen 3.8;
+    # only the CPU-only :8080 unit still loads the Qwen3.6 GGUF.
     # Timeout MUST be < HERMES cycle timeout (600s in scripts/hermes_operator.py)
     # so that when Hermes blacklists a slow cycle, the in-flight HTTP call
     # also unwinds and the thread exits — otherwise we leak one stuck
@@ -258,14 +261,14 @@ class Settings(BaseSettings):
     LLAMACPP_BASE_URL: str = "http://localhost:8081"
     LLAMACPP_ENABLED: bool = True
     LLAMACPP_TIMEOUT_SECONDS: int = 300
-    LLAMACPP_CHAT_MODEL: str = "Qwen3-32B-Q4_K_M"
-    LLAMACPP_EMBED_MODEL: str = "Qwen3-32B-Q4_K_M"
+    LLAMACPP_CHAT_MODEL: str = "Qwen3.8-27B-Q4_K_M"
+    LLAMACPP_EMBED_MODEL: str = "Qwen3.8-27B-Q4_K_M"
 
-    # llama.cpp ORACLE server on grid-svr Blackwell.
+    # llama.cpp ORACLE server on grid-svr (same Qwen3.8-27B llama-server).
     LLAMACPP_ORACLE_BASE_URL: str = "http://localhost:8081"
     LLAMACPP_ORACLE_ENABLED: bool = True
     LLAMACPP_ORACLE_TIMEOUT_SECONDS: int = 300
-    LLAMACPP_ORACLE_CHAT_MODEL: str = "Qwen3-32B-Q4_K_M"
+    LLAMACPP_ORACLE_CHAT_MODEL: str = "Qwen3.8-27B-Q4_K_M"
     # Must fit inside LLAMACPP_ORACLE_TIMEOUT_SECONDS at the server's real
     # throughput (~27 tok/s) or every full-length call orphans mid-generation
     # and holds the single llama slot, bombarding the server. 6000 tok ~= 220s.
@@ -273,17 +276,17 @@ class Settings(BaseSettings):
     LLAMACPP_ORACLE_NUM_PREDICT: int = 6000
     LLAMACPP_ORACLE_MIN_NUM_PREDICT: int = 0
 
-    # llama.cpp QUICK-tier remote server (redbox node — Qwen3-14B, Tailscale-reachable)
+    # llama.cpp QUICK-tier remote server (redbox node — qwen3.8-27b, Tailscale-reachable)
     LLAMACPP_QUICK_BASE_URL: str = "http://100.126.129.45:8080"
     LLAMACPP_QUICK_ENABLED: bool = True
     LLAMACPP_QUICK_TIMEOUT_SECONDS: int = 120
-    LLAMACPP_QUICK_CHAT_MODEL: str = "qwen3-14b"
+    LLAMACPP_QUICK_CHAT_MODEL: str = "qwen3.8-27b"
 
-    # llama.cpp REASON-tier remote server (gridz4 node — Qwen3.6 35B A3B, Tailscale-reachable)
+    # llama.cpp REASON-tier remote server (gridz4 node — Qwen3.8-27B Q4_K_M + mmproj, Tailscale-reachable)
     LLAMACPP_Z4_BASE_URL: str = "http://gridz4:8080"
     LLAMACPP_Z4_ENABLED: bool = True
     LLAMACPP_Z4_TIMEOUT_SECONDS: int = 180
-    LLAMACPP_Z4_CHAT_MODEL: str = "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+    LLAMACPP_Z4_CHAT_MODEL: str = "Qwen3.8-27B-Q4_K_M"
     LLAMACPP_Z4_NUM_PREDICT: int = 512
     LLAMACPP_Z4_MIN_NUM_PREDICT: int = 0
     LLAMACPP_Z4_REASONING_HEADROOM: int = 0
@@ -401,7 +404,7 @@ class Settings(BaseSettings):
 
     # LLM task router — providers: openai | huggingface | anthropic | ollama | llamacpp | llamacpp_quick | llamacpp_z4 | openrouter | bitnet
     LLM_ROUTER_ENABLED: bool = True
-    LLM_LOCAL_PROVIDER: str = "llamacpp_quick"  # LOCAL tier — redbox Qwen3-14B
+    LLM_LOCAL_PROVIDER: str = "llamacpp_quick"  # LOCAL tier — redbox qwen3.8-27b
     LLM_REASON_PROVIDER: str = "llamacpp_quick"  # REASON tier — redbox until z4 is tuned
     LLM_ORACLE_PROVIDER: str = "llamacpp_oracle"  # ORACLE tier — heavier oracle path
     # Legacy keys — kept so old .env files don't break get_llm() fallback logic

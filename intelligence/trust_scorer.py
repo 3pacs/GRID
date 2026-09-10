@@ -22,7 +22,9 @@ as evidence accumulates. Recent signals are exponentially weighted (half-life 90
 from __future__ import annotations
 
 import json
+import logging
 import math
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -106,6 +108,92 @@ CHOKEPOINT_CROSSING_MIN_DELTA: float = 0.15
 
 # Minimum price move to count as a signal_typeal outcome
 MOVE_THRESHOLD_PCT: float = 1.0
+
+# ── Price lookup guards ────────────────────────────────────────────────────
+# 2026-09-10: the trust cycle was issuing ~11,000 failing yfinance downloads
+# a day. Every PENDING signal past its window with no stored close hit
+# yfinance twice per cycle, and ~250 of those tickers can never price
+# (pseudo tickers such as MACRO / NONE, warrants, delisted names, class
+# shares spelled BRK.A instead of BRK-A). The guards below keep the live
+# fetch to symbols yfinance can serve, remember dead symbols for a while,
+# and bound the raw_series lookup so it never walks the whole hypertable.
+
+#: How far back from the target date a stored close may be and still count.
+PRICE_LOOKBACK_DAYS: int = 45
+
+#: How long a symbol that returned no data stays out of the live fetch.
+YF_NO_DATA_TTL_HOURS: int = 72
+
+#: Symbols yfinance can plausibly serve: 1-6 alphanumerics, optional
+#: class/currency suffix (BRK-B, HVT-A, BTC-USD).
+_YF_SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9]{0,5}(-[A-Z]{1,3})?$")
+
+#: Placeholders that some feeds write into ``signal_sources.ticker``.
+_UNPRICEABLE_TICKERS: frozenset[str] = frozenset({
+    "MACRO", "NONE", "NA", "N/A", "NULL", "UNKNOWN", "MARKET", "CASH", "USD",
+})
+
+#: yfinance symbol -> when it last returned no data (UTC).
+_YF_NO_DATA: dict[str, datetime] = {}
+
+
+def yf_symbol(ticker: str) -> str:
+    """Return the yfinance spelling of *ticker* (class shares use a dash)."""
+    return (ticker or "").strip().upper().replace(".", "-")
+
+
+def is_priceable_ticker(ticker: str | None) -> bool:
+    """True when *ticker* is a symbol a price feed can plausibly serve."""
+    if not ticker:
+        return False
+    sym = yf_symbol(ticker)
+    if sym in _UNPRICEABLE_TICKERS:
+        return False
+    return bool(_YF_SYMBOL_RE.match(sym))
+
+
+def _yf_negative_cached(sym: str, now: datetime | None = None) -> bool:
+    """True when *sym* returned no data within YF_NO_DATA_TTL_HOURS."""
+    seen = _YF_NO_DATA.get(sym)
+    if seen is None:
+        return False
+    now = now or datetime.now(timezone.utc)
+    if now - seen > timedelta(hours=YF_NO_DATA_TTL_HOURS):
+        _YF_NO_DATA.pop(sym, None)
+        return False
+    return True
+
+
+def _remember_yf_no_data(sym: str, now: datetime | None = None) -> None:
+    _YF_NO_DATA[sym] = now or datetime.now(timezone.utc)
+
+
+def _last_close(frame: Any, target_date: date) -> float | None:
+    """Pick the last close at or before *target_date* from a yfinance frame.
+
+    Handles both the flat and the multi-level (ticker-keyed) column layouts
+    yfinance produces, and never calls ``float`` on a Series.
+    """
+    if frame is None or getattr(frame, "empty", True):
+        return None
+    try:
+        valid = frame[frame.index.date <= target_date]  # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001 — index without .date (unit tests, odd frames)
+        valid = frame
+    if getattr(valid, "empty", False):
+        valid = frame
+    if "Close" not in valid.columns:
+        return None
+    close = valid["Close"]
+    if getattr(close, "ndim", 1) == 2:
+        close = close.iloc[:, 0]
+    close = close.dropna()
+    if close.empty:
+        return None
+    value = float(close.iloc[-1])
+    if math.isnan(value) or math.isinf(value) or value <= 0:
+        return None
+    return value
 
 # Direction inference for ``score_pending_signals``. Pre-2026-05-13 the
 # scorer only recognised literal "BUY" and "SELL" — every other
@@ -363,11 +451,18 @@ def _get_price_near_date(
         if row:
             return float(row[0])
 
+        # Bounded on both sides: raw_series is a hypertable and an open
+        # lower bound walks every chunk for tickers with no stored closes.
         row = conn.execute(text("""
             SELECT value FROM raw_series
-            WHERE series_id = :sid AND obs_date <= :d AND pull_status = 'SUCCESS'
+            WHERE series_id = :sid AND obs_date <= :d AND obs_date >= :lo
+              AND pull_status = 'SUCCESS'
             ORDER BY obs_date DESC LIMIT 1
-        """), {"sid": f"YF:{ticker}:close", "d": target_date}).fetchone()
+        """), {
+            "sid": f"YF:{ticker}:close",
+            "d": target_date,
+            "lo": target_date - timedelta(days=PRICE_LOOKBACK_DAYS),
+        }).fetchone()
         if row:
             return float(row[0])
 
@@ -376,23 +471,31 @@ def _get_price_near_date(
 
 
 def _fetch_yfinance_price(ticker: str, target_date: date) -> float | None:
-    """Fetch price from yfinance. Graceful degradation if unavailable."""
+    """Fetch price from yfinance. Graceful degradation if unavailable.
+
+    Skips symbols yfinance cannot serve and symbols that returned no data
+    within ``YF_NO_DATA_TTL_HOURS``; silences yfinance's own error logger so
+    a dead symbol does not spray ``Failed download`` into the journal.
+    """
+    if not is_priceable_ticker(ticker):
+        return None
+    sym = yf_symbol(ticker)
+    now = datetime.now(timezone.utc)
+    if _yf_negative_cached(sym, now):
+        return None
     try:
         import yfinance as yf
 
+        logging.getLogger("yfinance").setLevel(logging.CRITICAL)
         start = target_date - timedelta(days=5)
         end = target_date + timedelta(days=5)
-        df = yf.download(ticker, start=str(start), end=str(end), progress=False)
-        if df.empty:
-            return None
-        valid = df[df.index.date <= target_date]  # type: ignore[union-attr]
-        if valid.empty:
-            valid = df
-        close_col = "Close"
-        if close_col not in valid.columns:
-            return None
-        return float(valid[close_col].iloc[-1])
+        df = yf.download(sym, start=str(start), end=str(end), progress=False)
+        price = _last_close(df, target_date)
+        if price is None:
+            _remember_yf_no_data(sym, now)
+        return price
     except Exception as exc:
+        _remember_yf_no_data(sym, now)
         log.debug("yfinance fallback failed for {t}: {e}", t=ticker, e=str(exc))
         return None
 
@@ -417,8 +520,20 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
 
     summary: dict[str, Any] = {
         "scored": 0, "correct": 0, "wrong": 0, "expired": 0,
-        "skipped_no_price": 0,
+        "skipped_no_price": 0, "skipped_unpriceable": 0,
     }
+
+    # One price lookup per (ticker, date) per cycle, and once a ticker has
+    # proven unpriceable in this cycle its remaining signals are skipped
+    # without touching the DB or yfinance again.
+    price_memo: dict[tuple[str, date], float | None] = {}
+    dead_tickers: set[str] = set()
+
+    def _price(ticker: str, d: date) -> float | None:
+        key = (ticker, d)
+        if key not in price_memo:
+            price_memo[key] = _get_price_near_date(engine, ticker, d)
+        return price_memo[key]
 
     with engine.begin() as conn:
         rows = conn.execute(text("""
@@ -456,21 +571,32 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
                 summary["expired"] += 1
                 continue
 
+            if not is_priceable_ticker(ticker):
+                summary["skipped_unpriceable"] += 1
+                continue
+            if ticker in dead_tickers:
+                summary["skipped_no_price"] += 1
+                continue
+
             # Get price at signal time if not stored
             entry_price = _extract_price(signal_value)
             if entry_price is None:
-                entry_price = _get_price_near_date(engine, ticker, signal_dt)
+                entry_price = _price(ticker, signal_dt)
             if entry_price is None or entry_price <= 0:
                 summary["skipped_no_price"] += 1
+                if _yf_negative_cached(yf_symbol(ticker)):
+                    dead_tickers.add(ticker)
                 continue
 
             # Get current/evaluation price
             eval_date = signal_dt + timedelta(days=eval_days)
             if eval_date > today:
                 eval_date = today
-            current_price = _get_price_near_date(engine, ticker, eval_date)
+            current_price = _price(ticker, eval_date)
             if current_price is None:
                 summary["skipped_no_price"] += 1
+                if _yf_negative_cached(yf_symbol(ticker)):
+                    dead_tickers.add(ticker)
                 continue
 
             # Compute return
@@ -503,9 +629,11 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
 
     log.info(
         "Signal scoring complete: {s} scored ({c} correct, {w} wrong, {e} expired), "
-        "{sk} skipped (no price)",
+        "{sk} skipped (no price), {su} skipped (unpriceable ticker), "
+        "{dead} tickers dead this cycle",
         s=summary["scored"], c=summary["correct"], w=summary["wrong"],
         e=summary["expired"], sk=summary["skipped_no_price"],
+        su=summary["skipped_unpriceable"], dead=len(dead_tickers),
     )
     return summary
 

@@ -34,13 +34,9 @@ from sqlalchemy.engine import Engine
 from normalization.entity_map import SEED_MAPPINGS, NEW_MAPPINGS_V2
 
 # ── Redundancy map cache ───────────────────────────────────────────────────
-# The DB scan inside build_redundancy_map() does a 4-way DISTINCT JOIN across
-# raw_series × source_catalog × resolved_series × feature_registry — that
-# scans millions of rows and takes minutes. Without a cache, any dashboard
-# widget polling /source-audit/* re-fires the same query, exhausts the DB
-# pool, and blocks every other request on the API (lever page, ticker
-# charts, everything). Cache the result per-engine for 30 minutes so the
-# slow scan runs at most once per TTL.
+# build_redundancy_map() is a pure merge of the entity map and the seed
+# hints (the DB scan was removed 2026-09-10 — see the function body).
+# Dashboard widgets poll /source-audit/*, so keep a 30-minute cache anyway.
 _REDUNDANCY_CACHE: dict[str, Any] = {"data": None, "ts": None}
 _REDUNDANCY_TTL_SECONDS: int = 1800
 
@@ -171,10 +167,8 @@ def build_redundancy_map(engine: Engine) -> dict[str, list[str]]:
         dict: feature_name -> list of raw series_ids that map to it.
     """
     # ── Cache fast-path ────────────────────────────────────────────────
-    # The DB scan below joins 4 tables with DISTINCT and takes minutes on
-    # the live corpus. Serving it from an in-process cache with a 30-min
-    # TTL kills the "everything is slow" symptom caused by dashboard
-    # widgets polling /source-audit/*.
+    # Cheap now (pure dict merge), but dashboard widgets poll
+    # /source-audit/* and the 30-min TTL keeps the result stable.
     now = datetime.now(timezone.utc)
     cached = _REDUNDANCY_CACHE.get("data")
     cached_ts = _REDUNDANCY_CACHE.get("ts")
@@ -195,32 +189,13 @@ def build_redundancy_map(engine: Engine) -> dict[str, list[str]]:
     for raw_id, feature_name in all_mappings.items():
         feature_to_sources[feature_name].append(raw_id)
 
-    # Also scan the database for raw_series -> feature_registry links via
-    # entity_map lookups already resolved in resolved_series.
-    try:
-        # LIMIT 50k is a safety cap — the prior unbounded DISTINCT scan
-        # holds a connection for minutes on the live corpus and starves
-        # the rest of the API pool. We only need enough rows to populate
-        # the redundancy map; hard-cap it.
-        with engine.connect() as conn:
-            conn.execute(text("SET LOCAL statement_timeout = '20s'"))
-            rows = conn.execute(text("""
-                SELECT DISTINCT rs.series_id, fr.name AS feature_name
-                FROM raw_series rs
-                JOIN source_catalog sc ON rs.source_id = sc.id
-                JOIN resolved_series res ON res.source_priority_used = sc.id
-                JOIN feature_registry fr ON res.feature_id = fr.id
-                WHERE rs.pull_status = 'SUCCESS'
-                LIMIT 50000
-            """)).fetchall()
-            for row in rows:
-                series_id, fname = row[0], row[1]
-                if series_id not in feature_to_sources[fname]:
-                    feature_to_sources[fname].append(series_id)
-    except Exception as exc:
-        log.warning(
-            "Could not scan DB for additional redundancy: {e}", e=str(exc),
-        )
+    # No DB scan. The old raw_series × source_catalog × resolved_series ×
+    # feature_registry join paired every raw series of a *source* with every
+    # feature that source ever resolved (a cartesian product, not a mapping —
+    # resolved_series carries no series_id), and it timed out on every Hermes
+    # cycle. The only real raw-series → feature mapping is the entity map
+    # above; ``engine`` is kept in the signature for callers and tests.
+    _ = engine
 
     # Merge seed redundancy hints
     for fname, sources in _SEED_REDUNDANCY.items():
