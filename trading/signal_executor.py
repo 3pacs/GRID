@@ -53,6 +53,27 @@ def _get_expected_lag(conn, hypothesis_id: int | None) -> int:
     return lag.get("expected_lag", _DEFAULT_EXPECTED_LAG)
 
 
+def resolve_hold_days(
+    strategy_horizon_days: int | None, expected_lag: int | None
+) -> int:
+    """Holding period for auto-close (LEVER-PACKAGE §7 T2.5).
+
+    The strategy's own ``horizon_days`` wins when set; otherwise the
+    hypothesis ``expected_lag``; otherwise the legacy 1-day default. Always
+    at least 1 so a trade is never closed on its entry day.
+    """
+    for candidate in (strategy_horizon_days, expected_lag):
+        if candidate is None:
+            continue
+        try:
+            value = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return _DEFAULT_EXPECTED_LAG
+
+
 def _compute_kelly_size(engine_obj: PaperTradingEngine, conn, strategy_id: str) -> float:
     """Compute position size from closed trades using Kelly criterion.
 
@@ -102,14 +123,14 @@ def execute_signals(engine: Engine) -> dict:
     # ------------------------------------------------------------------
     with engine.connect() as conn:
         strategies = conn.execute(text(
-            "SELECT id, hypothesis_id, leader, follower "
+            "SELECT id, hypothesis_id, leader, follower, horizon_days "
             "FROM paper_strategies WHERE status = 'ACTIVE'"
         )).fetchall()
 
     log.info("Signal executor: checking {n} active strategies", n=len(strategies))
 
     for strat in strategies:
-        strategy_id, hypothesis_id, leader, follower = strat
+        strategy_id, hypothesis_id, leader, follower, strategy_horizon_days = strat
         signals_checked += 1
 
         # Circuit breaker check — skip halted strategies
@@ -217,9 +238,13 @@ def execute_signals(engine: Engine) -> dict:
                                       s=strategy_id, t=open_trade[0])
 
                 # ----------------------------------------------------------
-                # 6. Close trades past expected_lag (ALWAYS runs)
+                # 6. Close trades past the holding period (ALWAYS runs).
+                #    Strategy horizon_days beats the hypothesis expected_lag
+                #    so long-horizon paper trades are not closed next day.
                 # ----------------------------------------------------------
-                expected_lag = _get_expected_lag(conn, hypothesis_id)
+                expected_lag = resolve_hold_days(
+                    strategy_horizon_days, _get_expected_lag(conn, hypothesis_id)
+                )
 
                 open_trades = conn.execute(text(
                     "SELECT id, ticker, entry_date FROM paper_trades "
