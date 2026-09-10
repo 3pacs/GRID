@@ -46,7 +46,7 @@ export default function LoadingSkeleton({
 
     if (variant === 'card') {
         return (
-            <div style={{ marginBottom: tokens.space.sm, ...extraStyle }}>
+            <div data-testid="loading-skeleton" style={{ marginBottom: tokens.space.sm, ...extraStyle }}>
                 <div style={{ ...baseStyle, height: '120px', width: '100%', borderRadius: tokens.radius.md, marginBottom: tokens.space.sm }} />
                 <div style={{ ...baseStyle, height: '14px', width: '60%', marginBottom: tokens.space.xs }} />
                 <div style={{ ...baseStyle, height: '12px', width: '40%' }} />
@@ -56,7 +56,7 @@ export default function LoadingSkeleton({
 
     if (variant === 'chart') {
         return (
-            <div style={{
+            <div data-testid="loading-skeleton" style={{
                 background: colors.card,
                 border: `1px solid ${colors.border}`,
                 borderRadius: tokens.radius.md,
@@ -76,6 +76,7 @@ export default function LoadingSkeleton({
         lines.push(
             <div
                 key={i}
+                data-testid="loading-skeleton"
                 style={{
                     ...baseStyle,
                     height,

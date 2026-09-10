@@ -1,9 +1,12 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState } from 'react';
 import { api } from '../api.js';
 import {
     Search, CheckCircle, XCircle, Archive,
     RefreshCw, FileText, Activity
 } from 'lucide-react';
+import { useAsyncData } from '../hooks/useAsyncData.js';
+import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
+import ErrorState from '../components/ErrorState.jsx';
 
 const DOMAINS = ['pipeline', 'tools', 'alpha', 'intel', 'grid'];
 const STATUSES = ['inbox', 'evaluating', 'approved', 'rejected', 'active'];
@@ -26,41 +29,26 @@ const STATUS_ICONS = {
 export default function Vault() {
     const [domain, setDomain] = useState('');
     const [status, setStatus] = useState('');
-    const [notes, setNotes] = useState([]);
-    const [total, setTotal] = useState(0);
     const [searchQuery, setSearchQuery] = useState('');
     const [searchResults, setSearchResults] = useState(null);
-    const [dashboard, setDashboard] = useState(null);
     const [selectedNote, setSelectedNote] = useState(null);
     const [actions, setActions] = useState([]);
-    const [loading, setLoading] = useState(false);
     const [syncing, setSyncing] = useState(false);
 
-    const loadNotes = useCallback(async () => {
-        setLoading(true);
-        try {
-            const params = {};
-            if (domain) params.domain = domain;
-            if (status) params.status = status;
-            const data = await api.vaultNotes(params);
-            setNotes(data.notes || []);
-            setTotal(data.total || 0);
-        } catch (e) {
-            console.error('Failed to load notes:', e);
-        }
-        setLoading(false);
-    }, [domain, status]);
+    const { data: notesData, loading, error, refetch: loadNotes } = useAsyncData(async () => {
+        const params = {};
+        if (domain) params.domain = domain;
+        if (status) params.status = status;
+        const data = await api.vaultNotes(params);
+        return { notes: data.notes || [], total: data.total || 0 };
+    }, { fallback: { notes: [], total: 0 }, deps: [domain, status] });
+    const notes = notesData.notes;
+    const total = notesData.total;
 
-    const loadDashboard = useCallback(async () => {
-        try {
-            const data = await api.vaultDashboard();
-            setDashboard(data);
-        } catch (e) {
-            console.error('Failed to load dashboard:', e);
-        }
-    }, []);
-
-    useEffect(() => { loadNotes(); loadDashboard(); }, [loadNotes, loadDashboard]);
+    const { data: dashboard, refetch: loadDashboard } = useAsyncData(
+        () => api.vaultDashboard(),
+        { fallback: null, deps: [domain, status] }
+    );
 
     const handleSearch = async () => {
         if (!searchQuery.trim()) { setSearchResults(null); return; }
@@ -183,6 +171,12 @@ export default function Vault() {
             {/* Notes list + Detail panel */}
             <div style={{ display: 'grid', gridTemplateColumns: selectedNote ? '1fr 1fr' : '1fr', gap: 16 }}>
                 <div>
+                {loading && !searchResults && notes.length === 0 ? (
+                    <LoadingSkeleton variant="text" count={5} />
+                ) : error && !searchResults ? (
+                    <ErrorState error={error} onRetry={loadNotes} title="Vault notes unavailable" />
+                ) : (
+                <>
                     <div style={{ fontSize: 12, color: '#666', marginBottom: 8 }}>
                         {searchResults ? `${searchResults.length} search results` : `${total} notes`}
                     </div>
@@ -210,6 +204,8 @@ export default function Vault() {
                     {displayNotes.length === 0 && !loading && (
                         <div style={{ color: '#555', fontSize: 13, padding: 24, textAlign: 'center' }}>No notes found</div>
                     )}
+                </>
+                )}
                 </div>
 
                 {selectedNote && (
