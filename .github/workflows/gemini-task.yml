@@ -79,7 +79,7 @@ jobs:
         if: ${{ inputs.mode != 'diag' }}
         shell: bash
         run: |
-          set -uo pipefail
+          set -euo pipefail
           if [ -f /etc/grid/gemini.env ]; then set -a; . /etc/grid/gemini.env; set +a; fi
           [ -n "${GEMINI_API_KEY:-}" ] && echo "GEMINI_API_KEY: set via /etc/grid/gemini.env" || echo "GEMINI_API_KEY: not in /etc/grid/gemini.env (fine if $CLI is logged in with the runner user's own credentials)"
 
@@ -99,7 +99,7 @@ jobs:
               nvm use default >/dev/null 2>&1 || true
             fi
             for d in "$HOME/.npm-global/bin" "$HOME/.local/bin" "$HOME"/.nvm/versions/node/*/bin; do
-              [ -d "$d" ] && PATH="$d:$PATH"
+              if [ -d "$d" ]; then PATH="$d:$PATH"; fi
             done
             export PATH
             if command -v "$CLI" >/dev/null 2>&1; then
