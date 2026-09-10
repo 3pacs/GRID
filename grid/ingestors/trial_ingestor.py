@@ -53,9 +53,24 @@ DB_CONFIG = {
     "password": os.getenv("DB_PASSWORD", ""),
 }
 
-# Window (days from today) for primary completion dates written to catalyst_calendar
-DAYS_LOOKAHEAD = 400
-DAYS_LOOKBACK  = 0
+# Window (days from today) for primary completion dates written to catalyst_calendar.
+#
+# LOOKAHEAD (2026-09-10): was 400, which silently truncated the Long Plays
+# 18-month catalyst horizon (548 d) at ingestion — the board could not see a
+# readout it was built to gate on. Measured that day, catalyst_calendar held
+# nothing beyond 397 days out. 560 clears 18 months with a fortnight of slack.
+#
+# LOOKBACK (2026-09-10): was 0, so a readout was DELETED from GRID's memory the
+# day after it happened. That is why trial_signals had 0 of 135 rows scored and
+# why P(success) could only ever be a borrowed industry average: the event dates
+# needed to measure our own hit rate were being discarded. Two years of history
+# is enough to fit a phase base rate (see intelligence/catalyst_ev.py
+# ``empirical_phase_outcomes`` and intelligence/trial_outcomes.py).
+#
+# Past events stay out of the operator's way: the ``upcoming_catalysts`` view and
+# ``long_plays._load_catalysts`` both filter ``expected_date >= CURRENT_DATE``.
+DAYS_LOOKAHEAD = 560
+DAYS_LOOKBACK  = -730
 
 # Anything that is not a plain ticker shape is a sponsor name written into the
 # ticker column by the pre-resolver ingestor (489 of 561 rows on 2026-09-10).
