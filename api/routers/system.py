@@ -166,6 +166,26 @@ def health() -> HealthResponse:
         log.debug("Health: LLM availability check failed: {e}", e=str(exc))
         checks["llm_available"] = False
 
+    # --- Robinhood crypto connector ---
+    # Local state only (mode, caps): health is unauthenticated and must stay
+    # bounded, so this never calls Robinhood. An unconfigured connector is a
+    # normal state, not a degradation — the operator opts in by setting keys.
+    try:
+        from trading.robinhood import get_robinhood_trader
+
+        rh = get_robinhood_trader()
+        checks["robinhood"] = {
+            "mode": rh.mode,
+            "configured": rh.configured,
+            "live_trading": rh.live,
+            "max_position_usd": rh.max_position_usd,
+            "max_drawdown_pct": rh.max_drawdown_pct,
+        }
+    except Exception as exc:
+        log.warning("Health: Robinhood connector check failed: {e}", e=str(exc))
+        checks["robinhood"] = {"mode": "ERROR", "configured": False, "error": str(exc)}
+        degraded_reasons.append("robinhood connector misconfigured")
+
     # --- API key audit ---
     try:
         from config import settings
