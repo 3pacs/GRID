@@ -116,11 +116,14 @@ function ScatterModal({ pair, onClose, days }) {
 
 function ScatterPlot({ featureA, featureB, days = 90 }) {
     const svgRef = useRef(null);
-    const [status, setStatus] = useState('loading'); // 'loading' | 'error' | 'empty' | 'ready'
+    const [status, setStatus] = useState('loading'); // 'loading' | 'error' | 'empty' | 'no-overlap' | 'ready'
     const [errorMessage, setErrorMessage] = useState('');
     const [points, setPoints] = useState([]);
 
-    // Fetch real paired time series from the signals timeseries endpoint.
+    // Fetch real paired time series from the signals timeseries endpoint and
+    // join on obs_date -- the two features can have different observation
+    // calendars (e.g. crypto trades weekends, equities don't), so index
+    // pairing would plot points that never actually co-occurred.
     useEffect(() => {
         let cancelled = false;
         setStatus('loading');
@@ -142,15 +145,35 @@ function ScatterPlot({ featureA, featureB, days = 90 }) {
             }
             const seriesA = result?.series?.[rawA];
             const seriesB = result?.series?.[rawB];
+            const datesA = result?.dates?.[rawA];
+            const datesB = result?.dates?.[rawB];
             if (!seriesA?.length || !seriesB?.length) {
                 setStatus('empty');
                 return;
             }
-            const n = Math.min(seriesA.length, seriesB.length);
-            const pairs = [];
-            for (let i = 0; i < n; i++) {
-                pairs.push({ x: seriesA[i], y: seriesB[i] });
+            // No "dates" on the response means an older backend that can't be
+            // trusted to align -- never fall back to index pairing.
+            if (!datesA?.length || !datesB?.length) {
+                setStatus('empty');
+                return;
             }
+
+            const mapA = new Map();
+            for (let i = 0; i < datesA.length && i < seriesA.length; i++) {
+                mapA.set(datesA[i], seriesA[i]);
+            }
+            const mapB = new Map();
+            for (let i = 0; i < datesB.length && i < seriesB.length; i++) {
+                mapB.set(datesB[i], seriesB[i]);
+            }
+
+            const commonDates = [...mapA.keys()].filter(d => mapB.has(d)).sort();
+            if (commonDates.length < 2) {
+                setStatus('no-overlap');
+                return;
+            }
+
+            const pairs = commonDates.map(d => ({ x: mapA.get(d), y: mapB.get(d) }));
             setPoints(pairs);
             setStatus('ready');
         }).catch(err => {
@@ -235,6 +258,12 @@ function ScatterPlot({ featureA, featureB, days = 90 }) {
                 <div style={{ fontSize: '10px', color: colors.textMuted, fontFamily: MONO,
                     textAlign: 'center', padding: '16px 0' }}>
                     Pair time series not available yet
+                </div>
+            )}
+            {status === 'no-overlap' && (
+                <div style={{ fontSize: '10px', color: colors.textMuted, fontFamily: MONO,
+                    textAlign: 'center', padding: '16px 0' }}>
+                    No overlapping dates for this pair
                 </div>
             )}
         </>
