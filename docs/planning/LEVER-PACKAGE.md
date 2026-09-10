@@ -516,6 +516,19 @@ Every item extends an existing module unless marked **NEW**; `scripts/pre_create
 before any new file; `scripts/deploy.py --smoke` to ship. Days are one engineer or one
 agent wave.
 
+> **Sprint 1 status (2026-09-10, branch `claude/finance-visualization-stack-tpDSI`):**
+> landed — T0.1 realized alpha (`alpha_research/realized_alpha.py`, migration `0057`,
+> `GET /api/v1/alpha/realized`, daily 06:30), T0.3 NULL propagation with layer and
+> evidence coverage gating HIGH, T0.5 astrology quarantine (PSI removed from the SETUP
+> layer; `astrogrid:` rows excluded from calibration, model/trace evolution and
+> postmortem selection — scoring left intact so AstroGrid's own scoreboard still works),
+> T0.6 for the live predictor's feature gather (`OracleEngine._gather_signals` through
+> `PITStore`, `LATEST_AS_OF`; price lookups unchanged), the V5 R1.1–R1.3/R1.6 live canvas
+> (contracts `pg_notify` in the audit transaction → API listener → SSE → node pulse),
+> and R3.4 canvas in the operator tab bar. Not yet: T0.2 journal-outcome scheduling, T0.4
+> calibration read-out (needs the server), T0.7 paid-LLM flag, T1.x data reachability.
+> Deploy is the operator's step (`scripts/deploy.py --snapshot --restart --smoke`).
+
 ### T0 — Truth gates first (3–4 days). Nothing else can be believed until these exist.
 
 | # | Item | Module | Verification |
