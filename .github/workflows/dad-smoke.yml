@@ -46,6 +46,9 @@ jobs:
         id: smoke
         run: |
           set -euo pipefail
+          for f in /data/grid_v4/grid_release/.env /home/grid/grid_v4/grid_repo/.env /home/grid/grid_v4/grid_repo/grid/.env; do
+            if [ -f "$f" ]; then set -a; . "$f"; set +a; echo "(env sourced from $f)"; break; fi
+          done
           STRICT_FLAG=""
           if [ "${{ inputs.strict }}" = "true" ]; then
             STRICT_FLAG="--strict"
