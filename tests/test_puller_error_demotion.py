@@ -208,3 +208,84 @@ class TestWorldBankErrorDemotion:
         )
         assert "WARNING" in levels
         mock_record_failure.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# FRED-backed altdata pullers — a retired series id answers 400, which is a
+# configuration problem (the id map is stale), never an application bug.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestFredDeadSeriesDemotion:
+    """A FRED 400 must warn, name the id, and say how to fix it."""
+
+    def test_buyback_execution_400_logs_warning_naming_the_id(self):
+        from ingestion.altdata.buyback_execution import BuybackExecutionPuller
+
+        puller = BuybackExecutionPuller(
+            api_key="fake-key", db_engine=_mock_engine_with_source()
+        )
+
+        with patch.object(
+            puller, "_fetch_fred_series", side_effect=_http_error(400)
+        ), patch(
+            "ingestion.altdata.buyback_execution.time.sleep", return_value=None
+        ):
+            records = _capture_levels(puller.pull)
+
+        levels = {lvl for lvl, _ in records}
+        assert "ERROR" not in levels, (
+            "A FRED 400 means the series id is retired — configuration, not a "
+            f"bug. Logging it at ERROR floods errors.jsonl. Got: {records}"
+        )
+        assert "WARNING" in levels
+        messages = " ".join(msg for _, msg in records)
+        assert "NCBCEBQ027S" in messages, (
+            f"the warning must name the failing id; got: {records}"
+        )
+        assert "update the id map" in messages
+
+    def test_credit_index_proxies_400_logs_warning_naming_the_id(self):
+        from ingestion.altdata.credit_index_proxies import (
+            CreditIndexProxiesPuller,
+        )
+
+        puller = CreditIndexProxiesPuller(
+            api_key="fake-key", db_engine=_mock_engine_with_source()
+        )
+
+        with patch.object(
+            puller, "_fetch_fred_series", side_effect=_http_error(400)
+        ):
+            records = _capture_levels(puller.pull)
+
+        levels = {lvl for lvl, _ in records}
+        assert "ERROR" not in levels, (
+            "A FRED 400 means the series id is retired — configuration, not a "
+            f"bug. Logging it at ERROR floods errors.jsonl. Got: {records}"
+        )
+        assert "WARNING" in levels
+        messages = " ".join(msg for _, msg in records)
+        assert "BAMLEMHBHYCRPIOAS" in messages
+        assert "update the id map" in messages
+
+    def test_non_http_bug_still_logs_error(self):
+        """A real code bug (KeyError) must keep its ERROR severity."""
+        from ingestion.altdata.credit_index_proxies import (
+            CreditIndexProxiesPuller,
+        )
+
+        puller = CreditIndexProxiesPuller(
+            api_key="fake-key", db_engine=_mock_engine_with_source()
+        )
+
+        with patch.object(
+            puller, "_fetch_fred_series", side_effect=KeyError("boom")
+        ):
+            records = _capture_levels(puller.pull)
+
+        levels = {lvl for lvl, _ in records}
+        assert "ERROR" in levels, (
+            f"KeyError is a code bug and must stay at ERROR. Got: {records}"
+        )
