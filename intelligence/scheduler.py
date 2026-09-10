@@ -381,6 +381,43 @@ def run_intelligence_loop() -> None:
 
     _sched.every().sunday.at("05:30").do(_long_plays_weekly)
 
+    # ── Trial gems → enriched small caps → board (daily chain, 2026-09-10) ──
+    # Hermes' _SOURCE_REGISTRY carries interval_h for these but nothing runs
+    # fn-based entries on that interval, and the 06:00 cron for the ingestor
+    # silently failed for five months on a missing log directory. Schedule the
+    # chain here so it does not depend on either: ingest CT.gov, score the
+    # signal (sub-$2B gate enforced), enrich the small caps' fundamentals.
+    def _trial_ingestor_daily() -> None:
+        try:
+            from db import get_engine as _ge
+            from grid.ingestors.trial_ingestor import run as _ingest
+            summary = _ingest(_ge())
+            log.info("trial ingestor daily: {s}", s=summary)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("trial ingestor daily failed: {e}", e=str(exc))
+
+    def _trial_signal_daily() -> None:
+        try:
+            from db import get_engine as _ge
+            from grid.signals.trial_signal import run_daily as _score
+            summary = _score(_ge(), top_n=60)
+            log.info("trial signal daily: {s}", s=summary)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("trial signal daily failed: {e}", e=str(exc))
+
+    def _small_cap_enrichment_daily() -> None:
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.small_cap_enrichment import pull_all as _enrich
+            summary = _enrich(_ge())
+            log.info("small-cap enrichment daily: {s}", s=summary)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("small-cap enrichment daily failed: {e}", e=str(exc))
+
+    _sched.every().day.at("05:40").do(_trial_ingestor_daily)
+    _sched.every().day.at("05:55").do(_trial_signal_daily)
+    _sched.every().day.at("06:05").do(_small_cap_enrichment_daily)
+
     def _actor_trust_cog_recompute() -> None:
         """INTEL-2: recompute trust-vs-cog classification for every lever puller."""
         try:
