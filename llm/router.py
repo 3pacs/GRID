@@ -105,25 +105,36 @@ def _fallback_chain(tier: Tier, provider: str) -> list[str]:
     reasoning but slow (~5 tok/sec on CPU), so we never auto-add it to
     interactive tier fallbacks — interactive callers would block on it.
     Only ``Tier.BATCH`` reaches it.
+
+    NOTE: ``gemma`` was dropped from every chain on 2026-09-10. Its only
+    endpoint was ``GEMMA_BASE_URL=http://localhost:8080`` — the CPU-only
+    llama.cpp unit that the operator retired ("there should be no CPU-only
+    Qwens"). It had been ``GEMMA_ENABLED=False`` and therefore dead weight in
+    the chain for some time; keeping it would only re-point traffic at a
+    decommissioned port.
+
+    ``llamacpp`` stays: despite its name it resolves to
+    ``LLAMACPP_BASE_URL=http://localhost:8081``, the shim in front of the
+    healthy RTX 3090 llama-server on :8086 — not the retired :8080 unit.
     """
     if tier == Tier.LOCAL:
         # Lightweight tier — koala and ocr-node host the cheap small models;
         # z400 (RTX A2000 12GB / GTX 1660S 6GB, qwen2.5:7b-instruct) is
         # another cluster ollama node, added as a load-spreading fallback
         # 2026-05-13; gridz4 is overkill for LOCAL but still a fast fallback.
-        chain = ["llamacpp_quick", "ollama_koala", "ollama_ocr", "ollama_z400", "llamacpp_z4", "llamacpp", "gemma", "ollama", "openrouter", "openai"]
+        chain = ["llamacpp_quick", "ollama_koala", "ollama_ocr", "ollama_z400", "llamacpp_z4", "llamacpp", "ollama", "gemini", "openrouter", "openai"]
     elif tier == Tier.ORACLE:
         # gridz4 (Qwen3.8-27B Q4_K_M) is the primary ORACLE node; grid-svr's
         # RTX 3090 Qwen3.8-27B (`llamacpp_oracle`, :8081 shim → :8086) is the
         # first fallback. panda is offline for the foreseeable future, so
         # ORACLE fallback stays on live llama.cpp/cloud providers.
-        chain = ["llamacpp_z4", "llamacpp_oracle", "llamacpp", "gemma", "openrouter", "openai"]
+        chain = ["llamacpp_z4", "llamacpp_oracle", "llamacpp", "gemini", "openrouter", "openai"]
     elif tier == Tier.BATCH:
-        chain = ["llamacpp_batch", "llamacpp_oracle", "llamacpp_z4", "openrouter", "openai"]
+        chain = ["llamacpp_batch", "llamacpp_oracle", "llamacpp_z4", "gemini", "openrouter", "openai"]
     else:
         # REASON / DEFAULT — z400's qwen2.5:7b is a capable analysis-grade
         # fallback after the redbox/gridz4/koala/ocr nodes (added 2026-05-13).
-        chain = ["llamacpp_quick", "llamacpp_z4", "ollama_koala", "ollama_ocr", "ollama_z400", "llamacpp", "gemma", "ollama", "openrouter", "openai"]
+        chain = ["llamacpp_quick", "llamacpp_z4", "ollama_koala", "ollama_ocr", "ollama_z400", "llamacpp", "ollama", "gemini", "openrouter", "openai"]
     return [candidate for candidate in chain if candidate != provider]
 
 
@@ -211,11 +222,85 @@ def get_llm(
     return _NullClient()
 
 
+def _embed_chain() -> list[str]:
+    """Provider names for embeddings, in order, from ``EMBED_PROVIDER_CHAIN``."""
+    from config import settings
+
+    raw = getattr(settings, "EMBED_PROVIDER_CHAIN", "") or ""
+    chain = [name.strip() for name in raw.split(",") if name.strip()]
+    return chain or ["ollama_koala", "ollama_z400", "ollama"]
+
+
+def embed(
+    texts: list[str],
+    model: str | None = None,
+) -> list[list[float]] | None:
+    """Embed ``texts`` on the first tailnet GPU node that answers.
+
+    Walks ``EMBED_PROVIDER_CHAIN`` (default koala → z400 → grid-svr Ollama).
+    grid-svr is deliberately last: its Ollama shares the RTX 3090 with the
+    REASON/ORACLE llama-server, so embedding batches there would evict the
+    27B chat model.
+
+    Before 2026-09-10 embeddings went to the CPU-only llama.cpp unit on
+    grid-svr :8080, which was never started with ``--embeddings`` and answered
+    every call with HTTP 501. That unit is retired; this is its replacement.
+
+    Args:
+        texts: Strings to embed. An empty list short-circuits to ``[]``.
+        model: Embedding model override. Defaults to each provider's
+            configured embed model (``nomic-embed-text`` on every node).
+
+    Returns:
+        One vector per input text, or ``None`` when no provider answered.
+        Never raises — callers treat ``None`` as "embeddings unavailable"
+        and degrade gracefully.
+    """
+    if not texts:
+        return []
+
+    tried: list[str] = []
+    for provider in _embed_chain():
+        if _provider_in_backoff(provider):
+            continue
+        try:
+            client = _client_cache.get(provider) or _create_client(provider)
+        except Exception as exc:  # a broken provider must not sink the chain
+            log.debug("Embed provider {p} init failed: {e}", p=provider, e=str(exc))
+            continue
+        if client is None or not getattr(client, "is_available", False):
+            continue
+
+        _client_cache[provider] = client
+        tried.append(provider)
+        try:
+            vectors = client.embed(texts, model=model)
+        except Exception as exc:
+            log.warning("Embed via {p} raised: {e}", p=provider, e=str(exc))
+            continue
+        if vectors:
+            log.debug(
+                "Embedded {n} texts via {p} — dim={d}",
+                n=len(texts), p=provider,
+                d=len(vectors[0]) if vectors[0] else 0,
+            )
+            return vectors
+
+    # Graceful degradation: warning, not error — an offline embed node is an
+    # operational condition, not an application bug (CLAUDE.md log-level rule).
+    log.warning(
+        "No embedding provider answered (chain={c}, reachable={t}) — "
+        "returning None",
+        c=",".join(_embed_chain()), t=",".join(tried) or "none",
+    )
+    return None
+
+
 # Paid/hosted LLM providers — billed per token. Disabled by default per the local-first rule:
 # GRID's fallback chains end in openrouter/openai, so a redeploy that restored API keys would
 # silently re-leak. This choke-point keeps paid OFF even if a key reappears. To intentionally
 # re-enable, set GRID_ALLOW_PAID_LLM=1 in the environment.
-_PAID_PROVIDERS = frozenset({"openai", "openrouter", "anthropic", "huggingface"})
+_PAID_PROVIDERS = frozenset({"openai", "openrouter", "anthropic", "huggingface", "gemini"})
 
 
 def _paid_llm_allowed() -> bool:
@@ -263,6 +348,8 @@ def _create_client(provider: str) -> Any:
         return _create_llamacpp_quick_client(settings)
     elif provider == "llamacpp_z4":
         return _create_llamacpp_z4_client(settings)
+    elif provider == "gemini":
+        return _create_gemini_client(settings)
     elif provider == "gemma":
         return _create_gemma_client(settings)
     elif provider == "bitnet":
@@ -512,6 +599,31 @@ def _create_llamacpp_z4_client(settings: Any) -> Any:
     except Exception as exc:
         log.debug("llama.cpp z4 client init failed: {e}", e=str(exc))
         return None
+
+
+def _create_gemini_client(settings: Any) -> Any:
+    """Create a Google Gemini client (Generative AI REST API).
+
+    Paid provider — ``_create_client`` already refused this call unless
+    ``GRID_ALLOW_PAID_LLM`` is set, so reaching here means the operator opted
+    in. Sits ahead of ``openrouter`` in every chat chain per the operator's
+    2026-09-10 direction to prefer a frontier model over CPU inference.
+    """
+    api_key = getattr(settings, "GEMINI_API_KEY", "")
+    if not api_key:
+        log.warning("No GEMINI_API_KEY set — Gemini unavailable")
+        return None
+
+    return GeminiClient(
+        api_key=api_key,
+        base_url=getattr(
+            settings,
+            "GEMINI_BASE_URL",
+            "https://generativelanguage.googleapis.com/v1beta",
+        ),
+        model=getattr(settings, "GEMINI_CHAT_MODEL", "gemini-2.5-flash"),
+        timeout=getattr(settings, "GEMINI_TIMEOUT_SECONDS", 120),
+    )
 
 
 def _create_gemma_client(settings: Any) -> Any:
@@ -781,6 +893,217 @@ class HuggingFaceClient(_OpenAICompatibleClient):
 
     def _extra_payload_fields(self) -> dict[str, Any]:
         return {"stream": False}
+
+
+class GeminiClient:
+    """Google Gemini client conforming to the LLMClient protocol.
+
+    Talks to the Generative AI REST API via ``requests`` (no SDK dependency,
+    matching :class:`AnthropicClient`). Gemini's payload shape differs from
+    OpenAI's in three ways this class translates:
+
+    * messages are ``contents`` entries with ``parts``, not ``content`` strings;
+    * the assistant role is spelled ``model``, not ``assistant``;
+    * a system message goes in a top-level ``systemInstruction``, not inline.
+
+    Every failure path returns ``None`` so callers degrade gracefully — the
+    router's chain simply moves on to the next provider.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str = "https://generativelanguage.googleapis.com/v1beta",
+        model: str = "gemini-2.5-flash",
+        timeout: int = 120,
+    ) -> None:
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.timeout = timeout
+        self.is_available = bool(api_key)
+        self._knowledge_cache: dict[str, str] = {}
+
+    @staticmethod
+    def _to_gemini_payload(
+        messages: list[dict[str, str]],
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Split OpenAI-style messages into Gemini contents + system text."""
+        contents: list[dict[str, Any]] = []
+        system_text = ""
+        for message in messages:
+            role = message.get("role", "user")
+            content = message.get("content", "")
+            if role == "system":
+                system_text += content + "\n"
+                continue
+            contents.append(
+                {
+                    "role": "model" if role == "assistant" else "user",
+                    "parts": [{"text": content}],
+                }
+            )
+        return contents, system_text.strip()
+
+    def chat(
+        self,
+        messages: list[dict[str, str]],
+        model: str | None = None,
+        temperature: float = 0.3,
+        num_predict: int = 4096,
+        system_knowledge: list[str] | None = None,
+        extra_metadata: dict | None = None,
+    ) -> str | None:
+        if not self.is_available:
+            return None
+
+        contents, system_text = self._to_gemini_payload(messages)
+        if not contents:
+            return None
+
+        model_name = model or self.model
+        payload: dict[str, Any] = {
+            "contents": contents,
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": num_predict,
+            },
+        }
+        if system_text:
+            payload["systemInstruction"] = {"parts": [{"text": system_text}]}
+
+        start = time.monotonic()
+        try:
+            resp = requests.post(
+                f"{self.base_url}/models/{model_name}:generateContent",
+                json=payload,
+                # Key travels as a header, never in the URL — query strings leak
+                # into proxy and access logs.
+                headers={
+                    "x-goog-api-key": self.api_key,
+                    "Content-Type": "application/json",
+                },
+                timeout=self.timeout,
+            )
+            latency_ms = (time.monotonic() - start) * 1000
+
+            if resp.status_code >= 400:
+                log.warning(
+                    "Gemini API {status} ({l:.0f}ms): {body}",
+                    status=resp.status_code, l=latency_ms,
+                    body=resp.text[:300],
+                )
+                if resp.status_code in {401, 402, 403}:
+                    self.is_available = False
+                    _mark_provider_unavailable(
+                        "gemini", f"HTTP {resp.status_code}", _PROVIDER_AUTH_BACKOFF_S
+                    )
+                elif resp.status_code == 429:
+                    self.is_available = False
+                    _mark_provider_unavailable(
+                        "gemini", "HTTP 429", _PROVIDER_RATE_BACKOFF_S
+                    )
+                return None
+
+            data = resp.json()
+            candidates = data.get("candidates") or []
+            if not candidates:
+                # A prompt blocked by safety filters comes back 200 with no
+                # candidates — that is a miss, not a crash.
+                log.warning(
+                    "Gemini returned no candidates: {r}",
+                    r=str(data.get("promptFeedback", ""))[:200],
+                )
+                return None
+
+            parts = candidates[0].get("content", {}).get("parts", [])
+            text_out = "".join(p.get("text", "") for p in parts)
+            if not text_out:
+                return None
+
+            usage = data.get("usageMetadata", {})
+            log.debug(
+                "Gemini chat — model={m}, latency={l:.0f}ms, in={i}, out={o}",
+                m=model_name, l=latency_ms,
+                i=usage.get("promptTokenCount", "?"),
+                o=usage.get("candidatesTokenCount", "?"),
+            )
+
+            try:
+                from llm.feedback_loop import log_llm_call
+                log_llm_call(
+                    module="gemini",
+                    tier="unknown",
+                    system_prompt=system_text[:2000],
+                    user_prompt=contents[0]["parts"][0]["text"][:2000],
+                    output=text_out[:2000],
+                    context_tokens=usage.get("promptTokenCount", 0),
+                    output_tokens=usage.get("candidatesTokenCount", 0),
+                    latency_ms=int(latency_ms),
+                    model=model_name,
+                    provider="gemini",
+                    metadata=dict(extra_metadata) if extra_metadata else None,
+                )
+            except Exception:
+                pass  # never let logging break inference
+
+            return text_out
+
+        except Exception as exc:
+            latency_ms = (time.monotonic() - start) * 1000
+            log.warning(
+                "Gemini API failed ({l:.0f}ms): {err}", l=latency_ms, err=str(exc)
+            )
+            return None
+
+    def generate(
+        self,
+        prompt: str,
+        model: str | None = None,
+        system: str | None = None,
+        temperature: float = 0.3,
+        num_predict: int = 4096,
+    ) -> str | None:
+        messages: list[dict[str, str]] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        return self.chat(messages, model=model, temperature=temperature,
+                         num_predict=num_predict)
+
+    def embed(
+        self,
+        texts: list[str],
+        model: str | None = None,
+    ) -> list[list[float]] | None:
+        """Not wired — GRID embeddings stay on tailnet GPU nodes.
+
+        See ``EMBED_PROVIDER_CHAIN`` / :func:`embed`. Sending embedding
+        batches to a paid frontier API would bill per call for vectors that
+        koala and z400 produce for free.
+        """
+        return None
+
+    def health_check(self) -> dict[str, Any]:
+        return {"available": self.is_available, "provider": "gemini",
+                "model": self.model, "endpoint": self.base_url}
+
+    def list_models(self) -> list[dict[str, Any]]:
+        return [{"name": self.model, "provider": "gemini"}]
+
+    def get_model_names(self) -> list[str]:
+        return [self.model]
+
+    def pull_model(self, model_name: str) -> bool:
+        return True  # Cloud models don't need pulling
+
+    def load_knowledge(self, doc_name: str) -> str | None:
+        from knowledge.loader import load_knowledge_doc
+        return load_knowledge_doc(self._knowledge_cache, doc_name)
+
+    def load_all_knowledge(self) -> str:
+        from knowledge.loader import load_all_knowledge_docs
+        return load_all_knowledge_docs(self._knowledge_cache)
 
 
 class AnthropicClient:

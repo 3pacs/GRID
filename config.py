@@ -302,6 +302,34 @@ class Settings(BaseSettings):
     LLAMACPP_BATCH_TIMEOUT_SECONDS: int = 600
     LLAMACPP_BATCH_CHAT_MODEL: str = "DeepSeekV4-Flash-158B-Q4_K_M"
 
+    # ------------------------------------------------------------------
+    # Embeddings — tailnet GPU Ollama nodes only.
+    #
+    # Until 2026-09-10 embeddings went to the CPU-only llama.cpp unit on
+    # grid-svr :8080 (via HYPERSPACE_BASE_URL), which was never started with
+    # ``--embeddings`` — every call returned HTTP 501 and the error log filled
+    # with `POST /v1/embeddings … 501`. Per the operator directive of the same
+    # day ("no CPU-only Qwens — use another machine on the tailnet"), that unit
+    # is retired and embeddings resolve through EMBED_PROVIDER_CHAIN instead.
+    #
+    # Order matters: koala and z400 both carry `nomic-embed-text` on their own
+    # GPUs; grid-svr's own Ollama is last because it shares the RTX 3090 with
+    # the REASON/ORACLE llama-server and we do not want embedding batches
+    # evicting the 27B chat model. ``llm.router.embed()`` walks this list and
+    # returns None when no node answers (graceful degradation — never raises).
+    # Per-node embed models are declared with their nodes above
+    # (OLLAMA_KOALA_EMBED_MODEL, OLLAMA_Z400_EMBED_MODEL, OLLAMA_EMBED_MODEL).
+    EMBED_PROVIDER_CHAIN: str = "ollama_koala,ollama_z400,ollama"
+    EMBED_MODEL: str = "nomic-embed-text"
+
+    # Google Gemini (paid frontier — gated by GRID_ALLOW_PAID_LLM like every
+    # other paid provider). Placed ahead of openrouter in the chat fallback
+    # chains per the operator's "if you can make Gemini do the work, that is
+    # best". Key lives in /etc/grid/gemini.env on grid-svr; never commit it.
+    GEMINI_BASE_URL: str = "https://generativelanguage.googleapis.com/v1beta"
+    GEMINI_CHAT_MODEL: str = "gemini-2.5-flash"
+    GEMINI_TIMEOUT_SECONDS: int = 120
+
     # Auth
     GRID_MASTER_PASSWORD_HASH: str = ""
     GRID_JWT_SECRET: str = ""

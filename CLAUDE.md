@@ -71,13 +71,18 @@ This enforces grep-before-create discipline and prevents the duplication documen
 
 - **Backend:** Python 3.11+, [[FastAPI]], [[SQLAlchemy]] 2.0, [[PostgreSQL]] 15 + [[TimescaleDB]]
 - **Frontend:** React 18, Vite, [[Zustand]], served as PWA from [[FastAPI]]
-- **LLM:** Local Qwen 3.8 27B everywhere that matters (verified 2026-09-10): grid-svr
+- **LLM:** Local Qwen 3.8 27B on GPU everywhere (verified 2026-09-10): grid-svr
   RTX 3090 llama-server (Qwen3.8-27B Q4_K_M + mmproj on 100.75.185.36:8086, fronted by the
   :8081 shim — REASON + ORACLE tiers), redbox `qwen3.8-27b` (LOCAL tier), gridz4
-  `Qwen3.8-27B-Q4_K_M`, Ollama `qwen3.8:27b` on :11434. The CPU-only `grid-llamacpp` unit
-  on :8080 still loads the Qwen3.6 GGUF and only receives embedding calls it answers 501.
-  Paid providers are gated off by default. See `llm/router.py` for the 3-tier taxonomy
-  (LOCAL/REASON/ORACLE).
+  `Qwen3.8-27B-Q4_K_M`, Ollama `qwen3.8:27b` on :11434.
+  **No CPU-only inference** — the operator retired the `grid-llamacpp` unit on :8080
+  (Qwen3.6 GGUF, `NGL=0`, 17.9 GB RAM, answered every embedding call 501) on 2026-09-10.
+  Don't recreate it; `server_setup/grid-llamacpp.service` is deleted on purpose.
+  **Embeddings** go through `llm.router.embed()` → `EMBED_PROVIDER_CHAIN`
+  (koala → z400 → grid-svr Ollama, all `nomic-embed-text`), returning `None` when no
+  node answers. Paid providers — now including `gemini`, which sits ahead of
+  `openrouter` in every chat chain — stay gated off behind `GRID_ALLOW_PAID_LLM`.
+  See `llm/router.py` for the 3-tier taxonomy (LOCAL/REASON/ORACLE).
 - **Config:** pydantic-settings, environment variables via `.env`
 
 ## Server Deployment
