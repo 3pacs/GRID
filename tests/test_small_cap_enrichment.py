@@ -145,9 +145,12 @@ def test_shape_enrichment_row_truncates_description_and_stamps_source() -> None:
     assert sce.shape_enrichment_row("", {"market_cap": 1.0}) is None
 
 
-def _puller(api_key: str = "", http_get: Any = None) -> tuple[sce.SmallCapEnrichmentPuller, MagicMock]:
+def _puller(api_key: str = "", http_get: Any = None, yf: Any = None) -> tuple[sce.SmallCapEnrichmentPuller, MagicMock]:
     engine = MagicMock()
-    p = sce.SmallCapEnrichmentPuller(engine, api_key=api_key, http_get=http_get or MagicMock(), sleep=lambda s: None)
+    p = sce.SmallCapEnrichmentPuller(
+        engine, api_key=api_key, http_get=http_get or MagicMock(), sleep=lambda s: None,
+        yf_puller=yf if yf is not None else MagicMock(),  # never construct the real yfinance puller in tests
+    )
     return p, engine
 
 
@@ -225,7 +228,9 @@ def test_tiingo_market_cap_reads_pit_bounded_series() -> None:
     assert p.tiingo_market_cap("AAPL", AS_OF) == 2.2e9
     stmt, params = conn.execute.call_args.args
     assert "pull_status = 'SUCCESS'" in str(stmt) and "obs_date <= :as_of" in str(stmt)
-    assert params == {"sid": "TIINGO_FUND:AAPL:market_cap", "as_of": AS_OF}
+    assert "obs_date >= :since" in str(stmt)  # bounded: unbounded scans cost ~100 s per small cap with no TIINGO_FUND series
+    assert params == {"sid": "TIINGO_FUND:AAPL:market_cap", "as_of": AS_OF,
+                      "since": AS_OF - timedelta(days=sce.TIINGO_MCAP_LOOKBACK_DAYS)}
     conn.execute.side_effect = RuntimeError("db down")
     assert p.tiingo_market_cap("AAPL", AS_OF) is None
 
@@ -398,9 +403,11 @@ def test_latest_price_is_pit_bounded_over_yf_and_tiingo_closes() -> None:
     stmt, params = conn.execute.call_args.args
     sql = str(stmt)
     assert "series_id = ANY(:series_ids)" in sql and "obs_date <= :as_of" in sql and "pull_timestamp <= :as_of_ts" in sql
+    assert "obs_date >= :since" in sql  # lower bound -> TimescaleDB chunk exclusion (unbounded scan was ~100 s/ticker)
     assert "%" not in sql and "format(" not in sql
     assert params["series_ids"] == ["YF:SMLX:adj_close", "YF:SMLX:close", "TIINGO:SMLX:adj_close", "TIINGO:SMLX:close"]
     assert params["as_of"] == AS_OF and params["as_of_ts"].date() == AS_OF and params["as_of_ts"].tzinfo is not None
+    assert params["since"] == AS_OF - timedelta(days=sce.PRICE_LOOKBACK_DAYS) == date(2026, 7, 27)
     conn.execute.return_value.first.return_value = None
     assert p.latest_price("SMLX", AS_OF) is None
     conn.execute.side_effect = RuntimeError("db down")
@@ -448,3 +455,89 @@ def test_enrich_ticker_survives_submissions_miss() -> None:
     assert row is not None
     assert row["profile"]["market_cap"] == 500_000_000.0 and row["profile"]["sector"] is None
     assert row["profile"]["enrichment_source"] == "sec_xbrl,derived_shares_x_price"
+
+
+# ── price coverage: yfinance → raw_series before the cap derivation ───────
+
+
+def test_price_series_ids_cover_class_shares() -> None:
+    assert sce.SmallCapEnrichmentPuller._price_series_ids("smlx") == [
+        "YF:SMLX:adj_close", "YF:SMLX:close", "TIINGO:SMLX:adj_close", "TIINGO:SMLX:close",
+    ]
+    ids = sce.SmallCapEnrichmentPuller._price_series_ids("BRK.B")
+    assert "YF:BRK.B:close" in ids and "YF:BRK-B:close" in ids
+
+
+def test_latest_closes_is_one_bounded_query() -> None:
+    p, engine = _puller()
+    conn = engine.connect.return_value.__enter__.return_value
+    conn.execute.return_value.fetchall.return_value = [("SMLX", date(2026, 9, 9)), ("OLDX", "2026-08-01"), ("BRK-B", date(2026, 9, 8))]
+    out = p.latest_closes(["SMLX", "OLDX", "NONE", "BRK.B"], AS_OF)
+    assert out == {"SMLX": date(2026, 9, 9), "OLDX": date(2026, 8, 1), "BRK.B": date(2026, 9, 8)}
+    stmt, params = conn.execute.call_args.args
+    sql = str(stmt)
+    assert "series_id = ANY(:series_ids)" in sql and "obs_date >= :since" in sql and "obs_date <= :as_of" in sql
+    assert params["since"] == AS_OF - timedelta(days=sce.PRICE_LOOKBACK_DAYS) and params["as_of"] == AS_OF
+    assert len(params["series_ids"]) == 4 * 3 + 8  # BRK.B contributes both spellings
+    conn.execute.side_effect = RuntimeError("db down")
+    assert p.latest_closes(["SMLX"], AS_OF) == {}
+    assert p.latest_closes([], AS_OF) == {}
+
+
+def test_ensure_prices_pulls_missing_history_and_refills_stale_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    yf = MagicMock()
+    yf.pull_ticker.return_value = {"status": "SUCCESS", "rows_inserted": 12}
+    p, _ = _puller(yf=yf)
+    monkeypatch.setattr(p, "latest_closes", lambda tickers, as_of: {
+        "FRESH": AS_OF - timedelta(days=1), "STALE": AS_OF - timedelta(days=9),
+    })
+    stats = p.ensure_prices(["fresh", "STALE", "MISSING", "MISSING", ""], AS_OF)
+    assert stats["checked"] == 3 and stats["missing"] == 1 and stats["stale"] == 1
+    assert stats["pulled"] == 2 and stats["rows_inserted"] == 24 and stats["failed"] == 0
+    calls = {c.args[0]: c.args[1:] for c in yf.pull_ticker.call_args_list}
+    assert set(calls) == {"MISSING", "STALE"}
+    assert calls["MISSING"] == (AS_OF - timedelta(days=sce.PRICE_HISTORY_DAYS), AS_OF + timedelta(days=1))
+    assert calls["STALE"] == (AS_OF - timedelta(days=9) - timedelta(days=3), AS_OF + timedelta(days=1))
+
+    # Nothing to do -> no puller call at all.
+    yf.pull_ticker.reset_mock()
+    monkeypatch.setattr(p, "latest_closes", lambda tickers, as_of: {"FRESH": AS_OF})
+    assert p.ensure_prices(["FRESH"], AS_OF)["pulled"] == 0 and yf.pull_ticker.call_count == 0
+
+
+def test_ensure_prices_counts_failures_budget_and_missing_puller(monkeypatch: pytest.MonkeyPatch) -> None:
+    yf = MagicMock()
+    yf.pull_ticker.side_effect = [RuntimeError("yahoo down"), {"status": "PARTIAL", "rows_inserted": 0}]
+    p, _ = _puller(yf=yf)
+    monkeypatch.setattr(p, "latest_closes", lambda tickers, as_of: {})
+    stats = p.ensure_prices(["A", "B"], AS_OF)
+    assert stats["pulled"] == 1 and stats["failed"] == 2  # exception + non-SUCCESS status
+
+    monkeypatch.setattr(sce, "MAX_PRICE_PULLS_PER_RUN", 1)
+    yf.pull_ticker.side_effect = None
+    yf.pull_ticker.return_value = {"status": "SUCCESS", "rows_inserted": 1}
+    stats = p.ensure_prices(["A", "B", "C"], AS_OF)
+    assert stats["pulled"] == 1 and stats["skipped_budget"] == 2
+
+    # No yfinance puller constructible -> every planned pull is a failure, never an exception.
+    p2, _ = _puller(yf=MagicMock())
+    p2._yf_puller = None
+    monkeypatch.setattr(p2, "latest_closes", lambda tickers, as_of: {})
+    monkeypatch.setattr(p2, "_yf", lambda: None)
+    assert p2.ensure_prices(["A", "B"], AS_OF)["failed"] == 2
+
+
+def test_pull_all_ensures_prices_before_enriching_and_reports_them(monkeypatch: pytest.MonkeyPatch) -> None:
+    p, _ = _puller()
+    monkeypatch.setattr(sce, "ensure_table", lambda e: None)
+    order: list[str] = []
+    monkeypatch.setattr(p, "ensure_prices", lambda tickers, as_of=None: order.append("prices:%s" % ",".join(tickers)) or {"pulled": 3})
+    monkeypatch.setattr(p, "enrich_ticker", lambda t, as_of=None: order.append("enrich:" + t) or None)
+    out = p.pull_all(["b", "a"])
+    assert order == ["prices:B,A", "enrich:B", "enrich:A"]
+    assert out["prices"] == {"pulled": 3} and out["skipped_no_data"] == 2
+
+    # ensure_prices blowing up must not stop the enrichment.
+    monkeypatch.setattr(p, "ensure_prices", MagicMock(side_effect=RuntimeError("boom")))
+    out = p.pull_all(["a"])
+    assert out["prices"] == {"error": "boom"} and out["tickers_attempted"] == 1
