@@ -106,6 +106,21 @@ the batch URL.
 
 ## Phase 2 — Deploy the merged code to both trees
 
+> **Correction (found after writing this):** `.github/workflows/deploy.yml` already runs
+> on every push to `main` on a self-hosted runner **on grid-svr**. It resets
+> `/data/grid_v4/grid_release` to `origin/main`, installs requirements, builds the PWA,
+> and restarts `grid-api` with `WorkingDirectory=/data/grid_v4/grid_release` (a systemd
+> drop-in). It succeeded for #395, #396 and #397, so **`grid-api` is already on the
+> merged code** and `/data/grid_v4/astrogrid_dedup` is no longer what the API runs from.
+> What this phase still has to do is only the **Hermes tree**
+> (`/home/grid/grid_v4/grid_repo`, WorkingDirectory of `grid-hermes`, `grid-intelligence`,
+> `grid-realtime`, …): fast-forward it to `origin/main` and `pip install`. Skip the
+> `astrogrid_dedup` pull and the PWA build below. Expect `grid-api` to restart by itself
+> a minute or two after any merge to `main`.
+>
+> `.github/workflows/ops-bringup.yml` (PR #398) runs this whole runbook on that runner
+> as a re-runnable verification pass; use it after the manual run, not concurrently.
+
 Files changed by #395/#396 that matter at runtime (tests and docs excluded; deletions of
 dead PWA sources are harmless on the server because the PWA is rebuilt from source):
 
