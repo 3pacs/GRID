@@ -13,7 +13,7 @@ import {
     EDGE_DEFAULT_COLOR,
     EDGE_LEGEND,
     edgeColorForType,
-} from '../components/canvas/nodeStyles.js';
+} from '../canvas/nodeStyles.js';
 
 const { default: useCanvasStore } = await import('../canvas/CanvasStore.js');
 

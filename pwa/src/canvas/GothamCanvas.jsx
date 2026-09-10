@@ -29,7 +29,7 @@ import TemporalScrubber from './TemporalScrubber.jsx';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts.js';
 import { useCommunities } from './hooks/useCommunities.js';
 import { useEventStream } from '../hooks/useEventStream.js';
-import { EDGE_LEGEND } from '../components/canvas/nodeStyles.js';
+import { EDGE_LEGEND } from './nodeStyles.js';
 
 // ── Lens lenses — lazy-loaded to keep the graph bundle lean ──
 const CanvasSupplyLens = React.lazy(() => import('../views/canvas_lenses/SupplyLens.jsx'));

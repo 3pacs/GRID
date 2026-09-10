@@ -5,7 +5,7 @@
 
 import { create } from 'zustand';
 import Graph from 'graphology';
-import { edgeColorForType } from '../components/canvas/nodeStyles.js';
+import { edgeColorForType } from './nodeStyles.js';
 
 const useCanvasStore = create((set, get) => ({
     // ── Graph state ──
