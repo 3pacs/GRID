@@ -417,14 +417,27 @@ def ensure_sponsor_map_table(engine: Any) -> bool:
     key = id(engine)
     if key in _TABLE_ENSURED:
         return True
+    # The table is normally created by migration 0060 as the postgres owner and
+    # only GRANTed to the app role, so CREATE INDEX (even IF NOT EXISTS) raises
+    # "must be owner of table" for the app. Treat the index as best-effort and
+    # judge readiness by whether the table can be read.
     try:
         with engine.begin() as conn:
             conn.execute(_ENSURE_TABLE_SQL)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("sponsor_resolver: ensure table DDL skipped: {e}", e=str(exc))
+    try:
+        with engine.begin() as conn:
             conn.execute(_ENSURE_INDEX_SQL)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("sponsor_resolver: index DDL skipped (migration owns it): {e}", e=str(exc))
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1 FROM sponsor_ticker_map LIMIT 1")).fetchall()
         _TABLE_ENSURED.add(key)
         return True
     except Exception as exc:  # noqa: BLE001
-        log.warning("sponsor_resolver: ensure_sponsor_map_table failed: {e}", e=str(exc))
+        log.warning("sponsor_resolver: sponsor_ticker_map not usable: {e}", e=str(exc))
         return False
 
 

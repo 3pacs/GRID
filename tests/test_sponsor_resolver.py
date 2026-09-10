@@ -329,3 +329,60 @@ def test_migration_0060_matches_the_module_ddl() -> None:
     for col in ("sponsor_norm", "ticker", "source", "confidence", "resolved_at", "notes"):
         assert col in sql and col in str(sr._ENSURE_TABLE_SQL)
     assert "GRANT ALL ON sponsor_ticker_map TO grid;" in sql
+
+
+# ── cache table readiness (migration owns the DDL; app role may not) ───────
+
+
+class _DdlEngine(_FakeEngine):
+    """Raises on the DDL statements the app role is not allowed to run."""
+
+    def __init__(self, *, fail_table: bool = False, fail_index: bool = False, fail_select: bool = False) -> None:
+        super().__init__()
+        self.fail_table, self.fail_index, self.fail_select = fail_table, fail_index, fail_select
+
+    def connect(self) -> "_DdlConn":
+        return _DdlConn(self)
+
+    def begin(self) -> "_DdlConn":
+        return _DdlConn(self)
+
+
+class _DdlConn(_FakeConn):
+    def execute(self, stmt: Any, params: Any = None) -> MagicMock:
+        sql = str(stmt)
+        eng = self._engine
+        eng.calls.append((sql, params or {}))  # record even when the statement fails
+        if "CREATE TABLE" in sql and eng.fail_table:
+            raise RuntimeError("permission denied for schema public")
+        if "CREATE INDEX" in sql and eng.fail_index:
+            raise RuntimeError("must be owner of table sponsor_ticker_map")
+        if sql.strip().startswith("SELECT 1 FROM sponsor_ticker_map") and eng.fail_select:
+            raise RuntimeError('relation "sponsor_ticker_map" does not exist')
+        eng.calls.pop()  # the base class records it again
+        return super().execute(stmt, params)
+
+
+def test_ensure_table_tolerates_index_ownership_error_when_table_is_readable() -> None:
+    eng = _DdlEngine(fail_index=True)
+    assert sr.ensure_sponsor_map_table(eng) is True
+    sqls = [s for s, _ in eng.calls]
+    assert any("CREATE TABLE" in s for s in sqls) and any("CREATE INDEX" in s for s in sqls)
+    assert any(s.strip().startswith("SELECT 1 FROM sponsor_ticker_map") for s in sqls)
+    # Cached per engine: a second call issues no statements.
+    n = len(eng.calls)
+    assert sr.ensure_sponsor_map_table(eng) is True and len(eng.calls) == n
+
+
+def test_ensure_table_tolerates_table_ddl_error_too() -> None:
+    eng = _DdlEngine(fail_table=True, fail_index=True)
+    assert sr.ensure_sponsor_map_table(eng) is True
+
+
+def test_ensure_table_reports_unusable_when_select_fails_and_does_not_cache() -> None:
+    eng = _DdlEngine(fail_table=True, fail_index=True, fail_select=True)
+    assert sr.ensure_sponsor_map_table(eng) is False
+    assert id(eng) not in sr._TABLE_ENSURED
+    # Not cached -> retried next time (e.g. after the migration runs).
+    eng.fail_select = False
+    assert sr.ensure_sponsor_map_table(eng) is True

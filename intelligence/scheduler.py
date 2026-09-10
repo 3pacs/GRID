@@ -414,9 +414,11 @@ def run_intelligence_loop() -> None:
         except Exception as exc:  # noqa: BLE001
             log.warning("small-cap enrichment daily failed: {e}", e=str(exc))
 
+    # Order matters: the signal's cap gate reads company_profiles.market_cap,
+    # which the enrichment writes — so enrich before scoring.
     _sched.every().day.at("05:40").do(_trial_ingestor_daily)
-    _sched.every().day.at("05:55").do(_trial_signal_daily)
-    _sched.every().day.at("06:05").do(_small_cap_enrichment_daily)
+    _sched.every().day.at("05:52").do(_small_cap_enrichment_daily)
+    _sched.every().day.at("06:05").do(_trial_signal_daily)
 
     def _actor_trust_cog_recompute() -> None:
         """INTEL-2: recompute trust-vs-cog classification for every lever puller."""

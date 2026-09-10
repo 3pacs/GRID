@@ -331,3 +331,120 @@ def test_hermes_registry_pins() -> None:
     }
     keys = list(ho._SOURCE_EXTRAS)
     assert keys.index("trial_signal") < keys.index("small_cap_enrichment")
+
+
+# ── derived market cap + SEC sector (FMP v3 deprecated) ───────────────────
+
+
+@pytest.mark.parametrize(
+    "shares,price,expected",
+    [
+        (50_000_000, 12.5, 625_000_000.0),
+        ("50000000", "12.5", 625_000_000.0),
+        (None, 12.5, None),
+        (50_000_000, None, None),
+        (0, 12.5, None),
+        (50_000_000, -1.0, None),
+        (float("nan"), 12.5, None),
+        ("abc", 12.5, None),
+    ],
+)
+def test_derive_market_cap(shares: Any, price: Any, expected: float | None) -> None:
+    assert sce.derive_market_cap(shares, price) == expected
+
+
+@pytest.mark.parametrize(
+    "sic,expected",
+    [
+        (2834, "Healthcare"), ("2836", "Healthcare"), (3841, "Healthcare"), (8071, "Healthcare"),
+        (7372, "Technology"), (3674, "Technology"), (1090, "Materials"), (1311, "Energy"),
+        (2860, "Materials"), (3711, "Industrials"), (4911, "Utilities"), (6770, "Financials"),
+        (9999, None), (None, None), ("", None), ("n/a", None),
+    ],
+)
+def test_sector_from_sic(sic: Any, expected: str | None) -> None:
+    assert sce.sector_from_sic(sic) == expected
+
+
+def test_sec_submissions_maps_sic_to_sector_and_degrades(monkeypatch: pytest.MonkeyPatch) -> None:
+    import grid.signals.sponsor_resolver as sr
+
+    monkeypatch.setattr(sr, "sec_cik_for_ticker", lambda t: "0000000001" if t == "SMLX" else None)
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {"sic": "2834", "sicDescription": "PHARMACEUTICAL PREPARATIONS", "name": "SMALLEX BIO INC"}
+    ok = MagicMock(return_value=resp)
+    p, _ = _puller(http_get=ok)
+    out = p.sec_submissions("SMLX")
+    assert out == {
+        "sic": "2834", "sic_description": "PHARMACEUTICAL PREPARATIONS", "sector": "Healthcare",
+        "industry": "Pharmaceutical Preparations", "name": "Smallex Bio Inc",
+    }
+    assert ok.call_args.args[0] == "https://data.sec.gov/submissions/CIK0000000001.json"
+    assert ok.call_args.kwargs["headers"]["User-Agent"] == sce.SEC_UA
+
+    assert p.sec_submissions("NOCIK") == {} and ok.call_count == 1   # no CIK -> no request
+    resp.status_code = 429
+    assert p.sec_submissions("SMLX") == {}
+    boom = MagicMock(side_effect=ConnectionError("sec down"))
+    p, _ = _puller(http_get=boom)
+    assert p.sec_submissions("SMLX") == {}
+
+
+def test_latest_price_is_pit_bounded_over_yf_and_tiingo_closes() -> None:
+    p, engine = _puller()
+    conn = engine.connect.return_value.__enter__.return_value
+    conn.execute.return_value.first.return_value = (12.5,)
+    assert p.latest_price("smlx", AS_OF) == 12.5
+    stmt, params = conn.execute.call_args.args
+    sql = str(stmt)
+    assert "series_id = ANY(:series_ids)" in sql and "obs_date <= :as_of" in sql and "pull_timestamp <= :as_of_ts" in sql
+    assert "%" not in sql and "format(" not in sql
+    assert params["series_ids"] == ["YF:SMLX:adj_close", "YF:SMLX:close", "TIINGO:SMLX:adj_close", "TIINGO:SMLX:close"]
+    assert params["as_of"] == AS_OF and params["as_of_ts"].date() == AS_OF and params["as_of_ts"].tzinfo is not None
+    conn.execute.return_value.first.return_value = None
+    assert p.latest_price("SMLX", AS_OF) is None
+    conn.execute.side_effect = RuntimeError("db down")
+    assert p.latest_price("SMLX", AS_OF) is None
+
+
+def test_enrich_ticker_derives_cap_from_sec_shares_and_sector_from_submissions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No FMP key, no Tiingo cap: cap = SEC shares × PIT close; sector/industry from SEC SIC."""
+    p, _ = _puller(api_key="")
+    monkeypatch.setattr(p, "tiingo_market_cap", lambda t, as_of: None)
+    monkeypatch.setattr(p, "sec_fields", lambda t: sce.parse_sec_companyfacts(_FACTS))
+    monkeypatch.setattr(p, "latest_price", lambda t, as_of: 12.5)
+    monkeypatch.setattr(p, "sec_submissions", lambda t: {
+        "sic": "2834", "sic_description": "PHARMACEUTICAL PREPARATIONS", "sector": "Healthcare",
+        "industry": "Pharmaceutical Preparations", "name": "Smallex Bio Inc",
+    })
+    row = p.enrich_ticker("SMLX", AS_OF)
+    assert row is not None
+    prof = row["profile"]
+    assert prof["market_cap"] == 50_000_000 * 12.5 == 625_000_000.0
+    assert prof["shares_outstanding"] == 50_000_000 and prof["cash"] == 120e6
+    assert row["sector"] == prof["sector"] == "Healthcare" and prof["industry"] == "Pharmaceutical Preparations"
+    assert row["name"] == "Smallex Bio Inc"
+    assert prof["enrichment_source"] == "sec_xbrl,derived_shares_x_price,sec_submissions"
+
+    # No price known -> cap stays None (the signal's cap gate must treat it as unknown, not zero).
+    monkeypatch.setattr(p, "latest_price", lambda t, as_of: None)
+    prof = p.enrich_ticker("SMLX", AS_OF)["profile"]
+    assert prof["market_cap"] is None and "derived_shares_x_price" not in prof["enrichment_source"]
+
+    # A reported cap is never overridden by the derived one, and a known sector is kept.
+    monkeypatch.setattr(p, "tiingo_market_cap", lambda t, as_of: 1.1e9)
+    monkeypatch.setattr(p, "latest_price", MagicMock(side_effect=AssertionError("price not needed when a cap is reported")))
+    prof = p.enrich_ticker("SMLX", AS_OF)["profile"]
+    assert prof["market_cap"] == 1.1e9 and prof["enrichment_source"] == "tiingo,sec_xbrl,sec_submissions"
+
+
+def test_enrich_ticker_survives_submissions_miss() -> None:
+    p, _ = _puller(api_key="")
+    p.tiingo_market_cap = lambda t, as_of: None  # type: ignore[method-assign]
+    p.sec_fields = lambda t: sce.parse_sec_companyfacts(_FACTS)  # type: ignore[method-assign]
+    p.latest_price = lambda t, as_of: 10.0  # type: ignore[method-assign]
+    p.sec_submissions = lambda t: {}  # type: ignore[method-assign]
+    row = p.enrich_ticker("SMLX", AS_OF)
+    assert row is not None
+    assert row["profile"]["market_cap"] == 500_000_000.0 and row["profile"]["sector"] is None
+    assert row["profile"]["enrichment_source"] == "sec_xbrl,derived_shares_x_price"
