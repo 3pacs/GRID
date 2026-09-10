@@ -21,13 +21,26 @@ so downstream features can consume it without re-deriving.
 
 FRED series pulled (all quarterly):
 
-- ``NCBBCCB1Q027S``        — Nonfinancial corporate business, net equity
-                              repurchases (Z.1 Flow of Funds, $ mil SAAR)
+- ``NCBCEBQ027S``          — Nonfinancial corporate business, corporate
+                              equities liability, transactions (Z.1 Flow of
+                              Funds, $ mil SAAR). **Sign-flipped** — see below.
 - ``CPATAX``               — Corporate profits after tax
 - ``BOGZ1FU104122005Q``    — Nonfinancial corporate business, net
                               purchases of equities
-- ``NCBEIAQ027S``          — Nonfinancial corporate business, capital
-                              expenditures
+- ``BOGZ1FA105050005Q``    — Nonfinancial corporate business, total capital
+                              expenditures (Z.1, $ mil SAAR)
+
+Sign convention for ``net_repurchases``: FRED publishes the Z.1 line as net
+*issuance* of corporate equities, where a negative value means the sector
+retired more equity than it issued — i.e. bought back stock. GRID's label is
+``net_repurchases``, so the puller stores ``-1 x`` the FRED value: positive
+means buybacks exceeded issuance. The multiplier lives in ``BUYBACK_SERIES``
+under ``sign`` and is recorded in each row's ``raw_payload`` so the
+transformation is visible downstream.
+
+Predecessor ids ``NCBBCCB1Q027S`` (net_repurchases) and ``NCBEIAQ027S``
+(capex) were retired by FRED and returned HTTP 400 on every pull, which left
+``buybacks:execution_ratio`` with no fresh data.
 
 The composite ``buybacks:execution_ratio`` is only written for periods
 where both net repurchases and profits-after-tax are present and profits
@@ -55,37 +68,52 @@ import requests
 from loguru import logger as log
 from sqlalchemy.engine import Engine
 
-from ingestion.base import BasePuller, retry_on_failure
+from ingestion.base import (
+    BasePuller,
+    log_fred_series_failure,
+    retry_on_failure,
+)
 
 # ---------------------------------------------------------------------------
 # FRED series configuration
 # ---------------------------------------------------------------------------
 
 #: Mapping of short GRID label → FRED series config. The short label is
-#: used as the ``raw_series.series_id`` suffix (``buybacks:<label>``).
-BUYBACK_SERIES: dict[str, dict[str, str]] = {
+#: used as the ``raw_series.series_id`` suffix (``buybacks:<label>``) and is
+#: part of the storage contract — ids may be re-pointed, labels may not.
+#:
+#: ``sign`` is the multiplier applied to every observation before storage,
+#: reconciling FRED's published direction with the GRID label's meaning. It
+#: defaults to ``1.0`` and is recorded in ``raw_payload``.
+BUYBACK_SERIES: dict[str, dict[str, Any]] = {
     "net_repurchases": {
-        "fred_id": "NCBBCCB1Q027S",
+        "fred_id": "NCBCEBQ027S",
+        "sign": -1.0,
         "description": (
-            "Nonfinancial corporate business, net equity repurchases "
-            "(Z.1 Flow of Funds, quarterly, $ millions SAAR)"
+            "Nonfinancial corporate business, corporate equities liability, "
+            "transactions (Z.1 Flow of Funds, quarterly, $ millions SAAR). "
+            "FRED publishes net issuance; stored negated so positive means "
+            "net repurchases."
         ),
     },
     "profits_after_tax": {
         "fred_id": "CPATAX",
+        "sign": 1.0,
         "description": "Corporate profits after tax ($ billions SAAR)",
     },
     "net_equity_purchases": {
         "fred_id": "BOGZ1FU104122005Q",
+        "sign": 1.0,
         "description": (
             "Nonfinancial corporate business, net purchases of equities "
             "(Z.1, quarterly, $ millions)"
         ),
     },
     "capex": {
-        "fred_id": "NCBEIAQ027S",
+        "fred_id": "BOGZ1FA105050005Q",
+        "sign": 1.0,
         "description": (
-            "Nonfinancial corporate business, capital expenditures "
+            "Nonfinancial corporate business, total capital expenditures "
             "(Z.1, quarterly, $ millions SAAR)"
         ),
     },
@@ -122,7 +150,7 @@ class BuybackSnapshot:
     Attributes:
         period_end: Observation date (quarter end, FRED convention).
         net_repurchases_usd: Net equity repurchases for the quarter
-            (USD, raw FRED units — millions for NCBBCCB1Q027S, billions
+            (USD, raw FRED units — millions for NCBCEBQ027S, billions
             for CPATAX). The ratio is unit-agnostic so this is fine for
             *relative* trend work; absolute dollars would require unit
             reconciliation.
@@ -237,7 +265,7 @@ class BuybackExecutionPuller(BasePuller):
         those observations (with a warning).
 
         Parameters:
-            fred_id: FRED series identifier (e.g. ``NCBBCCB1Q027S``).
+            fred_id: FRED series identifier (e.g. ``NCBCEBQ027S``).
             start_date: Earliest observation date to request.
             end_date: Latest observation date to request. Defaults to
                 today.
@@ -318,17 +346,19 @@ class BuybackExecutionPuller(BasePuller):
 
         fetched: dict[str, list[tuple[date, float]]] = {}
         for label, cfg in BUYBACK_SERIES.items():
-            fred_id = cfg["fred_id"]
+            fred_id = str(cfg["fred_id"])
             try:
-                fetched[label] = self._fetch_fred_series(
+                rows = self._fetch_fred_series(
                     fred_id, start_date=start_date, end_date=end_date
                 )
+                sign = float(cfg.get("sign", 1.0))
+                if sign != 1.0:
+                    rows = [(obs_date, value * sign) for obs_date, value in rows]
+                fetched[label] = rows
             except Exception as exc:  # noqa: BLE001
-                log.error(
-                    "BuybackExecutionPuller: failed to fetch {fid} ({lbl}): {e}",
-                    fid=fred_id,
-                    lbl=label,
-                    e=str(exc),
+                # A 400 means FRED retired the id — configuration, not a bug.
+                log_fred_series_failure(
+                    self.SOURCE_NAME, label, fred_id, exc
                 )
                 fetched[label] = []
             time.sleep(_RATE_LIMIT_DELAY)
@@ -393,6 +423,7 @@ class BuybackExecutionPuller(BasePuller):
                         raw_payload={
                             "fred_series": BUYBACK_SERIES[label]["fred_id"],
                             "label": label,
+                            "sign": BUYBACK_SERIES[label].get("sign", 1.0),
                         },
                     )
                     inserted += 1
