@@ -11,13 +11,18 @@ Pure functions only — no DB, no network.
 """
 from __future__ import annotations
 
+import json
 import math
-from datetime import date
+from datetime import date, timedelta
+from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
 from intelligence import catalyst_ev as ce
+
+AS_OF = date(2026, 9, 10)
 
 
 # ── normalize_phase / lookups ─────────────────────────────────────────────
@@ -424,3 +429,279 @@ def test_ev_ranks_the_crashed_catalyst_name_above_the_flat_compounder() -> None:
     assert crashed is not None and compounder is not None
     assert crashed["expected_value_multiple"] > compounder["expected_value_multiple"]
     assert crashed["reward_to_risk"] > compounder["reward_to_risk"]
+
+
+# ── board assembly ────────────────────────────────────────────────────────
+
+
+def _patch_board(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    scored: list[dict[str, Any]] | None = None,
+    prices: dict[str, float] | None = None,
+) -> None:
+    """Stub the two cross-module reads the board makes.
+
+    ``_load_spot_prices`` goes through ``long_plays._load_adj_close``, so
+    patching that keeps this module's own loader in the path.
+    """
+    monkeypatch.setattr(
+        "intelligence.trial_outcomes.load_scored_outcomes",
+        lambda engine, as_of=None: list(scored or []),
+    )
+    default = {t: 6.0 for t in ("GEMX", "NOOPT", "NOBS", "LOWP", "HIGHP", "MIDP")}
+    series = {t: [(AS_OF, px)] for t, px in (prices if prices is not None else default).items()}
+    monkeypatch.setattr(
+        "intelligence.long_plays._load_adj_close",
+        lambda engine, tickers, years, as_of: series,
+    )
+
+
+def _board_engine(
+    *,
+    catalysts: list[Any],
+    profiles: list[Any],
+    options: list[Any],
+) -> MagicMock:
+    """Engine routing each loader's SQL to its fixture rows."""
+    conn = MagicMock()
+    conn.__enter__ = MagicMock(return_value=conn)
+    conn.__exit__ = MagicMock(return_value=False)
+
+    def execute(stmt: Any, params: Any = None) -> MagicMock:
+        sql = str(stmt)
+        result = MagicMock()
+        if "FROM catalyst_calendar" in sql:
+            result.fetchall.return_value = catalysts
+        elif "FROM company_profiles" in sql:
+            result.fetchall.return_value = profiles
+        elif "FROM options_daily_signals" in sql:
+            result.fetchall.return_value = options
+        else:
+            result.fetchall.return_value = []
+        return result
+
+    conn.execute.side_effect = execute
+    engine = MagicMock()
+    engine.connect.return_value = conn
+    engine.begin.return_value = conn
+    return engine
+
+
+def _catalyst_row(
+    ticker: str = "GEMX",
+    *,
+    days_out: int = 120,
+    phase: str = "PHASE3",
+    indication: str = "oncology",
+    designation: str | None = "Fast Track",
+    runway: float | None = 18.0,
+) -> tuple:
+    return (
+        ticker, "READOUT", AS_OF + timedelta(days=days_out), phase, indication,
+        designation, 0.8, 100.0, 0.66, "BUY", 700.0, runway,
+    )
+
+
+def _profile_row(
+    ticker: str = "GEMX",
+    *,
+    cash: float | None = 3.0e8,
+    debt: float | None = 2.0e7,
+    shares: float | None = 5.0e7,
+    burn_q: float | None = 3.0e7,
+    runway: float | None = 18.0,
+) -> tuple:
+    return (
+        ticker,
+        {
+            "cash": cash, "total_debt": debt, "shares_outstanding": shares,
+            "quarterly_burn": burn_q, "cash_runway_months": runway,
+            "market_cap": 7.0e8, "sector": "Healthcare", "industry": "Biotechnology",
+        },
+    )
+
+
+def _option_row(ticker: str = "GEMX", *, spot: float = 6.0, iv: float = 1.1) -> tuple:
+    return (ticker, spot, iv, AS_OF - timedelta(days=1))
+
+
+def test_a_fully_anchored_catalyst_gets_ranked_with_its_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_board(monkeypatch)
+    engine = _board_engine(
+        catalysts=[_catalyst_row()], profiles=[_profile_row()], options=[_option_row()],
+    )
+    board = ce.build_catalyst_board(engine, as_of=AS_OF)
+
+    assert board["catalysts_considered"] == 1
+    assert board["ranked_total"] == 1 and not board["unranked"]
+    row = board["ranked"][0]
+
+    assert row["ticker"] == "GEMX"
+    assert row["expected_value_multiple"] is not None
+    # the evidence that produced P(success) travels with the row
+    assert row["p_success_phase"] == "PHASE3"
+    assert set(row["p_success_factors"]) == {"indication", "endpoint_clarity", "fda_designation", "enrollment"}
+    assert row["p_success_basis"] == "literature_prior"
+    # both anchors are real
+    assert row["upside_basis"] == "options_iv_lognormal_tail"
+    assert row["net_cash_per_share"] == pytest.approx((3.0e8 - 2.0e7) / 5.0e7)
+    assert row["total_debt_known"] is True
+    assert row["runway_covers_catalyst"] is True
+    assert row["blocking_reasons"] == []
+    json.dumps(board)
+
+
+def test_the_runway_gate_is_hard_even_when_the_arithmetic_looks_good(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cash that does not reach the readout means the holders get diluted."""
+    _patch_board(monkeypatch)
+    engine = _board_engine(
+        # readout 12 months out, 4 months of cash
+        catalysts=[_catalyst_row(days_out=365, runway=4.0)],
+        profiles=[_profile_row(runway=4.0)],
+        options=[_option_row()],
+    )
+    board = ce.build_catalyst_board(engine, as_of=AS_OF)
+    assert board["ranked_total"] == 0
+    row = board["unranked"][0]
+    assert row["runway_covers_catalyst"] is False
+    assert "runway_short" in row["blocking_reasons"]
+    assert board["unranked_reasons"]["runway_short"] == 1
+    # the EV is withheld rather than shown alongside a failed hard gate
+    assert row["expected_value_multiple"] is None
+
+
+def test_a_name_with_no_chain_is_unranked_not_bad(monkeypatch: pytest.MonkeyPatch) -> None:
+    """"Cannot price this yet" and "bad bet" must not look the same."""
+    _patch_board(monkeypatch)
+    engine = _board_engine(
+        catalysts=[_catalyst_row("NOOPT")], profiles=[_profile_row("NOOPT")], options=[],
+    )
+    board = ce.build_catalyst_board(engine, as_of=AS_OF)
+    assert board["ranked_total"] == 0
+    assert board["unranked"][0]["blocking_reasons"] == ["no_option_chain"]
+    assert board["unranked_reasons"] == {"no_option_chain": 1}
+    # and the board says what to do about it rather than staying silent
+    assert any("Run the options puller" in n for n in board["method_notes"])
+
+
+def test_an_unmeasured_balance_sheet_blocks_rather_than_assuming_no_debt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_board(monkeypatch)
+    engine = _board_engine(
+        catalysts=[_catalyst_row("NOBS")],
+        profiles=[_profile_row("NOBS", cash=None, shares=None)],
+        options=[_option_row("NOBS")],
+    )
+    board = ce.build_catalyst_board(engine, as_of=AS_OF)
+    assert board["ranked_total"] == 0
+    assert "balance_sheet_unknown" in board["unranked"][0]["blocking_reasons"]
+
+
+def test_unknown_debt_is_penalised_not_assumed_clean(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ignoring debt overstates a cash floor, which understates the risk."""
+    _patch_board(monkeypatch)
+    known = ce.build_catalyst_board(
+        _board_engine(catalysts=[_catalyst_row()], profiles=[_profile_row(debt=0.0)], options=[_option_row()]),
+        as_of=AS_OF,
+    )["ranked"][0]
+    unknown = ce.build_catalyst_board(
+        _board_engine(catalysts=[_catalyst_row()], profiles=[_profile_row(debt=None)], options=[_option_row()]),
+        as_of=AS_OF,
+    )["ranked"][0]
+    assert known["total_debt_known"] is True and unknown["total_debt_known"] is False
+    # same cash, but the unmeasured balance sheet gets a smaller credited floor
+    assert unknown["downside_multiple"] < known["downside_multiple"]
+
+
+def test_ranking_is_by_expected_value_descending(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_board(monkeypatch)
+    engine = _board_engine(
+        catalysts=[
+            _catalyst_row("LOWP", phase="PHASE1", designation=None),
+            _catalyst_row("HIGHP", phase="FILED", indication="hematology"),
+            _catalyst_row("MIDP", phase="PHASE3"),
+        ],
+        profiles=[_profile_row("LOWP"), _profile_row("HIGHP"), _profile_row("MIDP")],
+        options=[_option_row("LOWP"), _option_row("HIGHP"), _option_row("MIDP")],
+    )
+    board = ce.build_catalyst_board(engine, as_of=AS_OF)
+    evs = [r["expected_value_multiple"] for r in board["ranked"]]
+    assert evs == sorted(evs, reverse=True)
+    # a filed-and-haematology name outranks a phase 1 oncology one on the same chart
+    assert board["ranked"][0]["ticker"] == "HIGHP"
+
+
+def test_the_option_tenor_outlives_the_catalyst(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An expiry before the readout prices the wrong event."""
+    _patch_board(monkeypatch)
+    engine = _board_engine(
+        catalysts=[_catalyst_row(days_out=200)], profiles=[_profile_row()], options=[_option_row()],
+    )
+    row = ce.build_catalyst_board(engine, as_of=AS_OF)["ranked"][0]
+    assert row["days_to_expiry"] == 200 + ce.OPTION_TENOR_BUFFER_DAYS
+
+
+def test_the_board_reports_which_regime_produced_p_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Literature prior vs GRID's own tape must never be ambiguous."""
+    _patch_board(monkeypatch)
+    thin = ce.build_catalyst_board(
+        _board_engine(catalysts=[_catalyst_row()], profiles=[_profile_row()], options=[_option_row()]),
+        as_of=AS_OF,
+    )
+    assert thin["p_success_basis"] == "literature_prior"
+    assert any("literature priors" in n and "floor is 30" in n for n in thin["method_notes"])
+
+    _patch_board(
+        monkeypatch, scored=[{"trial_phase": "PHASE3", "fwd_return_30d": 0.5}] * 40,
+    )
+    fitted = ce.build_catalyst_board(
+        _board_engine(catalysts=[_catalyst_row()], profiles=[_profile_row()], options=[_option_row()]),
+        as_of=AS_OF,
+    )
+    assert fitted["p_success_basis"] == "grid_realized_outcomes"
+    assert fitted["ranked"][0]["p_success_base_rate"] == pytest.approx(1.0)
+    assert any("fitted from 40 scored GRID readouts" in n for n in fitted["method_notes"])
+
+
+def test_every_loader_is_pit_bounded_and_parameterised(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_board(monkeypatch)
+    engine = _board_engine(
+        catalysts=[_catalyst_row()], profiles=[_profile_row()], options=[_option_row()],
+    )
+    ce.build_catalyst_board(engine, as_of=AS_OF)
+    conn = engine.connect.return_value
+    seen = {str(c.args[0]): (c.args[1] if len(c.args) > 1 else {}) for c in conn.execute.call_args_list}
+
+    catalyst_sql = next(s for s in seen if "FROM catalyst_calendar" in s)
+    assert "expected_date >= :as_of" in catalyst_sql and "expected_date <= :max_date" in catalyst_sql
+    assert "ts.created_at <= :as_of_ts" in catalyst_sql
+    assert seen[catalyst_sql]["as_of"] == AS_OF
+
+    profile_sql = next(s for s in seen if "FROM company_profiles" in s)
+    assert "last_analyzed <= :as_of_ts" in profile_sql
+    assert seen[profile_sql]["as_of_ts"].date() == AS_OF
+
+    options_sql = next(s for s in seen if "FROM options_daily_signals" in s)
+    # bounded on both sides — this reads a dated snapshot table
+    assert "signal_date >= :start" in options_sql and "signal_date <= :as_of" in options_sql
+    assert seen[options_sql]["as_of"] == AS_OF
+
+    src = Path(ce.__file__).read_text(encoding="utf-8")
+    assert 'f"""' not in src and "f'''" not in src and ".format(" not in src
+
+
+def test_a_failing_source_degrades_the_board_without_raising(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_board(monkeypatch)
+    broken = MagicMock()
+    broken.connect.side_effect = RuntimeError("relation does not exist")
+    board = ce.build_catalyst_board(broken, as_of=AS_OF)
+    assert board["ranked"] == [] and board["catalysts_considered"] == 0
+    notes = "\n".join(board["method_notes"])
+    assert "catalyst_calendar: unavailable" in notes
+    assert "company_profiles: unavailable" in notes

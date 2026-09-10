@@ -43,10 +43,12 @@ Honesty rules (read before touching any number here)
   debt per share over price, haircut by the burn to the catalyst. A name
   trading under net cash has a floor; a name at 5x net cash does not.
 * ``upside_multiple`` is anchored on the **options market's own implied
-  distribution** (``intelligence.market_implied_prob``) where a chain
-  exists, else on realized comparable readouts, else it is ``None`` and the
-  name is not ranked. A missing anchor produces no row rather than an
-  invented one.
+  distribution** (``intelligence.market_implied_prob``). A name with no
+  listed chain has no upside anchor and is returned under ``unranked``
+  with ``no_option_chain``, never with a substituted default: "we cannot
+  price this yet" and "this is a bad bet" are different answers and the
+  board must not blur them. Its downside floor is still computed, because
+  spot comes from the PIT price history rather than the chain.
 * ``runway_covers_catalyst`` is a hard gate and it is the one that matters
   most: if the cash runs out before the readout, the equity is diluted
   away regardless of the science. This replaces the absolute
@@ -61,14 +63,22 @@ Public API
 ----------
 ``success_probability(...)``, ``downside_multiple(...)``,
 ``upside_multiple_from_iv(...)``, ``catalyst_ev(...)``,
-``runway_covers_catalyst(...)``, ``months_between(...)``
+``runway_covers_catalyst(...)``, ``months_between(...)``,
+``build_catalyst_board(engine, *, as_of=None, ...)``
 """
 
 from __future__ import annotations
 
+import json
 import math
-from datetime import date
-from typing import Any
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Callable, Sequence, TypeVar
+
+from loguru import logger as log
+from sqlalchemy import text
+from sqlalchemy.engine import Engine
+
+T = TypeVar("T")
 
 # ── Base rates ────────────────────────────────────────────────────────────
 #
@@ -573,3 +583,483 @@ def catalyst_ev(
         out["market_implied_probability"] = round(clamp(implied, 0.0, 1.0), 4)
         out["edge_vs_market"] = round(p - clamp(implied, 0.0, 1.0), 4)
     return out
+
+
+# ── Board assembly ────────────────────────────────────────────────────────
+#
+# Everything above is pure. Everything below reads the database, PIT-bounded
+# on ``as_of``, and degrades a failing source to a ``method_notes`` line
+# rather than an exception.
+
+DEFAULT_HORIZON_DAYS: int = 548          # 18 months, the gate's horizon
+DEFAULT_TOP_K: int = 40
+OPTION_TENOR_BUFFER_DAYS: int = 30       # the contract must outlive the event
+PROFILE_KEYS: tuple[str, ...] = (
+    "cash", "total_debt", "shares_outstanding", "quarterly_burn",
+    "cash_runway_months", "market_cap", "sector", "industry",
+)
+# Applied on top of the normal failure haircut when total_debt is unmeasured.
+# Ignoring debt overstates a cash floor, and overstating the floor understates
+# the risk — so an unmeasured balance sheet is penalised, never assumed clean.
+UNKNOWN_DEBT_HAIRCUT: float = 0.6
+
+_CATALYST_NAMES_SQL = text(
+    """
+    SELECT DISTINCT ON (cc.ticker, cc.expected_date)
+           cc.ticker,
+           cc.event_type,
+           cc.expected_date,
+           ts.trial_phase,
+           ts.primary_indication,
+           ts.fda_designation,
+           ts.endpoint_clarity,
+           ts.enrollment_pct,
+           ts.trial_strength_score,
+           ts.signal_type,
+           ts.market_cap_mm,
+           ts.cash_runway_months
+    FROM catalyst_calendar cc
+    LEFT JOIN trial_signals ts
+           ON ts.ticker = cc.ticker
+          AND ts.created_at <= :as_of_ts
+    WHERE cc.is_active
+      AND cc.expected_date >= :as_of
+      AND cc.expected_date <= :max_date
+      AND cc.ticker ~ '^[A-Z.-]{1,6}$'
+    ORDER BY cc.ticker, cc.expected_date ASC, ts.created_at DESC
+    """
+)
+
+_PROFILE_SQL = text(
+    """
+    SELECT ticker, profile
+    FROM company_profiles
+    WHERE ticker IS NOT NULL
+      AND profile IS NOT NULL
+      AND (last_analyzed IS NULL OR last_analyzed <= :as_of_ts)
+    """
+)
+
+_OPTIONS_SNAPSHOT_SQL = text(
+    """
+    SELECT DISTINCT ON (ticker) ticker, spot_price, iv_atm, signal_date
+    FROM options_daily_signals
+    WHERE ticker = ANY(:tickers)
+      AND signal_date >= :start
+      AND signal_date <= :as_of
+      AND iv_atm IS NOT NULL
+      AND spot_price IS NOT NULL
+    ORDER BY ticker, signal_date DESC
+    """
+)
+
+OPTIONS_SNAPSHOT_LOOKBACK_DAYS: int = 10
+
+
+def _safe(name: str, fn: Callable[[], T], notes: list[str], default: T) -> T:
+    """Run ``fn``; on any exception log, note it, and return ``default``."""
+    try:
+        return fn()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("catalyst_ev: {n} unavailable: {e}", n=name, e=str(exc))
+        notes.append(f"{name}: unavailable ({type(exc).__name__}: {str(exc)[:120]})")
+        return default
+
+
+def _as_of_timestamp(as_of: date) -> datetime:
+    """End of the ``as_of`` day in UTC — the PIT cut-off for timestamp columns."""
+    return datetime.combine(as_of, datetime.max.time()).replace(tzinfo=timezone.utc)
+
+
+def _norm_ticker(value: Any) -> str | None:
+    if value is None:
+        return None
+    out = str(value).strip().upper()
+    return out or None
+
+
+def _load_catalyst_names(
+    engine: Engine, as_of: date, horizon_days: int
+) -> list[dict[str, Any]]:
+    """Dated catalysts inside the horizon, with their trial evidence attached.
+
+    One row per (ticker, catalyst date), carrying the latest ``trial_signals``
+    record known at ``as_of`` — the phase, indication, designation, endpoint
+    clarity and enrollment that ``success_probability`` reads.
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(
+            _CATALYST_NAMES_SQL,
+            {
+                "as_of": as_of,
+                "as_of_ts": _as_of_timestamp(as_of),
+                "max_date": as_of + timedelta(days=int(horizon_days)),
+            },
+        ).fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        ticker = _norm_ticker(row[0])
+        if not ticker:
+            continue
+        expected = row[2]
+        expected_date = expected.date() if isinstance(expected, datetime) else expected
+        if not isinstance(expected_date, date):
+            continue
+        out.append(
+            {
+                "ticker": ticker,
+                "event_type": row[1],
+                "catalyst_date": expected_date,
+                "trial_phase": row[3],
+                "primary_indication": row[4],
+                "fda_designation": row[5],
+                "endpoint_clarity": _finite(row[6]),
+                "enrollment_pct": _finite(row[7]),
+                "trial_strength_score": _finite(row[8]),
+                "signal_type": (str(row[9]).strip().upper() if row[9] else None),
+                "market_cap_mm": _finite(row[10]),
+                "trial_runway_months": _finite(row[11]),
+            }
+        )
+    return out
+
+
+def _load_profiles(engine: Engine, as_of: date) -> dict[str, dict[str, Any]]:
+    """Balance-sheet fundamentals per ticker (PIT: ``last_analyzed <= as_of``).
+
+    Reads the profile JSONB directly rather than through
+    ``long_plays.FUNDAMENTALS_KEYS``, which omits ``total_debt`` and
+    ``quarterly_burn`` — the two fields the net-cash floor and the burn to
+    the catalyst are built from.
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(_PROFILE_SQL, {"as_of_ts": _as_of_timestamp(as_of)}).fetchall()
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        ticker = _norm_ticker(row[0])
+        if not ticker:
+            continue
+        profile = row[1]
+        if isinstance(profile, (str, bytes)):
+            try:
+                profile = json.loads(profile)
+            except (TypeError, ValueError):
+                profile = {}
+        if not isinstance(profile, dict):
+            profile = {}
+        entry: dict[str, Any] = {}
+        for key in PROFILE_KEYS:
+            value = profile.get(key)
+            entry[key] = value if key in ("sector", "industry") else _finite(value)
+        out[ticker] = entry
+    return out
+
+
+def _load_options_snapshot(
+    engine: Engine, tickers: Sequence[str], as_of: date
+) -> dict[str, dict[str, Any]]:
+    """Latest spot + ATM IV per ticker at or before ``as_of``.
+
+    Bounded on both sides of ``signal_date``. An empty result is the normal
+    state for a name with no listed chain — the caller records that the
+    upside anchor is unavailable rather than substituting one.
+    """
+    wanted = sorted({t for t in (_norm_ticker(x) for x in tickers) if t})
+    if not wanted:
+        return {}
+    with engine.connect() as conn:
+        rows = conn.execute(
+            _OPTIONS_SNAPSHOT_SQL,
+            {
+                "tickers": wanted,
+                "start": as_of - timedelta(days=OPTIONS_SNAPSHOT_LOOKBACK_DAYS),
+                "as_of": as_of,
+            },
+        ).fetchall()
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        ticker = _norm_ticker(row[0])
+        spot = _finite(row[1])
+        iv = _finite(row[2])
+        if ticker and spot and spot > 0 and iv and iv > 0:
+            signal_date = row[3]
+            out[ticker] = {
+                "spot": spot,
+                "iv_atm": iv,
+                "signal_date": (
+                    signal_date.isoformat() if hasattr(signal_date, "isoformat") else signal_date
+                ),
+            }
+    return out
+
+
+def _load_spot_prices(
+    engine: Engine, tickers: Sequence[str], as_of: date
+) -> dict[str, float]:
+    """Latest adjusted close per ticker at or before ``as_of``.
+
+    Reuses ``long_plays._load_adj_close`` — the PIT-correct reader this repo
+    already uses for the same universe — rather than opening a second path
+    to the same series.
+    """
+    from intelligence.long_plays import _load_adj_close
+
+    history = _load_adj_close(engine, tickers, 1, as_of)
+    out: dict[str, float] = {}
+    for ticker, points in history.items():
+        if not points:
+            continue
+        last = _finite(points[-1][1])
+        if last is not None and last > 0:
+            out[ticker] = last
+    return out
+
+
+def _fitted_base_rates(engine: Engine, as_of: date, notes: list[str]) -> tuple[dict[str, float] | None, str]:
+    """GRID's own phase base rates when enough readouts are scored.
+
+    Returns ``(table, basis)``. Until the scorer has run and cleared the
+    sample floor this returns ``(None, "literature_prior")`` and says so on
+    the board, so nobody mistakes a borrowed industry average for a
+    measurement.
+    """
+    from intelligence.trial_outcomes import load_scored_outcomes
+
+    scored = load_scored_outcomes(engine, as_of=as_of)
+    fitted, counts = empirical_phase_outcomes(scored)
+    if fitted:
+        notes.append(
+            f"p_success: fitted from {sum(counts.values())} scored GRID readouts {counts}"
+        )
+        return fitted, BASIS_EMPIRICAL
+    notes.append(
+        f"p_success: literature priors — only {sum(counts.values())} scored readouts "
+        f"{counts}, floor is {EMPIRICAL_MIN_SAMPLES} per phase"
+    )
+    return None, BASIS_LITERATURE
+
+
+def build_catalyst_board(
+    engine: Engine,
+    *,
+    as_of: date | None = None,
+    horizon_days: int = DEFAULT_HORIZON_DAYS,
+    top_k: int = DEFAULT_TOP_K,
+    tail_probability: float = 0.15,
+) -> dict[str, Any]:
+    """Rank dated catalysts by expected value, with the evidence attached.
+
+    Ranked on ``expected_value_multiple`` descending. A name is **ranked**
+    only when every leg is anchored — P(success), an upside from its own
+    option chain, and a net-cash downside. Names missing a leg are returned
+    under ``unranked`` with the reason, because "we cannot price this yet"
+    and "this is a bad bet" are different answers and the operator needs to
+    tell them apart.
+
+    Never raises. Every failing source degrades to a ``method_notes`` line.
+    """
+    as_of = as_of or date.today()
+    notes: list[str] = [
+        f"as_of={as_of.isoformat()}; every read PIT-bounded on that date",
+        "EV = p x upside + (1-p) x downside, in multiples of the current price; not a forecast",
+        f"upside: the price the option chain puts at a {tail_probability:.0%} tail by an expiry "
+        f"{OPTION_TENOR_BUFFER_DAYS} d past the catalyst — a lognormal understates a binary "
+        "readout, so this anchor is deliberately conservative",
+        "downside: net cash per share less burn to the catalyst, haircut for a failed readout",
+    ]
+
+    base_rates, basis = _safe(
+        "trial_outcomes", lambda: _fitted_base_rates(engine, as_of, notes), notes,
+        (None, BASIS_LITERATURE),
+    )
+    catalysts = _safe(
+        "catalyst_calendar", lambda: _load_catalyst_names(engine, as_of, horizon_days), notes, []
+    )
+    profiles = _safe("company_profiles", lambda: _load_profiles(engine, as_of), notes, {})
+    tickers = sorted({c["ticker"] for c in catalysts})
+    options = _safe(
+        "options_daily_signals", lambda: _load_options_snapshot(engine, tickers, as_of), notes, {}
+    )
+    # Spot must not depend on the option chain: a name without a chain still
+    # has a price, and therefore still has a computable net-cash floor. Only
+    # the *upside* anchor is chain-gated.
+    prices = _safe("price_history", lambda: _load_spot_prices(engine, tickers, as_of), notes, {})
+
+    if tickers and not options:
+        notes.append(
+            "options_daily_signals: no chain for any catalyst name — the upside anchor is "
+            "unavailable, so nothing can be ranked. Run the options puller over the catalyst "
+            "universe (ingestion/options.py catalyst_options_universe)"
+        )
+
+    ranked: list[dict[str, Any]] = []
+    unranked: list[dict[str, Any]] = []
+
+    for entry in catalysts:
+        try:
+            row = _score_catalyst(
+                entry,
+                profile=profiles.get(entry["ticker"]),
+                option=options.get(entry["ticker"]),
+                spot=prices.get(entry["ticker"]),
+                as_of=as_of,
+                base_rates=base_rates,
+                basis=basis,
+                tail_probability=tail_probability,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("catalyst_ev: {t} skipped: {e}", t=entry["ticker"], e=str(exc))
+            notes.append(f"{entry['ticker']}: scoring failed ({type(exc).__name__}); skipped")
+            continue
+        (ranked if row.get("expected_value_multiple") is not None else unranked).append(row)
+
+    ranked.sort(key=lambda r: (-float(r["expected_value_multiple"]), r["ticker"]))
+    unranked.sort(key=lambda r: r["ticker"])
+
+    return {
+        "as_of": as_of.isoformat(),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "horizon_days": int(horizon_days),
+        "p_success_basis": basis,
+        "catalysts_considered": len(catalysts),
+        "ranked": ranked[: max(1, int(top_k))],
+        "ranked_total": len(ranked),
+        "unranked": unranked,
+        "unranked_reasons": _reason_counts(unranked),
+        "method_notes": notes,
+    }
+
+
+def _reason_counts(rows: Sequence[dict[str, Any]]) -> dict[str, int]:
+    """Tally of why names could not be ranked — the coverage report."""
+    counts: dict[str, int] = {}
+    for row in rows:
+        for reason in row.get("blocking_reasons") or ["unknown"]:
+            counts[reason] = counts.get(reason, 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+def _score_catalyst(
+    entry: dict[str, Any],
+    *,
+    profile: dict[str, Any] | None,
+    option: dict[str, Any] | None,
+    spot: float | None,
+    as_of: date,
+    base_rates: dict[str, float] | None,
+    basis: str,
+    tail_probability: float,
+) -> dict[str, Any]:
+    """Score one dated catalyst. Always returns a row, ranked or not."""
+    ticker = entry["ticker"]
+    catalyst_date = entry["catalyst_date"]
+    months = months_between(as_of, catalyst_date)
+    days_to_catalyst = (catalyst_date - as_of).days
+    profile = profile or {}
+    blocking: list[str] = []
+
+    prob = success_probability(
+        phase=entry.get("trial_phase"),
+        indication=entry.get("primary_indication"),
+        endpoint_clarity=entry.get("endpoint_clarity"),
+        fda_designation=entry.get("fda_designation"),
+        enrollment_pct=entry.get("enrollment_pct"),
+        base_rates=base_rates,
+        basis=basis,
+    )
+
+    runway_months = profile.get("cash_runway_months")
+    if runway_months is None:
+        runway_months = entry.get("trial_runway_months")
+    runway = runway_covers_catalyst(runway_months=runway_months, months_to_catalyst=months)
+    if not runway["runway_covers_catalyst"]:
+        blocking.append(
+            "runway_short" if runway["runway_margin_months"] is not None else "runway_unknown"
+        )
+
+    # Prefer the option snapshot's spot so price and IV sit on one surface;
+    # fall back to the PIT close so a name without a chain still gets a floor.
+    spot = (option or {}).get("spot") or spot
+    if spot is None:
+        blocking.append("no_price")
+
+    shares = profile.get("shares_outstanding")
+    cash = profile.get("cash")
+    debt = profile.get("total_debt")
+    burn_q = profile.get("quarterly_burn")
+
+    net_cash_ps: float | None = None
+    monthly_burn_ps: float | None = None
+    debt_known = debt is not None
+    if cash is not None and shares is not None and shares > 0:
+        net_cash_ps = (cash - (debt or 0.0)) / shares
+        if burn_q is not None and burn_q > 0:
+            monthly_burn_ps = (burn_q / 3.0) / shares
+    else:
+        blocking.append("balance_sheet_unknown")
+
+    down = downside_multiple(
+        price=spot,
+        net_cash_per_share=net_cash_ps,
+        months_to_catalyst=months,
+        monthly_burn_per_share=monthly_burn_ps,
+        failure_haircut=0.5 if debt_known else UNKNOWN_DEBT_HAIRCUT * 0.5,
+    )
+    if down is None and not ({"balance_sheet_unknown", "no_price"} & set(blocking)):
+        blocking.append("downside_unanchored")
+
+    up = None
+    if option is not None:
+        up = upside_multiple_from_iv(
+            spot=spot,
+            iv=option.get("iv_atm"),
+            days_to_expiry=days_to_catalyst + OPTION_TENOR_BUFFER_DAYS,
+            tail_probability=tail_probability,
+        )
+        if up is None:
+            blocking.append("iv_tail_below_spot")
+    else:
+        blocking.append("no_option_chain")
+
+    market_implied: float | None = None
+    if up is not None and option is not None:
+        # The chain's own probability of reaching the same target — the
+        # number GRID's p_success is measured against.
+        market_implied = tail_probability
+
+    ev = catalyst_ev(
+        p_success=prob["p_success"],
+        upside_multiple=(up or {}).get("upside_multiple"),
+        downside_multiple=(down or {}).get("downside_multiple"),
+        market_implied_p=market_implied,
+    )
+    # The runway gate is a hard gate: a name whose cash does not reach its
+    # own readout is not ranked, however attractive the arithmetic looks.
+    if ev is not None and not runway["runway_covers_catalyst"]:
+        ev = None
+
+    row: dict[str, Any] = {
+        "ticker": ticker,
+        "event_type": entry.get("event_type"),
+        "catalyst_date": catalyst_date.isoformat(),
+        "months_to_catalyst": round(months, 2),
+        "trial_phase": entry.get("trial_phase"),
+        "primary_indication": entry.get("primary_indication"),
+        "fda_designation": entry.get("fda_designation"),
+        "signal_type": entry.get("signal_type"),
+        "market_cap_usd": (
+            entry["market_cap_mm"] * 1e6 if entry.get("market_cap_mm") else profile.get("market_cap")
+        ),
+        "spot": spot,
+        "sector": profile.get("sector"),
+        "net_cash_per_share": round(net_cash_ps, 4) if net_cash_ps is not None else None,
+        "total_debt_known": debt_known,
+        "blocking_reasons": blocking,
+        **prob,
+        **runway,
+        **(down or {}),
+        **(up or {}),
+        **(ev or {}),
+    }
+    row["expected_value_multiple"] = (ev or {}).get("expected_value_multiple")
+    return row
