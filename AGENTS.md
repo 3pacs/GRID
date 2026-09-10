@@ -33,6 +33,8 @@ Next pick-up:
 - Get `stepdad.png` onto the server → favicon + mascot. Then Phase 2: profiles + Whisper voice. TradingView/thinkorswim-via-Playwright is a candidate enrichment data source (operator wants the "stealthier" one) — wire behind GRID feeds, not primary.
 - Login `dad` / `mom` (contributor, `grid_users` id 14) created and verified against live API.
 
+**Note (2026-09-10):** The "two live code trees" / "deploy tool is misconfigured" situation above is superseded. Starting with the first `.github/workflows/deploy.yml` commit (2026-06-15), every push to `main` runs an automated deploy: a `verify` job, then a `deploy` job on the self-hosted grid-svr runner that resets `/data/grid_v4/grid_release` to `main`, builds the PWA, runs migrations, and points grid-api's systemd `WorkingDirectory` at that tree via a drop-in. `grid-api` now runs from `/data/grid_v4/grid_release`, kept in sync with `main` automatically — not from `grid-api-main`, and not manually via `scripts/deploy.py`. See `docs/SERVER-SERVICES.md` for the current topology.
+
 ## 2026-05-29 - Oracle llama-server "inference hang" = queue saturation death spiral
 
 What was done:

@@ -2,6 +2,29 @@
 
 All services run on `grid-svr` (Tailscale: `100.75.185.36`, user: `grid`).
 
+## Deploy Pipeline (grid-api)
+
+`grid-api` is **not** manually deployed — every push to `main` runs `.github/workflows/deploy.yml`:
+
+1. **`verify`** (runs on GitHub-hosted `ubuntu-latest`): starts Postgres, runs
+   `tests/test_api.py` and `tests/test_pit.py`.
+2. **`deploy`** (runs on the self-hosted `grid-svr` runner, only if `verify` passed or was
+   skipped): fetches `main` straight from GitHub and hard-resets
+   `/data/grid_v4/grid_release` to it, `pip install -r requirements.txt`, `cd pwa && npm ci
+   && npm run build`, then `alembic upgrade head`. It writes a systemd drop-in
+   (`/etc/systemd/system/grid-api.service.d/zz-release-worktree.conf`) pointing `grid-api`'s
+   `WorkingDirectory` at `/data/grid_v4/grid_release` and restarts the service. It then
+   verifies `/api/v1/system/health`, that the built PWA (`pwa_dist/assets/...`) is served,
+   and that `/openapi.json` lists the `actor-network`, `gold/stream`, and
+   `conviction/sweeps/latest` routes.
+
+So the **live `grid-api` tree is `/data/grid_v4/grid_release`**, kept in sync with `main` by
+this workflow — not the dev/source checkout at `~/grid_v4/grid_repo/grid/` referenced
+elsewhere on this page. The manual start/restart commands below still apply to the other
+services (Postgres, llama.cpp, Crucix, Hermes Operator, Coordinator, Worker), and to
+`grid-api` only if you're intentionally bypassing the automated deploy (e.g. local
+debugging on the server).
+
 ## Services (Boot Order)
 
 | # | Service | Port | Process | Location |
@@ -9,7 +32,7 @@ All services run on `grid-svr` (Tailscale: `100.75.185.36`, user: `grid`).
 | 1 | **PostgreSQL + TimescaleDB** | 5432 | Docker container `grid_db` | `~/grid_v4/grid_repo/grid/docker-compose.yml` |
 | 2 | **llama.cpp (Hermes 8B)** | 8080 | `llama-server` (CUDA, RTX PRO 4000) | `~/grid_v4/grid_repo/grid/vendor/llama.cpp/build/bin/llama-server` |
 | 3 | **Crucix** | 3117 | Node.js app | `~/grid_v4/Crucix/` (has own `.env`) |
-| 4 | **GRID API (uvicorn)** | 8000 | `python3 -m uvicorn api.main:app` | `~/grid_v4/grid_repo/grid/` |
+| 4 | **GRID API (uvicorn)** | 8000 | `python3 -m uvicorn api.main:app` | `/data/grid_v4/grid_release` (deployed tree — see [Deploy Pipeline](#deploy-pipeline-grid-api) below) |
 | 5 | **Hermes Operator** | — | `python3 scripts/hermes_operator.py` | `~/grid_v4/grid_repo/grid/` |
 | 6 | **Compute Coordinator** | 8100 | `uvicorn scripts.compute_coordinator:app` | `~/grid_v4/grid_repo/grid/` |
 | 7 | **Compute Worker** | — | `python3 scripts/worker.py` | `~/grid_v4/grid_repo/grid/` |
@@ -27,8 +50,8 @@ cd ~/grid_v4/grid_repo/grid && bash scripts/start_llamacpp.sh &
 cd ~/grid_v4/Crucix && node server.mjs &
 # (verify: curl -s http://localhost:3117)
 
-# 4. GRID API
-cd ~/grid_v4/grid_repo/grid && python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000 &
+# 4. GRID API (bypasses the deploy.yml-managed systemd drop-in — see Deploy Pipeline above)
+cd /data/grid_v4/grid_release && python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000 &
 
 # 5. Hermes Operator (autonomous daemon)
 cd ~/grid_v4/grid_repo/grid && python3 scripts/hermes_operator.py &
@@ -62,9 +85,9 @@ cd ~/grid_v4/grid_repo/grid && docker compose up -d
 sleep 2
 bash scripts/start_llamacpp.sh &
 sleep 5
-python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000 &
+cd /data/grid_v4/grid_release && python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000 &
 sleep 3
-python3 scripts/hermes_operator.py &
+cd ~/grid_v4/grid_repo/grid && python3 scripts/hermes_operator.py &
 ```
 
 ## Gemma Micro Models (CPU, ports 8082-8085)
@@ -112,7 +135,8 @@ No port forwarding needed. Traffic flows: User → Cloudflare → tunnel → loc
 
 | Item | Path |
 |------|------|
-| Repo | `~/grid_v4/grid_repo/grid/` |
+| Repo (dev/source, pushed to `main`) | `~/grid_v4/grid_repo/grid/` |
+| Repo (live `grid-api` tree, see [Deploy Pipeline](#deploy-pipeline-grid-api)) | `/data/grid_v4/grid_release` |
 | Crucix | `~/grid_v4/Crucix/` |
 | Crucix latest.json | `/data/grid_v4/Crucix/runs/latest.json` |
 | GGUF Model | `~/grid_v4/grid_repo/grid/models/Hermes-3-Llama-3.1-8B.Q4_K_M.gguf` |
