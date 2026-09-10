@@ -113,10 +113,10 @@ def _fallback_chain(tier: Tier, provider: str) -> list[str]:
         # 2026-05-13; gridz4 is overkill for LOCAL but still a fast fallback.
         chain = ["llamacpp_quick", "ollama_koala", "ollama_ocr", "ollama_z400", "llamacpp_z4", "llamacpp", "gemma", "ollama", "openrouter", "openai"]
     elif tier == Tier.ORACLE:
-        # gridz4 (Blackwell + Qwen3.6-35B-A3B Claude-Opus-distill) is now the
-        # primary ORACLE node. grid-svr's Pascal P100+GTX1070 27B (`llamacpp_oracle`)
-        # demoted to fallback 2026-05-09. panda is offline for the foreseeable
-        # future, so ORACLE fallback stays on live llama.cpp/cloud providers.
+        # gridz4 (Qwen3.8-27B Q4_K_M) is the primary ORACLE node; grid-svr's
+        # RTX 3090 Qwen3.8-27B (`llamacpp_oracle`, :8081 shim → :8086) is the
+        # first fallback. panda is offline for the foreseeable future, so
+        # ORACLE fallback stays on live llama.cpp/cloud providers.
         chain = ["llamacpp_z4", "llamacpp_oracle", "llamacpp", "gemma", "openrouter", "openai"]
     elif tier == Tier.BATCH:
         chain = ["llamacpp_batch", "llamacpp_oracle", "llamacpp_z4", "openrouter", "openai"]
@@ -465,7 +465,7 @@ def _create_llamacpp_batch_client(settings: Any) -> Any:
 
 
 def _create_llamacpp_quick_client(settings: Any) -> Any:
-    """Create a llama.cpp client for the QUICK-tier remote server (redbox, Qwen3-14B).
+    """Create a llama.cpp client for the QUICK-tier remote server (redbox, qwen3.8-27b).
 
     Opt-in via provider="llamacpp_quick" on get_llm() — not added to the automatic
     fallback chain, so enabling LLAMACPP_QUICK_ENABLED alone does not re-route
@@ -477,7 +477,7 @@ def _create_llamacpp_quick_client(settings: Any) -> Any:
         from llamacpp.client import LlamaCppClient
         return LlamaCppClient(
             base_url=getattr(settings, "LLAMACPP_QUICK_BASE_URL", "http://100.126.129.45:8080"),
-            model=getattr(settings, "LLAMACPP_QUICK_CHAT_MODEL", "qwen3-14b"),
+            model=getattr(settings, "LLAMACPP_QUICK_CHAT_MODEL", "qwen3.8-27b"),
             timeout=getattr(settings, "LLAMACPP_QUICK_TIMEOUT_SECONDS", 120),
         )
     except Exception as exc:
@@ -488,7 +488,7 @@ def _create_llamacpp_quick_client(settings: Any) -> Any:
 def _create_llamacpp_z4_client(settings: Any) -> Any:
     """Create a llama.cpp client for the gridz4 REASON-tier remote server.
 
-    z4 runs the no-thinking Qwen3.6-35B-A3B GGUF.  Keep this client bounded:
+    z4 serves Qwen3.8-27B Q4_K_M (reasoning off).  Keep this client bounded:
     the generic llama.cpp client adds reasoning headroom for thinking models,
     which turns default calls into 6K-token generations and can monopolize
     both gridz4 slots.
@@ -502,7 +502,7 @@ def _create_llamacpp_z4_client(settings: Any) -> Any:
             model=getattr(
                 settings,
                 "LLAMACPP_Z4_CHAT_MODEL",
-                "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+                "Qwen3.8-27B-Q4_K_M",
             ),
             timeout=getattr(settings, "LLAMACPP_Z4_TIMEOUT_SECONDS", 180),
             default_num_predict=getattr(settings, "LLAMACPP_Z4_NUM_PREDICT", 512),

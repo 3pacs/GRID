@@ -623,10 +623,18 @@ def _get_pullers_for_group(
             pullers.append(("Tiingo_Fundamentals", TiingoFundamentalsPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("Tiingo fundamentals puller init failed: {err}", err=str(exc))
-        # BLS (daily check, monthly release)
+        # BLS (daily check, monthly release). Pass the registration key:
+        # without it the v2 endpoint allows 25 queries/day and the daily
+        # pull reported "daily threshold ... reached" every morning.
         try:
             from ingestion.bls import BLSPuller
-            pullers.append(("BLS", BLSPuller(db_engine), "pull_series", {"start_year": 2024}))
+            from config import settings as _bls_settings
+            pullers.append((
+                "BLS",
+                BLSPuller(db_engine, api_key=_bls_settings.BLS_API_KEY or None),
+                "pull_series",
+                {"start_year": 2024},
+            ))
         except Exception as exc:
             log.warning("BLS puller init failed: {err}", err=str(exc))
         # CBOE indices — SKEW, VVIX, correlation, put/call ratio (daily)
