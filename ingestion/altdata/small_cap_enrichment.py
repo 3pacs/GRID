@@ -88,6 +88,11 @@ CALL_PAUSE_S = 0.3                 # between every external call (SEC limit is 1
 SMALL_CAP_MAX_USD = 2e9
 TRIAL_LOOKBACK_DAYS = 180
 OPTIONS_LOOKBACK_DAYS = 30
+PRICE_LOOKBACK_DAYS = 45           # a close older than this is not a usable cap basis
+PRICE_STALE_DAYS = 5               # refresh a ticker's closes when the latest is older than this
+PRICE_HISTORY_DAYS = 3 * 365       # first pull: enough weekly points for the Long Plays projection
+MAX_PRICE_PULLS_PER_RUN = 300      # yfinance is polite about ~1 download/s; keep a daily run bounded
+TIINGO_MCAP_LOOKBACK_DAYS = 120    # TIINGO_FUND market cap is daily; older is not a current cap
 REFRESH_AFTER_HOURS = 20           # skip tickers enriched more recently (daily cadence)
 FMP_CALL_BUDGET = 200              # FMP free tier: 250 req/day
 DESCRIPTION_MAX = 400
@@ -391,10 +396,14 @@ _METRICS_CAPS_SQL = text(
     ORDER BY ticker, obs_date DESC
     """
 )
+# obs_date is bounded on both sides: the lower bound lets TimescaleDB skip
+# every chunk outside the window (unbounded, this scanned the whole hypertable
+# for each ticker that has no TIINGO_FUND series — i.e. most small caps).
 _TIINGO_MCAP_SQL = text(
     """
     SELECT value FROM raw_series
-    WHERE series_id = :sid AND pull_status = 'SUCCESS' AND obs_date <= :as_of
+    WHERE series_id = :sid AND pull_status = 'SUCCESS'
+      AND obs_date >= :since AND obs_date <= :as_of
     ORDER BY obs_date DESC, pull_timestamp DESC
     LIMIT 1
     """
@@ -418,6 +427,7 @@ class SmallCapEnrichmentPuller:
         *,
         http_get: Callable[..., Any] | None = None,
         sleep: Callable[[float], None] | None = None,
+        yf_puller: Any = None,
     ) -> None:
         self.engine = db_engine
         self._api_key = api_key
@@ -425,6 +435,7 @@ class SmallCapEnrichmentPuller:
         self._fmp_calls = 0
         self._http_get = http_get or requests.get
         self._sleep = sleep or time.sleep
+        self._yf_puller: Any = yf_puller  # None -> lazily construct the GRID YFinancePuller
 
     # ── FMP (lazy; only when a key exists) ────────────────────────────────
 
@@ -501,7 +512,12 @@ class SmallCapEnrichmentPuller:
         try:
             with self.engine.connect() as conn:
                 row = conn.execute(
-                    _TIINGO_MCAP_SQL, {"sid": f"TIINGO_FUND:{ticker}:market_cap", "as_of": as_of}
+                    _TIINGO_MCAP_SQL,
+                    {
+                        "sid": f"TIINGO_FUND:{ticker}:market_cap",
+                        "since": as_of - timedelta(days=TIINGO_MCAP_LOOKBACK_DAYS),
+                        "as_of": as_of,
+                    },
                 ).first()
         except Exception as exc:  # noqa: BLE001
             log.debug("small_cap_enrichment: tiingo lookup failed for {t}: {e}", t=ticker, e=str(exc))
@@ -577,11 +593,15 @@ class SmallCapEnrichmentPuller:
 
     # ── Latest PIT close (raw_series) ─────────────────────────────────────
 
+    # Both obs_date bounds matter: the lower one lets TimescaleDB exclude every
+    # chunk older than the window (an unbounded scan of raw_series took ~100 s
+    # per ticker on grid-svr); the upper one is the PIT guard.
     _LATEST_PRICE_SQL = text(
         """
         SELECT value
         FROM raw_series
         WHERE series_id = ANY(:series_ids)
+          AND obs_date >= :since
           AND obs_date <= :as_of
           AND pull_timestamp <= :as_of_ts
           AND value IS NOT NULL AND value > 0
@@ -590,16 +610,27 @@ class SmallCapEnrichmentPuller:
         """
     )
 
-    def latest_price(self, ticker: str, as_of: date) -> float | None:
-        """Most recent close on or before ``as_of`` known by ``as_of`` (PIT), or None."""
+    @staticmethod
+    def _price_series_ids(ticker: str) -> list[str]:
+        """YF / Tiingo close series for a ticker (class shares are stored as ``BRK-B`` by the YF puller)."""
         t = ticker.upper()
-        series_ids = [f"YF:{t}:adj_close", f"YF:{t}:close", f"TIINGO:{t}:adj_close", f"TIINGO:{t}:close"]
+        forms = [t] if "." not in t else [t, t.replace(".", "-")]
+        out: list[str] = []
+        for f in forms:
+            out += [f"YF:{f}:adj_close", f"YF:{f}:close", f"TIINGO:{f}:adj_close", f"TIINGO:{f}:close"]
+        return out
+
+    def latest_price(self, ticker: str, as_of: date) -> float | None:
+        """Most recent close within ``PRICE_LOOKBACK_DAYS`` of ``as_of``, known by ``as_of`` (PIT), or None."""
+        t = ticker.upper()
+        series_ids = self._price_series_ids(t)
         try:
             with self.engine.connect() as conn:
                 row = conn.execute(
                     self._LATEST_PRICE_SQL,
                     {
                         "series_ids": series_ids,
+                        "since": as_of - timedelta(days=PRICE_LOOKBACK_DAYS),
                         "as_of": as_of,
                         "as_of_ts": datetime.combine(as_of, datetime.max.time()).replace(tzinfo=timezone.utc),
                     },
@@ -608,6 +639,110 @@ class SmallCapEnrichmentPuller:
             log.debug("small_cap_enrichment: latest_price {t} failed: {e}", t=t, e=str(exc))
             return None
         return _to_float(row[0]) if row is not None else None
+
+    # ── Price coverage (yfinance → raw_series) ────────────────────────────
+
+    _LATEST_CLOSES_SQL = text(
+        """
+        SELECT split_part(series_id, ':', 2) AS tk, max(obs_date)
+        FROM raw_series
+        WHERE series_id = ANY(:series_ids)
+          AND obs_date >= :since
+          AND obs_date <= :as_of
+          AND value IS NOT NULL AND value > 0
+        GROUP BY 1
+        """
+    )
+
+    def _yf(self) -> Any:
+        """The GRID yfinance puller (writes ``YF:{T}:{field}`` into raw_series); None when unavailable."""
+        if self._yf_puller is None:
+            try:
+                from ingestion.yfinance_pull import YFinancePuller
+
+                self._yf_puller = YFinancePuller(self.engine)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("small_cap_enrichment: yfinance puller unavailable: {e}", e=str(exc))
+                self._yf_puller = False
+        return self._yf_puller or None
+
+    def latest_closes(self, tickers: list[str], as_of: date) -> dict[str, date]:
+        """``ticker -> latest close date`` within ``PRICE_LOOKBACK_DAYS`` (one bounded query)."""
+        out: dict[str, date] = {}
+        if not tickers:
+            return out
+        ids: list[str] = []
+        for t in tickers:
+            ids += self._price_series_ids(t)
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(
+                    self._LATEST_CLOSES_SQL,
+                    {"series_ids": ids, "since": as_of - timedelta(days=PRICE_LOOKBACK_DAYS), "as_of": as_of},
+                ).fetchall()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("small_cap_enrichment: latest-close lookup failed: {e}", e=str(exc))
+            return out
+        for row in rows or []:
+            tk = str(row[0] or "").upper().replace("-", ".")
+            d = row[1] if isinstance(row[1], date) else _iso(row[1])
+            if tk and d is not None:
+                for cand in (tk, tk.replace(".", "-")):
+                    if cand in tickers:
+                        out[cand] = max(out.get(cand, d), d)
+        return out
+
+    def ensure_prices(self, tickers: list[str], as_of: date | None = None) -> dict[str, Any]:
+        """Make sure every ticker has a recent close in ``raw_series`` for the cap derivation.
+
+        GRID's price pullers cover the index/ETF/sector universe, not the trial
+        small caps (1 of 120 had a close on the first run). Tickers with no
+        close in ``PRICE_LOOKBACK_DAYS`` get ``PRICE_HISTORY_DAYS`` of history
+        (so the Long Plays projection has weekly points too); tickers whose
+        latest close is older than ``PRICE_STALE_DAYS`` get the gap refilled.
+        Uses the existing ``YFinancePuller`` so the rows carry a real
+        ``pull_timestamp`` (PIT). Never raises.
+        """
+        as_of = as_of or date.today()
+        tickers = sorted({str(t).strip().upper() for t in tickers if str(t).strip()})
+        stats: dict[str, Any] = {"checked": len(tickers), "missing": 0, "stale": 0, "pulled": 0,
+                                 "rows_inserted": 0, "failed": 0, "skipped_budget": 0}
+        if not tickers:
+            return stats
+        latest = self.latest_closes(tickers, as_of)
+        plan: list[tuple[str, date]] = []
+        for t in tickers:
+            last = latest.get(t)
+            if last is None:
+                stats["missing"] += 1
+                plan.append((t, as_of - timedelta(days=PRICE_HISTORY_DAYS)))
+            elif (as_of - last).days > PRICE_STALE_DAYS:
+                stats["stale"] += 1
+                plan.append((t, last - timedelta(days=3)))
+        if not plan:
+            return stats
+        yf = self._yf()
+        if yf is None:
+            stats["failed"] = len(plan)
+            return stats
+        for t, start in plan:
+            if stats["pulled"] >= MAX_PRICE_PULLS_PER_RUN:
+                stats["skipped_budget"] += 1
+                continue
+            try:
+                res = yf.pull_ticker(t, start, as_of + timedelta(days=1))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("small_cap_enrichment: price pull {t} failed: {e}", t=t, e=str(exc))
+                stats["failed"] += 1
+                continue
+            stats["pulled"] += 1
+            if isinstance(res, dict):
+                if res.get("status") not in (None, "SUCCESS"):
+                    stats["failed"] += 1
+                rows = res.get("rows_inserted")
+                stats["rows_inserted"] += int(rows) if isinstance(rows, (int, float)) else 0
+        log.info("small_cap_enrichment: prices {s}", s=stats)
+        return stats
 
     # ── Universe ──────────────────────────────────────────────────────────
 
@@ -736,6 +871,14 @@ class SmallCapEnrichmentPuller:
             return {"status": "SUCCESS", "tickers_attempted": 0, "rows_upserted": 0, "fmp_calls": 0,
                     "fmp_enabled": bool(self.fmp_api_key), "errors": []}
 
+        # Closes first: the derived market cap (SEC shares × PIT close) needs
+        # them, and GRID's price pullers do not cover this universe.
+        try:
+            prices = self.ensure_prices(tickers, as_of)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("small_cap_enrichment: ensure_prices failed: {e}", e=str(exc))
+            prices = {"error": str(exc)[:120]}
+
         upserted = 0
         skipped = 0
         errors: list[str] = []
@@ -769,6 +912,7 @@ class SmallCapEnrichmentPuller:
             "fmp_calls": self._fmp_calls,
             "fmp_enabled": bool(self.fmp_api_key),
             "sources": sources,
+            "prices": prices,
             "errors": errors,
             "elapsed_s": round(time.monotonic() - started, 1),
         }
