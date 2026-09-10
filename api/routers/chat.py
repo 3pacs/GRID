@@ -16,7 +16,7 @@ import inspect
 import re as _re
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 
@@ -327,20 +327,33 @@ def _get_db_engine():
 
 
 def _gather_regime_context() -> tuple[str, str]:
-    """Return current regime state from DB."""
+    """Return current regime state from DB.
+
+    The framing carries the row's own ``obs_date`` and, when the row is not
+    from today, how old it is. ``created_at`` is when the row was written, not
+    what it describes, so quoting it alone let a months-old regime read as
+    current in the verdict.
+    """
     try:
         engine = _get_db_engine()
         from sqlalchemy import text
         with engine.connect() as conn:
             row = conn.execute(text(
-                "SELECT regime, confidence, created_at "
+                "SELECT obs_date, regime, confidence, created_at "
                 "FROM regime_history ORDER BY obs_date DESC LIMIT 1"
             )).fetchone()
             if row:
-                return (
-                    f"Current regime: {row[0]} (confidence: {row[1]}, as of {row[2]})",
-                    "regime_history",
-                )
+                obs_date, regime, confidence, created_at = row
+                framing = f"Current regime: {regime} (confidence: {confidence}, as of {obs_date})"
+                if isinstance(obs_date, date):
+                    age_days = (date.today() - obs_date).days
+                    if age_days > 1:
+                        framing += (
+                            f" — NOTE: this reading is {age_days} days old, "
+                            "treat it as a stale regime read, not today's"
+                        )
+                framing += f" [written {created_at}]"
+                return framing, "regime_history"
     except Exception as exc:
         log.debug("Chat context: regime history query failed: {e}", e=str(exc))
     return "", ""

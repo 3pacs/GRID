@@ -22,6 +22,7 @@ Confidence is derived from how cleanly the reading falls into one regime
 vs straddling boundaries.
 """
 
+import argparse
 import json
 from datetime import date, timedelta
 from pathlib import Path
@@ -117,6 +118,39 @@ POSTURE_MAP = {
 # How many days to use for the derivative (smoothing window)
 DERIVATIVE_WINDOW = 5
 
+# Trailing window fed to the rolling z-scores. 756 trading-ish days ~= 3 years,
+# which is what the 252-day rolling window needs to warm up plus headroom.
+LOOKBACK_DAYS = 756
+
+# ── regime_history vocabulary ───────────────────────────────────
+#
+# ``regime_history`` is the cross-lane table read by the chat regime context,
+# api/routers/intel.py, the oracle prediction context, AstroGrid and the trial
+# signal. Its ``regime`` column carries this module's own state names.
+#
+# That is what the rows already on griddb contain — the 2026-03 load wrote
+# ``decision_journal.inferred_state`` verbatim with ``source='decision_journal'``
+# — and it is what the readers that act on the value expect:
+#
+#   grid/signals/trial_signal.py gates BUY on {"GROWTH", "NEUTRAL"} and stores
+#   the label into a CHECK-constrained column accepting only these four plus
+#   UNKNOWN. oracle/prediction_context.py::canonical_regime folds all four into
+#   its five-state bucket. api/routers/intel.py passes the label straight to the
+#   briefing.
+#
+# The "Canonical Historical Regime Contract" in .coordination.md describes a
+# different four-label vocabulary (risk_on / risk_off / neutral / transition).
+# No writer has ever produced it — the 12 loaded rows are all 'NEUTRAL', which
+# happens to read as valid under both — and adopting it here would collapse
+# CRISIS into FRAGILE and silently turn every trial-signal BUY into a WATCHLIST.
+# store/astrogrid.py::_normalize_regime_label is the one reader written against
+# that document; it now folds these states into its own labels instead.
+REGIME_HISTORY_LABELS = ("GROWTH", "NEUTRAL", "FRAGILE", "CRISIS")
+
+# Provenance recorded in regime_history.source, distinguishing rows this writer
+# produced from the 2026-03 one-off load that used source='decision_journal'.
+REGIME_HISTORY_SOURCE = "auto_regime"
+
 
 def _compute_stress_index(
     feature_matrix: "pd.DataFrame",
@@ -202,6 +236,319 @@ def _classify_regime(s: float, ds: float) -> tuple[str, float]:
     return "NEUTRAL", conf
 
 
+def _pit_feature_frame(
+    pit: PITStore,
+    feature_ids: list[int],
+    as_of: date,
+    lookback_days: int = LOOKBACK_DAYS,
+) -> "pd.DataFrame":
+    """Return a PIT-correct wide feature matrix as known on ``as_of``.
+
+    Goes through ``store.pit`` with the FIRST_RELEASE vintage policy so the
+    frame contains only rows whose ``release_date`` is on or before ``as_of``,
+    and asserts that explicitly before the caller can act on it. Recomputing a
+    historical day with today's revised vintages would be lookahead, which is
+    exactly what the backfill must not do.
+
+    Parameters:
+        pit: The PIT store.
+        feature_ids: feature_registry IDs to load.
+        as_of: Decision date. Nothing released after this date is included.
+        lookback_days: Trailing window of observations to keep.
+
+    Returns:
+        pd.DataFrame indexed by obs_date, one column per feature_id. Empty if
+        the PIT query returned nothing.
+    """
+    import pandas as pd
+
+    raw = pit.get_pit(feature_ids, as_of, vintage_policy="FIRST_RELEASE")
+    # get_pit already runs this as a safety net; call it again explicitly so the
+    # guard is visible on the path that persists a row (ATTENTION.md #8 — it
+    # raises rather than rolling anything back, so it must fire before any write).
+    pit.assert_no_lookahead(raw, as_of)
+
+    if raw.empty:
+        return pd.DataFrame()
+
+    window_start = as_of - timedelta(days=lookback_days)
+    raw = raw[raw["obs_date"] >= window_start]
+    if raw.empty:
+        return pd.DataFrame()
+
+    matrix = raw.pivot_table(
+        index="obs_date",
+        columns="feature_id",
+        values="value",
+        aggfunc="first",
+    )
+    matrix.index = pd.DatetimeIndex(matrix.index, name="obs_date")
+    return matrix.sort_index()
+
+
+def _resolve_regime_features(engine, weights: dict[str, float]) -> dict[int, str]:
+    """Return {feature_id: name} for the weighted features present in the DB."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT id, name FROM feature_registry "
+                "WHERE model_eligible = TRUE AND name = ANY(:names)"
+            ),
+            {"names": list(weights.keys())},
+        ).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+def compute_regime_at(
+    engine,
+    as_of: date,
+    weights: dict[str, float] | None = None,
+    fid_to_name: dict[int, str] | None = None,
+) -> dict[str, Any]:
+    """Classify the regime as it would have been read on ``as_of``.
+
+    This is the PIT-correct core shared by the daily run and the backfill:
+    every value it sees was already released on ``as_of``.
+
+    Parameters:
+        engine: SQLAlchemy engine.
+        as_of: Decision date.
+        weights: Feature weights; defaults to the module's active weights.
+        fid_to_name: Pre-resolved feature map, to avoid re-querying
+            feature_registry once per day in a backfill loop.
+
+    Returns:
+        Dict with regime, confidence, stress_index, stress_derivative and
+        n_observations — or an ``error`` key when there
+        is not enough point-in-time data to classify.
+    """
+    active_weights = weights if weights is not None else FEATURE_WEIGHTS
+    if fid_to_name is None:
+        fid_to_name = _resolve_regime_features(engine, active_weights)
+
+    if len(fid_to_name) < 3:
+        return {
+            "regime": "UNKNOWN",
+            "confidence": 0.0,
+            "error": f"insufficient features: {len(fid_to_name)}",
+        }
+
+    pit = PITStore(engine)
+    df = _pit_feature_frame(pit, list(fid_to_name), as_of)
+    if df.empty or len(df) < 50:
+        return {
+            "regime": "UNKNOWN",
+            "confidence": 0.0,
+            "error": f"insufficient data: {df.shape}",
+        }
+
+    df = df.ffill().bfill().dropna(axis=1, how="all")
+
+    stress_series, contributions = _compute_stress_index(df, fid_to_name, active_weights)
+    s_current = float(stress_series[-1]) if len(stress_series) > 0 else 0.0
+    if len(stress_series) > DERIVATIVE_WINDOW:
+        ds = float(stress_series[-1] - stress_series[-1 - DERIVATIVE_WINDOW]) / DERIVATIVE_WINDOW
+    else:
+        ds = 0.0
+
+    regime, confidence = _classify_regime(s_current, ds)
+
+    return {
+        "regime": regime,
+        "confidence": round(confidence, 4),
+        "posture": POSTURE_MAP.get(regime, "BALANCED"),
+        "stress_index": round(s_current, 4),
+        "stress_derivative": round(ds, 4),
+        "contributions": contributions,
+        "n_features": len(fid_to_name),
+        "n_observations": len(df),
+    }
+
+
+# Two complete literal statements rather than one assembled from a fragment.
+# The fragment was constant, so there was no injection path, but
+# .claude/rules/security.md bans f-strings, .format() and concatenation in SQL
+# outright — a rule worth keeping absolute, because the moment a fragment stops
+# being constant the review that would have caught it has already happened.
+_REGIME_HISTORY_UPSERT_SQL = text(
+    "INSERT INTO regime_history (obs_date, regime, confidence, source) "
+    "VALUES (:obs_date, :regime, :confidence, :source) "
+    "ON CONFLICT (obs_date) DO UPDATE SET "
+    "regime = EXCLUDED.regime, "
+    "confidence = EXCLUDED.confidence, "
+    "source = EXCLUDED.source"
+)
+
+_REGIME_HISTORY_INSERT_IGNORE_SQL = text(
+    "INSERT INTO regime_history (obs_date, regime, confidence, source) "
+    "VALUES (:obs_date, :regime, :confidence, :source) "
+    "ON CONFLICT (obs_date) DO NOTHING"
+)
+
+
+def persist_regime_history(
+    engine,
+    obs_date: date,
+    label: str,
+    confidence: float,
+    overwrite: bool = True,
+) -> bool:
+    """Upsert one row into ``regime_history``.
+
+    One row per observation date, stamped with ``source`` so a reader can tell
+    a row this writer produced from one the 2026-03 one-off load left behind.
+
+    Parameters:
+        engine: SQLAlchemy engine.
+        obs_date: The date the label describes.
+        label: One of ``REGIME_HISTORY_LABELS``.
+        confidence: 0-1 confidence score.
+        overwrite: When False, an existing row for ``obs_date`` is left alone.
+
+    Returns:
+        True if a row was written or updated.
+
+    Raises:
+        ValueError: If ``label`` is outside the vocabulary, or ``confidence``
+            is not a finite number in [0, 1]. A label the readers do not
+            recognize is worse than no row — trial_signal would store it as
+            UNKNOWN and downgrade every BUY — so this refuses rather than
+            writing something downstream will misread.
+    """
+    if label not in REGIME_HISTORY_LABELS:
+        raise ValueError(
+            f"regime_history label {label!r} is outside the vocabulary "
+            f"{REGIME_HISTORY_LABELS}"
+        )
+    conf = float(confidence)
+    if not np.isfinite(conf) or not (0.0 <= conf <= 1.0):
+        raise ValueError(f"regime confidence must be finite and in [0, 1], got {confidence!r}")
+
+    stmt = _REGIME_HISTORY_UPSERT_SQL if overwrite else _REGIME_HISTORY_INSERT_IGNORE_SQL
+    with engine.begin() as conn:
+        result = conn.execute(
+            stmt,
+            {
+                "obs_date": obs_date,
+                "regime": label,
+                "confidence": conf,
+                "source": REGIME_HISTORY_SOURCE,
+            },
+        )
+    return bool(result.rowcount)
+
+
+def backfill_regime_history(
+    engine,
+    start: date,
+    end: date,
+    overwrite: bool = False,
+    max_days: int = 400,
+    weights: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    """Recompute and persist daily regime_history rows over a bounded range.
+
+    Each day is classified with ``as_of`` set to that day, so a backfilled row
+    only ever reflects data that had actually been released by then. Days the
+    PIT store cannot support (not enough released history) are skipped and
+    reported rather than written with a fabricated label.
+
+    Parameters:
+        engine: SQLAlchemy engine.
+        start: First date to compute, inclusive.
+        end: Last date to compute, inclusive.
+        overwrite: Replace rows that already exist for a date.
+        max_days: Hard cap on the span, so a typo cannot start a multi-year job.
+        weights: Feature weights; defaults to the module's active weights.
+
+    Returns:
+        Dict with written / skipped / failed counts and the per-day labels.
+
+    Raises:
+        ValueError: If the range is inverted or wider than ``max_days``.
+    """
+    if end < start:
+        raise ValueError(f"backfill end {end} is before start {start}")
+    span = (end - start).days + 1
+    if span > max_days:
+        raise ValueError(
+            f"backfill span of {span} days exceeds max_days={max_days}; "
+            "narrow the range or raise --max-days deliberately"
+        )
+
+    active_weights = weights if weights is not None else _load_effective_weights()
+    fid_to_name = _resolve_regime_features(engine, active_weights)
+    if len(fid_to_name) < 3:
+        return {
+            "written": 0,
+            "skipped": 0,
+            "failed": span,
+            "error": f"insufficient features: {len(fid_to_name)}",
+        }
+
+    existing: set[date] = set()
+    if not overwrite:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT obs_date FROM regime_history "
+                    "WHERE obs_date >= :start AND obs_date <= :end"
+                ),
+                {"start": start, "end": end},
+            ).fetchall()
+        existing = {r[0] for r in rows}
+
+    written = 0
+    skipped = 0
+    failed = 0
+    labels: dict[str, str] = {}
+
+    current = start
+    while current <= end:
+        if current in existing:
+            skipped += 1
+            current += timedelta(days=1)
+            continue
+        try:
+            result = compute_regime_at(
+                engine, current, weights=active_weights, fid_to_name=fid_to_name
+            )
+            if result.get("error"):
+                log.warning(
+                    "Regime backfill {d}: {e}", d=current.isoformat(), e=result["error"]
+                )
+                failed += 1
+            else:
+                persist_regime_history(
+                    engine,
+                    current,
+                    result["regime"],
+                    result["confidence"],
+                    overwrite=True,
+                )
+                labels[current.isoformat()] = result["regime"]
+                written += 1
+        except Exception as exc:
+            log.warning(
+                "Regime backfill {d} failed: {e}", d=current.isoformat(), e=str(exc)
+            )
+            failed += 1
+        current += timedelta(days=1)
+
+    log.info(
+        "Regime backfill {s} to {e} — {w} written, {sk} skipped, {f} failed",
+        s=start.isoformat(), e=end.isoformat(), w=written, sk=skipped, f=failed,
+    )
+    return {
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "written": written,
+        "skipped": skipped,
+        "failed": failed,
+        "labels": labels,
+    }
+
+
 def run_with_weights(engine, weights: dict[str, float], save: bool = False) -> dict[str, Any]:
     """Run regime classification with custom weights, optionally saving them.
 
@@ -244,7 +591,7 @@ def run_with_weights(engine, weights: dict[str, float], save: bool = False) -> d
     fid_to_name = {r[0]: r[1] for r in feat_rows}
 
     today = date.today()
-    df = pit.get_feature_matrix(fids, today - timedelta(days=756), today, today)
+    df = _pit_feature_frame(pit, fids, today)
     if df.empty or len(df) < 50:
         return {"regime": "UNKNOWN", "confidence": 0.0, "error": f"insufficient data: {df.shape}"}
 
@@ -318,9 +665,11 @@ def run() -> dict[str, Any]:
 
     log.info("Regime detection using {n} features", n=len(fids))
 
-    # Build feature matrix (2+ years for rolling z-score computation)
+    # Build feature matrix (2+ years for rolling z-score computation).
+    # _pit_feature_frame is the shared PIT core — FIRST_RELEASE vintages and an
+    # explicit assert_no_lookahead before anything downstream persists a row.
     today = date.today()
-    df = pit.get_feature_matrix(fids, today - timedelta(days=756), today, today)
+    df = _pit_feature_frame(pit, fids, today)
     if df.empty or len(df) < 50:
         return {"regime": "UNKNOWN", "confidence": 0.0, "error": f"insufficient data: {df.shape}"}
 
@@ -404,6 +753,20 @@ def run() -> dict[str, Any]:
         operator_confidence="HIGH",
     )
 
+    # Persist the canonical daily row into regime_history. This is the table
+    # the chat regime context, the oracle prediction context, AstroGrid and the
+    # HMM transition model read. Until this call existed, auto_regime wrote only
+    # decision_journal and analytical_snapshots, so regime_history froze at
+    # whatever a one-off load had put there.
+    regime_history_written = False
+    regime_history_error: str | None = None
+    try:
+        regime_history_written = persist_regime_history(engine, today, regime, confidence)
+        log.info("regime_history updated — {d} = {l}", d=today.isoformat(), l=regime)
+    except Exception as exc:
+        regime_history_error = str(exc)
+        log.warning("regime_history persistence failed: {e}", e=regime_history_error)
+
     # Persist snapshot
     try:
         from store.snapshots import AnalyticalSnapshotStore
@@ -439,6 +802,8 @@ def run() -> dict[str, Any]:
 
     result = {
         "regime": regime,
+        "regime_history_written": regime_history_written,
+        "regime_history_error": regime_history_error,
         "confidence": confidence,
         "posture": posture,
         "stress_index": round(s_current, 4),
@@ -494,5 +859,52 @@ def run() -> dict[str, Any]:
     return result
 
 
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point: daily run, or a bounded point-in-time backfill."""
+    parser = argparse.ArgumentParser(description="GRID auto-regime detection")
+    parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help="Recompute regime_history rows over a date range instead of running for today",
+    )
+    parser.add_argument("--start", help="Backfill start date, YYYY-MM-DD (inclusive)")
+    parser.add_argument(
+        "--end",
+        help="Backfill end date, YYYY-MM-DD (inclusive). Defaults to today.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace regime_history rows that already exist in the range",
+    )
+    parser.add_argument(
+        "--max-days",
+        type=int,
+        default=400,
+        help="Hard cap on the backfill span (default: 400)",
+    )
+    args = parser.parse_args(argv)
+
+    if not args.backfill:
+        run()
+        return 0
+
+    if not args.start:
+        parser.error("--backfill requires --start")
+    start = date.fromisoformat(args.start)
+    end = date.fromisoformat(args.end) if args.end else date.today()
+
+    engine = get_engine()
+    result = backfill_regime_history(
+        engine,
+        start,
+        end,
+        overwrite=args.overwrite,
+        max_days=args.max_days,
+    )
+    print(json.dumps({k: v for k, v in result.items() if k != "labels"}, indent=2))
+    return 0 if not result.get("error") else 1
+
+
 if __name__ == "__main__":
-    run()
+    raise SystemExit(main())
