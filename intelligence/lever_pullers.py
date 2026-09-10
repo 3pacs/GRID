@@ -464,6 +464,74 @@ def _committee_has_jurisdiction(committee: str, ticker: str) -> bool:
 
 # ── 1. Identify Lever Pullers ────────────────────────────────────────────
 
+def _aggregate_scored_sources(conn: Any) -> list[tuple]:
+    """Every actor with >= MIN_SCORED_SIGNALS scored signals, one row each.
+
+    Rows: (source_type, identity, total_scored, correct, wrong,
+    last_signal_date, avg_lead_hours, avg_trust). Aggregates by the actor
+    behind the row (QuiverQuant feeds share one source_id per endpoint and
+    options flow is keyed per strike) and excludes aggregate-only feeds.
+    No LIMIT: a trust-ordered cut here silently dropped every low-hit-rate
+    category (options tapes) before the per-category quota could see them.
+    """
+    return conn.execute(text(f"""
+        SELECT
+            source_type,
+            {_IDENTITY_SQL} AS identity,
+            COUNT(*) AS total_signals,
+            SUM(CASE WHEN outcome = 'CORRECT' THEN 1 ELSE 0 END) AS correct,
+            SUM(CASE WHEN outcome = 'WRONG' THEN 1 ELSE 0 END) AS wrong,
+            MAX(signal_date) AS last_signal_date,
+            AVG(avg_lead_time_hours) AS avg_lead_hours,
+            AVG(trust_score) AS avg_trust
+        FROM signal_sources
+        WHERE outcome IN ('CORRECT', 'WRONG')
+          AND NOT (source_type = ANY(:excluded))
+        GROUP BY source_type, {_IDENTITY_SQL}
+        HAVING COUNT(*) >= :min_scored
+        ORDER BY AVG(trust_score) DESC
+    """), {
+        "excluded": list(AGGREGATE_SOURCE_TYPES),
+        "min_scored": MIN_SCORED_SIGNALS,
+    }).fetchall()
+
+
+def build_puller_index(engine: Engine) -> list[LeverPuller]:
+    """Lightweight LeverPuller for every qualified actor (no per-source lookups).
+
+    ``identify_lever_pullers`` returns the top-N *display* list with calls,
+    recent actions and a motivation model. Convergence and event detection
+    must not be limited to that list — eight TSM insiders buying in the
+    same week is a convergence whether or not they rank in the top 50 — so
+    they key on this index instead.
+    """
+    pullers: list[LeverPuller] = []
+    with engine.connect() as conn:
+        rows = _aggregate_scored_sources(conn)
+    for r in rows:
+        src_type, identity = r[0], r[1]
+        category = _category_from_source_type(src_type)
+        if category == "unknown":
+            continue
+        correct, wrong = int(r[3] or 0), int(r[4] or 0)
+        trust = (correct + 1.0) / (correct + wrong + 2.0)
+        avg_lead_hours = float(r[6]) if r[6] is not None else 0.0
+        pullers.append(LeverPuller(
+            id=f"{src_type}:{identity}",
+            name=identity,
+            category=category,
+            influence_rank=_influence_for_source(src_type, identity, {}),
+            trust_score=round(trust, 4),
+            position=_position_label(src_type, identity, {}),
+            motivation_model="unknown",
+            avg_lead_time_days=round(avg_lead_hours / 24.0, 2) if avg_lead_hours else 0.0,
+            total_signals=int(r[2]),
+            correct_signals=correct,
+        ))
+    log.info("Lever puller index: {n} qualified actors", n=len(pullers))
+    return pullers
+
+
 def identify_lever_pullers(engine: Engine) -> list[LeverPuller]:
     """Query signal_sources, aggregate by source, and rank by trust x influence.
 
@@ -482,31 +550,7 @@ def identify_lever_pullers(engine: Engine) -> list[LeverPuller]:
     pullers: list[LeverPuller] = []
 
     with engine.connect() as conn:
-        # Aggregate scored signals by the actor behind the row (not the raw
-        # source_id: QuiverQuant feeds share one id per endpoint and options
-        # flow is keyed per strike). Aggregate-only feeds are excluded.
-        rows = conn.execute(text(f"""
-            SELECT
-                source_type,
-                {_IDENTITY_SQL} AS identity,
-                COUNT(*) AS total_signals,
-                SUM(CASE WHEN outcome = 'CORRECT' THEN 1 ELSE 0 END) AS correct,
-                SUM(CASE WHEN outcome = 'WRONG' THEN 1 ELSE 0 END) AS wrong,
-                MAX(signal_date) AS last_signal_date,
-                AVG(avg_lead_time_hours) AS avg_lead_hours,
-                AVG(trust_score) AS avg_trust
-            FROM signal_sources
-            WHERE outcome IN ('CORRECT', 'WRONG')
-              AND NOT (source_type = ANY(:excluded))
-            GROUP BY source_type, {_IDENTITY_SQL}
-            HAVING COUNT(*) >= :min_scored
-            ORDER BY AVG(trust_score) DESC
-            LIMIT :lim
-        """), {
-            "excluded": list(AGGREGATE_SOURCE_TYPES),
-            "min_scored": MIN_SCORED_SIGNALS,
-            "lim": MAX_LEVER_PULLERS * 12,
-        }).fetchall()
+        rows = _aggregate_scored_sources(conn)
 
         if not rows:
             log.info("No scored sources found for lever puller identification")
@@ -907,29 +951,40 @@ def _assess_institutional_motivation(
     Returns:
         Motivation string.
     """
-    signal_type = action.get("signal_type", "")
+    direction = _direction_of(action)
 
-    # Count recent action directions
-    buy_count = sum(
-        1 for a in puller.recent_actions
-        if "BUY" in a.get("signal_type", "")
-    )
-    sell_count = sum(
-        1 for a in puller.recent_actions
-        if "SELL" in a.get("signal_type", "")
-    )
+    # Count recent action directions (BUY/SELL, bullish/bearish, CALL/PUT)
+    buy_count = sum(1 for a in puller.recent_actions if _direction_of(a) == "BUY")
+    sell_count = sum(1 for a in puller.recent_actions if _direction_of(a) == "SELL")
 
     total = buy_count + sell_count
-    if total == 0:
+    if total == 0 or direction is None:
         return "unknown"
 
     # If mostly buying and this is a sell (or vice versa), it is contrarian
-    if "BUY" in signal_type and sell_count > buy_count:
+    if direction == "BUY" and sell_count > buy_count:
         return "contrarian"
-    if "SELL" in signal_type and buy_count > sell_count:
+    if direction == "SELL" and buy_count > sell_count:
         return "contrarian"
 
     return "routine"
+
+
+def _direction_of(action: dict[str, Any]) -> str | None:
+    """Normalise an action to "BUY" / "SELL" / None across feed vocabularies.
+
+    Insiders say BUY/SELL, Reddit heat spikes carry ``direction: BULLISH``
+    or ``BEARISH`` (signal_type HEAT_SPIKE), WSB rows are wsb_bullish /
+    wsb_bearish, options rows are CALL / PUT.
+    """
+    st = str(action.get("signal_type") or "").upper()
+    details = action.get("details") or {}
+    d = str(details.get("direction") or "").upper() if isinstance(details, dict) else ""
+    for token, out in (("BUY", "BUY"), ("SELL", "SELL"), ("BULLISH", "BUY"), ("BEARISH", "SELL"),
+                       ("CALL", "BUY"), ("PUT", "SELL")):
+        if token in st or token in d:
+            return out
+    return None
 
 
 # ── 3. Get Active Lever Events ───────────────────────────────────────────
@@ -954,9 +1009,9 @@ def get_active_lever_events(
     """
     _ensure_lever_table(engine)
 
-    # First, get known lever pullers. Dashboard callers can pass the list
-    # they already fetched so this helper does not rescan signal_sources.
-    known_pullers = pullers if pullers is not None else identify_lever_pullers(engine)
+    # Every qualified actor, not just the top-50 display list. Dashboard
+    # callers can pass the list they already fetched to skip the rescan.
+    known_pullers = pullers if pullers is not None else build_puller_index(engine)
     puller_map: dict[str, LeverPuller] = {p.id: p for p in known_pullers}
 
     cutoff = date.today() - timedelta(days=days)
@@ -1133,7 +1188,9 @@ def find_lever_convergence(engine: Engine, pullers: list[LeverPuller] | None = N
 
     cutoff = date.today() - timedelta(days=CONVERGENCE_WINDOW_DAYS)
 
-    known_pullers = pullers if pullers is not None else identify_lever_pullers(engine)
+    # Convergence is about how many independent qualified actors line up on
+    # a ticker, so it keys on the full puller index, not the display top-50.
+    known_pullers = pullers if pullers is not None else build_puller_index(engine)
     puller_map: dict[str, LeverPuller] = {p.id: p for p in known_pullers}
 
     convergences: list[dict] = []

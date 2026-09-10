@@ -120,11 +120,14 @@ jobs:
       - name: Verify running API (health + OpenAPI)
         run: |
           set -euo pipefail
-          for attempt in {1..45}; do
+          # grid-api imports the whole intelligence tree at startup; on
+          # 2026-09-10 it took 96 s to start listening and the 90 s window
+          # failed a deploy that had actually landed. Allow four minutes.
+          for attempt in {1..120}; do
             if curl -fsS http://localhost:8000/api/v1/system/health; then
               break
             fi
-            if [ "$attempt" -eq 45 ]; then
+            if [ "$attempt" -eq 120 ]; then
               echo "grid-api did not pass health check after restart"
               sudo systemctl status grid-api --no-pager -l || true
               journalctl -u grid-api -n 120 --no-pager || true
