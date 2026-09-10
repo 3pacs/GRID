@@ -13,6 +13,9 @@ import { ArcLayer, ScatterplotLayer } from '@deck.gl/layers';
 import { HeatmapLayer } from '@deck.gl/aggregation-layers';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { api } from '../api.js';
+import { useAsyncData } from '../hooks/useAsyncData.js';
+import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
+import ErrorState from '../components/ErrorState.jsx';
 
 // Dark map style (free, no API key needed)
 const MAP_STYLE = 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json';
@@ -85,7 +88,6 @@ function GeoFlows() {
     const [density, setDensity] = useState([]);
     const [flowType, setFlowType] = useState('capital');
     const [days, setDays] = useState(90);
-    const [loading, setLoading] = useState(true);
     const [showFlows, setShowFlows] = useState(true);
     const [showActors, setShowActors] = useState(true);
     const [showHeatmap, setShowHeatmap] = useState(false);
@@ -145,24 +147,18 @@ function GeoFlows() {
     }, [viewState]);
 
     // Fetch data
-    useEffect(() => {
-        if (!webglSupported) return;
-
-        setLoading(true);
+    const { data: geoData, loading, error, refetch: reloadGeoData } = useAsyncData(async () => {
         const params = `flow_type=${flowType}&days=${days}`;
-
-        Promise.all([
+        const [flowRes, actorRes, densityRes] = await Promise.all([
             api.get(`/api/v1/geo/flows?${params}`),
             api.get(`/api/v1/geo/actors?min_influence=0.3&limit=300`),
             api.get(`/api/v1/geo/signals/density?days=${days}`),
-        ]).then(([flowRes, actorRes, densityRes]) => {
-            setFlows(flowRes?.flows || []);
-            setActors(actorRes?.actors || []);
-            setDensity(densityRes?.density || []);
-        }).catch(err => {
-            console.error('GeoFlows fetch error:', err);
-        }).finally(() => setLoading(false));
-    }, [flowType, days, webglSupported]);
+        ]);
+        setFlows(flowRes?.flows || []);
+        setActors(actorRes?.actors || []);
+        setDensity(densityRes?.density || []);
+        return { flowRes, actorRes, densityRes };
+    }, { fallback: null, deps: [flowType, days, webglSupported], skip: !webglSupported });
 
     // Arc layer -- capital flows between locations
     const arcLayer = useMemo(() => {
@@ -376,14 +372,24 @@ function GeoFlows() {
             )}
 
             {/* Loading indicator */}
-            {loading && (
+            {loading && !geoData && (
                 <div style={{
                     position: 'absolute', top: '50%', left: '50%',
                     transform: 'translate(-50%, -50%)',
-                    color: '#5A7080', fontSize: 14, zIndex: 10,
-                    fontFamily: "'IBM Plex Mono', monospace",
+                    width: '200px', zIndex: 10,
                 }}>
-                    Loading geo data...
+                    <LoadingSkeleton variant="text" count={2} />
+                </div>
+            )}
+
+            {/* Error indicator */}
+            {error && (
+                <div style={{
+                    position: 'absolute', top: '50%', left: '50%',
+                    transform: 'translate(-50%, -50%)',
+                    width: '320px', zIndex: 10,
+                }}>
+                    <ErrorState error={error} onRetry={reloadGeoData} title="Geo flow data unavailable" />
                 </div>
             )}
         </div>

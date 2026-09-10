@@ -4,6 +4,9 @@ import useStore from '../store.js';
 import { colors, tokens, shared } from '../styles/shared.js';
 import { useDevice } from '../hooks/useDevice.js';
 import ViewHelp from '../components/ViewHelp.jsx';
+import { useAsyncData } from '../hooks/useAsyncData.js';
+import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
+import ErrorState from '../components/ErrorState.jsx';
 
 const hypoStateColors = {
     CANDIDATE: { bg: '#1A6EBF22', color: '#1A6EBF' },
@@ -155,25 +158,23 @@ export default function Discovery({ focusHypothesis = '' }) {
     const [running, setRunning] = useState({});
     const { isMobile } = useDevice();
 
-    useEffect(() => { loadData(); }, []);
     useEffect(() => { loadHypotheses(); }, [hypoFilter]);
     useEffect(() => { setHypoQuery(focusHypothesis || ''); }, [focusHypothesis]);
 
-    const loadData = async () => {
+    const { loading, error, refetch: loadData } = useAsyncData(async () => {
         try {
             const [j, ortho, cluster] = await Promise.all([
-                api.getJobs().catch(() => ({ jobs: [] })),
+                api.getJobs(),
                 api.getResults('orthogonality').catch(() => null),
                 api.getResults('clustering').catch(() => null),
             ]);
             setJobs(j.jobs || []);
             if (ortho?.result) setOrthoResult(ortho.result);
             if (cluster?.result) setClusterResult(cluster.result);
-        } catch (err) {
-            addNotification('error', 'Failed to load discovery data');
+        } finally {
+            await loadHypotheses();
         }
-        loadHypotheses();
-    };
+    }, { fallback: null });
 
     const loadHypotheses = async () => {
         const params = {};
@@ -228,6 +229,12 @@ export default function Discovery({ focusHypothesis = '' }) {
                 <ViewHelp id="discovery" />
             </div>
 
+            {loading && !jobs.length && !orthoResult && !clusterResult ? (
+                <LoadingSkeleton variant="card" count={3} />
+            ) : error ? (
+                <ErrorState error={error} onRetry={loadData} title="Discovery data unavailable" />
+            ) : (
+            <>
             <div style={{
                 display: 'grid',
                 gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr',
@@ -449,6 +456,8 @@ export default function Discovery({ focusHypothesis = '' }) {
                     </div>
                 )}
             </div>
+            </>
+            )}
         </div>
     );
 }
