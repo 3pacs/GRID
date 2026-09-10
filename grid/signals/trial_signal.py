@@ -366,6 +366,29 @@ class TrialGemSignal:
         )
     """
 
+    # Same-day re-score: refresh today's row for (nct_id, ticker) instead of
+    # silently skipping it. Without this a run that finally knows the market
+    # cap / runway (enrichment landed after the morning score) could never
+    # replace the cap-unknown WATCHLIST row written earlier that day.
+    _UPDATE_SIGNAL_SQL = """
+        UPDATE trial_signals SET
+            run_id = %(run_id)s, company_name = %(company_name)s, sponsor_name = %(sponsor_name)s,
+            trial_phase = %(trial_phase)s, primary_indication = %(primary_indication)s,
+            primary_endpoint = %(primary_endpoint)s, endpoint_type = %(endpoint_type)s,
+            fda_designation = %(fda_designation)s, primary_completion_date = %(primary_completion_date)s,
+            enrollment_pct = %(enrollment_pct)s, days_to_completion = %(days_to_completion)s,
+            market_cap_mm = %(market_cap_mm)s, cash_runway_months = %(cash_runway_months)s,
+            pipeline_depth = %(pipeline_depth)s, trial_strength_score = %(trial_strength_score)s,
+            endpoint_clarity = %(endpoint_clarity)s, phase_weight = %(phase_weight)s,
+            disease_priority = %(disease_priority)s, cash_runway_score = %(cash_runway_score)s,
+            penalty_factors = %(penalty_factors)s, signal_type = %(signal_type)s,
+            regime_at_signal = %(regime_at_signal)s, confidence = %(confidence)s,
+            suggested_position_pct = %(suggested_position_pct)s, rationale = %(rationale)s,
+            red_flags = %(red_flags)s, catalysts = %(catalysts)s
+        WHERE nct_id = %(nct_id)s AND ticker = %(ticker)s
+          AND created_at >= CURRENT_DATE
+    """
+
     # Compact READOUT row per signal; deduped on (nct_id, ticker) against any
     # active row (the ingestor may already have written one for this NCT).
     _INSERT_CALENDAR_SQL = """
@@ -383,14 +406,16 @@ class TrialGemSignal:
     def write_to_db(self, results: list[SignalResult], run_id: str | None = None) -> int:
         """Persist signals to griddb trial_signals (+ compact catalyst_calendar rows).
 
-        Returns the number of trial_signals rows inserted (rows already present
-        for the same (nct_id, ticker) today are skipped, not duplicated).
+        Returns the number of trial_signals rows inserted. A row already present
+        for the same (nct_id, ticker) today is refreshed in place (counted in
+        ``self.stats["updated"]``), never duplicated.
         """
         if not results:
             return 0
 
         cur = self.conn.cursor()
         written = 0
+        updated = 0
         calendar_rows = 0
         run_id = run_id or datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         seen: set[tuple[str, str]] = set()
@@ -409,7 +434,7 @@ class TrialGemSignal:
                         + datetime.timedelta(days=r.days_to_completion)
                     )
 
-                cur.execute(self._INSERT_SIGNAL_SQL, {
+                params = {
                     "run_id": run_id, "nct_id": r.nct_id, "ticker": r.ticker,
                     "company_name": r.company_name, "sponsor_name": r.company_name,
                     "trial_phase": r.trial_phase, "primary_indication": r.primary_indication,
@@ -429,8 +454,13 @@ class TrialGemSignal:
                     "confidence": r.confidence,
                     "suggested_position_pct": r.suggested_position_pct,
                     "rationale": r.rationale, "red_flags": r.red_flags, "catalysts": r.catalysts,
-                })
-                written += _rowcount(cur)
+                }
+                cur.execute(self._INSERT_SIGNAL_SQL, params)
+                inserted = _rowcount(cur)
+                written += inserted
+                if inserted == 0:
+                    cur.execute(self._UPDATE_SIGNAL_SQL, params)
+                    updated += _rowcount(cur)
 
                 if completion_date is not None:
                     cur.execute(self._INSERT_CALENDAR_SQL, {
@@ -446,9 +476,10 @@ class TrialGemSignal:
 
         self.conn.commit()
         cur.close()
+        self.stats["updated"] = updated
         log.info(
-            f"Wrote {written} trial signals + {calendar_rows} catalyst_calendar rows "
-            f"to griddb (run_id={run_id})"
+            f"Wrote {written} trial signals (+{updated} same-day rows refreshed) + "
+            f"{calendar_rows} catalyst_calendar rows to griddb (run_id={run_id})"
         )
         return written
 
