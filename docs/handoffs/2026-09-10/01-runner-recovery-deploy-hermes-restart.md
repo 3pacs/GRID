@@ -11,14 +11,24 @@ verification and are queued for the grid-svr runner. Make sure they land, bring
 the Hermes tree and its daemons onto the same code, and verify each repaired
 error pattern is gone.
 
+## Status update — 20:40 UTC 2026-09-10 (supersedes step 1)
+
+The runner was restarted by the operator and is claiming jobs again. Deploy runs
+#565 (06a89a6) and #566 (d1bbfa9) **failed as designed**: they sat queued for
+40 minutes while main advanced, so the release tree fetched main, landed on
+`ae003d2`, and the `deploy.yml` guard rejected the mismatch against each run's
+own commit. Ignore both. **Deploy #567 (run 34527331707, commit `ae003d2` =
+current main) is the one that matters** — it carries #411, #412 and #413
+together. Start at step 2.
+
 ## Steps
 
 1. Check the runner: `actions_list list_workflow_runs deploy.yml`. If the Deploy
    job is still "queued" the runner is stalled — tell the operator to run
    `sudo systemctl restart actions.runner.3pacs-GRID.grid-svr` and wait. Do not
    re-dispatch jobs into a dead queue.
-2. When deploy #566 is green (its verify step checks health, PWA assets and three
-   OpenAPI routes), run an ops-exec that merges the Hermes tree from the release
+2. When the deploy for current main is green (its verify step checks health, PWA
+   assets and three OpenAPI routes), run an ops-exec that merges the Hermes tree from the release
    tree (command in 00-COMMON) and restarts:
    `grid-hermes grid-extractor grid-worker grid-coordinator grid-scheduler grid-intelligence`.
    Print `git log --oneline -1` of both trees and `systemctl is-active` of each unit.
