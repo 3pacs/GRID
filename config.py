@@ -68,6 +68,7 @@ class Settings(BaseSettings):
     EIA_API_KEY: str = ""
     GDELT_API_KEY: str = ""
     WORLDNEWS_API_KEY: str = ""
+    NEWSAPI_KEY: str = ""                # newsapi.org headline counts (scripts/load_wave2.py)
     OPENSECRETS_API_KEY: str = ""
 
     # Backup data source API keys

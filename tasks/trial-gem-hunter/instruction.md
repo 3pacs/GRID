@@ -46,7 +46,8 @@ Key tables:
 - `market_data`       ← price history for tickers
 
 ### 4. Alpha Vantage (price data)
-Key: SPT9IOAEYVUT7X6J
+Key: supplied at runtime through the `ALPHAVANTAGE_API_KEY` environment
+variable — never hardcode it in code, prompts, or logs
 Use for: 30-day price history, volume, 52-week range
 
 ---
