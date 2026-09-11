@@ -145,6 +145,56 @@ describe('MacroRegimeCard (via WidgetGrid)', () => {
             expect(screen.getByText(/market read isn.t ready yet/)).toBeInTheDocument();
         });
     });
+
+    // /api/v1/regime/current returns `state`; `regime` is the older shape the
+    // card was written against, so both have to render.
+    it('reads the endpoint\'s own `state` field', async () => {
+        api.getCurrent.mockResolvedValue({ state: 'GROWTH', data_staleness_days: 0 });
+        render(<WidgetGrid widgets={[{ type: 'macro_regime' }]} />);
+
+        await waitFor(() => {
+            expect(screen.getByText('Investors are feeling confident.')).toBeInTheDocument();
+        });
+    });
+
+    it('names the date the data is really from when the inputs are stale', async () => {
+        api.getCurrent.mockResolvedValue({
+            state: 'NEUTRAL',
+            as_of_date: '2026-09-10',
+            staleness_days: 0,
+            data_as_of: '2026-04-03',
+            data_staleness_days: 160,
+        });
+        render(<WidgetGrid widgets={[{ type: 'macro_regime' }]} />);
+
+        await waitFor(() => {
+            expect(screen.getByText(/Apr 3, 2026/)).toBeInTheDocument();
+        });
+        expect(screen.getByText(/160 days ago, not today/)).toBeInTheDocument();
+    });
+
+    it('says nothing about dates when the data is current', async () => {
+        api.getCurrent.mockResolvedValue({
+            state: 'NEUTRAL',
+            data_as_of: '2026-09-10',
+            data_staleness_days: 1,
+        });
+        render(<WidgetGrid widgets={[{ type: 'macro_regime' }]} />);
+
+        await waitFor(() => {
+            expect(screen.getByText(/calm and mixed/)).toBeInTheDocument();
+        });
+        expect(screen.queryByText(/not today/)).not.toBeInTheDocument();
+    });
+
+    it('still flags age when the data date itself is missing', async () => {
+        api.getCurrent.mockResolvedValue({ state: 'NEUTRAL', data_staleness_days: 160 });
+        render(<WidgetGrid widgets={[{ type: 'macro_regime' }]} />);
+
+        await waitFor(() => {
+            expect(screen.getByText(/160 days old/)).toBeInTheDocument();
+        });
+    });
 });
 
 describe('NewsCard (via WidgetGrid)', () => {

@@ -27,6 +27,12 @@ class RegimeCurrentResponse(BaseModel):
     # "as of 5 months ago" instead of presenting a frozen read as current.
     as_of_date: str = ""
     staleness_days: int | None = None
+    # The date the *data* behind the reading comes from, and its age. These are
+    # the honest pair: as_of_date is when the label was computed, which on a
+    # scheduled run is always today no matter how old its inputs were.
+    # None when the row predates the regime_history.data_as_of column.
+    data_as_of: str = ""
+    data_staleness_days: int | None = None
 
 
 class RegimeHistoryEntry(BaseModel):

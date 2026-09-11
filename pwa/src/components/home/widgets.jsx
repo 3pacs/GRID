@@ -190,10 +190,32 @@ function WatchlistCard({ title }) {
 
 // ── Macro regime ───────────────────────────────────────────────────────
 
+// Past this many days the regime's inputs are old enough that the card must
+// name the date it is really describing. Mirrors _REGIME_DATA_STALE_AFTER_DAYS
+// in api/routers/chat.py and MAX_FRESH_DATA_AGE_DAYS in scripts/auto_regime.py.
+const REGIME_DATA_STALE_AFTER_DAYS = 5;
+
+/** "Sep 10, 2026" from an ISO date, or null if it isn't one. */
+function plainDate(iso) {
+    if (typeof iso !== 'string' || !/^\d{4}-\d{2}-\d{2}/.test(iso)) return null;
+    const [y, m, d] = iso.slice(0, 10).split('-').map(Number);
+    const date = new Date(Date.UTC(y, m - 1, d));
+    if (Number.isNaN(date.getTime())) return null;
+    return date.toLocaleDateString(undefined, {
+        month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC',
+    });
+}
+
 function MacroRegimeCard({ title }) {
     const { loading, error, data, reload } = useFetch(() => api.getCurrent(), []);
-    const regime = data?.regime;
+    // /api/v1/regime/current calls it `state`; `regime` is the older shape.
+    const regime = data?.regime ?? data?.state;
     const r = regime ? plainRegime(regime) : null;
+    // The reading's own date is always "today" on a scheduled run. data_as_of is
+    // the day its inputs are actually from — the only one worth showing him.
+    const dataAge = data?.data_staleness_days;
+    const dataDate = plainDate(data?.data_as_of);
+    const stale = typeof dataAge === 'number' && dataAge > REGIME_DATA_STALE_AFTER_DAYS;
     return (
         <Shell title={title || 'The market right now'}>
             {loading && <Loading />}
@@ -204,6 +226,13 @@ function MacroRegimeCard({ title }) {
                         <div style={{ ...CS.regime, background: toneBg(r.tone), color: toneColor(r.tone) }}>
                             {r.sentence}
                         </div>
+                        {stale && (
+                            <div style={CS.dim}>
+                                {dataDate
+                                    ? `This is the market as of ${dataDate} — ${dataAge} days ago, not today.`
+                                    : `This read is ${dataAge} days old — not today’s market.`}
+                            </div>
+                        )}
                     </div>
                 )
                 : <Empty msg="The market read isn’t ready yet — check back shortly." />)}

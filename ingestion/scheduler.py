@@ -1181,12 +1181,19 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
     try:
         from scripts.auto_regime import run
         result = run()
+        # data_as_of is the date the reading is really about; the row's own
+        # obs_date is always today. While the resolver was down those were five
+        # months apart and nothing in this line said so.
         log.info(
-            "Auto regime detection — state={s}, confidence={c}, regime_history={rh}",
+            "Auto regime detection — state={s}, confidence={c}, regime_history={rh}, "
+            "data_as_of={da} ({age} days old)",
             s=result.get("regime", "?"),
             c=result.get("confidence", "?"),
             rh=result.get("regime", "?") if result.get("regime_history_written")
             else "NOT WRITTEN",
+            da=result.get("data_as_of") or "unknown",
+            age=result.get("data_staleness_days") if result.get("data_staleness_days") is not None
+            else "?",
         )
         if result.get("regime_history_error"):
             log.warning(

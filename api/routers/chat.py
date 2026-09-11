@@ -326,25 +326,47 @@ def _get_db_engine():
     return get_engine()
 
 
+# Beyond this, the regime's inputs are old enough that the verdict must not
+# present the label as today's read. Matches MAX_FRESH_DATA_AGE_DAYS in
+# scripts/auto_regime.py, which logs the same threshold on the writing side.
+_REGIME_DATA_STALE_AFTER_DAYS = 5
+
+
 def _gather_regime_context() -> tuple[str, str]:
     """Return current regime state from DB.
 
-    The framing carries the row's own ``obs_date`` and, when the row is not
-    from today, how old it is. ``created_at`` is when the row was written, not
-    what it describes, so quoting it alone let a months-old regime read as
-    current in the verdict.
+    The framing is built around ``data_as_of`` — the newest real observation
+    the label was computed from — not ``obs_date``, which on a scheduled run is
+    always today whatever the inputs were. A stalled pipeline produces a row
+    dated today carrying a five-month-old reading; quoting obs_date alone let
+    that read as current in the verdict. ``created_at`` is when the row was
+    written, which is a third thing again.
     """
     try:
         engine = _get_db_engine()
         from sqlalchemy import text
         with engine.connect() as conn:
             row = conn.execute(text(
-                "SELECT obs_date, regime, confidence, created_at "
+                "SELECT obs_date, regime, confidence, created_at, data_as_of "
                 "FROM regime_history ORDER BY obs_date DESC LIMIT 1"
             )).fetchone()
             if row:
-                obs_date, regime, confidence, created_at = row
+                obs_date, regime, confidence, created_at, data_as_of = row
                 framing = f"Current regime: {regime} (confidence: {confidence}, as of {obs_date})"
+                if isinstance(data_as_of, date):
+                    data_age = (date.today() - data_as_of).days
+                    framing += f" — computed from data through {data_as_of}"
+                    if data_age > _REGIME_DATA_STALE_AFTER_DAYS:
+                        framing += (
+                            f", which is {data_age} days old: this describes the "
+                            f"market as of {data_as_of}, NOT today. Say so rather "
+                            "than presenting it as the current regime"
+                        )
+                else:
+                    framing += (
+                        " — the age of the data behind this reading is unknown, "
+                        "so do not present it as today's regime"
+                    )
                 if isinstance(obs_date, date):
                     age_days = (date.today() - obs_date).days
                     if age_days > 1:

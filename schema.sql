@@ -313,6 +313,15 @@ CREATE TABLE IF NOT EXISTS regime_history (
                     'GROWTH', 'NEUTRAL', 'FRAGILE', 'CRISIS')),
     confidence  DOUBLE PRECISION CHECK (confidence BETWEEN 0 AND 1),
     source      TEXT,
+    -- Newest real observation behind the label, measured before any
+    -- forward-fill. obs_date is the day the row was computed FOR (today, on a
+    -- scheduled run); data_as_of is the day the data is actually from. They
+    -- diverge whenever the pipeline stalls, and only this column makes that
+    -- visible — a row whose inputs stopped in April still carries today's
+    -- obs_date. Nullable: rows written before this column existed cannot have
+    -- it reconstructed.
+    data_as_of  DATE CONSTRAINT ck_regime_history_data_as_of
+                     CHECK (data_as_of IS NULL OR data_as_of <= obs_date),
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
