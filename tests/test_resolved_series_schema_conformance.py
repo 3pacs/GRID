@@ -7,9 +7,10 @@ named four things which do not exist: the table ``entity_map``, the columns
 execution, and was logged at debug — so nothing in CI or in the logs said a
 word for five and a half months.
 
-This module re-reads ``schema.sql`` and checks every SQL literal in
-``scripts/hermes_operator.py`` and ``normalization/resolver.py`` that names
-``resolved_series``:
+This module re-reads ``schema.sql`` and checks every SQL literal that names
+``resolved_series`` in the four modules that write or read it outside the API
+layer — ``scripts/hermes_operator.py``, ``normalization/resolver.py``,
+``scripts/hermes_fixers.py`` and ``ingestion/scheduler.py``:
 
   * every column named in an INSERT column list is a real column;
   * every ``alias.column`` reference bound to resolved_series is real;
@@ -18,7 +19,10 @@ This module re-reads ``schema.sql`` and checks every SQL literal in
     schema (``schema.sql`` or a migration).
 
 The checker is exercised against the historical bad statement so the guard
-itself cannot rot into a no-op.
+itself cannot rot into a no-op, and ``test_every_guarded_module_yields_sql``
+fails if a module in the list stops producing literals at all — a rename or a
+refactor to f-strings would otherwise turn its coverage into a silent pass,
+which is the same failure mode the regression exploited.
 """
 
 from __future__ import annotations
@@ -31,10 +35,33 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCHEMA_PATH = REPO_ROOT / "schema.sql"
+# The pipeline modules whose resolved_series SQL is schema-checked: the
+# resolver (the only writer), the two Hermes-side readers, and the operator
+# itself.
 GUARDED_MODULES = (
     "scripts/hermes_operator.py",
     "normalization/resolver.py",
+    "scripts/hermes_fixers.py",
+    "ingestion/scheduler.py",
 )
+
+# Of those, the ones that must actually yield SQL literals. A module here
+# that produces nothing is a hole, not a pass: the extractor only sees
+# ``ast.Constant`` strings, so SQL moved into an f-string or a template
+# would silently drop out of coverage. See
+# TestGuardedModules.test_modules_that_must_yield_sql_still_do.
+MODULES_REQUIRING_SQL = (
+    "normalization/resolver.py",
+    "scripts/hermes_fixers.py",
+    "ingestion/scheduler.py",
+)
+
+# scripts/hermes_operator.py is the exception, and deliberately so: since the
+# b0a02b4 statement was removed it carries no resolved_series SQL at all, and
+# must not regain any. The resolver is the single writer; a hand-rolled
+# INSERT reappearing in the cycle is the exact shape of the regression. It
+# stays in GUARDED_MODULES so anything added there is checked on arrival.
+MODULE_REQUIRING_NO_SQL = "scripts/hermes_operator.py"
 
 # Words that can follow a table name but are not an alias.
 _NOT_AN_ALIAS = {
@@ -251,6 +278,50 @@ class TestGuardedModules:
         """Guard the guard: the resolver's INSERT must be one of the literals."""
         literals = _sql_literals(REPO_ROOT / "normalization/resolver.py")
         assert any("INSERT INTO resolved_series" in s for s in literals)
+
+    @pytest.mark.parametrize("rel_path", GUARDED_MODULES)
+    def test_guarded_module_exists(self, rel_path):
+        """A renamed or deleted module must fail loudly, not drop coverage."""
+        assert (REPO_ROOT / rel_path).exists(), (
+            f"{rel_path} is in GUARDED_MODULES but does not exist"
+        )
+
+    @pytest.mark.parametrize("rel_path", MODULES_REQUIRING_SQL)
+    def test_modules_that_must_yield_sql_still_do(self, rel_path):
+        """Guard the guard: a covered module must still expose SQL to check.
+
+        ``_sql_literals`` only sees ``ast.Constant`` strings. If a module is
+        refactored so its resolved_series SQL is built by an f-string, a
+        helper or a template, the extractor returns nothing and
+        ``test_every_sql_literal_conforms_to_schema`` passes vacuously —
+        exactly the shape of the 2026-03 regression, where nothing failed
+        because nothing was looking.
+        """
+        literals = _sql_literals(REPO_ROOT / rel_path)
+        assert literals, (
+            f"{rel_path} yielded no resolved_series SQL literals — either it "
+            f"no longer touches the table (move it out of "
+            f"MODULES_REQUIRING_SQL) or its SQL is no longer a plain string "
+            f"constant, in which case the checker is blind to it and must be "
+            f"taught the new shape"
+        )
+
+    def test_hermes_operator_has_no_resolved_series_sql(self):
+        """The cycle must not hand-roll resolved_series SQL again.
+
+        b0a02b4 put an INSERT ... SELECT into the cycle and wrapped it in
+        ``except Exception: log.debug(...)``; it named a table and columns
+        that do not exist and failed silently for 5.5 months. The resolver
+        is the single writer, reached through
+        ``_run_resolution_step`` — the operator itself should name
+        resolved_series nowhere in SQL.
+        """
+        literals = _sql_literals(REPO_ROOT / MODULE_REQUIRING_NO_SQL)
+        assert literals == [], (
+            f"{MODULE_REQUIRING_NO_SQL} has regained resolved_series SQL. "
+            f"Route writes through normalization.resolver.Resolver instead: "
+            f"{literals}"
+        )
 
 
 # ---------------------------------------------------------------------------
