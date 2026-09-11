@@ -44,6 +44,19 @@
 -- Populated by: existing scheduled pullers (ECB FX, yfinance ETF closes) via
 --               normalization/resolver.py, once these rows exist.
 --
+-- Column values must satisfy feature_registry's CHECK constraints, verified
+-- against griddb 2026-09-11:
+--   normalization        ZSCORE | MINMAX | RAW | RANK   (NOT 'NONE')
+--   missing_data_policy  FORWARD_FILL | INTERPOLATE | NAN
+--   family               rates credit breadth vol fx commodity sentiment
+--                        macro earnings crypto equity alternative systemic
+--                        trade flows
+-- The first version of this file used normalization='NONE', which is not in
+-- the allowed set; psql rejected the whole INSERT and nothing was written
+-- (0/9 registered before and after), so no database ever carried a partial
+-- apply. RAW is the right value here: these are raw prices and rates stored
+-- as published, and RAW is already in use on 101 rows.
+--
 -- Idempotent: ON CONFLICT (name) DO NOTHING, matching 0062 and
 -- ingestion/seed_v2.py. No new table or sequence, so no GRANT footer is
 -- required (grid already has privileges on feature_registry).
@@ -57,26 +70,26 @@ INSERT INTO feature_registry
 VALUES
   -- FX: the largest ghost by row volume (339 rows / 30 d)
   ('eurusd_ecb_daily', 'fx', 'EUR/USD daily reference rate published by the ECB',
-   'RAW', 1, 0, 'NONE', 'FORWARD_FILL', '2026-01-01', TRUE),
+   'RAW', 1, 0, 'RAW', 'FORWARD_FILL', '2026-01-01', TRUE),
 
   -- Bond ETF closes: mapped by the NEW_MAPPINGS_V2 comprehension over
   -- close and adj_close, target *_full, never registered.
   ('shy_full', 'credit', 'iShares 1-3 Year Treasury Bond ETF (SHY) close',
-   'RAW', 1, 0, 'NONE', 'FORWARD_FILL', '2026-01-01', TRUE),
+   'RAW', 1, 0, 'RAW', 'FORWARD_FILL', '2026-01-01', TRUE),
   ('ief_full', 'credit', 'iShares 7-10 Year Treasury Bond ETF (IEF) close',
-   'RAW', 1, 0, 'NONE', 'FORWARD_FILL', '2026-01-01', TRUE),
+   'RAW', 1, 0, 'RAW', 'FORWARD_FILL', '2026-01-01', TRUE),
   ('emb_full', 'credit', 'iShares JP Morgan USD Emerging Markets Bond ETF (EMB) close',
-   'RAW', 1, 0, 'NONE', 'FORWARD_FILL', '2026-01-01', TRUE),
+   'RAW', 1, 0, 'RAW', 'FORWARD_FILL', '2026-01-01', TRUE),
   ('jnk_full', 'credit', 'SPDR Bloomberg High Yield Bond ETF (JNK) close',
-   'RAW', 1, 0, 'NONE', 'FORWARD_FILL', '2026-01-01', TRUE),
+   'RAW', 1, 0, 'RAW', 'FORWARD_FILL', '2026-01-01', TRUE),
   ('mub_full', 'credit', 'iShares National Muni Bond ETF (MUB) close',
-   'RAW', 1, 0, 'NONE', 'FORWARD_FILL', '2026-01-01', TRUE),
+   'RAW', 1, 0, 'RAW', 'FORWARD_FILL', '2026-01-01', TRUE),
 
   -- Sector/theme ETF closes: mapped in SEED_MAPPINGS, never registered.
   ('smh_close', 'equity', 'VanEck Semiconductor ETF (SMH) close',
-   'RAW', 1, 0, 'NONE', 'FORWARD_FILL', '2026-01-01', TRUE),
+   'RAW', 1, 0, 'RAW', 'FORWARD_FILL', '2026-01-01', TRUE),
   ('icln_close', 'equity', 'iShares Global Clean Energy ETF (ICLN) close',
-   'RAW', 1, 0, 'NONE', 'FORWARD_FILL', '2026-01-01', TRUE),
+   'RAW', 1, 0, 'RAW', 'FORWARD_FILL', '2026-01-01', TRUE),
   ('lit_close', 'commodity', 'Global X Lithium & Battery Tech ETF (LIT) close',
-   'RAW', 1, 0, 'NONE', 'FORWARD_FILL', '2026-01-01', TRUE)
+   'RAW', 1, 0, 'RAW', 'FORWARD_FILL', '2026-01-01', TRUE)
 ON CONFLICT (name) DO NOTHING;
