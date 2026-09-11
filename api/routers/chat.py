@@ -15,8 +15,9 @@ import concurrent.futures as _futures
 import inspect
 import re as _re
 import threading
+import time
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 
@@ -326,21 +327,56 @@ def _get_db_engine():
     return get_engine()
 
 
+# Beyond this, the regime's inputs are old enough that the verdict must not
+# present the label as today's read. Matches MAX_FRESH_DATA_AGE_DAYS in
+# scripts/auto_regime.py, which logs the same threshold on the writing side.
+_REGIME_DATA_STALE_AFTER_DAYS = 5
+
+
 def _gather_regime_context() -> tuple[str, str]:
-    """Return current regime state from DB."""
+    """Return current regime state from DB.
+
+    The framing is built around ``data_as_of`` — the newest real observation
+    the label was computed from — not ``obs_date``, which on a scheduled run is
+    always today whatever the inputs were. A stalled pipeline produces a row
+    dated today carrying a five-month-old reading; quoting obs_date alone let
+    that read as current in the verdict. ``created_at`` is when the row was
+    written, which is a third thing again.
+    """
     try:
         engine = _get_db_engine()
         from sqlalchemy import text
         with engine.connect() as conn:
             row = conn.execute(text(
-                "SELECT regime, confidence, created_at "
+                "SELECT obs_date, regime, confidence, created_at, data_as_of "
                 "FROM regime_history ORDER BY obs_date DESC LIMIT 1"
             )).fetchone()
             if row:
-                return (
-                    f"Current regime: {row[0]} (confidence: {row[1]}, as of {row[2]})",
-                    "regime_history",
-                )
+                obs_date, regime, confidence, created_at, data_as_of = row
+                framing = f"Current regime: {regime} (confidence: {confidence}, as of {obs_date})"
+                if isinstance(data_as_of, date):
+                    data_age = (date.today() - data_as_of).days
+                    framing += f" — computed from data through {data_as_of}"
+                    if data_age > _REGIME_DATA_STALE_AFTER_DAYS:
+                        framing += (
+                            f", which is {data_age} days old: this describes the "
+                            f"market as of {data_as_of}, NOT today. Say so rather "
+                            "than presenting it as the current regime"
+                        )
+                else:
+                    framing += (
+                        " — the age of the data behind this reading is unknown, "
+                        "so do not present it as today's regime"
+                    )
+                if isinstance(obs_date, date):
+                    age_days = (date.today() - obs_date).days
+                    if age_days > 1:
+                        framing += (
+                            f" — NOTE: this reading is {age_days} days old, "
+                            "treat it as a stale regime read, not today's"
+                        )
+                framing += f" [written {created_at}]"
+                return framing, "regime_history"
     except Exception as exc:
         log.debug("Chat context: regime history query failed: {e}", e=str(exc))
     return "", ""
@@ -1084,7 +1120,35 @@ def _get_llm_client():
 
 _RESILIENT_EXEC = _futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="llm-failover")
 
-_LOCAL_CHAT_TIMEOUT_S = 18.0
+# Fallback default for the compose LLM budget, used only if settings.py's
+# COMPOSE_LLM_BUDGET_S is somehow missing. See _compose_budget_s().
+_COMPOSE_LLM_BUDGET_S_DEFAULT: float = 18.0
+
+
+def _compose_budget_s() -> float:
+    """Total wall-clock budget for one compose request's whole LLM attempt
+    (local card + any paid failover), enforced as a single deadline in
+    _resilient_chat — read live from settings.COMPOSE_LLM_BUDGET_S so an
+    operator can tune it without a deploy once a healthy-card timing
+    baseline exists (see config.py's comment on that setting; PR #453
+    review). Defaults to 18s, unchanged from the pre-fail-fast per-candidate
+    timeout: 2026-09-10 read-only QA (gemini-task 34544181414) only measured
+    compose while the local card was already degraded (18009ms to the busy
+    fallback, one candidate host not erroring out of its own read timeout
+    until 120s later in an abandoned background thread) — there is no
+    evidence yet of what a *healthy* compose answer needs, so the budget
+    stays conservative until _resilient_chat's own timing log below
+    supplies that data.
+    """
+    from config import settings
+    return getattr(settings, "COMPOSE_LLM_BUDGET_S", _COMPOSE_LLM_BUDGET_S_DEFAULT)
+
+# Total wall-clock budget for the PAID failover phase of the streaming verdict
+# (after the local card's own first-token budget, _STREAM_FIRST_TOKEN_S, has
+# already been spent). Keeps a slow third host from stacking multiple
+# per-provider paid timeouts into a multi-minute wait — see _COMPOSE_LLM_BUDGET_S.
+_STREAM_PAID_BUDGET_S: float = 20.0
+
 _PAID_CHAT_TIMEOUT_S = 45.0
 
 # Honest message when the card is busy AND no paid model answered.
@@ -1101,7 +1165,14 @@ def _call_with_timeout(fn, timeout_s: float):
 
 
 def _get_local_oracle():
-    """Best available LOCAL chat client (no cloud), or (None, None)."""
+    """Best available LOCAL chat client (no cloud), or (None, None).
+
+    ``get_llm`` already returns fast (no network call) when every candidate
+    endpoint in the tier's fallback chain is disabled or sitting inside its
+    own chat-failure backoff window (see llamacpp/client.py's
+    ``_ENDPOINT_BACKOFF_UNTIL``) — so a caller only pays a real connection cost
+    here when at least one candidate looks reachable.
+    """
     try:
         from llm.router import get_llm, Tier
         client = get_llm(Tier.ORACLE)
@@ -1118,7 +1189,12 @@ _PAID_PROVIDERS = ("openai", "openrouter")
 
 
 def _paid_clients():
-    """Available PAID cloud clients, in priority order: [(client, label), ...]."""
+    """Available PAID cloud clients, in priority order: [(client, label), ...].
+
+    Empty by default: paid providers are gated behind GRID_ALLOW_PAID_LLM
+    (see llm/router.py), so ``get_llm(provider=...)`` returns None instantly
+    without any network call when that flag is unset.
+    """
     from llm.router import get_llm
     out = []
     for prov in _PAID_PROVIDERS:
@@ -1133,30 +1209,62 @@ def _paid_clients():
 
 def _resilient_chat(messages, *, temperature: float = 0.3, num_predict: int = 800):
     """Local card first; on busy/slow/error, fail over through the paid cloud
-    models. Returns (text, label), or (None, None) when nothing responds."""
-    local, label = _get_local_oracle()
-    if local is not None:
-        try:
-            txt = _call_with_timeout(
-                lambda: local.chat(messages, temperature=temperature, num_predict=num_predict),
-                _LOCAL_CHAT_TIMEOUT_S,
-            )
-            if txt and txt.strip():
-                return txt, label
-            log.warning("Local LLM returned empty — failing over to paid")
-        except _futures.TimeoutError:
-            log.warning("Local card busy (>{t}s) — failing over to paid model", t=_LOCAL_CHAT_TIMEOUT_S)
-        except Exception as exc:
-            log.warning("Local LLM error ({e}) — failing over to paid", e=str(exc))
+    models. Returns (text, label), or (None, None) when nothing responds.
 
-    for paid, plabel in _paid_clients():
+    The whole attempt (local + paid) is bounded by the compose LLM budget
+    (settings.COMPOSE_LLM_BUDGET_S, see _compose_budget_s()): once the
+    deadline passes, remaining candidates are skipped rather than each
+    spending their own full timeout. Every successful answer logs its
+    elapsed time and answering label at log.info so the budget can be
+    tuned from real production timings instead of guesses.
+    """
+    budget = _compose_budget_s()
+    started = time.monotonic()
+    deadline = started + budget
+    local, label = _get_local_oracle()
+    paid_candidates = _paid_clients()
+
+    if local is None and not paid_candidates:
+        log.warning("Compose: no LLM endpoint available (all disabled) — returning busy fallback")
+        return None, None
+
+    if local is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            log.warning("Compose LLM budget ({b}s) exhausted before local attempt could run", b=budget)
+        else:
+            try:
+                txt = _call_with_timeout(
+                    lambda: local.chat(messages, temperature=temperature, num_predict=num_predict),
+                    remaining,
+                )
+                if txt and txt.strip():
+                    log.info(
+                        "Compose answered via {l} in {ms:.0f}ms (budget {b}s)",
+                        l=label, ms=(time.monotonic() - started) * 1000, b=budget,
+                    )
+                    return txt, label
+                log.warning("Local LLM returned empty — failing over to paid")
+            except _futures.TimeoutError:
+                log.warning("Compose LLM budget ({b}s) exceeded on local card — failing over to paid model", b=budget)
+            except Exception as exc:
+                log.warning("Local LLM error ({e}) — failing over to paid", e=str(exc))
+
+    for paid, plabel in paid_candidates:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            log.warning("Compose LLM budget ({b}s) exhausted before paid fallback {l} could run", b=budget, l=plabel)
+            break
         try:
             txt = _call_with_timeout(
                 lambda p=paid: p.chat(messages, temperature=temperature, num_predict=num_predict),
-                _PAID_CHAT_TIMEOUT_S,
+                remaining,
             )
             if txt and txt.strip():
-                log.info("Answered via paid model {l} (local card busy)", l=plabel)
+                log.info(
+                    "Compose answered via paid model {l} in {ms:.0f}ms (budget {b}s, local card busy)",
+                    l=plabel, ms=(time.monotonic() - started) * 1000, b=budget,
+                )
                 return txt, plabel
             log.warning("Paid model {l} returned empty — trying next", l=plabel)
         except Exception as exc:
@@ -2036,9 +2144,34 @@ async def compose_layout(
     _alert = _parse_alert_intent(question)
     if _alert:
         owner = _user_id_from_token(token) or "dad"
+        threshold = _alert.get("threshold")
+        if threshold is None:
+            # Relative move ("drops 5 percent") — resolve to a dollar price off
+            # the current quote (same read the alert store itself uses) rather
+            # than guessing; a percent number is never a bare dollar price.
+            from api.routers.price_alerts import current_price
+            base_price, _src = current_price(_alert["ticker"], prefer_live=False)
+            if base_price is None:
+                rid = _log_capability_gap(
+                    owner=owner,
+                    request_text=question,
+                    want=question,
+                    reason=f"No current price available for {_alert['ticker']} to compute a percent-based alert.",
+                )
+                return ChatComposeResponse(
+                    spoken_reply=(
+                        f"I couldn't look up {_alert['ticker']}'s current price, so I can't set "
+                        "that percent-based alert right now — try again later or give me a dollar amount."
+                    ),
+                    widgets=[], allocation=[],
+                    generated_at=now.isoformat(), model_used=None,
+                    cannot_fulfill=True, request_id=rid,
+                )
+            sign = -1.0 if _alert["direction"] == "below" else 1.0
+            threshold = round(base_price * (1 + sign * _alert["pct"]), 4)
         from api.routers.price_alerts import create_alert_record
         res = create_alert_record(
-            owner, _alert["ticker"], _alert["direction"], _alert["threshold"],
+            owner, _alert["ticker"], _alert["direction"], threshold,
             note=question[:280],
         )
         if res.get("ok"):
@@ -2270,14 +2403,50 @@ _ALERT_ABOVE = _re.compile(
 _ALERT_BELOW = _re.compile(
     r"\b(below|under|drops?|falls?|dips?|down to|goes?\s*down|sinks?|loses?)\b", _re.I)
 _ALERT_NUM = _re.compile(r"\$?\s*([\d,]+(?:\.\d+)?)\s*([kKmM])?\b")
+# A number followed by a percent cue ("5 percent", "5%", "5 pct") is a relative
+# move, not a dollar price — checked before _ALERT_NUM so "drops 5 percent"
+# doesn't get parsed as "drops below $5".
+_ALERT_PERCENT = _re.compile(r"\b([\d,]+(?:\.\d+)?)\s*(?:%|percent\b|pct\b)", _re.I)
+
+
+def _extract_alert_ticker(ql: str, q: str) -> str | None:
+    for name, sym in sorted(_ALERT_NAME_TO_TICKER.items(), key=lambda kv: -len(kv[0])):
+        if name in ql:
+            return sym
+    explicit = _re.search(r"\$([A-Za-z]{1,6})\b", q) or _re.search(r"\b([A-Z]{2,5})\b", q)
+    if explicit:
+        return explicit.group(1).upper()
+    return None
 
 
 def _parse_alert_intent(question: str) -> dict | None:
-    """Deterministically extract {ticker, direction, threshold} from a plain
-    request. Returns None when anything is ambiguous (then the LLM handles it).
-    Works with the LLM down — a price alert is a precise instruction."""
+    """Deterministically extract a price-alert intent from a plain request:
+    either {ticker, direction, threshold} for an absolute dollar price, or
+    {ticker, direction, pct} for a relative move ("drops 5 percent") that the
+    caller must resolve to a price once a current quote is available. Returns
+    None when anything is ambiguous (then the LLM handles it). Works with the
+    LLM down — a price alert is a precise instruction."""
     q = question or ""
     ql = q.lower()
+
+    pct_match = _ALERT_PERCENT.search(q)
+    if pct_match:
+        try:
+            pct = float(pct_match.group(1).replace(",", ""))
+        except ValueError:
+            return None
+        if pct <= 0:
+            return None
+        if _ALERT_BELOW.search(ql):
+            direction = "below"
+        elif _ALERT_ABOVE.search(ql):
+            direction = "above"
+        else:
+            return None
+        ticker = _extract_alert_ticker(ql, q)
+        if not ticker:
+            return None
+        return {"ticker": ticker, "direction": direction, "pct": pct / 100.0}
 
     m = _ALERT_NUM.search(q)
     if not m:
@@ -2301,15 +2470,7 @@ def _parse_alert_intent(question: str) -> dict | None:
     else:
         return None
 
-    ticker = None
-    for name, sym in sorted(_ALERT_NAME_TO_TICKER.items(), key=lambda kv: -len(kv[0])):
-        if name in ql:
-            ticker = sym
-            break
-    if ticker is None:
-        explicit = _re.search(r"\$([A-Za-z]{1,6})\b", q) or _re.search(r"\b([A-Z]{2,5})\b", q)
-        if explicit:
-            ticker = explicit.group(1).upper()
+    ticker = _extract_alert_ticker(ql, q)
     if not ticker:
         return None
 
@@ -2518,9 +2679,23 @@ def _stream_local_tokens(messages, client):
 def _stream_verdict(messages):
     """SSE generator: stream from the local card; if it's busy/slow/down, fail
     over to a paid model (emitted in chunks). If even paid is unreachable, tell
-    dad honestly the card is busy rather than faking an answer."""
-    got_any = False
+    dad honestly the card is busy rather than faking an answer.
+
+    The local attempt keeps its own first-token budget (_STREAM_FIRST_TOKEN_S);
+    the paid failover phase that follows is bounded overall by
+    _STREAM_PAID_BUDGET_S so a slow third host can't stack multiple
+    per-provider timeouts into a multi-minute wait.
+    """
     local, _label = _get_local_oracle()
+    paid_candidates = _paid_clients()
+
+    if local is None and not paid_candidates:
+        log.warning("Ask/stream: no LLM endpoint available (all disabled) — returning busy fallback")
+        yield _sse({"delta": CARD_BUSY_MESSAGE})
+        yield _sse({"done": True})
+        return
+
+    got_any = False
     if local is not None:
         try:
             for kind, val in _stream_local_tokens(messages, local):
@@ -2534,12 +2709,18 @@ def _stream_verdict(messages):
         yield _sse({"done": True})
         return
 
-    # Local produced nothing (busy/down) — paid models keep the answer smart.
-    for paid, plabel in _paid_clients():
+    # Local produced nothing (busy/down) — paid models keep the answer smart,
+    # bounded overall so this phase can't run past _STREAM_PAID_BUDGET_S.
+    deadline = time.monotonic() + _STREAM_PAID_BUDGET_S
+    for paid, plabel in paid_candidates:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            log.warning("Ask/stream paid budget ({b}s) exhausted before {l} could run", b=_STREAM_PAID_BUDGET_S, l=plabel)
+            break
         try:
             txt = _call_with_timeout(
                 lambda p=paid: p.chat(messages, temperature=0.3, num_predict=2000),
-                _PAID_CHAT_TIMEOUT_S,
+                min(remaining, _PAID_CHAT_TIMEOUT_S),
             )
             if txt and txt.strip():
                 log.info("Verdict via paid model {l} (local card busy)", l=plabel)

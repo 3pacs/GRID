@@ -1,7 +1,10 @@
 """Regression tests for contracts.handlers.trust."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import json
+from datetime import date, datetime, timezone
+from typing import Any
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
@@ -137,7 +140,10 @@ def test_on_signal_fired_maps_known_signal_type_to_direction(
     assert call["source_type"] == "congressional"
     assert call["source_id"] == signal_type
     assert call["ticker"] == "XOM"
-    assert call["signal_value"] == pytest.approx(0.5)
+    # signal_value is the price at signal time, fetched by register_signal;
+    # the strength only ever travels in metadata.
+    assert call["signal_value"] is None
+    assert call["metadata"]["strength"] == pytest.approx(0.5)
 
 
 def test_on_signal_fired_falls_back_to_positive_strength_for_unknown_type(
@@ -149,7 +155,8 @@ def test_on_signal_fired_falls_back_to_positive_strength_for_unknown_type(
 
     assert len(register_signal_spy.calls) == 1
     assert register_signal_spy.calls[0]["signal_type"] == "BUY"
-    assert register_signal_spy.calls[0]["signal_value"] == pytest.approx(0.30)
+    assert register_signal_spy.calls[0]["signal_value"] is None
+    assert register_signal_spy.calls[0]["metadata"]["strength"] == pytest.approx(0.30)
 
 
 def test_on_signal_fired_falls_back_to_negative_strength_for_unknown_type(
@@ -161,8 +168,94 @@ def test_on_signal_fired_falls_back_to_negative_strength_for_unknown_type(
 
     assert len(register_signal_spy.calls) == 1
     assert register_signal_spy.calls[0]["signal_type"] == "SELL"
-    # signal_value is |strength| so the magnitude is preserved.
-    assert register_signal_spy.calls[0]["signal_value"] == pytest.approx(0.30)
+    assert register_signal_spy.calls[0]["signal_value"] is None
+    # metadata carries the raw signed strength, not |strength|.
+    assert register_signal_spy.calls[0]["metadata"]["strength"] == pytest.approx(-0.30)
+
+
+def test_on_signal_fired_never_stores_strength_as_signal_value(
+    register_signal_spy,
+):
+    """Regression: ``register_signal(signal_value=...)`` is the price at
+    signal time and ``score_pending_signals`` reads it back as the entry
+    price of the outcome return. The handler used to pass ``abs(strength)``
+    there, so every BUY row it registered scored CORRECT (and every SELL row
+    WRONG) against a 0-1 "close" whatever the market did. The stored
+    signal_value must never be the strength: leave it ``None`` so the PIT
+    close is auto-fetched, and carry the strength in metadata only."""
+    evt = _signal_fired(signal_type="BUY", strength=0.42)
+
+    trust.on_signal_fired(evt, engine=object())
+
+    (call,) = register_signal_spy.calls
+    assert call["signal_value"] is None
+    assert call["metadata"]["strength"] == pytest.approx(0.42)
+
+
+class _CaptureConn:
+    """Capture-only DB connection for the real ``register_signal``.
+
+    Records every ``execute(stmt, params)`` as ``(sql_text, params_dict)``
+    and serves a row id for the ``INSERT ... RETURNING id``; the table
+    setup statements are no-ops.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def execute(self, stmt: Any, params: dict[str, Any] | None = None):
+        sql = getattr(stmt, "text", None) or str(stmt)
+        self.calls.append((sql, dict(params or {})))
+        result = MagicMock()
+        result.fetchone.return_value = (
+            (7,) if "INSERT INTO signal_sources" in sql else None
+        )
+        result.fetchall.return_value = []
+        return result
+
+
+def _capture_engine(conn: _CaptureConn) -> MagicMock:
+    engine = MagicMock()
+    cm = MagicMock()
+    cm.__enter__.return_value = conn
+    cm.__exit__.return_value = False
+    engine.begin.return_value = cm
+    engine.connect.return_value = cm
+    return engine
+
+
+def test_registered_row_binds_pit_close_not_strength_as_signal_value(
+    monkeypatch,
+):
+    """End to end through the real ``register_signal``: the INSERT binds the
+    point-in-time close as ``signal_value`` and the strength only inside the
+    metadata JSON, so the scorer's entry price is a real close."""
+    from intelligence import trust_scorer
+
+    lookups: list[tuple[str, date]] = []
+
+    def fake_close(_engine, ticker, target_date, *_args, **_kwargs):
+        lookups.append((ticker, target_date))
+        return 105.25
+
+    monkeypatch.setattr(trust_scorer, "_get_price_near_date", fake_close)
+    conn = _CaptureConn()
+    evt = _signal_fired(source="holder_overlap", signal_type="BUY", strength=0.42)
+
+    trust.on_signal_fired(evt, engine=_capture_engine(conn))
+
+    inserts = [
+        (sql, p) for sql, p in conn.calls if "INSERT INTO signal_sources" in sql
+    ]
+    assert len(inserts) == 1
+    _sql, params = inserts[0]
+    assert lookups and lookups[0][0] == "XOM"
+    assert isinstance(lookups[0][1], date)
+    assert params["p"] == pytest.approx(105.25)
+    assert params["st"] == "holder_overlap"
+    assert params["t"] == "XOM"
+    assert params["d"] == "BUY"
+    assert json.loads(params["m"])["strength"] == pytest.approx(0.42)
 
 
 def test_on_signal_fired_skips_when_strength_is_zero_and_type_unknown(

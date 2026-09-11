@@ -33,7 +33,9 @@ DB_CONFIG = {
     "password": "grid2026",
 }
 
-ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY", "SPT9IOAEYVUT7X6J")
+# Injected at runtime — ALPHAVANTAGE_API_KEY is the GRID-wide name, ALPHA_VANTAGE_KEY
+# the harness's legacy name. Never hardcode a key here; empty disables the fallback.
+ALPHA_VANTAGE_KEY = os.getenv("ALPHAVANTAGE_API_KEY") or os.getenv("ALPHA_VANTAGE_KEY", "")
 LOGS_DIR = "/logs"
 REWARD_FILE = f"{LOGS_DIR}/reward.txt"
 RESULTS_FILE = f"{LOGS_DIR}/results.json"
@@ -112,16 +114,20 @@ def fetch_historical_return(conn, ticker, from_date, days=30):
 
 
 def _av_forward_return(ticker, from_date, days=30):
-    """Alpha Vantage fallback for price data."""
+    """Alpha Vantage fallback for price data. Disabled when no key is configured."""
+    if not ALPHA_VANTAGE_KEY:
+        return None
     try:
-        url = (
-            f"https://www.alphavantage.co/query"
-            f"?function=TIME_SERIES_DAILY_ADJUSTED"
-            f"&symbol={ticker}"
-            f"&outputsize=full"
-            f"&apikey={ALPHA_VANTAGE_KEY}"
+        r = requests.get(
+            "https://www.alphavantage.co/query",
+            params={
+                "function": "TIME_SERIES_DAILY_ADJUSTED",
+                "symbol": ticker,
+                "outputsize": "full",
+                "apikey": ALPHA_VANTAGE_KEY,
+            },
+            timeout=15,
         )
-        r = requests.get(url, timeout=15)
         data = r.json().get("Time Series (Daily)", {})
         if not data:
             return None

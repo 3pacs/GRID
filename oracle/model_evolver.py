@@ -124,6 +124,7 @@ class ModelEvolver:
                     FROM oracle_predictions
                     WHERE verdict IN ('hit','miss','partial')
                       AND dedup_keep = TRUE
+                      AND id NOT LIKE 'astrogrid:%'
                     GROUP BY model_name
                 ) p ON p.model_name=m.name WHERE m.active=TRUE
             """)).fetchall()

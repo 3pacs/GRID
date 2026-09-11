@@ -8,9 +8,12 @@
  * buttons. After an action, the row is removed from the queue and the
  * next pending item shows up automatically.
  */
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useState } from 'react';
 import { api } from '../api.js';
 import useStore from '../store.js';
+import { useAsyncData } from '../hooks/useAsyncData.js';
+import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
+import ErrorState from '../components/ErrorState.jsx';
 
 const mono = "'JetBrains Mono', 'IBM Plex Mono', monospace";
 
@@ -76,33 +79,23 @@ const INTEL_COLOR = {
 
 export default function IntelModeration() {
     const userRole = useStore(s => s.userRole);
-    const [items, setItems] = useState(null);
-    const [loading, setLoading] = useState(false);
     const [busyId, setBusyId] = useState(null);
     const [msg, setMsg] = useState(null);
 
-    const load = useCallback(async () => {
-        setLoading(true);
+    const { data: items, loading, error, refetch: load } = useAsyncData(async () => {
         const res = await api.listPendingIntel(200);
-        setLoading(false);
         if (!res || res.error) {
-            setItems([]);
-            if (res?.status === 403) {
-                setMsg({ type: 'error', text: 'Admin role required.' });
-            }
-            return;
+            throw new Error(res?.status === 403 ? 'Admin role required.' : (res?.message || 'Failed to load pending intel'));
         }
-        setItems(Array.isArray(res) ? res : (res.data || []));
-    }, []);
-
-    useEffect(() => { load(); }, [load]);
+        return Array.isArray(res) ? res : (res.data || []);
+    }, { fallback: null });
 
     const act = async (id, action) => {
         setBusyId(id);
         const res = await api.verifyIntel(id, action);
         setBusyId(null);
         if (res && !res.error) {
-            setItems(prev => (prev || []).filter(it => it.id !== id));
+            load();
             setMsg({ type: 'success', text: `Intel #${id} ${action}.` });
             setTimeout(() => setMsg(null), 2500);
         } else {
@@ -139,11 +132,13 @@ export default function IntelModeration() {
                 }}>{msg.text}</div>
             )}
 
-            {loading && !items && (
-                <div style={styles.empty}>Loading pending queue…</div>
-            )}
-
-            {items && items.length === 0 && !loading && (
+            {loading && !items?.length ? (
+                <LoadingSkeleton variant="card" count={3} />
+            ) : error ? (
+                <ErrorState error={error} onRetry={load} title="Moderation queue unavailable" />
+            ) : (
+            <>
+            {items && items.length === 0 && (
                 <div style={styles.empty}>
                     No pending intel. The tentacles are quiet.
                 </div>
@@ -191,6 +186,8 @@ export default function IntelModeration() {
                     </div>
                 </div>
             ))}
+            </>
+            )}
         </div>
     );
 }

@@ -8,8 +8,10 @@
  * intel type, write a note, add a source URL, and submit. Acts as the
  * cooperative tentacle entry point outside the actor drawer flow.
  */
-import React, { useEffect, useState, useMemo } from 'react';
+import React, { useState, useMemo } from 'react';
 import { api } from '../api.js';
+import { useAsyncData } from '../hooks/useAsyncData.js';
+import ErrorState from '../components/ErrorState.jsx';
 
 const mono = "'JetBrains Mono', 'IBM Plex Mono', monospace";
 
@@ -95,7 +97,6 @@ const styles = {
 };
 
 export default function IntelSubmit() {
-    const [actorList, setActorList] = useState([]);
     const [actorInput, setActorInput] = useState('');
     const [selectedActor, setSelectedActor] = useState(null);
     const [showSug, setShowSug] = useState(false);
@@ -109,35 +110,32 @@ export default function IntelSubmit() {
     const [status, setStatus] = useState(null);
     const [submitting, setSubmitting] = useState(false);
 
-    // Load actor list from sector_map once on mount.
-    useEffect(() => {
-        (async () => {
-            const res = await api.getActorNetwork();
-            if (!res || res.error) {
-                setStatus({ type: 'error', text: res?.message || 'Unable to load tracked actors.' });
-                return;
-            }
-            const actors = [];
-            const seen = new Set();
-            const walk = (node) => {
-                if (!node) return;
-                if (Array.isArray(node)) { node.forEach(walk); return; }
-                if (typeof node === 'object') {
-                    if (node.id && !seen.has(node.id)) {
-                        seen.add(node.id);
-                        actors.push({
-                            id: node.id,
-                            label: node.label || node.name || node.id,
-                            type: node.type || '',
-                        });
-                    }
-                    Object.values(node).forEach(walk);
+    // Load actor list from sector_map once on mount. Non-blocking: the form
+    // itself is usable before this resolves, so no LoadingSkeleton gates it —
+    // only a failure surfaces, via ErrorState next to the actor field.
+    const { data: actorList, error: actorError, refetch: loadActors } = useAsyncData(async () => {
+        const res = await api.getActorNetwork();
+        if (!res || res.error) throw new Error(res?.message || 'Unable to load tracked actors.');
+        const actors = [];
+        const seen = new Set();
+        const walk = (node) => {
+            if (!node) return;
+            if (Array.isArray(node)) { node.forEach(walk); return; }
+            if (typeof node === 'object') {
+                if (node.id && !seen.has(node.id)) {
+                    seen.add(node.id);
+                    actors.push({
+                        id: node.id,
+                        label: node.label || node.name || node.id,
+                        type: node.type || '',
+                    });
                 }
-            };
-            walk(res.nodes || res.data || res);
-            setActorList(actors);
-        })();
-    }, []);
+                Object.values(node).forEach(walk);
+            }
+        };
+        walk(res.nodes || res.data || res);
+        return actors;
+    }, { fallback: [] });
 
     const suggestions = useMemo(() => {
         const q = actorInput.trim().toLowerCase();
@@ -187,6 +185,9 @@ export default function IntelSubmit() {
 
             <div style={styles.card}>
                 {status && <div style={styles.status(status.type)}>{status.text}</div>}
+                {actorError && (
+                    <ErrorState error={actorError} onRetry={loadActors} title="Actor list unavailable" />
+                )}
 
                 <label style={styles.label}>Actor *</label>
                 <input

@@ -1,0 +1,196 @@
+name: Ops — Gemini task on grid-svr
+
+# Dispatch a prompt to Gemini CLI running ON the server (self-hosted runner),
+# so an orchestrating session can hand Flash-class agents server-side work and
+# read their output as job logs / summary. Requires the "lanes" from
+# docs/planning/BRING-UP-RUNBOOK-2026-09-10.md Phase 9:
+#   - gemini CLI installed for the runner user (npm i -g @google/gemini-cli)
+#   - /etc/grid/gemini.env (0600, runner user) containing GEMINI_API_KEY=...
+# The prompt is passed through an environment variable, never interpolated into
+# the script, so it cannot inject shell.
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Task for the agent (it runs with cwd = workdir on grid-svr)"
+        type: string
+        required: true
+      model:
+        description: >-
+          Model name exactly as `agy` lists it. Verified on grid-svr 2026-09-10:
+          Gemini 3.8/3.7/3.6 Flash (High|Medium|Low), Gemini 3.1 Pro (High|Low),
+          Claude Sonnet 4.6 (Thinking), Claude Opus 4.6 (Thinking),
+          GPT-OSS 120B (Medium). API-style ids such as "gemini-flash-latest" are
+          rejected: `agy` matches on the display name, not the API id.
+        type: string
+        default: "Gemini 3.8 Flash (High)"
+      workdir:
+        description: "Working directory on the server"
+        type: string
+        default: "/data/grid_v4/grid_release"
+      yolo:
+        description: "Let the agent run tools without confirmation (non-interactive runs need this for any action)"
+        type: boolean
+        default: true
+      cli:
+        description: "CLI command on the server (agy = the installed Gemini/Antigravity CLI; or gemini). An absolute path is used as-is."
+        type: string
+        default: "agy"
+      mode:
+        description: "run = execute the prompt; help = only print the CLI's version and --help; diag = print PATH/CLI discovery info without needing the CLI"
+        type: choice
+        options: [run, help, diag]
+        default: "run"
+      print_timeout:
+        description: >-
+          agy print-mode wait timeout, passed as --print-timeout (Go duration
+          syntax, e.g. "75m"). Only applies when the resolved CLI is
+          agy/agy.real (ignored for gemini-cli). Must stay below the step's
+          outer `timeout 80m` wrapper.
+        type: string
+        default: "75m"
+
+jobs:
+  gemini:
+    name: Gemini on grid-svr
+    runs-on: [self-hosted, grid-svr]
+    timeout-minutes: 90
+    env:
+      PROMPT: ${{ inputs.prompt }}
+      MODEL: ${{ inputs.model }}
+      WORKDIR: ${{ inputs.workdir }}
+      YOLO: ${{ inputs.yolo }}
+      CLI: ${{ inputs.cli }}
+      MODE: ${{ inputs.mode }}
+      PRINT_TIMEOUT: ${{ inputs.print_timeout }}
+    steps:
+      - name: Diag
+        if: ${{ inputs.mode == 'diag' }}
+        shell: bash
+        run: |
+          set +e
+          {
+            echo "## Gemini runner diag"
+            echo '```'
+            echo "id -un: $(id -un)"
+            echo "HOME: $HOME"
+            echo "PATH: $PATH"
+            echo "--- nvm node bin dirs ---"
+            ls -d "$HOME"/.nvm/versions/node/*/bin 2>/dev/null
+            echo "--- candidate bins (npm-global, .local, /usr/local/bin) ---"
+            ls "$HOME"/.npm-global/bin "$HOME"/.local/bin /usr/local/bin 2>/dev/null | grep -iE 'agy|gemini|antigravity|node|npm'
+            echo "--- command -v -a ---"
+            command -v -a agy gemini node npm 2>/dev/null
+            echo "--- gemini.env ---"
+            test -r /etc/grid/gemini.env && echo "gemini.env: present" || echo "gemini.env: missing"
+            echo "--- /etc/grid listing ---"
+            ls -la /etc/grid 2>/dev/null
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Lanes check
+        if: ${{ inputs.mode != 'diag' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f /etc/grid/gemini.env ]; then set -a; . /etc/grid/gemini.env; set +a; fi
+          [ -n "${GEMINI_API_KEY:-}" ] && echo "GEMINI_API_KEY: set via /etc/grid/gemini.env" || echo "GEMINI_API_KEY: not in /etc/grid/gemini.env (fine if $CLI is logged in with the runner user's own credentials)"
+
+          # Resolve the CLI: accept an absolute path as-is, otherwise widen PATH
+          # to cover the places an interactively-installed CLI is likely to live
+          # (nvm, npm-global, ~/.local/bin) before giving up.
+          RESOLVED_CLI=""
+          case "$CLI" in
+            /*)
+              if [ -x "$CLI" ]; then RESOLVED_CLI="$CLI"; fi
+              ;;
+          esac
+          if [ -z "$RESOLVED_CLI" ]; then
+            if [ -f "$HOME/.nvm/nvm.sh" ]; then
+              # shellcheck disable=SC1091
+              . "$HOME/.nvm/nvm.sh"
+              nvm use default >/dev/null 2>&1 || true
+            fi
+            for d in "$HOME/.npm-global/bin" "$HOME/.local/bin" "$HOME"/.nvm/versions/node/*/bin; do
+              if [ -d "$d" ]; then PATH="$d:$PATH"; fi
+            done
+            export PATH
+            if command -v "$CLI" >/dev/null 2>&1; then
+              RESOLVED_CLI="$(command -v "$CLI")"
+            fi
+          fi
+
+          if [ -z "$RESOLVED_CLI" ]; then
+            echo "$CLI not on PATH for the runner user ($(id -un)) even after checking nvm/.npm-global/.local/bin; PATH=$PATH"
+            {
+              echo "## Gemini runner diag (CLI not found)"
+              echo '```'
+              echo "id -un: $(id -un)"
+              echo "HOME: $HOME"
+              echo "PATH: $PATH"
+              echo "--- nvm node bin dirs ---"
+              ls -d "$HOME"/.nvm/versions/node/*/bin 2>/dev/null
+              echo "--- candidate bins (npm-global, .local, /usr/local/bin) ---"
+              ls "$HOME"/.npm-global/bin "$HOME"/.local/bin /usr/local/bin 2>/dev/null | grep -iE 'agy|gemini|antigravity|node|npm'
+              echo "--- command -v -a ---"
+              command -v -a agy gemini node npm 2>/dev/null
+              echo "--- gemini.env ---"
+              test -r /etc/grid/gemini.env && echo "gemini.env: present" || echo "gemini.env: missing"
+              echo "--- /etc/grid listing ---"
+              ls -la /etc/grid 2>/dev/null
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 2
+          fi
+
+          echo "RESOLVED_CLI=$RESOLVED_CLI" >> "$GITHUB_ENV"
+          echo "PATH=$PATH" >> "$GITHUB_ENV"
+          echo "cli=$RESOLVED_CLI version=$("$RESOLVED_CLI" --version 2>&1 | head -1) | model=$MODEL | workdir=$WORKDIR | yolo=$YOLO | mode=$MODE"
+          test -d "$WORKDIR"
+          if [ "$MODE" = "help" ]; then
+            echo "----- $RESOLVED_CLI --help -----"; "$RESOLVED_CLI" --help 2>&1 | head -120
+            { echo "## $RESOLVED_CLI --help"; echo '```'; "$RESOLVED_CLI" --help 2>&1 | head -120; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Run task
+        if: ${{ inputs.mode == 'run' }}
+        shell: bash
+        run: |
+          set +e
+          if [ -f /etc/grid/gemini.env ]; then set -a; . /etc/grid/gemini.env; set +a; fi
+          cd "$WORKDIR"
+          # Flag set differs by CLI: agy (Antigravity CLI) takes --model/-p/--output-format
+          # and --dangerously-skip-permissions instead of gemini-cli's -m/--yolo.
+          cli_name="$(basename "$RESOLVED_CLI")"
+          if [ "$cli_name" = "agy" ] || [ "$cli_name" = "agy.real" ]; then
+            # agy's print-mode wait defaults to --print-timeout 5m0s, which silently
+            # truncates any task longer than 5 minutes (exit 0, partial output) well
+            # before the outer `timeout 80m` below ever kicks in.
+            args=(--model "$MODEL" -p "$PROMPT" --output-format text --print-timeout "$PRINT_TIMEOUT")
+            [ "$YOLO" = "true" ] && args+=(--dangerously-skip-permissions)
+          else
+            args=(-m "$MODEL")
+            [ "$YOLO" = "true" ] && args+=(--yolo)
+            args+=(-p "$PROMPT")
+          fi
+          echo "----- prompt (first 40 lines) -----"; printf '%s\n' "$PROMPT" | head -40; echo "-----"
+          timeout 80m "$RESOLVED_CLI" "${args[@]}" > /tmp/gemini_task.log 2>&1
+          rc=$?
+          echo "exit=$rc"
+          tail -c 60000 /tmp/gemini_task.log
+          {
+            echo "## Gemini task — model $MODEL — exit $rc"
+            echo '```'
+            tail -c 40000 /tmp/gemini_task.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+
+      - name: Upload transcript
+        if: ${{ always() && inputs.mode == 'run' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gemini-task-${{ github.run_id }}
+          path: /tmp/gemini_task.log
+          retention-days: 14

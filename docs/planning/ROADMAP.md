@@ -2,6 +2,12 @@
 
 > **Single source of truth.** Every session starts here. Updated 2026-03-31 (post-audit).
 >
+> **2026-09-09 addendum:** the v5 "financial Palantir" transformation (investigation canvas,
+> event backbone, graph layer, FTS, frontend modernization) has its own verified status
+> document — see [V5 Transformation](#v5-transformation--verified-status-2026-09-09) below and
+> [`V5-TRANSFORMATION.md`](V5-TRANSFORMATION.md). The System Snapshot and 4-week plan that
+> follow are historical (March 2026) and have not been refreshed.
+>
 > GRID exists to give a solo operator the same decision-quality as a team of analysts,
 > quants, and OSINT specialists. Intelligence amplifier, not a trading bot.
 
@@ -130,6 +136,29 @@ All [[MASTER-PLAN]] items are built:
 - SQL guard hook
 - Project-level Claude Code config (14 agents, 8 commands, 15 rules, 8 skills)
 </details>
+
+---
+
+## V5 Transformation — verified status (2026-09-09)
+
+Full detail, evidence, decisions, and remaining phases: [`V5-TRANSFORMATION.md`](V5-TRANSFORMATION.md).
+The April draft is archived at [`archive/V5-TRANSFORMATION-2026-04-08.md`](archive/V5-TRANSFORMATION-2026-04-08.md).
+
+| Vector | Verdict | One line |
+|---|---|---|
+| 1 Investigation Canvas | **Done, different stack** | Sigma.js `GothamCanvas` + 5,815-LOC backend; 1,902 LOC of dead React Flow beside it |
+| 2 Event backbone | **Fragmented** | `contracts/` is the real bus (15 typed events, 9 producers); plan's bus never started; SSE streams only keepalives |
+| 3 Graph layer (AGE) | **Ghost** | Cypher wrapper has zero callers, no migration; canvas uses SQL BFS |
+| 4 Full-text search | **Done+** | 5-branch materialized view, triggers, `ts_headline`, tests; refresh is manual only |
+| 5 Frontend modernization | **Built, not adopted** | `useAsyncData` 0 importers; skeletons 0 (regressed); 0 `.tsx`; 2,125 LOC dead `.ts`; god components grew |
+| 6 CI/CD | **Done+** | 3-job test workflow + verified self-hosted deploy; vitest not run; no asyncpg |
+
+**Remaining work is consolidation and adoption, not construction** — phases R0–R5 in
+`V5-TRANSFORMATION.md` §6 (~2–3 weeks). R0 (dead-code removal, honest APIs, CI ratchets)
+unblocks the rest. Nine explicit decisions in §5, including: `contracts/` is the backbone
+(D1), Redpanda is removed (D2), React Flow is deleted (D3), AGE is dormant with revival
+triggers (D4), persona surfaces (`Home`, `TenYearPortfolio`, `DadNav`) are frozen without
+operator sign-off (D8).
 
 ---
 
