@@ -106,6 +106,43 @@ describe('MoneyFlowCard', () => {
         });
     });
 
+    it('shows the data age when the payload was seeded from an aged persisted snapshot', async () => {
+        // snapshot_age_s only appears when api/routers/flows.py seeds the
+        // stale tier from a persisted snapshot on cold start — it's the
+        // signal that this data may not be fresh.
+        const computedAt = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(); // 3h ago
+        api.getSectorFlows.mockResolvedValue({
+            sectors: {
+                Energy: { etf: 'XLE', actors: [], sector_stress: -1.8, subsectors: [] },
+            },
+            computed_at: computedAt,
+            snapshot_age_s: 3 * 60 * 60,
+        });
+
+        render(<WidgetGrid widgets={MONEY_FLOW_WIDGETS} />);
+
+        await waitFor(() => {
+            expect(screen.getByText('Energy')).toBeInTheDocument();
+        });
+        expect(screen.getByText(/Data as of 3 hours ago/i)).toBeInTheDocument();
+    });
+
+    it('does not show a data-age line for a normal fresh payload', async () => {
+        api.getSectorFlows.mockResolvedValue({
+            sectors: {
+                Energy: { etf: 'XLE', actors: [], sector_stress: -1.8, subsectors: [] },
+            },
+            computed_at: new Date().toISOString(),
+        });
+
+        render(<WidgetGrid widgets={MONEY_FLOW_WIDGETS} />);
+
+        await waitFor(() => {
+            expect(screen.getByText('Energy')).toBeInTheDocument();
+        });
+        expect(screen.queryByText(/Data as of/i)).not.toBeInTheDocument();
+    });
+
     it('renders the error state on a rejected fetch and retries on click', async () => {
         api.getSectorFlows.mockRejectedValueOnce(new Error('network down'));
 
