@@ -35,14 +35,14 @@ public ICE BofA OAS / yield series that FRED publishes daily (free, no
 licence restriction):
 
     cat_7_china_hy:
-        em_hy_oas    BAMLEMHYCRPIOAS    EM Corporate HY OAS — broadest proxy
-        em_hy_yield  BAMLEMIBHYCRPIEY   EM Corporate HY yield level
+        em_hy_oas    BAMLEMHBHYCRPIOAS  EM HY Corporate Plus OAS — broadest proxy
+        em_hy_yield  BAMLEMHBHYCRPIEY   EM HY Corporate Plus effective yield
         em_ig_oas    BAMLEMCBPIOAS      EM IG (for IG-HY basis calc)
 
     cat_13_euro_at1:
         euro_hy_oas    BAMLHE00EHYIOAS         Euro HY OAS — proxy for AT1
         euro_hy_yield  BAMLHE00EHYIEY          Euro HY yield level
-        euro_ig_oas    BAMLEMRACRPIEMEAOAS     EMEA IG (for basis calc)
+        euro_ig_oas    BAMLEMRECRPIEMEAOAS     EMEA EM Corporate Plus (basis leg)
 
     cat_42_cdx_itraxx:
         us_bbb_oas      BAMLC0A4CBBB    US BBB — CDX IG proxy
@@ -69,7 +69,11 @@ import requests
 from loguru import logger as log
 from sqlalchemy.engine import Engine
 
-from ingestion.base import BasePuller, retry_on_failure
+from ingestion.base import (
+    BasePuller,
+    log_fred_series_failure,
+    retry_on_failure,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -83,15 +87,15 @@ _REQUEST_TIMEOUT: int = 30
 PROXY_SERIES: dict[str, dict[str, str]] = {
     "cat_7_china_hy": {
         # Best public proxy for iBoxx USD Asia High Yield
-        "em_hy_oas": "BAMLEMHYCRPIOAS",
-        "em_hy_yield": "BAMLEMIBHYCRPIEY",
+        "em_hy_oas": "BAMLEMHBHYCRPIOAS",
+        "em_hy_yield": "BAMLEMHBHYCRPIEY",
         "em_ig_oas": "BAMLEMCBPIOAS",
     },
     "cat_13_euro_at1": {
         # Best public proxy for iBoxx EUR CoCo / European bank AT1
         "euro_hy_oas": "BAMLHE00EHYIOAS",
         "euro_hy_yield": "BAMLHE00EHYIEY",
-        "euro_ig_oas": "BAMLEMRACRPIEMEAOAS",
+        "euro_ig_oas": "BAMLEMRECRPIEMEAOAS",
     },
     "cat_42_cdx_itraxx": {
         # Best public proxies for CDX NA IG / CDX NA HY / iTraxx Main / Xover
@@ -105,7 +109,7 @@ PROXY_SERIES: dict[str, dict[str, str]] = {
 
 PROXY_CORRELATION_NOTES: dict[str, str] = {
     "cat_7_china_hy": (
-        "BAMLEMHYCRPIOAS correlates ~0.87 with iBoxx USD Asia HY OAS on "
+        "BAMLEMHBHYCRPIOAS correlates ~0.87 with iBoxx USD Asia HY OAS on "
         "weekly moves (ICE methodology paper Q4 2023). EM IG / HY basis "
         "(HY-IG) tracks the corresponding CDX EM basis with ρ ~0.82."
     ),
@@ -324,12 +328,9 @@ class CreditIndexProxiesPuller(BasePuller):
             try:
                 observations = self._fetch_fred_series(fred_id, start_date)
             except Exception as exc:  # noqa: BLE001 — partial-failure contract
-                log.error(
-                    "credit_index_proxies: {g}/{lbl} ({fid}) fetch failed: {e}",
-                    g=group,
-                    lbl=label,
-                    fid=fred_id,
-                    e=str(exc),
+                # A 400 means FRED retired the id — configuration, not a bug.
+                log_fred_series_failure(
+                    self.SOURCE_NAME, f"{group}/{label}", fred_id, exc
                 )
                 continue
 

@@ -91,10 +91,19 @@ jobs:
 
     steps:
       - name: Build release tree
+        env:
+          SRC_URL: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git
         run: |
           set -euo pipefail
           cd "$DEPLOY_PATH"
-          git fetch origin && git reset --hard origin/main
+          echo "before: $(git log --oneline -1)"
+          # Fetch from GitHub itself with the job token, not from whatever `origin`
+          # points at: the clone's origin went stale in 2026 and every deploy after
+          # #364 reset to the same old commit while reporting success.
+          git fetch "$SRC_URL" main
+          git reset --hard FETCH_HEAD
+          echo "after:  $(git log --oneline -1)"
+          test "$(git rev-parse HEAD)" = "${{ github.sha }}" || { echo "::error::release tree is not at the pushed commit ${{ github.sha }}"; exit 1; }
           pip install -r requirements.txt
           cd pwa && npm ci && npm run build && cd ..
           python3 -m alembic upgrade head || echo "no migrations"
@@ -111,11 +120,14 @@ jobs:
       - name: Verify running API (health + OpenAPI)
         run: |
           set -euo pipefail
-          for attempt in {1..45}; do
+          # grid-api imports the whole intelligence tree at startup; on
+          # 2026-09-10 it took 96 s to start listening and the 90 s window
+          # failed a deploy that had actually landed. Allow four minutes.
+          for attempt in {1..120}; do
             if curl -fsS http://localhost:8000/api/v1/system/health; then
               break
             fi
-            if [ "$attempt" -eq 45 ]; then
+            if [ "$attempt" -eq 120 ]; then
               echo "grid-api did not pass health check after restart"
               sudo systemctl status grid-api --no-pager -l || true
               journalctl -u grid-api -n 120 --no-pager || true
@@ -123,16 +135,30 @@ jobs:
             fi
             sleep 2
           done
+          echo
+          fail() { echo "::error::verify failed: $*"; exit 1; }
           api_pid="$(systemctl show -p MainPID --value grid-api)"
-          test "$(readlink "/proc/${api_pid}/cwd")" = "$DEPLOY_PATH"
-          curl -fsS http://localhost:8000/ > /tmp/grid-index.html
-          index_js="$(grep -o '/assets/index-[^"]*\.js' /tmp/grid-index.html | head -1)"
-          test -n "$index_js"
-          curl -fsS "http://localhost:8000${index_js}" > /tmp/grid-index.js
-          grep -F '/gold/stream' /tmp/grid-index.js
-          curl -fsS http://localhost:8000/openapi.json > /tmp/grid-openapi.json
-          grep -F '"/api/v1/intelligence/actor-network"' /tmp/grid-openapi.json
-          grep -F '"/api/v1/dad/ticker/{ticker}/gold/stream"' /tmp/grid-openapi.json
+          cwd="$(sudo -n readlink "/proc/${api_pid}/cwd" 2>/dev/null || readlink "/proc/${api_pid}/cwd" 2>/dev/null || true)"
+          echo "grid-api pid=$api_pid cwd=$cwd"
+          [ "$cwd" = "$DEPLOY_PATH" ] || fail "grid-api cwd '$cwd' != $DEPLOY_PATH"
+          curl -fsS http://localhost:8000/ > /tmp/grid-index.html || fail "GET / failed"
+          index_js="$(grep -o '/assets/index-[^"]*\.js' /tmp/grid-index.html | head -1 || true)"
+          echo "index asset: ${index_js:-<none>}"
+          [ -n "$index_js" ] || fail "no /assets/index-*.js in index.html (PWA build missing?)"
+          curl -fsS "http://localhost:8000${index_js}" > /tmp/grid-index.js || fail "GET $index_js failed"
+          # The gold stream client may live in a lazily loaded chunk after code-splitting; check all served chunks.
+          if ! grep -qF '/gold/stream' /tmp/grid-index.js; then
+            found=0
+            for chunk in $(grep -o '/assets/[^"]*\.js' /tmp/grid-index.html | sort -u); do
+              curl -fsS "http://localhost:8000${chunk}" 2>/dev/null | grep -qF '/gold/stream' && { found=1; echo "gold stream client found in $chunk"; break; }
+            done
+            [ "$found" = 1 ] || grep -rqF '/gold/stream' "$DEPLOY_PATH/pwa_dist/assets" || fail "'/gold/stream' not in any built PWA chunk"
+          fi
+          curl -fsS http://localhost:8000/openapi.json > /tmp/grid-openapi.json || fail "GET /openapi.json failed"
+          grep -qF '"/api/v1/intelligence/actor-network"' /tmp/grid-openapi.json || fail "actor-network route missing from OpenAPI"
+          grep -qF '"/api/v1/dad/ticker/{ticker}/gold/stream"' /tmp/grid-openapi.json || fail "gold/stream route missing from OpenAPI"
+          grep -qF '"/api/v1/conviction/sweeps/latest"' /tmp/grid-openapi.json || fail "sweeps/latest route missing from OpenAPI (Sprint 3 not live)"
+          echo "verify: all assertions passed"
 
       - name: Notify success
         if: success()

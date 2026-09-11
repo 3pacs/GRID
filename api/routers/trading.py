@@ -43,6 +43,20 @@ class HyperliquidCloseRequest(BaseModel):
     ticker: str
 
 
+# ---------------------------------------------------------------------------
+# Robinhood crypto request models (EXCH-04)
+# ---------------------------------------------------------------------------
+
+class RobinhoodTradeRequest(BaseModel):
+    ticker: str
+    direction: str = "LONG"  # LONG buys; SHORT sells held quantity (spot)
+    size_usd: float
+
+
+class RobinhoodCloseRequest(BaseModel):
+    ticker: str
+
+
 class TradeRequest(BaseModel):
     strategy_id: str
     ticker: str
@@ -242,10 +256,29 @@ async def promote_to_strategy(
 
 
 @router.post("/execute-signals")
-async def execute_signals_now(_token: str = Depends(require_auth)) -> dict:
-    """Manually trigger signal execution."""
-    from trading.signal_executor import execute_signals
-    return execute_signals(get_db_engine())
+async def execute_signals_now(
+    venue: str | None = Query(
+        None, description="Optional exchange venue to mirror BUY signals to (e.g. robinhood)"
+    ),
+    wallet_id: str | None = Query(
+        None, description="trading_wallets row that sizes and risk-gates the venue orders"
+    ),
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Manually trigger signal execution.
+
+    Paper-only by default. With *venue* set, LONG signals on tickers the venue
+    reports tradable are also sent to that connector — dry-run until the
+    venue's live-trading flag is on.
+    """
+    from trading.signal_executor import SUPPORTED_VENUES, execute_signals
+
+    if venue and venue.strip().lower() not in SUPPORTED_VENUES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported venue {venue!r}. Known venues: {', '.join(SUPPORTED_VENUES)}",
+        )
+    return execute_signals(get_db_engine(), venue=venue, venue_wallet_id=wallet_id)
 
 
 @router.post("/strategies/{strategy_id}/kill")
@@ -407,6 +440,88 @@ async def hyperliquid_close(
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
     return result
+
+
+# ------------------------------------------------------------------
+# Robinhood crypto endpoints (EXCH-04) — dry-run unless ROBINHOOD_LIVE_TRADING
+# ------------------------------------------------------------------
+
+def _get_robinhood():
+    from trading.robinhood import get_robinhood_trader
+    return get_robinhood_trader()
+
+
+@router.get("/robinhood/status")
+async def robinhood_status(
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Connector mode (UNCONFIGURED / DRY_RUN / LIVE), caps, and the account when keys are set."""
+    return _get_robinhood().status()
+
+
+@router.get("/robinhood/balance")
+async def robinhood_balance(
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Buying power, holdings value, equity and high-water mark."""
+    result = _get_robinhood().get_balance()
+    if "error" in result:
+        raise HTTPException(status_code=503, detail=result["error"])
+    return result
+
+
+@router.get("/robinhood/positions")
+async def robinhood_positions(
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Crypto holdings valued at the current mid."""
+    positions = _get_robinhood().get_positions()
+    return {"positions": positions, "count": len(positions)}
+
+
+@router.get("/robinhood/orders")
+async def robinhood_orders(
+    limit: int = Query(50, ge=1, le=200),
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Recent Robinhood crypto orders."""
+    orders = _get_robinhood().get_orders(limit=limit)
+    return {"orders": orders, "count": len(orders)}
+
+
+@router.post("/robinhood/trade")
+async def robinhood_trade(
+    req: RobinhoodTradeRequest,
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Market order sized in USD; returns status dry_run until live trading is enabled."""
+    result = _get_robinhood().open_position(
+        ticker=req.ticker, direction=req.direction, size_usd=req.size_usd,
+    )
+    if "error" in result and result.get("status") != "rejected":
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@router.post("/robinhood/close")
+async def robinhood_close(
+    req: RobinhoodCloseRequest,
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Sell the whole tradable holding of a ticker."""
+    result = _get_robinhood().close_position(ticker=req.ticker)
+    if "error" in result and result.get("status") != "rejected":
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@router.post("/robinhood/orders/{order_id}/cancel")
+async def robinhood_cancel(
+    order_id: str,
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Cancel an open Robinhood crypto order."""
+    return _get_robinhood().cancel_order(order_id)
 
 
 # ------------------------------------------------------------------

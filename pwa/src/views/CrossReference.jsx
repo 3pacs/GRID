@@ -6,7 +6,7 @@
  *
  * Architecture:
  *   1. Wires to /api/v1/intelligence/cross-reference (real checks[])
- *   2. Falls back to planned visualization data when API unavailable
+ *   2. A domain/region with no live check renders as an honest data gap, never a fabricated number
  *   3. Groups checks by category+region for matrix view
  *   4. Shows individual checks granularly in drill-down
  *   5. Surfaces data gaps — sources we ingest but don't cross-reference yet
@@ -17,6 +17,9 @@ import { api } from '../api.js';
 import { shared, colors, tokens } from '../styles/shared.js';
 import ChartControls from '../components/ChartControls.jsx';
 import useFullScreen from '../hooks/useFullScreen.js';
+import { useAsyncData } from '../hooks/useAsyncData.js';
+import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
+import ErrorState from '../components/ErrorState.jsx';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -217,98 +220,6 @@ const DATA_GAPS = [
 ];
 
 
-// ── Planned visualization data (preserved as fallback + spec) ───────────
-
-const PLANNED_SOURCES = {
-    official: {
-        GDP: { US: 'BEA', China: 'NBS', EU: 'Eurostat', Japan: 'Cabinet Office', EM: 'IMF' },
-        Trade: { US: 'Census Bureau', China: 'GACC', EU: 'Eurostat', Japan: 'MOF', EM: 'WTO' },
-        Inflation: { US: 'BLS CPI', China: 'NBS CPI', EU: 'ECB HICP', Japan: 'BOJ', EM: 'World Bank' },
-        'Central Bank': { US: 'Fed Funds', China: 'PBOC MLF', EU: 'ECB Refi', Japan: 'BOJ YCC', EM: 'Composite' },
-        Employment: { US: 'BLS NFP', China: 'NBS Survey', EU: 'Eurostat LFS', Japan: 'Statistics Bureau', EM: 'ILO' },
-        Liquidity: { US: 'Fed H.4.1', China: 'PBOC OMO', EU: 'ECB MRO', Japan: 'BOJ Current Account', EM: '--' },
-        Credit: { US: 'Fed H.8', China: 'PBOC TSF', EU: 'ECB BLS', Japan: 'BOJ Tankan', EM: 'BIS' },
-        Housing: { US: 'Census HOUST', China: 'NBS RE', EU: 'ECB RPPI', Japan: 'MLIT', EM: '--' },
-        Energy: { US: 'EIA', China: 'NBS Elec', EU: 'Eurostat Energy', Japan: 'METI', EM: 'IEA' },
-    },
-    physical: {
-        GDP: { US: 'Satellite/Night Lights', China: 'Night Lights + Rail Freight', EU: 'Electricity Consumption', Japan: 'Industrial Electricity', EM: 'Satellite Composite' },
-        Trade: { US: 'AIS Ship Tracking', China: 'AIS + Port TEU', EU: 'AIS Rotterdam/Hamburg', Japan: 'AIS + Port Data', EM: 'AIS Global' },
-        Inflation: { US: 'Billion Prices Project', China: 'Web Scraped Prices', EU: 'Billion Prices + Fuel', Japan: 'Scanner Data', EM: 'Web Scraped Basket' },
-        'Central Bank': { US: 'Repo Volumes', China: 'Shibor Spread', EU: 'ESTR Spread', Japan: 'JGB Curve Shape', EM: 'CDS Spreads' },
-        Employment: { US: 'Indeed Job Postings', China: 'Baidu Job Search Index', EU: 'Indeed EU + Mobility', Japan: 'Recruit Index', EM: 'Google Trends Jobs' },
-        Liquidity: { US: 'RRP + TGA + Reserves', China: 'Interbank Rate', EU: 'Target2 Balances', Japan: 'BOJ Reserves vs Ops', EM: 'FX Reserves Draw' },
-        Credit: { US: 'FINRA Dark Pool + HY OAS', China: 'Trust Defaults', EU: 'BTP-Bund Spread', Japan: 'JGB Demand Ratio', EM: 'CDS Sovereign' },
-        Housing: { US: 'Mortgage Apps + Permits', China: 'Satellite Cement Plants', EU: 'Google Mortgage Search', Japan: 'REIT NAV vs Price', EM: '--' },
-        Energy: { US: 'Grid Load Data', China: 'VIIRS Night Lights', EU: 'ENTSO-E Grid', Japan: 'TEPCO Load', EM: 'Satellite Flaring' },
-    },
-};
-
-const PLANNED_VALUES = {
-    official: {
-        GDP: { US: '+2.8% YoY', China: '+5.2% YoY', EU: '+0.6% YoY', Japan: '+1.1% YoY', EM: '+4.1% YoY' },
-        Trade: { US: '-$68.3B', China: '+$82.1B', EU: '+€28.4B', Japan: '-¥462B', EM: 'Mixed' },
-        Inflation: { US: '3.2% YoY', China: '0.2% YoY', EU: '2.6% YoY', Japan: '2.8% YoY', EM: '5.4% avg' },
-        'Central Bank': { US: '5.25-5.50%', China: '2.50% MLF', EU: '4.50%', Japan: '-0.10%', EM: '7.2% avg' },
-        Employment: { US: '+216K NFP', China: '5.1% UE', EU: '6.4% UE', Japan: '2.5% UE', EM: '5.8% avg' },
-    },
-    physical: {
-        GDP: { US: '+2.6% (lights)', China: '+2.1% (lights/freight)', EU: '+0.4% (elec)', Japan: '+0.9% (elec)', EM: '+3.8% (composite)' },
-        Trade: { US: '-$71.0B (AIS)', China: '+$64.2B (port TEU)', EU: '+€22.1B (AIS)', Japan: '-¥480B (AIS)', EM: 'Weaker than reported' },
-        Inflation: { US: '3.5% (BPP)', China: '-0.8% (scraped)', EU: '2.9% (BPP)', Japan: '3.1% (scanner)', EM: '6.1% (scraped)' },
-        'Central Bank': { US: 'Tighter (repo)', China: 'Much tighter (Shibor)', EU: 'Aligned', Japan: 'Losing control (JGB)', EM: 'Wider CDS' },
-        Employment: { US: '+142K (Indeed)', China: '-12% searches', EU: '-8% postings', Japan: 'Aligned', EM: 'Weaker searches' },
-    },
-};
-
-const PLANNED_IMPLICATIONS = {
-    GDP: {
-        US: 'Growth on track; equity supportive',
-        China: 'Real growth likely ~2% not 5%; CNY overvalued, commodity demand overstated',
-        EU: 'Stagnation confirmed; ECB may cut sooner',
-        Japan: 'Modest growth consistent; JPY neutral',
-        EM: 'Slight overstatement; EM debt may tighten',
-    },
-    Trade: {
-        US: 'Deficit slightly wider than reported; USD supportive',
-        China: 'Surplus overstated by ~$18B; export weakness hidden',
-        EU: 'Surplus weaker; EUR mildly negative',
-        Japan: 'Trade data consistent',
-        EM: 'Port data shows weaker flows than headline',
-    },
-    Inflation: {
-        US: 'Real inflation ~30bps hotter; rate cuts delayed',
-        China: 'Actual deflation deeper than reported; policy response lagging',
-        EU: 'Inflation slightly hotter than HICP',
-        Japan: 'Scanner data says BOJ has more inflation than admitted',
-        EM: 'Real cost-of-living pressures worse than headline',
-    },
-    'Central Bank': {
-        US: 'Repo markets show stress beneath calm surface',
-        China: 'Interbank rates reveal much tighter conditions than MLF suggests',
-        EU: 'ECB transmission working as intended',
-        Japan: 'JGB curve steepening signals YCC losing credibility',
-        EM: 'CDS spreads widening faster than rate moves suggest',
-    },
-    Employment: {
-        US: 'Job postings down 34% from headline NFP pace; revisions coming',
-        China: 'Job search volumes collapsed; real UE likely 15-20%',
-        EU: 'Hiring intent falling faster than unemployment rate',
-        Japan: 'Labor market tight and consistent',
-        EM: 'Search data shows weaker labor demand',
-    },
-};
-
-const PLANNED_ANALOGS = {
-    GDP: { China: 'Last divergence this large (2019-Q4): PMI collapsed within 90 days, CNH fell 3.2%' },
-    Inflation: { China: 'Last CPI divergence >2σ (2015-Q1): PBOC cut RRR 3x within 6 months' },
-    'Central Bank': { Japan: 'Last JGB divergence (2022-Q4): BOJ widened YCC band within 45 days' },
-    Employment: {
-        US: 'Last Indeed/NFP divergence >1σ (2023-Q2): NFP revised down by 300K+ cumulatively',
-        China: 'China stopped publishing youth unemployment when divergence hit 2.5σ (2023-Q2)',
-    },
-};
-
 // Ticker impact mapping — which tickers are affected by each divergence
 const TICKER_IMPACT = {
     'GDP|China': ['FXI', 'KWEB', 'EEM', 'BABA', 'HG', 'FCX'],
@@ -335,9 +246,7 @@ const TICKER_IMPACT = {
 // ── Transform API response to display format ────────────────────────────
 
 function transformApiChecks(apiResponse) {
-    const { checks = [], red_flags = [], narrative = '', summary = {}, generated_at } = apiResponse;
-
-    if (!checks.length) return null;
+    const { checks = [], narrative = '', generated_at } = apiResponse;
 
     const cells = {};
     const checksByCell = {};
@@ -369,21 +278,18 @@ function transformApiChecks(apiResponse) {
             region,
             zScore: maxDiv,
             classification: classifyDivergence(maxDiv),
-            officialSource: PLANNED_SOURCES.official[cat]?.[region] || worstCheck.official_source || '--',
-            physicalSource: PLANNED_SOURCES.physical[cat]?.[region] || worstCheck.physical_source || '--',
-            officialValue: PLANNED_VALUES.official[cat]?.[region] || formatApiValue(worstCheck.official_value),
-            physicalValue: PLANNED_VALUES.physical[cat]?.[region] || formatApiValue(worstCheck.physical_value),
-            implication: worstCheck.implication || PLANNED_IMPLICATIONS[cat]?.[region] || '',
-            historicalAnalog: PLANNED_ANALOGS[cat]?.[region] || null,
+            officialSource: worstCheck.official_source || '--',
+            physicalSource: worstCheck.physical_source || '--',
+            officialValue: formatApiValue(worstCheck.official_value),
+            physicalValue: formatApiValue(worstCheck.physical_value),
+            implication: worstCheck.implication || '',
             confidence: avgConfidence,
             checkedAt: worstCheck.checked_at,
             checks: cellChecks,  // Individual checks for drill-down
-            officialTrend: makeSparkline(50, 0.3, 2),
-            physicalTrend: makeSparkline(50, maxDiv > 2 ? -0.5 : maxDiv > 1.5 ? 0.1 : 0.25, 3),
         };
     }
 
-    // Fill in planned cells that API didn't cover
+    // Fill in cells the API didn't cover — an honest gap, never a fabricated number
     for (const cat of CATEGORIES) {
         for (const reg of REGIONS) {
             const key = `${cat}|${reg}`;
@@ -393,16 +299,13 @@ function transformApiChecks(apiResponse) {
                     region: reg,
                     zScore: null,
                     classification: 'noData',
-                    officialSource: PLANNED_SOURCES.official[cat]?.[reg] || '--',
-                    physicalSource: PLANNED_SOURCES.physical[cat]?.[reg] || '--',
-                    officialValue: PLANNED_VALUES.official[cat]?.[reg] || '--',
-                    physicalValue: PLANNED_VALUES.physical[cat]?.[reg] || '--',
-                    implication: PLANNED_IMPLICATIONS[cat]?.[reg] || 'No cross-reference data available',
-                    historicalAnalog: PLANNED_ANALOGS[cat]?.[reg] || null,
+                    officialSource: '--',
+                    physicalSource: '--',
+                    officialValue: '--',
+                    physicalValue: '--',
+                    implication: 'Not available yet — no cross-reference check configured for this domain/region.',
                     confidence: 0,
                     checks: [],
-                    officialTrend: [],
-                    physicalTrend: [],
                 };
             }
         }
@@ -428,7 +331,6 @@ function transformApiChecks(apiResponse) {
             : narrative,
         generatedAt: generated_at,
         totalChecks: checks.length,
-        source: 'live',
     };
 }
 
@@ -436,102 +338,6 @@ function formatApiValue(val) {
     if (val == null) return '--';
     if (typeof val === 'number') return val.toFixed(2);
     return String(val);
-}
-
-function makeSparkline(base, drift, noise) {
-    const pts = [];
-    let v = base;
-    for (let i = 0; i < 12; i++) {
-        v += drift + (Math.random() - 0.5) * noise;
-        pts.push({ month: i, value: v });
-    }
-    return pts;
-}
-
-
-// ── Planned fallback data (the visualization spec) ──────────────────────
-
-function generatePlaceholderData() {
-    const cells = {};
-    const redFlags = [];
-
-    const zScores = {
-        GDP:           { US: 0.3, China: 2.8, EU: 0.4, Japan: 0.3, EM: 0.5 },
-        Trade:         { US: 0.7, China: 1.9, EU: 1.1, Japan: 0.4, EM: 1.2 },
-        Inflation:     { US: 0.8, China: 2.4, EU: 0.6, Japan: 0.7, EM: 1.0 },
-        'Central Bank':{ US: 0.9, China: 1.7, EU: 0.2, Japan: 2.1, EM: 1.3 },
-        Employment:    { US: 1.4, China: 2.6, EU: 1.6, Japan: 0.2, EM: 1.5 },
-        Liquidity:     { US: 1.8, China: null, EU: null, Japan: null, EM: null },
-        Credit:        { US: 1.1, China: null, EU: null, Japan: null, EM: null },
-        Housing:       { US: 0.9, China: null, EU: null, Japan: null, EM: null },
-        Energy:        { US: 0.4, China: null, EU: null, Japan: null, EM: null },
-    };
-
-    for (const cat of CATEGORIES) {
-        for (const reg of REGIONS) {
-            const z = zScores[cat]?.[reg] ?? null;
-            const cls = classifyDivergence(z);
-            const cell = {
-                category: cat,
-                region: reg,
-                zScore: z,
-                classification: cls,
-                officialSource: PLANNED_SOURCES.official[cat]?.[reg] || '--',
-                physicalSource: PLANNED_SOURCES.physical[cat]?.[reg] || '--',
-                officialValue: PLANNED_VALUES.official[cat]?.[reg] || '--',
-                physicalValue: PLANNED_VALUES.physical[cat]?.[reg] || '--',
-                implication: PLANNED_IMPLICATIONS[cat]?.[reg] || 'No significant divergence detected',
-                historicalAnalog: PLANNED_ANALOGS[cat]?.[reg] || null,
-                confidence: z != null ? 0.75 : 0,
-                checks: [],
-                officialTrend: z != null ? makeSparkline(50, 0.3, 2) : [],
-                physicalTrend: z != null ? makeSparkline(50, cls === 'major' ? -0.5 : cls === 'notable' ? 0.1 : 0.25, 3) : [],
-            };
-            cells[`${cat}|${reg}`] = cell;
-
-            if (z != null && z > 2.0) {
-                redFlags.push({
-                    category: cat,
-                    region: reg,
-                    headline: `${reg} ${cat} vs ${PLANNED_SOURCES.physical[cat]?.[reg] || 'Physical Data'}: MAJOR DIVERGENCE`,
-                    zScore: z,
-                    implication: PLANNED_IMPLICATIONS[cat]?.[reg] || '',
-                    checkCount: 0,
-                });
-            }
-        }
-    }
-
-    const narrative = {
-        summary: 'The cross-reference engine reveals a consistent pattern: China\'s official statistics are diverging from physical reality across GDP, inflation, trade, and employment simultaneously. This is the widest multi-indicator divergence since 2019-Q4. Meanwhile, US employment data shows early signs of overstatement, and Japan\'s yield curve control is losing credibility according to bond market signals.',
-        bullets: [
-            'China\'s real GDP growth is likely 2-2.5%, not 5.2% — night lights, rail freight, and electricity all confirm. Commodity importers are positioned for demand that may not materialize.',
-            'US NFP is running ~35% ahead of Indeed job postings, the widest gap since pre-revision 2023. Expect significant downward revisions that could accelerate rate cut timeline.',
-            'Japan\'s JGB curve shape says the market is pricing YCC abandonment within 6 months, despite BOJ rhetoric. JPY short squeeze risk is elevated.',
-            'US Fed net liquidity rising while rhetoric stays hawkish — the balance sheet tells a different story than the press conferences.',
-        ],
-        watchFor: [
-            'China NBS PMI release — will it confirm night light divergence?',
-            'US NFP benchmark revision — potential -500K cumulative revision',
-            'BOJ meeting — JGB market already pricing policy shift',
-            'EU Flash CPI — BPP suggests upside surprise',
-            'Fed RRP drawdown pace — liquidity injection masquerading as "tightening"',
-        ],
-    };
-
-    return { cells, redFlags, narrative, source: 'planned', totalChecks: 0 };
-}
-
-function generatePlaceholderHistory() {
-    return [
-        { date: '2025-11-15', category: 'Employment', region: 'US', flagged: 'NFP vs Indeed divergence at 1.8σ', outcome: 'NFP revised down by 71K two months later', marketMove: 'SPX +1.2% on revision day (dovish repricing)', verdict: 'confirmed' },
-        { date: '2025-09-22', category: 'GDP', region: 'China', flagged: 'GDP vs Night Lights divergence at 2.5σ', outcome: 'PMI fell below 49 within 60 days; copper dropped 8%', marketMove: 'FXI -11%, HG copper -8.3%', verdict: 'confirmed' },
-        { date: '2025-07-03', category: 'Central Bank', region: 'Japan', flagged: 'JGB curve vs BOJ rhetoric divergence at 1.9σ', outcome: 'BOJ widened YCC band in July meeting', marketMove: 'USDJPY -4.1% in 48 hours', verdict: 'confirmed' },
-        { date: '2025-05-18', category: 'Inflation', region: 'EU', flagged: 'HICP vs BPP divergence at 1.3σ', outcome: 'Flash CPI came in 20bps above consensus', marketMove: 'EUR +0.6%, Bund yields +8bps', verdict: 'confirmed' },
-        { date: '2025-03-10', category: 'Trade', region: 'China', flagged: 'Trade surplus vs AIS port data divergence at 2.1σ', outcome: 'Surplus revised down by $12B in subsequent release', marketMove: 'CNH weakened 0.8% vs USD', verdict: 'confirmed' },
-        { date: '2025-01-20', category: 'Employment', region: 'China', flagged: 'Reported UE vs Baidu job search divergence at 2.4σ', outcome: 'Youth UE reporting suspended (again)', marketMove: 'KWEB -6.2% over following week', verdict: 'confirmed' },
-        { date: '2024-11-08', category: 'Inflation', region: 'US', flagged: 'CPI vs BPP divergence at 0.9σ', outcome: 'Next CPI print was inline with BLS', marketMove: 'Minimal', verdict: 'miss' },
-    ];
 }
 
 
@@ -806,16 +612,6 @@ const s = {
                p === 'MEDIUM' ? colors.accent : colors.textMuted,
     }),
 
-    // Loading
-    loadingBar: {
-        height: '2px', background: colors.bg, borderRadius: '1px',
-        marginBottom: '16px', overflow: 'hidden',
-    },
-    loadingFill: {
-        height: '100%', background: colors.accent,
-        borderRadius: '1px', animation: 'loadSlide 1.5s ease infinite',
-        width: '40%',
-    },
 };
 
 
@@ -834,10 +630,6 @@ function ensureKeyframes() {
         @keyframes crossref-flagPulse {
             0%, 100% { border-color: rgba(239,68,68,0.25); }
             50% { border-color: rgba(239,68,68,0.65); }
-        }
-        @keyframes loadSlide {
-            0% { transform: translateX(-100%); }
-            100% { transform: translateX(350%); }
         }
         @keyframes crossref-fadeIn {
             from { opacity: 0; transform: translateY(8px); }
@@ -1256,7 +1048,6 @@ function CheckRow({ check, onClick }) {
 export default function CrossReference({ onNavigate }) {
     const [data, setData] = useState(null);
     const [history, setHistory] = useState(null);
-    const [loading, setLoading] = useState(true);
     const [selectedCell, setSelectedCell] = useState(null);
     const [activeTab, setActiveTab] = useState('matrix');
     const [flagsExpanded, setFlagsExpanded] = useState(true);
@@ -1269,63 +1060,50 @@ export default function CrossReference({ onNavigate }) {
 
     useEffect(() => {
         ensureKeyframes();
-        loadData();
     }, []);
 
-    async function loadData() {
-        setLoading(true);
-        try {
-            let crossRef, hist;
-            try {
-                [crossRef, hist] = await Promise.all([
-                    api.getCrossReference(),
-                    api.getCrossRefHistory(),
-                ]);
-            } catch {
-                crossRef = null;
-                hist = null;
-            }
+    const { loading, error, refetch: loadData } = useAsyncData(async () => {
+        const [crossRef, hist] = await Promise.all([
+            api.getCrossReference(),
+            api.getCrossRefHistory(),
+        ]);
 
-            // Transform API response OR fall back to planned data
-            if (crossRef && Array.isArray(crossRef.checks) && crossRef.checks.length > 0) {
-                const transformed = transformApiChecks(crossRef);
-                setData(transformed);
+        // api.js never rejects — a failed request resolves an
+        // { error: true, status, message } marker instead (see #449).
+        // This fetcher returns a transformed object rather than the raw
+        // api result, so #449's generic useAsyncData check never sees the
+        // marker; surface it here or a real failure would silently render
+        // as an honest-looking empty matrix instead of ErrorState.
+        if (crossRef?.error) throw new Error(crossRef.message || 'Failed to load cross-reference data');
+        if (hist?.error) throw new Error(hist.message || 'Failed to load cross-reference history');
 
-                // Lazy-load the LLM narrative when the fast endpoint
-                // returned narrative_pending=true (PR #189 split). Fires
-                // the slow ~10s narrative endpoint in the background and
-                // merges into the existing data once it lands so the
-                // matrix paints first and the prose layer fills in.
-                if (crossRef.narrative_pending) {
-                    api.getCrossReferenceNarrative()
-                        .then((res) => {
-                            const text = res && typeof res.narrative === 'string'
-                                ? res.narrative
-                                : '';
-                            if (!text) return;
-                            setData((prev) => prev ? {
-                                ...prev,
-                                narrative: { summary: text, bullets: [], watchFor: [] },
-                            } : prev);
-                        })
-                        .catch(() => { /* narrative is optional — silently drop */ });
-                }
-            } else {
-                setData(generatePlaceholderData());
-            }
+        const transformed = transformApiChecks(crossRef || {});
+        setData(transformed);
 
-            if (hist && Array.isArray(hist.records) && hist.records.length > 0) {
-                setHistory(hist.records);
-            } else {
-                setHistory(generatePlaceholderHistory());
-            }
-        } catch {
-            setData(generatePlaceholderData());
-            setHistory(generatePlaceholderHistory());
-        } finally {
-            setLoading(false);
+        // Lazy-load the LLM narrative when the fast endpoint
+        // returned narrative_pending=true (PR #189 split). Fires
+        // the slow ~10s narrative endpoint in the background and
+        // merges into the existing data once it lands so the
+        // matrix paints first and the prose layer fills in.
+        if (crossRef?.narrative_pending) {
+            api.getCrossReferenceNarrative()
+                .then((res) => {
+                    const text = res && typeof res.narrative === 'string'
+                        ? res.narrative
+                        : '';
+                    if (!text) return;
+                    setData((prev) => prev ? {
+                        ...prev,
+                        narrative: { summary: text, bullets: [], watchFor: [] },
+                    } : prev);
+                })
+                .catch(() => { /* narrative is optional — silently drop */ });
         }
-    }
+
+        setHistory(Array.isArray(hist?.records) ? hist.records : []);
+
+        return transformed;
+    }, { fallback: null });
 
     const handleCellClick = useCallback((key) => {
         setSelectedCell(prev => prev === key ? null : key);
@@ -1397,21 +1175,6 @@ export default function CrossReference({ onNavigate }) {
     const handleMatrixZoomOut = useCallback(() => setMatrixZoom(prev => Math.max(prev * 0.7, 0.5)), []);
     const handleMatrixFit = useCallback(() => setMatrixZoom(1), []);
 
-    if (loading) {
-        return (
-            <div style={s.container}>
-                <div style={s.header}>
-                    <div style={s.title}>CROSS-REFERENCE ENGINE</div>
-                    <div style={s.subtitle}>Government statistics vs. physical reality</div>
-                </div>
-                <div style={s.loadingBar}><div style={s.loadingFill} /></div>
-                <div style={{ textAlign: 'center', color: colors.textMuted, fontSize: '13px', fontFamily: mono, padding: '60px 0' }}>
-                    Running {CATEGORIES.length * REGIONS.length} cross-reference checks across {CATEGORIES.length} domains...
-                </div>
-            </div>
-        );
-    }
-
     const { cells, redFlags, narrative } = data || {};
     const selectedData = selectedCell ? cells?.[selectedCell] : null;
     const tickers = selectedCell ? TICKER_IMPACT[selectedCell] : null;
@@ -1422,13 +1185,15 @@ export default function CrossReference({ onNavigate }) {
             <div style={s.header}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
                     <div style={s.title}>CROSS-REFERENCE ENGINE</div>
-                    <span style={{
-                        ...s.sourceTag,
-                        background: data?.source === 'live' ? colors.greenBg : colors.yellowBg,
-                        color: data?.source === 'live' ? colors.green : colors.yellow,
-                    }}>
-                        {data?.source === 'live' ? 'LIVE' : 'PLANNED'}
-                    </span>
+                    {data && (
+                        <span style={{
+                            ...s.sourceTag,
+                            background: data.totalChecks > 0 ? colors.greenBg : colors.yellowBg,
+                            color: data.totalChecks > 0 ? colors.green : colors.yellow,
+                        }}>
+                            {data.totalChecks > 0 ? 'LIVE' : 'NO DATA'}
+                        </span>
+                    )}
                 </div>
                 <div style={s.subtitle}>
                     Government statistics vs. physical reality — {CATEGORIES.length} domains × {REGIONS.length} regions
@@ -1440,6 +1205,12 @@ export default function CrossReference({ onNavigate }) {
                 </div>
             </div>
 
+            {loading && !data ? (
+                <LoadingSkeleton variant="chart" />
+            ) : error ? (
+                <ErrorState error={error} onRetry={loadData} title="Cross-reference data unavailable" />
+            ) : (
+            <>
             {/* ── Score Row ── */}
             <div style={s.scoreRow}>
                 <div
@@ -1506,9 +1277,13 @@ export default function CrossReference({ onNavigate }) {
                         ))}
                     </div>
                 </div>
-            ) : (
+            ) : (data?.totalChecks || 0) > 0 ? (
                 <div style={s.greenBanner}>
                     <span style={s.greenText}>All cross-reference checks consistent</span>
+                </div>
+            ) : (
+                <div style={s.greenBanner}>
+                    <span style={{ ...s.greenText, color: colors.textMuted }}>No live cross-reference checks available yet</span>
                 </div>
             )}
 
@@ -1764,10 +1539,10 @@ export default function CrossReference({ onNavigate }) {
                         <div style={s.narrativePanel}>
                             <div style={{ ...s.sectionTitle, marginTop: 0, color: colors.yellow }}>NO LIVE CHECKS AVAILABLE</div>
                             <div style={s.narrativeSummary}>
-                                The cross-reference engine API is not returning live checks. The matrix view shows planned data from the visualization spec.
-                                When the API is connected, this tab will show every individual check with its z-score, official value, physical value, and confidence.
+                                The cross-reference engine API is not returning live checks right now. Every domain/region in the matrix is marked as a data gap until a check runs — no values are shown in their place.
+                                When checks are live, this tab will show every individual check with its z-score, official value, physical value, and confidence.
                             </div>
-                            <div style={{ ...s.sectionTitle, color: colors.accent }}>PLANNED CHECK CATEGORIES</div>
+                            <div style={{ ...s.sectionTitle, color: colors.accent }}>CHECK CATEGORIES</div>
                             {CATEGORIES.map(cat => (
                                 <div key={cat} style={{ marginBottom: '8px' }}>
                                     <span style={{ fontSize: '11px', fontFamily: mono, color: CATEGORY_META[cat]?.color || colors.text, fontWeight: 700 }}>
@@ -1933,6 +1708,8 @@ export default function CrossReference({ onNavigate }) {
                         </div>
                     ))}
                 </>
+            )}
+            </>
             )}
 
             {/* Bottom padding */}

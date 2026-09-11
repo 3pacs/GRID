@@ -2,7 +2,7 @@ import React, { useState, useRef, useCallback, useEffect } from 'react';
 import DOMPurify from 'dompurify';
 import { Search, Plus, X, Loader2, Database, Zap, Lightbulb, Camera, ExternalLink } from 'lucide-react';
 import { api } from '../api.js';
-import { NODE_COLORS } from './canvas/nodeStyles.js';
+import { NODE_COLORS } from '../canvas/nodeStyles.js';
 
 // Snippets from /search/intelligence are produced by Postgres ts_headline,
 // which wraps matched terms in <mark>…</mark> but does NOT escape any other

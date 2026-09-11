@@ -52,7 +52,51 @@ def _payload_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
-def _write_audit(engine: Engine, contract: BaseContract, payload_hash: str) -> None:
+# PostgreSQL rejects NOTIFY payloads over 8000 bytes; keep headroom.
+NOTIFY_MAX_BYTES = 7800
+_NOTIFY_ENVELOPE_KEYS = ("ticker", "actor_id", "actor_hint", "canonical_name", "prediction_id")
+
+
+def notify_payload(contract: BaseContract, payload: dict[str, Any]) -> str:
+    """JSON for ``pg_notify``: the full contract, or a small envelope when the
+    serialised contract would exceed the NOTIFY size limit.
+
+    The envelope always carries ``event_id`` (for echo de-duplication in
+    ``api/routers/sse.py``), the contract type, and the identity keys the
+    canvas matches nodes on.
+    """
+    blob = json.dumps(payload, default=str)
+    if len(blob.encode("utf-8")) <= NOTIFY_MAX_BYTES:
+        return blob
+    envelope: dict[str, Any] = {
+        "event_id": str(contract.event_id),
+        "contract_type": type(contract).__name__,
+        "producer_module": contract.producer_module,
+        "timestamp": payload.get("timestamp"),
+        "truncated": True,
+    }
+    for key in _NOTIFY_ENVELOPE_KEYS:
+        if key in payload:
+            envelope[key] = payload[key]
+    return json.dumps(envelope, default=str)
+
+
+def _write_audit(
+    engine: Engine,
+    contract: BaseContract,
+    payload_hash: str,
+    *,
+    channel: str | None = None,
+    notify_json: str | None = None,
+) -> None:
+    """Write the audit row and, in the same transaction, ``pg_notify``.
+
+    Issuing the notify inside the audit transaction makes it transactional:
+    PostgreSQL delivers it only if the audit row commits, so listeners
+    (``events/bus.py`` in the API process → SSE) never see a contract that
+    was not recorded. This is the cross-process leg the April v5 plan
+    designed and never wired (V5-TRANSFORMATION.md §5 D1, R1.1).
+    """
     sql = text(
         """
         INSERT INTO contracts_audit (
@@ -79,6 +123,11 @@ def _write_audit(engine: Engine, contract: BaseContract, payload_hash: str) -> N
                 schema_version=contract.schema_version,
             )
         )
+        if channel and notify_json is not None:
+            conn.execute(
+                text("SELECT pg_notify(:channel, :payload)"),
+                {"channel": channel, "payload": notify_json},
+            )
 
 
 def emit(contract: BaseContract) -> UUID:
@@ -86,7 +135,8 @@ def emit(contract: BaseContract) -> UUID:
 
     1. Serialise to JSON-safe dict.
     2. Compute payload_hash for idempotency detection.
-    3. Write a row to ``contracts_audit``.
+    3. Write a row to ``contracts_audit`` and ``pg_notify`` the channel in
+       the same transaction (cross-process delivery to the SSE listener).
     4. Forward to the local event bus on the contract's channel.
 
     Returns the event id.
@@ -96,7 +146,13 @@ def emit(contract: BaseContract) -> UUID:
     channel = channel_for(type(contract))
 
     try:
-        _write_audit(_get_engine(), contract, payload_hash)
+        _write_audit(
+            _get_engine(),
+            contract,
+            payload_hash,
+            channel=channel,
+            notify_json=notify_payload(contract, payload),
+        )
     except Exception as exc:
         # Never let audit-write failure block the emit path — the dispatcher
         # will still attempt delivery via the bus, and the dead-letter store

@@ -1,0 +1,62 @@
+name: Ops — exec on grid-svr
+
+# Run a bash script on the grid-svr self-hosted runner and return its output
+# in the job summary. The orchestrating session uses this to diagnose and
+# operate the server (the same trust level as any workflow file in this repo,
+# which already runs arbitrary steps on that runner). The script arrives via
+# an environment variable, never interpolated into the shell.
+#
+# Guard rails: 30-minute cap, output truncated to 60 KB, and the script is
+# echoed first so the run log shows exactly what was executed. Never put
+# secrets in the script input; read them from the server .env if needed and
+# never print them.
+
+on:
+  workflow_dispatch:
+    inputs:
+      script:
+        description: "bash script to run (cwd = workdir)"
+        type: string
+        required: true
+      workdir:
+        description: "Working directory"
+        type: string
+        default: "/data/grid_v4/grid_release"
+      source_env:
+        description: "Source the GRID .env (release tree, else Hermes tree) before running"
+        type: boolean
+        default: true
+
+jobs:
+  exec:
+    name: exec on grid-svr
+    runs-on: [self-hosted, grid-svr]
+    timeout-minutes: 30
+    env:
+      SCRIPT: ${{ inputs.script }}
+      WORKDIR: ${{ inputs.workdir }}
+      SOURCE_ENV: ${{ inputs.source_env }}
+    steps:
+      - name: Run
+        shell: bash
+        run: |
+          set +e
+          echo "----- script -----"; printf '%s\n' "$SCRIPT"; echo "------------------"
+          if [ "$SOURCE_ENV" = "true" ]; then
+            for f in /data/grid_v4/grid_release/.env /home/grid/grid_v4/grid_repo/.env /home/grid/grid_v4/grid_repo/grid/.env; do
+              if [ -f "$f" ]; then set -a; . "$f"; set +a; echo "(env sourced from $f)"; break; fi
+            done
+          fi
+          cd "$WORKDIR" || { echo "no such workdir: $WORKDIR"; exit 2; }
+          printf '%s\n' "$SCRIPT" > /tmp/ops_exec_script.sh
+          timeout 28m bash /tmp/ops_exec_script.sh > /tmp/ops_exec_out.log 2>&1
+          rc=$?
+          echo "exit=$rc"
+          tail -c 60000 /tmp/ops_exec_out.log
+          {
+            echo "## exec on grid-svr — exit $rc"
+            echo '```'
+            tail -c 50000 /tmp/ops_exec_out.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $rc

@@ -22,28 +22,60 @@ from sqlalchemy import text
 from hyperspace.client import HyperspaceClient
 
 
+def _embed_chain_repr() -> str:
+    """Human-readable embed chain for log lines (never raises)."""
+    try:
+        from llm.router import _embed_chain
+
+        return ",".join(_embed_chain())
+    except Exception:  # pragma: no cover — logging helper only
+        return "unknown"
+
+
 class GRIDEmbeddings:
     """Semantic embedding interface for GRID feature and hypothesis analysis.
 
-    Wraps the Hyperspace embedding endpoint to provide:
+    Provides:
     - Feature-description embeddings for semantic similarity
     - Hypothesis deduplication via cosine similarity
     - Natural-language feature search
 
-    All methods return ``None`` when Hyperspace is unavailable.
+    Vectors come from :func:`llm.router.embed`, which walks
+    ``EMBED_PROVIDER_CHAIN`` (koala → z400 → grid-svr Ollama, all serving
+    ``nomic-embed-text`` on their own GPUs).
+
+    Until 2026-09-10 this class embedded through the Hyperspace client, whose
+    ``HYPERSPACE_BASE_URL`` pointed at the CPU-only llama.cpp unit on grid-svr
+    :8080. That server was never started with ``--embeddings``, so every call
+    returned HTTP 501 and every method here silently returned ``None``. The
+    operator retired CPU-only inference; embeddings now go to a tailnet GPU
+    node and the Hyperspace client is kept for chat/status only.
+
+    All methods still return ``None`` (or an empty result) when no embedding
+    provider answers — graceful degradation is unchanged.
 
     Attributes:
-        client: HyperspaceClient instance.
+        client: HyperspaceClient instance, retained for callers that also use
+            it for chat and for the health surface. Not used for embeddings.
     """
 
-    def __init__(self, hyperspace_client: HyperspaceClient) -> None:
+    def __init__(self, hyperspace_client: HyperspaceClient | None = None) -> None:
         """Initialise the embedding layer.
 
         Parameters:
-            hyperspace_client: A connected HyperspaceClient.
+            hyperspace_client: Optional HyperspaceClient. Retained for
+                backwards compatibility with existing call sites; embeddings
+                no longer route through it.
         """
         self.client = hyperspace_client
-        log.info("GRIDEmbeddings initialised — available={a}", a=self.client.is_available)
+        log.info("GRIDEmbeddings initialised — embed chain={c}", c=_embed_chain_repr())
+
+    @staticmethod
+    def _embed(texts: list[str]) -> list[list[float]] | None:
+        """Embed via the router's tailnet GPU chain. ``None`` when none answer."""
+        from llm.router import embed as router_embed
+
+        return router_embed(texts)
 
     def embed_features(
         self,
@@ -63,17 +95,14 @@ class GRIDEmbeddings:
 
         Returns:
             pd.DataFrame: Feature names as index, embedding dimensions as
-                columns.  Returns ``None`` if Hyperspace is unavailable.
+                columns.  Returns ``None`` if no embedding provider answered.
         """
-        if not self.client.is_available:
-            return None
-
         texts = self._build_feature_texts(feature_names, db_engine)
         if not texts:
             return None
 
-        vectors = self.client.embed(texts)
-        if vectors is None:
+        vectors = self._embed(texts)
+        if not vectors:
             return None
 
         df = pd.DataFrame(vectors, index=feature_names)
@@ -190,12 +219,9 @@ class GRIDEmbeddings:
             list[tuple[str, float]]: Up to ``top_k`` (feature_name, similarity)
                 pairs sorted descending.  Empty list if unavailable.
         """
-        if not self.client.is_available:
-            return []
-
         # Embed the query
-        query_vec = self.client.embed([query])
-        if query_vec is None:
+        query_vec = self._embed([query])
+        if not query_vec:
             return []
 
         # Embed all features
@@ -239,11 +265,8 @@ class GRIDEmbeddings:
         Returns:
             list[float]: Embedding vector, or ``None`` if unavailable.
         """
-        if not self.client.is_available:
-            return None
-
-        vectors = self.client.embed([statement])
-        if vectors is None or len(vectors) == 0:
+        vectors = self._embed([statement])
+        if not vectors:
             return None
         return vectors[0]
 
@@ -267,12 +290,12 @@ class GRIDEmbeddings:
                 the threshold.  ``most_similar_existing_statement`` is the
                 closest match (or None if no embeddings available).
         """
-        if not self.client.is_available or not existing_statements:
+        if not existing_statements:
             return (False, None)
 
         all_texts = [new_statement] + existing_statements
-        vectors = self.client.embed(all_texts)
-        if vectors is None or len(vectors) < 2:
+        vectors = self._embed(all_texts)
+        if not vectors or len(vectors) < 2:
             return (False, None)
 
         new_vec = np.array(vectors[0])

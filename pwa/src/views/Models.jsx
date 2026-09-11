@@ -1,9 +1,12 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import { api } from '../api.js';
 import useStore from '../store.js';
 import DecisionModal from '../components/DecisionModal.jsx';
 import KillSwitch from '../components/KillSwitch.jsx';
 import ViewHelp from '../components/ViewHelp.jsx';
+import { useAsyncData } from '../hooks/useAsyncData.js';
+import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
+import ErrorState from '../components/ErrorState.jsx';
 
 const stateColors = {
     PRODUCTION: '#1A7A4A', STAGING: '#1A6EBF', SHADOW: '#8A6000',
@@ -66,20 +69,14 @@ export default function Models() {
     const [expanded, setExpanded] = useState(null);
     const [confirmAction, setConfirmAction] = useState(null);
 
-    useEffect(() => {
-        loadModels();
-    }, []);
-
-    const loadModels = async () => {
-        try {
-            const [all, prod] = await Promise.all([
-                api.getModels(),
-                api.getProductionModels(),
-            ]);
-            setAllModels(all.models || []);
-            setProductionModels(prod.models || {});
-        } catch (e) { console.warn('[GRID] Models:', e.message); }
-    };
+    const { loading, error, refetch: loadModels } = useAsyncData(async () => {
+        const [all, prod] = await Promise.all([
+            api.getModels(),
+            api.getProductionModels(),
+        ]);
+        setAllModels(all.models || []);
+        setProductionModels(prod.models || {});
+    }, { fallback: null });
 
     const handleTransition = async (modelId, newState) => {
         try {
@@ -118,6 +115,12 @@ export default function Models() {
                 <ViewHelp id="models" />
             </div>
 
+            {loading && !allModels?.length ? (
+                <LoadingSkeleton variant="card" count={3} />
+            ) : error ? (
+                <ErrorState error={error} onRetry={loadModels} title="Model registry unavailable" />
+            ) : (
+            <>
             <div style={styles.prodCards}>
                 {['REGIME', 'TACTICAL', 'EXECUTION'].map(layer => {
                     const model = productionModels?.[layer];
@@ -207,6 +210,8 @@ export default function Models() {
                     onConfirm={() => handleTransition(confirmAction.modelId, confirmAction.target)}
                     onCancel={() => setConfirmAction(null)}
                 />
+            )}
+            </>
             )}
         </div>
     );

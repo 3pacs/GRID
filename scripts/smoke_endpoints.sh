@@ -151,8 +151,13 @@ except Exception as e:
 
 # 2. supply_chain endpoint
 try:
+    import inspect
     from api.routers.supply_chain import get_supply_chain
-    r = asyncio.run(get_supply_chain("NVDA", "both", 3, "smoke_test"))
+    # The handler became synchronous; accept either shape so this gate does
+    # not fail on a signature change that the endpoint itself survived.
+    r = get_supply_chain("NVDA", "both", 3, "smoke_test")
+    if inspect.iscoroutine(r):
+        r = asyncio.run(r)
     n = len(r["nodes"])
     e = len(r["edges"])
     ch = len(r["chokepoints"])
