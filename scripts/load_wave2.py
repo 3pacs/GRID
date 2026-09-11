@@ -223,8 +223,10 @@ except Exception as e:
 # 7. ALPHA VANTAGE — Technical indicators
 # ═══════════════════════════════════════════
 log.info("\n--- Alpha Vantage ---")
-AV_KEY = 'SPT9IOAEYVUT7X6J'
-sid = get_src('ALPHA_VANTAGE')
+# Key comes from the environment via config.py (never a literal); the request
+# carries it in `params` so it is never interpolated into a URL string.
+AV_KEY = settings.ALPHAVANTAGE_API_KEY
+AV_URL = "https://www.alphavantage.co/query"
 
 av_indicators = [
     ('SPY', 'RSI', 'spy_rsi', 'vol', 'SPY RSI 14-day'),
@@ -233,14 +235,25 @@ av_indicators = [
     ('BTC', 'RSI', 'btc_rsi_av', 'vol', 'BTC RSI 14-day (crypto)'),
 ]
 
+if not AV_KEY:
+    log.warning("ALPHAVANTAGE_API_KEY not set -- skipping Alpha Vantage indicators")
+    av_indicators = []
+else:
+    sid = get_src('ALPHA_VANTAGE')
+
 for symbol, indicator, feat_name, family, desc in av_indicators:
     try:
+        params = {
+            "function": indicator,
+            "symbol": symbol,
+            "interval": "daily",
+            "series_type": "close",
+            "apikey": AV_KEY,
+        }
         if indicator == 'RSI':
-            url = f"https://www.alphavantage.co/query?function=RSI&symbol={symbol}&interval=daily&time_period=14&series_type=close&apikey={AV_KEY}"
-        elif indicator == 'MACD':
-            url = f"https://www.alphavantage.co/query?function=MACD&symbol={symbol}&interval=daily&series_type=close&apikey={AV_KEY}"
+            params["time_period"] = 14
         
-        r = requests.get(url, timeout=30)
+        r = requests.get(AV_URL, params=params, timeout=30)
         data = r.json()
         
         fid = get_fid(feat_name, family, desc)
@@ -270,8 +283,7 @@ for symbol, indicator, feat_name, family, desc in av_indicators:
 # 8. NEWSAPI — Headlines sentiment proxy
 # ═══════════════════════════════════════════
 log.info("\n--- NewsAPI ---")
-NEWS_KEY = '33cc8e8ba8b74505abab278a4f5ad735'
-sid = get_src('NEWSAPI')
+NEWS_KEY = settings.NEWSAPI_KEY
 
 topics = {
     'news_recession': 'recession OR economic downturn',
@@ -283,6 +295,12 @@ topics = {
     'news_layoffs': 'layoffs OR job cuts OR workforce reduction',
     'news_housing': 'housing market OR mortgage rates OR real estate',
 }
+
+if not NEWS_KEY:
+    log.warning("NEWSAPI_KEY not set -- skipping NewsAPI headline counts")
+    topics = {}
+else:
+    sid = get_src('NEWSAPI')
 
 for feat_name, query in topics.items():
     try:
