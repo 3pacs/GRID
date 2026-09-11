@@ -11,7 +11,7 @@ require a live pg_engine fixture.
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -1204,7 +1204,7 @@ class _RecordingEngine:
         """Params of every statement carrying the pull_timestamp window."""
         return [
             p for sql, p in self.calls
-            if isinstance(p, dict) and "pull_timestamp >= COALESCE" in sql
+            if isinstance(p, dict) and "pull_timestamp >= :since" in sql
         ]
 
 
@@ -1237,8 +1237,15 @@ def _patched_entity_map(monkeypatch, feature_id: int | None = 1):
 
 class TestResolutionWindow:
 
-    def test_lookback_is_a_bound_parameter(self, monkeypatch):
-        """The window must bind :lookback — never interpolate it into SQL."""
+    def test_lookback_never_reaches_the_sql(self, monkeypatch):
+        """The lookback must never be interpolated into SQL.
+
+        It used to travel as :lookback inside NOW() - :lookback * INTERVAL
+        '1 day'. That kept it a bound parameter but left the lower bound
+        wrapped in COALESCE, where the planner could not use it as an index
+        bound. It is now resolved to a concrete instant before binding, so
+        the guarantee holds with no expression around the bound at all.
+        """
         _patched_entity_map(monkeypatch)
         engine = _RecordingEngine()
         Resolver(db_engine=engine).resolve_pending(lookback_days=2, workers=1)
@@ -1246,10 +1253,13 @@ class TestResolutionWindow:
         windows = engine.window_params()
         assert windows, "no windowed statement executed"
         for params in windows:
-            assert params["lookback"] == 2
-            assert params["since"] is None
+            assert "lookback" not in params
+            assert isinstance(params["since"], datetime)
+            age = datetime.now(timezone.utc) - params["since"]
+            assert timedelta(days=2) <= age < timedelta(days=2, minutes=5)
         for sql, _ in engine.calls:
             assert "INTERVAL '2 day" not in sql
+            assert "INTERVAL '1 day'" not in sql
 
     def test_since_watermark_overrides_lookback(self, monkeypatch):
         """A watermark is passed through as :since on every windowed query."""
@@ -1289,7 +1299,11 @@ class TestResolutionWindow:
         import normalization.resolver as resolver_mod
 
         source = inspect.getsource(resolver_mod.Resolver.resolve_pending)
-        assert "pull_timestamp >= COALESCE" in source
+        # Pin the indexable shape, not merely the absence of interpolation:
+        # the previous COALESCE / IS NULL OR form was equally free of string
+        # building and still cost every backfill chunk a full table scan.
+        assert "pull_timestamp >= :since" in source
+        assert "pull_timestamp >= COALESCE" not in source
         assert ".format(" not in source
         for line in source.splitlines():
             stripped = line.strip()
@@ -1757,3 +1771,102 @@ class TestResolveRangeFaultTolerance:
         assert "default=DEFAULT_BACKFILL_CHUNK_DAYS" in source
         assert DEFAULT_BACKFILL_CHUNK_DAYS == 1
 
+
+
+# ---------------------------------------------------------------------------
+# The pull_timestamp window must reach the planner as index bounds
+# ---------------------------------------------------------------------------
+
+
+class TestWindowBoundsAreIndexable:
+    """Both raw_series scans must compare pull_timestamp to plain parameters.
+
+    The window used to be carried inline as
+
+        pull_timestamp >= COALESCE(CAST(:since AS timestamptz), NOW() - ...)
+        AND (CAST(:until AS timestamptz) IS NULL
+             OR pull_timestamp < CAST(:until AS timestamptz))
+
+    psycopg2 binds a naive datetime as ``timestamp without time zone``, and
+    ``timestamp -> timestamptz`` is STABLE rather than IMMUTABLE, so it is
+    not folded to a constant at plan time. Inside COALESCE and inside the
+    ``IS NULL OR`` disjunction the planner got no usable bound and scanned
+    the whole of raw_series for every chunk — which is why a 1-day chunk
+    and a 7-day chunk both hit the same 600s statement timeout while the
+    rolling window, where both parameters are NULL and the disjunction
+    folds away, ran in 2.2s.
+    """
+
+    def _scans(self, engine):
+        return [
+            (sql, params) for sql, params in engine.calls
+            if "FROM raw_series rs" in sql
+        ]
+
+    def test_both_scans_bound_pull_timestamp_directly(self, monkeypatch):
+        _patched_entity_map(monkeypatch)
+        engine = _RecordingEngine()
+        Resolver(db_engine=engine).resolve_pending(lookback_days=2, workers=1)
+
+        scans = self._scans(engine)
+        assert len(scans) >= 2, "expected the DISTINCT scan and the row fetch"
+        for sql, _params in scans:
+            assert "rs.pull_timestamp >= :since" in sql
+            assert "rs.pull_timestamp < COALESCE(" in sql
+
+    def test_no_scan_buries_a_bound_in_coalesce_or_a_null_test(self, monkeypatch):
+        _patched_entity_map(monkeypatch)
+        engine = _RecordingEngine()
+        Resolver(db_engine=engine).resolve_pending(lookback_days=2, workers=1)
+
+        for sql, _params in self._scans(engine):
+            collapsed = " ".join(sql.split())
+            # The lower bound must not be wrapped in COALESCE again, and the
+            # upper bound must not be reached through an IS NULL disjunction.
+            assert "pull_timestamp >= COALESCE" not in collapsed
+            assert "IS NULL" not in collapsed
+            assert "INTERVAL '1 day'" not in collapsed
+
+    def test_absent_since_is_resolved_to_an_aware_instant_not_left_to_sql(
+        self, monkeypatch
+    ):
+        """lookback_days must arrive as a real timestamp, not NOW() - :lookback."""
+        _patched_entity_map(monkeypatch)
+        engine = _RecordingEngine()
+        Resolver(db_engine=engine).resolve_pending(lookback_days=2, workers=1)
+
+        for _sql, params in self._scans(engine):
+            assert isinstance(params["since"], datetime)
+            assert params["since"].tzinfo is not None, (
+                "the default window must be anchored to an absolute instant, "
+                "the way the server-side NOW() it replaced was"
+            )
+            assert params["until"] is None
+            assert "lookback" not in params
+
+    def test_caller_supplied_bounds_are_passed_through_untouched(self, monkeypatch):
+        """A backfill chunk's own bounds must not be rewritten under it."""
+        _patched_entity_map(monkeypatch)
+        engine = _RecordingEngine()
+        since, until = datetime(2026, 4, 4), datetime(2026, 4, 5)
+        Resolver(db_engine=engine).resolve_pending(
+            lookback_days=30, workers=1, since=since, until=until
+        )
+
+        scans = self._scans(engine)
+        assert scans
+        for _sql, params in scans:
+            assert params["since"] == since
+            assert params["until"] == until
+
+    def test_window_bounds_helper_defaults_only_the_lower_bound(self):
+        from normalization.resolver import _window_bounds
+
+        since, until = datetime(2026, 4, 4), datetime(2026, 4, 5)
+        assert _window_bounds(since, until, 30) == {"since": since, "until": until}
+
+        defaulted = _window_bounds(None, None, 2)
+        assert defaulted["until"] is None
+        assert defaulted["since"].tzinfo is not None
+        age = datetime.now(timezone.utc) - defaulted["since"]
+        assert timedelta(days=2) <= age < timedelta(days=2, minutes=5)
