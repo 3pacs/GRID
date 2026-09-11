@@ -25,6 +25,92 @@ services (Postgres, llama.cpp, Crucix, Hermes Operator, Coordinator, Worker), an
 `grid-api` only if you're intentionally bypassing the automated deploy (e.g. local
 debugging on the server).
 
+## Deploy Path (grid-hermes)
+
+`grid-hermes` does **not** share the `grid-api` release tree, and
+`.github/workflows/deploy.yml` never touches it: that workflow hard-resets
+`/data/grid_v4/grid_release` and restarts `grid-api` only. So **merging to `main`
+does not deploy Hermes.**
+
+Verified read-only on 2026-09-11 (ops-exec runs
+[34549441175](https://github.com/3pacs/GRID/actions/runs/34549441175) and
+[34550741131](https://github.com/3pacs/GRID/actions/runs/34550741131)):
+
+| Fact | Value |
+|---|---|
+| `WorkingDirectory` | `/home/grid/grid_v4/grid_repo` — a symlink to `/data/grid_v4/grid_repo` |
+| `EnvironmentFile` | `/home/grid/grid_v4/grid_repo/.env` |
+| `ExecStart` | `/usr/bin/python3 scripts/hermes_operator.py` |
+| `/proc/<MainPID>/cwd` | `/data/grid_v4/grid_repo` |
+
+Note this is `…/grid_repo`, **not** `…/grid_repo/grid/` as older rows on this
+page say.
+
+Hermes updates its own tree from inside its cycle via
+`scripts.hermes_operator.git_pull()`, which runs `git pull --ff-only origin main`
+(see `tests/test_hermes_git_pull.py`). Two things follow, and both bite:
+
+1. **`--ff-only` refuses once the tree carries local commits.** As of
+   2026-09-11 the Hermes tree was **60 commits ahead of its last-known
+   `origin/main`, 0 behind**, with several local `Merge /data/grid_v4/grid_release`
+   commits and a dirty working tree. `HEAD` is not an ancestor of `origin/main`,
+   so the self-pull cannot advance it — silently, since a refused pull is logged
+   at `warning` and the cycle carries on.
+2. **A pulled tree is not a running tree.** The process imports its modules at
+   start, so new code only takes effect on `systemctl restart grid-hermes`.
+
+**Getting a Hermes-side change live therefore takes an operator**, in this order:
+
+```bash
+# 1. Reconcile the tree. This is an operator decision — the local commits and
+#    the dirty working tree must be dealt with by hand. Do NOT blind-reset it:
+#    those merges may carry changes that exist nowhere else.
+cd /data/grid_v4/grid_repo && git status -sb && git log --oneline origin/main..HEAD
+
+# 2. Once HEAD is an ancestor of origin/main again:
+cd /data/grid_v4/grid_repo && git pull --ff-only origin main
+
+# 3. Restart so the process picks up the new modules.
+sudo systemctl restart grid-hermes
+
+# 4. Confirm the cycle's resolution step is actually running.
+journalctl -u grid-hermes -f | grep -iE 'Resolution|Resolver'
+```
+
+## Resolver Catch-Up Runbook
+
+`resolved_series` is the PIT table every analytical surface reads. Its per-cycle
+writer is Hermes cycle step 3b (`_run_resolution_step` →
+`Resolver.resolve_pending`), which covers a 2-day window narrowed by a
+watermark. Recovering a *gap* is a separate, operator-run job: walk the backlog
+in bounded chunks of `raw_series.pull_timestamp`.
+
+```bash
+cd /data/grid_v4/grid_release
+
+# Calibrate on ONE day first — every phase runs, nothing is written.
+python -m normalization.resolver --since 2026-04-04 --until 2026-04-05 \
+    --chunk-days 1 --workers 8 --dry-run
+
+# Then write. Idempotent: re-running a chunk hits
+# ON CONFLICT (feature_id, obs_date, vintage_date) DO NOTHING.
+python -m normalization.resolver --since 2026-04-04 --until 2026-04-18 \
+    --chunk-days 1 --workers 8
+```
+
+**Use `--chunk-days 1` for the backlog.** A historical window costs far more
+than a recent one of the same width: the rolling 2-day window's distinct-series
+scan is 2.2 s (index scan on `idx_raw_series_pull_timestamp`, buffers
+half-cached), but a 7-day window five months back did not finish inside the
+resolver's own 600 s statement timeout — `raw_series` is ~1.93 B rows and an old
+week is a cold, scattered heap read. Widen only when a dry run shows headroom.
+
+Run it in slices that fit inside the ≤ 25-minute `ops-exec` budget rather than
+one long invocation. A chunk that fails is recorded with its date range and the
+walk continues; the summary's `failed_ranges` lists exactly what to retry, and
+the CLI prints a ready-to-paste retry line per failure. Because every insert is
+`ON CONFLICT … DO NOTHING`, re-running an overlapping range is always safe.
+
 ## Services (Boot Order)
 
 | # | Service | Port | Process | Location |
@@ -33,7 +119,7 @@ debugging on the server).
 | 2 | **llama.cpp (Qwen3.8-27B, RTX 3090)** | 8086 (shim on 8081) | `llama-server` (CUDA) | `/data/vendor/llama.cpp/build/bin/llama-server` |
 | 3 | **Crucix** | 3117 | Node.js app | `~/grid_v4/Crucix/` (has own `.env`) |
 | 4 | **GRID API (uvicorn)** | 8000 | `python3 -m uvicorn api.main:app` | `/data/grid_v4/grid_release` (deployed tree — see [Deploy Pipeline](#deploy-pipeline-grid-api) below) |
-| 5 | **Hermes Operator** | — | `python3 scripts/hermes_operator.py` | `~/grid_v4/grid_repo/grid/` |
+| 5 | **Hermes Operator** | — | `python3 scripts/hermes_operator.py` | `/home/grid/grid_v4/grid_repo` → `/data/grid_v4/grid_repo` (see [Deploy Path (grid-hermes)](#deploy-path-grid-hermes)) |
 | 6 | **Compute Coordinator** | 8100 | `uvicorn scripts.compute_coordinator:app` | `~/grid_v4/grid_repo/grid/` |
 | 7 | **Compute Worker** | — | `python3 scripts/worker.py` | `~/grid_v4/grid_repo/grid/` |
 
