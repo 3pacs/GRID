@@ -1,0 +1,70 @@
+name: Dad Path Smoke Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: 'grid-api base URL to test'
+        required: false
+        default: 'http://127.0.0.1:8000'
+      strict:
+        description: 'Exit 1 if anything is broken'
+        type: boolean
+        required: false
+        default: false
+  workflow_call:
+    inputs:
+      base_url:
+        description: 'grid-api base URL to test'
+        required: false
+        default: 'http://127.0.0.1:8000'
+        type: string
+      strict:
+        description: 'Exit 1 if anything is broken'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  RELEASE_DIR: /data/grid_v4/grid_release
+
+jobs:
+  smoke:
+    name: Dad Path Smoke
+    runs-on: [self-hosted, grid-svr]
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          pip install -r requirements.txt
+
+      - name: Run dad path smoke test
+        id: smoke
+        run: |
+          set -euo pipefail
+          for f in /data/grid_v4/grid_release/.env /home/grid/grid_v4/grid_repo/.env /home/grid/grid_v4/grid_repo/grid/.env; do
+            if [ -f "$f" ]; then set -a; . "$f"; set +a; echo "(env sourced from $f)"; break; fi
+          done
+          STRICT_FLAG=""
+          if [ "${{ inputs.strict }}" = "true" ]; then
+            STRICT_FLAG="--strict"
+          fi
+          python3 scripts/smoke_dad_path.py \
+            --base-url "${{ inputs.base_url }}" \
+            --release-dir "$RELEASE_DIR" \
+            --json /tmp/dad_smoke.json \
+            --budget-ms 5000 \
+            $STRICT_FLAG
+
+      - name: Upload smoke result JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dad-smoke-result
+          path: /tmp/dad_smoke.json
+          retention-days: 14
+          if-no-files-found: warn

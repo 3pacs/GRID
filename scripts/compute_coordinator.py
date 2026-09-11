@@ -307,7 +307,27 @@ BOOGERBOTS_REQUIRED_AUDIT_EVENTS = {
     "completed_or_failed",
 }
 BOOGERBOTS_PRIORITY_CEILING = 30
+
+# Tenant order, inverted 2026-09-10 on the operator's call ("flip it around,
+# ocmri defers"; "ocmri is lowest priority for now").
+#
+# Claims are served `ORDER BY priority DESC`, so a higher number wins. Until
+# today OCMRI sat on a floor of 31, above the 0-30 Boogerbots band, and every
+# Boogerbots job had to declare that it yielded to OCMRI. Now OCMRI is capped
+# at 0 — the bottom of the scale — and the Boogerbots band starts at 1, so any
+# GRID or Boogerbots work outranks it.
+#
+# `COMPUTE_YIELD_TO_OCMRI=true` in the environment restores the old order
+# without a code change, which is what "for now" buys.
+OCMRI_PRIORITY_CEILING = 0
+BOOGERBOTS_PRIORITY_FLOOR = OCMRI_PRIORITY_CEILING + 1
+#: Legacy floor, only meaningful when yielding to OCMRI is re-enabled.
 OCMRI_PRIORITY_FLOOR = BOOGERBOTS_PRIORITY_CEILING + 1
+
+
+def yields_to_ocmri() -> bool:
+    """True when the deprecated OCMRI-wins tenant order is re-enabled."""
+    return bool(getattr(settings, "COMPUTE_YIELD_TO_OCMRI", False))
 KILL_SWITCH_TRUTHY_VALUES = {"1", "true", "yes", "on", "active", "stop"}
 KILL_SWITCH_FALSEY_VALUES = {"", "0", "false", "no", "off", "inactive"}
 
@@ -413,27 +433,45 @@ def boogerbots_scheduler_proof(payload: dict[str, Any]) -> dict[str, Any]:
     )
     preemption = payload.get("preemption")
     preemption_enabled = _is_mapping(preemption) and preemption.get("enabled") is True
+    legacy = yields_to_ocmri()
+    floor = 0 if legacy else BOOGERBOTS_PRIORITY_FLOOR
     priority_in_range = (
         isinstance(priority_value, int)
-        and 0 <= priority_value <= BOOGERBOTS_PRIORITY_CEILING
+        and floor <= priority_value <= BOOGERBOTS_PRIORITY_CEILING
     )
+    # Legacy order: OCMRI outranks Boogerbots, which must declare the yield.
     ocmri_priority_wins = (
         priority_in_range
         and "ocmri" in yield_targets
         and preemption_enabled
         and priority_value < OCMRI_PRIORITY_FLOOR
     )
+    # Current order: OCMRI is capped at the bottom, so Boogerbots outranks it
+    # on priority alone — no yield declaration required.
+    ocmri_defers = priority_in_range and priority_value > OCMRI_PRIORITY_CEILING
+    claim_order = (
+        [
+            {"tenant": "ocmri", "priority": OCMRI_PRIORITY_FLOOR},
+            {"tenant": "boogerbots", "priority": priority_value},
+        ]
+        if legacy
+        else [
+            {"tenant": "boogerbots", "priority": priority_value},
+            {"tenant": "ocmri", "priority": OCMRI_PRIORITY_CEILING},
+        ]
+    )
     return {
         "boogerbots_priority_value": priority_value,
         "boogerbots_priority_ceiling": BOOGERBOTS_PRIORITY_CEILING,
+        "boogerbots_priority_floor": floor,
         "ocmri_priority_floor": OCMRI_PRIORITY_FLOOR,
+        "ocmri_priority_ceiling": OCMRI_PRIORITY_CEILING,
         "ocmri_priority_wins": ocmri_priority_wins,
+        "ocmri_defers": ocmri_defers,
+        "yields_to_ocmri": legacy,
         "yield_to_ocmri": "ocmri" in yield_targets,
         "preemption_enabled": preemption_enabled,
-        "claim_order_proof": [
-            {"tenant": "ocmri", "priority": OCMRI_PRIORITY_FLOOR},
-            {"tenant": "boogerbots", "priority": priority_value},
-        ],
+        "claim_order_proof": claim_order,
     }
 
 
@@ -469,7 +507,8 @@ def boogerbots_w1_proof(payload: dict[str, Any]) -> dict[str, Any]:
     kill_switch = boogerbots_kill_switch_state(payload)
     audit = boogerbots_audit_sink_proof(payload)
     ready = (
-        scheduler["ocmri_priority_wins"]
+        (scheduler["ocmri_priority_wins"] if yields_to_ocmri()
+         else scheduler["ocmri_defers"])
         and kill_switch["configured"]
         and audit["separate_from_ocmri_sentry"]
         and audit["required_events_present"]
@@ -519,12 +558,16 @@ def boogerbots_contract_errors(payload: dict[str, Any]) -> list[str]:
                 "priority.class must be 'boogerbots-low' or "
                 "'boogerbots-background'"
             )
+        band_floor = 0 if yields_to_ocmri() else BOOGERBOTS_PRIORITY_FLOOR
         if (
             not isinstance(priority_value, int)
-            or priority_value < 0
-            or priority_value > 30
+            or priority_value < band_floor
+            or priority_value > BOOGERBOTS_PRIORITY_CEILING
         ):
-            errors.append("priority.value must be an integer from 0 through 30")
+            errors.append(
+                "priority.value must be an integer from "
+                f"{band_floor} through {BOOGERBOTS_PRIORITY_CEILING}"
+            )
 
     resources = payload.get("resources")
     resources = resources if _is_mapping(resources) else {}
@@ -541,7 +584,9 @@ def boogerbots_contract_errors(payload: dict[str, Any]) -> list[str]:
     if not _is_mapping(yield_policy):
         errors.append("yield_policy must be an object")
     else:
-        if "ocmri" not in set(_string_list(yield_policy.get("yield_to"))):
+        if yields_to_ocmri() and "ocmri" not in set(
+            _string_list(yield_policy.get("yield_to"))
+        ):
             errors.append("yield_policy.yield_to must include 'ocmri'")
         check_interval = yield_policy.get("check_interval_seconds")
         if not isinstance(check_interval, int) or check_interval < 5 or check_interval > 60:
@@ -551,11 +596,17 @@ def boogerbots_contract_errors(payload: dict[str, Any]) -> list[str]:
             and yield_policy.get("idle_window_required") is not True
         ):
             errors.append("GPU workloads must set yield_policy.idle_window_required=true")
-        if yield_policy.get("on_ocmri_demand") not in {
+        on_demand = yield_policy.get("on_ocmri_demand")
+        allowed_on_demand = {
             "checkpoint_and_exit",
             "exit_without_start",
             "pause_and_resume",
-        }:
+        }
+        # Only required while Boogerbots yields; if declared anyway it must
+        # still name a supported action.
+        if (yields_to_ocmri() or on_demand is not None) and (
+            on_demand not in allowed_on_demand
+        ):
             errors.append("yield_policy.on_ocmri_demand has an unsupported action")
 
     preemption = payload.get("preemption")
@@ -633,7 +684,7 @@ async def health():
 
 
 @app.post("/workers/register")
-async def register_worker(w: WorkerRegister):
+def register_worker(w: WorkerRegister):
     conn = get_conn()
     conn.autocommit = True
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -657,7 +708,7 @@ async def register_worker(w: WorkerRegister):
 
 
 @app.get("/workers")
-async def list_workers():
+def list_workers():
     conn = get_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT * FROM compute_workers ORDER BY id")
@@ -667,7 +718,7 @@ async def list_workers():
 
 
 @app.post("/workers/{worker_id}/heartbeat")
-async def worker_heartbeat(worker_id: int, active_jobs: Optional[int] = None):
+def worker_heartbeat(worker_id: int, active_jobs: Optional[int] = None):
     conn = get_conn()
     conn.autocommit = True
     cur = conn.cursor()
@@ -729,7 +780,7 @@ async def dry_run_job(payload: dict):
 
 
 @app.get("/jobs")
-async def list_jobs(state: Optional[str] = None, job_type: Optional[str] = None, limit: int = 50):
+def list_jobs(state: Optional[str] = None, job_type: Optional[str] = None, limit: int = 50):
     conn = get_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     query = "SELECT * FROM compute_jobs WHERE TRUE"
@@ -749,7 +800,7 @@ async def list_jobs(state: Optional[str] = None, job_type: Optional[str] = None,
 
 
 @app.get("/jobs/{job_id}")
-async def get_job(job_id: int):
+def get_job(job_id: int):
     conn = get_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT * FROM compute_jobs WHERE id=%s", (job_id,))
@@ -761,7 +812,7 @@ async def get_job(job_id: int):
 
 
 @app.get("/metadata/compute-inputs")
-async def compute_inputs(model_limit: int = 16, feature_limit: int = 20):
+def compute_inputs(model_limit: int = 16, feature_limit: int = 20):
     """Return coordinator-DB-valid IDs for external job producers."""
     conn = get_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -783,7 +834,7 @@ async def compute_inputs(model_limit: int = 16, feature_limit: int = 20):
 
 
 @app.post("/jobs/{job_id}/cancel")
-async def cancel_job(job_id: int):
+def cancel_job(job_id: int):
     conn = get_conn()
     conn.autocommit = True
     cur = conn.cursor()
@@ -793,7 +844,7 @@ async def cancel_job(job_id: int):
 
 
 @app.post("/jobs/claim")
-async def claim_job(
+def claim_job(
     worker_id: int,
     gpu_available: bool = False,
     ollama_available: bool = False,
@@ -874,7 +925,7 @@ async def claim_job(
 
 
 @app.post("/jobs/{job_id}/start")
-async def start_job(job_id: int, worker_id: int):
+def start_job(job_id: int, worker_id: int):
     conn = get_conn()
     conn.autocommit = True
     cur = conn.cursor()
@@ -884,13 +935,38 @@ async def start_job(job_id: int, worker_id: int):
     return {"status": "started", "job_id": job_id}
 
 
+def completion_already_recorded(cur, job_id: int) -> str | None:
+    """Return the job's terminal state when a result row already exists.
+
+    Workers retry ``/complete`` after a slow first response; without this
+    check the retry raised ``Invalid transition: COMPLETED -> COMPLETED``.
+    """
+    cur.execute("SELECT state FROM compute_jobs WHERE id=%s", (job_id,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    state = row["state"] if isinstance(row, dict) else row[0]
+    if state not in (JobState.COMPLETED.value, JobState.FAILED.value,
+                     JobState.VALID.value, JobState.ASSIMILATED.value):
+        return None
+    cur.execute("SELECT 1 FROM compute_results WHERE job_id=%s LIMIT 1", (job_id,))
+    return state if cur.fetchone() else None
+
+
 @app.post("/jobs/{job_id}/complete")
-async def complete_job(job_id: int, result: JobResult):
+def complete_job(job_id: int, result: JobResult):
     conn = get_conn()
     conn.autocommit = False
     cur = conn.cursor()
 
     try:
+        recorded = completion_already_recorded(cur, job_id)
+        if recorded:
+            conn.rollback()
+            log.info("Job #{id} completion already recorded (state={s}) — idempotent ack",
+                     id=job_id, s=recorded)
+            return {"status": "already_recorded", "job_id": job_id, "state": recorded}
+
         if result.error:
             transition_job(cur, job_id, JobState.FAILED, result.error, result.worker_id)
             cur.execute("UPDATE compute_jobs SET error_message=%s WHERE id=%s", (result.error, job_id))
@@ -919,7 +995,7 @@ async def complete_job(job_id: int, result: JobResult):
 
 
 @app.post("/jobs/{job_id}/validate")
-async def validate_job(job_id: int):
+def validate_job(job_id: int):
     conn = get_conn()
     conn.autocommit = True
     cur = conn.cursor()
@@ -929,7 +1005,7 @@ async def validate_job(job_id: int):
 
 
 @app.post("/jobs/{job_id}/assimilate")
-async def assimilate_job(job_id: int):
+def assimilate_job(job_id: int):
     conn = get_conn()
     conn.autocommit = True
     cur = conn.cursor()
@@ -939,7 +1015,7 @@ async def assimilate_job(job_id: int):
 
 
 @app.get("/stats")
-async def coordinator_stats():
+def coordinator_stats():
     conn = get_conn()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 

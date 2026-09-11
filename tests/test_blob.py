@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+import types
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -71,6 +73,48 @@ class TestBlobStoreAvailability:
             store._available = False
             result = store.available
         assert result is False
+
+
+class TestBlobStoreCredentials:
+    """Empty MINIO_* credentials disable the store; there are no built-in defaults."""
+
+    @pytest.fixture
+    def fake_minio(self, monkeypatch):
+        module = types.ModuleType("minio")
+        module.Minio = MagicMock(name="Minio")
+        monkeypatch.setitem(sys.modules, "minio", module)
+        return module
+
+    def test_config_ships_no_default_credentials(self):
+        from config import Settings
+
+        assert Settings.model_fields["MINIO_ACCESS_KEY"].default == ""
+        assert Settings.model_fields["MINIO_SECRET_KEY"].default == ""
+
+    def test_disabled_without_credentials(self, monkeypatch, fake_minio):
+        from config import settings
+
+        monkeypatch.setattr(settings, "MINIO_ACCESS_KEY", "")
+        monkeypatch.setattr(settings, "MINIO_SECRET_KEY", "")
+        store = BlobStore()
+
+        assert store.available is False
+        assert store.put("filings", "AAPL/10-K.pdf", b"x") is False
+        assert store._get_client() is None  # cached: no retry, no second warning
+        fake_minio.Minio.assert_not_called()
+
+    def test_connects_with_credentials(self, monkeypatch, fake_minio):
+        from config import settings
+
+        monkeypatch.setattr(settings, "MINIO_ACCESS_KEY", "test-access")
+        monkeypatch.setattr(settings, "MINIO_SECRET_KEY", "test-secret")
+        store = BlobStore()
+
+        assert store._get_client() is fake_minio.Minio.return_value
+        assert store.available is True
+        _, kwargs = fake_minio.Minio.call_args
+        assert kwargs["access_key"] == "test-access"
+        assert kwargs["secret_key"] == "test-secret"
 
 
 class TestBlobStorePut:

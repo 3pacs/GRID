@@ -175,22 +175,29 @@ class TestNewsMomentumAnalyzer:
         assert result.sentiment_trend == "unavailable"
         assert result.momentum_direction == "unavailable"
         assert result.energy_state == "unavailable"
+        assert result.direction == "unavailable"
+        assert result.summary
 
     def test_analyze_with_data(
         self, mock_engine: MagicMock, mock_pit_store: MagicMock
     ) -> None:
-        """Should compute momentum metrics when data is available."""
-        # Mock feature registry lookup
+        """Should compute momentum metrics from the actor-tone composite."""
+        # Mock feature registry lookup — every _resolve_feature_ids() call
+        # (actor tones, price, tension) sees the same rows via this mock, so
+        # give it two actor-tone columns to exercise the row-mean composite.
         mock_conn = MagicMock()
         mock_result = MagicMock()
-        mock_result.fetchall.return_value = [(1, "gdelt_tone_usa")]
+        mock_result.fetchall.return_value = [
+            (1, "gdelt_actor_powell_tone"),
+            (2, "gdelt_actor_lagarde_tone"),
+        ]
         mock_conn.execute.return_value = mock_result
         mock_engine.connect.return_value.__enter__.return_value = mock_conn
 
-        # Create synthetic tone data
+        # Create synthetic tone data across both resolved columns
         dates = pd.date_range("2024-01-01", periods=60, freq="D")
         tone_data = np.sin(np.linspace(0, 4 * np.pi, 60)) * 2 + 1
-        matrix = pd.DataFrame({1: tone_data}, index=dates)
+        matrix = pd.DataFrame({1: tone_data, 2: tone_data * 0.8}, index=dates)
         mock_pit_store.get_feature_matrix.return_value = matrix
 
         analyzer = NewsMomentumAnalyzer(mock_engine, mock_pit_store)
@@ -203,6 +210,13 @@ class TestNewsMomentumAnalyzer:
         assert "trend" in result.details
         assert "momentum" in result.details
         assert "energy" in result.details
+        assert result.details["features_available"] == [
+            "gdelt_actor_powell_tone", "gdelt_actor_lagarde_tone",
+        ]
+        # Plain-English summary + bull/bear direction are what the
+        # stepdad.finance news card renders
+        assert isinstance(result.summary, str) and result.summary
+        assert result.direction in ("bullish", "bearish", "mixed")
 
     def test_analyze_insufficient_data(
         self, mock_engine: MagicMock, mock_pit_store: MagicMock
@@ -211,7 +225,7 @@ class TestNewsMomentumAnalyzer:
         # Mock feature registry lookup
         mock_conn = MagicMock()
         mock_result = MagicMock()
-        mock_result.fetchall.return_value = [(1, "gdelt_tone_usa")]
+        mock_result.fetchall.return_value = [(1, "gdelt_actor_powell_tone")]
         mock_conn.execute.return_value = mock_result
         mock_engine.connect.return_value.__enter__.return_value = mock_conn
 
@@ -225,6 +239,35 @@ class TestNewsMomentumAnalyzer:
 
         assert result.available is False
 
+    def test_analyze_averages_across_available_actor_tones(
+        self, mock_engine: MagicMock, mock_pit_store: MagicMock
+    ) -> None:
+        """A single actor query going empty on a given day should not sink the composite."""
+        mock_conn = MagicMock()
+        mock_result = MagicMock()
+        mock_result.fetchall.return_value = [
+            (1, "gdelt_actor_powell_tone"),
+            (2, "gdelt_actor_lagarde_tone"),
+        ]
+        mock_conn.execute.return_value = mock_result
+        mock_engine.connect.return_value.__enter__.return_value = mock_conn
+
+        dates = pd.date_range("2024-01-01", periods=30, freq="D")
+        # Column 2 is missing every other day — the composite should still
+        # be built from whatever is present rather than dropping the row.
+        col1 = pd.Series(np.linspace(-2, 2, 30), index=dates)
+        col2 = pd.Series(np.linspace(2, -2, 30), index=dates)
+        col2.iloc[::2] = np.nan
+        matrix = pd.DataFrame({1: col1, 2: col2}, index=dates)
+        mock_pit_store.get_feature_matrix.return_value = matrix
+
+        analyzer = NewsMomentumAnalyzer(mock_engine, mock_pit_store)
+        result = analyzer.analyze(date(2024, 1, 30))
+
+        assert result.available is True
+        # 30 rows of composite data survive even with column 2 half-missing
+        assert result.details["data_points"] == 30
+
     def test_momentum_result_to_dict(self) -> None:
         """MomentumResult.to_dict should serialize correctly."""
         mr = MomentumResult(
@@ -232,6 +275,8 @@ class TestNewsMomentumAnalyzer:
             sentiment_trend="rising",
             momentum_direction="accelerating",
             energy_state="high",
+            direction="bullish",
+            summary="News tone is improving.",
             details={"key": "val"},
             warnings=["w1"],
         )
@@ -239,7 +284,16 @@ class TestNewsMomentumAnalyzer:
         assert d["available"] is True
         assert d["sentiment_trend"] == "rising"
         assert d["energy_state"] == "high"
+        assert d["direction"] == "bullish"
+        assert d["summary"] == "News tone is improving."
         assert d["details"]["key"] == "val"
+
+    def test_trend_to_direction_maps_to_plain_sentiment_vocabulary(self) -> None:
+        """direction must use words plainSentiment() (pwa) recognizes as bull/bear."""
+        assert NewsMomentumAnalyzer._trend_to_direction("rising") == "bullish"
+        assert NewsMomentumAnalyzer._trend_to_direction("falling") == "bearish"
+        assert NewsMomentumAnalyzer._trend_to_direction("neutral") == "mixed"
+        assert NewsMomentumAnalyzer._trend_to_direction("unavailable") == "unavailable"
 
     def test_resolve_feature_ids_db_error(
         self, mock_engine: MagicMock, mock_pit_store: MagicMock
@@ -250,7 +304,7 @@ class TestNewsMomentumAnalyzer:
         mock_engine.connect.return_value.__enter__.return_value = mock_conn
 
         analyzer = NewsMomentumAnalyzer(mock_engine, mock_pit_store)
-        ids = analyzer._resolve_feature_ids(["gdelt_tone_usa"])
+        ids = analyzer._resolve_feature_ids(["gdelt_actor_powell_tone"])
 
         assert ids == {}
 

@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
-"""Atomic dual-write deploy helper for GRID's two server trees.
+"""Atomic dual-write deploy helper for GRID's manually-managed server trees.
 
-The GRID backend runs from two distinct working directories on grid-svr:
+NOTE: grid-api is no longer deployed through this script. Every push to `main`
+now runs `.github/workflows/deploy.yml`'s `deploy` job on the self-hosted
+grid-svr runner, which resets `/data/grid_v4/grid_release` to `main`, builds
+the PWA, runs migrations, points grid-api's WorkingDirectory at that tree via
+a systemd drop-in, and restarts it. The `astrogrid_dedup` tree and the
+`--restart`/`--smoke` flags below are stale for grid-api specifically — using
+them will not affect what grid-api actually serves, and `restart_grid_api()`
+below just restarts the systemd unit in place — it does not touch the
+`WorkingDirectory` drop-in deploy.yml writes, so the unit keeps running from
+`/data/grid_v4/grid_release` regardless. See docs/SERVER-SERVICES.md for the
+current topology.
+
+This script still dual-writes to the two trees below for the other services
+that are not covered by deploy.yml:
 
     GRID_REPO_HOME = /home/grid/grid_v4/grid_repo
         (aliased to /data/grid_v4/grid_repo via the /home/grid/grid_v4 symlink)
@@ -9,12 +22,16 @@ The GRID backend runs from two distinct working directories on grid-svr:
         grid-realtime, grid-spider, grid-backlinker, grid-breaking-news.
 
     GRID_REPO_DATA = /data/grid_v4/astrogrid_dedup
-        WorkingDirectory for: grid-api.
+        Historical WorkingDirectory for grid-api; superseded by
+        /data/grid_v4/grid_release (see note above). Still dual-written,
+        hash-verified, and smoke-tested by this script's own code below,
+        even though it no longer reflects what grid-api serves.
 
-Every code-affecting deploy MUST land on both paths, or services will silently
-run stale code. Historical ad-hoc `scp` boilerplate has been wrong at least 6
-times this session (root-owned files, forgotten copies, permission denied,
-drift, etc.). This helper eliminates those failure modes.
+Every code-affecting deploy to those non-grid-api services MUST land on both
+paths, or they will silently run stale code. Historical ad-hoc `scp`
+boilerplate has been wrong at least 6 times this session (root-owned files,
+forgotten copies, permission denied, drift, etc.). This helper eliminates
+those failure modes.
 
 What it does
 ------------

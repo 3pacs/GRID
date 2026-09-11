@@ -343,6 +343,7 @@ class OperatorState:
         self.last_sector_health: datetime | None = None  # Daily sector health snapshot at 3 AM UTC
         self.last_active_hypo_scoring: datetime | None = None  # Periodic batch scoring of overdue active hypos (30 min)
         self.last_earnings_calendar_sync: datetime | None = None  # earnings_events → earnings_calendar back-compat sync (30 min)
+        self.last_resolution: datetime | None = None  # raw_series → resolved_series watermark (start time of the last clean resolver run)
 
         # Hermes status log: task_name -> {last_run, success, duration_s, error}
         self.task_status: dict[str, dict[str, Any]] = {}
@@ -353,13 +354,27 @@ class OperatorState:
         success: bool,
         duration_s: float,
         error: str | None = None,
+        transient: bool = False,
     ) -> None:
-        """Record the outcome of a scheduled task for the status endpoint."""
+        """Record the outcome of a scheduled task for the status endpoint.
+
+        Args:
+            task_name: Cycle step the outcome belongs to.
+            success: Whether the step completed cleanly.
+            duration_s: Wall time the step consumed.
+            error: Failure detail, prefixed with the exception class where
+                the caller knows it.
+            transient: True when the failure is operational (a statement
+                timeout, a dropped connection, a step abandoned at its
+                budget) rather than a defect. Health surfaces read this to
+                avoid paging on a slow database.
+        """
         self.task_status[task_name] = {
             "last_run": datetime.now(timezone.utc).isoformat(),
             "success": success,
             "duration_s": round(duration_s, 2),
             "error": error,
+            "transient": transient,
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -395,6 +410,7 @@ class OperatorState:
             "last_sector_health": self.last_sector_health.isoformat() if self.last_sector_health else None,
             "last_active_hypo_scoring": self.last_active_hypo_scoring.isoformat() if self.last_active_hypo_scoring else None,
             "last_earnings_calendar_sync": self.last_earnings_calendar_sync.isoformat() if self.last_earnings_calendar_sync else None,
+            "last_resolution": self.last_resolution.isoformat() if self.last_resolution else None,
             "last_options_scoring": self.last_options_scoring.isoformat() if self.last_options_scoring else None,
             "task_status": self.task_status,
         }
@@ -435,7 +451,7 @@ class OperatorState:
             "last_signal_forecasts", "last_enrich_connections",
             "last_contagion_backtest", "last_contagion_feedback",
             "last_sector_health", "last_active_hypo_scoring",
-            "last_earnings_calendar_sync", "last_ux_audit",
+            "last_earnings_calendar_sync", "last_resolution", "last_ux_audit",
             "last_daily_digest", "last_100x_digest", "last_oracle_cycle",
         ]
         hydrated_any = False

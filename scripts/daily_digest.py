@@ -73,6 +73,8 @@ _SNAPSHOT_STATS_SQL = text("""
     WHERE created_at >= NOW() - INTERVAL '24 hours'
 """)
 
+# raw_series is a TimescaleDB hypertable: bound the time column on BOTH
+# sides or the planner walks every chunk.
 _PULL_STATS_SQL = text("""
     SELECT
         COUNT(DISTINCT source_id) as sources_pulled,
@@ -81,6 +83,7 @@ _PULL_STATS_SQL = text("""
         MAX(pull_timestamp) as latest_pull
     FROM raw_series
     WHERE pull_timestamp >= NOW() - INTERVAL '24 hours'
+      AND pull_timestamp <= NOW()
 """)
 
 _FAILED_PULLS_SQL = text("""
@@ -91,6 +94,20 @@ _FAILED_PULLS_SQL = text("""
     ORDER BY created_at DESC
     LIMIT 20
 """)
+
+
+def _collect_long_plays(engine: Any) -> dict[str, Any] | None:
+    """Latest persisted Long Plays board, or ``None`` when none exists.
+
+    Read-only and never raises — a missing table or an unbuilt board just
+    drops the section.
+    """
+    try:
+        from intelligence.long_plays import load_latest_board
+        return load_latest_board(engine)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("daily digest: long plays board unavailable: {e}", e=str(exc))
+        return None
 
 
 def _collect_issues(engine: Any) -> list[dict[str, Any]]:
@@ -221,10 +238,107 @@ def _record_digest_sent(engine: Any, sent_at: datetime) -> None:
 # Email builder
 # ---------------------------------------------------------------------------
 
+def _fmt_usd_short(value: Any) -> str:
+    """``$906 M`` style market cap, ``—`` when unknown."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "&#8212;"
+    if v != v or v in (float("inf"), float("-inf")) or v <= 0:
+        return "&#8212;"
+    for divisor, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M")):
+        if v >= divisor:
+            return f"${v / divisor:.1f} {suffix}"
+    return f"${v:,.0f}"
+
+
+def _fmt_num(value: Any, fmt: str = "{:.2f}") -> str:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "&#8212;"
+    if v != v:
+        return "&#8212;"
+    return fmt.format(v)
+
+
+def _build_long_plays_section(board: dict[str, Any] | None) -> dict[str, Any]:
+    """Long Plays section: entry candidates first, with the route that qualified them."""
+    if not board:
+        return {
+            "title": "Long Plays",
+            "body": "<span style='color:#5A7A96'>No Long Plays board has been built yet</span>",
+        }
+
+    from intelligence.long_plays import entry_first
+
+    rows = entry_first(board.get("candidates") or [])
+    entries = [c for c in rows if c.get("stance") == "entry_candidate"]
+    by_route = board.get("entry_candidates_by_route") or {}
+    route_tail = ", ".join(f"{route} {n}" for route, n in sorted(by_route.items()) if n)
+
+    body = (
+        f"<div class='kpi-row'>"
+        f"<span class='kpi-label'>Universe</span>"
+        f"<span class='kpi-value'>{board.get('universe_size', '?')}</span>"
+        f"</div>"
+        f"<div class='kpi-row'>"
+        f"<span class='kpi-label'>Entry Candidates</span>"
+        f"<span class='kpi-value' style='color:{'#22C55E' if entries else '#5A7A96'}'>"
+        f"{len(entries)}{f' ({route_tail})' if route_tail else ''}</span>"
+        f"</div>"
+    )
+
+    rows_html = ""
+    for cand in rows[:15]:
+        gate = cand.get("gate") or {}
+        stance = cand.get("stance") or ""
+        stance_color = {
+            "entry_candidate": "#22C55E", "watch": "#5A7A96", "avoid": "#EF4444",
+        }.get(stance, "#5A7A96")
+        proj_3y = ((cand.get("projection") or {}).get("3y") or {})
+        rows_html += (
+            f"<tr>"
+            f"<td style='font-size:13px;font-weight:700'>{cand.get('ticker', '')}</td>"
+            f"<td style='color:{stance_color};font-size:11px;font-weight:700'>{stance}</td>"
+            f"<td style='font-size:13px'>{cand.get('coverage_route') or '&#8212;'}</td>"
+            f"<td style='font-size:13px'>{_fmt_usd_short(cand.get('market_cap_usd'))}</td>"
+            f"<td style='font-size:13px'>{_fmt_num(gate.get('cash_runway_months'), '{:.0f} mo')}</td>"
+            f"<td style='font-size:13px'>{gate.get('next_catalyst_date') or '&#8212;'}</td>"
+            f"<td style='font-size:13px'>"
+            f"{_fmt_num(proj_3y.get('p50_multiple'), '{:.2f}x')} / "
+            f"{_fmt_num(proj_3y.get('p90_multiple'), '{:.2f}x')}</td>"
+            f"</tr>"
+        )
+
+    if rows_html:
+        body += (
+            "<br><table class='data-table'>"
+            "<tr><th>TICKER</th><th>STANCE</th><th>ROUTE</th><th>CAP</th>"
+            "<th>RUNWAY</th><th>CATALYST</th><th>3Y p50/p90</th></tr>"
+            f"{rows_html}</table>"
+            "<br><em style='color:#5A7A96;font-size:12px'>Multiples are a seeded proxy "
+            "from historical CAGR/vol &#8212; not a forecast.</em>"
+        )
+
+    if not entries and board.get("stand_down_reason"):
+        body += (
+            f"<br><strong style='color:#F59E0B'>Stand down:</strong> "
+            f"{board['stand_down_reason']}"
+        )
+
+    return {
+        "title": "Long Plays",
+        "body": body,
+        "accent": "green" if entries else "",
+    }
+
+
 def _build_digest_sections(
     issues: list[dict[str, Any]],
     ux_audit: dict[str, Any] | None,
     system_stats: dict[str, Any],
+    long_plays: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Build email sections for the daily digest."""
     sections: list[dict[str, Any]] = []
@@ -382,6 +496,9 @@ def _build_digest_sections(
 
     sections.append({"title": "System Health (24h)", "body": sys_body})
 
+    # ── Long Plays ──
+    sections.append(_build_long_plays_section(long_plays))
+
     return sections
 
 
@@ -405,16 +522,20 @@ def send_daily_digest(engine: Any, dry_run: bool = False) -> dict[str, Any]:
     issues = _collect_issues(engine)
     ux_audit = _collect_ux_audit(engine)
     system_stats = _collect_system_stats(engine)
+    long_plays = _collect_long_plays(engine)
 
     result: dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "issues_count": len(issues),
         "ux_score": ux_audit.get("score") if ux_audit else None,
         "has_ux_audit": ux_audit is not None,
+        "long_plays_entry_candidates": (
+            (long_plays or {}).get("entry_candidates") if long_plays else None
+        ),
     }
 
     # Build email
-    sections = _build_digest_sections(issues, ux_audit, system_stats)
+    sections = _build_digest_sections(issues, ux_audit, system_stats, long_plays)
     now = datetime.now(timezone.utc)
     subject = (
         f"GRID Daily Digest — {now.strftime('%b %d')} | "

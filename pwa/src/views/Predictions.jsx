@@ -1,6 +1,9 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { api } from '../api.js';
 import { shared, colors, tokens } from '../styles/shared.js';
+import { useAsyncData } from '../hooks/useAsyncData.js';
+import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
+import ErrorState from '../components/ErrorState.jsx';
 
 // ── Styles ────────────────────────────────────────────────────────────────
 
@@ -497,22 +500,22 @@ function PredictionCard({ pred }) {
 
 export default function Predictions() {
     const [tab, setTab] = useState('active');
-    const [scoreboard, setScoreboard] = useState(null);
     const [predictions, setPredictions] = useState([]);
-    const [latest, setLatest] = useState(null);
-    const [loading, setLoading] = useState(true);
     const [filterTicker, setFilterTicker] = useState('');
     const [filterModel, setFilterModel] = useState('');
     const [predTotal, setPredTotal] = useState(0);
 
-    const fetchScoreboard = useCallback(async () => {
-        try {
-            const data = await api.getOracleScoreboard();
-            setScoreboard(data);
-        } catch (e) {
-            console.warn('Scoreboard fetch failed:', e);
-        }
-    }, []);
+    const { data: scoreData, loading, error, refetch: loadScoreboard } = useAsyncData(async () => {
+        const [scoreboardRes, latestRes] = await Promise.all([
+            api.getOracleScoreboard(),
+            api.getOracleLatest(),
+        ]);
+        if (scoreboardRes?.error) throw new Error(scoreboardRes.message || 'Failed to load oracle scoreboard');
+        if (latestRes?.error) throw new Error(latestRes.message || 'Failed to load oracle latest results');
+        return { scoreboard: scoreboardRes, latest: latestRes };
+    }, { fallback: { scoreboard: null, latest: null } });
+    const scoreboard = scoreData.scoreboard;
+    const latest = scoreData.latest;
 
     const fetchPredictions = useCallback(async (status) => {
         try {
@@ -527,20 +530,6 @@ export default function Predictions() {
             setPredictions([]);
         }
     }, [filterTicker, filterModel]);
-
-    const fetchLatest = useCallback(async () => {
-        try {
-            const data = await api.getOracleLatest();
-            setLatest(data);
-        } catch (e) {
-            console.warn('Latest fetch failed:', e);
-        }
-    }, []);
-
-    useEffect(() => {
-        setLoading(true);
-        Promise.all([fetchScoreboard(), fetchLatest()]).finally(() => setLoading(false));
-    }, []);
 
     useEffect(() => {
         const statusMap = { active: 'active', scored: 'scored', expired: 'expired' };
@@ -579,15 +568,17 @@ export default function Predictions() {
                 .pred-card-anim { animation: fadeIn 0.3s ease both; }
             `}</style>
 
-            {loading && (
-                <div style={s.loadingBar}><div style={s.loadingFill} /></div>
-            )}
-
             <div style={s.header}>
                 <span>Oracle Predictions</span>
                 <span style={s.headerAccent}>TRACK RECORD</span>
             </div>
 
+            {loading && !scoreboard ? (
+                <LoadingSkeleton variant="card" count={3} />
+            ) : error ? (
+                <ErrorState error={error} onRetry={loadScoreboard} title="Oracle scoreboard unavailable" />
+            ) : (
+            <>
             {/* ── Scoreboard Header ─────────────────────────────── */}
             <div style={s.scoreboardRow}>
                 <div style={s.scoreCard}>
@@ -822,6 +813,8 @@ export default function Predictions() {
                         </div>
                     )}
                 </>
+            )}
+            </>
             )}
         </div>
     );

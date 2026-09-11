@@ -68,8 +68,12 @@ describe('LessonsWidget', () => {
 
         render(<LessonsWidget />);
 
+        // Wait for the first load to *render*, not just for the call to be
+        // recorded: clicking Refresh while the widget is still loading is a
+        // no-op, which made this flaky on slow CI runners.
         await waitFor(() => {
             expect(api.getPostmortemLessons).toHaveBeenCalledTimes(1);
+            expect(screen.getByText('L1')).toBeInTheDocument();
         });
 
         fireEvent.click(screen.getByTestId('lessons-refresh'));

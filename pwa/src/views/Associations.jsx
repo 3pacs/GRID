@@ -5,12 +5,15 @@
  * card feed. Each card is a self-contained insight sorted by importance.
  * Designed mobile-first for 390px iPhone screens.
  */
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
 import { api } from '../api.js';
 import useStore from '../store.js';
 import { colors, tokens, shared } from '../styles/shared.js';
 import { useDevice } from '../hooks/useDevice.js';
 import ViewHelp from '../components/ViewHelp.jsx';
+import { useAsyncData } from '../hooks/useAsyncData.js';
+import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
+import ErrorState from '../components/ErrorState.jsx';
 
 // ── Local push notifications for extreme findings ───────────────────
 async function notifyIfExtreme(cards) {
@@ -651,48 +654,37 @@ export default function Associations({ onNavigate }) {
     const { addNotification } = useStore();
     const [cards, setCards] = useState([]);
     const [filter, setFilter] = useState('all');
-    const [loading, setLoading] = useState(true);
     const { isMobile } = useDevice();
 
-    useEffect(() => {
-        loadAll();
-    }, []);
+    const { loading, error, refetch: loadAll } = useAsyncData(async () => {
+        const [anomalies, correlations, regimeFeatures, smartHeatmap] = await Promise.all([
+            api.getAnomalies(),
+            api.getCorrelationMatrix().catch(() => null),
+            api.getRegimeFeatures().catch(() => null),
+            api.getSmartHeatmap(null, true).catch(() => null),
+        ]);
+        const builtCards = buildCards(anomalies, correlations, regimeFeatures, smartHeatmap);
+        setCards(builtCards);
+        notifyIfExtreme(builtCards);
 
-    const loadAll = async () => {
-        setLoading(true);
-        try {
-            const [anomalies, correlations, regimeFeatures, smartHeatmap] = await Promise.all([
-                api.getAnomalies().catch(() => null),
-                api.getCorrelationMatrix().catch(() => null),
-                api.getRegimeFeatures().catch(() => null),
-                api.getSmartHeatmap(null, true).catch(() => null),
-            ]);
-            const builtCards = buildCards(anomalies, correlations, regimeFeatures, smartHeatmap);
-            setCards(builtCards);
-            notifyIfExtreme(builtCards);
-
-            // Fetch sparklines for feature spotlight cards (non-blocking)
-            const spotlightFeatures = builtCards
-                .filter(c => c.type === 'feature_spotlight')
-                .map(c => c.feature)
-                .slice(0, 20);
-            if (spotlightFeatures.length > 0) {
-                api.getTimeseries(spotlightFeatures, 30).then(ts => {
-                    if (ts?.series) {
-                        setCards(prev => prev.map(c => {
-                            if (c.type === 'feature_spotlight' && ts.series[c.feature]) {
-                                return { ...c, sparkline: ts.series[c.feature].slice(-14) };
-                            }
-                            return c;
-                        }));
-                    }
-                }).catch(() => {});
-            }
-        } catch (err) {
-            addNotification('error', 'Failed to load association data');
+        // Fetch sparklines for feature spotlight cards (non-blocking)
+        const spotlightFeatures = builtCards
+            .filter(c => c.type === 'feature_spotlight')
+            .map(c => c.feature)
+            .slice(0, 20);
+        if (spotlightFeatures.length > 0) {
+            api.getTimeseries(spotlightFeatures, 30).then(ts => {
+                if (ts?.series) {
+                    setCards(prev => prev.map(c => {
+                        if (c.type === 'feature_spotlight' && ts.series[c.feature]) {
+                            return { ...c, sparkline: ts.series[c.feature].slice(-14) };
+                        }
+                        return c;
+                    }));
+                }
+            }).catch(() => {});
         }
-        setLoading(false);
-    };
+    }, { fallback: null });
 
     const filtered = cards.filter(c => filterMatch(c, filter));
 
@@ -741,25 +733,28 @@ export default function Associations({ onNavigate }) {
             </div>
 
             {/* Loading */}
-            {loading && (
-                <div style={{ textAlign: 'center', padding: '40px 0', color: colors.textMuted, fontSize: tokens.fontSize.md }}>
-                    Scanning market structure...
-                </div>
+            {loading && cards.length === 0 && (
+                <LoadingSkeleton variant="card" count={4} />
+            )}
+
+            {/* Error */}
+            {error && (
+                <ErrorState error={error} onRetry={loadAll} title="Associations data unavailable" />
             )}
 
             {/* Feed */}
-            {!loading && filtered.length === 0 && (
+            {!loading && !error && filtered.length === 0 && (
                 <div style={{ textAlign: 'center', padding: '40px 0', color: colors.textMuted, fontSize: tokens.fontSize.md }}>
                     No insights for this filter. Try "All".
                 </div>
             )}
 
-            {!loading && filtered.map(card => (
+            {!loading && !error && filtered.map(card => (
                 <InsightCard key={card.id} card={card} />
             ))}
 
             {/* Legacy link */}
-            {!loading && (
+            {!loading && !error && (
                 <div style={{
                     textAlign: 'center', padding: `${tokens.space.xl} 0`,
                     marginTop: tokens.space.lg,

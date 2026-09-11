@@ -175,12 +175,35 @@ _VALID_METRICS = frozenset({
 })
 
 
-def get_actor_analytics(actor_id: str, engine: Engine | None = None) -> dict | None:
+# Analytics scopes -> table. "full" is the whole actor graph (dominated by
+# the ICIJ / PEP / sanctions dumps); "curated" is the named-market-actor
+# subgraph written by ``scripts/graph_analytics.py --scope curated``. The
+# table name is only ever taken from this whitelist.
+ANALYTICS_TABLES: dict[str, str] = {
+    "full": "actor_analytics",
+    "curated": "actor_analytics_curated",
+}
+
+
+def analytics_table(scope: str) -> str:
+    """Whitelisted analytics table for ``scope``; ValueError on anything else."""
+    try:
+        return ANALYTICS_TABLES[scope]
+    except KeyError:
+        raise ValueError(
+            f"Invalid analytics scope '{scope}'. Must be one of: {sorted(ANALYTICS_TABLES)}"
+        ) from None
+
+
+def get_actor_analytics(
+    actor_id: str, engine: Engine | None = None, scope: str = "full"
+) -> dict | None:
     """Get precomputed graph analytics for an actor.
 
     Returns dict with pagerank, community_id, betweenness, eigenvector,
     degree_centrality, hub_score, authority_score, computed_at. None if not found.
     """
+    table = analytics_table(scope)
     if engine is None:
         from api.dependencies import get_db_engine
         engine = get_db_engine()
@@ -191,7 +214,7 @@ def get_actor_analytics(actor_id: str, engine: Engine | None = None) -> dict | N
                 "SELECT actor_id, pagerank, community_id, betweenness, "
                 "eigenvector, degree_centrality, hub_score, authority_score, "
                 "computed_at "
-                "FROM actor_analytics WHERE actor_id = :aid"
+                f"FROM {table} WHERE actor_id = :aid"
             ),
             {"aid": actor_id},
         ).fetchone()
@@ -212,9 +235,10 @@ def get_actor_analytics(actor_id: str, engine: Engine | None = None) -> dict | N
 
 
 def get_community_members(
-    community_id: int, limit: int = 50, engine: Engine | None = None
+    community_id: int, limit: int = 50, engine: Engine | None = None, scope: str = "full"
 ) -> list[dict]:
     """Get all actors in a community, ordered by PageRank descending."""
+    table = analytics_table(scope)
     if engine is None:
         from api.dependencies import get_db_engine
         engine = get_db_engine()
@@ -224,7 +248,7 @@ def get_community_members(
             text(
                 "SELECT aa.actor_id, a.name, a.category, aa.pagerank, "
                 "aa.betweenness, aa.eigenvector, aa.hub_score, aa.authority_score "
-                "FROM actor_analytics aa "
+                f"FROM {table} aa "
                 "JOIN actors a ON aa.actor_id = a.id "
                 "WHERE aa.community_id = :cid "
                 "ORDER BY aa.pagerank DESC "
@@ -249,7 +273,7 @@ def get_community_members(
 
 
 def get_top_actors(
-    metric: str = "pagerank", limit: int = 20, engine: Engine | None = None
+    metric: str = "pagerank", limit: int = 20, engine: Engine | None = None, scope: str = "full"
 ) -> list[dict]:
     """Get top actors by any analytics metric.
 
@@ -260,16 +284,18 @@ def get_top_actors(
         raise ValueError(
             f"Invalid metric '{metric}'. Must be one of: {sorted(_VALID_METRICS)}"
         )
+    table = analytics_table(scope)
 
     if engine is None:
         from api.dependencies import get_db_engine
         engine = get_db_engine()
 
-    # metric is validated against _VALID_METRICS so safe for column reference
+    # metric is validated against _VALID_METRICS and table against
+    # ANALYTICS_TABLES, so both are safe as identifiers
     sql = (
         "SELECT aa.actor_id, a.name, a.category, "
         f"aa.{metric}, aa.community_id, aa.pagerank "
-        "FROM actor_analytics aa "
+        f"FROM {table} aa "
         "JOIN actors a ON aa.actor_id = a.id "
         f"ORDER BY aa.{metric} DESC "
         "LIMIT :lim"
@@ -291,51 +317,83 @@ def get_top_actors(
     ]
 
 
-def get_community_list(engine: Engine | None = None) -> list[dict]:
-    """Get all communities with member counts and top member."""
+def get_community_list(
+    engine: Engine | None = None, scope: str = "full", limit: int | None = None
+) -> list[dict]:
+    """Get communities with member counts and top member, largest first.
+
+    One query: a GROUP BY for counts joined to a DISTINCT ON pick of the
+    top-PageRank member per community (the previous version issued one
+    extra query per community, a 44K-query N+1 on the full graph).
+    """
+    table = analytics_table(scope)
+    if engine is None:
+        from api.dependencies import get_db_engine
+        engine = get_db_engine()
+
+    sql = f"""
+        WITH agg AS (
+            SELECT community_id,
+                   COUNT(*)                     AS member_count,
+                   COALESCE(MAX(pagerank), 0)   AS max_pagerank
+            FROM {table}
+            WHERE community_id IS NOT NULL
+            GROUP BY community_id
+        ),
+        top AS (
+            SELECT DISTINCT ON (aa.community_id)
+                   aa.community_id, a.name, a.category
+            FROM {table} aa
+            JOIN actors a ON a.id = aa.actor_id
+            WHERE aa.community_id IS NOT NULL
+            ORDER BY aa.community_id, aa.pagerank DESC NULLS LAST
+        )
+        SELECT agg.community_id, agg.member_count, agg.max_pagerank, top.name, top.category
+        FROM agg
+        LEFT JOIN top ON top.community_id = agg.community_id
+        ORDER BY agg.member_count DESC, agg.community_id
+    """
+    params: dict[str, Any] = {}
+    if limit is not None:
+        sql += " LIMIT :lim"
+        params["lim"] = int(limit)
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(sql), params).fetchall()
+
+    return [
+        {
+            "community_id": r[0],
+            "member_count": int(r[1]),
+            "max_pagerank": float(r[2] or 0),
+            "top_member": r[3],
+            "top_category": r[4],
+        }
+        for r in rows
+    ]
+
+
+def get_community_category_mix(
+    community_id: int, limit: int = 5, engine: Engine | None = None, scope: str = "full"
+) -> list[dict]:
+    """Dominant actor categories in a community: ``[{category, count}, ...]``."""
+    table = analytics_table(scope)
     if engine is None:
         from api.dependencies import get_db_engine
         engine = get_db_engine()
 
     with engine.connect() as conn:
-        rows = conn.execute(text("""
-            SELECT aa.community_id,
-                   COUNT(*) AS member_count,
-                   MAX(aa.pagerank) AS max_pagerank
-            FROM actor_analytics aa
-            WHERE aa.community_id IS NOT NULL
-            GROUP BY aa.community_id
-            ORDER BY member_count DESC
-        """)).fetchall()
-
-    communities = []
-    for r in rows:
-        cid = r[0]
-        count = r[1]
-        max_pr = float(r[2] or 0)
-
-        # Get the top member name for labeling
-        with engine.connect() as conn:
-            top = conn.execute(
-                text(
-                    "SELECT a.name, a.category "
-                    "FROM actor_analytics aa "
-                    "JOIN actors a ON aa.actor_id = a.id "
-                    "WHERE aa.community_id = :cid "
-                    "ORDER BY aa.pagerank DESC LIMIT 1"
-                ),
-                {"cid": cid},
-            ).fetchone()
-
-        communities.append({
-            "community_id": cid,
-            "member_count": count,
-            "max_pagerank": max_pr,
-            "top_member": top[0] if top else None,
-            "top_category": top[1] if top else None,
-        })
-
-    return communities
+        rows = conn.execute(
+            text(
+                "SELECT a.category, COUNT(*) AS n "
+                f"FROM {table} aa "
+                "JOIN actors a ON a.id = aa.actor_id "
+                "WHERE aa.community_id = :cid "
+                "GROUP BY a.category ORDER BY n DESC LIMIT :lim"
+            ),
+            {"cid": community_id, "lim": limit},
+        ).fetchall()
+    return [{"category": r[0], "count": int(r[1])} for r in rows]
 
 
 def _parse_agtype(val: Any) -> Any:

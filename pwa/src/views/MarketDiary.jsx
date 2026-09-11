@@ -4,6 +4,9 @@ import { api } from '../api.js';
 import { shared, colors } from '../styles/shared.js';
 import ViewHelp from '../components/ViewHelp.jsx';
 import { formatMonthYear, formatLongDate, formatDateTime } from '../utils/formatTime.js';
+import { useAsyncData } from '../hooks/useAsyncData.js';
+import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
+import ErrorState from '../components/ErrorState.jsx';
 
 /* ── Markdown renderer ──────────────────────────────────────── */
 
@@ -358,10 +361,8 @@ const s = {
 /* ── Main Component ────────────────────────────────────────── */
 
 export default function MarketDiary() {
-    const [entries, setEntries] = useState([]);
     const [selectedDate, setSelectedDate] = useState(null);
     const [currentEntry, setCurrentEntry] = useState(null);
-    const [loading, setLoading] = useState(true);
     const [entryLoading, setEntryLoading] = useState(false);
     const [searchTerm, setSearchTerm] = useState('');
     const [searchResults, setSearchResults] = useState(null);
@@ -375,19 +376,15 @@ export default function MarketDiary() {
     }, []);
 
     // Load entry list
-    useEffect(() => {
-        setLoading(true);
-        api.getDiaryList(365)
-            .then(data => {
-                setEntries(data.entries || []);
-                // Auto-select the most recent entry
-                if (data.entries?.length > 0 && !selectedDate) {
-                    setSelectedDate(data.entries[0].date);
-                }
-            })
-            .catch(() => setEntries([]))
-            .finally(() => setLoading(false));
-    }, []);
+    const { data: entries, loading, error, refetch: reloadEntries } = useAsyncData(async () => {
+        const data = await api.getDiaryList(365);
+        const list = data.entries || [];
+        // Auto-select the most recent entry
+        if (list.length > 0 && !selectedDate) {
+            setSelectedDate(list[0].date);
+        }
+        return list;
+    }, { fallback: [] });
 
     // Load selected entry
     useEffect(() => {
@@ -416,8 +413,7 @@ export default function MarketDiary() {
                 if (data.date) {
                     setSelectedDate(data.date);
                     // Refresh entry list
-                    api.getDiaryList(365)
-                        .then(d => setEntries(d.entries || []));
+                    reloadEntries();
                 }
             })
             .finally(() => setGenerating(false));
@@ -446,10 +442,18 @@ export default function MarketDiary() {
         'Click "Generate Today" to manually trigger the current day\'s diary.',
     ];
 
-    if (loading) {
+    if (loading && !entries.length) {
         return (
             <div style={s.container}>
-                <div style={s.empty}>Loading market diary...</div>
+                <LoadingSkeleton variant="card" count={4} />
+            </div>
+        );
+    }
+
+    if (error) {
+        return (
+            <div style={s.container}>
+                <ErrorState error={error} onRetry={reloadEntries} title="Market diary unavailable" />
             </div>
         );
     }
