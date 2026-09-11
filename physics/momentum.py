@@ -7,6 +7,14 @@ Computes physics-inspired momentum metrics from GDELT sentiment features:
   - Kinetic energy of sentiment (rate of change squared)
   - Cross-correlation with price features (sentiment-price coupling)
 
+The tone signal is a composite (row-mean) across the named-actor tone
+features that ingestion/altdata/gdelt.py::GDELTPuller.pull_recent actually
+writes every scheduled cycle (gdelt_actor_*_tone), and the "conflict" signal
+is a composite across its country-tension features (gdelt_tension_*). A
+single actor or country pair can go quiet on any given day (GDELT DOC API
+queries fail independently), so averaging across the whole named set is
+more robust than pinning the read to one series.
+
 Uses PIT-correct data retrieval to prevent lookahead bias.
 """
 
@@ -33,6 +41,8 @@ class MomentumResult:
     sentiment_trend: str  # "rising", "falling", "neutral", "unavailable"
     momentum_direction: str  # "accelerating", "decelerating", "stable", "unavailable"
     energy_state: str  # "high", "medium", "low", "unavailable"
+    direction: str  # "bullish", "bearish", "mixed", "unavailable" — plain-English tone
+    summary: str
     details: dict[str, Any]
     warnings: list[str]
 
@@ -42,13 +52,37 @@ class MomentumResult:
             "sentiment_trend": self.sentiment_trend,
             "momentum_direction": self.momentum_direction,
             "energy_state": self.energy_state,
+            "direction": self.direction,
+            "summary": self.summary,
             "details": self.details,
             "warnings": self.warnings,
         }
 
 
-# GDELT feature names expected in feature_registry
-GDELT_FEATURES = ["gdelt_tone_usa", "gdelt_conflict_global"]
+# GDELT actor-tone features: named heads of state / central bankers whose
+# media tone GDELTPuller._pull_actor_tones() tracks. Composite tone signal.
+GDELT_ACTOR_TONE_FEATURES = [
+    "gdelt_actor_powell_tone",
+    "gdelt_actor_lagarde_tone",
+    "gdelt_actor_xi_tone",
+    "gdelt_actor_putin_tone",
+    "gdelt_actor_mbs_tone",
+    "gdelt_actor_yellen_tone",
+    "gdelt_actor_ueda_tone",
+]
+
+# GDELT country-pair tension features: GDELTPuller._pull_tension_scores().
+# Composite "conflict" signal (higher = more negative-tone volume between
+# the pair).
+GDELT_TENSION_FEATURES = [
+    "gdelt_tension_us_china",
+    "gdelt_tension_us_russia",
+    "gdelt_tension_us_iran",
+    "gdelt_tension_china_taiwan",
+    "gdelt_tension_russia_ukraine",
+    "gdelt_tension_israel_iran",
+    "gdelt_tension_india_china",
+]
 PRICE_FEATURES = ["sp500_close"]
 
 
@@ -86,29 +120,26 @@ class NewsMomentumAnalyzer:
         warnings: list[str] = []
         details: dict[str, Any] = {"as_of_date": as_of_date.isoformat()}
 
-        # Resolve feature IDs for GDELT features
-        gdelt_ids = self._resolve_feature_ids(GDELT_FEATURES)
-        if not gdelt_ids:
-            log.warning("No GDELT features found in feature_registry")
-            return MomentumResult(
-                available=False,
-                sentiment_trend="unavailable",
-                momentum_direction="unavailable",
-                energy_state="unavailable",
-                details={
-                    "note": "GDELT features not found in feature_registry. "
-                    "Ensure gdelt_tone_usa and/or gdelt_conflict_global are ingested.",
-                    "as_of_date": as_of_date.isoformat(),
-                },
-                warnings=["No GDELT sentiment features registered"],
+        # Resolve feature IDs for the GDELT actor-tone composite
+        tone_ids = self._resolve_feature_ids(GDELT_ACTOR_TONE_FEATURES)
+        if not tone_ids:
+            log.warning("No GDELT actor-tone features found in feature_registry")
+            return self._unavailable_result(
+                as_of_date,
+                note=(
+                    "GDELT actor-tone features not found in feature_registry. "
+                    "Ensure GDELTPuller.pull_recent is scheduled and its "
+                    "gdelt_actor_*_tone features are registered."
+                ),
+                warning="No GDELT actor-tone features registered",
             )
 
         # Get PIT-correct sentiment data
         start_date = as_of_date - timedelta(days=lookback_days)
-        feature_ids = list(gdelt_ids.values())
+        tone_feature_ids = list(tone_ids.values())
 
         matrix = self.pit_store.get_feature_matrix(
-            feature_ids=feature_ids,
+            feature_ids=tone_feature_ids,
             start_date=start_date,
             end_date=as_of_date,
             as_of_date=as_of_date,
@@ -116,41 +147,26 @@ class NewsMomentumAnalyzer:
         )
 
         if matrix.empty or matrix.shape[0] < 5:
-            return MomentumResult(
-                available=False,
-                sentiment_trend="unavailable",
-                momentum_direction="unavailable",
-                energy_state="unavailable",
-                details={
-                    "note": "Insufficient GDELT data for momentum analysis",
+            return self._unavailable_result(
+                as_of_date,
+                note="Insufficient GDELT data for momentum analysis",
+                warning="Insufficient GDELT data (need at least 5 observations)",
+                extra_details={
                     "rows_available": matrix.shape[0] if not matrix.empty else 0,
-                    "as_of_date": as_of_date.isoformat(),
                 },
-                warnings=["Insufficient GDELT data (need at least 5 observations)"],
             )
 
         details["data_points"] = matrix.shape[0]
-        details["features_available"] = list(gdelt_ids.keys())
+        details["features_available"] = list(tone_ids.keys())
 
-        # Use the primary tone feature (gdelt_tone_usa preferred)
-        tone_id = gdelt_ids.get("gdelt_tone_usa") or next(iter(gdelt_ids.values()))
-        tone_col = tone_id
-        if tone_col not in matrix.columns:
-            # Fall back to first available column
-            tone_col = matrix.columns[0]
-
-        tone_series = matrix[tone_col].dropna()
+        # Composite tone: average across whichever actor-tone columns have
+        # data on a given date (any one actor query can come back empty).
+        tone_series = matrix[list(tone_ids.values())].mean(axis=1, skipna=True).dropna()
         if len(tone_series) < 5:
-            return MomentumResult(
-                available=False,
-                sentiment_trend="unavailable",
-                momentum_direction="unavailable",
-                energy_state="unavailable",
-                details={
-                    "note": "Insufficient non-null tone data",
-                    "as_of_date": as_of_date.isoformat(),
-                },
-                warnings=["Too few non-null GDELT tone observations"],
+            return self._unavailable_result(
+                as_of_date,
+                note="Insufficient non-null tone data",
+                warning="Too few non-null GDELT tone observations",
             )
 
         # 1) Sentiment trend: linear regression slope over lookback
@@ -180,22 +196,122 @@ class NewsMomentumAnalyzer:
         else:
             details["cross_correlation"] = {"note": "No price features available"}
 
-        # Conflict feature analysis (if available)
-        conflict_id = gdelt_ids.get("gdelt_conflict_global")
-        if conflict_id is not None and conflict_id in matrix.columns:
-            conflict_series = matrix[conflict_id].dropna()
-            if len(conflict_series) >= 5:
-                conflict_energy = self._compute_energy(conflict_series)
-                details["conflict_energy"] = conflict_energy
+        # 5) Conflict/tension composite (optional — degrades gracefully)
+        tension_ids = self._resolve_feature_ids(GDELT_TENSION_FEATURES)
+        conflict_energy: dict[str, Any] | None = None
+        if tension_ids:
+            tension_matrix = self._load_matrix(
+                list(tension_ids.values()), start_date, as_of_date
+            )
+            if not tension_matrix.empty:
+                tension_series = (
+                    tension_matrix[list(tension_ids.values())]
+                    .mean(axis=1, skipna=True)
+                    .dropna()
+                )
+                if len(tension_series) >= 5:
+                    conflict_energy = self._compute_energy(tension_series)
+                    details["conflict_energy"] = conflict_energy
+                    details["tension_features_available"] = list(tension_ids.keys())
+
+        summary = self._build_summary(
+            sentiment_trend, momentum_direction, energy_state, conflict_energy,
+        )
 
         return MomentumResult(
             available=True,
             sentiment_trend=sentiment_trend,
             momentum_direction=momentum_direction,
             energy_state=energy_state,
+            direction=self._trend_to_direction(sentiment_trend),
+            summary=summary,
             details=details,
             warnings=warnings,
         )
+
+    @staticmethod
+    def _trend_to_direction(sentiment_trend: str) -> str:
+        """Map the physics trend label to the plain bull/bear word the
+        stepdad.finance home page's plainSentiment() helper recognizes
+        (pwa/src/components/home/plain.js — matches /bull|.../ and
+        /bear|.../ substrings), so the news card's mood badge reflects
+        actual tone instead of always falling through to its neutral
+        default."""
+        return {"rising": "bullish", "falling": "bearish", "neutral": "mixed"}.get(
+            sentiment_trend, "unavailable"
+        )
+
+    def _unavailable_result(
+        self,
+        as_of_date: date,
+        note: str,
+        warning: str,
+        extra_details: dict[str, Any] | None = None,
+    ) -> MomentumResult:
+        """Build the standard 'no data' MomentumResult, DRYing up the early returns."""
+        details = {"note": note, "as_of_date": as_of_date.isoformat()}
+        if extra_details:
+            details.update(extra_details)
+        return MomentumResult(
+            available=False,
+            sentiment_trend="unavailable",
+            momentum_direction="unavailable",
+            energy_state="unavailable",
+            direction="unavailable",
+            summary="News momentum isn't available right now — check back shortly.",
+            details=details,
+            warnings=[warning],
+        )
+
+    def _load_matrix(
+        self, feature_ids: list[int], start_date: date, as_of_date: date
+    ) -> pd.DataFrame:
+        """Fetch a PIT-correct feature matrix, swallowing lookup errors as empty."""
+        if not feature_ids:
+            return pd.DataFrame()
+        try:
+            return self.pit_store.get_feature_matrix(
+                feature_ids=feature_ids,
+                start_date=start_date,
+                end_date=as_of_date,
+                as_of_date=as_of_date,
+                vintage_policy="LATEST_AS_OF",
+            )
+        except Exception as exc:
+            log.warning("Failed to load feature matrix: {e}", e=str(exc))
+            return pd.DataFrame()
+
+    @staticmethod
+    def _build_summary(
+        sentiment_trend: str,
+        momentum_direction: str,
+        energy_state: str,
+        conflict_energy: dict[str, Any] | None,
+    ) -> str:
+        """Plain-English one-liner describing the current news momentum state."""
+        trend_words = {
+            "rising": "News tone toward major economic and policy actors is improving",
+            "falling": "News tone toward major economic and policy actors is worsening",
+            "neutral": "News tone toward major economic and policy actors is steady",
+        }
+        parts = [trend_words.get(sentiment_trend, "News tone is mixed")]
+
+        if momentum_direction == "accelerating":
+            parts.append("and moving quickly")
+        elif momentum_direction == "decelerating":
+            parts.append("and losing steam")
+
+        if energy_state == "high":
+            parts.append("— headline activity is elevated")
+        elif energy_state == "low":
+            parts.append("— it's a quiet news cycle")
+
+        sentence = " ".join(parts) + "."
+
+        if conflict_energy and conflict_energy.get("state") == "high":
+            sentence += " Geopolitical tension chatter is elevated too."
+
+        return sentence
 
     # ------------------------------------------------------------------
     # Internal computations

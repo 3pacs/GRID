@@ -2,6 +2,30 @@
 
 Append-only running log for GRID system work.
 
+## 2026-09-11 - alien self-hosted CI runner for GRID activated (handoff-09), TEST_RUNNER left unset pending WSL keep-alive
+
+What was done:
+
+- Registered runner `alien` (labels `self-hosted, alien, tests`) for 3pacs/GRID inside the Dell's `GitHubActions` WSL2 distro: `/opt/github-actions/GRID/alien`, unit `actions.runner.3pacs-GRID.alien.service` (drop-in: egress guard, `user@1000`, rootless `DOCKER_HOST`, `TZ=UTC`). Installed PostgreSQL 15.19 + TimescaleDB 2.28.3 as a persistent service, `grid/testpass/griddb_test`, cluster + DB pinned to UTC; Python 3.11 (deadsnakes), build-essential, libpq-dev.
+- Verified on alien via PR #450: Frontend Build 1m26s green, Lint 1m56s green, Backend Tests ran all 8,061 tests in 14m12s with `Reset persistent Postgres (alien)` executed and the ephemeral-Postgres step skipped (ON_ALIEN true). Fallback verified: deleting `TEST_RUNNER` and re-running sends the jobs back to `ubuntu-latest` (run 34544223388, green).
+- Fixed two alien-only failures: `test_regime_history_writer` off-by-one day (Postgres was America/Los_Angeles; now UTC) and `TestGauntlet::test_run_gauntlet` needing ~90 s on the E5-2698 v3 (`test.yml`: pytest `--timeout` 60 -> 180, backend `timeout-minutes` 15 -> 25).
+- Rewrote the `docs/SERVER-SERVICES.md` "Alien Runner" section with the real install path (WSL2 layout, pgdg/Timescale repos and package names, missing `svc.sh` in the 2.337.0 tarball, MSYS path-conversion gotcha, UTC pin, measured timings).
+
+Non-obvious decisions:
+
+- **`TEST_RUNNER` is deliberately unset.** The documented boot contract (Windows scheduled task `GitHubActions-WSL-Start`) does not exist on alien, so the distro idles out ~1 min after the last `wsl.exe` session and every Linux runner on the box goes offline (all 19 siblings were offline on 2026-09-10 for this reason). With the variable set that blocks CI repo-wide and cancels foreign PRs' jobs mid-run. Creating the task needs an operator's elevated PowerShell on alien; the exact snippet is in SERVER-SERVICES.md. Flip `gh variable set TEST_RUNNER --body alien -R 3pacs/GRID` only after `wsl.exe -l -v` says Running unattended.
+- Did not replace the distro's system Node 22 with Node 20 (shared with sibling runners); `actions/setup-node`/`setup-python` provision 20 / 3.11 into the runner tool cache.
+- deploy.yml, ops-exec.yml, gemini-task.yml, ops-bringup.yml untouched; alien has no deploy credentials.
+
+Broken or TBD:
+
+- Backend Tests on alien is ~2x slower than hosted (single-process pytest on a 2014 Xeon). Needs `pytest-xdist` with per-worker DB isolation to meet the handoff's 4-minute bar.
+- A second consecutive alien run with warm cache was not completed because the distro cannot be kept alive without the scheduled task.
+
+Next pick-up:
+
+- Operator: create `GitHubActions-WSL-Start` on alien (snippet in SERVER-SERVICES.md), confirm `wsl.exe -l -v` Running and all runners online, then set `TEST_RUNNER=alien` and watch the next two PRs' test jobs.
+
 ## 2026-05-30 - stepdad.finance: natural-language home composer (Phase 1, LIVE)
 
 What was done:

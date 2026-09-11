@@ -9,6 +9,7 @@ to suggest mappings for unmapped series.
 from __future__ import annotations
 
 import difflib
+import re
 from typing import Any
 
 from loguru import logger as log
@@ -217,6 +218,24 @@ SEED_MAPPINGS: dict[str, str] = {
     "gdelt_tone_usa": "gdelt_tone_usa",
     "gdelt_event_count": "gdelt_event_count",
 
+    # ── GDELT actor tones + country tensions (GDELTPuller.pull_recent,
+    # scheduled in ingestion/scheduler.py; physics/momentum.py reads these
+    # as a composite for the stepdad.finance news card) ────────────────────
+    "gdelt_actor_powell_tone": "gdelt_actor_powell_tone",
+    "gdelt_actor_lagarde_tone": "gdelt_actor_lagarde_tone",
+    "gdelt_actor_xi_tone": "gdelt_actor_xi_tone",
+    "gdelt_actor_putin_tone": "gdelt_actor_putin_tone",
+    "gdelt_actor_mbs_tone": "gdelt_actor_mbs_tone",
+    "gdelt_actor_yellen_tone": "gdelt_actor_yellen_tone",
+    "gdelt_actor_ueda_tone": "gdelt_actor_ueda_tone",
+    "gdelt_tension_us_china": "gdelt_tension_us_china",
+    "gdelt_tension_us_russia": "gdelt_tension_us_russia",
+    "gdelt_tension_us_iran": "gdelt_tension_us_iran",
+    "gdelt_tension_china_taiwan": "gdelt_tension_china_taiwan",
+    "gdelt_tension_russia_ukraine": "gdelt_tension_russia_ukraine",
+    "gdelt_tension_israel_iran": "gdelt_tension_israel_iran",
+    "gdelt_tension_india_china": "gdelt_tension_india_china",
+
     # ── Supply chain series (stored with feature name as series_id) ────────
     "supply_chain.ism_deliveries": "supply_chain.ism_deliveries",
     "supply_chain.ism_backlog": "supply_chain.ism_backlog",
@@ -286,7 +305,11 @@ SEED_MAPPINGS: dict[str, str] = {
     # ── CNN Fear & Greed (prefix: feargreed.) ─────────────────────────────
     "feargreed.cnn_value": "feargreed_cnn_value",
     "feargreed.cnn_previous_close": "feargreed_cnn_previous_close",
-    "feargreed.crypto_value": "feargreed_crypto_value",
+    # TYPO-FIX 2026-09-11: feargreed_crypto_value has no feature_registry row
+    # (verified on griddb), so this mapping resolved to None and every one of
+    # the ~30 rows/30d this puller writes was dropped. crypto_fear_greed
+    # (registry id 199) is the registered feature for exactly this series.
+    "feargreed.crypto_value": "crypto_fear_greed",
 
     # ── Philadelphia Fed ADS Index ────────────────────────────────────────
     "ads.business_conditions_index": "ads_business_conditions",
@@ -621,6 +644,24 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "YF:ETH-USD:volume": "eth_total_volume",
     "YF:SOL-USD:volume": "sol_total_volume",
     "YF:BTC-USD:volume": "btc_total_volume",
+
+    # ── Crypto spot prices (2026-09-11) ───────────────────────────────────
+    # The *volume* series above were mapped; the prices never were, so
+    # YF:BTC-USD:close and YF:ETH-USD:close have been landing in raw_series
+    # daily (31 rows each in the 30 d to 2026-09-11, newest 2026-09-11) and
+    # going nowhere. Their features already exist: btc_usd_full id=2787,
+    # eth_usd_full id=2788, sol_usd_full id=2789 (verified on griddb), so
+    # these are mappings only, no feature_registry insert needed.
+    "YF:BTC-USD:close": "btc_usd_full",
+    "YF:BTC-USD:adj_close": "btc_usd_full",
+    "YF:ETH-USD:close": "eth_usd_full",
+    "YF:ETH-USD:adj_close": "eth_usd_full",
+    # SOL is pre-positioned, not a live win: sol_usd_full is registered but
+    # YF:SOL-USD:close had 0 rows in the 30 d to 2026-09-11 — the puller is
+    # not currently producing it. Mapping it now is inert and becomes correct
+    # the moment it does, rather than being a second thing to remember.
+    "YF:SOL-USD:close": "sol_usd_full",
+    "YF:SOL-USD:adj_close": "sol_usd_full",
     "YF:TAO-USD:close": "tao_chain_market_cap",
     "YF:TAO-USD:volume": "tao_chain_total_volume",
     "YF:BRK-B:close": "brk-b_full",
@@ -854,15 +895,132 @@ NEW_MAPPINGS_V2: dict[str, str] = {
 }
 
 
+# ── Dynamic pattern resolution for per-ticker yfinance OHLCV ──────────────
+#
+# The yfinance pullers emit one series per ticker *per field*:
+#   YF:<TICKER>:<field>   field in {open, high, low, close, volume, adj_close}
+#
+# Enumerating those by hand costs ~6 dict lines per ticker (~5,000 lines for
+# the current universe), which is why ~650k rows — 60%+ of all unmapped
+# volume — sat unresolved.  Instead we derive candidate feature names from
+# the conventions the static dicts already use (see the ``_full`` / ``_close``
+# comprehensions at the end of NEW_MAPPINGS_V2) and accept a candidate ONLY
+# if feature_registry actually has it.
+#
+# This is a FALLBACK: an exact static mapping always wins, so nothing that
+# resolves today can change.  A derived name that is not registered is never
+# returned — returning one would recreate the "ghost mapping" failure mode
+# that migrations 0062/0063 had to clean up: a mapping that looks resolved
+# while silently dropping every row.
+
+# Sentinel for the pattern cache.  A cached *miss* is stored as None, so
+# "absent from the cache" needs a value None cannot collide with.
+_PATTERN_CACHE_MISS: object = object()
+
+_YF_SERIES_RE = re.compile(
+    r"^YF:(?P<ticker>[^:]+):(?P<field>open|high|low|close|volume|adj_close)$"
+)
+
+# Candidate name suffixes per field, most-canonical first.  Every suffix here
+# is a convention already present in SEED_MAPPINGS / NEW_MAPPINGS_V2:
+#   *_full          — sp500_full, tlt_full, btc_usd_full, the *_full comprehensions
+#   *_close         — smh_close, icln_close, lit_close, cl_close, uup_etf_close
+#   *_total_volume  — btc_total_volume, eth_total_volume, sol_total_volume
+# Price fields never list a volume suffix and vice versa, so a close can
+# never land on a volume feature.
+_YF_FIELD_SUFFIXES: dict[str, tuple[str, ...]] = {
+    "adj_close": ("_full", "_close", "_adj_close"),
+    "close": ("_full", "_close"),
+    "open": ("_open",),
+    "high": ("_high",),
+    "low": ("_low",),
+    "volume": ("_volume", "_total_volume"),
+}
+
+# Hard ceiling on derived names tested for one series_id.  Keeps the list
+# bounded and obvious; every candidate is a dict lookup, never a query.
+_YF_MAX_CANDIDATES = 12
+
+
+def yf_ticker_stems(ticker: str) -> list[str]:
+    """Return the feature-name stems a yfinance ticker can map onto.
+
+    Ordered most-literal first and de-duplicated.  The variants mirror
+    conventions already present in the static dicts::
+
+        AAPL    -> aapl                   (the *_full comprehensions)
+        CL=F    -> cl=f, cl               (YF:CL=F:close -> cl_close)
+        ^GSPC   -> ^gspc, gspc            (yfinance index prefix)
+        BTC-USD -> btc-usd, btc_usd       (YF:BTC-USD:close -> btc_usd_full)
+
+    Parameters:
+        ticker: Raw ticker as it appears in the series_id (e.g. 'BRK-B').
+
+    Returns:
+        list[str]: Candidate stems, most-literal first, no duplicates.
+    """
+    stems: list[str] = []
+
+    def _add(stem: str) -> None:
+        if stem and stem not in stems:
+            stems.append(stem)
+
+    base = ticker.lower().strip()
+    _add(base)
+    # Strip yfinance syntax noise: '^' index prefix, '=F'/'=X' contract suffix.
+    cleaned = base.lstrip("^")
+    if cleaned.endswith("=f") or cleaned.endswith("=x"):
+        cleaned = cleaned[:-2]
+    _add(cleaned)
+    # Hyphenated tickers are registered with underscores (btc-usd -> btc_usd).
+    for stem in list(stems):
+        _add(stem.replace("-", "_"))
+    return stems
+
+
+def yf_candidate_feature_names(series_id: str) -> list[str]:
+    """Derive candidate feature names for a ``YF:<ticker>:<field>`` series_id.
+
+    Returns an empty list for anything that is not a yfinance OHLCV
+    series_id.  The names are candidates only — the caller MUST confirm each
+    one exists in feature_registry before using it.
+
+    Parameters:
+        series_id: Raw series identifier (e.g. 'YF:AAPL:adj_close').
+
+    Returns:
+        list[str]: Ordered, de-duplicated candidate feature names, capped at
+        ``_YF_MAX_CANDIDATES``.
+    """
+    match = _YF_SERIES_RE.match(series_id)
+    if match is None:
+        return []
+
+    suffixes = _YF_FIELD_SUFFIXES.get(match.group("field"), ())
+    candidates: list[str] = []
+    for stem in yf_ticker_stems(match.group("ticker")):
+        for suffix in suffixes:
+            name = f"{stem}{suffix}"
+            if name not in candidates:
+                candidates.append(name)
+    return candidates[:_YF_MAX_CANDIDATES]
+
+
 class EntityMap:
     """Maps raw series identifiers to feature registry entries.
 
     Uses the hardcoded SEED_MAPPINGS as a base and resolves
     feature_registry IDs from the database.
 
+    Exact static mappings always win.  Only on a static miss does the
+    dynamic ``YF:<ticker>:<field>`` pattern fallback run, and it resolves
+    only to feature names that are actually registered.
+
     Attributes:
         engine: SQLAlchemy engine for database lookups.
         _feature_cache: Cached mapping of feature name -> feature_registry.id.
+        _pattern_cache: Memoised pattern-fallback results per series_id,
+            including misses (None), so a repeated miss costs no lookup.
     """
 
     def __init__(self, db_engine: Engine) -> None:
@@ -881,6 +1039,9 @@ class EntityMap:
         # series_ids already warned about, and how many lookups each one
         # swallowed. Reported in bulk by missing_feature_report().
         self._miss_counts: dict[str, int] = {}
+        # series_id -> resolved id, or None for a confirmed miss.  Misses are
+        # cached too: this path misses constantly by design.
+        self._pattern_cache: dict[str, int | None] = {}
         self._load_feature_cache()
         self.load_v2_mappings()
         self._detect_duplicate_mappings()
@@ -903,10 +1064,19 @@ class EntityMap:
         # The cache is authoritative again, so previously-confirmed misses
         # get one more chance against the rows we just read.
         self._unregistered_features = set()
+        # Registry contents changed under us — previously-cached pattern
+        # misses may now resolve (and vice versa).
+        self._pattern_cache = {}
         log.debug("Feature cache loaded: {n} entries", n=len(self._feature_cache))
 
     def get_feature_id(self, series_id: str) -> int | None:
         """Resolve a raw series_id to a feature_registry.id.
+
+        Resolution order:
+            1. Exact static mapping (SEED_MAPPINGS, with V2 merged in).  This
+               always wins — nothing that resolves today can change.
+            2. On a static miss only, the ``YF:<ticker>:<field>`` pattern
+               fallback, which resolves solely to registered feature names.
 
         A miss is bounded work. Before 2026-09-11 every miss re-ran
         ``_load_feature_cache()`` (a full ``feature_registry`` SELECT) and
@@ -920,7 +1090,8 @@ class EntityMap:
         process: after one refresh confirms it absent it goes in
         ``_unregistered_features`` and later lookups return None from the
         cache alone. The warning is emitted once per series_id;
-        ``missing_feature_report()`` carries the totals.
+        ``missing_feature_report()`` carries the totals. A series_id the
+        pattern fallback resolves is not a miss and is not counted.
 
         Parameters:
             series_id: Raw series identifier (e.g. 'T10Y2Y', 'YF:^GSPC:close').
@@ -930,6 +1101,9 @@ class EntityMap:
         """
         feature_name = SEED_MAPPINGS.get(series_id)
         if feature_name is None:
+            pattern_id = self._resolve_by_pattern(series_id)
+            if pattern_id is not None:
+                return pattern_id
             self._record_miss(series_id)
             log.debug("No mapping found for series_id={sid}", sid=series_id)
             return None
@@ -988,6 +1162,64 @@ class EntityMap:
             "unregistered_features": sorted(self._unregistered_features),
             "top_series": [[sid, n] for sid, n in ranked[:10]],
         }
+
+    def _resolve_by_pattern(self, series_id: str) -> int | None:
+        """Fallback resolution for per-ticker yfinance OHLCV series_ids.
+
+        Runs only after an exact static mapping has missed.  Derives candidate
+        feature names from the repo's existing naming conventions (see
+        :func:`yf_candidate_feature_names`) and returns the first one present
+        in ``_feature_cache``.  A candidate that is not registered is never
+        returned — that would be a ghost mapping, which looks resolved but
+        drops every row (see migrations 0062 / 0063).
+
+        Results — hits and misses alike — are memoised per series_id, so a
+        repeated miss costs one dict lookup rather than a candidate walk, and
+        never a registry query.  The cache is cleared whenever
+        ``_load_feature_cache`` reloads the registry.
+
+        Parameters:
+            series_id: Raw series identifier that no static mapping covers.
+
+        Returns:
+            int: The feature_registry.id of the first registered candidate,
+            or None if this is not a yfinance OHLCV series_id or nothing
+            registered matches.
+        """
+        cached = self._pattern_cache.get(series_id, _PATTERN_CACHE_MISS)
+        if cached is not _PATTERN_CACHE_MISS:
+            return cached  # type: ignore[return-value]
+
+        candidates = yf_candidate_feature_names(series_id)
+        feature_id: int | None = None
+        resolved_name: str | None = None
+        for name in candidates:
+            fid = self._feature_cache.get(name)
+            if fid is not None:
+                feature_id, resolved_name = fid, name
+                break
+
+        self._pattern_cache[series_id] = feature_id
+
+        if feature_id is None or resolved_name is None:
+            if candidates:
+                # DEBUG, not warning: most tickers in the raw feed have no
+                # registered feature and never will.  Warning here would bury
+                # errors.jsonl under hundreds of thousands of non-events.
+                log.debug(
+                    "Pattern fallback found no registered feature for "
+                    "{sid} (tried: {cands})",
+                    sid=series_id,
+                    cands=", ".join(candidates),
+                )
+            return None
+
+        log.debug(
+            "Pattern-resolved {sid} -> {fn} (id={fid})",
+            sid=series_id, fn=resolved_name, fid=feature_id,
+        )
+        self._check_feature_freshness(resolved_name, feature_id)
+        return feature_id
 
     def _detect_duplicate_mappings(self) -> None:
         """Log warnings for raw_ids that appear in both SEED and V2 with

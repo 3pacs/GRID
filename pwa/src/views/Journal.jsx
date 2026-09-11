@@ -2,6 +2,9 @@ import React, { useEffect, useState } from 'react';
 import { api } from '../api.js';
 import useStore from '../store.js';
 import ViewHelp from '../components/ViewHelp.jsx';
+import { useAsyncData } from '../hooks/useAsyncData.js';
+import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
+import ErrorState from '../components/ErrorState.jsx';
 
 const styles = {
     container: { padding: '16px', paddingTop: 'calc(env(safe-area-inset-top, 0px) + 16px)' },
@@ -61,18 +64,16 @@ export default function Journal({ onNavigate }) {
     const [filter, setFilter] = useState('ALL');
 
     useEffect(() => {
-        loadEntries();
         api.getJournalStats().then(setJournalStats).catch(() => {});
     }, [filter]);
 
-    const loadEntries = async () => {
+    const { loading, error, refetch: loadEntries } = useAsyncData(async () => {
         const params = { limit: 50 };
         if (filter !== 'ALL') params.verdict = filter;
-        try {
-            const data = await api.getJournal(params);
-            setJournalEntries(data.entries || []);
-        } catch (e) { console.warn('[GRID] Journal:', e.message); }
-    };
+        const data = await api.getJournal(params);
+        if (data?.error) throw new Error(data.message || 'Failed to load journal');
+        setJournalEntries(data.entries || []);
+    }, { fallback: null, deps: [filter] });
 
     const stats = journalStats || {};
 
@@ -113,6 +114,12 @@ export default function Journal({ onNavigate }) {
                 ))}
             </div>
 
+            {loading && !journalEntries?.length ? (
+                <LoadingSkeleton variant="card" count={4} />
+            ) : error ? (
+                <ErrorState error={error} onRetry={loadEntries} title="Journal unavailable" />
+            ) : (
+            <>
             {journalEntries.map((entry, i) => {
                 const verdict = entry.verdict || 'PENDING';
                 const vc = verdictColors[verdict] || verdictColors.PENDING;
@@ -154,6 +161,8 @@ export default function Journal({ onNavigate }) {
                 <div style={{ color: '#5A7080', textAlign: 'center', padding: '40px', fontSize: '14px' }}>
                     No entries match filter
                 </div>
+            )}
+            </>
             )}
         </div>
     );

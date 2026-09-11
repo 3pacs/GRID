@@ -6,6 +6,7 @@ math, SSE frame parsing, secret redaction, and report rendering.
 
 from __future__ import annotations
 
+import argparse
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.smoke_dad_path import (
     FALLBACK_MASCOT_PATH,
+    Client,
     StepResult,
     as_of_age_days,
     compose_branch,
@@ -25,7 +27,9 @@ from scripts.smoke_dad_path import (
     iter_sse_events,
     redact_secrets,
     render_report,
+    step_composer,
     step_static,
+    step_widget_data,
     validate_widget_types,
     worst_status,
 )
@@ -320,6 +324,126 @@ class TestStepStaticMascotResolution:
 
         mascot_sub = next(s for s in result.data["substeps"] if s["name"] == "static:mascot")
         assert mascot_sub["status"] == "degraded"
+
+
+# ── step_composer / step_widget_data — auth-blocked grading ────────────────
+#
+# Every endpoint these two steps call requires a bearer token
+# (api.auth.require_auth). When mint_contributor_token() fails, the old
+# behavior sent unauthenticated requests anyway, got 401s back, and graded
+# them "broken" — indistinguishable from a real outage. These steps must
+# instead recognize "no token" up front and report "blocked" without ever
+# making the doomed requests. A token that mints but is rejected (401) is
+# still a real failure and must stay "broken".
+
+
+class TestStepComposerAuthGrading:
+    def test_blocked_when_no_token(self):
+        client = Client("http://x", token=None)
+        result = step_composer(client, 5000)
+        assert result.status == "blocked"
+        assert "no token" in result.note
+
+    def test_blocked_makes_no_requests(self):
+        client = FakeClient({})
+        client.token = None
+        result = step_composer(client, 5000)
+        assert result.status == "blocked"
+        assert client.requested_paths == []
+
+    def test_broken_on_401_with_token(self):
+        responses = {
+            "/api/v1/chat/compose": FakeHTTPResponse(401),
+            "/api/v1/chat/ask/stream": FakeHTTPResponse(401),
+        }
+        client = FakeClient(responses)
+        client.token = "fake-token"
+        result = step_composer(client, 5000)
+        assert result.status == "broken"
+
+
+class TestStepWidgetDataAuthGrading:
+    def test_blocked_when_no_token(self):
+        client = Client("http://x", token=None)
+        result = step_widget_data(client, 5000)
+        assert result.status == "blocked"
+        assert "no token" in result.note
+
+    def test_blocked_makes_no_requests(self):
+        client = FakeClient({})
+        client.token = None
+        result = step_widget_data(client, 5000)
+        assert result.status == "blocked"
+        assert client.requested_paths == []
+
+    def test_broken_on_401_with_token(self):
+        responses = {
+            "/api/v1/watchlist/AAPL/quote": FakeHTTPResponse(401),
+            "/api/v1/watchlist/TSLA/quote": FakeHTTPResponse(401),
+            "/api/v1/watchlist/GLD/quote": FakeHTTPResponse(401),
+            "/api/v1/flows/sectors": FakeHTTPResponse(401),
+            "/api/v1/alerts": FakeHTTPResponse(401),
+            "/api/v1/dad/ticker/AAPL/gold": FakeHTTPResponse(401),
+            "/api/v1/dad/ticker/AAPL/evidence": FakeHTTPResponse(401),
+            "/api/v1/dad/ticker/AAPL/chart": FakeHTTPResponse(401),
+            "/api/v1/dad/ticker/AAPL/options": FakeHTTPResponse(401),
+            "/api/v1/regime/current": FakeHTTPResponse(401),
+            "/api/v1/physics/momentum?lookback_days=63": FakeHTTPResponse(401),
+        }
+        client = FakeClient(responses)
+        client.token = "fake-token"
+        result = step_widget_data(client, 5000)
+        assert result.status == "broken"
+
+
+# ── run() — exit code when blocked ──────────────────────────────────────
+
+
+class TestRunExitCodeWhenBlocked:
+    def test_exit_code_2_when_auth_blocked(self, monkeypatch, tmp_path):
+        import scripts.smoke_dad_path as smoke
+
+        monkeypatch.setattr(smoke, "step_health", lambda client, budget_ms: StepResult("health", "ok"))
+        monkeypatch.setattr(
+            smoke, "step_static", lambda client, budget_ms, release_dir: StepResult("static", "ok")
+        )
+        monkeypatch.setattr(
+            smoke,
+            "mint_contributor_token",
+            lambda release_dir: (None, "token mint failed: GRID_JWT_SECRET must be set"),
+        )
+        monkeypatch.setattr(smoke, "step_freshness", lambda release_dir: StepResult("freshness", "ok"))
+        monkeypatch.setattr(smoke, "step_logs", lambda: StepResult("logs", "ok"))
+        monkeypatch.setattr(smoke, "step_deploy_tree", lambda release_dir: StepResult("deploy_tree", "ok"))
+
+        args = argparse.Namespace(base_url="http://x", release_dir=str(tmp_path), budget_ms=5000, strict=False)
+        exit_code, report, result = smoke.run(args)
+
+        assert exit_code == 2
+        statuses = {s["name"]: s["status"] for s in result["steps"]}
+        assert statuses["auth"] == "blocked"
+        assert statuses["composer"] == "blocked"
+        assert statuses["widget_data"] == "blocked"
+        assert "## Blocked items" in report
+
+    def test_exit_code_0_when_nothing_blocked_or_broken(self, monkeypatch, tmp_path):
+        import scripts.smoke_dad_path as smoke
+
+        monkeypatch.setattr(smoke, "step_health", lambda client, budget_ms: StepResult("health", "ok"))
+        monkeypatch.setattr(
+            smoke, "step_static", lambda client, budget_ms, release_dir: StepResult("static", "ok")
+        )
+        monkeypatch.setattr(smoke, "mint_contributor_token", lambda release_dir: ("real-token", "minted"))
+        monkeypatch.setattr(smoke, "step_composer", lambda client, budget_ms: StepResult("composer", "ok"))
+        monkeypatch.setattr(smoke, "step_widget_data", lambda client, budget_ms: StepResult("widget_data", "ok"))
+        monkeypatch.setattr(smoke, "step_freshness", lambda release_dir: StepResult("freshness", "ok"))
+        monkeypatch.setattr(smoke, "step_logs", lambda: StepResult("logs", "ok"))
+        monkeypatch.setattr(smoke, "step_deploy_tree", lambda release_dir: StepResult("deploy_tree", "ok"))
+
+        args = argparse.Namespace(base_url="http://x", release_dir=str(tmp_path), budget_ms=5000, strict=False)
+        exit_code, _report, _result = smoke.run(args)
+
+        assert exit_code == 0
 
 
 # ── worst_status ─────────────────────────────────────────────────────────

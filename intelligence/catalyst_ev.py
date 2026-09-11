@@ -145,6 +145,25 @@ EMPIRICAL_MIN_SAMPLES: int = 30
 BASIS_LITERATURE: str = "literature_prior"
 BASIS_EMPIRICAL: str = "grid_realized_outcomes"
 
+# ── Trade shape ───────────────────────────────────────────────────────────
+# EV and edge_vs_market answer different questions and a board that shows
+# only one of them misleads in opposite directions.
+#
+#   expected_value_multiple < 1.0  -> holding the EQUITY is negative EV. The
+#     net-cash floor on a busted biotech is near zero, so a failed readout
+#     takes almost everything; a 25% shot at 1.5x does not pay for that.
+#   edge_vs_market > 0             -> GRID's p_success exceeds the probability
+#     the option chain assigns the same move. Buying that tail with DEFINED
+#     RISK can be positive EV even when the equity is not, because the option
+#     caps the loss at premium while the equity does not.
+#
+# Those are compatible: most rows on a real board are TRADE_SHAPE_OPTION_TAIL.
+# Ranking by EV alone buries them; ranking by edge alone hides that the
+# underlying is a falling knife. Every ranked row now carries both.
+TRADE_SHAPE_EQUITY: str = "equity_or_option"      # EV > 1 and edge > 0
+TRADE_SHAPE_OPTION_TAIL: str = "defined_risk_option_only"  # edge > 0, EV <= 1
+TRADE_SHAPE_NONE: str = "no_trade"                # edge <= 0
+
 # ── Gates ─────────────────────────────────────────────────────────────────
 #
 # Runway must cover the catalyst plus a buffer. The buffer exists because a
@@ -839,6 +858,27 @@ def _fitted_base_rates(engine: Engine, as_of: date, notes: list[str]) -> tuple[d
     return None, BASIS_LITERATURE
 
 
+def classify_trade_shape(
+    *,
+    expected_value_multiple: float | None,
+    edge_vs_market: float | None,
+) -> str:
+    """Which instrument, if any, the two numbers actually support.
+
+    A negative edge is ``no_trade`` regardless of EV: without an edge over
+    the chain there is nothing to harvest. A positive edge with EV at or
+    below 1.0 is tradable only with defined risk, because the equity leg
+    loses money on these odds.
+    """
+    ev = _finite(expected_value_multiple)
+    edge = _finite(edge_vs_market)
+    if edge is None or edge <= 0.0:
+        return TRADE_SHAPE_NONE
+    if ev is not None and ev > 1.0:
+        return TRADE_SHAPE_EQUITY
+    return TRADE_SHAPE_OPTION_TAIL
+
+
 def build_catalyst_board(
     engine: Engine,
     *,
@@ -846,10 +886,22 @@ def build_catalyst_board(
     horizon_days: int = DEFAULT_HORIZON_DAYS,
     top_k: int = DEFAULT_TOP_K,
     tail_probability: float = 0.15,
+    rank_by: str = "edge_vs_market",
 ) -> dict[str, Any]:
-    """Rank dated catalysts by expected value, with the evidence attached.
+    """Rank dated catalysts by their edge over the chain, evidence attached.
 
-    Ranked on ``expected_value_multiple`` descending. A name is **ranked**
+    Ranked on ``rank_by`` descending — ``edge_vs_market`` by default, which
+    is the number this module has always said is the interesting one: an EV
+    built from the option chain's own upside anchor is close to
+    self-referential, while ``p_success - market_implied_probability`` is a
+    genuine disagreement with the market. Pass
+    ``rank_by="expected_value_multiple"`` for the previous ordering.
+
+    Every ranked row carries ``trade_shape`` (see ``classify_trade_shape``)
+    so a reader cannot mistake a name whose equity leg is negative EV for
+    one that is outright attractive. ``actionable`` mirrors it as a bool.
+
+    A name is **ranked**
     only when every leg is anchored — P(success), an upside from its own
     option chain, and a net-cash downside. Names missing a leg are returned
     under ``unranked`` with the reason, because "we cannot price this yet"
@@ -913,8 +965,39 @@ def build_catalyst_board(
             continue
         (ranked if row.get("expected_value_multiple") is not None else unranked).append(row)
 
-    ranked.sort(key=lambda r: (-float(r["expected_value_multiple"]), r["ticker"]))
+    for row in ranked:
+        shape = classify_trade_shape(
+            expected_value_multiple=row.get("expected_value_multiple"),
+            edge_vs_market=row.get("edge_vs_market"),
+        )
+        row["trade_shape"] = shape
+        row["actionable"] = shape != TRADE_SHAPE_NONE
+
+    if rank_by not in {"edge_vs_market", "expected_value_multiple"}:
+        notes.append(f"rank_by={rank_by!r} not recognised; ranked on edge_vs_market")
+        rank_by = "edge_vs_market"
+
+    def _key(r: dict[str, Any]) -> tuple[float, str]:
+        v = _finite(r.get(rank_by))
+        # Missing sort key sinks rather than crashes or floats to the top.
+        return (-(v if v is not None else float("-inf")), r["ticker"])
+
+    ranked.sort(key=_key)
     unranked.sort(key=lambda r: r["ticker"])
+
+    actionable_total = sum(1 for r in ranked if r["actionable"])
+    equity_ok = sum(1 for r in ranked if r["trade_shape"] == TRADE_SHAPE_EQUITY)
+    notes.append(
+        f"ranked on {rank_by} descending; {actionable_total}/{len(ranked)} carry a positive "
+        f"edge over the chain, of which {equity_ok} also clear EV > 1.0"
+    )
+    notes.append(
+        "trade_shape: expected_value_multiple <= 1.0 means the EQUITY leg is negative EV — "
+        "the net-cash floor is near zero, so a failed readout takes almost everything. A "
+        "positive edge_vs_market with EV <= 1.0 is tradable only with defined risk "
+        "(the option caps the loss at premium; the equity does not). Never read this board "
+        "as a buy-the-stock list."
+    )
 
     return {
         "as_of": as_of.isoformat(),
@@ -922,8 +1005,11 @@ def build_catalyst_board(
         "horizon_days": int(horizon_days),
         "p_success_basis": basis,
         "catalysts_considered": len(catalysts),
+        "rank_by": rank_by,
         "ranked": ranked[: max(1, int(top_k))],
         "ranked_total": len(ranked),
+        "actionable_total": actionable_total,
+        "equity_grade_total": equity_ok,
         "unranked": unranked,
         "unranked_reasons": _reason_counts(unranked),
         "method_notes": notes,
