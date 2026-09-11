@@ -2,9 +2,11 @@ import React, { useState, useEffect, useRef } from 'react';
 import { api } from '../api.js';
 import { shared, colors } from '../styles/shared.js';
 import ViewHelp from '../components/ViewHelp.jsx';
+import { useAsyncData } from '../hooks/useAsyncData.js';
+import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
+import ErrorState from '../components/ErrorState.jsx';
 
 export default function SystemLogs({ focusSource = '' }) {
-    const [logs, setLogs] = useState([]);
     const [source, setSource] = useState('api');
     const [autoRefresh, setAutoRefresh] = useState(false);
     const [config, setConfig] = useState(null);
@@ -13,10 +15,11 @@ export default function SystemLogs({ focusSource = '' }) {
     const [sourceFilter, setSourceFilter] = useState(focusSource || '');
     const intervalRef = useRef(null);
 
-    useEffect(() => {
-        loadLogs();
-        return () => clearInterval(intervalRef.current);
-    }, [source]);
+    const { data: logs, loading, error, refetch: loadLogs } = useAsyncData(async () => {
+        const result = await api.getLogs(source, 100);
+        if (result?.error) throw new Error(result.message || 'Failed to load logs');
+        return result.logs || result || [];
+    }, { fallback: [], deps: [source] });
 
     useEffect(() => {
         if (autoRefresh) {
@@ -36,13 +39,6 @@ export default function SystemLogs({ focusSource = '' }) {
             }
         }
     }, [focusSource]);
-
-    const loadLogs = async () => {
-        try {
-            const result = await api.getLogs(source, 100);
-            setLogs(result.logs || result || []);
-        } catch (e) { console.warn('[GRID] System:', e.message); }
-    };
 
     const loadConfig = async () => {
         try {
@@ -125,6 +121,11 @@ export default function SystemLogs({ focusSource = '' }) {
                         </div>
                     </div>
 
+                    {loading && !logs?.length ? (
+                        <LoadingSkeleton variant="card" count={4} />
+                    ) : error ? (
+                        <ErrorState error={error} onRetry={loadLogs} title="Logs unavailable" />
+                    ) : (
                     <div style={{
                         ...shared.prose,
                         maxHeight: '600px',
@@ -147,6 +148,7 @@ export default function SystemLogs({ focusSource = '' }) {
                             <div style={{ color: colors.textMuted }}>No logs available</div>
                         )}
                     </div>
+                    )}
                 </>
             )}
 
