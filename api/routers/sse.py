@@ -1,11 +1,20 @@
 """Server-Sent Events endpoint for real-time event streaming.
 
-Clients connect to ``GET /api/v1/events/stream`` and receive events
-from all GRID channels. Optional ``channels`` query param to filter.
+Clients connect to ``GET /api/v1/events/stream`` and receive events from
+every stream channel: the legacy ``grid_*`` set in ``events/channels.py``
+plus every typed contract channel (``grid_contracts_*``) from
+``contracts/channels.py``. Optional ``channels`` query param to filter.
+
+Until 2026-09-10 the stream subscribed only to the legacy set, which has no
+producers, so it carried the ``connected`` frame and keepalives and nothing
+else. The contracts layer is the backbone with real emitters (fifteen typed
+events, nine producers); ``contracts/emit.py`` now issues ``pg_notify`` in
+the same transaction as its audit write, and ``events/bus.py`` fans
+listener-delivered events out to subscribers registered with ``remote=True``.
 
 Example:
     curl -H "Authorization: Bearer <token>" \\
-         "https://grid.stepdad.finance/api/v1/events/stream?channels=grid_signal_fire,grid_regime_change"
+         "https://grid.stepdad.finance/api/v1/events/stream?channels=grid_contracts_signal_fired"
 """
 
 from __future__ import annotations
@@ -19,10 +28,24 @@ from fastapi.responses import StreamingResponse
 from loguru import logger as log
 
 from api.auth import require_auth
-from events.bus import bus
-from events.channels import ALL_CHANNELS, Event
+from events.bus import RecentEventIds, bus
+from events.channels import ALL_CHANNELS as LEGACY_CHANNELS, Event
+
+try:
+    from contracts.channels import ALL_CHANNELS as CONTRACT_CHANNELS
+except Exception as _contracts_exc:  # pragma: no cover — contracts layer is optional at import
+    log.warning("SSE: contract channels unavailable: {e}", e=str(_contracts_exc))
+    CONTRACT_CHANNELS: tuple[str, ...] = ()
+
+# Every channel the stream can carry, legacy first, de-duplicated, ordered.
+STREAM_CHANNELS: tuple[str, ...] = tuple(dict.fromkeys((*LEGACY_CHANNELS, *CONTRACT_CHANNELS)))
 
 router = APIRouter(prefix="/api/v1/events", tags=["events"])
+
+
+def _event_id_of(event: Event) -> Any:
+    payload = event.payload
+    return payload.get("event_id") if isinstance(payload, dict) else None
 
 
 @router.get("/stream")
@@ -35,22 +58,28 @@ async def event_stream(
     # Parse channel filter
     if channels:
         requested = set(ch.strip() for ch in channels.split(","))
-        listen_channels = tuple(ch for ch in requested if ch in ALL_CHANNELS)
+        listen_channels = tuple(ch for ch in STREAM_CHANNELS if ch in requested)
     else:
-        listen_channels = ALL_CHANNELS
+        listen_channels = STREAM_CHANNELS
 
     # Queue for this client's events
     queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=100)
+    # In-process emits arrive twice when this process is also the PG
+    # listener (direct fan-out + its own notify echo); drop the second.
+    recent = RecentEventIds()
 
     def on_event(event: Event) -> None:
+        if recent.seen_before(_event_id_of(event)):
+            return
         try:
             queue.put_nowait(event)
         except asyncio.QueueFull:
             pass  # Drop oldest-style: client is too slow
 
-    # Subscribe to requested channels
+    # Subscribe to requested channels — remote=True so contracts emitted in
+    # other processes (grid-hermes, grid-scheduler) reach the browser.
     for ch in listen_channels:
-        bus.subscribe(ch, on_event)
+        bus.subscribe(ch, on_event, remote=True)
 
     async def generate():
         try:
@@ -71,10 +100,7 @@ async def event_stream(
         finally:
             # Unsubscribe on disconnect
             for ch in listen_channels:
-                try:
-                    bus._subscribers[ch].remove(on_event)
-                except ValueError:
-                    pass
+                bus.unsubscribe(ch, on_event)
             log.debug("SSE client disconnected")
 
     return StreamingResponse(
@@ -94,8 +120,11 @@ async def list_channels(
 ) -> dict[str, Any]:
     """List all available event channels."""
     return {
-        "channels": list(ALL_CHANNELS),
-        "count": len(ALL_CHANNELS),
+        "channels": list(STREAM_CHANNELS),
+        "count": len(STREAM_CHANNELS),
+        "legacy": list(LEGACY_CHANNELS),
+        "contracts": list(CONTRACT_CHANNELS),
+        "listening": bus.listening,
     }
 
 

@@ -1,6 +1,9 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { api } from '../api.js';
 import { shared, colors, tokens } from '../styles/shared.js';
+import { useAsyncData } from '../hooks/useAsyncData.js';
+import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
+import ErrorState from '../components/ErrorState.jsx';
 
 // ── Styles ──────────────────────────────────────────────────────
 
@@ -496,25 +499,24 @@ function PerformanceDashboard({ strategies }) {
 // ── Main View ───────────────────────────────────────────────────
 
 export default function Strategies() {
-    const [strategies, setStrategies] = useState([]);
-    const [loading, setLoading] = useState(true);
     const [tab, setTab] = useState('active');
 
-    useEffect(() => {
-        (async () => {
-            const res = await api.getPaperStrategies();
-            if (!res.error) setStrategies(res.strategies || []);
-            setLoading(false);
-        })();
-    }, []);
+    const { data: strategies, loading, error, refetch: loadStrategies } = useAsyncData(async () => {
+        const res = await api.getPaperStrategies();
+        if (res?.error) throw new Error(res.message || 'Failed to load paper strategies');
+        return res.strategies || [];
+    }, { fallback: [] });
 
     const active = strategies.filter(s => s.status === 'ACTIVE');
     const paused = strategies.filter(s => s.status === 'PAUSED');
     const killed = strategies.filter(s => s.status === 'KILLED');
     const liveStrategies = [...active, ...paused];
 
-    if (loading) {
-        return <div style={s.loading}>Loading strategies...</div>;
+    if (loading && !strategies.length) {
+        return <LoadingSkeleton variant="card" count={3} />;
+    }
+    if (error) {
+        return <ErrorState error={error} onRetry={loadStrategies} title="Paper strategies unavailable" />;
     }
 
     return (

@@ -256,6 +256,7 @@ class TraceAnalyzer:
                     WHERE scored_at >= :cutoff
                       AND verdict IS NOT NULL
                       AND dedup_keep = TRUE
+                      AND id NOT LIKE 'astrogrid:%'
                     GROUP BY model_name
                 """), {"cutoff": cutoff}).fetchall()
             return {
@@ -568,6 +569,7 @@ class TargetedMutator:
                            COUNT(*) FILTER (WHERE verdict = 'hit') * 1.0 / NULLIF(COUNT(*), 0) AS hr
                     FROM oracle_predictions
                     WHERE verdict IS NOT NULL
+                      AND id NOT LIKE 'astrogrid:%'
                     GROUP BY model_name
                     HAVING COUNT(*) >= :min_preds
                     ORDER BY hr DESC LIMIT 1

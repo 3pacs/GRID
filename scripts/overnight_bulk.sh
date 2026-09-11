@@ -2,6 +2,17 @@
 echo "=== OVERNIGHT BULK DOWNLOAD ==="
 echo "Started: $(date)"
 
+# API keys come from the repo .env (same pattern as grid_hourly_catchup.sh);
+# never hardcode them in this script.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+GRID_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+if [[ -f "${GRID_ROOT}/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "${GRID_ROOT}/.env"
+    set +a
+fi
+
 # ═══════════════════════════════════════════
 # 1. FULL EDGAR ARCHIVE
 # ═══════════════════════════════════════════
@@ -60,53 +71,57 @@ echo "=== EIA FULL ENERGY DATA ==="
 mkdir -p /data/grid/bulk/eia/series
 cd /data/grid/bulk/eia
 
-EIA_KEY="QAz3bg00oRnsiRgFrBJy3k8xI36lklWW6q7CdNEg"
+EIA_KEY="${EIA_API_KEY:-}"
 
-# Petroleum
-for series in WCRFPUS2 WCESTUS1 WCRIMUS2 WCRSTUS1 WPULEUS3 WTTSTUS1 WGTSTUS1 WKJSTUS1 WDISTUS1 WBCSTUS1 WRESTUS1 WDIRPUS2 WDIRIM2; do
-    url="https://api.eia.gov/v2/petroleum/sum/sndw/data/?api_key=${EIA_KEY}&frequency=weekly&data[0]=value&facets[series][]=${series}&sort[0][column]=period&sort[0][direction]=desc&length=5000"
-    out="series/pet_${series}.json"
-    if [ ! -f "$out" ]; then
-        echo "  EIA petroleum: $series"
-        curl -s "$url" > "$out"
-        sleep 0.5
-    fi
-done
+if [[ -z "$EIA_KEY" ]]; then
+    echo "  EIA_API_KEY not set -- skipping EIA downloads"
+else
+    # Petroleum
+    for series in WCRFPUS2 WCESTUS1 WCRIMUS2 WCRSTUS1 WPULEUS3 WTTSTUS1 WGTSTUS1 WKJSTUS1 WDISTUS1 WBCSTUS1 WRESTUS1 WDIRPUS2 WDIRIM2; do
+        url="https://api.eia.gov/v2/petroleum/sum/sndw/data/?api_key=${EIA_KEY}&frequency=weekly&data[0]=value&facets[series][]=${series}&sort[0][column]=period&sort[0][direction]=desc&length=5000"
+        out="series/pet_${series}.json"
+        if [ ! -f "$out" ]; then
+            echo "  EIA petroleum: $series"
+            curl -s "$url" > "$out"
+            sleep 0.5
+        fi
+    done
 
-# Natural Gas
-for series in RNGWHHD RNGC1 RNGC2 RNGC3 RNGC4; do
-    url="https://api.eia.gov/v2/natural-gas/pri/sum/data/?api_key=${EIA_KEY}&frequency=monthly&data[0]=value&facets[series][]=${series}&sort[0][column]=period&sort[0][direction]=desc&length=5000"
-    out="series/ng_${series}.json"
-    if [ ! -f "$out" ]; then
-        echo "  EIA nat gas: $series"
-        curl -s "$url" > "$out"
-        sleep 0.5
-    fi
-done
+    # Natural Gas
+    for series in RNGWHHD RNGC1 RNGC2 RNGC3 RNGC4; do
+        url="https://api.eia.gov/v2/natural-gas/pri/sum/data/?api_key=${EIA_KEY}&frequency=monthly&data[0]=value&facets[series][]=${series}&sort[0][column]=period&sort[0][direction]=desc&length=5000"
+        out="series/ng_${series}.json"
+        if [ ! -f "$out" ]; then
+            echo "  EIA nat gas: $series"
+            curl -s "$url" > "$out"
+            sleep 0.5
+        fi
+    done
 
-# Electricity generation by source
-for series in ELEC.GEN.ALL-US-99.M ELEC.GEN.SUN-US-99.M ELEC.GEN.WND-US-99.M ELEC.GEN.NG-US-99.M ELEC.GEN.COL-US-99.M ELEC.GEN.NUC-US-99.M; do
-    encoded=$(echo $series | sed 's/\./%2E/g')
-    url="https://api.eia.gov/v2/electricity/electric-power-operational-data/data/?api_key=${EIA_KEY}&frequency=monthly&data[0]=generation&sort[0][column]=period&sort[0][direction]=desc&length=5000"
-    out="series/elec_$(echo $series | tr '.' '_').json"
-    if [ ! -f "$out" ]; then
-        echo "  EIA electricity: $series"
-        curl -s "$url" > "$out"
-        sleep 0.5
-    fi
-done
+    # Electricity generation by source
+    for series in ELEC.GEN.ALL-US-99.M ELEC.GEN.SUN-US-99.M ELEC.GEN.WND-US-99.M ELEC.GEN.NG-US-99.M ELEC.GEN.COL-US-99.M ELEC.GEN.NUC-US-99.M; do
+        encoded=$(echo $series | sed 's/\./%2E/g')
+        url="https://api.eia.gov/v2/electricity/electric-power-operational-data/data/?api_key=${EIA_KEY}&frequency=monthly&data[0]=generation&sort[0][column]=period&sort[0][direction]=desc&length=5000"
+        out="series/elec_$(echo $series | tr '.' '_').json"
+        if [ ! -f "$out" ]; then
+            echo "  EIA electricity: $series"
+            curl -s "$url" > "$out"
+            sleep 0.5
+        fi
+    done
 
-# Crude oil prices - full history
-url="https://api.eia.gov/v2/petroleum/pri/spt/data/?api_key=${EIA_KEY}&frequency=daily&data[0]=value&facets[series][]=RWTC&sort[0][column]=period&sort[0][direction]=desc&length=10000"
-echo "  EIA crude price history..."
-curl -s "$url" > "series/crude_price_full.json"
+    # Crude oil prices - full history
+    url="https://api.eia.gov/v2/petroleum/pri/spt/data/?api_key=${EIA_KEY}&frequency=daily&data[0]=value&facets[series][]=RWTC&sort[0][column]=period&sort[0][direction]=desc&length=10000"
+    echo "  EIA crude price history..."
+    curl -s "$url" > "series/crude_price_full.json"
 
-# Weekly petroleum status report
-url="https://api.eia.gov/v2/petroleum/stoc/wstk/data/?api_key=${EIA_KEY}&frequency=weekly&data[0]=value&sort[0][column]=period&sort[0][direction]=desc&length=5000"
-echo "  EIA weekly petroleum status..."
-curl -s "$url" > "series/weekly_petroleum_status.json"
+    # Weekly petroleum status report
+    url="https://api.eia.gov/v2/petroleum/stoc/wstk/data/?api_key=${EIA_KEY}&frequency=weekly&data[0]=value&sort[0][column]=period&sort[0][direction]=desc&length=5000"
+    echo "  EIA weekly petroleum status..."
+    curl -s "$url" > "series/weekly_petroleum_status.json"
 
-echo "EIA done: $(du -sh /data/grid/bulk/eia/)"
+    echo "EIA done: $(du -sh /data/grid/bulk/eia/)"
+fi
 
 # ═══════════════════════════════════════════
 # 3. GDELT FULL ARCHIVE (bonus)

@@ -134,11 +134,24 @@ def _normalize_scoring_class(value: Any) -> str:
     return raw if raw in _VALID_SCORING_CLASSES else "liquid_market"
 
 
+# regime_history.regime carries auto_regime's state names (GROWTH / NEUTRAL /
+# FRAGILE / CRISIS), not the risk_on/risk_off vocabulary the AstroGrid contract
+# document assumed. Until the table had a writer this went unnoticed: its only
+# rows were 'NEUTRAL', which case-folds into a label this function already
+# accepted. Now that the daily job writes every state, fold them here rather
+# than returning None and dropping the regime on every non-neutral day.
+_REGIME_STATE_ALIASES = {
+    "growth": "risk_on",
+    "fragile": "risk_off",
+    "crisis": "risk_off",
+}
+
+
 def _normalize_regime_label(value: Any) -> str | None:
     cleaned = str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
     if cleaned in {"risk_on", "risk_off", "neutral", "transition"}:
         return cleaned
-    return None
+    return _REGIME_STATE_ALIASES.get(cleaned)
 
 
 def _build_historical_regime_lookup(

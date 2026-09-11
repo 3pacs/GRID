@@ -12,6 +12,11 @@ on:
 
 jobs:
   claude-review:
+    # Claude review is advisory. Keep it disabled while the repository OAuth
+    # credential is unavailable or expired so optional AI review failures do
+    # not turn otherwise-green PRs red. A repository administrator can set
+    # CLAUDE_REVIEW_ENABLED=true after repairing auth to opt back in.
+    if: ${{ vars.CLAUDE_REVIEW_ENABLED == 'true' }}
     # Optional: Filter by PR author
     # if: |
     #   github.event.pull_request.user.login == 'external-contributor' ||

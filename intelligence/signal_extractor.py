@@ -20,12 +20,27 @@ Runs as a daemon alongside the backlinker.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
+from datetime import date, timedelta
 
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+
+# raw_series is a TimescaleDB hypertable. The unbounded ``series_id LIKE``
+# scan ran across every chunk twelve times per cycle and hit the statement
+# timeout on every pass (2026-09-10). The daemon runs continuously, so the
+# incremental pass only needs rows observed recently; the start-up sweep
+# looks further back but stays bounded too.
+EXTRACTOR_LOOKBACK_DAYS: int = int(os.environ.get("GRID_EXTRACTOR_LOOKBACK_DAYS", "45"))
+EXTRACTOR_FULL_SWEEP_DAYS: int = int(os.environ.get("GRID_EXTRACTOR_FULL_SWEEP_DAYS", "730"))
+
+
+def _since(lookback_days: int) -> date:
+    return date.today() - timedelta(days=max(int(lookback_days), 1))
 
 
 # ── Series ID patterns → actor extraction ──
@@ -146,9 +161,18 @@ EXTRACTORS = [
 ]
 
 
-def extract_from_raw_series(engine: Engine, batch_size: int = 5000) -> dict[str, int]:
-    """Scan raw_series for structured entries and create signal_data records."""
+def extract_from_raw_series(
+    engine: Engine,
+    batch_size: int = 5000,
+    lookback_days: int = EXTRACTOR_LOOKBACK_DAYS,
+) -> dict[str, int]:
+    """Scan raw_series for structured entries and create signal_data records.
+
+    Only rows with ``obs_date`` in the last *lookback_days* are scanned so
+    the hypertable query prunes to recent chunks.
+    """
     stats = {"scanned": 0, "extracted": 0, "skipped": 0, "errors": 0}
+    since = _since(lookback_days)
 
     with engine.connect() as conn:
         for extractor in EXTRACTORS:
@@ -161,6 +185,7 @@ def extract_from_raw_series(engine: Engine, batch_size: int = 5000) -> dict[str,
                 SELECT rs.series_id, rs.obs_date, rs.value
                 FROM raw_series rs
                 WHERE rs.series_id LIKE :pattern
+                  AND rs.obs_date >= :since
                   AND NOT EXISTS (
                       SELECT 1 FROM signal_data sd
                       WHERE sd.source_id = rs.series_id
@@ -168,7 +193,7 @@ def extract_from_raw_series(engine: Engine, batch_size: int = 5000) -> dict[str,
                   )
                 ORDER BY rs.obs_date DESC
                 LIMIT :lim
-            """), {"pattern": pattern, "lim": batch_size}).fetchall()
+            """), {"pattern": pattern, "since": since, "lim": batch_size}).fetchall()
 
             stats["scanned"] += len(rows)
 
@@ -222,9 +247,14 @@ def extract_from_raw_series(engine: Engine, batch_size: int = 5000) -> dict[str,
     return stats
 
 
-def extract_from_signal_sources(engine: Engine, batch_size: int = 5000) -> dict[str, int]:
+def extract_from_signal_sources(
+    engine: Engine,
+    batch_size: int = 5000,
+    lookback_days: int = EXTRACTOR_LOOKBACK_DAYS,
+) -> dict[str, int]:
     """Scan signal_sources table and create signal_data records with real actor names."""
     stats = {"scanned": 0, "extracted": 0, "errors": 0}
+    since = _since(lookback_days)
 
     with engine.connect() as conn:
         # Check if signal_sources exists
@@ -238,14 +268,15 @@ def extract_from_signal_sources(engine: Engine, batch_size: int = 5000) -> dict[
             SELECT ss.source_type, ss.source_id, ss.ticker, ss.signal_date,
                    ss.signal_type, ss.signal_value
             FROM signal_sources ss
-            WHERE NOT EXISTS (
+            WHERE ss.signal_date >= :since
+              AND NOT EXISTS (
                 SELECT 1 FROM signal_data sd
                 WHERE sd.source_id = CONCAT(ss.source_type, ':', ss.source_id, ':', ss.ticker)
                   AND sd.signal_date = ss.signal_date
             )
             ORDER BY ss.signal_date DESC
             LIMIT :lim
-        """), {"lim": batch_size}).fetchall()
+        """), {"since": since, "lim": batch_size}).fetchall()
 
         stats["scanned"] = len(rows)
 
@@ -313,10 +344,13 @@ def run_extractor(interval: int = 300) -> None:
     engine = get_engine()
     log.info("Signal extractor starting — interval={i}s", i=interval)
 
-    # Initial full sweep
-    log.info("Extractor: initial full sweep")
-    extract_from_raw_series(engine, batch_size=50000)
-    extract_from_signal_sources(engine, batch_size=50000)
+    # Initial sweep — bounded, and a timeout here must not kill the daemon.
+    log.info("Extractor: initial sweep over the last {d} days", d=EXTRACTOR_FULL_SWEEP_DAYS)
+    try:
+        extract_from_raw_series(engine, batch_size=50000, lookback_days=EXTRACTOR_FULL_SWEEP_DAYS)
+        extract_from_signal_sources(engine, batch_size=50000, lookback_days=EXTRACTOR_FULL_SWEEP_DAYS)
+    except Exception as exc:
+        log.warning("Extractor initial sweep failed (continuing with incremental passes): {e}", e=str(exc))
 
     while True:
         try:

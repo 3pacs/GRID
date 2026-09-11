@@ -38,8 +38,8 @@ def test_emit_writes_audit_row(fake_bus, monkeypatch):
     monkeypatch.setattr(emit_mod, "bus", fake_bus)
     audit_calls = []
 
-    def fake_audit(engine, contract, payload_hash):
-        audit_calls.append((contract.event_id, payload_hash))
+    def fake_audit(engine, contract, payload_hash, *, channel=None, notify_json=None):
+        audit_calls.append((contract.event_id, payload_hash, channel, notify_json))
 
     monkeypatch.setattr(emit_mod, "_write_audit", fake_audit)
     monkeypatch.setattr(emit_mod, "_get_engine", lambda: object())
@@ -59,6 +59,10 @@ def test_emit_writes_audit_row(fake_bus, monkeypatch):
     assert audit_calls[0][0] == c.event_id
     assert isinstance(audit_calls[0][1], str)
     assert len(audit_calls[0][1]) == 64  # sha256 hex digest
+    # The pg_notify leg rides in the audit transaction: channel + JSON payload.
+    assert audit_calls[0][2] == emit_mod.channel_for(type(c))
+    assert isinstance(audit_calls[0][3], str)
+    assert str(c.event_id) in audit_calls[0][3]
 
 
 def test_pull_lifecycle_emits_started_and_completed(fake_bus, monkeypatch):

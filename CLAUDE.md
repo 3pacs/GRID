@@ -71,9 +71,19 @@ This enforces grep-before-create discipline and prevents the duplication documen
 
 - **Backend:** Python 3.11+, [[FastAPI]], [[SQLAlchemy]] 2.0, [[PostgreSQL]] 15 + [[TimescaleDB]]
 - **Frontend:** React 18, Vite, [[Zustand]], served as PWA from [[FastAPI]]
-- **LLM:** Dual local inference — Nemotron-Cascade-2 30B GPU (:8080) + Nemotron-3-Super-120B
-  CPU (:8081). OpenRouter Claude fallback. See `llm/router.py` for the 3-tier taxonomy
-  (LOCAL/REASON/ORACLE).
+- **LLM:** Local Qwen 3.8 27B on GPU everywhere (verified 2026-09-10): grid-svr
+  RTX 3090 llama-server (Qwen3.8-27B Q4_K_M + mmproj on 100.75.185.36:8086, fronted by the
+  :8081 shim — REASON + ORACLE tiers), redbox `qwen3.8-27b` (LOCAL tier), gridz4
+  `Qwen3.8-27B-Q4_K_M`, Ollama `qwen3.8:27b` on :11434.
+  **No CPU-only inference** — the operator retired the `grid-llamacpp` unit on :8080
+  (Qwen3.6 GGUF, `NGL=0`, 17.9 GB RAM, answered every embedding call 501) on 2026-09-10.
+  Don't recreate it; `server_setup/grid-llamacpp.service` is deleted on purpose.
+  **Embeddings** go through `llm.router.embed()` → `EMBED_PROVIDER_CHAIN`
+  (gridz4 → koala → z400 → grid-svr Ollama, all `nomic-embed-text`), returning `None`
+  when no node answers. Only gridz4:11434 and grid-svr:11434 actually answered on
+  2026-09-10 — koala has been offline 48 days and z400 is no longer a tailnet peer. Paid providers — now including `gemini`, which sits ahead of
+  `openrouter` in every chat chain — stay gated off behind `GRID_ALLOW_PAID_LLM`.
+  See `llm/router.py` for the 3-tier taxonomy (LOCAL/REASON/ORACLE).
 - **Config:** pydantic-settings, environment variables via `.env`
 
 ## Server Deployment

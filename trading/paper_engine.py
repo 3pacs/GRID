@@ -86,6 +86,13 @@ class PaperTradingEngine:
             conn.execute(text(
                 "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS threshold_used FLOAT"
             ))
+            # 2026-09-10 (LEVER-PACKAGE §7 T2.5): per-strategy holding period.
+            # NULL = legacy behaviour (close after the hypothesis expected_lag,
+            # default 1 d). Long-horizon strategies set 90/180 so the executor
+            # does not close them the next day.
+            conn.execute(text(
+                "ALTER TABLE paper_strategies ADD COLUMN IF NOT EXISTS horizon_days INTEGER"
+            ))
         log.debug("Paper trading tables ensured")
 
     def register_strategy(
@@ -94,11 +101,18 @@ class PaperTradingEngine:
         leader: str,
         follower: str,
         description: str = "",
+        horizon_days: int | None = None,
     ) -> str:
         """Register a new paper trading strategy from a hypothesis.
 
+        ``horizon_days`` (optional) is the holding period the signal
+        executor uses to auto-close this strategy's trades; ``None`` keeps
+        the hypothesis ``expected_lag`` behaviour.
+
         Returns strategy_id.
         """
+        if horizon_days is not None and int(horizon_days) <= 0:
+            raise ValueError("horizon_days must be a positive integer or None")
         strategy_id = f"h{hypothesis_id}_{leader}_{follower}"
 
         with self.engine.begin() as conn:
@@ -110,12 +124,14 @@ class PaperTradingEngine:
                 return strategy_id
 
             conn.execute(text(
-                "INSERT INTO paper_strategies (id, hypothesis_id, leader, follower, description, capital, high_water_mark) "
-                "VALUES (:id, :hid, :leader, :follower, :desc, :cap, :cap)"
+                "INSERT INTO paper_strategies "
+                "(id, hypothesis_id, leader, follower, description, capital, high_water_mark, horizon_days) "
+                "VALUES (:id, :hid, :leader, :follower, :desc, :cap, :cap, :horizon_days)"
             ), {
                 "id": strategy_id, "hid": hypothesis_id,
                 "leader": leader, "follower": follower,
                 "desc": description, "cap": self.initial_capital,
+                "horizon_days": int(horizon_days) if horizon_days is not None else None,
             })
 
         log.info("Registered paper strategy: {s}", s=strategy_id)

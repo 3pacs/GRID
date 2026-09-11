@@ -2,6 +2,54 @@
 
 Append-only running log for GRID system work.
 
+## 2026-09-11 - correction: the `GitHubActions-WSL-Start` task exists (supersedes the boot-contract claim below)
+
+What was done:
+
+- Corrected `docs/SERVER-SERVICES.md` "Alien Runner": the Windows scheduled task `GitHubActions-WSL-Start` **does exist** on alien. The entry below, and the doc text it shipped, said it was absent and told the operator to re-register it. Both were wrong, and following that guidance would have duplicated or overwritten a working task.
+- Root cause of the false negative: `ssh alien 'schtasks /query /tn ...'` runs under Git Bash, where MSYS rewrites `/query` into `C:/Program Files/Git/query`; the resulting argument error reads like "task not found". The correct probe is now documented: `ssh alien 'MSYS_NO_PATHCONV=1 schtasks /query /tn GitHubActions-WSL-Start /v /fo LIST'`, or PowerShell `Get-ScheduledTaskInfo`.
+- Documented the task's actual failure mode and the operator fix. It has only boot and logon triggers with `RestartOnFailure` Count 5 / Interval PT1M; it ran on 2026-09-02, exited 1, exhausted its five retries, and — with Windows `LastBootUpTime` at 2026-08-19 — nothing re-fired it for 22 days, which is why all 19 runners were down. The fix is `Set-ScheduledTask` adding a 15-minute repetition trigger to the existing task (safe: `MultipleInstancesPolicy` is already `IgnoreNew`), plus enabling `Microsoft-Windows-TaskScheduler/Operational`, which is off and is why the 2026-09-02 failure left no record.
+- Reworded the `TEST_RUNNER` warning to match reality (gate on the distro being `Running` and the runner `online`, not on the task existing) and fixed the same MSYS bug in the Health / recovery probe.
+
+Non-obvious decisions:
+
+- Added as a new entry rather than editing the 2026-09-11 entry below, which stays as written — this log is append-only, and the wrong claim is worth leaving visible next to its correction.
+- `schtasks /run` on the existing task was used to bring the distro up. That is an ops start of operator-authored infrastructure, not persistence creation; no task was created, modified, or enabled by an agent.
+
+Broken or TBD:
+
+- The repetition trigger still needs an operator's elevated PowerShell on alien. Until it lands, one transient failure can take CI down repo-wide again for as long as the box stays up.
+- Vault `05-GRID/Infrastructure/Servers.md` still carries the same "absent" claim.
+
+Next pick-up:
+
+- Operator: run the `Set-ScheduledTask` snippet in `docs/SERVER-SERVICES.md`, then confirm `wsl.exe -l -v` reports `Running` after a deliberate `schtasks /end`.
+- Full investigation log: `Sessions/S-2026-09-11-opus-alien-runner-followup.md` in the Obsidian vault.
+
+## 2026-09-11 - alien self-hosted CI runner for GRID activated (handoff-09), TEST_RUNNER left unset pending WSL keep-alive
+
+What was done:
+
+- Registered runner `alien` (labels `self-hosted, alien, tests`) for 3pacs/GRID inside the Dell's `GitHubActions` WSL2 distro: `/opt/github-actions/GRID/alien`, unit `actions.runner.3pacs-GRID.alien.service` (drop-in: egress guard, `user@1000`, rootless `DOCKER_HOST`, `TZ=UTC`). Installed PostgreSQL 15.19 + TimescaleDB 2.28.3 as a persistent service, `grid/testpass/griddb_test`, cluster + DB pinned to UTC; Python 3.11 (deadsnakes), build-essential, libpq-dev.
+- Verified on alien via PR #450: Frontend Build 1m26s green, Lint 1m56s green, Backend Tests ran all 8,061 tests in 14m12s with `Reset persistent Postgres (alien)` executed and the ephemeral-Postgres step skipped (ON_ALIEN true). Fallback verified: deleting `TEST_RUNNER` and re-running sends the jobs back to `ubuntu-latest` (run 34544223388, green).
+- Fixed two alien-only failures: `test_regime_history_writer` off-by-one day (Postgres was America/Los_Angeles; now UTC) and `TestGauntlet::test_run_gauntlet` needing ~90 s on the E5-2698 v3 (`test.yml`: pytest `--timeout` 60 -> 180, backend `timeout-minutes` 15 -> 25).
+- Rewrote the `docs/SERVER-SERVICES.md` "Alien Runner" section with the real install path (WSL2 layout, pgdg/Timescale repos and package names, missing `svc.sh` in the 2.337.0 tarball, MSYS path-conversion gotcha, UTC pin, measured timings).
+
+Non-obvious decisions:
+
+- **`TEST_RUNNER` is deliberately unset.** The documented boot contract (Windows scheduled task `GitHubActions-WSL-Start`) does not exist on alien, so the distro idles out ~1 min after the last `wsl.exe` session and every Linux runner on the box goes offline (all 19 siblings were offline on 2026-09-10 for this reason). With the variable set that blocks CI repo-wide and cancels foreign PRs' jobs mid-run. Creating the task needs an operator's elevated PowerShell on alien; the exact snippet is in SERVER-SERVICES.md. Flip `gh variable set TEST_RUNNER --body alien -R 3pacs/GRID` only after `wsl.exe -l -v` says Running unattended.
+- Did not replace the distro's system Node 22 with Node 20 (shared with sibling runners); `actions/setup-node`/`setup-python` provision 20 / 3.11 into the runner tool cache.
+- deploy.yml, ops-exec.yml, gemini-task.yml, ops-bringup.yml untouched; alien has no deploy credentials.
+
+Broken or TBD:
+
+- Backend Tests on alien is ~2x slower than hosted (single-process pytest on a 2014 Xeon). Needs `pytest-xdist` with per-worker DB isolation to meet the handoff's 4-minute bar.
+- A second consecutive alien run with warm cache was not completed because the distro cannot be kept alive without the scheduled task.
+
+Next pick-up:
+
+- Operator: create `GitHubActions-WSL-Start` on alien (snippet in SERVER-SERVICES.md), confirm `wsl.exe -l -v` Running and all runners online, then set `TEST_RUNNER=alien` and watch the next two PRs' test jobs.
+
 ## 2026-05-30 - stepdad.finance: natural-language home composer (Phase 1, LIVE)
 
 What was done:
@@ -32,6 +80,8 @@ Next pick-up:
 
 - Get `stepdad.png` onto the server → favicon + mascot. Then Phase 2: profiles + Whisper voice. TradingView/thinkorswim-via-Playwright is a candidate enrichment data source (operator wants the "stealthier" one) — wire behind GRID feeds, not primary.
 - Login `dad` / `mom` (contributor, `grid_users` id 14) created and verified against live API.
+
+**Note (2026-09-10):** The "two live code trees" / "deploy tool is misconfigured" situation above is superseded. Starting with the first `.github/workflows/deploy.yml` commit (2026-06-15), every push to `main` runs an automated deploy: a `verify` job, then a `deploy` job on the self-hosted grid-svr runner that resets `/data/grid_v4/grid_release` to `main`, builds the PWA, runs migrations, and points grid-api's systemd `WorkingDirectory` at that tree via a drop-in. `grid-api` now runs from `/data/grid_v4/grid_release`, kept in sync with `main` automatically — not from `grid-api-main`, and not manually via `scripts/deploy.py`. See `docs/SERVER-SERVICES.md` for the current topology.
 
 ## 2026-05-29 - Oracle llama-server "inference hang" = queue saturation death spiral
 

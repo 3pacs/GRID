@@ -20,6 +20,7 @@ ENDPOINTS = [
     "/api/v1/intelligence/dashboard",
     "/api/v1/intelligence/thesis",
     "/api/v1/flows/aggregated",
+    "/api/v1/flows/sectors",
     "/api/v1/regime/current",
     "/api/v1/system/status",
     "/api/v1/flows/layers",

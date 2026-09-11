@@ -144,8 +144,11 @@ def test_score_setup_bucket_maxes_on_extreme_macro_conditions(
     result = cs.score_setup(object(), "ABC", _series([100.0, 20.0]), as_of_date=date(2026, 5, 13))
 
     assert result.name == "SETUP"
-    assert result.score == 20
-    assert result.max_score == 20
+    # 17 = drawdown 5 + VIX 5 + credit 4 + curve 3. planetary_stress_index is
+    # supplied above but must contribute nothing (removed 2026-09-10).
+    assert result.score == 17
+    assert result.max_score == cs.SETUP_MAX_SCORE == 17
+    assert not any("PSI" in signal for signal in result.signals)
     assert result.data_available is True
     assert any("[EXTREME]" in signal for signal in result.signals)
 

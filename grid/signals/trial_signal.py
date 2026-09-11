@@ -3,24 +3,36 @@ grid/signals/trial_signal.py
 
 GRID Signal Module: Clinical Trial Catalyst Intelligence
 
-Reads trial_cache (populated by trial_ingestor.py cron), scores trial quality,
-resolves sponsor→ticker via SEC EDGAR, and surfaces near-term catalyst
-opportunities as GRID signals.
+Reads trial_cache (populated by trial_ingestor.py), scores trial quality,
+resolves sponsor→ticker through the layered ``grid.signals.sponsor_resolver``
+(INDUSTRY sponsors only), and surfaces near-term catalyst opportunities as
+GRID signals.
 
 Conforms to GRID signal interface:
   - generate() → list[SignalResult]
   - score is normalized [0, 1]
   - regime-aware (reads from regime_history)
-  - writes to trial_signals (separate domain from GRID features)
+  - writes to trial_signals (separate domain from GRID features) and a compact
+    READOUT row per signal into catalyst_calendar (deduped on nct_id)
+
+Company data is GRID-first (no paid quote API):
+  ticker_metrics_daily.market_cap_usd → company_profiles.profile->>'market_cap'
+  → raw_series TIINGO_FUND:{T}:market_cap → FMP profile (only if FMP_API_KEY)
+  → None. Cash runway comes from company_profiles.profile (cash, quarterly_burn,
+  cash_runway_months — written by ingestion.altdata.small_cap_enrichment).
+
+The mcap < $2B gate is ENFORCED: > $2B is skipped, unknown cap is capped at
+WATCHLIST with red flag ``market_cap_unknown``.
 
 Usage (standalone):
     python3 -m grid.signals.trial_signal --output table
     python3 -m grid.signals.trial_signal --output db --top-n 20
 
-Usage (via GRID pipeline):
-    from grid.signals.trial_signal import TrialGemSignal
+Usage (via GRID pipeline / Hermes):
+    from grid.signals.trial_signal import TrialGemSignal, run_daily
     sig = TrialGemSignal(db_conn)
     results = sig.generate()
+    run_daily(engine)   # Hermes registry entry `trial_signal`
 """
 
 from __future__ import annotations
@@ -29,11 +41,21 @@ import os
 import json
 import logging
 import datetime
+import time
 import requests
 import psycopg2
 import psycopg2.extras
 from dataclasses import dataclass, asdict, field
-from typing import Optional
+from typing import Any, Optional
+
+from grid.signals.sponsor_resolver import (
+    ResolvedSponsor,
+    is_industry_class,
+    normalize_sponsor_name,
+    resolve_sponsor,
+    resolve_ticker_sec,
+    _load_sec_tickers as _load_sec_tickers,  # re-exported for back-compat
+)
 
 log = logging.getLogger("grid.signals.trial_signal")
 
@@ -42,7 +64,16 @@ log = logging.getLogger("grid.signals.trial_signal")
 CT_GOV_BASE = "https://clinicaltrials.gov/api/v2/studies"
 SEC_COMPANY_TICKERS = "https://www.sec.gov/files/company_tickers.json"
 SEC_UA = "GRID Research grid@stepdad.finance"
-AV_KEY = os.getenv("ALPHAVANTAGE_API_KEY", os.getenv("ALPHA_VANTAGE_KEY", ""))
+FMP_PROFILE_URL = "https://financialmodelingprep.com/api/v3/profile/{ticker}"
+FMP_CALL_BUDGET = 60           # per process — FMP free tier is 250 req/day
+FMP_PAUSE_S = 0.3
+
+MARKET_CAP_MAX_MM = 2000.0     # the < $2B gate
+MARKET_CAP_MIN_MM = 10.0       # shells / delisted
+RUN_DAILY_TOP_N = 60
+
+# Regimes trial_signals.regime_at_signal accepts (CHECK constraint)
+ALLOWED_REGIMES = frozenset({"GROWTH", "NEUTRAL", "FRAGILE", "CRISIS", "UNKNOWN"})
 
 # Disease areas with priority scores (higher = bigger abnormal return history)
 DISEASE_PRIORITY = {
@@ -132,87 +163,15 @@ class SignalResult:
     red_flags: list[str] = field(default_factory=list)
     catalysts: list[str] = field(default_factory=list)
     penalty_factors: dict = field(default_factory=dict)
+    # 0-1 score component (min(1, runway_months / 24)); the persisted
+    # ``cash_runway_score`` column is NUMERIC(5,4), so months must never land here.
+    cash_runway_score: float = 0.5
 
 
-# ── SEC ticker map (loaded once per process) ──────────────────────────────────
+# ── Sponsor → ticker (moved to grid.signals.sponsor_resolver) ─────────────────
+# Thin aliases so existing callers / test patches keep working.
 
-_SEC_TICKER_MAP: dict[str, str] = {}   # lowercase name → ticker
-_SEC_TICKER_LOADED = False
-
-
-def _load_sec_tickers():
-    """
-    Download SEC company_tickers.json and build a lowercase-name → ticker map.
-    This is ~13K entries, covers all US-listed public companies.
-    """
-    global _SEC_TICKER_MAP, _SEC_TICKER_LOADED
-    if _SEC_TICKER_LOADED:
-        return
-    try:
-        resp = requests.get(
-            SEC_COMPANY_TICKERS,
-            headers={"User-Agent": SEC_UA},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        for entry in data.values():
-            name = entry.get("title", "").strip().lower()
-            ticker = entry.get("ticker", "").strip().upper()
-            if name and ticker:
-                _SEC_TICKER_MAP[name] = ticker
-        log.info(f"Loaded {len(_SEC_TICKER_MAP)} tickers from SEC company_tickers.json")
-    except Exception as e:
-        log.warning(f"Failed to load SEC tickers: {e}")
-    _SEC_TICKER_LOADED = True
-
-
-def _resolve_ticker_sec(sponsor_name: str) -> Optional[str]:
-    """
-    Fuzzy match sponsor name against SEC company_tickers.json.
-    Tries exact match, then prefix match, then substring match.
-    """
-    _load_sec_tickers()
-    if not _SEC_TICKER_MAP:
-        return None
-
-    # Normalize
-    name = sponsor_name.strip().lower()
-    # Strip common suffixes
-    for suffix in [", inc.", ", inc", " inc.", " inc", ", ltd.", ", ltd",
-                   " ltd.", " ltd", " llc", " plc", " corp.", " corp",
-                   " co.", " co", " s.a.", " ag", " se", " nv",
-                   " gmbh", " pty", " srl"]:
-        if name.endswith(suffix):
-            name = name[: -len(suffix)].strip()
-            break
-
-    # Exact match
-    if name in _SEC_TICKER_MAP:
-        return _SEC_TICKER_MAP[name]
-
-    # Check with common variations
-    for variant in [name, f"{name} inc", f"{name} inc.",
-                    f"{name} corp", f"{name} pharmaceuticals",
-                    f"{name} therapeutics", f"{name} biosciences"]:
-        if variant in _SEC_TICKER_MAP:
-            return _SEC_TICKER_MAP[variant]
-
-    # Substring match — sponsor name contained in SEC name
-    matches = []
-    for sec_name, ticker in _SEC_TICKER_MAP.items():
-        if name in sec_name or sec_name.startswith(name):
-            matches.append((sec_name, ticker))
-    if len(matches) == 1:
-        return matches[0][1]
-    # If multiple matches, prefer pharmaceutical/biotech companies
-    for sec_name, ticker in matches:
-        if any(kw in sec_name for kw in ["pharma", "thera", "bio", "onco", "medic"]):
-            return ticker
-    if matches:
-        return matches[0][1]
-
-    return None
+_resolve_ticker_sec = resolve_ticker_sec
 
 
 # ── Main signal class ─────────────────────────────────────────────────────────
@@ -221,9 +180,13 @@ class TrialGemSignal:
     """
     GRID signal module for clinical trial catalyst discovery.
     Reads from trial_cache (populated by trial_ingestor.py) and CT.gov live API.
+
+    ``engine`` (optional SQLAlchemy Engine) feeds the sponsor resolver's
+    persistent cache (``sponsor_ticker_map``); all other reads go through the
+    psycopg2 connection.
     """
 
-    def __init__(self, db_conn=None, db_config: dict = None):
+    def __init__(self, db_conn=None, db_config: dict | None = None, engine: Any = None):
         if db_conn:
             self.conn = db_conn
         elif db_config:
@@ -236,14 +199,35 @@ class TrialGemSignal:
                 user=os.getenv("DB_USER", "grid"),
                 password=os.getenv("DB_PASSWORD", ""),
             )
-        self._av_calls = 0  # rate limit tracker
+        self.engine = engine
+        self._fmp_calls = 0  # FMP budget tracker (per process)
+        self.stats: dict[str, int] = {
+            "trials": 0, "skipped_non_industry": 0, "skipped_unresolved": 0,
+            "skipped_cap_gate": 0, "cap_unknown": 0, "scored": 0, "deduped": 0,
+        }
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     # ── Public interface ──────────────────────────────────────────────────────
+
+    def _resolve(self, trial: TrialRecord) -> ResolvedSponsor:
+        """Resolve the trial's lead sponsor (layered resolver; never raises)."""
+        try:
+            return resolve_sponsor(self.engine, trial.sponsor, trial.sponsor_class)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"Sponsor resolution failed for {trial.sponsor!r}: {e}")
+            return ResolvedSponsor(None, "error", 0.0, "resolver_error")
 
     def generate(self, top_n: int = 10) -> list[SignalResult]:
         """
         Main entry point. Returns ranked list of trial signal candidates.
         Regime-gated: only BUY in GROWTH/NEUTRAL, WATCHLIST otherwise.
+        Non-INDUSTRY sponsors are skipped before any resolution; the mcap
+        gate is enforced (unknown cap → WATCHLIST at most + red flag).
         """
         regime = self._get_regime()
         log.info(f"Current GRID regime: {regime}")
@@ -254,17 +238,38 @@ class TrialGemSignal:
             log.info("No cached trials, fetching live from ClinicalTrials.gov")
             trials = self._fetch_candidates_live()
         log.info(f"Processing {len(trials)} candidate trials")
+        self.stats["trials"] = len(trials)
 
         results = []
+        seen: set[tuple[str, str]] = set()
+        company_cache: dict[str, dict] = {}
         for trial in trials:
-            ticker = _resolve_ticker_sec(trial.sponsor)
-            if not ticker:
-                # Skip trials we can't map to a ticker — no point scoring garbage
+            if is_industry_class(trial.sponsor_class) is not True:
+                # Universities / NIH / hospitals / networks are not investable.
+                self.stats["skipped_non_industry"] += 1
                 continue
 
-            company_data = self._fetch_company_data(ticker)
-            if not self._passes_company_gates(company_data):
+            resolved = self._resolve(trial)
+            ticker = resolved.ticker
+            if not ticker:
+                # Skip trials we can't map to a ticker — no point scoring garbage
+                self.stats["skipped_unresolved"] += 1
                 continue
+            if (trial.nct_id, ticker) in seen:
+                self.stats["deduped"] += 1
+                continue
+            seen.add((trial.nct_id, ticker))
+
+            if ticker not in company_cache:
+                company_cache[ticker] = self._fetch_company_data(ticker)
+            company_data = company_cache[ticker]
+            gate = self._company_gate(company_data)
+            if gate == "skip":
+                self.stats["skipped_cap_gate"] += 1
+                continue
+            cap_unknown = gate == "cap_unknown"
+            if cap_unknown:
+                self.stats["cap_unknown"] += 1
 
             score_components = self._score_trial(trial, company_data)
             total_score = self._weighted_score(score_components)
@@ -272,6 +277,13 @@ class TrialGemSignal:
             final_score = total_score * penalty_mult
 
             signal_type = self._determine_signal(final_score, regime)
+            red_flags = list(penalties.keys())
+            if cap_unknown:
+                # Enforced gate: without a known market cap nothing is a BUY.
+                if signal_type == "BUY":
+                    signal_type = "WATCHLIST"
+                red_flags.append("market_cap_unknown")
+                penalties["market_cap_unknown"] = 1.0
             confidence = self._compute_confidence(final_score, regime)
             position = self._position_size(final_score, confidence) if signal_type == "BUY" else None
 
@@ -301,66 +313,162 @@ class TrialGemSignal:
                 confidence             = round(confidence, 4),
                 suggested_position_pct = position,
                 rationale              = self._build_rationale(trial, score_components, regime),
-                red_flags              = list(penalties.keys()),
+                red_flags              = red_flags,
                 catalysts              = self._extract_catalysts(trial),
                 penalty_factors        = penalties,
+                cash_runway_score      = score_components.get("cash_runway", 0.5),
             )
             results.append(result)
 
         results.sort(key=lambda r: (-r.trial_strength_score, r.days_to_completion))
-        log.info(f"Scored {len(results)} trials with resolved tickers")
+        self.stats["scored"] = len(results)
+        log.info(
+            "trial_signal: trials=%d industry=%d resolved=%d scored=%d "
+            "skipped_cap=%d cap_unknown=%d deduped=%d",
+            self.stats["trials"],
+            self.stats["trials"] - self.stats["skipped_non_industry"],
+            self.stats["trials"] - self.stats["skipped_non_industry"] - self.stats["skipped_unresolved"],
+            self.stats["scored"], self.stats["skipped_cap_gate"],
+            self.stats["cap_unknown"], self.stats["deduped"],
+        )
         return results[:top_n]
 
-    def write_to_db(self, results: list[SignalResult], run_id: str = None) -> int:
-        """Persist signals to griddb trial_signals table."""
+    # Dedupe: one trial_signals row per (nct_id, ticker) per day; re-runs on
+    # the same day do not stack duplicates (the April run had several per NCT).
+    _INSERT_SIGNAL_SQL = """
+        INSERT INTO trial_signals (
+            run_id, nct_id, ticker, company_name, sponsor_name,
+            trial_phase, primary_indication, primary_endpoint,
+            endpoint_type, fda_designation,
+            primary_completion_date,
+            enrollment_pct, days_to_completion,
+            market_cap_mm, cash_runway_months, pipeline_depth,
+            trial_strength_score, endpoint_clarity, phase_weight,
+            disease_priority, cash_runway_score, penalty_factors,
+            signal_type, regime_at_signal, confidence,
+            suggested_position_pct, rationale, red_flags, catalysts
+        )
+        SELECT
+            %(run_id)s, %(nct_id)s, %(ticker)s, %(company_name)s, %(sponsor_name)s,
+            %(trial_phase)s, %(primary_indication)s, %(primary_endpoint)s,
+            %(endpoint_type)s, %(fda_designation)s,
+            %(primary_completion_date)s,
+            %(enrollment_pct)s, %(days_to_completion)s,
+            %(market_cap_mm)s, %(cash_runway_months)s, %(pipeline_depth)s,
+            %(trial_strength_score)s, %(endpoint_clarity)s, %(phase_weight)s,
+            %(disease_priority)s, %(cash_runway_score)s, %(penalty_factors)s,
+            %(signal_type)s, %(regime_at_signal)s, %(confidence)s,
+            %(suggested_position_pct)s, %(rationale)s, %(red_flags)s, %(catalysts)s
+        WHERE NOT EXISTS (
+            SELECT 1 FROM trial_signals
+            WHERE nct_id = %(nct_id)s AND ticker = %(ticker)s
+              AND created_at >= CURRENT_DATE
+        )
+    """
+
+    # Same-day re-score: refresh today's row for (nct_id, ticker) instead of
+    # silently skipping it. Without this a run that finally knows the market
+    # cap / runway (enrichment landed after the morning score) could never
+    # replace the cap-unknown WATCHLIST row written earlier that day.
+    _UPDATE_SIGNAL_SQL = """
+        UPDATE trial_signals SET
+            run_id = %(run_id)s, company_name = %(company_name)s, sponsor_name = %(sponsor_name)s,
+            trial_phase = %(trial_phase)s, primary_indication = %(primary_indication)s,
+            primary_endpoint = %(primary_endpoint)s, endpoint_type = %(endpoint_type)s,
+            fda_designation = %(fda_designation)s, primary_completion_date = %(primary_completion_date)s,
+            enrollment_pct = %(enrollment_pct)s, days_to_completion = %(days_to_completion)s,
+            market_cap_mm = %(market_cap_mm)s, cash_runway_months = %(cash_runway_months)s,
+            pipeline_depth = %(pipeline_depth)s, trial_strength_score = %(trial_strength_score)s,
+            endpoint_clarity = %(endpoint_clarity)s, phase_weight = %(phase_weight)s,
+            disease_priority = %(disease_priority)s, cash_runway_score = %(cash_runway_score)s,
+            penalty_factors = %(penalty_factors)s, signal_type = %(signal_type)s,
+            regime_at_signal = %(regime_at_signal)s, confidence = %(confidence)s,
+            suggested_position_pct = %(suggested_position_pct)s, rationale = %(rationale)s,
+            red_flags = %(red_flags)s, catalysts = %(catalysts)s
+        WHERE nct_id = %(nct_id)s AND ticker = %(ticker)s
+          AND created_at >= CURRENT_DATE
+    """
+
+    # Compact READOUT row per signal; deduped on (nct_id, ticker) against any
+    # active row (the ingestor may already have written one for this NCT).
+    _INSERT_CALENDAR_SQL = """
+        INSERT INTO catalyst_calendar
+            (ticker, nct_id, event_type, expected_date,
+             confidence_window_days, source, notes, is_active)
+        SELECT %(ticker)s, %(nct_id)s, 'READOUT', %(expected_date)s,
+               30, 'trial_signal', %(notes)s, TRUE
+        WHERE NOT EXISTS (
+            SELECT 1 FROM catalyst_calendar
+            WHERE nct_id = %(nct_id)s AND ticker = %(ticker)s AND is_active = TRUE
+        )
+    """
+
+    def write_to_db(self, results: list[SignalResult], run_id: str | None = None) -> int:
+        """Persist signals to griddb trial_signals (+ compact catalyst_calendar rows).
+
+        Returns the number of trial_signals rows inserted. A row already present
+        for the same (nct_id, ticker) today is refreshed in place (counted in
+        ``self.stats["updated"]``), never duplicated.
+        """
         if not results:
             return 0
 
         cur = self.conn.cursor()
         written = 0
+        updated = 0
+        calendar_rows = 0
         run_id = run_id or datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        seen: set[tuple[str, str]] = set()
 
         for r in results:
+            key = (r.nct_id, r.ticker)
+            if key in seen:
+                continue
+            seen.add(key)
             try:
                 # Compute completion date from days_to_completion
                 completion_date = None
-                if r.days_to_completion and r.days_to_completion < 999:
+                if r.days_to_completion is not None and r.days_to_completion < 999:
                     completion_date = (
                         datetime.date.today()
                         + datetime.timedelta(days=r.days_to_completion)
                     )
 
-                cur.execute("""
-                    INSERT INTO trial_signals (
-                        run_id, nct_id, ticker, company_name,
-                        trial_phase, primary_indication, primary_endpoint,
-                        endpoint_type, fda_designation,
-                        primary_completion_date,
-                        enrollment_pct, days_to_completion,
-                        market_cap_mm, cash_runway_months, pipeline_depth,
-                        trial_strength_score, endpoint_clarity, phase_weight,
-                        disease_priority, cash_runway_score, penalty_factors,
-                        signal_type, regime_at_signal, confidence,
-                        suggested_position_pct, rationale, red_flags, catalysts
-                    ) VALUES (
-                        %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                        %s,%s,%s,%s,%s,%s,%s,%s,%s,%s
-                    )
-                """, (
-                    run_id, r.nct_id, r.ticker, r.company_name,
-                    r.trial_phase, r.primary_indication, r.primary_endpoint,
-                    r.endpoint_type, r.fda_designation,
-                    completion_date,
-                    r.enrollment_pct, r.days_to_completion,
-                    r.market_cap_mm, r.cash_runway_months, r.pipeline_depth,
-                    r.trial_strength_score, r.endpoint_clarity, r.phase_weight,
-                    r.disease_priority_score, r.cash_runway_months,
-                    json.dumps(r.penalty_factors),
-                    r.signal_type, r.regime_at_signal, r.confidence,
-                    r.suggested_position_pct, r.rationale,
-                    r.red_flags, r.catalysts,
-                ))
-                written += 1
+                params = {
+                    "run_id": run_id, "nct_id": r.nct_id, "ticker": r.ticker,
+                    "company_name": r.company_name, "sponsor_name": r.company_name,
+                    "trial_phase": r.trial_phase, "primary_indication": r.primary_indication,
+                    "primary_endpoint": r.primary_endpoint, "endpoint_type": r.endpoint_type,
+                    "fda_designation": r.fda_designation,
+                    "primary_completion_date": completion_date,
+                    "enrollment_pct": r.enrollment_pct, "days_to_completion": r.days_to_completion,
+                    "market_cap_mm": r.market_cap_mm, "cash_runway_months": r.cash_runway_months,
+                    "pipeline_depth": r.pipeline_depth,
+                    "trial_strength_score": r.trial_strength_score,
+                    "endpoint_clarity": r.endpoint_clarity, "phase_weight": r.phase_weight,
+                    "disease_priority": r.disease_priority_score,
+                    "cash_runway_score": _unit_score(r.cash_runway_score),
+                    "penalty_factors": json.dumps(r.penalty_factors),
+                    "signal_type": r.signal_type,
+                    "regime_at_signal": _storage_regime(r.regime_at_signal),
+                    "confidence": r.confidence,
+                    "suggested_position_pct": r.suggested_position_pct,
+                    "rationale": r.rationale, "red_flags": r.red_flags, "catalysts": r.catalysts,
+                }
+                cur.execute(self._INSERT_SIGNAL_SQL, params)
+                inserted = _rowcount(cur)
+                written += inserted
+                if inserted == 0:
+                    cur.execute(self._UPDATE_SIGNAL_SQL, params)
+                    updated += _rowcount(cur)
+
+                if completion_date is not None:
+                    cur.execute(self._INSERT_CALENDAR_SQL, {
+                        "ticker": r.ticker, "nct_id": r.nct_id,
+                        "expected_date": completion_date,
+                        "notes": (r.rationale or "")[:200],
+                    })
+                    calendar_rows += _rowcount(cur)
             except Exception as e:
                 log.warning(f"Failed to write {r.ticker}/{r.nct_id}: {e}")
                 self.conn.rollback()
@@ -368,7 +476,11 @@ class TrialGemSignal:
 
         self.conn.commit()
         cur.close()
-        log.info(f"Wrote {written} trial signals to griddb (run_id={run_id})")
+        self.stats["updated"] = updated
+        log.info(
+            f"Wrote {written} trial signals (+{updated} same-day rows refreshed) + "
+            f"{calendar_rows} catalyst_calendar rows to griddb (run_id={run_id})"
+        )
         return written
 
     # ── Data sources ──────────────────────────────────────────────────────────
@@ -485,38 +597,129 @@ class TrialGemSignal:
             has_results=bool(s.get("resultsSection")),
         )
 
-    # ── Company data ──────────────────────────────────────────────────────────
+    # ── Company data (GRID-first; no paid quote API) ──────────────────────────
 
-    def _fetch_company_data(self, ticker: str) -> dict:
-        """Fetch market cap from Alpha Vantage. Rate-limited to 5 calls/min on free tier."""
-        if not AV_KEY or self._av_calls >= 5:
+    def _query_one(self, sql: str, params: tuple) -> Optional[tuple]:
+        """Run a single-row read on the psycopg2 connection; None on any failure."""
+        try:
+            cur = self.conn.cursor()
+            cur.execute(sql, params)
+            row = cur.fetchone()
+            cur.close()
+            return tuple(row) if row is not None else None
+        except Exception as e:  # noqa: BLE001
+            log.debug(f"company lookup failed: {e}")
+            try:
+                self.conn.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            return None
+
+    def _market_cap_from_metrics(self, ticker: str, as_of: datetime.date) -> Optional[float]:
+        """ticker_metrics_daily.market_cap_usd (USD), PIT-bounded by ``as_of``."""
+        row = self._query_one(
+            "SELECT market_cap_usd FROM ticker_metrics_daily "
+            "WHERE ticker = %s AND market_cap_usd IS NOT NULL AND obs_date <= %s "
+            "ORDER BY obs_date DESC LIMIT 1",
+            (ticker, as_of),
+        )
+        return _pos_float(row[0]) if row else None
+
+    def _profile(self, ticker: str) -> dict:
+        """company_profiles.profile JSONB as a dict ({} when absent)."""
+        row = self._query_one("SELECT profile FROM company_profiles WHERE ticker = %s", (ticker,))
+        if not row or row[0] is None:
             return {}
+        p = row[0]
+        if isinstance(p, str):
+            try:
+                p = json.loads(p)
+            except ValueError:
+                return {}
+        return p if isinstance(p, dict) else {}
+
+    def _market_cap_from_tiingo(self, ticker: str, as_of: datetime.date) -> Optional[float]:
+        """Latest raw_series TIINGO_FUND:{T}:market_cap (USD) at or before ``as_of``."""
+        row = self._query_one(
+            "SELECT value FROM raw_series "
+            "WHERE series_id = %s AND pull_status = 'SUCCESS' AND obs_date <= %s "
+            "ORDER BY obs_date DESC, pull_timestamp DESC LIMIT 1",
+            (f"TIINGO_FUND:{ticker}:market_cap", as_of),
+        )
+        return _pos_float(row[0]) if row else None
+
+    def _market_cap_from_fmp(self, ticker: str) -> Optional[float]:
+        """FMP profile ``mktCap`` (USD) — only when FMP_API_KEY is set, within budget."""
+        key = _fmp_api_key()
+        if not key or self._fmp_calls >= FMP_CALL_BUDGET:
+            return None
+        self._fmp_calls += 1
         try:
             resp = requests.get(
-                "https://www.alphavantage.co/query",
-                params={"function": "OVERVIEW", "symbol": ticker, "apikey": AV_KEY},
-                timeout=10,
+                FMP_PROFILE_URL.format(ticker=ticker), params={"apikey": key}, timeout=10,
             )
-            self._av_calls += 1
-            d = resp.json()
-            if "MarketCapitalization" not in d:
-                return {}
-            market_cap = float(d.get("MarketCapitalization", 0)) / 1e6
-            return {
-                "market_cap_mm": market_cap if market_cap > 0 else None,
-                "cash_runway_months": None,
-                "pipeline_depth": None,
-            }
-        except Exception:
-            return {}
+            if resp.status_code != 200:
+                log.warning(f"FMP profile {ticker}: HTTP {resp.status_code}")
+                return None
+            data = resp.json()
+            first = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else {})
+            time.sleep(FMP_PAUSE_S)
+            return _pos_float(first.get("mktCap"))
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"FMP profile {ticker} failed: {e}")
+            return None
+
+    def _fetch_company_data(self, ticker: str, as_of: Optional[datetime.date] = None) -> dict:
+        """GRID-first market cap + cash runway for ``ticker``.
+
+        Order: ticker_metrics_daily → company_profiles.profile.market_cap →
+        raw_series TIINGO_FUND market_cap → FMP profile (key required) → None.
+        Runway from company_profiles.profile (cash_runway_months, or
+        cash / quarterly_burn * 3). Never raises.
+        """
+        as_of = as_of or datetime.date.today()
+        profile = self._profile(ticker)
+
+        mcap_usd = self._market_cap_from_metrics(ticker, as_of)
+        source = "ticker_metrics_daily" if mcap_usd else None
+        if mcap_usd is None:
+            mcap_usd = _pos_float(profile.get("market_cap"))
+            source = "company_profiles" if mcap_usd else None
+        if mcap_usd is None:
+            mcap_usd = self._market_cap_from_tiingo(ticker, as_of)
+            source = "tiingo_fundamentals" if mcap_usd else None
+        if mcap_usd is None:
+            mcap_usd = self._market_cap_from_fmp(ticker)
+            source = "fmp" if mcap_usd else None
+
+        runway = _pos_float(profile.get("cash_runway_months"))
+        if runway is None:
+            cash = _pos_float(profile.get("cash"))
+            burn = _pos_float(profile.get("quarterly_burn"))
+            if cash is not None and burn is not None:
+                runway = round(cash / max(burn, 1.0) * 3.0, 1)
+
+        return {
+            "market_cap_mm": round(mcap_usd / 1e6, 2) if mcap_usd else None,
+            "market_cap_source": source,
+            "cash_runway_months": runway,
+            "pipeline_depth": _int_or_none(profile.get("pipeline_depth")),
+            "cash": _pos_float(profile.get("cash")),
+            "quarterly_burn": _pos_float(profile.get("quarterly_burn")),
+        }
+
+    def _company_gate(self, company_data: dict) -> str:
+        """Enforced mcap gate: 'pass' | 'skip' (>$2B or <$10M) | 'cap_unknown'."""
+        mc = company_data.get("market_cap_mm")
+        if mc is None:
+            return "cap_unknown"
+        if mc > MARKET_CAP_MAX_MM or mc < MARKET_CAP_MIN_MM:
+            return "skip"
+        return "pass"
 
     def _passes_company_gates(self, company_data: dict) -> bool:
-        mc = company_data.get("market_cap_mm")
-        if mc is not None and mc > 2000:
-            return False
-        if mc is not None and mc < 10:
-            return False
-        return True
+        """Back-compat boolean view of :meth:`_company_gate` (unknown cap passes, but is capped)."""
+        return self._company_gate(company_data) != "skip"
 
     # ── Scoring ────────────────────────────────────────────────────────────────
 
@@ -698,6 +901,127 @@ class TrialGemSignal:
         if fda:
             catalysts.append(f"FDA designation: {fda}")
         return catalysts
+
+
+# ── Module helpers ────────────────────────────────────────────────────────────
+
+
+def _pos_float(value: Any) -> Optional[float]:
+    """Finite positive float or None."""
+    if value is None or value == "":
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f in (float("inf"), float("-inf")) or f <= 0:
+        return None
+    return f
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmp_api_key() -> str:
+    """FMP key from the environment, else config.settings; '' when unset."""
+    key = os.getenv("FMP_API_KEY", "")
+    if key:
+        return key
+    try:
+        from config import settings
+
+        return str(getattr(settings, "FMP_API_KEY", "") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _storage_regime(regime: Optional[str]) -> str:
+    """Map any regime label onto the trial_signals CHECK set (unknown labels → UNKNOWN)."""
+    r = str(regime or "UNKNOWN").strip().upper()
+    return r if r in ALLOWED_REGIMES else "UNKNOWN"
+
+
+def _unit_score(value: Any, default: float = 0.5) -> float:
+    """Clamp a score component into [0, 1] for the NUMERIC(5,4) score columns.
+
+    A runway in months written here overflowed the column ("must round to an
+    absolute value less than 10^1") and dropped every signal with a known
+    runway, so the write path never trusts the caller's range.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    if v != v:  # NaN
+        return default
+    return round(min(1.0, max(0.0, v)), 4)
+
+
+def _rowcount(cur: Any) -> int:
+    """psycopg2 rowcount as an insert count (unknown/-1 → 1)."""
+    rc = getattr(cur, "rowcount", None)
+    if rc is None or not isinstance(rc, int) or rc < 0:
+        return 1
+    return rc
+
+
+def _db_config_from_engine(engine: Any) -> dict:
+    """psycopg2 connect kwargs from a SQLAlchemy engine URL (falls back to env)."""
+    url = getattr(engine, "url", None)
+    host = getattr(url, "host", None)
+    if url is None or not host:
+        return {
+            "host": os.getenv("DB_HOST", "localhost"),
+            "port": int(os.getenv("DB_PORT", 5432)),
+            "dbname": os.getenv("DB_NAME", "griddb"),
+            "user": os.getenv("DB_USER", "grid"),
+            "password": os.getenv("DB_PASSWORD", ""),
+        }
+    return {
+        "host": host,
+        "port": int(getattr(url, "port", None) or 5432),
+        "dbname": getattr(url, "database", None) or "griddb",
+        "user": getattr(url, "username", None) or "grid",
+        "password": getattr(url, "password", None) or "",
+    }
+
+
+def run_daily(engine: Any, top_n: int = RUN_DAILY_TOP_N) -> dict:
+    """Hermes entry point (registry ``trial_signal``): generate top ``top_n`` and persist.
+
+    Instantiates :class:`TrialGemSignal` against the GRID engine's DSN (the
+    engine itself feeds the sponsor resolver cache), writes to
+    ``trial_signals`` + ``catalyst_calendar`` and returns counts. Never raises.
+    """
+    started = time.monotonic()
+    sig: Optional[TrialGemSignal] = None
+    try:
+        sig = TrialGemSignal(db_config=_db_config_from_engine(engine), engine=engine)
+        results = sig.generate(top_n=top_n)
+        written = sig.write_to_db(results)
+        counts = {
+            "status": "SUCCESS",
+            "scored": len(results),
+            "written": written,
+            "buy": sum(1 for r in results if r.signal_type == "BUY"),
+            "watchlist": sum(1 for r in results if r.signal_type == "WATCHLIST"),
+            "avoid": sum(1 for r in results if r.signal_type == "AVOID"),
+            "elapsed_s": round(time.monotonic() - started, 1),
+        }
+        counts.update({k: v for k, v in sig.stats.items() if k != "scored"})
+        log.info("trial_signal.run_daily: %s", counts)
+        return counts
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"trial_signal.run_daily failed: {e}")
+        return {"status": "FAILED", "error": str(e)[:200], "scored": 0, "written": 0,
+                "elapsed_s": round(time.monotonic() - started, 1)}
+    finally:
+        if sig is not None:
+            sig.close()
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
