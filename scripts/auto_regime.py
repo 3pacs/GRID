@@ -105,15 +105,18 @@ DEFAULT_FEATURE_WEIGHTS: dict[str, float] = {
 # nothing feeds this concept, so its weight drops to zero rather than scoring a
 # frozen column.
 REGIME_FEATURE_SOURCES: dict[str, list[str]] = {
-    # vix_spot (id 11) is the right feature — 18,303 observations back to 1990,
-    # fed by both VIXCLS and YF:^VIX:close, raw fresh to 2026-09-10 — but it is
-    # model_eligible = FALSE, so the governance gate below skips it. It stays
-    # first so it takes over the day that flag is flipped. vvix (id 18094) is
-    # the eligible fed stand-in: same direction (vol-of-vol spikes with VIX),
-    # 384 observations, seed `vvix` raw fresh to 2026-09-10. `vix` (id 105) has
-    # no seed at all — it is one of the frozen rows that produced the hollow
-    # backfill — and is listed only as a last resort.
-    "vix":               ["vix_spot", "vvix", "vix"],
+    # vix_spot (id 11) is the feature — 18,303 observations back to 1990, fed by
+    # both VIXCLS and YF:^VIX:close, raw fresh to 2026-09-10 — and it is
+    # model_eligible = FALSE, so the governance gate below skips it and this
+    # concept scores nothing until that flag is flipped. It is the only
+    # candidate on purpose. vvix (id 18094) is eligible and fed, but VVIX is
+    # the volatility *of* VIX: a different series with different dynamics that
+    # can spike while VIX is quiet, and it would carry the index's largest
+    # weight (+0.20) under a slider labelled "vix". `vix` (id 105) is eligible
+    # with 505 observations and no seed at all — listing it as a fallback would
+    # bind this concept straight back to one of the frozen rows that produced
+    # the hollow backfill. An honest zero beats either.
+    "vix":               ["vix_spot"],
 
     # hy_oas_spread (id 18150): 7,636 observations from 1996, fed by
     # BAMLH0A0HYM2, raw fresh to 2026-09-09. hyg_full resolves further (to

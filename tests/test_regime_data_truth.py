@@ -106,6 +106,14 @@ class TestFeatureAliasing:
         # And its name never even reaches the query.
         assert conn.execute.call_count == 0
 
+    def test_the_vix_concept_never_binds_to_a_different_series(self):
+        """vvix is eligible and fed, but VVIX is the volatility *of* VIX — it
+        can spike while VIX is quiet, and it would carry the index's largest
+        weight (+0.20) under a slider labelled "vix". `vix` id 105 is eligible
+        with 505 observations and no seed, so listing it would bind straight
+        back to one of the frozen rows this PR is about. Honest zero instead."""
+        assert REGIME_FEATURE_SOURCES["vix"] == ["vix_spot"]
+
     def test_the_credit_concept_never_binds_to_the_etf_price(self):
         """hyg_full resolves further than hy_oas_spread, but it is the HY ETF
         price: it falls as spreads widen. Scoring it under a +0.15 stress
@@ -123,7 +131,7 @@ class TestFeatureAliasing:
         assert _candidate_names("not_a_concept") == ["not_a_concept"]
 
     def test_binds_the_first_candidate_that_is_fed(self):
-        concept = "vix"
+        concept = "dollar_index"
         first, second = REGIME_FEATURE_SOURCES[concept][:2]
         engine, _ = _engine_returning(
             [
@@ -136,7 +144,7 @@ class TestFeatureAliasing:
         assert bindings[concept]["feature_id"] == 11
 
     def test_falls_through_to_the_next_candidate_when_the_first_is_absent(self):
-        concept = "vix"
+        concept = "dollar_index"
         second = REGIME_FEATURE_SOURCES[concept][1]
         engine, _ = _engine_returning([(12, second, 900, DATA_CLIFF)])
         bindings = _resolve_regime_bindings(engine, {concept: 0.2})
@@ -145,7 +153,7 @@ class TestFeatureAliasing:
     def test_skips_a_candidate_with_too_little_history_for_the_zscore(self):
         """The index is a 252-day rolling z-score; a column shorter than that
         contributes mostly its own warm-up."""
-        concept = "vix"
+        concept = "dollar_index"
         first, second = REGIME_FEATURE_SOURCES[concept][:2]
         engine, _ = _engine_returning(
             [
@@ -153,7 +161,7 @@ class TestFeatureAliasing:
                 (12, second, MIN_CANDIDATE_OBSERVATIONS, DATA_CLIFF),
             ]
         )
-        bindings = _resolve_regime_bindings(engine, {concept: 0.2})
+        bindings = _resolve_regime_bindings(engine, {concept: 0.05})
         assert bindings[concept]["feature"] == second
 
     def test_a_registered_but_never_fed_candidate_is_rejected(self):
@@ -349,8 +357,9 @@ class TestPersistCarriesTheDataDate:
 class TestBackfillCarriesTheDataDate:
     def test_each_backfilled_row_gets_its_own_data_date(self):
         engine, _ = _engine_returning(
-            [(1, "vix", 900, DATA_CLIFF), (2, "hy_spread", 900, DATA_CLIFF),
-             (3, "sp500", 900, DATA_CLIFF)]
+            [(1, "vix_spot", 900, DATA_CLIFF),
+             (2, "hy_oas_spread", 900, DATA_CLIFF),
+             (3, "sp500_full", 900, DATA_CLIFF)]
         )
 
         def fake_compute(eng, as_of, weights=None, fid_to_name=None):

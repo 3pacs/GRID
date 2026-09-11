@@ -50,9 +50,12 @@ def _pit_frame(as_of: date, n_days: int = 400, release_offset_days: int = 1) -> 
 
 def _engine_with_features(
     fids=(
-        (1, "vix", 900, date(2026, 9, 9)),
-        (2, "hy_spread", 900, date(2026, 9, 9)),
-        (3, "sp500", 900, date(2026, 9, 9)),
+        # The features that actually back the vix / hy_spread / sp500 concepts
+        # (scripts.auto_regime.REGIME_FEATURE_SOURCES), not the frozen registry
+        # rows that share the concept names.
+        (1, "vix_spot", 900, date(2026, 9, 9)),
+        (2, "hy_oas_spread", 900, date(2026, 9, 9)),
+        (3, "sp500_full", 900, date(2026, 9, 9)),
     )
 ):
     """Mock engine whose feature query answers the candidate/coverage shape.
@@ -316,9 +319,9 @@ class TestBackfill:
         existing.fetchall.return_value = [(date(2026, 9, 2),), (date(2026, 9, 3),)]
         feats = MagicMock()
         feats.fetchall.return_value = [
-            (1, "vix", 900, date(2026, 9, 9)),
-            (2, "hy_spread", 900, date(2026, 9, 9)),
-            (3, "sp500", 900, date(2026, 9, 9)),
+            (1, "vix_spot", 900, date(2026, 9, 9)),
+            (2, "hy_oas_spread", 900, date(2026, 9, 9)),
+            (3, "sp500_full", 900, date(2026, 9, 9)),
         ]
         conn.execute.side_effect = [feats, existing]
 
