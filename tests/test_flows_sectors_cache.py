@@ -395,6 +395,28 @@ def test_persist_sectors_snapshot_skips_unchanged_payload(monkeypatch):
     assert fake_store.save_snapshot.call_count == 1
 
 
+def test_persist_sectors_snapshot_retries_unchanged_payload_after_failed_save(monkeypatch):
+    """A failed insert must not poison the hash: if `save_snapshot` returns
+    None (insert failure), the next cycle must retry the persist even when
+    the sector data is unchanged, instead of treating it as already saved."""
+    fake_store = MagicMock()
+    monkeypatch.setattr(
+        "store.snapshots.AnalyticalSnapshotStore",
+        lambda db_engine, retention_per_category=None: fake_store,
+    )
+    monkeypatch.setattr(flows_router, "get_db_engine", lambda: MagicMock())
+    fake_store.save_snapshot.side_effect = [None, 7]
+
+    sectors = {"Energy": {"etf": "XLE", "sector_stress": 0.4}}
+    flows_router._persist_sectors_snapshot({"sectors": sectors, "computed_at": "2026-09-11T00:00:00+00:00"})
+    assert flows_router._last_persisted_sectors_hash is None
+
+    flows_router._persist_sectors_snapshot({"sectors": sectors, "computed_at": "2026-09-11T00:04:00+00:00"})
+
+    assert fake_store.save_snapshot.call_count == 2
+    assert flows_router._last_persisted_sectors_hash is not None
+
+
 def test_persist_sectors_snapshot_persists_again_when_data_changes(monkeypatch):
     fake_store = MagicMock()
     monkeypatch.setattr(

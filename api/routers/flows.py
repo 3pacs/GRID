@@ -304,7 +304,9 @@ def _persist_sectors_snapshot(payload: dict[str, Any]) -> None:
     Only writes a new row when the sector data actually changed since the
     last persisted snapshot — see `_hash_sectors_payload`. Retention on
     `AnalyticalSnapshotStore` caps the table as a backstop even if the data
-    keeps changing every cycle.
+    keeps changing every cycle. The hash is only recorded after a successful
+    insert, so a failed persist is retried on the next cycle even when the
+    data is unchanged.
 
     Best-effort only: a persistence failure must never fail the warm cycle
     or block a request — the process just falls back to the in-memory
@@ -323,7 +325,10 @@ def _persist_sectors_snapshot(payload: dict[str, Any]) -> None:
             db_engine=get_db_engine(),
             retention_per_category=_SECTOR_SNAPSHOT_RETENTION,
         )
-        store.save_snapshot(category=_SECTOR_SNAPSHOT_CATEGORY, payload=payload)
+        snap_id = store.save_snapshot(category=_SECTOR_SNAPSHOT_CATEGORY, payload=payload)
+        if snap_id is None:
+            log.warning("Sector flow snapshot persist returned no id — will retry next cycle")
+            return
         _last_persisted_sectors_hash = payload_hash
     except Exception as exc:
         log.warning("Sector flow snapshot persist failed (non-fatal): {e}", e=str(exc))
