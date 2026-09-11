@@ -5,6 +5,9 @@ import StatusDot from '../components/StatusDot.jsx';
 import ViewHelp from '../components/ViewHelp.jsx';
 import { colors, tokens, shared, themes, getColors } from '../styles/shared.js';
 import { formatDateTime } from '../utils/formatTime.js';
+import { useAsyncData } from '../hooks/useAsyncData.js';
+import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
+import ErrorState from '../components/ErrorState.jsx';
 
 // ── Styles ──────────────────────────────────────────────────────
 
@@ -198,7 +201,6 @@ export default function Settings({ onLogout, onShowTour }) {
     const isAdmin = userRole === 'admin';
 
     const [tab, setTab] = useState('Status');
-    const [services, setServices] = useState(null);
     const [apiKeys, setApiKeys] = useState(null);
     const [hermesStatus, setHermesStatus] = useState(null);
     const [freshness, setFreshness] = useState(null);
@@ -208,23 +210,21 @@ export default function Settings({ onLogout, onShowTour }) {
     const [showAddUser, setShowAddUser] = useState(false);
     const [loading, setLoading] = useState({});
 
+    const { data: services, loading: statusLoading, error: statusError, refetch: loadServices } = useAsyncData(async () => {
+        const d = await api.getServices();
+        if (d?.error) throw new Error(d.message || 'Failed to load services');
+        return d;
+    }, { fallback: null, skip: true });
+
     // Fetch data for current tab
     useEffect(() => {
-        if (tab === 'Status') fetchServices();
+        if (tab === 'Status') loadServices();
         if (tab === 'API Keys') fetchApiKeys();
         if (tab === 'Hermes') fetchHermes();
         if (tab === 'Coverage') fetchCoverage();
         if (tab === 'Notifications') fetchPushPreferences();
         if (tab === 'Account') fetchUsers();
     }, [tab]);
-
-    const fetchServices = () => {
-        setLoading(p => ({ ...p, services: true }));
-        api.getServices()
-            .then(d => setServices(d))
-            .catch(() => addNotification('error', 'Failed to load services'))
-            .finally(() => setLoading(p => ({ ...p, services: false })));
-    };
 
     const fetchApiKeys = () => {
         setLoading(p => ({ ...p, keys: true }));
@@ -437,6 +437,8 @@ export default function Settings({ onLogout, onShowTour }) {
     // ── Render helpers ──────────────────────────────────────────
 
     const renderStatus = () => {
+        if (statusLoading && !services) return <LoadingSkeleton variant="card" count={3} />;
+        if (statusError) return <ErrorState error={statusError} onRetry={loadServices} title="Service status unavailable" />;
         const svc = services;
         const res = svc?.resources || {};
         return (

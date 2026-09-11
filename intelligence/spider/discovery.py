@@ -6,9 +6,14 @@ from typing import Any
 
 from loguru import logger as log
 
+from intelligence.actor_identity import build_person_index, resolve_canonical_actor_id
 from intelligence.entity_resolver import SpiderEntityResolver as EntityResolver
 from intelligence.spider.graph_engine import GraphEngine
 from intelligence.spider.models import ConnectionMeta, DiscoveredConnection
+
+# Actor-id prefixes that hold natural persons, for the SEC person-filer rule
+# ("SCRIVNER DOUGLAS G" -> the insider actor already in the graph).
+_PERSON_ID_PREFIXES: tuple[str, ...] = ("insider_", "ins_", "congress_", "gov_")
 
 
 class DiscoveryOrchestrator:
@@ -18,6 +23,19 @@ class DiscoveryOrchestrator:
         self._graph = graph
         self._resolver = resolver
         self._adapters: list[Any] = adapters
+
+    def _build_person_index(self) -> dict[str, str]:
+        """Name key -> person actor id, over the person-shaped ids only.
+
+        Restricting to person ids keeps a company from ever answering a person
+        key. One O(actors) pass, built at most once per expansion and only when
+        a person filer actually turns up.
+        """
+        return build_person_index(
+            (actor_id, data.get("name", ""))
+            for actor_id, data in self._graph.iter_actors()
+            if actor_id.startswith(_PERSON_ID_PREFIXES)
+        )
 
     def expand(self, actor_id: str) -> tuple[list[dict[str, Any]], list[tuple[str, str, ConnectionMeta]]]:
         """Expand an actor's connections using all adapters.
@@ -58,8 +76,36 @@ class DiscoveryOrchestrator:
         new_actors: list[dict[str, Any]] = []
         new_connections: list[tuple[str, str, ConnectionMeta]] = []
 
+        # Built on first use: most expansions turn up no person filer at all.
+        person_index: dict[str, str] | None = None
+
+        def person_lookup(key: str) -> str | None:
+            nonlocal person_index
+            if person_index is None:
+                person_index = self._build_person_index()
+            return person_index.get(key)
+
         for dc in unique:
-            target_id = self._resolver.resolve(dc.target_name, dc.target_hint)
+            # SEC filer display names ("BlackRock Inc.  (BLK)  (CIK 0001364742)")
+            # name an entity the graph usually already holds as a ticker or
+            # insider actor. Resolve that first — it is a hard-data identity,
+            # where the resolver below is a fuzzy edit-distance guess — and
+            # attach the edge to the canonical node instead of minting a
+            # corporation_<slug> twin that only ever connects to other twins.
+            canonical = resolve_canonical_actor_id(
+                dc.target_name,
+                exists=self._graph.has_actor,
+                person_lookup=person_lookup,
+            )
+            if canonical is not None:
+                target_id, rule = canonical
+                self._graph.add_alias(target_id, dc.target_name)
+                log.debug(
+                    "Folded filer '{n}' into {t} via {r}",
+                    n=dc.target_name, t=target_id, r=rule,
+                )
+            else:
+                target_id = self._resolver.resolve(dc.target_name, dc.target_hint)
 
             if target_id is None:
                 category = dc.target_hint.get("category", "corporation")

@@ -155,6 +155,13 @@ def _load_price(
 # LAYER SCORERS
 # ═══════════════════════════════════════════════════════════════
 
+# Max attainable SETUP points: drawdown 5 + VIX 5 + credit 4 + curve 3. The
+# 3-point planetary_stress_index component was removed 2026-09-10 (astrology
+# is not a market-scoring input); the layer's 20-point weight in the composite
+# is preserved through LayerResult.max_score.
+SETUP_MAX_SCORE = 17
+
+
 def score_setup(
     conn,
     ticker: str,
@@ -168,7 +175,9 @@ def score_setup(
     vix = _load_latest(conn, "vix_spot", as_of_date=as_of_date)
     hy = _load_latest(conn, "hy_oas_spread", as_of_date=as_of_date)
     _load_latest(conn, "ofr_financial_stress", as_of_date=as_of_date)
-    psi = _load_latest(conn, "planetary_stress_index", as_of_date=as_of_date)
+    # planetary_stress_index was removed from this layer 2026-09-10: a celestial
+    # feature must not be an input to a market-scoring endpoint
+    # (LEVER-PACKAGE.md §4.1 / §7 T0.5). It stays available to AstroGrid.
     yc = _load_latest(conn, "yld_curve_2s10s", as_of_date=as_of_date)
 
     if price.empty:
@@ -210,17 +219,14 @@ def score_setup(
             score += 2
             signals.append(f"HY={hy:.1f} [STRESS]")
 
-    # PSI (0-3 pts)
-    if psi is not None and 0.5 < psi < 4.0:
-        score += 3
-        signals.append(f"PSI={psi:.1f} [FAVORABLE]")
-
     # Yield curve (0-3 pts)
     if yc is not None and yc < 0:
         score += 3
         signals.append(f"YC={yc:.2f} [INVERTED]")
 
-    return LayerResult("SETUP", min(score, 20), 20, 0.95, tuple(signals), True)
+    # Max is 17 since the 3-point celestial component was removed; the layer
+    # keeps its 20-point weight in the composite via LayerResult.max_score.
+    return LayerResult("SETUP", min(score, SETUP_MAX_SCORE), SETUP_MAX_SCORE, 0.95, tuple(signals), True)
 
 
 def score_company(

@@ -389,6 +389,50 @@ def daily_digest() -> None:
             except Exception:
                 pass
 
+        # Long plays (multi-year board; every multiple is a labelled proxy)
+        try:
+            from intelligence.long_plays import entry_first, load_latest_board
+
+            board = load_latest_board(engine)
+            if board:
+                lines: list[str] = []
+                # Entry candidates first — a name that cleared the gate is
+                # what the operator can act on, whatever its asymmetry rank.
+                for cand in entry_first(board.get("candidates") or []):
+                    if cand.get("stance") not in ("entry_candidate", "watch"):
+                        continue
+                    proj = ((cand.get("projection") or {}).get("3y") or {})
+                    p50 = proj.get("p50_multiple")
+                    p50_txt = f"{p50:.2f}x" if isinstance(p50, (int, float)) else "n/a"
+                    gate = cand.get("gate") or {}
+                    cats = cand.get("catalysts") or []
+                    first_cat = (
+                        f"{cats[0].get('event_type')} {cats[0].get('expected_date')}"
+                        if cats
+                        else (
+                            f"catalyst {gate['next_catalyst_date']}"
+                            if gate.get("next_catalyst_date") else "no catalyst"
+                        )
+                    )
+                    route = cand.get("coverage_route")
+                    route_txt = f" — via {route}" if route else ""
+                    lines.append(
+                        f"{cand.get('ticker')} — {cand.get('stance')}{route_txt} — "
+                        f"p50 3y {p50_txt} (proxy) — {first_cat}"
+                    )
+                    if len(lines) >= 5:
+                        break
+                if lines:
+                    sections.append(_section_text(
+                        "Long plays",
+                        "\n".join(lines) + "\n(proxy multiples from historical CAGR/vol; not forecasts)",
+                        accent="#7c5cff",
+                    ))
+                elif board.get("stand_down_reason"):
+                    sections.append(_section_text("Long plays", str(board["stand_down_reason"])))
+        except Exception:
+            pass
+
         if not sections:
             sections.append(_section_text("Status", "All systems operational. No notable events in the last 24 hours."))
 

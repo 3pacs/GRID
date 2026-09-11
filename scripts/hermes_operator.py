@@ -92,17 +92,26 @@ SIGNAL_CLASSIFICATION_TIMEOUT_SECONDS = 120   # gemma micro classifier batch
 ANOMALY_NARRATION_TIMEOUT_SECONDS = 90        # gemma micro anomaly narrator
 KNOWLEDGE_MAP_TIMEOUT_SECONDS = 120           # gemma micro knowledge mapper
 DIAGNOSE_PULLS_TIMEOUT_SECONDS = 240          # Hermes pull diagnosis/fix step — bumped 2026-05-08 because diagnose runs per-source retry which can chain HTTP calls
+RESOLUTION_TIMEOUT_SECONDS = 240              # normalization.resolver.Resolver.resolve_pending — see RESOLUTION_CYCLE_LOOKBACK_DAYS
 SMART_INGESTION_TIMEOUT_SECONDS = 300         # smart_scheduler.tick() — matches TICK_TIME_BUDGET_S in ingestion/smart_scheduler.py so Hermes doesn't pull the plug while SmartScheduler is mid-shutdown
 TIMESFM_TIMEOUT_SECONDS = 240                 # oracle/forecaster_adapter.run_timesfm_forecast_cycle
-INTELLIGENCE_TASKS_TIMEOUT_SECONDS = 360      # trust/forecasts/thesis/cross-ref/options + daily-window backtest_scanner.review_existing_hypotheses (LLM-bound). Bumped 2026-05-08 from 180s after the timeout machinery was actually working — 180s was empirical-untested guess; 360s reflects observed daily run length with LLM calls
+DAILY_INTEL_BATCH_OBSERVED_S = 360            # observed run length of the 02:00 daily block (source_audit → backtest_scan → postmortem → options_improvement → hypothesis_review → auto_discover) with LLM calls, measured 2026-05-08
+INTELLIGENCE_TASKS_TIMEOUT_SECONDS = 900      # whole run_intelligence_tasks() step. MUST exceed ACTIVE_HYPO_SCORING_MAX_RUNTIME_S + DAILY_INTEL_BATCH_OBSERVED_S: the 30-min active-hypothesis scorer runs FIRST inside this step, so if its budget alone exceeds this cap the step times out before the daily block — and auto_discover() — is ever reached. That inversion (360s cap vs 600s scorer) is how hypothesis discovery starved from 2026-05-15 onward. Was 360 (2026-05-08); raised 2026-09-10. tests/test_hermes_timeout_budgets.py pins the invariant.
 POSTMORTEM_BATCH_LIMIT = 20                   # Drain postmortem backlog in bounded chunks instead of orphaning long LLM loops.
 
 # Active-hypothesis scoring — periodic batch that closes the loop on the
 # auto_discover() pipeline. The bottleneck is per-row score_hypothesis()
 # calls which the 2026-05-15 manual run timed at ~15/sec on grid-svr;
-# 200 rows / 600s leaves ample headroom (~3 rows/sec budget).
+# 200 rows / 240s is still ~1 row/sec of budget against a ~15 rows/sec
+# engine, so a full batch completes in ~15s and the cap only matters when
+# the DB is contended. The cap was 600s until 2026-09-10 — larger than the
+# 360s INTELLIGENCE_TASKS_TIMEOUT_SECONDS that wrapped it, which orphaned
+# the step twice an hour and could starve the daily block (see the note on
+# INTELLIGENCE_TASKS_TIMEOUT_SECONDS above). Runtime budget must satisfy
+# ACTIVE_HYPO_SCORING_MAX_RUNTIME_S + DAILY_INTEL_BATCH_OBSERVED_S
+# <= INTELLIGENCE_TASKS_TIMEOUT_SECONDS.
 ACTIVE_HYPO_SCORING_BATCH_SIZE = 200
-ACTIVE_HYPO_SCORING_MAX_RUNTIME_S = 600
+ACTIVE_HYPO_SCORING_MAX_RUNTIME_S = 240
 ACTIVE_HYPO_SCORING_INTERVAL_MINUTES = 30
 
 # Earnings events → earnings_calendar back-compat sync. The DB-side
@@ -114,6 +123,33 @@ ACTIVE_HYPO_SCORING_INTERVAL_MINUTES = 30
 # runs it every 30 minutes from Hermes alongside the active-hypothesis
 # scorer (same cadence, same scheduling mechanism).
 EARNINGS_CALENDAR_SYNC_INTERVAL_MINUTES = 30
+
+# Conflict resolution (cycle step 3b). This is the ONLY writer of
+# resolved_series, the table every PIT/analytical surface reads.
+#
+# History: commit b0a02b4 (2026-03-29) replaced the Python resolver with an
+# "INSERT ... SELECT ... JOIN entity_map" fast path that referenced a table
+# and columns that do not exist, inside `except: log.debug(...)`. It failed on
+# every cycle in silence and resolved_series stopped advancing for 5.5 months.
+# The resolver is back, and the failure path now logs at warning and lands in
+# cycle_result["resolution"].
+#
+# Cost control: the resolver's 30-day default window is for manual runs. The
+# cycle runs every 5 minutes, so it passes a 2-day window, narrowed further by
+# a watermark (state.last_resolution, persisted with the rest of OperatorState
+# in the hermes_operator analytical_snapshots payload and rehydrated on
+# restart). The watermark is the time the last successful run STARTED, minus
+# an overlap margin, so a row pulled while the resolver was running is picked
+# up next cycle instead of being skipped.
+#
+# Measured on griddb 2026-09-11 (ops-exec run 34548358613, raw_series at
+# 1.93B rows / 510 GB): the cold 2-day window costs 1.8s for the DISTINCT
+# (18,865 series, index scan on idx_raw_series_pull_timestamp) plus 6.2s to
+# fetch its 655,376 rows — ~8s of SELECT inside a 240s budget. Once the
+# watermark is set the window is the overlap plus one cycle, not two days.
+RESOLUTION_CYCLE_LOOKBACK_DAYS = 2
+RESOLUTION_WATERMARK_OVERLAP_HOURS = 2
+RESOLUTION_CYCLE_WORKERS = 4
 
 # Keep signal classification under its per-step timeout. The classifier makes
 # one local LLM call per signal and live calls can approach 15s each.
@@ -225,6 +261,11 @@ _SOURCE_EXTRAS: dict[str, dict[str, Any]] = {
     "regulatory_events":           {"mod": "ingestion.altdata.regulatory_events",       "fn": "run_weekly",   "interval_h": 168},
     "obsidian":                    {"mod": "ingestion.altdata.obsidian_sync",           "fn": "run_sync",     "interval_h": 0.083},
     "trial_ingestor":              {"mod": "grid.ingestors.trial_ingestor",             "fn": "main",         "interval_h": 24},
+    # Trial-gem feed for the Long Plays board (task #28). Order matters:
+    # ingestor (CT.gov → trial_cache/catalyst_calendar) → signal (trial_signals)
+    # → small-cap enrichment (company_profiles cash / burn / runway / mcap).
+    "trial_signal":                {"mod": "grid.signals.trial_signal",                 "fn": "run_daily",    "interval_h": 24},
+    "small_cap_enrichment":        {"mod": "ingestion.altdata.small_cap_enrichment",    "fn": "pull_all",     "interval_h": 24},
 
     # ── Class-based pullers catalogued but not yet scheduler-wired
     # (Adding to PULLER_REGISTRY is the eventual fix; tracking here so
@@ -234,6 +275,8 @@ _SOURCE_EXTRAS: dict[str, dict[str, Any]] = {
     "pmxt_archive":    {"mod": "ingestion.altdata.pmxt_archive",               "cls": "PmxtArchivePuller"},
     "pm_history":      {"mod": "ingestion.altdata.prediction_market_history",  "cls": "PredictionMarketHistoryPuller"},
     "warn_layoffs":    {"mod": "ingestion.altdata.warn_layoffs",               "cls": "WARNLayoffsPuller",     "interval_h": 24},
+    # FMP market-cap refresh for trial tickers (pull(), not pull_all()).
+    "company_profiles_puller": {"mod": "ingestion.altdata.company_profiles_puller", "cls": "CompanyProfilesPuller", "pull_method": "pull", "interval_h": 24},
 
     # ── skip_runtime stubs (ctor/method signature mismatch — needs wrapper
     # or _resolve_puller upgrade before they can actually run).
@@ -766,6 +809,19 @@ def run_intelligence_tasks(
         except Exception as exc:
             log.warning("Source audit import failed: {e}", e=str(exc))
 
+        # Flow materialization — projects signal_sources into the relational
+        # flow tables (dark_pool_weekly, etf_flows, insider_trades,
+        # congressional_trades, junction_point_readings). The module existed
+        # with zero callers, which is why those tables were documented empty
+        # (docs/planning/FILL-EMPTY-TABLES.md; LEVER-PACKAGE.md §7 T1.4).
+        try:
+            from ingestion.flow_materializer import sync_all as _flow_sync_all
+            results["flow_materialize"] = _run_intel_task(
+                "flow_materialize", _flow_sync_all, state, engine,
+            )
+        except Exception as exc:
+            log.warning("Flow materializer import failed: {e}", e=str(exc))
+
         try:
             from analysis.backtest_scanner import run_full_scan
             results["backtest_scan"] = _run_intel_task(
@@ -1295,6 +1351,141 @@ def _run_obsidian_cycle(engine: Any) -> dict[str, Any]:
 
 # ─── Main loop ───────────────────────────────────────────────────────
 
+def _is_transient_db_error(exc: BaseException) -> bool:
+    """True when a failure is operational rather than a defect in our code.
+
+    ``sqlalchemy.exc.OperationalError`` is the wrapper for everything the
+    database refuses for reasons outside the statement itself — a
+    statement_timeout cancellation, a dropped or exhausted connection, a
+    server restart. Its sibling ``ProgrammingError`` (the 2026-03 regression's
+    "column does not exist") is emphatically not transient, and must keep
+    showing up as a real failure. Health surfaces use this to tell "the
+    database was busy" from "this code is broken", which was exactly the
+    distinction lost when the whole path sat inside ``except: log.debug``.
+
+    Args:
+        exc: The exception raised by the resolver.
+
+    Returns:
+        True if a retry on the next cycle could plausibly succeed unchanged.
+    """
+    try:
+        from sqlalchemy.exc import OperationalError
+    except Exception:  # pragma: no cover - SQLAlchemy is a hard dependency
+        return False
+    return isinstance(exc, OperationalError)
+
+
+def _run_resolution_step(engine: Any, state: OperatorState) -> dict[str, Any]:
+    """Run conflict resolution for this cycle and report the outcome.
+
+    Resolution is the pipeline step that makes ingested data visible to every
+    PIT consumer, so its failures must never be silent: any error is logged at
+    warning and returned in ``cycle_result["resolution"]``, and the outcome is
+    recorded on ``state.task_status`` (surfaced by the Hermes status payload).
+
+    The watermark only advances on a clean run — a timeout, an exception, or a
+    worker error leaves it where it was so the next cycle re-scans the window.
+    A run abandoned on timeout keeps going as an orphan thread (see
+    _run_with_timeout); that is safe here because every insert is
+    ``ON CONFLICT ... DO NOTHING``, so the worst case is duplicated effort.
+
+    Args:
+        engine: SQLAlchemy engine for the GRID database.
+        state: OperatorState carrying the ``last_resolution`` watermark.
+
+    Returns:
+        The resolver summary, or a dict with ``timeout``/``error``.
+    """
+    state.current_step = "resolution"
+    run_started = datetime.now(timezone.utc)
+    since = None
+    if getattr(state, "last_resolution", None):
+        since = state.last_resolution - timedelta(
+            hours=RESOLUTION_WATERMARK_OVERLAP_HOURS
+        )
+    step_t0 = time.time()
+    # _run_with_timeout reports a raise and a timeout the same way, so the
+    # exception is captured here to tell the two apart in cycle_result.
+    failure: dict[str, Any] = {}
+
+    def _resolve() -> dict[str, Any]:
+        from normalization.resolver import Resolver
+
+        try:
+            return Resolver(db_engine=engine).resolve_pending(
+                lookback_days=RESOLUTION_CYCLE_LOOKBACK_DAYS,
+                workers=RESOLUTION_CYCLE_WORKERS,
+                since=since,
+            )
+        except Exception as exc:
+            failure["error"] = str(exc)
+            failure["error_class"] = type(exc).__name__
+            failure["transient"] = _is_transient_db_error(exc)
+            raise
+
+    result, ok = _run_with_timeout(
+        "resolution", _resolve, RESOLUTION_TIMEOUT_SECONDS, state,
+    )
+
+    if failure:
+        # Warning for every failure (CLAUDE.md reserves log.error for
+        # unhandled application bugs), but the class is in the message and
+        # the transient flag rides along so the health surfaces can tell a
+        # dropped connection from a programming error without parsing text.
+        log.warning(
+            "Resolution failed ({c}{t}): {e} — watermark held at {w}",
+            c=failure["error_class"],
+            t=", transient" if failure["transient"] else "",
+            e=failure["error"], w=getattr(state, "last_resolution", None),
+        )
+        detail = f"{failure['error_class']}: {failure['error']}"
+        state.record_task(
+            "resolution", False, time.time() - step_t0, detail,
+            transient=failure["transient"],
+        )
+        return {
+            "error": failure["error"],
+            "error_class": failure["error_class"],
+            "transient": failure["transient"],
+        }
+
+    if not ok or result is None:
+        # A step abandoned at the timeout is the operational case by
+        # definition — it ran out of budget, it did not misbehave.
+        log.warning(
+            "Resolution step did not complete (timeout after {s}s) — "
+            "watermark held at {w}",
+            s=RESOLUTION_TIMEOUT_SECONDS, w=getattr(state, "last_resolution", None),
+        )
+        state.record_task(
+            "resolution", False, time.time() - step_t0, "timeout", transient=True,
+        )
+        return {"timeout": True, "transient": True}
+
+    if result.get("errors"):
+        log.warning(
+            "Resolution completed with {e} worker error(s) — resolved={r}, "
+            "watermark held at {w}",
+            e=result["errors"], r=result.get("resolved", 0),
+            w=getattr(state, "last_resolution", None),
+        )
+        state.record_task(
+            "resolution", False, time.time() - step_t0,
+            f"{result['errors']} worker error(s)",
+        )
+        return result
+
+    state.last_resolution = run_started
+    state.record_task("resolution", True, time.time() - step_t0)
+    log.info(
+        "Resolution: {r} rows resolved, {c} conflicts, {s} series in {t}s",
+        r=result.get("resolved", 0), c=result.get("conflicts_found", 0),
+        s=result.get("series_scanned", 0), t=result.get("duration_s", 0),
+    )
+    return result
+
+
 def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     """Execute one operator cycle."""
     state.cycle_count += 1
@@ -1450,38 +1641,15 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
             log.error("Smart ingestion failed: {e}", e=str(exc))
             cycle_result["ingestion"] = {"error": str(exc)}
 
-    # 3b. Fast SQL resolution (skip slow Python resolver — use INSERT SELECT)
+    # 3b. Conflict resolution — raw_series → resolved_series via the
+    # canonical resolver (priority_rank winner + per-family conflict
+    # thresholds). See RESOLUTION_CYCLE_LOOKBACK_DAYS above for why this
+    # is not a bare INSERT ... SELECT, and why a failure here is loud.
     if dry_run:
         cycle_result["resolution"] = {"skipped": "dry_run"}
-        log.info("[DRY RUN] Would run fast resolution")
+        log.info("[DRY RUN] Would run conflict resolution")
     else:
-        try:
-            state.current_step = "resolution"
-            with engine.begin() as conn:
-                # Set statement timeout to avoid blocking the cycle
-                conn.execute(text("SET LOCAL statement_timeout = '120s'"))
-                # Fast bulk resolve: INSERT into resolved_series from raw_series
-                # for any rows pulled in the last hour that don't have resolved entries
-                result = conn.execute(text("""
-                    INSERT INTO resolved_series (feature_id, obs_date, value, source_id, resolved_at)
-                    SELECT em.feature_id, rs.obs_date, rs.value, rs.source_id, NOW()
-                    FROM raw_series rs
-                    JOIN entity_map em ON em.series_id = rs.series_id
-                    WHERE rs.pull_timestamp > NOW() - INTERVAL '1 hour'
-                    AND rs.pull_status = 'SUCCESS'
-                    AND NOT EXISTS (
-                        SELECT 1 FROM resolved_series res
-                        WHERE res.feature_id = em.feature_id
-                        AND res.obs_date = rs.obs_date
-                    )
-                    ON CONFLICT (feature_id, obs_date) DO NOTHING
-                """))
-                res_count = result.rowcount
-            cycle_result["resolution"] = {"rows_resolved": res_count}
-            if res_count:
-                log.info("Fast resolution: {n} new rows", n=res_count)
-        except Exception as exc:
-            log.debug("Resolution: {e}", e=str(exc))
+        cycle_result["resolution"] = _run_resolution_step(engine, state)
 
     # 4. Fill data gaps — SKIP: SmartScheduler handles freshness now
     # The old gap filler re-pulled entire sources which was slow.

@@ -23,12 +23,14 @@ import { buildRouteHash } from '../routing.js';
 import useCanvasStore from './CanvasStore.js';
 import SigmaGraph from './SigmaGraph.jsx';
 import DetailPanel from './panels/DetailPanel.jsx';
+import SweepPanel from './panels/SweepPanel.jsx';
 import ContextMenu from './ContextMenu.jsx';
 import LayerControls from './LayerControls.jsx';
 import TemporalScrubber from './TemporalScrubber.jsx';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts.js';
 import { useCommunities } from './hooks/useCommunities.js';
-import { EDGE_LEGEND } from '../components/canvas/nodeStyles.js';
+import { useEventStream } from '../hooks/useEventStream.js';
+import { EDGE_LEGEND } from './nodeStyles.js';
 
 // ── Lens lenses — lazy-loaded to keep the graph bundle lean ──
 const CanvasSupplyLens = React.lazy(() => import('../views/canvas_lenses/SupplyLens.jsx'));
@@ -711,6 +713,7 @@ export default function GothamCanvas() {
         graph, selectedNode, detailPanelOpen, detailData, loading,
         contextMenu, activeLayers, boardName, searchQuery, boardId, visibleDepth,
         loadGraph, addNodes, selectNode, clearSelection, toggleLayer,
+        sweep, setSweep,
         setTimeRange, hideContextMenu, showContextMenu, setVisibleDepth,
     } = store;
 
@@ -728,6 +731,19 @@ export default function GothamCanvas() {
     const [canvasStatus, setCanvasStatus] = useState(null);
     const nameInputRef = useRef(null);
     const sigmaRef = useRef(null);
+
+    // ── Live signal pulses ──
+    // Typed contracts (SignalFired, ActorMaterialized, PredictionScored,
+    // RegimeTransition…) arrive over /api/v1/events/stream; any node the
+    // payload names pulses in place for ACTIVITY_TTL_MS. Layout is untouched.
+    const onLiveEvent = useCallback((evt) => {
+        useCanvasStore.getState().markActivity(evt);
+    }, []);
+    useEventStream({ onEvent: onLiveEvent });
+    useEffect(() => {
+        const timer = setInterval(() => useCanvasStore.getState().decayActivity(), 5000);
+        return () => clearInterval(timer);
+    }, []);
 
     const getBoardIdFromHash = useCallback(() => parseCanvasHash().boardId, []);
 
@@ -1024,9 +1040,9 @@ export default function GothamCanvas() {
     const finishEditName = () => setEditingName(false);
 
     // ── Search ──
-    const handleSearchSubmit = useCallback(async (e) => {
-        if (e.key !== 'Enter' || !searchQuery.trim()) return;
-        const query = searchQuery.trim();
+    const runSearch = useCallback(async (rawQuery) => {
+        const query = String(rawQuery || '').trim();
+        if (!query) return;
         useCanvasStore.getState().setLoading(true);
         try {
             const graphKey = canvasGraphCacheKey(query, CANVAS_STORAGE_DEPTH, 'all', null, 350);
@@ -1060,7 +1076,38 @@ export default function GothamCanvas() {
         } finally {
             useCanvasStore.getState().setLoading(false);
         }
-    }, [searchQuery, loadGraph, connectDots, setLensActorId]);
+    }, [loadGraph, connectDots, setLensActorId]);
+
+    const handleSearchSubmit = useCallback((e) => {
+        if (e.key !== 'Enter' || !searchQuery.trim()) return;
+        runSearch(searchQuery);
+    }, [searchQuery, runSearch]);
+
+    // ── Sweep verdicts: load the latest persisted long-horizon sweep once ──
+    // 90 d first (the Sunday job), then whatever ran most recently.
+    useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            try {
+                let data = await api.getLatestSweep({ horizonDays: 90 });
+                if (!data || data.error) data = await api.getLatestSweep();
+                if (!cancelled && data && !data.error && Array.isArray(data.top_k)) setSweep(data);
+            } catch (err) {
+                // No sweep yet is normal on a fresh server; the panel explains it.
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [setSweep]);
+
+    const verdictsLayerOn = activeLayers instanceof Set
+        ? activeLayers.has('verdicts')
+        : activeLayers?.verdicts !== false && !!activeLayers?.verdicts;
+
+    const handleSweepPick = useCallback((ticker) => {
+        if (!ticker) return;
+        useCanvasStore.getState().setSearchQuery(ticker);
+        runSearch(ticker);
+    }, [runSearch]);
 
     // ── Context menu actions ──
     const handleContextAction = useCallback(async (action) => {
@@ -1408,6 +1455,16 @@ export default function GothamCanvas() {
                     <div style={S.loadingOverlay}>
                         <div style={S.loadingText}>Mapping intelligence network...</div>
                     </div>
+                )}
+
+                {/* Sweep verdicts — takes the side slot when nothing is selected */}
+                {!isMobile && verdictsLayerOn && !detailPanelOpen && (
+                    <SweepPanel
+                        sweep={sweep}
+                        activeTicker={searchQuery}
+                        onPick={handleSweepPick}
+                        onClose={() => toggleLayer('verdicts')}
+                    />
                 )}
 
                 {/* Detail Panel — side panel on desktop, bottom sheet on mobile */}

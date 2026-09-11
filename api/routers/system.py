@@ -166,6 +166,26 @@ def health() -> HealthResponse:
         log.debug("Health: LLM availability check failed: {e}", e=str(exc))
         checks["llm_available"] = False
 
+    # --- Robinhood crypto connector ---
+    # Local state only (mode, caps): health is unauthenticated and must stay
+    # bounded, so this never calls Robinhood. An unconfigured connector is a
+    # normal state, not a degradation — the operator opts in by setting keys.
+    try:
+        from trading.robinhood import get_robinhood_trader
+
+        rh = get_robinhood_trader()
+        checks["robinhood"] = {
+            "mode": rh.mode,
+            "configured": rh.configured,
+            "live_trading": rh.live,
+            "max_position_usd": rh.max_position_usd,
+            "max_drawdown_pct": rh.max_drawdown_pct,
+        }
+    except Exception as exc:
+        log.warning("Health: Robinhood connector check failed: {e}", e=str(exc))
+        checks["robinhood"] = {"mode": "ERROR", "configured": False, "error": str(exc)}
+        degraded_reasons.append("robinhood connector misconfigured")
+
     # --- API key audit ---
     try:
         from config import settings
@@ -662,15 +682,23 @@ def pipeline_health(
                 ).fetchone()
                 resolver.pending = r[0] if r else 0
 
+                # Vintages are clamped to today: sources that publish
+                # forward-dated releases (FRED calendar rows reach
+                # 2026-12-31) would otherwise make an idle resolver look
+                # like it ran in the future. Verified on griddb 2026-09-11,
+                # ops-exec run 34547844805: MAX(vintage_date) = 2026-12-31
+                # while the last real resolution was 2026-04-04.
                 r = conn.execute(text(
-                    "SELECT MAX(vintage_date) FROM resolved_series"
+                    "SELECT MAX(vintage_date) FROM resolved_series "
+                    "WHERE vintage_date <= CURRENT_DATE"
                 )).fetchone()
                 if r and r[0]:
                     resolver.last_run = r[0].isoformat()
 
                 r = conn.execute(text(
                     "SELECT COUNT(*) FROM resolved_series "
-                    "WHERE vintage_date >= CURRENT_DATE - INTERVAL '1 day'"
+                    "WHERE vintage_date >= CURRENT_DATE - INTERVAL '1 day' "
+                    "AND vintage_date <= CURRENT_DATE"
                 )).fetchone()
                 resolver.last_resolved = r[0] if r else 0
             except Exception as exc:
@@ -1111,7 +1139,7 @@ def hermes_status(
 _SECRET_FIELDS = {
     "DB_PASSWORD", "FRED_API_KEY", "BLS_API_KEY", "TRADINGVIEW_WEBHOOK_SECRET",
     "KOSIS_API_KEY", "COMTRADE_API_KEY", "JQUANTS_PASSWORD", "USDA_NASS_API_KEY",
-    "NOAA_TOKEN", "EIA_API_KEY", "GDELT_API_KEY", "WORLDNEWS_API_KEY",
+    "NOAA_TOKEN", "EIA_API_KEY", "GDELT_API_KEY", "WORLDNEWS_API_KEY", "NEWSAPI_KEY",
     "COINGECKO_API_KEY", "ALPHAVANTAGE_API_KEY", "TWELVEDATA_API_KEY",
     "OPENAI_API_KEY", "GRID_MASTER_PASSWORD_HASH", "GRID_JWT_SECRET",
     "POLYMARKET_API_KEY", "POLYMARKET_PRIVATE_KEY", "KALSHI_PASSWORD",

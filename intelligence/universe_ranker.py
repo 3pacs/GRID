@@ -58,6 +58,9 @@ from sqlalchemy.engine import Engine
 
 
 DEFAULT_TOP_K: int = 20
+# Horizon (days) handed to should_i_trade for every ticker in a sweep. The
+# weekday sweep keeps the legacy 7d; the Sunday long-horizon sweep passes 90.
+DEFAULT_HORIZON_DAYS: int = 7
 
 # Regime signature cutoffs (pct of succeeded tickers with verdict='high')
 TRENDING_HIGH_FRACTION: float = 0.20   # > 20% → trending
@@ -166,6 +169,11 @@ class TickerRanking:
     composite_score: float
     has_ticket: bool
     error: str | None = None
+    # Names of the decision-stack stages that degraded for this ticker
+    # (``DecisionResponse.stage_errors`` keys). A sweep where every ticker
+    # lands no_trade is only diagnosable if this survives — see
+    # ``verdict_counts``.
+    stage_errors: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -178,6 +186,7 @@ class TickerRanking:
             "composite_score": round(self.composite_score, 4),
             "has_ticket": self.has_ticket,
             "error": self.error,
+            "stage_errors": list(self.stage_errors),
         }
 
 
@@ -224,10 +233,16 @@ class UniverseRankingReport:
     generated_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
+    # Forecast horizon every should_i_trade call in this sweep used (days).
+    horizon_days: int = 7
+    # Verdict histogram + degraded-stage tally for the whole sweep
+    # (``verdict_counts``). Persisted so an empty ``top_k`` is explainable.
+    verdict_counts: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "universe_name": self.universe_name,
+            "horizon_days": self.horizon_days,
             "tickers_attempted": self.tickers_attempted,
             "tickers_succeeded": self.tickers_succeeded,
             "top_k": [r.to_dict() for r in self.top_k],
@@ -239,6 +254,7 @@ class UniverseRankingReport:
             "regime_signature": self.regime_signature,
             "narrative": self.narrative,
             "generated_at": self.generated_at,
+            "verdict_counts": dict(self.verdict_counts),
         }
 
 
@@ -324,6 +340,29 @@ def detect_sector_concentration(
     return alerts
 
 
+def verdict_counts(rankings: Sequence[TickerRanking]) -> dict[str, Any]:
+    """Verdict histogram plus the degraded-stage tally for a sweep.
+
+    A sweep whose ``top_k`` is empty is otherwise a dead end: the
+    persisted row said only "no high/medium verdicts found". This block
+    answers the next question — were the verdicts *computed* and weak, or
+    did the decision stack never produce a prediction? ``stage_errors``
+    counts how many tickers had each ``should_i_trade`` stage degrade.
+    """
+    counts: dict[str, Any] = {v: 0 for v in _VERDICT_ORDER}
+    counts["errors"] = 0
+    stages: dict[str, int] = {}
+    for r in rankings:
+        counts[r.verdict] = counts.get(r.verdict, 0) + 1
+        if r.error is not None:
+            counts["errors"] += 1
+        for stage in r.stage_errors:
+            stages[stage] = stages.get(stage, 0) + 1
+    counts["stage_errors"] = dict(sorted(stages.items()))
+    counts["rankable"] = sum(counts.get(v, 0) for v in _RANKABLE_VERDICTS)
+    return counts
+
+
 def rank_tickers(
     rankings: Sequence[TickerRanking],
     k: int = DEFAULT_TOP_K,
@@ -357,11 +396,24 @@ def build_narrative(report: "UniverseRankingReport") -> str:
             "nothing to rank."
         )
     if not report.top_k:
+        # An empty sweep must say what the verdicts *were* and which stages
+        # degraded, or the reader cannot tell a weak market from a broken
+        # stack (that ambiguity is what left the Long Plays coverage gate
+        # unreachable on 2026-09-10).
+        counts = report.verdict_counts or {}
+        histogram = ", ".join(
+            f"{v}={counts[v]}" for v in _VERDICT_ORDER if counts.get(v)
+        )
+        stage_errors = counts.get("stage_errors") or {}
+        detail = f" verdicts: {histogram}." if histogram else ""
+        if stage_errors:
+            worst = sorted(stage_errors.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+            detail += " Degraded stages: " + ", ".join(f"{s} on {n}" for s, n in worst) + "."
         return (
             f"Universe '{report.universe_name}': "
             f"{report.tickers_succeeded}/{report.tickers_attempted} "
             f"tickers scored, regime={report.regime_signature}, "
-            "no high/medium verdicts found — stand down."
+            f"no high/medium verdicts found — stand down.{detail}"
         )
 
     top_mentions = ", ".join(
@@ -446,6 +498,7 @@ def _run_one_ticker(
     ticker: str,
     *,
     account_size_usd: float,
+    horizon_days: int = DEFAULT_HORIZON_DAYS,
 ) -> TickerRanking:
     """Call ``should_i_trade`` for a single ticker defensively.
 
@@ -477,6 +530,7 @@ def _run_one_ticker(
             engine,
             ticker,
             account_size_usd=account_size_usd,
+            horizon_days=horizon_days,
         )
     except Exception as exc:  # noqa: BLE001
         log.debug(
@@ -519,6 +573,7 @@ def _run_one_ticker(
         composite_score=score,
         has_ticket=ticket is not None,
         error=None,
+        stage_errors=tuple(sorted(getattr(response, "stage_errors", {}) or {})),
     )
 
 
@@ -600,9 +655,15 @@ def rank_universe(
     account_size_usd: float = 100_000.0,
     top_k: int = DEFAULT_TOP_K,
     parallel: bool = False,
+    horizon_days: int = DEFAULT_HORIZON_DAYS,
 ) -> UniverseRankingReport:
     """Run ``should_i_trade`` across a ticker universe and rank by
     composite score.
+
+    ``horizon_days`` (2026-09-10) is passed to every ``should_i_trade``
+    call and recorded on the report; the weekly long-horizon sweep in
+    ``intelligence/scheduler.py`` runs this at 90 days so multi-month
+    verdicts are persisted in ``universe_ranking_history``.
 
     Sequential by default; ``parallel=True`` fans out over a
     ``ThreadPoolExecutor`` with at most ``MAX_PARALLEL_WORKERS`` workers
@@ -642,6 +703,7 @@ def rank_universe(
                         engine,
                         t,
                         account_size_usd=account_size_usd,
+                        horizon_days=horizon_days,
                     ): t
                     for t in tickers
                 }
@@ -667,7 +729,9 @@ def rank_universe(
             for t in tickers:
                 rankings.append(
                     _run_one_ticker(
-                        engine, t, account_size_usd=account_size_usd
+                        engine, t,
+                        account_size_usd=account_size_usd,
+                        horizon_days=horizon_days,
                     )
                 )
     except Exception as exc:  # noqa: BLE001
@@ -718,6 +782,8 @@ def rank_universe(
         concentration_alerts=alerts,
         regime_signature=regime,
         narrative="",
+        horizon_days=horizon_days,
+        verdict_counts=verdict_counts(rankings),
     )
     return _with_narrative(report)
 
@@ -740,6 +806,8 @@ def _with_narrative(report: UniverseRankingReport) -> UniverseRankingReport:
         regime_signature=report.regime_signature,
         narrative=text_,
         generated_at=report.generated_at,
+        horizon_days=report.horizon_days,
+        verdict_counts=report.verdict_counts,
     )
 
 
@@ -768,9 +836,27 @@ def ensure_ranking_table(engine: Engine) -> None:
         )
         """
     )
+    # 2026-09-10: horizon of the sweep. Existing rows were all 7 d.
+    alter = text(
+        """
+        ALTER TABLE universe_ranking_history
+        ADD COLUMN IF NOT EXISTS horizon_days INTEGER NOT NULL DEFAULT 7
+        """
+    )
+    # 2026-09-10: verdict histogram + degraded-stage tally. The first 90 d
+    # sweep persisted 33/33 tickers and an empty top_k with nothing on the
+    # row to say why; this column is that "why".
+    alter_counts = text(
+        """
+        ALTER TABLE universe_ranking_history
+        ADD COLUMN IF NOT EXISTS verdict_counts JSONB NOT NULL DEFAULT '{}'::jsonb
+        """
+    )
     try:
         with engine.begin() as conn:
             conn.execute(ddl)
+            conn.execute(alter)
+            conn.execute(alter_counts)
     except Exception as exc:  # noqa: BLE001
         log.debug("universe_ranker: ensure_ranking_table failed: {e}", e=exc)
 
@@ -789,15 +875,17 @@ def persist_ranking(engine: Engine, report: UniverseRankingReport) -> int:
     insert_sql = text(
         """
         INSERT INTO universe_ranking_history (
-            generated_at, universe_name,
+            generated_at, universe_name, horizon_days,
             tickers_attempted, tickers_succeeded,
             regime_signature, top_k,
-            sector_distributions, concentration_alerts, narrative
+            sector_distributions, concentration_alerts, narrative,
+            verdict_counts
         ) VALUES (
-            :generated_at, :universe_name,
+            :generated_at, :universe_name, :horizon_days,
             :tickers_attempted, :tickers_succeeded,
             :regime_signature, :top_k,
-            :sector_distributions, :concentration_alerts, :narrative
+            :sector_distributions, :concentration_alerts, :narrative,
+            :verdict_counts
         )
         RETURNING id
         """
@@ -810,6 +898,7 @@ def persist_ranking(engine: Engine, report: UniverseRankingReport) -> int:
                 {
                     "generated_at": report.generated_at,
                     "universe_name": report.universe_name,
+                    "horizon_days": int(report.horizon_days),
                     "tickers_attempted": report.tickers_attempted,
                     "tickers_succeeded": report.tickers_succeeded,
                     "regime_signature": report.regime_signature,
@@ -823,6 +912,7 @@ def persist_ranking(engine: Engine, report: UniverseRankingReport) -> int:
                         list(report.concentration_alerts)
                     ),
                     "narrative": report.narrative,
+                    "verdict_counts": json.dumps(dict(report.verdict_counts)),
                 },
             ).first()
         if row is None:
@@ -831,6 +921,138 @@ def persist_ranking(engine: Engine, report: UniverseRankingReport) -> int:
     except Exception as exc:  # noqa: BLE001
         log.debug("universe_ranker: persist_ranking failed: {e}", e=exc)
         return -1
+
+
+# ── Read-back (2026-09-10) ──────────────────────────────────────────────
+#
+# The Sunday long-horizon sweep persists here; until now nothing read the
+# table back. These two helpers are the domain layer behind
+# ``GET /api/v1/conviction/sweeps`` so the canvas can paint the latest
+# verdicts without re-running the (slow) decision stack.
+
+_LATEST_RANKING_SQL = text(
+    """
+    SELECT id, generated_at, universe_name, horizon_days, tickers_attempted,
+           tickers_succeeded, regime_signature, top_k, sector_distributions,
+           concentration_alerts, narrative, verdict_counts
+    FROM universe_ranking_history
+    WHERE (CAST(:horizon_days AS INTEGER) IS NULL OR horizon_days = :horizon_days)
+      AND (CAST(:universe_name AS TEXT) IS NULL OR universe_name = :universe_name)
+    ORDER BY generated_at DESC, id DESC
+    LIMIT 1
+    """
+)
+
+_COUNT_RANKINGS_SQL = text(
+    """
+    SELECT COUNT(*) FROM universe_ranking_history
+    WHERE (CAST(:horizon_days AS INTEGER) IS NULL OR horizon_days = :horizon_days)
+    """
+)
+
+_PAGE_RANKINGS_SQL = text(
+    """
+    SELECT id, generated_at, universe_name, horizon_days, tickers_attempted,
+           tickers_succeeded, regime_signature, top_k, sector_distributions,
+           concentration_alerts, narrative, verdict_counts
+    FROM universe_ranking_history
+    WHERE (CAST(:horizon_days AS INTEGER) IS NULL OR horizon_days = :horizon_days)
+    ORDER BY generated_at DESC, id DESC
+    LIMIT :limit OFFSET :offset
+    """
+)
+
+
+def _ranking_row_to_dict(row: Any) -> dict[str, Any]:
+    import json
+
+    def _j(v: Any, default: Any = None) -> Any:
+        if default is None:
+            default = []
+        if v is None:
+            return default
+        if isinstance(v, (list, dict)):
+            return v
+        try:
+            return json.loads(v)
+        except (TypeError, ValueError):
+            return default
+
+    generated_at = row[1]
+    return {
+        "id": int(row[0]),
+        "generated_at": (
+            generated_at.isoformat() if hasattr(generated_at, "isoformat") else generated_at
+        ),
+        "universe_name": row[2],
+        "horizon_days": int(row[3]) if row[3] is not None else DEFAULT_HORIZON_DAYS,
+        "tickers_attempted": int(row[4] or 0),
+        "tickers_succeeded": int(row[5] or 0),
+        "regime_signature": row[6],
+        "top_k": _j(row[7]),
+        "sector_distributions": _j(row[8]),
+        "concentration_alerts": _j(row[9]),
+        "narrative": row[10] or "",
+        "verdict_counts": _j(row[11] if len(row) > 11 else None, {}),
+    }
+
+
+def load_latest_ranking(
+    engine: Engine,
+    *,
+    horizon_days: int | None = None,
+    universe_name: str | None = None,
+) -> dict[str, Any] | None:
+    """Most recent persisted sweep, optionally filtered by horizon/universe.
+
+    Returns the row as a JSON-safe dict (``top_k`` already parsed), or
+    ``None`` when nothing matches or the table does not exist yet.
+    """
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                _LATEST_RANKING_SQL,
+                {"horizon_days": horizon_days, "universe_name": universe_name},
+            ).first()
+    except Exception as exc:  # noqa: BLE001
+        log.debug("universe_ranker: load_latest_ranking failed: {e}", e=exc)
+        return None
+    return _ranking_row_to_dict(row) if row is not None else None
+
+
+def list_rankings(
+    engine: Engine,
+    *,
+    limit: int = 20,
+    offset: int = 0,
+    horizon_days: int | None = None,
+) -> dict[str, Any]:
+    """Page through persisted sweeps, newest first.
+
+    Returns ``{"entries", "total", "limit", "offset", "has_more"}`` (the
+    list-endpoint contract in ``.claude/rules/security.md``). ``top_k`` is
+    returned per row so a client can diff verdicts across sweeps.
+    """
+    limit = max(1, int(limit))
+    offset = max(0, int(offset))
+    params: dict[str, Any] = {"horizon_days": horizon_days}
+    try:
+        with engine.connect() as conn:
+            total = int(conn.execute(_COUNT_RANKINGS_SQL, params).scalar() or 0)
+            rows = conn.execute(
+                _PAGE_RANKINGS_SQL, {**params, "limit": limit, "offset": offset}
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        log.debug("universe_ranker: list_rankings failed: {e}", e=exc)
+        total, rows = 0, []
+    entries = [_ranking_row_to_dict(r) for r in rows]
+    return {
+        "entries": entries,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "has_more": offset + len(entries) < total,
+    }
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────

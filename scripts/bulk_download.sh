@@ -1,6 +1,19 @@
 #!/bin/bash
 set -u
 
+# API keys come from the repo .env (same pattern as grid_hourly_catchup.sh);
+# never hardcode them in this script.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+GRID_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+if [[ -f "${GRID_ROOT}/.env" ]]; then
+    set -a
+    set +u
+    # shellcheck disable=SC1091
+    source "${GRID_ROOT}/.env"
+    set -u
+    set +a
+fi
+
 DATA_ROOT="${GRID_DATA_ROOT:-/data/grid}"
 BULK_ROOT="${GRID_BULK_ROOT:-$DATA_ROOT/bulk}"
 LOG_ROOT="${GRID_DOWNLOAD_LOG_ROOT:-$DATA_ROOT/logs/downloads}"
@@ -40,13 +53,16 @@ run_download() {
   local url="$2"
   local target="$3"
   shift 3
+  # The manifest is a plain-text log: never write a key-bearing URL into it.
+  local log_url
+  log_url="$(printf '%s' "$url" | sed -E 's/(api_key|apikey|token)=[^&]*/\1=REDACTED/g')"
 
   log_manifest \
     type=bulk_download \
     run_id="$RUN_ID" \
     dataset="$dataset" \
     state=queued \
-    url="$url" \
+    url="$log_url" \
     target="$target"
 
   (
@@ -56,7 +72,7 @@ run_download() {
         run_id="$RUN_ID" \
         dataset="$dataset" \
         state=done \
-        url="$url" \
+        url="$log_url" \
         target="$target" \
         bytes="$(file_size "$target")"
     else
@@ -65,7 +81,7 @@ run_download() {
         run_id="$RUN_ID" \
         dataset="$dataset" \
         state=failed \
-        url="$url" \
+        url="$log_url" \
         target="$target"
     fi
   ) &
@@ -84,9 +100,14 @@ echo "EIA downloads started in background"
 
 echo "=== 2. FRED BULK ==="
 cd "$BULK_ROOT/fred"
-# All FRED series metadata
-run_download "fred_all_series" "https://api.stlouisfed.org/fred/tags/series?api_key=bc8b4507787daf394e42f07b97d6c0fc&file_type=json&limit=100000" "fred_all_series.json"
-echo "FRED metadata downloading"
+# All FRED series metadata. FRED only accepts the key as a query parameter; it
+# comes from FRED_API_KEY in the environment and is redacted in the manifest.
+if [[ -z "${FRED_API_KEY:-}" ]]; then
+  echo "FRED_API_KEY not set -- skipping FRED metadata download"
+else
+  run_download "fred_all_series" "https://api.stlouisfed.org/fred/tags/series?api_key=${FRED_API_KEY}&file_type=json&limit=100000" "fred_all_series.json"
+  echo "FRED metadata downloading"
+fi
 
 echo "=== 3. SEC EDGAR FULL ==="
 cd "$BULK_ROOT/edgar"

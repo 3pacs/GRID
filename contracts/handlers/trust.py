@@ -106,6 +106,12 @@ def on_signal_fired(
     ``trust_scorer.register_signal`` so the Bayesian beta posterior has a
     row to deposit outcomes against once the prediction is scored.
 
+    ``signal_value`` is deliberately left ``None``. On ``register_signal``
+    that argument is the *price at signal time* — ``score_pending_signals``
+    reads it back as the entry price of the outcome return — so the
+    scorer must fetch the point-in-time close itself. The signed strength
+    travels in ``metadata["strength"]`` only.
+
     Best-effort: ``register_signal`` already swallows DB failures and
     returns ``None`` on unrecognised source types.
     """
@@ -151,6 +157,10 @@ def on_signal_fired(
         "strength": strength,
     }
 
+    # Never pass the strength as ``signal_value``: the scorer would price
+    # the row off a 0-1 "close", so every BUY scored CORRECT and every SELL
+    # WRONG whatever the market did. ``None`` makes register_signal fetch
+    # the PIT close at registration time.
     try:
         row_id = register_signal(
             engine,
@@ -158,7 +168,7 @@ def on_signal_fired(
             source_id=source_id,
             ticker=ticker,
             signal_type=direction,
-            signal_value=abs(strength) if strength else None,
+            signal_value=None,
             metadata=metadata,
         )
     except Exception as exc:

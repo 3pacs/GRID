@@ -293,6 +293,200 @@ def run_intelligence_loop() -> None:
     _sched.every().day.at("03:30").do(_actor_news_top200)
     _sched.every().sunday.at("04:00").do(_actor_news_weekly_tail)
 
+    def _journal_verdicts_daily() -> None:
+        """Close the decision-journal loop on a schedule (LEVER-PACKAGE §7 T0.2).
+
+        ``DecisionJournal.record_outcome`` had no scheduled caller — verdicts
+        only arrived when someone ran ``scripts/backfill_journal_verdicts.py``
+        by hand, so the oracle's journal-feedback multiplier
+        (``oracle/engine.py::_get_journal_feedback``) learned from whatever
+        happened to be backfilled. Runs after the 06:30 realized-alpha job.
+        """
+        try:
+            from scripts.backfill_journal_verdicts import run as _score_journal
+            summary = _score_journal(dry_run=False)
+            log.info(
+                "journal verdicts daily: scored={s} skipped={k}",
+                s=summary.get("scored", summary.get("updated", 0)),
+                k=summary.get("skipped", 0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("journal verdicts daily failed: {e}", e=str(exc))
+
+    _sched.every().day.at("06:45").do(_journal_verdicts_daily)
+
+    def _trial_outcomes_daily() -> None:
+        """Score what each trial readout actually did (2026-09-10).
+
+        ``trial_signals`` shipped with ``fwd_return_30d`` and a comment
+        saying a post-hoc job filled it. None existed — 135 rows, 0 scored.
+        Without this GRID has no record of any readout it flagged, so
+        ``intelligence/catalyst_ev.py`` can only offer a borrowed industry
+        base rate for P(success). This is the job that replaces that
+        borrowed number with GRID's own tape.
+
+        Runs daily and only over windows that have fully elapsed, so a
+        readout is scored once, ~30 days after it lands.
+        """
+        try:
+            from db import get_engine as _ge
+            from intelligence.trial_outcomes import score_trial_outcomes
+
+            summary = score_trial_outcomes(_ge())
+            log.info(
+                "trial outcomes: {r}/{rc} readouts, {s}/{sc} signals scored, {u} unpriced",
+                r=summary.get("readouts_scored"), rc=summary.get("readouts_considered"),
+                s=summary.get("signals_scored"), sc=summary.get("signals_considered"),
+                u=summary.get("unpriced"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("trial outcomes scoring failed: {e}", e=str(exc))
+
+    _sched.every().day.at("07:15").do(_trial_outcomes_daily)
+
+    def _long_horizon_sweep() -> None:
+        """Weekly 90-day decision sweep (LEVER-PACKAGE §7 T2.2).
+
+        The long-horizon stack (edge-scanner playbooks → ``should_i_trade``
+        with the coverage-gated conviction stack) existed but nothing ran
+        it, and the oracle only ever wrote ~35-day predictions. This sweep
+        runs ``rank_universe`` at 90 days and persists the report to
+        ``universe_ranking_history`` so multi-month verdicts accumulate a
+        track record.
+
+        Universe (2026-09-10): the edge scanner's playbook pool — 33
+        mid/large caps — **plus** the Long Plays pool
+        (``intelligence.long_plays.long_plays_universe``: trial gems,
+        catalyst names and enriched sub-$2 B small caps). The two had
+        drifted apart, so the names the Long Plays board exists to
+        surface could never earn sweep coverage: the board's coverage
+        gate asked the sweep about tickers the sweep had never scored.
+        """
+        try:
+            from db import get_engine as _ge
+            from intelligence.long_plays import long_plays_universe
+            from intelligence.market_edge_scanner import TARGET_UNIVERSE
+            from intelligence.universe_ranker import persist_ranking, rank_universe
+
+            engine = _ge()
+            playbook_pool = {str(t).strip().upper() for t in TARGET_UNIVERSE if t}
+            try:
+                board_pool = {str(t).strip().upper() for t in long_plays_universe(engine) if t}
+            except Exception as exc:  # noqa: BLE001
+                log.warning("long-horizon sweep: long_plays_universe unavailable: {e}", e=str(exc))
+                board_pool = set()
+            universe = sorted(playbook_pool | board_pool)
+
+            report = rank_universe(
+                engine,
+                universe,
+                horizon_days=90,
+                parallel=True,
+                top_k=25,
+            )
+            row_id = persist_ranking(engine, report)
+            log.info(
+                "long-horizon sweep: {s}/{a} tickers ({p} playbook + {b} long-plays), "
+                "regime={r}, verdicts={v}, top={t}, row={row}",
+                s=report.tickers_succeeded, a=report.tickers_attempted,
+                p=len(playbook_pool), b=len(board_pool - playbook_pool),
+                r=report.regime_signature,
+                v=report.verdict_counts,
+                t=[x.ticker for x in report.top_k[:5]],
+                row=row_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("long-horizon sweep failed: {e}", e=str(exc))
+
+    _sched.every().sunday.at("05:00").do(_long_horizon_sweep)
+
+    def _long_plays_weekly() -> None:
+        """Weekly Long Plays board (multi-year 10x/100x candidates).
+
+        Composes frontier themes, edge-scanner playbooks, trial catalysts,
+        options asymmetry, the 90 d sweep verdicts and the engine's realized
+        alpha into ``long_plays_board`` (``intelligence/long_plays.py``).
+        Runs 30 min after the 05:00 sweep so the coverage gate sees this
+        week's verdicts. Every number on the board is a labelled proxy.
+        """
+        try:
+            from db import get_engine as _ge
+            from intelligence.long_plays import build_long_plays_board, persist_board
+
+            engine = _ge()
+            board = build_long_plays_board(engine, top_k=25)
+            row_id = persist_board(engine, board)
+            log.info(
+                "long plays weekly: universe={u}, candidates={c}, entry={e}, top5={t}, row={row}, stand_down={sd}",
+                u=board.get("universe_size"),
+                c=len(board.get("candidates") or []),
+                e=board.get("entry_candidates"),
+                t=[(c["ticker"], c["stance"]) for c in (board.get("candidates") or [])[:5]],
+                row=row_id,
+                sd=board.get("stand_down_reason"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("long plays weekly failed: {e}", e=str(exc))
+
+    _sched.every().sunday.at("05:30").do(_long_plays_weekly)
+
+    def _curated_graph_analytics_weekly() -> None:
+        """Louvain communities / PageRank on the curated (named market actor) subgraph.
+
+        The full actor graph is 3.4M nodes dominated by the ICIJ / PEP /
+        sanctions dumps, so its communities describe offshore service
+        providers. This weekly pass writes ``actor_analytics_curated``, which
+        the lever map reads for its actor-community section.
+        """
+        try:
+            from scripts.graph_analytics import run_graph_analytics
+
+            result = run_graph_analytics(scope="curated")
+            log.info("curated graph analytics weekly: {r}", r=result)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("curated graph analytics weekly failed: {e}", e=str(exc))
+
+    _sched.every().sunday.at("04:30").do(_curated_graph_analytics_weekly)
+
+    # ── Trial gems → enriched small caps → board (daily chain, 2026-09-10) ──
+    # Hermes' _SOURCE_REGISTRY carries interval_h for these but nothing runs
+    # fn-based entries on that interval, and the 06:00 cron for the ingestor
+    # silently failed for five months on a missing log directory. Schedule the
+    # chain here so it does not depend on either: ingest CT.gov, score the
+    # signal (sub-$2B gate enforced), enrich the small caps' fundamentals.
+    def _trial_ingestor_daily() -> None:
+        try:
+            from db import get_engine as _ge
+            from grid.ingestors.trial_ingestor import run as _ingest
+            summary = _ingest(_ge())
+            log.info("trial ingestor daily: {s}", s=summary)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("trial ingestor daily failed: {e}", e=str(exc))
+
+    def _trial_signal_daily() -> None:
+        try:
+            from db import get_engine as _ge
+            from grid.signals.trial_signal import run_daily as _score
+            summary = _score(_ge(), top_n=60)
+            log.info("trial signal daily: {s}", s=summary)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("trial signal daily failed: {e}", e=str(exc))
+
+    def _small_cap_enrichment_daily() -> None:
+        try:
+            from db import get_engine as _ge
+            from ingestion.altdata.small_cap_enrichment import pull_all as _enrich
+            summary = _enrich(_ge())
+            log.info("small-cap enrichment daily: {s}", s=summary)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("small-cap enrichment daily failed: {e}", e=str(exc))
+
+    # Order matters: the signal's cap gate reads company_profiles.market_cap,
+    # which the enrichment writes — so enrich before scoring.
+    _sched.every().day.at("05:40").do(_trial_ingestor_daily)
+    _sched.every().day.at("05:52").do(_small_cap_enrichment_daily)
+    _sched.every().day.at("06:05").do(_trial_signal_daily)
+
     def _actor_trust_cog_recompute() -> None:
         """INTEL-2: recompute trust-vs-cog classification for every lever puller."""
         try:
@@ -352,6 +546,31 @@ def run_intelligence_loop() -> None:
             log.warning("calibration daily failed: {e}", e=str(exc))
 
     _sched.every().day.at("02:15").do(_calibration_snapshot_and_drift)
+
+    def _realized_alpha_daily() -> None:
+        """GRID-4 §8.1 truth gate: rolling realized alpha vs SPY, net of
+        5 bp/side, for every paper trade and scored oracle prediction.
+
+        Runs 06:30 UTC — after the 02:15 calibration snapshot and the 06:00
+        daily context, before US cash open — and upserts one row per
+        (as_of, source, horizon) into realized_alpha_daily plus the
+        per-trade decomposition into realized_alpha_trades.
+        """
+        try:
+            from db import get_engine as _ge
+            from alpha_research.realized_alpha import run_daily
+            summary = run_daily(_ge())
+            log.info(
+                "realized alpha daily: {s} scored, {k} skipped, spy={spy}, "
+                "headline={h}",
+                s=summary.get("scored", 0), k=summary.get("skipped", 0),
+                spy=summary.get("spy_feature"),
+                h=summary.get("headline_annualized"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("realized alpha daily failed: {e}", e=str(exc))
+
+    _sched.every().day.at("06:30").do(_realized_alpha_daily)
 
     # ── SWEEP: new puller hooks (CAT-25/27/30/49/71/81) ────────────────
 
