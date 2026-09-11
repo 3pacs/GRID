@@ -1632,3 +1632,91 @@ class TestResolverCli:
 
         assert resolver_main(["--no-conflict-report"]) == 0
         assert "Conflicts" not in capsys.readouterr().out
+
+
+class TestFeatureIdMemoisation:
+    """The measured cost of a 2-day window was not the SQL.
+
+    A 2-day dry run on griddb (ops-exec run 150) fetched 655,551 raw rows
+    into 569,400 (series_id, obs_date) groups over 18,916 distinct
+    series_ids, so the resolve loop called EntityMap.get_feature_id ~30x
+    per series. On a miss where the mapping exists but the feature is not
+    in feature_registry, get_feature_id re-runs _load_feature_cache() — a
+    full feature_registry SELECT — and logs a warning. That repetition was
+    54.6s of a 61.5s run; the two raw_series scans together were 9s.
+    """
+
+    @staticmethod
+    def _counting_map(feature_id=7):
+        """An EntityMap stand-in that records every get_feature_id call."""
+        calls: list[str] = []
+
+        def _get(series_id):
+            calls.append(series_id)
+            return feature_id
+
+        entity_map = MagicMock()
+        entity_map.get_feature_id.side_effect = _get
+        return entity_map, calls
+
+    @patch("normalization.resolver._flush_batch")
+    @patch("normalization.resolver.EntityMap")
+    def test_each_series_is_looked_up_once_per_run(self, MockEntityMap, _flush):
+        """Same series across many obs_dates must cost one lookup, not one
+        per observation."""
+        entity_map, calls = self._counting_map()
+        MockEntityMap.return_value = entity_map
+
+        rows = [
+            _raw_row("SPY", date(2026, 9, day)) for day in range(1, 11)
+        ]
+        engine, _ = _recording_engine(rows=rows)
+        summary = Resolver(db_engine=engine).resolve_pending(
+            lookback_days=2, workers=1, dry_run=True
+        )
+
+        assert summary["groups"] == 10, "expected one group per obs_date"
+        assert calls == ["SPY"], f"expected a single lookup, got {len(calls)}"
+
+    @patch("normalization.resolver._flush_batch")
+    @patch("normalization.resolver.EntityMap")
+    def test_unmapped_series_are_not_re_looked_up(self, MockEntityMap, _flush):
+        """A miss is the expensive case — it must be cached too."""
+        entity_map, calls = self._counting_map(feature_id=None)
+        MockEntityMap.return_value = entity_map
+
+        rows = [_raw_row("NOPE", date(2026, 9, day)) for day in range(1, 21)]
+        engine, _ = _recording_engine(rows=rows)
+        summary = Resolver(db_engine=engine).resolve_pending(
+            lookback_days=2, workers=1, dry_run=True
+        )
+
+        assert calls == ["NOPE"]
+        # Both counters are reported: 20 groups skipped, 1 series at fault.
+        assert summary["unmapped_groups"] == 20
+        assert summary["unmapped_series"] == 1
+        assert summary["candidates"] == 0
+
+    @patch("normalization.resolver._flush_batch")
+    @patch("normalization.resolver.EntityMap")
+    def test_distinct_series_each_get_their_own_lookup(self, MockEntityMap, _flush):
+        """Memoisation must not collapse different series onto one answer."""
+        seen: dict[str, int | None] = {"AAA": 1, "BBB": None, "CCC": 3}
+        entity_map = MagicMock()
+        entity_map.get_feature_id.side_effect = lambda sid: seen[sid]
+        MockEntityMap.return_value = entity_map
+
+        rows = [
+            _raw_row(sid, date(2026, 9, day))
+            for sid in seen
+            for day in (1, 2, 3)
+        ]
+        engine, _ = _recording_engine(rows=rows)
+        summary = Resolver(db_engine=engine).resolve_pending(
+            lookback_days=2, workers=1, dry_run=True
+        )
+
+        assert entity_map.get_feature_id.call_count == 3
+        assert summary["candidates"] == 6   # AAA and CCC, 3 obs_dates each
+        assert summary["unmapped_groups"] == 3
+        assert summary["unmapped_series"] == 1

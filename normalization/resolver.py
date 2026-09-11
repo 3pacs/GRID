@@ -202,8 +202,12 @@ class Resolver:
             dict carrying the historical counts (``resolved``,
             ``conflicts_found``, ``errors``), the volume observed at each
             phase (``series_count``, ``raw_rows``, ``groups``,
-            ``unmapped_groups``, ``candidates``), a ``dry_run`` flag and a
-            ``timings`` dict of per-phase seconds. Under dry_run
+            ``unmapped_groups``, ``unmapped_series``, ``candidates``), a
+            ``dry_run`` flag and a ``timings`` dict of per-phase seconds.
+            ``unmapped_series`` counts distinct series_ids the entity map
+            could not resolve — the actionable number, since
+            ``unmapped_groups`` scales with how many obs_dates each one
+            happens to have. Under dry_run
             ``resolved`` is 0 and ``candidates`` is what would have been
             written.
         """
@@ -227,6 +231,7 @@ class Resolver:
             "raw_rows": 0,
             "groups": 0,
             "unmapped_groups": 0,
+            "unmapped_series": 0,
             "candidates": 0,
         }
 
@@ -301,6 +306,32 @@ class Resolver:
             local_t = {"fetch_s": 0.0, "group_s": 0.0, "flush_s": 0.0}
             INSERT_BATCH = 500
 
+            # Memoise the series_id -> feature_id lookup for this partition.
+            #
+            # A 2-day window produced 569,400 (series_id, obs_date) groups
+            # over only 18,916 distinct series_ids, so the unmemoised loop
+            # called EntityMap.get_feature_id ~30x per series. That is not
+            # free: on a miss where the mapping exists but the feature is
+            # not in feature_registry, get_feature_id re-runs
+            # _load_feature_cache() — a full feature_registry SELECT — and
+            # logs a warning, every single time. Measured on griddb, that
+            # repetition was 54.6s of a 61.5s dry run while the two SQL
+            # scans together cost 9s.
+            #
+            # Partitions are disjoint by series_id, so a plain dict per
+            # worker needs no lock and shares nothing. Within one run a
+            # series that misses stays missed; the next cycle re-resolves
+            # it, which is the same staleness the cache refresh already had.
+            feature_ids: dict[str, int | None] = {}
+
+            def _feature_id(series_id: str) -> int | None:
+                """get_feature_id, resolved once per series_id per run."""
+                if series_id not in feature_ids:
+                    feature_ids[series_id] = entity_map.get_feature_id(series_id)
+                    if feature_ids[series_id] is None:
+                        local["unmapped_series"] += 1
+                return feature_ids[series_id]
+
             def _flush(batch: list[dict]) -> None:
                 """Account for a prepared batch, writing it unless dry_run."""
                 if not batch:
@@ -342,7 +373,7 @@ class Resolver:
                 insert_batch: list[dict] = []
 
                 for (series_id, obs_date_val), sources in groups.items():
-                    feature_id = entity_map.get_feature_id(series_id)
+                    feature_id = _feature_id(series_id)
                     if feature_id is None:
                         local["unmapped_groups"] += 1
                         continue
@@ -503,6 +534,7 @@ class Resolver:
             "raw_rows": 0,
             "groups": 0,
             "unmapped_groups": 0,
+            "unmapped_series": 0,
             "candidates": 0,
         }
         chunks: list[dict[str, Any]] = []
