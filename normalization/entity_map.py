@@ -217,6 +217,24 @@ SEED_MAPPINGS: dict[str, str] = {
     "gdelt_tone_usa": "gdelt_tone_usa",
     "gdelt_event_count": "gdelt_event_count",
 
+    # ── GDELT actor tones + country tensions (GDELTPuller.pull_recent,
+    # scheduled in ingestion/scheduler.py; physics/momentum.py reads these
+    # as a composite for the stepdad.finance news card) ────────────────────
+    "gdelt_actor_powell_tone": "gdelt_actor_powell_tone",
+    "gdelt_actor_lagarde_tone": "gdelt_actor_lagarde_tone",
+    "gdelt_actor_xi_tone": "gdelt_actor_xi_tone",
+    "gdelt_actor_putin_tone": "gdelt_actor_putin_tone",
+    "gdelt_actor_mbs_tone": "gdelt_actor_mbs_tone",
+    "gdelt_actor_yellen_tone": "gdelt_actor_yellen_tone",
+    "gdelt_actor_ueda_tone": "gdelt_actor_ueda_tone",
+    "gdelt_tension_us_china": "gdelt_tension_us_china",
+    "gdelt_tension_us_russia": "gdelt_tension_us_russia",
+    "gdelt_tension_us_iran": "gdelt_tension_us_iran",
+    "gdelt_tension_china_taiwan": "gdelt_tension_china_taiwan",
+    "gdelt_tension_russia_ukraine": "gdelt_tension_russia_ukraine",
+    "gdelt_tension_israel_iran": "gdelt_tension_israel_iran",
+    "gdelt_tension_india_china": "gdelt_tension_india_china",
+
     # ── Supply chain series (stored with feature name as series_id) ────────
     "supply_chain.ism_deliveries": "supply_chain.ism_deliveries",
     "supply_chain.ism_backlog": "supply_chain.ism_backlog",
