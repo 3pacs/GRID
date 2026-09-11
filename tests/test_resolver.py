@@ -1720,3 +1720,40 @@ class TestFeatureIdMemoisation:
         assert summary["candidates"] == 6   # AAA and CCC, 3 obs_dates each
         assert summary["unmapped_groups"] == 3
         assert summary["unmapped_series"] == 1
+
+    def test_a_failed_chunk_does_not_abort_the_run(self):
+        """The controller runs the catch-up in slices; one chunk timing out
+        must not discard the chunks that already landed. Chunks are
+        independent and idempotent, so the failure is recorded and the run
+        moves on."""
+        resolver = Resolver(db_engine=MagicMock())
+        seen: list[str] = []
+
+        def _flaky(workers=8, dry_run=False, since=None, until=None, **_kw):
+            seen.append(since.date().isoformat())
+            if since.date() == date(2026, 4, 11):
+                raise RuntimeError("canceling statement due to statement timeout")
+            return {
+                "resolved": 2, "conflicts_found": 0, "errors": 0,
+                "series_count": 1, "raw_rows": 2, "groups": 1,
+                "unmapped_groups": 0, "unmapped_series": 0, "candidates": 2,
+                "dry_run": dry_run, "timings": {"total_s": 0.1},
+            }
+
+        resolver.resolve_pending = _flaky  # type: ignore[method-assign]
+
+        result = resolver.resolve_backlog(
+            since=date(2026, 4, 4), until=date(2026, 4, 25), chunk_days=7
+        )
+
+        # All three chunks were attempted, not just the ones before the failure.
+        assert seen == ["2026-04-04", "2026-04-11", "2026-04-18"]
+        # The two good chunks still counted.
+        assert result["totals"]["resolved"] == 4
+        assert result["totals"]["errors"] == 1
+        # The failed chunk names itself so the operator can retry that range.
+        failed = [c for c in result["chunks"] if c.get("failed")]
+        assert len(failed) == 1
+        assert failed[0]["since"] == "2026-04-11"
+        assert "statement timeout" in failed[0]["failed"]
+        assert failed[0]["resolved"] == 0

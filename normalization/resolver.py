@@ -207,9 +207,8 @@ class Resolver:
             ``unmapped_series`` counts distinct series_ids the entity map
             could not resolve — the actionable number, since
             ``unmapped_groups`` scales with how many obs_dates each one
-            happens to have. Under dry_run
-            ``resolved`` is 0 and ``candidates`` is what would have been
-            written.
+            happens to have. Under dry_run ``resolved`` is 0 and
+            ``candidates`` is what would have been written.
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import threading
@@ -504,6 +503,8 @@ class Resolver:
 
         Returns:
             dict with the window, one summary per chunk, and summed totals.
+            A chunk that raised carries ``errors: 1`` and a ``failed``
+            message instead of counts; the run continues past it.
         """
         lower = _as_utc(since)
         upper = (
@@ -541,12 +542,32 @@ class Resolver:
         started = time.perf_counter()
 
         for index, (chunk_from, chunk_to) in enumerate(bounds, start=1):
-            summary = self.resolve_pending(
-                workers=workers,
-                dry_run=dry_run,
-                since=chunk_from,
-                until=chunk_to,
-            )
+            # One chunk must not take the run down with it. The chunks are
+            # independent and idempotent, so a chunk that times out (a wide
+            # window, a busy server) is recorded and skipped — the operator
+            # retries just that range, narrower, instead of losing every
+            # chunk that already landed.
+            chunk_started = time.perf_counter()
+            try:
+                summary = self.resolve_pending(
+                    workers=workers,
+                    dry_run=dry_run,
+                    since=chunk_from,
+                    until=chunk_to,
+                )
+            except Exception as exc:
+                log.error(
+                    "Chunk {i}/{n} [{a} → {b}) failed, continuing: {e}",
+                    i=index, n=len(bounds), a=chunk_from.date(),
+                    b=chunk_to.date(), e=str(exc),
+                )
+                summary = dict.fromkeys(totals, 0)
+                summary.update(
+                    errors=1,
+                    dry_run=dry_run,
+                    failed=str(exc),
+                    timings={"total_s": round(time.perf_counter() - chunk_started, 3)},
+                )
             for key in totals:
                 totals[key] += int(summary.get(key, 0))
             record = {
