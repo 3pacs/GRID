@@ -342,6 +342,7 @@ async def get_actor_detail(
 @router.get("/actor/{actor_id}/analytics")
 async def get_actor_analytics_endpoint(
     actor_id: str,
+    scope: str = Query("full", pattern="^(full|curated)$", description="full graph or curated market-actor subgraph"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Return precomputed graph analytics for a single actor.
@@ -353,10 +354,10 @@ async def get_actor_analytics_endpoint(
         from store.graph import get_actor_analytics
 
         engine = get_db_engine()
-        result = get_actor_analytics(actor_id, engine=engine)
+        result = get_actor_analytics(actor_id, engine=engine, scope=scope)
         if result is None:
             return {"error": f"No analytics found for actor '{actor_id}'", "analytics": None}
-        return {"analytics": result}
+        return {"analytics": result, "scope": scope}
     except Exception as exc:
         log.warning("Actor analytics for {a} failed: {e}", a=actor_id, e=str(exc))
         return {"analytics": None, "error": str(exc)}
@@ -366,6 +367,7 @@ async def get_actor_analytics_endpoint(
 async def get_top_actors_endpoint(
     metric: str = Query("pagerank", description="Metric to rank by"),
     limit: int = Query(20, ge=1, le=200, description="Number of actors to return"),
+    scope: str = Query("full", pattern="^(full|curated)$", description="full graph or curated market-actor subgraph"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Return top actors ranked by any analytics metric.
@@ -377,8 +379,8 @@ async def get_top_actors_endpoint(
         from store.graph import get_top_actors
 
         engine = get_db_engine()
-        actors = get_top_actors(metric=metric, limit=limit, engine=engine)
-        return {"actors": actors, "metric": metric, "count": len(actors)}
+        actors = get_top_actors(metric=metric, limit=limit, engine=engine, scope=scope)
+        return {"actors": actors, "metric": metric, "count": len(actors), "scope": scope}
     except ValueError as exc:
         return {"actors": [], "metric": metric, "count": 0, "error": str(exc)}
     except Exception as exc:
@@ -466,18 +468,26 @@ def _load_community_list(engine: Any) -> tuple[list[dict[str, Any]], str]:
 
 @router.get("/analytics/communities")
 async def get_communities_endpoint(
+    scope: str = Query("full", pattern="^(full|curated)$", description="full graph or curated market-actor subgraph"),
+    limit: int = Query(200, ge=1, le=2000, description="Max communities (curated scope)"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
-    """Return list of all communities with member counts and top member.
+    """Return list of communities with member counts and top member.
 
-    Reads the materialized ``community_summary`` cache when available (see
-    migration 0055), falling back to the live aggregation. The ``source``
-    field reports which path served the request.
+    ``scope=full`` reads the materialized ``community_summary`` cache when
+    available (see migration 0055), falling back to the live aggregation.
+    ``scope=curated`` reads the small named-market-actor table directly. The
+    ``source`` field reports which path served the request.
     """
     try:
         engine = get_db_engine()
+        if scope == "curated":
+            from store.graph import get_community_list
+
+            communities = get_community_list(engine=engine, scope="curated", limit=limit)
+            return {"communities": communities, "count": len(communities), "source": "live", "scope": scope}
         communities, source = _load_community_list(engine)
-        return {"communities": communities, "count": len(communities), "source": source}
+        return {"communities": communities, "count": len(communities), "source": source, "scope": scope}
     except Exception as exc:
         log.warning("Community list failed: {e}", e=str(exc))
         return {"communities": [], "count": 0, "error": str(exc)}
@@ -487,6 +497,7 @@ async def get_communities_endpoint(
 async def get_community_members_endpoint(
     community_id: int,
     limit: int = Query(50, ge=1, le=500, description="Max members to return"),
+    scope: str = Query("full", pattern="^(full|curated)$", description="full graph or curated market-actor subgraph"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Return all actors in a community, ordered by PageRank."""
@@ -494,8 +505,8 @@ async def get_community_members_endpoint(
         from store.graph import get_community_members
 
         engine = get_db_engine()
-        members = get_community_members(community_id, limit=limit, engine=engine)
-        return {"community_id": community_id, "members": members, "count": len(members)}
+        members = get_community_members(community_id, limit=limit, engine=engine, scope=scope)
+        return {"community_id": community_id, "members": members, "count": len(members), "scope": scope}
     except Exception as exc:
         log.warning("Community members for {c} failed: {e}", c=community_id, e=str(exc))
         return {"community_id": community_id, "members": [], "count": 0, "error": str(exc)}

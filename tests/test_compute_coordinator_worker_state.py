@@ -135,19 +135,22 @@ def test_boogerbots_dry_run_accepts_valid_contract_without_mutation():
     assert response["w1_proof"]["non_mutating"] is True
 
 
-def test_boogerbots_w1_proof_shows_ocmri_priority_wins_and_audit_is_separate():
+def test_boogerbots_w1_proof_shows_ocmri_defers_and_audit_is_separate():
     proof = coordinator.boogerbots_w1_proof(boogerbots_job())
 
     scheduler = proof["scheduler"]
     assert scheduler["boogerbots_priority_value"] == 10
     assert scheduler["boogerbots_priority_ceiling"] == 30
-    assert scheduler["ocmri_priority_floor"] == 31
-    assert scheduler["ocmri_priority_wins"] is True
-    assert scheduler["yield_to_ocmri"] is True
+    assert scheduler["boogerbots_priority_floor"] == 1
+    assert scheduler["ocmri_priority_ceiling"] == 0
+    # Inverted 2026-09-10: OCMRI is capped at the bottom of the scale, so
+    # Boogerbots outranks it on priority alone.
+    assert scheduler["ocmri_defers"] is True
+    assert scheduler["yields_to_ocmri"] is False
     assert scheduler["preemption_enabled"] is True
     assert scheduler["claim_order_proof"] == [
-        {"tenant": "ocmri", "priority": 31},
         {"tenant": "boogerbots", "priority": 10},
+        {"tenant": "ocmri", "priority": 0},
     ]
 
     audit = proof["audit"]
@@ -227,7 +230,7 @@ def test_boogerbots_dry_run_rejects_ocmri_escalation_and_missing_audit():
 
     assert "tenant must be 'boogerbots'" in errors
     assert "priority.class must be 'boogerbots-low' or 'boogerbots-background'" in errors
-    assert "priority.value must be an integer from 0 through 30" in errors
+    assert "priority.value must be an integer from 1 through 30" in errors
     assert "audit.log_sink must be separate from OCMRI/Sentry" in errors
     assert "audit.correlation_id is required" in errors
     assert any(error.startswith("audit.events missing") for error in errors)
@@ -248,3 +251,106 @@ def test_boogerbots_live_submit_is_blocked_until_w1_enabled():
 
     assert exc.value.status_code == 400
     assert "/jobs/dry-run" in exc.value.detail
+
+
+# ---------------------------------------------------------------------------
+# Tenant order — inverted 2026-09-10 ("flip it around, ocmri defers";
+# "ocmri is lowest priority for now"). Claims are served ORDER BY priority
+# DESC, so OCMRI's ceiling of 0 puts it below the 1-30 Boogerbots band.
+# ---------------------------------------------------------------------------
+
+
+def test_ocmri_is_capped_below_the_boogerbots_band():
+    assert coordinator.OCMRI_PRIORITY_CEILING == 0
+    assert coordinator.BOOGERBOTS_PRIORITY_FLOOR == 1
+    assert (
+        coordinator.OCMRI_PRIORITY_CEILING
+        < coordinator.BOOGERBOTS_PRIORITY_FLOOR
+        <= coordinator.BOOGERBOTS_PRIORITY_CEILING
+    )
+
+
+def test_yield_to_ocmri_is_no_longer_required():
+    """The mandatory yield declaration is gone under the inverted order."""
+    job = boogerbots_job(
+        yield_policy={
+            "check_interval_seconds": 30,
+            "idle_window_required": False,
+        }
+    )
+    errors = coordinator.boogerbots_contract_errors(job)
+
+    assert not any("yield_to must include" in e for e in errors), errors
+    assert not any("on_ocmri_demand" in e for e in errors), errors
+
+
+def test_declared_on_ocmri_demand_must_still_name_a_supported_action():
+    """Optional, but a bogus value is still a contract error."""
+    job = boogerbots_job(
+        yield_policy={
+            "check_interval_seconds": 30,
+            "idle_window_required": False,
+            "on_ocmri_demand": "ignore_and_continue",
+        }
+    )
+    errors = coordinator.boogerbots_contract_errors(job)
+
+    assert any("on_ocmri_demand" in e for e in errors), errors
+
+
+def test_priority_zero_is_rejected_because_it_ties_ocmri():
+    """0 is OCMRI's band now; Boogerbots must sit strictly above it."""
+    job = boogerbots_job(priority={"class": "boogerbots-background", "value": 0})
+    errors = coordinator.boogerbots_contract_errors(job)
+
+    assert any("priority.value must be an integer from 1 through 30" in e
+               for e in errors), errors
+
+
+def test_priority_above_the_ceiling_is_still_rejected():
+    job = boogerbots_job(priority={"class": "boogerbots-background", "value": 31})
+    errors = coordinator.boogerbots_contract_errors(job)
+
+    assert any("priority.value must be an integer from 1 through 30" in e
+               for e in errors), errors
+
+
+def test_legacy_order_restored_by_the_flag(monkeypatch):
+    """COMPUTE_YIELD_TO_OCMRI=true puts OCMRI back on top without a code edit."""
+    from config import settings
+
+    monkeypatch.setattr(settings, "COMPUTE_YIELD_TO_OCMRI", True, raising=False)
+
+    scheduler = coordinator.boogerbots_scheduler_proof(boogerbots_job())
+    assert scheduler["yields_to_ocmri"] is True
+    assert scheduler["ocmri_priority_wins"] is True
+    assert scheduler["claim_order_proof"] == [
+        {"tenant": "ocmri", "priority": 31},
+        {"tenant": "boogerbots", "priority": 10},
+    ]
+
+    # And the yield declaration becomes mandatory again.
+    errors = coordinator.boogerbots_contract_errors(
+        boogerbots_job(
+            yield_policy={
+                "check_interval_seconds": 30,
+                "idle_window_required": False,
+            }
+        )
+    )
+    assert any("yield_to must include" in e for e in errors), errors
+
+
+def test_w1_readiness_no_longer_depends_on_yielding_to_ocmri():
+    """A job that declares no yield is still W1-ready under the new order."""
+    job = boogerbots_job(
+        yield_policy={
+            "check_interval_seconds": 30,
+            "idle_window_required": False,
+        }
+    )
+    proof = coordinator.boogerbots_w1_proof(job)
+
+    assert proof["scheduler"]["ocmri_defers"] is True
+    assert proof["scheduler"]["ocmri_priority_wins"] is False
+    assert proof["ready"] is True

@@ -48,6 +48,22 @@ export const routes = [
         desc: 'Weekly long-horizon stock allocations from 10-year chart quality',
     },
     /*
+     * Canvas is the operator's investigation surface (Sigma.js entity graph
+     * with live signal pulses). Promoted from the Research drawer to the
+     * primary tab bar 2026-09-10 (LEVER-PACKAGE.md Sprint 1). Operator
+     * persona only — DAD_VIEWS in app.jsx still gates the simple shell.
+     */
+    {
+        id: 'canvas',
+        label: 'Canvas',
+        labelShort: 'CANVAS',
+        icon: Grid3X3,
+        component: './views/Canvas.jsx',
+        group: 'worldView',
+        nav: 'tab',
+        desc: 'Investigation canvas — entities, levers, and live signals on one graph',
+    },
+    /*
      * TPS (Trump-Proximity Score) remains in the primary world-view strip,
      * but the default landing route now starts on the 10-year portfolio query.
      */
@@ -301,15 +317,6 @@ export const routes = [
     },
 
     /* ── Drawer: RESEARCH section ────────────────────────────────── */
-    {
-        id: 'canvas',
-        label: 'Canvas',
-        icon: Grid3X3,
-        component: './views/Canvas.jsx',
-        group: 'research',
-        nav: 'drawer',
-        desc: 'Investigation sandbox for manual graph work',
-    },
     {
         id: 'thesis',
         label: 'Thesis',
@@ -620,6 +627,7 @@ export const routes = [
 
 const PRIMARY_TAB_IDS = new Set([
     'ten-year',
+    'canvas',
     'surfacer',
     'dashboard',
     'money-flow',
@@ -687,7 +695,6 @@ const HOMEWORK_ROUTE_IDS = new Set([
     'cross-reference',
     'regime-analog',
     'globe',
-    'canvas',
     'correlation-matrix',
     'discovery',
     'associations',

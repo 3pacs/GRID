@@ -5,6 +5,7 @@
  */
 import React, { useState, useCallback } from 'react';
 import { colors, tokens, shared, glassMorphism } from '../../styles/shared.js';
+import { api } from '../../api.js';
 
 const MONO = "'JetBrains Mono', monospace";
 const SANS = "'IBM Plex Sans', -apple-system, sans-serif";
@@ -535,6 +536,189 @@ function ActorDetail({ node }) {
     );
 }
 
+// ── Conviction card ──────────────────────────────────────────────────────
+// Runs the full decision stack for a ticker on demand (oracle → red team →
+// provenance with layer/evidence coverage → base rates → stress → Kelly
+// ticket) and shows the verdict *and why*. This is the prediction engine's
+// answer surfaced where the operator is looking (LEVER-PACKAGE.md §7,
+// Sprint 2). The call is synchronous on the server and can take seconds,
+// so it is never fired automatically.
+
+const HORIZON_CHOICES = [7, 30, 90, 180];
+
+const VERDICT_COLORS = {
+    high: colors.success,
+    medium: colors.warning,
+    low: colors.textMuted,
+    no_trade: colors.danger,
+};
+
+export function tickerFromNode(node) {
+    const data = node?.data || {};
+    const raw = data.ticker || node?.ticker || node?.label || node?.name || node?.id || '';
+    return String(raw).replace(/^t:/, '').trim().toUpperCase();
+}
+
+export function summarizeDecision(decision) {
+    if (!decision) return null;
+    const prov = decision.provenance_report || null;
+    const ticket = decision.trade_ticket || null;
+    const verdict = decision.unified_verdict || prov?.verdict || 'no_trade';
+    const layersPresent = prov?.layers_present;
+    const layersTotal = prov?.layers_total;
+    return {
+        verdict,
+        reason: prov?.verdict_reason || (decision.verdict_reasons || [])[0] || '',
+        reasons: decision.verdict_reasons || [],
+        confidence: prov?.confidence ?? decision.prediction?.confidence ?? null,
+        aggregate: prov?.aggregate_conviction ?? null,
+        layersPresent: layersPresent ?? null,
+        layersTotal: layersTotal ?? null,
+        evidenceCoverage: prov?.evidence_coverage ?? null,
+        direction: prov?.direction || decision.prediction?.direction || '',
+        evidence: (prov?.signal_evidence || [])
+            .slice()
+            .sort((a, b) => (b.shapley_weight || 0) - (a.shapley_weight || 0))
+            .slice(0, 4),
+        kellyPct: ticket?.kelly_size_pct ?? ticket?.kelly_fraction ?? null,
+        stageErrors: Object.keys(decision.stage_errors || {}),
+        horizonDays: decision.horizon_days ?? null,
+    };
+}
+
+export function ConvictionCard({ ticker, fetchDecision }) {
+    const [horizon, setHorizon] = useState(30);
+    const [state, setState] = useState({ status: 'idle', decision: null, error: null });
+    const fetcher = fetchDecision || ((t, opts) => api.getConvictionDecision(t, opts));
+
+    const run = useCallback(async () => {
+        if (!ticker) return;
+        setState({ status: 'loading', decision: null, error: null });
+        try {
+            const decision = await fetcher(ticker, { horizonDays: horizon });
+            setState({ status: 'done', decision, error: null });
+        } catch (err) {
+            setState({ status: 'error', decision: null, error: err?.message || 'conviction stack failed' });
+        }
+    }, [ticker, horizon, fetcher]);
+
+    const summary = summarizeDecision(state.decision);
+    const verdictColor = summary ? (VERDICT_COLORS[summary.verdict] || colors.textMuted) : colors.textMuted;
+
+    return (
+        <div style={S.section} data-testid="conviction-card">
+            <div style={S.sectionTitle}>CONVICTION</div>
+            <div style={S.card}>
+                <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
+                    {HORIZON_CHOICES.map((h) => (
+                        <button
+                            key={h}
+                            type="button"
+                            onClick={() => setHorizon(h)}
+                            aria-pressed={horizon === h}
+                            style={{
+                                ...S.badge(horizon === h ? colors.accent : colors.textMuted),
+                                cursor: 'pointer',
+                                border: 'none',
+                            }}
+                        >
+                            {h}d
+                        </button>
+                    ))}
+                    <button
+                        type="button"
+                        onClick={run}
+                        disabled={state.status === 'loading' || !ticker}
+                        style={{
+                            ...S.badge(colors.accent),
+                            marginLeft: 'auto',
+                            cursor: state.status === 'loading' ? 'wait' : 'pointer',
+                            border: 'none',
+                        }}
+                    >
+                        {state.status === 'loading' ? 'Running…' : 'Run stack'}
+                    </button>
+                </div>
+
+                {state.status === 'idle' && (
+                    <div style={{ ...S.emptyText, marginTop: '8px' }}>
+                        Runs the full decision stack for {ticker || 'this ticker'} at the chosen horizon.
+                    </div>
+                )}
+                {state.status === 'error' && (
+                    <div style={{ ...S.emptyText, marginTop: '8px', color: colors.danger }}>{state.error}</div>
+                )}
+                {summary && (
+                    <div style={{ marginTop: '10px' }} data-testid="conviction-result">
+                        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                            <span style={{ ...S.badge(verdictColor), fontWeight: 700 }}>
+                                {String(summary.verdict).toUpperCase().replace('_', ' ')}
+                            </span>
+                            {summary.direction && <span style={S.directionBadge(summary.direction)}>{summary.direction}</span>}
+                            {summary.horizonDays != null && (
+                                <span style={{ fontSize: '10px', color: colors.textMuted, fontFamily: MONO }}>{summary.horizonDays}d</span>
+                            )}
+                        </div>
+                        {summary.reason && (
+                            <div style={{ fontSize: '12px', color: colors.text, fontFamily: SANS, marginTop: '6px' }}>
+                                {summary.reason}
+                            </div>
+                        )}
+                        <div style={S.row}>
+                            <span style={S.label}>Confidence</span>
+                            <span style={S.value}>{summary.confidence != null ? `${(summary.confidence * 100).toFixed(0)}%` : '--'}</span>
+                        </div>
+                        <div style={S.row}>
+                            <span style={S.label}>Aggregate conviction</span>
+                            <span style={S.value}>{summary.aggregate != null ? summary.aggregate.toFixed(2) : '--'}</span>
+                        </div>
+                        <div style={S.row}>
+                            <span style={S.label}>Layers computed</span>
+                            <span style={S.value}>
+                                {summary.layersPresent != null && summary.layersTotal != null
+                                    ? `${summary.layersPresent}/${summary.layersTotal}`
+                                    : '--'}
+                            </span>
+                        </div>
+                        <div style={summary.kellyPct != null ? S.row : S.rowLast}>
+                            <span style={S.label}>Calibrated evidence</span>
+                            <span style={S.value}>
+                                {summary.evidenceCoverage != null ? `${(summary.evidenceCoverage * 100).toFixed(0)}%` : '--'}
+                            </span>
+                        </div>
+                        {summary.kellyPct != null && (
+                            <div style={S.rowLast}>
+                                <span style={S.label}>Kelly size</span>
+                                <span style={S.value}>{`${(Number(summary.kellyPct) * 100).toFixed(1)}%`}</span>
+                            </div>
+                        )}
+                        {summary.evidence.length > 0 && (
+                            <div style={{ marginTop: '8px' }}>
+                                {summary.evidence.map((ev, i) => (
+                                    <div key={i} style={S.signalItem}>
+                                        <span style={{ fontSize: '12px', color: colors.text, fontFamily: SANS, flex: 1 }}>
+                                            {ev.signal_source}
+                                        </span>
+                                        <span style={S.badge(colors.accent)}>{ev.classification}</span>
+                                        <span style={{ fontSize: '10px', color: colors.textMuted, fontFamily: MONO }}>
+                                            {ev.shapley_weight != null ? `${(ev.shapley_weight * 100).toFixed(0)}%` : ''}
+                                        </span>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                        {summary.stageErrors.length > 0 && (
+                            <div style={{ ...S.emptyText, marginTop: '6px' }}>
+                                Partial: {summary.stageErrors.join(', ')} unavailable
+                            </div>
+                        )}
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+}
+
 function TickerDetail({ node }) {
     const data = node.data || {};
     const price = data.price || data.current_price || null;
@@ -565,6 +749,9 @@ function TickerDetail({ node }) {
                     )}
                 </div>
             )}
+
+            {/* Conviction — the prediction engine's verdict for this ticker */}
+            <ConvictionCard ticker={tickerFromNode(node)} />
 
             {/* Related Actors */}
             <div style={S.section}>

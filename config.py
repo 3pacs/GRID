@@ -68,6 +68,7 @@ class Settings(BaseSettings):
     EIA_API_KEY: str = ""
     GDELT_API_KEY: str = ""
     WORLDNEWS_API_KEY: str = ""
+    NEWSAPI_KEY: str = ""                # newsapi.org headline counts (scripts/load_wave2.py)
     OPENSECRETS_API_KEY: str = ""
 
     # Backup data source API keys
@@ -182,11 +183,11 @@ class Settings(BaseSettings):
     HERMES_HYPO_LLM_ENABLED: bool = False           # gate the LLM hypothesis second-opinion
     HERMES_HYPO_LLM_LIMIT: int = 10                 # top-N highest-conviction active hypos per run
 
-    # Ollama (local lightweight LLM — Qwen 7B)
+    # Ollama on grid-svr (qwen3.8:27b, gemma3:12b, qwen3-vl, nomic-embed-text)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_ENABLED: bool = True
     OLLAMA_TIMEOUT_SECONDS: int = 120
-    OLLAMA_CHAT_MODEL: str = "qwen3:8b"
+    OLLAMA_CHAT_MODEL: str = "qwen3.8:27b"
     OLLAMA_EMBED_MODEL: str = "nomic-embed-text"
 
     # Remote Ollama nodes — added 2026-05-09. Each has its own URL +
@@ -234,6 +235,21 @@ class Settings(BaseSettings):
     OLLAMA_Z400_CHAT_MODEL: str = "qwen2.5:7b-instruct-q4_K_M"
     OLLAMA_Z400_EMBED_MODEL: str = "nomic-embed-text"
 
+    # Ollama on gridz4 (:11434) — distinct from the llama.cpp server on the
+    # same box (LLAMACPP_Z4_BASE_URL, gridz4:8080). Verified 2026-09-10 from
+    # grid-svr: peer active on a direct connection, serving
+    # `nomic-embed-text:latest` alongside qwen3-vl/qwen3:8b.
+    #
+    # This is the primary embedding node. It is the only *separate* tailnet
+    # machine currently answering with an embedding model — koala has been
+    # offline 48 days and z400 is no longer a tailnet peer at all — so it is
+    # what satisfies the operator's "use another machine on the tailnet".
+    OLLAMA_Z4_BASE_URL: str = "http://gridz4:11434"
+    OLLAMA_Z4_ENABLED: bool = True
+    OLLAMA_Z4_TIMEOUT_SECONDS: int = 120
+    OLLAMA_Z4_CHAT_MODEL: str = "qwen3:8b"
+    OLLAMA_Z4_EMBED_MODEL: str = "nomic-embed-text"
+
     # koala card 1 — Kokoro TTS server (CPU inference, FastAPI on :8091).
     # OpenAI-compatible /v1/audio/speech endpoint. 54 voices, 24kHz mono WAV.
     # Useful as a local replacement for OpenAI TTS in audio_briefing.py.
@@ -246,7 +262,10 @@ class Settings(BaseSettings):
     WHISPER_BASE_URL: str = "http://koala:8092"
     WHISPER_ENABLED: bool = True
 
-    # llama.cpp server on grid-svr Blackwell (Qwen3.6 27B GPU + mmproj, port 8081)
+    # llama.cpp on grid-svr (RTX 3090 24 GB): Qwen3.8-27B Q4_K_M + mmproj,
+    # llama-server on 100.75.185.36:8086 fronted by the :8081 shim. Verified
+    # 2026-09-10 — every GPU tier (this box, gridz4, redbox) serves Qwen 3.8;
+    # only the CPU-only :8080 unit still loads the Qwen3.6 GGUF.
     # Timeout MUST be < HERMES cycle timeout (600s in scripts/hermes_operator.py)
     # so that when Hermes blacklists a slow cycle, the in-flight HTTP call
     # also unwinds and the thread exits — otherwise we leak one stuck
@@ -258,14 +277,14 @@ class Settings(BaseSettings):
     LLAMACPP_BASE_URL: str = "http://localhost:8081"
     LLAMACPP_ENABLED: bool = True
     LLAMACPP_TIMEOUT_SECONDS: int = 300
-    LLAMACPP_CHAT_MODEL: str = "Qwen3-32B-Q4_K_M"
-    LLAMACPP_EMBED_MODEL: str = "Qwen3-32B-Q4_K_M"
+    LLAMACPP_CHAT_MODEL: str = "Qwen3.8-27B-Q4_K_M"
+    LLAMACPP_EMBED_MODEL: str = "Qwen3.8-27B-Q4_K_M"
 
-    # llama.cpp ORACLE server on grid-svr Blackwell.
+    # llama.cpp ORACLE server on grid-svr (same Qwen3.8-27B llama-server).
     LLAMACPP_ORACLE_BASE_URL: str = "http://localhost:8081"
     LLAMACPP_ORACLE_ENABLED: bool = True
     LLAMACPP_ORACLE_TIMEOUT_SECONDS: int = 300
-    LLAMACPP_ORACLE_CHAT_MODEL: str = "Qwen3-32B-Q4_K_M"
+    LLAMACPP_ORACLE_CHAT_MODEL: str = "Qwen3.8-27B-Q4_K_M"
     # Must fit inside LLAMACPP_ORACLE_TIMEOUT_SECONDS at the server's real
     # throughput (~27 tok/s) or every full-length call orphans mid-generation
     # and holds the single llama slot, bombarding the server. 6000 tok ~= 220s.
@@ -273,17 +292,27 @@ class Settings(BaseSettings):
     LLAMACPP_ORACLE_NUM_PREDICT: int = 6000
     LLAMACPP_ORACLE_MIN_NUM_PREDICT: int = 0
 
-    # llama.cpp QUICK-tier remote server (redbox node — Qwen3-14B, Tailscale-reachable)
+    # llama.cpp QUICK-tier remote server (redbox node — qwen3.8-27b, Tailscale-reachable)
     LLAMACPP_QUICK_BASE_URL: str = "http://100.126.129.45:8080"
     LLAMACPP_QUICK_ENABLED: bool = True
     LLAMACPP_QUICK_TIMEOUT_SECONDS: int = 120
-    LLAMACPP_QUICK_CHAT_MODEL: str = "qwen3-14b"
+    LLAMACPP_QUICK_CHAT_MODEL: str = "qwen3.8-27b"
 
-    # llama.cpp REASON-tier remote server (gridz4 node — Qwen3.6 35B A3B, Tailscale-reachable)
+    # Total wall-clock budget (seconds) for one /chat/compose request's whole
+    # LLM attempt (local card + any paid failover) — api/routers/chat.py's
+    # _resilient_chat. Defaults to 18s, unchanged from the pre-fail-fast
+    # per-candidate timeout, until a healthy-card timing baseline is measured
+    # via ops-exec (scripts/smoke_dad_path.py's `compose:` substeps print
+    # elapsed ms) — lower it once that data exists. Compose logs the elapsed
+    # ms and answering label on every successful call so that measurement can
+    # be taken from production logs. See PR #453.
+    COMPOSE_LLM_BUDGET_S: float = 18.0
+
+    # llama.cpp REASON-tier remote server (gridz4 node — Qwen3.8-27B Q4_K_M + mmproj, Tailscale-reachable)
     LLAMACPP_Z4_BASE_URL: str = "http://gridz4:8080"
     LLAMACPP_Z4_ENABLED: bool = True
     LLAMACPP_Z4_TIMEOUT_SECONDS: int = 180
-    LLAMACPP_Z4_CHAT_MODEL: str = "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+    LLAMACPP_Z4_CHAT_MODEL: str = "Qwen3.8-27B-Q4_K_M"
     LLAMACPP_Z4_NUM_PREDICT: int = 512
     LLAMACPP_Z4_MIN_NUM_PREDICT: int = 0
     LLAMACPP_Z4_REASONING_HEADROOM: int = 0
@@ -298,6 +327,47 @@ class Settings(BaseSettings):
     LLAMACPP_BATCH_ENABLED: bool = False
     LLAMACPP_BATCH_TIMEOUT_SECONDS: int = 600
     LLAMACPP_BATCH_CHAT_MODEL: str = "DeepSeekV4-Flash-158B-Q4_K_M"
+
+    # ------------------------------------------------------------------
+    # Embeddings — tailnet GPU Ollama nodes only.
+    #
+    # Until 2026-09-10 embeddings went to the CPU-only llama.cpp unit on
+    # grid-svr :8080 (via HYPERSPACE_BASE_URL), which was never started with
+    # ``--embeddings`` — every call returned HTTP 501 and the error log filled
+    # with `POST /v1/embeddings … 501`. Per the operator directive of the same
+    # day ("no CPU-only Qwens — use another machine on the tailnet"), that unit
+    # is retired and embeddings resolve through EMBED_PROVIDER_CHAIN instead.
+    #
+    # Order is by verified reachability, then by GPU contention.
+    #
+    # Probed from grid-svr 2026-09-10 (`tailscale status` + /api/tags):
+    #   ollama_z4     gridz4:11434  ACTIVE, direct, nomic-embed-text  <- primary
+    #   ollama_koala  koala:11434   offline, last seen 48 days ago
+    #   ollama_z400   z400:11434    not a tailnet peer at all
+    #   ollama        localhost     ACTIVE, nomic-embed-text        <- last resort
+    #
+    # gridz4 is what satisfies the operator's "use another machine on the
+    # tailnet" — it is the only *separate* box currently serving an embedding
+    # model. koala and z400 stay in the chain ahead of grid-svr so they resume
+    # duty automatically if they come back; both are ENABLED=false in the live
+    # .env, so a dead entry costs nothing (the factory returns None before any
+    # socket is opened). grid-svr is last because its Ollama shares the RTX
+    # 3090 with the REASON/ORACLE llama-server, and embedding batches there
+    # would evict the 27B chat model.
+    #
+    # ``llm.router.embed()`` walks this list and returns None when no node
+    # answers (graceful degradation — never raises). Per-node embed models are
+    # declared with their nodes above (OLLAMA_Z4_EMBED_MODEL, etc.).
+    EMBED_PROVIDER_CHAIN: str = "ollama_z4,ollama_koala,ollama_z400,ollama"
+    EMBED_MODEL: str = "nomic-embed-text"
+
+    # Google Gemini (paid frontier — gated by GRID_ALLOW_PAID_LLM like every
+    # other paid provider). Placed ahead of openrouter in the chat fallback
+    # chains per the operator's "if you can make Gemini do the work, that is
+    # best". Key lives in /etc/grid/gemini.env on grid-svr; never commit it.
+    GEMINI_BASE_URL: str = "https://generativelanguage.googleapis.com/v1beta"
+    GEMINI_CHAT_MODEL: str = "gemini-2.5-flash"
+    GEMINI_TIMEOUT_SECONDS: int = 120
 
     # Auth
     GRID_MASTER_PASSWORD_HASH: str = ""
@@ -338,6 +408,15 @@ class Settings(BaseSettings):
     # Circuit breaker (signal executor)
     CIRCUIT_BREAKER_THRESHOLD: int = 3       # consecutive failures before halting
     CIRCUIT_BREAKER_COOLDOWN_HOURS: int = 24  # hours before probation
+
+    # Paid LLM providers (openai, openrouter, anthropic, huggingface) are hard-gated
+    # OFF unless this is explicitly True. Declared here because llm/router.py reads
+    # it via getattr(settings, ...) and pydantic-settings only binds env vars to
+    # declared fields (extra="ignore") — until 2026-09-10 the flag could never be
+    # turned on for the router. Set GRID_ALLOW_PAID_LLM=true in the environment to
+    # opt in; the Hermes bridge (intelligence/hermes/config.py) reads os.getenv
+    # directly and already honoured it.
+    GRID_ALLOW_PAID_LLM: bool = False
 
     # Gemma 4 main server is disabled until a live port-8080 Gemma service is restored.
     # The Gemma micro endpoints below remain separate and active.
@@ -392,7 +471,7 @@ class Settings(BaseSettings):
 
     # LLM task router — providers: openai | huggingface | anthropic | ollama | llamacpp | llamacpp_quick | llamacpp_z4 | openrouter | bitnet
     LLM_ROUTER_ENABLED: bool = True
-    LLM_LOCAL_PROVIDER: str = "llamacpp_quick"  # LOCAL tier — redbox Qwen3-14B
+    LLM_LOCAL_PROVIDER: str = "llamacpp_quick"  # LOCAL tier — redbox qwen3.8-27b
     LLM_REASON_PROVIDER: str = "llamacpp_quick"  # REASON tier — redbox until z4 is tuned
     LLM_ORACLE_PROVIDER: str = "llamacpp_oracle"  # ORACLE tier — heavier oracle path
     # Legacy keys — kept so old .env files don't break get_llm() fallback logic
@@ -430,6 +509,25 @@ class Settings(BaseSettings):
     HYPERLIQUID_TESTNET: bool = True
     HYPERLIQUID_MAX_POSITION_USD: float = 100.0
     HYPERLIQUID_MAX_DRAWDOWN_PCT: float = 0.20
+
+    # Compute coordinator tenant order (scripts/compute_coordinator.py).
+    # Inverted 2026-09-10 on the operator's call: OCMRI is the lowest-priority
+    # tenant "for now", capped at 0 while Boogerbots runs 1-30, so GRID and
+    # Boogerbots work outranks it and no yield declaration is required.
+    # Set true to restore the old order, where OCMRI sat above the Boogerbots
+    # band and every Boogerbots job had to declare that it yielded.
+    COMPUTE_YIELD_TO_OCMRI: bool = False
+
+    # Robinhood crypto trading — official key-signed Crypto Trading API
+    # (trading/robinhood.py). Dry-run until ROBINHOOD_LIVE_TRADING=true.
+    # Generate the keypair with `python -m trading.robinhood keygen`; the
+    # public half goes into the Robinhood API-credential form.
+    ROBINHOOD_API_KEY: str = ""
+    ROBINHOOD_PRIVATE_KEY_B64: str = ""      # base64 Ed25519 seed; server .env only
+    ROBINHOOD_LIVE_TRADING: bool = False     # Must be True to send orders
+    ROBINHOOD_MAX_POSITION_USD: float = 100.0
+    ROBINHOOD_MAX_DRAWDOWN_PCT: float = 0.20
+    ROBINHOOD_BASE_URL: str = "https://trading.robinhood.com"
 
     # Solana trading (AutoHedge-derived 4-agent pipeline)
     JUPITER_API_KEY: str = ""              # Unlocks Jupiter rate limits
@@ -494,7 +592,10 @@ class Settings(BaseSettings):
     # Email alerts
     ALERT_EMAIL_ENABLED: bool = True
     ALERT_EMAIL_TO: str = "stepdadfinance@gmail.com"
-    ALERT_EMAIL_FROM: str = "grid-alerts@grid-svr"
+    # 2026-09-10: GRID sends as the Hermes mailbox (ROADMAP Phase 15). A bare
+    # "@grid-svr" sender through local Postfix is what Gmail dropped silently.
+    # Auth (ALERT_SMTP_USER/PASSWORD, host smtp.<provider>, 587, TLS) lives in .env.
+    ALERT_EMAIL_FROM: str = "hermes@stepdad.finance"
     ALERT_SMTP_HOST: str = "localhost"
     ALERT_SMTP_PORT: int = 25
     ALERT_SMTP_USER: str = ""
@@ -518,10 +619,11 @@ class Settings(BaseSettings):
     REDPANDA_BROKER: str = "localhost:19092"
     REDPANDA_ENABLED: bool = True
 
-    # MinIO / S3 blob store
+    # MinIO / S3 blob store. Credentials come from .env (or /etc/agent-hub/minio.env
+    # for the hub) — never defaults; empty keys leave the blob store disabled.
     MINIO_ENDPOINT: str = "localhost:9000"
-    MINIO_ACCESS_KEY: str = "gridminio"
-    MINIO_SECRET_KEY: str = "gridminio2026"
+    MINIO_ACCESS_KEY: str = ""
+    MINIO_SECRET_KEY: str = ""
     MINIO_SECURE: bool = False
     MINIO_REGION: str = "us-east-1"
 

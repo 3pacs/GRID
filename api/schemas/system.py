@@ -96,6 +96,11 @@ class HermesTaskStatus(BaseModel):
     success: bool = False
     duration_s: float = 0.0
     error: str | None = None
+    # True when the failure is operational (statement timeout, dropped
+    # connection, a step abandoned at its budget) rather than a defect —
+    # set by OperatorState.record_task. Defaults False so snapshots written
+    # before the field existed still validate.
+    transient: bool = False
 
 
 class HermesStatusResponse(BaseModel):

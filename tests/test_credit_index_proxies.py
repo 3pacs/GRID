@@ -220,12 +220,12 @@ def _all_groups_response_map() -> dict[str, dict[str, Any]]:
     """
     canned: dict[str, dict[str, Any]] = {}
     base_values = {
-        "BAMLEMHYCRPIOAS": [("2025-01-01", "5.20"), ("2025-01-02", "5.30")],
-        "BAMLEMIBHYCRPIEY": [("2025-01-01", "8.10"), ("2025-01-02", "8.15")],
+        "BAMLEMHBHYCRPIOAS": [("2025-01-01", "5.20"), ("2025-01-02", "5.30")],
+        "BAMLEMHBHYCRPIEY": [("2025-01-01", "8.10"), ("2025-01-02", "8.15")],
         "BAMLEMCBPIOAS": [("2025-01-01", "1.80"), ("2025-01-02", "1.85")],
         "BAMLHE00EHYIOAS": [("2025-01-01", "4.10"), ("2025-01-02", "4.20")],
         "BAMLHE00EHYIEY": [("2025-01-01", "6.50"), ("2025-01-02", "6.55")],
-        "BAMLEMRACRPIEMEAOAS": [("2025-01-01", "1.30"), ("2025-01-02", "1.32")],
+        "BAMLEMRECRPIEMEAOAS": [("2025-01-01", "1.30"), ("2025-01-02", "1.32")],
         "BAMLC0A4CBBB": [("2025-01-01", "1.20"), ("2025-01-02", "1.25")],
         "BAMLH0A1HYBB": [("2025-01-01", "2.80"), ("2025-01-02", "2.85")],
         "BAMLH0A2HYB": [("2025-01-01", "4.50"), ("2025-01-02", "4.55")],
@@ -357,7 +357,7 @@ class TestRunCreditIndexProxiesPuller:
         engine, sink, _ = stateful_mock_engine
         canned = _all_groups_response_map()
         # Make BAMLEMCBPIOAS (em_ig_oas) only have 2025-01-01, but
-        # BAMLEMHYCRPIOAS (em_hy_oas) keeps both dates → basis only on
+        # BAMLEMHBHYCRPIOAS (em_hy_oas) keeps both dates → basis only on
         # 2025-01-01 for cat_7.
         canned["BAMLEMCBPIOAS"] = _fred_payload([("2025-01-01", "1.80")])
 

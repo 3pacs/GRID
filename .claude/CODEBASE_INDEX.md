@@ -31,24 +31,32 @@
 | thesis_tracker | `snapshot_thesis(engine)` | ThesisSnapshot | Current thesis state |
 | thesis_tracker | `score_old_theses(engine)` | list[dict] | Score theses vs actual SPY |
 
-## Canvas & Graph (V5 Phase 1-3)
+## Canvas & Graph (V5) — corrected 2026-09-09 from code audit
+
+> Hand-corrected against the tree; the previous version of this section described a React
+> Flow canvas and a live AGE graph that do not match the code. Full evidence:
+> `docs/planning/V5-TRANSFORMATION.md` §2. Regenerate with `/grid-orient` when possible.
 
 | Module | File | Purpose |
 |--------|------|---------|
-| Canvas CRUD | `api/routers/canvas.py` (facade) | Board/node/edge CRUD at /api/v1/canvas/* |
-| Canvas Core | `api/routers/canvas_core.py` | Board list/create/get/update/delete |
-| Canvas Graph | `api/routers/canvas_graph.py` | Node/edge CRUD + bulk PUT /graph |
-| Canvas Expand | `api/routers/canvas_expand.py` | Expand network (BFS), suggest connections, shortest path |
-| Graph Store | `store/graph.py` | Apache AGE Cypher wrapper (expand, shortest_path, community) |
-| Canvas View | `pwa/src/views/Canvas.jsx` | React Flow workspace with 5 node types |
-| Canvas Store | `pwa/src/stores/canvasStore.js` | Zustand slice (boards, nodes, edges) |
-| Node Types | `pwa/src/components/canvas/*.jsx` | ActorNode, CompanyNode, HypothesisNode, SignalNode, NoteNode |
-| SendToCanvas | `pwa/src/components/SendToCanvas.jsx` | Reusable cross-view "Send to Canvas" button |
-| Context Menu | `pwa/src/components/canvas/CanvasContextMenu.jsx` | Right-click: Expand, Suggest, Remove, Color |
+| Canvas facade | `api/routers/canvas.py` (2,147 LOC) | Board CRUD, `GET /graph` (SQL BFS over `actor_connections`), fork, dots; mounts the sub-routers below |
+| Canvas Expand | `api/routers/canvas_expand.py` | Tiered enrichment expand (depth tiers 1–3 implemented), suggest-connections; `/path` is a stub |
+| Canvas Graph | `api/routers/canvas_graph.py` | Node/edge CRUD + bulk `PUT /graph` + evidence pinning (relational, not a graph DB) |
+| Canvas Investigate / LLM / Predict | `canvas_investigate.py`, `canvas_llm.py`, `canvas_predict.py` | One-shot board build, `/explain`, board → `discovered_hypotheses` |
+| Canvas Core | `api/routers/canvas_core.py` | **Not mounted** — duplicate board routes; extraction unfinished (`canvas.py:47-49`) |
+| Canvas View | `pwa/src/canvas/GothamCanvas.jsx` | **Sigma.js + graphology** WebGL canvas (`views/Canvas.jsx` is a 4-line re-export) |
+| Canvas Store | `pwa/src/canvas/CanvasStore.js` | Zustand wrapping a graphology `Graph`; `stores/canvasStore.js` is an unused duplicate |
+| Lenses | `pwa/src/views/canvas_lenses/` | `CapitalLens`, `SupplyLens`, routed `#/canvas/{actorId}/{lens}` |
+| Dead React Flow set | `pwa/src/components/canvas/*` (all but `nodeStyles.js`), `SendToCanvas.jsx` | Zero importers; scheduled for removal / rewrite (V5 R0, R3) |
+| Graph Store | `store/graph.py` | `GraphStore` Cypher wrapper has **zero callers**; the used functions query relational `actor_analytics` (offline NetworkX PageRank/Louvain) |
 
-**Apache AGE:** Installed on PG14, `shared_preload_libraries = 'age'`. Graph `grid_graph` with 5 vertex + 8 edge labels, 4141 actors synced. Cypher queries via `store/graph.py`.
+**Apache AGE:** no `CREATE EXTENSION age` migration exists in the repo and no code path
+queries `grid_graph`. Treat as DORMANT (V5 §5 D4). Any server-side install is unverifiable
+from a clone and unused either way.
 
-**Canvas tables:** `canvas_boards`, `canvas_nodes`, `canvas_edges` (migration `a1b2c3d4e5f6`)
+**Canvas tables:** `investigation_boards` (JSONB `graph_state`), legacy `canvas_boards` /
+`canvas_nodes` / `canvas_edges` (Alembic `a1b2c3d4e5f6`), `investigation_evidence`.
+`canvas_board_store.py` keeps the two schemas in sync.
 
 ## DB Schema Quick Reference
 

@@ -4,6 +4,9 @@ import IntelligenceSearch from '../components/IntelligenceSearch.jsx';
 import { api } from '../api.js';
 import { buildRouteHash } from '../routing.js';
 import { colors, tokens } from '../styles/shared.js';
+import { useAsyncData } from '../hooks/useAsyncData.js';
+import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
+import ErrorState from '../components/ErrorState.jsx';
 
 const styles = {
     page: {
@@ -147,23 +150,12 @@ export default function IntelligenceSearchView({ onNavigate, originView }) {
         return () => window.removeEventListener('resize', syncLayout);
     }, []);
 
-    useEffect(() => {
-        let cancelled = false;
-        async function loadBoards() {
-            try {
-                const data = await api.listBoards();
-                const items = Array.isArray(data) ? data : [];
-                if (!cancelled) {
-                    setBoards(items);
-                    setSelectedBoardId(items[0]?.id || '');
-                }
-            } catch {
-                if (!cancelled) setBoards([]);
-            }
-        }
-        loadBoards();
-        return () => { cancelled = true; };
-    }, []);
+    const { loading: boardsLoading, error: boardsError, refetch: loadBoards } = useAsyncData(async () => {
+        const data = await api.listBoards();
+        const items = Array.isArray(data) ? data : [];
+        setBoards(items);
+        setSelectedBoardId(items[0]?.id || '');
+    }, { fallback: null });
 
     const ensureBoardId = async () => {
         if (selectedBoardId) return selectedBoardId;
@@ -278,6 +270,11 @@ export default function IntelligenceSearchView({ onNavigate, originView }) {
                     Open the best matching view for each result, or stage findings on a Canvas board to map the connections.
                 </div>
 
+                {boardsLoading && boards.length === 0 ? (
+                    <LoadingSkeleton variant="text" count={1} width="220px" />
+                ) : boardsError ? (
+                    <ErrorState error={boardsError} onRetry={loadBoards} title="Canvas boards unavailable" />
+                ) : (
                 <div style={controlsStyle}>
                     <select
                         style={selectStyle}
@@ -297,6 +294,7 @@ export default function IntelligenceSearchView({ onNavigate, originView }) {
                         Open Canvas
                     </button>
                 </div>
+                )}
                 <div style={styles.status}>{saving ? 'Saving to Canvas...' : status}</div>
 
                 {added.length > 0 && (

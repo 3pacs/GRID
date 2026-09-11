@@ -157,6 +157,37 @@ def _fetch_endpoint(path: str, api_key: str) -> list[dict]:
     return []
 
 
+def _insider_signal_type(rec: dict[str, Any]) -> str:
+    """Classify a QuiverQuant /live/insiders record as a buy or a sell.
+
+    The endpoint returns ``AcquiredDisposedCode`` ("A" acquired / "D"
+    disposed) and the Form 4 ``TransactionCode``; it does not return a
+    ``TransactionType`` field. Reading that missing field labelled every
+    insider row "insider_sell", which made the feed's direction meaningless
+    downstream (edge_signals reads insider_sell as bearish).
+
+    Parameters:
+        rec: One QuiverQuant insider record.
+
+    Returns:
+        "insider_buy" or "insider_sell".
+    """
+    acq_disp = str(rec.get("AcquiredDisposedCode") or "").strip().upper()[:1]
+    if acq_disp == "A":
+        return "insider_buy"
+    if acq_disp == "D":
+        return "insider_sell"
+
+    code = str(rec.get("TransactionCode") or "").strip().upper()[:1]
+    if code == "P":
+        return "insider_buy"
+    if code == "S":
+        return "insider_sell"
+
+    txn = str(rec.get("TransactionType") or "").lower()
+    return "insider_buy" if "buy" in txn or "purchase" in txn else "insider_sell"
+
+
 def _store_signals(
     engine: Engine,
     records: list[dict],
@@ -203,8 +234,7 @@ def _store_signals(
                 sentiment = rec.get("Sentiment", 0)
                 signal_type = "wsb_bullish" if sentiment and sentiment > 0 else "wsb_bearish" if sentiment and sentiment < 0 else "wsb_neutral"
             elif endpoint_key == "insider_trading":
-                txn = rec.get("TransactionType", "")
-                signal_type = "insider_buy" if "buy" in str(txn).lower() else "insider_sell"
+                signal_type = _insider_signal_type(rec)
 
             try:
                 conn.execute(text("""

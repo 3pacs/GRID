@@ -623,10 +623,18 @@ def _get_pullers_for_group(
             pullers.append(("Tiingo_Fundamentals", TiingoFundamentalsPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("Tiingo fundamentals puller init failed: {err}", err=str(exc))
-        # BLS (daily check, monthly release)
+        # BLS (daily check, monthly release). Pass the registration key:
+        # without it the v2 endpoint allows 25 queries/day and the daily
+        # pull reported "daily threshold ... reached" every morning.
         try:
             from ingestion.bls import BLSPuller
-            pullers.append(("BLS", BLSPuller(db_engine), "pull_series", {"start_year": 2024}))
+            from config import settings as _bls_settings
+            pullers.append((
+                "BLS",
+                BLSPuller(db_engine, api_key=_bls_settings.BLS_API_KEY or None),
+                "pull_series",
+                {"start_year": 2024},
+            ))
         except Exception as exc:
             log.warning("BLS puller init failed: {err}", err=str(exc))
         # CBOE indices — SKEW, VVIX, correlation, put/call ratio (daily)
@@ -1165,15 +1173,33 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
     except Exception as exc:
         log.warning("FinBERT scoring failed: {err}", err=str(exc))
 
-    # Regime detection (runs after all data is fresh)
+    # Regime detection (runs after all data is fresh). This is the only writer
+    # of regime_history — the table the chat regime context, oracle prediction
+    # context and AstroGrid read — so a silent failure here shows up on dad's
+    # surfaces as a frozen market read. Log the write outcome, don't just log
+    # the classification.
     try:
         from scripts.auto_regime import run
         result = run()
+        # data_as_of is the date the reading is really about; the row's own
+        # obs_date is always today. While the resolver was down those were five
+        # months apart and nothing in this line said so.
         log.info(
-            "Auto regime detection — state={s}, confidence={c}",
+            "Auto regime detection — state={s}, confidence={c}, regime_history={rh}, "
+            "data_as_of={da} ({age} days old)",
             s=result.get("regime", "?"),
             c=result.get("confidence", "?"),
+            rh=result.get("regime", "?") if result.get("regime_history_written")
+            else "NOT WRITTEN",
+            da=result.get("data_as_of") or "unknown",
+            age=result.get("data_staleness_days") if result.get("data_staleness_days") is not None
+            else "?",
         )
+        if result.get("regime_history_error"):
+            log.warning(
+                "Auto regime detection could not update regime_history: {e}",
+                e=result["regime_history_error"],
+            )
     except Exception as exc:
         log.error("Auto regime detection failed: {err}", err=str(exc))
         try:

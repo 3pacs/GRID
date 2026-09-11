@@ -2,6 +2,9 @@ import React, { useState, useEffect } from 'react';
 import { api } from '../api.js';
 import { shared, colors } from '../styles/shared.js';
 import { formatDateTime } from '../utils/formatTime.js';
+import { useAsyncData } from '../hooks/useAsyncData.js';
+import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
+import ErrorState from '../components/ErrorState.jsx';
 
 const CATEGORIES = ['all', 'regime', 'macro', 'technical', 'sentiment', 'risk', 'general'];
 
@@ -204,23 +207,26 @@ function EntryDetail({ entry, related, onBack, onSelect }) {
 export default function Knowledge() {
     const [query, setQuery] = useState('');
     const [category, setCategory] = useState('all');
-    const [entries, setEntries] = useState([]);
-    const [total, setTotal] = useState(0);
     const [offset, setOffset] = useState(0);
     const [summary, setSummary] = useState(null);
-    const [loading, setLoading] = useState(false);
     const [selectedEntry, setSelectedEntry] = useState(null);
     const [selectedRelated, setSelectedRelated] = useState([]);
     const limit = 20;
 
     useEffect(() => {
         loadSummary();
-        loadEntries();
     }, []);
 
-    useEffect(() => {
-        loadEntries();
-    }, [category, offset]);
+    const { data: entriesData, loading, error, refetch: loadEntries } = useAsyncData(async () => {
+        const params = new URLSearchParams({ limit, offset });
+        if (query) params.set('q', query);
+        if (category && category !== 'all') params.set('category', category);
+        const result = await api.getKnowledge(params);
+        if (result?.error) throw new Error(result.message || 'Failed to load knowledge tree');
+        return { entries: result.entries || [], total: result.total || 0 };
+    }, { fallback: { entries: [], total: 0 }, deps: [category, offset] });
+    const entries = entriesData.entries;
+    const total = entriesData.total;
 
     const loadSummary = async () => {
         try {
@@ -229,22 +235,6 @@ export default function Knowledge() {
         } catch (e) {
             console.warn('[GRID] Knowledge summary:', e.message);
         }
-    };
-
-    const loadEntries = async () => {
-        setLoading(true);
-        try {
-            const params = new URLSearchParams({ limit, offset });
-            if (query) params.set('q', query);
-            if (category && category !== 'all') params.set('category', category);
-            const result = await api.getKnowledge(params);
-            setEntries(result.entries || []);
-            setTotal(result.total || 0);
-        } catch (e) {
-            console.warn('[GRID] Knowledge search:', e.message);
-            setEntries([]);
-        }
-        setLoading(false);
     };
 
     const handleSearch = (e) => {
@@ -311,10 +301,10 @@ export default function Knowledge() {
             </div>
 
             {/* Results */}
-            {loading ? (
-                <div style={{ ...shared.card, textAlign: 'center', color: colors.textMuted }}>
-                    Loading...
-                </div>
+            {loading && !entries.length ? (
+                <LoadingSkeleton variant="card" count={3} />
+            ) : error ? (
+                <ErrorState error={error} onRetry={loadEntries} title="Knowledge tree unavailable" />
             ) : entries.length === 0 ? (
                 <div style={{
                     ...shared.card, textAlign: 'center', color: colors.textMuted,

@@ -33,7 +33,7 @@ describe('route registry', () => {
         expect(ids.has('snapshots')).toBe(true);
     });
 
-    it('keeps Surfacer separate from the Canvas toy workspace', () => {
+    it('keeps Surfacer and the Canvas investigation surface as separate primary tabs', () => {
         const surfacer = routes.find(route => route.id === 'surfacer');
         const canvas = routes.find(route => route.id === 'canvas');
 
@@ -41,12 +41,15 @@ describe('route registry', () => {
         expect(surfacer?.group).toBe('worldView');
         expect(surfacer?.nav).toBe('tab');
         expect(canvas?.component).toBe('./views/Canvas.jsx');
-        expect(canvas?.nav).toBe('drawer');
+        expect(canvas?.group).toBe('worldView');
+        expect(canvas?.nav).toBe('tab');
+        expect(canvas?.labelShort).toBe('CANVAS');
     });
 
     it('surfaces only the core alpha views as top tabs', () => {
         expect(tabRoutes.map(route => route.id)).toEqual([
             'ten-year',
+            'canvas',
             'surfacer',
             'dashboard',
             'money-flow',

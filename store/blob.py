@@ -41,15 +41,26 @@ class BlobStore:
     def __init__(self):
         self._client = None
         self._available = None
+        self._disabled = False  # no credentials configured; warned once
 
     def _get_client(self):
         """Lazy-init MinIO client."""
         if self._client is not None:
             return self._client
+        if self._disabled:
+            return None
 
         try:
             from minio import Minio
             from config import settings
+
+            if not settings.MINIO_ACCESS_KEY or not settings.MINIO_SECRET_KEY:
+                log.warning(
+                    "MINIO_ACCESS_KEY / MINIO_SECRET_KEY not set -- blob store disabled"
+                )
+                self._disabled = True
+                self._available = False
+                return None
 
             self._client = Minio(
                 settings.MINIO_ENDPOINT,

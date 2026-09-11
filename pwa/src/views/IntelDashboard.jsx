@@ -52,23 +52,8 @@ export default function IntelDashboard({ onNavigate }) {
     const alertCount = convergence?.alerts?.length || 0;
     const sourceCount = trustSources?.sources?.length || 0;
 
-    // Placeholder sources if API not wired
-    const sources = trustSources?.sources || [
-        { name: 'FRED', trust_score: 0.94, accuracy_30d: 0.96, signals: 142, category: 'macro' },
-        { name: 'BLS', trust_score: 0.87, accuracy_30d: 0.89, signals: 38, category: 'employment' },
-        { name: 'Unusual Whales', trust_score: 0.72, accuracy_30d: 0.68, signals: 256, category: 'flow' },
-        { name: 'Congressional Trades', trust_score: 0.81, accuracy_30d: 0.77, signals: 24, category: 'insider' },
-        { name: 'Dark Pool (FINRA)', trust_score: 0.76, accuracy_30d: 0.71, signals: 89, category: 'flow' },
-        { name: 'Polymarket', trust_score: 0.69, accuracy_30d: 0.65, signals: 67, category: 'prediction' },
-        { name: 'Satellite/Alt Data', trust_score: 0.83, accuracy_30d: 0.80, signals: 31, category: 'physical' },
-        { name: 'Reddit (Trust-Scored)', trust_score: 0.44, accuracy_30d: 0.38, signals: 412, category: 'social' },
-    ];
-
-    const alerts = convergence?.alerts || [
-        { ticker: 'NVDA', type: 'multi-signal', message: 'Congressional buy + unusual call flow + dark pool accumulation', severity: 'high', timestamp: new Date().toISOString() },
-        { ticker: 'TLT', type: 'divergence', message: 'Fed liquidity expanding but bond prices falling -- divergence', severity: 'medium', timestamp: new Date().toISOString() },
-        { ticker: 'SPY', type: 'regime-shift', message: 'Regime probability shifting from GROWTH to FRAGILE', severity: 'high', timestamp: new Date().toISOString() },
-    ];
+    const sources = trustSources?.sources || [];
+    const alerts = convergence?.alerts || [];
 
     const trustColor = (score) => {
         if (score >= 0.85) return colors.green;
@@ -305,6 +290,11 @@ export default function IntelDashboard({ onNavigate }) {
                 <div style={{ ...shared.sectionTitle, marginBottom: tokens.space.sm }}>
                     TRUST-SCORED SOURCES
                 </div>
+                {sources.length === 0 ? (
+                    <div style={{ ...shared.card, color: colors.textMuted, fontSize: '12px', fontFamily: MONO, textAlign: 'center', padding: tokens.space.lg }}>
+                        No trust-scored sources available yet
+                    </div>
+                ) : (
                 <div style={{
                     display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))',
                     gap: '8px',
@@ -393,6 +383,7 @@ export default function IntelDashboard({ onNavigate }) {
                         );
                     })}
                 </div>
+                )}
             </div>
 
             {/* ── Quick Links ── */}
