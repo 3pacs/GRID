@@ -76,6 +76,20 @@ describe('CrossReference view async data', () => {
         expect(screen.getByText('Divergence Matrix')).toBeInTheDocument();
     });
 
+    it('treats a resolved api.js error marker as a failure, not empty data (regression for #449)', async () => {
+        // api.js never rejects on a real failure — it resolves
+        // { error: true, status, message } instead. Without the explicit
+        // check, that marker would sail into transformApiChecks() and
+        // render as an honest-looking empty matrix instead of ErrorState.
+        api.getCrossReference.mockResolvedValueOnce({ error: true, status: 503, message: 'cross-reference service unavailable' });
+
+        render(<CrossReference />);
+
+        expect(await screen.findByText('cross-reference service unavailable')).toBeInTheDocument();
+        expect(screen.queryByText('Divergence Matrix')).not.toBeInTheDocument();
+        expect(screen.queryByText('No live cross-reference checks available yet')).not.toBeInTheDocument();
+    });
+
     it('renders an honest empty state with no synthetic series when the payload is empty', async () => {
         api.getCrossReference.mockResolvedValue({ checks: [] });
 
