@@ -83,20 +83,27 @@ in bounded chunks of `raw_series.pull_timestamp`:
 ```bash
 cd /data/grid_v4/grid_release
 
-# Measure first — every phase runs, nothing is written.
-python -m normalization.resolver --since 2026-04-04 --until 2026-04-11 \
-    --chunk-days 7 --workers 8 --dry-run
+# Calibrate on ONE day first — every phase runs, nothing is written.
+python -m normalization.resolver --since 2026-04-04 --until 2026-04-05 \
+    --chunk-days 1 --workers 8 --dry-run
 
 # Then write. Idempotent: re-running a chunk hits
 # ON CONFLICT (feature_id, obs_date, vintage_date) DO NOTHING.
-python -m normalization.resolver --since 2026-04-04 --until 2026-05-02 \
-    --chunk-days 7 --workers 8
+python -m normalization.resolver --since 2026-04-04 --until 2026-04-18 \
+    --chunk-days 1 --workers 8
 ```
 
-Run it in slices that fit the 28-minute `ops-exec` cap rather than one long
-invocation, and keep `--chunk-days` at 7 or below: chunk cost scales with rows
-pulled in the window, not with `raw_series` size (~1.93 B rows), because
-`idx_raw_series_pull_timestamp` serves the window as an index scan.
+Size the chunks from that dry run, and run in slices that fit the 28-minute
+`ops-exec` cap rather than one long invocation.
+
+**A historical window costs far more than a recent one of the same width.** The
+rolling 2-day window's distinct-series scan is 2.2 s (index scan on
+`idx_raw_series_pull_timestamp`, buffers half-cached), but a 7-day window five
+months back did not finish inside the resolver's own 600 s statement timeout —
+`raw_series` is ~1.93 B rows and an old week is a cold, scattered heap read. So
+`--chunk-days 7` is fine as the rolling-window default and too wide for a
+backfill; start at 1 and widen only with measured headroom. A chunk that fails is
+recorded with its date range and the run continues, so retry that range alone.
 
 ## Services (Boot Order)
 
