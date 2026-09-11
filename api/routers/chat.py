@@ -2049,9 +2049,34 @@ async def compose_layout(
     _alert = _parse_alert_intent(question)
     if _alert:
         owner = _user_id_from_token(token) or "dad"
+        threshold = _alert.get("threshold")
+        if threshold is None:
+            # Relative move ("drops 5 percent") — resolve to a dollar price off
+            # the current quote (same read the alert store itself uses) rather
+            # than guessing; a percent number is never a bare dollar price.
+            from api.routers.price_alerts import current_price
+            base_price, _src = current_price(_alert["ticker"], prefer_live=False)
+            if base_price is None:
+                rid = _log_capability_gap(
+                    owner=owner,
+                    request_text=question,
+                    want=question,
+                    reason=f"No current price available for {_alert['ticker']} to compute a percent-based alert.",
+                )
+                return ChatComposeResponse(
+                    spoken_reply=(
+                        f"I couldn't look up {_alert['ticker']}'s current price, so I can't set "
+                        "that percent-based alert right now — try again later or give me a dollar amount."
+                    ),
+                    widgets=[], allocation=[],
+                    generated_at=now.isoformat(), model_used=None,
+                    cannot_fulfill=True, request_id=rid,
+                )
+            sign = -1.0 if _alert["direction"] == "below" else 1.0
+            threshold = round(base_price * (1 + sign * _alert["pct"]), 4)
         from api.routers.price_alerts import create_alert_record
         res = create_alert_record(
-            owner, _alert["ticker"], _alert["direction"], _alert["threshold"],
+            owner, _alert["ticker"], _alert["direction"], threshold,
             note=question[:280],
         )
         if res.get("ok"):
@@ -2283,14 +2308,50 @@ _ALERT_ABOVE = _re.compile(
 _ALERT_BELOW = _re.compile(
     r"\b(below|under|drops?|falls?|dips?|down to|goes?\s*down|sinks?|loses?)\b", _re.I)
 _ALERT_NUM = _re.compile(r"\$?\s*([\d,]+(?:\.\d+)?)\s*([kKmM])?\b")
+# A number followed by a percent cue ("5 percent", "5%", "5 pct") is a relative
+# move, not a dollar price — checked before _ALERT_NUM so "drops 5 percent"
+# doesn't get parsed as "drops below $5".
+_ALERT_PERCENT = _re.compile(r"\b([\d,]+(?:\.\d+)?)\s*(?:%|percent\b|pct\b)", _re.I)
+
+
+def _extract_alert_ticker(ql: str, q: str) -> str | None:
+    for name, sym in sorted(_ALERT_NAME_TO_TICKER.items(), key=lambda kv: -len(kv[0])):
+        if name in ql:
+            return sym
+    explicit = _re.search(r"\$([A-Za-z]{1,6})\b", q) or _re.search(r"\b([A-Z]{2,5})\b", q)
+    if explicit:
+        return explicit.group(1).upper()
+    return None
 
 
 def _parse_alert_intent(question: str) -> dict | None:
-    """Deterministically extract {ticker, direction, threshold} from a plain
-    request. Returns None when anything is ambiguous (then the LLM handles it).
-    Works with the LLM down — a price alert is a precise instruction."""
+    """Deterministically extract a price-alert intent from a plain request:
+    either {ticker, direction, threshold} for an absolute dollar price, or
+    {ticker, direction, pct} for a relative move ("drops 5 percent") that the
+    caller must resolve to a price once a current quote is available. Returns
+    None when anything is ambiguous (then the LLM handles it). Works with the
+    LLM down — a price alert is a precise instruction."""
     q = question or ""
     ql = q.lower()
+
+    pct_match = _ALERT_PERCENT.search(q)
+    if pct_match:
+        try:
+            pct = float(pct_match.group(1).replace(",", ""))
+        except ValueError:
+            return None
+        if pct <= 0:
+            return None
+        if _ALERT_BELOW.search(ql):
+            direction = "below"
+        elif _ALERT_ABOVE.search(ql):
+            direction = "above"
+        else:
+            return None
+        ticker = _extract_alert_ticker(ql, q)
+        if not ticker:
+            return None
+        return {"ticker": ticker, "direction": direction, "pct": pct / 100.0}
 
     m = _ALERT_NUM.search(q)
     if not m:
@@ -2314,15 +2375,7 @@ def _parse_alert_intent(question: str) -> dict | None:
     else:
         return None
 
-    ticker = None
-    for name, sym in sorted(_ALERT_NAME_TO_TICKER.items(), key=lambda kv: -len(kv[0])):
-        if name in ql:
-            ticker = sym
-            break
-    if ticker is None:
-        explicit = _re.search(r"\$([A-Za-z]{1,6})\b", q) or _re.search(r"\b([A-Z]{2,5})\b", q)
-        if explicit:
-            ticker = explicit.group(1).upper()
+    ticker = _extract_alert_ticker(ql, q)
     if not ticker:
         return None
 
