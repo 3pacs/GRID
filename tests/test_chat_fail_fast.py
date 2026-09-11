@@ -64,7 +64,7 @@ class TestResilientChatSlowEndpoint:
         # The fake host would take far longer than the budget to respond;
         # the call must be abandoned at the budget, not at the host's delay.
         slow = _slow_client(delay_s=5.0)
-        with patch.object(chat, "_COMPOSE_LLM_BUDGET_S", 0.3), \
+        with patch.object(chat, "_compose_budget_s", return_value=0.3), \
              patch.object(chat, "_get_local_oracle", return_value=(slow, "test-local")), \
              patch.object(chat, "_paid_clients", return_value=[]):
             start = time.monotonic()
@@ -76,7 +76,7 @@ class TestResilientChatSlowEndpoint:
 
     def test_budget_exceeded_is_logged_as_warning_not_error(self):
         slow = _slow_client(delay_s=2.0)
-        with patch.object(chat, "_COMPOSE_LLM_BUDGET_S", 0.2), \
+        with patch.object(chat, "_compose_budget_s", return_value=0.2), \
              patch.object(chat, "_get_local_oracle", return_value=(slow, "test-local")), \
              patch.object(chat, "_paid_clients", return_value=[]), \
              patch.object(chat.log, "warning") as mock_warn, \
@@ -99,6 +99,28 @@ class TestResilientChatHealthyEndpoint:
         assert text == "here is your dashboard"
         assert label == "qwen3.6-local"
         assert elapsed < 1.0
+
+    def test_logs_elapsed_ms_and_label_so_the_budget_can_be_tuned_from_data(self):
+        fast = _fast_client(reply="here is your dashboard")
+        with patch.object(chat, "_get_local_oracle", return_value=(fast, "qwen3.6-local")), \
+             patch.object(chat, "_paid_clients", return_value=[]), \
+             patch.object(chat.log, "info") as mock_info:
+            chat._resilient_chat([{"role": "user", "content": "hi"}])
+
+        logged = [str(c.args) + str(c.kwargs) for c in mock_info.call_args_list]
+        assert any("qwen3.6-local" in entry and "ms" in entry.lower() for entry in logged)
+
+
+class TestComposeBudgetSetting:
+    def test_reads_the_configured_budget_from_settings(self):
+        from config import settings
+        with patch.object(settings, "COMPOSE_LLM_BUDGET_S", 42.0):
+            assert chat._compose_budget_s() == 42.0
+
+    def test_defaults_to_eighteen_seconds_unchanged_from_pre_fail_fast_behavior(self):
+        from config import settings
+        with patch.object(settings, "COMPOSE_LLM_BUDGET_S", 18.0):
+            assert chat._compose_budget_s() == 18.0
 
 
 # ── _stream_verdict (ask/stream) ─────────────────────────────────────────

@@ -1098,15 +1098,28 @@ def _get_llm_client():
 
 _RESILIENT_EXEC = _futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="llm-failover")
 
-# Total wall-clock budget for one compose request's whole LLM attempt (local
-# card + any paid failover), enforced as a single deadline in _resilient_chat.
-# 2026-09-10 read-only QA (gemini-task 34544181414) measured compose taking
-# 18009ms end to end while the local card was degraded — dad watched a spinner
-# for 18-20s before hearing "busy", and one candidate host didn't error out of
-# its own read timeout until 120s later (in an abandoned background thread).
-# Bounding the whole attempt to ~8s means the busy message lands fast without
-# waiting for any single host's own (much larger) configured timeout.
-_COMPOSE_LLM_BUDGET_S: float = 8.0
+# Fallback default for the compose LLM budget, used only if settings.py's
+# COMPOSE_LLM_BUDGET_S is somehow missing. See _compose_budget_s().
+_COMPOSE_LLM_BUDGET_S_DEFAULT: float = 18.0
+
+
+def _compose_budget_s() -> float:
+    """Total wall-clock budget for one compose request's whole LLM attempt
+    (local card + any paid failover), enforced as a single deadline in
+    _resilient_chat — read live from settings.COMPOSE_LLM_BUDGET_S so an
+    operator can tune it without a deploy once a healthy-card timing
+    baseline exists (see config.py's comment on that setting; PR #453
+    review). Defaults to 18s, unchanged from the pre-fail-fast per-candidate
+    timeout: 2026-09-10 read-only QA (gemini-task 34544181414) only measured
+    compose while the local card was already degraded (18009ms to the busy
+    fallback, one candidate host not erroring out of its own read timeout
+    until 120s later in an abandoned background thread) — there is no
+    evidence yet of what a *healthy* compose answer needs, so the budget
+    stays conservative until _resilient_chat's own timing log below
+    supplies that data.
+    """
+    from config import settings
+    return getattr(settings, "COMPOSE_LLM_BUDGET_S", _COMPOSE_LLM_BUDGET_S_DEFAULT)
 
 # Total wall-clock budget for the PAID failover phase of the streaming verdict
 # (after the local card's own first-token budget, _STREAM_FIRST_TOKEN_S, has
@@ -1176,11 +1189,16 @@ def _resilient_chat(messages, *, temperature: float = 0.3, num_predict: int = 80
     """Local card first; on busy/slow/error, fail over through the paid cloud
     models. Returns (text, label), or (None, None) when nothing responds.
 
-    The whole attempt (local + paid) is bounded by ``_COMPOSE_LLM_BUDGET_S``:
-    once the deadline passes, remaining candidates are skipped rather than
-    each spending their own full timeout.
+    The whole attempt (local + paid) is bounded by the compose LLM budget
+    (settings.COMPOSE_LLM_BUDGET_S, see _compose_budget_s()): once the
+    deadline passes, remaining candidates are skipped rather than each
+    spending their own full timeout. Every successful answer logs its
+    elapsed time and answering label at log.info so the budget can be
+    tuned from real production timings instead of guesses.
     """
-    deadline = time.monotonic() + _COMPOSE_LLM_BUDGET_S
+    budget = _compose_budget_s()
+    started = time.monotonic()
+    deadline = started + budget
     local, label = _get_local_oracle()
     paid_candidates = _paid_clients()
 
@@ -1191,7 +1209,7 @@ def _resilient_chat(messages, *, temperature: float = 0.3, num_predict: int = 80
     if local is not None:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            log.warning("Compose LLM budget ({b}s) exhausted before local attempt could run", b=_COMPOSE_LLM_BUDGET_S)
+            log.warning("Compose LLM budget ({b}s) exhausted before local attempt could run", b=budget)
         else:
             try:
                 txt = _call_with_timeout(
@@ -1199,17 +1217,21 @@ def _resilient_chat(messages, *, temperature: float = 0.3, num_predict: int = 80
                     remaining,
                 )
                 if txt and txt.strip():
+                    log.info(
+                        "Compose answered via {l} in {ms:.0f}ms (budget {b}s)",
+                        l=label, ms=(time.monotonic() - started) * 1000, b=budget,
+                    )
                     return txt, label
                 log.warning("Local LLM returned empty — failing over to paid")
             except _futures.TimeoutError:
-                log.warning("Compose LLM budget ({b}s) exceeded on local card — failing over to paid model", b=_COMPOSE_LLM_BUDGET_S)
+                log.warning("Compose LLM budget ({b}s) exceeded on local card — failing over to paid model", b=budget)
             except Exception as exc:
                 log.warning("Local LLM error ({e}) — failing over to paid", e=str(exc))
 
     for paid, plabel in paid_candidates:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            log.warning("Compose LLM budget ({b}s) exhausted before paid fallback {l} could run", b=_COMPOSE_LLM_BUDGET_S, l=plabel)
+            log.warning("Compose LLM budget ({b}s) exhausted before paid fallback {l} could run", b=budget, l=plabel)
             break
         try:
             txt = _call_with_timeout(
@@ -1217,7 +1239,10 @@ def _resilient_chat(messages, *, temperature: float = 0.3, num_predict: int = 80
                 remaining,
             )
             if txt and txt.strip():
-                log.info("Answered via paid model {l} (local card busy)", l=plabel)
+                log.info(
+                    "Compose answered via paid model {l} in {ms:.0f}ms (budget {b}s, local card busy)",
+                    l=plabel, ms=(time.monotonic() - started) * 1000, b=budget,
+                )
                 return txt, plabel
             log.warning("Paid model {l} returned empty — trying next", l=plabel)
         except Exception as exc:
