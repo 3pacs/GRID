@@ -1419,7 +1419,7 @@ class TestResolveBacklog:
         )
 
         assert [(a.date().isoformat(), b.date().isoformat())
-                for a, b, _w, _d in windows] == [
+                for a, b, _w, _d in windows] == [  # whole-day widths here
             ("2026-04-04", "2026-04-11"),
             ("2026-04-11", "2026-04-18"),
             ("2026-04-18", "2026-04-25"),
@@ -1452,8 +1452,8 @@ class TestResolveBacklog:
         )
 
         assert [(c["chunk"], c["since"], c["until"]) for c in result["chunks"]] == [
-            (1, "2026-04-04", "2026-04-11"),
-            (2, "2026-04-11", "2026-04-18"),
+            (1, "2026-04-04T00:00:00+00:00", "2026-04-11T00:00:00+00:00"),
+            (2, "2026-04-11T00:00:00+00:00", "2026-04-18T00:00:00+00:00"),
         ]
 
     def test_default_until_covers_today(self):
@@ -1478,13 +1478,48 @@ class TestResolveBacklog:
             3, True,
         )]
 
-    def test_chunk_days_below_one_is_coerced(self):
+    @pytest.mark.parametrize("bad", (0, -1, -0.5))
+    def test_non_positive_chunk_days_is_rejected(self, bad):
+        """A zero-width chunk would loop forever; say so instead of guessing."""
+        resolver, _ = self._stub_resolver()
+        with pytest.raises(ValueError):
+            resolver.resolve_backlog(
+                since=date(2026, 4, 4), until=date(2026, 4, 6), chunk_days=bad
+            )
+
+    def test_fractional_chunk_days_subdivides_a_single_day(self):
+        """Ingestion volume per day is wildly uneven — 2026-04-04 alone holds
+        19,669,409 SUCCESS rows (ops-exec run 34551779486) against ~250k for a
+        whole week in August. A calendar day can therefore be too wide to
+        resolve in one statement, so the width must go below a day."""
         resolver, windows = self._stub_resolver()
         resolver.resolve_backlog(
-            since=date(2026, 4, 4), until=date(2026, 4, 6), chunk_days=0
+            since=date(2026, 4, 4), until=date(2026, 4, 5), chunk_days=0.25
         )
 
-        assert len(windows) == 2, "a zero-width chunk would loop forever"
+        assert len(windows) == 4, "expected four 6-hour chunks"
+        assert [w[0].isoformat() for w in windows] == [
+            "2026-04-04T00:00:00+00:00",
+            "2026-04-04T06:00:00+00:00",
+            "2026-04-04T12:00:00+00:00",
+            "2026-04-04T18:00:00+00:00",
+        ]
+        assert windows[-1][1] == datetime(2026, 4, 5, tzinfo=_timezone.utc)
+
+    def test_sub_day_chunks_are_distinguishable_in_the_record(self):
+        """Per-chunk records must carry full timestamps, or every chunk inside
+        one day would report identical bounds and the operator could not tell
+        which range to retry."""
+        resolver, _ = self._stub_resolver()
+        result = resolver.resolve_backlog(
+            since=date(2026, 4, 4), until=date(2026, 4, 5), chunk_days=0.5
+        )
+
+        bounds = [(c["since"], c["until"]) for c in result["chunks"]]
+        assert len(set(bounds)) == len(bounds) == 2
+        assert bounds[0] == (
+            "2026-04-04T00:00:00+00:00", "2026-04-04T12:00:00+00:00"
+        )
 
     def test_inverted_range_is_rejected(self):
         resolver, _ = self._stub_resolver()
@@ -1537,7 +1572,7 @@ class TestResolverCli:
         args = build_parser().parse_args([])
         assert args.since is None
         assert args.until is None
-        assert args.chunk_days == 7
+        assert args.chunk_days == 7.0
         assert args.workers == 8
         assert args.dry_run is False
 
@@ -1548,7 +1583,7 @@ class TestResolverCli:
         ])
         assert args.since == date(2026, 4, 4)
         assert args.until == date(2026, 4, 11)
-        assert args.chunk_days == 7
+        assert args.chunk_days == 7.0
         assert args.workers == 8
         assert args.dry_run is True
 
@@ -1556,10 +1591,20 @@ class TestResolverCli:
         self._install_fake_db(monkeypatch)
         assert resolver_main(["--until", "2026-04-11"]) == 2
 
-    @pytest.mark.parametrize("bad", (["--chunk-days", "0"], ["--workers", "0"]))
+    @pytest.mark.parametrize(
+        "bad",
+        (["--chunk-days", "0"], ["--chunk-days", "-1"], ["--workers", "0"]),
+    )
     def test_nonsense_bounds_exit_nonzero(self, monkeypatch, bad):
         self._install_fake_db(monkeypatch)
         assert resolver_main(bad) == 2
+
+    def test_fractional_chunk_days_is_accepted(self):
+        """The April backlog needs sub-day chunks, so the flag must take a
+        float — 0.25 is 6 hours."""
+        args = build_parser().parse_args(["--since", "2026-04-04",
+                                          "--chunk-days", "0.25"])
+        assert args.chunk_days == 0.25
 
     def test_since_routes_to_resolve_backlog(self, monkeypatch, capsys):
         self._install_fake_db(monkeypatch)
@@ -1581,7 +1626,7 @@ class TestResolverCli:
         assert rc == 0
         assert seen == {
             "since": date(2026, 4, 4), "until": None,
-            "chunk_days": 7, "workers": 8, "dry_run": True,
+            "chunk_days": 7.0, "workers": 8, "dry_run": True,
         }
         assert "totals" in capsys.readouterr().out
 
@@ -1754,6 +1799,6 @@ class TestFeatureIdMemoisation:
         # The failed chunk names itself so the operator can retry that range.
         failed = [c for c in result["chunks"] if c.get("failed")]
         assert len(failed) == 1
-        assert failed[0]["since"] == "2026-04-11"
+        assert failed[0]["since"] == "2026-04-11T00:00:00+00:00"
         assert "statement timeout" in failed[0]["failed"]
         assert failed[0]["resolved"] == 0

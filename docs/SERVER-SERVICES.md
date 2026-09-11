@@ -80,30 +80,46 @@ writer is Hermes cycle step 3b (`run_fast_resolution` →
 `Resolver.resolve_pending(lookback_days=2)`). To recover a gap, walk the backlog
 in bounded chunks of `raw_series.pull_timestamp`:
 
+**Chunk width must follow the data, not the calendar.** Ingestion volume per day
+is wildly uneven, measured 2026-09-11 (ops-exec runs
+[34551047779](https://github.com/3pacs/GRID/actions/runs/34551047779),
+[34551779486](https://github.com/3pacs/GRID/actions/runs/34551779486)):
+
+| window | SUCCESS rows | distinct-scan |
+|---|---|---|
+| 2026-04-04 → 04-05 (one day) | **19,669,409** | 22.9 s (224,808 cold buffer reads) |
+| 2026-04-04 → 04-11 (one week) | — | **did not finish in 600 s** |
+| 2026-05-16 → 05-23 (one week) | 979,897 | 40.7 s |
+| 2026-08-22 → 08-29 (one week) | 251,579 | 0.7 s |
+| last 2 days (rolling, warm) | 655,473 | 2.2 s |
+
+Early April runs ~20 M rows **per day**; late August runs ~250 k **per week**. So
+`--chunk-days 7` is a rolling-window default only, and for the April–mid-May
+block even one calendar day is too wide — `--chunk-days` takes a float for that
+(`0.25` is 6 hours). Weeks before 2026-05-16 could not even be counted inside
+45 s, so calibrate with `--dry-run` before writing:
+
 ```bash
 cd /data/grid_v4/grid_release
 
-# Calibrate on ONE day first — every phase runs, nothing is written.
+# Calibrate — every phase runs, nothing is written. Start narrow in April.
 python -m normalization.resolver --since 2026-04-04 --until 2026-04-05 \
-    --chunk-days 1 --workers 8 --dry-run
+    --chunk-days 0.25 --workers 8 --dry-run
 
-# Then write. Idempotent: re-running a chunk hits
+# Write once the dry run fits comfortably under the 600 s statement timeout.
+# Idempotent: re-running a chunk hits
 # ON CONFLICT (feature_id, obs_date, vintage_date) DO NOTHING.
-python -m normalization.resolver --since 2026-04-04 --until 2026-04-18 \
-    --chunk-days 1 --workers 8
+python -m normalization.resolver --since 2026-04-04 --until 2026-04-06 \
+    --chunk-days 0.25 --workers 8
+
+# The tail of the backlog is far lighter; widen there.
+python -m normalization.resolver --since 2026-07-18 --until 2026-09-12 \
+    --chunk-days 7 --workers 8
 ```
 
-Size the chunks from that dry run, and run in slices that fit the 28-minute
-`ops-exec` cap rather than one long invocation.
-
-**A historical window costs far more than a recent one of the same width.** The
-rolling 2-day window's distinct-series scan is 2.2 s (index scan on
-`idx_raw_series_pull_timestamp`, buffers half-cached), but a 7-day window five
-months back did not finish inside the resolver's own 600 s statement timeout —
-`raw_series` is ~1.93 B rows and an old week is a cold, scattered heap read. So
-`--chunk-days 7` is fine as the rolling-window default and too wide for a
-backfill; start at 1 and widen only with measured headroom. A chunk that fails is
-recorded with its date range and the run continues, so retry that range alone.
+Run in slices that fit the 28-minute `ops-exec` cap rather than one long
+invocation. A chunk that fails is recorded with its exact timestamp range and the
+run continues, so retry that range alone, narrower.
 
 ## Services (Boot Order)
 

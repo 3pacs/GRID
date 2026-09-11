@@ -481,7 +481,7 @@ class Resolver:
         self,
         since: date | datetime,
         until: date | datetime | None = None,
-        chunk_days: int = 7,
+        chunk_days: float = 7.0,
         workers: int = 8,
         dry_run: bool = False,
     ) -> dict[str, Any]:
@@ -497,7 +497,12 @@ class Resolver:
             since: Inclusive lower bound on pull_timestamp.
             until: Exclusive upper bound. Defaults to tomorrow (UTC) so
                 everything pulled so far is covered.
-            chunk_days: Width of each chunk in days (minimum 1).
+            chunk_days: Width of each chunk in days. Fractional values are
+                allowed and sometimes necessary: ingestion volume per day is
+                not uniform — 2026-04-04 alone holds 19.7 M SUCCESS rows
+                while a whole week in August holds ~250 k — so a single
+                calendar day can be too wide to resolve in one statement.
+                ``0.25`` is a 6-hour chunk. Must be > 0.
             workers: Resolver threads per chunk.
             dry_run: Measure without writing (see resolve_pending).
 
@@ -513,7 +518,9 @@ class Resolver:
         )
         if upper <= lower:
             raise ValueError(f"until ({upper}) must be after since ({lower})")
-        width = timedelta(days=max(1, int(chunk_days)))
+        if chunk_days <= 0:
+            raise ValueError(f"chunk_days must be > 0, got {chunk_days!r}")
+        width = timedelta(days=float(chunk_days))
 
         bounds: list[tuple[datetime, datetime]] = []
         cursor = lower
@@ -524,7 +531,8 @@ class Resolver:
 
         log.info(
             "Backlog resolution: {n} chunk(s) of {d}d from {a} to {b} (dry_run={dr})",
-            n=len(bounds), d=width.days, a=lower.date(), b=upper.date(), dr=dry_run,
+            n=len(bounds), d=chunk_days, a=lower.isoformat(),
+            b=upper.isoformat(), dr=dry_run,
         )
 
         totals: dict[str, int] = {
@@ -558,8 +566,8 @@ class Resolver:
             except Exception as exc:
                 log.error(
                     "Chunk {i}/{n} [{a} → {b}) failed, continuing: {e}",
-                    i=index, n=len(bounds), a=chunk_from.date(),
-                    b=chunk_to.date(), e=str(exc),
+                    i=index, n=len(bounds), a=chunk_from.isoformat(),
+                    b=chunk_to.isoformat(), e=str(exc),
                 )
                 summary = dict.fromkeys(totals, 0)
                 summary.update(
@@ -572,8 +580,8 @@ class Resolver:
                 totals[key] += int(summary.get(key, 0))
             record = {
                 "chunk": index,
-                "since": chunk_from.date().isoformat(),
-                "until": chunk_to.date().isoformat(),
+                "since": chunk_from.isoformat(),
+                "until": chunk_to.isoformat(),
                 **summary,
             }
             chunks.append(record)
@@ -594,9 +602,9 @@ class Resolver:
             n=len(bounds), t=elapsed,
         )
         return {
-            "since": lower.date().isoformat(),
-            "until": upper.date().isoformat(),
-            "chunk_days": width.days,
+            "since": lower.isoformat(),
+            "until": upper.isoformat(),
+            "chunk_days": chunk_days,
             "workers": workers,
             "dry_run": dry_run,
             "chunks": chunks,
@@ -665,8 +673,10 @@ def build_parser() -> argparse.ArgumentParser:
              "Defaults to tomorrow (UTC). Requires --since.",
     )
     parser.add_argument(
-        "--chunk-days", type=int, default=7, metavar="N",
-        help="Width of each backlog chunk in days (default: 7).",
+        "--chunk-days", type=float, default=7.0, metavar="N",
+        help="Width of each backlog chunk in days (default: 7). Fractional "
+             "values are allowed and needed where a single day is too big to "
+             "resolve in one statement — 0.25 is a 6-hour chunk.",
     )
     parser.add_argument(
         "--lookback-days", type=int, default=30, metavar="N",
@@ -695,8 +705,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.until is not None and args.since is None:
         log.error("--until requires --since")
         return 2
-    if args.chunk_days < 1:
-        log.error("--chunk-days must be >= 1")
+    if args.chunk_days <= 0:
+        log.error("--chunk-days must be > 0")
         return 2
     if args.workers < 1:
         log.error("--workers must be >= 1")
