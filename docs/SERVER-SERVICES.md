@@ -343,20 +343,52 @@ guard and the `runner` user session. The GRID runner is
 
 **Boot contract:** WSL2 shuts the distro down when nothing holds it, which takes
 every Linux runner on alien offline at once (all 19 sibling runners were
-offline on 2026-09-10 for exactly this reason). The vault's `Servers.md`
-documents a scheduled task `GitHubActions-WSL-Start` that keeps the distro
-alive — it was **absent** on 2026-09-11 and must be recreated by the operator
-on the Windows side (elevated PowerShell):
+offline on 2026-09-10 for exactly this reason). The Windows scheduled task
+`GitHubActions-WSL-Start` is what holds it open, and it **does exist** — an
+earlier revision of this section said it was absent, which was wrong. Check
+before concluding anything:
+
+```bash
+ssh alien 'MSYS_NO_PATHCONV=1 schtasks /query /tn GitHubActions-WSL-Start /v /fo LIST'
+ssh alien 'powershell -NoProfile -Command "Get-ScheduledTaskInfo -TaskName GitHubActions-WSL-Start"'
+```
+
+`MSYS_NO_PATHCONV=1` is load-bearing: without it MSYS rewrites `/query` to
+`C:/Program Files/Git/query` and `schtasks` fails with an argument error that
+reads like "task not found". That is exactly how the false "absent" claim got
+into this file.
+
+As installed the task runs
+`wsl.exe -d GitHubActions -u root --exec /usr/bin/sleep infinity` as `owner`
+(LogonType S4U, RunLevel HighestAvailable, `ExecutionTimeLimit` PT0S).
+
+**Its real failure mode is that it cannot recover on its own.** It has only a
+boot trigger and a logon trigger, with `RestartOnFailure` Count 5 / Interval
+PT1M. On 2026-09-02 it ran and exited 1, burned its five one-minute retries,
+and then had nothing left to re-fire it — Windows `LastBootUpTime` was
+2026-08-19, so across 22 days of uptime the distro stayed down and took every
+runner with it. `schtasks /run /tn GitHubActions-WSL-Start` brings it straight
+back up, which is the recovery action, not re-registration.
+
+**Operator fix — add a repetition trigger to the existing task.** Do not
+re-register it. `Set-ScheduledTask` keeps the triggers it already has and adds
+a 15-minute repeat that runs forever; `MultipleInstancesPolicy` is already
+`IgnoreNew`, so re-firing while the distro is healthy is a no-op (elevated
+PowerShell on alien):
 
 ```powershell
-$a = New-ScheduledTaskAction -Execute "C:\Windows\System32\wsl.exe" `
-       -Argument '-d GitHubActions --exec sleep infinity'
-$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) `
-       -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
-$p = New-ScheduledTaskPrincipal -UserId "owner" -LogonType S4U -RunLevel Highest
-Register-ScheduledTask -TaskName GitHubActions-WSL-Start -Action $a `
-  -Trigger (New-ScheduledTaskTrigger -AtStartup),(New-ScheduledTaskTrigger -AtLogOn) `
-  -Settings $s -Principal $p
+$repeat = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+            -RepetitionInterval (New-TimeSpan -Minutes 15) `
+            -RepetitionDuration ([TimeSpan]::MaxValue)
+Set-ScheduledTask -TaskName GitHubActions-WSL-Start -Trigger @(
+  (New-ScheduledTaskTrigger -AtStartup),
+  (New-ScheduledTaskTrigger -AtLogOn),
+  $repeat)
+
+# The Task Scheduler operational log is disabled, which is why the 2026-09-02
+# failure left no record at all. Turn it on so the next one is diagnosable.
+wevtutil set-log Microsoft-Windows-TaskScheduler/Operational /enabled:true
+
 Start-ScheduledTask -TaskName GitHubActions-WSL-Start
 wsl.exe -l -v    # GitHubActions must say Running
 ```
@@ -366,11 +398,15 @@ rewrites leading-slash arguments, so `--exec /bin/sh -c ...` reaches wsl.exe as
 `C:/Program Files/Git/usr/bin/sh` and fails with `execvpe ... No such file`.
 Use `--exec sleep infinity` (no path) or `MSYS_NO_PATHCONV=1`.
 
-**Do not set `TEST_RUNNER` until that task exists and `wsl.exe -l -v` says
-Running.** With the variable set and the distro stopped, every PR's Lint /
-Backend Tests / Frontend Build queues against an offline runner, and a job that
-is mid-run when the distro idles out is cancelled (this happened to a foreign
-PR's Backend Tests on 2026-09-11 01:15Z during activation testing).
+**Do not set `TEST_RUNNER` while the distro is stopped.** Confirm
+`wsl.exe -l -v` says `Running` and that
+`gh api repos/3pacs/GRID/actions/runners` reports `alien` as `online` first.
+With the variable set and the distro down, every PR's Lint / Backend Tests /
+Frontend Build queues against an offline runner, and a job that is mid-run when
+the distro idles out is cancelled (this happened to a foreign PR's Backend
+Tests on 2026-09-11 01:15Z during activation testing). The way back is
+`gh variable delete TEST_RUNNER -R 3pacs/GRID`, then cancel and re-run anything
+already queued so it lands on `ubuntu-latest`.
 
 ### One-time setup (as root inside the `GitHubActions` distro)
 
@@ -464,7 +500,7 @@ journalctl -u actions.runner.3pacs-GRID.alien.service -n 5   # expect "Listening
 ```bash
 # Windows side (SSH to alien, Git Bash):
 wsl.exe -l -v                                                  # GitHubActions must be Running
-schtasks /query /tn GitHubActions-WSL-Start                    # boot contract present?
+MSYS_NO_PATHCONV=1 schtasks /query /tn GitHubActions-WSL-Start /v /fo LIST   # boot contract
 # Inside the distro (wsl.exe -d GitHubActions -u root):
 systemctl status actions.runner.3pacs-GRID.alien --no-pager    # runner service
 systemctl restart actions.runner.3pacs-GRID.alien              # if it drops off "Idle"

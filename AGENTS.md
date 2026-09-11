@@ -2,6 +2,30 @@
 
 Append-only running log for GRID system work.
 
+## 2026-09-11 - correction: the `GitHubActions-WSL-Start` task exists (supersedes the boot-contract claim below)
+
+What was done:
+
+- Corrected `docs/SERVER-SERVICES.md` "Alien Runner": the Windows scheduled task `GitHubActions-WSL-Start` **does exist** on alien. The entry below, and the doc text it shipped, said it was absent and told the operator to re-register it. Both were wrong, and following that guidance would have duplicated or overwritten a working task.
+- Root cause of the false negative: `ssh alien 'schtasks /query /tn ...'` runs under Git Bash, where MSYS rewrites `/query` into `C:/Program Files/Git/query`; the resulting argument error reads like "task not found". The correct probe is now documented: `ssh alien 'MSYS_NO_PATHCONV=1 schtasks /query /tn GitHubActions-WSL-Start /v /fo LIST'`, or PowerShell `Get-ScheduledTaskInfo`.
+- Documented the task's actual failure mode and the operator fix. It has only boot and logon triggers with `RestartOnFailure` Count 5 / Interval PT1M; it ran on 2026-09-02, exited 1, exhausted its five retries, and — with Windows `LastBootUpTime` at 2026-08-19 — nothing re-fired it for 22 days, which is why all 19 runners were down. The fix is `Set-ScheduledTask` adding a 15-minute repetition trigger to the existing task (safe: `MultipleInstancesPolicy` is already `IgnoreNew`), plus enabling `Microsoft-Windows-TaskScheduler/Operational`, which is off and is why the 2026-09-02 failure left no record.
+- Reworded the `TEST_RUNNER` warning to match reality (gate on the distro being `Running` and the runner `online`, not on the task existing) and fixed the same MSYS bug in the Health / recovery probe.
+
+Non-obvious decisions:
+
+- Added as a new entry rather than editing the 2026-09-11 entry below, which stays as written — this log is append-only, and the wrong claim is worth leaving visible next to its correction.
+- `schtasks /run` on the existing task was used to bring the distro up. That is an ops start of operator-authored infrastructure, not persistence creation; no task was created, modified, or enabled by an agent.
+
+Broken or TBD:
+
+- The repetition trigger still needs an operator's elevated PowerShell on alien. Until it lands, one transient failure can take CI down repo-wide again for as long as the box stays up.
+- Vault `05-GRID/Infrastructure/Servers.md` still carries the same "absent" claim.
+
+Next pick-up:
+
+- Operator: run the `Set-ScheduledTask` snippet in `docs/SERVER-SERVICES.md`, then confirm `wsl.exe -l -v` reports `Running` after a deliberate `schtasks /end`.
+- Full investigation log: `Sessions/S-2026-09-11-opus-alien-runner-followup.md` in the Obsidian vault.
+
 ## 2026-09-11 - alien self-hosted CI runner for GRID activated (handoff-09), TEST_RUNNER left unset pending WSL keep-alive
 
 What was done:
