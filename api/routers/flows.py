@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends
@@ -35,6 +38,14 @@ _SECTOR_CACHE_KEY = "sectors"
 # of serving {"unavailable": True} until the warm loop's first cycle
 # finishes (~70s cold — see AGENTS.md 2026-09-11 deploy-restart timeline).
 _SECTOR_SNAPSHOT_CATEGORY = "sector_flows"
+
+# Warm cycles run every ~240s, so persisting unconditionally would add ~360
+# rows/day forever (#454 review). Bound growth two ways: skip the write
+# entirely when the sector data hasn't changed (see `_hash_sectors_payload`),
+# and cap the table at this many rows per category as a backstop via
+# AnalyticalSnapshotStore's retention parameter.
+_SECTOR_SNAPSHOT_RETENTION = 50
+_last_persisted_sectors_hash: str | None = None
 
 _sector_warm_lock = threading.Lock()
 _sector_warm_thread_started = False
@@ -264,30 +275,62 @@ def _compute_sectors_payload() -> dict[str, Any]:
             "subsectors": list(sector.get("subsectors", {}).keys()),
         }
 
-    return {"sectors": sectors}
+    return {
+        "sectors": sectors,
+        # Survives every cache tier (fresh, stale, persisted snapshot) since
+        # it's baked into the payload dict itself — `get_sectors` never needs
+        # to special-case it.
+        "computed_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 _SECTOR_WARM_RETRY_SECONDS = 30.0
 
 
+def _hash_sectors_payload(payload: dict[str, Any]) -> str:
+    """Stable hash of the sector data only.
+
+    Excludes ``computed_at`` (which always differs run-to-run) so an
+    unchanged sector map doesn't churn a new row into analytical_snapshots
+    every warm cycle.
+    """
+    sectors_json = json.dumps(payload.get("sectors", {}), sort_keys=True, default=str)
+    return hashlib.sha256(sectors_json.encode("utf-8")).hexdigest()
+
+
 def _persist_sectors_snapshot(payload: dict[str, Any]) -> None:
     """Persist a successfully computed payload for cold-start recovery.
+
+    Only writes a new row when the sector data actually changed since the
+    last persisted snapshot — see `_hash_sectors_payload`. Retention on
+    `AnalyticalSnapshotStore` caps the table as a backstop even if the data
+    keeps changing every cycle.
 
     Best-effort only: a persistence failure must never fail the warm cycle
     or block a request — the process just falls back to the in-memory
     tiers, same as before this existed.
     """
+    global _last_persisted_sectors_hash
     try:
+        payload_hash = _hash_sectors_payload(payload)
+        if payload_hash == _last_persisted_sectors_hash:
+            log.debug("Sector flow snapshot unchanged — skipping persist")
+            return
+
         from store.snapshots import AnalyticalSnapshotStore
 
-        store = AnalyticalSnapshotStore(db_engine=get_db_engine())
+        store = AnalyticalSnapshotStore(
+            db_engine=get_db_engine(),
+            retention_per_category=_SECTOR_SNAPSHOT_RETENTION,
+        )
         store.save_snapshot(category=_SECTOR_SNAPSHOT_CATEGORY, payload=payload)
+        _last_persisted_sectors_hash = payload_hash
     except Exception as exc:
         log.warning("Sector flow snapshot persist failed (non-fatal): {e}", e=str(exc))
 
 
 def _load_persisted_sectors_snapshot() -> None:
-    """Seed the stale tier from the last persisted snapshot.
+    """Seed the stale tier from the last persisted snapshot, age-gated.
 
     Runs once, before the warm loop's first compute, so a process that was
     just restarted (deploy, crash, manual bounce) can serve the last known
@@ -295,19 +338,52 @@ def _load_persisted_sectors_snapshot() -> None:
     placeholder for the ~70s it takes to compute fresh. Failures (table not
     there yet, DB unreachable, no snapshot ever saved) are non-fatal — the
     process just waits on the warm loop's first cycle like before.
+
+    A snapshot older than `_SECTOR_STALE_TTL` (or one with no `computed_at`
+    to judge age from) is never seeded — a days-old sector map must never be
+    served as merely "stale" with no indication of how old it really is.
+    Otherwise the seeded payload gets a `snapshot_age_s` field so the card
+    can say how old the data is.
     """
     try:
         from store.snapshots import AnalyticalSnapshotStore
 
         store = AnalyticalSnapshotStore(db_engine=get_db_engine())
         rows = store.get_latest(_SECTOR_SNAPSHOT_CATEGORY, n=1)
-        if rows and rows[0].get("payload"):
-            payload = rows[0]["payload"]
-            _sector_stale_cache.set(_SECTOR_CACHE_KEY, payload)
+        if not rows or not rows[0].get("payload"):
+            return
+
+        payload = rows[0]["payload"]
+        computed_at = payload.get("computed_at")
+        if not computed_at:
+            log.info("Sector flow snapshot has no computed_at — skipping seed")
+            return
+
+        try:
+            computed_dt = datetime.fromisoformat(computed_at)
+        except ValueError:
             log.info(
-                "Sector flow cache seeded from persisted snapshot ({n} sectors)",
-                n=len(payload.get("sectors", {})),
+                "Sector flow snapshot computed_at is unparseable ({v!r}) — skipping seed",
+                v=computed_at,
             )
+            return
+        if computed_dt.tzinfo is None:
+            computed_dt = computed_dt.replace(tzinfo=timezone.utc)
+
+        age_s = (datetime.now(timezone.utc) - computed_dt).total_seconds()
+        if age_s > _SECTOR_STALE_TTL:
+            log.info(
+                "Sector flow snapshot too old to seed ({age:.0f}s > {ttl:.0f}s TTL) — skipping",
+                age=age_s, ttl=_SECTOR_STALE_TTL,
+            )
+            return
+
+        payload = {**payload, "snapshot_age_s": round(age_s, 1)}
+        _sector_stale_cache.set(_SECTOR_CACHE_KEY, payload)
+        log.info(
+            "Sector flow cache seeded from persisted snapshot ({n} sectors, {age:.0f}s old)",
+            n=len(payload.get("sectors", {})), age=age_s,
+        )
     except Exception as exc:
         log.warning("Sector flow snapshot load failed (non-fatal): {e}", e=str(exc))
 

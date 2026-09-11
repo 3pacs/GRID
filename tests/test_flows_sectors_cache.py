@@ -19,6 +19,7 @@ matching the pattern in tests/test_sector_health.py.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -60,10 +61,12 @@ def _res(rows=None, one=None):
 def _clear_caches_and_thread_flag():
     flows_router._sector_cache.clear()
     flows_router._sector_stale_cache.clear()
+    flows_router._last_persisted_sectors_hash = None
     yield
     flows_router._sector_cache.clear()
     flows_router._sector_stale_cache.clear()
     flows_router._sector_warm_thread_started = False
+    flows_router._last_persisted_sectors_hash = None
 
 
 # ── Cache tiers are the shared TTLCache utility ────────────────────────────
@@ -227,6 +230,48 @@ def test_start_sector_flow_warm_thread_starts_warm_thread_once(monkeypatch):
 def test_load_persisted_sectors_snapshot_seeds_stale_tier(monkeypatch):
     """Cold start recovery: a persisted snapshot fills the stale tier so a
     request never sees the empty/unavailable placeholder after a restart."""
+    recent = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    persisted_payload = {"sectors": {"Energy": {"etf": "XLE"}}, "computed_at": recent}
+    fake_store = MagicMock()
+    fake_store.get_latest.return_value = [{"payload": persisted_payload}]
+    monkeypatch.setattr(
+        "store.snapshots.AnalyticalSnapshotStore", lambda db_engine: fake_store,
+    )
+    monkeypatch.setattr(flows_router, "get_db_engine", lambda: MagicMock())
+
+    flows_router._load_persisted_sectors_snapshot()
+
+    seeded = flows_router._sector_stale_cache.get(flows_router._SECTOR_CACHE_KEY)
+    assert seeded["sectors"] == persisted_payload["sectors"]
+    assert seeded["computed_at"] == recent
+    # Exposed so the card can say how old the data is (~5 minutes here).
+    assert 250 < seeded["snapshot_age_s"] < 350
+    fake_store.get_latest.assert_called_once_with(flows_router._SECTOR_SNAPSHOT_CATEGORY, n=1)
+
+
+def test_load_persisted_sectors_snapshot_skips_when_older_than_stale_ttl(monkeypatch):
+    """A days-old persisted snapshot must never be seeded as merely 'stale'
+    with no indication of its true age — skip it outright."""
+    too_old = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=flows_router._SECTOR_STALE_TTL + 60)
+    ).isoformat()
+    persisted_payload = {"sectors": {"Energy": {"etf": "XLE"}}, "computed_at": too_old}
+    fake_store = MagicMock()
+    fake_store.get_latest.return_value = [{"payload": persisted_payload}]
+    monkeypatch.setattr(
+        "store.snapshots.AnalyticalSnapshotStore", lambda db_engine: fake_store,
+    )
+    monkeypatch.setattr(flows_router, "get_db_engine", lambda: MagicMock())
+
+    flows_router._load_persisted_sectors_snapshot()
+
+    assert flows_router._sector_stale_cache.get(flows_router._SECTOR_CACHE_KEY) is None
+
+
+def test_load_persisted_sectors_snapshot_skips_when_computed_at_missing(monkeypatch):
+    """Legacy/pre-migration snapshots with no computed_at can't be aged —
+    skip rather than guess."""
     persisted_payload = {"sectors": {"Energy": {"etf": "XLE"}}}
     fake_store = MagicMock()
     fake_store.get_latest.return_value = [{"payload": persisted_payload}]
@@ -237,8 +282,7 @@ def test_load_persisted_sectors_snapshot_seeds_stale_tier(monkeypatch):
 
     flows_router._load_persisted_sectors_snapshot()
 
-    assert flows_router._sector_stale_cache.get(flows_router._SECTOR_CACHE_KEY) == persisted_payload
-    fake_store.get_latest.assert_called_once_with(flows_router._SECTOR_SNAPSHOT_CATEGORY, n=1)
+    assert flows_router._sector_stale_cache.get(flows_router._SECTOR_CACHE_KEY) is None
 
 
 def test_load_persisted_sectors_snapshot_noop_when_nothing_saved(monkeypatch):
@@ -306,11 +350,12 @@ def test_sector_warm_cycle_persists_snapshot_on_success(monkeypatch):
 def test_persist_sectors_snapshot_saves_via_analytical_snapshot_store(monkeypatch):
     fake_store = MagicMock()
     monkeypatch.setattr(
-        "store.snapshots.AnalyticalSnapshotStore", lambda db_engine: fake_store,
+        "store.snapshots.AnalyticalSnapshotStore",
+        lambda db_engine, retention_per_category=None: fake_store,
     )
     monkeypatch.setattr(flows_router, "get_db_engine", lambda: MagicMock())
 
-    payload = {"sectors": {"Energy": {"etf": "XLE"}}}
+    payload = {"sectors": {"Energy": {"etf": "XLE"}}, "computed_at": "2026-09-11T00:00:00+00:00"}
     flows_router._persist_sectors_snapshot(payload)
 
     fake_store.save_snapshot.assert_called_once_with(
@@ -318,11 +363,63 @@ def test_persist_sectors_snapshot_saves_via_analytical_snapshot_store(monkeypatc
     )
 
 
+def test_persist_sectors_snapshot_passes_retention_to_store(monkeypatch):
+    captured = {}
+
+    def _fake_store(db_engine, retention_per_category=None):
+        captured["retention_per_category"] = retention_per_category
+        return MagicMock()
+
+    monkeypatch.setattr("store.snapshots.AnalyticalSnapshotStore", _fake_store)
+    monkeypatch.setattr(flows_router, "get_db_engine", lambda: MagicMock())
+
+    flows_router._persist_sectors_snapshot({"sectors": {"Energy": {"etf": "XLE"}}})
+
+    assert captured["retention_per_category"] == flows_router._SECTOR_SNAPSHOT_RETENTION
+
+
+def test_persist_sectors_snapshot_skips_unchanged_payload(monkeypatch):
+    """Bounding growth: an unchanged sector map must not add a new row every
+    240s warm cycle — only `computed_at` differs between calls."""
+    fake_store = MagicMock()
+    monkeypatch.setattr(
+        "store.snapshots.AnalyticalSnapshotStore",
+        lambda db_engine, retention_per_category=None: fake_store,
+    )
+    monkeypatch.setattr(flows_router, "get_db_engine", lambda: MagicMock())
+
+    sectors = {"Energy": {"etf": "XLE", "sector_stress": 0.4}}
+    flows_router._persist_sectors_snapshot({"sectors": sectors, "computed_at": "2026-09-11T00:00:00+00:00"})
+    flows_router._persist_sectors_snapshot({"sectors": sectors, "computed_at": "2026-09-11T00:04:00+00:00"})
+
+    assert fake_store.save_snapshot.call_count == 1
+
+
+def test_persist_sectors_snapshot_persists_again_when_data_changes(monkeypatch):
+    fake_store = MagicMock()
+    monkeypatch.setattr(
+        "store.snapshots.AnalyticalSnapshotStore",
+        lambda db_engine, retention_per_category=None: fake_store,
+    )
+    monkeypatch.setattr(flows_router, "get_db_engine", lambda: MagicMock())
+
+    flows_router._persist_sectors_snapshot({
+        "sectors": {"Energy": {"etf": "XLE", "sector_stress": 0.4}},
+        "computed_at": "2026-09-11T00:00:00+00:00",
+    })
+    flows_router._persist_sectors_snapshot({
+        "sectors": {"Energy": {"etf": "XLE", "sector_stress": 0.9}},
+        "computed_at": "2026-09-11T00:04:00+00:00",
+    })
+
+    assert fake_store.save_snapshot.call_count == 2
+
+
 def test_persist_sectors_snapshot_failure_never_raises(monkeypatch):
     """A persist failure must never propagate — the warm cycle already
     populated the in-memory tiers and a request must still succeed."""
 
-    def _boom(db_engine):
+    def _boom(db_engine, retention_per_category=None):
         raise RuntimeError("db unreachable")
 
     monkeypatch.setattr("store.snapshots.AnalyticalSnapshotStore", _boom)
@@ -352,6 +449,48 @@ def test_sector_warm_cycle_survives_persist_failure(monkeypatch):
 
 
 # ── _compute_sectors_payload: bounded, parameterized batched query ─────────
+
+
+def test_compute_sectors_payload_stamps_computed_at(monkeypatch):
+    """Every computed payload carries a UTC ISO 8601 computed_at so callers
+    downstream (cache tiers, persisted snapshot, the frontend card) always
+    know how old the data is."""
+
+    def side_effect(sql: str, params: dict):
+        s = sql.lower()
+        if "to_regclass" in s:
+            return _res(one=(None,))
+        return _res(rows=[])
+
+    engine, _ = _make_router_engine(side_effect)
+    monkeypatch.setattr(flows_router, "get_db_engine", lambda: engine)
+    monkeypatch.setattr(
+        "api.dependencies.get_pit_store", lambda: MagicMock(get_feature_matrix=lambda **kw: None),
+    )
+
+    before = datetime.now(timezone.utc)
+    result = flows_router._compute_sectors_payload()
+    after = datetime.now(timezone.utc)
+
+    assert "computed_at" in result
+    computed_dt = datetime.fromisoformat(result["computed_at"])
+    if computed_dt.tzinfo is None:
+        computed_dt = computed_dt.replace(tzinfo=timezone.utc)
+    assert before <= computed_dt <= after
+
+
+def test_get_sectors_returns_computed_at_through_fresh_and_stale_tiers(monkeypatch):
+    """computed_at must survive both cache tiers unchanged — get_sectors
+    never strips or recomputes it."""
+    monkeypatch.setattr(flows_router, "_ensure_sector_warm_thread", lambda: None)
+    fresh_payload = {"sectors": {"Energy": {"etf": "XLE"}}, "computed_at": "2026-09-11T00:00:00+00:00"}
+    flows_router._sector_cache.set(flows_router._SECTOR_CACHE_KEY, fresh_payload)
+    assert flows_router.get_sectors("test-token")["computed_at"] == "2026-09-11T00:00:00+00:00"
+
+    flows_router._sector_cache.clear()
+    stale_payload = {"sectors": {"Energy": {"etf": "XLE"}}, "computed_at": "2026-09-11T00:00:00+00:00"}
+    flows_router._sector_stale_cache.set(flows_router._SECTOR_CACHE_KEY, stale_payload)
+    assert flows_router.get_sectors("test-token")["computed_at"] == "2026-09-11T00:00:00+00:00"
 
 
 def test_compute_sectors_payload_uses_bounded_parameterized_price_query(monkeypatch):
