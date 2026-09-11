@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
@@ -25,11 +25,13 @@ from normalization.entity_map import EntityMap
 # a watermark, because it runs every 5 minutes and cannot afford a 30-day scan.
 DEFAULT_LOOKBACK_DAYS: int = 30
 
-# Backfill chunk width. Measured on griddb 2026-09-11: the rolling 2-day
-# window's distinct-series scan takes 2.2s, but a 7-day window five months
-# back blew through the resolver's own 600s statement timeout (ops-exec run
-# 34551047779) — an old week of a 1.93B-row table is a cold heap read. One
-# day is the width that finishes; widen only with a dry run to back it up.
+# Backfill chunk width. Chunking bounds each transaction and isolates a
+# failure to one slice; it is not a performance knob. The cold-heap-read
+# theory it was originally sized against was wrong: before _window_bounds,
+# a 7-day chunk (ops-exec run 34551047779) and a 1-day chunk (run
+# 34619633738) both died at the same 600s statement timeout, because the
+# window never reached the planner as an index bound and every chunk
+# scanned the whole table regardless of its width.
 DEFAULT_BACKFILL_CHUNK_DAYS: int = 1
 
 # Two values are considered conflicting if they differ by more than 0.5%
@@ -53,6 +55,54 @@ def _as_datetime(value: datetime | date) -> datetime:
     if isinstance(value, datetime):
         return value
     return datetime(value.year, value.month, value.day)
+
+
+def _window_bounds(
+    since: datetime | None,
+    until: datetime | None,
+    lookback_days: int,
+) -> dict[str, Any]:
+    """Resolve the pull_timestamp window into two plain bound parameters.
+
+    Both statements that scan ``raw_series`` compare ``pull_timestamp``
+    directly against ``:since`` and ``:until`` so the planner can use them
+    as index bounds. They used to carry the window inline instead::
+
+        rs.pull_timestamp >= COALESCE(CAST(:since AS timestamptz),
+                                      NOW() - :lookback * INTERVAL '1 day')
+        AND (CAST(:until AS timestamptz) IS NULL
+             OR rs.pull_timestamp < CAST(:until AS timestamptz))
+
+    psycopg2 renders a naive datetime as ``timestamp without time zone``,
+    and ``timestamp -> timestamptz`` is STABLE — its result depends on the
+    session TimeZone — so it is not folded to a constant at plan time.
+    Wrapped in COALESCE and in the ``IS NULL OR`` disjunction, that left
+    the planner no usable bound on the backfill path: it chose a full
+    sequential scan of ``raw_series`` (~1.93B rows) for every chunk, no
+    matter how narrow. Chunk width never entered the cost, which is why a
+    1-day chunk and a 7-day chunk both died at the same 600s statement
+    timeout (ops-exec runs 34551047779 and 34619633738).
+
+    The rolling cycle never showed the fault. With both parameters NULL
+    the disjunction folds away and the lower bound becomes
+    ``now() - interval``, which the planner does use as an index bound —
+    hence 2.2s for the live 2-day window against 600s for every backfill
+    chunk.
+
+    ``until`` stays optional: ``COALESCE(:until, 'infinity'::timestamptz)``
+    in the SQL keeps the upper end unbounded when it is None, without the
+    ``IS NULL OR`` that defeated the index. Both forms were checked on a
+    ``raw_series``-shaped table and both bounds land in ``Index Cond``.
+
+    A caller-supplied ``since`` is passed through untouched, so an
+    operator's ``--since 2026-04-04`` keeps being read in the session's
+    time zone exactly as before. Only the default is made explicit, and it
+    is UTC-aware so the rolling window stays anchored to an absolute
+    instant the way the server-side ``NOW()`` it replaces was.
+    """
+    if since is None:
+        since = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    return {"since": since, "until": until}
 
 
 def _flush_batch(engine: Engine, batch: list[dict]) -> int:
@@ -164,13 +214,12 @@ class Resolver:
         )
 
         # Window bounds are passed to both statements below as bound
-        # parameters; CAST(... AS timestamptz) lets PostgreSQL type the
-        # NULL case without any string building.
-        window_params: dict[str, Any] = {
-            "lookback": lookback_days,
-            "since": since,
-            "until": until,
-        }
+        # parameters, as plain comparisons the planner can use as index
+        # bounds. See _window_bounds for what the previous inline form
+        # cost every backfill chunk.
+        window_params: dict[str, Any] = _window_bounds(
+            since, until, lookback_days
+        )
 
         # Shape of "nothing was missed", so every return path below carries
         # the same keys whether or not an EntityMap was ever constructed.
@@ -222,11 +271,9 @@ class Resolver:
                 SELECT DISTINCT rs.series_id
                 FROM raw_series rs
                 WHERE rs.pull_status = 'SUCCESS'
-                  AND rs.pull_timestamp >= COALESCE(
-                        CAST(:since AS timestamptz),
-                        NOW() - :lookback * INTERVAL '1 day')
-                  AND (CAST(:until AS timestamptz) IS NULL
-                       OR rs.pull_timestamp < CAST(:until AS timestamptz))
+                  AND rs.pull_timestamp >= :since
+                  AND rs.pull_timestamp < COALESCE(
+                        :until, 'infinity'::timestamptz)
             """), window_params).fetchall()
 
         all_series = [r[0] for r in series_rows]
@@ -283,11 +330,9 @@ class Resolver:
                         JOIN source_catalog sc ON rs.source_id = sc.id
                         WHERE rs.series_id = ANY(:sids)
                           AND rs.pull_status = 'SUCCESS'
-                          AND rs.pull_timestamp >= COALESCE(
-                                CAST(:since AS timestamptz),
-                                NOW() - :lookback * INTERVAL '1 day')
-                          AND (CAST(:until AS timestamptz) IS NULL
-                               OR rs.pull_timestamp < CAST(:until AS timestamptz))
+                          AND rs.pull_timestamp >= :since
+                          AND rs.pull_timestamp < COALESCE(
+                                :until, 'infinity'::timestamptz)
                         ORDER BY rs.series_id, rs.obs_date, sc.priority_rank ASC
                     """), {"sids": partition, **window_params}).fetchall()
 
@@ -445,11 +490,12 @@ class Resolver:
         ``failed_ranges`` in the result lists exactly what to retry, so the
         operator re-runs those days alone (narrower) rather than the range.
 
-        Chunk width is not free to choose: the rolling 2-day window's
-        distinct-series scan is 2.2s, but a 7-day window five months back
-        did not finish inside the 600s statement timeout (raw_series is
-        ~1.93B rows, and an old week is a cold, scattered heap read). Hence
-        the 1-day default — widen only on measured headroom.
+        Chunk width bounds the transaction and the blast radius of a
+        failure. It is not the cost driver it was once taken for: with the
+        pre-_window_bounds predicate, 1-day and 7-day chunks both hit the
+        600s statement timeout, because neither reached the planner as an
+        index bound and each scanned the whole of raw_series. Widen only on
+        measured headroom even so — the scan is real work.
 
         Args:
             since: Inclusive lower bound on ``raw_series.pull_timestamp``.
@@ -594,13 +640,13 @@ def main(argv: list[str] | None = None) -> int:
             "--until 2026-04-05 --chunk-days 1 --dry-run\n"
             "  python -m normalization.resolver --since 2026-04-04 "
             "--until 2026-04-18 --chunk-days 1\n\n"
-            "Use --chunk-days 1 for historical windows. A 7-day chunk five "
-            "months back exceeded the\nresolver's 600s statement timeout on "
-            "griddb, while the rolling 2-day window scans in\n2.2s — an old "
-            "week of a 1.93B-row table is a cold, scattered heap read. "
-            "Re-running a\nchunk is safe: every insert is ON CONFLICT "
-            "(feature_id, obs_date, vintage_date) DO NOTHING.\n"
-            "Chunks that fail are listed under failed_ranges; retry just "
+            "Chunk width bounds each transaction; it is not a speed knob. "
+            "Before the window bounds\nwere made index-usable, 1-day and "
+            "7-day chunks alike hit the 600s statement timeout,\nbecause "
+            "every chunk scanned the whole of raw_series no matter how "
+            "narrow it was.\nRe-running a chunk is safe: every insert is ON "
+            "CONFLICT (feature_id, obs_date,\nvintage_date) DO NOTHING. "
+            "Chunks that fail are listed under failed_ranges; retry\njust "
             "those, narrower."
         ),
     )
