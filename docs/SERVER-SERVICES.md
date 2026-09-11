@@ -235,59 +235,180 @@ Secrets and variables → Actions → Variables): when set to any non-empty valu
 `test.yml` targets `[self-hosted, alien, tests]`; when unset, jobs fall back to
 `ubuntu-latest` so CI never blocks on the Dell being offline.
 
-### One-time setup (run as the operator, on alien)
+
+### Where it actually lives (verified 2026-09-11)
+
+`alien` is a **Windows** host (tailnet name `precision5810`, Windows hostname
+`ALIEN`, SSH lands in Git Bash as `owner`). The Linux runners do not run on
+Windows: they live in the dedicated **WSL2 distro `GitHubActions`** (Ubuntu
+24.04, systemd enabled, unprivileged `runner` user with rootless Docker, no
+Windows interop/automount, egress guard). Run every command below as root
+inside that distro, e.g. from an SSH session on alien:
 
 ```bash
-# 1. PostgreSQL 15 + TimescaleDB — persistent, not a per-run container.
+wsl.exe -d GitHubActions -u root -- bash -s < setup-script.sh   # or interactive:
+wsl.exe -d GitHubActions -u root
+```
+
+Runners follow the fleet layout `/opt/github-actions/<repo>/<runner-name>/`
+owned by `runner`, with a systemd drop-in that orders them after the egress
+guard and the `runner` user session. The GRID runner is
+`/opt/github-actions/GRID/alien` → unit `actions.runner.3pacs-GRID.alien.service`.
+
+**Boot contract:** WSL2 shuts the distro down when nothing holds it, which takes
+every Linux runner on alien offline at once (all 19 sibling runners were
+offline on 2026-09-10 for exactly this reason). The vault's `Servers.md`
+documents a scheduled task `GitHubActions-WSL-Start` that keeps the distro
+alive — it was **absent** on 2026-09-11 and must be recreated by the operator
+on the Windows side (elevated PowerShell):
+
+```powershell
+$a = New-ScheduledTaskAction -Execute "C:\Windows\System32\wsl.exe" `
+       -Argument '-d GitHubActions --exec sleep infinity'
+$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) `
+       -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
+$p = New-ScheduledTaskPrincipal -UserId "owner" -LogonType S4U -RunLevel Highest
+Register-ScheduledTask -TaskName GitHubActions-WSL-Start -Action $a `
+  -Trigger (New-ScheduledTaskTrigger -AtStartup),(New-ScheduledTaskTrigger -AtLogOn) `
+  -Settings $s -Principal $p
+Start-ScheduledTask -TaskName GitHubActions-WSL-Start
+wsl.exe -l -v    # GitHubActions must say Running
+```
+
+Gotcha when testing this by hand from an SSH (Git Bash) session on alien: MSYS
+rewrites leading-slash arguments, so `--exec /bin/sh -c ...` reaches wsl.exe as
+`C:/Program Files/Git/usr/bin/sh` and fails with `execvpe ... No such file`.
+Use `--exec sleep infinity` (no path) or `MSYS_NO_PATHCONV=1`.
+
+**Do not set `TEST_RUNNER` until that task exists and `wsl.exe -l -v` says
+Running.** With the variable set and the distro stopped, every PR's Lint /
+Backend Tests / Frontend Build queues against an offline runner, and a job that
+is mid-run when the distro idles out is cancelled (this happened to a foreign
+PR's Backend Tests on 2026-09-11 01:15Z during activation testing).
+
+### One-time setup (as root inside the `GitHubActions` distro)
+
+```bash
+# 1. PostgreSQL 15 + TimescaleDB — persistent service, not a per-run container.
 #    The test job resets the schema (DROP SCHEMA public CASCADE; CREATE SCHEMA
 #    public) instead of spinning up a fresh instance every run.
-sudo apt-get update
-sudo sh -c "echo 'deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main' > /etc/apt/sources.list.d/pgdg.list"
-curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
-sudo apt-get update && sudo apt-get install -y postgresql-15 postgresql-15-timescaledb
-sudo timescaledb-tune --quiet --yes
-sudo systemctl enable --now postgresql
+#    Differences from the generic recipe: no lsb_release in the distro (use
+#    /etc/os-release); keys go in /etc/apt/keyrings with signed-by; TimescaleDB
+#    is NOT in pgdg — it comes from Timescale's packagecloud repo and the
+#    package is timescaledb-2-postgresql-15 (timescaledb-tune is in
+#    timescaledb-tools and needs explicit --pg-config/--conf-path).
+. /etc/os-release
+install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /etc/apt/keyrings/pgdg.gpg
+echo "deb [signed-by=/etc/apt/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+curl -fsSL https://packagecloud.io/timescale/timescaledb/gpgkey | gpg --dearmor -o /etc/apt/keyrings/timescaledb.gpg
+echo "deb [signed-by=/etc/apt/keyrings/timescaledb.gpg] https://packagecloud.io/timescale/timescaledb/ubuntu/ ${VERSION_CODENAME} main" > /etc/apt/sources.list.d/timescaledb.list
+apt-get update
+apt-get install -y postgresql-15 postgresql-client-15 timescaledb-2-postgresql-15 timescaledb-tools build-essential libpq-dev
+timescaledb-tune --quiet --yes --pg-config=/usr/lib/postgresql/15/bin/pg_config --conf-path=/etc/postgresql/15/main/postgresql.conf
+systemctl enable --now postgresql && systemctl restart postgresql
 sudo -u postgres psql -c "CREATE ROLE grid LOGIN PASSWORD 'testpass';"
 sudo -u postgres psql -c "CREATE DATABASE griddb_test OWNER grid;"
 sudo -u postgres psql -d griddb_test -c "CREATE EXTENSION IF NOT EXISTS timescaledb;"
 # matches the DB_URL the CI job already uses:
 # postgresql://grid:testpass@localhost:5432/griddb_test
+# Note: the job's `DROP SCHEMA public CASCADE` also drops the timescaledb
+# extension (it lives in public). The test suite does not need it — the
+# ubuntu-latest path uses a plain postgres:15 container — so this is fine.
+# Pin the cluster and the test DB to UTC. The distro's system zone is
+# America/Los_Angeles; the hosted postgres:15 container is UTC, and
+# tests/test_regime_history_writer.py::TestStalenessFields compares Python's
+# UTC date with Postgres current_date (it failed 164 == 165 on the first run).
+sed -i "s/^timezone = .*/timezone = 'UTC'/; s/^log_timezone = .*/log_timezone = 'UTC'/" /etc/postgresql/15/main/postgresql.conf
+sudo -u postgres psql -c "ALTER DATABASE griddb_test SET timezone TO 'UTC';"
+pg_ctlcluster 15 main reload
 
 # 2. Python 3.11 + Node 20
-sudo apt-get install -y software-properties-common
-sudo add-apt-repository -y ppa:deadsnakes/ppa && sudo apt-get update
-sudo apt-get install -y python3.11 python3.11-venv python3.11-dev
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-sudo apt-get install -y nodejs
+#    Both actions/setup-python@v6 and actions/setup-node@v6 provision their
+#    own toolchain into the runner tool cache (_work/_tool) on first run and
+#    reuse it afterwards, so a system install is a convenience, not a
+#    requirement. Do NOT run the nodesource setup_20 script: the distro's
+#    system Node (v22) is shared with the sibling runners for other repos.
+apt-get install -y software-properties-common
+add-apt-repository -y ppa:deadsnakes/ppa && apt-get update
+apt-get install -y python3.11 python3.11-venv python3.11-dev
 
-# 3. GitHub Actions runner — get a fresh download URL and registration token
-#    from https://github.com/3pacs/GRID/settings/actions/runners/new (token
-#    is single-use and expires in ~1 hour, so pull both values at install
-#    time rather than hardcoding them here).
-mkdir -p ~/actions-runner && cd ~/actions-runner
-curl -o actions-runner-linux-x64.tar.gz -L <DOWNLOAD_URL_FROM_RUNNERS_PAGE>
-tar xzf actions-runner-linux-x64.tar.gz
-./config.sh --url https://github.com/3pacs/GRID \
-  --token <REGISTRATION_TOKEN_FROM_RUNNERS_PAGE> \
-  --name alien --labels self-hosted,alien,tests --unattended
-sudo ./svc.sh install
-sudo ./svc.sh start
-# registers as systemd unit actions.runner.3pacs-GRID.alien
-systemctl status actions.runner.3pacs-GRID.alien --no-pager
+# 3. GitHub Actions runner — get a fresh registration token from
+#    https://github.com/3pacs/GRID/settings/actions/runners/new, or
+#    `gh api -X POST repos/3pacs/GRID/actions/runners/registration-token --jq .token`
+#    (single-use, expires in ~1 hour; never write it to disk or a doc).
+install -d -o runner -g runner /opt/github-actions/GRID/alien
+su - runner -c 'cd /opt/github-actions/GRID/alien \
+  && curl -sSLo r.tgz https://github.com/actions/runner/releases/download/v2.337.0/actions-runner-linux-x64-2.337.0.tar.gz \
+  && tar xzf r.tgz && rm r.tgz'
+/opt/github-actions/GRID/alien/bin/installdependencies.sh
+su - runner -c 'cd /opt/github-actions/GRID/alien && ./config.sh --unattended \
+  --url https://github.com/3pacs/GRID --token <REGISTRATION_TOKEN> \
+  --name alien --labels self-hosted,alien,tests --work _work'
+# The 2.337.0 tarball ships no top-level svc.sh; copy the identical script
+# from any sibling runner directory (or use bin/runsvc.sh with a hand-written
+# unit modelled on the siblings).
+cp /opt/github-actions/obsidian-vault/precision5810-vault-linux/svc.sh /opt/github-actions/GRID/alien/svc.sh
+cd /opt/github-actions/GRID/alien && ./svc.sh install runner
+install -d /etc/systemd/system/actions.runner.3pacs-GRID.alien.service.d
+cat > /etc/systemd/system/actions.runner.3pacs-GRID.alien.service.d/override.conf <<'CONF'
+[Unit]
+After=github-actions-egress-guard.service user@1000.service postgresql.service
+Requires=github-actions-egress-guard.service user@1000.service
+Wants=postgresql.service
 
-# 4. Flip CI over once the runner shows "Idle" on the runners page:
+[Service]
+Environment=CI_ARTIFACT_ROOT=/var/lib/github-actions-artifacts
+Environment=DOCKER_HOST=unix:///run/user/1000/docker.sock
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=TZ=UTC
+CONF
+systemctl daemon-reload && systemctl enable --now actions.runner.3pacs-GRID.alien.service
+journalctl -u actions.runner.3pacs-GRID.alien.service -n 5   # expect "Listening for Jobs"
+
+# 4. Flip CI over once the runner shows "Idle" on the runners page (or
+#    `gh api repos/3pacs/GRID/actions/runners` reports status "online"):
 #    gh variable set TEST_RUNNER --body alien -R 3pacs/GRID
-#    (or Settings → Secrets and variables → Actions → Variables → New)
+#    Setting it while no alien runner is online queues every PR's test jobs
+#    indefinitely — check first, and delete the variable to fall back.
 ```
 
 ### Health / recovery
 
 ```bash
-systemctl status actions.runner.3pacs-GRID.alien --no-pager   # runner service
-sudo systemctl restart actions.runner.3pacs-GRID.alien        # if it drops off "Idle"
-pg_isready -U grid -d griddb_test                              # persistent test DB
+# Windows side (SSH to alien, Git Bash):
+wsl.exe -l -v                                                  # GitHubActions must be Running
+schtasks /query /tn GitHubActions-WSL-Start                    # boot contract present?
+# Inside the distro (wsl.exe -d GitHubActions -u root):
+systemctl status actions.runner.3pacs-GRID.alien --no-pager    # runner service
+systemctl restart actions.runner.3pacs-GRID.alien              # if it drops off "Idle"
+pg_isready -h localhost -U grid -d griddb_test                  # persistent test DB
+# From anywhere with gh:
+gh api repos/3pacs/GRID/actions/runners --jq '.runners[] | "\(.name) \(.status) busy=\(.busy)"'
 ```
 
-To pull CI off alien without touching the workflow file, unset (or delete) the
+To pull CI off alien without touching the workflow file, delete the
 `TEST_RUNNER` repository variable — jobs fall back to `ubuntu-latest` on the
-next run.
+next run (a re-run of an already-queued run re-evaluates the variable too).
+
+### Measured on 2026-09-11 (first activation, PR #450)
+
+| Job | alien (warm tool cache) | ubuntu-latest |
+|---|---|---|
+| Lint | 1m56s | ~50s |
+| Frontend Build | 1m26s | ~1m07s |
+| Backend Tests (8,061 tests) | 14m58s job / 14m12s `Run tests` | 8m23s job / 6m47s `Run tests` |
+
+alien's CPU is a Xeon E5-2698 v3 (2.3 GHz, 2014): roughly 2x slower per core
+than the hosted VM, and pytest runs single-process. The ON_ALIEN branch was
+verified (`Reset persistent Postgres (alien)` ran, `Start ephemeral Postgres
+(hosted runner)` skipped), and the fallback was verified by deleting
+`TEST_RUNNER` and re-running: jobs re-evaluate the variable and land on
+`ubuntu-latest`. Two alien-only test failures were found and fixed:
+`TestGauntlet::test_run_gauntlet` takes ~90 s there (pytest `--timeout` raised
+60 -> 180 and the job `timeout-minutes` 15 -> 25 in `test.yml`), and the
+timezone mismatch above. The handoff's "under 4 minutes" bar holds for Lint and
+Frontend Build; Backend Tests will not get there on this CPU without
+parallelising the suite (`pytest-xdist -n auto` across 24 cores, which needs
+per-worker DB isolation first), so treat alien as a resilience/second-runner
+win for the test lane, not a speed win, until that lands.
