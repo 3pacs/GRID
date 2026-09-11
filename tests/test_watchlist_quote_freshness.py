@@ -100,7 +100,13 @@ class TestQuoteChangePct:
     def test_change_pct_none_when_no_price_history(self, mock_engine, _mock_init):
         _wire_engine(mock_engine, _mock_quote_conn([]))
 
-        response = client.get("/api/v1/watchlist/AAPL/quote", headers=_auth_header())
+        # No stored price falls through to the live-fetch fallback; force it
+        # to also come back empty so this test doesn't depend on whether the
+        # runner has real network access to Yahoo Finance.
+        with patch(
+            "api.routers.watchlist_overview._fetch_live_price", return_value=None
+        ):
+            response = client.get("/api/v1/watchlist/AAPL/quote", headers=_auth_header())
 
         assert response.status_code == 200
         assert response.json()["price"] is None
