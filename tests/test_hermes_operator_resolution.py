@@ -133,3 +133,105 @@ def test_run_cycle_resolution_branch_calls_run_fast_resolution():
     assert "run_fast_resolution(engine)" in block
     assert "entity_map" not in block
     assert "resolved_at" not in block
+
+
+def _fake_resolver_module(exc: Exception):
+    """A normalization.resolver stand-in whose resolve_pending raises `exc`."""
+
+    class Boom:
+        def __init__(self, db_engine):
+            pass
+
+        def resolve_pending(self, lookback_days=30, workers=8, **_kwargs):
+            raise exc
+
+    return SimpleNamespace(Resolver=Boom)
+
+
+def _captured_levels(monkeypatch) -> list[tuple[str, str]]:
+    """Record (level, message) for every log call hermes makes."""
+    records: list[tuple[str, str]] = []
+
+    def _recorder(level):
+        def _log(message, **kwargs):
+            records.append((level, message.format(**kwargs) if kwargs else message))
+        return _log
+
+    for level in ("error", "warning", "info", "debug"):
+        monkeypatch.setattr(hermes.log, level, _recorder(level), raising=False)
+    return records
+
+
+def test_operational_db_failure_logs_warning_not_error(monkeypatch):
+    """CLAUDE.md reserves log.error for unhandled application bugs. A dropped
+    connection, lock wait or statement timeout is operational noise — it must
+    land at warning so .server-logs/errors.jsonl stays signal-rich."""
+    from sqlalchemy.exc import OperationalError
+
+    monkeypatch.setitem(
+        sys.modules,
+        "normalization.resolver",
+        _fake_resolver_module(
+            OperationalError("SELECT 1", {}, Exception("canceling statement"))
+        ),
+    )
+    records = _captured_levels(monkeypatch)
+
+    result = hermes.run_fast_resolution(MagicMock())
+
+    assert "error" in result
+    assert result.get("transient") is True
+    levels = {level for level, msg in records if "Resolution failed" in msg}
+    assert levels == {"warning"}, f"expected warning only, got {levels}"
+
+
+def test_schema_failure_logs_error(monkeypatch):
+    """A ProgrammingError means the code and the schema disagree — the exact
+    class of failure that hid the 2026-04 frozen-price incident for seven
+    months. It must stay loud."""
+    from sqlalchemy.exc import ProgrammingError
+
+    monkeypatch.setitem(
+        sys.modules,
+        "normalization.resolver",
+        _fake_resolver_module(
+            ProgrammingError(
+                "INSERT INTO resolved_series ...", {},
+                Exception('relation "entity_map" does not exist'),
+            )
+        ),
+    )
+    records = _captured_levels(monkeypatch)
+
+    result = hermes.run_fast_resolution(MagicMock())
+
+    assert "error" in result
+    assert result.get("transient") is not True
+    levels = {level for level, msg in records if "Resolution failed" in msg}
+    assert levels == {"error"}, f"expected error only, got {levels}"
+
+
+def test_unexpected_bug_logs_error(monkeypatch):
+    """Anything that isn't a recognised operational failure stays an error."""
+    monkeypatch.setitem(
+        sys.modules,
+        "normalization.resolver",
+        _fake_resolver_module(TypeError("resolve_pending() got an unexpected kwarg")),
+    )
+    records = _captured_levels(monkeypatch)
+
+    result = hermes.run_fast_resolution(MagicMock())
+
+    assert "error" in result
+    levels = {level for level, msg in records if "Resolution failed" in msg}
+    assert levels == {"error"}
+
+
+def test_failures_are_never_swallowed_by_debug():
+    """The incident's root cause was `except Exception: log.debug(...)`. No
+    branch of this function may report a failure at debug level."""
+    body = _executable_body_source(hermes.run_fast_resolution)
+
+    assert "log.debug" not in body
+    assert "log.error" in body
+    assert "log.warning" in body

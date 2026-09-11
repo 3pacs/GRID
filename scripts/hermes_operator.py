@@ -61,6 +61,7 @@ if _GRID_DIR not in sys.path:
 
 from loguru import logger as log
 from sqlalchemy import text  # used by run_cycle DB writes
+from sqlalchemy.exc import OperationalError
 
 
 # ─── Configuration ───────────────────────────────────────────────────
@@ -1346,13 +1347,26 @@ def run_fast_resolution(engine: Any) -> dict[str, Any]:
     Bounded to a short lookback so it stays cheap in the per-cycle hot
     loop (the reason this was hand-rolled in the first place); the
     nightly/on-demand ``scripts/run_full_pipeline.py`` still calls
-    ``resolve_pending()`` with its full default lookback for catch-up.
+    ``resolve_pending()`` with its full default lookback, and
+    ``python -m normalization.resolver --since ...`` walks a historical
+    backlog in bounded date chunks.
+
+    Failure log level follows CLAUDE.md: a transient/operational database
+    failure (connection drop, lock wait, statement timeout — SQLAlchemy
+    ``OperationalError``) is a warning so ``errors.jsonl`` stays
+    signal-rich, while anything that means the code and the schema
+    disagree (``ProgrammingError``) or an outright bug is an error. The
+    2026-04 incident was a ProgrammingError class failure, and that is
+    exactly the class that must stay loud.
     """
     try:
         from normalization.resolver import Resolver
 
         resolver = Resolver(db_engine=engine)
         return resolver.resolve_pending(lookback_days=2, workers=4)
+    except OperationalError as exc:
+        log.warning("Resolution failed (operational): {e}", e=str(exc))
+        return {"error": str(exc), "transient": True}
     except Exception as exc:
         log.error("Resolution failed: {e}", e=str(exc))
         return {"error": str(exc)}

@@ -11,7 +11,9 @@ require a live pg_engine fixture.
 from __future__ import annotations
 
 import json
+import sys
 from datetime import date, datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -235,7 +237,9 @@ class TestSingleSourceUnit:
 
     @patch("normalization.resolver.EntityMap")
     def test_resolved_summary_keys_always_present(self, MockEntityMap):
-        """resolve_pending must always return all three summary keys."""
+        """resolve_pending must always return the three historical summary
+        keys, plus the measurement keys added for the dry-run/backlog work
+        (volume counts per phase, a dry_run flag and per-phase timings)."""
         mock_map = MagicMock()
         mock_map.get_feature_id.return_value = None
         MockEntityMap.return_value = mock_map
@@ -244,7 +248,12 @@ class TestSingleSourceUnit:
         resolver = Resolver(db_engine=engine)
         summary = resolver.resolve_pending()
 
-        assert set(summary.keys()) == {"resolved", "conflicts_found", "errors"}
+        assert {"resolved", "conflicts_found", "errors"} <= set(summary.keys())
+        assert {
+            "series_count", "raw_rows", "groups", "unmapped_groups",
+            "candidates", "dry_run", "timings",
+        } <= set(summary.keys())
+        assert isinstance(summary["timings"], dict)
 
     @patch("normalization.resolver.EntityMap")
     def test_pull_timestamp_date_extracted_for_release_date(self, MockEntityMap):
@@ -580,7 +589,14 @@ class TestSkipAndErrorUnit:
         resolver = Resolver(db_engine=engine)
         summary = resolver.resolve_pending()
 
-        assert summary == {"resolved": 0, "conflicts_found": 0, "errors": 0}
+        assert summary["resolved"] == 0
+        assert summary["conflicts_found"] == 0
+        assert summary["errors"] == 0
+        assert summary["series_count"] == 0
+        assert summary["candidates"] == 0
+        # The early return still reports what it measured getting there.
+        assert "distinct_series_s" in summary["timings"]
+        assert "total_s" in summary["timings"]
 
     def test_db_error_returns_error_count(self):
         engine = MagicMock()
@@ -1119,3 +1135,500 @@ class TestConflictDetection:
 
         # Should complete without errors
         assert result["errors"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Unit tests — pull window, dry run, and bounded backlog catch-up
+#
+# Added with the resolution-path hardening (slice 20b). The per-cycle
+# resolver had been dead since 2026-04-04 and nobody could say what a
+# window cost or how to recover the backlog, so resolve_pending gained a
+# measuring dry_run and absolute since/until bounds, and resolve_backlog
+# walks a historical range in bounded chunks.
+# ---------------------------------------------------------------------------
+
+from datetime import timezone as _timezone  # noqa: E402
+
+from normalization import resolver as resolver_module  # noqa: E402
+from normalization.resolver import (  # noqa: E402
+    _WINDOW_FROM,
+    _WINDOW_FROM_UNTIL,
+    _WINDOW_RELATIVE,
+    _as_utc,
+    _pull_window,
+    build_parser,
+    main as resolver_main,
+)
+
+
+def _recording_engine(rows=None, families=None):
+    """Mock engine that records every (sql, params) pair it executes.
+
+    Simpler than _mock_engine's fixed side-effect chain: every connection
+    returns the same rows, so tests can assert on the SQL and bound params
+    the resolver actually issued without counting connections.
+    """
+    calls: list[tuple[str, dict]] = []
+    rows = rows or []
+
+    def _execute(statement, params=None):
+        calls.append((str(statement), params if isinstance(params, dict) else {}))
+        result = MagicMock()
+        sql = str(statement).lower()
+        if "feature_registry" in sql:
+            result.fetchall.return_value = families or []
+        elif "distinct" in sql:
+            result.fetchall.return_value = sorted({(r[0],) for r in rows})
+        elif "from raw_series" in sql:
+            result.fetchall.return_value = list(rows)
+        else:
+            result.fetchall.return_value = []
+        result.fetchone.return_value = None
+        return result
+
+    conn = MagicMock()
+    conn.execute.side_effect = _execute
+
+    def _ctx(*_args, **_kwargs):
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=conn)
+        ctx.__exit__ = MagicMock(return_value=False)
+        return ctx
+
+    engine = MagicMock()
+    engine.begin.side_effect = _ctx
+    engine.connect.side_effect = _ctx
+    return engine, calls
+
+
+def _raw_row(series_id="SPY", obs=date(2026, 9, 10), value=100.0):
+    """One raw_series row in the shape the partition query returns."""
+    return (series_id, obs, value, 1, datetime(2026, 9, 10, 12, 0), 1, "TIINGO")
+
+
+class TestAsUtc:
+    """Chunk boundaries must not drift with the server timezone."""
+
+    def test_date_becomes_utc_midnight(self):
+        got = _as_utc(date(2026, 4, 4))
+        assert got == datetime(2026, 4, 4, tzinfo=_timezone.utc)
+
+    def test_naive_datetime_is_assumed_utc(self):
+        got = _as_utc(datetime(2026, 4, 4, 6, 30))
+        assert got == datetime(2026, 4, 4, 6, 30, tzinfo=_timezone.utc)
+
+    def test_aware_datetime_is_preserved(self):
+        original = datetime(2026, 4, 4, 6, 30, tzinfo=_timezone.utc)
+        assert _as_utc(original) is original
+
+
+class TestPullWindow:
+
+    def test_defaults_to_relative_lookback(self):
+        sql, params = _pull_window(30)
+        assert sql == _WINDOW_RELATIVE
+        assert params == {"lookback": 30}
+
+    def test_since_only_uses_lower_bound(self):
+        sql, params = _pull_window(30, since=date(2026, 4, 4))
+        assert sql == _WINDOW_FROM
+        assert params == {"since": datetime(2026, 4, 4, tzinfo=_timezone.utc)}
+
+    def test_since_and_until_bound_both_ends(self):
+        sql, params = _pull_window(
+            30, since=date(2026, 4, 4), until=date(2026, 4, 11)
+        )
+        assert sql == _WINDOW_FROM_UNTIL
+        assert params == {
+            "since": datetime(2026, 4, 4, tzinfo=_timezone.utc),
+            "until": datetime(2026, 4, 11, tzinfo=_timezone.utc),
+        }
+
+    def test_absolute_bounds_override_lookback(self):
+        _sql, params = _pull_window(2, since=date(2026, 4, 4))
+        assert "lookback" not in params
+
+    def test_until_without_since_is_rejected(self):
+        with pytest.raises(ValueError):
+            _pull_window(30, until=date(2026, 4, 11))
+
+    def test_every_variant_is_parameterised(self):
+        """SQL-safety rule: bounds travel as bound params, never as text."""
+        for variant in (_WINDOW_RELATIVE, _WINDOW_FROM, _WINDOW_FROM_UNTIL):
+            assert ":" in variant
+            assert "%" not in variant
+            assert "{" not in variant
+            assert "format" not in variant
+
+    def test_upper_bound_is_exclusive(self):
+        """Chunks must not double-count the boundary day: < not <=."""
+        assert "< :until" in _WINDOW_FROM_UNTIL
+        assert "<= :until" not in _WINDOW_FROM_UNTIL
+
+
+class TestResolvePendingWindowPlumbing:
+
+    @patch("normalization.resolver.EntityMap")
+    def test_relative_window_reaches_both_queries(self, MockEntityMap):
+        MockEntityMap.return_value = MagicMock()
+        engine, calls = _recording_engine()
+        Resolver(db_engine=engine).resolve_pending(lookback_days=2)
+
+        raw_reads = [(s, p) for s, p in calls if "raw_series" in s.lower()]
+        assert raw_reads
+        for sql, params in raw_reads:
+            assert "NOW() - :lookback * INTERVAL '1 day'" in sql
+            assert params.get("lookback") == 2
+
+    @patch("normalization.resolver.EntityMap")
+    def test_absolute_window_reaches_both_queries(self, MockEntityMap):
+        MockEntityMap.return_value = MagicMock()
+        engine, calls = _recording_engine(rows=[_raw_row()])
+        Resolver(db_engine=engine).resolve_pending(
+            since=date(2026, 4, 4), until=date(2026, 4, 11), dry_run=True
+        )
+
+        raw_reads = [(s, p) for s, p in calls if "raw_series" in s.lower()]
+        assert len(raw_reads) >= 2, "expected the distinct scan and a partition fetch"
+        for sql, params in raw_reads:
+            assert ":since" in sql and ":until" in sql
+            assert params["since"] == datetime(2026, 4, 4, tzinfo=_timezone.utc)
+            assert params["until"] == datetime(2026, 4, 11, tzinfo=_timezone.utc)
+
+    @patch("normalization.resolver.EntityMap")
+    def test_statement_timeout_is_raised_via_bound_param(self, MockEntityMap):
+        """The timeout override must not be interpolated into the SQL."""
+        MockEntityMap.return_value = MagicMock()
+        engine, calls = _recording_engine()
+        Resolver(db_engine=engine).resolve_pending(lookback_days=2)
+
+        overrides = [(s, p) for s, p in calls if "statement_timeout" in s]
+        assert overrides
+        for sql, params in overrides:
+            assert ":timeout_ms" in sql
+            assert str(Resolver._RESOLVE_STATEMENT_TIMEOUT_MS) in str(
+                params.get("timeout_ms")
+            )
+            assert str(Resolver._RESOLVE_STATEMENT_TIMEOUT_MS) not in sql
+
+
+class TestResolvePendingDryRun:
+
+    @patch("normalization.resolver._flush_batch")
+    @patch("normalization.resolver.EntityMap")
+    def test_dry_run_never_writes(self, MockEntityMap, mock_flush):
+        mock_map = MagicMock()
+        mock_map.get_feature_id.return_value = 7
+        MockEntityMap.return_value = mock_map
+
+        engine, _ = _recording_engine(rows=[_raw_row("SPY"), _raw_row("QQQ")])
+        summary = Resolver(db_engine=engine).resolve_pending(
+            lookback_days=2, workers=1, dry_run=True
+        )
+
+        mock_flush.assert_not_called()
+        assert summary["dry_run"] is True
+        assert summary["resolved"] == 0
+        # ...but it still reports what it would have written.
+        assert summary["candidates"] > 0
+        assert summary["raw_rows"] > 0
+        assert summary["groups"] > 0
+
+    @patch("normalization.resolver._flush_batch")
+    @patch("normalization.resolver.EntityMap")
+    def test_non_dry_run_still_writes(self, MockEntityMap, mock_flush):
+        mock_map = MagicMock()
+        mock_map.get_feature_id.return_value = 7
+        mock_flush.side_effect = lambda _engine, batch: len(batch)
+        MockEntityMap.return_value = mock_map
+
+        engine, _ = _recording_engine(rows=[_raw_row("SPY")])
+        summary = Resolver(db_engine=engine).resolve_pending(
+            lookback_days=2, workers=1
+        )
+
+        mock_flush.assert_called()
+        assert summary["dry_run"] is False
+        assert summary["resolved"] > 0
+        assert summary["candidates"] == summary["resolved"]
+
+    @patch("normalization.resolver.EntityMap")
+    def test_timings_cover_every_phase(self, MockEntityMap):
+        mock_map = MagicMock()
+        mock_map.get_feature_id.return_value = 7
+        MockEntityMap.return_value = mock_map
+
+        engine, _ = _recording_engine(rows=[_raw_row("SPY")])
+        summary = Resolver(db_engine=engine).resolve_pending(
+            lookback_days=2, workers=1, dry_run=True
+        )
+
+        timings = summary["timings"]
+        for phase in (
+            "entity_map_s", "feature_families_s", "distinct_series_s",
+            "workers_wall_s", "fetch_s", "group_s", "flush_s", "total_s",
+        ):
+            assert phase in timings, f"missing phase timing: {phase}"
+            assert timings[phase] >= 0
+        assert timings["flush_s"] == 0.0, "dry run must spend no time writing"
+
+    @patch("normalization.resolver.EntityMap")
+    def test_unmapped_series_are_counted_not_silently_dropped(self, MockEntityMap):
+        """443 of 1204 model-eligible features had a recent resolved row when
+        this was investigated; a run that maps nothing must say so rather
+        than reporting a clean zero."""
+        mock_map = MagicMock()
+        mock_map.get_feature_id.return_value = None
+        MockEntityMap.return_value = mock_map
+
+        engine, _ = _recording_engine(rows=[_raw_row("UNKNOWN_SERIES")])
+        summary = Resolver(db_engine=engine).resolve_pending(
+            lookback_days=2, workers=1, dry_run=True
+        )
+
+        assert summary["unmapped_groups"] == 1
+        assert summary["candidates"] == 0
+        assert summary["errors"] == 0
+
+
+class TestResolveBacklog:
+    """Bounded catch-up over a historical pull_timestamp range."""
+
+    @staticmethod
+    def _stub_resolver(engine=None):
+        """A Resolver whose resolve_pending records its window and returns 1 row."""
+        resolver = Resolver(db_engine=engine or MagicMock())
+        windows: list[tuple] = []
+
+        def _fake(workers=8, dry_run=False, since=None, until=None, **_kw):
+            windows.append((since, until, workers, dry_run))
+            return {
+                "resolved": 1, "conflicts_found": 0, "errors": 0,
+                "series_count": 2, "raw_rows": 3, "groups": 2,
+                "unmapped_groups": 0, "candidates": 1,
+                "dry_run": dry_run, "timings": {"total_s": 0.1},
+            }
+
+        resolver.resolve_pending = _fake  # type: ignore[method-assign]
+        return resolver, windows
+
+    def test_chunks_cover_the_range_without_gaps_or_overlap(self):
+        resolver, windows = self._stub_resolver()
+        resolver.resolve_backlog(
+            since=date(2026, 4, 4), until=date(2026, 4, 25), chunk_days=7
+        )
+
+        assert [(a.date().isoformat(), b.date().isoformat())
+                for a, b, _w, _d in windows] == [
+            ("2026-04-04", "2026-04-11"),
+            ("2026-04-11", "2026-04-18"),
+            ("2026-04-18", "2026-04-25"),
+        ]
+
+    def test_final_chunk_is_clamped_to_until(self):
+        resolver, windows = self._stub_resolver()
+        resolver.resolve_backlog(
+            since=date(2026, 4, 4), until=date(2026, 4, 20), chunk_days=7
+        )
+
+        assert windows[-1][1] == datetime(2026, 4, 20, tzinfo=_timezone.utc)
+
+    def test_totals_sum_across_chunks(self):
+        resolver, _ = self._stub_resolver()
+        result = resolver.resolve_backlog(
+            since=date(2026, 4, 4), until=date(2026, 4, 25), chunk_days=7
+        )
+
+        assert len(result["chunks"]) == 3
+        assert result["totals"]["resolved"] == 3
+        assert result["totals"]["candidates"] == 3
+        assert result["totals"]["raw_rows"] == 9
+        assert result["totals"]["errors"] == 0
+
+    def test_each_chunk_record_carries_its_own_bounds(self):
+        resolver, _ = self._stub_resolver()
+        result = resolver.resolve_backlog(
+            since=date(2026, 4, 4), until=date(2026, 4, 18), chunk_days=7
+        )
+
+        assert [(c["chunk"], c["since"], c["until"]) for c in result["chunks"]] == [
+            (1, "2026-04-04", "2026-04-11"),
+            (2, "2026-04-11", "2026-04-18"),
+        ]
+
+    def test_default_until_covers_today(self):
+        """The default upper bound must include rows pulled today, or a
+        catch-up would silently stop a day short of the live window."""
+        resolver, windows = self._stub_resolver()
+        resolver.resolve_backlog(since=date(2026, 4, 4), chunk_days=3650)
+
+        today = datetime.now(_timezone.utc).date()
+        assert windows[-1][1].date() > today
+
+    def test_dry_run_and_workers_propagate(self):
+        resolver, windows = self._stub_resolver()
+        resolver.resolve_backlog(
+            since=date(2026, 4, 4), until=date(2026, 4, 11),
+            chunk_days=7, workers=3, dry_run=True,
+        )
+
+        assert windows == [(
+            datetime(2026, 4, 4, tzinfo=_timezone.utc),
+            datetime(2026, 4, 11, tzinfo=_timezone.utc),
+            3, True,
+        )]
+
+    def test_chunk_days_below_one_is_coerced(self):
+        resolver, windows = self._stub_resolver()
+        resolver.resolve_backlog(
+            since=date(2026, 4, 4), until=date(2026, 4, 6), chunk_days=0
+        )
+
+        assert len(windows) == 2, "a zero-width chunk would loop forever"
+
+    def test_inverted_range_is_rejected(self):
+        resolver, _ = self._stub_resolver()
+        with pytest.raises(ValueError):
+            resolver.resolve_backlog(
+                since=date(2026, 4, 25), until=date(2026, 4, 4)
+            )
+
+    def test_single_day_range_is_one_chunk(self):
+        resolver, windows = self._stub_resolver()
+        resolver.resolve_backlog(
+            since=date(2026, 4, 4), until=date(2026, 4, 5), chunk_days=7
+        )
+
+        assert len(windows) == 1
+
+    def test_catch_up_is_idempotent_by_construction(self):
+        """Re-running a chunk must not duplicate rows — the guarantee is the
+        ON CONFLICT clause on the real insert, so pin it here."""
+        engine = MagicMock()
+        captured: list[str] = []
+
+        def _execute(statement, _params=None):
+            captured.append(str(statement))
+            return MagicMock()
+
+        conn = MagicMock()
+        conn.execute.side_effect = _execute
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=conn)
+        ctx.__exit__ = MagicMock(return_value=False)
+        engine.begin.return_value = ctx
+
+        resolver_module._flush_batch(engine, [{"fid": 1}])
+
+        assert captured
+        assert "ON CONFLICT (feature_id, obs_date, vintage_date) DO NOTHING" in captured[0]
+
+
+class TestResolverCli:
+    """`python -m normalization.resolver` — the controller's catch-up entry point."""
+
+    @staticmethod
+    def _install_fake_db(monkeypatch, engine=None):
+        monkeypatch.setitem(
+            sys.modules, "db", SimpleNamespace(get_engine=lambda: engine or MagicMock())
+        )
+
+    def test_parser_defaults(self):
+        args = build_parser().parse_args([])
+        assert args.since is None
+        assert args.until is None
+        assert args.chunk_days == 7
+        assert args.workers == 8
+        assert args.dry_run is False
+
+    def test_parses_the_documented_catch_up_invocation(self):
+        args = build_parser().parse_args([
+            "--since", "2026-04-04", "--until", "2026-04-11",
+            "--chunk-days", "7", "--workers", "8", "--dry-run",
+        ])
+        assert args.since == date(2026, 4, 4)
+        assert args.until == date(2026, 4, 11)
+        assert args.chunk_days == 7
+        assert args.workers == 8
+        assert args.dry_run is True
+
+    def test_until_without_since_exits_nonzero(self, monkeypatch):
+        self._install_fake_db(monkeypatch)
+        assert resolver_main(["--until", "2026-04-11"]) == 2
+
+    @pytest.mark.parametrize("bad", (["--chunk-days", "0"], ["--workers", "0"]))
+    def test_nonsense_bounds_exit_nonzero(self, monkeypatch, bad):
+        self._install_fake_db(monkeypatch)
+        assert resolver_main(bad) == 2
+
+    def test_since_routes_to_resolve_backlog(self, monkeypatch, capsys):
+        self._install_fake_db(monkeypatch)
+        seen: dict = {}
+
+        def _fake_backlog(self, since, until=None, chunk_days=7,
+                          workers=8, dry_run=False):
+            seen.update(since=since, until=until, chunk_days=chunk_days,
+                        workers=workers, dry_run=dry_run)
+            return {"totals": {"errors": 0, "resolved": 5}, "chunks": []}
+
+        monkeypatch.setattr(Resolver, "resolve_backlog", _fake_backlog)
+
+        rc = resolver_main([
+            "--since", "2026-04-04", "--chunk-days", "7",
+            "--workers", "8", "--dry-run",
+        ])
+
+        assert rc == 0
+        assert seen == {
+            "since": date(2026, 4, 4), "until": None,
+            "chunk_days": 7, "workers": 8, "dry_run": True,
+        }
+        assert "totals" in capsys.readouterr().out
+
+    def test_backlog_errors_exit_nonzero(self, monkeypatch):
+        self._install_fake_db(monkeypatch)
+        monkeypatch.setattr(
+            Resolver, "resolve_backlog",
+            lambda *_a, **_k: {"totals": {"errors": 2}, "chunks": []},
+        )
+        assert resolver_main(["--since", "2026-04-04"]) == 1
+
+    def test_no_since_keeps_the_legacy_rolling_window(self, monkeypatch, capsys):
+        """Existing callers run this module with no arguments; that must keep
+        resolving the rolling window and printing the conflict report."""
+        self._install_fake_db(monkeypatch)
+        seen: dict = {}
+
+        def _fake_pending(self, lookback_days=30, workers=8, dry_run=False,
+                          since=None, until=None):
+            seen.update(lookback_days=lookback_days, workers=workers,
+                        dry_run=dry_run)
+            return {"resolved": 1, "errors": 0, "timings": {"total_s": 0.1}}
+
+        monkeypatch.setattr(Resolver, "resolve_pending", _fake_pending)
+        monkeypatch.setattr(
+            Resolver, "get_conflict_report", lambda _self: pd.DataFrame()
+        )
+
+        rc = resolver_main([])
+
+        assert rc == 0
+        assert seen == {"lookback_days": 30, "workers": 8, "dry_run": False}
+        out = capsys.readouterr().out
+        assert "Resolution summary" in out
+        assert "No conflicts found" in out
+
+    def test_conflict_report_can_be_skipped(self, monkeypatch, capsys):
+        self._install_fake_db(monkeypatch)
+        monkeypatch.setattr(
+            Resolver, "resolve_pending",
+            lambda *_a, **_k: {"resolved": 0, "errors": 0, "timings": {}},
+        )
+
+        def _boom(_self):
+            raise AssertionError("conflict report should not have been built")
+
+        monkeypatch.setattr(Resolver, "get_conflict_report", _boom)
+
+        assert resolver_main(["--no-conflict-report"]) == 0
+        assert "Conflicts" not in capsys.readouterr().out
