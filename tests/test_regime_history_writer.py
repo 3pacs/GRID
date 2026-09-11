@@ -48,7 +48,21 @@ def _pit_frame(as_of: date, n_days: int = 400, release_offset_days: int = 1) -> 
     return pd.DataFrame(rows)
 
 
-def _engine_with_features(fids=((1, "vix"), (2, "hy_spread"), (3, "sp500"))):
+def _engine_with_features(
+    fids=(
+        # The features that actually back the vix / hy_spread / sp500 concepts
+        # (scripts.auto_regime.REGIME_FEATURE_SOURCES), not the frozen registry
+        # rows that share the concept names.
+        (1, "vix_spot", 900, date(2026, 9, 9)),
+        (2, "hy_oas_spread", 900, date(2026, 9, 9)),
+        (3, "sp500_full", 900, date(2026, 9, 9)),
+    )
+):
+    """Mock engine whose feature query answers the candidate/coverage shape.
+
+    ``_REGIME_CANDIDATE_SQL`` returns (id, name, n_obs, newest_obs) — the
+    coverage is what decides whether a candidate can back a concept.
+    """
     engine = MagicMock()
     conn = MagicMock()
     conn.__enter__.return_value = conn
@@ -125,6 +139,8 @@ class TestPersistRegimeHistory:
             "regime": "GROWTH",
             "confidence": 0.8,
             "source": REGIME_HISTORY_SOURCE,
+            # Unknown unless the caller establishes it — never guessed.
+            "data_as_of": None,
         }
 
     def test_statements_are_whole_literals_not_assembled(self):
@@ -302,7 +318,11 @@ class TestBackfill:
         existing = MagicMock()
         existing.fetchall.return_value = [(date(2026, 9, 2),), (date(2026, 9, 3),)]
         feats = MagicMock()
-        feats.fetchall.return_value = [(1, "vix"), (2, "hy_spread"), (3, "sp500")]
+        feats.fetchall.return_value = [
+            (1, "vix_spot", 900, date(2026, 9, 9)),
+            (2, "hy_oas_spread", 900, date(2026, 9, 9)),
+            (3, "sp500_full", 900, date(2026, 9, 9)),
+        ]
         conn.execute.side_effect = [feats, existing]
 
         with patch("scripts.auto_regime.compute_regime_at",
@@ -377,7 +397,10 @@ class TestStalenessFields:
         latest.fetchone.return_value = (
             "FRAGILE", 0.72, 0.1, {}, "DEFENSIVE", "NEUTRAL", reading_ts,
         )
-        conn.execute.side_effect = [prod, latest]
+        # Third query: the regime_history row's data_as_of for that date.
+        history = MagicMock()
+        history.fetchone.return_value = (None,)
+        conn.execute.side_effect = [prod, latest, history]
         engine.connect.return_value = conn
 
         with patch.object(regime_router, "get_db_engine", return_value=engine):
@@ -405,7 +428,9 @@ class TestStalenessFields:
         conn.__enter__.return_value = conn
         conn.__exit__.return_value = False
         result = MagicMock()
-        result.fetchone.return_value = (obs_date, "FRAGILE", 0.7, datetime(2026, 3, 29, 20, 10))
+        result.fetchone.return_value = (
+            obs_date, "FRAGILE", 0.7, datetime(2026, 3, 29, 20, 10), obs_date,
+        )
         conn.execute.return_value = result
         engine.connect.return_value = conn
 
@@ -441,7 +466,9 @@ class TestStalenessFields:
         conn.__enter__.return_value = conn
         conn.__exit__.return_value = False
         result = MagicMock()
-        result.fetchone.return_value = (date.today(), "NEUTRAL", 0.6, datetime.now())
+        result.fetchone.return_value = (
+            date.today(), "NEUTRAL", 0.6, datetime.now(), date.today(),
+        )
         conn.execute.return_value = result
         engine.connect.return_value = conn
 

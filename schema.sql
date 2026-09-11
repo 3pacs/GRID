@@ -58,6 +58,12 @@ CREATE INDEX IF NOT EXISTS idx_raw_series_obs_date
     ON raw_series (obs_date DESC);
 CREATE INDEX IF NOT EXISTS idx_raw_series_series_id
     ON raw_series (series_id);
+-- Drives the resolver's window (`pull_timestamp >= watermark`), which runs on
+-- every Hermes cycle. Present on griddb since before 2026-09-11 but never
+-- declared here, so a fresh database would sequential-scan the largest table
+-- in the system (1.93B rows / 510 GB as of 2026-09-11) every five minutes.
+CREATE INDEX IF NOT EXISTS idx_raw_series_pull_timestamp
+    ON raw_series (pull_timestamp DESC);
 
 -- ============================================================
 -- TABLE: dad_ticker_summary_cache
@@ -313,6 +319,15 @@ CREATE TABLE IF NOT EXISTS regime_history (
                     'GROWTH', 'NEUTRAL', 'FRAGILE', 'CRISIS')),
     confidence  DOUBLE PRECISION CHECK (confidence BETWEEN 0 AND 1),
     source      TEXT,
+    -- Newest real observation behind the label, measured before any
+    -- forward-fill. obs_date is the day the row was computed FOR (today, on a
+    -- scheduled run); data_as_of is the day the data is actually from. They
+    -- diverge whenever the pipeline stalls, and only this column makes that
+    -- visible — a row whose inputs stopped in April still carries today's
+    -- obs_date. Nullable: rows written before this column existed cannot have
+    -- it reconstructed.
+    data_as_of  DATE CONSTRAINT ck_regime_history_data_as_of
+                     CHECK (data_as_of IS NULL OR data_as_of <= obs_date),
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

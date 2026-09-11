@@ -1068,6 +1068,15 @@ export default function CrossReference({ onNavigate }) {
             api.getCrossRefHistory(),
         ]);
 
+        // api.js never rejects — a failed request resolves an
+        // { error: true, status, message } marker instead (see #449).
+        // This fetcher returns a transformed object rather than the raw
+        // api result, so #449's generic useAsyncData check never sees the
+        // marker; surface it here or a real failure would silently render
+        // as an honest-looking empty matrix instead of ErrorState.
+        if (crossRef?.error) throw new Error(crossRef.message || 'Failed to load cross-reference data');
+        if (hist?.error) throw new Error(hist.message || 'Failed to load cross-reference history');
+
         const transformed = transformApiChecks(crossRef || {});
         setData(transformed);
 

@@ -7,7 +7,10 @@ highest-priority source and detecting value conflicts across sources.
 
 from __future__ import annotations
 
+import argparse
 import json
+import time
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import pandas as pd
@@ -16,6 +19,18 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from normalization.entity_map import EntityMap
+
+# Default window for manual/CLI runs. The Hermes cycle passes a much smaller
+# window (see scripts/hermes_operator.py::RESOLUTION_CYCLE_LOOKBACK_DAYS) plus
+# a watermark, because it runs every 5 minutes and cannot afford a 30-day scan.
+DEFAULT_LOOKBACK_DAYS: int = 30
+
+# Backfill chunk width. Measured on griddb 2026-09-11: the rolling 2-day
+# window's distinct-series scan takes 2.2s, but a 7-day window five months
+# back blew through the resolver's own 600s statement timeout (ops-exec run
+# 34551047779) — an old week of a 1.93B-row table is a cold heap read. One
+# day is the width that finishes; widen only with a dry run to back it up.
+DEFAULT_BACKFILL_CHUNK_DAYS: int = 1
 
 # Two values are considered conflicting if they differ by more than 0.5%
 CONFLICT_THRESHOLD: float = 0.005
@@ -31,6 +46,13 @@ FAMILY_CONFLICT_THRESHOLDS: dict[str, float] = {
     "systemic": 0.02,    # Systemic risk: 2%
     "trade": 0.02,       # Trade data: 2%
 }
+
+
+def _as_datetime(value: datetime | date) -> datetime:
+    """Normalise a date or datetime bound to a datetime."""
+    if isinstance(value, datetime):
+        return value
+    return datetime(value.year, value.month, value.day)
 
 
 def _flush_batch(engine: Engine, batch: list[dict]) -> int:
@@ -77,40 +99,109 @@ class Resolver:
 
     # Bulk resolution scans tens of millions of raw_series rows; the
     # default per-statement timeout (120s, see db.get_engine) is too tight
-    # for the DISTINCT scan and per-partition fetch. Override locally
-    # inside transactions via SET LOCAL.
+    # for the DISTINCT scan and per-partition fetch. Raised per transaction
+    # by _set_statement_timeout.
     _RESOLVE_STATEMENT_TIMEOUT_MS: int = 600_000  # 10 minutes
+
+    def _set_statement_timeout(self, conn: Any) -> None:
+        """Raise this transaction's statement_timeout for the bulk scans.
+
+        ``set_config(..., is_local => true)`` is ``SET LOCAL`` with a bound
+        parameter. Plain ``SET`` only accepts a literal, so it would force
+        the value into the SQL string — which is what .claude/rules
+        forbids, and what this replaced.
+        """
+        conn.execute(
+            text("SELECT set_config('statement_timeout', :timeout_ms, true)"),
+            {"timeout_ms": str(self._RESOLVE_STATEMENT_TIMEOUT_MS)},
+        )
 
     def resolve_pending(
         self,
-        lookback_days: int = 30,
+        lookback_days: int = DEFAULT_LOOKBACK_DAYS,
         workers: int = 8,
-    ) -> dict[str, int]:
+        since: datetime | date | None = None,
+        until: datetime | date | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
         """Resolve raw_series → resolved_series using multithreaded workers.
 
         Fetches distinct series_ids with pending data, partitions them across
         worker threads, and each worker resolves its partition independently
         with batched inserts.
 
+        The raw_series window is ``pull_timestamp >= since`` when a watermark
+        is supplied, otherwise ``pull_timestamp >= NOW() - lookback_days``.
+        Callers on a tight budget (the 5-minute Hermes cycle) pass a small
+        window and/or a watermark; manual/backfill runs keep the 30-day
+        default. Both bounds are bound parameters — never interpolated.
+
         Args:
-            lookback_days: Only process raw rows pulled within this window.
+            lookback_days: Fallback window when ``since`` is not supplied.
             workers: Number of concurrent resolver threads.
+            since: Absolute lower bound on ``raw_series.pull_timestamp``
+                (a persisted watermark, usually minus an overlap margin).
+                Overrides ``lookback_days`` when given.
+            until: Optional exclusive upper bound, used to chunk backfills.
+            dry_run: Run the SELECT + grouping + conflict detection but skip
+                every INSERT. ``resolved`` then counts rows that *would* be
+                written. Used to measure cost before changing the cycle.
 
         Returns:
-            dict with resolved, conflicts_found, errors counts.
+            dict with resolved, conflicts_found, errors, series_scanned,
+            duration_s, dry_run and unmapped (the EntityMap miss summary —
+            see EntityMap.missing_feature_report). Every return path carries
+            the same keys.
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import threading
 
-        log.info("Starting multithreaded resolution (workers={w}, lookback={d}d)",
-                 w=workers, d=lookback_days)
+        started_at = time.monotonic()
+        log.info(
+            "Starting resolution (workers={w}, lookback={d}d, since={s}, "
+            "until={u}, dry_run={dr})",
+            w=workers, d=lookback_days, s=since, u=until, dr=dry_run,
+        )
+
+        # Window bounds are passed to both statements below as bound
+        # parameters; CAST(... AS timestamptz) lets PostgreSQL type the
+        # NULL case without any string building.
+        window_params: dict[str, Any] = {
+            "lookback": lookback_days,
+            "since": since,
+            "until": until,
+        }
+
+        # Shape of "nothing was missed", so every return path below carries
+        # the same keys whether or not an EntityMap was ever constructed.
+        empty_unmapped: dict[str, Any] = {
+            "lookups_missed": 0, "series_ids": 0,
+            "unregistered_features": [], "top_series": [],
+        }
+
+        def _summary(
+            resolved: int = 0,
+            conflicts: int = 0,
+            errors: int = 0,
+            series: int = 0,
+            unmapped: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            return {
+                "resolved": resolved,
+                "conflicts_found": conflicts,
+                "errors": errors,
+                "series_scanned": series,
+                "duration_s": round(time.monotonic() - started_at, 2),
+                "dry_run": dry_run,
+                "unmapped": unmapped if unmapped is not None else dict(empty_unmapped),
+            }
 
         # Pre-load entity map and feature families (shared, read-only)
         try:
             entity_map = EntityMap(self.engine)
         except Exception as exc:
             log.error("Failed to load entity map: {e}", e=str(exc))
-            return {"resolved": 0, "conflicts_found": 0, "errors": 1}
+            return _summary(errors=1)
         feature_families: dict[int, str] = {}
         try:
             with self.engine.connect() as conn:
@@ -126,22 +217,24 @@ class Resolver:
         # this DISTINCT scan once raw_series grows past a few million rows.
         log.info("Fetching distinct series_ids...")
         with self.engine.begin() as conn:
-            conn.execute(
-                text(f"SET LOCAL statement_timeout = {self._RESOLVE_STATEMENT_TIMEOUT_MS}")
-            )
+            self._set_statement_timeout(conn)
             series_rows = conn.execute(text("""
-                SELECT DISTINCT series_id
-                FROM raw_series
-                WHERE pull_status = 'SUCCESS'
-                  AND pull_timestamp >= NOW() - :lookback * INTERVAL '1 day'
-            """), {"lookback": lookback_days}).fetchall()
+                SELECT DISTINCT rs.series_id
+                FROM raw_series rs
+                WHERE rs.pull_status = 'SUCCESS'
+                  AND rs.pull_timestamp >= COALESCE(
+                        CAST(:since AS timestamptz),
+                        NOW() - :lookback * INTERVAL '1 day')
+                  AND (CAST(:until AS timestamptz) IS NULL
+                       OR rs.pull_timestamp < CAST(:until AS timestamptz))
+            """), window_params).fetchall()
 
         all_series = [r[0] for r in series_rows]
         log.info("Found {n} distinct series_ids to resolve", n=len(all_series))
 
         if not all_series:
             log.info("No pending observations to resolve")
-            return {"resolved": 0, "conflicts_found": 0, "errors": 0}
+            return _summary(unmapped=entity_map.missing_feature_report())
 
         # Partition series_ids across workers
         chunk_size = max(1, len(all_series) // workers)
@@ -154,18 +247,34 @@ class Resolver:
         lock = threading.Lock()
         totals = {"resolved": 0, "conflicts_found": 0, "errors": 0}
 
+        def _flush(batch: list[dict]) -> int:
+            """Persist a batch, or just count it when dry-running."""
+            if dry_run:
+                return len(batch)
+            return _flush_batch(self.engine, batch)
+
         def _resolve_partition(partition: list[str], worker_id: int) -> dict[str, int]:
             """Resolve a partition of series_ids."""
             local = {"resolved": 0, "conflicts_found": 0, "errors": 0}
             INSERT_BATCH = 500
 
+            # Memoise series_id -> feature_id for this partition. The loop
+            # below runs once per (series_id, obs_date) group, and a live
+            # 2-day window produced 569,400 groups over 18,916 distinct
+            # series_ids — ~30 identical lookups each. Partitions are
+            # disjoint by series_id, so a plain dict per worker is
+            # lock-free and shares nothing.
+            feature_ids: dict[str, int | None] = {}
+
+            def _feature_id(series_id: str) -> int | None:
+                """entity_map.get_feature_id, resolved once per series_id."""
+                if series_id not in feature_ids:
+                    feature_ids[series_id] = entity_map.get_feature_id(series_id)
+                return feature_ids[series_id]
+
             try:
                 with self.engine.begin() as conn:
-                    conn.execute(
-                        text(
-                            f"SET LOCAL statement_timeout = {self._RESOLVE_STATEMENT_TIMEOUT_MS}"
-                        )
-                    )
+                    self._set_statement_timeout(conn)
                     rows = conn.execute(text("""
                         SELECT rs.series_id, rs.obs_date, rs.value,
                                rs.source_id, rs.pull_timestamp,
@@ -174,9 +283,13 @@ class Resolver:
                         JOIN source_catalog sc ON rs.source_id = sc.id
                         WHERE rs.series_id = ANY(:sids)
                           AND rs.pull_status = 'SUCCESS'
-                          AND rs.pull_timestamp >= NOW() - :lookback * INTERVAL '1 day'
+                          AND rs.pull_timestamp >= COALESCE(
+                                CAST(:since AS timestamptz),
+                                NOW() - :lookback * INTERVAL '1 day')
+                          AND (CAST(:until AS timestamptz) IS NULL
+                               OR rs.pull_timestamp < CAST(:until AS timestamptz))
                         ORDER BY rs.series_id, rs.obs_date, sc.priority_rank ASC
-                    """), {"sids": partition, "lookback": lookback_days}).fetchall()
+                    """), {"sids": partition, **window_params}).fetchall()
 
                 # Group by (series_id, obs_date)
                 groups: dict[tuple[str, Any], list[dict]] = {}
@@ -194,7 +307,7 @@ class Resolver:
                 insert_batch: list[dict] = []
 
                 for (series_id, obs_date_val), sources in groups.items():
-                    feature_id = entity_map.get_feature_id(series_id)
+                    feature_id = _feature_id(series_id)
                     if feature_id is None:
                         continue
 
@@ -243,15 +356,17 @@ class Resolver:
                     })
 
                     if len(insert_batch) >= INSERT_BATCH:
-                        local["resolved"] += _flush_batch(self.engine, insert_batch)
+                        local["resolved"] += _flush(insert_batch)
                         insert_batch = []
 
                 # Flush remaining
                 if insert_batch:
-                    local["resolved"] += _flush_batch(self.engine, insert_batch)
+                    local["resolved"] += _flush(insert_batch)
 
-                log.info("Worker {w}: resolved={r}, conflicts={c}",
-                         w=worker_id, r=local["resolved"], c=local["conflicts_found"])
+                log.info("Worker {w}: resolved={r}, conflicts={c}{d}",
+                         w=worker_id, r=local["resolved"],
+                         c=local["conflicts_found"],
+                         d=" (dry run — nothing written)" if dry_run else "")
 
             except Exception as exc:
                 log.error("Worker {w} failed: {e}", w=worker_id, e=str(exc))
@@ -277,9 +392,156 @@ class Resolver:
                     log.error("Worker {w} raised: {e}", w=worker_id, e=str(exc))
                     totals["errors"] += 1
 
+        # One line for the whole run instead of one warning per group:
+        # EntityMap counts its misses and reports them here.
+        unmapped = entity_map.missing_feature_report()
+        if unmapped["lookups_missed"]:
+            log.warning(
+                "Resolution skipped {n} lookup(s) across {s} unmapped "
+                "series_id(s); {u} mapped feature name(s) are missing from "
+                "feature_registry: {names}. Worst offenders: {top}",
+                n=unmapped["lookups_missed"], s=unmapped["series_ids"],
+                u=len(unmapped["unregistered_features"]),
+                names=unmapped["unregistered_features"][:10],
+                top=unmapped["top_series"],
+            )
+
+        summary = _summary(
+            resolved=totals["resolved"],
+            conflicts=totals["conflicts_found"],
+            errors=totals["errors"],
+            series=len(all_series),
+            unmapped=unmapped,
+        )
         log.info(
-            "Resolution complete — resolved={r}, conflicts={c}, errors={e}",
-            r=totals["resolved"], c=totals["conflicts_found"], e=totals["errors"],
+            "Resolution complete — resolved={r}, conflicts={c}, errors={e}, "
+            "series={s}, {t}s{d}",
+            r=summary["resolved"], c=summary["conflicts_found"],
+            e=summary["errors"], s=summary["series_scanned"],
+            t=summary["duration_s"],
+            d=" (dry run — nothing written)" if dry_run else "",
+        )
+        return summary
+
+    def resolve_range(
+        self,
+        since: datetime | date,
+        until: datetime | date | None = None,
+        chunk_days: int = DEFAULT_BACKFILL_CHUNK_DAYS,
+        workers: int = 8,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Resolve a historical pull_timestamp range in bounded chunks.
+
+        Catch-up entry point: a single 5-month window would hold one
+        transaction open for hours, so the range is walked in
+        ``chunk_days``-wide slices and each slice is resolved independently.
+
+        A slice that raises — a statement timeout on the DISTINCT scan is
+        the one we have actually seen — is recorded with its date range and
+        the walk continues, because the slices are independent and every
+        insert is ``ON CONFLICT ... DO NOTHING``. Losing the whole run to
+        one wide chunk would throw away every slice that already landed.
+        ``failed_ranges`` in the result lists exactly what to retry, so the
+        operator re-runs those days alone (narrower) rather than the range.
+
+        Chunk width is not free to choose: the rolling 2-day window's
+        distinct-series scan is 2.2s, but a 7-day window five months back
+        did not finish inside the 600s statement timeout (raw_series is
+        ~1.93B rows, and an old week is a cold, scattered heap read). Hence
+        the 1-day default — widen only on measured headroom.
+
+        Args:
+            since: Inclusive lower bound on ``raw_series.pull_timestamp``.
+            until: Exclusive upper bound. Defaults to now.
+            chunk_days: Width of each slice in days.
+            workers: Concurrent resolver threads per slice.
+            dry_run: Measure without writing (see ``resolve_pending``).
+
+        Returns:
+            dict with the same keys as ``resolve_pending`` plus ``chunks``,
+            ``chunks_failed`` and ``failed_ranges`` (one entry per slice
+            that raised or reported worker errors, carrying ``since``,
+            ``until``, ``error`` and ``error_class``).
+        """
+        if chunk_days < 1:
+            raise ValueError("chunk_days must be >= 1")
+
+        start = _as_datetime(since)
+        end = _as_datetime(until) if until is not None else datetime.now(start.tzinfo)
+        if end <= start:
+            raise ValueError("until must be after since")
+
+        totals: dict[str, Any] = {
+            "resolved": 0, "conflicts_found": 0, "errors": 0,
+            "series_scanned": 0, "duration_s": 0.0,
+            "dry_run": dry_run, "chunks": 0, "chunks_failed": 0,
+            "failed_ranges": [],
+        }
+        cursor = start
+        while cursor < end:
+            chunk_end = min(cursor + timedelta(days=chunk_days), end)
+            log.info("Resolving chunk {a} → {b}", a=cursor, b=chunk_end)
+            chunk_t0 = time.monotonic()
+            try:
+                result = self.resolve_pending(
+                    workers=workers,
+                    since=cursor,
+                    until=chunk_end,
+                    dry_run=dry_run,
+                )
+            except Exception as exc:
+                # Warning, not error: a chunk that outgrew the statement
+                # timeout is an operational sizing problem, not a bug.
+                log.warning(
+                    "Chunk {a} → {b} failed ({c}): {e} — continuing; "
+                    "retry this range alone with a smaller --chunk-days",
+                    a=cursor.date(), b=chunk_end.date(),
+                    c=type(exc).__name__, e=str(exc),
+                )
+                totals["errors"] += 1
+                totals["chunks"] += 1
+                totals["chunks_failed"] += 1
+                totals["failed_ranges"].append({
+                    "since": cursor.date().isoformat(),
+                    "until": chunk_end.date().isoformat(),
+                    "error": str(exc),
+                    "error_class": type(exc).__name__,
+                })
+                totals["duration_s"] = round(
+                    totals["duration_s"] + (time.monotonic() - chunk_t0), 2
+                )
+                cursor = chunk_end
+                continue
+
+            for key in ("resolved", "conflicts_found", "errors", "series_scanned"):
+                totals[key] += result[key]
+            totals["duration_s"] = round(totals["duration_s"] + result["duration_s"], 2)
+            totals["chunks"] += 1
+            if result["errors"]:
+                # A worker that failed inside resolve_pending never raises
+                # out of it, so this range is incomplete too — same retry.
+                totals["chunks_failed"] += 1
+                totals["failed_ranges"].append({
+                    "since": cursor.date().isoformat(),
+                    "until": chunk_end.date().isoformat(),
+                    "error": f"{result['errors']} worker error(s)",
+                    "error_class": "WorkerError",
+                })
+            cursor = chunk_end
+
+        if totals["failed_ranges"]:
+            log.warning(
+                "Range resolution: {n} of {t} chunk(s) incomplete — retry "
+                "these ranges alone: {r}",
+                n=totals["chunks_failed"], t=totals["chunks"],
+                r=[(f["since"], f["until"]) for f in totals["failed_ranges"]],
+            )
+        log.info(
+            "Range resolution complete — chunks={n} ({f} failed), "
+            "resolved={r}, errors={e}, {t}s",
+            n=totals["chunks"], f=totals["chunks_failed"],
+            r=totals["resolved"], e=totals["errors"], t=totals["duration_s"],
         )
         return totals
 
@@ -321,16 +583,92 @@ class Resolver:
         return df
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point: ad-hoc resolution, bounded backfills, dry runs."""
+    parser = argparse.ArgumentParser(
+        description="Resolve raw_series → resolved_series (PIT conflict resolution)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Backfill recipe — dry-run one day first, then write:\n"
+            "  python -m normalization.resolver --since 2026-04-04 "
+            "--until 2026-04-05 --chunk-days 1 --dry-run\n"
+            "  python -m normalization.resolver --since 2026-04-04 "
+            "--until 2026-04-18 --chunk-days 1\n\n"
+            "Use --chunk-days 1 for historical windows. A 7-day chunk five "
+            "months back exceeded the\nresolver's 600s statement timeout on "
+            "griddb, while the rolling 2-day window scans in\n2.2s — an old "
+            "week of a 1.93B-row table is a cold, scattered heap read. "
+            "Re-running a\nchunk is safe: every insert is ON CONFLICT "
+            "(feature_id, obs_date, vintage_date) DO NOTHING.\n"
+            "Chunks that fail are listed under failed_ranges; retry just "
+            "those, narrower."
+        ),
+    )
+    parser.add_argument(
+        "--since",
+        help="Resolve raw rows pulled on/after this date (YYYY-MM-DD). "
+             "Walks the range in --chunk-days slices.",
+    )
+    parser.add_argument(
+        "--until",
+        help="Exclusive upper bound (YYYY-MM-DD). Defaults to now.",
+    )
+    parser.add_argument(
+        "--chunk-days", type=int, default=DEFAULT_BACKFILL_CHUNK_DAYS,
+        help=f"Chunk width in days for --since backfills "
+             f"(default: {DEFAULT_BACKFILL_CHUNK_DAYS}). Keep 1 for "
+             f"historical windows; widen only after a --dry-run shows "
+             f"headroom against the 600s statement timeout.",
+    )
+    parser.add_argument(
+        "--lookback-days", type=int, default=DEFAULT_LOOKBACK_DAYS,
+        help=f"Window when --since is absent (default: {DEFAULT_LOOKBACK_DAYS}).",
+    )
+    parser.add_argument("--workers", type=int, default=8, help="Resolver threads.")
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Select and group without inserting; reports what would be written.",
+    )
+    parser.add_argument(
+        "--conflict-report", action="store_true",
+        help="Print the conflict report after resolving.",
+    )
+    args = parser.parse_args(argv)
+
     from db import get_engine
 
     resolver = Resolver(db_engine=get_engine())
-    summary = resolver.resolve_pending()
+    if args.since:
+        summary = resolver.resolve_range(
+            since=date.fromisoformat(args.since),
+            until=date.fromisoformat(args.until) if args.until else None,
+            chunk_days=args.chunk_days,
+            workers=args.workers,
+            dry_run=args.dry_run,
+        )
+    else:
+        summary = resolver.resolve_pending(
+            lookback_days=args.lookback_days,
+            workers=args.workers,
+            dry_run=args.dry_run,
+        )
     print(f"Resolution summary: {summary}")
 
-    report = resolver.get_conflict_report()
-    if not report.empty:
-        print(f"\nConflicts found: {len(report)}")
-        print(report.head(10))
-    else:
-        print("\nNo conflicts found")
+    for failed in summary.get("failed_ranges", []):
+        print(
+            f"  RETRY: --since {failed['since']} --until {failed['until']} "
+            f"--chunk-days 1   ({failed['error_class']}: {failed['error']})"
+        )
+
+    if args.conflict_report:
+        report = resolver.get_conflict_report()
+        if not report.empty:
+            print(f"\nConflicts found: {len(report)}")
+            print(report.head(10))
+        else:
+            print("\nNo conflicts found")
+    return 1 if summary["errors"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
