@@ -25,6 +25,13 @@ from normalization.entity_map import EntityMap
 # a watermark, because it runs every 5 minutes and cannot afford a 30-day scan.
 DEFAULT_LOOKBACK_DAYS: int = 30
 
+# Backfill chunk width. Measured on griddb 2026-09-11: the rolling 2-day
+# window's distinct-series scan takes 2.2s, but a 7-day window five months
+# back blew through the resolver's own 600s statement timeout (ops-exec run
+# 34551047779) — an old week of a 1.93B-row table is a cold heap read. One
+# day is the width that finishes; widen only with a dry run to back it up.
+DEFAULT_BACKFILL_CHUNK_DAYS: int = 1
+
 # Two values are considered conflicting if they differ by more than 0.5%
 CONFLICT_THRESHOLD: float = 0.005
 
@@ -409,7 +416,7 @@ class Resolver:
         self,
         since: datetime | date,
         until: datetime | date | None = None,
-        chunk_days: int = 7,
+        chunk_days: int = DEFAULT_BACKFILL_CHUNK_DAYS,
         workers: int = 8,
         dry_run: bool = False,
     ) -> dict[str, Any]:
@@ -418,7 +425,20 @@ class Resolver:
         Catch-up entry point: a single 5-month window would hold one
         transaction open for hours, so the range is walked in
         ``chunk_days``-wide slices and each slice is resolved independently.
-        A failed slice is counted and the walk continues.
+
+        A slice that raises — a statement timeout on the DISTINCT scan is
+        the one we have actually seen — is recorded with its date range and
+        the walk continues, because the slices are independent and every
+        insert is ``ON CONFLICT ... DO NOTHING``. Losing the whole run to
+        one wide chunk would throw away every slice that already landed.
+        ``failed_ranges`` in the result lists exactly what to retry, so the
+        operator re-runs those days alone (narrower) rather than the range.
+
+        Chunk width is not free to choose: the rolling 2-day window's
+        distinct-series scan is 2.2s, but a 7-day window five months back
+        did not finish inside the 600s statement timeout (raw_series is
+        ~1.93B rows, and an old week is a cold, scattered heap read). Hence
+        the 1-day default — widen only on measured headroom.
 
         Args:
             since: Inclusive lower bound on ``raw_series.pull_timestamp``.
@@ -428,7 +448,10 @@ class Resolver:
             dry_run: Measure without writing (see ``resolve_pending``).
 
         Returns:
-            dict with the same keys as ``resolve_pending`` plus ``chunks``.
+            dict with the same keys as ``resolve_pending`` plus ``chunks``,
+            ``chunks_failed`` and ``failed_ranges`` (one entry per slice
+            that raised or reported worker errors, carrying ``since``,
+            ``until``, ``error`` and ``error_class``).
         """
         if chunk_days < 1:
             raise ValueError("chunk_days must be >= 1")
@@ -441,28 +464,73 @@ class Resolver:
         totals: dict[str, Any] = {
             "resolved": 0, "conflicts_found": 0, "errors": 0,
             "series_scanned": 0, "duration_s": 0.0,
-            "dry_run": dry_run, "chunks": 0,
+            "dry_run": dry_run, "chunks": 0, "chunks_failed": 0,
+            "failed_ranges": [],
         }
         cursor = start
         while cursor < end:
             chunk_end = min(cursor + timedelta(days=chunk_days), end)
             log.info("Resolving chunk {a} → {b}", a=cursor, b=chunk_end)
-            result = self.resolve_pending(
-                workers=workers,
-                since=cursor,
-                until=chunk_end,
-                dry_run=dry_run,
-            )
+            chunk_t0 = time.monotonic()
+            try:
+                result = self.resolve_pending(
+                    workers=workers,
+                    since=cursor,
+                    until=chunk_end,
+                    dry_run=dry_run,
+                )
+            except Exception as exc:
+                # Warning, not error: a chunk that outgrew the statement
+                # timeout is an operational sizing problem, not a bug.
+                log.warning(
+                    "Chunk {a} → {b} failed ({c}): {e} — continuing; "
+                    "retry this range alone with a smaller --chunk-days",
+                    a=cursor.date(), b=chunk_end.date(),
+                    c=type(exc).__name__, e=str(exc),
+                )
+                totals["errors"] += 1
+                totals["chunks"] += 1
+                totals["chunks_failed"] += 1
+                totals["failed_ranges"].append({
+                    "since": cursor.date().isoformat(),
+                    "until": chunk_end.date().isoformat(),
+                    "error": str(exc),
+                    "error_class": type(exc).__name__,
+                })
+                totals["duration_s"] = round(
+                    totals["duration_s"] + (time.monotonic() - chunk_t0), 2
+                )
+                cursor = chunk_end
+                continue
+
             for key in ("resolved", "conflicts_found", "errors", "series_scanned"):
                 totals[key] += result[key]
             totals["duration_s"] = round(totals["duration_s"] + result["duration_s"], 2)
             totals["chunks"] += 1
+            if result["errors"]:
+                # A worker that failed inside resolve_pending never raises
+                # out of it, so this range is incomplete too — same retry.
+                totals["chunks_failed"] += 1
+                totals["failed_ranges"].append({
+                    "since": cursor.date().isoformat(),
+                    "until": chunk_end.date().isoformat(),
+                    "error": f"{result['errors']} worker error(s)",
+                    "error_class": "WorkerError",
+                })
             cursor = chunk_end
 
+        if totals["failed_ranges"]:
+            log.warning(
+                "Range resolution: {n} of {t} chunk(s) incomplete — retry "
+                "these ranges alone: {r}",
+                n=totals["chunks_failed"], t=totals["chunks"],
+                r=[(f["since"], f["until"]) for f in totals["failed_ranges"]],
+            )
         log.info(
-            "Range resolution complete — chunks={n}, resolved={r}, errors={e}, {t}s",
-            n=totals["chunks"], r=totals["resolved"],
-            e=totals["errors"], t=totals["duration_s"],
+            "Range resolution complete — chunks={n} ({f} failed), "
+            "resolved={r}, errors={e}, {t}s",
+            n=totals["chunks"], f=totals["chunks_failed"],
+            r=totals["resolved"], e=totals["errors"], t=totals["duration_s"],
         )
         return totals
 
@@ -508,6 +576,22 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entry point: ad-hoc resolution, bounded backfills, dry runs."""
     parser = argparse.ArgumentParser(
         description="Resolve raw_series → resolved_series (PIT conflict resolution)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Backfill recipe — dry-run one day first, then write:\n"
+            "  python -m normalization.resolver --since 2026-04-04 "
+            "--until 2026-04-05 --chunk-days 1 --dry-run\n"
+            "  python -m normalization.resolver --since 2026-04-04 "
+            "--until 2026-04-18 --chunk-days 1\n\n"
+            "Use --chunk-days 1 for historical windows. A 7-day chunk five "
+            "months back exceeded the\nresolver's 600s statement timeout on "
+            "griddb, while the rolling 2-day window scans in\n2.2s — an old "
+            "week of a 1.93B-row table is a cold, scattered heap read. "
+            "Re-running a\nchunk is safe: every insert is ON CONFLICT "
+            "(feature_id, obs_date, vintage_date) DO NOTHING.\n"
+            "Chunks that fail are listed under failed_ranges; retry just "
+            "those, narrower."
+        ),
     )
     parser.add_argument(
         "--since",
@@ -519,8 +603,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Exclusive upper bound (YYYY-MM-DD). Defaults to now.",
     )
     parser.add_argument(
-        "--chunk-days", type=int, default=7,
-        help="Chunk width for --since backfills (default: 7).",
+        "--chunk-days", type=int, default=DEFAULT_BACKFILL_CHUNK_DAYS,
+        help=f"Chunk width in days for --since backfills "
+             f"(default: {DEFAULT_BACKFILL_CHUNK_DAYS}). Keep 1 for "
+             f"historical windows; widen only after a --dry-run shows "
+             f"headroom against the 600s statement timeout.",
     )
     parser.add_argument(
         "--lookback-days", type=int, default=DEFAULT_LOOKBACK_DAYS,
@@ -555,6 +642,12 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=args.dry_run,
         )
     print(f"Resolution summary: {summary}")
+
+    for failed in summary.get("failed_ranges", []):
+        print(
+            f"  RETRY: --since {failed['since']} --until {failed['until']} "
+            f"--chunk-days 1   ({failed['error_class']}: {failed['error']})"
+        )
 
     if args.conflict_report:
         report = resolver.get_conflict_report()
