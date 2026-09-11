@@ -58,6 +58,12 @@ CREATE INDEX IF NOT EXISTS idx_raw_series_obs_date
     ON raw_series (obs_date DESC);
 CREATE INDEX IF NOT EXISTS idx_raw_series_series_id
     ON raw_series (series_id);
+-- Drives the resolver's window (`pull_timestamp >= watermark`), which runs on
+-- every Hermes cycle. Present on griddb since before 2026-09-11 but never
+-- declared here, so a fresh database would sequential-scan the largest table
+-- in the system (1.93B rows / 510 GB as of 2026-09-11) every five minutes.
+CREATE INDEX IF NOT EXISTS idx_raw_series_pull_timestamp
+    ON raw_series (pull_timestamp DESC);
 
 -- ============================================================
 -- TABLE: dad_ticker_summary_cache
