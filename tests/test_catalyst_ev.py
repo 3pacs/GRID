@@ -61,6 +61,35 @@ def test_indication_multiplier_is_tolerant_of_free_text() -> None:
     assert ce.indication_multiplier("oncology") < 1.0 < ce.indication_multiplier("hematology")
 
 
+@pytest.mark.parametrize(
+    "condition, area",
+    [
+        ("Melanoma", "oncology"),
+        ("Metastatic Non-Small Cell Lung Cancer", "oncology"),
+        # a haematologic malignancy is oncology risk, not the 1.35 of
+        # non-malignant haematology — mapping it otherwise inflates the prior
+        ("Chronic Lymphocytic Leukemia", "oncology"),
+        ("Relapsed Multiple Myeloma", "oncology"),
+        ("Sickle Cell Disease", "hematology"),
+        ("Hemophilia A", "hematology"),
+        ("Alzheimer Disease", "neurology"),
+        ("Relapsing Multiple Sclerosis", "neurology"),
+        ("Major Depressive Disorder", "psychiatry"),
+        ("Type 2 Diabetes Mellitus", "metabolic"),
+        ("Geographic Atrophy Secondary to Macular Degeneration", "ophthalmology"),
+        ("Cystic Fibrosis", "respiratory"),
+        ("Ulcerative Colitis", "autoimmune"),
+    ],
+)
+def test_ct_gov_condition_names_map_onto_a_therapeutic_area(condition: str, area: str) -> None:
+    """A registry disease name must not silently score a neutral 1.0."""
+    assert ce.indication_multiplier(condition) == ce.INDICATION_LOA_MULTIPLIER[area]
+
+
+def test_an_unrecognised_condition_is_neutral_not_guessed() -> None:
+    assert ce.indication_multiplier("Idiopathic Widget Deficiency") == 1.0
+
+
 def test_designation_multiplier_takes_the_strongest_match() -> None:
     assert ce.designation_multiplier("Breakthrough Therapy") == 1.25
     assert ce.designation_multiplier("Fast Track") == 1.10
@@ -492,14 +521,19 @@ def _catalyst_row(
     ticker: str = "GEMX",
     *,
     days_out: int = 120,
-    phase: str = "PHASE3",
-    indication: str = "oncology",
+    phase: str | None = "PHASE3",
+    indication: str | None = "oncology",
     designation: str | None = "Fast Track",
     runway: float | None = 18.0,
+    registry_phases: Any = None,
+    registry_conditions: Any = None,
 ) -> tuple:
+    """One ``_CATALYST_NAMES_SQL`` row: trial_signals evidence, then the
+    ct.gov registry fallback columns read off ``trial_cache.raw_json``."""
     return (
         ticker, "READOUT", AS_OF + timedelta(days=days_out), phase, indication,
         designation, 0.8, 100.0, 0.66, "BUY", 700.0, runway,
+        registry_phases, registry_conditions,
     )
 
 
@@ -681,6 +715,9 @@ def test_every_loader_is_pit_bounded_and_parameterised(monkeypatch: pytest.Monke
     catalyst_sql = next(s for s in seen if "FROM catalyst_calendar" in s)
     assert "expected_date >= :as_of" in catalyst_sql and "expected_date <= :max_date" in catalyst_sql
     assert "ts.created_at <= :as_of_ts" in catalyst_sql
+    # the registry fallback is a PIT read too — a study cached after the
+    # decision date is not evidence that was available at the decision date
+    assert "tc.parsed_at <= :as_of_ts" in catalyst_sql
     assert seen[catalyst_sql]["as_of"] == AS_OF
 
     profile_sql = next(s for s in seen if "FROM company_profiles" in s)
@@ -694,6 +731,182 @@ def test_every_loader_is_pit_bounded_and_parameterised(monkeypatch: pytest.Monke
 
     src = Path(ce.__file__).read_text(encoding="utf-8")
     assert 'f"""' not in src and "f'''" not in src and ".format(" not in src
+
+
+# ── the no-evidence gate ──────────────────────────────────────────────────
+#
+# Measured on 2026-09-11 the board ranked MANE, ORKA and TARS — none of which
+# had a trial phase on file — above IDYA, whose Phase 2 melanoma evidence
+# correctly lowered its prior to 0.247. The three unmeasured names were
+# competing on DEFAULT_PHASE_BASE_RATE (0.29), a number invented for them.
+# That rewards the absence of evidence, and these tests pin it shut.
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (None, None),
+        ([], None),
+        (["PHASE2"], "PHASE2"),
+        (["PHASE2", "PHASE3"], "PHASE2/PHASE3"),
+        ('["PHASE1", "PHASE2"]', "PHASE1/PHASE2"),
+        ("PHASE3", "PHASE3"),
+        (["NA"], "NA"),
+        ([None, ""], None),
+    ],
+)
+def test_registry_phases_flatten_to_a_normalisable_string(raw: Any, expected: str | None) -> None:
+    assert ce._registry_phase(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (None, None),
+        ([], None),
+        (["Melanoma", "Solid Tumor"], "Melanoma"),
+        ('["Sickle Cell Disease"]', "Sickle Cell Disease"),
+        ("Alzheimer Disease", "Alzheimer Disease"),
+        ([" ", "Asthma"], "Asthma"),
+    ],
+)
+def test_registry_conditions_yield_the_primary_indication(raw: Any, expected: str | None) -> None:
+    assert ce._registry_indication(raw) == expected
+
+
+def test_a_name_with_no_trial_phase_is_unranked_not_scored_on_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_board(monkeypatch)
+    engine = _board_engine(
+        catalysts=[_catalyst_row(phase=None, indication=None)],
+        profiles=[_profile_row()],
+        options=[_option_row()],
+    )
+    board = ce.build_catalyst_board(engine, as_of=AS_OF)
+
+    assert board["ranked_total"] == 0
+    row = board["unranked"][0]
+    assert "no_trial_evidence" in row["blocking_reasons"]
+    assert board["unranked_reasons"]["no_trial_evidence"] == 1
+    # the EV is withheld, not shown next to a fabricated prior
+    assert row["expected_value_multiple"] is None
+    assert row["trial_phase_source"] is None
+
+
+def test_an_unphased_name_cannot_outrank_a_name_with_harder_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The regression itself: the unmeasured must not beat the measured."""
+    monkeypatch.setattr(
+        "intelligence.trial_outcomes.load_scored_outcomes", lambda engine, as_of=None: []
+    )
+    monkeypatch.setattr(
+        "intelligence.long_plays._load_adj_close",
+        lambda engine, tickers, years, as_of: {t: [(AS_OF, 6.0)] for t in ("BLANK", "KNOWN")},
+    )
+    engine = _board_engine(
+        catalysts=[
+            # no phase at all — previously scored on the 0.29 default
+            _catalyst_row("BLANK", phase=None, indication=None, designation=None),
+            # phase 2 oncology: real evidence, and the multiplier marks it hard
+            _catalyst_row("KNOWN", phase="PHASE2", indication="oncology", designation=None),
+        ],
+        profiles=[_profile_row("BLANK"), _profile_row("KNOWN")],
+        options=[_option_row("BLANK"), _option_row("KNOWN")],
+    )
+    board = ce.build_catalyst_board(engine, as_of=AS_OF)
+
+    assert [r["ticker"] for r in board["ranked"]] == ["KNOWN"]
+    assert [r["ticker"] for r in board["unranked"]] == ["BLANK"]
+
+
+def test_the_registry_supplies_the_phase_when_grid_has_not_scored_the_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The phase was already ingested into trial_cache — use it, don't block."""
+    _patch_board(monkeypatch)
+    engine = _board_engine(
+        catalysts=[
+            _catalyst_row(
+                phase=None,
+                indication=None,
+                registry_phases=["PHASE2", "PHASE3"],
+                registry_conditions=["Melanoma"],
+            )
+        ],
+        profiles=[_profile_row()],
+        options=[_option_row()],
+    )
+    board = ce.build_catalyst_board(engine, as_of=AS_OF)
+
+    assert board["ranked_total"] == 1
+    row = board["ranked"][0]
+    assert "no_trial_evidence" not in row["blocking_reasons"]
+    # a 2/3 trial still has to clear phase 2
+    assert row["p_success_phase"] == "PHASE2"
+    assert row["trial_phase_source"] == ce.PHASE_SOURCE_REGISTRY
+    assert row["primary_indication"] == "Melanoma"
+    assert row["primary_indication_source"] == ce.PHASE_SOURCE_REGISTRY
+    # and the registry indication actually reaches the prior
+    assert "indication" in row["p_success_factors"]
+
+
+def test_grid_s_own_scored_evidence_wins_over_the_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_board(monkeypatch)
+    engine = _board_engine(
+        catalysts=[
+            _catalyst_row(
+                phase="PHASE3", indication="hematology",
+                registry_phases=["PHASE1"], registry_conditions=["Melanoma"],
+            )
+        ],
+        profiles=[_profile_row()],
+        options=[_option_row()],
+    )
+    row = ce.build_catalyst_board(engine, as_of=AS_OF)["ranked"][0]
+    assert row["p_success_phase"] == "PHASE3"
+    assert row["trial_phase_source"] == ce.PHASE_SOURCE_SIGNAL
+    assert row["primary_indication"] == "hematology"
+    assert row["primary_indication_source"] == ce.PHASE_SOURCE_SIGNAL
+
+
+def test_a_non_applicable_registry_phase_is_not_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ct.gov writes NA for trials with no phase — that is absence, not data."""
+    _patch_board(monkeypatch)
+    engine = _board_engine(
+        catalysts=[_catalyst_row(phase=None, indication=None, registry_phases=["NA"])],
+        profiles=[_profile_row()],
+        options=[_option_row()],
+    )
+    board = ce.build_catalyst_board(engine, as_of=AS_OF)
+    assert board["ranked_total"] == 0
+    assert "no_trial_evidence" in board["unranked"][0]["blocking_reasons"]
+
+
+def test_the_board_reports_where_every_phase_came_from(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_board(monkeypatch)
+    engine = _board_engine(
+        catalysts=[
+            _catalyst_row("GEMX"),
+            _catalyst_row("MIDP", phase=None, registry_phases=["PHASE3"]),
+            _catalyst_row("LOWP", phase=None),
+        ],
+        profiles=[_profile_row("GEMX"), _profile_row("MIDP"), _profile_row("LOWP")],
+        options=[_option_row("GEMX"), _option_row("MIDP"), _option_row("LOWP")],
+    )
+    board = ce.build_catalyst_board(engine, as_of=AS_OF)
+    assert any(
+        "1 from GRID's own trial_signals" in n and "1 from the ct.gov registry" in n
+        and "1 with none" in n
+        for n in board["method_notes"]
+    )
 
 
 def test_a_failing_source_degrades_the_board_without_raising(monkeypatch: pytest.MonkeyPatch) -> None:
