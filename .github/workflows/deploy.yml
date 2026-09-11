@@ -14,6 +14,11 @@ on:
         type: boolean
         required: false
         default: true
+      skip_migrations:
+        description: 'Skip alembic upgrade head (explicit opt-out only; never silent)'
+        type: boolean
+        required: false
+        default: false
 
 env:
   DEPLOY_PATH: /data/grid_v4/grid_release
@@ -103,10 +108,40 @@ jobs:
           git fetch "$SRC_URL" main
           git reset --hard FETCH_HEAD
           echo "after:  $(git log --oneline -1)"
-          test "$(git rev-parse HEAD)" = "${{ github.sha }}" || { echo "::error::release tree is not at the pushed commit ${{ github.sha }}"; exit 1; }
+          # A merge burst (several PRs landing within a minute) means an older run's
+          # `main` fetch can already be a strict ancestor of a newer commit that merged
+          # in the meantime — the release tree still contains the pushed commit, it's
+          # just not HEAD anymore. Accept "pushed commit is an ancestor of HEAD" instead
+          # of requiring exact equality, so only the newest run (which is what should
+          # deploy anyway) needs to pass.
+          git merge-base --is-ancestor "${{ github.sha }}" HEAD || { echo "::error::release tree is not at the pushed commit ${{ github.sha }}"; exit 1; }
           pip install -r requirements.txt
           cd pwa && npm ci && npm run build && cd ..
-          python3 -m alembic upgrade head || echo "no migrations"
+          if [ "${{ inputs.skip_migrations }}" = "true" ]; then
+            echo "::warning::alembic upgrade head skipped via workflow_dispatch input skip_migrations=true"
+          else
+            # Source the same GRID .env candidates ops-exec.yml uses so alembic gets DB
+            # credentials — the release tree carries no .env of its own, which is why
+            # every deploy before this one failed on "no password supplied" (or, before
+            # PR #443, on the divergent alembic heads) and had the failure swallowed by
+            # `|| echo "no migrations"`. No migration has ever actually been applied by
+            # a deploy; echo only which file was sourced, never its contents.
+            for f in /data/grid_v4/grid_release/.env /home/grid/grid_v4/grid_repo/.env /home/grid/grid_v4/grid_repo/grid/.env; do
+              if [ -f "$f" ]; then set -a; . "$f"; set +a; echo "(env sourced from $f)"; break; fi
+            done
+            {
+              echo "## Alembic"
+              echo '### current (before upgrade)'
+              echo '```'
+              python3 -m alembic current
+              echo '```'
+              echo '### heads'
+              echo '```'
+              python3 -m alembic heads
+              echo '```'
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            python3 -m alembic upgrade head
+          fi
 
       - name: Restart grid-api
         if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
@@ -167,3 +202,16 @@ jobs:
       - name: Notify failure
         if: failure()
         run: echo "Deployment FAILED - check server logs"
+
+  dad-smoke:
+    name: Dad Path Smoke (post-deploy, report-only)
+    needs: [deploy]
+    # Report-only (strict: false) until the dad-path smoke test has a track record on
+    # real deploys — a failure here does not fail this workflow. Same gating as the
+    # restart step: only meaningful right after a deploy that actually restarted
+    # grid-api, and only if that deploy succeeded.
+    if: needs.deploy.result == 'success' && (github.event_name == 'push' || inputs.do_restart == true)
+    uses: ./.github/workflows/dad-smoke.yml
+    with:
+      base_url: http://127.0.0.1:8000
+      strict: false
