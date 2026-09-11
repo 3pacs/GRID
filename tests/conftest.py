@@ -73,6 +73,19 @@ def _db_url() -> str:
 # different workers; with it, all six land on one.
 _DB_TOKENS = ("pg_engine", "live_engine", "get_engine(", "get_connection(")
 
+# Files whose individual tests are slow enough that keeping them together makes
+# the file the critical path for the whole run. These are left ungrouped so
+# `loadgroup` spreads their tests one at a time like plain `--dist load`.
+# Measured on ubuntu-latest (run 34554188271): test_alpha_signals.py is 49.4 s +
+# 42.9 s of gauntlet work in one file, and test_gauntlet_determinism.py another
+# ~91 s; on alien, which is ~2x slower per core, each is ~3 minutes of forced
+# serial time. Neither file touches a database or a module-scoped fixture, so
+# spreading them is safe.
+_SPREAD_FILES = frozenset({
+    "tests/test_alpha_signals.py",
+    "tests/test_gauntlet_determinism.py",
+})
+
 
 @lru_cache(maxsize=None)
 def _module_touches_db(path: str) -> bool:
@@ -99,8 +112,10 @@ def pytest_collection_modifyitems(config, items):
         # xdist appends short and readable; item.path is the absolute path the
         # source scan needs.
         module_id = item.nodeid.split("::")[0]
-        group = "postgres" if _module_touches_db(str(getattr(item, "path", "") or "")) else module_id
-        item.add_marker(pytest.mark.xdist_group(group))
+        if _module_touches_db(str(getattr(item, "path", "") or "")):
+            item.add_marker(pytest.mark.xdist_group("postgres"))
+        elif module_id not in _SPREAD_FILES:
+            item.add_marker(pytest.mark.xdist_group(module_id))
 
 
 @pytest.fixture
