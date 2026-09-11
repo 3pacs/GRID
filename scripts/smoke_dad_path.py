@@ -422,6 +422,9 @@ def mint_contributor_token(release_dir: str) -> tuple[str | None, str]:
 
 
 def step_composer(client: Client, budget_ms: int) -> StepResult:
+    if not client.token:
+        return StepResult("composer", "blocked", None, "no token (auth blocked) — skipped, not graded as broken")
+
     sub: list[StepResult] = []
     llm_timeout_s = max(budget_ms * 10, 65_000) / 1000
 
@@ -498,6 +501,9 @@ def step_composer(client: Client, budget_ms: int) -> StepResult:
 
 
 def step_widget_data(client: Client, budget_ms: int) -> StepResult:
+    if not client.token:
+        return StepResult("widget_data", "blocked", None, "no token (auth blocked) — skipped, not graded as broken")
+
     sub: list[StepResult] = []
     timeout_s = max(budget_ms, 15_000) / 1000
 
