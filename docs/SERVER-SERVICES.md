@@ -264,7 +264,7 @@ on the Windows side (elevated PowerShell):
 
 ```powershell
 $a = New-ScheduledTaskAction -Execute "C:\Windows\System32\wsl.exe" `
-       -Argument '-d GitHubActions --exec /bin/sh -c "exec sleep infinity"'
+       -Argument '-d GitHubActions --exec sleep infinity'
 $s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) `
        -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
 $p = New-ScheduledTaskPrincipal -UserId "owner" -LogonType S4U -RunLevel Highest
@@ -274,6 +274,17 @@ Register-ScheduledTask -TaskName GitHubActions-WSL-Start -Action $a `
 Start-ScheduledTask -TaskName GitHubActions-WSL-Start
 wsl.exe -l -v    # GitHubActions must say Running
 ```
+
+Gotcha when testing this by hand from an SSH (Git Bash) session on alien: MSYS
+rewrites leading-slash arguments, so `--exec /bin/sh -c ...` reaches wsl.exe as
+`C:/Program Files/Git/usr/bin/sh` and fails with `execvpe ... No such file`.
+Use `--exec sleep infinity` (no path) or `MSYS_NO_PATHCONV=1`.
+
+**Do not set `TEST_RUNNER` until that task exists and `wsl.exe -l -v` says
+Running.** With the variable set and the distro stopped, every PR's Lint /
+Backend Tests / Frontend Build queues against an offline runner, and a job that
+is mid-run when the distro idles out is cancelled (this happened to a foreign
+PR's Backend Tests on 2026-09-11 01:15Z during activation testing).
 
 ### One-time setup (as root inside the `GitHubActions` distro)
 
@@ -304,6 +315,13 @@ sudo -u postgres psql -d griddb_test -c "CREATE EXTENSION IF NOT EXISTS timescal
 # Note: the job's `DROP SCHEMA public CASCADE` also drops the timescaledb
 # extension (it lives in public). The test suite does not need it — the
 # ubuntu-latest path uses a plain postgres:15 container — so this is fine.
+# Pin the cluster and the test DB to UTC. The distro's system zone is
+# America/Los_Angeles; the hosted postgres:15 container is UTC, and
+# tests/test_regime_history_writer.py::TestStalenessFields compares Python's
+# UTC date with Postgres current_date (it failed 164 == 165 on the first run).
+sed -i "s/^timezone = .*/timezone = 'UTC'/; s/^log_timezone = .*/log_timezone = 'UTC'/" /etc/postgresql/15/main/postgresql.conf
+sudo -u postgres psql -c "ALTER DATABASE griddb_test SET timezone TO 'UTC';"
+pg_ctlcluster 15 main reload
 
 # 2. Python 3.11 + Node 20
 #    Both actions/setup-python@v6 and actions/setup-node@v6 provision their
@@ -343,6 +361,7 @@ Wants=postgresql.service
 Environment=CI_ARTIFACT_ROOT=/var/lib/github-actions-artifacts
 Environment=DOCKER_HOST=unix:///run/user/1000/docker.sock
 Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=TZ=UTC
 CONF
 systemctl daemon-reload && systemctl enable --now actions.runner.3pacs-GRID.alien.service
 journalctl -u actions.runner.3pacs-GRID.alien.service -n 5   # expect "Listening for Jobs"
@@ -371,3 +390,25 @@ gh api repos/3pacs/GRID/actions/runners --jq '.runners[] | "\(.name) \(.status) 
 To pull CI off alien without touching the workflow file, delete the
 `TEST_RUNNER` repository variable — jobs fall back to `ubuntu-latest` on the
 next run (a re-run of an already-queued run re-evaluates the variable too).
+
+### Measured on 2026-09-11 (first activation, PR #450)
+
+| Job | alien (warm tool cache) | ubuntu-latest |
+|---|---|---|
+| Lint | 1m56s | ~50s |
+| Frontend Build | 1m26s | ~1m07s |
+| Backend Tests (8,061 tests) | 14m58s job / 14m12s `Run tests` | 8m23s job / 6m47s `Run tests` |
+
+alien's CPU is a Xeon E5-2698 v3 (2.3 GHz, 2014): roughly 2x slower per core
+than the hosted VM, and pytest runs single-process. The ON_ALIEN branch was
+verified (`Reset persistent Postgres (alien)` ran, `Start ephemeral Postgres
+(hosted runner)` skipped), and the fallback was verified by deleting
+`TEST_RUNNER` and re-running: jobs re-evaluate the variable and land on
+`ubuntu-latest`. Two alien-only test failures were found and fixed:
+`TestGauntlet::test_run_gauntlet` takes ~90 s there (pytest `--timeout` raised
+60 -> 180 and the job `timeout-minutes` 15 -> 25 in `test.yml`), and the
+timezone mismatch above. The handoff's "under 4 minutes" bar holds for Lint and
+Frontend Build; Backend Tests will not get there on this CPU without
+parallelising the suite (`pytest-xdist -n auto` across 24 cores, which needs
+per-worker DB isolation first), so treat alien as a resilience/second-runner
+win for the test lane, not a speed win, until that lands.

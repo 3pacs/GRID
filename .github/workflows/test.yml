@@ -21,7 +21,10 @@ jobs:
   backend-tests:
     name: Backend Tests
     runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","alien","tests"]') || 'ubuntu-latest' }}
-    timeout-minutes: 15
+    # alien (Xeon E5-2698 v3) is ~2x slower per core than ubuntu-latest: the
+    # suite takes ~14.5 min there and TestGauntlet::test_run_gauntlet alone
+    # takes ~90 s, so both timeouts need headroom (measured 2026-09-11).
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@v7
@@ -87,7 +90,7 @@ jobs:
           fi
 
           set +e
-          python -m pytest tests/ -v --tb=short --maxfail=50 --timeout=60 > /tmp/grid-pytest-output.txt 2>&1
+          python -m pytest tests/ -v --tb=short --maxfail=50 --timeout=180 > /tmp/grid-pytest-output.txt 2>&1
           pytest_status=$?
           set -e
 
