@@ -1351,6 +1351,31 @@ def _run_obsidian_cycle(engine: Any) -> dict[str, Any]:
 
 # ─── Main loop ───────────────────────────────────────────────────────
 
+def _is_transient_db_error(exc: BaseException) -> bool:
+    """True when a failure is operational rather than a defect in our code.
+
+    ``sqlalchemy.exc.OperationalError`` is the wrapper for everything the
+    database refuses for reasons outside the statement itself — a
+    statement_timeout cancellation, a dropped or exhausted connection, a
+    server restart. Its sibling ``ProgrammingError`` (the 2026-03 regression's
+    "column does not exist") is emphatically not transient, and must keep
+    showing up as a real failure. Health surfaces use this to tell "the
+    database was busy" from "this code is broken", which was exactly the
+    distinction lost when the whole path sat inside ``except: log.debug``.
+
+    Args:
+        exc: The exception raised by the resolver.
+
+    Returns:
+        True if a retry on the next cycle could plausibly succeed unchanged.
+    """
+    try:
+        from sqlalchemy.exc import OperationalError
+    except Exception:  # pragma: no cover - SQLAlchemy is a hard dependency
+        return False
+    return isinstance(exc, OperationalError)
+
+
 def _run_resolution_step(engine: Any, state: OperatorState) -> dict[str, Any]:
     """Run conflict resolution for this cycle and report the outcome.
 
@@ -1382,7 +1407,7 @@ def _run_resolution_step(engine: Any, state: OperatorState) -> dict[str, Any]:
     step_t0 = time.time()
     # _run_with_timeout reports a raise and a timeout the same way, so the
     # exception is captured here to tell the two apart in cycle_result.
-    failure: dict[str, str] = {}
+    failure: dict[str, Any] = {}
 
     def _resolve() -> dict[str, Any]:
         from normalization.resolver import Resolver
@@ -1395,6 +1420,8 @@ def _run_resolution_step(engine: Any, state: OperatorState) -> dict[str, Any]:
             )
         except Exception as exc:
             failure["error"] = str(exc)
+            failure["error_class"] = type(exc).__name__
+            failure["transient"] = _is_transient_db_error(exc)
             raise
 
     result, ok = _run_with_timeout(
@@ -1402,23 +1429,39 @@ def _run_resolution_step(engine: Any, state: OperatorState) -> dict[str, Any]:
     )
 
     if failure:
+        # Warning for every failure (CLAUDE.md reserves log.error for
+        # unhandled application bugs), but the class is in the message and
+        # the transient flag rides along so the health surfaces can tell a
+        # dropped connection from a programming error without parsing text.
         log.warning(
-            "Resolution failed: {e} — watermark held at {w}",
+            "Resolution failed ({c}{t}): {e} — watermark held at {w}",
+            c=failure["error_class"],
+            t=", transient" if failure["transient"] else "",
             e=failure["error"], w=getattr(state, "last_resolution", None),
         )
+        detail = f"{failure['error_class']}: {failure['error']}"
         state.record_task(
-            "resolution", False, time.time() - step_t0, failure["error"],
+            "resolution", False, time.time() - step_t0, detail,
+            transient=failure["transient"],
         )
-        return {"error": failure["error"]}
+        return {
+            "error": failure["error"],
+            "error_class": failure["error_class"],
+            "transient": failure["transient"],
+        }
 
     if not ok or result is None:
+        # A step abandoned at the timeout is the operational case by
+        # definition — it ran out of budget, it did not misbehave.
         log.warning(
             "Resolution step did not complete (timeout after {s}s) — "
             "watermark held at {w}",
             s=RESOLUTION_TIMEOUT_SECONDS, w=getattr(state, "last_resolution", None),
         )
-        state.record_task("resolution", False, time.time() - step_t0, "timeout")
-        return {"timeout": True}
+        state.record_task(
+            "resolution", False, time.time() - step_t0, "timeout", transient=True,
+        )
+        return {"timeout": True, "transient": True}
 
     if result.get("errors"):
         log.warning(

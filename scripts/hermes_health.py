@@ -354,13 +354,27 @@ class OperatorState:
         success: bool,
         duration_s: float,
         error: str | None = None,
+        transient: bool = False,
     ) -> None:
-        """Record the outcome of a scheduled task for the status endpoint."""
+        """Record the outcome of a scheduled task for the status endpoint.
+
+        Args:
+            task_name: Cycle step the outcome belongs to.
+            success: Whether the step completed cleanly.
+            duration_s: Wall time the step consumed.
+            error: Failure detail, prefixed with the exception class where
+                the caller knows it.
+            transient: True when the failure is operational (a statement
+                timeout, a dropped connection, a step abandoned at its
+                budget) rather than a defect. Health surfaces read this to
+                avoid paging on a slow database.
+        """
         self.task_status[task_name] = {
             "last_run": datetime.now(timezone.utc).isoformat(),
             "success": success,
             "duration_s": round(duration_s, 2),
             "error": error,
+            "transient": transient,
         }
 
     def to_dict(self) -> dict[str, Any]:
