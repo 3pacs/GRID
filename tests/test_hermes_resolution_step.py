@@ -48,9 +48,13 @@ class _FakeState:
         self.cooldowns = _FakeCooldowns()
         self.task_status: dict[str, dict] = {}
 
-    def record_task(self, task_name, success, duration_s, error=None) -> None:
+    def record_task(
+        self, task_name, success, duration_s, error=None, transient=False,
+    ) -> None:
+        # Mirrors OperatorState.record_task in scripts/hermes_health.py.
         self.task_status[task_name] = {
             "success": success, "duration_s": duration_s, "error": error,
+            "transient": transient,
         }
 
 
@@ -231,7 +235,7 @@ class TestResolutionStepFailsLoudly:
 
         result = hermes._run_resolution_step(object(), state)
 
-        assert result == {"timeout": True}
+        assert result["timeout"] is True
         assert state.last_resolution == watermark
         assert any("did not complete" in str(r) for r in warnings_captured)
         assert state.task_status["resolution"]["error"] == "timeout"
@@ -260,6 +264,132 @@ class TestResolutionStepFailsLoudly:
         source = inspect.getsource(hermes._run_resolution_step)
         assert "log.debug" not in source
         assert source.count("log.warning") >= 3
+
+
+# ---------------------------------------------------------------------------
+# Transient vs. real: the health surfaces must be able to tell them apart
+# ---------------------------------------------------------------------------
+
+class TestTransientFailureMarker:
+    """A timeout and a broken statement are both warnings, not the same event.
+
+    Before this, every failure reported identically, so a health surface
+    could not distinguish "the database was busy for 240s" from "this SQL
+    names a column that does not exist" — which is the distinction the
+    2026-03 regression destroyed by hiding both under ``log.debug``.
+    """
+
+    def test_operational_error_is_marked_transient(
+        self, monkeypatch, warnings_captured,
+    ):
+        from sqlalchemy.exc import OperationalError
+
+        import scripts.hermes_operator as hermes
+
+        exc = OperationalError(
+            "SELECT 1", {}, Exception("canceling statement due to statement timeout")
+        )
+        _install_resolver(monkeypatch, raises=exc)
+        state = _FakeState()
+
+        result = hermes._run_resolution_step(object(), state)
+
+        assert result["transient"] is True
+        assert result["error_class"] == "OperationalError"
+        assert state.task_status["resolution"]["transient"] is True
+        assert state.task_status["resolution"]["success"] is False
+        # Still a warning, and the class is in the message.
+        assert any("OperationalError" in str(r) for r in warnings_captured)
+
+    def test_programming_error_is_not_transient(
+        self, monkeypatch, warnings_captured,
+    ):
+        """The 2026-03 regression's own error must never read as transient."""
+        from sqlalchemy.exc import ProgrammingError
+
+        import scripts.hermes_operator as hermes
+
+        exc = ProgrammingError(
+            "INSERT INTO resolved_series", {},
+            Exception('column "source_id" of relation "resolved_series" '
+                      'does not exist'),
+        )
+        _install_resolver(monkeypatch, raises=exc)
+        state = _FakeState()
+
+        result = hermes._run_resolution_step(object(), state)
+
+        assert result["transient"] is False
+        assert result["error_class"] == "ProgrammingError"
+        assert state.task_status["resolution"]["transient"] is False
+        assert any("ProgrammingError" in str(r) for r in warnings_captured)
+
+    def test_plain_exception_is_not_transient(self, monkeypatch):
+        import scripts.hermes_operator as hermes
+
+        _install_resolver(monkeypatch, raises=RuntimeError("boom"))
+        state = _FakeState()
+
+        result = hermes._run_resolution_step(object(), state)
+
+        assert result["transient"] is False
+        assert result["error_class"] == "RuntimeError"
+
+    def test_timeout_is_transient(self, monkeypatch):
+        """A step abandoned at its budget ran out of time, it did not break."""
+        import scripts.hermes_operator as hermes
+
+        _install_resolver(monkeypatch, summary=None)
+        monkeypatch.setattr(
+            hermes, "_run_with_timeout",
+            lambda _name, _fn, _timeout, _state: (None, False),
+        )
+        state = _FakeState()
+
+        result = hermes._run_resolution_step(object(), state)
+
+        assert result == {"timeout": True, "transient": True}
+        assert state.task_status["resolution"]["transient"] is True
+
+    def test_recorded_detail_carries_the_exception_class(self, monkeypatch):
+        import scripts.hermes_operator as hermes
+
+        _install_resolver(monkeypatch, raises=ValueError("bad vintage"))
+        state = _FakeState()
+
+        hermes._run_resolution_step(object(), state)
+
+        assert state.task_status["resolution"]["error"] == "ValueError: bad vintage"
+
+    def test_classifier_is_exception_type_based_not_string_matching(self):
+        """OperationalError is the class; message text must not decide."""
+        from sqlalchemy.exc import OperationalError, ProgrammingError
+
+        import scripts.hermes_operator as hermes
+
+        # Same message, different class — only the class may matter.
+        message = Exception("canceling statement due to statement timeout")
+        assert hermes._is_transient_db_error(
+            OperationalError("s", {}, message)
+        ) is True
+        assert hermes._is_transient_db_error(
+            ProgrammingError("s", {}, message)
+        ) is False
+        assert hermes._is_transient_db_error(RuntimeError("timeout")) is False
+
+
+def test_operator_state_record_task_persists_the_transient_flag():
+    """The real OperatorState, not the double, must store the flag."""
+    from scripts.hermes_health import OperatorState
+
+    state = OperatorState()
+    state.record_task("resolution", False, 1.5, "OperationalError: x", transient=True)
+    assert state.task_status["resolution"]["transient"] is True
+    assert state.task_status["resolution"]["error"] == "OperationalError: x"
+
+    # Default stays False so existing callers are unchanged.
+    state.record_task("other", True, 0.1)
+    assert state.task_status["other"]["transient"] is False
 
 
 def test_resolution_timeout_fits_in_the_cycle():

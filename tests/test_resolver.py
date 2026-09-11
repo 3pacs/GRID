@@ -11,7 +11,7 @@ require a live pg_engine fixture.
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -246,7 +246,7 @@ class TestSingleSourceUnit:
 
         assert set(summary.keys()) == {
             "resolved", "conflicts_found", "errors",
-            "series_scanned", "duration_s", "dry_run",
+            "series_scanned", "duration_s", "dry_run", "unmapped",
         }
 
     @patch("normalization.resolver.EntityMap")
@@ -1209,13 +1209,28 @@ class _RecordingEngine:
 
 
 def _patched_entity_map(monkeypatch, feature_id: int | None = 1):
-    """Point the resolver's EntityMap at a stub mapping every series."""
+    """Point the resolver's EntityMap at a stub mapping every series.
+
+    Mirrors the real EntityMap surface the resolver uses: get_feature_id
+    plus missing_feature_report(), which resolve_pending calls once at the
+    end of a run to log unmapped series in bulk.
+    """
     class _Stub:
         def __init__(self, _engine):
-            pass
+            self.lookups: list[str] = []
 
-        def get_feature_id(self, _series_id):
+        def get_feature_id(self, series_id):
+            self.lookups.append(series_id)
             return feature_id
+
+        def missing_feature_report(self):
+            missed = [s for s in self.lookups] if feature_id is None else []
+            return {
+                "lookups_missed": len(missed),
+                "series_ids": len(set(missed)),
+                "unregistered_features": [],
+                "top_series": [],
+            }
 
     monkeypatch.setattr("normalization.resolver.EntityMap", _Stub)
 
@@ -1287,7 +1302,11 @@ class TestResolutionWindow:
         summary = Resolver(db_engine=engine).resolve_pending(workers=1)
         assert set(summary) == {
             "resolved", "conflicts_found", "errors",
-            "series_scanned", "duration_s", "dry_run",
+            "series_scanned", "duration_s", "dry_run", "unmapped",
+        }
+        assert set(summary["unmapped"]) == {
+            "lookups_missed", "series_ids", "unregistered_features",
+            "top_series",
         }
 
 
@@ -1404,3 +1423,337 @@ class TestResolveRange:
         resolver = Resolver(db_engine=MagicMock())
         with pytest.raises(ValueError):
             resolver.resolve_range(since=date(2026, 3, 29), chunk_days=0)
+
+# ---------------------------------------------------------------------------
+# The per-worker feature_id memo
+# ---------------------------------------------------------------------------
+
+
+class TestFeatureIdMemo:
+    """One EntityMap lookup per series_id per partition, not per group.
+
+    A live 2-day window on griddb produced 569,400 (series_id, obs_date)
+    groups over 18,916 distinct series_ids — ~30 identical lookups each.
+    With get_feature_id re-reading feature_registry on every miss, that
+    repetition was 54.6s of a 61.5s dry run, against 9.1s for both SQL
+    scans combined. Partitions are disjoint by series_id, so the memo is
+    per-worker and needs no lock.
+    """
+
+    def _rows_for(self, series_id: str, n_dates: int):
+        """n_dates raw rows for one series, each on its own obs_date.
+
+        Each row becomes its own (series_id, obs_date) group, which is what
+        the memo has to collapse back down to one lookup.
+        """
+        base = datetime(2026, 1, 1, 12, 0)
+        return [
+            FakeRow((series_id, (base + timedelta(days=d)).date(),
+                     100.0 + d, 1, base + timedelta(days=d), 1, "FRED"))
+            for d in range(n_dates)
+        ]
+
+    def test_one_lookup_per_series_id_not_per_group(self, monkeypatch):
+        lookups: list[str] = []
+
+        class _CountingStub:
+            def __init__(self, _engine):
+                pass
+
+            def get_feature_id(self, series_id):
+                lookups.append(series_id)
+                return 1
+
+            def missing_feature_report(self):
+                return {
+                    "lookups_missed": 0, "series_ids": 0,
+                    "unregistered_features": [], "top_series": [],
+                }
+
+        monkeypatch.setattr("normalization.resolver.EntityMap", _CountingStub)
+
+        rows = self._rows_for("T10Y2Y", 25)
+        engine, _ = _mock_engine(pending_rows=rows)
+        Resolver(db_engine=engine).resolve_pending(workers=1, dry_run=True)
+
+        assert len(rows) == 25, "fixture should produce 25 groups"
+        assert lookups == ["T10Y2Y"], (
+            f"25 groups of one series_id produced {len(lookups)} lookups"
+        )
+
+    def test_a_missing_series_is_also_looked_up_only_once(self, monkeypatch):
+        """A None result must be memoised too — misses are the hot case."""
+        lookups: list[str] = []
+
+        class _MissingStub:
+            def __init__(self, _engine):
+                pass
+
+            def get_feature_id(self, series_id):
+                lookups.append(series_id)
+                return None
+
+            def missing_feature_report(self):
+                return {
+                    "lookups_missed": len(lookups),
+                    "series_ids": len(set(lookups)),
+                    "unregistered_features": ["ief_full"],
+                    "top_series": [[s, 1] for s in set(lookups)],
+                }
+
+        monkeypatch.setattr("normalization.resolver.EntityMap", _MissingStub)
+
+        engine, _ = _mock_engine(pending_rows=self._rows_for("YF:IEF:close", 40))
+        summary = Resolver(db_engine=engine).resolve_pending(
+            workers=1, dry_run=True,
+        )
+
+        assert lookups == ["YF:IEF:close"]
+        assert summary["resolved"] == 0
+        assert summary["unmapped"]["unregistered_features"] == ["ief_full"]
+
+    def test_distinct_series_are_each_looked_up(self, monkeypatch):
+        """Memoising must not collapse genuinely different series_ids."""
+        lookups: list[str] = []
+
+        class _Stub:
+            def __init__(self, _engine):
+                pass
+
+            def get_feature_id(self, series_id):
+                lookups.append(series_id)
+                return 1
+
+            def missing_feature_report(self):
+                return {
+                    "lookups_missed": 0, "series_ids": 0,
+                    "unregistered_features": [], "top_series": [],
+                }
+
+        monkeypatch.setattr("normalization.resolver.EntityMap", _Stub)
+
+        rows = (self._rows_for("T10Y2Y", 5) + self._rows_for("DGS10", 5)
+                + self._rows_for("VIXCLS", 5))
+        # _mock_engine wires one worker connection per series_id, so run
+        # one partition per series (chunk_size = 3 // 3 = 1).
+        engine, _ = _mock_engine(pending_rows=rows)
+        Resolver(db_engine=engine).resolve_pending(workers=3, dry_run=True)
+
+        assert sorted(set(lookups)) == ["DGS10", "T10Y2Y", "VIXCLS"]
+        assert len(lookups) == 3, "each series_id must be resolved exactly once"
+
+
+# ---------------------------------------------------------------------------
+# statement_timeout is bound, never formatted into SQL
+# ---------------------------------------------------------------------------
+
+
+class TestStatementTimeoutIsParameterised:
+    """.claude/rules/security.md: no f-strings or .format() in SQL.
+
+    SET's grammar only accepts a literal, which is why the old code built
+    the statement with an f-string. set_config(..., is_local => true) is
+    the same transaction-scoped change as a function call, so the value
+    travels as a bound parameter.
+    """
+
+    def test_timeout_travels_as_a_bound_parameter(self, monkeypatch):
+        _patched_entity_map(monkeypatch)
+        engine = _RecordingEngine()
+        resolver = Resolver(db_engine=engine)
+        resolver.resolve_pending(lookback_days=2, workers=1)
+
+        timeout_calls = [
+            (sql, params) for sql, params in engine.calls
+            if "statement_timeout" in sql
+        ]
+        assert timeout_calls, "statement_timeout was never raised"
+        for sql, params in timeout_calls:
+            assert "set_config" in sql
+            assert ":timeout_ms" in sql
+            assert params["timeout_ms"] == str(
+                Resolver._RESOLVE_STATEMENT_TIMEOUT_MS
+            )
+            assert str(Resolver._RESOLVE_STATEMENT_TIMEOUT_MS) not in sql, (
+                "the timeout value is interpolated into the SQL string"
+            )
+
+    def test_no_module_sql_literal_uses_set_local(self):
+        """Guard the pattern, not just this one call site."""
+        import ast
+        from pathlib import Path
+
+        tree = ast.parse(
+            Path(__file__).resolve().parent.parent
+            .joinpath("normalization/resolver.py").read_text()
+        )
+        for node in ast.walk(tree):
+            if isinstance(node, ast.JoinedStr):
+                # An f-string anywhere in the module is fine unless it is SQL.
+                rendered = "".join(
+                    v.value for v in node.values
+                    if isinstance(v, ast.Constant) and isinstance(v.value, str)
+                )
+                assert "statement_timeout" not in rendered.lower(), (
+                    "statement_timeout is being built with an f-string"
+                )
+
+
+# ---------------------------------------------------------------------------
+# A backlog walk survives a failed chunk
+# ---------------------------------------------------------------------------
+
+
+class TestResolveRangeFaultTolerance:
+    """One bad chunk must not discard the chunks that already landed.
+
+    Historical windows are cold: the rolling 2-day window's distinct-series
+    scan is 2.2s, but a 7-day chunk five months back exceeded the 600s
+    statement timeout on griddb (ops-exec run 34551047779). Chunks are
+    independent and every insert is ON CONFLICT ... DO NOTHING, so the walk
+    continues and the failed range is reported for a narrower retry.
+    """
+
+    def _summary(self, resolved=10, errors=0):
+        return {
+            "resolved": resolved, "conflicts_found": 0, "errors": errors,
+            "series_scanned": 5, "duration_s": 1.0, "dry_run": False,
+            "unmapped": {
+                "lookups_missed": 0, "series_ids": 0,
+                "unregistered_features": [], "top_series": [],
+            },
+        }
+
+    def test_a_raising_chunk_does_not_abort_the_walk(self, monkeypatch):
+        from sqlalchemy.exc import OperationalError
+
+        _patched_entity_map(monkeypatch)
+        resolver = Resolver(db_engine=MagicMock())
+        seen: list[tuple] = []
+
+        def _fake(**kwargs):
+            seen.append((kwargs["since"], kwargs["until"]))
+            if kwargs["since"] == datetime(2026, 4, 2):
+                raise OperationalError(
+                    "SELECT DISTINCT", {},
+                    Exception("canceling statement due to statement timeout"),
+                )
+            return self._summary()
+
+        monkeypatch.setattr(resolver, "resolve_pending", _fake)
+
+        totals = resolver.resolve_range(
+            since=date(2026, 4, 1), until=date(2026, 4, 4), chunk_days=1,
+        )
+
+        assert len(seen) == 3, "the walk stopped at the failed chunk"
+        assert totals["chunks"] == 3
+        assert totals["chunks_failed"] == 1
+        assert totals["resolved"] == 20, "surviving chunks must still count"
+        assert totals["errors"] == 1
+
+    def test_failed_range_is_reported_for_retry(self, monkeypatch):
+        from sqlalchemy.exc import OperationalError
+
+        _patched_entity_map(monkeypatch)
+        resolver = Resolver(db_engine=MagicMock())
+
+        def _fake(**kwargs):
+            if kwargs["since"] == datetime(2026, 4, 2):
+                raise OperationalError("SELECT", {}, Exception("timeout"))
+            return self._summary()
+
+        monkeypatch.setattr(resolver, "resolve_pending", _fake)
+
+        totals = resolver.resolve_range(
+            since=date(2026, 4, 1), until=date(2026, 4, 4), chunk_days=1,
+        )
+
+        assert len(totals["failed_ranges"]) == 1
+        failed = totals["failed_ranges"][0]
+        assert failed["since"] == "2026-04-02"
+        assert failed["until"] == "2026-04-03"
+        assert failed["error_class"] == "OperationalError"
+        assert "timeout" in failed["error"]
+
+    def test_worker_errors_also_mark_the_range_incomplete(self, monkeypatch):
+        """resolve_pending swallows worker failures — the range is still bad."""
+        _patched_entity_map(monkeypatch)
+        resolver = Resolver(db_engine=MagicMock())
+
+        def _fake(**kwargs):
+            if kwargs["since"] == datetime(2026, 4, 2):
+                return self._summary(resolved=3, errors=2)
+            return self._summary()
+
+        monkeypatch.setattr(resolver, "resolve_pending", _fake)
+
+        totals = resolver.resolve_range(
+            since=date(2026, 4, 1), until=date(2026, 4, 4), chunk_days=1,
+        )
+
+        assert totals["chunks_failed"] == 1
+        assert totals["failed_ranges"][0]["since"] == "2026-04-02"
+        assert totals["failed_ranges"][0]["error_class"] == "WorkerError"
+        assert totals["errors"] == 2
+
+    def test_a_clean_walk_reports_no_failures(self, monkeypatch):
+        _patched_entity_map(monkeypatch)
+        resolver = Resolver(db_engine=MagicMock())
+        monkeypatch.setattr(
+            resolver, "resolve_pending", lambda **kw: self._summary(),
+        )
+
+        totals = resolver.resolve_range(
+            since=date(2026, 4, 1), until=date(2026, 4, 4), chunk_days=1,
+        )
+
+        assert totals["chunks"] == 3
+        assert totals["chunks_failed"] == 0
+        assert totals["failed_ranges"] == []
+
+    def test_every_chunk_failing_still_returns_a_summary(self, monkeypatch):
+        _patched_entity_map(monkeypatch)
+        resolver = Resolver(db_engine=MagicMock())
+
+        def _fake(**kwargs):
+            raise RuntimeError("database is down")
+
+        monkeypatch.setattr(resolver, "resolve_pending", _fake)
+
+        totals = resolver.resolve_range(
+            since=date(2026, 4, 1), until=date(2026, 4, 4), chunk_days=1,
+        )
+
+        assert totals["chunks"] == 3
+        assert totals["chunks_failed"] == 3
+        assert len(totals["failed_ranges"]) == 3
+        assert totals["resolved"] == 0
+
+    def test_backlog_chunk_default_is_one_day(self, monkeypatch):
+        """7 days did not finish inside the 600s timeout on a cold window."""
+        from normalization.resolver import DEFAULT_BACKFILL_CHUNK_DAYS
+
+        assert DEFAULT_BACKFILL_CHUNK_DAYS == 1
+
+        _patched_entity_map(monkeypatch)
+        resolver = Resolver(db_engine=MagicMock())
+        seen: list[tuple] = []
+
+        def _fake(**kwargs):
+            seen.append((kwargs["since"], kwargs["until"]))
+            return self._summary()
+
+        monkeypatch.setattr(resolver, "resolve_pending", _fake)
+        resolver.resolve_range(since=date(2026, 4, 1), until=date(2026, 4, 4))
+
+        assert len(seen) == 3, "default chunk width is not one day"
+
+    def test_cli_default_matches_the_module_default(self):
+        from normalization.resolver import DEFAULT_BACKFILL_CHUNK_DAYS, main
+        import inspect
+
+        source = inspect.getsource(main)
+        assert "default=DEFAULT_BACKFILL_CHUNK_DAYS" in source
+        assert DEFAULT_BACKFILL_CHUNK_DAYS == 1
+

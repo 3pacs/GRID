@@ -149,7 +149,9 @@ class Resolver:
 
         Returns:
             dict with resolved, conflicts_found, errors, series_scanned,
-            duration_s and dry_run.
+            duration_s, dry_run and unmapped (the EntityMap miss summary —
+            see EntityMap.missing_feature_report). Every return path carries
+            the same keys.
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import threading
@@ -170,11 +172,19 @@ class Resolver:
             "until": until,
         }
 
+        # Shape of "nothing was missed", so every return path below carries
+        # the same keys whether or not an EntityMap was ever constructed.
+        empty_unmapped: dict[str, Any] = {
+            "lookups_missed": 0, "series_ids": 0,
+            "unregistered_features": [], "top_series": [],
+        }
+
         def _summary(
             resolved: int = 0,
             conflicts: int = 0,
             errors: int = 0,
             series: int = 0,
+            unmapped: dict[str, Any] | None = None,
         ) -> dict[str, Any]:
             return {
                 "resolved": resolved,
@@ -183,6 +193,7 @@ class Resolver:
                 "series_scanned": series,
                 "duration_s": round(time.monotonic() - started_at, 2),
                 "dry_run": dry_run,
+                "unmapped": unmapped if unmapped is not None else dict(empty_unmapped),
             }
 
         # Pre-load entity map and feature families (shared, read-only)
@@ -223,7 +234,7 @@ class Resolver:
 
         if not all_series:
             log.info("No pending observations to resolve")
-            return _summary()
+            return _summary(unmapped=entity_map.missing_feature_report())
 
         # Partition series_ids across workers
         chunk_size = max(1, len(all_series) // workers)
@@ -400,8 +411,8 @@ class Resolver:
             conflicts=totals["conflicts_found"],
             errors=totals["errors"],
             series=len(all_series),
+            unmapped=unmapped,
         )
-        summary["unmapped"] = unmapped
         log.info(
             "Resolution complete — resolved={r}, conflicts={c}, errors={e}, "
             "series={s}, {t}s{d}",
