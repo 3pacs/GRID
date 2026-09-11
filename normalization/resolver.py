@@ -92,9 +92,22 @@ class Resolver:
 
     # Bulk resolution scans tens of millions of raw_series rows; the
     # default per-statement timeout (120s, see db.get_engine) is too tight
-    # for the DISTINCT scan and per-partition fetch. Override locally
-    # inside transactions via SET LOCAL.
+    # for the DISTINCT scan and per-partition fetch. Raised per transaction
+    # by _set_statement_timeout.
     _RESOLVE_STATEMENT_TIMEOUT_MS: int = 600_000  # 10 minutes
+
+    def _set_statement_timeout(self, conn: Any) -> None:
+        """Raise this transaction's statement_timeout for the bulk scans.
+
+        ``set_config(..., is_local => true)`` is ``SET LOCAL`` with a bound
+        parameter. Plain ``SET`` only accepts a literal, so it would force
+        the value into the SQL string — which is what .claude/rules
+        forbids, and what this replaced.
+        """
+        conn.execute(
+            text("SELECT set_config('statement_timeout', :timeout_ms, true)"),
+            {"timeout_ms": str(self._RESOLVE_STATEMENT_TIMEOUT_MS)},
+        )
 
     def resolve_pending(
         self,
@@ -186,9 +199,7 @@ class Resolver:
         # this DISTINCT scan once raw_series grows past a few million rows.
         log.info("Fetching distinct series_ids...")
         with self.engine.begin() as conn:
-            conn.execute(
-                text(f"SET LOCAL statement_timeout = {self._RESOLVE_STATEMENT_TIMEOUT_MS}")
-            )
+            self._set_statement_timeout(conn)
             series_rows = conn.execute(text("""
                 SELECT DISTINCT rs.series_id
                 FROM raw_series rs
@@ -245,11 +256,7 @@ class Resolver:
 
             try:
                 with self.engine.begin() as conn:
-                    conn.execute(
-                        text(
-                            f"SET LOCAL statement_timeout = {self._RESOLVE_STATEMENT_TIMEOUT_MS}"
-                        )
-                    )
+                    self._set_statement_timeout(conn)
                     rows = conn.execute(text("""
                         SELECT rs.series_id, rs.obs_date, rs.value,
                                rs.source_id, rs.pull_timestamp,
