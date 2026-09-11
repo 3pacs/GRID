@@ -260,6 +260,24 @@ _BEARISH_SENTIMENT_TOKENS: frozenset[str] = frozenset({
 })
 
 
+def _payload_dict(signal_value: Any) -> dict[str, Any]:
+    """Return ``signal_value`` as a dict.
+
+    JSONB comes back from psycopg2 as a dict already; a text column (or a
+    test double) may hand us the JSON document as a string. Scalars, lists
+    and unparsable text give an empty dict so callers can ``.get`` safely.
+    """
+    if isinstance(signal_value, dict):
+        return signal_value
+    if isinstance(signal_value, (str, bytes, bytearray)):
+        try:
+            parsed = json.loads(signal_value)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
 def _direction_from_text(raw: Any) -> str:
     """Classify a free-form direction string into bullish / bearish / unknown.
 
@@ -322,7 +340,7 @@ def _infer_signal_direction(
         if "bearish" in name_lower or name_lower.startswith("sell") or name_lower.endswith("_sell") or "_short" in name_lower or "short_" in name_lower:
             return "bearish"
 
-    payload: dict[str, Any] = signal_value if isinstance(signal_value, dict) else {}
+    payload: dict[str, Any] = _payload_dict(signal_value)
 
     direction = _direction_from_text(payload.get("direction"))
     if direction != "unknown":
@@ -497,10 +515,14 @@ def _extract_price(signal_value: Any, source_type: str | None = None) -> float |
 
     is_options = source_type in _OPTIONS_SOURCE_TYPES
 
-    if isinstance(signal_value, dict):
+    # A text column (or a test double) may hand the payload over as a JSON
+    # string; parse it so those rows are not silently treated as scalars.
+    payload = _payload_dict(signal_value)
+
+    if payload:
         if is_options:
             for key in _SPOT_PRICE_KEYS:
-                spot = signal_value.get(key)
+                spot = payload.get(key)
                 if spot is None:
                     continue
                 try:
@@ -510,7 +532,7 @@ def _extract_price(signal_value: Any, source_type: str | None = None) -> float |
                 if val > 0:
                     return val
             return None
-        price = signal_value.get("price")
+        price = payload.get("price")
         if price is not None:
             try:
                 return float(price)
@@ -532,14 +554,23 @@ def _extract_price(signal_value: Any, source_type: str | None = None) -> float |
 
 def _get_price_near_date(
     engine: Engine, ticker: str, target_date: date,
+    as_of: datetime | None = None,
 ) -> float | None:
-    """Get closing price at or near *target_date*.
+    """Get the closing price at or before *target_date*, as known at *as_of*.
+
+    Point-in-time bounded on both axes: every candidate row has
+    ``obs_date <= target_date`` (no close from after the day we are
+    pricing) and ``pull_timestamp <= as_of`` (no row that landed after the
+    caller's decision instant). *as_of* defaults to now, which is what the
+    outcome scorer wants — the cycle's start time, so a re-run reproduces
+    the same closes.
 
     Checks (in order):
       1. options_daily_signals.spot_price
-      2. raw_series YF close data
-      3. yfinance live fetch (last resort)
+      2. raw_series YF close data (latest vintage pulled by *as_of*)
+      3. yfinance live fetch (last resort, closes <= target_date only)
     """
+    as_of = as_of or datetime.now(timezone.utc)
     with engine.connect() as conn:
         row = conn.execute(text("""
             SELECT spot_price FROM options_daily_signals
@@ -554,12 +585,14 @@ def _get_price_near_date(
         row = conn.execute(text("""
             SELECT value FROM raw_series
             WHERE series_id = :sid AND obs_date <= :d AND obs_date >= :lo
+              AND pull_timestamp <= :as_of
               AND pull_status = 'SUCCESS'
-            ORDER BY obs_date DESC LIMIT 1
+            ORDER BY obs_date DESC, pull_timestamp DESC LIMIT 1
         """), {
             "sid": f"YF:{ticker}:close",
             "d": target_date,
             "lo": target_date - timedelta(days=PRICE_LOOKBACK_DAYS),
+            "as_of": as_of,
         }).fetchone()
         if row:
             return float(row[0])
@@ -630,14 +663,16 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
 
     # One price lookup per (ticker, date) per cycle, and once a ticker has
     # proven unpriceable in this cycle its remaining signals are skipped
-    # without touching the DB or yfinance again.
+    # without touching the DB or yfinance again. Every lookup is bounded
+    # at the cycle's start instant so the whole run prices off one
+    # point-in-time snapshot.
     price_memo: dict[tuple[str, date], float | None] = {}
     dead_tickers: set[str] = set()
 
     def _price(ticker: str, d: date) -> float | None:
         key = (ticker, d)
         if key not in price_memo:
-            price_memo[key] = _get_price_near_date(engine, ticker, d)
+            price_memo[key] = _get_price_near_date(engine, ticker, d, as_of=now)
         return price_memo[key]
 
     with engine.begin() as conn:

@@ -33,6 +33,14 @@ Honesty rules (read before touching any number here)
   enrollment completion. It is a **prior**, labelled as one on every row
   (``p_success_basis``). It is not a forecast and must never be presented
   as one.
+* A name with **no trial phase on file** is returned under ``unranked``
+  with ``no_trial_evidence``. It must never inherit
+  ``DEFAULT_PHASE_BASE_RATE`` and compete on it: doing so ranks the
+  unmeasured above a measured name whose indication multiplier honestly
+  marks it harder, which rewards the absence of evidence. The phase comes
+  from GRID's own scored ``trial_signals`` where that exists and from the
+  raw ct.gov study in ``trial_cache`` otherwise, and every row says which
+  (``trial_phase_source``).
 * The base-rate tables are the weakest link and they say so. They are
   literature priors, not GRID measurements. ``empirical_phase_outcomes()``
   replaces them with GRID's own realized readouts the moment
@@ -119,6 +127,68 @@ INDICATION_LOA_MULTIPLIER: dict[str, float] = {
     "respiratory": 0.95,
 }
 
+# ct.gov names a *disease*, not a therapeutic area. This maps the condition
+# strings that actually appear in ``trial_cache`` onto the areas above.
+# Ordered: the first substring hit wins, so haematologic MALIGNANCIES sit in
+# the oncology block deliberately — leukemia and myeloma carry solid-tumour-like
+# development risk, not the 1.35 of non-malignant haematology (sickle cell,
+# haemophilia), and mapping them to "hematology" would inflate the prior on
+# exactly the names this board ranks. Terms are matched against the
+# underscored key, so multi-word terms are written with underscores.
+INDICATION_TERM_TO_AREA: dict[str, str] = {
+    # oncology (incl. haematologic malignancy)
+    "neoplasm": "oncology", "cancer": "oncology", "carcinoma": "oncology",
+    "tumor": "oncology", "tumour": "oncology", "melanoma": "oncology",
+    "sarcoma": "oncology", "glioma": "oncology", "glioblastoma": "oncology",
+    "lymphoma": "oncology", "leukemia": "oncology", "leukaemia": "oncology",
+    "myeloma": "oncology", "myelodysplastic": "oncology", "mesothelioma": "oncology",
+    "metasta": "oncology",
+    # non-malignant haematology
+    "sickle_cell": "hematology", "hemophilia": "hematology",
+    "haemophilia": "hematology", "thalassemia": "hematology",
+    "thrombocytopenia": "hematology", "von_willebrand": "hematology",
+    "anemia": "hematology", "anaemia": "hematology",
+    # neurology
+    "alzheimer": "neurology", "parkinson": "neurology", "huntington": "neurology",
+    "amyotrophic": "neurology", "multiple_sclerosis": "neurology",
+    "epilep": "neurology", "dementia": "neurology", "migraine": "neurology",
+    "neuropath": "neurology", "muscular_dystrophy": "neurology",
+    "spinal_muscular": "neurology", "stroke": "neurology",
+    # psychiatry
+    "depress": "psychiatry", "schizophren": "psychiatry", "bipolar": "psychiatry",
+    "anxiety": "psychiatry", "post_traumatic": "psychiatry",
+    # cardiovascular
+    "heart_failure": "cardiovascular", "hypertension": "cardiovascular",
+    "cardiomyopathy": "cardiovascular", "atrial_fibrillation": "cardiovascular",
+    "coronary": "cardiovascular", "myocardial": "cardiovascular",
+    "amyloidosis": "cardiovascular",
+    # infectious disease
+    "infection": "infectious_disease", "hiv": "infectious_disease",
+    "hepatitis": "infectious_disease", "influenza": "infectious_disease",
+    "covid": "infectious_disease", "tuberculosis": "infectious_disease",
+    "malaria": "infectious_disease", "viral": "infectious_disease",
+    "bacterial": "infectious_disease", "vaccine": "infectious_disease",
+    # metabolic
+    "diabet": "metabolic", "obesity": "metabolic", "steatohepatitis": "metabolic",
+    "nash": "metabolic", "hyperlipid": "metabolic", "cholesterol": "metabolic",
+    "hypercholesterol": "metabolic",
+    # autoimmune / immunology
+    "lupus": "autoimmune", "psoriasis": "autoimmune", "psoriatic": "autoimmune",
+    "rheumatoid": "autoimmune", "crohn": "autoimmune", "colitis": "autoimmune",
+    "atopic_dermatitis": "autoimmune", "vitiligo": "autoimmune",
+    "myasthenia": "autoimmune", "celiac": "autoimmune",
+    "inflammatory_bowel": "autoimmune", "alopecia": "autoimmune",
+    # ophthalmology
+    "macular": "ophthalmology", "retinit": "ophthalmology",
+    "retinopathy": "ophthalmology", "glaucoma": "ophthalmology",
+    "uveitis": "ophthalmology", "dry_eye": "ophthalmology",
+    "ophthalm": "ophthalmology",
+    # respiratory
+    "asthma": "respiratory", "copd": "respiratory",
+    "chronic_obstructive": "respiratory", "cystic_fibrosis": "respiratory",
+    "pulmonary_fibrosis": "respiratory", "bronchiectasis": "respiratory",
+}
+
 # Evidence modifiers. Each is a multiplicative nudge on the base rate,
 # bounded so that no single input can dominate the prior.
 FDA_DESIGNATION_MULTIPLIER: dict[str, float] = {
@@ -144,6 +214,25 @@ EMPIRICAL_MIN_SAMPLES: int = 30
 
 BASIS_LITERATURE: str = "literature_prior"
 BASIS_EMPIRICAL: str = "grid_realized_outcomes"
+
+# ── Trade shape ───────────────────────────────────────────────────────────
+# EV and edge_vs_market answer different questions and a board that shows
+# only one of them misleads in opposite directions.
+#
+#   expected_value_multiple < 1.0  -> holding the EQUITY is negative EV. The
+#     net-cash floor on a busted biotech is near zero, so a failed readout
+#     takes almost everything; a 25% shot at 1.5x does not pay for that.
+#   edge_vs_market > 0             -> GRID's p_success exceeds the probability
+#     the option chain assigns the same move. Buying that tail with DEFINED
+#     RISK can be positive EV even when the equity is not, because the option
+#     caps the loss at premium while the equity does not.
+#
+# Those are compatible: most rows on a real board are TRADE_SHAPE_OPTION_TAIL.
+# Ranking by EV alone buries them; ranking by edge alone hides that the
+# underlying is a falling knife. Every ranked row now carries both.
+TRADE_SHAPE_EQUITY: str = "equity_or_option"      # EV > 1 and edge > 0
+TRADE_SHAPE_OPTION_TAIL: str = "defined_risk_option_only"  # edge > 0, EV <= 1
+TRADE_SHAPE_NONE: str = "no_trade"                # edge <= 0
 
 # ── Gates ─────────────────────────────────────────────────────────────────
 #
@@ -210,7 +299,16 @@ def normalize_phase(phase: Any) -> str | None:
 
 
 def indication_multiplier(indication: Any) -> float:
-    """Therapeutic-area LOA multiplier; 1.0 for an unknown or missing area."""
+    """Therapeutic-area LOA multiplier; 1.0 for an unknown or missing area.
+
+    Accepts an area name (``trial_signals.primary_indication``) or a plain
+    disease name (a ct.gov condition — "Melanoma", "Sickle Cell Disease"),
+    which ``INDICATION_TERM_TO_AREA`` maps onto an area first. Without that
+    map every registry-sourced name would silently score 1.0, which is the
+    same reward-the-absence-of-evidence failure the phase gate exists to
+    stop: an oncology trial must be marked hard whether GRID or ct.gov
+    named the disease.
+    """
     key = _normalize_key(indication)
     if key is None:
         return 1.0
@@ -220,6 +318,9 @@ def indication_multiplier(indication: Any) -> float:
     for known, mult in INDICATION_LOA_MULTIPLIER.items():
         if known in key:
             return mult
+    for term, area in INDICATION_TERM_TO_AREA.items():
+        if term in key:
+            return INDICATION_LOA_MULTIPLIER.get(area, 1.0)
     return 1.0
 
 
@@ -263,8 +364,11 @@ def success_probability(
     nothing. ``enrollment_pct`` is 0..100.
 
     Every input is optional: with only a phase this returns the bare base
-    rate. With nothing recognisable it returns the default phase rate and
-    says so in ``factors``.
+    rate. With no recognisable phase it returns ``DEFAULT_PHASE_BASE_RATE``
+    with ``p_success_phase = None`` — the caller's signal that the number is
+    a placeholder standing in for absent evidence, not a prior about this
+    name. ``build_catalyst_board`` refuses to rank such a row
+    (``no_trial_evidence``); any new caller must make the same distinction.
     """
     table = base_rates or PHASE_TRANSITION_BASE_RATES
     phase_key = normalize_phase(phase)
@@ -617,11 +721,20 @@ _CATALYST_NAMES_SQL = text(
            ts.trial_strength_score,
            ts.signal_type,
            ts.market_cap_mm,
-           ts.cash_runway_months
+           ts.cash_runway_months,
+           tc.raw_json #> '{protocolSection,designModule,phases}',
+           tc.raw_json #> '{protocolSection,conditionsModule,conditions}'
     FROM catalyst_calendar cc
     LEFT JOIN trial_signals ts
            ON ts.ticker = cc.ticker
           AND ts.created_at <= :as_of_ts
+    -- The registry fallback. ``trial_signals`` only covers names GRID has
+    -- scored; ``trial_cache`` holds the raw ct.gov study for every catalyst
+    -- the ingestor wrote, keyed by the same nct_id the calendar row carries.
+    -- Without this join a name we *have* the phase for reads as phase-unknown.
+    LEFT JOIN trial_cache tc
+           ON tc.nct_id = cc.nct_id
+          AND tc.parsed_at <= :as_of_ts
     WHERE cc.is_active
       AND cc.expected_date >= :as_of
       AND cc.expected_date <= :max_date
@@ -678,6 +791,52 @@ def _norm_ticker(value: Any) -> str | None:
     return out or None
 
 
+PHASE_SOURCE_SIGNAL: str = "trial_signals"
+PHASE_SOURCE_REGISTRY: str = "trial_registry"
+
+
+def _registry_phase(value: Any) -> str | None:
+    """ct.gov ``designModule.phases`` (a JSON array) as one normalisable string.
+
+    ``["PHASE2", "PHASE3"]`` becomes ``"PHASE2/PHASE3"``, which
+    ``normalize_phase`` reads as the earlier (harder) leg. ``["NA"]`` and
+    friends normalise to ``None`` and are therefore treated as no evidence.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            value = [value]
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, Sequence):
+        return None
+    parts = [str(v).strip() for v in value if str(v or "").strip()]
+    return "/".join(parts) or None
+
+
+def _registry_indication(value: Any) -> str | None:
+    """First ct.gov condition — the therapeutic area the LOA multiplier reads."""
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return str(value).strip() or None
+    if isinstance(value, str):
+        return value.strip() or None
+    if not isinstance(value, Sequence):
+        return None
+    for item in value:
+        text_value = str(item or "").strip()
+        if text_value:
+            return text_value
+    return None
+
+
 def _load_catalyst_names(
     engine: Engine, as_of: date, horizon_days: int
 ) -> list[dict[str, Any]]:
@@ -686,6 +845,13 @@ def _load_catalyst_names(
     One row per (ticker, catalyst date), carrying the latest ``trial_signals``
     record known at ``as_of`` — the phase, indication, designation, endpoint
     clarity and enrollment that ``success_probability`` reads.
+
+    Where GRID has not scored the name, the phase and indication fall back to
+    the raw ct.gov study in ``trial_cache`` for the calendar row's own
+    ``nct_id``. Both paths are labelled on the row (``trial_phase_source``,
+    ``primary_indication_source``) so a reader can tell GRID's own scored
+    evidence from registry metadata — and so a name with neither is visibly
+    evidence-free rather than silently scored on a default.
     """
     with engine.connect() as conn:
         rows = conn.execute(
@@ -705,13 +871,29 @@ def _load_catalyst_names(
         expected_date = expected.date() if isinstance(expected, datetime) else expected
         if not isinstance(expected_date, date):
             continue
+        phase = row[3]
+        phase_source: str | None = PHASE_SOURCE_SIGNAL if normalize_phase(phase) else None
+        if phase_source is None:
+            registry_phase = _registry_phase(row[12] if len(row) > 12 else None)
+            if normalize_phase(registry_phase):
+                phase, phase_source = registry_phase, PHASE_SOURCE_REGISTRY
+
+        indication = row[4]
+        indication_source: str | None = PHASE_SOURCE_SIGNAL if indication else None
+        if indication_source is None:
+            registry_indication = _registry_indication(row[13] if len(row) > 13 else None)
+            if registry_indication:
+                indication, indication_source = registry_indication, PHASE_SOURCE_REGISTRY
+
         out.append(
             {
                 "ticker": ticker,
                 "event_type": row[1],
                 "catalyst_date": expected_date,
-                "trial_phase": row[3],
-                "primary_indication": row[4],
+                "trial_phase": phase,
+                "trial_phase_source": phase_source,
+                "primary_indication": indication,
+                "primary_indication_source": indication_source,
                 "fda_designation": row[5],
                 "endpoint_clarity": _finite(row[6]),
                 "enrollment_pct": _finite(row[7]),
@@ -839,6 +1021,27 @@ def _fitted_base_rates(engine: Engine, as_of: date, notes: list[str]) -> tuple[d
     return None, BASIS_LITERATURE
 
 
+def classify_trade_shape(
+    *,
+    expected_value_multiple: float | None,
+    edge_vs_market: float | None,
+) -> str:
+    """Which instrument, if any, the two numbers actually support.
+
+    A negative edge is ``no_trade`` regardless of EV: without an edge over
+    the chain there is nothing to harvest. A positive edge with EV at or
+    below 1.0 is tradable only with defined risk, because the equity leg
+    loses money on these odds.
+    """
+    ev = _finite(expected_value_multiple)
+    edge = _finite(edge_vs_market)
+    if edge is None or edge <= 0.0:
+        return TRADE_SHAPE_NONE
+    if ev is not None and ev > 1.0:
+        return TRADE_SHAPE_EQUITY
+    return TRADE_SHAPE_OPTION_TAIL
+
+
 def build_catalyst_board(
     engine: Engine,
     *,
@@ -846,10 +1049,22 @@ def build_catalyst_board(
     horizon_days: int = DEFAULT_HORIZON_DAYS,
     top_k: int = DEFAULT_TOP_K,
     tail_probability: float = 0.15,
+    rank_by: str = "edge_vs_market",
 ) -> dict[str, Any]:
-    """Rank dated catalysts by expected value, with the evidence attached.
+    """Rank dated catalysts by their edge over the chain, evidence attached.
 
-    Ranked on ``expected_value_multiple`` descending. A name is **ranked**
+    Ranked on ``rank_by`` descending — ``edge_vs_market`` by default, which
+    is the number this module has always said is the interesting one: an EV
+    built from the option chain's own upside anchor is close to
+    self-referential, while ``p_success - market_implied_probability`` is a
+    genuine disagreement with the market. Pass
+    ``rank_by="expected_value_multiple"`` for the previous ordering.
+
+    Every ranked row carries ``trade_shape`` (see ``classify_trade_shape``)
+    so a reader cannot mistake a name whose equity leg is negative EV for
+    one that is outright attractive. ``actionable`` mirrors it as a bool.
+
+    A name is **ranked**
     only when every leg is anchored — P(success), an upside from its own
     option chain, and a net-cash downside. Names missing a leg are returned
     under ``unranked`` with the reason, because "we cannot price this yet"
@@ -892,6 +1107,17 @@ def build_catalyst_board(
             "universe (ingestion/options.py catalyst_options_universe)"
         )
 
+    if catalysts:
+        scored = sum(1 for c in catalysts if c.get("trial_phase_source") == PHASE_SOURCE_SIGNAL)
+        registry = sum(
+            1 for c in catalysts if c.get("trial_phase_source") == PHASE_SOURCE_REGISTRY
+        )
+        notes.append(
+            f"trial phase: {scored} from GRID's own trial_signals, {registry} from the ct.gov "
+            f"registry (trial_cache), {len(catalysts) - scored - registry} with none — the last "
+            "group is unranked (no_trial_evidence), never scored on the default base rate"
+        )
+
     ranked: list[dict[str, Any]] = []
     unranked: list[dict[str, Any]] = []
 
@@ -913,8 +1139,39 @@ def build_catalyst_board(
             continue
         (ranked if row.get("expected_value_multiple") is not None else unranked).append(row)
 
-    ranked.sort(key=lambda r: (-float(r["expected_value_multiple"]), r["ticker"]))
+    for row in ranked:
+        shape = classify_trade_shape(
+            expected_value_multiple=row.get("expected_value_multiple"),
+            edge_vs_market=row.get("edge_vs_market"),
+        )
+        row["trade_shape"] = shape
+        row["actionable"] = shape != TRADE_SHAPE_NONE
+
+    if rank_by not in {"edge_vs_market", "expected_value_multiple"}:
+        notes.append(f"rank_by={rank_by!r} not recognised; ranked on edge_vs_market")
+        rank_by = "edge_vs_market"
+
+    def _key(r: dict[str, Any]) -> tuple[float, str]:
+        v = _finite(r.get(rank_by))
+        # Missing sort key sinks rather than crashes or floats to the top.
+        return (-(v if v is not None else float("-inf")), r["ticker"])
+
+    ranked.sort(key=_key)
     unranked.sort(key=lambda r: r["ticker"])
+
+    actionable_total = sum(1 for r in ranked if r["actionable"])
+    equity_ok = sum(1 for r in ranked if r["trade_shape"] == TRADE_SHAPE_EQUITY)
+    notes.append(
+        f"ranked on {rank_by} descending; {actionable_total}/{len(ranked)} carry a positive "
+        f"edge over the chain, of which {equity_ok} also clear EV > 1.0"
+    )
+    notes.append(
+        "trade_shape: expected_value_multiple <= 1.0 means the EQUITY leg is negative EV — "
+        "the net-cash floor is near zero, so a failed readout takes almost everything. A "
+        "positive edge_vs_market with EV <= 1.0 is tradable only with defined risk "
+        "(the option caps the loss at premium; the equity does not). Never read this board "
+        "as a buy-the-stock list."
+    )
 
     return {
         "as_of": as_of.isoformat(),
@@ -922,8 +1179,11 @@ def build_catalyst_board(
         "horizon_days": int(horizon_days),
         "p_success_basis": basis,
         "catalysts_considered": len(catalysts),
+        "rank_by": rank_by,
         "ranked": ranked[: max(1, int(top_k))],
         "ranked_total": len(ranked),
+        "actionable_total": actionable_total,
+        "equity_grade_total": equity_ok,
         "unranked": unranked,
         "unranked_reasons": _reason_counts(unranked),
         "method_notes": notes,
@@ -957,6 +1217,17 @@ def _score_catalyst(
     days_to_catalyst = (catalyst_date - as_of).days
     profile = profile or {}
     blocking: list[str] = []
+
+    # No phase, no rank. Without a phase ``success_probability`` falls back to
+    # DEFAULT_PHASE_BASE_RATE — a number invented for this name — which ranks
+    # the unmeasured ABOVE a measured one whose indication multiplier honestly
+    # marks it harder (IDYA, Phase 2 melanoma, p 0.247, sat below three names
+    # with no trial evidence at all on 2026-09-11). That is the same failure
+    # the module refuses for the upside anchor: "we cannot price this yet" and
+    # "this is a bad bet" are different answers.
+    phase_key = normalize_phase(entry.get("trial_phase"))
+    if phase_key is None:
+        blocking.append("no_trial_evidence")
 
     prob = success_probability(
         phase=entry.get("trial_phase"),
@@ -1033,9 +1304,11 @@ def _score_catalyst(
         downside_multiple=(down or {}).get("downside_multiple"),
         market_implied_p=market_implied,
     )
-    # The runway gate is a hard gate: a name whose cash does not reach its
-    # own readout is not ranked, however attractive the arithmetic looks.
-    if ev is not None and not runway["runway_covers_catalyst"]:
+    # Hard gates. A name whose cash does not reach its own readout, or whose
+    # trial phase is unknown, is not ranked however attractive the arithmetic
+    # looks — the first is diluted away regardless of the science, the second
+    # has no science on file to price.
+    if ev is not None and (not runway["runway_covers_catalyst"] or phase_key is None):
         ev = None
 
     row: dict[str, Any] = {
@@ -1044,7 +1317,9 @@ def _score_catalyst(
         "catalyst_date": catalyst_date.isoformat(),
         "months_to_catalyst": round(months, 2),
         "trial_phase": entry.get("trial_phase"),
+        "trial_phase_source": entry.get("trial_phase_source"),
         "primary_indication": entry.get("primary_indication"),
+        "primary_indication_source": entry.get("primary_indication_source"),
         "fda_designation": entry.get("fda_designation"),
         "signal_type": entry.get("signal_type"),
         "market_cap_usd": (

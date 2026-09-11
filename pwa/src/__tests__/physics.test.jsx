@@ -70,4 +70,14 @@ describe('Physics dashboard tab async data', () => {
         });
         expect(screen.getByText('Recovered.')).toBeInTheDocument();
     });
+
+    it('shows an error state when the api client resolves an error marker instead of throwing', async () => {
+        api.getPhysicsDashboard.mockResolvedValueOnce({ error: true, status: 503, message: 'physics service unavailable' });
+
+        render(<Physics />);
+        fireEvent.click(screen.getByText('Load Physics Dashboard'));
+
+        expect(await screen.findByText('physics service unavailable')).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
+    });
 });

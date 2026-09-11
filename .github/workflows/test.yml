@@ -21,7 +21,10 @@ jobs:
   backend-tests:
     name: Backend Tests
     runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","alien","tests"]') || 'ubuntu-latest' }}
-    timeout-minutes: 15
+    # alien (Xeon E5-2698 v3) is ~2x slower per core than ubuntu-latest: the
+    # suite takes ~14.5 min there and TestGauntlet::test_run_gauntlet alone
+    # takes ~90 s, so both timeouts need headroom (measured 2026-09-11).
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@v7
@@ -58,7 +61,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          pip install pytest pytest-cov
+          pip install pytest pytest-cov pytest-xdist
 
       - name: Run tests
         env:
@@ -86,8 +89,18 @@ jobs:
             exit "$collection_status"
           fi
 
+          # -n auto: one worker per core (24 on alien, 4 on ubuntu-latest).
+          # --dist loadgroup honours the xdist_group markers tests/conftest.py
+          # assigns: every test that can reach a live PostgreSQL shares one
+          # group and so runs serially on a single worker, and every other test
+          # is grouped by its file so a module's tests stay together and in
+          # order. See the block comment in tests/conftest.py for why.
+          # --durations=25 surfaces the slowest tests so the next round of
+          # tuning has numbers instead of guesses.
           set +e
-          python -m pytest tests/ -v --tb=short --maxfail=50 --timeout=60 > /tmp/grid-pytest-output.txt 2>&1
+          python -m pytest tests/ -v --tb=short --maxfail=50 --timeout=180 \
+            -n auto --dist loadgroup --durations=25 \
+            > /tmp/grid-pytest-output.txt 2>&1
           pytest_status=$?
           set -e
 

@@ -318,7 +318,7 @@ def _run_scoring(pending_rows, prices):
     """Run score_pending_signals against fake rows and a price lookup table."""
     engine = _FakeEngine(pending_rows)
 
-    def fake_price(_engine, ticker, target_date):
+    def fake_price(_engine, ticker, target_date, as_of=None):
         return prices.get((ticker, target_date))
 
     with patch.object(trust_scorer, "_ensure_tables", lambda _e: None), \

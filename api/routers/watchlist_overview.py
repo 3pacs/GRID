@@ -379,7 +379,7 @@ def get_ticker_quote(
     a live fetch when nothing is stored.
 
     Returns: ticker, price, change_pct, put_call_ratio, max_pain, iv_atm,
-    sentiment, source, as_of.
+    sentiment, source, as_of, stale (as_of more than 3 calendar days old).
     """
     from datetime import date
 
@@ -390,21 +390,41 @@ def get_ticker_quote(
 
     price: float | None = None
     change_pct: float | None = None
-    as_of: str | None = None
+    as_of_date: date | None = None
     source = "grid"
     put_call_ratio = max_pain = iv_atm = None
 
     with engine.connect() as conn:
         try:
-            row = conn.execute(text(
-                "SELECT rs.value, rs.obs_date FROM resolved_series rs "
-                "JOIN feature_registry fr ON fr.id = rs.feature_id "
-                "WHERE fr.name = ANY(:names) "
-                "ORDER BY rs.obs_date DESC LIMIT 1"
-            ), {"names": feature_names}).fetchone()
-            if row:
-                price = float(row[0])
-                as_of = str(row[1])
+            # Two most recent closes so change_pct reflects the actual prior
+            # session rather than always coming back null for GRID-sourced
+            # prices (the live-fallback path was the only one that set it).
+            # A puller with a lookback window re-inserts the same obs_date
+            # under a new vintage_date on every run (uq_resolved_series_composite
+            # is (feature_id, obs_date, vintage_date)), so a plain
+            # `ORDER BY obs_date DESC LIMIT 2` can return two vintages of the
+            # SAME day and turn change_pct into a same-day delta (often 0).
+            # Pin to the single feature with the freshest row first, then
+            # collapse to one (latest-vintage) value per calendar day.
+            rows = conn.execute(text(
+                "WITH winner AS ("
+                "  SELECT rs.feature_id FROM resolved_series rs "
+                "  JOIN feature_registry fr ON fr.id = rs.feature_id "
+                "  WHERE fr.name = ANY(:names) "
+                "  ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 1"
+                ") "
+                "SELECT DISTINCT ON (rs.obs_date) rs.value, rs.obs_date "
+                "FROM resolved_series rs "
+                "WHERE rs.feature_id = (SELECT feature_id FROM winner) "
+                "ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 2"
+            ), {"names": feature_names}).fetchall()
+            if rows:
+                price = float(rows[0][0])
+                as_of_date = rows[0][1]
+                if len(rows) > 1 and rows[1][0]:
+                    prev_close = float(rows[1][0])
+                    if prev_close:
+                        change_pct = round((price - prev_close) / prev_close, 5)
         except Exception as exc:
             log.debug("Quote: price query failed for {t}: {e}", t=ticker_upper, e=str(exc))
 
@@ -428,7 +448,8 @@ def get_ticker_quote(
                 change_pct = live.get("pct_1d")
                 source = "live"
                 if price is not None:
-                    _cache_price_to_db(engine, ticker_upper, price, date.today())
+                    as_of_date = date.today()
+                    _cache_price_to_db(engine, ticker_upper, price, as_of_date)
         except Exception as exc:
             log.debug("Quote: live price failed for {t}: {e}", t=ticker_upper, e=str(exc))
 
@@ -443,6 +464,8 @@ def get_ticker_quote(
         score -= 1
     sentiment = "bullish" if score > 0 else "bearish" if score < 0 else "neutral"
 
+    stale = (date.today() - as_of_date).days > 3 if as_of_date is not None else None
+
     return {
         "ticker": ticker_upper,
         "price": price,
@@ -452,7 +475,8 @@ def get_ticker_quote(
         "iv_atm": iv_atm,
         "sentiment": sentiment,
         "source": source,
-        "as_of": as_of,
+        "as_of": str(as_of_date) if as_of_date is not None else None,
+        "stale": stale,
     }
 
 

@@ -130,11 +130,15 @@ def upgrade() -> None:
         WHERE search_vector IS NULL
     """))
 
+    # analytical_snapshots has no title/summary: its text columns are
+    # category / subcategory, with the detail carried in jsonb payload and
+    # metrics. Naming title here made the statement fail outright, and made
+    # the trigger below reject every write to the table.
     op.execute(sa.text("""
         UPDATE analytical_snapshots
         SET search_vector = to_tsvector(
             'english',
-            COALESCE(title, '') || ' ' || COALESCE(summary, '')
+            COALESCE(category, '') || ' ' || COALESCE(subcategory, '')
         )
         WHERE search_vector IS NULL
     """))
@@ -216,7 +220,7 @@ def upgrade() -> None:
         BEGIN
             NEW.search_vector := to_tsvector(
                 'english',
-                COALESCE(NEW.title, '') || ' ' || COALESCE(NEW.summary, '')
+                COALESCE(NEW.category, '') || ' ' || COALESCE(NEW.subcategory, '')
             );
             RETURN NEW;
         END
@@ -259,10 +263,10 @@ def upgrade() -> None:
         FROM discovered_hypotheses WHERE thesis IS NOT NULL
         UNION ALL
         SELECT 'snapshot' AS source_type, id::text,
-               COALESCE(title, '') AS title,
-               COALESCE(summary, '') AS body,
-               to_tsvector('english', COALESCE(title, '') || ' ' || COALESCE(summary, '')) AS tsv
-        FROM analytical_snapshots WHERE summary IS NOT NULL
+               COALESCE(category, '') AS title,
+               COALESCE(subcategory, '') AS body,
+               to_tsvector('english', COALESCE(category, '') || ' ' || COALESCE(subcategory, '')) AS tsv
+        FROM analytical_snapshots WHERE category IS NOT NULL
     """))
 
     op.execute(sa.text("""

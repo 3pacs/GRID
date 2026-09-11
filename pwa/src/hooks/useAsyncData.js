@@ -25,6 +25,11 @@ import { useState, useEffect, useCallback, useRef } from 'react';
  * @param {any[]} options.deps - Extra dependencies to trigger refetch (default: [])
  * @param {boolean} options.skip - Skip the initial fetch (default: false)
  * @returns {{ data: T, loading: boolean, error: Error|null, refetch: () => void, stale: boolean }}
+ *
+ * `api.js` never rejects on network/HTTP/parse failure — it resolves an
+ * `{ error: true, status, message }` marker instead. A resolved marker is
+ * routed through the same `setError` path as a thrown error, so `data` is
+ * never left holding it.
  */
 export function useAsyncData(fetcher, options = {}) {
     const { fallback = null, deps = [], skip = false } = options;
@@ -45,6 +50,11 @@ export function useAsyncData(fetcher, options = {}) {
 
         try {
             const result = await fetcherRef.current();
+            if (result && typeof result === 'object' && result.error === true) {
+                const err = new Error(result.message || 'Request failed');
+                err.status = result.status;
+                throw err;
+            }
             if (mountedRef.current) {
                 setData(result);
                 setStale(false);

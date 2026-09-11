@@ -68,6 +68,7 @@ class Settings(BaseSettings):
     EIA_API_KEY: str = ""
     GDELT_API_KEY: str = ""
     WORLDNEWS_API_KEY: str = ""
+    NEWSAPI_KEY: str = ""                # newsapi.org headline counts (scripts/load_wave2.py)
     OPENSECRETS_API_KEY: str = ""
 
     # Backup data source API keys
@@ -296,6 +297,16 @@ class Settings(BaseSettings):
     LLAMACPP_QUICK_ENABLED: bool = True
     LLAMACPP_QUICK_TIMEOUT_SECONDS: int = 120
     LLAMACPP_QUICK_CHAT_MODEL: str = "qwen3.8-27b"
+
+    # Total wall-clock budget (seconds) for one /chat/compose request's whole
+    # LLM attempt (local card + any paid failover) — api/routers/chat.py's
+    # _resilient_chat. Defaults to 18s, unchanged from the pre-fail-fast
+    # per-candidate timeout, until a healthy-card timing baseline is measured
+    # via ops-exec (scripts/smoke_dad_path.py's `compose:` substeps print
+    # elapsed ms) — lower it once that data exists. Compose logs the elapsed
+    # ms and answering label on every successful call so that measurement can
+    # be taken from production logs. See PR #453.
+    COMPOSE_LLM_BUDGET_S: float = 18.0
 
     # llama.cpp REASON-tier remote server (gridz4 node — Qwen3.8-27B Q4_K_M + mmproj, Tailscale-reachable)
     LLAMACPP_Z4_BASE_URL: str = "http://gridz4:8080"
@@ -608,10 +619,11 @@ class Settings(BaseSettings):
     REDPANDA_BROKER: str = "localhost:19092"
     REDPANDA_ENABLED: bool = True
 
-    # MinIO / S3 blob store
+    # MinIO / S3 blob store. Credentials come from .env (or /etc/agent-hub/minio.env
+    # for the hub) — never defaults; empty keys leave the blob store disabled.
     MINIO_ENDPOINT: str = "localhost:9000"
-    MINIO_ACCESS_KEY: str = "gridminio"
-    MINIO_SECRET_KEY: str = "gridminio2026"
+    MINIO_ACCESS_KEY: str = ""
+    MINIO_SECRET_KEY: str = ""
     MINIO_SECURE: bool = False
     MINIO_REGION: str = "us-east-1"
 

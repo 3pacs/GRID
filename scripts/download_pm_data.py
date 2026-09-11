@@ -62,10 +62,24 @@ def download_and_extract(data_dir: Path) -> None:
                     tar.extractall(path=str(data_dir))
     except ImportError:
         print("zstandard not installed, trying CLI zstd...")
-        subprocess.run(
-            f"zstd -d {archive_path} --stdout | tar -xf - -C {data_dir}",
-            shell=True, check=True,
+        zstd_proc = subprocess.Popen(
+            ["zstd", "-d", str(archive_path), "--stdout"],
+            stdout=subprocess.PIPE,
         )
+        try:
+            tar_result = subprocess.run(
+                ["tar", "-xf", "-", "-C", str(data_dir)],
+                stdin=zstd_proc.stdout,
+                check=False,
+            )
+        finally:
+            if zstd_proc.stdout is not None:
+                zstd_proc.stdout.close()
+            zstd_rc = zstd_proc.wait()
+        if zstd_rc != 0:
+            raise subprocess.CalledProcessError(zstd_rc, ["zstd", "-d", str(archive_path), "--stdout"])
+        if tar_result.returncode != 0:
+            raise subprocess.CalledProcessError(tar_result.returncode, tar_result.args)
 
     # Move nested data/ up if present
     nested = data_dir / "data"

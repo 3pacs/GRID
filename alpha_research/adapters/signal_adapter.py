@@ -171,7 +171,7 @@ def publish_regime_signal(
     # Correct architecture: regime signals should drive POSITION SIZING,
     # STRATEGY SELECTION, and the weighting of OTHER directional signals
     # (per credit_cycle's own signal_families.prefer/avoid output that
-    # oracle currently ignores). See docs/TODO-REGIME-SIGNAL-USAGE.md.
+    # oracle currently ignores).
     #
     # Stopgap: publish all regime signals with Direction.NEUTRAL so they
     # stop being treated as directional bets. Oracle will keep them in the
