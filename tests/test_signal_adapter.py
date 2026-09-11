@@ -414,3 +414,20 @@ def test_publish_all_alpha_signals_skips_empty_prices_and_unknown_regimes(
     assert results == {}
     assert engine.begin_calls == 0
     assert engine.conn.calls == []
+
+
+def test_publish_regime_signal_docstring_has_no_dangling_todo_doc_reference() -> None:
+    """Regression: PUNCH-LIST-2026-05-13 line 117.
+
+    The comment block inside ``publish_regime_signal`` used to point readers
+    at ``docs/TODO-REGIME-SIGNAL-USAGE.md`` for the "correct architecture"
+    follow-up plan, but that doc has never existed in the repo. Drop the
+    dangling reference so future readers do not chase a 404.
+    """
+    import inspect
+
+    source = inspect.getsource(signal_adapter.publish_regime_signal)
+    assert "TODO-REGIME-SIGNAL-USAGE" not in source, (
+        "publish_regime_signal must not reference the missing "
+        "docs/TODO-REGIME-SIGNAL-USAGE.md file"
+    )

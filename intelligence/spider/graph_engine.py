@@ -68,6 +68,19 @@ class GraphEngine:
             if name:
                 self._names[_normalize_name(name)] = actor_id
 
+    def add_alias(self, actor_id: str, name: str) -> None:
+        """Point an extra name at an existing actor without creating a node.
+
+        Used when a SEC filer display name resolves to an actor the graph
+        already holds (``"BlackRock Inc.  (BLK)  (CIK …)"`` -> ``corp_BLK``),
+        so the next sighting of that string resolves by name alone. A no-op
+        when the actor is unknown or the name is already taken.
+        """
+        if not name or actor_id not in self._actors:
+            return
+        with self._lock:
+            self._names.setdefault(_normalize_name(name), actor_id)
+
     def add_connection(
         self, actor_a: str, actor_b: str, meta: ConnectionMeta
     ) -> None:
@@ -105,6 +118,11 @@ class GraphEngine:
     def get_neighbors(self, actor_id: str) -> dict[str, ConnectionMeta]:
         """Return {neighbor_id: ConnectionMeta} for an actor."""
         return dict(self._adj.get(actor_id, {}))
+
+    def iter_actors(self) -> list[tuple[str, dict[str, Any]]]:
+        """Snapshot of (actor_id, actor_data) pairs, safe to iterate."""
+        with self._lock:
+            return list(self._actors.items())
 
     def resolve_name(self, name: str) -> Optional[str]:
         """Look up actor_id by name (case-insensitive)."""

@@ -62,7 +62,8 @@ _CURATED_EDGE_SQL = (
     "WHERE a.category NOT LIKE %s AND b.category NOT LIKE %s "
     "  AND NOT (a.category = ANY(%s)) AND NOT (b.category = ANY(%s)) "
     "  AND a.id NOT LIKE %s AND b.id NOT LIKE %s "
-    "  AND a.name NOT LIKE %s AND b.name NOT LIKE %s"
+    "  AND a.name NOT LIKE %s AND b.name NOT LIKE %s "
+    "  AND a.merged_into IS NULL AND b.merged_into IS NULL"
 )
 
 
@@ -423,6 +424,15 @@ def run_graph_analytics(scope: str = "full") -> dict:
     """
     t_start = time.time()
     table_for_scope(scope)
+
+    if scope == "curated":
+        # _CURATED_EDGE_SQL filters on actors.merged_into (SEC filer names
+        # folded into their ticker / insider actor by fold_actor_aliases).
+        # migration 0061 is the contract; this idempotent DDL keeps the weekly
+        # job self-healing on a tree that has not applied it yet.
+        from intelligence.actor_identity import ensure_merged_into_column
+
+        ensure_merged_into_column()
 
     # Load graph
     G = load_actor_graph(scope=scope)

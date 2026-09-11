@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import { api } from '../api.js';
 import useStore from '../store.js';
 import ConfidenceMeter from '../components/ConfidenceMeter.jsx';
@@ -7,6 +7,9 @@ import { shared, colors } from '../styles/shared.js';
 import ViewHelp from '../components/ViewHelp.jsx';
 import { interpretDriver, getFeatureLabel } from '../utils/interpret.js';
 import { formatDateTime, formatShortDate } from '../utils/formatTime.js';
+import { useAsyncData } from '../hooks/useAsyncData.js';
+import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
+import ErrorState from '../components/ErrorState.jsx';
 
 const stateColors = {
     'GROWTH': '#22C55E', 'NEUTRAL': '#3B82F6', 'FRAGILE': '#F59E0B', 'CRISIS': '#EF4444',
@@ -114,14 +117,12 @@ export default function Regime() {
     const [activeTab, setActiveTab] = useState('action');
     const [activeStrategy, setActiveStrategy] = useState(null);
 
-    useEffect(() => { loadData(); }, []);
-
-    const loadData = async () => {
+    const { data, loading, error, refetch: loadData } = useAsyncData(async () => {
         const [current, all, hist, trans] = await Promise.all([
-            api.getCurrent().catch(() => null),
-            api.getAllActiveRegimes().catch(() => null),
-            api.getHistory(90).catch(() => ({ history: [] })),
-            api.getTransitions().catch(() => ({ transitions: [] })),
+            api.getCurrent(),
+            api.getAllActiveRegimes(),
+            api.getHistory(90),
+            api.getTransitions(),
         ]);
         if (current) {
             setCurrentRegime(current);
@@ -132,7 +133,8 @@ export default function Regime() {
         if (all) setAllRegimes(all);
         setHistory(hist.history || []);
         setTransitions(trans.transitions || []);
-    };
+        return { current, all, hist, trans };
+    }, { fallback: null });
 
     const loadSynthesis = async () => {
         setSynthLoading(true);
@@ -162,6 +164,12 @@ export default function Regime() {
                 </div>
             </div>
 
+            {loading && !data ? (
+                <LoadingSkeleton variant="card" count={4} />
+            ) : error ? (
+                <ErrorState error={error} onRetry={loadData} title="Regime data unavailable" />
+            ) : (
+            <>
             {/* Primary State Banner */}
             <div style={{
                 ...shared.card, padding: '16px 20px',
@@ -604,6 +612,8 @@ export default function Regime() {
                     Regime detection runs daily at 6:00 PM ET after data ingestion.
                     Check System Logs for ingestion status.
                 </div>
+            )}
+            </>
             )}
         </div>
     );

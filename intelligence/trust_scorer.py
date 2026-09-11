@@ -109,6 +109,19 @@ CHOKEPOINT_CROSSING_MIN_DELTA: float = 0.15
 # Minimum price move to count as a signal_typeal outcome
 MOVE_THRESHOLD_PCT: float = 1.0
 
+# Source types whose signal_value describes an option contract, not the
+# underlying. Their payload prices are premiums/strikes and must never be
+# used as an entry price against an underlying close (see _extract_price).
+_OPTIONS_SOURCE_TYPES: frozenset[str] = frozenset({
+    "options_flow",     # unusual_whales UNUSUAL_OPTIONS tapes
+    "whale_options",
+})
+
+# Payload keys that do carry the underlying spot on an options row.
+_SPOT_PRICE_KEYS: tuple[str, ...] = (
+    "spot", "spot_price", "underlying_price", "underlying",
+)
+
 # ── Price lookup guards ────────────────────────────────────────────────────
 # 2026-09-10: the trust cycle was issuing ~11,000 failing yfinance downloads
 # a day. Every PENDING signal past its window with no stored close hit
@@ -203,14 +216,6 @@ def _last_close(frame: Any, target_date: date) -> float | None:
 # every downstream consumer (trust_scorer, lever_pullers) treat every
 # source as untrustworthy.
 #
-# 2026-09-10: the inference below existed but ``score_pending_signals``
-# never called it — the classifier still compared ``signal_type`` to the
-# literals, so every options_flow UNUSUAL_OPTIONS row (223K, direction
-# CALL/PUT in the payload) scored WRONG and the options tapes sat at
-# Bayesian trust 0.001 in lever_pullers. The scorer now routes every row
-# through ``_infer_signal_direction`` and the option vocabulary (CALL/PUT)
-# is part of the payload direction words.
-#
 # Each entry maps a signal_type → directional intent. Types absent from
 # both maps require ``signal_value`` to declare the direction (e.g.
 # UNUSUAL_OPTIONS sets ``"direction"`` in the payload). Anything we still
@@ -232,16 +237,26 @@ _BEARISH_SIGNAL_TYPES: frozenset[str] = frozenset({
     "trade_idea_short",
 })
 
-# ``signal_value["direction"]`` vocabularies across feeds: smart_money /
-# social write BULLISH / BEARISH / NEUTRAL, NET_POSITION_DELTA writes
-# up / down, unusual_whales writes the option side CALL / PUT. A CALL tape
-# expects the underlying to rise over the evaluation window, a PUT tape
-# expects it to fall. NEUTRAL (and anything else) stays unknown.
-_BULLISH_DIRECTION_WORDS: frozenset[str] = frozenset({
+# Payload ``direction`` values, exact match. Options tapes speak in contract
+# type: the unusual_whales puller writes a literal ``"CALL"`` / ``"PUT"``
+# (ingestion/altdata/unusual_whales.py::_emit_whale_signal), so buying calls
+# reads bullish and buying puts reads bearish.
+_BULLISH_DIRECTIONS: frozenset[str] = frozenset({
     "up", "long", "bull", "bullish", "buy", "call", "calls",
 })
-_BEARISH_DIRECTION_WORDS: frozenset[str] = frozenset({
+_BEARISH_DIRECTIONS: frozenset[str] = frozenset({
     "down", "short", "bear", "bearish", "sell", "put", "puts",
+})
+
+# Token sets for compound directions (``CALL_SWEEP``, ``BULLISH_CALL``,
+# ``BEAR_CALL_SPREAD``). Explicit sentiment outranks contract type — a
+# bear call spread is bearish even though it is built out of calls — so
+# these are checked before the call/put fallback.
+_BULLISH_SENTIMENT_TOKENS: frozenset[str] = frozenset({
+    "up", "long", "bull", "bullish", "buy", "buys", "bought",
+})
+_BEARISH_SENTIMENT_TOKENS: frozenset[str] = frozenset({
+    "down", "short", "bear", "bearish", "sell", "sells", "sold",
 })
 
 
@@ -263,6 +278,35 @@ def _payload_dict(signal_value: Any) -> dict[str, Any]:
     return {}
 
 
+def _direction_from_text(raw: Any) -> str:
+    """Classify a free-form direction string into bullish / bearish / unknown.
+
+    Parameters:
+        raw: Payload ``direction`` value; coerced to ``str``.
+
+    Returns:
+        ``"bullish"``, ``"bearish"`` or ``"unknown"``.
+    """
+    text_l = str(raw or "").strip().lower()
+    if not text_l:
+        return "unknown"
+    if text_l in _BULLISH_DIRECTIONS:
+        return "bullish"
+    if text_l in _BEARISH_DIRECTIONS:
+        return "bearish"
+
+    tokens = {tok for tok in re.split(r"[^a-z0-9]+", text_l) if tok}
+    if tokens & _BULLISH_SENTIMENT_TOKENS:
+        return "bullish"
+    if tokens & _BEARISH_SENTIMENT_TOKENS:
+        return "bearish"
+    if tokens & {"call", "calls"}:
+        return "bullish"
+    if tokens & {"put", "puts"}:
+        return "bearish"
+    return "unknown"
+
+
 def _infer_signal_direction(
     signal_type: str | None,
     signal_value: Any,
@@ -273,9 +317,9 @@ def _infer_signal_direction(
       1. Explicit name match (``_BULLISH_SIGNAL_TYPES`` / ``_BEARISH_SIGNAL_TYPES``)
       2. Substring fallback on the type name (handles future additions
          like ``cluster_long`` / ``short_squeeze_alert`` without code change)
-      3. ``signal_value["direction"]`` — used by NET_POSITION_DELTA
-         (up/down), HEAT_SPIKE (BULLISH/BEARISH), UNUSUAL_OPTIONS
-         (CALL/PUT), etc.
+      3. ``signal_value["direction"]`` — used by NET_POSITION_DELTA,
+         HEAT_SPIKE, UNUSUAL_OPTIONS, etc. Options tapes declare a contract
+         type (``CALL`` / ``PUT``); see ``_direction_from_text``.
       4. Transaction text on house_trading / senate_trading rows.
       5. ``unknown`` — caller must leave the row PENDING rather than
          force a WRONG.
@@ -296,19 +340,11 @@ def _infer_signal_direction(
         if "bearish" in name_lower or name_lower.startswith("sell") or name_lower.endswith("_sell") or "_short" in name_lower or "short_" in name_lower:
             return "bearish"
 
-    payload = _payload_dict(signal_value)
+    payload: dict[str, Any] = _payload_dict(signal_value)
 
-    # Token match so compound labels (CALL_SWEEP, BULLISH_CALL, PUT_SWEEP)
-    # classify too; a label naming both sides (PUT_CALL_RATIO) is no bet.
-    direction = str(payload.get("direction", "") or "").strip().lower()
-    if direction:
-        tokens = set(re.split(r"[^a-z0-9]+", direction)) - {""}
-        bull = bool(tokens & _BULLISH_DIRECTION_WORDS)
-        bear = bool(tokens & _BEARISH_DIRECTION_WORDS)
-        if bull and not bear:
-            return "bullish"
-        if bear and not bull:
-            return "bearish"
+    direction = _direction_from_text(payload.get("direction"))
+    if direction != "unknown":
+        return direction
 
     # Congressional trading: direction is on the Transaction text.
     if signal_type in ("house_trading", "senate_trading"):
@@ -449,67 +485,69 @@ def _ensure_tables(engine: Engine) -> None:
 
 # ── Value Extraction ──────────────────────────────────────────────────────
 
-def _extract_price(signal_value: Any) -> float | None:
-    """Extract a numeric price from signal_value which may be a scalar or JSONB dict.
+def _extract_price(signal_value: Any, source_type: str | None = None) -> float | None:
+    """Extract a numeric entry price from signal_value (scalar or JSONB dict).
 
     Handles:
       - None / falsy -> None
       - float / int  -> float
       - dict with 'price' key -> float(price)
       - str -> attempt float()
+
+    Options rows are the exception. For ``source_type`` in
+    ``_OPTIONS_SOURCE_TYPES`` a bare ``price`` is the option premium (or the
+    strike), never the underlying spot, so scoring it against a later
+    *underlying* close compares two different instruments and produces
+    nonsense returns. Only an explicitly-marked spot key is accepted; anything
+    else returns ``None`` so the caller falls through to
+    ``_get_price_near_date``, which prices the underlying.
+
+    Parameters:
+        signal_value: Raw ``signal_sources.signal_value`` (JSONB or scalar).
+        source_type: Owning ``signal_sources.source_type``, used to apply the
+            options guard. ``None`` keeps the pre-existing behaviour.
+
+    Returns:
+        Positive entry price, or ``None`` if the caller should look one up.
     """
     if signal_value is None:
         return None
-    if isinstance(signal_value, dict):
-        price = signal_value.get("price")
+
+    is_options = source_type in _OPTIONS_SOURCE_TYPES
+
+    # A text column (or a test double) may hand the payload over as a JSON
+    # string; parse it so those rows are not silently treated as scalars.
+    payload = _payload_dict(signal_value)
+
+    if payload:
+        if is_options:
+            for key in _SPOT_PRICE_KEYS:
+                spot = payload.get(key)
+                if spot is None:
+                    continue
+                try:
+                    val = float(spot)
+                except (TypeError, ValueError):
+                    continue
+                if val > 0:
+                    return val
+            return None
+        price = payload.get("price")
         if price is not None:
             try:
                 return float(price)
             except (TypeError, ValueError):
                 return None
         return None
+
+    if is_options:
+        # A bare scalar on an options row is the notional premium.
+        return None
     try:
         val = float(signal_value)
         return val if val > 0 else None
     except (TypeError, ValueError):
         return None
-
-
-#: Payload keys that carry the underlying's spot at signal time.
-_SPOT_PRICE_KEYS: tuple[str, ...] = ("spot", "spot_price", "underlying_price")
-
-#: Sources whose payload ``price`` (when present) is an option premium or a
-#: strike, never the underlying — those rows price off the PIT close.
-_OPTION_SOURCE_TYPES: frozenset[str] = frozenset({"options_flow", "whale_options"})
-
-
-def _extract_entry_price(source_type: str | None, signal_value: Any) -> float | None:
-    """Entry price for the outcome return, or ``None`` to use the PIT close.
-
-    ``register_signal`` writers store the close as a bare number and the
-    payload writers may carry the underlying under a spot key; both are
-    honoured. On an options row (``options_flow`` / ``whale_options``) a
-    ``price`` key is the premium or the strike, so it is ignored and the
-    underlying comes from ``_get_price_near_date``. Non-positive values are
-    treated as missing so the caller falls back to the lookup.
-    """
-    payload = _payload_dict(signal_value)
-    if not payload:
-        return _extract_price(signal_value)
-    for key in _SPOT_PRICE_KEYS:
-        value = payload.get(key)
-        if value is None:
-            continue
-        try:
-            spot = float(value)
-        except (TypeError, ValueError):
-            continue
-        if spot > 0:
-            return spot
-    if (source_type or "") in _OPTION_SOURCE_TYPES:
-        return None
-    price = _extract_price(payload)
-    return price if price is not None and price > 0 else None
 
 
 # ── Price Helpers ──────────────────────────────────────────────────────────
@@ -599,17 +637,17 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
     """Evaluate pending signals against actual price moves.
 
     For each pending signal whose evaluation window has elapsed:
-      - Infer the call's direction with ``_infer_signal_direction``:
-        BUY/SELL names, bullish/bearish type names, or the payload's
-        ``direction`` (CALL/PUT on UNUSUAL_OPTIONS, BULLISH/BEARISH on
-        HEAT_SPIKE, up/down on NET_POSITION_DELTA). A row with no
-        inferable direction stays PENDING — it is never forced WRONG.
-      - Fetch the point-in-time close at signal_date and at the end of the
-        source's ``EVALUATION_WINDOWS`` window (options_flow / scanner: 7 d).
-      - bullish + price up   > MOVE_THRESHOLD_PCT -> CORRECT
-      - bearish + price down > MOVE_THRESHOLD_PCT -> CORRECT
+      - Infer the signal's direction via ``_infer_signal_direction``.
+      - Fetch actual price change from signal_date to now.
+      - bullish + price up   >MOVE_THRESHOLD_PCT -> CORRECT
+      - bearish + price down >MOVE_THRESHOLD_PCT -> CORRECT
       - Otherwise -> WRONG
+      - Direction unknown -> left PENDING (never forced to WRONG)
       - Signals too old (>90 days pending) -> EXPIRED
+
+    Entry price comes from the payload only when it refers to the scored
+    instrument; options rows fall through to the underlying's close
+    (see ``_extract_price``).
 
     Returns summary dict with counts.
     """
@@ -673,8 +711,9 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
                 summary["expired"] += 1
                 continue
 
-            # Direction first, before any price lookup: a row we cannot
-            # classify stays PENDING and must not spend a yfinance call.
+            # Direction first: an unclassifiable row must stay PENDING rather
+            # than be forced to WRONG, and resolving it before the price
+            # lookups keeps unscoreable rows off the yfinance fallback.
             direction = _infer_signal_direction(signal_type, signal_value)
             if direction == "unknown":
                 summary["skipped_unknown_direction"] += 1
@@ -687,9 +726,8 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
                 summary["skipped_no_price"] += 1
                 continue
 
-            # Entry: the stored close / spot when the writer kept one, else
-            # the PIT close at signal_date (always, for options rows).
-            entry_price = _extract_entry_price(src_type, signal_value)
+            # Get price at signal time if not stored
+            entry_price = _extract_price(signal_value, source_type=src_type)
             if entry_price is None:
                 entry_price = _price(ticker, signal_dt)
             if entry_price is None or entry_price <= 0:
@@ -712,15 +750,19 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
             # Compute return
             pct_change = (current_price - entry_price) / entry_price * 100.0
 
-            # Classify against the call's own direction: a CALL tape or a
-            # BULLISH heat spike is right when the underlying rose, a PUT
-            # tape or a BEARISH spike when it fell. Anything inside the
-            # threshold band is a miss for either side.
-            if direction == "bullish":
-                outcome = "CORRECT" if pct_change > MOVE_THRESHOLD_PCT else "WRONG"
+            # Classify against the inferred direction, not the literal
+            # signal_type. Matching on "BUY"/"SELL" alone forced every
+            # richer type (UNUSUAL_OPTIONS, insider_buy, HEAT_SPIKE, …)
+            # to WRONG no matter what the price did.
+            if direction == "bullish" and pct_change > MOVE_THRESHOLD_PCT:
+                outcome = "CORRECT"
+                summary["correct"] += 1
+            elif direction == "bearish" and pct_change < -MOVE_THRESHOLD_PCT:
+                outcome = "CORRECT"
+                summary["correct"] += 1
             else:
-                outcome = "CORRECT" if pct_change < -MOVE_THRESHOLD_PCT else "WRONG"
-            summary["correct" if outcome == "CORRECT" else "wrong"] += 1
+                outcome = "WRONG"
+                summary["wrong"] += 1
 
             conn.execute(text("""
                 UPDATE signal_sources
@@ -739,13 +781,114 @@ def score_pending_signals(engine: Engine) -> dict[str, Any]:
     log.info(
         "Signal scoring complete: {s} scored ({c} correct, {w} wrong, {e} expired), "
         "{sk} skipped (no price), {su} skipped (unpriceable ticker), "
-        "{ud} skipped (no direction), {dead} tickers dead this cycle",
+        "{sd} left PENDING (direction unknown), {dead} tickers dead this cycle",
         s=summary["scored"], c=summary["correct"], w=summary["wrong"],
         e=summary["expired"], sk=summary["skipped_no_price"],
-        su=summary["skipped_unpriceable"], ud=summary["skipped_unknown_direction"],
-        dead=len(dead_tickers),
+        su=summary["skipped_unpriceable"],
+        sd=summary["skipped_unknown_direction"], dead=len(dead_tickers),
     )
     return summary
+
+
+# ── 1b. Rescore an already-scored source type ─────────────────────────────
+
+def rescore_source_type(
+    engine: Engine,
+    source_type: str,
+    since_days: int = 120,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Reset and re-score every row of *source_type* inside a recent window.
+
+    Outcomes written under a broken classifier stay wrong forever: rows leave
+    PENDING once and are never revisited. After fixing the classifier this
+    resets ``outcome`` for the affected rows so the next scoring pass can
+    judge them again.
+
+    Only recent rows can be rescued: ``score_pending_signals`` EXPIREs
+    anything older than 90 days, so rows beyond that in the window will come
+    back EXPIRED rather than scored. The default 120-day window is
+    deliberately wider than 90 so the expiry is explicit in the result rather
+    than silently excluded.
+
+    Parameters:
+        engine: SQLAlchemy engine.
+        source_type: ``signal_sources.source_type`` to rescore (exact match).
+        since_days: Look back this many days from today over ``signal_date``.
+        dry_run: When True (default) only report what would be reset; no
+            writes and no scoring pass.
+
+    Returns:
+        Dict with ``source_type``, ``since_days``, ``dry_run``, ``eligible``
+        (rows in window), ``reset`` (rows returned to PENDING), and, for a
+        live run, ``scored`` / ``correct`` / ``wrong`` / ``expired`` /
+        ``pending`` counts for this source type after the pass.
+    """
+    _ensure_tables(engine)
+
+    result: dict[str, Any] = {
+        "source_type": source_type,
+        "since_days": since_days,
+        "dry_run": dry_run,
+        "eligible": 0,
+        "reset": 0,
+    }
+
+    with engine.begin() as conn:
+        eligible = conn.execute(text("""
+            SELECT count(*) FROM signal_sources
+            WHERE source_type = :st
+              AND signal_date >= (CURRENT_DATE - make_interval(days => :days))
+        """), {"st": source_type, "days": since_days}).scalar_one()
+        result["eligible"] = int(eligible or 0)
+
+        if dry_run:
+            log.info(
+                "rescore_source_type DRY RUN: {n} {st} rows in the last {d}d "
+                "would be reset to PENDING",
+                n=result["eligible"], st=source_type, d=since_days,
+            )
+            return result
+
+        reset = conn.execute(text("""
+            UPDATE signal_sources
+            SET outcome = 'PENDING',
+                outcome_return = NULL,
+                scored_at = NULL
+            WHERE source_type = :st
+              AND signal_date >= (CURRENT_DATE - make_interval(days => :days))
+        """), {"st": source_type, "days": since_days}).rowcount
+        result["reset"] = int(reset or 0)
+
+    log.info(
+        "rescore_source_type: reset {n} {st} rows, re-scoring",
+        n=result["reset"], st=source_type,
+    )
+    result["pass_summary"] = score_pending_signals(engine)
+
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT coalesce(outcome, 'PENDING') AS outcome, count(*)
+            FROM signal_sources
+            WHERE source_type = :st
+              AND signal_date >= (CURRENT_DATE - make_interval(days => :days))
+            GROUP BY 1
+        """), {"st": source_type, "days": since_days}).fetchall()
+
+    by_outcome = {str(o).lower(): int(c) for o, c in rows}
+    result["correct"] = by_outcome.get("correct", 0)
+    result["wrong"] = by_outcome.get("wrong", 0)
+    result["expired"] = by_outcome.get("expired", 0)
+    result["pending"] = by_outcome.get("pending", 0)
+    result["scored"] = result["correct"] + result["wrong"]
+
+    log.info(
+        "rescore_source_type {st}: {s} scored ({c} correct, {w} wrong), "
+        "{e} expired, {p} still pending",
+        st=source_type, s=result["scored"], c=result["correct"],
+        w=result["wrong"], e=result["expired"], p=result["pending"],
+    )
+    return result
 
 
 # ── 2. Update Trust Scores ────────────────────────────────────────────────

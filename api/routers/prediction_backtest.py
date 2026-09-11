@@ -109,11 +109,23 @@ def dataset_stats(engine=Depends(get_db_engine)):
     """Get prediction market dataset statistics."""
     from sqlalchemy import text
 
+    # Static, allowlisted per-table count queries. Never build SQL by
+    # interpolating a table name into an f-string — see
+    # .claude/rules/security.md.
+    _COUNT_QUERIES = {
+        "prediction_market_markets": text(
+            "SELECT COUNT(*) FROM prediction_market_markets"
+        ),
+        "prediction_market_trades": text(
+            "SELECT COUNT(*) FROM prediction_market_trades"
+        ),
+    }
+
     stats = {}
     with engine.connect() as conn:
-        for table in ["prediction_market_markets", "prediction_market_trades"]:
+        for table, query in _COUNT_QUERIES.items():
             try:
-                row = conn.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar()
+                row = conn.execute(query).scalar()
                 stats[table] = row
             except Exception:
                 stats[table] = 0

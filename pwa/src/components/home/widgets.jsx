@@ -3,6 +3,7 @@ import { api } from '../../api.js';
 import { colors } from '../../styles/shared.js';
 import { AnswerView } from './answerFormat.jsx';
 import { tickerLabel, tickerName, plainSentiment, plainRegime, warmError } from './plain.js';
+import { formatRelative } from '../../utils/formatTime.js';
 
 const SANS = "'IBM Plex Sans', -apple-system, sans-serif";
 const MONO = "'IBM Plex Mono', monospace";
@@ -75,14 +76,16 @@ function MoodBadge({ raw }) {
 // ── Verdict ────────────────────────────────────────────────────────────
 
 function VerdictCard({ title, props }) {
-    const question = props?.question || title || '';
+    // `title` is the card's label, not a question — a blank/missing props.question
+    // means there is nothing to ask, never a fallback to stream the title itself.
+    const question = (props?.question || '').trim();
     const [text, setText] = useState('');
-    const [status, setStatus] = useState('loading'); // loading | streaming | done | error
+    const [status, setStatus] = useState(question ? 'loading' : 'idle'); // idle | loading | streaming | done | error
     const [n, setN] = useState(0);
     const retry = useCallback(() => setN((x) => x + 1), []);
 
     useEffect(() => {
-        if (!question) { setStatus('done'); return undefined; }
+        if (!question) { setStatus('idle'); return undefined; }
         const controller = new AbortController();
         setText(''); setStatus('loading');
         api.askStream(question, {
@@ -97,6 +100,7 @@ function VerdictCard({ title, props }) {
 
     return (
         <Shell title={title || 'Your read'} accent>
+            {status === 'idle' && <Empty msg="Ask a question to get a read on it." />}
             {status === 'loading' && (
                 <div style={CS.thinking}>
                     <span style={CS.thinkDots}><i style={CS.dot} /><i style={{ ...CS.dot, animationDelay: '.2s' }} /><i style={{ ...CS.dot, animationDelay: '.4s' }} /></span>
@@ -187,10 +191,32 @@ function WatchlistCard({ title }) {
 
 // ── Macro regime ───────────────────────────────────────────────────────
 
+// Past this many days the regime's inputs are old enough that the card must
+// name the date it is really describing. Mirrors _REGIME_DATA_STALE_AFTER_DAYS
+// in api/routers/chat.py and MAX_FRESH_DATA_AGE_DAYS in scripts/auto_regime.py.
+const REGIME_DATA_STALE_AFTER_DAYS = 5;
+
+/** "Sep 10, 2026" from an ISO date, or null if it isn't one. */
+function plainDate(iso) {
+    if (typeof iso !== 'string' || !/^\d{4}-\d{2}-\d{2}/.test(iso)) return null;
+    const [y, m, d] = iso.slice(0, 10).split('-').map(Number);
+    const date = new Date(Date.UTC(y, m - 1, d));
+    if (Number.isNaN(date.getTime())) return null;
+    return date.toLocaleDateString(undefined, {
+        month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC',
+    });
+}
+
 function MacroRegimeCard({ title }) {
     const { loading, error, data, reload } = useFetch(() => api.getCurrent(), []);
-    const regime = data?.regime;
+    // /api/v1/regime/current calls it `state`; `regime` is the older shape.
+    const regime = data?.regime ?? data?.state;
     const r = regime ? plainRegime(regime) : null;
+    // The reading's own date is always "today" on a scheduled run. data_as_of is
+    // the day its inputs are actually from — the only one worth showing him.
+    const dataAge = data?.data_staleness_days;
+    const dataDate = plainDate(data?.data_as_of);
+    const stale = typeof dataAge === 'number' && dataAge > REGIME_DATA_STALE_AFTER_DAYS;
     return (
         <Shell title={title || 'The market right now'}>
             {loading && <Loading />}
@@ -201,6 +227,13 @@ function MacroRegimeCard({ title }) {
                         <div style={{ ...CS.regime, background: toneBg(r.tone), color: toneColor(r.tone) }}>
                             {r.sentence}
                         </div>
+                        {stale && (
+                            <div style={CS.dim}>
+                                {dataDate
+                                    ? `This is the market as of ${dataDate} — ${dataAge} days ago, not today.`
+                                    : `This read is ${dataAge} days old — not today’s market.`}
+                            </div>
+                        )}
                     </div>
                 )
                 : <Empty msg="The market read isn’t ready yet — check back shortly." />)}
@@ -232,33 +265,45 @@ function NewsCard({ title }) {
 
 function MoneyFlowCard({ title }) {
     const { loading, error, data, reload } = useFetch(() => api.getSectorFlows(), []);
-    const sectors = data?.sectors || [];
-    const ranked = [...sectors]
+    const sectors = data?.sectors || {};
+    const sectorEntries = Object.entries(sectors);
+    const warming = Boolean(data?.unavailable) || (sectorEntries.length === 0 && Boolean(data?.stale));
+    const ranked = sectorEntries
+        .map(([key, s]) => ({ ...s, name: s?.name || s?.sector || key }))
         .filter((s) => typeof s?.sector_stress === 'number')
         .sort((a, b) => Math.abs(b.sector_stress) - Math.abs(a.sector_stress))
         .slice(0, 6);
+    // `snapshot_age_s` only appears when the payload was seeded from a
+    // persisted snapshot on cold start (api/routers/flows.py) — a real
+    // signal this data may be old, so say how old using `computed_at`
+    // rather than showing it as if it were live.
+    const ageLabel = typeof data?.snapshot_age_s === 'number' && data?.computed_at
+        ? formatRelative(data.computed_at)
+        : null;
     return (
         <Shell title={title || 'Where attention is going'}>
             {loading && <Loading />}
             {error && <ErrorState msg={warmError()} onRetry={reload} />}
-            {data && (ranked.length === 0
-                ? <Empty msg="Nothing notable moving right now." />
-                : (
-                    <div style={CS.col}>
-                        {ranked.map((s, i) => {
-                            const name = s.name || s.sector || s.etf || `Group ${i + 1}`;
-                            const inflow = s.sector_stress >= 0;
-                            return (
-                                <div key={i} style={CS.flowRow}>
-                                    <span style={CS.flowName}>{String(name).replace(/_/g, ' ')}</span>
-                                    <span style={{ ...CS.flowWord, color: inflow ? colors.green : colors.red }}>
-                                        {inflow ? '▲ money coming in' : '▼ money pulling out'}
-                                    </span>
-                                </div>
-                            );
-                        })}
-                    </div>
-                ))}
+            {data && (warming
+                ? <Empty msg="Money-flow data is still warming up. Try again in a minute." />
+                : (ranked.length === 0
+                    ? <Empty msg="Nothing notable moving right now." />
+                    : (
+                        <div style={CS.col}>
+                            {ageLabel && <div style={CS.dim}>Data as of {ageLabel}</div>}
+                            {ranked.map((s, i) => {
+                                const inflow = s.sector_stress >= 0;
+                                return (
+                                    <div key={i} style={CS.flowRow}>
+                                        <span style={CS.flowName}>{String(s.name).replace(/_/g, ' ')}</span>
+                                        <span style={{ ...CS.flowWord, color: inflow ? colors.green : colors.red }}>
+                                            {inflow ? '▲ money coming in' : '▼ money pulling out'}
+                                        </span>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    )))}
         </Shell>
     );
 }

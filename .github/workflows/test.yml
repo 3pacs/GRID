@@ -6,29 +6,25 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   PYTHON_VERSION: "3.11"
   NODE_VERSION: "20"
+  # Non-empty -> target the alien self-hosted runner; empty/unset -> ubuntu-latest.
+  # Set via Settings > Secrets and variables > Actions > Variables > TEST_RUNNER.
+  ON_ALIEN: ${{ vars.TEST_RUNNER != '' }}
 
 jobs:
   backend-tests:
     name: Backend Tests
-    runs-on: ubuntu-latest
-
-    services:
-      postgres:
-        image: postgres:15
-        env:
-          POSTGRES_USER: grid
-          POSTGRES_PASSWORD: testpass
-          POSTGRES_DB: griddb_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","alien","tests"]') || 'ubuntu-latest' }}
+    # alien (Xeon E5-2698 v3) is ~2x slower per core than ubuntu-latest: the
+    # suite takes ~14.5 min there and TestGauntlet::test_run_gauntlet alone
+    # takes ~90 s, so both timeouts need headroom (measured 2026-09-11).
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@v7
@@ -39,10 +35,33 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
+      # ubuntu-latest is a fresh VM every run, so bring up an ephemeral
+      # Postgres container. alien keeps a persistent PostgreSQL 15 +
+      # TimescaleDB service (see docs/SERVER-SERVICES.md, "Alien Runner")
+      # that the next step resets instead of pulling+starting a container.
+      - name: Start ephemeral Postgres (hosted runner)
+        if: env.ON_ALIEN != 'true'
+        run: |
+          docker run -d --name grid-test-pg \
+            -e POSTGRES_USER=grid -e POSTGRES_PASSWORD=testpass -e POSTGRES_DB=griddb_test \
+            -p 5432:5432 postgres:15
+          for i in $(seq 1 30); do
+            docker exec grid-test-pg pg_isready -U grid > /dev/null 2>&1 && break
+            sleep 1
+          done
+
+      - name: Reset persistent Postgres (alien)
+        if: env.ON_ALIEN == 'true'
+        env:
+          PGPASSWORD: testpass
+        run: |
+          psql -h localhost -U grid -d griddb_test -c \
+            'DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;'
+
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          pip install pytest pytest-cov
+          pip install pytest pytest-cov pytest-xdist
 
       - name: Run tests
         env:
@@ -70,8 +89,18 @@ jobs:
             exit "$collection_status"
           fi
 
+          # -n auto: one worker per core (24 on alien, 4 on ubuntu-latest).
+          # --dist loadgroup honours the xdist_group markers tests/conftest.py
+          # assigns: every test that can reach a live PostgreSQL shares one
+          # group and so runs serially on a single worker, and every other test
+          # is grouped by its file so a module's tests stay together and in
+          # order. See the block comment in tests/conftest.py for why.
+          # --durations=25 surfaces the slowest tests so the next round of
+          # tuning has numbers instead of guesses.
           set +e
-          python -m pytest tests/ -v --tb=short --maxfail=50 --timeout=60 > /tmp/grid-pytest-output.txt 2>&1
+          python -m pytest tests/ -v --tb=short --maxfail=50 --timeout=180 \
+            -n auto --dist loadgroup --durations=25 \
+            > /tmp/grid-pytest-output.txt 2>&1
           pytest_status=$?
           set -e
 
@@ -92,9 +121,14 @@ jobs:
             echo "No SQL injection patterns detected"
           fi
 
+      - name: Stop ephemeral Postgres (hosted runner)
+        if: always() && env.ON_ALIEN != 'true'
+        run: docker rm -f grid-test-pg 2>/dev/null || true
+
   frontend-build:
     name: Frontend Build
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","alien","tests"]') || 'ubuntu-latest' }}
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v7
@@ -134,7 +168,8 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","alien","tests"]') || 'ubuntu-latest' }}
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v7
@@ -143,6 +178,7 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
 
       - name: Install linters
         run: pip install ruff bandit

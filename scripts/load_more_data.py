@@ -1,7 +1,6 @@
 import yfinance as yf
 import psycopg2
 import requests
-import os
 from config import settings
 from loguru import logger as log
 
@@ -118,8 +117,8 @@ for name, (ticker, family, desc) in FEATURES.items():
     except Exception as e:
         log.error("  {} ({}): ERROR {}", name, ticker, e)
 
-# Additional FRED series
-FRED_KEY = os.environ.get('FRED_API_KEY', 'bc8b4507787daf394e42f07b97d6c0fc')
+# Additional FRED series (key from the environment via config.py, never a literal)
+FRED_KEY = settings.FRED_API_KEY
 FRED_NEW = {
     'ice_bofa_move': ('BAMLC0A4CBBB', 'vol', 'ICE BofA BBB Corporate Spread'),
     'ted_spread': ('TEDRATE', 'credit', 'TED Spread'),
@@ -137,6 +136,10 @@ FRED_NEW = {
     'leading_index': ('USSLIND', 'macro', 'Leading Economic Index'),
     'loan_growth': ('TOTLL', 'credit', 'Total Loans and Leases'),
 }
+
+if not FRED_KEY:
+    log.warning("FRED_API_KEY not set -- skipping additional FRED series")
+    FRED_NEW = {}
 
 for name, (series, family, desc) in FRED_NEW.items():
     cur.execute(

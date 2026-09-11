@@ -22,12 +22,20 @@ class MinioReportObjectStore:
         from config import settings
         from minio import Minio
 
-        endpoint = os.getenv("MINIO_ENDPOINT", getattr(settings, "MINIO_ENDPOINT", "localhost:9000"))
-        access_key = os.getenv("MINIO_ACCESS_KEY", getattr(settings, "MINIO_ACCESS_KEY", "gridminio"))
-        secret_key = os.getenv("MINIO_SECRET_KEY", getattr(settings, "MINIO_SECRET_KEY", "gridminio2026"))
-        secure_raw = os.getenv("MINIO_SECURE", str(getattr(settings, "MINIO_SECURE", False)))
+        # Process env (systemd EnvironmentFile=/etc/agent-hub/minio.env) wins over
+        # config.py; neither carries a built-in credential.
+        endpoint = os.getenv("MINIO_ENDPOINT") or settings.MINIO_ENDPOINT
+        access_key = os.getenv("MINIO_ACCESS_KEY") or settings.MINIO_ACCESS_KEY
+        secret_key = os.getenv("MINIO_SECRET_KEY") or settings.MINIO_SECRET_KEY
+        secure_raw = os.getenv("MINIO_SECURE", str(settings.MINIO_SECURE))
         secure = secure_raw.lower() in {"1", "true", "yes", "on"}
-        region = os.getenv("MINIO_REGION", getattr(settings, "MINIO_REGION", "us-east-1"))
+        region = os.getenv("MINIO_REGION") or settings.MINIO_REGION
+
+        if not access_key or not secret_key:
+            log.warning(
+                "MINIO_ACCESS_KEY / MINIO_SECRET_KEY not set -- agent_hub object store "
+                "writes will fail until /etc/agent-hub/minio.env provides them"
+            )
 
         self._client = Minio(
             endpoint,

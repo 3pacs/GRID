@@ -184,6 +184,8 @@ _SEC_NAME_TO_TICKER: dict[str, str] = {}      # raw lower-cased SEC title -> tic
 _SEC_NORM_TO_TICKER: dict[str, str] = {}      # normalised SEC title -> ticker
 _SEC_TICKERS: set[str] = set()
 _SEC_TICKER_TO_CIK: dict[str, str] = {}
+_SEC_CIK_TO_TICKER: dict[str, str] = {}     # 10-digit zero-padded CIK -> primary ticker
+_SEC_CIK_TITLES: dict[str, set[str]] = {}   # 10-digit CIK -> distinct normalised titles
 
 
 def _load_sec_tickers() -> None:
@@ -216,7 +218,17 @@ def _ingest_sec_payload(data: Any) -> None:
         _SEC_TICKERS.add(ticker)
         cik = entry.get("cik_str")
         if cik is not None and str(cik).strip():
-            _SEC_TICKER_TO_CIK.setdefault(ticker, str(cik).strip().zfill(10))
+            padded = str(cik).strip().zfill(10)
+            _SEC_TICKER_TO_CIK.setdefault(ticker, padded)
+            # One CIK can list several share classes (GOOG/GOOGL, BRK-A/BRK-B).
+            # The file lists the primary listing first, so setdefault keeps it.
+            _SEC_CIK_TO_TICKER.setdefault(padded, ticker)
+            # Track distinct titles per CIK so callers can tell share classes
+            # of one company from a fund complex filing many unrelated funds.
+            if title:
+                _SEC_CIK_TITLES.setdefault(padded, set()).add(
+                    normalize_sponsor_name(title) or title
+                )
         if title:
             # Prefer the common share class when several classes share a title
             # (the file lists the primary listing first).
@@ -238,6 +250,33 @@ def sec_cik_for_ticker(ticker: str | None) -> str | None:
         return None
     _load_sec_tickers()
     return _SEC_TICKER_TO_CIK.get(str(ticker).strip().upper())
+
+
+def sec_ticker_for_cik(cik: str | int | None) -> str | None:
+    """Primary listed ticker for a CIK, or None when the CIK is not listed.
+
+    The inverse of :func:`sec_cik_for_ticker`, over the same one-per-process
+    ``company_tickers.json`` cache. ``cik`` may be any form SEC emits — an int,
+    ``"1364742"`` or the zero-padded ``"0001364742"``. Filers with no listed
+    equity (``iSHARES TRUST``, most fund complexes) are absent from
+    ``company_tickers.json`` and return None.
+
+    Several tickers under one CIK are share classes of the same company
+    (GOOG/GOOGL) and resolve to the primary listing. A CIK filing under several
+    *different* names is a fund complex, where no single ticker stands for the
+    filer, and returns None rather than an arbitrary member.
+    """
+    if cik is None:
+        return None
+    digits = str(cik).strip()
+    if not digits.isdigit():
+        return None
+    _load_sec_tickers()
+    padded = digits.zfill(10)
+    if len(_SEC_CIK_TITLES.get(padded, ())) > 1:
+        log.debug("sponsor_resolver: CIK {c} covers several names — no single ticker", c=padded)
+        return None
+    return _SEC_CIK_TO_TICKER.get(padded)
 
 
 _PHARMA_HINTS = ("pharma", "thera", "bio", "onco", "medic", "genetic", "genom", "immun", "health", "life sciences")

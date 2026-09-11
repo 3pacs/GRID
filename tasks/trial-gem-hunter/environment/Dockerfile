@@ -15,10 +15,12 @@ RUN pip install --no-cache-dir \
     python-dateutil \
     sqlalchemy
 
-# Environment — GRID db credentials injected at runtime
+# Environment — GRID db credentials and API keys are injected at runtime
+# (docker run -e / --env-file). Never bake secrets into the image: the
+# Alpha Vantage key used by tests/test.py is read from ALPHAVANTAGE_API_KEY
+# (legacy name ALPHA_VANTAGE_KEY is also accepted) at runtime.
 ENV GRID_DB_HOST=host.docker.internal
 ENV GRID_DB_PORT=5432
-ENV ALPHA_VANTAGE_KEY=SPT9IOAEYVUT7X6J
 
 # ClinicalTrials.gov API (no key needed)
 ENV CT_GOV_BASE=https://clinicaltrials.gov/api/v2/studies

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger as log
@@ -115,6 +115,34 @@ async def simulate_weights(
     return {"ok": True, "result": result}
 
 
+def _regime_data_as_of(engine, reading_date: date | None) -> date | None:
+    """Return ``regime_history.data_as_of`` for the row describing ``reading_date``.
+
+    The journal entry carries no record of how old its inputs were — only the
+    regime_history row written by the same run does. Missing row, missing
+    column or a legacy row all mean the same thing here: unknown, reported as
+    such rather than filled in with the reading's own date.
+    """
+    if reading_date is None:
+        return None
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT data_as_of FROM regime_history "
+                    "WHERE obs_date = :d LIMIT 1"
+                ),
+                {"d": reading_date},
+            ).fetchone()
+    except Exception as exc:
+        log.warning("Regime: data_as_of lookup failed: {e}", e=str(exc))
+        return None
+    if row is None or row[0] is None:
+        return None
+    value = row[0]
+    return value.date() if isinstance(value, datetime) else value
+
+
 @router.get("/current", response_model=RegimeCurrentResponse)
 def get_current(_token: str = Depends(require_auth)) -> RegimeCurrentResponse:
     """Return current inferred regime state."""
@@ -166,11 +194,35 @@ def get_current(_token: str = Depends(require_auth)) -> RegimeCurrentResponse:
             model_version="none",
             as_of=datetime.now(timezone.utc).isoformat(),
             baseline_comparison="No data — run auto_regime or wait for scheduled detection",
+            as_of_date="",
+            staleness_days=None,
+            data_as_of="",
+            data_staleness_days=None,
         )
 
     model_label = f"{prod[1]} v{prod[2]}" if prod else "auto"
     flags = latest[3] if isinstance(latest[3], dict) else {}
     contradiction_list = [f"{k}: {v}" for k, v in flags.items()] if flags else []
+
+    # Carry the reading's own date alongside the timestamp so a surface can show
+    # staleness honestly rather than presenting a months-old row as "now".
+    as_of_date = ""
+    staleness_days: int | None = None
+    reading_date: date | None = None
+    ts = latest[6]
+    if ts is not None:
+        reading_date = ts.date() if isinstance(ts, datetime) else ts
+        as_of_date = reading_date.isoformat()
+        staleness_days = (date.today() - reading_date).days
+
+    # The reading's own date says when it was computed, not how old the data
+    # behind it is. Those are the same number only while the pipeline is
+    # current; regime_history.data_as_of is what separates them.
+    data_as_of_date = _regime_data_as_of(engine, reading_date)
+    data_as_of = data_as_of_date.isoformat() if data_as_of_date else ""
+    data_staleness_days = (
+        (date.today() - data_as_of_date).days if data_as_of_date else None
+    )
 
     return RegimeCurrentResponse(
         state=latest[0],
@@ -178,8 +230,12 @@ def get_current(_token: str = Depends(require_auth)) -> RegimeCurrentResponse:
         transition_probability=float(latest[2]),
         contradiction_flags=contradiction_list,
         model_version=model_label,
-        as_of=latest[6].isoformat() if latest[6] else "",
+        as_of=ts.isoformat() if ts else "",
         baseline_comparison=latest[5] or "",
+        as_of_date=as_of_date,
+        staleness_days=staleness_days,
+        data_as_of=data_as_of,
+        data_staleness_days=data_staleness_days,
     )
 
 

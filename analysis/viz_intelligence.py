@@ -29,6 +29,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
+from loguru import logger as log
 
 # ── Chart Type Taxonomy ─────────────────────────────────────────────────────
 # Each type maps to a D3/React renderer in the frontend
@@ -514,8 +515,8 @@ def compute_source_weights(
         try:
             from db import get_engine
             engine = get_engine()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("viz_intelligence.compute_source_weights: get_engine failed: {}", exc)
 
     if engine is not None:
         try:
@@ -532,8 +533,8 @@ def compute_source_weights(
                     )).fetchall()
                     for name, pulled_at in rows:
                         freshness_map[name.lower()] = pulled_at
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("viz_intelligence.compute_source_weights: source_catalog freshness query failed: {}", exc)
 
     weights = {}
     for family in families:

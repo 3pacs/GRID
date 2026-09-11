@@ -149,7 +149,10 @@ def get_timeseries(
     """Return recent time-series values for one or more features.
 
     Used for sparkline rendering and trend analysis. Returns one array
-    of values per feature, sampled at daily frequency.
+    of values per feature, sampled at daily frequency, plus the matching
+    observation dates so callers can join series on date rather than index
+    (features may have different observation calendars, e.g. crypto trading
+    weekends while equities don't).
     """
     engine = get_db_engine()
     feature_names = [f.strip() for f in features.split(",") if f.strip()][:20]
@@ -172,12 +175,15 @@ def get_timeseries(
             ).fetchall()
 
         series: dict[str, list[float]] = {}
+        dates: dict[str, list[str]] = {}
         for name, obs_date, value in rows:
             if name not in series:
                 series[name] = []
+                dates[name] = []
             series[name].append(float(value) if value is not None else 0.0)
+            dates[name].append(obs_date.isoformat() if obs_date is not None else None)
 
-        return {"series": series, "days": days, "count": len(series)}
+        return {"series": series, "dates": dates, "days": days, "count": len(series)}
     except Exception as exc:
         log.warning("Timeseries fetch failed: {e}", e=str(exc))
         raise HTTPException(status_code=500, detail=f"Timeseries fetch failed: {exc}") from exc
