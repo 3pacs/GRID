@@ -874,6 +874,13 @@ class EntityMap:
         self.engine = db_engine
         self._feature_cache: dict[str, int] = {}
         self._feature_freshness: dict[str, Any] = {}
+        # Names whose absence from feature_registry has already been
+        # confirmed by a cache refresh. See get_feature_id for why this
+        # negative cache exists; _load_feature_cache clears it.
+        self._unregistered_features: set[str] = set()
+        # series_ids already warned about, and how many lookups each one
+        # swallowed. Reported in bulk by missing_feature_report().
+        self._miss_counts: dict[str, int] = {}
         self._load_feature_cache()
         self.load_v2_mappings()
         self._detect_duplicate_mappings()
@@ -893,10 +900,27 @@ class EntityMap:
                 text("SELECT id, name FROM feature_registry")
             ).fetchall()
         self._feature_cache = {row[1]: row[0] for row in rows}
+        # The cache is authoritative again, so previously-confirmed misses
+        # get one more chance against the rows we just read.
+        self._unregistered_features = set()
         log.debug("Feature cache loaded: {n} entries", n=len(self._feature_cache))
 
     def get_feature_id(self, series_id: str) -> int | None:
         """Resolve a raw series_id to a feature_registry.id.
+
+        A miss is bounded work. Before 2026-09-11 every miss re-ran
+        ``_load_feature_cache()`` (a full ``feature_registry`` SELECT) and
+        logged a warning, and the common miss is a mapping whose target was
+        never added to the registry — permanent, and hit once per
+        (series_id, obs_date) group. On griddb that was 547,038 of 569,400
+        groups in a 2-day window: 54.6s of a 61.5s resolver run spent
+        re-reading a table that had not changed, plus a warning per group.
+
+        So a name is refreshed against the registry at most once per
+        process: after one refresh confirms it absent it goes in
+        ``_unregistered_features`` and later lookups return None from the
+        cache alone. The warning is emitted once per series_id;
+        ``missing_feature_report()`` carries the totals.
 
         Parameters:
             series_id: Raw series identifier (e.g. 'T10Y2Y', 'YF:^GSPC:close').
@@ -906,27 +930,64 @@ class EntityMap:
         """
         feature_name = SEED_MAPPINGS.get(series_id)
         if feature_name is None:
+            self._record_miss(series_id)
             log.debug("No mapping found for series_id={sid}", sid=series_id)
             return None
 
         feature_id = self._feature_cache.get(feature_name)
-        if feature_id is None:
-            # Refresh cache in case new features were added
+        if feature_id is None and feature_name not in self._unregistered_features:
+            # Refresh once, in case the feature was registered after the
+            # cache was built. _load_feature_cache() clears the negative
+            # cache, so the name below is re-confirmed against fresh rows.
             self._load_feature_cache()
             feature_id = self._feature_cache.get(feature_name)
+            if feature_id is None:
+                self._unregistered_features.add(feature_name)
 
         if feature_id is None:
-            log.warning(
-                "Mapping exists ({sid} -> {fn}) but feature not in registry",
-                sid=series_id,
-                fn=feature_name,
-            )
+            if self._record_miss(series_id) == 1:
+                log.warning(
+                    "Mapping exists ({sid} -> {fn}) but feature not in "
+                    "registry — further misses for this series_id are "
+                    "counted, not logged",
+                    sid=series_id,
+                    fn=feature_name,
+                )
             return feature_id
 
         # Warn if the resolved feature has no recent data (cached check)
         self._check_feature_freshness(feature_name, feature_id)
 
         return feature_id
+
+    def _record_miss(self, series_id: str) -> int:
+        """Count a failed lookup. Returns the running count for this id."""
+        count = self._miss_counts.get(series_id, 0) + 1
+        self._miss_counts[series_id] = count
+        return count
+
+    def missing_feature_report(self) -> dict[str, Any]:
+        """Summarise every lookup this instance could not resolve.
+
+        Callers that run a bulk pass (the resolver) log this once at the end
+        instead of one warning per group.
+
+        Returns:
+            dict with ``lookups_missed`` (total failed lookups),
+            ``series_ids`` (how many distinct series_ids missed),
+            ``unregistered_features`` (mapped names absent from
+            feature_registry) and ``top_series`` (the 10 worst offenders as
+            ``[series_id, count]`` pairs).
+        """
+        ranked = sorted(
+            self._miss_counts.items(), key=lambda kv: kv[1], reverse=True
+        )
+        return {
+            "lookups_missed": sum(self._miss_counts.values()),
+            "series_ids": len(self._miss_counts),
+            "unregistered_features": sorted(self._unregistered_features),
+            "top_series": [[sid, n] for sid, n in ranked[:10]],
+        }
 
     def _detect_duplicate_mappings(self) -> None:
         """Log warnings for raw_ids that appear in both SEED and V2 with

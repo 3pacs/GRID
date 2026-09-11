@@ -229,6 +229,20 @@ class Resolver:
             local = {"resolved": 0, "conflicts_found": 0, "errors": 0}
             INSERT_BATCH = 500
 
+            # Memoise series_id -> feature_id for this partition. The loop
+            # below runs once per (series_id, obs_date) group, and a live
+            # 2-day window produced 569,400 groups over 18,916 distinct
+            # series_ids — ~30 identical lookups each. Partitions are
+            # disjoint by series_id, so a plain dict per worker is
+            # lock-free and shares nothing.
+            feature_ids: dict[str, int | None] = {}
+
+            def _feature_id(series_id: str) -> int | None:
+                """entity_map.get_feature_id, resolved once per series_id."""
+                if series_id not in feature_ids:
+                    feature_ids[series_id] = entity_map.get_feature_id(series_id)
+                return feature_ids[series_id]
+
             try:
                 with self.engine.begin() as conn:
                     conn.execute(
@@ -268,7 +282,7 @@ class Resolver:
                 insert_batch: list[dict] = []
 
                 for (series_id, obs_date_val), sources in groups.items():
-                    feature_id = entity_map.get_feature_id(series_id)
+                    feature_id = _feature_id(series_id)
                     if feature_id is None:
                         continue
 
@@ -353,12 +367,27 @@ class Resolver:
                     log.error("Worker {w} raised: {e}", w=worker_id, e=str(exc))
                     totals["errors"] += 1
 
+        # One line for the whole run instead of one warning per group:
+        # EntityMap counts its misses and reports them here.
+        unmapped = entity_map.missing_feature_report()
+        if unmapped["lookups_missed"]:
+            log.warning(
+                "Resolution skipped {n} lookup(s) across {s} unmapped "
+                "series_id(s); {u} mapped feature name(s) are missing from "
+                "feature_registry: {names}. Worst offenders: {top}",
+                n=unmapped["lookups_missed"], s=unmapped["series_ids"],
+                u=len(unmapped["unregistered_features"]),
+                names=unmapped["unregistered_features"][:10],
+                top=unmapped["top_series"],
+            )
+
         summary = _summary(
             resolved=totals["resolved"],
             conflicts=totals["conflicts_found"],
             errors=totals["errors"],
             series=len(all_series),
         )
+        summary["unmapped"] = unmapped
         log.info(
             "Resolution complete — resolved={r}, conflicts={c}, errors={e}, "
             "series={s}, {t}s{d}",
