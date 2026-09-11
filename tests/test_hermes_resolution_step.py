@@ -392,6 +392,27 @@ def test_operator_state_record_task_persists_the_transient_flag():
     assert state.task_status["other"]["transient"] is False
 
 
+def test_hermes_status_schema_carries_the_transient_flag():
+    """The flag is pointless if the API layer drops it.
+
+    HermesTaskStatus is constructed as ``HermesTaskStatus(**v)`` from the
+    recorded dict in api/routers/system.py, and pydantic ignores unknown
+    keys by default — an undeclared field would be silently discarded
+    before any health surface could read it.
+    """
+    from api.schemas.system import HermesTaskStatus
+    from scripts.hermes_health import OperatorState
+
+    state = OperatorState()
+    state.record_task("resolution", False, 2.0, "OperationalError: x", transient=True)
+    model = HermesTaskStatus(**state.task_status["resolution"])
+    assert model.transient is True
+
+    # A snapshot written before the field existed must still validate.
+    legacy = {"last_run": None, "success": False, "duration_s": 1.0, "error": "x"}
+    assert HermesTaskStatus(**legacy).transient is False
+
+
 def test_resolution_timeout_fits_in_the_cycle():
     """The step's budget must leave room inside the 5-minute cycle interval."""
     import scripts.hermes_operator as hermes
