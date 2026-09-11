@@ -75,8 +75,22 @@ class AnalyticalSnapshotStore:
         "pipeline_summary",
     )
 
-    def __init__(self, db_engine: Engine) -> None:
+    def __init__(
+        self,
+        db_engine: Engine,
+        retention_per_category: int | None = None,
+    ) -> None:
+        """
+        Parameters:
+            db_engine: SQLAlchemy engine for database access.
+            retention_per_category: When set, `save_snapshot` prunes each
+                category down to its `retention_per_category` most recent
+                rows after every successful insert. `None` (default) keeps
+                every row, matching pre-existing behavior for callers that
+                don't opt in.
+        """
         self.engine = db_engine
+        self.retention_per_category = retention_per_category
         self._ensure_table()
 
     def _ensure_table(self) -> None:
@@ -159,10 +173,38 @@ class AnalyticalSnapshotStore:
                 "Snapshot saved — id={id}, category={cat}, as_of={d}",
                 id=snap_id, cat=category, d=as_of_date,
             )
-            return snap_id
         except Exception as exc:
             log.error("Failed to save snapshot ({cat}): {e}", cat=category, e=str(exc))
             return None
+
+        if self.retention_per_category is not None:
+            self._prune_category(category, self.retention_per_category)
+        return snap_id
+
+    def _prune_category(self, category: str, keep_n: int) -> None:
+        """Delete all but the `keep_n` most recent snapshots for a category.
+
+        Best-effort: a pruning failure must never fail the write that
+        triggered it — the row is already committed by the time this runs.
+        """
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "DELETE FROM analytical_snapshots "
+                        "WHERE category = :cat AND id NOT IN ("
+                        "    SELECT id FROM analytical_snapshots "
+                        "    WHERE category = :cat "
+                        "    ORDER BY snapshot_date DESC, created_at DESC "
+                        "    LIMIT :keep_n"
+                        ")"
+                    ),
+                    {"cat": category, "keep_n": keep_n},
+                )
+        except Exception as exc:
+            log.warning(
+                "Could not prune old snapshots ({cat}): {e}", cat=category, e=str(exc),
+            )
 
     def save_pipeline_snapshots(self, step_results: dict[str, Any]) -> int:
         """Save snapshots for all pipeline step results.

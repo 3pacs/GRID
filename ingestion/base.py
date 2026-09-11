@@ -160,6 +160,45 @@ def log_pull_failure(
     )
 
 
+#: Phrase appended to the WARNING emitted for a FRED id that FRED no longer
+#: serves. Operators grep for this to find id maps that need updating.
+FRED_DEAD_SERIES_HINT: str = "series does not exist — update the id map"
+
+
+def log_fred_series_failure(
+    source: str,
+    label: str,
+    fred_id: str,
+    exc: BaseException,
+) -> None:
+    """Log a per-series FRED fetch failure at the appropriate severity.
+
+    FRED answers ``400 Bad Request`` — not 404 — for a series id that is
+    not in its catalog, so a retired id looks like a client error. That is
+    a configuration problem, never an application bug, so it is logged at
+    WARNING naming the id and the fix; ``.server-logs/errors.jsonl`` stays
+    signal-rich. Every other failure is delegated to
+    :func:`log_pull_failure`, which routes genuine code bugs to ERROR and
+    upstream / transport faults to WARNING.
+
+    Parameters:
+        source: Puller name, e.g. ``buyback_execution``.
+        label: GRID label for the series (the ``raw_series`` id suffix).
+        fred_id: FRED series id that was requested.
+        exc: Exception raised by the fetch.
+    """
+    if _http_status_from_exc(exc) == 400:
+        log.warning(
+            "{src}: FRED {fid} ({lbl}) returned HTTP 400 — {hint}",
+            src=source,
+            fid=fred_id,
+            lbl=label,
+            hint=FRED_DEAD_SERIES_HINT,
+        )
+        return
+    log_pull_failure(source, f"{label} ({fred_id})", exc)
+
+
 def retry_on_failure(
     max_attempts: int = DEFAULT_RETRY_ATTEMPTS,
     backoff: float = DEFAULT_RETRY_BACKOFF,

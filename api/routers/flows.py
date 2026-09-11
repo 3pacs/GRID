@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+import threading
+import time
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends
@@ -16,8 +21,34 @@ from utils.ttl_cache import TTLCache
 router = APIRouter(prefix="/api/v1/flows", tags=["flows"])
 
 
-_SECTOR_CACHE_TTL: float = 300.0  # 5 minutes
+_SECTOR_CACHE_TTL: float = 300.0  # 5 minutes — "fresh" window
 _sector_cache: TTLCache = TTLCache(ttl=_SECTOR_CACHE_TTL, max_size=5)
+
+# Stale-while-revalidate tier: holds the last successfully computed payload
+# well past the fresh TTL so a request never blocks on the full computation
+# (measured 40s cold / 20ms warm — AGENTS.md 2026-05-30). ``_sector_warm_loop``
+# keeps both tiers populated from a background thread; the request path only
+# ever reads from cache and never runs the computation inline.
+_SECTOR_STALE_TTL: float = 21600.0  # 6 hours
+_sector_stale_cache: TTLCache = TTLCache(ttl=_SECTOR_STALE_TTL, max_size=5)
+_SECTOR_CACHE_KEY = "sectors"
+
+# Persists the last good payload to analytical_snapshots (store/snapshots.py)
+# so a freshly restarted process can seed the stale tier immediately instead
+# of serving {"unavailable": True} until the warm loop's first cycle
+# finishes (~70s cold — see AGENTS.md 2026-09-11 deploy-restart timeline).
+_SECTOR_SNAPSHOT_CATEGORY = "sector_flows"
+
+# Warm cycles run every ~240s, so persisting unconditionally would add ~360
+# rows/day forever (#454 review). Bound growth two ways: skip the write
+# entirely when the sector data hasn't changed (see `_hash_sectors_payload`),
+# and cap the table at this many rows per category as a backstop via
+# AnalyticalSnapshotStore's retention parameter.
+_SECTOR_SNAPSHOT_RETENTION = 50
+_last_persisted_sectors_hash: str | None = None
+
+_sector_warm_lock = threading.Lock()
+_sector_warm_thread_started = False
 
 # Narrative LLM calls are expensive (1-5s). Cache per-sector for 1 hour so
 # sector-dive requests don't pay the ollama round-trip on every pageview.
@@ -25,13 +56,14 @@ _SECTOR_NARRATIVE_TTL: float = 3600.0
 _sector_narrative_cache: TTLCache = TTLCache(ttl=_SECTOR_NARRATIVE_TTL, max_size=32)
 
 
-@router.get("/sectors")
-def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
-    """Return the full sector map with live z-scores for each actor's features."""
-    cached = _sector_cache.get("sectors")
-    if cached is not None:
-        return cached
+def _compute_sectors_payload() -> dict[str, Any]:
+    """Build the full sector map with live z-scores for each actor's features.
 
+    This is the expensive path (~40s cold per AGENTS.md 2026-05-30, driven
+    mostly by the batched price/z-score DB work below). It must never be
+    called directly from the request handler — only from the background
+    warm loop — so a cold cache can never block a request.
+    """
     from analysis.sector_map import SECTOR_MAP, get_actor_influence
 
     engine = get_db_engine()
@@ -120,39 +152,64 @@ def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
         from datetime import date, timedelta
         today = date.today()
         d30 = today - timedelta(days=30)
-
-        # Build all possible series_ids
-        sid_to_ticker: dict[str, str] = {}
-        for t in all_tickers:
-            sid_to_ticker[f"YF:{t}:close"] = t
-            sid_to_ticker[f"YF:{t}-USD:close"] = t
+        # Bound the "latest price" scan too — without this, DISTINCT ON
+        # over series_id IN (...) has to sort the *entire* history of every
+        # matching series. 180 days is generous slack for even slow-updating
+        # sources while keeping the query index-friendly.
+        lookback = today - timedelta(days=180)
 
         if all_tickers:
+            # Two possible series_id spellings per ticker (plain equities vs
+            # the "-USD" crypto/fx style). One batched round trip covers all
+            # tickers x both spellings instead of the previous per-ticker,
+            # per-spelling loop (up to 4 sequential queries x N tickers,
+            # which is what made this endpoint 40s on a cold DB connection
+            # pool — see AGENTS.md 2026-05-30).
+            series_ids: list[str] = []
+            sid_to_ticker: dict[str, str] = {}
+            for t in sorted(all_tickers):
+                for sid in (f"YF:{t}:close", f"YF:{t}-USD:close"):
+                    series_ids.append(sid)
+                    sid_to_ticker[sid] = t
+
+            placeholders = ", ".join(f":s{i}" for i in range(len(series_ids)))
+            params = {f"s{i}": s for i, s in enumerate(series_ids)}
+            params["d30"] = d30
+            params["lookback"] = lookback
+
             with engine.connect() as conn:
-                for ticker in all_tickers:
-                    # Try YF:TICKER:close, then YF:TICKER-USD:close
-                    for sid in [f"YF:{ticker}:close", f"YF:{ticker}-USD:close"]:
-                        # Use MEDIAN-like approach: get the most common value for latest date
-                        # to avoid volume/adj_close contamination in the :close series
-                        row = conn.execute(text(
-                            "SELECT value FROM raw_series "
-                            "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
-                            "AND value > 0.01 AND value < 999999 "
-                            "ORDER BY obs_date DESC, pull_timestamp DESC LIMIT 1"
-                        ), {"sid": sid}).fetchone()
-                        if row:
-                            price_map[ticker] = float(row[0])
-                            prev = conn.execute(text(
-                                "SELECT value FROM raw_series "
-                                "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
-                                "AND value > 0.01 AND value < 999999 "
-                                "AND obs_date <= :d30 "
-                                "ORDER BY obs_date DESC, pull_timestamp DESC LIMIT 1"
-                            ), {"sid": sid, "d30": d30}).fetchone()
-                            if prev and float(prev[0]) != 0:
-                                change_30d_map[ticker] = round(
-                                    (price_map[ticker] - float(prev[0])) / float(prev[0]), 5)
-                            break
+                # Use MEDIAN-like approach: get the most common value for latest date
+                # to avoid volume/adj_close contamination in the :close series
+                latest_rows = conn.execute(text(
+                    "SELECT DISTINCT ON (series_id) series_id, value "
+                    "FROM raw_series "
+                    "WHERE series_id IN (" + placeholders + ") "
+                    "AND pull_status = 'SUCCESS' AND value > 0.01 AND value < 999999 "
+                    "AND obs_date >= :lookback "
+                    "ORDER BY series_id, obs_date DESC, pull_timestamp DESC"
+                ), params).fetchall()
+                latest_by_sid = {r[0]: float(r[1]) for r in latest_rows}
+
+                prev_rows = conn.execute(text(
+                    "SELECT DISTINCT ON (series_id) series_id, value "
+                    "FROM raw_series "
+                    "WHERE series_id IN (" + placeholders + ") "
+                    "AND pull_status = 'SUCCESS' AND value > 0.01 AND value < 999999 "
+                    "AND obs_date >= :lookback AND obs_date <= :d30 "
+                    "ORDER BY series_id, obs_date DESC, pull_timestamp DESC"
+                ), params).fetchall()
+                prev_by_sid = {r[0]: float(r[1]) for r in prev_rows}
+
+            for ticker in all_tickers:
+                # Prefer YF:TICKER:close, then YF:TICKER-USD:close
+                for sid in (f"YF:{ticker}:close", f"YF:{ticker}-USD:close"):
+                    if sid in latest_by_sid:
+                        price_map[ticker] = latest_by_sid[sid]
+                        prev = prev_by_sid.get(sid)
+                        if prev:
+                            change_30d_map[ticker] = round(
+                                (price_map[ticker] - prev) / prev, 5)
+                        break
     except Exception as exc:
         log.warning("Batch price fetch failed: {e}", e=str(exc))
 
@@ -218,9 +275,207 @@ def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
             "subsectors": list(sector.get("subsectors", {}).keys()),
         }
 
-    result = {"sectors": sectors}
-    _sector_cache.set("sectors", result)
-    return result
+    return {
+        "sectors": sectors,
+        # Survives every cache tier (fresh, stale, persisted snapshot) since
+        # it's baked into the payload dict itself — `get_sectors` never needs
+        # to special-case it.
+        "computed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+_SECTOR_WARM_RETRY_SECONDS = 30.0
+
+
+def _hash_sectors_payload(payload: dict[str, Any]) -> str:
+    """Stable hash of the sector data only.
+
+    Excludes ``computed_at`` (which always differs run-to-run) so an
+    unchanged sector map doesn't churn a new row into analytical_snapshots
+    every warm cycle.
+    """
+    sectors_json = json.dumps(payload.get("sectors", {}), sort_keys=True, default=str)
+    return hashlib.sha256(sectors_json.encode("utf-8")).hexdigest()
+
+
+def _persist_sectors_snapshot(payload: dict[str, Any]) -> None:
+    """Persist a successfully computed payload for cold-start recovery.
+
+    Only writes a new row when the sector data actually changed since the
+    last persisted snapshot — see `_hash_sectors_payload`. Retention on
+    `AnalyticalSnapshotStore` caps the table as a backstop even if the data
+    keeps changing every cycle. The hash is only recorded after a successful
+    insert, so a failed persist is retried on the next cycle even when the
+    data is unchanged.
+
+    Best-effort only: a persistence failure must never fail the warm cycle
+    or block a request — the process just falls back to the in-memory
+    tiers, same as before this existed.
+    """
+    global _last_persisted_sectors_hash
+    try:
+        payload_hash = _hash_sectors_payload(payload)
+        if payload_hash == _last_persisted_sectors_hash:
+            log.debug("Sector flow snapshot unchanged — skipping persist")
+            return
+
+        from store.snapshots import AnalyticalSnapshotStore
+
+        store = AnalyticalSnapshotStore(
+            db_engine=get_db_engine(),
+            retention_per_category=_SECTOR_SNAPSHOT_RETENTION,
+        )
+        snap_id = store.save_snapshot(category=_SECTOR_SNAPSHOT_CATEGORY, payload=payload)
+        if snap_id is None:
+            log.warning("Sector flow snapshot persist returned no id — will retry next cycle")
+            return
+        _last_persisted_sectors_hash = payload_hash
+    except Exception as exc:
+        log.warning("Sector flow snapshot persist failed (non-fatal): {e}", e=str(exc))
+
+
+def _load_persisted_sectors_snapshot() -> None:
+    """Seed the stale tier from the last persisted snapshot, age-gated.
+
+    Runs once, before the warm loop's first compute, so a process that was
+    just restarted (deploy, crash, manual bounce) can serve the last known
+    payload immediately instead of the empty ``{"unavailable": True}``
+    placeholder for the ~70s it takes to compute fresh. Failures (table not
+    there yet, DB unreachable, no snapshot ever saved) are non-fatal — the
+    process just waits on the warm loop's first cycle like before.
+
+    A snapshot older than `_SECTOR_STALE_TTL` (or one with no `computed_at`
+    to judge age from) is never seeded — a days-old sector map must never be
+    served as merely "stale" with no indication of how old it really is.
+    Otherwise the seeded payload gets a `snapshot_age_s` field so the card
+    can say how old the data is.
+    """
+    try:
+        from store.snapshots import AnalyticalSnapshotStore
+
+        store = AnalyticalSnapshotStore(db_engine=get_db_engine())
+        rows = store.get_latest(_SECTOR_SNAPSHOT_CATEGORY, n=1)
+        if not rows or not rows[0].get("payload"):
+            return
+
+        payload = rows[0]["payload"]
+        computed_at = payload.get("computed_at")
+        if not computed_at:
+            log.info("Sector flow snapshot has no computed_at — skipping seed")
+            return
+
+        try:
+            computed_dt = datetime.fromisoformat(computed_at)
+        except ValueError:
+            log.info(
+                "Sector flow snapshot computed_at is unparseable ({v!r}) — skipping seed",
+                v=computed_at,
+            )
+            return
+        if computed_dt.tzinfo is None:
+            computed_dt = computed_dt.replace(tzinfo=timezone.utc)
+
+        age_s = (datetime.now(timezone.utc) - computed_dt).total_seconds()
+        if age_s > _SECTOR_STALE_TTL:
+            log.info(
+                "Sector flow snapshot too old to seed ({age:.0f}s > {ttl:.0f}s TTL) — skipping",
+                age=age_s, ttl=_SECTOR_STALE_TTL,
+            )
+            return
+
+        payload = {**payload, "snapshot_age_s": round(age_s, 1)}
+        _sector_stale_cache.set(_SECTOR_CACHE_KEY, payload)
+        log.info(
+            "Sector flow cache seeded from persisted snapshot ({n} sectors, {age:.0f}s old)",
+            n=len(payload.get("sectors", {})), age=age_s,
+        )
+    except Exception as exc:
+        log.warning("Sector flow snapshot load failed (non-fatal): {e}", e=str(exc))
+
+
+def _sector_warm_cycle() -> float:
+    """Run one warm cycle: compute and populate both cache tiers.
+
+    Returns the number of seconds to sleep before the next cycle — short on
+    failure (quick retry after a transient DB blip), comfortably inside the
+    fresh TTL on success (so steady traffic never sees a fresh-cache miss).
+    Split out from `_sector_warm_loop` so it can be exercised directly by
+    tests without needing to run (or break out of) an infinite loop.
+    """
+    try:
+        result = _compute_sectors_payload()
+        _sector_cache.set(_SECTOR_CACHE_KEY, result)
+        _sector_stale_cache.set(_SECTOR_CACHE_KEY, result)
+        _persist_sectors_snapshot(result)
+        log.info(
+            "Sector flow cache warmed ({n} sectors)",
+            n=len(result.get("sectors", {})),
+        )
+        return max(_SECTOR_CACHE_TTL - 60.0, _SECTOR_WARM_RETRY_SECONDS)
+    except Exception as exc:
+        log.warning("Sector flow cache warm failed: {e}", e=str(exc))
+        return _SECTOR_WARM_RETRY_SECONDS
+
+
+def _sector_warm_loop() -> None:
+    """Background loop that keeps the sector cache warm for the process lifetime."""
+    while True:
+        time.sleep(_sector_warm_cycle())
+
+
+def _ensure_sector_warm_thread() -> None:
+    """Start the background warm loop once, lazily, on first request.
+
+    Not started at module import time — import can happen in contexts
+    (tests, tooling) that shouldn't trigger DB traffic or long-lived
+    threads as a side effect. This is the fallback path for a process
+    whose startup hook (``start_sector_flow_warm_thread``) didn't run or
+    failed; the one-time guard below means the persisted-snapshot load and
+    thread start still happen exactly once either way.
+    """
+    global _sector_warm_thread_started
+    with _sector_warm_lock:
+        if _sector_warm_thread_started:
+            return
+        _sector_warm_thread_started = True
+    _load_persisted_sectors_snapshot()
+    threading.Thread(
+        target=_sector_warm_loop, daemon=True, name="sector-flow-warm",
+    ).start()
+
+
+def start_sector_flow_warm_thread() -> None:
+    """Startup hook: seed the stale tier and start the warm loop eagerly.
+
+    Called from the API's deferred-startup path (``api/main.py``) so a
+    freshly restarted process has the persisted payload available and the
+    warm loop already running before the first user request arrives,
+    instead of relying on that first request to lazily trigger both.
+    """
+    _ensure_sector_warm_thread()
+
+
+@router.get("/sectors")
+def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
+    """Return the full sector map with live z-scores for each actor's features.
+
+    Never computes inline: a fresh cache hit returns immediately, a stale
+    hit returns the last good payload immediately (stale-while-revalidate —
+    the background warm loop keeps refreshing it), and a true cold process
+    (nothing computed yet) returns an explicit empty/unavailable payload
+    instead of blocking the request for the ~40s cold compute.
+    """
+    _ensure_sector_warm_thread()
+
+    cached = _sector_cache.get(_SECTOR_CACHE_KEY)
+    if cached is not None:
+        return cached
+
+    stale = _sector_stale_cache.get(_SECTOR_CACHE_KEY)
+    if stale is not None:
+        return stale
+
+    return {"sectors": {}, "stale": True, "unavailable": True}
 
 
 @router.get("/sectors/{sector_name}/detail")

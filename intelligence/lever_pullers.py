@@ -31,6 +31,7 @@ Key entry points:
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -50,10 +51,144 @@ INFLUENCE_WEIGHTS: dict[str, float] = {
     "insider": 0.6,
     "institutional": 0.7,
     "dealer": 0.8,
+    "options_flow": 0.65,      # unusual options tape per underlying (whale_<ticker>)
+    "government": 0.6,         # awarding agencies (federal contract flow)
+    "regulator": 0.7,          # export controls / new rules
+    "lobbyist": 0.5,           # LDA registrants and their clients
+    "analyst": 0.4,            # Crucix / internal trade ideas
+    "social": 0.3,             # Reddit / retail sentiment handles
     "foreign_lobbying": 0.6,   # FARA-registered foreign agents
     "geopolitical": 0.7,       # GDELT tension/actor signals
     "diplomatic_cable": 0.4,   # Declassified FOIA cables (lagged but contextual)
 }
+
+# signal_sources.source_type -> lever puller category. Anything not listed is
+# "unknown" and is never promoted to a lever puller.
+SOURCE_TYPE_CATEGORIES: dict[str, str] = {
+    "fed": "fed",
+    "congressional": "congress",
+    "quiverquant:house": "congress",
+    "quiverquant:senate": "congress",
+    "insider": "insider",
+    "quiverquant:insider": "insider",
+    "institutional": "institutional",
+    "darkpool": "dealer",
+    "scanner": "dealer",
+    "options_flow": "options_flow",
+    "gov_contract": "government",
+    "export_control": "regulator",
+    "quiverquant:lobbying": "lobbyist",
+    "lobbying": "lobbyist",
+    "foreign_lobbying": "foreign_lobbying",
+    "fara": "foreign_lobbying",
+    "crucix_idea": "analyst",
+    "social": "social",
+    "geopolitical": "geopolitical",
+    "diplomatic_cable": "diplomatic_cable",
+}
+
+# Ticker-level aggregate feeds with a single constant source_id and no actor
+# behind them (qq_off_exchange, qq_wsb, ...). They are signals, not pullers.
+AGGREGATE_SOURCE_TYPES: frozenset[str] = frozenset({
+    "quiverquant:offexchange", "quiverquant:gov_contracts", "quiverquant:wsb",
+    "quiverquant:political_beta", "quiverquant:flights", "quiverquant:twitter",
+    "legislative", "smart_money",
+})
+
+# Where the actor's identity lives when source_id is a constant feed name.
+# Evaluated in SQL (jsonb ->>) and mirrored in Python by ``puller_identity``.
+IDENTITY_FIELDS: dict[str, tuple[str, ...]] = {
+    "quiverquant:house": ("Representative",),
+    "quiverquant:senate": ("Senator",),
+    "quiverquant:insider": ("Name",),
+    "quiverquant:lobbying": ("Registrant", "Client"),
+}
+
+# options_flow source ids are whale_<ticker>_<strike>; the puller is the
+# underlying's options tape, so the strike suffix is dropped.
+OPTIONS_STRIKE_SUFFIX_RE = r"_[0-9.]+$"
+
+# ── Insider (Form 4) motivation inputs ───────────────────────────────────
+#
+# Two feeds land in signal_sources as category "insider" and they spell the
+# same facts differently: the SEC Form 4 puller writes snake_case keys and
+# BUY/SELL/UNUSUAL_* signal types, QuiverQuant echoes its own PascalCase
+# record and insider_buy/insider_sell. Read both through one alias table so a
+# rule is written once.
+INSIDER_CODE_KEYS: tuple[str, ...] = (
+    "transaction_code", "TransactionCode", "transactionCode", "Code",
+)
+INSIDER_PLAN_KEYS: tuple[str, ...] = (
+    "is_10b5_1", "aff10b5One", "Is10b5One", "plan_10b5_1",
+)
+INSIDER_TITLE_KEYS: tuple[str, ...] = (
+    "insider_title", "officerTitle", "Title", "insiderTitle",
+)
+# QuiverQuant carries no pre-multiplied value, so Shares x PricePerShare is
+# computed from the two keys it does carry (see INSIDER_SHARE_KEYS below).
+INSIDER_VALUE_KEYS: tuple[str, ...] = ("value", "Value", "total_value")
+INSIDER_SHARE_KEYS: tuple[str, ...] = ("shares", "Shares")
+INSIDER_PRICE_KEYS: tuple[str, ...] = ("price", "PricePerShare")
+# 'A' acquired / 'D' disposed. On the QuiverQuant feed this is the only
+# trustworthy direction: that feed derives signal_type from a TransactionType
+# field its API does not return, so every row lands as "insider_sell".
+INSIDER_ACQ_DISP_KEYS: tuple[str, ...] = (
+    "AcquiredDisposedCode", "acquired_disposed_code",
+)
+# Booleans the QuiverQuant feed sets for reporting-owner relationships.
+INSIDER_SENIOR_FLAG_KEYS: tuple[str, ...] = ("isDirector", "isOfficer")
+
+# Form 4 codes whose motivation is mechanical, not an opinion on the stock:
+# M exercise of a derivative, A award/grant, F shares withheld for tax,
+# G gift, X in-the-money option exercise. Everything discretionary flows
+# through P (open-market purchase) and S (open-market sale).
+#
+# X is not in the hand-off's M/A/F/G list but is the same kind of event as M
+# and is live in the QuiverQuant feed; without it an exercise that acquires
+# shares would rank as an informed purchase.
+INSIDER_ROUTINE_CODES: frozenset[str] = frozenset({"M", "A", "F", "G", "X"})
+
+# A purchase this size is a considered bet rather than a token buy.
+INSIDER_INFORMED_BUY_VALUE: float = 100_000.0
+# A discretionary sale below this is noise: diversification, a house, tuition.
+INSIDER_INFORMED_SELL_VALUE: float = 250_000.0
+
+# Seniority that makes a purchase materially more informative.
+INSIDER_SENIOR_TITLE_RE: re.Pattern[str] = re.compile(
+    r"\b(chief|ceo|cfo|coo|cto|c\.e\.o|c\.f\.o|president|director|chair)",
+    re.IGNORECASE,
+)
+# ... but "Vice President" and "Assistant Secretary" are middle management,
+# and matching them on the word "president" would call every one of them a
+# C-suite buy.
+INSIDER_JUNIOR_TITLE_RE: re.Pattern[str] = re.compile(
+    r"\b(vice|assistant|deputy|associate|asst\.?|vp)\b",
+    re.IGNORECASE,
+)
+
+# Values a JSON/JSONB boolean-ish field can take across the two feeds.
+_TRUE_STRINGS: frozenset[str] = frozenset({"1", "true", "t", "y", "yes"})
+
+# Per-category cap so 400 insiders cannot crowd every other lever out of the top 50.
+MAX_PER_CATEGORY: int = 10
+
+# A puller needs this many scored signals before its trust means anything.
+MIN_SCORED_SIGNALS: int = 3
+
+# Events from pullers below this Bayesian trust are not surfaced.
+MIN_EVENT_TRUST: float = 0.02
+
+_IDENTITY_SQL = """
+    CASE
+        WHEN source_type = 'options_flow' THEN regexp_replace(source_id, '_[0-9.]+$', '')
+        WHEN source_type = 'quiverquant:house' THEN COALESCE(signal_value->>'Representative', source_id)
+        WHEN source_type = 'quiverquant:senate' THEN COALESCE(signal_value->>'Senator', source_id)
+        WHEN source_type = 'quiverquant:insider' THEN COALESCE(signal_value->>'Name', source_id)
+        WHEN source_type = 'quiverquant:lobbying'
+            THEN COALESCE(signal_value->>'Registrant', signal_value->>'Client', source_id)
+        ELSE source_id
+    END
+"""
 
 # Higher-influence congressional positions (committee chairs, leadership)
 CONGRESS_LEADERSHIP_KEYWORDS: set[str] = {
@@ -119,6 +254,10 @@ class LeverPuller:
     avg_lead_time_days: float = 0.0
     best_calls: list[dict] = field(default_factory=list)
     worst_calls: list[dict] = field(default_factory=list)
+    total_signals: int = 0      # scored signals (CORRECT + WRONG) behind trust_score
+    correct_signals: int = 0
+    motivation_mix: dict[str, int] = field(default_factory=dict)  # label -> count over recent actions
+    aliases: list[str] = field(default_factory=list)  # other <source_type>:<identity> ids for the same actor
 
 
 @dataclass
@@ -183,16 +322,43 @@ def _category_from_source_type(source_type: str) -> str:
     Returns:
         Normalised category string.
     """
-    mapping = {
-        "congressional": "congress",
-        "insider": "insider",
-        "darkpool": "dealer",
-        "social": "institutional",
-        "scanner": "dealer",
-        "fed": "fed",
-        "institutional": "institutional",
-    }
-    return mapping.get(source_type.lower(), "unknown")
+    return SOURCE_TYPE_CATEGORIES.get((source_type or "").lower(), "unknown")
+
+
+def puller_identity(source_type: str, source_id: str, signal_value: Any = None) -> str:
+    """The actor behind a signal_sources row (mirrors ``_IDENTITY_SQL``).
+
+    options_flow rows are keyed whale_<ticker>_<strike>; the puller is the
+    underlying's options tape. QuiverQuant feeds use one constant source_id
+    per endpoint, so the person is read from signal_value.
+    """
+    st = (source_type or "").lower()
+    sid = source_id or ""
+    if st == "options_flow":
+        import re
+
+        return re.sub(OPTIONS_STRIKE_SUFFIX_RE, "", sid)
+    fields = IDENTITY_FIELDS.get(st)
+    if not fields:
+        return sid
+    details: dict[str, Any] = {}
+    if isinstance(signal_value, dict):
+        details = signal_value
+    elif isinstance(signal_value, str) and signal_value:
+        try:
+            details = json.loads(signal_value)
+        except (json.JSONDecodeError, TypeError):
+            details = {}
+    for f in fields:
+        v = details.get(f) if isinstance(details, dict) else None
+        if v:
+            return str(v).strip()
+    return sid
+
+
+def puller_id_for(source_type: str, source_id: str, signal_value: Any = None) -> str:
+    """Stable lever-puller id: ``<source_type>:<identity>``."""
+    return f"{source_type}:{puller_identity(source_type, source_id, signal_value)}"
 
 
 def _influence_for_source(
@@ -236,11 +402,17 @@ def _influence_for_source(
                 base = max(base, 0.8)
                 break
 
-    # Boost C-suite insiders over 10% owners
+    # Boost C-suite insiders over 10% owners (Form 4 and QuiverQuant shapes)
     if category == "insider":
-        title = (metadata.get("insider_title") or "").lower()
-        if any(t in title for t in ("ceo", "cfo", "coo", "president", "director")):
+        title = (metadata.get("insider_title") or metadata.get("officerTitle") or "").lower()
+        if any(t in title for t in ("ceo", "cfo", "coo", "president", "director", "chief")):
             base = max(base, 0.7)
+
+    # Index / mega-cap options tapes move more than single-name tapes
+    if category == "options_flow":
+        underlying = puller_identity(source_type, source_id).replace("whale_", "").upper()
+        if underlying in {"SPY", "QQQ", "IWM", "TLT", "GLD"}:
+            base = max(base, 0.8)
 
     return min(base, 1.0)
 
@@ -292,6 +464,35 @@ def _position_label(
     if category == "institutional":
         return metadata.get("fund_name", "Institutional Allocator")
 
+    if category == "options_flow":
+        underlying = puller_identity(source_type, source_id).replace("whale_", "").upper()
+        return f"Options tape — {underlying}" if underlying else "Options tape"
+
+    if category == "government":
+        return f"Awarding agency — {source_id}" if source_id else "Awarding agency"
+
+    if category == "regulator":
+        return "Export-control / regulatory rule"
+
+    if category == "lobbyist":
+        return "Lobbying registrant"
+
+    if category == "analyst":
+        return "Trade-idea generator"
+
+    if category == "social":
+        platform = metadata.get("platform") or (source_id.split(":")[0] if ":" in source_id else "social")
+        return f"Retail sentiment — {platform}"
+
+    if category == "foreign_lobbying":
+        return "FARA-registered foreign agent"
+
+    if category == "geopolitical":
+        return "Geopolitical actor (GDELT)"
+
+    if category == "diplomatic_cable":
+        return "Diplomatic cable source"
+
     return "Unknown"
 
 
@@ -329,6 +530,117 @@ def _committee_has_jurisdiction(committee: str, ticker: str) -> bool:
 
 # ── 1. Identify Lever Pullers ────────────────────────────────────────────
 
+def _aggregate_scored_sources(conn: Any) -> list[tuple]:
+    """Every actor with >= MIN_SCORED_SIGNALS scored signals, one row each.
+
+    Rows: (source_type, identity, total_scored, correct, wrong,
+    last_signal_date, avg_lead_hours, avg_trust). Aggregates by the actor
+    behind the row (QuiverQuant feeds share one source_id per endpoint and
+    options flow is keyed per strike) and excludes aggregate-only feeds.
+    No LIMIT: a trust-ordered cut here silently dropped every low-hit-rate
+    category (options tapes) before the per-category quota could see them.
+    """
+    return conn.execute(text(f"""
+        SELECT
+            source_type,
+            {_IDENTITY_SQL} AS identity,
+            COUNT(*) AS total_signals,
+            SUM(CASE WHEN outcome = 'CORRECT' THEN 1 ELSE 0 END) AS correct,
+            SUM(CASE WHEN outcome = 'WRONG' THEN 1 ELSE 0 END) AS wrong,
+            MAX(signal_date) AS last_signal_date,
+            AVG(avg_lead_time_hours) AS avg_lead_hours,
+            AVG(trust_score) AS avg_trust
+        FROM signal_sources
+        WHERE outcome IN ('CORRECT', 'WRONG')
+          AND NOT (source_type = ANY(:excluded))
+        GROUP BY source_type, {_IDENTITY_SQL}
+        HAVING COUNT(*) >= :min_scored
+        ORDER BY AVG(trust_score) DESC
+    """), {
+        "excluded": list(AGGREGATE_SOURCE_TYPES),
+        "min_scored": MIN_SCORED_SIGNALS,
+    }).fetchall()
+
+
+def build_puller_index(engine: Engine) -> list[LeverPuller]:
+    """Lightweight LeverPuller for every qualified actor (no per-source lookups).
+
+    ``identify_lever_pullers`` returns the top-N *display* list with calls,
+    recent actions and a motivation model. Convergence and event detection
+    must not be limited to that list — eight TSM insiders buying in the
+    same week is a convergence whether or not they rank in the top 50 — so
+    they key on this index instead.
+    """
+    pullers: list[LeverPuller] = []
+    with engine.connect() as conn:
+        rows = _aggregate_scored_sources(conn)
+    for r in rows:
+        src_type, identity = r[0], r[1]
+        category = _category_from_source_type(src_type)
+        if category == "unknown":
+            continue
+        correct, wrong = int(r[3] or 0), int(r[4] or 0)
+        trust = (correct + 1.0) / (correct + wrong + 2.0)
+        avg_lead_hours = float(r[6]) if r[6] is not None else 0.0
+        pullers.append(LeverPuller(
+            id=f"{src_type}:{identity}",
+            name=identity,
+            category=category,
+            influence_rank=_influence_for_source(src_type, identity, {}),
+            trust_score=round(trust, 4),
+            position=_position_label(src_type, identity, {}),
+            motivation_model="unknown",
+            avg_lead_time_days=round(avg_lead_hours / 24.0, 2) if avg_lead_hours else 0.0,
+            total_signals=int(r[2]),
+            correct_signals=correct,
+        ))
+    pullers = merge_cross_feed_duplicates(pullers)
+    log.info("Lever puller index: {n} qualified actors", n=len(pullers))
+    return pullers
+
+
+def _actor_key(puller: LeverPuller) -> tuple[str, str]:
+    """Same person across feeds: (category, normalised name)."""
+    name = " ".join(puller.name.lower().replace(".", " ").replace(",", " ").split())
+    return puller.category, name
+
+
+def merge_cross_feed_duplicates(pullers: list[LeverPuller]) -> list[LeverPuller]:
+    """Fold the same actor reported by two feeds into one puller.
+
+    John Fetterman arrives as ``congressional:John Fetterman`` and
+    ``quiverquant:senate:John Fetterman``; counted twice he doubles a
+    convergence. The higher-trust record wins, the other id becomes an
+    alias so its rows still resolve to the same puller, and the scored
+    counts are summed.
+    """
+    by_key: dict[tuple[str, str], LeverPuller] = {}
+    order: list[tuple[str, str]] = []
+    for p in sorted(pullers, key=lambda p: (-p.trust_score, -p.total_signals, p.id)):
+        key = _actor_key(p)
+        keep = by_key.get(key)
+        if keep is None:
+            by_key[key] = p
+            order.append(key)
+            continue
+        keep.aliases.append(p.id)
+        keep.aliases.extend(a for a in p.aliases if a not in keep.aliases)
+        keep.total_signals += p.total_signals
+        keep.correct_signals += p.correct_signals
+        keep.recent_actions = (keep.recent_actions + p.recent_actions)[:10]
+    return [by_key[k] for k in order]
+
+
+def puller_map_of(pullers: list[LeverPuller]) -> dict[str, LeverPuller]:
+    """id -> puller, including every alias id."""
+    out: dict[str, LeverPuller] = {}
+    for p in pullers:
+        out[p.id] = p
+        for a in p.aliases:
+            out.setdefault(a, p)
+    return out
+
+
 def identify_lever_pullers(engine: Engine) -> list[LeverPuller]:
     """Query signal_sources, aggregate by source, and rank by trust x influence.
 
@@ -347,47 +659,48 @@ def identify_lever_pullers(engine: Engine) -> list[LeverPuller]:
     pullers: list[LeverPuller] = []
 
     with engine.connect() as conn:
-        # Aggregate scored signals by source
-        rows = conn.execute(text("""
-            SELECT
-                source_type,
-                source_id,
-                COUNT(*) AS total_signals,
-                SUM(CASE WHEN outcome = 'CORRECT' THEN 1 ELSE 0 END) AS correct,
-                SUM(CASE WHEN outcome = 'WRONG' THEN 1 ELSE 0 END) AS wrong,
-                AVG(CASE WHEN outcome = 'CORRECT' THEN outcome_return END) AS avg_return_correct,
-                AVG(CASE WHEN outcome = 'WRONG' THEN outcome_return END) AS avg_return_wrong,
-                MAX(signal_date) AS last_signal_date,
-                AVG(avg_lead_time_hours) AS avg_lead_hours,
-                AVG(trust_score) AS avg_trust
-            FROM signal_sources
-            WHERE outcome IN ('CORRECT', 'WRONG')
-            GROUP BY source_type, source_id
-            ORDER BY AVG(trust_score) DESC
-            LIMIT :lim
-        """), {"lim": MAX_LEVER_PULLERS * 3}).fetchall()
+        rows = _aggregate_scored_sources(conn)
 
         if not rows:
             log.info("No scored sources found for lever puller identification")
             return []
 
-        # Fetch the most recent metadata for each source (for position/committee info)
+        # Rank by Bayesian trust x base influence, then take a per-category
+        # quota so one category (insiders) cannot crowd the others out.
+        ranked: list[tuple[float, tuple]] = []
         for r in rows:
-            src_type, src_id = r[0], r[1]
-            _total, correct, wrong = int(r[2]), int(r[3] or 0), int(r[4] or 0)
-            float(r[5]) if r[5] is not None else 0.0
-            float(r[6]) if r[6] is not None else 0.0
-            r[7]
-            avg_lead_hours = float(r[8]) if r[8] is not None else 0.0
-            float(r[9]) if r[9] is not None else 0.5
+            src_type = r[0]
+            category = _category_from_source_type(src_type)
+            if category == "unknown":
+                continue
+            correct, wrong = int(r[3] or 0), int(r[4] or 0)
+            trust = (correct + 1.0) / (correct + wrong + 2.0)
+            ranked.append((trust * INFLUENCE_WEIGHTS.get(category, 0.3), r))
+        ranked.sort(key=lambda x: x[0], reverse=True)
 
-            # Fetch latest signal metadata for context
-            meta_row = conn.execute(text("""
+        selected: list[tuple] = []
+        per_category: dict[str, int] = defaultdict(int)
+        for _score, r in ranked:
+            category = _category_from_source_type(r[0])
+            if per_category[category] >= MAX_PER_CATEGORY:
+                continue
+            per_category[category] += 1
+            selected.append(r)
+            if len(selected) >= MAX_LEVER_PULLERS:
+                break
+
+        for r in selected:
+            src_type, identity = r[0], r[1]
+            total_scored, correct, wrong = int(r[2]), int(r[3] or 0), int(r[4] or 0)
+            avg_lead_hours = float(r[6]) if r[6] is not None else 0.0
+
+            # Latest signal metadata for position/committee/title context
+            meta_row = conn.execute(text(f"""
                 SELECT signal_value FROM signal_sources
-                WHERE source_type = :st AND source_id = :si
+                WHERE source_type = :st AND {_IDENTITY_SQL} = :si
                 ORDER BY signal_date DESC
                 LIMIT 1
-            """), {"st": src_type, "si": src_id}).fetchone()
+            """), {"st": src_type, "si": identity}).fetchone()
 
             metadata: dict[str, Any] = {}
             if meta_row and meta_row[0]:
@@ -397,24 +710,21 @@ def identify_lever_pullers(engine: Engine) -> list[LeverPuller]:
                     pass
 
             category = _category_from_source_type(src_type)
-            influence = _influence_for_source(src_type, src_id, metadata)
-            position = _position_label(src_type, src_id, metadata)
+            influence = _influence_for_source(src_type, identity, metadata)
+            position = _position_label(src_type, identity, metadata)
 
             # Bayesian trust: (hits + 1) / (hits + misses + 2)
             trust = (correct + 1.0) / (correct + wrong + 2.0)
 
-            # Fetch best and worst calls
-            best_calls = _fetch_top_calls(conn, src_type, src_id, "CORRECT", limit=3)
-            worst_calls = _fetch_top_calls(conn, src_type, src_id, "WRONG", limit=3)
-
-            # Fetch recent actions
-            recent_actions = _fetch_recent_actions(conn, src_type, src_id, limit=5)
+            best_calls = _fetch_top_calls(conn, src_type, identity, "CORRECT", limit=3)
+            worst_calls = _fetch_top_calls(conn, src_type, identity, "WRONG", limit=3)
+            recent_actions = _fetch_recent_actions(conn, src_type, identity, limit=5)
 
             avg_lead_days = avg_lead_hours / 24.0 if avg_lead_hours else 0.0
 
             puller = LeverPuller(
-                id=f"{src_type}:{src_id}",
-                name=src_id,
+                id=f"{src_type}:{identity}",
+                name=identity,
                 category=category,
                 influence_rank=influence,
                 trust_score=round(trust, 4),
@@ -424,7 +734,10 @@ def identify_lever_pullers(engine: Engine) -> list[LeverPuller]:
                 avg_lead_time_days=round(avg_lead_days, 2),
                 best_calls=best_calls,
                 worst_calls=worst_calls,
+                total_signals=total_scored,
+                correct_signals=correct,
             )
+            derive_motivation_model(puller, engine)
             pullers.append(puller)
 
     # Sort by composite score: trust * influence
@@ -465,7 +778,7 @@ def _fetch_top_calls(
     rows = conn.execute(text(f"""
         SELECT ticker, signal_date, outcome_return, signal_type
         FROM signal_sources
-        WHERE source_type = :st AND source_id = :si AND outcome = :oc
+        WHERE source_type = :st AND {_IDENTITY_SQL} = :si AND outcome = :oc
           AND outcome_return IS NOT NULL
         ORDER BY outcome_return {order}
         LIMIT :lim
@@ -499,10 +812,10 @@ def _fetch_recent_actions(
     Returns:
         List of dicts with ticker, signal_date, signal_type, signal_value.
     """
-    rows = conn.execute(text("""
+    rows = conn.execute(text(f"""
         SELECT ticker, signal_date, signal_type, signal_value
         FROM signal_sources
-        WHERE source_type = :st AND source_id = :si
+        WHERE source_type = :st AND {_IDENTITY_SQL} = :si
         ORDER BY signal_date DESC
         LIMIT :lim
     """), {"st": source_type, "si": source_id, "lim": limit}).fetchall()
@@ -567,11 +880,14 @@ def _persist_lever_pullers(engine: Engine, pullers: list[LeverPuller]) -> None:
                 "mot": p.motivation_model,
                 "trust": p.trust_score,
                 "lead": p.avg_lead_time_days,
-                "total": len(p.recent_actions) + len(p.best_calls) + len(p.worst_calls),
-                "correct": len(p.best_calls),
+                # Real scored counts behind trust_score (the old value was the
+                # length of three preview lists, which made every puller 8/3).
+                "total": int(p.total_signals),
+                "correct": int(p.correct_signals),
                 "meta": json.dumps({
                     "best_calls": p.best_calls,
                     "worst_calls": p.worst_calls,
+                    "motivation_mix": p.motivation_mix,
                 }),
             })
 
@@ -629,24 +945,7 @@ def assess_motivation(
 
     # ── Insider motivation ──
     if puller.category == "insider":
-        # Buys are almost always informed (insiders buy for one reason)
-        if signal_type in ("BUY", "UNUSUAL_BUY"):
-            return "likely_informed"
-
-        # Large unusual sells = informed or hedging
-        is_unusual = details.get("is_unusual_size", False)
-        if is_unusual and signal_type in ("SELL", "UNUSUAL_SELL"):
-            return "hedging"
-
-        # Derivative transactions often routine
-        if details.get("is_derivative", False):
-            return "routine"
-
-        # Default sells to routine (many reasons to sell)
-        if "SELL" in signal_type:
-            return "routine"
-
-        return "unknown"
+        return _assess_insider_motivation(details, signal_type)
 
     # ── Fed motivation ──
     if puller.category == "fed":
@@ -656,12 +955,230 @@ def assess_motivation(
     if puller.category == "dealer":
         return "hedging"
 
-    # ── Institutional motivation ──
-    if puller.category == "institutional":
-        # Check if action aligns with recent trend or is contrarian
+    # ── Options tape: calls with an OI spike or size are positioning; puts are hedges ──
+    if puller.category == "options_flow":
+        direction = str(details.get("direction") or "").upper()
+        oi_ratio = _to_float(details.get("oi_ratio"))
+        notional = _to_float(details.get("notional"))
+        if direction == "PUT":
+            return "hedging"
+        if direction == "CALL" and ((oi_ratio or 0) >= 3.0 or (notional or 0) >= 1_000_000):
+            return "likely_informed"
+        return "routine" if direction else "unknown"
+
+    # ── Government awards and regulatory rules are mandate-driven ──
+    if puller.category in ("government", "regulator"):
+        return "institutional_mandate"
+
+    # ── Lobbying: large spend on a named bill is influence-seeking ──
+    if puller.category == "lobbyist":
+        amount = _to_float(details.get("Amount") or details.get("amount"))
+        return "likely_informed" if (amount or 0) >= 100_000 else "routine"
+
+    # ── Institutional / social: routine unless it breaks the actor's own pattern ──
+    if puller.category in ("institutional", "social"):
         return _assess_institutional_motivation(puller, action, engine)
 
     return "unknown"
+
+
+_MOTIVATION_PRIORITY: tuple[str, ...] = (
+    "likely_informed", "hedging", "contrarian", "institutional_mandate", "routine", "unknown",
+)
+
+
+def _to_float(value: Any) -> float | None:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f else None
+
+
+def _first_present(details: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    """Return the first non-empty value among *keys*, else None."""
+    for key in keys:
+        value = details.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _to_bool(value: Any) -> bool:
+    """Coerce a JSON/JSONB boolean-ish value to bool."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in _TRUE_STRINGS
+    return False
+
+
+def insider_transaction_code(details: dict[str, Any]) -> str:
+    """Extract the Form 4 transaction code from either insider feed.
+
+    Parameters:
+        details: Parsed ``signal_value`` for an insider row.
+
+    Returns:
+        Single upper-case code letter (``"P"``, ``"S"``, ``"M"``, ...), or
+        ``""`` when the row predates the code being carried through.
+    """
+    raw = _first_present(details, INSIDER_CODE_KEYS)
+    if raw is None:
+        return ""
+    return str(raw).strip().upper()[:1]
+
+
+def _insider_direction(details: dict[str, Any], signal_type: str) -> str:
+    """Decide whether an insider acquired or disposed of shares.
+
+    The Form 4 acquired/disposed code is authoritative and is preferred over
+    ``signal_type``: the QuiverQuant feed labels every insider row
+    "insider_sell" because it reads a TransactionType field the API does not
+    return, so its signal_type says nothing about direction. The Form 4
+    puller's own BUY/UNUSUAL_BUY/CLUSTER_BUY/SELL labels are reliable and are
+    used when no code is present.
+
+    Parameters:
+        details: Parsed ``signal_value`` for the row.
+        signal_type: ``signal_sources.signal_type``.
+
+    Returns:
+        ``"BUY"``, ``"SELL"`` or ``""``.
+    """
+    acq_disp = str(_first_present(details, INSIDER_ACQ_DISP_KEYS) or "").upper()[:1]
+    if acq_disp == "A":
+        return "BUY"
+    if acq_disp == "D":
+        return "SELL"
+
+    upper = (signal_type or "").upper()
+    if "BUY" in upper:
+        return "BUY"
+    if "SELL" in upper:
+        return "SELL"
+    return ""
+
+
+def _insider_value(details: dict[str, Any]) -> float:
+    """Dollar size of an insider transaction, across both feeds.
+
+    Parameters:
+        details: Parsed ``signal_value`` for the row.
+
+    Returns:
+        Trade value in dollars; 0.0 when neither feed supplies enough to
+        compute one.
+    """
+    value = _to_float(_first_present(details, INSIDER_VALUE_KEYS))
+    if value is not None:
+        return abs(value)
+
+    shares = _to_float(_first_present(details, INSIDER_SHARE_KEYS))
+    price = _to_float(_first_present(details, INSIDER_PRICE_KEYS))
+    if shares is not None and price is not None:
+        return abs(shares * price)
+    return 0.0
+
+
+def _insider_is_senior(details: dict[str, Any]) -> bool:
+    """True when the reporting owner is an officer or a director.
+
+    Parameters:
+        details: Parsed ``signal_value`` for the row.
+
+    Returns:
+        True for a C-suite or board-level reporting owner.
+    """
+    for key in INSIDER_SENIOR_FLAG_KEYS:
+        if _to_bool(details.get(key)):
+            return True
+    title = str(_first_present(details, INSIDER_TITLE_KEYS) or "")
+    if INSIDER_JUNIOR_TITLE_RE.search(title):
+        return False
+    return bool(INSIDER_SENIOR_TITLE_RE.search(title))
+
+
+def _assess_insider_motivation(details: dict[str, Any], signal_type: str) -> str:
+    """Classify one insider transaction from its Form 4 transaction code.
+
+    A Form 4 says *why* mechanically: a 10b5-1 plan sale was scheduled months
+    ago, an M is an option exercise, an A is a grant, an F is tax withholding,
+    a G is a gift — none of them is a market opinion. Only discretionary
+    open-market purchases (P) and sales (S) carry information, and only above
+    a size that makes them a considered bet.
+
+    Parameters:
+        details: Parsed ``signal_value`` for the row.
+        signal_type: ``signal_sources.signal_type``.
+
+    Returns:
+        "likely_informed", "routine" or "unknown".
+    """
+    if _to_bool(_first_present(details, INSIDER_PLAN_KEYS)):
+        return "routine"
+
+    code = insider_transaction_code(details)
+    if code in INSIDER_ROUTINE_CODES:
+        return "routine"
+
+    # P and S are open-market trades and state their own direction; anything
+    # else falls back to the acquired/disposed code or the signal type.
+    if code == "P":
+        direction = "BUY"
+    elif code == "S":
+        direction = "SELL"
+    else:
+        direction = _insider_direction(details, signal_type)
+
+    if not direction:
+        # An unranked code (C, D, I, J, K, V, W) with nothing else to go on.
+        return "unknown"
+
+    value = _insider_value(details)
+
+    if direction == "BUY":
+        if value >= INSIDER_INFORMED_BUY_VALUE or _insider_is_senior(details):
+            return "likely_informed"
+        return "routine"
+
+    # Discretionary (no plan flag, checked above) and large enough to be a
+    # decision rather than housekeeping.
+    if value >= INSIDER_INFORMED_SELL_VALUE:
+        return "likely_informed"
+    return "routine"
+
+
+def derive_motivation_model(puller: LeverPuller, engine: Engine) -> str:
+    """Set ``puller.motivation_model`` from the majority label of its recent actions.
+
+    ``assess_motivation`` classifies one action; the persisted model is the
+    label that dominates the puller's recent behaviour (ties broken by
+    ``_MOTIVATION_PRIORITY``, "unknown" only when nothing else was seen).
+    Also records the full label mix on ``puller.motivation_mix``.
+    """
+    counts: dict[str, int] = defaultdict(int)
+    for action in puller.recent_actions:
+        try:
+            label = assess_motivation(puller, action, engine)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("motivation assessment failed for {p}: {e}", p=puller.id, e=str(exc))
+            label = "unknown"
+        counts[label] += 1
+    puller.motivation_mix = dict(counts)
+    known = {k: v for k, v in counts.items() if k != "unknown"}
+    if not known:
+        puller.motivation_model = "unknown"
+        return puller.motivation_model
+    best = max(known.values())
+    for label in _MOTIVATION_PRIORITY:
+        if known.get(label) == best:
+            puller.motivation_model = label
+            return label
+    puller.motivation_model = max(known, key=known.get)  # pragma: no cover - priority covers every label
+    return puller.motivation_model
 
 
 def _assess_institutional_motivation(
@@ -682,29 +1199,40 @@ def _assess_institutional_motivation(
     Returns:
         Motivation string.
     """
-    signal_type = action.get("signal_type", "")
+    direction = _direction_of(action)
 
-    # Count recent action directions
-    buy_count = sum(
-        1 for a in puller.recent_actions
-        if "BUY" in a.get("signal_type", "")
-    )
-    sell_count = sum(
-        1 for a in puller.recent_actions
-        if "SELL" in a.get("signal_type", "")
-    )
+    # Count recent action directions (BUY/SELL, bullish/bearish, CALL/PUT)
+    buy_count = sum(1 for a in puller.recent_actions if _direction_of(a) == "BUY")
+    sell_count = sum(1 for a in puller.recent_actions if _direction_of(a) == "SELL")
 
     total = buy_count + sell_count
-    if total == 0:
+    if total == 0 or direction is None:
         return "unknown"
 
     # If mostly buying and this is a sell (or vice versa), it is contrarian
-    if "BUY" in signal_type and sell_count > buy_count:
+    if direction == "BUY" and sell_count > buy_count:
         return "contrarian"
-    if "SELL" in signal_type and buy_count > sell_count:
+    if direction == "SELL" and buy_count > sell_count:
         return "contrarian"
 
     return "routine"
+
+
+def _direction_of(action: dict[str, Any]) -> str | None:
+    """Normalise an action to "BUY" / "SELL" / None across feed vocabularies.
+
+    Insiders say BUY/SELL, Reddit heat spikes carry ``direction: BULLISH``
+    or ``BEARISH`` (signal_type HEAT_SPIKE), WSB rows are wsb_bullish /
+    wsb_bearish, options rows are CALL / PUT.
+    """
+    st = str(action.get("signal_type") or "").upper()
+    details = action.get("details") or {}
+    d = str(details.get("direction") or "").upper() if isinstance(details, dict) else ""
+    for token, out in (("BUY", "BUY"), ("SELL", "SELL"), ("BULLISH", "BUY"), ("BEARISH", "SELL"),
+                       ("CALL", "BUY"), ("PUT", "SELL")):
+        if token in st or token in d:
+            return out
+    return None
 
 
 # ── 3. Get Active Lever Events ───────────────────────────────────────────
@@ -729,10 +1257,10 @@ def get_active_lever_events(
     """
     _ensure_lever_table(engine)
 
-    # First, get known lever pullers. Dashboard callers can pass the list
-    # they already fetched so this helper does not rescan signal_sources.
-    known_pullers = pullers if pullers is not None else identify_lever_pullers(engine)
-    puller_map: dict[str, LeverPuller] = {p.id: p for p in known_pullers}
+    # Every qualified actor, not just the top-50 display list. Dashboard
+    # callers can pass the list they already fetched to skip the rescan.
+    known_pullers = pullers if pullers is not None else build_puller_index(engine)
+    puller_map = puller_map_of(known_pullers)
 
     cutoff = date.today() - timedelta(days=days)
     events: list[LeverEvent] = []
@@ -748,10 +1276,13 @@ def get_active_lever_events(
 
         for r in rows:
             src_type, src_id, ticker, sig_date, sig_type, sig_val, trust = r
-            puller_id = f"{src_type}:{src_id}"
+            puller_id = puller_id_for(src_type, src_id, sig_val)
             puller = puller_map.get(puller_id)
 
-            if puller is None:
+            if puller is None or puller.trust_score < MIN_EVENT_TRUST:
+                # Below the floor the source has never been right (options
+                # tapes score 0/1,900 under the current outcome rule); its
+                # rows would drown the event list without adding information.
                 continue
 
             # Parse signal value metadata
@@ -825,24 +1356,102 @@ def _motivation_narrative(
                 return f"Likely informed — {committee} has jurisdiction over {ticker}'s sector"
             return "Likely informed — large position or unusual timing"
         if puller.category == "insider":
-            return "Likely informed — insider buying own stock (skin in the game)"
+            return _insider_narrative(
+                "Likely informed",
+                "discretionary open-market trade",
+                details,
+            )
+        if puller.category == "options_flow":
+            return f"Likely informed — sized call positioning with an open-interest spike in {ticker}"
+        if puller.category == "lobbyist":
+            return "Likely informed — large lobbying spend on named legislation"
         return "Likely informed — unusual pattern"
 
     if motivation == "routine":
         if puller.category == "insider":
-            return "Routine — likely scheduled 10b5-1 plan or diversification"
+            return _insider_narrative(
+                "Routine", "not a discretionary market bet", details
+            )
+        if puller.category == "options_flow":
+            return "Routine — ordinary options tape, no size or OI anomaly"
         return "Routine rebalancing"
 
     if motivation == "hedging":
+        if puller.category == "options_flow":
+            return f"Hedging — put positioning in {ticker}"
         return "Hedging — position management or risk reduction"
 
     if motivation == "contrarian":
         return "Contrarian — acting against their recent pattern"
 
     if motivation == "institutional_mandate":
+        if puller.category == "government":
+            return "Institutional mandate — federal contract award"
+        if puller.category == "regulator":
+            return "Institutional mandate — regulatory rule"
         return "Institutional mandate — policy role"
 
+    if motivation == "unknown" and puller.category == "insider":
+        return _insider_narrative(
+            "Unknown motivation", "no ranked transaction code", details
+        )
+
     return "Unknown motivation — insufficient data"
+
+
+# Plain-English gloss for the Form 4 codes the narrative can encounter.
+INSIDER_CODE_LABELS: dict[str, str] = {
+    "P": "open-market purchase",
+    "S": "open-market sale",
+    "A": "grant or award",
+    "M": "option exercise",
+    "F": "shares withheld for tax",
+    "G": "gift",
+    "D": "disposition to the issuer",
+    "C": "conversion of a derivative",
+    "I": "discretionary transaction",
+    "J": "other",
+    "K": "equity swap",
+    "V": "voluntary early report",
+    "W": "acquisition by will or descent",
+    "X": "in-the-money option exercise",
+}
+
+
+def _insider_narrative(
+    verdict: str,
+    reason: str,
+    details: dict[str, Any],
+) -> str:
+    """Build an insider motivation narrative that names its evidence.
+
+    The old text asserted "likely scheduled 10b5-1 plan" for every routine
+    sell whether or not the filing said so. This prints what the Form 4
+    actually reported: the transaction code and the Rule 10b5-1 plan flag.
+
+    Parameters:
+        verdict: Leading verdict phrase ("Routine", "Likely informed", ...).
+        reason: Fallback clause when the row carries no transaction code.
+        details: Parsed ``signal_value`` for the row.
+
+    Returns:
+        Narrative motivation string.
+    """
+    code = insider_transaction_code(details)
+    is_plan = _to_bool(_first_present(details, INSIDER_PLAN_KEYS))
+
+    if code:
+        label = INSIDER_CODE_LABELS.get(code, "unclassified code")
+        clause = f"Form 4 code {code} ({label})"
+    else:
+        clause = f"{reason}; Form 4 code not recorded"
+
+    plan_clause = (
+        "under a Rule 10b5-1 plan"
+        if is_plan
+        else "no Rule 10b5-1 plan flag"
+    )
+    return f"{verdict} — {clause}, {plan_clause}"
 
 
 def _build_event_context(details: dict[str, Any]) -> str:
@@ -896,8 +1505,10 @@ def find_lever_convergence(engine: Engine, pullers: list[LeverPuller] | None = N
 
     cutoff = date.today() - timedelta(days=CONVERGENCE_WINDOW_DAYS)
 
-    known_pullers = pullers if pullers is not None else identify_lever_pullers(engine)
-    puller_map: dict[str, LeverPuller] = {p.id: p for p in known_pullers}
+    # Convergence is about how many independent qualified actors line up on
+    # a ticker, so it keys on the full puller index, not the display top-50.
+    known_pullers = pullers if pullers is not None else build_puller_index(engine)
+    puller_map = puller_map_of(known_pullers)
 
     convergences: list[dict] = []
 
@@ -916,12 +1527,14 @@ def find_lever_convergence(engine: Engine, pullers: list[LeverPuller] | None = N
     ticker_actions: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
         ticker, src_type, src_id, sig_type, sig_date, trust, sig_val = r
-        puller_id = f"{src_type}:{src_id}"
+        puller_id = puller_id_for(src_type, src_id, sig_val)
         if puller_id not in puller_map:
             continue
 
+        # Canonical id: an alias (same person from another feed) must not
+        # count as a second independent puller.
         ticker_actions[ticker].append({
-            "puller_id": puller_id,
+            "puller_id": puller_map[puller_id].id,
             "puller": puller_map[puller_id],
             "signal_type": sig_type,
             "signal_date": sig_date,
@@ -1265,7 +1878,7 @@ def get_lever_context_for_ticker(engine: Engine, ticker: str) -> dict:
     ticker = ticker.upper().strip()
 
     pullers = identify_lever_pullers(engine)
-    puller_map: dict[str, LeverPuller] = {p.id: p for p in pullers}
+    puller_map = puller_map_of(pullers)
 
     result: dict[str, Any] = {
         "ticker": ticker,
@@ -1294,7 +1907,7 @@ def get_lever_context_for_ticker(engine: Engine, ticker: str) -> dict:
         puller_signals: dict[str, list[dict]] = defaultdict(list)
         for r in rows:
             src_type, src_id, sig_type, sig_date, sig_val, trust, outcome, ret = r
-            puller_id = f"{src_type}:{src_id}"
+            puller_id = puller_id_for(src_type, src_id, sig_val)
 
             details: dict[str, Any] = {}
             if sig_val:

@@ -263,38 +263,53 @@ class ECBPuller(BasePuller):
 
         try:
             with self.engine.begin() as conn:
-                # Get matching dates where both series exist
+                # Latest vintage of each yield per obs_date. The plain
+                # self-join multiplied every date by its vintages and the
+                # loop then inserted the same obs_date twice inside one
+                # transaction (same pull_timestamp) — uq_raw_series_composite
+                # violations on every ECB pull (2026-09-10).
                 rows = conn.execute(
                     text(
-                        "SELECT a.obs_date, a.value AS btp, b.value AS bund "
-                        "FROM raw_series a "
-                        "JOIN raw_series b ON a.obs_date = b.obs_date "
-                        "WHERE a.series_id = 'italy_btp_10y' AND a.source_id = :src "
-                        "AND b.series_id = 'euro_bund_10y' AND b.source_id = :src "
-                        "AND a.pull_status = 'SUCCESS' AND b.pull_status = 'SUCCESS' "
-                        "ORDER BY a.obs_date"
+                        "WITH btp AS ("
+                        "  SELECT DISTINCT ON (obs_date) obs_date, value FROM raw_series "
+                        "  WHERE series_id = 'italy_btp_10y' AND source_id = :src "
+                        "    AND pull_status = 'SUCCESS' "
+                        "  ORDER BY obs_date, pull_timestamp DESC"
+                        "), bund AS ("
+                        "  SELECT DISTINCT ON (obs_date) obs_date, value FROM raw_series "
+                        "  WHERE series_id = 'euro_bund_10y' AND source_id = :src "
+                        "    AND pull_status = 'SUCCESS' "
+                        "  ORDER BY obs_date, pull_timestamp DESC"
+                        ") "
+                        "SELECT btp.obs_date, btp.value AS btp, bund.value AS bund "
+                        "FROM btp JOIN bund USING (obs_date) "
+                        "ORDER BY btp.obs_date"
                     ),
                     {"src": self.source_id},
                 ).fetchall()
 
+                existing = self._get_existing_dates("euro_btp_bund_spread", conn)
                 inserted = 0
                 for row in rows:
-                    spread = row[1] - row[2]  # BTP - Bund
-                    if self._row_exists("euro_btp_bund_spread", row[0], conn):
+                    obs_dt = row[0]
+                    if obs_dt in existing:
                         continue
+                    spread = row[1] - row[2]  # BTP - Bund
                     conn.execute(
                         text(
                             "INSERT INTO raw_series "
                             "(series_id, source_id, obs_date, value, pull_status) "
-                            "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
+                            "VALUES (:sid, :src, :od, :val, 'SUCCESS') "
+                            "ON CONFLICT DO NOTHING"
                         ),
                         {
                             "sid": "euro_btp_bund_spread",
                             "src": self.source_id,
-                            "od": row[0],
+                            "od": obs_dt,
                             "val": spread,
                         },
                     )
+                    existing.add(obs_dt)
                     inserted += 1
 
                 result["rows_inserted"] = inserted

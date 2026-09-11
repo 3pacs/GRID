@@ -1,7 +1,10 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useMemo } from 'react';
 import { api } from '../api.js';
 import { shared, colors, tokens } from '../styles/shared.js';
 import { formatRelative, formatFullDateTime } from '../utils/formatTime.js';
+import { useAsyncData } from '../hooks/useAsyncData.js';
+import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
+import ErrorState from '../components/ErrorState.jsx';
 
 const MONO = "'JetBrains Mono', 'IBM Plex Mono', monospace";
 const SANS = "'IBM Plex Sans', -apple-system, sans-serif";
@@ -291,19 +294,15 @@ function Empty({ msg }) {
 
 export default function Archive() {
     const [activeTab, setActiveTab] = useState('deep_dives');
-    const [archive, setArchive] = useState(null);
-    const [loading, setLoading] = useState(true);
     const [generating, setGenerating] = useState(false);
     const [playerUrl, setPlayerUrl] = useState(null);
     const [days, setDays] = useState(90);
 
-    useEffect(() => {
-        setLoading(true);
-        api.getResearchArchive(days).then(r => {
-            setArchive(r);
-            setLoading(false);
-        }).catch(() => setLoading(false));
-    }, [days]);
+    const { data: archive, loading, error, refetch: loadArchive } = useAsyncData(async () => {
+        const r = await api.getResearchArchive(days);
+        if (r?.error) throw new Error(r.message || 'Failed to load research archive');
+        return r;
+    }, { fallback: null, deps: [days] });
 
     const triggerDeepDive = async () => {
         setGenerating(true);
@@ -401,9 +400,10 @@ export default function Archive() {
             </div>
 
             {/* Content */}
-            {loading ? (
-                <div style={{ textAlign: 'center', padding: '40px', fontFamily: MONO,
-                    fontSize: '12px', color: colors.textDim }}>Loading archive...</div>
+            {loading && !archive ? (
+                <LoadingSkeleton variant="card" count={3} />
+            ) : error ? (
+                <ErrorState error={error} onRetry={loadArchive} title="Research archive unavailable" />
             ) : (
                 <div>
                     {activeTab === 'deep_dives' && <DeepDiveList dives={archive?.deep_dives} />}

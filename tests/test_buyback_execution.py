@@ -2,6 +2,10 @@
 
 Covers:
     - BuybackSnapshot dataclass ratio computation (happy path + zero-profit).
+    - net_repurchases sign reconciliation: FRED publishes NCBCEBQ027S as net
+      *issuance* (negative when the sector is a net repurchaser), so the
+      puller stores the negated value and records the multiplier.
+    - A FRED 400 (retired series id) logs WARNING, not ERROR.
     - run_buyback_puller top-level entrypoint with a mock engine.
     - Composite execution_ratio materialization (only where both inputs
       exist for the same period).
@@ -170,11 +174,11 @@ class TestRunBuybackPuller:
         engine, _, inserts = _mock_engine()
 
         responses = {
-            "NCBBCCB1Q027S": _mock_response(
+            "NCBCEBQ027S": _mock_response(
                 _fred_payload(
                     [
-                        ("2024-09-30", "800000.0"),
-                        ("2024-12-31", "900000.0"),
+                        ("2024-09-30", "-800000.0"),
+                        ("2024-12-31", "-900000.0"),
                     ]
                 )
             ),
@@ -189,7 +193,7 @@ class TestRunBuybackPuller:
             "BOGZ1FU104122005Q": _mock_response(
                 _fred_payload([("2024-12-31", "123.0")])
             ),
-            "NCBEIAQ027S": _mock_response(
+            "BOGZ1FA105050005Q": _mock_response(
                 _fred_payload([("2024-12-31", "456.0")])
             ),
         }
@@ -230,11 +234,11 @@ class TestRunBuybackPuller:
         # Net repurchases has Q3 + Q4. Profits has only Q4. Composite
         # should therefore appear only for Q4.
         responses = {
-            "NCBBCCB1Q027S": _mock_response(
+            "NCBCEBQ027S": _mock_response(
                 _fred_payload(
                     [
-                        ("2024-09-30", "800000.0"),
-                        ("2024-12-31", "900000.0"),
+                        ("2024-09-30", "-800000.0"),
+                        ("2024-12-31", "-900000.0"),
                     ]
                 )
             ),
@@ -280,14 +284,14 @@ class TestRunBuybackPuller:
 
         # CPATAX fails, the other three succeed.
         responses = {
-            "NCBBCCB1Q027S": _mock_response(
-                _fred_payload([("2024-12-31", "900000.0")])
+            "NCBCEBQ027S": _mock_response(
+                _fred_payload([("2024-12-31", "-900000.0")])
             ),
             "CPATAX": _mock_response({}, status_code=500),
             "BOGZ1FU104122005Q": _mock_response(
                 _fred_payload([("2024-12-31", "100.0")])
             ),
-            "NCBEIAQ027S": _mock_response(
+            "BOGZ1FA105050005Q": _mock_response(
                 _fred_payload([("2024-12-31", "200.0")])
             ),
         }
@@ -312,11 +316,11 @@ class TestRunBuybackPuller:
         engine, _, inserts = _mock_engine()
 
         responses = {
-            "NCBBCCB1Q027S": _mock_response(
+            "NCBCEBQ027S": _mock_response(
                 _fred_payload(
                     [
                         ("2024-09-30", "."),
-                        ("2024-12-31", "900000.0"),
+                        ("2024-12-31", "-900000.0"),
                     ]
                 )
             ),
@@ -352,8 +356,8 @@ class TestRunBuybackPuller:
         engine, _, inserts = _mock_engine(existing_dates=existing)
 
         responses = {
-            "NCBBCCB1Q027S": _mock_response(
-                _fred_payload([("2024-12-31", "900000.0")])
+            "NCBCEBQ027S": _mock_response(
+                _fred_payload([("2024-12-31", "-900000.0")])
             ),
             "CPATAX": _mock_response(
                 _fred_payload([("2024-12-31", "1500.0")])
@@ -361,7 +365,7 @@ class TestRunBuybackPuller:
             "BOGZ1FU104122005Q": _mock_response(
                 _fred_payload([("2024-12-31", "123.0")])
             ),
-            "NCBEIAQ027S": _mock_response(
+            "BOGZ1FA105050005Q": _mock_response(
                 _fred_payload([("2024-12-31", "456.0")])
             ),
         }
@@ -397,6 +401,92 @@ class TestRunBuybackPuller:
 # Direct puller smoke test (ensures class wiring works even without the
 # run_* entrypoint path).
 # ---------------------------------------------------------------------------
+
+
+class TestNetRepurchasesSign:
+    """FRED's net-issuance sign must be flipped to match the GRID label."""
+
+    def _patch_fred(self, responses: dict[str, MagicMock]) -> Any:
+        def _side_effect(url, params=None, timeout=None):  # noqa: ANN001
+            sid = (params or {}).get("series_id")
+            if sid in responses:
+                return responses[sid]
+            return _mock_response({"observations": []})
+
+        return _side_effect
+
+    def test_negative_net_issuance_stored_as_positive_repurchases(self) -> None:
+        """A quarter of net buybacks must land as a positive value."""
+        engine, _, inserts = _mock_engine()
+
+        responses = {
+            "NCBCEBQ027S": _mock_response(
+                _fred_payload([("2024-12-31", "-900000.0")])
+            ),
+        }
+        with patch(
+            "ingestion.altdata.buyback_execution.requests.get",
+            side_effect=self._patch_fred(responses),
+        ):
+            run_buyback_puller(engine, api_key="fake-key")
+
+        rows = [
+            ins for ins in inserts if ins["sid"] == "buybacks:net_repurchases"
+        ]
+        assert len(rows) == 1
+        assert rows[0]["val"] == pytest.approx(900000.0)
+
+    def test_net_issuance_quarter_stored_as_negative_repurchases(self) -> None:
+        """A quarter of net issuance must land as a negative value."""
+        engine, _, inserts = _mock_engine()
+
+        responses = {
+            "NCBCEBQ027S": _mock_response(
+                _fred_payload([("2024-12-31", "125000.0")])
+            ),
+        }
+        with patch(
+            "ingestion.altdata.buyback_execution.requests.get",
+            side_effect=self._patch_fred(responses),
+        ):
+            run_buyback_puller(engine, api_key="fake-key")
+
+        rows = [
+            ins for ins in inserts if ins["sid"] == "buybacks:net_repurchases"
+        ]
+        assert len(rows) == 1
+        assert rows[0]["val"] == pytest.approx(-125000.0)
+
+    def test_sign_multiplier_is_recorded_in_payload(self) -> None:
+        """Provenance: the applied multiplier must survive into raw_payload."""
+        import json
+
+        engine, _, inserts = _mock_engine()
+
+        responses = {
+            "NCBCEBQ027S": _mock_response(
+                _fred_payload([("2024-12-31", "-900000.0")])
+            ),
+            "CPATAX": _mock_response(
+                _fred_payload([("2024-12-31", "1500.0")])
+            ),
+        }
+        with patch(
+            "ingestion.altdata.buyback_execution.requests.get",
+            side_effect=self._patch_fred(responses),
+        ):
+            run_buyback_puller(engine, api_key="fake-key")
+
+        by_sid = {ins["sid"]: json.loads(ins["payload"]) for ins in inserts}
+        assert by_sid["buybacks:net_repurchases"]["sign"] == -1.0
+        assert by_sid["buybacks:net_repurchases"]["fred_series"] == "NCBCEBQ027S"
+        assert by_sid["buybacks:profits_after_tax"]["sign"] == 1.0
+
+    def test_only_net_repurchases_is_negated(self) -> None:
+        """Every other configured series keeps FRED's published sign."""
+        for label, cfg in BUYBACK_SERIES.items():
+            expected = -1.0 if label == "net_repurchases" else 1.0
+            assert cfg.get("sign", 1.0) == expected, label
 
 
 class TestBuybackExecutionPuller:

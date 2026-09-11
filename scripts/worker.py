@@ -313,6 +313,32 @@ def claim_next_job(coordinator, worker_id, gpu_available, ollama_available, excl
     return r.json()
 
 
+#: Seconds to wait for the coordinator to acknowledge a completion report.
+#: 30 s produced a daily stream of "Read timed out" followed by 400s: the
+#: coordinator had recorded the result, the retry then hit an invalid
+#: COMPLETED -> COMPLETED transition.
+COMPLETE_TIMEOUT_S = 90
+
+#: Job states in which a completion report has already been recorded.
+TERMINAL_JOB_STATES = frozenset({"COMPLETED", "FAILED", "VALID", "ASSIMILATED"})
+
+
+def job_already_recorded(coordinator, job_id):
+    """True when the coordinator already holds a terminal state for *job_id*.
+
+    Used after a failed ``/complete`` call: a read timeout or a 400 on retry
+    usually means the first report landed and the retry is redundant.
+    """
+    try:
+        r = requests.get(f"{coordinator}/jobs/{job_id}", timeout=10)
+        r.raise_for_status()
+        state = str((r.json() or {}).get("state", "")).upper()
+        return state in TERMINAL_JOB_STATES
+    except Exception as exc:  # noqa: BLE001 — best-effort probe
+        log.debug("Could not read job #{j} state: {e}", j=job_id, e=exc)
+        return False
+
+
 def run_claimed_job(job, coordinator, worker_id):
     job_id = job["id"]
 
@@ -341,13 +367,20 @@ def run_claimed_job(job, coordinator, worker_id):
     reported = False
     for attempt in range(1, 4):
         try:
-            r = requests.post(f"{coordinator}/jobs/{job_id}/complete", json=payload, timeout=30)
+            r = requests.post(f"{coordinator}/jobs/{job_id}/complete", json=payload,
+                              timeout=COMPLETE_TIMEOUT_S)
             r.raise_for_status()
             reported = True
             break
         except Exception as exc:
-            log.error("Failed to report result for job #{id} attempt {a}: {e}",
-                      id=job_id, a=attempt, e=exc)
+            if job_already_recorded(coordinator, job_id):
+                log.info("Job #{id} result already recorded by coordinator (attempt {a}: {e})",
+                         id=job_id, a=attempt, e=exc)
+                reported = True
+                break
+            level = log.warning if attempt < 3 else log.error
+            level("Failed to report result for job #{id} attempt {a}: {e}",
+                  id=job_id, a=attempt, e=exc)
             time.sleep(min(attempt * 2, 5))
 
     if error:

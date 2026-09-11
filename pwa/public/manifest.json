@@ -1,7 +1,7 @@
 {
-  "name": "GRID Intelligence",
-  "short_name": "GRID",
-  "description": "Systematic Trading Intelligence Platform",
+  "name": "stepdad.finance",
+  "short_name": "stepdad",
+  "description": "Ask a plain-language question about your money and get a straight answer.",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#080C10",

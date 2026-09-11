@@ -1,5 +1,8 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { api } from '../api.js';
+import { useAsyncData } from '../hooks/useAsyncData.js';
+import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
+import ErrorState from '../components/ErrorState.jsx';
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -504,7 +507,6 @@ export default function InfluenceNetwork({ selectedTicker = '' }) {
   const [graphData, setGraphData] = useState({ nodes: [], links: [], metadata: {} });
   const [loops, setLoops] = useState([]);
   const [hypocrisy, setHypocrisy] = useState([]);
-  const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('graph');
   const [selectedNode, setSelectedNode] = useState(null);
   const [nodeDetail, setNodeDetail] = useState(null);
@@ -524,25 +526,17 @@ export default function InfluenceNetwork({ selectedTicker = '' }) {
   }, []);
 
   // Fetch data
-  useEffect(() => {
-    async function load() {
-      setLoading(true);
-      try {
-        const [graphRes, loopsRes, hypocrisyRes] = await Promise.all([
-          api.get('/api/v1/intelligence/influence').catch(() => ({ nodes: [], links: [], metadata: {} })),
-          api.get('/api/v1/intelligence/influence/circular-flows').catch(() => ({ loops: [] })),
-          api.get('/api/v1/intelligence/influence/hypocrisy').catch(() => ({ flags: [] })),
-        ]);
-        setGraphData(graphRes);
-        setLoops(loopsRes.loops || []);
-        setHypocrisy(hypocrisyRes.flags || []);
-      } catch (err) {
-        console.error('Influence network load failed:', err);
-      }
-      setLoading(false);
-    }
-    load();
-  }, []);
+  const { data, loading, error, refetch } = useAsyncData(async () => {
+    const [graphRes, loopsRes, hypocrisyRes] = await Promise.all([
+      api.get('/api/v1/intelligence/influence'),
+      api.get('/api/v1/intelligence/influence/circular-flows'),
+      api.get('/api/v1/intelligence/influence/hypocrisy'),
+    ]);
+    setGraphData(graphRes);
+    setLoops(loopsRes.loops || []);
+    setHypocrisy(hypocrisyRes.flags || []);
+    return graphRes;
+  }, { fallback: null });
 
   // Load detail for selected company node
   const handleSelectNode = useCallback(async (node) => {
@@ -625,10 +619,10 @@ export default function InfluenceNetwork({ selectedTicker = '' }) {
         ))}
       </div>
 
-      {loading ? (
-        <div style={{ padding: 60, textAlign: 'center', color: COLORS.textDim, fontFamily: MONO, fontSize: 13 }}>
-          Loading influence network...
-        </div>
+      {loading && !data ? (
+        <LoadingSkeleton variant="chart" count={1} />
+      ) : error ? (
+        <ErrorState error={error} onRetry={refetch} title="Influence network unavailable" />
       ) : (
         <>
           {activeTab === 'graph' && (

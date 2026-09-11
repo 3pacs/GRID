@@ -71,52 +71,60 @@ class TestClientGracefulDegradation:
 # ---------------------------------------------------------------------------
 
 class TestEmbeddingsGracefulDegradation:
-    """Verify embeddings return None gracefully when node is down."""
+    """Verify embeddings return None gracefully when no embed node answers.
 
-    def test_embeddings_returns_none_gracefully(self):
+    Each test pins ``_embed`` to None rather than relying on the real chain
+    being unreachable from CI — otherwise these would pass for the wrong
+    reason on a runner that can actually reach koala or z400.
+    """
+
+    @staticmethod
+    def _dark_embedder(monkeypatch) -> GRIDEmbeddings:
+        embedder = GRIDEmbeddings()
+        monkeypatch.setattr(embedder, "_embed", lambda texts: None)
+        return embedder
+
+    def test_embeddings_returns_none_gracefully(self, monkeypatch):
         """semantic_similarity_matrix should return None without raising."""
-        client = HyperspaceClient(
-            base_url="http://localhost:9999/v1",
-            timeout=2,
-        )
-        embedder = GRIDEmbeddings(client)
+        embedder = self._dark_embedder(monkeypatch)
 
         result = embedder.semantic_similarity_matrix(["feat_a", "feat_b"])
         assert result is None
 
-    def test_embed_features_returns_none(self):
+    def test_embed_features_returns_none(self, monkeypatch):
         """embed_features should return None without raising."""
-        client = HyperspaceClient(
-            base_url="http://localhost:9999/v1",
-            timeout=2,
-        )
-        embedder = GRIDEmbeddings(client)
+        embedder = self._dark_embedder(monkeypatch)
 
         result = embedder.embed_features(["feat_a", "feat_b"])
         assert result is None
 
-    def test_find_similar_returns_empty(self):
+    def test_find_similar_returns_empty(self, monkeypatch):
         """find_similar_features should return empty list without raising."""
-        client = HyperspaceClient(
-            base_url="http://localhost:9999/v1",
-            timeout=2,
-        )
-        embedder = GRIDEmbeddings(client)
+        embedder = self._dark_embedder(monkeypatch)
 
         result = embedder.find_similar_features("credit stress", ["a", "b"])
         assert isinstance(result, list)
         assert len(result) == 0
 
-    def test_embed_hypothesis_returns_none(self):
+    def test_embed_hypothesis_returns_none(self, monkeypatch):
         """embed_hypothesis should return None without raising."""
-        client = HyperspaceClient(
-            base_url="http://localhost:9999/v1",
-            timeout=2,
-        )
-        embedder = GRIDEmbeddings(client)
+        embedder = self._dark_embedder(monkeypatch)
 
         result = embedder.embed_hypothesis("test hypothesis")
         assert result is None
+
+    def test_embeddings_work_without_a_hyperspace_client(self, monkeypatch):
+        """Embeddings must not depend on the retired :8080 Hyperspace node.
+
+        Regression guard for hand-off 04: GRIDEmbeddings used to gate every
+        method on ``hyperspace_client.is_available``, so retiring that node
+        would have silently disabled all semantic analysis.
+        """
+        embedder = GRIDEmbeddings()  # no client at all
+        assert embedder.client is None
+        monkeypatch.setattr(embedder, "_embed", lambda texts: [[1.0, 0.0]])
+
+        assert embedder.embed_hypothesis("a statement") == [1.0, 0.0]
 
 
 # ---------------------------------------------------------------------------
@@ -198,27 +206,33 @@ class TestMonitorGracefulDegradation:
 # ---------------------------------------------------------------------------
 
 class TestHypothesisDedupLogic:
-    """Test dedup logic using mocked embeddings (no network required)."""
+    """Test dedup logic using mocked embeddings (no network required).
 
-    def test_dedup_identifies_near_duplicate(self):
+    Since 2026-09-10 vectors come from ``llm.router.embed`` (the tailnet GPU
+    embed chain), not from the Hyperspace client — so the seam these tests
+    patch is ``GRIDEmbeddings._embed``.
+    """
+
+    def test_dedup_identifies_near_duplicate(self, monkeypatch):
         """Nearly identical statements should be flagged as duplicates."""
-        client = MagicMock(spec=HyperspaceClient)
-        client.is_available = True
+        embedder = GRIDEmbeddings()
 
-        embedder = GRIDEmbeddings(client)
-
-        # Mock embed to return controlled vectors
+        # Controlled vectors:
         # Near-duplicate: vectors pointing in nearly the same direction
         # Different: vector pointing in a different direction
         near_dup_vec = [1.0, 0.0, 0.0]
         original_vec = [0.99, 0.1, 0.0]  # Very close to near_dup
         different_vec = [0.0, 0.0, 1.0]  # Orthogonal
 
-        client.embed.return_value = [
-            near_dup_vec,   # new_statement
-            original_vec,   # first existing (near-duplicate)
-            different_vec,  # second existing (different)
-        ]
+        monkeypatch.setattr(
+            embedder,
+            "_embed",
+            lambda texts: [
+                near_dup_vec,   # new_statement
+                original_vec,   # first existing (near-duplicate)
+                different_vec,  # second existing (different)
+            ],
+        )
 
         is_dup, match = embedder.hypothesis_dedup_check(
             new_statement="Yield curve inversion predicts recession within 12 months",
@@ -233,19 +247,20 @@ class TestHypothesisDedupLogic:
         assert is_dup is True
         assert match == "Inverted yield curve is a leading indicator of recession within one year"
 
-    def test_dedup_clears_different_statement(self):
+    def test_dedup_clears_different_statement(self, monkeypatch):
         """A genuinely different statement should not be flagged."""
-        client = MagicMock(spec=HyperspaceClient)
-        client.is_available = True
-
-        embedder = GRIDEmbeddings(client)
+        embedder = GRIDEmbeddings()
 
         # New statement vector is orthogonal to all existing
-        client.embed.return_value = [
-            [0.0, 0.0, 1.0],   # new (orthogonal)
-            [1.0, 0.0, 0.0],   # existing 1
-            [0.0, 1.0, 0.0],   # existing 2
-        ]
+        monkeypatch.setattr(
+            embedder,
+            "_embed",
+            lambda texts: [
+                [0.0, 0.0, 1.0],   # new (orthogonal)
+                [1.0, 0.0, 0.0],   # existing 1
+                [0.0, 1.0, 0.0],   # existing 2
+            ],
+        )
 
         is_dup, match = embedder.hypothesis_dedup_check(
             new_statement="Copper-gold ratio predicts manufacturing PMI direction",
@@ -261,10 +276,7 @@ class TestHypothesisDedupLogic:
 
     def test_dedup_handles_empty_existing(self):
         """Empty existing list should return not duplicate."""
-        client = MagicMock(spec=HyperspaceClient)
-        client.is_available = True
-
-        embedder = GRIDEmbeddings(client)
+        embedder = GRIDEmbeddings()
 
         is_dup, match = embedder.hypothesis_dedup_check(
             new_statement="test",

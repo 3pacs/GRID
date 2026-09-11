@@ -32,14 +32,15 @@ def ins(fid, d, val, sid):
     cur.execute("INSERT INTO resolved_series (feature_id,obs_date,release_date,vintage_date,value,source_priority_used) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", (fid,d,d,d,val,sid))
 
 total = 0
-EIA_KEY = 'QAz3bg00oRnsiRgFrBJy3k8xI36lklWW6q7CdNEg'
-NOAA_KEY = 'TAbZzkQbuOqhjvwZNsrNVLDYZyLiWCLH'
+# Keys come from the environment via config.py (never literals). Sections
+# whose key is missing are skipped with a warning so the script still runs.
+EIA_KEY = settings.EIA_API_KEY
+NOAA_KEY = settings.NOAA_TOKEN
 
 # ═══════════════════════════════════════════
 # 1. EIA — Energy data
 # ═══════════════════════════════════════════
 log.info("--- EIA Energy ---")
-sid = get_src('EIA')
 
 eia_series = {
     'eia_crude_stocks': ('PET.WCESTUS1.W', 'commodity', 'US Crude Oil Stocks Weekly'),
@@ -52,10 +53,27 @@ eia_series = {
     'eia_electricity_demand': ('ELEC.GEN.ALL-US-99.M', 'macro', 'US Electricity Generation Monthly'),
 }
 
+if not EIA_KEY:
+    log.warning("EIA_API_KEY not set -- skipping EIA energy series")
+    eia_series = {}
+else:
+    sid = get_src('EIA')
+
 for feat_name, (series_id, family, desc) in eia_series.items():
     fid = get_fid(feat_name, family, desc)
     try:
-        r = requests.get(f"https://api.eia.gov/v2/seriesid/{series_id}?api_key={EIA_KEY}&frequency=weekly&start=2024-01-01&sort[0][column]=period&sort[0][direction]=desc&length=500", timeout=30)
+        r = requests.get(
+            f"https://api.eia.gov/v2/seriesid/{series_id}",
+            params={
+                "api_key": EIA_KEY,
+                "frequency": "weekly",
+                "start": "2024-01-01",
+                "sort[0][column]": "period",
+                "sort[0][direction]": "desc",
+                "length": 500,
+            },
+            timeout=30,
+        )
         data = r.json()
         rows = data.get('response', {}).get('data', [])
         count = 0
@@ -78,24 +96,6 @@ for feat_name, (series_id, family, desc) in eia_series.items():
 # 2. NOAA — Heating/Cooling degree days
 # ═══════════════════════════════════════════
 log.info("\n--- NOAA Climate ---")
-noaa_sid = get_src('NOAA')
-
-# National HDD/CDD from NOAA
-try:
-    r = requests.get("https://www.ncei.noaa.gov/cdo-web/api/v2/data?datasetid=NORMAL_ANN&datatypeid=ANN-HTDD-NORMAL&locationid=FIPS:06&startdate=2024-01-01&enddate=2026-03-20&limit=1000",
-        headers={"token": NOAA_KEY}, timeout=30)
-    data = r.json().get('results', [])
-    if data:
-        fid = get_fid('noaa_hdd_ca', 'macro', 'CA Heating Degree Days Annual Normal')
-        for row in data:
-            d = row.get('date', '')[:10]
-            v = row.get('value')
-            if d and v: ins(fid, d, float(v), noaa_sid); total += 1
-        log.info("  CA HDD normals: {} rows", len(data))
-    else:
-        log.info("  CA HDD: no data returned")
-except Exception as e:
-    log.error("  NOAA HDD: ERROR {}", e)
 
 # NOAA recent daily temps for major stations
 stations = {
@@ -103,6 +103,29 @@ stations = {
     'noaa_chicago_temp': ('GHCND:USW00094846', 'Chicago OHare'),
     'noaa_houston_temp': ('GHCND:USW00012960', 'Houston Intercontinental'),
 }
+
+if not NOAA_KEY:
+    log.warning("NOAA_TOKEN not set -- skipping NOAA climate series")
+    stations = {}
+else:
+    noaa_sid = get_src('NOAA')
+    # National HDD/CDD from NOAA
+    try:
+        r = requests.get("https://www.ncei.noaa.gov/cdo-web/api/v2/data?datasetid=NORMAL_ANN&datatypeid=ANN-HTDD-NORMAL&locationid=FIPS:06&startdate=2024-01-01&enddate=2026-03-20&limit=1000",
+            headers={"token": NOAA_KEY}, timeout=30)
+        data = r.json().get('results', [])
+        if data:
+            fid = get_fid('noaa_hdd_ca', 'macro', 'CA Heating Degree Days Annual Normal')
+            for row in data:
+                d = row.get('date', '')[:10]
+                v = row.get('value')
+                if d and v: ins(fid, d, float(v), noaa_sid); total += 1
+            log.info("  CA HDD normals: {} rows", len(data))
+        else:
+            log.info("  CA HDD: no data returned")
+    except Exception as e:
+        log.error("  NOAA HDD: ERROR {}", e)
+
 for feat_name, (station, desc) in stations.items():
     try:
         r = requests.get(f"https://www.ncei.noaa.gov/cdo-web/api/v2/data?datasetid=GHCND&datatypeid=TMAX,TMIN&stationid={station}&startdate=2025-01-01&enddate=2026-03-20&limit=1000&units=standard",

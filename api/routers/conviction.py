@@ -55,22 +55,35 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger as log
 from sqlalchemy.engine import Engine
 
-from api.auth import require_auth
+from api.auth import require_auth, require_role
 from api.dependencies import get_db_engine
 from intelligence.decision_gateway import should_i_trade
 from intelligence.llm_narrator import narrate_trade
+from intelligence.long_plays import (
+    build_long_plays_board,
+    load_latest_board,
+    persist_board,
+)
 from intelligence.pair_conviction import (
     DEFAULT_PAIR_CANDIDATES,
     generate_pair_ticket,
     scan_candidate_pairs,
 )
 from intelligence.signal_health_monitor import audit_all_series
-from intelligence.universe_ranker import rank_universe
+from intelligence.universe_ranker import (
+    list_rankings,
+    load_latest_ranking,
+    rank_universe,
+)
 
 
 # ── Router ────────────────────────────────────────────────────────────────
 
 router = APIRouter(prefix="/api/v1/conviction", tags=["conviction"])
+
+# Module-level so tests can override it via ``app.dependency_overrides``
+# (``require_role(...)`` returns a fresh closure on every call).
+_require_admin = require_role("admin")
 
 
 # ── Constants ─────────────────────────────────────────────────────────────
@@ -164,6 +177,101 @@ def _error(status_code: int, stage: str, exc: Exception) -> HTTPException:
             "error_type": type(exc).__name__,
         },
     )
+
+
+# ── GET /sweeps, /sweeps/latest ──────────────────────────────────────────
+#
+# Read-back of the persisted universe sweeps (``universe_ranking_history``).
+# The Sunday 05:00 long-horizon job in ``intelligence/scheduler.py`` writes
+# 90 d rankings here; the canvas paints those verdicts without re-running
+# the decision stack. Declared before ``/ticker/{ticker}`` for clarity only —
+# the prefixes do not collide.
+
+
+@router.get("/sweeps/latest")
+async def get_latest_sweep(
+    horizon_days: int | None = Query(
+        None,
+        ge=1,
+        le=365,
+        description="Only sweeps run at this horizon (e.g. 90 for the weekly long-horizon sweep).",
+    ),
+    universe: str | None = Query(
+        None,
+        description="Only sweeps over this universe name (e.g. 'custom', 'SP500').",
+    ),
+    engine: Engine = Depends(get_db_engine),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Most recent persisted sweep. 404 when none has run yet."""
+    universe_name = universe.strip() if universe and universe.strip() else None
+    row = load_latest_ranking(engine, horizon_days=horizon_days, universe_name=universe_name)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "stage": "load_latest_ranking",
+                "error": "no persisted sweep matches; the weekly job has not run yet",
+                "horizon_days": horizon_days,
+                "universe": universe_name,
+            },
+        )
+    return _to_serializable(row)
+
+
+@router.get("/sweeps")
+async def list_sweeps(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    horizon_days: int | None = Query(None, ge=1, le=365),
+    engine: Engine = Depends(get_db_engine),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Persisted sweeps, newest first (``entries``/``total``/``has_more``)."""
+    return _to_serializable(
+        list_rankings(engine, limit=limit, offset=offset, horizon_days=horizon_days)
+    )
+
+
+# ── GET /long-plays, POST /long-plays/refresh ────────────────────────────
+#
+# Read-back of the persisted Long Plays board (``long_plays_board``), the
+# multi-year 10x/100x candidate surface built by ``intelligence/long_plays.py``.
+# The Sunday 05:30 job writes it; ``/refresh`` lets an admin rebuild it now.
+# Every projection on the board is a labelled proxy, never a forecast.
+
+
+@router.get("/long-plays")
+async def get_long_plays(
+    engine: Engine = Depends(get_db_engine),
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Most recent persisted Long Plays board. 404 when none has run yet."""
+    board = load_latest_board(engine)
+    if board is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "stage": "load_latest_board",
+                "error": "no persisted long-plays board; the weekly job has not run yet",
+            },
+        )
+    return _to_serializable(board)
+
+
+@router.post("/long-plays/refresh")
+async def refresh_long_plays(
+    top_k: int = Query(25, ge=1, le=100, description="Candidates kept on the board."),
+    engine: Engine = Depends(get_db_engine),
+    _token: str = Depends(_require_admin),
+) -> dict[str, Any]:
+    """Admin only: rebuild the board now, persist it, and return it."""
+    try:
+        board = build_long_plays_board(engine, top_k=top_k)
+    except Exception as exc:  # noqa: BLE001
+        raise _error(500, "build_long_plays_board", exc) from exc
+    row_id = persist_board(engine, board)
+    return _to_serializable({"persisted_id": row_id, **board})
 
 
 # ── GET /ticker/{ticker} ─────────────────────────────────────────────────

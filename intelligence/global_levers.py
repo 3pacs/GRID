@@ -1626,7 +1626,47 @@ def get_lever_hierarchy(engine: Engine | None = None) -> dict[str, Any]:
         "summary": domain_summaries,
         "total_domains": len(hierarchy),
         "total_actors": sum(s["actor_count"] for s in domain_summaries.values()),
+        "actor_communities": _fetch_curated_communities(engine) if engine else [],
     }
+
+
+CURATED_COMMUNITY_LIMIT = 12
+
+
+def _fetch_curated_communities(engine: Engine, limit: int = CURATED_COMMUNITY_LIMIT) -> list[dict[str, Any]]:
+    """Largest communities of the curated (named market actor) graph, with leaders.
+
+    Reads ``actor_analytics_curated`` (``scripts/graph_analytics.py --scope
+    curated``). Empty list when the table is missing or the read fails, so
+    the lever map still renders.
+    """
+    try:
+        from store.graph import (
+            get_community_category_mix,
+            get_community_list,
+            get_community_members,
+        )
+
+        out: list[dict[str, Any]] = []
+        for c in get_community_list(engine=engine, scope="curated", limit=limit):
+            cid = c["community_id"]
+            leaders = get_community_members(cid, limit=4, engine=engine, scope="curated")
+            mix = get_community_category_mix(cid, limit=4, engine=engine, scope="curated")
+            out.append({
+                "community_id": cid,
+                "member_count": c["member_count"],
+                "label": c.get("top_category") or (mix[0]["category"] if mix else "unknown"),
+                "leaders": [
+                    {"actor_id": m["actor_id"], "name": m["name"], "category": m["category"],
+                     "pagerank": round(float(m.get("pagerank") or 0), 6)}
+                    for m in leaders
+                ],
+                "category_mix": mix,
+            })
+        return out
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Curated community read skipped: {e}", e=str(exc))
+        return []
 
 
 _CATEGORY_TO_DOMAIN: dict[str, str] = {
@@ -1645,6 +1685,17 @@ _CATEGORY_TO_DOMAIN: dict[str, str] = {
     "regulator": "regulation",
     "commodity_trader": "energy",
     "trade_official": "trade",
+    # signal_sources.source_type values (the dynamic-actor injector keys on these)
+    "options_flow": "capital_allocation",
+    "quiverquant:house": "fiscal_policy",
+    "quiverquant:senate": "fiscal_policy",
+    "quiverquant:insider": "capital_allocation",
+    "quiverquant:lobbying": "regulation",
+    "gov_contract": "fiscal_policy",
+    "export_control": "regulation",
+    "crucix_idea": "information",
+    "social": "information",
+    "darkpool": "capital_allocation",
 }
 
 

@@ -33,13 +33,69 @@ from db import execute_sql, get_connection
 # 1. Load actor graph from PostgreSQL
 # ---------------------------------------------------------------------------
 
-def load_actor_graph() -> nx.DiGraph:
-    """Build a NetworkX DiGraph from actor_connections and actors tables."""
-    log.info("Loading actor connections from database...")
-    edges = execute_sql(
-        "SELECT actor_a, actor_b, relationship, strength "
-        "FROM actor_connections"
-    )
+# Scopes: "full" is every actor_connections edge (3.4M actors, dominated by
+# the ICIJ / PEP / sanctions dumps); "curated" keeps only edges whose two
+# endpoints are named market actors, so the communities describe who moves
+# markets rather than which offshore service provider registered whom.
+SCOPES: dict[str, str] = {
+    "full": "actor_analytics",
+    "curated": "actor_analytics_curated",
+}
+
+# Bulk-import categories excluded from the curated subgraph.
+DUMP_CATEGORIES: tuple[str, ...] = (
+    "pep", "person_of_interest", "entity_of_interest", "donor",
+    "sanctioned", "ofac_sanctioned", "unknown", "other",
+)
+DUMP_CATEGORY_PREFIX = "icij"
+
+# Feed constants that were ingested as if they were actors (qq_insider_trading,
+# qq_house_trading, ...). They connect to every ticker they ever reported on
+# and would otherwise be the highest-PageRank "actor" in the curated graph.
+ARTEFACT_ID_PREFIX = "qq_"
+
+_CURATED_EDGE_SQL = (
+    "SELECT c.actor_a, c.actor_b, c.relationship, c.strength "
+    "FROM actor_connections c "
+    "JOIN actors a ON a.id = c.actor_a "
+    "JOIN actors b ON b.id = c.actor_b "
+    "WHERE a.category NOT LIKE %s AND b.category NOT LIKE %s "
+    "  AND NOT (a.category = ANY(%s)) AND NOT (b.category = ANY(%s)) "
+    "  AND a.id NOT LIKE %s AND b.id NOT LIKE %s "
+    "  AND a.name NOT LIKE %s AND b.name NOT LIKE %s "
+    "  AND a.merged_into IS NULL AND b.merged_into IS NULL"
+)
+
+
+def table_for_scope(scope: str) -> str:
+    """Analytics table for a scope; raises on anything outside the whitelist."""
+    try:
+        return SCOPES[scope]
+    except KeyError:
+        raise ValueError(f"Unknown graph scope '{scope}'. Must be one of: {sorted(SCOPES)}") from None
+
+
+def load_actor_graph(scope: str = "full") -> nx.DiGraph:
+    """Build a NetworkX DiGraph from actor_connections and actors tables.
+
+    ``scope="curated"`` restricts edges to those between named market actors
+    (see ``DUMP_CATEGORIES`` / ``DUMP_CATEGORY_PREFIX``).
+    """
+    table_for_scope(scope)
+    log.info("Loading actor connections from database (scope={s})...", s=scope)
+    if scope == "curated":
+        prefix = f"{DUMP_CATEGORY_PREFIX}%"
+        artefact = f"{ARTEFACT_ID_PREFIX}%"
+        edges = execute_sql(
+            _CURATED_EDGE_SQL,
+            (prefix, prefix, list(DUMP_CATEGORIES), list(DUMP_CATEGORIES),
+             artefact, artefact, artefact, artefact),
+        )
+    else:
+        edges = execute_sql(
+            "SELECT actor_a, actor_b, relationship, strength "
+            "FROM actor_connections"
+        )
     log.info("Loaded {n} edges", n=len(edges))
 
     if not edges:
@@ -107,17 +163,27 @@ def compute_communities(G: nx.DiGraph) -> dict[str, int]:
     Returns an empty dict and logs a warning when the dep is unavailable.
     """
     log.info("Computing Louvain community detection...")
-    try:
-        from community import community_louvain  # python-louvain
-    except ImportError:
-        log.warning(
-            "python-louvain not installed — skipping community detection. "
-            "Returning empty partition."
-        )
-        return {}
     t0 = time.time()
     G_undirected = G.to_undirected()
-    partition = community_louvain.best_partition(G_undirected, weight="weight")
+    try:
+        from community import community_louvain  # python-louvain
+
+        partition = community_louvain.best_partition(G_undirected, weight="weight")
+    except ImportError:
+        # networkx >= 2.8 ships its own Louvain; use it so a missing wheel
+        # does not silently leave every community_id NULL.
+        louvain = getattr(getattr(nx, "community", None), "louvain_communities", None)
+        if louvain is None or G_undirected.number_of_edges() == 0:
+            log.warning(
+                "python-louvain not installed and networkx has no louvain_communities — "
+                "skipping community detection. Returning empty partition."
+            )
+            return {}
+        log.info("python-louvain not installed — using networkx louvain_communities")
+        partition = {}
+        for cid, members in enumerate(louvain(G_undirected, weight="weight", seed=42)):
+            for node in members:
+                partition[node] = cid
     n_communities = len(set(partition.values()))
     log.info("Louvain found {c} communities in {t:.1f}s", c=n_communities, t=time.time() - t0)
     return partition
@@ -187,19 +253,26 @@ def store_results(
     hubs: dict[str, float],
     authorities: dict[str, float],
     batch_size: int = 1000,
+    scope: str = "full",
 ) -> int:
-    """Batch UPSERT analytics results into actor_analytics table."""
+    """Batch UPSERT analytics results into the scope's analytics table."""
+    table = table_for_scope(scope)
     nodes = list(G.nodes())
     total = len(nodes)
-    log.info("Storing analytics for {n} actors...", n=total)
+    log.info("Storing analytics for {n} actors into {t}...", n=total, t=table)
     t0 = time.time()
     stored = 0
+    purged = 0
+    from datetime import datetime, timezone
+
+    run_started_at = datetime.now(timezone.utc)
 
     with get_connection() as conn:
         with conn.cursor() as cur:
-            # Ensure the table exists (idempotent)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS actor_analytics (
+            # Ensure the table exists (idempotent). ``table`` comes from the
+            # SCOPES whitelist, never from user input.
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {table} (
                     actor_id            TEXT PRIMARY KEY REFERENCES actors(id) ON DELETE CASCADE,
                     pagerank            DOUBLE PRECISION DEFAULT 0,
                     community_id        INTEGER,
@@ -216,8 +289,9 @@ def store_results(
                 batch = nodes[i : i + batch_size]
                 values_list = []
                 params = []
-                for idx, node_id in enumerate(batch):
-                    idx * 8
+                for node_id in batch:
+                    # computed_at = NOW() is >= run_started_at, so the purge
+                    # below never removes a row written by this run.
                     values_list.append(
                         "(%s, %s, %s, %s, %s, %s, %s, %s, NOW())"
                     )
@@ -233,7 +307,7 @@ def store_results(
                     ])
 
                 sql = (
-                    "INSERT INTO actor_analytics "
+                    f"INSERT INTO {table} "
                     "(actor_id, pagerank, community_id, betweenness, eigenvector, "
                     "degree_centrality, hub_score, authority_score, computed_at) "
                     "VALUES " + ", ".join(values_list) + " "
@@ -254,8 +328,18 @@ def store_results(
                 if pct % 10 < (batch_size / total * 100) or i == 0:
                     log.info("Stored {s}/{t} actors ({p:.0f}%)", s=stored, t=total, p=pct)
 
+            # Rows for actors that left the graph (or, for the curated scope,
+            # were excluded as feed artefacts) must not survive the run,
+            # otherwise a stale node keeps leading its old community.
+            cur.execute(
+                f"DELETE FROM {table} WHERE computed_at < %s",
+                (run_started_at,),
+            )
+            rc = getattr(cur, "rowcount", None)
+            purged = rc if isinstance(rc, int) and rc >= 0 else 0
+
     elapsed = time.time() - t0
-    log.info("All {n} actors stored in {t:.1f}s", n=stored, t=elapsed)
+    log.info("All {n} actors stored in {t:.1f}s ({p} stale rows purged)", n=stored, t=elapsed, p=purged)
     return stored
 
 
@@ -332,15 +416,29 @@ def print_summary(
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-def run_graph_analytics() -> dict:
-    """Execute the full graph analytics pipeline. Returns summary dict."""
+def run_graph_analytics(scope: str = "full") -> dict:
+    """Execute the full graph analytics pipeline. Returns summary dict.
+
+    ``scope="curated"`` analyses only the named-market-actor subgraph and
+    stores into ``actor_analytics_curated`` (the full table is untouched).
+    """
     t_start = time.time()
+    table_for_scope(scope)
+
+    if scope == "curated":
+        # _CURATED_EDGE_SQL filters on actors.merged_into (SEC filer names
+        # folded into their ticker / insider actor by fold_actor_aliases).
+        # migration 0061 is the contract; this idempotent DDL keeps the weekly
+        # job self-healing on a tree that has not applied it yet.
+        from intelligence.actor_identity import ensure_merged_into_column
+
+        ensure_merged_into_column()
 
     # Load graph
-    G = load_actor_graph()
+    G = load_actor_graph(scope=scope)
     if G.number_of_nodes() == 0:
         log.warning("Empty graph — nothing to analyze")
-        return {"nodes": 0, "edges": 0, "communities": 0, "elapsed_s": 0}
+        return {"nodes": 0, "edges": 0, "communities": 0, "elapsed_s": 0, "scope": scope}
 
     # Compute all metrics
     pagerank = compute_pagerank(G)
@@ -357,6 +455,7 @@ def run_graph_analytics() -> dict:
     stored = store_results(
         G, pagerank, communities, betweenness,
         eigenvector, degree_cent, hubs, authorities,
+        scope=scope,
     )
 
     # Print summary
@@ -371,9 +470,16 @@ def run_graph_analytics() -> dict:
         "communities": len(set(communities.values())),
         "stored": stored,
         "elapsed_s": round(elapsed, 1),
+        "scope": scope,
     }
 
 
 if __name__ == "__main__":
-    result = run_graph_analytics()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="GRID actor graph analytics")
+    parser.add_argument("--scope", choices=sorted(SCOPES), default="full",
+                        help="full = every edge; curated = named market actors only")
+    args = parser.parse_args()
+    result = run_graph_analytics(scope=args.scope)
     log.info("Done: {r}", r=result)

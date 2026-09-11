@@ -12,8 +12,9 @@ many reasons (diversification, taxes, planned sales). Cluster buys
 strong signals.
 
 Series stored with pattern: INSIDER:{ticker}:{insider_name}:{txn_type}
-Fields: ticker, insider_name, insider_title, transaction_type, shares,
-        price, value, filing_date, transaction_date
+Fields: ticker, insider_name, insider_title, transaction_type,
+        transaction_code, shares, price, value, filing_date,
+        transaction_date, is_10b5_1, direct_or_indirect
 Tracked: cluster buys (multiple insiders buying = strong signal),
          unusual size (>$500K)
 """
@@ -88,6 +89,46 @@ _TXN_CODES: dict[str, str] = {
     "V": "VOLUNTARY",  # Voluntary reporting
     "W": "WILL",      # Acquisition by will or laws of descent
 }
+
+# Footnote wording that identifies a Rule 10b5-1 trading plan. Filers write it
+# a dozen ways ("Rule 10b5-1", "10b5-1(c)", "10b5 1 plan"), so match loosely.
+_RULE_10B5_1_RE: re.Pattern[str] = re.compile(r"10\s*b5[\s\-‐-―]?1", re.IGNORECASE)
+
+# XML boolean-ish values used by the SEC ownership schema for <aff10b5One>.
+_XML_TRUE_VALUES: frozenset[str] = frozenset({"1", "true", "y", "yes"})
+
+
+def _xml_flag_is_true(raw: str | None) -> bool:
+    """Interpret an SEC ownership-schema boolean element.
+
+    Parameters:
+        raw: Element text (``"1"``, ``"true"``, ``"0"``, None, ...).
+
+    Returns:
+        True when the element asserts the flag.
+    """
+    if not raw:
+        return False
+    return raw.strip().lower() in _XML_TRUE_VALUES
+
+
+def _collect_footnotes(root: Any) -> dict[str, str]:
+    """Map footnote id -> footnote text for a parsed Form 4 document.
+
+    Parameters:
+        root: Parsed ``ownershipDocument`` element.
+
+    Returns:
+        Dict of ``{"F1": "This sale was made pursuant to a Rule 10b5-1 ..."}``.
+    """
+    footnotes: dict[str, str] = {}
+    for note in root.findall(".//footnotes/footnote"):
+        note_id = note.get("id") or ""
+        if not note_id:
+            continue
+        # Footnotes occasionally carry inline markup; ``itertext`` flattens it.
+        footnotes[note_id] = " ".join(t.strip() for t in note.itertext() if t.strip())
+    return footnotes
 
 
 def _normalize_insider_name(name: str) -> str:
@@ -348,10 +389,22 @@ class InsiderFilingsPuller(BasePuller):
         if not insider_name:
             return []
 
+        # Rule 10b5-1 attestation. Schema X0508+ carries <aff10b5One> as a
+        # direct child of <ownershipDocument> for the whole filing; older
+        # filings only say so in a footnote on the transaction itself.
+        doc_flag = root.find("aff10b5One")
+        doc_10b5_1 = _xml_flag_is_true(doc_flag.text if doc_flag is not None else None)
+        footnotes = _collect_footnotes(root)
+
         # Extract non-derivative transactions
         for txn in root.findall(".//nonDerivativeTransaction"):
             txn_dict = self._parse_transaction_element(
-                txn, ticker, insider_name, insider_title
+                txn,
+                ticker,
+                insider_name,
+                insider_title,
+                footnotes=footnotes,
+                doc_10b5_1=doc_10b5_1,
             )
             if txn_dict:
                 transactions.append(txn_dict)
@@ -359,12 +412,52 @@ class InsiderFilingsPuller(BasePuller):
         # Extract derivative transactions
         for txn in root.findall(".//derivativeTransaction"):
             txn_dict = self._parse_transaction_element(
-                txn, ticker, insider_name, insider_title, is_derivative=True
+                txn,
+                ticker,
+                insider_name,
+                insider_title,
+                is_derivative=True,
+                footnotes=footnotes,
+                doc_10b5_1=doc_10b5_1,
             )
             if txn_dict:
                 transactions.append(txn_dict)
 
         return transactions
+
+    @staticmethod
+    def _transaction_is_10b5_1(
+        elem: Any,
+        footnotes: dict[str, str],
+        doc_10b5_1: bool,
+    ) -> bool:
+        """Decide whether one transaction was made under a Rule 10b5-1 plan.
+
+        Three sources, in order of reliability: the filing-level
+        ``<aff10b5One>`` attestation, a transaction-scoped ``<aff10b5One>``,
+        and the text of any footnote the transaction references.
+
+        Parameters:
+            elem: Transaction XML element.
+            footnotes: Document footnote id -> text map.
+            doc_10b5_1: Filing-level attestation.
+
+        Returns:
+            True when the transaction is a planned (non-discretionary) trade.
+        """
+        if doc_10b5_1:
+            return True
+
+        for flag in elem.findall(".//aff10b5One"):
+            if _xml_flag_is_true(flag.text):
+                return True
+
+        for ref in elem.findall(".//footnoteId"):
+            note = footnotes.get(ref.get("id") or "", "")
+            if note and _RULE_10B5_1_RE.search(note):
+                return True
+
+        return False
 
     def _parse_transaction_element(
         self,
@@ -373,6 +466,8 @@ class InsiderFilingsPuller(BasePuller):
         insider_name: str,
         insider_title: str,
         is_derivative: bool = False,
+        footnotes: dict[str, str] | None = None,
+        doc_10b5_1: bool = False,
     ) -> dict[str, Any] | None:
         """Parse a single transaction XML element.
 
@@ -382,6 +477,8 @@ class InsiderFilingsPuller(BasePuller):
             insider_name: Reporting owner name.
             insider_title: Officer title if applicable.
             is_derivative: Whether this is a derivative transaction.
+            footnotes: Document footnote id -> text map (for 10b5-1 detection).
+            doc_10b5_1: Filing-level Rule 10b5-1 attestation.
 
         Returns:
             Parsed transaction dict, or None if unparseable.
@@ -429,6 +526,13 @@ class InsiderFilingsPuller(BasePuller):
 
         value = shares * price
 
+        # Direct vs indirect ownership (held personally, or through a trust /
+        # LLC / family member). Indirect sales carry less signal.
+        nature_elem = elem.find(".//ownershipNature/directOrIndirectOwnership/value")
+        direct_or_indirect = ""
+        if nature_elem is not None and nature_elem.text:
+            direct_or_indirect = nature_elem.text.strip().upper()[:1]
+
         return {
             "ticker": ticker,
             "insider_name": insider_name,
@@ -441,6 +545,10 @@ class InsiderFilingsPuller(BasePuller):
             "value": value,
             "transaction_date": txn_date,
             "is_derivative": is_derivative,
+            "is_10b5_1": self._transaction_is_10b5_1(
+                elem, footnotes or {}, doc_10b5_1
+            ),
+            "direct_or_indirect": direct_or_indirect,
         }
 
     # ------------------------------------------------------------------ #
@@ -554,6 +662,8 @@ class InsiderFilingsPuller(BasePuller):
                 "ticker": trade["ticker"],
                 "sdate": trade["transaction_date"],
                 "stype2": signal_type,
+                # ``price`` stays the trade price per share —
+                # trust_scorer._extract_price reads it as the entry price.
                 "sval": json.dumps({
                     "insider_title": trade.get("insider_title", ""),
                     "shares": trade.get("shares", 0),
@@ -561,6 +671,9 @@ class InsiderFilingsPuller(BasePuller):
                     "value": trade.get("value", 0),
                     "is_derivative": trade.get("is_derivative", False),
                     "is_unusual_size": is_unusual,
+                    "transaction_code": trade.get("transaction_code", ""),
+                    "is_10b5_1": bool(trade.get("is_10b5_1", False)),
+                    "direct_or_indirect": trade.get("direct_or_indirect", ""),
                 }),
             },
         )
@@ -670,6 +783,11 @@ class InsiderFilingsPuller(BasePuller):
                                 filing_date_str = source.get("file_date", "")
                                 for t in trades:
                                     t["filing_date"] = filing_date_str
+                                    # Keep the source document addressable so a
+                                    # later backfill can re-parse the filing
+                                    # instead of guessing at missing fields.
+                                    t["accession"] = adsh
+                                    t["filing_url"] = file_url
                                 all_trades.extend(trades)
                             filings_processed += 1
                     except SECRateLimitedError as exc:
@@ -759,6 +877,10 @@ class InsiderFilingsPuller(BasePuller):
                         "filing_date": trade.get("filing_date", ""),
                         "transaction_date": trade["transaction_date"].isoformat(),
                         "is_derivative": trade["is_derivative"],
+                        "is_10b5_1": trade.get("is_10b5_1", False),
+                        "direct_or_indirect": trade.get("direct_or_indirect", ""),
+                        "accession": trade.get("accession", ""),
+                        "filing_url": trade.get("filing_url", ""),
                     },
                 )
                 rows_inserted += 1

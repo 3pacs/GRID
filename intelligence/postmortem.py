@@ -477,6 +477,7 @@ def batch_postmortem(
         SELECT id FROM oracle_predictions
         WHERE verdict = 'miss'
           AND scored_at >= :cutoff
+          AND id NOT LIKE 'astrogrid:%'
           AND id NOT IN (
               SELECT prediction_id FROM trade_postmortems
               WHERE prediction_id IS NOT NULL

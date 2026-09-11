@@ -58,6 +58,12 @@ CREATE INDEX IF NOT EXISTS idx_raw_series_obs_date
     ON raw_series (obs_date DESC);
 CREATE INDEX IF NOT EXISTS idx_raw_series_series_id
     ON raw_series (series_id);
+-- Drives the resolver's window (`pull_timestamp >= watermark`), which runs on
+-- every Hermes cycle. Present on griddb since before 2026-09-11 but never
+-- declared here, so a fresh database would sequential-scan the largest table
+-- in the system (1.93B rows / 510 GB as of 2026-09-11) every five minutes.
+CREATE INDEX IF NOT EXISTS idx_raw_series_pull_timestamp
+    ON raw_series (pull_timestamp DESC);
 
 -- ============================================================
 -- TABLE: dad_ticker_summary_cache
@@ -291,6 +297,39 @@ CREATE INDEX IF NOT EXISTS idx_decision_journal_confidence
     ON decision_journal (operator_confidence);
 CREATE INDEX IF NOT EXISTS idx_decision_journal_outcome_recorded
     ON decision_journal (outcome_recorded_at);
+
+-- ---------------------------------------------------------------------------
+-- regime_history — the daily regime label, one row per observation date.
+--
+-- Written by scripts/auto_regime.py (daily via ingestion/scheduler.py, and by
+-- its --backfill entry point). Read by api/routers/chat.py, api/routers/intel.py,
+-- oracle/prediction_context.py, store/astrogrid.py and grid/signals/trial_signal.py.
+--
+-- ``regime`` carries auto_regime's own state names. That is what the 2026-03
+-- rows on griddb hold (the load wrote decision_journal.inferred_state verbatim)
+-- and what the readers that act on the value expect — trial_signal gates BUY on
+-- {GROWTH, NEUTRAL} and stores the label into a CHECK-constrained column.
+--
+-- The table existed on griddb long before it was declared here, which is how
+-- it came to have no writer in the repository at all.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS regime_history (
+    obs_date    DATE PRIMARY KEY,
+    regime      TEXT NOT NULL CHECK (upper(regime) IN (
+                    'GROWTH', 'NEUTRAL', 'FRAGILE', 'CRISIS')),
+    confidence  DOUBLE PRECISION CHECK (confidence BETWEEN 0 AND 1),
+    source      TEXT,
+    -- Newest real observation behind the label, measured before any
+    -- forward-fill. obs_date is the day the row was computed FOR (today, on a
+    -- scheduled run); data_as_of is the day the data is actually from. They
+    -- diverge whenever the pipeline stalls, and only this column makes that
+    -- visible — a row whose inputs stopped in April still carries today's
+    -- obs_date. Nullable: rows written before this column existed cannot have
+    -- it reconstructed.
+    data_as_of  DATE CONSTRAINT ck_regime_history_data_as_of
+                     CHECK (data_as_of IS NULL OR data_as_of <= obs_date),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
 -- Partial index for conflict reporting
 CREATE INDEX IF NOT EXISTS idx_resolved_series_conflict_detail
