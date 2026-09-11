@@ -305,7 +305,11 @@ SEED_MAPPINGS: dict[str, str] = {
     # ── CNN Fear & Greed (prefix: feargreed.) ─────────────────────────────
     "feargreed.cnn_value": "feargreed_cnn_value",
     "feargreed.cnn_previous_close": "feargreed_cnn_previous_close",
-    "feargreed.crypto_value": "feargreed_crypto_value",
+    # TYPO-FIX 2026-09-11: feargreed_crypto_value has no feature_registry row
+    # (verified on griddb), so this mapping resolved to None and every one of
+    # the ~30 rows/30d this puller writes was dropped. crypto_fear_greed
+    # (registry id 199) is the registered feature for exactly this series.
+    "feargreed.crypto_value": "crypto_fear_greed",
 
     # ── Philadelphia Fed ADS Index ────────────────────────────────────────
     "ads.business_conditions_index": "ads_business_conditions",
@@ -640,6 +644,24 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "YF:ETH-USD:volume": "eth_total_volume",
     "YF:SOL-USD:volume": "sol_total_volume",
     "YF:BTC-USD:volume": "btc_total_volume",
+
+    # ── Crypto spot prices (2026-09-11) ───────────────────────────────────
+    # The *volume* series above were mapped; the prices never were, so
+    # YF:BTC-USD:close and YF:ETH-USD:close have been landing in raw_series
+    # daily (31 rows each in the 30 d to 2026-09-11, newest 2026-09-11) and
+    # going nowhere. Their features already exist: btc_usd_full id=2787,
+    # eth_usd_full id=2788, sol_usd_full id=2789 (verified on griddb), so
+    # these are mappings only, no feature_registry insert needed.
+    "YF:BTC-USD:close": "btc_usd_full",
+    "YF:BTC-USD:adj_close": "btc_usd_full",
+    "YF:ETH-USD:close": "eth_usd_full",
+    "YF:ETH-USD:adj_close": "eth_usd_full",
+    # SOL is pre-positioned, not a live win: sol_usd_full is registered but
+    # YF:SOL-USD:close had 0 rows in the 30 d to 2026-09-11 — the puller is
+    # not currently producing it. Mapping it now is inert and becomes correct
+    # the moment it does, rather than being a second thing to remember.
+    "YF:SOL-USD:close": "sol_usd_full",
+    "YF:SOL-USD:adj_close": "sol_usd_full",
     "YF:TAO-USD:close": "tao_chain_market_cap",
     "YF:TAO-USD:volume": "tao_chain_total_volume",
     "YF:BRK-B:close": "brk-b_full",
