@@ -235,7 +235,7 @@ class TestSingleSourceUnit:
 
     @patch("normalization.resolver.EntityMap")
     def test_resolved_summary_keys_always_present(self, MockEntityMap):
-        """resolve_pending must always return all three summary keys."""
+        """resolve_pending must always return the full summary contract."""
         mock_map = MagicMock()
         mock_map.get_feature_id.return_value = None
         MockEntityMap.return_value = mock_map
@@ -244,7 +244,10 @@ class TestSingleSourceUnit:
         resolver = Resolver(db_engine=engine)
         summary = resolver.resolve_pending()
 
-        assert set(summary.keys()) == {"resolved", "conflicts_found", "errors"}
+        assert set(summary.keys()) == {
+            "resolved", "conflicts_found", "errors",
+            "series_scanned", "duration_s", "dry_run",
+        }
 
     @patch("normalization.resolver.EntityMap")
     def test_pull_timestamp_date_extracted_for_release_date(self, MockEntityMap):
@@ -580,7 +583,10 @@ class TestSkipAndErrorUnit:
         resolver = Resolver(db_engine=engine)
         summary = resolver.resolve_pending()
 
-        assert summary == {"resolved": 0, "conflicts_found": 0, "errors": 0}
+        assert summary["resolved"] == 0
+        assert summary["conflicts_found"] == 0
+        assert summary["errors"] == 0
+        assert summary["series_scanned"] == 0
 
     def test_db_error_returns_error_count(self):
         engine = MagicMock()
@@ -1119,3 +1125,282 @@ class TestConflictDetection:
 
         # Should complete without errors
         assert result["errors"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Unit tests — resolution window, watermark and dry run
+#
+# The Hermes cycle runs every 5 minutes and cannot afford the 30-day default
+# window, so it passes `since` (a persisted watermark) and a 2-day fallback.
+# These tests pin the parameterization of that window and the dry-run path
+# used to measure cost before turning the cycle back on.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingEngine:
+    """Engine double that records every (sql, params) pair it executes.
+
+    Returns one series_id from the DISTINCT query and one raw row from the
+    worker query, so a full resolve_pending() pass runs end to end without a
+    database.
+    """
+
+    def __init__(self, raw_rows: list[tuple] | None = None) -> None:
+        self.calls: list[tuple[str, dict]] = []
+        self.inserts: list[list[dict]] = []
+        self._raw_rows = raw_rows if raw_rows is not None else [
+            ("VIXCLS", date(2026, 9, 10), 17.5, 3, datetime(2026, 9, 10, 12, 0), 1, "FRED"),
+        ]
+
+    # -- connection plumbing ------------------------------------------------
+    def _conn(self):
+        engine = self
+
+        class _Result:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def fetchall(self):
+                return self._rows
+
+            def fetchone(self):
+                return self._rows[0] if self._rows else None
+
+        class _Conn:
+            def execute(self, statement, params=None):
+                sql = str(statement)
+                engine.calls.append((sql, params))
+                if isinstance(params, list):          # executemany → INSERT
+                    engine.inserts.append(params)
+                    return _Result([])
+                if "SELECT DISTINCT" in sql:
+                    return _Result(
+                        [(sid,) for sid in sorted({r[0] for r in engine._raw_rows})]
+                    )
+                if "FROM raw_series rs" in sql:
+                    sids = set(params.get("sids", [])) if params else set()
+                    return _Result([r for r in engine._raw_rows if r[0] in sids])
+                if "feature_registry" in sql:
+                    return _Result([(1, "vol")])
+                return _Result([])
+
+        class _Ctx:
+            def __enter__(self_inner):
+                return _Conn()
+
+            def __exit__(self_inner, *_exc):
+                return False
+
+        return _Ctx()
+
+    def begin(self):
+        return self._conn()
+
+    def connect(self):
+        return self._conn()
+
+    # -- helpers ------------------------------------------------------------
+    def window_params(self) -> list[dict]:
+        """Params of every statement carrying the pull_timestamp window."""
+        return [
+            p for sql, p in self.calls
+            if isinstance(p, dict) and "pull_timestamp >= COALESCE" in sql
+        ]
+
+
+def _patched_entity_map(monkeypatch, feature_id: int | None = 1):
+    """Point the resolver's EntityMap at a stub mapping every series."""
+    class _Stub:
+        def __init__(self, _engine):
+            pass
+
+        def get_feature_id(self, _series_id):
+            return feature_id
+
+    monkeypatch.setattr("normalization.resolver.EntityMap", _Stub)
+
+
+class TestResolutionWindow:
+
+    def test_lookback_is_a_bound_parameter(self, monkeypatch):
+        """The window must bind :lookback — never interpolate it into SQL."""
+        _patched_entity_map(monkeypatch)
+        engine = _RecordingEngine()
+        Resolver(db_engine=engine).resolve_pending(lookback_days=2, workers=1)
+
+        windows = engine.window_params()
+        assert windows, "no windowed statement executed"
+        for params in windows:
+            assert params["lookback"] == 2
+            assert params["since"] is None
+        for sql, _ in engine.calls:
+            assert "INTERVAL '2 day" not in sql
+
+    def test_since_watermark_overrides_lookback(self, monkeypatch):
+        """A watermark is passed through as :since on every windowed query."""
+        _patched_entity_map(monkeypatch)
+        engine = _RecordingEngine()
+        watermark = datetime(2026, 9, 10, 18, 0)
+
+        Resolver(db_engine=engine).resolve_pending(
+            lookback_days=2, workers=1, since=watermark,
+        )
+
+        windows = engine.window_params()
+        assert windows
+        for params in windows:
+            assert params["since"] == watermark
+
+    def test_until_bounds_the_window(self, monkeypatch):
+        """`until` is bound as an exclusive upper bound for chunked backfills."""
+        _patched_entity_map(monkeypatch)
+        engine = _RecordingEngine()
+        start, end = datetime(2026, 3, 29), datetime(2026, 4, 5)
+
+        Resolver(db_engine=engine).resolve_pending(
+            workers=1, since=start, until=end,
+        )
+
+        windows = engine.window_params()
+        assert windows
+        for params in windows:
+            assert params["since"] == start
+            assert params["until"] == end
+
+    def test_window_sql_uses_no_string_interpolation(self):
+        """The window predicate must be a literal with bound params only."""
+        import inspect
+
+        import normalization.resolver as resolver_mod
+
+        source = inspect.getsource(resolver_mod.Resolver.resolve_pending)
+        assert "pull_timestamp >= COALESCE" in source
+        assert ".format(" not in source
+        for line in source.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("f\"", "f'")):
+                assert "SELECT" not in stripped and "INSERT" not in stripped
+
+    def test_summary_keys_are_stable(self, monkeypatch):
+        _patched_entity_map(monkeypatch)
+        engine = _RecordingEngine()
+        summary = Resolver(db_engine=engine).resolve_pending(workers=1)
+        assert set(summary) == {
+            "resolved", "conflicts_found", "errors",
+            "series_scanned", "duration_s", "dry_run",
+        }
+
+
+class TestDryRun:
+
+    def test_dry_run_writes_nothing(self, monkeypatch):
+        _patched_entity_map(monkeypatch)
+        engine = _RecordingEngine()
+
+        summary = Resolver(db_engine=engine).resolve_pending(
+            lookback_days=2, workers=1, dry_run=True,
+        )
+
+        assert summary["dry_run"] is True
+        assert engine.inserts == []
+        assert not any(
+            "INSERT INTO resolved_series" in sql for sql, _ in engine.calls
+        )
+
+    def test_dry_run_counts_what_would_be_written(self, monkeypatch):
+        _patched_entity_map(monkeypatch)
+        rows = [
+            ("VIXCLS", date(2026, 9, 9), 17.5, 3, datetime(2026, 9, 9, 12, 0), 1, "FRED"),
+            ("VIXCLS", date(2026, 9, 10), 18.1, 3, datetime(2026, 9, 10, 12, 0), 1, "FRED"),
+        ]
+        engine = _RecordingEngine(raw_rows=rows)
+
+        summary = Resolver(db_engine=engine).resolve_pending(
+            workers=1, dry_run=True,
+        )
+
+        assert summary["resolved"] == 2      # two (series_id, obs_date) groups
+        assert summary["series_scanned"] == 1
+        assert summary["duration_s"] >= 0
+
+    def test_wet_run_still_inserts(self, monkeypatch):
+        _patched_entity_map(monkeypatch)
+        engine = _RecordingEngine()
+
+        summary = Resolver(db_engine=engine).resolve_pending(workers=1)
+
+        assert summary["dry_run"] is False
+        assert engine.inserts, "expected an INSERT batch"
+        assert summary["resolved"] == 1
+
+    def test_unmapped_series_are_skipped(self, monkeypatch):
+        """A series with no entity mapping yields no resolved row."""
+        _patched_entity_map(monkeypatch, feature_id=None)
+        engine = _RecordingEngine()
+
+        summary = Resolver(db_engine=engine).resolve_pending(
+            workers=1, dry_run=True,
+        )
+
+        assert summary["resolved"] == 0
+
+
+class TestResolveRange:
+
+    def test_range_is_walked_in_chunks(self, monkeypatch):
+        """A multi-week catch-up is split into bounded windows."""
+        _patched_entity_map(monkeypatch)
+        resolver = Resolver(db_engine=MagicMock())
+        seen: list[tuple] = []
+
+        def _fake_resolve_pending(**kwargs):
+            seen.append((kwargs["since"], kwargs["until"]))
+            return {
+                "resolved": 10, "conflicts_found": 1, "errors": 0,
+                "series_scanned": 5, "duration_s": 1.0, "dry_run": False,
+            }
+
+        monkeypatch.setattr(resolver, "resolve_pending", _fake_resolve_pending)
+
+        totals = resolver.resolve_range(
+            since=date(2026, 3, 29), until=date(2026, 4, 12), chunk_days=7,
+        )
+
+        assert totals["chunks"] == 2
+        assert totals["resolved"] == 20
+        assert totals["conflicts_found"] == 2
+        assert seen[0][0] == datetime(2026, 3, 29)
+        assert seen[0][1] == datetime(2026, 4, 5)
+        assert seen[1][0] == datetime(2026, 4, 5)
+        assert seen[1][1] == datetime(2026, 4, 12)
+
+    def test_final_chunk_is_clamped_to_until(self, monkeypatch):
+        _patched_entity_map(monkeypatch)
+        resolver = Resolver(db_engine=MagicMock())
+        seen: list[tuple] = []
+
+        def _fake_resolve_pending(**kwargs):
+            seen.append((kwargs["since"], kwargs["until"]))
+            return {
+                "resolved": 0, "conflicts_found": 0, "errors": 0,
+                "series_scanned": 0, "duration_s": 0.0, "dry_run": True,
+            }
+
+        monkeypatch.setattr(resolver, "resolve_pending", _fake_resolve_pending)
+        resolver.resolve_range(
+            since=date(2026, 3, 29), until=date(2026, 4, 3),
+            chunk_days=7, dry_run=True,
+        )
+
+        assert len(seen) == 1
+        assert seen[0][1] == datetime(2026, 4, 3)
+
+    def test_rejects_inverted_range(self):
+        resolver = Resolver(db_engine=MagicMock())
+        with pytest.raises(ValueError):
+            resolver.resolve_range(since=date(2026, 4, 3), until=date(2026, 3, 29))
+
+    def test_rejects_zero_chunk(self):
+        resolver = Resolver(db_engine=MagicMock())
+        with pytest.raises(ValueError):
+            resolver.resolve_range(since=date(2026, 3, 29), chunk_days=0)
