@@ -1323,6 +1323,41 @@ def _run_obsidian_cycle(engine: Any) -> dict[str, Any]:
 
 # ─── Main loop ───────────────────────────────────────────────────────
 
+def run_fast_resolution(engine: Any) -> dict[str, Any]:
+    """Resolve pending raw_series rows into resolved_series for this cycle.
+
+    Delegates to normalization.resolver.Resolver — the one place that
+    knows the real series_id -> feature_registry mapping (SEED_MAPPINGS /
+    NEW_MAPPINGS_V2, no such thing as a DB-side ``entity_map`` table) and
+    the real resolved_series column set (release_date, vintage_date,
+    source_priority_used; no ``resolved_at`` or ``source_id`` columns).
+
+    This used to be a hand-rolled ``INSERT ... SELECT`` here that joined
+    a nonexistent ``entity_map`` table, wrote to columns resolved_series
+    doesn't have, and targeted ``ON CONFLICT (feature_id, obs_date)`` —
+    one column short of the real unique index
+    ``uq_resolved_series_composite (feature_id, obs_date, vintage_date)``.
+    It raised on every single cycle and was swallowed by ``log.debug``,
+    so resolved_series silently stopped advancing for every feature that
+    depends on this cycle-level path (equity ``_full`` prices among them)
+    while raw ingestion kept flowing — the freshest raw row and the
+    resolved value could be months apart with no error anywhere.
+
+    Bounded to a short lookback so it stays cheap in the per-cycle hot
+    loop (the reason this was hand-rolled in the first place); the
+    nightly/on-demand ``scripts/run_full_pipeline.py`` still calls
+    ``resolve_pending()`` with its full default lookback for catch-up.
+    """
+    try:
+        from normalization.resolver import Resolver
+
+        resolver = Resolver(db_engine=engine)
+        return resolver.resolve_pending(lookback_days=2, workers=4)
+    except Exception as exc:
+        log.error("Resolution failed: {e}", e=str(exc))
+        return {"error": str(exc)}
+
+
 def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     """Execute one operator cycle."""
     state.cycle_count += 1
@@ -1478,38 +1513,18 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
             log.error("Smart ingestion failed: {e}", e=str(exc))
             cycle_result["ingestion"] = {"error": str(exc)}
 
-    # 3b. Fast SQL resolution (skip slow Python resolver — use INSERT SELECT)
+    # 3b. Resolution — raw_series -> resolved_series
     if dry_run:
         cycle_result["resolution"] = {"skipped": "dry_run"}
-        log.info("[DRY RUN] Would run fast resolution")
+        log.info("[DRY RUN] Would run resolution")
     else:
-        try:
-            state.current_step = "resolution"
-            with engine.begin() as conn:
-                # Set statement timeout to avoid blocking the cycle
-                conn.execute(text("SET LOCAL statement_timeout = '120s'"))
-                # Fast bulk resolve: INSERT into resolved_series from raw_series
-                # for any rows pulled in the last hour that don't have resolved entries
-                result = conn.execute(text("""
-                    INSERT INTO resolved_series (feature_id, obs_date, value, source_id, resolved_at)
-                    SELECT em.feature_id, rs.obs_date, rs.value, rs.source_id, NOW()
-                    FROM raw_series rs
-                    JOIN entity_map em ON em.series_id = rs.series_id
-                    WHERE rs.pull_timestamp > NOW() - INTERVAL '1 hour'
-                    AND rs.pull_status = 'SUCCESS'
-                    AND NOT EXISTS (
-                        SELECT 1 FROM resolved_series res
-                        WHERE res.feature_id = em.feature_id
-                        AND res.obs_date = rs.obs_date
-                    )
-                    ON CONFLICT (feature_id, obs_date) DO NOTHING
-                """))
-                res_count = result.rowcount
-            cycle_result["resolution"] = {"rows_resolved": res_count}
-            if res_count:
-                log.info("Fast resolution: {n} new rows", n=res_count)
-        except Exception as exc:
-            log.debug("Resolution: {e}", e=str(exc))
+        state.current_step = "resolution"
+        cycle_result["resolution"] = run_fast_resolution(engine)
+        if cycle_result["resolution"].get("resolved"):
+            log.info(
+                "Resolution: {n} rows resolved",
+                n=cycle_result["resolution"]["resolved"],
+            )
 
     # 4. Fill data gaps — SKIP: SmartScheduler handles freshness now
     # The old gap filler re-pulled entire sources which was slow.
