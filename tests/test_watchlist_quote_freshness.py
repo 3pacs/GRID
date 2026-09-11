@@ -7,10 +7,20 @@ path ever set it) and exposed no way for the ticker_pulse card to know a
 price was stale. Both are fixed by fetching the two most recent closes so
 change_pct comes from the actual prior session, and by adding a `stale`
 flag (as_of older than 3 calendar days).
+
+Also guards a review-caught bug in that same fix: a plain
+`ORDER BY obs_date DESC LIMIT 2` can return two *vintages* of the same
+day (uq_resolved_series_composite is (feature_id, obs_date, vintage_date),
+and a puller with a lookback window re-inserts yesterday's close under a
+new vintage_date on every run), turning change_pct into a same-day delta
+instead of a day-over-day one. Postgres's DISTINCT ON isn't exercisable
+against a mocked connection, so the guard below asserts the query shape
+itself rather than re-deriving Postgres semantics in Python.
 """
 
 from __future__ import annotations
 
+import inspect
 import os
 from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
@@ -28,6 +38,7 @@ os.environ.setdefault("GRID_MASTER_PASSWORD_HASH", _pwd_ctx.hash("testpassword12
 
 from api.auth import create_token
 from api.main import app
+from api.routers.watchlist_overview import get_ticker_quote
 
 client = TestClient(app)
 
@@ -89,7 +100,13 @@ class TestQuoteChangePct:
     def test_change_pct_none_when_no_price_history(self, mock_engine, _mock_init):
         _wire_engine(mock_engine, _mock_quote_conn([]))
 
-        response = client.get("/api/v1/watchlist/AAPL/quote", headers=_auth_header())
+        # No stored price falls through to the live-fetch fallback; force it
+        # to also come back empty so this test doesn't depend on whether the
+        # runner has real network access to Yahoo Finance.
+        with patch(
+            "api.routers.watchlist_overview._fetch_live_price", return_value=None
+        ):
+            response = client.get("/api/v1/watchlist/AAPL/quote", headers=_auth_header())
 
         assert response.status_code == 200
         assert response.json()["price"] is None
@@ -171,3 +188,24 @@ class TestQuoteLiveFallback:
         assert data["change_pct"] == 0.01
         assert data["as_of"] == str(date.today())
         assert data["stale"] is False
+
+
+class TestQuoteQueryCollapsesVintages:
+    """Regression guard for the review finding on this same fix: a naive
+    `ORDER BY obs_date DESC LIMIT 2` can return two vintages of the same
+    calendar day (uq_resolved_series_composite includes vintage_date), so
+    the query must collapse to one row per obs_date and pin to a single
+    feature before taking the two most recent days. DISTINCT ON is
+    Postgres-only and not exercisable against a mocked connection, so this
+    asserts the query text carries the fix rather than re-deriving
+    Postgres semantics in Python.
+    """
+
+    def test_price_query_pins_one_feature_and_collapses_vintages(self):
+        src = inspect.getsource(get_ticker_quote)
+
+        assert "DISTINCT ON (rs.obs_date)" in src
+        assert "vintage_date DESC" in src
+        assert "WITH winner AS" in src
+        # The naive, buggy shape must not reappear.
+        assert "ORDER BY rs.obs_date DESC LIMIT 2" not in src

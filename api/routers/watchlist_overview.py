@@ -399,11 +399,24 @@ def get_ticker_quote(
             # Two most recent closes so change_pct reflects the actual prior
             # session rather than always coming back null for GRID-sourced
             # prices (the live-fallback path was the only one that set it).
+            # A puller with a lookback window re-inserts the same obs_date
+            # under a new vintage_date on every run (uq_resolved_series_composite
+            # is (feature_id, obs_date, vintage_date)), so a plain
+            # `ORDER BY obs_date DESC LIMIT 2` can return two vintages of the
+            # SAME day and turn change_pct into a same-day delta (often 0).
+            # Pin to the single feature with the freshest row first, then
+            # collapse to one (latest-vintage) value per calendar day.
             rows = conn.execute(text(
-                "SELECT rs.value, rs.obs_date FROM resolved_series rs "
-                "JOIN feature_registry fr ON fr.id = rs.feature_id "
-                "WHERE fr.name = ANY(:names) "
-                "ORDER BY rs.obs_date DESC LIMIT 2"
+                "WITH winner AS ("
+                "  SELECT rs.feature_id FROM resolved_series rs "
+                "  JOIN feature_registry fr ON fr.id = rs.feature_id "
+                "  WHERE fr.name = ANY(:names) "
+                "  ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 1"
+                ") "
+                "SELECT DISTINCT ON (rs.obs_date) rs.value, rs.obs_date "
+                "FROM resolved_series rs "
+                "WHERE rs.feature_id = (SELECT feature_id FROM winner) "
+                "ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 2"
             ), {"names": feature_names}).fetchall()
             if rows:
                 price = float(rows[0][0])
