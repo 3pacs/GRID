@@ -1660,11 +1660,16 @@ class TestResolveRangeFaultTolerance:
             since=date(2026, 4, 1), until=date(2026, 4, 4), chunk_days=1,
         )
 
-        assert len(seen) == 3, "the walk stopped at the failed chunk"
-        assert totals["chunks"] == 3
-        assert totals["chunks_failed"] == 1
-        assert totals["resolved"] == 20, "surviving chunks must still count"
-        assert totals["errors"] == 1
+        # A statement timeout is now narrowed rather than skipped, so the
+        # day-wide attempt for 2026-04-02 is followed by sub-day retries. The
+        # guarantee under test is unchanged: the walk does not stop there.
+        day_wide = [(a, b) for a, b in seen if (b - a) == timedelta(days=1)]
+        assert len(day_wide) == 3, "the walk stopped at the failed chunk"
+        assert (datetime(2026, 4, 3), datetime(2026, 4, 4)) in seen, (
+            "the walk must reach the chunk after the failing one"
+        )
+        assert totals["chunks_narrowed"] >= 1, "a timeout must be narrowed"
+        assert totals["resolved"] >= 20, "surviving chunks must still count"
 
     def test_failed_range_is_reported_for_retry(self, monkeypatch):
         from sqlalchemy.exc import OperationalError
@@ -1685,8 +1690,10 @@ class TestResolveRangeFaultTolerance:
 
         assert len(totals["failed_ranges"]) == 1
         failed = totals["failed_ranges"][0]
-        assert failed["since"] == "2026-04-02"
-        assert failed["until"] == "2026-04-03"
+        # Full timestamps, not dates: narrowing yields sub-day windows, and
+        # date-only bounds would collapse every hour of a day to one string.
+        assert failed["since"] == "2026-04-02T00:00:00"
+        assert failed["until"] == "2026-04-03T00:00:00"
         assert failed["error_class"] == "OperationalError"
         assert "timeout" in failed["error"]
 
@@ -1707,7 +1714,7 @@ class TestResolveRangeFaultTolerance:
         )
 
         assert totals["chunks_failed"] == 1
-        assert totals["failed_ranges"][0]["since"] == "2026-04-02"
+        assert totals["failed_ranges"][0]["since"] == "2026-04-02T00:00:00"
         assert totals["failed_ranges"][0]["error_class"] == "WorkerError"
         assert totals["errors"] == 2
 
@@ -1870,3 +1877,114 @@ class TestWindowBoundsAreIndexable:
         assert defaulted["since"].tzinfo is not None
         age = datetime.now(timezone.utc) - defaulted["since"]
         assert timedelta(days=2) <= age < timedelta(days=2, minutes=5)
+
+
+# ---------------------------------------------------------------------------
+# A timed-out chunk is narrowed and retried, never silently skipped
+# ---------------------------------------------------------------------------
+
+
+class _Timeout(Exception):
+    """Stands in for psycopg2's QueryCanceled statement-timeout error."""
+
+    def __init__(self) -> None:
+        super().__init__("canceling statement due to statement timeout")
+
+
+class TestAdaptiveChunkNarrowing:
+    """A window too heavy for statement_timeout must be halved, not dropped.
+
+    Before this, resolve_range recorded the range in failed_ranges and walked
+    on, and nothing ever went back for it — so a backfill reported success
+    having silently skipped every day too expensive to finish. Seen live on
+    2026-09-11: the second chunk of the April-September walk (2026-04-05) died
+    at the 600s timeout and the walk continued as if it had not.
+    """
+
+    def _resolver(self, monkeypatch, fail_for):
+        """Resolver whose resolve_pending times out for the given windows."""
+        _patched_entity_map(monkeypatch)
+        r = Resolver(db_engine=_RecordingEngine())
+        seen: list[tuple[datetime, datetime]] = []
+
+        def fake_resolve_pending(workers=8, since=None, until=None, dry_run=False, **kw):
+            seen.append((since, until))
+            # Match the window exactly: a predicate that also matched the
+            # halves would make them time out too and narrow to the floor,
+            # which is the *other* test's scenario.
+            if any(since == a and until == b for a, b in fail_for):
+                raise _Timeout()
+            return {
+                "resolved": 10, "conflicts_found": 0, "errors": 0,
+                "series_scanned": 1, "duration_s": 1.0, "dry_run": dry_run,
+                "unmapped": {},
+            }
+
+        r.resolve_pending = fake_resolve_pending  # type: ignore[method-assign]
+        return r, seen
+
+    def test_a_timed_out_day_is_split_until_it_fits(self, monkeypatch):
+        # The whole of 2026-04-05 times out; each 12h half succeeds.
+        day = (datetime(2026, 4, 5), datetime(2026, 4, 6))
+        r, seen = self._resolver(monkeypatch, fail_for=[day])
+
+        totals = r.resolve_range(
+            since=datetime(2026, 4, 5), until=datetime(2026, 4, 6), chunk_days=1,
+        )
+
+        assert totals["chunks_narrowed"] == 1
+        # Two 12-hour halves actually ran and landed rows.
+        halves = [(a, b) for a, b in seen if (b - a) == timedelta(hours=12)]
+        assert len(halves) == 2, f"expected two 12h halves, got {seen}"
+        assert totals["resolved"] == 20
+        assert totals["failed_ranges"] == [], "a narrowed range must not be reported failed"
+
+    def test_narrowing_stops_at_the_floor_and_reports(self, monkeypatch):
+        from normalization.resolver import MIN_BACKFILL_CHUNK_SECONDS
+
+        # Everything times out, so narrowing runs to the floor and gives up.
+        _patched_entity_map(monkeypatch)
+        r = Resolver(db_engine=_RecordingEngine())
+
+        def always_timeout(workers=8, since=None, until=None, dry_run=False, **kw):
+            raise _Timeout()
+
+        r.resolve_pending = always_timeout  # type: ignore[method-assign]
+        totals = r.resolve_range(
+            since=datetime(2026, 4, 5), until=datetime(2026, 4, 6), chunk_days=1,
+        )
+
+        assert totals["failed_ranges"], "an unresolvable window must still be reported"
+        for rng in totals["failed_ranges"]:
+            span = datetime.fromisoformat(rng["until"]) - datetime.fromisoformat(rng["since"])
+            assert span.total_seconds() <= MIN_BACKFILL_CHUNK_SECONDS
+            # Sub-day ranges must survive reporting: date-only would collapse
+            # every hour of 2026-04-05 to the same unusable string.
+            assert "T" in rng["since"] and "T" in rng["until"]
+
+    def test_a_non_timeout_failure_is_not_narrowed(self, monkeypatch):
+        """Narrowing a schema error would just burn the split budget."""
+        _patched_entity_map(monkeypatch)
+        r = Resolver(db_engine=_RecordingEngine())
+        calls: list[tuple] = []
+
+        def boom(workers=8, since=None, until=None, dry_run=False, **kw):
+            calls.append((since, until))
+            raise ValueError("column does not exist")
+
+        r.resolve_pending = boom  # type: ignore[method-assign]
+        totals = r.resolve_range(
+            since=datetime(2026, 4, 5), until=datetime(2026, 4, 6), chunk_days=1,
+        )
+
+        assert len(calls) == 1, "a non-timeout failure must be tried exactly once"
+        assert totals["chunks_narrowed"] == 0
+        assert totals["failed_ranges"][0]["error_class"] == "ValueError"
+
+    def test_timeout_predicate_matches_the_real_psycopg2_text(self):
+        from normalization.resolver import _is_statement_timeout
+
+        assert _is_statement_timeout(_Timeout())
+        assert _is_statement_timeout(Exception("(psycopg2.errors.QueryCanceled)"))
+        assert not _is_statement_timeout(ValueError("column does not exist"))
+        assert not _is_statement_timeout(Exception("connection refused"))
