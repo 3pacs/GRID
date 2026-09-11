@@ -198,6 +198,16 @@ def _sync_deferred_startup(app: FastAPI) -> None:
     except Exception as exc:
         log.warning("Dashboard pre-warm failed (will build on first request): {e}", e=str(exc))
 
+    # Pre-warm the sector flow cache so a freshly restarted process serves
+    # the persisted payload instead of the empty/unavailable placeholder
+    # until the first request lazily starts the warm loop.
+    try:
+        from api.routers.flows import start_sector_flow_warm_thread
+        start_sector_flow_warm_thread()
+        log.info("Sector flow warm thread started from startup hook")
+    except Exception as exc:
+        log.warning("Sector flow warm thread startup skipped: {e}", e=str(exc))
+
     log.info("GRID API ready — serving requests")
 
 
