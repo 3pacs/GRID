@@ -192,7 +192,7 @@ class TestScorePendingMemo:
 
         lookups: list[tuple[str, date]] = []
 
-        def fake_price(engine_, ticker, d):
+        def fake_price(engine_, ticker, d, as_of=None):
             lookups.append((ticker, d))
             if ticker == "ZZZZ":
                 ts._remember_yf_no_data("ZZZZ")  # what the live fetch does on no data
