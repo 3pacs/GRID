@@ -30,6 +30,12 @@ _SECTOR_STALE_TTL: float = 21600.0  # 6 hours
 _sector_stale_cache: TTLCache = TTLCache(ttl=_SECTOR_STALE_TTL, max_size=5)
 _SECTOR_CACHE_KEY = "sectors"
 
+# Persists the last good payload to analytical_snapshots (store/snapshots.py)
+# so a freshly restarted process can seed the stale tier immediately instead
+# of serving {"unavailable": True} until the warm loop's first cycle
+# finishes (~70s cold — see AGENTS.md 2026-09-11 deploy-restart timeline).
+_SECTOR_SNAPSHOT_CATEGORY = "sector_flows"
+
 _sector_warm_lock = threading.Lock()
 _sector_warm_thread_started = False
 
@@ -264,6 +270,48 @@ def _compute_sectors_payload() -> dict[str, Any]:
 _SECTOR_WARM_RETRY_SECONDS = 30.0
 
 
+def _persist_sectors_snapshot(payload: dict[str, Any]) -> None:
+    """Persist a successfully computed payload for cold-start recovery.
+
+    Best-effort only: a persistence failure must never fail the warm cycle
+    or block a request — the process just falls back to the in-memory
+    tiers, same as before this existed.
+    """
+    try:
+        from store.snapshots import AnalyticalSnapshotStore
+
+        store = AnalyticalSnapshotStore(db_engine=get_db_engine())
+        store.save_snapshot(category=_SECTOR_SNAPSHOT_CATEGORY, payload=payload)
+    except Exception as exc:
+        log.warning("Sector flow snapshot persist failed (non-fatal): {e}", e=str(exc))
+
+
+def _load_persisted_sectors_snapshot() -> None:
+    """Seed the stale tier from the last persisted snapshot.
+
+    Runs once, before the warm loop's first compute, so a process that was
+    just restarted (deploy, crash, manual bounce) can serve the last known
+    payload immediately instead of the empty ``{"unavailable": True}``
+    placeholder for the ~70s it takes to compute fresh. Failures (table not
+    there yet, DB unreachable, no snapshot ever saved) are non-fatal — the
+    process just waits on the warm loop's first cycle like before.
+    """
+    try:
+        from store.snapshots import AnalyticalSnapshotStore
+
+        store = AnalyticalSnapshotStore(db_engine=get_db_engine())
+        rows = store.get_latest(_SECTOR_SNAPSHOT_CATEGORY, n=1)
+        if rows and rows[0].get("payload"):
+            payload = rows[0]["payload"]
+            _sector_stale_cache.set(_SECTOR_CACHE_KEY, payload)
+            log.info(
+                "Sector flow cache seeded from persisted snapshot ({n} sectors)",
+                n=len(payload.get("sectors", {})),
+            )
+    except Exception as exc:
+        log.warning("Sector flow snapshot load failed (non-fatal): {e}", e=str(exc))
+
+
 def _sector_warm_cycle() -> float:
     """Run one warm cycle: compute and populate both cache tiers.
 
@@ -277,6 +325,7 @@ def _sector_warm_cycle() -> float:
         result = _compute_sectors_payload()
         _sector_cache.set(_SECTOR_CACHE_KEY, result)
         _sector_stale_cache.set(_SECTOR_CACHE_KEY, result)
+        _persist_sectors_snapshot(result)
         log.info(
             "Sector flow cache warmed ({n} sectors)",
             n=len(result.get("sectors", {})),
@@ -298,16 +347,31 @@ def _ensure_sector_warm_thread() -> None:
 
     Not started at module import time — import can happen in contexts
     (tests, tooling) that shouldn't trigger DB traffic or long-lived
-    threads as a side effect.
+    threads as a side effect. This is the fallback path for a process
+    whose startup hook (``start_sector_flow_warm_thread``) didn't run or
+    failed; the one-time guard below means the persisted-snapshot load and
+    thread start still happen exactly once either way.
     """
     global _sector_warm_thread_started
     with _sector_warm_lock:
         if _sector_warm_thread_started:
             return
         _sector_warm_thread_started = True
+    _load_persisted_sectors_snapshot()
     threading.Thread(
         target=_sector_warm_loop, daemon=True, name="sector-flow-warm",
     ).start()
+
+
+def start_sector_flow_warm_thread() -> None:
+    """Startup hook: seed the stale tier and start the warm loop eagerly.
+
+    Called from the API's deferred-startup path (``api/main.py``) so a
+    freshly restarted process has the persisted payload available and the
+    warm loop already running before the first user request arrives,
+    instead of relying on that first request to lazily trigger both.
+    """
+    _ensure_sector_warm_thread()
 
 
 @router.get("/sectors")

@@ -182,6 +182,7 @@ def test_sector_warm_cycle_failure_leaves_caches_untouched_and_retries_soon(monk
 
 def test_ensure_sector_warm_thread_starts_exactly_once(monkeypatch):
     monkeypatch.setattr(flows_router, "_sector_warm_loop", lambda: None)
+    monkeypatch.setattr(flows_router, "_load_persisted_sectors_snapshot", lambda: None)
     thread_mock = MagicMock()
     monkeypatch.setattr(flows_router.threading, "Thread", thread_mock)
 
@@ -191,6 +192,163 @@ def test_ensure_sector_warm_thread_starts_exactly_once(monkeypatch):
 
     assert thread_mock.call_count == 1
     thread_mock.return_value.start.assert_called_once()
+
+
+def test_ensure_sector_warm_thread_loads_persisted_snapshot_once(monkeypatch):
+    monkeypatch.setattr(flows_router, "_sector_warm_loop", lambda: None)
+    monkeypatch.setattr(flows_router.threading, "Thread", MagicMock())
+    load_calls = []
+    monkeypatch.setattr(
+        flows_router, "_load_persisted_sectors_snapshot", lambda: load_calls.append(1),
+    )
+
+    flows_router._ensure_sector_warm_thread()
+    flows_router._ensure_sector_warm_thread()
+
+    assert load_calls == [1]
+
+
+# ── Startup hook + persisted-snapshot cold-start recovery ─────────────────
+
+
+def test_start_sector_flow_warm_thread_starts_warm_thread_once(monkeypatch):
+    monkeypatch.setattr(flows_router, "_sector_warm_loop", lambda: None)
+    monkeypatch.setattr(flows_router, "_load_persisted_sectors_snapshot", lambda: None)
+    thread_mock = MagicMock()
+    monkeypatch.setattr(flows_router.threading, "Thread", thread_mock)
+
+    flows_router.start_sector_flow_warm_thread()
+    flows_router.start_sector_flow_warm_thread()
+
+    assert thread_mock.call_count == 1
+    thread_mock.return_value.start.assert_called_once()
+
+
+def test_load_persisted_sectors_snapshot_seeds_stale_tier(monkeypatch):
+    """Cold start recovery: a persisted snapshot fills the stale tier so a
+    request never sees the empty/unavailable placeholder after a restart."""
+    persisted_payload = {"sectors": {"Energy": {"etf": "XLE"}}}
+    fake_store = MagicMock()
+    fake_store.get_latest.return_value = [{"payload": persisted_payload}]
+    monkeypatch.setattr(
+        "store.snapshots.AnalyticalSnapshotStore", lambda db_engine: fake_store,
+    )
+    monkeypatch.setattr(flows_router, "get_db_engine", lambda: MagicMock())
+
+    flows_router._load_persisted_sectors_snapshot()
+
+    assert flows_router._sector_stale_cache.get(flows_router._SECTOR_CACHE_KEY) == persisted_payload
+    fake_store.get_latest.assert_called_once_with(flows_router._SECTOR_SNAPSHOT_CATEGORY, n=1)
+
+
+def test_load_persisted_sectors_snapshot_noop_when_nothing_saved(monkeypatch):
+    fake_store = MagicMock()
+    fake_store.get_latest.return_value = []
+    monkeypatch.setattr(
+        "store.snapshots.AnalyticalSnapshotStore", lambda db_engine: fake_store,
+    )
+    monkeypatch.setattr(flows_router, "get_db_engine", lambda: MagicMock())
+
+    flows_router._load_persisted_sectors_snapshot()
+
+    assert flows_router._sector_stale_cache.get(flows_router._SECTOR_CACHE_KEY) is None
+
+
+def test_load_persisted_sectors_snapshot_failure_is_non_fatal(monkeypatch):
+    """Persistence-layer failures (missing table, DB down) must never raise
+    — the process just falls back to the normal cold-start behavior."""
+
+    def _boom(db_engine):
+        raise RuntimeError("db unreachable")
+
+    monkeypatch.setattr("store.snapshots.AnalyticalSnapshotStore", _boom)
+    monkeypatch.setattr(flows_router, "get_db_engine", lambda: MagicMock())
+
+    flows_router._load_persisted_sectors_snapshot()  # must not raise
+
+    assert flows_router._sector_stale_cache.get(flows_router._SECTOR_CACHE_KEY) is None
+
+
+def test_cold_start_after_snapshot_load_serves_persisted_payload_not_unavailable(monkeypatch):
+    """End-to-end cold-start check: once the persisted snapshot is loaded
+    into the stale tier, a request on a freshly restarted process gets that
+    payload immediately instead of the empty unavailable placeholder."""
+    persisted_payload = {"sectors": {"Technology": {"etf": "XLK"}}}
+    flows_router._sector_stale_cache.set(flows_router._SECTOR_CACHE_KEY, persisted_payload)
+    monkeypatch.setattr(flows_router, "_ensure_sector_warm_thread", lambda: None)
+
+    def _boom():
+        raise AssertionError("must not compute inline")
+
+    monkeypatch.setattr(flows_router, "_compute_sectors_payload", _boom)
+
+    result = flows_router.get_sectors("test-token")
+
+    assert result == persisted_payload
+
+
+# ── Persisting a successfully computed payload ─────────────────────────────
+
+
+def test_sector_warm_cycle_persists_snapshot_on_success(monkeypatch):
+    payload = {"sectors": {"Energy": {"etf": "XLE"}}}
+    monkeypatch.setattr(flows_router, "_compute_sectors_payload", lambda: payload)
+    persist_calls = []
+    monkeypatch.setattr(
+        flows_router, "_persist_sectors_snapshot", lambda p: persist_calls.append(p),
+    )
+
+    flows_router._sector_warm_cycle()
+
+    assert persist_calls == [payload]
+
+
+def test_persist_sectors_snapshot_saves_via_analytical_snapshot_store(monkeypatch):
+    fake_store = MagicMock()
+    monkeypatch.setattr(
+        "store.snapshots.AnalyticalSnapshotStore", lambda db_engine: fake_store,
+    )
+    monkeypatch.setattr(flows_router, "get_db_engine", lambda: MagicMock())
+
+    payload = {"sectors": {"Energy": {"etf": "XLE"}}}
+    flows_router._persist_sectors_snapshot(payload)
+
+    fake_store.save_snapshot.assert_called_once_with(
+        category=flows_router._SECTOR_SNAPSHOT_CATEGORY, payload=payload,
+    )
+
+
+def test_persist_sectors_snapshot_failure_never_raises(monkeypatch):
+    """A persist failure must never propagate — the warm cycle already
+    populated the in-memory tiers and a request must still succeed."""
+
+    def _boom(db_engine):
+        raise RuntimeError("db unreachable")
+
+    monkeypatch.setattr("store.snapshots.AnalyticalSnapshotStore", _boom)
+    monkeypatch.setattr(flows_router, "get_db_engine", lambda: MagicMock())
+
+    flows_router._persist_sectors_snapshot({"sectors": {}})  # must not raise
+
+
+def test_sector_warm_cycle_survives_persist_failure(monkeypatch):
+    """Even if persistence raises unexpectedly (defense in depth — normally
+    ``_persist_sectors_snapshot`` swallows its own errors), a warm cycle
+    must never crash the background thread: the in-memory tiers it already
+    populated stay intact and the cycle just falls back to a quick retry."""
+    payload = {"sectors": {"Energy": {"etf": "XLE"}}}
+    monkeypatch.setattr(flows_router, "_compute_sectors_payload", lambda: payload)
+
+    def _boom(p):
+        raise RuntimeError("persist blew up")
+
+    monkeypatch.setattr(flows_router, "_persist_sectors_snapshot", _boom)
+
+    sleep_for = flows_router._sector_warm_cycle()  # must not raise
+
+    assert flows_router._sector_cache.get(flows_router._SECTOR_CACHE_KEY) == payload
+    assert flows_router._sector_stale_cache.get(flows_router._SECTOR_CACHE_KEY) == payload
+    assert sleep_for == flows_router._SECTOR_WARM_RETRY_SECONDS
 
 
 # ── _compute_sectors_payload: bounded, parameterized batched query ─────────
