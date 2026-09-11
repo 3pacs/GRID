@@ -15,6 +15,7 @@ import concurrent.futures as _futures
 import inspect
 import re as _re
 import threading
+import time
 import uuid
 from datetime import date, datetime, timezone
 from typing import Any
@@ -1097,7 +1098,22 @@ def _get_llm_client():
 
 _RESILIENT_EXEC = _futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="llm-failover")
 
-_LOCAL_CHAT_TIMEOUT_S = 18.0
+# Total wall-clock budget for one compose request's whole LLM attempt (local
+# card + any paid failover), enforced as a single deadline in _resilient_chat.
+# 2026-09-10 read-only QA (gemini-task 34544181414) measured compose taking
+# 18009ms end to end while the local card was degraded — dad watched a spinner
+# for 18-20s before hearing "busy", and one candidate host didn't error out of
+# its own read timeout until 120s later (in an abandoned background thread).
+# Bounding the whole attempt to ~8s means the busy message lands fast without
+# waiting for any single host's own (much larger) configured timeout.
+_COMPOSE_LLM_BUDGET_S: float = 8.0
+
+# Total wall-clock budget for the PAID failover phase of the streaming verdict
+# (after the local card's own first-token budget, _STREAM_FIRST_TOKEN_S, has
+# already been spent). Keeps a slow third host from stacking multiple
+# per-provider paid timeouts into a multi-minute wait — see _COMPOSE_LLM_BUDGET_S.
+_STREAM_PAID_BUDGET_S: float = 20.0
+
 _PAID_CHAT_TIMEOUT_S = 45.0
 
 # Honest message when the card is busy AND no paid model answered.
@@ -1114,7 +1130,14 @@ def _call_with_timeout(fn, timeout_s: float):
 
 
 def _get_local_oracle():
-    """Best available LOCAL chat client (no cloud), or (None, None)."""
+    """Best available LOCAL chat client (no cloud), or (None, None).
+
+    ``get_llm`` already returns fast (no network call) when every candidate
+    endpoint in the tier's fallback chain is disabled or sitting inside its
+    own chat-failure backoff window (see llamacpp/client.py's
+    ``_ENDPOINT_BACKOFF_UNTIL``) — so a caller only pays a real connection cost
+    here when at least one candidate looks reachable.
+    """
     try:
         from llm.router import get_llm, Tier
         client = get_llm(Tier.ORACLE)
@@ -1131,7 +1154,12 @@ _PAID_PROVIDERS = ("openai", "openrouter")
 
 
 def _paid_clients():
-    """Available PAID cloud clients, in priority order: [(client, label), ...]."""
+    """Available PAID cloud clients, in priority order: [(client, label), ...].
+
+    Empty by default: paid providers are gated behind GRID_ALLOW_PAID_LLM
+    (see llm/router.py), so ``get_llm(provider=...)`` returns None instantly
+    without any network call when that flag is unset.
+    """
     from llm.router import get_llm
     out = []
     for prov in _PAID_PROVIDERS:
@@ -1146,27 +1174,47 @@ def _paid_clients():
 
 def _resilient_chat(messages, *, temperature: float = 0.3, num_predict: int = 800):
     """Local card first; on busy/slow/error, fail over through the paid cloud
-    models. Returns (text, label), or (None, None) when nothing responds."""
-    local, label = _get_local_oracle()
-    if local is not None:
-        try:
-            txt = _call_with_timeout(
-                lambda: local.chat(messages, temperature=temperature, num_predict=num_predict),
-                _LOCAL_CHAT_TIMEOUT_S,
-            )
-            if txt and txt.strip():
-                return txt, label
-            log.warning("Local LLM returned empty — failing over to paid")
-        except _futures.TimeoutError:
-            log.warning("Local card busy (>{t}s) — failing over to paid model", t=_LOCAL_CHAT_TIMEOUT_S)
-        except Exception as exc:
-            log.warning("Local LLM error ({e}) — failing over to paid", e=str(exc))
+    models. Returns (text, label), or (None, None) when nothing responds.
 
-    for paid, plabel in _paid_clients():
+    The whole attempt (local + paid) is bounded by ``_COMPOSE_LLM_BUDGET_S``:
+    once the deadline passes, remaining candidates are skipped rather than
+    each spending their own full timeout.
+    """
+    deadline = time.monotonic() + _COMPOSE_LLM_BUDGET_S
+    local, label = _get_local_oracle()
+    paid_candidates = _paid_clients()
+
+    if local is None and not paid_candidates:
+        log.warning("Compose: no LLM endpoint available (all disabled) — returning busy fallback")
+        return None, None
+
+    if local is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            log.warning("Compose LLM budget ({b}s) exhausted before local attempt could run", b=_COMPOSE_LLM_BUDGET_S)
+        else:
+            try:
+                txt = _call_with_timeout(
+                    lambda: local.chat(messages, temperature=temperature, num_predict=num_predict),
+                    remaining,
+                )
+                if txt and txt.strip():
+                    return txt, label
+                log.warning("Local LLM returned empty — failing over to paid")
+            except _futures.TimeoutError:
+                log.warning("Compose LLM budget ({b}s) exceeded on local card — failing over to paid model", b=_COMPOSE_LLM_BUDGET_S)
+            except Exception as exc:
+                log.warning("Local LLM error ({e}) — failing over to paid", e=str(exc))
+
+    for paid, plabel in paid_candidates:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            log.warning("Compose LLM budget ({b}s) exhausted before paid fallback {l} could run", b=_COMPOSE_LLM_BUDGET_S, l=plabel)
+            break
         try:
             txt = _call_with_timeout(
                 lambda p=paid: p.chat(messages, temperature=temperature, num_predict=num_predict),
-                _PAID_CHAT_TIMEOUT_S,
+                remaining,
             )
             if txt and txt.strip():
                 log.info("Answered via paid model {l} (local card busy)", l=plabel)
@@ -2531,9 +2579,23 @@ def _stream_local_tokens(messages, client):
 def _stream_verdict(messages):
     """SSE generator: stream from the local card; if it's busy/slow/down, fail
     over to a paid model (emitted in chunks). If even paid is unreachable, tell
-    dad honestly the card is busy rather than faking an answer."""
-    got_any = False
+    dad honestly the card is busy rather than faking an answer.
+
+    The local attempt keeps its own first-token budget (_STREAM_FIRST_TOKEN_S);
+    the paid failover phase that follows is bounded overall by
+    _STREAM_PAID_BUDGET_S so a slow third host can't stack multiple
+    per-provider timeouts into a multi-minute wait.
+    """
     local, _label = _get_local_oracle()
+    paid_candidates = _paid_clients()
+
+    if local is None and not paid_candidates:
+        log.warning("Ask/stream: no LLM endpoint available (all disabled) — returning busy fallback")
+        yield _sse({"delta": CARD_BUSY_MESSAGE})
+        yield _sse({"done": True})
+        return
+
+    got_any = False
     if local is not None:
         try:
             for kind, val in _stream_local_tokens(messages, local):
@@ -2547,12 +2609,18 @@ def _stream_verdict(messages):
         yield _sse({"done": True})
         return
 
-    # Local produced nothing (busy/down) — paid models keep the answer smart.
-    for paid, plabel in _paid_clients():
+    # Local produced nothing (busy/down) — paid models keep the answer smart,
+    # bounded overall so this phase can't run past _STREAM_PAID_BUDGET_S.
+    deadline = time.monotonic() + _STREAM_PAID_BUDGET_S
+    for paid, plabel in paid_candidates:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            log.warning("Ask/stream paid budget ({b}s) exhausted before {l} could run", b=_STREAM_PAID_BUDGET_S, l=plabel)
+            break
         try:
             txt = _call_with_timeout(
                 lambda p=paid: p.chat(messages, temperature=0.3, num_predict=2000),
-                _PAID_CHAT_TIMEOUT_S,
+                min(remaining, _PAID_CHAT_TIMEOUT_S),
             )
             if txt and txt.strip():
                 log.info("Verdict via paid model {l} (local card busy)", l=plabel)

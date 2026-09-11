@@ -67,7 +67,14 @@ class LlamaCppClient:
         self.reasoning_headroom = reasoning_headroom
         self.is_available: bool = False
         self._knowledge_cache: dict[str, str] = {}
-        self._backoff_key = f"{self.base_url}|{self.model}"
+        # Keyed by base_url alone (not base_url|model): several router
+        # provider names (llamacpp, llamacpp_oracle, ...) can point at the
+        # same physical shim/host under different configured model strings.
+        # Keying by model let one provider's chat failure back off only
+        # itself while a same-host sibling kept probing the still-broken
+        # endpoint fresh on every request (2026-09-11 stepdad.finance
+        # composer fail-fast investigation).
+        self._backoff_key = self.base_url
 
         backoff_until = _ENDPOINT_BACKOFF_UNTIL.get(self._backoff_key)
         if backoff_until and time.time() < backoff_until:
@@ -154,6 +161,12 @@ class LlamaCppClient:
             str: The assistant's response text, or None if unavailable.
         """
         if not self.is_available:
+            # Honor an active chat-failure backoff window before spending a
+            # network round-trip on a health re-check — the whole point of
+            # _mark_chat_failure is that we already know this endpoint is bad.
+            backoff_until = _ENDPOINT_BACKOFF_UNTIL.get(self._backoff_key)
+            if backoff_until and time.time() < backoff_until:
+                return None
             # Retry health check — server may have started after us
             try:
                 resp = requests.get(f"{self.base_url}/health", timeout=3)
