@@ -52,6 +52,72 @@ def _safe_json(data: Any) -> str:
     return json.dumps(data, cls=_NumpyEncoder, default=str)
 
 
+# ---------------------------------------------------------------------------
+# Canonical schema
+# ---------------------------------------------------------------------------
+# This is the ONE definition of ``analytical_snapshots`` in the repository.
+# Every writer and every migration must agree with it.
+#
+# A second, incompatible DDL for the same table name used to live in
+# ``scripts/parse_datasets.py`` — it declared ``actor / ticker / title /
+# summary / data`` columns that the real table has never had. The FTS
+# migration ``phase4_fts_intelligence_search`` was written against that
+# phantom shape and installed a BEFORE INSERT OR UPDATE trigger assigning
+# ``NEW.title``, which PL/pgSQL rejects with
+#
+#     record "new" has no field "title"
+#
+# on *every* write. That took the table offline for writes on 2026-09-11
+# (05:55–15:26 UTC) and silently dropped every analytical snapshot produced
+# in that window. Keep the definition here and nowhere else; the guard in
+# ``tests/test_migration_fts_columns.py`` reads this constant to check what
+# the migrations are allowed to reference.
+#
+# Note ``search_vector tsvector`` is NOT declared here: it is added by the
+# FTS migration, not by this table's own bootstrap.
+ANALYTICAL_SNAPSHOTS_DDL = """
+    CREATE TABLE IF NOT EXISTS analytical_snapshots (
+        id            BIGSERIAL PRIMARY KEY,
+        snapshot_date DATE NOT NULL,
+        category      TEXT NOT NULL,
+        subcategory   TEXT,
+        as_of_date    DATE NOT NULL,
+        payload       JSONB NOT NULL,
+        metrics       JSONB,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+"""
+
+ANALYTICAL_SNAPSHOTS_INDEX_DDL = (
+    """
+    CREATE INDEX IF NOT EXISTS idx_analytical_snapshots_date
+        ON analytical_snapshots (snapshot_date DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_analytical_snapshots_category
+        ON analytical_snapshots (category, snapshot_date DESC)
+    """,
+)
+
+
+def ensure_analytical_snapshots_table(db_engine: Engine) -> None:
+    """Create ``analytical_snapshots`` and its indexes if they don't exist.
+
+    Idempotent, and best-effort: a database that cannot be reached must not
+    stop the caller from starting up.
+
+    Parameters:
+        db_engine: SQLAlchemy engine for database access.
+    """
+    try:
+        with db_engine.begin() as conn:
+            conn.execute(text(ANALYTICAL_SNAPSHOTS_DDL))
+            for idx in ANALYTICAL_SNAPSHOTS_INDEX_DDL:
+                conn.execute(text(idx))
+    except Exception as exc:
+        log.warning("Could not ensure analytical_snapshots table: {e}", e=str(exc))
+
+
 class AnalyticalSnapshotStore:
     """Persist and query analytical outputs for historical comparison.
 
@@ -95,33 +161,7 @@ class AnalyticalSnapshotStore:
 
     def _ensure_table(self) -> None:
         """Create the analytical_snapshots table if it doesn't exist."""
-        ddl = text("""
-            CREATE TABLE IF NOT EXISTS analytical_snapshots (
-                id            BIGSERIAL PRIMARY KEY,
-                snapshot_date DATE NOT NULL,
-                category      TEXT NOT NULL,
-                subcategory   TEXT,
-                as_of_date    DATE NOT NULL,
-                payload       JSONB NOT NULL,
-                metrics       JSONB,
-                created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
-        idx_date = text("""
-            CREATE INDEX IF NOT EXISTS idx_analytical_snapshots_date
-                ON analytical_snapshots (snapshot_date DESC)
-        """)
-        idx_cat = text("""
-            CREATE INDEX IF NOT EXISTS idx_analytical_snapshots_category
-                ON analytical_snapshots (category, snapshot_date DESC)
-        """)
-        try:
-            with self.engine.begin() as conn:
-                conn.execute(ddl)
-                conn.execute(idx_date)
-                conn.execute(idx_cat)
-        except Exception as exc:
-            log.warning("Could not ensure analytical_snapshots table: {e}", e=str(exc))
+        ensure_analytical_snapshots_table(self.engine)
 
     # ------------------------------------------------------------------
     # Write

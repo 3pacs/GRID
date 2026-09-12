@@ -13,8 +13,10 @@ Usage:
 Tables created if missing:
     - actors                  (persons, entities, donors, officers)
     - entity_relationships    (ICIJ edges, actor connections)
-    - analytical_snapshots    (trades, speeches, intel records)
     - signal_data             (large-trade signals, anomalies)
+    - analytical_snapshots    (trades, speeches, intel records) — created via
+      store.snapshots.ensure_analytical_snapshots_table(), which owns the one
+      canonical DDL for that table; this file must not redeclare it.
 """
 from __future__ import annotations
 
@@ -27,7 +29,7 @@ import sys
 import time
 import zipfile
 from collections import defaultdict
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional
 
 # Allow imports from project root
@@ -36,6 +38,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db import get_engine
 from sqlalchemy import text
 from loguru import logger as log
+
+from store.snapshots import ensure_analytical_snapshots_table
 
 
 # ---------------------------------------------------------------------------
@@ -75,23 +79,14 @@ CREATE INDEX IF NOT EXISTS idx_entity_rel_type ON entity_relationships(relations
 CREATE UNIQUE INDEX IF NOT EXISTS uq_entity_rel
     ON entity_relationships(actor_a, actor_b, relationship, source_id);
 
-CREATE TABLE IF NOT EXISTS analytical_snapshots (
-    id              BIGSERIAL PRIMARY KEY,
-    category        TEXT NOT NULL,
-    snapshot_date   DATE,
-    actor           TEXT,
-    ticker          TEXT,
-    title           TEXT,
-    summary         TEXT,
-    data            JSONB DEFAULT '{}',
-    confidence      TEXT NOT NULL DEFAULT 'confirmed',
-    source_id       TEXT,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_snap_category ON analytical_snapshots(category);
-CREATE INDEX IF NOT EXISTS idx_snap_date ON analytical_snapshots(snapshot_date);
-CREATE INDEX IF NOT EXISTS idx_snap_actor ON analytical_snapshots(actor);
-CREATE INDEX IF NOT EXISTS idx_snap_ticker ON analytical_snapshots(ticker);
+-- analytical_snapshots is deliberately absent here. It is owned by
+-- store/snapshots.py (ANALYTICAL_SNAPSHOTS_DDL) and created via
+-- ensure_analytical_snapshots_table() in _ensure_tables() below. This file
+-- used to declare a rival shape for the same table name — actor / ticker /
+-- title / summary / data columns that the real table has never had — and the
+-- phase4 FTS migration was written against that phantom shape. Its trigger
+-- then assigned NEW.title and PostgreSQL rejected every write to the table
+-- with `record "new" has no field "title"`. One definition only.
 
 CREATE TABLE IF NOT EXISTS signal_data (
     id              BIGSERIAL PRIMARY KEY,
@@ -183,6 +178,9 @@ class DatasetParser:
                     conn.execute(text(stmt))
             except Exception as exc:
                 log.debug("DDL skip (likely exists): {e}", e=str(exc)[:80])
+        # analytical_snapshots comes from its owning module, not from
+        # SCHEMA_DDL — see the note where it used to be declared above.
+        ensure_analytical_snapshots_table(self.engine)
         log.info("Tables ready")
 
     # ------------------------------------------------------------------
@@ -1006,7 +1004,50 @@ class DatasetParser:
         except Exception as e:
             log.error("Relationships batch insert error: {e}", e=str(e))
 
-    def _insert_snapshots_batch(self, batch: list[dict]):
+    @staticmethod
+    def _snapshot_row(entry: dict) -> dict:
+        """Map one flat dataset record onto the canonical snapshot columns.
+
+        Callers in this file build records in the shape the source datasets
+        have (``actor``/``ticker``/``title``/``summary``/``data``).
+        ``analytical_snapshots`` has none of those columns — see
+        ``store/snapshots.py`` for the one true schema — so everything
+        descriptive is folded into the jsonb ``payload`` instead. Nothing is
+        dropped; it just stops pretending to be columns.
+
+        Parameters:
+            entry: Flat record with at least a ``category`` key.
+
+        Returns:
+            dict: Bind parameters for the canonical INSERT.
+        """
+        snapshot_date = entry.get("snapshot_date") or date.today()
+        data = entry.get("data")
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except (TypeError, ValueError):
+                data = {"raw": data}
+        payload = {
+            "actor": entry.get("actor"),
+            "ticker": entry.get("ticker"),
+            "title": entry.get("title"),
+            "summary": entry.get("summary"),
+            "confidence": entry.get("confidence", "confirmed"),
+            "source_id": entry.get("source_id"),
+            "data": data if isinstance(data, dict) else {},
+        }
+        return {
+            "snapshot_date": snapshot_date,
+            "category": entry["category"],
+            # source_id is the natural refinement within a category
+            # ('senate_efds', 'house_disclosures', 'fed_speeches').
+            "subcategory": entry.get("source_id"),
+            "as_of_date": snapshot_date,
+            "payload": json.dumps(payload),
+        }
+
+    def _insert_snapshots_batch(self, batch: list[dict]) -> None:
         """Insert a batch of analytical snapshots."""
         if not batch:
             return
@@ -1015,12 +1056,12 @@ class DatasetParser:
                 conn.execute(
                     text("""
                         INSERT INTO analytical_snapshots
-                            (category, snapshot_date, actor, ticker, title,
-                             summary, data, confidence, source_id)
-                        VALUES (:category, :snapshot_date, :actor, :ticker, :title,
-                                :summary, :data::jsonb, :confidence, :source_id)
+                            (snapshot_date, category, subcategory,
+                             as_of_date, payload)
+                        VALUES (:snapshot_date, :category, :subcategory,
+                                :as_of_date, CAST(:payload AS jsonb))
                     """),
-                    batch,
+                    [self._snapshot_row(entry) for entry in batch],
                 )
         except Exception as e:
             log.error("Snapshots batch insert error: {e}", e=str(e))
