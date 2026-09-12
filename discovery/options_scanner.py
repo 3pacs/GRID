@@ -25,6 +25,28 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 
+def _nullable_float(value: Any) -> float | None:
+    """Coerce to a native float, preserving a missing value as SQL NULL.
+
+    ``options_daily_signals`` columns are nullable and several of them are
+    legitimately NULL for a thin chain, so a plain ``float(value)`` raises
+    ``TypeError: float() argument must be ... not 'NoneType'`` and takes the
+    whole scan down with it. NaN is treated as missing too — pandas/numpy
+    aggregations upstream produce NaN for an empty slice, and a NaN in a
+    DOUBLE PRECISION column reads back as a number that fails every
+    comparison. Both become NULL, which is what "we do not have this" means.
+    """
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if out != out:  # NaN
+        return None
+    return out
+
+
 @dataclass
 class MispricingOpportunity:
     """A flagged options mispricing opportunity."""
@@ -39,7 +61,13 @@ class MispricingOpportunity:
     strikes: list[float] = field(default_factory=list)
     expiry: str = ""
     spot_price: float = 0.0
-    iv_atm: float = 0.0
+    # ATM implied vol is genuinely absent for a thin chain — ingestion's
+    # _compute_atm_iv() returns None when no contract sits inside the +/-2%
+    # ATM band (or every IV in it is NaN), and options_daily_signals.iv_atm
+    # is nullable to record that. Keep it None rather than coercing to 0.0:
+    # a zero would read downstream as "this name has zero implied vol",
+    # which is a different and false claim.
+    iv_atm: float | None = None
     confidence: str = "LOW"         # LOW / MEDIUM / HIGH
 
     @property
@@ -71,6 +99,10 @@ class OptionsScanner:
     TERM_INVERSION_THRESHOLD = -0.05  # Negative term slope = backwardation
     IV_PERCENTILE_CHEAP = 10     # Below 10th percentile = historically cheap
     IV_PERCENTILE_RICH = 95      # Above 95th percentile = historically rich
+
+    # Above this share of the scanned universe, a missing column stops being
+    # a per-ticker thin-chain gap and starts being a data-source problem.
+    SYSTEMATIC_GAP_SHARE = 0.5
 
     def __init__(self, db_engine: Engine, lookback_days: int = 252) -> None:
         self.engine = db_engine
@@ -107,10 +139,13 @@ class OptionsScanner:
         )
 
         opportunities: list[MispricingOpportunity] = []
+        coverage: dict[str, int] = {"scanned": 0, "no_spot": 0, "no_iv_atm": 0}
 
         for ticker in tickers:
-            ticker_opps = self._scan_ticker(ticker, scan_date)
+            ticker_opps = self._scan_ticker(ticker, scan_date, coverage)
             opportunities.extend(ticker_opps)
+
+        self._warn_on_field_coverage(coverage, scan_date)
 
         # Filter and sort
         filtered = [o for o in opportunities if o.score >= min_score]
@@ -153,14 +188,100 @@ class OptionsScanner:
             ).fetchall()
         return [r[0] for r in rows]
 
+    def _warn_on_field_coverage(
+        self, coverage: dict[str, int], scan_date: date
+    ) -> None:
+        """Surface a whole-source outage instead of swallowing it per ticker.
+
+        One thin chain with no ATM IV is normal and is skipped quietly by
+        ``_scan_ticker``. The same column missing across most of the universe
+        means the puller or the vendor stopped producing it, which no amount
+        of per-row tolerance should hide. Warning, not error: the fault is
+        upstream of this module (see CLAUDE.md log-level rule).
+
+        Parameters:
+            coverage: Tally produced by ``_scan_ticker``.
+            scan_date: Date being scanned, for the message.
+        """
+        scanned = coverage.get("scanned", 0)
+        if scanned <= 0:
+            return
+
+        for field_name, key in (("iv_atm", "no_iv_atm"), ("spot_price", "no_spot")):
+            missing = coverage.get(key, 0)
+            if missing <= 0:
+                continue
+            share = missing / scanned
+            if share < self.SYSTEMATIC_GAP_SHARE:
+                log.info(
+                    "options_scanner: {n}/{t} tickers have no {f} on {d} "
+                    "(thin chains — scored without it)",
+                    n=missing, t=scanned, f=field_name, d=scan_date,
+                )
+                continue
+            log.warning(
+                "options_scanner: options_daily_signals.{f} is missing for "
+                "{n}/{t} scanned tickers on {d} ({p:.0%}) — that is a data "
+                "source problem, not a thin chain; check ingestion/options.py",
+                f=field_name, n=missing, t=scanned, d=scan_date, p=share,
+            )
+
     def _scan_ticker(
-        self, ticker: str, scan_date: date
+        self,
+        ticker: str,
+        scan_date: date,
+        coverage: dict[str, int] | None = None,
     ) -> list[MispricingOpportunity]:
-        """Run all signal checks for a single ticker."""
+        """Run all signal checks for a single ticker.
+
+        Parameters:
+            ticker: Ticker to scan.
+            scan_date: Date to scan.
+            coverage: Optional tally that ``scan_all`` uses to tell a
+                per-ticker data gap apart from a whole-source outage. Keys:
+                ``scanned``, ``no_spot``, ``no_iv_atm``.
+
+        Returns:
+            list[MispricingOpportunity]: At most one opportunity; empty when
+            the ticker has no current row or no usable spot price.
+        """
         # Get current signals
         current = self._get_current_signals(ticker, scan_date)
         if current is None:
             return []
+
+        if coverage is not None:
+            coverage["scanned"] = coverage.get("scanned", 0) + 1
+
+        # Spot price anchors the target strikes, the max-pain divergence and
+        # the payoff estimate. Without it the row cannot be acted on, so the
+        # ticker is skipped rather than persisted as an unpriceable
+        # "opportunity". A NULL here is an upstream coverage gap, not a bug
+        # in this module, hence warning rather than error.
+        spot_price = _nullable_float(current.get("spot_price"))
+        if spot_price is None or spot_price <= 0:
+            if coverage is not None:
+                coverage["no_spot"] = coverage.get("no_spot", 0) + 1
+            log.warning(
+                "options_scanner: skipping {t} — options_daily_signals."
+                "spot_price is {v!r} on the latest row at or before {d}",
+                t=ticker, v=current.get("spot_price"), d=scan_date,
+            )
+            return []
+
+        # iv_atm is allowed to be NULL — _get_current_signals' own WHERE
+        # clause admits it ("iv_atm IS NULL OR iv_atm >= 0.03"). Only the
+        # iv_percentile signal and the payoff estimate read it, and both
+        # already degrade on None, so the opportunity is kept and the gap is
+        # carried through to the database as a NULL.
+        iv_atm = _nullable_float(current.get("iv_atm"))
+        if iv_atm is None:
+            if coverage is not None:
+                coverage["no_iv_atm"] = coverage.get("no_iv_atm", 0) + 1
+            log.debug(
+                "options_scanner: {t} has no ATM IV on {d} — scoring without it",
+                t=ticker, d=scan_date,
+            )
 
         # Get historical signals for percentile ranking
         history = self._get_signal_history(ticker, scan_date)
@@ -290,6 +411,13 @@ class OptionsScanner:
         # Get strike targets
         strikes = self._get_target_strikes(ticker, scan_date, dominant_direction, current)
 
+        # near_expiry is nullable as well — str(None) would hand persist_scan
+        # the literal string "None", which is truthy and then fails the DATE
+        # cast on insert. An absent expiry stays the empty string, which
+        # persist_scan already maps to SQL NULL.
+        raw_expiry = current.get("near_expiry")
+        near_expiry = str(raw_expiry) if raw_expiry else ""
+
         opp = MispricingOpportunity(
             ticker=ticker,
             scan_date=scan_date,
@@ -299,9 +427,9 @@ class OptionsScanner:
             thesis=thesis,
             signals=signals,
             strikes=strikes,
-            expiry=str(current.get("near_expiry", "")),
-            spot_price=current.get("spot_price", 0),
-            iv_atm=current.get("iv_atm", 0),
+            expiry=near_expiry,
+            spot_price=spot_price,
+            iv_atm=iv_atm,
             confidence=confidence,
         )
 
@@ -968,10 +1096,12 @@ class OptionsScanner:
                             k: {"score": v["score"], "value": str(v.get("value", ""))}
                             for k, v in opp.signals.items()
                         }),
-                        "strikes": [float(s) for s in opp.strikes],
+                        "strikes": [float(s) for s in opp.strikes if s is not None],
                         "expiry": opp.expiry if opp.expiry else None,
-                        "spot": float(opp.spot_price),
-                        "iv": float(opp.iv_atm),
+                        "spot": _nullable_float(opp.spot_price),
+                        # options_mispricing_scans.iv_atm is nullable; a thin
+                        # chain with no ATM IV writes NULL rather than 0.0.
+                        "iv": _nullable_float(opp.iv_atm),
                         "conf": opp.confidence,
                         "is100": bool(opp.is_100x),
                     },
