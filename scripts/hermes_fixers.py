@@ -71,6 +71,9 @@ HERMES_REPAIR_SKILLS: tuple[tuple[str, str], ...] = (
     ("LIST_SUBAGENTS", "List Hermes' dedicated subagent roles and queue contracts."),
     ("DISPATCH_SUBAGENT:<role>:<target_id>[:priority]", "Queue a bounded goal for a dedicated Hermes subagent role."),
     ("CHECK_SUBAGENTS", "Inspect goal_queue state for Hermes-managed subagent work."),
+    ("CHECK_WRITER_FRESHNESS[:table]", "Detect an expected-writer table that has stopped growing (the five-month resolved_series stall)."),
+    ("REGISTER_GHOST_FEATURES", "Register entity_map targets that have no feature_registry row, whose observations are being dropped."),
+    ("REPORT_UNMAPPED_SERIES[:limit]", "Aggregate series_ids skipped at resolution for having no entity_map entry."),
     ("NONE", "No repair needed."),
 )
 
@@ -102,6 +105,16 @@ HERMES_SUBAGENTS: dict[str, dict[str, Any]] = {
         "priority": 130,
         "allow_cloud": False,
         "description": "Inventory GRID data roots, flag un-ingested archives, and plan cold-storage cleanup.",
+    },
+    "mapping_steward": {
+        "goal_type": "hermes_propose_entity_mappings",
+        "hardware_tier": "cpu",
+        "priority": 145,
+        "allow_cloud": False,
+        "description": (
+            "Propose entity_map entries for series_ids that keep recurring "
+            "unmapped, so the mapping backlog drains instead of accumulating."
+        ),
     },
     "hypothesis_scorer": {
         "goal_type": "score_active_hypothesis",
@@ -879,6 +892,42 @@ def _execute_hermes_repair_command(
         inserted = int(row[0]) if row and row[0] is not None else 0
         total = int(row[1]) if row and row[1] is not None else 0
         return {"cmd": raw_cmd, "status": "ok", "inserted": inserted, "total_events": total}
+
+    if upper_cmd.startswith("CHECK_WRITER_FRESHNESS"):
+        # The check that would have caught resolved_series going quiet in April
+        # on the very next cycle, instead of five months later.
+        from scripts.hermes_data_integrity import check_writer_freshness
+        target = raw_cmd.split(":", 1)[1].strip() if ":" in raw_cmd else None
+        return {
+            "cmd": raw_cmd,
+            **check_writer_freshness(
+                _require_engine(engine, raw_cmd),
+                table=target or None,
+                cycle_number=getattr(state, "cycle_number", None),
+            ),
+        }
+
+    if upper_cmd == "REGISTER_GHOST_FEATURES":
+        from scripts.hermes_data_integrity import register_ghost_features
+        return {
+            "cmd": raw_cmd,
+            **register_ghost_features(
+                _require_engine(engine, raw_cmd),
+                cycle_number=getattr(state, "cycle_number", None),
+            ),
+        }
+
+    if upper_cmd.startswith("REPORT_UNMAPPED_SERIES"):
+        from scripts.hermes_data_integrity import report_unmapped_series
+        arg = raw_cmd.split(":", 1)[1].strip() if ":" in raw_cmd else ""
+        return {
+            "cmd": raw_cmd,
+            **report_unmapped_series(
+                _require_engine(engine, raw_cmd),
+                cycle_number=getattr(state, "cycle_number", None),
+                limit=int(arg) if arg.isdigit() else 25,
+            ),
+        }
 
     if upper_cmd == "CHECK_HEALTH":
         return {"cmd": raw_cmd, "status": "ok", "health": health}

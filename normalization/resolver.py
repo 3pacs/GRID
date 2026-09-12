@@ -34,6 +34,30 @@ DEFAULT_LOOKBACK_DAYS: int = 30
 # scanned the whole table regardless of its width.
 DEFAULT_BACKFILL_CHUNK_DAYS: int = 1
 
+# Floor for adaptive chunk narrowing. A chunk that outgrows the statement
+# timeout is halved and retried rather than skipped; this is where splitting
+# stops being the answer. Measured 2026-09-11: with the window reaching the
+# planner as an index bound, most days resolve in ~8 min, but heavy days
+# (2026-04-05 was the first) still exceed the 600s statement timeout.
+MIN_BACKFILL_CHUNK_SECONDS: int = 3600  # one hour
+
+
+def _is_statement_timeout(exc: BaseException) -> bool:
+    """True when a failure is the statement timeout that narrowing can fix.
+
+    Only a window too large to finish inside ``statement_timeout`` is helped
+    by a smaller window. A schema error or a dropped connection repeats at
+    every width, so narrowing those would burn the whole split budget on a
+    failure that was never about size.
+    """
+    blob = f"{type(exc).__name__} {exc}".lower().replace("_", "")
+    return (
+        "querycanceled" in blob
+        or "statementtimeout" in blob
+        or "canceling statement due to statement timeout" in blob
+    )
+
+
 # Two values are considered conflicting if they differ by more than 0.5%
 CONFLICT_THRESHOLD: float = 0.005
 
@@ -468,6 +492,90 @@ class Resolver:
         )
         return summary
 
+    def _resolve_window(
+        self,
+        since: datetime,
+        until: datetime,
+        workers: int,
+        dry_run: bool,
+        totals: dict[str, Any],
+    ) -> None:
+        """Resolve one window, halving it and retrying on a statement timeout.
+
+        A window that outgrows ``statement_timeout`` used to be recorded in
+        ``failed_ranges`` and skipped, and nothing ever went back for it — so
+        a backfill reported success having silently dropped every day too
+        heavy to finish. Observed live on 2026-09-11: the very second chunk of
+        the April→September walk (2026-04-05) died at the 600s timeout and the
+        walk moved on as if it had not.
+
+        Narrowing is the fix rather than a bigger timeout because it is
+        self-correcting: whatever the true cost of a day, halving reaches a
+        width that fits, and a day that is merely twice as heavy as its
+        neighbour costs one extra attempt instead of a raised ceiling for
+        everything. Splitting stops at ``MIN_BACKFILL_CHUNK_SECONDS``, below
+        which a timeout is no longer about window size and is recorded for a
+        human.
+
+        Only a timeout is narrowed (see ``_is_statement_timeout``); any other
+        failure repeats at every width, so it is recorded once and the walk
+        continues.
+
+        Accumulates into ``totals`` in place; returns nothing.
+        """
+        span_s = (until - since).total_seconds()
+        chunk_t0 = time.monotonic()
+        log.info("Resolving chunk {a} → {b}", a=since, b=until)
+        try:
+            result = self.resolve_pending(
+                workers=workers, since=since, until=until, dry_run=dry_run,
+            )
+        except Exception as exc:
+            elapsed = round(time.monotonic() - chunk_t0, 2)
+            totals["duration_s"] = round(totals["duration_s"] + elapsed, 2)
+            if _is_statement_timeout(exc) and span_s > MIN_BACKFILL_CHUNK_SECONDS:
+                midpoint = since + timedelta(seconds=span_s / 2)
+                log.warning(
+                    "Chunk {a} → {b} hit the statement timeout after {e}s — "
+                    "narrowing to two {h:.1f}h halves and retrying",
+                    a=since, b=until, e=elapsed, h=span_s / 7200,
+                )
+                totals["chunks_narrowed"] += 1
+                self._resolve_window(since, midpoint, workers, dry_run, totals)
+                self._resolve_window(midpoint, until, workers, dry_run, totals)
+                return
+            # Warning, not error: a window that cannot be narrowed further is
+            # an operational problem to look at, not a crash to propagate.
+            log.warning(
+                "Chunk {a} → {b} failed ({c}) after {e}s: {m} — continuing",
+                a=since, b=until, c=type(exc).__name__, e=elapsed, m=str(exc),
+            )
+            totals["errors"] += 1
+            totals["chunks"] += 1
+            totals["chunks_failed"] += 1
+            totals["failed_ranges"].append({
+                "since": since.isoformat(),
+                "until": until.isoformat(),
+                "error": str(exc),
+                "error_class": type(exc).__name__,
+            })
+            return
+
+        for key in ("resolved", "conflicts_found", "errors", "series_scanned"):
+            totals[key] += result[key]
+        totals["duration_s"] = round(totals["duration_s"] + result["duration_s"], 2)
+        totals["chunks"] += 1
+        if result["errors"]:
+            # A worker that failed inside resolve_pending never raises out of
+            # it, so this range is incomplete too — same retry.
+            totals["chunks_failed"] += 1
+            totals["failed_ranges"].append({
+                "since": since.isoformat(),
+                "until": until.isoformat(),
+                "error": f"{result['errors']} worker error(s)",
+                "error_class": "WorkerError",
+            })
+
     def resolve_range(
         self,
         since: datetime | date,
@@ -522,58 +630,12 @@ class Resolver:
             "resolved": 0, "conflicts_found": 0, "errors": 0,
             "series_scanned": 0, "duration_s": 0.0,
             "dry_run": dry_run, "chunks": 0, "chunks_failed": 0,
-            "failed_ranges": [],
+            "chunks_narrowed": 0, "failed_ranges": [],
         }
         cursor = start
         while cursor < end:
             chunk_end = min(cursor + timedelta(days=chunk_days), end)
-            log.info("Resolving chunk {a} → {b}", a=cursor, b=chunk_end)
-            chunk_t0 = time.monotonic()
-            try:
-                result = self.resolve_pending(
-                    workers=workers,
-                    since=cursor,
-                    until=chunk_end,
-                    dry_run=dry_run,
-                )
-            except Exception as exc:
-                # Warning, not error: a chunk that outgrew the statement
-                # timeout is an operational sizing problem, not a bug.
-                log.warning(
-                    "Chunk {a} → {b} failed ({c}): {e} — continuing; "
-                    "retry this range alone with a smaller --chunk-days",
-                    a=cursor.date(), b=chunk_end.date(),
-                    c=type(exc).__name__, e=str(exc),
-                )
-                totals["errors"] += 1
-                totals["chunks"] += 1
-                totals["chunks_failed"] += 1
-                totals["failed_ranges"].append({
-                    "since": cursor.date().isoformat(),
-                    "until": chunk_end.date().isoformat(),
-                    "error": str(exc),
-                    "error_class": type(exc).__name__,
-                })
-                totals["duration_s"] = round(
-                    totals["duration_s"] + (time.monotonic() - chunk_t0), 2
-                )
-                cursor = chunk_end
-                continue
-
-            for key in ("resolved", "conflicts_found", "errors", "series_scanned"):
-                totals[key] += result[key]
-            totals["duration_s"] = round(totals["duration_s"] + result["duration_s"], 2)
-            totals["chunks"] += 1
-            if result["errors"]:
-                # A worker that failed inside resolve_pending never raises
-                # out of it, so this range is incomplete too — same retry.
-                totals["chunks_failed"] += 1
-                totals["failed_ranges"].append({
-                    "since": cursor.date().isoformat(),
-                    "until": chunk_end.date().isoformat(),
-                    "error": f"{result['errors']} worker error(s)",
-                    "error_class": "WorkerError",
-                })
+            self._resolve_window(cursor, chunk_end, workers, dry_run, totals)
             cursor = chunk_end
 
         if totals["failed_ranges"]:
@@ -584,10 +646,11 @@ class Resolver:
                 r=[(f["since"], f["until"]) for f in totals["failed_ranges"]],
             )
         log.info(
-            "Range resolution complete — chunks={n} ({f} failed), "
-            "resolved={r}, errors={e}, {t}s",
+            "Range resolution complete — chunks={n} ({f} failed, {w} narrowed "
+            "after a timeout), resolved={r}, errors={e}, {t}s",
             n=totals["chunks"], f=totals["chunks_failed"],
-            r=totals["resolved"], e=totals["errors"], t=totals["duration_s"],
+            w=totals["chunks_narrowed"], r=totals["resolved"],
+            e=totals["errors"], t=totals["duration_s"],
         )
         return totals
 
@@ -702,8 +765,8 @@ def main(argv: list[str] | None = None) -> int:
 
     for failed in summary.get("failed_ranges", []):
         print(
-            f"  RETRY: --since {failed['since']} --until {failed['until']} "
-            f"--chunk-days 1   ({failed['error_class']}: {failed['error']})"
+            f"  RETRY: --since {failed['since']} --until {failed['until']}   "
+            f"({failed['error_class']}: {failed['error']})"
         )
 
     if args.conflict_report:
