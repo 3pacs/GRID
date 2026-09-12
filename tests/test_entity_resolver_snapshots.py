@@ -359,6 +359,39 @@ def test_statements_read_the_payload(sql):
 
 
 @pytest.mark.unit
+def test_partial_index_predicate_matches_the_queries():
+    """The migration's index and the queries must agree, or the index is dead.
+
+    ``idx_analytical_snapshots_payload_actor`` (and its trigram twin) are
+    *partial*: PostgreSQL will only use them when the index predicate implies
+    the query's. If either side's actor expression is edited alone, the
+    planner silently reverts to the sequential scan the migration measured at
+    121,197 — no error, just a resolver that got 36x slower.
+    """
+    import importlib
+    import importlib.util
+
+    # The migration is loaded by path; drop any stale bytecode first so an
+    # edit within the filesystem's mtime granularity is still seen.
+    importlib.invalidate_caches()
+    spec = importlib.util.spec_from_file_location(
+        "snapshot_payload_actor_index",
+        REPO_ROOT / "migrations" / "versions"
+        / "snapshot_payload_actor_index_20260912.py",
+    )
+    assert spec and spec.loader
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+
+    # Both statements must filter on exactly the expression the index keys.
+    for sql in (SNAPSHOT_SEARCH_SQL, SNAPSHOT_NAME_SCAN_SQL):
+        assert migration.ACTOR_EXPR in " ".join(sql.split()), (
+            f"index keys {migration.ACTOR_EXPR!r}, which does not appear in:"
+            f"\n{sql}"
+        )
+
+
+@pytest.mark.unit
 def test_search_sql_binds_every_value():
     """`.claude/rules/security.md`: no f-strings or .format() in SQL."""
     assert ":name" in SNAPSHOT_SEARCH_SQL
