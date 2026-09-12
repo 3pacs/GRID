@@ -979,32 +979,40 @@ def grid_submit_research(task_type: str, response: str) -> dict[str, Any]:
 
     Returns confirmation with task acceptance status.
     """
-    from sqlalchemy import text
+    from store.snapshots import AnalyticalSnapshotStore
 
     engine = _get_engine()
 
     try:
-        with engine.begin() as conn:
-            # Store the research result in analytical_snapshots
-            conn.execute(
-                text(
-                    "INSERT INTO analytical_snapshots (category, payload, created_at) "
-                    "VALUES (:cat, :payload, NOW())"
-                ),
-                {
-                    "cat": f"mcp_research_{task_type}",
-                    "payload": json.dumps({
-                        "task_type": task_type,
-                        "response": response,
-                        "source": "mcp_submission",
-                        "confidence_label": "estimated",
-                    }),
-                },
-            )
+        # Write through the owning module rather than hand-rolling the INSERT.
+        # analytical_snapshots.snapshot_date and .as_of_date are both NOT NULL
+        # with no default, so the three-column INSERT this used to run
+        # ("category, payload, created_at") raised NotNullViolation on every
+        # call and no miner submission was ever stored. save_snapshot() fills
+        # both from the schema it owns — see store/snapshots.py.
+        snapshot_id = AnalyticalSnapshotStore(engine).save_snapshot(
+            category=f"mcp_research_{task_type}",
+            subcategory="mcp_submission",
+            payload={
+                "task_type": task_type,
+                "response": response,
+                "source": "mcp_submission",
+                "confidence_label": "estimated",
+            },
+        )
+        if snapshot_id is None:
+            # save_snapshot logs the cause and returns None; do not report a
+            # write that did not happen as accepted.
+            return {
+                "status": "error",
+                "error": "analytical_snapshots write failed — see server logs",
+                "confidence_label": "n/a",
+            }
 
         return {
             "status": "accepted",
             "task_type": task_type,
+            "snapshot_id": snapshot_id,
             "response_length": len(response),
             "confidence_label": "confirmed",
         }
