@@ -246,14 +246,20 @@ class TestFTSSearch:
                 )
             """))
 
-            # Create analytical_snapshots table if not exists
+            # Create analytical_snapshots table if not exists.
+            # Mirrors store/snapshots.py::ANALYTICAL_SNAPSHOTS_DDL — the one
+            # canonical shape. This fixture used to declare title/summary
+            # columns the real table has never had, which is the same phantom
+            # shape the phase4 FTS migration was written against.
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS analytical_snapshots (
                     id BIGSERIAL PRIMARY KEY,
+                    snapshot_date DATE NOT NULL DEFAULT CURRENT_DATE,
                     category TEXT NOT NULL DEFAULT 'test',
-                    snapshot_date DATE DEFAULT CURRENT_DATE,
-                    title TEXT,
-                    summary TEXT,
+                    subcategory TEXT,
+                    as_of_date DATE NOT NULL DEFAULT CURRENT_DATE,
+                    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    metrics JSONB,
                     search_vector tsvector,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
@@ -287,10 +293,12 @@ class TestFTSSearch:
             """))
 
             conn.execute(text("""
-                INSERT INTO analytical_snapshots (category, title, summary)
+                INSERT INTO analytical_snapshots (category, subcategory, payload)
                 VALUES
-                    ('market_regime', 'Q1 2026 Market Regime', 'Growth regime with strong tech leadership and rising yields'),
-                    ('sector_analysis', 'Semiconductor Deep Dive', 'AI infrastructure spending drives semiconductor revenue growth')
+                    ('market_regime', 'Q1 2026 Market Regime',
+                     '{"summary": "Growth regime with strong tech leadership and rising yields"}'::jsonb),
+                    ('sector_analysis', 'Semiconductor Deep Dive',
+                     '{"summary": "AI infrastructure spending drives semiconductor revenue growth"}'::jsonb)
             """))
 
             # Drop and recreate materialized view
@@ -316,10 +324,10 @@ class TestFTSSearch:
                 FROM discovered_hypotheses WHERE thesis IS NOT NULL
                 UNION ALL
                 SELECT 'snapshot' AS source_type, id::text,
-                       COALESCE(title, '') AS title,
-                       COALESCE(summary, '') AS body,
-                       to_tsvector('english', COALESCE(title, '') || ' ' || COALESCE(summary, '')) AS tsv
-                FROM analytical_snapshots WHERE summary IS NOT NULL
+                       COALESCE(category, '') AS title,
+                       COALESCE(subcategory, '') AS body,
+                       to_tsvector('english', COALESCE(category, '') || ' ' || COALESCE(subcategory, '')) AS tsv
+                FROM analytical_snapshots WHERE category IS NOT NULL
             """))
 
             conn.execute(text("""
@@ -341,7 +349,7 @@ class TestFTSSearch:
             conn.execute(text("DELETE FROM discovered_hypotheses WHERE id LIKE 'test-%%'"))
             # signal_data and analytical_snapshots use BIGSERIAL, cleanup by description
             conn.execute(text("DELETE FROM signal_data WHERE description LIKE '%%Insider purchase%%' OR description LIKE '%%Congressional disclosure%%'"))
-            conn.execute(text("DELETE FROM analytical_snapshots WHERE title LIKE '%%Q1 2026%%' OR title LIKE '%%Semiconductor Deep%%'"))
+            conn.execute(text("DELETE FROM analytical_snapshots WHERE subcategory LIKE '%%Q1 2026%%' OR subcategory LIKE '%%Semiconductor Deep%%'"))
 
     def test_basic_fts_query(self):
         """Search for 'Buffett' should return the actor."""
