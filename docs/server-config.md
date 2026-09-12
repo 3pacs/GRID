@@ -21,7 +21,7 @@
 | **Host** | localhost |
 | **Port** | 5432 |
 | **User** | grid |
-| **Password** | gridmaster2026 |
+| **Password** | See `DB_PASSWORD` in `grid/.env` (not committed — set per `config.py` / `.env.example`) |
 | **Database (live)** | **griddb** (212K+ resolved_series, 567 features, 40 sources) |
 | **Database (empty)** | grid (schema only — do not use) |
 
@@ -61,7 +61,7 @@ All LLM outputs and data stored on /data (11T drive):
 | **Port** | 8000 |
 | **Python** | python3 (3.10, system) |
 | **Packages** | ~/.local/lib/python3.10/site-packages/ |
-| **Login password** | grid2026 |
+| **Login password** | See `GRID_MASTER_PASSWORD_HASH` in `grid/.env` (bcrypt hash; plaintext is never stored — set/rotate via `scripts/setup_auth.py`) |
 
 ## API Keys (in .env)
 
@@ -71,7 +71,7 @@ All LLM outputs and data stored on /data (11T drive):
 | EIA_API_KEY | Set (QAz3bg00...) |
 | NOAA_TOKEN | Set (TAbZzkQb...) |
 | GRID_JWT_SECRET | Set (auto-generated) |
-| GRID_MASTER_PASSWORD_HASH | Set (bcrypt for grid2026) |
+| GRID_MASTER_PASSWORD_HASH | Set (bcrypt hash — generate/rotate with `scripts/setup_auth.py`; plaintext lives only in the operator's password manager) |
 | KOSIS_API_KEY | Empty — Korean registration needed |
 | COMTRADE_API_KEY | Empty — UN registration needed |
 | JQUANTS_EMAIL/PASSWORD | Empty — Japanese registration needed |
@@ -110,13 +110,13 @@ kill $(lsof -t -i:8000); sleep 1; cd ~/grid_v4/grid_repo/grid && nohup python3 -
 curl -s localhost:8000/api/v1/system/health | python3 -m json.tool
 
 # Database shell
-PGPASSWORD=gridmaster2026 psql -h localhost -U grid -d griddb
+PGPASSWORD="$DB_PASSWORD" psql -h localhost -U grid -d griddb
 
 # Count data
-PGPASSWORD=gridmaster2026 psql -h localhost -U grid -d griddb -c "SELECT COUNT(*) FROM resolved_series;"
+PGPASSWORD="$DB_PASSWORD" psql -h localhost -U grid -d griddb -c "SELECT COUNT(*) FROM resolved_series;"
 
 # Apply schema changes
-PGPASSWORD=gridmaster2026 psql -h localhost -U grid -d griddb -f ~/grid_v4/grid_repo/grid/schema.sql
+PGPASSWORD="$DB_PASSWORD" psql -h localhost -U grid -d griddb -f ~/grid_v4/grid_repo/grid/schema.sql
 
 # Run daily data pull
 cd ~/grid_v4/grid_repo/grid && nohup python3 -c "from ingestion.scheduler import run_daily_pulls; run_daily_pulls()" > /data/grid/logs/daily_pull.log 2>&1 &
