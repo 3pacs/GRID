@@ -101,6 +101,179 @@ DOMAIN_WEIGHTS: dict[str, float] = {
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# QUERY FAILURE CLASSIFICATION
+# ══════════════════════════════════════════════════════════════════════════
+# Every source query in this module is wrapped so that one unavailable table
+# cannot take down resolution across the other five. That is the right
+# behaviour, but until 2026-09-12 the handlers logged every cause at
+# `log.warning`, and a query that named columns `analytical_snapshots` has
+# never had ("actor", "title", "source_id") raised `UndefinedColumn` on every
+# call and was reported as "Could not scan snapshots" — so the 556k-row
+# snapshot corpus was skipped entirely and the index build reported zero
+# snapshot names with nothing in errors.jsonl to say why.
+#
+# CLAUDE.md reserves `log.error` for unhandled application bugs and
+# `log.warning` for transient/operational faults. SQL that names a column the
+# table does not have is the former: it cannot succeed on any retry, on any
+# host, at any time. Classify on that line so the next schema drift is loud.
+
+# SQLSTATEs that mean "this statement named something the schema lacks".
+_SCHEMA_FAULT_SQLSTATES: frozenset[str] = frozenset({
+    "42703",  # undefined_column
+    "42883",  # undefined_function
+    "42P10",  # invalid_column_reference
+})
+
+# Fallback for DBAPIs that expose no SQLSTATE (sqlite, some drivers). Kept
+# deliberately narrow: a missing *table* is NOT a schema fault here, because
+# an optional corpus that was never loaded is a legitimate runtime state on a
+# fresh database, whereas a missing column means the query text is wrong.
+_SCHEMA_FAULT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r'column\s+"?[\w.]+"?\s+(?:of\s+relation\s+"?\w+"?\s+)?does not exist',
+        re.IGNORECASE,
+    ),
+    re.compile(r"no such column", re.IGNORECASE),
+    # The PL/pgSQL form: a BEFORE INSERT trigger assigning a field the record
+    # type lacks, which is how the same phantom shape took analytical_snapshots
+    # offline for writes on 2026-09-11.
+    re.compile(r'record\s+"\w+"\s+has no field', re.IGNORECASE),
+)
+
+
+def _is_schema_fault(exc: BaseException) -> bool:
+    """True when a query failed because it named a column the table lacks.
+
+    Args:
+        exc: The exception raised by the failed query.
+
+    Returns:
+        True for a fault no retry can fix (undefined column, undefined
+        function, invalid column reference); False for anything else,
+        including an undefined table.
+    """
+    sqlstate = getattr(getattr(exc, "orig", None), "pgcode", None)
+    if sqlstate in _SCHEMA_FAULT_SQLSTATES:
+        return True
+    message = str(exc)
+    return any(pattern.search(message) for pattern in _SCHEMA_FAULT_PATTERNS)
+
+
+def _log_query_failure(where: str, exc: BaseException) -> None:
+    """Log a failed source query at the level its cause deserves.
+
+    Schema faults go to `log.error` so they reach `.server-logs/errors.jsonl`
+    and `scripts/audit_error_log.py`; everything else stays a warning so that
+    file keeps its signal (CLAUDE.md, "Log levels").
+
+    Args:
+        where: Human-readable description of the query that failed.
+        exc: The exception it raised.
+    """
+    if _is_schema_fault(exc):
+        log.error(
+            "{where} names a column the live schema does not have: {e}",
+            where=where, e=exc,
+        )
+    else:
+        log.warning("{where} failed: {e}", where=where, e=exc)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ANALYTICAL SNAPSHOT QUERIES
+# ══════════════════════════════════════════════════════════════════════════
+# `analytical_snapshots` has exactly `id, snapshot_date, category,
+# subcategory, as_of_date, payload, metrics, created_at` (plus `search_vector`
+# from the FTS migration) — see `ANALYTICAL_SNAPSHOTS_DDL` in
+# `store/snapshots.py`, the one definition of this table. The actor, title and
+# source id are keys of the jsonb `payload`, which is where
+# `scripts/parse_datasets.py` writes congressional trades and Fed speeches.
+#
+# Both statements used to name `actor`, `title` and `source_id` as columns —
+# a shape that came from a rival DDL #477 deleted and that the real table has
+# never had. Every call raised `UndefinedColumn`, and both handlers logged it
+# at warning level, so the entire snapshot corpus was skipped in silence.
+#
+# They are module constants rather than inline strings so the tests execute
+# the same text production does instead of a copy that can drift.
+
+# Where the actor name lives, measured on griddb 2026-09-12:
+#
+#   payload ->> 'actor'     0 rows — the canonical key. parse_datasets writes
+#                           it for congressional trades and Fed speeches, but
+#                           only since #477: every such write failed for as
+#                           long as the phantom columns were in the tree, so
+#                           nothing carries it yet. This is the key that
+#                           matters from the next parser run onward.
+#   payload ->> 'senator'   5,000 rows — the same field under its pre-#477
+#                           spelling. The live `congressional_trade` rows hold
+#                           the raw Senate EFD record (senator / ticker / type
+#                           / amount / transaction_date / owner /
+#                           asset_description / asset_type / comment /
+#                           ptr_link), and `senator` is its actor: "David A
+#                           Perdue , Jr", the name this module's docstring
+#                           opens with. No other writer in the tree uses a
+#                           `senator` key, so this arm cannot capture anything
+#                           that is not a legislator.
+#
+# Deliberately NOT read here: `payload ->> 'name'`, carried by the 12,282
+# `category='opensanctions'` rows. The key is generic enough that a later
+# writer could mean something else by it, and `parse_opensanctions` already
+# loads that corpus into `actors` — so reading it would let one source count
+# as two domains in `_compute_bridge_score` and inflate the very signal
+# bridges exist to measure. Filed separately.
+#
+# `source_id` falls back to `subcategory`: parse_datasets writes the source id
+# to both (it is the natural refinement within a category), and the legacy
+# congressional rows carry only the column. Either way
+# `_guess_domain_from_source_id` also reads `category`, which spells
+# "congressional_trade".
+#
+# The COALESCE is computed once in a subquery so it cannot drift between the
+# SELECT list and the WHERE clause. PostgreSQL flattens a subquery this simple
+# into the outer query, so the predicate still reaches the base relation and
+# `idx_analytical_snapshots_payload_actor` (migration
+# snapshot_payload_actor_index_20260912) still applies. The aliases avoid the
+# phantom column names on purpose — an alias called `actor` would teach the
+# next reader that the column exists.
+SNAPSHOT_SEARCH_SQL = """
+    SELECT id, category, actor_name, snapshot_date,
+           snapshot_title, snapshot_source, created_at
+    FROM (
+        SELECT id,
+               category,
+               snapshot_date,
+               created_at,
+               COALESCE(payload ->> 'actor', payload ->> 'senator')
+                   AS actor_name,
+               payload ->> 'title' AS snapshot_title,
+               COALESCE(payload ->> 'source_id', subcategory)
+                   AS snapshot_source
+        FROM analytical_snapshots
+    ) s
+    WHERE actor_name IS NOT NULL
+      AND actor_name <> ''
+      AND (lower(actor_name) = lower(:name)
+           OR lower(actor_name) LIKE :pattern)
+    LIMIT 200
+"""
+
+# The empty-string guard matters here: parse_datasets writes Fed speeches with
+# `speech.get("s", "")`, so a speech with no named speaker would otherwise
+# enter the resolution index as a nameless entity.
+SNAPSHOT_NAME_SCAN_SQL = """
+    SELECT DISTINCT actor_name
+    FROM (
+        SELECT COALESCE(payload ->> 'actor', payload ->> 'senator')
+                   AS actor_name
+        FROM analytical_snapshots
+    ) s
+    WHERE actor_name IS NOT NULL
+      AND actor_name <> ''
+"""
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # PHONETIC ENCODING — Double Metaphone (simplified)
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -486,7 +659,7 @@ class EntityResolver:
                             if last_seen is None or ts > last_seen:
                                 last_seen = ts
             except Exception as e:
-                log.warning("Error searching {t}: {e}", t=table_name, e=e)
+                _log_query_failure(f"{table_name} entity search", e)
 
         bridge = self._compute_bridge_score(sources)
 
@@ -555,18 +728,27 @@ class EntityResolver:
     def _search_snapshots(
         self, normalized: str, can_key: str, entity_type: str
     ) -> list[dict[str, Any]]:
-        """Search analytical_snapshots for matching actor names."""
+        """Search analytical_snapshots for matching actor names.
+
+        The actor, title and source id live in the jsonb ``payload``, not in
+        columns. ``analytical_snapshots`` has exactly ``id, snapshot_date,
+        category, subcategory, as_of_date, payload, metrics, created_at``
+        (+ ``search_vector`` from the FTS migration) — see
+        ``ANALYTICAL_SNAPSHOTS_DDL`` in ``store/snapshots.py``, the one
+        definition of this table. It has never had ``actor``/``title``/
+        ``source_id``; those came from a rival DDL in
+        ``scripts/parse_datasets.py`` that #477 deleted.
+
+        Selecting them as columns raised ``UndefinedColumn`` on every call,
+        and ``resolve()`` logged it as a warning, so this source silently
+        contributed nothing to any resolution.
+
+        See ``SNAPSHOT_SEARCH_SQL`` for where the actor name actually lives
+        and which payload keys are read.
+        """
         results = []
         with self.engine.connect() as conn:
-            rows = conn.execute(text("""
-                SELECT id, category, actor, snapshot_date, title,
-                       source_id, created_at
-                FROM analytical_snapshots
-                WHERE actor IS NOT NULL
-                  AND (lower(actor) = lower(:name)
-                       OR lower(actor) LIKE :pattern)
-                LIMIT 200
-            """), {
+            rows = conn.execute(text(SNAPSHOT_SEARCH_SQL), {
                 "name": normalized,
                 "pattern": f"%{can_key.split()[0] if can_key.split() else ''}%",
             }).fetchall()
@@ -876,20 +1058,18 @@ class EntityResolver:
                     all_names["actors"].add(row[0])
                 log.info("Actors: {n} unique names", n=len(all_names["actors"]))
             except Exception as e:
-                log.warning("Could not scan actors: {e}", e=e)
+                _log_query_failure("actors name scan", e)
 
-            # Analytical snapshots
+            # Analytical snapshots — the actor is a jsonb payload key, not a
+            # column (see SNAPSHOT_NAME_SCAN_SQL).
             try:
-                rows = conn.execute(text(
-                    "SELECT DISTINCT actor FROM analytical_snapshots "
-                    "WHERE actor IS NOT NULL"
-                )).fetchall()
+                rows = conn.execute(text(SNAPSHOT_NAME_SCAN_SQL)).fetchall()
                 for row in rows:
                     all_names["analytical_snapshots"].add(row[0])
                 log.info("Snapshots: {n} unique actors",
                          n=len(all_names["analytical_snapshots"]))
             except Exception as e:
-                log.warning("Could not scan snapshots: {e}", e=e)
+                _log_query_failure("analytical_snapshots name scan", e)
 
             # Signal data
             try:
@@ -902,7 +1082,7 @@ class EntityResolver:
                 log.info("Signals: {n} unique actors",
                          n=len(all_names["signal_data"]))
             except Exception as e:
-                log.warning("Could not scan signals: {e}", e=e)
+                _log_query_failure("signal_data name scan", e)
 
             # Entity relationships (both sides)
             try:
@@ -918,7 +1098,7 @@ class EntityResolver:
                 log.info("Relationships: {n} unique entities",
                          n=len(all_names["entity_relationships"]))
             except Exception as e:
-                log.warning("Could not scan relationships: {e}", e=e)
+                _log_query_failure("entity_relationships name scan", e)
 
         # Flatten and cluster
         name_to_sources: dict[str, set[str]] = defaultdict(set)
@@ -1151,7 +1331,7 @@ class EntityResolver:
                     connected = b if normalize_name(a).lower() == normalized.lower() else a
                     results.append((connected, row[2], float(row[3] or 0.5)))
             except Exception as exc:
-                log.warning("Entity connection query failed: {e}", e=exc)
+                _log_query_failure("entity connection query", exc)
 
         return results
 
