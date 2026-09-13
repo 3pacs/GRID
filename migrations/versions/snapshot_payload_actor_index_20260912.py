@@ -98,6 +98,31 @@ be local to), so the settings are set at session level and reset in a
 a deploy hang indefinitely behind a long Hermes transaction, and a migration
 that never returns is worse than one that fails loudly.
 
+``lock_timeout`` is set to ``0`` -- disabled -- which is the opposite of the
+usual advice for DDL. ``CONCURRENTLY``'s three waits for other transactions
+(``WaitForLockers`` after each build phase, ``WaitForOlderSnapshots`` before
+the index is marked valid) are implemented as lock acquisitions on
+``VIRTUALXACTID`` tags, so ``lock_timeout`` governs them exactly as it governs
+a table lock. The 60 s ``lock_timeout`` this revision carried at first would
+therefore have swapped one failure for another --
+
+    ERROR:  canceling statement due to lock timeout
+
+-- the moment it waited on one of Hermes' 376-530 s transactions, which is to
+say almost immediately. ``WaitForOlderSnapshots`` waits on *every* backend in
+the database holding an older snapshot, not only those touching this table, so
+Hermes' ``raw_series`` scan counts even though it never reads
+``analytical_snapshots``.
+
+Disabling it costs nothing. ``statement_timeout`` bounds the statement whether
+it is scanning or sleeping on a lock, so the 30-minute ceiling already covers
+everything ``lock_timeout`` would have caught. And the usual reason to keep a
+short one on DDL -- a waiting lock request piling every later query up behind
+it -- does not apply to ``SHARE UPDATE EXCLUSIVE``, which conflicts with
+neither ``ACCESS SHARE`` nor ``ROW EXCLUSIVE``: Hermes reads and writes right
+through this build. It is set explicitly rather than left alone so that a
+role- or database-level default cannot reintroduce the trap.
+
 If this revision times out again, ``CONCURRENTLY`` is the wrong tool for this
 table and the answer is a plain ``CREATE INDEX`` in a maintenance window —
 one scan, no waiting on other transactions, at the cost of a brief
@@ -198,10 +223,14 @@ def _pg_trgm_ready(conn) -> bool:
         return False
 
 
-# Enough headroom for two detoasting scans of a 910 MB heap plus the wait for
+# Enough headroom for two detoasting scans of a 910 MB heap plus the waits for
 # older transactions, but still bounded — see "Timeouts" above.
 BUILD_STATEMENT_TIMEOUT = "1800s"
-BUILD_LOCK_TIMEOUT = "60s"
+
+# Disabled, deliberately: CONCURRENTLY's waits for other transactions are lock
+# waits, so any finite value here aborts the build mid-wait. BUILD_STATEMENT_
+# TIMEOUT is the single bound. See "Timeouts" above before shortening this.
+BUILD_LOCK_TIMEOUT = "0"
 
 
 def _set_build_timeouts() -> None:
@@ -209,7 +238,8 @@ def _set_build_timeouts() -> None:
 
     Session-level, not ``SET LOCAL``: ``autocommit_block()`` has no transaction
     for a LOCAL setting to belong to, so ``SET LOCAL`` would emit a warning and
-    change nothing.
+    change nothing. ``lock_timeout`` goes to ``0`` rather than to a short value
+    -- see "Timeouts" in the module docstring.
     """
     op.execute(f"SET statement_timeout = '{BUILD_STATEMENT_TIMEOUT}'")
     op.execute(f"SET lock_timeout = '{BUILD_LOCK_TIMEOUT}'")

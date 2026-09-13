@@ -358,6 +358,24 @@ def test_statements_read_the_payload(sql):
     assert "payload ->> 'actor'" in sql
 
 
+def _load_index_migration() -> ModuleType:
+    """Load the actor-index revision by path (migrations/ is not a package)."""
+    import importlib
+
+    # Drop any stale bytecode first so an edit within the filesystem's mtime
+    # granularity is still seen.
+    importlib.invalidate_caches()
+    spec = importlib.util.spec_from_file_location(
+        "snapshot_payload_actor_index",
+        REPO_ROOT / "migrations" / "versions"
+        / "snapshot_payload_actor_index_20260912.py",
+    )
+    assert spec and spec.loader
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    return migration
+
+
 @pytest.mark.unit
 def test_partial_index_predicate_matches_the_queries():
     """The migration's index and the queries must agree, or the index is dead.
@@ -368,20 +386,7 @@ def test_partial_index_predicate_matches_the_queries():
     planner silently reverts to the sequential scan the migration measured at
     121,197 — no error, just a resolver that got 36x slower.
     """
-    import importlib
-    import importlib.util
-
-    # The migration is loaded by path; drop any stale bytecode first so an
-    # edit within the filesystem's mtime granularity is still seen.
-    importlib.invalidate_caches()
-    spec = importlib.util.spec_from_file_location(
-        "snapshot_payload_actor_index",
-        REPO_ROOT / "migrations" / "versions"
-        / "snapshot_payload_actor_index_20260912.py",
-    )
-    assert spec and spec.loader
-    migration = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(migration)
+    migration = _load_index_migration()
 
     # Both statements must filter on exactly the expression the index keys.
     for sql in (SNAPSHOT_SEARCH_SQL, SNAPSHOT_NAME_SCAN_SQL):
@@ -389,6 +394,48 @@ def test_partial_index_predicate_matches_the_queries():
             f"index keys {migration.ACTOR_EXPR!r}, which does not appear in:"
             f"\n{sql}"
         )
+
+
+@pytest.mark.unit
+def test_build_does_not_set_a_finite_lock_timeout():
+    """A short lock_timeout aborts the CONCURRENTLY build mid-wait.
+
+    ``CREATE INDEX CONCURRENTLY`` waits for other transactions three times --
+    ``WaitForLockers`` after each build phase, ``WaitForOlderSnapshots`` before
+    the index is marked valid -- and each of those waits is a lock acquisition
+    on a ``VIRTUALXACTID`` tag, so ``lock_timeout`` applies to it. This
+    revision first carried ``lock_timeout = 60s``, which on griddb would have
+    traded the statement timeout it was fixing for
+
+        ERROR:  canceling statement due to lock timeout
+
+    against Hermes' 376-530 s transactions. ``statement_timeout`` already
+    bounds the statement while it waits, so the short lock timeout bought
+    nothing and cost the build.
+    """
+    migration = _load_index_migration()
+    assert migration.BUILD_LOCK_TIMEOUT in ("0", "0s"), (
+        "lock_timeout must be disabled for a CONCURRENTLY build, not merely "
+        f"generous; got {migration.BUILD_LOCK_TIMEOUT!r}"
+    )
+
+
+@pytest.mark.unit
+def test_build_statement_timeout_is_bounded():
+    """...but statement_timeout must stay finite, and finite means recoverable.
+
+    ``0`` here would let a deploy hang behind a long Hermes transaction with no
+    way out but a manual kill. The deploy job's own ceiling is GitHub's 360 min
+    default, so anything near that stops being a bound at all.
+    """
+    migration = _load_index_migration()
+    ceiling = migration.BUILD_STATEMENT_TIMEOUT
+    assert ceiling.endswith("s"), f"expected an explicit unit, got {ceiling!r}"
+    seconds = int(ceiling[:-1])
+    assert 300 <= seconds <= 3600, (
+        f"{ceiling!r} is outside the range this build was measured for: too "
+        "low re-breaks the deploy, too high stops bounding it"
+    )
 
 
 @pytest.mark.unit
