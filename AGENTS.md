@@ -2,6 +2,88 @@
 
 Append-only running log for GRID system work.
 
+## 2026-09-13 - snapshot-actor reload + retired the payload senator fallback
+
+What was done:
+
+- Executed handoff `GRID-HANDOFF-snapshot-actor-reload-2026-09-13` (from
+  `claude@claude-web`, written for the follow-up to PR #479) on grid-svr.
+- Step 0 env guard confirmed `target OK: localhost griddb` before any write.
+- Reloaded Fed speeches: `python3 scripts/parse_datasets.py speeches` — 0 →
+  1,299 `fed_speech` snapshot rows, all carrying `payload ->> 'actor'`.
+- Reloaded congressional trades: deleted the 5,000 legacy
+  `payload ->> 'senator'`-keyed `congressional_trade` rows (user-approved —
+  the auto-mode classifier flagged the DELETE as a mass-delete action), then
+  `python3 scripts/parse_datasets.py trades` — 8,350 Senate rows reinserted
+  under the canonical `actor` key; House correctly skipped (
+  `house_trades.json` is still the S3 `AccessDenied` XML error the parser
+  guards against).
+- Verified: `payload ->> 'actor'` = 9,649, `payload ->> 'senator'` = 0,
+  distinct actors 49 → 108. Trigger condition in the handoff ("if senator
+  reaches 0 and actor carries everything") was met.
+- Opened PR [#482](https://github.com/3pacs/GRID/pull/482): simplified
+  `SNAPSHOT_SEARCH_SQL` / `SNAPSHOT_NAME_SCAN_SQL` in
+  `intelligence/entity_resolver.py` to drop the now-dead `senator` COALESCE
+  arm, added migration `retire_snapshot_senator_arm_20260913` (new revision,
+  not an edit to the superseded `snapshot_payload_actor_index_20260912` —
+  Alembic tracks applied state by id, not content, and that migration's
+  index already existed on griddb ahead of `alembic_version`, which was
+  itself one revision stale: the trigram twin index was never built), and
+  updated `tests/test_entity_resolver_snapshots.py` accordingly.
+
+Non-obvious decisions:
+
+- Did not apply the new migration to griddb, and did not run
+  `alembic upgrade head` to sync the stale `alembic_version` / build the
+  missing trigram index either — both are production DDL against a live,
+  556k-row table and both were blocked by the auto-mode classifier
+  (`Production Deploy`). Left as an explicit follow-up rather than routed
+  around.
+- `origin` (`git@github.com:3pacs/GRID.git`, SSH) has no usable key in this
+  shell (`Permission denied (publickey)`) — its cached ref was ~97 commits
+  stale. Added a second remote `origin-https` using `gh`'s token to fetch
+  the real `origin/main` and push the PR branch. Left both remotes in
+  place; `origin` itself is unfixed and will fail the same way for the next
+  session unless an SSH key or `gh auth setup-git`-compatible URL is wired
+  in.
+- `tests/test_entity_resolver_snapshots.py` has 14 failures on this host
+  before and after this change (verified identical failure set on `410be285`
+  in an isolated `git worktree`): system `sqlite3` here is 3.37.2, one minor
+  version short of the `->>` JSON operator (added 3.38.0) both the harness
+  and the production queries use. Pre-existing environment gap, not a
+  regression; CI likely runs a newer Python/SQLite (PR #479 merged on green
+  CI using this same operator).
+
+Broken or TBD:
+
+- PR #482 open, unmerged. Needs: apply
+  `retire_snapshot_senator_arm_20260913` to griddb, confirm
+  `EXPLAIN ANALYZE` on `SNAPSHOT_SEARCH_SQL` hits the BitmapOr plan (not a
+  seq scan), then merge.
+- **New bug found, not fixed**: `scripts/parse_datasets.py`'s
+  `_insert_signals_batch` mixes `%(name)s`- and `:name`-style bind params in
+  one SQL string (`:data::jsonb` next to `%(source_id)s`) —
+  `psycopg2.errors.SyntaxError`, silently dropped all 236
+  `congressional_large_trade` signal rows from the 2026-09-13 `trades` run
+  (`analytical_snapshots` inserts were unaffected). Logged to
+  `.server-logs/errors.jsonl` at 06:45:53Z; needs its own fix + backfill.
+- `origin` SSH remote broken (see above) — worth fixing at the fleet level
+  so the next session doesn't have to rediscover the `origin-https` +
+  `gh`-token workaround.
+- Handoff's other two "Also open" items untouched by design:
+  `scripts/assimilator.py:122`'s `SnapshotStore`/`AnalyticalSnapshotStore`
+  import mismatch (Anik has a separate session on it), and `config.py`'s
+  silent `griddb → grid` DB-name fallback on empty `DB_PASSWORD`.
+
+Next pick-up:
+
+- Decide when to run `alembic upgrade head` (or the two migrations'
+  `CREATE`/`DROP INDEX CONCURRENTLY` statements directly) against griddb,
+  then merge #482.
+- Fix `_insert_signals_batch`'s bind-param mixing and re-run the `trades`
+  signal insert to backfill the 236 missing `congressional_large_trade`
+  rows.
+
 ## 2026-09-11 - correction: the `GitHubActions-WSL-Start` task exists (supersedes the boot-contract claim below)
 
 What was done:
