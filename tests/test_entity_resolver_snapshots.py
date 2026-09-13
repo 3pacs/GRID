@@ -418,28 +418,79 @@ def test_index_build_is_not_concurrent():
 
 
 @pytest.mark.unit
-def test_invalid_index_is_dropped_concurrently():
-    """The drop is the one place CONCURRENTLY is required, not forbidden.
+def test_oversize_table_runs_no_ddl_at_all():
+    """The deferral path must not touch the database, not even to tidy up.
 
-    A plain ``DROP INDEX`` takes ACCESS EXCLUSIVE, and a *waiting* ACCESS
-    EXCLUSIVE request queues every later query behind it. Run 288 showed a
-    plain DROP failing to acquire that lock within 5 s on this table, which
-    Hermes writes every cycle -- and the failed drop then let
-    ``CREATE INDEX ... IF NOT EXISTS`` match the INVALID leftover by name and
-    report success having built nothing.
+    Clearing an INVALID leftover is tempting here and would re-break deploys:
+    on a table this size the drop is the *only* work there is, it waits on
+    other transactions, and under ``db.py``'s 120 s ``statement_timeout`` it
+    would time out against Hermes' 376-530 s transactions and fail the deploy
+    -- which is the failure this revision exists to remove.
 
-    ``DROP INDEX CONCURRENTLY`` takes SHARE UPDATE EXCLUSIVE instead, which
-    conflicts with neither ``ACCESS SHARE`` nor ``ROW EXCLUSIVE``.
+    Drives the real ``upgrade()`` with a recording double in place of alembic's
+    ``op``, so this fails if anyone adds a statement to that branch.
+    """
+    migration = _load_index_migration()
+    executed: list[str] = []
+
+    class _RecordingOp:
+        @staticmethod
+        def get_bind():
+            return _StubConn()
+
+        @staticmethod
+        def execute(statement):
+            executed.append(str(statement))
+
+    class _StubConn:
+        """Answers the two catalog reads upgrade() makes before deciding."""
+
+        def execute(self, statement, params=None):
+            text = " ".join(str(statement).split())
+            if "pg_total_relation_size" in text:
+                return _Result(scalar=2 * 1024 * 1024 * 1024)  # 2 GB
+            if "indisvalid" in text:
+                return _Result(rows=[(migration.BTREE_INDEX,),
+                                     (migration.TRGM_INDEX,)])
+            raise AssertionError(f"unexpected read on the deferral path: {text}")
+
+    class _Result:
+        def __init__(self, scalar=None, rows=()):
+            self._scalar, self._rows = scalar, rows
+
+        def scalar(self):
+            return self._scalar
+
+        def fetchall(self):
+            return self._rows
+
+    original_op = migration.op
+    migration.op = _RecordingOp
+    try:
+        migration.upgrade()
+    finally:
+        migration.op = original_op
+
+    assert executed == [], (
+        "the oversize branch must execute no DDL; it ran: " + "; ".join(executed)
+    )
+
+
+@pytest.mark.unit
+def test_leftovers_are_found_by_indisvalid_not_by_name():
+    """``CREATE INDEX IF NOT EXISTS`` matches on the name, which is the trap.
+
+    On griddb (ops-exec run 288) a failed CONCURRENTLY build left the index
+    present but INVALID, and the next ``CREATE ... IF NOT EXISTS`` matched it
+    by name, skipped, and reported success having built nothing. Only
+    ``indisvalid`` distinguishes the two.
     """
     import inspect
 
     migration = _load_index_migration()
-    source = inspect.getsource(migration._drop_if_invalid)
-    assert "DROP INDEX CONCURRENTLY" in source, (
-        "_drop_if_invalid must not take ACCESS EXCLUSIVE on this table"
-    )
+    source = inspect.getsource(migration._invalid_leftovers)
     assert "indisvalid" in source, (
-        "_drop_if_invalid must decide from the catalog, not from a name match"
+        "leftovers must be identified from the catalog, not from a name match"
     )
 
 

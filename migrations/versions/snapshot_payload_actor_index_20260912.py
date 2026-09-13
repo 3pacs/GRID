@@ -93,10 +93,19 @@ Build inline where that is cheap, and refuse loudly where it is not:
   indexes automatically, which a "leave it to the operator" rule would deny
   them.
 
-* **Large table** — skip, and ``log.warning`` the exact SQL to run. The
-  revision is still recorded as applied, because the *schema* is correct
-  either way: these are performance indexes, and ``entity_resolver`` returns
-  the same rows without them, just via a 121,197-cost sequential scan.
+* **Large table** — execute **no DDL at all**, and ``log.warning`` the exact
+  SQL to run. The revision is still recorded as applied, because the *schema*
+  is correct either way: these are performance indexes, and
+  ``entity_resolver`` returns the same rows without them, just via a
+  121,197-cost sequential scan.
+
+  "No DDL at all" includes not clearing an INVALID leftover, which is
+  tempting and wrong. On a table this size the drop would be the only work
+  there is, it waits on other transactions, and under ``db.py``'s 120 s
+  ``statement_timeout`` it would time out against Hermes' 376-530 s
+  transactions and fail the deploy — reintroducing the exact failure this
+  revision exists to remove. Clearing leftovers on a live table is an ops job
+  with its own timeout budget. The warning names them so nobody has to guess.
 
 Skipping is deliberately **loud and tracked**, not silent. Silence is what
 made the original bug (#477/#479) survive for months: a failure nobody could
@@ -175,39 +184,24 @@ def _table_bytes(conn) -> int:
     """)).scalar() or 0
 
 
-def _drop_if_invalid(conn, index_name: str) -> None:
-    """Clear an index left INVALID by an earlier failed CONCURRENTLY build.
+def _invalid_leftovers(conn) -> Sequence[str]:
+    """Names of our two indexes that exist but are INVALID.
 
-    ``IF NOT EXISTS`` matches on the *name*, so it skips such a leftover
-    forever and the planner never gets a usable index — exactly what happened
-    on griddb in ops-exec run 288, where the CREATE reported success having
-    silently done nothing.
-
-    ``DROP INDEX CONCURRENTLY`` rather than a plain DROP: it takes SHARE
-    UPDATE EXCLUSIVE instead of ACCESS EXCLUSIVE, so it cannot pile queries up
-    behind it on a busy table. The same run showed a plain DROP failing to get
-    ACCESS EXCLUSIVE within 5 s here.
+    A failed ``CONCURRENTLY`` build leaves the index behind with
+    ``indisready`` true: Postgres keeps maintaining it on every write while
+    the planner cannot use it. Worse, ``CREATE INDEX ... IF NOT EXISTS``
+    matches on the *name*, so it skips such a leftover forever and reports
+    success having built nothing — which is exactly what happened on griddb in
+    ops-exec run 288.
     """
     from sqlalchemy import text
 
-    invalid = conn.execute(text("""
-        SELECT 1 FROM pg_class c
+    rows = conn.execute(text("""
+        SELECT c.relname FROM pg_class c
           JOIN pg_index i ON i.indexrelid = c.oid
-         WHERE c.relname = :name AND NOT i.indisvalid
-    """), {"name": index_name}).scalar()
-    if not invalid:
-        return
-
-    log.warning("%s is INVALID (a failed earlier build) - dropping it first",
-                index_name)
-    with op.get_context().autocommit_block():
-        # No ACCESS EXCLUSIVE here, so lock_timeout must not cut short the
-        # wait for older transactions, which is a VIRTUALXACTID lock wait.
-        op.execute("SET lock_timeout = '0'")
-        try:
-            op.execute(f'DROP INDEX CONCURRENTLY IF EXISTS "{index_name}"')
-        finally:
-            op.execute("RESET lock_timeout")
+         WHERE c.relname IN (:btree, :trgm) AND NOT i.indisvalid
+    """), {"btree": BTREE_INDEX, "trgm": TRGM_INDEX}).fetchall()
+    return [r[0] for r in rows]
 
 
 def _pg_trgm_ready(conn) -> bool:
@@ -242,45 +236,64 @@ def _pg_trgm_ready(conn) -> bool:
         return False
 
 
-def _warn_deferred(size_bytes: int, statements: Sequence[str]) -> None:
+def _warn_deferred(size_bytes: int, leftovers: Sequence[str]) -> None:
     """Say, in full, what was not built and exactly how to build it."""
+    remedy = [f"DROP INDEX CONCURRENTLY {name};" for name in leftovers]
+    remedy += [" ".join(s.split()) + ";" for s in (_CREATE_BTREE, _CREATE_TRGM)]
     log.warning(
         "analytical_snapshots is %.0f MB, over the %.0f MB inline-build "
-        "ceiling, so %s and %s were NOT created. entity_resolver's snapshot "
-        "search still returns correct rows, via a sequential scan measured at "
-        "cost 121,197 instead of 3,344. CREATE INDEX CONCURRENTLY has been "
-        "measured as unable to finish on this table (ops-exec run 288: the "
-        "trigram build timed out after 1400 s), so build these in a "
-        "maintenance window, with statement_timeout lifted, as plain "
-        "CREATE INDEX:\n%s",
+        "ceiling, so %s and %s were NOT created and this revision changed "
+        "nothing. entity_resolver's snapshot search still returns correct "
+        "rows, via a sequential scan measured at cost 121,197 instead of "
+        "3,344. CREATE INDEX CONCURRENTLY has been measured as unable to "
+        "finish on this table (ops-exec run 288: the trigram build timed out "
+        "after 1400 s), so build these in a maintenance window, with "
+        "statement_timeout lifted, as plain CREATE INDEX. pg_trgm must be "
+        "installed for the second.%s\n%s",
         size_bytes / 1024 / 1024,
         INLINE_BUILD_MAX_BYTES / 1024 / 1024,
         BTREE_INDEX, TRGM_INDEX,
-        "\n".join(" ".join(s.split()) + ";" for s in statements),
+        (f" {len(leftovers)} INVALID leftover(s) must be dropped first, or "
+         "CREATE INDEX IF NOT EXISTS will match them by name and silently "
+         "build nothing." if leftovers else ""),
+        "\n".join(remedy),
     )
 
 
 def upgrade() -> None:
-    """Create both partial expression indexes where that is cheap; else warn."""
+    """Create both partial expression indexes where that is cheap; else warn.
+
+    The size check comes first and the oversize branch executes **no DDL at
+    all** — not even the cleanup of an INVALID leftover. That is deliberate.
+    On a table this size the drop is the only work there would be, it waits on
+    other transactions, and under ``db.py``'s 120 s ``statement_timeout`` it
+    would time out against Hermes' 376-530 s transactions and fail the deploy
+    — reintroducing the exact failure this revision exists to remove. Clearing
+    leftovers on a live table is an ops job with its own timeout budget, not
+    something to hang every deploy on.
+    """
     conn = op.get_bind()
 
-    _drop_if_invalid(conn, BTREE_INDEX)
-    _drop_if_invalid(conn, TRGM_INDEX)
+    size_bytes = _table_bytes(conn)
+    if size_bytes > INLINE_BUILD_MAX_BYTES:
+        _warn_deferred(size_bytes, _invalid_leftovers(conn))
+        return
 
+    # Small table from here: everything below runs in the migration's own
+    # transaction, so a failure rolls back rather than leaving another INVALID
+    # index behind — which is how the leftovers on griddb accumulated.
     statements = [_CREATE_BTREE]
     if _pg_trgm_ready(conn):
         statements.append(_CREATE_TRGM)
 
-    size_bytes = _table_bytes(conn)
-    if size_bytes > INLINE_BUILD_MAX_BYTES:
-        _warn_deferred(size_bytes, statements)
-        return
-
-    # Plain CREATE INDEX: one heap scan, no waiting on other transactions. The
-    # ACCESS EXCLUSIVE hold is why this branch is gated on size.
     op.execute(f"SET statement_timeout = '{BUILD_STATEMENT_TIMEOUT}'")
     op.execute(f"SET lock_timeout = '{BUILD_LOCK_TIMEOUT}'")
     try:
+        for name in _invalid_leftovers(conn):
+            # Plain DROP is right here and wrong on a large table: ACCESS
+            # EXCLUSIVE is cheap to take when nothing else is connected.
+            log.warning("%s is INVALID (a failed earlier build) - recreating", name)
+            op.execute(f'DROP INDEX IF EXISTS "{name}"')
         for statement in statements:
             op.execute(statement)
     finally:
