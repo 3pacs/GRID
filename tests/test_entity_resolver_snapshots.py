@@ -397,45 +397,91 @@ def test_partial_index_predicate_matches_the_queries():
 
 
 @pytest.mark.unit
-def test_build_does_not_set_a_finite_lock_timeout():
-    """A short lock_timeout aborts the CONCURRENTLY build mid-wait.
+def test_index_build_is_not_concurrent():
+    """CONCURRENTLY has been measured as unable to finish on this table.
 
-    ``CREATE INDEX CONCURRENTLY`` waits for other transactions three times --
-    ``WaitForLockers`` after each build phase, ``WaitForOlderSnapshots`` before
-    the index is marked valid -- and each of those waits is a lock acquisition
-    on a ``VIRTUALXACTID`` tag, so ``lock_timeout`` applies to it. This
-    revision first carried ``lock_timeout = 60s``, which on griddb would have
-    traded the statement timeout it was fixing for
+    ops-exec run 288 (2026-09-13) ran the trigram build out-of-band with
+    ``statement_timeout`` at 1400 s and ``lock_timeout`` disabled -- every
+    obstacle removed -- and it still timed out after the full 1400 s. A
+    *partial* index has to evaluate ``payload ->> 'actor'`` on all 558k rows,
+    detoasting 245 MB of TOAST, and ``CONCURRENTLY`` does that twice.
 
-        ERROR:  canceling statement due to lock timeout
-
-    against Hermes' 376-530 s transactions. ``statement_timeout`` already
-    bounds the statement while it waits, so the short lock timeout bought
-    nothing and cost the build.
+    So the build is plain ``CREATE INDEX``, gated on table size. Reaching for
+    ``CONCURRENTLY`` again would reintroduce a deploy that fails every time.
     """
     migration = _load_index_migration()
-    assert migration.BUILD_LOCK_TIMEOUT in ("0", "0s"), (
-        "lock_timeout must be disabled for a CONCURRENTLY build, not merely "
-        f"generous; got {migration.BUILD_LOCK_TIMEOUT!r}"
+    for stmt in (migration._CREATE_BTREE, migration._CREATE_TRGM):
+        assert "CONCURRENTLY" not in stmt.upper(), (
+            "CREATE INDEX CONCURRENTLY cannot finish on analytical_snapshots; "
+            f"use a plain CREATE INDEX under the size gate:\n{stmt}"
+        )
+
+
+@pytest.mark.unit
+def test_invalid_index_is_dropped_concurrently():
+    """The drop is the one place CONCURRENTLY is required, not forbidden.
+
+    A plain ``DROP INDEX`` takes ACCESS EXCLUSIVE, and a *waiting* ACCESS
+    EXCLUSIVE request queues every later query behind it. Run 288 showed a
+    plain DROP failing to acquire that lock within 5 s on this table, which
+    Hermes writes every cycle -- and the failed drop then let
+    ``CREATE INDEX ... IF NOT EXISTS`` match the INVALID leftover by name and
+    report success having built nothing.
+
+    ``DROP INDEX CONCURRENTLY`` takes SHARE UPDATE EXCLUSIVE instead, which
+    conflicts with neither ``ACCESS SHARE`` nor ``ROW EXCLUSIVE``.
+    """
+    import inspect
+
+    migration = _load_index_migration()
+    source = inspect.getsource(migration._drop_if_invalid)
+    assert "DROP INDEX CONCURRENTLY" in source, (
+        "_drop_if_invalid must not take ACCESS EXCLUSIVE on this table"
+    )
+    assert "indisvalid" in source, (
+        "_drop_if_invalid must decide from the catalog, not from a name match"
     )
 
 
 @pytest.mark.unit
-def test_build_statement_timeout_is_bounded():
-    """...but statement_timeout must stay finite, and finite means recoverable.
+def test_inline_build_is_gated_below_production_size():
+    """The gate must actually exclude griddb, or the deploy breaks again.
 
-    ``0`` here would let a deploy hang behind a long Hermes transaction with no
-    way out but a manual kill. The deploy job's own ceiling is GitHub's 360 min
-    default, so anything near that stops being a bound at all.
+    analytical_snapshots is 1155 MB. The ceiling exists to separate "small
+    enough that a brief exclusive lock is free" from "production", so a value
+    at or above production size would put a multi-minute ACCESS EXCLUSIVE hold
+    back into the automated deploy path.
     """
     migration = _load_index_migration()
-    ceiling = migration.BUILD_STATEMENT_TIMEOUT
-    assert ceiling.endswith("s"), f"expected an explicit unit, got {ceiling!r}"
-    seconds = int(ceiling[:-1])
-    assert 300 <= seconds <= 3600, (
-        f"{ceiling!r} is outside the range this build was measured for: too "
-        "low re-breaks the deploy, too high stops bounding it"
+    griddb_bytes = 1155 * 1024 * 1024
+    assert migration.INLINE_BUILD_MAX_BYTES < griddb_bytes, (
+        f"ceiling {migration.INLINE_BUILD_MAX_BYTES} does not exclude the "
+        f"live table at {griddb_bytes} bytes"
     )
+    assert migration.INLINE_BUILD_MAX_BYTES > 0, "a zero ceiling skips everywhere"
+
+
+@pytest.mark.unit
+def test_build_timeouts_are_bounded():
+    """Both timers stay finite on the plain-build path.
+
+    ``statement_timeout`` at ``0`` would let a deploy hang with no way out but
+    a manual kill. ``lock_timeout`` at ``0`` would let a waiting ACCESS
+    EXCLUSIVE request pile every later query up behind it -- which is exactly
+    why the CONCURRENTLY version of this migration wanted it disabled and this
+    one must not.
+    """
+    migration = _load_index_migration()
+    for label, value, lo, hi in (
+        ("statement", migration.BUILD_STATEMENT_TIMEOUT, 60, 3600),
+        ("lock", migration.BUILD_LOCK_TIMEOUT, 1, 60),
+    ):
+        assert value.endswith("s"), f"{label}: expected a unit, got {value!r}"
+        seconds = int(value[:-1])
+        assert lo <= seconds <= hi, (
+            f"{label}_timeout {value!r} is outside the range this build was "
+            f"measured for ({lo}-{hi}s)"
+        )
 
 
 @pytest.mark.unit
