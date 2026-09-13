@@ -477,6 +477,52 @@ def test_oversize_table_runs_no_ddl_at_all():
 
 
 @pytest.mark.unit
+def test_missing_table_is_not_treated_as_a_small_one():
+    """A fresh database reaches this revision before the table exists.
+
+    No migration creates ``analytical_snapshots`` -- ``store/snapshots.py``
+    does, on first use -- so ``pg_total_relation_size(to_regclass(...))``
+    returns NULL there. Coalescing that to ``0`` would read as "small table"
+    and send the revision into ``CREATE INDEX`` on something that is not
+    there.
+    """
+    migration = _load_index_migration()
+    executed: list[str] = []
+
+    class _RecordingOp:
+        @staticmethod
+        def get_bind():
+            return _StubConn()
+
+        @staticmethod
+        def execute(statement):
+            executed.append(str(statement))
+
+    class _StubConn:
+        def execute(self, statement, params=None):
+            text = " ".join(str(statement).split())
+            assert "pg_total_relation_size" in text, (
+                f"nothing should be read before the table exists: {text}"
+            )
+            return _NullResult()
+
+    class _NullResult:
+        def scalar(self):
+            return None   # to_regclass found no such table
+
+    original_op = migration.op
+    migration.op = _RecordingOp
+    try:
+        migration.upgrade()
+    finally:
+        migration.op = original_op
+
+    assert executed == [], (
+        "a missing table must produce no DDL; it ran: " + "; ".join(executed)
+    )
+
+
+@pytest.mark.unit
 def test_leftovers_are_found_by_indisvalid_not_by_name():
     """``CREATE INDEX IF NOT EXISTS`` matches on the name, which is the trap.
 

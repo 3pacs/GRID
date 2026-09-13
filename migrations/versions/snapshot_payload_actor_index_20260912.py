@@ -175,13 +175,20 @@ _CREATE_TRGM = f"""
 """
 
 
-def _table_bytes(conn) -> int:
-    """Total size of analytical_snapshots, or 0 if it does not exist yet."""
+def _table_bytes(conn):
+    """Total size of analytical_snapshots, or ``None`` if it does not exist.
+
+    The distinction matters. No migration creates this table —
+    ``store/snapshots.py``'s ``ANALYTICAL_SNAPSHOTS_DDL`` does, at runtime — so
+    ``alembic upgrade head`` against a genuinely fresh database reaches this
+    revision before the table exists. Reporting that as ``0`` would look like
+    "small table" and send it straight into ``CREATE INDEX`` on nothing.
+    """
     from sqlalchemy import text
 
     return conn.execute(text("""
-        SELECT COALESCE(pg_total_relation_size(to_regclass('analytical_snapshots')), 0)
-    """)).scalar() or 0
+        SELECT pg_total_relation_size(to_regclass('analytical_snapshots'))
+    """)).scalar()
 
 
 def _invalid_leftovers(conn) -> Sequence[str]:
@@ -275,6 +282,17 @@ def upgrade() -> None:
     conn = op.get_bind()
 
     size_bytes = _table_bytes(conn)
+    if size_bytes is None:
+        log.warning(
+            "analytical_snapshots does not exist yet, so %s and %s were not "
+            "created. No migration creates that table - store/snapshots.py "
+            "does, on first use - so a fresh database reaches this revision "
+            "before it is there. Re-run this revision once the store has "
+            "created it, or let the next deploy do so.",
+            BTREE_INDEX, TRGM_INDEX,
+        )
+        return
+
     if size_bytes > INLINE_BUILD_MAX_BYTES:
         _warn_deferred(size_bytes, _invalid_leftovers(conn))
         return
