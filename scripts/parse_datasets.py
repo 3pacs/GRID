@@ -1078,7 +1078,7 @@ class DatasetParser:
                             (signal_type, signal_date, ticker, actor, direction,
                              magnitude, description, data, confidence, source_id)
                         VALUES (:signal_type, :signal_date, :ticker, :actor, :direction,
-                                :magnitude, :description, :data::jsonb, :confidence,
+                                :magnitude, :description, CAST(:data AS jsonb), :confidence,
                                 :source_id)
                     """),
                     batch,
