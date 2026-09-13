@@ -197,24 +197,21 @@ def _log_query_failure(where: str, exc: BaseException) -> None:
 # They are module constants rather than inline strings so the tests execute
 # the same text production does instead of a copy that can drift.
 
-# Where the actor name lives, measured on griddb 2026-09-12:
+# Where the actor name lives, reloaded on griddb 2026-09-13 (handoff
+# GRID-HANDOFF-snapshot-actor-reload-2026-09-13):
 #
-#   payload ->> 'actor'     0 rows — the canonical key. parse_datasets writes
-#                           it for congressional trades and Fed speeches, but
-#                           only since #477: every such write failed for as
-#                           long as the phantom columns were in the tree, so
-#                           nothing carries it yet. This is the key that
-#                           matters from the next parser run onward.
-#   payload ->> 'senator'   5,000 rows — the same field under its pre-#477
-#                           spelling. The live `congressional_trade` rows hold
-#                           the raw Senate EFD record (senator / ticker / type
-#                           / amount / transaction_date / owner /
-#                           asset_description / asset_type / comment /
-#                           ptr_link), and `senator` is its actor: "David A
-#                           Perdue , Jr", the name this module's docstring
-#                           opens with. No other writer in the tree uses a
-#                           `senator` key, so this arm cannot capture anything
-#                           that is not a legislator.
+#   payload ->> 'actor'     9,649 rows — the canonical key. parse_datasets has
+#                           written it for congressional trades and Fed
+#                           speeches since #477; the 2026-09-13 reload deleted
+#                           the 5,000 legacy `senator`-keyed rows and
+#                           reinserted them canonically, then added the
+#                           previously-empty fed_speech corpus (1,299 rows).
+#   payload ->> 'senator'   0 rows — the pre-#477 spelling, fully retired by
+#                           the reload above. No writer in the tree has used
+#                           this key since, so the COALESCE fallback that used
+#                           to read it is dead weight and has been removed.
+#                           See migration retire_snapshot_senator_arm_20260913
+#                           for the matching index change.
 #
 # Deliberately NOT read here: `payload ->> 'name'`, carried by the 12,282
 # `category='opensanctions'` rows. The key is generic enough that a later
@@ -229,11 +226,11 @@ def _log_query_failure(where: str, exc: BaseException) -> None:
 # `_guess_domain_from_source_id` also reads `category`, which spells
 # "congressional_trade".
 #
-# The COALESCE is computed once in a subquery so it cannot drift between the
-# SELECT list and the WHERE clause. PostgreSQL flattens a subquery this simple
-# into the outer query, so the predicate still reaches the base relation and
-# `idx_analytical_snapshots_payload_actor` (migration
-# snapshot_payload_actor_index_20260912) still applies. The aliases avoid the
+# The expression is computed once in a subquery so it cannot drift between
+# the SELECT list and the WHERE clause. PostgreSQL flattens a subquery this
+# simple into the outer query, so the predicate still reaches the base
+# relation and `idx_analytical_snapshots_payload_actor` (migration
+# retire_snapshot_senator_arm_20260913) still applies. The aliases avoid the
 # phantom column names on purpose — an alias called `actor` would teach the
 # next reader that the column exists.
 SNAPSHOT_SEARCH_SQL = """
@@ -244,8 +241,7 @@ SNAPSHOT_SEARCH_SQL = """
                category,
                snapshot_date,
                created_at,
-               COALESCE(payload ->> 'actor', payload ->> 'senator')
-                   AS actor_name,
+               payload ->> 'actor' AS actor_name,
                payload ->> 'title' AS snapshot_title,
                COALESCE(payload ->> 'source_id', subcategory)
                    AS snapshot_source
@@ -264,8 +260,7 @@ SNAPSHOT_SEARCH_SQL = """
 SNAPSHOT_NAME_SCAN_SQL = """
     SELECT DISTINCT actor_name
     FROM (
-        SELECT COALESCE(payload ->> 'actor', payload ->> 'senator')
-                   AS actor_name
+        SELECT payload ->> 'actor' AS actor_name
         FROM analytical_snapshots
     ) s
     WHERE actor_name IS NOT NULL

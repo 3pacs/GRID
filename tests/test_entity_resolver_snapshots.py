@@ -172,9 +172,10 @@ UNNAMED_SPEECH = {
     "source_id": "fed_speeches",
 }
 
-# A congressional_trade row in the shape griddb actually holds: the raw Senate
-# EFD record, written before #477 fixed parse_datasets, with the actor under
-# `senator` and the name repeated in subcategory. 5,000 of these are live.
+# A congressional_trade row in the shape griddb held before the 2026-09-13
+# reload: the raw Senate EFD record, written before #477 fixed
+# parse_datasets, with the actor under `senator` and the name repeated in
+# subcategory. Retired — see test_retired_senator_key_is_not_read_as_an_actor.
 LEGACY_SENATE_ROW = {
     "snapshot_date": date(2021, 2, 16),
     "category": "congressional_trade",
@@ -326,10 +327,12 @@ def test_name_scan_sql_executes_against_the_canonical_table(snapshot_engine):
         "David A Perdue , Jr",      # payload ->> 'actor', post-#477 writer
         "Thomas R Carper",
         "Jerome H Powell",
-        "Thomas H Tuberville",      # payload ->> 'senator', the live shape
     }
     # The OpenSanctions `name` key is deliberately not an actor source.
     assert "Perdue, David Alfred" not in names
+    # The retired `senator` key (see test_the_retired_senator_key_*) must not
+    # surface either.
+    assert "Thomas H Tuberville" not in names
 
 
 @pytest.mark.unit
@@ -365,8 +368,16 @@ def test_partial_index_predicate_matches_the_queries():
     ``idx_analytical_snapshots_payload_actor`` (and its trigram twin) are
     *partial*: PostgreSQL will only use them when the index predicate implies
     the query's. If either side's actor expression is edited alone, the
-    planner silently reverts to the sequential scan the migration measured at
-    121,197 — no error, just a resolver that got 36x slower.
+    planner silently reverts to a sequential scan — no error, just a resolver
+    that got dramatically slower.
+
+    Pinned to ``retire_snapshot_senator_arm_20260913``, which superseded
+    ``snapshot_payload_actor_index_20260912`` and rebuilt the live index on
+    the bare ``payload ->> 'actor'`` expression once the 2026-09-13 reload
+    retired the last ``senator``-keyed row. Alembic tracks applied state by
+    revision id, not by diffing file content, so editing the superseded
+    migration's ``ACTOR_EXPR`` in place would not change anything on a
+    database that already ran it — the new revision is the one that matters.
     """
     import importlib
     import importlib.util
@@ -375,9 +386,9 @@ def test_partial_index_predicate_matches_the_queries():
     # edit within the filesystem's mtime granularity is still seen.
     importlib.invalidate_caches()
     spec = importlib.util.spec_from_file_location(
-        "snapshot_payload_actor_index",
+        "retire_snapshot_senator_arm",
         REPO_ROOT / "migrations" / "versions"
-        / "snapshot_payload_actor_index_20260912.py",
+        / "retire_snapshot_senator_arm_20260913.py",
     )
     assert spec and spec.loader
     migration = importlib.util.module_from_spec(spec)
@@ -463,27 +474,16 @@ def test_name_scan_skips_an_empty_actor(snapshot_engine):
 
 
 @pytest.mark.unit
-def test_search_finds_the_legacy_senator_shape(resolver):
-    """The 5,000 live congressional rows keep the actor under `senator`.
+def test_retired_senator_key_is_not_read_as_an_actor(resolver):
+    """``payload ->> 'senator'`` is retired — see SNAPSHOT_SEARCH_SQL.
 
-    Written before #477 fixed parse_datasets, so they never got
-    ``payload ->> 'actor'``. Reading only the canonical key would leave the
-    resolver blind to the whole congressional corpus on griddb today.
+    The 2026-09-13 reload (GRID-HANDOFF-snapshot-actor-reload-2026-09-13)
+    deleted every live `senator`-keyed row on griddb and reinserted the
+    corpus under the canonical `actor` key, so this shape should no longer
+    occur — but the resolver must not resurrect it as an entity if a stale
+    row like this one is ever encountered again.
     """
-    hits = _search(resolver, "Thomas Tuberville")
-    assert [h["raw_name"] for h in hits] == ["Thomas H Tuberville"]
-
-
-@pytest.mark.unit
-def test_legacy_senator_row_still_resolves_its_domain(resolver):
-    """Its subcategory is the senator's name, not a source id.
-
-    ``_guess_domain_from_source_id`` also reads ``category``, which spells
-    ``congressional_trade``, so the domain is right regardless.
-    """
-    hit = _search(resolver, "Thomas Tuberville")[0]
-    assert hit["source"] == "congressional"
-    assert hit["category"] == "congressional_trade"
+    assert _search(resolver, "Thomas Tuberville") == []
 
 
 @pytest.mark.unit
