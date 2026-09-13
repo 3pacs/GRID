@@ -81,6 +81,10 @@ jobs:
       - name: Run critical tests
         env:
           DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          # config.py now rejects an empty DB_PASSWORD unconditionally (see
+          # the 2026-09-13 incident) — must match the postgres container
+          # password above so Settings() construction doesn't fail collection.
+          DB_PASSWORD: testpass
           GRID_JWT_SECRET: test-secret-ci
           TESTING: "true"
         run: |

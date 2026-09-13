@@ -64,18 +64,27 @@ class TestDBPasswordValidation:
             if saved is not None:
                 sys.modules["config"] = saved
 
-    def test_empty_allowed_if_not_changeme(self):
-        """Empty DB_PASSWORD doesn't trigger the 'changeme' validator —
-        only the literal default 'changeme' is rejected in production."""
+    @pytest.mark.parametrize("environment", ["production", "development"])
+    def test_empty_password_rejected_regardless_of_environment(self, environment):
+        """Empty DB_PASSWORD must raise unconditionally.
+
+        This check is deliberately NOT gated on ENVIRONMENT: if .env was
+        never sourced, ENVIRONMENT itself silently falls back to
+        "development" too, so a check gated on `env != "development"` would
+        never fire in exactly the scenario it exists to catch. Verify both
+        "production" and "development" to prove it isn't gated.
+        """
+        from pydantic import ValidationError
+
         saved = sys.modules.pop("config", None)
         try:
             with patch.dict(
                 os.environ,
-                {"ENVIRONMENT": "production", "DB_PASSWORD": "", "FRED_API_KEY": "fake"},
+                {"ENVIRONMENT": environment, "DB_PASSWORD": "", "FRED_API_KEY": "fake"},
                 clear=False,
             ):
-                mod = importlib.import_module("config")
-                assert mod.settings.DB_PASSWORD == ""
+                with pytest.raises(ValidationError):
+                    importlib.import_module("config")
         finally:
             sys.modules.pop("config", None)
             if saved is not None:
