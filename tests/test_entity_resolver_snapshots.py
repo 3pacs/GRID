@@ -358,6 +358,24 @@ def test_statements_read_the_payload(sql):
     assert "payload ->> 'actor'" in sql
 
 
+def _load_index_migration() -> ModuleType:
+    """Load the actor-index revision by path (migrations/ is not a package)."""
+    import importlib
+
+    # Drop any stale bytecode first so an edit within the filesystem's mtime
+    # granularity is still seen.
+    importlib.invalidate_caches()
+    spec = importlib.util.spec_from_file_location(
+        "snapshot_payload_actor_index",
+        REPO_ROOT / "migrations" / "versions"
+        / "snapshot_payload_actor_index_20260912.py",
+    )
+    assert spec and spec.loader
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    return migration
+
+
 @pytest.mark.unit
 def test_partial_index_predicate_matches_the_queries():
     """The migration's index and the queries must agree, or the index is dead.
@@ -368,26 +386,198 @@ def test_partial_index_predicate_matches_the_queries():
     planner silently reverts to the sequential scan the migration measured at
     121,197 — no error, just a resolver that got 36x slower.
     """
-    import importlib
-    import importlib.util
-
-    # The migration is loaded by path; drop any stale bytecode first so an
-    # edit within the filesystem's mtime granularity is still seen.
-    importlib.invalidate_caches()
-    spec = importlib.util.spec_from_file_location(
-        "snapshot_payload_actor_index",
-        REPO_ROOT / "migrations" / "versions"
-        / "snapshot_payload_actor_index_20260912.py",
-    )
-    assert spec and spec.loader
-    migration = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(migration)
+    migration = _load_index_migration()
 
     # Both statements must filter on exactly the expression the index keys.
     for sql in (SNAPSHOT_SEARCH_SQL, SNAPSHOT_NAME_SCAN_SQL):
         assert migration.ACTOR_EXPR in " ".join(sql.split()), (
             f"index keys {migration.ACTOR_EXPR!r}, which does not appear in:"
             f"\n{sql}"
+        )
+
+
+@pytest.mark.unit
+def test_index_build_is_not_concurrent():
+    """CONCURRENTLY has been measured as unable to finish on this table.
+
+    ops-exec run 288 (2026-09-13) ran the trigram build out-of-band with
+    ``statement_timeout`` at 1400 s and ``lock_timeout`` disabled -- every
+    obstacle removed -- and it still timed out after the full 1400 s. A
+    *partial* index has to evaluate ``payload ->> 'actor'`` on all 558k rows,
+    detoasting 245 MB of TOAST, and ``CONCURRENTLY`` does that twice.
+
+    So the build is plain ``CREATE INDEX``, gated on table size. Reaching for
+    ``CONCURRENTLY`` again would reintroduce a deploy that fails every time.
+    """
+    migration = _load_index_migration()
+    for stmt in (migration._CREATE_BTREE, migration._CREATE_TRGM):
+        assert "CONCURRENTLY" not in stmt.upper(), (
+            "CREATE INDEX CONCURRENTLY cannot finish on analytical_snapshots; "
+            f"use a plain CREATE INDEX under the size gate:\n{stmt}"
+        )
+
+
+@pytest.mark.unit
+def test_oversize_table_runs_no_ddl_at_all():
+    """The deferral path must not touch the database, not even to tidy up.
+
+    Clearing an INVALID leftover is tempting here and would re-break deploys:
+    on a table this size the drop is the *only* work there is, it waits on
+    other transactions, and under ``db.py``'s 120 s ``statement_timeout`` it
+    would time out against Hermes' 376-530 s transactions and fail the deploy
+    -- which is the failure this revision exists to remove.
+
+    Drives the real ``upgrade()`` with a recording double in place of alembic's
+    ``op``, so this fails if anyone adds a statement to that branch.
+    """
+    migration = _load_index_migration()
+    executed: list[str] = []
+
+    class _RecordingOp:
+        @staticmethod
+        def get_bind():
+            return _StubConn()
+
+        @staticmethod
+        def execute(statement):
+            executed.append(str(statement))
+
+    class _StubConn:
+        """Answers the two catalog reads upgrade() makes before deciding."""
+
+        def execute(self, statement, params=None):
+            text = " ".join(str(statement).split())
+            if "pg_total_relation_size" in text:
+                return _Result(scalar=2 * 1024 * 1024 * 1024)  # 2 GB
+            if "indisvalid" in text:
+                return _Result(rows=[(migration.BTREE_INDEX,),
+                                     (migration.TRGM_INDEX,)])
+            raise AssertionError(f"unexpected read on the deferral path: {text}")
+
+    class _Result:
+        def __init__(self, scalar=None, rows=()):
+            self._scalar, self._rows = scalar, rows
+
+        def scalar(self):
+            return self._scalar
+
+        def fetchall(self):
+            return self._rows
+
+    original_op = migration.op
+    migration.op = _RecordingOp
+    try:
+        migration.upgrade()
+    finally:
+        migration.op = original_op
+
+    assert executed == [], (
+        "the oversize branch must execute no DDL; it ran: " + "; ".join(executed)
+    )
+
+
+@pytest.mark.unit
+def test_missing_table_is_not_treated_as_a_small_one():
+    """A fresh database reaches this revision before the table exists.
+
+    No migration creates ``analytical_snapshots`` -- ``store/snapshots.py``
+    does, on first use -- so ``pg_total_relation_size(to_regclass(...))``
+    returns NULL there. Coalescing that to ``0`` would read as "small table"
+    and send the revision into ``CREATE INDEX`` on something that is not
+    there.
+    """
+    migration = _load_index_migration()
+    executed: list[str] = []
+
+    class _RecordingOp:
+        @staticmethod
+        def get_bind():
+            return _StubConn()
+
+        @staticmethod
+        def execute(statement):
+            executed.append(str(statement))
+
+    class _StubConn:
+        def execute(self, statement, params=None):
+            text = " ".join(str(statement).split())
+            assert "pg_total_relation_size" in text, (
+                f"nothing should be read before the table exists: {text}"
+            )
+            return _NullResult()
+
+    class _NullResult:
+        def scalar(self):
+            return None   # to_regclass found no such table
+
+    original_op = migration.op
+    migration.op = _RecordingOp
+    try:
+        migration.upgrade()
+    finally:
+        migration.op = original_op
+
+    assert executed == [], (
+        "a missing table must produce no DDL; it ran: " + "; ".join(executed)
+    )
+
+
+@pytest.mark.unit
+def test_leftovers_are_found_by_indisvalid_not_by_name():
+    """``CREATE INDEX IF NOT EXISTS`` matches on the name, which is the trap.
+
+    On griddb (ops-exec run 288) a failed CONCURRENTLY build left the index
+    present but INVALID, and the next ``CREATE ... IF NOT EXISTS`` matched it
+    by name, skipped, and reported success having built nothing. Only
+    ``indisvalid`` distinguishes the two.
+    """
+    import inspect
+
+    migration = _load_index_migration()
+    source = inspect.getsource(migration._invalid_leftovers)
+    assert "indisvalid" in source, (
+        "leftovers must be identified from the catalog, not from a name match"
+    )
+
+
+@pytest.mark.unit
+def test_inline_build_is_gated_below_production_size():
+    """The gate must actually exclude griddb, or the deploy breaks again.
+
+    analytical_snapshots is 1155 MB. The ceiling exists to separate "small
+    enough that a brief exclusive lock is free" from "production", so a value
+    at or above production size would put a multi-minute ACCESS EXCLUSIVE hold
+    back into the automated deploy path.
+    """
+    migration = _load_index_migration()
+    griddb_bytes = 1155 * 1024 * 1024
+    assert migration.INLINE_BUILD_MAX_BYTES < griddb_bytes, (
+        f"ceiling {migration.INLINE_BUILD_MAX_BYTES} does not exclude the "
+        f"live table at {griddb_bytes} bytes"
+    )
+    assert migration.INLINE_BUILD_MAX_BYTES > 0, "a zero ceiling skips everywhere"
+
+
+@pytest.mark.unit
+def test_build_timeouts_are_bounded():
+    """Both timers stay finite on the plain-build path.
+
+    ``statement_timeout`` at ``0`` would let a deploy hang with no way out but
+    a manual kill. ``lock_timeout`` at ``0`` would let a waiting ACCESS
+    EXCLUSIVE request pile every later query up behind it -- which is exactly
+    why the CONCURRENTLY version of this migration wanted it disabled and this
+    one must not.
+    """
+    migration = _load_index_migration()
+    for label, value, lo, hi in (
+        ("statement", migration.BUILD_STATEMENT_TIMEOUT, 60, 3600),
+        ("lock", migration.BUILD_LOCK_TIMEOUT, 1, 60),
+    ):
+        assert value.endswith("s"), f"{label}: expected a unit, got {value!r}"
+        seconds = int(value[:-1])
+        assert lo <= seconds <= hi, (
+            f"{label}_timeout {value!r} is outside the range this build was "
+            f"measured for ({lo}-{hi}s)"
         )
 
 
