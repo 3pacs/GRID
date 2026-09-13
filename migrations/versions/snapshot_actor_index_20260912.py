@@ -1,6 +1,6 @@
 """Index analytical_snapshots on the payload actor.
 
-Revision ID: snapshot_payload_actor_index_20260912
+Revision ID: snapshot_actor_index_20260912
 Revises: restore_news_search_arm_20260912
 Create Date: 2026-09-12 01:10:00.000000
 
@@ -130,7 +130,7 @@ from alembic import op
 
 
 # revision identifiers, used by Alembic.
-revision: str = "snapshot_payload_actor_index_20260912"
+revision: str = "snapshot_actor_index_20260912"
 down_revision: Union[str, Sequence[str], None] = "restore_news_search_arm_20260912"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None

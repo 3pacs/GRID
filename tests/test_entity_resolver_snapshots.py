@@ -366,9 +366,9 @@ def _load_index_migration() -> ModuleType:
     # granularity is still seen.
     importlib.invalidate_caches()
     spec = importlib.util.spec_from_file_location(
-        "snapshot_payload_actor_index",
+        "snapshot_actor_index",
         REPO_ROOT / "migrations" / "versions"
-        / "snapshot_payload_actor_index_20260912.py",
+        / "snapshot_actor_index_20260912.py",
     )
     assert spec and spec.loader
     migration = importlib.util.module_from_spec(spec)
