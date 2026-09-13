@@ -418,3 +418,36 @@ def test_once_exits_nonzero_when_an_insight_was_dropped(
 
     monkeypatch.setattr(assimilator, "process_completed_jobs", lambda: (3, 0))
     assert assimilator.main() == 0
+
+
+def test_once_routes_a_raise_through_the_error_sink(assimilator, monkeypatch) -> None:
+    """A raise escaping `--once` would bypass errors.jsonl entirely.
+
+    The daemon loop has this guard; `--once` did not. `config.py` attaches the
+    GitSink with `log.add(_git_sink.write, level="ERROR")` — it only ever sees
+    *logged* ERROR records, and nothing installs a `sys.excepthook`, so an
+    uncaught traceback reaches stderr and the operational health signal never
+    records that the pass failed.
+    """
+    from loguru import logger
+
+    monkeypatch.setattr(sys, "argv", ["assimilator.py", "--once"])
+
+    def _raising_pass():
+        raise RuntimeError("coordinator returned a malformed job")
+
+    monkeypatch.setattr(assimilator, "process_completed_jobs", _raising_pass)
+
+    records = []
+    sink_id = logger.add(lambda m: records.append(m.record), level="DEBUG")
+    try:
+        assert assimilator.main() == 1, "a crashed pass must not exit 0"
+    finally:
+        logger.remove(sink_id)
+
+    errors = [r for r in records if r["level"].name == "ERROR"]
+    assert len(errors) == 1, "the failed pass was not logged at ERROR"
+    assert errors[0]["exception"] is not None, (
+        "logged without opt(exception=True), so errors.jsonl gets the message "
+        "but not the traceback"
+    )

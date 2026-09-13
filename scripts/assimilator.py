@@ -285,7 +285,16 @@ def main() -> int:
     log.info("GRID Assimilator starting — coordinator: {url}", url=COORDINATOR_URL)
 
     if args.once:
-        count, failed = process_completed_jobs()
+        try:
+            count, failed = process_completed_jobs()
+        except Exception as e:
+            # The daemon loop below has this guard and --once did not. It
+            # matters because the GitSink is a loguru sink attached at ERROR
+            # (config.py) and nothing installs a sys.excepthook, so a raise
+            # that escapes here reaches stderr and errors.jsonl never records
+            # the failure at all.
+            log.opt(exception=True).error("Assimilator --once failed: {e}", e=e)
+            return 1
         log.info("Processed {n} jobs ({f} failed)", n=count, f=failed)
         # A single pass that dropped insights must not look like a clean run
         # to whatever scheduled it.
