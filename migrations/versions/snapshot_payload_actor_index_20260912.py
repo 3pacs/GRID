@@ -66,6 +66,44 @@ for it.
 other migrations in this tree use. Those build indexes on tables they have
 just created; this one is live and Hermes writes to it every cycle, so a
 plain build would hold ACCESS EXCLUSIVE for a full heap scan.
+
+Timeouts
+--------
+
+The first attempt at this revision (deploy run 637, 2026-09-13) failed:
+
+    psycopg2.errors.QueryCanceled: canceling statement due to statement timeout
+
+``db.py:87`` sets ``statement_timeout=120000`` on every connection through
+``connect_args``, deliberately — a runaway 215 s scan took the lever page down
+on 2026-04-15. Its own comment names the escape hatch this revision should
+have used from the start: *"Override per-call with SET LOCAL
+statement_timeout = 0 for jobs that legitimately need longer."*
+(``griddb`` also carries a 300 s per-database default; the 120 s client
+setting is the one that wins.)
+
+Two minutes is nowhere near enough here, and the reason is not the index —
+it is the predicate. ``analytical_snapshots`` is 1155 MB (910 MB heap +
+245 MB TOAST), and building a *partial* index means evaluating
+``payload ->> 'actor'`` on all 558k rows, which detoasts every jsonb payload.
+``CONCURRENTLY`` does that twice, and then waits for every transaction older
+than itself to finish — and Hermes keeps a multi-minute
+``SELECT DISTINCT rs.series_id FROM raw_series`` in flight more or less
+continuously. Only 9,649 rows end up in the index; the cost is all in
+reaching them.
+
+``SET LOCAL`` is not usable inside ``autocommit_block()`` (no transaction to
+be local to), so the settings are set at session level and reset in a
+``finally``. The ceiling is 30 minutes rather than ``0``: unlimited would let
+a deploy hang indefinitely behind a long Hermes transaction, and a migration
+that never returns is worse than one that fails loudly.
+
+If this revision times out again, ``CONCURRENTLY`` is the wrong tool for this
+table and the answer is a plain ``CREATE INDEX`` in a maintenance window —
+one scan, no waiting on other transactions, at the cost of a brief
+ACCESS EXCLUSIVE. Do not make the failure non-fatal: a failed deploy is
+visible and recoverable, whereas a revision recorded as applied with no index
+behind it silently returns the planner to the 121,197-cost sequential scan.
 """
 
 import logging
@@ -160,21 +198,55 @@ def _pg_trgm_ready(conn) -> bool:
         return False
 
 
+# Enough headroom for two detoasting scans of a 910 MB heap plus the wait for
+# older transactions, but still bounded — see "Timeouts" above.
+BUILD_STATEMENT_TIMEOUT = "1800s"
+BUILD_LOCK_TIMEOUT = "60s"
+
+
+def _set_build_timeouts() -> None:
+    """Lift db.py's 120 s per-statement cap for the duration of the build.
+
+    Session-level, not ``SET LOCAL``: ``autocommit_block()`` has no transaction
+    for a LOCAL setting to belong to, so ``SET LOCAL`` would emit a warning and
+    change nothing.
+    """
+    op.execute(f"SET statement_timeout = '{BUILD_STATEMENT_TIMEOUT}'")
+    op.execute(f"SET lock_timeout = '{BUILD_LOCK_TIMEOUT}'")
+
+
+def _reset_build_timeouts() -> None:
+    """Hand the connection back with the timeouts it arrived with."""
+    op.execute("RESET statement_timeout")
+    op.execute("RESET lock_timeout")
+
+
 def upgrade() -> None:
     """Create both partial expression indexes, without locking out writers."""
     conn = op.get_bind()
     # CREATE INDEX CONCURRENTLY cannot run inside a transaction block.
     with op.get_context().autocommit_block():
-        op.execute(_drop_if_invalid(BTREE_INDEX))
-        op.execute(_CREATE_BTREE)
+        _set_build_timeouts()
+        try:
+            # A CONCURRENTLY build that fails leaves the index behind, INVALID
+            # but still maintained on every write — unusable by the planner and
+            # pure cost. Clear any such leftover before rebuilding.
+            op.execute(_drop_if_invalid(BTREE_INDEX))
+            op.execute(_CREATE_BTREE)
 
-        if _pg_trgm_ready(conn):
-            op.execute(_drop_if_invalid(TRGM_INDEX))
-            op.execute(_CREATE_TRGM)
+            if _pg_trgm_ready(conn):
+                op.execute(_drop_if_invalid(TRGM_INDEX))
+                op.execute(_CREATE_TRGM)
+        finally:
+            _reset_build_timeouts()
 
 
 def downgrade() -> None:
     """Drop both indexes. Nothing depends on them; the search just gets slower."""
     with op.get_context().autocommit_block():
-        op.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {TRGM_INDEX}")
-        op.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {BTREE_INDEX}")
+        _set_build_timeouts()
+        try:
+            op.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {TRGM_INDEX}")
+            op.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {BTREE_INDEX}")
+        finally:
+            _reset_build_timeouts()
