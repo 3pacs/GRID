@@ -115,7 +115,7 @@ the CLI prints a ready-to-paste retry line per failure. Because every insert is
 
 | # | Service | Port | Process | Location |
 |---|---------|------|---------|----------|
-| 1 | **PostgreSQL + TimescaleDB** | 5432 | Docker container `grid_db` | `~/grid_v4/grid_repo/grid/docker-compose.yml` |
+| 1 | **PostgreSQL 14.23** (bare-metal, **no TimescaleDB**) | 5432 | systemd `postgresql@14-main.service` | PGDATA `/data/postgresql/14/main` |
 | 2 | **llama.cpp (Qwen3.8-27B, RTX 3090)** | 8086 (shim on 8081) | `llama-server` (CUDA) | `/data/vendor/llama.cpp/build/bin/llama-server` |
 | 3 | **Crucix** | 3117 | Node.js app | `~/grid_v4/Crucix/` (has own `.env`) |
 | 4 | **GRID API (uvicorn)** | 8000 | `python3 -m uvicorn api.main:app` | `/data/grid_v4/grid_release` (deployed tree — see [Deploy Pipeline](#deploy-pipeline-grid-api) below) |
@@ -126,8 +126,9 @@ the CLI prints a ready-to-paste retry line per failure. Because every insert is
 ## Start Commands (Manual)
 
 ```bash
-# 1. Database (auto-restarts via Docker)
-cd ~/grid_v4/grid_repo/grid && docker compose up -d
+# 1. Database (bare-metal cluster, NOT a container — there is no `grid_db` container
+#    on grid-svr and no docker-compose.yml in the Hermes tree)
+sudo systemctl start postgresql@14-main
 
 # 2. llama.cpp
 cd ~/grid_v4/grid_repo/grid && bash scripts/start_llamacpp.sh &
@@ -160,14 +161,14 @@ kill $(pgrep -f uvicorn)                  # GRID API
 kill $(pgrep -f llama-server)             # llama.cpp
 kill $(pgrep -f hermes_operator)          # Hermes Operator
 kill $(pgrep -f "node.*Crucix")           # Crucix
-cd ~/grid_v4/grid_repo/grid && docker compose down  # PostgreSQL
+sudo systemctl stop postgresql@14-main    # PostgreSQL (bare-metal cluster)
 ```
 
 ## Restart All
 
 ```bash
 kill $(pgrep -f uvicorn) $(pgrep -f llama-server) $(pgrep -f hermes_operator) 2>/dev/null
-cd ~/grid_v4/grid_repo/grid && docker compose up -d
+sudo systemctl restart postgresql@14-main
 sleep 2
 bash scripts/start_llamacpp.sh &
 sleep 5

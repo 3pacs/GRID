@@ -5,7 +5,7 @@ Each class maps to one error pattern seen in the grid-svr journal:
 * ``TestPriceGuards`` / ``TestScorePendingMemo`` — 11,109 failing yfinance
   downloads a day from the trust scorer re-fetching dead tickers.
 * ``TestExtractorBounds`` — signal_extractor statement timeouts from an
-  unbounded ``series_id LIKE`` scan over the raw_series hypertable.
+  unbounded ``series_id LIKE`` scan over the ~1.9-billion-row raw_series.
 * ``TestWorkerCompletion`` / ``TestCoordinatorIdempotent`` — worker
   ``/complete`` read timeouts followed by 400 "Invalid transition" retries.
 * ``TestBtpBund`` — ECB BTP-Bund uq_raw_series_composite violations.

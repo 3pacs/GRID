@@ -187,7 +187,7 @@ Some modules have direct import dependencies:
 
 ## State Management
 
-### Database Tables (PostgreSQL 15 + TimescaleDB)
+### Database Tables (PostgreSQL — production grid-svr is PG 14.23, no TimescaleDB)
 
 | Table | Purpose | Key Properties |
 |-------|---------|----------------|

@@ -4,7 +4,7 @@
 
 - **Python 3.11+** — backend, ingestion, analysis, inference
 - **Node.js** (implied by Vite/React toolchain) — frontend build only
-- **SQL** — [[PostgreSQL]] 15 schema, [[TimescaleDB]] hypertables
+- **SQL** — [[PostgreSQL]] schema (production: PG 14.23, no [[TimescaleDB]], no hypertables)
 
 ## Backend Framework
 
@@ -48,7 +48,7 @@
 
 ## Database
 
-- **[[PostgreSQL]] 15 + [[TimescaleDB]]** — Docker image `timescale/timescaledb:latest-pg15` (`grid/docker-compose.yml`)
+- **[[PostgreSQL]]** — production grid-svr: PG 14.23 bare-metal, no [[TimescaleDB]]. Local dev: Docker image `timescale/timescaledb:latest-pg15` (`grid/docker-compose.yml`)
 - **[[SQLAlchemy]] 2.0** — engine with connection pool (pool_size=5, max_overflow=10, pool_timeout=30, pool_pre_ping=True) (`grid/db.py:44-49`)
 - **psycopg2-binary** — raw connections for schema application and direct SQL (`grid/db.py:56-89`)
 - **Schema:** Applied via `grid/schema.sql` through `grid/db.py:apply_schema()`

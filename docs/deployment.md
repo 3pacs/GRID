@@ -140,7 +140,7 @@ Data sources with missing keys will be skipped. The system logs warnings at star
 
 ## Database Setup
 
-GRID requires [[PostgreSQL]] 15 with the [[TimescaleDB]] extension. SQLite and MySQL are not supported (the [[PIT Store|PIT query engine]] uses `DISTINCT ON`, `MAKE_INTERVAL`, array types, and partial indexes).
+GRID requires [[PostgreSQL]] 14 or newer. SQLite and MySQL are not supported (the [[PIT Store|PIT query engine]] uses `DISTINCT ON`, `MAKE_INTERVAL`, array types, and partial indexes). The [[TimescaleDB]] extension is optional — the dev container below bundles it, but **production grid-svr runs PG 14.23 without it and has no hypertables**, so never write a migration or query that requires it.
 
 ### Using Docker Compose (recommended)
 

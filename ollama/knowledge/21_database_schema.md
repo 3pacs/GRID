@@ -2,7 +2,8 @@
 
 ## Overview
 
-GRID uses PostgreSQL 15 with TimescaleDB extension. The schema enforces PIT
+GRID uses PostgreSQL. Production grid-svr runs PG 14.23 with **no TimescaleDB and no
+hypertables**; the PG 15 + TimescaleDB stack is local dev and CI only. The schema enforces PIT
 correctness, model governance, feature registry, and decision journal immutability
 through constraints, triggers, and indexes.
 
@@ -70,4 +71,4 @@ Alembic is configured for schema migrations:
 
 - `schema.sql` — Complete schema definition
 - `db.py` — Engine creation, schema application, health checks
-- `docker-compose.yml` — PostgreSQL 15 + TimescaleDB container
+- `docker-compose.yml` — PostgreSQL 15 + TimescaleDB container (local dev only)

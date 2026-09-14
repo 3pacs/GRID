@@ -502,7 +502,8 @@ def test_backfill_sql_shape_is_bounded_parameterized_and_idempotent() -> None:
     payload_sql = str(bf._SELECT_PAYLOADS)
     update_sql = str(bf._UPDATE_ROW)
 
-    # Bounded on both sides of the date column (raw_series is a hypertable).
+    # Bounded on both sides of the date column (raw_series is a plain table of
+    # ~1.9 billion rows -- the bounds keep the read to the backfill window).
     for sql, column in ((select_sql, "signal_date"), (payload_sql, "obs_date")):
         assert f"{column} >= :start_date" in sql
         assert f"{column} <= :end_date" in sql

@@ -7,7 +7,7 @@ GRID is a systematic trading intelligence platform that ingests macroeconomic an
 - **Python 3.11+**
 - **Docker** and Docker Compose
 - **Node.js 18+** (for PWA frontend)
-- **[[PostgreSQL]] 15+** (required — not compatible with MySQL or SQLite due to `DISTINCT ON`, `MAKE_INTERVAL`, array types, and partial indexes). [[TimescaleDB]] extension optional but recommended. Provided via Docker.
+- **[[PostgreSQL]] 14+** (required — not compatible with MySQL or SQLite due to `DISTINCT ON`, `MAKE_INTERVAL`, array types, and partial indexes). [[TimescaleDB]] is genuinely optional: the docker-compose dev stack and CI ship it, **production grid-svr runs PG 14.23 without it**, and no table is a hypertable there. Provided via Docker for local dev.
 - A **[[FRED]] API key** (free from https://fred.stlouisfed.org/docs/api/api_key.html)
 
 ## Quick Start

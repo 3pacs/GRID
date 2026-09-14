@@ -396,9 +396,12 @@ _METRICS_CAPS_SQL = text(
     ORDER BY ticker, obs_date DESC
     """
 )
-# obs_date is bounded on both sides: the lower bound lets TimescaleDB skip
-# every chunk outside the window (unbounded, this scanned the whole hypertable
-# for each ticker that has no TIINGO_FUND series — i.e. most small caps).
+# obs_date is bounded on both sides. The lower bound is PRICE_LOOKBACK_DAYS --
+# a staleness rule (a market cap older than that must not be used), which also
+# keeps the read bounded. There is no TimescaleDB on grid-svr and raw_series is
+# a plain ~1.9-billion-row table, so this is an index-range bound, not chunk
+# exclusion; unbounded, this was ~100 s for each ticker with no TIINGO_FUND
+# series — i.e. most small caps.
 _TIINGO_MCAP_SQL = text(
     """
     SELECT value FROM raw_series
@@ -593,9 +596,11 @@ class SmallCapEnrichmentPuller:
 
     # ── Latest PIT close (raw_series) ─────────────────────────────────────
 
-    # Both obs_date bounds matter: the lower one lets TimescaleDB exclude every
-    # chunk older than the window (an unbounded scan of raw_series took ~100 s
-    # per ticker on grid-svr); the upper one is the PIT guard.
+    # Both obs_date bounds matter. The lower one is PRICE_LOOKBACK_DAYS -- a
+    # staleness rule that also bounds the index range scanned; an unbounded scan
+    # of raw_series took ~100 s per ticker on grid-svr. (It is not chunk
+    # exclusion: there is no TimescaleDB on grid-svr and raw_series is a plain
+    # ~1.93-billion-row table.) The upper one is the PIT guard.
     _LATEST_PRICE_SQL = text(
         """
         SELECT value

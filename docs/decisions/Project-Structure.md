@@ -17,7 +17,7 @@ This is the canonical directory map. Use this to orient before diving into any m
 |------|---------|
 | `config.py` | Centralized pydantic-settings (391 lines, 25+ API keys, all toggles) |
 | `db.py` | SQLAlchemy engine + psycopg2 raw connections (pool: 20+40 overflow) |
-| `schema.sql` | PostgreSQL 15 + TimescaleDB (30+ tables, 101KB) |
+| `schema.sql` | PostgreSQL (30+ tables, 101KB); TimescaleDB optional — production has none |
 | `mcp_server.py` | Model Context Protocol interface (46KB, full-text search) |
 | `cli.py` | CLI entrypoint |
 | `dashboard.py` | Dashboard runner |

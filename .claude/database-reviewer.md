@@ -92,7 +92,9 @@ For detailed index patterns, schema design examples, connection management, conc
 
 ## GRID Database Context
 
-**Database:** PostgreSQL 15 + TimescaleDB. Pool: 20+40 (GRID_DB_POOL_SIZE/GRID_DB_MAX_OVERFLOW)
+**Database:** PostgreSQL. Production grid-svr is **PG 14.23 bare-metal, no TimescaleDB,
+no hypertables** (local dev + CI run PG 15 + TimescaleDB). Review against PG 14 semantics.
+Pool: 20+40 (GRID_DB_POOL_SIZE/GRID_DB_MAX_OVERFLOW)
 
 **Key tables:** resolved_series (PIT hot table), feature_registry (1,219 features), hypothesis_registry (lifecycle states), oracle_predictions (615+), paper_trades/paper_strategies, decision_journal (IMMUTABLE), trust_scores, dollar_flows, actors/wealth_flows (495 actors), lever_pullers, cross_reference_checks
 

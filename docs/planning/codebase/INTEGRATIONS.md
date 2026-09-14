@@ -2,7 +2,7 @@
 
 ## Database
 
-- **[[PostgreSQL]] 15 + [[TimescaleDB]]** via Docker (`grid/docker-compose.yml`)
+- **[[PostgreSQL]]** — production grid-svr: PG 14.23 bare-metal, no [[TimescaleDB]]; local dev via Docker (`grid/docker-compose.yml`)
 - **Connection:** `postgresql://{user}:{password}@{host}:{port}/{dbname}` constructed in `grid/config.py:114-119`
 - **Defaults:** `localhost:5432/grid`, user `grid_user`, password `changeme`
 - **Driver:** psycopg2-binary (raw) + [[SQLAlchemy]] 2.0 (engine/pool)

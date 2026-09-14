@@ -30,8 +30,11 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 
-# raw_series is a TimescaleDB hypertable. The unbounded ``series_id LIKE``
-# scan ran across every chunk twelve times per cycle and hit the statement
+# raw_series is a plain, non-partitioned table of ~1.9 billion rows. There is
+# no TimescaleDB on grid-svr (PG 14.23, extension not installed and not even
+# available) and therefore no chunks to prune -- the bound below is what keeps
+# a pass to a slice of the table, not chunk exclusion. The unbounded
+# ``series_id LIKE`` scan ran twelve times per cycle and hit the statement
 # timeout on every pass (2026-09-10). The daemon runs continuously, so the
 # incremental pass only needs rows observed recently; the start-up sweep
 # looks further back but stays bounded too.
@@ -169,7 +172,8 @@ def extract_from_raw_series(
     """Scan raw_series for structured entries and create signal_data records.
 
     Only rows with ``obs_date`` in the last *lookback_days* are scanned so
-    the hypertable query prunes to recent chunks.
+    the query stays bounded to a recent slice of raw_series rather than
+    walking all ~1.9 billion rows.
     """
     stats = {"scanned": 0, "extracted": 0, "skipped": 0, "errors": 0}
     since = _since(lookback_days)

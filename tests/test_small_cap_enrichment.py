@@ -403,7 +403,7 @@ def test_latest_price_is_pit_bounded_over_yf_and_tiingo_closes() -> None:
     stmt, params = conn.execute.call_args.args
     sql = str(stmt)
     assert "series_id = ANY(:series_ids)" in sql and "obs_date <= :as_of" in sql and "pull_timestamp <= :as_of_ts" in sql
-    assert "obs_date >= :since" in sql  # lower bound -> TimescaleDB chunk exclusion (unbounded scan was ~100 s/ticker)
+    assert "obs_date >= :since" in sql  # staleness bound + bounded index range (unbounded scan was ~100 s/ticker)
     assert "%" not in sql and "format(" not in sql
     assert params["series_ids"] == ["YF:SMLX:adj_close", "YF:SMLX:close", "TIINGO:SMLX:adj_close", "TIINGO:SMLX:close"]
     assert params["as_of"] == AS_OF and params["as_of_ts"].date() == AS_OF and params["as_of_ts"].tzinfo is not None

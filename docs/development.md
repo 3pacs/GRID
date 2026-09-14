@@ -15,7 +15,7 @@ This guide covers setting up a development environment, running tests, and follo
 
 ### 1. Start the Database
 
-GRID requires [[PostgreSQL]] 15 with [[TimescaleDB]]. SQLite and MySQL are not supported -- the [[PIT Store|PIT query engine]] relies on PostgreSQL-specific features (`DISTINCT ON`, `MAKE_INTERVAL`, array types, partial indexes).
+GRID requires [[PostgreSQL]] 14 or newer. SQLite and MySQL are not supported -- the [[PIT Store|PIT query engine]] relies on PostgreSQL-specific features (`DISTINCT ON`, `MAKE_INTERVAL`, array types, partial indexes). [[TimescaleDB]] is optional: this dev container bundles it, **production grid-svr does not have it**.
 
 ```bash
 cd grid

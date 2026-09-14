@@ -73,8 +73,9 @@ _SNAPSHOT_STATS_SQL = text("""
     WHERE created_at >= NOW() - INTERVAL '24 hours'
 """)
 
-# raw_series is a TimescaleDB hypertable: bound the time column on BOTH
-# sides or the planner walks every chunk.
+# raw_series is a plain table of ~1.9 billion rows (no TimescaleDB on
+# grid-svr): bound the time column on BOTH sides or this aggregate reads far
+# more of the table than the digest window needs.
 _PULL_STATS_SQL = text("""
     SELECT
         COUNT(DISTINCT source_id) as sources_pulled,

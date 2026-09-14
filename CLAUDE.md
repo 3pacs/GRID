@@ -69,7 +69,9 @@ This enforces grep-before-create discipline and prevents the duplication documen
 
 ## Tech Stack
 
-- **Backend:** Python 3.11+, [[FastAPI]], [[SQLAlchemy]] 2.0, [[PostgreSQL]] 15 + [[TimescaleDB]]
+- **Backend:** Python 3.11+, [[FastAPI]], [[SQLAlchemy]] 2.0, [[PostgreSQL]]
+  (**production grid-svr is PG 14.23, bare-metal, with NO [[TimescaleDB]]** — see
+  "Database environments" below; local dev and CI do run PG 15 + TimescaleDB)
 - **Frontend:** React 18, Vite, [[Zustand]], served as PWA from [[FastAPI]]
 - **LLM:** Local Qwen 3.8 27B on GPU everywhere (verified 2026-09-10): grid-svr
   RTX 3090 llama-server (Qwen3.8-27B Q4_K_M + mmproj on 100.75.185.36:8086, fronted by the
@@ -86,6 +88,39 @@ This enforces grep-before-create discipline and prevents the duplication documen
   See `llm/router.py` for the 3-tier taxonomy (LOCAL/REASON/ORACLE).
 - **Config:** pydantic-settings, environment variables via `.env`
 
+## Database environments (they are NOT the same)
+
+Three different databases get called "the database" in this repo. Conflating them has
+already produced wrong code comments and a wrong ops runbook.
+
+| | Production `grid-svr` | CI (`alien` runner) | Local dev |
+|---|---|---|---|
+| Version | **PostgreSQL 14.23** | PostgreSQL 15.19 | PG 15 (container) |
+| Packaging | Ubuntu 22.04 stock, **bare metal** | native service | `timescale/timescaledb:latest-pg15` |
+| TimescaleDB | **NOT installed, not even available** | 2.28.3 | bundled |
+| Process | systemd `postgresql@14-main.service` | native service | Docker |
+| PGDATA | `/data/postgresql/14/main` | — | volume `grid_pgdata` |
+
+There is **no `grid_db` container on grid-svr** and no `docker-compose.yml` in the Hermes
+tree — `docker compose up -d` starts the *dev* database, never production.
+
+Consequences, verified on griddb 2026-09-14:
+
+- **`raw_series` is a plain, non-partitioned table of ~1.93 billion rows.** There are no
+  chunks. Any comment or plan that reasons about "chunk exclusion" or "chunk pruning" in
+  production is reasoning about something that does not exist. Bounded `obs_date` predicates
+  are still right and still required — they bound an **index range** (ten btree indexes
+  exist; `idx_raw_series_dedup` is a covering partial index on
+  `(series_id, obs_date, pull_timestamp DESC) INCLUDE (value) WHERE pull_status='SUCCESS'`).
+- Migration `0037_options_v2_schema.sql` calls `create_hypertable()` inside a DO block that
+  degrades gracefully. So **`option_snapshots_raw` is a hypertable in CI and a plain table in
+  production.** Never write code whose correctness depends on hypertable behaviour — CI will
+  pass and production will not match.
+- Write only PG 14-compatible SQL. No `MERGE` (PG 15+); none is in the tree today.
+
+PG 14 reaches end of life around **November 2026**. Upgrading is a real task but is gated on
+proving the base backup restores and on moving PGDATA to NVMe — see `docs/planning/ROADMAP.md`.
+
 ## Server Deployment
 
 - Repo on server: `~/grid_v4` (user: `grid`, host: `grid-svr`)
@@ -99,8 +134,8 @@ This enforces grep-before-create discipline and prevents the duplication documen
 ## Essential Commands
 
 ```bash
-# Database
-cd grid && docker compose up -d                    # Start PostgreSQL + TimescaleDB
+# Database (LOCAL DEV ONLY — production runs bare-metal PG 14, not this container)
+cd grid && docker compose up -d                    # Start PostgreSQL 15 + TimescaleDB
 
 # Backend
 cd grid && pip install -r requirements.txt

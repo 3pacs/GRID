@@ -129,7 +129,8 @@ _SPOT_PRICE_KEYS: tuple[str, ...] = (
 # (pseudo tickers such as MACRO / NONE, warrants, delisted names, class
 # shares spelled BRK.A instead of BRK-A). The guards below keep the live
 # fetch to symbols yfinance can serve, remember dead symbols for a while,
-# and bound the raw_series lookup so it never walks the whole hypertable.
+# and bound the raw_series lookup so it never walks the whole table
+# (raw_series is a plain table of ~1.9 billion rows; see _get_price_near_date).
 
 #: How far back from the target date a stored close may be and still count.
 PRICE_LOOKBACK_DAYS: int = 45
@@ -580,8 +581,15 @@ def _get_price_near_date(
         if row:
             return float(row[0])
 
-        # Bounded on both sides: raw_series is a hypertable and an open
-        # lower bound walks every chunk for tickers with no stored closes.
+        # Bounded on both sides. The lower bound is PRICE_LOOKBACK_DAYS and is
+        # a correctness rule, not an optimisation: a stored close older than
+        # that must not be used as a price for this date. Do not widen or drop
+        # it to "speed things up" -- on today's schema idx_raw_series_dedup
+        # (series_id, obs_date, pull_timestamp DESC) INCLUDE (value)
+        # WHERE pull_status = 'SUCCESS' already serves this query as an index
+        # only scan with or without the lower bound (EXPLAIN, griddb,
+        # 2026-09-14), so removing it would buy nothing and would silently
+        # start pricing off stale closes.
         row = conn.execute(text("""
             SELECT value FROM raw_series
             WHERE series_id = :sid AND obs_date <= :d AND obs_date >= :lo

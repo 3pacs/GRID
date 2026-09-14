@@ -85,10 +85,11 @@ _SELECT_CANDIDATES = text(
     """
 )
 
-# raw_series is a TimescaleDB hypertable: obs_date is bounded on both sides so
-# the planner prunes to the window's chunks instead of scanning every one. The
-# payloads are read once and matched in Python rather than through a
-# correlated per-row lookup on an unindexed jsonb expression.
+# raw_series is a plain table of ~1.9 billion rows (no TimescaleDB on grid-svr,
+# so there are no chunks to prune): obs_date is bounded on both sides to keep
+# the read to the backfill window instead of the whole table. The payloads are
+# read once and matched in Python rather than through a correlated per-row
+# lookup on an unindexed jsonb expression.
 _SELECT_PAYLOADS = text(
     """
     SELECT obs_date, raw_payload
