@@ -26,6 +26,7 @@ from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
+from loguru import logger as loguru_logger
 
 os.environ.setdefault("ENVIRONMENT", "development")
 os.environ.setdefault("GRID_JWT_SECRET", "test-secret-key-for-testing-only")
@@ -39,6 +40,22 @@ os.environ.setdefault("GRID_MASTER_PASSWORD_HASH", _pwd_ctx.hash("testpassword12
 from api.auth import create_token
 from api.main import app
 from api.routers.watchlist_overview import get_ticker_quote
+
+
+class _FakeOrig(Exception):
+    """Stand-in for a psycopg2 error carrying a SQLSTATE."""
+
+    def __init__(self, pgcode: str, message: str = "") -> None:
+        super().__init__(message)
+        self.pgcode = pgcode
+
+
+class _FakeDBAPIError(Exception):
+    """Stand-in for a SQLAlchemy DBAPIError wrapping a driver error."""
+
+    def __init__(self, message: str, orig: Exception | None = None) -> None:
+        super().__init__(message)
+        self.orig = orig
 
 client = TestClient(app)
 
@@ -209,3 +226,91 @@ class TestQuoteQueryCollapsesVintages:
         assert "WITH winner AS" in src
         # The naive, buggy shape must not reappear.
         assert "ORDER BY rs.obs_date DESC LIMIT 2" not in src
+
+
+class TestQuoteQueryFailureIsAudible:
+    """The other half of the frozen-price incident: when the price query
+    itself failed, the handler logged at `log.debug` and the endpoint quietly
+    answered from the live-fetch fallback. Debug level is off in production,
+    so `.server-logs/errors.jsonl` — the canonical operational health signal
+    per CLAUDE.md — recorded nothing at all, and a dead query looked exactly
+    like a healthy one. Route it the way `intelligence/entity_resolver.py`
+    does: a schema fault is an application bug (`log.error`), anything else
+    is operational (`log.warning`). Neither is `log.debug` — that is the bug
+    class PRs #477 and #479 spent two rounds removing.
+    """
+
+    @staticmethod
+    def _records():
+        """Capture (level, message) pairs; loguru does not use stdlib logging."""
+        records: list[tuple[str, str]] = []
+        sink_id = loguru_logger.add(
+            lambda msg: records.append(
+                (msg.record["level"].name, msg.record["message"])
+            ),
+            level="WARNING",
+        )
+        return records, sink_id
+
+    def _quote_with_price_query_raising(self, mock_engine, exc):
+        """Drive /quote with a price query that raises `exc`, return log records."""
+        mock_conn = MagicMock()
+        opt_result = MagicMock()
+        opt_result.fetchone.return_value = None
+        mock_conn.execute.side_effect = [exc, opt_result]
+        _wire_engine(mock_engine, mock_conn)
+
+        records, sink_id = self._records()
+        try:
+            with patch(
+                "api.routers.watchlist_overview._fetch_live_price", return_value=None
+            ):
+                response = client.get(
+                    "/api/v1/watchlist/AAPL/quote", headers=_auth_header()
+                )
+        finally:
+            loguru_logger.remove(sink_id)
+        assert response.status_code == 200
+        return records
+
+    @patch("api.routers.watchlist_overview._init_table")
+    @patch("api.routers.watchlist_overview.get_db_engine")
+    def test_schema_fault_in_price_query_logs_at_error(self, mock_engine, _mock_init):
+        """SQLSTATE 42703 can't succeed on any retry — it is a code bug."""
+        records = self._quote_with_price_query_raising(
+            mock_engine, _FakeDBAPIError("boom", _FakeOrig("42703"))
+        )
+
+        levels = [level for level, _ in records]
+        assert "ERROR" in levels, records
+        assert any("Quote price query for AAPL" in msg for _, msg in records), records
+
+    @patch("api.routers.watchlist_overview._init_table")
+    @patch("api.routers.watchlist_overview.get_db_engine")
+    def test_undefined_column_message_logs_at_error(self, mock_engine, _mock_init):
+        """Same fault via the message, for drivers that expose no SQLSTATE."""
+        records = self._quote_with_price_query_raising(
+            mock_engine, _FakeDBAPIError('column "obs_date" does not exist')
+        )
+
+        assert "ERROR" in [level for level, _ in records], records
+
+    @patch("api.routers.watchlist_overview._init_table")
+    @patch("api.routers.watchlist_overview.get_db_engine")
+    def test_transient_failure_stays_a_warning(self, mock_engine, _mock_init):
+        """A statement timeout is operational — errors.jsonl keeps its signal."""
+        records = self._quote_with_price_query_raising(
+            mock_engine,
+            _FakeDBAPIError("canceling statement due to statement timeout"),
+        )
+
+        levels = [level for level, _ in records]
+        assert "WARNING" in levels, records
+        assert "ERROR" not in levels, records
+
+    def test_no_query_failure_is_swallowed_at_debug(self):
+        """Guard the whole endpoint, not just the one arm the test drives."""
+        src = inspect.getsource(get_ticker_quote)
+        assert "log.debug" not in src, (
+            "a failed query in /quote must not be invisible in production"
+        )

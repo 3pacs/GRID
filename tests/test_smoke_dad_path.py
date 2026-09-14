@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -21,6 +21,7 @@ from scripts.smoke_dad_path import (
     StepResult,
     as_of_age_days,
     compose_branch,
+    grade_quote_freshness,
     find_index_asset,
     find_mascot_asset,
     find_mascot_asset_on_disk,
@@ -31,6 +32,7 @@ from scripts.smoke_dad_path import (
     step_static,
     step_widget_data,
     validate_widget_types,
+    weekday_age,
     worst_status,
 )
 
@@ -506,3 +508,114 @@ class TestRenderReport:
         report = render_report(self._steps(), {"base_url": "http://x", "release_dir": "/tmp", "generated_at": "now"})
         assert "## Blocked items" in report
         assert "release dir not found" in report
+
+
+# ── quote freshness: weekday_age / grade_quote_freshness ─────────────────
+
+
+class TestWeekdayAge:
+    """Calendar age can't grade a stock quote — a Monday quote carrying
+    Friday's close is three calendar days old and perfectly fresh. Counting
+    Mon-Fri only collapses every weekend to zero.
+
+    All `now` values below are 2026-09-14 (a Monday) unless stated.
+    """
+
+    MONDAY = datetime(2026, 9, 14, 12, 0, tzinfo=timezone.utc)
+
+    def test_missing_as_of_is_none(self):
+        assert weekday_age(None, now=self.MONDAY) is None
+        assert weekday_age("", now=self.MONDAY) is None
+        assert weekday_age("not-a-date", now=self.MONDAY) is None
+
+    def test_weekend_gap_does_not_age_a_friday_close(self):
+        """Mon 2026-09-14 reading Fri 2026-09-11: 3 calendar days, 1 weekday."""
+        assert as_of_age_days("2026-09-11", now=self.MONDAY) == pytest.approx(3.5, abs=0.01)
+        assert weekday_age("2026-09-11", now=self.MONDAY) == 1
+
+    def test_same_day_is_zero(self):
+        assert weekday_age("2026-09-14", now=self.MONDAY) == 0
+
+    def test_future_as_of_is_zero(self):
+        assert weekday_age("2026-09-20", now=self.MONDAY) == 0
+
+    def test_monday_holiday_costs_one_weekday(self):
+        """Thu close read on the Monday after a Friday market holiday."""
+        assert weekday_age("2026-09-10", now=self.MONDAY) == 2
+
+    def test_whole_weeks_count_five_each(self):
+        # 2026-08-31 is a Monday, exactly two weeks before 2026-09-14.
+        assert weekday_age("2026-08-31", now=self.MONDAY) == 10
+
+    def test_the_frozen_price_incident_scores_far_past_any_holiday(self):
+        """The real ticker_pulse payload: as_of stuck at 2026-07-15."""
+        now = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+        assert weekday_age("2026-07-15", now=now) == 41
+
+    def test_accepts_datetime_and_date_objects(self):
+        assert weekday_age(datetime(2026, 9, 11, tzinfo=timezone.utc), now=self.MONDAY) == 1
+        assert weekday_age(date(2026, 9, 11), now=self.MONDAY) == 1
+
+
+class TestGradeQuoteFreshness:
+    """Regression guard for the gap the 2026-09-10 live QA exposed: the quote
+    check graded HTTP 200 and a non-null price as "ok" while `as_of` had been
+    frozen at 2026-07-15 for two months. HTTP 200 is not freshness.
+    """
+
+    MONDAY = datetime(2026, 9, 14, 12, 0, tzinfo=timezone.utc)
+
+    def test_yesterdays_close_is_ok(self):
+        assert grade_quote_freshness("2026-09-11", now=self.MONDAY) == ("ok", 1)
+
+    def test_holiday_slack_is_still_ok(self):
+        assert grade_quote_freshness("2026-09-10", now=self.MONDAY) == ("ok", 2)
+
+    def test_three_weekdays_is_degraded(self):
+        assert grade_quote_freshness("2026-09-09", now=self.MONDAY) == ("degraded", 3)
+
+    def test_four_weekdays_is_broken(self):
+        """No US market-calendar pattern explains four missed sessions."""
+        assert grade_quote_freshness("2026-09-08", now=self.MONDAY) == ("broken", 4)
+
+    def test_the_frozen_price_incident_is_broken(self):
+        now = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+        status, age = grade_quote_freshness("2026-07-15", now=now)
+        assert status == "broken"
+        assert age == 41
+
+    def test_missing_as_of_is_degraded_not_broken(self):
+        """The price may be fine; the endpoint is just not saying when it's from."""
+        assert grade_quote_freshness(None, now=self.MONDAY) == ("degraded", None)
+
+
+class TestStepWidgetDataGradesQuoteFreshness:
+    """End-to-end through `step_widget_data`: a stale-but-200 quote must not
+    come back "ok". This is the assertion that would have caught the frozen
+    ticker_pulse prices on any smoke run after 2026-07-15.
+    """
+
+    @staticmethod
+    def _quote_responses(as_of):
+        body = {"price": 226.5, "change_pct": None, "as_of": as_of, "stale": True}
+        return {
+            f"/api/v1/watchlist/{t}/quote": FakeHTTPResponse(200, json_data=body)
+            for t in ("AAPL", "TSLA", "GLD")
+        }
+
+    def _run(self, as_of):
+        client = FakeClient(self._quote_responses(as_of))
+        client.token = "fake-token"
+        result = step_widget_data(client, 5000)
+        return [s for s in result.data["substeps"] if s["name"].startswith("quote:")]
+
+    def test_stale_quote_is_not_graded_ok(self):
+        quotes = self._run("2026-07-15")
+        assert quotes, "expected quote substeps"
+        assert all(q["status"] == "broken" for q in quotes), quotes
+        assert all("weekday_age=" in q["note"] for q in quotes), quotes
+
+    def test_fresh_quote_is_ok(self):
+        fresh = (datetime.now(timezone.utc) - timedelta(days=1)).date().isoformat()
+        quotes = self._run(fresh)
+        assert all(q["status"] == "ok" for q in quotes), quotes

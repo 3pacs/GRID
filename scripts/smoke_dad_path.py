@@ -37,7 +37,7 @@ import sys
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -140,11 +140,10 @@ def compose_branch(payload: dict[str, Any]) -> str:
     return "error"
 
 
-def as_of_age_days(as_of: Any, *, now: datetime | None = None) -> float | None:
-    """Age in days of an `as_of` date/datetime-ish value. None on missing/bad input."""
+def _parse_as_of(as_of: Any) -> datetime | None:
+    """Parse an `as_of` date/datetime-ish value to an aware UTC datetime."""
     if as_of in (None, ""):
         return None
-    now = now or datetime.now(timezone.utc)
     dt: datetime | None = None
     if isinstance(as_of, datetime):
         dt = as_of
@@ -161,7 +160,77 @@ def as_of_age_days(as_of: Any, *, now: datetime | None = None) -> float | None:
                 return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def as_of_age_days(as_of: Any, *, now: datetime | None = None) -> float | None:
+    """Age in days of an `as_of` date/datetime-ish value. None on missing/bad input."""
+    dt = _parse_as_of(as_of)
+    if dt is None:
+        return None
+    now = now or datetime.now(timezone.utc)
     return max(0.0, (now - dt).total_seconds() / 86400.0)
+
+
+def weekday_age(as_of: Any, *, now: datetime | None = None) -> int | None:
+    """Weekdays elapsed since `as_of`, i.e. Mon-Fri in `(as_of, now]`.
+
+    Calendar age can't grade a stock quote: a Monday-morning quote carrying
+    Friday's close is three calendar days old and perfectly fresh. Counting
+    only Mon-Fri collapses every weekend to zero, so the number means "US
+    sessions that should have produced a newer close" — with one caveat, the
+    market holidays that fall on a weekday. The US equity market never closes
+    for two consecutive weekdays, so one weekday of slack covers every
+    holiday in the calendar; callers add that slack to their threshold.
+
+    Returns None on missing/unparseable input.
+    """
+    dt = _parse_as_of(as_of)
+    if dt is None:
+        return None
+    now = now or datetime.now(timezone.utc)
+    start, end = dt.date(), now.date()
+    if end <= start:
+        return 0
+    # Whole weeks contribute exactly 5 weekdays each; walk only the remainder.
+    span = (end - start).days
+    weeks, rest = divmod(span, 7)
+    count = weeks * 5
+    for i in range(1, rest + 1):
+        if (start + timedelta(days=i)).weekday() < 5:
+            count += 1
+    return count
+
+
+# Quote-freshness grading, in weekdays (see `weekday_age`):
+#   <= 2  fresh — yesterday's close, plus one weekday of slack for a market
+#         holiday. A Monday quote carrying Thursday's close after a Friday
+#         holiday scores exactly 2.
+#   == 3  degraded — no US holiday pattern produces three consecutive
+#         non-trading weekdays, but one missed pull cycle around a half-day
+#         shouldn't page anyone.
+#   >= 4  broken — nothing in the market calendar explains it; the writer
+#         behind the feature has stopped. The frozen ticker_pulse prices
+#         found on 2026-09-10 scored ~40 by this measure.
+QUOTE_FRESH_WEEKDAYS = 2
+QUOTE_DEGRADED_WEEKDAYS = 3
+
+
+def grade_quote_freshness(as_of: Any, *, now: datetime | None = None) -> tuple[str, int | None]:
+    """Grade a quote's `as_of` against the market calendar.
+
+    Returns `(status, weekday_age)`. A missing or unparseable `as_of` is
+    "degraded", not "broken": the price may still be good and the endpoint
+    is simply not saying when it is from.
+    """
+    age = weekday_age(as_of, now=now)
+    if age is None:
+        return "degraded", None
+    if age <= QUOTE_FRESH_WEEKDAYS:
+        return "ok", age
+    if age <= QUOTE_DEGRADED_WEEKDAYS:
+        return "degraded", age
+    return "broken", age
 
 
 def iter_sse_events(buf: str) -> list[dict[str, Any]]:
@@ -517,12 +586,24 @@ def step_widget_data(client: Client, budget_ms: int) -> StepResult:
             sub.append(StepResult(f"quote:{ticker}", "broken", ms, f"HTTP {resp.status_code}"))
             continue
         payload = resp.json()
-        age = as_of_age_days(payload.get("as_of"))
+        as_of = payload.get("as_of")
+        age = as_of_age_days(as_of)
         price = payload.get("price")
         change_null = payload.get("change_pct") is None
-        status = "ok" if price is not None else "degraded"
-        note = f"price={price} as_of_age_days={age} change_pct_null={change_null}"
-        sub.append(StepResult(f"quote:{ticker}", status, ms, note, {"as_of_age_days": age}))
+        # HTTP 200 with a price is not "ok": the endpoint answers 200 with a
+        # two-month-old close just as happily, which is how the frozen
+        # ticker_pulse prices survived every smoke run since 2026-07-15.
+        # Grade the age, in weekdays, so the market calendar can't mask it.
+        fresh_status, wd_age = grade_quote_freshness(as_of)
+        status = worst_status([fresh_status, "ok" if price is not None else "degraded"])
+        note = (
+            f"price={price} as_of={as_of} weekday_age={wd_age} "
+            f"as_of_age_days={age} change_pct_null={change_null}"
+        )
+        sub.append(StepResult(
+            f"quote:{ticker}", status, ms, note,
+            {"as_of_age_days": age, "weekday_age": wd_age, "as_of": as_of},
+        ))
 
     try:
         resp, ms = client.request("GET", "/api/v1/flows/sectors", timeout_s=timeout_s)
