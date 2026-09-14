@@ -650,7 +650,25 @@ class Settings(BaseSettings):
     @field_validator("DB_PASSWORD")
     @classmethod
     def _check_db_password(cls, v: str) -> str:
-        """Reject missing or default password in non-development environments."""
+        """Reject an empty password, and reject the literal 'changeme'
+        default outside development.
+
+        The empty-password check is deliberately UNCONDITIONAL — it does not
+        gate on ENVIRONMENT. If `.env` was never sourced, ENVIRONMENT itself
+        silently falls back to "development" too, so a check gated on
+        `env != "development"` would never fire in exactly the scenario it
+        exists to catch (see the 2026-09-13 incident: an unsourced .env
+        produced DB_NAME="grid" — not the real "griddb" — with an empty
+        DB_PASSWORD, and was stopped only by Postgres itself refusing
+        passwordless auth, not by this application).
+        """
+        if not v:
+            raise ValueError(
+                "DB_PASSWORD is empty. This usually means .env was not "
+                "sourced (or DB_PASSWORD is missing from it) — check "
+                "before assuming defaults like DB_HOST/DB_NAME are safe. "
+                "Set DB_PASSWORD in .env."
+            )
         env = os.getenv("ENVIRONMENT", "development")
         if env != "development" and v == "changeme":
             raise ValueError(

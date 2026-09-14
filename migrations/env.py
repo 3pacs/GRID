@@ -10,9 +10,16 @@ from sqlalchemy import engine_from_config, pool
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import Settings
+from migrations.logging_setup import configure_logging
 
 # Alembic Config object.
 config = context.config
+
+# Before anything else: without this, alembic's own NullHandler swallows every
+# record a migration logs, including the deferral warnings
+# snapshot_actor_index_20260912 relies on to report work it declined to do.
+# See migrations/logging_setup.py.
+configure_logging(config.config_file_name)
 
 # Override sqlalchemy.url from Settings.
 config.set_main_option("sqlalchemy.url", Settings().DB_URL)
