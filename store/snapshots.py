@@ -22,6 +22,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from utils.ttl_cache import TTLCache
+
 
 class _NumpyEncoder(json.JSONEncoder):
     """JSON encoder that handles numpy types and pandas objects."""
@@ -115,6 +117,43 @@ ANALYTICAL_SNAPSHOTS_INDEX_DDL = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Category discovery
+# ---------------------------------------------------------------------------
+# Which categories exist is a property of the DATA, not of any literal in this
+# file, and no maintained tuple can ever enumerate it:
+#
+#   * two writers build the category at runtime — ``mcp_server.py``'s
+#     f"mcp_research_{task_type}" and ``orchestration/llm_taskqueue.py``'s
+#     f"llm_task_{task.task_type}" — so the value doesn't exist until the row
+#     is written;
+#   * five modules INSERT into ``analytical_snapshots`` directly and never
+#     reach ``save_snapshot`` at all (``scripts/parse_datasets.py``,
+#     ``ingestion/openbb_pipeline.py``, ``scripts/drain_backlog.py``,
+#     ``scripts/drain_surfacer_backfill.py``, and this module).
+#
+# ``AnalyticalSnapshotStore.list_categories`` reads the table instead. A
+# hardcoded list used to gate ``GET /api/v1/snapshots/latest/{category}``,
+# which 400'd every category not in it — see the PIPELINE_CATEGORIES note.
+#
+# ``SELECT ... GROUP BY category`` is an index scan over
+# ``idx_analytical_snapshots_category``; PostgreSQL 15 has no loose index
+# scan, so it touches every row (~17K and growing as of 2026-09). Cheap, but
+# not free per request, so the result is cached process-wide. There is one
+# engine per process (``api/dependencies.get_db_engine``), so a single key is
+# enough. ``save_snapshot`` invalidates on a genuinely new category, which
+# makes a first-ever write visible immediately in-process; other processes
+# pick it up within the TTL.
+_CATEGORY_CACHE_TTL: float = 300.0
+_CATEGORY_CACHE_KEY = "categories"
+_category_cache: TTLCache = TTLCache(ttl=_CATEGORY_CACHE_TTL, max_size=1)
+
+
+def clear_category_cache() -> None:
+    """Drop the cached category listing so the next read hits the database."""
+    _category_cache.clear()
+
+
 def ensure_analytical_snapshots_table(db_engine: Engine) -> None:
     """Create ``analytical_snapshots`` and its indexes if they don't exist.
 
@@ -144,8 +183,21 @@ class AnalyticalSnapshotStore:
         engine: SQLAlchemy engine for database access.
     """
 
-    # Recognised snapshot categories
-    CATEGORIES = (
+    # The categories the core analytical pipeline produces — the ones
+    # ``save_pipeline_snapshots`` writes and ``_extract_metrics`` knows how to
+    # summarize.
+    #
+    # THIS IS NOT THE SET OF VALID CATEGORIES, and nothing may treat it as
+    # one. It was named ``CATEGORIES`` until 2026-09, and that name read as
+    # "every category there is": the snapshots API gated
+    # ``GET /latest/{category}`` on membership and so returned HTTP 400 for
+    # every category outside these eight — ``sleuth_investigation``,
+    # ``alpha101``, ``strategy151``, ``research_sweep``, ``sector_flows``,
+    # ``human_llm_insight``, ``congressional_trade``, ``opensanctions``,
+    # ``crypto_price``, and both runtime-built families. Use
+    # ``list_categories()`` for what actually exists; this tuple is
+    # documentation of the canonical pipeline set only.
+    PIPELINE_CATEGORIES = (
         "clustering",
         "orthogonality",
         "regime_detection",
@@ -194,7 +246,9 @@ class AnalyticalSnapshotStore:
         """Persist a single analytical snapshot.
 
         Parameters:
-            category: One of CATEGORIES (e.g. 'clustering', 'orthogonality').
+            category: Free-form category label (e.g. 'clustering',
+                'sector_flows'). Not restricted to PIPELINE_CATEGORIES —
+                callers invent categories, including at runtime.
             payload: Full result dict to store as JSONB.
             as_of_date: The decision date the analysis was run for.
             subcategory: Optional refinement (e.g. 'k=4', 'pre_2008').
@@ -242,9 +296,26 @@ class AnalyticalSnapshotStore:
             log.error("Failed to save snapshot ({cat}): {e}", cat=category, e=str(exc))
             return None
 
+        self._invalidate_category_cache_if_new(category)
+
         if self.retention_per_category is not None:
             self._prune_category(category, self.retention_per_category)
         return snap_id
+
+    @staticmethod
+    def _invalidate_category_cache_if_new(category: str) -> None:
+        """Drop the cached category listing when `category` isn't in it.
+
+        A first-ever write of a category would otherwise stay invisible to
+        ``list_categories`` (and so to ``GET /api/v1/snapshots/categories``)
+        for up to the cache TTL. Writes of an already-known category leave the
+        cache alone, so the steady state still serves from cache.
+        """
+        cached = _category_cache.get(_CATEGORY_CACHE_KEY)
+        if cached is None:
+            return
+        if not any(entry.get("category") == category for entry in cached):
+            _category_cache.clear()
 
     def _prune_category(self, category: str, keep_n: int) -> None:
         """Delete all but the `keep_n` most recent snapshots for a category.
@@ -378,6 +449,57 @@ class AnalyticalSnapshotStore:
     # ------------------------------------------------------------------
     # Read / compare
     # ------------------------------------------------------------------
+
+    def list_categories(self, use_cache: bool = True) -> list[dict[str, Any]]:
+        """Return every category actually present in ``analytical_snapshots``.
+
+        Derived from the table, never from a maintained literal — see the
+        "Category discovery" note above for why a literal cannot work. Result
+        is cached process-wide for ``_CATEGORY_CACHE_TTL`` seconds.
+
+        Parameters:
+            use_cache: When False, always query the database (and refresh the
+                cache with the result).
+
+        Returns:
+            list[dict]: One entry per category, ordered by category name, with
+                ``category``, ``snapshot_count``, and ``latest_snapshot_date``
+                (ISO date string, or None if the category has no dated rows).
+                Empty list if the table is unreachable or absent.
+        """
+        if use_cache:
+            cached = _category_cache.get(_CATEGORY_CACHE_KEY)
+            if cached is not None:
+                return cached
+
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(
+                    text(
+                        "SELECT category, COUNT(*) AS snapshot_count, "
+                        "       MAX(snapshot_date) AS latest_snapshot_date "
+                        "FROM analytical_snapshots "
+                        "GROUP BY category "
+                        "ORDER BY category"
+                    )
+                ).fetchall()
+        except Exception as exc:
+            # Operational, not an application bug: the table is absent on a
+            # fresh install and the database is briefly unreachable during a
+            # restart. Warning, so errors.jsonl stays signal-rich (CLAUDE.md).
+            log.warning("Could not list snapshot categories: {e}", e=str(exc))
+            return []
+
+        categories = [
+            {
+                "category": r[0],
+                "snapshot_count": int(r[1]),
+                "latest_snapshot_date": r[2].isoformat() if r[2] else None,
+            }
+            for r in rows
+        ]
+        _category_cache.set(_CATEGORY_CACHE_KEY, categories)
+        return categories
 
     def get_latest(
         self,
