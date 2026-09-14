@@ -82,56 +82,121 @@ def _mock_engine(
     fallback_result.fetchone.return_value = None
     fallback_conn.execute.return_value = fallback_result
 
-    connect_contexts = [_make_ctx(fam_conn)]
-    for _ in range(5):
-        connect_contexts.append(_make_ctx(fallback_conn))
-    engine.connect.side_effect = connect_contexts
+    def _connect_execute(statement, params=None):
+        # Same reasoning as engine.begin below: dispatch on the statement
+        # rather than on call order, so the fixture cannot run dry when the
+        # resolver's call pattern changes.
+        return fam_result if "feature_registry" in str(statement) else fallback_result
 
-    # ── engine.begin() chain — series fetch, workers, then writes ──
-    # 1. Distinct series_ids
-    series_conn = MagicMock()
+    connect_conn = MagicMock()
+    connect_conn.execute.side_effect = _connect_execute
+    engine.connect.side_effect = lambda: _make_ctx(connect_conn)
+
+    # ── engine.begin() — dispatched on the statement, not on call order ──
+    # This used to be a positional side_effect list: first begin() was the
+    # series fetch, then one per series_id, then the writes. That coupled the
+    # fixture to how many times the resolver happens to call begin(), and the
+    # distinct-series scan now runs as one transaction per time slice (see
+    # normalization.resolver.DISTINCT_SCAN_SLICE_HOURS), so the list ran dry
+    # and 32 tests died on StopIteration.
+    #
+    # Dispatching on the SQL is what _RecordingEngine further down this file
+    # already does, and it is what the real engine does in effect: the same
+    # connection answers whatever it is asked. No test here is *about* begin()
+    # ordering, so nothing is weakened by removing the coupling.
     series_result = MagicMock()
     series_result.fetchall.return_value = [(sid,) for sid in series_ids]
-    series_conn.execute.return_value = series_result
 
-    # 2. One worker_conn per series_id, returning its raw_series rows
-    worker_contexts = []
-    for sid in series_ids:
-        worker_conn = MagicMock()
-        # Inside the worker begin() context the resolver runs:
-        #   conn.execute(SET LOCAL statement_timeout)  → result ignored
-        #   conn.execute(SELECT raw_series ...).fetchall() → rows
-        # MagicMock().execute(...) returns a MagicMock with fetchall(),
-        # but we need fetchall() to return our rows for the SECOND call,
-        # not the first. Use a side_effect that always returns the same
-        # rows-bearing result — SET LOCAL ignores it, the SELECT consumes
-        # it. Both shapes are compatible.
-        worker_result = MagicMock()
-        worker_result.fetchall.return_value = [
-            r for r in rows if (isinstance(r, (tuple, FakeRow)) and r[0] == sid)
-        ]
-        worker_conn.execute.return_value = worker_result
-        worker_contexts.append(_make_ctx(worker_conn))
-
-    # 3. Write phase — _flush_batch INSERTs. Tests inspect this conn.
+    # Write phase — _flush_batch INSERTs. Tests inspect this conn, so the
+    # INSERTs must land on it and its side_effect list must not be consumed
+    # by anything else.
     write_conn = MagicMock()
     existing_result = MagicMock()
     existing_result.fetchone.return_value = (1,) if already_resolved else None
     insert_result = MagicMock()
-    n = max(len(rows), 1)
-    write_conn.execute.side_effect = [
-        val for _ in range(n) for val in (existing_result, insert_result)
-    ]
 
-    # Plus a few spare write contexts so multi-partition / multi-batch
-    # tests don't run out of begin() returns.
-    begin_contexts = [_make_ctx(series_conn)] + worker_contexts
-    begin_contexts.append(_make_ctx(write_conn))
-    for _ in range(5):
-        begin_contexts.append(_make_ctx(write_conn))
-    engine.begin.side_effect = begin_contexts
+    def _write_execute(statement, params=None):
+        # Dispatched rather than a fixed [existing, insert] * n list: that
+        # list was sized for a shape _flush_batch no longer has (it issues a
+        # single executemany INSERT per flush), so it ran dry as soon as the
+        # call pattern shifted. Keyed on the statement, it cannot.
+        return insert_result if "INSERT" in str(statement).upper() else existing_result
+
+    write_conn.execute.side_effect = _write_execute
+
+    def _begin_execute(statement, params=None):
+        sql = str(statement)
+        # SET LOCAL statement_timeout: result ignored, and it must not eat a
+        # write_conn side_effect entry. One per transaction, so one per slice.
+        if "set_config" in sql:
+            return MagicMock()
+        if "SELECT DISTINCT" in sql:
+            return series_result
+        if "FROM raw_series rs" in sql:
+            # The worker row fetch, bounded by the partition's series_ids.
+            sids = set(params.get("sids", [])) if isinstance(params, dict) else set()
+            result = MagicMock()
+            result.fetchall.return_value = [
+                r for r in rows
+                if isinstance(r, (tuple, FakeRow)) and r[0] in sids
+            ]
+            return result
+        if "feature_registry" in sql:
+            return fam_result
+        return write_conn.execute(statement, params)
+
+    begin_conn = MagicMock()
+    begin_conn.execute.side_effect = _begin_execute
+    engine.begin.side_effect = lambda: _make_ctx(begin_conn)
 
     return engine, write_conn
+
+
+def _reusable_ctx(conn):
+    """A context manager double that can be entered any number of times."""
+    ctx = MagicMock()
+    ctx.__enter__ = MagicMock(return_value=conn)
+    ctx.__exit__ = MagicMock(return_value=False)
+    return ctx
+
+
+def _dispatch_begin(engine, series_result, worker_rows, write_conn):
+    """Route engine.begin() by statement rather than by call order.
+
+    The per-test fixtures below each set
+    ``engine.begin.side_effect = [series_ctx, worker_ctx, write_ctx]``, which
+    assumes the resolver calls begin() exactly three times in that order. The
+    distinct-series scan now runs one transaction per time slice (see
+    normalization.resolver.DISTINCT_SCAN_SLICE_HOURS), so that list runs dry.
+
+    None of these tests is *about* how many times begin() is called — they
+    assert on resolved/conflict counts — so keying on the SQL removes an
+    incidental coupling without weakening anything.
+    """
+    def _execute(statement, params=None):
+        sql = str(statement)
+        if "set_config" in sql:            # SET LOCAL statement_timeout
+            return MagicMock()
+        if "SELECT DISTINCT" in sql:
+            return series_result
+        if "FROM raw_series rs" in sql:
+            # Bounded by the partition's series_ids, as the real query is.
+            # Returning every row to every partition double-counts once the
+            # resolver splits into more than one.
+            sids = set(params.get("sids", [])) if isinstance(params, dict) else set()
+            result = MagicMock()
+            result.fetchall.return_value = [
+                r for r in worker_rows
+                if not sids or (r[0] in sids)
+            ]
+            return result
+        return write_conn.execute(statement, params)
+
+    conn = MagicMock()
+    conn.execute.side_effect = _execute
+    ctx = _reusable_ctx(conn)
+    engine.begin.side_effect = lambda: ctx
+    return conn
 
 
 # ---------------------------------------------------------------------------
@@ -659,28 +724,16 @@ class TestSkipAndErrorUnit:
         # swallow it and fall through to default thresholds.
         bad_conn = MagicMock()
         bad_conn.execute.side_effect = Exception("family table missing")
-        engine.connect.side_effect = [_ctx(bad_conn)]
+        engine.connect.side_effect = lambda: _ctx(bad_conn)
 
-        # engine.begin chain: series-distinct → worker-fetch → write.
-        series_conn = MagicMock()
+        # engine.begin: dispatched on the statement, not on call order.
         series_res = MagicMock()
         series_res.fetchall.return_value = [("X",)]
-        series_conn.execute.return_value = series_res
-
-        worker_conn = MagicMock()
-        worker_res = MagicMock()
-        worker_res.fetchall.return_value = pending
-        worker_conn.execute.return_value = worker_res
 
         write_conn = MagicMock()
-        ins_res = MagicMock()
-        write_conn.execute.return_value = ins_res
+        write_conn.execute.return_value = MagicMock()
 
-        engine.begin.side_effect = [
-            _ctx(series_conn),
-            _ctx(worker_conn),
-            _ctx(write_conn),
-        ]
+        _dispatch_begin(engine, series_res, pending, write_conn)
 
         resolver = Resolver(db_engine=engine)
         summary = resolver.resolve_pending()
@@ -797,30 +850,21 @@ class TestPriorityUnit:
         fam_res = MagicMock()
         fam_res.fetchall.return_value = [(62, "")]
         fam_conn.execute.return_value = fam_res
-        engine.connect.side_effect = [_ctx(fam_conn)]
+        engine.connect.side_effect = lambda: _ctx(fam_conn)
 
-        # engine.begin chain: series-distinct → worker-fetch → write.
-        series_conn = MagicMock()
         series_res = MagicMock()
         series_res.fetchall.return_value = [("T10Y2Y",)]
-        series_conn.execute.return_value = series_res
-
-        worker_conn = MagicMock()
-        worker_res = MagicMock()
-        worker_res.fetchall.return_value = pending
-        worker_conn.execute.return_value = worker_res
 
         write_conn = MagicMock()
         existing = MagicMock()
         existing.fetchone.return_value = None
         ins = MagicMock()
-        write_conn.execute.side_effect = [existing, ins, existing, ins, existing, ins]
+        write_conn.execute.side_effect = (
+            lambda statement, params=None:
+                ins if "INSERT" in str(statement).upper() else existing
+        )
 
-        engine.begin.side_effect = [
-            _ctx(series_conn),
-            _ctx(worker_conn),
-            _ctx(write_conn),
-        ]
+        _dispatch_begin(engine, series_res, pending, write_conn)
 
         resolver = Resolver(db_engine=engine)
         summary = resolver.resolve_pending()
@@ -869,33 +913,19 @@ class TestDateFilteringUnit:
         # → write_conn. With 2 distinct series IDs and the default 8-worker
         # partition split, only one partition actually gets work; we still
         # provide enough worker contexts to be safe.
-        series_conn = MagicMock()
         series_res = MagicMock()
         series_res.fetchall.return_value = [("AAA",), ("BBB",)]
-        series_conn.execute.return_value = series_res
-
-        def _make_worker_conn(rows):
-            wc = MagicMock()
-            wr = MagicMock()
-            wr.fetchall.return_value = rows
-            wc.execute.return_value = wr
-            return wc
-
-        worker_conn = _make_worker_conn(pending)
 
         write_conn = MagicMock()
         existing = MagicMock()
         existing.fetchone.return_value = None
         ins = MagicMock()
-        write_conn.execute.side_effect = [existing, ins, existing, ins]
+        write_conn.execute.side_effect = (
+            lambda statement, params=None:
+                ins if "INSERT" in str(statement).upper() else existing
+        )
 
-        engine.begin.side_effect = [
-            _ctx(series_conn),
-            _ctx(worker_conn),
-            _ctx(worker_conn),
-            _ctx(write_conn),
-            _ctx(write_conn),
-        ]
+        _dispatch_begin(engine, series_res, pending, write_conn)
 
         resolver = Resolver(db_engine=engine)
         summary = resolver.resolve_pending()
@@ -1207,6 +1237,31 @@ class _RecordingEngine:
             if isinstance(p, dict) and "pull_timestamp >= :since" in sql
         ]
 
+    def distinct_windows(self) -> list[dict]:
+        """Params of the distinct-series scan, one entry per time slice.
+
+        That scan is sliced (normalization.resolver.DISTINCT_SCAN_SLICE_HOURS)
+        so it stops holding one long-lived transaction, so these carry slice
+        bounds rather than the caller's window: the first begins at the
+        caller's `since` and the last carries the caller's `until`.
+        """
+        return [
+            p for sql, p in self.calls
+            if isinstance(p, dict) and "SELECT DISTINCT" in sql
+        ]
+
+    def fetch_windows(self) -> list[dict]:
+        """Params of the per-partition row fetch, which is not sliced.
+
+        These still carry the caller's window exactly.
+        """
+        return [
+            p for sql, p in self.calls
+            if isinstance(p, dict)
+            and "pull_timestamp >= :since" in sql
+            and "SELECT DISTINCT" not in sql
+        ]
+
 
 def _patched_entity_map(monkeypatch, feature_id: int | None = 1):
     """Point the resolver's EntityMap at a stub mapping every series.
@@ -1255,8 +1310,11 @@ class TestResolutionWindow:
         for params in windows:
             assert "lookback" not in params
             assert isinstance(params["since"], datetime)
-            age = datetime.now(timezone.utc) - params["since"]
-            assert timedelta(days=2) <= age < timedelta(days=2, minutes=5)
+        # The window opens where the lookback says. Only the earliest bound
+        # carries that instant: the distinct scan is sliced, so later slices
+        # start later by construction.
+        age = datetime.now(timezone.utc) - min(p["since"] for p in windows)
+        assert timedelta(days=2) <= age < timedelta(days=2, minutes=5)
         for sql, _ in engine.calls:
             assert "INTERVAL '2 day" not in sql
             assert "INTERVAL '1 day'" not in sql
@@ -1271,10 +1329,15 @@ class TestResolutionWindow:
             lookback_days=2, workers=1, since=watermark,
         )
 
-        windows = engine.window_params()
-        assert windows
-        for params in windows:
+        assert engine.distinct_windows()[0]["since"] == watermark, (
+            "the first slice must open at the watermark"
+        )
+        fetches = engine.fetch_windows()
+        assert fetches
+        for params in fetches:
             assert params["since"] == watermark
+        # Nothing may reach back before it.
+        assert all(p["since"] >= watermark for p in engine.window_params())
 
     def test_until_bounds_the_window(self, monkeypatch):
         """`until` is bound as an exclusive upper bound for chunked backfills."""
@@ -1286,9 +1349,14 @@ class TestResolutionWindow:
             workers=1, since=start, until=end,
         )
 
-        windows = engine.window_params()
-        assert windows
-        for params in windows:
+        slices = engine.distinct_windows()
+        assert slices
+        assert slices[0]["since"] == start, "first slice opens at `since`"
+        assert slices[-1]["until"] == end, "last slice closes at `until`"
+        assert all(start <= p["since"] < end for p in slices)
+        fetches = engine.fetch_windows()
+        assert fetches
+        for params in fetches:
             assert params["since"] == start
             assert params["until"] == end
 
@@ -1848,8 +1916,14 @@ class TestWindowBoundsAreIndexable:
                 "the default window must be anchored to an absolute instant, "
                 "the way the server-side NOW() it replaced was"
             )
-            assert params["until"] is None
             assert "lookback" not in params
+        # An unbounded window must stay unbounded at its far end. The distinct
+        # scan is sliced, so intermediate slices carry a concrete upper bound;
+        # the last one must still be open, or rows written during the scan
+        # would start being dropped.
+        assert engine.distinct_windows()[-1]["until"] is None
+        for params in engine.fetch_windows():
+            assert params["until"] is None
 
     def test_caller_supplied_bounds_are_passed_through_untouched(self, monkeypatch):
         """A backfill chunk's own bounds must not be rewritten under it."""
@@ -1860,9 +1934,13 @@ class TestWindowBoundsAreIndexable:
             lookback_days=30, workers=1, since=since, until=until
         )
 
-        scans = self._scans(engine)
-        assert scans
-        for _sql, params in scans:
+        slices = engine.distinct_windows()
+        assert slices
+        assert slices[0]["since"] == since, "not rewritten under the caller"
+        assert slices[-1]["until"] == until
+        fetches = engine.fetch_windows()
+        assert fetches
+        for params in fetches:
             assert params["since"] == since
             assert params["until"] == until
 

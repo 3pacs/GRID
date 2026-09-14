@@ -41,6 +41,28 @@ DEFAULT_BACKFILL_CHUNK_DAYS: int = 1
 # (2026-04-05 was the first) still exceed the 600s statement timeout.
 MIN_BACKFILL_CHUNK_SECONDS: int = 3600  # one hour
 
+# Width of one slice of the distinct-series_id scan. This bounds how long a
+# single transaction lives; it is not a throughput knob, and the total work is
+# unchanged.
+#
+# Measured on griddb 2026-09-14 (raw_series: 511 GB, 1.93e9 rows, ten indexes
+# totalling ~344 GB). Sampling pg_stat_activity every 20s caught the rolling
+# 2-day scan mid-flight at 371s, 391s and 411s, waiting on IO:DataFileRead
+# throughout. Re-running the identical 2-day window ~2 minutes later took
+# 33.9s — the same pages, now cached. So the cost is cold heap reads: ~400s
+# cold against ~34s warm, for 246,093 rows yielding 9,636 distinct series.
+#
+# Why that matters beyond latency: while one statement runs, its backend holds
+# an xmin, and CREATE/DROP INDEX CONCURRENTLY wait for every transaction older
+# than themselves. A 400s scan is a 400s window in which no concurrent DDL on
+# any table in this database can finish — which is what defeated the
+# analytical_snapshots index work on 2026-09-13 (DROP INDEX CONCURRENTLY timed
+# out at 719s and 360s).
+#
+# 4 hours puts a cold slice near 30s at the rate above, so a 2-day window
+# becomes 12 statements of ~30s rather than one of ~400s.
+DISTINCT_SCAN_SLICE_HOURS: int = 4
+
 
 def _is_statement_timeout(exc: BaseException) -> bool:
     """True when a failure is the statement timeout that narrowing can fix.
@@ -190,6 +212,102 @@ class Resolver:
             {"timeout_ms": str(self._RESOLVE_STATEMENT_TIMEOUT_MS)},
         )
 
+    _DISTINCT_SERIES_SQL = """
+        SELECT DISTINCT rs.series_id
+        FROM raw_series rs
+        WHERE rs.pull_status = 'SUCCESS'
+          AND rs.pull_timestamp >= :since
+          AND rs.pull_timestamp < COALESCE(
+                :until, 'infinity'::timestamptz)
+    """
+
+    @staticmethod
+    def _scan_slices(
+        since: datetime,
+        until: datetime | None,
+        width: timedelta,
+    ) -> list[tuple[datetime, datetime | None]]:
+        """Split ``[since, until)`` into contiguous half-open slices.
+
+        The last slice carries the caller's ``until`` verbatim — ``None``
+        included — so an unbounded window stays unbounded. That preserves a
+        real property of the single-statement version: with no upper bound,
+        rows written *while* the scan runs are still seen. Capping the final
+        slice at "now" instead would quietly start dropping them.
+
+        Falls back to one unsliced pass when the bounds cannot be compared —
+        an operator's naive ``--since`` against an aware ``until`` raises
+        TypeError, and that combination was already broken in the SQL, so
+        this is not the place to start failing on it.
+        """
+        if until is None:
+            # Unbounded: slice forward from `since` up to now, then let the
+            # final slice run to infinity as before.
+            try:
+                horizon = datetime.now(since.tzinfo)
+            except Exception:  # pragma: no cover - defensive
+                return [(since, None)]
+        else:
+            horizon = until
+
+        try:
+            if horizon <= since:
+                return [(since, until)]
+        except TypeError:
+            return [(since, until)]
+
+        slices: list[tuple[datetime, datetime | None]] = []
+        start = since
+        while start < horizon:
+            end = start + width
+            if end >= horizon:
+                break
+            slices.append((start, end))
+            start = end
+        slices.append((start, until))
+        return slices
+
+    def _distinct_series_ids(self, window_params: dict[str, Any]) -> list[str]:
+        """The series_ids with data in the window, read in bounded slices.
+
+        One statement over the whole window holds an xmin for its entire
+        duration — measured at ~400s cold on the rolling 2-day window — and
+        `CREATE`/`DROP INDEX CONCURRENTLY` anywhere in the database wait for
+        every transaction older than themselves. See
+        ``DISTINCT_SCAN_SLICE_HOURS``.
+
+        The union of ``DISTINCT`` over contiguous slices is exactly
+        ``DISTINCT`` over their union, so the result is unchanged; only the
+        transaction lifetime is.
+        """
+        since = window_params["since"]
+        until = window_params.get("until")
+        slices = self._scan_slices(
+            since, until, timedelta(hours=DISTINCT_SCAN_SLICE_HOURS)
+        )
+
+        found: set[str] = set()
+        for index, (slice_since, slice_until) in enumerate(slices, start=1):
+            # A transaction per slice, so SET LOCAL applies and each one ends
+            # promptly. db.py's global 120s cap is far too short for even one
+            # slice of this scan.
+            with self.engine.begin() as conn:
+                self._set_statement_timeout(conn)
+                rows = conn.execute(
+                    text(self._DISTINCT_SERIES_SQL),
+                    {"since": slice_since, "until": slice_until},
+                ).fetchall()
+            found.update(r[0] for r in rows)
+            if len(slices) > 1:
+                log.debug(
+                    "series_id scan slice {i}/{n} ({a} → {b}): {r} rows, "
+                    "{t} distinct so far",
+                    i=index, n=len(slices), a=slice_since,
+                    b=slice_until if slice_until is not None else "∞",
+                    r=len(rows), t=len(found),
+                )
+        return sorted(found)
+
     def resolve_pending(
         self,
         lookback_days: int = DEFAULT_LOOKBACK_DAYS,
@@ -285,22 +403,8 @@ class Resolver:
         except Exception as exc:
             log.warning("Could not load feature families: {e}", e=str(exc))
 
-        # Fetch distinct series_ids with recent data. Wrap in a transaction
-        # so SET LOCAL applies; the global 120s timeout is too short for
-        # this DISTINCT scan once raw_series grows past a few million rows.
         log.info("Fetching distinct series_ids...")
-        with self.engine.begin() as conn:
-            self._set_statement_timeout(conn)
-            series_rows = conn.execute(text("""
-                SELECT DISTINCT rs.series_id
-                FROM raw_series rs
-                WHERE rs.pull_status = 'SUCCESS'
-                  AND rs.pull_timestamp >= :since
-                  AND rs.pull_timestamp < COALESCE(
-                        :until, 'infinity'::timestamptz)
-            """), window_params).fetchall()
-
-        all_series = [r[0] for r in series_rows]
+        all_series = self._distinct_series_ids(window_params)
         log.info("Found {n} distinct series_ids to resolve", n=len(all_series))
 
         if not all_series:
