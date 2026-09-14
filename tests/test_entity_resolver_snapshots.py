@@ -15,10 +15,11 @@ snapshots"). Actor resolution skipped the entire 556k-row snapshot corpus and
 
 Two things are pinned here:
 
-* the SQL runs against the canonical columns and extracts the descriptive
-  fields from the jsonb ``payload`` — exercised by *executing* it, not by
-  pattern-matching the string, so a reference to a column the table lacks
-  fails the test the way it fails production; and
+* the SQL runs against the canonical columns — the actor from the real
+  ``actor_name`` column (migration ``snapshot_actor_col_20260914``), title
+  and source id still extracted from the jsonb ``payload`` — exercised by
+  *executing* it, not by pattern-matching the string, so a reference to a
+  column the table lacks fails the test the way it fails production; and
 * a query naming a missing column is logged at ``log.error``. CLAUDE.md
   reserves that level for unhandled application bugs, and SQL that cannot
   succeed on any retry is one. Downgrading it to a warning is what hid this
@@ -172,9 +173,14 @@ UNNAMED_SPEECH = {
     "source_id": "fed_speeches",
 }
 
-# A congressional_trade row in the shape griddb actually holds: the raw Senate
-# EFD record, written before #477 fixed parse_datasets, with the actor under
-# `senator` and the name repeated in subcategory. 5,000 of these are live.
+# A congressional_trade row in the shape written before #477 fixed
+# parse_datasets, with the actor under the retired `senator` payload key and
+# the name repeated in subcategory. Confirmed 0 rows carry `senator` on
+# griddb as of 2026-09-14 (`snapshot_actor_col_20260914`'s docstring) — this
+# shape is fully retired, not merely rare, and `actor_name` is never
+# backfilled for it. Kept as a fixture to pin that this row is *not* found
+# (see test_retired_senator_shape_no_longer_resolves below), not because any
+# live row still looks like this.
 LEGACY_SENATE_ROW = {
     "snapshot_date": date(2021, 2, 16),
     "category": "congressional_trade",
@@ -238,12 +244,16 @@ def snapshot_engine():
                 text(
                     "INSERT INTO analytical_snapshots "
                     "(snapshot_date, category, subcategory, as_of_date, "
-                    " payload, created_at) "
+                    " payload, actor_name, created_at) "
                     "VALUES (:snapshot_date, :category, :subcategory, "
-                    "        :as_of_date, :payload, :created_at)"
+                    "        :as_of_date, :payload, :actor_name, :created_at)"
                 ),
                 row,
             )
+        # These three bypass _snapshot_row and never set actor_name — exactly
+        # how a row that predates the backfill, or was never written by
+        # parse_datasets, looks: NULL until (and unless) something backfills
+        # or rewrites it.
         for raw in (CLUSTERING_SNAPSHOT, LEGACY_SENATE_ROW, OPENSANCTIONS_ROW):
             conn.execute(
                 text(
@@ -319,17 +329,18 @@ def test_search_sql_executes_against_the_canonical_table(snapshot_engine):
 
 @pytest.mark.unit
 def test_name_scan_sql_executes_against_the_canonical_table(snapshot_engine):
-    """The index-build scan must run, and must find the payload actors."""
+    """The index-build scan must run, and must find every backfilled actor_name."""
     with snapshot_engine.connect() as conn:
         names = {row[0] for row in conn.execute(text(SNAPSHOT_NAME_SCAN_SQL))}
     assert names == {
-        "David A Perdue , Jr",      # payload ->> 'actor', post-#477 writer
+        "David A Perdue , Jr",
         "Thomas R Carper",
         "Jerome H Powell",
-        "Thomas H Tuberville",      # payload ->> 'senator', the live shape
     }
     # The OpenSanctions `name` key is deliberately not an actor source.
     assert "Perdue, David Alfred" not in names
+    # The retired `senator`-only payload shape never gets an actor_name.
+    assert "Thomas H Tuberville" not in names
 
 
 @pytest.mark.unit
@@ -353,13 +364,34 @@ def test_statements_reference_no_phantom_column(sql):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("sql", [SNAPSHOT_SEARCH_SQL, SNAPSHOT_NAME_SCAN_SQL])
-def test_statements_read_the_payload(sql):
-    """Positive counterpart: the actor must come from the jsonb payload."""
-    assert "payload ->> 'actor'" in sql
+def test_statements_read_actor_name_the_column_not_the_payload(sql):
+    """The actor comes from the real column now, not a jsonb extraction.
+
+    Positive counterpart to ``test_statements_reference_no_phantom_column``:
+    pins the actual fix (snapshot_actor_col_20260914), not just the absence
+    of the old bug.
+    """
+    assert "actor_name" in sql
+    assert "payload ->> 'actor'" not in sql
+    assert "payload ->> 'senator'" not in sql
+
+
+@pytest.mark.unit
+def test_search_sql_still_reads_title_and_source_from_the_payload():
+    """Only the actor was promoted to a column; title/source_id still aren't."""
+    assert "payload ->> 'title'" in SNAPSHOT_SEARCH_SQL
+    assert "payload ->> 'source_id'" in SNAPSHOT_SEARCH_SQL
 
 
 def _load_index_migration() -> ModuleType:
-    """Load the actor-index revision by path (migrations/ is not a package)."""
+    """Load the (now-superseded) jsonb-expression index revision by path.
+
+    Still exercised below for the parts of its own behaviour that remain
+    true regardless of what superseded it (it must never have reached for
+    CONCURRENTLY) — migrations that already shipped are not edited after the
+    fact, so this file's own mechanics are frozen history, not something this
+    PR changes.
+    """
     import importlib
 
     # Drop any stale bytecode first so an edit within the filesystem's mtime
@@ -376,22 +408,41 @@ def _load_index_migration() -> ModuleType:
     return migration
 
 
+def _load_actor_column_migration() -> ModuleType:
+    """Load the revision that supersedes it: the plain actor_name column."""
+    import importlib
+
+    importlib.invalidate_caches()
+    spec = importlib.util.spec_from_file_location(
+        "snapshot_actor_col",
+        REPO_ROOT / "migrations" / "versions"
+        / "snapshot_actor_col_20260914.py",
+    )
+    assert spec and spec.loader
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    return migration
+
+
 @pytest.mark.unit
 def test_partial_index_predicate_matches_the_queries():
     """The migration's index and the queries must agree, or the index is dead.
 
-    ``idx_analytical_snapshots_payload_actor`` (and its trigram twin) are
-    *partial*: PostgreSQL will only use them when the index predicate implies
-    the query's. If either side's actor expression is edited alone, the
-    planner silently reverts to the sequential scan the migration measured at
-    121,197 — no error, just a resolver that got 36x slower.
+    Re-pointed at ``snapshot_actor_col_20260914``, which supersedes
+    ``snapshot_actor_index_20260912`` the same way that revision superseded
+    its own predecessor: ``idx_analytical_snapshots_actor_name`` (and its
+    trigram twin) are still *partial* — PostgreSQL only uses a partial index
+    when its predicate implies the query's — but the predicate is now a
+    plain-column NULL/empty check, not a jsonb expression, so there is no
+    expression text to keep byte-for-byte in step. The risk this guards
+    against is unchanged: if either side's predicate is edited alone, the
+    planner silently reverts to a sequential scan.
     """
-    migration = _load_index_migration()
+    migration = _load_actor_column_migration()
 
-    # Both statements must filter on exactly the expression the index keys.
     for sql in (SNAPSHOT_SEARCH_SQL, SNAPSHOT_NAME_SCAN_SQL):
-        assert migration.ACTOR_EXPR in " ".join(sql.split()), (
-            f"index keys {migration.ACTOR_EXPR!r}, which does not appear in:"
+        assert migration.PREDICATE in " ".join(sql.split()), (
+            f"index keys {migration.PREDICATE!r}, which does not appear in:"
             f"\n{sql}"
         )
 
@@ -591,6 +642,243 @@ def test_search_sql_binds_every_value():
 
 
 # ---------------------------------------------------------------------------
+# snapshot_actor_col_20260914 — the plain-column migration that supersedes
+# snapshot_actor_index_20260912's jsonb-expression indexes.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_new_index_build_is_not_concurrent():
+    """CONCURRENTLY cannot run here at all: migrations/env.py wraps every
+    revision in one transaction, and CREATE INDEX CONCURRENTLY errors
+    immediately inside a transaction block, on any table size."""
+    migration = _load_actor_column_migration()
+    for stmt in (migration._CREATE_BTREE, migration._CREATE_TRGM):
+        assert "CONCURRENTLY" not in stmt.upper()
+
+
+@pytest.mark.unit
+def test_new_indexes_are_partial_on_the_same_predicate_as_each_other():
+    """Both new indexes must share PREDICATE, or one indexes rows the other
+    doesn't and a query result could differ depending which plan Postgres
+    picks."""
+    migration = _load_actor_column_migration()
+    for stmt in (migration._CREATE_BTREE, migration._CREATE_TRGM):
+        normalized = " ".join(stmt.split())
+        assert f"WHERE {migration.PREDICATE}" in normalized
+
+
+@pytest.mark.unit
+def test_new_build_timeouts_are_bounded():
+    """Same guard as the predecessor migration's, applied to this one:
+    neither timer may be unbounded, and both must be generous relative to the
+    ~5s this revision's whole operation was measured at against griddb."""
+    migration = _load_actor_column_migration()
+    for label, value, lo, hi in (
+        ("statement", migration.BUILD_STATEMENT_TIMEOUT, 30, 3600),
+        ("lock", migration.BUILD_LOCK_TIMEOUT, 1, 300),
+    ):
+        assert value.endswith("s"), f"{label}: expected a unit, got {value!r}"
+        seconds = int(value[:-1])
+        assert lo <= seconds <= hi, (
+            f"{label}_timeout {value!r} is outside a sane range ({lo}-{hi}s)"
+        )
+
+
+@pytest.mark.unit
+def test_chunk_ranges_cover_the_id_span_with_no_gap_or_overlap():
+    """The backfill's own chunk boundaries, tested as a pure function.
+
+    No database needed: this is the one piece of upgrade()'s logic that is
+    meaningful to test without a live Postgres connection, and a gap would
+    silently skip backfilling some rows while an overlap would just do
+    redundant (harmless but wasteful) work -- worth pinning either way.
+    """
+    migration = _load_actor_column_migration()
+
+    chunks = list(migration._chunk_ranges(1, 123_456, 50_000))
+    assert chunks[0][0] == 1
+    assert chunks[-1][1] == 123_456
+    for (_, prev_end), (next_start, _) in zip(chunks, chunks[1:]):
+        assert next_start == prev_end + 1, "gap or overlap between chunks"
+    for lo, hi in chunks:
+        assert hi - lo + 1 <= 50_000
+
+
+@pytest.mark.unit
+def test_chunk_ranges_handles_a_span_smaller_than_one_chunk():
+    migration = _load_actor_column_migration()
+    assert list(migration._chunk_ranges(5, 5, 50_000)) == [(5, 5)]
+
+
+@pytest.mark.unit
+def test_new_migration_drops_both_legacy_indexes_unconditionally():
+    """The two jsonb-expression indexes are superseded on every database, not
+    only when they happen to be INVALID -- see the module docstring's "The
+    two leftover indexes" section for why a fresh database's (valid) copies
+    must be dropped too, unlike the predecessor migration's own
+    indisvalid-gated cleanup (test_leftovers_are_found_by_indisvalid_not_by_name).
+
+    Driven against the real upgrade() with a double that never reports
+    anything as INVALID (it doesn't implement `indisvalid` lookups at all) --
+    if dropping the legacy indexes required that check, this would fail with
+    an AttributeError instead of the DROP statements simply running.
+    """
+    migration = _load_actor_column_migration()
+    executed: list[str] = []
+
+    class _RecordingOp:
+        @staticmethod
+        def get_bind():
+            return stub_conn
+
+        @staticmethod
+        def execute(statement):
+            executed.append(" ".join(str(statement).split()))
+
+    class _StubConn:
+        def execute(self, statement, params=None):
+            stmt = " ".join(str(statement).split())
+            if "to_regclass" in stmt:
+                return _Scalar(True)
+            if "min(id), max(id)" in stmt:
+                return _Scalar(None)  # empty table: skip straight to indexing
+            if "pg_extension" in stmt:
+                return _Scalar(1)
+            executed.append(stmt)
+            return None
+
+    class _Scalar:
+        def __init__(self, value):
+            self._value = value
+
+        def scalar(self):
+            return self._value
+
+        def fetchone(self):
+            return (self._value,) if self._value is not None else None
+
+    stub_conn = _StubConn()
+    original_op = migration.op
+    migration.op = _RecordingOp
+    try:
+        migration.upgrade()
+    finally:
+        migration.op = original_op
+
+    joined = "\n".join(executed)
+    for name in (migration.LEGACY_BTREE_INDEX, migration.LEGACY_TRGM_INDEX):
+        assert f'DROP INDEX IF EXISTS "{name}"' in joined, (
+            f"{name} was not dropped unconditionally:\n{joined}"
+        )
+
+
+@pytest.mark.unit
+def test_new_migration_runs_no_ddl_when_the_table_does_not_exist():
+    """Same fresh-database guard as the predecessor migration: no migration
+    creates analytical_snapshots, so a genuinely fresh database can reach
+    this revision before store/snapshots.py has created it."""
+    migration = _load_actor_column_migration()
+    executed: list[str] = []
+
+    class _RecordingOp:
+        @staticmethod
+        def get_bind():
+            return _StubConn()
+
+        @staticmethod
+        def execute(statement):
+            executed.append(str(statement))
+
+    class _StubConn:
+        def execute(self, statement, params=None):
+            stmt = " ".join(str(statement).split())
+            assert "to_regclass" in stmt, f"nothing should run before the table check: {stmt}"
+            return _NullResult()
+
+    class _NullResult:
+        def scalar(self):
+            return None
+
+    original_op = migration.op
+    migration.op = _RecordingOp
+    try:
+        migration.upgrade()
+    finally:
+        migration.op = original_op
+
+    assert executed == [], f"a missing table must produce no DDL; it ran: {executed}"
+
+
+@pytest.mark.unit
+def test_new_migration_upgrade_sequence_add_backfill_index_drop():
+    """Drives the real upgrade() end to end with a recording double, pinning
+    the order the module docstring promises: (a) add column, (b) backfill,
+    (c) build the two new indexes, (d) drop the two legacy ones."""
+    migration = _load_actor_column_migration()
+    executed: list[str] = []
+
+    class _RecordingOp:
+        @staticmethod
+        def get_bind():
+            return stub_conn
+
+        @staticmethod
+        def execute(statement):
+            executed.append(" ".join(str(statement).split()))
+
+    class _StubResult:
+        rowcount = 3
+
+    class _StubConn:
+        def execute(self, statement, params=None):
+            stmt = " ".join(str(statement).split())
+            if "to_regclass" in stmt:
+                return _Scalar(True)
+            if "min(id), max(id)" in stmt:
+                return _Row((1, 40_000))
+            if "pg_extension" in stmt:
+                return _Scalar(1)
+            executed.append(stmt)
+            return _StubResult()
+
+    class _Scalar:
+        def __init__(self, value):
+            self._value = value
+
+        def scalar(self):
+            return self._value
+
+    class _Row:
+        def __init__(self, row):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    stub_conn = _StubConn()
+    original_op = migration.op
+    migration.op = _RecordingOp
+    try:
+        migration.upgrade()
+    finally:
+        migration.op = original_op
+
+    def _first_index(marker):
+        for i, stmt in enumerate(executed):
+            if marker in stmt:
+                return i
+        raise AssertionError(f"{marker!r} never executed:\n" + "\n".join(executed))
+
+    add_col = _first_index("ADD COLUMN IF NOT EXISTS actor_name")
+    backfill = _first_index("UPDATE analytical_snapshots")
+    new_btree = _first_index(f"CREATE INDEX IF NOT EXISTS {migration.NEW_BTREE_INDEX}")
+    new_trgm = _first_index(f"CREATE INDEX IF NOT EXISTS {migration.NEW_TRGM_INDEX}")
+    drop_legacy = _first_index(f'DROP INDEX IF EXISTS "{migration.LEGACY_TRGM_INDEX}"')
+
+    assert add_col < backfill < new_btree < new_trgm < drop_legacy
+
+
+# ---------------------------------------------------------------------------
 # Payload extraction
 # ---------------------------------------------------------------------------
 
@@ -653,27 +941,22 @@ def test_name_scan_skips_an_empty_actor(snapshot_engine):
 
 
 @pytest.mark.unit
-def test_search_finds_the_legacy_senator_shape(resolver):
-    """The 5,000 live congressional rows keep the actor under `senator`.
+def test_retired_senator_shape_no_longer_resolves(resolver):
+    """The pre-#477 `senator`-key payload shape is a dead end now, on purpose.
 
-    Written before #477 fixed parse_datasets, so they never got
-    ``payload ->> 'actor'``. Reading only the canonical key would leave the
-    resolver blind to the whole congressional corpus on griddb today.
+    Before ``snapshot_actor_col_20260914``, ``COALESCE(payload ->> 'actor',
+    payload ->> 'senator')`` kept this shape resolvable — necessary at the
+    time because griddb held 5,000 live rows written before #477 fixed
+    ``parse_datasets``, all under the `senator` key. Confirmed on griddb
+    2026-09-14 (that migration's docstring): 0 rows carry `senator` any
+    longer. ``actor_name`` is only ever backfilled from `actor`, so a row
+    that never had that key gets no ``actor_name`` and this source silently
+    stops contributing it — the same "silently" that made the original bug
+    (#477/#479) costly, but this time deliberate and pinned by this test
+    rather than accidental and undiscovered, because the shape it drops is
+    confirmed to have zero live rows.
     """
-    hits = _search(resolver, "Thomas Tuberville")
-    assert [h["raw_name"] for h in hits] == ["Thomas H Tuberville"]
-
-
-@pytest.mark.unit
-def test_legacy_senator_row_still_resolves_its_domain(resolver):
-    """Its subcategory is the senator's name, not a source id.
-
-    ``_guess_domain_from_source_id`` also reads ``category``, which spells
-    ``congressional_trade``, so the domain is right regardless.
-    """
-    hit = _search(resolver, "Thomas Tuberville")[0]
-    assert hit["source"] == "congressional"
-    assert hit["category"] == "congressional_trade"
+    assert _search(resolver, "Thomas Tuberville") == []
 
 
 @pytest.mark.unit

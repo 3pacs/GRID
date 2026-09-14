@@ -1015,6 +1015,12 @@ class DatasetParser:
         descriptive is folded into the jsonb ``payload`` instead. Nothing is
         dropped; it just stops pretending to be columns.
 
+        ``actor_name`` is the one exception: it is a real column (migration
+        ``snapshot_actor_col_20260914``), written directly here from the same
+        ``entry.get("actor")`` value that also goes into ``payload`` — every
+        insert from this writer populates it going forward, so the one-time
+        migration backfill never has to run again for new rows.
+
         Parameters:
             entry: Flat record with at least a ``category`` key.
 
@@ -1028,8 +1034,9 @@ class DatasetParser:
                 data = json.loads(data)
             except (TypeError, ValueError):
                 data = {"raw": data}
+        actor = entry.get("actor")
         payload = {
-            "actor": entry.get("actor"),
+            "actor": actor,
             "ticker": entry.get("ticker"),
             "title": entry.get("title"),
             "summary": entry.get("summary"),
@@ -1045,6 +1052,7 @@ class DatasetParser:
             "subcategory": entry.get("source_id"),
             "as_of_date": snapshot_date,
             "payload": json.dumps(payload),
+            "actor_name": actor,
         }
 
     def _insert_snapshots_batch(self, batch: list[dict]) -> None:
@@ -1057,9 +1065,10 @@ class DatasetParser:
                     text("""
                         INSERT INTO analytical_snapshots
                             (snapshot_date, category, subcategory,
-                             as_of_date, payload)
+                             as_of_date, payload, actor_name)
                         VALUES (:snapshot_date, :category, :subcategory,
-                                :as_of_date, CAST(:payload AS jsonb))
+                                :as_of_date, CAST(:payload AS jsonb),
+                                :actor_name)
                     """),
                     [self._snapshot_row(entry) for entry in batch],
                 )

@@ -74,7 +74,19 @@ def _safe_json(data: Any) -> str:
 # the migrations are allowed to reference.
 #
 # Note ``search_vector tsvector`` is NOT declared here: it is added by the
-# FTS migration, not by this table's own bootstrap.
+# FTS migration, not by this table's own bootstrap, because that column
+# needs a trigger to stay maintained and belongs to that migration's own
+# lifecycle.
+#
+# ``actor_name TEXT`` IS declared here, unlike ``search_vector`` above: it
+# needs no trigger, no backfill machinery beyond a one-time migration
+# (``migrations/versions/snapshot_actor_col_20260914.py``), and every writer
+# of this table can populate it directly at insert time
+# (``scripts/parse_datasets.py::_snapshot_row``), the same way every other
+# column here works. A fresh database (dev, CI, a restored slice) gets it
+# from first boot rather than waiting on a migration to run against a table
+# that migration doesn't even know exists yet until `store/snapshots.py`
+# creates it (see that migration's fresh-database guard).
 ANALYTICAL_SNAPSHOTS_DDL = """
     CREATE TABLE IF NOT EXISTS analytical_snapshots (
         id            BIGSERIAL PRIMARY KEY,
@@ -83,6 +95,7 @@ ANALYTICAL_SNAPSHOTS_DDL = """
         subcategory   TEXT,
         as_of_date    DATE NOT NULL,
         payload       JSONB NOT NULL,
+        actor_name    TEXT,
         metrics       JSONB,
         created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
