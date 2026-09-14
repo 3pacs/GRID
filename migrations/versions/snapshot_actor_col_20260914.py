@@ -93,20 +93,37 @@ Two independent reasons, either one sufficient on its own:
    ``CREATE INDEX CONCURRENTLY`` cannot run inside a transaction block at
    all -- it would fail immediately with a driver error, before evaluating
    a single row, on *any* size table.
-2. **Now unnecessary.** A plain, non-``CONCURRENTLY`` ``CREATE INDEX`` takes
-   a ``SHARE`` lock -- it blocks writers but not readers -- for the duration
-   of the build. Measured at 0.87 s and 0.64 s above, that is not a
-   meaningful write stall on a table Hermes writes to continuously; it is the
-   ACCESS EXCLUSIVE hold a plain ``DROP INDEX`` needs (attempt 3's other
-   finding: one could not even acquire that lock within 5 s) that made a
-   large table dangerous, and every DDL statement below that needs
-   ACCESS EXCLUSIVE (``ADD COLUMN``, ``DROP INDEX``) is a catalog-only
-   change with nothing to scan, exactly like the 0.0018 s ``ADD COLUMN``
-   measured above.
+2. **Now unnecessary, but not lock-free.** A plain, non-``CONCURRENTLY``
+   ``CREATE INDEX`` takes only a ``SHARE`` lock on its own -- it would block
+   writers but not readers for the 0.87 s / 0.64 s measured above. But this
+   revision runs as ONE transaction (see "Structural" above), and
+   ``ADD COLUMN`` -- the first statement -- already takes ACCESS EXCLUSIVE
+   and holds it, uninterrupted, until COMMIT: Postgres does not downgrade a
+   lock mid-transaction because a later statement would have asked for less.
+   So for this transaction's *entire* duration -- backfill, both index
+   builds, both drops -- ``analytical_snapshots`` is inaccessible to every
+   other reader and writer, not only to writers during the index builds. A
+   prior draft of this paragraph described only the index builds' own lock
+   and understated that.
+
+   What bounds the exposure is duration, not lock strength: every statement
+   in the transaction is either a catalog-only change or scans/writes a
+   table with no jsonb extraction (see the top of this docstring for why
+   that extraction was the actual cost). Measured end to end in production
+   (deploy run 34872136777, 2026-09-14): ``ALTER TABLE`` to the transaction
+   reaching ``head`` was 5.97 s, backfilling the same 9,649 rows measured in
+   the dry run above -- consistent with the "under five seconds" dry-run
+   estimate. That is an observed bound from one production run at that
+   table's current size, not a guarantee at 10-100x it; ``BUILD_STATEMENT_
+   TIMEOUT`` / ``BUILD_LOCK_TIMEOUT`` below exist precisely so a future
+   regression fails loudly within 120s/30s instead of holding this lock
+   indefinitely.
 
 So there is no size gate here, unlike this revision's predecessor: every
 step is cheap regardless of table size once the column is plain text, so
-there is nothing left to defer.
+there is nothing left to defer -- "cheap" bounds the transaction's
+duration, not its lock scope, which is ACCESS EXCLUSIVE throughout per
+above.
 
 Chunking
 --------
@@ -232,6 +249,16 @@ def _pg_trgm_ready(conn) -> bool:
     trigram index on ``actors(name)``: report the shortfall rather than fail
     the whole upgrade, because the trigram index is a performance index, not
     a correctness one.
+
+    The ``CREATE EXTENSION`` attempt runs inside a SAVEPOINT
+    (``conn.begin_nested()``). This whole revision runs as one transaction
+    (see "Why this is one ordinary transaction" above), and Postgres aborts
+    that transaction on a failed statement regardless of whether the driver
+    exception is caught in Python -- every later statement in ``upgrade()``,
+    including the ``RESET statement_timeout`` / ``RESET lock_timeout`` calls
+    in its own ``finally`` block, would then fail with "current transaction
+    is aborted, commands ignored until end of transaction block". The
+    SAVEPOINT confines a failed ``CREATE EXTENSION`` to this one attempt.
     """
     installed = conn.execute(
         text("SELECT count(*) FROM pg_extension WHERE extname = 'pg_trgm'")
@@ -240,7 +267,8 @@ def _pg_trgm_ready(conn) -> bool:
         return True
 
     try:
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+        with conn.begin_nested():
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
         return True
     except Exception as exc:
         log.warning(

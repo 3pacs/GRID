@@ -878,6 +878,143 @@ def test_new_migration_upgrade_sequence_add_backfill_index_drop():
     assert add_col < backfill < new_btree < new_trgm < drop_legacy
 
 
+@pytest.mark.unit
+def test_save_snapshot_actor_is_discoverable_by_entity_resolver(snapshot_engine):
+    """A snapshot written through the canonical API, not just parse_datasets'
+    bespoke insert, must be findable the same way.
+
+    AnalyticalSnapshotStore.save_snapshot() had no actor_name parameter at
+    all, so nothing written through it -- clustering, orthogonality,
+    sleuth_investigation, research_sweep, and every other of its ~14 callers
+    -- could ever be indexed for entity resolution, even if a future caller's
+    payload were about a specific person. Built without __init__ (as the
+    `resolver` fixture is) so the store's own real _ensure_table() -- which
+    runs the Postgres-flavored ANALYTICAL_SNAPSHOTS_DDL -- never touches this
+    SQLite engine; the table already exists via the `snapshot_engine` fixture.
+    """
+    from store.snapshots import AnalyticalSnapshotStore
+
+    store = AnalyticalSnapshotStore.__new__(AnalyticalSnapshotStore)
+    store.engine = snapshot_engine
+    store.retention_per_category = None
+
+    snap_id = store.save_snapshot(
+        category="sleuth_investigation",
+        payload={"question": "who benefits"},
+        actor_name="Nancy P Example",
+    )
+    assert snap_id is not None
+
+    resolver = EntityResolver.__new__(EntityResolver)
+    resolver.engine = snapshot_engine
+    hits = _search(resolver, "Nancy P Example")
+
+    assert [h["raw_name"] for h in hits] == ["Nancy P Example"]
+    assert hits[0]["category"] == "sleuth_investigation"
+
+
+# ---------------------------------------------------------------------------
+# snapshot_actor_col_20260914 / snapshot_actor_index_20260912 --
+# _pg_trgm_ready's CREATE EXTENSION must not abort the migration transaction
+# ---------------------------------------------------------------------------
+
+class _Savepoint:
+    """Stands in for the object conn.begin_nested() returns.
+
+    __exit__ returns False (falsy) unconditionally, matching real SAVEPOINT
+    behavior: on an exception, SQLAlchemy issues ROLLBACK TO SAVEPOINT and
+    still re-raises, letting the caller's own try/except decide what to do.
+    A test double that swallowed the exception here would validate nothing.
+    """
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _Scalar:
+    def __init__(self, value):
+        self._value = value
+
+    def scalar(self):
+        return self._value
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "loader", [_load_actor_column_migration, _load_index_migration],
+    ids=["snapshot_actor_col_20260914", "snapshot_actor_index_20260912"],
+)
+def test_pg_trgm_ready_confines_a_failed_create_extension_to_a_savepoint(loader):
+    """A failed CREATE EXTENSION must not abort the whole migration transaction.
+
+    migrations/env.py wraps each revision in one transaction. Postgres aborts
+    that transaction on a failed statement regardless of whether the driver
+    exception is caught in Python -- a bare try/except around CREATE
+    EXTENSION did not undo that, so every later statement in upgrade() would
+    then fail with "current transaction is aborted", including the RESET
+    calls in its own finally block. begin_nested() (SAVEPOINT / ROLLBACK TO
+    SAVEPOINT) confines the abort to this one attempt.
+    """
+    migration = loader()
+
+    class _StubConn:
+        def __init__(self):
+            self.began_nested = False
+
+        def execute(self, statement, params=None):
+            stmt = " ".join(str(statement).split())
+            if "pg_extension" in stmt:
+                return _Scalar(0)  # not installed
+            if "CREATE EXTENSION" in stmt:
+                raise RuntimeError("permission denied to create extension")
+            raise AssertionError(f"unexpected statement outside the probe: {stmt}")
+
+        def begin_nested(self):
+            self.began_nested = True
+            return _Savepoint()
+
+    conn = _StubConn()
+    result = migration._pg_trgm_ready(conn)
+
+    assert result is False
+    assert conn.began_nested is True, (
+        "CREATE EXTENSION must run inside begin_nested() (a SAVEPOINT), or a "
+        "failure here aborts the whole migration transaction"
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "loader", [_load_actor_column_migration, _load_index_migration],
+    ids=["snapshot_actor_col_20260914", "snapshot_actor_index_20260912"],
+)
+def test_pg_trgm_ready_skips_the_savepoint_when_already_installed(loader):
+    """No SAVEPOINT overhead -- and no CREATE EXTENSION attempt at all --
+    when pg_trgm is already there, which is the case on griddb today."""
+    migration = loader()
+
+    class _StubConn:
+        def __init__(self):
+            self.began_nested = False
+
+        def execute(self, statement, params=None):
+            assert "pg_extension" in " ".join(str(statement).split())
+            return _Scalar(1)
+
+        def begin_nested(self):
+            self.began_nested = True
+            raise AssertionError(
+                "must not attempt CREATE EXTENSION when already installed"
+            )
+
+    conn = _StubConn()
+    assert migration._pg_trgm_ready(conn) is True
+    assert conn.began_nested is False
+
+
 # ---------------------------------------------------------------------------
 # Payload extraction
 # ---------------------------------------------------------------------------
