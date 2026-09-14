@@ -10,39 +10,47 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Path, Query
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
 
 router = APIRouter(prefix="/api/v1/snapshots", tags=["snapshots"])
 
+# ``analytical_snapshots.category`` is an unconstrained TEXT column, so the
+# boundary check here is on the shape of the value, not on membership of a
+# list. Which categories exist is data (see store/snapshots.py's "Category
+# discovery" note) and these handlers must not second-guess it: every category
+# parameter is a bound query parameter, and an unrecognised one simply matches
+# no rows.
+_MAX_CATEGORY_LEN = 128
+
 
 @router.get("/latest/{category}")
 def get_latest_snapshots(
-    category: str,
+    category: str = Path(..., min_length=1, max_length=_MAX_CATEGORY_LEN),
     n: int = Query(default=1, ge=1, le=50),
     _user: dict = Depends(require_auth),
 ) -> list[dict[str, Any]]:
-    """Return the N most recent snapshots for a category."""
+    """Return the N most recent snapshots for a category.
+
+    A category with no rows is not an error — it returns ``[]``, matching
+    ``/history``. This endpoint used to reject anything outside a hardcoded
+    eight-value tuple with HTTP 400, which made most of the table
+    unreadable; see store/snapshots.py's PIPELINE_CATEGORIES note.
+    Call ``/categories`` to discover what exists.
+    """
     from store.snapshots import AnalyticalSnapshotStore
 
     engine = get_db_engine()
     store = AnalyticalSnapshotStore(db_engine=engine)
 
-    if category not in store.CATEGORIES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown category '{category}'. Valid: {store.CATEGORIES}",
-        )
-
-    results = store.get_latest(category, n=n)
-    return results
+    return store.get_latest(category, n=n)
 
 
 @router.get("/history/{category}")
 def get_snapshot_history(
-    category: str,
+    category: str = Path(..., min_length=1, max_length=_MAX_CATEGORY_LEN),
     start_date: date | None = Query(default=None),
     end_date: date | None = Query(default=None),
     _user: dict = Depends(require_auth),
@@ -61,7 +69,7 @@ def get_snapshot_history(
 
 @router.get("/compare/{category}")
 def compare_snapshots(
-    category: str,
+    category: str = Path(..., min_length=1, max_length=_MAX_CATEGORY_LEN),
     date_a: date = Query(...),
     date_b: date = Query(...),
     _user: dict = Depends(require_auth),
@@ -80,11 +88,32 @@ def compare_snapshots(
 
 @router.get("/categories")
 def list_categories(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     _user: dict = Depends(require_auth),
-) -> list[str]:
-    """Return all available snapshot categories."""
+) -> dict[str, Any]:
+    """Return every snapshot category present in ``analytical_snapshots``.
+
+    Read from the table, so it reports what the writers actually produced
+    rather than a maintained literal. Each entry carries ``category``,
+    ``snapshot_count`` and ``latest_snapshot_date`` so a dashboard can show
+    what is available and how stale it is without a probe request per
+    category.
+    """
     from store.snapshots import AnalyticalSnapshotStore
-    return list(AnalyticalSnapshotStore.CATEGORIES)
+
+    engine = get_db_engine()
+    store = AnalyticalSnapshotStore(db_engine=engine)
+
+    categories = store.list_categories()
+    total = len(categories)
+    return {
+        "entries": categories[offset : offset + limit],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "has_more": (offset + limit) < total,
+    }
 
 
 # ------------------------------------------------------------------
