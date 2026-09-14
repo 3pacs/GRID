@@ -182,39 +182,42 @@ def _log_query_failure(where: str, exc: BaseException) -> None:
 # ══════════════════════════════════════════════════════════════════════════
 # ANALYTICAL SNAPSHOT QUERIES
 # ══════════════════════════════════════════════════════════════════════════
-# `analytical_snapshots` has exactly `id, snapshot_date, category,
-# subcategory, as_of_date, payload, metrics, created_at` (plus `search_vector`
+# `analytical_snapshots` has `id, snapshot_date, category, subcategory,
+# as_of_date, payload, actor_name, metrics, created_at` (plus `search_vector`
 # from the FTS migration) — see `ANALYTICAL_SNAPSHOTS_DDL` in
-# `store/snapshots.py`, the one definition of this table. The actor, title and
-# source id are keys of the jsonb `payload`, which is where
-# `scripts/parse_datasets.py` writes congressional trades and Fed speeches.
+# `store/snapshots.py`, the one definition of this table. `title` and
+# `source_id` are keys of the jsonb `payload`, which is where
+# `scripts/parse_datasets.py` writes congressional trades and Fed speeches;
+# `actor_name` is a plain column, promoted out of `payload` by
+# `migrations/versions/snapshot_actor_col_20260914.py`.
 #
 # Both statements used to name `actor`, `title` and `source_id` as columns —
 # a shape that came from a rival DDL #477 deleted and that the real table has
 # never had. Every call raised `UndefinedColumn`, and both handlers logged it
-# at warning level, so the entire snapshot corpus was skipped in silence.
+# at warning level, so the entire snapshot corpus was skipped in silence. A
+# later fix (#479) read the actor out of the jsonb payload instead
+# (`COALESCE(payload ->> 'actor', payload ->> 'senator')`), which was correct
+# but not indexable at any reasonable cost — three attempts at
+# `CREATE INDEX CONCURRENTLY` on that expression failed on griddb's 558k-row
+# table (see `snapshot_actor_col_20260914`'s docstring for the full history),
+# because a *partial expression* index has to evaluate the expression, and
+# therefore detoast the jsonb, on every row to decide what qualifies.
 #
 # They are module constants rather than inline strings so the tests execute
 # the same text production does instead of a copy that can drift.
 
-# Where the actor name lives, measured on griddb 2026-09-12:
+# Where the actor name lives, as of `snapshot_actor_col_20260914`:
 #
-#   payload ->> 'actor'     0 rows — the canonical key. parse_datasets writes
-#                           it for congressional trades and Fed speeches, but
-#                           only since #477: every such write failed for as
-#                           long as the phantom columns were in the tree, so
-#                           nothing carries it yet. This is the key that
-#                           matters from the next parser run onward.
-#   payload ->> 'senator'   5,000 rows — the same field under its pre-#477
-#                           spelling. The live `congressional_trade` rows hold
-#                           the raw Senate EFD record (senator / ticker / type
-#                           / amount / transaction_date / owner /
-#                           asset_description / asset_type / comment /
-#                           ptr_link), and `senator` is its actor: "David A
-#                           Perdue , Jr", the name this module's docstring
-#                           opens with. No other writer in the tree uses a
-#                           `senator` key, so this arm cannot capture anything
-#                           that is not a legislator.
+#   actor_name    9,649 non-null rows on griddb (2026-09-14) — backfilled
+#                 once from `payload ->> 'actor'`, and written directly by
+#                 `scripts/parse_datasets.py::_snapshot_row` for every insert
+#                 from here on, so it never needs backfilling again.
+#
+# `payload ->> 'senator'`, the pre-#477 spelling of the same field, is
+# deliberately NOT read anywhere in this module or in the backfill migration:
+# confirmed 0 rows carry that key on griddb (2026-09-14). It was fully
+# retired, not merely rare, by the time `actor` became the exclusive writer
+# path.
 #
 # Deliberately NOT read here: `payload ->> 'name'`, carried by the 12,282
 # `category='opensanctions'` rows. The key is generic enough that a later
@@ -229,28 +232,19 @@ def _log_query_failure(where: str, exc: BaseException) -> None:
 # `_guess_domain_from_source_id` also reads `category`, which spells
 # "congressional_trade".
 #
-# The COALESCE is computed once in a subquery so it cannot drift between the
-# SELECT list and the WHERE clause. PostgreSQL flattens a subquery this simple
-# into the outer query, so the predicate still reaches the base relation and
-# `idx_analytical_snapshots_payload_actor` (migration
-# snapshot_payload_actor_index_20260912) still applies. The aliases avoid the
-# phantom column names on purpose — an alias called `actor` would teach the
-# next reader that the column exists.
+# `actor_name` is filtered directly — no subquery, no jsonb expression to
+# keep in step with an index — and `idx_analytical_snapshots_actor_name` /
+# `idx_analytical_snapshots_actor_name_trgm` (migration
+# snapshot_actor_col_20260914) key exactly this column under exactly this
+# predicate. Keep `PREDICATE` in that migration and the `WHERE` clause below
+# in step; a partial index is only usable when its predicate implies the
+# query's.
 SNAPSHOT_SEARCH_SQL = """
     SELECT id, category, actor_name, snapshot_date,
-           snapshot_title, snapshot_source, created_at
-    FROM (
-        SELECT id,
-               category,
-               snapshot_date,
-               created_at,
-               COALESCE(payload ->> 'actor', payload ->> 'senator')
-                   AS actor_name,
-               payload ->> 'title' AS snapshot_title,
-               COALESCE(payload ->> 'source_id', subcategory)
-                   AS snapshot_source
-        FROM analytical_snapshots
-    ) s
+           payload ->> 'title' AS snapshot_title,
+           COALESCE(payload ->> 'source_id', subcategory) AS snapshot_source,
+           created_at
+    FROM analytical_snapshots
     WHERE actor_name IS NOT NULL
       AND actor_name <> ''
       AND (lower(actor_name) = lower(:name)
@@ -263,11 +257,7 @@ SNAPSHOT_SEARCH_SQL = """
 # enter the resolution index as a nameless entity.
 SNAPSHOT_NAME_SCAN_SQL = """
     SELECT DISTINCT actor_name
-    FROM (
-        SELECT COALESCE(payload ->> 'actor', payload ->> 'senator')
-                   AS actor_name
-        FROM analytical_snapshots
-    ) s
+    FROM analytical_snapshots
     WHERE actor_name IS NOT NULL
       AND actor_name <> ''
 """
@@ -730,21 +720,24 @@ class EntityResolver:
     ) -> list[dict[str, Any]]:
         """Search analytical_snapshots for matching actor names.
 
-        The actor, title and source id live in the jsonb ``payload``, not in
-        columns. ``analytical_snapshots`` has exactly ``id, snapshot_date,
-        category, subcategory, as_of_date, payload, metrics, created_at``
-        (+ ``search_vector`` from the FTS migration) — see
-        ``ANALYTICAL_SNAPSHOTS_DDL`` in ``store/snapshots.py``, the one
-        definition of this table. It has never had ``actor``/``title``/
-        ``source_id``; those came from a rival DDL in
-        ``scripts/parse_datasets.py`` that #477 deleted.
+        ``actor_name`` is a plain column (migration
+        ``snapshot_actor_col_20260914``); ``title`` and ``source_id`` are
+        still keys of the jsonb ``payload``. ``analytical_snapshots`` has
+        ``id, snapshot_date, category, subcategory, as_of_date, payload,
+        actor_name, metrics, created_at`` (+ ``search_vector`` from the FTS
+        migration) — see ``ANALYTICAL_SNAPSHOTS_DDL`` in
+        ``store/snapshots.py``, the one definition of this table. It has
+        never had ``actor``/``title``/``source_id`` as columns; those came
+        from a rival DDL in ``scripts/parse_datasets.py`` that #477 deleted.
 
         Selecting them as columns raised ``UndefinedColumn`` on every call,
         and ``resolve()`` logged it as a warning, so this source silently
-        contributed nothing to any resolution.
+        contributed nothing to any resolution. #479 fixed that by reading the
+        jsonb payload directly, which worked but could not be indexed at any
+        reasonable cost; ``actor_name`` is what made indexing viable.
 
-        See ``SNAPSHOT_SEARCH_SQL`` for where the actor name actually lives
-        and which payload keys are read.
+        See ``SNAPSHOT_SEARCH_SQL`` for the current shape and which payload
+        keys are still read.
         """
         results = []
         with self.engine.connect() as conn:
@@ -1060,8 +1053,9 @@ class EntityResolver:
             except Exception as e:
                 _log_query_failure("actors name scan", e)
 
-            # Analytical snapshots — the actor is a jsonb payload key, not a
-            # column (see SNAPSHOT_NAME_SCAN_SQL).
+            # Analytical snapshots — actor_name is a plain column, backfilled
+            # from the jsonb payload once (see SNAPSHOT_NAME_SCAN_SQL and
+            # migrations/versions/snapshot_actor_col_20260914.py).
             try:
                 rows = conn.execute(text(SNAPSHOT_NAME_SCAN_SQL)).fetchall()
                 for row in rows:

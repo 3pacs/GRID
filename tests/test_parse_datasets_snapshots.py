@@ -35,6 +35,7 @@ SCRIPT = REPO_ROOT / "scripts" / "parse_datasets.py"
 
 CANONICAL_COLUMNS = {
     "snapshot_date", "category", "subcategory", "as_of_date", "payload",
+    "actor_name",
 }
 
 
@@ -125,6 +126,22 @@ def test_source_id_becomes_subcategory(snapshot_row) -> None:
     assert row["subcategory"] == "house_disclosures"
 
 
+def test_actor_name_column_mirrors_the_payload_actor(snapshot_row) -> None:
+    """actor_name is a real column now (snapshot_actor_col_20260914) — every
+    insert must populate it directly rather than relying on a backfill."""
+    row = snapshot_row({
+        "category": "congressional_trade",
+        "actor": "David A Perdue , Jr",
+    })
+    assert row["actor_name"] == "David A Perdue , Jr"
+    assert json.loads(row["payload"])["actor"] == "David A Perdue , Jr"
+
+
+def test_actor_name_is_none_when_no_actor_is_given(snapshot_row) -> None:
+    row = snapshot_row({"category": "clustering"})
+    assert row["actor_name"] is None
+
+
 def test_missing_date_is_filled_because_the_columns_are_not_null(snapshot_row) -> None:
     """``snapshot_date`` and ``as_of_date`` are both NOT NULL on the real table."""
     row = snapshot_row({"category": "fed_speech", "snapshot_date": None})
@@ -138,12 +155,19 @@ def test_non_json_data_is_kept_rather_than_crashing(snapshot_row) -> None:
 
 
 def test_insert_statement_names_only_canonical_columns(parse_datasets) -> None:
-    """Static check on the SQL itself, independent of the row mapping."""
+    """Static check on the SQL itself, independent of the row mapping.
+
+    Word-bounded on purpose: ``:actor_name`` is a real bind param
+    (``actor_name`` is a real column, snapshot_actor_col_20260914) and must
+    not trip the ``:actor`` phantom check just because it shares a prefix.
+    """
+    import re
+
     source = SCRIPT.read_text()
     start = source.index("INSERT INTO analytical_snapshots")
-    stmt = source[start:start + 400]
+    stmt = source[start:start + 450]
     for phantom in ("actor", "ticker", "title", "summary", "confidence"):
-        assert f":{phantom}" not in stmt, (
+        assert not re.search(rf":{phantom}\b", stmt), (
             f"the analytical_snapshots INSERT still binds :{phantom}, which "
             f"is not a column of that table"
         )
