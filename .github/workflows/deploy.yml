@@ -10,7 +10,7 @@ on:
         required: false
         default: 'false'
       do_restart:
-        description: 'Restart grid-api after deploy'
+        description: 'Restart grid-api and grid-hermes after deploy'
         type: boolean
         required: false
         default: true
@@ -211,6 +211,58 @@ jobs:
           grep -qF '"/api/v1/dad/ticker/{ticker}/gold/stream"' /tmp/grid-openapi.json || fail "gold/stream route missing from OpenAPI"
           grep -qF '"/api/v1/conviction/sweeps/latest"' /tmp/grid-openapi.json || fail "sweeps/latest route missing from OpenAPI (Sprint 3 not live)"
           echo "verify: all assertions passed"
+
+      # grid-hermes runs `ExecStart=/usr/bin/python3 scripts/hermes_operator.py`
+      # with a RELATIVE path, resolved against WorkingDirectory. Its unit pins
+      # that to the Hermes tree, which no deploy writes to -- so every
+      # Hermes-side change has shipped to grid_release and then not run. #487
+      # (2026-09-13) and #490 (2026-09-14) both sat deployed-but-inert for
+      # exactly that reason: on 2026-09-14 the live process was still on
+      # 5facbdf0, started 2026-09-11, with zero occurrences of
+      # DISTINCT_SCAN_SLICE_HOURS or RESOLUTION_SCAN_BUDGET_SECONDS.
+      #
+      # This is the same drop-in grid-api already gets, so both services run the
+      # tree this workflow actually deployed. Placed after the API verify: if the
+      # API did not come back healthy, stop before bouncing a second service.
+      - name: Restart grid-hermes
+        if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /etc/systemd/system/grid-hermes.service.d
+          printf '%s\n' '[Service]' "WorkingDirectory=$DEPLOY_PATH" | sudo tee /etc/systemd/system/grid-hermes.service.d/zz-release-worktree.conf >/dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl restart grid-hermes
+
+      # Prove it is running the DEPLOYED tree, not merely that it is alive. A
+      # bare `is-active` would have reported green through the whole period the
+      # daemon ran three-day-old code, which is the failure this exists to make
+      # impossible.
+      - name: Verify grid-hermes runs the deployed tree
+        if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
+        run: |
+          set -euo pipefail
+          for attempt in {1..30}; do
+            state="$(systemctl is-active grid-hermes || true)"
+            [ "$state" = "active" ] && break
+            if [ "$attempt" -eq 30 ]; then
+              echo "::error::grid-hermes not active after restart (state=$state)"
+              sudo systemctl status grid-hermes --no-pager -l || true
+              journalctl -u grid-hermes -n 60 --no-pager || true
+              exit 1
+            fi
+            sleep 2
+          done
+          pid="$(systemctl show -p MainPID --value grid-hermes)"
+          cwd="$(sudo -n readlink "/proc/${pid}/cwd" 2>/dev/null || readlink "/proc/${pid}/cwd" 2>/dev/null || true)"
+          echo "grid-hermes pid=$pid cwd=$cwd"
+          # DEPLOY_PATH is reached through a symlink on this host, so compare
+          # resolved paths rather than the literal strings.
+          want="$(readlink -f "$DEPLOY_PATH")"
+          [ -n "$cwd" ] && [ "$(readlink -f "$cwd")" = "$want" ] || {
+            echo "::error::grid-hermes cwd '$cwd' does not resolve to $want -- it is running a different tree"
+            exit 1
+          }
+          echo "verify: grid-hermes is running the deployed tree"
 
       - name: Notify success
         if: success()
