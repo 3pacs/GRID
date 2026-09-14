@@ -401,26 +401,48 @@ class BasePuller:
         self,
         series_id: str,
         conn: Any,
+        start_date: date | None = None,
+        end_date: date | None = None,
     ) -> set[date]:
-        """Fetch all obs_dates already stored for a series in one query.
+        """Fetch obs_dates already stored for a series in one query.
 
         Much faster than per-row _row_exists() checks for bulk inserts.
+
+        Unbounded by default (every historical date), which is correct for
+        callers that check dates spanning all of history. A caller that only
+        needs to de-duplicate against a bounded fetch window — e.g. a puller
+        that requested `[start_date, end_date]` from its upstream API and can
+        only ever look up dates inside that same window — should pass both
+        bounds: on a series with a very long history, scanning every row
+        ever inserted just to answer "do I already have today's value" scans
+        far more than it needs to. Passing only one bound is intentionally
+        allowed (open-ended on the other side) for callers that know one end
+        but not the other.
 
         Parameters:
             series_id: The series identifier.
             conn: Active database connection.
+            start_date: If given, only consider obs_date >= start_date.
+            end_date: If given, only consider obs_date <= end_date.
 
         Returns:
-            set[date]: All observation dates already in raw_series.
+            set[date]: Observation dates already in raw_series (within the
+                bounds given, or all of them if neither bound is given).
         """
-        rows = conn.execute(
-            text(
-                "SELECT DISTINCT obs_date FROM raw_series "
-                "WHERE series_id = :sid AND source_id = :src "
-                "AND pull_status = 'SUCCESS'"
-            ),
-            {"sid": series_id, "src": self.source_id},
-        ).fetchall()
+        sql = (
+            "SELECT DISTINCT obs_date FROM raw_series "
+            "WHERE series_id = :sid AND source_id = :src "
+            "AND pull_status = 'SUCCESS'"
+        )
+        params: dict[str, Any] = {"sid": series_id, "src": self.source_id}
+        if start_date is not None:
+            sql += " AND obs_date >= :start_date"
+            params["start_date"] = start_date
+        if end_date is not None:
+            sql += " AND obs_date <= :end_date"
+            params["end_date"] = end_date
+
+        rows = conn.execute(text(sql), params).fetchall()
         return {r[0] for r in rows}
 
     def _get_latest_date(

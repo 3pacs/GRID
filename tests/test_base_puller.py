@@ -340,6 +340,118 @@ class TestBasePullerRowExists:
         assert params["src"] == 42
 
 
+class TestBasePullerGetExistingDates:
+    """_get_existing_dates: unbounded by default (57 other callers depend on
+    that), optionally bounded to a [start_date, end_date] window for callers
+    that only ever check dates inside a range they already fetched."""
+
+    def _make_puller(self, mock_engine):
+        puller = BasePuller.__new__(BasePuller)
+        puller.engine = mock_engine
+        puller.source_id = 1
+        return puller
+
+    def _mock_conn(self, rows):
+        conn = MagicMock()
+        result = MagicMock()
+        result.fetchall.return_value = rows
+        conn.execute.return_value = result
+        return conn
+
+    def _sql_and_params(self, conn):
+        call_args = conn.execute.call_args
+        stmt = call_args[0][0]
+        params = call_args[0][1] if len(call_args[0]) > 1 else call_args[1]
+        return str(getattr(stmt, "text", stmt)), params
+
+    def test_unbounded_returns_all_dates(self, mock_engine):
+        """Default call (no bounds) — the shape all 57 existing callers use."""
+        puller = self._make_puller(mock_engine)
+        conn = self._mock_conn([(date(2020, 1, 1),), (date(2024, 6, 15),)])
+
+        result = puller._get_existing_dates("DFF", conn)
+
+        assert result == {date(2020, 1, 1), date(2024, 6, 15)}
+
+    def test_unbounded_query_has_no_date_filter(self, mock_engine):
+        """Regression guard: omitting both bounds must not add any obs_date
+        clause, or every one of the 57 unbounded callers changes behavior."""
+        puller = self._make_puller(mock_engine)
+        conn = self._mock_conn([])
+
+        puller._get_existing_dates("DFF", conn)
+
+        sql, params = self._sql_and_params(conn)
+        assert "obs_date >=" not in sql
+        assert "obs_date <=" not in sql
+        assert "start_date" not in params
+        assert "end_date" not in params
+
+    def test_bounded_start_and_end_adds_both_filters(self, mock_engine):
+        puller = self._make_puller(mock_engine)
+        conn = self._mock_conn([])
+
+        puller._get_existing_dates(
+            "YF:^DJI:open",
+            conn,
+            start_date=date(2026, 9, 1),
+            end_date=date(2026, 9, 14),
+        )
+
+        sql, params = self._sql_and_params(conn)
+        assert "obs_date >= :start_date" in sql
+        assert "obs_date <= :end_date" in sql
+        assert params["start_date"] == date(2026, 9, 1)
+        assert params["end_date"] == date(2026, 9, 14)
+
+    def test_bounded_start_only_leaves_end_open(self, mock_engine):
+        puller = self._make_puller(mock_engine)
+        conn = self._mock_conn([])
+
+        puller._get_existing_dates("DFF", conn, start_date=date(2026, 9, 1))
+
+        sql, params = self._sql_and_params(conn)
+        assert "obs_date >= :start_date" in sql
+        assert "obs_date <=" not in sql
+        assert "end_date" not in params
+
+    def test_bounded_end_only_leaves_start_open(self, mock_engine):
+        puller = self._make_puller(mock_engine)
+        conn = self._mock_conn([])
+
+        puller._get_existing_dates("DFF", conn, end_date=date(2026, 9, 14))
+
+        sql, params = self._sql_and_params(conn)
+        assert "obs_date <= :end_date" in sql
+        assert "obs_date >=" not in sql
+        assert "start_date" not in params
+
+    def test_bounds_are_parameterized_not_interpolated(self, mock_engine):
+        """`.claude/rules/security.md`: bound params only, never inline literals."""
+        puller = self._make_puller(mock_engine)
+        conn = self._mock_conn([])
+
+        puller._get_existing_dates(
+            "DFF", conn, start_date=date(2026, 9, 1), end_date=date(2026, 9, 14),
+        )
+
+        sql, _ = self._sql_and_params(conn)
+        assert "2026-09-01" not in sql
+        assert "2026-09-14" not in sql
+
+    def test_bounded_still_filters_pull_status_success(self, mock_engine):
+        """The bound is additive — the existing correctness filter must survive."""
+        puller = self._make_puller(mock_engine)
+        conn = self._mock_conn([])
+
+        puller._get_existing_dates(
+            "DFF", conn, start_date=date(2026, 9, 1), end_date=date(2026, 9, 14),
+        )
+
+        sql, _ = self._sql_and_params(conn)
+        assert "pull_status = 'SUCCESS'" in sql
+
+
 # ---------------------------------------------------------------------------
 # Inheritance tests
 # ---------------------------------------------------------------------------

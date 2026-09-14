@@ -200,7 +200,19 @@ class YFinancePuller(BasePuller):
                         )
                         selected = selected.iloc[:, 0]
                     col_data = selected.dropna()
-                    existing_dates = self._get_existing_dates(series_id, conn)
+                    # Bounded to the same window this call already requested
+                    # from yfinance: col_data can only contain dates inside
+                    # [start_date, end_date], since yf.download() itself
+                    # bounds the response — so checking existing dates
+                    # outside that window can never affect the skip check
+                    # below. end_date stays open when unset ("through
+                    # today"): we can't have already inserted a future date.
+                    existing_dates = self._get_existing_dates(
+                        series_id,
+                        conn,
+                        start_date=pd.Timestamp(start_date).date(),
+                        end_date=pd.Timestamp(end_date).date() if end_date else None,
+                    )
 
                     for dt_idx, value in col_data.items():
                         # Defensive: reject any index entry that isn't a real
