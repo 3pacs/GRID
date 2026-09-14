@@ -112,3 +112,8 @@ pytest>=9.1.0
 pytest-timeout>=2.4.0
 pytest-xdist>=3.8.0
 pytrends>=4.9.0
+# Declared, not inherited. PyYAML was already installed everywhere as a prefect
+# dependency, but tests/test_deploy_restarts_hermes.py parses the deploy
+# workflow with it, and a guard that disappears when someone else's transitive
+# dependency shifts is not a guard.
+PyYAML>=6.0

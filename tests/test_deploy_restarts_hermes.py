@@ -31,7 +31,15 @@ import subprocess
 
 import pytest
 
-yaml = pytest.importorskip("yaml")
+# A plain import, deliberately, not `pytest.importorskip("yaml")`.
+#
+# PyYAML reaches CI only transitively (prefect depends on it) and is not
+# declared by this repo, so an importorskip here would make every guard in this
+# file vanish silently the day that chain shifts -- green CI, zero coverage,
+# and no signal that the deploy-integrity checks stopped running. That is the
+# same shape as the bug the file exists to catch, so it fails loudly instead.
+# requirements.txt now declares PyYAML for exactly this reason.
+import yaml
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEPLOY_YML = os.path.join(REPO_ROOT, ".github", "workflows", "deploy.yml")
