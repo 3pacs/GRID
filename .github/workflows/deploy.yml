@@ -145,6 +145,19 @@ jobs:
               echo '```'
             } | tee -a "$GITHUB_STEP_SUMMARY"
             python3 -m alembic upgrade head
+            # ...and again afterwards. Without this the summary records only
+            # where the database *was*: `alembic current` before the upgrade,
+            # and then silence. Run 641 is the case -- the upgrade ran, a
+            # revision took its deferral branch, and the log showed neither
+            # which revisions were applied nor where head ended up. A deploy
+            # that migrates the production database should say so in its own
+            # record.
+            {
+              echo '### current (after upgrade)'
+              echo '```'
+              python3 -m alembic current
+              echo '```'
+            } | tee -a "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Restart grid-api

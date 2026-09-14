@@ -21,6 +21,13 @@ These constraints are stable schema, verified against griddb on 2026-09-11:
 Parsing SQL with a regex is crude, but the alternative is a live database in
 CI, and the failure this guards against is exactly the kind a unit test can
 see: a literal that is not in a fixed set.
+
+Scans ``migrations/versions/*.py`` as well as ``migrations/*.sql``. The raw
+.sql files are the legacy mechanism -- nothing in deploy runs them (see
+``migrations/RAW_SQL_LEDGER.md``) -- so new feature_registry rows arrive as
+alembic revisions now, and a guard that only read .sql would have gone quiet
+exactly when it started to matter. The same ``VALUES`` rows appear in a
+revision as a Python string literal, so one regex covers both.
 """
 from __future__ import annotations
 
@@ -51,7 +58,10 @@ _ROW = re.compile(
 
 def _files_inserting_into_feature_registry() -> list[Path]:
     out = []
-    for p in sorted(MIGRATIONS.glob("*.sql")):
+    candidates = sorted(MIGRATIONS.glob("*.sql")) + sorted(
+        (MIGRATIONS / "versions").glob("*.py")
+    )
+    for p in candidates:
         text = p.read_text(errors="replace")
         if re.search(r"INSERT\s+INTO\s+feature_registry", text, re.IGNORECASE):
             out.append(p)
