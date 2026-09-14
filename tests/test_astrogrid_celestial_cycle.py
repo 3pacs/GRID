@@ -175,8 +175,8 @@ def test_hermes_dry_run_passes_both_flags() -> None:
     from scripts import hermes_operator as ho
 
     src = inspect.getsource(ho.run_cycle)
-    start = src.index("# 7i. AstroGrid celestial cycle")
-    step = src[start : src.index("# 8. Git push", start)]
+    start = src.index("# 7c2. AstroGrid celestial cycle")
+    step = src[start : src.index("# 7d. Oracle prediction cycle", start)]
     assert "persist=not dry_run" in step
     assert "interpret=not dry_run" in step, (
         "dry run must skip the interpretation too, or `hermes_operator "
@@ -300,31 +300,31 @@ def test_hermes_celestial_step_fits_inside_the_cycle_budget() -> None:
     assert ho.ASTROGRID_CELESTIAL_TIMEOUT_SECONDS < ho.CYCLE_TIMEOUT_SECONDS
 
 
-def test_celestial_deferral_guard_is_reachable() -> None:
-    """The steps that precede 7i can exhaust the cycle, so the guard is live.
+def test_celestial_step_runs_before_the_oracle() -> None:
+    """Order is the point of this placement, so pin it.
 
-    Oracle alone (4000s) still leaves room for the 240s celestial step inside
-    the 4500s cycle cap, so pairwise arithmetic does not justify the guard.
-    What does is the sum: the budgeted steps that run *before* 7i total well
-    over the cycle cap, so a slow cycle can reach step 7i with less than the
-    step needs. If that ever stops being true the guard becomes dead code and
-    should be removed deliberately, not left as a misleading branch.
+    The step first shipped as 7i, last in the cycle, and never ran once in
+    two hours on 2026-09-14: four grid-hermes restarts each reset the
+    in-memory oracle gate, so every cycle spent itself on a fresh oracle pass
+    and nothing behind step 7d executed. A sub-second sky build plus one
+    bounded LLM call has no dependency on the oracle, so it belongs in front
+    of it. If someone moves it back, this fails.
     """
+    import inspect
+
     from scripts import hermes_operator as ho
 
-    preceding = (
-        ho.DIAGNOSE_PULLS_TIMEOUT_SECONDS
-        + ho.SMART_INGESTION_TIMEOUT_SECONDS
-        + ho.RESOLUTION_TIMEOUT_SECONDS
-        + ho.ORACLE_CYCLE_TIMEOUT_SECONDS
-        + ho.TIMESFM_TIMEOUT_SECONDS
-        + ho.SIGNAL_CLASSIFICATION_TIMEOUT_SECONDS
-        + ho.ANOMALY_NARRATION_TIMEOUT_SECONDS
-        + ho.KNOWLEDGE_MAP_TIMEOUT_SECONDS
-        + ho.INTELLIGENCE_TASKS_TIMEOUT_SECONDS
-    )
-    assert preceding > ho.CYCLE_TIMEOUT_SECONDS, (
-        "Steps before the celestial step no longer total more than the cycle "
-        "budget; the deferral guard in run_cycle step 7i may now be "
-        "unreachable."
-    )
+    src = inspect.getsource(ho.run_cycle)
+    assert src.index("# 7c2. AstroGrid celestial cycle") < src.index(
+        "# 7d. Oracle prediction cycle"
+    ), "the celestial step must run before the oracle, not behind it"
+
+
+# NOTE: an earlier test asserted the deferral guard was *reachable*, on the
+# grounds that the budgeted steps ahead of the celestial step summed to more
+# than CYCLE_TIMEOUT_SECONDS. Moving the step in front of the oracle makes
+# that false -- only diagnose (240) + smart ingestion (300) + resolution (420)
+# are budgeted before it now. That test existed to force exactly this
+# decision, and the decision is: keep the guard, because the unbudgeted steps
+# that still run first have no cap and a slow cycle can arrive here late; drop
+# the reachability claim, which no longer holds.
