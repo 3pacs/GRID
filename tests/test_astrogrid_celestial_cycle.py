@@ -1,0 +1,330 @@
+"""Tests for the AstroGrid celestial production cycle.
+
+Background
+----------
+AstroGrid's celestial half had no scheduler. ``save_snapshot`` was reachable
+only from ``GET /astrogrid/snapshot`` and ``save_interpretation`` only from
+``POST /astrogrid/interpret``, so ``astrogrid.sky_snapshot`` stopped gaining
+rows on 2026-04-28 (187 rows), ``persona_run`` on 2026-05-01 (3 rows), and
+``seer_run``/``engine_run`` never held one — while the learning half kept
+running hourly on its own timer the whole time.
+
+``oracle.astrogrid_cycle.run_celestial_cycle`` is the missing producer. These
+tests drive the real function against recording doubles; none of them pins a
+constant for its own sake.
+"""
+
+from __future__ import annotations
+
+from datetime import date
+from typing import Any
+
+import pytest
+
+
+class _RecordingStore:
+    """Stands in for AstroGridStore, recording what the cycle persists."""
+
+    def __init__(
+        self,
+        *,
+        snapshot_id: int | None = 42,
+        snapshot_exc: Exception | None = None,
+        interpretation_exc: Exception | None = None,
+    ) -> None:
+        self.snapshots: list[dict[str, Any]] = []
+        self.interpretations: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        self._snapshot_id = snapshot_id
+        self._snapshot_exc = snapshot_exc
+        self._interpretation_exc = interpretation_exc
+
+    def save_snapshot(self, snapshot: dict[str, Any]) -> int | None:
+        if self._snapshot_exc is not None:
+            raise self._snapshot_exc
+        self.snapshots.append(snapshot)
+        return self._snapshot_id
+
+    def save_interpretation(
+        self, request_payload: dict[str, Any], response_payload: dict[str, Any]
+    ) -> dict[str, int | None]:
+        if self._interpretation_exc is not None:
+            raise self._interpretation_exc
+        self.interpretations.append((request_payload, response_payload))
+        return {"engine_run_id": 1, "seer_run_id": 2, "persona_run_id": 3}
+
+
+def _fake_snapshot(target: date) -> dict[str, Any]:
+    return {
+        "date": str(target),
+        "timestamp": "2026-09-14T08:00:00+00:00",
+        "source": "analysis.ephemeris",
+        "objects": [],
+        "aspects": [{"a": "MARS", "b": "SATURN", "type": "square"}],
+        "events": [{"kind": "lunar", "label": "waxing gibbous"}],
+        "seer": {"reading": "deterministic", "prediction": "none", "why": []},
+        "signals": {"planetaryStress": 3},
+    }
+
+
+@pytest.fixture
+def patched_cycle(monkeypatch: pytest.MonkeyPatch):
+    """Patch the helper imports the cycle performs lazily, inside the function.
+
+    ``run_celestial_cycle`` imports from ``api.routers.astrogrid_helpers`` at
+    call time to keep FastAPI out of Hermes' import graph, so patching must
+    target that module rather than ``oracle.astrogrid_cycle``.
+    """
+    import api.routers.astrogrid_helpers as helpers
+
+    calls: dict[str, Any] = {"snapshot": 0, "interpretation": 0, "requests": []}
+
+    def _build_snapshot(target: date, engine: Any) -> dict[str, Any]:
+        calls["snapshot"] += 1
+        calls["snapshot_target"] = target
+        calls["snapshot_engine"] = engine
+        return _fake_snapshot(target)
+
+    def _build_interpretation(req: Any) -> dict[str, Any]:
+        calls["interpretation"] += 1
+        calls["requests"].append(req)
+        return {"summary": "s", "seer": {}, "used_llm": True}
+
+    monkeypatch.setattr(helpers, "build_snapshot", _build_snapshot)
+    monkeypatch.setattr(helpers, "build_interpretation", _build_interpretation)
+    return calls
+
+
+def _run(store: _RecordingStore, monkeypatch: pytest.MonkeyPatch, **kwargs):
+    import api.dependencies as deps
+    from oracle.astrogrid_cycle import run_celestial_cycle
+
+    monkeypatch.setattr(deps, "get_astrogrid_store", lambda: store)
+    return run_celestial_cycle(object(), **kwargs)
+
+
+def test_cycle_persists_snapshot_and_interpretation(
+    patched_cycle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole point: one call writes both halves of the celestial state."""
+    store = _RecordingStore()
+    result = _run(store, monkeypatch, target=date(2026, 9, 14))
+
+    assert len(store.snapshots) == 1
+    assert len(store.interpretations) == 1
+    assert result["snapshot_id"] == 42
+    assert result["interpretation_ids"] == {
+        "engine_run_id": 1,
+        "seer_run_id": 2,
+        "persona_run_id": 3,
+    }
+    assert result["errors"] == []
+
+
+def test_interpretation_reads_the_snapshot_that_was_stored(
+    patched_cycle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The seer must interpret the stored sky, not a separately recomputed one.
+
+    Building the snapshot twice would let the stored state and the
+    interpretation disagree across a minute boundary.
+    """
+    store = _RecordingStore()
+    _run(store, monkeypatch, target=date(2026, 9, 14))
+
+    assert patched_cycle["snapshot"] == 1, "snapshot must be built exactly once"
+    req = patched_cycle["requests"][0]
+    assert req.snapshot == store.snapshots[0]
+
+
+def test_persist_false_builds_but_never_writes(
+    patched_cycle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _RecordingStore()
+    result = _run(store, monkeypatch, target=date(2026, 9, 14), persist=False)
+
+    assert store.snapshots == []
+    assert store.interpretations == []
+    assert patched_cycle["snapshot"] == 1
+    assert patched_cycle["interpretation"] == 1
+    assert result["persisted"] is False
+
+
+def test_interpret_false_skips_the_llm_call(
+    patched_cycle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Hermes dry run must not spend a local-LLM call on a rehearsal.
+
+    It still builds the snapshot: that path is sub-second, deterministic and
+    side-effect free, so exercising it is the point of a dry run.
+    """
+    store = _RecordingStore()
+    result = _run(
+        store, monkeypatch, target=date(2026, 9, 14), persist=False, interpret=False
+    )
+
+    assert patched_cycle["snapshot"] == 1, "dry run should still build the sky"
+    assert patched_cycle["interpretation"] == 0, "dry run must not call the model"
+    assert result["interpretation_skipped"] is True
+    assert result["errors"] == []
+
+
+def test_hermes_dry_run_passes_both_flags() -> None:
+    """A dry-run cycle must neither write nor call the model."""
+    import inspect
+
+    from scripts import hermes_operator as ho
+
+    src = inspect.getsource(ho.run_cycle)
+    start = src.index("# 7i. AstroGrid celestial cycle")
+    step = src[start : src.index("# 8. Git push", start)]
+    assert "persist=not dry_run" in step
+    assert "interpret=not dry_run" in step, (
+        "dry run must skip the interpretation too, or `hermes_operator "
+        "--dry-run` spends up to ASTROGRID_CELESTIAL_TIMEOUT_SECONDS on a "
+        "local-LLM call that produces nothing"
+    )
+
+
+def test_defaults_to_today_when_no_target_given(
+    patched_cycle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _RecordingStore()
+    result = _run(store, monkeypatch)
+
+    assert patched_cycle["snapshot_target"] == date.today()
+    assert result["date"] == date.today().isoformat()
+
+
+def test_snapshot_build_failure_does_not_raise(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failing celestial cycle must not take the Hermes cycle down."""
+    import api.routers.astrogrid_helpers as helpers
+
+    def _boom(target: date, engine: Any) -> dict[str, Any]:
+        raise RuntimeError("ephemeris unavailable")
+
+    monkeypatch.setattr(helpers, "build_snapshot", _boom)
+    store = _RecordingStore()
+    result = _run(store, monkeypatch, target=date(2026, 9, 14))
+
+    assert result["snapshot_id"] is None
+    assert any("ephemeris unavailable" in e for e in result["errors"])
+    assert store.interpretations == [], "must not interpret a sky it failed to build"
+
+
+def test_snapshot_persist_failure_still_interprets(
+    patched_cycle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A store write failure is reported, not fatal — the build still happened."""
+    store = _RecordingStore(snapshot_exc=RuntimeError("db down"))
+    result = _run(store, monkeypatch, target=date(2026, 9, 14))
+
+    assert result["snapshot_id"] is None
+    assert any("snapshot_persist" in e for e in result["errors"])
+    assert patched_cycle["interpretation"] == 1
+
+
+def test_interpretation_persist_failure_is_reported_not_raised(
+    patched_cycle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _RecordingStore(interpretation_exc=RuntimeError("db down"))
+    result = _run(store, monkeypatch, target=date(2026, 9, 14))
+
+    assert len(store.snapshots) == 1
+    assert any("interpretation_persist" in e for e in result["errors"])
+
+
+def test_llm_absence_is_recorded_not_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Graceful degradation: no local model means a deterministic reading."""
+    import api.routers.astrogrid_helpers as helpers
+
+    monkeypatch.setattr(helpers, "build_snapshot", _fake_snapshot_builder())
+    monkeypatch.setattr(
+        helpers,
+        "build_interpretation",
+        lambda req: {"summary": "s", "seer": {}, "used_llm": False},
+    )
+    store = _RecordingStore()
+    result = _run(store, monkeypatch, target=date(2026, 9, 14))
+
+    assert result["used_llm"] is False
+    assert result["errors"] == []
+    assert len(store.interpretations) == 1, "a fallback reading is still worth storing"
+
+
+def _fake_snapshot_builder():
+    def _builder(target: date, engine: Any) -> dict[str, Any]:
+        return _fake_snapshot(target)
+
+    return _builder
+
+
+# ── Single-code-path invariants ──────────────────────────────────────────
+#
+# The scheduler and the HTTP route must stay on one implementation. If a
+# future edit re-inlines the build into a handler, the two paths drift and the
+# scheduled snapshot stops matching the one the UI shows — the exact class of
+# divergence that makes "is it producing?" unanswerable.
+
+
+def test_snapshot_route_delegates_to_the_shared_builder() -> None:
+    import inspect
+
+    from api.routers import astrogrid_core as core
+
+    src = inspect.getsource(core.get_snapshot)
+    assert "build_snapshot(" in src, "route must call the shared builder"
+    assert "build_astrological_ephemeris" not in src, (
+        "snapshot construction must live in astrogrid_helpers.build_snapshot, "
+        "not inline in the route — the Hermes celestial step calls the same "
+        "function and the two must not diverge"
+    )
+
+
+def test_interpret_route_delegates_to_the_shared_interpreter() -> None:
+    import inspect
+
+    from api.routers import astrogrid_core as core
+
+    src = inspect.getsource(core.interpret_snapshot)
+    assert "build_interpretation(" in src, "route must call the shared interpreter"
+    assert "get_llm" not in src, (
+        "the LLM call must live in astrogrid_helpers.build_interpretation, not "
+        "inline in the route — the Hermes celestial step calls the same function"
+    )
+
+
+def test_hermes_celestial_step_fits_inside_the_cycle_budget() -> None:
+    """The step's own budget must be small enough to ever run."""
+    from scripts import hermes_operator as ho
+
+    assert ho.ASTROGRID_CELESTIAL_TIMEOUT_SECONDS < ho.CYCLE_TIMEOUT_SECONDS
+
+
+def test_celestial_deferral_guard_is_reachable() -> None:
+    """The steps that precede 7i can exhaust the cycle, so the guard is live.
+
+    Oracle alone (4000s) still leaves room for the 240s celestial step inside
+    the 4500s cycle cap, so pairwise arithmetic does not justify the guard.
+    What does is the sum: the budgeted steps that run *before* 7i total well
+    over the cycle cap, so a slow cycle can reach step 7i with less than the
+    step needs. If that ever stops being true the guard becomes dead code and
+    should be removed deliberately, not left as a misleading branch.
+    """
+    from scripts import hermes_operator as ho
+
+    preceding = (
+        ho.DIAGNOSE_PULLS_TIMEOUT_SECONDS
+        + ho.SMART_INGESTION_TIMEOUT_SECONDS
+        + ho.RESOLUTION_TIMEOUT_SECONDS
+        + ho.ORACLE_CYCLE_TIMEOUT_SECONDS
+        + ho.TIMESFM_TIMEOUT_SECONDS
+        + ho.SIGNAL_CLASSIFICATION_TIMEOUT_SECONDS
+        + ho.ANOMALY_NARRATION_TIMEOUT_SECONDS
+        + ho.KNOWLEDGE_MAP_TIMEOUT_SECONDS
+        + ho.INTELLIGENCE_TASKS_TIMEOUT_SECONDS
+    )
+    assert preceding > ho.CYCLE_TIMEOUT_SECONDS, (
+        "Steps before the celestial step no longer total more than the cycle "
+        "budget; the deferral guard in run_cycle step 7i may now be "
+        "unreachable."
+    )

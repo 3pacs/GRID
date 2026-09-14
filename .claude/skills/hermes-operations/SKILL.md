@@ -32,6 +32,7 @@ Every 5 minutes, Hermes runs one cycle:
    7f.    Intelligence modules (trust scoring, forensics, etc.)
    7g.    Rotation paper trading (daily 17:00-17:30 UTC)
    7h.    Tiingo bulk data pull (overnight 02:00-06:00 UTC)
+   7i.    AstroGrid celestial cycle (hourly; sky snapshot + interpretation)
 8. Git push (commit analytical outputs)
 9. Save cycle snapshot
 ```
@@ -64,6 +65,22 @@ Every 5 minutes, Hermes runs one cycle:
    ```
 
 3. Use `getattr(state, attr, None)` for new state fields (backwards compatible)
+
+4. If the task is slow enough to need a `_run_with_timeout` budget, check the
+   cycle's remaining budget before starting it, and advance the state marker
+   only on a completed run:
+
+   ```python
+   elapsed = time.monotonic() - cycle_start
+   if CYCLE_TIMEOUT_SECONDS - elapsed < MY_TASK_TIMEOUT_SECONDS:
+       # defer; leave the marker alone so the next cycle retries
+   ```
+
+   The budgeted steps ahead of 7i already total more than
+   `CYCLE_TIMEOUT_SECONDS`, so a slow cycle can reach a late step with nothing
+   left — and a budgeted step that starts there takes the whole cycle down
+   rather than just itself. Cycles run every 5 minutes, so deferring costs one
+   cycle, not the slot. See step 7i for a worked example.
 
 ## Service Management
 
