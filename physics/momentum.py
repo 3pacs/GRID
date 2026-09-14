@@ -83,7 +83,14 @@ GDELT_TENSION_FEATURES = [
     "gdelt_tension_israel_iran",
     "gdelt_tension_india_china",
 ]
-PRICE_FEATURES = ["sp500_close"]
+# Price side of the sentiment-price cross-correlation. ``sp500_full`` is the
+# name normalization/entity_map.py maps ``YF:^GSPC:close`` onto, and so the
+# only S&P 500 close the resolver ever writes. The obvious-looking
+# ``sp500_close`` was here until 2026-09-14 and matches nothing: no mapping
+# targets it, so _resolve_feature_ids() returned {} and this analysis had
+# never run once, reporting "No price features available" instead.
+# tests/test_momentum_feature_contract.py fails on a name with no writer.
+PRICE_FEATURES = ["sp500_full"]
 
 
 class NewsMomentumAnalyzer:
