@@ -328,3 +328,72 @@ def test_celestial_step_runs_before_the_oracle() -> None:
 # decision, and the decision is: keep the guard, because the unbudgeted steps
 # that still run first have no cap and a slow cycle can arrive here late; drop
 # the reachability claim, which no longer holds.
+
+
+# ---------------------------------------------------------------------------
+# The real builder.
+#
+# Every test above replaces ``build_snapshot`` with a double, which is correct
+# for testing the *cycle* but left the extracted builder itself uncovered. It
+# shipped in #493 with ``datetime.now(timezone.utc)`` on its last line and no
+# ``timezone`` import -- the name came from ``astrogrid_core``, which imports
+# it, and did not travel with the code. 263 tests stayed green because not one
+# of them called the function. In production it raised NameError on every
+# Hermes cycle *and* on every ``GET /astrogrid/snapshot``.
+#
+# These two drive the unpatched builder, so a bare name anywhere in it fails
+# here instead of on grid-svr.
+# ---------------------------------------------------------------------------
+
+
+class _DeadEngine:
+    """An engine whose every connection attempt fails.
+
+    ``_get_latest_resolved`` and ``_get_market_regime`` both swallow engine
+    exceptions and degrade to ``None``, so the builder is exercised end to end
+    with no database: the solar and regime lookups take their failure path and
+    everything else is pure ephemeris arithmetic.
+    """
+
+    def connect(self) -> Any:
+        raise RuntimeError("no database in this test")
+
+
+def test_real_build_snapshot_returns_a_payload_without_a_database() -> None:
+    """The unpatched builder must run to completion and return the payload."""
+    from api.routers.astrogrid_helpers import build_snapshot
+
+    target = date(2026, 9, 14)
+    snapshot = build_snapshot(target, _DeadEngine())
+
+    # The last statement of the function is the return dict, so a bare name
+    # there is only caught by reading what comes back.
+    assert snapshot["date"] == str(target)
+    assert snapshot["timestamp"].startswith("2026-")
+    for key in ("objects", "aspects", "events", "signals", "seer", "grid"):
+        assert key in snapshot, f"{key} missing from the snapshot payload"
+
+    # Degradation, not silence: the DB is gone, so the DB-backed solar
+    # features are None while the computed fallback still lands.
+    solar = snapshot["grid"]["solar"]
+    assert solar["geomagnetic_kp_index"] is None
+    assert isinstance(solar["solar_cycle_phase"], float)
+
+
+def test_cycle_persists_a_snapshot_built_by_the_real_builder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Hermes path end to end, with nothing but the store faked.
+
+    ``patched_cycle`` is deliberately absent here. This is the exact call
+    Hermes step 7c2 makes, and it is the one that was failing in production
+    while every mocked test passed.
+    """
+    store = _RecordingStore()
+    result = _run(store, monkeypatch, target=date(2026, 9, 14), interpret=False)
+
+    assert result["errors"] == [], f"real builder reported errors: {result['errors']}"
+    assert result["snapshot_id"] == 42
+    assert len(store.snapshots) == 1
+    assert store.snapshots[0]["date"] == "2026-09-14"
+    assert store.snapshots[0]["timestamp"]
