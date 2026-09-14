@@ -92,7 +92,7 @@ SIGNAL_CLASSIFICATION_TIMEOUT_SECONDS = 120   # gemma micro classifier batch
 ANOMALY_NARRATION_TIMEOUT_SECONDS = 90        # gemma micro anomaly narrator
 KNOWLEDGE_MAP_TIMEOUT_SECONDS = 120           # gemma micro knowledge mapper
 DIAGNOSE_PULLS_TIMEOUT_SECONDS = 240          # Hermes pull diagnosis/fix step — bumped 2026-05-08 because diagnose runs per-source retry which can chain HTTP calls
-RESOLUTION_TIMEOUT_SECONDS = 240              # normalization.resolver.Resolver.resolve_pending — see RESOLUTION_CYCLE_LOOKBACK_DAYS
+RESOLUTION_TIMEOUT_SECONDS = 420              # normalization.resolver.Resolver.resolve_pending. Outer guard only — RESOLUTION_SCAN_BUDGET_SECONDS is what bounds the step. Must hold that budget (180) + one slice of overshoot capped at MIN_SCAN_SLICE_TIMEOUT_S (60) + the worst resolve phase observed live on 2026-09-14 (77.5s, cycle 6014) = 317.5s. Was 240, which the 371-411s cold scan of ops-exec run 292 did not fit inside. tests/test_hermes_resolution_watermark.py pins the invariant.
 SMART_INGESTION_TIMEOUT_SECONDS = 300         # smart_scheduler.tick() — matches TICK_TIME_BUDGET_S in ingestion/smart_scheduler.py so Hermes doesn't pull the plug while SmartScheduler is mid-shutdown
 TIMESFM_TIMEOUT_SECONDS = 240                 # oracle/forecaster_adapter.run_timesfm_forecast_cycle
 DAILY_INTEL_BATCH_OBSERVED_S = 360            # observed run length of the 02:00 daily block (source_audit → backtest_scan → postmortem → options_improvement → hypothesis_review → auto_discover) with LLM calls, measured 2026-05-08
@@ -138,18 +138,70 @@ EARNINGS_CALENDAR_SYNC_INTERVAL_MINUTES = 30
 # cycle runs every 5 minutes, so it passes a 2-day window, narrowed further by
 # a watermark (state.last_resolution, persisted with the rest of OperatorState
 # in the hermes_operator analytical_snapshots payload and rehydrated on
-# restart). The watermark is the time the last successful run STARTED, minus
-# an overlap margin, so a row pulled while the resolver was running is picked
-# up next cycle instead of being skipped.
+# restart). The watermark is how far the last run actually scanned, minus an
+# overlap margin, so a row pulled while the resolver was running is picked up
+# next cycle instead of being skipped.
 #
-# Measured on griddb 2026-09-11 (ops-exec run 34548358613, raw_series at
-# 1.93B rows / 510 GB): the cold 2-day window costs 1.8s for the DISTINCT
-# (18,865 series, index scan on idx_raw_series_pull_timestamp) plus 6.2s to
-# fetch its 655,376 rows — ~8s of SELECT inside a 240s budget. Once the
-# watermark is set the window is the overlap plus one cycle, not two days.
+# MEASUREMENT — where this step's time actually goes
+# --------------------------------------------------
+# Two griddb measurements, both real, taken under different cache states.
+# raw_series is 511 GB / 1.93e9 rows with ten indexes totalling ~344 GB.
+#
+#   ops-exec run 292 (2026-09-14, COLD): sampling pg_stat_activity every 20s
+#     caught the rolling 2-day DISTINCT at 371s, 391s and 411s, on
+#     IO:DataFileRead throughout. Re-run ~2 minutes later: 33.9s warm,
+#     246,093 rows yielding 9,636 distinct series.
+#
+#   ops-exec run 312 (2026-09-14 05:41 UTC, WARM, and under load — host load
+#     average 23, sdc 82% util / 90ms r_await with a pg_basebackup at 84.8%):
+#     the same 2-day window, now sliced 13 ways by #487, scanned in 0.2s
+#     total, max slice 0.1s, 233,664 rows yielding 8,617 distinct series. A
+#     second identical pass also took 0.2s. The full resolve_pending (dry
+#     run) over that window took 12.2s — so ~0.2s of scan and ~12s of
+#     resolve.
+#
+# Which corrects the note this replaces (ops-exec run 34548358613, 1.8s for
+# the DISTINCT plus 6.2s to fetch 655,376 rows) on two points. It is not
+# wrong about the number — 1.8s is the same order as run 312's 0.2s — but it
+# was labelled COLD and it is a warm measurement; run 292 is what this
+# statement costs when the cache really is cold, and that is 200x larger and
+# larger than the step budget. And the scan is not where the step's time
+# goes: eight consecutive live cycles on 2026-09-14 (6008-6015) ran the step
+# in 10.5s, 22.3s, 10.8s, 15.9s, 20.6s, 19.3s, 77.5s and 10.5s, and in the
+# 77.5s one the scan finished in ~1s and a single resolver worker accounted
+# for ~76s.
+#
+# So the budget below is sized for the cold tail of the scan, and
+# RESOLUTION_TIMEOUT_SECONDS is sized to hold that budget plus the observed
+# worst-case resolve phase. Once the watermark is current the window is the
+# overlap plus one cycle — one slice — not two days.
 RESOLUTION_CYCLE_LOOKBACK_DAYS = 2
 RESOLUTION_WATERMARK_OVERLAP_HOURS = 2
 RESOLUTION_CYCLE_WORKERS = 4
+
+# Wall seconds the resolver's distinct-series scan may spend before it stops
+# starting slices and resolves the prefix it enumerated.
+#
+# This is the fix, not the timeout above it. Before this, a scan that outran
+# RESOLUTION_TIMEOUT_SECONDS threw away everything it had done:
+# _run_with_timeout abandoned the step, the watermark advanced only on a fully
+# clean run, so the next cycle re-scanned the identical cold window with the
+# identical budget. Nothing about the second attempt was more likely to
+# succeed than the first — the failure was self-perpetuating rather than
+# self-correcting.
+#
+# With a scan budget the truncated case is an ordinary successful return
+# carrying "scanned through here", so the watermark advances over the prefix
+# and the next cycle RESUMES instead of restarting. Progress is monotonic even
+# when every cycle is truncated. Raising the timeout alone would have left
+# that in place and moved the cliff.
+#
+# 180s at the ~34s-per-slice cold rate of run 292 (411s / 12 slices) is ~5
+# slices, so a cold 2-day catch-up completes over three cycles instead of
+# never. Against the steady-state window — the 2h overlap plus one cycle,
+# which is a single slice — it is ~5x headroom on a cold slice and ~1000x on
+# the 0.2s warm scan run 312 measured.
+RESOLUTION_SCAN_BUDGET_SECONDS = 180
 
 # Keep signal classification under its per-step timeout. The classifier makes
 # one local LLM call per signal and live calls can approach 15s each.
@@ -1376,6 +1428,47 @@ def _is_transient_db_error(exc: BaseException) -> bool:
     return isinstance(exc, OperationalError)
 
 
+def _watermark_from(
+    result: dict[str, Any], run_started: datetime,
+) -> datetime:
+    """How far a resolver summary proves the window was actually scanned.
+
+    ``scanned_through`` is the exclusive upper bound of the range the run
+    enumerated and resolved. It is the only honest watermark: advancing to
+    ``run_started`` after a truncated scan would claim the slices the budget
+    cut off, and those rows would never be resolved.
+
+    A summary without the key — an older resolver, or a double in a test —
+    falls back to ``run_started``, which is what the step used unconditionally
+    before the budget existed.
+
+    Timestamps survive a round trip through the snapshot payload as ISO
+    strings, so a string is parsed rather than trusted to compare.
+    """
+    raw = result.get("scanned_through")
+    if raw is None:
+        return run_started
+    if isinstance(raw, str):
+        try:
+            raw = datetime.fromisoformat(raw)
+        except ValueError:
+            log.warning(
+                "Resolution reported an unparseable scanned_through ({v}) — "
+                "holding the watermark at the run start instead",
+                v=result.get("scanned_through"),
+            )
+            return run_started
+    if not isinstance(raw, datetime):
+        return run_started
+    if raw.tzinfo is None:
+        raw = raw.replace(tzinfo=timezone.utc)
+    # Never claim more than the run could have seen: the scan's open end is
+    # reported as the moment the resolver started, which is at or after
+    # run_started, and a clock skew must not push the watermark into the
+    # future of this cycle.
+    return min(raw, run_started)
+
+
 def _run_resolution_step(engine: Any, state: OperatorState) -> dict[str, Any]:
     """Run conflict resolution for this cycle and report the outcome.
 
@@ -1384,11 +1477,38 @@ def _run_resolution_step(engine: Any, state: OperatorState) -> dict[str, Any]:
     warning and returned in ``cycle_result["resolution"]``, and the outcome is
     recorded on ``state.task_status`` (surfaced by the Hermes status payload).
 
-    The watermark only advances on a clean run — a timeout, an exception, or a
-    worker error leaves it where it was so the next cycle re-scans the window.
-    A run abandoned on timeout keeps going as an orphan thread (see
-    _run_with_timeout); that is safe here because every insert is
-    ``ON CONFLICT ... DO NOTHING``, so the worst case is duplicated effort.
+    The watermark advances to how far the run actually SCANNED, never to how
+    far it was asked to scan. A run that stops at RESOLUTION_SCAN_BUDGET_SECONDS
+    returns normally, reporting ``scanned_through`` short of the window's end;
+    the watermark moves there and the next cycle resumes from it. That is the
+    difference between a slow database costing one slice of progress and
+    costing all of it:
+
+      * the watermark used to advance only on a fully clean run, so a cycle
+        that ran out of budget re-scanned the same cold window next time,
+        with the same budget, and ran out again. Nothing about the retry was
+        more likely to succeed than the attempt before it;
+      * a run abandoned at the timeout also leaves its worker thread alive
+        with an open transaction (see _run_with_timeout), and a long-lived
+        snapshot blocks CREATE/DROP INDEX CONCURRENTLY database-wide. The scan
+        budget is what keeps the step inside its timeout, so that path is no
+        longer the normal way a slow cycle ends.
+
+    _run_with_timeout also calls ``blacklist_for_timeout("resolution")``, but
+    unlike oracle_cycle, signal_classification, anomaly_narration and
+    knowledge_mapping, nothing here consults ``cooldowns.can_retry()`` — so
+    that entry has never actually skipped a resolution step. Production on
+    2026-09-14 showed exactly that: ``resolution`` blacklisted until 10:15
+    UTC while every cycle from 6008 to 6015 ran it and succeeded. The entry is
+    left as-is deliberately; honouring it here would introduce a 24h stall
+    that does not currently exist. It is a misleading health signal, not a
+    live failure mode.
+
+    A timeout, an exception, or a worker error still holds the watermark
+    exactly where it was: those runs cannot say how much of their work
+    landed. A run abandoned on timeout keeps going as an orphan thread; that
+    is safe here because every insert is ``ON CONFLICT ... DO NOTHING``, so
+    the worst case is duplicated effort.
 
     Args:
         engine: SQLAlchemy engine for the GRID database.
@@ -1417,6 +1537,7 @@ def _run_resolution_step(engine: Any, state: OperatorState) -> dict[str, Any]:
                 lookback_days=RESOLUTION_CYCLE_LOOKBACK_DAYS,
                 workers=RESOLUTION_CYCLE_WORKERS,
                 since=since,
+                scan_budget_s=RESOLUTION_SCAN_BUDGET_SECONDS,
             )
         except Exception as exc:
             failure["error"] = str(exc)
@@ -1476,12 +1597,26 @@ def _run_resolution_step(engine: Any, state: OperatorState) -> dict[str, Any]:
         )
         return result
 
-    state.last_resolution = run_started
+    advanced = _watermark_from(result, run_started)
+    if state.last_resolution is None or advanced > state.last_resolution:
+        state.last_resolution = advanced
     state.record_task("resolution", True, time.time() - step_t0)
+    if not result.get("scan_complete", True):
+        # Operational, not a fault — the step did its job inside its budget
+        # and made real progress. Worth a warning because a cycle that keeps
+        # reporting this is behind and catching up a slice at a time.
+        log.warning(
+            "Resolution stopped at its scan budget — the window opened at "
+            "{o} and the watermark advanced to {w}; the rest resumes next "
+            "cycle",
+            o=since, w=state.last_resolution,
+        )
     log.info(
-        "Resolution: {r} rows resolved, {c} conflicts, {s} series in {t}s",
+        "Resolution: {r} rows resolved, {c} conflicts, {s} series in {t}s "
+        "(scanned through {w}, complete={k})",
         r=result.get("resolved", 0), c=result.get("conflicts_found", 0),
         s=result.get("series_scanned", 0), t=result.get("duration_s", 0),
+        w=state.last_resolution, k=result.get("scan_complete", True),
     )
     return result
 

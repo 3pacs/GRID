@@ -312,6 +312,11 @@ class TestSingleSourceUnit:
         assert set(summary.keys()) == {
             "resolved", "conflicts_found", "errors",
             "series_scanned", "duration_s", "dry_run", "unmapped",
+            # How far the distinct-series scan actually got, and whether that
+            # is the whole window. The Hermes cycle keys its watermark off
+            # these, so a return path that omits them silently costs a cycle
+            # its progress — see normalization.resolver._scan_series_ids.
+            "scanned_through", "scan_complete",
         }
 
     @patch("normalization.resolver.EntityMap")
@@ -1385,6 +1390,7 @@ class TestResolutionWindow:
         assert set(summary) == {
             "resolved", "conflicts_found", "errors",
             "series_scanned", "duration_s", "dry_run", "unmapped",
+            "scanned_through", "scan_complete",
         }
         assert set(summary["unmapped"]) == {
             "lookups_missed", "series_ids", "unregistered_features",

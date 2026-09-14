@@ -63,6 +63,20 @@ MIN_BACKFILL_CHUNK_SECONDS: int = 3600  # one hour
 # becomes 12 statements of ~30s rather than one of ~400s.
 DISTINCT_SCAN_SLICE_HOURS: int = 4
 
+# Floor on the per-statement timeout a budgeted scan gives one slice.
+#
+# A budgeted scan caps each slice at the budget it has left, so the scan as a
+# whole cannot outlive its budget — without that, a single slice could sit on
+# _RESOLVE_STATEMENT_TIMEOUT_MS (10 minutes) and blow through the step timeout
+# the budget exists to stay inside, which puts the run straight back on the
+# orphaned-thread-plus-24h-blacklist path. The floor keeps the last slice of a
+# nearly-spent budget from being handed a timeout too short to be worth
+# starting; it is why worst-case scan time is budget + this, not budget.
+#
+# 60s against the ~34s cold slice measured on griddb (411s / 12 slices) is
+# roughly 2x headroom.
+MIN_SCAN_SLICE_TIMEOUT_S: int = 60
+
 
 def _is_statement_timeout(exc: BaseException) -> bool:
     """True when a failure is the statement timeout that narrowing can fix.
@@ -199,17 +213,27 @@ class Resolver:
     # by _set_statement_timeout.
     _RESOLVE_STATEMENT_TIMEOUT_MS: int = 600_000  # 10 minutes
 
-    def _set_statement_timeout(self, conn: Any) -> None:
-        """Raise this transaction's statement_timeout for the bulk scans.
+    def _set_statement_timeout(
+        self, conn: Any, timeout_ms: int | None = None,
+    ) -> None:
+        """Raise (or lower) this transaction's statement_timeout.
 
         ``set_config(..., is_local => true)`` is ``SET LOCAL`` with a bound
         parameter. Plain ``SET`` only accepts a literal, so it would force
         the value into the SQL string — which is what .claude/rules
         forbids, and what this replaced.
+
+        Args:
+            conn: Connection inside an open transaction.
+            timeout_ms: Override for this statement. Defaults to
+                ``_RESOLVE_STATEMENT_TIMEOUT_MS``. A budgeted scan passes a
+                smaller value so one slice cannot outlive the whole budget.
         """
+        if timeout_ms is None:
+            timeout_ms = self._RESOLVE_STATEMENT_TIMEOUT_MS
         conn.execute(
             text("SELECT set_config('statement_timeout', :timeout_ms, true)"),
-            {"timeout_ms": str(self._RESOLVE_STATEMENT_TIMEOUT_MS)},
+            {"timeout_ms": str(int(timeout_ms))},
         )
 
     _DISTINCT_SERIES_SQL = """
@@ -267,8 +291,13 @@ class Resolver:
         slices.append((start, until))
         return slices
 
-    def _distinct_series_ids(self, window_params: dict[str, Any]) -> list[str]:
-        """The series_ids with data in the window, read in bounded slices.
+    def _scan_series_ids(
+        self,
+        window_params: dict[str, Any],
+        scan_budget_s: float | None = None,
+        open_end: datetime | None = None,
+    ) -> tuple[list[str], datetime, bool]:
+        """Scan the window for series_ids, stopping at ``scan_budget_s``.
 
         One statement over the whole window holds an xmin for its entire
         duration — measured at ~400s cold on the rolling 2-day window — and
@@ -277,27 +306,103 @@ class Resolver:
         ``DISTINCT_SCAN_SLICE_HOURS``.
 
         The union of ``DISTINCT`` over contiguous slices is exactly
-        ``DISTINCT`` over their union, so the result is unchanged; only the
-        transaction lifetime is.
+        ``DISTINCT`` over their union, so a *complete* scan returns exactly
+        what one statement returned; only the transaction lifetime differs.
+
+        ``scan_budget_s`` makes a partial scan a first-class outcome rather
+        than a lost run. The Hermes cycle's per-step budget was smaller than
+        a COLD scan of its own 2-day window — 240s against the 371-411s
+        ops-exec run 292 measured — so the scan either finished or the whole
+        step was abandoned at its timeout with nothing to show. And because
+        the caller's watermark only advanced on a complete run, the next
+        cycle re-scanned the same cold window with the same budget: nothing
+        about the retry was more likely to succeed. Stopping at the budget
+        and reporting how far the scan actually got lets the caller advance
+        its watermark over the prefix that *was* enumerated, so each cycle
+        makes a slice of progress instead of none.
+
+        Warm, the same scan is 0.2s (ops-exec run 312, 13 slices, 233,664
+        rows, 8,617 distinct series), so this path is a tail case — but it is
+        the tail that used to cost the run everything.
+
+        The budget is checked between slices, never inside one: a slice is
+        either fully enumerated or not counted, so ``scanned_through`` never
+        claims a range the scan only partly covered. Overshoot is therefore
+        bounded by one slice.
+
+        Args:
+            window_params: ``since`` and optional ``until`` bounds.
+            scan_budget_s: Wall seconds after which no *new* slice is
+                started. None (the default, and every manual/backfill
+                caller) scans the whole window as before.
+            open_end: Value to report as ``scanned_through`` when the window
+                has no upper bound and the scan completed. Defaults to the
+                moment the scan started, which is conservative: the final
+                unbounded slice sees everything up to when its statement
+                runs, which is later.
+
+        Returns:
+            ``(series_ids, scanned_through, complete)``. ``scanned_through``
+            is always a datetime — the exclusive upper bound of the range
+            actually enumerated — so a caller can use it as a watermark
+            without having to interpret None.
         """
         since = window_params["since"]
         until = window_params.get("until")
         slices = self._scan_slices(
             since, until, timedelta(hours=DISTINCT_SCAN_SLICE_HOURS)
         )
+        started = time.monotonic()
+        if open_end is None:
+            open_end = datetime.now(getattr(since, "tzinfo", None))
 
         found: set[str] = set()
+        scanned_through: datetime = since
+        complete = False
         for index, (slice_since, slice_until) in enumerate(slices, start=1):
+            slice_timeout_ms = None
+            if scan_budget_s is not None:
+                remaining = scan_budget_s - (time.monotonic() - started)
+                slice_timeout_ms = int(
+                    max(remaining, MIN_SCAN_SLICE_TIMEOUT_S) * 1000
+                )
             # A transaction per slice, so SET LOCAL applies and each one ends
             # promptly. db.py's global 120s cap is far too short for even one
             # slice of this scan.
-            with self.engine.begin() as conn:
-                self._set_statement_timeout(conn)
-                rows = conn.execute(
-                    text(self._DISTINCT_SERIES_SQL),
-                    {"since": slice_since, "until": slice_until},
-                ).fetchall()
+            try:
+                with self.engine.begin() as conn:
+                    self._set_statement_timeout(conn, slice_timeout_ms)
+                    rows = conn.execute(
+                        text(self._DISTINCT_SERIES_SQL),
+                        {"since": slice_since, "until": slice_until},
+                    ).fetchall()
+            except Exception as exc:
+                # A slice killed by its own timeout is the budget doing its
+                # job from inside the statement. Keep the slices that already
+                # landed and report the prefix — losing them is the failure
+                # this whole mechanism exists to prevent.
+                #
+                # The FIRST slice is different: nothing completed, so there is
+                # no prefix to report and nothing to salvage. Let it out, so
+                # the caller sees a real (transient) failure rather than a
+                # silent no-op cycle.
+                if (scan_budget_s is None or index == 1
+                        or not _is_statement_timeout(exc)):
+                    raise
+                log.warning(
+                    "series_id scan slice {i}/{n} hit its {t}s statement "
+                    "timeout — keeping the {i0} slice(s) already scanned "
+                    "(through {w}) and resuming next cycle",
+                    i=index, n=len(slices),
+                    t=(slice_timeout_ms or 0) / 1000, i0=index - 1,
+                    w=scanned_through,
+                )
+                break
             found.update(r[0] for r in rows)
+            # The slice finished, so the range it covered is enumerated.
+            # An open final slice reports `open_end` rather than None: the
+            # caller needs a timestamp it can store as a watermark.
+            scanned_through = slice_until if slice_until is not None else open_end
             if len(slices) > 1:
                 log.debug(
                     "series_id scan slice {i}/{n} ({a} → {b}): {r} rows, "
@@ -306,7 +411,30 @@ class Resolver:
                     b=slice_until if slice_until is not None else "∞",
                     r=len(rows), t=len(found),
                 )
-        return sorted(found)
+            if index == len(slices):
+                complete = True
+                break
+            elapsed = time.monotonic() - started
+            if scan_budget_s is not None and elapsed >= scan_budget_s:
+                # Operational, not a fault: the database was slower than the
+                # budget. Warning rather than error per CLAUDE.md.
+                log.warning(
+                    "series_id scan stopped at its {b}s budget after {e:.1f}s "
+                    "({i}/{n} slices, scanned through {t}) — resolving the "
+                    "prefix; the rest resumes next cycle",
+                    b=scan_budget_s, e=elapsed, i=index, n=len(slices),
+                    t=scanned_through,
+                )
+                break
+        return sorted(found), scanned_through, complete
+
+    def _distinct_series_ids(self, window_params: dict[str, Any]) -> list[str]:
+        """The series_ids with data in the window, read in bounded slices.
+
+        Unbudgeted wrapper over ``_scan_series_ids`` for callers that only
+        want the ids and always scan the whole window.
+        """
+        return self._scan_series_ids(window_params)[0]
 
     def resolve_pending(
         self,
@@ -315,6 +443,7 @@ class Resolver:
         since: datetime | date | None = None,
         until: datetime | date | None = None,
         dry_run: bool = False,
+        scan_budget_s: float | None = None,
     ) -> dict[str, Any]:
         """Resolve raw_series → resolved_series using multithreaded workers.
 
@@ -338,21 +467,43 @@ class Resolver:
             dry_run: Run the SELECT + grouping + conflict detection but skip
                 every INSERT. ``resolved`` then counts rows that *would* be
                 written. Used to measure cost before changing the cycle.
+            scan_budget_s: Wall seconds the distinct-series scan may spend
+                before it stops starting slices and resolves the prefix it
+                enumerated. None (the default, and every manual/backfill
+                caller) scans the whole window. See ``_scan_series_ids``.
 
         Returns:
             dict with resolved, conflicts_found, errors, series_scanned,
-            duration_s, dry_run and unmapped (the EntityMap miss summary —
-            see EntityMap.missing_feature_report). Every return path carries
-            the same keys.
+            duration_s, dry_run, scanned_through, scan_complete and unmapped
+            (the EntityMap miss summary — see
+            EntityMap.missing_feature_report). Every return path carries the
+            same keys.
+
+            ``scanned_through`` is the exclusive upper bound of the range
+            this run actually enumerated and resolved, and ``scan_complete``
+            says whether that is the whole requested window. A caller keeping
+            a watermark advances it to ``scanned_through``, never past it —
+            that is the difference between a truncated run costing one slice
+            of progress and costing all of it.
+
+            It is an ISO-8601 **string**, not a datetime: this summary is
+            written straight into JSON by several callers — the Hermes cycle
+            snapshot, scripts/export_astrogrid_local_data.py's manifest — and
+            only some of them pass ``default=str``.
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import threading
 
         started_at = time.monotonic()
+        # Wall clock, captured before any scanning: what an unbounded window
+        # is reported as having been scanned through. Conservative — the
+        # final open slice actually sees rows written after this instant.
+        started_utc = datetime.now(timezone.utc)
         log.info(
             "Starting resolution (workers={w}, lookback={d}d, since={s}, "
-            "until={u}, dry_run={dr})",
+            "until={u}, dry_run={dr}, scan_budget={b})",
             w=workers, d=lookback_days, s=since, u=until, dr=dry_run,
+            b=scan_budget_s,
         )
 
         # Window bounds are passed to both statements below as bound
@@ -376,7 +527,16 @@ class Resolver:
             errors: int = 0,
             series: int = 0,
             unmapped: dict[str, Any] | None = None,
+            scanned_through: datetime | None = None,
+            scan_complete: bool = False,
         ) -> dict[str, Any]:
+            # A path that never reached the scan has enumerated nothing, so
+            # it reports the window's own lower bound: a watermark holder
+            # then advances by zero rather than over unscanned time.
+            through = (
+                scanned_through if scanned_through is not None
+                else window_params["since"]
+            )
             return {
                 "resolved": resolved,
                 "conflicts_found": conflicts,
@@ -384,6 +544,11 @@ class Resolver:
                 "series_scanned": series,
                 "duration_s": round(time.monotonic() - started_at, 2),
                 "dry_run": dry_run,
+                "scanned_through": (
+                    through.isoformat() if hasattr(through, "isoformat")
+                    else through
+                ),
+                "scan_complete": scan_complete,
                 "unmapped": unmapped if unmapped is not None else dict(empty_unmapped),
             }
 
@@ -404,12 +569,28 @@ class Resolver:
             log.warning("Could not load feature families: {e}", e=str(exc))
 
         log.info("Fetching distinct series_ids...")
-        all_series = self._distinct_series_ids(window_params)
-        log.info("Found {n} distinct series_ids to resolve", n=len(all_series))
+        all_series, scanned_through, scan_complete = self._scan_series_ids(
+            window_params, scan_budget_s=scan_budget_s, open_end=started_utc,
+        )
+        if not scan_complete:
+            # Resolve exactly the prefix the scan enumerated. Without this the
+            # worker fetch would still reach to the end of the window and
+            # resolve rows for series the scan never listed — an arbitrary
+            # subset, reported as if the whole window had been done.
+            window_params = {**window_params, "until": scanned_through}
+        log.info(
+            "Found {n} distinct series_ids to resolve (scanned through {t}, "
+            "complete={c})",
+            n=len(all_series), t=scanned_through, c=scan_complete,
+        )
 
         if not all_series:
             log.info("No pending observations to resolve")
-            return _summary(unmapped=entity_map.missing_feature_report())
+            return _summary(
+                unmapped=entity_map.missing_feature_report(),
+                scanned_through=scanned_through,
+                scan_complete=scan_complete,
+            )
 
         # Partition series_ids across workers
         chunk_size = max(1, len(all_series) // workers)
@@ -585,13 +766,16 @@ class Resolver:
             errors=totals["errors"],
             series=len(all_series),
             unmapped=unmapped,
+            scanned_through=scanned_through,
+            scan_complete=scan_complete,
         )
         log.info(
-            "Resolution complete — resolved={r}, conflicts={c}, errors={e}, "
-            "series={s}, {t}s{d}",
+            "Resolution {k} — resolved={r}, conflicts={c}, errors={e}, "
+            "series={s}, scanned through {w}, {t}s{d}",
+            k="complete" if scan_complete else "partial (budget)",
             r=summary["resolved"], c=summary["conflicts_found"],
             e=summary["errors"], s=summary["series_scanned"],
-            t=summary["duration_s"],
+            w=summary["scanned_through"], t=summary["duration_s"],
             d=" (dry run — nothing written)" if dry_run else "",
         )
         return summary
