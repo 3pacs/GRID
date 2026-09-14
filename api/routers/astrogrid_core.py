@@ -12,33 +12,23 @@ from loguru import logger as log
 from api.auth import require_auth
 from api.dependencies import get_astrogrid_store, get_db_engine
 from api.routers.astrogrid_helpers import (
-    AstroEphemeris,
     AstrogridInterpretRequest,
-    build_astrological_ephemeris,
+    build_interpretation,
+    build_snapshot,
     enrich_astrogrid_scoreable_universe,
     get_astrogrid_scoreable_universe,
-    _build_objects,
     _build_scorecard_evaluation,
     _build_scorecard_item,
     _build_scorecard_summary,
-    _build_signal_field,
-    _build_snapshot_events,
-    _build_snapshot_seer,
     _compute_full_ephemeris,
-    _fallback_interpretation,
-    _build_interpret_messages,
     _get_latest_resolved,
-    _get_market_regime,
     _group_scorecard_items,
     _interpret_kp,
-    _llm_backend_name,
     _MERCURY_RETROGRADES,
-    _parse_json_response,
     _parse_snapshot_date,
     _phase_name,
     _resolve_scorecard_feature,
     _load_scorecard_history,
-    _solar_cycle_phase,
 )
 
 router = APIRouter(tags=["astrogrid"])
@@ -174,76 +164,7 @@ async def get_snapshot(
         return {"error": str(exc)}
 
     engine = get_db_engine()
-    ephemeris = AstroEphemeris()
-    full_ephemeris = build_astrological_ephemeris(target)
-    objects = _build_objects(target, ephemeris, full_ephemeris)
-
-    solar_features: dict[str, Any] = {
-        "geomagnetic_kp_index": None,
-        "sunspot_number": None,
-        "solar_wind_speed": None,
-        "solar_cycle_phase": None,
-    }
-    for feature_name in solar_features:
-        solar_features[feature_name], _ = _get_latest_resolved(engine, feature_name)
-
-    if solar_features["solar_cycle_phase"] is None:
-        solar_features["solar_cycle_phase"] = round(_solar_cycle_phase(target), 6)
-
-    market_regime, market_bias = _get_market_regime(engine, target)
-    signals, signal_field = _build_signal_field(
-        full_ephemeris["lunar_phase"],
-        full_ephemeris["nakshatra"],
-        full_ephemeris["aspects"],
-        objects,
-        solar_features,
-        market_regime,
-        market_bias,
-        full_ephemeris["void_of_course"],
-    )
-    events = _build_snapshot_events(
-        target,
-        full_ephemeris["lunar_phase"],
-        full_ephemeris["nakshatra"],
-        full_ephemeris["aspects"],
-        full_ephemeris["void_of_course"],
-    )
-    seer = _build_snapshot_seer(
-        full_ephemeris["lunar_phase"],
-        full_ephemeris["nakshatra"],
-        signals,
-        events,
-    )
-
-    source_parts = ["analysis.ephemeris"]
-    if any(value is not None for value in solar_features.values()):
-        source_parts.append("resolved_series")
-    if market_regime is not None:
-        source_parts.append("regime_history")
-
-    snapshot = {
-        "date": str(target),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "source": "+".join(source_parts),
-        "objects": objects,
-        "bodies": objects,
-        "positions": full_ephemeris["positions"],
-        "aspects": full_ephemeris["aspects"],
-        "lunar": full_ephemeris["lunar_phase"],
-        "nakshatra": full_ephemeris["nakshatra"],
-        "void_of_course": full_ephemeris["void_of_course"],
-        "retrograde_planets": full_ephemeris["retrograde_planets"],
-        "summary": full_ephemeris["summary"],
-        "signals": signals,
-        "signal_field": signal_field,
-        "events": events,
-        "seer": seer,
-        "grid": {
-            "market_regime": market_regime,
-            "market_regime_bias": market_bias,
-            "solar": solar_features,
-        },
-    }
+    snapshot = build_snapshot(target, engine)
     try:
         get_astrogrid_store().save_snapshot(snapshot)
     except Exception as exc:
@@ -377,83 +298,9 @@ async def interpret_snapshot(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Run a model-backed interpretation over deterministic AstroGrid state."""
-    fallback = _fallback_interpretation(req)
-
+    result = build_interpretation(req)
     try:
-        from llm.router import get_llm, Tier
-
-        client = get_llm(Tier.LOCAL)
-        backend = _llm_backend_name(client)
-        model = getattr(client, "model", None)
-        if not getattr(client, "is_available", False):
-            fallback["backend"] = backend
-            fallback["model"] = model
-            return fallback
-
-        messages = _build_interpret_messages(req)
-        raw = client.chat(
-            messages=messages,
-            temperature=0.2,
-            num_predict=1200,
-        )
-        parsed = _parse_json_response(raw)
-        if not parsed:
-            fallback["backend"] = backend
-            fallback["model"] = model
-            return fallback
-
-        summary = str(parsed.get("summary") or fallback["summary"])
-        seer = (
-            parsed.get("seer")
-            if isinstance(parsed.get("seer"), dict)
-            else fallback["seer"]
-        )
-        threads = (
-            parsed.get("threads")
-            if isinstance(parsed.get("threads"), list)
-            else fallback["threads"]
-        )
-        engine_notes = (
-            parsed.get("engine_notes")
-            if isinstance(parsed.get("engine_notes"), list)
-            else fallback["engine_notes"]
-        )
-        tone_notes = (
-            parsed.get("tone_notes")
-            if isinstance(parsed.get("tone_notes"), list)
-            else fallback["tone_notes"]
-        )
-
-        result = {
-            "summary": summary,
-            "seer": {
-                "reading": str(seer.get("reading") or fallback["seer"]["reading"]),
-                "prediction": str(seer.get("prediction") or fallback["seer"]["prediction"]),
-                "why": list(seer.get("why") or fallback["seer"]["why"])[:6],
-                "warnings": list(seer.get("warnings") or fallback["seer"]["warnings"])[:6],
-            },
-            "threads": threads[:12],
-            "engine_notes": engine_notes[:8],
-            "tone_notes": tone_notes[:6],
-            "used_llm": True,
-            "backend": backend,
-            "model": model,
-            "raw_length": len(raw or ""),
-        }
-        try:
-            get_astrogrid_store().save_interpretation(req.model_dump(), result)
-        except Exception as persist_exc:
-            log.warning(
-                "AstroGrid interpret store unavailable: {e}", e=str(persist_exc)
-            )
-        return result
-    except Exception as exc:
-        log.warning("AstroGrid interpretation failed: {e}", e=str(exc))
-        fallback["error"] = str(exc)
-        try:
-            get_astrogrid_store().save_interpretation(req.model_dump(), fallback)
-        except Exception as persist_exc:
-            log.warning(
-                "AstroGrid fallback store unavailable: {e}", e=str(persist_exc)
-            )
-        return fallback
+        get_astrogrid_store().save_interpretation(req.model_dump(), result)
+    except Exception as persist_exc:
+        log.warning("AstroGrid interpret store unavailable: {e}", e=str(persist_exc))
+    return result

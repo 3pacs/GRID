@@ -152,6 +152,8 @@ __all__ = [
     "_build_signal_field",
     "_build_snapshot_events",
     "_build_snapshot_seer",
+    "build_snapshot",
+    "build_interpretation",
     "_llm_backend_name",
     "_top_snapshot_threads",
     "_compact_engine_outputs",
@@ -1089,6 +1091,174 @@ def _build_snapshot_seer(
         "supporting_lenses": list(dict.fromkeys(supporting_lenses)),
         "conflicts": conflicts,
     }
+
+
+def build_snapshot(target: date, engine: Any) -> dict[str, Any]:
+    """Build the unified AstroGrid state payload for ``target``.
+
+    Extracted from the ``GET /astrogrid/snapshot`` handler so that callers
+    without an HTTP request — the Hermes celestial step — can produce the same
+    payload. The handler and the scheduler must stay on one code path: a
+    snapshot built by an out-of-band HTTP call to our own API would drift the
+    moment either side changed, and would make the scheduler depend on the
+    API process being up.
+
+    Pure build, no persistence. Callers decide whether to store the result.
+    """
+    ephemeris = AstroEphemeris()
+    full_ephemeris = build_astrological_ephemeris(target)
+    objects = _build_objects(target, ephemeris, full_ephemeris)
+
+    solar_features: dict[str, Any] = {
+        "geomagnetic_kp_index": None,
+        "sunspot_number": None,
+        "solar_wind_speed": None,
+        "solar_cycle_phase": None,
+    }
+    for feature_name in solar_features:
+        solar_features[feature_name], _ = _get_latest_resolved(engine, feature_name)
+
+    if solar_features["solar_cycle_phase"] is None:
+        solar_features["solar_cycle_phase"] = round(_solar_cycle_phase(target), 6)
+
+    market_regime, market_bias = _get_market_regime(engine, target)
+    signals, signal_field = _build_signal_field(
+        full_ephemeris["lunar_phase"],
+        full_ephemeris["nakshatra"],
+        full_ephemeris["aspects"],
+        objects,
+        solar_features,
+        market_regime,
+        market_bias,
+        full_ephemeris["void_of_course"],
+    )
+    events = _build_snapshot_events(
+        target,
+        full_ephemeris["lunar_phase"],
+        full_ephemeris["nakshatra"],
+        full_ephemeris["aspects"],
+        full_ephemeris["void_of_course"],
+    )
+    seer = _build_snapshot_seer(
+        full_ephemeris["lunar_phase"],
+        full_ephemeris["nakshatra"],
+        signals,
+        events,
+    )
+
+    source_parts = ["analysis.ephemeris"]
+    if any(value is not None for value in solar_features.values()):
+        source_parts.append("resolved_series")
+    if market_regime is not None:
+        source_parts.append("regime_history")
+
+    return {
+        "date": str(target),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source": "+".join(source_parts),
+        "objects": objects,
+        "bodies": objects,
+        "positions": full_ephemeris["positions"],
+        "aspects": full_ephemeris["aspects"],
+        "lunar": full_ephemeris["lunar_phase"],
+        "nakshatra": full_ephemeris["nakshatra"],
+        "void_of_course": full_ephemeris["void_of_course"],
+        "retrograde_planets": full_ephemeris["retrograde_planets"],
+        "summary": full_ephemeris["summary"],
+        "signals": signals,
+        "signal_field": signal_field,
+        "events": events,
+        "seer": seer,
+        "grid": {
+            "market_regime": market_regime,
+            "market_regime_bias": market_bias,
+            "solar": solar_features,
+        },
+    }
+
+
+def build_interpretation(req: "AstrogridInterpretRequest") -> dict[str, Any]:
+    """Interpret deterministic AstroGrid state, with or without an LLM.
+
+    Extracted from the ``POST /astrogrid/interpret`` handler so the Hermes
+    celestial step runs the identical path rather than a second implementation
+    that would drift. Persistence stays with the caller.
+
+    Degrades the way the rest of GRID does: if the local model is offline or
+    returns unparseable output, the deterministic fallback is returned and
+    marked ``used_llm: False``. It never raises.
+    """
+    fallback = _fallback_interpretation(req)
+
+    try:
+        from llm.router import get_llm, Tier
+
+        client = get_llm(Tier.LOCAL)
+        backend = _llm_backend_name(client)
+        model = getattr(client, "model", None)
+        if not getattr(client, "is_available", False):
+            fallback["backend"] = backend
+            fallback["model"] = model
+            return fallback
+
+        messages = _build_interpret_messages(req)
+        raw = client.chat(
+            messages=messages,
+            temperature=0.2,
+            num_predict=1200,
+        )
+        parsed = _parse_json_response(raw)
+        if not parsed:
+            fallback["backend"] = backend
+            fallback["model"] = model
+            return fallback
+
+        summary = str(parsed.get("summary") or fallback["summary"])
+        seer = (
+            parsed.get("seer")
+            if isinstance(parsed.get("seer"), dict)
+            else fallback["seer"]
+        )
+        threads = (
+            parsed.get("threads")
+            if isinstance(parsed.get("threads"), list)
+            else fallback["threads"]
+        )
+        engine_notes = (
+            parsed.get("engine_notes")
+            if isinstance(parsed.get("engine_notes"), list)
+            else fallback["engine_notes"]
+        )
+        tone_notes = (
+            parsed.get("tone_notes")
+            if isinstance(parsed.get("tone_notes"), list)
+            else fallback["tone_notes"]
+        )
+
+        return {
+            "summary": summary,
+            "seer": {
+                "reading": str(seer.get("reading") or fallback["seer"]["reading"]),
+                "prediction": str(
+                    seer.get("prediction") or fallback["seer"]["prediction"]
+                ),
+                "why": list(seer.get("why") or fallback["seer"]["why"])[:6],
+                "warnings": list(
+                    seer.get("warnings") or fallback["seer"]["warnings"]
+                )[:6],
+            },
+            "threads": threads[:12],
+            "engine_notes": engine_notes[:8],
+            "tone_notes": tone_notes[:6],
+            "used_llm": True,
+            "backend": backend,
+            "model": model,
+            "raw_length": len(raw or ""),
+        }
+    except Exception as exc:
+        log.warning("AstroGrid interpretation failed: {e}", e=str(exc))
+        fallback["error"] = str(exc)
+        return fallback
 
 
 def _llm_backend_name(client: Any) -> str:
