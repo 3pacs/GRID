@@ -1986,6 +1986,78 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     except Exception as exc:
         log.warning("news_contagion_listener failed: {e}", e=str(exc))
 
+    # 7c2. AstroGrid celestial cycle — hourly, ahead of the oracle.
+    #
+    # AstroGrid's learning half (scoring/backtest/review) has its own
+    # astrogrid-learning.timer and is healthy. Its celestial half had no
+    # scheduler at all: sky snapshots and interpretations were written only
+    # when a browser hit the API, so astrogrid.sky_snapshot stopped on
+    # 2026-04-28, persona_run on 2026-05-01, and seer_run/engine_run never
+    # held a row. This step is the producer those tables were missing.
+    #
+    # Hourly rather than every cycle: the sky state a snapshot captures moves
+    # on the order of hours, and the interpretation costs a local LLM call.
+    #
+    # Placed BEFORE the oracle, not after it. It first shipped as 7i, last in
+    # the cycle, and in two hours on 2026-09-14 it never ran once: four
+    # grid-hermes restarts (16:02, 16:10, 17:05, 17:48) each built a fresh
+    # OperatorState, which reset last_oracle_cycle to None and reopened the
+    # 6-hour oracle gate, so every cycle started a full oracle pass and none
+    # reached the steps behind it -- "Alpha signals published" (7e) last
+    # appeared at 15:40, before any of the restarts. A sub-second sky build
+    # plus one bounded LLM call has no dependency on the oracle and no reason
+    # to queue behind it. The starvation of 7e-7h is a separate, shared
+    # problem: the oracle gate lives only in memory.
+    try:
+        now_utc = datetime.now(timezone.utc)
+        last_celestial = getattr(state, "_last_astrogrid_celestial_hour", None)
+        current_hour = now_utc.replace(minute=0, second=0, microsecond=0)
+        # Yield to a cycle that has already spent its budget: a 240s step
+        # started at 4400s would take the whole cycle down with it rather
+        # than just itself. The hour marker is left untouched, so the next
+        # cycle picks the hour up instead of losing it.
+        #
+        # Ahead of the oracle this is insurance rather than the common case:
+        # only diagnose (240) + smart ingestion (300) + resolution (420) are
+        # budgeted before it, well inside the 4500s cap. The unbudgeted steps
+        # that also run first -- pipeline, data gatherer, autoresearch,
+        # self-diagnostics, the 7a-7c digests -- have no cap of their own, so
+        # a slow cycle can still arrive here late. Kept for that case.
+        elapsed = time.monotonic() - cycle_start
+        budget_left = CYCLE_TIMEOUT_SECONDS - elapsed
+        if budget_left < ASTROGRID_CELESTIAL_TIMEOUT_SECONDS:
+            log.info(
+                "AstroGrid celestial cycle deferred — {b:.0f}s of cycle budget left,"
+                " needs {n}s",
+                b=budget_left,
+                n=ASTROGRID_CELESTIAL_TIMEOUT_SECONDS,
+            )
+            cycle_result["astrogrid_celestial"] = {
+                "deferred": "insufficient_cycle_budget",
+                "budget_left_s": round(budget_left, 1),
+            }
+        elif last_celestial != current_hour:
+            state.current_step = "astrogrid_celestial"
+            from oracle.astrogrid_cycle import run_celestial_cycle
+
+            celestial_result, ok = _run_with_timeout(
+                "astrogrid_celestial",
+                lambda: run_celestial_cycle(
+                    engine, persist=not dry_run, interpret=not dry_run
+                ),
+                ASTROGRID_CELESTIAL_TIMEOUT_SECONDS,
+                state,
+            )
+            if ok and celestial_result:
+                cycle_result["astrogrid_celestial"] = celestial_result
+                # Advance only on a completed run. A timeout leaves the marker
+                # alone so the next cycle retries instead of skipping the hour.
+                state._last_astrogrid_celestial_hour = current_hour
+            elif not ok:
+                cycle_result["astrogrid_celestial"] = {"timeout": True}
+    except Exception as exc:
+        log.warning("AstroGrid celestial cycle failed: {e}", e=str(exc))
+
     # 7d. Oracle prediction cycle (every 6 hours)
     try:
         now = datetime.now(timezone.utc)
@@ -2354,63 +2426,6 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
                     log.info("[DRY RUN] Would run Tiingo bulk pull")
     except Exception as exc:
         log.warning("Tiingo bulk pull failed: {e}", e=str(exc))
-
-    # 7i. AstroGrid celestial cycle — hourly.
-    #
-    # AstroGrid's learning half (scoring/backtest/review) has its own
-    # astrogrid-learning.timer and is healthy. Its celestial half had no
-    # scheduler at all: sky snapshots and interpretations were written only
-    # when a browser hit the API, so astrogrid.sky_snapshot stopped on
-    # 2026-04-28, persona_run on 2026-05-01, and seer_run/engine_run never
-    # held a row. This step is the producer those tables were missing.
-    #
-    # Hourly rather than every cycle: the sky state a snapshot captures moves
-    # on the order of hours, and the interpretation costs a local LLM call.
-    try:
-        now_utc = datetime.now(timezone.utc)
-        last_celestial = getattr(state, "_last_astrogrid_celestial_hour", None)
-        current_hour = now_utc.replace(minute=0, second=0, microsecond=0)
-        # Yield to a cycle that has already spent its budget. Oracle alone
-        # (4000s) still leaves room inside the 4500s cap; it is the running
-        # total of every step before this one that can exhaust it, and a 240s
-        # step starting at 4400s would take the whole cycle down with it
-        # rather than just itself. The hour marker is left untouched, so the
-        # next cycle picks the hour up instead of losing it.
-        # tests/test_astrogrid_celestial_cycle.py pins that this is reachable.
-        elapsed = time.monotonic() - cycle_start
-        budget_left = CYCLE_TIMEOUT_SECONDS - elapsed
-        if budget_left < ASTROGRID_CELESTIAL_TIMEOUT_SECONDS:
-            log.info(
-                "AstroGrid celestial cycle deferred — {b:.0f}s of cycle budget left,"
-                " needs {n}s",
-                b=budget_left,
-                n=ASTROGRID_CELESTIAL_TIMEOUT_SECONDS,
-            )
-            cycle_result["astrogrid_celestial"] = {
-                "deferred": "insufficient_cycle_budget",
-                "budget_left_s": round(budget_left, 1),
-            }
-        elif last_celestial != current_hour:
-            state.current_step = "astrogrid_celestial"
-            from oracle.astrogrid_cycle import run_celestial_cycle
-
-            celestial_result, ok = _run_with_timeout(
-                "astrogrid_celestial",
-                lambda: run_celestial_cycle(
-                    engine, persist=not dry_run, interpret=not dry_run
-                ),
-                ASTROGRID_CELESTIAL_TIMEOUT_SECONDS,
-                state,
-            )
-            if ok and celestial_result:
-                cycle_result["astrogrid_celestial"] = celestial_result
-                # Advance only on a completed run. A timeout leaves the marker
-                # alone so the next cycle retries instead of skipping the hour.
-                state._last_astrogrid_celestial_hour = current_hour
-            elif not ok:
-                cycle_result["astrogrid_celestial"] = {"timeout": True}
-    except Exception as exc:
-        log.warning("AstroGrid celestial cycle failed: {e}", e=str(exc))
 
     # 8. Git push — commit and push any new outputs
     if dry_run:
