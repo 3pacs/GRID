@@ -855,9 +855,6 @@ class TestPriorityUnit:
         series_res = MagicMock()
         series_res.fetchall.return_value = [("T10Y2Y",)]
 
-        worker_res = MagicMock()
-        worker_res.fetchall.return_value = pending
-
         write_conn = MagicMock()
         existing = MagicMock()
         existing.fetchone.return_value = None
@@ -918,9 +915,6 @@ class TestDateFilteringUnit:
         # provide enough worker contexts to be safe.
         series_res = MagicMock()
         series_res.fetchall.return_value = [("AAA",), ("BBB",)]
-
-        worker_res = MagicMock()
-        worker_res.fetchall.return_value = pending
 
         write_conn = MagicMock()
         existing = MagicMock()
