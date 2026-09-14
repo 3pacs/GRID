@@ -81,12 +81,14 @@ def _safe_json(data: Any) -> str:
 # ``actor_name TEXT`` IS declared here, unlike ``search_vector`` above: it
 # needs no trigger, no backfill machinery beyond a one-time migration
 # (``migrations/versions/snapshot_actor_col_20260914.py``), and every writer
-# of this table can populate it directly at insert time
-# (``scripts/parse_datasets.py::_snapshot_row``), the same way every other
-# column here works. A fresh database (dev, CI, a restored slice) gets it
-# from first boot rather than waiting on a migration to run against a table
-# that migration doesn't even know exists yet until `store/snapshots.py`
-# creates it (see that migration's fresh-database guard).
+# of this table can populate it directly at insert time -- today that's
+# ``scripts/parse_datasets.py::_snapshot_row`` via its own bespoke insert, and
+# ``AnalyticalSnapshotStore.save_snapshot()`` below via its optional
+# ``actor_name`` parameter -- the same way every other column here works. A
+# fresh database (dev, CI, a restored slice) gets it from first boot rather
+# than waiting on a migration to run against a table that migration doesn't
+# even know exists yet until `store/snapshots.py` creates it (see that
+# migration's fresh-database guard).
 ANALYTICAL_SNAPSHOTS_DDL = """
     CREATE TABLE IF NOT EXISTS analytical_snapshots (
         id            BIGSERIAL PRIMARY KEY,
@@ -187,6 +189,7 @@ class AnalyticalSnapshotStore:
         as_of_date: date | None = None,
         subcategory: str | None = None,
         metrics: dict[str, Any] | None = None,
+        actor_name: str | None = None,
     ) -> int | None:
         """Persist a single analytical snapshot.
 
@@ -196,6 +199,14 @@ class AnalyticalSnapshotStore:
             as_of_date: The decision date the analysis was run for.
             subcategory: Optional refinement (e.g. 'k=4', 'pre_2008').
             metrics: Optional summary metrics for fast querying.
+            actor_name: Optional person/entity this snapshot is about,
+                written to the indexed ``actor_name`` column (migration
+                ``snapshot_actor_col_20260914``) so entity_resolver.py's
+                snapshot search can find this row (see
+                ``SNAPSHOT_SEARCH_SQL`` in intelligence/entity_resolver.py).
+                Leave ``None`` for categories with no natural actor
+                (clustering, regime_detection, ...) -- every current caller
+                of this method does.
 
         Returns:
             int: Snapshot row ID, or None on failure.
@@ -208,8 +219,8 @@ class AnalyticalSnapshotStore:
                 row = conn.execute(
                     text(
                         "INSERT INTO analytical_snapshots "
-                        "(snapshot_date, category, subcategory, as_of_date, payload, metrics) "
-                        "VALUES (:sd, :cat, :sub, :aod, CAST(:payload_json AS jsonb), CAST(:metrics_json AS jsonb)) "
+                        "(snapshot_date, category, subcategory, as_of_date, payload, actor_name, metrics) "
+                        "VALUES (:sd, :cat, :sub, :aod, CAST(:payload_json AS jsonb), :actor_name, CAST(:metrics_json AS jsonb)) "
                         "RETURNING id"
                     ),
                     {
@@ -218,6 +229,7 @@ class AnalyticalSnapshotStore:
                         "sub": subcategory,
                         "aod": as_of_date,
                         "payload_json": _safe_json(payload),
+                        "actor_name": actor_name,
                         "metrics_json": _safe_json(metrics) if metrics else None,
                     },
                 ).fetchone()

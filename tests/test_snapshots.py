@@ -114,3 +114,44 @@ def test_save_snapshot_failure_skips_pruning():
     snap_id = store.save_snapshot(category="sector_flows", payload={"sectors": {}})
 
     assert snap_id is None
+
+
+def test_save_snapshot_writes_actor_name_when_given():
+    """The canonical write path can persist an actor, not only parse_datasets.
+
+    Before this, only scripts/parse_datasets.py's bespoke insert populated
+    actor_name (migration snapshot_actor_col_20260914) -- every other caller
+    of save_snapshot() had no way to, even if a future caller's payload were
+    about a specific person or entity.
+    """
+    engine, conn = _make_engine()
+    store = AnalyticalSnapshotStore(db_engine=engine)
+    conn.execute.reset_mock()
+
+    store.save_snapshot(
+        category="sleuth_investigation", payload={}, actor_name="Jane Q Public",
+    )
+
+    insert_calls = [
+        c for c in conn.execute.call_args_list
+        if "INSERT INTO analytical_snapshots" in _sql_text(c.args[0])
+    ]
+    assert len(insert_calls) == 1
+    stmt, params = insert_calls[0].args[0], insert_calls[0].args[1]
+    assert ":actor_name" in _sql_text(stmt)
+    assert params["actor_name"] == "Jane Q Public"
+
+
+def test_save_snapshot_actor_name_defaults_to_none():
+    """Every current caller omits actor_name; it must not become required."""
+    engine, conn = _make_engine()
+    store = AnalyticalSnapshotStore(db_engine=engine)
+    conn.execute.reset_mock()
+
+    store.save_snapshot(category="clustering", payload={"result": {}})
+
+    insert_calls = [
+        c for c in conn.execute.call_args_list
+        if "INSERT INTO analytical_snapshots" in _sql_text(c.args[0])
+    ]
+    assert insert_calls[0].args[1]["actor_name"] is None

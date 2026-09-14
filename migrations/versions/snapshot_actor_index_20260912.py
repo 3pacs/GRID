@@ -220,6 +220,15 @@ def _pg_trgm_ready(conn) -> bool:
     a performance index, not a correctness one. The same fallback
     ``intelligence/actor_discovery.py`` already uses for its own trigram index
     on ``actors(name)``.
+
+    The ``CREATE EXTENSION`` attempt runs inside a SAVEPOINT
+    (``conn.begin_nested()``): this revision's small-table branch runs
+    several more statements afterward in the same transaction, and a failed
+    ``CREATE EXTENSION`` would otherwise abort that transaction at the
+    Postgres level regardless of the driver exception being caught in
+    Python — every later statement would then fail with "current
+    transaction is aborted". The SAVEPOINT confines the failure to this one
+    attempt.
     """
     from sqlalchemy import text
 
@@ -230,7 +239,8 @@ def _pg_trgm_ready(conn) -> bool:
         return True
 
     try:
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+        with conn.begin_nested():
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
         return True
     except Exception as exc:
         log.warning(
