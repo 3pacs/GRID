@@ -31,6 +31,9 @@ from llm.router import get_llm as get_client
 COORDINATOR_URL = os.getenv("GRID_COORDINATOR_URL", "http://localhost:8100")
 POLL_INTERVAL = 15  # seconds
 
+# analytical_snapshots.category written for every assimilated insight.
+SNAPSHOT_CATEGORY = "human_llm_insight"
+
 EXTRACTION_SYSTEM = """You are GRID's intelligence parser. You receive raw LLM responses
 from external models (ChatGPT, Gemini, Claude) and extract structured trading intelligence.
 
@@ -118,16 +121,30 @@ def parse_response(raw_response: str, query: str, context: str, model_used: str)
         }
 
 
-def store_insight(job: dict, parsed: dict) -> None:
-    """Store parsed insight in analytical_snapshots."""
-    from store.snapshots import SnapshotStore
+def store_insight(job: dict, parsed: dict) -> int:
+    """Store a parsed insight in analytical_snapshots.
+
+    Parameters:
+        job: The coordinator job dict the insight was extracted from.
+        parsed: The structured insight to persist as the snapshot payload.
+
+    Returns:
+        int: The analytical_snapshots row id.
+
+    Raises:
+        RuntimeError: When the row did not land. `save_snapshot` catches its
+            own exceptions and returns None, so a silent failure is otherwise
+            indistinguishable from success — and the caller would go on to
+            mark the job ASSIMILATED with nothing in the table.
+    """
+    from store.snapshots import AnalyticalSnapshotStore
     from db import get_engine
 
     engine = get_engine()
-    store = SnapshotStore(engine)
+    store = AnalyticalSnapshotStore(db_engine=engine)
 
-    store.save_snapshot(
-        category="human_llm_insight",
+    snapshot_id = store.save_snapshot(
+        category=SNAPSHOT_CATEGORY,
         subcategory=job.get("name", "unknown"),
         payload=parsed,
         metrics={
@@ -139,12 +156,30 @@ def store_insight(job: dict, parsed: dict) -> None:
             "parsed": parsed.get("parsed", False),
         },
     )
-    log.info("Stored insight for job #{id} in analytical_snapshots", id=job["id"])
+    if snapshot_id is None:
+        raise RuntimeError(
+            f"save_snapshot returned no id for job #{job['id']} — "
+            f"the insight did not reach analytical_snapshots"
+        )
+
+    log.info(
+        "Stored insight for job #{id} as analytical_snapshots #{sid}",
+        id=job["id"], sid=snapshot_id,
+    )
+    return snapshot_id
 
 
-def process_completed_jobs() -> int:
-    """Process all completed HUMAN_LLM_QUERY jobs. Returns count processed."""
+def process_completed_jobs() -> tuple[int, int]:
+    """Process all completed HUMAN_LLM_QUERY jobs.
+
+    Returns:
+        tuple[int, int]: ``(processed, failed)`` — jobs assimilated, and jobs
+        whose insight could not be stored. `failed` is reported separately so
+        a pass that persisted nothing is not indistinguishable from an idle
+        one (the `--once` exit code depends on it).
+    """
     processed = 0
+    failed = 0
 
     # Get completed HUMAN_LLM_QUERY jobs
     try:
@@ -157,7 +192,7 @@ def process_completed_jobs() -> int:
         jobs = r.json()
     except Exception as e:
         log.warning("Failed to fetch completed jobs: {e}", e=e)
-        return 0
+        return 0, 0
 
     for job in jobs:
         job_id = job["id"]
@@ -206,7 +241,27 @@ def process_completed_jobs() -> int:
         parsed = parse_response(raw_response, query, context, model_used)
 
         if parsed:
-            store_insight(job, parsed)
+            try:
+                store_insight(job, parsed)
+            except Exception as exc:
+                # log.error, not the log.warning the fetch failures above use:
+                # reaching here means the insight was parsed but could not be
+                # written, which is an application bug (a name store.snapshots
+                # doesn't export, a column the table doesn't have) far more
+                # often than an outage. opt(exception=True) so errors.jsonl
+                # gets the traceback rather than a bare message.
+                #
+                # `continue` matters twice: this used to propagate out of the
+                # function and abort every remaining job in the batch, and the
+                # job must stay COMPLETED for a retry rather than be marked
+                # ASSIMILATED with nothing persisted.
+                failed += 1
+                log.opt(exception=True).error(
+                    "Failed to store insight for job #{id} ({err}) — "
+                    "leaving it unassimilated",
+                    id=job_id, err=str(exc),
+                )
+                continue
 
             # Mark as VALID then ASSIMILATED
             try:
@@ -217,10 +272,11 @@ def process_completed_jobs() -> int:
             except Exception as e:
                 log.warning("Failed to mark job #{id} as assimilated: {e}", id=job_id, e=e)
 
-    return processed
+    return processed, failed
 
 
-def main():
+def main() -> int:
+    """CLI entrypoint. Returns the process exit code."""
     import argparse
     parser = argparse.ArgumentParser(description="GRID Human LLM Response Assimilator")
     parser.add_argument("--once", action="store_true", help="Single pass, then exit")
@@ -229,23 +285,40 @@ def main():
     log.info("GRID Assimilator starting — coordinator: {url}", url=COORDINATOR_URL)
 
     if args.once:
-        count = process_completed_jobs()
-        log.info("Processed {n} jobs", n=count)
-        return
+        try:
+            count, failed = process_completed_jobs()
+        except Exception as e:
+            # The daemon loop below has this guard and --once did not. It
+            # matters because the GitSink is a loguru sink attached at ERROR
+            # (config.py) and nothing installs a sys.excepthook, so a raise
+            # that escapes here reaches stderr and errors.jsonl never records
+            # the failure at all.
+            log.opt(exception=True).error("Assimilator --once failed: {e}", e=e)
+            return 1
+        log.info("Processed {n} jobs ({f} failed)", n=count, f=failed)
+        # A single pass that dropped insights must not look like a clean run
+        # to whatever scheduled it.
+        return 1 if failed else 0
 
     while True:
         try:
-            count = process_completed_jobs()
-            if count:
-                log.info("Processed {n} jobs this cycle", n=count)
+            count, failed = process_completed_jobs()
+            if count or failed:
+                log.info(
+                    "Processed {n} jobs this cycle ({f} failed)", n=count, f=failed,
+                )
         except KeyboardInterrupt:
             log.info("Assimilator shutting down")
             break
         except Exception as e:
-            log.error("Assimilator error: {e}", e=e)
+            # opt(exception=True) so errors.jsonl gets the traceback rather
+            # than a bare message with no origin.
+            log.opt(exception=True).error("Assimilator error: {e}", e=e)
 
         time.sleep(POLL_INTERVAL)
 
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
