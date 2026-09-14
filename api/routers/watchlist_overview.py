@@ -15,6 +15,15 @@ from api.routers.watchlist_helpers import (
     _resolve_feature_names,
 )
 
+# One definition of "is this failure a schema fault?", not two. #477 and #479
+# spent two rounds removing exactly this bug class — a query naming a column
+# the live schema lacks, swallowed at a level nobody reads — and the classifier
+# they landed on lives in intelligence/entity_resolver.py. Importing it keeps
+# the two call sites in step when the SQLSTATE list grows; re-deriving it here
+# is how they drift. Module-level import is cheap: entity_resolver's own
+# imports are stdlib + loguru + sqlalchemy.
+from intelligence.entity_resolver import _log_query_failure
+
 router = APIRouter(tags=["watchlist"])
 
 
@@ -59,7 +68,7 @@ def get_ticker_overview(
             if price_row:
                 price_info = {"price": float(price_row[0]), "date": str(price_row[1]), "source": "grid"}
         except Exception as exc:
-            log.debug("WatchlistOverview: price query failed for {t}: {e}", t=ticker_upper, e=str(exc))
+            _log_query_failure(f"Overview price query for {ticker_upper}", exc)
 
         if not price_info:
             live = _fetch_live_price(ticker_upper)
@@ -87,7 +96,7 @@ def get_ticker_overview(
                     "total_oi": opt_row[6],
                 }
         except Exception as exc:
-            log.debug("WatchlistOverview: options query failed for {t}: {e}", t=ticker_upper, e=str(exc))
+            _log_query_failure(f"Overview options query for {ticker_upper}", exc)
 
         # Regime
         try:
@@ -102,7 +111,7 @@ def get_ticker_overview(
                     "posture": regime_row[2],
                 }
         except Exception as exc:
-            log.debug("WatchlistOverview: regime query failed: {e}", e=str(exc))
+            _log_query_failure("Overview regime query", exc)
 
         # Related features (recent values for context)
         try:
@@ -138,7 +147,7 @@ def get_ticker_overview(
                 for r in feat_rows
             ]
         except Exception as exc:
-            log.debug("WatchlistOverview: related features query failed for {t}: {e}", t=ticker_upper, e=str(exc))
+            _log_query_failure(f"Overview related-features query for {ticker_upper}", exc)
 
     # ── Sector path (for capital-flow mini-chart) ────────────────
     try:
@@ -426,7 +435,10 @@ def get_ticker_quote(
                     if prev_close:
                         change_pct = round((price - prev_close) / prev_close, 5)
         except Exception as exc:
-            log.debug("Quote: price query failed for {t}: {e}", t=ticker_upper, e=str(exc))
+            # A dead price query is why the ticker_pulse card silently fell
+            # back to a live fetch for two months. At debug level, in
+            # production, nothing recorded that it had happened at all.
+            _log_query_failure(f"Quote price query for {ticker_upper}", exc)
 
         try:
             opt = conn.execute(text(
@@ -437,7 +449,7 @@ def get_ticker_quote(
             if opt:
                 put_call_ratio, max_pain, iv_atm = opt[0], opt[1], opt[2]
         except Exception as exc:
-            log.debug("Quote: options query failed for {t}: {e}", t=ticker_upper, e=str(exc))
+            _log_query_failure(f"Quote options query for {ticker_upper}", exc)
 
     # Live fallback only when nothing is stored (kept off the hot path).
     if price is None:
@@ -451,7 +463,11 @@ def get_ticker_quote(
                     as_of_date = date.today()
                     _cache_price_to_db(engine, ticker_upper, price, as_of_date)
         except Exception as exc:
-            log.debug("Quote: live price failed for {t}: {e}", t=ticker_upper, e=str(exc))
+            # Not a query: an outbound HTTP fetch. Always operational.
+            log.warning(
+                "Quote: live price fetch failed for {t}: {e}",
+                t=ticker_upper, e=str(exc),
+            )
 
     # Rule-based sentiment from options positioning (same logic as /overview).
     score = 0
