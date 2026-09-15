@@ -15,12 +15,12 @@ on:
         required: false
         default: true
       activate_scheduler:
-        description: 'One-time: also restart grid-scheduler onto the release path (interrupts its current pass -- see deploy.yml comments). Never implied by a routine push or by do_restart. Requires either a verified completed-cycle boundary or acknowledge_scheduler_interruption=true.'
+        description: 'One-time: also restart grid-scheduler onto the release path (interrupts its current pass -- see deploy.yml comments). Never implied by a routine push or by do_restart. Also requires acknowledge_scheduler_interruption=true.'
         type: boolean
         required: false
         default: false
       acknowledge_scheduler_interruption:
-        description: 'Explicit override: restart grid-scheduler even without a verified completed-cycle boundary, accepting that it may interrupt an in-progress puller call or scheduled job. Only consulted when activate_scheduler=true.'
+        description: 'Required to activate grid-scheduler: explicitly acknowledges the restart will interrupt whatever is currently running (a puller call in progress, or another scheduled job). There is no automated safe-to-restart check. Only consulted when activate_scheduler=true.'
         type: boolean
         required: false
         default: false
@@ -317,67 +317,41 @@ jobs:
       # confirmed for the yfinance path (_get_existing_dates, #498), NOT
       # audited across the ~100 other registered pullers in
       # ingestion/scheduler.py, some of which may not check-before-insert the
-      # same way. So this does not claim interruption is always safe. Instead
-      # it requires either (a) a verified completed-cycle boundary -- nothing
-      # in a torn/mid-pass state to begin with -- or (b) an explicit human
-      # acknowledgment (`acknowledge_scheduler_interruption=true`) that the
-      # interruption risk is accepted anyway. There is no automatic
-      # "wait, then proceed regardless" fallback.
+      # same way.
+      #
+      # There is no automated "safe to restart" check: a log tail can only
+      # show what has already happened, and a historical completion marker
+      # does not prove nothing has started since (an earlier version of this
+      # workflow made exactly that mistake, comparing mismatched journalctl
+      # output formats besides). So activation always requires an explicit
+      # `acknowledge_scheduler_interruption=true` -- a human decision, informed
+      # by whatever they check themselves (journalctl -u grid-scheduler, the
+      # log tail this workflow also prints below, or otherwise), never an
+      # automatic pass. See scripts/scheduler_activation_gate.sh (tested in
+      # tests/test_scheduler_activation_gate.py) for the actual decision.
       - name: Report grid-scheduler activation status
         if: ${{ inputs.activate_scheduler != true }}
         run: |
           {
             echo "grid-scheduler was NOT restarted this run (activate_scheduler was not set)."
             echo "It continues running its existing checkout, independent of the release tree this run deployed."
-            echo "**Scheduler activation remains pending.** To activate: run this workflow via workflow_dispatch with activate_scheduler=true."
+            echo "**Scheduler activation remains pending.** To activate: run this workflow via workflow_dispatch with activate_scheduler=true and acknowledge_scheduler_interruption=true."
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
-      # Looks for direct, positive evidence of an idle boundary -- the most
-      # recent grid-scheduler log line is itself one of the top-level
-      # cycle-finished markers (run_daily_pulls/run_pull_group/
-      # run_monthly_pulls returning) -- rather than inferring idleness from
-      # an absence of output, which cannot distinguish "quiet because done"
-      # from "quiet because stuck mid-call" (exactly the shape of the #498
-      # bug: minutes of silence during a statement-timeout wait). This is
-      # necessarily conservative: the scheduler also runs several smaller
-      # jobs (SEC velocity, business-news analysis, TPS refresh, cleanup
-      # tasks) with no equivalent single "fully done" marker, so a genuinely
-      # idle moment between those can still read as NOT verified. This step
-      # only records what it found; the next step enforces the gate.
-      - name: Check for a verified grid-scheduler completed-cycle boundary
+      # Purely informational -- makes no claim about current idleness. Shown
+      # only so a human deciding on acknowledge_scheduler_interruption has
+      # the same context this workflow does; it does not gate anything.
+      - name: Show recent grid-scheduler activity (for your own judgment)
         if: ${{ inputs.activate_scheduler == true }}
-        run: |
-          set -euo pipefail
-          boundary_re='Daily pulls finished|Monthly pulls finished|Pull group [a-z]+ complete'
-          last_line="$(journalctl -u grid-scheduler -n 1 --no-pager -q --output=cat 2>/dev/null || true)"
-          last_boundary_line="$(journalctl -u grid-scheduler -n 2000 --no-pager -q 2>/dev/null | grep -E "$boundary_re" | tail -1 || true)"
-          echo "most recent grid-scheduler log line: ${last_line:-<none>}"
-          echo "most recent completed-cycle marker:  ${last_boundary_line:-<none found in last 2000 lines>}"
-          verified=false
-          if [ -n "$last_line" ] && [ -n "$last_boundary_line" ] && [ "$last_line" = "$last_boundary_line" ]; then
-            verified=true
-          fi
-          echo "SCHEDULER_BOUNDARY_VERIFIED=$verified" >> "$GITHUB_ENV"
-          if [ "$verified" = true ]; then
-            echo "Verified: the most recent log line IS a completed-cycle boundary."
-          else
-            echo "NOT verified: the most recent log line is not a recognized completed-cycle boundary."
-            echo "This check only recognizes the top-level daily/weekly/monthly/annual pull-group completion lines -- it can under-detect a genuinely idle moment between smaller jobs. If you have independently confirmed via 'journalctl -u grid-scheduler' that it is acceptable to interrupt right now, re-run with acknowledge_scheduler_interruption=true."
-          fi
+        run: journalctl -u grid-scheduler -n 20 --no-pager -q || true
 
-      - name: Require a verified boundary or an explicit interruption acknowledgment
+      - name: Require explicit interruption acknowledgment
         if: ${{ inputs.activate_scheduler == true }}
-        run: |
-          set -euo pipefail
-          if [ "$SCHEDULER_BOUNDARY_VERIFIED" != "true" ] && [ "${{ inputs.acknowledge_scheduler_interruption }}" != "true" ]; then
-            echo "::error::No verified completed-cycle boundary was found, and acknowledge_scheduler_interruption was not set. Refusing to restart grid-scheduler -- this would interrupt whatever is currently running (a puller call in progress, or another scheduled job), and duplicate-safety on the next pass is not verified for every registered puller. Either re-run once a boundary is verified, or re-run with acknowledge_scheduler_interruption=true if you have independently confirmed it is acceptable to interrupt now."
-            exit 1
-          fi
-          if [ "$SCHEDULER_BOUNDARY_VERIFIED" = "true" ]; then
-            echo "Proceeding: verified completed-cycle boundary."
-          else
-            echo "::warning::Proceeding WITHOUT a verified completed-cycle boundary -- acknowledge_scheduler_interruption was explicitly set. This may interrupt an in-progress puller call or scheduled job."
-          fi
+        # This job never runs actions/checkout -- it gets code onto the box
+        # entirely via "Build release tree" above -- so the gate script is
+        # read from $DEPLOY_PATH (the tree that step just fetched), not a
+        # workspace-relative path that wouldn't resolve here.
+        run: bash "$DEPLOY_PATH/scripts/scheduler_activation_gate.sh" "${{ inputs.acknowledge_scheduler_interruption }}"
 
       - name: Restart grid-scheduler (activate_scheduler only)
         if: ${{ inputs.activate_scheduler == true }}
