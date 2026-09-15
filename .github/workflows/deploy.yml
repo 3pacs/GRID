@@ -264,6 +264,66 @@ jobs:
           }
           echo "verify: grid-hermes is running the deployed tree"
 
+      # grid-scheduler has the exact same class of bug the grid-hermes fix
+      # above addressed for #487/#490: its unit pins WorkingDirectory to
+      # /home/grid/grid_v4/grid_repo, a separate checkout this workflow never
+      # writes to. Confirmed 2026-09-15: grid_repo's HEAD (5facbdf0, dated
+      # 2026-09-11) predates every PR merged today (#368/#370/#382/#383/#489/
+      # #495/#498) and isn't even reachable on GitHub (a local-only merge
+      # commit) -- its own `origin` remote can't authenticate (SSH key
+      # rejected) either, so it can't self-heal. Confirmed live: the running
+      # scheduler was still hitting the exact unbounded-query timeout #498
+      # fixes, on ^DJI/^VIX6M/HG=F/GC=F, hours after grid-api/grid-hermes had
+      # already redeployed successfully.
+      #
+      # Fix is the same release-path drop-in pattern as grid-api/grid-hermes
+      # above -- only WorkingDirectory moves to $DEPLOY_PATH. EnvironmentFile
+      # deliberately stays on grid_repo/.env, same reason grid-api/grid-hermes
+      # keep it there too: grid_release carries no .env of its own. Confirmed
+      # grid-scheduler shares the same interpreter and dependencies as
+      # grid-api/grid-hermes (bare /usr/bin/python3.10, no venv, one shared
+      # system site-packages -- e.g. tqdm is already 4.70.1 system-wide) so
+      # this is purely a working-directory fix, not an environment migration.
+      # The scheduler's own connection-pool override
+      # (grid-scheduler.service.d/pool-budget.conf, EnvironmentFile= only) is
+      # untouched by this -- different directive key, no collision.
+      - name: Restart grid-scheduler
+        if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /etc/systemd/system/grid-scheduler.service.d
+          printf '%s\n' '[Service]' "WorkingDirectory=$DEPLOY_PATH" | sudo tee /etc/systemd/system/grid-scheduler.service.d/zz-release-worktree.conf >/dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl restart grid-scheduler
+
+      # Same proof-of-tree pattern as the grid-hermes verify above -- a bare
+      # is-active would stay green through the whole time the scheduler ran
+      # stale code, which is exactly the failure this exists to catch.
+      - name: Verify grid-scheduler runs the deployed tree
+        if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
+        run: |
+          set -euo pipefail
+          for attempt in {1..30}; do
+            state="$(systemctl is-active grid-scheduler || true)"
+            [ "$state" = "active" ] && break
+            if [ "$attempt" -eq 30 ]; then
+              echo "::error::grid-scheduler not active after restart (state=$state)"
+              sudo systemctl status grid-scheduler --no-pager -l || true
+              journalctl -u grid-scheduler -n 60 --no-pager || true
+              exit 1
+            fi
+            sleep 2
+          done
+          pid="$(systemctl show -p MainPID --value grid-scheduler)"
+          cwd="$(sudo -n readlink "/proc/${pid}/cwd" 2>/dev/null || readlink "/proc/${pid}/cwd" 2>/dev/null || true)"
+          echo "grid-scheduler pid=$pid cwd=$cwd"
+          want="$(readlink -f "$DEPLOY_PATH")"
+          [ -n "$cwd" ] && [ "$(readlink -f "$cwd")" = "$want" ] || {
+            echo "::error::grid-scheduler cwd '$cwd' does not resolve to $want -- it is running a different tree"
+            exit 1
+          }
+          echo "verify: grid-scheduler is running the deployed tree"
+
       - name: Notify success
         if: success()
         run: echo "Deployment successful"
