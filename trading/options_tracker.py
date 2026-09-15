@@ -606,7 +606,17 @@ def _fetch_yfinance_price(ticker: str, target_date: date) -> float | None:
 
         end = target_date + timedelta(days=5)  # buffer for weekends/holidays
         start = target_date - timedelta(days=5)
-        df = yf.download(ticker, start=str(start), end=str(end), progress=False)
+        # auto_adjust=False: the price this returns is compared against an
+        # option *strike* to compute intrinsic value (see
+        # score_expired_recommendations). Strikes are raw, unadjusted prices,
+        # and the two earlier legs of this chain (options_daily_signals.
+        # spot_price and raw_series "YF:{ticker}:close") are raw too. A
+        # dividend-back-adjusted close understates CALL intrinsic and
+        # overstates PUT intrinsic against the same strike.
+        df = yf.download(
+            ticker, start=str(start), end=str(end), progress=False,
+            auto_adjust=False,
+        )
         if df.empty:
             return None
         # Get the closest date <= target_date

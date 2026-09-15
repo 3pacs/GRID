@@ -39,7 +39,16 @@ class CryptoETFPuller:
         for crypto_ticker, etfs in ETF_MAP.items():
             for etf in etfs:
                 try:
-                    data = yf.download(etf, period="30d", interval="1d", progress=False)
+                    # auto_adjust=False: the close taken from this frame is
+                    # persisted as "price" in signal_sources.signal_value and
+                    # is later read back as the *entry price* by
+                    # intelligence.trust_scorer._extract_price, which scores
+                    # it against raw closes. Keep it on the raw basis.
+                    # (yfinance's default flipped to True in 0.2.x.)
+                    data = yf.download(
+                        etf, period="30d", interval="1d", progress=False,
+                        auto_adjust=False,
+                    )
                     if data is None or data.empty or len(data) < 20:
                         continue
 
