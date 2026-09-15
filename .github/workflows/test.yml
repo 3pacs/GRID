@@ -12,7 +12,16 @@ concurrency:
 
 env:
   PYTHON_VERSION: "3.11"
-  NODE_VERSION: "20"
+  # Pinned to the exact version already running on grid-svr (verified via
+  # `node -v` there), not a floating "22" -- one explicit version shared by
+  # CI and production, rather than two independently-drifting definitions of
+  # "a Node 22". grid-svr's own deploy path (deploy.yml's "Build release
+  # tree" step) never pins a Node version at all; it just uses whatever's on
+  # the self-hosted runner's PATH. pwa/.npmrc's engine-strict=true is the
+  # actual enforcement against vitest 5's real engines range
+  # (^22.12.0 || ^24.0.0 || >=26.0.0) in both places -- this pin is about
+  # parity, not the safety check.
+  NODE_VERSION: "22.22.1"
   # Non-empty -> target the alien self-hosted runner; empty/unset -> ubuntu-latest.
   # Set via Settings > Secrets and variables > Actions > Variables > TEST_RUNNER.
   ON_ALIEN: ${{ vars.TEST_RUNNER != '' }}

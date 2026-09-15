@@ -135,6 +135,14 @@ jobs:
           # deploy anyway) needs to pass.
           git merge-base --is-ancestor "${{ github.sha }}" HEAD || { echo "::error::release tree is not at the pushed commit ${{ github.sha }}"; exit 1; }
           pip install -r requirements.txt
+          # This step never pins a Node version -- it builds with whatever is
+          # already on the runner's PATH (grid-svr's own global install, not
+          # anything actions/setup-node manages). pwa/.npmrc sets
+          # engine-strict=true, so `npm ci` itself now fails loudly on any
+          # installed package's real `engines.node` range (vitest 5's
+          # ^22.12.0 || ^24.0.0 || >=26.0.0 included) instead of the
+          # non-fatal EBADENGINE warning npm prints by default -- no
+          # hand-rolled version check to keep in sync here.
           cd pwa && npm ci && npm run build && cd ..
           if [ "${{ inputs.skip_migrations }}" = "true" ]; then
             echo "::warning::alembic upgrade head skipped via workflow_dispatch input skip_migrations=true"
