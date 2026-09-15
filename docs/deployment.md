@@ -460,7 +460,7 @@ These are documented in `ATTENTION.md` and should be addressed based on priority
 ### Medium Priority
 
 - **CORS origin validation** (item 64) -- If `GRID_ALLOWED_ORIGINS` is not set in production, only localhost is allowed (safe but confusing).
-- **No dependency lock file** (item 33) -- `requirements.txt` uses minimum versions. Consider `pip freeze > requirements.lock` for reproducible builds.
+- **No dependency lock file** (item 33) -- `requirements.txt` uses minimum versions. A `requirements.lock` was generated twice (2026-03, 2026-05) but never wired into CI or the deploy path (both always installed from `requirements.txt`), so it just went stale and was removed. A real fix would need a resolver that handles `>=`-only constraints without exploding combinatorially (`pip-compile --generate-hashes` hit `ResolutionTooDeepError` on this file) -- e.g. migrating to `uv` or `poetry`.
 - **Admin endpoints lack pagination** (item 48) -- `model_registry`, `source_catalog`, `feature_registry`, `hypothesis_registry` queries have no LIMIT.
 
 ---
