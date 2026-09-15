@@ -16,7 +16,7 @@ constant for its own sake.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -367,9 +367,14 @@ def test_real_build_snapshot_returns_a_payload_without_a_database() -> None:
     snapshot = build_snapshot(target, _DeadEngine())
 
     # The last statement of the function is the return dict, so a bare name
-    # there is only caught by reading what comes back.
+    # there is only caught by reading what comes back. Parse the timestamp
+    # rather than pin its calendar year: the point is that it's a real,
+    # UTC-aware `datetime.now()` call, not that it happened in 2026.
     assert snapshot["date"] == str(target)
-    assert snapshot["timestamp"].startswith("2026-")
+    parsed_timestamp = datetime.fromisoformat(snapshot["timestamp"])
+    assert parsed_timestamp.tzinfo is not None
+    assert parsed_timestamp.utcoffset() == timedelta(0)
+    assert abs(datetime.now(timezone.utc) - parsed_timestamp) < timedelta(minutes=5)
     for key in ("objects", "aspects", "events", "signals", "seer", "grid"):
         assert key in snapshot, f"{key} missing from the snapshot payload"
 
