@@ -602,7 +602,7 @@ class DiscordScanner(BasePuller):
                 try:
                     async with websockets.connect(
                         _DISCORD_GATEWAY,
-                        extra_headers={"User-Agent": "Mozilla/5.0"},
+                        additional_headers={"User-Agent": "Mozilla/5.0"},
                     ) as ws:
                         # Receive HELLO
                         hello = json.loads(await ws.recv())
