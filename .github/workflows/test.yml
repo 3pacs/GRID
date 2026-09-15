@@ -187,8 +187,26 @@ jobs:
       - name: Install linters
         run: pip install ruff bandit
 
-      - name: Ruff lint
+      # Style and unused-import noise across a 700+ module tree: too much to
+      # gate on today, so this stays advisory and reports without failing.
+      - name: Ruff lint (advisory)
         run: ruff check . --select E,W,F --ignore E501 --exit-zero
+
+      # These are not style. Every rule here means the name does not exist at
+      # runtime, so the code raises the moment it is reached.
+      #
+      # This gate exists because it was missing. #493 extracted build_snapshot()
+      # into api/routers/astrogrid_helpers.py and left `timezone` behind in the
+      # module it came from. Ruff's F821 flagged it, --exit-zero discarded the
+      # finding, Lint went green, and the function raised NameError on every
+      # Hermes cycle and every GET /astrogrid/snapshot in production.
+      #
+      # Every rule below is at zero on this tree, so the gate starts green and
+      # only ever goes red on a new defect. `notebooks` is excluded: ruff reads
+      # cross-cell names in .ipynb as undefined, which is a property of the
+      # notebook model rather than a bug in the code.
+      - name: Ruff lint (blocking — names that do not exist at runtime)
+        run: ruff check . --select F821,F822,F823,F402,F501,F502,F632 --exclude notebooks
 
       - name: Obsidian wikilink integrity
         run: python scripts/obsidian_backlinks.py --check
