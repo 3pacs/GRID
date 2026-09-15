@@ -7,9 +7,13 @@ Tests run against the FastAPI app directly without requiring a live server.
 
 from __future__ import annotations
 
+import json
 import os
 from unittest.mock import MagicMock, patch
 
+import pytest
+from fastapi import WebSocketDisconnect
+from fastapi.routing import iter_route_contexts
 from fastapi.testclient import TestClient
 
 # Set test environment before importing the app
@@ -37,6 +41,20 @@ def _auth_header() -> dict[str, str]:
     """Return a valid Authorization header."""
     token = create_token(expires_hours=1)
     return {"Authorization": f"Bearer {token}"}
+
+
+def _effective_paths() -> list[str]:
+    """Every route path the app actually serves, in registration order.
+
+    Not `[r.path for r in app.routes]`: since FastAPI 0.137 `include_router()`
+    is lazy, so a sub-router shows up in `.routes` as one opaque
+    `_IncludedRouter` with no `.path` and its children are invisible. Every
+    GRID facade router (intelligence, canvas, watchlist, astrogrid) is included
+    that way, so the naive list sees almost nothing. `iter_route_contexts`
+    resolves them back to full paths and preserves ordering, which the
+    static-before-dynamic assertion below depends on.
+    """
+    return [ctx.path for ctx in iter_route_contexts(app.routes)]
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +190,7 @@ class TestProtectedRouteWithToken:
 
     def test_actor_network_route_is_not_double_prefixed(self):
         """Actor-network should exist only on the canonical intelligence path."""
-        paths = [route.path for route in app.routes if hasattr(route, "path")]
+        paths = _effective_paths()
         assert paths.count("/api/v1/intelligence/actor-network") == 1
         assert "/api/v1/intelligence/actor-network" in paths
         assert "/api/v1/intelligence/edges" in paths
@@ -180,7 +198,7 @@ class TestProtectedRouteWithToken:
 
     def test_static_lever_routes_precede_dynamic_domain_route(self):
         """Static lever endpoints must register before the generic domain matcher."""
-        paths = [route.path for route in app.routes if hasattr(route, "path")]
+        paths = _effective_paths()
         dynamic_idx = paths.index("/api/v1/intelligence/levers/{domain}")
         assert paths.index("/api/v1/intelligence/levers/report") < dynamic_idx
         assert paths.index("/api/v1/intelligence/levers/cross-domain") < dynamic_idx
@@ -306,3 +324,55 @@ class TestRegimeCurrentUncalibrated:
             assert response.status_code == 200
             data = response.json()
             assert data["state"] == "UNCALIBRATED"
+
+
+# ---------------------------------------------------------------------------
+# 8. WebSocket first-message authentication
+# ---------------------------------------------------------------------------
+
+
+class TestWebSocketAuth:
+    """/ws must authenticate on the first message, never on a query param.
+
+    FastAPI reworked WebSocket routing and dependency handling across the
+    0.13x line, so this handshake is exactly the behavior a version bump can
+    quietly regress. It had no coverage before, which meant "WS auth still
+    works" was an assumption rather than a check.
+    """
+
+    def test_valid_token_is_accepted(self):
+        token = create_token(expires_hours=1)
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"token": token}))
+            hello = ws.receive_json()
+            assert hello["type"] == "connected"
+
+    def test_invalid_token_is_rejected(self):
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"token": "not-a-real-jwt"}))
+            with pytest.raises(WebSocketDisconnect) as exc:
+                ws.receive_json()
+        assert exc.value.code == 4001
+
+    def test_missing_token_is_rejected(self):
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"hello": "world"}))
+            with pytest.raises(WebSocketDisconnect) as exc:
+                ws.receive_json()
+        assert exc.value.code == 4001
+
+    def test_non_json_first_message_is_rejected(self):
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text("definitely not json")
+            with pytest.raises(WebSocketDisconnect) as exc:
+                ws.receive_json()
+        assert exc.value.code == 4001
+
+    def test_token_is_not_accepted_as_a_query_param(self):
+        """Query-param tokens leak into proxy/access logs — they must not work."""
+        token = create_token(expires_hours=1)
+        with client.websocket_connect(f"/ws?token={token}") as ws:
+            ws.send_text(json.dumps({"nope": True}))
+            with pytest.raises(WebSocketDisconnect) as exc:
+                ws.receive_json()
+        assert exc.value.code == 4001

@@ -16,6 +16,7 @@ import uuid
 from types import ModuleType
 
 import pytest
+from fastapi.routing import iter_route_contexts
 
 # ---------------------------------------------------------------------------
 # Prefer the real api.auth — only stub if heavy deps are unavailable.
@@ -44,6 +45,29 @@ except Exception:
 
 # ── Router structure tests (no DB needed) ─────────────────────────────────
 
+def _paths(router) -> list[str]:
+    """Resolved paths for every route the router serves, sub-routers included.
+
+    `api.routers.canvas` is a facade: it include_router()s canvas_graph,
+    canvas_expand, canvas_investigate, canvas_llm and canvas_predict. Since
+    FastAPI 0.137 those arrive in `.routes` as opaque `_IncludedRouter`
+    entries that have no `.path` at all, so the old
+    `[r.path for r in router.routes]` raised AttributeError and, before that,
+    would have silently missed every sub-router endpoint.
+    `iter_route_contexts` resolves them, prefix included.
+    """
+    return [ctx.path for ctx in iter_route_contexts(router.routes)]
+
+
+def _methods_by_path(router) -> dict[str, set[str]]:
+    """Map resolved path -> HTTP methods, sub-routers included."""
+    methods: dict[str, set[str]] = {}
+    for ctx in iter_route_contexts(router.routes):
+        if ctx.methods:
+            methods.setdefault(ctx.path, set()).update(ctx.methods)
+    return methods
+
+
 class TestCanvasRouter:
     @pytest.fixture(autouse=True)
     def _import_router(self):
@@ -57,33 +81,25 @@ class TestCanvasRouter:
         assert "canvas" in self.router.tags
 
     def test_list_boards_endpoint_exists(self):
-        paths = [r.path for r in self.router.routes]
+        paths = _paths(self.router)
         assert any(p.endswith("/boards") for p in paths)
 
     def test_create_board_endpoint_exists(self):
-        methods = {}
-        for r in self.router.routes:
-            if hasattr(r, "methods"):
-                for m in r.methods:
-                    methods.setdefault(r.path, set()).add(m)
+        methods = _methods_by_path(self.router)
         board_paths = [p for p in methods if p.endswith("/boards")]
         assert any("POST" in methods[p] for p in board_paths)
 
     def test_get_board_endpoint_exists(self):
-        paths = [r.path for r in self.router.routes]
+        paths = _paths(self.router)
         assert any("/boards/{board_id}" in p for p in paths)
 
     def test_delete_board_endpoint_exists(self):
-        methods = {}
-        for r in self.router.routes:
-            if hasattr(r, "methods"):
-                for m in r.methods:
-                    methods.setdefault(r.path, set()).add(m)
+        methods = _methods_by_path(self.router)
         board_paths = [p for p in methods if "{board_id}" in p and "node" not in p and "edge" not in p and "graph" not in p]
         assert any("DELETE" in methods[p] for p in board_paths)
 
     def test_bulk_save_endpoint_exists(self):
-        paths = [r.path for r in self.router.routes]
+        paths = _paths(self.router)
         assert any(p.endswith("/graph") for p in paths)
 
     def test_add_node_endpoint_exists(self):
@@ -91,13 +107,13 @@ class TestCanvasRouter:
         # a refactor that split canvas responsibilities across multiple
         # routers. Check the graph router instead of the main canvas router.
         from api.routers.canvas_graph import router as graph_router
-        paths = [r.path for r in graph_router.routes]
+        paths = _paths(graph_router)
         assert any(p.endswith("/nodes") for p in paths), \
             f"No /nodes endpoint on canvas_graph router. Got: {paths}"
 
     def test_add_edge_endpoint_exists(self):
         from api.routers.canvas_graph import router as graph_router
-        paths = [r.path for r in graph_router.routes]
+        paths = _paths(graph_router)
         assert any(p.endswith("/edges") for p in paths), \
             f"No /edges endpoint on canvas_graph router. Got: {paths}"
 

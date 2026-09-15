@@ -49,10 +49,30 @@ def test_base_requirements_declare_openpyxl() -> None:
     )
 
 def test_fastapi_upper_bound_blocks_unreviewed_route_introspection_drift() -> None:
+    # The original bound was <0.137.0, set when FastAPI 0.137 made
+    # include_router() lazy: a sub-router now lands in `.routes` as a single
+    # opaque `_IncludedRouter` with no `.path`, instead of its child routes
+    # being flattened into the parent. Everything that enumerated
+    # `app.routes` / `router.routes` to discover paths went blind, which is
+    # what broke the actor-network and lever-ordering regression tests.
+    #
+    # That introspection has now been modernized onto the supported
+    # `fastapi.routing.iter_route_contexts()` API (api/routers/system.py,
+    # tests/test_api.py, tests/test_canvas_api.py), and 0.139 was verified to
+    # be a routing no-op: /api/v1/intelligence/actor-network still resolves
+    # exactly once and the double-prefixed path still 404s, static lever
+    # routes still win over /levers/{domain}, the OpenAPI schema is unchanged,
+    # and the /ws first-message token handshake still authenticates and
+    # rejects as before.
+    #
+    # The ceiling stays one minor above the verified version on purpose: it is
+    # a tested bound, not a guess, so 0.140 needs the same check re-run before
+    # it is allowed in.
     for path in (REQUIREMENTS_PATH, REQUIREMENTS_API_PATH):
         fastapi_req = _requirement_line(path, "fastapi")
 
-        assert "<0.137.0" in fastapi_req, (
-            f"{path.name} must keep FastAPI below 0.137 until route "
-            "introspection is modernized for the new router behavior."
+        assert "<0.140.0" in fastapi_req, (
+            f"{path.name} must keep FastAPI below 0.140 — 0.139 is the "
+            "highest release whose router/introspection behavior has actually "
+            "been verified against GRID's facade routers and /ws auth."
         )
