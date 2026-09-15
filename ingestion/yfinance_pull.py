@@ -180,6 +180,21 @@ class YFinancePuller(BasePuller):
 
             inserted = 0
 
+            # yfinance's own `end` is exclusive (start="2026-09-10",
+            # end="2026-09-11" returns only 09-10 — confirmed against the
+            # live API, not assumed), so the last date col_data can actually
+            # contain is one day before end_date, not end_date itself.
+            # _get_existing_dates's own end_date parameter is a normal
+            # inclusive bound; this converts once, before the per-field
+            # loop, rather than passing yfinance's exclusive convention
+            # into a shared method other callers would reasonably expect
+            # to be inclusive on both ends.
+            existing_end_bound = (
+                (pd.Timestamp(end_date) - pd.Timedelta(days=1)).date()
+                if end_date
+                else None
+            )
+
             with self.engine.begin() as conn:
                 for col_name, field_key in _FIELD_MAP.items():
                     if col_name not in df.columns:
@@ -200,7 +215,19 @@ class YFinancePuller(BasePuller):
                         )
                         selected = selected.iloc[:, 0]
                     col_data = selected.dropna()
-                    existing_dates = self._get_existing_dates(series_id, conn)
+                    # Bounded to the same window this call already requested
+                    # from yfinance: col_data can only contain dates inside
+                    # [start_date, end_date), since yf.download() itself
+                    # bounds the response — so checking existing dates
+                    # outside that window can never affect the skip check
+                    # below. end_date stays open when unset ("through
+                    # today"): we can't have already inserted a future date.
+                    existing_dates = self._get_existing_dates(
+                        series_id,
+                        conn,
+                        start_date=pd.Timestamp(start_date).date(),
+                        end_date=existing_end_bound,
+                    )
 
                     for dt_idx, value in col_data.items():
                         # Defensive: reject any index entry that isn't a real

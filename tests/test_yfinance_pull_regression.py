@@ -130,3 +130,129 @@ def test_duplicate_columns_dont_iterate_column_names(engine_recording_inserts):
         od = params.get("od")
         if od is not None:
             assert not isinstance(od, str), f"obs_date={od!r} should never be a string"
+
+
+def test_existing_dates_check_is_bounded_to_the_requested_window(engine_recording_inserts):
+    """The dedup lookup must not scan a series' entire history to answer a
+    question only about the window this call actually fetched.
+
+    On a series with a very long, heavily-attempted pull history (millions
+    of rows for a single series_id/source_id), the previously-unbounded
+    `SELECT DISTINCT obs_date ... WHERE series_id = ... AND source_id = ...`
+    scanned every row ever inserted just to de-duplicate a handful of newly
+    fetched dates, and was slow enough to hit the statement timeout. Since
+    the fetched frame can only ever contain dates inside
+    [start_date, end_date] (yf.download() itself bounds the response), the
+    lookup only needs to cover that same window.
+    """
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    frame = pd.DataFrame(
+        {"Open": [87.35]},
+        index=pd.DatetimeIndex([pd.Timestamp("2026-09-11")], name="Date"),
+    )
+
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(
+             yfinance_pull.YFinancePuller, "_get_existing_dates", return_value=set()
+         ) as mock_get_existing, \
+         patch.object(yfinance_pull.yf, "download", return_value=frame):
+        puller = yfinance_pull.YFinancePuller(engine)
+        puller.pull_ticker("^DJI", start_date="2026-09-11", end_date="2026-09-14")
+
+    assert mock_get_existing.called, "_get_existing_dates must still be called"
+    _, kwargs = mock_get_existing.call_args
+    assert kwargs.get("start_date") == date(2026, 9, 11)
+    # One day before the requested end_date: yfinance's own `end` is
+    # exclusive (see test_existing_dates_end_bound_matches_yfinances_exclusive_end),
+    # so 09-14 requested means col_data can contain at most through 09-13.
+    assert kwargs.get("end_date") == date(2026, 9, 13)
+
+
+def test_existing_dates_check_leaves_end_open_when_end_date_omitted(engine_recording_inserts):
+    """`end_date=None` means 'through today' upstream — the existence check
+    must not invent an artificial upper bound that could hide a date the
+    fetch actually returned."""
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    frame = pd.DataFrame(
+        {"Open": [87.35]},
+        index=pd.DatetimeIndex([pd.Timestamp("2026-09-11")], name="Date"),
+    )
+
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(
+             yfinance_pull.YFinancePuller, "_get_existing_dates", return_value=set()
+         ) as mock_get_existing, \
+         patch.object(yfinance_pull.yf, "download", return_value=frame):
+        puller = yfinance_pull.YFinancePuller(engine)
+        puller.pull_ticker("^DJI", start_date="2026-09-11")
+
+    _, kwargs = mock_get_existing.call_args
+    assert kwargs.get("start_date") == date(2026, 9, 11)
+    assert kwargs.get("end_date") is None
+
+
+def test_existing_dates_end_bound_matches_yfinances_exclusive_end(engine_recording_inserts):
+    """yfinance's own `end` is exclusive — confirmed against the live API:
+    start="2026-09-10", end="2026-09-11" returns only 09-10, never 09-11.
+    _get_existing_dates's end_date is a normal inclusive bound, so the value
+    passed through must be one day before the requested end_date, not
+    end_date itself — otherwise the existence check would include a day
+    col_data can never contain, silently widening the scan for no benefit
+    (harmless today, but not what "bounded to the fetch window" should mean).
+    """
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    frame = pd.DataFrame(
+        {"Open": [87.35]},
+        index=pd.DatetimeIndex([pd.Timestamp("2026-09-10")], name="Date"),
+    )
+
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(
+             yfinance_pull.YFinancePuller, "_get_existing_dates", return_value=set()
+         ) as mock_get_existing, \
+         patch.object(yfinance_pull.yf, "download", return_value=frame):
+        puller = yfinance_pull.YFinancePuller(engine)
+        puller.pull_ticker("^DJI", start_date="2026-09-10", end_date="2026-09-11")
+
+    _, kwargs = mock_get_existing.call_args
+    assert kwargs.get("start_date") == date(2026, 9, 10)
+    assert kwargs.get("end_date") == date(2026, 9, 10), (
+        "end_date passed to _get_existing_dates must be one day before the "
+        "requested end_date (yfinance excludes the end date itself)"
+    )
+
+
+def test_pull_all_backfill_still_passes_a_wide_open_ended_bound(engine_recording_inserts):
+    """`pull_all()` never passes an end_date (its signature has none) — a
+    backfill (`backfill_all(start_date="1970-01-01")`, or this module's own
+    `__main__` calling `pull_all(start_date="2020-01-01")`) must still reach
+    _get_existing_dates with that same wide start_date and an open end, not
+    something narrowed to "recent days". The bound only ever tightens the
+    routine daily-schedule case (start_date=today); a broad backfill request
+    stays exactly as broad as it asks to be.
+    """
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    frame = pd.DataFrame(
+        {"Open": [87.35]},
+        index=pd.DatetimeIndex([pd.Timestamp("2020-01-02")], name="Date"),
+    )
+
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(
+             yfinance_pull.YFinancePuller, "_get_existing_dates", return_value=set()
+         ) as mock_get_existing, \
+         patch.object(yfinance_pull.yf, "download", return_value=frame):
+        puller = yfinance_pull.YFinancePuller(engine)
+        puller.pull_all(ticker_list=["^DJI"], start_date="2020-01-01")
+
+    _, kwargs = mock_get_existing.call_args
+    assert kwargs.get("start_date") == date(2020, 1, 1)
+    assert kwargs.get("end_date") is None
