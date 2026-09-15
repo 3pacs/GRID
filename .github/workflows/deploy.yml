@@ -14,6 +14,11 @@ on:
         type: boolean
         required: false
         default: true
+      activate_scheduler:
+        description: 'One-time: also restart grid-scheduler onto the release path (interrupts its current pass -- see deploy.yml comments). Never implied by a routine push or by do_restart.'
+        type: boolean
+        required: false
+        default: false
       skip_migrations:
         description: 'Skip alembic upgrade head (explicit opt-out only; never silent)'
         type: boolean
@@ -287,10 +292,58 @@ jobs:
       # The scheduler's own connection-pool override
       # (grid-scheduler.service.d/pool-budget.conf, EnvironmentFile= only) is
       # untouched by this -- different directive key, no collision.
-      - name: Restart grid-scheduler
-        if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
+      #
+      # UNLIKE grid-api/grid-hermes, everything below is gated on the explicit
+      # `activate_scheduler` input alone -- never on a routine push, and never
+      # on `do_restart` (which still only covers api/hermes). grid-scheduler
+      # is a long-running, sequential ingestion loop (ingestion/scheduler.py):
+      # a restart can't corrupt or double-write anything (every puller call is
+      # independently transaction-scoped, and the `schedule` library
+      # recomputes next_run on restart rather than re-firing an already-passed
+      # slot), but it does defer whichever sources are mid-pass to their next
+      # scheduled slot -- a real, if bounded, cost that a fast/stateless
+      # api/hermes restart doesn't have. So activation stays a deliberate,
+      # one-off action (see this PR's description for the exact procedure),
+      # not something every merge triggers.
+      - name: Report grid-scheduler activation status
+        if: ${{ inputs.activate_scheduler != true }}
+        run: |
+          {
+            echo "grid-scheduler was NOT restarted this run (activate_scheduler was not set)."
+            echo "It continues running its existing checkout, independent of the release tree this run deployed."
+            echo "**Scheduler activation remains pending.** To activate: run this workflow via workflow_dispatch with activate_scheduler=true."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Best-effort only -- see the safety note above for why a restart can
+      # never corrupt data even if this misses. Treats 90s of journal silence
+      # (no puller start/complete/warning lines) as a proxy for "not mid-pull
+      # right now"; gives up after 10 minutes and proceeds anyway rather than
+      # hanging the deploy job indefinitely.
+      - name: Wait for a grid-scheduler checkpoint (best-effort)
+        if: ${{ inputs.activate_scheduler == true }}
         run: |
           set -euo pipefail
+          for attempt in {1..20}; do
+            recent="$(journalctl -u grid-scheduler --since '90 seconds ago' --no-pager -q 2>/dev/null | wc -l)"
+            if [ "$recent" -eq 0 ]; then
+              echo "grid-scheduler quiet for 90s+ (check ${attempt}/20) -- proceeding"
+              exit 0
+            fi
+            echo "grid-scheduler shows activity in the last 90s (check ${attempt}/20) -- waiting 30s"
+            sleep 30
+          done
+          echo "::warning::grid-scheduler still showing activity after 10 minutes of waiting -- proceeding anyway. This cannot corrupt or duplicate data (see the safety note above); it only defers whichever sources are mid-pass to their next scheduled slot."
+
+      - name: Restart grid-scheduler (activate_scheduler only)
+        if: ${{ inputs.activate_scheduler == true }}
+        run: |
+          set -euo pipefail
+          # Recorded so the later verify step can search only logs from this
+          # restart onward -- the pre-restart process already had the same
+          # pool override (pool-budget.conf is untouched by this PR), so a
+          # relative "last N minutes" search could match its old log line
+          # and falsely confirm the NEW process initialized when it hadn't.
+          date -u +%s > "$RUNNER_TEMP/grid-scheduler-restart-ts"
           sudo mkdir -p /etc/systemd/system/grid-scheduler.service.d
           printf '%s\n' '[Service]' "WorkingDirectory=$DEPLOY_PATH" | sudo tee /etc/systemd/system/grid-scheduler.service.d/zz-release-worktree.conf >/dev/null
           sudo systemctl daemon-reload
@@ -300,7 +353,7 @@ jobs:
       # is-active would stay green through the whole time the scheduler ran
       # stale code, which is exactly the failure this exists to catch.
       - name: Verify grid-scheduler runs the deployed tree
-        if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
+        if: ${{ inputs.activate_scheduler == true }}
         run: |
           set -euo pipefail
           for attempt in {1..30}; do
@@ -323,6 +376,62 @@ jobs:
             exit 1
           }
           echo "verify: grid-scheduler is running the deployed tree"
+
+      # Beyond PID/cwd: prove the pool override actually reached the new
+      # process, that it initialized cleanly under that config (not just
+      # is-active -- a crash-loop still reports active between crashes), and
+      # that the specific bug this activation exists to fix is actually
+      # fixed, using the same ^DJI ticker that was timing out live before
+      # this PR (see #498 and this PR's description).
+      - name: Verify effective pool config, clean init, and a previously timing-out ticker
+        if: ${{ inputs.activate_scheduler == true }}
+        run: |
+          set -euo pipefail
+          pid="$(systemctl show -p MainPID --value grid-scheduler)"
+
+          echo "--- effective pool settings (from the running process's own environment) ---"
+          env_pool="$( { sudo -n tr '\0' '\n' < "/proc/${pid}/environ" 2>/dev/null || tr '\0' '\n' < "/proc/${pid}/environ" 2>/dev/null; } | grep -E '^GRID_DB_(POOL_SIZE|MAX_OVERFLOW)=' | sort)"
+          echo "$env_pool"
+          echo "$env_pool" | grep -qx 'GRID_DB_POOL_SIZE=3' || { echo "::error::GRID_DB_POOL_SIZE is not 3 in the restarted process"; exit 1; }
+          echo "$env_pool" | grep -qx 'GRID_DB_MAX_OVERFLOW=7' || { echo "::error::GRID_DB_MAX_OVERFLOW is not 7 in the restarted process"; exit 1; }
+
+          echo "--- successful initialization under that same effective config ---"
+          restart_ts="$(cat "$RUNNER_TEMP/grid-scheduler-restart-ts")"
+          for attempt in {1..30}; do
+            if journalctl -u grid-scheduler --since "@${restart_ts}" --no-pager -q 2>/dev/null | grep -qF 'pool_size=3, max_overflow=7'; then
+              echo "found the engine-creation log line confirming effective config"
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              echo "::error::did not see the pool_size=3, max_overflow=7 engine-creation log line within 2.5 minutes of restart"
+              journalctl -u grid-scheduler -n 80 --no-pager || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+          echo "--- a previously timing-out ticker completes with the bounded query ---"
+          for f in /data/grid_v4/grid_release/.env /home/grid/grid_v4/grid_repo/.env /home/grid/grid_v4/grid_repo/grid/.env; do
+            if [ -f "$f" ]; then set -a; . "$f"; set +a; echo "(env sourced from $f)"; break; fi
+          done
+          cd "$DEPLOY_PATH"
+          python3 - <<'PYEOF'
+          import time
+          from db import get_engine
+          from ingestion.yfinance_pull import YFinancePuller
+
+          t0 = time.time()
+          result = YFinancePuller(get_engine()).pull_ticker("^DJI", start_date="2026-09-14")
+          elapsed = time.time() - t0
+          print(f"^DJI verification: status={result['status']} rows_inserted={result['rows_inserted']} "
+                f"elapsed={elapsed:.1f}s errors={result['errors']}")
+          assert result["status"] in ("SUCCESS", "PARTIAL"), f"^DJI pull did not complete cleanly: {result}"
+          assert not any("statement timeout" in str(e).lower() for e in result["errors"]), (
+              f"^DJI is still timing out on the unbounded query: {result['errors']}"
+          )
+          PYEOF
+          echo "verify: ^DJI completed without a statement timeout, using the bounded existence check"
+          echo "**grid-scheduler activated successfully** (pool config, init, and a previously timing-out ticker all verified)." | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Notify success
         if: success()
