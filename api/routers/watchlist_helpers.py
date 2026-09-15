@@ -231,7 +231,11 @@ def _fetch_live_price(ticker: str) -> dict | None:
         price = getattr(info, "last_price", None)
         prev = getattr(info, "previous_close", None)
         if price is None:
-            hist = tk.history(period="5d")
+            # auto_adjust=False to match the fast_info branch above:
+            # last_price/previous_close are raw quotes, so the fallback must
+            # not hand back a dividend-adjusted close for the same field.
+            # Ticker.history() defaults to auto_adjust=True in yfinance 0.2.x+.
+            hist = tk.history(period="5d", auto_adjust=False)
             if not hist.empty:
                 price = float(hist["Close"].iloc[-1])
                 if len(hist) >= 2:
@@ -323,7 +327,18 @@ def _batch_fetch_prices(tickers: list[str]) -> dict[str, dict]:
 
         yf_tickers = list(yf_map.values())
         joined = " ".join(yf_tickers)
-        df = yf.download(joined, period="5d", group_by="ticker", progress=False)
+        # auto_adjust=False: these closes are shown to the user as the live
+        # price and are written back into raw_series by _cache_price_to_db,
+        # so they must stay on the same raw, unadjusted basis as the rest of
+        # the price stack (raw_series "YF:{ticker}:close", fast_info.
+        # last_price). yfinance's default flipped to True in 0.2.x. The
+        # pct_1d/pct_1w returns below would be marginally more correct on an
+        # adjusted basis, but over a 5-day window that only differs across a
+        # single ex-dividend date, and a mismatched price level is worse.
+        df = yf.download(
+            joined, period="5d", group_by="ticker", progress=False,
+            auto_adjust=False,
+        )
 
         # Reverse map: yfinance ticker -> original ticker
         {v: k for k, v in yf_map.items()}
