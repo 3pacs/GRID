@@ -50,13 +50,16 @@ shutdown attempt.
 **Total: 42 distinct PIDs killed** alongside the main process (16196), spanning
 label `python3` (37), `n/a` (3, meaning the process had already exited/exec'd by
 the time systemd read `/proc/<pid>/comm`, or the name field was otherwise
-unavailable), and `jemalloc_bg_thd` (1). systemd's `Killing process` log line for a
-stop-timeout SIGKILL fallback iterates over every PID in the unit's cgroup, which
-includes both distinct forked processes **and** individual threads (each kernel
-thread has its own PID-like TID, and appears in cgroup process/task listings) --
-this log alone does not distinguish which of the 42 were separate processes versus
-threads of the single Python interpreter. See "Thread vs. process" hypothesis
-below for why the balance of evidence favors mostly-threads.
+unavailable), and `jemalloc_bg_thd` (1). **Confirmed** (2026-09-16 follow-up,
+see §4c): these are genuine separate forked processes, not thread IDs.
+systemd's `Killing process` log line for a stop-timeout SIGKILL fallback
+iterates only `cgroup.procs`, which lists thread-group leaders (i.e. distinct
+processes) -- it never enumerates individual thread IDs. (This corrects the
+original version of this document, which read the same ambiguity in the log
+line alone as leaving the thread-vs-process question open, and leaned toward
+"mostly threads" as the more likely read at the time -- superseded by the
+follow-up's direct check of the actual systemd/kernel semantics, not a new
+guess.)
 
 **Elapsed time**: `systemctl restart` was issued at approximately 19:18:01 (the
 GitHub Actions step group start for `Restart grid-realtime`); SIGKILL fired at
@@ -195,29 +198,58 @@ resource-starvation issue unrelated to the row count (see 4c).
 
 ### 4c. Why 42 PIDs, including a `jemalloc_bg_thd`-named one, were killed
 
-**Not confirmed; the strongest available clue is circumstantial.** systemd's
-per-cgroup kill-everything fallback does not distinguish threads from processes
-in its log line, but a companion check on the *new* process (PID 2999240, running
-cleanly) shows `Threads: 52` in `/proc/<pid>/status` while `ps --ppid 2999240`
-shows **zero** child processes -- i.e. a single Python process can legitimately
-carry dozens of "tasks" that are threads, not forks. `jemalloc_bg_thd` is jemalloc's
-own background arena-decay thread name; jemalloc is a native memory allocator
-typically linked into compiled extensions, not something the pure-Python GRID
-code links directly. `curl_cffi` (version 0.16.3, confirmed installed) is
-`yfinance`'s (version 1.7.0, confirmed installed) HTTP backend and is exactly the
-kind of native/CFFI dependency that could plausibly link jemalloc. `yahoo.py`
-calls `yf.download(..., threads=True)` (confirmed in source, line 87) -- yfinance's
-own concurrent-download mode -- once every 60 seconds, for 49 days (~70,000
-invocations).
+**Updated 2026-09-16, incorporating a follow-up investigation session's
+direct evidence** (credited throughout this section; not this document's
+own original work). Two things are now on materially firmer footing than
+the original version of this section, and one remains genuinely open.
 
-**The hypothesis, stated as a hypothesis**: some fraction of those ~70,000
-`yf.download(threads=True)` calls may not have fully torn down their internal
-worker threads (or `curl_cffi`'s underlying connections/handles), leaking a small
-number of threads per call that accumulated slowly over 49 days, with
-`jemalloc_bg_thd` as an artifact of `curl_cffi`'s native layer. **This is not
-proven.** No thread was inspected while alive (all evidence is post-mortem from a
-systemd log line), and no code change is proposed here as a result -- see "Next
-steps" below for how this could be confirmed one way or the other.
+**Confirmed, not circumstantial: the 42 PIDs are real forked processes.**
+systemd's cgroup-kill fallback (`Killing process NNNN`) enumerates
+`cgroup.procs` specifically -- thread-group leaders only. It never lists
+individual thread IDs. So whatever spawned these 42 processes used a real
+`fork()`/`clone()` without `CLONE_THREAD`, not Python's `threading` module.
+This replaces the original version's weaker, log-line-only reasoning
+("balance of evidence favors mostly-threads") with a direct check of the
+actual kernel/systemd semantics involved.
+
+**The originally-proposed yfinance/curl_cffi thread-leak hypothesis is
+not supported by direct investigation, but is not conclusively ruled
+out either.** The follow-up session: grepped the installed `yfinance`
+1.7.0 and `curl_cffi` 0.16.3 source trees on grid-svr for
+`subprocess`/`multiprocessing`/`os.fork` -- zero matches in either. Traced
+`yf.download(..., threads=True)` (confirmed in `yahoo.py` source, line 87)
+to the `multitasking` package it depends on, which defaults to
+`ENGINE="thread"` -- confirmed live by importing it in the actual
+production venv and running a real `yf.download()` call, observing zero
+threads left behind afterward. Live-`strace`'d the actual running
+production process (PID 2999240) for 90 seconds spanning two real 60-second
+Yahoo poll cycles: every `clone3()` call carried `CLONE_THREAD`, and thread
+creation/exit counts balanced -- ordinary, short-lived thread churn (~31
+threads per poll), not a leak, in the window observed. Given the leak's own
+estimated rate (next paragraph) is roughly one event per ~1,400 poll
+cycles, a 2-cycle trace was never likely to catch it regardless of whether
+the hypothesis is true -- **this evidence weighs against yfinance/curl_cffi
+as the source, it does not conclusively rule out an intermittent cause
+there or elsewhere.** `jemalloc_bg_thd`'s presence as one of the 42 *is*
+still consistent with some native/compiled dependency being involved
+somewhere in the process tree -- that observation stands; only the specific
+yfinance/curl_cffi explanation for it has been investigated and weakened,
+not the underlying "something native leaked a process" finding.
+
+**The real leak is confirmed to exist and remains genuinely unexplained.**
+Not found in any code path inspected so far: GRID application code,
+`yfinance`, `curl_cffi`, or the `multitasking` package. `dex_scanner.py`
+(the other realtime feed with any child-process surface area) was also
+checked -- it uses only `aiohttp`, no subprocess path.
+
+**The "~1 per 1,400 poll cycles" figure is an estimate, not a directly
+measured rate.** It is derived from dividing an approximate poll count
+(60s Yahoo polls over the 49-day uptime, roughly 70,000) by the observed
+process count (roughly 50, from this incident's own PID list plus the
+prior process's cumulative history) -- a single order-of-magnitude
+estimate from one incident's aftermath, not a rate independently confirmed
+by repeated measurement. Treat it as "rare enough that a short trace
+wouldn't be expected to catch it," not as a precise, reproducible figure.
 
 ### 4d. Whether the leak (if real) is the actual cause of the shutdown stall
 
@@ -245,30 +277,73 @@ hypothesis, not a conclusion.
   it shows zero child processes after its first ~11 minutes of runtime.
 - The `dex_scanner` symbol-accumulation hypothesis (4a) and the
   thread-leak-during-yahoo-polling hypothesis (4c) are independent claims with
-  different confidence levels -- 4a is grounded directly in code + a matching data
-  point; 4c is circumstantial and explicitly weaker.
+  different confidence levels -- 4a is grounded directly in code + a matching
+  data point; 4c's specific yfinance/curl_cffi explanation is now
+  investigated and weighed against (source grep, live import test, and a
+  90s/2-cycle strace of the real process, all showing no leak in that
+  window) -- but a short trace not reproducing a rare, estimated-not-measured
+  event is not the same as ruling the hypothesis out conclusively, and the
+  underlying "something native leaked a real process" finding stands either
+  way.
 
-## 6. Recommended next steps (not performed here -- investigation only)
+## 6. Recommended next steps
 
-1. **Watch `Threads:` in `/proc/<realtime-pid>/status` over time** on the current
+1. ✅ **Done (2026-09-16 follow-up): an unconditional completion marker for
+   the final-flush phase.** `ingestion/realtime/ws_listener.py::
+   _run_final_flush` now logs `"Final flush phase reached its end
+   (outcome=...)"` regardless of outcome (`written`/`timed_out`/`failed`/
+   `nothing_to_flush`), explicitly worded so it cannot be misread as a
+   persistence guarantee for the non-`written` cases (their own
+   `log.error` lines, immediately above, already state the candles were
+   NOT written). Extracted into a standalone async function and covered by
+   `tests/test_realtime_final_flush_marker.py` (all four outcomes exercised
+   directly, plus a test pinning down the marker's own wording contract).
+   This directly answers the original ask this document was written to
+   satisfy: a future SIGKILL with no marker line before it proves the kill
+   landed mid-flush; one with the marker line proves the phase completed
+   (by whichever outcome, not necessarily a successful write).
+2. **Watch `Threads:` in `/proc/<realtime-pid>/status` over time** on the current
    process (baseline: 52 threads at ~11 minutes post-restart) -- if it climbs
    materially over days/weeks without bound, that would be direct, current
    evidence for a live leak (rather than inferring from the now-unavailable old
-   process).
-2. **Add symbol-count / active_symbols as a monitored metric** (e.g. logged
+   process). **Not done as part of this follow-up** -- no additional production
+   instrumentation beyond item 1 above was added this round.
+3. **Add symbol-count / active_symbols as a monitored metric** (e.g. logged
    periodically, not just at shutdown) so a future restart's "Flushing N remaining
    candles" isn't the first time anyone learns the count has grown to hundreds.
-3. **Consider an eviction policy for `CandleBuilder.candles`** (e.g. drop an
+   Not done.
+4. **Consider an eviction policy for `CandleBuilder.candles`** (e.g. drop an
    entry if it hasn't received a tick in N intervals) if the dex_scanner
    accumulation (4a) is judged worth addressing -- a design/product decision, not
    made here.
-4. If pursued, a controlled reproduction (e.g. a staging instance running
-   `yf.download(threads=True)` in a tight loop while watching `/proc/<pid>/status`
-   `Threads:` and `lsof`/`ls /proc/<pid>/fd` for handle growth) would be needed to
-   confirm or rule out hypothesis 4c -- not attempted here, per the instruction to
-   make no production changes as part of this investigation.
+5. **A true controlled reproduction of hypothesis 4c remains not performed.**
+   The 2026-09-16 follow-up's live strace (§4c) observed the real process
+   under real load for 90 seconds/2 poll cycles and found no leak in that
+   window -- useful, real evidence, but not a substitute for a dedicated
+   reproduction (e.g. a staging instance running `yf.download(threads=True)`
+   in a tight loop for a duration long enough to plausibly catch a
+   ~1-per-1,400-cycle event, watching `/proc/<pid>/status` `Threads:` and
+   `lsof`/`ls /proc/<pid>/fd` for handle growth throughout). Still not
+   attempted, consistent with making no additional production changes.
 
 This is tracked separately from `docs/TODO-REALTIME-CANDLE-CORRECTNESS.md` (which
 covers candle *merge* correctness across a restart, a different concern from
 shutdown reliability) and from any oracle-scoring/prediction-dedup work (see
 `docs/TODO-DUP-WRITES.md`, unrelated).
+
+## 7. 2026-09-16 follow-up -- what changed and why
+
+This document was revised the same day it was merged, incorporating direct
+evidence from a separate investigation session (`local_d17dbc48`,
+"Investigate grid-realtime orphaned-process shutdown failure") that ran
+concurrently and produced findings not available when this document was
+first written. Specifically corrected: the thread-vs-process framing in §1
+and §4c (now confirmed as processes, not "balance of evidence favors
+threads"), and the yfinance/curl_cffi hypothesis in §4c (investigated via
+source grep, a live import test, and a real strace -- weakened, not
+confirmed as ruled out). Added: the `_run_final_flush` marker (§6, item 1),
+implemented and tested in this same follow-up, based on that other
+session's original (uncommitted) diff -- reproduced faithfully with one
+wording refinement (the marker's own log message now states explicitly, in
+the message itself rather than only in a source comment, that reaching it
+does not prove persistence for the non-`written` outcomes).
