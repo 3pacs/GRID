@@ -29,6 +29,16 @@ on:
         type: boolean
         required: false
         default: false
+      activate_realtime:
+        description: 'One-time: also restart grid-realtime onto the release path (drops the current WS/candle-builder session -- see deploy.yml comments). Never implied by a routine push or by do_restart. Also requires acknowledge_realtime_interruption=true.'
+        type: boolean
+        required: false
+        default: false
+      acknowledge_realtime_interruption:
+        description: 'Required to activate grid-realtime: explicitly acknowledges the restart drops the live Binance WebSocket session (auto-reconnects, brief tick-capture gap) and force-closes every symbols in-progress candle bar early via flush_all() -- those rows are still written, not lost, but each is truncated to less than its full interval rather than a clean boundary close. There is no automated safe-to-restart check. Only consulted when activate_realtime=true.'
+        type: boolean
+        required: false
+        default: false
       skip_migrations:
         description: 'Skip alembic upgrade head (explicit opt-out only; never silent)'
         type: boolean
@@ -506,6 +516,134 @@ jobs:
           else
             echo "Ticker probe (diagnostic, separate from activation): PASSED -- ^DJI completed over ${probe_from}..${probe_end} without a statement timeout" | tee -a "$GITHUB_STEP_SUMMARY"
           fi
+
+      # grid-realtime has the exact same class of bug the grid-scheduler fix
+      # (#499) addressed: its unit pins WorkingDirectory to
+      # /home/grid/grid_v4/grid_repo, a separate checkout this workflow never
+      # writes to on a routine push. Confirmed 2026-09-16: grid-realtime's
+      # process had been running since 2026-07-29 with grid_repo's checkout
+      # stuck around 2026-09-11 -- both predate every dependency/bug-fix PR
+      # merged this week, including the auto_adjust fix to
+      # ingestion/realtime/feeds/yahoo.py (#503).
+      #
+      # UNLIKE grid-api/grid-hermes, everything below is gated on the explicit
+      # activate_realtime input alone -- never on a routine push, and never on
+      # do_restart (which only covers api/hermes). grid-realtime is a
+      # long-running daemon with a live Binance WebSocket subscription and an
+      # in-memory candle-building buffer (ingestion/realtime/candle_builder.py),
+      # not a stateless request server.
+      #
+      # Data-loss shape is narrower than "restart = lose data": ws_listener.py
+      # has a graceful SIGTERM handler (systemctl restart sends SIGTERM by
+      # default) that cancels its 4 async tasks and calls
+      # CandleBuilder.flush_all(), which moves every in-progress candle to the
+      # flush queue before exit -- nothing is silently dropped. But
+      # flush_all() force-closes each active symbol's candle early, so every
+      # symbol's in-progress bar at restart time gets written truncated
+      # (less than its full interval) rather than at a clean boundary. The
+      # Binance feed already has its own reconnect-with-backoff loop for
+      # transient disconnects (ingestion/realtime/feeds/binance.py), so a
+      # full restart just re-enters that loop -- a brief real-time-capture
+      # gap during reconnect, not a new failure mode.
+      #
+      # There is no automated "safe to restart" check, same reasoning as
+      # grid-scheduler: nothing can prove no candle is mid-interval right
+      # now. So activation always requires an explicit
+      # acknowledge_realtime_interruption=true -- a human decision, never an
+      # automatic pass.
+      - name: Report grid-realtime activation status
+        if: ${{ inputs.activate_realtime != true }}
+        run: |
+          {
+            echo "grid-realtime was NOT restarted this run (activate_realtime was not set)."
+            echo "It continues running its existing checkout, independent of the release tree this run deployed."
+            echo "**Realtime activation remains pending.** To activate: run this workflow via workflow_dispatch with activate_realtime=true and acknowledge_realtime_interruption=true."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Require explicit interruption acknowledgment (realtime)
+        if: ${{ inputs.activate_realtime == true }}
+        # Same reasoning as the grid-scheduler gate: this job never runs
+        # actions/checkout, so the gate script is read from $DEPLOY_PATH (the
+        # tree "Build release tree" already fetched), not a workspace-relative
+        # path that wouldn't resolve here.
+        run: bash "$DEPLOY_PATH/scripts/realtime_activation_gate.sh" "${{ inputs.acknowledge_realtime_interruption }}"
+
+      - name: Restart grid-realtime (activate_realtime only)
+        if: ${{ inputs.activate_realtime == true }}
+        run: |
+          set -euo pipefail
+          date -u +%s > "$RUNNER_TEMP/grid-realtime-restart-ts"
+          sudo mkdir -p /etc/systemd/system/grid-realtime.service.d
+          DROPIN=/etc/systemd/system/grid-realtime.service.d/zz-release-worktree.conf
+          if [ -f "$DROPIN" ]; then
+            BACKUP="${DROPIN}.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+            sudo cp -a "$DROPIN" "$BACKUP"
+            echo "Existing drop-in backed up to $BACKUP"
+            echo "Exact rollback: sudo cp -a $BACKUP $DROPIN && sudo systemctl daemon-reload && sudo systemctl restart grid-realtime" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No pre-existing drop-in at $DROPIN (first activation)."
+            echo "Exact rollback: sudo rm $DROPIN && sudo systemctl daemon-reload && sudo systemctl restart grid-realtime" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          printf '%s\n' '[Service]' "WorkingDirectory=$DEPLOY_PATH" | sudo tee "$DROPIN" >/dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl restart grid-realtime
+
+      # Same proof-of-tree pattern as grid-api/grid-hermes/grid-scheduler --
+      # a bare is-active would stay green through the whole time it ran stale
+      # code.
+      - name: Verify grid-realtime runs the deployed tree
+        if: ${{ inputs.activate_realtime == true }}
+        run: |
+          set -euo pipefail
+          for attempt in {1..30}; do
+            state="$(systemctl is-active grid-realtime || true)"
+            [ "$state" = "active" ] && break
+            if [ "$attempt" -eq 30 ]; then
+              echo "::error::grid-realtime not active after restart (state=$state)"
+              sudo systemctl status grid-realtime --no-pager -l || true
+              journalctl -u grid-realtime -n 60 --no-pager || true
+              exit 1
+            fi
+            sleep 2
+          done
+          pid="$(systemctl show -p MainPID --value grid-realtime)"
+          cwd="$(sudo -n readlink "/proc/${pid}/cwd" 2>/dev/null || readlink "/proc/${pid}/cwd" 2>/dev/null || true)"
+          echo "grid-realtime pid=$pid cwd=$cwd"
+          want="$(readlink -f "$DEPLOY_PATH")"
+          [ -n "$cwd" ] && [ "$(readlink -f "$cwd")" = "$want" ] || {
+            echo "::error::grid-realtime cwd '$cwd' does not resolve to $want -- it is running a different tree"
+            exit 1
+          }
+          # Prove the daemon actually started its task set, not just that the
+          # process is alive -- "4 async tasks" is logged unconditionally by
+          # ws_listener.py's main() on every successful start (ingestion/
+          # realtime/ws_listener.py:29), so this is the one line every clean
+          # boot always emits. "Binance WS connected" is a stronger secondary
+          # signal (ingestion/realtime/feeds/binance.py:51) confirming at
+          # least one live feed actually connected, not just that asyncio
+          # scheduled the tasks -- Yahoo's own feed only logs at DEBUG level
+          # (yahoo.py:59, likely below the configured log level in
+          # production) so it isn't a reliable line to grep for here.
+          restart_ts="$(cat "$RUNNER_TEMP/grid-realtime-restart-ts")"
+          for attempt in {1..30}; do
+            if journalctl -u grid-realtime --since "@${restart_ts}" --no-pager -q 2>/dev/null \
+                 | grep -qF '4 async tasks'; then
+              echo "found the startup log line confirming a clean boot"
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              echo "::error::did not see the startup log line within 2.5 minutes of restart"
+              journalctl -u grid-realtime -n 80 --no-pager || true
+              exit 1
+            fi
+            sleep 5
+          done
+          if journalctl -u grid-realtime --since "@${restart_ts}" --no-pager -q 2>/dev/null | grep -qF 'Binance WS connected'; then
+            echo "Binance feed confirmed connected post-restart." | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::no 'Binance WS connected' line seen yet -- daemon started cleanly but the feed connection isn't confirmed (does not fail activation; Binance has its own reconnect-with-backoff loop)."
+          fi
+          echo "**grid-realtime activated successfully** (deployed tree confirmed, startup clean)." | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Notify success
         if: success()
