@@ -35,7 +35,7 @@ on:
         required: false
         default: false
       acknowledge_realtime_interruption:
-        description: 'Required to activate grid-realtime: explicitly acknowledges the restart drops the live Binance WebSocket session (auto-reconnects, brief tick-capture gap) and force-closes every symbols in-progress candle bar early via flush_all() -- those rows are still written, not lost, but each is truncated to less than its full interval rather than a clean boundary close. There is no automated safe-to-restart check. Only consulted when activate_realtime=true.'
+        description: 'Required to activate grid-realtime: explicitly acknowledges the restart drops the live Binance WebSocket session (auto-reconnects, brief tick-capture gap) and force-closes every symbol''s in-progress candle bar early via flush_all() -- those rows are still written, not lost, but each is truncated to less than its full interval rather than a clean boundary close. There is no automated safe-to-restart check. Only consulted when activate_realtime=true.'
         type: boolean
         required: false
         default: false
