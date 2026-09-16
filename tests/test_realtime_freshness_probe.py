@@ -21,6 +21,7 @@ import os
 import sys
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from sqlalchemy import text
@@ -230,3 +231,40 @@ def test_run_probe_end_to_end_reports_seen_for_a_source_with_a_fresh_row(realtim
     # rather than an exact count.
     yahoo_line = next(line for line in lines if line.startswith(("SEEN yahoo", "UNVERIFIED yahoo")))
     assert yahoo_line.startswith("SEEN yahoo"), f"expected a fresh yahoo row to be reported SEEN, got: {yahoo_line}"
+
+
+def test_script_invoked_as_a_subprocess_from_repo_root_can_import_db():
+    """Regression test for a real bug this exact invocation shape hit in
+    production: `from db import get_engine` (db.py lives at the repo root,
+    not in scripts/) failed with ModuleNotFoundError when the script was
+    run the way deploy.yml actually runs it -- `python3
+    scripts/realtime_freshness_probe.py <arg>` from the repo root -- even
+    though every other test in this file (which imports the module
+    directly, letting pytest's own sys.path handling paper over it) kept
+    passing. Python puts a script's OWN directory on sys.path[0] when
+    invoked this way, not the caller's cwd, so scripts/ needs its own
+    explicit sys.path insert for repo-root imports to resolve regardless
+    of caller. This test reproduces the EXACT invocation shape, not an
+    approximation of it.
+
+    No live Postgres needed: reaching the `import psycopg2` line inside
+    db.py (a real, expected environment dependency, not a code bug) is
+    proof enough that `from db import get_engine` itself resolved --
+    that specific ModuleNotFoundError is what this guards against, not
+    full end-to-end DB connectivity (covered by the other tests in this
+    file, which skip without Postgres).
+    """
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parent.parent
+    result = subprocess.run(
+        [sys.executable, "scripts/realtime_freshness_probe.py", "2026-09-16T19:19:34Z"],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert "ModuleNotFoundError: No module named 'db'" not in result.stderr, (
+        f"the script cannot import db.py when invoked as a subprocess from "
+        f"the repo root, exactly how deploy.yml calls it -- stderr:\n{result.stderr}"
+    )
