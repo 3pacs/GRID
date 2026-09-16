@@ -2143,7 +2143,22 @@ class OracleEngine:
         return [r[0] for r in rows]
 
     def _get_spot_price(self, ticker: str) -> float | None:
-        """Get latest spot price for a ticker."""
+        """Get latest spot price for a ticker.
+
+        Raw basis only. The value returned here becomes ``entry_price`` on
+        new ``OraclePrediction`` rows, which must stay on the same raw basis
+        as ``options_daily_signals.spot_price`` (this method's primary
+        source) and as the actual/exit price ``scripts/score_oracle_trades.py``
+        scores it against (``fetch_prices()``, ``auto_adjust=False`` as of
+        PR #516). The fallback below used to prefer ``adj_close`` over
+        ``close`` -- silently mixing an adjusted entry price against a raw
+        exit price, the same dividend/split-driven spurious-return bug
+        PR #503 fixed for intelligence/trust_scorer.py and
+        trading/options_tracker.py. No adjusted fallback: if a raw close
+        isn't available, return ``None`` so the caller
+        (``generate_predictions_for_ticker``) stores its existing
+        ``NO_DATA`` placeholder instead of a wrong-basis price.
+        """
         with self.engine.connect() as conn:
             row = conn.execute(text("""
                 SELECT spot_price FROM options_daily_signals
@@ -2153,16 +2168,14 @@ class OracleEngine:
             if row:
                 return float(row[0])
 
-            # Fallback to yfinance raw data
-            # Prefer adj_close (accounts for splits/dividends), fall back to close
-            for suffix in ("adj_close", "close"):
-                row = conn.execute(text("""
-                    SELECT value FROM raw_series
-                    WHERE series_id = :sid AND pull_status = 'SUCCESS'
-                    ORDER BY obs_date DESC LIMIT 1
-                """), {"sid": f"YF:{ticker}:{suffix}"}).fetchone()
-                if row:
-                    return float(row[0])
+            # Fallback to yfinance raw close. Raw only -- see docstring.
+            row = conn.execute(text("""
+                SELECT value FROM raw_series
+                WHERE series_id = :sid AND pull_status = 'SUCCESS'
+                ORDER BY obs_date DESC LIMIT 1
+            """), {"sid": f"YF:{ticker}:close"}).fetchone()
+            if row:
+                return float(row[0])
             return None
 
     def _get_price_at_date(self, ticker: str, target_date: date) -> float | None:
