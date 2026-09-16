@@ -76,7 +76,7 @@ boto3>=1.34.0
 tqdm>=4.70.1
 tenacity>=8.2.0
 websockets>=16.1
-pyarrow>=14.0.0
+pyarrow>=25.0.1
 polars>=1.40.1
 
 # ML model training
