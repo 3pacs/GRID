@@ -71,10 +71,9 @@ and from the two clusters -- consistent with (not proof of) accumulation at
 different, widely-spaced points over the 49-day uptime, rather than all being
 created in one recent burst.
 
-## 2. Confirmed by direct query (read-only, run after the fact)
+## 2. What a direct, read-only query establishes -- and what it does NOT
 
-**The final shutdown flush did not write any row to `realtime_candles`.** Queried
-directly:
+**Exactly what was checked:**
 
 ```sql
 SELECT source, count(*), min(created_at), max(created_at)
@@ -84,32 +83,72 @@ WHERE ts > TIMESTAMP '2026-09-16 18:00:00+00'
 GROUP BY source
 ```
 
-Result: **zero rows**, for any source, in the entire window from the
-"Flushing 723 remaining candles..." log line to the SIGKILL. This is a confirmed
-fact (absence of rows in a completed, read-only query), not an inference -- the
-723-candle final flush produced no output before the process was killed.
+Result: **zero rows**, for any source, with `created_at` in that window.
+
+**What this establishes, precisely**: no row was newly INSERTED with a
+`created_at` timestamp between the "Flushing 723 remaining candles..." log
+line and the kill. That is all a `created_at` timestamp can prove, because
+`created_at` is set only by an actual `INSERT` (`DEFAULT now()`, never
+touched again).
+
+**What this does NOT establish**: that the flush never completed.
+`INSERT_SQL` is `ON CONFLICT (symbol, interval, ts) DO NOTHING` --a
+completed flush attempt that tries to write N rows where some or all of
+those exact `(symbol, interval, ts)` keys **already existed** in the table
+would insert **fewer than N rows, or zero**, and produce no `created_at`
+change for any of them, indistinguishable from "never attempted" by this
+query alone. Whether any of the 723 keys in this specific batch already
+existed was not independently checked -- the exact list of 723
+`(symbol, ts)` pairs was never logged and cannot be reconstructed now that
+the process is gone, so this cannot be resolved after the fact. A
+supporting (not conclusive) observation: the periodic flusher's own last
+successful cycle, 30 seconds earlier ("Flushed 80 candles... 79 symbols" at
+19:17:33), would have just started a fresh, not-yet-flushed bucket for
+each of those ~79 continuously-active symbols -- for those specific keys
+specifically, a first-ever write for that timestamp is the more likely
+case, which would make a DO-NOTHING-masked completion less likely for
+*them*. This reasoning does not extend to the remaining ~640+ entries in
+the 723 (the long-accumulated, rarely-active `dex_scanner` symbols -- see
+hypothesis 4a), whose prior-existence status is simply unknown.
+
+**Conclusion for this section: zero rows were newly inserted in that
+window. Whether the final flush completed is UNCONFIRMED**, not
+established either way by this query -- see Section 3.
 
 ## 3. Unconfirmed
 
+- **Whether the final shutdown flush completed.** Not established by the
+  database query above (see Section 2 for exactly why -- `DO NOTHING` can
+  mask a completed attempt) and not established by any surviving log line
+  either (neither "Final flush: N candles written" nor "Final flush timed
+  out after 30s" -- the two outcomes the code itself would log -- appears
+  anywhere before the kill). No independent evidence (a stack trace, a
+  core dump, an APM trace) exists to resolve this either way. Absent such
+  evidence, this remains open in both directions: a completed flush that
+  happened to write zero *new* rows is not ruled out, and neither is a
+  flush that never ran to completion at all.
 - **Where exactly execution was stuck** between "Flushing 723 remaining
-  candles..." (19:18:12) and the kill (19:19:33). The code path is: `log.info(...)`
-  → `builder.flush_all()` (synchronous, pure in-memory dict iteration, should be
-  fast even for 723 entries) → `builder.drain()` (same) → `build_insert_values()`
-  (same) → `await asyncio.wait_for(bounded_write(_write_final_flush_sync, rows),
-  timeout=30)`. The 30-second bound wraps only the last step. 81 seconds of total
-  silence, with zero log output (not even the "Final flush timed out after 30s"
-  or "Final flush: N candles written" lines that step's own code would produce on
-  either successful completion or a timeout), means execution did not reach the
-  end of that `await` in the normal way -- but *why* is not established. No stack
-  trace, core dump, or other diagnostic was captured before the SIGKILL destroyed
-  the process; none of these can be reconstructed after the fact.
-- Whether the 723-candle count itself (vs. flusher.py's routine ~80) directly
-  caused the hang, versus being coincidental to some other stuck condition, is not
+  candles..." (19:18:12) and the kill (19:19:33), if it was in fact stuck
+  rather than completed-with-nothing-to-insert. The code path is:
+  `log.info(...)` → `builder.flush_all()` (synchronous, pure in-memory
+  dict iteration, should be fast even for 723 entries) → `builder.drain()`
+  (same) → `build_insert_values()` (same) → `await asyncio.wait_for(
+  bounded_write(_write_final_flush_sync, rows), timeout=30)`. The
+  30-second bound wraps only the last step. 81 seconds of total silence,
+  with zero log output of any kind, means execution did not reach the end
+  of that `await` in the normal way (or, per the point above, executed it
+  in a way that produced no distinguishing log or row) -- but *why* is not
+  established. No stack trace, core dump, or other diagnostic was
+  captured before the SIGKILL destroyed the process; none of these can be
+  reconstructed after the fact.
+- Whether the 723-candle count itself (vs. flusher.py's routine ~80)
+  directly caused a hang, versus being coincidental to some other stuck
+  condition (or to no hang at all, per the point above), is not
   established -- see hypothesis below.
-- Whether the killed PIDs were genuinely leaked/orphaned resources accumulated
-  over time, or were created in the final moments of the stuck shutdown attempt
-  itself, is not established from the log alone (the numeric-range clustering is
-  suggestive, not conclusive).
+- Whether the killed PIDs were genuinely leaked/orphaned resources
+  accumulated over time, or were created in the final moments of the
+  shutdown attempt itself, is not established from the log alone (the
+  numeric-range clustering is suggestive, not conclusive).
 
 ## 4. Hypotheses (not confirmed -- grounded in code/data, not proof)
 
