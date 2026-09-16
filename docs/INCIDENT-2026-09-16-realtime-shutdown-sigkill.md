@@ -22,9 +22,9 @@ investigation began, so they could not be inspected live.
 2026-09-16T19:18:03+0000  DEX scanner cancelled — shutting down
 2026-09-16T19:18:11+0000  Binance WS feed cancelled — shutting down
 2026-09-16T19:18:12+0000  Flushing 723 remaining candles...
-                          [[ 81 seconds of total silence from PID 16196 -- no further
+                          (( 81 seconds of total silence from PID 16196 -- no further
                              log line of any kind, at any level, appears before the
-                             kill below ]]
+                             kill below ))
 2026-09-16T19:19:33+0000  systemd: grid-realtime.service: State 'stop-sigterm' timed out. Killing.
 2026-09-16T19:19:33+0000  Killing process 16196 (python3) with signal SIGKILL     [main process]
 2026-09-16T19:19:33+0000  Killing process 17962 (python3) with signal SIGKILL
