@@ -295,3 +295,30 @@ def test_guard_fails_against_the_pre_fix_workflow():
 
     # Both halves were missing, which is exactly the shipped-but-inert bug.
     assert len(failures) == 2, f"expected both guards to fail on the old file, got: {failures}"
+
+
+@pytest.mark.unit
+def test_freshness_probe_query_is_bounded_by_an_indexed_column():
+    """The freshness probe's `WHERE created_at > :restart_ts` has no index
+    to use on its own (realtime_candles has no index on created_at) and
+    forces a full sequential scan -- confirmed in production to exceed
+    Postgres's statement_timeout against the real 2M+-row table (only ever
+    exercised against small CI tables before that). Guards against silently
+    dropping the `ts > :ts_floor` bound that makes this use
+    idx_rt_candles_ts instead (validated via EXPLAIN ANALYZE directly
+    against production: Parallel Seq Scan, cost ~39911 -> Index Scan using
+    idx_rt_candles_ts, <1ms -- no new index, no settings change).
+    """
+    step = _step_named(_deploy_steps(), "verify grid-realtime is delivering fresh data")
+    assert step is not None, "deploy.yml does not verify grid-realtime data freshness"
+
+    run = step.get("run", "")
+    assert "ts_floor" in run, (
+        "the freshness probe no longer bounds its query by ts -- this will "
+        "force a full sequential scan on realtime_candles again (no index "
+        "on created_at), which times out against the real production table"
+    )
+    assert "idx_rt_candles_ts" in run or "WHERE ts >" in run, (
+        "the freshness probe's query no longer filters on ts before "
+        "created_at"
+    )

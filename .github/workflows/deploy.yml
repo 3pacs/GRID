@@ -491,47 +491,71 @@ jobs:
           # created_at is after restart_ts could not have been written by the
           # dying old process, only by the new one.
           #
-          # Deliberately NOT also matching on a ts time-window (an earlier
-          # version of this check did -- but ts >= some-window is a
-          # timestamp-window match, not proof of new ingestion: it can
-          # equally match a row the OLD process's shutdown flush wrote for
-          # that same bucket, which is exactly the ambiguity this check
-          # exists to resolve, not reproduce). created_at is set only by an
-          # actual INSERT (see INSERT_SQL in flusher.py -- `ON CONFLICT DO
+          # The proof of "new ingestion, not just a stale row" is
+          # created_at > restart_ts (see below for why that alone is
+          # correct) -- but a bare `WHERE created_at > :restart_ts` has no
+          # index to use (realtime_candles has no index on created_at) and
+          # forces a full sequential scan. Against the real production
+          # table (2M+ rows spanning months) that exceeds Postgres's own
+          # statement_timeout (confirmed in production: this exact query
+          # was cancelled with `psycopg2.errors.QueryCanceled: canceling
+          # statement due to statement timeout` during the first-ever
+          # activation, 2026-09-16 -- the check had only ever been
+          # exercised against small CI tables before that). Fixed by ALSO
+          # bounding on ts, which realtime_candles DOES have an index on
+          # (idx_rt_candles_ts) -- this is a genuine index-scan optimization,
+          # not a semantic change: a fresh post-restart row's ts (its
+          # bucket floor) cannot be more than one interval before the
+          # process that wrote it started, so bounding ts to a window
+          # starting well before restart_ts (10 minutes -- two full
+          # 5-minute buckets of slack) cannot exclude any row the
+          # unbounded query would have found. Validated directly against
+          # production (read-only EXPLAIN ANALYZE, no index added, no
+          # settings changed): the old query plans as `Parallel Seq Scan`
+          # (cost ~39911); this one plans as `Index Scan using
+          # idx_rt_candles_ts` and executes in under 1ms.
+          #
+          # The created_at (not ts) comparison itself is still what proves
+          # freshness, unchanged: created_at is set only by an actual
+          # INSERT (see INSERT_SQL in flusher.py -- `ON CONFLICT DO
           # NOTHING` means a colliding write either lands as a fresh INSERT
           # for a new bucket, or is entirely discarded for a colliding one;
           # there is no UPDATE path that could touch an existing row's
-          # created_at). So this check proves fresh INSERTs specifically,
-          # and will not see the ONE bucket per symbol whose complete
-          # candle got silently discarded by DO NOTHING at the restart
-          # boundary (see docs/TODO-REALTIME-CANDLE-CORRECTNESS.md) -- but
-          # the periodic flusher runs across many OTHER buckets too, and a
+          # created_at), and restart_ts (captured by the previous step,
+          # immediately after the blocking restart command returns)
+          # unambiguously post-dates the old process's entire shutdown
+          # sequence. So this check proves fresh INSERTs specifically, and
+          # will not see the ONE bucket per symbol whose complete candle
+          # got silently discarded by DO NOTHING at the restart boundary
+          # (see docs/TODO-REALTIME-CANDLE-CORRECTNESS.md) -- but the
+          # periodic flusher runs across many OTHER buckets too, and a
           # genuinely working feed will produce at least one fresh INSERT
-          # (a new bucket rolling over) well within the 4-minute window
-          # below regardless of that one discarded bucket -- so this check
-          # still reliably detects overall feed liveness; it's a
-          # false-negative risk only for that single colliding bucket
-          # specifically, never a false-positive one (it can't claim
-          # freshness that didn't happen, since created_at is only ever set
-          # by a real INSERT).
+          # well within the 4-minute window below regardless of that one
+          # discarded bucket -- so this check still reliably detects
+          # overall feed liveness; it's a false-negative risk only for
+          # that single colliding bucket specifically, never a
+          # false-positive one.
           restart_ts="$(cat "$RUNNER_TEMP/grid-realtime-restart-ts")"
           restart_iso="$(date -u -d "@${restart_ts}" +%Y-%m-%dT%H:%M:%SZ)"
+          ts_floor_iso="$(date -u -d "@$((restart_ts - 600))" +%Y-%m-%dT%H:%M:%SZ)"
           probe_out="$RUNNER_TEMP/grid-realtime-freshness-probe.txt"
           set +e
-          timeout 240 python3 - "$restart_iso" > "$probe_out" <<'PYEOF'
+          timeout 240 python3 - "$restart_iso" "$ts_floor_iso" > "$probe_out" <<'PYEOF'
           import sys
           from db import get_engine
           from sqlalchemy import text
 
           restart_iso = sys.argv[1]
+          ts_floor_iso = sys.argv[2]
           engine = get_engine()
           with engine.connect() as conn:
               rows = conn.execute(text("""
                   SELECT source, count(*), max(ts), max(created_at)
                   FROM realtime_candles
-                  WHERE created_at > :restart_ts
+                  WHERE ts > :ts_floor
+                    AND created_at > :restart_ts
                   GROUP BY source
-              """), {"restart_ts": restart_iso}).fetchall()
+              """), {"ts_floor": ts_floor_iso, "restart_ts": restart_iso}).fetchall()
           sources = {r[0]: (r[1], r[2], r[3]) for r in rows}
 
           # SEEN/UNVERIFIED per source, printed as parseable lines -- bash
