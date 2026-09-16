@@ -17,12 +17,20 @@ grid-realtime is restarted unconditionally on the same gate as
 grid-api/grid-hermes rather than behind a separate opt-in input: its unit
 already carries `Restart=always`/`RestartSec=10`, SIGTERM triggers a graceful
 shutdown that flushes the in-progress candle (ws_listener.py::main), every
-candle write is an idempotent `INSERT ... ON CONFLICT DO NOTHING`
-(flusher.py), the Binance feed already reconnects with backoff on any
+candle write MERGES on conflict rather than discarding either side
+(`INSERT ... ON CONFLICT (symbol, interval, ts) DO UPDATE`, flusher.py --
+see its own comment for the merge algebra, and
+tests/test_realtime_shutdown_semantics.py for the live-database-verified
+regression), the Binance feed already reconnects with backoff on any
 disconnect (feeds/binance.py), and the Yahoo feed is a stateless HTTP poll
 with no per-connection state (feeds/yahoo.py) -- a deploy-triggered restart
 is the same bounded, self-healing event this daemon already tolerates on
-every unplanned crash.
+every unplanned crash. "Restart=always is already normal" is necessary but
+not sufficient justification on its own, though -- see
+ingestion/realtime/db_writer.py's docstring for the DB-connection-
+concurrency bound that had its own gap (a cancelled coroutine could release
+its slot while its executor thread was still mid-write) found and fixed
+alongside this.
 
 So these guard both halves: the restart happens, on the same gate as
 grid-api/grid-hermes, and it is verified by reading the running process's
@@ -34,7 +42,6 @@ grid-scheduler went unnoticed for days.
 from __future__ import annotations
 
 import os
-import subprocess
 
 import pytest
 
@@ -175,21 +182,25 @@ def test_do_restart_input_description_mentions_realtime():
 
 @pytest.mark.unit
 def test_guard_fails_against_the_pre_fix_workflow():
-    """Red/green, against the real previous file rather than a hand-made one.
+    """Red/green, against a stable fixture rather than git history.
 
-    Reads deploy.yml as of the commit before this change and asserts the two
-    load-bearing guards would have failed on it (there was no grid-realtime
-    restart step at all). Skips where git history is not available (shallow
-    clones without the parent, exported trees).
+    Originally read deploy.yml via `git show HEAD~1:...` -- fragile, because
+    HEAD~1 is only "the commit before this change" for the very first commit
+    built on top of the true pre-fix baseline. Any later, ordinary commit on
+    this branch (a fixup, a rebase, a second PR stacked on this one) shifts
+    HEAD~1 to point at an already-partially-fixed intermediate state instead,
+    silently breaking this test's red/green premise without changing
+    anything this test is actually supposed to be guarding.
+
+    tests/fixtures/deploy_pre_grid_realtime_fix.yml is a small, permanent,
+    hand-written snippet with the same shape as deploy.yml before grid-realtime
+    had any restart/verify step at all -- not a copy of history, just "the
+    known-bad shape the guards below must catch". It never needs to change
+    again regardless of how this branch's commit history evolves.
     """
-    prev = subprocess.run(
-        ["git", "show", "HEAD~1:.github/workflows/deploy.yml"],
-        cwd=REPO_ROOT, capture_output=True, text=True,
-    )
-    if prev.returncode != 0:
-        pytest.skip("previous revision of deploy.yml not available in this checkout")
-
-    old_steps = yaml.safe_load(prev.stdout)["jobs"]["deploy"]["steps"]
+    fixture_path = os.path.join(REPO_ROOT, "tests", "fixtures", "deploy_pre_grid_realtime_fix.yml")
+    with open(fixture_path, encoding="utf-8") as handle:
+        old_steps = yaml.safe_load(handle)["jobs"]["deploy"]["steps"]
 
     failures: list[str] = []
 

@@ -416,11 +416,19 @@ jobs:
       # at the same time). Bounded to ~4 minutes: Yahoo polls every 60s,
       # Binance ticks are near-continuous when markets are open, so a fresh
       # row from EITHER source is expected well inside that window whenever
-      # markets are open. Does not fail the deploy on timeout (crypto trades
-      # 24/7 but equities/futures do not -- a restart during a closed
-      # session legitimately has no fresh Yahoo/Binance-equity data to find,
-      # and this step cannot tell "quiet market" apart from "broken feed"),
-      # but records what it found either way.
+      # markets are open.
+      #
+      # Reported PER SOURCE, deliberately not folded into one pass/fail,
+      # because they have different excuses for silence: Yahoo covers
+      # equities/futures/forex, closed outside market hours, so Yahoo being
+      # quiet is often just "no market open right now" -- but Binance is
+      # crypto, trades 24/7, and has no such excuse. Binance silence is
+      # flagged with a stronger warning than Yahoo silence for that reason.
+      # This step still never fails the deploy either way: it cannot
+      # distinguish "quiet market" from "broken feed" for Yahoo, and even
+      # for Binance a transient issue shouldn't block a deploy that already
+      # passed process-start verification -- so every outcome below is
+      # recorded, not gated on.
       - name: Verify grid-realtime is delivering fresh data
         if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
         run: |
@@ -431,41 +439,68 @@ jobs:
           cd "$DEPLOY_PATH"
           restart_ts="$(cat "$RUNNER_TEMP/grid-realtime-restart-ts")"
           restart_iso="$(date -u -d "@${restart_ts}" +%Y-%m-%dT%H:%M:%SZ)"
+          # Floor to the 5-minute candle interval: the restart-adjacent
+          # candle for a bucket already in progress at restart time is
+          # written via ON CONFLICT DO UPDATE (a merge, see INSERT_SQL in
+          # flusher.py), which does NOT touch created_at -- only the
+          # original INSERT set that. Checking created_at alone would miss
+          # exactly that row, so this also checks ts against the
+          # restart-time bucket floor directly.
+          restart_bucket_epoch=$(( (restart_ts / 300) * 300 ))
+          restart_bucket_iso="$(date -u -d "@${restart_bucket_epoch}" +%Y-%m-%dT%H:%M:%SZ)"
+          probe_out="$RUNNER_TEMP/grid-realtime-freshness-probe.txt"
           set +e
-          timeout 240 python3 - "$restart_iso" <<'PYEOF'
+          timeout 240 python3 - "$restart_iso" "$restart_bucket_iso" > "$probe_out" <<'PYEOF'
           import sys
-          from datetime import datetime
           from db import get_engine
           from sqlalchemy import text
 
-          restart_iso = sys.argv[1]
+          restart_iso, restart_bucket_iso = sys.argv[1], sys.argv[2]
           engine = get_engine()
           with engine.connect() as conn:
               rows = conn.execute(text("""
-                  SELECT source, count(*), max(ts)
+                  SELECT source, count(*), max(ts), max(created_at)
                   FROM realtime_candles
-                  WHERE created_at > :restart_ts
+                  WHERE created_at > :restart_ts OR ts >= :restart_bucket
                   GROUP BY source
-              """), {"restart_ts": restart_iso}).fetchall()
-          sources = {r[0]: (r[1], r[2]) for r in rows}
+              """), {"restart_ts": restart_iso, "restart_bucket": restart_bucket_iso}).fetchall()
+          sources = {r[0]: (r[1], r[2], r[3]) for r in rows}
+
+          # SEEN/UNVERIFIED per source, printed as parseable lines -- bash
+          # below reports each source's own severity rather than collapsing
+          # to one pass/fail, since Yahoo and Binance have different excuses
+          # for silence (see this step's comment).
           for src in ("yahoo", "binance"):
               if src in sources:
-                  n, latest = sources[src]
-                  print(f"{src}: {n} candle(s) written since restart, latest bucket {latest}")
+                  n, latest_ts, latest_created = sources[src]
+                  print(f"SEEN {src} count={n} latest_candle_ts={latest_ts} latest_row_created_at={latest_created}")
               else:
-                  print(f"{src}: no candles written since restart yet")
-          sys.exit(0 if sources else 1)
+                  print(f"UNVERIFIED {src} -- no row with created_at after restart or ts in the restart-adjacent bucket")
           PYEOF
           probe_rc=$?
           set -e
+          cat "$probe_out"
+
           if [ "$probe_rc" -eq 124 ]; then
-            echo "::warning::data-freshness check timed out after 4 minutes -- does not fail the deploy (see step comment)"
-            echo "grid-realtime data freshness: TIMED OUT (4 min, no candles seen yet)" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "::warning::data-freshness check timed out after 4 minutes -- no result for either source"
+            echo "grid-realtime data freshness: UNVERIFIED (yahoo) -- check timed out, not a feed-silence finding" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "grid-realtime data freshness: UNVERIFIED (binance) -- check timed out, not a feed-silence finding" | tee -a "$GITHUB_STEP_SUMMARY"
           elif [ "$probe_rc" -ne 0 ]; then
-            echo "::warning::no candles from either source since restart yet -- does not fail the deploy (markets may be closed)"
-            echo "grid-realtime data freshness: NONE SEEN YET" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "::warning::data-freshness check itself failed (probe_rc=$probe_rc) -- see the log above for the traceback"
+            echo "grid-realtime data freshness: UNVERIFIED (yahoo) -- freshness check errored, not a feed-silence finding" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "grid-realtime data freshness: UNVERIFIED (binance) -- freshness check errored, not a feed-silence finding" | tee -a "$GITHUB_STEP_SUMMARY"
           else
-            echo "grid-realtime data freshness: confirmed (see log above)" | tee -a "$GITHUB_STEP_SUMMARY"
+            if grep -q "^SEEN yahoo" "$probe_out"; then
+              echo "grid-realtime data freshness: yahoo CONFIRMED -- $(grep '^SEEN yahoo' "$probe_out")" | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              echo "grid-realtime data freshness: yahoo UNVERIFIED -- no fresh row seen. Not necessarily a problem: Yahoo covers equities/futures/forex, closed outside market hours -- this cannot distinguish a quiet market from a broken feed." | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
+            if grep -q "^SEEN binance" "$probe_out"; then
+              echo "grid-realtime data freshness: binance CONFIRMED -- $(grep '^SEEN binance' "$probe_out")" | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::warning::grid-realtime: no fresh binance candle seen since restart -- crypto trades 24/7, so unlike yahoo this is NOT explained by closed markets and deserves a closer look"
+              echo "grid-realtime data freshness: binance UNVERIFIED -- no fresh row seen, and crypto trading 24/7 means a closed-market explanation does NOT apply here. Worth investigating if this persists." | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
           fi
 
       # grid-scheduler has the exact same class of bug the grid-hermes fix

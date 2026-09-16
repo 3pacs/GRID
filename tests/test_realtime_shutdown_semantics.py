@@ -12,14 +12,16 @@ shutdown" timestamp -- confirmed directly against CandleBuilder. Because of
 that, a truncated candle and a later, complete candle for the same bucket
 share an identical (symbol, interval, ts) primary key
 (schema.sql:1728-1743). Both write paths (ws_listener.py's shutdown flush,
-flusher.py's periodic flush) use ON CONFLICT (symbol, interval, ts) DO
-NOTHING, so whichever row lands FIRST wins permanently -- and it is
-provably the truncated one, since the old process's shutdown flush always
-completes before a new process's candle for the same bucket even starts.
-"Idempotent" (no duplicate/corrupt rows) is true of this; "the most
-complete data wins" is not, and that's the behavior this file pins down so
-a future change to either write path can't silently alter it in either
-direction without a test noticing.
+flusher.py's periodic flush) use the identical INSERT_SQL (imported, not
+duplicated -- see ws_listener.py), which now MERGES on that conflict:
+high/low widen, volume/trade_count sum, vwap is recomputed from both
+partials' own (vwap, volume), close takes the later row, open stays
+whichever was there first (always the truncated candle's, since the old
+process's shutdown flush always completes before the new process's first
+tick). test_restart_interruption_produces_a_correctly_merged_candle below
+proves this against a real Postgres, not a simulation of the SQL -- the
+merge involves GREATEST/LEAST/arithmetic that a hand-rolled Python model
+could get subtly wrong in ways that wouldn't be caught until production.
 
 ## DB-write concurrency bound
 
@@ -35,31 +37,22 @@ confirm all three write call sites actually route through it.
 from __future__ import annotations
 
 import asyncio
+import os
+import uuid
 from datetime import datetime, timezone
+
+import pytest
+from sqlalchemy import text
 
 from ingestion.realtime.candle_builder import CandleBuilder
 from ingestion.realtime.db_writer import bounded_write
-from ingestion.realtime.flusher import build_insert_values
+from ingestion.realtime.flusher import INSERT_SQL, build_insert_values
 
 # Column indices in the tuples build_insert_values() produces:
 # (symbol, asset_class, interval, ts_bucket, open, high, low, close,
 #  volume, vwap, trade_count, source)
 _SYMBOL, _ASSET_CLASS, _INTERVAL, _TS = 0, 1, 2, 3
 _OPEN, _HIGH, _LOW, _CLOSE, _VOLUME, _VWAP, _TRADE_COUNT, _SOURCE = range(4, 12)
-
-
-class _FakeCandlesTable:
-    """Minimal stand-in for realtime_candles honoring its real PK/conflict contract."""
-
-    def __init__(self) -> None:
-        self.rows: dict[tuple, tuple] = {}
-
-    def insert_on_conflict_do_nothing(self, rows: list[tuple]) -> None:
-        for row in rows:
-            key = (row[_SYMBOL], row[_INTERVAL], row[_TS])
-            if key in self.rows:
-                continue  # DO NOTHING -- exact Postgres semantics for this PK
-            self.rows[key] = row
 
 
 def test_shutdown_flush_writes_candle_under_interval_start_not_shutdown_time():
@@ -80,61 +73,171 @@ def test_shutdown_flush_writes_candle_under_interval_start_not_shutdown_time():
     assert candle.ts_bucket == datetime(2026, 9, 16, 14, 5, 0, tzinfo=timezone.utc)
 
 
-def test_truncated_candle_blocks_a_later_complete_candle_for_the_same_bucket():
-    """The actual interruption/restart scenario, traced through real code.
+def _connect_to_real_test_db():
+    """Connect using the CI-actual Postgres credentials, not conftest.py's
+    ``pg_engine`` default.
+
+    ``pg_engine`` falls back to ``postgresql://grid_user:changeme@localhost
+    :5432/grid`` (conftest.py's ``_DEFAULT_DB_URL``) unless
+    ``GRID_TEST_DB_URL`` is exported -- and nothing in
+    ``.github/workflows/test.yml`` ever exports it. That workflow's actual
+    Postgres (both the ephemeral ``docker run`` path on ``ubuntu-latest``
+    and the persistent-service path on the ``alien`` self-hosted runner
+    this repo's CI actually uses) is provisioned as
+    ``POSTGRES_USER=grid POSTGRES_PASSWORD=testpass POSTGRES_DB=griddb_test``
+    -- which doesn't match ``config.py``'s ``DB_USER=grid_user``/
+    ``DB_NAME=grid`` defaults either (only ``DB_PASSWORD`` gets overridden,
+    via the workflow's own ``DB_PASSWORD: testpass`` env). So neither
+    ``pg_engine`` nor a bare ``db.get_engine()`` actually reaches CI's real
+    database for this test; connecting with the literal credentials the
+    workflow provisions is what does.
+    """
+    from sqlalchemy import create_engine
+
+    candidates = [
+        # What CI's Postgres is actually provisioned with.
+        "postgresql://grid:testpass@localhost:5432/griddb_test",
+        # conftest.py's own default, for local dev boxes set up that way.
+        "postgresql://grid_user:changeme@localhost:5432/grid",
+    ]
+    env_url = os.environ.get("GRID_TEST_DB_URL")
+    if env_url:
+        candidates.insert(0, env_url)
+
+    for url in candidates:
+        try:
+            engine = create_engine(url, pool_pre_ping=True)
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            return engine
+        except Exception:
+            continue
+    return None
+
+
+@pytest.fixture
+def realtime_candles_schema():
+    """Idempotently create realtime_candles (schema.sql:1728-1743) for this
+    test session, matching the real column types exactly -- the merge SQL
+    under test uses GREATEST/LEAST/arithmetic that behaves differently
+    across types, so this must be the real DDL, not an approximation.
+    Cleans up only the rows this test creates (unique symbol per test run).
+    """
+    pg_engine = _connect_to_real_test_db()
+    if pg_engine is None:
+        pytest.skip("PostgreSQL not available (tried CI credentials and conftest.py's default)")
+
+    ddl = """
+        CREATE TABLE IF NOT EXISTS realtime_candles (
+            symbol       TEXT NOT NULL,
+            asset_class  TEXT NOT NULL,
+            interval     TEXT NOT NULL DEFAULT '5m',
+            ts           TIMESTAMPTZ NOT NULL,
+            open         DOUBLE PRECISION,
+            high         DOUBLE PRECISION,
+            low          DOUBLE PRECISION,
+            close        DOUBLE PRECISION,
+            volume       DOUBLE PRECISION,
+            vwap         DOUBLE PRECISION,
+            trade_count  INTEGER DEFAULT 0,
+            source       TEXT NOT NULL,
+            created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (symbol, interval, ts)
+        );
+    """
+    with pg_engine.begin() as conn:
+        conn.execute(text(ddl))
+
+    symbol = f"TEST_{uuid.uuid4().hex[:8]}"
+    yield pg_engine, symbol
+
+    with pg_engine.begin() as conn:
+        conn.execute(text("DELETE FROM realtime_candles WHERE symbol = :s"), {"s": symbol})
+    pg_engine.dispose()
+
+
+def test_restart_interruption_produces_a_correctly_merged_candle(realtime_candles_schema):
+    """The actual interruption/restart scenario, against the real INSERT_SQL
+    and a real Postgres -- not a simulation of what the SQL might do.
 
     Old process gets SIGTERM mid-interval, flushes a 1-tick truncated
     candle for the 14:05:00 bucket. New process starts immediately,
     ingests the rest of that same interval (4 more ticks) before crossing
-    into the next bucket, and its own flush tries to write a materially
-    more complete candle for the identical bucket. Both go through the
-    real build_insert_values() into a fake table enforcing the real
-    PRIMARY KEY (symbol, interval, ts) / ON CONFLICT DO NOTHING contract.
+    into the next bucket, and its own flush writes a materially more
+    complete candle for the identical bucket -- via the SAME INSERT_SQL,
+    hitting the real ON CONFLICT DO UPDATE merge path.
     """
-    table = _FakeCandlesTable()
+    engine, symbol = realtime_candles_schema
 
     # --- Old process: SIGTERM arrives at 14:07:23, one tick already in ---
     old_builder = CandleBuilder()
     old_builder.ingest(
-        "AAPL", 180.0, 100,
+        symbol, 180.0, 100,
         datetime(2026, 9, 16, 14, 7, 23, tzinfo=timezone.utc),
         "equity", "yahoo",
     )
     old_builder.flush_all()
     truncated_rows = build_insert_values(old_builder.drain())
-    table.insert_on_conflict_do_nothing(truncated_rows)  # old process's shutdown flush
 
     # --- New process: starts immediately, ingests the rest of 14:05-14:10 ---
     new_builder = CandleBuilder()
     for minute, second, price in [(7, 40, 181.0), (8, 10, 179.0), (8, 45, 182.0), (9, 30, 183.5)]:
         new_builder.ingest(
-            "AAPL", price, 100,
+            symbol, price, 100,
             datetime(2026, 9, 16, 14, minute, second, tzinfo=timezone.utc),
             "equity", "yahoo",
         )
     # Crossing into 14:10:00 flushes the now-complete 14:05:00 candle.
     new_builder.ingest(
-        "AAPL", 184.0, 100,
+        symbol, 184.0, 100,
         datetime(2026, 9, 16, 14, 10, 5, tzinfo=timezone.utc),
         "equity", "yahoo",
     )
     complete_rows = build_insert_values(new_builder.drain())
     assert len(complete_rows) == 1  # only the completed 14:05:00 candle, not the new 14:10:00 one
-    table.insert_on_conflict_do_nothing(complete_rows)  # new process's next flush
 
     truncated_key = (truncated_rows[0][_SYMBOL], truncated_rows[0][_INTERVAL], truncated_rows[0][_TS])
     complete_key = (complete_rows[0][_SYMBOL], complete_rows[0][_INTERVAL], complete_rows[0][_TS])
     assert truncated_key == complete_key, "both candles must target the identical primary key"
 
-    # The truncated row won: written first, and DO NOTHING never lets the
-    # later, more complete one replace it.
-    persisted = table.rows[truncated_key]
-    assert persisted[_TRADE_COUNT] == 1, "the surviving row is the 1-tick truncated candle"
-    assert persisted[_CLOSE] == 180.0
+    # Write both through the REAL INSERT_SQL, in the real chronological
+    # order (old always completes before new even starts). Uses psycopg2's
+    # own %s-paramstyle directly via the engine's raw DBAPI connection --
+    # INSERT_SQL is exactly what flusher.py/ws_listener.py send in
+    # production, and rewriting it into SQLAlchemy's :name style here would
+    # mean testing a different string than the one that actually ships.
+    import psycopg2.extras
+    raw = engine.raw_connection()
+    try:
+        with raw.cursor() as cur:
+            psycopg2.extras.execute_batch(cur, INSERT_SQL, truncated_rows)
+            psycopg2.extras.execute_batch(cur, INSERT_SQL, complete_rows)
+        raw.commit()
+    finally:
+        raw.close()
 
-    # Spell out exactly what was silently discarded.
-    assert complete_rows[0][_TRADE_COUNT] == 4, "the more-complete candle had 4 ticks"
-    assert complete_rows[0][_TRADE_COUNT] not in (persisted[_TRADE_COUNT],)
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT open, high, low, close, volume, vwap, trade_count "
+                "FROM realtime_candles WHERE symbol = :s AND interval = :i AND ts = :t"
+            ),
+            {"s": symbol, "i": truncated_rows[0][_INTERVAL], "t": truncated_rows[0][_TS]},
+        ).fetchone()
+
+    assert row is not None, "merged row was not persisted at all"
+    open_, high, low, close, volume, vwap, trade_count = row
+
+    # The intended result: a full reconstruction of the interval, not
+    # either partial candle alone.
+    assert open_ == pytest.approx(180.0), "open must stay the truncated candle's (it came first)"
+    assert high == pytest.approx(183.5), "high must widen to cover both partials"
+    assert low == pytest.approx(179.0), "low must widen to cover both partials"
+    assert close == pytest.approx(183.5), "close must be the later (complete) candle's"
+    assert volume == pytest.approx(500.0), "volume must be the SUM of both partials, not either alone"
+    assert trade_count == 5, "trade_count must be the SUM (1 + 4), not either alone"
+    # vwap = (180*100 + 181.375*400) / 500 = 90550 / 500 = 181.1
+    assert vwap == pytest.approx(181.1), "vwap must be the volume-weighted combination of both partials"
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +277,71 @@ def test_bounded_write_caps_concurrency_at_two():
     asyncio.run(_run())
     assert max_concurrent_seen == 2, (
         f"expected bounded_write to cap concurrency at 2, observed {max_concurrent_seen}"
+    )
+
+
+def test_bounded_write_holds_the_cap_even_when_the_awaiting_coroutine_is_cancelled():
+    """The specific gap a threading.Semaphore (not asyncio.Semaphore) closes.
+
+    An asyncio.Semaphore acquired in the coroutine gets released the moment
+    that coroutine's task.cancel() unwinds -- even though the underlying
+    executor thread is still running and still holds an open DB connection
+    (threads can't be forcibly cancelled). A third write can then acquire
+    the wrongly-freed slot and run concurrently with the still-running
+    cancelled one, exceeding the ceiling. This reproduces exactly that:
+    starts 2 slow writes, cancels one WHILE its thread is still mid-write,
+    immediately starts a 3rd, and asserts the true connection-holding
+    concurrency (measured inside the write function itself, on the worker
+    thread -- not by counting live asyncio tasks, which would be fooled by
+    the same bug this test exists to catch) never exceeds 2.
+    """
+    import threading
+    import time
+
+    counter_lock = threading.Lock()
+    concurrent_now = 0
+    max_concurrent_seen = 0
+    entered = threading.Event()
+
+    def slow_write(marker: str, release_after: float) -> None:
+        nonlocal concurrent_now, max_concurrent_seen
+        with counter_lock:
+            concurrent_now += 1
+            max_concurrent_seen = max(max_concurrent_seen, concurrent_now)
+        if marker == "A":
+            entered.set()  # let main() know A's thread has actually started
+        try:
+            time.sleep(release_after)
+        finally:
+            with counter_lock:
+                concurrent_now -= 1
+
+    async def _run():
+        task_a = asyncio.create_task(bounded_write(slow_write, "A", 0.5))
+        task_b = asyncio.create_task(bounded_write(slow_write, "B", 0.5))
+
+        # Block until A's thread has actually opened its "connection" --
+        # not just until the coroutine has been scheduled -- so the
+        # cancellation below lands while a real thread is genuinely mid-write.
+        await asyncio.get_event_loop().run_in_executor(None, entered.wait, 2.0)
+
+        task_a.cancel()
+        try:
+            await task_a
+        except asyncio.CancelledError:
+            pass  # expected -- the coroutine unwinds; A's thread keeps running
+
+        # Immediately try a 3rd write. If cancelling A wrongly freed a slot,
+        # this proceeds concurrently with A's still-running thread and B,
+        # pushing observed concurrency to 3.
+        task_c = asyncio.create_task(bounded_write(slow_write, "C", 0.1))
+        await asyncio.gather(task_b, task_c, return_exceptions=True)
+
+    asyncio.run(_run())
+    assert max_concurrent_seen <= 2, (
+        f"cancelling the awaiting coroutine let a 3rd write run concurrently "
+        f"with a still-in-flight one -- observed {max_concurrent_seen} "
+        f"simultaneous connection-holding threads, ceiling is 2"
     )
 
 

@@ -1,0 +1,47 @@
+# Static, checked-in fixture representing the SHAPE of .github/workflows/deploy.yml
+# before grid-realtime got a restart/verify step at all (i.e. the actual state of
+# main before PR #514/#515). This is NOT read from git history (see
+# tests/test_deploy_restarts_realtime.py::test_guard_fails_against_the_pre_fix_workflow
+# for why that was fragile) -- it's a small, hand-written, permanently-stable
+# snippet with just enough real structure (a couple of other services' steps) to
+# exercise _step_named()'s lookup correctly, deliberately omitting any
+# "restart grid-realtime" / "verify grid-realtime" step. It should never need to
+# change again: its only job is to be "the known-bad shape the guard must catch",
+# not to track deploy.yml's actual current content.
+jobs:
+  deploy:
+    steps:
+      - name: Build release tree
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor "${{ github.sha }}" HEAD
+          cd pwa && npm ci && npm run build && cd ..
+
+      - name: Restart grid-api
+        if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
+        run: |
+          sudo systemctl restart grid-api
+
+      - name: Restart grid-hermes
+        if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
+        run: |
+          sudo systemctl restart grid-hermes
+
+      - name: Verify grid-hermes runs the deployed tree
+        if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
+        run: |
+          pid="$(systemctl show -p MainPID --value grid-hermes)"
+          cwd="$(readlink "/proc/${pid}/cwd")"
+          [ "$cwd" = "$DEPLOY_PATH" ]
+
+      # No grid-realtime restart/verify step at all -- this is the actual
+      # regression these guards exist to catch.
+
+      - name: Restart grid-scheduler (activate_scheduler only)
+        if: ${{ inputs.activate_scheduler == true }}
+        run: |
+          sudo systemctl restart grid-scheduler
+
+      - name: Notify success
+        if: success()
+        run: echo "Deployment successful"

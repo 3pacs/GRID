@@ -21,20 +21,18 @@ from ingestion.realtime.db_writer import bounded_write
 from ingestion.realtime.feeds.binance import run_binance_feed
 from ingestion.realtime.feeds.dex_scanner import run_dex_scanner
 from ingestion.realtime.feeds.yahoo import run_yahoo_feed
-from ingestion.realtime.flusher import build_insert_values, run_flusher
+# INSERT_SQL is imported, not duplicated: this final flush and flusher.py's
+# periodic flush are the two write paths that can conflict on the same
+# (symbol, interval, ts) primary key across a restart (see INSERT_SQL's own
+# comment in flusher.py for the merge algebra and why it's safe). Importing
+# instead of copy-pasting the SQL means they cannot drift out of sync.
+from ingestion.realtime.flusher import INSERT_SQL, build_insert_values, run_flusher
 
 # Bounds the final flush so a stalled write can't hang the whole shutdown
 # sequence indefinitely -- leaves comfortable margin under grid-realtime's
 # systemd TimeoutStopUSec (90s default, unset in the unit) for task
 # cancellation and everything else in main() to also complete.
 FINAL_FLUSH_TIMEOUT_SECONDS = 30
-
-FINAL_FLUSH_SQL = (
-    "INSERT INTO realtime_candles "
-    "(symbol, asset_class, interval, ts, open, high, low, close, volume, vwap, trade_count, source) "
-    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
-    "ON CONFLICT (symbol, interval, ts) DO NOTHING"
-)
 
 
 def _write_final_flush_sync(rows: list[tuple]) -> None:
@@ -44,7 +42,7 @@ def _write_final_flush_sync(rows: list[tuple]) -> None:
 
     with get_connection() as conn:
         with conn.cursor() as cur:
-            execute_batch(cur, FINAL_FLUSH_SQL, rows, page_size=500)
+            execute_batch(cur, INSERT_SQL, rows, page_size=500)
 
 
 async def main() -> None:
@@ -94,11 +92,16 @@ async def main() -> None:
     #     other identity -- and if the next process (started fresh after
     #     this restart) later builds a *complete* candle for that same
     #     bucket, its own flush uses the identical (symbol, interval, ts)
-    #     key. ON CONFLICT DO NOTHING means the truncated row -- written
-    #     first, before the new process even starts -- wins permanently;
-    #     the more-complete one is silently discarded, never overwrites it.
+    #     key. INSERT_SQL (flusher.py) MERGES on that conflict rather than
+    #     discarding either side -- high/low widen, volume/trade_count sum,
+    #     vwap is recomputed from both partials, close takes the later
+    #     (this row's) value, open stays whichever was there first (always
+    #     the truncated candle's, since it's always written first). So the
+    #     final persisted candle reconstructs the true full interval instead
+    #     of permanently keeping whichever side happened to write first.
     #     See tests/test_realtime_shutdown_semantics.py for this traced
-    #     end-to-end against the real INSERT.
+    #     end-to-end against the real INSERT, verified against a live
+    #     Postgres in CI.
     #   - The actual DB write below CAN fail (unreachable DB, exhausted
     #     slots outright, a query timeout) or simply run out of time. On
     #     either, the exception/timeout is caught and logged, and the
