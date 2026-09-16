@@ -620,7 +620,20 @@ def _fetch_yfinance_price(ticker: str, target_date: date) -> float | None:
         logging.getLogger("yfinance").setLevel(logging.CRITICAL)
         start = target_date - timedelta(days=5)
         end = target_date + timedelta(days=5)
-        df = yf.download(sym, start=str(start), end=str(end), progress=False)
+        # auto_adjust=False is load-bearing, not cosmetic. This is the last
+        # leg of a three-source price chain whose other two legs are raw,
+        # unadjusted prices: options_daily_signals.spot_price, and raw_series
+        # "YF:{ticker}:close" (written by ingestion/yfinance_pull.py, which
+        # also passes auto_adjust=False and stores the adjusted series
+        # separately as "YF:{ticker}:adj_close"). yfinance flipped this
+        # default to True in 0.2.x, which back-adjusts historical closes for
+        # dividends/splits. Scoring a signal by comparing an entry price on
+        # one basis against an exit price on the other manufactures a return
+        # equal to the cumulative adjustment factor between the two dates.
+        df = yf.download(
+            sym, start=str(start), end=str(end), progress=False,
+            auto_adjust=False,
+        )
         price = _last_close(df, target_date)
         if price is None:
             _remember_yf_no_data(sym, now)

@@ -80,7 +80,13 @@ def _fetch_prices() -> dict[str, tuple[float, float]]:
 
     try:
         # period='5d' ensures data on weekends (period='1d' returns empty for some symbols)
-        data = yf.download(tickers, period="5d", interval="1m", progress=False, threads=True)
+        # auto_adjust=False: this is the live tape feeding the candle
+        # builder, so it must carry actual traded prices rather than a
+        # back-adjusted series. yfinance's default flipped to True in 0.2.x.
+        data = yf.download(
+            tickers, period="5d", interval="1m", progress=False, threads=True,
+            auto_adjust=False,
+        )
         if data.empty:
             return result
 
