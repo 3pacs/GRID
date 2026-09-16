@@ -27,66 +27,80 @@ MAX_CONSECUTIVE_FAILURES = 3
 
 # On conflict, MERGE the two partial candles rather than discard the new
 # one -- but the correct merge depends on what the source actually delivers,
-# and is NOT the same for every source. Traced against the real feed code
-# (ingestion/realtime/feeds/binance.py, feeds/yahoo.py):
+# and is NOT the same for every source, and is NOT complete even within a
+# source. Traced against the real feed code (feeds/binance.py, feeds/
+# yahoo.py) and candle_builder.py's CandleState, not assumed:
 #
-#   - binance.py: each WebSocket message is one individually-executed trade
-#     (Binance's own @trade stream semantics -- data["q"] is that ONE
-#     trade's own quantity, data["T"] its own execution time; reconnecting
-#     never replays a trade already delivered, it only resumes from "now").
-#     Two partial candles from the same bucket, split by a restart, cover
-#     genuinely DIFFERENT, non-overlapping sets of trades. Summing
-#     volume/trade_count reconstructs the true total -- this is the
-#     "incremental observations" case.
+#   - binance.py: each WebSocket message carries its own trade ID (data["t"])
+#     and execution timestamp (data["T"]) from Binance's @trade stream. The
+#     parser reads data["T"] only to compute the candle bucket and never
+#     stores it; data["t"] is never read at all -- neither survives past
+#     CandleBuilder.ingest(). So summing volume/trade_count for this source
+#     rests on an ASSUMPTION about the upstream feed ("each trade is
+#     delivered exactly once, a reconnect only resumes from 'now'"), not on
+#     anything this code independently verifies -- there is no trade-ID dedup
+#     check that would catch an accidental redelivery, because no trade ID
+#     is persisted to check.
 #
-#   - yahoo.py: each poll re-downloads the LATEST known 1-minute bar
-#     (`yf.download(..., interval="1m")`, then `.iloc[-1]`) and re-ingests
-#     it as a "tick" timestamped at POLL time, not the bar's own time. If
-#     Yahoo's data hasn't advanced between two polls (its own refresh
-#     lag is often >60s), or if the old process's last poll and the new
-#     process's first poll both land within the same still-"latest" bar's
-#     window, BOTH partial candles can include a contribution from the
-#     SAME underlying bar. This is the "complete snapshot" case: summing
-#     volume/trade_count here can double-count that one shared bar. (This
-#     poll-vs-bar mismatch is a pre-existing property of yahoo.py's design,
-#     not introduced here -- it can already inflate a single process's own
-#     candle across two consecutive polls, independent of any restart. Not
-#     addressed here: this SQL is about not making the restart-merge case
-#     WORSE than what a single process already does, not rearchitecting
-#     yahoo.py's poll-to-tick mapping, which is a separate, larger change.)
+#   - yahoo.py: each poll re-downloads the LATEST known 1-minute bar and
+#     re-ingests it as a tick timestamped at POLL time, not the bar's own
+#     time. CandleState tracks only the running 5-minute-bucket total, with
+#     no per-minute breakdown -- so a same-minute revision (should replace
+#     that minute's prior contribution) and a genuinely different minute
+#     within the same bucket (should add to it) look identical at merge
+#     time. GREATEST (below) handles the first case correctly by
+#     construction (a growing revision of one minute naturally has more
+#     volume, so GREATEST picks it) but silently under-counts the second --
+#     it returns only the larger side's own total, not the true union of two
+#     non-overlapping minutes. Never inflates, but not a full reconstruction
+#     either. See docs/TODO-REALTIME-CANDLE-CORRECTNESS.md for what fixing
+#     this for real would require (per-minute tracking) -- out of scope here.
 #
-# So: additive (SUM) for source='binance', non-additive (GREATEST -- trust
-# whichever side has accumulated more, never both) for every other source.
-# GREATEST/LEAST are safe unconditionally because they're idempotent under
-# duplication (max of two equal numbers is that same number, no inflation
-# risk) -- only a true SUM can inflate, so only the binance branch needs the
-# stronger "these are genuinely disjoint" guarantee.
+# So: additive (SUM) for source='binance' (an assumption, not a verified
+# guarantee -- see above), non-additive (GREATEST -- trust whichever side
+# has accumulated more, never both) for every other source. GREATEST/LEAST
+# are safe unconditionally in the sense of never inflating (idempotent under
+# duplication, and never claim more than the larger side's own total) --
+# only a true SUM can inflate, so only the binance branch needs the
+# duplicate guard below to matter.
 #
 # Two more properties, independent of source:
 #
 #   1. Exact-duplicate resubmission (the SAME batch replayed -- e.g. if
 #      flusher.py's own retry-on-ambiguous-failure path resends a buffer
-#      whose previous write actually succeeded server-side) must be a true
-#      no-op, not a second SUM. Guarded explicitly below: when incoming
-#      open/close/volume/trade_count all match what's already stored, every
-#      field is left unchanged, regardless of source.
+#      whose previous write actually succeeded server-side) is a no-op for
+#      volume/trade_count/vwap when incoming open/close/volume/trade_count
+#      all match what's already stored. This is a heuristic proxy for "the
+#      same batch was resent," not proof of identical underlying trades --
+#      two genuinely different trade sets could in principle produce
+#      identical aggregates and be wrongly treated as a duplicate. That
+#      failure mode under-counts (a missed real update), never inflates,
+#      which is the direction judged acceptable given the alternative is
+#      unconditionally double-summing on every retry.
 #
-#   2. "Which side is later" for `close` is decided by trade_count (more
-#      accumulated observations = more complete = more likely to include
-#      the true latest tick), NOT by which row happens to be EXCLUDED. In
-#      the realistic case (systemd `restart` = stop-then-start, strictly
-#      sequential) the existing row is always older and EXCLUDED always has
-#      more, so this agrees with "trust EXCLUDED" anyway -- but unlike that
-#      simpler rule, this one is also correct if a write is ever reordered
-#      or replayed out of sequence: a less-complete row can never overwrite
-#      a more-complete row's close. On an exact trade_count tie, prefers
-#      the incoming row (a reasonable default when completeness alone can't
-#      decide).
+#   2. `close` is plain "last write wins" (EXCLUDED.close, unconditionally,
+#      not gated by the duplicate check -- a duplicate write has the same
+#      close either way). This is correct for the only reachable production
+#      ordering: a restart's old-segment shutdown flush provably completes,
+#      successfully or not, strictly before the new process's first write is
+#      even possible, so EXCLUDED is always the chronologically later side.
+#      It is deliberately NOT based on trade_count or any other completeness
+#      proxy -- an earlier version of this SQL did exactly that ("more
+#      accumulated observations = more likely to include the true latest
+#      tick"), which is unsound: trade count reflects how busy a segment's
+#      time window was, not when it occurred, so a later, correct segment
+#      can easily have FEWER trades than an earlier one and would have been
+#      wrongly overridden. Plain last-write-wins also does not claim to
+#      solve genuine reverse delivery (the write arriving second is not
+#      actually the chronologically later one) -- that is a real, open,
+#      tested-as-a-known-limitation gap (see
+#      tests/test_realtime_shutdown_semantics.py and
+#      docs/TODO-REALTIME-CANDLE-CORRECTNESS.md), not something aggregate
+#      values alone (trade count, or anything else derived from them) can
+#      resolve without real trade-level identity/order data.
 #
 # See tests/test_realtime_shutdown_semantics.py for the traced,
-# live-database-verified regressions covering all of this: the disjoint
-# pre-/post-restart case, exact-duplicate replay, overlapping (Yahoo-style)
-# batches, and reverse arrival order.
+# live-database-verified regressions covering all of this.
 INSERT_SQL = """
     INSERT INTO realtime_candles
         (symbol, asset_class, interval, ts, open, high, low, close, volume, vwap, trade_count, source)
@@ -94,15 +108,7 @@ INSERT_SQL = """
     ON CONFLICT (symbol, interval, ts) DO UPDATE SET
         high = GREATEST(realtime_candles.high, EXCLUDED.high),
         low = LEAST(realtime_candles.low, EXCLUDED.low),
-        close = CASE
-            WHEN realtime_candles.open = EXCLUDED.open
-                 AND realtime_candles.close = EXCLUDED.close
-                 AND realtime_candles.volume = EXCLUDED.volume
-                 AND realtime_candles.trade_count = EXCLUDED.trade_count
-                THEN realtime_candles.close  -- exact duplicate: no-op
-            WHEN EXCLUDED.trade_count >= realtime_candles.trade_count THEN EXCLUDED.close
-            ELSE realtime_candles.close
-        END,
+        close = EXCLUDED.close,
         volume = CASE
             WHEN realtime_candles.open = EXCLUDED.open
                  AND realtime_candles.close = EXCLUDED.close
@@ -136,7 +142,13 @@ INSERT_SQL = """
                      + COALESCE(EXCLUDED.vwap, 0) * EXCLUDED.volume)
                     / (realtime_candles.volume + EXCLUDED.volume)
                 ELSE NULL END
-            WHEN EXCLUDED.trade_count >= realtime_candles.trade_count THEN EXCLUDED.vwap
+            -- Non-binance: vwap must stay consistent with whichever side's
+            -- volume the GREATEST above actually kept -- reusing that same
+            -- comparison, not a new independent rule (see property 2 above
+            -- for why introducing another independent completeness proxy
+            -- here would repeat the same mistake close's old trade_count
+            -- rule made).
+            WHEN EXCLUDED.volume >= realtime_candles.volume THEN EXCLUDED.vwap
             ELSE realtime_candles.vwap
         END
 """

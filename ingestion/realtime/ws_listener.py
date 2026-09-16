@@ -93,21 +93,27 @@ async def main() -> None:
     #     this restart) later builds a *complete* candle for that same
     #     bucket, its own flush uses the identical (symbol, interval, ts)
     #     key. INSERT_SQL (flusher.py) MERGES on that conflict -- but NOT
-    #     identically for every source. See INSERT_SQL's own comment for the
-    #     full reasoning (binance.py's trades are genuinely non-overlapping
-    #     and safe to sum; yahoo.py re-polls the same "latest bar" and can
+    #     identically for every source, and NOT completely even within a
+    #     source. See INSERT_SQL's own comment for the full reasoning:
+    #     binance.py's trades are assumed (not independently verified --
+    #     no trade ID survives aggregation) genuinely non-overlapping and
+    #     safe to sum; yahoo.py re-polls the same "latest bar" and can
     #     overlap with itself across the restart boundary, so it widens
-    #     high/low but does not sum volume/trade_count), plus the
-    #     exact-duplicate-replay no-op guard and the trade_count-based
-    #     (not arrival-order-based) rule for which side's close wins. So the
-    #     final persisted candle reconstructs as much of the true interval
-    #     as the source's own delivery guarantees allow, without ever
-    #     inflating totals on a replay or letting a less-complete write
-    #     clobber a more-complete one's close.
-    #     See tests/test_realtime_shutdown_semantics.py for this traced
-    #     end-to-end against real Postgres: the disjoint pre-/post-restart
-    #     case, exact-duplicate replay, overlapping (Yahoo-style) batches,
-    #     and reverse arrival order.
+    #     high/low and takes GREATEST of volume/trade_count (never
+    #     inflates, but under-counts when the two sides cover genuinely
+    #     different minutes within the bucket -- no per-minute tracking
+    #     exists to tell that apart from a same-minute revision). `close`
+    #     is plain last-write-wins, correct for the one reachable
+    #     production ordering (old segment's flush always completes, or
+    #     fails, before the new process's first write) but not a general
+    #     solution to true reverse delivery, which would need trade-level
+    #     timestamps this code does not capture. See
+    #     docs/TODO-REALTIME-CANDLE-CORRECTNESS.md for what a real fix
+    #     would require and tests/test_realtime_shutdown_semantics.py for
+    #     all of this traced end-to-end against real Postgres, including
+    #     the two known-limitation cases tested (not silently assumed
+    #     away): Binance close-selection under genuine reverse delivery,
+    #     and Yahoo under-counting genuinely distinct minutes.
     #   - The actual DB write below CAN fail (unreachable DB, exhausted
     #     slots outright, a query timeout) or simply run out of time. On
     #     either, the exception/timeout is caught and logged, and the

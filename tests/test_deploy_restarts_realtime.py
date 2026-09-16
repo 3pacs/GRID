@@ -12,31 +12,44 @@ Confirmed live on 2026-09-16: grid-realtime's process (PID 16196) had been
 running since 2026-07-29 with zero restarts, and its checkout at
 `/home/grid/grid_v4/grid_repo` was last fast-forwarded around 2026-09-11
 (commit 5facbdf0) -- both predate every dependency/bug-fix PR merged around
-2026-09-15/16 (#366, #367, #371, #374, #503). Unlike grid-scheduler,
-grid-realtime is restarted unconditionally on the same gate as
-grid-api/grid-hermes rather than behind a separate opt-in input: its unit
-already carries `Restart=always`/`RestartSec=10`, SIGTERM triggers a graceful
-shutdown that flushes the in-progress candle (ws_listener.py::main), every
-candle write MERGES on conflict rather than discarding either side
-(`INSERT ... ON CONFLICT (symbol, interval, ts) DO UPDATE`, flusher.py --
-see its own comment for the merge algebra, and
-tests/test_realtime_shutdown_semantics.py for the live-database-verified
-regression), the Binance feed already reconnects with backoff on any
-disconnect (feeds/binance.py), and the Yahoo feed is a stateless HTTP poll
-with no per-connection state (feeds/yahoo.py) -- a deploy-triggered restart
-is the same bounded, self-healing event this daemon already tolerates on
-every unplanned crash. "Restart=always is already normal" is necessary but
-not sufficient justification on its own, though -- see
-ingestion/realtime/db_writer.py's docstring for the DB-connection-
-concurrency bound that had its own gap (a cancelled coroutine could release
-its slot while its executor thread was still mid-write) found and fixed
-alongside this.
+2026-09-15/16 (#366, #367, #371, #374, #503).
 
-So these guard both halves: the restart happens, on the same gate as
-grid-api/grid-hermes, and it is verified by reading the running process's
-working directory -- `systemctl is-active` alone cannot distinguish "running"
-from "running what we deployed", which is exactly how grid-hermes and
-grid-scheduler went unnoticed for days.
+grid-realtime's restart is now gated the SAME WAY as grid-scheduler --
+behind an explicit `activate_realtime` input plus
+`acknowledge_realtime_interruption`, never on a routine push or on
+`do_restart` (which only covers grid-api/grid-hermes). This is a deliberate
+narrowing from an earlier version of this fix, which put grid-realtime on
+the unconditional gate reasoning that `Restart=always` plus a merge-on-
+conflict INSERT was sufficient justification. Closer review found the merge
+SQL (`INSERT_SQL`, flusher.py) has real, tested correctness gaps: neither
+trade-level identity (Binance) nor per-minute state (Yahoo) survives past
+`CandleBuilder` aggregation, so close-selection and Yahoo's volume
+reconstruction across a restart are provably incomplete in specific, tested
+ways -- see docs/TODO-REALTIME-CANDLE-CORRECTNESS.md and
+tests/test_realtime_shutdown_semantics.py. Until that larger fix lands, a
+restart during active trading can leave the bucket straddling it with an
+incorrect close or under-reported volume for the affected symbol(s) -- a
+narrow, bounded, but real risk, so activation requires the same explicit
+human acknowledgment grid-scheduler's gate does
+(scripts/realtime_activation_gate.sh), rather than being treated as already
+safe.
+
+What IS unconditionally true regardless of the above, from this same round:
+SIGTERM triggers a graceful shutdown that flushes the in-progress candle
+(ws_listener.py::main), the Binance feed already reconnects with backoff on
+any disconnect (feeds/binance.py), the Yahoo feed is a stateless HTTP poll
+with no per-connection state (feeds/yahoo.py), and
+ingestion/realtime/db_writer.py's DB-connection-concurrency bound closes a
+real gap (a cancelled coroutine could release its slot while its executor
+thread was still mid-write) found and fixed alongside this.
+
+So these guard three things: the restart step exists and is gated
+identically to grid-scheduler's activation (not to grid-api/grid-hermes's
+unconditional restart), the activation gate script is actually consulted,
+and the restart -- once it does run -- is verified by reading the running
+process's working directory, not just `systemctl is-active` (which cannot
+distinguish "running" from "running what we deployed", exactly how
+grid-hermes and grid-scheduler went unnoticed for days).
 """
 
 from __future__ import annotations
@@ -145,27 +158,38 @@ def test_realtime_restart_happens_after_hermes_is_verified():
 
 
 @pytest.mark.unit
-def test_realtime_steps_are_gated_like_the_api_restart():
-    """Same gate as grid-api/grid-hermes -- never the scheduler's opt-in gate.
+def test_realtime_steps_are_gated_like_the_scheduler_activation():
+    """Same opt-in shape as grid-scheduler -- never the unconditional api/hermes gate.
 
-    grid-realtime does not carry grid-scheduler's interrupted-long-pass risk
-    (see the module docstring), so it belongs on the unconditional
-    push/do_restart gate, not behind a separate activation input.
+    Candle-merge correctness across a restart has known, tested gaps (see
+    the module docstring and docs/TODO-REALTIME-CANDLE-CORRECTNESS.md), so
+    grid-realtime activation requires the same explicit acknowledgment
+    grid-scheduler's does, not the routine push/do_restart gate.
     """
     steps = _deploy_steps()
-    api = _step_named(steps, "restart grid-api")
-    for label in ("restart grid-realtime", "verify grid-realtime"):
+    scheduler_restart = _step_named(steps, "restart grid-scheduler")
+    api_restart = _step_named(steps, "restart grid-api")
+    for label in ("restart grid-realtime", "verify grid-realtime runs the deployed tree",
+                  "verify grid-realtime is delivering fresh data"):
         step = _step_named(steps, label)
-        assert step.get("if") == api.get("if"), (
-            f"'{label}' has gate {step.get('if')!r}, but 'Restart grid-api' has "
-            f"{api.get('if')!r}. A workflow_dispatch with do_restart=false must "
-            "not restart grid-realtime either, and a routine push must."
+        assert step is not None, f"missing step: {label}"
+        assert step.get("if") != api_restart.get("if"), (
+            f"'{label}' has gate {step.get('if')!r}, matching 'Restart grid-api' "
+            f"({api_restart.get('if')!r}) -- grid-realtime must not be on the "
+            "unconditional push/do_restart gate."
         )
+        assert "activate_realtime" in str(step.get("if")), (
+            f"'{label}' has gate {step.get('if')!r}, which does not reference "
+            "inputs.activate_realtime"
+        )
+    # Same shape as grid-scheduler's own activation gate (single explicit
+    # input, not folded into do_restart).
+    assert "activate_scheduler" in str(scheduler_restart.get("if"))
 
 
 @pytest.mark.unit
-def test_do_restart_input_description_mentions_realtime():
-    """The workflow_dispatch help text should not undersell what do_restart does."""
+def test_activate_realtime_input_exists_and_requires_acknowledgment():
+    """Mirrors activate_scheduler/acknowledge_scheduler_interruption exactly."""
     with open(DEPLOY_YML, encoding="utf-8") as handle:
         workflow = yaml.safe_load(handle)
     # PyYAML's default (YAML 1.1) resolver parses the bare `on:` key as the
@@ -174,9 +198,45 @@ def test_do_restart_input_description_mentions_realtime():
     # `jobs.deploy.steps` and never hits this; this is the first assertion in
     # this repo's deploy tests to read the workflow_dispatch inputs block.
     workflow_dispatch = workflow[True]["workflow_dispatch"]
-    description = workflow_dispatch["inputs"]["do_restart"]["description"]
-    assert "grid-realtime" in description, (
-        "do_restart now also restarts grid-realtime -- its description should say so"
+    inputs = workflow_dispatch["inputs"]
+
+    assert "activate_realtime" in inputs, "no activate_realtime workflow_dispatch input"
+    assert inputs["activate_realtime"].get("default") is False, (
+        "activate_realtime must default to false -- never implied"
+    )
+
+    assert "acknowledge_realtime_interruption" in inputs, (
+        "no acknowledge_realtime_interruption workflow_dispatch input"
+    )
+    assert inputs["acknowledge_realtime_interruption"].get("default") is False
+
+    do_restart_description = inputs["do_restart"]["description"]
+    assert "grid-realtime" not in do_restart_description, (
+        "do_restart's description still claims to restart grid-realtime, but "
+        "restart is now gated separately behind activate_realtime"
+    )
+
+
+@pytest.mark.unit
+def test_realtime_activation_gate_script_is_actually_consulted():
+    """The acknowledgment input must be enforced by the gate script, not just
+    read -- otherwise a caller could set activate_realtime=true without
+    acknowledge_realtime_interruption and nothing would stop the restart.
+    """
+    steps = _deploy_steps()
+    gate_step = _step_named(steps, "require explicit interruption acknowledgment (grid-realtime)")
+    assert gate_step is not None, "no gate step for grid-realtime activation"
+    assert "activate_realtime" in str(gate_step.get("if"))
+    run = gate_step.get("run", "")
+    assert "realtime_activation_gate.sh" in run
+    assert "acknowledge_realtime_interruption" in run
+
+    restart_step = _step_named(steps, "restart grid-realtime")
+    steps_by_name = [(s.get("name") or "") for s in steps]
+    gate_index = next(i for i, n in enumerate(steps_by_name) if "require explicit interruption acknowledgment (grid-realtime)" in n.lower())
+    restart_index = next(i for i, n in enumerate(steps_by_name) if "restart grid-realtime" in n.lower())
+    assert gate_index < restart_index, (
+        "the acknowledgment gate must run BEFORE the restart, not after"
     )
 
 

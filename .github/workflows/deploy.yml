@@ -10,7 +10,7 @@ on:
         required: false
         default: 'false'
       do_restart:
-        description: 'Restart grid-api, grid-hermes, and grid-realtime after deploy'
+        description: 'Restart grid-api and grid-hermes after deploy'
         type: boolean
         required: false
         default: true
@@ -21,6 +21,16 @@ on:
         default: false
       acknowledge_scheduler_interruption:
         description: 'Required to activate grid-scheduler: explicitly acknowledges the restart will interrupt whatever is currently running (a puller call in progress, or another scheduled job). There is no automated safe-to-restart check. Only consulted when activate_scheduler=true.'
+        type: boolean
+        required: false
+        default: false
+      activate_realtime:
+        description: 'Restart grid-realtime onto the release path. Opt-in, NOT on the same gate as grid-api/grid-hermes/do_restart -- the candle merge across a restart has known, tested correctness gaps (see docs/TODO-REALTIME-CANDLE-CORRECTNESS.md). Also requires acknowledge_realtime_interruption=true.'
+        type: boolean
+        required: false
+        default: false
+      acknowledge_realtime_interruption:
+        description: 'Required to activate grid-realtime: explicitly acknowledges that the candle bucket straddling this restart may end up with an incorrect close or under-reported volume/trade_count for the affected symbol(s) (see scripts/realtime_activation_gate.sh). Only consulted when activate_realtime=true.'
         type: boolean
         required: false
         default: false
@@ -304,28 +314,51 @@ jobs:
       # around 2026-09-11 (5facbdf0) -- both predate every dependency/bug-fix
       # PR merged around 2026-09-15/16 (#366, #367, #371, #374, #503).
       #
-      # Unlike grid-scheduler below, grid-realtime is restarted
-      # unconditionally on the SAME gate as grid-api/grid-hermes (routine push
-      # or do_restart=true), not behind a separate opt-in input. grid-scheduler
-      # needed that extra gate because restarting can interrupt a long,
-      # sequential puller call whose idempotency-on-partial-re-run is
-      # unaudited across ~100 registered pullers. grid-realtime does not have
-      # that shape -- but "Restart=always already makes unplanned restarts
-      # normal" is necessary, not sufficient, justification on its own; the
-      # actual case rests on what was traced and fixed in this same change:
+      # UNLIKE grid-api/grid-hermes, and unlike an earlier version of this
+      # workflow, grid-realtime is now gated the SAME WAY as grid-scheduler
+      # below: behind an explicit `activate_realtime` input plus
+      # `acknowledge_realtime_interruption`, never on a routine push or on
+      # `do_restart` (which still only covers api/hermes). This is a
+      # deliberate narrowing, not the original design -- the first version
+      # of this fix put grid-realtime on the unconditional gate, reasoning
+      # that "Restart=always already makes unplanned restarts normal" plus a
+      # merge-on-conflict INSERT (instead of DO NOTHING) was sufficient. That
+      # merge SQL was then found, under closer review, to have real
+      # correctness gaps: it does not have access to any trade-level
+      # identity or per-minute breakdown (neither survives past
+      # CandleBuilder aggregation -- confirmed by reading feeds/binance.py
+      # and candle_builder.py, not assumed), so close-selection and Yahoo's
+      # volume reconstruction across a restart are provably incomplete in
+      # ways tested and documented, not merely theoretical:
+      #   - `close` is "last write wins" -- correct for the one reachable
+      #     production ordering (a restart's old-segment flush always
+      #     completes, or fails, strictly before the new process's first
+      #     write), but not a general solution to genuine reverse delivery,
+      #     which cannot be resolved without trade-level timestamps this
+      #     code does not capture.
+      #   - Yahoo's volume/trade_count merge uses GREATEST, which never
+      #     inflates but under-counts when the pre- and post-restart
+      #     segments cover genuinely different minutes within the same
+      #     5-minute bucket (no per-minute tracking exists to distinguish
+      #     that from a same-minute revision).
+      # See docs/TODO-REALTIME-CANDLE-CORRECTNESS.md for the full analysis
+      # and what a real fix requires (capturing more identity/order data at
+      # ingest time, a schema-level change), and
+      # tests/test_realtime_shutdown_semantics.py for both gaps proven
+      # against a real Postgres alongside the cases the merge DOES handle
+      # correctly (disjoint pre-/post-restart accumulation, exact-duplicate
+      # replay, same-minute Yahoo revisions). Until that larger fix lands,
+      # a restart during active trading can leave the bucket straddling it
+      # with an incorrect close or an under-reported volume/trade_count for
+      # the affected symbol(s) -- a narrow, bounded blast radius (one bucket
+      # per symbol per restart), but real, so it goes through the same
+      # explicit-acknowledgment gate as grid-scheduler
+      # (scripts/realtime_activation_gate.sh) rather than being treated as
+      # already safe. This still rests on real, verified fixes from the
+      # same round that ARE unconditionally true regardless of the above:
       #   - SIGTERM triggers a graceful shutdown (ws_listener.py::main) that
       #     cancels the feed tasks and flushes whatever candle is in progress
       #     before exiting.
-      #   - Every candle write goes through `INSERT ... ON CONFLICT (symbol,
-      #     interval, ts) DO NOTHING` (flusher.py) -- idempotent in the sense
-      #     that no duplicate or corrupt row can result, but NOT in the sense
-      #     that the most-complete candle wins: a truncated shutdown-flush
-      #     candle and a later complete one for the same bucket share the
-      #     identical primary key, and whichever lands first (always the
-      #     truncated one) permanently blocks the other. One truncated
-      #     candle per active symbol around the restart, tested and pinned
-      #     down exactly in tests/test_realtime_shutdown_semantics.py rather
-      #     than asserted as harmless.
       #   - Traced empirically (see this PR's description) that final
       #     flushing is NOT at risk from a slow, unwrapped `run_in_executor`
       #     call (e.g. Yahoo's synchronous `yf.download()`) -- cancellation
@@ -336,12 +369,11 @@ jobs:
       #     including the SIGTERM handler, delaying the whole shutdown
       #     sequence past systemd's TimeoutStopUSec (90s default, unset in
       #     this unit) and risking a SIGKILL that skips the final flush
-      #     entirely. Fixed in this change: every DB write in
-      #     ingestion/realtime/ now runs through db_writer.bounded_write(),
-      #     off the event loop and capped at 2 concurrent (see that module's
-      #     docstring), and the final flush itself is wrapped in a 30s
-      #     asyncio.wait_for so a stalled write can't hang shutdown
-      #     indefinitely either.
+      #     entirely. Fixed: every DB write in ingestion/realtime/ now runs
+      #     through db_writer.bounded_write(), off the event loop and capped
+      #     at 2 concurrent (see that module's docstring), and the final
+      #     flush itself is wrapped in a 30s asyncio.wait_for so a stalled
+      #     write can't hang shutdown indefinitely either.
       #   - The Binance feed (feeds/binance.py) already reconnects with
       #     exponential backoff on any disconnect -- a restart looks like just
       #     another disconnect from Binance's side. It never opens a DB
@@ -349,8 +381,26 @@ jobs:
       #     reconnect storms don't compound DB connection pressure.
       #   - The Yahoo feed (feeds/yahoo.py) is a stateless 60s HTTP poll with
       #     no persistent connection and nothing to lose across a restart.
-      - name: Restart grid-realtime
-        if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
+      - name: Report grid-realtime activation status
+        if: ${{ inputs.activate_realtime != true }}
+        run: |
+          {
+            echo "grid-realtime was NOT restarted this run (activate_realtime was not set)."
+            echo "It continues running its existing checkout, independent of the release tree this run deployed."
+            echo "**Realtime activation remains pending.** To activate: run this workflow via workflow_dispatch with activate_realtime=true and acknowledge_realtime_interruption=true."
+            echo "See docs/TODO-REALTIME-CANDLE-CORRECTNESS.md for why activation is gated: candle-merge correctness gaps across a restart, tested but not yet fixed."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Require explicit interruption acknowledgment (grid-realtime)
+        if: ${{ inputs.activate_realtime == true }}
+        # This job never runs actions/checkout -- it gets code onto the box
+        # entirely via "Build release tree" above -- so the gate script is
+        # read from $DEPLOY_PATH (the tree that step just fetched), not a
+        # workspace-relative path that wouldn't resolve here.
+        run: bash "$DEPLOY_PATH/scripts/realtime_activation_gate.sh" "${{ inputs.acknowledge_realtime_interruption }}"
+
+      - name: Restart grid-realtime (activate_realtime only)
+        if: ${{ inputs.activate_realtime == true }}
         run: |
           set -euo pipefail
           sudo bash "$DEPLOY_PATH/scripts/realtime_dropin_backup.sh" \
@@ -369,7 +419,7 @@ jobs:
       # fresh data" step below -- a process that started cleanly can still
       # be stuck on a broken feed).
       - name: Verify grid-realtime runs the deployed tree
-        if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
+        if: ${{ inputs.activate_realtime == true }}
         run: |
           set -euo pipefail
           date -u +%s > "$RUNNER_TEMP/grid-realtime-restart-ts"
@@ -430,7 +480,7 @@ jobs:
       # passed process-start verification -- so every outcome below is
       # recorded, not gated on.
       - name: Verify grid-realtime is delivering fresh data
-        if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
+        if: ${{ inputs.activate_realtime == true }}
         run: |
           set -euo pipefail
           for f in /data/grid_v4/grid_release/.env /home/grid/grid_v4/grid_repo/.env; do
@@ -512,12 +562,12 @@ jobs:
             echo "grid-realtime data freshness: UNVERIFIED (binance) -- freshness check errored, not a feed-silence finding" | tee -a "$GITHUB_STEP_SUMMARY"
           else
             if grep -q "^SEEN yahoo" "$probe_out"; then
-              echo "grid-realtime data freshness: yahoo CONFIRMED -- $(grep '^SEEN yahoo' "$probe_out")" | tee -a "$GITHUB_STEP_SUMMARY"
+              echo "grid-realtime data freshness: yahoo CONFIRMED new insert since restart -- $(grep '^SEEN yahoo' "$probe_out")" | tee -a "$GITHUB_STEP_SUMMARY"
             else
               echo "grid-realtime data freshness: yahoo UNVERIFIED -- no fresh row seen. Not necessarily a problem: Yahoo covers equities/futures/forex, closed outside market hours -- this cannot distinguish a quiet market from a broken feed." | tee -a "$GITHUB_STEP_SUMMARY"
             fi
             if grep -q "^SEEN binance" "$probe_out"; then
-              echo "grid-realtime data freshness: binance CONFIRMED -- $(grep '^SEEN binance' "$probe_out")" | tee -a "$GITHUB_STEP_SUMMARY"
+              echo "grid-realtime data freshness: binance CONFIRMED new insert since restart -- $(grep '^SEEN binance' "$probe_out")" | tee -a "$GITHUB_STEP_SUMMARY"
             else
               echo "::warning::grid-realtime: no fresh binance candle seen since restart -- crypto trades 24/7, so unlike yahoo this is NOT explained by closed markets and deserves a closer look"
               echo "grid-realtime data freshness: binance UNVERIFIED -- no fresh row seen, and crypto trading 24/7 means a closed-market explanation does NOT apply here. Worth investigating if this persists." | tee -a "$GITHUB_STEP_SUMMARY"
