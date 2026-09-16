@@ -58,6 +58,15 @@ from __future__ import annotations
 import argparse
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+# `python3 scripts/realtime_freshness_probe.py` (exactly how deploy.yml
+# invokes this) puts THIS file's own directory (scripts/) on sys.path[0],
+# not the repo root -- so `from db import get_engine` below would fail
+# with ModuleNotFoundError even when run from the repo root, since db.py
+# lives there, not in scripts/. Same convention used throughout scripts/
+# (e.g. bulk_resolve.py, ai_analyst.py, autoresearch.py).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # 4x flusher.py's FLUSH_INTERVAL (300s) -- generous slack for a delayed
 # write (e.g. flusher.py's own buffer-and-retry path) while still pruning
