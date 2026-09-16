@@ -12,6 +12,7 @@ import asyncio
 from loguru import logger as log
 
 from ingestion.realtime.candle_builder import CandleBuilder, CandleState
+from ingestion.realtime.db_writer import bounded_write
 
 FLUSH_INTERVAL = 300  # 5 minutes
 MAX_BUFFER_CYCLES = 12  # 1 hour of candles before dropping oldest
@@ -38,10 +39,18 @@ def build_insert_values(candles: list[CandleState]) -> list[tuple]:
     return rows
 
 
+def _write_batch_sync(rows: list[tuple]) -> None:
+    """Synchronous batch insert -- run off the event loop via bounded_write."""
+    from db import get_connection
+    from psycopg2.extras import execute_batch
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            execute_batch(cur, INSERT_SQL, rows, page_size=500)
+
+
 async def run_flusher(builder: CandleBuilder) -> None:
     """Periodically drain candle builder and batch-insert to DB. Runs forever."""
-    from db import get_connection
-
     buffer: list[CandleState] = []
     consecutive_failures = 0
 
@@ -64,10 +73,7 @@ async def run_flusher(builder: CandleBuilder) -> None:
                 log.warning("Dropped {n} oldest buffered candles (buffer overflow)", n=dropped)
 
             rows = build_insert_values(buffer)
-            with get_connection() as conn:
-                with conn.cursor() as cur:
-                    from psycopg2.extras import execute_batch
-                    execute_batch(cur, INSERT_SQL, rows, page_size=500)
+            await bounded_write(_write_batch_sync, rows)
 
             log.info(
                 "Flushed {n} candles to realtime_candles ({syms} symbols)",

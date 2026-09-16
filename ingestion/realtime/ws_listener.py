@@ -17,10 +17,34 @@ import signal
 from loguru import logger as log
 
 from ingestion.realtime.candle_builder import CandleBuilder
+from ingestion.realtime.db_writer import bounded_write
 from ingestion.realtime.feeds.binance import run_binance_feed
 from ingestion.realtime.feeds.dex_scanner import run_dex_scanner
 from ingestion.realtime.feeds.yahoo import run_yahoo_feed
-from ingestion.realtime.flusher import run_flusher
+from ingestion.realtime.flusher import build_insert_values, run_flusher
+
+# Bounds the final flush so a stalled write can't hang the whole shutdown
+# sequence indefinitely -- leaves comfortable margin under grid-realtime's
+# systemd TimeoutStopUSec (90s default, unset in the unit) for task
+# cancellation and everything else in main() to also complete.
+FINAL_FLUSH_TIMEOUT_SECONDS = 30
+
+FINAL_FLUSH_SQL = (
+    "INSERT INTO realtime_candles "
+    "(symbol, asset_class, interval, ts, open, high, low, close, volume, vwap, trade_count, source) "
+    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+    "ON CONFLICT (symbol, interval, ts) DO NOTHING"
+)
+
+
+def _write_final_flush_sync(rows: list[tuple]) -> None:
+    """Synchronous final-flush insert -- run off the event loop via bounded_write."""
+    from db import get_connection
+    from psycopg2.extras import execute_batch
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            execute_batch(cur, FINAL_FLUSH_SQL, rows, page_size=500)
 
 
 async def main() -> None:
@@ -56,31 +80,62 @@ async def main() -> None:
         if isinstance(r, Exception) and not isinstance(r, asyncio.CancelledError):
             log.error("Task {name} failed: {err}", name=t.get_name(), err=str(r))
 
-    # Flush remaining candles
+    # Flush remaining candles.
+    #
+    # What this guarantees, precisely -- not "nothing is lost":
+    #   - flush_all() moves every in-progress candle (including the one
+    #     started seconds ago) into the flush queue synchronously, in
+    #     memory, before we ever touch the DB. That part cannot fail.
+    #   - Each such candle keeps the ts_bucket it was assigned at creation
+    #     (CandleBuilder._bucket_floor -- the interval's start, e.g.
+    #     14:05:00 for a candle spanning 14:05-14:10), not a "final
+    #     timestamp" reflecting when it was cut short. So it is written
+    #     truncated (fewer ticks than a full interval), not under some
+    #     other identity -- and if the next process (started fresh after
+    #     this restart) later builds a *complete* candle for that same
+    #     bucket, its own flush uses the identical (symbol, interval, ts)
+    #     key. ON CONFLICT DO NOTHING means the truncated row -- written
+    #     first, before the new process even starts -- wins permanently;
+    #     the more-complete one is silently discarded, never overwrites it.
+    #     See tests/test_realtime_shutdown_semantics.py for this traced
+    #     end-to-end against the real INSERT.
+    #   - The actual DB write below CAN fail (unreachable DB, exhausted
+    #     slots outright, a query timeout) or simply run out of time. On
+    #     either, the exception/timeout is caught and logged, and the
+    #     process still exits -- that batch is genuinely lost, not
+    #     retried, because no later flush is coming.
+    #   - The write itself runs off the event loop (bounded_write ->
+    #     run_in_executor) and under a hard timeout, specifically so a
+    #     slow database cannot also delay *this* code from running in the
+    #     first place. Traced empirically (see this change's PR
+    #     description): unlike a slow synchronous call made directly on
+    #     the event loop -- which blocks signal handling itself, the
+    #     actual failure mode this bounded_write rollout targets in
+    #     flusher.py and dex_scanner.py -- an executor-wrapped call does
+    #     NOT block asyncio.gather() or the code after it; cancellation is
+    #     delivered promptly regardless of how long the underlying thread
+    #     keeps running in the background.
     log.info("Flushing {n} remaining candles...", n=builder.active_symbols)
     builder.flush_all()
     drained = builder.drain()
     if drained:
+        rows = build_insert_values(drained)
         try:
-            from ingestion.realtime.flusher import build_insert_values
-            from db import get_connection
-
-            rows = build_insert_values(drained)
-            with get_connection() as conn:
-                with conn.cursor() as cur:
-                    from psycopg2.extras import execute_batch
-                    execute_batch(
-                        cur,
-                        "INSERT INTO realtime_candles "
-                        "(symbol, asset_class, interval, ts, open, high, low, close, volume, vwap, trade_count, source) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
-                        "ON CONFLICT (symbol, interval, ts) DO NOTHING",
-                        rows,
-                        page_size=500,
-                    )
+            await asyncio.wait_for(
+                bounded_write(_write_final_flush_sync, rows),
+                timeout=FINAL_FLUSH_TIMEOUT_SECONDS,
+            )
             log.info("Final flush: {n} candles written", n=len(rows))
+        except asyncio.TimeoutError:
+            log.error(
+                "Final flush timed out after {s}s -- {n} candles NOT written, not retried",
+                s=FINAL_FLUSH_TIMEOUT_SECONDS, n=len(rows),
+            )
         except Exception as exc:
-            log.error("Final flush failed: {err}", err=str(exc))
+            log.error(
+                "Final flush failed: {err} -- {n} candles NOT written, not retried",
+                err=str(exc), n=len(rows),
+            )
 
     log.info("GRID Realtime Listener shut down cleanly")
 

@@ -15,6 +15,7 @@ from datetime import date, datetime, timezone
 from loguru import logger as log
 
 from ingestion.realtime.candle_builder import CandleBuilder
+from ingestion.realtime.db_writer import bounded_write
 
 POLL_INTERVAL = 60
 WATCHED_TOKEN_TTL = 86400  # 24 hours
@@ -103,7 +104,7 @@ async def run_dex_scanner(builder: CandleBuilder) -> None:
             spikes = detect_spikes(pools)
 
             if spikes:
-                _write_signals(spikes)
+                await bounded_write(_write_signals, spikes)
                 for s in spikes:
                     watched_tokens[s["ticker"]] = (
                         datetime.now(tz=timezone.utc).timestamp() + WATCHED_TOKEN_TTL

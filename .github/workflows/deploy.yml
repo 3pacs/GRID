@@ -10,7 +10,7 @@ on:
         required: false
         default: 'false'
       do_restart:
-        description: 'Restart grid-api and grid-hermes after deploy'
+        description: 'Restart grid-api, grid-hermes, and grid-realtime after deploy'
         type: boolean
         required: false
         default: true
@@ -286,6 +286,187 @@ jobs:
             exit 1
           }
           echo "verify: grid-hermes is running the deployed tree"
+
+      # grid-realtime has the exact same class of bug already fixed for
+      # grid-hermes (#487/#490): its unit runs `ExecStart=/usr/bin/python3 -m
+      # ingestion.realtime.ws_listener`, and `-m` resolves that module against
+      # sys.path with the process's cwd prepended -- which systemd sets from
+      # WorkingDirectory. That unit pins WorkingDirectory to
+      # /home/grid/grid_v4/grid_repo, a checkout this workflow never writes
+      # to, so every realtime-side change has shipped to grid_release and
+      # never run for this process. There is no restart step for it at all in
+      # this workflow prior to this change (grep confirms zero references to
+      # "grid-realtime" here before this diff).
+      #
+      # Confirmed live 2026-09-16: grid-realtime's process (PID 16196) has
+      # been running since 2026-07-29 with zero restarts since, and its
+      # checkout at /home/grid/grid_v4/grid_repo was last fast-forwarded
+      # around 2026-09-11 (5facbdf0) -- both predate every dependency/bug-fix
+      # PR merged around 2026-09-15/16 (#366, #367, #371, #374, #503).
+      #
+      # Unlike grid-scheduler below, grid-realtime is restarted
+      # unconditionally on the SAME gate as grid-api/grid-hermes (routine push
+      # or do_restart=true), not behind a separate opt-in input. grid-scheduler
+      # needed that extra gate because restarting can interrupt a long,
+      # sequential puller call whose idempotency-on-partial-re-run is
+      # unaudited across ~100 registered pullers. grid-realtime does not have
+      # that shape -- but "Restart=always already makes unplanned restarts
+      # normal" is necessary, not sufficient, justification on its own; the
+      # actual case rests on what was traced and fixed in this same change:
+      #   - SIGTERM triggers a graceful shutdown (ws_listener.py::main) that
+      #     cancels the feed tasks and flushes whatever candle is in progress
+      #     before exiting.
+      #   - Every candle write goes through `INSERT ... ON CONFLICT (symbol,
+      #     interval, ts) DO NOTHING` (flusher.py) -- idempotent in the sense
+      #     that no duplicate or corrupt row can result, but NOT in the sense
+      #     that the most-complete candle wins: a truncated shutdown-flush
+      #     candle and a later complete one for the same bucket share the
+      #     identical primary key, and whichever lands first (always the
+      #     truncated one) permanently blocks the other. One truncated
+      #     candle per active symbol around the restart, tested and pinned
+      #     down exactly in tests/test_realtime_shutdown_semantics.py rather
+      #     than asserted as harmless.
+      #   - Traced empirically (see this PR's description) that final
+      #     flushing is NOT at risk from a slow, unwrapped `run_in_executor`
+      #     call (e.g. Yahoo's synchronous `yf.download()`) -- cancellation
+      #     delivery doesn't wait on an orphaned executor thread. The REAL
+      #     risk found was different: flusher.py's and dex_scanner.py's
+      #     periodic/spike DB writes were DIRECT, unwrapped synchronous calls
+      #     on the event loop -- a slow one could block the loop itself,
+      #     including the SIGTERM handler, delaying the whole shutdown
+      #     sequence past systemd's TimeoutStopUSec (90s default, unset in
+      #     this unit) and risking a SIGKILL that skips the final flush
+      #     entirely. Fixed in this change: every DB write in
+      #     ingestion/realtime/ now runs through db_writer.bounded_write(),
+      #     off the event loop and capped at 2 concurrent (see that module's
+      #     docstring), and the final flush itself is wrapped in a 30s
+      #     asyncio.wait_for so a stalled write can't hang shutdown
+      #     indefinitely either.
+      #   - The Binance feed (feeds/binance.py) already reconnects with
+      #     exponential backoff on any disconnect -- a restart looks like just
+      #     another disconnect from Binance's side. It never opens a DB
+      #     connection directly (only flusher.py does, on its behalf), so
+      #     reconnect storms don't compound DB connection pressure.
+      #   - The Yahoo feed (feeds/yahoo.py) is a stateless 60s HTTP poll with
+      #     no persistent connection and nothing to lose across a restart.
+      - name: Restart grid-realtime
+        if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
+        run: |
+          set -euo pipefail
+          sudo bash "$DEPLOY_PATH/scripts/realtime_dropin_backup.sh" \
+            /etc/systemd/system/grid-realtime.service.d \
+            /etc/systemd/system/grid-realtime.service.d/zz-release-worktree.conf \
+            "$DEPLOY_PATH" \
+            grid-realtime | tee -a "$GITHUB_STEP_SUMMARY"
+          sudo systemctl daemon-reload
+          sudo systemctl restart grid-realtime
+
+      # Proves the NEW process actually booted from the release path --
+      # not that grid-realtime is merely alive (a bare is-active would stay
+      # green through the entire period it ran stale code, exactly like the
+      # grid-hermes incident this mirrors), and not that it is delivering
+      # fresh data (that's the separate "Verify grid-realtime is delivering
+      # fresh data" step below -- a process that started cleanly can still
+      # be stuck on a broken feed).
+      - name: Verify grid-realtime runs the deployed tree
+        if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
+        run: |
+          set -euo pipefail
+          date -u +%s > "$RUNNER_TEMP/grid-realtime-restart-ts"
+          for attempt in {1..30}; do
+            state="$(systemctl is-active grid-realtime || true)"
+            [ "$state" = "active" ] && break
+            if [ "$attempt" -eq 30 ]; then
+              echo "::error::grid-realtime not active after restart (state=$state)"
+              sudo systemctl status grid-realtime --no-pager -l || true
+              journalctl -u grid-realtime -n 60 --no-pager || true
+              exit 1
+            fi
+            sleep 2
+          done
+          pid="$(systemctl show -p MainPID --value grid-realtime)"
+          cwd="$(sudo -n readlink "/proc/${pid}/cwd" 2>/dev/null || readlink "/proc/${pid}/cwd" 2>/dev/null || true)"
+          echo "grid-realtime pid=$pid cwd=$cwd"
+          want="$(readlink -f "$DEPLOY_PATH")"
+          [ -n "$cwd" ] && [ "$(readlink -f "$cwd")" = "$want" ] || {
+            echo "::error::grid-realtime cwd '$cwd' does not resolve to $want -- it is running a different tree"
+            exit 1
+          }
+          restart_ts="$(cat "$RUNNER_TEMP/grid-realtime-restart-ts")"
+          for attempt in {1..30}; do
+            if journalctl -u grid-realtime --since "@${restart_ts}" --no-pager -q 2>/dev/null \
+                 | grep -qF '4 async tasks'; then
+              echo "found the startup log line confirming a clean boot"
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              echo "::error::did not see the startup log line within 2.5 minutes of restart"
+              journalctl -u grid-realtime -n 80 --no-pager || true
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "verify: grid-realtime booted the deployed tree (process/cwd/startup-log only -- see the next step for data freshness)"
+
+      # Deliberately separate from the step above: booting cleanly from the
+      # right directory says nothing about whether Yahoo or Binance are
+      # actually delivering data post-restart (a broken API key, a changed
+      # Yahoo response shape, a Binance endpoint change -- any of these would
+      # leave the process "running the deployed tree" and completely silent
+      # at the same time). Bounded to ~4 minutes: Yahoo polls every 60s,
+      # Binance ticks are near-continuous when markets are open, so a fresh
+      # row from EITHER source is expected well inside that window whenever
+      # markets are open. Does not fail the deploy on timeout (crypto trades
+      # 24/7 but equities/futures do not -- a restart during a closed
+      # session legitimately has no fresh Yahoo/Binance-equity data to find,
+      # and this step cannot tell "quiet market" apart from "broken feed"),
+      # but records what it found either way.
+      - name: Verify grid-realtime is delivering fresh data
+        if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
+        run: |
+          set -euo pipefail
+          for f in /data/grid_v4/grid_release/.env /home/grid/grid_v4/grid_repo/.env; do
+            if [ -f "$f" ]; then set -a; . "$f"; set +a; break; fi
+          done
+          cd "$DEPLOY_PATH"
+          restart_ts="$(cat "$RUNNER_TEMP/grid-realtime-restart-ts")"
+          restart_iso="$(date -u -d "@${restart_ts}" +%Y-%m-%dT%H:%M:%SZ)"
+          set +e
+          timeout 240 python3 - "$restart_iso" <<'PYEOF'
+          import sys
+          from datetime import datetime
+          from db import get_engine
+          from sqlalchemy import text
+
+          restart_iso = sys.argv[1]
+          engine = get_engine()
+          with engine.connect() as conn:
+              rows = conn.execute(text("""
+                  SELECT source, count(*), max(ts)
+                  FROM realtime_candles
+                  WHERE created_at > :restart_ts
+                  GROUP BY source
+              """), {"restart_ts": restart_iso}).fetchall()
+          sources = {r[0]: (r[1], r[2]) for r in rows}
+          for src in ("yahoo", "binance"):
+              if src in sources:
+                  n, latest = sources[src]
+                  print(f"{src}: {n} candle(s) written since restart, latest bucket {latest}")
+              else:
+                  print(f"{src}: no candles written since restart yet")
+          sys.exit(0 if sources else 1)
+          PYEOF
+          probe_rc=$?
+          set -e
+          if [ "$probe_rc" -eq 124 ]; then
+            echo "::warning::data-freshness check timed out after 4 minutes -- does not fail the deploy (see step comment)"
+            echo "grid-realtime data freshness: TIMED OUT (4 min, no candles seen yet)" | tee -a "$GITHUB_STEP_SUMMARY"
+          elif [ "$probe_rc" -ne 0 ]; then
+            echo "::warning::no candles from either source since restart yet -- does not fail the deploy (markets may be closed)"
+            echo "grid-realtime data freshness: NONE SEEN YET" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "grid-realtime data freshness: confirmed (see log above)" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
 
       # grid-scheduler has the exact same class of bug the grid-hermes fix
       # above addressed for #487/#490: its unit pins WorkingDirectory to
