@@ -14,25 +14,34 @@ running since 2026-07-29 with zero restarts, and its checkout at
 (commit 5facbdf0) -- both predate every dependency/bug-fix PR merged around
 2026-09-15/16 (#366, #367, #371, #374, #503).
 
-grid-realtime's restart is now gated the SAME WAY as grid-scheduler --
-behind an explicit `activate_realtime` input plus
+grid-realtime's restart is gated the SAME WAY as grid-scheduler -- behind
+an explicit `activate_realtime` input plus
 `acknowledge_realtime_interruption`, never on a routine push or on
 `do_restart` (which only covers grid-api/grid-hermes). This is a deliberate
 narrowing from an earlier version of this fix, which put grid-realtime on
-the unconditional gate reasoning that `Restart=always` plus a merge-on-
-conflict INSERT was sufficient justification. Closer review found the merge
-SQL (`INSERT_SQL`, flusher.py) has real, tested correctness gaps: neither
-trade-level identity (Binance) nor per-minute state (Yahoo) survives past
-`CandleBuilder` aggregation, so close-selection and Yahoo's volume
-reconstruction across a restart are provably incomplete in specific, tested
-ways -- see docs/TODO-REALTIME-CANDLE-CORRECTNESS.md and
-tests/test_realtime_shutdown_semantics.py. Until that larger fix lands, a
-restart during active trading can leave the bucket straddling it with an
-incorrect close or under-reported volume for the affected symbol(s) -- a
-narrow, bounded, but real risk, so activation requires the same explicit
-human acknowledgment grid-scheduler's gate does
-(scripts/realtime_activation_gate.sh), rather than being treated as already
-safe.
+the unconditional gate reasoning that `Restart=always` was sufficient
+justification on its own. Closer review found a real, PRE-EXISTING risk
+that reasoning glossed over: every candle write is `INSERT ... ON CONFLICT
+(symbol, interval, ts) DO NOTHING` (`INSERT_SQL`, flusher.py) -- unchanged
+by this PR, same as `main` -- which is idempotent (no duplicate/corrupt
+row) but does NOT mean the most complete candle wins. A truncated
+shutdown-flush candle and a later, complete candle for the same bucket
+share the identical primary key, and whichever lands first (always the
+truncated one) permanently blocks the other -- proven against real
+Postgres in tests/test_realtime_shutdown_semantics.py::
+test_truncated_candle_blocks_a_later_complete_candle_for_the_same_bucket.
+A source-aware merge (`DO UPDATE`) was explored in an earlier round of
+this same PR and reverted after review found real, unresolved correctness
+gaps in it -- see docs/TODO-REALTIME-CANDLE-CORRECTNESS.md for that
+history and docs/realtime_candle_merge_proposal_tests.py for the reverted
+draft. This PR does not change candle persistence semantics at all -- the
+truncation risk above happens on every unplanned crash-restart today too,
+not something this PR introduces, but it is real and this PR does not fix
+it, so -- combined with this being the first-ever automated restart of a
+daemon otherwise untouched for months -- activation requires the same
+explicit human acknowledgment grid-scheduler's gate does
+(scripts/realtime_activation_gate.sh), rather than being treated as
+already safe.
 
 What IS unconditionally true regardless of the above, from this same round:
 SIGTERM triggers a graceful shutdown that flushes the in-progress candle

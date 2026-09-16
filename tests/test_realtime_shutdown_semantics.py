@@ -13,51 +13,25 @@ that, a truncated candle and a later, complete candle for the same bucket
 share an identical (symbol, interval, ts) primary key
 (schema.sql:1728-1743). Both write paths (ws_listener.py's shutdown flush,
 flusher.py's periodic flush) use the identical INSERT_SQL (imported, not
-duplicated -- see ws_listener.py), which merges on that conflict.
+duplicated -- see ws_listener.py), which is `ON CONFLICT (symbol,
+interval, ts) DO NOTHING` -- the same persistence semantics as main,
+unchanged by this deployment-path repair.
 
-**The merge is NOT the same for every source, and is NOT complete even
-within a source** -- see INSERT_SQL's own comment in flusher.py for the
-full reasoning, traced against the actual feed code (feeds/binance.py,
-feeds/yahoo.py) and candle_builder.py's CandleState, not assumed. Neither
-Binance's trade IDs/timestamps nor Yahoo's per-minute breakdown survive
-past CandleBuilder aggregation -- confirmed by reading the parser code, not
-inferred -- which bounds what the merge can correctly resolve:
-
-- binance.py's @trade stream is ASSUMED (not independently verified --
-  there is no persisted trade ID to dedup against) to deliver each trade
-  exactly once; a reconnect resumes from "now" per the parser's own logic.
-  Two partial candles split by a restart are treated as covering genuinely
-  disjoint trades, so summing volume/trade_count reconstructs the true
-  total under that assumption -- additive merge.
-- yahoo.py re-polls the LATEST known 1-minute bar every 60s and re-ingests
-  it as a fresh "tick" timestamped at poll time, not the bar's own time.
-  CandleState has no per-minute breakdown, so a same-minute revision and a
-  genuinely different minute within the same 5-minute bucket look
-  identical at merge time. GREATEST handles the first correctly (a growing
-  revision naturally has more volume) but under-counts the second (returns
-  only the larger side's own total, not the true union of two
-  non-overlapping minutes) -- tested and documented as a known limitation,
-  not silently assumed safe.
-
-Two more properties, tested below against a real Postgres (the merge
-involves GREATEST/LEAST/CASE arithmetic a hand-rolled Python model could
-get subtly wrong in ways that wouldn't surface until production):
-
-- Replaying an exact-duplicate batch (same open/close/volume/trade_count)
-  is a no-op for the SUM-based fields, not a second addition -- guarded
-  explicitly in INSERT_SQL. This is a heuristic proxy for "the same batch
-  was resent" (equality of four aggregate fields), not proof of identical
-  underlying trades -- documented as such, not oversold.
-- `close` is plain last-write-wins (EXCLUDED.close, unconditionally) --
-  correct for the one reachable production ordering (a restart's old
-  segment always finishes, or fails, strictly before the new process's
-  first write), proven below to NOT depend on trade_count (an earlier
-  version used trade_count as a completeness proxy for "which side is
-  later," which is unsound: trade count reflects how busy a segment's
-  window was, not when it occurred, so a later, correct segment can have
-  FEWER trades than an earlier one). Also NOT a general solution to
-  genuine reverse delivery, which is tested below as a known, documented
-  limitation rather than silently assumed away.
+**"Idempotent" (no duplicate/corrupt row can result) is true of this;
+"the most complete candle wins" is NOT.** Whichever row lands FIRST at
+that primary key wins permanently, and it is provably the truncated one:
+the old process's shutdown flush always completes, successfully or not,
+strictly before a new process's candle for the same bucket even starts.
+`test_truncated_candle_blocks_a_later_complete_candle_for_the_same_bucket`
+below proves this against a real Postgres rather than describing it. This
+is a real, known, PRE-EXISTING risk that this PR does not fix -- see
+docs/TODO-REALTIME-CANDLE-CORRECTNESS.md for the tracked follow-up (it
+needs a schema-level change: trade-level identity/order for Binance,
+per-minute tracking for Yahoo) and
+docs/realtime_candle_merge_proposal_tests.py for a source-aware merge
+design that was explored and then reverted out of this PR after review
+found real correctness gaps in it -- kept there as a starting point for
+that follow-up, not shipped here.
 
 ## DB-write concurrency bound
 
@@ -154,10 +128,8 @@ def _connect_to_real_test_db():
 @pytest.fixture
 def realtime_candles_schema():
     """Idempotently create realtime_candles (schema.sql:1728-1743) for this
-    test session, matching the real column types exactly -- the merge SQL
-    under test uses GREATEST/LEAST/arithmetic that behaves differently
-    across types, so this must be the real DDL, not an approximation.
-    Cleans up only the rows this test creates (unique symbol per test run).
+    test session, matching the real column types exactly. Cleans up only
+    the rows this test creates (unique symbol per test run).
     """
     pg_engine = _connect_to_real_test_db()
     if pg_engine is None:
@@ -222,23 +194,20 @@ def _read_candle(engine, symbol, interval, ts):
     return row
 
 
-def test_restart_interruption_produces_a_correctly_merged_candle(realtime_candles_schema):
-    """The disjoint pre-/post-restart scenario, against the real INSERT_SQL
-    and a real Postgres -- not a simulation of what the SQL might do.
+def test_truncated_candle_blocks_a_later_complete_candle_for_the_same_bucket(realtime_candles_schema):
+    """The actual interruption/restart scenario, against the real
+    INSERT_SQL (`ON CONFLICT DO NOTHING`) and a real Postgres -- proves the
+    known, pre-existing, NOT-fixed-by-this-PR risk rather than describing
+    it.
 
     Old process gets SIGTERM mid-interval, flushes a 1-tick truncated
     candle for the 14:05:00 bucket. New process starts immediately,
     ingests the rest of that same interval (4 more ticks) before crossing
-    into the next bucket, and its own flush writes a materially more
-    complete candle for the identical bucket -- via the SAME INSERT_SQL,
-    hitting the real ON CONFLICT DO UPDATE merge path.
-
-    Uses source="binance": binance.py's @trade stream delivers each trade
-    exactly once, so the two partials here cover genuinely disjoint trades
-    and summing volume/trade_count is the correct reconstruction (see
-    INSERT_SQL's own comment in flusher.py). This is NOT the right source
-    to prove yahoo.py's overlap-safe behavior -- see
-    test_overlapping_yahoo_batches_do_not_double_count for that.
+    into the next bucket, and its own flush tries to write a materially
+    more complete candle for the identical bucket. Both go through the
+    real INSERT_SQL, hitting the real PRIMARY KEY (symbol, interval, ts) /
+    ON CONFLICT DO NOTHING contract -- and the truncated one, having
+    landed first, wins permanently.
     """
     engine, symbol = realtime_candles_schema
 
@@ -247,10 +216,11 @@ def test_restart_interruption_produces_a_correctly_merged_candle(realtime_candle
     old_builder.ingest(
         symbol, 180.0, 100,
         datetime(2026, 9, 16, 14, 7, 23, tzinfo=timezone.utc),
-        "crypto", "binance",
+        "equity", "yahoo",
     )
     old_builder.flush_all()
     truncated_rows = build_insert_values(old_builder.drain())
+    _write_rows(engine, truncated_rows)  # old process's shutdown flush
 
     # --- New process: starts immediately, ingests the rest of 14:05-14:10 ---
     new_builder = CandleBuilder()
@@ -258,398 +228,42 @@ def test_restart_interruption_produces_a_correctly_merged_candle(realtime_candle
         new_builder.ingest(
             symbol, price, 100,
             datetime(2026, 9, 16, 14, minute, second, tzinfo=timezone.utc),
-            "crypto", "binance",
+            "equity", "yahoo",
         )
     # Crossing into 14:10:00 flushes the now-complete 14:05:00 candle.
     new_builder.ingest(
         symbol, 184.0, 100,
         datetime(2026, 9, 16, 14, 10, 5, tzinfo=timezone.utc),
-        "crypto", "binance",
+        "equity", "yahoo",
     )
     complete_rows = build_insert_values(new_builder.drain())
     assert len(complete_rows) == 1  # only the completed 14:05:00 candle, not the new 14:10:00 one
+    _write_rows(engine, complete_rows)  # new process's next flush
 
     truncated_key = (truncated_rows[0][_SYMBOL], truncated_rows[0][_INTERVAL], truncated_rows[0][_TS])
     complete_key = (complete_rows[0][_SYMBOL], complete_rows[0][_INTERVAL], complete_rows[0][_TS])
     assert truncated_key == complete_key, "both candles must target the identical primary key"
 
-    # Write both in the real chronological order (old always completes
-    # before new even starts).
-    _write_rows(engine, truncated_rows)
-    _write_rows(engine, complete_rows)
-
     open_, high, low, close, volume, vwap, trade_count = _read_candle(
         engine, symbol, truncated_rows[0][_INTERVAL], truncated_rows[0][_TS]
     )
 
-    # The intended result: a full reconstruction of the interval, not
-    # either partial candle alone.
-    assert open_ == pytest.approx(180.0), "open must stay the truncated candle's (it came first)"
-    assert high == pytest.approx(183.5), "high must widen to cover both partials"
-    assert low == pytest.approx(179.0), "low must widen to cover both partials"
-    assert close == pytest.approx(183.5), "close must be the later (complete) candle's"
-    assert volume == pytest.approx(500.0), "volume must be the SUM of both partials (binance=incremental), not either alone"
-    assert trade_count == 5, "trade_count must be the SUM (1 + 4), not either alone"
-    # vwap = (180*100 + 181.375*400) / 500 = 90550 / 500 = 181.1
-    assert vwap == pytest.approx(181.1), "vwap must be the volume-weighted combination of both partials"
+    # The truncated row won: written first, and DO NOTHING never lets the
+    # later, more complete one replace it.
+    assert trade_count == 1, "the surviving row must be the 1-tick truncated candle, not the merged/complete one"
+    assert close == pytest.approx(180.0), "close stays the truncated candle's single tick"
+    assert volume == pytest.approx(100.0), "volume stays the truncated candle's, not summed or widened"
+
+    # Spell out exactly what was silently discarded.
+    assert complete_rows[0][_TRADE_COUNT] == 4, "the more-complete candle had 4 ticks"
+    assert complete_rows[0][_TRADE_COUNT] != trade_count, "and none of it survived"
 
     import warnings
     warnings.warn(
-        "MARKER_REALTIME_MERGE_BINANCE: test_restart_interruption_produces_a_correctly_merged_candle "
-        "executed against a real PostgreSQL and asserted volume=500.0 trade_count=5 vwap=181.1"
-    )
-
-
-def test_duplicate_delivery_does_not_inflate_totals(realtime_candles_schema):
-    """Replaying the exact same batch (e.g. a retry after an ambiguous write
-    failure that actually succeeded server-side) must be a true no-op --
-    not a second SUM, regardless of source. Proven for source="binance"
-    since that is the source where a naive SUM-based merge would otherwise
-    double the totals; GREATEST-based sources are idempotent under
-    duplication by construction and don't need this guard to stay correct,
-    but the exact-duplicate CASE in INSERT_SQL applies uniformly anyway.
-    """
-    engine, symbol = realtime_candles_schema
-
-    builder = CandleBuilder()
-    for minute, second, price in [(5, 3, 100.0), (6, 12, 101.0), (7, 45, 99.5)]:
-        builder.ingest(
-            symbol, price, 50,
-            datetime(2026, 9, 16, 14, minute, second, tzinfo=timezone.utc),
-            "crypto", "binance",
-        )
-    builder.flush_all()
-    rows = build_insert_values(builder.drain())
-    assert len(rows) == 1
-
-    _write_rows(engine, rows)
-    first = _read_candle(engine, symbol, rows[0][_INTERVAL], rows[0][_TS])
-
-    # Replay the IDENTICAL batch a second time.
-    _write_rows(engine, rows)
-    second = _read_candle(engine, symbol, rows[0][_INTERVAL], rows[0][_TS])
-
-    assert second == first, "replaying an identical batch must not change any stored field"
-    open_, high, low, close, volume, vwap, trade_count = second
-    assert volume == pytest.approx(150.0), "volume must reflect only the ORIGINAL 3 ticks, not 6"
-    assert trade_count == 3, "trade_count must reflect only the ORIGINAL 3 ticks, not 6"
-
-    import warnings
-    warnings.warn(
-        "MARKER_REALTIME_DUPLICATE_NOOP: test_duplicate_delivery_does_not_inflate_totals "
-        "executed against a real PostgreSQL and asserted an exact-duplicate replay left volume=150.0 trade_count=3 unchanged"
-    )
-
-
-def test_overlapping_yahoo_batches_do_not_double_count(realtime_candles_schema):
-    """yahoo.py re-polls the LATEST known 1-minute bar every 60s and can
-    report a contribution from the SAME underlying bar in two consecutive
-    polls -- including across a restart boundary (old process's last poll,
-    new process's first poll). Simulates that overlap directly: both
-    "old" and "new" partials here are built from ticks that summing would
-    double-count, and asserts the merge uses GREATEST (trusts whichever
-    side accumulated more), not SUM, for source="yahoo".
-    """
-    engine, symbol = realtime_candles_schema
-
-    # --- Old process's last poll: reports the bar as of 14:07:00, vol=200 ---
-    old_builder = CandleBuilder()
-    old_builder.ingest(
-        symbol, 50.0, 200,
-        datetime(2026, 9, 16, 14, 7, 0, tzinfo=timezone.utc),
-        "equity", "yahoo",
-    )
-    old_builder.flush_all()
-    old_rows = build_insert_values(old_builder.drain())
-
-    # --- New process's first poll: re-reports the SAME still-latest bar,
-    # now with more of it accumulated (vol=350), plus advances further. ---
-    new_builder = CandleBuilder()
-    new_builder.ingest(
-        symbol, 51.0, 350,
-        datetime(2026, 9, 16, 14, 7, 30, tzinfo=timezone.utc),
-        "equity", "yahoo",
-    )
-    new_builder.ingest(
-        symbol, 52.0, 400,
-        datetime(2026, 9, 16, 14, 8, 10, tzinfo=timezone.utc),
-        "equity", "yahoo",
-    )
-    # Crossing into 14:10:00 flushes the now-complete 14:05:00 candle.
-    new_builder.ingest(
-        symbol, 53.0, 10,
-        datetime(2026, 9, 16, 14, 10, 1, tzinfo=timezone.utc),
-        "equity", "yahoo",
-    )
-    new_rows = build_insert_values(new_builder.drain())
-    assert len(new_rows) == 1
-    # new_builder's own in-memory accumulation over its two 14:05-bucket
-    # ticks (350 + 400): high=52.0, low=51.0, close=52.0 (last tick in the
-    # bucket -- the 53.0/vol=10 tick belongs to the NEXT bucket, 14:10:00,
-    # and appears only to trigger this flush, not in these values).
-    assert new_rows[0][_VOLUME] == pytest.approx(750.0)
-    assert new_rows[0][_TRADE_COUNT] == 2
-
-    _write_rows(engine, old_rows)
-    _write_rows(engine, new_rows)
-
-    open_, high, low, close, volume, vwap, trade_count = _read_candle(
-        engine, symbol, old_rows[0][_INTERVAL], old_rows[0][_TS]
-    )
-
-    # GREATEST semantics: the new side's cumulative volume/trade_count
-    # (750/2, its own 2-tick CandleBuilder accumulation covering the
-    # overlapping bar) supersedes the old side's (200/1) because Yahoo's
-    # own bar had grown between polls -- NOT 200 + 750 = 950, which would
-    # double-count the shared bar underlying both partial observations.
-    assert volume == pytest.approx(750.0), "yahoo volume must be GREATEST of the two sides, not their SUM"
-    assert trade_count == 2, "yahoo trade_count must be GREATEST of the two sides, not their SUM"
-    assert close == pytest.approx(52.0), "close is last-write-wins -- new_rows was written second (EXCLUDED)"
-    assert high == pytest.approx(52.0)
-    assert low == pytest.approx(50.0)
-
-    import warnings
-    warnings.warn(
-        "MARKER_REALTIME_YAHOO_GREATEST: test_overlapping_yahoo_batches_do_not_double_count "
-        "executed against a real PostgreSQL and asserted volume=750.0 (GREATEST, not SUM=950.0)"
-    )
-
-
-def test_binance_close_follows_write_order_even_when_the_later_segment_has_fewer_trades(realtime_candles_schema):
-    """A later (chronologically, and written-second-to-the-DB) Binance
-    segment can have FEWER trades than the earlier one -- a quiet period
-    after a restart is ordinary, not exceptional. `close` must still pick
-    up the later segment's value. This is the regression test for the bug
-    in an earlier version of INSERT_SQL, which used `trade_count` as a
-    completeness/recency proxy for close-selection -- unsound, because
-    trade count reflects how busy a segment's time window was, not when it
-    occurred. That version would have wrongly kept the FIRST segment's
-    close here (3 >= 1), overriding the correct, later value.
-    """
-    engine, symbol = realtime_candles_schema
-
-    # --- Segment A: written FIRST, busier (3 trades) ---
-    busy_builder = CandleBuilder()
-    for minute, second, price in [(5, 3, 100.0), (6, 0, 101.0), (7, 0, 102.0)]:
-        busy_builder.ingest(
-            symbol, price, 10,
-            datetime(2026, 9, 16, 14, minute, second, tzinfo=timezone.utc),
-            "crypto", "binance",
-        )
-    busy_builder.flush_all()
-    busy_rows = build_insert_values(busy_builder.drain())
-    assert busy_rows[0][_TRADE_COUNT] == 3
-
-    # --- Segment B: written SECOND (chronologically later, restart
-    # continuation), but quiet -- only 1 trade before crossing into the
-    # next bucket triggers its own flush. ---
-    quiet_builder = CandleBuilder()
-    quiet_builder.ingest(
-        symbol, 999.0, 5,
-        datetime(2026, 9, 16, 14, 7, 50, tzinfo=timezone.utc),
-        "crypto", "binance",
-    )
-    quiet_builder.ingest(
-        symbol, 1.0, 1,
-        datetime(2026, 9, 16, 14, 10, 1, tzinfo=timezone.utc),
-        "crypto", "binance",
-    )
-    quiet_rows = build_insert_values(quiet_builder.drain())
-    assert len(quiet_rows) == 1
-    assert quiet_rows[0][_TRADE_COUNT] == 1
-
-    _write_rows(engine, busy_rows)
-    _write_rows(engine, quiet_rows)
-
-    open_, high, low, close, volume, vwap, trade_count = _read_candle(
-        engine, symbol, busy_rows[0][_INTERVAL], busy_rows[0][_TS]
-    )
-
-    assert close == pytest.approx(999.0), (
-        "close must be the later (written-second) segment's value even "
-        "though it has FEWER trades (1 < 3) -- trade_count must not block "
-        "the correct, later close"
-    )
-    assert volume == pytest.approx(35.0), "binance still sums: 30 (busy) + 5 (quiet)"
-    assert trade_count == 4, "binance still sums: 3 (busy) + 1 (quiet)"
-
-    import warnings
-    warnings.warn(
-        "MARKER_REALTIME_BINANCE_CLOSE_NOT_TRADE_COUNT: "
-        "test_binance_close_follows_write_order_even_when_the_later_segment_has_fewer_trades "
-        "executed against a real PostgreSQL and asserted close=999.0 despite trade_count 1 < 3"
-    )
-
-
-def test_binance_close_under_genuine_reverse_delivery_is_a_known_limitation(realtime_candles_schema):
-    """Documents, rather than hides, a real gap: INSERT_SQL has no
-    trade-level timestamp to check, so it cannot tell true chronological
-    order apart from DB write order. This test writes the TRUE-LATER
-    segment to the DB FIRST and the TRUE-EARLIER segment SECOND (the
-    reverse of the only ordering the restart mechanism actually produces --
-    see docs/TODO-REALTIME-CANDLE-CORRECTNESS.md for why this specific
-    reversal is not believed reachable via the current restart path, and
-    what would need to change to make it detectable if it ever were). Under
-    plain last-write-wins, the wrong (chronologically earlier) segment's
-    close survives. Asserting the actual, current behavior here (not the
-    behavior a fix should someday have) keeps this test honest: it fails
-    loudly, forcing an update, the day someone "fixes" close-selection with
-    another aggregate-only heuristic without actually capturing trade-level
-    identity/order -- exactly the mistake trade_count made.
-    """
-    engine, symbol = realtime_candles_schema
-
-    later_builder = CandleBuilder()
-    later_builder.ingest(
-        symbol, 999.0, 10,
-        datetime(2026, 9, 16, 14, 9, 0, tzinfo=timezone.utc),
-        "crypto", "binance",
-    )
-    later_builder.flush_all()
-    later_rows = build_insert_values(later_builder.drain())
-
-    earlier_builder = CandleBuilder()
-    earlier_builder.ingest(
-        symbol, 100.0, 10,
-        datetime(2026, 9, 16, 14, 6, 0, tzinfo=timezone.utc),
-        "crypto", "binance",
-    )
-    earlier_builder.flush_all()
-    earlier_rows = build_insert_values(earlier_builder.drain())
-
-    # Reversed: the chronologically LATER segment lands at the DB FIRST,
-    # the chronologically EARLIER segment lands SECOND.
-    _write_rows(engine, later_rows)
-    _write_rows(engine, earlier_rows)
-
-    open_, high, low, close, volume, vwap, trade_count = _read_candle(
-        engine, symbol, later_rows[0][_INTERVAL], later_rows[0][_TS]
-    )
-
-    assert close == pytest.approx(100.0), (
-        "KNOWN LIMITATION, asserted deliberately: under genuine reverse "
-        "delivery, last-write-wins picks up the chronologically EARLIER "
-        "segment's close (100.0), not the true latest (999.0). See "
-        "docs/TODO-REALTIME-CANDLE-CORRECTNESS.md -- fixing this requires "
-        "persisting real trade-level timestamps, not a smarter comparison "
-        "of the aggregates already being thrown away."
-    )
-
-    import warnings
-    warnings.warn(
-        "MARKER_REALTIME_BINANCE_REVERSE_DELIVERY_LIMITATION: "
-        "test_binance_close_under_genuine_reverse_delivery_is_a_known_limitation "
-        "executed against a real PostgreSQL and confirmed close=100.0 (wrong vs true-latest 999.0), a documented open gap"
-    )
-
-
-def test_yahoo_same_minute_revision_is_replaced_not_added_by_greatest(realtime_candles_schema):
-    """A same-minute revision (Yahoo re-polls minute06 and reports a larger,
-    more-complete volume for that SAME minute) should REPLACE the prior
-    partial report, not add to it. GREATEST handles this correctly by
-    construction: a growing revision of one minute naturally has more
-    volume than the earlier partial report of that same minute, so
-    GREATEST picks the revision -- the true total for the bucket is the
-    revision's own volume (200), not the sum of both reports (350).
-    """
-    engine, symbol = realtime_candles_schema
-
-    partial_builder = CandleBuilder()
-    partial_builder.ingest(
-        symbol, 50.0, 150,
-        datetime(2026, 9, 16, 14, 6, 0, tzinfo=timezone.utc),
-        "equity", "yahoo",
-    )
-    partial_builder.flush_all()
-    partial_rows = build_insert_values(partial_builder.drain())
-
-    # Same minute (14:06), later poll, more of it has now elapsed.
-    revised_builder = CandleBuilder()
-    revised_builder.ingest(
-        symbol, 51.0, 200,
-        datetime(2026, 9, 16, 14, 6, 45, tzinfo=timezone.utc),
-        "equity", "yahoo",
-    )
-    revised_builder.flush_all()
-    revised_rows = build_insert_values(revised_builder.drain())
-
-    _write_rows(engine, partial_rows)
-    _write_rows(engine, revised_rows)
-
-    open_, high, low, close, volume, vwap, trade_count = _read_candle(
-        engine, symbol, partial_rows[0][_INTERVAL], partial_rows[0][_TS]
-    )
-
-    assert volume == pytest.approx(200.0), (
-        "a same-minute revision must REPLACE (200), not add to (350), the "
-        "prior partial report of that same minute"
-    )
-
-    import warnings
-    warnings.warn(
-        "MARKER_REALTIME_YAHOO_REVISION_REPLACES: "
-        "test_yahoo_same_minute_revision_is_replaced_not_added_by_greatest "
-        "executed against a real PostgreSQL and asserted volume=200.0 (revision replaced, SUM=350.0 would have been wrong)"
-    )
-
-
-def test_yahoo_distinct_minutes_are_undercounted_by_greatest_a_known_limitation(realtime_candles_schema):
-    """Two GENUINELY DIFFERENT minutes within the same 5-minute bucket
-    should accumulate: minute05's volume and minute07's volume are both
-    real, non-overlapping contributions, and the true bucket total is
-    their sum. GREATEST cannot tell this apart from the same-minute-
-    revision case above (CandleState has no per-minute breakdown), so it
-    keeps only the larger side's own total and silently drops the other
-    side's genuinely distinct contribution. Documented here as a known,
-    accepted limitation (never inflates, but does not fully reconstruct
-    the bucket either) -- see docs/TODO-REALTIME-CANDLE-CORRECTNESS.md for
-    what fixing this for real (per-minute tracking) would require.
-    """
-    engine, symbol = realtime_candles_schema
-
-    minute05_builder = CandleBuilder()
-    minute05_builder.ingest(
-        symbol, 50.0, 100,
-        datetime(2026, 9, 16, 14, 5, 10, tzinfo=timezone.utc),
-        "equity", "yahoo",
-    )
-    minute05_builder.flush_all()
-    minute05_rows = build_insert_values(minute05_builder.drain())
-
-    # A genuinely different minute (07), not a revision of 05 -- e.g. the
-    # new process's first poll after a restart, which never saw minute05
-    # at all.
-    minute07_builder = CandleBuilder()
-    minute07_builder.ingest(
-        symbol, 53.0, 120,
-        datetime(2026, 9, 16, 14, 7, 10, tzinfo=timezone.utc),
-        "equity", "yahoo",
-    )
-    minute07_builder.flush_all()
-    minute07_rows = build_insert_values(minute07_builder.drain())
-
-    _write_rows(engine, minute05_rows)
-    _write_rows(engine, minute07_rows)
-
-    open_, high, low, close, volume, vwap, trade_count = _read_candle(
-        engine, symbol, minute05_rows[0][_INTERVAL], minute05_rows[0][_TS]
-    )
-
-    true_total = 100.0 + 120.0  # what distinct-minute accumulation SHOULD produce
-    assert volume == pytest.approx(120.0), (
-        "KNOWN LIMITATION, asserted deliberately: GREATEST(100, 120) = 120 "
-        f"under-counts the true total ({true_total}) by minute05's entire "
-        "100 -- it cannot distinguish 'a distinct minute that should "
-        "accumulate' from 'a revision that should replace'. See "
-        "docs/TODO-REALTIME-CANDLE-CORRECTNESS.md."
-    )
-    assert volume < true_total, "sanity check on the true_total arithmetic above"
-
-    import warnings
-    warnings.warn(
-        "MARKER_REALTIME_YAHOO_DISTINCT_MINUTE_UNDERCOUNT_LIMITATION: "
-        "test_yahoo_distinct_minutes_are_undercounted_by_greatest_a_known_limitation "
-        "executed against a real PostgreSQL and confirmed volume=120.0 vs true total=220.0, a documented open gap"
+        "MARKER_REALTIME_DO_NOTHING_TRUNCATION: "
+        "test_truncated_candle_blocks_a_later_complete_candle_for_the_same_bucket "
+        "executed against a real PostgreSQL and confirmed the truncated (trade_count=1) row "
+        "permanently blocked the complete (trade_count=4) one -- a known, pre-existing, unfixed risk"
     )
 
 

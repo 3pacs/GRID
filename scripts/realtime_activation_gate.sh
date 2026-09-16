@@ -6,37 +6,33 @@
 # grid-realtime's restart itself is cheap and well-understood (SIGTERM ->
 # graceful shutdown flush -> systemd restart, the same bounded event the
 # daemon already tolerates on every unplanned crash). The reason this gate
-# exists is narrower and different from the restart mechanics: the candle
-# merge SQL (INSERT_SQL, ingestion/realtime/flusher.py) that reconciles a
-# truncated pre-restart candle with the post-restart continuation has known,
-# accepted correctness gaps, traced and tested against a real Postgres in
-# tests/test_realtime_shutdown_semantics.py rather than merely asserted:
+# exists is narrower and different from the restart mechanics: this is the
+# FIRST TIME this daemon will ever be restarted by this pipeline (confirmed
+# 2026-09-16: its process had been running since 2026-07-29 with zero
+# restarts), and its EXISTING persistence semantics -- unchanged by this
+# deployment repair -- are `INSERT ... ON CONFLICT (symbol, interval, ts)
+# DO NOTHING` (ingestion/realtime/flusher.py). "Idempotent" (no duplicate or
+# corrupt row) is true of that; "the most complete candle wins" is NOT --
+# whichever row lands FIRST at a given bucket's primary key wins permanently,
+# and it is provably the truncated one, since the old process's shutdown
+# flush always completes (successfully or not) strictly before a new
+# process's candle for the same bucket even starts. Proven against a real
+# Postgres, not merely asserted, in
+# tests/test_realtime_shutdown_semantics.py::
+# test_truncated_candle_blocks_a_later_complete_candle_for_the_same_bucket.
 #
-#   - close is resolved by "last write wins" (whichever side's row lands at
-#     the DB second). That is correct for the only reachable production
-#     ordering (a restart's old-segment flush provably completes, or fails,
-#     strictly before the new process's first write is even possible) -- but
-#     Binance's parser never persists trade IDs or per-trade timestamps past
-#     aggregation (confirmed by reading feeds/binance.py and
-#     candle_builder.py, not assumed), so there is no way to verify true
-#     chronological order independent of write order, or to correctly
-#     resolve a genuinely out-of-order delivery if one ever occurred.
-#   - Yahoo's volume/trade_count merge uses GREATEST, which never inflates
-#     but also never reconstructs a bucket whose pre- and post-restart
-#     segments cover genuinely different, non-overlapping minutes -- it
-#     silently keeps only the larger of the two sides' own totals, not their
-#     true union.
-#
-# See docs/TODO-REALTIME-CANDLE-CORRECTNESS.md for the full analysis and the
-# larger change (capturing trade-level identity/order, or per-minute keys
-# for Yahoo) that would actually close these gaps. Until that lands, a
-# restart during active trading can produce one candle -- the bucket
-# straddling the restart, for the affected symbol(s) -- with an incorrect
-# close price or an under-reported volume/trade_count. That is a narrow,
-# bounded blast radius (one bucket per symbol per restart), not a reason to
-# never restart, but it is real and not yet fixed, so this requires the same
-# explicit human acknowledgment grid-scheduler's gate does, rather than
-# treating restart safety as fully established.
+# This repair does NOT change that persistence semantics -- a source-aware
+# merge was explored and then reverted out of the same PR after review found
+# real correctness gaps in it (see docs/TODO-REALTIME-CANDLE-CORRECTNESS.md
+# and docs/realtime_candle_merge_proposal_tests.py for that draft and what a
+# real fix requires). So this restart carries the SAME truncation risk any
+# unplanned crash-and-restart already carries today -- not a new risk this
+# PR introduces, but a real, bounded one (one bucket per symbol per restart)
+# that this PR does not resolve either. Combined with this being the first
+# ever automated restart of a daemon that has otherwise run untouched for
+# months, that calls for the same explicit human acknowledgment
+# grid-scheduler's gate requires, rather than treating restart as
+# risk-free just because Restart=always already makes crashes routine.
 #
 # Usage: realtime_activation_gate.sh <acknowledge_realtime_interruption>
 #   Exit 0 = proceed (acknowledgment given).
@@ -47,14 +43,14 @@ acknowledge="${1:-false}"
 
 if [ "$acknowledge" != "true" ]; then
   echo "REFUSED: activating grid-realtime requires acknowledge_realtime_interruption=true." >&2
-  echo "The candle merge across a restart has known, tested-but-unresolved correctness gaps" >&2
-  echo "(see docs/TODO-REALTIME-CANDLE-CORRECTNESS.md) -- close-selection and Yahoo volume" >&2
-  echo "reconstruction across the restart boundary are not proven correct in every case." >&2
-  echo "If you accept that the bucket straddling this restart may end up with an incorrect" >&2
-  echo "close or an under-reported volume/trade_count for the affected symbol(s), re-run with" >&2
-  echo "acknowledge_realtime_interruption=true." >&2
+  echo "grid-realtime's candle persistence is ON CONFLICT DO NOTHING (unchanged by this repair)" >&2
+  echo "-- whichever candle for a given bucket lands first wins permanently, and a restart" >&2
+  echo "always makes the OLD, truncated one land first (see docs/TODO-REALTIME-CANDLE-CORRECTNESS.md" >&2
+  echo "and tests/test_realtime_shutdown_semantics.py for the proof against real Postgres)." >&2
+  echo "If you accept that the bucket straddling this restart may end up with a truncated" >&2
+  echo "candle for the affected symbol(s), re-run with acknowledge_realtime_interruption=true." >&2
   exit 1
 fi
 
-echo "PROCEED: acknowledge_realtime_interruption=true -- restarting grid-realtime now, accepting the known candle-merge correctness gaps at the restart boundary."
+echo "PROCEED: acknowledge_realtime_interruption=true -- restarting grid-realtime now, accepting the known DO-NOTHING candle-truncation risk at the restart boundary."
 exit 0

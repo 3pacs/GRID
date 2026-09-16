@@ -92,28 +92,26 @@ async def main() -> None:
     #     other identity -- and if the next process (started fresh after
     #     this restart) later builds a *complete* candle for that same
     #     bucket, its own flush uses the identical (symbol, interval, ts)
-    #     key. INSERT_SQL (flusher.py) MERGES on that conflict -- but NOT
-    #     identically for every source, and NOT completely even within a
-    #     source. See INSERT_SQL's own comment for the full reasoning:
-    #     binance.py's trades are assumed (not independently verified --
-    #     no trade ID survives aggregation) genuinely non-overlapping and
-    #     safe to sum; yahoo.py re-polls the same "latest bar" and can
-    #     overlap with itself across the restart boundary, so it widens
-    #     high/low and takes GREATEST of volume/trade_count (never
-    #     inflates, but under-counts when the two sides cover genuinely
-    #     different minutes within the bucket -- no per-minute tracking
-    #     exists to tell that apart from a same-minute revision). `close`
-    #     is plain last-write-wins, correct for the one reachable
-    #     production ordering (old segment's flush always completes, or
-    #     fails, before the new process's first write) but not a general
-    #     solution to true reverse delivery, which would need trade-level
-    #     timestamps this code does not capture. See
-    #     docs/TODO-REALTIME-CANDLE-CORRECTNESS.md for what a real fix
-    #     would require and tests/test_realtime_shutdown_semantics.py for
-    #     all of this traced end-to-end against real Postgres, including
-    #     the two known-limitation cases tested (not silently assumed
-    #     away): Binance close-selection under genuine reverse delivery,
-    #     and Yahoo under-counting genuinely distinct minutes.
+    #     key. INSERT_SQL (flusher.py) is `ON CONFLICT DO NOTHING` -- the
+    #     SAME persistence semantics as main, unchanged by this repair.
+    #     "Idempotent" (no duplicate/corrupt row can result) is true of
+    #     this; "the most complete candle wins" is NOT -- whichever row
+    #     lands FIRST at that primary key wins permanently, and it is
+    #     provably the truncated one, since the old process's shutdown
+    #     flush always completes (successfully or not) strictly before a
+    #     new process's candle for the same bucket even starts. This is a
+    #     real, known, PRE-EXISTING risk this deployment repair does NOT
+    #     fix -- proven against real Postgres in
+    #     tests/test_realtime_shutdown_semantics.py::
+    #     test_truncated_candle_blocks_a_later_complete_candle_for_the_same_bucket.
+    #     A source-aware merge was explored and then reverted out of this
+    #     PR after review found real gaps in it (see
+    #     docs/TODO-REALTIME-CANDLE-CORRECTNESS.md and
+    #     docs/realtime_candle_merge_proposal_tests.py for that draft and
+    #     what a real fix requires) -- fixing this needs a schema-level
+    #     change (trade-level identity/order for Binance, per-minute
+    #     tracking for Yahoo), not another SQL rewrite alone, so it is
+    #     tracked as separate follow-up work rather than attempted here.
     #   - The actual DB write below CAN fail (unreachable DB, exhausted
     #     slots outright, a query timeout) or simply run out of time. On
     #     either, the exception/timeout is caught and logged, and the

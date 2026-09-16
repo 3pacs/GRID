@@ -3,11 +3,13 @@
 This gate is what .github/workflows/deploy.yml consults before restarting
 grid-realtime, now that activation is opt-in (see
 tests/test_deploy_restarts_realtime.py for the workflow-shape guards, and
-docs/TODO-REALTIME-CANDLE-CORRECTNESS.md for why: the candle merge across a
-restart has tested, known-unresolved correctness gaps in close-selection and
-Yahoo volume reconstruction). The gate does not claim to have verified
-anything about those gaps being safe -- it only checks for an explicit human
-acknowledgment of the risk, the same shape as
+docs/TODO-REALTIME-CANDLE-CORRECTNESS.md for why: grid-realtime's candle
+persistence is `ON CONFLICT DO NOTHING`, unchanged by this deployment
+repair, so a restart during active trading can permanently truncate the
+candle for the bucket it lands in -- a real, pre-existing, tested risk, not
+something this repair introduces or fixes). The gate does not claim to have
+verified anything about that risk being safe -- it only checks for an
+explicit human acknowledgment, the same shape as
 scripts/scheduler_activation_gate.sh.
 """
 
@@ -57,13 +59,13 @@ class TestRealtimeActivationGate:
         assert result.returncode == 1
 
     def test_refusal_message_names_the_actual_known_gap(self):
-        # This gate exists for a specific, traced reason (candle merge
-        # correctness across a restart) -- not a generic "restarts are
+        # This gate exists for a specific, traced reason (DO-NOTHING candle
+        # truncation across a restart) -- not a generic "restarts are
         # scary" disclaimer. The refusal should say so, not just refuse.
         result = _run("false")
         combined = (result.stdout + result.stderr).lower()
         assert "candle" in combined
-        assert "close" in combined or "volume" in combined
+        assert "truncat" in combined or "do nothing" in combined
 
     def test_does_not_error_under_set_euo_pipefail_with_no_args(self):
         # The script itself runs under `set -euo pipefail`; `${1:-false}`
