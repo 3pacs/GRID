@@ -437,33 +437,54 @@ jobs:
             if [ -f "$f" ]; then set -a; . "$f"; set +a; break; fi
           done
           cd "$DEPLOY_PATH"
+          # restart_ts is captured by the PREVIOUS step ("Verify grid-realtime
+          # runs the deployed tree") as its very first action -- which only
+          # starts running after THIS step's own "Restart grid-realtime"
+          # (systemctl restart, a blocking call covering both the stop-with-
+          # shutdown-flush and the start) has already returned. So restart_ts
+          # unambiguously post-dates the old process's entire shutdown
+          # sequence, including its own final candle flush -- a row whose
+          # created_at is after restart_ts could not have been written by the
+          # dying old process, only by the new one.
+          #
+          # Deliberately NOT also matching on a ts time-window (an earlier
+          # version of this check did, to catch the one candle merge-UPDATEd
+          # rather than freshly INSERTed at the restart boundary -- but
+          # ts >= some-window is a timestamp-window match, not proof of new
+          # ingestion: it can equally match a row the OLD process's shutdown
+          # flush wrote for that same bucket, which is exactly the ambiguity
+          # this check exists to resolve, not reproduce). created_at is set
+          # only by the initial INSERT (see INSERT_SQL in flusher.py -- the
+          # ON CONFLICT DO UPDATE branch never touches it), so this check has
+          # a known, honestly-scoped limitation: it proves fresh INSERTs, and
+          # will not see a bucket whose ONLY post-restart activity was a
+          # merge-UPDATE with no other fresh row from that source in the
+          # window. Given the periodic flusher runs across many buckets at
+          # once, a genuinely working feed will produce at least one fresh
+          # INSERT (a new bucket rolling over) well within the 4-minute
+          # window below whenever it's actually delivering data -- so this
+          # remaining gap is narrow, and it's a false-negative risk (under-
+          # reporting freshness), never a false-positive one (it can't claim
+          # freshness that didn't happen, since created_at is only ever set
+          # by a real INSERT).
           restart_ts="$(cat "$RUNNER_TEMP/grid-realtime-restart-ts")"
           restart_iso="$(date -u -d "@${restart_ts}" +%Y-%m-%dT%H:%M:%SZ)"
-          # Floor to the 5-minute candle interval: the restart-adjacent
-          # candle for a bucket already in progress at restart time is
-          # written via ON CONFLICT DO UPDATE (a merge, see INSERT_SQL in
-          # flusher.py), which does NOT touch created_at -- only the
-          # original INSERT set that. Checking created_at alone would miss
-          # exactly that row, so this also checks ts against the
-          # restart-time bucket floor directly.
-          restart_bucket_epoch=$(( (restart_ts / 300) * 300 ))
-          restart_bucket_iso="$(date -u -d "@${restart_bucket_epoch}" +%Y-%m-%dT%H:%M:%SZ)"
           probe_out="$RUNNER_TEMP/grid-realtime-freshness-probe.txt"
           set +e
-          timeout 240 python3 - "$restart_iso" "$restart_bucket_iso" > "$probe_out" <<'PYEOF'
+          timeout 240 python3 - "$restart_iso" > "$probe_out" <<'PYEOF'
           import sys
           from db import get_engine
           from sqlalchemy import text
 
-          restart_iso, restart_bucket_iso = sys.argv[1], sys.argv[2]
+          restart_iso = sys.argv[1]
           engine = get_engine()
           with engine.connect() as conn:
               rows = conn.execute(text("""
                   SELECT source, count(*), max(ts), max(created_at)
                   FROM realtime_candles
-                  WHERE created_at > :restart_ts OR ts >= :restart_bucket
+                  WHERE created_at > :restart_ts
                   GROUP BY source
-              """), {"restart_ts": restart_iso, "restart_bucket": restart_bucket_iso}).fetchall()
+              """), {"restart_ts": restart_iso}).fetchall()
           sources = {r[0]: (r[1], r[2], r[3]) for r in rows}
 
           # SEEN/UNVERIFIED per source, printed as parseable lines -- bash
@@ -475,7 +496,7 @@ jobs:
                   n, latest_ts, latest_created = sources[src]
                   print(f"SEEN {src} count={n} latest_candle_ts={latest_ts} latest_row_created_at={latest_created}")
               else:
-                  print(f"UNVERIFIED {src} -- no row with created_at after restart or ts in the restart-adjacent bucket")
+                  print(f"UNVERIFIED {src} -- no row with created_at strictly after restart_ts ({restart_iso})")
           PYEOF
           probe_rc=$?
           set -e

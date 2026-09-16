@@ -26,30 +26,67 @@ MAX_BUFFER_CYCLES = 12  # 1 hour of candles before dropping oldest
 MAX_CONSECUTIVE_FAILURES = 3
 
 # On conflict, MERGE the two partial candles rather than discard the new
-# one. Restart interruption is the only realistic way this conflict fires
-# (see candle_builder.py: CandleBuilder never re-creates a candle for a
-# bucket it has already flushed within one process's lifetime) -- and
-# because a shutdown's final flush always completes before the next
-# process's first tick, the row ALREADY in the table is always the
-# chronologically EARLIER partial candle, and EXCLUDED (the incoming row)
-# is always the LATER one. That ordering is what makes this algebra safe:
-#   - open: untouched (omitted from SET) -- the existing row's open is
-#     always the true interval open, since it was there from the first tick.
-#   - high/low: GREATEST/LEAST -- commutative, correct regardless of order.
-#   - close: EXCLUDED.close -- the incoming row is always later, so its
-#     close is the more recent price. NOT commutative -- this is the one
-#     field that depends on the ordering guarantee above.
-#   - volume, trade_count: summed -- each partial candle counts genuinely
-#     different ticks (before vs. after the restart), so this reconstructs
-#     the true total rather than picking one side.
-#   - vwap: recomputed from the two partials' own (vwap, volume) pairs --
-#     the table stores only the reduced ratio, not vwap_numerator/
-#     vwap_denominator separately, but numerator = vwap * volume, so the
-#     combined weighted average is recoverable from what's already stored.
-#     COALESCEs to 0 contribution when a partial had zero volume (vwap NULL
-#     in that case, per CandleState.vwap).
+# one -- but the correct merge depends on what the source actually delivers,
+# and is NOT the same for every source. Traced against the real feed code
+# (ingestion/realtime/feeds/binance.py, feeds/yahoo.py):
+#
+#   - binance.py: each WebSocket message is one individually-executed trade
+#     (Binance's own @trade stream semantics -- data["q"] is that ONE
+#     trade's own quantity, data["T"] its own execution time; reconnecting
+#     never replays a trade already delivered, it only resumes from "now").
+#     Two partial candles from the same bucket, split by a restart, cover
+#     genuinely DIFFERENT, non-overlapping sets of trades. Summing
+#     volume/trade_count reconstructs the true total -- this is the
+#     "incremental observations" case.
+#
+#   - yahoo.py: each poll re-downloads the LATEST known 1-minute bar
+#     (`yf.download(..., interval="1m")`, then `.iloc[-1]`) and re-ingests
+#     it as a "tick" timestamped at POLL time, not the bar's own time. If
+#     Yahoo's data hasn't advanced between two polls (its own refresh
+#     lag is often >60s), or if the old process's last poll and the new
+#     process's first poll both land within the same still-"latest" bar's
+#     window, BOTH partial candles can include a contribution from the
+#     SAME underlying bar. This is the "complete snapshot" case: summing
+#     volume/trade_count here can double-count that one shared bar. (This
+#     poll-vs-bar mismatch is a pre-existing property of yahoo.py's design,
+#     not introduced here -- it can already inflate a single process's own
+#     candle across two consecutive polls, independent of any restart. Not
+#     addressed here: this SQL is about not making the restart-merge case
+#     WORSE than what a single process already does, not rearchitecting
+#     yahoo.py's poll-to-tick mapping, which is a separate, larger change.)
+#
+# So: additive (SUM) for source='binance', non-additive (GREATEST -- trust
+# whichever side has accumulated more, never both) for every other source.
+# GREATEST/LEAST are safe unconditionally because they're idempotent under
+# duplication (max of two equal numbers is that same number, no inflation
+# risk) -- only a true SUM can inflate, so only the binance branch needs the
+# stronger "these are genuinely disjoint" guarantee.
+#
+# Two more properties, independent of source:
+#
+#   1. Exact-duplicate resubmission (the SAME batch replayed -- e.g. if
+#      flusher.py's own retry-on-ambiguous-failure path resends a buffer
+#      whose previous write actually succeeded server-side) must be a true
+#      no-op, not a second SUM. Guarded explicitly below: when incoming
+#      open/close/volume/trade_count all match what's already stored, every
+#      field is left unchanged, regardless of source.
+#
+#   2. "Which side is later" for `close` is decided by trade_count (more
+#      accumulated observations = more complete = more likely to include
+#      the true latest tick), NOT by which row happens to be EXCLUDED. In
+#      the realistic case (systemd `restart` = stop-then-start, strictly
+#      sequential) the existing row is always older and EXCLUDED always has
+#      more, so this agrees with "trust EXCLUDED" anyway -- but unlike that
+#      simpler rule, this one is also correct if a write is ever reordered
+#      or replayed out of sequence: a less-complete row can never overwrite
+#      a more-complete row's close. On an exact trade_count tie, prefers
+#      the incoming row (a reasonable default when completeness alone can't
+#      decide).
+#
 # See tests/test_realtime_shutdown_semantics.py for the traced,
-# live-database-verified regression covering this exact scenario.
+# live-database-verified regressions covering all of this: the disjoint
+# pre-/post-restart case, exact-duplicate replay, overlapping (Yahoo-style)
+# batches, and reverse arrival order.
 INSERT_SQL = """
     INSERT INTO realtime_candles
         (symbol, asset_class, interval, ts, open, high, low, close, volume, vwap, trade_count, source)
@@ -57,16 +94,51 @@ INSERT_SQL = """
     ON CONFLICT (symbol, interval, ts) DO UPDATE SET
         high = GREATEST(realtime_candles.high, EXCLUDED.high),
         low = LEAST(realtime_candles.low, EXCLUDED.low),
-        close = EXCLUDED.close,
-        volume = realtime_candles.volume + EXCLUDED.volume,
-        vwap = CASE
-            WHEN (realtime_candles.volume + EXCLUDED.volume) > 0 THEN
-                (COALESCE(realtime_candles.vwap, 0) * realtime_candles.volume
-                 + COALESCE(EXCLUDED.vwap, 0) * EXCLUDED.volume)
-                / (realtime_candles.volume + EXCLUDED.volume)
-            ELSE NULL
+        close = CASE
+            WHEN realtime_candles.open = EXCLUDED.open
+                 AND realtime_candles.close = EXCLUDED.close
+                 AND realtime_candles.volume = EXCLUDED.volume
+                 AND realtime_candles.trade_count = EXCLUDED.trade_count
+                THEN realtime_candles.close  -- exact duplicate: no-op
+            WHEN EXCLUDED.trade_count >= realtime_candles.trade_count THEN EXCLUDED.close
+            ELSE realtime_candles.close
         END,
-        trade_count = realtime_candles.trade_count + EXCLUDED.trade_count
+        volume = CASE
+            WHEN realtime_candles.open = EXCLUDED.open
+                 AND realtime_candles.close = EXCLUDED.close
+                 AND realtime_candles.volume = EXCLUDED.volume
+                 AND realtime_candles.trade_count = EXCLUDED.trade_count
+                THEN realtime_candles.volume  -- exact duplicate: no-op
+            WHEN realtime_candles.source = 'binance' THEN realtime_candles.volume + EXCLUDED.volume
+            ELSE GREATEST(realtime_candles.volume, EXCLUDED.volume)
+        END,
+        trade_count = CASE
+            WHEN realtime_candles.open = EXCLUDED.open
+                 AND realtime_candles.close = EXCLUDED.close
+                 AND realtime_candles.volume = EXCLUDED.volume
+                 AND realtime_candles.trade_count = EXCLUDED.trade_count
+                THEN realtime_candles.trade_count  -- exact duplicate: no-op
+            WHEN realtime_candles.source = 'binance' THEN realtime_candles.trade_count + EXCLUDED.trade_count
+            ELSE GREATEST(realtime_candles.trade_count, EXCLUDED.trade_count)
+        END,
+        vwap = CASE
+            WHEN realtime_candles.open = EXCLUDED.open
+                 AND realtime_candles.close = EXCLUDED.close
+                 AND realtime_candles.volume = EXCLUDED.volume
+                 AND realtime_candles.trade_count = EXCLUDED.trade_count
+                THEN realtime_candles.vwap  -- exact duplicate: no-op
+            WHEN realtime_candles.source = 'binance' THEN
+                -- vwap_numerator = vwap * volume (the table stores only the
+                -- reduced ratio, not the numerator/denominator separately,
+                -- but this recovers it from what IS stored).
+                CASE WHEN (realtime_candles.volume + EXCLUDED.volume) > 0 THEN
+                    (COALESCE(realtime_candles.vwap, 0) * realtime_candles.volume
+                     + COALESCE(EXCLUDED.vwap, 0) * EXCLUDED.volume)
+                    / (realtime_candles.volume + EXCLUDED.volume)
+                ELSE NULL END
+            WHEN EXCLUDED.trade_count >= realtime_candles.trade_count THEN EXCLUDED.vwap
+            ELSE realtime_candles.vwap
+        END
 """
 
 

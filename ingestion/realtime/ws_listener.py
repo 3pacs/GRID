@@ -92,16 +92,22 @@ async def main() -> None:
     #     other identity -- and if the next process (started fresh after
     #     this restart) later builds a *complete* candle for that same
     #     bucket, its own flush uses the identical (symbol, interval, ts)
-    #     key. INSERT_SQL (flusher.py) MERGES on that conflict rather than
-    #     discarding either side -- high/low widen, volume/trade_count sum,
-    #     vwap is recomputed from both partials, close takes the later
-    #     (this row's) value, open stays whichever was there first (always
-    #     the truncated candle's, since it's always written first). So the
-    #     final persisted candle reconstructs the true full interval instead
-    #     of permanently keeping whichever side happened to write first.
+    #     key. INSERT_SQL (flusher.py) MERGES on that conflict -- but NOT
+    #     identically for every source. See INSERT_SQL's own comment for the
+    #     full reasoning (binance.py's trades are genuinely non-overlapping
+    #     and safe to sum; yahoo.py re-polls the same "latest bar" and can
+    #     overlap with itself across the restart boundary, so it widens
+    #     high/low but does not sum volume/trade_count), plus the
+    #     exact-duplicate-replay no-op guard and the trade_count-based
+    #     (not arrival-order-based) rule for which side's close wins. So the
+    #     final persisted candle reconstructs as much of the true interval
+    #     as the source's own delivery guarantees allow, without ever
+    #     inflating totals on a replay or letting a less-complete write
+    #     clobber a more-complete one's close.
     #     See tests/test_realtime_shutdown_semantics.py for this traced
-    #     end-to-end against the real INSERT, verified against a live
-    #     Postgres in CI.
+    #     end-to-end against real Postgres: the disjoint pre-/post-restart
+    #     case, exact-duplicate replay, overlapping (Yahoo-style) batches,
+    #     and reverse arrival order.
     #   - The actual DB write below CAN fail (unreachable DB, exhausted
     #     slots outright, a query timeout) or simply run out of time. On
     #     either, the exception/timeout is caught and logged, and the
