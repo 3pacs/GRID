@@ -295,3 +295,32 @@ def test_guard_fails_against_the_pre_fix_workflow():
 
     # Both halves were missing, which is exactly the shipped-but-inert bug.
     assert len(failures) == 2, f"expected both guards to fail on the old file, got: {failures}"
+
+
+@pytest.mark.unit
+def test_freshness_probe_delegates_to_the_extracted_bounded_script():
+    """The freshness probe's `WHERE created_at > :restart_ts` has no index
+    to use on its own (realtime_candles has no index on created_at) and
+    forces a full sequential scan -- confirmed in production to exceed
+    Postgres's statement_timeout against the real 2M+-row table (only ever
+    exercised against small CI tables before that). The actual query
+    (bounded by `ts` as well, using the existing idx_rt_candles_ts index --
+    validated via EXPLAIN ANALYZE directly against production: Parallel
+    Seq Scan, cost ~39911 -> Index Scan, <1ms, no new index/settings
+    change) now lives in scripts/realtime_freshness_probe.py, exercised
+    directly by tests/test_realtime_freshness_probe.py (including boundary
+    tests -- the ts bound is a performance fix, NOT proven equivalent to
+    an unbounded scan in every case, see that script's own docstring).
+    This guards only that the workflow step still calls it, not the SQL
+    itself.
+    """
+    step = _step_named(_deploy_steps(), "verify grid-realtime is delivering fresh data")
+    assert step is not None, "deploy.yml does not verify grid-realtime data freshness"
+
+    run = step.get("run", "")
+    assert "scripts/realtime_freshness_probe.py" in run, (
+        "the freshness-check step no longer calls the extracted, "
+        "boundary-tested probe script -- if the query was inlined back "
+        "into the workflow, the ts bound (and its own test coverage) may "
+        "have been lost too"
+    )
