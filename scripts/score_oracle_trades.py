@@ -53,8 +53,21 @@ def fetch_prices(tickers: list[str], start: str, end: str) -> dict[str, pd.DataF
 
     log.info("Fetching prices for {} tickers from {} to {}...", len(tickers), start, end)
 
+    # auto_adjust=False is load-bearing, not cosmetic. Most rows scored by this
+    # script never touch Step 2's backfill below — their entry_price was set at
+    # prediction time by oracle/engine.py's _get_spot_price(), which reads the
+    # raw, unadjusted options_daily_signals.spot_price. yfinance flipped
+    # yf.download()'s default to True in 0.2.x, which silently back-adjusts
+    # Close for dividends/splits. Scoring that raw entry_price against a
+    # back-adjusted `actual` close here would manufacture a return equal to
+    # the cumulative adjustment factor between entry and expiry — the same
+    # mixed-basis bug PR #503 fixed in intelligence/trust_scorer.py.
+    #
     # Batch download
-    data = yf.download(yf_symbols, start=start, end=end, group_by="ticker", progress=False)
+    data = yf.download(
+        yf_symbols, start=start, end=end, group_by="ticker", progress=False,
+        auto_adjust=False,
+    )
 
     prices = {}  # ticker -> {date -> close_price}
 
