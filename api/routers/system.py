@@ -8,6 +8,7 @@ import time
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends
+from fastapi.routing import iter_route_contexts
 from loguru import logger as log
 from sqlalchemy import text
 
@@ -1430,9 +1431,18 @@ def _list_view_files() -> list[str]:
 
 
 def _count_routes(app_instance) -> int:
-    """Count all registered API routes."""
+    """Count all registered API routes.
+
+    FastAPI >=0.137 includes sub-routers lazily: `include_router()` appends a
+    single opaque `_IncludedRouter` to `.routes` instead of flattening the
+    child's routes into the parent. Iterating `app.routes` directly therefore
+    only sees the app's own routes — on GRID that under-counts by an order of
+    magnitude, because every facade router (intelligence, canvas, watchlist,
+    astrogrid) hides its whole surface behind one entry. `iter_route_contexts`
+    walks through those and yields fully-resolved paths/methods.
+    """
     try:
-        return len([r for r in app_instance.routes if hasattr(r, "methods")])
+        return len([c for c in iter_route_contexts(app_instance.routes) if c.methods])
     except Exception as exc:
         log.debug("System: route count failed: {e}", e=str(exc))
         return 0
