@@ -69,6 +69,17 @@ async def _run_final_flush(builder: CandleBuilder) -> str:
     candles were NOT written. Read the marker's outcome value together
     with whichever branch's own log line fired, never as a standalone
     success signal on its own.
+
+    outcome="written" is itself a narrower claim than it sounds: it means
+    the INSERT statement executed and its transaction committed (see
+    db.get_connection()'s commit-on-clean-exit contract) -- it does NOT
+    mean all (or any) of the N drained candles became new rows. INSERT_SQL
+    (flusher.py) is `ON CONFLICT (symbol, interval, ts) DO NOTHING`, with
+    no RETURNING clause, so a commit that silently inserts zero rows --
+    every one of the N keys already present, e.g. the periodic flusher won
+    the same bucket first -- is indistinguishable here from one that
+    inserted all N. "written" answers "did the write phase fail," not
+    "how many candles landed."
     """
     log.info("Flushing {n} remaining candles...", n=builder.active_symbols)
     builder.flush_all()
@@ -81,7 +92,12 @@ async def _run_final_flush(builder: CandleBuilder) -> str:
                 bounded_write(_write_final_flush_sync, rows),
                 timeout=FINAL_FLUSH_TIMEOUT_SECONDS,
             )
-            log.info("Final flush: {n} candles written", n=len(rows))
+            log.info(
+                "Final flush: write of {n} candle(s) committed -- ON CONFLICT "
+                "DO NOTHING means some or all may have been pre-existing keys, "
+                "not new rows",
+                n=len(rows),
+            )
             outcome = "written"
         except asyncio.TimeoutError:
             log.error(
@@ -99,7 +115,9 @@ async def _run_final_flush(builder: CandleBuilder) -> str:
     log.info(
         "Final flush phase reached its end (outcome={outcome}) -- proves "
         "the phase ran, NOT that data was persisted; only outcome=written "
-        "confirms a committed write",
+        "confirms the write transaction committed, which is still not the "
+        "same as confirming new rows were inserted (ON CONFLICT DO NOTHING "
+        "can commit while inserting zero)",
         outcome=outcome,
     )
     return outcome
