@@ -29,7 +29,7 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-DB_URL = "postgresql://grid:gridmaster2026@localhost:5432/griddb"
+from config import settings
 
 # Ticker → yfinance symbol mapping
 YF_MAP = {
@@ -354,7 +354,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
-    engine = create_engine(DB_URL)
+    engine = create_engine(settings.DB_URL)
 
     with engine.begin() as conn:
         # ── Step 0: Get all pending predictions ──
