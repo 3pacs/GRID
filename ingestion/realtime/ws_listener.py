@@ -45,6 +45,84 @@ def _write_final_flush_sync(rows: list[tuple]) -> None:
             execute_batch(cur, INSERT_SQL, rows, page_size=500)
 
 
+async def _run_final_flush(builder: CandleBuilder) -> str:
+    """Drain and write whatever candles are still in progress at shutdown.
+
+    Returns the outcome ("written", "timed_out", "failed", or
+    "nothing_to_flush") and, regardless of outcome, logs an unconditional
+    marker line proving this PHASE reached its end.
+
+    That marker answers one specific, narrow question this file's incident
+    history (docs/INCIDENT-2026-09-16-realtime-shutdown-sigkill.md) found
+    could not otherwise be answered after the fact: whether a SIGKILL
+    landed before or during this phase. Its presence in the journal proves
+    execution reached this point; its absence before a kill proves the
+    kill landed mid-flush (blocked in the DB write or earlier).
+
+    It does NOT prove data was persisted. Reaching the marker after
+    catching a timeout or exception is exactly as certain to log as
+    reaching it after a clean write -- "the phase ran to completion" and
+    "the write committed" are different claims. Only outcome="written"
+    means a commit actually happened; "timed_out" and "failed" mean the
+    phase completed *by catching an error*, one already logged at
+    log.error level, immediately above, stating explicitly that the
+    candles were NOT written. Read the marker's outcome value together
+    with whichever branch's own log line fired, never as a standalone
+    success signal on its own.
+
+    outcome="written" is itself a narrower claim than it sounds: it means
+    the INSERT statement executed and its transaction committed (see
+    db.get_connection()'s commit-on-clean-exit contract) -- it does NOT
+    mean all (or any) of the N drained candles became new rows. INSERT_SQL
+    (flusher.py) is `ON CONFLICT (symbol, interval, ts) DO NOTHING`, with
+    no RETURNING clause, so a commit that silently inserts zero rows --
+    every one of the N keys already present, e.g. the periodic flusher won
+    the same bucket first -- is indistinguishable here from one that
+    inserted all N. "written" answers "did the write phase fail," not
+    "how many candles landed."
+    """
+    log.info("Flushing {n} remaining candles...", n=builder.active_symbols)
+    builder.flush_all()
+    drained = builder.drain()
+    outcome = "nothing_to_flush"
+    if drained:
+        rows = build_insert_values(drained)
+        try:
+            await asyncio.wait_for(
+                bounded_write(_write_final_flush_sync, rows),
+                timeout=FINAL_FLUSH_TIMEOUT_SECONDS,
+            )
+            log.info(
+                "Final flush: write of {n} candle(s) committed -- ON CONFLICT "
+                "DO NOTHING means some or all may have been pre-existing keys, "
+                "not new rows",
+                n=len(rows),
+            )
+            outcome = "written"
+        except asyncio.TimeoutError:
+            log.error(
+                "Final flush timed out after {s}s -- {n} candles NOT written, not retried",
+                s=FINAL_FLUSH_TIMEOUT_SECONDS, n=len(rows),
+            )
+            outcome = "timed_out"
+        except Exception as exc:
+            log.error(
+                "Final flush failed: {err} -- {n} candles NOT written, not retried",
+                err=str(exc), n=len(rows),
+            )
+            outcome = "failed"
+
+    log.info(
+        "Final flush phase reached its end (outcome={outcome}) -- proves "
+        "the phase ran, NOT that data was persisted; only outcome=written "
+        "confirms the write transaction committed, which is still not the "
+        "same as confirming new rows were inserted (ON CONFLICT DO NOTHING "
+        "can commit while inserting zero)",
+        outcome=outcome,
+    )
+    return outcome
+
+
 async def main() -> None:
     """Launch all feeds and the flusher, handle graceful shutdown."""
     builder = CandleBuilder()
@@ -128,27 +206,13 @@ async def main() -> None:
     #     NOT block asyncio.gather() or the code after it; cancellation is
     #     delivered promptly regardless of how long the underlying thread
     #     keeps running in the background.
-    log.info("Flushing {n} remaining candles...", n=builder.active_symbols)
-    builder.flush_all()
-    drained = builder.drain()
-    if drained:
-        rows = build_insert_values(drained)
-        try:
-            await asyncio.wait_for(
-                bounded_write(_write_final_flush_sync, rows),
-                timeout=FINAL_FLUSH_TIMEOUT_SECONDS,
-            )
-            log.info("Final flush: {n} candles written", n=len(rows))
-        except asyncio.TimeoutError:
-            log.error(
-                "Final flush timed out after {s}s -- {n} candles NOT written, not retried",
-                s=FINAL_FLUSH_TIMEOUT_SECONDS, n=len(rows),
-            )
-        except Exception as exc:
-            log.error(
-                "Final flush failed: {err} -- {n} candles NOT written, not retried",
-                err=str(exc), n=len(rows),
-            )
+    #   - This phase's own completion is independently provable after the
+    #     fact (see _run_final_flush's docstring for exactly what its
+    #     marker log line does and does not prove) -- added after the
+    #     2026-09-16 incident where a SIGKILL landed during this restart's
+    #     shutdown with no log evidence either way of whether the flush had
+    #     completed (docs/INCIDENT-2026-09-16-realtime-shutdown-sigkill.md).
+    await _run_final_flush(builder)
 
     log.info("GRID Realtime Listener shut down cleanly")
 
