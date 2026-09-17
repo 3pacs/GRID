@@ -61,7 +61,7 @@ def _patch_engine(monkeypatch, routes: dict[str, _FakeResult]):
     )
 
 
-def _patch_send_sync(monkeypatch, returns: bool = True):
+def _patch_send_sync(monkeypatch, returns: str = "sent"):
     calls = []
 
     def _fake(*a, **k):
@@ -92,26 +92,44 @@ def test_dry_run_never_calls_send(monkeypatch) -> None:
 
 def test_live_send_confirmed_sets_sent_true(monkeypatch) -> None:
     _patch_engine(monkeypatch, routes=_QUIET_ROUTES)
-    calls = _patch_send_sync(monkeypatch, returns=True)
+    calls = _patch_send_sync(monkeypatch, returns="sent")
 
     result = email_mod.daily_digest(dry_run=False)
 
     assert calls  # _send_sync was actually invoked
+    assert result["send_status"] == "sent"
     assert result["sent"] is True
     assert "error" not in result
 
 
-def test_live_send_unconfirmed_sets_sent_false_not_true(monkeypatch) -> None:
+def test_live_send_failed_sets_sent_false(monkeypatch) -> None:
     """This is the exact bug the reviewer flagged: the previous version
     called the fire-and-forget _send() and then set sent=True
     unconditionally, before SMTP had even attempted anything. daily_digest
     must only report sent=True once _send_sync has actually confirmed it.
     """
     _patch_engine(monkeypatch, routes=_QUIET_ROUTES)
-    _patch_send_sync(monkeypatch, returns=False)
+    _patch_send_sync(monkeypatch, returns="failed")
 
     result = email_mod.daily_digest(dry_run=False)
 
+    assert result["send_status"] == "failed"
+    assert result["sent"] is False
+    assert "error" in result
+
+
+def test_live_send_uncertain_is_not_reported_as_sent(monkeypatch) -> None:
+    """An ambiguous SMTP outcome (connection lost mid-transmission) must
+    never be collapsed into either "sent" or a plain "failed" — the
+    scheduler treats "uncertain" differently from a clean failure (it
+    does not auto-retry), and that distinction has to survive here.
+    """
+    _patch_engine(monkeypatch, routes=_QUIET_ROUTES)
+    _patch_send_sync(monkeypatch, returns="uncertain")
+
+    result = email_mod.daily_digest(dry_run=False)
+
+    assert result["send_status"] == "uncertain"
     assert result["sent"] is False
     assert "error" in result
 

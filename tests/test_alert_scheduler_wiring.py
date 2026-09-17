@@ -54,6 +54,34 @@ class _FakeEngine:
         return self.conn
 
 
+class _FakeStateStore:
+    """In-memory stand-in for the alert_state row, used in place of
+    _read_state/_write_state so tests can drive realistic sequences
+    (including a write failing on a specific call) without a real DB.
+    """
+
+    def __init__(self):
+        self.state: dict | None = None
+        self.write_calls: list[tuple] = []
+        self.fail_write_on_call: int | None = None
+
+    def read(self, engine):
+        return self.state
+
+    def write(self, engine, at, status):
+        self.write_calls.append((at, status))
+        if self.fail_write_on_call == len(self.write_calls):
+            raise RuntimeError("simulated persistence failure")
+        self.state = {"seen_at": at, "status": status}
+
+
+def _digest(status: str, error: str | None = None):
+    result = {"send_status": status, "sent": status == "sent"}
+    if error:
+        result["error"] = error
+    return result
+
+
 def _in_window(minute: int = 30) -> datetime:
     return datetime(2026, 9, 17, scheduler._DIGEST_HOUR_UTC, minute, tzinfo=timezone.utc)
 
@@ -67,42 +95,124 @@ def test_outside_the_digest_hour_never_touches_the_engine() -> None:
     assert engine.conn.lock_calls == 0
 
 
-def test_claims_lock_then_sends_then_records_on_confirmed_success(monkeypatch) -> None:
+def test_confirmed_send_writes_uncertain_then_sent(monkeypatch) -> None:
     engine = _FakeEngine(lock_available=True)
-    monkeypatch.setattr(scheduler, "_latest_sent_at", lambda engine: None)
-    recorded = []
-    monkeypatch.setattr(scheduler, "_record_sent", lambda engine, now: recorded.append(now))
+    store = _FakeStateStore()
+    monkeypatch.setattr(scheduler, "_read_state", store.read)
+    monkeypatch.setattr(scheduler, "_write_state", store.write)
     digest_calls = []
     monkeypatch.setattr(
-        "alerts.email.daily_digest",
-        lambda: (digest_calls.append(1), {"sent": True})[1],
+        "alerts.email.daily_digest", lambda: (digest_calls.append(1), _digest("sent"))[1]
     )
 
     now = _in_window()
     scheduler._send_digest_once_per_window(engine, now)
 
-    assert engine.conn.lock_calls == 1
-    assert engine.conn.unlock_calls == 1
     assert digest_calls == [1]
-    assert recorded == [now]
+    # The pre-send marker and the terminal write both happened, in order.
+    assert [status for _at, status in store.write_calls] == ["uncertain", "sent"]
+    assert store.state == {"seen_at": now, "status": "sent"}
 
 
-def test_unconfirmed_send_does_not_record_so_a_retry_can_happen(monkeypatch) -> None:
-    """This is the fix for the "sent" flag meaning dispatch, not delivery:
-    daily_digest() now returns a real synchronous outcome, and the
-    scheduler must only persist a claim when that outcome was True.
-    """
+def test_failed_send_is_recorded_as_failed_and_immediately_retryable(monkeypatch) -> None:
     engine = _FakeEngine(lock_available=True)
-    monkeypatch.setattr(scheduler, "_latest_sent_at", lambda engine: None)
-    recorded = []
-    monkeypatch.setattr(scheduler, "_record_sent", lambda engine, now: recorded.append(now))
+    store = _FakeStateStore()
+    monkeypatch.setattr(scheduler, "_read_state", store.read)
+    monkeypatch.setattr(scheduler, "_write_state", store.write)
+    digest_calls = []
     monkeypatch.setattr(
-        "alerts.email.daily_digest", lambda: {"sent": False, "error": "SMTP refused"}
+        "alerts.email.daily_digest",
+        lambda: (digest_calls.append(1), _digest("failed", "SMTP refused"))[1],
     )
 
-    scheduler._send_digest_once_per_window(engine, _in_window())
+    now = _in_window()
+    scheduler._send_digest_once_per_window(engine, now)
+    assert store.state["status"] == "failed"
 
-    assert recorded == []
+    # A clean pre-acceptance failure must not block the very next attempt.
+    scheduler._send_digest_once_per_window(engine, now + timedelta(minutes=1))
+    assert len(digest_calls) == 2
+
+
+def test_persist_failure_after_confirmed_send_leaves_uncertain_not_silent(monkeypatch) -> None:
+    """This is the exact bug the reviewer flagged: SMTP succeeds, then the
+    terminal state write raises (persistence failure, or a crash at that
+    exact point). The pre-send "uncertain" marker must be what's left on
+    disk — not nothing, which would read as "never attempted" and permit
+    an automatic resend next minute.
+    """
+    engine = _FakeEngine(lock_available=True)
+    store = _FakeStateStore()
+    store.fail_write_on_call = 2  # the terminal write, not the pre-send one
+    monkeypatch.setattr(scheduler, "_read_state", store.read)
+    monkeypatch.setattr(scheduler, "_write_state", store.write)
+    monkeypatch.setattr("alerts.email.daily_digest", lambda: _digest("sent"))
+
+    now = _in_window()
+    scheduler._send_digest_once_per_window(engine, now)
+
+    # The terminal write raised, so it's not in state, but the pre-send
+    # write succeeded and is what's left.
+    assert store.state == {"seen_at": now, "status": "uncertain"}
+
+
+def test_uncertain_state_blocks_automatic_retry_while_fresh(monkeypatch) -> None:
+    engine = _FakeEngine(lock_available=True)
+    now = _in_window()
+    store = _FakeStateStore()
+    store.state = {"seen_at": now - timedelta(minutes=1), "status": "uncertain"}
+    monkeypatch.setattr(scheduler, "_read_state", store.read)
+    monkeypatch.setattr(scheduler, "_write_state", store.write)
+    digest_calls = []
+    monkeypatch.setattr(
+        "alerts.email.daily_digest", lambda: (digest_calls.append(1), _digest("sent"))[1]
+    )
+
+    scheduler._send_digest_once_per_window(engine, now)
+
+    assert digest_calls == []
+
+
+def test_stale_uncertain_state_still_blocks_within_the_gap_window(monkeypatch) -> None:
+    """An unresolved attempt does not get silently retried just because
+    time has passed within the same day's window — that would be
+    guessing it's now safe. It stays blocked (same as a confirmed "sent"
+    would) until the whole gap window elapses.
+    """
+    engine = _FakeEngine(lock_available=True)
+    now = _in_window()
+    store = _FakeStateStore()
+    store.state = {
+        "seen_at": now - timedelta(minutes=scheduler._UNCERTAIN_STALE_MINUTES + 1),
+        "status": "uncertain",
+    }
+    monkeypatch.setattr(scheduler, "_read_state", store.read)
+    monkeypatch.setattr(scheduler, "_write_state", store.write)
+    digest_calls = []
+    monkeypatch.setattr(
+        "alerts.email.daily_digest", lambda: (digest_calls.append(1), _digest("sent"))[1]
+    )
+
+    scheduler._send_digest_once_per_window(engine, now)
+
+    assert digest_calls == []
+
+
+def test_uncertain_state_past_the_whole_gap_window_is_eligible_again(monkeypatch) -> None:
+    engine = _FakeEngine(lock_available=True)
+    now = _in_window()
+    store = _FakeStateStore()
+    store.state = {"seen_at": now - timedelta(hours=scheduler._MIN_GAP_HOURS + 1), "status": "uncertain"}
+    monkeypatch.setattr(scheduler, "_read_state", store.read)
+    monkeypatch.setattr(scheduler, "_write_state", store.write)
+    digest_calls = []
+    monkeypatch.setattr(
+        "alerts.email.daily_digest", lambda: (digest_calls.append(1), _digest("sent"))[1]
+    )
+
+    scheduler._send_digest_once_per_window(engine, now)
+
+    assert digest_calls == [1]
 
 
 def test_two_concurrent_callers_only_one_sends(monkeypatch) -> None:
@@ -112,12 +222,12 @@ def test_two_concurrent_callers_only_one_sends(monkeypatch) -> None:
     caller can't even get past the lock to check.
     """
     shared_engine = _FakeEngine(lock_available=True)
-    monkeypatch.setattr(scheduler, "_latest_sent_at", lambda engine: None)
-    monkeypatch.setattr(scheduler, "_record_sent", lambda engine, now: None)
+    store = _FakeStateStore()
+    monkeypatch.setattr(scheduler, "_read_state", store.read)
+    monkeypatch.setattr(scheduler, "_write_state", store.write)
     digest_calls = []
     monkeypatch.setattr(
-        "alerts.email.daily_digest",
-        lambda: (digest_calls.append(1), {"sent": True})[1],
+        "alerts.email.daily_digest", lambda: (digest_calls.append(1), _digest("sent"))[1]
     )
 
     now = _in_window()
@@ -134,11 +244,13 @@ def test_two_concurrent_callers_only_one_sends(monkeypatch) -> None:
 def test_already_sent_within_the_gap_skips_without_sending(monkeypatch) -> None:
     engine = _FakeEngine(lock_available=True)
     now = _in_window()
-    monkeypatch.setattr(scheduler, "_latest_sent_at", lambda engine: now - timedelta(hours=1))
+    store = _FakeStateStore()
+    store.state = {"seen_at": now - timedelta(hours=1), "status": "sent"}
+    monkeypatch.setattr(scheduler, "_read_state", store.read)
+    monkeypatch.setattr(scheduler, "_write_state", store.write)
     digest_calls = []
     monkeypatch.setattr(
-        "alerts.email.daily_digest",
-        lambda: (digest_calls.append(1), {"sent": True})[1],
+        "alerts.email.daily_digest", lambda: (digest_calls.append(1), _digest("sent"))[1]
     )
 
     scheduler._send_digest_once_per_window(engine, now)
@@ -148,7 +260,7 @@ def test_already_sent_within_the_gap_skips_without_sending(monkeypatch) -> None:
 
 
 def test_a_state_read_error_fails_closed_not_open(monkeypatch) -> None:
-    """The bug this fixes: _latest_sent_at used to swallow DB errors and
+    """The bug this fixes: state reads used to swallow DB errors and
     return None, which reads as "never sent" — i.e. eligible to send. An
     unreadable state table must block sending, not permit it.
     """
@@ -157,11 +269,10 @@ def test_a_state_read_error_fails_closed_not_open(monkeypatch) -> None:
     def _raise(engine):
         raise RuntimeError("state table unreachable")
 
-    monkeypatch.setattr(scheduler, "_latest_sent_at", _raise)
+    monkeypatch.setattr(scheduler, "_read_state", _raise)
     digest_calls = []
     monkeypatch.setattr(
-        "alerts.email.daily_digest",
-        lambda: (digest_calls.append(1), {"sent": True})[1],
+        "alerts.email.daily_digest", lambda: (digest_calls.append(1), _digest("sent"))[1]
     )
 
     scheduler._send_digest_once_per_window(engine, _in_window())

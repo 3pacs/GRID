@@ -210,11 +210,29 @@ def _send_in_thread(subject: str, html: str, plain: str) -> None:
     t.start()
 
 
-def _do_send(subject: str, html: str, plain: str) -> bool:
+def _do_send(subject: str, html: str, plain: str) -> str:
+    """Send over SMTP, returning one of three outcomes — not a bool.
+
+    "sent": ``sendmail()`` returned normally — the relay accepted the
+        message. A later failure in ``quit()`` does not change this:
+        QUIT is connection cleanup, not part of the accept decision, and
+        treating its failure as "the send failed" was the exact bug this
+        fixes — an accepted message could be reported as a failure and
+        retried, risking a duplicate.
+    "failed": a clean, pre-acceptance failure — mail disabled, or the
+        connection/auth/HELO never completed, or the relay explicitly
+        rejected the sender/recipients before any message data went
+        out. Nothing was transmitted; safe to retry.
+    "uncertain": the connection was lost, timed out, or otherwise
+        interrupted during or after the DATA phase, so whether the relay
+        actually received the message cannot be determined from here.
+        Callers must not treat this as either success or a safe-to-retry
+        failure.
+    """
     try:
         cfg = _get_settings()
         if not cfg.ALERT_EMAIL_ENABLED:
-            return False
+            return "failed"
 
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
@@ -230,24 +248,44 @@ def _do_send(subject: str, html: str, plain: str) -> bool:
         if is_external and not use_tls:
             use_tls = True
 
+        smtp = smtplib.SMTP(host, port, timeout=30)
         if use_tls:
-            smtp = smtplib.SMTP(host, port, timeout=30)
             smtp.ehlo()
             smtp.starttls()
             smtp.ehlo()
-        else:
-            smtp = smtplib.SMTP(host, port, timeout=30)
-
         if cfg.ALERT_SMTP_USER and cfg.ALERT_SMTP_PASSWORD:
             smtp.login(cfg.ALERT_SMTP_USER, cfg.ALERT_SMTP_PASSWORD)
-
-        smtp.sendmail(cfg.ALERT_EMAIL_FROM, [cfg.ALERT_EMAIL_TO], msg.as_string())
-        smtp.quit()
-        log.info("Newsletter sent — {s}", s=subject)
-        return True
     except Exception as exc:
-        log.warning("Newsletter send failed — {s}: {e}", s=subject, e=str(exc))
-        return False
+        log.warning("Newsletter send failed before relay acceptance — {s}: {e}", s=subject, e=str(exc))
+        return "failed"
+
+    try:
+        smtp.sendmail(cfg.ALERT_EMAIL_FROM, [cfg.ALERT_EMAIL_TO], msg.as_string())
+    except (smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused, smtplib.SMTPResponseException) as exc:
+        # An explicit rejection response — the relay told us no before
+        # accepting the body. Clean, safe to retry.
+        log.warning("Newsletter send rejected by relay — {s}: {e}", s=subject, e=str(exc))
+        try:
+            smtp.quit()
+        except Exception:
+            pass
+        return "failed"
+    except Exception as exc:
+        # Connection lost, timed out, or otherwise interrupted while
+        # transmitting — genuinely unknown whether the relay got it.
+        log.warning("Newsletter send outcome unknown — {s}: {e}", s=subject, e=str(exc))
+        return "uncertain"
+
+    try:
+        smtp.quit()
+    except Exception as exc:
+        log.debug(
+            "SMTP quit() failed after a successful sendmail — message was already "
+            "accepted, this does not change the outcome: {e}", e=str(exc),
+        )
+
+    log.info("Newsletter sent — {s}", s=subject)
+    return "sent"
 
 
 def _send(subject: str, sections: list[dict], footer_note: str = "") -> None:
@@ -257,8 +295,8 @@ def _send(subject: str, sections: list[dict], footer_note: str = "") -> None:
     _send_in_thread(subject, html, plain)
 
 
-def _send_sync(subject: str, sections: list[dict], footer_note: str = "") -> bool:
-    """Render and send synchronously, returning the real SMTP outcome.
+def _send_sync(subject: str, sections: list[dict], footer_note: str = "") -> str:
+    """Render and send synchronously, returning "sent"/"failed"/"uncertain".
 
     ``_send`` exists to keep request handlers non-blocking; it fires a
     background thread and returns before ``_do_send`` even runs, so a
@@ -266,7 +304,8 @@ def _send_sync(subject: str, sections: list[dict], footer_note: str = "") -> boo
     "sent" there means "handed to a thread," not "delivered." A caller
     running on its own background thread already (not a request path —
     e.g. the daily digest scheduler) should call this instead, so it can
-    record a successful send only once one has actually happened.
+    record a successful send only once one has actually happened, and
+    treat an "uncertain" outcome as neither success nor a safe retry.
     """
     html = _render_html(subject, sections, footer_note)
     plain = "\n\n".join(f"[{s['title']}]\n{s.get('body', '')}" for s in sections)
@@ -551,13 +590,15 @@ def daily_digest(dry_run: bool = False) -> dict[str, Any]:
         # handler, so blocking here on real SMTP I/O is safe — and it's
         # what lets the caller record a claim only after an actual
         # confirmed outcome instead of after merely dispatching one.
-        sent_ok = _send_sync(subject, sections)
-        result["sent"] = sent_ok
-        if not sent_ok:
-            result["error"] = "SMTP send did not confirm success (see alerts.email logs)"
-        log.info("Daily digest {status} — {n} sections, {d} degraded",
-                  status="sent" if sent_ok else "NOT sent", n=len(sections), d=len(degraded))
+        send_status = _send_sync(subject, sections)
+        result["send_status"] = send_status
+        result["sent"] = send_status == "sent"
+        if send_status != "sent":
+            result["error"] = f"send status: {send_status}"
+        log.info("Daily digest send status={status} — {n} sections, {d} degraded",
+                  status=send_status, n=len(sections), d=len(degraded))
     except Exception as exc:
+        result["send_status"] = "failed"
         result["sent"] = False
         result["error"] = str(exc)
         log.warning("Daily digest failed: {e}", e=str(exc))
