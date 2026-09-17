@@ -736,13 +736,15 @@ export default function SectorDive({ sector: sectorProp, onBack }) {
                     value={fmtUSD(metrics.etf_flow_5d)}
                     color={metrics.etf_flow_5d == null ? colors.textMuted : (metrics.etf_flow_5d >= 0 ? colors.green : colors.red)}
                 />
-                <MetricCard label="Dark Pool Signal" value={metrics.dark_pool_signal || 'neutral'} color={
+                {/* A missing signal or activity list renders '--', never a
+                    'neutral' reading or a count of 0 the backend did not send. */}
+                <MetricCard label="Dark Pool Signal" value={metrics.dark_pool_signal || '--'} color={
                     metrics.dark_pool_signal === 'accumulation' ? colors.green
                     : metrics.dark_pool_signal === 'distribution' ? colors.red
-                    : colors.textDim
+                    : metrics.dark_pool_signal ? colors.textDim : colors.textMuted
                 } />
-                <MetricCard label="Insider Trades (30d)" value={String((metrics.insider_activity || []).length)} color={colors.text} />
-                <MetricCard label="Congressional (60d)" value={String((metrics.congressional_activity || []).length)} color={colors.text} />
+                <MetricCard label="Insider Trades (30d)" value={Array.isArray(metrics.insider_activity) ? String(metrics.insider_activity.length) : '--'} color={Array.isArray(metrics.insider_activity) ? colors.text : colors.textMuted} />
+                <MetricCard label="Congressional (60d)" value={Array.isArray(metrics.congressional_activity) ? String(metrics.congressional_activity.length) : '--'} color={Array.isArray(metrics.congressional_activity) ? colors.text : colors.textMuted} />
             </div>
 
             {/* ═══ SUBSECTOR TREEMAP ═══ */}
