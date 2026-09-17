@@ -49,7 +49,7 @@ loguru>=0.7.2
 
 # Hyperspace (OpenAI-compatible API client) + Hermes analyst bridge
 # (intelligence/hermes/ relies on the reasoning-token usage fields)
-openai>=1.40.0
+openai>=3.13.0
 
 # LLM observability — pipes every LLM call into Langfuse for trace/eval/regression
 # Self-hosted at http://grid-svr:3000; configured via LANGFUSE_HOST/PUBLIC_KEY/SECRET_KEY env
