@@ -1672,7 +1672,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
             )
             reset_pool_peak(pool_stats["checked_out"])
         except Exception as exc:
-            log.debug("Pool stats logging failed: {e}", e=str(exc))
+            log.warning("Pool stats logging failed: {e}", e=str(exc))
         health = check_system_health(engine)
         cycle_result["health"] = health
         hermes_ok = health["hermes"]["healthy"]

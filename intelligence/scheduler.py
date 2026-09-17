@@ -1190,7 +1190,7 @@ def run_intelligence_loop() -> None:
                 )
                 reset_pool_peak(pool_stats["checked_out"])
             except Exception as exc:
-                log.debug("Pool stats logging failed: {e}", e=str(exc))
+                log.warning("Pool stats logging failed: {e}", e=str(exc))
         time.sleep(30)
 
 
