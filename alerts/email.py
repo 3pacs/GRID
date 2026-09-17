@@ -333,26 +333,62 @@ def send_weekly_review(review_content: str) -> None:
     )
 
 
-def daily_digest() -> None:
-    """Compile and send a daily digest newsletter with live data."""
+_STALE_REGIME_HOURS = 24
+
+
+def daily_digest(dry_run: bool = False) -> dict[str, Any]:
+    """Compile and send a daily digest newsletter with live data.
+
+    Parameters:
+        dry_run: If True, build the digest content but never call ``_send``.
+            Use this to preview a section count/titles/degraded-collector
+            list against real data before relying on a live send — e.g.
+            after a period where this function wasn't being invoked at all.
+
+    Returns:
+        dict summarizing what was built: ``sections``, ``section_titles``,
+        ``degraded`` (collector names whose query raised), and either
+        ``dry_run`` or ``sent``/``error``. A truthy return does not mean
+        every section built successfully — check ``degraded``.
+    """
+    result: dict[str, Any] = {"timestamp": datetime.now(timezone.utc).isoformat()}
     try:
         from sqlalchemy import text as sa_text
         from db import get_engine
 
         engine = get_engine()
         sections: list[dict] = []
+        degraded: list[str] = []
 
         with engine.connect() as conn:
-            # Regime
+            # Regime — a stale decision_journal row must not be presented
+            # as the current regime with no indication of its age.
             try:
                 row = conn.execute(sa_text(
-                    "SELECT inferred_state, state_confidence, grid_recommendation "
-                    "FROM decision_journal ORDER BY decision_timestamp DESC LIMIT 1"
+                    "SELECT inferred_state, state_confidence, grid_recommendation, "
+                    "decision_timestamp FROM decision_journal "
+                    "ORDER BY decision_timestamp DESC LIMIT 1"
                 )).fetchone()
                 if row:
-                    sections.append(_section_regime(row[0], row[1], row[2]))
-            except Exception:
-                pass
+                    ts = row[3]
+                    ts = ts if (ts is None or ts.tzinfo) else ts.replace(tzinfo=timezone.utc)
+                    age_hours = (
+                        (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+                        if ts is not None else None
+                    )
+                    if age_hours is not None and age_hours >= _STALE_REGIME_HOURS:
+                        sections.append(_section_text(
+                            "Regime State",
+                            f"Stale — last decision_journal entry {age_hours:.0f}h ago "
+                            f"({ts}). Last known state: {row[0]}, "
+                            f"suggested action was: {row[2]}.",
+                            accent="amber",
+                        ))
+                    else:
+                        sections.append(_section_regime(row[0], row[1], row[2]))
+            except Exception as exc:
+                degraded.append("regime")
+                log.debug("Daily digest regime section failed: {e}", e=str(exc))
 
             # Journal count
             try:
@@ -361,8 +397,9 @@ def daily_digest() -> None:
                     "WHERE decision_timestamp >= NOW() - INTERVAL '24 hours'"
                 )).fetchone()
                 sections.append(_section_kpi("Decisions (24h)", str(row[0]) if row else "0"))
-            except Exception:
-                pass
+            except Exception as exc:
+                degraded.append("journal_count")
+                log.debug("Daily digest journal-count section failed: {e}", e=str(exc))
 
             # 100x opportunities
             try:
@@ -374,8 +411,9 @@ def daily_digest() -> None:
                 )).fetchall()
                 for r in rows:
                     sections.append(_section_100x(r[0], r[1], r[2], r[4], r[3]))
-            except Exception:
-                pass
+            except Exception as exc:
+                degraded.append("100x_opportunities")
+                log.debug("Daily digest 100x section failed: {e}", e=str(exc))
 
             # Data freshness
             try:
@@ -386,8 +424,9 @@ def daily_digest() -> None:
                 if row and row[0]:
                     sections.append(_section_kpi("Active Sources (24h)", str(row[0]),
                                                  f"latest: {str(row[1])[:16]}"))
-            except Exception:
-                pass
+            except Exception as exc:
+                degraded.append("data_freshness")
+                log.debug("Daily digest freshness section failed: {e}", e=str(exc))
 
         # Long plays (multi-year board; every multiple is a labelled proxy)
         try:
@@ -430,16 +469,48 @@ def daily_digest() -> None:
                     ))
                 elif board.get("stand_down_reason"):
                     sections.append(_section_text("Long plays", str(board["stand_down_reason"])))
-        except Exception:
-            pass
+        except Exception as exc:
+            degraded.append("long_plays")
+            log.debug("Daily digest long-plays section failed: {e}", e=str(exc))
 
-        if not sections:
-            sections.append(_section_text("Status", "All systems operational. No notable events in the last 24 hours."))
+        # A collector failure must never be silently indistinguishable from
+        # "nothing to report" — that's how a digest ends up claiming
+        # "All systems operational" while its own queries were failing.
+        if degraded:
+            sections.append(_section_text(
+                "Data collection issues",
+                f"{len(degraded)} section(s) failed to build and are omitted "
+                f"above: {', '.join(degraded)}. This digest is incomplete.",
+                accent="red",
+            ))
+        elif not sections:
+            sections.append(_section_text(
+                "Status",
+                "All systems operational. No notable events in the last 24 hours.",
+            ))
 
-        _send("GRID Intelligence — Daily Digest", sections)
-        log.info("Daily digest sent")
+        subject = "GRID Intelligence — Daily Digest"
+        result.update({
+            "sections": len(sections),
+            "section_titles": [s["title"] for s in sections],
+            "degraded": degraded,
+        })
+
+        if dry_run:
+            result["dry_run"] = True
+            log.info("Daily digest built (dry run) — {n} sections, {d} degraded",
+                      n=len(sections), d=len(degraded))
+            return result
+
+        _send(subject, sections)
+        result["sent"] = True
+        log.info("Daily digest sent — {n} sections, {d} degraded",
+                  n=len(sections), d=len(degraded))
     except Exception as exc:
+        result["sent"] = False
+        result["error"] = str(exc)
         log.warning("Daily digest failed: {e}", e=str(exc))
+    return result
 
 
 def _section_code_block(title: str, code: str) -> dict:
