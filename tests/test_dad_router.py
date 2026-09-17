@@ -32,13 +32,17 @@ def test_gold_from_summary_scores_high_workbook_footprint():
 
     assert gold["verdict"] == "High workbook conviction"
     assert gold["tone"] == "strong"
-    assert gold["score"] >= 80
+    assert gold["heuristic_score"] >= 80
+    assert gold["weights"]["file_count"]["weight"] == 8
 
 
 def test_gold_from_summary_handles_missing_ticker():
     gold = _gold_from_summary(None)
 
-    assert gold["score"] == 0
+    # B-M18: no workbook rows is an absence, not a zero score.
+    assert gold["heuristic_score"] is None
+    assert gold["weights"] is None
+    assert gold["score_basis"] == "no_workbook_history"
     assert gold["tone"] == "neutral"
     assert "not showing up" in gold["one_liner"]
 
@@ -186,6 +190,7 @@ def test_grid_decision_stack_uses_workbook_grid_and_fundamentals():
         {"signal_sources": [{"trust_score": 0.7}], "tradingview_signals": [], "regime": None},
     )
 
-    assert decision["score"] >= 45
+    assert decision["heuristic_score"] >= 45
+    assert decision["weights"]["workbook_prior_multiplier"] == 0.35
     assert decision["stance"] in {"Deep review first", "Watchlist with checks"}
     assert any(card["source"] == "Finviz fundamentals" for card in decision["cards"])
