@@ -377,12 +377,23 @@ function RiskTreemap({ data, selectedCategory, onSelect }) {
                 const m = d.data.metrics;
                 const cellW = d.x1 - d.x0;
                 if (cellW < 100) return '';
+                // An unmeasured sub-system (backend available:false) shows
+                // 'no data'; a measured one with a missing metric shows '?'.
+                // Never print a default 0 / 0% as if it were observed.
+                if (m.available === false) return 'no data';
+                const num = (v) => (typeof v === 'number' && Number.isFinite(v)) ? v : null;
                 if (d.data.key === 'dealer_risk') return `GEX: ${m.gex_regime || '?'}`;
-                if (d.data.key === 'volatility_risk') return `VIX: ${m.vix || '?'}`;
-                if (d.data.key === 'concentration_risk') return `Top5: ${((m.top_5_watchlist_weight || 0) * 100).toFixed(0)}%`;
-                if (d.data.key === 'correlation_risk') return `Avg: ${m.avg_cross_correlation || '?'}`;
-                if (d.data.key === 'credit_risk') return `HY: ${m.hy_spread || '?'}bp`;
-                if (d.data.key === 'liquidity_risk') return `Fed: ${formatMetric('', m.fed_net_liquidity_change_1m || 0)}`;
+                if (d.data.key === 'volatility_risk') return `VIX: ${num(m.vix) ?? '?'}`;
+                if (d.data.key === 'concentration_risk') {
+                    const w = num(m.top_5_watchlist_weight);
+                    return `Top5: ${w === null ? '?' : (w * 100).toFixed(0) + '%'}`;
+                }
+                if (d.data.key === 'correlation_risk') return `Avg: ${num(m.avg_cross_correlation) ?? '?'}`;
+                if (d.data.key === 'credit_risk') return `HY: ${num(m.hy_spread) ?? '?'}bp`;
+                if (d.data.key === 'liquidity_risk') {
+                    const c = num(m.fed_net_liquidity_change_1m);
+                    return `Fed: ${c === null ? '?' : formatMetric('', c)}`;
+                }
                 return '';
             })
             .attr('font-size', '10px')

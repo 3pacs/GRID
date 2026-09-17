@@ -102,6 +102,10 @@ describe('RiskMap truthfulness', () => {
         expect(screen.queryByText('LOW')).not.toBeInTheDocument();
         expect(screen.queryByText('MODERATE')).not.toBeInTheDocument();
         expect(screen.queryByText('50')).not.toBeInTheDocument();
+        // Treemap subtitles must not print a default 0 for an unmeasured sub-system.
+        expect(document.body.textContent).not.toMatch(/Top5: 0%/);
+        expect(document.body.textContent).not.toMatch(/Fed: 0/);
+        expect(document.body.textContent).toMatch(/no data/);
     });
 
     it('source contains no random walk and no synthetic timeline', () => {
