@@ -39,6 +39,16 @@ on:
         type: boolean
         required: false
         default: false
+      activate_intelligence:
+        description: 'One-time: also restart grid-intelligence onto the release path (interrupts its current pass -- see deploy.yml comments). Never implied by a routine push or by do_restart. Also requires acknowledge_intelligence_interruption=true.'
+        type: boolean
+        required: false
+        default: false
+      acknowledge_intelligence_interruption:
+        description: 'Required to activate grid-intelligence: explicitly acknowledges the restart may skip whatever schedule-library job is currently running or due imminently, with no catch-up for a missed daily/weekly occurrence. There is no automated safe-to-restart check. Only consulted when activate_intelligence=true.'
+        type: boolean
+        required: false
+        default: false
       skip_migrations:
         description: 'Skip alembic upgrade head (explicit opt-out only; never silent)'
         type: boolean
@@ -773,6 +783,153 @@ jobs:
           else
             echo "Ticker probe (diagnostic, separate from activation): PASSED -- ^DJI completed over ${probe_from}..${probe_end} without a statement timeout" | tee -a "$GITHUB_STEP_SUMMARY"
           fi
+
+      # grid-intelligence has the exact same class of bug the grid-hermes
+      # and grid-scheduler fixes above addressed: its unit's WorkingDirectory
+      # is pinned to /data/grid_v4/grid_repo -- confirmed live, and distinct
+      # from BOTH the release path this workflow deploys to AND from
+      # grid-scheduler's own /home/grid/grid_v4/grid_repo, three separate
+      # checkouts in this fleet, not two. Verified directly (not assumed
+      # from the api/hermes/scheduler pattern): grid-intelligence runs as
+      # the same User=grid, same bare /usr/bin/python3.10, no PYTHONPATH
+      # override, and resolves the same per-user site-packages
+      # (/home/grid/.local/lib/python3.10/site-packages) those other
+      # services already share -- so this is a working-directory fix, not
+      # an environment migration, same conclusion as scheduler's but
+      # independently confirmed for this process rather than inferred.
+      #
+      # UNLIKE grid-api/grid-hermes, everything below is gated on the
+      # explicit `activate_intelligence` input alone -- never on a routine
+      # push, and never on `do_restart` (which still only covers
+      # api/hermes). grid-intelligence is a long-running loop
+      # (intelligence/scheduler.py) registering ~25 schedule-library jobs
+      # from every-15-minutes to weekly, not a stateless request server.
+      #
+      # Safety is narrower than it might look, stated precisely rather than
+      # as a blanket guarantee: the `schedule` library has no catch-up
+      # mechanism. run_intelligence_loop() rebuilds every job's "next run"
+      # from the moment the process starts, so a restart landing near a
+      # daily or weekly job's exact trigger silently skips that occurrence
+      # until its next natural recurrence (up to a week later for weekly
+      # jobs) rather than deferring it -- confirmed by reading the
+      # `_sched.every(...).do(...)` registrations, not assumed. Individual
+      # task functions each catch their own exceptions internally, so a
+      # normal failure never crashes the loop, but that is a different
+      # question from what a SIGTERM mid-task does, and whether every one
+      # of the ~25 registered tasks is write-safe if killed mid-transaction
+      # (like the resolver's ON CONFLICT DO NOTHING pattern) has not been
+      # audited across all of them -- only spot-checked for one or two.
+      #
+      # There is no automated "safe to restart" check, same reasoning as
+      # grid-scheduler's gate: a log tail can only show what has already
+      # happened. So activation always requires an explicit
+      # `acknowledge_intelligence_interruption=true` -- a human decision,
+      # never an automatic pass. See
+      # scripts/intelligence_activation_gate.sh (tested in
+      # tests/test_intelligence_activation_gate.py) for the actual decision.
+      - name: Report grid-intelligence activation status
+        if: ${{ inputs.activate_intelligence != true }}
+        run: |
+          {
+            echo "grid-intelligence was NOT restarted this run (activate_intelligence was not set)."
+            echo "It continues running its existing checkout (/data/grid_v4/grid_repo), independent of the release tree this run deployed."
+            echo "**Intelligence activation remains pending.** To activate: run this workflow via workflow_dispatch with activate_intelligence=true and acknowledge_intelligence_interruption=true."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Purely informational -- makes no claim about current idleness. Shown
+      # only so a human deciding on acknowledge_intelligence_interruption has
+      # the same context this workflow does; it does not gate anything.
+      - name: Show recent grid-intelligence activity (for your own judgment)
+        if: ${{ inputs.activate_intelligence == true }}
+        run: journalctl -u grid-intelligence -n 20 --no-pager -q || true
+
+      - name: Require explicit interruption acknowledgment (grid-intelligence)
+        if: ${{ inputs.activate_intelligence == true }}
+        # Same reasoning as grid-scheduler's equivalent step: this job never
+        # runs actions/checkout, so the gate script is read from
+        # $DEPLOY_PATH (the tree "Build release tree" already fetched), not
+        # a workspace-relative path that wouldn't resolve here.
+        run: bash "$DEPLOY_PATH/scripts/intelligence_activation_gate.sh" "${{ inputs.acknowledge_intelligence_interruption }}"
+
+      - name: Restart grid-intelligence (activate_intelligence only)
+        if: ${{ inputs.activate_intelligence == true }}
+        run: |
+          set -euo pipefail
+          # Recorded so the later verify step can search only logs from
+          # this restart onward.
+          date -u +%s > "$RUNNER_TEMP/grid-intelligence-restart-ts"
+          sudo mkdir -p /etc/systemd/system/grid-intelligence.service.d
+          # Preserve whatever is already there (if anything) so rollback can
+          # restore the exact prior state rather than assuming "delete" is
+          # correct -- true only if this is genuinely the first activation.
+          DROPIN=/etc/systemd/system/grid-intelligence.service.d/zz-release-worktree.conf
+          if [ -f "$DROPIN" ]; then
+            BACKUP="${DROPIN}.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+            sudo cp -a "$DROPIN" "$BACKUP"
+            echo "Existing drop-in backed up to $BACKUP"
+            echo "Exact rollback: sudo cp -a $BACKUP $DROPIN && sudo systemctl daemon-reload && sudo systemctl restart grid-intelligence" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No pre-existing drop-in at $DROPIN (first activation)."
+            echo "Exact rollback: sudo rm $DROPIN && sudo systemctl daemon-reload && sudo systemctl restart grid-intelligence" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          printf '%s\n' '[Service]' "WorkingDirectory=$DEPLOY_PATH" | sudo tee "$DROPIN" >/dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl restart grid-intelligence
+
+      # Same proof-of-tree pattern as grid-hermes/grid-scheduler above -- a
+      # bare is-active would stay green through the whole time
+      # grid-intelligence ran stale code from grid_repo, which is exactly
+      # the failure this exists to catch.
+      - name: Verify grid-intelligence runs the deployed tree
+        if: ${{ inputs.activate_intelligence == true }}
+        run: |
+          set -euo pipefail
+          for attempt in {1..30}; do
+            state="$(systemctl is-active grid-intelligence || true)"
+            [ "$state" = "active" ] && break
+            if [ "$attempt" -eq 30 ]; then
+              echo "::error::grid-intelligence not active after restart (state=$state)"
+              sudo systemctl status grid-intelligence --no-pager -l || true
+              journalctl -u grid-intelligence -n 60 --no-pager || true
+              exit 1
+            fi
+            sleep 2
+          done
+          pid="$(systemctl show -p MainPID --value grid-intelligence)"
+          cwd="$(sudo -n readlink "/proc/${pid}/cwd" 2>/dev/null || readlink "/proc/${pid}/cwd" 2>/dev/null || true)"
+          echo "grid-intelligence pid=$pid cwd=$cwd"
+          want="$(readlink -f "$DEPLOY_PATH")"
+          [ -n "$cwd" ] && [ "$(readlink -f "$cwd")" = "$want" ] || {
+            echo "::error::grid-intelligence cwd '$cwd' does not resolve to $want -- it is running a different tree"
+            exit 1
+          }
+          echo "verify: grid-intelligence is running the deployed tree"
+
+      # Beyond PID/cwd: prove the deployed code (specifically, the pool
+      # telemetry this activation exists to turn on) actually ran, not just
+      # that the process is up -- a crash-loop still reports active between
+      # crashes. This step alone is what "activation succeeded" means for
+      # grid-intelligence.
+      - name: Verify grid-intelligence pool telemetry is live
+        if: ${{ inputs.activate_intelligence == true }}
+        run: |
+          set -euo pipefail
+          restart_ts="$(cat "$RUNNER_TEMP/grid-intelligence-restart-ts")"
+          # The intelligence loop only logs pool stats every 10 ticks of its
+          # 30s run_pending() loop (~5 min) -- allow up to three intervals.
+          for attempt in {1..90}; do
+            if journalctl -u grid-intelligence --since "@${restart_ts}" --no-pager -q 2>/dev/null | grep -qF 'DB pool (intelligence loop)'; then
+              echo "found the pool-telemetry log line confirming the deployed instrumentation is running"
+              break
+            fi
+            if [ "$attempt" -eq 90 ]; then
+              echo "::error::did not see a 'DB pool (intelligence loop)' log line within ~15 minutes of restart"
+              journalctl -u grid-intelligence -n 80 --no-pager || true
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "**grid-intelligence activated successfully** (running the deployed tree with pool telemetry confirmed live)." | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Notify success
         if: success()
