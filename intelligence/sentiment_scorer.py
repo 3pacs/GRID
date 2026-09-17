@@ -38,6 +38,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from store.observations import read_latest, read_latest_n, read_window
 
 # ── Configuration ─────────────────────────────────────────────────────────
 
@@ -324,19 +325,15 @@ def _score_momentum(engine: Engine) -> SentimentComponent:
 
     try:
         with engine.connect() as conn:
-            rows = conn.execute(text(
-                "SELECT value, obs_date FROM raw_series "
-                "WHERE series_id = 'YF:^GSPC:close' "
-                "ORDER BY obs_date DESC LIMIT 25"
-            )).fetchall()
+            rows = read_latest_n(conn, "YF:^GSPC:close", 25)
 
             if len(rows) >= 6:
-                latest = float(rows[0][0])
-                d5 = float(rows[5][0])
+                latest = rows[0].value
+                d5 = rows[5].value
                 ret_5d = (latest - d5) / d5
 
             if len(rows) >= 21:
-                d20 = float(rows[20][0])
+                d20 = rows[20].value
                 ret_20d = (latest - d20) / d20
     except Exception as e:
         log.warning("Momentum scoring failed: {e}", e=e)
@@ -364,14 +361,10 @@ def _score_volatility(engine: Engine) -> SentimentComponent:
     """Score from VIX level — high VIX = bearish, low VIX = bullish."""
     try:
         with engine.connect() as conn:
-            row = conn.execute(text(
-                "SELECT value FROM raw_series "
-                "WHERE series_id = 'YF:^VIX:close' "
-                "ORDER BY obs_date DESC LIMIT 1"
-            )).fetchone()
+            row = read_latest(conn, "YF:^VIX:close")
 
             if row:
-                vix = float(row[0])
+                vix = row.value
                 # VIX scoring: 12 = very bullish (+0.8), 20 = neutral, 30 = bearish (-0.6), 40+ = crisis (-1.0)
                 if vix <= 12:
                     score = 0.8
@@ -402,14 +395,12 @@ def _score_vol_term_structure(engine: Engine) -> SentimentComponent:
     """VIX vs VIX3M: contango = complacent (bullish), backwardation = fear (bearish)."""
     try:
         with engine.connect() as conn:
-            vix = conn.execute(text(
-                "SELECT value FROM raw_series WHERE series_id='YF:^VIX:close' ORDER BY obs_date DESC LIMIT 1"
-            )).scalar()
-            vix3m = conn.execute(text(
-                "SELECT value FROM raw_series WHERE series_id='YF:^VIX3M:close' ORDER BY obs_date DESC LIMIT 1"
-            )).scalar()
-            if vix and vix3m and float(vix3m) > 0:
-                ratio = float(vix) / float(vix3m)
+            vix_obs = read_latest(conn, "YF:^VIX:close")
+            vix3m_obs = read_latest(conn, "YF:^VIX3M:close")
+            vix = vix_obs.value if vix_obs else None
+            vix3m = vix3m_obs.value if vix3m_obs else None
+            if vix and vix3m and vix3m > 0:
+                ratio = vix / vix3m
                 # ratio < 1 = contango (normal/bullish), > 1 = backwardation (fear)
                 score = max(-1.0, min(1.0, (1.0 - ratio) * 3))
                 return SentimentComponent(
@@ -430,12 +421,10 @@ def _score_breadth(engine: Engine) -> SentimentComponent:
             positive = 0
             total = 0
             for etf in etfs:
-                rows = conn.execute(text(
-                    "SELECT value FROM raw_series WHERE series_id = :sid ORDER BY obs_date DESC LIMIT 6"
-                ), {"sid": f"YF:{etf}:close"}).fetchall()
+                rows = read_latest_n(conn, f"YF:{etf}:close", 6)
                 if len(rows) >= 2:
                     total += 1
-                    if float(rows[0][0]) > float(rows[1][0]):
+                    if rows[0].value > rows[1].value:
                         positive += 1
             if total >= 5:
                 ratio = positive / total
@@ -453,16 +442,14 @@ def _score_trend(engine: Engine) -> SentimentComponent:
     """SPY position relative to 50d and 200d moving averages."""
     try:
         with engine.connect() as conn:
-            rows = conn.execute(text(
-                "SELECT value FROM raw_series WHERE series_id='YF:^GSPC:close' ORDER BY obs_date DESC LIMIT 200"
-            )).fetchall()
+            rows = read_latest_n(conn, "YF:^GSPC:close", 200)
             if len(rows) >= 50:
-                latest = float(rows[0][0])
-                ma50 = sum(float(r[0]) for r in rows[:50]) / 50
+                latest = rows[0].value
+                ma50 = sum(r.value for r in rows[:50]) / 50
                 above_50 = latest > ma50
                 above_200 = False
                 if len(rows) >= 200:
-                    ma200 = sum(float(r[0]) for r in rows[:200]) / 200
+                    ma200 = sum(r.value for r in rows[:200]) / 200
                     above_200 = latest > ma200
 
                 if above_50 and above_200:
@@ -614,11 +601,13 @@ def _score_yield_curve(engine: Engine) -> SentimentComponent:
     """10Y-2Y spread — positive = normal (bullish), negative = inverted (bearish)."""
     try:
         with engine.connect() as conn:
-            row = conn.execute(text(
-                "SELECT value FROM raw_series WHERE series_id='FRED:T10Y2Y' ORDER BY obs_date DESC LIMIT 1"
-            )).scalar()
+            # The FRED puller stores this series as ``T10Y2Y`` (no prefix);
+            # ``FRED:T10Y2Y`` matched nothing, so this component always read
+            # "No data available". Verified against griddb 2026-09-17:
+            # ``T10Y2Y`` present to 2026-09-17, ``FRED:T10Y2Y`` absent.
+            row = read_latest(conn, "T10Y2Y")
             if row:
-                spread = float(row)
+                spread = row.value
                 # Spread > 0.5 = healthy, 0 to 0.5 = flattening, < 0 = inverted
                 if spread > 1.0:
                     score = 0.8
@@ -639,19 +628,15 @@ def _score_credit_spread(engine: Engine) -> SentimentComponent:
     """HYG vs LQD ratio — rising = risk appetite (bullish), falling = flight to quality."""
     try:
         with engine.connect() as conn:
-            hyg_rows = conn.execute(text(
-                "SELECT value FROM raw_series WHERE series_id='YF:HYG:close' ORDER BY obs_date DESC LIMIT 21"
-            )).fetchall()
-            lqd_rows = conn.execute(text(
-                "SELECT value FROM raw_series WHERE series_id='YF:LQD:close' ORDER BY obs_date DESC LIMIT 21"
-            )).fetchall()
+            hyg_rows = read_latest_n(conn, "YF:HYG:close", 21)
+            lqd_rows = read_latest_n(conn, "YF:LQD:close", 21)
             if len(hyg_rows) >= 2 and len(lqd_rows) >= 2:
-                hyg_now = float(hyg_rows[0][0])
-                lqd_now = float(lqd_rows[0][0])
+                hyg_now = hyg_rows[0].value
+                lqd_now = lqd_rows[0].value
                 ratio_now = hyg_now / lqd_now if lqd_now > 0 else 1.0
 
-                hyg_prev = float(hyg_rows[-1][0])
-                lqd_prev = float(lqd_rows[-1][0])
+                hyg_prev = hyg_rows[-1].value
+                lqd_prev = lqd_rows[-1].value
                 ratio_prev = hyg_prev / lqd_prev if lqd_prev > 0 else 1.0
 
                 change = (ratio_now - ratio_prev) / ratio_prev
@@ -697,11 +682,9 @@ def _score_fear_greed(engine: Engine) -> SentimentComponent:
     # We compute it from existing data rather than external API
     try:
         with engine.connect() as conn:
-            vix = conn.execute(text(
-                "SELECT value FROM raw_series WHERE series_id='YF:^VIX:close' ORDER BY obs_date DESC LIMIT 1"
-            )).scalar()
-            if vix:
-                vix_val = float(vix)
+            vix_obs = read_latest(conn, "YF:^VIX:close")
+            if vix_obs:
+                vix_val = vix_obs.value
                 # Simple fear/greed: VIX < 15 = extreme greed, > 30 = extreme fear
                 fg_score = max(0, min(100, 100 - (vix_val - 10) * (100 / 30)))
                 # Map 0-100 to [-1, +1]: 50 = neutral
@@ -896,21 +879,17 @@ def score_past_predictions(engine: Engine) -> dict[str, Any]:
                 pred_id, pred_date, pred_score, pred_label, comp_json, weight_json = pred
 
                 # Get realized SPY return over the evaluation window
-                spy_rows = conn.execute(text(
-                    "SELECT value, obs_date FROM raw_series "
-                    "WHERE series_id = 'YF:^GSPC:close' "
-                    "AND obs_date >= :start AND obs_date <= :end "
-                    "ORDER BY obs_date"
-                ), {
-                    "start": pred_date,
-                    "end": pred_date + timedelta(days=EVALUATION_WINDOW_DAYS + 3),  # Buffer for weekends
-                }).fetchall()
+                spy_rows = read_window(
+                    conn, "YF:^GSPC:close",
+                    start=pred_date,
+                    as_of=pred_date + timedelta(days=EVALUATION_WINDOW_DAYS + 3),  # Buffer for weekends
+                )
 
                 if len(spy_rows) < 2:
                     continue  # Not enough price data yet
 
-                start_price = float(spy_rows[0][0])
-                end_price = float(spy_rows[-1][0])
+                start_price = spy_rows[0].value
+                end_price = spy_rows[-1].value
                 realized = (end_price - start_price) / start_price
 
                 # Did we get the direction right?
