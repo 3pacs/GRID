@@ -1,6 +1,6 @@
 """Record the scanner score behind every options recommendation.
 
-Revision ID: options_rec_scanner_score_20260917
+Revision ID: options_rec_scanner_score_0917
 Revises: snapshot_actor_col_20260914
 Create Date: 2026-09-17
 
@@ -36,7 +36,7 @@ from collections.abc import Sequence
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "options_rec_scanner_score_20260917"
+revision: str = "options_rec_scanner_score_0917"
 down_revision: str | Sequence[str] | None = "snapshot_actor_col_20260914"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
