@@ -1028,7 +1028,19 @@ async function handlePersonaSubmit() {
         : response;
     const guruResponse = await submitGuruQuestion();
     state.guruThinking = false;
-    if (guruResponse?.answer) {
+    if (guruResponse?.answer?.status === 'no_scoreable_data') {
+        // The backend performed no comparison, so there is no call to show.
+        state.personaResponse = {
+            ...response,
+            persona_name: 'Guru',
+            mode: guruResponse.answer.horizon || response.mode,
+            answer: [
+                'No call: no scoreable market data',
+                guruResponse.answer.reason,
+            ].filter(Boolean).join(' | '),
+            allowed_lenses: ['grid', 'mystical', guruResponse.answer.target_group].filter(Boolean),
+        };
+    } else if (guruResponse?.answer) {
         state.personaResponse = {
             ...response,
             persona_name: 'Guru',
@@ -1037,7 +1049,12 @@ async function handlePersonaSubmit() {
                 guruResponse.answer.call,
                 guruResponse.answer.timing,
                 guruResponse.answer.setup,
-                `Invalidation: ${guruResponse.answer.invalidation}`,
+                guruResponse.answer.invalidation
+                    ? `Invalidation: ${guruResponse.answer.invalidation}`
+                    : '',
+                guruResponse.answer.invalidation_basis === 'house_rule_fixed_pct'
+                    ? 'Invalidation basis: fixed house rule (not derived from realised vol)'
+                    : '',
             ].filter(Boolean).join(' | '),
             allowed_lenses: ['grid', 'mystical', guruResponse.answer.target_group].filter(Boolean),
         };
@@ -1778,9 +1795,11 @@ async function submitGuruQuestion() {
         writeLogs(LOG_KEYS.oracle, {
             at: new Date().toISOString(),
             question: state.question,
-            call: response.answer?.call || prediction.call,
-            timing: response.answer?.timing || prediction.timing,
-            invalidation: response.answer?.invalidation || prediction.invalidation,
+            call: response.answer?.call ?? prediction.call ?? null,
+            callStatus: response.answer?.status ?? null,
+            timing: response.answer?.timing ?? prediction.timing ?? null,
+            invalidation: response.answer?.invalidation ?? prediction.invalidation ?? null,
+            invalidationBasis: response.answer?.invalidation_basis ?? null,
             score: prediction.postmortem?.state || prediction.status || 'pending',
             predictionId: prediction.prediction_id,
         });

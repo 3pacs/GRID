@@ -671,11 +671,203 @@ def test_guru_ask_returns_public_answer_without_session(mock_store_factory) -> N
 
     assert response.status_code == 200
     data = response.json()
-    assert data["answer"]["call"]
+    # No overlay was supplied, so no relative-strength comparison was performed and no
+    # call may be manufactured (D-H10).
+    assert data["answer"]["call"] is None
+    assert data["answer"]["status"] == "no_scoreable_data"
+    assert data["answer"]["setup"] is None
+    assert data["answer"]["reason"]
     assert data["answer"]["timing"] == "7d swing window"
+    assert data["status"] == "no_scoreable_data"
     assert data["prediction"] is None
-    assert data["persistence_status"] == "not_persisted_public_session"
+    assert data["persistence_status"] == "not_persisted_no_scoreable_data"
     mock_store.save_prediction.assert_not_called()
+
+
+@patch("api.routers.astrogrid_predictions.get_astrogrid_store")
+def test_guru_ask_empty_overlay_emits_no_call_even_with_session(mock_store_factory) -> None:
+    """An authenticated caller gets the same honest gap, and nothing is persisted."""
+    mock_store = MagicMock()
+    mock_store_factory.return_value = mock_store
+
+    response = client.post(
+        "/api/v1/astrogrid/guru/ask",
+        headers=_auth_header(),
+        json={
+            "question": "What crypto should I buy right now?",
+            "market_overlay_snapshot": {},
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    answer = data["answer"]
+    assert answer["call"] is None
+    assert answer["status"] == "no_scoreable_data"
+    assert answer["setup"] is None
+    assert answer["invalidation"] is None
+    assert answer["invalidation_basis"] is None
+    assert answer["overlay_ranked_items"] == 0
+    assert "no relative-strength comparison was performed" in answer["reason"]
+    assert data["call"] is None
+    assert data["prediction"] is None
+    mock_store.save_prediction.assert_not_called()
+
+    body = response.text
+    assert "cleanest mapped relative-strength read" not in body
+    assert "buy BTC" not in body
+
+
+@patch("api.routers.astrogrid_predictions.get_astrogrid_store")
+def test_guru_ask_overlay_without_matching_symbols_emits_no_call(mock_store_factory) -> None:
+    """Partial data: a populated scorecard matching none of the targets is still a gap."""
+    mock_store = MagicMock()
+    mock_store_factory.return_value = mock_store
+
+    response = client.post(
+        "/api/v1/astrogrid/guru/ask",
+        headers=_auth_header(),
+        json={
+            "question": "Should I buy META right now?",
+            "target_symbols": ["META"],
+            "market_overlay_snapshot": {
+                "scorecard": {
+                    "items": [
+                        {"symbol": "BTC", "group": "crypto", "momentum_score": 0.9},
+                    ]
+                }
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    answer = response.json()["answer"]
+    assert answer["call"] is None
+    assert answer["status"] == "no_scoreable_data"
+    assert "META" in answer["reason"]
+    mock_store.save_prediction.assert_not_called()
+
+
+@patch("api.routers.astrogrid_predictions.publish_astrogrid_prediction")
+@patch("api.routers.astrogrid_predictions._classify_prediction_scoreability")
+@patch("api.routers.astrogrid_predictions.get_astrogrid_store")
+def test_guru_ask_populated_overlay_labels_invalidation_as_house_rule(
+    mock_store_factory,
+    mock_classify_scoreability,
+    mock_publish,
+) -> None:
+    mock_store = MagicMock()
+    mock_classify_scoreability.return_value = (
+        "liquid_market",
+        [{"symbol": "BTC", "status": "scoreable_now", "scoreable_now": True, "reason_if_not": None}],
+    )
+    mock_store.save_prediction.return_value = {"prediction_id": "guru-2", "call": "buy BTC"}
+    mock_store_factory.return_value = mock_store
+    mock_publish.return_value = {"status": "published"}
+
+    response = client.post(
+        "/api/v1/astrogrid/guru/ask",
+        headers=_auth_header(),
+        json={
+            "question": "What crypto should I buy right now?",
+            "market_overlay_snapshot": {
+                "scorecard": {
+                    "items": [
+                        {"symbol": "BTC", "group": "crypto", "momentum_score": 0.9},
+                        {"symbol": "ETH", "group": "crypto", "momentum_score": 0.2},
+                    ]
+                }
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    answer = response.json()["answer"]
+    assert answer["call"] == "buy BTC"
+    assert answer["status"] == "scoreable"
+    assert answer["overlay_ranked_items"] == 2
+    assert answer["invalidation_basis"] == "house_rule_fixed_pct"
+    assert answer["invalidation_detail"]["swing_pct"] == 4.0
+    assert answer["invalidation_detail"]["macro_pct"] == 8.0
+    assert answer["invalidation_detail"]["derived_from"] is None
+    assert "fixed house rule" in answer["invalidation"]
+    saved = mock_store.save_prediction.call_args.args[0]
+    assert saved["market_overlay_snapshot"]["overlay_scoreability"]["status"] == "scoreable"
+    assert saved["market_overlay_snapshot"]["overlay_scoreability"]["ranked_items"] == 2
+
+
+@patch("api.routers.astrogrid_predictions.publish_astrogrid_prediction")
+@patch("api.routers.astrogrid_predictions._classify_prediction_scoreability")
+@patch("api.routers.astrogrid_predictions.get_astrogrid_store")
+def test_create_prediction_refuses_guru_directive_without_overlay_ranking(
+    mock_store_factory,
+    mock_classify_scoreability,
+    mock_publish,
+) -> None:
+    mock_store = MagicMock()
+    mock_classify_scoreability.return_value = ("liquid_market", [])
+    mock_store_factory.return_value = mock_store
+
+    response = client.post(
+        "/api/v1/astrogrid/predictions",
+        headers=_auth_header(),
+        json={
+            "question": "What crypto should I buy right now?",
+            "call": "buy BTC",
+            "timing": "7d swing window",
+            "setup": "BTC has the cleanest mapped relative-strength read in crypto",
+            "invalidation": "stop the read if BTC gives back 4% on swing",
+            "market_overlay_snapshot": {},
+            "model_version": "astrogrid-guru-v1",
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["call"] is None
+    assert data["status"] == "no_scoreable_data"
+    assert data["persisted"] is False
+    assert data["reason"]
+    mock_store.save_prediction.assert_not_called()
+    mock_publish.assert_not_called()
+
+
+@patch("api.routers.astrogrid_predictions.publish_astrogrid_prediction")
+@patch("api.routers.astrogrid_predictions._classify_prediction_scoreability")
+@patch("api.routers.astrogrid_predictions.get_astrogrid_store")
+def test_create_prediction_discloses_overlay_gap_for_operator_authored_call(
+    mock_store_factory,
+    mock_classify_scoreability,
+    mock_publish,
+) -> None:
+    """An operator-authored call is kept, but the empty overlay is disclosed, not hidden."""
+    mock_store = MagicMock()
+    mock_classify_scoreability.return_value = ("liquid_market", [])
+    mock_store.save_prediction.return_value = {"prediction_id": "pred-9", "call": "press BTC"}
+    mock_store_factory.return_value = mock_store
+    mock_publish.return_value = {"status": "published"}
+
+    response = client.post(
+        "/api/v1/astrogrid/predictions",
+        headers=_auth_header(),
+        json={
+            "question": "what crypto should i buy right now?",
+            "call": "press BTC",
+            "timing": "now",
+            "setup": "operator read",
+            "invalidation": "break if regime flips",
+            "market_overlay_snapshot": {},
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["market_overlay_scoreability"]["status"] == "no_scoreable_data"
+    assert data["market_overlay_scoreability"]["ranked_items"] == 0
+    saved = mock_store.save_prediction.call_args.args[0]
+    scoreability = saved["market_overlay_snapshot"]["overlay_scoreability"]
+    assert scoreability["status"] == "no_scoreable_data"
+    assert scoreability["reason"]
 
 
 @patch("api.routers.astrogrid_predictions.get_astrogrid_store")
