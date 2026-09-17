@@ -44,8 +44,9 @@ def _default_env(**overrides: str) -> dict[str, str]:
 
 
 class _FakeCursor:
-    def __init__(self, work_rows):
+    def __init__(self, work_rows, insert_rowcount: int = 1):
         self._work_rows = work_rows
+        self._insert_rowcount = insert_rowcount
         self.executed: list[str] = []
 
     def execute(self, sql, params=None):
@@ -56,12 +57,12 @@ class _FakeCursor:
 
     @property
     def rowcount(self):
-        return 1
+        return self._insert_rowcount
 
 
 class _FakeConn:
-    def __init__(self, work_rows):
-        self.cursor_obj = _FakeCursor(work_rows)
+    def __init__(self, work_rows, insert_rowcount: int = 1):
+        self.cursor_obj = _FakeCursor(work_rows, insert_rowcount)
         self.commits = 0
         self.closed = False
 
@@ -75,8 +76,8 @@ class _FakeConn:
         self.closed = True
 
 
-def _install_fake_db(monkeypatch, work_rows):
-    fake_conn = _FakeConn(work_rows)
+def _install_fake_db(monkeypatch, work_rows, insert_rowcount: int = 1):
+    fake_conn = _FakeConn(work_rows, insert_rowcount)
     monkeypatch.setattr("psycopg2.connect", lambda **kwargs: fake_conn)
     return fake_conn
 
@@ -147,6 +148,29 @@ def test_success_stamps_only_twelvedata_not_dividends_splits_stats(monkeypatch) 
     assert "DIVIDENDS" not in stamp_sql[0]
     assert "SPLITS" not in stamp_sql[0]
     assert "STATS" not in stamp_sql[0]
+
+
+def test_all_rows_xbrl_protected_is_not_total_failure(monkeypatch) -> None:
+    """The bug this fixes: inserted_total == 0 was read as "every ticker
+    failed." A successful fetch whose every (ticker, obs_date) row is
+    already SEC-XBRL-owned also yields inserted_total == 0 via the ON
+    CONFLICT ... WHERE guard's cur.rowcount == 0 — that's the intended,
+    protective outcome, not a failure, and the source was still reached.
+    """
+    mod = _load_module(monkeypatch, _default_env())
+    fake_conn = _install_fake_db(
+        monkeypatch,
+        work_rows=[{"ticker": "AAA", "bucket": "DEAD"}],
+        insert_rowcount=0,  # every INSERT ... ON CONFLICT ... WHERE is a no-op
+    )
+    monkeypatch.setattr(mod, "fetch_td", lambda ticker, start, end: [{"date": "2026-01-01", "close": 1.0}])
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+
+    rc = mod.main()
+
+    assert rc == 0
+    stamp_sql = [sql for sql in fake_conn.cursor_obj.executed if "source_catalog" in sql]
+    assert len(stamp_sql) == 1  # fetched_ok > 0 still stamps TWELVEDATA as pulled
 
 
 def test_redact_api_key_strips_the_key_from_arbitrary_text(monkeypatch) -> None:

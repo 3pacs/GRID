@@ -189,9 +189,18 @@ def main() -> int:
         conn.close()
         return 0
 
+    # Tracked separately, per the distinction that matters for both the
+    # exit code and the freshness stamp below: a fetch either failed
+    # outright (no bars — a real problem) or succeeded (bars came back
+    # from Twelve Data, i.e. the source itself is reachable and fresh).
+    # A successful fetch can still write zero rows if every date is
+    # SEC-XBRL-owned (the ON CONFLICT WHERE guard intentionally skips
+    # those) — that's a correct, protective no-op, not a failure, and
+    # must not be counted as one.
+    fetched_ok = 0
     inserted_total = 0
+    protected_total = 0
     failed: list[str] = []
-    skipped: list[str] = []
     for i, row in enumerate(work, 1):
         ticker = row["ticker"]
         bucket = row["bucket"]
@@ -203,7 +212,9 @@ def main() -> int:
             print(f"[{i}/{len(work)}] {ticker} ({bucket}): 0 bars")
             time.sleep(RATE_LIMIT_SEC)
             continue
+        fetched_ok += 1
         ins = 0
+        protected = 0
         for b in bars:
             # task #171: defer to SEC XBRL on every (ticker, obs_date)
             # row it has already written. We detect XBRL ownership via
@@ -211,7 +222,9 @@ def main() -> int:
             # populated by sec_xbrl_shares.py. TD remains responsible
             # for filling pure-gap rows (XBRL never ran OR window out
             # of range). On conflict where XBRL has written, the UPDATE
-            # is a no-op via the WHERE clause.
+            # is a no-op via the WHERE clause — cur.rowcount is 0 for
+            # that row, distinct from a failure: the fetch succeeded and
+            # this script correctly deferred to the canonical writer.
             cur.execute(
                 """
                 INSERT INTO ticker_metrics_daily (ticker, obs_date, close_price, source, as_of)
@@ -226,23 +239,32 @@ def main() -> int:
             )
             if cur.rowcount > 0:
                 ins += 1
+            else:
+                protected += 1
         conn.commit()
         inserted_total += ins
-        print(f"[{i}/{len(work)}] {ticker} ({bucket}): {len(bars)} bars, {ins} ins/upd")
+        protected_total += protected
+        print(f"[{i}/{len(work)}] {ticker} ({bucket}): {len(bars)} bars, "
+              f"{ins} ins/upd, {protected} XBRL-protected")
         time.sleep(RATE_LIMIT_SEC)
 
-    print(f"\nDONE inserted/updated={inserted_total} failed={len(failed)} skipped={len(skipped)}")
+    print(f"\nDONE fetched_ok={fetched_ok}/{len(work)} inserted/updated={inserted_total} "
+          f"protected={protected_total} failed={len(failed)}")
     if failed:
         print(f"failed tickers: {failed[:40]}{'...' if len(failed)>40 else ''}")
 
     # Stamp source_catalog so freshness monitoring reflects actual pull
-    # cadence — but only for what this run actually did. Two things the
-    # previous version got wrong: it stamped unconditionally, even when
-    # every single ticker failed and inserted_total was 0, marking a
-    # totally failed run as freshly-pulled; and it stamped
-    # TWELVEDATA_DIVIDENDS/_SPLITS/_STATS, which this script — it only
-    # calls the /time_series daily-close endpoint — never fetches at all.
-    if inserted_total > 0:
+    # cadence from the source — separate from data coverage. A run where
+    # every fetch succeeded but every row was XBRL-protected still means
+    # TWELVEDATA itself was successfully queried just now; it's only
+    # inserted_total that would be zero. Gating the stamp on fetched_ok
+    # (not inserted_total) keeps "source was pulled" and "rows were
+    # written" as the two different things they are. Also fixed:
+    # previously stamped TWELVEDATA_DIVIDENDS/_SPLITS/_STATS
+    # unconditionally on every successful run — this script only ever
+    # calls the /time_series daily-close endpoint and never fetches any
+    # of those three.
+    if fetched_ok > 0:
         try:
             cur.execute("""
                 UPDATE source_catalog SET last_pull_at = now()
@@ -254,12 +276,14 @@ def main() -> int:
 
     conn.close()
 
-    if work and inserted_total == 0:
-        # Every ticker in this run failed — a scheduler/monitor watching
-        # this job's exit code must be able to tell total failure from
-        # success, not just read it out of the log text.
-        print("total failure: 0 tickers inserted/updated out of "
-              f"{len(work)} attempted", file=sys.stderr)
+    if work and fetched_ok == 0:
+        # Every ticker in this run failed to fetch — a scheduler/monitor
+        # watching this job's exit code must be able to tell total
+        # failure from success (including the legitimate all-protected
+        # case, which is not a failure), not just read it out of the
+        # log text.
+        print(f"total failure: 0/{len(work)} tickers had a successful fetch",
+              file=sys.stderr)
         return 1
     return 0
 
