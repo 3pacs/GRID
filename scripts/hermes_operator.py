@@ -2704,7 +2704,15 @@ def main(args: list[str] | None = None) -> None:
                 result[0] = run_cycle(state, dry_run=dry_run)
             except Exception as exc:
                 error[0] = exc
-        t = threading.Thread(target=_target, daemon=True)
+        # Named explicitly (default would be "Thread-N") so db.py's
+        # per-thread checkout attribution (get_checkout_attribution) can
+        # actually distinguish this cycle's connections from the
+        # long-running llm-taskqueue background thread's, instead of both
+        # showing up as anonymous thread names in a burst.
+        t = threading.Thread(
+            target=_target, daemon=True,
+            name=f"hermes-cycle-{state.cycle_count + 1}",
+        )
         t.start()
         t.join(timeout=timeout)
         if t.is_alive():

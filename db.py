@@ -69,6 +69,78 @@ def get_pool_peak_checked_out() -> int:
         return _pool_peak_checked_out
 
 
+# ---------------------------------------------------------------------------
+# Checkout attribution — WHICH thread holds each open connection and for how
+# long, so a burst like the one on 2026-09-17 (checked_out climbing 17->48
+# during a hermes cycle) can be attributed by thread/lifetime instead of
+# re-investigated from scratch each time. Deliberately does NOT attempt to
+# capture the calling code's stack (SQLAlchemy pool internals are between
+# the checkout event and any application frame, so a cheap single-frame
+# lookup would only show pool-internal code, and a full stack walk on every
+# checkout is not bounded overhead on a hot path). Thread name is enough to
+# distinguish concurrent owners sharing one process's pool (e.g. a cycle
+# worker thread vs. the llm-taskqueue background thread) and correlates
+# against each thread's own structured logs (cycle/task boundaries) for
+# finer attribution. Logs no SQL, no query parameters, no connection
+# strings, and no credentials -- only thread names, counts, and durations.
+# ---------------------------------------------------------------------------
+_checkout_lock = threading.Lock()
+_open_checkouts: dict[int, tuple[str, float]] = {}  # id(connection_rec) -> (thread_name, monotonic_start)
+
+# A connection held open this long is notable regardless of pool pressure --
+# most queries in this codebase are expected to complete in well under a
+# second (db.py's own statement_timeout defaults to 120s as a hard ceiling,
+# but that bounds a single statement, not how long application code might
+# hold a connection open across several statements or other work).
+_LIFETIME_WARN_SECONDS = 5.0
+
+
+def _record_checkout_open(connection_rec: object) -> None:
+    """Record that a connection was just checked out, by whichever thread did it."""
+    thread_name = threading.current_thread().name
+    with _checkout_lock:
+        _open_checkouts[id(connection_rec)] = (thread_name, time.monotonic())
+
+
+def _record_checkout_closed(connection_rec: object) -> None:
+    """Record that a connection was returned; warn if it was held unusually long."""
+    key = id(connection_rec)
+    with _checkout_lock:
+        entry = _open_checkouts.pop(key, None)
+    if entry is None:
+        return
+    thread_name, opened_at = entry
+    lifetime_s = time.monotonic() - opened_at
+    if lifetime_s > _LIFETIME_WARN_SECONDS:
+        log.warning(
+            "DB connection held {s:.1f}s by thread={t} before being returned",
+            s=lifetime_s, t=thread_name,
+        )
+
+
+def get_checkout_attribution() -> dict[str, Any]:
+    """Return currently-open checkouts grouped by thread, with ages.
+
+    Returns:
+        dict with ``by_thread`` (thread name -> count of connections that
+        thread currently holds open) and ``oldest_open_seconds`` (age of the
+        longest-held currently-open connection, or None if none are open).
+        Contains no SQL, parameters, or connection details -- only thread
+        names, counts, and durations.
+    """
+    now = time.monotonic()
+    with _checkout_lock:
+        entries = list(_open_checkouts.values())
+    by_thread: dict[str, int] = {}
+    oldest_age: float | None = None
+    for thread_name, opened_at in entries:
+        by_thread[thread_name] = by_thread.get(thread_name, 0) + 1
+        age = now - opened_at
+        if oldest_age is None or age > oldest_age:
+            oldest_age = age
+    return {"by_thread": by_thread, "oldest_open_seconds": oldest_age}
+
+
 def reset_pool_peak(baseline: int = 0) -> None:
     """Reset the checked-out high-water-mark, using ``baseline`` as the floor.
 
@@ -150,13 +222,20 @@ def get_engine() -> Engine:
             checked_out = _engine.pool.checkedout()  # type: ignore[union-attr]
             capacity = pool_size + max_overflow
             _record_checkout_peak(checked_out)
+            _record_checkout_open(connection_rec)
             if checked_out > _warn_threshold:
                 log.warning(
-                    "DB pool utilization high — {co}/{cap} connections checked out ({pct:.0f}%)",
+                    "DB pool utilization high — {co}/{cap} connections checked out ({pct:.0f}%) "
+                    "owners={owners}",
                     co=checked_out,
                     cap=capacity,
                     pct=checked_out / capacity * 100,
+                    owners=get_checkout_attribution()["by_thread"],
                 )
+
+        @event.listens_for(_engine, "checkin")
+        def _on_checkin(dbapi_conn, connection_rec):  # noqa: ARG001
+            _record_checkout_closed(connection_rec)
 
         log.info(
             "SQLAlchemy engine created — pool_size={ps}, max_overflow={mo}",
@@ -195,8 +274,11 @@ def get_pool_stats(engine: Engine | None = None) -> dict[str, int]:
         since the last :func:`reset_pool_peak` call — catches bursts a
         point-in-time sample would miss between observations),
         ``overflow`` (SQLAlchemy's raw overflow counter — negative means
-        the pool holds fewer live connections than pool_size), and
-        ``capacity`` (pool_size + max_overflow, the hard ceiling).
+        the pool holds fewer live connections than pool_size),
+        ``capacity`` (pool_size + max_overflow, the hard ceiling), and
+        ``checkout_owners`` (currently-open checkouts grouped by thread
+        name, plus the oldest open connection's age — see
+        :func:`get_checkout_attribution`).
     """
     eng = engine if engine is not None else get_engine()
     pool = eng.pool
@@ -211,6 +293,7 @@ def get_pool_stats(engine: Engine | None = None) -> dict[str, int]:
         "peak_checked_out": get_pool_peak_checked_out(),
         "overflow": pool.overflow(),  # type: ignore[attr-defined]
         "capacity": pool_size + max_overflow,
+        "checkout_owners": get_checkout_attribution(),
     }
 
 
