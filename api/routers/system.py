@@ -106,13 +106,16 @@ def health() -> HealthResponse:
             if not recent:
                 degraded_reasons.append("no data pulled in 7 days")
 
-        # Connection pool details
-        pool = engine.pool
-        pool_ok = pool.checkedout() < pool.size() + pool.overflow()
+        # Connection pool details — shared helper so every process (API,
+        # Hermes, ...) reports the same fields the same way instead of each
+        # reading engine.pool.* ad hoc.
+        from db import get_pool_stats
+        pool_stats = get_pool_stats(engine)
+        pool_ok = pool_stats["checked_out"] < pool_stats["capacity"]
         checks["pool_healthy"] = pool_ok
-        checks["pool_size"] = pool.size()
-        checks["pool_checked_out"] = pool.checkedout()
-        checks["pool_overflow"] = pool.overflow()
+        checks["pool_size"] = pool_stats["pool_size"]
+        checks["pool_checked_out"] = pool_stats["checked_out"]
+        checks["pool_overflow"] = pool_stats["overflow"]
         if not pool_ok:
             degraded_reasons.append("connection pool exhausted")
     except Exception as exc:
