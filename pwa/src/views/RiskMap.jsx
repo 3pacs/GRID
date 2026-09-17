@@ -18,6 +18,9 @@ const RISK_COLORS = {
     elevated: '#F97316',
     high: '#EF4444',
     critical: '#991B1B',
+    // Sub-system reported no data (backend `available: false`). Rendered
+    // grey and never as a default 'moderate' reading.
+    unknown: '#64748B',
 };
 
 const RISK_WEIGHTS = {
@@ -26,6 +29,7 @@ const RISK_WEIGHTS = {
     elevated: 4,
     moderate: 3,
     low: 2,
+    unknown: 1,
 };
 
 const CATEGORY_LABELS = {
@@ -113,7 +117,8 @@ function metricLabel(key) {
 
 function RiskGauge({ score }) {
     const svgRef = useRef(null);
-    const scoreVal = Math.round((score || 0) * 100);
+    const hasScore = typeof score === 'number' && Number.isFinite(score);
+    const scoreVal = hasScore ? Math.round(score * 100) : null;
 
     useEffect(() => {
         if (!svgRef.current) return;
@@ -134,6 +139,27 @@ function RiskGauge({ score }) {
         grad.append('stop').attr('offset', '55%').attr('stop-color', RISK_COLORS.elevated);
         grad.append('stop').attr('offset', '75%').attr('stop-color', RISK_COLORS.high);
         grad.append('stop').attr('offset', '100%').attr('stop-color', RISK_COLORS.critical);
+
+        if (scoreVal === null) {
+            // No overall score (every sub-system unavailable): draw the empty
+            // dial and say so instead of animating a needle to 0.
+            const arcEmpty = d3.arc()
+                .innerRadius(innerR).outerRadius(outerR)
+                .startAngle(-Math.PI / 2).endAngle(Math.PI / 2);
+            svg.append('path')
+                .attr('d', arcEmpty())
+                .attr('transform', `translate(${cx},${cy})`)
+                .attr('fill', colors.border)
+                .attr('opacity', 0.4);
+            svg.append('text')
+                .attr('x', cx).attr('y', cy - 25)
+                .attr('text-anchor', 'middle')
+                .attr('font-size', '14px')
+                .attr('font-family', colors.mono)
+                .attr('fill', colors.textMuted)
+                .text('UNAVAILABLE');
+            return;
+        }
 
         // Background arc
         const arcBg = d3.arc()
@@ -256,7 +282,7 @@ function RiskTreemap({ data, selectedCategory, onSelect }) {
         // Build hierarchy
         const children = CATEGORY_KEYS.map(key => {
             const cat = data[key] || {};
-            const level = cat.risk_level || 'moderate';
+            const level = cat.risk_level || 'unknown';
             return {
                 key,
                 label: CATEGORY_LABELS[key],
@@ -351,12 +377,23 @@ function RiskTreemap({ data, selectedCategory, onSelect }) {
                 const m = d.data.metrics;
                 const cellW = d.x1 - d.x0;
                 if (cellW < 100) return '';
+                // An unmeasured sub-system (backend available:false) shows
+                // 'no data'; a measured one with a missing metric shows '?'.
+                // Never print a default 0 / 0% as if it were observed.
+                if (m.available === false) return 'no data';
+                const num = (v) => (typeof v === 'number' && Number.isFinite(v)) ? v : null;
                 if (d.data.key === 'dealer_risk') return `GEX: ${m.gex_regime || '?'}`;
-                if (d.data.key === 'volatility_risk') return `VIX: ${m.vix || '?'}`;
-                if (d.data.key === 'concentration_risk') return `Top5: ${((m.top_5_watchlist_weight || 0) * 100).toFixed(0)}%`;
-                if (d.data.key === 'correlation_risk') return `Avg: ${m.avg_cross_correlation || '?'}`;
-                if (d.data.key === 'credit_risk') return `HY: ${m.hy_spread || '?'}bp`;
-                if (d.data.key === 'liquidity_risk') return `Fed: ${formatMetric('', m.fed_net_liquidity_change_1m || 0)}`;
+                if (d.data.key === 'volatility_risk') return `VIX: ${num(m.vix) ?? '?'}`;
+                if (d.data.key === 'concentration_risk') {
+                    const w = num(m.top_5_watchlist_weight);
+                    return `Top5: ${w === null ? '?' : (w * 100).toFixed(0) + '%'}`;
+                }
+                if (d.data.key === 'correlation_risk') return `Avg: ${num(m.avg_cross_correlation) ?? '?'}`;
+                if (d.data.key === 'credit_risk') return `HY: ${num(m.hy_spread) ?? '?'}bp`;
+                if (d.data.key === 'liquidity_risk') {
+                    const c = num(m.fed_net_liquidity_change_1m);
+                    return `Fed: ${c === null ? '?' : formatMetric('', c)}`;
+                }
                 return '';
             })
             .attr('font-size', '10px')
@@ -423,9 +460,11 @@ function RiskDetailPanel({ categoryKey, data }) {
     if (!categoryKey || !data) return null;
 
     const cat = data[categoryKey] || {};
-    const level = cat.risk_level || 'moderate';
-    const color = RISK_COLORS[level] || RISK_COLORS.moderate;
-    const explanation = (LEVEL_EXPLANATIONS[categoryKey] || {})[level] || '';
+    const level = cat.risk_level || 'unknown';
+    const color = RISK_COLORS[level] || RISK_COLORS.unknown;
+    const explanation = level === 'unknown'
+        ? `No data for this risk sub-system${cat.reason ? ` (${cat.reason})` : ''}.`
+        : (LEVEL_EXPLANATIONS[categoryKey] || {})[level] || '';
 
     // Filter out risk_level from displayed metrics
     const metrics = Object.entries(cat).filter(([k]) => k !== 'risk_level');
@@ -537,225 +576,49 @@ function RiskDetailPanel({ categoryKey, data }) {
 
 // ── Risk Timeline (bottom strip) ───────────────────────────────────────
 
-function RiskTimeline({ data, onPointClick }) {
-    const svgRef = useRef(null);
-    const containerRef = useRef(null);
-    const [width, setWidth] = useState(600);
-    const [hoveredPoint, setHoveredPoint] = useState(null);
-
-    useEffect(() => {
-        if (!containerRef.current) return;
-        const obs = new ResizeObserver(entries => {
-            for (const e of entries) {
-                const w = e.contentRect.width;
-                if (w > 0) setWidth(w);
-            }
-        });
-        obs.observe(containerRef.current);
-        setWidth(containerRef.current.clientWidth || 600);
-        return () => obs.disconnect();
-    }, []);
-
-    useEffect(() => {
-        if (!svgRef.current || !data) return;
-
-        const h = 80;
-        const margin = { top: 10, right: 12, bottom: 20, left: 40 };
-        const svg = d3.select(svgRef.current);
-        svg.selectAll('*').remove();
-        svg.attr('width', width).attr('height', h);
-
-        const chartW = width - margin.left - margin.right;
-        const chartH = h - margin.top - margin.bottom;
-
-        // Generate synthetic timeline from current snapshot (in a real system
-        // this would come from stored historical risk scores)
-        const now = new Date();
-        const categories = CATEGORY_KEYS;
-        const levelScore = { critical: 1, high: 0.8, elevated: 0.6, moderate: 0.4, low: 0.2 };
-
-        const timelineData = categories.map(key => {
-            const cat = data[key] || {};
-            const currentScore = levelScore[cat.risk_level || 'moderate'] || 0.4;
-            // Generate 30 synthetic points with some random walk around current
-            const points = [];
-            let val = currentScore;
-            for (let i = 29; i >= 0; i--) {
-                const d = new Date(now);
-                d.setDate(d.getDate() - i);
-                val = Math.max(0.05, Math.min(0.95, val + (Math.random() - 0.5) * 0.12));
-                points.push({ date: d, value: val });
-            }
-            // Pin last point to actual
-            points[points.length - 1].value = currentScore;
-            return { key, label: CATEGORY_LABELS[key], points, color: RISK_COLORS[cat.risk_level || 'moderate'] };
-        });
-
-        const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
-
-        const xScale = d3.scaleTime()
-            .domain([timelineData[0].points[0].date, now])
-            .range([0, chartW]);
-
-        const yScale = d3.scaleLinear()
-            .domain([0, 1])
-            .range([chartH, 0]);
-
-        // Grid
-        g.append('line')
-            .attr('x1', 0).attr('x2', chartW)
-            .attr('y1', yScale(0.6)).attr('y2', yScale(0.6))
-            .attr('stroke', `${RISK_COLORS.elevated}30`)
-            .attr('stroke-width', 0.5)
-            .attr('stroke-dasharray', '4,3');
-
-        // Lines
-        const lineGen = d3.line()
-            .x(d => xScale(d.date))
-            .y(d => yScale(d.value))
-            .curve(d3.curveMonotoneX);
-
-        timelineData.forEach(series => {
-            g.append('path')
-                .datum(series.points)
-                .attr('fill', 'none')
-                .attr('stroke', series.color)
-                .attr('stroke-width', 1.2)
-                .attr('opacity', 0.7)
-                .attr('d', lineGen);
-        });
-
-        // Convergence highlight: shade areas where 3+ categories above 0.6
-        for (let i = 0; i < 30; i++) {
-            const elevatedCount = timelineData.filter(s => s.points[i].value >= 0.6).length;
-            if (elevatedCount >= 3) {
-                const x = xScale(timelineData[0].points[i].date);
-                const w2 = chartW / 30;
-                g.append('rect')
-                    .attr('x', x - w2 / 2)
-                    .attr('y', 0)
-                    .attr('width', w2)
-                    .attr('height', chartH)
-                    .attr('fill', `${RISK_COLORS.high}12`)
-                    .attr('rx', 1);
-            }
-        }
-
-        // Interactive overlay - vertical hover line + tooltip
-        const overlay = g.append('rect')
-            .attr('width', chartW)
-            .attr('height', chartH)
-            .attr('fill', 'transparent')
-            .style('cursor', 'pointer');
-
-        const hoverLine = g.append('line')
-            .attr('y1', 0).attr('y2', chartH)
-            .attr('stroke', '#E8F0F840')
-            .attr('stroke-width', 1)
-            .attr('stroke-dasharray', '4,3')
-            .attr('opacity', 0);
-
-        const hoverDots = timelineData.map(series => {
-            return g.append('circle')
-                .attr('r', 3)
-                .attr('fill', series.color)
-                .attr('stroke', '#E8F0F8')
-                .attr('stroke-width', 1)
-                .attr('opacity', 0);
-        });
-
-        overlay.on('mousemove', function (event) {
-            const [mx] = d3.pointer(event);
-            const dateAtMouse = xScale.invert(mx);
-            const idx = Math.round((dateAtMouse - timelineData[0].points[0].date) / (1000 * 60 * 60 * 24));
-            const clampedIdx = Math.max(0, Math.min(29, idx));
-
-            hoverLine.attr('x1', mx).attr('x2', mx).attr('opacity', 1);
-
-            const pointData = timelineData.map((series, si) => {
-                const pt = series.points[clampedIdx];
-                if (pt) {
-                    hoverDots[si].attr('cx', xScale(pt.date)).attr('cy', yScale(pt.value)).attr('opacity', 1);
-                }
-                const levelNames = ['Low', 'Low', 'Moderate', 'Elevated', 'High', 'Critical'];
-                return { label: series.label, value: pt ? levelNames[Math.round(pt.value * 5)] : '--', color: series.color };
-            });
-
-            const date = timelineData[0].points[clampedIdx]?.date;
-            setHoveredPoint({
-                x: event.clientX, y: event.clientY,
-                date: date ? d3.timeFormat('%b %d')(date) : '',
-                categories: pointData,
-                elevatedCount: timelineData.filter(s => s.points[clampedIdx]?.value >= 0.6).length,
-            });
-        })
-        .on('mouseleave', function () {
-            hoverLine.attr('opacity', 0);
-            hoverDots.forEach(d => d.attr('opacity', 0));
-            setHoveredPoint(null);
-        })
-        .on('click', function (event) {
-            const [mx] = d3.pointer(event);
-            const dateAtMouse = xScale.invert(mx);
-            const idx = Math.round((dateAtMouse - timelineData[0].points[0].date) / (1000 * 60 * 60 * 24));
-            const clampedIdx = Math.max(0, Math.min(29, idx));
-            const date = timelineData[0].points[clampedIdx]?.date;
-            if (onPointClick && date) {
-                onPointClick(date, timelineData.map(s => ({ key: s.key, label: s.label, value: s.points[clampedIdx]?.value })));
-            }
-        });
-
-        // X axis
-        g.append('g')
-            .attr('transform', `translate(0,${chartH})`)
-            .call(d3.axisBottom(xScale).ticks(5).tickSize(0).tickFormat(d3.timeFormat('%b %d')))
-            .call(g => g.select('.domain').remove())
-            .call(g => g.selectAll('.tick text')
-                .attr('font-size', '8px')
-                .attr('font-family', colors.mono)
-                .attr('fill', colors.textMuted));
-
-        // Y axis
-        g.append('g')
-            .call(d3.axisLeft(yScale).ticks(3).tickSize(0).tickFormat(d => ['', '', '', '', ''][Math.round(d * 4)] || ''))
-            .call(g => g.select('.domain').remove());
-
-    }, [data, width, onPointClick]);
+function RiskTimeline({ data }) {
+    // The risk-map API returns a single current snapshot per category and
+    // no stored history. An earlier version of this component drew a 30-day
+    // "RISK TIMELINE" from a random walk anchored to the current level, with
+    // real calendar dates, hover readings and a convergence band -- fabricated
+    // history presented as observations. Until a backend history series
+    // exists, this renders only the real current levels and says plainly
+    // that history is unavailable.
+    const rows = CATEGORY_KEYS.map(key => {
+        const cat = data?.[key] || {};
+        // Backend marks an unmeasured sub-system with available:false and
+        // risk_level 'unknown'; both render as UNAVAILABLE, never as a level.
+        const measured = cat.available !== false && cat.risk_level && cat.risk_level !== 'unknown';
+        const level = measured ? cat.risk_level : null;
+        const known = level && RISK_COLORS[level];
+        return { key, label: CATEGORY_LABELS[key], level, color: known ? RISK_COLORS[level] : colors.textMuted };
+    });
+    const asOf = data?.generated_at ? formatDate(new Date(data.generated_at)) : null;
 
     return (
-        <div ref={containerRef} style={{ width: '100%', position: 'relative' }}>
-            <svg ref={svgRef} style={{ display: 'block', width: '100%', cursor: 'crosshair' }} />
-            {hoveredPoint && (
-                <div style={{
-                    position: 'fixed',
-                    left: Math.min(hoveredPoint.x + 12, window.innerWidth - 240),
-                    top: hoveredPoint.y - 100,
-                    background: '#0A1018',
-                    border: `1px solid ${colors.border}`,
-                    borderRadius: tokens.radius.md,
-                    padding: '10px 14px',
-                    maxWidth: '220px',
-                    zIndex: 1000,
-                    pointerEvents: 'none',
-                    boxShadow: '0 8px 32px rgba(0,0,0,0.6)',
-                }}>
-                    <div style={{ fontSize: '11px', fontWeight: 700, color: '#E8F0F8', fontFamily: colors.mono, marginBottom: '6px' }}>
-                        {hoveredPoint.date}
-                        {hoveredPoint.elevatedCount >= 3 && (
-                            <span style={{ color: RISK_COLORS.high, marginLeft: '6px', fontSize: '9px' }}>CONVERGENCE</span>
-                        )}
+        <div style={{ width: '100%' }}>
+            <div style={{
+                fontSize: '11px', color: colors.textMuted, fontFamily: colors.mono,
+                padding: '10px 0 8px',
+            }}>
+                No 30-day risk history is stored yet. Showing the current snapshot only
+                {asOf ? ` (as of ${asOf})` : ''}.
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                {rows.map(r => (
+                    <div key={r.key} style={{
+                        display: 'flex', alignItems: 'center', gap: '6px',
+                        padding: '4px 8px', border: `1px solid ${colors.border}`,
+                        borderRadius: tokens.radius.sm, fontFamily: colors.mono, fontSize: '10px',
+                    }}>
+                        <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: r.color, display: 'inline-block' }} />
+                        <span style={{ color: colors.textMuted }}>{r.label}</span>
+                        <span style={{ color: r.color, fontWeight: 700 }}>
+                            {r.level ? r.level.toUpperCase() : 'UNAVAILABLE'}
+                        </span>
                     </div>
-                    {hoveredPoint.categories.map((cat, i) => (
-                        <div key={i} style={{ display: 'flex', justifyContent: 'space-between', fontSize: '9px', fontFamily: colors.mono, padding: '1px 0' }}>
-                            <span style={{ color: colors.textMuted }}>{cat.label}</span>
-                            <span style={{ color: cat.color, fontWeight: 600 }}>{cat.value}</span>
-                        </div>
-                    ))}
-                    <div style={{ fontSize: '8px', color: colors.textMuted, fontFamily: colors.mono, marginTop: '4px', borderTop: `1px solid ${colors.borderSubtle}`, paddingTop: '4px' }}>
-                        Click to select this date
-                    </div>
-                </div>
-            )}
+                ))}
+            </div>
         </div>
     );
 }
@@ -768,7 +631,6 @@ export default function RiskMap({ onNavigate }) {
     const [error, setError] = useState(null);
     const [selectedCategory, setSelectedCategory] = useState(null);
     const [gaugeExpanded, setGaugeExpanded] = useState(false);
-    const [timelineTooltip, setTimelineTooltip] = useState(null);
     const [riskSearch, setRiskSearch] = useState('');
     const [treemapZoom, setTreemapZoom] = useState(1);
     const fullScreenRef = useRef(null);
@@ -902,8 +764,8 @@ export default function RiskMap({ onNavigate }) {
                             }}>
                                 {CATEGORY_KEYS.map(key => {
                                     const cat = data[key] || {};
-                                    const level = cat.risk_level || 'moderate';
-                                    const rColor = RISK_COLORS[level] || RISK_COLORS.moderate;
+                                    const level = cat.risk_level || 'unknown';
+                                    const rColor = RISK_COLORS[level] || RISK_COLORS.unknown;
                                     return (
                                         <div key={key}
                                             onClick={(e) => { e.stopPropagation(); handleSelect(key); }}
@@ -1024,57 +886,10 @@ export default function RiskMap({ onNavigate }) {
                         )}
                     </div>
 
-                    {/* Timeline */}
+                    {/* Current snapshot per category (no stored history yet) */}
                     <div style={{ ...shared.card, marginTop: tokens.space.md }}>
-                        <div style={{
-                            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                        }}>
-                            <div style={shared.sectionTitle}>RISK TIMELINE (30D)</div>
-                            <div style={{
-                                fontSize: '9px', color: colors.textMuted,
-                                fontFamily: colors.mono,
-                            }}>
-                                Hover to inspect, click to select | Shaded = convergence
-                            </div>
-                        </div>
-                        <RiskTimeline
-                            data={data}
-                            onPointClick={(date, categories) => {
-                                setTimelineTooltip({ date, categories });
-                            }}
-                        />
-                        {/* Selected timeline point detail */}
-                        {timelineTooltip && (
-                            <div style={{
-                                marginTop: '8px', padding: '10px 14px',
-                                background: `${colors.accent}06`,
-                                border: `1px solid ${colors.accent}20`,
-                                borderRadius: tokens.radius.sm,
-                                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                                flexWrap: 'wrap', gap: '8px',
-                            }}>
-                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                                    <span style={{ fontSize: '11px', fontWeight: 700, color: colors.accent, fontFamily: colors.mono }}>
-                                        Selected: {timelineTooltip.date instanceof Date ? formatDate(timelineTooltip.date) : String(timelineTooltip.date)}
-                                    </span>
-                                    {timelineTooltip.categories.filter(c => c.value >= 0.6).length >= 3 && (
-                                        <span style={{
-                                            padding: '2px 6px', borderRadius: '3px',
-                                            fontSize: '9px', fontWeight: 700, fontFamily: colors.mono,
-                                            background: `${RISK_COLORS.high}20`, color: RISK_COLORS.high,
-                                        }}>CONVERGENCE</span>
-                                    )}
-                                </div>
-                                <button
-                                    onClick={() => setTimelineTooltip(null)}
-                                    style={{
-                                        background: 'none', border: `1px solid ${colors.border}`,
-                                        borderRadius: '4px', color: colors.textMuted, cursor: 'pointer',
-                                        padding: '2px 8px', fontSize: '10px', fontFamily: colors.mono,
-                                    }}
-                                >Dismiss</button>
-                            </div>
-                        )}
+                        <div style={shared.sectionTitle}>RISK LEVELS (CURRENT SNAPSHOT)</div>
+                        <RiskTimeline data={data} />
                     </div>
                 </>
             )}
