@@ -28,6 +28,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from store.observations import read_latest_n
 
 # ──────────────────────────────────────────────────────────────────
 # Schema
@@ -76,17 +77,9 @@ def _gather_market_moves(engine: Engine, target_date: date) -> dict[str, Any]:
                 "^VIX": "VIX",
             }
             for yf_ticker, label in index_tickers.items():
-                rows = conn.execute(
-                    text(
-                        "SELECT value, obs_date FROM raw_series "
-                        "WHERE series_id = :sid "
-                        "AND obs_date <= :dt "
-                        "ORDER BY obs_date DESC LIMIT 2"
-                    ),
-                    {"sid": f"YF:{yf_ticker}:close", "dt": target_date},
-                ).fetchall()
+                rows = read_latest_n(conn, f"YF:{yf_ticker}:close", 2, as_of=target_date)
                 if len(rows) >= 2:
-                    today_val, prior_val = float(rows[0][0]), float(rows[1][0])
+                    today_val, prior_val = rows[0].value, rows[1].value
                     chg = today_val - prior_val
                     chg_pct = (chg / prior_val * 100) if prior_val else 0
                     moves["indices"][label] = {
@@ -104,17 +97,9 @@ def _gather_market_moves(engine: Engine, target_date: date) -> dict[str, Any]:
             }
             sector_perf: list[dict] = []
             for etf, name in sector_etfs.items():
-                rows = conn.execute(
-                    text(
-                        "SELECT value, obs_date FROM raw_series "
-                        "WHERE series_id = :sid "
-                        "AND obs_date <= :dt "
-                        "ORDER BY obs_date DESC LIMIT 2"
-                    ),
-                    {"sid": f"YF:{etf}:close", "dt": target_date},
-                ).fetchall()
+                rows = read_latest_n(conn, f"YF:{etf}:close", 2, as_of=target_date)
                 if len(rows) >= 2:
-                    t, p = float(rows[0][0]), float(rows[1][0])
+                    t, p = rows[0].value, rows[1].value
                     pct = (t - p) / p * 100 if p else 0
                     sector_perf.append({"sector": name, "etf": etf, "change_pct": round(pct, 2)})
 
@@ -130,17 +115,9 @@ def _gather_market_moves(engine: Engine, target_date: date) -> dict[str, Any]:
                 "YF:TLT:close": "Long Bonds (TLT)",
             }
             for sid, label in notable_series.items():
-                rows = conn.execute(
-                    text(
-                        "SELECT value, obs_date FROM raw_series "
-                        "WHERE series_id = :sid "
-                        "AND obs_date <= :dt "
-                        "ORDER BY obs_date DESC LIMIT 2"
-                    ),
-                    {"sid": sid, "dt": target_date},
-                ).fetchall()
+                rows = read_latest_n(conn, sid, 2, as_of=target_date)
                 if len(rows) >= 2:
-                    t, p = float(rows[0][0]), float(rows[1][0])
+                    t, p = rows[0].value, rows[1].value
                     pct = (t - p) / p * 100 if p else 0
                     if abs(pct) >= 0.5:
                         moves["notable"].append({
@@ -258,17 +235,9 @@ def _gather_thesis_accuracy(engine: Engine, target_date: date) -> dict[str, Any]
 
         # Determine actual market direction from S&P close
         with engine.connect() as conn:
-            rows = conn.execute(
-                text(
-                    "SELECT value, obs_date FROM raw_series "
-                    "WHERE series_id = 'YF:^GSPC:close' "
-                    "AND obs_date <= :dt "
-                    "ORDER BY obs_date DESC LIMIT 2"
-                ),
-                {"dt": target_date},
-            ).fetchall()
+            rows = read_latest_n(conn, "YF:^GSPC:close", 2, as_of=target_date)
             if len(rows) >= 2:
-                today_close, prior_close = float(rows[0][0]), float(rows[1][0])
+                today_close, prior_close = rows[0].value, rows[1].value
                 daily_return = (today_close - prior_close) / prior_close * 100
                 accuracy["actual_outcome"] = "BULLISH" if daily_return > 0.1 else ("BEARISH" if daily_return < -0.1 else "NEUTRAL")
                 accuracy["sp500_return_pct"] = round(daily_return, 2)
@@ -380,8 +349,11 @@ def _build_diary_prompt(
 
     # Intelligence context: hypotheses and postmortems
     try:
-        from intelligence.context_provider import get_active_hypotheses, get_recent_postmortems
         from db import get_engine as _get_engine
+        from intelligence.context_provider import (
+            get_active_hypotheses,
+            get_recent_postmortems,
+        )
         _eng = _get_engine()
         hyp_context = get_active_hypotheses(_eng, limit=5)
         pm_context = get_recent_postmortems(_eng, limit=3)
@@ -414,7 +386,7 @@ def _generate_narrative(
     # Try to get an LLM client (LOCAL tier — high-volume narrative)
     if ollama_client is None:
         try:
-            from llm.router import get_llm, Tier
+            from llm.router import Tier, get_llm
             ollama_client = get_llm(Tier.LOCAL)
         except Exception as exc:
             log.warning("LLM client unavailable for market diary: {e}", e=exc)
@@ -755,6 +727,7 @@ def schedule_daily_diary(engine: Engine) -> None:
 
     def _diary_loop() -> None:
         import time as _time
+
         import schedule as _sched
 
         _sched.every().monday.at("22:00").do(write_diary_entry, engine=engine)
