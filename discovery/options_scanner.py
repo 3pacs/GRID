@@ -713,12 +713,15 @@ class OptionsScanner:
             from physics.dealer_gamma import DealerGammaEngine
 
             dg = DealerGammaEngine(self.engine)
-            profile = dg.compute_gex_profile(ticker, snap_date=scan_date)
+            # as_of=True: the last chain at or before scan_date. Strict
+            # equality would drop every scan run on a non-pull day, and a
+            # later chain would be look-ahead.
+            profile = dg.compute_gex_profile(ticker, snap_date=scan_date, as_of=True)
         except Exception as exc:  # pragma: no cover — defensive
             log.debug("dealer_gamma extras failed for {t}: {e}", t=ticker, e=str(exc))
             return (0.0, "", 0.0, "", meta)
 
-        if not profile or "error" in profile:
+        if not profile or not profile.get("available"):
             return (0.0, "", 0.0, "", meta)
 
         spot = float(profile.get("spot") or 0.0)
