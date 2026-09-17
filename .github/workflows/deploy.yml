@@ -859,20 +859,14 @@ jobs:
           # this restart onward.
           date -u +%s > "$RUNNER_TEMP/grid-intelligence-restart-ts"
           sudo mkdir -p /etc/systemd/system/grid-intelligence.service.d
-          # Preserve whatever is already there (if anything) so rollback can
-          # restore the exact prior state rather than assuming "delete" is
-          # correct -- true only if this is genuinely the first activation.
           DROPIN=/etc/systemd/system/grid-intelligence.service.d/zz-release-worktree.conf
-          if [ -f "$DROPIN" ]; then
-            BACKUP="${DROPIN}.bak-$(date -u +%Y%m%dT%H%M%SZ)"
-            sudo cp -a "$DROPIN" "$BACKUP"
-            echo "Existing drop-in backed up to $BACKUP"
-            echo "Exact rollback: sudo cp -a $BACKUP $DROPIN && sudo systemctl daemon-reload && sudo systemctl restart grid-intelligence" | tee -a "$GITHUB_STEP_SUMMARY"
-          else
-            echo "No pre-existing drop-in at $DROPIN (first activation)."
-            echo "Exact rollback: sudo rm $DROPIN && sudo systemctl daemon-reload && sudo systemctl restart grid-intelligence" | tee -a "$GITHUB_STEP_SUMMARY"
-          fi
-          printf '%s\n' '[Service]' "WorkingDirectory=$DEPLOY_PATH" | sudo tee "$DROPIN" >/dev/null
+          # scripts/dropin_backup_and_write.sh (tested in
+          # tests/test_dropin_backup_and_write.py) backs up whatever is
+          # already there before overwriting, rather than the backup/rollback
+          # logic existing only as inline bash no test ever ran.
+          printf '%s\n' '[Service]' "WorkingDirectory=$DEPLOY_PATH" \
+            | sudo bash "$DEPLOY_PATH/scripts/dropin_backup_and_write.sh" "$DROPIN" grid-intelligence \
+            | tee -a "$GITHUB_STEP_SUMMARY"
           sudo systemctl daemon-reload
           sudo systemctl restart grid-intelligence
 
@@ -903,6 +897,16 @@ jobs:
             echo "::error::grid-intelligence cwd '$cwd' does not resolve to $want -- it is running a different tree"
             exit 1
           }
+          # Persisted for the telemetry-verify step below: filtering
+          # journalctl by --since alone is not enough. If this were a
+          # *re*-activation (not the first one), the OLD process --
+          # already instrumented from a prior activation -- could still
+          # be emitting its own "DB pool (intelligence loop)" line in the
+          # brief window between capturing restart_ts and the kill signal
+          # actually landing, which --since would happily match and
+          # falsely confirm the NEW process. Filtering by this exact PID
+          # closes that gap regardless of what the old process was doing.
+          echo "$pid" > "$RUNNER_TEMP/grid-intelligence-new-pid"
           echo "verify: grid-intelligence is running the deployed tree"
 
       # Beyond PID/cwd: prove the deployed code (specifically, the pool
@@ -915,21 +919,23 @@ jobs:
         run: |
           set -euo pipefail
           restart_ts="$(cat "$RUNNER_TEMP/grid-intelligence-restart-ts")"
-          # The intelligence loop only logs pool stats every 10 ticks of its
-          # 30s run_pending() loop (~5 min) -- allow up to three intervals.
+          new_pid="$(cat "$RUNNER_TEMP/grid-intelligence-new-pid")"
+          # _PID= scopes this to the exact new process, not "the service's
+          # logs since some timestamp" -- see the comment on that file
+          # above for why --since alone isn't sufficient on a re-activation.
           for attempt in {1..90}; do
-            if journalctl -u grid-intelligence --since "@${restart_ts}" --no-pager -q 2>/dev/null | grep -qF 'DB pool (intelligence loop)'; then
-              echo "found the pool-telemetry log line confirming the deployed instrumentation is running"
+            if journalctl "_PID=${new_pid}" --since "@${restart_ts}" --no-pager -q 2>/dev/null | grep -qF 'DB pool (intelligence loop)'; then
+              echo "found the pool-telemetry log line from pid=${new_pid} confirming the deployed instrumentation is running"
               break
             fi
             if [ "$attempt" -eq 90 ]; then
-              echo "::error::did not see a 'DB pool (intelligence loop)' log line within ~15 minutes of restart"
-              journalctl -u grid-intelligence -n 80 --no-pager || true
+              echo "::error::did not see a 'DB pool (intelligence loop)' log line from pid=${new_pid} within ~15 minutes of restart"
+              journalctl "_PID=${new_pid}" -n 80 --no-pager || true
               exit 1
             fi
             sleep 10
           done
-          echo "**grid-intelligence activated successfully** (running the deployed tree with pool telemetry confirmed live)." | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "**grid-intelligence activated successfully** (running the deployed tree with pool telemetry confirmed live from pid=${new_pid})." | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Notify success
         if: success()
