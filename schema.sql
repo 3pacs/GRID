@@ -823,6 +823,10 @@ CREATE TABLE IF NOT EXISTS options_recommendations (
     thesis          TEXT,
     dealer_context  TEXT,
     sanity_status   JSONB,
+    -- Scanner composite score (0-10) this recommendation came from. Buckets
+    -- the empirical win-rate lookup in trading/options_recommender.py; NULL
+    -- rows are excluded from it rather than assumed into a bucket.
+    scanner_score   DOUBLE PRECISION,
     generated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     outcome         TEXT,           -- WIN/LOSS/EXPIRED/OPEN
     actual_return   NUMERIC,
@@ -835,6 +839,9 @@ CREATE INDEX IF NOT EXISTS idx_options_rec_generated
     ON options_recommendations (generated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_options_rec_expiry_outcome
     ON options_recommendations (expiry) WHERE outcome IS NULL;
+CREATE INDEX IF NOT EXISTS idx_options_rec_score_outcome
+    ON options_recommendations (scanner_score, outcome)
+    WHERE scanner_score IS NOT NULL AND outcome IN ('WIN', 'LOSS');
 
 -- ============================================================
 -- TABLE: scanner_weights

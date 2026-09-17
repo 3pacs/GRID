@@ -57,6 +57,30 @@ ESTIMATE_ENTRY_SIGMA_FRAC: float = 0.5
 ESTIMATE_TARGET_MULT: float = 2.0
 ESTIMATE_STOP_MULT: float = 0.5
 
+# Tag written onto any premium produced by ``estimate_premium`` so the ticket
+# reader can tell a modelled number from a quoted one.
+PREMIUM_BASIS_MODELLED: str = "modelled_1sigma"
+
+# ── Empirical win-probability lookup (audit C-H6) ───────────────────
+#
+# Win probability is READ FROM OUTCOMES or it is ``None``.  There is no
+# formula mapping a scanner score onto a hit rate: the previous
+# ``0.30 + (score - 5) * 0.06`` was a tuning constant wearing the name of
+# a measurement, and it sized real Kelly bets.
+#
+# The replacement buckets closed recommendations by the scanner score
+# they were generated from and returns the realised win rate for the
+# bucket the candidate falls in — but only once the bucket holds at least
+# ``WIN_PROB_MIN_SAMPLE`` resolved trades.  Below that the answer is
+# ``None`` and every number derived from it (Kelly fraction, suggested
+# contracts, expected return) is ``None`` too.
+WIN_PROB_MIN_SAMPLE: int = 20
+WIN_PROB_SCORE_BUCKET: float = 1.0
+
+# Risk-free rate used by the Black-Scholes fallback pricer.  Echoed into
+# every recommendation it prices so the reader can see the assumption.
+MODEL_RISK_FREE_RATE: float = 0.05
+
 
 def compute_kelly_fraction(
     accuracy: float,
@@ -188,6 +212,33 @@ def round_to_nickel(value: float) -> float:
     return round(round(value / step) * step, 2)
 
 
+# ── Null-safe display helpers ───────────────────────────────────────
+#
+# Every one of these renders a missing value as "n/a" rather than as 0,
+# 0.0% or $0.00.  A report that prints "$0.00 target" for a trade whose
+# target could not be computed is the same defect as the placeholder it
+# replaced, only at the presentation layer.
+
+def _fmt_money(value: float | None) -> str:
+    return "n/a" if value is None else f"${value:.2f}"
+
+
+def _fmt_pct(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.1%}"
+
+
+def _fmt_signed_pct(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:+.0f}%"
+
+
+def _fmt_count(value: int | None) -> str:
+    return "n/a" if value is None else str(value)
+
+
+def _fmt_ratio(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.1f}x"
+
+
 def _db_scalar(value: Any) -> Any:
     """Convert pandas/numpy scalar values before handing them to SQLAlchemy."""
     if value is None or isinstance(value, (str, bytes, dict, list, tuple)):
@@ -298,6 +349,12 @@ def estimate_premium(
     point when the chain is missing.  One-sigma move over ``dte`` days at
     annualised ``iv_atm``.  Used by contagion → ticket and any other
     pipeline that doesn't have bid/ask snapshots.
+
+    Callers MUST tag the resulting premiums ``premium_basis:
+    PREMIUM_BASIS_MODELLED`` in whatever payload they emit — these are
+    model output, not prices anyone quoted.  ``iv_atm`` must be a real
+    measured ATM IV; passing a placeholder produces a placeholder premium
+    with no way for the reader to tell.
     """
     if spot <= 0 or iv_atm <= 0 or dte <= 0:
         return 0.0, 0.0, 0.0
@@ -371,25 +428,46 @@ class OptionsRecommendation:
     expiry: str                     # ISO date (YYYY-MM-DD)
 
     # ── Entry ──
-    entry_price: float              # mid of bid-ask at recommendation time
-    entry_bid: float = 0.0         # bid at recommendation time
-    entry_ask: float = 0.0         # ask at recommendation time
+    entry_price: float              # bid-ask mid, last trade, or modelled price
+    entry_bid: float | None = None  # bid at recommendation time (None if unquoted)
+    entry_ask: float | None = None  # ask at recommendation time (None if unquoted)
+    # How ``entry_price`` was obtained — never leave a modelled price
+    # indistinguishable from a quoted one:
+    #   "quote"      → mid of a real bid/ask in options_snapshots
+    #   "last_trade" → snapshot row exists but only last_price was populated
+    #   "model"      → no snapshot row; Black-Scholes at the echoed sigma/rate
+    entry_price_basis: str = "unknown"
+    entry_model_sigma: float | None = None  # sigma used when basis == "model"
+    entry_model_rate: float | None = None   # r used when basis == "model"
+    entry_snapshot_date: str | None = None  # snap_date the quote came from
     entry_by_date: str = ""        # enter by this date or cancel
     underlying_price: float = 0.0  # stock price at recommendation time
 
     # ── Exit targets ──
-    target_price: float = 0.0      # option target price (profit exit)
-    target_return_pct: float = 0.0 # expected % return on the option
-    stop_loss: float = 0.0         # option stop loss price
+    # target/stop are None when the GEX profile that defines them is absent —
+    # a 2x-entry target was never a measurement of anything (audit C-H8).
+    target_price: float | None = None       # option target price (profit exit)
+    target_return_pct: float | None = None  # expected % return on the option
+    target_basis: str | None = None         # "gamma_wall" when derived, else None
+    stop_loss: float | None = None          # option stop loss price
+    stop_basis: str | None = None           # "gamma_flip" when derived, else None
     stop_loss_stock: float = 0.0   # stock price that invalidates (easier to watch)
     time_stop_date: str = ""       # exit by this date if thesis hasn't played out
-    max_risk: float = 0.0          # total dollars at risk per contract
-    expected_return: float = 0.0   # expected return per contract (win_prob * gain - loss_prob * loss)
+    max_risk: float | None = None  # total dollars at risk across the position
+    expected_return: float | None = None  # win_prob * gain - loss_prob * loss
 
     # ── Sizing ──
-    kelly_fraction: float = 0.0    # Kelly-optimal fraction of portfolio
-    suggested_contracts: int = 0   # for a $100K portfolio, how many contracts
+    # All three are None unless an empirical win probability exists. A null
+    # here must never be read as 0 by a consumer that sorts or sizes on it.
+    kelly_fraction: float | None = None    # Kelly-optimal fraction of portfolio
+    suggested_contracts: int | None = None  # contracts at ``self.capital``
     max_portfolio_pct: float = 0.02  # never more than 2% of portfolio per trade
+
+    # ── Win probability provenance (audit C-H6) ──
+    win_probability: float | None = None   # realised hit rate for the score bucket
+    win_probability_n: int = 0             # resolved trades behind it
+    win_probability_basis: str = "unavailable"  # empirical_score_bucket | insufficient_history | query_failed
+    scanner_score: float | None = None     # the score the bucket was keyed on
 
     # ── Thesis (lever + condition framework) ──
     confidence: float = 0.0        # 0-1 overall confidence
@@ -427,16 +505,26 @@ class OptionsRecommendation:
             "entry_price": self.entry_price,
             "entry_bid": self.entry_bid,
             "entry_ask": self.entry_ask,
+            "entry_price_basis": self.entry_price_basis,
+            "entry_model_sigma": self.entry_model_sigma,
+            "entry_model_rate": self.entry_model_rate,
+            "entry_snapshot_date": self.entry_snapshot_date,
             "entry_by_date": self.entry_by_date,
             "underlying_price": self.underlying_price,
             "target_price": self.target_price,
             "target_return_pct": self.target_return_pct,
+            "target_basis": self.target_basis,
             "stop_loss": self.stop_loss,
+            "stop_basis": self.stop_basis,
             "stop_loss_stock": self.stop_loss_stock,
             "time_stop_date": self.time_stop_date,
             "max_risk": self.max_risk,
             "kelly_fraction": self.kelly_fraction,
             "suggested_contracts": self.suggested_contracts,
+            "win_probability": self.win_probability,
+            "win_probability_n": self.win_probability_n,
+            "win_probability_basis": self.win_probability_basis,
+            "scanner_score": self.scanner_score,
             "confidence": self.confidence,
             "thesis": self.thesis,
             "lever": self.lever,
@@ -461,17 +549,22 @@ class OptionsRecommendation:
     def to_trade_ticket(self) -> str:
         """Format as a human-readable trade ticket for alerts/email."""
         rr = self.risk_reward_ratio
+        quote = (
+            f"bid ${self.entry_bid:.2f} / ask ${self.entry_ask:.2f}"
+            if self.entry_bid is not None and self.entry_ask is not None
+            else f"basis {self.entry_price_basis}, unquoted"
+        )
         return (
             f"{'═' * 50}\n"
             f"  {self.ticker} {self.strike}{self.direction[0]} {self.expiry}\n"
             f"{'═' * 50}\n"
-            f"  ENTRY:  ${self.entry_price:.2f} (bid ${self.entry_bid:.2f} / ask ${self.entry_ask:.2f})\n"
+            f"  ENTRY:  ${self.entry_price:.2f} ({quote})\n"
             f"  STOCK:  ${self.underlying_price:.2f} at time of rec\n"
-            f"  TARGET: ${self.target_price:.2f} ({self.target_return_pct:+.0f}%)\n"
-            f"  STOP:   ${self.stop_loss:.2f} (or stock {'below' if self.direction == 'PUT' else 'above'} ${self.stop_loss_stock:.2f})\n"
+            f"  TARGET: {_fmt_money(self.target_price)} ({_fmt_signed_pct(self.target_return_pct)})\n"
+            f"  STOP:   {_fmt_money(self.stop_loss)} (or stock {'below' if self.direction == 'PUT' else 'above'} ${self.stop_loss_stock:.2f})\n"
             f"  TIME:   Exit by {self.time_stop_date} if no move\n"
-            f"  SIZE:   {self.suggested_contracts} contracts ({self.kelly_fraction:.1%} Kelly)\n"
-            f"  R/R:    {rr:.1f}x | Confidence: {self.confidence:.0%}\n"
+            f"  SIZE:   {_fmt_count(self.suggested_contracts)} contracts ({_fmt_pct(self.kelly_fraction)} Kelly)\n"
+            f"  R/R:    {_fmt_ratio(rr)} | Confidence: {self.confidence:.0%}\n"
             f"{'─' * 50}\n"
             f"  LEVER:  {self.lever}\n"
             f"  ACTOR:  {self.lever_actor} ({self.lever_direction})\n"
@@ -490,10 +583,10 @@ class OptionsRecommendation:
         )
 
     @property
-    def risk_reward_ratio(self) -> float:
-        """Target profit / max risk."""
-        if self.max_risk <= 0:
-            return 0.0
+    def risk_reward_ratio(self) -> float | None:
+        """Target gain as a fraction of entry — ``None`` without a target."""
+        if self.target_price is None or self.entry_price <= 0:
+            return None
         return (self.target_price - self.entry_price) / self.entry_price
 
     @property
@@ -636,8 +729,15 @@ class OptionsRecommender:
                     t=opp.ticker, e=str(exc),
                 )
 
-        # Sort by expected return descending
-        recommendations.sort(key=lambda r: r.expected_return, reverse=True)
+        # Sort by expected return descending, unsized recommendations last.
+        # An unknown expected return is NOT a zero: it must not outrank a
+        # measured negative one, and it must not be treated as one either.
+        recommendations.sort(
+            key=lambda r: (
+                r.expected_return is None,
+                -(r.expected_return if r.expected_return is not None else 0.0),
+            )
+        )
 
         log.info(
             "Generated {n} actionable recommendations from {t} opportunities",
@@ -686,11 +786,12 @@ class OptionsRecommender:
                         "INSERT INTO options_recommendations "
                         "(ticker, direction, strike, expiry, entry_price, target_price, "
                         "stop_loss, expected_return, kelly_fraction, confidence, thesis, "
-                        "dealer_context, sanity_status, signals, opposing_signals, generated_at) "
+                        "dealer_context, sanity_status, signals, opposing_signals, "
+                        "scanner_score, generated_at) "
                         "VALUES (:ticker, :direction, :strike, :expiry, :entry_price, "
                         ":target_price, :stop_loss, :expected_return, :kelly_fraction, "
                         ":confidence, :thesis, :dealer_context, :sanity_status, "
-                        ":signals, :opposing_signals, :generated_at)"
+                        ":signals, :opposing_signals, :scanner_score, :generated_at)"
                     ),
                     {
                         "ticker": rec.ticker,
@@ -700,9 +801,12 @@ class OptionsRecommender:
                         "entry_price": _db_scalar(rec.entry_price),
                         "target_price": _db_scalar(rec.target_price),
                         "stop_loss": _db_scalar(rec.stop_loss),
-                        "expected_return": _db_scalar(getattr(rec, "expected_return", 0)),
+                        "expected_return": _db_scalar(rec.expected_return),
                         "kelly_fraction": _db_scalar(rec.kelly_fraction),
                         "confidence": _db_scalar(rec.confidence),
+                        # Persisted so the empirical win-rate lookup has a
+                        # score to bucket future outcomes by (audit C-H6).
+                        "scanner_score": _db_scalar(rec.scanner_score),
                         "thesis": rec.thesis,
                         "dealer_context": rec.dealer_context,
                         "sanity_status": json.dumps(rec.sanity_status),
@@ -759,35 +863,68 @@ class OptionsRecommender:
             log.debug("Skipping {t}: no suitable expiry", t=ticker)
             return None
 
-        # Compute entry price from bid/ask mid
-        entry_price = self._get_entry_price(db, ticker, strike, expiry, direction)
-        if entry_price is None or entry_price <= 0:
+        # Compute entry price — quoted mid where one exists, otherwise a
+        # model price that says so.
+        entry = self._get_entry_price(db, ticker, strike, expiry, direction)
+        if entry is None or entry["price"] is None or entry["price"] <= 0:
             log.debug("Skipping {t}: no valid entry price at K={k}", t=ticker, k=strike)
             return None
+        entry_price = float(entry["price"])
 
-        # Target from GEX expected move (gamma wall distance)
-        target_price = self._compute_target_price(
+        # Target from GEX expected move (gamma wall distance).  ``None`` when
+        # no GEX profile defines one — audit C-H8.
+        target_price, target_basis = self._compute_target_price(
             entry_price, spot, strike, direction, gex_profile,
         )
 
-        # Stop loss from gamma flip point
-        stop_loss = self._compute_stop_loss(
+        # Stop loss from gamma flip point — ``None`` when there is no flip.
+        stop_loss, stop_basis = self._compute_stop_loss(
             entry_price, spot, strike, direction, gex_profile,
         )
 
-        # Win probability and payoff for Kelly
-        win_prob = self._estimate_win_probability(opp, gex_profile)
-        payoff_ratio = (target_price - entry_price) / max(entry_price - stop_loss, 0.01)
+        # Win probability read from realised outcomes, or None (audit C-H6).
+        win_prob, win_prob_n, win_prob_basis = self._empirical_win_probability(
+            db, opp.score,
+        )
 
-        # Kelly fraction
-        kelly_fraction = self._compute_kelly(win_prob, payoff_ratio)
+        # Payoff ratio needs BOTH exit levels; without them there is no
+        # Kelly input and therefore no size.
+        risk_per_contract = (
+            entry_price - stop_loss if stop_loss is not None else None
+        )
+        if (
+            target_price is not None
+            and risk_per_contract is not None
+            and risk_per_contract > 0
+        ):
+            payoff_ratio = (target_price - entry_price) / risk_per_contract
+        else:
+            payoff_ratio = None
 
-        # Expected return
-        expected_return = win_prob * (target_price - entry_price) - (1 - win_prob) * (entry_price - stop_loss)
+        # Sizing is null unless every input is real.  A null must never be
+        # silently read as 0 or 0.5 downstream — it means "not sized".
+        kelly_fraction: float | None = None
+        expected_return: float | None = None
+        suggested_contracts: int | None = None
+        max_risk: float | None = None
+        if win_prob is not None and payoff_ratio is not None and payoff_ratio > 0:
+            kelly_fraction = self._compute_kelly(win_prob, payoff_ratio)
+            expected_return = (
+                win_prob * (target_price - entry_price)
+                - (1 - win_prob) * risk_per_contract
+            )
+            suggested_contracts = (
+                max(1, int(self.capital * kelly_fraction / (entry_price * 100)))
+                if kelly_fraction > 0
+                else 0
+            )
+            max_risk = suggested_contracts * entry_price * 100
 
-        # Max risk in dollars (entry premium x 100 shares x kelly fraction of capital)
-        contracts = max(1, int(self.capital * kelly_fraction / (entry_price * 100)))
-        max_risk = contracts * entry_price * 100
+        target_return_pct = (
+            (target_price / entry_price - 1.0) * 100.0
+            if target_price is not None
+            else None
+        )
 
         # Confidence from scanner score + GEX alignment
         confidence = self._compute_confidence(opp, gex_profile, direction)
@@ -812,11 +949,36 @@ class OptionsRecommender:
             strike=round(strike, 2),
             expiry=str(expiry),
             entry_price=round(entry_price, 4),
-            target_price=round(target_price, 4),
-            stop_loss=round(max(stop_loss, 0.01), 4),
-            expected_return=round(expected_return, 4),
-            max_risk=round(max_risk, 2),
-            kelly_fraction=round(kelly_fraction, 4),
+            entry_bid=entry["bid"],
+            entry_ask=entry["ask"],
+            entry_price_basis=entry["basis"],
+            entry_model_sigma=entry["sigma"],
+            entry_model_rate=entry["rate"],
+            entry_snapshot_date=entry["snap_date"],
+            underlying_price=round(float(spot), 4),
+            target_price=round(target_price, 4) if target_price is not None else None,
+            target_return_pct=(
+                round(target_return_pct, 4) if target_return_pct is not None else None
+            ),
+            target_basis=target_basis,
+            stop_loss=(
+                round(max(stop_loss, 0.01), 4) if stop_loss is not None else None
+            ),
+            stop_basis=stop_basis,
+            expected_return=(
+                round(expected_return, 4) if expected_return is not None else None
+            ),
+            max_risk=round(max_risk, 2) if max_risk is not None else None,
+            kelly_fraction=(
+                round(kelly_fraction, 4) if kelly_fraction is not None else None
+            ),
+            suggested_contracts=suggested_contracts,
+            win_probability=(
+                round(win_prob, 4) if win_prob is not None else None
+            ),
+            win_probability_n=win_prob_n,
+            win_probability_basis=win_prob_basis,
+            scanner_score=float(opp.score) if opp.score is not None else None,
             confidence=round(confidence, 4),
             thesis=thesis,
             dealer_context=dealer_context,
@@ -1009,13 +1171,27 @@ class OptionsRecommender:
         strike: float,
         expiry: date,
         direction: str,
-    ) -> float | None:
-        """Get entry price as mid of bid/ask from latest options snapshot."""
+    ) -> dict[str, Any] | None:
+        """Resolve the entry price AND how it was obtained.
+
+        Returns a dict ``{price, bid, ask, basis, sigma, rate, snap_date}``
+        or ``None`` when no price can be established at all.
+
+        ``basis`` is one of:
+          - ``"quote"``      — mid of a real bid/ask in ``options_snapshots``
+          - ``"last_trade"`` — snapshot row exists but only ``last_price`` did
+          - ``"model"``      — no snapshot row; Black-Scholes at ``sigma``/``rate``
+
+        Audit C-H7: the old version returned a bare float, so a
+        Black-Scholes price computed at a hardcoded σ=0.25 was served under
+        the same ``entry_price`` field as a live bid/ask mid and nothing in
+        the payload distinguished them.
+        """
         opt_type = "call" if direction == "CALL" else "put"
 
         with db.connect() as conn:
             row = conn.execute(text("""
-                SELECT bid, ask, last_price
+                SELECT bid, ask, last_price, snap_date
                 FROM options_snapshots
                 WHERE ticker = :ticker
                   AND strike = :strike
@@ -1031,17 +1207,35 @@ class OptionsRecommender:
             }).fetchone()
 
         if row is None:
-            # Fallback: estimate from IV using simplified model
+            # No snapshot at all — price it, and say that we priced it.
             return self._estimate_premium(db, ticker, strike, expiry, direction)
 
-        bid = float(row[0]) if row[0] and row[0] > 0 else 0.0
-        ask = float(row[1]) if row[1] and row[1] > 0 else 0.0
-        last = float(row[2]) if row[2] and row[2] > 0 else 0.0
+        bid = float(row[0]) if row[0] and row[0] > 0 else None
+        ask = float(row[1]) if row[1] and row[1] > 0 else None
+        last = float(row[2]) if row[2] and row[2] > 0 else None
+        snap_date = str(row[3]) if len(row) > 3 and row[3] else None
 
-        if bid > 0 and ask > 0:
-            return (bid + ask) / 2.0
-        if last > 0:
-            return last
+        if bid is not None and ask is not None:
+            return {
+                "price": (bid + ask) / 2.0,
+                "bid": bid,
+                "ask": ask,
+                "basis": "quote",
+                "sigma": None,
+                "rate": None,
+                "snap_date": snap_date,
+            }
+        if last is not None:
+            # A real trade print, but not a two-sided quote: say which.
+            return {
+                "price": last,
+                "bid": bid,
+                "ask": ask,
+                "basis": "last_trade",
+                "sigma": None,
+                "rate": None,
+                "snap_date": snap_date,
+            }
         return None
 
     def _estimate_premium(
@@ -1051,18 +1245,33 @@ class OptionsRecommender:
         strike: float,
         expiry: date,
         direction: str,
-    ) -> float | None:
-        """Rough premium estimate from Black-Scholes when bid/ask unavailable."""
+    ) -> dict[str, Any] | None:
+        """Black-Scholes premium when no snapshot exists, with its inputs.
+
+        Returns ``None`` when the model's own inputs are missing — there is
+        no default sigma.  The previous ``sigma = self._get_atm_iv(...) or
+        0.25`` (audit C-H7) meant a ticker with no measured ATM IV was
+        priced off a 25% constant and the result was published as
+        ``entry_price`` with nothing marking it as invented.
+        """
         from physics.dealer_gamma import _d1, _d2
         from scipy.stats import norm
 
         spot = self._get_spot(db, ticker)
         if spot <= 0:
+            log.debug("No model premium for {t}: no spot price", t=ticker)
+            return None
+
+        sigma = self._get_atm_iv(db, ticker)
+        if sigma is None or sigma <= 0:
+            log.debug(
+                "No model premium for {t}: no measured ATM IV to price with",
+                t=ticker,
+            )
             return None
 
         T = max((expiry - date.today()).days, 1) / 365.0
-        r = 0.05
-        sigma = self._get_atm_iv(db, ticker) or 0.25
+        r = MODEL_RISK_FREE_RATE
 
         d1 = _d1(spot, strike, T, r, sigma)
         d2 = _d2(spot, strike, T, r, sigma)
@@ -1072,7 +1281,15 @@ class OptionsRecommender:
         else:
             price = strike * math.exp(-r * T) * norm.cdf(-d2) - spot * norm.cdf(-d1)
 
-        return max(price, 0.01)
+        return {
+            "price": max(float(price), 0.01),
+            "bid": None,
+            "ask": None,
+            "basis": "model",
+            "sigma": float(sigma),
+            "rate": r,
+            "snap_date": None,
+        }
 
     def _compute_target_price(
         self,
@@ -1081,14 +1298,22 @@ class OptionsRecommender:
         strike: float,
         direction: str,
         gex_profile: dict,
-    ) -> float:
+    ) -> tuple[float | None, str | None]:
         """Set target from GEX expected move (gamma wall distance).
 
-        If GEX data available: target is based on distance to gamma wall.
-        Otherwise: use 2x entry as conservative target.
+        Returns ``(target, basis)``.  Without a gamma wall in the trade's
+        direction there is no expected move to target, so the answer is
+        ``(None, None)``.
+
+        Audit C-H8: this used to return ``entry_price * 2.0`` whenever the
+        GEX profile was missing — a doubling constant published as
+        ``target_price``, and then as ``target_return_pct`` (+100%) and as
+        the gain leg of ``expected_return``.  The docstring said the target
+        came from the GEX expected move; for every ticker without a GEX
+        profile it came from the number 2.
         """
         if not gex_profile:
-            return entry_price * 2.0
+            return None, None
 
         if direction == "CALL":
             call_wall = gex_profile.get("call_wall") or 0
@@ -1098,16 +1323,17 @@ class OptionsRecommender:
                 # Option delta ~0.3 for OTM call; option moves ~ delta * underlying move
                 # But with gamma acceleration, the option move is amplified
                 option_move_mult = max(1.5, move_pct / max(entry_price / spot, 0.001))
-                return entry_price * (1 + option_move_mult)
+                return entry_price * (1 + option_move_mult), "gamma_call_wall"
         else:
             put_wall = gex_profile.get("put_wall") or 0
             if put_wall and put_wall < spot:
                 move_pct = (spot - put_wall) / spot
                 option_move_mult = max(1.5, move_pct / max(entry_price / spot, 0.001))
-                return entry_price * (1 + option_move_mult)
+                return entry_price * (1 + option_move_mult), "gamma_put_wall"
 
-        # Fallback: 2x entry
-        return entry_price * 2.0
+        # A GEX profile exists but has no wall on our side — still nothing
+        # measured to target.
+        return None, None
 
     def _compute_stop_loss(
         self,
@@ -1116,19 +1342,21 @@ class OptionsRecommender:
         strike: float,
         direction: str,
         gex_profile: dict,
-    ) -> float:
+    ) -> tuple[float | None, str | None]:
         """Set stop from gamma flip point.
 
-        If GEX data available: gamma flip represents the regime change point.
-        When spot crosses gamma flip, dealer flows reverse -> our thesis breaks.
-        Otherwise: use 50% of entry as stop.
+        Returns ``(stop, basis)``.  The gamma flip is what defines the stop:
+        when spot crosses it, dealer flows reverse and the thesis breaks.
+        With no flip level there is no derived stop, so the answer is
+        ``(None, None)`` rather than a 50%-of-entry constant — that constant
+        fed ``payoff_ratio`` and therefore the Kelly size.
         """
         if not gex_profile:
-            return entry_price * 0.50
+            return None, None
 
         gamma_flip = gex_profile.get("gamma_flip")
         if gamma_flip is None:
-            return entry_price * 0.50
+            return None, None
 
         if direction == "CALL":
             # For calls: if spot drops below gamma flip, thesis is broken
@@ -1137,50 +1365,74 @@ class OptionsRecommender:
                 drop_pct = (spot - gamma_flip) / spot
                 # Option loses roughly delta * drop_pct * spot
                 option_loss_pct = min(0.70, drop_pct * 3.0)  # amplified by leverage
-                return entry_price * (1 - option_loss_pct)
+                return entry_price * (1 - option_loss_pct), "gamma_flip"
         else:
             # For puts: if spot rallies above gamma flip, thesis breaks
             if gamma_flip > spot:
                 rally_pct = (gamma_flip - spot) / spot
                 option_loss_pct = min(0.70, rally_pct * 3.0)
-                return entry_price * (1 - option_loss_pct)
+                return entry_price * (1 - option_loss_pct), "gamma_flip"
 
-        return entry_price * 0.50
+        # Flip sits on the wrong side of spot — it does not define a stop here.
+        return None, None
 
     # ── Kelly and Probability ────────────────────────────────────────
 
-    def _estimate_win_probability(self, opp, gex_profile: dict) -> float:
-        """Estimate win probability from scanner score and GEX alignment.
+    def _empirical_win_probability(
+        self, db: Engine, score: float | None,
+    ) -> tuple[float | None, int, str]:
+        """Realised win rate for this candidate's scanner-score bucket.
 
-        Score 6/10 -> ~35% base win rate
-        Score 8/10 -> ~50%
-        Score 10/10 -> ~60% (capped — markets are efficient)
-        GEX alignment bonus: +5-10%
+        Returns ``(probability, n, basis)``:
+
+        - ``("empirical_score_bucket")`` — at least ``WIN_PROB_MIN_SAMPLE``
+          resolved (WIN/LOSS) recommendations were generated at a scanner
+          score inside the same ``WIN_PROB_SCORE_BUCKET``-wide bucket, and
+          the probability is wins/resolved for that bucket.
+        - ``(None, n, "insufficient_history")`` — fewer than the minimum;
+          ``n`` says how many there were so the reader can see the gap.
+        - ``(None, 0, "no_score")`` / ``"query_failed"`` — we cannot look.
+
+        This replaces the affine score→probability map flagged as audit
+        C-H6.  That map was a tuning constant: no part of it was ever
+        checked against an outcome, yet it fed ``kelly_fraction``,
+        ``suggested_contracts`` and ``expected_return`` — i.e. it decided
+        position size.
         """
-        score = opp.score
-        # Linear mapping: score 5->30%, 10->60%
-        base_prob = 0.30 + (score - 5.0) * 0.06
+        if score is None:
+            return None, 0, "no_score"
 
-        # GEX alignment bonus
-        regime = gex_profile.get("regime", "")
-        direction = opp.direction
-        if regime == "SHORT_GAMMA":
-            # Short gamma amplifies moves — good for directional bets
-            base_prob += 0.05
-        elif regime == "LONG_GAMMA" and direction in ("CALL", "PUT"):
-            # Long gamma dampens moves — harder for directional bets
-            base_prob -= 0.03
+        bucket = max(WIN_PROB_SCORE_BUCKET, 0.01)
+        lo = math.floor(float(score) / bucket) * bucket
+        hi = lo + bucket
 
-        # Vanna/charm adjustment
-        vanna = gex_profile.get("vanna_exposure", 0)
-        if direction == "CALL" and vanna < 0:
-            # Negative vanna + IV drop -> dealers buy underlying -> bullish
-            base_prob += 0.03
-        elif direction == "PUT" and vanna > 0:
-            # Positive vanna + IV rise -> dealers sell underlying -> bearish
-            base_prob += 0.03
+        try:
+            with db.connect() as conn:
+                row = conn.execute(text("""
+                    SELECT
+                        COUNT(*) FILTER (WHERE outcome = 'WIN') AS wins,
+                        COUNT(*) AS resolved
+                    FROM options_recommendations
+                    WHERE outcome IN ('WIN', 'LOSS')
+                      AND scanner_score IS NOT NULL
+                      AND scanner_score >= :lo
+                      AND scanner_score < :hi
+                """), {"lo": lo, "hi": hi}).fetchone()
+        except Exception as exc:  # noqa: BLE001 — any DB failure means "unknown"
+            # A failed lookup is not a low win rate and it is certainly not
+            # an average one. It is an absence, and it is reported as one.
+            log.debug("win-probability history query failed: {e}", e=str(exc))
+            return None, 0, "query_failed"
 
-        return max(0.10, min(0.65, base_prob))
+        if row is None:
+            return None, 0, "insufficient_history"
+
+        wins = int(row[0] or 0)
+        resolved = int(row[1] or 0)
+        if resolved < WIN_PROB_MIN_SAMPLE:
+            return None, resolved, "insufficient_history"
+
+        return wins / resolved, resolved, "empirical_score_bucket"
 
     def _compute_kelly(self, win_prob: float, payoff_ratio: float) -> float:
         """Kelly criterion with half-Kelly shrink, capped at ``self.max_kelly``.
@@ -1291,7 +1543,13 @@ class OptionsRecommender:
             }).fetchone()
 
         if row is None:
-            return {"status": "SKIP", "reason": "No snapshot data for strike — using estimated premium"}
+            return {
+                "status": "SKIP",
+                "reason": (
+                    "No options_snapshots row for this strike — IV/OI/spread "
+                    f"unchecked; entry_price_basis={rec.entry_price_basis}"
+                ),
+            }
 
         iv = float(row[0]) if row[0] else 0
         oi = int(row[1]) if row[1] else 0
@@ -1461,9 +1719,10 @@ FAIL = data quality issue, incoherent thesis, or fundamentally flawed logic
 Recommendation:
 - Ticker: {rec.ticker} {rec.direction}
 - Strike: ${rec.strike:.2f}, Expiry: {rec.expiry}
-- Entry: ${rec.entry_price:.4f}, Target: ${rec.target_price:.4f}, Stop: ${rec.stop_loss:.4f}
-- Expected Return: ${rec.expected_return:.4f}, Max Risk: ${rec.max_risk:.2f}
-- Kelly Fraction: {rec.kelly_fraction:.2%}
+- Entry: ${rec.entry_price:.4f} (basis: {rec.entry_price_basis}), Target: {_fmt_money(rec.target_price)}, Stop: {_fmt_money(rec.stop_loss)}
+- Expected Return: {_fmt_money(rec.expected_return)}, Max Risk: {_fmt_money(rec.max_risk)}
+- Kelly Fraction: {_fmt_pct(rec.kelly_fraction)}
+- Win probability: {_fmt_pct(rec.win_probability)} (n={rec.win_probability_n}, basis={rec.win_probability_basis})
 - Confidence: {rec.confidence:.1%}
 - Thesis: {rec.thesis}
 - Dealer Context: {rec.dealer_context}
@@ -1476,6 +1735,8 @@ Rules for your review:
 - Confidence < 20% with Kelly > 10% → FAIL (overbet on low conviction)
 - Thesis makes no logical sense → FAIL
 - Everything else → PASS
+- "n/a" means the value could not be measured. That is an acceptable
+  state, NOT a reason to FAIL — judge the thesis and the data quality.
 
 Respond with ONLY the JSON object."""
 
@@ -1514,7 +1775,19 @@ Respond with ONLY the JSON object."""
 
         Query past scanner results with similar setups and check outcomes.
         Similar = same ticker + same direction + score within 1.5 points.
+
+        The score comes from ``rec.scanner_score`` — the actual scanner
+        output the recommendation was built from.  It used to be
+        back-derived as ``rec.confidence * 10``, which silently made the
+        analog window a function of the confidence heuristic rather than
+        of the score the analogs were themselves stored under.
         """
+        if rec.scanner_score is None:
+            return {
+                "status": "SKIP",
+                "reason": "No scanner score on the recommendation to match analogs by",
+            }
+        score = float(rec.scanner_score)
         try:
             with db.connect() as conn:
                 # Check if mispricing scans table exists and has data
@@ -1530,8 +1803,8 @@ Respond with ONLY the JSON object."""
                 """), {
                     "ticker": rec.ticker,
                     "direction": rec.direction,
-                    "lo_score": rec.confidence * 10 - 1.5,  # approximate score
-                    "hi_score": rec.confidence * 10 + 1.5,
+                    "lo_score": score - 1.5,
+                    "hi_score": score + 1.5,
                 }).fetchall()
 
             if not rows:
@@ -1683,9 +1956,20 @@ Respond with ONLY the JSON object."""
             lines.extend([
                 f"#{i}  {rec.ticker} {rec.direction}  |  Confidence: {rec.confidence:.1%}",
                 f"     Strike: ${rec.strike:,.2f}  |  Expiry: {rec.expiry}",
-                f"     Entry: ${rec.entry_price:.4f}  |  Target: ${rec.target_price:.4f}  |  Stop: ${rec.stop_loss:.4f}",
-                f"     Expected Return: ${rec.expected_return:.4f}  |  Max Risk: ${rec.max_risk:,.2f}",
-                f"     Kelly: {rec.kelly_fraction:.2%}  |  R:R: {rec.risk_reward_ratio:.1f}x",
+                (
+                    f"     Entry: ${rec.entry_price:.4f} ({rec.entry_price_basis})  |  "
+                    f"Target: {_fmt_money(rec.target_price)}  |  "
+                    f"Stop: {_fmt_money(rec.stop_loss)}"
+                ),
+                (
+                    f"     Expected Return: {_fmt_money(rec.expected_return)}  |  "
+                    f"Max Risk: {_fmt_money(rec.max_risk)}"
+                ),
+                (
+                    f"     Win prob: {_fmt_pct(rec.win_probability)} "
+                    f"(n={rec.win_probability_n}, {rec.win_probability_basis})"
+                ),
+                f"     Kelly: {_fmt_pct(rec.kelly_fraction)}  |  R:R: {_fmt_ratio(rec.risk_reward_ratio)}",
                 f"     Thesis: {rec.thesis}",
                 f"     Dealer: {rec.dealer_context}",
                 f"     Sanity: [{sanity_summary}]",
