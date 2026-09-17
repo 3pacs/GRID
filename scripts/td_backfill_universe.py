@@ -53,25 +53,30 @@ import psycopg2.extras
 import requests
 
 
-def _dsn_from_env() -> str:
-    """Build the DSN from the process env.
+def _connect_params_from_env() -> dict[str, str | int]:
+    """Read DB connection params from the process env as keyword args.
 
     This script's own systemd unit already loads
     /home/grid/grid_v4/grid_repo/.env via EnvironmentFile=, the same file
     every other GRID service reads its DB credentials from — no credential
-    belongs hardcoded in a script.
+    belongs hardcoded in a script. Passed to psycopg2.connect() as kwargs
+    rather than interpolated into a conninfo string — manual interpolation
+    breaks (or worse, silently misparses) on a password containing a
+    space, quote, or backslash.
     """
-    host = os.environ.get("DB_HOST", "localhost")
-    port = os.environ.get("DB_PORT", "5432")
-    name = os.environ.get("DB_NAME", "griddb")
-    user = os.environ.get("DB_USER", "grid")
     password = os.environ.get("DB_PASSWORD", "")
     if not password:
         sys.exit("DB_PASSWORD missing from environment")
-    return f"host={host} port={port} dbname={name} user={user} password={password}"
+    return {
+        "host": os.environ.get("DB_HOST", "localhost"),
+        "port": int(os.environ.get("DB_PORT", "5432")),
+        "dbname": os.environ.get("DB_NAME", "griddb"),
+        "user": os.environ.get("DB_USER", "grid"),
+        "password": password,
+    }
 
 
-DSN = _dsn_from_env()
+CONNECT_PARAMS = _connect_params_from_env()
 TD_URL = "https://api.twelvedata.com/time_series"
 RATE_LIMIT_SEC = 8.0   # 8 req/min = 7.5s between calls; 8s for safety margin
 
@@ -85,6 +90,10 @@ WINDOW_BY_BUCKET = {
 API_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
 if not API_KEY:
     sys.exit("TWELVEDATA_API_KEY missing")
+
+
+def _redact_api_key(text: str) -> str:
+    return text.replace(API_KEY, "***REDACTED***") if API_KEY else text
 
 
 def fetch_td(ticker: str, start: date, end: date) -> list[dict]:
@@ -103,7 +112,9 @@ def fetch_td(ticker: str, start: date, end: date) -> list[dict]:
             timeout=30,
         )
     except requests.RequestException as exc:
-        print(f"  {ticker}: network error: {exc}", file=sys.stderr)
+        # requests' exception __str__ can embed the failed request's full
+        # URL, including the apikey query param — never log it verbatim.
+        print(f"  {ticker}: network error: {_redact_api_key(str(exc))}", file=sys.stderr)
         return []
     if r.status_code != 200:
         print(f"  {ticker}: HTTP {r.status_code}", file=sys.stderr)
@@ -133,7 +144,7 @@ def main() -> int:
     limit       = int(os.environ.get("LIMIT", "0"))      # 0 = no cap
     dry_run     = bool(os.environ.get("DRY_RUN"))
 
-    conn = psycopg2.connect(DSN)
+    conn = psycopg2.connect(**CONNECT_PARAMS)
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     where_bucket = "bucket IN ('DEAD','STALE_30+','STALE_7_30')"
     if only_bucket:
@@ -158,9 +169,26 @@ def main() -> int:
         work = work[:limit]
     print(f"backfill target: {len(work)} tickers (dry_run={dry_run})")
     if not work:
+        conn.close()
         return 0
 
     end_d = date.today()
+
+    if dry_run:
+        # No write path is reachable from here — not even a transaction is
+        # opened. A dry run must be a pure preview: it exists specifically
+        # so a live check can be re-run to verify freshness/missing-data
+        # behavior without risk of mutating source_catalog or anything
+        # else, no matter what the rest of this function does below.
+        for i, row in enumerate(work, 1):
+            ticker = row["ticker"]
+            bucket = row["bucket"]
+            days = WINDOW_BY_BUCKET.get(bucket, 60)
+            start_d = end_d - timedelta(days=days)
+            print(f"[{i}/{len(work)}] {ticker} ({bucket}) → would fetch {start_d} → {end_d}")
+        conn.close()
+        return 0
+
     inserted_total = 0
     failed: list[str] = []
     skipped: list[str] = []
@@ -169,9 +197,6 @@ def main() -> int:
         bucket = row["bucket"]
         days = WINDOW_BY_BUCKET.get(bucket, 60)
         start_d = end_d - timedelta(days=days)
-        if dry_run:
-            print(f"[{i}/{len(work)}] {ticker} ({bucket}) → would fetch {start_d} → {end_d}")
-            continue
         bars = fetch_td(ticker, start_d, end_d)
         if not bars:
             failed.append(ticker)
@@ -210,16 +235,32 @@ def main() -> int:
     if failed:
         print(f"failed tickers: {failed[:40]}{'...' if len(failed)>40 else ''}")
 
-    # Stamp source_catalog so freshness monitoring reflects actual pull cadence.
-    try:
-        cur.execute("""
-            UPDATE source_catalog SET last_pull_at = now()
-            WHERE name IN ('TWELVEDATA','TWELVEDATA_DIVIDENDS','TWELVEDATA_SPLITS','TWELVEDATA_STATS')
-        """)
-        conn.commit()
-    except Exception as exc:
-        print(f'source_catalog stamp failed: {exc}')
+    # Stamp source_catalog so freshness monitoring reflects actual pull
+    # cadence — but only for what this run actually did. Two things the
+    # previous version got wrong: it stamped unconditionally, even when
+    # every single ticker failed and inserted_total was 0, marking a
+    # totally failed run as freshly-pulled; and it stamped
+    # TWELVEDATA_DIVIDENDS/_SPLITS/_STATS, which this script — it only
+    # calls the /time_series daily-close endpoint — never fetches at all.
+    if inserted_total > 0:
+        try:
+            cur.execute("""
+                UPDATE source_catalog SET last_pull_at = now()
+                WHERE name = 'TWELVEDATA'
+            """)
+            conn.commit()
+        except Exception as exc:
+            print(f'source_catalog stamp failed: {exc}')
+
     conn.close()
+
+    if work and inserted_total == 0:
+        # Every ticker in this run failed — a scheduler/monitor watching
+        # this job's exit code must be able to tell total failure from
+        # success, not just read it out of the log text.
+        print("total failure: 0 tickers inserted/updated out of "
+              f"{len(work)} attempted", file=sys.stderr)
+        return 1
     return 0
 
 
