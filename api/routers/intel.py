@@ -2050,7 +2050,8 @@ def intel_briefing(
                     "spot_price": spot,
                     "iv_atm": float(r[7]) if r[7] else None,
                     "confidence": float(r[8]) if r[8] else None,
-                    "is_100x": r[9],
+                    # Historical column name, honest field name (C-M20).
+                    "heuristic_payoff_flag": r[9],
                     "scanned_at": _safe_isoformat(r[10]),
                     "invalidation": (
                         "Score drops below 4.0 or IV normalizes above 50th pct"

@@ -24,7 +24,6 @@ from trading.options_recommender import (
     OptionsRecommender,
 )
 
-
 # ── Fixtures ────────────────────────────────────────────────────────────────
 
 
@@ -77,7 +76,7 @@ def _make_engine(
     engine = MagicMock()
     conn = MagicMock()
 
-    def execute(sql, params=None):  # noqa: ARG001
+    def execute(sql, params=None):
         sql_str = str(sql).lower()
         result = MagicMock()
         result.fetchone.return_value = None
