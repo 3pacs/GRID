@@ -21,12 +21,13 @@ from __future__ import annotations
 import threading
 import time
 
+import pytest
 from loguru import logger as log
 from sqlalchemy import create_engine, event
 from sqlalchemy.pool import QueuePool
 
 import db as db_module
-from db import get_checkout_attribution
+from db import get_checkout_attribution, get_outstanding_checkouts, reset_pool_peak
 
 
 def _sqlite_engine(pool_size: int = 8, max_overflow: int = 4):
@@ -51,10 +52,32 @@ def _wire_attribution(engine):
         db_module._record_checkout_closed(connection_rec)
 
 
-def setup_function(_fn):
-    # Every test starts with a clean attribution table, independent of
-    # whatever an earlier test (or an already-created shared engine) left
-    # open.
+@pytest.fixture(autouse=True)
+def _reset_module_state():
+    # Every test starts with a clean attribution table AND a clean peak
+    # tracker, independent of whatever an earlier test -- in this file or
+    # another (both share db.py's module-level state) -- left behind. A
+    # prior test file's thread-safety test can leave the peak at a large
+    # nonzero value; without resetting it here, an assertion in this file
+    # that expects a known peak value would fail before ever reaching the
+    # rest of that test body, itself leaving stale state for tests after
+    # it -- exactly the kind of cross-test pollution this exists to avoid.
+    #
+    # Deliberately a pytest fixture, not a bare `setup_function`: this
+    # module's tests are all methods on Test* classes, and
+    # setup_function/teardown_function only apply to plain module-level
+    # test functions -- they silently never fire for class-based tests
+    # (setup_method is the per-class equivalent). An autouse fixture is
+    # the one mechanism that actually applies uniformly regardless of
+    # whether a test is a bare function or a class method. This was
+    # verified empirically: an earlier setup_function-based version of
+    # this reset passed every test in isolation (nothing to clean up yet)
+    # and only failed when run alongside another test file -- exactly the
+    # signature of a reset that was never actually running.
+    reset_pool_peak()
+    with db_module._checkout_lock:
+        db_module._open_checkouts.clear()
+    yield
     with db_module._checkout_lock:
         db_module._open_checkouts.clear()
 
@@ -234,3 +257,189 @@ class TestGetPoolStatsIncludesAttribution:
             assert stats["checkout_owners"]["by_thread"] == {threading.current_thread().name: 1}
         finally:
             conn.close()
+
+
+class TestInvalidationAndReconnect:
+    """Verifies actual behavior rather than assuming it -- these are the
+    exact lifecycle edges a naive id(connection_rec)-keyed table could get
+    wrong: invalidation, reconnect, and cross-thread release.
+    """
+
+    def test_invalidated_connection_still_gets_checked_in(self):
+        """Invalidating mid-use replaces the underlying DBAPI connection
+        for next time -- it does not skip returning the pool slot. If it
+        did, this would leave a permanently stale entry that never clears.
+        """
+        engine = _sqlite_engine()
+        _wire_attribution(engine)
+
+        conn = engine.connect()
+        assert get_checkout_attribution()["open_count"] == 1
+
+        conn.invalidate()
+        conn.close()
+
+        assert get_checkout_attribution()["open_count"] == 0
+
+    def test_reconnect_after_invalidation_gets_its_own_fresh_entry(self):
+        """A new checkout after invalidation must be tracked as its own
+        entry, not confused with (or blocked by) the invalidated one --
+        id(connection_rec) differs for the new pool slot's connection
+        record, so this should Just Work, but is verified rather than
+        assumed.
+        """
+        engine = _sqlite_engine()
+        _wire_attribution(engine)
+
+        conn1 = engine.connect()
+        conn1.invalidate()
+        conn1.close()
+        assert get_checkout_attribution()["open_count"] == 0
+
+        conn2 = engine.connect()
+        try:
+            assert get_checkout_attribution()["open_count"] == 1
+        finally:
+            conn2.close()
+        assert get_checkout_attribution()["open_count"] == 0
+
+    def test_checkin_from_a_different_thread_preserves_acquiring_thread(self):
+        """Checkout and checkin are not required to happen on the same
+        thread. The *acquiring* thread (captured at checkout) must survive
+        to the checkin-side warning even when a different thread performs
+        the actual release.
+        """
+        engine = _sqlite_engine()
+        _wire_attribution(engine)
+
+        conn_holder: list = []
+
+        def _acquire():
+            threading.current_thread().name = "acquirer-thread"
+            conn_holder.append(engine.connect())
+
+        acquirer = threading.Thread(target=_acquire)
+        acquirer.start()
+        acquirer.join(timeout=5)
+
+        assert get_checkout_attribution()["by_thread"] == {"acquirer-thread": 1}
+
+        # A *different* thread (the test's main thread) releases it --
+        # closing the connection object itself fires the real checkin
+        # event from this thread, not the acquiring one.
+        released_by_main_thread = threading.current_thread().name
+        assert released_by_main_thread != "acquirer-thread"
+        conn_holder[0].close()
+        assert get_checkout_attribution()["by_thread"] == {}
+
+
+class TestEngineDisposalClearsAttribution:
+    def test_clear_engine_clears_stale_checkouts_and_peak(self, monkeypatch):
+        """A checkout still open when clear_engine() disposes the engine
+        would otherwise never get a matching checkin from the *new*
+        engine's listeners -- permanently stale. clear_engine() must wipe
+        both the attribution table and the peak tracker.
+        """
+        fake_disposed = _sqlite_engine()
+        monkeypatch.setattr(db_module, "_engine", fake_disposed)
+        with db_module._checkout_lock:
+            db_module._open_checkouts[12345] = ("some-stale-thread", time.monotonic())
+        db_module._record_checkout_peak(7)
+        assert get_checkout_attribution()["open_count"] == 1
+        assert db_module.get_pool_peak_checked_out() == 7
+
+        db_module.clear_engine()
+
+        assert get_checkout_attribution()["open_count"] == 0
+        assert db_module.get_pool_peak_checked_out() == 0
+        assert db_module._engine is None
+
+
+class TestOutstandingCheckoutsVisibility:
+    """A checkin-side duration warning can only fire once a connection
+    returns -- it can never reveal one that never returns at all. These
+    exercise the point-in-time, on-demand view that closes that gap.
+    """
+
+    def test_reports_age_and_acquiring_thread_without_requiring_checkin(self):
+        engine = _sqlite_engine()
+        _wire_attribution(engine)
+
+        conn = engine.connect()  # never closed within this test
+        try:
+            outstanding = get_outstanding_checkouts()
+            assert len(outstanding) == 1
+            assert outstanding[0]["acquired_by"] == threading.current_thread().name
+            assert outstanding[0]["age_seconds"] >= 0
+        finally:
+            conn.close()
+
+    def test_min_age_filter_excludes_recent_checkouts(self):
+        engine = _sqlite_engine()
+        _wire_attribution(engine)
+
+        conn = engine.connect()
+        try:
+            assert get_outstanding_checkouts(min_age_seconds=60.0) == []
+            assert len(get_outstanding_checkouts(min_age_seconds=0.0)) == 1
+        finally:
+            conn.close()
+
+    def test_sorted_oldest_first_across_threads(self):
+        engine = _sqlite_engine(pool_size=8, max_overflow=4)
+        _wire_attribution(engine)
+
+        with db_module._checkout_lock:
+            now = time.monotonic()
+            db_module._open_checkouts[111] = ("thread-old", now - 10.0)
+            db_module._open_checkouts[222] = ("thread-new", now - 1.0)
+
+        result = get_outstanding_checkouts()
+        assert [r["acquired_by"] for r in result] == ["thread-old", "thread-new"]
+
+        with db_module._checkout_lock:
+            db_module._open_checkouts.pop(111, None)
+            db_module._open_checkouts.pop(222, None)
+
+
+class TestInstrumentationCannotBreakRealCheckout:
+    """The actual production listeners (registered inside get_engine(),
+    not the simplified _wire_attribution test helper above) must isolate
+    every instrumentation call so a bug in tracking/logging can never
+    prevent a real checkout or checkin from succeeding.
+    """
+
+    def test_get_engine_checkout_succeeds_even_if_attribution_tracking_raises(self, monkeypatch):
+        monkeypatch.setattr(db_module, "_engine", None)
+        monkeypatch.setenv("GRID_DB_POOL_SIZE", "4")
+        monkeypatch.setenv("GRID_DB_MAX_OVERFLOW", "2")
+        monkeypatch.setattr(
+            db_module, "settings",
+            type("FakeSettings", (), {"DB_URL": "sqlite:///:memory:", "DB_PASSWORD": "x"})(),
+        )
+
+        def _fake_create_engine(url, **kwargs):
+            return create_engine(
+                "sqlite:///:memory:",
+                poolclass=QueuePool,
+                pool_size=kwargs["pool_size"],
+                max_overflow=kwargs["max_overflow"],
+            )
+
+        monkeypatch.setattr(db_module, "create_engine", _fake_create_engine)
+
+        # Make the attribution helper explode on every call -- the real
+        # checkout must still succeed regardless.
+        def _boom(*args, **kwargs):
+            raise RuntimeError("simulated instrumentation bug")
+
+        monkeypatch.setattr(db_module, "_record_checkout_open", _boom)
+        monkeypatch.setattr(db_module, "_record_checkout_closed", _boom)
+
+        engine = db_module.get_engine()  # the real function, real listeners
+        conn = engine.connect()  # must not raise despite _boom above
+        try:
+            assert conn.execute(__import__("sqlalchemy").text("SELECT 1")).scalar() == 1
+        finally:
+            conn.close()  # must not raise either
+            monkeypatch.setattr(db_module, "_engine", None)  # don't leak into other tests
