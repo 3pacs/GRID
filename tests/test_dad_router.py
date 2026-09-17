@@ -154,8 +154,12 @@ def test_grid_decision_stack_uses_workbook_grid_and_fundamentals():
     gold = _gold_from_summary(summary)
     grid = {
         "metrics": {
-            "return_1y_pct": 32.0,
-            "pct_from_52w_high": -4.0,
+            # Window-keyed since B-H10: the chart metrics are named after the
+            # window actually measured, not always 1Y / 52 weeks.
+            "return_window_pct": 32.0,
+            "pct_from_window_high": -4.0,
+            "window_days": 365,
+            "window_label": "1Y",
         },
         "source_freshness": [
             {"source": "yfinance", "state": "fresh"},

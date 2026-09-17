@@ -1872,8 +1872,11 @@ def _apply_physics_scores(engine, today, setups: list) -> None:
         tickers = {s["ticker"] for s in setups if s.get("ticker")}
         for ticker in tickers:
             try:
-                result = dge.compute_gex_profile(ticker, today)
-                if "error" not in result:
+                # as_of=True: today's picture may legitimately rest on the
+                # last stored chain (weekend/holiday), but never on a later
+                # one. The date used is surfaced as physics.gex_snap_date.
+                result = dge.compute_gex_profile(ticker, today, as_of=True)
+                if result.get("available"):
                     gex_by_ticker[ticker] = result
             except Exception as exc:
                 log.debug("Flows: GEX profile failed for {t}: {e}", t=ticker, e=str(exc))
@@ -1917,6 +1920,7 @@ def _apply_physics_scores(engine, today, setups: list) -> None:
             regime = gex_data.get("regime", "NEUTRAL")
             physics["gex"] = round(gex_norm, 4)
             physics["gex_regime"] = regime
+            physics["gex_snap_date"] = gex_data.get("snap_date")
             if regime == "SHORT_GAMMA":
                 physics["gex_interpretation"] = (
                     "Dealers short gamma \u2014 moves will be amplified"

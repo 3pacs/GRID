@@ -214,6 +214,15 @@ def _range_to_days(range_name: str | None) -> int:
     }.get(key, 365)
 
 
+def _window_label(days: int) -> str:
+    """Human label for a price window, honest about its real length."""
+    for label, span in (("1M", 31), ("3M", 92), ("6M", 183), ("1Y", 365),
+                        ("2Y", 730), ("5Y", 1825), ("10Y", 3650)):
+        if days == span:
+            return label
+    return f"{days}D"
+
+
 def _detail_urls(ticker: str) -> dict[str, str]:
     enc = ticker
     return {
@@ -1019,14 +1028,21 @@ def _grid_market_context(
         first = prices[0]["value"]
         high = max(row["value"] for row in prices)
         low = min(row["value"] for row in prices)
+        # Keyed by the window actually measured. These used to be named
+        # high_52w / low_52w / pct_from_52w_high / return_1y_pct whatever the
+        # requested range was, so ?range=1M labelled a 31-day high as the
+        # 52-week high and a 31-day return as 1Y (audit B-H10).
         metrics = {
             "latest_price": latest,
             "first_price": first,
-            "return_1y_pct": ((latest - first) / first * 100) if first else None,
-            "high_52w": high,
-            "low_52w": low,
-            "pct_from_52w_high": ((latest - high) / high * 100) if high else None,
-            "pct_above_52w_low": ((latest - low) / low * 100) if low else None,
+            "window_days": days,
+            "window_label": _window_label(days),
+            "window_start": prices[0]["date"],
+            "return_window_pct": ((latest - first) / first * 100) if first else None,
+            "high_window": high,
+            "low_window": low,
+            "pct_from_window_high": ((latest - high) / high * 100) if high else None,
+            "pct_above_window_low": ((latest - low) / low * 100) if low else None,
             "obs_count": len(prices),
             "as_of": prices[-1]["date"],
         }
@@ -1240,25 +1256,32 @@ def _grid_decision_stack(
     })
 
     metrics = grid.get("metrics", {})
-    ret_1y = metrics.get("return_1y_pct")
-    from_high = metrics.get("pct_from_52w_high")
+    # Window-keyed: the copy below names the window that was measured rather
+    # than asserting 1Y / 52 weeks regardless of the range (B-H10).
+    ret_window = metrics.get("return_window_pct")
+    from_high = metrics.get("pct_from_window_high")
+    window = metrics.get("window_label") or (
+        f"{metrics['window_days']}D" if metrics.get("window_days") else "window"
+    )
     chart_points = 0.0
-    if ret_1y is not None:
-        if ret_1y >= 20:
+    if ret_window is not None:
+        if ret_window >= 20:
             chart_points += 15
-            reasons.append(f"GRID 1Y trend is strong at {ret_1y:.1f}%.")
-        elif ret_1y > 0:
+            reasons.append(f"GRID {window} trend is strong at {ret_window:.1f}%.")
+        elif ret_window > 0:
             chart_points += 8
-            reasons.append(f"GRID 1Y trend is positive at {ret_1y:.1f}%.")
+            reasons.append(f"GRID {window} trend is positive at {ret_window:.1f}%.")
         else:
             chart_points -= 4
-            blockers.append(f"GRID 1Y trend is negative at {ret_1y:.1f}%.")
+            blockers.append(f"GRID {window} trend is negative at {ret_window:.1f}%.")
     if from_high is not None:
         if from_high >= -10:
             chart_points += 5
         elif from_high <= -30:
             chart_points -= 5
-            blockers.append(f"Price is {abs(from_high):.1f}% below its 52-week high.")
+            blockers.append(
+                f"Price is {abs(from_high):.1f}% below its {window} high."
+            )
     if not metrics:
         blockers.append("GRID has no resolved price history for this ticker yet.")
     score += chart_points
@@ -1267,8 +1290,8 @@ def _grid_decision_stack(
         "state": "strong" if chart_points >= 15 else "watch" if chart_points > 0 else "missing" if not metrics else "caution",
         "points": round(chart_points, 1),
         "detail": (
-            f"1Y {ret_1y:.1f}%, {abs(from_high):.1f}% from 52W high"
-            if ret_1y is not None and from_high is not None
+            f"{window} {ret_window:.1f}%, {abs(from_high):.1f}% from {window} high"
+            if ret_window is not None and from_high is not None
             else "No GRID chart history."
         ),
     })
