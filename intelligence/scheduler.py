@@ -1164,8 +1164,33 @@ def run_intelligence_loop() -> None:
     time.sleep(120)
     log.info("Intelligence loop active — first run_pending cycle starting")
 
+    # Pool checkout/checkin is service-wide for this process: run_pending()
+    # dispatches every scheduled intelligence task from this single loop, and
+    # all of them share the one db.get_engine() singleton — there is no
+    # second engine or worker process in this service to double-count or
+    # miss.
+    _tick = 0
+    _POOL_LOG_EVERY_N_TICKS = 10  # ~5 min at the 30s tick below
+
     while True:
         _sched.run_pending()
+        _tick += 1
+        if _tick % _POOL_LOG_EVERY_N_TICKS == 0:
+            try:
+                from db import get_engine, get_pool_stats, reset_pool_peak
+                pool_stats = get_pool_stats(get_engine())
+                log.info(
+                    "DB pool (intelligence loop) — checked_out={co}/{cap} now, "
+                    "peak_since_last_log={pk} "
+                    "(pool_size={ps}, max_overflow={mo}, checked_in={ci})",
+                    co=pool_stats["checked_out"], cap=pool_stats["capacity"],
+                    pk=pool_stats["peak_checked_out"],
+                    ps=pool_stats["pool_size"], mo=pool_stats["max_overflow"],
+                    ci=pool_stats["checked_in"],
+                )
+                reset_pool_peak(pool_stats["checked_out"])
+            except Exception as exc:
+                log.debug("Pool stats logging failed: {e}", e=str(exc))
         time.sleep(30)
 
 

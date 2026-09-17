@@ -69,8 +69,16 @@ def get_pool_peak_checked_out() -> int:
         return _pool_peak_checked_out
 
 
-def reset_pool_peak() -> None:
-    """Reset the checked-out high-water-mark to 0 (e.g. at a cycle boundary).
+def reset_pool_peak(baseline: int = 0) -> None:
+    """Reset the checked-out high-water-mark, using ``baseline`` as the floor.
+
+    Connections already checked out at the moment of reset won't fire a
+    new "checkout" event — they were borrowed before the reset and stay
+    borrowed — so a bare reset to 0 would silently under-report the next
+    interval's true peak until *another* checkout happens to occur. Pass
+    the pool's current ``checked_out`` count (e.g. from
+    :func:`get_pool_stats`) as ``baseline`` so the next interval starts
+    from what is actually outstanding right now, not from zero.
 
     Call this after reading :func:`get_pool_peak_checked_out` so the next
     read reflects only the interval since the reset, not the whole
@@ -78,7 +86,7 @@ def reset_pool_peak() -> None:
     """
     global _pool_peak_checked_out
     with _pool_peak_lock:
-        _pool_peak_checked_out = 0
+        _pool_peak_checked_out = baseline
 
 
 def get_engine() -> Engine:
