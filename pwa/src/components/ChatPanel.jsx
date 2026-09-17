@@ -270,7 +270,7 @@ const S = {
         borderRadius: tokens.radius.sm,
         border: `1px solid ${colors.borderSubtle}`,
     },
-    confidence: {
+    claimCheck: {
         fontSize: '10px',
         fontFamily: MONO,
         color: colors.textMuted,
@@ -456,14 +456,23 @@ export default function ChatPanel({ open: controlledOpen, onOpenChange } = {}) {
                     role: 'assistant',
                     content: `Error: ${result.message || 'Request failed'}`,
                     sources: [],
-                    confidence: 0,
+                    claimCheck: null,
                 });
             } else {
                 const gridMsg = {
                     role: 'assistant',
                     content: result.answer,
                     sources: result.sources_used || [],
-                    confidence: result.confidence || 0,
+                    // The API no longer sends a `confidence` number
+                    // (docs/reference/CONFIDENCE_POLICY.md). What it sends is
+                    // the publishing firewall's count of claims it checked;
+                    // null whenever the firewall did not run.
+                    claimCheck: result.claim_count != null ? {
+                        claimCount: result.claim_count,
+                        flaggedCount: result.flagged_count,
+                        verifiedRatio: result.verified_claim_ratio,
+                        decision: result.firewall_decision,
+                    } : null,
                 };
                 addChatMessage(gridMsg);
                 if (!open) setChatUnread(unread + 1);
@@ -473,7 +482,7 @@ export default function ChatPanel({ open: controlledOpen, onOpenChange } = {}) {
                 role: 'assistant',
                 content: `Connection error: ${err.message}`,
                 sources: [],
-                confidence: 0,
+                claimCheck: null,
             });
         } finally {
             setLoading(false);
@@ -590,9 +599,10 @@ export default function ChatPanel({ open: controlledOpen, onOpenChange } = {}) {
                                         ))}
                                     </div>
                                 )}
-                                {msg.confidence > 0 && (
-                                    <div style={S.confidence}>
-                                        confidence: {(msg.confidence * 100).toFixed(0)}%
+                                {msg.claimCheck && msg.claimCheck.claimCount > 0 && (
+                                    <div style={S.claimCheck}>
+                                        {msg.claimCheck.claimCount - msg.claimCheck.flaggedCount}/{msg.claimCheck.claimCount} claims verified
+                                        {msg.claimCheck.decision ? ` (firewall: ${msg.claimCheck.decision})` : ''}
                                     </div>
                                 )}
                             </div>

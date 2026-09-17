@@ -102,7 +102,8 @@ function _fallbackDetailFromAttrs(nodeId, nodeType, attrs = {}) {
             ...(attrs.data || {}),
             trust_score: attrs.trust_score,
             trustScore: attrs.trust_score,
-            confidence: attrs.confidence,
+            source_class: attrs.source_class,
+            source_class_score: attrs.source_class_score,
             direction: attrs.direction,
             magnitude: attrs.magnitude,
             source_type: attrs.source_type,
@@ -123,14 +124,14 @@ function _normalizeDetailForPanel(detail, selectedNode, attrs = {}) {
             direction: 'out',
             counterparty: f.to_entity,
             amount: f.amount_estimate,
-            confidence: f.confidence,
+            source_class: f.source_class,
             date: f.flow_date,
         }));
         const incoming = (detail.wealth_flows_in || []).map((f) => ({
             direction: 'in',
             counterparty: f.from_actor,
             amount: f.amount_estimate,
-            confidence: f.confidence,
+            source_class: f.source_class,
             date: f.flow_date,
         }));
         return {
@@ -525,12 +526,12 @@ const S = {
         whiteSpace: 'nowrap',
         flexShrink: 0,
     }),
-    dotConfidence: (conf) => ({
+    dotInputs: {
         fontSize: '10px',
         fontFamily: MONO,
-        color: conf >= 0.8 ? colors.green : conf >= 0.5 ? colors.yellow : colors.red,
+        color: colors.textMuted,
         flexShrink: 0,
-    }),
+    },
     dotActors: {
         fontSize: '10px',
         fontFamily: MONO,
@@ -1566,9 +1567,19 @@ export default function GothamCanvas() {
                                     <div style={{ flex: 1, minWidth: 0 }}>
                                         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
                                             <span style={S.dotBadge(dotType.color)}>{dotType.label}</span>
-                                            <span style={S.dotConfidence(dot.confidence || 0)}>
-                                                {((dot.confidence || 0) * 100).toFixed(0)}% conf
-                                            </span>
+                                            {/* /canvas/dots no longer ships a
+                                                confidence number: the old one
+                                                was an affine function of the
+                                                row count with no calibration
+                                                behind it. The counts it was
+                                                built from are shown instead. */}
+                                            {dot.inputs && (
+                                                <span style={S.dotInputs}>
+                                                    {Object.entries(dot.inputs)
+                                                        .map(([k, v]) => `${k}=${v}`)
+                                                        .join(' · ')}
+                                                </span>
+                                            )}
                                         </div>
                                         <div style={{ color: colors.text, fontSize: '12px' }}>
                                             {dot.description || 'Cross-reference detected'}
