@@ -1646,24 +1646,33 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
 
     # 1. Health check
     try:
-        from db import get_engine, get_pool_stats, reset_pool_peak
+        from db import get_engine
         engine = get_engine()
-        # Read the peak accumulated since the previous cycle's reset first —
-        # a point sample of checked_out taken here would only show this
-        # instant, missing whatever burst happened mid-cycle. Reset after
-        # reading so the next cycle's peak reflects only its own interval.
-        pool_stats = get_pool_stats(engine)
-        cycle_result["db_pool"] = pool_stats
-        log.info(
-            "DB pool (this process) — checked_out={co}/{cap} now, "
-            "peak_since_last_cycle={pk} "
-            "(pool_size={ps}, max_overflow={mo}, checked_in={ci})",
-            co=pool_stats["checked_out"], cap=pool_stats["capacity"],
-            pk=pool_stats["peak_checked_out"],
-            ps=pool_stats["pool_size"], mo=pool_stats["max_overflow"],
-            ci=pool_stats["checked_in"],
-        )
-        reset_pool_peak(pool_stats["checked_out"])
+        # Pool telemetry is isolated in its own try/except: some callers
+        # (dry-run tests, alternate `db` stand-ins) only provide
+        # get_engine(), and instrumentation must never be able to take
+        # down the actual health check that follows.
+        try:
+            from db import get_pool_stats, reset_pool_peak
+            # Read the peak accumulated since the previous cycle's reset
+            # first — a point sample of checked_out taken here would only
+            # show this instant, missing whatever burst happened
+            # mid-cycle. Reset after reading so the next cycle's peak
+            # reflects only its own interval.
+            pool_stats = get_pool_stats(engine)
+            cycle_result["db_pool"] = pool_stats
+            log.info(
+                "DB pool (this process) — checked_out={co}/{cap} now, "
+                "peak_since_last_cycle={pk} "
+                "(pool_size={ps}, max_overflow={mo}, checked_in={ci})",
+                co=pool_stats["checked_out"], cap=pool_stats["capacity"],
+                pk=pool_stats["peak_checked_out"],
+                ps=pool_stats["pool_size"], mo=pool_stats["max_overflow"],
+                ci=pool_stats["checked_in"],
+            )
+            reset_pool_peak(pool_stats["checked_out"])
+        except Exception as exc:
+            log.debug("Pool stats logging failed: {e}", e=str(exc))
         health = check_system_health(engine)
         cycle_result["health"] = health
         hermes_ok = health["hermes"]["healthy"]
