@@ -165,7 +165,9 @@ function SectorHealthGauge({ health }) {
     const ringRef = useRef(null);
     const [showTip, setShowTip] = useState(false);
     const score = health?.score ?? null;
-    const trend = health?.trend_30d || 'stable';
+    // null when the health payload is unavailable; never default to a
+    // 'stable' reading the backend did not report.
+    const trend = health?.trend_30d ?? null;
     const components = health?.components || {};
     const color = HEALTH_COLOR(score);
 
@@ -269,7 +271,7 @@ function SectorHealthGauge({ health }) {
                             {TREND_ARROW[trend] || '\u2192'}
                         </span>
                         <span style={{ fontFamily: mono, fontSize: '11px', color: colors.text }}>
-                            {trend}
+                            {trend ?? 'unavailable'}
                         </span>
                     </div>
                 </div>
