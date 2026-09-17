@@ -185,3 +185,31 @@ def test_source_has_no_default_literals_left():
     src = inspect.getsource(ir._build_risk_map)
     for banned in ("else 20.0", "else 400", "else 100", "else 0.3", "pct = 50", "vix_val * 0.9"):
         assert banned not in src, banned
+
+
+def test_fully_unavailable_result_is_served_but_not_cached(monkeypatch):
+    """No sub-system measured -> honest payload now, no 5-minute pin."""
+    _stub_dealer_gamma(monkeypatch, {"error": "no chain"})
+    monkeypatch.setattr(ir, "get_db_engine", lambda: _engine(lambda sql, p: _res()))
+
+    result = asyncio.run(ir.get_risk_map("test-token"))
+
+    assert result["overall_risk_score"] is None
+    assert result["available_subsystems"] == 0
+    assert ir._risk_map_cache.get(ir._RISK_MAP_CACHE_KEY) is None
+
+
+def test_partially_measured_result_is_cached(monkeypatch):
+    _stub_dealer_gamma(monkeypatch, {"error": "no chain"})
+
+    def side_effect(sql, params):
+        if (params or {}).get("n") == "%hy%spread%":
+            return _res(one=(350.0,))
+        return _res()
+
+    monkeypatch.setattr(ir, "get_db_engine", lambda: _engine(side_effect))
+    result = asyncio.run(ir.get_risk_map("test-token"))
+
+    assert result["available_subsystems"] == 1
+    assert ir._risk_map_cache.get(ir._RISK_MAP_CACHE_KEY) is result
+

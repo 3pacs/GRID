@@ -547,7 +547,11 @@ async def get_risk_map(
             detail=f"Risk map unavailable: {exc}",
         ) from exc
 
-    _risk_map_cache.set(_RISK_MAP_CACHE_KEY, result)
+    if result.get("available_subsystems", 0) > 0:
+        # Only pin a payload that measured at least one sub-system. A fully
+        # unavailable read is still served honestly, but the next caller
+        # should retry rather than be handed a 5-minute-old "nothing".
+        _risk_map_cache.set(_RISK_MAP_CACHE_KEY, result)
     return result
 
 

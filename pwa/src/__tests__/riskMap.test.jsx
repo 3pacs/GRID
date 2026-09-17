@@ -80,6 +80,30 @@ describe('RiskMap truthfulness', () => {
         expect(screen.getAllByText('MODERATE').length).toBeGreaterThanOrEqual(1);
     });
 
+    it('renders a null overall score as UNAVAILABLE on the gauge, never as 0 or 50', async () => {
+        const allUnavailable = {
+            ...MEASURED,
+            dealer_risk: { risk_level: 'unknown', available: false, reason: 'no chain' },
+            volatility_risk: { risk_level: 'unknown', available: false, reason: 'no VIX series' },
+            credit_risk: { risk_level: 'unknown', available: false, reason: 'no HY series' },
+            overall_risk_score: null,
+            available_subsystems: 0,
+            unavailable_subsystems: ['Dealer positioning', 'Volatility', 'Concentration', 'Correlation', 'Credit spreads', 'Liquidity'],
+            risk_narrative: 'No risk sub-system could be measured; the overall score is unavailable.',
+        };
+        api.getRiskMap.mockResolvedValue(allUnavailable);
+
+        render(<RiskMap onNavigate={vi.fn()} />);
+
+        await waitFor(() => {
+            // six category chips + the gauge label
+            expect(screen.getAllByText('UNAVAILABLE').length).toBeGreaterThanOrEqual(7);
+        });
+        expect(screen.queryByText('LOW')).not.toBeInTheDocument();
+        expect(screen.queryByText('MODERATE')).not.toBeInTheDocument();
+        expect(screen.queryByText('50')).not.toBeInTheDocument();
+    });
+
     it('source contains no random walk and no synthetic timeline', () => {
         const src = fs.readFileSync(path.resolve(__dirname, '../views/RiskMap.jsx'), 'utf8');
         expect(src).not.toMatch(/Math\.random\(/);
