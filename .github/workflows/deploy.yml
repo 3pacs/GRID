@@ -925,7 +925,7 @@ jobs:
           # above for why --since alone isn't sufficient on a re-activation.
           for attempt in {1..90}; do
             if journalctl "_PID=${new_pid}" --since "@${restart_ts}" --no-pager -q 2>/dev/null | grep -qF 'DB pool (intelligence loop)'; then
-              echo "found the pool-telemetry log line from pid=${new_pid} confirming the deployed instrumentation is running"
+              echo "found the pool-telemetry log line from pid=${new_pid}"
               break
             fi
             if [ "$attempt" -eq 90 ]; then
@@ -935,7 +935,22 @@ jobs:
             fi
             sleep 10
           done
-          echo "**grid-intelligence activated successfully** (running the deployed tree with pool telemetry confirmed live from pid=${new_pid})." | tee -a "$GITHUB_STEP_SUMMARY"
+
+          # The log line only proves pid=new_pid said this AT SOME POINT
+          # since the restart -- it does not prove that process is still
+          # the one running now. Up to 15 minutes could have passed in the
+          # loop above; if it crashed after logging (Restart=always would
+          # respawn it under a NEW pid), declaring success here would be
+          # wrong. Re-check current state before declaring anything.
+          current_pid="$(systemctl show -p MainPID --value grid-intelligence)"
+          current_state="$(systemctl is-active grid-intelligence || true)"
+          if [ "$current_state" != "active" ] || [ "$current_pid" != "$new_pid" ]; then
+            echo "::error::grid-intelligence logged the telemetry line from pid=${new_pid}, but is no longer that same active process now (current state=${current_state}, current pid=${current_pid})"
+            sudo systemctl status grid-intelligence --no-pager -l || true
+            journalctl -u grid-intelligence -n 60 --no-pager || true
+            exit 1
+          fi
+          echo "**grid-intelligence activated successfully** (pid=${new_pid} logged the deployed pool telemetry and is still the current active process)." | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Notify success
         if: success()
