@@ -124,6 +124,30 @@ jobs:
     if: always() && (needs.verify.result == 'success' || needs.verify.result == 'skipped')
 
     steps:
+      # Scoped to this job only, via actions/setup-node's own tool-cache --
+      # does NOT touch grid-svr's global Node install (still whatever
+      # `node -v` shows in an interactive shell there). Must be its own
+      # step: setup-node adds its installed version to $GITHUB_PATH, which
+      # only takes effect for steps that run *after* this one in the same
+      # job -- the "Build release tree" step's npm commands rely on that.
+      #
+      # No `cache: npm` here, unlike test.yml's equivalent step: this job
+      # has no actions/checkout step at all (it manages $DEPLOY_PATH as a
+      # persistent git checkout via its own `git fetch`/`reset --hard`
+      # below, not a fresh clone into GITHUB_WORKSPACE), so there is no
+      # lockfile at a path relative to the default workspace for the cache
+      # action to key off. Caching is a speed optimization, not required
+      # for the version pin itself -- left out rather than pointed at a
+      # path that may not resolve the way it does in test.yml.
+      - name: Set up Node (this job only)
+        uses: actions/setup-node@v7
+        with:
+          # Keep this in sync with test.yml's NODE_VERSION by hand -- env
+          # blocks are scoped per workflow file, so the two can't share a
+          # single value without a repository variable, which doesn't exist
+          # for this today.
+          node-version: "22.23.2"
+
       - name: Build release tree
         env:
           SRC_URL: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git
@@ -145,14 +169,15 @@ jobs:
           # deploy anyway) needs to pass.
           git merge-base --is-ancestor "${{ github.sha }}" HEAD || { echo "::error::release tree is not at the pushed commit ${{ github.sha }}"; exit 1; }
           pip install -r requirements.txt
-          # This step never pins a Node version -- it builds with whatever is
-          # already on the runner's PATH (grid-svr's own global install, not
-          # anything actions/setup-node manages). pwa/.npmrc sets
-          # engine-strict=true, so `npm ci` itself now fails loudly on any
-          # installed package's real `engines.node` range (vitest 5's
-          # ^22.12.0 || ^24.0.0 || >=26.0.0 included) instead of the
-          # non-fatal EBADENGINE warning npm prints by default -- no
-          # hand-rolled version check to keep in sync here.
+          # Node itself is now pinned by the "Set up Node (this job only)"
+          # step above, via actions/setup-node's own tool-cache -- it
+          # prepended that version to $GITHUB_PATH before this step ran, so
+          # `npm` here resolves to 22.23.2, not grid-svr's global install.
+          # pwa/.npmrc still sets engine-strict=true, so `npm ci` fails
+          # loudly (not the non-fatal EBADENGINE warning npm prints by
+          # default) on any installed package's real `engines.node` range
+          # this pinned version doesn't satisfy -- no hand-rolled version
+          # check to keep in sync here.
           cd pwa && npm ci && npm run build && cd ..
           if [ "${{ inputs.skip_migrations }}" = "true" ]; then
             echo "::warning::alembic upgrade head skipped via workflow_dispatch input skip_migrations=true"
