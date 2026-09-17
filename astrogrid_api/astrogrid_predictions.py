@@ -33,6 +33,51 @@ from astrogrid_api.astrogrid_helpers import (
 
 router = APIRouter(tags=["astrogrid"])
 
+# The fixed 3%/4%/5%/8% invalidation levels below are a house rule, not a measurement:
+# they are not derived from the target's realised volatility, its ATR or any backtest.
+# Every payload carrying one must also carry ``invalidation_basis``.
+INVALIDATION_BASIS_HOUSE_RULE = "house_rule_fixed_pct"
+INVALIDATION_BASIS_STRUCTURAL = "structural_level_no_fixed_pct"
+
+_HOUSE_RULE_INVALIDATION_NOTE = (
+    "Fixed house rule applied to every call; not derived from realised volatility, "
+    "ATR or any backtest of this target."
+)
+
+
+def _directive_call(action: str, selected: str, fallback: str) -> str:
+    """Build a directive line only when a concrete symbol was actually selected."""
+    if selected and selected != "HYBRID":
+        return f"{action} {selected}"
+    return fallback
+
+
+def _overlay_unavailable_reason(
+    overlay: dict[str, Any],
+    target_symbols: list[str],
+    target_group: str,
+) -> str:
+    """Explain, in one sentence, why no relative-strength comparison was possible."""
+    if not isinstance(overlay, dict) or not overlay:
+        return (
+            "no market overlay snapshot was supplied, so no relative-strength "
+            "comparison was performed"
+        )
+    scorecard = overlay.get("scorecard")
+    if not isinstance(scorecard, dict) or not any(
+        scorecard.get(key) for key in ("items", "leaders", "laggards")
+    ):
+        return (
+            "market overlay snapshot carried no scorecard items, so no "
+            "relative-strength comparison was performed"
+        )
+    scope = ", ".join(target_symbols) if target_symbols else (target_group or "the requested universe")
+    return (
+        f"market overlay scorecard held no ranked items matching {scope}, so no "
+        "relative-strength comparison was performed"
+    )
+
+
 _GURU_BULLISH_FALLBACK_CANDIDATES = {
     "crypto": ["BTC", "ETH", "SOL"],
     "equity": ["AAPL", "MSFT", "GOOGL", "NVDA", "META"],
@@ -111,7 +156,9 @@ def _ranked_overlay_items(
     )
 
 
-def _build_guru_directive(req: AstrogridGuruRequest) -> tuple[AstrogridPredictionRequest, dict[str, Any]]:
+def _build_guru_directive(
+    req: AstrogridGuruRequest,
+) -> tuple[AstrogridPredictionRequest | None, dict[str, Any]]:
     seed = AstrogridPredictionRequest(
         question=req.question,
         call="read field",
@@ -151,6 +198,26 @@ def _build_guru_directive(req: AstrogridGuruRequest) -> tuple[AstrogridPredictio
     overlay = dict(req.market_overlay_snapshot or {})
     bullish_items = _ranked_overlay_items(overlay, resolved_candidates, target_group, reverse=True)
     bearish_items = _ranked_overlay_items(overlay, resolved_candidates, target_group, reverse=False)
+    if not bullish_items and not bearish_items:
+        # No comparison was performed, so there is no comparative directive to emit.
+        return None, {
+            "call": None,
+            "status": "no_scoreable_data",
+            "reason": _overlay_unavailable_reason(overlay, resolved_candidates, target_group),
+            "timing": None,
+            "setup": None,
+            "invalidation": None,
+            "invalidation_basis": None,
+            "invalidation_detail": None,
+            "note": None,
+            "question_intent": question_intent,
+            "target_group": target_group,
+            "target_symbols": [],
+            "contract": None,
+            "horizon": horizon,
+            "overlay_ranked_items": 0,
+            "disclaimer": "Entertainment and research only. Not financial advice.",
+        }
     top = bullish_items[0] if bullish_items else {}
     weak = bearish_items[0] if bearish_items else {}
     asset_label = "crypto" if target_group == "crypto" else "equity" if target_group == "equity" else "market"
@@ -214,20 +281,33 @@ def _build_guru_directive(req: AstrogridGuruRequest) -> tuple[AstrogridPredictio
         call = f"fade {trade_symbol}" if trade_symbol not in generic_targets else "fade the weakest mapped laggard"
         setup = f"{avoid_line(trade_symbol, compared_symbols)}. Do not add fresh long exposure while the weakness persists."
         invalidation = avoid_invalidation(trade_symbol)
+        invalidation_basis = (
+            INVALIDATION_BASIS_HOUSE_RULE if target_group == "crypto" else INVALIDATION_BASIS_STRUCTURAL
+        )
     elif question_intent in {"timing_entry", "buy_or_wait"}:
         selected = selected_ref(top)
         trade_symbol = contract_symbols_for(selected)[0] if contract_symbols_for(selected) else selected
         compared_symbols = comparison_symbols_for(trade_symbol)
-        call = f"buy {trade_symbol} on confirmation" if trade_symbol not in generic_targets else "buy the leader on confirmation"
+        call = (
+            _directive_call("buy", trade_symbol, "buy the leader") + " on confirmation"
+            if trade_symbol not in generic_targets
+            else "buy the leader on confirmation"
+        )
         setup = f"{support_line(trade_symbol, compared_symbols)}. Entry stays inactive until price confirms the move."
         invalidation = wait_invalidation(trade_symbol)
+        invalidation_basis = INVALIDATION_BASIS_STRUCTURAL
     else:
         selected = selected_ref(top)
         trade_symbol = contract_symbols_for(selected)[0] if contract_symbols_for(selected) else selected
         compared_symbols = comparison_symbols_for(trade_symbol)
-        call = f"buy {trade_symbol}" if trade_symbol not in generic_targets else "press the best mapped leader"
+        call = _directive_call("buy", trade_symbol, "press the best mapped leader")
         setup = support_line(trade_symbol, compared_symbols)
         invalidation = buy_invalidation(trade_symbol)
+        invalidation_basis = (
+            INVALIDATION_BASIS_HOUSE_RULE
+            if target_group in {"crypto", "equity"}
+            else INVALIDATION_BASIS_STRUCTURAL
+        )
 
     contract_symbols = contract_symbols_for(trade_symbol)
     contract = {
@@ -278,15 +358,26 @@ def _build_guru_directive(req: AstrogridGuruRequest) -> tuple[AstrogridPredictio
     )
     return prediction_req, {
         "call": call,
+        "status": "scoreable",
+        "reason": None,
         "timing": timing,
         "setup": setup,
         "invalidation": invalidation,
+        "invalidation_basis": invalidation_basis,
+        "invalidation_detail": {
+            "basis": invalidation_basis,
+            "derived_from": None,
+            "note": _HOUSE_RULE_INVALIDATION_NOTE
+            if invalidation_basis == INVALIDATION_BASIS_HOUSE_RULE
+            else "Structural level; no fixed percentage applied.",
+        },
         "note": note,
         "question_intent": question_intent,
         "target_group": target_group,
         "target_symbols": contract_symbols,
         "contract": contract,
         "horizon": horizon,
+        "overlay_ranked_items": len(bullish_items),
         "disclaimer": "Entertainment and research only. Not financial advice.",
     }
 
@@ -307,12 +398,34 @@ def _persist_prediction(
     confidence = _prediction_confidence(req)
 
     market_overlay_snapshot = dict(req.market_overlay_snapshot or {})
+    overlay_ranked = _ranked_overlay_items(
+        market_overlay_snapshot, target_symbols, target_group, reverse=True
+    )
+    overlay_scoreability: dict[str, Any] = {
+        "status": "scoreable" if overlay_ranked else "no_scoreable_data",
+        "ranked_items": len(overlay_ranked),
+        "reason": None
+        if overlay_ranked
+        else _overlay_unavailable_reason(market_overlay_snapshot, target_symbols, target_group),
+    }
+    if not overlay_ranked and str(req.model_version or "").startswith("astrogrid-guru"):
+        # A guru directive is derived from the overlay ranking; with no ranked items
+        # there is no comparison behind it, so nothing is persisted and no call returned.
+        return {
+            "call": None,
+            "status": "no_scoreable_data",
+            "reason": overlay_scoreability["reason"],
+            "prediction_id": None,
+            "persisted": False,
+            "market_overlay_scoreability": overlay_scoreability,
+        }
     scorecard_overlay = dict(market_overlay_snapshot.get("scorecard") or {})
     scorecard_overlay["target_statuses"] = target_statuses
     scorecard_overlay["target_group"] = target_group
     market_overlay_snapshot["scorecard"] = scorecard_overlay
     market_overlay_snapshot["question_intent"] = question_intent
     market_overlay_snapshot["target_group"] = target_group
+    market_overlay_snapshot["overlay_scoreability"] = overlay_scoreability
 
     actor_context = dict(actor_context or {})
     oracle_publish_result: dict[str, Any] = {"status": "not_attempted"}
@@ -446,6 +559,18 @@ async def ask_guru(
 ) -> dict[str, Any]:
     """Answer a plain Guru question and persist it into the AstroGrid ledger."""
     prediction_req, answer = _build_guru_directive(req)
+    if prediction_req is None:
+        # The overlay produced nothing to compare, so there is no call to make.
+        return {
+            "answer": answer,
+            "prediction": None,
+            "postmortem": None,
+            "call": None,
+            "status": "no_scoreable_data",
+            "reason": answer["reason"],
+            "disclaimer": answer["disclaimer"],
+            "persistence_status": "not_persisted_no_scoreable_data",
+        }
     auth_header = request.headers.get("authorization") or ""
     token = auth_header.removeprefix("Bearer").strip() if auth_header.lower().startswith("bearer") else ""
     if not token:
