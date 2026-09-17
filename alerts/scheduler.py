@@ -5,12 +5,18 @@ Starts a daemon thread that runs the daily digest email once per day in
 the 07:00-07:59 UTC hour. Called from ``api/main.py`` during application
 startup.
 
-Dedup is persisted in ``alert_state`` (alert_type="research_daily_digest",
-entity_id="daily") rather than held in a process-local variable, so a
-restart mid-window — or a second process, if this is ever deployed with
-more than the current single worker — cannot resend the same day's
-digest. Same pattern already proven by scripts/daily_digest.py's
-Hermes-cycle digest, which uses the same table.
+Concurrency (2026-09-17 rewrite): the first version deduped by reading
+the last-send timestamp, sending, and only afterward recording it — two
+processes (or two racing loop iterations) could both pass the read
+before either wrote, and a persistence failure after a real send meant
+the state table never advanced, so the loop kept retrying every minute
+for the rest of the hour. This version holds a Postgres advisory lock
+(``pg_try_advisory_lock``) for the whole check-send-record sequence, so
+only one holder can ever be inside it at a time, and fails closed — any
+error acquiring the lock or reading state means no send this minute,
+never "send anyway." Dedup state itself still lives in ``alert_state``
+(alert_type="research_daily_digest", entity_id="daily"), the same table
+scripts/daily_digest.py uses for the Hermes digest.
 """
 
 from __future__ import annotations
@@ -26,71 +32,106 @@ _ALERT_TYPE = "research_daily_digest"
 _ENTITY_ID = "daily"
 _DIGEST_HOUR_UTC = 7
 _MIN_GAP_HOURS = 20
+# Arbitrary but fixed 32-bit key for the digest send lock (pg_advisory_lock
+# takes a bigint; a single int key is fine and simpler than the two-int form).
+_ADVISORY_LOCK_KEY = 0x47_44_49_47  # 'GDIG' bytes, no meaning beyond being stable
 
 _scheduler_thread: threading.Thread | None = None
 _stop_event = threading.Event()
 
 
 def _latest_sent_at(engine: Any) -> datetime | None:
-    """Return the last persisted send timestamp for this digest, if any."""
-    if engine is None:
-        return None
-    try:
-        from sqlalchemy import text as sa_text
+    """Return the last persisted send timestamp for this digest, if any.
 
-        with engine.connect() as conn:
-            row = conn.execute(
-                sa_text(
-                    "SELECT seen_at FROM alert_state "
-                    "WHERE alert_type = :t AND entity_id = :e "
-                    "ORDER BY seen_at DESC LIMIT 1"
-                ),
-                {"t": _ALERT_TYPE, "e": _ENTITY_ID},
-            ).fetchone()
-        if not row or not row[0]:
-            return None
-        ts = row[0]
-        return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
-    except Exception as exc:
-        log.debug("Could not read persisted digest timestamp: {e}", e=str(exc))
+    Raises on a DB error rather than swallowing it — the caller must fail
+    closed (treat "can't tell" as "don't send"), not treat an unreadable
+    state table as "never sent."
+    """
+    from sqlalchemy import text as sa_text
+
+    with engine.connect() as conn:
+        row = conn.execute(
+            sa_text(
+                "SELECT seen_at FROM alert_state "
+                "WHERE alert_type = :t AND entity_id = :e "
+                "ORDER BY seen_at DESC LIMIT 1"
+            ),
+            {"t": _ALERT_TYPE, "e": _ENTITY_ID},
+        ).fetchone()
+    if not row or not row[0]:
         return None
+    ts = row[0]
+    return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
 
 
 def _record_sent(engine: Any, sent_at: datetime) -> None:
-    """Persist the send timestamp so a restart or second process can't resend."""
-    if engine is None:
-        return
-    try:
-        from sqlalchemy import text as sa_text
+    """Persist the send timestamp. Raises on failure — see caller."""
+    from sqlalchemy import text as sa_text
 
-        with engine.begin() as conn:
-            conn.execute(
-                sa_text(
-                    "INSERT INTO alert_state (alert_type, entity_id, seen_at) "
-                    "VALUES (:t, :e, :seen_at) "
-                    "ON CONFLICT (alert_type, entity_id) DO UPDATE SET "
-                    "seen_at = EXCLUDED.seen_at"
-                ),
-                {"t": _ALERT_TYPE, "e": _ENTITY_ID, "seen_at": sent_at},
-            )
-    except Exception as exc:
-        log.debug("Could not persist digest timestamp: {e}", e=str(exc))
+    with engine.begin() as conn:
+        conn.execute(
+            sa_text(
+                "INSERT INTO alert_state (alert_type, entity_id, seen_at) "
+                "VALUES (:t, :e, :seen_at) "
+                "ON CONFLICT (alert_type, entity_id) DO UPDATE SET "
+                "seen_at = EXCLUDED.seen_at"
+            ),
+            {"t": _ALERT_TYPE, "e": _ENTITY_ID, "seen_at": sent_at},
+        )
 
 
-def _should_send_now(engine: Any, now: datetime) -> bool:
-    """Is it time to send the digest, per persisted state?
+def _send_digest_once_per_window(engine: Any, now: datetime) -> None:
+    """Attempt the daily digest send, at most once per process at a time
+    and at most once globally per ``_MIN_GAP_HOURS`` window.
 
-    Kept separate from the loop and from any real clock/thread so tests
-    can drive it directly with a fake engine and a fixed ``now`` instead
-    of starting the real daemon thread (which would otherwise reach real
-    DB/SMTP code if a test happened to run during the actual send hour).
+    Holds ``pg_try_advisory_lock`` for the entire check-send-record
+    sequence: only the holder can pass the "not yet sent" check and reach
+    ``daily_digest()``, closing the race a plain read-then-later-write
+    left open. A failed or unconfirmed send does not record anything, so
+    the next minute's iteration (once the lock is free again) can retry —
+    that retry is legitimate because ``daily_digest()`` now returns a
+    real, synchronous SMTP outcome (not "dispatched to a thread"), so a
+    retry here is a response to a known failure, not a blind repeat of an
+    ambiguous one. Any exception anywhere in this function — acquiring
+    the lock, reading state, sending, or recording — means no send: fail
+    closed, never fail open into sending.
     """
-    if now.hour != _DIGEST_HOUR_UTC:
-        return False
-    last = _latest_sent_at(engine)
-    if last is not None and (now - last) < timedelta(hours=_MIN_GAP_HOURS):
-        return False
-    return True
+    if now.hour != _DIGEST_HOUR_UTC or engine is None:
+        return
+
+    from sqlalchemy import text as sa_text
+
+    lock_conn = None
+    try:
+        lock_conn = engine.connect()
+        got_lock = lock_conn.execute(
+            sa_text("SELECT pg_try_advisory_lock(:key)"), {"key": _ADVISORY_LOCK_KEY}
+        ).scalar()
+        if not got_lock:
+            log.debug("Another process holds the digest send lock this minute")
+            return
+        try:
+            last = _latest_sent_at(engine)
+            if last is not None and (now - last) < timedelta(hours=_MIN_GAP_HOURS):
+                return
+            log.info("Alert scheduler — claimed digest send lock, building daily digest")
+            from alerts.email import daily_digest
+
+            result = daily_digest()
+            if result.get("sent"):
+                _record_sent(engine, now)
+            else:
+                log.warning(
+                    "Daily digest did not confirm send this attempt — will retry: {e}",
+                    e=result.get("error"),
+                )
+        finally:
+            lock_conn.execute(sa_text("SELECT pg_advisory_unlock(:key)"), {"key": _ADVISORY_LOCK_KEY})
+    except Exception as exc:
+        log.warning("Digest send attempt failed — failing closed, no send recorded: {e}", e=str(exc))
+    finally:
+        if lock_conn is not None:
+            lock_conn.close()
 
 
 def _run_loop() -> None:
@@ -101,21 +142,7 @@ def _run_loop() -> None:
 
             engine = get_engine()
             now = datetime.now(timezone.utc)
-            if _should_send_now(engine, now):
-                log.info("Alert scheduler — triggering daily digest")
-                try:
-                    from alerts.email import daily_digest
-
-                    result = daily_digest()
-                    if result.get("sent"):
-                        _record_sent(engine, now)
-                    else:
-                        log.warning(
-                            "Daily digest did not send — will retry next minute: {e}",
-                            e=result.get("error"),
-                        )
-                except Exception as exc:
-                    log.warning("Daily digest failed: {e}", e=str(exc))
+            _send_digest_once_per_window(engine, now)
         except Exception as exc:
             log.debug("Alert scheduler loop error: {e}", e=str(exc))
 
@@ -126,9 +153,10 @@ def schedule_alerts() -> None:
     """Start the alert scheduler daemon thread.
 
     Safe to call multiple times — only starts one thread per process.
-    Send-state dedup lives in the database (see ``_should_send_now``), so
-    a restart mid-window, or a second process if this is ever deployed
-    with more than one worker, still cannot double-send the same day.
+    Send-state dedup and mutual exclusion live in the database (see
+    ``_send_digest_once_per_window``), so a restart mid-window, or a
+    second process if this is ever deployed with more than one worker,
+    still cannot double-send the same day.
     """
     global _scheduler_thread
 

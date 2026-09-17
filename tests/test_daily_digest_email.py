@@ -2,8 +2,10 @@
 unreachable for ~4 months (see GRID-wt-alerts-digest-wiring PR) because
 nothing called schedule_alerts(). These tests exist so a revival like that
 one is checked for content correctness, not just wiring: a collector
-failure must never look like "All systems operational", and a dry run
-must never touch the real send path.
+failure must never look like "All systems operational", a dry run must
+never touch the real send path, "sent" must mean a confirmed SMTP outcome
+rather than a dispatched-to-a-thread guess, and a missing/future/stale
+regime timestamp must never render as a current regime.
 """
 from __future__ import annotations
 
@@ -59,20 +61,59 @@ def _patch_engine(monkeypatch, routes: dict[str, _FakeResult]):
     )
 
 
-def _patch_send(monkeypatch):
+def _patch_send_sync(monkeypatch, returns: bool = True):
     calls = []
-    monkeypatch.setattr(email_mod, "_send", lambda *a, **k: calls.append((a, k)))
+
+    def _fake(*a, **k):
+        calls.append((a, k))
+        return returns
+
+    monkeypatch.setattr(email_mod, "_send_sync", _fake)
     return calls
+
+
+_QUIET_ROUTES = {
+    "inferred_state": _FakeResult(one=None),
+    "COUNT(*)": _FakeResult(one=(0,)),
+    "options_mispricing_scans": _FakeResult(many=[]),
+    "raw_series": _FakeResult(one=(0, None)),
+}
 
 
 def test_dry_run_never_calls_send(monkeypatch) -> None:
     _patch_engine(monkeypatch, routes={})
-    calls = _patch_send(monkeypatch)
+    calls = _patch_send_sync(monkeypatch)
 
     result = email_mod.daily_digest(dry_run=True)
 
     assert result["dry_run"] is True
     assert calls == []
+
+
+def test_live_send_confirmed_sets_sent_true(monkeypatch) -> None:
+    _patch_engine(monkeypatch, routes=_QUIET_ROUTES)
+    calls = _patch_send_sync(monkeypatch, returns=True)
+
+    result = email_mod.daily_digest(dry_run=False)
+
+    assert calls  # _send_sync was actually invoked
+    assert result["sent"] is True
+    assert "error" not in result
+
+
+def test_live_send_unconfirmed_sets_sent_false_not_true(monkeypatch) -> None:
+    """This is the exact bug the reviewer flagged: the previous version
+    called the fire-and-forget _send() and then set sent=True
+    unconditionally, before SMTP had even attempted anything. daily_digest
+    must only report sent=True once _send_sync has actually confirmed it.
+    """
+    _patch_engine(monkeypatch, routes=_QUIET_ROUTES)
+    _patch_send_sync(monkeypatch, returns=False)
+
+    result = email_mod.daily_digest(dry_run=False)
+
+    assert result["sent"] is False
+    assert "error" in result
 
 
 def test_collector_failure_is_reported_not_hidden_as_all_systems_operational(monkeypatch) -> None:
@@ -111,12 +152,7 @@ def test_genuinely_quiet_day_is_not_marked_degraded(monkeypatch) -> None:
     a quiet day (zero rows everywhere) still yields one section — it must
     not be flagged as a collector failure.
     """
-    _patch_engine(monkeypatch, routes={
-        "inferred_state": _FakeResult(one=None),
-        "COUNT(*)": _FakeResult(one=(0,)),
-        "options_mispricing_scans": _FakeResult(many=[]),
-        "raw_series": _FakeResult(one=(0, None)),
-    })
+    _patch_engine(monkeypatch, routes=_QUIET_ROUTES)
 
     result = email_mod.daily_digest(dry_run=True)
 
@@ -125,31 +161,64 @@ def test_genuinely_quiet_day_is_not_marked_degraded(monkeypatch) -> None:
     assert result["section_titles"] == ["Decisions (24h)"]
 
 
-def test_stale_regime_is_labelled_stale_not_shown_as_current(monkeypatch) -> None:
-    stale_ts = datetime.now(timezone.utc) - timedelta(hours=email_mod._STALE_REGIME_HOURS + 1)
-    _patch_engine(monkeypatch, routes={
-        "inferred_state": _FakeResult(one=("RISK_ON", 0.8, "BUY", stale_ts)),
-        "COUNT(*)": _FakeResult(one=(0,)),
-        "options_mispricing_scans": _FakeResult(many=[]),
-        "raw_series": _FakeResult(one=(0, None)),
-    })
-
-    result = email_mod.daily_digest(dry_run=True)
-
-    assert "Regime State" in result["section_titles"]
-    assert "regime" not in result["degraded"]
+def _regime_result(monkeypatch, row_tuple):
+    routes = dict(_QUIET_ROUTES)
+    routes["inferred_state"] = _FakeResult(one=row_tuple)
+    _patch_engine(monkeypatch, routes=routes)
+    return email_mod.daily_digest(dry_run=True)
 
 
-def test_fresh_regime_uses_the_normal_regime_section(monkeypatch) -> None:
+def test_fresh_regime_uses_the_plain_regime_title(monkeypatch) -> None:
     fresh_ts = datetime.now(timezone.utc) - timedelta(hours=1)
-    _patch_engine(monkeypatch, routes={
-        "inferred_state": _FakeResult(one=("RISK_ON", 0.8, "BUY", fresh_ts)),
-        "COUNT(*)": _FakeResult(one=(0,)),
-        "options_mispricing_scans": _FakeResult(many=[]),
-        "raw_series": _FakeResult(one=(0, None)),
-    })
+    result = _regime_result(monkeypatch, ("RISK_ON", 0.8, "BUY", fresh_ts))
 
-    result = email_mod.daily_digest(dry_run=True)
-
-    assert "Regime State" in result["section_titles"]
     assert result["degraded"] == []
+    # Exact title match, not "in" — the stale/unverified branches share
+    # the "Regime State" prefix, so a substring check alone would still
+    # pass if the fresh branch accidentally took one of those instead.
+    assert "Regime State" in result["section_titles"]
+    assert "Regime State — stale" not in result["section_titles"]
+    assert "Regime State — unverified" not in result["section_titles"]
+
+
+def test_stale_regime_gets_a_distinct_title_and_states_its_age(monkeypatch) -> None:
+    stale_ts = datetime.now(timezone.utc) - timedelta(hours=email_mod._STALE_REGIME_HOURS + 1)
+    result = _regime_result(monkeypatch, ("RISK_ON", 0.8, "BUY", stale_ts))
+
+    assert "regime" not in result["degraded"]
+    assert "Regime State — stale" in result["section_titles"]
+    assert "Regime State" not in [
+        t for t in result["section_titles"] if t != "Regime State — stale"
+    ]
+    body = next(s["body"] for s in result["section_bodies"] if s["title"] == "Regime State — stale")
+    assert "h ago" in body
+
+
+def test_missing_regime_timestamp_is_unverified_not_current(monkeypatch) -> None:
+    """Defensive handling for a NULL decision_timestamp (schema says NOT
+    NULL, but code that treats "unknown age" as "current" is exactly
+    backwards if that constraint is ever violated or relaxed) must not
+    silently fall into the normal current-regime rendering branch.
+    """
+    result = _regime_result(monkeypatch, ("RISK_ON", 0.8, "BUY", None))
+
+    assert "Regime State — unverified" in result["section_titles"]
+
+
+def test_future_regime_timestamp_is_rejected_not_treated_as_extra_fresh(monkeypatch) -> None:
+    future_ts = datetime.now(timezone.utc) + timedelta(hours=5)
+    result = _regime_result(monkeypatch, ("RISK_ON", 0.8, "BUY", future_ts))
+
+    assert "Regime State — unverified" in result["section_titles"]
+    body = next(
+        s["body"] for s in result["section_bodies"] if s["title"] == "Regime State — unverified"
+    )
+    assert "future" in body.lower()
+
+
+def test_dry_run_preview_includes_rendered_body_not_just_titles(monkeypatch) -> None:
+    fresh_ts = datetime.now(timezone.utc) - timedelta(hours=1)
+    result = _regime_result(monkeypatch, ("RISK_ON", 0.8, "BUY", fresh_ts))
+
+    assert "section_bodies" in result
+    assert all("body" in s for s in result["section_bodies"])

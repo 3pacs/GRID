@@ -257,6 +257,22 @@ def _send(subject: str, sections: list[dict], footer_note: str = "") -> None:
     _send_in_thread(subject, html, plain)
 
 
+def _send_sync(subject: str, sections: list[dict], footer_note: str = "") -> bool:
+    """Render and send synchronously, returning the real SMTP outcome.
+
+    ``_send`` exists to keep request handlers non-blocking; it fires a
+    background thread and returns before ``_do_send`` even runs, so a
+    caller can never learn whether the message was actually accepted —
+    "sent" there means "handed to a thread," not "delivered." A caller
+    running on its own background thread already (not a request path —
+    e.g. the daily digest scheduler) should call this instead, so it can
+    record a successful send only once one has actually happened.
+    """
+    html = _render_html(subject, sections, footer_note)
+    plain = "\n\n".join(f"[{s['title']}]\n{s.get('body', '')}" for s in sections)
+    return _do_send(subject, html, plain)
+
+
 # ---------------------------------------------------------------------------
 # Public API — Email types
 # ---------------------------------------------------------------------------
@@ -361,8 +377,11 @@ def daily_digest(dry_run: bool = False) -> dict[str, Any]:
         degraded: list[str] = []
 
         with engine.connect() as conn:
-            # Regime — a stale decision_journal row must not be presented
-            # as the current regime with no indication of its age.
+            # Regime — a missing, stale, or future-dated decision_journal
+            # timestamp must never render through the normal "current
+            # regime" branch. Age is unverifiable in the first two cases
+            # (worse than merely stale) and untrustworthy in the third
+            # (clock skew or bad data) — none of them are "current."
             try:
                 row = conn.execute(sa_text(
                     "SELECT inferred_state, state_confidence, grid_recommendation, "
@@ -376,10 +395,27 @@ def daily_digest(dry_run: bool = False) -> dict[str, Any]:
                         (datetime.now(timezone.utc) - ts).total_seconds() / 3600
                         if ts is not None else None
                     )
-                    if age_hours is not None and age_hours >= _STALE_REGIME_HOURS:
+                    if ts is None:
                         sections.append(_section_text(
-                            "Regime State",
-                            f"Stale — last decision_journal entry {age_hours:.0f}h ago "
+                            "Regime State — unverified",
+                            f"decision_journal's latest row has no timestamp; age "
+                            f"cannot be verified. Last known state: {row[0]}, "
+                            f"suggested action was: {row[2]}.",
+                            accent="amber",
+                        ))
+                    elif age_hours < 0:
+                        sections.append(_section_text(
+                            "Regime State — unverified",
+                            f"decision_journal's latest timestamp ({ts}) is in the "
+                            f"future — rejecting it rather than treating it as "
+                            f"current. Last known state: {row[0]}, suggested "
+                            f"action was: {row[2]}.",
+                            accent="red",
+                        ))
+                    elif age_hours >= _STALE_REGIME_HOURS:
+                        sections.append(_section_text(
+                            "Regime State — stale",
+                            f"last decision_journal entry {age_hours:.0f}h ago "
                             f"({ts}). Last known state: {row[0]}, "
                             f"suggested action was: {row[2]}.",
                             accent="amber",
@@ -498,14 +534,29 @@ def daily_digest(dry_run: bool = False) -> dict[str, Any]:
 
         if dry_run:
             result["dry_run"] = True
+            # Full content, not just titles — this is what a live check
+            # verifying timestamps/staleness/missing-data behavior needs
+            # to actually inspect; titles alone can't show a regime's
+            # rendered age or a degraded section's message text.
+            result["section_bodies"] = [
+                {"title": s["title"], "body": s.get("body", ""), "accent": s.get("accent", "")}
+                for s in sections
+            ]
             log.info("Daily digest built (dry run) — {n} sections, {d} degraded",
                       n=len(sections), d=len(degraded))
             return result
 
-        _send(subject, sections)
-        result["sent"] = True
-        log.info("Daily digest sent — {n} sections, {d} degraded",
-                  n=len(sections), d=len(degraded))
+        # Synchronous send: daily_digest() already runs on the scheduler's
+        # own background thread (alerts/scheduler.py), never a request
+        # handler, so blocking here on real SMTP I/O is safe — and it's
+        # what lets the caller record a claim only after an actual
+        # confirmed outcome instead of after merely dispatching one.
+        sent_ok = _send_sync(subject, sections)
+        result["sent"] = sent_ok
+        if not sent_ok:
+            result["error"] = "SMTP send did not confirm success (see alerts.email logs)"
+        log.info("Daily digest {status} — {n} sections, {d} degraded",
+                  status="sent" if sent_ok else "NOT sent", n=len(sections), d=len(degraded))
     except Exception as exc:
         result["sent"] = False
         result["error"] = str(exc)
