@@ -746,7 +746,10 @@ async def get_scan(
                 "spot_price": o.spot_price,
                 "iv_atm": o.iv_atm,
                 "confidence": o.confidence,
-                "is_100x": o.is_100x,
+                # Audit C-M20: renamed from "is_100x" and shipped with the
+                # model inputs behind it. Nullable — unmodelled is not "no".
+                "heuristic_payoff_flag": o.heuristic_payoff_flag,
+                "payoff_inputs": o.payoff_inputs,
             }
             for o in opps
         ]
@@ -754,11 +757,22 @@ async def get_scan(
         return {
             "opportunities": results,
             "count": len(results),
-            "count_100x": sum(1 for o in opps if o.is_100x),
+            "heuristic_payoff_flag_count": sum(
+                1 for o in opps if o.heuristic_payoff_flag
+            ),
+            "payoff_unmodelled_count": sum(
+                1 for o in opps if o.heuristic_payoff_flag is None
+            ),
         }
     except Exception as exc:
         log.warning("Derivatives scan failed: {e}", e=str(exc))
-        return {"opportunities": [], "count": 0, "count_100x": 0, "error": str(exc)}
+        return {
+            "opportunities": [],
+            "count": 0,
+            "heuristic_payoff_flag_count": 0,
+            "payoff_unmodelled_count": 0,
+            "error": str(exc),
+        }
 
 
 # ── GET /flow-timeline/{ticker} ─────────────────────────────────────

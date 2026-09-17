@@ -237,7 +237,12 @@ function ScannerCard({ item }) {
                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                     <span style={styles.ticker}>{item.ticker}</span>
                     <span style={directionStyle(item.direction)}>{item.direction}</span>
-                    {item.is_100x && <span style={styles.badge100x}>100x</span>}
+                    {item.heuristic_payoff_flag && (
+                        <span
+                            style={styles.badge100x}
+                            title={`Modelled payoff heuristic, not a quoted price. Inputs: ${JSON.stringify(item.payoff_inputs || {})}`}
+                        >100x est.</span>
+                    )}
                 </div>
                 <div style={{ textAlign: 'right' }}>
                     <div style={{
@@ -254,18 +259,20 @@ function ScannerCard({ item }) {
             <div style={styles.scoreBar(item.score)}>
                 <div style={styles.scoreFill(item.score)} />
             </div>
-            {item.estimated_payoff_multiple && (
-                <div style={{
-                    marginTop: '10px',
-                    fontSize: '13px',
-                    color: colors.text,
-                    fontFamily: "'JetBrains Mono', monospace",
-                }}>
-                    Est. Payoff: <span style={{ color: colors.green, fontWeight: 700 }}>
-                        {item.estimated_payoff_multiple?.toFixed(1)}x
+            <div style={{
+                marginTop: '10px',
+                fontSize: '13px',
+                color: colors.text,
+                fontFamily: "'JetBrains Mono', monospace",
+            }}>
+                Modelled payoff: {item.estimated_payoff_multiple != null ? (
+                    <span style={{ color: colors.green, fontWeight: 700 }}>
+                        {item.estimated_payoff_multiple.toFixed(1)}x
                     </span>
-                </div>
-            )}
+                ) : (
+                    <span style={{ color: colors.textMuted }}>not modelled (inputs missing)</span>
+                )}
+            </div>
             {item.thesis && (
                 <div style={{
                     marginTop: '8px',
@@ -790,10 +797,12 @@ function HundredXCard({ item }) {
                 </div>
                 <div style={{ textAlign: 'right' }}>
                     <div style={styles.hundredXPayoff}>
-                        {item.estimated_payoff_multiple?.toFixed(0)}x
+                        {item.estimated_payoff_multiple != null
+                            ? `${item.estimated_payoff_multiple.toFixed(0)}x`
+                            : 'n/a'}
                     </div>
                     <div style={{ fontSize: '10px', color: colors.textMuted, marginTop: '2px' }}>
-                        EST. PAYOFF
+                        MODELLED PAYOFF
                     </div>
                 </div>
             </div>
@@ -923,7 +932,7 @@ export default function Options({ selectedTicker = '' }) {
             const [sig, scan, opps] = await Promise.all([
                 api.getOptionsSignals().catch(() => ({ signals: [] })),
                 api.scanMispricing(5.0).catch(() => ({ opportunities: [] })),
-                api.get100xOpportunities().catch(() => ({ opportunities: [] })),
+                api.getHeuristicPayoffOpportunities().catch(() => ({ opportunities: [] })),
             ]);
             setSignals(sig.signals || []);
             setScanner((scan.opportunities || []).sort((a, b) => (b.score || 0) - (a.score || 0)));

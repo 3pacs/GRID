@@ -857,7 +857,8 @@ def _load_options_asymmetry(engine: Engine, as_of: date) -> dict[str, dict[str, 
             "score": _finite(row[2]),
             "direction": row[4],
             "thesis": row[5],
-            "is_100x": bool(row[6]) if row[6] is not None else None,
+            # Column is still named is_100x; the field says what it is.
+            "heuristic_payoff_flag": bool(row[6]) if row[6] is not None else None,
             "scan_date": scan.isoformat() if hasattr(scan, "isoformat") else scan,
         }
     return out

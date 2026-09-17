@@ -526,7 +526,11 @@ async def scan_mispricing(
                 "spot_price": o.spot_price,
                 "iv_atm": o.iv_atm,
                 "confidence": o.confidence,
-                "is_100x": o.is_100x,
+                # Audit C-M20: was "is_100x", a bare boolean asserting a
+                # market fact that was built entirely from tuning constants.
+                # Renamed, nullable, and shipped with its inputs.
+                "heuristic_payoff_flag": o.heuristic_payoff_flag,
+                "payoff_inputs": o.payoff_inputs,
             }
             for o in opps
         ]
@@ -534,18 +538,32 @@ async def scan_mispricing(
         return {
             "opportunities": results,
             "count": len(results),
-            "count_100x": sum(1 for o in opps if o.is_100x),
+            "heuristic_payoff_flag_count": sum(
+                1 for o in opps if o.heuristic_payoff_flag
+            ),
+            "payoff_unmodelled_count": sum(
+                1 for o in opps if o.heuristic_payoff_flag is None
+            ),
         }
     except Exception as exc:
         log.warning("Options scan failed: {e}", e=str(exc))
         return {"opportunities": [], "count": 0, "error": str(exc)}
 
 
-@router.get("/100x")
-async def get_100x_opportunities(
+@router.get("/heuristic-payoff")
+@router.get("/100x", deprecated=True)
+async def get_heuristic_payoff_opportunities(
     _token: str = Depends(require_auth),
 ) -> dict:
-    """Return only 100x+ flagged mispricing opportunities."""
+    """Opportunities whose MODELLED payoff multiple clears the 100x threshold.
+
+    The ``/100x`` path is retained as a deprecated alias because
+    ``pwa/src/api.js`` ships in installed PWAs that update on their own
+    schedule; ``/heuristic-payoff`` is the name to use. Both return the same
+    payload, in which every flagged item carries the ``payoff_inputs`` the
+    model used (audit C-M20) — the flag was previously a bare ``is_100x``
+    boolean whose entire derivation was invisible to the reader.
+    """
     try:
         from discovery.options_scanner import OptionsScanner
 
@@ -566,13 +584,19 @@ async def get_100x_opportunities(
                 "spot_price": o.spot_price,
                 "iv_atm": o.iv_atm,
                 "confidence": o.confidence,
+                "heuristic_payoff_flag": o.heuristic_payoff_flag,
+                "payoff_inputs": o.payoff_inputs,
             }
             for o in opps
         ]
 
-        return {"opportunities": results, "count": len(results)}
+        return {
+            "opportunities": results,
+            "count": len(results),
+            "flag_basis": "modelled_heuristic",
+        }
     except Exception as exc:
-        log.warning("100x scan failed: {e}", e=str(exc))
+        log.warning("Heuristic payoff scan failed: {e}", e=str(exc))
         return {"opportunities": [], "count": 0, "error": str(exc)}
 
 
@@ -580,7 +604,10 @@ async def get_100x_opportunities(
 def get_scan_history(
     ticker: str | None = Query(None),
     days: int = Query(30, ge=1, le=365),
-    only_100x: bool = Query(False),
+    only_flagged: bool = Query(
+        False,
+        description="Only rows whose modelled payoff cleared the threshold",
+    ),
     limit: int = Query(100, ge=1, le=500),
     _token: str = Depends(require_auth),
 ) -> dict:
@@ -591,8 +618,10 @@ def get_scan_history(
 
     # Build query safely — all conditions use parameterized placeholders
     base_query = (
+        # is_100x / payoff_multiple are the historical COLUMN names; the
+        # response renames them to say what they actually are.
         "SELECT ticker, scan_date, score, payoff_multiple, direction, "
-        "thesis, confidence, is_100x, spot_price, iv_atm "
+        "thesis, confidence, is_100x, spot_price, iv_atm, payoff_inputs "
         "FROM options_mispricing_scans "
         "WHERE scan_date >= CURRENT_DATE - make_interval(days => :days)"
     )
@@ -601,7 +630,7 @@ def get_scan_history(
     if ticker:
         base_query += " AND ticker = :ticker"
         params["ticker"] = ticker
-    if only_100x:
+    if only_flagged:
         base_query += " AND is_100x = TRUE"
 
     base_query += " ORDER BY score DESC LIMIT :lim"
@@ -620,9 +649,10 @@ def get_scan_history(
             "direction": r[4],
             "thesis": r[5],
             "confidence": r[6],
-            "is_100x": r[7],
+            "heuristic_payoff_flag": r[7],
             "spot_price": r[8],
             "iv_atm": r[9],
+            "payoff_inputs": r[10],
         }
         for r in rows
     ]
