@@ -323,10 +323,25 @@ function SanityDots({ checks }) {
 }
 
 function ConfidenceCircle({ value }) {
-    const pct = Math.round((value || 0) * 100);
+    // A missing confidence is not a zero confidence. Render an explicit
+    // "n/a" dial rather than a red 0% that reads as a measured verdict.
+    if (value == null || Number.isNaN(Number(value))) {
+        return (
+            <svg width="40" height="40" viewBox="0 0 40 40" style={{ flexShrink: 0 }}>
+                <circle cx="20" cy="20" r="16" fill="none" stroke={colors.border} strokeWidth="3" />
+                <text x="20" y="21" textAnchor="middle" dominantBaseline="middle"
+                    fontSize="9" fontWeight="700" fill={colors.textMuted}
+                    fontFamily="'JetBrains Mono', monospace"
+                >
+                    n/a
+                </text>
+            </svg>
+        );
+    }
+    const pct = Math.round(value * 100);
     const r = 16;
     const circ = 2 * Math.PI * r;
-    const offset = circ - (circ * (value || 0));
+    const offset = circ - (circ * value);
     const col = pct >= 70 ? colors.green : pct >= 40 ? colors.yellow : colors.red;
     return (
         <svg width="40" height="40" viewBox="0 0 40 40" style={{ flexShrink: 0 }}>
@@ -426,6 +441,17 @@ function TradeRecommendationCard({ rec }) {
     const dirColor = dir === 'CALL' ? colors.green : colors.red;
     const expReturn = rec.expected_return != null ? (rec.expected_return * 100).toFixed(1) : null;
     const kelly = rec.kelly_fraction != null ? (rec.kelly_fraction * 100).toFixed(1) : null;
+    // The API field names are entry_price / target_price / stop_loss; the
+    // short aliases are kept only for older cached payloads. Any of them may
+    // legitimately be null now (no quote, no GEX target, no gamma flip) and
+    // a null renders "n/a", never "$0.00".
+    const entry = rec.entry_price ?? rec.entry ?? null;
+    const target = rec.target_price ?? rec.target ?? null;
+    const stop = rec.stop_loss ?? rec.stop ?? null;
+    const money = (v) => (v != null ? `$${Number(v).toFixed(2)}` : 'n/a');
+    const winProb = rec.win_probability != null
+        ? `${(rec.win_probability * 100).toFixed(0)}% (n=${rec.win_probability_n ?? 0})`
+        : null;
 
     return (
         <div style={{
@@ -452,11 +478,11 @@ function TradeRecommendationCard({ rec }) {
                 gap: '6px', marginTop: '10px',
             }}>
                 {[
-                    { label: 'Strike', value: rec.strike != null ? `$${rec.strike.toFixed(0)}` : '--' },
-                    { label: 'Expiry', value: rec.expiry || '--' },
-                    { label: 'Entry', value: rec.entry != null ? `$${rec.entry.toFixed(2)}` : '--' },
-                    { label: 'Target', value: rec.target != null ? `$${rec.target.toFixed(2)}` : '--' },
-                    { label: 'Stop', value: rec.stop != null ? `$${rec.stop.toFixed(2)}` : '--' },
+                    { label: 'Strike', value: rec.strike != null ? `$${Number(rec.strike).toFixed(0)}` : 'n/a' },
+                    { label: 'Expiry', value: rec.expiry || 'n/a' },
+                    { label: 'Entry', value: money(entry) },
+                    { label: 'Target', value: money(target) },
+                    { label: 'Stop', value: money(stop) },
                 ].map(m => (
                     <div key={m.label} style={styles.metricBox}>
                         <div style={{ ...styles.metricLabel, fontSize: '9px' }}>{m.label}</div>
@@ -465,8 +491,21 @@ function TradeRecommendationCard({ rec }) {
                 ))}
             </div>
 
-            {/* Risk/Reward bar */}
-            <RiskRewardBar stop={rec.stop} entry={rec.entry} target={rec.target} />
+            {/* Provenance: a modelled entry price never reads as a quote */}
+            {rec.entry_price_basis && rec.entry_price_basis !== 'quote' && (
+                <div style={{
+                    marginTop: '6px', fontSize: '10px', color: colors.textMuted,
+                    fontFamily: "'JetBrains Mono', monospace",
+                }}>
+                    entry basis: {rec.entry_price_basis}
+                    {rec.entry_price_basis === 'model' && rec.entry_model_sigma != null && (
+                        <span> (sigma {Number(rec.entry_model_sigma).toFixed(2)}, r {Number(rec.entry_model_rate ?? 0).toFixed(2)}) — not a quoted price</span>
+                    )}
+                </div>
+            )}
+
+            {/* Risk/Reward bar — hidden entirely when a level is unknown */}
+            <RiskRewardBar stop={stop} entry={entry} target={target} />
 
             {/* Expected return + Kelly + Sanity */}
             <div style={{
@@ -484,14 +523,18 @@ function TradeRecommendationCard({ rec }) {
                             {parseFloat(expReturn) >= 0 ? '+' : ''}{expReturn}% exp
                         </span>
                     )}
-                    {kelly != null && (
-                        <span style={{
-                            fontSize: '10px', color: colors.textMuted,
-                            fontFamily: "'JetBrains Mono', monospace",
-                        }}>
-                            Kelly: {kelly}%
-                        </span>
-                    )}
+                    <span style={{
+                        fontSize: '10px', color: colors.textMuted,
+                        fontFamily: "'JetBrains Mono', monospace",
+                    }}>
+                        Kelly: {kelly != null ? `${kelly}%` : 'unsized'}
+                    </span>
+                    <span style={{
+                        fontSize: '10px', color: colors.textMuted,
+                        fontFamily: "'JetBrains Mono', monospace",
+                    }}>
+                        Win prob: {winProb ?? 'no history'}
+                    </span>
                 </div>
                 <SanityDots checks={rec.sanity_checks} />
             </div>
