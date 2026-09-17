@@ -41,8 +41,9 @@ Asymmetry score (``asymmetry_score``)
 * ``catalyst_strength`` — best ``trial_strength_score`` of an upcoming
   catalyst (0..1).
 * ``payoff_multiple`` — best options payoff multiple in the last 30 days.
-* ``playbook_edge`` — ``base_edge`` (percent) of the strongest playbook
-  that lists the ticker; 25 is the scale ceiling.
+* ``playbook_edge`` — ``prior_rank_points`` (a dimensionless hand-tuned
+  playbook prior, not a percent return) of the strongest playbook that lists
+  the ticker; 25 is the scale ceiling.
 
 Missing components contribute 0; the sum is clamped to [0, 1].
 
@@ -973,7 +974,7 @@ def _company_name(ticker: str) -> str | None:
 
 
 def _playbook_index() -> dict[str, list[dict[str, Any]]]:
-    """Playbooks keyed by ticker (id, title, thesis_stub, horizon, category, base_edge)."""
+    """Playbooks keyed by ticker (id, title, thesis_stub, horizon, category, prior_rank_points)."""
     from intelligence.market_edge_scanner import PLAYBOOKS
 
     out: dict[str, list[dict[str, Any]]] = {}
@@ -990,7 +991,7 @@ def _playbook_index() -> dict[str, list[dict[str, Any]]]:
                     "horizon": playbook.horizon,
                     "category": playbook.category,
                     "sector_focus": playbook.sector_focus,
-                    "base_edge": float(playbook.base_edge),
+                    "prior_rank_points": float(playbook.prior_rank_points),
                 }
             )
     return out
@@ -1136,7 +1137,7 @@ def _candidate(
         for theme in (pb.get("category"), pb.get("sector_focus")):
             if theme and theme not in themes:
                 themes.append(str(theme))
-        edge = _finite(pb.get("base_edge"))
+        edge = _finite(pb.get("prior_rank_points"))
         if edge is not None and (playbook_edge is None or edge > playbook_edge):
             playbook_edge = edge
     indication = (trial_meta or {}).get("primary_indication") or next(
