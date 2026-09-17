@@ -64,9 +64,9 @@ PREMIUM_BASIS_MODELLED: str = "modelled_1sigma"
 # ── Empirical win-probability lookup (audit C-H6) ───────────────────
 #
 # Win probability is READ FROM OUTCOMES or it is ``None``.  There is no
-# formula mapping a scanner score onto a hit rate: the previous
-# ``0.30 + (score - 5) * 0.06`` was a tuning constant wearing the name of
-# a measurement, and it sized real Kelly bets.
+# formula mapping a scanner score onto a hit rate: the previous affine map
+# (30% at score 5, plus six points per score point) was a tuning constant
+# wearing the name of a measurement, and it sized real Kelly bets.
 #
 # The replacement buckets closed recommendations by the scanner score
 # they were generated from and returns the realised win rate for the
@@ -1305,12 +1305,12 @@ class OptionsRecommender:
         direction there is no expected move to target, so the answer is
         ``(None, None)``.
 
-        Audit C-H8: this used to return ``entry_price * 2.0`` whenever the
-        GEX profile was missing — a doubling constant published as
-        ``target_price``, and then as ``target_return_pct`` (+100%) and as
-        the gain leg of ``expected_return``.  The docstring said the target
-        came from the GEX expected move; for every ticker without a GEX
-        profile it came from the number 2.
+        Audit C-H8: this used to return a flat doubling of the entry
+        premium whenever the GEX profile was missing — a constant published
+        as ``target_price``, and then as ``target_return_pct`` (+100%) and
+        as the gain leg of ``expected_return``.  The docstring said the
+        target came from the GEX expected move; for every ticker without a
+        GEX profile it came from the number 2.
         """
         if not gex_profile:
             return None, None
