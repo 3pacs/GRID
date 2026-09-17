@@ -21,6 +21,7 @@ from sqlalchemy import text
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from intelligence.actors.provenance import actor_source, source_as_of
 
 router = APIRouter(prefix="/api/v1/intel", tags=["intel-product"])
 
@@ -196,6 +197,8 @@ def intel_search(
                         "aum_usd": r[4],
                         "trust_score": r[5],
                         "confidence": r[6] or "derived",
+                        "source": actor_source(r[0]),
+                        "source_as_of": source_as_of(r[0]),
                     })
             except Exception as exc:
                 log.debug("Actor search skipped: {e}", e=str(exc))
@@ -369,6 +372,8 @@ def intel_entity_profile(
                     "aum_usd": r[4],
                     "trust_score": r[5],
                     "confidence": "derived",
+                    "source": actor_source(r[0]),
+                    "source_as_of": source_as_of(r[0]),
                 })
         except Exception as exc:
             log.debug("Actor lookup skipped for {n}: {e}", n=name, e=str(exc))
@@ -425,6 +430,11 @@ def intel_actor_dossier(
         "connected_entities": [],
         "sector_influence": [],
         "confidence": "derived",
+        # Provenance of the identity row: "curated_seed" when the actor came
+        # from the hand-curated seed table, "observed" otherwise. None until
+        # an identity row is found.
+        "source": None,
+        "source_as_of": None,
     }
 
     with engine.connect() as conn:
@@ -453,7 +463,11 @@ def intel_actor_dossier(
                     "connections": _safe_json(row[7]),
                     "confidence": row[8] or "derived",
                     "known_positions": _safe_json(row[9]),
+                    "source": actor_source(row[0]),
+                    "source_as_of": source_as_of(row[0]),
                 }
+                dossier["source"] = dossier["identity"]["source"]
+                dossier["source_as_of"] = dossier["identity"]["source_as_of"]
         except Exception as exc:
             log.debug("Actor identity lookup failed: {e}", e=str(exc))
 
