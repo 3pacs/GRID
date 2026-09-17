@@ -374,8 +374,12 @@ function compactFields(data) {
         .slice(0, 10);
 }
 
-function confidenceValue(data) {
-    const raw = firstNonEmpty(data.confidence, data.trust_score, data.trustScore, data.score);
+// A generic node's only measured 0-1 number is its trust score. The canvas
+// API no longer emits a `confidence` number for signals or edges
+// (docs/reference/CONFIDENCE_POLICY.md), so nothing is invented when this is
+// null: the gauge is simply not rendered.
+function trustValue(data) {
+    const raw = firstNonEmpty(data.trust_score, data.trustScore, data.score);
     return typeof raw === 'number' ? Math.max(0, Math.min(1, raw)) : null;
 }
 
@@ -383,8 +387,7 @@ function connectionBadge(item) {
     if (!item || typeof item !== 'object') return null;
     if (item.direction) return item.direction;
     if (item.type) return item.type;
-    if (typeof item.confidence === 'number') return `${(item.confidence * 100).toFixed(0)}%`;
-    if (item.confidence) return String(item.confidence);
+    if (item.source_class) return String(item.source_class);
     return null;
 }
 
@@ -469,9 +472,9 @@ function ActorDetail({ node }) {
                                 {formatMoney(f.amount)}
                             </span>
                         </div>
-                        {f.confidence && (
+                        {f.source_class && f.source_class !== 'unknown' && (
                             <div style={{ marginTop: '4px' }}>
-                                <ConfidenceLabel level={f.confidence} />
+                                <ConfidenceLabel level={f.source_class} />
                             </div>
                         )}
                     </div>
@@ -774,7 +777,12 @@ function TickerDetail({ node }) {
                 <div style={S.sectionTitle}>RECENT SIGNALS</div>
                 {recentSignals.length === 0 && <div style={S.emptyText}>No recent signals</div>}
                 {recentSignals
-                    .sort((a, b) => (b.confidence || 0) - (a.confidence || 0))
+                    // signal_data.confidence is the row's own provenance
+                    // column (a label or a number). Unknown sorts last.
+                    .sort((a, b) => (
+                        (typeof b.confidence === 'number' ? b.confidence : -1)
+                        - (typeof a.confidence === 'number' ? a.confidence : -1)
+                    ))
                     .slice(0, 8)
                     .map((s, i) => (
                         <div key={i} style={S.signalItem}>
@@ -783,7 +791,9 @@ function TickerDetail({ node }) {
                                 {s.source || s.type || '--'}
                             </span>
                             <span style={{ fontSize: '10px', color: colors.textMuted, fontFamily: MONO }}>
-                                {s.confidence != null ? `${(s.confidence * 100).toFixed(0)}%` : ''}
+                                {typeof s.confidence === 'number'
+                                    ? `${(s.confidence * 100).toFixed(0)}%`
+                                    : (s.confidence || '')}
                             </span>
                         </div>
                     ))}
@@ -844,7 +854,7 @@ function TickerDetail({ node }) {
 
 function SignalDetail({ node }) {
     const data = node.data || {};
-    const confidence = data.confidence || 0;
+    const sourceClass = data.source_class || null;
     const sourceType = data.source_type || data.sourceType || data.source || '';
     const direction = data.direction || '';
     const actor = data.actor || data.actor_name || '';
@@ -854,16 +864,11 @@ function SignalDetail({ node }) {
 
     return (
         <>
-            {/* Confidence */}
+            {/* Provenance class of the underlying row (never a number) */}
             <div style={S.card}>
-                <div style={S.row}>
-                    <span style={S.label}>Confidence</span>
-                    <span style={{ ...S.value, color: trustColor(confidence) }}>
-                        {(confidence * 100).toFixed(0)}%
-                    </span>
-                </div>
-                <div style={S.gauge}>
-                    <div style={S.gaugeFill(confidence * 100, trustColor(confidence))} />
+                <div style={S.rowLast}>
+                    <span style={S.label}>Source class</span>
+                    <span style={S.value}>{sourceClass || 'unknown'}</span>
                 </div>
             </div>
 
@@ -1008,7 +1013,7 @@ function GenericIntelligenceDetail({ node }) {
         data.summary,
         node.description,
     );
-    const confidence = confidenceValue(data);
+    const trust = trustValue(data);
     const date = firstNonEmpty(data.date, data.created_at, data.updated_at, data.signal_date, data.event_date);
     const ticker = firstNonEmpty(data.ticker, data.symbol);
     const source = firstNonEmpty(data.source_type, data.sourceType, data.source, data.provider);
@@ -1046,16 +1051,16 @@ function GenericIntelligenceDetail({ node }) {
                 </div>
             </div>
 
-            {confidence != null && (
+            {trust != null && (
                 <div style={S.card}>
                     <div style={S.row}>
-                        <span style={S.label}>Confidence</span>
-                        <span style={{ ...S.value, color: trustColor(confidence) }}>
-                            {(confidence * 100).toFixed(0)}%
+                        <span style={S.label}>Trust score</span>
+                        <span style={{ ...S.value, color: trustColor(trust) }}>
+                            {(trust * 100).toFixed(0)}%
                         </span>
                     </div>
                     <div style={S.gauge}>
-                        <div style={S.gaugeFill(confidence * 100, trustColor(confidence))} />
+                        <div style={S.gaugeFill(trust * 100, trustColor(trust))} />
                     </div>
                 </div>
             )}

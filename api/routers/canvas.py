@@ -21,6 +21,7 @@ Endpoints:
 from __future__ import annotations
 
 import json
+import math
 import uuid
 from collections import defaultdict, deque
 from datetime import date, datetime, timedelta, timezone
@@ -254,18 +255,75 @@ def _format_signal_label(
     return "SIGNAL"
 
 
+def _measured_or_none(value: Any) -> float | None:
+    """Pass a nullable numeric column through without inventing a midpoint.
+
+    Replaces the retired divide-by-one-hundred fallback (D-H1), which did two
+    wrong things at once: it rescaled a 0-1 column as if it were 0-100,
+    turning a real 0.8 into 0.008, and it turned a NULL into 0.5 — a value
+    ~60x larger than any genuine score, which then decided which nodes
+    survived ``limit``. ``actors.influence_score`` / ``actors.trust_score``
+    are on a 0-1 scale (intelligence/actors/models.py), so they are returned
+    unchanged.
+    """
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(f) or math.isinf(f):
+        return None
+    return f
+
+
+_SOURCE_CLASS_SCORE = {
+    "confirmed": 1.0,
+    "derived": 0.8,
+    "estimated": 0.6,
+    "rumored": 0.3,
+    "inferred": 0.5,
+}
+
+
+def _signal_confidence(raw: Any) -> tuple[float | None, str]:
+    """Map ``signal_data.confidence`` to (score, source_class).
+
+    The column carries a provenance *label*, not a measurement, so it is
+    published as ``source_class`` with the label's own name. An unmapped or
+    NULL label yields ``(None, "unknown")`` rather than the old ``0.5``
+    fallback and the old ``"estimated"`` relabel, which reported a row
+    written with the schema default (``'derived'``) under a weaker
+    provenance than it actually had (D-M13).
+    """
+    if raw is None:
+        return None, "unknown"
+    if isinstance(raw, str):
+        label = raw.strip().lower()
+        if label in _SOURCE_CLASS_SCORE:
+            return _SOURCE_CLASS_SCORE[label], label
+        return None, "unknown"
+    value = _measured_or_none(raw)
+    return value, ("numeric" if value is not None else "unknown")
+
+
 def _limit_canvas_nodes(nodes: list[dict], limit: int) -> list[dict]:
     """Apply a true total node cap while preserving center/high-influence actors."""
     if limit <= 0:
         return []
 
     center_nodes = [n for n in nodes if n.get("is_center")]
+    # An unscored actor (influence is None) is unknown, not zero and not
+    # average: it sorts *after* every scored actor rather than displacing one.
     actor_nodes = sorted(
         [
             n for n in nodes
             if n.get("type") == "actor" and not n.get("is_center")
         ],
-        key=lambda n: n.get("influence", 0),
+        key=lambda n: (
+            0 if n.get("influence") is None else 1,
+            n.get("influence") or 0.0,
+        ),
         reverse=True,
     )
     other_nodes = [
@@ -418,8 +476,9 @@ def _bfs_actors(
                         "target": f"a:{to_a}",
                         "type": "connection",
                         "label": r["relationship"] or "connected",
-                        "strength": float(r["strength"] or 0.5),
-                        "confidence": 0.7,
+                        # actor_connections has no confidence column: the 0.7
+                        # that used to sit here was a literal on every edge.
+                        "strength": _measured_or_none(r["strength"]),
                     })
 
                 # Visit neighbor
@@ -503,14 +562,11 @@ def _load_signals_for_actors(
                     continue
                 seen_signals.add(sig_id)
 
-                # Confidence may be a label (confirmed/derived/etc) or numeric
+                # signal_data.confidence is a provenance label
+                # (confirmed/derived/...) or a number. An unmapped label is
+                # unknown, not 0.5 (D-M13).
                 conf_raw = r["confidence"]
-                if isinstance(conf_raw, str):
-                    conf_map = {"confirmed": 1.0, "derived": 0.8, "estimated": 0.6,
-                                "rumored": 0.3, "inferred": 0.5}
-                    conf_val = conf_map.get(conf_raw.lower(), 0.5)
-                else:
-                    conf_val = float(conf_raw or 0.5)
+                conf_val, conf_label = _signal_confidence(conf_raw)
 
                 label = _format_signal_label(
                     r["signal_type"],
@@ -526,8 +582,8 @@ def _load_signals_for_actors(
                     "graph_depth": actor_depth + 1,
                     "source_type": r["signal_type"],
                     "direction": r["direction"],
-                    "confidence": conf_val,
-                    "confidence_label": str(conf_raw) if conf_raw else "estimated",
+                    "source_class_score": conf_val,
+                    "source_class": conf_label,
                     "magnitude": float(r["magnitude"] or 0),
                     "signal_date": str(r["signal_date"]) if r["signal_date"] else None,
                     "description": r["description"],
@@ -586,7 +642,7 @@ def _load_wealth_flows(
                     "target": f"a:{r['to_entity']}",
                     "type": "flow",
                     "amount": float(r["amount_estimate"] or 0),
-                    "confidence": r["confidence"] or "estimated",
+                    "source_class": r["confidence"] or "unknown",
                     "flow_date": str(r["flow_date"]) if r["flow_date"] else None,
                 })
 
@@ -624,7 +680,7 @@ def _load_dollar_flows(
                         "flow_type": r["source_type"],
                         "amount": float(r["amount_usd"] or 0),
                         "direction": r["direction"],
-                        "confidence": r["confidence"] or "estimated",
+                        "source_class": r["confidence"] or "unknown",
                         "flow_date": str(r["flow_date"]) if r["flow_date"] else None,
                     })
 
@@ -773,13 +829,7 @@ def _load_signals_for_ticker(
 
         for r in rows:
             sig_id = f"s:{r['id']}"
-            cr = r["confidence"]
-            if isinstance(cr, str):
-                cm = {"confirmed": 1.0, "derived": 0.8, "estimated": 0.6,
-                      "rumored": 0.3, "inferred": 0.5}
-                cv = cm.get(cr.lower(), 0.5)
-            else:
-                cv = float(cr or 0.5)
+            cv, cl = _signal_confidence(r["confidence"])
             label = _format_signal_label(
                 r["signal_type"],
                 r["ticker"],
@@ -794,7 +844,8 @@ def _load_signals_for_ticker(
                 "graph_depth": 1,
                 "source_type": r["signal_type"],
                 "direction": r["direction"],
-                "confidence": cv,
+                "source_class_score": cv,
+                "source_class": cl,
                 "magnitude": float(r["magnitude"] or 0),
                 "signal_date": str(r["signal_date"]) if r["signal_date"] else None,
                 "description": r["description"],
@@ -898,8 +949,8 @@ def get_canvas_graph(
                 "label": _format_actor_label(aid, row["name"]),
                 "tier": row["tier"] or "unknown",
                 "category": row["category"] or "unknown",
-                "influence": float(row["influence_score"] or 50) / 100.0,
-                "trust_score": float(row["trust_score"] or 50) / 100.0,
+                "influence": _measured_or_none(row["influence_score"]),
+                "trust_score": _measured_or_none(row["trust_score"]),
                 "title": row["title"] or "",
                 "is_center": False,
             })
@@ -926,8 +977,8 @@ def get_canvas_graph(
                         "target": f"a:{cr['actor_b']}",
                         "type": "connection",
                         "label": cr["relationship"] or "",
-                        "strength": float(cr["strength"] or 0.5),
-                        "confidence": "confirmed",
+                        # Same table, same absent confidence column.
+                        "strength": _measured_or_none(cr["strength"]),
                     })
 
             # ── Implicit edges: same category ──
@@ -982,8 +1033,14 @@ def get_canvas_graph(
                                         "target": f"a:{b}",
                                         "type": "co_signal",
                                         "label": ticker,
-                                        "strength": 0.4,
-                                        "confidence": "derived",
+                                        # Synthesized from "both actors touched
+                                        # this ticker in the window"; there is
+                                        # no measured strength, so ship the
+                                        # count that produced the edge instead
+                                        # of a constant 0.4 (D-M12).
+                                        "strength": None,
+                                        "basis": "co_occurrence_within_window",
+                                        "shared_actor_count": len(shared),
                                     })
             except Exception as exc:
                 log.debug("Co-signal edge detection failed: {e}", e=str(exc))
@@ -1009,8 +1066,8 @@ def get_canvas_graph(
                 "graph_depth": int(data.get("_graph_depth", 0)),
                 "tier": data.get("tier", "unknown"),
                 "category": data.get("category", "unknown"),
-                "influence": float(data.get("influence_score") or 50) / 100.0,
-                "trust_score": float(data.get("trust_score") or 50) / 100.0,
+                "influence": _measured_or_none(data.get("influence_score")),
+                "trust_score": _measured_or_none(data.get("trust_score")),
                 "title": data.get("title", ""),
                 "is_center": aid == center_entity["id"],
             })
@@ -1064,8 +1121,8 @@ def get_canvas_graph(
                             "graph_depth": 1,
                             "tier": row["tier"],
                             "category": row["category"],
-                            "influence": float(row["influence_score"] or 50) / 100.0,
-                            "trust_score": float(row["trust_score"] or 50) / 100.0,
+                            "influence": _measured_or_none(row["influence_score"]),
+                            "trust_score": _measured_or_none(row["trust_score"]),
                             "title": row["title"],
                             "is_center": False,
                         })
@@ -1086,8 +1143,8 @@ def get_canvas_graph(
                             "graph_depth": int(data.get("_graph_depth", 1)),
                             "tier": data.get("tier", "unknown"),
                             "category": data.get("category", "unknown"),
-                            "influence": float(data.get("influence_score") or 50) / 100.0,
-                            "trust_score": float(data.get("trust_score") or 50) / 100.0,
+                            "influence": _measured_or_none(data.get("influence_score")),
+                            "trust_score": _measured_or_none(data.get("trust_score")),
                             "title": data.get("title", ""),
                             "is_center": False,
                         })
@@ -1308,8 +1365,8 @@ async def _actor_detail(engine: Engine, actor_id: str) -> dict[str, Any]:
             "name": actor["name"],
             "tier": actor["tier"],
             "category": actor["category"],
-            "influence_score": float(actor.get("influence_score") or 50) / 100.0,
-            "trust_score": float(actor.get("trust_score") or 50) / 100.0,
+            "influence_score": _measured_or_none(actor.get("influence_score")),
+            "trust_score": _measured_or_none(actor.get("trust_score")),
             "title": actor.get("title"),
             "net_worth_estimate": actor.get("net_worth_estimate"),
             "aum": actor.get("aum"),
@@ -1464,8 +1521,8 @@ def expand_node(
                     "graph_depth": int(data.get("_graph_depth", 0)),
                     "tier": data.get("tier", "unknown"),
                     "category": data.get("category", "unknown"),
-                    "influence": float(data.get("influence_score") or 50) / 100.0,
-                    "trust_score": float(data.get("trust_score") or 50) / 100.0,
+                    "influence": _measured_or_none(data.get("influence_score")),
+                    "trust_score": _measured_or_none(data.get("trust_score")),
                     "title": data.get("title", ""),
                     "is_center": False,
                 })
@@ -1530,8 +1587,8 @@ def expand_node(
                             "name": row["name"],
                             "tier": row["tier"],
                             "category": row["category"],
-                            "influence": float(row["influence_score"] or 50) / 100.0,
-                            "trust_score": float(row["trust_score"] or 50) / 100.0,
+                            "influence": _measured_or_none(row["influence_score"]),
+                            "trust_score": _measured_or_none(row["trust_score"]),
                             "title": row["title"],
                             "is_center": False,
                         })
@@ -1889,7 +1946,8 @@ def get_dot_connections(
                             f"{', '.join(str(a) for a in actors_list[:5]) if isinstance(actors_list, list) else str(actors_list)}"
                         ),
                     ],
-                    "confidence": min(0.9, 0.3 + cnt * 0.05),
+                    "inputs": {"insider_transaction_count": cnt,
+                                         "window_days": days},
                     "description": (
                         f"Insider cluster: {cnt} insider trades on {row['ticker']} -- "
                         f"{len(actors_list) if isinstance(actors_list, list) else 1} distinct insiders"
@@ -1929,7 +1987,8 @@ def get_dot_connections(
                         f"{cnt} whale_options + whale_flow agreements on {row['ticker']}",
                         f"Consensus direction: {row['direction']}",
                     ],
-                    "confidence": min(0.95, 0.4 + cnt * 0.03),
+                    "inputs": {"agreement_count": cnt,
+                                         "window_days": days},
                     "description": (
                         f"Whale convergence: {cnt} whale_options/whale_flow signals agree "
                         f"{row['direction']} on {row['ticker']}"
@@ -1968,7 +2027,8 @@ def get_dot_connections(
                         f"{cnt} lobbying-insider overlaps on {row['ticker']} within 30d windows",
                         "Company lobbying activity coincides with insider trading",
                     ],
-                    "confidence": min(0.85, 0.4 + cnt * 0.05),
+                    "inputs": {"overlap_count": cnt,
+                                         "window_days": days},
                     "description": (
                         f"Lobbying-insider correlation: {row['ticker']} has {cnt} instances "
                         f"of insider trades near lobbying disclosures"
@@ -2008,7 +2068,8 @@ def get_dot_connections(
                         f"{bull} bullish vs {bear} bearish signals on {row['ticker']}",
                         f"Divergence ratio: {bull}/{total} bullish, {bear}/{total} bearish",
                     ],
-                    "confidence": min(0.9, 0.3 + min(bull, bear) / max(bull, bear, 1) * 0.6),
+                    "inputs": {"bullish": bull, "bearish": bear,
+                               "window_days": days},
                     "description": (
                         f"Signal divergence on {row['ticker']}: "
                         f"{bull} bullish vs {bear} bearish -- market is conflicted"
@@ -2045,7 +2106,9 @@ def get_dot_connections(
                         f"{events} geopolitical events involving {row['actor']}",
                         f"Average tension magnitude: {tension:.1f}",
                     ],
-                    "confidence": min(0.9, 0.3 + tension * 0.1),
+                    "inputs": {"avg_tension_magnitude": tension,
+                               "event_count": events,
+                               "window_days": days},
                     "description": (
                         f"Geopolitical hot spot: {row['actor']} -- "
                         f"{events} events, avg tension {tension:.1f}"
@@ -2083,7 +2146,9 @@ def get_dot_connections(
                         f"{cnt} unusual options signals on {row['ticker']}",
                         f"Directional lean: {bull} bullish, {bear} bearish ({lean})",
                     ],
-                    "confidence": min(0.9, 0.3 + cnt * 0.03),
+                    "inputs": {"unusual_options_signal_count": cnt,
+                                         "bullish": bull, "bearish": bear,
+                                         "window_days": days},
                     "description": (
                         f"Unusual options: {cnt} signals on {row['ticker']} -- "
                         f"skewing {lean} ({bull}B/{bear}S)"
@@ -2122,7 +2187,8 @@ def get_dot_connections(
                             f"{', '.join(str(s) for s in sources) if isinstance(sources, list) else str(sources)}"
                         ),
                     ],
-                    "confidence": min(0.95, 0.4 + src_count * 0.1),
+                    "inputs": {"distinct_source_count": src_count,
+                                         "window_days": days},
                     "description": (
                         f"Multi-source convergence: {src_count} signal types agree "
                         f"{row['direction']} on {row['ticker']}"
