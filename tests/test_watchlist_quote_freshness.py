@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import inspect
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
@@ -191,11 +191,18 @@ class TestQuoteLiveFallback:
         self, _mock_cache, mock_engine, _mock_init
     ):
         """Previously as_of stayed null on the live-fallback path even
-        though a fresh live price was returned."""
+        though a fresh live price was returned.
+
+        as_of is the quote's own bar date (audit C-M14): stamping today on a
+        weekend read claimed Friday's close as a Sunday observation. Here the
+        bar is today's, so as_of is today and the price is not stale.
+        """
         _wire_engine(mock_engine, _mock_quote_conn([]))
+        today = date.today()
         with patch(
             "api.routers.watchlist_overview._fetch_live_price",
-            return_value={"price": 42.0, "pct_1d": 0.01},
+            return_value={"price": 42.0, "pct_1d": 0.01,
+                          "bar_date": today.isoformat()},
         ):
             response = client.get("/api/v1/watchlist/ZZZ/quote", headers=_auth_header())
 
@@ -203,8 +210,49 @@ class TestQuoteLiveFallback:
         assert data["source"] == "live"
         assert data["price"] == 42.0
         assert data["change_pct"] == 0.01
-        assert data["as_of"] == str(date.today())
+        assert data["as_of"] == str(today)
         assert data["stale"] is False
+
+    @patch("api.routers.watchlist_overview._init_table")
+    @patch("api.routers.watchlist_overview.get_db_engine")
+    @patch("api.routers.watchlist_overview._cache_price_to_db")
+    def test_live_fallback_reports_the_quotes_own_bar_date(
+        self, _mock_cache, mock_engine, _mock_init
+    ):
+        """A Friday close served on a Sunday reports Friday, and reads stale
+        once it is more than three days old."""
+        _wire_engine(mock_engine, _mock_quote_conn([]))
+        old_bar = datetime.now(timezone.utc).date() - timedelta(days=5)
+        with patch(
+            "api.routers.watchlist_overview._fetch_live_price",
+            return_value={"price": 42.0, "pct_1d": 0.01,
+                          "bar_date": old_bar.isoformat()},
+        ):
+            response = client.get("/api/v1/watchlist/ZZZ/quote", headers=_auth_header())
+
+        data = response.json()
+        assert data["as_of"] == str(old_bar)
+        assert data["stale"] is True
+
+    @patch("api.routers.watchlist_overview._init_table")
+    @patch("api.routers.watchlist_overview.get_db_engine")
+    @patch("api.routers.watchlist_overview._cache_price_to_db")
+    def test_undated_live_quote_reports_no_as_of(
+        self, _mock_cache, mock_engine, _mock_init
+    ):
+        """fast_info quotes carry no bar date, so as_of stays null rather
+        than being back-filled with today's."""
+        _wire_engine(mock_engine, _mock_quote_conn([]))
+        with patch(
+            "api.routers.watchlist_overview._fetch_live_price",
+            return_value={"price": 42.0, "pct_1d": 0.01, "bar_date": None},
+        ):
+            response = client.get("/api/v1/watchlist/ZZZ/quote", headers=_auth_header())
+
+        data = response.json()
+        assert data["price"] == 42.0
+        assert data["as_of"] is None
+        assert data["stale"] is None
 
 
 class TestQuoteQueryCollapsesVintages:
