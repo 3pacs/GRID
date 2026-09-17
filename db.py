@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Generator
@@ -44,6 +45,40 @@ def _is_slot_exhaustion_error(exc: BaseException) -> bool:
 # SQLAlchemy Engine (singleton)
 # ---------------------------------------------------------------------------
 _engine: Engine | None = None
+
+# Thread-safe high-water-mark for checked-out connections. A per-cycle or
+# per-health-check point sample can land between bursts and miss them
+# entirely; this records the peak seen by any thread since the last reset,
+# via the pool's own checkout event, so short-lived spikes are never lost
+# between observations.
+_pool_peak_checked_out = 0
+_pool_peak_lock = threading.Lock()
+
+
+def _record_checkout_peak(checked_out: int) -> None:
+    """Update the thread-safe checked-out high-water-mark if exceeded."""
+    global _pool_peak_checked_out
+    with _pool_peak_lock:
+        if checked_out > _pool_peak_checked_out:
+            _pool_peak_checked_out = checked_out
+
+
+def get_pool_peak_checked_out() -> int:
+    """Return the highest checked-out count observed since the last reset."""
+    with _pool_peak_lock:
+        return _pool_peak_checked_out
+
+
+def reset_pool_peak() -> None:
+    """Reset the checked-out high-water-mark to 0 (e.g. at a cycle boundary).
+
+    Call this after reading :func:`get_pool_peak_checked_out` so the next
+    read reflects only the interval since the reset, not the whole
+    process's lifetime.
+    """
+    global _pool_peak_checked_out
+    with _pool_peak_lock:
+        _pool_peak_checked_out = 0
 
 
 def get_engine() -> Engine:
@@ -106,6 +141,7 @@ def get_engine() -> Engine:
         def _on_checkout(dbapi_conn, connection_rec, connection_proxy):  # noqa: ARG001
             checked_out = _engine.pool.checkedout()  # type: ignore[union-attr]
             capacity = pool_size + max_overflow
+            _record_checkout_peak(checked_out)
             if checked_out > _warn_threshold:
                 log.warning(
                     "DB pool utilization high — {co}/{cap} connections checked out ({pct:.0f}%)",
@@ -131,6 +167,43 @@ def clear_engine() -> None:
     if _engine is not None:
         _engine.dispose()
     _engine = None
+
+
+def get_pool_stats(engine: Engine | None = None) -> dict[str, int]:
+    """Return this process's actual SQLAlchemy pool instrumentation.
+
+    Distinguishes configured capacity from live usage so callers (health
+    endpoints, per-cycle log lines) never have to infer checked-out
+    concurrency from ``pg_stat_activity.state`` — that only shows whether a
+    backend is running a query *right now*, not how many connections this
+    process is holding checked out of its own pool at all.
+
+    Returns:
+        dict with ``pool_size`` (configured retained capacity),
+        ``max_overflow`` (configured burst capacity beyond pool_size),
+        ``checked_in`` (idle, available in the pool right now),
+        ``checked_out`` (borrowed by in-flight work right now),
+        ``peak_checked_out`` (thread-safe high-water-mark of checked_out
+        since the last :func:`reset_pool_peak` call — catches bursts a
+        point-in-time sample would miss between observations),
+        ``overflow`` (SQLAlchemy's raw overflow counter — negative means
+        the pool holds fewer live connections than pool_size), and
+        ``capacity`` (pool_size + max_overflow, the hard ceiling).
+    """
+    eng = engine if engine is not None else get_engine()
+    pool = eng.pool
+    pool_size = pool.size()  # type: ignore[attr-defined]
+    max_overflow = getattr(pool, "_max_overflow", 0)
+    checked_out = pool.checkedout()  # type: ignore[attr-defined]
+    return {
+        "pool_size": pool_size,
+        "max_overflow": max_overflow,
+        "checked_in": pool.checkedin(),  # type: ignore[attr-defined]
+        "checked_out": checked_out,
+        "peak_checked_out": get_pool_peak_checked_out(),
+        "overflow": pool.overflow(),  # type: ignore[attr-defined]
+        "capacity": pool_size + max_overflow,
+    }
 
 
 def _connect_with_retry(max_attempts: int = 5) -> psycopg2.extensions.connection:
