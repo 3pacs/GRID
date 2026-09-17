@@ -27,6 +27,22 @@ from intelligence.entity_resolver import _log_query_failure
 router = APIRouter(tags=["watchlist"])
 
 
+def _format_price_action(ticker: str, price: float, pct_1d: float | None) -> str:
+    """Render the rule-based "Price Action" sentence.
+
+    ``pct_1d`` is a **fraction** everywhere in the price stack
+    (watchlist_helpers._fetch_live_price returns ``(price - prev) / prev``), so
+    it must be multiplied by 100 before it is printed with a ``%`` sign. The
+    previous code formatted the fraction directly, which rendered a +2.34% day
+    as "up 0.0%".
+    """
+    body = f"{ticker} is trading at ${price:.2f}."
+    if pct_1d is not None:
+        direction = "up" if pct_1d >= 0 else "down"
+        body += f" The stock is {direction} {abs(pct_1d) * 100:.1f}% on the day."
+    return body
+
+
 @router.get("/{ticker}/overview")
 def get_ticker_overview(
     ticker: str,
@@ -329,11 +345,9 @@ def get_ticker_overview(
     if sections is None:
         sections = []
         if price_info.get("price"):
-            price_body = f"{ticker_upper} is trading at ${price_info['price']:.2f}."
-            if price_info.get("pct_1d") is not None:
-                pct = price_info["pct_1d"]
-                direction = "up" if pct >= 0 else "down"
-                price_body += f" The stock is {direction} {abs(pct):.1f}% on the day."
+            price_body = _format_price_action(
+                ticker_upper, price_info["price"], price_info.get("pct_1d")
+            )
             sections.append({"title": "Price Action", "body": price_body})
         if options_info and options_info.get("put_call_ratio") is not None:
             pcr = options_info["put_call_ratio"]
@@ -563,8 +577,10 @@ def get_ticker_edge(
                     "name": sig.get("insider", "Unknown"),
                     "title": meta.get("title", ""),
                     "action": sig.get("direction", "BUY"),
-                    "shares": meta.get("shares", 0),
-                    "value": meta.get("value", 0),
+                    # null, never 0: a "0 shares / $0" insider row reads as an
+                    # observed trade of zero size.
+                    "shares": meta.get("shares"),
+                    "value": meta.get("value"),
                     "date": sig.get("date", ""),
                     "cluster": meta.get("cluster", False),
                 })
@@ -578,7 +594,9 @@ def get_ticker_edge(
                     except Exception:
                         dp_meta = {}
                 dark_pool = {
-                    "volume_vs_avg": dp_meta.get("volume_vs_avg", 1.0),
+                    # null, never 1.0: "exactly average dark-pool volume" is a
+                    # measurement, and this metadata simply did not carry one.
+                    "volume_vs_avg": dp_meta.get("volume_vs_avg"),
                     "signal": (
                         "accumulation" if latest_dp.get("direction") == "BUY"
                         else "distribution"
@@ -607,10 +625,12 @@ def get_ticker_edge(
                     except Exception:
                         meta = {}
                 whale_flow.append({
-                    "strike": meta.get("strike", 0),
-                    "expiry": meta.get("expiry", ""),
+                    # null, never 0: a "$0 strike" / "$0 premium" whale print
+                    # reads as an observed trade that never happened.
+                    "strike": meta.get("strike"),
+                    "expiry": meta.get("expiry") or None,
                     "direction": str(r[1]),
-                    "premium": meta.get("premium", 0),
+                    "premium": meta.get("premium"),
                     "date": str(r[2]),
                 })
             social_rows = conn.execute(text("""
@@ -649,8 +669,10 @@ def get_ticker_edge(
                         meta = {}
                 prediction_markets.append({
                     "market": meta.get("market", str(r[0])),
-                    "probability": meta.get("probability", 0.5),
-                    "change_24h": meta.get("change_24h", 0.0),
+                    # null, never 0.5/0.0: a 50% market-implied probability is a
+                    # tradeable-looking number that no market ever quoted.
+                    "probability": meta.get("probability"),
+                    "change_24h": meta.get("change_24h"),
                 })
     except Exception as exc:
         log.warning("Edge: signal_sources query failed for {t}: {e}", t=ticker_upper, e=str(exc))
