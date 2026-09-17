@@ -911,11 +911,32 @@ def _get_finviz_profile(engine: Any, ticker: str, *, refresh: bool = False) -> d
     }
 
 
+# Hand-picked point weights. Nothing here is calibrated against an outcome; the
+# weights ship with every payload so a reader can see the number is a weighted count
+# of workbook footprint, not a conviction measurement.
+_GOLD_SCORE_WEIGHTS: dict[str, dict[str, Any]] = {
+    "evidence_score": {"weight": 2.5, "cap": None},
+    "file_count": {"weight": 8, "cap": None},
+    "sheet_count": {"weight": 2, "cap": None},
+    "mentions": {"weight": 1, "cap": 30},
+}
+_GOLD_SCORE_CLAMP = {"min": 0, "max": 100}
+_GOLD_VERDICT_THRESHOLDS = {
+    "high_workbook_conviction": {"heuristic_score": 80, "file_count": 3},
+    "known_name": {"heuristic_score": 45},
+    "light_footprint": {"heuristic_score": 15},
+}
+
+
 def _gold_from_summary(summary: dict[str, Any] | None) -> dict[str, Any]:
     if not summary:
+        # No workbook rows were found. That is an absence of evidence, not a zero
+        # score, so no number is published.
         return {
             "verdict": "No workbook history yet",
-            "score": 0,
+            "heuristic_score": None,
+            "weights": None,
+            "score_basis": "no_workbook_history",
             "tone": "neutral",
             "one_liner": "This ticker is not showing up in Dad's copied workbook corpus yet.",
         }
@@ -924,7 +945,28 @@ def _gold_from_summary(summary: dict[str, Any] | None) -> dict[str, Any]:
     file_count = int(summary.get("file_count") or 0)
     sheet_count = int(summary.get("sheet_count") or 0)
     evidence_score = float(summary.get("evidence_score") or 0)
-    score = min(100, round(evidence_score * 2.5 + file_count * 8 + sheet_count * 2 + min(mentions, 30)))
+    inputs = {
+        "evidence_score": evidence_score,
+        "file_count": file_count,
+        "sheet_count": sheet_count,
+        "mentions": mentions,
+    }
+    weights: dict[str, Any] = {}
+    raw_total = 0.0
+    for term, spec in _GOLD_SCORE_WEIGHTS.items():
+        value = inputs[term]
+        capped = min(value, spec["cap"]) if spec["cap"] is not None else value
+        points = capped * spec["weight"]
+        raw_total += points
+        weights[term] = {
+            "weight": spec["weight"],
+            "cap": spec["cap"],
+            "input": value,
+            "points": round(points, 2),
+        }
+    score = min(_GOLD_SCORE_CLAMP["max"], round(raw_total))
+    weights["_clamp"] = dict(_GOLD_SCORE_CLAMP)
+    weights["_verdict_thresholds"] = _GOLD_VERDICT_THRESHOLDS
 
     if score >= 80 and file_count >= 3:
         verdict = "High workbook conviction"
@@ -945,7 +987,9 @@ def _gold_from_summary(summary: dict[str, Any] | None) -> dict[str, Any]:
 
     return {
         "verdict": verdict,
-        "score": score,
+        "heuristic_score": score,
+        "weights": weights,
+        "score_basis": "workbook_footprint_weighted_count",
         "tone": tone,
         "one_liner": one_liner,
     }
@@ -1353,6 +1397,44 @@ def _num_field(finviz: dict[str, Any], field_id: str) -> float | None:
     return float(numeric) if isinstance(numeric, (int, float)) else None
 
 
+# Every term below is a hand-picked point award chosen by hand, never fitted or scored
+# against an outcome. The table is the single source of truth for the arithmetic *and*
+# is published as `decision_stack.weights`, so the number can never be read as a
+# calibrated 0-100 conviction without its recipe.
+_DECISION_STACK_WEIGHTS: dict[str, Any] = {
+    "workbook_prior_multiplier": 0.35,
+    "grid_return_window_strong_ge_20pct": 15,
+    "grid_return_window_positive": 8,
+    "grid_return_window_negative": -4,
+    "grid_within_10pct_of_52w_high": 5,
+    "grid_below_30pct_of_window_high": -5,
+    "finviz_pe_reviewable_0_to_35": 5,
+    "finviz_pe_rich_above_60": -4,
+    "finviz_roe_ge_15": 5,
+    "finviz_margin_ge_10": 4,
+    "finviz_eps_next_5y_ge_10": 3,
+    "finviz_debt_equity_0_to_1": 4,
+    "finviz_debt_equity_above_2": -4,
+    "finviz_stale": -5,
+    "options_row_present": 5,
+    "options_put_call_ratio_above_1_2": -2,
+    "signals_per_trusted_row": 2,
+    "signals_trusted_cap": 8,
+    "signals_per_tradingview_alert": 2,
+    "signals_tradingview_cap": 6,
+    "regime_cautious": -4,
+    "regime_not_cautious": 2,
+    "stale_source_each": -3,
+    "stale_source_cap": -12,
+    "_clamp": {"min": 0, "max": 100},
+    "_stance_thresholds": {
+        "Deep review first": 70,
+        "Watchlist with checks": 45,
+        "Needs more evidence": 25,
+    },
+}
+
+
 def _grid_decision_stack(
     summary: dict[str, Any] | None,
     gold: dict[str, Any],
@@ -1364,8 +1446,10 @@ def _grid_decision_stack(
     cards: list[dict[str, Any]] = []
     reasons: list[str] = []
     blockers: list[str] = []
+    w = _DECISION_STACK_WEIGHTS
 
-    score = round(float(gold.get("score") or 0) * 0.35, 1)
+    gold_score = gold.get("heuristic_score")
+    score = round(float(gold_score or 0) * w["workbook_prior_multiplier"], 1)
     cards.append({
         "source": "Dad workbooks",
         "state": "strong" if summary and int(summary.get("file_count") or 0) >= 3 else "watch" if summary else "missing",
@@ -1384,19 +1468,19 @@ def _grid_decision_stack(
     chart_points = 0.0
     if ret_window is not None:
         if ret_window >= 20:
-            chart_points += 15
+            chart_points += w["grid_return_window_strong_ge_20pct"]
             reasons.append(f"GRID {window} trend is strong at {ret_window:.1f}%.")
         elif ret_window > 0:
-            chart_points += 8
+            chart_points += w["grid_return_window_positive"]
             reasons.append(f"GRID {window} trend is positive at {ret_window:.1f}%.")
         else:
-            chart_points -= 4
+            chart_points += w["grid_return_window_negative"]
             blockers.append(f"GRID {window} trend is negative at {ret_window:.1f}%.")
     if from_high is not None:
         if from_high >= -10:
-            chart_points += 5
+            chart_points += w["grid_within_10pct_of_52w_high"]
         elif from_high <= -30:
-            chart_points -= 5
+            chart_points += w["grid_below_30pct_of_window_high"]
             blockers.append(
                 f"Price is {abs(from_high):.1f}% below its {window} high."
             )
@@ -1422,26 +1506,26 @@ def _grid_decision_stack(
     eps_5y = _num_field(finviz, "eps_next_5y")
     if finviz.get("status") in {"ready", "stale"}:
         if forward_pe and 0 < forward_pe <= 35:
-            finviz_points += 5
+            finviz_points += w["finviz_pe_reviewable_0_to_35"]
             reasons.append(f"Finviz valuation is reviewable: forward/ttm P/E {forward_pe:g}.")
         elif forward_pe and forward_pe > 60:
-            finviz_points -= 4
+            finviz_points += w["finviz_pe_rich_above_60"]
             blockers.append(f"Finviz valuation is rich: P/E {forward_pe:g}.")
         if roe and roe >= 15:
-            finviz_points += 5
+            finviz_points += w["finviz_roe_ge_15"]
         if margin and margin >= 10:
-            finviz_points += 4
+            finviz_points += w["finviz_margin_ge_10"]
         if eps_5y and eps_5y >= 10:
-            finviz_points += 3
+            finviz_points += w["finviz_eps_next_5y_ge_10"]
         if debt_eq is not None and 0 <= debt_eq <= 1:
-            finviz_points += 4
+            finviz_points += w["finviz_debt_equity_0_to_1"]
         elif debt_eq and debt_eq > 2:
-            finviz_points -= 4
+            finviz_points += w["finviz_debt_equity_above_2"]
             blockers.append(f"Finviz debt/equity is elevated at {debt_eq:g}.")
     else:
         blockers.append("Finviz fundamentals are not in GRID for this ticker yet.")
     if finviz.get("freshness", {}).get("state") == "stale":
-        finviz_points -= 5
+        finviz_points += w["finviz_stale"]
         blockers.append("Finviz fundamentals are stale; refresh before making the call.")
     score += finviz_points
     cards.append({
@@ -1453,10 +1537,10 @@ def _grid_decision_stack(
 
     options_points = 0.0
     if options:
-        options_points += 5
+        options_points += w["options_row_present"]
         pcr = options.get("put_call_ratio")
         if pcr and pcr > 1.2:
-            options_points -= 2
+            options_points += w["options_put_call_ratio_above_1_2"]
             blockers.append(f"Options put/call ratio is elevated at {pcr:.2f}.")
     score += options_points
     cards.append({
@@ -1470,9 +1554,9 @@ def _grid_decision_stack(
     trusted = [row for row in signals.get("signal_sources", []) if row.get("trust_score", 0) >= 0.6]
     tv_alerts = signals.get("tradingview_signals", [])
     if trusted:
-        signal_points += min(8, len(trusted) * 2)
+        signal_points += min(w["signals_trusted_cap"], len(trusted) * w["signals_per_trusted_row"])
     if tv_alerts:
-        signal_points += min(6, len(tv_alerts) * 2)
+        signal_points += min(w["signals_tradingview_cap"], len(tv_alerts) * w["signals_per_tradingview_alert"])
     score += signal_points
     cards.append({
         "source": "GRID signals",
@@ -1485,20 +1569,20 @@ def _grid_decision_stack(
     if regime:
         rec = str(regime.get("grid_recommendation") or "").lower()
         if any(word in rec for word in ("risk", "hedge", "cash", "defensive", "reduce")):
-            score -= 4
+            score += w["regime_cautious"]
             blockers.append(f"Current GRID regime is cautious: {regime.get('grid_recommendation')}.")
         else:
-            score += 2
+            score += w["regime_not_cautious"]
 
     stale_sources = []
     for source in grid.get("source_freshness", []):
         if source.get("state") in {"stale", "missing"}:
             stale_sources.append(source.get("source"))
     if stale_sources:
-        score -= min(12, len(stale_sources) * 3)
+        score += max(w["stale_source_cap"], len(stale_sources) * w["stale_source_each"])
         blockers.append(f"Stale or missing source rows: {', '.join(stale_sources[:5])}.")
 
-    score = max(0, min(100, round(score, 1)))
+    score = max(w["_clamp"]["min"], min(w["_clamp"]["max"], round(score, 1)))
     if score >= 70:
         stance = "Deep review first"
         tone = "strong"
@@ -1519,12 +1603,19 @@ def _grid_decision_stack(
 
     return {
         "stance": stance,
+        "stance_basis": "heuristic_score_thresholds",
         "tone": tone,
-        "score": score,
+        "heuristic_score": score,
+        "weights": dict(w),
+        "score_basis": "hand_picked_point_awards",
         "cards": cards,
         "reasons": reasons[:5],
         "blockers": blockers[:6],
-        "method": "Workbook prior plus GRID price, fundamentals, options, signal, regime, and freshness checks.",
+        "method": (
+            "Hand-picked point awards over the workbook prior plus GRID price, "
+            "fundamentals, options, signal, regime and freshness checks. Not a "
+            "backtested or calibrated conviction score - every weight is in `weights`."
+        ),
     }
 
 
