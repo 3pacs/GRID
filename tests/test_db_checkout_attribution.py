@@ -401,6 +401,37 @@ class TestOutstandingCheckoutsVisibility:
             db_module._open_checkouts.pop(111, None)
             db_module._open_checkouts.pop(222, None)
 
+    def test_result_is_capped_and_keeps_the_oldest_entries(self):
+        # A misconfiguration or genuine leak that accumulates far more open
+        # connections than any real pool_size/max_overflow budget allows
+        # must never turn this into unbounded logging. The cap must also
+        # keep the *oldest* (most suspicious, longest-held) entries rather
+        # than an arbitrary 200 -- those are the ones worth investigating.
+        from db import _MAX_REPORTED_OPEN_CHECKOUTS
+
+        now = time.monotonic()
+        synthetic_count = _MAX_REPORTED_OPEN_CHECKOUTS + 5
+        with db_module._checkout_lock:
+            for i in range(synthetic_count):
+                # Oldest entry is id 0 (age == synthetic_count seconds ago).
+                db_module._open_checkouts[i] = (f"thread-{i}", now - (synthetic_count - i))
+
+        try:
+            result = get_outstanding_checkouts()
+            assert len(result) == _MAX_REPORTED_OPEN_CHECKOUTS
+            # The 5 newest (least suspicious) synthetic entries were dropped;
+            # every entry that survived is at least as old as any dropped one.
+            kept_names = {r["acquired_by"] for r in result}
+            assert "thread-0" in kept_names  # oldest, must survive the cap
+            for i in range(_MAX_REPORTED_OPEN_CHECKOUTS, synthetic_count):
+                assert f"thread-{i}" not in kept_names  # newest 5 (highest i), dropped
+            for i in range(0, _MAX_REPORTED_OPEN_CHECKOUTS):
+                assert f"thread-{i}" in kept_names  # oldest 200 (lowest i), kept
+        finally:
+            with db_module._checkout_lock:
+                for i in range(synthetic_count):
+                    db_module._open_checkouts.pop(i, None)
+
 
 class TestInstrumentationCannotBreakRealCheckout:
     """The actual production listeners (registered inside get_engine(),
