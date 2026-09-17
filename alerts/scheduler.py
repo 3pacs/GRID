@@ -133,9 +133,21 @@ def _send_digest_once_per_window(engine: Any, now: datetime) -> None:
             state = _read_state(engine)
             if state is not None:
                 age = now - state["seen_at"]
-                if state["status"] == "sent" and age < timedelta(hours=_MIN_GAP_HOURS):
+                status = state["status"]
+                if status not in ("sent", "failed", "uncertain"):
+                    # A row with a timestamp but no recognized status —
+                    # e.g. written by a version of this code before the
+                    # status payload existed, or by anything else that
+                    # ever touches this alert_type/entity_id key.
+                    # Unknown does not mean safe: treat it exactly like a
+                    # confirmed "sent" rather than falling through both
+                    # named branches and treating an unrecognized-but-
+                    # recent timestamp as if there were no prior state at
+                    # all.
+                    status = "sent"
+                if status == "sent" and age < timedelta(hours=_MIN_GAP_HOURS):
                     return
-                if state["status"] == "uncertain":
+                if status == "uncertain":
                     if age < timedelta(minutes=_UNCERTAIN_STALE_MINUTES):
                         log.debug("A digest send attempt is still recent and unresolved — waiting")
                         return

@@ -241,6 +241,52 @@ def test_two_concurrent_callers_only_one_sends(monkeypatch) -> None:
     assert digest_calls == [1]
 
 
+def test_legacy_row_without_a_status_is_treated_conservatively_as_sent(monkeypatch) -> None:
+    """Migration fixture: a row with a timestamp but no payload.status —
+    e.g. one written by a version of this code before the status payload
+    existed, or by anything else that ever touches this alert_type/
+    entity_id key. The eligibility check must not fall through both
+    named branches and treat an unrecognized-but-recent timestamp as
+    though there were no prior state at all; unknown status is not the
+    same as "safe to send".
+    """
+    engine = _FakeEngine(lock_available=True)
+    now = _in_window()
+    store = _FakeStateStore()
+    store.state = {"seen_at": now - timedelta(hours=1), "status": None}
+    monkeypatch.setattr(scheduler, "_read_state", store.read)
+    monkeypatch.setattr(scheduler, "_write_state", store.write)
+    digest_calls = []
+    monkeypatch.setattr(
+        "alerts.email.daily_digest", lambda: (digest_calls.append(1), _digest("sent"))[1]
+    )
+
+    scheduler._send_digest_once_per_window(engine, now)
+
+    assert digest_calls == []
+
+
+def test_unrecognized_status_value_is_also_treated_conservatively_as_sent(monkeypatch) -> None:
+    """Same reasoning as the missing-status case, for a payload that has
+    some other string in it — from a future status this code doesn't
+    know about, or corruption. Reject it rather than guess it's safe.
+    """
+    engine = _FakeEngine(lock_available=True)
+    now = _in_window()
+    store = _FakeStateStore()
+    store.state = {"seen_at": now - timedelta(hours=1), "status": "queued"}
+    monkeypatch.setattr(scheduler, "_read_state", store.read)
+    monkeypatch.setattr(scheduler, "_write_state", store.write)
+    digest_calls = []
+    monkeypatch.setattr(
+        "alerts.email.daily_digest", lambda: (digest_calls.append(1), _digest("sent"))[1]
+    )
+
+    scheduler._send_digest_once_per_window(engine, now)
+
+    assert digest_calls == []
+
+
 def test_already_sent_within_the_gap_skips_without_sending(monkeypatch) -> None:
     engine = _FakeEngine(lock_available=True)
     now = _in_window()
