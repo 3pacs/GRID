@@ -224,6 +224,7 @@ class TestMilestone:
             target_value=2.50,
             target_unit="EPS",
             probability=0.8,
+            confidence_source="ANALYST",
         )
         assert m.status == "PENDING"
         assert m.probability == 0.8

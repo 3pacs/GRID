@@ -43,8 +43,12 @@ class CompositeValuation:
     milestones: list[dict[str, Any]] = field(default_factory=list)
     scorecard: dict[str, Any] = field(default_factory=dict)
 
-    # Probability-weighted milestone impact on intrinsic value
+    # Probability-weighted milestone impact on intrinsic value, and how
+    # many pending milestones actually carried a stated probability (the
+    # rest are unscored and contribute nothing — never a 0.5 midpoint).
     milestone_value_adjustment: float = 0.0
+    milestone_scored_n: int = 0
+    milestone_unscored_n: int = 0
 
     # Adjusted intrinsic value (base + milestone expectations)
     adjusted_intrinsic_low: float | None = None
@@ -65,6 +69,8 @@ class CompositeValuation:
             "milestones": self.milestones,
             "scorecard": self.scorecard,
             "milestone_value_adjustment": self.milestone_value_adjustment,
+            "milestone_scored_n": self.milestone_scored_n,
+            "milestone_unscored_n": self.milestone_unscored_n,
             "adjusted_intrinsic_low": self.adjusted_intrinsic_low,
             "adjusted_intrinsic_mid": self.adjusted_intrinsic_mid,
             "adjusted_intrinsic_high": self.adjusted_intrinsic_high,
@@ -105,7 +111,10 @@ class CompositeValuationEngine:
         # 2. Milestones + scorecard
         composite.milestones = self.milestones.get_timeline(ticker)
         composite.scorecard = self.milestones.get_scorecard(ticker)
-        composite.milestone_value_adjustment = self.milestones.probability_weighted_impact(ticker)
+        weighted = self.milestones.probability_weighted_impact(ticker)
+        composite.milestone_value_adjustment = weighted["total_impact"]
+        composite.milestone_scored_n = weighted["scored_n"]
+        composite.milestone_unscored_n = weighted["unscored_n"]
 
         # 3. Adjusted intrinsic values (base + milestone expectations)
         if composite.valuation:
@@ -371,7 +380,13 @@ Be specific. Use numbers. Every prediction must have a target value, timeframe, 
                     if m.get("achievement_pct") is not None:
                         actual_str += f" ({m['achievement_pct']:.0f}% of target)"
 
-                prob_str = f" [Probability: {m['probability']:.0%}]" if m.get("probability") else ""
+                # A stated probability is a prior with a basis, not a
+                # confidence; an unstated one reads unscored, never 50%.
+                if m.get("probability") is not None:
+                    basis = m.get("confidence_source") or "basis unknown"
+                    prob_str = f" [Stated probability: {m['probability']:.0%} ({basis})]"
+                else:
+                    prob_str = " [Probability: unscored]"
 
                 sections.append(
                     f"- **{m['date']}** {status_icon} {m['type']}: "
@@ -392,7 +407,8 @@ Be specific. Use numbers. Every prediction must have a target value, timeframe, 
         if c.milestone_value_adjustment != 0:
             sections.append(
                 f"**Probability-weighted milestone value adjustment:** "
-                f"${c.milestone_value_adjustment:+.2f}/share"
+                f"${c.milestone_value_adjustment:+.2f}/share "
+                f"(scored {c.milestone_scored_n}, unscored {c.milestone_unscored_n})"
             )
             sections.append(
                 f"**Adjusted intrinsic value:** ${c.adjusted_intrinsic_low or 0:.2f} — "
