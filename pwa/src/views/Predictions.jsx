@@ -408,10 +408,10 @@ export function PredictionCard({ pred }) {
 
             <div style={s.predMeta}>
                 <div style={s.predMetric}>
-                    {/* entry_price is null when no spot was measured at
-                        publish time. `x?.toFixed(2) || '---'` never fired for
-                        a measured 0.0 (not nullish) and an explicit null
-                        check also keeps the "$" off the empty case. */}
+                    {/* D-M32: entry_price is null when no spot was measured at
+                        publish time. `x?.toFixed(2) || '---'` never fired for the
+                        old 0.0 (not nullish) and printed "$0.00"; an explicit
+                        null check also keeps the "$" off the empty case. */}
                     <div style={s.predMetricVal}>
                         {pred.entry_price == null ? '---' : `$${pred.entry_price.toFixed(2)}`}
                     </div>

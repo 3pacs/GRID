@@ -465,9 +465,9 @@ def main(argv: list[str] | None = None) -> None:
 
         # No usable entry price → no_data. NULL must be listed explicitly:
         # `entry_price = 0` is NULL for a NULL row, so a prediction published
-        # with no observed spot would otherwise sit 'pending' forever, neither
-        # scored nor accounted for. It is not scorable and it is not a 0%
-        # return — it is excluded, and the notes say why.
+        # with no observed spot (D-M32) would otherwise sit 'pending' forever,
+        # neither scored nor accounted for. It is not scorable and it is not a
+        # 0% return — it is excluded, and the notes say why.
         res = conn.execute(text("""
             UPDATE oracle_predictions
             SET verdict = 'no_data',

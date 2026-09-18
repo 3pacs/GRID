@@ -123,9 +123,9 @@ def get_predictions(
         days_left = (expiry_date - today).days if expiry_date else 0
 
         # Compute tracking P&L for active predictions.
-        # A NULL entry price (no spot observed at publish time) is not a zero
-        # entry price. Both are excluded, but explicitly: `and r[6]` only
-        # escaped a divide-by-zero because 0.0 happens to be falsy.
+        # A NULL entry price (D-M32: no spot observed at publish time) is not
+        # a zero entry price. Both are excluded, but explicitly: `and r[6]`
+        # only escaped a divide-by-zero because 0.0 happens to be falsy.
         tracking_pnl = None
         if r[17] == "pending" and r[6] is not None and float(r[6]) > 0:
             try:
