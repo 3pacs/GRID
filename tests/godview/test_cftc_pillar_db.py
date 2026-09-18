@@ -240,7 +240,30 @@ def test_pit_read_excludes_rows_released_after_as_of(godview_pg_engine, source_i
 
 
 def test_partial_refresh_cannot_expose_a_mixed_generation(godview_pg_engine, source_id, monkeypatch):
-    """Simulate a crash mid-materialization: nothing from that run should ever commit."""
+    """Simulate a crash mid-materialization: nothing from that run should ever commit.
+
+    Root cause of the earlier flaky assertion (real Postgres, tree 6e8df878):
+    a naive mock that raises on EVERY call to ``record_generation`` sees TWO
+    calls, not one -- ``materialize_cftc_pillar`` makes exactly one attempt
+    to publish the generation as ``complete`` inside its main transaction
+    (which raises here and rolls the whole transaction back, discarding that
+    call's effects entirely), and THEN ``_record_failure`` makes one
+    separate, best-effort attempt -- in a FRESH transaction -- to record the
+    run as ``failed`` for observability (see its own docstring: "the main
+    one already rolled back"). Two calls to the mocked name is therefore
+    correct: it is not a retry of the risky publish, it is a different
+    operation (recording failure) after the risky one has already, safely,
+    rolled back.
+
+    The fake below mirrors that real transaction boundary instead of
+    treating every call the same: it fails ONLY the ``status=complete``
+    publish attempt (one call, proving "exactly one publish attempt"), and
+    lets the ``status=failed`` bookkeeping call through to the real
+    ``record_generation`` in what stands in for Postgres's fresh follow-up
+    transaction -- so the test can assert on real, persisted DB state
+    (a 'failed' row, never a 'complete' one; zero data rows) rather than on
+    a raw call count that conflates two different operations.
+    """
     engine = godview_pg_engine
     contract_key = f"CRASH_{uuid.uuid4().hex[:8]}"
     contract_code = f"C{uuid.uuid4().hex[:6]}"
@@ -255,19 +278,30 @@ def test_partial_refresh_cannot_expose_a_mixed_generation(godview_pg_engine, sou
     import godview.cftc_pillar as cftc_pillar_module
 
     real_record_generation = cftc_pillar_module.record_generation
-    call_count = {"n": 0}
+    publish_attempts = {"complete": 0, "failed": 0}
 
-    def _boom(*args, **kwargs):
-        call_count["n"] += 1
-        raise RuntimeError("simulated crash before publish")
+    def _fake(conn, **kwargs):
+        status = kwargs.get("status")
+        if status == STATUS_COMPLETE:
+            publish_attempts["complete"] += 1
+            raise RuntimeError("simulated crash before publish")
+        # status == STATUS_FAILED: let the fallback's separate, fresh-transaction
+        # bookkeeping attempt actually succeed, mirroring a real transient
+        # failure that clears by the time the follow-up transaction runs.
+        publish_attempts["failed"] += 1
+        return real_record_generation(conn, **kwargs)
 
-    monkeypatch.setattr(cftc_pillar_module, "record_generation", _boom)
+    monkeypatch.setattr(cftc_pillar_module, "record_generation", _fake)
 
     result = materialize_cftc_pillar(engine, as_of=as_of_date, contracts=contracts)
     assert result.status == "FAILED"
-    assert call_count["n"] == 1  # the crash happened inside the main transaction
+    assert publish_attempts["complete"] == 1  # exactly one attempt to publish as complete
+    assert publish_attempts["failed"] == 1  # exactly one (separate) failure-recording attempt
 
-    # The whole transaction (rows + bookkeeping) must have rolled back together.
+    monkeypatch.setattr(cftc_pillar_module, "record_generation", real_record_generation)
+
+    # The whole transaction (rows + the complete-publish bookkeeping call) must
+    # have rolled back together -- zero data rows, ever, for this generation.
     with engine.begin() as conn:
         row_count = conn.execute(
             text("SELECT COUNT(*) FROM cftc_positioning_daily WHERE contract_code = :c"),
@@ -275,7 +309,14 @@ def test_partial_refresh_cannot_expose_a_mixed_generation(godview_pg_engine, sou
         ).scalar()
     assert row_count == 0
 
-    monkeypatch.setattr(cftc_pillar_module, "record_generation", real_record_generation)
+    # The follow-up transaction's failure record DID persist -- this run is
+    # visibly 'failed', never silently missing and never 'complete'.
+    with engine.begin() as conn:
+        gen_status = conn.execute(
+            text("SELECT status FROM godview_generations WHERE generation_id = :g"),
+            {"g": result.generation_id},
+        ).scalar()
+    assert gen_status == STATUS_FAILED
 
     # A strict-PIT read must never see this generation as complete.
     with engine.begin() as conn:
