@@ -388,7 +388,9 @@ function InsiderEdgePanel({ edgeData, loading }) {
                         {dark_pool && (
                             <SignalCard
                                 icon={SIGNAL_ICONS.dark_pool} label="Dark Pool"
-                                actor={`${dark_pool.volume_vs_avg?.toFixed(1)}x avg volume`}
+                                actor={dark_pool.volume_vs_avg == null
+                                    ? 'volume vs avg not reported'
+                                    : `${dark_pool.volume_vs_avg.toFixed(1)}x avg volume`}
                                 action={dark_pool.signal?.toUpperCase() || 'NEUTRAL'}
                                 date={dark_pool.date}
                                 trustScore={null}
@@ -408,10 +410,14 @@ function InsiderEdgePanel({ edgeData, loading }) {
                             <SignalCard key={`pred-${i}`}
                                 icon={SIGNAL_ICONS.prediction_markets} label="Prediction Mkt"
                                 actor={p.market}
-                                action={p.probability >= 0.6 ? 'LIKELY' : p.probability <= 0.4 ? 'UNLIKELY' : 'TOSS-UP'}
+                                action={p.probability == null
+                                    ? 'NO QUOTE'
+                                    : p.probability >= 0.6 ? 'LIKELY' : p.probability <= 0.4 ? 'UNLIKELY' : 'TOSS-UP'}
                                 date={null}
                                 trustScore={p.probability}
-                                direction={p.change_24h > 0 ? 'bullish' : p.change_24h < 0 ? 'bearish' : 'neutral'}
+                                direction={p.change_24h == null
+                                    ? null
+                                    : p.change_24h > 0 ? 'bullish' : p.change_24h < 0 ? 'bearish' : 'neutral'}
                             />
                         ))}
                         {smart_money?.map((s, i) => (
