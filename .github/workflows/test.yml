@@ -96,7 +96,7 @@ jobs:
         run: |
           set -euo pipefail
           psql -h localhost -U grid -d griddb_test -v ON_ERROR_STOP=0 -q -f schema.sql > /tmp/grid-schema.log 2>&1 || true
-          grep -ciE "^psql:.*ERROR" /tmp/grid-schema.log | xargs -I{} echo "schema.sql: {} statement error(s) (idempotent re-runs report 'already exists' only)"
+          schema_errors=$(grep -ciE "^psql:.*ERROR" /tmp/grid-schema.log || true); echo "schema.sql: ${schema_errors} statement error(s) (idempotent re-runs report only already-exists notices)"
           python -m alembic stamp snapshot_actor_col_20260914
           python -m alembic upgrade head
           python -m alembic current
