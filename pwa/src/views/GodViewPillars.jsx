@@ -13,7 +13,6 @@ import { colors, shared } from '../styles/shared.js';
  */
 
 const NOT_BUILT_PILLARS = [
-    { key: 'buyback_blackouts', label: 'Corporate Buyback Blackouts', reason: 'no measured source' },
     { key: 'dealer_gex', label: 'Dealer Gamma Exposure', reason: 'engine correctness unproven' },
 ];
 
@@ -450,6 +449,65 @@ function SecFtdCard({ data, error }) {
     );
 }
 
+function BuybackBlackoutCard({ data, error }) {
+    const cardStyle = {
+        background: colors.card, border: `1px solid ${colors.border}`, borderRadius: 10, padding: 16, marginBottom: 16,
+    };
+
+    if (error) {
+        return <div style={cardStyle} data-testid="buyback-card" data-state="error">
+            <div style={{ color: colors.text, fontWeight: 600, marginBottom: 8 }}>Corporate Buyback Blackouts</div>
+            <div style={{ color: colors.red }}>Failed to load: {error}</div>
+        </div>;
+    }
+    if (!data) {
+        return <div style={cardStyle} data-testid="buyback-card" data-state="loading">
+            <div style={{ color: colors.text, fontWeight: 600 }}>Corporate Buyback Blackouts</div>
+            <div style={{ color: colors.textDim, marginTop: 8 }}>Loading…</div>
+        </div>;
+    }
+    if (data.available === false) {
+        return <div style={cardStyle} data-testid="buyback-card" data-state="unavailable">
+            <UnavailablePanel label="Corporate Buyback Blackouts" payload={data} />
+        </div>;
+    }
+
+    const issuers = data.issuers || {};
+    const tickers = Object.keys(issuers);
+
+    return (
+        <div style={cardStyle} data-testid="buyback-card" data-state="available">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 4 }}>
+                <div style={{ color: colors.text, fontWeight: 600, fontSize: 16 }}>Corporate Buyback Blackouts</div>
+                <div style={{ fontSize: 11, color: colors.textMuted }}>as of {data.as_of}</div>
+            </div>
+            <div style={{ fontSize: 11, color: colors.yellow, marginBottom: 4 }} data-testid="modeling-assumption-note">
+                {data.note}
+            </div>
+            <div style={{ fontSize: 11, color: colors.textMuted, marginBottom: 10 }} data-testid="missing-input-note">
+                {data.missing_input}
+            </div>
+            {tickers.length === 0 ? (
+                <div style={{ color: colors.textMuted, fontSize: 13 }}>no issuer is in a modeled quiet window as of this date</div>
+            ) : (
+                tickers.map((ticker) => {
+                    const field = issuers[ticker];
+                    return (
+                        <div key={ticker} style={{ display: 'flex', justifyContent: 'space-between', padding: '4px 0', borderBottom: `1px solid ${colors.borderSubtle}` }}>
+                            <span style={{ color: colors.text }}>{ticker}</span>
+                            <span style={{ color: colors.yellow, fontSize: 12 }}>{fmtValue(field.value)}</span>
+                            <ProvenanceBadge provenance={field.provenance} availability={field.availability} />
+                        </div>
+                    );
+                })
+            )}
+            <div style={{ fontSize: 10, color: colors.textDimAlt, marginTop: 8 }}>
+                generation {data.generation_id || '—'} published {fmtDateTime(data.generation_published_at)}
+            </div>
+        </div>
+    );
+}
+
 function NotBuiltCard({ label, reason }) {
     return (
         <div
@@ -487,6 +545,9 @@ export default function GodViewPillars() {
     const [ftdData, setFtdData] = useState(null);
     const [ftdError, setFtdError] = useState(null);
     const [ftdLoading, setFtdLoading] = useState(true);
+    const [buybackData, setBuybackData] = useState(null);
+    const [buybackError, setBuybackError] = useState(null);
+    const [buybackLoading, setBuybackLoading] = useState(true);
 
     useEffect(() => {
         let cancelled = false;
@@ -555,6 +616,17 @@ export default function GodViewPillars() {
         return () => { cancelled = true; };
     }, [asOf, includeInferred]);
 
+    useEffect(() => {
+        let cancelled = false;
+        setBuybackLoading(true);
+        setBuybackError(null);
+        api.get(`/api/v1/godview/pillars/buyback_blackouts?as_of=${encodeURIComponent(asOf)}`)
+            .then((res) => { if (!cancelled) setBuybackData(res); })
+            .catch((e) => { if (!cancelled) setBuybackError(e.message || 'request failed'); })
+            .finally(() => { if (!cancelled) setBuybackLoading(false); });
+        return () => { cancelled = true; };
+    }, [asOf]);
+
     return (
         <div style={{ padding: 20, maxWidth: 720 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 16, gap: 12, flexWrap: 'wrap' }}>
@@ -587,6 +659,7 @@ export default function GodViewPillars() {
             {cmdtyLoading ? <CommodityWarehouseCard data={null} error={null} /> : <CommodityWarehouseCard data={cmdtyData} error={cmdtyError} />}
             {finraLoading ? <FinraShortVolumeCard data={null} error={null} /> : <FinraShortVolumeCard data={finraData} error={finraError} />}
             {ftdLoading ? <SecFtdCard data={null} error={null} /> : <SecFtdCard data={ftdData} error={ftdError} />}
+            {buybackLoading ? <BuybackBlackoutCard data={null} error={null} /> : <BuybackBlackoutCard data={buybackData} error={buybackError} />}
 
             {NOT_BUILT_PILLARS.map((p) => (
                 <NotBuiltCard key={p.key} label={p.label} reason={p.reason} />

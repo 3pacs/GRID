@@ -24,7 +24,7 @@ function deferred() {
  * commodity_warehouses). Route the mock by path so a test about one pillar
  * doesn't leak its response into the other two cards' assertions.
  */
-function mockPillars({ cftc, fed, cmdty, finra, ftd } = {}) {
+function mockPillars({ cftc, fed, cmdty, finra, ftd, buyback } = {}) {
     api.get.mockImplementation((path) => {
         if (path.includes('/pillars/cftc')) return Promise.resolve(cftc ?? NEVER_CONFIGURED);
         if (path.includes('/pillars/fed_net_liquidity')) return Promise.resolve(fed ?? NEVER_CONFIGURED);
@@ -33,6 +33,7 @@ function mockPillars({ cftc, fed, cmdty, finra, ftd } = {}) {
         }
         if (path.includes('/pillars/finra_short_volume')) return Promise.resolve(finra ?? NEVER_CONFIGURED);
         if (path.includes('/pillars/sec_regsho_ftd')) return Promise.resolve(ftd ?? NEVER_CONFIGURED);
+        if (path.includes('/pillars/buyback_blackouts')) return Promise.resolve(buyback ?? NEVER_CONFIGURED);
         return Promise.resolve(NEVER_CONFIGURED);
     });
 }
@@ -179,13 +180,12 @@ describe('GodViewPillars view', () => {
         expect(within(screen.getByTestId('cftc-pillar-card')).getByText(/network down/)).toBeInTheDocument();
     });
 
-    it('always renders the not-built-yet cards for the other two pillars, each with its own reason', async () => {
+    it('always renders the not-built-yet card for the remaining pillar, with its reason', async () => {
         mockPillars();
 
         render(<GodViewPillars />);
 
-        await waitFor(() => expect(screen.getAllByTestId('pillar-card-not-built').length).toBe(2));
-        expect(screen.getByText(/no measured source/)).toBeInTheDocument();
+        await waitFor(() => expect(screen.getAllByTestId('pillar-card-not-built').length).toBe(1));
         expect(screen.getByText(/engine correctness unproven/)).toBeInTheDocument();
     });
 
@@ -386,5 +386,36 @@ describe('GodViewPillars view', () => {
         expect(card.getByTestId('not-a-timeline-note')).toHaveTextContent(/no T\+35 buy-in timeline/);
         expect(card.getByText('Y4000A102')).toBeInTheDocument();
         expect(card.getByText('373')).toBeInTheDocument();
+    });
+
+    it('renders the buyback blackout pillar with the modeling-assumption and missing-input notes', async () => {
+        mockPillars({
+            buyback: {
+                available: true,
+                status: 'ok',
+                pillar: 'buyback_blackouts',
+                as_of: '2026-10-15',
+                note: 'modeled quiet window = earnings_date -14d to +2d (common issuer self-imposed Rule 10b-18 compliance PRACTICE, not an SEC-mandated period -- the SEC\'s own Rule 10b5-1 statement is explicit: "we are not adopting a cooling-off period for issuers")',
+                missing_input: 'issuer-level repurchase execution data (10-Q/10-K share-repurchase tables via EDGAR) does not exist in this database; no dollar or share buyback figure is ever computed here',
+                issuers_with_data: 1,
+                generation_id: 'gen-buyback-1',
+                generation_published_at: '2026-10-15T00:00:00+00:00',
+                issuers: {
+                    AAPL: {
+                        availability: 'available', provenance: 'modeled', value: 'quiet_window',
+                        earnings_date_used: '2026-10-20', window_start: '2026-10-06', window_end: '2026-10-22',
+                    },
+                },
+            },
+        });
+
+        render(<GodViewPillars />);
+
+        await waitFor(() => expect(screen.getByTestId('buyback-card')).toHaveAttribute('data-state', 'available'));
+        const card = within(screen.getByTestId('buyback-card'));
+        expect(card.getByTestId('modeling-assumption-note')).toHaveTextContent(/not adopting a cooling-off period for issuers/);
+        expect(card.getByTestId('missing-input-note')).toHaveTextContent(/EDGAR/);
+        expect(card.getByText('AAPL')).toBeInTheDocument();
+        expect(card.getByText('quiet_window')).toBeInTheDocument();
     });
 });

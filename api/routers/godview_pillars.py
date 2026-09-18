@@ -77,6 +77,12 @@ from godview.sec_ftd_pillar import (
     compute_age_days as ftd_compute_age_days,
     read_sec_ftd_pillar,
 )
+from godview.buyback_pillar import (
+    MISSING_INPUT as BUYBACK_MISSING_INPUT,
+    MODELING_ASSUMPTION_NOTE,
+    PILLAR_NAME as BUYBACK_PILLAR_NAME,
+    read_buyback_pillar,
+)
 from store.availability import unavailable
 from store.availability_fields import (
     STALE_MATERIALIZER_FAILED,
@@ -85,6 +91,7 @@ from store.availability_fields import (
     STALE_STALE,
     derived_field,
     measured_field,
+    modeled_field,
     unavailable_field,
 )
 
@@ -95,7 +102,6 @@ router = APIRouter(prefix="/api/v1/godview", tags=["godview"])
 #: a catch-all) so a typo in the URL still reads as "not built" honestly,
 #: not a silent 404.
 _KNOWN_UNBUILT_PILLARS = {
-    "buyback_blackouts": "no measured source",
     "dealer_gex": "engine correctness unproven",
 }
 
@@ -656,6 +662,64 @@ def get_sec_ftd_pillar(
         "generation_id": result.generation_id,
         "generation_published_at": result.generation_published_at.isoformat() if result.generation_published_at else None,
         "fields": fields_by_cusip,
+    }
+
+
+@router.get("/pillars/buyback_blackouts")
+def get_buyback_pillar(
+    as_of: Annotated[date | None, Query()] = None,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Issuer-level MODELED quiet-window calendar. NO dollar amounts, NO "%
+    of market in blackout" -- see BUYBACK_MISSING_INPUT and
+    godview/buyback_pillar.py's docstring for exactly why."""
+    as_of = as_of or date.today()
+    engine = get_db_engine()
+
+    try:
+        with engine.connect() as conn:
+            if not _table_exists(conn, "issuer_buyback_blackout_windows") or not _table_exists(conn, "godview_generations"):
+                return unavailable(
+                    "issuer_buyback_blackout_windows or godview_generations does not exist yet",
+                    source=BUYBACK_PILLAR_NAME, pillar=BUYBACK_PILLAR_NAME, coverage=None,
+                )
+            result = read_buyback_pillar(conn, as_of)
+    except Exception as exc:  # noqa: BLE001
+        return unavailable(f"godview read failed: {exc}", source=BUYBACK_PILLAR_NAME, pillar=BUYBACK_PILLAR_NAME, coverage=None)
+
+    if result.state == "never_configured":
+        return unavailable(STALE_NEVER_CONFIGURED, source=BUYBACK_PILLAR_NAME, pillar=BUYBACK_PILLAR_NAME, coverage=None)
+    if result.state == "materializer_failed":
+        return unavailable(STALE_MATERIALIZER_FAILED, source=BUYBACK_PILLAR_NAME, pillar=BUYBACK_PILLAR_NAME, coverage=None)
+
+    issuers = {}
+    for row in result.rows:
+        common = {
+            "obs_date": row["calendar_date"], "published_at": None, "available_at": None,
+            "revision": row["generation_id"], "source_catalog": "earnings_calendar", "series_id": row["ticker"],
+        }
+        record = modeled_field(
+            row["window_status"], unit=None, calculation_version="buyback_pillar_v1",
+            **common,
+        ).to_dict()
+        record["availability_basis"] = row.get("availability_basis")
+        record["availability_basis_note"] = None
+        record["earnings_date_used"] = row["earnings_date_used"].isoformat() if row["earnings_date_used"] else None
+        record["window_start"] = row["window_start"].isoformat() if row["window_start"] else None
+        record["window_end"] = row["window_end"].isoformat() if row["window_end"] else None
+        issuers[row["ticker"]] = record
+
+    return {
+        "available": True,
+        "status": "ok" if issuers else "partial",
+        "pillar": BUYBACK_PILLAR_NAME,
+        "as_of": as_of.isoformat(),
+        "note": MODELING_ASSUMPTION_NOTE,
+        "missing_input": BUYBACK_MISSING_INPUT,
+        "issuers_with_data": result.issuers_with_data,
+        "generation_id": result.generation_id,
+        "generation_published_at": result.generation_published_at.isoformat() if result.generation_published_at else None,
+        "issuers": issuers,
     }
 
 

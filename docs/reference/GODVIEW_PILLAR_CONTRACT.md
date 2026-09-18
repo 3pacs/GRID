@@ -395,6 +395,49 @@ no published release calendar to observe directly); `availability_basis`
 uses a wider tolerance (10 days, vs. 3 elsewhere) reflecting the SEC's own
 approximate language ("about the 15th").
 
+## 15. Corporate buyback blackout pillar
+
+`godview/buyback_pillar.py`. Implements ONLY what is measurable or
+explicitly modeled:
+
+* **Measured input:** earnings dates from `earnings_calendar` — a lazily
+  created, untracked table (`ingestion/altdata/earnings_calendar.py::
+  _ensure_earnings_table`, not in `schema.sql` or any migration; grepped
+  2026-09-18, the only earnings/catalyst-dated table anywhere in this
+  codebase). When an issuer has no earnings date there, its window is
+  unavailable — nothing to derive it from, never invented.
+* **Modeled output:** a per-issuer quiet-window calendar, `earnings_date − 14
+  calendar days` through `earnings_date + 2 calendar days`. `provenance` is
+  always `'modeled'`.
+
+**This window is NOT an SEC-mandated rule for issuers — a documented
+assumption, disclosed in every row's `source_ref`.** Rule 10b5-1's 2022
+amendments impose a cooling-off period on directors/officers, quoted from
+SEC Chair Gensler's statement
+(https://www.sec.gov/newsroom/speeches-statements/gensler-insider-trading-20221214):
+
+> "90 days or two days after the release of financial statements,
+> whichever is longer, but no more than 120 days"
+
+but the same statement says plainly:
+
+> "we are not adopting a cooling-off period for issuers"
+
+So this pillar's window models the common Rule 10b-18 self-imposed
+compliance PRACTICE many issuers follow, not an SEC requirement — never
+presented as measured fact.
+
+**Explicitly never computed: any dollar amount, any "% of market in
+blackout."** Those require issuer-level repurchase EXECUTION disclosures
+(10-Q/10-K share-repurchase tables via EDGAR), which do not exist
+anywhere in this database — named exactly as `MISSING_INPUT`, returned in
+every API response. The tracked `corporate_buyback_blackouts` table
+(market-wide `sp500_cap_blackout_pct`/`active_corporate_bid_m`) is left
+completely untouched — this pillar writes to a NEW table,
+`issuer_buyback_blackout_windows`, because the aggregate table's grain
+cannot represent a per-issuer figure without blurring measured vs.
+assumed.
+
 ## Status of all seven God View pillars (2026-09-18)
 
 | pillar | status | why |
@@ -405,7 +448,7 @@ approximate language ("about the 15th").
 | Commodity warehouses (Cushing leg) | **permanently unavailable** | `never_configured` — no real Cushing series id exists in this codebase; will not silently substitute a near-miss |
 | FINRA short volume | **built** | full slice; realistically `unavailable(never_configured)` in production until the puller is scheduled (deployment decision, not a code gap) |
 | SEC Reg SHO FTD | **built** | full slice; outstanding balance only, no timeline/squeeze score; realistically `unavailable(never_configured)` until the puller is scheduled |
-| Corporate buyback blackouts | not built | no measured source |
+| Corporate buyback blackouts | **built** | modeled quiet-window calendar only; no dollar/% figures — those need EDGAR repurchase disclosures, absent from this DB |
 | Dealer GEX | not built | engine correctness unproven |
 
 Every "not built" pillar's specific reason is returned verbatim by
