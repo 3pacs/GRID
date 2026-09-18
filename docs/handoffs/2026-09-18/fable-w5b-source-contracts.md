@@ -372,12 +372,40 @@ page's own examples don't cover petroleum/stoc/wstk specifically).
   it).
 
 **Exact bounded request the operator can run once, live, to confirm this
-contract** (reads `$EIA_API_KEY` from the environment, never pastes it
-inline; `length=5` bounds it to 5 rows):
+contract** (corrected 2026-09-18 pass 5). Properties: the key is read from
+`$EIA_API_KEY` and passed to curl through a config file on a private file
+descriptor, so it never appears in the command's arguments, in `ps`, or in
+shell history; `-g` disables curl's URL globbing so the literal `[0]`/`[]`
+facet syntax is sent as-is; `--data-urlencode` with `-G` encodes every query
+parameter; `--max-time 20` bounds the call; `-w` reports the HTTP status;
+`length=5` bounds the reply to 5 rows; the body is written to a file and
+only its shape is printed, never the URL:
 
 ```bash
-curl -s "https://api.eia.gov/v2/petroleum/stoc/wstk/data/?api_key=${EIA_API_KEY}&frequency=weekly&data[0]=value&facets[series][]=W_EPC0_SAX_YCUOK_MBBL&sort[0][column]=period&sort[0][direction]=desc&length=5"
+set -o pipefail
+: "${EIA_API_KEY:?EIA_API_KEY is not set in this shell}"
+out="$(mktemp)"
+curl -sS -g -G --max-time 20   -K <(printf 'data-urlencode = "api_key=%s"
+' "$EIA_API_KEY")   --data-urlencode 'frequency=weekly'   --data-urlencode 'data[0]=value'   --data-urlencode 'facets[series][]=W_EPC0_SAX_YCUOK_MBBL'   --data-urlencode 'sort[0][column]=period'   --data-urlencode 'sort[0][direction]=desc'   --data-urlencode 'length=5'   -o "$out" -w 'HTTP %{http_code} in %{time_total}s
+'   'https://api.eia.gov/v2/petroleum/stoc/wstk/data/'
+python3 - "$out" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+if "error" in d:
+    print("ERROR key present:", str(d["error"])[:120]); sys.exit(1)
+rows = d.get("response", {}).get("data", [])
+print("rows:", len(rows))
+for r in rows:
+    print(r.get("period"), r.get("value"), r.get("units"), (r.get("series-description") or r.get("series") or "")[:60])
+PY
+rm -f "$out"
 ```
+
+What one successful response proves: the request contract (route, facet
+and sort parameter shapes, units, weekly period format). What it does NOT
+prove: that the puller is scheduled, that fresh rows arrive, or that the
+Cushing leg is live — those remain separate deployment decisions and the
+pillar stays `never_configured` until they are taken.
 
 What to check in the reply:
 
