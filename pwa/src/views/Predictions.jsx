@@ -352,7 +352,7 @@ function CalibrationChart({ buckets }) {
 
 // ── Prediction Card ───────────────────────────────────────────────────────
 
-function PredictionCard({ pred }) {
+export function PredictionCard({ pred }) {
     const [expanded, setExpanded] = useState(false);
     const isCall = pred.direction === 'CALL' || pred.direction === 'LONG';
     const confPct = Math.round((pred.confidence || 0) * 100);
@@ -401,7 +401,13 @@ function PredictionCard({ pred }) {
 
             <div style={s.predMeta}>
                 <div style={s.predMetric}>
-                    <div style={s.predMetricVal}>${pred.entry_price?.toFixed(2) || '---'}</div>
+                    {/* D-M32: entry_price is null when no spot was measured at
+                        publish time. `x?.toFixed(2) || '---'` never fired for the
+                        old 0.0 (not nullish) and printed "$0.00"; an explicit
+                        null check also keeps the "$" off the empty case. */}
+                    <div style={s.predMetricVal}>
+                        {pred.entry_price == null ? '---' : `$${pred.entry_price.toFixed(2)}`}
+                    </div>
                     <div style={s.predMetricLbl}>ENTRY</div>
                 </div>
                 <div style={s.predMetric}>

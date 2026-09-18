@@ -38,6 +38,99 @@ def _measured_or_none(value: Any) -> float | None:
     return f
 
 
+_ENTRY_PRICE_SOURCE = "options_daily_signals.spot_price"
+
+
+def _as_of_date(payload: dict[str, Any]) -> date:
+    """The prediction's as-of date. Never raises; falls back to today (UTC)."""
+    as_of = payload.get("as_of_ts")
+    try:
+        if isinstance(as_of, str):
+            return datetime.fromisoformat(as_of.replace("Z", "+00:00")).date()
+        if isinstance(as_of, datetime):
+            return as_of.date()
+    except (TypeError, ValueError):
+        pass
+    return datetime.now(timezone.utc).date()
+
+
+def _measured_entry_price(
+    engine: Engine, ticker: str, as_of: date
+) -> tuple[float | None, dict[str, Any]]:
+    """The last raw spot observed on or before ``as_of``, with its date.
+
+    An entry price is a measurement, so it ships with the day it was measured
+    on or it does not ship at all. The retired literal here was ``0.0``: it
+    rendered as "$0.00" on the prediction card and turned every downstream
+    ``(exit - entry) / entry`` into nonsense, while being indistinguishable
+    from a price somebody had actually looked up.
+
+    Source and basis: ``options_daily_signals.spot_price`` is the same raw
+    (unadjusted) series ``oracle/engine.py:_get_spot_price`` writes as
+    ``entry_price`` and that ``scripts/score_oracle_trades.py`` scores against
+    (``fetch_prices(..., auto_adjust=False)``, PR #516). Mixing an adjusted
+    entry against a raw exit manufactures a dividend/split-sized return out of
+    nothing — see ``tests/test_oracle_engine_spot_price_basis.py``.
+
+    Point-in-time: ``signal_date <= as_of`` never reads a close from after the
+    prediction was made. No observation on or before that date means ``None``,
+    not a stand-in.
+
+    Returns ``(price, basis)``. ``basis`` always carries a ``status`` of
+    ``"measured"`` or ``"unavailable"`` and is stored on the row beside the
+    price so a reader can tell a looked-up entry from a missing one.
+    """
+    as_of_iso = as_of.isoformat()
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT spot_price, signal_date
+                    FROM options_daily_signals
+                    WHERE ticker = :t
+                      AND signal_date <= :d
+                      AND spot_price > 0
+                    ORDER BY signal_date DESC
+                    LIMIT 1
+                    """
+                ),
+                {"t": ticker, "d": as_of},
+            ).fetchone()
+    except Exception as exc:  # pragma: no cover - defensive; never block a publish
+        return None, {
+            "status": "unavailable",
+            "source": None,
+            "as_of": as_of_iso,
+            "reason": f"entry price lookup failed: {exc}",
+        }
+
+    price = _measured_or_none(row[0]) if row else None
+    if price is None or price <= 0:
+        return None, {
+            "status": "unavailable",
+            "source": None,
+            "as_of": as_of_iso,
+            "reason": (
+                f"no {_ENTRY_PRICE_SOURCE} observation for {ticker} "
+                f"on or before {as_of_iso}"
+            ),
+        }
+
+    observed_on = row[1]
+    return price, {
+        "status": "measured",
+        "source": _ENTRY_PRICE_SOURCE,
+        "observed_on": (
+            observed_on.isoformat()
+            if hasattr(observed_on, "isoformat")
+            else str(observed_on)
+        ),
+        "as_of": as_of_iso,
+        "ticker": ticker,
+    }
+
+
 def _prediction_direction(payload: dict[str, Any]) -> str:
     raw = " ".join(
         [
@@ -86,14 +179,8 @@ def publish_astrogrid_prediction(engine: Engine, payload: dict[str, Any]) -> dic
     ]
     # Enrich with 11-layer conviction context: regime / fci_regime / vix_level /
     # signal_contributions. Never raises — defaults on any upstream failure.
+    as_of_date = _as_of_date(payload)
     try:
-        as_of_ts = payload.get("as_of_ts")
-        if isinstance(as_of_ts, str):
-            as_of_date = datetime.fromisoformat(as_of_ts.replace("Z", "+00:00")).date()
-        elif isinstance(as_of_ts, datetime):
-            as_of_date = as_of_ts.date()
-        else:
-            as_of_date = datetime.now(timezone.utc).date()
         # No supplied confidence means no astrogrid weight to record, not a
         # 0.5 one. `_normalize_contributions` drops a None value, so the
         # context simply carries no astrogrid weight.
@@ -115,6 +202,14 @@ def publish_astrogrid_prediction(engine: Engine, payload: dict[str, Any]) -> dic
             "signal_contributions": {},
         }
     signals = enrich_signals_payload(signals_list, context)
+    ticker = (payload.get("target_symbols") or ["HYBRID"])[0]
+    # D-M32: the entry price was the literal 0.0 on every published row. It is
+    # now the measured spot at `as_of_date`, or NULL — and the basis travels
+    # with it so "not looked up" is legible on the row itself.
+    entry_price, entry_price_basis = _measured_entry_price(
+        engine, ticker, as_of_date
+    )
+    signals["entry_price_basis"] = entry_price_basis
     # Pre-migration safety: the ON CONFLICT below targets the partial unique
     # index oracle_predictions_dedup_unique. Ensure it exists (once/process)
     # so this insert can't raise 42P10 on a not-yet-migrated DB.
@@ -185,10 +280,12 @@ def publish_astrogrid_prediction(engine: Engine, payload: dict[str, Any]) -> dic
             ),
             {
                 "id": oracle_prediction_id,
-                "ticker": (payload.get("target_symbols") or ["HYBRID"])[0],
+                "ticker": ticker,
                 "prediction_type": "astrogrid",
                 "direction": _prediction_direction(payload),
-                "entry_price": 0.0,
+                # NULL, not 0.0, when no spot was observed on or before
+                # as_of_date. `signals.entry_price_basis` says which it was.
+                "entry_price": entry_price,
                 "expiry": _prediction_expiry(payload),
                 # Three nominally independent metrics used to be the same
                 # number, and that number was 0.5 whenever the caller omitted
@@ -215,4 +312,6 @@ def publish_astrogrid_prediction(engine: Engine, payload: dict[str, Any]) -> dic
         "status": "published",
         "oracle_prediction_id": oracle_prediction_id,
         "contract": "oracle.publish.v1",
+        "entry_price": entry_price,
+        "entry_price_basis": entry_price_basis,
     }
