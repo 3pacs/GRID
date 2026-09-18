@@ -35,6 +35,10 @@ from intelligence import source_quality_ablation as sqa
 from oracle.calibration import compute_calibration
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+from oracle.entry_price_policy import (  # noqa: E402
+    SCORE_NOTE_ENTRY_NULL,
+    SCORE_NOTE_ENTRY_ZERO,
+)
 
 
 # ── In-memory fixture ──────────────────────────────────────────────────────
@@ -675,3 +679,89 @@ class TestPostmortemZeroEntry:
             assert category == "not_measured", (entry, category)
             assert note in root_cause
             assert note in what_missed
+
+
+# ── A row closed for an invalid entry price counts nowhere ──────────────────
+
+class TestClosedInvalidEntryRowsCountNowhere:
+    """When the scorer or the engine closes a row whose entry price is NULL,
+    zero or negative, it writes exactly ``verdict='no_data'``,
+    ``scored_at=NOW()`` and ``score_notes=<reason>`` and leaves ``pnl_pct``
+    NULL. Such a row must not become a win, a loss, a zero return or a
+    calibration sample — even when it carries a measured confidence — because
+    every aggregate keys on ``verdict IN ('hit','miss','partial')`` and never
+    on ``pnl_pct`` being present. This pins the closed row against the real
+    aggregation SQL, extracted from the scorer, and against calibration.
+    """
+
+    def _seed(self, engine) -> None:
+        with engine.begin() as conn:
+            _insert(conn, id="hit-row", ticker="AAA", direction="CALL",
+                    entry_price=100.0, confidence=0.9, verdict="hit",
+                    pnl_pct=10.0, expiry=date(2026, 9, 1))
+            _insert(conn, id="miss-row", ticker="BBB", direction="CALL",
+                    entry_price=100.0, confidence=0.6, verdict="miss",
+                    pnl_pct=-10.0, expiry=date(2026, 9, 1))
+            # Closed by the engine/scorer for a zero entry: measured
+            # confidence, NULL pnl, the zero reason.
+            _insert(conn, id="closed-zero-entry", ticker="CCC", direction="CALL",
+                    entry_price=0.0, confidence=0.9, verdict="no_data",
+                    pnl_pct=None, score_notes=SCORE_NOTE_ENTRY_ZERO,
+                    scored_at="2026-09-18 00:00:00", expiry=date(2026, 9, 1))
+            _insert(conn, id="closed-null-entry", ticker="DDD", direction="CALL",
+                    entry_price=None, confidence=0.9, verdict="no_data",
+                    pnl_pct=None, score_notes=SCORE_NOTE_ENTRY_NULL,
+                    scored_at="2026-09-18 00:00:00", expiry=date(2026, 9, 1))
+
+    @staticmethod
+    def _scorer_sql(marker: str) -> str:
+        src = (REPO_ROOT / "scripts" / "score_oracle_trades.py").read_text(
+            encoding="utf-8"
+        )
+        start = src.index(marker)
+        start = src.index('text("""', start) + len('text("""')
+        end = src.index('"""', start)
+        return src[start:end]
+
+    def test_not_a_calibration_sample(self, engine):
+        self._seed(engine)
+        report = compute_calibration(engine, n_bins=10)
+        # Only the hit and the miss are samples; the two closed rows carry a
+        # measured 0.9 but are not verdicts.
+        assert report.total_predictions == 2
+        assert report.overall_accuracy == pytest.approx(0.5)
+
+    def test_not_a_win_loss_or_zero_return_in_the_model_summary(self, engine):
+        self._seed(engine)
+        sql = self._scorer_sql("model_stats = conn.execute(")
+        with engine.connect() as conn:
+            rows = conn.execute(text(sql)).fetchall()
+        assert len(rows) == 1
+        _name, total, hits, misses, partials, pending, avg_pnl = rows[0]
+        assert total == 4                      # closed rows are still rows...
+        assert (hits, misses, partials, pending) == (1, 1, 0, 0)  # ...not outcomes
+        assert avg_pnl == pytest.approx(0.0)   # (10 - 10) / 2: no third term at 0
+
+    def test_absent_from_the_scored_only_ticker_summary(self, engine):
+        self._seed(engine)
+        sql = self._scorer_sql("ticker_stats = conn.execute(")
+        with engine.connect() as conn:
+            tickers = {r[0] for r in conn.execute(text(sql)).fetchall()}
+        assert tickers == {"AAA", "BBB"}
+
+    def test_closed_rows_are_final_and_untouched_by_the_scorer(self, engine):
+        """The chunk query requires a usable entry price; the sweep only
+        re-labels rows still 'pending'. A closed row keeps its verdict, note
+        and NULL pnl through another run."""
+        self._seed(engine)
+        src = (REPO_ROOT / "scripts" / "score_oracle_trades.py").read_text(
+            encoding="utf-8"
+        )
+        assert "AND entry_price IS NOT NULL" in src and "AND entry_price > 0" in src
+        assert "verdict = 'pending'" in src or "verdict='pending'" in src
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT verdict, score_notes, pnl_pct FROM oracle_predictions "
+                "WHERE id = 'closed-zero-entry'"
+            )).fetchone()
+        assert row == ("no_data", SCORE_NOTE_ENTRY_ZERO, None)
