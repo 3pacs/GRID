@@ -91,6 +91,12 @@ def compute_calibration(
         WHERE verdict IN ('hit', 'miss', 'partial')
           AND dedup_keep = TRUE
           AND id NOT LIKE 'astrogrid:%'
+          -- A prediction published without a stated confidence has no
+          -- probability to score for reliability. It is excluded, not
+          -- counted at a default: `total_predictions` therefore counts
+          -- only rows that actually stated one. `float(r[0])` below would
+          -- raise TypeError on a NULL.
+          AND confidence IS NOT NULL
     """
     params: dict[str, Any] = {}
 
