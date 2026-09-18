@@ -483,31 +483,56 @@ an all-calls chain (never crosses → `unavailable`), and a chain with half
 its contracts missing IV (coverage < 1, those contracts skipped rather
 than defaulted).
 
-**Explicitly never computed: any claim that a figure here matches a real
-dealer's actual book.** No real captured options chain fixture exists
-anywhere in this codebase to validate the engine's sign convention or
-modeled-dealer-positioning assumption against a known-correct GEX number —
-named exactly as `MISSING_INPUT`, returned in every API response as
-`missing_input`. This is the concrete input this lane could not obtain and
-the specific claim it prevents: a claim of accuracy against real dealer
-positioning, as opposed to internal mechanical correctness (which the
-three synthetic cases do validate).
+**Numerical validation against a real, sourced chain (2026-09-18):**
+`tests/godview/test_dealer_gex_validation.py` runs this engine's
+`_compute_gex_for_chain` against a live SPY options chain captured via
+`yfinance` (`tests/godview/fixtures/options_chain_SPY_20260918.json`;
+exact provenance — source URL/API, capture timestamp, spot, expiry — in
+the sidecar `options_chain_SPY_20260918.SOURCE.md`), and compares it to
+an INDEPENDENTLY written expected-value calculation (its own
+`math.erf`-based normal pdf, its own Black-Scholes gamma, its own
+gamma-flip/max-pain/ATM-IV/put-call-ratio code — none of it imported from
+the engine). Net/call/put GEX, gamma-flip strike, max pain, put/call OI
+ratio, and ATM IV agree within a stated `1e-6` relative tolerance; the
+engine's `contracts_used`/`contracts_present` match the test's own count
+of usable rows exactly. **What this proves:** the engine's math is
+numerically correct under its stated, disclosed assumptions (r=q=0,
+chain-reported implied_vol, the call-positive/put-negative sign
+convention, a 100-share contract multiplier), on a real chain, not just
+on the three synthetic cases below. **What this does NOT prove: any
+claim that a figure here matches a real dealer's actual book.**
+`options_snapshots` still carries no dealer-vs-customer position split
+at all — no table, no column, nowhere in this database records who
+actually holds which side of an option — so the "dealers are short both
+sides" convention remains a MODELED assumption, never a measurement.
+Every field this pillar produces stays `provenance='modeled'` for
+exactly that reason (checked by
+`test_router_still_reports_gex_fields_as_modeled`, not just asserted in
+prose), named exactly as `MISSING_INPUT`, returned in every API response
+as `missing_input`: a claim of accuracy against real dealer positioning,
+as opposed to internal mechanical correctness (which the sourced-chain
+test above and the three synthetic cases below both validate).
 
-## Status of all seven God View pillars (2026-09-18)
+## Operational readiness of all seven God View pillars (2026-09-18)
 
-| pillar | status | why |
-|---|---|---|
-| CFTC positioning | **built** | full slice: adapter, migration, materializer, strict-PIT API (+ `include_inferred`), UI card |
-| Fed net liquidity | **built** | full slice; per-component basis; `forward_impulse_score` intentionally NULL (not implemented) |
-| Commodity warehouses (LME leg) | **built** | LME cancelled-warrant ratio, reused from the existing puller |
-| Commodity warehouses (Cushing leg) | **permanently unavailable** | `never_configured` — no real Cushing series id exists in this codebase; will not silently substitute a near-miss |
-| FINRA short volume | **built** | full slice; realistically `unavailable(never_configured)` in production until the puller is scheduled (deployment decision, not a code gap) |
-| SEC Reg SHO FTD | **built** | full slice; outstanding balance only, no timeline/squeeze score; realistically `unavailable(never_configured)` until the puller is scheduled |
-| Corporate buyback blackouts | **built** | modeled quiet-window calendar only; no dollar/% figures — those need EDGAR repurchase disclosures, absent from this DB |
-| Dealer GEX | **built** | from-scratch engine, `provenance='modeled'` throughout; mechanically validated by 3 synthetic cases; no real captured chain fixture exists to validate against a known-correct figure — see section 16 |
+Seven implementations are not seven working production feeds.
 
-Every God View pillar named in this contract is now built (2026-09-18).
-Any pillar name this router does not recognize still renders the honest
-"not built yet" state via `api/routers/godview_pillars.py`'s
+| Pillar | Implemented | Adapter verified | DB/API tested (real PG) | Model validated | Scheduled | Fresh data observed | Production verified |
+|---|---|---|---|---|---|---|---|
+| CFTC positioning | yes | existing puller; live not re-verified this cycle | yes (run 4, composition d9a960ab, 162/0/0) | n/a (measured or simple derived, unit-tested) | no | no | no |
+| Fed net liquidity | yes | existing FRED puller; units fix a828f4bf; live not re-verified | yes (run 4, composition d9a960ab, 162/0/0) | n/a (measured or simple derived, unit-tested) | no | no | no |
+| Commodity warehouses | yes | LME puller registered but has "never written a row" (unexplained, pass-1 finding); Cushing leg `never_configured` | yes (run 4, composition d9a960ab, 162/0/0) | n/a (measured or simple derived, unit-tested) | no | no | no |
+| FINRA short volume | yes | parser verified on one real captured file (#564); puller unscheduled | yes (run 4, composition d9a960ab, 162/0/0) | n/a (measured or simple derived, unit-tested) | no | no | no |
+| SEC Reg SHO FTD | yes | parser verified on one real captured zip (#564); puller unscheduled | yes (run 4, composition d9a960ab, 162/0/0) | n/a (measured or simple derived, unit-tested) | no | no | no |
+| Corporate buyback blackouts | yes | no adapter — consumes untracked `earnings_calendar` | yes (run 4, composition d9a960ab, 162/0/0) | modeled window, not validatable (no measured source) | no | no | no |
+| Dealer GEX | yes | consumes `options_snapshots`; its writer not verified this cycle | yes (run 4, composition d9a960ab, 162/0/0) | numerically validated on a sourced chain, commit `b5782a8a` (this cycle) — dealer positioning NOT validated (modeled) — see section 16 | no | no | no |
+
+Every God View pillar named in this contract is **implemented** in code
+(2026-09-18). "Implemented" means exactly the "Implemented" column above
+— it does not mean scheduled, activated, or deployed: every pillar reads
+"no" across Scheduled / Fresh data observed / Production verified,
+because nothing in this row is scheduled, activated, or deployed. Any
+pillar name this router does not recognize still renders the honest "not
+built yet" state via `api/routers/godview_pillars.py`'s
 `_KNOWN_UNBUILT_PILLARS` map / catch-all route (currently empty, kept for
 future pillars) — never a silent 404, never a fabricated value.
