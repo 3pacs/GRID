@@ -51,7 +51,7 @@ import time
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 # Ensure grid/ is on sys.path
 _GRID_DIR = str(Path(__file__).resolve().parent.parent)
@@ -69,6 +69,13 @@ CYCLE_INTERVAL_SECONDS = 300          # 5 minutes between cycles
 CYCLE_TIMEOUT_SECONDS = 4500          # 75 min max per cycle (oracle dominates one in N cycles)
                                        # (per-step timeouts kick in earlier; this
                                        # is a safety net for unforeseen hangs)
+# The per-cycle pool_stats log (below, in run_cycle) only fires when a cycle
+# completes -- a stuck or long-running cycle (up to CYCLE_TIMEOUT_SECONDS)
+# would otherwise produce zero visibility into connections it opened and
+# never returned. This poll runs on its own thread, independent of cycle
+# completion, so an outstanding checkout is visible well before -- or even
+# without -- a cycle ever finishing.
+OUTSTANDING_CHECKOUT_POLL_SECONDS = 60
 PIPELINE_INTERVAL_HOURS = 6           # run full pipeline every 6 hours
 DATA_FRESHNESS_THRESHOLD_HOURS = 26   # flag stale sources after 26h
 MAX_PULL_RETRIES = 3                  # retry failed pulls up to 3 times
@@ -1648,6 +1655,31 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     try:
         from db import get_engine
         engine = get_engine()
+        # Pool telemetry is isolated in its own try/except: some callers
+        # (dry-run tests, alternate `db` stand-ins) only provide
+        # get_engine(), and instrumentation must never be able to take
+        # down the actual health check that follows.
+        try:
+            from db import get_pool_stats, reset_pool_peak
+            # Read the peak accumulated since the previous cycle's reset
+            # first — a point sample of checked_out taken here would only
+            # show this instant, missing whatever burst happened
+            # mid-cycle. Reset after reading so the next cycle's peak
+            # reflects only its own interval.
+            pool_stats = get_pool_stats(engine)
+            cycle_result["db_pool"] = pool_stats
+            log.info(
+                "DB pool (this process) — checked_out={co}/{cap} now, "
+                "peak_since_last_cycle={pk} "
+                "(pool_size={ps}, max_overflow={mo}, checked_in={ci})",
+                co=pool_stats["checked_out"], cap=pool_stats["capacity"],
+                pk=pool_stats["peak_checked_out"],
+                ps=pool_stats["pool_size"], mo=pool_stats["max_overflow"],
+                ci=pool_stats["checked_in"],
+            )
+            reset_pool_peak(pool_stats["checked_out"])
+        except Exception as exc:
+            log.warning("Pool stats logging failed: {e}", e=str(exc))
         health = check_system_health(engine)
         cycle_result["health"] = health
         hermes_ok = health["hermes"]["healthy"]
@@ -2597,6 +2629,52 @@ def _emit_obsidian_cycle_report(state: Any, cycle_result: dict[str, Any]) -> Non
         log.warning("obsidian-report fan-out failed: {e}", e=str(exc))
 
 
+def _log_outstanding_checkouts_once() -> list[dict[str, Any]] | None:
+    """Poll and log this process's currently-open DB checkouts.
+
+    This must run inside the same process as the engine it inspects --
+    db.py's checkout tracking is a process-local module dict, so a
+    separate Python invocation (e.g. a one-off diagnostic script) gets its
+    own empty tracking state and can never see what this Hermes process
+    has open. Wrapped in its own try/except, matching the isolation used
+    for the per-cycle pool_stats log, so a telemetry bug can never affect
+    real cycle work. Returns the outstanding-checkout list for tests;
+    callers running the poll loop don't need the return value.
+    """
+    try:
+        from db import get_outstanding_checkouts
+        outstanding = get_outstanding_checkouts()
+        if outstanding:
+            log.info(
+                "DB pool (this process) — {n} outstanding checkout(s): {rows}",
+                n=len(outstanding), rows=outstanding,
+            )
+        return outstanding
+    except Exception as exc:
+        log.warning("Outstanding-checkout telemetry failed: {e}", e=str(exc))
+        return None
+
+
+def _outstanding_checkout_telemetry_loop(
+    interval_seconds: float, *, sleep_fn: Callable[[float], None] = time.sleep,
+) -> None:
+    """Background loop: poll outstanding DB checkouts on a fixed interval.
+
+    Runs independently of cycle completion or cycle length -- a cycle can
+    run for up to CYCLE_TIMEOUT_SECONDS (75 min) or hang past it, during
+    which the per-cycle pool_stats log in run_cycle never fires. This loop
+    is the only source of outstanding-checkout visibility during that
+    window. Intended to run as a daemon thread for the life of the process.
+
+    ``sleep_fn`` is injectable (defaults to time.sleep) so tests can drive
+    a bounded number of iterations without monkeypatching the global time
+    module or actually sleeping.
+    """
+    while True:
+        sleep_fn(interval_seconds)
+        _log_outstanding_checkouts_once()
+
+
 def main(args: list[str] | None = None) -> None:
     """Entry point for the Hermes operator daemon."""
     parser = argparse.ArgumentParser(description="GRID Hermes Operator — 24/7 self-healing daemon")
@@ -2654,6 +2732,29 @@ def main(args: list[str] | None = None) -> None:
         except Exception as exc:
             log.warning("Failed to start LLM task queue: {e}", e=str(exc))
 
+    # Start outstanding-checkout telemetry as its own background daemon
+    # thread, independent of cycle completion (see
+    # _outstanding_checkout_telemetry_loop). Must run in-process: it reads
+    # db.py's process-local checkout tracking, which a separate script
+    # invocation cannot see.
+    _outstanding_checkout_thread = None
+    if not opts.dry_run:
+        try:
+            import threading as _threading
+            _outstanding_checkout_thread = _threading.Thread(
+                target=_outstanding_checkout_telemetry_loop,
+                args=(OUTSTANDING_CHECKOUT_POLL_SECONDS,),
+                daemon=True,
+                name="hermes-outstanding-checkout-telemetry",
+            )
+            _outstanding_checkout_thread.start()
+            log.info(
+                "Outstanding-checkout telemetry thread launched (interval={s}s)",
+                s=OUTSTANDING_CHECKOUT_POLL_SECONDS,
+            )
+        except Exception as exc:
+            log.warning("Failed to start outstanding-checkout telemetry: {e}", e=str(exc))
+
     # Run DB model migrations once on startup (idempotent)
     try:
         from db import get_engine as _get_engine_for_migrate
@@ -2679,7 +2780,15 @@ def main(args: list[str] | None = None) -> None:
                 result[0] = run_cycle(state, dry_run=dry_run)
             except Exception as exc:
                 error[0] = exc
-        t = threading.Thread(target=_target, daemon=True)
+        # Named explicitly (default would be "Thread-N") so db.py's
+        # per-thread checkout attribution (get_checkout_attribution) can
+        # actually distinguish this cycle's connections from the
+        # long-running llm-taskqueue background thread's, instead of both
+        # showing up as anonymous thread names in a burst.
+        t = threading.Thread(
+            target=_target, daemon=True,
+            name=f"hermes-cycle-{state.cycle_count + 1}",
+        )
         t.start()
         t.join(timeout=timeout)
         if t.is_alive():
