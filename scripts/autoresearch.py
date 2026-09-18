@@ -22,10 +22,13 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import sys
+import time
+import uuid
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -37,6 +40,20 @@ from store.pit import PITStore
 from ollama.client import get_client as get_ollama
 from ollama.reasoner import OllamaReasoner, SYSTEM_PROMPT
 from validation.backtest import WalkForwardBacktest
+
+# Per-step wall-clock budget for one run_autoresearch() invocation, read by
+# scripts/hermes_operator.py when it wraps the call in _run_with_timeout
+# (mirroring RESOLUTION_TIMEOUT_SECONDS / ORACLE_CYCLE_TIMEOUT_SECONDS there).
+# Conservative default: max_iterations defaults to 5 and one iteration can
+# include an LLM generate call, a walk-forward backtest, and an LLM critique
+# call, so this is sized like the other multi-call LLM steps in hermes_operator.py
+# (ORACLE_CYCLE_TIMEOUT_SECONDS=4000 for 41 tickers) rather than the
+# single-call steps (SIGNAL_CLASSIFICATION_TIMEOUT_SECONDS=120). Not itself a
+# cancellation guarantee — see _run_with_timeout's docstring in
+# hermes_operator.py: a worker that outruns this budget is abandoned, not
+# killed, which is exactly why the generation-fencing below exists.
+import os as _os
+AUTORESEARCH_TIMEOUT_SECONDS = int(_os.getenv("GRID_AUTORESEARCH_TIMEOUT_SECONDS", "1800"))
 
 
 # ── Prompt templates ──────────────────────────────────────────────────
@@ -125,6 +142,177 @@ Output ONE hypothesis in this exact JSON format — nothing else:
 # ── Helpers ───────────────────────────────────────────────────────────
 
 _ortho_cache: list[int] | None = None
+
+
+class AutoresearchDataError(RuntimeError):
+    """Raised when a DB query in the autoresearch data-loading phase fails.
+
+    Wraps the underlying driver/DB exception (e.g. a psycopg2 error from a
+    bad column reference or a lost connection) so callers get a typed,
+    identifiable signal naming which phase failed, instead of a bare
+    exception whose origin is hard to trace once it has bubbled up through
+    ``maybe_run_autoresearch``'s generic ``except Exception`` handler.
+    """
+
+    def __init__(self, phase: str, original: Exception):
+        self.phase = phase
+        self.original = original
+        super().__init__(f"autoresearch data load failed in phase '{phase}': {original}")
+
+
+def _failed_result(phase: str, error: str) -> dict[str, Any]:
+    """Build the structured failure result returned by ``run_autoresearch``.
+
+    Keeps the same key set as a successful run (see the return at the end
+    of ``run_autoresearch``) so a caller — or a future status surface —
+    can read ``status``/``phase``/``error`` to distinguish "ran and failed"
+    from "ran and passed/failed hypotheses", instead of the failure being
+    indistinguishable from an ordinary zero-iteration run.
+    """
+    return {
+        "status": "failed",
+        "phase": phase,
+        "error": error,
+        "iterations_run": 0,
+        "iterations": 0,
+        "best_result": None,
+        "best_sharpe": None,
+        "all_attempts": [],
+        "passed": False,
+    }
+
+
+# ── Run-state persistence (W4b) ─────────────────────────────────────────
+#
+# Every run_autoresearch() invocation is recorded as one or more rows in
+# analytical_snapshots (category="research_run", subcategory="autoresearch"):
+# a "started" row when the run begins, "running" checkpoint rows after each
+# iteration, and a terminal "ok"/"failed"/"abandoned" row when it ends.
+# ("timeout" rows are written by the CALLER — scripts/hermes_operator.py —
+# because a timed-out worker is abandoned, not killed; see its
+# _run_with_timeout docstring. This module cannot know it has been timed out
+# from the inside.)
+#
+# This reuses AnalyticalSnapshotStore — no new table, per this task's
+# instructions. Persistence is best-effort: a failure to WRITE the run
+# record must never break the research loop itself, so every call is
+# wrapped and only logged on failure (matching
+# AnalyticalSnapshotStore.save_snapshot's own fail-soft contract).
+
+def _get_code_sha() -> str | None:
+    """Return the current git HEAD sha, or None if it cannot be determined.
+
+    Best-effort: no git binary, not a git checkout, or any other failure
+    all just mean the run record's code_sha field is None.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=str(Path(__file__).resolve().parent.parent),
+        )
+        if proc.returncode == 0:
+            sha = proc.stdout.strip()
+            return sha or None
+    except Exception:
+        pass
+    return None
+
+
+def _record_research_run(
+    engine: Any,
+    run_id: str,
+    status: str,
+    *,
+    phase: str | None = None,
+    error: str | None = None,
+    error_category: str | None = None,
+    iteration: int | None = None,
+    iterations: int | None = None,
+    skip_reasons: list[str] | None = None,
+    failure_reasons: list[str] | None = None,
+    duration_s: float | None = None,
+    generation: int | None = None,
+    code_sha: str | None = None,
+    inputs: dict[str, Any] | None = None,
+) -> int | None:
+    """Persist one research_run record to ``analytical_snapshots``.
+
+    Parameters mirror the schema documented in
+    docs/handoffs/2026-09-18/fable-w4b-runstate.md. ``status`` is one of
+    "started", "running", "ok", "failed", "timeout", "abandoned".
+
+    Returns:
+        The new snapshot row id, or None if the write failed (logged, not
+        raised — see module docstring above).
+    """
+    try:
+        from store.snapshots import AnalyticalSnapshotStore
+
+        store = AnalyticalSnapshotStore(db_engine=engine)
+        payload = {
+            "run_id": run_id,
+            "status": status,
+            "phase": phase,
+            "error": error,
+            "error_category": error_category,
+            "iteration": iteration,
+            "iterations": iterations,
+            "skip_reasons": skip_reasons or [],
+            "failure_reasons": failure_reasons or [],
+            "duration_s": duration_s,
+            "generation": generation,
+            "code_sha": code_sha,
+            "inputs": inputs,
+        }
+        metrics = {
+            "run_id": run_id,
+            "status": status,
+            "iteration": iteration,
+            "generation": generation,
+        }
+        return store.save_snapshot(
+            category="research_run",
+            subcategory="autoresearch",
+            payload=payload,
+            metrics=metrics,
+        )
+    except Exception as exc:
+        log.warning(
+            "Failed to record research run state (run_id={r}, status={s}): {e}",
+            r=run_id, s=status, e=str(exc),
+        )
+        return None
+
+
+def _generation_current(
+    generation: int | None,
+    is_current_generation: Callable[[int], bool] | None,
+) -> bool:
+    """Return whether ``generation`` is still the operator's current one.
+
+    When either argument is None (e.g. a standalone CLI run with no
+    operator-assigned generation), fencing is a no-op and every write is
+    allowed — there is no operator to have moved on.
+
+    IMPORTANT SCOPE NOTE: this is an in-process check only. ``generation``
+    and ``is_current_generation`` are backed by a single mutable counter
+    living in the SAME hermes_operator.py process
+    (``_AutoresearchGenerationTracker``), so this fences a stale worker
+    THREAD within that process — e.g. an orphaned thread left running after
+    ``_run_with_timeout`` abandons it (it cannot be killed; see that
+    function's docstring). It does NOT fence a second Hermes process, a
+    worker that survives a process restart, or any other cross-process
+    case. Cross-process fencing would need a DB-backed lease (a row with an
+    owner/epoch that every writer re-checks transactionally against, e.g.
+    ``SELECT ... FOR UPDATE`` or an optimistic version column) — not
+    implemented here.
+    """
+    if generation is None or is_current_generation is None:
+        return True
+    return is_current_generation(generation)
 
 
 def _select_orthogonal_features(cur, max_features: int = 13, corr_threshold: float = 0.7) -> list[int]:
@@ -297,6 +485,40 @@ def get_feature_name_map(cur) -> dict[int, str]:
     return {r[0]: r[1] for r in cur.fetchall()}
 
 
+def _load_research_context(cur) -> dict[str, Any]:
+    """Load the feature list, name map, and market snapshot that seed
+    hypothesis generation.
+
+    Each DB call is wrapped individually so that a query failure (a bad
+    column reference, a lost connection, a permissions error, ...) raises
+    a typed ``AutoresearchDataError`` naming which phase failed, rather
+    than an unlabeled driver exception. ``run_autoresearch`` catches this
+    and turns it into an explicit, structured failure result instead of
+    letting it propagate up to be logged as a single generic warning by
+    ``maybe_run_autoresearch`` (scripts/hermes_fixers.py).
+    """
+    try:
+        feature_list = get_feature_list(cur)
+    except Exception as exc:  # noqa: BLE001 - intentionally broad, re-typed below
+        raise AutoresearchDataError("feature_list", exc) from exc
+
+    try:
+        feature_names = get_feature_name_map(cur)
+    except Exception as exc:  # noqa: BLE001
+        raise AutoresearchDataError("feature_name_map", exc) from exc
+
+    try:
+        market_snapshot = get_market_snapshot(cur)
+    except Exception as exc:  # noqa: BLE001
+        raise AutoresearchDataError("market_snapshot", exc) from exc
+
+    return {
+        "feature_list": feature_list,
+        "feature_names": feature_names,
+        "market_snapshot": market_snapshot,
+    }
+
+
 def parse_hypothesis_json(text: str) -> dict[str, Any] | None:
     """Extract hypothesis JSON from LLM output."""
     # Try to find JSON block
@@ -414,6 +636,9 @@ def run_autoresearch(
     backtest_end: date | None = None,
     n_splits: int = 5,
     cost_bps: float = 10.0,
+    run_id: str | None = None,
+    generation: int | None = None,
+    is_current_generation: Callable[[int], bool] | None = None,
 ) -> dict[str, Any]:
     """Run the full autoresearch loop.
 
@@ -425,9 +650,26 @@ def run_autoresearch(
         backtest_end: Backtest end date (default: today).
         n_splits: Walk-forward splits.
         cost_bps: Transaction cost assumption.
+        run_id: Identifies this invocation in the ``research_run`` snapshot
+            trail. Pass the SAME run_id to retry an aborted/timed-out
+            invocation — hypothesis inserts are then deduplicated by
+            (statement, layer) and a hypothesis already PASSED on a prior
+            attempt is not re-backtested or re-notified. Defaults to a
+            fresh uuid4 (a standalone CLI run has nothing to retry).
+        generation: Operator-assigned generation id for write fencing (see
+            ``_generation_current``). None (the CLI/default case) disables
+            fencing — there is no operator to have moved on from.
+        is_current_generation: Callable checking whether ``generation`` is
+            still current. Passed by scripts/hermes_fixers.py::
+            maybe_run_autoresearch, which forwards it from
+            scripts/hermes_operator.py's ``_AutoresearchGenerationTracker``.
 
     Returns:
         dict: Summary with best hypothesis, all attempts, and final verdict.
+            Always includes "status" (started/ok/failed/abandoned) as of
+            this task; "timeout" is recorded by the caller, not returned
+            from here, since a timed-out call never returns at all (the
+            worker thread is abandoned by _run_with_timeout).
     """
     import psycopg2
 
@@ -436,7 +678,19 @@ def run_autoresearch(
     if backtest_end is None:
         backtest_end = date.today()
 
+    run_id = run_id or str(uuid.uuid4())
+    code_sha = _get_code_sha()
+    _start_monotonic = time.monotonic()
+
+    def _duration_s() -> float:
+        return round(time.monotonic() - _start_monotonic, 3)
+
     engine = get_engine()
+    _record_research_run(
+        engine, run_id, "started",
+        phase="init", generation=generation, code_sha=code_sha,
+    )
+
     pit = PITStore(engine)
     backtester = WalkForwardBacktest(engine, pit)
     ollama = get_ollama()
@@ -444,25 +698,80 @@ def run_autoresearch(
 
     if not ollama.is_available:
         log.error("Ollama not available — cannot run autoresearch")
-        return {"error": "Ollama not available"}
+        _record_research_run(
+            engine, run_id, "failed",
+            phase="ollama_availability", error="Ollama not available",
+            error_category="ollama_unavailable", iterations=0,
+            duration_s=_duration_s(), generation=generation, code_sha=code_sha,
+        )
+        return _failed_result(phase="ollama_availability", error="Ollama not available")
 
-    pg = psycopg2.connect(
-        host=settings.DB_HOST,
-        port=settings.DB_PORT,
-        dbname=settings.DB_NAME,
-        user=settings.DB_USER,
-        password=settings.DB_PASSWORD,
-    )
+    try:
+        pg = psycopg2.connect(
+            host=settings.DB_HOST,
+            port=settings.DB_PORT,
+            dbname=settings.DB_NAME,
+            user=settings.DB_USER,
+            password=settings.DB_PASSWORD,
+        )
+    except Exception as exc:
+        log.error("Autoresearch DB connection failed: {e}", e=str(exc))
+        _record_research_run(
+            engine, run_id, "failed",
+            phase="db_connect", error=str(exc), error_category="db_connect_failure",
+            iterations=0, duration_s=_duration_s(), generation=generation, code_sha=code_sha,
+        )
+        return _failed_result(phase="db_connect", error=str(exc))
+
     pg.autocommit = True
     cur = pg.cursor()
 
-    feature_list = get_feature_list(cur)
-    feature_names = get_feature_name_map(cur)
-    market_snapshot = get_market_snapshot(cur)
+    try:
+        ctx = _load_research_context(cur)
+    except AutoresearchDataError as exc:
+        # Reserve log.error for unhandled application bugs (CLAUDE.md):
+        # a DB query failing here means the code and the live schema have
+        # drifted apart, which is exactly that class of bug.
+        log.error(
+            "Autoresearch data load failed in phase '{p}': {e}",
+            p=exc.phase, e=exc.original,
+        )
+        pg.close()
+        _record_research_run(
+            engine, run_id, "failed",
+            phase=exc.phase, error=str(exc.original), error_category="db_load_failure",
+            iterations=0, duration_s=_duration_s(), generation=generation, code_sha=code_sha,
+        )
+        return _failed_result(phase=exc.phase, error=str(exc.original))
+
+    feature_list = ctx["feature_list"]
+    feature_names = ctx["feature_names"]
+    market_snapshot = ctx["market_snapshot"]
+
+    # Inputs manifest for the run record — derived from data already loaded
+    # above, not a maintained literal (same "derive, don't hardcode"
+    # principle store/snapshots.py uses for category discovery).
+    _ortho_ids_for_manifest = _select_orthogonal_features(cur)  # cached, no re-query
+    inputs_manifest = {
+        "feature_ids_count": len(_ortho_ids_for_manifest),
+        "market_snapshot_keys": [
+            feature_names.get(fid, str(fid)) for fid in _ortho_ids_for_manifest
+        ],
+        # No evaluation-version concept exists anywhere in this codebase
+        # today (checked validation/backtest.py and config.py) — left None
+        # rather than inventing one.
+        "evaluation_version": None,
+    }
+    _record_research_run(
+        engine, run_id, "running",
+        phase="context_loaded", iteration=0, generation=generation,
+        code_sha=code_sha, inputs=inputs_manifest, duration_s=_duration_s(),
+    )
 
     attempts: list[dict[str, Any]] = []
     best_result: dict[str, Any] | None = None
     best_sharpe: float = -999.0
+    fence_events: list[str] = []
 
     log.info("=" * 70)
     log.info("GRID AUTORESEARCH ENGINE")
@@ -474,6 +783,35 @@ def run_autoresearch(
         log.info("─" * 70)
         log.info("ITERATION {}/{}", iteration, max_iterations)
         log.info("─" * 70)
+
+        # ── Fencing check ──────────────────────────────────────────────
+        # Checked once per iteration, before any write this iteration would
+        # make (hypothesis insert, backtest -> validation_results insert,
+        # model_registry insert). If the operator has moved on to a newer
+        # generation — e.g. because _run_with_timeout gave up waiting on
+        # this exact call and the caller bumped the generation counter —
+        # this worker is an orphan and must stop trying to publish. It
+        # cannot be killed (see hermes_operator.py's _run_with_timeout
+        # docstring), so "stop" here means "stop writing", not "stop
+        # existing"; the thread still runs to this point harmlessly.
+        if not _generation_current(generation, is_current_generation):
+            log.warning(
+                "Autoresearch generation {g} superseded before iteration {i} "
+                "— abandoning further writes (fenced)", g=generation, i=iteration,
+            )
+            fence_events.append(f"fenced_before_iteration_{iteration}")
+            attempts.append({
+                "iteration": iteration,
+                "error": "fenced: operator generation superseded",
+                "fenced": True,
+            })
+            break
+
+        _record_research_run(
+            engine, run_id, "running",
+            phase="iteration", iteration=iteration, generation=generation,
+            code_sha=code_sha, duration_s=_duration_s(),
+        )
 
         # ── Step 1: Generate or refine hypothesis ─────────────────────
         if iteration == 1:
@@ -558,34 +896,140 @@ def run_autoresearch(
         log.info("  Lags:      {}", hyp['lag_structure'])
         log.info("  Threshold: Sharpe >= {}", hyp['proposed_threshold'])
 
-        # ── Step 2: Register hypothesis ───────────────────────────────
+        # ── Step 2: Register hypothesis (idempotent) ──────────────────
+        # A retry of this same run_id (e.g. after the operator abandoned a
+        # timed-out prior attempt and the caller invokes run_autoresearch
+        # again) must not insert a second hypothesis_registry row for the
+        # same (statement, layer). hypothesis_registry has no run_id
+        # column to key on directly (adding one is a schema change, out of
+        # scope — "no new table" per this task, and a new column carries
+        # the same weight), so (statement, layer) is the deterministic key
+        # this loop already has in hand.
         log.info("[2/4] Registering hypothesis...")
-        try:
-            cur.execute(
-                "INSERT INTO hypothesis_registry "
-                "(statement, layer, feature_ids, lag_structure, proposed_metric, proposed_threshold, state) "
-                "VALUES (%s, %s, %s, %s, %s, %s, 'TESTING') RETURNING id",
-                (
-                    hyp["statement"],
-                    layer,
-                    hyp["feature_ids"],
-                    json.dumps(hyp["lag_structure"]),
-                    hyp["proposed_metric"],
-                    hyp["proposed_threshold"],
-                ),
+        cur.execute(
+            "SELECT id, state FROM hypothesis_registry "
+            "WHERE statement = %s AND layer = %s ORDER BY id DESC LIMIT 1",
+            (hyp["statement"], layer),
+        )
+        existing_hyp = cur.fetchone()
+        reused_hyp = existing_hyp is not None
+
+        if reused_hyp:
+            hyp_id, existing_state = existing_hyp
+            log.info(
+                "  Reusing existing hypothesis_registry row {id} (state={s}) "
+                "for identical statement+layer — idempotent retry, no duplicate insert",
+                id=hyp_id, s=existing_state,
             )
-            hyp_id = cur.fetchone()[0]
-            log.info("  Registered as hypothesis_id={}", hyp_id)
-        except Exception as exc:
-            log.error("Failed to register hypothesis: {e}", e=str(exc))
+        else:
+            try:
+                cur.execute(
+                    "INSERT INTO hypothesis_registry "
+                    "(statement, layer, feature_ids, lag_structure, proposed_metric, proposed_threshold, state) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, 'TESTING') RETURNING id",
+                    (
+                        hyp["statement"],
+                        layer,
+                        hyp["feature_ids"],
+                        json.dumps(hyp["lag_structure"]),
+                        hyp["proposed_metric"],
+                        hyp["proposed_threshold"],
+                    ),
+                )
+                hyp_id = cur.fetchone()[0]
+                existing_state = "TESTING"
+                log.info("  Registered as hypothesis_id={}", hyp_id)
+            except Exception as exc:
+                log.error("Failed to register hypothesis: {e}", e=str(exc))
+                attempts.append({
+                    "iteration": iteration,
+                    "statement": hyp["statement"],
+                    "error": f"DB insert failed: {exc}",
+                })
+                continue
+
+        # A hypothesis reused from a prior attempt that already reached a
+        # terminal state must not be re-backtested (that would insert a
+        # second validation_results row) or, if it already PASSED,
+        # re-notified (see "no notification path called twice" below).
+        if reused_hyp and existing_state == "PASSED":
+            log.info(
+                "  Hypothesis {id} already PASSED on a prior attempt with "
+                "this statement — skipping duplicate backtest/notify "
+                "(idempotent retry)", id=hyp_id,
+            )
+            reused_attempt = {
+                "iteration": iteration,
+                "hypothesis_id": hyp_id,
+                "statement": hyp["statement"],
+                "feature_ids": hyp["feature_ids"],
+                "lag_structure": hyp["lag_structure"],
+                "verdict": "PASS",
+                "reused": True,
+            }
+            attempts.append(reused_attempt)
+            if best_result is None:
+                best_result = reused_attempt
+
+            # Model idempotency: don't create a second CANDIDATE model for
+            # a hypothesis that already has one.
+            cur.execute(
+                "SELECT id FROM model_registry WHERE hypothesis_id = %s LIMIT 1",
+                (hyp_id,),
+            )
+            if cur.fetchone() is None and _generation_current(generation, is_current_generation):
+                try:
+                    _create_model_from_hypothesis(cur, hyp_id, hyp, layer, {})
+                except Exception as exc:
+                    log.warning("Auto model creation failed: {e}", e=str(exc))
+
+            # Deliberately NOT calling notify_on_pass here — this branch
+            # only runs when the hypothesis already reached PASSED on an
+            # earlier attempt, which is exactly the attempt that called
+            # notify_on_pass the one time it was genuinely new. Calling it
+            # again here would be the "notification path called twice"
+            # this task's idempotent-acceptance requirement rules out.
+            break
+
+        if reused_hyp and existing_state == "FAILED":
+            log.info(
+                "  Hypothesis {id} already FAILED on a prior attempt with "
+                "this statement — skipping duplicate backtest, refining "
+                "for next iteration", id=hyp_id,
+            )
             attempts.append({
                 "iteration": iteration,
+                "hypothesis_id": hyp_id,
                 "statement": hyp["statement"],
-                "error": f"DB insert failed: {exc}",
+                "feature_ids": hyp["feature_ids"],
+                "verdict": "FAIL",
+                "reused": True,
             })
             continue
 
         # ── Step 3: Run walk-forward backtest ─────────────────────────
+        # backtester.run_validation() writes a validation_results row
+        # internally (validation/backtest.py, outside this task's editable
+        # file set) — fenced here, at the call boundary, rather than
+        # inside that module: if the operator has moved on since the
+        # fencing check at the top of this iteration, don't even start a
+        # backtest whose only DB effect is another write this worker has
+        # already lost the right to make.
+        if not _generation_current(generation, is_current_generation):
+            log.warning(
+                "Autoresearch generation {g} superseded before backtest "
+                "(hypothesis {h}) — skipping (fenced)", g=generation, h=hyp_id,
+            )
+            fence_events.append(f"fenced_before_backtest_iteration_{iteration}")
+            attempts.append({
+                "iteration": iteration,
+                "hypothesis_id": hyp_id,
+                "statement": hyp["statement"],
+                "error": "fenced: operator generation superseded",
+                "fenced": True,
+            })
+            break
+
         log.info("[3/4] Running walk-forward backtest...")
         try:
             result = backtester.run_validation(
@@ -662,14 +1106,35 @@ def run_autoresearch(
             log.info("    {}", hyp['statement'])
             log.info("    Sharpe={} (baseline={})", sharpe, baseline_sharpe)
 
-            # Auto-create CANDIDATE model from passed hypothesis
-            try:
-                _create_model_from_hypothesis(cur, hyp_id, hyp, layer, result)
-                log.info("    Model created (CANDIDATE) from hypothesis {}", hyp_id)
-            except Exception as exc:
-                log.warning("Auto model creation failed: {e}", e=str(exc))
+            # Auto-create CANDIDATE model from passed hypothesis — fenced
+            # (model_registry insert) and idempotent (skip if a candidate
+            # already exists for this hypothesis, e.g. a retry landed here
+            # a second time before the DB round-trip below could record it).
+            if not _generation_current(generation, is_current_generation):
+                log.warning(
+                    "Autoresearch generation {g} superseded before model "
+                    "creation (hypothesis {h}) — skipping (fenced)",
+                    g=generation, h=hyp_id,
+                )
+                fence_events.append(f"fenced_before_model_creation_iteration_{iteration}")
+            else:
+                cur.execute(
+                    "SELECT id FROM model_registry WHERE hypothesis_id = %s LIMIT 1",
+                    (hyp_id,),
+                )
+                if cur.fetchone() is None:
+                    try:
+                        _create_model_from_hypothesis(cur, hyp_id, hyp, layer, result)
+                        log.info("    Model created (CANDIDATE) from hypothesis {}", hyp_id)
+                    except Exception as exc:
+                        log.warning("Auto model creation failed: {e}", e=str(exc))
+                else:
+                    log.info("    CANDIDATE model already exists for hypothesis {} — skipping duplicate", hyp_id)
 
-            # Send email notification
+            # Send email notification. This is the ONE place a genuinely
+            # new PASS notifies — the reused_hyp/"PASSED" idempotent
+            # short-circuit above deliberately never reaches this branch,
+            # so a retry with the same run_id cannot double-notify.
             try:
                 from scripts.notify import notify_on_pass
                 notify_on_pass(attempt)
@@ -695,12 +1160,40 @@ def run_autoresearch(
         log.info("No valid hypotheses were generated.")
     log.info("=" * 70)
 
+    # The run-record end write is itself fenced: a worker that only became
+    # stale AFTER its last per-iteration check (e.g. the operator moved on
+    # while this call was doing its final bookkeeping) must not publish an
+    # "ok" end record — that would let a superseded run look like the
+    # authoritative outcome for run_id, even though every insert-row write
+    # is append-only and does not literally overwrite anything. "abandoned"
+    # names this precisely: the run finished its own work but the operator
+    # had already stopped waiting on it.
+    final_status = "ok"
+    if fence_events or not _generation_current(generation, is_current_generation):
+        final_status = "abandoned"
+
+    _record_research_run(
+        engine, run_id, final_status,
+        phase="complete", iteration=len(attempts), iterations=len(attempts),
+        skip_reasons=fence_events, generation=generation, code_sha=code_sha,
+        duration_s=_duration_s(),
+    )
+
     return {
+        "status": final_status,
+        # "iterations_run" is the long-standing key (read by scripts/notify.py).
+        # "iterations" is what scripts/hermes_fixers.py::maybe_run_autoresearch
+        # actually reads into state.hypotheses_tested via result.get("iterations", 0).
+        # That mismatch meant hypotheses_tested never advanced even on a fully
+        # successful run; both keys are populated here so it does.
         "iterations_run": len(attempts),
+        "iterations": len(attempts),
         "best_result": best_result,
         "best_sharpe": best_sharpe,
         "all_attempts": attempts,
         "passed": any(a.get("verdict") == "PASS" for a in attempts),
+        "run_id": run_id,
+        "fenced": bool(fence_events),
     }
 
 

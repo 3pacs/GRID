@@ -26,6 +26,54 @@ router = APIRouter(prefix="/api/v1/snapshots", tags=["snapshots"])
 _MAX_CATEGORY_LEN = 128
 
 
+# ------------------------------------------------------------------
+# Research run status (GRID W4c) — read-only surface over the
+# scripts/autoresearch.py run-state trail (category="research_run",
+# subcategory="autoresearch"; see scripts/research_status.py and
+# docs/handoffs/2026-09-18/fable-w4b-runstate.md for the record schema).
+# ------------------------------------------------------------------
+
+@router.get("/research/latest")
+def get_latest_research_run(
+    _user: dict = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return the latest autoresearch research_run event, if any.
+
+    Response shapes (never a 500, including on a missing table):
+      - A run/event exists: the record flattened to the top level —
+        ``run_id``, ``status`` (the record's OWN lifecycle status:
+        started/running/ok/failed/timeout/abandoned — not an envelope
+        sentinel), ``phase``, ``error``, ``error_category``, ``iteration``,
+        ``iterations``, ``skip_reasons``, ``failure_reasons``,
+        ``duration_s``, ``generation``, ``code_sha``, ``inputs`` (which
+        carries ``evaluation_version``) — plus ``latest_hypothesis`` (the
+        most recent ``hypothesis_registry`` outcome: id/statement/layer/
+        state/kill_reason/updated_at) when one exists. NOTE: the
+        research_run record itself does not currently link to a specific
+        hypothesis_id, so ``latest_hypothesis`` is the latest hypothesis
+        outcome independent of which run produced it, not necessarily the
+        one this run tested — see scripts/research_status.py::
+        latest_hypothesis_outcome's docstring.
+      - No research_run rows exist yet (table reachable, empty):
+        ``{"status": "no_runs"}``.
+      - The query itself failed (table missing, database unreachable):
+        ``{"status": "unavailable", "reason": "<short diagnostic>"}``.
+    """
+    from scripts.research_status import latest_hypothesis_outcome, latest_research_run_result
+
+    engine = get_db_engine()
+    result = latest_research_run_result(engine)
+
+    if result.get("status") in ("no_runs", "unavailable"):
+        return result
+
+    hypothesis = latest_hypothesis_outcome(engine)
+    if hypothesis is not None:
+        result["latest_hypothesis"] = hypothesis
+
+    return result
+
+
 @router.get("/latest/{category}")
 def get_latest_snapshots(
     category: str = Path(..., min_length=1, max_length=_MAX_CATEGORY_LEN),
