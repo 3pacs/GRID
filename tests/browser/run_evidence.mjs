@@ -190,6 +190,9 @@ function startPwaDevServer() {
                 GRID_WS_PROXY_TARGET: `ws://127.0.0.1:${FIXTURE_PORT}`,
             },
             stdio: ['ignore', 'pipe', 'pipe'],
+            // Node >= 20.12 refuses to spawn a .cmd shim without a shell (EINVAL);
+            // stopChild's taskkill /T reaps the whole shell tree on Windows.
+            shell: process.platform === 'win32',
         }
     );
     return child;
