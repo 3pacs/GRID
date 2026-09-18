@@ -69,6 +69,7 @@ class WalkForwardBacktest:
         vintage_policy: str = "FIRST_RELEASE",
         cost_bps: float = 10.0,
         predict_fn: Any = None,
+        target_feature_id: int | None = None,
     ) -> dict[str, Any]:
         """Run a full walk-forward validation.
 
@@ -82,6 +83,12 @@ class WalkForwardBacktest:
             cost_bps: Transaction cost assumption in basis points.
             predict_fn: Callable that takes a feature DataFrame and returns
                         predictions. If None, uses a simple baseline.
+            target_feature_id: Which of ``feature_ids`` is the
+                target/underlying return series to trade and score against.
+                ``None`` keeps the old implicit "lowest feature id" default
+                (logged as a warning naming the id actually used) --
+                callers should pass this explicitly rather than relying on
+                whatever the smallest id happens to be.
 
         Returns:
             dict: Comprehensive validation results suitable for storing in
@@ -137,7 +144,9 @@ class WalkForwardBacktest:
             matrix = matrix.ffill().dropna()
 
             # Compute era metrics
-            era_metric = self._compute_era_metrics(matrix, predict_fn, cost_bps)
+            era_metric = self._compute_era_metrics(
+                matrix, predict_fn, cost_bps, target_feature_id
+            )
             era_metric["era"] = i + 1
             era_metric["start"] = era_start.isoformat()
             era_metric["end"] = era_end.isoformat()
@@ -153,10 +162,12 @@ class WalkForwardBacktest:
             vintage_policy=vintage_policy,
         )
         full_matrix = full_matrix.ffill().dropna()
-        full_metrics = self._compute_era_metrics(full_matrix, predict_fn, cost_bps)
+        full_metrics = self._compute_era_metrics(
+            full_matrix, predict_fn, cost_bps, target_feature_id
+        )
 
         # Baseline comparison (buy-and-hold equivalent)
-        baseline = self._compute_baseline_metrics(full_matrix)
+        baseline = self._compute_baseline_metrics(full_matrix, target_feature_id)
 
         # Simplicity comparison
         simplicity = self._compute_simplicity_comparison(
@@ -246,16 +257,23 @@ class WalkForwardBacktest:
         matrix: pd.DataFrame,
         predict_fn: Any,
         cost_bps: float,
+        target_feature_id: int | None = None,
     ) -> dict[str, Any]:
         """Compute performance metrics for a single era.
 
         Parameters:
             matrix: Feature matrix for the era.
-            predict_fn: Callable taking the (column-sorted) feature matrix
-                and returning a position/signal per row (aligned to
-                ``matrix.index``). ``None`` falls back to a fully-invested
-                buy-and-hold baseline.
+            predict_fn: Callable taking the feature matrix (column-sorted,
+                target column removed) and returning a position/signal per
+                row (aligned to ``matrix.index``). ``None`` falls back to a
+                fully-invested buy-and-hold baseline.
             cost_bps: Cost assumption in basis points.
+            target_feature_id: Which column is the target/underlying return
+                series. ``None`` keeps the old "lowest feature id, whatever
+                it is" default (a ``log.warning`` names which one was
+                picked, since that's an arbitrary choice the caller should
+                usually override). When set, that column is both the return
+                series AND excluded from what ``predict_fn`` gets to see.
 
         Returns:
             dict: Era performance metrics.
@@ -273,10 +291,32 @@ class WalkForwardBacktest:
         if matrix.shape[1] == 0:
             return {"return": 0.0, "sharpe": 0.0, "max_drawdown": 0.0, "n_days": 0}
 
-        # The lowest-labeled column is the target/underlying return series.
-        # Picking by sorted label (not position) makes this independent of
-        # the order feature_ids were requested in.
-        target = matrix.iloc[:, 0]
+        if target_feature_id is not None:
+            if target_feature_id not in matrix.columns:
+                log.warning(
+                    "target_feature_id {t} not present in this era's "
+                    "matrix (columns={c}); nothing to score against",
+                    t=target_feature_id, c=list(matrix.columns),
+                )
+                return {"return": 0.0, "sharpe": 0.0, "max_drawdown": 0.0, "n_days": 0}
+            target_col = target_feature_id
+        else:
+            # Sorted-label default: order-independent, but still an
+            # arbitrary pick among the requested feature_ids -- name it so
+            # a caller relying on the default can see what actually got
+            # traded.
+            target_col = matrix.columns[0]
+            log.warning(
+                "No target_feature_id given; defaulting to the lowest "
+                "feature id ({t}) as the target/underlying return series",
+                t=target_col,
+            )
+
+        target = matrix[target_col]
+        # predict_fn never sees the target column -- it should not be
+        # able to read the very series it's trying to predict.
+        features = matrix.drop(columns=[target_col])
+
         target_returns = target.pct_change()
         n_total = int(len(target_returns))
         valid_returns = target_returns.dropna()
@@ -296,10 +336,19 @@ class WalkForwardBacktest:
         # prediction for a row is treated as "no position" (0), not as a
         # wrong call and not dropped from the denominator.
         if predict_fn is not None:
-            signal = pd.Series(predict_fn(matrix), index=matrix.index)
+            raw_signal = pd.Series(predict_fn(features), index=matrix.index)
         else:
-            signal = pd.Series(1.0, index=matrix.index)
-        signal = signal.reindex(valid_returns.index).astype(float).fillna(0.0)
+            raw_signal = pd.Series(1.0, index=matrix.index)
+
+        # Same-bar lookahead guard: a signal computed from row t's own
+        # features (which includes t's own already-realized return) has
+        # not been decided yet when target_returns[t] is realized -- it can
+        # only be acted on starting the NEXT bar. Shift by one period so
+        # the position decided at t earns the return from t to t+1, not
+        # the return that already happened getting to t.
+        lagged_signal = raw_signal.shift(1).reindex(valid_returns.index)
+        n_warmup = int(lagged_signal.isna().sum())
+        signal = lagged_signal.astype(float).fillna(0.0)
 
         strategy_returns = signal * valid_returns
 
@@ -326,14 +375,22 @@ class WalkForwardBacktest:
             "max_drawdown": round(max_dd, 6),
             "n_days": len(adjusted_returns),
             "n_missing": n_missing,
+            "n_warmup": n_warmup,
             "n_total": n_total,
         }
 
-    def _compute_baseline_metrics(self, matrix: pd.DataFrame) -> dict[str, Any]:
+    def _compute_baseline_metrics(
+        self,
+        matrix: pd.DataFrame,
+        target_feature_id: int | None = None,
+    ) -> dict[str, Any]:
         """Compute baseline (buy-and-hold) metrics.
 
         Parameters:
             matrix: Full period feature matrix.
+            target_feature_id: Same meaning as in ``_compute_era_metrics``.
+                The baseline has no ``predict_fn`` to hide the target from,
+                so this only picks which column to buy-and-hold.
 
         Returns:
             dict: Baseline performance metrics.
@@ -344,7 +401,24 @@ class WalkForwardBacktest:
         matrix = matrix.sort_index(axis=1)
         matrix = matrix[~matrix.index.duplicated(keep="first")]
 
-        returns = matrix.iloc[:, 0].pct_change().dropna()
+        if target_feature_id is not None:
+            if target_feature_id not in matrix.columns:
+                log.warning(
+                    "target_feature_id {t} not present in the baseline "
+                    "matrix (columns={c}); nothing to score against",
+                    t=target_feature_id, c=list(matrix.columns),
+                )
+                return {"return": 0.0, "sharpe": 0.0, "max_drawdown": 0.0}
+            target_col = target_feature_id
+        else:
+            target_col = matrix.columns[0]
+            log.warning(
+                "No target_feature_id given; defaulting to the lowest "
+                "feature id ({t}) as the baseline's buy-and-hold series",
+                t=target_col,
+            )
+
+        returns = matrix[target_col].pct_change().dropna()
         if returns.empty:
             return {"return": 0.0, "sharpe": 0.0, "max_drawdown": 0.0}
 

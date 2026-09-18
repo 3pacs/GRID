@@ -276,6 +276,95 @@ def test_fetch_pit_correct_matrix_dedupes_across_day_fetches():
 # ---------------------------------------------------------------------------
 
 
+def test_same_bar_signal_cannot_win_by_construction():
+    """A predictor that uses row t's OWN already-realized return
+    (sign(target.pct_change()) at t) must not be able to trade that same
+    return -- that would be scoring a decision on information that only
+    existed once the outcome was already known.
+
+    sign(x) * x == |x| >= 0 for every row, so the pre-fix formula
+    (`signal * valid_returns`, no shift) is *structurally* incapable of
+    losing: any nonzero move is scored as a win. That is reproduced
+    directly and asserted here (see the docstring at module level for the
+    session's separate confirmation that this was really true of the
+    pre-fix code). After the fix (signal shifted one period before it is
+    applied), this same predictor must not come out ahead.
+    """
+    bt = _bt()
+    dates = pd.DatetimeIndex([date(2024, 1, i) for i in range(1, 6)], name="obs_date")
+    matrix = pd.DataFrame({1: [100.0, 110.0, 99.0, 108.0, 97.0]}, index=dates)
+
+    def cheat_same_bar(features: pd.DataFrame) -> pd.Series:
+        # features has the target column removed; recompute what the
+        # target's own same-bar return sign would have been using the raw
+        # prices captured in this closure -- this is exactly the shape of
+        # bug a caller could introduce by deriving a signal from data that
+        # includes the current bar's own realized move.
+        target_returns = pd.Series([100.0, 110.0, 99.0, 108.0, 97.0], index=features.index).pct_change()
+        return np.sign(target_returns)
+
+    # Sanity: the raw (unshifted) same-bar formula is structurally >= 0.
+    target_returns = matrix[1].pct_change()
+    valid_returns = target_returns.dropna()
+    unshifted = np.sign(target_returns).reindex(valid_returns.index) * valid_returns
+    assert (unshifted.fillna(0) >= 0).all()
+    assert float((1 + unshifted).prod() - 1) > 0
+
+    result = bt._compute_era_metrics(matrix, cheat_same_bar, cost_bps=0.0)
+    assert result["return"] <= 0.0, (
+        "a signal derived from the bar's own already-realized return must "
+        "not be able to trade that same bar -- the engine must shift it "
+        "forward, which for this fixture guarantees a non-positive result"
+    )
+
+
+def test_genuine_next_period_predictor_may_win():
+    """Contrast case for the same-bar test: a predictor that is
+    (by construction, as an oracle in this test only) told the sign of
+    the *next* period's return is legitimately allowed to win once the
+    engine's one-period shift lines it up with the bar it actually
+    predicted.
+    """
+    bt = _bt()
+    dates = pd.DatetimeIndex([date(2024, 1, i) for i in range(1, 6)], name="obs_date")
+    prices = [100.0, 110.0, 99.0, 108.0, 97.0]
+    matrix = pd.DataFrame({1: prices}, index=dates)
+
+    def oracle_next_period(features: pd.DataFrame) -> pd.Series:
+        target_returns = pd.Series(prices, index=features.index).pct_change()
+        return np.sign(target_returns.shift(-1))
+
+    result = bt._compute_era_metrics(matrix, oracle_next_period, cost_bps=0.0)
+    assert result["return"] > 0.0
+
+
+def test_warmup_rows_are_counted_separately_not_silently_zeroed():
+    """A predict_fn with its own burn-in (NaN until enough history exists)
+    must have those NaN-signal rows tracked via n_warmup, not just
+    silently filled to 0 with no record -- and they must not corrupt the
+    n_missing/n_days accounting for genuinely scored rows.
+    """
+    bt = _bt()
+    dates = pd.DatetimeIndex([date(2024, 1, i) for i in range(1, 5)], name="obs_date")
+    matrix = pd.DataFrame({1: [100.0, 105.0, 95.0, 110.0]}, index=dates)
+
+    def needs_two_rows_of_history(features: pd.DataFrame) -> pd.Series:
+        s = pd.Series(np.nan, index=features.index)
+        s.iloc[2:] = 1.0
+        return s
+
+    result = bt._compute_era_metrics(matrix, needs_two_rows_of_history, cost_bps=0.0)
+
+    assert result["n_total"] == 4
+    assert result["n_missing"] == 1  # row 0: pct_change() has no prior value
+    assert result["n_warmup"] == 2  # rows 1, 2: shifted signal still undefined
+    assert result["n_days"] == 3  # rows 1, 2, 3 all have a defined target return
+    # Only row 3 (signal shifted from row 2's defined 1.0) actually traded;
+    # rows 1 and 2 contributed a flat (zero-position) day, not a guess.
+    r3 = (110.0 - 95.0) / 95.0
+    assert result["return"] == pytest.approx(r3, abs=1e-5)
+
+
 def test_no_move_and_missing_rows_are_counted_explicitly():
     bt = _bt()
     dates = pd.DatetimeIndex(
@@ -300,3 +389,62 @@ def test_no_move_and_missing_rows_are_counted_explicitly():
     # The no-move day contributed a factor of (1+0)=1, not "wrong"/dropped:
     # compounding [0.0, 0.05] gives exactly 5%.
     assert result["return"] == pytest.approx(0.05)
+
+
+# ---------------------------------------------------------------------------
+# explicit target_feature_id: no longer "whatever the smallest id is"
+# ---------------------------------------------------------------------------
+
+
+def test_target_feature_id_is_hidden_from_predict_fn():
+    bt = _bt()
+    dates = pd.DatetimeIndex([date(2024, 1, 1), date(2024, 1, 2)], name="obs_date")
+    matrix = pd.DataFrame({1: [50.0, 49.0], 2: [100.0, 110.0]}, index=dates)
+
+    seen_columns: list[list[int]] = []
+
+    def spy_predict_fn(features: pd.DataFrame) -> pd.Series:
+        seen_columns.append(list(features.columns))
+        return pd.Series(1.0, index=features.index)
+
+    bt._compute_era_metrics(matrix, spy_predict_fn, cost_bps=0.0, target_feature_id=2)
+
+    assert seen_columns, "predict_fn was never called"
+    assert 2 not in seen_columns[0], "predict_fn must not see the target column"
+    assert seen_columns[0] == [1]
+
+
+def test_target_feature_id_result_is_column_order_invariant():
+    bt = _bt()
+    dates = pd.DatetimeIndex(
+        [date(2024, 1, 1), date(2024, 1, 2), date(2024, 1, 3)], name="obs_date"
+    )
+    data = {10: [100.0, 105.0, 103.0], 20: [50.0, 49.0, 51.0], 30: [1.0, 1.0, 1.0]}
+
+    ordered = pd.DataFrame(data, index=dates)[[10, 20, 30]]
+    permuted = pd.DataFrame(data, index=dates)[[30, 10, 20]]
+
+    result_ordered = bt._compute_era_metrics(
+        ordered, None, cost_bps=10.0, target_feature_id=20
+    )
+    result_permuted = bt._compute_era_metrics(
+        permuted, None, cost_bps=10.0, target_feature_id=20
+    )
+
+    assert result_ordered == result_permuted
+    # And it must actually be trading column 20, not the sorted-first (10).
+    default_result = bt._compute_era_metrics(ordered, None, cost_bps=10.0)
+    assert result_ordered != default_result
+
+
+def test_target_feature_id_missing_from_matrix_is_handled_explicitly():
+    bt = _bt()
+    dates = pd.DatetimeIndex([date(2024, 1, 1), date(2024, 1, 2)], name="obs_date")
+    matrix = pd.DataFrame({1: [100.0, 110.0]}, index=dates)
+
+    result = bt._compute_era_metrics(matrix, None, cost_bps=0.0, target_feature_id=999)
+    assert result["return"] == 0.0
+    assert result["n_days"] == 0
+
+    baseline_result = bt._compute_baseline_metrics(matrix, target_feature_id=999)
+    assert baseline_result["return"] == 0.0
