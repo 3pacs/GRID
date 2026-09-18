@@ -31,6 +31,22 @@ class JournalEntryCreate(BaseModel):
             raise ValueError("Must be LOW, MEDIUM, HIGH, or UNSCORED")
         return v
 
+    @field_validator("state_confidence")
+    @classmethod
+    def validate_state_confidence(cls, v: float | None) -> float | None:
+        # None is the explicit UNSCORED state (requires a reason, below). A
+        # number must be a finite probability; the boundary rejects the rest
+        # so the journal's CHECK and the writer never see it.
+        if v is None:
+            return v
+        import math
+
+        if math.isnan(v) or math.isinf(v):
+            raise ValueError("state_confidence must be a finite number or null")
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("state_confidence must be between 0 and 1 (or null with a reason)")
+        return v
+
     @model_validator(mode="after")
     def unscored_requires_reason(self) -> "JournalEntryCreate":
         if self.state_confidence is None and not (
