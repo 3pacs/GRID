@@ -120,6 +120,7 @@ def create(
             model_version_id=body.model_version_id,
             inferred_state=body.inferred_state,
             state_confidence=body.state_confidence,
+            confidence_reason=body.confidence_reason,
             transition_probability=body.transition_probability,
             contradiction_flags=body.contradiction_flags,
             grid_recommendation=body.grid_recommendation,
