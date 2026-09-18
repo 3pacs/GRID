@@ -30,14 +30,28 @@ same as any other. This revision extends the trigger to also refuse changes
 to ``confidence_reason`` — the reason is part of the permanent record, not an
 annotation.
 
-Downgrade is DELIBERATELY ONE-WAY on nullability
-------------------------------------------------
-``confidence_reason`` is dropped, and with it the reason text for every
-unscored row — that data cannot be reconstructed. ``NOT NULL`` is only
-restored when the table holds no NULL ``state_confidence``; if unscored rows
-exist, restoring it would require either deleting append-only rows or
-inventing a number, and both are worse than leaving the column nullable. In
-that case the column stays nullable and the migration logs why.
+``operator_confidence`` gains a fourth category, ``UNSCORED``, so a ticket
+with no measured confidence is not filed under ``LOW`` (a chosen category
+dressed up as an assessment). The three existing categories are unchanged.
+
+Downgrade is DELIBERATELY ONE-WAY whenever unscored rows exist
+--------------------------------------------------------------
+The journal is append-only, so a downgrade may never delete rows, rewrite
+a confidence, or discard the reason that explains a NULL. Therefore:
+
+* if the table holds NO unscored row, the downgrade is complete: the CHECK
+  and the reason column go, the trigger body reverts, ``NOT NULL`` and the
+  three-value ``operator_confidence`` CHECK are restored;
+* if unscored rows exist, the downgrade removes only the partial index and
+  leaves ``state_confidence`` nullable, ``confidence_reason`` in place
+  (with its CHECK and trigger clause) and the four-value
+  ``operator_confidence`` CHECK, and logs why. The previous application
+  version is unaffected by the extra column: its INSERT names its columns
+  explicitly and always supplies a number, and the readers that would have
+  crashed on a NULL are the ones this PR fixes (rolling back the app alone
+  with unscored rows present is documented as unsafe in the PR).
+
+No statement in this revision ever UPDATEs ``decision_journal``.
 """
 
 import logging
@@ -57,6 +71,27 @@ depends_on: str | Sequence[str] | None = None
 log = logging.getLogger("alembic.runtime.migration")
 
 CK_UNSCORED = "ck_decision_journal_unscored_has_reason"
+CK_OPERATOR = "ck_decision_journal_operator_confidence"
+
+# Drop whatever CHECK currently constrains operator_confidence, whatever it is
+# called (schema.sql creates it inline, so PostgreSQL named it
+# decision_journal_operator_confidence_check; an alembic-built database may
+# differ). Matches on the constraint definition, not the name.
+_DROP_OPERATOR_CHECK = """
+DO $$
+DECLARE c record;
+BEGIN
+    FOR c IN
+        SELECT conname
+        FROM pg_constraint
+        WHERE conrelid = 'decision_journal'::regclass
+          AND contype = 'c'
+          AND pg_get_constraintdef(oid) ILIKE '%operator_confidence%IN%'
+    LOOP
+        EXECUTE format('ALTER TABLE decision_journal DROP CONSTRAINT %I', c.conname);
+    END LOOP;
+END $$;
+"""
 
 
 _TRIGGER_FN_WITH_REASON = """
@@ -125,28 +160,11 @@ def upgrade() -> None:
         "ALTER TABLE decision_journal ALTER COLUMN state_confidence DROP NOT NULL"
     )
 
-    # Re-upgrading after a downgrade: the downgrade drops confidence_reason
-    # (destroying the text) but deliberately leaves the NULL confidences in
-    # place, because deleting append-only rows is worse. Those rows come back
-    # here as NULL/NULL and would fail the CHECK below, so the migration would
-    # refuse to re-apply. Verified against PostgreSQL 14 on 2026-09-18: without
-    # this backfill, `upgrade head` after `downgrade` raises
-    #   CheckViolation: ck_decision_journal_unscored_has_reason is violated
-    #
-    # The backfill states a fact about the record's provenance. It does NOT
-    # invent a confidence: state_confidence stays NULL. It touches only rows
-    # that are already unscored AND already have no reason, and it runs before
-    # the trigger below starts guarding confidence_reason.
-    op.execute(
-        "UPDATE decision_journal "
-        "SET confidence_reason = 'unscored: reason text unavailable - it was "
-        "dropped by a downgrade of journal_unscored_conf_0918 and cannot be "
-        "reconstructed. The confidence itself was never measured.' "
-        "WHERE state_confidence IS NULL AND confidence_reason IS NULL"
-    )
-
     # An unscored row must say why it is unscored. Without this, dropping
     # NOT NULL would simply re-open the door to a silent, unexplained NULL.
+    # (No backfill is needed before adding it: the downgrade never drops
+    # confidence_reason while unscored rows exist, so there is no way to
+    # arrive here with a NULL/NULL row.)
     op.execute(
         f"ALTER TABLE decision_journal DROP CONSTRAINT IF EXISTS {CK_UNSCORED}"
     )
@@ -154,6 +172,14 @@ def upgrade() -> None:
         f"ALTER TABLE decision_journal ADD CONSTRAINT {CK_UNSCORED} "
         "CHECK (state_confidence IS NOT NULL OR confidence_reason IS NOT NULL)"
     )
+
+    # operator_confidence: LOW / MEDIUM / HIGH / UNSCORED.
+    op.execute(_DROP_OPERATOR_CHECK)
+    op.execute(
+        f"ALTER TABLE decision_journal ADD CONSTRAINT {CK_OPERATOR} "
+        "CHECK (operator_confidence IN ('LOW', 'MEDIUM', 'HIGH', 'UNSCORED'))"
+    )
+
     op.execute(
         "COMMENT ON COLUMN decision_journal.state_confidence IS "
         "'Measured confidence in the inferred state, 0-1. NULL means UNSCORED: "
@@ -189,33 +215,41 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.execute("DROP INDEX IF EXISTS idx_decision_journal_unscored")
+
+    conn = op.get_bind()
+    unscored = conn.exec_driver_sql(
+        "SELECT count(*) FROM decision_journal "
+        "WHERE state_confidence IS NULL OR operator_confidence = 'UNSCORED'"
+    ).scalar()
+    if unscored:
+        # One-way by design. See the module docstring: nothing may be
+        # deleted, rewritten or left unexplained, so the nullable column, its
+        # reason, the CHECKs and the trigger clause all stay.
+        log.warning(
+            "journal_unscored_conf_0918 downgrade left decision_journal's "
+            "unscored support in place: %s unscored row(s) exist. "
+            "state_confidence stays NULLABLE, confidence_reason and its "
+            "CHECK stay, operator_confidence keeps 'UNSCORED'. Restoring "
+            "the old shape would require deleting append-only rows or "
+            "inventing a confidence.",
+            unscored,
+        )
+        return
+
     op.execute(
         f"ALTER TABLE decision_journal DROP CONSTRAINT IF EXISTS {CK_UNSCORED}"
     )
-
     # Restore the trigger body FIRST: it must stop referencing
     # confidence_reason before that column disappears.
     op.execute(_TRIGGER_FN_WITHOUT_REASON)
     op.execute(
         "ALTER TABLE decision_journal DROP COLUMN IF EXISTS confidence_reason"
     )
-
-    # Guarded, one-way-by-design: only re-impose NOT NULL when nothing would
-    # have to be deleted or invented to satisfy it.
-    conn = op.get_bind()
-    unscored = conn.exec_driver_sql(
-        "SELECT count(*) FROM decision_journal WHERE state_confidence IS NULL"
-    ).scalar()
-    if unscored:
-        log.warning(
-            "decision_journal.state_confidence left NULLABLE on downgrade: "
-            "%s unscored row(s) exist. Restoring NOT NULL would require "
-            "deleting append-only rows or inventing a confidence. The "
-            "reason text for those rows was dropped with confidence_reason "
-            "and cannot be recovered.",
-            unscored,
-        )
-    else:
-        op.execute(
-            "ALTER TABLE decision_journal ALTER COLUMN state_confidence SET NOT NULL"
-        )
+    op.execute(
+        "ALTER TABLE decision_journal ALTER COLUMN state_confidence SET NOT NULL"
+    )
+    op.execute(_DROP_OPERATOR_CHECK)
+    op.execute(
+        f"ALTER TABLE decision_journal ADD CONSTRAINT {CK_OPERATOR} "
+        "CHECK (operator_confidence IN ('LOW', 'MEDIUM', 'HIGH'))"
+    )

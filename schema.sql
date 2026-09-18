@@ -285,8 +285,11 @@ CREATE TABLE IF NOT EXISTS decision_journal (
     baseline_recommendation TEXT NOT NULL,
     action_taken            TEXT NOT NULL,
     counterfactual          TEXT NOT NULL,
-    operator_confidence     TEXT NOT NULL CHECK (operator_confidence IN (
-                                'LOW', 'MEDIUM', 'HIGH')),
+    -- UNSCORED: the decision carries no measured confidence at all
+    -- (state_confidence IS NULL); it is not filed under LOW.
+    operator_confidence     TEXT NOT NULL CONSTRAINT ck_decision_journal_operator_confidence
+                                CHECK (operator_confidence IN (
+                                'LOW', 'MEDIUM', 'HIGH', 'UNSCORED')),
     outcome_value           DOUBLE PRECISION,
     outcome_recorded_at     TIMESTAMPTZ,
     verdict                 TEXT CHECK (verdict IN (

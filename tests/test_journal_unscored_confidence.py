@@ -433,8 +433,8 @@ class TestContagionTicketWritesTheUnscoredRecord:
         assert "unscored" in reason
         assert ctt.CONFIDENCE_BASIS_NO_HISTORY in reason
         assert "n=0" in reason
-        # And absolutely no invented number anywhere near it.
-        assert captured["operator_confidence"] == "LOW"
+        # And absolutely no invented number or assessment anywhere near it.
+        assert captured["operator_confidence"] == "UNSCORED"
 
     def test_scored_ticket_still_clamps_and_journals_a_number(self, monkeypatch):
         from trading import contagion_to_ticket as ctt
@@ -471,3 +471,61 @@ class TestContagionTicketWritesTheUnscoredRecord:
         assert ctt.write_ticket_to_journal(MagicMock(), ticket) == 7
         assert captured["state_confidence"] == 1.0  # clamp preserved
         assert captured["operator_confidence"] == "HIGH"
+
+
+
+class TestUnscoredOperatorCategory:
+    def test_log_decision_accepts_unscored_category(self, journal, mock_engine):
+        conn = mock_engine.begin.return_value.__enter__.return_value
+        conn.execute.return_value.fetchone.return_value = (5,)
+        journal.log_decision(
+            model_version_id=1,
+            inferred_state="supply_disruption",
+            state_confidence=None,
+            confidence_reason="unscored: no backtest history (n=0)",
+            transition_probability=0.1,
+            contradiction_flags={},
+            grid_recommendation="HOLD",
+            baseline_recommendation="HOLD",
+            action_taken="HOLD",
+            counterfactual="",
+            operator_confidence="UNSCORED",
+        )
+        params = conn.execute.call_args[0][1]
+        assert params["oc"] == "UNSCORED"
+        assert params["sc"] is None
+
+    def test_api_schema_accepts_unscored_category(self):
+        from api.schemas.journal import JournalEntryCreate
+
+        entry = JournalEntryCreate(
+            model_version_id=1,
+            inferred_state="x",
+            state_confidence=None,
+            confidence_reason="unscored: no history",
+            transition_probability=0.0,
+            grid_recommendation="HOLD",
+            baseline_recommendation="HOLD",
+            action_taken="HOLD",
+            counterfactual="",
+            operator_confidence="UNSCORED",
+        )
+        assert entry.operator_confidence == "UNSCORED"
+
+    def test_schema_sql_and_migration_agree_on_the_four_categories(self):
+        import re
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[1]
+        schema = (root / "schema.sql").read_text(encoding="utf-8")
+        mig = (
+            root / "migrations" / "versions" / "journal_unscored_confidence_0918.py"
+        ).read_text(encoding="utf-8")
+        want = "'LOW', 'MEDIUM', 'HIGH', 'UNSCORED'"
+        assert want in re.sub(r"\s+", " ", schema)
+        assert want in mig
+        # The downgrade never UPDATEs or DELETEs the journal; the upgrade
+        # never UPDATEs it either.
+        body = mig[mig.index("def upgrade"):]
+        assert "UPDATE decision_journal" not in body
+        assert "DELETE FROM decision_journal" not in body
