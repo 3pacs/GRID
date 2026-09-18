@@ -6,22 +6,22 @@ Source: reads the raw FRED series ``WALCL``, ``WTREGEN``, ``RRPONTSYD``
 directly from ``raw_series`` (as written by ``ingestion/fred.py`` -- read
 only, not modified). Does NOT read
 ``ingestion/altdata/fed_liquidity.py``'s ``COMPUTED:fed_net_liquidity``
-series: that module subtracts RRPONTSYD from WALCL/WTREGEN with no unit
-conversion despite FRED publishing them in different units (confirmed via
-WebFetch 2026-09-18):
-
-* WALCL   -- "Millions of U.S. Dollars, Not Seasonally Adjusted"
-             (https://fred.stlouisfed.org/series/WALCL)
-* WTREGEN -- "Millions of U.S. Dollars, Not Seasonally Adjusted"
-             (https://fred.stlouisfed.org/series/WTREGEN)
-* RRPONTSYD -- "Billions of US Dollars, Not Seasonally Adjusted"
-             (https://fred.stlouisfed.org/series/RRPONTSYD)
-
-That is a ~1000x scale bug on the RRPONTSYD term (flagged separately as
-its own follow-up; not this lane's file to fix). This module computes net
-liquidity itself, in millions USD (matching the tracked
-``fed_net_liquidity_daily.net_liquidity_usd_m`` column), converting
-RRPONTSYD with ``RRP_BILLIONS_TO_MILLIONS`` explicitly.
+series -- that module's own materialized PIT-free number has no
+per-component provenance/generation tracking, which this pillar needs and
+that one doesn't carry. This pillar computes net liquidity itself, with
+its own PIT/generation semantics, but for the UNIT CONVERSION specifically
+imports ``normalize_to_millions`` / ``FRED_SERIES_UNIT_QUOTES`` /
+``UNIT_SCALE_TO_MILLIONS`` from ``ingestion.altdata.fed_liquidity`` --
+that module is the single source of truth for "what unit is series X
+stored in, and what's the documented scale factor to millions USD" (fixed
+2026-09-18, see its own module docstring for the cited FRED-page quotes:
+WALCL/WTREGEN are millions USD, RRPONTSYD is billions USD). Before that
+fix, ``ingestion/altdata/fed_liquidity.py`` combined RRPONTSYD (billions)
+with WALCL/WTREGEN (millions) with no conversion at all -- a ~1000x scale
+bug on the RRPONTSYD term; this pillar never had that bug (it always did
+its own conversion), but importing the shared constants now means the two
+paths use the exact same scale factor instead of two independently
+maintained copies that could drift apart again.
 
 Release schedule: WALCL and WTREGEN are both FRED "Weekly, (ending/as of)
 Wednesday" series (confirmed via WebFetch 2026-09-18), published via the
@@ -70,6 +70,10 @@ from godview.generations import (
     new_generation_id,
     record_generation,
 )
+from ingestion.altdata.fed_liquidity import (
+    UNIT_SCALE_TO_MILLIONS,
+    normalize_to_millions,
+)
 from store.availability import measured_or_none
 
 PILLAR_NAME = "fed_net_liquidity"
@@ -79,8 +83,11 @@ WTREGEN_SERIES_ID = "WTREGEN"
 RRP_SERIES_ID = "RRPONTSYD"
 
 #: Confirmed 2026-09-18 via FRED's own series pages (see module docstring).
+#: The conversion itself (normalize_to_millions) is imported above from
+#: ingestion.altdata.fed_liquidity -- the single source of truth -- rather
+#: than duplicated here.
 UNIT = "millions_usd"
-RRP_BILLIONS_TO_MILLIONS = 1000.0
+RRP_BILLIONS_TO_MILLIONS = UNIT_SCALE_TO_MILLIONS["billions_usd"]
 
 #: H.4.1 publication lag: Wednesday obs_date -> Thursday release (1 day).
 FED_RELEASE_LAG_DAYS = 1
@@ -126,10 +133,23 @@ def compute_release_date(obs_date: date) -> tuple[date | None, str]:
 
 
 def compute_net_liquidity_millions(
-    walcl_millions: float, wtregen_millions: float, rrp_billions: float
-) -> float:
-    """Net Liquidity = WALCL - WTREGEN - RRPONTSYD, all converted to millions USD."""
-    return walcl_millions - wtregen_millions - (rrp_billions * RRP_BILLIONS_TO_MILLIONS)
+    walcl_raw: float, wtregen_raw: float, rrp_raw: float
+) -> float | None:
+    """Net Liquidity = WALCL - WTREGEN - RRPONTSYD, each normalised to millions USD.
+
+    Each argument is the RAW value as stored in raw_series (WALCL/WTREGEN in
+    their native millions USD, RRPONTSYD in its native billions USD) --
+    normalisation happens here via ``normalize_to_millions``
+    (``ingestion.altdata.fed_liquidity``'s single source of truth), not by
+    the caller pre-scaling anything. Returns ``None`` -- never a fabricated
+    number -- if any component's unit is unknown to that shared table.
+    """
+    w_m = normalize_to_millions(WALCL_SERIES_ID, walcl_raw)
+    t_m = normalize_to_millions(WTREGEN_SERIES_ID, wtregen_raw)
+    r_m = normalize_to_millions(RRP_SERIES_ID, rrp_raw)
+    if w_m is None or t_m is None or r_m is None:
+        return None
+    return w_m - t_m - r_m
 
 
 def compute_rrp_pct_of_peak(rrp_millions_history: Sequence[float], window: int = PEAK_WINDOW_WEEKS) -> float | None:
@@ -292,9 +312,15 @@ def materialize_fed_liquidity_pillar(engine: Engine, *, as_of: date | None = Non
                     continue  # missing component -> this obs_date stays unavailable, not fabricated
 
                 net_liquidity_m = compute_net_liquidity_millions(walcl, wtregen, rrp)
+                if net_liquidity_m is None:
+                    continue  # unknown unit for a component -- no fallback, no row
+
+                rrp_m = normalize_to_millions(RRP_SERIES_ID, rrp)
+                if rrp_m is None:
+                    continue  # same guard, belt-and-suspenders with the check above
 
                 prior_net_liq, prior_rrp_m = _existing_net_liquidity_history(conn, obs_date)
-                rrp_m_history = [v for _, v in prior_rrp_m] + [rrp * RRP_BILLIONS_TO_MILLIONS]
+                rrp_m_history = [v for _, v in prior_rrp_m] + [rrp_m]
                 rrp_pct_of_peak = compute_rrp_pct_of_peak(rrp_m_history)
                 coverage = coverage_fraction_for_window(len(rrp_m_history))
 

@@ -23,11 +23,35 @@ Already pulled by fred.py (reused here from raw_series):
 - WTREGEN — TGA balance (weekly)
 
 Derived features stored as COMPUTED:* series:
-- fed_net_liquidity = WALCL - WTREGEN - RRPONTSYD
-- fed_net_liquidity_change_1w = week-over-week change
-- fed_net_liquidity_change_1m = month-over-month change
-- reverse_repo_pct_of_peak = current RRP / max(RRP history)
+- fed_net_liquidity = WALCL - WTREGEN - RRPONTSYD, all normalised to millions
+  USD first (see "Units" below) -- fixed 2026-09-18. Before that fix this
+  subtraction combined WALCL/WTREGEN (millions) with RRPONTSYD (billions)
+  with no conversion, making the RRPONTSYD term ~1000x too small relative
+  to the other two whenever reverse-repo usage was a meaningful fraction of
+  the total (see tests/test_fed_liquidity_units.py's regression test for
+  the magnitude on a constructed fixture).
+- fed_net_liquidity_change_1w = week-over-week change (millions USD)
+- fed_net_liquidity_change_1m = month-over-month change (millions USD)
+- reverse_repo_pct_of_peak = current RRP / max(RRP history) -- skipped
+  entirely (never a fabricated ratio) when there is no RRP history at all
+  or the historical peak is exactly 0
 - tga_drawdown = 30-day change in TGA (negative = spending = liquidity injection)
+
+Units (confirmed via each series' own FRED page, fetched 2026-09-18 -- never
+assumed from a comment or a series name):
+
+    WALCL     -- "Millions of U.S. Dollars, Not Seasonally Adjusted"
+                 https://fred.stlouisfed.org/series/WALCL
+    WTREGEN   -- "Millions of U.S. Dollars, Not Seasonally Adjusted"
+                 https://fred.stlouisfed.org/series/WTREGEN
+    RRPONTSYD -- "Billions of US Dollars, Not Seasonally Adjusted"
+                 https://fred.stlouisfed.org/series/RRPONTSYD
+
+``FRED_SERIES_UNIT_QUOTES`` and ``normalize_to_millions()`` below are the
+SINGLE source of truth for this conversion -- ``godview/fed_liquidity_pillar.py``
+(the God View Fed net liquidity pillar) imports them from here rather than
+maintaining its own copy of the scale factor, so the two paths can never
+silently disagree again.
 """
 
 from __future__ import annotations
@@ -42,6 +66,119 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, retry_on_failure
+
+# ---------------------------------------------------------------------------
+# Units -- see module docstring's "Units" section for the cited quotes.
+# ---------------------------------------------------------------------------
+
+#: series_id -> (unit_key, "quote (source URL)"). This table -- not a
+#: comment, not the series name, not an assumption -- is what every
+#: conversion in this module (and godview/fed_liquidity_pillar.py) looks up.
+#: Add a series here ONLY after confirming its unit on FRED's own page.
+FRED_SERIES_UNIT_QUOTES: dict[str, tuple[str, str]] = {
+    "WALCL": (
+        "millions_usd",
+        '"Millions of U.S. Dollars, Not Seasonally Adjusted" '
+        "(https://fred.stlouisfed.org/series/WALCL)",
+    ),
+    "WTREGEN": (
+        "millions_usd",
+        '"Millions of U.S. Dollars, Not Seasonally Adjusted" '
+        "(https://fred.stlouisfed.org/series/WTREGEN)",
+    ),
+    "RRPONTSYD": (
+        "billions_usd",
+        '"Billions of US Dollars, Not Seasonally Adjusted" '
+        "(https://fred.stlouisfed.org/series/RRPONTSYD)",
+    ),
+}
+
+#: Explicit, documented scale factor to convert a confirmed unit to millions
+#: USD. Never applied as a bare magic multiplier -- always looked up here,
+#: keyed by the series' own confirmed unit (via FRED_SERIES_UNIT_QUOTES),
+#: never guessed from the series id or hand-picked per call site.
+UNIT_SCALE_TO_MILLIONS: dict[str, float] = {
+    "millions_usd": 1.0,
+    "billions_usd": 1000.0,
+}
+
+
+def series_unit(series_id: str) -> str | None:
+    """The confirmed FRED unit key for ``series_id``, or ``None`` if unknown.
+
+    ``None`` means "not in FRED_SERIES_UNIT_QUOTES" -- add the series there
+    (with a cited quote) before relying on this, never guess.
+    """
+    entry = FRED_SERIES_UNIT_QUOTES.get(series_id)
+    return entry[0] if entry else None
+
+
+def normalize_to_millions(series_id: str, value: float | None) -> float | None:
+    """Convert ``value`` (in ``series_id``'s own confirmed FRED unit) to millions USD.
+
+    Returns ``None`` -- never a fabricated number -- when ``value`` is
+    ``None``, or ``series_id``'s unit is not in ``FRED_SERIES_UNIT_QUOTES``
+    (unknown unit), or that unit has no entry in ``UNIT_SCALE_TO_MILLIONS``.
+    Callers must treat ``None`` as "do not write a value for this
+    observation," not as zero.
+    """
+    if value is None:
+        return None
+    unit = series_unit(series_id)
+    if unit is None:
+        return None
+    scale = UNIT_SCALE_TO_MILLIONS.get(unit)
+    if scale is None:
+        return None
+    return value * scale
+
+
+def build_net_liquidity_series(
+    walcl: dict[date, float],
+    wtregen: dict[date, float],
+    rrp: dict[date, float],
+) -> dict[date, float]:
+    """Forward-filled, UNIT-NORMALISED net liquidity series (millions USD).
+
+    Pure function (no I/O) so it can be unit-tested directly against
+    constructed fixtures -- ``_compute_derived`` below is the only caller
+    that also touches the database.
+
+    For each date where all three components have at least one prior
+    observation (forward-filled to handle the weekly/daily frequency
+    mismatch between WALCL/WTREGEN and RRPONTSYD), converts each to
+    millions USD via ``normalize_to_millions`` and combines them. A date is
+    silently omitted -- never assigned a fabricated value -- if any
+    component's normalisation returns ``None`` (unknown unit) or hasn't
+    appeared yet.
+    """
+    all_dates = sorted(set(walcl.keys()) | set(wtregen.keys()) | set(rrp.keys()))
+
+    net_liq: dict[date, float] = {}
+    last_w: float | None = None
+    last_t: float | None = None
+    last_r: float | None = None
+    for d in all_dates:
+        if d in walcl:
+            last_w = walcl[d]
+        if d in wtregen:
+            last_t = wtregen[d]
+        if d in rrp:
+            last_r = rrp[d]
+
+        if last_w is None or last_t is None or last_r is None:
+            continue
+
+        w_m = normalize_to_millions("WALCL", last_w)
+        t_m = normalize_to_millions("WTREGEN", last_t)
+        r_m = normalize_to_millions("RRPONTSYD", last_r)
+        if w_m is None or t_m is None or r_m is None:
+            # Unknown unit for a component -- no fallback, no value written.
+            continue
+
+        net_liq[d] = w_m - t_m - r_m
+
+    return net_liq
 
 # FRED series this puller is responsible for fetching directly.
 # WALCL and WTREGEN are already in fred.py's FRED_SERIES_LIST,
@@ -391,34 +528,26 @@ class FedLiquidityPuller(BasePuller):
         wtregen = self._load_series_from_db("WTREGEN", lookback_start, end_date)
         rrp = self._load_series_from_db("RRPONTSYD", lookback_start, end_date)
 
-        if not walcl or not wtregen or not rrp:
+        missing_components = [
+            name
+            for name, series in (("WALCL", walcl), ("WTREGEN", wtregen), ("RRPONTSYD", rrp))
+            if not series
+        ]
+        if missing_components:
             log.warning(
                 "FedLiquidity: missing raw data for derived features "
-                "(WALCL={w}, WTREGEN={t}, RRPONTSYD={r} rows)",
+                "(WALCL={w}, WTREGEN={t}, RRPONTSYD={r} rows) -- "
+                "fed_net_liquidity will not be written for this run, no fallback value",
                 w=len(walcl),
                 t=len(wtregen),
                 r=len(rrp),
             )
 
-        # Build aligned net liquidity series using forward-fill for
-        # weekly/daily frequency mismatch
-        all_dates = sorted(
-            set(walcl.keys()) | set(wtregen.keys()) | set(rrp.keys())
-        )
-
-        # Forward-fill: carry last known value for each component
-        net_liq: dict[date, float] = {}
-        last_w, last_t, last_r = None, None, None
-        for d in all_dates:
-            if d in walcl:
-                last_w = walcl[d]
-            if d in wtregen:
-                last_t = wtregen[d]
-            if d in rrp:
-                last_r = rrp[d]
-
-            if last_w is not None and last_t is not None and last_r is not None:
-                net_liq[d] = last_w - last_t - last_r
+        # Unit-normalised (millions USD), forward-filled net liquidity series
+        # -- see build_net_liquidity_series's docstring. No fallback: a date
+        # is omitted, never assigned a fabricated value, if normalisation
+        # fails for any component.
+        net_liq = build_net_liquidity_series(walcl, wtregen, rrp)
 
         # Convert to sorted list for temporal lookups
         net_liq_dates = sorted(net_liq.keys())
@@ -440,14 +569,23 @@ class FedLiquidityPuller(BasePuller):
                             "walcl": walcl.get(d),
                             "wtregen": wtregen.get(d),
                             "rrpontsyd": rrp.get(d),
+                            "unit": "millions_usd",
                         },
                     )
                     nl_rows += 1
-            results.append({
-                "feature": "COMPUTED:fed_net_liquidity",
-                "status": "SUCCESS",
-                "rows_inserted": nl_rows,
-            })
+            if nl_rows == 0 and missing_components:
+                results.append({
+                    "feature": "COMPUTED:fed_net_liquidity",
+                    "status": "FAILED",
+                    "rows_inserted": 0,
+                    "error": f"missing component(s): {', '.join(missing_components)}; no fallback constant",
+                })
+            else:
+                results.append({
+                    "feature": "COMPUTED:fed_net_liquidity",
+                    "status": "SUCCESS",
+                    "rows_inserted": nl_rows,
+                })
 
             # ── COMPUTED:fed_net_liquidity_change_1w ───────────────────────
             chg_1w_rows = 0
@@ -470,7 +608,7 @@ class FedLiquidityPuller(BasePuller):
                             series_id=sid,
                             obs_date=d,
                             value=chg,
-                            raw_payload={"current": net_liq[d], "prev_1w": prev_val},
+                            raw_payload={"current": net_liq[d], "prev_1w": prev_val, "unit": "millions_usd"},
                         )
                         chg_1w_rows += 1
             results.append({
@@ -499,7 +637,7 @@ class FedLiquidityPuller(BasePuller):
                             series_id=sid,
                             obs_date=d,
                             value=chg,
-                            raw_payload={"current": net_liq[d], "prev_1m": prev_val},
+                            raw_payload={"current": net_liq[d], "prev_1m": prev_val, "unit": "millions_usd"},
                         )
                         chg_1m_rows += 1
             results.append({
@@ -509,34 +647,61 @@ class FedLiquidityPuller(BasePuller):
             })
 
             # ── COMPUTED:reverse_repo_pct_of_peak ──────────────────────────
-            # Use ALL historical RRP data for peak calculation
+            # Use ALL historical RRP data for peak calculation. No fallback
+            # constant: a peak of 1.0 when there is no history, or when the
+            # peak is genuinely 0, would fabricate a ratio against a number
+            # that isn't RRPONTSYD's actual peak -- skip the feature instead
+            # (deleted fallback constants: `... if all_rrp else 1.0` and
+            # `if rrp_peak == 0: rrp_peak = 1.0`).
             all_rrp = self._load_series_from_db(
                 "RRPONTSYD", date(2000, 1, 1), end_date
             )
-            rrp_peak = max(all_rrp.values()) if all_rrp else 1.0
-            if rrp_peak == 0:
-                rrp_peak = 1.0
+            rrp_peak = max(all_rrp.values()) if all_rrp else None
 
-            rrp_pct_rows = 0
-            for d, val in sorted(rrp.items()):
-                if d < start_date:
-                    continue
-                pct = val / rrp_peak
-                sid = "COMPUTED:reverse_repo_pct_of_peak"
-                if not self._row_exists(sid, d, conn):
-                    self._insert_raw(
-                        conn=conn,
-                        series_id=sid,
-                        obs_date=d,
-                        value=pct,
-                        raw_payload={"rrp": val, "peak": rrp_peak},
-                    )
-                    rrp_pct_rows += 1
-            results.append({
-                "feature": "COMPUTED:reverse_repo_pct_of_peak",
-                "status": "SUCCESS",
-                "rows_inserted": rrp_pct_rows,
-            })
+            if rrp_peak is None:
+                log.warning(
+                    "FedLiquidity: no historical RRPONTSYD data -- "
+                    "reverse_repo_pct_of_peak skipped, no fallback constant"
+                )
+                results.append({
+                    "feature": "COMPUTED:reverse_repo_pct_of_peak",
+                    "status": "FAILED",
+                    "rows_inserted": 0,
+                    "error": "no RRPONTSYD history; no fallback constant",
+                })
+            elif rrp_peak == 0:
+                log.warning(
+                    "FedLiquidity: RRPONTSYD peak is 0 -- "
+                    "reverse_repo_pct_of_peak skipped (would divide by zero), "
+                    "no fallback constant"
+                )
+                results.append({
+                    "feature": "COMPUTED:reverse_repo_pct_of_peak",
+                    "status": "FAILED",
+                    "rows_inserted": 0,
+                    "error": "RRPONTSYD peak is 0; no fallback constant",
+                })
+            else:
+                rrp_pct_rows = 0
+                for d, val in sorted(rrp.items()):
+                    if d < start_date:
+                        continue
+                    pct = val / rrp_peak
+                    sid = "COMPUTED:reverse_repo_pct_of_peak"
+                    if not self._row_exists(sid, d, conn):
+                        self._insert_raw(
+                            conn=conn,
+                            series_id=sid,
+                            obs_date=d,
+                            value=pct,
+                            raw_payload={"rrp": val, "peak": rrp_peak, "unit": "ratio_0_1"},
+                        )
+                        rrp_pct_rows += 1
+                results.append({
+                    "feature": "COMPUTED:reverse_repo_pct_of_peak",
+                    "status": "SUCCESS",
+                    "rows_inserted": rrp_pct_rows,
+                })
 
             # ── COMPUTED:tga_drawdown ──────────────────────────────────────
             # 30-day change in TGA: negative means Treasury spending = liquidity injection
