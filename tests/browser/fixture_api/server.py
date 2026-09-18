@@ -47,8 +47,16 @@ ROUTES: list[tuple[str, re.Pattern, callable]] = [
     ("GET", re.compile(r"^/api/v1/watchlist/?$"), lambda m, q, s: fx.watchlist_list(s)),
     ("GET", re.compile(r"^/api/v1/physics/momentum$"), lambda m, q, s: fx.news_momentum(s)),
     ("GET", re.compile(r"^/api/v1/flows/sectors$"), lambda m, q, s: fx.sector_flows(s)),
+    ("POST", re.compile(r"^/api/v1/chat/compose$"), lambda m, q, s: fx.chat_compose(s)),
+    ("GET", re.compile(rf"^/api/v1/watchlist/(?P<ticker>{_TICKER_RE})/quote$"),
+     lambda m, q, s: fx.ticker_quote(m.group("ticker"), s)),
+    ("GET", re.compile(r"^/api/v1/ten-year-portfolio/weekly$"),
+     lambda m, q, s: fx.ten_year_portfolio_weekly(s)),
 
-    # (b) ticker investigation
+    # (b) ticker investigation — note GET .../gold/stream (SSE) has NO route
+    # here on purpose: TickerLookup.jsx's EventSource falls back to the four
+    # GETs below on a stream error, and a 404 is exactly that trigger. See
+    # README "SSE fallback" note.
     ("GET", re.compile(rf"^/api/v1/dad/ticker/(?P<ticker>{_TICKER_RE})/gold$"),
      lambda m, q, s: fx.dad_ticker_gold(m.group("ticker"), s)),
     ("GET", re.compile(rf"^/api/v1/dad/ticker/(?P<ticker>{_TICKER_RE})/evidence$"),
@@ -66,18 +74,45 @@ ROUTES: list[tuple[str, re.Pattern, callable]] = [
     ("GET", re.compile(r"^/api/v1/watchlist/portfolio$"), lambda m, q, s: fx.watchlist_portfolio(s)),
     ("GET", re.compile(rf"^/api/v1/watchlist/(?P<ticker>{_TICKER_RE})/edge$"),
      lambda m, q, s: fx.ticker_edge(m.group("ticker"), s)),
+    ("GET", re.compile(rf"^/api/v1/watchlist/(?P<ticker>{_TICKER_RE})/analysis$"),
+     lambda m, q, s: fx.watchlist_ticker_analysis(m.group("ticker"), s)),
+    ("GET", re.compile(rf"^/api/v1/watchlist/(?P<ticker>{_TICKER_RE})/overview$"),
+     lambda m, q, s: fx.watchlist_ticker_overview(m.group("ticker"), s)),
+    ("GET", re.compile(rf"^/api/v1/derivatives/gex/(?P<ticker>{_TICKER_RE})$"),
+     lambda m, q, s: fx.derivatives_gex(m.group("ticker"), s)),
+    ("GET", re.compile(rf"^/api/v1/derivatives/vanna-charm/(?P<ticker>{_TICKER_RE})$"),
+     lambda m, q, s: fx.derivatives_vanna_charm(m.group("ticker"), s)),
+    ("GET", re.compile(rf"^/api/v1/derivatives/flow-timeline/(?P<ticker>{_TICKER_RE})$"),
+     lambda m, q, s: fx.derivatives_flow_timeline(m.group("ticker"), s)),
     ("GET", re.compile(r"^/api/v1/intelligence/dashboard$"), lambda m, q, s: fx.intelligence_dashboard(s)),
 
-    # (d) research status — no dedicated PWA page exists (see README);
-    # this stubs the closest analog actually wired up, Pipeline Health.
+    # (d) research status — no dedicated PWA page exists (see README).
+    # Pipeline Health is the closest analog wired up; Discovery.jsx is the
+    # real operator-only "research status" surface the lead's browser run
+    # identified.
     ("GET", re.compile(r"^/api/v1/system/pipeline-health$"), lambda m, q, s: fx.pipeline_health(s)),
+    ("GET", re.compile(r"^/api/v1/discovery/jobs$"), lambda m, q, s: fx.discovery_jobs(s)),
+    ("GET", re.compile(r"^/api/v1/discovery/results/(?P<type>orthogonality|clustering)$"),
+     lambda m, q, s: fx.discovery_results(m.group("type"), s)),
+    ("GET", re.compile(r"^/api/v1/discovery/hypotheses/results$"),
+     lambda m, q, s: fx.discovery_hypotheses_results(s)),
+    ("GET", re.compile(r"^/api/v1/discovery/hypotheses$"), lambda m, q, s: fx.discovery_hypotheses(s)),
 
-    # (e) data health / source drill-down
+    # (e) data health / source drill-down — Operator.jsx's actual six calls.
+    ("GET", re.compile(r"^/api/v1/system/status$"), lambda m, q, s: fx.system_status(s)),
     ("GET", re.compile(r"^/api/v1/system/health$"), lambda m, q, s: fx.system_health(s)),
+    ("GET", re.compile(r"^/api/v1/system/freshness$"), lambda m, q, s: fx.system_freshness(s)),
     ("GET", re.compile(r"^/api/v1/system/hermes-status$"), lambda m, q, s: fx.hermes_status(s)),
+    ("GET", re.compile(r"^/api/v1/snapshots/issues$"), lambda m, q, s: fx.snapshots_issues(s)),
+    ("GET", re.compile(r"^/api/v1/snapshots/latest/(?P<category>[A-Za-z0-9_]+)$"),
+     lambda m, q, s: fx.snapshots_latest(m.group("category"), s)),
     ("GET", re.compile(rf"^/api/v1/sectors/(?P<sector>[A-Za-z0-9_.\- ]+)/health$"),
      lambda m, q, s: fx.sector_health(m.group("sector"), s)),
 ]
+
+# POST /api/v1/chat/ask/stream is handled separately (SSE, not JSON) — see
+# FixtureHandler._handle_ask_stream.
+_ASK_STREAM_PATH = re.compile(r"^/api/v1/chat/ask/stream$")
 
 
 class FixtureHandler(BaseHTTPRequestHandler):
@@ -116,10 +151,37 @@ class FixtureHandler(BaseHTTPRequestHandler):
             status=404,
         )
 
+    def _handle_ask_stream(self):
+        """SSE response for POST /api/v1/chat/ask/stream, matching what
+        pwa/src/api.js's askStream() parses: `data: {"delta": "..."}\\n\\n`
+        chunks over a chunked/streamed connection, closed when done — no
+        explicit terminator event is required (api.js:945-976).
+        """
+        deltas = fx.chat_ask_stream_deltas(self.scenario)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        full = ""
+        for delta in deltas:
+            full += delta
+            chunk = f"data: {json.dumps({'delta': delta})}\n\n".encode("utf-8")
+            try:
+                self.wfile.write(chunk)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                return
+
     def do_GET(self):
         self._dispatch("GET")
 
     def do_POST(self):
+        parts = urlsplit(self.path)
+        if _ASK_STREAM_PATH.match(parts.path):
+            self._handle_ask_stream()
+            return
         self._dispatch("POST")
 
     def do_OPTIONS(self):

@@ -50,24 +50,35 @@ GENERATED_AT = "2026-09-18T09:00:00+00:00"
 
 # ── Auth ──────────────────────────────────────────────────────────────
 
+def _fixture_role() -> str:
+    """FIXTURE_ROLE env var: 'admin' (default, full operator cockpit) or
+    'contributor' (pwa/src/authSession.js:57 SIMPLE_ROLES -> dad-mode simple
+    shell, just the two contributor pages). Read at request time (not at
+    import time) so a running server picks up a changed env var on restart.
+    """
+    return os.environ.get("FIXTURE_ROLE", "admin")
+
+
 def login_response() -> dict:
     """A synthetic dev token. Not a real JWT — the fixture server does not
     verify it; see tests/browser/README.md for why that is legitimate here.
     """
+    role = _fixture_role()
     return {
-        "token": "dev-fixture-token.not-a-real-jwt.TEST1",
+        "token": f"dev-fixture-token.not-a-real-jwt.{role}",
         "expires_in": 3600,
-        "role": "admin",
-        "username": "fixture-operator",
+        "role": role,
+        "username": "fixture-operator" if role == "admin" else "fixture-dad",
     }
 
 
 def verify_response() -> dict:
+    role = _fixture_role()
     return {
         "valid": True,
         "expires_at": "2026-09-16T14:30:00+00:00",
-        "role": "admin",
-        "username": "fixture-operator",
+        "role": role,
+        "username": "fixture-operator" if role == "admin" else "fixture-dad",
     }
 
 
@@ -162,10 +173,183 @@ def sector_flows(scenario: str) -> dict:
 
 
 # ── Journey (b): ticker investigation ────────────────────────────────
+#
+# These mirror the ACTUAL return dicts of api/routers/dad.py on the
+# composed-g tree (read directly, not guessed), because
+# pwa/src/views/TickerLookup.jsx reads a specific, non-obvious key set from
+# each response (data.workbook.{evidence,files,sheets}, data.summary,
+# data.gold, data.decision_stack, data.finviz, data.grid_data, data.signals,
+# data.tradingview, data.dad_stats, data.source_lanes, data.fit_signals,
+# data.risks, data.next_actions, data.status — see TickerLookup.jsx:277-292).
+# An earlier version of these fixtures invented a smaller, wrong shape; it
+# 200'd but rendered "NaN hits" (LanePill, TickerLookup.jsx:55, needs
+# lane.file_hits + lane.sheet_hits + lane.evidence_rows, all three present)
+# and "Price loading" forever (price_history items need a `value` key, not
+# `close`). Router functions mirrored, with line numbers on composed-g as of
+# 2026-09-18:
+#   _build_compact_dad_response   dad.py:1916  (-> GET .../gold)
+#   _assemble_dad_response        dad.py:1856  (assembles gold's full dict)
+#   _load_workbook_context        dad.py:1682  (workbook/summary/source_lanes/
+#                                                dad_stats/fit_signals)
+#   _gold_from_summary            dad.py:864   (gold.{verdict,heuristic_score,...})
+#   _grid_decision_stack          dad.py:1390  (decision_stack.{stance,cards,...})
+#   _lane_counts                  dad.py:309   (source_lanes[i].{id,label,detail,
+#                                                file_hits,sheet_hits,evidence_rows})
+#   _dad_stat_cards               dad.py:341   (dad_stats[i].{id,label,state,why,
+#                                                hits,prompt})
+#   _tradingview_payload          dad.py:366   (tradingview.{chart_url,...})
+#   _compact_finviz               dad.py:237   (finviz.{status,stats,field_count,...})
+#   _compact_grid                 dad.py:256   (grid_data.{price_history[{date,value}],
+#                                                metrics,source_freshness,...})
+#   _compact_signals              dad.py:278   (signals.{signal_count,regime,...})
+#   _build_evidence_payload       dad.py:1958  (-> GET .../evidence)
+#   _build_chart_payload          dad.py:1989  (-> GET .../chart)
+#   _build_finviz_payload         dad.py:2049  (-> GET .../finviz)
+#   _build_options_payload        dad.py:2073  (-> GET .../options)
+#   _options_history_context      dad.py:1190  (options.{latest,history,...})
+#
+# The view also opens an SSE stream, GET .../gold/stream (EventSource,
+# api.js:370-399, streamDadTickerGold), before falling back to the four
+# parallel GETs above on stream error (TickerLookup.jsx:399-406,
+# startDetailStream's onError -> hydrateDetails). This fixture server has no
+# route for .../gold/stream, so it 404s — that is the intended fallback
+# path, not a bug, and is exercised on every lookup.
 
-def dad_ticker_gold(ticker: str, scenario: str) -> dict:
+def _dad_workbook_summary(scenario: str) -> dict | None:
     if scenario == "empty":
-        gold = {
+        return None
+    if scenario == "partial":
+        return {"ticker": TICKER, "mentions": 3, "file_count": 1, "sheet_count": 1,
+                "evidence_score": 2.0, "source_types": "cell"}
+    return {"ticker": TICKER, "mentions": 8, "file_count": 2, "sheet_count": 3,
+            "evidence_score": 9.0, "source_types": "sheet_name,filename"}
+
+
+def _dad_workbook_evidence(scenario: str) -> list[dict]:
+    if scenario == "empty":
+        return []
+    rows = [
+        {"source_type": "sheet_name", "evidence_text": f"{TICKER} target multiple",
+         "context_score": 4.0, "file": "test_workbook_2026.xlsx", "sheet": "Watchlist",
+         "cell": "B12", "row_context": "position sizing notes", "column_header": "Ticker"},
+    ]
+    if scenario == "healthy":
+        rows.append({"source_type": "filename", "evidence_text": f"{TICKER} historical CAGR vs QQQ",
+                      "context_score": 5.0, "file": f"test_workbook_2026_{TICKER}.xlsx", "sheet": "Summary",
+                      "cell": "A1", "row_context": "long-term chart + benchmark notes", "column_header": None})
+    if scenario == "partial":
+        # This row's own extraction is unresolved — no fabricated text.
+        rows.append({"source_type": "cell", "evidence_text": None, "context_score": 0.0,
+                      "file": "test_workbook_2026.xlsx", "sheet": "Notes", "cell": None,
+                      "row_context": None, "column_header": None})
+    return rows
+
+
+def _dad_workbook_files(scenario: str) -> list[dict]:
+    if scenario == "empty":
+        return []
+    return [{"file": "test_workbook_2026.xlsx", "mentions": 6, "score": 9.0}]
+
+
+def _dad_workbook_sheets(scenario: str) -> list[dict]:
+    if scenario == "empty":
+        return []
+    sheets = [{"file": "test_workbook_2026.xlsx", "sheet": "Watchlist", "mentions": 4, "score": 6.0}]
+    if scenario == "healthy":
+        sheets.append({"file": f"test_workbook_2026_{TICKER}.xlsx", "sheet": "Summary", "mentions": 2, "score": 5.0})
+    return sheets
+
+
+def _dad_source_lanes(scenario: str, evidence: list[dict], files: list[dict], sheets: list[dict]) -> list[dict]:
+    """Mirrors dad.py:309 _lane_counts: classify by filename/sheet keywords,
+    count evidence/file/sheet hits per lane, drop lanes with zero hits.
+    """
+    if not (evidence or files or sheets):
+        return []
+    workbook_lane = {
+        "id": "workbook", "label": "Other Workbook",
+        "detail": "Workbook evidence that needs manual classification.",
+        "evidence_rows": len(evidence), "file_hits": sum(int(r.get("mentions") or 0) for r in files),
+        "sheet_hits": 0,
+    }
+    lanes = [workbook_lane]
+    if scenario == "healthy":
+        lanes.append({
+            "id": "dad_method", "label": "Dad Method",
+            "detail": "Framework files: CAGR, historical charts, portfolio role, prudent entry, and benchmark context.",
+            "evidence_rows": 0, "file_hits": 0,
+            "sheet_hits": sum(int(r.get("mentions") or 0) for r in sheets),
+        })
+    return [lane for lane in lanes if lane["evidence_rows"] or lane["file_hits"] or lane["sheet_hits"]]
+
+
+def _dad_stat_cards(scenario: str) -> list[dict]:
+    """Mirrors dad.py:341 _dad_stat_cards / DAD_STAT_CATALOG (dad.py:83-121):
+    six fixed cards, each 'present' or 'needed' depending on whether the
+    workbook corpus text hits that card's keywords. Empty/partial corpora
+    hit nothing, so every card reads 'needed' — that is the real behaviour,
+    not a fixture bug.
+    """
+    catalog = [
+        ("chart_quality", "Chart Quality",
+         "Dad checks whether the long-term chart is up-and-right and whether it recovered from prior highs.",
+         "Show 1Y, 5Y, 10Y trend, drawdown, recovery from high, and QQQ/SPY relative strength."),
+        ("benchmark_fit", "Benchmark Fit",
+         "He thinks in S&P/QQQ context: what sector or theme am I overweight, missing, or duplicating?",
+         "Compare against QQQ/SPY and show whether it adds a new role or just repeats existing exposure."),
+        ("prudent_entry", "Prudent Entry",
+         "His buy decision wants zones: speculative, prudent, and back-up-the-truck levels.",
+         "Show valuation context, current price versus target zones, and reason not to buy yet."),
+        ("options_yield", "Options / Yield",
+         "He uses covered calls and spreads to define payoff, premium, stop, and take-profit.",
+         "Show premium, days to expiry, return if exercised, max loss, take-profit, and stop-loss."),
+        ("portfolio_role", "Portfolio Role",
+         "He wants to know what account, sleeve, and allocation role a name belongs in.",
+         "Show sleeve, target size, current exposure, cost basis evidence, and rebalance impact."),
+        ("risk_control", "Risk Control",
+         "The spreadsheet language repeatedly checks downside, distance from high, stop-loss, and drawdown.",
+         "Show what can break the thesis, downside level, debt/liquidity risk, and exit trigger."),
+    ]
+    present_ids = {"chart_quality", "portfolio_role"} if scenario == "healthy" else set()
+    hits_by_id = {
+        "chart_quality": ["historical", "cagr"],
+        "portfolio_role": ["portfolio"],
+    }
+    cards = []
+    for stat_id, label, why, prompt in catalog:
+        present = stat_id in present_ids
+        cards.append({
+            "id": stat_id, "label": label,
+            "state": "present" if present else "needed",
+            "why": why,
+            "hits": hits_by_id.get(stat_id, []) if present else [],
+            "prompt": prompt,
+        })
+    return cards
+
+
+def _dad_fit_signals(scenario: str, summary: dict | None) -> list[dict]:
+    if not summary:
+        return []
+    signals = [{
+        "label": "Workbook depth",
+        "state": "strong" if int(summary.get("file_count") or 0) >= 3 else "partial",
+        "detail": f"{summary.get('mentions', 0)} mentions across {summary.get('file_count', 0)} files "
+                   f"and {summary.get('sheet_count', 0)} sheets",
+    }]
+    if scenario == "healthy":
+        signals.append({"label": "Named at file level", "state": "strong",
+                         "detail": "The ticker appears in workbook or file names, not only individual cells."})
+    else:
+        signals.append({"label": "Context still thin", "state": "neutral",
+                         "detail": "Mentions were found, but the extractor has not classified clear decision language yet."})
+    return signals
+
+
+def _dad_gold(summary: dict | None) -> dict:
+    """Mirrors dad.py:864 _gold_from_summary exactly (composed-g)."""
+    if not summary:
+        return {
             "verdict": "No workbook history yet",
             "heuristic_score": None,
             "weights": None,
@@ -173,173 +357,364 @@ def dad_ticker_gold(ticker: str, scenario: str) -> dict:
             "tone": "neutral",
             "one_liner": "This ticker is not showing up in Dad's copied workbook corpus yet.",
         }
+    mentions = int(summary.get("mentions") or 0)
+    file_count = int(summary.get("file_count") or 0)
+    sheet_count = int(summary.get("sheet_count") or 0)
+    evidence_score = float(summary.get("evidence_score") or 0)
+    weights = {
+        "evidence_score": {"weight": 2.5, "cap": None, "input": evidence_score, "points": round(evidence_score * 2.5, 2)},
+        "file_count": {"weight": 8, "cap": None, "input": file_count, "points": round(file_count * 8, 2)},
+        "sheet_count": {"weight": 2, "cap": None, "input": sheet_count, "points": round(sheet_count * 2, 2)},
+        "mentions": {"weight": 1, "cap": 30, "input": mentions, "points": round(min(mentions, 30) * 1, 2)},
+        "_clamp": {"min": 0, "max": 100},
+        "_verdict_thresholds": {
+            "high_workbook_conviction": {"heuristic_score": 80, "file_count": 3},
+            "known_name": {"heuristic_score": 45},
+            "light_workbook_footprint": {"heuristic_score": 15},
+        },
+    }
+    raw_total = sum(v["points"] for k, v in weights.items() if not k.startswith("_"))
+    score = min(100, round(raw_total))
+    if score >= 80 and file_count >= 3:
+        verdict, tone, one_liner = "High workbook conviction", "strong", "Dad's workbooks mention this ticker repeatedly across files and sheets."
+    elif score >= 45:
+        verdict, tone, one_liner = "Known name in Dad's research", "watch", "This has enough workbook footprint to deserve a serious look."
+    elif score >= 15:
+        verdict, tone, one_liner = "Light workbook footprint", "light", "There is workbook evidence, but not enough to treat it as a core Dad name."
     else:
-        gold = {
-            "verdict": "Known name in Dad's research",
-            "heuristic_score": 52,
-            "weights": {
-                "evidence_score": {"weight": 2.5, "cap": None, "input": 9.0, "points": 22.5},
-                "file_count": {"weight": 8, "cap": None, "input": 2, "points": 16.0},
-                "sheet_count": {"weight": 2, "cap": None, "input": 3, "points": 6.0},
-                "mentions": {"weight": 1, "cap": 30, "input": 8, "points": 8.0},
-                "_clamp": {"min": 0, "max": 100},
-            },
-            "score_basis": "workbook_footprint_weighted_count",
-            "tone": "watch",
-            "one_liner": "This has enough workbook footprint to deserve a serious look.",
-        }
+        verdict, tone, one_liner = "Trace evidence only", "neutral", "Only a small amount of workbook evidence showed up for this ticker."
     return {
-        "ticker": ticker,
-        "status": "ok",
-        "gold": gold,
-        "price": ticker_price_block(scenario),
-        "finviz_summary": dad_ticker_finviz(ticker, scenario)["stats"][:3],
-        "generated_at": GENERATED_AT,
+        "verdict": verdict, "heuristic_score": score, "weights": weights,
+        "score_basis": "workbook_footprint_weighted_count", "tone": tone, "one_liner": one_liner,
     }
 
 
-def ticker_price_block(scenario: str) -> dict:
+def _dad_finviz(scenario: str, *, include_fields: bool = False) -> dict:
+    """Mirrors dad.py:237 _compact_finviz (composed-g)."""
     if scenario == "empty":
-        return {"available": False, "status": "unavailable", "reason": "no price series", "price": None, "as_of": None}
+        stats: list[dict] = []
+        status, freshness = "unavailable", {"state": "missing", "age_hours": None, "label": "missing"}
+    else:
+        stats = [
+            {"field": "sector", "label": "Sector", "group": "profile", "raw_value": "Technology",
+             "parsed": None, "numeric_value": None, "value_kind": "text"},
+            {"field": "pe_ratio", "label": "P/E", "group": "valuation", "raw_value": "18.00",
+             "parsed": 18.0, "numeric_value": 18.0, "value_kind": "numeric"},
+        ]
+        if scenario == "partial":
+            # A field whose scrape came back non-numeric: text, not a fabricated 0.0.
+            stats.append({"field": "dividend_pct", "label": "Dividend %", "group": "valuation",
+                           "raw_value": "N/A", "parsed": None, "numeric_value": None, "value_kind": "text"})
+            status, freshness = "stale", {"state": "stale", "age_hours": 168.0, "label": "stale"}
+        else:
+            status, freshness = "ready", {"state": "fresh", "age_hours": 4.0, "label": "fresh"}
     return {
-        "available": True,
-        "price": 100.0,
-        "change_1d_pct": 0.0,
-        "as_of": AS_OF_DATE,
-        "price_source": "fixture",
+        "status": status,
+        "source": "postgres",
+        "freshness": freshness,
+        "latest_pull": "2026-09-15T06:00:00+00:00" if scenario != "empty" else None,
+        "latest_obs_date": AS_OF_DATE if scenario != "empty" else None,
+        "field_count": len(stats),
+        "rows_inserted": 0,
+        "live_refresh_requested": False,
+        "refresh_available": True,
+        "stats": stats,
+        "error": None,
+        **({"fields": {s["field"]: s for s in stats}} if include_fields else {}),
+    }
+
+
+def _dad_price_history(scenario: str) -> list[dict]:
+    if scenario == "empty":
+        return []
+    # PriceChart / TickerLookup.jsx read `.value`, never `.close`.
+    return [
+        {"date": "2026-09-10", "value": 98.0},
+        {"date": "2026-09-11", "value": 99.0},
+        {"date": "2026-09-12", "value": 100.0},
+        {"date": "2026-09-15", "value": 100.0},
+    ]
+
+
+def _dad_metrics(scenario: str, price_history: list[dict]) -> dict:
+    if not price_history:
+        return {}
+    latest, first = price_history[-1]["value"], price_history[0]["value"]
+    high = max(r["value"] for r in price_history)
+    low = min(r["value"] for r in price_history)
+    return {
+        "latest_price": latest, "first_price": first, "window_days": 365, "window_label": "1Y",
+        "window_start": price_history[0]["date"],
+        "return_window_pct": ((latest - first) / first * 100) if first else None,
+        "high_window": high, "low_window": low,
+        "pct_from_window_high": ((latest - high) / high * 100) if high else None,
+        "pct_above_window_low": ((latest - low) / low * 100) if low else None,
+        "obs_count": len(price_history), "as_of": price_history[-1]["date"],
+    }
+
+
+def _dad_source_freshness(scenario: str) -> list[dict]:
+    """Mirrors dad.py:979 _source_freshness for the six sources the chart
+    endpoint always asks about; a source with no row still gets an entry
+    ('missing'), it never disappears from the list.
+    """
+    sources = ["yfinance", "Finviz", "TradingView", "Social_Smart_Money", "SEC_INSIDER", "Unusual_Whales"]
+    out = []
+    for name in sources:
+        if scenario != "empty" and name == "yfinance":
+            state = "stale" if scenario == "partial" else "fresh"
+            age = 168.0 if scenario == "partial" else 6.0
+            out.append({"source": name, "last_pull": "2026-09-08T06:00:00+00:00" if scenario == "partial" else "2026-09-15T06:00:00+00:00",
+                        "latest_raw_pull": None, "state": state, "age_hours": age, "label": state})
+        else:
+            out.append({"source": name, "last_pull": None, "latest_raw_pull": None,
+                        "state": "missing", "age_hours": None, "label": "missing"})
+    return out
+
+
+def _dad_grid_data(scenario: str, *, include_price_history: bool) -> dict:
+    """Mirrors dad.py:256 _compact_grid (composed-g)."""
+    price_history = _dad_price_history(scenario) if include_price_history else []
+    metrics = _dad_metrics(scenario, _dad_price_history(scenario))
+    return {
+        "status": "ready" if metrics else "missing",
+        "feature_names": [f"{TICKER}_close"] if metrics else [],
+        "metrics": metrics,
+        "freshness": (
+            {"state": "fresh", "age_hours": 6.0, "label": "fresh"} if metrics
+            else {"state": "missing", "age_hours": None, "label": "missing"}
+        ),
+        "source_freshness": _dad_source_freshness(scenario),
+        "features": [],
+        "price_history": price_history,
+        "price_points_total": len(_dad_price_history(scenario)),
+        "price_points_returned": len(price_history),
+    }
+
+
+def _dad_signals(scenario: str, *, include_rows: bool) -> dict:
+    """Mirrors dad.py:278 _compact_signals (composed-g)."""
+    signal_rows = [] if scenario == "empty" else [
+        {"source_type": "social", "source_id": "test-forum", "date": AS_OF_DATE, "signal_type": "BUY",
+         "signal_value": {}, "trust_score": 0.4 if scenario == "healthy" else 0.0,
+         "created_at": AS_OF_DATETIME},
+    ]
+    tv_rows: list[dict] = []
+    payload = {
+        "signal_count": len(signal_rows),
+        "tradingview_count": len(tv_rows),
+        "regime": None,
+    }
+    if include_rows:
+        payload["signal_sources"] = signal_rows
+        payload["tradingview_signals"] = tv_rows
+    return payload
+
+
+def _dad_options_context(scenario: str, *, days: int = 90, limit: int = 90) -> dict:
+    """Mirrors dad.py:1190 _options_history_context (composed-g)."""
+    if scenario == "empty":
+        return {"status": "missing", "latest": None, "history": [], "days": days, "limit": limit,
+                "freshness": {"state": "missing", "age_hours": None, "label": "missing"}}
+    latest = {
+        "date": AS_OF_DATE, "put_call_ratio": 0.9, "max_pain": 100.0, "iv_skew": 0.02,
+        "total_oi": 500, "total_volume": 120, "spot_price": 100.0, "iv_atm": 0.35,
+        "term_slope": 0.01, "oi_concentration": 0.3,
+    }
+    return {
+        "status": "ready", "latest": latest, "history": [latest], "days": days, "limit": limit,
+        "freshness": {"state": "fresh" if scenario == "healthy" else "aging",
+                       "age_hours": 6.0 if scenario == "healthy" else 96.0,
+                       "label": "fresh" if scenario == "healthy" else "aging"},
+    }
+
+
+def _dad_decision_stack(scenario: str, summary: dict | None, gold: dict) -> dict:
+    """Simplified but structurally accurate mirror of dad.py:1390
+    _grid_decision_stack: same key set (stance/tone/heuristic_score/weights/
+    cards/reasons/blockers/method), synthetic point values.
+    """
+    gold_score = gold.get("heuristic_score") or 0
+    cards = [
+        {"source": "Dad workbooks",
+         "state": "strong" if summary and int(summary.get("file_count") or 0) >= 3 else ("watch" if summary else "missing"),
+         "points": round(gold_score * 0.6, 1), "detail": gold.get("one_liner") or "No workbook prior."},
+        {"source": "GRID price history", "state": "watch" if scenario != "empty" else "missing",
+         "points": 6.0 if scenario != "empty" else 0.0,
+         "detail": "1Y +2.0%, 0.0% from 1Y high" if scenario != "empty" else "No GRID chart history."},
+        {"source": "Finviz fundamentals", "state": "caution" if scenario == "partial" else ("watch" if scenario == "healthy" else "missing"),
+         "points": 4.0 if scenario == "healthy" else 0.0,
+         "detail": "Finviz fundamentals are stale; refresh before making the call." if scenario == "partial" else "2 fields, fresh",
+         "inputs": {"forward_pe": 18.0 if scenario != "empty" else None, "roe": None, "debt_equity": None,
+                     "profit_margin": None, "eps_next_5y": None},
+         "skipped_fields": ["roe", "debt_equity", "profit_margin", "eps_next_5y"]},
+        {"source": "GRID options", "state": "watch" if scenario != "empty" else "missing",
+         "points": 2.0 if scenario != "empty" else 0.0,
+         "detail": f"Latest options date {AS_OF_DATE}" if scenario != "empty" else "No options_daily_signals row."},
+        {"source": "GRID signals", "state": "missing", "points": 0.0,
+         "detail": "0 trusted signal rows, 0 TradingView alerts"},
+    ]
+    total = round(sum(c["points"] for c in cards), 1)
+    if total >= 70:
+        stance, tone = "Deep review first", "strong"
+    elif total >= 45:
+        stance, tone = "Watchlist with checks", "watch"
+    elif total >= 25:
+        stance, tone = "Needs more evidence", "caution"
+    else:
+        stance, tone = "Do not surface hard yet", "light"
+    blockers = ["Finviz fundamentals are stale; refresh before making the call."] if scenario == "partial" else []
+    reasons = ["Workbook prior exists, but GRID needs more current confirmation."] if summary else \
+        ["GRID does not have enough current evidence for this ticker yet."]
+    return {
+        "stance": stance, "stance_basis": "heuristic_score_thresholds", "tone": tone,
+        "heuristic_score": total, "weights": {"workbook_prior_multiplier": 0.6},
+        "score_basis": "hand_picked_point_awards",
+        "skipped_terms": {"finviz": ["roe", "debt_equity", "profit_margin", "eps_next_5y"]},
+        "cards": cards, "reasons": reasons[:5], "blockers": blockers[:6],
+        "method": ("Hand-picked point awards over the workbook prior plus GRID price, "
+                   "fundamentals, options, signal, regime and freshness checks. Not a "
+                   "backtested or calibrated conviction score - every weight is in `weights`."),
+    }
+
+
+def _dad_tradingview(ticker: str) -> dict:
+    """Mirrors dad.py:366 _tradingview_payload exactly."""
+    symbol = ticker.replace(".", "-")
+    tv_symbol = f"NASDAQ:{symbol}"
+    encoded = tv_symbol.replace(":", "%3A")
+    return {
+        "symbol": tv_symbol,
+        "chart_url": f"https://www.tradingview.com/chart/?symbol={encoded}",
+        "symbol_search_url": f"https://www.tradingview.com/symbols/{symbol}/",
+        "webhook_note": "GRID can show TradingView webhook alerts already sent into /api/v1/tradingview/webhook.",
+    }
+
+
+def dad_ticker_gold(ticker: str, scenario: str) -> dict:
+    """GET /api/v1/dad/ticker/{ticker}/gold -> mirrors
+    _build_compact_dad_response / _assemble_dad_response (compact=True)."""
+    summary = _dad_workbook_summary(scenario)
+    evidence = _dad_workbook_evidence(scenario)
+    files = _dad_workbook_files(scenario)
+    sheets = _dad_workbook_sheets(scenario)
+    gold = _dad_gold(summary)
+    finviz = _dad_finviz(scenario, include_fields=False)
+    grid_data = _dad_grid_data(scenario, include_price_history=False)
+    signals = _dad_signals(scenario, include_rows=False)
+    decision_stack = _dad_decision_stack(scenario, summary, gold)
+    risks = ["Workbook footprint is historical evidence, not a live buy/sell recommendation.",
+             "Current price, fundamentals, news, and liquidity still need a fresh market check."]
+    next_actions = ["Compare the workbook evidence against a current chart and fundamentals pass.",
+                     "Check whether Dad's workbook language is buy, watch, hold, or sell before acting."]
+    if scenario == "empty":
+        risks.append("Regex extraction found no confident workbook footprint for this ticker.")
+        next_actions.insert(0, "Try the company name or related ticker if this was renamed, delisted, or crypto-like.")
+    return {
+        "ticker": ticker,
+        "status": "ready" if summary else "not_found",
+        "payload_mode": "compact",
+        "gold": gold,
+        "decision_stack": decision_stack,
+        "source": {"attached": scenario != "empty", "db_path": None},
+        "message": None,
+        "summary": summary,
+        "workbook": {"files": files, "sheets": sheets, "evidence": evidence},
+        "source_lanes": _dad_source_lanes(scenario, evidence, files, sheets),
+        "dad_stats": _dad_stat_cards(scenario),
+        "finviz": finviz,
+        "grid_data": grid_data,
+        "options": _dad_options_context(scenario)["latest"],
+        "signals": signals,
+        "tradingview": _dad_tradingview(ticker),
+        "fit_signals": _dad_fit_signals(scenario, summary),
+        "risks": risks,
+        "next_actions": next_actions,
+        "detail_urls": {
+            "evidence": f"/api/v1/dad/ticker/{ticker}/evidence",
+            "chart": f"/api/v1/dad/ticker/{ticker}/chart",
+            "finviz": f"/api/v1/dad/ticker/{ticker}/finviz",
+            "options": f"/api/v1/dad/ticker/{ticker}/options",
+        },
+        "hydration": {"compact": True, "evidence": "inline_sample", "chart": "detail_endpoint",
+                       "finviz": "summary", "options": "latest"},
+        "performance": {"timings_ms": {}, "total_ms": 0.0},
+        "cache": {"hit": False, "ttl_seconds": 300},
     }
 
 
 def dad_ticker_evidence(ticker: str, scenario: str) -> dict:
-    if scenario == "empty":
-        return {
-            "ticker": ticker,
-            "status": "ok",
-            "rows": [],
-            "total": 0,
-            "limit": 50,
-            "offset": 0,
-            "source_lanes": [],
-        }
-    rows = [
-        {
-            "id": 1,
-            "file_name": "test_workbook_2026.xlsx",
-            "sheet_name": "Watchlist",
-            "source_type": "sheet_name",
-            "evidence_text": f"{TICKER} — target multiple",
-            "row_context": "position sizing notes",
-            "obs_date": "2026-09-02",
-        },
-    ]
-    if scenario == "partial":
-        # one evidence row's own extraction is unresolved: no fabricated text.
-        rows.append({
-            "id": 2,
-            "file_name": "test_workbook_2026.xlsx",
-            "sheet_name": "Notes",
-            "source_type": "cell",
-            "evidence_text": None,
-            "row_context": None,
-            "obs_date": None,
-        })
+    """GET .../evidence -> mirrors _build_evidence_payload (dad.py:1958)."""
+    summary = _dad_workbook_summary(scenario)
+    evidence = _dad_workbook_evidence(scenario)
+    files = _dad_workbook_files(scenario)
+    sheets = _dad_workbook_sheets(scenario)
     return {
         "ticker": ticker,
-        "status": "ok",
-        "rows": rows,
-        "total": len(rows),
-        "limit": 50,
-        "offset": 0,
-        "source_lanes": ["filename", "sheet_name"],
+        "status": "ready" if summary else "not_found",
+        "summary": summary,
+        "workbook": {"files": files, "sheets": sheets, "evidence": evidence},
+        "source_lanes": _dad_source_lanes(scenario, evidence, files, sheets),
+        "dad_stats": _dad_stat_cards(scenario),
+        "fit_signals": _dad_fit_signals(scenario, summary),
+        "page": {"limit": 50, "offset": 0, "returned": len(evidence)},
+        "performance": {"timings_ms": {}, "total_ms": 0.0},
     }
 
 
 def dad_ticker_chart(ticker: str, scenario: str) -> dict:
-    if scenario == "empty":
-        return {
-            "ticker": ticker,
-            "status": "ok",
-            "range": "1Y",
-            "prices": [],
-            "signals": [],
-            "available": False,
-            "reason": "no price history in raw_series for this range",
-        }
-    prices = [
-        {"date": "2026-09-10", "close": 98.0},
-        {"date": "2026-09-11", "close": 99.0},
-        {"date": "2026-09-12", "close": 100.0},
-        {"date": "2026-09-15", "close": 100.0},
-    ]
-    payload = {
+    """GET .../chart -> mirrors _build_chart_payload (dad.py:1989)."""
+    grid_data = _dad_grid_data(scenario, include_price_history=True)
+    signals = _dad_signals(scenario, include_rows=True)
+    return {
         "ticker": ticker,
-        "status": "ok",
+        "status": grid_data["status"],
+        "payload_mode": "chart",
         "range": "1Y",
-        "prices": prices,
-        "signals": [],
-        "available": True,
-        "price_source": "fixture",
+        "points": 260,
+        "grid_data": grid_data,
+        "price_history": grid_data["price_history"],
+        "metrics": grid_data["metrics"],
+        "features": grid_data["features"],
+        "source_freshness": grid_data["source_freshness"],
+        "tradingview_signals": signals.get("tradingview_signals", []),
+        "regime": signals.get("regime"),
+        "signals": signals,
+        "performance": {"timings_ms": {}, "total_ms": 0.0},
     }
-    if scenario == "partial":
-        # Price history is fine but the options-overlay signal is stale/unscored.
-        payload["signals"] = [
-            {"date": "2026-09-15", "signal_type": "options_flow", "value": None, "reason": "stale (last pull 2026-09-08)"},
-        ]
-    return payload
 
 
 def dad_ticker_finviz(ticker: str, scenario: str) -> dict:
-    if scenario == "empty":
-        return {
-            "ticker": ticker,
-            "status": "ok",
-            "freshness": {"state": "missing", "last_pull": None},
-            "latest_obs_date": None,
-            "field_count": 0,
-            "rows_inserted": 0,
-            "skipped_text_fields": 0,
-            "live_refresh_requested": False,
-            "refresh_available": True,
-            "stats": [],
-            "scraped": False,
-        }
-    stats = [
-        {"field": "sector", "label": "Sector", "group": "profile", "raw_value": "Technology",
-         "parsed": None, "numeric_value": None, "value_kind": "text"},
-        {"field": "pe_ratio", "label": "P/E", "group": "valuation", "raw_value": "18.00",
-         "parsed": 18.0, "numeric_value": 18.0, "value_kind": "numeric"},
-    ]
-    if scenario == "partial":
-        # A field whose scrape came back non-numeric: text, not a fabricated 0.0.
-        stats.append({
-            "field": "dividend_pct", "label": "Dividend %", "group": "valuation",
-            "raw_value": "N/A", "parsed": None, "numeric_value": None, "value_kind": "text",
-        })
-        freshness_state = "stale"
-    else:
-        freshness_state = "fresh"
+    """GET .../finviz -> mirrors _build_finviz_payload (dad.py:2049).
+    Response is wrapped in a top-level `finviz` key; TickerLookup.jsx merges
+    `finvizResult.finviz` into `data.finviz` (mergeTickerData, line 111-113).
+    """
+    finviz = _dad_finviz(scenario, include_fields=True)
     return {
         "ticker": ticker,
-        "status": "ok",
-        "freshness": {"state": freshness_state, "last_pull": "2026-09-15T06:00:00+00:00"},
-        "latest_obs_date": AS_OF_DATE,
-        "field_count": len(stats),
-        "rows_inserted": 0,
-        "skipped_text_fields": 1 if scenario == "partial" else 0,
-        "live_refresh_requested": False,
-        "refresh_available": True,
-        "stats": stats,
-        "scraped": False,
+        "status": finviz["status"],
+        "payload_mode": "finviz",
+        "finviz": finviz,
+        "performance": {"timings_ms": {}, "total_ms": 0.0},
     }
 
 
 def dad_ticker_options(ticker: str, scenario: str) -> dict:
-    if scenario == "empty":
-        return {"ticker": ticker, "status": "ok", "days": [], "available": False, "reason": "no options signal history"}
-    days = [
-        {"date": "2026-09-15", "put_call_ratio": 0.9, "unusual_volume": False, "notional_flow": 0.0},
-    ]
-    return {"ticker": ticker, "status": "ok", "days": days, "available": True}
+    """GET .../options -> mirrors _build_options_payload (dad.py:2073).
+    Response is wrapped in a top-level `options` key; TickerLookup.jsx merges
+    `optionsResult.options` into `data.options` (mergeTickerData, line 114-116).
+    """
+    ctx = _dad_options_context(scenario)
+    return {
+        "ticker": ticker,
+        "status": ctx["status"],
+        "payload_mode": "options",
+        "options": ctx,
+        "latest": ctx["latest"],
+        "history": ctx["history"],
+        "freshness": ctx["freshness"],
+        "performance": {"timings_ms": {}, "total_ms": 0.0},
+    }
 
 
 def catalyst_timeline(ticker: str, scenario: str) -> dict:
@@ -425,6 +800,24 @@ def catalyst_timeline(ticker: str, scenario: str) -> dict:
 # ── Journey (c): watchlist / portfolio, /edge, trust+convergence ────
 
 def watchlist_portfolio(scenario: str) -> dict:
+    """GET /api/v1/watchlist/portfolio -> mirrors api/routers/watchlist_core.py
+    ::get_portfolio (composed-g, ~line 133-379) exactly.
+
+    Two things an earlier version of this fixture got wrong, both because it
+    guessed the shape instead of reading the router:
+      1. Position keys are ticker/display_name/price/change_1d/change_1w/
+         weight/sector/asset_type — NOT custom_weight/return_1d_pct/has_price.
+         Portfolio.jsx:277 reads `p.weight` (a 0..1 fraction) and renders
+         `(p.weight * 100).toFixed(1)}%`; the wrong key name rendered "NaN%".
+      2. A holding with no price is NOT included in `positions` with a null
+         price — it is dropped from `positions` entirely and counted in
+         `positions_missing_price` / listed in `missing_price_tickers`
+         instead (get_portfolio's docstring: "a holding with no price is
+         not a holding worth zero: it is a holding we could not measure").
+    There are deliberately no dollar P&L keys at all (no total_value,
+    no per-position pnl_1d) — see the README's "defects observed" list for
+    what that means for Portfolio.jsx, which still reads some of them.
+    """
     if scenario == "empty":
         return {
             "total_value": None,
@@ -447,46 +840,39 @@ def watchlist_portfolio(scenario: str) -> dict:
     position = {
         "ticker": TICKER,
         "display_name": "Test One Corp",
-        "asset_type": "stock",
-        "custom_weight": None,
         "price": 100.0,
-        "return_1d_pct": 0.0,
-        "has_price": True,
+        "change_1d": 0.0,
+        "change_1w": 1.0,
+        "weight": 1.0,
+        "sector": "Technology",
+        "asset_type": "stock",
     }
-    payload = {
+    positions = [position]
+    missing_price_tickers: list[str] = []
+    if scenario == "partial":
+        # TEST2 is on the watchlist but has no price at all: it never enters
+        # `positions` (a missing price is not a 0% holding), it is excluded
+        # from weight_priced_total / the weighted return, and is reported
+        # only in missing_price_tickers.
+        missing_price_tickers = ["TEST2"]
+    return {
         "total_value": None,
         "total_value_basis": "GRID stores no position sizes or cost basis for watchlist items",
         "weighted_return_1d_pct": 0.0,
         "return_1d_weight_coverage": 1.0,
-        "positions": [position],
-        "positions_missing_price": 0,
-        "missing_price_tickers": [],
-        "weight_priced_total": 1.0,
+        "positions": positions,
+        "positions_missing_price": len(missing_price_tickers),
+        "missing_price_tickers": missing_price_tickers,
+        "weight_priced_total": sum(p["weight"] for p in positions),
         "allocation": {"by_sector": {"Technology": 1.0}, "by_asset_type": {"stock": 1.0}},
         "risk_metrics": {
             "concentration_top3": 1.0,
-            "beta_proxy_by_asset_class": {"stock": 1.0},
+            "beta_proxy_by_asset_class": 1.0,
             "beta_proxy_basis": "asset-class proxy, not a measured per-position beta",
             "sector_diversification_score": 0.0,
         },
         "options_pnl": {"total_recommendations": 0, "wins": 0, "losses": 0, "open": 0, "total_return": 0},
     }
-    if scenario == "partial":
-        # A second holding exists but has no price at all: excluded from the
-        # weighted return (not counted as a 0% move) and reported explicitly.
-        payload["positions"].append({
-            "ticker": "TEST2",
-            "display_name": "Test Two Inc",
-            "asset_type": "stock",
-            "custom_weight": None,
-            "price": None,
-            "return_1d_pct": None,
-            "has_price": False,
-        })
-        payload["positions_missing_price"] = 1
-        payload["missing_price_tickers"] = ["TEST2"]
-        payload["return_1d_weight_coverage"] = 0.5
-    return payload
 
 
 def ticker_edge(ticker: str, scenario: str) -> dict:
@@ -718,17 +1104,39 @@ def system_health(scenario: str) -> dict:
 
 
 def hermes_status(scenario: str) -> dict:
+    """GET /api/v1/system/hermes-status -> mirrors api/schemas/system.py's
+    HermesStatusResponse exactly (running/cycle_count/task_status/
+    operator_state/...), consumed by pwa/src/views/Operator.jsx (hermes.running,
+    hermes.task_status, hermes.operator_state.last_pipeline_run) and
+    pwa/src/views/Settings.jsx.
+    """
     if scenario == "empty":
-        return {"tasks": [], "as_of": GENERATED_AT}
-    tasks = [
-        {"name": "test_puller_fred", "last_run": "2026-09-15T06:00:00+00:00", "success": True, "duration_s": 4.2, "error": None},
-    ]
+        return {
+            "running": False, "cycle_count": 0, "task_status": {}, "operator_state": {},
+            "uptime_seconds": 0.0, "schedule": {}, "tasks": [], "snapshots": [], "task_count": 0,
+        }
+    task_status = {
+        "test_puller_fred": {"last_run": "2026-09-15T06:00:00+00:00", "success": True, "duration_s": 4.2, "error": None},
+    }
     if scenario == "partial":
-        tasks.append({
-            "name": "test_puller_finviz", "last_run": "2026-09-15T06:05:00+00:00",
-            "success": False, "duration_s": 0.5, "error": "operational timeout (statement_timeout)",
-        })
-    return {"tasks": tasks, "as_of": GENERATED_AT}
+        task_status["test_puller_finviz"] = {
+            "last_run": "2026-09-15T06:05:00+00:00", "success": False, "duration_s": 0.5,
+            "error": "operational timeout (statement_timeout)",
+        }
+    return {
+        "running": True,
+        "cycle_count": 42,
+        "task_status": task_status,
+        "operator_state": {
+            "last_pipeline_run": "2026-09-15T06:10:00+00:00",
+            "pulls_retried": 0, "fixes_applied": 0, "hypotheses_tested": 0, "errors_diagnosed": 0,
+        },
+        "uptime_seconds": 86400.0,
+        "schedule": {},
+        "tasks": [],
+        "snapshots": [],
+        "task_count": len(task_status),
+    }
 
 
 def sector_health(sector: str, scenario: str) -> dict:
@@ -738,3 +1146,359 @@ def sector_health(sector: str, scenario: str) -> dict:
     if scenario == "partial":
         payload = {"sector": sector, "available": False, "status": "unavailable", "reason": "partial coverage (2/6 series stale)", "as_of": None}
     return payload
+
+
+# ── Journey (a) extra: home compose + verdict stream ─────────────────
+# Home.jsx (pwa/src/views/Home.jsx) never renders WidgetGrid directly — it
+# posts the question to POST /api/v1/chat/compose (api.js:905, api/routers/
+# chat.py:2128 compose_layout) and only builds the layout from that
+# response's `widgets`/`spoken_reply`. Each widget then fetches its OWN data
+# independently (widgets.jsx useFetch calls) — ticker_pulse calls
+# api.getTickerQuote, watchlist calls api.getWatchlist, macro_regime calls
+# api.getCurrent, news calls api.getNewsMomentum, money_flow calls
+# api.getSectorFlows — all already served above. The verdict widget additionally
+# opens POST /api/v1/chat/ask/stream (SSE) on mount whenever compose gave it a
+# non-empty props.question (widgets.jsx VerdictCard, ~line 91).
+
+def chat_compose(scenario: str) -> dict:
+    """POST /api/v1/chat/compose -> mirrors ChatComposeResponse
+    (api/routers/chat.py:306-318): spoken_reply, widgets[{type,title,props}],
+    allocation[{ticker,weight}], generated_at, model_used, cannot_fulfill,
+    request_id, alert_created.
+    """
+    widgets = [
+        {"type": "verdict", "title": "Your read", "props": {"question": f"How is {TICKER} doing right now?"}},
+        {"type": "ticker_pulse", "title": TICKER, "props": {"ticker": TICKER}},
+        {"type": "watchlist", "title": "My stocks", "props": {}},
+        {"type": "macro_regime", "title": "The market right now", "props": {}},
+        {"type": "news", "title": "What's in the news", "props": {}},
+        {"type": "money_flow", "title": "Where attention is going", "props": {}},
+    ]
+    spoken = {
+        "healthy": f"Here's how things look for {TICKER} and the market right now.",
+        "partial": f"Here's what I've got for {TICKER} — a couple of things are still catching up.",
+        "empty": "I don't have anything saved or measured yet, but here's the market overview.",
+    }[scenario]
+    allocation = [] if scenario == "empty" else [{"ticker": TICKER, "weight": 1.0}]
+    return {
+        "spoken_reply": spoken,
+        "widgets": widgets,
+        "allocation": allocation,
+        "generated_at": GENERATED_AT,
+        "model_used": "fixture-rule-based",
+        "cannot_fulfill": False,
+        "request_id": None,
+        "alert_created": False,
+    }
+
+
+def chat_ask_stream_deltas(scenario: str) -> list[str]:
+    """Text chunks for the SSE stream at POST /api/v1/chat/ask/stream
+    (api/routers/chat.py:2740 ask_grid_stream, media_type text/event-stream).
+    api.js's askStream (api.js:945-976) only reads `data: {"delta": ...}`
+    lines and concatenates them — no explicit terminator is required, the
+    stream just ends when the connection closes.
+    """
+    sentence = {
+        "healthy": f"{TICKER} looks steady today, in line with a risk-on market read.",
+        "partial": f"{TICKER}'s workbook history is thin, and one data source is stale right now.",
+        "empty": "There isn't enough saved or measured data yet to give a read.",
+    }[scenario]
+    words = sentence.split(" ")
+    return [w + " " for w in words]
+
+
+# ── Journey (b) extra: watchlist ticker analysis/overview + derivatives ──
+# The #/watchlist/{ticker} view (WatchlistAnalysis.jsx) calls these before
+# /edge: GET .../analysis (watchlist_analysis.py::get_ticker_analysis),
+# GET .../overview (watchlist_overview.py::get_ticker_overview), and three
+# derivatives endpoints that return their own `{"error": ...}` shape on
+# failure rather than a fixture-side HTTP error.
+
+def watchlist_ticker_analysis(ticker: str, scenario: str) -> dict:
+    """Mirrors api/routers/watchlist_analysis.py::get_ticker_analysis
+    (composed-g, ~line 58-105 assembling `analysis`)."""
+    if scenario == "empty":
+        return {"ticker": ticker, "watchlist_item": None, "watchlist_saved": False, "period": "3M",
+                 "price_history": [], "price_source": None, "related_features": [], "options": [],
+                 "regime": None, "tradingview_signals": []}
+    price_history = [{"date": "2026-09-10", "value": 98.0}, {"date": "2026-09-15", "value": 100.0}]
+    payload = {
+        "ticker": ticker, "watchlist_item": {"ticker": ticker, "display_name": "Test One Corp"},
+        "watchlist_saved": True, "period": "3M",
+        "price_history": price_history, "price_source": "grid",
+        "related_features": [{"name": f"{ticker}_close", "z_score": 0.4}],
+        "options": [],
+        "regime": {"state": "RISK_ON", "confidence": 0.62} if scenario == "healthy" else None,
+        "tradingview_signals": [],
+    }
+    return payload
+
+
+def watchlist_ticker_overview(ticker: str, scenario: str) -> dict:
+    """Mirrors api/routers/watchlist_overview.py::get_ticker_overview
+    (composed-g, ~line 31-44 docstring: overview/key_levels/sentiment/
+    generated_at/sector_path)."""
+    if scenario == "empty":
+        return {"overview": "No price, options, or regime context is available for this ticker yet.",
+                 "key_levels": [], "sentiment": "unknown", "generated_at": GENERATED_AT, "sector_path": []}
+    return {
+        "overview": f"{ticker} is trading near its 5-day range with a risk-on macro backdrop.",
+        "key_levels": [{"level": 98.0, "label": "5D low"}, {"level": 100.0, "label": "5D high"}],
+        "sentiment": "neutral" if scenario == "partial" else "constructive",
+        "generated_at": GENERATED_AT,
+        "sector_path": ["Technology"],
+    }
+
+
+def derivatives_gex(ticker: str, scenario: str) -> dict:
+    """Mirrors api/routers/derivatives.py::get_gex (~line 81-95): returns the
+    full GEX profile, or {"error": ..., "ticker": ...} on failure — a shape
+    the fixture reproduces directly rather than a fixture-side HTTP error.
+    """
+    if scenario in ("partial", "empty"):
+        return {"error": "no options chain rows for this ticker", "ticker": ticker}
+    return {
+        "ticker": ticker, "gex_aggregate": 1_250_000.0, "gamma_flip": 99.5, "gamma_wall": 105.0,
+        "put_wall": 95.0, "call_wall": 105.0, "dealer_delta": 0.0, "vanna_exposure": 200.0,
+        "charm_exposure": -50.0, "regime": "long_gamma", "spot": 100.0, "per_strike": [],
+    }
+
+
+def derivatives_vanna_charm(ticker: str, scenario: str) -> dict:
+    """Mirrors api/routers/derivatives.py::get_vanna_charm (~line 172-192)."""
+    if scenario in ("partial", "empty"):
+        return {"error": "no options chain rows for this ticker", "ticker": ticker}
+    return {
+        "ticker": ticker, "vanna_exposure": 200.0, "charm_exposure": -50.0, "spot": 100.0,
+        "per_strike": [], "days_to_opex": 12, "interpretation": "Dealers are modestly long gamma into OpEx.",
+    }
+
+
+def derivatives_flow_timeline(ticker: str, scenario: str) -> dict:
+    """Mirrors api/routers/derivatives.py::get_flow_timeline (~line 854-872)."""
+    if scenario == "empty":
+        return {"ticker": ticker, "days": 90, "history": [], "gamma_flip_crossings": []}
+    history = [{"date": AS_OF_DATE, "net_gex": 1_250_000.0, "spot": 100.0, "regime": "long_gamma"}]
+    return {"ticker": ticker, "days": 90, "history": history, "gamma_flip_crossings": []}
+
+
+# ── Journey (d)/(e) real surfaces: Operator.jsx + Discovery.jsx ──────
+# The lead's browser run of the real PWA found these are the actual
+# operator-only ("research status" / "data health") surfaces wired up —
+# not a dedicated /research-status route. Operator.jsx (pwa/src/views/
+# Operator.jsx:51-64) loads all six in parallel on mount; Discovery.jsx
+# loads jobs/results/hypotheses.
+
+def system_status(scenario: str) -> dict:
+    """GET /api/v1/system/status -> mirrors SystemStatusResponse
+    (api/schemas/system.py:49-55)."""
+    return {
+        "database": {"connected": scenario != "empty", "size_mb": 512.0 if scenario != "empty" else 0.0},
+        "hyperspace": {"node_online": False, "api_available": False, "peer_id": None, "points": None,
+                        "connected_peers": None, "model_loaded": None},
+        "grid": {"features_total": 40 if scenario != "empty" else 0, "features_model_eligible": 12,
+                  "hypotheses_total": 6, "hypotheses_in_production": 1,
+                  "journal_entries_total": 30, "journal_entries_with_outcomes": 18},
+        "server": {"disk_total_gb": 500.0, "disk_used_gb": 120.0, "disk_free_gb": 380.0, "disk_percent": 24.0,
+                    "cpu_percent": 8.0, "memory_total_gb": 32.0, "memory_used_gb": 10.0, "memory_percent": 31.0,
+                    "cpu_temp_c": None, "gpu_temp_c": None},
+        "uptime_seconds": 86400.0,
+        "server_time": GENERATED_AT,
+    }
+
+
+def system_freshness(scenario: str) -> dict:
+    """GET /api/v1/system/freshness -> mirrors FreshnessResponse
+    (api/schemas/system.py:74-91)."""
+    if scenario == "empty":
+        return {"families": [], "overall_status": "RED",
+                 "stale_sources": [{"source": "test_puller_fred", "last_pull": None, "stale": True}]}
+    families = [{"family": "macro", "total": 1, "fresh_today": 1, "status": "GREEN"}]
+    stale_sources: list[dict] = []
+    overall = "GREEN"
+    if scenario == "partial":
+        families = [{"family": "macro", "total": 2, "fresh_today": 1, "stale": 1, "status": "YELLOW"}]
+        stale_sources = [{"source": "test_puller_finviz", "last_pull": "2026-09-08T06:00:00+00:00", "stale": True}]
+        overall = "YELLOW"
+    else:
+        families[0]["stale"] = 0
+    return {"families": families, "overall_status": overall, "stale_sources": stale_sources}
+
+
+def snapshots_issues(scenario: str) -> list[dict]:
+    """GET /api/v1/snapshots/issues -> returns a PLAIN LIST (not
+    {"issues": [...]}) — mirrors api/routers/snapshots.py:123-181 exactly.
+    See README "defects observed": Operator.jsx:61 does
+    `issuesRes?.issues || issuesRes || []`, which works for this shape,
+    but crashes (`issues.map is not a function`, Operator.jsx:365, no
+    Array.isArray guard) if a real fetch instead returns an `{error:true,...}`
+    object — this fixture always 200s so that path isn't reproduced here,
+    only documented.
+    """
+    if scenario == "empty":
+        return []
+    issues = [
+        {"id": 1, "created_at": "2026-09-15T06:05:00+00:00", "category": "ingestion", "severity": "WARNING",
+         "source": "test_puller_finviz", "title": "Stale pull", "detail": "No SUCCESS row in 24h.",
+         "stack_trace": None, "hermes_diagnosis": "Rate limited upstream.", "fix_applied": False,
+         "fix_result": None, "resolved_at": None, "cycle_number": 41},
+    ]
+    if scenario == "partial":
+        issues.append({"id": 2, "created_at": "2026-09-15T06:06:00+00:00", "category": "scoring",
+                        "severity": "ERROR", "source": "trust_scorer", "title": "Convergence detection skipped",
+                        "detail": "signal_sources query timed out.", "stack_trace": None,
+                        "hermes_diagnosis": None, "fix_applied": False, "fix_result": None,
+                        "resolved_at": None, "cycle_number": 42})
+    return issues
+
+
+def snapshots_latest(category: str, scenario: str) -> list[dict]:
+    """GET /api/v1/snapshots/latest/{category} -> a PLAIN LIST, mirrors
+    api/routers/snapshots.py:29-46 (store.get_latest)."""
+    if scenario == "empty":
+        return []
+    row = {"category": category, "snapshot_date": AS_OF_DATE, "metrics": {"sources_ok": 1, "sources_total": 1}}
+    if scenario == "partial":
+        row["metrics"] = {"sources_ok": 1, "sources_total": 2}
+    return [row]
+
+
+def discovery_jobs(scenario: str) -> dict:
+    """GET /api/v1/discovery/jobs -> mirrors api/routers/discovery.py:117-126."""
+    if scenario == "empty":
+        return {"jobs": []}
+    jobs = [{"id": "job-1", "type": "orthogonality", "status": "complete", "started": AS_OF_DATETIME}]
+    if scenario == "partial":
+        jobs.append({"id": "job-2", "type": "clustering", "status": "failed", "started": AS_OF_DATETIME,
+                      "error": "insufficient feature history"})
+    return {"jobs": jobs}
+
+
+def discovery_results(result_type: str, scenario: str) -> dict:
+    """GET /api/v1/discovery/results/{orthogonality|clustering} -> mirrors
+    api/routers/discovery.py:129-149."""
+    if scenario != "healthy":
+        return {"result": None, "message": f"No completed {result_type} run found"}
+    return {"result": {"type": result_type, "generated_at": GENERATED_AT, "summary": "synthetic fixture result"}}
+
+
+def discovery_hypotheses(scenario: str) -> dict:
+    """GET /api/v1/discovery/hypotheses -> mirrors
+    api/routers/discovery.py:261-291 (plain hypothesis_registry rows)."""
+    if scenario == "empty":
+        return {"hypotheses": []}
+    hyps = [{"id": 1, "statement": f"{TICKER} momentum leads sector flow", "state": "TESTING",
+             "layer": "REGIME", "created_at": AS_OF_DATETIME, "updated_at": AS_OF_DATETIME}]
+    if scenario == "partial":
+        hyps.append({"id": 2, "statement": "Untestable placeholder hypothesis", "state": "TESTING",
+                      "layer": "REGIME", "created_at": AS_OF_DATETIME, "updated_at": AS_OF_DATETIME,
+                      "skip_reason": "feature series has < 30 observations in window"})
+    return {"hypotheses": hyps}
+
+
+def discovery_hypotheses_results(scenario: str) -> dict:
+    """GET /api/v1/discovery/hypotheses/results -> mirrors
+    api/routers/discovery.py:155-251 (results[]/count)."""
+    if scenario == "empty":
+        return {"results": [], "count": 0}
+    results = [{"id": 1, "statement": f"{TICKER} momentum leads sector flow", "state": "TESTING",
+                "layer": "REGIME", "correlation": 0.42, "optimal_lag": 3, "r_squared": 0.18,
+                "feature_ids": [1], "lag_structure": None, "created_at": AS_OF_DATETIME,
+                "updated_at": AS_OF_DATETIME, "tested_at": AS_OF_DATETIME}]
+    if scenario == "partial":
+        # Explicit failure/skip reason on the second hypothesis — never a
+        # fabricated correlation/r_squared for an untested one.
+        results.append({"id": 2, "statement": "Untestable placeholder hypothesis", "state": "FAILED",
+                         "layer": "REGIME", "correlation": None, "optimal_lag": None, "r_squared": None,
+                         "feature_ids": [], "lag_structure": None, "created_at": AS_OF_DATETIME,
+                         "updated_at": AS_OF_DATETIME, "tested_at": None,
+                         "skip_reason": "feature series has < 30 observations in window"})
+    return {"results": results, "count": len(results)}
+
+
+def ticker_quote(ticker: str, scenario: str) -> dict:
+    """GET /api/v1/watchlist/{ticker}/quote -> mirrors
+    api/routers/watchlist_overview.py::get_ticker_quote (~line 378-437):
+    ticker/price/change_pct/put_call_ratio/max_pain/iv_atm/sentiment/source/
+    as_of/stale. Powers the Home page's ticker_pulse widget.
+    """
+    if scenario == "empty":
+        return {"ticker": ticker, "price": None, "change_pct": None, "put_call_ratio": None,
+                 "max_pain": None, "iv_atm": None, "sentiment": None, "source": None,
+                 "as_of": None, "stale": None}
+    return {
+        "ticker": ticker, "price": 100.0, "change_pct": 0.0 if scenario == "healthy" else -0.4,
+        "put_call_ratio": 0.9, "max_pain": 100.0, "iv_atm": 0.35,
+        "sentiment": "neutral", "source": "grid", "as_of": AS_OF_DATE,
+        "stale": scenario == "partial",
+    }
+
+
+def ten_year_portfolio_weekly(scenario: str) -> dict:
+    """GET /api/v1/ten-year-portfolio/weekly -> mirrors
+    api/routers/ten_year_portfolio.py::weekly_ten_year_portfolio (~line
+    262-298) + build_weekly_recommendation / build_profile_portfolio.
+
+    TenYearPortfolio.jsx:69-76 `money(value)` renders `null`/`NaN` as the
+    literal string "$0" (not "--" or "n/a" like its sibling `pct()`/
+    `number()` helpers) — see README "defects observed". That collapse
+    happens client-side, so this fixture still serves honest nulls in the
+    empty scenario; it does not manufacture a real-looking $0 either.
+    """
+    if scenario == "empty":
+        return {
+            "status": "empty",
+            "message": "No eligible Yahoo adjusted-close price history found.",
+            "universe": {"mode": "stocks_only", "requested_years": 10, "series_available": 0,
+                          "requested_candidates": 40, "stock_candidates": 0, "ranked_candidates": 0,
+                          "source": "raw_series:yfinance_adjusted_close",
+                          "frontier_source": "resolved_series:ticker_full",
+                          "input_universe_size": 40, "input_universe": "dad_chart_core_universe",
+                          "frontier_input_universe_size": 12},
+            "as_of": None, "capital": 1_000_000.0,
+            "benchmark": {"ticker": "QQQ", "cagr": None, "total_return": None, "sparkline": []},
+            "ranked": [], "profiles": [], "candidate_boards": [],
+        }
+    allocation = {
+        "ticker": TICKER, "score": 0.6, "cagr": 0.08, "annual_volatility": 0.22, "latest_price": 100.0,
+        "years": 10.0, "target_weight": 1.0, "target_dollars": 1_000_000.0, "whole_shares": 10000,
+        "estimated_position_value": 1_000_000.0, "action": "BUY", "hold_until_rank_below": 15,
+        "themes": ["synthetic"],
+    }
+    monte_carlo = {
+        "years": 10, "simulations": 2000, "p10": 900_000.0, "p50": 1_400_000.0, "p90": 2_100_000.0,
+        "probability_above_start": 0.78, "expected_annual_return": 0.08, "annual_volatility": 0.22,
+    }
+    profile = {
+        "id": "dad_chartist", "label": "Dad Chartist", "description": "Synthetic fixture profile.",
+        "capital": 1_000_000.0, "cash_target": 0.0, "estimated_invested": 1_000_000.0,
+        "estimated_residual_cash": 0.0, "top_n": 15, "max_position": 0.1, "configured_max_position": 0.1,
+        "hold_buffer": 5,
+        "weekly_policy": {"review": "weekly", "rebalance_threshold": "hold-rank/trend/weight drift only",
+                           "entry_rule": "New buys must rank inside top 15.",
+                           "exit_rule": "Existing names can be held until rank 20 unless the chart breaks."},
+        "monte_carlo": monte_carlo, "allocations": [allocation],
+    }
+    if scenario == "partial":
+        # Benchmark data is stale/incomplete while the ranked universe itself
+        # is fine — a stale flag on the benchmark, not a fabricated CAGR.
+        benchmark = {"ticker": "QQQ", "cagr": None, "total_return": None, "sparkline": [],
+                      "stale": True, "reason": "benchmark price history did not cover the full window"}
+    else:
+        benchmark = {"ticker": "QQQ", "cagr": 0.12, "total_return": 2.1, "sparkline": [100.0, 105.0, 112.0]}
+    return {
+        "status": "ok",
+        "as_of": AS_OF_DATE,
+        "capital": 1_000_000.0,
+        "benchmark": benchmark,
+        "universe": {"mode": "stocks_only", "requested_years": 10, "series_available": 1,
+                      "requested_candidates": 40, "stock_candidates": 1, "ranked_candidates": 1,
+                      "source": "raw_series:yfinance_adjusted_close",
+                      "frontier_source": "resolved_series:ticker_full",
+                      "input_universe_size": 40, "input_universe": "dad_chart_core_universe",
+                      "frontier_input_universe_size": 12},
+        "ranked": [allocation],
+        "profiles": [profile],
+        "candidate_boards": [],
+    }
