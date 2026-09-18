@@ -29,7 +29,7 @@ export default function RegimeCard({ regime, compact = false, onClick }) {
                     {regime.state}
                 </span>
                 <span style={{ fontSize: '12px', color: '#5A7080' }}>
-                    {Math.round((regime.confidence || 0) * 100)}%
+                    {regime.confidence != null ? `${Math.round(regime.confidence * 100)}%` : '--'}
                 </span>
             </span>
         );
@@ -50,7 +50,7 @@ export default function RegimeCard({ regime, compact = false, onClick }) {
             }}>
                 {regime.state}
             </div>
-            <ConfidenceMeter value={regime.confidence || 0} label="Confidence" color={color} />
+            <ConfidenceMeter value={regime.confidence ?? null} label="Confidence" color={color} />
             {regime.transition_probability > 0 && (
                 <div style={{
                     marginTop: '12px', fontSize: '13px', color: '#5A7080',

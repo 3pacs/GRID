@@ -59,12 +59,12 @@ function RegimeBar({ state, confidence, recommendation, isCurrent }) {
                 </div>
                 <span style={{ fontSize: '18px', fontWeight: 700, color: sc,
                     fontFamily: "'JetBrains Mono', monospace" }}>
-                    {Math.round(confidence * 100)}%
+                    {confidence != null ? `${Math.round(confidence * 100)}%` : '--'}
                 </span>
             </div>
             <div style={{ marginTop: '6px', height: '4px', borderRadius: '2px',
                 background: '#1A2840', overflow: 'hidden' }}>
-                <div style={{ height: '100%', width: `${confidence * 100}%`,
+                <div style={{ height: '100%', width: `${confidence != null ? confidence * 100 : 0}%`,
                     background: sc, borderRadius: '2px', transition: 'width 0.6s ease' }} />
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '6px' }}>
@@ -352,7 +352,7 @@ export default function Regime() {
                             <RegimeBar
                                 key={state}
                                 state={state}
-                                confidence={active?.confidence || 0}
+                                confidence={active?.confidence ?? null}
                                 recommendation={active?.recommendation}
                                 isCurrent={regime.state === state}
                             />
@@ -555,8 +555,10 @@ export default function Regime() {
                                 {history.map((h, i) => (
                                     <div key={i} style={{
                                         flex: 1, background: stateColors[h.state] || '#5A7080',
-                                        opacity: 0.5 + h.confidence * 0.5,
-                                    }} title={`${h.date}: ${h.state} (${Math.round(h.confidence * 100)}%)`} />
+                                        // null = unscored: dimmed, not drawn
+                                        // as a half-confident reading.
+                                        opacity: h.confidence != null ? 0.5 + h.confidence * 0.5 : 0.15,
+                                    }} title={`${h.date}: ${h.state} (${h.confidence != null ? `${Math.round(h.confidence * 100)}%` : 'unscored'})`} />
                                 ))}
                             </div>
                             <div style={{ display: 'flex', justifyContent: 'space-between',
@@ -591,7 +593,7 @@ export default function Regime() {
                                 </div>
                                 <span style={{ fontSize: '11px', color: '#5A7080',
                                     fontFamily: "'JetBrains Mono', monospace" }}>
-                                    {Math.round(t.confidence * 100)}%
+                                    {t.confidence != null ? `${Math.round(t.confidence * 100)}%` : '--'}
                                 </span>
                             </div>
                         ))

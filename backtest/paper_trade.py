@@ -82,6 +82,17 @@ class PaperTradeTracker:
             return {"error": "No regime data in decision_journal"}
 
         regime = row[0]
+        if row[1] is None:
+            # The latest decision is UNSCORED. Every prediction confidence
+            # below is a multiple of this number, so proceeding would turn one
+            # missing measurement into a whole set of invented ones. Refuse,
+            # the same way a missing regime row is refused.
+            return {
+                "error": "Latest decision_journal entry is unscored "
+                         "(state_confidence IS NULL) - no confidence to size "
+                         "predictions from; refusing to invent one",
+                "regime": regime,
+            }
         confidence = float(row[1])
         trans_prob = float(row[2])
         posture = row[3]
