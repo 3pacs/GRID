@@ -1200,7 +1200,95 @@ def intelligence_dashboard(scenario: str) -> dict:
 # -> GET /api/v1/system/pipeline-health), which is what Hermes/research
 # scheduling actually surfaces today.
 
+def _field_record(
+    *, availability, provenance=None, value=None, unit=None,
+    obs_date=None, obs_start=None, obs_end=None,
+    published_at=None, available_at=None, ingested_at=None,
+    revision=None, source_catalog=None, series_id=None,
+    calculation_version=None, coverage_fraction=None,
+    coverage_count=None, coverage_expected=None, stale_reason=None,
+):
+    """Mirrors store/availability_fields.py::FieldRecord.to_dict() exactly
+    (read at commit b5babef4, lines ~166-190: availability/provenance/value/
+    unit/obs_date/obs_start/obs_end/published_at/available_at/ingested_at/
+    revision/source_catalog/series_id/calculation_version/
+    coverage_fraction/coverage_count/coverage_expected/stale_reason).
+    """
+    return {
+        "availability": availability, "provenance": provenance, "value": value, "unit": unit,
+        "obs_date": obs_date, "obs_start": obs_start, "obs_end": obs_end,
+        "published_at": published_at, "available_at": available_at, "ingested_at": ingested_at,
+        "revision": revision, "source_catalog": source_catalog, "series_id": series_id,
+        "calculation_version": calculation_version, "coverage_fraction": coverage_fraction,
+        "coverage_count": coverage_count, "coverage_expected": coverage_expected,
+        "stale_reason": stale_reason,
+    }
+
+
+def research_status(scenario: str) -> dict:
+    """GET /api/v1/snapshots/research/latest -> mirrors
+    api/routers/snapshots.py::get_latest_research_run (read at commit
+    2218e88d, lines 36-70) and scripts/research_status.py's
+    latest_research_run_result / latest_hypothesis_outcome (same commit,
+    whole file): a research_run row flattened to the top level (run_id,
+    status — the RECORD's own lifecycle status, not an envelope sentinel —
+    phase, error, error_category, iteration, iterations, skip_reasons,
+    failure_reasons, duration_s, generation, code_sha, inputs), plus
+    latest_hypothesis (id/statement/layer/state/kill_reason/updated_at)
+    when a hypothesis_registry row exists — a SEPARATE, independent read,
+    not extracted from the run record (research_status.py's
+    latest_hypothesis_outcome docstring).
+
+    - empty (table reachable, zero rows): {"status": "no_runs"}
+    - healthy: an "ok" run, iterations 3, no skip/failure reasons.
+    - partial: a "failed" run at phase "feature_list" with one skip reason
+      and one failure reason (a timeout-status example was explicitly not
+      requested — not built).
+    """
+    if scenario == "empty":
+        return {"status": "no_runs"}
+    if scenario == "partial":
+        return {
+            "id": 501, "created_at": AS_OF_DATETIME,
+            "run_id": "run-test1-002", "status": "failed", "phase": "feature_list",
+            "error": "feature_list query timed out", "error_category": "operational_timeout",
+            "iteration": 2, "iterations": 2,
+            "skip_reasons": ["TEST2: insufficient price history"],
+            "failure_reasons": ["feature_list: statement timeout after 30s"],
+            "duration_s": 41.2, "generation": 7, "code_sha": "dbef7ced",
+            "inputs": {"feature_ids_count": 0, "market_snapshot_keys": [], "evaluation_version": "v3"},
+            "latest_hypothesis": {
+                "id": 2, "statement": "Untestable placeholder hypothesis", "layer": "REGIME",
+                "state": "FAILED", "kill_reason": "feature series has < 30 observations in window",
+                "updated_at": AS_OF_DATETIME,
+            },
+        }
+    return {
+        "id": 500, "created_at": AS_OF_DATETIME,
+        "run_id": "run-test1-001", "status": "ok", "phase": "complete",
+        "error": None, "error_category": None,
+        "iteration": 3, "iterations": 3,
+        "skip_reasons": [], "failure_reasons": [],
+        "duration_s": 118.4, "generation": 7, "code_sha": "dbef7ced",
+        "inputs": {
+            "feature_ids_count": 40,
+            "market_snapshot_keys": ["vix_close", "sp500_full"],
+            "evaluation_version": "v3",
+        },
+        "latest_hypothesis": {
+            "id": 1, "statement": f"{TICKER} momentum leads sector flow", "layer": "REGIME",
+            "state": "TESTING", "kill_reason": None, "updated_at": AS_OF_DATETIME,
+        },
+    }
+
+
 def pipeline_health(scenario: str) -> dict:
+    """GET /api/v1/system/pipeline-health -> mirrors PipelineHealthResponse
+    (api/schemas/system.py, read at commit 28b536df, lines 176-190):
+    top-level `availability`/`stale_reason` (draft #567 contract addition),
+    and each source's `field_record` (:143-148,
+    store/availability_fields.py::FieldRecord.to_dict()).
+    """
     if scenario == "empty":
         return {
             "summary": {"total_sources": 0, "healthy": 0, "stale": 0, "broken": 0},
@@ -1208,6 +1296,8 @@ def pipeline_health(scenario: str) -> dict:
             "coverage": {},
             "recent_errors": [],
             "resolver_status": {"pending": 0, "last_run": None, "last_resolved": 0},
+            "availability": "unavailable",
+            "stale_reason": "unknown",
         }
     sources = [
         {
@@ -1220,11 +1310,19 @@ def pipeline_health(scenario: str) -> dict:
             "freshness": "green",
             "series_count": 4,
             "error": None,
+            "field_record": _field_record(
+                availability="available", provenance="measured",
+                ingested_at="2026-09-15T06:00:00+00:00", source_catalog="test_puller_fred",
+                # healthy: published_at/available_at/revision/coverage stay null.
+            ),
         },
     ]
     summary = {"total_sources": 1, "healthy": 1, "stale": 0, "broken": 0}
     recent_errors = []
+    availability = "available"
+    stale_reason = None
     if scenario == "partial":
+        sources[0]["field_record"]["stale_reason"] = None  # still healthy, unaffected
         sources.append({
             "name": "test_puller_finviz",
             "type": "altdata",
@@ -1235,8 +1333,28 @@ def pipeline_health(scenario: str) -> dict:
             "freshness": "yellow",
             "series_count": 0,
             "error": "last successful pull was 7 days ago",
+            "field_record": _field_record(
+                availability="available", provenance="measured",
+                ingested_at="2026-09-08T06:00:00+00:00", source_catalog="test_puller_finviz",
+                stale_reason="stale",
+            ),
         })
-        summary = {"total_sources": 2, "healthy": 1, "stale": 1, "broken": 0}
+        sources.append({
+            "name": "test_puller_never_configured",
+            "type": "altdata",
+            "status": "broken",
+            "last_pull": None,
+            "rows_last_pull": None,
+            "next_scheduled": None,
+            "freshness": "red",
+            "series_count": None,
+            "error": "no API key / puller never set up for this environment",
+            "field_record": _field_record(
+                availability="unavailable", source_catalog="test_puller_never_configured",
+                stale_reason="never_configured",
+            ),
+        })
+        summary = {"total_sources": 3, "healthy": 1, "stale": 1, "broken": 1}
         recent_errors = [{"timestamp": "2026-09-15T06:05:00+00:00", "source": "test_puller_finviz", "message": "stale (>24h since last SUCCESS row)"}]
     return {
         "summary": summary,
@@ -1244,6 +1362,8 @@ def pipeline_health(scenario: str) -> dict:
         "coverage": {"macro": {"total": 1, "with_data": 1, "pct": 100.0}},
         "recent_errors": recent_errors,
         "resolver_status": {"pending": 0, "last_run": "2026-09-15T06:10:00+00:00", "last_resolved": 4},
+        "availability": availability,
+        "stale_reason": stale_reason,
     }
 
 
@@ -1530,20 +1650,47 @@ def system_status(scenario: str) -> dict:
 
 def system_freshness(scenario: str) -> dict:
     """GET /api/v1/system/freshness -> mirrors FreshnessResponse
-    (api/schemas/system.py:74-91)."""
+    (api/schemas/system.py, read at commit 28b536df, lines 82-102):
+    top-level `availability`/`stale_reason` (draft #567), and each
+    StaleSource's `field_record` (:82-91, same FieldRecord.to_dict() shape
+    as pipeline_health above).
+    """
     if scenario == "empty":
-        return {"families": [], "overall_status": "RED",
-                 "stale_sources": [{"source": "test_puller_fred", "last_pull": None, "stale": True}]}
+        return {
+            "families": [], "overall_status": "RED", "stale_sources": [],
+            "availability": "unavailable", "stale_reason": "unknown",
+        }
     families = [{"family": "macro", "total": 1, "fresh_today": 1, "status": "GREEN"}]
     stale_sources: list[dict] = []
     overall = "GREEN"
+    availability = "available"
+    stale_reason = None
     if scenario == "partial":
         families = [{"family": "macro", "total": 2, "fresh_today": 1, "stale": 1, "status": "YELLOW"}]
-        stale_sources = [{"source": "test_puller_finviz", "last_pull": "2026-09-08T06:00:00+00:00", "stale": True}]
+        stale_sources = [
+            {
+                "source": "test_puller_finviz", "last_pull": "2026-09-08T06:00:00+00:00", "stale": True,
+                "field_record": _field_record(
+                    availability="available", provenance="measured",
+                    ingested_at="2026-09-08T06:00:00+00:00", source_catalog="test_puller_finviz",
+                    stale_reason="stale",
+                ),
+            },
+            {
+                "source": "test_puller_never_configured", "last_pull": None, "stale": True,
+                "field_record": _field_record(
+                    availability="unavailable", source_catalog="test_puller_never_configured",
+                    stale_reason="never_configured",
+                ),
+            },
+        ]
         overall = "YELLOW"
     else:
         families[0]["stale"] = 0
-    return {"families": families, "overall_status": overall, "stale_sources": stale_sources}
+    return {
+        "families": families, "overall_status": overall, "stale_sources": stale_sources,
+        "availability": availability, "stale_reason": stale_reason,
+    }
 
 
 def snapshots_issues(scenario: str) -> list[dict]:

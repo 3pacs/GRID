@@ -100,6 +100,14 @@ ROUTES: list[tuple[str, re.Pattern, callable]] = [
     ("GET", re.compile(r"^/api/v1/discovery/hypotheses/results$"),
      lambda m, q, s: fx.discovery_hypotheses_results(s)),
     ("GET", re.compile(r"^/api/v1/discovery/hypotheses$"), lambda m, q, s: fx.discovery_hypotheses(s)),
+    # /research/latest: --research-unavailable (default off) forces the
+    # envelope-level "unavailable" shape regardless of --scenario, for
+    # checking that specific rendering without needing a real DB outage.
+    ("GET", re.compile(r"^/api/v1/snapshots/research/latest$"),
+     lambda m, q, s: (
+         {"status": "unavailable", "reason": "fixture: category unavailable"}
+         if FixtureHandler.research_unavailable else fx.research_status(s)
+     )),
 
     # (e) data health / source drill-down — Operator.jsx's actual six calls.
     ("GET", re.compile(r"^/api/v1/system/status$"), lambda m, q, s: fx.system_status(s)),
@@ -120,6 +128,7 @@ _ASK_STREAM_PATH = re.compile(r"^/api/v1/chat/ask/stream$")
 
 class FixtureHandler(BaseHTTPRequestHandler):
     scenario = "healthy"
+    research_unavailable = False
 
     def _send_json(self, payload, status=200):
         body = json.dumps(payload, indent=2).encode("utf-8")
@@ -206,9 +215,20 @@ def main() -> int:
         choices=VALID_SCENARIOS,
         default=os.environ.get("FIXTURE_SCENARIO", "healthy"),
     )
+    parser.add_argument(
+        "--research-unavailable",
+        action="store_true",
+        default=False,
+        help=(
+            "Force GET /api/v1/snapshots/research/latest to the envelope-level "
+            "{'status': 'unavailable', ...} shape regardless of --scenario "
+            "(default off — /research/latest follows --scenario like everything else)."
+        ),
+    )
     args = parser.parse_args()
 
     FixtureHandler.scenario = args.scenario
+    FixtureHandler.research_unavailable = args.research_unavailable
     server = ThreadingHTTPServer(("127.0.0.1", args.port), FixtureHandler)
     print(
         f"[fixture-api] serving scenario={args.scenario!r} on http://127.0.0.1:{args.port} "

@@ -123,8 +123,8 @@ const JOURNEYS = {
         { name: 'watchlist-analysis', hash: '#/watchlist/TEST1', ready: /INSIDER EDGE|AI OVERVIEW/ },
         { name: 'portfolio', hash: '#/portfolio', ready: /Portfolio Value/ },
         { name: 'operator', hash: '#/operator', ready: /HERMES STATUS/ },
-        { name: 'discovery', hash: '#/discovery', ready: /HYPOTHESES/ },
-        { name: 'pipeline-health', hash: '#/pipeline-health', ready: /PIPELINE HEALTH/ },
+        { name: 'discovery', hash: '#/discovery', ready: /HYPOTHESES|RESEARCH RUN|No research run recorded|Research status unavailable/ },
+        { name: 'pipeline-health', hash: '#/pipeline-health', ready: /PIPELINE HEALTH|Pipeline health unavailable/ },
         { name: 'ten-year', hash: '#/ten-year', ready: /10-Year|TOP CHART|No eligible/ },
         { name: 'snapshots', hash: '#/snapshots', ready: /LATEST SNAPSHOT|No snapshots|Snapshots unavailable|unexpected response/ },
         // Operator (admin) can reach catalyst-timeline normally, unlike the
