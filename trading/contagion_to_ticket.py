@@ -557,6 +557,28 @@ def _get_default_model_version_id(engine: Engine) -> int | None:
         return None
 
 
+def _unscored_reason(ticket: dict[str, Any]) -> str:
+    """Spell out, for the permanent record, why a ticket has no confidence.
+
+    Stored in ``decision_journal.confidence_reason``. It must be readable on
+    its own years later, so it names the basis tag and the sample size rather
+    than assuming the reader can re-derive them.
+    """
+    basis = ticket.get("confidence_basis") or CONFIDENCE_BASIS_NO_HISTORY
+    n = ticket.get("confidence_n")
+    n_txt = f"n={n}" if n is not None else "n unknown"
+    if basis == CONFIDENCE_BASIS_NO_HISTORY:
+        return (
+            "unscored: no contagion backtest history for shock_type="
+            f"{ticket.get('shock_type')} ({basis}, {n_txt}) — no confidence "
+            "was measured and none was invented"
+        )
+    return (
+        f"unscored: confidence unavailable ({basis}, {n_txt}) — no confidence "
+        "was measured and none was invented"
+    )
+
+
 def write_ticket_to_journal(
     engine: Engine,
     ticket: dict[str, Any],
@@ -574,23 +596,30 @@ def write_ticket_to_journal(
         log.debug("journal skip: no model_version_id available")
         return None
 
-    # ``DecisionJournal.log_decision`` requires a 0-1 ``state_confidence`` and
-    # the journal is immutable, so a ticket with no measured confidence cannot
-    # be logged without inventing one. It is skipped instead: the previous
-    # ``float(ticket.get("confidence") or 0.5)`` wrote a fabricated 0.5 into
-    # the permanent audit record, and an immutable log is the worst possible
-    # place to put a made-up number. The caller sees no journal_id and the
-    # reason is logged.
+    # Three states, not two. The pre-#539 code wrote a fabricated 0.5 into the
+    # permanent audit record whenever a ticket had no measured confidence; #539
+    # replaced that with skipping the row, which traded a false number for a
+    # missing record. Neither is the audit the operator needs. Since
+    # journal_unscored_conf_0918 the journal can hold the honest third state:
+    # state_confidence NULL plus a mandatory reason. Nothing is invented and
+    # nothing is omitted.
     raw_confidence = ticket.get("confidence")
+    confidence: float | None
+    confidence_reason: str | None
     if raw_confidence is None:
+        confidence = None
+        confidence_reason = _unscored_reason(ticket)
         log.info(
-            "journal skip for {t}: confidence is null ({b}) — refusing to "
-            "write a placeholder into the immutable journal",
+            "journal unscored for {t}: {r}",
             t=ticket.get("ticker"),
-            b=ticket.get("confidence_basis"),
+            r=confidence_reason,
         )
-        return None
-    confidence = max(0.0, min(1.0, float(raw_confidence)))
+    else:
+        confidence = max(0.0, min(1.0, float(raw_confidence)))
+        confidence_reason = (
+            f"scored: {ticket.get('confidence_basis') or CONFIDENCE_BASIS_BACKTEST} "
+            f"(n={ticket.get('confidence_n')})"
+        )
     state_label = f"CONTAGION_{str(ticket.get('shock_type','')).upper()}"
     action = (
         f"{ticket['direction'].upper()} {ticket['instrument'].upper()} "
@@ -612,15 +641,24 @@ def write_ticket_to_journal(
             model_version_id=mv_id,
             inferred_state=state_label,
             state_confidence=confidence,
+            confidence_reason=confidence_reason,
             transition_probability=min(1.0, max(0.0, ticket.get("kelly_size", 0.0))),
             contradiction_flags=contradiction,
             grid_recommendation=action,
             baseline_recommendation="HOLD",
             action_taken=action,
             counterfactual=ticket.get("thesis", ""),
+            # operator_confidence is a categorical NOT NULL column and is a
+            # different thing from the measured state_confidence. With no
+            # measurement at all there is no evidence of an edge, so the
+            # truthful category is the floor, LOW — and the row carries
+            # confidence_reason so "LOW" is never mistaken for a measurement.
             operator_confidence=(
-                "HIGH" if confidence >= 0.65
-                else ("MEDIUM" if confidence >= 0.5 else "LOW")
+                "LOW" if confidence is None
+                else (
+                    "HIGH" if confidence >= 0.65
+                    else ("MEDIUM" if confidence >= 0.5 else "LOW")
+                )
             ),
         )
         return int(decision_id)
