@@ -1786,3 +1786,35 @@ CREATE INDEX IF NOT EXISTS idx_market_briefings_date
     ON market_briefings (briefing_date DESC);
 CREATE INDEX IF NOT EXISTS idx_market_briefings_type
     ON market_briefings (briefing_type, briefing_date DESC);
+
+-- ---------------------------------------------------------------------------
+-- insider_trades: normally created by revision f1a2b3c4d5e6_capital_flow_tables
+-- (and lazily by ingestion/flow_materializer.py). Declared here too because a
+-- database built from schema.sql and stamped at a later revision skips that
+-- revision, and the god-view materialized view (revision
+-- god_view_market_tables_20260918) reads insider_trades. DDL identical to the
+-- revision; idempotent.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS insider_trades (
+    id              BIGSERIAL PRIMARY KEY,
+    ticker          TEXT NOT NULL,
+    trade_date      DATE NOT NULL,
+    insider_name    TEXT NOT NULL,
+    insider_title   TEXT,
+    trade_type      TEXT NOT NULL,
+    shares          NUMERIC,
+    value           NUMERIC,
+    price_per_share NUMERIC,
+    filing_date     DATE,
+    is_cluster_buy  BOOLEAN DEFAULT FALSE,
+    signal_source_id INTEGER,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (ticker, trade_date, insider_name, trade_type)
+);
+CREATE INDEX IF NOT EXISTS ix_insider_trades_ticker_date
+    ON insider_trades (ticker, trade_date DESC);
+CREATE INDEX IF NOT EXISTS ix_insider_trades_value
+    ON insider_trades (value DESC NULLS LAST);
+CREATE INDEX IF NOT EXISTS ix_insider_trades_cluster_buy
+    ON insider_trades (is_cluster_buy)
+    WHERE is_cluster_buy = TRUE;

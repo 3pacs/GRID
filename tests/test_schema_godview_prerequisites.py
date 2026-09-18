@@ -1,12 +1,15 @@
 """The god-view revision is not self-contained: its materialized view reads two tables that the
-revision itself never creates. A fresh install applies ``schema.sql`` (scripts/server_startup.sh)
-and then runs ``alembic upgrade head``; if either table is missing at that point the upgrade fails
-with ``relation ... does not exist`` (observed on an isolated database, 2026-09-18).
+revision itself never creates, so ``alembic upgrade`` through it fails with
+``relation ... does not exist`` unless both already exist (observed on isolated databases,
+2026-09-18).
 
-* ``insider_trades`` is created by the earlier revision ``f1a2b3c4d5e6_capital_flow_tables``.
-* ``market_briefings`` was only ever created lazily at runtime by ``ollama/market_briefing.py``;
-  it must be declared in ``schema.sql`` (with the same DDL) so the upgrade can run on a fresh box.
+* ``insider_trades`` is created by the earlier revision ``f1a2b3c4d5e6_capital_flow_tables`` —
+  but a database built from ``schema.sql`` and *stamped* at a later revision skips that revision
+  (and the full history cannot be replayed from nothing on a schema.sql database today: three
+  older revisions reference ``discovered_hypotheses``, which schema.sql never creates).
+* ``market_briefings`` was only ever created lazily at runtime by ``ollama/market_briefing.py``.
 
+Both are therefore declared in ``schema.sql`` with the same DDL as their existing creators.
 This guard reads the files only; it needs no database.
 """
 
@@ -56,6 +59,17 @@ def test_god_view_revision_reads_the_two_external_tables():
 
 def test_insider_trades_is_created_by_an_earlier_revision():
     assert _creates(CAPITAL_FLOW.read_text(encoding="utf-8"), "insider_trades")
+
+
+def test_insider_trades_is_declared_in_schema_sql_with_the_revision_ddl():
+    schema = SCHEMA.read_text(encoding="utf-8")
+    assert _creates(schema, "insider_trades")
+    assert "IF NOT EXISTS insider_trades" in schema
+    assert _columns(schema, "insider_trades") == _columns(
+        CAPITAL_FLOW.read_text(encoding="utf-8"), "insider_trades"
+    )
+    for col in ("trade_date", "trade_type"):  # the columns the god-view matview reads
+        assert col in _columns(schema, "insider_trades")
 
 
 def test_market_briefings_is_declared_in_schema_sql():
