@@ -1484,40 +1484,45 @@ class OracleEngine:
                 #   alpha_research:vix_exposure  ×1.40 (1826r/0w)
                 #   alpha_research:credit_cycle  ×0.20 (0r/1826w, suspected sign-inverted)
                 #   news_intel                    ×0.60 (102r/204w)
-                # Master switch GRID_SIGNAL_OVERRIDES_ENABLED (default ON).
+                #
+                # SAFEGUARDS (2026-09-18, GRID W7): this used to read
+                # SIGNAL_WEIGHT_OVERRIDES / DEFERRED_SIGNAL_OVERRIDES
+                # directly and only gate on the SIGNAL_OVERRIDES_ENABLED
+                # flag — which bypassed the promotion_ledger check that
+                # intelligence.signal_weight_overrides.get_override()
+                # enforces for the non-deferred path. Use
+                # get_effective_overrides() instead: it returns the
+                # merged table only when BOTH the master switch is on
+                # AND a matching promotion_ledger approval exists,
+                # otherwise {} (nothing applied). Master switch
+                # GRID_SIGNAL_OVERRIDES_ENABLED now defaults OFF.
                 try:
                     from intelligence.signal_weight_overrides import (
-                        SIGNAL_WEIGHT_OVERRIDES,
-                        DEFERRED_SIGNAL_OVERRIDES,
-                        SIGNAL_OVERRIDES_ENABLED,
                         SIGNAL_OVERRIDE_MIN,
                         SIGNAL_OVERRIDE_MAX,
+                        get_effective_overrides,
                     )
-                    if SIGNAL_OVERRIDES_ENABLED:
-                        # Merge bare-name + full-name overrides — bare
-                        # for asset families (equity/vol/...), full for
-                        # the deferred research signals (alpha_research:*,
-                        # news_intel).
-                        _merged_overrides = {
-                            **SIGNAL_WEIGHT_OVERRIDES,
-                            **DEFERRED_SIGNAL_OVERRIDES,
-                        }
-                        for i, sig in enumerate(signals):
-                            mult = _merged_overrides.get(sig.name)
-                            if mult is None:
-                                # Try the bare family name too (signals
-                                # sometimes carry just "vol" instead of
-                                # "feature:vol").
-                                mult = _merged_overrides.get(
-                                    getattr(sig, "family", "")
-                                )
-                            if mult is None:
-                                continue
-                            mult = max(
-                                SIGNAL_OVERRIDE_MIN,
-                                min(SIGNAL_OVERRIDE_MAX, float(mult)),
+                    # Merge bare-name + full-name overrides — bare for
+                    # asset families (equity/vol/...), full for the
+                    # deferred research signals (alpha_research:*,
+                    # news_intel). Empty unless promoted.
+                    _merged_overrides = get_effective_overrides()
+                    for i, sig in enumerate(signals):
+                        mult = _merged_overrides.get(sig.name)
+                        if mult is None:
+                            # Try the bare family name too (signals
+                            # sometimes carry just "vol" instead of
+                            # "feature:vol").
+                            mult = _merged_overrides.get(
+                                getattr(sig, "family", "")
                             )
-                            signals[i] = replace(sig, weight=sig.weight * mult)
+                        if mult is None:
+                            continue
+                        mult = max(
+                            SIGNAL_OVERRIDE_MIN,
+                            min(SIGNAL_OVERRIDE_MAX, float(mult)),
+                        )
+                        signals[i] = replace(sig, weight=sig.weight * mult)
                 except Exception as exc:  # noqa: BLE001
                     log.debug("signal_weight_overrides skipped: {e}", e=str(exc))
 
