@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 
 import pytest
 
+import godview.sec_ftd_pillar as sec_ftd_pillar
 from godview.sec_ftd_pillar import (
     AGE_NOTE,
     NOT_A_TIMELINE_NOTE,
@@ -13,6 +14,7 @@ from godview.sec_ftd_pillar import (
     compute_age_days,
     compute_release_date,
     compute_total_failed_usd,
+    materialize_sec_ftd_pillar,
     resolve_display_symbol,
 )
 
@@ -70,3 +72,131 @@ def test_resolve_display_symbol_falls_back_to_cusip_and_says_so():
 def test_compute_age_days_is_calendar_days_since_settlement():
     assert compute_age_days(date(2026, 8, 17), date(2026, 9, 18)) == 32
     assert compute_age_days(date(2026, 9, 18), date(2026, 9, 18)) == 0
+
+
+# ---------------------------------------------------------------------------
+# Regression fake: real-Postgres run 4 (composition 0f0451aa) found
+# materialize_sec_ftd_pillar returning FAILED with
+# psycopg2.errors.NotNullViolation on mandatory_buyin_date -- the pillar
+# deliberately writes NULL there (no T+35 buy-in timeline, see
+# NOT_A_TIMELINE_NOTE) but god_view_market_tables_20260918 declared that
+# column NOT NULL. The bare fed_liquidity_pillar_pure.py-style _FakeConn (a
+# no-op that returns an empty result for any SQL, never inspecting params)
+# would have let this defect through silently. This fake actually enforces
+# NOT NULL on INSERTs into sec_regsho_ftd_cns, so this class of defect
+# cannot pass a pure test again without a real database.
+# ---------------------------------------------------------------------------
+
+
+class _FakeNotNullViolation(Exception):
+    pass
+
+
+#: The REAL, CURRENT schema's NOT NULL columns for sec_regsho_ftd_cns, after
+#: migrations/versions/godview_pit_secftd_0918.py's 2026-09-18 fix DROPped
+#: the constraint on mandatory_buyin_date. days_remaining/squeeze_risk_score
+#: were already nullable in god_view_market_tables_20260918 -- checked, not
+#: guessed.
+_FIXED_NOT_NULL_COLUMNS = frozenset({"settlement_date", "ticker", "failed_shares"})
+
+
+class _FakeResult:
+    def mappings(self):
+        return self
+
+    def all(self):
+        return []
+
+    def fetchall(self):
+        return []
+
+    def fetchone(self):
+        return None
+
+    def scalar(self):
+        return 1
+
+
+class _FakeConn:
+    """Unlike the bare fed-liquidity fake, this one enforces NOT NULL on the
+    one statement that matters here: the raw INSERT into sec_regsho_ftd_cns
+    (every other DB call the materializer makes is monkeypatched away at the
+    helper-function level below, mirroring test_fed_liquidity_pillar_pure.py's
+    pattern)."""
+
+    def __init__(self, not_null_columns: frozenset[str]):
+        self._not_null_columns = not_null_columns
+
+    def execute(self, stmt, params=None):
+        if params is not None and "INSERT INTO sec_regsho_ftd_cns" in str(stmt):
+            for column in self._not_null_columns:
+                if params.get(column) is None:
+                    raise _FakeNotNullViolation(
+                        f'null value in column "{column}" of relation '
+                        f'"sec_regsho_ftd_cns" violates not-null constraint'
+                    )
+        return _FakeResult()
+
+
+class _FakeEngineCtx:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __enter__(self):
+        return self._conn
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeEngine:
+    def __init__(self, not_null_columns: frozenset[str]):
+        self._not_null_columns = not_null_columns
+
+    def begin(self):
+        return _FakeEngineCtx(_FakeConn(self._not_null_columns))
+
+
+def _patched_materialize(monkeypatch, *, not_null_columns: frozenset[str]):
+    settlement_date = date(2026, 8, 20)
+    pull_timestamp = datetime(2026, 9, 15, 6, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(sec_ftd_pillar, "_discover_cusips", lambda conn, as_of: ["Y4000A102"])
+    monkeypatch.setattr(
+        sec_ftd_pillar,
+        "_read_cusip_history",
+        lambda conn, cusip, as_of: {
+            settlement_date: {
+                "failed_shares": 373.0,
+                "symbol": "AAPL",
+                "price": 16.99,
+                "pull_timestamp": pull_timestamp,
+            }
+        },
+    )
+    monkeypatch.setattr(sec_ftd_pillar, "_existing_settlement_dates", lambda conn, ticker, cusip: set())
+    monkeypatch.setattr(sec_ftd_pillar, "_distinct_pull_count", lambda conn, cusip, obs_date: 1)
+    monkeypatch.setattr(sec_ftd_pillar, "record_generation", lambda *a, **k: None)
+
+    return materialize_sec_ftd_pillar(_FakeEngine(not_null_columns), as_of=date(2026, 9, 18))
+
+
+def test_materializer_null_mandatory_buyin_date_fails_pre_fix_schema_passes_fixed_schema(monkeypatch):
+    """Fails before the 2026-09-18 fix's column set is used, passes after.
+
+    Run with the PRE-FIX column set (mandatory_buyin_date still NOT NULL,
+    matching god_view_market_tables_20260918 before
+    godview_pit_secftd_0918's ALTER), the materializer's real row --
+    mandatory_buyin_date deliberately None -- fails exactly the way real
+    Postgres did on composition 0f0451aa. Run with the FIXED column set (that
+    migration's DROP NOT NULL applied), the identical row succeeds.
+    """
+    pre_fix_columns = _FIXED_NOT_NULL_COLUMNS | {"mandatory_buyin_date"}
+
+    result_before = _patched_materialize(monkeypatch, not_null_columns=pre_fix_columns)
+    assert result_before.status == "FAILED"
+    assert "mandatory_buyin_date" in result_before.message
+
+    result_after = _patched_materialize(monkeypatch, not_null_columns=_FIXED_NOT_NULL_COLUMNS)
+    assert result_after.status == "SUCCESS"
+    assert result_after.rows_written == 1
