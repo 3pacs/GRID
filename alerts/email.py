@@ -123,18 +123,37 @@ def _section_100x(
     ticker: str, direction: str, score: float, thesis: str, payoff: float = 0,
     confidence: str | None = None,
 ) -> dict:
-    # A row's own confidence label (LOW/MEDIUM/HIGH, stored alongside the
-    # score in options_mispricing_scans) must survive into the rendered
-    # alert — without it, a LOW-confidence flagged opportunity is visually
-    # identical to a HIGH-confidence one: same purple accent, same "100x
-    # Opportunity" title, same weight. Treat anything that isn't a
-    # recognized non-LOW label (missing, empty, unexpected value) as LOW
-    # too, so a legacy row or a future label this code doesn't know about
-    # fails toward caution rather than toward the confident-looking default.
-    is_low_confidence = (confidence or "").strip().upper() not in ("MEDIUM", "HIGH")
-    conf_note = (
-        ' &nbsp; <span class="badge badge-hold">LOW CONFIDENCE</span>' if is_low_confidence else ""
-    )
+    # options_mispricing_scans.confidence (LOW/MEDIUM/HIGH) must survive
+    # into the rendered alert — without it, a LOW-confidence flagged row is
+    # visually identical to a HIGH-confidence one: same purple accent, same
+    # "100x Opportunity" title, same weight.
+    #
+    # Note on what this label actually is: discovery/options_scanner.py sets
+    # it from a fixed threshold on the composite score (>=8.0/>=6.0), not
+    # from a scored track record (hit rate, calibration, verified-vs-flagged
+    # count) — the bar docs/reference/CONFIDENCE_POLICY.md sets for a field
+    # named "confidence". Relaying it here is still strictly better than the
+    # prior behavior (no signal at all reached the alert), but it does not
+    # make the underlying label a measured confidence; renaming it belongs
+    # to whoever next revises discovery/options_scanner.py, not this fix.
+    #
+    # The column is `confidence TEXT NOT NULL` today (verified against
+    # main and against #539's reshaping of this table, which leaves this
+    # column untouched), so None/malformed input isn't reachable through
+    # the live schema — the branch below is defensive for a legacy row or
+    # a future write path, not a currently-observed case. It renders
+    # distinctly from a recorded "LOW": labelling it "LOW CONFIDENCE" would
+    # assert something we don't actually know, so it gets its own wording.
+    label = (confidence or "").strip().upper()
+    if label == "LOW":
+        conf_note = ' &nbsp; <span class="badge badge-hold">LOW CONFIDENCE</span>'
+        accent = "amber"
+    elif label in ("MEDIUM", "HIGH"):
+        conf_note = ""
+        accent = "purple"
+    else:
+        conf_note = ' &nbsp; <span class="badge badge-hold">CONFIDENCE UNKNOWN</span>'
+        accent = "amber"
     return {
         "title": f"100x Opportunity — {ticker}",
         "body": (
@@ -145,7 +164,7 @@ def _section_100x(
             f'{conf_note}'
             f'<br><br>{thesis}'
         ),
-        "accent": "amber" if is_low_confidence else "purple",
+        "accent": accent,
     }
 
 
@@ -512,9 +531,14 @@ def daily_digest(dry_run: bool = False) -> dict[str, Any]:
             # gets a row on a FAILED pull (value=0, a real pull_timestamp),
             # so counting every row regardless of status reports a source as
             # "active" off pulls that never actually produced an
-            # observation. Every other raw_series reader in the codebase
-            # (analysis/flow_thesis_data.py and friends) already filters to
-            # SUCCESS; this KPI didn't.
+            # observation. analysis/flow_thesis_data.py's raw_series reads
+            # already filter to SUCCESS — this KPI didn't. That is NOT true
+            # of most raw_series readers: the 2026-09-17 fake-data audit's
+            # root cause #1 is that 22 analytical modules read raw_series by
+            # obs_date alone, and #535 has migrated 7 of them so far,
+            # leaving 18 legacy unfiltered readers as documented, open
+            # follow-up work (see grid-fake-data-LEDGER.md). This fix covers
+            # only this one KPI in this file, not that broader gap.
             try:
                 row = conn.execute(sa_text(
                     "SELECT COUNT(DISTINCT source_id), MAX(pull_timestamp) FROM raw_series "

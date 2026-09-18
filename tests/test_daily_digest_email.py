@@ -81,13 +81,35 @@ _QUIET_ROUTES = {
 
 
 def test_dry_run_never_calls_send(monkeypatch) -> None:
+    """No notification transport is reachable in dry_run: not the
+    synchronous send path daily_digest uses live (_send_sync), not the
+    fire-and-forget one other alert functions use (_send), and not SMTP
+    itself — proving this at the smtplib.SMTP level, not just by checking
+    that the module's own wrapper functions weren't invoked, so a future
+    change that starts constructing the client directly instead of going
+    through _do_send would still be caught here. daily_digest never
+    imports alerts.push_notify (grep-verified), so push transport isn't a
+    separate call path to assert against for this function.
+    """
+    import smtplib
+
+    smtp_calls: list = []
+    monkeypatch.setattr(smtplib, "SMTP", lambda *a, **k: smtp_calls.append((a, k)))
+
     _patch_engine(monkeypatch, routes={})
-    calls = _patch_send_sync(monkeypatch)
+    sync_calls = _patch_send_sync(monkeypatch)
+    fire_and_forget_calls = []
+    monkeypatch.setattr(
+        email_mod, "_send",
+        lambda *a, **k: fire_and_forget_calls.append((a, k)),
+    )
 
     result = email_mod.daily_digest(dry_run=True)
 
     assert result["dry_run"] is True
-    assert calls == []
+    assert sync_calls == []
+    assert fire_and_forget_calls == []
+    assert smtp_calls == []
 
 
 def test_live_send_confirmed_sets_sent_true(monkeypatch) -> None:
@@ -288,11 +310,13 @@ def test_medium_confidence_100x_row_renders_plainly(monkeypatch) -> None:
     assert "LOW CONFIDENCE" not in body["body"]
 
 
-def test_missing_confidence_100x_row_fails_toward_flagged(monkeypatch) -> None:
+def test_missing_confidence_100x_row_is_labelled_unknown_not_low(monkeypatch) -> None:
     """A row with no recognizable confidence label (NULL, empty, or a value
-    this code doesn't know about) must default to the cautious rendering,
-    not the confident-looking one — same fail-closed posture as the regime
-    section's handling of a missing/unverifiable timestamp.
+    this code doesn't know about) is not known to be LOW — that would
+    assert something the data doesn't say. It must still fail toward the
+    cautious (amber) rendering, but with wording that doesn't invent a
+    confidence category, same fail-closed-but-honest posture as the
+    regime section's handling of a missing/unverifiable timestamp.
     """
     result = _hundredx_result(
         monkeypatch, ("XYZ", "CALL", 9.1, 150.0, "thin-chain dislocation", None),
@@ -300,13 +324,31 @@ def test_missing_confidence_100x_row_fails_toward_flagged(monkeypatch) -> None:
 
     body = next(s for s in result["section_bodies"] if s["title"] == "100x Opportunity — XYZ")
     assert body["accent"] == "amber"
-    assert "LOW CONFIDENCE" in body["body"]
+    assert "CONFIDENCE UNKNOWN" in body["body"]
+    assert "LOW CONFIDENCE" not in body["body"]
 
 
-def test_alert_on_100x_opportunity_defaults_to_low_confidence_rendering(monkeypatch) -> None:
+def test_malformed_confidence_100x_row_is_labelled_unknown_not_low(monkeypatch) -> None:
+    """A value that isn't LOW/MEDIUM/HIGH at all (garbage, a future label
+    this code hasn't been taught) must not silently become MEDIUM/HIGH's
+    plain rendering, and must not be misreported as the specific "LOW"
+    the scanner never actually recorded either.
+    """
+    result = _hundredx_result(
+        monkeypatch, ("XYZ", "CALL", 9.1, 150.0, "thin-chain dislocation", "banana"),
+    )
+
+    body = next(s for s in result["section_bodies"] if s["title"] == "100x Opportunity — XYZ")
+    assert body["accent"] == "amber"
+    assert "CONFIDENCE UNKNOWN" in body["body"]
+    assert "LOW CONFIDENCE" not in body["body"]
+
+
+def test_alert_on_100x_opportunity_defaults_to_unknown_confidence_rendering(monkeypatch) -> None:
     """The standalone alert function (called directly by
     scripts/run_full_pipeline.py, not through daily_digest) must apply the
-    same fail-closed default when its caller doesn't pass a confidence.
+    same fail-closed-but-honest default when its caller doesn't pass a
+    confidence: caution without asserting a specific "LOW" it wasn't told.
     """
     captured: dict = {}
     monkeypatch.setattr(
@@ -319,6 +361,13 @@ def test_alert_on_100x_opportunity_defaults_to_low_confidence_rendering(monkeypa
     email_mod.alert_on_100x_opportunity("XYZ", 9.1, "CALL", "thesis text")
 
     assert captured["sections"][0]["accent"] == "amber"
+    assert "CONFIDENCE UNKNOWN" in captured["sections"][0]["body"]
+    assert "LOW CONFIDENCE" not in captured["sections"][0]["body"]
+
+    captured.clear()
+    email_mod.alert_on_100x_opportunity("XYZ", 9.1, "CALL", "thesis text", confidence="LOW")
+
+    assert captured["sections"][0]["accent"] == "amber"
     assert "LOW CONFIDENCE" in captured["sections"][0]["body"]
 
     captured.clear()
@@ -326,6 +375,7 @@ def test_alert_on_100x_opportunity_defaults_to_low_confidence_rendering(monkeypa
 
     assert captured["sections"][0]["accent"] == "purple"
     assert "LOW CONFIDENCE" not in captured["sections"][0]["body"]
+    assert "CONFIDENCE UNKNOWN" not in captured["sections"][0]["body"]
 
 
 # ---------------------------------------------------------------------------
