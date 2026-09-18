@@ -27,6 +27,7 @@ from evaluation.signal_outcomes import (
     dedupe_records,
     evaluate_signal,
     filter_by_origin_tag,
+    make_default_price_accessor,
     summarize_outcomes,
 )
 
@@ -333,6 +334,52 @@ def test_synthetic_origin_tag_is_separable_in_cohort_summary():
     assert len(synthetic_only) == 1
     assert synthetic_only[0].instrument == "SYN1"
     assert synthetic_only[0].outcome == "WRONG"
+
+
+# ---------------------------------------------------------------------------
+# make_default_price_accessor now delegates to the price-series contract
+# (workstream W3d, evaluation/prices.py) instead of guessing feature names
+# itself. This is the one test in this file that isn't pure in-memory
+# Python — it needs *something* engine-shaped for PriceSeriesContract to
+# query, so it reuses test_evaluation_prices.py's fake engine (no real
+# database; that file's own tests cover the contract in depth).
+# ---------------------------------------------------------------------------
+
+
+def test_make_default_price_accessor_delegates_to_the_contract():
+    from evaluation.prices import PITPriceAccessor
+    from tests.test_evaluation_prices import make_fake_engine
+
+    exit_date = D0 + timedelta(days=5)
+    fake_engine = make_fake_engine(
+        features={"acme_close": 7},
+        resolved=[
+            {"feature_id": 7, "obs_date": D0, "value": 50.0, "release_date": D0, "vintage_date": D0},
+            {
+                "feature_id": 7,
+                "obs_date": exit_date,
+                "value": 55.0,
+                "release_date": exit_date,
+                "vintage_date": exit_date,
+            },
+        ],
+    )
+
+    class _FakePitStore:
+        engine = fake_engine
+
+    accessor = make_default_price_accessor(_FakePitStore())
+    assert isinstance(accessor, PITPriceAccessor)
+
+    # Its resolver rule is injectable but defaults to the real
+    # _resolve_feature_names — override it here to avoid depending on
+    # api.routers.watchlist_helpers's own guessing internals in this test.
+    accessor._contract._candidate_name_fn = lambda instrument: ["acme_close"]
+
+    point = accessor("ACME", D0)
+    assert point is not None
+    assert point.price == 50.0
+    assert point.basis == "close"
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,4 @@
+# Acceptance-mode run artifact (tests/integration/conftest.py + the
+# TestAcceptanceSummary test in test_research_vertical_slice.py) -- written
+# fresh on every acceptance-mode pytest run, never committed.
+acceptance_summary.json

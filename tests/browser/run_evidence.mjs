@@ -127,6 +127,10 @@ const JOURNEYS = {
         { name: 'pipeline-health', hash: '#/pipeline-health', ready: /PIPELINE HEALTH|Pipeline health unavailable/ },
         { name: 'ten-year', hash: '#/ten-year', ready: /10-Year|TOP CHART|No eligible/ },
         { name: 'snapshots', hash: '#/snapshots', ready: /LATEST SNAPSHOT|No snapshots|Snapshots unavailable|unexpected response/ },
+        // Route id is 'godview' (NOT 'godview-pillars') — confirmed via
+        // `git show d197c9a3 -- pwa/src/routes.js`: `{id: 'godview', ...,
+        // component: './views/GodViewPillars.jsx'}`.
+        { name: 'godview', hash: '#/godview', ready: /God View . Institutional Pillars|UNAVAILABLE/ },
         // Operator (admin) can reach catalyst-timeline normally, unlike the
         // contributor gate below — added so the earlier owner-fix on this
         // view can be re-verified from the admin side too.

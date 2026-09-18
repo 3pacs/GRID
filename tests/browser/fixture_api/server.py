@@ -109,6 +109,14 @@ ROUTES: list[tuple[str, re.Pattern, callable]] = [
          if FixtureHandler.research_unavailable else fx.research_status(s)
      )),
 
+    # God View pillars (W6) — 'cftc' is the one built pillar, registered
+    # BEFORE the catch-all (mirrors api/routers/godview_pillars.py's own
+    # FastAPI registration order: the concrete /pillars/cftc route must be
+    # added first so it, not the catch-all, matches "cftc").
+    ("GET", re.compile(r"^/api/v1/godview/pillars/cftc$"), lambda m, q, s: fx.godview_pillar_cftc(s)),
+    ("GET", re.compile(r"^/api/v1/godview/pillars/(?P<pillar>[A-Za-z0-9_]+)$"),
+     lambda m, q, s: fx.godview_pillar_unbuilt(m.group("pillar"))),
+
     # (e) data health / source drill-down — Operator.jsx's actual six calls.
     ("GET", re.compile(r"^/api/v1/system/status$"), lambda m, q, s: fx.system_status(s)),
     ("GET", re.compile(r"^/api/v1/system/health$"), lambda m, q, s: fx.system_health(s)),

@@ -69,17 +69,33 @@ documented columns (ShortExemptVolume, TotalVolume) are carried in
 ``raw_payload`` rather than invented as separate series, since the task
 only specifies this one series-id shape.
 
-Endpoint NOT verified live
----------------------------
-Per this workstream's constraints, no call was made to any FINRA API or
-download endpoint while building this module (WebFetch was used only
-against the public documentation pages above). ``_DAILY_FILE_URL_TEMPLATE``
-below is a placeholder built from the commonly-documented FINRA daily-file
-naming convention; it has **not** been confirmed against a live response.
-``_fetch_raw_text`` therefore requires an explicit URL (or a monkeypatched
-``requests.get`` in tests) rather than silently trusting that placeholder --
-confirm the real endpoint before this puller is registered in the
-scheduler.
+Endpoint verified live (W5c, 2026-09-18)
+-----------------------------------------
+Confirmed by WebFetch against
+https://www.finra.org/finra-data/browse-catalog/short-sale-volume-data/daily-short-sale-volume-files
+and by one real HTTP GET (see
+``tests/fixtures/sources/finra_short_volume/REAL_CAPTURE_NOTE.txt`` for
+the exact URL, timestamp, and response headers):
+
+    https://cdn.finra.org/equity/regsho/daily/<MarketPrefix>shvol<YYYYMMDD>.txt
+
+Market-prefix codes documented on that page (``MARKET_PREFIXES`` below):
+``CNMS`` (Consolidated NMS -- the default), ``FNQC`` (FINRA/NASDAQ TRF
+Chicago), ``FNRA`` (ADF), ``FNSQ`` (FINRA/NASDAQ TRF Carteret), ``FNYX``
+(FINRA/NYSE TRF), ``FORF`` (ORF). ``_fetch_raw_text`` builds this URL from
+``settings.FINRA_SHORT_VOLUME_BASE_URL`` (config.py; not a secret -- no
+key is required) unless an explicit ``url`` is passed.
+
+**Live-response anomaly (recorded, not silently normalized):** the real
+CNMS file captured for the fixture does NOT match the layout PDF exactly
+-- ``ShortVolume``/``TotalVolume`` are fractional rather than whole
+shares, and ~65% of rows carry a comma-joined multi-facility ``Market``
+value (e.g. ``"B,Q,N"``) rather than the documented single alpha
+character. The parser and ``series_id()`` tolerate both (values pass
+through ``float()``; ``market`` is stored as whatever string is present).
+See the fixture NOTE for the open question of whether that is expected
+CNMS behavior or a sandboxed-network artifact -- unresolved, and a reason
+this puller stays unregistered (see the scheduler patch) until confirmed.
 """
 
 from __future__ import annotations
@@ -91,6 +107,7 @@ import requests
 from loguru import logger as log
 from sqlalchemy.engine import Engine
 
+from config import settings
 from ingestion.base import BasePuller, log_pull_failure, retry_on_failure
 
 # ---- Series-id namespace (disjoint from finra_ats.py's "finra.*") ----
@@ -98,21 +115,44 @@ _SERIES_PREFIX = "finra:short_volume"
 
 # ---- Documentation source (informational only; not fetched at runtime) ----
 _DOCS_URL = "https://www.finra.org/finra-data/browse-catalog/short-sale-volume"
+_DAILY_FILES_PAGE_URL = (
+    "https://www.finra.org/finra-data/browse-catalog/short-sale-volume-data/"
+    "daily-short-sale-volume-files"
+)
 _LAYOUT_PDF_URL = (
     "https://www.finra.org/sites/default/files/2021-07/"
     "DailyShortSaleVolumeFileLayout.pdf"
 )
 
-# Commonly-documented FINRA daily short-volume file naming convention.
-# NOT independently verified against a live FINRA response for this pass
-# (no API calls were made). Confirm before activating this puller.
-_DAILY_FILE_URL_TEMPLATE = (
-    "https://cdn.finra.org/equity/regsho/daily/CNMSshvol{yyyymmdd}.txt"
-)
+# Verified live (see module docstring): "<MarketPrefix>shvol<YYYYMMDD>.txt"
+# under settings.FINRA_SHORT_VOLUME_BASE_URL (config.py; public CDN, no key).
+_DAILY_FILE_URL_TEMPLATE = "{base_url}{market_prefix}shvol{yyyymmdd}.txt"
+
+# Market-prefix codes documented on _DAILY_FILES_PAGE_URL. "CNMS"
+# (Consolidated NMS) is the default -- one file covering all facilities.
+MARKET_PREFIXES: dict[str, str] = {
+    "CNMS": "Consolidated NMS",
+    "FNQC": "FINRA/NASDAQ TRF Chicago",
+    "FNRA": "ADF",
+    "FNSQ": "FINRA/NASDAQ TRF Carteret",
+    "FNYX": "FINRA/NYSE TRF",
+    "FORF": "ORF",
+}
+_DEFAULT_MARKET_PREFIX = "CNMS"
+
+# Request identification header. FINRA's CDN does not require a specific
+# User-Agent (unlike SEC's fails-to-deliver endpoint -- see sec_ftd.py /
+# settings.SEC_USER_AGENT), but this puller still identifies itself.
+_REQUEST_HEADERS = {"User-Agent": "GRID/1.0 (aniksrobot@gmail.com)"}
 
 _REQUEST_TIMEOUT: int = 30
 
 # Reporting-facility ("Market") codes documented in the FINRA layout PDF.
+# NOTE: the live CNMS file captured for this puller's fixture frequently
+# reports a comma-joined LIST of these codes in one row (e.g. "B,Q,N")
+# rather than a single code -- see REAL_CAPTURE_NOTE.txt in the fixtures
+# directory. This dict is retained as the documented reference table; it
+# is not used to validate/reject the parsed Market field.
 MARKET_CODES: dict[str, str] = {
     "N": "NYSE TRF",
     "Q": "NASDAQ TRF Carteret",
@@ -297,35 +337,40 @@ class FINRAShortVolumePuller(BasePuller):
         backoff=2.0,
         retryable_exceptions=(ConnectionError, TimeoutError, OSError, requests.RequestException),
     )
-    def _fetch_raw_text(self, trade_date: date, url: str | None = None) -> str:
+    def _fetch_raw_text(
+        self,
+        trade_date: date,
+        url: str | None = None,
+        *,
+        market_prefix: str = _DEFAULT_MARKET_PREFIX,
+    ) -> str:
         """Fetch the raw pipe-delimited daily file for one trade date.
 
-        Never called by the test suite (tests operate on
-        :func:`parse_daily_short_volume_file` directly, or monkeypatch this
-        method / ``requests.get``). Requires an explicit ``url`` because
-        ``_DAILY_FILE_URL_TEMPLATE`` has not been verified against a live
-        FINRA response -- see module docstring.
+        Builds the URL from ``settings.FINRA_SHORT_VOLUME_BASE_URL`` and
+        the documented ``<MarketPrefix>shvol<YYYYMMDD>.txt`` naming
+        convention (verified live -- see module docstring) unless an
+        explicit ``url`` is supplied. Tests monkeypatch this method
+        directly rather than hitting the network.
 
         Parameters:
             trade_date: Trade date to fetch.
-            url: Explicit download URL. If omitted, raises rather than
-                silently trusting the unverified placeholder template.
+            url: Explicit download URL, overriding the built one.
+            market_prefix: One of ``MARKET_PREFIXES`` (default ``"CNMS"``,
+                the consolidated file). Ignored if ``url`` is given.
 
         Returns:
             Decoded file text.
 
         Raises:
-            NotImplementedError: if no ``url`` is supplied.
             requests.RequestException: on HTTP failure after retries.
         """
         if url is None:
-            raise NotImplementedError(
-                "FINRA daily short-volume download URL was not verified live "
-                "for this contract-first pass. Pass url= explicitly (or "
-                "confirm and hardcode the endpoint) before activating this "
-                "puller."
+            url = _DAILY_FILE_URL_TEMPLATE.format(
+                base_url=settings.FINRA_SHORT_VOLUME_BASE_URL,
+                market_prefix=market_prefix,
+                yyyymmdd=trade_date.strftime("%Y%m%d"),
             )
-        resp = requests.get(url, timeout=_REQUEST_TIMEOUT)
+        resp = requests.get(url, headers=_REQUEST_HEADERS, timeout=_REQUEST_TIMEOUT)
         resp.raise_for_status()
         return resp.text
 
@@ -334,6 +379,7 @@ class FINRAShortVolumePuller(BasePuller):
         trade_date: date | str,
         *,
         url: str | None = None,
+        market_prefix: str = _DEFAULT_MARKET_PREFIX,
         dry_run: bool = False,
     ) -> dict[str, Any]:
         """Pull and store one trade date's daily short-sale volume file.
@@ -341,6 +387,8 @@ class FINRAShortVolumePuller(BasePuller):
         Parameters:
             trade_date: Trade date (date or "YYYY-MM-DD" string).
             url: Explicit download URL for :meth:`_fetch_raw_text`.
+            market_prefix: Market-prefix code (default ``"CNMS"``,
+                consolidated). Ignored if ``url`` is given.
             dry_run: If True, fetch and parse but write nothing to the
                 database. Returns the same shape of result with
                 ``dry_run=True`` and a ``rows_would_insert`` count instead
@@ -354,7 +402,9 @@ class FINRAShortVolumePuller(BasePuller):
             trade_date = date.fromisoformat(trade_date)
 
         try:
-            raw_text = self._fetch_raw_text(trade_date, url=url)
+            raw_text = self._fetch_raw_text(
+                trade_date, url=url, market_prefix=market_prefix
+            )
         except Exception as exc:  # noqa: BLE001 -- bounded below
             log_pull_failure(self.SOURCE_NAME, str(trade_date), exc)
             return {

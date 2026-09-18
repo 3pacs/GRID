@@ -115,6 +115,7 @@ to be restarted.
 | (c) Watchlist / portfolio, edge & trust-convergence | `#/portfolio` → `pwa/src/views/Portfolio.jsx`; `#/watchlist-analysis?ticker=TEST1` → `pwa/src/views/WatchlistAnalysis.jsx` (analysis/overview load first, then edge + derivatives) | `GET /api/v1/watchlist/portfolio`; `GET /api/v1/watchlist/TEST1/{analysis,overview,edge}`; `GET /api/v1/derivatives/{gex,vanna-charm,flow-timeline}/TEST1`; `GET /api/v1/intelligence/dashboard` (→ `.trust.top_sources` / `.trust.convergence_events`) | `watchlist_portfolio`, `watchlist_ticker_analysis`, `watchlist_ticker_overview`, `ticker_edge`, `derivatives_gex`, `derivatives_vanna_charm`, `derivatives_flow_timeline`, `intelligence_dashboard` |
 | (d) Research status | **No dedicated page exists.** The real operator-only surfaces are Discovery (`#/discovery` → `pwa/src/views/Discovery.jsx`) and Pipeline Health (`#/pipeline-health` → `pwa/src/views/PipelineHealth.jsx`) | `GET /api/v1/discovery/{jobs,hypotheses,hypotheses/results,results/orthogonality,results/clustering}`; `GET /api/v1/system/pipeline-health`; `GET /api/v1/snapshots/research/latest` (new — draft #566) | `discovery_jobs`, `discovery_hypotheses`, `discovery_hypotheses_results`, `discovery_results`, `pipeline_health`, `research_status` |
 | (e) Data health / source drill-down | `#/operator` → `pwa/src/views/Operator.jsx` (loads all six below on mount); sector drill-down via `GET /api/v1/sectors/{sector}/health` | `GET /api/v1/system/status`, `GET /api/v1/system/hermes-status?limit=20`, `GET /api/v1/snapshots/issues?...`, `GET /api/v1/snapshots/latest/pipeline_summary?n=10`, `GET /api/v1/system/health`, `GET /api/v1/system/freshness`, `GET /api/v1/sectors/Technology/health` | `system_status`, `hermes_status`, `snapshots_issues`, `snapshots_latest`, `system_health`, `system_freshness`, `sector_health` |
+| God View pillars (W6, draft, not yet a first-release journey) | `#/godview` → `pwa/src/views/GodViewPillars.jsx` (route id **`godview`**, not `godview-pillars` — see note below) | `GET /api/v1/godview/pillars/cftc?as_of=YYYY-MM-DD`; `GET /api/v1/godview/pillars/{finra_short_volume,sec_regsho_ftd,commodity_warehouses,fed_net_liquidity,buyback_blackouts,dealer_gex}` (six known-unbuilt pillars, not five) | `godview_pillar_cftc`, `godview_pillar_unbuilt` |
 
 All fixtures live in `tests/browser/fixture_api/fixtures.py`, routed by
 `tests/browser/fixture_api/server.py`. Data is entirely synthetic: ticker
@@ -146,6 +147,36 @@ pass guessed and shipped fixtures that 200'd but broke the view (see
 | `discovery_jobs` / `discovery_results` / `discovery_hypotheses` / `discovery_hypotheses_results` | discovery.py:117-291 | `Discovery.jsx` jobs/results/hypotheses panels |
 | `research_status` | `get_latest_research_run` (`api/routers/snapshots.py:36-70`, read via `git show 2218e88d:...`) + `scripts/research_status.py`'s `latest_research_run_result`/`latest_hypothesis_outcome` (same commit) — draft #566, new endpoint `GET /api/v1/snapshots/research/latest`. Server flag `--research-unavailable` (default off) forces the `{"status":"unavailable",...}` envelope shape regardless of `--scenario`. | closest wired-up analog is `Discovery.jsx`; no dedicated research-status view exists yet |
 | `pipeline_health` / `system_freshness` `field_record` + top-level `availability`/`stale_reason` | `PipelineSourceStatus`/`StaleSource`/`FreshnessResponse`/`PipelineHealthResponse` schemas (`api/schemas/system.py`, read via `git show 28b536df:...`, lines 74-190) + `FieldRecord.to_dict()` (`store/availability_fields.py`, read via `git show b5babef4:...`, lines ~166-190) — draft #567, additive fields on two existing endpoints | `Operator.jsx` / `PipelineHealth.jsx` (fields are additive; nothing previously reading these responses breaks) |
+| `godview_pillar_cftc` / `godview_pillar_unbuilt` | `api/routers/godview_pillars.py` (`git show 7560fb02:...`, whole file — `get_cftc_pillar` :117-165, `get_pillar_not_built` :168-181, `_row_to_field_records` :80-107) + `godview/cftc_pillar.py` (same commit: `PILLAR_NAME`/`CFTC_PILLAR_CONTRACTS`/`STALE_AFTER_DAYS`/`PillarReadResult`/`read_cftc_pillar` :575-645) + `store/availability.py::unavailable()` (:101-121) + `store/availability_fields.py`'s `measured_field`/`derived_field`/`unavailable_field` (:209-231) | `pwa/src/views/GodViewPillars.jsx` (`git show 7560fb02:...` — not yet present in this worktree's `pwa/src`, W6 is still a draft) |
+
+**Corrections to the W6 request** (found by reading source before implementing, not assumed):
+- The route id is **`godview`**, not `godview-pillars` — confirmed via
+  `git show d197c9a3 -- pwa/src/routes.js`, which adds exactly
+  `{id: 'godview', label: 'God View', component: './views/GodViewPillars.jsx', ...}`.
+  The fixture, journey, and README all use `#/godview`.
+- There are **six** known-unbuilt pillar names in
+  `_KNOWN_UNBUILT_PILLARS` (`api/routers/godview_pillars.py:46-53`):
+  `finra_short_volume`, `sec_regsho_ftd`, `commodity_warehouses`,
+  `fed_net_liquidity`, `buyback_blackouts`, `dealer_gex` — not five.
+  All six are handled by `godview_pillar_unbuilt`.
+- `ingested_at` is requested as "set" for the healthy scenario's field
+  records, but the real router's `_row_to_field_records` (:83-90) never
+  includes `ingested_at` in the `common` dict it passes to
+  `measured_field`/`derived_field`/`unavailable_field` — it stays `None`
+  even on a fully healthy, fully-covered read. The fixture mirrors that
+  (faithfully null), rather than inventing a value the real endpoint would
+  never send.
+- "One field `stale_reason: 'stale'`" isn't a state this router can
+  produce: `"stale"` is only ever the **top-level** `stale_reason` (set
+  from `newest_release_date` vs. `STALE_AFTER_DAYS`, `godview_pillars.py:
+  155-160`); a per-field `stale_reason` on a derived field that has no
+  value is always `STALE_PARTIAL_HISTORY` ("partial_history",
+  `_row_to_field_records:95-101`) — there is no code path that assigns a
+  field's own `stale_reason` to `"stale"`. The partial fixture instead
+  has a top-level `stale_reason: "stale"` (one contract's release is too
+  old) *and* one field-level `stale_reason: "partial_history"` (GOLD's
+  short derived-history window, `coverage_fraction: 0.6`) — both real,
+  distinct states, neither invented.
 | `ten_year_portfolio_weekly` | `weekly_ten_year_portfolio` (ten_year_portfolio.py:262-298) + `build_weekly_recommendation`/`build_profile_portfolio` | `TenYearPortfolio.jsx` profile/allocation/Monte-Carlo cards |
 | `chat_compose` | `ChatComposeResponse` schema (chat.py:306-318) | `Home.jsx`'s `layout.{spoken,widgets,allocation}` |
 | `chat_ask_stream_deltas` | `ask_grid_stream` (chat.py:2740-2775) | `widgets.jsx` `VerdictCard`'s streamed text |

@@ -201,7 +201,7 @@ def test_pull_from_text_malformed_rows_skipped_not_written():
 def test_pull_fetch_failure_returns_failed_status_no_writes():
     p = _puller()
 
-    def _boom(url=None):
+    def _boom(url=None, yyyymm=None, half=None):
         raise ConnectionError("simulated network failure contacting SEC")
 
     p._fetch_zip_bytes = _boom
@@ -284,16 +284,117 @@ def test_pull_from_text_dry_run_writes_nothing():
     assert p.engine.store["rows"] == []
 
 
-def test_fetch_zip_bytes_without_url_raises_not_implemented():
-    """The unverified placeholder endpoint must never be trusted silently."""
+def test_fetch_zip_bytes_without_url_or_yyyymm_half_raises_value_error(monkeypatch):
+    """Without an explicit url, both yyyymm and half are required to build
+    the documented cnsfails<YYYYMM><a|b>.zip URL."""
+    import config
+
+    monkeypatch.setattr(config.settings, "SEC_USER_AGENT", "GRID/1.0 (test@example.com)")
     p = _puller()
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ValueError):
         p._fetch_zip_bytes()
+
+
+def test_fetch_zip_bytes_without_sec_user_agent_fails_closed(monkeypatch):
+    """SEC requires a descriptive User-Agent with contact info -- this must
+    never silently fall back to a default or send an unidentified request."""
+    import config
+
+    monkeypatch.setattr(config.settings, "SEC_USER_AGENT", "")
+    p = _puller()
+    with pytest.raises(RuntimeError, match="SEC_USER_AGENT"):
+        p._fetch_zip_bytes(yyyymm="202608", half="b")
 
 
 def test_series_id_namespace_is_sec_ftd_balance():
     sid = SECFTDPuller.series_id("037833100")
     assert sid == "sec:ftd_balance:037833100"
+
+
+def test_fetch_zip_bytes_builds_documented_url(monkeypatch):
+    """Without an explicit url=, the documented cnsfails<YYYYMM><a|b>.zip
+    URL is built from yyyymm/half -- the endpoint is confirmed live now
+    (see module docstring and REAL_CAPTURE_NOTE.txt)."""
+    import config
+
+    monkeypatch.setattr(
+        config.settings, "SEC_USER_AGENT", "GRID/1.0 (test@example.com)"
+    )
+    captured = {}
+
+    class _FakeResp:
+        content = b"PK\x05\x06" + b"\x00" * 18  # minimal empty-zip EOCD
+
+        def raise_for_status(self):
+            return None
+
+    def _fake_get(url, headers=None, timeout=None):
+        captured["url"] = url
+        captured["headers"] = headers
+        return _FakeResp()
+
+    monkeypatch.setattr("ingestion.altdata.sec_ftd.requests.get", _fake_get)
+    p = _puller()
+    p._fetch_zip_bytes(yyyymm="202608", half="b")
+
+    assert captured["url"] == (
+        "https://www.sec.gov/files/data/fails-deliver-data/cnsfails202608b.zip"
+    )
+    assert captured["headers"]["User-Agent"] == "GRID/1.0 (test@example.com)"
+
+
+# ── Real captured fixtures (see REAL_CAPTURE_NOTE.txt for provenance) ─────
+
+
+def test_parse_real_first500_matches_documented_columns():
+    parsed = parse_ftd_file(_load("real_capture_first500.txt"))
+    assert len(parsed["rows"]) == 500
+    assert parsed["skipped"] == 0
+
+    for row in parsed["rows"]:
+        assert set(row) == {
+            "date",
+            "cusip",
+            "symbol",
+            "quantity_fails",
+            "description",
+            "price",
+        }
+        assert row["date"] == date(2026, 8, 17)
+        assert len(row["cusip"]) == 9
+        assert row["quantity_fails"] >= 0
+
+
+def test_real_fixture_same_cusip_across_dates_not_summed():
+    """Real rows for one CUSIP (Y4000A102 / HQ) across all 11 settlement
+    dates in the captured half-month file. Each pull() call must store
+    each date's balance independently -- never summed or overwritten --
+    per the documented "outstanding balance as of a settlement date"
+    semantics."""
+    parsed = parse_ftd_file(_load("real_capture_multi_date_cusip.txt"))
+    assert len(parsed["rows"]) == 11
+    assert len({r["date"] for r in parsed["rows"]}) == 11  # 11 distinct dates
+    assert all(r["cusip"] == "Y4000A102" for r in parsed["rows"])
+
+    p = _puller()
+    result = p.pull_from_text(
+        _load("real_capture_multi_date_cusip.txt"), publication_half="2026-08-real"
+    )
+
+    assert result["status"] == "SUCCESS"
+    assert result["rows_inserted"] == 11
+
+    stored = [
+        r for r in p.engine.store["rows"] if r["series_id"] == "sec:ftd_balance:Y4000A102"
+    ]
+    assert len(stored) == 11
+    # Each date's balance is stored as its own row with its own value --
+    # never aggregated into a single summed figure.
+    stored_by_date = {r["obs_date"]: r["value"] for r in stored}
+    assert stored_by_date[date(2026, 8, 17)] == 373.0
+    assert stored_by_date[date(2026, 8, 24)] == 145601.0
+    assert stored_by_date[date(2026, 8, 31)] == 179.0
+    assert sum(stored_by_date.values()) != stored_by_date[date(2026, 8, 17)]
 
 
 # ── Cross-source isolation: neither dataset lands under the other's ids ────
@@ -313,7 +414,7 @@ def test_finra_short_volume_and_sec_ftd_never_share_series_ids():
     finra_fixtures = (
         Path(__file__).parent / "fixtures" / "sources" / "finra_short_volume"
     )
-    finra_p._fetch_raw_text = lambda trade_date, url=None: (
+    finra_p._fetch_raw_text = lambda trade_date, url=None, **kwargs: (
         finra_fixtures / "good.txt"
     ).read_text()
     finra_result = finra_p.pull("2026-09-16")
