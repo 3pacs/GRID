@@ -1,0 +1,43 @@
+diff --git a/ingestion/scheduler.py b/ingestion/scheduler.py
+index 33450cd1..00b0479d 100644
+--- a/ingestion/scheduler.py
++++ b/ingestion/scheduler.py
+@@ -721,6 +721,38 @@ def _get_pullers_for_group(
+             pullers.append(("FINRA_Margin", FINRAMarginPuller(db_engine), "pull", {}))
+         except Exception as exc:
+             log.warning("FINRA margin init failed: {err}", err=str(exc))
++        # FINRA Daily Short Sale Volume (Reg SHO daily files) -- UNAPPLIED.
++        # Contract-first puller (docs/handoffs/2026-09-18/fable-w5b-source-contracts.md).
++        # Do NOT enable until the download URL is confirmed live and a
++        # trade_date argument (or a date-rolling wrapper) is wired up --
++        # pull() takes a required trade_date, unlike the no-arg pullers
++        # above.
++        # try:
++        #     from ingestion.altdata.finra_short_volume import FINRAShortVolumePuller
++        #     pullers.append((
++        #         "FINRA_Short_Volume",
++        #         FINRAShortVolumePuller(db_engine),
++        #         "pull",
++        #         {"trade_date": date.today() - timedelta(days=1)},
++        #     ))
++        # except Exception as exc:
++        #     log.warning("FINRA short volume init failed: {err}", err=str(exc))
++        # SEC Fails-to-Deliver (FTD) balances -- UNAPPLIED.
++        # Contract-first puller (docs/handoffs/2026-09-18/fable-w5b-source-contracts.md).
++        # Do NOT enable until the zip download URL is confirmed live --
++        # pull() needs a real url= for the current half-month's
++        # cnsfails<YYYYMM><a|b>.zip file; there is no "just pull the
++        # latest" default yet.
++        # try:
++        #     from ingestion.altdata.sec_ftd import SECFTDPuller
++        #     pullers.append((
++        #         "SEC_FTD",
++        #         SECFTDPuller(db_engine),
++        #         "pull",
++        #         {},
++        #     ))
++        # except Exception as exc:
++        #     log.warning("SEC FTD init failed: {err}", err=str(exc))
+         # LittleSis power mapping — actor relationships (daily)
+         try:
+             from ingestion.altdata.littlesis_puller import LittleSisPuller
