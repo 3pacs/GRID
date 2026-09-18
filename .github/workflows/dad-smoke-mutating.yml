@@ -1,0 +1,98 @@
+name: Dad Path Smoke Test (MUTATING — alert-creation/composer)
+
+# The ONLY place --mode=mutating may run. workflow_dispatch-only: never
+# workflow_call, never triggered by deploy.yml or dad-smoke.yml. This is
+# what exercises scripts/smoke_dad_path.py's composer/alert-creation path
+# (the "tell me when NVDA drops 5 percent" prompt), which persists a real
+# row in sd_price_alerts via api/routers/price_alerts.create_alert_record
+# (api/routers/chat.py:2144-2178, :2227-2244; price_alerts.py:148-154) and
+# can also log a capability-gap request that iMessages + emails the operator
+# (chat.py:2185-2197, :2248-2261 -> _log_capability_gap, chat.py:2497-2519).
+#
+# IMPORTANT: `base_url` MUST point at an isolated target — a throwaway/test
+# deployment, never https://grid.stepdad.finance or any grid-api instance
+# backed by the real production database. If you are not running this
+# against an isolated environment, do not check `i_accept_production_writes`;
+# that checkbox is the second, separately-authorised gate (alongside this
+# workflow itself being workflow_dispatch-only) the script requires before
+# it will touch a single non-GET endpoint — see validate_mode() in
+# scripts/smoke_dad_path.py.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: 'grid-api base URL to test — MUST be an isolated target, never production'
+        required: true
+      target:
+        description: 'What this base_url points at (for the run summary/audit trail)'
+        required: false
+        default: 'isolated'
+      i_accept_production_writes:
+        description: 'I have confirmed base_url is an isolated target and I authorise this run to create real alerts/capability-gap rows there'
+        type: boolean
+        required: true
+        default: false
+      release_dir:
+        description: 'Release dir on the runner (for token minting + DB freshness reads)'
+        required: false
+        default: '/data/grid_v4/grid_release'
+      strict:
+        description: 'Exit 1 if anything is broken'
+        type: boolean
+        required: false
+        default: false
+
+env:
+  SMOKE_ALLOW_MUTATIONS: "1"
+
+jobs:
+  smoke-mutating:
+    name: Dad Path Smoke (MUTATING)
+    runs-on: [self-hosted, grid-svr]
+    timeout-minutes: 20
+    # Belt-and-suspenders: even though the input is required, refuse to run
+    # the step at all unless it was explicitly checked true.
+    if: inputs.i_accept_production_writes == true
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Refuse if target is not marked isolated
+        if: inputs.target != 'isolated'
+        run: |
+          echo "::warning::target='${{ inputs.target }}' — this workflow is meant for an isolated environment. Re-run with target=isolated once base_url has been verified isolated, or stop now if it is not."
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          pip install -r requirements.txt
+
+      - name: Run dad path smoke test (mutating)
+        id: smoke
+        run: |
+          set -euo pipefail
+          for f in "${{ inputs.release_dir }}/.env" /home/grid/grid_v4/grid_repo/.env /home/grid/grid_v4/grid_repo/grid/.env; do
+            if [ -f "$f" ]; then set -a; . "$f"; set +a; echo "(env sourced from $f)"; break; fi
+          done
+          STRICT_FLAG=""
+          if [ "${{ inputs.strict }}" = "true" ]; then
+            STRICT_FLAG="--strict"
+          fi
+          python3 scripts/smoke_dad_path.py \
+            --base-url "${{ inputs.base_url }}" \
+            --release-dir "${{ inputs.release_dir }}" \
+            --json /tmp/dad_smoke_mutating.json \
+            --budget-ms 5000 \
+            --mode mutating \
+            --i-accept-production-writes \
+            $STRICT_FLAG
+
+      - name: Upload smoke result JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dad-smoke-mutating-result
+          path: /tmp/dad_smoke_mutating.json
+          retention-days: 14
+          if-no-files-found: warn

@@ -360,7 +360,7 @@ class TestStepComposerAuthGrading:
         }
         client = FakeClient(responses)
         client.token = "fake-token"
-        result = step_composer(client, 5000)
+        result = step_composer(client, 5000, mode="mutating")
         assert result.status == "broken"
 
 
@@ -436,8 +436,12 @@ class TestRunExitCodeWhenBlocked:
             smoke, "step_static", lambda client, budget_ms, release_dir: StepResult("static", "ok")
         )
         monkeypatch.setattr(smoke, "mint_contributor_token", lambda release_dir: ("real-token", "minted"))
-        monkeypatch.setattr(smoke, "step_composer", lambda client, budget_ms: StepResult("composer", "ok"))
+        monkeypatch.setattr(smoke, "step_composer", lambda client, budget_ms, mode: StepResult("composer", "ok"))
         monkeypatch.setattr(smoke, "step_widget_data", lambda client, budget_ms: StepResult("widget_data", "ok"))
+        monkeypatch.setattr(
+            smoke, "step_alerts_count",
+            lambda client, budget_ms, label: StepResult(f"alerts_count:{label}", "ok", None, "count=0", {"count": 0}),
+        )
         monkeypatch.setattr(smoke, "step_freshness", lambda release_dir: StepResult("freshness", "ok"))
         monkeypatch.setattr(smoke, "step_logs", lambda: StepResult("logs", "ok"))
         monkeypatch.setattr(smoke, "step_deploy_tree", lambda release_dir: StepResult("deploy_tree", "ok"))
