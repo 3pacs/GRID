@@ -33,6 +33,23 @@ class PathRequest(BaseModel):
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
+def _measured_or_none(value: Any) -> float | None:
+    """Nullable numeric column -> float or None, never a midpoint.
+
+    A NULL rating is unknown; the retired ``if x else 0.5`` form both invented
+    a mid-range rating and rewrote a genuine ``0.0``.
+    """
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(f) or math.isinf(f):
+        return None
+    return f
+
+
 def _row_to_dict(row: Any) -> dict:
     """Convert a SQLAlchemy row to a plain dict with ISO timestamps."""
     d = dict(row._mapping)
@@ -188,8 +205,11 @@ def _get_lever_puller_data(conn: Connection, name: str) -> dict | None:
         "is_lever_puller": True,
         "lever_category": m["category"],
         "lever_position": m["position"],
-        "influence_rank": float(m["influence_rank"]) if m["influence_rank"] else 0.5,
-        "trust_score": float(m["trust_score"]) if m["trust_score"] else 0.5,
+        # Unrated stays null so the badge can show "unrated" (D-M18); the
+        # old 0.5 was indistinguishable from a measured mid-range rating and
+        # also rewrote a genuine 0.0 to 0.5.
+        "influence_rank": _measured_or_none(m["influence_rank"]),
+        "trust_score": _measured_or_none(m["trust_score"]),
         "motivation_model": m["motivation_model"],
         "total_signals": int(m["total_signals"] or 0),
         "correct_signals": int(m["correct_signals"] or 0),
@@ -447,7 +467,7 @@ def expand_node(
             if lever:
                 edge_label = f"{edge_label} [LEVER]" if edge_label else "LEVER PULLER"
             _insert_edge(node_id, cnid, edge_label,
-                         {"strength": float(nbr["strength"]) if nbr.get("strength") else 0.5})
+                         {"strength": _measured_or_none(nbr.get("strength"))})
 
         # ── 1b. Top 3 signals ────────────────────────────────────────
         if match_terms:
@@ -610,7 +630,7 @@ def expand_node(
                     "ticker": im["ticker"],
                     "direction": "buy" if "purchase" in (im["trade_type"] or "").lower() or "buy" in (im["trade_type"] or "").lower() else "sell",
                     "magnitude": min(val / 1e6, 10) if val else 0,
-                    "confidence": "confirmed",
+                    "source_class": "sec_form4_insider_filing",
                     "insider_name": im["insider_name"],
                     "insider_title": im["insider_title"],
                     "is_cluster_buy": im["is_cluster_buy"],
@@ -646,7 +666,7 @@ def expand_node(
                     "signal_type": "congressional",
                     "ticker": cm["ticker"],
                     "direction": "buy" if "purchase" in (cm["transaction_type"] or "").lower() else "sell",
-                    "confidence": "confirmed",
+                    "source_class": "house_senate_disclosure",
                     "representative": cm["representative"],
                     "party": cm["party"], "state": cm["state"],
                     "committee": cm["committee"],
@@ -837,8 +857,8 @@ def expand_node(
                 _insert_node(lpid, "actor", f"{lm['name']} ({lm['position'] or lm['category']})", px, py, {
                     "entityId": lm["source_id"], "category": lm["category"],
                     "is_lever_puller": True, "lever_position": lm["position"],
-                    "influence_rank": float(lm["influence_rank"]) if lm["influence_rank"] else 0.5,
-                    "trust_score": float(lm["trust_score"]) if lm["trust_score"] else 0.5,
+                    "influence_rank": _measured_or_none(lm["influence_rank"]),
+                    "trust_score": _measured_or_none(lm["trust_score"]),
                     "motivation_model": lm["motivation_model"], "accuracy_pct": round(accuracy, 1),
                 })
                 _insert_edge(node_id, lpid, f"lever: {lm['category']}")
@@ -897,7 +917,7 @@ def expand_node(
                 llabel = lm["question"][:90] + "..." if len(lm["question"] or "") > 90 else lm["question"] or "?"
                 _insert_node(lid, "evidence", llabel, px, py, {
                     "evidence_type": "investigation_lead",
-                    "confidence": "rumored",
+                    "source_class": "open_investigation_lead",
                     "content": str(lm["evidence"])[:200] if lm["evidence"] else "",
                     "category": lm["category"],
                     "priority": lm["priority"],
@@ -1137,7 +1157,7 @@ def suggest_connections(
                 "source_node_id": canvas_a,
                 "target_node_id": canvas_b,
                 "relationship": rm["relationship"],
-                "strength": float(rm["strength"]) if rm["strength"] else 0.5,
+                "strength": _measured_or_none(rm["strength"]),
                 "edge_id": f"suggest-{uuid.uuid4().hex[:12]}",
             })
             # Mark as seen to avoid duplicates from bidirectional entries

@@ -28,6 +28,22 @@ import api.routers.watchlist_helpers as _wh
 
 router = APIRouter(tags=["watchlist"])
 
+# Why every dollar field on GET /portfolio is null: the watchlist table holds a
+# ticker and a weight, never a share count or a cost basis, so a portfolio
+# value could only ever be invented.
+_NO_POSITION_SIZES = "no_position_sizes_stored"
+
+# A weight-by-asset-class table, not a measured beta. Exposed under
+# risk_metrics.beta_proxy_basis so the reader can see it is a lookup.
+_ASSET_CLASS_BETA_PROXY = {
+    "stock": 1.1, "crypto": 1.8, "etf": 1.0, "commodity": 0.6,
+    "index": 1.0, "forex": 0.3,
+}
+_BETA_PROXY_BASIS = (
+    "asset_class_lookup (stock 1.1 / crypto 1.8 / etf 1.0 / commodity 0.6 / "
+    "index 1.0 / forex 0.3); not regressed against SPY or any benchmark"
+)
+
 
 @router.get("/")
 def list_watchlist(
@@ -118,12 +134,18 @@ async def get_watchlist_prices(
 def get_portfolio(
     _token: str = Depends(require_auth),
 ) -> dict:
-    """Portfolio analytics view — watchlist as a portfolio with P&L, allocation, risk.
+    """Portfolio analytics view — watchlist as a weighted basket.
 
-    Since we don't have actual position sizes, each ticker gets equal weight
-    unless a custom weight column is set. Computes allocation by sector and
-    asset type, risk metrics (concentration, beta, diversification), and
-    options P&L from the recommendation tracker.
+    GRID stores **no position sizes and no cost basis** for watchlist items:
+    only a weight (custom, or equal by default). Every dollar figure derived
+    from that would be invented, so ``total_value`` is ``null`` with a
+    ``total_value_basis`` reason and no dollar P&L keys are emitted at all.
+    Percentage returns *are* measured, so they are returned — weighted over
+    the positions that actually have a price, with the coverage disclosed.
+
+    Holdings with no price are excluded from every total and reported in
+    ``positions_missing_price`` / ``missing_price_tickers`` instead of being
+    counted as a zero move.
     """
 
     _init_table()
@@ -146,13 +168,24 @@ def get_portfolio(
 
     if not rows:
         return {
-            "total_value": 0, "total_pnl_1d": 0, "total_pnl_1d_pct": 0,
-            "total_pnl_1m": 0, "positions": [], "allocation": {
+            "total_value": None,
+            "total_value_basis": _NO_POSITION_SIZES,
+            "weighted_return_1d_pct": None,
+            "return_1d_weight_coverage": None,
+            "positions": [],
+            "positions_missing_price": 0,
+            "missing_price_tickers": [],
+            "weight_priced_total": 0.0,
+            "allocation": {
                 "by_sector": {}, "by_asset_type": {},
-            }, "risk_metrics": {
-                "concentration_top3": 0, "beta_weighted": 0,
-                "sector_diversification_score": 0,
-            }, "options_pnl": {
+            },
+            "risk_metrics": {
+                "concentration_top3": None,
+                "beta_proxy_by_asset_class": None,
+                "beta_proxy_basis": _BETA_PROXY_BASIS,
+                "sector_diversification_score": None,
+            },
+            "options_pnl": {
                 "total_recommendations": 0, "wins": 0, "losses": 0,
                 "open": 0, "total_return": 0,
             },
@@ -215,41 +248,54 @@ def get_portfolio(
                 sector_ctx[it["ticker"]] = "Other"
 
     # ── Build positions list ─────────────────────────────────────
-    ESTIMATED_PORTFOLIO = 125_000  # estimated portfolio value
+    # A holding with no price is not a holding worth zero: it is a holding we
+    # could not measure. It is kept out of every total and surfaced separately
+    # so the reader sees the book's coverage rather than a silent gap.
+    #
+    # There is deliberately no 1-month return here. _batch_fetch_prices only
+    # downloads a 5-day window (watchlist_helpers.py), so no real 1-month close
+    # is ever loaded on this path, and extrapolating the 1-week return would be
+    # a fabricated number wearing a measured label.
     positions = []
-    total_pnl_1d = 0.0
-    total_pnl_1m = 0.0
+    missing_price_tickers: list[str] = []
 
     for it in items:
         tk = it["ticker"]
         pd_ = cached_prices.get(tk, {}) if cached_prices else {}
         price = pd_.get("price")
-        pct_1d = pd_.get("pct_1d")
-        pct_1w = pd_.get("pct_1w")
 
-        # Estimate 1m from 1w if not available
-        pct_1m = None
-        if pct_1w is not None:
-            pct_1m = pct_1w * 4.0 / 1.0  # rough extrapolation from 1w
-
-        alloc_value = ESTIMATED_PORTFOLIO * it["weight"]
-        pnl_1d = round(alloc_value * pct_1d, 2) if pct_1d is not None else 0
-        pnl_1m = round(alloc_value * (pct_1m or 0), 2)
-
-        total_pnl_1d += pnl_1d
-        total_pnl_1m += pnl_1m
+        if price is None:
+            missing_price_tickers.append(tk)
+            continue
 
         positions.append({
             "ticker": tk,
             "display_name": it["display_name"],
             "price": price,
-            "change_1d": pct_1d,
-            "change_1w": pct_1w,
+            "change_1d": pd_.get("pct_1d"),
+            "change_1w": pd_.get("pct_1w"),
             "weight": round(it["weight"], 4),
             "sector": sector_ctx.get(tk, "Other"),
             "asset_type": it["asset_type"],
-            "pnl_1d": pnl_1d,
         })
+
+    # ── Weighted percentage return (measured, not a dollar figure) ───
+    # Renormalised over the positions that have BOTH a weight and a 1d return;
+    # return_1d_weight_coverage says how much of the book that actually was.
+    ret_weight = sum(
+        p["weight"] for p in positions if p["change_1d"] is not None
+    )
+    if ret_weight > 0:
+        weighted_return_1d_pct = round(sum(
+            p["weight"] * p["change_1d"]
+            for p in positions if p["change_1d"] is not None
+        ) / ret_weight, 6)
+        return_1d_weight_coverage = round(ret_weight, 4)
+    else:
+        weighted_return_1d_pct = None
+        return_1d_weight_coverage = None
+
+    weight_priced_total = round(sum(p["weight"] for p in positions), 4)
 
     # ── Allocation ───────────────────────────────────────────────
     by_sector: dict[str, float] = {}
@@ -262,18 +308,24 @@ def get_portfolio(
 
     # ── Risk metrics ─────────────────────────────────────────────
     sorted_weights = sorted([p["weight"] for p in positions], reverse=True)
-    concentration_top3 = round(sum(sorted_weights[:3]), 4) if len(sorted_weights) >= 3 else 1.0
+    concentration_top3 = (
+        round(sum(sorted_weights[:3]), 4) if sorted_weights else None
+    )
 
-    # Simple beta estimate: weight stocks ~1.1, crypto ~1.8, etf ~1.0
-    beta_map = {"stock": 1.1, "crypto": 1.8, "etf": 1.0, "commodity": 0.6,
-                "index": 1.0, "forex": 0.3}
-    beta_weighted = round(sum(
-        p["weight"] * beta_map.get(p["asset_type"], 1.0) for p in positions
-    ), 2)
+    # NOT a beta. This is a per-asset-class lookup, so it is named for what it
+    # is and ships the table it came from; nothing here is regressed against
+    # SPY or any other benchmark.
+    beta_proxy = round(sum(
+        p["weight"] * _ASSET_CLASS_BETA_PROXY.get(p["asset_type"], 1.0)
+        for p in positions
+    ), 2) if positions else None
 
     # Sector diversification: 1 - HHI (Herfindahl) of sector weights
-    hhi = sum(w ** 2 for w in by_sector.values())
-    sector_diversification = round(1.0 - hhi, 4)
+    if by_sector:
+        hhi = sum(w ** 2 for w in by_sector.values())
+        sector_diversification = round(1.0 - hhi, 4)
+    else:
+        sector_diversification = None
 
     # ── Options P&L from recommendation tracker ──────────────────
     options_pnl = {
@@ -304,18 +356,24 @@ def get_portfolio(
         log.debug("Options P&L query failed: {e}", e=str(exc))
 
     return {
-        "total_value": ESTIMATED_PORTFOLIO,
-        "total_pnl_1d": round(total_pnl_1d, 2),
-        "total_pnl_1d_pct": round(total_pnl_1d / ESTIMATED_PORTFOLIO, 4) if ESTIMATED_PORTFOLIO else 0,
-        "total_pnl_1m": round(total_pnl_1m, 2),
+        # No share counts and no cost basis are stored, so there is no dollar
+        # total to report and no dollar P&L keys at all.
+        "total_value": None,
+        "total_value_basis": _NO_POSITION_SIZES,
+        "weighted_return_1d_pct": weighted_return_1d_pct,
+        "return_1d_weight_coverage": return_1d_weight_coverage,
         "positions": positions,
+        "positions_missing_price": len(missing_price_tickers),
+        "missing_price_tickers": missing_price_tickers,
+        "weight_priced_total": weight_priced_total,
         "allocation": {
             "by_sector": by_sector,
             "by_asset_type": by_asset_type,
         },
         "risk_metrics": {
             "concentration_top3": concentration_top3,
-            "beta_weighted": beta_weighted,
+            "beta_proxy_by_asset_class": beta_proxy,
+            "beta_proxy_basis": _BETA_PROXY_BASIS,
             "sector_diversification_score": sector_diversification,
         },
         "options_pnl": options_pnl,
@@ -445,8 +503,10 @@ def list_watchlist_enriched(
                             "pct_1m": None,
                             "source": "live",
                         }
-                        # Write back to DB so next lookup is fast
-                        _cache_price_to_db(engine, tk, live["price"], today)
+                        # Write back to DB so next lookup is fast — but only
+                        # under the quote's own trading day, never today's
+                        # date on a weekend/holiday read (C-M14).
+                        _cache_price_to_db(engine, tk, live["price"], live.get("bar_date"))
     except Exception as exc:
         log.debug("Watchlist: price data enrichment failed: {e}", e=str(exc))
 

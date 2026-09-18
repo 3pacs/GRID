@@ -46,7 +46,10 @@ class OraclePublishRequest(BaseModel):
     call: str
     timing: str
     invalidation: str
-    confidence: float = 0.5
+    # No default: a publisher that does not state a confidence publishes
+    # without one (docs/reference/CONFIDENCE_POLICY.md). The old 0.5 default
+    # made every silent caller look like a stated 50% forecast.
+    confidence: float | None = None
     weight_version: str = "astrogrid-v1"
     model_version: str = "astrogrid-oracle-v1"
     grid_summary: str | None = None
@@ -120,8 +123,11 @@ def get_predictions(
         days_left = (expiry_date - today).days if expiry_date else 0
 
         # Compute tracking P&L for active predictions
+        # A NULL entry price (D-M32: no spot observed at publish time) is not
+        # a zero entry price. Both are excluded, but explicitly: `and r[6]`
+        # only escaped a divide-by-zero because 0.0 happens to be falsy.
         tracking_pnl = None
-        if r[17] == "pending" and r[6]:
+        if r[17] == "pending" and r[6] is not None and float(r[6]) > 0:
             try:
                 with engine.connect() as conn2:
                     spot = conn2.execute(text("""
@@ -216,7 +222,9 @@ def get_latest(
             FROM oracle_predictions
             WHERE created_at >= :ct - INTERVAL '5 minutes'
               AND dedup_keep = TRUE
-            ORDER BY confidence DESC
+            -- A prediction with no stated confidence is unknown, not the
+            -- most confident: NULLS LAST, never first.
+            ORDER BY confidence DESC NULLS LAST
             LIMIT 20
         """), {"ct": cycle_time}).fetchall()
 

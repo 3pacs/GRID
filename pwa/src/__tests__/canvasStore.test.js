@@ -48,7 +48,7 @@ describe('CanvasStore graph normalization', () => {
 
         useCanvasStore.getState().addNodes({
             new_nodes: [
-                { node_id: 's:123', node_type: 'signal', label: 'Insider buy', confidence: 0.91 },
+                { node_id: 's:123', node_type: 'signal', label: 'Insider buy', source_class: 'signal_data:insider', source_class_score: 0.91 },
             ],
             new_edges: [
                 {
@@ -64,7 +64,10 @@ describe('CanvasStore graph normalization', () => {
         expect(after).not.toBe(before);
         expect(after.hasNode('s:123')).toBe(true);
         expect(after.getNodeAttribute('s:123', 'nodeType')).toBe('signal');
-        expect(after.getNodeAttribute('s:123', 'confidence')).toBe(0.91);
+        // The canvas API sends a provenance class, not a `confidence` number
+        // (docs/reference/CONFIDENCE_POLICY.md).
+        expect(after.getNodeAttribute('s:123', 'source_class')).toBe('signal_data:insider');
+        expect(after.getNodeAttribute('s:123', 'source_class_score')).toBe(0.91);
         expect(after.size).toBe(1);
     });
 

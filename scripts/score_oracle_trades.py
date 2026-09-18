@@ -246,6 +246,7 @@ def score_one_chunk(
         FROM oracle_predictions
         WHERE verdict = 'pending'
           AND expiry <= :today
+          AND entry_price IS NOT NULL
           AND entry_price > 0
         ORDER BY expiry
         LIMIT :chunk_size
@@ -261,6 +262,12 @@ def score_one_chunk(
         ) = r
 
         if direction not in ("CALL", "PUT"):
+            counters["skipped"] += 1
+            continue
+
+        # Belt-and-braces against a future edit to the chunk WHERE above: a
+        # NULL or zero entry is not a 0% move and not an infinite one.
+        if entry is None or entry <= 0:
             counters["skipped"] += 1
             continue
 
@@ -409,7 +416,7 @@ def main(argv: list[str] | None = None) -> None:
         for r in rows:
             pred_id, ticker, direction, entry_price, created_date, expiry = r
 
-            if entry_price and entry_price > 0:
+            if entry_price is not None and entry_price > 0:
                 continue  # Already has a price
 
             price = get_price_for_date(prices, ticker, created_date)
@@ -456,15 +463,24 @@ def main(argv: list[str] | None = None) -> None:
         """))
         log.info("  NEUTRAL → no_data: {}", res.rowcount)
 
-        # entry_price still 0 → no_data
+        # No usable entry price → no_data. NULL must be listed explicitly:
+        # `entry_price = 0` is NULL for a NULL row, so a prediction published
+        # with no observed spot (D-M32) would otherwise sit 'pending' forever,
+        # neither scored nor accounted for. It is not scorable and it is not a
+        # 0% return — it is excluded, and the notes say why.
         res = conn.execute(text("""
             UPDATE oracle_predictions
             SET verdict = 'no_data',
-                score_notes = 'No entry price available for scoring',
+                score_notes = CASE
+                    WHEN entry_price IS NULL
+                    THEN 'No entry price was measured at publish time'
+                    ELSE 'No entry price available for scoring'
+                END,
                 scored_at = NOW()
-            WHERE verdict = 'pending' AND entry_price = 0
+            WHERE verdict = 'pending'
+              AND (entry_price IS NULL OR entry_price = 0)
         """))
-        log.info("  entry_price=0 → no_data: {}", res.rowcount)
+        log.info("  no usable entry_price → no_data: {}", res.rowcount)
 
     # ── Step 4: Score expired predictions (CHUNKED) ──
     log.info("\n--- STEP 4: Score Expired Predictions ---")
@@ -475,6 +491,7 @@ def main(argv: list[str] | None = None) -> None:
             SELECT COUNT(*) FROM oracle_predictions
             WHERE verdict = 'pending'
               AND expiry <= :today
+              AND entry_price IS NOT NULL
               AND entry_price > 0
         """), {"today": today}).scalar() or 0)
 

@@ -8,7 +8,7 @@ DealerGammaEngine and options_snapshots tables.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
@@ -17,6 +17,7 @@ from sqlalchemy import text
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from intelligence.catalyst_aggregator import MACRO_CALENDAR_UNAVAILABLE_REASON
 
 router = APIRouter(
     prefix="/api/v1/derivatives",
@@ -78,21 +79,37 @@ def get_overview() -> dict[str, Any]:
 
 # ── GET /gex/{ticker} ───────────────────────────────────────────────
 
+# Read as a module-level singleton so the route signature carries no call in
+# its default (flake8-bugbear B008).
+_SNAP_DATE_QUERY = Query(
+    None,
+    description=(
+        "Chain date to price off (YYYY-MM-DD). Strict: if no chain was stored "
+        "that day the response is available:false — a later chain is never "
+        "substituted. Omit for the latest chain up to today."
+    ),
+)
+
+
 @router.get("/gex/{ticker}")
-async def get_gex(ticker: str) -> dict[str, Any]:
+async def get_gex(
+    ticker: str,
+    snap_date: date | None = _SNAP_DATE_QUERY,
+) -> dict[str, Any]:
     """Full GEX profile for a single ticker.
 
     Returns gex_aggregate, gamma_flip, gamma_wall, put_wall, call_wall,
     dealer_delta, vanna_exposure, charm_exposure, regime, profile curve,
-    and per_strike breakdown.
+    and per_strike breakdown, plus the snap_date the chain actually came
+    from (never later than the requested date).
     """
     try:
         engine_gex = _get_gex_engine()
-        result = engine_gex.compute_gex_profile(ticker.upper())
+        result = engine_gex.compute_gex_profile(ticker.upper(), snap_date=snap_date)
         return result
     except Exception as exc:
         log.warning("GEX computation failed for {t}: {e}", t=ticker, e=str(exc))
-        return {"error": str(exc), "ticker": ticker.upper()}
+        return {"available": False, "error": str(exc), "ticker": ticker.upper()}
 
 
 # ── GET /regime ──────────────────────────────────────────────────────
@@ -567,6 +584,16 @@ async def get_flow_narrative() -> dict[str, Any]:
     try:
         engine_gex = _get_gex_engine()
         spy = engine_gex.compute_gex_profile("SPY")
+        if not spy.get("available"):
+            # No chain -> no narrative. Narrating off a missing profile
+            # printed "SPY is trading at $0.00" with a NEUTRAL regime.
+            return {
+                "content": None,
+                "positioning_data": None,
+                "briefing_date": None,
+                "stale": True,
+                "error": spy.get("error", "No SPY GEX profile available"),
+            }
 
         regime = spy.get("regime", "UNKNOWN")
         spot = spy.get("spot", 0)
@@ -720,7 +747,10 @@ async def get_scan(
                 "spot_price": o.spot_price,
                 "iv_atm": o.iv_atm,
                 "confidence": o.confidence,
-                "is_100x": o.is_100x,
+                # Audit C-M20: renamed from "is_100x" and shipped with the
+                # model inputs behind it. Nullable — unmodelled is not "no".
+                "heuristic_payoff_flag": o.heuristic_payoff_flag,
+                "payoff_inputs": o.payoff_inputs,
             }
             for o in opps
         ]
@@ -728,11 +758,22 @@ async def get_scan(
         return {
             "opportunities": results,
             "count": len(results),
-            "count_100x": sum(1 for o in opps if o.is_100x),
+            "heuristic_payoff_flag_count": sum(
+                1 for o in opps if o.heuristic_payoff_flag
+            ),
+            "payoff_unmodelled_count": sum(
+                1 for o in opps if o.heuristic_payoff_flag is None
+            ),
         }
     except Exception as exc:
         log.warning("Derivatives scan failed: {e}", e=str(exc))
-        return {"opportunities": [], "count": 0, "count_100x": 0, "error": str(exc)}
+        return {
+            "opportunities": [],
+            "count": 0,
+            "heuristic_payoff_flag_count": 0,
+            "payoff_unmodelled_count": 0,
+            "error": str(exc),
+        }
 
 
 # ── GET /flow-timeline/{ticker} ─────────────────────────────────────
@@ -784,71 +825,75 @@ def _generate_opex_calendar(start_date: date, end_date: date) -> list[dict]:
     return events
 
 
-def _generate_catalysts(start_date: date, end_date: date, ticker: str) -> list[dict]:
-    """Generate known macro catalysts for the date range.
+def _as_date(value: Any) -> date | None:
+    """Coerce a DB value to a ``date``, or None when it is not one.
 
-    Hardcodes recurring FOMC and CPI dates. Attempts yfinance for earnings.
+    Stored rows are the only source of event dates here, so a column that
+    did not come back as a date/datetime yields no event at all.
     """
-    catalysts = []
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return None
 
-    # FOMC 2026 scheduled dates (2-day meetings ending on these dates)
-    fomc_dates = [
-        date(2026, 1, 28), date(2026, 3, 18), date(2026, 5, 6),
-        date(2026, 6, 17), date(2026, 7, 29), date(2026, 9, 16),
-        date(2026, 10, 28), date(2026, 12, 16),
-    ]
-    for d in fomc_dates:
-        if start_date <= d <= end_date:
-            catalysts.append({
-                "date": str(d),
-                "type": "fomc",
-                "label": "FOMC Decision",
-            })
 
-    # CPI release dates 2026 (typically ~10th-15th of each month)
-    cpi_dates = [
-        date(2026, 1, 14), date(2026, 2, 11), date(2026, 3, 11),
-        date(2026, 4, 10), date(2026, 5, 13), date(2026, 6, 10),
-        date(2026, 7, 15), date(2026, 8, 12), date(2026, 9, 16),
-        date(2026, 10, 14), date(2026, 11, 12), date(2026, 12, 9),
-    ]
-    for d in cpi_dates:
-        if start_date <= d <= end_date:
-            catalysts.append({
-                "date": str(d),
-                "type": "cpi",
-                "label": "CPI Release",
-            })
+def _generate_catalysts(
+    db: Any,
+    start_date: date,
+    end_date: date,
+    ticker: str,
+) -> tuple[list[dict], str, str]:
+    """Catalysts inside [start_date, end_date] — stored rows only.
 
-    # Try yfinance for earnings date
+    Earnings dates are read from ``earnings_calendar`` (written by
+    ingestion/altdata/earnings_calendar.py) and each carries its ``source``
+    and the ``as_of`` timestamp of the pull that stored it.
+
+    Macro events (FOMC decisions, CPI releases) have no ingested calendar
+    anywhere in GRID: no table stores a scheduled macro release with a
+    source and an as_of.  So none are emitted.  The caller reports that gap
+    through ``catalysts_status`` / ``catalysts_reason`` instead of planting
+    a hand-typed calendar and rendering it as observed data.
+
+    Returns
+    -------
+    ``(catalysts, status, reason)`` where ``status`` is ``"unavailable"``
+    when nothing could be sourced and ``"partial"`` when earnings were
+    found but the macro calendar is still missing.
+    """
+    catalysts: list[dict] = []
+
     try:
-        import yfinance as yf
-        tk = yf.Ticker(ticker)
-        cal = tk.calendar
-        if cal is not None:
-            earnings_dates = None
-            if isinstance(cal, dict):
-                earnings_dates = cal.get("Earnings Date", [])
-            elif hasattr(cal, "columns"):
-                if "Earnings Date" in cal.index:
-                    earnings_dates = cal.loc["Earnings Date"].tolist()
-            if earnings_dates:
-                for ed in earnings_dates:
-                    try:
-                        ed_date = ed.date() if hasattr(ed, 'date') else date.fromisoformat(str(ed)[:10])
-                        if start_date <= ed_date <= end_date:
-                            catalysts.append({
-                                "date": str(ed_date),
-                                "type": "earnings",
-                                "label": f"{ticker} Earnings",
-                            })
-                    except Exception as e:
-                        log.debug("Derivatives: earnings date parse failed: {e}", e=str(e))
-    except Exception as e:
-        log.warning("Derivatives: catalyst aggregation failed: {e}", e=str(e))
+        with db.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT earnings_date, pull_timestamp "
+                "FROM earnings_calendar "
+                "WHERE ticker = :t "
+                "AND earnings_date >= :start AND earnings_date <= :end "
+                "ORDER BY earnings_date ASC"
+            ), {"t": ticker, "start": start_date, "end": end_date}).fetchall()
+    except Exception as exc:
+        log.debug("Derivatives: earnings_calendar read failed: {e}", e=str(exc))
+        rows = []
+
+    for r in rows:
+        event_date = _as_date(r[0])
+        if event_date is None:
+            # A row without a real date is not an event. Never guess one.
+            continue
+        pulled_at = _as_date(r[1])
+        catalysts.append({
+            "date": str(event_date),
+            "type": "earnings",
+            "label": f"{ticker} Earnings",
+            "source": "earnings_calendar",
+            "as_of": str(pulled_at) if pulled_at is not None else None,
+        })
 
     catalysts.sort(key=lambda c: c["date"])
-    return catalysts
+    status = "partial" if catalysts else "unavailable"
+    return catalysts, status, MACRO_CALENDAR_UNAVAILABLE_REASON
 
 
 @router.get("/flow-timeline/{ticker}")
@@ -858,8 +903,11 @@ def get_flow_timeline(
 ) -> dict[str, Any]:
     """Historical GEX timeline with OpEx calendar and catalysts.
 
-    Builds a time-series of net GEX, spot price, and regime,
-    overlaid with OpEx expiration dates and macro catalysts.
+    Builds a time-series of net GEX, spot price, and regime, overlaid with
+    OpEx expiration dates (computed from the expiry convention) and
+    catalysts read from stored rows.  GRID ingests no macro event calendar,
+    so scheduled FOMC/CPI dates are reported as unavailable via
+    ``catalysts_status`` / ``catalysts_reason`` rather than invented.
     """
     from datetime import timedelta
 
@@ -889,22 +937,45 @@ def get_flow_timeline(
             for r in rows:
                 sig_date = r[0]
                 spot = float(r[1]) if r[1] else 0
+                # as_of=True: the chain that existed on or before this bar's
+                # date. Never a later one — a historical bar priced off the
+                # newest chain is look-ahead (C-H9).
+                net_gex = None
+                regime_raw = None
+                chain_snap_date = None
                 try:
-                    gex_result = engine_gex.compute_gex_profile(ticker, snap_date=sig_date)
-                    net_gex = gex_result.get("gex_aggregate", 0)
-                    regime_raw = (gex_result.get("regime") or "NEUTRAL").lower()
-                    spot = gex_result.get("spot", spot)
-                except Exception:
-                    net_gex = 0
-                    regime_raw = "neutral"
+                    gex_result = engine_gex.compute_gex_profile(
+                        ticker, snap_date=sig_date, as_of=True
+                    )
+                    if gex_result.get("available"):
+                        net_gex = gex_result.get("gex_aggregate")
+                        regime_raw = (gex_result.get("regime") or "").lower()
+                        chain_snap_date = gex_result.get("snap_date")
+                        spot = gex_result.get("spot", spot)
+                except Exception as exc:
+                    # A failed computation is not a zero-GEX neutral day
+                    # (C-M5): the bar reports null and the chart shows a gap.
+                    log.debug(
+                        "Flow timeline GEX failed for {t} on {d}: {e}",
+                        t=ticker, d=sig_date, e=str(exc),
+                    )
+
+                regime = None
+                if regime_raw in {"short_gamma", "long_gamma", "neutral"}:
+                    regime = regime_raw
 
                 history.append({
                     "date": str(sig_date),
-                    "net_gex": round(net_gex),
-                    "regime": "short_gamma" if regime_raw == "short_gamma" else
-                              "long_gamma" if regime_raw == "long_gamma" else "neutral",
+                    "net_gex": round(net_gex) if net_gex is not None else None,
+                    "regime": regime,
+                    "chain_snap_date": chain_snap_date,
                     "spot": round(spot, 2),
                 })
+
+                if net_gex is None:
+                    # Unknown, not zero: it can neither confirm nor break a
+                    # gamma-flip crossing, so the previous sign is kept.
+                    continue
 
                 if prev_gex is not None and prev_gex * net_gex < 0:
                     gamma_flip_crossings.append({
@@ -922,11 +993,13 @@ def get_flow_timeline(
         try:
             engine_gex = _get_gex_engine()
             result = engine_gex.compute_gex_profile(ticker)
-            if not result.get("error"):
+            if result.get("available"):
+                # Dated by the chain itself, not by today.
                 history.append({
-                    "date": result.get("snap_date", str(end_date)),
+                    "date": result.get("snap_date"),
                     "net_gex": round(result.get("gex_aggregate", 0)),
                     "regime": (result.get("regime") or "NEUTRAL").lower(),
+                    "chain_snap_date": result.get("snap_date"),
                     "spot": result.get("spot", 0),
                 })
         except Exception as exc:
@@ -935,8 +1008,10 @@ def get_flow_timeline(
     # ── Generate OpEx calendar (past + 90 days forward) ──
     opex_calendar = _generate_opex_calendar(start_date, end_date + timedelta(days=90))
 
-    # ── Generate catalysts (past + 90 days forward) ──
-    catalysts = _generate_catalysts(start_date, end_date + timedelta(days=90), ticker)
+    # ── Catalysts (past + 90 days forward), from stored rows only ──
+    catalysts, catalysts_status, catalysts_reason = _generate_catalysts(
+        db, start_date, end_date + timedelta(days=90), ticker,
+    )
 
     return {
         "ticker": ticker,
@@ -944,6 +1019,8 @@ def get_flow_timeline(
         "history": history,
         "opex_calendar": opex_calendar,
         "catalysts": catalysts,
+        "catalysts_status": catalysts_status,
+        "catalysts_reason": catalysts_reason,
         "gamma_flip_crossings": gamma_flip_crossings,
     }
 

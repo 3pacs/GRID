@@ -243,7 +243,7 @@ export default function MobileDashboard({ subTab, onNavigate }) {
                     api.getStatus(),
                     api.getCurrent(),
                     api.getPipelineHealth(),
-                    api.get100xOpportunities(),
+                    api.getHeuristicPayoffOpportunities(),
                     api.getSources(),
                     api.getJournal({ limit: '5' }),
                     api.getOperatorIssues(7, null, 'ERROR'),

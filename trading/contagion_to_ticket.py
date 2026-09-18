@@ -47,6 +47,7 @@ from trading.options_recommender import (
     DTE_SCALE_BY_IMPACT,
     MAX_KELLY_PER_TICKET,
     MIN_DTE,
+    PREMIUM_BASIS_MODELLED,
     compute_kelly_fraction,
     estimate_premium,
     pick_expiry,
@@ -56,10 +57,18 @@ from trading.options_recommender import (
 # ── Contagion-specific tunables ────────────────────────────────────────────
 
 MIN_ABS_MARGIN_IMPACT: float = 0.01
-DEFAULT_CONFIDENCE_NO_HISTORY: float = 0.55
 INVALIDATION_SHORT_UP_PCT: float = 0.02
 INVALIDATION_LONG_DOWN_PCT: float = 0.02
 FLOW_THESIS_TAG: str = "contagion_derived"
+
+# Reported as ``confidence_basis`` when ``contagion_backtest_results`` holds
+# nothing for this shock type.  Audit C-H4: this branch used to substitute a
+# module-level 0.55 and feed it straight into ``compute_kelly_fraction``, so
+# a ticket with ZERO backtest history was position-sized as though it had a
+# measured 55% edge.  That constant is deleted: no history means no
+# confidence and no size.
+CONFIDENCE_BASIS_NO_HISTORY: str = "no_backtest_history"
+CONFIDENCE_BASIS_BACKTEST: str = "contagion_backtest_accuracy"
 
 
 # ── Data loaders ───────────────────────────────────────────────────────────
@@ -184,7 +193,13 @@ def _load_options_signal(engine: Engine, ticker: str) -> dict[str, Any] | None:
         "max_pain": float(row[3]) if row[3] is not None else None,
         "iv_skew": float(row[4]) if row[4] is not None else None,
         "spot_price": spot,
-        "iv_atm": float(row[6]) if row[6] is not None else 0.30,
+        # options_daily_signals.iv_atm is nullable: ingestion writes NULL when
+        # no contract sits inside the ATM band. Audit C-H5: this used to
+        # become 0.30, which then priced every premium on the ticket through
+        # estimate_premium() — an entry, target and stop derived from a
+        # constant nobody measured. A missing IV stays missing; the ticket is
+        # skipped rather than modelled off a placeholder.
+        "iv_atm": float(row[6]) if row[6] is not None else None,
         "near_expiry": row[7],
     }
 
@@ -286,6 +301,61 @@ def _load_dealer_context(engine: Engine, ticker: str) -> dict[str, Any] | None:
     return _load_dealer_gamma_context(engine, ticker)
 
 
+def _verify_contract(
+    engine: Engine,
+    ticker: str,
+    strike: float,
+    expiry_iso: str,
+    instrument: str,
+) -> bool | None:
+    """Is ``(strike, expiry)`` an actually-listed contract?
+
+    Returns ``True`` when a matching ``options_snapshots`` row exists,
+    ``False`` when the chain has been seen but this contract is not in it,
+    and ``None`` when we could not check (query failed / no chain stored),
+    which is a third state and must not be collapsed into ``False``.
+
+    Audit C-M24: ``pick_strike`` falls back to "2% OTM from spot" and
+    ``pick_expiry`` snaps to "the next Friday", described in its own
+    docstring as "close enough to a listed monthly cycle for a ticket
+    card".  Neither is guaranteed to exist.  A ticket naming a strike and
+    expiry that were never listed is not a trade anyone can place, and
+    nothing in the payload said so.
+    """
+    if not ticker or not strike or strike <= 0 or not expiry_iso:
+        return None
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT 1
+                    FROM options_snapshots
+                    WHERE UPPER(ticker) = UPPER(:t)
+                      AND strike = :k
+                      AND expiry = CAST(:e AS DATE)
+                      AND opt_type = :ot
+                    LIMIT 1
+                    """
+                ),
+                {
+                    "t": ticker,
+                    "k": float(strike),
+                    "e": expiry_iso,
+                    "ot": instrument,
+                },
+            ).fetchone()
+    except Exception as exc:  # noqa: BLE001 — any DB failure means "unknown"
+        # An unanswerable question is not a "no". Returning False here would
+        # let a failed query masquerade as a verified-absent contract.
+        log.debug(
+            "contract verification failed for {t} {k} {e}: {err}",
+            t=ticker, k=strike, e=expiry_iso, err=str(exc),
+        )
+        return None
+    return row is not None
+
+
 def _load_contagion_accuracy(
     engine: Engine, shock_type: str | None = None
 ) -> tuple[float, int]:
@@ -374,8 +444,15 @@ def _build_single_ticket(
     gamma_ctx = _load_dealer_context(engine, ticker)
 
     spot = float(signal["spot_price"])
-    iv_atm = float(signal.get("iv_atm") or 0.30)
     max_pain = signal.get("max_pain")
+
+    # No measured ATM IV → no modelled premium → no ticket (audit C-H5).
+    iv_raw = signal.get("iv_atm")
+    if iv_raw is None:
+        return None, "no iv_atm in options_daily_signals"
+    iv_atm = float(iv_raw)
+    if iv_atm <= 0:
+        return None, f"non-positive iv_atm ({iv_atm})"
 
     direction = "short" if margin < 0 else "long"
     instrument = "put" if direction == "short" else "call"
@@ -387,17 +464,27 @@ def _build_single_ticket(
         spot, iv_atm, dte
     )
 
+    # These premiums are model output from a 1σ move, not quotes. Say so on
+    # the ticket rather than letting them read as prices someone showed.
+    contract_verified = _verify_contract(
+        engine, ticker, strike, expiry_iso, instrument,
+    )
+
     if direction == "short":
         invalidation_price = round(spot * (1 + INVALIDATION_SHORT_UP_PCT), 2)
     else:
         invalidation_price = round(spot * (1 - INVALIDATION_LONG_DOWN_PCT), 2)
 
-    # Kelly sizing: fall back to a conservative confidence when history is empty.
+    # Kelly sizing comes from measured backtest accuracy or it does not
+    # happen (audit C-H4). Zero history is not a 55% edge.
     if accuracy_n > 0 and accuracy >= 0:
-        confidence = float(accuracy)
+        confidence: float | None = float(accuracy)
+        confidence_basis = CONFIDENCE_BASIS_BACKTEST
+        kelly = compute_kelly_fraction(confidence)
     else:
-        confidence = DEFAULT_CONFIDENCE_NO_HISTORY
-    kelly = compute_kelly_fraction(confidence)
+        confidence = None
+        confidence_basis = CONFIDENCE_BASIS_NO_HISTORY
+        kelly = 0.0
 
     thesis = _build_thesis(
         prediction, victim, ticker, direction, invalidation_price, dte
@@ -415,6 +502,10 @@ def _build_single_ticket(
         "entry_premium": entry_premium,
         "target_premium": target_premium,
         "stop_premium": stop_premium,
+        # Provenance for the three numbers above and for the contract itself.
+        "premium_basis": PREMIUM_BASIS_MODELLED,
+        "iv_atm": round(iv_atm, 6),
+        "contract_verified": contract_verified,
         "kelly_size": kelly,
         "invalidation_price": invalidation_price,
         "underlying_price": round(spot, 2),
@@ -426,7 +517,9 @@ def _build_single_ticket(
             "call_wall": gamma_ctx.get("call_wall") if gamma_ctx else None,
             "regime": gamma_ctx.get("regime") if gamma_ctx else None,
         },
-        "confidence": round(confidence, 4),
+        "confidence": round(confidence, 4) if confidence is not None else None,
+        "confidence_basis": confidence_basis,
+        "confidence_n": int(accuracy_n),
         "margin_impact_pct": round(margin, 6),
         "shock_node": prediction.shock_node,
         "shock_type": prediction.shock_type,
@@ -464,6 +557,28 @@ def _get_default_model_version_id(engine: Engine) -> int | None:
         return None
 
 
+def _unscored_reason(ticket: dict[str, Any]) -> str:
+    """Spell out, for the permanent record, why a ticket has no confidence.
+
+    Stored in ``decision_journal.confidence_reason``. It must be readable on
+    its own years later, so it names the basis tag and the sample size rather
+    than assuming the reader can re-derive them.
+    """
+    basis = ticket.get("confidence_basis") or CONFIDENCE_BASIS_NO_HISTORY
+    n = ticket.get("confidence_n")
+    n_txt = f"n={n}" if n is not None else "n unknown"
+    if basis == CONFIDENCE_BASIS_NO_HISTORY:
+        return (
+            "unscored: no contagion backtest history for shock_type="
+            f"{ticket.get('shock_type')} ({basis}, {n_txt}) — no confidence "
+            "was measured and none was invented"
+        )
+    return (
+        f"unscored: confidence unavailable ({basis}, {n_txt}) — no confidence "
+        "was measured and none was invented"
+    )
+
+
 def write_ticket_to_journal(
     engine: Engine,
     ticket: dict[str, Any],
@@ -481,8 +596,30 @@ def write_ticket_to_journal(
         log.debug("journal skip: no model_version_id available")
         return None
 
-    confidence = float(ticket.get("confidence") or 0.5)
-    confidence = max(0.0, min(1.0, confidence))
+    # Three states, not two. The pre-#539 code wrote a fabricated 0.5 into the
+    # permanent audit record whenever a ticket had no measured confidence; #539
+    # replaced that with skipping the row, which traded a false number for a
+    # missing record. Neither is the audit the operator needs. Since
+    # journal_unscored_conf_0918 the journal can hold the honest third state:
+    # state_confidence NULL plus a mandatory reason. Nothing is invented and
+    # nothing is omitted.
+    raw_confidence = ticket.get("confidence")
+    confidence: float | None
+    confidence_reason: str | None
+    if raw_confidence is None:
+        confidence = None
+        confidence_reason = _unscored_reason(ticket)
+        log.info(
+            "journal unscored for {t}: {r}",
+            t=ticket.get("ticker"),
+            r=confidence_reason,
+        )
+    else:
+        confidence = max(0.0, min(1.0, float(raw_confidence)))
+        confidence_reason = (
+            f"scored: {ticket.get('confidence_basis') or CONFIDENCE_BASIS_BACKTEST} "
+            f"(n={ticket.get('confidence_n')})"
+        )
     state_label = f"CONTAGION_{str(ticket.get('shock_type','')).upper()}"
     action = (
         f"{ticket['direction'].upper()} {ticket['instrument'].upper()} "
@@ -504,15 +641,23 @@ def write_ticket_to_journal(
             model_version_id=mv_id,
             inferred_state=state_label,
             state_confidence=confidence,
+            confidence_reason=confidence_reason,
             transition_probability=min(1.0, max(0.0, ticket.get("kelly_size", 0.0))),
             contradiction_flags=contradiction,
             grid_recommendation=action,
             baseline_recommendation="HOLD",
             action_taken=action,
             counterfactual=ticket.get("thesis", ""),
+            # operator_confidence is a categorical NOT NULL column and is a
+            # different thing from the measured state_confidence. With no
+            # measurement at all the category is UNSCORED, not LOW: LOW is
+            # an assessment, and nothing here was assessed.
             operator_confidence=(
-                "HIGH" if confidence >= 0.65
-                else ("MEDIUM" if confidence >= 0.5 else "LOW")
+                "UNSCORED" if confidence is None
+                else (
+                    "HIGH" if confidence >= 0.65
+                    else ("MEDIUM" if confidence >= 0.5 else "LOW")
+                )
             ),
         )
         return int(decision_id)
@@ -701,4 +846,7 @@ __all__ = [
     "MIN_ABS_MARGIN_IMPACT",
     "MIN_DTE",
     "DTE_SCALE_BY_IMPACT",
+    "PREMIUM_BASIS_MODELLED",
+    "CONFIDENCE_BASIS_NO_HISTORY",
+    "CONFIDENCE_BASIS_BACKTEST",
 ]

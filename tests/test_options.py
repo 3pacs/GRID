@@ -132,29 +132,38 @@ from discovery.options_scanner import MispricingOpportunity, OptionsScanner
 class TestMispricingOpportunity:
     """Tests for the MispricingOpportunity dataclass."""
 
-    def test_is_100x_true(self):
+    def test_heuristic_payoff_flag_true(self):
         opp = MispricingOpportunity(
             ticker="SPY", scan_date=date.today(), score=8.5,
             estimated_payoff_multiple=150.0, direction="CALL",
             thesis="Test thesis",
         )
-        assert opp.is_100x is True
+        assert opp.heuristic_payoff_flag is True
 
-    def test_is_100x_false(self):
+    def test_heuristic_payoff_flag_false(self):
         opp = MispricingOpportunity(
             ticker="SPY", scan_date=date.today(), score=5.0,
             estimated_payoff_multiple=50.0, direction="PUT",
             thesis="Test thesis",
         )
-        assert opp.is_100x is False
+        assert opp.heuristic_payoff_flag is False
 
-    def test_is_100x_boundary(self):
+    def test_heuristic_payoff_flag_boundary(self):
         opp = MispricingOpportunity(
             ticker="SPY", scan_date=date.today(), score=7.0,
             estimated_payoff_multiple=100.0, direction="CALL",
             thesis="Boundary test",
         )
-        assert opp.is_100x is True
+        assert opp.heuristic_payoff_flag is True
+
+    def test_unmodelled_payoff_flag_is_none_not_false(self):
+        """Unknown is a third state — it must not read as "does not clear"."""
+        opp = MispricingOpportunity(
+            ticker="SPY", scan_date=date.today(), score=7.0,
+            estimated_payoff_multiple=None, direction="CALL",
+            thesis="No IV to model with",
+        )
+        assert opp.heuristic_payoff_flag is None
 
 
 class TestOptionsScannerScoring:
@@ -304,16 +313,17 @@ class TestPayoffEstimation:
 
     def test_low_iv_high_score_gives_high_payoff(self):
         scanner = self._make_scanner()
-        payoff = scanner._estimate_payoff_multiple(
+        payoff, inputs = scanner._estimate_payoff_multiple(
             {"iv_atm": 0.12, "spot_price": 500, "max_pain": 450},
             composite_score=8.0,
             direction="CALL",
         )
         assert payoff >= 50  # Low IV + high score = big potential
+        assert inputs["basis"] == "modelled_heuristic"
 
     def test_high_iv_low_score_gives_low_payoff(self):
         scanner = self._make_scanner()
-        payoff = scanner._estimate_payoff_multiple(
+        payoff, _inputs = scanner._estimate_payoff_multiple(
             {"iv_atm": 0.60, "spot_price": 500, "max_pain": 495},
             composite_score=3.0,
             direction="PUT",
@@ -322,21 +332,36 @@ class TestPayoffEstimation:
 
     def test_payoff_capped_at_1000(self):
         scanner = self._make_scanner()
-        payoff = scanner._estimate_payoff_multiple(
+        payoff, _inputs = scanner._estimate_payoff_multiple(
             {"iv_atm": 0.01, "spot_price": 500, "max_pain": 300},
             composite_score=10.0,
             direction="CALL",
         )
         assert payoff <= 1000
 
-    def test_missing_iv_fallback(self):
+    def test_missing_iv_is_unmodelled_not_score_times_five(self):
+        """Audit C-M20: the old fallback returned composite_score * 5, i.e.
+        it manufactured a payoff MULTIPLE out of a signal SCORE."""
         scanner = self._make_scanner()
-        payoff = scanner._estimate_payoff_multiple(
+        payoff, inputs = scanner._estimate_payoff_multiple(
             {"iv_atm": None, "spot_price": 500},
             composite_score=7.0,
             direction="CALL",
         )
-        assert payoff > 0
+        assert payoff is None
+        assert payoff != 35.0  # what the old fallback would have returned
+        assert inputs["basis"] == "unavailable"
+        assert inputs["unavailable_reason"] == "no measured iv_atm"
+
+    def test_inputs_carry_the_four_required_terms(self):
+        scanner = self._make_scanner()
+        _payoff, inputs = scanner._estimate_payoff_multiple(
+            {"iv_atm": 0.25, "spot_price": 100.0, "max_pain": 90.0},
+            composite_score=7.0,
+            direction="CALL",
+        )
+        for key in ("iv_atm", "expected_move_pct", "otm_cost_pct", "leverage"):
+            assert inputs[key] is not None, key
 
 
 class TestFormatReport:
@@ -363,9 +388,23 @@ class TestFormatReport:
         ]
         report = scanner.format_report(opps)
         assert "SPY" in report
-        assert "100x+" in report
+        assert "HEURISTIC PAYOFF FLAG" in report
         assert "150x" in report
         assert "HIGH" in report
+
+    def test_report_says_so_when_payoff_is_unmodelled(self):
+        scanner = self._make_scanner()
+        opps = [
+            MispricingOpportunity(
+                ticker="SPY", scan_date=date(2026, 3, 23), score=8.5,
+                estimated_payoff_multiple=None, direction="CALL",
+                thesis="Test thesis", confidence="HIGH",
+                spot_price=500.0, iv_atm=None,
+            ),
+        ]
+        report = scanner.format_report(opps)
+        assert "n/a (inputs missing)" in report
+        assert "HEURISTIC PAYOFF FLAG" not in report
 
 
 class TestTargetStrikes:
