@@ -267,8 +267,17 @@ CREATE TABLE IF NOT EXISTS decision_journal (
     decision_timestamp      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     model_version_id        INTEGER NOT NULL REFERENCES model_registry(id),
     inferred_state          TEXT NOT NULL,
-    state_confidence        DOUBLE PRECISION NOT NULL CHECK (
+    -- NULL means UNSCORED: no confidence was ever measured for this
+    -- decision. It is a third, explicit state — never a stand-in for a
+    -- number, and never to be read as 0. An unscored row is EXCLUDED from
+    -- calibration/scoring, not counted as a zero. Whenever it is NULL,
+    -- confidence_reason must say why (ck_decision_journal_unscored_has_reason
+    -- below). A CHECK evaluating to NULL passes, so BETWEEN 0 AND 1 still
+    -- constrains every row that does carry a number.
+    state_confidence        DOUBLE PRECISION CHECK (
                                 state_confidence BETWEEN 0 AND 1),
+    -- Why state_confidence is what it is. Required when it is NULL.
+    confidence_reason       TEXT,
     transition_probability  DOUBLE PRECISION NOT NULL CHECK (
                                 transition_probability BETWEEN 0 AND 1),
     contradiction_flags     JSONB NOT NULL DEFAULT '{}',
@@ -282,7 +291,9 @@ CREATE TABLE IF NOT EXISTS decision_journal (
     outcome_recorded_at     TIMESTAMPTZ,
     verdict                 TEXT CHECK (verdict IN (
                                 'HELPED', 'HARMED', 'NEUTRAL', 'INSUFFICIENT_DATA')),
-    annotation              TEXT
+    annotation              TEXT,
+    CONSTRAINT ck_decision_journal_unscored_has_reason CHECK (
+        state_confidence IS NOT NULL OR confidence_reason IS NOT NULL)
 );
 
 CREATE INDEX IF NOT EXISTS idx_decision_journal_timestamp
@@ -297,6 +308,10 @@ CREATE INDEX IF NOT EXISTS idx_decision_journal_confidence
     ON decision_journal (operator_confidence);
 CREATE INDEX IF NOT EXISTS idx_decision_journal_outcome_recorded
     ON decision_journal (outcome_recorded_at);
+-- Unscored (no measured confidence) rows, for audit review.
+CREATE INDEX IF NOT EXISTS idx_decision_journal_unscored
+    ON decision_journal (decision_timestamp DESC)
+    WHERE state_confidence IS NULL;
 
 -- ---------------------------------------------------------------------------
 -- regime_history — the daily regime label, one row per observation date.
@@ -378,6 +393,9 @@ BEGIN
     END IF;
     IF OLD.state_confidence IS DISTINCT FROM NEW.state_confidence THEN
         RAISE EXCEPTION 'decision_journal is append-only: cannot modify state_confidence';
+    END IF;
+    IF OLD.confidence_reason IS DISTINCT FROM NEW.confidence_reason THEN
+        RAISE EXCEPTION 'decision_journal is append-only: cannot modify confidence_reason';
     END IF;
     IF OLD.transition_probability IS DISTINCT FROM NEW.transition_probability THEN
         RAISE EXCEPTION 'decision_journal is append-only: cannot modify transition_probability';
