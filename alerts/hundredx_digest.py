@@ -591,7 +591,7 @@ def run_100x_digest(force: bool = False) -> dict[str, Any]:
 
     # Get all opportunities — include everything the scanner flagged
     all_opps = sorted(opportunities, key=lambda o: -o.score)
-    hundredx_opps = [o for o in opportunities if o.is_100x]
+    hundredx_opps = [o for o in opportunities if o.heuristic_payoff_flag]
 
     log.info(
         "100x Digest: {total} total, {high} high-score, {hx} 100x",
@@ -633,7 +633,10 @@ def run_100x_digest(force: bool = False) -> dict[str, Any]:
             "strikes": opp.strikes,
             "expiry": opp.expiry,
             "confidence": opp.confidence,
-            "is_100x": opp.is_100x,
+            # Audit C-M20: the modelled payoff flag, with its inputs, not
+            # a bare "is_100x" assertion about the market.
+            "heuristic_payoff_flag": opp.heuristic_payoff_flag,
+            "payoff_inputs": opp.payoff_inputs,
         }
 
         v = _verify_opportunity(opp.ticker, opp_dict, engine)
@@ -677,7 +680,7 @@ def run_100x_digest(force: bool = False) -> dict[str, Any]:
     sorted_opps = sorted(
         zip(verified_opps, verifications),
         key=lambda x: (
-            -int(bool(x[0].get("is_100x", False))),
+            -int(bool(x[0].get("heuristic_payoff_flag"))),
             -float(x[0].get("score") or 0),
         ),
     )
@@ -701,7 +704,7 @@ def run_100x_digest(force: bool = False) -> dict[str, Any]:
         ))
 
     # Step 4: Send
-    n_100x = sum(1 for o in verified_opps if o.get("is_100x"))
+    n_100x = sum(1 for o in verified_opps if o.get("heuristic_payoff_flag"))
     subject = f"GRID Intelligence — {n_100x} 100x + {len(verified_opps) - n_100x} High-Score Opportunities"
 
     # Inject extra CSS for strike tables

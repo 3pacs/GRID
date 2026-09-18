@@ -333,14 +333,14 @@ def run_pipeline(historical: bool = False) -> dict:
         from discovery.options_scanner import OptionsScanner
         scanner = OptionsScanner(engine)
         opps = scanner.scan_all(min_score=5.0)
-        n_100x = sum(1 for o in opps if o.is_100x)
+        n_100x = sum(1 for o in opps if o.heuristic_payoff_flag)
         if opps:
             scanner.persist_scan(opps)
         log.info("Options scan — {n} opportunities, {x} 100x+", n=len(opps), x=n_100x)
 
         # Email alert for any 100x+ finds
         for opp in opps:
-            if opp.is_100x:
+            if opp.heuristic_payoff_flag:
                 try:
                     from alerts.email import alert_on_100x_opportunity
                     alert_on_100x_opportunity(opp.ticker, opp.score, opp.direction, opp.thesis)
