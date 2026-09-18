@@ -46,7 +46,10 @@ class OraclePublishRequest(BaseModel):
     call: str
     timing: str
     invalidation: str
-    confidence: float = 0.5
+    # No default: a publisher that does not state a confidence publishes
+    # without one (docs/reference/CONFIDENCE_POLICY.md). The old 0.5 default
+    # made every silent caller look like a stated 50% forecast.
+    confidence: float | None = None
     weight_version: str = "astrogrid-v1"
     model_version: str = "astrogrid-oracle-v1"
     grid_summary: str | None = None
@@ -216,7 +219,9 @@ def get_latest(
             FROM oracle_predictions
             WHERE created_at >= :ct - INTERVAL '5 minutes'
               AND dedup_keep = TRUE
-            ORDER BY confidence DESC
+            -- A prediction with no stated confidence is unknown, not the
+            -- most confident: NULLS LAST, never first.
+            ORDER BY confidence DESC NULLS LAST
             LIMIT 20
         """), {"ct": cycle_time}).fetchall()
 
