@@ -329,8 +329,9 @@ class TestEdgeMissingMetadata:
         data = _get_edge({
             "congressional": [],
             "insider": [],
-            # metadata carries the direction but no volume_vs_avg.
-            "darkpool": [{"direction": "BUY", "date": "2026-09-15", "metadata": {}}],
+            # metadata carries no volume_vs_avg; signal_type is what the
+            # real get_insider_edge emits (never "direction").
+            "darkpool": [{"signal_type": "BUY", "date": "2026-09-15", "metadata": {}}],
         })
         assert data["dark_pool"]["volume_vs_avg"] is None
         assert data["dark_pool"]["signal"] == "accumulation"
@@ -340,7 +341,7 @@ class TestEdgeMissingMetadata:
             "congressional": [],
             "insider": [],
             "darkpool": [{
-                "direction": "BUY", "date": "2026-09-15",
+                "signal_type": "BUY", "date": "2026-09-15",
                 "metadata": {"volume_vs_avg": 2.4},
             }],
         })
@@ -374,7 +375,7 @@ class TestEdgeMissingMetadata:
         data = _get_edge({
             "congressional": [],
             "insider": [{
-                "insider": "Jane Doe", "direction": "SELL",
+                "insider": "Jane Doe", "signal_type": "SELL",
                 "date": "2026-09-10", "metadata": {"title": "CFO"},
             }],
             "darkpool": [],
@@ -401,6 +402,150 @@ class TestEdgeMissingMetadata:
         assert data["whale_flow"] == []
         assert data["prediction_markets"] == []
         assert data["dark_pool"] is None
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Edge action labels come from signal_type, never a default "BUY"
+# ══════════════════════════════════════════════════════════════════
+#
+# get_insider_edge emits the column name, ``signal_type``. The router used to
+# read ``sig.get("direction", "BUY")``, so against real rows every
+# congressional / insider action rendered BUY and every dark-pool print
+# rendered "distribution". The mocked fixtures above carried ``direction``
+# and so never saw it. Same defect class as C-M22 (convergence direction).
+
+
+def _signal_row(source_id, signal_type, signal_date, trust_score=None, metadata=None):
+    """One signal_sources row in get_insider_edge's SELECT column order."""
+    return (source_id, signal_type, signal_date, None, trust_score, "PENDING", None, metadata)
+
+
+def _real_edge_engine(cong_rows=(), insider_rows=(), dp_rows=()):
+    """Engine whose signal_sources answers let the *real* get_insider_edge run."""
+    def _execute(statement, *args, **kwargs):
+        sql = str(statement)
+        result = MagicMock()
+        if "source_type = 'congressional'" in sql:
+            result.fetchall.return_value = list(cong_rows)
+        elif "source_type = 'insider'" in sql:
+            result.fetchall.return_value = list(insider_rows)
+        elif "source_type = 'darkpool'" in sql:
+            result.fetchall.return_value = list(dp_rows)
+        else:
+            result.fetchall.return_value = []
+            result.fetchone.return_value = None
+        return result
+
+    conn = MagicMock()
+    conn.execute.side_effect = _execute
+    engine = MagicMock()
+    for factory in (engine.connect, engine.begin):
+        factory.return_value.__enter__ = MagicMock(return_value=conn)
+        factory.return_value.__exit__ = MagicMock(return_value=False)
+    return engine
+
+
+def _get_edge_via_real_helper(cong_rows=(), insider_rows=(), dp_rows=()):
+    engine = _real_edge_engine(cong_rows, insider_rows, dp_rows)
+    app.dependency_overrides[get_db_engine] = lambda: engine
+    try:
+        with patch("intelligence.trust_scorer.detect_convergence", return_value=[]):
+            response = client.get("/api/v1/watchlist/NVDA/edge", headers=_auth_header())
+    finally:
+        app.dependency_overrides.pop(get_db_engine, None)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+class TestEdgeActionLabels:
+    def test_real_helper_output_shape_is_signal_type(self):
+        """Pin the contract the router depends on: the helper says signal_type."""
+        from intelligence.trust_scorer import get_insider_edge
+
+        engine = _real_edge_engine(
+            cong_rows=[_signal_row("Rep. A", "SELL", "2026-09-10", 0.7, {})],
+        )
+        edge = get_insider_edge(engine, "NVDA")
+        row = edge["congressional"][0]
+        assert row["signal_type"] == "SELL"
+        assert "direction" not in row
+
+    def test_sell_rows_render_sell_through_the_real_helper(self):
+        """The regression: stored SELL rows must not come back as BUY."""
+        data = _get_edge_via_real_helper(
+            cong_rows=[_signal_row("Rep. A", "SELL", "2026-09-10", 0.7, {"amount": "$15K"})],
+            insider_rows=[_signal_row("Jane Doe", "SELL", "2026-09-11", None, {"title": "CFO"})],
+            dp_rows=[_signal_row("dp:1", "SELL", "2026-09-12", None, {})],
+        )
+        assert data["congressional"][0]["action"] == "SELL"
+        assert data["insider"][0]["action"] == "SELL"
+        assert data["dark_pool"]["signal"] == "distribution"
+        assert data["dark_pool"]["signal_type"] == "SELL"
+
+    def test_buy_rows_render_buy_through_the_real_helper(self):
+        data = _get_edge_via_real_helper(
+            cong_rows=[_signal_row("Rep. B", "BUY", "2026-09-10", None, {})],
+            insider_rows=[_signal_row("John Roe", "BUY", "2026-09-11", None, {})],
+            dp_rows=[_signal_row("dp:2", "BUY", "2026-09-12", None, {})],
+        )
+        assert data["congressional"][0]["action"] == "BUY"
+        assert data["insider"][0]["action"] == "BUY"
+        assert data["dark_pool"]["signal"] == "accumulation"
+
+    def test_mixed_rows_keep_their_own_labels(self):
+        data = _get_edge_via_real_helper(
+            cong_rows=[
+                _signal_row("Rep. A", "SELL", "2026-09-10", None, {}),
+                _signal_row("Rep. B", "BUY", "2026-09-09", None, {}),
+            ],
+        )
+        assert [c["action"] for c in data["congressional"]] == ["SELL", "BUY"]
+
+    def test_insider_variant_signal_type_passes_through(self):
+        """UNUSUAL_SELL is a stored label; it is neither collapsed nor defaulted."""
+        data = _get_edge_via_real_helper(
+            insider_rows=[_signal_row("Jane Doe", "UNUSUAL_SELL", "2026-09-11", None, {})],
+        )
+        assert data["insider"][0]["action"] == "UNUSUAL_SELL"
+
+    def test_missing_label_is_null_not_buy(self):
+        """Neither signal_type nor direction: null + nothing invented."""
+        data = _get_edge({
+            "congressional": [{"member": "Rep. A", "date": "2026-09-10", "metadata": {}}],
+            "insider": [{"insider": "Jane Doe", "date": "2026-09-11", "metadata": {}}],
+            "darkpool": [{"date": "2026-09-12", "metadata": {}}],
+        })
+        assert data["congressional"][0]["action"] is None
+        assert data["insider"][0]["action"] is None
+        assert data["dark_pool"]["signal"] is None
+        assert data["dark_pool"]["signal_type"] is None
+
+    def test_dark_pool_unrecognised_label_is_null_not_distribution(self):
+        data = _get_edge({
+            "congressional": [], "insider": [],
+            "darkpool": [{"signal_type": "UNUSUAL_VOLUME", "date": "2026-09-12", "metadata": {}}],
+        })
+        assert data["dark_pool"]["signal"] is None
+        assert data["dark_pool"]["signal_type"] == "UNUSUAL_VOLUME"
+
+    def test_legacy_direction_key_is_honoured_only_when_present(self):
+        data = _get_edge({
+            "congressional": [{"member": "Rep. A", "direction": "SELL", "date": "2026-09-10", "metadata": {}}],
+            "insider": [],
+            "darkpool": [{"direction": "SELL", "date": "2026-09-12", "metadata": {}}],
+        })
+        assert data["congressional"][0]["action"] == "SELL"
+        assert data["dark_pool"]["signal"] == "distribution"
+
+    def test_signal_type_wins_over_direction(self):
+        data = _get_edge({
+            "congressional": [{
+                "member": "Rep. A", "signal_type": "SELL", "direction": "BUY",
+                "date": "2026-09-10", "metadata": {},
+            }],
+            "insider": [], "darkpool": [],
+        })
+        assert data["congressional"][0]["action"] == "SELL"
 
 
 # ══════════════════════════════════════════════════════════════════

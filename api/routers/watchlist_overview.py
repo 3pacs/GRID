@@ -47,6 +47,47 @@ def _round_or_none(value, digits: int = 2) -> float | None:
         return None
 
 
+def _signal_action(sig: dict) -> str | None:
+    """The stored BUY/SELL label of a trust_scorer signal row, or ``None``.
+
+    ``intelligence.trust_scorer.get_insider_edge`` emits the column name,
+    ``signal_type`` (``'BUY'`` / ``'SELL'``, plus insider variants such as
+    ``'UNUSUAL_SELL'``). Older fixtures spelled it ``direction``; that key is
+    honoured only when it is actually present. When neither resolves the
+    label is ``None`` -- never a default ``"BUY"``, which is byte-identical
+    on the wire to a stored BUY and would paint every SELL row green.
+
+    See docs/reference/CONFIDENCE_POLICY.md and
+    docs/reference/AVAILABILITY_CONTRACT.md (null + basis, never a
+    fabricated default).
+    """
+    if not isinstance(sig, dict):
+        return None
+    for key in ("signal_type", "direction"):
+        value = sig.get(key)
+        if value is None:
+            continue
+        label = str(value).strip().upper()
+        if label:
+            return label
+    return None
+
+
+def _dark_pool_signal(action: str | None) -> str | None:
+    """Map a dark-pool row's stored label onto accumulation / distribution.
+
+    Only an explicit BUY or SELL says which way the block traded. Anything
+    else (missing label, a variant we do not understand) is ``None``: the old
+    ``"accumulation" if ... == "BUY" else "distribution"`` turned every
+    unlabelled print into distribution.
+    """
+    if action == "BUY":
+        return "accumulation"
+    if action == "SELL":
+        return "distribution"
+    return None
+
+
 def _format_price_action(ticker: str, price: float, pct_1d: float | None) -> str:
     """Render the rule-based "Price Action" sentence.
 
@@ -572,7 +613,9 @@ def get_ticker_edge(
                         meta = {}
                 congressional.append({
                     "member": sig.get("member", "Unknown"),
-                    "action": sig.get("direction", "BUY"),
+                    # signal_type is what get_insider_edge emits; None when
+                    # the row carries no label, never a default "BUY".
+                    "action": _signal_action(sig),
                     "amount": meta.get("amount", "N/A"),
                     "date": sig.get("date", ""),
                     "committee": meta.get("committee", "N/A"),
@@ -591,7 +634,7 @@ def get_ticker_edge(
                 insider.append({
                     "name": sig.get("insider", "Unknown"),
                     "title": meta.get("title", ""),
-                    "action": sig.get("direction", "BUY"),
+                    "action": _signal_action(sig),
                     # null, never 0: a "0 shares / $0" insider row reads as an
                     # observed trade of zero size.
                     "shares": meta.get("shares"),
@@ -608,14 +651,16 @@ def get_ticker_edge(
                         import json; dp_meta = json.loads(dp_meta)
                     except Exception:
                         dp_meta = {}
+                dp_action = _signal_action(latest_dp)
                 dark_pool = {
                     # null, never 1.0: "exactly average dark-pool volume" is a
                     # measurement, and this metadata simply did not carry one.
                     "volume_vs_avg": dp_meta.get("volume_vs_avg"),
-                    "signal": (
-                        "accumulation" if latest_dp.get("direction") == "BUY"
-                        else "distribution"
-                    ),
+                    # accumulation / distribution only from an explicit
+                    # BUY / SELL signal_type; null otherwise. signal_type is
+                    # the basis the label was derived from.
+                    "signal": _dark_pool_signal(dp_action),
+                    "signal_type": dp_action,
                     "date": latest_dp.get("date", ""),
                 }
     except Exception as exc:

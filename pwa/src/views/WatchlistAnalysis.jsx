@@ -274,6 +274,16 @@ export function TrustBar({ score, width = 48 }) {
     );
 }
 
+// A null action is an unlabelled row (the API sends null, never a default
+// BUY), so it colours neither green nor red. Only an explicit BUY/SELL family
+// label picks a side; SignalCard falls through to textDim otherwise.
+function signalDirection(action) {
+    if (action == null) return 'unknown';
+    if (action === 'BUY' || action.endsWith('_BUY')) return 'bullish';
+    if (action === 'SELL' || action.endsWith('_SELL')) return 'bearish';
+    return 'unknown';
+}
+
 function SignalCard({ icon, label, actor, action, date, trustScore, direction }) {
     const dirColor = direction === 'bullish' || action === 'BUY' || action === 'CALL' || action === 'INCREASED'
         ? colors.green
@@ -391,16 +401,16 @@ export function InsiderEdgePanel({ edgeData, loading }) {
                         {congressional?.map((c, i) => (
                             <SignalCard key={`cong-${i}`}
                                 icon={SIGNAL_ICONS.congressional} label="Congress"
-                                actor={c.member} action={c.action} date={c.date}
-                                trustScore={c.trust_score} direction={c.action === 'BUY' ? 'bullish' : 'bearish'}
+                                actor={c.member} action={c.action ?? 'UNKNOWN'} date={c.date}
+                                trustScore={c.trust_score} direction={signalDirection(c.action)}
                             />
                         ))}
                         {insider?.map((ins, i) => (
                             <SignalCard key={`ins-${i}`}
                                 icon={SIGNAL_ICONS.insider} label={ins.title || 'Insider'}
-                                actor={ins.name} action={ins.action} date={ins.date}
+                                actor={ins.name} action={ins.action ?? 'UNKNOWN'} date={ins.date}
                                 trustScore={null}
-                                direction={ins.action === 'BUY' ? 'bullish' : 'bearish'}
+                                direction={signalDirection(ins.action)}
                             />
                         ))}
                         {dark_pool && (
@@ -409,10 +419,11 @@ export function InsiderEdgePanel({ edgeData, loading }) {
                                 actor={dark_pool.volume_vs_avg == null
                                     ? 'volume vs avg not reported'
                                     : `${dark_pool.volume_vs_avg.toFixed(1)}x avg volume`}
-                                action={dark_pool.signal?.toUpperCase() || 'NEUTRAL'}
+                                action={dark_pool.signal?.toUpperCase() ?? 'UNKNOWN'}
                                 date={dark_pool.date}
                                 trustScore={null}
-                                direction={dark_pool.signal === 'accumulation' ? 'bullish' : 'bearish'}
+                                direction={dark_pool.signal === 'accumulation' ? 'bullish'
+                                    : dark_pool.signal === 'distribution' ? 'bearish' : 'unknown'}
                             />
                         )}
                         {whale_flow?.map((w, i) => (
