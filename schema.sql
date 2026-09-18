@@ -1762,3 +1762,27 @@ CREATE TABLE IF NOT EXISTS ref_verification_log (
 CREATE INDEX IF NOT EXISTS idx_ref_log_url ON ref_verification_log(url);
 CREATE INDEX IF NOT EXISTS idx_ref_log_classification ON ref_verification_log(classification);
 CREATE INDEX IF NOT EXISTS idx_ref_log_checked_at ON ref_verification_log(checked_at);
+
+-- ---------------------------------------------------------------------------
+-- market_briefings: written by ollama/market_briefing.py (which also creates it
+-- lazily at runtime). Declared here because the Alembic revision
+-- god_view_market_tables_20260918 builds the materialized view
+-- market_god_view_daily on top of it, so a fresh install that applies
+-- schema.sql and then runs `alembic upgrade head` must already have it.
+-- DDL identical to ollama/market_briefing.py; idempotent.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS market_briefings (
+    id              SERIAL PRIMARY KEY,
+    briefing_type   TEXT NOT NULL,
+    briefing_date   DATE NOT NULL,
+    content         TEXT NOT NULL,
+    sentiment_score REAL,
+    sentiment_label TEXT,
+    sentiment_data  JSONB,
+    snapshot_data   JSONB,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_market_briefings_date
+    ON market_briefings (briefing_date DESC);
+CREATE INDEX IF NOT EXISTS idx_market_briefings_type
+    ON market_briefings (briefing_type, briefing_date DESC);
