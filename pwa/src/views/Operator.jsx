@@ -324,7 +324,7 @@ export default function Operator() {
                     {status.database && (
                         <div style={{ fontSize: '11px', color: colors.textMuted, marginTop: '8px' }}>
                             DB: {status.database.connected ? 'Connected' : 'Disconnected'}
-                            {status.database.size_mb && ` · ${(status.database.size_mb / 1024).toFixed(1)}GB`}
+                            {status.database.connected && typeof status.database.size_mb === 'number' && ` · ${(status.database.size_mb / 1024).toFixed(1)}GB`}
                         </div>
                     )}
                 </div>

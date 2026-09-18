@@ -62,12 +62,12 @@ const DEFAULT_PLAN_STEPS = [
 ];
 
 function pct(value, digits = 1) {
-    if (value == null || Number.isNaN(Number(value))) return 'n/a';
+    if (value == null || Number.isNaN(Number(value))) return '—';
     return `${(Number(value) * 100).toFixed(digits)}%`;
 }
 
 function money(value) {
-    if (value == null || Number.isNaN(Number(value))) return '$0';
+    if (value == null || Number.isNaN(Number(value))) return '—';
     return Number(value).toLocaleString(undefined, {
         style: 'currency',
         currency: 'USD',
@@ -76,7 +76,7 @@ function money(value) {
 }
 
 function number(value, digits = 1) {
-    if (value == null || Number.isNaN(Number(value))) return 'n/a';
+    if (value == null || Number.isNaN(Number(value))) return '—';
     return Number(value).toFixed(digits);
 }
 
@@ -302,6 +302,12 @@ export default function TenYearPortfolio() {
         const result = await api.getTenYearPortfolio({ capital, years: 10 });
         if (result?.error || result?.status === 'error') {
             setError(result?.message || result?.error || 'Portfolio query failed');
+        } else if (result?.status === 'empty') {
+            // The router's own "no eligible price history" response — a
+            // valid, non-error result with nothing to show. Surface its
+            // message instead of silently treating it as a normal payload
+            // (which left the view rendering zeros and a stuck "loading").
+            setError(result?.message || 'No eligible price history yet.');
         } else {
             setData(result);
             if (!result.profiles?.some(profile => profile.id === activeProfileId)) {
@@ -751,7 +757,7 @@ export default function TenYearPortfolio() {
                             <DollarSign size={18} />
                             <strong>{activeProfile?.label || 'Profile'}</strong>
                         </div>
-                        <p>{activeProfile?.description || 'Waiting for the weekly portfolio query.'}</p>
+                        <p>{activeProfile?.description || error || 'Waiting for the weekly portfolio query.'}</p>
                         <p>{activeProfile?.weekly_policy?.exit_rule || ''}</p>
                     </div>
                 </section>
@@ -759,7 +765,7 @@ export default function TenYearPortfolio() {
                 <aside className="ty-side">
                     <div className="ty-side-block">
                         <span>As of</span>
-                        <strong>{data?.as_of || 'loading'}</strong>
+                        <strong>{loading ? 'loading' : (data?.as_of || '—')}</strong>
                     </div>
                     <div className="ty-side-block">
                         <span>Benchmark</span>
