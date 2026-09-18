@@ -556,7 +556,9 @@ function _nodeAttributes(node, id) {
         tier,
         category,
         influence,
-        trust_score: node.trust_score || data.trust_score || data.trustScore,
+        // ?? not ||: a measured 0 trust must not fall through to the next
+        // candidate, and an unscored actor stays null rather than undefined-y.
+        trust_score: node.trust_score ?? data.trust_score ?? data.trustScore ?? null,
         title: node.title || data.title || data.subtitle || '',
         graphDepth,
         entityId: node.entityId || node.entity_id || data.entityId || data.entity_id,
