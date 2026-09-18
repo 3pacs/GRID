@@ -111,12 +111,14 @@ class WalkForwardBacktest:
 
             log.info("Era {i}/{n}: {s} to {e}", i=i + 1, n=n_splits, s=era_start, e=era_end)
 
-            # Get PIT-correct feature matrix for this era
-            matrix = self.pit_store.get_feature_matrix(
+            # Get PIT-correct feature matrix for this era. Fetched one
+            # calendar day at a time (see _fetch_pit_correct_matrix) so a
+            # revision or release that only became available later in the
+            # era can never leak into an earlier day's row.
+            matrix = self._fetch_pit_correct_matrix(
                 feature_ids=feature_ids,
                 start_date=era_start,
                 end_date=era_end,
-                as_of_date=era_end,
                 vintage_policy=vintage_policy,
             )
 
@@ -143,12 +145,11 @@ class WalkForwardBacktest:
             era_metric["status"] = "OK"
             era_results.append(era_metric)
 
-        # Compute full-period metrics
-        full_matrix = self.pit_store.get_feature_matrix(
+        # Compute full-period metrics (same per-day PIT fetch as each era).
+        full_matrix = self._fetch_pit_correct_matrix(
             feature_ids=feature_ids,
             start_date=start_date,
             end_date=end_date,
-            as_of_date=end_date,
             vintage_policy=vintage_policy,
         )
         full_matrix = full_matrix.ffill().dropna()
@@ -192,6 +193,54 @@ class WalkForwardBacktest:
         log.info("Validation complete — verdict={v}", v=verdict)
         return result
 
+    def _fetch_pit_correct_matrix(
+        self,
+        feature_ids: list[int],
+        start_date: date,
+        end_date: date,
+        vintage_policy: str,
+    ) -> pd.DataFrame:
+        """Build a feature matrix where every row is only as current as its
+        own observation date.
+
+        ``PITStore.get_feature_matrix`` takes a single ``as_of_date`` for
+        the whole call. Passing the era/window's *end* date (as the old
+        code did) means a row near the start of the window can pick up a
+        release or revision that only became available later in the
+        window but still before that single cutoff -- lookahead relative
+        to that row's own decision point, and a real problem under
+        ``LATEST_AS_OF`` vintage policy where later revisions are exactly
+        what gets selected.
+
+        Fetching one calendar day at a time, with ``as_of_date`` pinned to
+        that same day, removes the leak: nothing dated after day ``d`` can
+        ever appear in day ``d``'s row, regardless of vintage policy.
+        Deliberately not batched further — correctness over throughput for
+        this non-negotiable PIT guarantee (see CLAUDE.md).
+        """
+        frames: list[pd.DataFrame] = []
+        current = start_date
+        while current <= end_date:
+            daily = self.pit_store.get_feature_matrix(
+                feature_ids=feature_ids,
+                start_date=current,
+                end_date=current,
+                as_of_date=current,
+                vintage_policy=vintage_policy,
+            )
+            if not daily.empty:
+                frames.append(daily)
+            current += timedelta(days=1)
+
+        if not frames:
+            return pd.DataFrame(index=pd.DatetimeIndex([], name="obs_date"))
+
+        combined = pd.concat(frames)
+        # Defensive de-dup: a duplicate (feature_id, obs_date) row can never
+        # inflate the sample count seen downstream.
+        combined = combined[~combined.index.duplicated(keep="first")]
+        return combined.sort_index()
+
     def _compute_era_metrics(
         self,
         matrix: pd.DataFrame,
@@ -202,23 +251,61 @@ class WalkForwardBacktest:
 
         Parameters:
             matrix: Feature matrix for the era.
-            predict_fn: Prediction function (or None for baseline).
+            predict_fn: Callable taking the (column-sorted) feature matrix
+                and returning a position/signal per row (aligned to
+                ``matrix.index``). ``None`` falls back to a fully-invested
+                buy-and-hold baseline.
             cost_bps: Cost assumption in basis points.
 
         Returns:
             dict: Era performance metrics.
         """
         if matrix.empty:
-            return {"return": 0.0, "sharpe": 0.0, "max_drawdown": 0.0}
+            return {"return": 0.0, "sharpe": 0.0, "max_drawdown": 0.0, "n_days": 0}
 
-        # Use first column as a proxy return series for metric computation
-        returns = matrix.iloc[:, 0].pct_change().dropna()
-        if returns.empty:
-            return {"return": 0.0, "sharpe": 0.0, "max_drawdown": 0.0}
+        # Column order must never affect the result: sort by label instead
+        # of relying on positional iloc (which silently picked up whatever
+        # column happened to land first), and collapse duplicate obs_date
+        # rows before they can inflate the sample count.
+        matrix = matrix.sort_index(axis=1)
+        matrix = matrix[~matrix.index.duplicated(keep="first")]
+
+        if matrix.shape[1] == 0:
+            return {"return": 0.0, "sharpe": 0.0, "max_drawdown": 0.0, "n_days": 0}
+
+        # The lowest-labeled column is the target/underlying return series.
+        # Picking by sorted label (not position) makes this independent of
+        # the order feature_ids were requested in.
+        target = matrix.iloc[:, 0]
+        target_returns = target.pct_change()
+        n_total = int(len(target_returns))
+        valid_returns = target_returns.dropna()
+        n_missing = n_total - int(len(valid_returns))
+
+        if valid_returns.empty:
+            return {
+                "return": 0.0,
+                "sharpe": 0.0,
+                "max_drawdown": 0.0,
+                "n_days": 0,
+                "n_missing": n_missing,
+                "n_total": n_total,
+            }
+
+        # Predictions actually drive the result now. A missing/None
+        # prediction for a row is treated as "no position" (0), not as a
+        # wrong call and not dropped from the denominator.
+        if predict_fn is not None:
+            signal = pd.Series(predict_fn(matrix), index=matrix.index)
+        else:
+            signal = pd.Series(1.0, index=matrix.index)
+        signal = signal.reindex(valid_returns.index).astype(float).fillna(0.0)
+
+        strategy_returns = signal * valid_returns
 
         # Apply cost adjustment
         cost_adjustment = cost_bps / 10000.0
-        adjusted_returns = returns - cost_adjustment / 252  # Daily cost
+        adjusted_returns = strategy_returns - cost_adjustment / 252  # Daily cost
 
         cum_return = float((1 + adjusted_returns).prod() - 1)
         ann_return = float((1 + cum_return) ** (252 / max(len(adjusted_returns), 1)) - 1)
@@ -238,6 +325,8 @@ class WalkForwardBacktest:
             "sharpe": round(sharpe, 4),
             "max_drawdown": round(max_dd, 6),
             "n_days": len(adjusted_returns),
+            "n_missing": n_missing,
+            "n_total": n_total,
         }
 
     def _compute_baseline_metrics(self, matrix: pd.DataFrame) -> dict[str, Any]:
@@ -251,6 +340,9 @@ class WalkForwardBacktest:
         """
         if matrix.empty or matrix.shape[1] == 0:
             return {"return": 0.0, "sharpe": 0.0, "max_drawdown": 0.0}
+
+        matrix = matrix.sort_index(axis=1)
+        matrix = matrix[~matrix.index.duplicated(keep="first")]
 
         returns = matrix.iloc[:, 0].pct_change().dropna()
         if returns.empty:
