@@ -2401,7 +2401,17 @@ def _get_regime_context(engine: Engine) -> dict[str, Any]:
             return {"regime": "UNKNOWN", "confidence": 0, "adjustments": {}}
 
         regime = str(row[0]).upper()
-        conf = float(row[1]) if row[1] else 0
+        if row[1] is None:
+            # UNSCORED. ``float(row[1]) if row[1] else 0`` used to hand back a
+            # 0 that callers then weight with, making "never measured"
+            # indistinguishable from "measured at zero confidence".
+            return {
+                "regime": regime,
+                "confidence": None,
+                "confidence_basis": "unscored",
+                "adjustments": {},
+            }
+        conf = float(row[1])
 
         # Parse stress index
         stress = None

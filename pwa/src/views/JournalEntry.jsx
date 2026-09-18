@@ -122,7 +122,16 @@ export default function JournalEntry({ entryId, onBack }) {
                     <span style={styles.value}>{entry.inferred_state}</span>
                 </div>
                 <div style={{ margin: '8px 0' }}>
-                    <ConfidenceMeter value={entry.state_confidence || 0} label="Confidence" />
+                    <ConfidenceMeter
+                        value={entry.state_confidence ?? null}
+                        label="Confidence"
+                        unscoredNote={entry.confidence_reason}
+                    />
+                    {entry.state_confidence == null && entry.confidence_reason && (
+                        <div style={{ fontSize: '11px', color: '#5A7080', marginTop: '4px' }}>
+                            {entry.confidence_reason}
+                        </div>
+                    )}
                 </div>
                 <div style={styles.row}>
                     <span style={styles.label}>GRID</span>

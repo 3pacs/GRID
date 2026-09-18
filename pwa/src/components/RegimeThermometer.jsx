@@ -13,7 +13,11 @@ const regimeStages = [
 function regimeToPosition(regime) {
     if (!regime?.state) return 0.5;
     const state = regime.state.toLowerCase();
-    const confidence = regime.confidence ?? 0.5;
+    // `?? 0.5` used to invent a coin-flip confidence and drive the needle
+    // with it. Unscored means we cannot place the needle by confidence, so
+    // fall back to the state's neutral midpoint and let the caller flag it.
+    if (regime.confidence == null) return 0.5;
+    const confidence = regime.confidence;
 
     if (state.includes('contraction') || state.includes('crisis')) {
         return 0.05 + confidence * 0.15;

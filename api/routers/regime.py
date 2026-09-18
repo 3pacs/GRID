@@ -58,7 +58,8 @@ def get_weights(_token: str = Depends(require_auth)) -> dict:
         ).fetchone()
         if row:
             regime_state = row[0]
-            confidence = float(row[1]) if row[1] else None
+            # None = unscored; `is not None` so a measured 0.0 survives.
+            confidence = float(row[1]) if row[1] is not None else None
             # Parse stress index from counterfactual field (format: "S=0.123, dS/dt=0.0045")
             cf = row[2] or ""
             if "S=" in cf:
@@ -226,7 +227,10 @@ def get_current(_token: str = Depends(require_auth)) -> RegimeCurrentResponse:
 
     return RegimeCurrentResponse(
         state=latest[0],
-        confidence=float(latest[1]),
+        # None = UNSCORED: the decision carries no measured confidence.
+        # float(None) used to raise here and 500 the endpoint that the whole
+        # dashboard hangs off.
+        confidence=float(latest[1]) if latest[1] is not None else None,
         transition_probability=float(latest[2]),
         contradiction_flags=contradiction_list,
         model_version=model_label,
@@ -264,7 +268,11 @@ def get_all_active(_token: str = Depends(require_auth)) -> dict:
         for row in rows:
             entry = {
                 "state": row[0],
-                "confidence": float(row[1]) if row[1] else 0.0,
+                # None = unscored. `else 0.0` made an unmeasured
+                # decision indistinguishable from a measured zero.
+                "confidence": (
+                    float(row[1]) if row[1] is not None else None
+                ),
                 "transition_probability": float(row[2]) if row[2] else 0.0,
                 "contradiction_flags": row[3] if isinstance(row[3], dict) else {},
                 "recommendation": row[4] or "",
@@ -275,9 +283,15 @@ def get_all_active(_token: str = Depends(require_auth)) -> dict:
             else:
                 strategy.append(entry)
 
-        # Sort by confidence descending
-        macro.sort(key=lambda x: x["confidence"], reverse=True)
-        strategy.sort(key=lambda x: x["confidence"], reverse=True)
+        # Sort by confidence descending, unscored entries last. Comparing
+        # None against a float raises, and coercing it to 0.0 just to sort
+        # would put "never measured" where "measured at zero" belongs.
+        def _conf_key(entry: dict) -> tuple[int, float]:
+            conf = entry["confidence"]
+            return (0, 0.0) if conf is None else (1, float(conf))
+
+        macro.sort(key=_conf_key, reverse=True)
+        strategy.sort(key=_conf_key, reverse=True)
 
         # Get feature contributions from the latest clustering result
         feature_contributions = []
@@ -371,7 +385,16 @@ def get_synthesis(_token: str = Depends(require_auth)) -> dict:
         ).fetchall()
 
     regime_summary = "\n".join(
-        f"  {r[0]}: {float(r[1])*100:.0f}% confidence — recommendation: {r[2] or 'none'}"
+        "  {s}: {c} — recommendation: {rec}".format(
+            s=r[0],
+            # None = unscored. float(None) raised here, 500-ing /synthesis.
+            c=(
+                f"{float(r[1]) * 100:.0f}% confidence"
+                if r[1] is not None
+                else "unscored (no confidence measured)"
+            ),
+            rec=r[2] or "none",
+        )
         for r in regime_rows
     )
 
@@ -463,7 +486,8 @@ def get_history(
         RegimeHistoryEntry(
             date=str(row[0]),
             state=row[1],
-            confidence=float(row[2]),
+            # None = unscored; rendered as "--" by the PWA, never as 0%.
+            confidence=float(row[2]) if row[2] is not None else None,
         )
         for row in rows
     ]
@@ -495,7 +519,10 @@ def get_transitions(
                     date=str(rows[i][0]),
                     from_state=rows[i - 1][1],
                     to_state=rows[i][1],
-                    confidence=float(rows[i][2]),
+                    # None = unscored; see RegimeHistoryEntry.confidence.
+                    confidence=(
+                        float(rows[i][2]) if rows[i][2] is not None else None
+                    ),
                 )
             )
 
