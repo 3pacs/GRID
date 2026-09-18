@@ -1,6 +1,6 @@
 import React from 'react';
 import { render, screen, waitFor } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import TenYearPortfolio from '../views/TenYearPortfolio.jsx';
 import { api } from '../api.js';
 
@@ -134,5 +134,55 @@ describe('TenYearPortfolio API status handling', () => {
         expect(screen.queryByText('—')).not.toBeInTheDocument();
         expect(screen.queryByText('n/a')).not.toBeInTheDocument();
         expect(screen.queryByText('loading')).not.toBeInTheDocument();
+    });
+});
+
+// Dad-mode (contributor role -> isSimpleUser()) renders a different, plain-
+// language shell (see the `if (simple) { ... }` branch). It used to reuse a
+// single `error` string for both the router's "empty" response and an
+// actual load failure, so an empty response ("no eligible price history")
+// showed the same "We could not load the plan just now..." wording as a
+// real failure, plus a leftover "Press Update to build the plan." prompt —
+// telling a non-technical user the load failed when it hadn't.
+describe('TenYearPortfolio dad-mode (contributor) empty vs error copy', () => {
+    beforeEach(() => {
+        api.getTenYearPortfolio.mockReset();
+        localStorage.setItem('grid_role', 'contributor');
+    });
+
+    afterEach(() => {
+        localStorage.removeItem('grid_role');
+    });
+
+    it('says there is no data yet, not that loading failed, when status is "empty"', async () => {
+        api.getTenYearPortfolio.mockResolvedValue({
+            status: 'empty',
+            message: 'No eligible Yahoo adjusted-close price history found.',
+        });
+
+        render(<TenYearPortfolio />);
+
+        await waitFor(() => {
+            expect(screen.getAllByText('No eligible price history yet, so there is no plan to show.').length).toBeGreaterThan(0);
+        });
+
+        expect(screen.queryByText('We could not load the plan just now. Please try Update again in a moment.')).not.toBeInTheDocument();
+        expect(screen.queryByText('Press Update to build the plan.')).not.toBeInTheDocument();
+        expect(screen.queryByText('$0')).not.toBeInTheDocument();
+    });
+
+    it('keeps the "could not load" failure copy when status is "error"', async () => {
+        api.getTenYearPortfolio.mockResolvedValue({
+            status: 'error',
+            error: 'Ten-year portfolio query failed.',
+        });
+
+        render(<TenYearPortfolio />);
+
+        await waitFor(() => {
+            expect(screen.getByText('We could not load the plan just now. Please try Update again in a moment.')).toBeInTheDocument();
+        });
+
+        expect(screen.queryByText('No eligible price history yet, so there is no plan to show.')).not.toBeInTheDocument();
     });
 });
