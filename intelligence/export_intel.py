@@ -47,19 +47,28 @@ class ExportControlRecord:
 
 @dataclass
 class RevenueImpactAssessment:
-    """Revenue impact estimate from export controls."""
+    """Revenue impact estimate from export controls.
+
+    ``estimated_revenue_at_risk_pct`` is ``None`` for any ticker without a
+    filed China-revenue baseline: a number derived from nothing is worse
+    than no number. ``as_of`` is the vintage of the baseline it was derived
+    from and ``basis`` names how it was derived.
+    """
     ticker: str
     company_name: str
     sector: str
     china_revenue_pct: float
-    estimated_revenue_at_risk_pct: float
+    estimated_revenue_at_risk_pct: float | None
     active_restrictions_count: int
     max_severity: int
     latest_action_date: str
     latest_action_title: str
-    risk_level: str  # LOW / MEDIUM / HIGH / CRITICAL
+    risk_level: str  # UNKNOWN / LOW / MEDIUM / HIGH / CRITICAL
     restricted_countries: list[str]
     notes: str
+    as_of: str
+    basis: str
+    data_source: str = "curated_filing_estimate"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -67,14 +76,28 @@ class RevenueImpactAssessment:
 
 # ── Revenue exposure data (approximate, updated periodically) ───────────
 
-# These are approximate China/HK revenue percentages from public filings.
-# Kept in sync with the ingestion module but used for impact assessment.
+# These are approximate China/HK revenue percentages from public filings,
+# read and typed in by a person -- they are NOT pulled from a filings feed,
+# and nothing re-checks them when a new 10-K lands. Every assessment built
+# from this table therefore ships CHINA_REVENUE_TABLE_AS_OF plus a `basis`
+# naming the multiplier that produced the at-risk figure (audit A-H12).
+#
+# Vintage of the table: the last hand-edit of this file
+# (`git log -1 --date=short -- intelligence/export_intel.py`). A per-entry
+# `fiscal_period` overrides it where the curator recorded one.
+CHINA_REVENUE_TABLE_AS_OF = "2026-03-28"
+
+#: How estimated_revenue_at_risk_pct is produced: the curated China revenue
+#: share scaled by a severity/count multiplier. Not a backtested figure.
+REVENUE_AT_RISK_BASIS = "curated_china_revenue_share x severity_heuristic"
+
 _CHINA_REVENUE_ESTIMATES: dict[str, dict[str, Any]] = {
     "NVDA": {
         "name": "NVIDIA",
         "sector": "AI chips",
         "china_revenue_pct": 25.0,
-        "total_revenue_b": 60.9,  # FY2024 approximate
+        "total_revenue_b": 60.9,
+        "fiscal_period": "FY2024",  # approximate, per the curator
         "notes": "China revenue was ~25% pre-restrictions; dropped with A800/H800 bans. "
                  "H20 variant still shipped until further tightening.",
     },
@@ -331,8 +354,10 @@ def assess_revenue_impact(
         ticker: Stock ticker symbol.
 
     Returns:
-        Dict with revenue impact assessment fields. Returns a minimal
-        dict with risk_level='UNKNOWN' if the ticker is not tracked.
+        Dict with revenue impact assessment fields, always carrying ``as_of``
+        and ``basis``. A ticker with no filed China-revenue baseline returns
+        ``risk_level='UNKNOWN'`` and ``estimated_revenue_at_risk_pct=None`` --
+        never a number, and never 0.0, which reads as "measured zero risk".
     """
     ticker_upper = ticker.strip().upper()
 
@@ -345,7 +370,11 @@ def assess_revenue_impact(
             "notes": f"{ticker_upper} not tracked in export controls module. "
                      "Add to EXPORT_CONTROL_TICKERS if relevant.",
             "active_restrictions_count": 0,
-            "estimated_revenue_at_risk_pct": 0.0,
+            "estimated_revenue_at_risk_pct": None,
+            "china_revenue_pct": None,
+            "as_of": None,
+            "basis": "no_filed_china_revenue_baseline",
+            "data_source": "unavailable",
         }
 
     # Fetch active restrictions from the last year
@@ -412,6 +441,8 @@ def assess_revenue_impact(
         risk_level = "LOW"
 
     assessment = RevenueImpactAssessment(
+        as_of=baseline.get("fiscal_period") or CHINA_REVENUE_TABLE_AS_OF,
+        basis=REVENUE_AT_RISK_BASIS,
         ticker=ticker_upper,
         company_name=baseline["name"],
         sector=baseline["sector"],

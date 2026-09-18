@@ -36,6 +36,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from oracle.entry_price_policy import entry_price_score_note
+
 import os
 _USE_SIGNAL_REGISTRY = os.getenv("GRID_SIGNAL_REGISTRY", "0") == "1"
 
@@ -618,9 +620,9 @@ class OracleEngine:
                     prediction_type TEXT NOT NULL,
                     direction TEXT NOT NULL,
                     target_price DOUBLE PRECISION,
-                    entry_price DOUBLE PRECISION NOT NULL,
+                    entry_price DOUBLE PRECISION,
                     expiry DATE NOT NULL,
-                    confidence DOUBLE PRECISION NOT NULL,
+                    confidence DOUBLE PRECISION,
                     expected_move_pct DOUBLE PRECISION,
                     signal_strength DOUBLE PRECISION,
                     coherence DOUBLE PRECISION,
@@ -643,6 +645,15 @@ class OracleEngine:
                 ALTER TABLE oracle_predictions
                 ADD COLUMN IF NOT EXISTS dedup_keep BOOLEAN NOT NULL DEFAULT TRUE
             """))
+            # D-H11 / D-M32: `confidence` and `entry_price` are NULL when
+            # nothing measured them. Both writers already bind None
+            # (`_store_predictions` for a ticker with no spot, `oracle/publish.py`
+            # for an unsupplied confidence). The CREATE above carries the
+            # nullable shape for a fresh database; an existing table is
+            # relaxed by alembic revision ``oracle_pred_nullable_0918`` at
+            # deploy time, NOT here: ALTER COLUMN takes ACCESS EXCLUSIVE on
+            # the table every time this bootstrap runs.
+            # tests/test_oracle_predictions_schema_parity.py keeps the two in step.
             conn.execute(text("""
                 ALTER TABLE oracle_predictions
                 ADD COLUMN IF NOT EXISTS horizon_days INTEGER
@@ -1593,17 +1604,31 @@ class OracleEngine:
                         if evt.get("signal_type") == pred_dir:
                             # Boost: 10% per source above minimum 3
                             src_count = evt.get("source_count", 0)
-                            combined_conf = evt.get("combined_confidence", 0.5)
-                            convergence_boost = 1.0 + 0.1 * (src_count - 2) * combined_conf
-                            # Inject convergence sources as additional signals
+                            combined_conf = evt.get("combined_confidence")
+                            if combined_conf is None:
+                                # Unscored convergence: the sources agree, but
+                                # nothing measured how far to trust them. The
+                                # old `or 0.5` amplified confidence by a number
+                                # no scorer produced. Agreement alone does not
+                                # size a prediction — no boost.
+                                convergence_boost = 1.0
+                            else:
+                                convergence_boost = 1.0 + 0.1 * (src_count - 2) * combined_conf
+                            # Inject convergence sources as additional signals —
+                            # only the ones carrying a measured trust, since
+                            # that value is both the signal's value and its
+                            # weight and there is no honest stand-in for it.
                             for src in evt.get("sources", []):
+                                src_trust = src.get("trust_score")
+                                if src_trust is None:
+                                    continue
                                 signals.append(Signal(
                                     name=f"convergence:{src['source_type']}",
                                     family="convergence",
-                                    value=src.get("trust_score", 0.5),
+                                    value=src_trust,
                                     z_score=1.5 if pred_dir == "BUY" else -1.5,
                                     direction="bullish" if pred_dir == "BUY" else "bearish",
-                                    weight=src.get("trust_score", 0.5),
+                                    weight=src_trust,
                                     freshness_hours=0,
                                 ))
                             break  # Use first matching convergence event
@@ -1813,7 +1838,16 @@ class OracleEngine:
         """
         today = date.today()
         scored = 0
-        results = {"hits": 0, "misses": 0, "partials": 0, "total": 0}
+        results = {
+            "hits": 0,
+            "misses": 0,
+            "partials": 0,
+            "total": 0,
+            # Rows closed as 'no_data' because their entry price was NULL,
+            # zero or negative. Reported, never folded into misses and never
+            # left out of the tally altogether.
+            "unscorable_entry_price": 0,
+        }
 
         with self.engine.begin() as conn:
             # Get pending predictions past expiry
@@ -1830,14 +1864,26 @@ class OracleEngine:
             for r in rows:
                 pred_id, ticker, direction, target, entry, expiry, conf, expected, model = r
 
-                # A prediction with no measured entry price is not scorable.
-                # NULL is not a zero entry and a zero entry is not a 0% move:
-                # `(actual - entry) / entry` raises TypeError on the first and
-                # ZeroDivisionError on the second. Same contract as
-                # scripts/score_oracle_trades.py, which requires
-                # `entry_price IS NOT NULL AND entry_price > 0` before it
-                # divides and sweeps everything else to 'no_data'.
-                if entry is None or float(entry) <= 0:
+                # An entry price that cannot be divided by is settled here,
+                # BEFORE the division below. NULL is not a zero entry and a
+                # zero entry is not a 0% move: `(actual - entry) / entry`
+                # raises TypeError on the first and ZeroDivisionError on the
+                # second. Neither is skipped silently — the row is closed as
+                # 'no_data' carrying the reason it could not be scored, so it
+                # stops sitting 'pending' forever and the reason survives in
+                # score_notes. The price is never repaired or invented.
+                # Same contract and same strings as
+                # scripts/score_oracle_trades.py.
+                entry_note = entry_price_score_note(entry)
+                if entry_note is not None:
+                    conn.execute(text("""
+                        UPDATE oracle_predictions
+                        SET verdict = 'no_data',
+                            score_notes = :notes,
+                            scored_at = NOW()
+                        WHERE id = :id
+                    """), {"notes": entry_note, "id": pred_id})
+                    results["unscorable_entry_price"] += 1
                     continue
 
                 # Get actual price at expiry
@@ -2646,6 +2692,9 @@ class EnsemblePredictor:
                 t=ticker,
                 e=str(exc),
             )
+        # 0.0 means "no catalyst we know of" — and the macro calendar is not
+        # ingested at all, so an FOMC week reads as 0.0 here. Absence of a
+        # catalyst only skips the dampening; it never boosts confidence.
         if catalyst_proximity > 0:
             confidence = round(confidence * (1.0 - 0.5 * catalyst_proximity), 4)
 

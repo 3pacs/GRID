@@ -1,23 +1,23 @@
 """Read-side NULL compatibility for ``oracle_predictions``.
 
-PR #544 makes ``oracle_predictions.entry_price`` and
-``oracle_predictions.confidence`` nullable and starts publishing NULL when
-nothing measured them. These tests pin the *reader* contract that has to hold
-on this branch so it stays a safe rollback target once such a row exists:
+``oracle_predictions.entry_price`` and ``oracle_predictions.confidence`` are
+nullable (D-M32 / D-H11): they hold the measured value, or NULL when nothing
+measured them. These tests pin the *reader* contract that every consumer of
+those two columns has to honour:
 
 * a NULL entry price is **not scorable** — never fetched into the scorer's
   chunk, never divided by, never turned into a 0% return, and it leaves no
   ``pnl_pct`` behind;
 * a **measured** ``0.0`` entry price keeps the contract the code already had:
   ``scripts/score_oracle_trades.py`` requires ``entry_price > 0`` before it
-  divides, so a zero entry is swept to ``no_data`` rather than dividing by
-  zero. That behaviour is unchanged here — only NULL is newly named;
+  divides, so a zero entry is reported as **unavailable with a reason**
+  rather than divided by — a reason distinct from the NULL one;
 * a NULL confidence is excluded from calibration, reliability and every
   average, while a **measured** ``0.0`` confidence is counted as ``0.0``;
 * nothing substitutes ``0``, ``0.5`` or ``0.7`` for a missing value.
 
-Everything here runs on both schemas: the queries under test never depend on
-the column being nullable, only on their own NULL handling.
+Every query under test guards its own NULL handling, so none of this depends
+on when the column was relaxed.
 """
 
 from __future__ import annotations
@@ -35,6 +35,10 @@ from intelligence import source_quality_ablation as sqa
 from oracle.calibration import compute_calibration
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+from oracle.entry_price_policy import (  # noqa: E402
+    SCORE_NOTE_ENTRY_NULL,
+    SCORE_NOTE_ENTRY_ZERO,
+)
 
 
 # ── In-memory fixture ──────────────────────────────────────────────────────
@@ -245,7 +249,13 @@ def test_no_data_sweep_names_null_explicitly() -> None:
     assert sweep is not None, "the no_data sweep no longer branches on NULL"
     body = sweep.group(0)
     assert "WHEN entry_price IS NULL" in body
-    assert "entry_price IS NULL OR entry_price = 0" in body
+    # `<= 0`, not `= 0`: a negative entry is no more divisible than a zero
+    # one, and `= 0` would leave it in the pool the chunk query then refuses.
+    assert "entry_price IS NULL OR entry_price <= 0" in body
+    # The three cases are named separately — nobody measured it, the
+    # measurement is zero, the measurement is negative — because they are
+    # three different findings.
+    assert "WHEN entry_price = 0 THEN" in body
     # And it must not have grown a placeholder.
     assert "COALESCE(entry_price" not in body
 
@@ -456,3 +466,302 @@ def test_postmortem_timing_check_tolerates_an_unmeasured_entry():
     )
     assert isinstance(category, str) and category
     assert isinstance(root_cause, str)
+
+
+# ── A zero entry price is a measurement that cannot be a basis ─────────────
+#
+# NULL and 0 are different findings and get different reasons. Neither is
+# repaired, neither is divided by, and neither is skipped without saying so.
+
+class TestEngineScoringLoopEntryPrice:
+    """``OracleEngine.score_expired_predictions`` closes what it cannot score.
+
+    Unlike the scorer's chunk query, the engine's own SELECT has no
+    entry-price filter at all — every pending expired row reaches the loop.
+    So this is the path where a NULL raises TypeError and a measured 0 raises
+    ZeroDivisionError, and the one that has to settle both before dividing.
+    """
+
+    def _engine_under_test(self, engine, prices: dict):
+        from oracle.engine import OracleEngine
+
+        # __init__ runs 8+ CREATE TABLE statements in Postgres dialect and
+        # loads the model registry. Neither is under test here, so the
+        # instance is built directly around the fixture's connection.
+        oe = object.__new__(OracleEngine)
+        oe.engine = engine
+        oe.models = []
+        oe._last_guard_verdicts = []
+        oe._get_price_at_date = lambda ticker, _expiry: prices.get(ticker)
+        return oe
+
+    def _seed(self, engine) -> date:
+        today = date.today()
+        expiry = today - timedelta(days=1)
+        with engine.begin() as conn:
+            _insert(
+                conn, id="null-entry", ticker="AAA", direction="CALL",
+                entry_price=None, confidence=0.6, expiry=expiry,
+            )
+            _insert(
+                conn, id="zero-entry", ticker="BBB", direction="CALL",
+                entry_price=0.0, confidence=0.6, expiry=expiry,
+            )
+            _insert(
+                conn, id="negative-entry", ticker="DDD", direction="CALL",
+                entry_price=-3.0, confidence=0.6, expiry=expiry,
+            )
+            _insert(
+                conn, id="normal", ticker="CCC", direction="CALL",
+                entry_price=100.0, confidence=0.6, expiry=expiry,
+            )
+        return today
+
+    def test_unusable_entries_are_closed_with_their_own_reasons(self, engine):
+        from oracle.entry_price_policy import (
+            SCORE_NOTE_ENTRY_NEGATIVE,
+            SCORE_NOTE_ENTRY_NULL,
+            SCORE_NOTE_ENTRY_ZERO,
+        )
+
+        self._seed(engine)
+        oe = self._engine_under_test(
+            engine, {"AAA": 110.0, "BBB": 110.0, "CCC": 110.0, "DDD": 110.0},
+        )
+
+        # No TypeError on the NULL, no ZeroDivisionError on the measured 0.
+        results = oe.score_expired_predictions()
+
+        with engine.connect() as conn:
+            rows = {
+                r[0]: (r[1], r[2], r[3])
+                for r in conn.execute(text(
+                    "SELECT id, verdict, score_notes, pnl_pct "
+                    "FROM oracle_predictions"
+                )).fetchall()
+            }
+
+        # Each unusable entry is closed — not left 'pending' forever, and not
+        # folded into the miss column.
+        assert rows["null-entry"][0] == "no_data"
+        assert rows["null-entry"][1] == SCORE_NOTE_ENTRY_NULL
+        assert rows["zero-entry"][0] == "no_data"
+        assert rows["zero-entry"][1] == SCORE_NOTE_ENTRY_ZERO
+        assert rows["negative-entry"][0] == "no_data"
+        assert rows["negative-entry"][1] == SCORE_NOTE_ENTRY_NEGATIVE
+
+        # The two reasons are distinct: "nobody measured it" is not the same
+        # finding as "the measurement cannot be a basis".
+        assert SCORE_NOTE_ENTRY_NULL != SCORE_NOTE_ENTRY_ZERO
+
+        # No return was invented for any of them, at any value.
+        for pred_id in ("null-entry", "zero-entry", "negative-entry"):
+            assert rows[pred_id][2] is None, pred_id
+
+        # They are reported, not silently dropped from the tally.
+        assert results["unscorable_entry_price"] == 3, results
+        assert results["misses"] == 0, results
+
+        # The measured row still scores: (110 - 100) / 100 = +10% on a CALL.
+        assert rows["normal"][0] == "hit"
+        assert rows["normal"][2] == pytest.approx(10.0)
+
+    def test_a_zero_entry_never_reaches_a_division(self, engine):
+        """A zero entry must be settled *before* the divide, not caught after.
+
+        Driven by making any arithmetic against the fetched price raise: if
+        the guard sat downstream of ``(actual - entry) / entry`` this would
+        surface as an AssertionError from the operand rather than a clean
+        skip.
+        """
+        self._seed(engine)
+
+        class _Exploding(float):
+            def __sub__(self, other):  # pragma: no cover - must not run
+                raise AssertionError("arithmetic on an unusable entry price")
+
+            def __truediv__(self, other):  # pragma: no cover - must not run
+                raise AssertionError("division by an unusable entry price")
+
+        with engine.begin() as conn:
+            conn.execute(text(
+                "DELETE FROM oracle_predictions WHERE id <> 'zero-entry'"
+            ))
+        oe = self._engine_under_test(engine, {"BBB": _Exploding(110.0)})
+        results = oe.score_expired_predictions()
+        assert results["unscorable_entry_price"] == 1
+        assert results["total"] == 0
+
+
+class TestEntryPricePolicy:
+    """The shared classifier every reader binds its reason from."""
+
+    def test_null_and_zero_are_different_findings(self):
+        from oracle.entry_price_policy import (
+            SCORE_NOTE_ENTRY_NULL,
+            SCORE_NOTE_ENTRY_ZERO,
+            entry_price_score_note,
+        )
+
+        assert entry_price_score_note(None) == SCORE_NOTE_ENTRY_NULL
+        assert entry_price_score_note(0) == SCORE_NOTE_ENTRY_ZERO
+        assert entry_price_score_note(0.0) == SCORE_NOTE_ENTRY_ZERO
+        assert SCORE_NOTE_ENTRY_NULL != SCORE_NOTE_ENTRY_ZERO
+
+    def test_a_positive_entry_has_no_reason_and_divides(self):
+        from oracle.entry_price_policy import (
+            entry_price_score_note,
+            is_divisible_entry_price,
+        )
+
+        assert entry_price_score_note(214.5) is None
+        assert is_divisible_entry_price(214.5) is True
+        assert is_divisible_entry_price(0.0) is False
+        assert is_divisible_entry_price(None) is False
+
+    def test_a_reason_is_never_a_substitute_price(self):
+        """Nothing in the policy hands back a number to divide by."""
+        from oracle import entry_price_policy
+
+        for name in dir(entry_price_policy):
+            if name.startswith("_"):
+                continue
+            value = getattr(entry_price_policy, name)
+            assert not isinstance(value, (int, float)), (
+                f"{name} is a number; this module states reasons, it does "
+                f"not supply stand-in prices"
+            )
+
+
+class TestPostmortemZeroEntry:
+    """A measured zero is narrated as the measurement plus why it is useless."""
+
+    def test_zero_entry_keeps_the_measurement_and_states_the_reason(self):
+        from intelligence.postmortem import _summarise_what_happened
+        from oracle.entry_price_policy import SCORE_NOTE_ENTRY_ZERO
+
+        text_out = _summarise_what_happened(
+            "AAPL", "CALL", 0.0, 210.0, "miss", -0.1, [],
+        )
+        # The measurement is not hidden -- it really was 0.00 ...
+        assert "$0.00" in text_out
+        # ... and the sentence says why no return follows from it.
+        assert SCORE_NOTE_ENTRY_ZERO in text_out
+
+    def test_null_entry_says_nobody_measured_it(self):
+        from intelligence.postmortem import _summarise_what_happened
+
+        text_out = _summarise_what_happened(
+            "AAPL", "CALL", None, 210.0, "miss", -0.1, [],
+        )
+        assert "no measured entry price" in text_out
+        # Never a price nobody looked up.
+        assert "$0.00" not in text_out
+
+    def test_timing_classification_names_the_reason_instead_of_missing(self):
+        from intelligence.postmortem import _classify_prediction_failure
+        from oracle.entry_price_policy import (
+            SCORE_NOTE_ENTRY_NULL,
+            SCORE_NOTE_ENTRY_ZERO,
+        )
+
+        for entry, note in ((None, SCORE_NOTE_ENTRY_NULL),
+                            (0.0, SCORE_NOTE_ENTRY_ZERO)):
+            category, root_cause, _wrong, _right, what_missed = (
+                _classify_prediction_failure(
+                    ticker="AAPL", direction="CALL", entry_price=entry,
+                    target=210.0, expiry=date.today(), actual_price=190.0,
+                    actual_move_pct=-5.0, signals=[], anti_signals=[],
+                    price_path=[{"price": 200.0}, {"price": 190.0}],
+                )
+            )
+            # Not "wrong_signal": nothing here shows the model was wrong.
+            assert category == "not_measured", (entry, category)
+            assert note in root_cause
+            assert note in what_missed
+
+
+# ── A row closed for an invalid entry price counts nowhere ──────────────────
+
+class TestClosedInvalidEntryRowsCountNowhere:
+    """When the scorer or the engine closes a row whose entry price is NULL,
+    zero or negative, it writes exactly ``verdict='no_data'``,
+    ``scored_at=NOW()`` and ``score_notes=<reason>`` and leaves ``pnl_pct``
+    NULL. Such a row must not become a win, a loss, a zero return or a
+    calibration sample — even when it carries a measured confidence — because
+    every aggregate keys on ``verdict IN ('hit','miss','partial')`` and never
+    on ``pnl_pct`` being present. This pins the closed row against the real
+    aggregation SQL, extracted from the scorer, and against calibration.
+    """
+
+    def _seed(self, engine) -> None:
+        with engine.begin() as conn:
+            _insert(conn, id="hit-row", ticker="AAA", direction="CALL",
+                    entry_price=100.0, confidence=0.9, verdict="hit",
+                    pnl_pct=10.0, expiry=date(2026, 9, 1))
+            _insert(conn, id="miss-row", ticker="BBB", direction="CALL",
+                    entry_price=100.0, confidence=0.6, verdict="miss",
+                    pnl_pct=-10.0, expiry=date(2026, 9, 1))
+            # Closed by the engine/scorer for a zero entry: measured
+            # confidence, NULL pnl, the zero reason.
+            _insert(conn, id="closed-zero-entry", ticker="CCC", direction="CALL",
+                    entry_price=0.0, confidence=0.9, verdict="no_data",
+                    pnl_pct=None, score_notes=SCORE_NOTE_ENTRY_ZERO,
+                    scored_at="2026-09-18 00:00:00", expiry=date(2026, 9, 1))
+            _insert(conn, id="closed-null-entry", ticker="DDD", direction="CALL",
+                    entry_price=None, confidence=0.9, verdict="no_data",
+                    pnl_pct=None, score_notes=SCORE_NOTE_ENTRY_NULL,
+                    scored_at="2026-09-18 00:00:00", expiry=date(2026, 9, 1))
+
+    @staticmethod
+    def _scorer_sql(marker: str) -> str:
+        src = (REPO_ROOT / "scripts" / "score_oracle_trades.py").read_text(
+            encoding="utf-8"
+        )
+        start = src.index(marker)
+        start = src.index('text("""', start) + len('text("""')
+        end = src.index('"""', start)
+        return src[start:end]
+
+    def test_not_a_calibration_sample(self, engine):
+        self._seed(engine)
+        report = compute_calibration(engine, n_bins=10)
+        # Only the hit and the miss are samples; the two closed rows carry a
+        # measured 0.9 but are not verdicts.
+        assert report.total_predictions == 2
+        assert report.overall_accuracy == pytest.approx(0.5)
+
+    def test_not_a_win_loss_or_zero_return_in_the_model_summary(self, engine):
+        self._seed(engine)
+        sql = self._scorer_sql("model_stats = conn.execute(")
+        with engine.connect() as conn:
+            rows = conn.execute(text(sql)).fetchall()
+        assert len(rows) == 1
+        _name, total, hits, misses, partials, pending, avg_pnl = rows[0]
+        assert total == 4                      # closed rows are still rows...
+        assert (hits, misses, partials, pending) == (1, 1, 0, 0)  # ...not outcomes
+        assert avg_pnl == pytest.approx(0.0)   # (10 - 10) / 2: no third term at 0
+
+    def test_absent_from_the_scored_only_ticker_summary(self, engine):
+        self._seed(engine)
+        sql = self._scorer_sql("ticker_stats = conn.execute(")
+        with engine.connect() as conn:
+            tickers = {r[0] for r in conn.execute(text(sql)).fetchall()}
+        assert tickers == {"AAA", "BBB"}
+
+    def test_closed_rows_are_final_and_untouched_by_the_scorer(self, engine):
+        """The chunk query requires a usable entry price; the sweep only
+        re-labels rows still 'pending'. A closed row keeps its verdict, note
+        and NULL pnl through another run."""
+        self._seed(engine)
+        src = (REPO_ROOT / "scripts" / "score_oracle_trades.py").read_text(
+            encoding="utf-8"
+        )
+        assert "AND entry_price IS NOT NULL" in src and "AND entry_price > 0" in src
+        assert "verdict = 'pending'" in src or "verdict='pending'" in src
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT verdict, score_notes, pnl_pct FROM oracle_predictions "
+                "WHERE id = 'closed-zero-entry'"
+            )).fetchone()
+        assert row == ("no_data", SCORE_NOTE_ENTRY_ZERO, None)

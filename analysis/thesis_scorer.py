@@ -743,8 +743,11 @@ def _score_trust_convergence(engine: Engine, accuracy: float) -> dict:
                 "No multi-source convergence events detected (need 3+ independent sources on same ticker).",
                 status="active", historical_accuracy=accuracy)
 
-        buy_events = [e for e in events if e.get("direction", "").upper() == "BUY"]
-        sell_events = [e for e in events if e.get("direction", "").upper() == "SELL"]
+        # detect_convergence emits direction as bullish/bearish, or None when
+        # the sources disagree or carry no resolvable direction; an unresolved
+        # event votes for neither side.
+        buy_events = [e for e in events if e.get("direction") == "bullish"]
+        sell_events = [e for e in events if e.get("direction") == "bearish"]
 
         net = len(buy_events) - len(sell_events)
         score = net * 20  # each convergence event ≈ 20 points

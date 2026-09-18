@@ -267,8 +267,17 @@ CREATE TABLE IF NOT EXISTS decision_journal (
     decision_timestamp      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     model_version_id        INTEGER NOT NULL REFERENCES model_registry(id),
     inferred_state          TEXT NOT NULL,
-    state_confidence        DOUBLE PRECISION NOT NULL CHECK (
+    -- NULL means UNSCORED: no confidence was ever measured for this
+    -- decision. It is a third, explicit state — never a stand-in for a
+    -- number, and never to be read as 0. An unscored row is EXCLUDED from
+    -- calibration/scoring, not counted as a zero. Whenever it is NULL,
+    -- confidence_reason must say why (ck_decision_journal_unscored_has_reason
+    -- below). A CHECK evaluating to NULL passes, so BETWEEN 0 AND 1 still
+    -- constrains every row that does carry a number.
+    state_confidence        DOUBLE PRECISION CHECK (
                                 state_confidence BETWEEN 0 AND 1),
+    -- Why state_confidence is what it is. Required when it is NULL.
+    confidence_reason       TEXT,
     transition_probability  DOUBLE PRECISION NOT NULL CHECK (
                                 transition_probability BETWEEN 0 AND 1),
     contradiction_flags     JSONB NOT NULL DEFAULT '{}',
@@ -276,13 +285,18 @@ CREATE TABLE IF NOT EXISTS decision_journal (
     baseline_recommendation TEXT NOT NULL,
     action_taken            TEXT NOT NULL,
     counterfactual          TEXT NOT NULL,
-    operator_confidence     TEXT NOT NULL CHECK (operator_confidence IN (
-                                'LOW', 'MEDIUM', 'HIGH')),
+    -- UNSCORED: the decision carries no measured confidence at all
+    -- (state_confidence IS NULL); it is not filed under LOW.
+    operator_confidence     TEXT NOT NULL CONSTRAINT ck_decision_journal_operator_confidence
+                                CHECK (operator_confidence IN (
+                                'LOW', 'MEDIUM', 'HIGH', 'UNSCORED')),
     outcome_value           DOUBLE PRECISION,
     outcome_recorded_at     TIMESTAMPTZ,
     verdict                 TEXT CHECK (verdict IN (
                                 'HELPED', 'HARMED', 'NEUTRAL', 'INSUFFICIENT_DATA')),
-    annotation              TEXT
+    annotation              TEXT,
+    CONSTRAINT ck_decision_journal_unscored_has_reason CHECK (
+        state_confidence IS NOT NULL OR confidence_reason IS NOT NULL)
 );
 
 CREATE INDEX IF NOT EXISTS idx_decision_journal_timestamp
@@ -297,6 +311,10 @@ CREATE INDEX IF NOT EXISTS idx_decision_journal_confidence
     ON decision_journal (operator_confidence);
 CREATE INDEX IF NOT EXISTS idx_decision_journal_outcome_recorded
     ON decision_journal (outcome_recorded_at);
+-- Unscored (no measured confidence) rows, for audit review.
+CREATE INDEX IF NOT EXISTS idx_decision_journal_unscored
+    ON decision_journal (decision_timestamp DESC)
+    WHERE state_confidence IS NULL;
 
 -- ---------------------------------------------------------------------------
 -- regime_history — the daily regime label, one row per observation date.
@@ -378,6 +396,9 @@ BEGIN
     END IF;
     IF OLD.state_confidence IS DISTINCT FROM NEW.state_confidence THEN
         RAISE EXCEPTION 'decision_journal is append-only: cannot modify state_confidence';
+    END IF;
+    IF OLD.confidence_reason IS DISTINCT FROM NEW.confidence_reason THEN
+        RAISE EXCEPTION 'decision_journal is append-only: cannot modify confidence_reason';
     END IF;
     IF OLD.transition_probability IS DISTINCT FROM NEW.transition_probability THEN
         RAISE EXCEPTION 'decision_journal is append-only: cannot modify transition_probability';
@@ -727,7 +748,8 @@ CREATE TABLE IF NOT EXISTS options_mispricing_scans (
     ticker          TEXT NOT NULL,
     scan_date       DATE NOT NULL,
     score           DOUBLE PRECISION NOT NULL,
-    payoff_multiple DOUBLE PRECISION NOT NULL,
+    -- NULL when the payoff could not be modelled (audit C-M20).
+    payoff_multiple DOUBLE PRECISION,
     direction       TEXT NOT NULL,
     thesis          TEXT NOT NULL,
     signals         JSONB,
@@ -736,7 +758,13 @@ CREATE TABLE IF NOT EXISTS options_mispricing_scans (
     spot_price      DOUBLE PRECISION,
     iv_atm          DOUBLE PRECISION,
     confidence      TEXT NOT NULL,
-    is_100x         BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Column name is historical: the modelled payoff-threshold flag
+    -- (served as heuristic_payoff_flag). NULLABLE because "could not be
+    -- modelled" is a third state; no default so it is never asserted.
+    is_100x         BOOLEAN,
+    -- The inputs the flag was computed from (iv_atm, expected_move_pct,
+    -- otm_cost_pct, leverage) so the number travels with its basis.
+    payoff_inputs   JSONB,
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE (ticker, scan_date, direction)
 );
@@ -823,6 +851,10 @@ CREATE TABLE IF NOT EXISTS options_recommendations (
     thesis          TEXT,
     dealer_context  TEXT,
     sanity_status   JSONB,
+    -- Scanner composite score (0-10) this recommendation came from. Buckets
+    -- the empirical win-rate lookup in trading/options_recommender.py; NULL
+    -- rows are excluded from it rather than assumed into a bucket.
+    scanner_score   DOUBLE PRECISION,
     generated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     outcome         TEXT,           -- WIN/LOSS/EXPIRED/OPEN
     actual_return   NUMERIC,
@@ -835,6 +867,9 @@ CREATE INDEX IF NOT EXISTS idx_options_rec_generated
     ON options_recommendations (generated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_options_rec_expiry_outcome
     ON options_recommendations (expiry) WHERE outcome IS NULL;
+CREATE INDEX IF NOT EXISTS idx_options_rec_score_outcome
+    ON options_recommendations (scanner_score, outcome)
+    WHERE scanner_score IS NOT NULL AND outcome IN ('WIN', 'LOSS');
 
 -- ============================================================
 -- TABLE: scanner_weights
@@ -869,7 +904,13 @@ CREATE TABLE IF NOT EXISTS signal_sources (
     outcome             TEXT,               -- filled later: 'CORRECT', 'WRONG', 'PENDING'
     outcome_return      NUMERIC,            -- filled later
     scored_at           TIMESTAMPTZ,
-    trust_score         NUMERIC DEFAULT 0.5,
+    -- No DEFAULT: NULL means "intelligence/trust_scorer.py has not scored this
+    -- source yet". A 0.5 default was indistinguishable from a measured 0.5 and
+    -- reached the /watchlist/{t}/edge trust bar and the convergence WebSocket
+    -- alert as though a scorer had produced it. A measured 0.0 is a
+    -- measurement; readers must test IS NULL, never falsiness.
+    -- See migrations/versions/signal_sources_trust_nodefault.py.
+    trust_score         NUMERIC,
     hit_count           INT DEFAULT 0,
     miss_count          INT DEFAULT 0,
     avg_lead_time_hours NUMERIC,

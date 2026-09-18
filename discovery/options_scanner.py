@@ -54,7 +54,11 @@ class MispricingOpportunity:
     ticker: str
     scan_date: date
     score: float                    # 0-10 composite score
-    estimated_payoff_multiple: float  # e.g. 150.0 = 150x
+    # Modelled payoff multiple (e.g. 150.0 = 150x) for a notional deep-OTM
+    # contract. None when the inputs to model it are missing — it is NOT
+    # back-filled from the composite score, which measures something else
+    # entirely (audit C-M20).
+    estimated_payoff_multiple: float | None
     direction: str                  # "CALL" or "PUT"
     thesis: str                     # Human-readable thesis
     signals: dict[str, Any] = field(default_factory=dict)
@@ -69,9 +73,27 @@ class MispricingOpportunity:
     # which is a different and false claim.
     iv_atm: float | None = None
     confidence: str = "LOW"         # LOW / MEDIUM / HIGH
+    # Every input to ``estimated_payoff_multiple``, so the flag below can be
+    # read rather than taken on faith: {iv_atm, expected_move_pct,
+    # otm_cost_pct, leverage}. Empty when the multiple could not be modelled.
+    payoff_inputs: dict[str, Any] = field(default_factory=dict)
 
     @property
-    def is_100x(self) -> bool:
+    def heuristic_payoff_flag(self) -> bool | None:
+        """Did the MODELLED payoff multiple clear 100x?
+
+        This is a threshold on a number built from tuning constants
+        (``otm_cost_pct = iv_atm * 0.5``, a ``* 10`` leverage term, a
+        ``score / 5`` multiplier) — not an observation of any contract's
+        price. It was previously called ``is_100x`` and published as a bare
+        boolean under that name, which asserts a fact about the market
+        (audit C-M20). The inputs now travel with it in ``payoff_inputs``.
+
+        ``None`` when the multiple could not be modelled at all: unknown is
+        not the same as "does not clear 100x".
+        """
+        if self.estimated_payoff_multiple is None:
+            return None
         # Cast to native bool — estimated_payoff_multiple may be a numpy
         # scalar (np.float64) from pandas/numpy arithmetic upstream, in
         # which case `>=` returns numpy.bool_ and psycopg2 can't adapt it.
@@ -103,6 +125,15 @@ class OptionsScanner:
     # Above this share of the scanned universe, a missing column stops being
     # a per-ticker thin-chain gap and starts being a data-source problem.
     SYSTEMATIC_GAP_SHARE = 0.5
+
+    # ── Payoff-model constants (audit C-M20) ──────────────────────────
+    # These are hand-tuned, not fitted. They are named here and echoed into
+    # every opportunity's ``payoff_inputs`` so the multiple they produce can
+    # be read as the model output it is rather than as an observed price.
+    OTM_COST_FRAC_OF_ATM_IV = 0.5   # deep-OTM cost proxy ≈ half the ATM IV
+    IV_LEVERAGE_BASELINE = 0.40     # leverage normalised to a 40% IV name
+    PAYOFF_SCALE = 10               # move/cost → multiple scaling term
+    PAYOFF_CAP = 1000.0             # options do not go above ~1000x in practice
 
     def __init__(self, db_engine: Engine, lookback_days: int = 252) -> None:
         self.engine = db_engine
@@ -151,10 +182,14 @@ class OptionsScanner:
         filtered = [o for o in opportunities if o.score >= min_score]
         filtered.sort(key=lambda o: o.score, reverse=True)
 
-        n_100x = sum(1 for o in filtered if o.is_100x)
+        n_flagged = sum(1 for o in filtered if o.heuristic_payoff_flag)
+        n_unmodelled = sum(
+            1 for o in filtered if o.heuristic_payoff_flag is None
+        )
         log.info(
-            "Scan complete — {n} opportunities ({x} potential 100x+)",
-            n=len(filtered), x=n_100x,
+            "Scan complete — {n} opportunities ({x} clear the modelled "
+            "100x payoff threshold, {u} could not be modelled)",
+            n=len(filtered), x=n_flagged, u=n_unmodelled,
         )
 
         # Individual email alerts disabled — use bundled 100x digest instead
@@ -175,7 +210,7 @@ class OptionsScanner:
             list[MispricingOpportunity]: Only opportunities with >= 100x payoff.
         """
         all_opps = self.scan_all(scan_date=scan_date, min_score=6.0)
-        return [o for o in all_opps if o.is_100x]
+        return [o for o in all_opps if o.heuristic_payoff_flag]
 
     def _get_available_tickers(self) -> list[str]:
         """Get tickers that have options_daily_signals data."""
@@ -394,8 +429,10 @@ class OptionsScanner:
 
         dominant_direction = max(direction_votes, key=direction_votes.get)  # type: ignore[arg-type]
 
-        # Estimate payoff multiple
-        payoff = self._estimate_payoff_multiple(current, composite, dominant_direction)
+        # Model the payoff multiple, keeping every input that produced it
+        payoff, payoff_inputs = self._estimate_payoff_multiple(
+            current, composite, dominant_direction,
+        )
 
         # Build thesis
         thesis = self._build_thesis(ticker, signals, dominant_direction, current)
@@ -422,7 +459,8 @@ class OptionsScanner:
             ticker=ticker,
             scan_date=scan_date,
             score=round(composite, 2),
-            estimated_payoff_multiple=round(payoff, 1),
+            estimated_payoff_multiple=round(payoff, 1) if payoff is not None else None,
+            payoff_inputs=payoff_inputs,
             direction=dominant_direction,
             thesis=thesis,
             signals=signals,
@@ -713,12 +751,15 @@ class OptionsScanner:
             from physics.dealer_gamma import DealerGammaEngine
 
             dg = DealerGammaEngine(self.engine)
-            profile = dg.compute_gex_profile(ticker, snap_date=scan_date)
+            # as_of=True: the last chain at or before scan_date. Strict
+            # equality would drop every scan run on a non-pull day, and a
+            # later chain would be look-ahead.
+            profile = dg.compute_gex_profile(ticker, snap_date=scan_date, as_of=True)
         except Exception as exc:  # pragma: no cover — defensive
             log.debug("dealer_gamma extras failed for {t}: {e}", t=ticker, e=str(exc))
             return (0.0, "", 0.0, "", meta)
 
-        if not profile or "error" in profile:
+        if not profile or not profile.get("available"):
             return (0.0, "", 0.0, "", meta)
 
         spot = float(profile.get("spot") or 0.0)
@@ -764,30 +805,53 @@ class OptionsScanner:
 
     def _estimate_payoff_multiple(
         self, current: dict, composite_score: float, direction: str
-    ) -> float:
-        """Estimate potential payoff multiple for a deep OTM option.
+    ) -> tuple[float | None, dict[str, Any]]:
+        """Model a payoff multiple for a notional deep-OTM option.
 
-        This is a rough estimate based on:
-        - How cheap the option is (IV percentile)
-        - How large the potential move is (max pain divergence + signals)
-        - The leverage of deep OTM options
+        Returns ``(multiple, inputs)``. ``inputs`` carries every quantity the
+        multiple was built from — ``iv_atm``, ``expected_move_pct``,
+        ``otm_cost_pct``, ``leverage`` — plus the constants applied, so the
+        reader can judge the number instead of trusting it.
 
-        100x payoffs come from buying cheap, deep OTM options before a large
-        move. Low IV + extreme positioning + catalysts = the setup.
+        The model is: how cheap the option is (IV), how large the move might
+        be (max-pain divergence), and the nonlinearity of deep OTM strikes.
+        None of it is a quote.
+
+        Audit C-M20: the missing-input branch used to return
+        ``composite_score * 5``, i.e. it manufactured a *payoff multiple*
+        out of a *signal score* — two different quantities in two different
+        units — and that number then decided ``is_100x``. Missing inputs now
+        return ``None`` and the flag downstream goes to ``None`` with it.
         """
         iv_atm = current.get("iv_atm")
         spot = current.get("spot_price", 0) or 0
         max_pain = current.get("max_pain", 0) or 0
 
-        if iv_atm is None or spot == 0:
-            return composite_score * 5  # Rough fallback
+        inputs: dict[str, Any] = {
+            "iv_atm": float(iv_atm) if iv_atm is not None else None,
+            "spot_price": float(spot) if spot else None,
+            "max_pain": float(max_pain) if max_pain else None,
+            "composite_score": round(float(composite_score), 4),
+            "expected_move_pct": None,
+            "otm_cost_pct": None,
+            "leverage": None,
+            "otm_cost_frac_of_atm_iv": self.OTM_COST_FRAC_OF_ATM_IV,
+            "iv_leverage_baseline": self.IV_LEVERAGE_BASELINE,
+            "payoff_scale": self.PAYOFF_SCALE,
+            "payoff_cap": self.PAYOFF_CAP,
+            "basis": "modelled_heuristic",
+        }
+
+        if iv_atm is None or iv_atm <= 0 or spot == 0:
+            inputs["basis"] = "unavailable"
+            inputs["unavailable_reason"] = (
+                "no measured iv_atm" if not iv_atm else "no spot price"
+            )
+            return None, inputs
 
         # Base leverage: lower IV = cheaper options = higher payoff potential
-        if iv_atm > 0:
-            # ATM options at 15% IV cost ~1/3 of options at 45% IV
-            iv_leverage = max(1, 0.40 / iv_atm)  # normalized to 40% IV baseline
-        else:
-            iv_leverage = 1.0
+        # ATM options at 15% IV cost ~1/3 of options at 45% IV
+        iv_leverage = max(1, self.IV_LEVERAGE_BASELINE / iv_atm)
 
         # Move magnitude from max pain divergence
         divergence_pct = abs(spot - max_pain) / spot * 100
@@ -801,12 +865,21 @@ class OptionsScanner:
         # If expected move is 10% and option cost is 0.5%, payoff ~ 20x base
 
         expected_move_pct = max(divergence_pct, composite_score * 1.5)
-        otm_cost_pct = iv_atm * 0.5  # Deep OTM ~50% of ATM IV as cost proxy
+        otm_cost_pct = iv_atm * self.OTM_COST_FRAC_OF_ATM_IV
 
-        if otm_cost_pct > 0:
-            base_payoff = (expected_move_pct / (otm_cost_pct * 100)) * iv_leverage * 10
-        else:
-            base_payoff = composite_score * 10
+        inputs["expected_move_pct"] = round(float(expected_move_pct), 4)
+        inputs["otm_cost_pct"] = round(float(otm_cost_pct), 6)
+        inputs["leverage"] = round(float(iv_leverage), 4)
+
+        if otm_cost_pct <= 0:
+            # Cannot price the cost leg, so there is no ratio to report.
+            inputs["basis"] = "unavailable"
+            inputs["unavailable_reason"] = "otm_cost_pct <= 0"
+            return None, inputs
+
+        base_payoff = (
+            (expected_move_pct / (otm_cost_pct * 100)) * iv_leverage * self.PAYOFF_SCALE
+        )
 
         # Score multiplier: higher conviction = higher estimated payoff
         score_mult = composite_score / 5  # 1.0 at score=5, 2.0 at score=10
@@ -814,7 +887,7 @@ class OptionsScanner:
         payoff = base_payoff * score_mult
 
         # Cap at reasonable maximum (options can't go above ~1000x in practice)
-        return min(payoff, 1000.0)
+        return min(payoff, self.PAYOFF_CAP), inputs
 
     # ------------------------------------------------------------------
     # Thesis generation
@@ -996,16 +1069,29 @@ class OptionsScanner:
             "GRID OPTIONS MISPRICING SCANNER",
             f"Scan Date: {opportunities[0].scan_date}",
             f"Total Opportunities: {len(opportunities)}",
-            f"100x+ Flagged: {sum(1 for o in opportunities if o.is_100x)}",
+            (
+                "Heuristic payoff flag set: "
+                f"{sum(1 for o in opportunities if o.heuristic_payoff_flag)} "
+                "(unmodelled: "
+                f"{sum(1 for o in opportunities if o.heuristic_payoff_flag is None)})"
+            ),
             "=" * 80,
             "",
         ]
 
         for i, opp in enumerate(opportunities, 1):
-            flag = " *** 100x+ ***" if opp.is_100x else ""
+            flag = (
+                " *** HEURISTIC PAYOFF FLAG ***"
+                if opp.heuristic_payoff_flag else ""
+            )
             lines.extend([
                 f"#{i} [{opp.confidence}] {opp.ticker} {opp.direction}{flag}",
-                f"   Score: {opp.score}/10  |  Est. Payoff: {opp.estimated_payoff_multiple:.0f}x",
+                f"   Score: {opp.score}/10  |  Modelled payoff: "
+                + (
+                    f"{opp.estimated_payoff_multiple:.0f}x"
+                    if opp.estimated_payoff_multiple is not None
+                    else "n/a (inputs missing)"
+                ),
                 f"   Spot: ${opp.spot_price:,.2f}  |  IV ATM: {opp.iv_atm:.1%}" if opp.iv_atm else f"   Spot: ${opp.spot_price:,.2f}",
                 f"   Target Strikes: {', '.join(f'${s:,.0f}' for s in opp.strikes)}",
                 f"   Expiry: {opp.expiry}",
@@ -1038,7 +1124,14 @@ class OptionsScanner:
                     ticker          TEXT NOT NULL,
                     scan_date       DATE NOT NULL,
                     score           DOUBLE PRECISION NOT NULL,
-                    payoff_multiple DOUBLE PRECISION NOT NULL,
+                    -- Nullable for the same reason as is_100x below: an
+                    -- unmodelled payoff is NULL, not a number. schema.sql and
+                    -- alembic revision options_rec_scanner_score_0917 already
+                    -- had it nullable; this CREATE did not, so on a database
+                    -- where the scanner ran FIRST (the ALTERs then skip via
+                    -- IF EXISTS) a NULL payoff INSERT would have raised
+                    -- NotNullViolation.
+                    payoff_multiple DOUBLE PRECISION,
                     direction       TEXT NOT NULL,
                     thesis          TEXT NOT NULL,
                     signals         JSONB,
@@ -1047,7 +1140,11 @@ class OptionsScanner:
                     spot_price      DOUBLE PRECISION,
                     iv_atm          DOUBLE PRECISION,
                     confidence      TEXT NOT NULL,
-                    is_100x         BOOLEAN NOT NULL DEFAULT FALSE,
+                    -- Column name is historical. It holds the modelled
+                    -- payoff threshold flag, and it is NULLABLE because
+                    -- "could not be modelled" is a third state (audit C-M20).
+                    is_100x         BOOLEAN,
+                    payoff_inputs   JSONB,
                     created_at      TIMESTAMPTZ DEFAULT NOW(),
                     UNIQUE (ticker, scan_date, direction)
                 )
@@ -1060,6 +1157,11 @@ class OptionsScanner:
                 CREATE INDEX IF NOT EXISTS idx_mispricing_100x
                 ON options_mispricing_scans (is_100x) WHERE is_100x = TRUE
             """))
+            # Pre-existing deployments created is_100x as NOT NULL DEFAULT
+            # FALSE, payoff_multiple NOT NULL and no payoff_inputs. That
+            # reshaping is applied by alembic revision
+            # options_rec_scanner_score_0917 at deploy time (and mirrored in
+            # schema.sql), not lazily here on the first scan after a deploy.
 
             count = 0
             for opp in opportunities:
@@ -1069,9 +1171,10 @@ class OptionsScanner:
                         "INSERT INTO options_mispricing_scans "
                         "(ticker, scan_date, score, payoff_multiple, direction, "
                         "thesis, signals, strikes, expiry, spot_price, iv_atm, "
-                        "confidence, is_100x) "
+                        "confidence, is_100x, payoff_inputs) "
                         "VALUES (:ticker, :sd, :score, :payoff, :dir, :thesis, "
-                        ":signals, :strikes, :expiry, :spot, :iv, :conf, :is100) "
+                        ":signals, :strikes, :expiry, :spot, :iv, :conf, "
+                        ":is100, :payoff_inputs) "
                         "ON CONFLICT (ticker, scan_date, direction) DO UPDATE SET "
                         "score = EXCLUDED.score, "
                         "payoff_multiple = EXCLUDED.payoff_multiple, "
@@ -1081,7 +1184,8 @@ class OptionsScanner:
                         "spot_price = EXCLUDED.spot_price, "
                         "iv_atm = EXCLUDED.iv_atm, "
                         "confidence = EXCLUDED.confidence, "
-                        "is_100x = EXCLUDED.is_100x"
+                        "is_100x = EXCLUDED.is_100x, "
+                        "payoff_inputs = EXCLUDED.payoff_inputs"
                     ),
                     {
                         "ticker": opp.ticker,
@@ -1089,7 +1193,11 @@ class OptionsScanner:
                         # Defensive native-type coercion: numpy/pandas
                         # scalars leak through and break psycopg2 adapters.
                         "score": float(opp.score),
-                        "payoff": float(opp.estimated_payoff_multiple),
+                        "payoff": (
+                            float(opp.estimated_payoff_multiple)
+                            if opp.estimated_payoff_multiple is not None
+                            else None
+                        ),
                         "dir": opp.direction,
                         "thesis": opp.thesis,
                         "signals": json.dumps({
@@ -1103,7 +1211,16 @@ class OptionsScanner:
                         # chain with no ATM IV writes NULL rather than 0.0.
                         "iv": _nullable_float(opp.iv_atm),
                         "conf": opp.confidence,
-                        "is100": bool(opp.is_100x),
+                        # Column name is historical; the value is the
+                        # modelled threshold flag, NULL when unmodelled.
+                        "is100": (
+                            bool(opp.heuristic_payoff_flag)
+                            if opp.heuristic_payoff_flag is not None
+                            else None
+                        ),
+                        "payoff_inputs": json.dumps(
+                            opp.payoff_inputs or {}, default=str
+                        ),
                     },
                 )
                 count += 1

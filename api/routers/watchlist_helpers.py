@@ -208,8 +208,14 @@ def _row_to_dict(row: Any) -> dict:
 def _fetch_live_price(ticker: str) -> dict | None:
     """Fetch a live/recent price from yfinance as fallback.
 
-    Returns {"price": float, "prev_close": float, "pct_1d": float, "source": "live"}
+    Returns {"price", "prev_close", "pct_1d", "bar_date", "source": "live"}
     or None on failure.
+
+    ``bar_date`` is the trading day the price actually belongs to, taken from
+    the yfinance bar index. It is ``None`` on the ``fast_info`` path, where
+    the quote carries no date of its own: callers that persist this price
+    must not invent one (audit C-M14 / D-M30 — a Friday close written into
+    raw_series as Sunday's observation).
     """
     try:
         import yfinance as yf
@@ -230,14 +236,18 @@ def _fetch_live_price(ticker: str) -> dict | None:
         info = tk.fast_info
         price = getattr(info, "last_price", None)
         prev = getattr(info, "previous_close", None)
+        # fast_info is an undated live quote; only the history() fallback
+        # below knows which trading day the close belongs to.
+        bar_date = None
         if price is None:
             # auto_adjust=False to match the fast_info branch above:
             # last_price/previous_close are raw quotes, so the fallback must
             # not hand back a dividend-adjusted close for the same field.
-            # Ticker.history() defaults to auto_adjust=True in yfinance 0.2.x+.
+            # Ticker.history defaults to auto_adjust=True in yfinance 0.2.x+.
             hist = tk.history(period="5d", auto_adjust=False)
             if not hist.empty:
                 price = float(hist["Close"].iloc[-1])
+                bar_date = _bar_date(hist.index[-1])
                 if len(hist) >= 2:
                     prev = float(hist["Close"].iloc[-2])
         if price is None:
@@ -247,6 +257,7 @@ def _fetch_live_price(ticker: str) -> dict | None:
             "price": round(price, 4),
             "prev_close": round(prev, 4) if prev else None,
             "pct_1d": pct_1d,
+            "bar_date": bar_date,
             "source": "live",
         }
     except Exception as exc:
@@ -254,11 +265,31 @@ def _fetch_live_price(ticker: str) -> dict | None:
         return None
 
 
-def _cache_price_to_db(engine: Any, ticker: str, price: float, date: Any) -> None:
-    """Write yfinance price back to raw_series for future lookups."""
+def _bar_date(index_value: Any) -> str | None:
+    """Trading-day string for a yfinance bar index entry, or None."""
     try:
-        from datetime import datetime, timezone
+        if hasattr(index_value, "date"):
+            return index_value.date().isoformat()
+        return str(index_value)[:10] or None
+    except (AttributeError, TypeError, ValueError):  # pragma: no cover
+        return None
 
+
+def _cache_price_to_db(engine: Any, ticker: str, price: float, date: Any) -> None:
+    """Write a yfinance price back to raw_series for future lookups.
+
+    ``date`` must be the trading day the price belongs to. When it is None
+    the write is skipped: a GET handler that stamps ``date.today()`` on an
+    undated quote corrupts the series (a Friday close stored as Saturday's
+    observation, then re-served as the latest close — audit D-M30).
+    """
+    if date is None:
+        log.debug(
+            "Skipping raw_series cache for {t}: quote carries no bar date",
+            t=ticker,
+        )
+        return
+    try:
         with engine.begin() as conn:
             src_row = conn.execute(
                 text("SELECT id FROM source_catalog WHERE name = 'yfinance' LIMIT 1")
@@ -273,7 +304,7 @@ def _cache_price_to_db(engine: Any, ticker: str, price: float, date: Any) -> Non
             source_id = src_row[0]
 
             series_id = f"yf_{ticker.lower()}_close"
-            obs_date = date if date else datetime.now(timezone.utc).date()
+            obs_date = date
 
             conn.execute(
                 text(
@@ -298,7 +329,13 @@ def _cache_price_to_db(engine: Any, ticker: str, price: float, date: Any) -> Non
 def _batch_fetch_prices(tickers: list[str]) -> dict[str, dict]:
     """Batch-fetch live prices for multiple tickers via yf.download.
 
-    Returns {TICKER: {price, prev_close, pct_1d, pct_1w, updated_at}, ...}.
+    Returns {TICKER: {price, prev_close, pct_1d, pct_1w, bar_date,
+    updated_at, fetched_at}, ...}.
+
+    ``updated_at`` is the timestamp of the close's **own bar**, and
+    ``bar_date`` its trading day. They are not "now": a Friday close served
+    on a Sunday reports Friday (audit C-M14). ``fetched_at`` records when we
+    asked, which is the only thing "now" honestly describes.
     """
     from datetime import datetime, timezone
 
@@ -344,6 +381,7 @@ def _batch_fetch_prices(tickers: list[str]) -> dict[str, dict]:
         {v: k for k, v in yf_map.items()}
 
         results: dict[str, dict] = {}
+        # When the fetch happened — distinct from the bar it returned.
         now_iso = datetime.now(timezone.utc).isoformat()
 
         for tk in tickers:
@@ -356,6 +394,13 @@ def _batch_fetch_prices(tickers: list[str]) -> dict[str, dict]:
 
                 if close.empty:
                     continue
+
+                last_bar = close.index[-1]
+                bar_date = _bar_date(last_bar)
+                try:
+                    bar_iso = last_bar.isoformat()
+                except (AttributeError, TypeError, ValueError):  # pragma: no cover
+                    bar_iso = bar_date
 
                 last_price = float(close.iloc[-1])
                 prev_close = float(close.iloc[-2]) if len(close) >= 2 else None
@@ -374,7 +419,9 @@ def _batch_fetch_prices(tickers: list[str]) -> dict[str, dict]:
                     "prev_close": round(prev_close, 4) if prev_close else None,
                     "pct_1d": pct_1d,
                     "pct_1w": pct_1w,
-                    "updated_at": now_iso,
+                    "bar_date": bar_date,
+                    "updated_at": bar_iso,
+                    "fetched_at": now_iso,
                 }
             except Exception as exc:
                 log.debug("Batch price parse failed for {t}: {e}", t=tk, e=str(exc))

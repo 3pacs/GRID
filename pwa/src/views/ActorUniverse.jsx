@@ -742,8 +742,12 @@ export default function ActorUniverse() {
                 // Opacity from trust score -- modulate instance color alpha via brightness
                 // (InstancedMesh doesn't support per-instance opacity natively;
                 //  we approximate by darkening low-trust nodes)
-                const trust = n.trust_score || 0.5;
-                const brightness = 0.4 + trust * 0.6;
+                // trust_score is null when nothing has scored the actor.
+                // Unscored nodes render at the dim end rather than borrowing a
+                // 0.5 the scorer never produced; the detail panel says
+                // "unscored" in words. See docs/reference/CONFIDENCE_POLICY.md.
+                const trust = typeof n.trust_score === 'number' ? n.trust_score : null;
+                const brightness = trust == null ? 0.4 : 0.4 + trust * 0.6;
                 const tierColor = TIER_COLORS[n.tier] || 0x5A7080;
                 tempColor.setHex(tierColor);
                 tempColor.multiplyScalar(brightness);
@@ -1172,7 +1176,9 @@ export default function ActorUniverse() {
                             </div>
                             <div style={{ ...shared.metric, flex: 1, minWidth: '80px' }}>
                                 <div style={{ ...shared.metricValue, fontSize: '15px' }}>
-                                    {((selectedNode.trust_score || 0) * 100).toFixed(0)}%
+                                    {typeof selectedNode.trust_score === 'number'
+                                        ? `${(selectedNode.trust_score * 100).toFixed(0)}%`
+                                        : 'unscored'}
                                 </div>
                                 <div style={shared.metricLabel}>Trust</div>
                             </div>
@@ -1181,12 +1187,14 @@ export default function ActorUniverse() {
                         {/* Trust bar */}
                         <div>
                             <div style={{ height: '4px', background: colors.border, borderRadius: '2px', overflow: 'hidden' }}>
-                                <div style={{
-                                    height: '100%',
-                                    width: `${(selectedNode.trust_score || 0) * 100}%`,
-                                    background: `linear-gradient(90deg, ${colors.accent}, ${TIER_HEX[selectedNode.tier] || colors.accent})`,
-                                    borderRadius: '2px',
-                                }} />
+                                {typeof selectedNode.trust_score === 'number' && (
+                                    <div style={{
+                                        height: '100%',
+                                        width: `${selectedNode.trust_score * 100}%`,
+                                        background: `linear-gradient(90deg, ${colors.accent}, ${TIER_HEX[selectedNode.tier] || colors.accent})`,
+                                        borderRadius: '2px',
+                                    }} />
+                                )}
                             </div>
                         </div>
 

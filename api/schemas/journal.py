@@ -10,12 +10,10 @@ from pydantic import BaseModel, field_validator, model_validator
 class JournalEntryCreate(BaseModel):
     model_version_id: int
     inferred_state: str
-    # ROLLBACK TARGET: reads are null-safe (see JournalEntryResponse), but
-    # this build keeps the pre-#539 writer, which cannot record a
-    # confidence_reason. Accepting a null here would insert an unexplained
-    # NULL - a NOT NULL violation on the old schema, and a violation of
-    # ck_decision_journal_unscored_has_reason on the new one. Refuse at the
-    # boundary with a 422 instead of 500-ing at the database.
+    # None = UNSCORED: no confidence was ever measured. Permitted only with
+    # confidence_reason (enforced by the model validator below and, at the
+    # storage layer, by ck_decision_journal_unscored_has_reason). Never a
+    # stand-in for a number and never to be read as 0.
     state_confidence: float | None = None
     confidence_reason: str | None = None
     transition_probability: float
@@ -29,19 +27,35 @@ class JournalEntryCreate(BaseModel):
     @field_validator("operator_confidence")
     @classmethod
     def validate_confidence(cls, v: str) -> str:
-        if v not in ("LOW", "MEDIUM", "HIGH"):
-            raise ValueError("Must be LOW, MEDIUM, or HIGH")
+        if v not in ("LOW", "MEDIUM", "HIGH", "UNSCORED"):
+            raise ValueError("Must be LOW, MEDIUM, HIGH, or UNSCORED")
+        return v
+
+    @field_validator("state_confidence")
+    @classmethod
+    def validate_state_confidence(cls, v: float | None) -> float | None:
+        # None is the explicit UNSCORED state (requires a reason, below). A
+        # number must be a finite probability; the boundary rejects the rest
+        # so the journal's CHECK and the writer never see it.
+        if v is None:
+            return v
+        import math
+
+        if math.isnan(v) or math.isinf(v):
+            raise ValueError("state_confidence must be a finite number or null")
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("state_confidence must be between 0 and 1 (or null with a reason)")
         return v
 
     @model_validator(mode="after")
-    def unscored_writes_are_not_supported(self) -> "JournalEntryCreate":
-        if self.state_confidence is None:
+    def unscored_requires_reason(self) -> "JournalEntryCreate":
+        if self.state_confidence is None and not (
+            self.confidence_reason and self.confidence_reason.strip()
+        ):
             raise ValueError(
-                "state_confidence is null (unscored), and this build does "
-                "not write unscored entries: it is the rollback target for "
-                "PR #539 and carries #539's readers without its writer. "
-                "Existing unscored rows are read and rendered correctly; "
-                "new ones require the full #539 write path."
+                "state_confidence is null (unscored) - confidence_reason is "
+                "required to say why. The journal is append-only; an "
+                "unexplained NULL can never be annotated after the fact."
             )
         return self
 

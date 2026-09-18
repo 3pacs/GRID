@@ -225,14 +225,17 @@ class TestUnscoredSortsLast:
         entries.sort(key=conf_key, reverse=True)
         assert [e["state"] for e in entries] == ["C", "B", "A"]
 
-class TestRollbackTargetRefusesToWriteUnscored:
-    """The create path must not pretend it can record an unscored decision.
+class TestWriteContractAcceptsUnscoredOnlyWithReason:
+    """The create path under #539's contract (supersedes #545's refusal).
 
-    ``journal.log.DecisionJournal.log_decision`` on this branch is the
-    pre-#539 writer: no ``confidence_reason`` parameter, and no way to
-    satisfy ``ck_decision_journal_unscored_has_reason``. A null that reached
-    it would be a 500 (NOT NULL on the old schema, CHECK on the new one), so
-    the boundary refuses it as a 422 instead.
+    #545 (the readers-only rollback target) refuses a null ``state_confidence``
+    at the boundary with a 422 because its writer cannot record one. #539
+    ships the writer, so the contract becomes: a null confidence is accepted
+    ONLY with a non-blank ``confidence_reason``; invalid input (no reason,
+    blank reason, out-of-range or non-finite number) is rejected at the
+    boundary; a measured ``0.0`` is a measurement and passes through
+    untouched. When #545 lands first, this file replaces #545's copy on the
+    #539 rebase; the reader classes above are identical in both.
     """
 
     @staticmethod
@@ -251,39 +254,58 @@ class TestRollbackTargetRefusesToWriteUnscored:
         base.update(over)
         return base
 
-    def test_null_confidence_is_rejected_even_with_a_reason(self):
+    def test_null_confidence_with_a_reason_is_accepted(self):
+        from api.schemas.journal import JournalEntryCreate
+
+        entry = JournalEntryCreate(
+            **self._payload(
+                state_confidence=None,
+                confidence_reason="unscored: no contagion backtest history (n=0)",
+                operator_confidence="UNSCORED",
+            )
+        )
+        assert entry.state_confidence is None
+        assert entry.confidence_reason.startswith("unscored:")
+
+    @pytest.mark.parametrize("reason", [None, "", "   ", "\t\n"])
+    def test_null_confidence_without_a_reason_is_rejected(self, reason):
         from pydantic import ValidationError
 
         from api.schemas.journal import JournalEntryCreate
 
-        with pytest.raises(ValidationError, match="rollback target"):
+        with pytest.raises(ValidationError, match="confidence_reason"):
             JournalEntryCreate(
-                **self._payload(
-                    state_confidence=None,
-                    confidence_reason="unscored: n=0",
-                )
+                **self._payload(state_confidence=None, confidence_reason=reason)
             )
 
-    def test_a_number_is_still_accepted(self):
+    @pytest.mark.parametrize("bad", [-0.01, 1.01, float("nan"), float("inf")])
+    def test_out_of_range_or_non_finite_confidence_is_rejected(self, bad):
+        from pydantic import ValidationError
+
+        from api.schemas.journal import JournalEntryCreate
+
+        with pytest.raises(ValidationError, match="state_confidence"):
+            JournalEntryCreate(**self._payload(state_confidence=bad))
+
+    def test_measured_zero_is_preserved_not_treated_as_unscored(self):
         from api.schemas.journal import JournalEntryCreate
 
         entry = JournalEntryCreate(**self._payload(state_confidence=0.0))
-        # A measured zero is a measurement, not an absence.
         assert entry.state_confidence == 0.0
+        assert entry.confidence_reason is None
 
-    def test_the_router_does_not_pass_confidence_reason_to_the_writer(self):
-        """Guards the exact TypeError that made the raw cherry-pick unsafe."""
+    def test_the_router_passes_the_reason_to_a_writer_that_accepts_it(self):
         import inspect
 
         from journal.log import DecisionJournal
 
         params = inspect.signature(DecisionJournal.log_decision).parameters
-        assert "confidence_reason" not in params
+        assert "confidence_reason" in params
 
         src = inspect.getsource(
             __import__("api.routers.journal", fromlist=["create"]).create
         )
-        assert "confidence_reason" not in src
+        assert "confidence_reason=body.confidence_reason" in src
 
 
 class TestJournalResponseCarriesTheReason:

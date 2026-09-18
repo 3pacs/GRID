@@ -62,6 +62,8 @@ def test_earnings_prediction_to_dict():
         earnings_date="2026-01-29",
         predicted_direction="up",
         predicted_move_pct=3.5,
+        predicted_move_basis="history_and_options",
+        expected_move_options=3.8,
         confidence=0.72,
         iv_rank=65.0,
         historical_surprise_avg=4.2,
@@ -76,3 +78,5 @@ def test_earnings_prediction_to_dict():
     assert d["predicted_direction"] == "up"
     assert d["verdict"] == "pending"
     assert d["confidence"] == 0.72
+    assert d["predicted_move_basis"] == "history_and_options"
+    assert d["expected_move_options"] == 3.8
