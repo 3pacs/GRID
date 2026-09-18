@@ -79,6 +79,148 @@ function OverviewSkeleton() {
    AI Overview card
    ═══════════════════════════════════════════════════════════════════ */
 
+/* ═══════════════════════════════════════════════════════════════════
+   Derivatives panel states (GEX / Vanna-Charm / Flow Timeline)
+
+   Each panel is one of: loading · ok · empty · failed. A panel that fails
+   never hides itself and never takes the others down; it renders an
+   explicit "unavailable" card with a fixed, safe explanation and a Retry
+   button. Backend error text (which can carry SQL, paths or internals) is
+   never rendered — only a category is.
+
+   Shapes (api/routers/derivatives.py, physics/dealer_gamma.py):
+     api.js non-2xx / network → { error: true, status, message }
+     GEX  ok      → { available: true, snap_date, ... }
+          no data → { available: false, error: "No options data for …" |
+                      "No spot price for …" | "No GEX data available" }
+          failure → { available: false, error: <exception text> }
+     Vanna ok     → { vanna_exposure, ... }; failure/no data → { error }
+     Flow  ok     → { history: [...] }; empty → { history: [] };
+          failure → api.js error object (the route raises, never 200+error)
+   ═══════════════════════════════════════════════════════════════════ */
+
+// The engine reports a missing chain through these fixed prefixes; anything
+// else in `error` is a real failure. (physics/dealer_gamma.py 173/184/520)
+const NO_DATA_PREFIXES = ['No options data', 'No spot price', 'No GEX data'];
+
+function isNoDataMessage(msg) {
+    return typeof msg === 'string' && NO_DATA_PREFIXES.some(p => msg.startsWith(p));
+}
+
+/** Days between an ISO date string and today (UTC), or null. */
+function daysOld(iso) {
+    if (!iso) return null;
+    const t = Date.parse(iso);
+    if (Number.isNaN(t)) return null;
+    return Math.floor((Date.now() - t) / 86400000);
+}
+
+const STALE_AFTER_DAYS = 3;
+
+/**
+ * Classify one derivatives response into a panel state.
+ * @param {'gex'|'vanna'|'flow'} panel
+ * @param {{status: string, value?: any, reason?: any}} settled  Promise.allSettled entry
+ */
+export function classifyPanelResult(panel, settled) {
+    if (!settled || settled.status !== 'fulfilled') {
+        return { status: 'failed', kind: 'unreachable' };
+    }
+    const v = settled.value;
+    if (v == null || typeof v !== 'object') return { status: 'failed', kind: 'service' };
+    // api.js error object (non-2xx or network)
+    if (v.error === true && typeof v.status === 'number') {
+        return v.status === 0
+            ? { status: 'failed', kind: 'unreachable' }
+            : { status: 'failed', kind: 'http', httpStatus: v.status };
+    }
+    if (panel === 'gex') {
+        if (v.available === false || v.error) {
+            return isNoDataMessage(v.error) ? { status: 'empty' } : { status: 'failed', kind: 'service' };
+        }
+        const age = daysOld(v.snap_date);
+        return { status: 'ok', data: v, asOf: v.snap_date || null, stale: age != null && age > STALE_AFTER_DAYS };
+    }
+    if (panel === 'vanna') {
+        if (v.error) {
+            return isNoDataMessage(v.error) ? { status: 'empty' } : { status: 'failed', kind: 'service' };
+        }
+        return { status: 'ok', data: v };
+    }
+    // flow timeline
+    if (v.error) return { status: 'failed', kind: 'service' };
+    const history = Array.isArray(v.history) ? v.history : [];
+    if (history.length === 0) return { status: 'empty' };
+    return { status: 'ok', data: v };
+}
+
+const PANEL_LABEL = { gex: 'Dealer GEX profile', vanna: 'Vanna / charm', flow: 'Flow timeline' };
+
+function failureExplanation(kind, httpStatus) {
+    switch (kind) {
+        case 'unreachable': return 'the API could not be reached';
+        case 'http': return `the server answered with status ${httpStatus}`;
+        default: return 'the derivatives service reported a failure while computing it';
+    }
+}
+
+/**
+ * Explicit non-ok panel card. `status` is 'loading' | 'empty' | 'failed'.
+ * Renders no backend text — only the fixed explanation for the category.
+ */
+export function PanelStatusCard({ panel, ticker, state, onRetry }) {
+    const label = PANEL_LABEL[panel] || panel;
+    if (state.status === 'loading') {
+        return <div data-testid={`${panel}-panel-loading`}><OverviewSkeleton /></div>;
+    }
+    const base = {
+        ...shared.card,
+        padding: '12px 14px',
+        borderColor: colors.border,
+        display: 'flex', flexDirection: 'column', gap: '6px',
+    };
+    if (state.status === 'empty') {
+        return (
+            <div style={base} data-testid={`${panel}-panel-empty`}>
+                <div style={{ fontSize: '11px', fontWeight: 600, color: colors.textMuted, letterSpacing: '0.5px' }}>
+                    {label.toUpperCase()}
+                </div>
+                <div style={{ fontSize: '12px', color: colors.textSecondary }}>
+                    No {label.toLowerCase()} data for {ticker}: the options-chain store has no rows for it.
+                    This is an empty result, not a failure.
+                </div>
+            </div>
+        );
+    }
+    return (
+        <div style={{ ...base, borderColor: colors.red }} data-testid={`${panel}-panel-failed`}>
+            <div style={{ fontSize: '11px', fontWeight: 600, color: colors.red, letterSpacing: '0.5px' }}>
+                {label.toUpperCase()} UNAVAILABLE
+            </div>
+            <div style={{ fontSize: '12px', color: colors.textSecondary }}>
+                The request for {ticker} failed ({failureExplanation(state.kind, state.httpStatus)}).
+                The panel is shown as unavailable rather than hidden or filled with placeholder values.
+            </div>
+            {onRetry && (
+                <button type="button" onClick={onRetry} data-testid={`${panel}-panel-retry`}
+                    style={{ ...shared.button, alignSelf: 'flex-start', fontSize: '11px', padding: '4px 10px' }}>
+                    Retry
+                </button>
+            )}
+        </div>
+    );
+}
+
+function StaleBadge({ asOf }) {
+    return (
+        <div data-testid="gex-panel-stale" style={{
+            fontSize: '10px', color: colors.yellow, marginBottom: '4px', letterSpacing: '0.3px',
+        }}>
+            STALE: chain as of {asOf} (older than {STALE_AFTER_DAYS} days)
+        </div>
+    );
+}
+
 function CollapsibleSection({ title, body, defaultExpanded = true }) {
     const [expanded, setExpanded] = useState(defaultExpanded);
 
@@ -1134,13 +1276,28 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
     const [overviewLoading, setOverviewLoading] = useState(true);
     const [period, setPeriod] = useState('3M');
     const [priceLoading, setPriceLoading] = useState(false);
-    const [gexData, setGexData] = useState(null);
-    const [gexLoading, setGexLoading] = useState(true);
-    const [vannaCharmData, setVannaCharmData] = useState(null);
-    const [flowTimelineData, setFlowTimelineData] = useState(null);
-    const [secondaryLoading, setSecondaryLoading] = useState(true);
+    // Derivatives panels: each is { status: 'loading'|'ok'|'empty'|'failed', data?, kind?, ... }
+    const LOADING = { status: 'loading' };
+    const [gexState, setGexState] = useState(LOADING);
+    const [vannaState, setVannaState] = useState(LOADING);
+    const [flowState, setFlowState] = useState(LOADING);
     const [edgeData, setEdgeData] = useState(null);
     const [edgeLoading, setEdgeLoading] = useState(true);
+
+    const PANEL_FETCH = useMemo(() => ({
+        gex: (t) => api.getGEXProfile(t),
+        vanna: (t) => api.getVannaCharm(t),
+        flow: (t) => api.getFlowTimeline(t, 90),
+    }), []);
+    const PANEL_SET = useMemo(() => ({ gex: setGexState, vanna: setVannaState, flow: setFlowState }), []);
+
+    /** Load (or retry) one derivatives panel; a rejection or an error shape becomes a 'failed' state. */
+    const loadPanel = useCallback((panel, t) => {
+        const set = PANEL_SET[panel];
+        set(LOADING);
+        return Promise.allSettled([PANEL_FETCH[panel](t)])
+            .then(([settled]) => set(classifyPanelResult(panel, settled)));
+    }, [PANEL_FETCH, PANEL_SET]);
 
     useEffect(() => {
         if (!ticker) return;
@@ -1151,11 +1308,9 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
         setError(null);
         setOverview(null);
         setOverviewLoading(true);
-        setGexData(null);
-        setGexLoading(true);
-        setVannaCharmData(null);
-        setFlowTimelineData(null);
-        setSecondaryLoading(true);
+        setGexState(LOADING);
+        setVannaState(LOADING);
+        setFlowState(LOADING);
         setEdgeData(null);
         setEdgeLoading(true);
 
@@ -1189,25 +1344,11 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
             setEdgeLoading(false);
         });
 
-        // Phase 3: Fetch GEX, vanna-charm, flow timeline in parallel
-        Promise.allSettled([
-            api.getGEXProfile(ticker),
-            api.getVannaCharm(ticker),
-            api.getFlowTimeline(ticker, 90),
-        ]).then(([gexResult, vcResult, ftResult]) => {
-            if (gexResult.status === 'fulfilled' && !gexResult.value?.error) {
-                setGexData(gexResult.value);
-            }
-            setGexLoading(false);
-            if (vcResult.status === 'fulfilled' && !vcResult.value?.error) {
-                setVannaCharmData(vcResult.value);
-            }
-            if (ftResult.status === 'fulfilled' && !ftResult.value?.error) {
-                setFlowTimelineData(ftResult.value);
-            }
-            setSecondaryLoading(false);
-        });
-    }, [ticker]);
+        // Phase 3: GEX, vanna-charm, flow timeline — independent; one failing never hides another
+        loadPanel('gex', ticker);
+        loadPanel('vanna', ticker);
+        loadPanel('flow', ticker);
+    }, [ticker, loadPanel]);
 
     const handlePeriodChange = useCallback(async (newPeriod) => {
         if (newPeriod === period) return;
@@ -1370,49 +1511,57 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
                     </div>
                 )}
 
-                {/* Dealer GEX Profile — show skeleton while loading */}
-                {gexData ? (
-                    <div style={{ gridColumn: '1 / -1' }}>
-                        {isMobile ? (
-                            <CollapsibleSection title="DEALER GEX PROFILE" defaultExpanded={false}
-                                body={<GEXProfile ticker={ticker} gexData={gexData} spotPrice={gexData.spot} />} />
-                        ) : (
-                            <GEXProfile ticker={ticker} gexData={gexData} spotPrice={gexData.spot} />
-                        )}
-                    </div>
-                ) : gexLoading ? (
-                    <div style={{ gridColumn: '1 / -1' }}>
-                        <OverviewSkeleton />
-                    </div>
-                ) : null}
+                {/* Dealer GEX Profile — loading / ok (+stale badge) / empty / failed, always visible */}
+                <div style={{ gridColumn: '1 / -1' }}>
+                    {gexState.status === 'ok' ? (
+                        <div data-testid="gex-panel-ok">
+                            {gexState.stale && <StaleBadge asOf={gexState.asOf} />}
+                            {isMobile ? (
+                                <CollapsibleSection title="DEALER GEX PROFILE" defaultExpanded={false}
+                                    body={<GEXProfile ticker={ticker} gexData={gexState.data} spotPrice={gexState.data.spot} />} />
+                            ) : (
+                                <GEXProfile ticker={ticker} gexData={gexState.data} spotPrice={gexState.data.spot} />
+                            )}
+                        </div>
+                    ) : (
+                        <PanelStatusCard panel="gex" ticker={ticker} state={gexState}
+                            onRetry={() => loadPanel('gex', ticker)} />
+                    )}
+                </div>
 
                 {/* Vanna / Charm Compass */}
-                {vannaCharmData && (
-                    <div style={{ gridColumn: '1 / -1' }}>
-                        {isMobile ? (
-                            <CollapsibleSection title="VANNA / CHARM" defaultExpanded={false}
-                                body={<VannaCharmViz ticker={ticker} vannaCharmData={vannaCharmData} />} />
-                        ) : (
-                            <VannaCharmViz ticker={ticker} vannaCharmData={vannaCharmData} />
-                        )}
-                    </div>
-                )}
+                <div style={{ gridColumn: '1 / -1' }}>
+                    {vannaState.status === 'ok' ? (
+                        <div data-testid="vanna-panel-ok">
+                            {isMobile ? (
+                                <CollapsibleSection title="VANNA / CHARM" defaultExpanded={false}
+                                    body={<VannaCharmViz ticker={ticker} vannaCharmData={vannaState.data} />} />
+                            ) : (
+                                <VannaCharmViz ticker={ticker} vannaCharmData={vannaState.data} />
+                            )}
+                        </div>
+                    ) : (
+                        <PanelStatusCard panel="vanna" ticker={ticker} state={vannaState}
+                            onRetry={() => loadPanel('vanna', ticker)} />
+                    )}
+                </div>
 
                 {/* Flow Timeline */}
-                {flowTimelineData ? (
-                    <div style={{ gridColumn: '1 / -1' }}>
-                        {isMobile ? (
-                            <CollapsibleSection title="FLOW TIMELINE" defaultExpanded={false}
-                                body={<FlowTimeline ticker={ticker} timelineData={flowTimelineData} />} />
-                        ) : (
-                            <FlowTimeline ticker={ticker} timelineData={flowTimelineData} />
-                        )}
-                    </div>
-                ) : secondaryLoading ? (
-                    <div style={{ gridColumn: '1 / -1' }}>
-                        <OverviewSkeleton />
-                    </div>
-                ) : null}
+                <div style={{ gridColumn: '1 / -1' }}>
+                    {flowState.status === 'ok' ? (
+                        <div data-testid="flow-panel-ok">
+                            {isMobile ? (
+                                <CollapsibleSection title="FLOW TIMELINE" defaultExpanded={false}
+                                    body={<FlowTimeline ticker={ticker} timelineData={flowState.data} />} />
+                            ) : (
+                                <FlowTimeline ticker={ticker} timelineData={flowState.data} />
+                            )}
+                        </div>
+                    ) : (
+                        <PanelStatusCard panel="flow" ticker={ticker} state={flowState}
+                            onRetry={() => loadPanel('flow', ticker)} />
+                    )}
+                </div>
 
                 {/* Trade Recommendations for this ticker */}
                 <div style={{ gridColumn: '1 / -1' }}>
