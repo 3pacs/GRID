@@ -1,7 +1,7 @@
 """Add actors.provenance / actors.provenance_as_of.
 
 Revision ID: actors_provenance_20260917
-Revises: snapshot_actor_col_20260914
+Revises: earnings_pred_move_basis_0918 (re-parented 2026-09-18: this PR is stacked on #540, whose revision sits between; keeps the remediation chain linear so no merge revision is needed)
 Create Date: 2026-09-17
 
 Why
@@ -53,7 +53,7 @@ from sqlalchemy import text
 
 # revision identifiers, used by Alembic.
 revision: str = "actors_provenance_20260917"
-down_revision: Union[str, Sequence[str], None] = "snapshot_actor_col_20260914"
+down_revision: Union[str, Sequence[str], None] = "earnings_pred_move_basis_0918"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
