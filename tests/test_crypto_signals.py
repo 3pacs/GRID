@@ -1,20 +1,21 @@
 """Tests for crypto signal bridge — existing data → signal_sources."""
 import pytest
 from datetime import date
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 
 @pytest.fixture
-def engine():
-    """PostgreSQL test engine."""
-    eng = create_engine("postgresql://grid_user:changeme@localhost:5432/grid")
-    try:
-        with eng.connect() as conn:
-            conn.execute(text("SELECT 1"))
-    except Exception:
-        pytest.skip("PostgreSQL not available")
-    yield eng
-    eng.dispose()
+def engine(pg_engine):
+    """PostgreSQL test engine.
+
+    Previously created its own engine hard-coded to
+    postgresql://grid_user:changeme@localhost:5432/grid, which could never
+    see GRID_TEST_DB_URL and therefore never joined the suite's serialized
+    "postgres" xdist group. Routing through `pg_engine` (tests/conftest.py)
+    picks up GRID_TEST_DB_URL and keeps the same "PostgreSQL not available"
+    skip when no database is configured.
+    """
+    return pg_engine
 
 
 def test_coingecko_breakout_emits_signal(engine):
