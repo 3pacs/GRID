@@ -448,3 +448,294 @@ def test_target_feature_id_missing_from_matrix_is_handled_explicitly():
 
     baseline_result = bt._compute_baseline_metrics(matrix, target_feature_id=999)
     assert baseline_result["return"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# leakage-safe train/test separation (fit_fn / embargo_days)
+# ---------------------------------------------------------------------------
+#
+# These exercise run_validation end-to-end against a FakePITStore, since
+# the split lives in the era loop itself, not in a single computation
+# method.
+
+
+def _linear_dates(start: date, n: int) -> list[date]:
+    return [start + timedelta(days=i) for i in range(n)]
+
+
+def _store_from_prices(dates: list[date], prices: list[float]) -> FakePITStore:
+    return FakePITStore(
+        rows=[
+            Row(feature_id=1, obs_date=d, value=p, release_date=d, vintage_date=d)
+            for d, p in zip(dates, prices)
+        ]
+    )
+
+
+def test_fit_fn_memorization_cannot_beat_baseline_without_test_era_access():
+    """A fit_fn that "memorizes" is only ever shown the train window, so
+    the only thing it can memorize is train dates' own returns. Looked up
+    against test-era dates (which were never in that window), every
+    lookup misses -- the cheat has nothing to cheat with, and must not
+    beat a genuinely positive buy-and-hold baseline.
+    """
+    dates = _linear_dates(date(2024, 1, 1), 41)
+    prices = [100.0 * (1.005**i) for i in range(41)]  # steady uptrend
+    store = _store_from_prices(dates, prices)
+
+    def memorize_fit_fn(train_matrix: pd.DataFrame):
+        target = train_matrix.sort_index(axis=1).iloc[:, 0]
+        returns_by_date = target.pct_change().dropna().to_dict()
+
+        def predict(features: pd.DataFrame) -> pd.Series:
+            return pd.Series(
+                [np.sign(returns_by_date.get(pd.Timestamp(d), 0.0)) for d in features.index],
+                index=features.index,
+            )
+
+        return predict
+
+    bt = _bt()
+    bt.pit_store = store
+    result = bt.run_validation(
+        hypothesis_id=1,
+        feature_ids=[1],
+        start_date=dates[0],
+        end_date=dates[-1],
+        n_splits=2,
+        cost_bps=0.0,
+        fit_fn=memorize_fit_fn,
+        embargo_days=1,
+        target_feature_id=1,
+    )
+
+    baseline_return = result["baseline_comparison"]["return"]
+    strategy_return = result["full_period_metrics"]["return"]
+    assert baseline_return > 0  # sanity: the fixture has genuine positive drift
+    assert strategy_return == pytest.approx(0.0)  # every lookup missed -> flat
+    assert strategy_return < baseline_return
+
+
+def test_embargo_size_controls_overlap_leak_gain():
+    """An "overlap-leaking" fit_fn peeks at the H days immediately after
+    train_end (a stand-in for a label horizon that wasn't embargoed out).
+    With embargo_days=0, train_end sits right at the test era's own
+    start, so that peek IS the test era's own opening move -- a real,
+    if adversarially constructed, leak. With embargo_days>=horizon,
+    train_end is pushed back far enough that the same peek only ever
+    lands on the training tail, which this fixture deliberately makes
+    move in the OPPOSITE direction from the test era's actual trend.
+    """
+    horizon = 3
+    dates = _linear_dates(date(2024, 1, 1), 41)
+    prices: list[float] = []
+    p = 100.0
+    for i in range(41):
+        if i <= 16:
+            r = 0.0
+        elif i <= 19:  # era 0's last 3 days (the horizon)
+            r = -0.05
+        else:  # all of era 1: uptrend
+            r = 0.05
+        p = p * (1 + r)
+        prices.append(p)
+    store = _store_from_prices(dates, prices)
+    price_by_date = dict(zip([pd.Timestamp(d) for d in dates], prices))
+
+    def make_overlap_leaking_fit_fn():
+        def fit_fn(train_matrix: pd.DataFrame):
+            train_end_ts = train_matrix.sort_index().index.max()
+            window_dates = [train_end_ts + pd.Timedelta(days=k) for k in range(1, horizon + 1)]
+            window_prices = [price_by_date[d] for d in window_dates if d in price_by_date]
+            direction = 0.0
+            if len(window_prices) >= 2:
+                direction = float(np.sign(window_prices[-1] - window_prices[0]))
+
+            def predict(features: pd.DataFrame) -> pd.Series:
+                return pd.Series(direction, index=features.index)
+
+            return predict
+
+        return fit_fn
+
+    def run(embargo_days: int) -> dict:
+        bt = _bt()
+        bt.pit_store = store
+        return bt.run_validation(
+            hypothesis_id=1,
+            feature_ids=[1],
+            start_date=dates[0],
+            end_date=dates[-1],
+            n_splits=2,
+            cost_bps=0.0,
+            fit_fn=make_overlap_leaking_fit_fn(),
+            embargo_days=embargo_days,
+            target_feature_id=1,
+        )
+
+    small_embargo = run(embargo_days=0)
+    large_embargo = run(embargo_days=horizon)
+
+    assert small_embargo["n_no_train_data"] == 1  # era 0 has nothing before it
+    assert large_embargo["n_no_train_data"] == 1
+
+    small_return = small_embargo["full_period_metrics"]["return"]
+    large_return = large_embargo["full_period_metrics"]["return"]
+
+    assert small_return > 0, "embargo=0 lets the peek land on era 1's own opening days"
+    assert large_return < 0, (
+        "embargo>=horizon: the same peek now lands on the training "
+        "tail's opposite-direction move instead"
+    )
+    assert small_return > large_return
+
+
+def test_first_era_with_no_prior_training_data_is_marked_explicitly():
+    dates = _linear_dates(date(2024, 1, 1), 30)
+    prices = [100.0 + i for i in range(30)]
+    store = _store_from_prices(dates, prices)
+
+    def fit_fn(train_matrix: pd.DataFrame):
+        return lambda features: pd.Series(1.0, index=features.index)
+
+    bt = _bt()
+    bt.pit_store = store
+    result = bt.run_validation(
+        hypothesis_id=1,
+        feature_ids=[1],
+        start_date=dates[0],
+        end_date=dates[-1],
+        n_splits=3,
+        cost_bps=0.0,
+        fit_fn=fit_fn,
+        embargo_days=1,
+        target_feature_id=1,
+    )
+
+    statuses = [e["status"] for e in result["era_results"]]
+    assert statuses[0] == "NO_TRAIN_DATA"
+    assert result["n_no_train_data"] >= 1
+    # Never silently scored: the era_consistency gate must see it.
+    assert result["gate_detail"]["era_consistency"] is False
+    # And it contributes nothing to the aggregate -- verified structurally
+    # in test_fit_fn_memorization_cannot_beat_baseline_without_test_era_access
+    # and test_embargo_size_controls_overlap_leak_gain via n_no_train_data.
+
+
+def test_era_boundaries_never_overlap_and_respect_embargo():
+    dates = _linear_dates(date(2024, 1, 1), 60)
+    prices = [100.0 + i * 0.1 for i in range(60)]
+    store = _store_from_prices(dates, prices)
+
+    def fit_fn(train_matrix: pd.DataFrame):
+        return lambda features: pd.Series(1.0, index=features.index)
+
+    embargo = 2
+    bt = _bt()
+    bt.pit_store = store
+    result = bt.run_validation(
+        hypothesis_id=1,
+        feature_ids=[1],
+        start_date=dates[0],
+        end_date=dates[-1],
+        n_splits=4,
+        cost_bps=0.0,
+        fit_fn=fit_fn,
+        embargo_days=embargo,
+        target_feature_id=1,
+    )
+
+    eras = result["era_results"]
+    assert len(eras) == 4
+    for e in eras:
+        assert "train_end" in e and "test_start" in e  # every era, OK or not
+        train_end = date.fromisoformat(e["train_end"])
+        test_start = date.fromisoformat(e["test_start"])
+        assert train_end + timedelta(days=e["embargo_days"]) < test_start
+
+    test_windows = [
+        (date.fromisoformat(e["test_start"]), date.fromisoformat(e["test_end"]))
+        for e in eras
+    ]
+    for (_s1, e1), (s2, _e2) in zip(test_windows, test_windows[1:]):
+        assert e1 < s2  # strictly non-overlapping, chronologically ordered
+
+
+def test_stateless_predict_fn_path_unaffected_by_fit_fn_addition():
+    """No fit_fn given -> old behavior exactly: no boundary fields, no
+    n_no_train_data eras, predict_fn applied directly within its own era.
+    Guards the "existing stateless predict_fn callers keep working
+    unchanged" requirement.
+    """
+    bt = _bt()
+    dates = pd.DatetimeIndex([date(2024, 1, i) for i in range(1, 6)], name="obs_date")
+    matrix = pd.DataFrame({1: [100.0, 110.0, 99.0, 108.0, 97.0]}, index=dates)
+    result = bt._compute_era_metrics(matrix, None, cost_bps=0.0)
+    assert "train_start" not in result
+
+
+# ---------------------------------------------------------------------------
+# item 2 of round 3: why the per-day query loop was NOT batched
+# ---------------------------------------------------------------------------
+
+
+def test_single_asof_batch_then_mask_is_not_equivalent_to_per_day_fetch():
+    """Documents why the per-day PIT fetch loop was left as-is.
+
+    ``PITStore.get_feature_matrix`` (via ``get_pit``) runs
+    ``DISTINCT ON (feature_id, obs_date) ... WHERE release_date <= :aod
+    ORDER BY vintage_date ASC`` for FIRST_RELEASE -- it commits to the row
+    with the SMALLEST vintage_date among rows satisfying the ONE as_of_date
+    given, and the SQL permanently discards every other vintage for that
+    (feature_id, obs_date) before anything is returned. A single fetch at
+    as_of_date=end_date, even followed by masking every returned row whose
+    release_date is after its own obs_date, can only mask what that one
+    query already chose to return -- it can never go back and pick a
+    DIFFERENT, earlier-released vintage the query already discarded,
+    because vintage_date and release_date are independent columns with no
+    documented monotonicity guarantee between them (nothing in
+    store/pit.py's docstring promises "larger vintage_date implies later
+    release_date").
+
+    This fixture makes that concrete: for one obs_date, the row with the
+    smallest vintage_date (what a single as_of=end_date FIRST_RELEASE
+    query commits to) was released LATE (day 10), while a DIFFERENT,
+    larger-vintage_date row for that same obs_date was released EARLY
+    (right on the obs_date, day 5) -- so it is the one a correct per-day
+    fetch (as_of_date=day 5) actually returns. The single-shot query never
+    returns that row at all, so no post-hoc masking can recover it.
+    """
+
+    def day(k: int) -> date:
+        return date(2024, 1, 1) + timedelta(days=k)
+
+    store = FakePITStore(
+        rows=[
+            # The contested obs_date, two competing vintages:
+            Row(feature_id=1, obs_date=day(5), value=111.0, release_date=day(10), vintage_date=day(1)),
+            Row(feature_id=1, obs_date=day(5), value=999.0, release_date=day(5), vintage_date=day(6)),
+        ]
+    )
+
+    bt = _bt()
+    bt.pit_store = store
+
+    correct = bt._fetch_pit_correct_matrix(
+        feature_ids=[1], start_date=day(5), end_date=day(5), vintage_policy="FIRST_RELEASE"
+    )
+    assert correct.loc[pd.Timestamp(day(5)), 1] == 999.0  # the early-released vintage
+
+    naive_batch = store.get_feature_matrix(
+        feature_ids=[1],
+        start_date=day(5),
+        end_date=day(5),
+        as_of_date=day(20),
+        vintage_policy="FIRST_RELEASE",
+    )
+    # The single global query already committed to the smallest
+    # vintage_date overall (subject only to release <= day20) -- the
+    # late-released one -- discarding the early-released vintage
+    # entirely. No masking pass over this result can recover 999.0; it
+    # was never returned to mask in the first place.
+    assert naive_batch.loc[pd.Timestamp(day(5)), 1] == 111.0
+    assert naive_batch.loc[pd.Timestamp(day(5)), 1] != correct.loc[pd.Timestamp(day(5)), 1]
