@@ -42,6 +42,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from store.observations import read_latest
 
 # ── Domain constants ─────────────────────────────────────────────────────
 
@@ -316,18 +317,11 @@ def _read_market_cap(engine: Engine, ticker: str) -> float | None:
 def _read_total_debt(engine: Engine, ticker: str) -> float | None:
     try:
         with engine.connect() as conn:
-            row = conn.execute(
-                text(
-                    "SELECT value FROM raw_series "
-                    "WHERE series_id = :s AND value IS NOT NULL "
-                    "ORDER BY obs_date DESC LIMIT 1"
-                ),
-                {"s": f"sec_xbrl:{ticker.upper()}:total_debt"},
-            ).fetchone()
+            obs = read_latest(conn, f"sec_xbrl:{ticker.upper()}:total_debt")
     except Exception as exc:  # noqa: BLE001
         log.debug("total_debt read failed for {t}: {e}", t=ticker, e=str(exc))
         return None
-    return float(row[0]) if row else None
+    return obs.value if obs else None
 
 
 def _read_equity_vol(engine: Engine, ticker: str) -> float | None:
