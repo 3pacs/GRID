@@ -278,6 +278,97 @@ def _run_with_timeout(name: str, fn, timeout_s: int, state):
         return None, False
 
 
+def _run_autoresearch_with_lease_heartbeat(
+    fn,
+    timeout_s: int,
+    engine: Any,
+    lease_name: str,
+    owner_id: str,
+    lease_generation: int,
+    state,
+    heartbeat_interval_s: int = 15,
+):
+    """Like ``_run_with_timeout`` above, specialised for autoresearch (GRID
+    W4f, 2026-09-18): closes the cross-process gap named in
+    docs/handoffs/2026-09-18/fable-w4b-runstate.md's residual case #2 by
+    keeping the ``governance.leases`` "autoresearch" row alive for as long
+    as this call is genuinely still waiting on a healthy worker, instead
+    of doing one long blocking wait the way ``_run_with_timeout`` does.
+
+    Rationale for polling instead of reusing ``_run_with_timeout``
+    directly: that function is shared by many unrelated steps
+    (resolution, oracle_cycle, ...) and its single blocking
+    ``fut.result(timeout=timeout_s)`` has no hook to run code WHILE the
+    wait is in progress. Reimplementing that one call as a poll loop here,
+    scoped to autoresearch only, avoids touching a well-tested shared
+    helper for a need only this one caller has.
+
+    Behavior:
+      * Waits in ``heartbeat_interval_s`` slices. After every slice that
+        times out (the worker is still running), calls
+        ``governance.leases.heartbeat()`` to renew the lease's expiry --
+        this is what keeps a legitimately slow (not hung) run from having
+        its lease go stale purely because of duration.
+      * Once the TOTAL elapsed wait reaches ``timeout_s``, stops
+        heartbeating and abandons the worker exactly like
+        ``_run_with_timeout`` (blacklist + ``shutdown(wait=False,
+        cancel_futures=True)`` -- the thread cannot be killed, see that
+        function's docstring). From this point no one renews the lease, so
+        it goes stale on its own schedule; any ``guarded_write`` the
+        orphan later attempts under ``lease_generation`` is rejected by
+        the row's own ``expires_at``/``generation`` check regardless of
+        whether a NEW owner has acquired the lease yet.
+
+    Returns:
+        (result, ok) — same contract as ``_run_with_timeout``.
+    """
+    import concurrent.futures
+
+    from governance.leases import heartbeat as _lease_heartbeat
+
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    fut = ex.submit(fn)
+    elapsed = 0.0
+    try:
+        while True:
+            wait_s = max(min(heartbeat_interval_s, timeout_s - elapsed), 0)
+            try:
+                result = fut.result(timeout=wait_s)
+                ex.shutdown(wait=True)
+                return result, True
+            except concurrent.futures.TimeoutError:
+                elapsed += wait_s
+                if elapsed >= timeout_s:
+                    raise
+                try:
+                    renewed = _lease_heartbeat(engine, lease_name, owner_id, lease_generation)
+                    if not renewed:
+                        log.warning(
+                            "Autoresearch lease heartbeat reports we no "
+                            "longer own generation {g} — continuing to "
+                            "wait for the worker, but it is now orphaned "
+                            "for write purposes.", g=lease_generation,
+                        )
+                except Exception as exc:
+                    log.warning(
+                        "Autoresearch lease heartbeat call failed (owner={o}, "
+                        "generation={g}): {e}", o=owner_id, g=lease_generation, e=str(exc),
+                    )
+    except concurrent.futures.TimeoutError:
+        log.warning(
+            "Step 'autoresearch' timed out after {s}s — blacklisting for {h}h",
+            s=timeout_s, h=TIMEOUT_BLACKLIST_HOURS,
+        )
+        state.cooldowns.blacklist_for_timeout("autoresearch")
+        ex.shutdown(wait=False, cancel_futures=True)
+        return None, False
+    except Exception as exc:
+        log.warning("Step 'autoresearch' raised: {e}", e=str(exc))
+        state.cooldowns.record_attempt("autoresearch", success=False, error=str(exc))
+        ex.shutdown(wait=False, cancel_futures=True)
+        return None, False
+
+
 class _AutoresearchGenerationTracker:
     """In-process generation counter, used to fence autoresearch writes.
 
@@ -1944,37 +2035,78 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
             ar_run_id = str(uuid.uuid4())
             ar_generation = _autoresearch_generation.next()
 
-            def _autoresearch_call():
-                return maybe_run_autoresearch(
-                    state, dry_run=dry_run,
-                    run_id=ar_run_id, generation=ar_generation,
-                    is_current_generation=_autoresearch_generation.is_current,
-                )
+            # Cross-process lease (GRID W4f, 2026-09-18): acquiring this
+            # BEFORE the call, and forwarding the returned generation into
+            # every write run_autoresearch() makes, is what fences a
+            # SECOND Hermes process or a worker surviving a process
+            # restart — the in-process ar_generation above only ever
+            # fenced a stale THREAD within this same process (see
+            # _AutoresearchGenerationTracker's docstring). LeaseHeld means
+            # another owner already holds a live lease (e.g. two operator
+            # processes both reaching this gate); skip this cycle rather
+            # than force a takeover.
+            from governance.leases import LeaseHeld as _LeaseHeld
+            from governance.leases import acquire as _lease_acquire
+            from governance.leases import release as _lease_release
 
-            ar_result, ar_ok = _run_with_timeout(
-                "autoresearch", _autoresearch_call,
-                AUTORESEARCH_TIMEOUT_SECONDS, state,
-            )
-            if ar_ok:
-                if ar_result is not None:
-                    cycle_result["autoresearch"] = ar_result
-            else:
-                # Bump NOW, not on the next cycle-6 gate an hour from now —
-                # the abandoned worker thread is still running and could
-                # write at any point between now and then.
-                _autoresearch_generation.next()
-                cycle_result["autoresearch"] = {"status": "timeout", "run_id": ar_run_id}
-                try:
-                    from scripts.autoresearch import _record_research_run
-                    _record_research_run(
-                        engine, ar_run_id, "timeout",
-                        phase="operator_timeout",
-                        error=f"exceeded {AUTORESEARCH_TIMEOUT_SECONDS}s",
-                        error_category="timeout",
-                        generation=ar_generation,
+            ar_owner_id = f"hermes-operator-{ar_run_id}"
+            try:
+                ar_lease_generation = _lease_acquire(engine, "autoresearch", ar_owner_id)
+            except _LeaseHeld as exc:
+                log.warning("Autoresearch lease held elsewhere — skipping this cycle: {e}", e=str(exc))
+                cycle_result["autoresearch"] = {"status": "lease_held", "run_id": ar_run_id}
+                ar_lease_generation = None
+
+            if ar_lease_generation is not None:
+                def _autoresearch_call():
+                    return maybe_run_autoresearch(
+                        state, dry_run=dry_run,
+                        run_id=ar_run_id, generation=ar_generation,
+                        is_current_generation=_autoresearch_generation.is_current,
+                        lease_generation=ar_lease_generation, lease_owner_id=ar_owner_id,
                     )
-                except Exception as exc:
-                    log.warning("Failed to record autoresearch timeout: {e}", e=str(exc))
+
+                ar_result, ar_ok = _run_autoresearch_with_lease_heartbeat(
+                    _autoresearch_call, AUTORESEARCH_TIMEOUT_SECONDS, engine,
+                    "autoresearch", ar_owner_id, ar_lease_generation, state,
+                )
+                if ar_ok:
+                    if ar_result is not None:
+                        cycle_result["autoresearch"] = ar_result
+                    try:
+                        _lease_release(engine, "autoresearch", ar_owner_id, ar_lease_generation)
+                    except Exception as exc:
+                        log.debug(
+                            "Autoresearch lease release failed (harmless — "
+                            "TTL will expire it): {e}", e=str(exc),
+                        )
+                else:
+                    # Bump NOW, not on the next cycle-6 gate an hour from now —
+                    # the abandoned worker thread is still running and could
+                    # write at any point between now and then.
+                    _autoresearch_generation.next()
+                    cycle_result["autoresearch"] = {"status": "timeout", "run_id": ar_run_id}
+                    try:
+                        from scripts.autoresearch import _record_research_run
+                        _record_research_run(
+                            engine, ar_run_id, "timeout",
+                            phase="operator_timeout",
+                            error=f"exceeded {AUTORESEARCH_TIMEOUT_SECONDS}s",
+                            error_category="timeout",
+                            generation=ar_generation,
+                        )
+                    except Exception as exc:
+                        log.warning("Failed to record autoresearch timeout: {e}", e=str(exc))
+                    # Deliberately do NOT release the lease here: the orphaned
+                    # worker thread (still running — see _run_with_timeout's
+                    # docstring, same limitation applies here) may still be
+                    # mid-way through a guarded_write call under
+                    # ar_lease_generation. Releasing now would let a brand-new
+                    # acquire() bump the generation immediately while that
+                    # write could still be in flight; leaving it to expire on
+                    # its own TTL (no more heartbeats will renew it) is what
+                    # makes the row-lock ordering argument in
+                    # governance/leases.py hold.
         except Exception as exc:
             log.warning("Autoresearch failed: {e}", e=str(exc))
 

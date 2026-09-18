@@ -1683,6 +1683,8 @@ def maybe_run_autoresearch(
     run_id: str | None = None,
     generation: int | None = None,
     is_current_generation: Any = None,
+    lease_generation: int | None = None,
+    lease_owner_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Run autoresearch if system is healthy and enough time has passed.
 
@@ -1697,6 +1699,14 @@ def maybe_run_autoresearch(
         is_current_generation: Callable(int) -> bool, forwarded to
             run_autoresearch(). See scripts/hermes_operator.py's
             ``_AutoresearchGenerationTracker``.
+        lease_generation: Cross-process ``research_leases`` generation
+            (GRID W4f, 2026-09-18), forwarded to run_autoresearch() so
+            every real write it makes is guarded against a second Hermes
+            process / a worker surviving a restart, not just a stale
+            in-process thread. None (the default) disables cross-process
+            guarding. See scripts/hermes_operator.py's cycle-6 gate,
+            which acquires this from ``governance.leases.acquire()``.
+        lease_owner_id: Forwarded to run_autoresearch() for logging only.
     """
     now = datetime.now(timezone.utc)
 
@@ -1717,6 +1727,8 @@ def maybe_run_autoresearch(
             run_id=run_id,
             generation=generation,
             is_current_generation=is_current_generation,
+            lease_generation=lease_generation,
+            lease_owner_id=lease_owner_id,
         )
         state.last_autoresearch = now
         state.hypotheses_tested += result.get("iterations", 0)

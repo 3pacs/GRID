@@ -59,15 +59,34 @@ class WalkForwardBacktest:
         pit_store: PITStore for point-in-time data access.
     """
 
-    def __init__(self, db_engine: Engine, pit_store: PITStore) -> None:
+    def __init__(
+        self,
+        db_engine: Engine,
+        pit_store: PITStore,
+        write_guard: Any = None,
+    ) -> None:
         """Initialise the backtester.
 
         Parameters:
             db_engine: SQLAlchemy engine connected to the GRID database.
             pit_store: PITStore instance for PIT-correct data.
+            write_guard: Optional hook for the ``validation_results`` insert
+                (GRID W4f, 2026-09-18). When given, it must be a callable
+                ``write_guard(fn)`` that executes ``fn(conn)`` against a
+                SQLAlchemy ``Connection`` inside its own guarded
+                transaction and returns whatever ``fn`` returns -- e.g.
+                ``lambda fn: governance.leases.run_guarded(engine,
+                "autoresearch", generation, fn)``. Default ``None``
+                preserves the exact prior behavior (a plain
+                ``self.engine.begin()`` block) so #556's existing tests and
+                every other caller of this class are unaffected -- this is
+                purely an optional hook, not an evaluator semantics
+                change. See ``_store_result`` below and
+                ``governance/leases.py`` for the guard itself.
         """
         self.engine = db_engine
         self.pit_store = pit_store
+        self._write_guard = write_guard
         log.info("WalkForwardBacktest initialised")
 
     def run_validation(
@@ -760,33 +779,52 @@ class WalkForwardBacktest:
 
         Parameters:
             result: Complete validation result dict.
+
+        When ``self._write_guard`` was given at construction (GRID W4f),
+        the insert runs through it instead of a bare
+        ``self.engine.begin()`` block -- see ``__init__``'s docstring.
+        ``governance.leases.OwnershipLost`` is deliberately let through
+        unmodified (not swallowed by the generic ``except Exception``
+        below) so a caller such as ``scripts/autoresearch.py`` can tell
+        "this write was fenced -- do not notify/promote" apart from an
+        ordinary storage failure, which stays fail-soft exactly as before.
         """
+        def _do_insert(conn: Any) -> None:
+            conn.execute(
+                text("""
+                    INSERT INTO validation_results
+                    (hypothesis_id, vintage_policy, era_results,
+                     full_period_metrics, baseline_comparison,
+                     simplicity_comparison, walk_forward_splits,
+                     cost_assumption_bps, overall_verdict, gate_detail)
+                    VALUES
+                    (:hid, :vp, :er, :fpm, :bc, :sc, :wfs, :cab, :ov, :gd)
+                """),
+                {
+                    "hid": result["hypothesis_id"],
+                    "vp": result["vintage_policy"],
+                    "er": json.dumps(result["era_results"]),
+                    "fpm": json.dumps(result["full_period_metrics"]),
+                    "bc": json.dumps(result["baseline_comparison"]),
+                    "sc": json.dumps(result["simplicity_comparison"]),
+                    "wfs": result["walk_forward_splits"],
+                    "cab": result["cost_assumption_bps"],
+                    "ov": result["overall_verdict"],
+                    "gd": json.dumps(result["gate_detail"]),
+                },
+            )
+
+        from governance.leases import OwnershipLost  # local import: optional dependency
+
         try:
-            with self.engine.begin() as conn:
-                conn.execute(
-                    text("""
-                        INSERT INTO validation_results
-                        (hypothesis_id, vintage_policy, era_results,
-                         full_period_metrics, baseline_comparison,
-                         simplicity_comparison, walk_forward_splits,
-                         cost_assumption_bps, overall_verdict, gate_detail)
-                        VALUES
-                        (:hid, :vp, :er, :fpm, :bc, :sc, :wfs, :cab, :ov, :gd)
-                    """),
-                    {
-                        "hid": result["hypothesis_id"],
-                        "vp": result["vintage_policy"],
-                        "er": json.dumps(result["era_results"]),
-                        "fpm": json.dumps(result["full_period_metrics"]),
-                        "bc": json.dumps(result["baseline_comparison"]),
-                        "sc": json.dumps(result["simplicity_comparison"]),
-                        "wfs": result["walk_forward_splits"],
-                        "cab": result["cost_assumption_bps"],
-                        "ov": result["overall_verdict"],
-                        "gd": json.dumps(result["gate_detail"]),
-                    },
-                )
+            if self._write_guard is not None:
+                self._write_guard(_do_insert)
+            else:
+                with self.engine.begin() as conn:
+                    _do_insert(conn)
             log.info("Validation result stored for hypothesis {h}", h=result["hypothesis_id"])
+        except OwnershipLost:
+            raise
         except Exception as exc:
             log.error("Failed to store validation result: {err}", err=str(exc))
 

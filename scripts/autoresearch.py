@@ -40,6 +40,7 @@ from store.pit import PITStore
 from ollama.client import get_client as get_ollama
 from ollama.reasoner import OllamaReasoner, SYSTEM_PROMPT
 from validation.backtest import WalkForwardBacktest
+from governance.leases import OwnershipLost
 
 # Per-step wall-clock budget for one run_autoresearch() invocation, read by
 # scripts/hermes_operator.py when it wraps the call in _run_with_timeout
@@ -313,6 +314,32 @@ def _generation_current(
     if generation is None or is_current_generation is None:
         return True
     return is_current_generation(generation)
+
+
+def _guarded_or_direct(cur, pg, lease_generation: int | None, fn: Callable[[Any], Any]) -> Any:
+    """Run ``fn(cur)`` directly, or -- when ``lease_generation`` is not
+    None -- run it through ``governance.leases.run_guarded_dbapi`` against
+    ``pg`` (the SAME psycopg2 connection ``cur`` belongs to) so the write
+    only commits while the cross-process "autoresearch" lease still names
+    this generation as current (GRID W4f, 2026-09-18 -- closes the
+    cross-process gap documented in
+    docs/handoffs/2026-09-18/fable-w4b-runstate.md's residual case #2).
+
+    ``lease_generation`` is None for a standalone CLI run (no operator, no
+    lease to check against -- matches the existing ``generation``/
+    ``is_current_generation`` in-process fencing's own "None disables
+    fencing" contract) and for every existing caller/test that predates
+    this task, so this is purely additive: nothing changes unless a caller
+    explicitly supplies a lease generation.
+
+    ``governance.leases.OwnershipLost`` propagates unchanged so call sites
+    can record a "fenced" outcome instead of treating it as an ordinary
+    write failure.
+    """
+    if lease_generation is None:
+        return fn(cur)
+    from governance.leases import run_guarded_dbapi
+    return run_guarded_dbapi(pg, "autoresearch", lease_generation, fn)
 
 
 def _select_orthogonal_features(cur, max_features: int = 13, corr_threshold: float = 0.7) -> list[int]:
@@ -639,6 +666,8 @@ def run_autoresearch(
     run_id: str | None = None,
     generation: int | None = None,
     is_current_generation: Callable[[int], bool] | None = None,
+    lease_generation: int | None = None,
+    lease_owner_id: str | None = None,
 ) -> dict[str, Any]:
     """Run the full autoresearch loop.
 
@@ -663,13 +692,36 @@ def run_autoresearch(
             still current. Passed by scripts/hermes_fixers.py::
             maybe_run_autoresearch, which forwards it from
             scripts/hermes_operator.py's ``_AutoresearchGenerationTracker``.
+        lease_generation: Cross-process generation for the "autoresearch"
+            row in ``research_leases`` (GRID W4f, 2026-09-18), obtained by
+            the operator from ``governance.leases.acquire()``. Distinct
+            from ``generation`` above: ``generation``/
+            ``is_current_generation`` fence a stale worker THREAD within
+            one Hermes process (cheap, in-memory, checked once per
+            iteration as an early-exit optimization); ``lease_generation``
+            is what actually makes every real write
+            (hypothesis_registry/model_registry/validation_results)
+            transactionally safe against a SECOND process, or a worker
+            surviving a process restart, via ``governance.leases.
+            guarded_write``/``guarded_write_dbapi``. None (the default)
+            disables cross-process guarding, matching a standalone CLI run
+            with no lease to check against.
+        lease_owner_id: Owner id recorded on the lease by the caller's
+            ``acquire()`` call. Only used for logging here (the guard
+            itself only checks generation + expiry, not owner_id) --
+            forwarded through for traceability in log lines.
 
     Returns:
         dict: Summary with best hypothesis, all attempts, and final verdict.
-            Always includes "status" (started/ok/failed/abandoned) as of
-            this task; "timeout" is recorded by the caller, not returned
-            from here, since a timed-out call never returns at all (the
-            worker thread is abandoned by _run_with_timeout).
+            "status" is one of started/ok/failed/abandoned/fenced.
+            "abandoned" means an in-process generation check
+            (``is_current_generation``) fired at some point; "fenced"
+            (GRID W4f) means a cross-process ``governance.leases.
+            OwnershipLost`` fired -- the lease was lost to another
+            process/generation while a real write was attempted. "timeout"
+            is recorded by the caller, not returned from here, since a
+            timed-out call never returns at all (the worker thread is
+            abandoned by _run_with_timeout).
     """
     import psycopg2
 
@@ -692,7 +744,20 @@ def run_autoresearch(
     )
 
     pit = PITStore(engine)
-    backtester = WalkForwardBacktest(engine, pit)
+    # Cross-process write guard (GRID W4f) for the validation_results insert
+    # validation/backtest.py performs internally. Only constructed when the
+    # caller supplied a lease_generation -- every pre-existing caller/test
+    # (lease_generation=None) gets the exact same WalkForwardBacktest(engine,
+    # pit) 2-arg call as before, so nothing here changes their behavior.
+    if lease_generation is not None:
+        from governance.leases import run_guarded
+
+        def _write_guard(fn, _engine=engine, _gen=lease_generation):
+            return run_guarded(_engine, "autoresearch", _gen, fn)
+
+        backtester = WalkForwardBacktest(engine, pit, write_guard=_write_guard)
+    else:
+        backtester = WalkForwardBacktest(engine, pit)
     ollama = get_ollama()
     reasoner = OllamaReasoner(ollama)
 
@@ -922,8 +987,8 @@ def run_autoresearch(
                 id=hyp_id, s=existing_state,
             )
         else:
-            try:
-                cur.execute(
+            def _insert_hypothesis(gcur):
+                gcur.execute(
                     "INSERT INTO hypothesis_registry "
                     "(statement, layer, feature_ids, lag_structure, proposed_metric, proposed_threshold, state) "
                     "VALUES (%s, %s, %s, %s, %s, %s, 'TESTING') RETURNING id",
@@ -936,9 +1001,25 @@ def run_autoresearch(
                         hyp["proposed_threshold"],
                     ),
                 )
-                hyp_id = cur.fetchone()[0]
+                return gcur.fetchone()[0]
+
+            try:
+                hyp_id = _guarded_or_direct(cur, pg, lease_generation, _insert_hypothesis)
                 existing_state = "TESTING"
                 log.info("  Registered as hypothesis_id={}", hyp_id)
+            except OwnershipLost as exc:
+                log.warning(
+                    "Autoresearch lease lost before hypothesis insert "
+                    "(iteration {i}): {e}", i=iteration, e=str(exc),
+                )
+                fence_events.append(f"lease_lost_before_hypothesis_insert_iteration_{iteration}")
+                attempts.append({
+                    "iteration": iteration,
+                    "statement": hyp["statement"],
+                    "error": "fenced: cross-process lease lost",
+                    "fenced": True,
+                })
+                break
             except Exception as exc:
                 log.error("Failed to register hypothesis: {e}", e=str(exc))
                 attempts.append({
@@ -979,7 +1060,16 @@ def run_autoresearch(
             )
             if cur.fetchone() is None and _generation_current(generation, is_current_generation):
                 try:
-                    _create_model_from_hypothesis(cur, hyp_id, hyp, layer, {})
+                    _guarded_or_direct(
+                        cur, pg, lease_generation,
+                        lambda gcur: _create_model_from_hypothesis(gcur, hyp_id, hyp, layer, {}),
+                    )
+                except OwnershipLost as exc:
+                    log.warning(
+                        "Autoresearch lease lost before reused-PASSED model "
+                        "creation (hypothesis {h}): {e}", h=hyp_id, e=str(exc),
+                    )
+                    fence_events.append(f"lease_lost_before_reused_model_creation_iteration_{iteration}")
                 except Exception as exc:
                     log.warning("Auto model creation failed: {e}", e=str(exc))
 
@@ -1040,12 +1130,53 @@ def run_autoresearch(
                 n_splits=n_splits,
                 cost_bps=cost_bps,
             )
+        except OwnershipLost as exc:
+            # The validation_results insert inside run_validation() (its
+            # own write_guard, constructed above) lost the cross-process
+            # lease mid-backtest. Do NOT also try to mark the hypothesis
+            # FAILED here -- that write would need the exact same guard,
+            # and the honest outcome is "this worker no longer owns
+            # anything", not "this hypothesis failed". Stop and record
+            # fenced, same shape as every other fencing checkpoint.
+            log.warning(
+                "Autoresearch lease lost during backtest (hypothesis {h}): {e}",
+                h=hyp_id, e=str(exc),
+            )
+            fence_events.append(f"lease_lost_during_backtest_iteration_{iteration}")
+            attempts.append({
+                "iteration": iteration,
+                "hypothesis_id": hyp_id,
+                "statement": hyp["statement"],
+                "error": "fenced: cross-process lease lost",
+                "fenced": True,
+            })
+            break
         except Exception as exc:
             log.error("Backtest failed: {e}", e=str(exc))
-            cur.execute(
-                "UPDATE hypothesis_registry SET state='FAILED', kill_reason=%s WHERE id=%s",
-                (f"Backtest error: {exc}", hyp_id),
-            )
+            kill_reason = f"Backtest error: {exc}"
+
+            def _mark_failed(gcur):
+                gcur.execute(
+                    "UPDATE hypothesis_registry SET state='FAILED', kill_reason=%s WHERE id=%s",
+                    (kill_reason, hyp_id),
+                )
+
+            try:
+                _guarded_or_direct(cur, pg, lease_generation, _mark_failed)
+            except OwnershipLost as lease_exc:
+                log.warning(
+                    "Autoresearch lease lost while marking hypothesis {h} "
+                    "FAILED after a backtest error: {e}", h=hyp_id, e=str(lease_exc),
+                )
+                fence_events.append(f"lease_lost_marking_failed_iteration_{iteration}")
+                attempts.append({
+                    "iteration": iteration,
+                    "hypothesis_id": hyp_id,
+                    "statement": hyp["statement"],
+                    "error": "fenced: cross-process lease lost",
+                    "fenced": True,
+                })
+                break
             attempts.append({
                 "iteration": iteration,
                 "statement": hyp["statement"],
@@ -1070,14 +1201,43 @@ def run_autoresearch(
         log.info("  Era summary:    {}", format_era_summary(era_results))
 
         # ── Step 4: Update hypothesis state ───────────────────────────
+        # This is the mid-iteration state UPDATE named as the single
+        # largest remaining window in
+        # docs/handoffs/2026-09-18/fable-w4b-runstate.md's residual case
+        # #1: nothing previously re-checked fencing between "backtest
+        # returned" and "state written", so an orphan whose generation
+        # went stale WHILE the backtest itself ran (unbounded from this
+        # module's perspective) could still land this write. Routing it
+        # through the lease guard closes that: the row lock guarded_write
+        # takes cannot have been affected by anything that happened during
+        # the backtest, because the check now happens transactionally at
+        # the moment of THIS write, not before the backtest started.
         log.info("[4/4] Updating hypothesis state...")
         new_state = "PASSED" if verdict == "PASS" else "FAILED"
         kill_reason = None if verdict == "PASS" else f"Verdict={verdict}, Sharpe={sharpe}"
 
-        cur.execute(
-            "UPDATE hypothesis_registry SET state=%s, kill_reason=%s, updated_at=NOW() WHERE id=%s",
-            (new_state, kill_reason, hyp_id),
-        )
+        def _update_state(gcur, _state=new_state, _reason=kill_reason):
+            gcur.execute(
+                "UPDATE hypothesis_registry SET state=%s, kill_reason=%s, updated_at=NOW() WHERE id=%s",
+                (_state, _reason, hyp_id),
+            )
+
+        try:
+            _guarded_or_direct(cur, pg, lease_generation, _update_state)
+        except OwnershipLost as exc:
+            log.warning(
+                "Autoresearch lease lost writing hypothesis {h} state "
+                "after backtest (verdict={v}): {e}", h=hyp_id, v=verdict, e=str(exc),
+            )
+            fence_events.append(f"lease_lost_after_backtest_iteration_{iteration}")
+            attempts.append({
+                "iteration": iteration,
+                "hypothesis_id": hyp_id,
+                "statement": hyp["statement"],
+                "error": "fenced: cross-process lease lost",
+                "fenced": True,
+            })
+            break
 
         attempt = {
             "iteration": iteration,
@@ -1110,6 +1270,16 @@ def run_autoresearch(
             # (model_registry insert) and idempotent (skip if a candidate
             # already exists for this hypothesis, e.g. a retry landed here
             # a second time before the DB round-trip below could record it).
+            #
+            # `model_creation_fenced` gates the notification below (GRID
+            # W4f, 2026-09-18 fix): previously this fenced/not-fenced
+            # branch did NOT stop notify_on_pass from being called a few
+            # lines down even when model creation was skipped as fenced —
+            # a real "notification fires on a fenced path" bug found while
+            # tracing every sink reachable from this branch, not something
+            # this task introduced. Any fencing here (in-process OR
+            # cross-process lease loss) now suppresses the notification.
+            model_creation_fenced = False
             if not _generation_current(generation, is_current_generation):
                 log.warning(
                     "Autoresearch generation {g} superseded before model "
@@ -1117,6 +1287,7 @@ def run_autoresearch(
                     g=generation, h=hyp_id,
                 )
                 fence_events.append(f"fenced_before_model_creation_iteration_{iteration}")
+                model_creation_fenced = True
             else:
                 cur.execute(
                     "SELECT id FROM model_registry WHERE hypothesis_id = %s LIMIT 1",
@@ -1124,8 +1295,18 @@ def run_autoresearch(
                 )
                 if cur.fetchone() is None:
                     try:
-                        _create_model_from_hypothesis(cur, hyp_id, hyp, layer, result)
+                        _guarded_or_direct(
+                            cur, pg, lease_generation,
+                            lambda gcur: _create_model_from_hypothesis(gcur, hyp_id, hyp, layer, result),
+                        )
                         log.info("    Model created (CANDIDATE) from hypothesis {}", hyp_id)
+                    except OwnershipLost as exc:
+                        log.warning(
+                            "Autoresearch lease lost before model creation "
+                            "(hypothesis {h}): {e}", h=hyp_id, e=str(exc),
+                        )
+                        fence_events.append(f"lease_lost_before_model_creation_iteration_{iteration}")
+                        model_creation_fenced = True
                     except Exception as exc:
                         log.warning("Auto model creation failed: {e}", e=str(exc))
                 else:
@@ -1134,12 +1315,23 @@ def run_autoresearch(
             # Send email notification. This is the ONE place a genuinely
             # new PASS notifies — the reused_hyp/"PASSED" idempotent
             # short-circuit above deliberately never reaches this branch,
-            # so a retry with the same run_id cannot double-notify.
-            try:
-                from scripts.notify import notify_on_pass
-                notify_on_pass(attempt)
-            except Exception as exc:
-                log.debug("Email notification skipped: {e}", e=str(exc))
+            # so a retry with the same run_id cannot double-notify. Also
+            # never notifies on a fenced path (see model_creation_fenced
+            # above) — a notification is a real-world side effect (an
+            # actual email send, see scripts/notify.py) with no
+            # transactional rollback, so the guard's job here is to
+            # prevent the call from ever happening, not to wrap it.
+            if not model_creation_fenced:
+                try:
+                    from scripts.notify import notify_on_pass
+                    notify_on_pass(attempt)
+                except Exception as exc:
+                    log.debug("Email notification skipped: {e}", e=str(exc))
+            else:
+                log.info(
+                    "    Notification skipped — model creation was fenced "
+                    "for hypothesis {}", hyp_id,
+                )
 
             break
 
@@ -1160,16 +1352,30 @@ def run_autoresearch(
         log.info("No valid hypotheses were generated.")
     log.info("=" * 70)
 
-    # The run-record end write is itself fenced: a worker that only became
-    # stale AFTER its last per-iteration check (e.g. the operator moved on
-    # while this call was doing its final bookkeeping) must not publish an
-    # "ok" end record — that would let a superseded run look like the
-    # authoritative outcome for run_id, even though every insert-row write
-    # is append-only and does not literally overwrite anything. "abandoned"
-    # names this precisely: the run finished its own work but the operator
-    # had already stopped waiting on it.
+    # The run-record end write itself is NOT lease-guarded (deliberately —
+    # see docs/handoffs/2026-09-18/fable-w4f-write-sinks.md's "sinks that
+    # cannot be guarded" section): it is what REPORTS a fenced outcome, so
+    # gating it behind the same lease it is reporting the loss of would be
+    # circular. It stays the existing best-effort/fail-soft
+    # analytical_snapshots append.
+    #
+    # final_status distinguishes WHY a run did not reach a clean "ok":
+    #   "fenced"    — a cross-process governance.leases.OwnershipLost fired
+    #                 (lease_lost_* in fence_events) — GRID W4f.
+    #   "abandoned" — only the in-process generation check
+    #                 (is_current_generation) fired, no lease was even in
+    #                 play (a standalone/no-lease run) — GRID W4b, unchanged.
+    # A worker that only became stale AFTER its last per-iteration check
+    # (e.g. the operator moved on while this call was doing its final
+    # bookkeeping) must not publish an "ok" end record — that would let a
+    # superseded run look like the authoritative outcome for run_id, even
+    # though every insert-row write is append-only and does not literally
+    # overwrite anything.
+    lease_fenced = any(e.startswith("lease_lost_") for e in fence_events)
     final_status = "ok"
-    if fence_events or not _generation_current(generation, is_current_generation):
+    if lease_fenced:
+        final_status = "fenced"
+    elif fence_events or not _generation_current(generation, is_current_generation):
         final_status = "abandoned"
 
     _record_research_run(
