@@ -483,15 +483,35 @@ an all-calls chain (never crosses → `unavailable`), and a chain with half
 its contracts missing IV (coverage < 1, those contracts skipped rather
 than defaulted).
 
-**Explicitly never computed: any claim that a figure here matches a real
-dealer's actual book.** No real captured options chain fixture exists
-anywhere in this codebase to validate the engine's sign convention or
-modeled-dealer-positioning assumption against a known-correct GEX number —
-named exactly as `MISSING_INPUT`, returned in every API response as
-`missing_input`. This is the concrete input this lane could not obtain and
-the specific claim it prevents: a claim of accuracy against real dealer
-positioning, as opposed to internal mechanical correctness (which the
-three synthetic cases do validate).
+**Numerical validation against a real, sourced chain (2026-09-18):**
+`tests/godview/test_dealer_gex_validation.py` runs this engine's
+`_compute_gex_for_chain` against a live SPY options chain captured via
+`yfinance` (`tests/godview/fixtures/options_chain_SPY_20260918.json`;
+exact provenance — source URL/API, capture timestamp, spot, expiry — in
+the sidecar `options_chain_SPY_20260918.SOURCE.md`), and compares it to
+an INDEPENDENTLY written expected-value calculation (its own
+`math.erf`-based normal pdf, its own Black-Scholes gamma, its own
+gamma-flip/max-pain/ATM-IV/put-call-ratio code — none of it imported from
+the engine). Net/call/put GEX, gamma-flip strike, max pain, put/call OI
+ratio, and ATM IV agree within a stated `1e-6` relative tolerance; the
+engine's `contracts_used`/`contracts_present` match the test's own count
+of usable rows exactly. **What this proves:** the engine's math is
+numerically correct under its stated, disclosed assumptions (r=q=0,
+chain-reported implied_vol, the call-positive/put-negative sign
+convention, a 100-share contract multiplier), on a real chain, not just
+on the three synthetic cases below. **What this does NOT prove: any
+claim that a figure here matches a real dealer's actual book.**
+`options_snapshots` still carries no dealer-vs-customer position split
+at all — no table, no column, nowhere in this database records who
+actually holds which side of an option — so the "dealers are short both
+sides" convention remains a MODELED assumption, never a measurement.
+Every field this pillar produces stays `provenance='modeled'` for
+exactly that reason (checked by
+`test_router_still_reports_gex_fields_as_modeled`, not just asserted in
+prose), named exactly as `MISSING_INPUT`, returned in every API response
+as `missing_input`: a claim of accuracy against real dealer positioning,
+as opposed to internal mechanical correctness (which the sourced-chain
+test above and the three synthetic cases below both validate).
 
 ## Status of all seven God View pillars (2026-09-18)
 
