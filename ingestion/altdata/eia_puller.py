@@ -61,17 +61,20 @@ _WEEKLY_STOCKS_ROUTE = "petroleum/stoc/wstk"
 # that browser page for the Cushing storage hub.
 DEFAULT_WEEKLY_STOCKS_SERIES = "W_EPC0_SAX_YCUOK_MBBL"
 
+# EIA requests carry ``api_key=<value>`` in the query string, so any
+# exception raised by ``requests`` (e.g. ``HTTPError.__str__``, which embeds
+# ``response.url``) can echo the live key straight into the log. Redact it
+# before anything derived from a request exception is logged. (Reviewed
+# helper from #553 -- kept as the single definition per the integration
+# fix; see tests/test_source_eia.py for its redaction test. The
+# weekly-stocks code below (as_display_url/fetch_weekly_stocks) calls this
+# same helper rather than defining its own.)
+_API_KEY_QS_PATTERN = re.compile(r"(api_key=)[^&\s]+", re.IGNORECASE)
+
 
 def _redact_api_key(text: str) -> str:
-    """Mask an ``api_key=...`` query value for safe logging.
-
-    Minimal redaction helper -- no such helper exists elsewhere in
-    ``ingestion/`` on this branch (checked before adding this) to reuse.
-    Never logs the real key; used for the log line in
-    :func:`fetch_weekly_stocks` and by tests asserting the built URL's
-    displayed form never contains a real key value.
-    """
-    return re.sub(r"(api_key=)[^&]*", r"\1***", text)
+    """Strip an ``api_key=...`` query value out of an error message."""
+    return _API_KEY_QS_PATTERN.sub(r"\1***", text)
 
 
 class EIAPuller(BasePuller):
@@ -123,7 +126,16 @@ class EIAPuller(BasePuller):
             try:
                 records = self._fetch_series(facet, start_str, end_str)
             except Exception as exc:
-                log.error("EIA fetch failed for {f}: {e}", f=facet, e=str(exc))
+                # Upstream/network fault (bad JSON, HTTP error, timeout) --
+                # not a code bug, so this is a WARNING per the project's
+                # log-level convention (see ingestion/base.py::log_pull_failure).
+                # The exception text from `requests` can embed the request
+                # URL -- including our api_key query param -- so redact it.
+                log.warning(
+                    "EIA fetch failed for {f}: {e}",
+                    f=facet,
+                    e=_redact_api_key(str(exc)),
+                )
                 continue
 
             with self.engine.begin() as conn:
@@ -142,6 +154,13 @@ class EIAPuller(BasePuller):
                     self._insert_raw(conn=conn, series_id=sid, obs_date=obs,
                                      value=fv, raw_payload={"facet": facet})
                     total += 1
+                    # A single response can (rarely) repeat a period -- e.g. a
+                    # duplicated row from an upstream retry-within-response.
+                    # Record it as seen immediately so a repeat later in this
+                    # same `records` list is skipped too, not just repeats
+                    # across separate pull() calls (which `existing` already
+                    # covered before this fix).
+                    existing.add(obs)
             time.sleep(1.0)
 
         log.info("EIA: {n} rows inserted", n=total)

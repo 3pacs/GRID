@@ -1,0 +1,8 @@
+{
+  "report_date": "not-a-real-date",
+  "metals": [
+    {"metal": "Copper", "total_stocks": "N/A", "cancelled_warrants": null},
+    {"metal": "Unobtainium", "total_stocks": 999, "cancelled_warrants": 1},
+    {"metal": "Zinc", "total_stocks": 250000, "cancelled_warrants": 50000}
+  ]
+}
