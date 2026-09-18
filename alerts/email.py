@@ -119,7 +119,52 @@ def _section_regime(state: str, confidence: float, action: str) -> dict:
     }
 
 
-def _section_100x(ticker: str, direction: str, score: float, thesis: str, payoff: float = 0) -> dict:
+def _section_100x(
+    ticker: str, direction: str, score: float, thesis: str, payoff: float = 0,
+    confidence: str | None = None,
+) -> dict:
+    # options_mispricing_scans.confidence (LOW/MEDIUM/HIGH) must survive
+    # into the rendered alert — without it, a LOW-confidence flagged row is
+    # visually identical to a HIGH-confidence one.
+    #
+    # What this label actually is, made visible in the email itself (not
+    # only here) per docs/reference/CONFIDENCE_POLICY.md (#544, adopted
+    # 2026-09-17): discovery/options_scanner.py sets it from a fixed
+    # threshold on the composite score (>=8.0/>=6.0), not from a scored
+    # track record (hit rate, calibration, verified-vs-flagged count) —
+    # the bar that policy sets for a field named "confidence". It doesn't
+    # clear that bar, so every rendering below says "heuristic confidence"
+    # and never the bare word, in every branch including MEDIUM/HIGH — a
+    # HIGH bucket is still just a threshold on the same composite score,
+    # not a calibrated high-confidence signal, and saying so only for LOW
+    # would misleadingly imply the other two are measured. Renaming the
+    # underlying field belongs to whoever next revises
+    # discovery/options_scanner.py (#539's lane), not this fix.
+    #
+    # The column is `confidence TEXT NOT NULL` — verified against
+    # schema.sql, which puts no CHECK constraint on this column (contrast
+    # decision_journal.operator_confidence, which does constrain its values
+    # to LOW/MEDIUM/HIGH). NOT NULL rules out None; it does NOT rule out an
+    # unexpected non-LOW/MEDIUM/HIGH string reaching here — nothing in the
+    # schema stops one being written, so the "unknown" branch below is a
+    # real, reachable case (a typo, a future code path, a direct edit),
+    # not purely defensive for a hypothetical legacy row.
+    label = (confidence or "").strip().upper()
+    if label == "LOW":
+        conf_note = (
+            ' &nbsp; <span class="badge badge-hold">HEURISTIC CONFIDENCE: LOW</span>'
+        )
+        accent = "amber"
+    elif label in ("MEDIUM", "HIGH"):
+        conf_note = (
+            f' &nbsp; <span class="badge badge-regime">heuristic confidence: {label}</span>'
+        )
+        accent = "purple"
+    else:
+        conf_note = (
+            ' &nbsp; <span class="badge badge-hold">HEURISTIC CONFIDENCE: UNKNOWN</span>'
+        )
+        accent = "amber"
     return {
         "title": f"100x Opportunity — {ticker}",
         "body": (
@@ -127,9 +172,13 @@ def _section_100x(ticker: str, direction: str, score: float, thesis: str, payoff
             f'{ticker} {direction}S</span> &nbsp; '
             f'Score: <strong>{score:.1f}/10</strong>'
             f'{f" &nbsp; Est. Payoff: <strong>{payoff:.0f}x</strong>" if payoff else ""}'
+            f'{conf_note}'
             f'<br><br>{thesis}'
+            f'<br><br><span style="font-size:11px;color:#5A7A96;">Confidence is a '
+            f'scanner heuristic (a threshold on the composite score) — not a '
+            f'calibrated or track-record-scored confidence.</span>'
         ),
-        "accent": "purple",
+        "accent": accent,
     }
 
 
@@ -349,10 +398,12 @@ def alert_on_regime_change(from_regime: str, to_regime: str, confidence: float) 
     )
 
 
-def alert_on_100x_opportunity(ticker: str, score: float, direction: str, thesis: str) -> None:
+def alert_on_100x_opportunity(
+    ticker: str, score: float, direction: str, thesis: str, confidence: str | None = None,
+) -> None:
     _send(
         f"GRID Intelligence — 100x Alert: {ticker} {direction}S",
-        [_section_100x(ticker, direction, score, thesis)],
+        [_section_100x(ticker, direction, score, thesis, confidence=confidence)],
     )
 
 
@@ -479,22 +530,34 @@ def daily_digest(dry_run: bool = False) -> dict[str, Any]:
             # 100x opportunities
             try:
                 rows = conn.execute(sa_text(
-                    "SELECT ticker, direction, score, payoff_multiple, thesis "
+                    "SELECT ticker, direction, score, payoff_multiple, thesis, confidence "
                     "FROM options_mispricing_scans "
                     "WHERE is_100x = TRUE AND scan_date >= CURRENT_DATE - 3 "
                     "ORDER BY score DESC LIMIT 5"
                 )).fetchall()
                 for r in rows:
-                    sections.append(_section_100x(r[0], r[1], r[2], r[4], r[3]))
+                    sections.append(_section_100x(r[0], r[1], r[2], r[4], r[3], confidence=r[5]))
             except Exception as exc:
                 degraded.append("100x_opportunities")
                 log.debug("Daily digest 100x section failed: {e}", e=str(exc))
 
-            # Data freshness
+            # Data freshness — pull_status = 'SUCCESS' only. raw_series also
+            # gets a row on a FAILED pull (value=0, a real pull_timestamp),
+            # so counting every row regardless of status reports a source as
+            # "active" off pulls that never actually produced an
+            # observation. analysis/flow_thesis_data.py's raw_series reads
+            # already filter to SUCCESS — this KPI didn't. That is NOT true
+            # of most raw_series readers: the 2026-09-17 fake-data audit's
+            # root cause #1 is that 22 analytical modules read raw_series by
+            # obs_date alone, and #535 has migrated 7 of them so far,
+            # leaving 18 legacy unfiltered readers as documented, open
+            # follow-up work (see grid-fake-data-LEDGER.md). This fix covers
+            # only this one KPI in this file, not that broader gap.
             try:
                 row = conn.execute(sa_text(
                     "SELECT COUNT(DISTINCT source_id), MAX(pull_timestamp) FROM raw_series "
-                    "WHERE pull_timestamp >= NOW() - INTERVAL '24 hours'"
+                    "WHERE pull_timestamp >= NOW() - INTERVAL '24 hours' "
+                    "AND pull_status = 'SUCCESS'"
                 )).fetchone()
                 if row and row[0]:
                     sections.append(_section_kpi("Active Sources (24h)", str(row[0]),
