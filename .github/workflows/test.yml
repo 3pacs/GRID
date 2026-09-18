@@ -80,9 +80,22 @@ jobs:
       # environment cannot populate, so every one of them skipped with
       # "PostgreSQL not available" while the job stayed green. Build the schema
       # the way a fresh box does (schema.sql, then the Alembic chain from the
-      # last pre-god-view head; the history cannot be replayed from nothing —
-      # see tests/test_schema_godview_prerequisites.py) and hand the URL to the
-      # suite. The guard after pytest fails the job if any DB test still skips.
+      # last pre-god-view head) and hand the URL to the suite. The guard after
+      # pytest fails the job if any DB test still skips.
+      #
+      # What the stamp does NOT represent (measured 2026-09-18 on a disposable
+      # PostgreSQL 14 against production's table inventory): schema.sql plus
+      # the post-stamp revisions yields 43 tables; production has 216. Nineteen
+      # of the missing ones are created by revisions the stamp skips
+      # (canvas_*, goal_queue/goal_results, investigation_evidence, the
+      # capital-flow tables, congressional_trades, ...); the rest are created
+      # at runtime by modules. Replaying the whole history from nothing is not
+      # possible today: it stops at the ninth revision on a runtime-created
+      # table (analytical_snapshots), after discovered_hypotheses. Tests that
+      # need those tables therefore FAIL or SKIP here — visibly, by design —
+      # until schema.sql declares the runtime prerequisites or the revisions
+      # are made self-contained. Stamping must never be read as proof that
+      # the skipped revisions were exercised.
       - name: Bootstrap test database schema
         env:
           PGPASSWORD: testpass
@@ -149,7 +162,7 @@ jobs:
           # tuning has numbers instead of guesses.
           set +e
           python -m pytest tests/ -v --tb=short --maxfail=50 --timeout=180 \
-            -n auto --dist loadgroup --durations=25 \
+            -n auto --dist loadgroup --durations=25 -rs \
             > /tmp/grid-pytest-output.txt 2>&1
           pytest_status=$?
           set -e
@@ -161,15 +174,19 @@ jobs:
           tail -300 /tmp/grid-pytest-output.txt
           echo "::endgroup::"
 
-          # Database coverage accounting. With -v every test prints one line
-          # ending in PASSED/FAILED/SKIPPED; the database skips carry one of
-          # the fixed reasons below. Executed = DB-fixture tests that ran.
-          db_skips=$(grep -cE "SKIPPED.*(PostgreSQL not available|Postgres not available|griddb not reachable)" /tmp/grid-pytest-output.txt || true)
-          db_executed=$(grep -E "^(tests/(test_journal|test_pit|test_resolver|test_holder_deal_overlap|test_acquisition_decomposition|test_capital_flow_rollups|test_canvas_graph_state_store|test_canvas_predict|test_goal_queue|test_intelligence_search|test_investigation_evidence|test_realtime_freshness_probe|test_realtime_shutdown_semantics|test_parse_datasets_signals)\.py|tests/contracts/(test_dead_letter|test_migration)\.py).* (PASSED|FAILED)" /tmp/grid-pytest-output.txt | wc -l || true)
-          echo "database tests executed: ${db_executed}; skipped for a missing database: ${db_skips}"
+          # Database coverage accounting. -v prints one line per test ending
+          # in PASSED/FAILED/SKIPPED (xdist prefixes it with "[gwN] [ nn%]"),
+          # and -rs prints every skip with its reason in the short summary.
+          # Executed = tests in the database-touching files that ran to a
+          # verdict; database skips = any skip whose reason is a missing
+          # database OR a missing table (the stamp gap above shows up here).
+          DB_FILES='tests/(test_journal|test_pit|test_resolver|test_holder_deal_overlap|test_acquisition_decomposition|test_capital_flow_rollups|test_canvas_graph_state_store|test_canvas_predict|test_goal_queue|test_intelligence_search|test_investigation_evidence|test_realtime_freshness_probe|test_realtime_shutdown_semantics|test_parse_datasets_signals|test_reasoning_bank|test_hypothesis_kills|test_crypto_signals)\.py|tests/contracts/(test_dead_letter|test_migration)\.py'
+          db_executed=$(grep -cE "(PASSED|FAILED|ERROR) +(${DB_FILES})::" /tmp/grid-pytest-output.txt || true)
+          db_skips=$(grep -ciE "^SKIPPED .*(PostgreSQL not available|Postgres not available|griddb not reachable|table missing|missing table|GRID_PG_INTEGRATION)" /tmp/grid-pytest-output.txt || true)
+          echo "database tests executed: ${db_executed}; skipped for a missing database or table: ${db_skips}"
           if [ "${db_skips}" != "0" ]; then
-            echo "::error::${db_skips} database-gated test(s) skipped although the PostgreSQL service is up — the schema bootstrap or GRID_TEST_DB_URL wiring regressed; a green job must not imply coverage it skipped"
-            grep -E "SKIPPED.*(PostgreSQL not available|Postgres not available|griddb not reachable)" /tmp/grid-pytest-output.txt | head -20
+            echo "::error::${db_skips} database-gated test(s) skipped although the PostgreSQL service is up (missing database wiring, a hard-coded URL, or a table the stamped bootstrap does not create) — a green job must not imply coverage it skipped"
+            grep -iE "^SKIPPED .*(PostgreSQL not available|Postgres not available|griddb not reachable|table missing|missing table|GRID_PG_INTEGRATION)" /tmp/grid-pytest-output.txt | head -40
             exit 1
           fi
           exit "$pytest_status"
