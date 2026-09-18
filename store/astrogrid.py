@@ -1088,21 +1088,21 @@ class AstroGridStore:
             proposed_mystical["nakshatra"] = _review_weight(proposed_mystical["nakshatra"], -0.03)
             proposed_mystical["aspects"] = _review_weight(proposed_mystical["aspects"], -0.03)
 
-        confidence = 0.45
-        if hit_count + miss_count >= 10:
-            confidence += 0.15
-        if best_alpha and best_alpha > 0.02:
-            confidence += 0.15
-        if top_grid:
-            confidence += 0.05
-        from intelligence.confidence_calibration import calibrate_confidence_default
-        confidence = round(
-            calibrate_confidence_default(
-                min(0.95, confidence),
-                "astrogrid_mystical",
-            ),
-            3,
-        )
+        # The review used to publish a stack of arbitrary constants
+        # (0.45 + 0.15 + 0.15 + 0.05) as its `confidence`, and
+        # `calibrate_confidence_default` returns its input unchanged whenever
+        # no reliability table exists for `astrogrid_mystical` — which is the
+        # normal case — so the published number was just the constant stack
+        # (D-M33). It is null until a reliability curve exists; the evidence
+        # counts it was built from are published instead.
+        confidence = None
+        review_evidence = {
+            "scored_n": hit_count + miss_count,
+            "hit_count": hit_count,
+            "miss_count": miss_count,
+            "best_alpha": best_alpha,
+            "top_grid_drivers": list(top_grid or []),
+        }
 
         what_worked = []
         if top_grid:
@@ -1151,6 +1151,10 @@ class AstroGridStore:
             "proposed_grid_weights": proposed_grid,
             "proposed_mystical_weights": proposed_mystical,
             "confidence": confidence,
+            "confidence_basis": (
+                "no reliability curve for astrogrid_mystical"
+            ),
+            "review_evidence": review_evidence,
             "reasoning_summary": reasoning_summary,
             "best_variant": best_variant,
             "best_variant_by_group": best_variant_by_group,
@@ -1209,7 +1213,10 @@ class AstroGridStore:
             ):
                 if key in parsed:
                     merged[key] = parsed[key]
-            merged["confidence"] = _coerce_confidence(merged.get("confidence")) or review_payload["confidence"]
+            # An LLM-refined review does not acquire a track record either:
+            # keep the deterministic value (null) unless the LLM returned a
+            # number that actually parses in range.
+            merged["confidence"] = _coerce_confidence(merged.get("confidence"))
             return "llm" if provider_mode == "llm" else "hybrid", getattr(client, "model", None), merged
         except Exception as exc:
             log.debug("AstroGrid review LLM unavailable: {e}", e=str(exc))
@@ -1343,7 +1350,9 @@ class AstroGridStore:
                     "proposed_grid_weights": _safe_json(review_payload.get("proposed_grid_weights") or {}),
                     "proposed_mystical_weights": _safe_json(review_payload.get("proposed_mystical_weights") or {}),
                     "reasoning_summary": _compact_text(review_payload.get("reasoning_summary")),
-                    "confidence": float(review_payload.get("confidence") or 0.5),
+                    # NULL when the review stated none: `or 0.5` invented a
+                    # stated confidence and rewrote a genuine 0.0 (D-M33).
+                    "confidence": _coerce_confidence(review_payload.get("confidence")),
                 },
             ).fetchone()
 
@@ -1942,7 +1951,7 @@ class AstroGridStore:
             "proposed_grid_weights": _json_loads(row[4], {}),
             "proposed_mystical_weights": _json_loads(row[5], {}),
             "reasoning_summary": row[6] or "",
-            "confidence": float(row[7] or 0.0),
+            "confidence": _coerce_confidence(row[7]),
             "created_at": row[8].isoformat() if row[8] else None,
             "status": self._weight_proposal_effective_state(proposal_status, decision),
             "proposal_status": proposal_status,
