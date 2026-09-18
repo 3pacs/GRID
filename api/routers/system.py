@@ -34,6 +34,17 @@ from api.schemas.system import (
     StaleSource,
     SystemStatusResponse,
 )
+from store.availability_fields import (
+    FIELD_AVAILABILITY_AVAILABLE,
+    FIELD_AVAILABILITY_UNAVAILABLE,
+    STALE_CONSUMER_QUERY_MISMATCH,
+    STALE_FETCH_FAILED,
+    STALE_NEVER_CONFIGURED,
+    STALE_STALE,
+    STALE_UNKNOWN,
+    measured_field,
+    unavailable_field,
+)
 
 router = APIRouter(prefix="/api/v1/system", tags=["system"])
 
@@ -374,6 +385,24 @@ def status(_token: str = Depends(require_auth)) -> SystemStatusResponse:
     )
 
 
+def _classify_query_failure(exc: Exception) -> str:
+    """Best-effort category for a failed health-check query, as a ``stale_reason``.
+
+    A bare ``Exception`` carries no structured error taxonomy, so most
+    failures fall through to ``STALE_UNKNOWN`` — this is intentionally
+    approximate and never invented as anything more specific than the
+    message actually supports (a missing column/table reads as a
+    query/schema mismatch; a connection/timeout message reads as a fetch
+    failure). Callers must not treat the result as authoritative.
+    """
+    msg = str(exc).lower()
+    if "does not exist" in msg or "column" in msg or "relation" in msg or "no such table" in msg:
+        return STALE_CONSUMER_QUERY_MISMATCH
+    if "timeout" in msg or "connection" in msg or "could not connect" in msg:
+        return STALE_FETCH_FAILED
+    return STALE_UNKNOWN
+
+
 @router.get("/freshness", response_model=FreshnessResponse)
 def freshness(_token: str = Depends(require_auth)) -> FreshnessResponse:
     """Per-family data freshness report.
@@ -382,6 +411,7 @@ def freshness(_token: str = Depends(require_auth)) -> FreshnessResponse:
     """
     engine = get_db_engine()
     families: list[FamilyFreshness] = []
+    query_failed_reason: str | None = None
     try:
         with engine.connect() as conn:
             rows = conn.execute(text(
@@ -412,6 +442,7 @@ def freshness(_token: str = Depends(require_auth)) -> FreshnessResponse:
                 ))
     except Exception as exc:
         log.warning("Freshness query failed: {e}", e=str(exc))
+        query_failed_reason = _classify_query_failure(exc)
 
     # Overall status: worst family status
     if not families or any(f.status == "RED" for f in families):
@@ -433,14 +464,27 @@ def freshness(_token: str = Depends(require_auth)) -> FreshnessResponse:
                 "ORDER BY sc.last_pull_at ASC NULLS FIRST "
                 "LIMIT 20"
             )).fetchall()
-            stale_sources = [
-                StaleSource(
-                    source=r[0],
-                    last_pull=r[1].isoformat() if r[1] else None,
+            for r in rows:
+                src_name, last_pull_at = r[0], r[1]
+                # This query only ever returns sources that are already
+                # >48h stale or never pulled, so every row here is one of
+                # exactly those two contract states — never a fabricated
+                # third state.
+                if last_pull_at is None:
+                    record = unavailable_field(STALE_NEVER_CONFIGURED, source_catalog=src_name)
+                else:
+                    record = measured_field(
+                        None,
+                        source_catalog=src_name,
+                        ingested_at=last_pull_at,
+                        stale_reason=STALE_STALE,
+                    )
+                stale_sources.append(StaleSource(
+                    source=src_name,
+                    last_pull=last_pull_at.isoformat() if last_pull_at else None,
                     stale=True,
-                )
-                for r in rows
-            ]
+                    field_record=record.to_dict(),
+                ))
     except Exception as exc:
         log.debug("System: stale sources query failed: {e}", e=str(exc))
 
@@ -448,6 +492,8 @@ def freshness(_token: str = Depends(require_auth)) -> FreshnessResponse:
         families=families,
         overall_status=overall,
         stale_sources=stale_sources,
+        availability=FIELD_AVAILABILITY_UNAVAILABLE if query_failed_reason else FIELD_AVAILABILITY_AVAILABLE,
+        stale_reason=query_failed_reason,
     )
 
 
@@ -522,6 +568,7 @@ def pipeline_health(
     coverage: dict[str, dict] = {}
     recent_errors: list[PipelineError] = []
     resolver = ResolverStatus()
+    query_failed_reason: str | None = None
 
     try:
         with engine.connect() as conn:
@@ -572,14 +619,17 @@ def pipeline_health(
                 stale_hours = schedule_info[1] if schedule_info else 168  # default 7 days
 
                 # Determine status and freshness
+                last_pull_utc = None
                 if last_pull is None:
                     status = "broken"
                     freshness = "red"
                 else:
-
-                    age = datetime.now(timezone.utc) - last_pull.replace(
-                        tzinfo=timezone.utc
-                    ) if last_pull.tzinfo is None else datetime.now(timezone.utc) - last_pull
+                    last_pull_utc = (
+                        last_pull.replace(tzinfo=timezone.utc)
+                        if last_pull.tzinfo is None
+                        else last_pull
+                    )
+                    age = datetime.now(timezone.utc) - last_pull_utc
                     age_hours = age.total_seconds() / 3600
 
                     if age_hours <= stale_hours:
@@ -591,6 +641,30 @@ def pipeline_health(
                     else:
                         status = "broken"
                         freshness = "red"
+
+                # Contract record (store/availability_fields.py::FieldRecord).
+                # `last_pull` is the only real signal this query has: when
+                # it is None the source has never been pulled at all
+                # (unavailable / never_configured — not fetch_failed, which
+                # would claim we know an attempt was made and failed). When
+                # it exists, that pull timestamp is a genuine measurement
+                # even if it is old, so the field stays `available` and the
+                # degree of staleness is carried in `stale_reason`, not in
+                # `availability`. `rows_last_pull` counts rows written in
+                # the last 48h — a healthy source with rows=0 there is NOT
+                # relabelled empty_source; that would require knowing the
+                # most recent pull *attempt's own* row count, which this
+                # query does not carry (see report: not-measured).
+                if last_pull_utc is None:
+                    field_record = unavailable_field(STALE_NEVER_CONFIGURED, source_catalog=src_name)
+                else:
+                    field_record = measured_field(
+                        recent_rows,
+                        unit="rows",
+                        source_catalog=src_name,
+                        ingested_at=last_pull_utc,
+                        stale_reason=STALE_STALE if status in ("stale", "broken") else None,
+                    )
 
                 # Compute next_scheduled (approximate)
                 next_scheduled = None
@@ -620,6 +694,7 @@ def pipeline_health(
                     next_scheduled=next_scheduled,
                     freshness=freshness,
                     series_count=series_count,
+                    field_record=field_record.to_dict(),
                 ))
 
             # ── Coverage by family ─────────────────────────────────────
@@ -710,6 +785,12 @@ def pipeline_health(
 
     except Exception as exc:
         log.warning("Pipeline health query failed: {e}", e=str(exc))
+        # Previously this fell straight through to the summary below with
+        # `sources`/`coverage`/`recent_errors` all still at their empty
+        # initial values -> a 200 the PWA reads as "0 sources, 0 healthy"
+        # (PipelineHealth.jsx summary tiles), indistinguishable from a
+        # pipeline that genuinely has zero sources. Record *why* instead.
+        query_failed_reason = _classify_query_failure(exc)
 
     # ── Build summary ──────────────────────────────────────────────
     healthy = sum(1 for s in sources if s.status == "healthy")
@@ -728,6 +809,8 @@ def pipeline_health(
         coverage=coverage,
         recent_errors=recent_errors,
         resolver_status=resolver,
+        availability=FIELD_AVAILABILITY_UNAVAILABLE if query_failed_reason else FIELD_AVAILABILITY_AVAILABLE,
+        stale_reason=query_failed_reason,
     )
 
 
