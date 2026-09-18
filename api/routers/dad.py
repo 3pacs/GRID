@@ -405,6 +405,26 @@ def _parse_finviz_value(raw: str | None) -> float | str | None:
         return raw.strip()
 
 
+def _finviz_parsed_number(parsed: Any) -> float | None:
+    """Return a Finviz `parsed` payload value as a float, or None when it is not a number.
+
+    Rows written by `_store_finviz_snapshot` carry a real float; rows written by
+    `ingestion/altdata/finviz_scraper.py` historically carried `str(parsed)`, so a
+    numeric string must still count. Anything that does not coerce - "Technology",
+    "N/A", "" - is text, and text is not a measurement.
+    """
+    if parsed is None or isinstance(parsed, bool):
+        return None
+    if isinstance(parsed, (int, float)):
+        return float(parsed)
+    if isinstance(parsed, str):
+        try:
+            return float(parsed.strip())
+        except ValueError:
+            return None
+    return None
+
+
 def _as_utc(value: Any) -> datetime | None:
     if value is None:
         return None
@@ -651,13 +671,24 @@ def _read_finviz_rows(engine: Any, ticker: str) -> dict[str, Any]:
                 payload = {}
         payload = payload if isinstance(payload, dict) else {}
         pull_dt = _as_utc(pull_timestamp)
+        # A row whose payload records a non-numeric parse (Sector, Industry, an
+        # unparsable "N/A") is text. Historically those rows were written with a
+        # 0.0 placeholder in the NOT NULL `value` column and pull_status='SUCCESS'
+        # (B-M17). Those rows still exist; they are read as text here so the
+        # placeholder is never served or scored as a measurement. Nothing is
+        # rewritten in the database.
+        raw_parsed = payload.get("parsed")
+        parsed_number = _finviz_parsed_number(raw_parsed)
+        is_text = parsed_number is None and raw_parsed is not None
         fields[field] = {
             "field": field,
             "label": payload.get("label") or field.replace("_", " ").title(),
             "group": payload.get("group") or "other",
             "raw_value": payload.get("raw_value"),
-            "parsed": payload.get("parsed"),
-            "numeric_value": float(value) if value is not None else None,
+            "parsed": None if is_text else parsed_number,
+            "numeric_value": None if is_text else (float(value) if value is not None else None),
+            "value_kind": "text" if is_text else "numeric",
+            "text_value": raw_parsed if is_text else None,
             "obs_date": str(obs_date) if obs_date else None,
             "pull_timestamp": pull_dt.isoformat() if pull_dt else str(pull_timestamp),
         }
@@ -674,11 +705,20 @@ def _read_finviz_rows(engine: Any, ticker: str) -> dict[str, Any]:
     }
 
 
-def _store_finviz_snapshot(engine: Any, ticker: str, pairs: dict[str, str]) -> int:
+def _store_finviz_snapshot(engine: Any, ticker: str, pairs: dict[str, str]) -> dict[str, int]:
+    """Write the numeric Finviz fields into raw_series. Text fields get no row.
+
+    `raw_series.value` is `DOUBLE PRECISION NOT NULL`, so the table can only hold
+    numeric observations. Sector and Industry are always text, and a numeric field
+    can come back as "N/A" or other unparsable text. Those used to be coerced to
+    `0.0` and written with `pull_status='SUCCESS'` - a fabricated measurement that
+    accumulated in the durable series (B-M17). They are now skipped and counted.
+    """
     source_id = _ensure_finviz_source_id(engine)
     today = date.today()
     now = datetime.now(timezone.utc)
     inserted = 0
+    skipped_text = 0
 
     with engine.begin() as conn:
         for finviz_label, (field_id, display_label, group) in FINVIZ_FIELD_MAP.items():
@@ -687,7 +727,16 @@ def _store_finviz_snapshot(engine: Any, ticker: str, pairs: dict[str, str]) -> i
             if raw_value is None or parsed is None:
                 continue
 
-            numeric_value = parsed if isinstance(parsed, (int, float)) else 0.0
+            if isinstance(parsed, bool) or not isinstance(parsed, (int, float)):
+                # Not a number: no numeric observation exists, so no row is written.
+                skipped_text += 1
+                log.debug(
+                    "Finviz {t}: {f} is not numeric ({v!r}); no raw_series row written",
+                    t=ticker, f=field_id, v=parsed,
+                )
+                continue
+
+            numeric_value = float(parsed)
             payload = {
                 "ticker": ticker,
                 "field": field_id,
@@ -728,7 +777,7 @@ def _store_finviz_snapshot(engine: Any, ticker: str, pairs: dict[str, str]) -> i
             {"source_id": source_id},
         )
 
-    return inserted
+    return {"rows_inserted": inserted, "skipped_text_fields": skipped_text}
 
 
 def _finviz_stat_cards(fields: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
@@ -750,6 +799,7 @@ def _finviz_stat_cards(fields: dict[str, dict[str, Any]]) -> list[dict[str, Any]
             "raw_value": item.get("raw_value"),
             "parsed": item.get("parsed"),
             "numeric_value": item.get("numeric_value"),
+            "value_kind": item.get("value_kind", "numeric"),
         })
     return cards
 
@@ -763,11 +813,12 @@ def _get_finviz_profile(engine: Any, ticker: str, *, refresh: bool = False) -> d
     if refresh and freshness["state"] in {"missing", "aging", "stale"}:
         try:
             pairs = _fetch_finviz_snapshot(ticker)
-            inserted = _store_finviz_snapshot(engine, ticker, pairs)
+            write_summary = _store_finviz_snapshot(engine, ticker, pairs)
             scraped = True
             stored = _read_finviz_rows(engine, ticker)
             freshness = _freshness_state(stored.get("latest_pull"), stale_hours=24)
-            stored["rows_inserted"] = inserted
+            stored["rows_inserted"] = write_summary["rows_inserted"]
+            stored["skipped_text_fields"] = write_summary["skipped_text_fields"]
         except Exception as exc:
             scrape_error = str(exc)
             log.debug("Finviz live scrape failed for {t}: {e}", t=ticker, e=scrape_error)
@@ -785,6 +836,7 @@ def _get_finviz_profile(engine: Any, ticker: str, *, refresh: bool = False) -> d
         "latest_obs_date": str(stored.get("latest_obs_date")) if stored.get("latest_obs_date") else None,
         "field_count": stored.get("field_count", 0),
         "rows_inserted": stored.get("rows_inserted", 0),
+        "skipped_text_fields": stored.get("skipped_text_fields", 0),
         "live_refresh_requested": refresh,
         "refresh_available": True,
         "stats": _finviz_stat_cards(fields),
@@ -1269,14 +1321,28 @@ def _latest_signal_context(engine: Any, ticker: str) -> dict[str, Any]:
 
 
 def _num_field(finviz: dict[str, Any], field_id: str) -> float | None:
+    """The numeric reading for a Finviz field, or None when there is not one.
+
+    A field that did not parse to a number has no reading. It used to fall through
+    to `numeric_value`, which for a legacy row is the fabricated `0.0` placeholder -
+    so an unparsable Debt/Eq scored the `finviz_debt_equity_0_to_1` award (B-M17).
+    Absence is returned as None and the caller skips the term.
+    """
     item = finviz.get("fields", {}).get(field_id)
     if not item:
         return None
-    value = item.get("parsed")
-    if isinstance(value, (int, float)):
-        return float(value)
+    if item.get("value_kind") == "text":
+        return None
+    parsed = item.get("parsed")
+    number = _finviz_parsed_number(parsed)
+    if number is not None:
+        return number
+    if parsed is not None:
+        return None
     numeric = item.get("numeric_value")
-    return float(numeric) if isinstance(numeric, (int, float)) else None
+    if isinstance(numeric, bool) or not isinstance(numeric, (int, float)):
+        return None
+    return float(numeric)
 
 
 # Every term below is a hand-picked point award chosen by hand, never fitted or scored
@@ -1386,6 +1452,16 @@ def _grid_decision_stack(
     debt_eq = _num_field(finviz, "debt_equity")
     margin = _num_field(finviz, "profit_margin") or _num_field(finviz, "operating_margin")
     eps_5y = _num_field(finviz, "eps_next_5y")
+    # A field with no numeric reading awards nothing, and says so, rather than
+    # scoring a placeholder zero (B-M17).
+    finviz_inputs: dict[str, float | None] = {
+        "forward_pe": forward_pe,
+        "roe": roe,
+        "debt_equity": debt_eq,
+        "profit_margin": margin,
+        "eps_next_5y": eps_5y,
+    }
+    skipped_finviz = sorted(name for name, val in finviz_inputs.items() if val is None)
     if finviz.get("status") in {"ready", "stale"}:
         if forward_pe and 0 < forward_pe <= 35:
             finviz_points += w["finviz_pe_reviewable_0_to_35"]
@@ -1415,6 +1491,8 @@ def _grid_decision_stack(
         "state": "strong" if finviz_points >= 12 else "watch" if finviz_points > 0 else "missing" if finviz.get("status") == "unavailable" else "caution",
         "points": round(finviz_points, 1),
         "detail": f"{finviz.get('field_count', 0)} fields, {finviz.get('freshness', {}).get('label', 'unknown')}",
+        "inputs": dict(finviz_inputs),
+        "skipped_fields": skipped_finviz,
     })
 
     options_points = 0.0
@@ -1490,6 +1568,7 @@ def _grid_decision_stack(
         "heuristic_score": score,
         "weights": dict(w),
         "score_basis": "hand_picked_point_awards",
+        "skipped_terms": {"finviz": skipped_finviz},
         "cards": cards,
         "reasons": reasons[:5],
         "blockers": blockers[:6],

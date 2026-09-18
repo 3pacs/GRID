@@ -88,6 +88,22 @@ const UNSCORED = {
     },
 };
 
+// B-M17: a Finviz field that did not parse to a number now arrives as
+// `parsed: null` / `numeric_value: null` instead of a fabricated 0.0. The panel
+// must show the scraped text, never a zero.
+const UNPARSABLE_FINVIZ = {
+    ...SCORED,
+    finviz: {
+        status: 'ready',
+        field_count: 2,
+        freshness: { state: 'fresh', label: 'fresh' },
+        stats: [
+            { id: 'debt_equity', label: 'Debt/Eq', group: 'risk', raw_value: 'N/A', parsed: null, numeric_value: null, value_kind: 'text' },
+            { id: 'roe', label: 'ROE', group: 'quality', raw_value: '0.00%', parsed: 0, numeric_value: 0, value_kind: 'numeric' },
+        ],
+    },
+};
+
 describe('TickerLookup conviction gauges', () => {
     afterEach(() => {
         cleanup();
@@ -122,5 +138,19 @@ describe('TickerLookup conviction gauges', () => {
         expect(text).toMatch(/No workbook rows, so no score/);
         // A missing score must never be rendered as a zero.
         expect(container.querySelectorAll('.tl-no-score').length).toBe(2);
+    });
+
+    it('renders an unparsable Finviz field as its text, never as a zero', async () => {
+        getDadTickerGold.mockResolvedValue(UNPARSABLE_FINVIZ);
+        const { default: TickerLookup } = await import('../views/TickerLookup.jsx');
+        const { container } = render(<TickerLookup />);
+
+        await waitFor(() => expect(container.querySelector('.tl-finviz-grid')).not.toBeNull());
+        const grid = container.querySelector('.tl-finviz-grid');
+        // Debt/Eq did not parse: the scraped cell shows, and no fabricated 0 does.
+        expect(grid.textContent).toContain('Debt/EqN/A');
+        expect(grid.textContent).not.toMatch(/Debt\/Eq0/);
+        // A measured zero is still a number and still renders.
+        expect(grid.textContent).toContain('ROE0.00%');
     });
 });
