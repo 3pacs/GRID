@@ -2347,7 +2347,7 @@ function render() {
             <div class="panel hero-panel oracle-hero-panel">
                 <div class="split-header">
                     <h2>Guru</h2>
-                    <div class="subtle">${state.seer ? `${state.seer.confidence_band} / ${state.seer.horizon}` : 'Awaiting brief.'}</div>
+                    <div class="subtle">${state.seer ? `${state.seer.confidence_band || 'unrated'} / ${state.seer.horizon}` : 'Awaiting brief.'}</div>
                 </div>
                 ${state.seer ? `
                     <div class="seer-reading seer-reading-hero">${state.seer.reading}</div>
