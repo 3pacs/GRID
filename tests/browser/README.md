@@ -70,10 +70,11 @@ npm run dev
 
 Then open `http://localhost:5173/` in the one available browser.
 
-A `.claude/launch.json` entry named **`grid-pwa-fixtures`** runs step 2 for
-you (`npm run dev` in `pwa/`, proxy env vars already pointed at
-`127.0.0.1:8000`) — but it does **not** start the fixture server, so step 1
-must still be run manually first.
+Two `.claude/launch.json` entries cover both steps: **`grid-fixture-api`**
+runs step 1 (`python tests/browser/fixture_api/server.py --port 8000
+--scenario healthy`; edit the args to change scenario) and
+**`grid-pwa-fixtures`** runs step 2 (`npm run dev` in `pwa/`, proxy env vars
+already pointed at `127.0.0.1:8000`). Start `grid-fixture-api` first.
 
 To switch scenarios, stop the fixture server (Ctrl-C) and restart it with
 `--scenario partial` or `--scenario empty`; the PWA dev server does not need

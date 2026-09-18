@@ -2,9 +2,25 @@
   "version": "0.0.1",
   "configurations": [
     {
+      "name": "grid-fixture-api",
+      "runtimeExecutable": "python",
+      "runtimeArgs": [
+        "tests/browser/fixture_api/server.py",
+        "--port",
+        "8000",
+        "--scenario",
+        "healthy"
+      ],
+      "port": 8000,
+      "url": "http://localhost:8000"
+    },
+    {
       "name": "grid-pwa-fixtures",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev"],
+      "runtimeArgs": [
+        "run",
+        "dev"
+      ],
       "cwd": "pwa",
       "port": 5173,
       "env": {
