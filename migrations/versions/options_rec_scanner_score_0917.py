@@ -1,7 +1,7 @@
 """Record the scanner score behind every options recommendation.
 
 Revision ID: options_rec_scanner_score_0917
-Revises: snapshot_actor_col_20260914
+Revises: actors_provenance_20260917 (re-parented 2026-09-18: this PR is stacked on #542; chain #540 -> #542 -> #539 stays linear, no merge revision)
 Create Date: 2026-09-17
 
 Why this exists
@@ -37,7 +37,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "options_rec_scanner_score_0917"
-down_revision: str | Sequence[str] | None = "snapshot_actor_col_20260914"
+down_revision: str | Sequence[str] | None = "actors_provenance_20260917"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
