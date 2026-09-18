@@ -13,7 +13,6 @@ import { colors, shared } from '../styles/shared.js';
  */
 
 const NOT_BUILT_PILLARS = [
-    { key: 'sec_regsho_ftd', label: 'SEC Reg SHO — FTD', reason: 'adapter exists but is unscheduled/unverified live' },
     { key: 'buyback_blackouts', label: 'Corporate Buyback Blackouts', reason: 'no measured source' },
     { key: 'dealer_gex', label: 'Dealer Gamma Exposure', reason: 'engine correctness unproven' },
 ];
@@ -396,6 +395,61 @@ function FinraShortVolumeCard({ data, error }) {
     );
 }
 
+function SecFtdCard({ data, error }) {
+    const cardStyle = {
+        background: colors.card, border: `1px solid ${colors.border}`, borderRadius: 10, padding: 16, marginBottom: 16,
+    };
+
+    if (error) {
+        return <div style={cardStyle} data-testid="sec-ftd-card" data-state="error">
+            <div style={{ color: colors.text, fontWeight: 600, marginBottom: 8 }}>SEC Fails-to-Deliver</div>
+            <div style={{ color: colors.red }}>Failed to load: {error}</div>
+        </div>;
+    }
+    if (!data) {
+        return <div style={cardStyle} data-testid="sec-ftd-card" data-state="loading">
+            <div style={{ color: colors.text, fontWeight: 600 }}>SEC Fails-to-Deliver</div>
+            <div style={{ color: colors.textDim, marginTop: 8 }}>Loading…</div>
+        </div>;
+    }
+    if (data.available === false) {
+        return <div style={cardStyle} data-testid="sec-ftd-card" data-state="unavailable">
+            <UnavailablePanel label="SEC Fails-to-Deliver" payload={data} />
+        </div>;
+    }
+
+    const fields = data.fields || {};
+    const cusips = Object.keys(fields);
+
+    return (
+        <div style={cardStyle} data-testid="sec-ftd-card" data-state="available">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 4 }}>
+                <div style={{ color: colors.text, fontWeight: 600, fontSize: 16 }}>SEC Fails-to-Deliver</div>
+                <div style={{ fontSize: 11, color: colors.textMuted }}>as of {data.as_of}</div>
+            </div>
+            <div style={{ fontSize: 11, color: colors.yellow, marginBottom: 10 }} data-testid="not-a-timeline-note">
+                {data.note}
+            </div>
+            {cusips.length === 0 ? (
+                <div style={{ color: colors.textMuted, fontSize: 13 }}>no qualifying rows as of this date</div>
+            ) : (
+                cusips.map((cusip) => (
+                    <div key={cusip} style={{ marginBottom: 12 }}>
+                        <div style={{ fontSize: 13, color: colors.textDim, marginBottom: 4 }}>{cusip}</div>
+                        <FieldRow name="Outstanding balance (shares)" field={fields[cusip].failed_shares} />
+                        <FieldRow name="Closing price" field={fields[cusip].closing_price} />
+                        <FieldRow name="Balance value ($)" field={fields[cusip].total_failed_usd} />
+                        <FieldRow name="Observation age (days)" field={fields[cusip].observation_age_days} />
+                    </div>
+                ))
+            )}
+            <div style={{ fontSize: 10, color: colors.textDimAlt, marginTop: 8 }}>
+                generation {data.generation_id || '—'} published {fmtDateTime(data.generation_published_at)}
+            </div>
+        </div>
+    );
+}
+
 function NotBuiltCard({ label, reason }) {
     return (
         <div
@@ -430,6 +484,9 @@ export default function GodViewPillars() {
     const [finraData, setFinraData] = useState(null);
     const [finraError, setFinraError] = useState(null);
     const [finraLoading, setFinraLoading] = useState(true);
+    const [ftdData, setFtdData] = useState(null);
+    const [ftdError, setFtdError] = useState(null);
+    const [ftdLoading, setFtdLoading] = useState(true);
 
     useEffect(() => {
         let cancelled = false;
@@ -486,6 +543,18 @@ export default function GodViewPillars() {
         return () => { cancelled = true; };
     }, [asOf, includeInferred]);
 
+    useEffect(() => {
+        let cancelled = false;
+        setFtdLoading(true);
+        setFtdError(null);
+        const qs = `as_of=${encodeURIComponent(asOf)}&include_inferred=${includeInferred ? 'true' : 'false'}`;
+        api.get(`/api/v1/godview/pillars/sec_regsho_ftd?${qs}`)
+            .then((res) => { if (!cancelled) setFtdData(res); })
+            .catch((e) => { if (!cancelled) setFtdError(e.message || 'request failed'); })
+            .finally(() => { if (!cancelled) setFtdLoading(false); });
+        return () => { cancelled = true; };
+    }, [asOf, includeInferred]);
+
     return (
         <div style={{ padding: 20, maxWidth: 720 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 16, gap: 12, flexWrap: 'wrap' }}>
@@ -517,6 +586,7 @@ export default function GodViewPillars() {
             {fedLoading ? <FedLiquidityCard data={null} error={null} /> : <FedLiquidityCard data={fedData} error={fedError} />}
             {cmdtyLoading ? <CommodityWarehouseCard data={null} error={null} /> : <CommodityWarehouseCard data={cmdtyData} error={cmdtyError} />}
             {finraLoading ? <FinraShortVolumeCard data={null} error={null} /> : <FinraShortVolumeCard data={finraData} error={finraError} />}
+            {ftdLoading ? <SecFtdCard data={null} error={null} /> : <SecFtdCard data={ftdData} error={ftdError} />}
 
             {NOT_BUILT_PILLARS.map((p) => (
                 <NotBuiltCard key={p.key} label={p.label} reason={p.reason} />

@@ -24,7 +24,7 @@ function deferred() {
  * commodity_warehouses). Route the mock by path so a test about one pillar
  * doesn't leak its response into the other two cards' assertions.
  */
-function mockPillars({ cftc, fed, cmdty, finra } = {}) {
+function mockPillars({ cftc, fed, cmdty, finra, ftd } = {}) {
     api.get.mockImplementation((path) => {
         if (path.includes('/pillars/cftc')) return Promise.resolve(cftc ?? NEVER_CONFIGURED);
         if (path.includes('/pillars/fed_net_liquidity')) return Promise.resolve(fed ?? NEVER_CONFIGURED);
@@ -32,6 +32,7 @@ function mockPillars({ cftc, fed, cmdty, finra } = {}) {
             return Promise.resolve(cmdty ?? { lme: NEVER_CONFIGURED, cushing_crude_stocks: NEVER_CONFIGURED });
         }
         if (path.includes('/pillars/finra_short_volume')) return Promise.resolve(finra ?? NEVER_CONFIGURED);
+        if (path.includes('/pillars/sec_regsho_ftd')) return Promise.resolve(ftd ?? NEVER_CONFIGURED);
         return Promise.resolve(NEVER_CONFIGURED);
     });
 }
@@ -178,13 +179,12 @@ describe('GodViewPillars view', () => {
         expect(within(screen.getByTestId('cftc-pillar-card')).getByText(/network down/)).toBeInTheDocument();
     });
 
-    it('always renders the not-built-yet cards for the other three pillars, each with its own reason', async () => {
+    it('always renders the not-built-yet cards for the other two pillars, each with its own reason', async () => {
         mockPillars();
 
         render(<GodViewPillars />);
 
-        await waitFor(() => expect(screen.getAllByTestId('pillar-card-not-built').length).toBe(3));
-        expect(screen.getByText(/adapter exists but is unscheduled\/unverified live/)).toBeInTheDocument();
+        await waitFor(() => expect(screen.getAllByTestId('pillar-card-not-built').length).toBe(2));
         expect(screen.getByText(/no measured source/)).toBeInTheDocument();
         expect(screen.getByText(/engine correctness unproven/)).toBeInTheDocument();
     });
@@ -354,5 +354,37 @@ describe('GodViewPillars view', () => {
         expect(card.getByTestId('not-short-interest-note')).toHaveTextContent(/NOT short INTEREST/);
         expect(card.getByText('AAPL')).toBeInTheDocument();
         expect(card.getByText('0.6')).toBeInTheDocument();
+    });
+
+    it('renders the SEC FTD pillar with the not-a-timeline note and per-CUSIP fields', async () => {
+        mockPillars({
+            ftd: {
+                available: true,
+                status: 'ok',
+                pillar: 'sec_ftd',
+                as_of: '2026-09-15',
+                include_inferred: false,
+                note: "outstanding balance as of one settlement date; never summed across dates, no T+35 buy-in timeline, no squeeze score",
+                cusips_with_data: 1,
+                generation_id: 'gen-ftd-1',
+                generation_published_at: '2026-09-15T06:00:00+00:00',
+                fields: {
+                    Y4000A102: {
+                        failed_shares: { availability: 'available', provenance: 'measured', value: 373, unit: 'shares' },
+                        closing_price: { availability: 'available', provenance: 'measured', value: 16.99, unit: 'usd_per_share' },
+                        total_failed_usd: { availability: 'available', provenance: 'derived', value: 6337.27, unit: 'usd' },
+                        observation_age_days: { availability: 'available', provenance: 'derived', value: 29, unit: 'days' },
+                    },
+                },
+            },
+        });
+
+        render(<GodViewPillars />);
+
+        await waitFor(() => expect(screen.getByTestId('sec-ftd-card')).toHaveAttribute('data-state', 'available'));
+        const card = within(screen.getByTestId('sec-ftd-card'));
+        expect(card.getByTestId('not-a-timeline-note')).toHaveTextContent(/no T\+35 buy-in timeline/);
+        expect(card.getByText('Y4000A102')).toBeInTheDocument();
+        expect(card.getByText('373')).toBeInTheDocument();
     });
 });

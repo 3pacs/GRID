@@ -70,6 +70,13 @@ from godview.finra_short_volume_pillar import (
     PILLAR_NAME as FINRA_PILLAR_NAME,
     read_finra_short_volume_pillar,
 )
+from godview.sec_ftd_pillar import (
+    AGE_NOTE as FTD_AGE_NOTE,
+    NOT_A_TIMELINE_NOTE as FTD_NOT_A_TIMELINE_NOTE,
+    PILLAR_NAME as SEC_FTD_PILLAR_NAME,
+    compute_age_days as ftd_compute_age_days,
+    read_sec_ftd_pillar,
+)
 from store.availability import unavailable
 from store.availability_fields import (
     STALE_MATERIALIZER_FAILED,
@@ -88,7 +95,6 @@ router = APIRouter(prefix="/api/v1/godview", tags=["godview"])
 #: a catch-all) so a typo in the URL still reads as "not built" honestly,
 #: not a silent 404.
 _KNOWN_UNBUILT_PILLARS = {
-    "sec_regsho_ftd": "adapter exists but is unscheduled/unverified live",
     "buyback_blackouts": "no measured source",
     "dealer_gex": "engine correctness unproven",
 }
@@ -564,6 +570,92 @@ def get_finra_short_volume_pillar(
         "generation_id": result.generation_id,
         "generation_published_at": result.generation_published_at.isoformat() if result.generation_published_at else None,
         "fields": fields_by_ticker,
+    }
+
+
+def _ftd_field_records(row: dict[str, Any], as_of: date) -> dict[str, dict[str, Any]]:
+    basis = row.get("availability_basis")
+    basis_note = _availability_basis_note(basis)
+    common = {
+        "obs_date": row["settlement_date"],
+        "published_at": row["release_date"],
+        "available_at": row["available_at"],
+        "revision": row["generation_id"],
+        "source_catalog": "raw_series:sec_ftd",
+        "series_id": row["cusip"],
+    }
+    out: dict[str, dict[str, Any]] = {}
+    record = measured_field(row["failed_shares"], unit="shares", **common).to_dict()
+    record["availability_basis"] = basis
+    record["availability_basis_note"] = basis_note
+    out["failed_shares"] = record
+
+    price = row["closing_price"]
+    if price is None:
+        record = unavailable_field(STALE_PARTIAL_HISTORY, unit="usd_per_share", calculation_version="sec_ftd_pillar_v1", **common).to_dict()
+    else:
+        record = measured_field(price, unit="usd_per_share", **common).to_dict()
+    record["availability_basis"] = basis
+    record["availability_basis_note"] = basis_note
+    out["closing_price"] = record
+
+    total_usd = row["total_failed_usd"]
+    if total_usd is None:
+        record = unavailable_field(STALE_PARTIAL_HISTORY, unit="usd", calculation_version="sec_ftd_pillar_v1", **common).to_dict()
+    else:
+        record = derived_field(total_usd, unit="usd", calculation_version="sec_ftd_pillar_v1", **common).to_dict()
+    record["availability_basis"] = basis
+    record["availability_basis_note"] = basis_note
+    out["total_failed_usd"] = record
+
+    age_days = ftd_compute_age_days(row["settlement_date"], as_of)
+    record = derived_field(age_days, unit="days", calculation_version="sec_ftd_pillar_v1", **common).to_dict()
+    record["availability_basis"] = basis
+    record["availability_basis_note"] = basis_note
+    record["note"] = FTD_AGE_NOTE
+    out["observation_age_days"] = record
+    return out
+
+
+@router.get("/pillars/sec_regsho_ftd")
+def get_sec_ftd_pillar(
+    as_of: Annotated[date | None, Query()] = None,
+    include_inferred: Annotated[bool, Query()] = False,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """SEC Fails-to-Deliver outstanding-balance pillar. NO T+35 timeline, NO squeeze
+    score -- see FTD_NOT_A_TIMELINE_NOTE and godview/sec_ftd_pillar.py's docstring."""
+    as_of = as_of or date.today()
+    engine = get_db_engine()
+
+    try:
+        with engine.connect() as conn:
+            if not _table_exists(conn, "sec_regsho_ftd_cns") or not _table_exists(conn, "godview_generations"):
+                return unavailable(
+                    "sec_regsho_ftd_cns or godview_generations does not exist yet",
+                    source=SEC_FTD_PILLAR_NAME, pillar=SEC_FTD_PILLAR_NAME, coverage=None,
+                )
+            result = read_sec_ftd_pillar(conn, as_of, include_inferred=include_inferred)
+    except Exception as exc:  # noqa: BLE001
+        return unavailable(f"godview read failed: {exc}", source=SEC_FTD_PILLAR_NAME, pillar=SEC_FTD_PILLAR_NAME, coverage=None)
+
+    if result.state == "never_configured":
+        return unavailable(STALE_NEVER_CONFIGURED, source=SEC_FTD_PILLAR_NAME, pillar=SEC_FTD_PILLAR_NAME, coverage=None)
+    if result.state == "materializer_failed":
+        return unavailable(STALE_MATERIALIZER_FAILED, source=SEC_FTD_PILLAR_NAME, pillar=SEC_FTD_PILLAR_NAME, coverage=None)
+
+    fields_by_cusip = {row["cusip"]: _ftd_field_records(row, as_of) for row in result.rows}
+    return {
+        "available": True,
+        "status": "ok" if fields_by_cusip else "partial",
+        "pillar": SEC_FTD_PILLAR_NAME,
+        "as_of": as_of.isoformat(),
+        "include_inferred": include_inferred,
+        "note": FTD_NOT_A_TIMELINE_NOTE,
+        "cusips_with_data": result.cusips_with_data,
+        "generation_id": result.generation_id,
+        "generation_published_at": result.generation_published_at.isoformat() if result.generation_published_at else None,
+        "fields": fields_by_cusip,
     }
 
 

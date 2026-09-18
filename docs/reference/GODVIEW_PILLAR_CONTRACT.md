@@ -344,6 +344,57 @@ offers, how many produced a valid ratio row" — there is no curated
 watchlist to define a target universe against, because no scheduled pull
 has ever populated one.
 
+## 14. SEC Fails-to-Deliver (FTD) pillar
+
+`godview/sec_ftd_pillar.py`. Consumes (read-only) `raw_series` under
+`sec:ftd_balance:<cusip>`, written by `ingestion/altdata/sec_ftd.py` on
+`origin/fable/sources-finra-ftd-20260918` (commit `40a9f1ae`, not merged
+into this branch; read via `git show`).
+
+**Each row is an outstanding balance as of one settlement date — never
+summed across dates, no T+35 buy-in timeline, no squeeze score.** Per the
+SEC's own page (https://www.sec.gov/data-research/sec-markets-data/fails-deliver-data):
+
+> "The values of total fails-to-deliver shares represent the aggregate net
+> balance of shares that failed to be delivered as of a particular
+> settlement date."
+
+> "Fails-to-deliver can occur for a number of reasons on both long and
+> short sales. Therefore, fails-to-deliver are not necessarily the result
+> of short selling, and are not evidence of abusive short selling or
+> 'naked' short selling."
+
+`mandatory_buyin_date`/`days_remaining`/`squeeze_risk_score` (already
+columns on the tracked `sec_regsho_ftd_cns` table) stay permanently NULL.
+
+**"Age"** means `as_of - settlement_date` — how stale the observation is,
+computed at read time, never persisted. Explicitly NOT an attempt to
+determine the age of the underlying fails: the same SEC page states "the
+age of fails cannot be determined by looking at these numbers."
+
+**Display symbol:** no CUSIP→ticker mapping table exists in `schema.sql`
+(grepped 2026-09-18) — but `sec_ftd.py`'s own `raw_payload` already
+carries the FTD file's self-reported `symbol` per row. This pillar uses
+that (measured, same source) when present; when a row's payload lacks a
+usable symbol, it exposes the CUSIP itself and labels the row
+`ticker_source=cusip_fallback` rather than guessing.
+
+`closing_price` (measured, from the FTD file's own PRICE field) and
+`total_failed_usd` (derived = `failed_shares * closing_price`, same
+settlement date only) are populated when a price is present; `None`
+otherwise.
+
+**Release schedule** — quoted 2026-09-18 from the same SEC page:
+
+> "The first half of a given month is available at the end of the month.
+> The second half of a given month is available at about the 15th of the
+> next month."
+
+`release_date` is therefore INFERRED from this half-month rule (there is
+no published release calendar to observe directly); `availability_basis`
+uses a wider tolerance (10 days, vs. 3 elsewhere) reflecting the SEC's own
+approximate language ("about the 15th").
+
 ## Status of all seven God View pillars (2026-09-18)
 
 | pillar | status | why |
@@ -353,7 +404,7 @@ has ever populated one.
 | Commodity warehouses (LME leg) | **built** | LME cancelled-warrant ratio, reused from the existing puller |
 | Commodity warehouses (Cushing leg) | **permanently unavailable** | `never_configured` — no real Cushing series id exists in this codebase; will not silently substitute a near-miss |
 | FINRA short volume | **built** | full slice; realistically `unavailable(never_configured)` in production until the puller is scheduled (deployment decision, not a code gap) |
-| SEC Reg SHO FTD | not built | adapter exists but is unscheduled/unverified live |
+| SEC Reg SHO FTD | **built** | full slice; outstanding balance only, no timeline/squeeze score; realistically `unavailable(never_configured)` until the puller is scheduled |
 | Corporate buyback blackouts | not built | no measured source |
 | Dealer GEX | not built | engine correctness unproven |
 
