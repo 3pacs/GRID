@@ -618,9 +618,9 @@ class OracleEngine:
                     prediction_type TEXT NOT NULL,
                     direction TEXT NOT NULL,
                     target_price DOUBLE PRECISION,
-                    entry_price DOUBLE PRECISION NOT NULL,
+                    entry_price DOUBLE PRECISION,
                     expiry DATE NOT NULL,
-                    confidence DOUBLE PRECISION NOT NULL,
+                    confidence DOUBLE PRECISION,
                     expected_move_pct DOUBLE PRECISION,
                     signal_strength DOUBLE PRECISION,
                     coherence DOUBLE PRECISION,
@@ -642,6 +642,22 @@ class OracleEngine:
             conn.execute(text("""
                 ALTER TABLE oracle_predictions
                 ADD COLUMN IF NOT EXISTS dedup_keep BOOLEAN NOT NULL DEFAULT TRUE
+            """))
+            # D-H11 / D-M32: `confidence` and `entry_price` are NULL when
+            # nothing measured them. Both writers already bind None
+            # (`_store_predictions` for a ticker with no spot, `oracle/publish.py`
+            # for an unsupplied confidence), so the original NOT NULL on these
+            # two columns is a constraint no writer honours. Dropped here
+            # rather than in alembic: `oracle_predictions` has no alembic
+            # revision at all -- this bootstrap is the table's only DDL source,
+            # and DROP NOT NULL is idempotent.
+            conn.execute(text("""
+                ALTER TABLE oracle_predictions
+                ALTER COLUMN entry_price DROP NOT NULL
+            """))
+            conn.execute(text("""
+                ALTER TABLE oracle_predictions
+                ALTER COLUMN confidence DROP NOT NULL
             """))
             conn.execute(text("""
                 ALTER TABLE oracle_predictions
