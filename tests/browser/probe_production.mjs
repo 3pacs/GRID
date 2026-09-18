@@ -73,6 +73,10 @@
  * A contributor account is OPTIONAL — pass --contributor-username (and set
  * its password env var) only if a second, lower-privilege account exists to
  * probe with; the admin-only journeys and DIRECT_ENDPOINTS always run.
+ *
+ * `home` is OPTED OUT of the default batch-1 journey set — see
+ * OPT_IN_JOURNEYS below and PRODUCTION-PROBE-RUNBOOK.md. Pass
+ * `--journeys home` (comma-separated for more than one) to include it.
  */
 
 import { mkdirSync, writeFileSync, appendFileSync, existsSync } from 'node:fs';
@@ -93,6 +97,7 @@ function parseArgs(argv) {
         'contributor-password-env': null,
         ticker: null,
         out: null,
+        journeys: null,
     };
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
@@ -149,6 +154,19 @@ if (LOOKS_LOCAL) {
         'Use tests/browser/run_evidence.mjs for local/dev harness runs instead.');
 }
 const ORIGIN_STR = ORIGIN.origin;
+
+// ── Opt-in journeys — excluded from the default batch-1 set unless named ──
+// `home` triggers a GET /api/v1/alerts on load, which runs an idempotent
+// `CREATE TABLE IF NOT EXISTS sd_price_alerts` on the server
+// (api/routers/price_alerts.py:55-57) — never a write to existing data, and
+// this probe never issues the Home compose POST either way (the request
+// guard below aborts every non-GET except the one login POST). Still, the
+// batch-1 acceptance set stays DDL-free by default: `home` only runs when
+// explicitly named with `--journeys home` (comma-separated for more than one).
+const OPT_IN_JOURNEYS = new Set(['home']);
+const REQUESTED_JOURNEYS = new Set(
+    (args.journeys || '').split(',').map((s) => s.trim()).filter(Boolean)
+);
 
 console.log(`Release approval acknowledged for SHA ${RELEASE_SHA}. Target origin: ${ORIGIN_STR}`);
 console.log('This is a READ-ONLY probe (one login POST, everything else GET). Proceeding.');
@@ -214,6 +232,10 @@ function resolveBrowserExecutable() {
 // `ticker` is a placeholder the operator must supply for a real deployment
 // (production has no "TEST1"); journeys that need one are skipped with a
 // recorded reason if --ticker was not passed.
+//
+// `home` is in OPT_IN_JOURNEYS (defined above, near ORIGIN_STR) and is
+// filtered back out below unless named via --journeys — see that comment
+// for why, and PRODUCTION-PROBE-RUNBOOK.md for the operator-facing version.
 
 function journeysFor(ticker) {
     const tickerJourneys = ticker
@@ -225,7 +247,7 @@ function journeysFor(ticker) {
             { name: 'ticker-lookup', hash: '#/ticker-lookup', skipped_reason: 'no --ticker given', roles: ['admin', 'contributor'] },
             { name: 'watchlist-analysis', hash: null, skipped_reason: 'no --ticker given', roles: ['admin'] },
         ];
-    return [
+    const all = [
         // (a) home / market overview
         { name: 'home', hash: '#/home', roles: ['admin', 'contributor'] },
         // (b) ticker investigation
@@ -237,9 +259,11 @@ function journeysFor(ticker) {
         { name: 'pipeline-health', hash: '#/pipeline-health', roles: ['admin'] },
         // (e) data health
         { name: 'operator', hash: '#/operator', roles: ['admin'] },
+        { name: 'snapshots', hash: '#/snapshots', roles: ['admin'] },
         // Dad-mode-reachable journey, run under contributor too when available
         { name: 'ten-year', hash: '#/ten-year', roles: ['admin', 'contributor'] },
     ];
+    return all.filter((j) => !OPT_IN_JOURNEYS.has(j.name) || REQUESTED_JOURNEYS.has(j.name));
 }
 
 // Raw endpoint GETs named explicitly by the lead — recorded regardless of
@@ -252,6 +276,8 @@ const DIRECT_ENDPOINTS = [
     { path: '/api/v1/regime/current' },
     { path: '/api/v1/watchlist/' },
     { path: '/api/v1/ten-year-portfolio/weekly' },
+    { path: '/api/v1/snapshots/latest/pipeline_summary' },
+    { path: '/api/v1/snapshots/history/pipeline_summary' },
 ];
 
 // ── Rate limiter + non-GET guard, installed on every page ──────────────

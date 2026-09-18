@@ -37,6 +37,7 @@ data ages shown?). The script does not and cannot fill them in itself.
 | Rate limited | `makeApiRateGate(1000)` — a single shared token-bucket gate serializes all requests to the origin's `/api/` paths to at most one per second, across every page and every journey in the run. Static assets are not throttled (throttling images/CSS would make the page load take forever for no safety benefit). |
 | No crawling | Only `journeysFor()` (hash routes) and `DIRECT_ENDPOINTS` (raw GETs) are ever requested — both are fixed, hard-coded lists in the script. There is no link-following, no sitemap walk, no recursive discovery. |
 | Secrets redacted before they touch disk | Every JSON response body is passed through `redact()` before being written to `network.jsonl` or `direct_endpoints.json`: any key matching `/token|password|secret/i`, anywhere in the (possibly nested) object, becomes the literal string `"[REDACTED]"`. The `Authorization` header itself is never logged. |
+| `home` opted out of the default batch-1 set | See "Journeys covered" below. The probe never issues the Home compose POST (`installRequestGuard` aborts every non-GET except the one login POST, full stop — `home` gets no special case). `home`'s own on-load `GET /api/v1/alerts` runs an idempotent `CREATE TABLE IF NOT EXISTS sd_price_alerts` server-side (`api/routers/price_alerts.py:55-57`) — never a write to existing rows, and safe to re-run — but the batch-1 acceptance set stays DDL-free by default regardless; `home` only runs when explicitly named with `--journeys home`. |
 
 ## Prerequisites
 
@@ -63,6 +64,32 @@ data ages shown?). The script does not and cannot fill them in itself.
    Omitting it is allowed; those two journeys are recorded as skipped with
    a reason instead of guessed at.
 
+## Journeys covered
+
+The default batch-1 acceptance set (`--journeys` not passed):
+
+| Journey | Hash route | Roles |
+|---|---|---|
+| ticker-lookup | `#/ticker-lookup?ticker=<ticker>` | admin, contributor |
+| watchlist-analysis | `#/watchlist/<ticker>` | admin |
+| portfolio | `#/portfolio` | admin |
+| discovery | `#/discovery` | admin |
+| pipeline-health | `#/pipeline-health` | admin |
+| operator | `#/operator` | admin |
+| snapshots | `#/snapshots` | admin |
+| ten-year | `#/ten-year` | admin, contributor |
+
+`home` (`#/home`, admin + contributor) is **excluded from the default set** —
+it is opt-in only, via `--journeys home` (comma-separated if naming more than
+one opt-in journey). See the "`home` opted out" row in the safety-properties
+table above for why: it is not about the request guard or the rate limit —
+`home`'s own on-load `GET /api/v1/alerts` runs an idempotent
+`CREATE TABLE IF NOT EXISTS sd_price_alerts` server-side
+(`api/routers/price_alerts.py:55-57`), and this probe never issues the Home
+compose POST regardless (no journey gets a special case in the guard — see
+`installRequestGuard`). The batch-1 acceptance set simply stays DDL-free by
+default; run `--journeys home` deliberately if you want `home` covered too.
+
 ## Running it
 
 ```bash
@@ -79,6 +106,19 @@ node probe_production.mjs \
   --origin https://grid.stepdad.finance \
   --username operator \
   --ticker AAPL
+```
+
+This runs the default batch-1 acceptance set — see "Journeys covered" above.
+`home` is skipped unless you deliberately add `--journeys home` (or
+`--journeys home,<other-opt-in-journey>` — there are none yet beyond `home`):
+
+```bash
+node probe_production.mjs \
+  --i-have-release-approval <the-approved-release-sha> \
+  --origin https://grid.stepdad.finance \
+  --username operator \
+  --ticker AAPL \
+  --journeys home
 ```
 
 With an optional contributor account:
@@ -103,21 +143,23 @@ it refuses rather than hang.
 tests/browser/evidence/production/<release-sha>/run-<UTC-timestamp>/
   PROBE_SUMMARY.json          # origin, release SHA, per-role summary refs, proves/does-not-prove
   blocked_requests.jsonl      # any request the guard aborted (should normally be empty)
-  direct_endpoints.json       # status/timing/redacted-body for the 7 fixed endpoints
+  direct_endpoints.json       # status/timing/redacted-body for the 9 fixed endpoints
   admin/
     console.jsonl             # console errors/warnings
     network.jsonl             # every /api/ response: method, url, status, redacted body
     summary.json              # per-journey {crashed, operator_checklist:{...}}
-    home.png / home.mobile.png / home.text.txt
     ticker-lookup.png / ...
     watchlist-analysis.png / ...
     portfolio.png / ...
     discovery.png / ...
     pipeline-health.png / ...
     operator.png / ...
+    snapshots.png / snapshots.mobile.png / snapshots.text.txt
     ten-year.png / ...
+    home.png / ...            # only present when run with --journeys home
   contributor/                 # only if --contributor-username was given
-    ... same file shapes, fewer journeys (home, ticker-lookup, ten-year)
+    ... same file shapes, fewer journeys (ticker-lookup, ten-year, plus
+    home.* only when run with --journeys home)
 ```
 
 Every screenshot is full-page, captured twice per journey: 1280×900
