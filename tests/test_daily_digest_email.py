@@ -240,3 +240,175 @@ def test_dry_run_preview_includes_rendered_body_not_just_titles(monkeypatch) -> 
 
     assert "section_bodies" in result
     assert all("body" in s for s in result["section_bodies"])
+
+
+# ---------------------------------------------------------------------------
+# 100x confidence must survive into the rendered alert (not just is_100x)
+# ---------------------------------------------------------------------------
+
+def _hundredx_result(monkeypatch, row_tuple):
+    routes = dict(_QUIET_ROUTES)
+    routes["options_mispricing_scans"] = _FakeResult(many=[row_tuple])
+    _patch_engine(monkeypatch, routes=routes)
+    return email_mod.daily_digest(dry_run=True)
+
+
+def test_low_confidence_100x_row_is_visually_flagged(monkeypatch) -> None:
+    """is_100x=TRUE alone doesn't mean the row is trustworthy — the scanner
+    stores its own LOW/MEDIUM/HIGH confidence alongside the score, and a
+    LOW-confidence flagged row must not render with the same purple,
+    unqualified "100x Opportunity" treatment as a HIGH-confidence one.
+    """
+    result = _hundredx_result(
+        monkeypatch, ("XYZ", "CALL", 9.1, 150.0, "thin-chain dislocation", "LOW"),
+    )
+
+    body = next(s for s in result["section_bodies"] if s["title"] == "100x Opportunity — XYZ")
+    assert body["accent"] == "amber"
+    assert "LOW CONFIDENCE" in body["body"]
+
+
+def test_high_confidence_100x_row_renders_plainly(monkeypatch) -> None:
+    result = _hundredx_result(
+        monkeypatch, ("XYZ", "CALL", 9.1, 150.0, "thin-chain dislocation", "HIGH"),
+    )
+
+    body = next(s for s in result["section_bodies"] if s["title"] == "100x Opportunity — XYZ")
+    assert body["accent"] == "purple"
+    assert "LOW CONFIDENCE" not in body["body"]
+
+
+def test_medium_confidence_100x_row_renders_plainly(monkeypatch) -> None:
+    result = _hundredx_result(
+        monkeypatch, ("XYZ", "CALL", 9.1, 150.0, "thin-chain dislocation", "MEDIUM"),
+    )
+
+    body = next(s for s in result["section_bodies"] if s["title"] == "100x Opportunity — XYZ")
+    assert body["accent"] == "purple"
+    assert "LOW CONFIDENCE" not in body["body"]
+
+
+def test_missing_confidence_100x_row_fails_toward_flagged(monkeypatch) -> None:
+    """A row with no recognizable confidence label (NULL, empty, or a value
+    this code doesn't know about) must default to the cautious rendering,
+    not the confident-looking one — same fail-closed posture as the regime
+    section's handling of a missing/unverifiable timestamp.
+    """
+    result = _hundredx_result(
+        monkeypatch, ("XYZ", "CALL", 9.1, 150.0, "thin-chain dislocation", None),
+    )
+
+    body = next(s for s in result["section_bodies"] if s["title"] == "100x Opportunity — XYZ")
+    assert body["accent"] == "amber"
+    assert "LOW CONFIDENCE" in body["body"]
+
+
+def test_alert_on_100x_opportunity_defaults_to_low_confidence_rendering(monkeypatch) -> None:
+    """The standalone alert function (called directly by
+    scripts/run_full_pipeline.py, not through daily_digest) must apply the
+    same fail-closed default when its caller doesn't pass a confidence.
+    """
+    captured: dict = {}
+    monkeypatch.setattr(
+        email_mod, "_send",
+        lambda subject, sections, footer_note="": captured.update(
+            subject=subject, sections=sections,
+        ),
+    )
+
+    email_mod.alert_on_100x_opportunity("XYZ", 9.1, "CALL", "thesis text")
+
+    assert captured["sections"][0]["accent"] == "amber"
+    assert "LOW CONFIDENCE" in captured["sections"][0]["body"]
+
+    captured.clear()
+    email_mod.alert_on_100x_opportunity("XYZ", 9.1, "CALL", "thesis text", confidence="HIGH")
+
+    assert captured["sections"][0]["accent"] == "purple"
+    assert "LOW CONFIDENCE" not in captured["sections"][0]["body"]
+
+
+# ---------------------------------------------------------------------------
+# Data freshness must not count a source as "active" off a FAILED-only pull
+# ---------------------------------------------------------------------------
+
+def test_data_freshness_query_filters_to_successful_pulls(monkeypatch) -> None:
+    """raw_series gets a row on a FAILED pull too (value=0, a real
+    pull_timestamp) — counting every row regardless of pull_status would
+    report a source as "active" off pulls that never produced an actual
+    observation. Assert the real SQL text sent to the database, not just
+    the returned count, so a future edit that quietly drops the filter
+    (while keeping some other row shape that happens to satisfy the fake)
+    is still caught.
+    """
+    captured_sql: list[str] = []
+
+    class _CapturingConn(_FakeConn):
+        def execute(self, clause, *args, **kwargs):
+            captured_sql.append(str(clause))
+            return super().execute(clause, *args, **kwargs)
+
+    routes = dict(_QUIET_ROUTES)
+    monkeypatch.setattr(
+        "db.get_engine",
+        lambda: type("E", (), {"connect": lambda self: _CapturingConn(routes)})(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "intelligence.long_plays.load_latest_board", lambda engine: None, raising=False,
+    )
+
+    email_mod.daily_digest(dry_run=True)
+
+    freshness_sql = [s for s in captured_sql if "raw_series" in s and "COUNT(DISTINCT source_id)" in s]
+    assert freshness_sql, "expected the data-freshness query to run"
+    assert "pull_status" in freshness_sql[0]
+    assert "SUCCESS" in freshness_sql[0]
+
+
+def test_data_freshness_ignores_a_failed_only_source(monkeypatch) -> None:
+    """Behavioral counterpart to the SQL-text check above: a fake DB that
+    actually honors the pull_status filter (unlike the substring-routed
+    _FakeConn, which can't) should report zero active sources when the
+    only row in the window is a FAILED one — proving the fix changes real
+    query results, not just query text.
+    """
+    class _StatusAwareConn:
+        """Minimal stand-in that evaluates the one predicate this test cares
+        about instead of ignoring pull_status like the shared _FakeConn.
+        """
+        def __init__(self, only_row_status: str):
+            self._status = only_row_status
+
+        def execute(self, clause, *_args, **_kwargs):
+            sql = str(clause)
+            if "raw_series" in sql and "COUNT(DISTINCT source_id)" in sql:
+                if "pull_status = 'SUCCESS'" in sql and self._status != "SUCCESS":
+                    return _FakeResult(one=(0, None))
+                return _FakeResult(one=(1, datetime.now(timezone.utc)))
+            if "inferred_state" in sql:
+                return _FakeResult(one=None)
+            if "COUNT(*)" in sql:
+                return _FakeResult(one=(0,))
+            if "options_mispricing_scans" in sql:
+                return _FakeResult(many=[])
+            return _FakeResult(one=None, many=[])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    monkeypatch.setattr(
+        "db.get_engine",
+        lambda: type("E", (), {"connect": lambda self: _StatusAwareConn("FAILED")})(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "intelligence.long_plays.load_latest_board", lambda engine: None, raising=False,
+    )
+
+    result = email_mod.daily_digest(dry_run=True)
+
+    assert "Active Sources (24h)" not in result["section_titles"]

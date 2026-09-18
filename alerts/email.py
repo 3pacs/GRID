@@ -119,7 +119,22 @@ def _section_regime(state: str, confidence: float, action: str) -> dict:
     }
 
 
-def _section_100x(ticker: str, direction: str, score: float, thesis: str, payoff: float = 0) -> dict:
+def _section_100x(
+    ticker: str, direction: str, score: float, thesis: str, payoff: float = 0,
+    confidence: str | None = None,
+) -> dict:
+    # A row's own confidence label (LOW/MEDIUM/HIGH, stored alongside the
+    # score in options_mispricing_scans) must survive into the rendered
+    # alert — without it, a LOW-confidence flagged opportunity is visually
+    # identical to a HIGH-confidence one: same purple accent, same "100x
+    # Opportunity" title, same weight. Treat anything that isn't a
+    # recognized non-LOW label (missing, empty, unexpected value) as LOW
+    # too, so a legacy row or a future label this code doesn't know about
+    # fails toward caution rather than toward the confident-looking default.
+    is_low_confidence = (confidence or "").strip().upper() not in ("MEDIUM", "HIGH")
+    conf_note = (
+        ' &nbsp; <span class="badge badge-hold">LOW CONFIDENCE</span>' if is_low_confidence else ""
+    )
     return {
         "title": f"100x Opportunity — {ticker}",
         "body": (
@@ -127,9 +142,10 @@ def _section_100x(ticker: str, direction: str, score: float, thesis: str, payoff
             f'{ticker} {direction}S</span> &nbsp; '
             f'Score: <strong>{score:.1f}/10</strong>'
             f'{f" &nbsp; Est. Payoff: <strong>{payoff:.0f}x</strong>" if payoff else ""}'
+            f'{conf_note}'
             f'<br><br>{thesis}'
         ),
-        "accent": "purple",
+        "accent": "amber" if is_low_confidence else "purple",
     }
 
 
@@ -349,10 +365,12 @@ def alert_on_regime_change(from_regime: str, to_regime: str, confidence: float) 
     )
 
 
-def alert_on_100x_opportunity(ticker: str, score: float, direction: str, thesis: str) -> None:
+def alert_on_100x_opportunity(
+    ticker: str, score: float, direction: str, thesis: str, confidence: str | None = None,
+) -> None:
     _send(
         f"GRID Intelligence — 100x Alert: {ticker} {direction}S",
-        [_section_100x(ticker, direction, score, thesis)],
+        [_section_100x(ticker, direction, score, thesis, confidence=confidence)],
     )
 
 
@@ -479,22 +497,29 @@ def daily_digest(dry_run: bool = False) -> dict[str, Any]:
             # 100x opportunities
             try:
                 rows = conn.execute(sa_text(
-                    "SELECT ticker, direction, score, payoff_multiple, thesis "
+                    "SELECT ticker, direction, score, payoff_multiple, thesis, confidence "
                     "FROM options_mispricing_scans "
                     "WHERE is_100x = TRUE AND scan_date >= CURRENT_DATE - 3 "
                     "ORDER BY score DESC LIMIT 5"
                 )).fetchall()
                 for r in rows:
-                    sections.append(_section_100x(r[0], r[1], r[2], r[4], r[3]))
+                    sections.append(_section_100x(r[0], r[1], r[2], r[4], r[3], confidence=r[5]))
             except Exception as exc:
                 degraded.append("100x_opportunities")
                 log.debug("Daily digest 100x section failed: {e}", e=str(exc))
 
-            # Data freshness
+            # Data freshness — pull_status = 'SUCCESS' only. raw_series also
+            # gets a row on a FAILED pull (value=0, a real pull_timestamp),
+            # so counting every row regardless of status reports a source as
+            # "active" off pulls that never actually produced an
+            # observation. Every other raw_series reader in the codebase
+            # (analysis/flow_thesis_data.py and friends) already filters to
+            # SUCCESS; this KPI didn't.
             try:
                 row = conn.execute(sa_text(
                     "SELECT COUNT(DISTINCT source_id), MAX(pull_timestamp) FROM raw_series "
-                    "WHERE pull_timestamp >= NOW() - INTERVAL '24 hours'"
+                    "WHERE pull_timestamp >= NOW() - INTERVAL '24 hours' "
+                    "AND pull_status = 'SUCCESS'"
                 )).fetchone()
                 if row and row[0]:
                     sections.append(_section_kpi("Active Sources (24h)", str(row[0]),
