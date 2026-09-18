@@ -314,72 +314,23 @@ def classify_crowding(percentile_3y: float | None) -> str:
 # supposed to have been published; availability_basis says WHETHER we can
 # actually back that up with an observed acquisition near that time, or
 # whether we are only inferring it from the schedule. See contract doc
-# section 10 for the full rule; this is the pure classifier.
-
-AVAILABILITY_BASIS_OBSERVED = "observed_acquisition"
-AVAILABILITY_BASIS_INFERRED = "inferred_schedule"
-AVAILABILITY_BASIS_UNKNOWN = "unknown"
-AVAILABILITY_BASIS_VALUES = frozenset(
-    {AVAILABILITY_BASIS_OBSERVED, AVAILABILITY_BASIS_INFERRED, AVAILABILITY_BASIS_UNKNOWN}
+# section 10 for the full rule.
+#
+# The classifier itself moved to godview/availability_basis.py (2026-09-18,
+# Slice B) so the Fed liquidity and commodity warehouse pillars can share it
+# rather than re-picking their own tolerance/note text. Re-exported here,
+# unchanged, for backward compatibility with this module's existing callers
+# and tests.
+from godview.availability_basis import (  # noqa: E402
+    AVAILABILITY_BASIS_INFERRED,
+    AVAILABILITY_BASIS_OBSERVED,
+    AVAILABILITY_BASIS_TOLERANCE_DAYS,
+    AVAILABILITY_BASIS_UNKNOWN,
+    AVAILABILITY_BASIS_VALUES,
+    INFERRED_BASIS_NOTE,
+    UNKNOWN_BASIS_NOTE,
+    classify_availability_basis,
 )
-
-#: How many days after release_date a puller run may land and still count as
-#: "we observed the real acquisition," not "we are inferring from schedule."
-#: Covers a puller running over the weekend after the Friday release, or a
-#: Monday-holiday shift. Wider than this and the row is treated the same as
-#: a historical backfill: the schedule, not an observation, is doing the work.
-AVAILABILITY_BASIS_TOLERANCE_DAYS = 3
-
-INFERRED_BASIS_NOTE = "availability inferred from schedule; record revised/backfilled"
-UNKNOWN_BASIS_NOTE = "acquisition observed before the scheduled release; basis unclear"
-
-
-def classify_availability_basis(
-    release_date: date | None,
-    available_at: datetime | date | None,
-    *,
-    distinct_pull_count: int = 1,
-    tolerance_days: int = AVAILABILITY_BASIS_TOLERANCE_DAYS,
-) -> tuple[str, str | None]:
-    """Classify how we know this row's data was available, and why.
-
-    Returns ``(availability_basis, note)``. ``note`` is ``None`` exactly when
-    ``availability_basis == AVAILABILITY_BASIS_OBSERVED`` -- an observed row
-    needs no caveat.
-
-    * ``distinct_pull_count`` is how many DISTINCT ``pull_timestamp`` values
-      raw_series has ever recorded for this (contract, report_date), across
-      all of that row's raw metrics -- more than one means the CFTC report
-      was re-pulled (revised or a delayed second run), and the row this
-      materializer keeps is never labelled ``observed_acquisition`` "for the
-      original release" even if the winning (latest) pull happens to look
-      timely, per the operator's explicit rule.
-    * Otherwise: ``available_at`` within ``tolerance_days`` on-or-after
-      ``release_date`` (allowing 1 day of slack early, for timezone/clock
-      noise) is ``observed_acquisition``; later than that is
-      ``inferred_schedule`` (a backfill: the schedule, not an observation,
-      places it); a puller run implausibly far before the schedule says the
-      report existed is ``unknown`` (we cannot explain that acquisition from
-      the schedule at all).
-    * ``release_date is None`` (contract doc section 8's non-Tuesday
-      quarantine) or ``available_at is None`` -> always ``unknown``: with no
-      schedule-derived release_date to compare against, "observed near
-      schedule" and "inferred from schedule" are both meaningless.
-    """
-    if release_date is None or available_at is None:
-        return AVAILABILITY_BASIS_UNKNOWN, None
-
-    available_date = available_at.date() if isinstance(available_at, datetime) else available_at
-    age_days = (available_date - release_date).days
-
-    if distinct_pull_count > 1:
-        return AVAILABILITY_BASIS_INFERRED, INFERRED_BASIS_NOTE
-    if age_days > tolerance_days:
-        return AVAILABILITY_BASIS_INFERRED, INFERRED_BASIS_NOTE
-    if age_days < -1:
-        return AVAILABILITY_BASIS_UNKNOWN, UNKNOWN_BASIS_NOTE
-    return AVAILABILITY_BASIS_OBSERVED, None
-
 
 # ---------------------------------------------------------------------------
 # Materialization result type
@@ -670,7 +621,22 @@ class _EmptyUpstream(Exception):
 
 
 def _record_failure(engine: Engine, generation_id: str, reason: str) -> None:
-    """Record a failed attempt in its own transaction (the main one already rolled back)."""
+    """Record a failed attempt in its own transaction (the main one already rolled back).
+
+    This is a SEPARATE operation from the ``record_generation(..., status=
+    STATUS_COMPLETE, ...)`` call inside ``materialize_cftc_pillar``'s main
+    transaction, not a retry of it: that call attempted to publish the
+    generation and, if the main transaction failed, was rolled back along
+    with everything else in it (see contract doc section 7 -- exactly one
+    attempt to publish as complete, ever, per run). This function's own
+    call marks the SAME generation_id as ``failed`` instead, in a fresh
+    transaction, purely for observability -- a test that mocks
+    ``record_generation`` to always raise will see it invoked twice (once
+    for each distinct operation); that is correct, not a bug or a retry.
+    See tests/godview/test_cftc_pillar_db.py::
+    test_partial_refresh_cannot_expose_a_mixed_generation for the fake that
+    models this transaction boundary explicitly.
+    """
     try:
         with engine.begin() as conn:
             record_generation(
