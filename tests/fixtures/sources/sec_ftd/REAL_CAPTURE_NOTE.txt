@@ -1,0 +1,52 @@
+real_capture_first500.txt / real_capture_multi_date_cusip.txt -- provenance
+(W5c, 2026-09-18)
+============================================================================
+
+Captured with a single real HTTP GET (1 of the 2 requests allowed for this
+source under the W5c constraints):
+
+    GET https://www.sec.gov/files/data/fails-deliver-data/cnsfails202608b.zip
+    User-Agent: GRID/1.0 (aniksrobot@gmail.com)
+    HTTP/1.1 200 OK  (Server: nginx, X-AH-Environment: prod)
+    Captured: 2026-09-18
+    Zip size: 1,393,881 bytes; single member cnsfails202608b.txt,
+    uncompressed 3,874,330 bytes, 61,550 data rows (settlement dates
+    2026-08-17 through 2026-08-31, i.e. the "second half of August 2026"
+    file -- consistent with the documented ~15th-of-next-month publication
+    lag for second-half files, relative to a 2026-09-18 capture date).
+
+3,874,330 bytes is over the ~2 MB threshold in the task brief, so per
+instructions the extracted ZIP member is NOT stored whole. Two small real
+(not constructed) slices were kept instead, both taken verbatim from the
+one real decoded file above -- no values were invented:
+
+  - real_capture_first500.txt: header + the first 500 data rows of the
+    real file, unmodified. All 500 rows happen to share settlement date
+    2026-08-17 (each date block in the real file runs ~5,000-6,000 rows,
+    so any contiguous 500-row prefix stays within one date).
+  - real_capture_multi_date_cusip.txt: header + every row (11 of them) for
+    one real CUSIP (Y4000A102 / symbol HQ / "HORIZON QUANTUM HLDGS LTD
+    SHS") that recurs across all 11 settlement dates present in the file
+    (2026-08-17 .. 2026-08-31), with 11 different QUANTITY (FAILS) values
+    (373, 2245, 71, 1258, 3348, 145601, 9502, 16511, 26351, 3294, 179).
+    This slice exists specifically to test, on real data, that the puller
+    stores each settlement date's balance independently rather than
+    summing/overwriting across dates -- see
+    `test_real_fixture_same_cusip_across_dates_not_summed` in
+    tests/test_source_sec_ftd.py.
+
+Trailer lines ("Trailer record count ..." / "Trailer total quantity of
+shares ...") from the real file were deliberately dropped from both
+slices -- they are not part of either sample's row count and would only
+be parsed as (harmlessly skipped, non-fatal) malformed 1-field rows by
+`parse_ftd_file`, same as in the original file.
+
+Format check against the documented layout (SETTLEMENT DATE|CUSIP|
+SYMBOL|QUANTITY (FAILS)|DESCRIPTION|PRICE): the real file matches exactly
+-- pipe-delimited, 6 fields, 8-digit settlement date, integer quantity,
+header row present. No discrepancy observed here (contrast with the FINRA
+short-volume capture -- see the sibling NOTE.txt in
+tests/fixtures/sources/finra_short_volume/).
+
+Per-request budget used for this source: 1 of 2 allowed. No retry was
+attempted (the response was a 200, not a failure).

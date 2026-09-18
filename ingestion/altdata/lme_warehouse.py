@@ -276,6 +276,18 @@ def _parse_date_from_header(text_block: str, fallback: date) -> date:
                 ).date()
             except ValueError:
                 continue
+
+    # `text_block` was non-empty but matched neither the ISO nor the
+    # "13 April 2026" pattern -- silently substituting `fallback` (usually
+    # `date.today()`) here would corrupt the observation date without any
+    # trace, which is a PIT-correctness hazard. Log it so a format change
+    # upstream (LME) is visible in `.server-logs/errors.jsonl` instead of
+    # quietly mis-dating every row.
+    log.warning(
+        "LME: could not parse observation date from {t!r} -- using fallback {f}",
+        t=text_block[:120],
+        f=fallback,
+    )
     return fallback
 
 

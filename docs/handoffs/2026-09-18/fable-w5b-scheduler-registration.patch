@@ -1,0 +1,75 @@
+diff --git a/ingestion/scheduler.py b/ingestion/scheduler.py
+index 33450cd1..00b0479d 100644
+--- a/ingestion/scheduler.py
++++ b/ingestion/scheduler.py
+@@ -721,6 +721,44 @@ def _get_pullers_for_group(
+             pullers.append(("FINRA_Margin", FINRAMarginPuller(db_engine), "pull", {}))
+         except Exception as exc:
+             log.warning("FINRA margin init failed: {err}", err=str(exc))
++        # FINRA Daily Short Sale Volume (Reg SHO daily files) -- UNAPPLIED.
++        # Contract-first puller (docs/handoffs/2026-09-18/fable-w5b-source-contracts.md).
++        # W5c update: the download URL IS now confirmed live (real fixture
++        # captured -- see tests/fixtures/sources/finra_short_volume/
++        # REAL_CAPTURE_NOTE.txt) and FINRAShortVolumePuller.pull() builds
++        # it itself from settings.FINRA_SHORT_VOLUME_BASE_URL, so url=
++        # is no longer required. Still NOT enabled because:
++        #   1. pull() takes a required trade_date (or a date-rolling
++        #      wrapper), unlike the no-arg pullers above -- {"trade_date":
++        #      date.today() - timedelta(days=1)} below is a starting
++        #      point, not a verified "always the latest published file"
++        #      rule (FINRA may not have posted yesterday's file yet at
++        #      whatever time this scheduler group runs).
++        #   2. The live CNMS response captured for the fixture does NOT
++        #      match the documented layout exactly (fractional share
++        #      volumes; ~65% of rows have a comma-joined multi-facility
++        #      Market field like "B,Q,N" instead of one alpha code) --
++        #      unresolved whether that's expected CNMS behavior or a
++        #      sandboxed-network artifact. series_id() will mint ids like
++        #      finra:short_volume:AAPL:B,Q,N for those rows, which is
++        #      almost certainly not the intended shape.
++        #   3. Section 4 of the contracts doc (raw_series release_date /
++        #      latency_class schema gaps) is still open.
++        # try:
++        #     from ingestion.altdata.finra_short_volume import FINRAShortVolumePuller
++        #     pullers.append((
++        #         "FINRA_Short_Volume",
++        #         FINRAShortVolumePuller(db_engine),
++        #         "pull",
++        #         {"trade_date": date.today() - timedelta(days=1)},
++        #     ))
++        # except Exception as exc:
++        #     log.warning("FINRA short volume init failed: {err}", err=str(exc))
++        # SEC Fails-to-Deliver (FTD) balances -- UNAPPLIED.
++        # Contract-first puller (docs/handoffs/2026-09-18/fable-w5b-source-contracts.md).
++        # W5c update: the zip URL IS now confirmed live (real fixture
++        # captured -- see tests/fixtures/sources/sec_ftd/REAL_CAPTURE_NOTE.txt)
++        # and SECFTDPuller.pull()/_fetch_zip_bytes() build it themselves
++        # from yyyymm=/half= (no url= needed), matching the documented
++        # cnsfails<YYYYMM><a|b>.zip pattern exactly -- no format anomaly
++        # found here (contrast with FINRA above). Still NOT enabled
++        # because:
++        #   1. settings.SEC_USER_AGENT MUST be set (config.py / .env.example)
++        #      or every call fails closed with RuntimeError -- this
++        #      scheduler group has no mechanism yet to surface that
++        #      distinctly from a transient network failure.
++        #   2. There is no "just pull the latest" default -- the
++        #      {"yyyymm": ..., "half": ...} pair below has to roll to the
++        #      correct half-month given SEC's ~2-week publication lag
++        #      ("first half ... at the end of the month. The second half
++        #      ... at about the 15th of the next month.") and that
++        #      rolling logic does not exist yet.
++        #   3. Section 4 of the contracts doc (raw_series release_date /
++        #      no semi-monthly latency_class) is still open.
++        # try:
++        #     from ingestion.altdata.sec_ftd import SECFTDPuller
++        #     pullers.append((
++        #         "SEC_FTD",
++        #         SECFTDPuller(db_engine),
++        #         "pull",
++        #         {"yyyymm": "202608", "half": "b"},  # placeholder, not rolled
++        #     ))
++        # except Exception as exc:
++        #     log.warning("SEC FTD init failed: {err}", err=str(exc))
+         # LittleSis power mapping — actor relationships (daily)
+         try:
+             from ingestion.altdata.littlesis_puller import LittleSisPuller
