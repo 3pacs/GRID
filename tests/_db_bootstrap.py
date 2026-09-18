@@ -20,11 +20,24 @@ Alembic chain the stamp exercises:
   Needed by: ``tests/contracts/test_dead_letter.py`` (3 tests).
 
 * ``capital_flows`` (+ the harmless-to-create ``supply_chain_nodes`` /
-  ``supply_chain_edges`` from the same file) — created by the raw SQL
-  migration ``migrations/0021_supply_chain_and_capital_flows.sql`` (also
-  idempotent ``IF NOT EXISTS`` DDL only). Needed by:
-  ``tests/test_capital_flow_rollups.py`` (7), ``tests/test_holder_deal_overlap.py``
-  (7), ``tests/test_acquisition_decomposition.py`` (4) — 18 tests total.
+  ``supply_chain_edges`` from the same file) — created by
+  ``migrations/0021_supply_chain_and_capital_flows.sql`` and then altered by
+  ``migrations/0024_capital_flows_currency.sql``, applied in that order.
+  0021 alone is the *older* shape: it lacks the ``currency`` column and its
+  plain ``UNIQUE (actor_id, fiscal_period, period_type, flow_type,
+  counterparty_id, source_filing)`` constraint treats NULL
+  ``counterparty_id`` as always-distinct, so ``ON CONFLICT`` can't target
+  it. 0024 adds ``currency`` (default ``'USD'``) and the functional unique
+  index ``capital_flows_dedup_nullable_cp_key`` on ``(actor_id,
+  fiscal_period, period_type, flow_type, COALESCE(NULLIF(counterparty_id,
+  ''), '__none__'), source_filing)`` — the exact columns and ``ON CONFLICT``
+  target the tests below insert against. Confirmed current via
+  ``migrations/RAW_SQL_LEDGER.md`` ("legacy-applied": both present in
+  production) and by grep — no other file alters ``capital_flows`` (0034 and
+  0046 only add unrelated, capital_flows-referencing indexes, not columns).
+  Needed by: ``tests/test_capital_flow_rollups.py`` (7),
+  ``tests/test_holder_deal_overlap.py`` (7),
+  ``tests/test_acquisition_decomposition.py`` (4) — 18 tests total.
 
 * ``canvas_boards`` / ``canvas_nodes`` / ``canvas_edges`` — created by the
   idempotent Python function
@@ -57,7 +70,10 @@ from sqlalchemy.engine import Engine
 _ROOT = Path(__file__).resolve().parent.parent
 
 _CONTRACTS_MIGRATION = _ROOT / "scripts" / "migrations" / "20260411_contracts_infrastructure.sql"
-_CAPITAL_FLOWS_MIGRATION = _ROOT / "migrations" / "0021_supply_chain_and_capital_flows.sql"
+_CAPITAL_FLOWS_MIGRATIONS = (
+    _ROOT / "migrations" / "0021_supply_chain_and_capital_flows.sql",
+    _ROOT / "migrations" / "0024_capital_flows_currency.sql",
+)
 
 _bootstrapped = False
 
@@ -66,13 +82,20 @@ def bootstrap_test_prerequisites(engine: Engine) -> None:
     """Create the runtime-only tables the database-gated tests need.
 
     Idempotent and safe to call once per test session (guarded by a module
-    global) or repeatedly — every statement it runs is ``IF NOT EXISTS``.
-    Tables created, and the existing idempotent creator used for each:
+    global) or repeatedly — every statement it runs is ``IF NOT EXISTS``
+    (0024's dedup pass is a no-op DELETE against zero rows on a fresh
+    bootstrap). Tables created, and the existing idempotent creator used for
+    each:
 
     * ``contracts_audit``, ``contracts_dead_letter`` — via the DDL in
       ``scripts/migrations/20260411_contracts_infrastructure.sql``.
     * ``supply_chain_nodes``, ``supply_chain_edges``, ``capital_flows`` — via
-      the DDL in ``migrations/0021_supply_chain_and_capital_flows.sql``.
+      the DDL in ``migrations/0021_supply_chain_and_capital_flows.sql``,
+      then ``migrations/0024_capital_flows_currency.sql`` (adds the
+      ``currency`` column and the ``capital_flows_dedup_nullable_cp_key``
+      functional unique index the tests' ``ON CONFLICT`` targets — 0021
+      alone is the older, currency-less shape and does not match what the
+      tests insert).
     * ``canvas_boards``, ``canvas_nodes``, ``canvas_edges`` — via
       ``api.routers.canvas_board_store.ensure_legacy_canvas_tables(conn)``.
 
@@ -90,7 +113,8 @@ def bootstrap_test_prerequisites(engine: Engine) -> None:
 
     with engine.begin() as conn:
         conn.execute(text(_CONTRACTS_MIGRATION.read_text(encoding="utf-8")))
-        conn.execute(text(_CAPITAL_FLOWS_MIGRATION.read_text(encoding="utf-8")))
+        for path in _CAPITAL_FLOWS_MIGRATIONS:
+            conn.execute(text(path.read_text(encoding="utf-8")))
         ensure_legacy_canvas_tables(conn)
 
     _bootstrapped = True
