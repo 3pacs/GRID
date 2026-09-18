@@ -305,6 +305,34 @@ def classify_crowding(percentile_3y: float | None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Pure: availability_basis (observed vs. inferred vs. unknown)
+# ---------------------------------------------------------------------------
+#
+# Operator direction (2026-09-18): a published CFTC release schedule alone
+# does not establish historical availability for revised or backfilled
+# records. release_date (contract doc section 8) says WHEN a report is
+# supposed to have been published; availability_basis says WHETHER we can
+# actually back that up with an observed acquisition near that time, or
+# whether we are only inferring it from the schedule. See contract doc
+# section 10 for the full rule.
+#
+# The classifier itself moved to godview/availability_basis.py (2026-09-18,
+# Slice B) so the Fed liquidity and commodity warehouse pillars can share it
+# rather than re-picking their own tolerance/note text. Re-exported here,
+# unchanged, for backward compatibility with this module's existing callers
+# and tests.
+from godview.availability_basis import (  # noqa: E402
+    AVAILABILITY_BASIS_INFERRED,
+    AVAILABILITY_BASIS_OBSERVED,
+    AVAILABILITY_BASIS_TOLERANCE_DAYS,
+    AVAILABILITY_BASIS_UNKNOWN,
+    AVAILABILITY_BASIS_VALUES,
+    INFERRED_BASIS_NOTE,
+    UNKNOWN_BASIS_NOTE,
+    classify_availability_basis,
+)
+
+# ---------------------------------------------------------------------------
 # Materialization result type
 # ---------------------------------------------------------------------------
 
@@ -384,6 +412,36 @@ def _existing_report_dates(conn: Connection, contract_code: str) -> set[date]:
     return {r[0] for r in rows}
 
 
+def _distinct_pull_counts(conn: Connection, contract_key: str, as_of: date) -> dict[date, int]:
+    """How many DISTINCT pull_timestamp values raw_series has ever recorded per report_date.
+
+    Unlike ``_read_contract_history`` (which keeps only the LATEST pull per
+    (series_id, obs_date)), this counts ALL pulls ever made -- the signal
+    ``classify_availability_basis`` needs to tell "pulled once, on schedule"
+    apart from "re-pulled" (CFTC revised the report, or we backfilled it a
+    second time). Within one real puller run, every metric for a contract
+    shares the same transaction-constant ``NOW()`` pull_timestamp (see
+    ingestion/altdata/cftc_cot.py's ``pull_contract`` -- one ``engine.begin()``
+    per call), so > 1 distinct timestamp for a report_date only happens
+    across two SEPARATE runs, never within one.
+    """
+    series_ids = [_build_series_id(contract_key, metric) for metric in REQUIRED_METRICS]
+    rows = conn.execute(
+        text(
+            """
+            SELECT obs_date, COUNT(DISTINCT pull_timestamp) AS n
+            FROM raw_series
+            WHERE series_id = ANY(:sids)
+              AND obs_date <= :as_of
+              AND pull_status = 'SUCCESS'
+            GROUP BY obs_date
+            """
+        ),
+        {"sids": series_ids, "as_of": as_of},
+    ).all()
+    return {r[0]: int(r[1]) for r in rows}
+
+
 def _net_speculative_series(history: dict[date, dict[str, Any]], up_to: date) -> list[float]:
     """Chronological net_speculative values (noncommercial_long - short) for dates <= up_to."""
     dates = sorted(d for d in history if d <= up_to)
@@ -425,6 +483,7 @@ def materialize_cftc_pillar(
                     contracts_with_any_history.add(contract_key)
 
                 existing = _existing_report_dates(conn, meta["contract_code"])
+                pull_counts = _distinct_pull_counts(conn, contract_key, as_of)
 
                 for report_date, metrics in sorted(history.items()):
                     if report_date in existing:
@@ -449,6 +508,13 @@ def materialize_cftc_pillar(
                     release_date, source_ref = compute_release_date(report_date)
 
                     available_at = min(metrics["_pull_ts"].values()) if metrics.get("_pull_ts") else None
+                    availability_basis, basis_note = classify_availability_basis(
+                        release_date,
+                        available_at,
+                        distinct_pull_count=pull_counts.get(report_date, 1),
+                    )
+                    if basis_note:
+                        source_ref = f"{source_ref}; {basis_note}"
 
                     rows_to_insert.append(
                         {
@@ -471,6 +537,7 @@ def materialize_cftc_pillar(
                             "release_date": release_date,
                             "available_at": available_at,
                             "provenance": "measured",
+                            "availability_basis": availability_basis,
                             "generation_id": generation_id,
                             "coverage_fraction": coverage,
                             "source_ref": source_ref,
@@ -494,14 +561,16 @@ def materialize_cftc_pillar(
                             commercial_net, noncommercial_long, noncommercial_short,
                             noncommercial_net, spec_net_pct_oi, z_score_1y, z_score_3y,
                             percentile_3y, crowding_regime, release_date, available_at,
-                            provenance, generation_id, coverage_fraction, source_ref
+                            provenance, availability_basis, generation_id, coverage_fraction,
+                            source_ref
                         ) VALUES (
                             :report_date, :contract_code, :contract_name, :asset_class,
                             :total_open_interest, :commercial_long, :commercial_short,
                             :commercial_net, :noncommercial_long, :noncommercial_short,
                             :noncommercial_net, :spec_net_pct_oi, :z_score_1y, :z_score_3y,
                             :percentile_3y, :crowding_regime, :release_date, :available_at,
-                            :provenance, :generation_id, :coverage_fraction, :source_ref
+                            :provenance, :availability_basis, :generation_id, :coverage_fraction,
+                            :source_ref
                         )
                         ON CONFLICT (report_date, contract_code) DO NOTHING
                         """
@@ -552,7 +621,22 @@ class _EmptyUpstream(Exception):
 
 
 def _record_failure(engine: Engine, generation_id: str, reason: str) -> None:
-    """Record a failed attempt in its own transaction (the main one already rolled back)."""
+    """Record a failed attempt in its own transaction (the main one already rolled back).
+
+    This is a SEPARATE operation from the ``record_generation(..., status=
+    STATUS_COMPLETE, ...)`` call inside ``materialize_cftc_pillar``'s main
+    transaction, not a retry of it: that call attempted to publish the
+    generation and, if the main transaction failed, was rolled back along
+    with everything else in it (see contract doc section 7 -- exactly one
+    attempt to publish as complete, ever, per run). This function's own
+    call marks the SAME generation_id as ``failed`` instead, in a fresh
+    transaction, purely for observability -- a test that mocks
+    ``record_generation`` to always raise will see it invoked twice (once
+    for each distinct operation); that is correct, not a bug or a retry.
+    See tests/godview/test_cftc_pillar_db.py::
+    test_partial_refresh_cannot_expose_a_mixed_generation for the fake that
+    models this transaction boundary explicitly.
+    """
     try:
         with engine.begin() as conn:
             record_generation(
@@ -589,6 +673,7 @@ def read_cftc_pillar(
     as_of: date,
     *,
     contracts: dict[str, dict[str, str]] | None = None,
+    include_inferred: bool = False,
 ) -> PillarReadResult:
     """Strict-PIT read: latest qualifying row per tracked contract as of ``as_of``.
 
@@ -601,6 +686,13 @@ def read_cftc_pillar(
     four tracked contracts); tests pass their own isolated contract map so
     they don't collide with each other -- or with a real materializer run --
     on the shared ``cftc_positioning`` pillar name in ``godview_generations``.
+
+    ``include_inferred`` (default ``False``, contract doc section 10): strict
+    PIT admits only ``availability_basis = 'observed_acquisition'`` rows by
+    default. Pass ``True`` to also admit ``inferred_schedule``/``unknown``
+    rows -- every admitted row still carries its own ``availability_basis``
+    column so the caller (the API router) can label it, never silently
+    upgrade it to "observed."
     """
     contracts = contracts if contracts is not None else CFTC_PILLAR_CONTRACTS
     generation = _latest_complete_generation(conn, PILLAR_NAME)
@@ -612,20 +704,22 @@ def read_cftc_pillar(
         return PillarReadResult(state="never_configured", contracts_expected=len(contracts))
 
     contract_codes = [meta["contract_code"] for meta in contracts.values()]
+    basis_filter = "" if include_inferred else "AND availability_basis = 'observed_acquisition'"
     rows = conn.execute(
         text(
-            """
+            f"""
             SELECT DISTINCT ON (contract_code)
                 contract_code, contract_name, report_date, total_open_interest,
                 commercial_long, commercial_short, commercial_net,
                 noncommercial_long, noncommercial_short, noncommercial_net,
                 spec_net_pct_oi, z_score_1y, z_score_3y, percentile_3y,
                 crowding_regime, release_date, available_at, provenance,
-                generation_id, coverage_fraction, source_ref
+                availability_basis, generation_id, coverage_fraction, source_ref
             FROM cftc_positioning_daily
             WHERE contract_code = ANY(:codes)
               AND release_date IS NOT NULL
               AND release_date <= :as_of
+              {basis_filter}
             ORDER BY contract_code, report_date DESC
             """
         ),

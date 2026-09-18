@@ -1,10 +1,11 @@
-# God View pillar contract — CFTC positioning (W6, first slice)
+# God View pillar contract — CFTC positioning, Fed net liquidity, commodity warehouses (W6)
 
-**Status:** adopted 2026-09-18 for the CFTC positioning pillar. This is the reference
-contract every other God View pillar (FINRA short volume, SEC Reg SHO FTD, commodity
-warehouses, Fed net liquidity, buyback blackouts, dealer GEX) must satisfy before it is
-wired into `GET /api/v1/godview/pillars/<pillar>` — see "What remains for other pillars"
-at the bottom.
+**Status:** adopted 2026-09-18, originally for the CFTC positioning pillar (sections 1-10)
+and extended the same day (Slice B) to the Fed net liquidity pillar (section 11) and the
+commodity warehouse pillar (section 12). This is the reference contract every other God
+View pillar (FINRA short volume, SEC Reg SHO FTD, buyback blackouts, dealer GEX) must
+satisfy before it is wired into `GET /api/v1/godview/pillars/<pillar>` — see the status
+table near the bottom for exactly which pillars are built and why the rest aren't yet.
 
 Builds on `docs/reference/AVAILABILITY_CONTRACT.md` (whole-result available/partial/
 unavailable) and `store/availability_fields.py`'s `FieldRecord` (per-field availability +
@@ -163,6 +164,12 @@ from *strict-PIT* reads: `GET /api/v1/godview/pillars/cftc?as_of=` filters
 | a complete generation exists; the newest qualifying `release_date` is more than 10 days before `as_of` | `available=true`, `stale_reason="stale"` |
 | a complete generation exists; ≥1 qualifying row, no staleness | `available=true`, `coverage` as computed |
 
+"Qualifying" as of section 10 (2026-09-18 addendum) also requires
+`availability_basis = 'observed_acquisition'` unless the caller passes
+`include_inferred=true` — see section 10 below; `coverage` is computed over
+whichever set that query parameter selected, never over rows the request
+excluded.
+
 The endpoint never raises a 500 for a missing table — `to_regclass` / a caught
 `ProgrammingError` on `cftc_positioning_daily` or `godview_generations` degrades to the
 `never_configured` unavailable state.
@@ -177,12 +184,141 @@ tracked contract (not just "nothing new") is treated differently — see §7's f
 path — because that means the upstream adapter itself produced nothing, not that this
 run happened to be a quiet week.
 
-## What remains for other pillars
+## 10. Availability basis — observed vs. inferred vs. unknown
 
-FINRA short volume, SEC Reg SHO FTD, commodity warehouse inventories, Fed net liquidity,
-corporate buyback blackouts, and dealer GEX are **not built** in this slice. Their tables
-already exist (same tracked `god_view_market_tables_20260918` migration) but have none of
-the PIT columns this migration adds to `cftc_positioning_daily`, no materializer, and no
-route — `GET /api/v1/godview/pillars/<name>` for any of them, and the corresponding card
-in `GodViewPillars.jsx`, must render the honest "not built yet — no data" state rather
-than silently 404 or fabricate a number.
+**Addendum, 2026-09-18 (operator direction, Slice A):** "a published CFTC release
+schedule alone does not establish historical availability for revised or backfilled
+records." Section 8's `release_date` says WHEN a report was scheduled to publish, purely
+from the rule (Tuesday → Friday+3d). It says nothing about whether GRID actually *saw*
+that publication happen, versus reconstructing the date years later from a backfill run.
+`availability_basis` is the answer to that second question, stored per row (nullable
+`TEXT` on `cftc_positioning_daily`, added by `migrations/versions/godview_avail_basis_0918.py`,
+CHECK-constrained to the three values below) and exposed per field at the API layer.
+
+| value | meaning |
+|---|---|
+| `observed_acquisition` | The puller's own `pull_timestamp` (→ `available_at`) lands within `AVAILABILITY_BASIS_TOLERANCE_DAYS` (3 days) on-or-after `release_date`, and `raw_series` shows exactly one pull for this `(contract, report_date)`. We actually watched this get published. |
+| `inferred_schedule` | Either the pull landed more than 3 days after `release_date` (a historical backfill — the schedule, not an observation, is placing the date), or `raw_series` shows **more than one** distinct `pull_timestamp` for this report_date (CFTC revised the report, or GRID re-pulled it). A revised/backfilled record is **never** labelled `observed_acquisition` for the original release, even if the winning (latest) pull's own timing alone would otherwise look on-schedule. |
+| `unknown` | No `release_date` at all (section 8's non-Tuesday quarantine — nothing to compare against), no `available_at` at all, or an acquisition implausibly (>1 day) *before* the schedule says the report could have existed. |
+
+`godview/cftc_pillar.py::classify_availability_basis` is the pure classifier;
+`_distinct_pull_counts` supplies the revision signal by counting every distinct
+`pull_timestamp` `raw_series` has ever recorded for a report_date (not just the winning
+one `_read_contract_history`'s `LATEST_AS_OF` pick keeps) — within one real puller run
+every metric shares one transaction-constant `NOW()`, so more than one distinct timestamp
+only happens across two separate runs.
+
+**Strict-PIT reads default to `observed_acquisition` rows only.** `read_cftc_pillar(...,
+include_inferred=False)` (the default) adds `AND availability_basis = 'observed_acquisition'`
+to the query; `include_inferred=True` admits `inferred_schedule`/`unknown` rows too, and
+every admitted row still carries its own `availability_basis` — the API never silently
+upgrades an inferred row to "observed." The route is
+`GET /api/v1/godview/pillars/cftc?as_of=...&include_inferred=true`.
+
+**Per-field exposure:** each field's `FieldRecord.to_dict()` output (section 4) carries
+two additional sibling keys, `availability_basis` and `availability_basis_note` — added
+beside the vendored `FieldRecord` output rather than inside it, since that module is
+vendored verbatim from `feat/availability-provenance-contract` and must not diverge
+further before that branch merges. `availability_basis_note` is `None` exactly when the
+basis is `observed_acquisition`; otherwise it is the fixed string
+`"availability inferred from schedule; record revised/backfilled"` (inferred) or
+`"acquisition observed before the scheduled release; basis unclear"` (unknown).
+
+**Why two vintages of one row can't literally coexist:** `cftc_positioning_daily` keeps
+its `UNIQUE (report_date, contract_code)` constraint unchanged, and rows are INSERT-only
+(section 7) — so a "revised report_date" scenario is tested as two separate report_dates
+side by side (one pulled once, on schedule → observed; one `raw_series` shows was pulled
+twice → its single materialized row is the later, inferred-labelled vintage), not as two
+rows for the same report_date. See `tests/godview/test_cftc_pillar_pure.py`'s
+`test_availability_basis_revised_vs_first_release_side_by_side` and
+`tests/godview/test_cftc_pillar_db.py`'s
+`test_availability_basis_revised_report_date_labels_the_materialized_vintage_inferred`.
+
+## 11. Fed net liquidity pillar (Slice B)
+
+`godview/fed_liquidity_pillar.py`. Net Liquidity = WALCL − WTREGEN − RRPONTSYD, read
+directly from the raw FRED series in `raw_series` (`ingestion/fred.py`, read-only) — NOT
+from `ingestion/altdata/fed_liquidity.py`'s `COMPUTED:fed_net_liquidity`, which has a real
+unit bug (flagged separately, not fixed here; see that module's docstring cross-reference).
+
+**Units, confirmed via WebFetch 2026-09-18, never assumed:**
+
+| series | FRED units page | quote |
+|---|---|---|
+| WALCL | fred.stlouisfed.org/series/WALCL | "Millions of U.S. Dollars, Not Seasonally Adjusted" |
+| WTREGEN | fred.stlouisfed.org/series/WTREGEN | "Millions of U.S. Dollars, Not Seasonally Adjusted" |
+| RRPONTSYD | fred.stlouisfed.org/series/RRPONTSYD | "Billions of US Dollars, Not Seasonally Adjusted" |
+
+`net_liquidity_usd_m` (the tracked table's own column name) is therefore computed as
+`WALCL - WTREGEN - (RRPONTSYD * 1000)` — the `RRP_BILLIONS_TO_MILLIONS` scale factor is
+explicit in code, never implicit.
+
+**Release schedule, quoted 2026-09-18** from
+<https://www.federalreserve.gov/releases/h41/about.htm>:
+
+> "The H.4.1 statistical release, 'Factors Affecting Reserve Balances of Depository
+> Institutions and Condition Statement of Federal Reserve Banks,' is typically published
+> on Thursday afternoon around 4:30 p.m."
+
+WALCL and WTREGEN are both confirmed (via WebFetch on their own FRED pages) as
+"Weekly, as of / ending Wednesday" — so `obs_date` (Wednesday) → `release_date` =
+obs_date + 1 day (Thursday), set only when `obs_date` really is a Wednesday; otherwise
+withheld, same quarantine pattern as CFTC's Tuesday rule.
+
+**No fallback constants:** RRPONTSYD is a genuinely daily series, but this pillar takes
+ONLY the exact Wednesday's value — a missing exact-day observation (a holiday, a gap)
+leaves that whole Wednesday unmaterialized rather than substituting the nearest day.
+
+**Per-component availability basis and age:** unlike the CFTC pillar (one row-level
+`availability_basis`), this pillar stores THREE additional pull timestamps
+(`walcl_pulled_at`, `wtregen_pulled_at`, `rrp_pulled_at`) so the API can report each raw
+component's own basis/age independently, using the same shared
+`godview/availability_basis.py::classify_availability_basis` — the row-level
+`availability_basis` column is the worst case across all three (any component inferred
+→ the row is inferred).
+
+`forward_impulse_score` (a column on the tracked table) is always `NULL` in this slice —
+no forward-return model has been built or validated for it; `NULL` says "not implemented,"
+never a fabricated number.
+
+## 12. Commodity warehouse pillar (Slice B)
+
+`godview/commodity_warehouse_pillar.py`. Two independent fields:
+
+* **LME cancelled-warrant ratio** — reuses (read-only) `ingestion/altdata/lme_warehouse.py`'s
+  own `raw_series` writes (`lme:stocks_total_mt:<metal>`, `lme:stocks_cancelled_mt:<metal>`,
+  `lme:stocks_live_mt:<metal>`, `lme:cancelled_ratio:<metal>`) — the puller already computes
+  the ratio; this pillar reads it rather than recomputing it, so the two can never disagree.
+* **Cushing, OK crude stocks** — grepped the whole ingestion tree 2026-09-18 for a real EIA
+  Cushing series id (e.g. `WCSSTUS1`) and found **none**. `WCESTUS1`
+  (`ingestion/altdata/refinery_cracks.py`) looks similar but is US refiner **gasoline**
+  stocks, not Cushing crude — using it would silently substitute the wrong quantity, exactly
+  the defect `AVAILABILITY_CONTRACT.md` calls out by name. Per the operator's instruction,
+  this field is **permanently** `unavailable(reason="never_configured")` — `CUSHING_SERIES_ID`
+  is `None` on purpose, and no literal placeholder stands in for it anywhere in the code.
+
+**No cited release schedule:** unlike CFTC/Fed, no official LME publication-schedule page
+was found (`ingestion/altdata/lme_warehouse.py`'s own docstring says the same). Rather than
+assume a schedule exists, `release_date` is always `NULL` and `availability_basis` is
+always `'unknown'` for this pillar's rows — an honest admission, not a bug. The strict-PIT
+read therefore bounds results by `report_date <= as_of` only (the one temporal fact this
+pillar actually has), with no `include_inferred` gate (there is nothing for that flag to
+admit/exclude here).
+
+## Status of all seven God View pillars (2026-09-18)
+
+| pillar | status | why |
+|---|---|---|
+| CFTC positioning | **built** | full slice: adapter, migration, materializer, strict-PIT API (+ `include_inferred`), UI card |
+| Fed net liquidity | **built** | full slice; per-component basis; `forward_impulse_score` intentionally NULL (not implemented) |
+| Commodity warehouses (LME leg) | **built** | LME cancelled-warrant ratio, reused from the existing puller |
+| Commodity warehouses (Cushing leg) | **permanently unavailable** | `never_configured` — no real Cushing series id exists in this codebase; will not silently substitute a near-miss |
+| FINRA short volume | not built | adapter exists but is unscheduled/unverified live |
+| SEC Reg SHO FTD | not built | adapter exists but is unscheduled/unverified live |
+| Corporate buyback blackouts | not built | no measured source |
+| Dealer GEX | not built | engine correctness unproven |
+
+Every "not built" pillar's specific reason is returned verbatim by
+`GET /api/v1/godview/pillars/<name>` (via `api/routers/godview_pillars.py`'s
+`_KNOWN_UNBUILT_PILLARS` map) and rendered in the corresponding `NotBuiltCard` in
+`GodViewPillars.jsx` — never a silent 404, never a fabricated value.

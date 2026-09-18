@@ -8,12 +8,17 @@ ingestion/altdata/cftc_cot.py's documented record format, never downloaded.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 
 import pytest
 
 from godview.cftc_pillar import (
+    AVAILABILITY_BASIS_INFERRED,
+    AVAILABILITY_BASIS_OBSERVED,
+    AVAILABILITY_BASIS_UNKNOWN,
+    INFERRED_BASIS_NOTE,
     RELEASE_RULE_ID,
+    classify_availability_basis,
     classify_crowding,
     compute_percentile,
     compute_release_date,
@@ -153,3 +158,74 @@ def test_coverage_fraction_for_window_caps_at_one():
 )
 def test_classify_crowding_thresholds(percentile, expected):
     assert classify_crowding(percentile) == expected
+
+
+# ---------------------------------------------------------------------------
+# availability_basis (Slice A, operator direction 2026-09-18)
+# ---------------------------------------------------------------------------
+
+
+def test_availability_basis_unknown_without_a_release_date():
+    basis, note = classify_availability_basis(None, datetime(2026, 9, 18, tzinfo=timezone.utc))
+    assert basis == AVAILABILITY_BASIS_UNKNOWN
+    assert note is None
+
+
+def test_availability_basis_unknown_without_an_available_at():
+    basis, note = classify_availability_basis(date(2026, 9, 18), None)
+    assert basis == AVAILABILITY_BASIS_UNKNOWN
+    assert note is None
+
+
+def test_availability_basis_observed_for_a_first_release_pulled_on_schedule():
+    release_date = date(2026, 9, 18)  # a Friday
+    available_at = datetime(2026, 9, 19, 9, 0, tzinfo=timezone.utc)  # next day, 1 pull
+    basis, note = classify_availability_basis(release_date, available_at, distinct_pull_count=1)
+    assert basis == AVAILABILITY_BASIS_OBSERVED
+    assert note is None
+
+
+def test_availability_basis_observed_accepts_the_full_tolerance_window():
+    release_date = date(2026, 9, 18)
+    available_at = date(2026, 9, 21)  # exactly AVAILABILITY_BASIS_TOLERANCE_DAYS (3) later
+    basis, note = classify_availability_basis(release_date, available_at, distinct_pull_count=1)
+    assert basis == AVAILABILITY_BASIS_OBSERVED
+
+
+def test_availability_basis_inferred_for_a_backfilled_record_weeks_late():
+    release_date = date(2026, 6, 5)
+    available_at = date(2026, 9, 18)  # ~15 weeks later -- a historical backfill run
+    basis, note = classify_availability_basis(release_date, available_at, distinct_pull_count=1)
+    assert basis == AVAILABILITY_BASIS_INFERRED
+    assert note == INFERRED_BASIS_NOTE
+
+
+def test_availability_basis_inferred_for_a_revised_report_regardless_of_timing():
+    """A re-pulled report_date is never labelled observed for the original release,
+    even when the (later, winning) pull happens to land inside the tolerance window."""
+    release_date = date(2026, 9, 18)
+    available_at = date(2026, 9, 19)  # would be "observed" on its own
+    basis, note = classify_availability_basis(release_date, available_at, distinct_pull_count=2)
+    assert basis == AVAILABILITY_BASIS_INFERRED
+    assert note == INFERRED_BASIS_NOTE
+
+
+def test_availability_basis_revised_vs_first_release_side_by_side():
+    """Demonstrates the operator's literal scenario within the pure classifier:
+    cftc_positioning_daily's UNIQUE(report_date, contract_code) means only ONE
+    row can ever exist per report_date (immutable, INSERT-only -- see contract
+    doc section 7), so "two vintages of one row" cannot coexist in the table.
+    The comparison instead holds across two report_dates: one pulled once, on
+    schedule (observed); one that raw_series shows was pulled twice (revised),
+    whose only materialized row is the later, inferred-labelled vintage.
+    """
+    first_release_basis, first_release_note = classify_availability_basis(
+        date(2026, 9, 4), date(2026, 9, 5), distinct_pull_count=1
+    )
+    revised_basis, revised_note = classify_availability_basis(
+        date(2026, 9, 11), date(2026, 9, 12), distinct_pull_count=2
+    )
+    assert first_release_basis == AVAILABILITY_BASIS_OBSERVED
+    assert first_release_note is None
+    assert revised_basis == AVAILABILITY_BASIS_INFERRED
+    assert revised_note == INFERRED_BASIS_NOTE
