@@ -18,7 +18,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-_VALID_OPERATOR_CONFIDENCE = ("LOW", "MEDIUM", "HIGH")
+_VALID_OPERATOR_CONFIDENCE = ("LOW", "MEDIUM", "HIGH", "UNSCORED")
 _VALID_VERDICTS = ("HELPED", "HARMED", "NEUTRAL", "INSUFFICIENT_DATA")
 
 
@@ -79,7 +79,8 @@ class DecisionJournal:
             baseline_recommendation: What the baseline would recommend.
             action_taken: The actual action taken by the operator.
             counterfactual: What would have happened with the baseline.
-            operator_confidence: Operator's confidence level ('LOW'/'MEDIUM'/'HIGH').
+            operator_confidence: Operator's confidence level ('LOW'/'MEDIUM'/'HIGH'),
+                or 'UNSCORED' when no confidence was measured at all.
             confidence_reason: Why ``state_confidence`` is what it is.
                 REQUIRED when ``state_confidence`` is ``None``; optional
                 otherwise. Immutable once written.

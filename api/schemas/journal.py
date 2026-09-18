@@ -27,8 +27,8 @@ class JournalEntryCreate(BaseModel):
     @field_validator("operator_confidence")
     @classmethod
     def validate_confidence(cls, v: str) -> str:
-        if v not in ("LOW", "MEDIUM", "HIGH"):
-            raise ValueError("Must be LOW, MEDIUM, or HIGH")
+        if v not in ("LOW", "MEDIUM", "HIGH", "UNSCORED"):
+            raise ValueError("Must be LOW, MEDIUM, HIGH, or UNSCORED")
         return v
 
     @model_validator(mode="after")
