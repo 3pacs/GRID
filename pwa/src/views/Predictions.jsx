@@ -355,7 +355,12 @@ function CalibrationChart({ buckets }) {
 export function PredictionCard({ pred }) {
     const [expanded, setExpanded] = useState(false);
     const isCall = pred.direction === 'CALL' || pred.direction === 'LONG';
-    const confPct = Math.round((pred.confidence || 0) * 100);
+    // A prediction that stated no confidence has none to render. `|| 0`
+    // printed "0%" and drew an empty bar, which reads as a measured
+    // no-confidence call. A genuine measured 0 still renders "0%".
+    const confPct = pred.confidence == null
+        ? null
+        : Math.round(pred.confidence * 100);
     const signals = pred.signals || [];
     const antiSignals = pred.anti_signals || [];
     const bullSignals = signals.filter(s => s.direction === 'bullish');
@@ -387,16 +392,18 @@ export function PredictionCard({ pred }) {
                 <div style={{ textAlign: 'right' }}>
                     <div style={{
                         fontSize: '16px', fontWeight: 800, fontFamily: mono,
-                        color: confPct > 60 ? colors.green : confPct > 30 ? colors.yellow : colors.textMuted,
-                    }}>
-                        {confPct}%
+                        color: confPct == null ? colors.textMuted
+                            : confPct > 60 ? colors.green
+                            : confPct > 30 ? colors.yellow : colors.textMuted,
+                    }} title={confPct == null ? 'No confidence was stated for this prediction' : undefined}>
+                        {confPct == null ? '---' : `${confPct}%`}
                     </div>
                     <div style={{ fontSize: '9px', color: colors.textMuted, letterSpacing: '1px' }}>CONF</div>
                 </div>
             </div>
 
             <div style={s.confBar}>
-                <div style={s.confFill(confPct)} />
+                <div style={s.confFill(confPct == null ? 0 : confPct)} />
             </div>
 
             <div style={s.predMeta}>

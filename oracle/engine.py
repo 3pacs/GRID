@@ -1839,6 +1839,16 @@ class OracleEngine:
             for r in rows:
                 pred_id, ticker, direction, target, entry, expiry, conf, expected, model = r
 
+                # A prediction with no measured entry price is not scorable.
+                # NULL is not a zero entry and a zero entry is not a 0% move:
+                # `(actual - entry) / entry` raises TypeError on the first and
+                # ZeroDivisionError on the second. Same contract as
+                # scripts/score_oracle_trades.py, which requires
+                # `entry_price IS NOT NULL AND entry_price > 0` before it
+                # divides and sweeps everything else to 'no_data'.
+                if entry is None or float(entry) <= 0:
+                    continue
+
                 # Get actual price at expiry
                 actual = self._get_price_at_date(ticker, expiry)
                 if actual is None:
