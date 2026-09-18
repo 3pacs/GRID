@@ -50,6 +50,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from ingestion.altdata.fed_liquidity import RRPONTSYD_TO_MILLIONS
+
 
 # ── Global Central Banks Registry ─────────────────────────────────────
 # Each entry carries the series IDs we try to resolve from raw_series /
@@ -645,7 +647,8 @@ def _build_central_banks_layer(engine: Engine, as_of: date) -> dict:
             if bs_val is not None:  # bs_val is in millions for Fed
                 net_liq = bs_val
                 if reverse_repo is not None:
-                    net_liq -= reverse_repo
+                    # RRPONTSYD is billions; WALCL/WTREGEN are millions
+                    net_liq -= reverse_repo * RRPONTSYD_TO_MILLIONS
                 if tga is not None:
                     net_liq -= tga
 
@@ -656,7 +659,8 @@ def _build_central_banks_layer(engine: Engine, as_of: date) -> dict:
                 rr_1m = _get_fred_value_at(engine, "RRPONTSYD", one_month_ago)
                 tga_1m = _get_fred_value_at(engine, "WTREGEN", one_month_ago)
                 if rr_1m is not None:
-                    net_liq_1m -= rr_1m
+                    # RRPONTSYD is billions; WALCL/WTREGEN are millions
+                    net_liq_1m -= rr_1m * RRPONTSYD_TO_MILLIONS
                 if tga_1m is not None:
                     net_liq_1m -= tga_1m
 
