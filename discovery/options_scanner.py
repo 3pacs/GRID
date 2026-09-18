@@ -1151,24 +1151,10 @@ class OptionsScanner:
                 ON options_mispricing_scans (is_100x) WHERE is_100x = TRUE
             """))
             # Pre-existing deployments created is_100x as NOT NULL DEFAULT
-            # FALSE and without payoff_inputs; bring them in line so an
-            # unmodelled payoff can be stored as NULL rather than as "no".
-            conn.execute(text(
-                "ALTER TABLE options_mispricing_scans "
-                "ADD COLUMN IF NOT EXISTS payoff_inputs JSONB"
-            ))
-            conn.execute(text(
-                "ALTER TABLE options_mispricing_scans "
-                "ALTER COLUMN is_100x DROP NOT NULL"
-            ))
-            conn.execute(text(
-                "ALTER TABLE options_mispricing_scans "
-                "ALTER COLUMN is_100x DROP DEFAULT"
-            ))
-            conn.execute(text(
-                "ALTER TABLE options_mispricing_scans "
-                "ALTER COLUMN payoff_multiple DROP NOT NULL"
-            ))
+            # FALSE, payoff_multiple NOT NULL and no payoff_inputs. That
+            # reshaping is applied by alembic revision
+            # options_rec_scanner_score_0917 at deploy time (and mirrored in
+            # schema.sql), not lazily here on the first scan after a deploy.
 
             count = 0
             for opp in opportunities:
