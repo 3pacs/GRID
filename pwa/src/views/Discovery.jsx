@@ -26,6 +26,131 @@ const jobStatusColors = {
 
 const HYPO_STATES = ['ALL', 'CANDIDATE', 'TESTING', 'PASSED', 'FAILED', 'KILLED', 'PROMOTED'];
 
+const researchRunStatusColors = {
+    started: { bg: '#1A6EBF22', color: '#1A6EBF' },
+    running: { bg: '#1A6EBF22', color: '#1A6EBF' },
+    ok: { bg: '#22C55E22', color: '#22C55E' },
+    failed: { bg: '#EF444422', color: '#EF4444' },
+    timeout: { bg: '#F59E0B22', color: '#F59E0B' },
+    abandoned: { bg: '#5A708022', color: '#5A7080' },
+};
+
+// GRID W4c — reads GET /api/v1/snapshots/research/latest (api/routers/snapshots.py),
+// which wraps scripts/research_status.py::latest_research_run_result. Self-contained
+// fetch/render, same pattern as TestedHypotheses() below: it must not block or be
+// blocked by the main Discovery data load, since a research-run event may not exist
+// at all (a healthy "no data yet" state, not an error).
+//
+// Uses api.get() — the existing generic request helper other views already call for
+// ad-hoc endpoints with no dedicated api.js method (see AttentionRadar.jsx,
+// GeoFlows.jsx, InfluenceNetwork.jsx, Surfacer.jsx, TPS.jsx, Timeline.jsx,
+// Valuation.jsx) — rather than adding a new named method to api.js, which is claimed
+// by another lane in this branch.
+export function ResearchRunPanel() {
+    const [data, setData] = useState(null);
+    const [loaded, setLoaded] = useState(false);
+
+    useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            let result;
+            try {
+                result = await api.get('/api/v1/snapshots/research/latest');
+            } catch (err) {
+                result = { status: 'unavailable', reason: err?.message || 'request failed' };
+            }
+            if (!cancelled) {
+                setData(result);
+                setLoaded(true);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, []);
+
+    if (!loaded) return null;
+
+    if (!data || data.status === 'no_runs') {
+        return (
+            <div style={{ ...shared.cardGradient, marginBottom: tokens.space.xl }}>
+                <div style={shared.sectionTitle}>RESEARCH RUN</div>
+                <div style={{ color: colors.textMuted, fontSize: tokens.fontSize.sm }}>
+                    No research run recorded yet.
+                </div>
+            </div>
+        );
+    }
+
+    if (data.status === 'unavailable') {
+        return (
+            <div style={{ ...shared.cardGradient, marginBottom: tokens.space.xl }}>
+                <div style={shared.sectionTitle}>RESEARCH RUN</div>
+                <div style={{ color: colors.textMuted, fontSize: tokens.fontSize.sm }}>
+                    Research status unavailable: {data.reason || 'unknown reason'}
+                </div>
+            </div>
+        );
+    }
+
+    const sc = researchRunStatusColors[data.status] || researchRunStatusColors.abandoned;
+    const reasons = [
+        ...(data.skip_reasons || []),
+        ...(data.failure_reasons || []),
+    ];
+
+    return (
+        <div style={{ ...shared.cardGradient, marginBottom: tokens.space.xl }}>
+            <div style={shared.sectionTitle}>RESEARCH RUN</div>
+            <div style={{ display: 'flex', gap: tokens.space.sm, alignItems: 'center', flexWrap: 'wrap', marginBottom: tokens.space.sm }}>
+                <span style={{
+                    fontSize: tokens.fontSize.xs, fontWeight: 600,
+                    padding: '3px 10px', borderRadius: tokens.radius.sm,
+                    fontFamily: "'JetBrains Mono', monospace",
+                    background: sc.bg, color: sc.color,
+                }}>
+                    {String(data.status || '').toUpperCase()}
+                </span>
+                {data.phase && (
+                    <span style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted }}>
+                        phase: {data.phase}
+                    </span>
+                )}
+                {data.run_id && (
+                    <span style={{
+                        fontSize: tokens.fontSize.xs, color: colors.textDim,
+                        fontFamily: "'JetBrains Mono', monospace",
+                    }}>
+                        {data.run_id}
+                    </span>
+                )}
+            </div>
+            <div style={{
+                display: 'flex', gap: tokens.space.md, flexWrap: 'wrap',
+                fontSize: tokens.fontSize.xs, color: colors.textMuted, marginBottom: tokens.space.xs,
+            }}>
+                <span>iterations: {data.iterations ?? data.iteration ?? '—'}</span>
+                <span>duration: {data.duration_s != null ? `${data.duration_s}s` : '—'}</span>
+                <span>eval version: {data.inputs?.evaluation_version ?? '—'}</span>
+                <span>sha: {data.code_sha ? data.code_sha.substring(0, 8) : '—'}</span>
+            </div>
+            {data.error && (
+                <div style={{ fontSize: tokens.fontSize.xs, color: colors.red, marginBottom: tokens.space.xs }}>
+                    {data.error}
+                </div>
+            )}
+            {reasons.length > 0 && (
+                <div style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted }}>
+                    reasons: {reasons.join(', ')}
+                </div>
+            )}
+            {data.latest_hypothesis && (
+                <div style={{ fontSize: tokens.fontSize.xs, color: colors.textDim, marginTop: tokens.space.xs }}>
+                    latest hypothesis ({data.latest_hypothesis.state}): {data.latest_hypothesis.statement}
+                </div>
+            )}
+        </div>
+    );
+}
+
 function TestedHypotheses() {
     const { addNotification } = useStore();
     const [results, setResults] = useState([]);
@@ -228,6 +353,8 @@ export default function Discovery({ focusHypothesis = '' }) {
                 </div>
                 <ViewHelp id="discovery" />
             </div>
+
+            <ResearchRunPanel />
 
             {loading && !jobs.length && !orthoResult && !clusterResult ? (
                 <LoadingSkeleton variant="card" count={3} />
