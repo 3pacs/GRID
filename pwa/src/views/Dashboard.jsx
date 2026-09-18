@@ -525,8 +525,14 @@ export default function Dashboard({ onNavigate }) {
                                     ))}
                                 </div>
                                 <span style={{ fontFamily: MONO, fontSize: '11px', fontWeight: 600,
-                                    color: dirColor }}>
-                                    {(evt.combined_confidence * 100).toFixed(0)}%
+                                    color: typeof evt.combined_confidence === 'number'
+                                        ? dirColor : colors.textMuted }}>
+                                    {/* null when no source in the convergence
+                                        carries a scored trust — "unscored",
+                                        never NaN% and never a made-up 50%. */}
+                                    {typeof evt.combined_confidence === 'number'
+                                        ? `${(evt.combined_confidence * 100).toFixed(0)}%`
+                                        : 'unscored'}
                                 </span>
                             </div>
                         );
