@@ -1,0 +1,57 @@
+real_capture_sample.txt -- provenance (W5c, 2026-09-18)
+========================================================
+
+Captured with a single real HTTP GET (1 of the 2 requests allowed for this
+source under the W5c constraints):
+
+    GET https://cdn.finra.org/equity/regsho/daily/CNMSshvol20260916.txt
+    User-Agent: GRID/1.0 (aniksrobot@gmail.com)
+    HTTP/1.1 200 OK  (Server: cloudflare, x-cache: Hit from cloudfront)
+    Captured: 2026-09-18
+
+Full response: 12,283 data lines + header + trailer ("12282"), 543,878
+bytes. This file is a random 60-row sample of that response (seeded via
+`shuf --random-source`) with the original header kept and the trailer
+count rewritten to match the sampled row count (60), so the puller's
+trailer-count cross-check does not fire a spurious mismatch warning on a
+fixture that was deliberately trimmed for repo size. The full untrimmed
+capture was not committed (543 KB; not needed for the parser/reconciliation
+test) -- the URL and byte count above fully describe what was fetched.
+
+IMPORTANT -- format discrepancy vs. the documented layout
+-----------------------------------------------------------
+The FINRA layout PDF (see finra_short_volume.py's module docstring) says:
+
+  - ShortVolume / TotalVolume: "Numeric value, no decimals"
+  - Market: "1 alpha character" (N, Q, B, D, O)
+
+The live response captured above does NOT match either of those:
+
+  - ShortVolume/TotalVolume are fractional (e.g. "638095.307120"), not
+    whole shares.
+  - Market is frequently a comma-joined list of multiple facility codes
+    (e.g. "B,Q,N") rather than a single letter -- 7,932 of 12,283 rows
+    (~65%) have a multi-code Market field.
+
+This module's parser and `series_id()` do not reject either shape (values
+are cast with `float()`, and `market` is stored as whatever string is
+present, uppercased) -- see the added
+`test_parse_real_captured_finra_fixture` /
+`test_real_fixture_reconciles_short_le_total` tests in
+tests/test_source_finra_short_volume.py, which pass against this exact
+fixture. But before this puller is ever activated for real (see the
+scheduler patch), someone should confirm directly with FINRA (or by
+comparing against a second day's file) whether this is:
+  (a) expected behavior for the *consolidated* CNMS file specifically
+      (as opposed to the single-facility FNQC/FNRA/FNSQ/FNYX/FORF files,
+      which may report one row per facility with integer volumes), or
+  (b) evidence that this environment's network path to cdn.finra.org is
+      being intercepted/mocked rather than reaching the real FINRA CDN.
+Not resolved in this pass -- recorded here rather than silently assumed
+either way. `series_id()` will happily mint an id like
+`finra:short_volume:AAPL:B,Q,N` for a multi-code Market value; that is
+almost certainly not the intended series-id shape and should be revisited
+before activation.
+
+Per-request budget used for this source: 1 of 2 allowed. No retry was
+attempted (the response was a 200, not a failure).
