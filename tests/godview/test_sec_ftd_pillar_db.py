@@ -89,7 +89,21 @@ def test_materializer_writes_a_balance_row_with_symbol_and_dollar_value(godview_
 
     result = materialize_sec_ftd_pillar(engine, as_of=release_date)
     assert result.status == "SUCCESS"
-    assert result.rows_written == 1
+    # NOT result.rows_written: raw_series is a shared, cumulative table
+    # this materializer discovers EVERY sec:ftd_balance:* cusip from
+    # (never truncated between test runs), so a global rows_written total
+    # legitimately includes rows left by earlier tests/runs on a
+    # persistent scratch DB (real-Postgres run, composition d92ca9fc: 4
+    # rows across 4 CUSIPs, not 1). Scope to this test's own cusip + the
+    # generation_id this call actually produced.
+    with engine.begin() as conn:
+        own_rows_written = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM sec_regsho_ftd_cns WHERE cusip = :c AND generation_id = :gen"
+            ),
+            {"c": cusip, "gen": result.generation_id},
+        ).scalar()
+    assert own_rows_written == 1
 
     with engine.begin() as conn:
         row = conn.execute(
