@@ -203,3 +203,4 @@ Read the matching file only when the task calls for it — keep this core file l
 | Working on options, the oracle engine, or trial-gem-hunter | `docs/reference/SUBSYSTEMS.md` |
 | Rebuilding SEC ingestion (edgartools) | `docs/planning/SEC_TOOLS_REBUILD.md` |
 | Standing up a web session / hooks | `docs/SERVER-SERVICES.md`, `.claude/CODEBASE_INDEX.md` |
+| Returning a number that might be missing, modelled or stale (any API/analytics output) | `docs/reference/AVAILABILITY_CONTRACT.md` (+ `store/availability.py`, `store/observations.py`) |
