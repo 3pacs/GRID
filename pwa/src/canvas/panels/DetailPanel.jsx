@@ -394,7 +394,20 @@ function connectionBadge(item) {
 /* ── Section Components ──────────────────────────────────────── */
 
 function TrustGauge({ score }) {
-    const pct = (score || 0) * 100;
+    // An unscored actor has no trust score. Drawing an empty gauge labelled
+    // "0%" would read as a measured worst-case
+    // (docs/reference/CONFIDENCE_POLICY.md), so say "unrated" instead.
+    if (typeof score !== 'number') {
+        return (
+            <div style={S.card}>
+                <div style={S.rowLast}>
+                    <span style={S.label}>Trust Score</span>
+                    <span style={S.value}>unrated</span>
+                </div>
+            </div>
+        );
+    }
+    const pct = score * 100;
     const color = trustColor(score);
     return (
         <div style={S.card}>
@@ -422,7 +435,7 @@ function ActorDetail({ node }) {
 
     return (
         <>
-            <TrustGauge score={data.trust_score || data.trustScore || 0} />
+            <TrustGauge score={data.trust_score ?? data.trustScore ?? null} />
 
             {influenceRank && (
                 <div style={S.card}>
