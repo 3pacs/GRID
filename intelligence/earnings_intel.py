@@ -72,6 +72,8 @@ def _ensure_tables(engine: Engine) -> None:
                 earnings_date DATE NOT NULL,
                 predicted_direction TEXT NOT NULL,
                 predicted_move_pct DOUBLE PRECISION,
+                predicted_move_basis TEXT,
+                expected_move_options DOUBLE PRECISION,
                 confidence DOUBLE PRECISION,
                 iv_rank DOUBLE PRECISION,
                 historical_surprise_avg DOUBLE PRECISION,
@@ -87,16 +89,14 @@ def _ensure_tables(engine: Engine) -> None:
                 UNIQUE (ticker, earnings_date)
             )
         """))
-        # Added after the original table shipped: the basis behind predicted_move_pct
-        # and the IV-implied term, so a stored row says which inputs actually existed.
-        conn.execute(text("""
-            ALTER TABLE earnings_predictions
-            ADD COLUMN IF NOT EXISTS predicted_move_basis TEXT
-        """))
-        conn.execute(text("""
-            ALTER TABLE earnings_predictions
-            ADD COLUMN IF NOT EXISTS expected_move_options DOUBLE PRECISION
-        """))
+        # predicted_move_basis / expected_move_options were added after the
+        # original table shipped, so a stored row says which inputs actually
+        # existed behind predicted_move_pct. They are in the CREATE above for a
+        # fresh database; an already-created table is migrated by alembic
+        # revision ``earnings_pred_move_basis_0918``, NOT by a runtime ALTER
+        # here -- ADD COLUMN takes ACCESS EXCLUSIVE on the table and this
+        # function runs on every earnings request.
+        # tests/test_earnings_predictions_schema_parity.py keeps the two in step.
         conn.execute(text("""
             CREATE INDEX IF NOT EXISTS idx_earnings_pred_date
             ON earnings_predictions (earnings_date)
