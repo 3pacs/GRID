@@ -135,41 +135,107 @@ def watchlist_list(scenario: str) -> dict:
 
 
 def news_momentum(scenario: str) -> dict:
+    """GET /api/v1/physics/momentum -> mirrors `MomentumResult.to_dict()`
+    (physics/momentum.py:37-59) exactly: available/sentiment_trend/
+    momentum_direction/energy_state/direction/summary/details/warnings.
+
+    An earlier version of this fixture invented a shape (`status`,
+    `lookback_days`, `series`, `source`) that shares no keys with the real
+    one. `widgets.jsx` NewsCard reads `data?.direction` and `data?.summary`
+    (~:248-249); with the wrong shape both were always `undefined`, so the
+    card showed "It's quiet — no big news right now." even on the
+    `healthy` scenario, where real momentum data existed. That was a pure
+    fixture bug, not a real consumer mismatch — the router's `direction`/
+    `summary` fields do exist and NewsCard reads them correctly.
+    """
     if scenario in ("empty", "partial"):
         # partial: this is the widget that is unavailable while the rest of
         # home (regime, watchlist) is fine. empty: nothing has been computed.
         return {
             "available": False,
-            "status": "unavailable",
-            "reason": "no news_momentum rows in the lookback window",
-            "lookback_days": 63,
-            "series": [],
-            "as_of": None,
+            "sentiment_trend": "unavailable",
+            "momentum_direction": "unavailable",
+            "energy_state": "unavailable",
+            "direction": "unavailable",
+            "summary": "",
+            "details": {},
+            "warnings": ["No price features available"] if scenario == "empty" else ["GDELT lag: latest available data is 2 days old"],
         }
     return {
         "available": True,
-        "status": "ok",
-        "lookback_days": 63,
-        "series": [
-            {"ticker": TICKER, "momentum_score": 0.31, "article_count": 12, "as_of": AS_OF_DATE},
-        ],
-        "as_of": AS_OF_DATE,
-        "source": "physics.news_momentum",
+        "sentiment_trend": "rising",
+        "momentum_direction": "accelerating",
+        "energy_state": "medium",
+        "direction": "bullish",
+        "summary": f"News sentiment for {TICKER} is rising and accelerating — tone is net bullish this week.",
+        "details": {"lookback_days": 63, "as_of": AS_OF_DATE},
+        "warnings": [],
     }
+
+
+def alerts_list(scenario: str) -> dict:
+    """GET /api/v1/alerts -> mirrors api/routers/price_alerts.py::list_alerts
+    (~line 186-203): `{"alerts": [{id,ticker,direction,threshold,note,active,
+    created_at,triggered_at,last_price,price_at_create}]}`.
+
+    This route had no fixture at all — the fixture server 404'd on it, so
+    Home's alerts panel (`loadAlerts`, Home.jsx:42-46) silently caught the
+    error and left the panel empty on every scenario, including `healthy`.
+    """
+    if scenario == "empty":
+        return {"alerts": []}
+    alert = {
+        "id": 1, "ticker": TICKER, "direction": "above", "threshold": 110.0,
+        "note": "Tell me when TEST1 hits $110", "active": True,
+        "created_at": "2026-09-10T00:00:00+00:00", "triggered_at": None,
+        "last_price": 100.0, "price_at_create": 95.0,
+    }
+    if scenario == "partial":
+        # A second alert exists but has already triggered — recently
+        # triggered alerts stay visible for 7 days per the router's own
+        # WHERE clause, distinct from the still-active one above.
+        return {"alerts": [alert, {
+            "id": 2, "ticker": "TEST2", "direction": "below", "threshold": 40.0,
+            "note": None, "active": False,
+            "created_at": "2026-09-08T00:00:00+00:00", "triggered_at": "2026-09-14T00:00:00+00:00",
+            "last_price": 38.0, "price_at_create": 45.0,
+        }]}
+    return {"alerts": [alert]}
 
 
 def sector_flows(scenario: str) -> dict:
+    """GET /api/v1/flows/sectors -> mirrors api/routers/flows.py::get_sectors
+    (~line 267-284): `sectors` is a DICT keyed by sector name (not a list),
+    each value carrying `sector_stress` (not `flow_1d_pct`/`flow_5d_pct`,
+    which don't exist on this endpoint). The cold/empty payload is exactly
+    `{"sectors": {}, "stale": True, "unavailable": True}` (flows.py:478).
+
+    `widgets.jsx` MoneyFlowCard filters entries with
+    `typeof s?.sector_stress === 'number'` (~:270-274) — an earlier version
+    of this fixture used the wrong top-level type (a list) and the wrong
+    field name (`flow_1d_pct`), so every entry failed that filter and the
+    card always rendered "Nothing notable moving right now." even on
+    `healthy`.
+    """
     if scenario == "empty":
-        return {"sectors": [], "as_of": None, "available": False, "reason": "no flow data"}
-    return {
-        "sectors": [
-            {"sector": "Technology", "flow_1d_pct": 0.0, "flow_5d_pct": 1.2, "as_of": AS_OF_DATE},
-            {"sector": "Energy", "flow_1d_pct": -0.4, "flow_5d_pct": -2.1, "as_of": AS_OF_DATE},
-        ],
-        "as_of": AS_OF_DATE,
-        "available": True,
-        "source": "flows.sector_flows",
+        return {"sectors": {}, "stale": True, "unavailable": True}
+    sectors = {
+        "Technology": {
+            "etf": "XLK", "etf_price": 210.0, "etf_change_30d": 0.03, "etf_z": 0.4,
+            "etf_options": None, "actors": [], "sector_stress": 0.8, "subsectors": ["semiconductors"],
+        },
+        "Energy": {
+            "etf": "XLE", "etf_price": 90.0, "etf_change_30d": -0.02, "etf_z": -0.3,
+            "etf_options": None, "actors": [], "sector_stress": -0.5, "subsectors": ["oil_gas"],
+        },
     }
+    payload = {"sectors": sectors, "computed_at": GENERATED_AT}
+    if scenario == "partial":
+        # Snapshot is stale (seeded from a persisted snapshot on cold start,
+        # flows.py:347-386) rather than freshly computed — MoneyFlowCard
+        # shows "Data as of {ageLabel}" instead of treating it as live.
+        payload["snapshot_age_s"] = 21600.0  # 6h old
+    return payload
 
 
 # ── Journey (b): ticker investigation ────────────────────────────────
@@ -542,9 +608,19 @@ def _dad_decision_stack(scenario: str, summary: dict | None, gold: dict) -> dict
         {"source": "GRID price history", "state": "watch" if scenario != "empty" else "missing",
          "points": 6.0 if scenario != "empty" else 0.0,
          "detail": "1Y +2.0%, 0.0% from 1Y high" if scenario != "empty" else "No GRID chart history."},
-        {"source": "Finviz fundamentals", "state": "caution" if scenario == "partial" else ("watch" if scenario == "healthy" else "missing"),
+        {"source": "Finviz fundamentals",
+         "state": "caution" if scenario == "partial" else ("watch" if scenario == "healthy" else "missing"),
          "points": 4.0 if scenario == "healthy" else 0.0,
-         "detail": "Finviz fundamentals are stale; refresh before making the call." if scenario == "partial" else "2 fields, fresh",
+         # Must agree with FinvizPanel's own "unavailable, 0 fields, missing"
+         # for this same scenario (dad_ticker_finviz / _dad_finviz above) —
+         # an earlier version of this card said "2 fields, fresh" even when
+         # `empty` had zero Finviz rows, contradicting the Finviz panel in
+         # the same response.
+         "detail": (
+             "Finviz fundamentals are stale; refresh before making the call." if scenario == "partial"
+             else "0 fields, missing" if scenario == "empty"
+             else "2 fields, fresh"
+         ),
          "inputs": {"forward_pe": 18.0 if scenario != "empty" else None, "roe": None, "debt_equity": None,
                      "profit_margin": None, "eps_next_5y": None},
          "skipped_fields": ["roe", "debt_equity", "profit_margin", "eps_next_5y"]},
@@ -842,7 +918,11 @@ def watchlist_portfolio(scenario: str) -> dict:
         "display_name": "Test One Corp",
         "price": 100.0,
         "change_1d": 0.0,
-        "change_1w": 1.0,
+        # Fraction, not percent — same convention as change_1d
+        # (watchlist_helpers.py `pct_1w = round((last-first)/first, 5)`).
+        # An earlier version used 1.0 here (= "+100.00%" once Portfolio.jsx's
+        # fmtPct multiplies by 100), a straight units-convention mistake.
+        "change_1w": 0.012,
         "weight": 1.0,
         "sector": "Technology",
         "asset_type": "stock",
@@ -922,7 +1002,13 @@ def ticker_edge(ticker: str, scenario: str) -> dict:
                 "cluster": False,
             },
         ],
-        "dark_pool": {"available": True, "relative_volume": 1.0, "as_of": AS_OF_DATE},
+        # Mirrors watchlist_overview.py:572-578 (composed-g) exactly:
+        # {volume_vs_avg, signal, date} — not {available, relative_volume,
+        # as_of}. An earlier version used the wrong shape; WatchlistAnalysis
+        # .jsx:391 reads `dark_pool.volume_vs_avg?.toFixed(1)`, and since
+        # `undefined` coerces to the literal string "undefined" in a
+        # template literal, the panel rendered "undefinedx avg volume".
+        "dark_pool": {"volume_vs_avg": 1.0, "signal": "accumulation", "date": AS_OF_DATE},
         "whale_flow": [
             {"strike": 100.0, "expiry": "2026-10-16", "direction": "BUY", "premium": 25000, "date": "2026-09-12"},
         ],
@@ -931,8 +1017,10 @@ def ticker_edge(ticker: str, scenario: str) -> dict:
         "convergence": [],
     }
     if scenario == "partial":
-        # dark pool relative volume is unavailable while the rest of /edge is fine.
-        payload["dark_pool"] = {"available": False, "reason": "no dark-pool print in lookback window"}
+        # volume_vs_avg is unmeasured (null, never a fabricated 1.0) while
+        # the rest of /edge is fine — this dark-pool print's metadata simply
+        # didn't carry a volume_vs_avg (composed-g's own comment, same file).
+        payload["dark_pool"] = {"volume_vs_avg": None, "signal": "accumulation", "date": AS_OF_DATE}
     return payload
 
 
@@ -1071,6 +1159,18 @@ def pipeline_health(scenario: str) -> dict:
 # ── Journey (e): data health / source drill-down ────────────────────
 
 def system_health(scenario: str) -> dict:
+    """GET /api/v1/system/health -> mirrors api/routers/system.py::health.
+
+    Operator.jsx reads several `checks` fields this fixture originally
+    omitted: `disk_percent`/`disk_free_gb` (system.py:157-158, ":189-192"
+    template `Disk: {pct}% ({free}GB free)"`), `api_keys_configured`/
+    `api_keys_total` (system.py:197-198, ":193-196" template
+    `"API Keys: {configured}/{total}"`), `ws_clients` (system.py:148),
+    `llm_available` (system.py:168), and `thread_ingestion`
+    (system.py:141, `checks[f"thread_{name}"]`). Omitting them didn't error
+    (Operator.jsx has no null-guard on any of these), it rendered
+    "Disk: % (GB free)" and "API Keys: /" with the numbers missing.
+    """
     if scenario == "empty":
         return {
             "status": "degraded",
@@ -1082,8 +1182,15 @@ def system_health(scenario: str) -> dict:
                 "pool_size": 5,
                 "pool_checked_out": 0,
                 "pool_overflow": 0,
+                "disk_percent": 24.0,
+                "disk_free_gb": 380.0,
+                "api_keys_configured": 0,
+                "api_keys_total": 5,
+                "ws_clients": 0,
+                "llm_available": False,
+                "thread_ingestion": False,
             },
-            "degraded_reasons": ["no features registered", "no data pulled in 7 days"],
+            "degraded_reasons": ["no features registered", "no data pulled in 7 days", "thread 'ingestion' not running"],
         }
     checks = {
         "database": True,
@@ -1093,11 +1200,19 @@ def system_health(scenario: str) -> dict:
         "pool_size": 5,
         "pool_checked_out": 1,
         "pool_overflow": 0,
+        "disk_percent": 24.0,
+        "disk_free_gb": 380.0,
+        "api_keys_configured": 4,
+        "api_keys_total": 5,
+        "ws_clients": 0,
+        "llm_available": True,
+        "thread_ingestion": True,
     }
     degraded_reasons: list[str] = []
     status = "ok"
     if scenario == "partial":
         checks["recent_data"] = False
+        checks["llm_available"] = False
         degraded_reasons.append("no data pulled in 7 days")
         status = "degraded"
     return {"status": status, "checks": checks, "degraded_reasons": degraded_reasons}
@@ -1229,7 +1344,13 @@ def watchlist_ticker_analysis(ticker: str, scenario: str) -> dict:
         "price_history": price_history, "price_source": "grid",
         "related_features": [{"name": f"{ticker}_close", "z_score": 0.4}],
         "options": [],
-        "regime": {"state": "RISK_ON", "confidence": 0.62} if scenario == "healthy" else None,
+        # Mirrors watchlist_analysis.py:264-267 exactly: state/confidence/
+        # posture/as_of. `posture` (from decision_journal.grid_recommendation)
+        # was missing from an earlier version of this fixture;
+        # WatchlistAnalysis.jsx:1411 reads `regime.posture || '--'` — an
+        # honest fallback, but it fired for every scenario because the
+        # field was simply absent, not because it was legitimately unmeasured.
+        "regime": {"state": "RISK_ON", "confidence": 0.62, "posture": "Risk-On / Overweight Growth", "as_of": AS_OF_DATE},
         "tradingview_signals": [],
     }
     return payload
@@ -1244,7 +1365,15 @@ def watchlist_ticker_overview(ticker: str, scenario: str) -> dict:
                  "key_levels": [], "sentiment": "unknown", "generated_at": GENERATED_AT, "sector_path": []}
     return {
         "overview": f"{ticker} is trading near its 5-day range with a risk-on macro backdrop.",
-        "key_levels": [{"level": 98.0, "label": "5D low"}, {"level": 100.0, "label": "5D high"}],
+        # key_levels items are {"label": ..., "value": ...} — mirrors
+        # watchlist_overview.py:250-256 exactly. An earlier version used a
+        # "level" key instead of "value"; WatchlistAnalysis.jsx:217 reads
+        # `level.value`, so that typo rendered "5D low: $" with nothing
+        # after the "$" (AIOverviewCard), and separately fed `undefined`
+        # into PriceChart.jsx:121's `yScale(level.value)` as `keyLevels`,
+        # producing the browser console's
+        # `<text> attribute y: Expected length, "NaN"` warning.
+        "key_levels": [{"label": "5D low", "value": 98.0}, {"label": "5D high", "value": 100.0}],
         "sentiment": "neutral" if scenario == "partial" else "constructive",
         "generated_at": GENERATED_AT,
         "sector_path": ["Technology"],
@@ -1377,10 +1506,35 @@ def discovery_jobs(scenario: str) -> dict:
 
 def discovery_results(result_type: str, scenario: str) -> dict:
     """GET /api/v1/discovery/results/{orthogonality|clustering} -> mirrors
-    api/routers/discovery.py:129-149."""
-    if scenario != "healthy":
+    api/routers/discovery.py:129-149, which returns `job["result"]` as-is —
+    i.e. the raw summary dict from discovery/orthogonality.py or
+    discovery/clustering.py, not a generic wrapper.
+
+    Discovery.jsx reads orthoResult.{n_features_analyzed,true_dimensionality}
+    (discovery/orthogonality.py:368-370) and clusterResult.{best_k,
+    pca_components_used,variance_explained} (discovery/clustering.py:
+    247-252) directly off `result`. An earlier version of this fixture
+    returned `{"type", "generated_at", "summary": "..."}` instead — none of
+    those keys exist on the real result, so `orthoResult.n_features_analyzed`
+    etc. were `undefined` (rendered blank) and
+    `clusterResult.variance_explained * 100` was `undefined * 100` = `NaN`
+    (Discovery.jsx:339 has no null-guard on that multiply — see README
+    "Defects observed").
+    """
+    if scenario == "empty" or (scenario == "partial" and result_type == "clustering"):
         return {"result": None, "message": f"No completed {result_type} run found"}
-    return {"result": {"type": result_type, "generated_at": GENERATED_AT, "summary": "synthetic fixture result"}}
+    if result_type == "orthogonality":
+        result = {
+            "n_features_analyzed": 40, "n_features_dropped": 2,
+            "true_dimensionality": 6, "variance_explained_by_true_dim": 0.82,
+            "by_family": {"macro": 4, "options": 2}, "total_features": 40,
+        }
+    else:
+        result = {
+            "best_k": 4, "pca_components_used": 6, "variance_explained": 0.82,
+            "silhouette": 0.41, "gmm_persistence_days": 30,
+        }
+    return {"result": result}
 
 
 def discovery_hypotheses(scenario: str) -> dict:
@@ -1427,8 +1581,14 @@ def ticker_quote(ticker: str, scenario: str) -> dict:
         return {"ticker": ticker, "price": None, "change_pct": None, "put_call_ratio": None,
                  "max_pain": None, "iv_atm": None, "sentiment": None, "source": None,
                  "as_of": None, "stale": None}
+    # Deliberately non-zero on `healthy` (0.6%, not 0.0%): a measured flat
+    # day (change_pct == 0.0) is legitimate and would render "+0.0%"
+    # correctly, but a fixture-chosen exact 0.0 is easy to mistake for a
+    # missing-value default when reading the rendered page, so this fixture
+    # avoids the ambiguity rather than actually being broken (unlike the
+    # other fields fixed in this pass, this one worked; see README).
     return {
-        "ticker": ticker, "price": 100.0, "change_pct": 0.0 if scenario == "healthy" else -0.4,
+        "ticker": ticker, "price": 100.0, "change_pct": 0.6 if scenario == "healthy" else -0.4,
         "put_call_ratio": 0.9, "max_pain": 100.0, "iv_atm": 0.35,
         "sentiment": "neutral", "source": "grid", "as_of": AS_OF_DATE,
         "stale": scenario == "partial",

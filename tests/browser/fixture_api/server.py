@@ -50,6 +50,7 @@ ROUTES: list[tuple[str, re.Pattern, callable]] = [
     ("POST", re.compile(r"^/api/v1/chat/compose$"), lambda m, q, s: fx.chat_compose(s)),
     ("GET", re.compile(rf"^/api/v1/watchlist/(?P<ticker>{_TICKER_RE})/quote$"),
      lambda m, q, s: fx.ticker_quote(m.group("ticker"), s)),
+    ("GET", re.compile(r"^/api/v1/alerts$"), lambda m, q, s: fx.alerts_list(s)),
     ("GET", re.compile(r"^/api/v1/ten-year-portfolio/weekly$"),
      lambda m, q, s: fx.ten_year_portfolio_weekly(s)),
 

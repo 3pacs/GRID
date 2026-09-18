@@ -280,8 +280,103 @@ per instructions.
    `>=0` ternary treat `undefined` as falsy/null, not as `0`), so it isn't
    a fabricated-zero defect like #2, but it is a permanently-dead UI field
    reading data the API contract says will never exist.
+4. **`pwa/src/views/WatchlistAnalysis.jsx:1170-1174` and `:1346-1372`** — the
+   GEX and Vanna/Charm panels are wired as `Promise.allSettled(...).then(...)`
+   with `if (!gexResult.value?.error) setGexData(...)` (same for
+   vanna-charm); on the router's own `{"error": ..., "ticker": ...}` shape
+   (a real, documented response — `api/routers/derivatives.py:81-95`,
+   `:172-192` — not an HTTP failure), the state is simply never set. The
+   render is `{gexData ? <GEXProfile .../> : gexLoading ? <Skeleton/> :
+   null}` (line 1347-1360) and `{vannaCharmData && <VannaCharmViz .../>}`
+   with **no else branch at all** (line 1363-1372) — both panels vanish
+   silently with no "unavailable" state, unlike the Finviz/options panels
+   elsewhere on the same page. Reproduced directly (not inferred): both
+   fixtures return the router's `{"error": ...}` shape in `partial`, and
+   the corresponding panels do not render.
+5. **`pwa/src/views/Discovery.jsx:339`** —
+   `` `${(clusterResult.variance_explained * 100).toFixed(1)}%` `` has no
+   null-guard, unlike its sibling rows (`n_features_analyzed`/`true_dimensionality`
+   at lines 309-310 render `undefined` as blank, which is at least not a
+   fabricated number). If `clusterResult` is ever set with
+   `variance_explained` missing or `null`, this renders the literal string
+   `"NaN%"`. In this harness the actual trigger was an incomplete fixture
+   (see "Router function mirrored" — now fixed), but the arithmetic-without-a-guard
+   pattern is the latent defect: any future response shape gap reproduces it.
+6. **`pwa/src/views/Operator.jsx:295`** —
+   `` {status.database.size_mb && ` · ${(status.database.size_mb / 1024).toFixed(1)}GB`} ``.
+   When `size_mb` is exactly `0` (a real, measured "database has no data yet"
+   reading, not an absent one — this harness's `empty` scenario), JavaScript's
+   `&&` returns the falsy left operand itself (`0`), and React renders a bare
+   number `0` as text. Result: `DB: Disconnected0`. The fix pattern used
+   elsewhere on the same page (`!= null` checks) is not applied here.
+7. **`pwa/src/views/TenYearPortfolio.jsx:762`** —
+   `<strong>{data?.as_of || 'loading'}</strong>` under the "As of" label.
+   On the router's own `{"status": "empty", ...}` response (a completed,
+   honest "no eligible price history" result —
+   `api/routers/ten_year_portfolio.py:286-291` — not a pending request),
+   `data.as_of` is `null`, and the fallback string is the literal word
+   `"loading"` — used here as a static placeholder, not a live spinner. The
+   page has finished loading; nothing further will ever arrive, but the UI
+   keeps saying "loading" forever. Same family at line 754:
+   `{activeProfile?.description || 'Waiting for the weekly portfolio query.'}`
+   — again phrased as an in-progress state for a query that has already
+   completed and genuinely found nothing.
 
-## Shape differences: main vs. composed-g (44019a43)
+Items #4-#7 above were surfaced by the lead's browser run (see the
+classification table below), not by static reading alone; #1-#3 were found
+while building the fixtures.
+
+## Classification: residual renders from the lead's browser run
+
+The lead drove the real browser against this harness after the fixture
+corrections above and found further renders. Each is classified as either
+**FIXTURE GAP** (this harness's bug — fixed in this pass) or **VIEW DEFECT**
+(a real `pwa/src` issue, recorded above, not fixed). Where a missing field
+made a view render `NaN`/blank/bare-punctuation, both the fixture gap and
+the underlying view fragility are recorded, per the lead's instruction.
+
+| # | Symptom | Classification | Root cause / fix |
+|---|---|---|---|
+| 1 | WatchlistAnalysis AI overview: `"5D low: $"` / `"5D high: $"`, no numbers | FIXTURE GAP | `watchlist_ticker_overview`'s `key_levels` used key `"level"`; the view reads `level.value` (`WatchlistAnalysis.jsx:217`). Fixed. |
+| 2 | Operator subsystem health: `"Disk: % (GB free)"`, `"API Keys: /"` empty | FIXTURE GAP | `system_health`'s `checks` never had `disk_percent`/`disk_free_gb`/`api_keys_configured`/`api_keys_total`/`ws_clients`/`llm_available`/`thread_ingestion` (`Operator.jsx:189-198`). Fixed. |
+| 3 | Discovery: `"Variance explained NaN%"`, blank Features/dimensionality/Best k/PCA | FIXTURE GAP (+ latent VIEW DEFECT #5) | `discovery_results` returned a made-up `{type,generated_at,summary}` wrapper instead of the real `orthoResult`/`clusterResult` fields (`Discovery.jsx:309-310,337-339`). Fixed; #5 above records the unguarded multiply regardless. |
+| 4 | WatchlistAnalysis regime context: `"Posture --"` | FIXTURE GAP | `watchlist_ticker_analysis`'s `regime` omitted `posture`/`as_of` (`watchlist_analysis.py:264-267`; view: `WatchlistAnalysis.jsx:1411`, an otherwise-honest `|| '--'` fallback). Fixed. |
+| 5 | Console: `<text> attribute y: Expected length, "NaN"` on watchlist-analysis (partial) | FIXTURE GAP (same root as #1) | `PriceChart.jsx:121`'s `yScale(level.value)` on the same wrong `key_levels` shape as #1. Fixed by #1's fix; `PriceChart.jsx` has no defensive guard on `level.value`, which is a minor latent fragility but not classified as a standalone defect since the router never actually sends a level without a `value`. |
+| 6 | Portfolio: `"1W CHG +100.00%"` for TEST1 while 1D is `"+0.00%"` | FIXTURE GAP | `watchlist_portfolio`'s `change_1w` was `1.0` instead of a small fraction like real `pct_1w` values (`watchlist_helpers.py:370`, fraction convention, same as `change_1d`). Fixed to `0.012`. |
+| 7 | WatchlistAnalysis (partial): GEX and Vanna/Charm panels vanish with no message | VIEW DEFECT | See "Defects observed" #4 above (`WatchlistAnalysis.jsx:1170-1174`, `:1346-1372`). Not fixed. |
+| 8 | Console NaN on watchlist-analysis (partial) — same as #5 | FIXTURE GAP | Same cause and fix as #5; this was the "partial"-scenario instance of the same `key_levels` bug. |
+| 9 | Ticker-lookup (empty): decision-stack "Finviz fundamentals 0.0 pts — 2 fields, fresh" contradicts the Finviz panel's "unavailable, 0 fields, missing" in the same response | FIXTURE GAP | `_dad_decision_stack`'s Finviz card `detail` string had a two-way ternary (`partial` vs. else) that fell through to the "healthy" wording for `empty` too. Fixed to say "0 fields, missing" for `empty`, matching the Finviz panel. |
+| 10 | `#/ten-year` (empty): "INVESTED $0 / CASH $0" and "AS OF loading" forever, "Waiting for the weekly portfolio query." | VIEW DEFECT (2 lines) | See "Defects observed" #2 (`money()`, `:69-76`/`:178`) and #7 (`:762`, `:754`) above. Router's own `{"status": "empty"}` is a completed, honest result — not a pending load. Not fixed. |
+| 11 | Operator (empty): `"DB: Disconnected0"` | VIEW DEFECT | See "Defects observed" #6 above (`Operator.jsx:295`, `size_mb && ...` on a real `size_mb: 0`). Not fixed. |
+| 12 | Dad mode, home: news widget says "It's quiet — no big news right now." on a healthy momentum reading | FIXTURE GAP | `news_momentum` invented a shape (`status`/`lookback_days`/`series`/`source`) sharing no keys with the real `MomentumResult.to_dict()` (`physics/momentum.py:37-59`: `available`/`sentiment_trend`/`momentum_direction`/`energy_state`/`direction`/`summary`/`details`/`warnings`). `NewsCard` reads `data?.direction`/`data?.summary` (`widgets.jsx:248-249`), which are correct field names — this was a pure fixture bug, not a real consumer mismatch. Fixed. |
+| 13 | Dad mode, home: money-flow widget says "Nothing notable moving right now." on a healthy sectors reading | FIXTURE GAP | `sector_flows` returned a `list` under `sectors` with fields `flow_1d_pct`/`flow_5d_pct`; the real endpoint returns a **dict** keyed by sector name with a `sector_stress` field (`flows.py:267-284`). `MoneyFlowCard` filters on `typeof s?.sector_stress === 'number'` (`widgets.jsx:270-274`), which every entry failed. Fixed. |
+| 14 | Dad mode, home: ticker pulse shows `"TEST1 $100 +0.0%"` | Not a defect (fixture clarity change) | `ticker_quote`'s `change_pct` was a real `0.0` (a legitimate flat-day reading) and rendered correctly as `+0.0%`. Changed to a non-zero `0.6` anyway so a real measured zero is never visually indistinguishable from "the fixture forgot this field" while eyeballing the page. |
+| 15 | Dad mode, home: alerts panel always empty | FIXTURE GAP (missing route) | `GET /api/v1/alerts` had no route at all (404); `Home.jsx`'s `loadAlerts()` catches the failure silently. Added `alerts_list` mirroring `price_alerts.py::list_alerts` (~line 186-203) and the route. |
+| 16 | Dad mode, `#/ten-year`: "If it goes poorly $900,000 / Most likely $1,400,000 / If it goes well $2,100,000", "In about 78% of the outcomes...", "Yearly growth 8.0%, bumpiness 22%, vs big tech about 12% a year" | Not a defect — all router fields | Every one of these is a direct, unmodified passthrough of a router-emitted field, confirmed by reading `TenYearPortfolio.jsx`: `mc?.p10`/`p50`/`p90`/`probability_above_start`/`expected_annual_return`/`annual_volatility` (all from `activeProfile.monte_carlo`, `:342,:416-417`, `build_monte_carlo_projection`, `ten_year_portfolio.py:415+`) and `benchCagr = data?.benchmark?.cagr` (`:417`). `pct()`/`money()` (`:64-81`) are pure formatters — no client-side computation, no literal/default in the view. All supplied by `ten_year_portfolio_weekly`'s `monte_carlo`/`benchmark` fixture blocks. |
+
+## Dad mode — exact steps (this is the journey Anik will see)
+
+1. Stop the fixture server if running, then start it with
+   `FIXTURE_ROLE=contributor python tests/browser/fixture_api/server.py --port 8000 --scenario healthy`.
+2. In the browser, clear `localStorage` for `http://localhost:5173` (devtools →
+   Application → Local Storage → clear), or open a private window — a
+   leftover `grid_token`/`grid_role` from a prior admin session will
+   otherwise skip straight past the role gate.
+3. Open `http://localhost:5173/`, submit the login form with any password
+   (the fixture server ignores the value — see "Auth" above).
+4. `pwa/src/authSession.js:57`'s `isSimpleUser()` gate now reads role
+   `contributor` from the fixture token and switches the shell: simplified
+   nav (just the contributor's two pages), larger text, the
+   `stepdad.finance` Home composer with suggestion chips
+   (`pwa/src/views/Home.jsx`'s `SUGGESTIONS`) instead of the full operator
+   cockpit.
+5. Type or tap a suggestion (e.g. "How are my stocks doing?") — this posts
+   `POST /api/v1/chat/compose`, which returns the six-widget layout; each
+   widget then independently fetches its own data (regime, watchlist,
+   news, money flow, ticker pulse, and the verdict's SSE stream). Verified
+   end to end in `healthy`: all six render, the verdict streams text, and
+   the alerts panel (once fixture #15 above landed) shows the one active
+   `TEST1` alert.
 
 The base tree (`origin/main` @ `3fe3f5ef`, this worktree's parent) and the
 composed-g tree differ in `api/routers/intelligence_risk.py` and
