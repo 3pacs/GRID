@@ -1,10 +1,23 @@
 """Tests for ``intelligence.signal_weight_overrides``.
 
-Covers the 2026-09-18 GRID W7 safeguard change: overrides now default
-OFF, and even when the master switch is on, nothing is applied unless
-governance.promotion_ledger has an approved record for the exact
-override set (subject_hash + evaluation_version). See that module's
-docstring for the full rationale.
+Covers the 2026-09-18 GRID W7b split: the safeguard *capability*
+(promotion-ledger enforcement) is now independent of the operational
+*policy* of whether it's turned on. Current production behaviour is
+preserved by default:
+
+* ``GRID_SIGNAL_OVERRIDES_ENABLED`` defaults to True (legacy default,
+  restored).
+* ``GRID_SIGNAL_OVERRIDES_REQUIRE_LEDGER`` (new) defaults to False —
+  legacy behaviour exactly: overrides apply with no ledger check, but
+  one WARNING is logged (naming the knob) the first time they do.
+* Setting ``GRID_SIGNAL_OVERRIDES_REQUIRE_LEDGER=true`` gates
+  overrides behind an approved ``governance.promotion_ledger`` record,
+  exactly like the previous (now-superseded) always-on ledger gate.
+
+See that module's docstring for the full rationale, and
+``docs/reference/LEARNING_PROMOTION_PROTOCOL.md`` for the held
+operational decision to actually flip the defaults (tracked on
+``fable/overrides-policy-20260918``, not here).
 """
 
 from __future__ import annotations
@@ -17,10 +30,12 @@ from intelligence import signal_weight_overrides
 @pytest.fixture(autouse=True)
 def _reset_module_state(monkeypatch):
     """Keep tests isolated from env-derived module state and the
-    "warned once" latch."""
+    "warned once" latches."""
     monkeypatch.setattr(signal_weight_overrides, "_warned_missing_promotion", False)
+    monkeypatch.setattr(signal_weight_overrides, "_warned_legacy_no_ledger", False)
     yield
     monkeypatch.setattr(signal_weight_overrides, "_warned_missing_promotion", False)
+    monkeypatch.setattr(signal_weight_overrides, "_warned_legacy_no_ledger", False)
 
 
 def _force_promoted(monkeypatch, promoted: bool) -> None:
@@ -31,21 +46,65 @@ def _force_promoted(monkeypatch, promoted: bool) -> None:
     )
 
 
-def test_overrides_disabled_by_default():
-    """GRID_SIGNAL_OVERRIDES_ENABLED must default to False (behaviour
-    change from the prior default-True)."""
-    assert signal_weight_overrides.SIGNAL_OVERRIDES_ENABLED is False
+def test_overrides_enabled_by_default():
+    """GRID_SIGNAL_OVERRIDES_ENABLED must default to True (the
+    pre-existing production default, restored/preserved by W7b)."""
+    assert signal_weight_overrides.SIGNAL_OVERRIDES_ENABLED is True
 
 
-def test_disabled_master_switch_applies_nothing_regardless_of_ledger(monkeypatch):
+def test_require_ledger_disabled_by_default():
+    """GRID_SIGNAL_OVERRIDES_REQUIRE_LEDGER must default to False —
+    the new knob does not change behaviour unless explicitly set."""
+    assert signal_weight_overrides.SIGNAL_OVERRIDES_REQUIRE_LEDGER is False
+
+
+def test_disabled_master_switch_applies_nothing_regardless_of_require_ledger(monkeypatch):
     monkeypatch.setattr(signal_weight_overrides, "SIGNAL_OVERRIDES_ENABLED", False)
+    monkeypatch.setattr(signal_weight_overrides, "SIGNAL_OVERRIDES_REQUIRE_LEDGER", False)
+    assert signal_weight_overrides.get_override("equity") == 1.0
+    assert signal_weight_overrides.get_effective_overrides() == {}
+
+    monkeypatch.setattr(signal_weight_overrides, "SIGNAL_OVERRIDES_REQUIRE_LEDGER", True)
     _force_promoted(monkeypatch, True)  # even "promoted" doesn't matter if OFF
     assert signal_weight_overrides.get_override("equity") == 1.0
     assert signal_weight_overrides.get_effective_overrides() == {}
 
 
-def test_enabled_without_ledger_entry_applies_nothing_and_warns_once(monkeypatch):
+def test_legacy_default_applies_overrides_and_warns_once(monkeypatch):
+    """require_ledger=False (default): overrides apply exactly like
+    pre-W7 legacy behaviour, but exactly one WARNING is logged the
+    first time, naming GRID_SIGNAL_OVERRIDES_REQUIRE_LEDGER."""
     monkeypatch.setattr(signal_weight_overrides, "SIGNAL_OVERRIDES_ENABLED", True)
+    monkeypatch.setattr(signal_weight_overrides, "SIGNAL_OVERRIDES_REQUIRE_LEDGER", False)
+
+    warnings = []
+    monkeypatch.setattr(
+        signal_weight_overrides.log,
+        "warning",
+        lambda *a, **k: warnings.append((a, k)),
+    )
+
+    assert signal_weight_overrides.get_override("equity") == pytest.approx(1.20)
+    assert signal_weight_overrides.get_override("vol") == pytest.approx(0.30)
+    assert signal_weight_overrides.get_override(" commodity ") == pytest.approx(1.10)
+
+    effective = signal_weight_overrides.get_effective_overrides()
+    assert effective["equity"] == pytest.approx(1.20)
+    assert effective["news_intel"] == pytest.approx(0.60)  # deferred set included
+
+    assert len(warnings) == 1, "expected exactly one WARNING on first use"
+    msg = str(warnings[0])
+    assert "GRID_SIGNAL_OVERRIDES_REQUIRE_LEDGER" in msg
+
+    # Further calls must NOT warn again (log once).
+    signal_weight_overrides.get_override("equity")
+    signal_weight_overrides.get_effective_overrides()
+    assert len(warnings) == 1, "must not warn a second time (log once)"
+
+
+def test_require_ledger_without_approval_applies_nothing_and_warns_once(monkeypatch):
+    monkeypatch.setattr(signal_weight_overrides, "SIGNAL_OVERRIDES_ENABLED", True)
+    monkeypatch.setattr(signal_weight_overrides, "SIGNAL_OVERRIDES_REQUIRE_LEDGER", True)
 
     # Exercise the real _is_override_set_promoted() (not stubbed) by
     # making the underlying ledger lookup fail — the real function
@@ -74,8 +133,9 @@ def test_enabled_without_ledger_entry_applies_nothing_and_warns_once(monkeypatch
     assert len(warnings) == 1, "must not warn a second time (log once)"
 
 
-def test_enabled_with_matching_ledger_entry_applies_overrides(monkeypatch):
+def test_require_ledger_with_matching_approval_applies_overrides(monkeypatch):
     monkeypatch.setattr(signal_weight_overrides, "SIGNAL_OVERRIDES_ENABLED", True)
+    monkeypatch.setattr(signal_weight_overrides, "SIGNAL_OVERRIDES_REQUIRE_LEDGER", True)
     _force_promoted(monkeypatch, True)
 
     assert signal_weight_overrides.get_override("equity") == pytest.approx(1.20)
@@ -87,7 +147,7 @@ def test_enabled_with_matching_ledger_entry_applies_overrides(monkeypatch):
     assert effective["news_intel"] == pytest.approx(0.60)  # deferred set included
 
 
-def test_mismatched_hash_applies_nothing(monkeypatch):
+def test_require_ledger_mismatched_hash_applies_nothing(monkeypatch):
     """A ledger entry for a *different* override set/version must not
     count as promoting this one — is_approved() is queried with this
     module's exact subject_hash + evaluation_version, so a mismatch on
@@ -103,6 +163,7 @@ def test_mismatched_hash_applies_nothing(monkeypatch):
     import types
 
     monkeypatch.setattr(signal_weight_overrides, "SIGNAL_OVERRIDES_ENABLED", True)
+    monkeypatch.setattr(signal_weight_overrides, "SIGNAL_OVERRIDES_REQUIRE_LEDGER", True)
 
     import governance.promotion_ledger as ledger_mod
     from sqlalchemy import create_engine
@@ -129,7 +190,7 @@ def test_mismatched_hash_applies_nothing(monkeypatch):
     assert signal_weight_overrides.get_effective_overrides() == {}
 
 
-def test_enabled_with_real_ledger_match_via_sqlite_applies_overrides(monkeypatch):
+def test_require_ledger_with_real_ledger_match_via_sqlite_applies_overrides(monkeypatch):
     """End-to-end: recommend() + approve() against a real (sqlite)
     ledger, using this module's own compute_subject_hash(), then
     verify get_override()/get_effective_overrides() actually apply."""
@@ -137,6 +198,7 @@ def test_enabled_with_real_ledger_match_via_sqlite_applies_overrides(monkeypatch
     import types
 
     monkeypatch.setattr(signal_weight_overrides, "SIGNAL_OVERRIDES_ENABLED", True)
+    monkeypatch.setattr(signal_weight_overrides, "SIGNAL_OVERRIDES_REQUIRE_LEDGER", True)
 
     import governance.promotion_ledger as ledger_mod
     from sqlalchemy import create_engine
@@ -163,6 +225,7 @@ def test_enabled_with_real_ledger_match_via_sqlite_applies_overrides(monkeypatch
 
 def test_get_override_returns_neutral_for_unknown_or_unusable_signals(monkeypatch):
     monkeypatch.setattr(signal_weight_overrides, "SIGNAL_OVERRIDES_ENABLED", True)
+    monkeypatch.setattr(signal_weight_overrides, "SIGNAL_OVERRIDES_REQUIRE_LEDGER", True)
     _force_promoted(monkeypatch, True)
 
     assert signal_weight_overrides.get_override("unknown_signal") == 1.0

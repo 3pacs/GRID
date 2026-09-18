@@ -47,29 +47,46 @@ right/wrong ratios come from a corpus with contaminated scoring
 April 2026 dominates the scored predictions used to compute those
 ratios). Tainted labels must not silently drive live weights.
 
-Two changes as of this revision:
+This workstream (GRID W7b) deliberately separates that *safeguard
+capability* from any *operational policy decision* about whether to
+use it. This module, on its own, changes nothing about current
+production behaviour:
 
-1. ``GRID_SIGNAL_OVERRIDES_ENABLED`` now defaults to **False** (was
-   True). This is a behaviour change: any deployment that relied on
-   the previous default-ON and left the env var unset will now apply
-   NO signal weight overrides until an operator explicitly sets
-   ``GRID_SIGNAL_OVERRIDES_ENABLED=true`` *and* records a matching
-   promotion. ``config.py`` does not define this env var as a
-   pydantic-settings field (it's read directly from ``os.environ``
-   here) and is out of scope for this change — **the deploy owner
-   must check production's effective value of
-   ``GRID_SIGNAL_OVERRIDES_ENABLED`` directly** (`.env`, systemd
-   unit environment, etc.) to confirm what will actually happen on
-   next restart.
-2. Even when the master switch is True, overrides are only applied if
-   ``governance.promotion_ledger`` has an **approved** record for this
-   exact override set: ``kind="weight_override"``, a ``subject_hash``
-   over ``{SIGNAL_WEIGHT_OVERRIDES ∪ DEFERRED_SIGNAL_OVERRIDES,
-   EVALUATION_VERSION}``, and the matching ``evaluation_version``. No
-   ledger match => log once at WARNING and apply nothing (multiplier
-   1.0 / empty table). The override *values* themselves are untouched
-   by this change — only whether they are ever allowed to affect a
-   live weight.
+1. ``GRID_SIGNAL_OVERRIDES_ENABLED`` keeps its pre-existing default of
+   **True** — the master switch behaves exactly as it did before this
+   workstream. A deployment that leaves the env var unset continues to
+   apply the override table exactly as before.
+2. A NEW, independent knob, ``GRID_SIGNAL_OVERRIDES_REQUIRE_LEDGER``,
+   defaults to **False**. It controls whether a
+   ``governance.promotion_ledger`` approval is *required* before an
+   enabled override table is allowed to affect a live weight:
+
+   * ``require_ledger=False`` (default): legacy behaviour exactly —
+     overrides are applied whenever the master switch is on, with no
+     ledger check. Because this leaves tainted-corpus-derived weights
+     live with no auditable approval, this module logs **one**
+     WARNING (at first use) naming ``GRID_SIGNAL_OVERRIDES_REQUIRE_LEDGER``
+     and stating that overrides are being applied without a
+     promotion-ledger approval.
+   * ``require_ledger=True``: overrides are applied only if
+     ``governance.promotion_ledger`` has an **approved** record for
+     this exact override set: ``kind="weight_override"``, a
+     ``subject_hash`` over ``{SIGNAL_WEIGHT_OVERRIDES ∪
+     DEFERRED_SIGNAL_OVERRIDES, EVALUATION_VERSION}``, and the matching
+     ``evaluation_version``. No ledger match => log once at WARNING
+     and apply nothing (multiplier 1.0 / empty table).
+
+``config.py`` does not define either env var as a pydantic-settings
+field (both are read directly from ``os.environ`` here, as before)
+and is out of scope for this change — **the deploy owner must check
+production's effective value of both env vars directly** (`.env`,
+systemd unit environment, etc.) to know which path is active. Actually
+flipping to the safer defaults (``SIGNAL_OVERRIDES_ENABLED=False``,
+``REQUIRE_LEDGER=True``) is a held operational policy change tracked
+separately — see ``docs/reference/LEARNING_PROMOTION_PROTOCOL.md``'s
+controller-decision list and the ``fable/overrides-policy-20260918``
+branch. The override *values* themselves are untouched by any of
+this — only whether/when they're allowed to affect a live weight.
 
 See ``get_override()`` and ``get_effective_overrides()`` below, and
 ``governance/promotion_ledger.py`` for the ledger API.
@@ -92,11 +109,24 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on", "enabled")
 
 
-# Master switch. Default OFF (changed 2026-09-18 — see SAFEGUARDS note
-# above). The prior default-ON treated a corpus with known-contaminated
-# labels as safe to auto-apply to live weights; it is not. Flip to true
-# via env, AND record a matching promotion_ledger approval, to activate.
-SIGNAL_OVERRIDES_ENABLED: bool = _env_bool("GRID_SIGNAL_OVERRIDES_ENABLED", False)
+# Master switch. Default True — the pre-existing production default,
+# preserved as-is by this workstream (see SAFEGUARDS note above). This
+# is NOT an endorsement that applying a contaminated-corpus-derived
+# override table is safe; it means this module does not silently
+# change current production behaviour. Whether to flip this off is a
+# held operational decision — see GRID_SIGNAL_OVERRIDES_REQUIRE_LEDGER
+# below and docs/handoffs/2026-09-18/fable-w7-held-policy-flip.md on
+# the fable/overrides-policy-20260918 branch.
+SIGNAL_OVERRIDES_ENABLED: bool = _env_bool("GRID_SIGNAL_OVERRIDES_ENABLED", True)
+
+# Ledger-enforcement knob. Default False — legacy behaviour (no ledger
+# check) is preserved by default. Set to true to require an approved
+# governance.promotion_ledger record (matching this table's
+# subject_hash + EVALUATION_VERSION) before an enabled override table
+# is allowed to affect a live weight. See SAFEGUARDS note above.
+SIGNAL_OVERRIDES_REQUIRE_LEDGER: bool = _env_bool(
+    "GRID_SIGNAL_OVERRIDES_REQUIRE_LEDGER", False
+)
 
 
 # (signal_source name → multiplier on the conviction contribution)
@@ -213,6 +243,46 @@ def compute_subject_hash(
 _SUBJECT_HASH: str = compute_subject_hash()
 
 _warned_missing_promotion: bool = False
+_warned_legacy_no_ledger: bool = False
+
+
+def _warn_legacy_no_ledger_once() -> None:
+    """Log ONE warning (at startup/first use) that overrides are being
+    applied without a promotion-ledger approval, naming the knob that
+    would change that. Only reached when
+    ``SIGNAL_OVERRIDES_REQUIRE_LEDGER`` is False (legacy path)."""
+    global _warned_legacy_no_ledger
+    if _warned_legacy_no_ledger:
+        return
+    log.warning(
+        "GRID_SIGNAL_OVERRIDES_ENABLED is True and "
+        "GRID_SIGNAL_OVERRIDES_REQUIRE_LEDGER is False: signal weight "
+        "overrides derived from the trade_postmortems advisory "
+        "(evaluation_version={v}) are being applied to live weights "
+        "WITHOUT a promotion_ledger approval. Set "
+        "GRID_SIGNAL_OVERRIDES_REQUIRE_LEDGER=true to require an "
+        "approved governance.promotion_ledger record before these "
+        "overrides take effect.",
+        v=EVALUATION_VERSION,
+    )
+    _warned_legacy_no_ledger = True
+
+
+def _overrides_gate_open() -> bool:
+    """True iff current knobs allow the override table to be applied.
+
+    - Master switch off => always False.
+    - Master switch on, require_ledger False (legacy/default) => True,
+      after logging the one-time "no ledger approval" warning.
+    - Master switch on, require_ledger True => delegate to the ledger
+      check (which does its own one-time warning on a miss).
+    """
+    if not SIGNAL_OVERRIDES_ENABLED:
+        return False
+    if not SIGNAL_OVERRIDES_REQUIRE_LEDGER:
+        _warn_legacy_no_ledger_once()
+        return True
+    return _is_override_set_promoted()
 
 
 def _is_override_set_promoted() -> bool:
@@ -261,13 +331,15 @@ def _is_override_set_promoted() -> bool:
 def get_override(signal_source: Any) -> float:
     """Return the multiplier for ``signal_source`` (1.0 = no effect).
 
-    Returns 1.0 when the master switch is off, when the override set
-    lacks a matching promotion_ledger approval, the signal isn't in
-    the override table, or the input isn't a usable string.
+    Returns 1.0 when the master switch is off; when
+    ``GRID_SIGNAL_OVERRIDES_REQUIRE_LEDGER`` is True and the override
+    set lacks a matching promotion_ledger approval; when the signal
+    isn't in the override table; or when the input isn't a usable
+    string. When the master switch is on and require_ledger is False
+    (the legacy/default path), applies the override table and logs one
+    warning that no ledger approval was checked.
     """
-    if not SIGNAL_OVERRIDES_ENABLED:
-        return 1.0
-    if not _is_override_set_promoted():
+    if not _overrides_gate_open():
         return 1.0
     if not isinstance(signal_source, str) or not signal_source.strip():
         return 1.0
@@ -280,16 +352,15 @@ def get_override(signal_source: Any) -> float:
 def get_effective_overrides() -> dict[str, float]:
     """Return the merged override table (bare + deferred) gated the
     same way as ``get_override()``: empty unless the master switch is
-    on AND a matching promotion_ledger approval exists.
+    on, and (when ``GRID_SIGNAL_OVERRIDES_REQUIRE_LEDGER`` is True) a
+    matching promotion_ledger approval exists.
 
     This is the entry point ``oracle/engine.py`` uses at the
     per-signal weight multiplication step — it must never read
     ``SIGNAL_WEIGHT_OVERRIDES`` / ``DEFERRED_SIGNAL_OVERRIDES``
     directly, or it bypasses this gate entirely.
     """
-    if not SIGNAL_OVERRIDES_ENABLED:
-        return {}
-    if not _is_override_set_promoted():
+    if not _overrides_gate_open():
         return {}
     return {**SIGNAL_WEIGHT_OVERRIDES, **DEFERRED_SIGNAL_OVERRIDES}
 
@@ -300,9 +371,17 @@ def set_enabled(value: bool) -> None:
     SIGNAL_OVERRIDES_ENABLED = bool(value)
 
 
+def set_require_ledger(value: bool) -> None:
+    """Runtime toggle (mostly for tests / REPL)."""
+    global SIGNAL_OVERRIDES_REQUIRE_LEDGER
+    SIGNAL_OVERRIDES_REQUIRE_LEDGER = bool(value)
+
+
 def reset_promotion_warning_state() -> None:
-    """Test/REPL helper: clear the "warned once" latch so the next
-    unpromoted call logs again. Production code has no reason to call
-    this."""
-    global _warned_missing_promotion
+    """Test/REPL helper: clear both "warned once" latches (the
+    require_ledger=True missing-promotion warning and the
+    require_ledger=False legacy-path warning) so the next call logs
+    again. Production code has no reason to call this."""
+    global _warned_missing_promotion, _warned_legacy_no_ledger
     _warned_missing_promotion = False
+    _warned_legacy_no_ledger = False

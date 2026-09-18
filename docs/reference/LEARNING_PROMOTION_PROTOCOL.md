@@ -155,6 +155,18 @@ unsubstantiated precision this workstream exists to remove.
    than left pending or requiring manual review), and what that implies for any
    downstream statistic computed over "resolved" predictions. Affected population: to be
    measured.
+7. **Two-knob flip (GRID W7b, held)** — `intelligence/signal_weight_overrides.py` now
+   ships two independent knobs, both defaulting to the pre-existing production
+   behaviour: `GRID_SIGNAL_OVERRIDES_ENABLED` (default **True**, unchanged from before
+   this workstream) and the new `GRID_SIGNAL_OVERRIDES_REQUIRE_LEDGER` (default
+   **False** — no ledger check, matching legacy behaviour, with one WARNING logged
+   naming the knob). Flipping both defaults (`ENABLED=False`,
+   `REQUIRE_LEDGER=True`) is a live weight-policy change — it stops today's override
+   cuts/boosts from applying at all until a `weight_override` promotion is recommended
+   and approved — and is held on `fable/overrides-policy-20260918` pending explicit
+   operator approval; see that branch's
+   `docs/handoffs/2026-09-18/fable-w7-held-policy-flip.md` for the rollback path.
+   Affected population: to be measured.
 
 Each of these, once decided, should itself be recorded as a `signal_policy` kind
 recommendation in the promotion ledger — the decision is exactly the kind of durable,
