@@ -235,6 +235,15 @@ export const routes = [
         desc: 'Sector flows & influence',
     },
     {
+        id: 'godview',
+        label: 'God View',
+        icon: Eye,
+        component: './views/GodViewPillars.jsx',
+        group: 'markets',
+        nav: 'drawer',
+        desc: 'Institutional pillars — provenance, coverage, and stale/failed/empty states, honestly',
+    },
+    {
         id: 'earnings',
         label: 'Earnings',
         icon: Calendar,
@@ -648,6 +657,7 @@ const MAIN_DRAWER_SECTION_IDS = {
         'attention',
         'catalyst-timeline',
         'why',
+        'godview',
     ],
     INTELLIGENCE: [
         'intelligence-search',
