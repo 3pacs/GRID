@@ -31,6 +31,7 @@ import pandas as pd
 import pytest
 
 from backtest.engine import PitchBacktester, _pit_safe_fill
+from store.vintage_selection import select_vintage_per_decision
 from tests.fixtures.evaluator.fake_pit_store import FakePITStore, Row
 from validation.backtest import WalkForwardBacktest
 
@@ -739,3 +740,170 @@ def test_single_asof_batch_then_mask_is_not_equivalent_to_per_day_fetch():
     # was never returned to mask in the first place.
     assert naive_batch.loc[pd.Timestamp(day(5)), 1] == 111.0
     assert naive_batch.loc[pd.Timestamp(day(5)), 1] != correct.loc[pd.Timestamp(day(5)), 1]
+
+
+# ---------------------------------------------------------------------------
+# (h) W3c: batched per-decision PIT fetch (get_feature_vintages +
+#     select_vintage_per_decision) must exactly reproduce the per-day loop
+# ---------------------------------------------------------------------------
+
+
+def _build_vintage_torture_fixture() -> FakePITStore:
+    """Rows covering mid-window revisions, late releases, duplicate
+    vintages and vintage_date/release_date independence, across two
+    features -- deliberately constructed so FIRST_RELEASE and
+    LATEST_AS_OF pick DIFFERENT rows in several places.
+    """
+
+    def day(k: int) -> date:
+        return date(2024, 1, 1) + timedelta(days=k)
+
+    rows = [
+        # --- feature 1 ---
+        Row(feature_id=1, obs_date=day(0), value=100.0, release_date=day(0), vintage_date=day(0)),
+        Row(feature_id=1, obs_date=day(1), value=101.0, release_date=day(1), vintage_date=day(1)),
+        # obs=2: two eligible vintages -- FIRST_RELEASE (min vintage_date)
+        # picks 200.0, LATEST_AS_OF (max vintage_date) picks 205.0.
+        Row(feature_id=1, obs_date=day(2), value=200.0, release_date=day(2), vintage_date=day(1)),
+        Row(feature_id=1, obs_date=day(2), value=205.0, release_date=day(2), vintage_date=day(2)),
+        # exact duplicate of the row above -- must not create a second
+        # selected row or otherwise change the outcome.
+        Row(feature_id=1, obs_date=day(2), value=205.0, release_date=day(2), vintage_date=day(2)),
+        # obs=3: the ONLY vintage on file was released on day 10 -- a late
+        # release, ineligible under a day-3 decision. Both implementations
+        # must drop this (feature_id, obs_date) entirely.
+        Row(feature_id=1, obs_date=day(3), value=9999.0, release_date=day(10), vintage_date=day(10)),
+        Row(feature_id=1, obs_date=day(4), value=104.0, release_date=day(4), vintage_date=day(4)),
+        # obs=5: a genuine value, PLUS a "mid-window revision" that arrives
+        # on day 8 (still inside the [0, 9] window) -- it must never be
+        # visible to day 5's own decision, under EITHER policy.
+        Row(feature_id=1, obs_date=day(5), value=105.0, release_date=day(5), vintage_date=day(5)),
+        Row(feature_id=1, obs_date=day(5), value=999.0, release_date=day(8), vintage_date=day(8)),
+        Row(feature_id=1, obs_date=day(6), value=106.0, release_date=day(6), vintage_date=day(6)),
+        # obs=7: two eligible vintages, vintage_date ordering independent
+        # of release_date (both released on day 7).
+        Row(feature_id=1, obs_date=day(7), value=107.0, release_date=day(7), vintage_date=day(3)),
+        Row(feature_id=1, obs_date=day(7), value=170.0, release_date=day(7), vintage_date=day(9)),
+        Row(feature_id=1, obs_date=day(8), value=108.0, release_date=day(8), vintage_date=day(8)),
+        Row(feature_id=1, obs_date=day(9), value=109.0, release_date=day(9), vintage_date=day(9)),
+        # --- feature 2 ---
+        Row(feature_id=2, obs_date=day(0), value=1000.0, release_date=day(0), vintage_date=day(0)),
+        Row(feature_id=2, obs_date=day(3), value=1003.0, release_date=day(3), vintage_date=day(3)),
+        # late release for feature 2, obs=3 -- ineligible, must be dropped.
+        Row(feature_id=2, obs_date=day(3), value=99999.0, release_date=day(12), vintage_date=day(12)),
+        # obs=9: vintage_date and release_date deliberately inverted --
+        # FIRST_RELEASE (min vintage_date) picks 1009.0, LATEST_AS_OF (max
+        # vintage_date) picks 1109.0.
+        Row(feature_id=2, obs_date=day(9), value=1009.0, release_date=day(9), vintage_date=day(1)),
+        Row(feature_id=2, obs_date=day(9), value=1109.0, release_date=day(1), vintage_date=day(9)),
+    ]
+    return FakePITStore(rows=rows)
+
+
+@pytest.mark.parametrize("vintage_policy", ["FIRST_RELEASE", "LATEST_AS_OF"])
+def test_batched_pit_fetch_equivalent_to_per_day_fetch_validation_backtest(vintage_policy):
+    """The gating proof for defaulting validation.backtest to the batched path.
+
+    Same torture fixture, same window, same policy: the single-round-trip
+    ``_fetch_pit_correct_matrix_batched`` (get_feature_vintages +
+    select_vintage_per_decision) must return EXACTLY the same DataFrame as
+    ``_fetch_pit_correct_matrix_per_day`` -- not just the same shape, every
+    cell.
+    """
+    store = _build_vintage_torture_fixture()
+    bt = WalkForwardBacktest(db_engine=None, pit_store=store)
+    start, end = date(2024, 1, 1), date(2024, 1, 1) + timedelta(days=9)
+
+    per_day = bt._fetch_pit_correct_matrix_per_day(
+        feature_ids=[1, 2], start_date=start, end_date=end, vintage_policy=vintage_policy
+    )
+    batched = bt._fetch_pit_correct_matrix_batched(
+        feature_ids=[1, 2], start_date=start, end_date=end, vintage_policy=vintage_policy
+    )
+
+    pd.testing.assert_frame_equal(per_day, batched)
+
+    # And the public dispatcher, at its default, must agree with the
+    # explicit batched call (i.e. the default really is "batched").
+    via_dispatch = bt._fetch_pit_correct_matrix(
+        feature_ids=[1, 2], start_date=start, end_date=end, vintage_policy=vintage_policy
+    )
+    pd.testing.assert_frame_equal(via_dispatch, batched)
+
+
+@pytest.mark.parametrize("vintage_policy", ["FIRST_RELEASE", "LATEST_AS_OF"])
+def test_batched_pit_fetch_equivalent_to_per_day_fetch_engine(vintage_policy):
+    """Twin of the validation.backtest equivalence test, for backtest/engine.py."""
+    store = _build_vintage_torture_fixture()
+    bt = PitchBacktester(db_engine=None, pit_store=store)
+    start, end = date(2024, 1, 1), date(2024, 1, 1) + timedelta(days=9)
+
+    per_day = bt._fetch_pit_correct_matrix_per_day(
+        feature_ids=[1, 2], start_date=start, end_date=end, vintage_policy=vintage_policy
+    )
+    batched = bt._fetch_pit_correct_matrix_batched(
+        feature_ids=[1, 2], start_date=start, end_date=end, vintage_policy=vintage_policy
+    )
+
+    pd.testing.assert_frame_equal(per_day, batched)
+
+    via_dispatch = bt._fetch_pit_correct_matrix(
+        feature_ids=[1, 2], start_date=start, end_date=end, vintage_policy=vintage_policy
+    )
+    pd.testing.assert_frame_equal(via_dispatch, batched)
+
+
+def test_selector_never_uses_a_vintage_released_after_its_own_obs_date():
+    """``select_vintage_per_decision`` must exclude a late-released vintage
+
+    even when it would otherwise "win" the vintage-policy tiebreak (e.g.
+    the largest vintage_date for LATEST_AS_OF) -- the release_date <=
+    obs_date cutoff is applied BEFORE the policy tiebreak, not after.
+    """
+    d0 = date(2024, 1, 1)
+    d_future = d0 + timedelta(days=5)
+
+    vintages = pd.DataFrame(
+        [
+            # Eligible: released on the observation date itself.
+            {
+                "feature_id": 1,
+                "obs_date": d0,
+                "value": 42.0,
+                "release_date": d0,
+                "vintage_date": d0,
+            },
+            # Ineligible: released AFTER the observation date, but with a
+            # vintage_date far in the future that would win either
+            # policy's tiebreak if the cutoff were skipped.
+            {
+                "feature_id": 1,
+                "obs_date": d0,
+                "value": 8675309.0,
+                "release_date": d_future,
+                "vintage_date": d_future,
+            },
+        ]
+    )
+
+    for policy in ("FIRST_RELEASE", "LATEST_AS_OF"):
+        result = select_vintage_per_decision(vintages, policy)
+        assert len(result) == 1
+        assert result.iloc[0]["value"] == 42.0
+        assert (result["release_date"] <= result["obs_date"]).all()
+
+    # And when NO candidate is eligible, the (feature_id, obs_date) is
+    # dropped entirely rather than falling back to the ineligible row.
+    only_future = vintages.iloc[[1]]
+    for policy in ("FIRST_RELEASE", "LATEST_AS_OF"):
+        result = select_vintage_per_decision(only_future, policy)
+        assert result.empty
+
+
+def test_selector_rejects_invalid_policy():
+    vintages = pd.DataFrame(
+        [{"feature_id": 1, "obs_date": date(2024, 1, 1), "value": 1.0,
+          "release_date": date(2024, 1, 1), "vintage_date": date(2024, 1, 1)}]
+    )
+    with pytest.raises(ValueError):
+        select_vintage_per_decision(vintages, "NOT_A_REAL_POLICY")

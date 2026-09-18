@@ -95,3 +95,45 @@ class FakePITStore:
         )
         matrix.index = pd.DatetimeIndex(matrix.index, name="obs_date")
         return matrix.sort_index()
+
+    def get_feature_vintages(
+        self,
+        feature_ids: list[int],
+        start_date: date,
+        end_date: date,
+        as_of_date: date | None = None,
+    ) -> pd.DataFrame:
+        """Fake twin of ``store.pit.PITStore.get_feature_vintages``.
+
+        Returns every vintage on record for (feature_id, obs_date) in
+        range, undeduplicated -- no DISTINCT ON equivalent here, no
+        per-row selection. ``as_of_date``, when given, is only the same
+        coarse ``release_date <= as_of_date`` pre-filter the real method
+        documents; the caller's ``select_vintage_per_decision`` still has
+        to apply the real per-row cutoff afterwards.
+        """
+        candidates = [
+            r
+            for r in self.rows
+            if r.feature_id in feature_ids
+            and start_date <= r.obs_date <= end_date
+            and (as_of_date is None or r.release_date <= as_of_date)
+        ]
+
+        if not candidates:
+            return pd.DataFrame(
+                columns=["feature_id", "obs_date", "value", "release_date", "vintage_date"]
+            )
+
+        return pd.DataFrame(
+            [
+                {
+                    "feature_id": r.feature_id,
+                    "obs_date": r.obs_date,
+                    "value": r.value,
+                    "release_date": r.release_date,
+                    "vintage_date": r.vintage_date,
+                }
+                for r in candidates
+            ]
+        ).sort_values(["feature_id", "obs_date", "vintage_date"]).reset_index(drop=True)
