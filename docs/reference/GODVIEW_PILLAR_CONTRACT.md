@@ -513,21 +513,26 @@ as `missing_input`: a claim of accuracy against real dealer positioning,
 as opposed to internal mechanical correctness (which the sourced-chain
 test above and the three synthetic cases below both validate).
 
-## Status of all seven God View pillars (2026-09-18)
+## Operational readiness of all seven God View pillars (2026-09-18)
 
-| pillar | status | why |
-|---|---|---|
-| CFTC positioning | **built** | full slice: adapter, migration, materializer, strict-PIT API (+ `include_inferred`), UI card |
-| Fed net liquidity | **built** | full slice; per-component basis; `forward_impulse_score` intentionally NULL (not implemented) |
-| Commodity warehouses (LME leg) | **built** | LME cancelled-warrant ratio, reused from the existing puller |
-| Commodity warehouses (Cushing leg) | **permanently unavailable** | `never_configured` — no real Cushing series id exists in this codebase; will not silently substitute a near-miss |
-| FINRA short volume | **built** | full slice; realistically `unavailable(never_configured)` in production until the puller is scheduled (deployment decision, not a code gap) |
-| SEC Reg SHO FTD | **built** | full slice; outstanding balance only, no timeline/squeeze score; realistically `unavailable(never_configured)` until the puller is scheduled |
-| Corporate buyback blackouts | **built** | modeled quiet-window calendar only; no dollar/% figures — those need EDGAR repurchase disclosures, absent from this DB |
-| Dealer GEX | **built** | from-scratch engine, `provenance='modeled'` throughout; mechanically validated by 3 synthetic cases; no real captured chain fixture exists to validate against a known-correct figure — see section 16 |
+Seven implementations are not seven working production feeds.
 
-Every God View pillar named in this contract is now built (2026-09-18).
-Any pillar name this router does not recognize still renders the honest
-"not built yet" state via `api/routers/godview_pillars.py`'s
+| Pillar | Implemented | Adapter verified | DB/API tested (real PG) | Model validated | Scheduled | Fresh data observed | Production verified |
+|---|---|---|---|---|---|---|---|
+| CFTC positioning | yes | existing puller; live not re-verified this cycle | yes (run 4, composition d9a960ab, 162/0/0) | n/a (measured or simple derived, unit-tested) | no | no | no |
+| Fed net liquidity | yes | existing FRED puller; units fix a828f4bf; live not re-verified | yes (run 4, composition d9a960ab, 162/0/0) | n/a (measured or simple derived, unit-tested) | no | no | no |
+| Commodity warehouses | yes | LME puller registered but has "never written a row" (unexplained, pass-1 finding); Cushing leg `never_configured` | yes (run 4, composition d9a960ab, 162/0/0) | n/a (measured or simple derived, unit-tested) | no | no | no |
+| FINRA short volume | yes | parser verified on one real captured file (#564); puller unscheduled | yes (run 4, composition d9a960ab, 162/0/0) | n/a (measured or simple derived, unit-tested) | no | no | no |
+| SEC Reg SHO FTD | yes | parser verified on one real captured zip (#564); puller unscheduled | yes (run 4, composition d9a960ab, 162/0/0) | n/a (measured or simple derived, unit-tested) | no | no | no |
+| Corporate buyback blackouts | yes | no adapter — consumes untracked `earnings_calendar` | yes (run 4, composition d9a960ab, 162/0/0) | modeled window, not validatable (no measured source) | no | no | no |
+| Dealer GEX | yes | consumes `options_snapshots`; its writer not verified this cycle | yes (run 4, composition d9a960ab, 162/0/0) | numerically validated on a sourced chain, commit `b5782a8a` (this cycle) — dealer positioning NOT validated (modeled) — see section 16 | no | no | no |
+
+Every God View pillar named in this contract is **implemented** in code
+(2026-09-18). "Implemented" means exactly the "Implemented" column above
+— it does not mean scheduled, activated, or deployed: every pillar reads
+"no" across Scheduled / Fresh data observed / Production verified,
+because nothing in this row is scheduled, activated, or deployed. Any
+pillar name this router does not recognize still renders the honest "not
+built yet" state via `api/routers/godview_pillars.py`'s
 `_KNOWN_UNBUILT_PILLARS` map / catch-all route (currently empty, kept for
 future pillars) — never a silent 404, never a fabricated value.
