@@ -1,23 +1,23 @@
 """Tests for ``intelligence.signal_weight_overrides``.
 
-Covers the 2026-09-18 GRID W7b split: the safeguard *capability*
-(promotion-ledger enforcement) is now independent of the operational
-*policy* of whether it's turned on. Current production behaviour is
-preserved by default:
+This branch (``fable/overrides-policy-20260918``) is the HELD
+operational policy flip for GRID W7b: it merges in the
+``fable/learning-safeguards-20260918`` capability (ledger-enforcement
+knob, independent of whether it's turned on) and then flips both
+defaults to their safer values:
 
-* ``GRID_SIGNAL_OVERRIDES_ENABLED`` defaults to True (legacy default,
-  restored).
-* ``GRID_SIGNAL_OVERRIDES_REQUIRE_LEDGER`` (new) defaults to False —
-  legacy behaviour exactly: overrides apply with no ledger check, but
-  one WARNING is logged (naming the knob) the first time they do.
-* Setting ``GRID_SIGNAL_OVERRIDES_REQUIRE_LEDGER=true`` gates
-  overrides behind an approved ``governance.promotion_ledger`` record,
-  exactly like the previous (now-superseded) always-on ledger gate.
+* ``GRID_SIGNAL_OVERRIDES_ENABLED`` now defaults to **False** (was
+  True) — this is a production weight change: today's live override
+  cuts/boosts stop applying until an operator explicitly re-enables
+  the switch.
+* ``GRID_SIGNAL_OVERRIDES_REQUIRE_LEDGER`` now defaults to **True**
+  (was False) — even if re-enabled, overrides require a matching
+  ``governance.promotion_ledger`` approval; with no approval, nothing
+  is applied (plus one warning).
 
-See that module's docstring for the full rationale, and
-``docs/reference/LEARNING_PROMOTION_PROTOCOL.md`` for the held
-operational decision to actually flip the defaults (tracked on
-``fable/overrides-policy-20260918``, not here).
+See that module's docstring and
+``docs/handoffs/2026-09-18/fable-w7-held-policy-flip.md`` for the
+required approval and rollback path (revert this one commit).
 """
 
 from __future__ import annotations
@@ -46,16 +46,22 @@ def _force_promoted(monkeypatch, promoted: bool) -> None:
     )
 
 
-def test_overrides_enabled_by_default():
-    """GRID_SIGNAL_OVERRIDES_ENABLED must default to True (the
-    pre-existing production default, restored/preserved by W7b)."""
-    assert signal_weight_overrides.SIGNAL_OVERRIDES_ENABLED is True
+def test_overrides_disabled_by_default():
+    """HELD POLICY FLIP (fable/overrides-policy-20260918):
+    GRID_SIGNAL_OVERRIDES_ENABLED now defaults to False — this branch
+    intentionally flips the production default off pending an
+    explicit ledger approval. See
+    docs/handoffs/2026-09-18/fable-w7-held-policy-flip.md."""
+    assert signal_weight_overrides.SIGNAL_OVERRIDES_ENABLED is False
 
 
-def test_require_ledger_disabled_by_default():
-    """GRID_SIGNAL_OVERRIDES_REQUIRE_LEDGER must default to False —
-    the new knob does not change behaviour unless explicitly set."""
-    assert signal_weight_overrides.SIGNAL_OVERRIDES_REQUIRE_LEDGER is False
+def test_require_ledger_enabled_by_default():
+    """HELD POLICY FLIP (fable/overrides-policy-20260918):
+    GRID_SIGNAL_OVERRIDES_REQUIRE_LEDGER now defaults to True — even
+    if the master switch is re-enabled, overrides require a matching
+    promotion_ledger approval by default. See
+    docs/handoffs/2026-09-18/fable-w7-held-policy-flip.md."""
+    assert signal_weight_overrides.SIGNAL_OVERRIDES_REQUIRE_LEDGER is True
 
 
 def test_disabled_master_switch_applies_nothing_regardless_of_require_ledger(monkeypatch):
