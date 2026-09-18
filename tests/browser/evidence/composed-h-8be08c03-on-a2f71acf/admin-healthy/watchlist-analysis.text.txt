@@ -1,0 +1,88 @@
+Back
+TEST1
+$100
++2.04%
+Test One Corp · STOCK · Regime: RISK_ON
+AI OVERVIEW
+AI Generated · 02:00
+CONSTRUCTIVE
+TEST1 is trading near its 5-day range with a risk-on macro backdrop.
+5D low: $98
+5D high: $100
+INSIDER EDGE
+▼
+🏛 Congress
+BUY
+Test Member
+Sep 4, 2026
+60
+👤 CFO
+BUY
+Test Insider
+Sep 3, 2026
+🌊 Dark Pool
+ACCUMULATION
+1.0x avg volume
+Sep 14, 2026
+🐳 Whale Flow
+BUY
+$100 2026-10-16
+Sep 11, 2026
+🧠 test-forum
+BUY
+test_user
+PRICE
+H: $100 · L: $98
+1W
+1M
+3M
+6M
+1Y
+5D low
+5D high
+$98
+$99
+$99
+$100
+$100
+Sep 11
+Sep 13
+DEALER GEX PROFILE
+▼
+VANNA / CHARM
+▼
+FLOW TIMELINE
+▼
+TRADE RECOMMENDATIONS
+▼
+REGIME CONTEXT
+RISK_ON
+Regime
+62%
+Confidence
+Risk-On / Overweight Growth
+Posture
+RELATED FEATURES · 1
+▼
+10Y
+SURFACE
+DASH
+FLOW
+REFRESH
+SEARCH
+MORE
+ASK
+Ask GRID
+[TEST1]
+×
+What should I watch?
+Explain the current regime
+Any red flags?
+What are the lever pullers doing?
+Ask GRID anything about the market, your portfolio, or the intelligence picture.
+HORIZON
+1D
+1W
+1M
+3M
+6M+
