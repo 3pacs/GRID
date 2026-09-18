@@ -774,7 +774,10 @@ function seerCard(seer, snapshot) {
         window: event?.date || snapshot?.date || 'now',
         act: event ? `${prediction} ${relation} ${eventLabel}` : prediction,
         cue: event ? `${event.name || event.event} / ${(seer.key_factors || []).slice(0, 2).join(' / ')}` : (seer.key_factors || []).slice(0, 2).join(' / ') || 'mixed field',
-        confidence: asNumber(seer.confidence, 0.6),
+        // The API no longer states a seer confidence
+        // (docs/reference/CONFIDENCE_POLICY.md); null stays null rather than
+        // becoming a client-invented 0.6, and an unrated card sorts last.
+        confidence: asNumber(seer.confidence, null),
     };
 }
 
@@ -798,6 +801,10 @@ export function buildAstrogridHypotheses(snapshot, seer = null, overlay = null) 
 
     return cards
         .filter(Boolean)
-        .sort((a, b) => (b.confidence || 0) - (a.confidence || 0))
+        // Unknown is not zero, but it is below every rated card.
+        .sort((a, b) => (
+            (b.confidence == null ? -1 : b.confidence)
+            - (a.confidence == null ? -1 : a.confidence)
+        ))
         .slice(0, 5);
 }
