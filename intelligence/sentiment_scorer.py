@@ -295,9 +295,23 @@ def _score_regime(engine: Engine) -> SentimentComponent:
                 "ORDER BY decision_timestamp DESC LIMIT 1"
             )).fetchone()
 
+            if row and row[1] is None:
+                # UNSCORED decision. ``float(row[1] or 0.5)`` used to invent a
+                # coin flip here and multiply it into the sentiment score. An
+                # unmeasured confidence contributes nothing, so the regime
+                # component reports itself unavailable instead of being scored
+                # off a fabricated 0.5.
+                return SentimentComponent(
+                    name="regime", raw_value=0.0, score=0.0, weight=0.0,
+                    detail=(
+                        f"{row[0]} but unscored (state_confidence IS NULL) - "
+                        "excluded from the sentiment blend"
+                    ),
+                )
+
             if row:
                 state = row[0]
-                confidence = float(row[1] or 0.5)
+                confidence = float(row[1])
                 base_score = REGIME_SCORES.get(state.upper(), 0.0)
                 # Scale by confidence — low confidence pulls toward neutral
                 score = base_score * confidence

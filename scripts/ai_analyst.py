@@ -145,7 +145,10 @@ def _fetch_context() -> dict:
 
     return {
         "regime": regime,
-        "confidence": confidence if confidence else 0.0,
+        # None = unscored. Kept as None rather than coerced to 0.0: a
+        # fabricated "0% confidence" in the prompt reads to the model as
+        # a measured value, which is worse than saying nothing.
+        "confidence": confidence,
         "posture": posture,
         "regime_history": regime_history or [],
         "signals": signals or [],
@@ -171,7 +174,14 @@ def run(quiet: bool = False) -> str | None:
         f"  {f['name']}: {f['value']}" for f in ctx["fundamentals"]
     )
     regime_hist = "\n".join(
-        f"  {r['inferred_state']} ({r['state_confidence']:.0%})"
+        "  {s} ({c})".format(
+            s=r["inferred_state"],
+            c=(
+                f"{r['state_confidence']:.0%}"
+                if r["state_confidence"] is not None
+                else "unscored"
+            ),
+        )
         for r in ctx["regime_history"]
     )
     price_text = "\n".join(
