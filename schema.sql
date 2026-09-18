@@ -727,7 +727,8 @@ CREATE TABLE IF NOT EXISTS options_mispricing_scans (
     ticker          TEXT NOT NULL,
     scan_date       DATE NOT NULL,
     score           DOUBLE PRECISION NOT NULL,
-    payoff_multiple DOUBLE PRECISION NOT NULL,
+    -- NULL when the payoff could not be modelled (audit C-M20).
+    payoff_multiple DOUBLE PRECISION,
     direction       TEXT NOT NULL,
     thesis          TEXT NOT NULL,
     signals         JSONB,
@@ -736,7 +737,13 @@ CREATE TABLE IF NOT EXISTS options_mispricing_scans (
     spot_price      DOUBLE PRECISION,
     iv_atm          DOUBLE PRECISION,
     confidence      TEXT NOT NULL,
-    is_100x         BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Column name is historical: the modelled payoff-threshold flag
+    -- (served as heuristic_payoff_flag). NULLABLE because "could not be
+    -- modelled" is a third state; no default so it is never asserted.
+    is_100x         BOOLEAN,
+    -- The inputs the flag was computed from (iv_atm, expected_move_pct,
+    -- otm_cost_pct, leverage) so the number travels with its basis.
+    payoff_inputs   JSONB,
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE (ticker, scan_date, direction)
 );

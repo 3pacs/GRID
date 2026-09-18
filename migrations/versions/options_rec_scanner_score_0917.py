@@ -47,6 +47,28 @@ def upgrade() -> None:
         "ALTER TABLE options_recommendations "
         "ADD COLUMN IF NOT EXISTS scanner_score DOUBLE PRECISION"
     )
+    # options_mispricing_scans is created by discovery/options_scanner.py
+    # (CREATE TABLE IF NOT EXISTS, mirrored in schema.sql), never by alembic,
+    # so guard with IF EXISTS: on a database where the scanner has not run
+    # yet the table is absent and the scanner's own CREATE already carries
+    # the new shape. Reshaping: an unmodelled payoff is stored as NULL, not
+    # as a default FALSE / a NOT NULL multiple (audit C-M20).
+    op.execute(
+        "ALTER TABLE IF EXISTS options_mispricing_scans "
+        "ADD COLUMN IF NOT EXISTS payoff_inputs JSONB"
+    )
+    op.execute(
+        "ALTER TABLE IF EXISTS options_mispricing_scans "
+        "ALTER COLUMN is_100x DROP NOT NULL"
+    )
+    op.execute(
+        "ALTER TABLE IF EXISTS options_mispricing_scans "
+        "ALTER COLUMN is_100x DROP DEFAULT"
+    )
+    op.execute(
+        "ALTER TABLE IF EXISTS options_mispricing_scans "
+        "ALTER COLUMN payoff_multiple DROP NOT NULL"
+    )
     op.execute(
         "COMMENT ON COLUMN options_recommendations.scanner_score IS "
         "'discovery.options_scanner composite score (0-10) this recommendation "
@@ -63,6 +85,17 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Reverse the mispricing_scans reshaping only where it is safe: restoring
+    # NOT NULL would fail if NULL rows now exist, so set the old default
+    # for future rows and leave nullability relaxed (documented, one-way).
+    op.execute(
+        "ALTER TABLE IF EXISTS options_mispricing_scans "
+        "ALTER COLUMN is_100x SET DEFAULT FALSE"
+    )
+    op.execute(
+        "ALTER TABLE IF EXISTS options_mispricing_scans "
+        "DROP COLUMN IF EXISTS payoff_inputs"
+    )
     op.execute("DROP INDEX IF EXISTS idx_options_rec_score_outcome")
     op.execute(
         "ALTER TABLE options_recommendations DROP COLUMN IF EXISTS scanner_score"
