@@ -1604,17 +1604,31 @@ class OracleEngine:
                         if evt.get("signal_type") == pred_dir:
                             # Boost: 10% per source above minimum 3
                             src_count = evt.get("source_count", 0)
-                            combined_conf = evt.get("combined_confidence", 0.5)
-                            convergence_boost = 1.0 + 0.1 * (src_count - 2) * combined_conf
-                            # Inject convergence sources as additional signals
+                            combined_conf = evt.get("combined_confidence")
+                            if combined_conf is None:
+                                # Unscored convergence: the sources agree, but
+                                # nothing measured how far to trust them. The
+                                # old `or 0.5` amplified confidence by a number
+                                # no scorer produced. Agreement alone does not
+                                # size a prediction — no boost.
+                                convergence_boost = 1.0
+                            else:
+                                convergence_boost = 1.0 + 0.1 * (src_count - 2) * combined_conf
+                            # Inject convergence sources as additional signals —
+                            # only the ones carrying a measured trust, since
+                            # that value is both the signal's value and its
+                            # weight and there is no honest stand-in for it.
                             for src in evt.get("sources", []):
+                                src_trust = src.get("trust_score")
+                                if src_trust is None:
+                                    continue
                                 signals.append(Signal(
                                     name=f"convergence:{src['source_type']}",
                                     family="convergence",
-                                    value=src.get("trust_score", 0.5),
+                                    value=src_trust,
                                     z_score=1.5 if pred_dir == "BUY" else -1.5,
                                     direction="bullish" if pred_dir == "BUY" else "bearish",
-                                    weight=src.get("trust_score", 0.5),
+                                    weight=src_trust,
                                     freshness_hours=0,
                                 ))
                             break  # Use first matching convergence event

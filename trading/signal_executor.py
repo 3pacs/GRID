@@ -350,7 +350,19 @@ def execute_signals(
                                 for evt in (convergence or []):
                                     if evt.get("signal_type") == trade_dir:
                                         src_count = evt.get("source_count", 0)
-                                        combined_conf = evt.get("combined_confidence", 0.5)
+                                        combined_conf = evt.get("combined_confidence")
+                                        if combined_conf is None:
+                                            # Unscored convergence: `or 0.5`
+                                            # used to scale a real position by
+                                            # a trust level nobody measured.
+                                            # Agreement alone does not size a
+                                            # trade — leave Kelly alone.
+                                            log.info(
+                                                "Convergence on {t} {d} — {n} sources, "
+                                                "unscored: position size unchanged",
+                                                t=follower, d=trade_dir, n=src_count,
+                                            )
+                                            break
                                         convergence_mult = 1.0 + 0.15 * (src_count - 2) * combined_conf
                                         position_size = min(position_size * convergence_mult, position_size * 2.0)
                                         signal_strength *= convergence_mult

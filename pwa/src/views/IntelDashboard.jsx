@@ -55,12 +55,21 @@ export default function IntelDashboard({ onNavigate }) {
     const sources = trustSources?.sources || [];
     const alerts = convergence?.alerts || [];
 
+    // A NULL signal_sources.trust_score means the scorer has not run on this
+    // source. It is not a low score and not a zero — it gets a neutral colour
+    // and the word "unscored". See docs/reference/CONFIDENCE_POLICY.md.
+    const isScored = (v) => typeof v === 'number' && Number.isFinite(v);
+
     const trustColor = (score) => {
+        if (!isScored(score)) return colors.textMuted;
         if (score >= 0.85) return colors.green;
         if (score >= 0.7) return colors.yellow;
         if (score >= 0.5) return '#F97316';
         return colors.red;
     };
+
+    const trustPct = (score, digits = 0) =>
+        (isScored(score) ? `${(score * 100).toFixed(digits)}%` : 'unscored');
 
     const severityColor = (sev) => {
         if (sev === 'high') return colors.red;
@@ -325,7 +334,7 @@ export default function IntelDashboard({ onNavigate }) {
                                     <span style={{
                                         fontFamily: MONO, fontSize: '14px', fontWeight: 800,
                                         color: tColor, flexShrink: 0, whiteSpace: 'nowrap',
-                                    }}>{(src.trust_score * 100).toFixed(0)}%</span>
+                                    }}>{trustPct(src.trust_score)}</span>
                                 </div>
                                 <div style={{
                                     display: 'flex', gap: '8px', marginTop: '6px', flexWrap: 'wrap',
@@ -351,20 +360,22 @@ export default function IntelDashboard({ onNavigate }) {
                                             height: '4px', background: colors.bg,
                                             borderRadius: '2px', overflow: 'hidden', marginBottom: '8px',
                                         }}>
-                                            <div style={{
-                                                height: '100%', width: `${src.trust_score * 100}%`,
-                                                background: tColor, borderRadius: '2px',
-                                                transition: 'width 0.4s ease',
-                                            }} />
+                                            {isScored(src.trust_score) && (
+                                                <div style={{
+                                                    height: '100%', width: `${src.trust_score * 100}%`,
+                                                    background: tColor, borderRadius: '2px',
+                                                    transition: 'width 0.4s ease',
+                                                }} />
+                                            )}
                                         </div>
                                         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
                                             <div>
                                                 <div style={{ fontSize: '9px', color: colors.textMuted, fontFamily: MONO }}>TRUST SCORE</div>
-                                                <div style={{ fontSize: '13px', fontWeight: 700, color: tColor, fontFamily: MONO }}>{(src.trust_score * 100).toFixed(1)}%</div>
+                                                <div style={{ fontSize: '13px', fontWeight: 700, color: tColor, fontFamily: MONO }}>{trustPct(src.trust_score, 1)}</div>
                                             </div>
                                             <div>
                                                 <div style={{ fontSize: '9px', color: colors.textMuted, fontFamily: MONO }}>30D ACCURACY</div>
-                                                <div style={{ fontSize: '13px', fontWeight: 700, color: trustColor(src.accuracy_30d), fontFamily: MONO }}>{(src.accuracy_30d * 100).toFixed(1)}%</div>
+                                                <div style={{ fontSize: '13px', fontWeight: 700, color: trustColor(src.accuracy_30d), fontFamily: MONO }}>{trustPct(src.accuracy_30d, 1)}</div>
                                             </div>
                                         </div>
                                         <div style={{
@@ -372,7 +383,8 @@ export default function IntelDashboard({ onNavigate }) {
                                             marginTop: '6px', lineHeight: 1.5,
                                             wordBreak: 'break-word',
                                         }}>
-                                            {src.trust_score >= 0.85 ? 'High confidence source. Signals are weighted heavily in convergence scoring.'
+                                            {!isScored(src.trust_score) ? 'Unscored source. The trust scorer has not run on it yet, so its signals carry no weight in convergence scoring.'
+                                                : src.trust_score >= 0.85 ? 'High confidence source. Signals are weighted heavily in convergence scoring.'
                                                 : src.trust_score >= 0.7 ? 'Moderate confidence. Signals contribute but require corroboration.'
                                                 : src.trust_score >= 0.5 ? 'Low-moderate confidence. Used as supporting evidence only.'
                                                 : 'Low confidence. Signals are heavily discounted or used as contrarian indicators.'}

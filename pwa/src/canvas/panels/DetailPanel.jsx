@@ -393,6 +393,8 @@ function connectionBadge(item) {
 
 /* ── Section Components ──────────────────────────────────────── */
 
+// `score` is null when nothing scored the actor. A 0% gauge is a measurement;
+// an unscored actor gets the word instead (docs/reference/CONFIDENCE_POLICY.md).
 function TrustGauge({ score }) {
     // An unscored actor has no trust score. Drawing an empty gauge labelled
     // "0%" would read as a measured worst-case
@@ -413,7 +415,9 @@ function TrustGauge({ score }) {
         <div style={S.card}>
             <div style={S.row}>
                 <span style={S.label}>Trust Score</span>
-                <span style={{ ...S.value, color }}>{pct.toFixed(0)}%</span>
+                <span style={{ ...S.value, color }}>
+                    {`${pct.toFixed(0)}%`}
+                </span>
             </div>
             <div style={S.gauge}>
                 <div style={S.gaugeFill(pct, color)} />
@@ -435,6 +439,7 @@ function ActorDetail({ node }) {
 
     return (
         <>
+            {/* ?? not ||: a measured 0 is a score, and null stays null. */}
             <TrustGauge score={data.trust_score ?? data.trustScore ?? null} />
 
             {influenceRank && (

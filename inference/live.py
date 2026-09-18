@@ -180,9 +180,13 @@ class LiveInference:
                     if (rec_dir in ("BUY", "HOLD") and evt_dir == "SELL") or \
                        (rec_dir in ("REDUCE", "SELL") and evt_dir == "BUY"):
                         recommendation.setdefault("contradiction_flags", {})
+                        _conf = evt.get("combined_confidence")
                         recommendation["contradiction_flags"]["convergence_conflict"] = (
                             f"Convergence says {evt_dir} ({evt.get('source_count', 0)} sources, "
-                            f"conf={evt.get('combined_confidence', 0):.2f}) vs model says {rec_dir}"
+                            # None = no source in the event carries a scored
+                            # trust; "unscored", never a formatted 0.00.
+                            f"conf={'unscored' if _conf is None else format(_conf, '.2f')}) "
+                            f"vs model says {rec_dir}"
                         )
 
             results["layers"][layer] = {
