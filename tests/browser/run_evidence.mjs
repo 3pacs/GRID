@@ -114,24 +114,24 @@ function resolveBrowserExecutable() {
 
 const JOURNEYS = {
     admin: [
-        { name: 'home', hash: '#/home', clickText: 'How are my stocks doing?' },
-        { name: 'ticker-lookup', hash: '#/ticker-lookup' },
-        { name: 'watchlist-analysis', hash: '#/watchlist/TEST1' },
-        { name: 'portfolio', hash: '#/portfolio' },
-        { name: 'operator', hash: '#/operator' },
-        { name: 'discovery', hash: '#/discovery' },
-        { name: 'pipeline-health', hash: '#/pipeline-health' },
-        { name: 'ten-year', hash: '#/ten-year' },
+        { name: 'home', hash: '#/home', clickText: 'How are my stocks doing?', ready: /Your read|Start over|Here's (how|what)/ },
+        { name: 'ticker-lookup', hash: '#/ticker-lookup', ready: /GOLD VERDICT/ },
+        { name: 'watchlist-analysis', hash: '#/watchlist/TEST1', ready: /INSIDER EDGE/ },
+        { name: 'portfolio', hash: '#/portfolio', ready: /Portfolio Value/ },
+        { name: 'operator', hash: '#/operator', ready: /HERMES STATUS/ },
+        { name: 'discovery', hash: '#/discovery', ready: /HYPOTHESES/ },
+        { name: 'pipeline-health', hash: '#/pipeline-health', ready: /PIPELINE HEALTH/ },
+        { name: 'ten-year', hash: '#/ten-year', ready: /10-Year|TOP CHART|No eligible/ },
         // Operator (admin) can reach catalyst-timeline normally, unlike the
         // contributor gate below — added so the earlier owner-fix on this
         // view can be re-verified from the admin side too.
-        { name: 'catalyst-timeline-ACME', hash: '#/catalyst-timeline?ticker=ACME' },
+        { name: 'catalyst-timeline-ACME', hash: '#/catalyst-timeline?ticker=ACME', ready: /Catalyst|CATALYST|Enter a ticker|Error/ },
     ],
     contributor: [
-        { name: 'home', hash: '#/home', clickText: 'How are my stocks doing?' },
-        { name: 'ticker-lookup', hash: '#/ticker-lookup' },
-        { name: 'ten-year', hash: '#/ten-year' },
-        { name: 'catalyst-timeline-ACME', hash: '#/catalyst-timeline?ticker=ACME', allowCrash: true },
+        { name: 'home', hash: '#/home', clickText: 'How are my stocks doing?', ready: /Your read|Start over|Here's (how|what)/ },
+        { name: 'ticker-lookup', hash: '#/ticker-lookup', ready: /GOLD VERDICT/ },
+        { name: 'ten-year', hash: '#/ten-year', ready: /10-Year|TOP CHART|No eligible/ },
+        { name: 'catalyst-timeline-ACME', hash: '#/catalyst-timeline?ticker=ACME', allowCrash: true, ready: /Catalyst|CATALYST|Enter a ticker|Error|Tap a question/ },
     ],
 };
 
@@ -263,6 +263,25 @@ async function waitSettled(page) {
     });
 }
 
+/**
+ * Bounded, explicit UI-ready wait: poll document.body.innerText for the
+ * journey's `ready` regex (a piece of copy that only the settled view
+ * renders). Network-idle alone is not enough — SSE streams or polling
+ * widgets may never go idle. Returns 'ok', 'timeout', or 'none' (journey
+ * has no ready condition). A 'timeout' is recorded in summary.json and
+ * marks that journey's captures as INCOMPLETE evidence, never accepted.
+ */
+async function waitForReady(page, journey, timeoutMs = 10000) {
+    if (!journey.ready) return { ready: 'none', ready_wait_ms: 0 };
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+        const text = await page.evaluate(() => document.body.innerText).catch(() => '');
+        if (journey.ready.test(text)) return { ready: 'ok', ready_wait_ms: Date.now() - start };
+        await new Promise((r) => setTimeout(r, 250));
+    }
+    return { ready: 'timeout', ready_wait_ms: Date.now() - start };
+}
+
 function detectCrash(bodyText) {
     // ViewErrorBoundary.jsx renders "<ViewName> Error" as an <h3>, with
     // "An unexpected error occurred" (or the real error message) below it,
@@ -329,6 +348,7 @@ async function runOne(browser, role, scenario, outDir) {
                 await clickByVisibleText(page, journey.clickText);
                 await waitSettled(page);
             }
+            const readiness = await waitForReady(page, journey);
 
             // Desktop screenshot
             await page.setViewport({ width: 1280, height: 900 });
@@ -354,6 +374,9 @@ async function runOne(browser, role, scenario, outDir) {
                 console_errors: errorsAfter - journeyErrorCountBefore,
                 api_non_2xx: nonTwoXx,
                 allow_crash: !!journey.allowCrash,
+                ready: readiness.ready,
+                ready_wait_ms: readiness.ready_wait_ms,
+                evidence: readiness.ready === 'timeout' ? 'INCOMPLETE (ready condition not met within 10 s)' : 'complete',
             };
         } catch (err) {
             summary.journeys[journey.name] = {
