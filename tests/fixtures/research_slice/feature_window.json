@@ -1,0 +1,45 @@
+{
+  "features": [
+    {
+      "name": "rs_slice_macro_a",
+      "family": "macro",
+      "subfamily": "test",
+      "description": "Vertical-slice fixture: primary proxy macro series (return-proxy column).",
+      "transformation": "raw",
+      "normalization": "RAW",
+      "missing_data_policy": "FORWARD_FILL",
+      "eligible_from_date": "1990-01-01",
+      "model_eligible": true
+    },
+    {
+      "name": "rs_slice_macro_b",
+      "family": "macro",
+      "subfamily": "test",
+      "description": "Vertical-slice fixture: secondary proxy macro series.",
+      "transformation": "raw",
+      "normalization": "RAW",
+      "missing_data_policy": "FORWARD_FILL",
+      "eligible_from_date": "1990-01-01",
+      "model_eligible": true
+    }
+  ],
+  "series_window": {
+    "start_date": "2024-01-01",
+    "n_days": 45,
+    "base_value": 100.0,
+    "daily_drift": 0.35,
+    "oscillation_amplitude": 1.5,
+    "oscillation_period_days": 7
+  },
+  "mid_window_revision": {
+    "feature": "rs_slice_macro_a",
+    "obs_date_offset_days": 20,
+    "original_release_offset_days": 0,
+    "revised_release_offset_days": 10,
+    "revised_value": 999.0
+  },
+  "no_data_window": {
+    "start_date": "2023-01-01",
+    "end_date": "2023-01-05"
+  }
+}

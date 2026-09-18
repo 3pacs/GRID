@@ -1677,8 +1677,37 @@ def run_self_diagnostics(
 
 # ─── Autoresearch trigger ────────────────────────────────────────────
 
-def maybe_run_autoresearch(state: OperatorState, dry_run: bool = False) -> dict[str, Any] | None:
-    """Run autoresearch if system is healthy and enough time has passed."""
+def maybe_run_autoresearch(
+    state: OperatorState,
+    dry_run: bool = False,
+    run_id: str | None = None,
+    generation: int | None = None,
+    is_current_generation: Any = None,
+    lease_generation: int | None = None,
+    lease_owner_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Run autoresearch if system is healthy and enough time has passed.
+
+    Parameters:
+        run_id: Forwarded to run_autoresearch() for the research_run
+            snapshot trail / idempotent retry. Assigned by the caller
+            (scripts/hermes_operator.py), which also owns retrying with
+            the same run_id after a timeout.
+        generation: Operator-assigned generation id, forwarded to
+            run_autoresearch() for write fencing. None (the default)
+            disables fencing, matching a direct/standalone call.
+        is_current_generation: Callable(int) -> bool, forwarded to
+            run_autoresearch(). See scripts/hermes_operator.py's
+            ``_AutoresearchGenerationTracker``.
+        lease_generation: Cross-process ``research_leases`` generation
+            (GRID W4f, 2026-09-18), forwarded to run_autoresearch() so
+            every real write it makes is guarded against a second Hermes
+            process / a worker surviving a restart, not just a stale
+            in-process thread. None (the default) disables cross-process
+            guarding. See scripts/hermes_operator.py's cycle-6 gate,
+            which acquires this from ``governance.leases.acquire()``.
+        lease_owner_id: Forwarded to run_autoresearch() for logging only.
+    """
     now = datetime.now(timezone.utc)
 
     # Only run autoresearch every 12 hours
@@ -1693,9 +1722,21 @@ def maybe_run_autoresearch(state: OperatorState, dry_run: bool = False) -> dict[
     log.info("Running autoresearch cycle")
     try:
         from scripts.autoresearch import run_autoresearch
-        result = run_autoresearch(max_iterations=AUTORESEARCH_MAX_ITER)
+        result = run_autoresearch(
+            max_iterations=AUTORESEARCH_MAX_ITER,
+            run_id=run_id,
+            generation=generation,
+            is_current_generation=is_current_generation,
+            lease_generation=lease_generation,
+            lease_owner_id=lease_owner_id,
+        )
         state.last_autoresearch = now
         state.hypotheses_tested += result.get("iterations", 0)
+        if result.get("status") == "failed":
+            log.error(
+                "Autoresearch run failed in phase '{p}': {e}",
+                p=result.get("phase"), e=result.get("error"),
+            )
         return result
     except Exception as exc:
         log.warning("Autoresearch failed: {e}", e=str(exc))

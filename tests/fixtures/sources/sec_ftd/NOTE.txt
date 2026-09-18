@@ -1,0 +1,25 @@
+These fixtures are CONSTRUCTED for tests -- they are NOT real SEC data.
+
+They follow the field list documented on the SEC Fails-to-Deliver Data
+page (https://www.sec.gov/data-research/sec-markets-data/fails-deliver-data):
+
+    SETTLEMENT DATE (8 digits) | CUSIP (9 chars) | SYMBOL (10 chars) |
+    QUANTITY (FAILS) | DESCRIPTION (30 chars) | PRICE
+
+  "The data items are provided as a 'pipe delimited' text file."
+
+Each row is the OUTSTANDING BALANCE of fails as of SETTLEMENT DATE, not a
+count of new fails that day -- see sec_ftd.py's module docstring for the
+exact quotes this constraint comes from.
+
+Files:
+  good.txt              -- well-formed file, header row + 3 rows (3 CUSIPs).
+  empty.txt              -- header row only, no data rows.
+  malformed.txt          -- header row, one well-formed row, one row with
+                            a non-numeric QUANTITY, and one row with a
+                            wrong field count.
+  revised_same_date.txt  -- same (settlement date, CUSIP) key as one row
+                            in good.txt but a different QUANTITY, used to
+                            exercise idempotent-write behavior (a second
+                            pull must not duplicate or silently overwrite
+                            the already-stored balance).

@@ -1,0 +1,38 @@
+{
+  "tree_label": "composed-g-44019a43-sources-on-a2f71acf-pending-reroot",
+  "harness_commit": "2f7522f20640f885f04f630b6eb01be554ee643f",
+  "pwa_dir": "C:/Users/owner/dev/GRID-fable-wt-composed-g/pwa",
+  "pwa_commit": "44019a439c4697b860c5b571fc821acf1ba76b83",
+  "role": "contributor",
+  "scenario": "empty",
+  "started_at": "2026-09-18T09:39:12.390Z",
+  "journeys": {
+    "home": {
+      "crashed": false,
+      "console_errors": 0,
+      "api_non_2xx": [],
+      "allow_crash": false
+    },
+    "ticker-lookup": {
+      "crashed": false,
+      "console_errors": 2,
+      "api_non_2xx": [
+        "http://localhost:5174/api/v1/dad/ticker/RXT/gold/stream?token=dev-fixture-token.not-a-real-jwt.contributor"
+      ],
+      "allow_crash": false
+    },
+    "ten-year": {
+      "crashed": false,
+      "console_errors": 1,
+      "api_non_2xx": [],
+      "allow_crash": false
+    },
+    "catalyst-timeline-ACME": {
+      "crashed": false,
+      "console_errors": 1,
+      "api_non_2xx": [],
+      "allow_crash": true
+    }
+  },
+  "finished_at": "2026-09-18T09:39:22.120Z"
+}

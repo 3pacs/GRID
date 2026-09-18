@@ -49,6 +49,7 @@ import subprocess
 import sys
 import time
 import traceback
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -80,6 +81,19 @@ PIPELINE_INTERVAL_HOURS = 6           # run full pipeline every 6 hours
 DATA_FRESHNESS_THRESHOLD_HOURS = 26   # flag stale sources after 26h
 MAX_PULL_RETRIES = 3                  # retry failed pulls up to 3 times
 AUTORESEARCH_MAX_ITER = 5             # hypothesis iterations per cycle
+# Autoresearch had NO per-step timeout at all before this task (see
+# docs/handoffs/2026-09-18/fable-w4-research-states.md's "Activation
+# condition" section) — the cycle-6 gate called maybe_run_autoresearch()
+# directly inside a plain try/except, never through _run_with_timeout.
+# Duplicated from scripts/autoresearch.py's own AUTORESEARCH_TIMEOUT_SECONDS
+# (same env var, same default) for the same reason AUTORESEARCH_MAX_ITER is
+# duplicated in scripts/hermes_fixers.py: avoiding a circular import, since
+# scripts/autoresearch.py is only ever imported lazily, inside the function
+# that calls it. Conservative default: one iteration can chain an LLM
+# generate call, a walk-forward backtest, and an LLM critique call, so this
+# is sized like the other multi-call LLM steps below (ORACLE_CYCLE_TIMEOUT_
+# SECONDS=4000 for 41 tickers), not the single-call steps (120-240s).
+AUTORESEARCH_TIMEOUT_SECONDS = int(os.getenv("GRID_AUTORESEARCH_TIMEOUT_SECONDS", "1800"))
 HERMES_TEMPERATURE = 0.3              # LLM temperature for diagnostics
 # git-sync committed analytical outputs into the repo (data-exhaust pollution) and the pushes were failing; disabled by default. Set GRID_HERMES_GIT_SYNC=true only with a proper external sync target.
 GIT_SYNC_ENABLED = os.getenv("GRID_HERMES_GIT_SYNC", "false").lower() in ("1", "true", "yes")  # pull/push on each cycle
@@ -262,6 +276,150 @@ def _run_with_timeout(name: str, fn, timeout_s: int, state):
         state.cooldowns.record_attempt(name, success=False, error=str(exc))
         ex.shutdown(wait=False, cancel_futures=True)
         return None, False
+
+
+def _run_autoresearch_with_lease_heartbeat(
+    fn,
+    timeout_s: int,
+    engine: Any,
+    lease_name: str,
+    owner_id: str,
+    lease_generation: int,
+    state,
+    heartbeat_interval_s: int = 15,
+):
+    """Like ``_run_with_timeout`` above, specialised for autoresearch (GRID
+    W4f, 2026-09-18): closes the cross-process gap named in
+    docs/handoffs/2026-09-18/fable-w4b-runstate.md's residual case #2 by
+    keeping the ``governance.leases`` "autoresearch" row alive for as long
+    as this call is genuinely still waiting on a healthy worker, instead
+    of doing one long blocking wait the way ``_run_with_timeout`` does.
+
+    Rationale for polling instead of reusing ``_run_with_timeout``
+    directly: that function is shared by many unrelated steps
+    (resolution, oracle_cycle, ...) and its single blocking
+    ``fut.result(timeout=timeout_s)`` has no hook to run code WHILE the
+    wait is in progress. Reimplementing that one call as a poll loop here,
+    scoped to autoresearch only, avoids touching a well-tested shared
+    helper for a need only this one caller has.
+
+    Behavior:
+      * Waits in ``heartbeat_interval_s`` slices. After every slice that
+        times out (the worker is still running), calls
+        ``governance.leases.heartbeat()`` to renew the lease's expiry --
+        this is what keeps a legitimately slow (not hung) run from having
+        its lease go stale purely because of duration.
+      * Once the TOTAL elapsed wait reaches ``timeout_s``, stops
+        heartbeating and abandons the worker exactly like
+        ``_run_with_timeout`` (blacklist + ``shutdown(wait=False,
+        cancel_futures=True)`` -- the thread cannot be killed, see that
+        function's docstring). From this point no one renews the lease, so
+        it goes stale on its own schedule; any ``guarded_write`` the
+        orphan later attempts under ``lease_generation`` is rejected by
+        the row's own ``expires_at``/``generation`` check regardless of
+        whether a NEW owner has acquired the lease yet.
+
+    Returns:
+        (result, ok) — same contract as ``_run_with_timeout``.
+    """
+    import concurrent.futures
+
+    from governance.leases import heartbeat as _lease_heartbeat
+
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    fut = ex.submit(fn)
+    elapsed = 0.0
+    try:
+        while True:
+            wait_s = max(min(heartbeat_interval_s, timeout_s - elapsed), 0)
+            try:
+                result = fut.result(timeout=wait_s)
+                ex.shutdown(wait=True)
+                return result, True
+            except concurrent.futures.TimeoutError:
+                elapsed += wait_s
+                if elapsed >= timeout_s:
+                    raise
+                try:
+                    renewed = _lease_heartbeat(engine, lease_name, owner_id, lease_generation)
+                    if not renewed:
+                        log.warning(
+                            "Autoresearch lease heartbeat reports we no "
+                            "longer own generation {g} — continuing to "
+                            "wait for the worker, but it is now orphaned "
+                            "for write purposes.", g=lease_generation,
+                        )
+                except Exception as exc:
+                    log.warning(
+                        "Autoresearch lease heartbeat call failed (owner={o}, "
+                        "generation={g}): {e}", o=owner_id, g=lease_generation, e=str(exc),
+                    )
+    except concurrent.futures.TimeoutError:
+        log.warning(
+            "Step 'autoresearch' timed out after {s}s — blacklisting for {h}h",
+            s=timeout_s, h=TIMEOUT_BLACKLIST_HOURS,
+        )
+        state.cooldowns.blacklist_for_timeout("autoresearch")
+        ex.shutdown(wait=False, cancel_futures=True)
+        return None, False
+    except Exception as exc:
+        log.warning("Step 'autoresearch' raised: {e}", e=str(exc))
+        state.cooldowns.record_attempt("autoresearch", success=False, error=str(exc))
+        ex.shutdown(wait=False, cancel_futures=True)
+        return None, False
+
+
+class _AutoresearchGenerationTracker:
+    """In-process generation counter, used to fence autoresearch writes.
+
+    ``_run_with_timeout`` above abandons a timed-out worker rather than
+    cancelling it (its own docstring explains why: ``ThreadPoolExecutor``/
+    ``concurrent.futures`` has no API to kill a running thread). Without
+    something else stopping it, that orphaned worker keeps running
+    scripts/autoresearch.py::run_autoresearch() to completion and can still
+    insert into hypothesis_registry / model_registry / the research_run
+    snapshot trail, arbitrarily long after the operator moved on to the
+    next cycle.
+
+    This tracker is the compensating control. Every autoresearch
+    invocation is assigned a generation (``next()``) before it is handed to
+    the worker thread. run_autoresearch() (scripts/autoresearch.py) checks
+    ``is_current(generation)`` — via the closure captured in
+    ``is_current_generation`` below — before every write it makes; once
+    this tracker's ``current`` has moved past that generation, the check
+    fails and the write is skipped with a recorded "fenced" reason instead
+    of being made.
+
+    SCOPE: this fences a stale worker THREAD within this SAME PROCESS only.
+    ``current`` is a plain int behind the GIL, which is enough for an
+    orphan thread in the same interpreter to observe a bump made by the
+    main operator thread — it is NOT enough to fence a second Hermes
+    process, or a worker that survives past a process restart. Cross-
+    process fencing needs a DB-backed lease (a row with an owner/epoch
+    that every writer re-checks transactionally, e.g. ``SELECT ... FOR
+    UPDATE`` or an optimistic version column) — not implemented here. That
+    gap is why autoresearch remains explicitly not-yet-safe-to-activate on
+    a schedule; this task only makes it observable and safe to restart
+    within one process.
+    """
+
+    def __init__(self) -> None:
+        self.current = 0
+
+    def next(self) -> int:
+        """Advance to a new generation and return it."""
+        self.current += 1
+        return self.current
+
+    def is_current(self, generation: int) -> bool:
+        """Return whether *generation* is still the latest one assigned."""
+        return generation == self.current
+
+
+# Module-level: one tracker per Hermes operator process, shared by every
+# autoresearch invocation across cycles (see class docstring for scope).
+_autoresearch_generation = _AutoresearchGenerationTracker()
+
 
 # ─── Source registry (DERIVED from PULLER_REGISTRY — task #179) ────────────
 #
@@ -1369,31 +1527,56 @@ def _run_obsidian_cycle(engine: Any) -> dict[str, Any]:
             log.debug("Concept stubs skipped: {e}", e=str(exc))
 
         # 5. Add wikilinks to docs (only if concept stubs changed)
+        #
+        # IMPORTANT (2026-09-18 fix, see
+        # docs/handoffs/2026-09-18/fable-w4d-hermes-docs-rewrite.md): this
+        # used to write add_wikilinks()'s result straight back onto the
+        # SAME tracked file it read via collect_markdown_files() — silently
+        # rewriting README.md/CLAUDE.md/ATTENTION.md/docs/**/*.md in the
+        # release tree on nearly every Hermes cycle. Source docs are now
+        # read-only here; annotated copies go to
+        # resolve_backlinks_output_dir() (env-configurable, defaults under
+        # the Obsidian vault path this module already uses elsewhere), or
+        # this step is skipped entirely (logged) when that directory is
+        # unavailable. Never falls back to writing inside this checkout.
         backlinks_added = 0
         if stubs_created > 0:
             try:
                 from scripts.obsidian_backlinks import (
                     collect_markdown_files, build_doc_registry,
                     add_wikilinks, CONCEPT_LINKS,
+                    resolve_backlinks_output_dir, write_annotated_copy,
                 )
 
-                files = collect_markdown_files()
-                doc_registry = build_doc_registry(files)
-                all_entities = {**CONCEPT_LINKS}
-                skip_stems = {"README", "CLAUDE", "index", "plan", "config"}
-                for stem, target in doc_registry.items():
-                    if stem not in skip_stems and len(stem) > 3:
-                        all_entities[stem] = target
+                output_dir = resolve_backlinks_output_dir()
+                if output_dir is None:
+                    log.debug(
+                        "Obsidian backlinks skipped this cycle: no output "
+                        "directory configured/available (see "
+                        "resolve_backlinks_output_dir)",
+                    )
+                else:
+                    files = collect_markdown_files()
+                    doc_registry = build_doc_registry(files)
+                    all_entities = {**CONCEPT_LINKS}
+                    skip_stems = {"README", "CLAUDE", "index", "plan", "config"}
+                    for stem, target in doc_registry.items():
+                        if stem not in skip_stems and len(stem) > 3:
+                            all_entities[stem] = target
 
-                for f in files:
-                    content = f.read_text(encoding="utf-8", errors="replace")
-                    new_content, changes = add_wikilinks(content, f, all_entities)
-                    if changes:
-                        f.write_text(new_content, encoding="utf-8")
-                        backlinks_added += len(changes)
+                    for f in files:
+                        content = f.read_text(encoding="utf-8", errors="replace")
+                        new_content, changes = add_wikilinks(content, f, all_entities)
+                        if changes:
+                            write_annotated_copy(output_dir, f, new_content)
+                            backlinks_added += len(changes)
 
-                if backlinks_added:
-                    log.info("Obsidian backlinks: {n} links added", n=backlinks_added)
+                    if backlinks_added:
+                        log.info(
+                            "Obsidian backlinks: {n} links added (written "
+                            "to {d}; source docs untouched)",
+                            n=backlinks_added, d=output_dir,
+                        )
             except Exception as exc:
                 log.debug("Backlinks skipped: {e}", e=str(exc))
 
@@ -1834,12 +2017,96 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
             log.warning("Self-diagnostics failed: {e}", e=str(exc))
 
     # 6. Autoresearch — only every 12th cycle (1 hour)
+    #
+    # Bounded + fenced (this task): previously called maybe_run_autoresearch
+    # directly inside a plain try/except, with NO per-step timeout at all
+    # (see docs/handoffs/2026-09-18/fable-w4-research-states.md's
+    # "Activation condition" — this was the exact gap that made activating
+    # autoresearch on a schedule unsafe). Now wrapped in _run_with_timeout
+    # like resolution/oracle_cycle, AND every invocation gets a generation
+    # id from _autoresearch_generation: if the timeout fires, the worker
+    # thread is abandoned (not killed — see _run_with_timeout's docstring)
+    # but the generation is bumped immediately below, so any write that
+    # orphan later attempts is fenced by scripts/autoresearch.py's
+    # generation checks (recorded there with a "fenced" reason).
     if state.cycle_count % 12 == 0 and health.get("overall_healthy") and hermes_ok:
         try:
             state.current_step = "autoresearch"
-            ar_result = maybe_run_autoresearch(state, dry_run=dry_run)
-            if ar_result is not None:
-                cycle_result["autoresearch"] = ar_result
+            ar_run_id = str(uuid.uuid4())
+            ar_generation = _autoresearch_generation.next()
+
+            # Cross-process lease (GRID W4f, 2026-09-18): acquiring this
+            # BEFORE the call, and forwarding the returned generation into
+            # every write run_autoresearch() makes, is what fences a
+            # SECOND Hermes process or a worker surviving a process
+            # restart — the in-process ar_generation above only ever
+            # fenced a stale THREAD within this same process (see
+            # _AutoresearchGenerationTracker's docstring). LeaseHeld means
+            # another owner already holds a live lease (e.g. two operator
+            # processes both reaching this gate); skip this cycle rather
+            # than force a takeover.
+            from governance.leases import LeaseHeld as _LeaseHeld
+            from governance.leases import acquire as _lease_acquire
+            from governance.leases import release as _lease_release
+
+            ar_owner_id = f"hermes-operator-{ar_run_id}"
+            try:
+                ar_lease_generation = _lease_acquire(engine, "autoresearch", ar_owner_id)
+            except _LeaseHeld as exc:
+                log.warning("Autoresearch lease held elsewhere — skipping this cycle: {e}", e=str(exc))
+                cycle_result["autoresearch"] = {"status": "lease_held", "run_id": ar_run_id}
+                ar_lease_generation = None
+
+            if ar_lease_generation is not None:
+                def _autoresearch_call():
+                    return maybe_run_autoresearch(
+                        state, dry_run=dry_run,
+                        run_id=ar_run_id, generation=ar_generation,
+                        is_current_generation=_autoresearch_generation.is_current,
+                        lease_generation=ar_lease_generation, lease_owner_id=ar_owner_id,
+                    )
+
+                ar_result, ar_ok = _run_autoresearch_with_lease_heartbeat(
+                    _autoresearch_call, AUTORESEARCH_TIMEOUT_SECONDS, engine,
+                    "autoresearch", ar_owner_id, ar_lease_generation, state,
+                )
+                if ar_ok:
+                    if ar_result is not None:
+                        cycle_result["autoresearch"] = ar_result
+                    try:
+                        _lease_release(engine, "autoresearch", ar_owner_id, ar_lease_generation)
+                    except Exception as exc:
+                        log.debug(
+                            "Autoresearch lease release failed (harmless — "
+                            "TTL will expire it): {e}", e=str(exc),
+                        )
+                else:
+                    # Bump NOW, not on the next cycle-6 gate an hour from now —
+                    # the abandoned worker thread is still running and could
+                    # write at any point between now and then.
+                    _autoresearch_generation.next()
+                    cycle_result["autoresearch"] = {"status": "timeout", "run_id": ar_run_id}
+                    try:
+                        from scripts.autoresearch import _record_research_run
+                        _record_research_run(
+                            engine, ar_run_id, "timeout",
+                            phase="operator_timeout",
+                            error=f"exceeded {AUTORESEARCH_TIMEOUT_SECONDS}s",
+                            error_category="timeout",
+                            generation=ar_generation,
+                        )
+                    except Exception as exc:
+                        log.warning("Failed to record autoresearch timeout: {e}", e=str(exc))
+                    # Deliberately do NOT release the lease here: the orphaned
+                    # worker thread (still running — see _run_with_timeout's
+                    # docstring, same limitation applies here) may still be
+                    # mid-way through a guarded_write call under
+                    # ar_lease_generation. Releasing now would let a brand-new
+                    # acquire() bump the generation immediately while that
+                    # write could still be in flight; leaving it to expire on
+                    # its own TTL (no more heartbeats will renew it) is what
+                    # makes the row-lock ordering argument in
+                    # governance/leases.py hold.
         except Exception as exc:
             log.warning("Autoresearch failed: {e}", e=str(exc))
 
