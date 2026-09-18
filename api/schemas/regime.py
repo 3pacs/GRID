@@ -14,7 +14,9 @@ class RegimeDriver(BaseModel):
 
 class RegimeCurrentResponse(BaseModel):
     state: str
-    confidence: float = 0.0
+    # None = UNSCORED: no confidence was ever measured for this decision.
+    # Distinct from 0.0, which is a measured no-confidence reading.
+    confidence: float | None = 0.0
     transition_probability: float = 0.0
     top_drivers: list[RegimeDriver] = []
     contradiction_flags: list[str] = []
@@ -38,7 +40,8 @@ class RegimeCurrentResponse(BaseModel):
 class RegimeHistoryEntry(BaseModel):
     date: str
     state: str
-    confidence: float
+    # None = UNSCORED (see RegimeCurrentResponse.confidence).
+    confidence: float | None = None
 
 
 class RegimeHistoryResponse(BaseModel):
@@ -49,7 +52,8 @@ class RegimeTransition(BaseModel):
     date: str
     from_state: str
     to_state: str
-    confidence: float
+    # None = UNSCORED (see RegimeCurrentResponse.confidence).
+    confidence: float | None = None
 
 
 class RegimeTransitionsResponse(BaseModel):

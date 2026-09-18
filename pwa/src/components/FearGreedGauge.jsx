@@ -31,7 +31,9 @@ function computeScore(signals, regime) {
         return n.includes('PUT_CALL') || n.includes('PCALL');
     });
     // Regime confidence contributes
-    const regimeConf = regime?.confidence ?? 0.5;
+    // `?? 0.5` used to blend an invented mid-confidence into the composite.
+    // null means unscored: the regime factor is excluded from the score.
+    const regimeConf = regime?.confidence ?? null;
     const regimeState = (regime?.state || '').toLowerCase();
 
     let score = 50; // start neutral
@@ -53,15 +55,20 @@ function computeScore(signals, regime) {
         factors++;
     }
 
-    // Regime state
+    // Regime state. When the regime is UNSCORED (regimeConf == null) the
+    // state is still known but its confidence is not, so the confidence-scaled
+    // term is dropped and only the band base contributes - the least the state
+    // alone supports. It is NOT replaced by 0.5, and `null * 20` is not relied
+    // on to silently do the same thing.
+    const confTerm = (scale) => (regimeConf == null ? 0 : regimeConf * scale);
     if (regimeState.includes('expansion') || regimeState.includes('growth')) {
-        score += 70 + regimeConf * 20;
+        score += 70 + confTerm(20);
         factors++;
     } else if (regimeState.includes('recovery')) {
-        score += 60 + regimeConf * 10;
+        score += 60 + confTerm(10);
         factors++;
     } else if (regimeState.includes('contraction') || regimeState.includes('crisis')) {
-        score += 15 - regimeConf * 10;
+        score += 15 - confTerm(10);
         factors++;
     } else if (regimeState.includes('late') || regimeState.includes('fragile')) {
         score += 35;
