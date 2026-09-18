@@ -557,7 +557,11 @@ export function normalizeAstrogridScorecard(payload) {
         momentumScore: asNumber(item?.momentum_score ?? item?.momentumScore, 0),
         bias: asString(item?.bias),
         trend: asString(item?.trend),
-        confidence: normalizeConfidence(item?.confidence),
+        // Renamed from `confidence`: it measures how much data we hold for
+        // this item, not how right the forecast is
+        // (docs/reference/CONFIDENCE_POLICY.md). Null stays null.
+        coverageScore: asNumber(item?.coverage_score ?? item?.coverageScore, null),
+        coverageScoreBasis: asString(item?.coverage_score_basis),
         coverage: isObject(item?.coverage) ? item.coverage : {},
         source: asString(item?.source),
         raw: item,

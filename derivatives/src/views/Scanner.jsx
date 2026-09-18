@@ -87,9 +87,9 @@ function Scanner() {
                                 <span style={styles.summaryValue}>{data?.count || 0}</span>
                             </div>
                             <div style={styles.summaryItem}>
-                                <span style={styles.summaryLabel}>100x Flags</span>
+                                <span style={styles.summaryLabel}>Payoff Flags</span>
                                 <span style={{ ...styles.summaryValue, color: tokens.caution }}>
-                                    {data?.count_100x || 0}
+                                    {data?.heuristic_payoff_flag_count ?? 0}
                                 </span>
                             </div>
                         </div>
@@ -112,13 +112,16 @@ function Scanner() {
                                 <div style={styles.meta}>
                                     <span>{o.direction}</span>
                                     <span>{o.expiry}</span>
-                                    {o.estimated_payoff_multiple && (
-                                        <span style={{ color: tokens.accent }}>
-                                            {o.estimated_payoff_multiple.toFixed(0)}x payoff
-                                        </span>
-                                    )}
-                                    {o.is_100x && (
-                                        <span style={{ color: tokens.caution, fontWeight: 700 }}>100x</span>
+                                    <span style={{ color: tokens.accent }}>
+                                        {o.estimated_payoff_multiple != null
+                                            ? `${o.estimated_payoff_multiple.toFixed(0)}x modelled payoff`
+                                            : 'payoff not modelled'}
+                                    </span>
+                                    {o.heuristic_payoff_flag && (
+                                        <span
+                                            style={{ color: tokens.caution, fontWeight: 700 }}
+                                            title={`Modelled payoff heuristic: ${JSON.stringify(o.payoff_inputs || {})}`}
+                                        >100x (modelled)</span>
                                     )}
                                 </div>
                             </div>

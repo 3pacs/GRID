@@ -1112,7 +1112,11 @@ function PowerNetwork({ connections, onActorOpen }) {
             .join('line')
             .attr('stroke', d => EDGE_META[d.type]?.color || colors.textMuted)
             .attr('stroke-opacity', 0.5)
-            .attr('stroke-width', d => Math.max(0.5, (d.strength || 0.3) * 3));
+            // A curated_static edge ships strength: null on purpose — its old
+            // 0.8/0.6/0.5 weights were editorial. Draw it hairline and dashed
+            // rather than inventing a width for it.
+            .attr('stroke-width', d => (d.strength == null ? 0.75 : Math.max(0.5, d.strength * 3)))
+            .attr('stroke-dasharray', d => (d.provenance === 'curated_static' ? '3,3' : null));
 
         const nodeSel = svg.append('g')
             .attr('class', 'nodes')
@@ -1575,6 +1579,9 @@ function FeedRow({ row }) {
 
     const confColor = {
         confirmed: '#E2E8F0',
+        // Hand-curated static maps: rendered muted so a curated edge never
+        // reads like a confirmed one (audit B-H11).
+        curated:   colors.textMuted,
         derived:   colors.accent,
         estimated: colors.yellow,
         rumored:   '#A855F7',

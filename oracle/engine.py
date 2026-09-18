@@ -618,9 +618,9 @@ class OracleEngine:
                     prediction_type TEXT NOT NULL,
                     direction TEXT NOT NULL,
                     target_price DOUBLE PRECISION,
-                    entry_price DOUBLE PRECISION NOT NULL,
+                    entry_price DOUBLE PRECISION,
                     expiry DATE NOT NULL,
-                    confidence DOUBLE PRECISION NOT NULL,
+                    confidence DOUBLE PRECISION,
                     expected_move_pct DOUBLE PRECISION,
                     signal_strength DOUBLE PRECISION,
                     coherence DOUBLE PRECISION,
@@ -643,6 +643,15 @@ class OracleEngine:
                 ALTER TABLE oracle_predictions
                 ADD COLUMN IF NOT EXISTS dedup_keep BOOLEAN NOT NULL DEFAULT TRUE
             """))
+            # D-H11 / D-M32: `confidence` and `entry_price` are NULL when
+            # nothing measured them. Both writers already bind None
+            # (`_store_predictions` for a ticker with no spot, `oracle/publish.py`
+            # for an unsupplied confidence). The CREATE above carries the
+            # nullable shape for a fresh database; an existing table is
+            # relaxed by alembic revision ``oracle_pred_nullable_0918`` at
+            # deploy time, NOT here: ALTER COLUMN takes ACCESS EXCLUSIVE on
+            # the table every time this bootstrap runs.
+            # tests/test_oracle_predictions_schema_parity.py keeps the two in step.
             conn.execute(text("""
                 ALTER TABLE oracle_predictions
                 ADD COLUMN IF NOT EXISTS horizon_days INTEGER
@@ -2636,6 +2645,9 @@ class EnsemblePredictor:
                 t=ticker,
                 e=str(exc),
             )
+        # 0.0 means "no catalyst we know of" — and the macro calendar is not
+        # ingested at all, so an FOMC week reads as 0.0 here. Absence of a
+        # catalyst only skips the dampening; it never boosts confidence.
         if catalyst_proximity > 0:
             confidence = round(confidence * (1.0 - 0.5 * catalyst_proximity), 4)
 
