@@ -256,14 +256,51 @@ class ChatAskRequest(BaseModel):
 
 
 class ChatAskResponse(BaseModel):
+    """Answer payload.
+
+    There is deliberately no ``confidence`` field: see
+    docs/reference/CONFIDENCE_POLICY.md. The old one was
+    ``0.75 if context_text else 0.5`` — a constant that told the reader only
+    whether the context string was non-empty, and that still reported 0.75
+    for an answer the publishing firewall had rejected.
+
+    What replaces it is the firewall's own measurement of *this* answer:
+    ``claim_count`` atomic claims were extracted and checked against the
+    database, ``flagged_count`` of them failed. ``verified_claim_ratio`` is
+    ``(claim_count - flagged_count) / claim_count`` and is ``None`` whenever
+    the firewall did not run or extracted no checkable claim — never a
+    midpoint stand-in.
+    """
+
     answer: str
     sources_used: list[str]
-    confidence: float
     generated_at: str
     model_used: str | None = None
     answer_b: str | None = None  # A/B test: second model response
     model_b: str | None = None   # A/B test: second model name
     sanity_warnings: list[str] | None = None  # Data integrity warnings
+    # Publishing-firewall measurement (all None when the firewall did not run)
+    verified_claim_ratio: float | None = None
+    claim_count: int | None = None
+    flagged_count: int | None = None
+    firewall_decision: str | None = None
+
+
+def _verified_claim_ratio(
+    claim_count: int | None, flagged_count: int | None
+) -> float | None:
+    """Share of the answer's extracted claims the firewall did NOT flag.
+
+    ``None`` when the firewall did not run, or ran and found no checkable
+    claim: there is then nothing measured, and a number here would be
+    indistinguishable from a measurement. Never defaults to a midpoint.
+    """
+    if claim_count is None or flagged_count is None:
+        return None
+    if claim_count <= 0:
+        return None
+    verified = max(0, claim_count - flagged_count)
+    return round(verified / claim_count, 4)
 
 
 # ── Compose: natural language → live dashboard layout ───────────────────
@@ -1782,7 +1819,10 @@ async def _ask_grid_impl(
 
     # 1. Gather context
     context_text, sources = _build_context_block(question, ticker)
-    confidence = 0.5  # base
+    # Firewall measurement of the answer; stays None unless the firewall runs.
+    claim_count: int | None = None
+    flagged_count: int | None = None
+    firewall_decision: str | None = None
 
     # 1a. Post-query data gap scan (async, non-blocking)
     try:
@@ -1842,7 +1882,6 @@ async def _ask_grid_impl(
             answer = client.chat(messages, **primary_kwargs)
             if answer:
                 sources.append(f"llm/{backend}")
-                confidence = 0.75 if context_text else 0.5
                 model_used = getattr(client, "model", backend)
 
                 # A/B test: fire Opus in background for comparison
@@ -1878,6 +1917,9 @@ async def _ask_grid_impl(
                 try:
                     from oracle.firewall import verify_output
                     fw = verify_output(answer, _get_db_engine())
+                    claim_count = int(fw.claim_count)
+                    flagged_count = int(fw.flagged_count)
+                    firewall_decision = str(fw.decision.decision)
                     if fw.decision.decision in ("reject", "review"):
                         if fw.decision.decision == "reject":
                             log.warning(
@@ -1943,12 +1985,17 @@ async def _ask_grid_impl(
                 return ChatAskResponse(
                     answer=answer,
                     sources_used=sources,
-                    confidence=confidence,
                     generated_at=now.isoformat(),
                     model_used=model_used,
                     answer_b=answer_b,
                     model_b=model_b,
                     sanity_warnings=sanity_warnings or None,
+                    verified_claim_ratio=_verified_claim_ratio(
+                        claim_count, flagged_count
+                    ),
+                    claim_count=claim_count,
+                    flagged_count=flagged_count,
+                    firewall_decision=firewall_decision,
                 )
         except Exception as exc:
             log.warning("LLM chat failed, falling back to rule-based: {e}", e=str(exc))
@@ -1956,13 +2003,18 @@ async def _ask_grid_impl(
     # 3. Fallback: rule-based
     answer = _build_rule_based_response(context_text, question, sources)
     sources.append("rule_based")
-    confidence = 0.3 if context_text else 0.1
 
+    # No firewall runs on the rule-based fallback, so every measurement field
+    # stays null. The old code reported 0.3/0.1 here, which the UI rendered as
+    # "confidence: 30%".
     return ChatAskResponse(
         answer=answer,
         sources_used=sources,
-        confidence=confidence,
         generated_at=now.isoformat(),
+        verified_claim_ratio=_verified_claim_ratio(claim_count, flagged_count),
+        claim_count=claim_count,
+        flagged_count=flagged_count,
+        firewall_decision=firewall_decision,
     )
 
 
