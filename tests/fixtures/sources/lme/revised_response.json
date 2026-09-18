@@ -1,0 +1,6 @@
+{
+  "report_date": "2026-09-16",
+  "metals": [
+    {"metal": "Copper", "total_stocks": 125000, "cancelled_warrants": 40000}
+  ]
+}
