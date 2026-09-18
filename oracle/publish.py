@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -18,6 +19,23 @@ from oracle.prediction_context import (
 
 def _compact_text(value: Any, fallback: str = "") -> str:
     return " ".join(str(value or fallback).split())[:240]
+
+
+def _measured_or_none(value: Any) -> float | None:
+    """A caller-supplied metric, or None. Never a midpoint stand-in.
+
+    ``None`` stays ``None`` and a genuine ``0.0`` stays ``0.0`` (the retired
+    ``or 0.5`` form silently rewrote both).
+    """
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(f) or math.isinf(f):
+        return None
+    return f
 
 
 def _prediction_direction(payload: dict[str, Any]) -> str:
@@ -76,12 +94,18 @@ def publish_astrogrid_prediction(engine: Engine, payload: dict[str, Any]) -> dic
             as_of_date = as_of_ts.date()
         else:
             as_of_date = datetime.now(timezone.utc).date()
+        # No supplied confidence means no astrogrid weight to record, not a
+        # 0.5 one. `_normalize_contributions` drops a None value, so the
+        # context simply carries no astrogrid weight.
+        astrogrid_weight = _measured_or_none(payload.get("confidence"))
         context = build_prediction_context(
             engine,
             as_of=as_of_date,
-            model_weights={
-                "astrogrid": float(payload.get("confidence") or 0.5),
-            },
+            model_weights=(
+                {"astrogrid": astrogrid_weight}
+                if astrogrid_weight is not None
+                else None
+            ),
         )
     except Exception:
         context = {
@@ -145,7 +169,14 @@ def publish_astrogrid_prediction(engine: Engine, payload: dict[str, Any]) -> dic
                     ((created_at AT TIME ZONE 'UTC')::date)
                 ) WHERE dedup_keep = TRUE
                 DO UPDATE SET
-                    confidence = GREATEST(EXCLUDED.confidence, oracle_predictions.confidence),
+                    confidence = CASE
+                        WHEN EXCLUDED.confidence IS NULL
+                          OR oracle_predictions.confidence IS NULL
+                        THEN NULL
+                        ELSE GREATEST(
+                            EXCLUDED.confidence, oracle_predictions.confidence
+                        )
+                    END,
                     signals    = EXCLUDED.signals,
                     signal_strength = EXCLUDED.signal_strength,
                     coherence  = EXCLUDED.coherence,
@@ -159,9 +190,14 @@ def publish_astrogrid_prediction(engine: Engine, payload: dict[str, Any]) -> dic
                 "direction": _prediction_direction(payload),
                 "entry_price": 0.0,
                 "expiry": _prediction_expiry(payload),
-                "confidence": float(payload.get("confidence") or 0.5),
-                "signal_strength": float(payload.get("confidence") or 0.5),
-                "coherence": float(payload.get("confidence") or 0.5),
+                # Three nominally independent metrics used to be the same
+                # number, and that number was 0.5 whenever the caller omitted
+                # a confidence (D-H11). `or 0.5` also rewrote a legitimate
+                # 0.0 to 0.5. Each is now its own input, or NULL: a caller
+                # that did not supply it does not get one invented.
+                "confidence": _measured_or_none(payload.get("confidence")),
+                "signal_strength": _measured_or_none(payload.get("signal_strength")),
+                "coherence": _measured_or_none(payload.get("coherence")),
                 "model_name": "astrogrid",
                 "model_version": str(payload.get("model_version") or "astrogrid-oracle-v1"),
                 "signals": json.dumps(signals),

@@ -46,7 +46,10 @@ class OraclePublishRequest(BaseModel):
     call: str
     timing: str
     invalidation: str
-    confidence: float = 0.5
+    # No default: a publisher that does not state a confidence publishes
+    # without one (docs/reference/CONFIDENCE_POLICY.md). The old 0.5 default
+    # made every silent caller look like a stated 50% forecast.
+    confidence: float | None = None
     weight_version: str = "astrogrid-v1"
     model_version: str = "astrogrid-oracle-v1"
     grid_summary: str | None = None
