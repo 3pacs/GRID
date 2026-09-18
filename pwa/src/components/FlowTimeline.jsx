@@ -41,6 +41,13 @@ const CATALYST_COLORS = {
     cpi: '#F97316',
     earnings: '#A855F7',
 };
+// Legend entries are rendered only for catalyst types present in the
+// response, so the chart never advertises a marker it cannot draw.
+const CATALYST_LEGEND = [
+    { type: 'fomc', label: 'FOMC' },
+    { type: 'cpi', label: 'CPI' },
+    { type: 'earnings', label: 'Earnings' },
+];
 const OPEX_COLOR = '#3B82F6';
 
 export default function FlowTimeline({ ticker, timelineData }) {
@@ -69,7 +76,14 @@ export default function FlowTimeline({ ticker, timelineData }) {
 
         const history = timelineData.history || [];
         const opexCal = timelineData.opex_calendar || [];
-        const catalysts = timelineData.catalysts || [];
+        // The API reports catalysts_status: 'unavailable' when it has no
+        // sourced events for the window (GRID ingests no macro calendar, so
+        // FOMC/CPI dates are never among them). Draw nothing in that case --
+        // a diamond on the axis is a claim that something happens that day.
+        const catalystsUnavailable = timelineData.catalysts_status === 'unavailable';
+        const catalysts = catalystsUnavailable
+            ? []
+            : (timelineData.catalysts || []);
         const flipCrossings = timelineData.gamma_flip_crossings || [];
 
         // Bars the API could not compute carry net_gex: null (rather than a
@@ -506,6 +520,16 @@ export default function FlowTimeline({ ticker, timelineData }) {
         ? measuredHistory[measuredHistory.length - 1].net_gex
         : null;
     const flipCount = (timelineData.gamma_flip_crossings || []).length;
+    // Only legend the marker types actually on the chart, and say plainly
+    // that scheduled FOMC/CPI dates are not something the API can source.
+    const catalystStatus = timelineData.catalysts_status;
+    const shownCatalystTypes = new Set(
+        catalystStatus === 'unavailable'
+            ? []
+            : (timelineData.catalysts || []).map(c => c.type)
+    );
+    const macroCalendarMissing = catalystStatus === 'unavailable'
+        || catalystStatus === 'partial';
 
     return (
         <div ref={containerRef} style={{
@@ -578,18 +602,21 @@ export default function FlowTimeline({ ticker, timelineData }) {
                     <svg width="10" height="10"><polygon points="5,1 1,9 9,9" fill={OPEX_COLOR} opacity="0.7" /></svg>
                     OpEx
                 </span>
-                <span style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                    <svg width="10" height="10"><polygon points="5,0 10,5 5,10 0,5" fill={CATALYST_COLORS.fomc} opacity="0.85" /></svg>
-                    FOMC
-                </span>
-                <span style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                    <svg width="10" height="10"><polygon points="5,0 10,5 5,10 0,5" fill={CATALYST_COLORS.cpi} opacity="0.85" /></svg>
-                    CPI
-                </span>
-                <span style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                    <svg width="10" height="10"><polygon points="5,0 10,5 5,10 0,5" fill={CATALYST_COLORS.earnings} opacity="0.85" /></svg>
-                    Earnings
-                </span>
+                {CATALYST_LEGEND.filter(item => shownCatalystTypes.has(item.type)).map(item => (
+                    <span key={item.type} style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                        <svg width="10" height="10"><polygon points="5,0 10,5 5,10 0,5" fill={CATALYST_COLORS[item.type]} opacity="0.85" /></svg>
+                        {item.label}
+                    </span>
+                ))}
+                {macroCalendarMissing && (
+                    <span
+                        className="catalyst-unavailable-note"
+                        title={timelineData.catalysts_reason || ''}
+                        style={{ color: colors.textMuted, opacity: 0.85 }}
+                    >
+                        macro calendar unavailable
+                    </span>
+                )}
                 <span style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
                     <span style={{ width: '10px', height: '2px', background: colors.accent, opacity: 0.4, display: 'inline-block', borderTop: '1px dashed ' + colors.accent }}></span>
                     Spot
