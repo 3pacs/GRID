@@ -13,7 +13,6 @@ import { colors, shared } from '../styles/shared.js';
  */
 
 const NOT_BUILT_PILLARS = [
-    { key: 'finra_short_volume', label: 'FINRA Short Volume', reason: 'adapter exists but is unscheduled/unverified live' },
     { key: 'sec_regsho_ftd', label: 'SEC Reg SHO — FTD', reason: 'adapter exists but is unscheduled/unverified live' },
     { key: 'buyback_blackouts', label: 'Corporate Buyback Blackouts', reason: 'no measured source' },
     { key: 'dealer_gex', label: 'Dealer Gamma Exposure', reason: 'engine correctness unproven' },
@@ -341,6 +340,62 @@ function CommodityWarehouseCard({ data, error }) {
     );
 }
 
+function FinraShortVolumeCard({ data, error }) {
+    const cardStyle = {
+        background: colors.card, border: `1px solid ${colors.border}`, borderRadius: 10, padding: 16, marginBottom: 16,
+    };
+
+    if (error) {
+        return <div style={cardStyle} data-testid="finra-short-volume-card" data-state="error">
+            <div style={{ color: colors.text, fontWeight: 600, marginBottom: 8 }}>FINRA Short Sale Volume</div>
+            <div style={{ color: colors.red }}>Failed to load: {error}</div>
+        </div>;
+    }
+    if (!data) {
+        return <div style={cardStyle} data-testid="finra-short-volume-card" data-state="loading">
+            <div style={{ color: colors.text, fontWeight: 600 }}>FINRA Short Sale Volume</div>
+            <div style={{ color: colors.textDim, marginTop: 8 }}>Loading…</div>
+        </div>;
+    }
+    if (data.available === false) {
+        return <div style={cardStyle} data-testid="finra-short-volume-card" data-state="unavailable">
+            <UnavailablePanel label="FINRA Short Sale Volume" payload={data} />
+        </div>;
+    }
+
+    const fields = data.fields || {};
+    const tickers = Object.keys(fields);
+
+    return (
+        <div style={cardStyle} data-testid="finra-short-volume-card" data-state="available">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 4 }}>
+                <div style={{ color: colors.text, fontWeight: 600, fontSize: 16 }}>FINRA Short Sale Volume</div>
+                <div style={{ fontSize: 11, color: colors.textMuted }}>as of {data.as_of}</div>
+            </div>
+            <div style={{ fontSize: 11, color: colors.yellow, marginBottom: 10 }} data-testid="not-short-interest-note">
+                {data.note}
+            </div>
+            {tickers.length === 0 ? (
+                <div style={{ color: colors.textMuted, fontSize: 13 }}>no qualifying rows as of this date</div>
+            ) : (
+                tickers.map((ticker) => (
+                    <div key={ticker} style={{ marginBottom: 12 }}>
+                        <div style={{ fontSize: 13, color: colors.textDim, marginBottom: 4 }}>{ticker}</div>
+                        <FieldRow name="Short ratio" field={fields[ticker].short_ratio} />
+                        <FieldRow name="Short ratio (20d avg)" field={fields[ticker].short_ratio_20d_ma} />
+                        <FieldRow name="Short volume (shares)" field={fields[ticker].short_volume} />
+                        <FieldRow name="Total volume (shares)" field={fields[ticker].total_volume} />
+                        <FieldRow name="Spike flag" field={fields[ticker].is_spike} />
+                    </div>
+                ))
+            )}
+            <div style={{ fontSize: 10, color: colors.textDimAlt, marginTop: 8 }}>
+                generation {data.generation_id || '—'} published {fmtDateTime(data.generation_published_at)}
+            </div>
+        </div>
+    );
+}
+
 function NotBuiltCard({ label, reason }) {
     return (
         <div
@@ -372,6 +427,9 @@ export default function GodViewPillars() {
     const [cmdtyData, setCmdtyData] = useState(null);
     const [cmdtyError, setCmdtyError] = useState(null);
     const [cmdtyLoading, setCmdtyLoading] = useState(true);
+    const [finraData, setFinraData] = useState(null);
+    const [finraError, setFinraError] = useState(null);
+    const [finraLoading, setFinraLoading] = useState(true);
 
     useEffect(() => {
         let cancelled = false;
@@ -416,6 +474,18 @@ export default function GodViewPillars() {
         return () => { cancelled = true; };
     }, [asOf]);
 
+    useEffect(() => {
+        let cancelled = false;
+        setFinraLoading(true);
+        setFinraError(null);
+        const qs = `as_of=${encodeURIComponent(asOf)}&include_inferred=${includeInferred ? 'true' : 'false'}`;
+        api.get(`/api/v1/godview/pillars/finra_short_volume?${qs}`)
+            .then((res) => { if (!cancelled) setFinraData(res); })
+            .catch((e) => { if (!cancelled) setFinraError(e.message || 'request failed'); })
+            .finally(() => { if (!cancelled) setFinraLoading(false); });
+        return () => { cancelled = true; };
+    }, [asOf, includeInferred]);
+
     return (
         <div style={{ padding: 20, maxWidth: 720 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 16, gap: 12, flexWrap: 'wrap' }}>
@@ -446,6 +516,7 @@ export default function GodViewPillars() {
             {loading ? <CftcPillarCard data={null} error={null} /> : <CftcPillarCard data={data} error={error} />}
             {fedLoading ? <FedLiquidityCard data={null} error={null} /> : <FedLiquidityCard data={fedData} error={fedError} />}
             {cmdtyLoading ? <CommodityWarehouseCard data={null} error={null} /> : <CommodityWarehouseCard data={cmdtyData} error={cmdtyError} />}
+            {finraLoading ? <FinraShortVolumeCard data={null} error={null} /> : <FinraShortVolumeCard data={finraData} error={finraError} />}
 
             {NOT_BUILT_PILLARS.map((p) => (
                 <NotBuiltCard key={p.key} label={p.label} reason={p.reason} />

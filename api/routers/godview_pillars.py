@@ -65,6 +65,11 @@ from godview.fed_liquidity_pillar import (
     UNIT as FED_UNIT,
     read_fed_liquidity_pillar,
 )
+from godview.finra_short_volume_pillar import (
+    NOT_SHORT_INTEREST_NOTE,
+    PILLAR_NAME as FINRA_PILLAR_NAME,
+    read_finra_short_volume_pillar,
+)
 from store.availability import unavailable
 from store.availability_fields import (
     STALE_MATERIALIZER_FAILED,
@@ -83,7 +88,6 @@ router = APIRouter(prefix="/api/v1/godview", tags=["godview"])
 #: a catch-all) so a typo in the URL still reads as "not built" honestly,
 #: not a silent 404.
 _KNOWN_UNBUILT_PILLARS = {
-    "finra_short_volume": "adapter exists but is unscheduled/unverified live",
     "sec_regsho_ftd": "adapter exists but is unscheduled/unverified live",
     "buyback_blackouts": "no measured source",
     "dealer_gex": "engine correctness unproven",
@@ -483,6 +487,83 @@ def get_commodity_warehouse_pillar(
         "cushing_crude_stocks": unavailable(
             CUSHING_UNAVAILABLE_REASON, source="eia", pillar=COMMODITY_PILLAR_NAME, coverage=None
         ),
+    }
+
+
+def _finra_field_records(row: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    basis = row.get("availability_basis")
+    basis_note = _availability_basis_note(basis)
+    common = {
+        "obs_date": row["trade_date"],
+        "published_at": row["release_date"],
+        "available_at": row["available_at"],
+        "revision": row["generation_id"],
+        "source_catalog": "raw_series:finra_short_volume",
+        "series_id": row["ticker"],
+    }
+    out: dict[str, dict[str, Any]] = {}
+    for name, unit in (("short_volume", "shares"), ("short_exempt_volume", "shares"), ("total_volume", "shares")):
+        record = measured_field(row[name], unit=unit, **common).to_dict()
+        record["availability_basis"] = basis
+        record["availability_basis_note"] = basis_note
+        out[name] = record
+
+    for name, unit in (("short_ratio", "ratio_0_1"), ("short_ratio_20d_ma", "ratio_0_1"), ("is_spike", None)):
+        value = row[name]
+        if value is None:
+            record = unavailable_field(STALE_PARTIAL_HISTORY, unit=unit, calculation_version="finra_short_volume_pillar_v1", **common).to_dict()
+        else:
+            record = derived_field(value, unit=unit, calculation_version="finra_short_volume_pillar_v1", **common).to_dict()
+        record["availability_basis"] = basis
+        record["availability_basis_note"] = basis_note
+        out[name] = record
+    return out
+
+
+@router.get("/pillars/finra_short_volume")
+def get_finra_short_volume_pillar(
+    as_of: Annotated[date | None, Query()] = None,
+    include_inferred: Annotated[bool, Query()] = False,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Daily short-SALE-VOLUME pillar (NOT short interest, never a squeeze score --
+    see NOT_SHORT_INTEREST_NOTE and godview/finra_short_volume_pillar.py's docstring).
+
+    Realistically returns unavailable(never_configured) in production: the
+    live FINRA puller is deliberately unscheduled (unauthorised live pulls),
+    so raw_series has nothing to materialize from until that changes.
+    """
+    as_of = as_of or date.today()
+    engine = get_db_engine()
+
+    try:
+        with engine.connect() as conn:
+            if not _table_exists(conn, "finra_short_volume_daily") or not _table_exists(conn, "godview_generations"):
+                return unavailable(
+                    "finra_short_volume_daily or godview_generations does not exist yet",
+                    source=FINRA_PILLAR_NAME, pillar=FINRA_PILLAR_NAME, coverage=None,
+                )
+            result = read_finra_short_volume_pillar(conn, as_of, include_inferred=include_inferred)
+    except Exception as exc:  # noqa: BLE001
+        return unavailable(f"godview read failed: {exc}", source=FINRA_PILLAR_NAME, pillar=FINRA_PILLAR_NAME, coverage=None)
+
+    if result.state == "never_configured":
+        return unavailable(STALE_NEVER_CONFIGURED, source=FINRA_PILLAR_NAME, pillar=FINRA_PILLAR_NAME, coverage=None)
+    if result.state == "materializer_failed":
+        return unavailable(STALE_MATERIALIZER_FAILED, source=FINRA_PILLAR_NAME, pillar=FINRA_PILLAR_NAME, coverage=None)
+
+    fields_by_ticker = {row["ticker"]: _finra_field_records(row) for row in result.rows}
+    return {
+        "available": True,
+        "status": "ok" if fields_by_ticker else "partial",
+        "pillar": FINRA_PILLAR_NAME,
+        "as_of": as_of.isoformat(),
+        "include_inferred": include_inferred,
+        "note": NOT_SHORT_INTEREST_NOTE,
+        "symbols_with_data": result.symbols_with_data,
+        "generation_id": result.generation_id,
+        "generation_published_at": result.generation_published_at.isoformat() if result.generation_published_at else None,
+        "fields": fields_by_ticker,
     }
 
 

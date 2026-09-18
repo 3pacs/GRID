@@ -305,6 +305,45 @@ read therefore bounds results by `report_date <= as_of` only (the one temporal f
 pillar actually has), with no `include_inferred` gate (there is nothing for that flag to
 admit/exclude here).
 
+## 13. FINRA short-volume pillar
+
+`godview/finra_short_volume_pillar.py`. Consumes (read-only) ``raw_series`` under
+``finra:short_volume:<symbol>:<market>``, written by
+`ingestion/altdata/finra_short_volume.py` — that module lives on
+`origin/fable/sources-finra-ftd-20260918` (commit `40a9f1ae`), not merged into
+this branch; read via `git show`, never checked out.
+
+**Emphatically not short interest, never a squeeze score.** Per FINRA's own
+catalog page (https://www.finra.org/finra-data/browse-catalog/short-sale-volume):
+
+> "Short Sale Files do not — and are not intended to — equate to bi-monthly
+> reported short interest position information. The short interest data
+> reflects short positions held by market participants at a specific moment
+> in time on two discrete days each month, while the Daily File reflects the
+> aggregate volume of short trades effected on each trade date..."
+
+`short_ratio` = `short_volume / total_volume` for that trade date — a
+description of that day's trading mix, nothing more.
+
+**Release schedule**, quoted 2026-09-18 via WebFetch against
+https://www.finra.org/finra-data/browse-catalog/short-sale-volume-data/daily-short-sale-volume-files:
+
+> "FINRA posts the Daily Short Sale Volume Files to this no later than
+> 6:00:00pm ET of the same day on the relevant trade date."
+
+So `release_date = trade_date` always (no weekly gate, unlike CFTC/Fed).
+
+**Missing input, named exactly:** `FINRAShortVolumePuller` is deliberately
+NOT registered in `ingestion/scheduler.py` — unauthorised live pulls. This
+pillar's materializer reads whatever rows already exist in `raw_series`
+(a manual pull, a fixture); with none, `GET /api/v1/godview/pillars/finra_short_volume`
+returns `unavailable(never_configured)` — realistically, in production
+today, that is the state this endpoint returns, and that is correct, not
+a bug. `coverage` here means "of the symbols `raw_series` currently
+offers, how many produced a valid ratio row" — there is no curated
+watchlist to define a target universe against, because no scheduled pull
+has ever populated one.
+
 ## Status of all seven God View pillars (2026-09-18)
 
 | pillar | status | why |
@@ -313,7 +352,7 @@ admit/exclude here).
 | Fed net liquidity | **built** | full slice; per-component basis; `forward_impulse_score` intentionally NULL (not implemented) |
 | Commodity warehouses (LME leg) | **built** | LME cancelled-warrant ratio, reused from the existing puller |
 | Commodity warehouses (Cushing leg) | **permanently unavailable** | `never_configured` — no real Cushing series id exists in this codebase; will not silently substitute a near-miss |
-| FINRA short volume | not built | adapter exists but is unscheduled/unverified live |
+| FINRA short volume | **built** | full slice; realistically `unavailable(never_configured)` in production until the puller is scheduled (deployment decision, not a code gap) |
 | SEC Reg SHO FTD | not built | adapter exists but is unscheduled/unverified live |
 | Corporate buyback blackouts | not built | no measured source |
 | Dealer GEX | not built | engine correctness unproven |

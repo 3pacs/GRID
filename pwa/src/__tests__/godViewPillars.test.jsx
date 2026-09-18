@@ -24,13 +24,14 @@ function deferred() {
  * commodity_warehouses). Route the mock by path so a test about one pillar
  * doesn't leak its response into the other two cards' assertions.
  */
-function mockPillars({ cftc, fed, cmdty } = {}) {
+function mockPillars({ cftc, fed, cmdty, finra } = {}) {
     api.get.mockImplementation((path) => {
         if (path.includes('/pillars/cftc')) return Promise.resolve(cftc ?? NEVER_CONFIGURED);
         if (path.includes('/pillars/fed_net_liquidity')) return Promise.resolve(fed ?? NEVER_CONFIGURED);
         if (path.includes('/pillars/commodity_warehouses')) {
             return Promise.resolve(cmdty ?? { lme: NEVER_CONFIGURED, cushing_crude_stocks: NEVER_CONFIGURED });
         }
+        if (path.includes('/pillars/finra_short_volume')) return Promise.resolve(finra ?? NEVER_CONFIGURED);
         return Promise.resolve(NEVER_CONFIGURED);
     });
 }
@@ -177,13 +178,13 @@ describe('GodViewPillars view', () => {
         expect(within(screen.getByTestId('cftc-pillar-card')).getByText(/network down/)).toBeInTheDocument();
     });
 
-    it('always renders the not-built-yet cards for the other four pillars, each with its own reason', async () => {
+    it('always renders the not-built-yet cards for the other three pillars, each with its own reason', async () => {
         mockPillars();
 
         render(<GodViewPillars />);
 
-        await waitFor(() => expect(screen.getAllByTestId('pillar-card-not-built').length).toBe(4));
-        expect(screen.getAllByText(/adapter exists but is unscheduled\/unverified live/).length).toBe(2);
+        await waitFor(() => expect(screen.getAllByTestId('pillar-card-not-built').length).toBe(3));
+        expect(screen.getByText(/adapter exists but is unscheduled\/unverified live/)).toBeInTheDocument();
         expect(screen.getByText(/no measured source/)).toBeInTheDocument();
         expect(screen.getByText(/engine correctness unproven/)).toBeInTheDocument();
     });
@@ -319,5 +320,39 @@ describe('GodViewPillars view', () => {
         const card = within(screen.getByTestId('commodity-warehouse-card'));
         expect(within(card.getByTestId('lme-section')).getByText('copper')).toBeInTheDocument();
         expect(within(card.getByTestId('cushing-section')).getByText(/never_configured/)).toBeInTheDocument();
+    });
+
+    it('renders the FINRA short-volume pillar with the not-short-interest note and per-ticker fields', async () => {
+        mockPillars({
+            finra: {
+                available: true,
+                status: 'ok',
+                pillar: 'finra_short_volume',
+                as_of: '2026-09-16',
+                include_inferred: false,
+                note: "this is daily short-sale VOLUME executed on the trade date, NOT short INTEREST (a bi-monthly position snapshot) and never a squeeze score",
+                symbols_with_data: 1,
+                generation_id: 'gen-finra-1',
+                generation_published_at: '2026-09-16T18:00:00+00:00',
+                fields: {
+                    AAPL: {
+                        short_volume: { availability: 'available', provenance: 'measured', value: 600000, unit: 'shares' },
+                        short_exempt_volume: { availability: 'available', provenance: 'measured', value: 0, unit: 'shares' },
+                        total_volume: { availability: 'available', provenance: 'measured', value: 1000000, unit: 'shares' },
+                        short_ratio: { availability: 'available', provenance: 'derived', value: 0.6, unit: 'ratio_0_1' },
+                        short_ratio_20d_ma: { availability: 'unavailable', provenance: null, value: null, unit: 'ratio_0_1' },
+                        is_spike: { availability: 'available', provenance: 'derived', value: true, unit: null },
+                    },
+                },
+            },
+        });
+
+        render(<GodViewPillars />);
+
+        await waitFor(() => expect(screen.getByTestId('finra-short-volume-card')).toHaveAttribute('data-state', 'available'));
+        const card = within(screen.getByTestId('finra-short-volume-card'));
+        expect(card.getByTestId('not-short-interest-note')).toHaveTextContent(/NOT short INTEREST/);
+        expect(card.getByText('AAPL')).toBeInTheDocument();
+        expect(card.getByText('0.6')).toBeInTheDocument();
     });
 });
