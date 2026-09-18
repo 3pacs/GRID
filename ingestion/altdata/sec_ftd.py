@@ -85,13 +85,27 @@ balance. This is a wholly separate namespace from any ``finra:*`` series
 so a FTD balance can never land under a FINRA short-volume/short-interest
 series id or vice versa.
 
-Endpoint NOT verified live
----------------------------
-No call was made to any SEC API or file server while building this
-module. ``_FTD_ZIP_URL_TEMPLATE`` below reflects the file-naming
-convention observed on the documentation page but the absolute URL prefix
-has not been confirmed against a live response. ``_fetch_zip_bytes``
-requires an explicit URL rather than trusting that placeholder silently.
+Endpoint verified live (W5c, 2026-09-18)
+-----------------------------------------
+Confirmed by WebFetch against
+https://www.sec.gov/data-research/sec-markets-data/fails-deliver-data and
+by one real HTTP GET of a real half-month file (see
+``tests/fixtures/sources/sec_ftd/REAL_CAPTURE_NOTE.txt`` for the exact
+URL, timestamp, response headers, and how the real fixture files were
+derived from it -- the real archive was 3.87 MB uncompressed, over the
+~2 MB threshold for storing it whole, so two small real-data slices were
+kept instead of the full extracted text):
+
+    https://www.sec.gov/files/data/fails-deliver-data/cnsfails<YYYYMM><a|b>.zip
+
+``_FTD_ZIP_URL_TEMPLATE`` below builds this from that confirmed path. SEC
+requires a descriptive User-Agent with contact info on requests; this
+puller reads it from ``settings.SEC_USER_AGENT`` (config.py) and
+``_fetch_zip_bytes`` fails closed with a clear ``RuntimeError`` if it is
+unset, rather than sending an unidentified/default request. There is no
+column mismatch to report here (unlike ``finra_short_volume.py``'s
+CNMS-file anomaly) -- the real file's fields matched the documented
+pipe-delimited 6-field layout exactly.
 """
 
 from __future__ import annotations
@@ -105,6 +119,7 @@ import requests
 from loguru import logger as log
 from sqlalchemy.engine import Engine
 
+from config import settings
 from ingestion.base import BasePuller, log_pull_failure, retry_on_failure
 
 # ---- Series-id namespace (disjoint from any "finra:*" or "finra.*") ----
@@ -113,9 +128,9 @@ _SERIES_PREFIX = "sec:ftd_balance"
 # ---- Documentation source (informational only; not fetched at runtime) ----
 _DOCS_URL = "https://www.sec.gov/data-research/sec-markets-data/fails-deliver-data"
 
-# File-naming convention observed on the SEC page (e.g. "cnsfails202608a.zip",
-# "cnsfails202608b.zip"). Absolute URL prefix NOT independently verified
-# against a live SEC response for this pass -- confirm before activation.
+# Verified live (see module docstring): "cnsfails<YYYYMM><a|b>.zip" under
+# https://www.sec.gov/files/data/fails-deliver-data/ -- e.g.
+# "cnsfails202608a.zip" (first half), "cnsfails202608b.zip" (second half).
 _FTD_ZIP_URL_TEMPLATE = (
     "https://www.sec.gov/files/data/fails-deliver-data/cnsfails{yyyymm}{half}.zip"
 )
@@ -291,30 +306,60 @@ class SECFTDPuller(BasePuller):
         backoff=2.0,
         retryable_exceptions=(ConnectionError, TimeoutError, OSError, requests.RequestException),
     )
-    def _fetch_zip_bytes(self, url: str | None = None) -> bytes:
+    def _fetch_zip_bytes(
+        self,
+        url: str | None = None,
+        *,
+        yyyymm: str | None = None,
+        half: str | None = None,
+    ) -> bytes:
         """Download the raw FTD zip archive for one half-month.
 
-        Never called by the test suite. Requires an explicit ``url``
-        because ``_FTD_ZIP_URL_TEMPLATE`` has not been verified against a
-        live SEC response -- see module docstring.
+        Builds the URL from the verified ``_FTD_ZIP_URL_TEMPLATE`` (see
+        module docstring) from ``yyyymm``/``half`` when no explicit
+        ``url`` is given. SEC requires a descriptive User-Agent with
+        contact info on every request; this fails closed (no request is
+        made) if ``settings.SEC_USER_AGENT`` is unset, rather than
+        sending an unidentified default.
 
         Parameters:
-            url: Explicit zip download URL.
+            url: Explicit zip download URL, overriding the built one.
+            yyyymm: 6-digit year+month (e.g. ``"202608"``), used with
+                ``half`` to build the URL when ``url`` is not given.
+            half: ``"a"`` (first half of month) or ``"b"`` (second half),
+                used with ``yyyymm``.
 
         Returns:
             Raw zip bytes.
 
         Raises:
-            NotImplementedError: if no ``url`` is supplied.
+            RuntimeError: if ``settings.SEC_USER_AGENT`` is unset.
+            ValueError: if ``url`` is omitted and ``yyyymm``/``half`` are
+                not both supplied.
             requests.RequestException: on HTTP failure after retries.
         """
-        if url is None:
-            raise NotImplementedError(
-                "SEC FTD zip download URL was not verified live for this "
-                "contract-first pass. Pass url= explicitly (or confirm and "
-                "hardcode the endpoint) before activating this puller."
+        if not settings.SEC_USER_AGENT:
+            raise RuntimeError(
+                "SEC_USER_AGENT is not set. SEC requires a descriptive "
+                "User-Agent with contact info on every request to "
+                "sec.gov -- set SEC_USER_AGENT in .env (see .env.example) "
+                "before calling _fetch_zip_bytes/pull. Refusing to send "
+                "an unidentified request rather than falling back to a "
+                "default."
             )
-        resp = requests.get(url, timeout=_REQUEST_TIMEOUT)
+        if url is None:
+            if not yyyymm or not half:
+                raise ValueError(
+                    "_fetch_zip_bytes needs either url=, or both yyyymm= "
+                    "and half= to build the documented "
+                    "cnsfails<YYYYMM><a|b>.zip URL."
+                )
+            url = _FTD_ZIP_URL_TEMPLATE.format(yyyymm=yyyymm, half=half)
+        resp = requests.get(
+            url,
+            headers={"User-Agent": settings.SEC_USER_AGENT},
+            timeout=_REQUEST_TIMEOUT,
+        )
         resp.raise_for_status()
         return resp.content
 
@@ -322,6 +367,8 @@ class SECFTDPuller(BasePuller):
         self,
         *,
         url: str | None = None,
+        yyyymm: str | None = None,
+        half: str | None = None,
         publication_half: str | None = None,
         dry_run: bool = False,
     ) -> dict[str, Any]:
@@ -329,10 +376,14 @@ class SECFTDPuller(BasePuller):
 
         Parameters:
             url: Explicit zip download URL for :meth:`_fetch_zip_bytes`.
+            yyyymm: 6-digit year+month, used with ``half`` to build the
+                URL when ``url`` is not given (see :meth:`_fetch_zip_bytes`).
+            half: ``"a"`` or ``"b"``, used with ``yyyymm``.
             publication_half: Optional descriptive tag ("a" / "b" / a
                 free-form label) recorded in ``raw_payload`` for
                 traceability. This is NOT a verified release_date -- see
-                module docstring's contract-gap discussion.
+                module docstring's contract-gap discussion. Defaults to
+                ``half`` when omitted and ``half`` is given.
             dry_run: If True, fetch/parse but write nothing. Returns
                 ``rows_would_insert`` instead of ``rows_inserted``.
 
@@ -340,8 +391,10 @@ class SECFTDPuller(BasePuller):
             dict with status ("SUCCESS" or "FAILED"), rows_inserted (or
             rows_would_insert if dry_run), rows_skipped, and dry_run.
         """
+        if publication_half is None:
+            publication_half = half
         try:
-            zip_bytes = self._fetch_zip_bytes(url=url)
+            zip_bytes = self._fetch_zip_bytes(url=url, yyyymm=yyyymm, half=half)
             raw_text = extract_ftd_text_from_zip(zip_bytes)
         except Exception as exc:  # noqa: BLE001 -- bounded below
             log_pull_failure(self.SOURCE_NAME, publication_half or "unknown", exc)

@@ -148,7 +148,7 @@ def test_parse_blank_input_raises():
 
 def test_pull_success_writes_series_id_scheme_and_payload():
     p = _puller()
-    p._fetch_raw_text = lambda trade_date, url=None: _load("good.txt")
+    p._fetch_raw_text = lambda trade_date, url=None, **kwargs: _load("good.txt")
 
     result = p.pull("2026-09-16")
 
@@ -170,7 +170,7 @@ def test_pull_success_writes_series_id_scheme_and_payload():
 
 def test_pull_empty_file_writes_no_value_zero_rows():
     p = _puller()
-    p._fetch_raw_text = lambda trade_date, url=None: _load("empty.txt")
+    p._fetch_raw_text = lambda trade_date, url=None, **kwargs: _load("empty.txt")
 
     result = p.pull("2026-09-16")
 
@@ -181,7 +181,7 @@ def test_pull_empty_file_writes_no_value_zero_rows():
 
 def test_pull_malformed_rows_are_skipped_not_written():
     p = _puller()
-    p._fetch_raw_text = lambda trade_date, url=None: _load("malformed.txt")
+    p._fetch_raw_text = lambda trade_date, url=None, **kwargs: _load("malformed.txt")
 
     result = p.pull("2026-09-16")
 
@@ -194,7 +194,7 @@ def test_pull_malformed_rows_are_skipped_not_written():
 def test_pull_fetch_failure_returns_failed_status_no_writes():
     p = _puller()
 
-    def _boom(trade_date, url=None):
+    def _boom(trade_date, url=None, **kwargs):
         raise ConnectionError("simulated network failure contacting FINRA")
 
     p._fetch_raw_text = _boom
@@ -210,7 +210,7 @@ def test_pull_fetch_failure_returns_failed_status_no_writes():
 
 def test_pull_unparseable_file_returns_failed_status_no_writes():
     p = _puller()
-    p._fetch_raw_text = lambda trade_date, url=None: "not a finra file at all\n"
+    p._fetch_raw_text = lambda trade_date, url=None, **kwargs: "not a finra file at all\n"
 
     result = p.pull("2026-09-16")
 
@@ -222,11 +222,11 @@ def test_pull_unparseable_file_returns_failed_status_no_writes():
 def test_pull_is_idempotent_across_repeated_calls():
     engine = FakeEngine()
     p1 = _puller(engine)
-    p1._fetch_raw_text = lambda trade_date, url=None: _load("good.txt")
+    p1._fetch_raw_text = lambda trade_date, url=None, **kwargs: _load("good.txt")
     p1.pull("2026-09-16")
 
     p2 = _puller(engine)
-    p2._fetch_raw_text = lambda trade_date, url=None: _load("good.txt")
+    p2._fetch_raw_text = lambda trade_date, url=None, **kwargs: _load("good.txt")
     result2 = p2.pull("2026-09-16")
 
     assert result2["rows_inserted"] == 0  # everything already stored
@@ -236,11 +236,11 @@ def test_pull_is_idempotent_across_repeated_calls():
 def test_pull_revised_same_date_does_not_overwrite_existing_value():
     engine = FakeEngine()
     p1 = _puller(engine)
-    p1._fetch_raw_text = lambda trade_date, url=None: _load("good.txt")
+    p1._fetch_raw_text = lambda trade_date, url=None, **kwargs: _load("good.txt")
     p1.pull("2026-09-16")
 
     p2 = _puller(engine)
-    p2._fetch_raw_text = lambda trade_date, url=None: _load("revised_same_date.txt")
+    p2._fetch_raw_text = lambda trade_date, url=None, **kwargs: _load("revised_same_date.txt")
     result2 = p2.pull("2026-09-16")
 
     # revised_same_date.txt has the same (date, symbol=AAPL, market=D) key
@@ -255,7 +255,7 @@ def test_pull_revised_same_date_does_not_overwrite_existing_value():
 
 def test_pull_dry_run_writes_nothing():
     p = _puller()
-    p._fetch_raw_text = lambda trade_date, url=None: _load("good.txt")
+    p._fetch_raw_text = lambda trade_date, url=None, **kwargs: _load("good.txt")
 
     result = p.pull("2026-09-16", dry_run=True)
 
@@ -266,11 +266,110 @@ def test_pull_dry_run_writes_nothing():
     assert p.engine.store["rows"] == []
 
 
-def test_fetch_raw_text_without_url_raises_not_implemented():
-    """The unverified placeholder endpoint must never be trusted silently."""
+def test_fetch_raw_text_builds_documented_url_without_explicit_url(monkeypatch):
+    """Without an explicit url=, _fetch_raw_text must build the verified
+    <base_url><MarketPrefix>shvol<YYYYMMDD>.txt URL (see module docstring
+    and REAL_CAPTURE_NOTE.txt) rather than raising -- the endpoint is
+    confirmed live now, unlike the earlier contract-first placeholder."""
+    captured = {}
+
+    class _FakeResp:
+        text = "Date|Symbol|ShortVolume|ShortExemptVolume|TotalVolume|Market\n0\n"
+
+        def raise_for_status(self):
+            return None
+
+    def _fake_get(url, headers=None, timeout=None):
+        captured["url"] = url
+        captured["headers"] = headers
+        return _FakeResp()
+
+    monkeypatch.setattr(
+        "ingestion.altdata.finra_short_volume.requests.get", _fake_get
+    )
     p = _puller()
-    with pytest.raises(NotImplementedError):
-        p._fetch_raw_text(date(2026, 9, 16))
+    p._fetch_raw_text(date(2026, 9, 16))
+
+    assert captured["url"] == (
+        "https://cdn.finra.org/equity/regsho/daily/CNMSshvol20260916.txt"
+    )
+    assert captured["headers"]["User-Agent"] == "GRID/1.0 (aniksrobot@gmail.com)"
+
+
+def test_fetch_raw_text_honors_explicit_market_prefix(monkeypatch):
+    captured = {}
+
+    class _FakeResp:
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+    def _fake_get(url, headers=None, timeout=None):
+        captured["url"] = url
+        return _FakeResp()
+
+    monkeypatch.setattr(
+        "ingestion.altdata.finra_short_volume.requests.get", _fake_get
+    )
+    p = _puller()
+    p._fetch_raw_text(date(2026, 9, 16), market_prefix="FORF")
+
+    assert captured["url"] == (
+        "https://cdn.finra.org/equity/regsho/daily/FORFshvol20260916.txt"
+    )
+
+
+def test_fetch_raw_text_explicit_url_overrides_built_one(monkeypatch):
+    captured = {}
+
+    class _FakeResp:
+        text = "ok"
+
+        def raise_for_status(self):
+            return None
+
+    def _fake_get(url, headers=None, timeout=None):
+        captured["url"] = url
+        return _FakeResp()
+
+    monkeypatch.setattr(
+        "ingestion.altdata.finra_short_volume.requests.get", _fake_get
+    )
+    p = _puller()
+    p._fetch_raw_text(date(2026, 9, 16), url="https://example.test/override.txt")
+
+    assert captured["url"] == "https://example.test/override.txt"
+
+
+# ── Real captured fixture (see REAL_CAPTURE_NOTE.txt for provenance) ───────
+
+
+def test_parse_real_captured_finra_fixture_matches_documented_columns():
+    parsed = parse_daily_short_volume_file(_load("real_capture_sample.txt"))
+    assert parsed["rows"], "real fixture should contain parsed rows"
+
+    for row in parsed["rows"]:
+        assert set(row) == {
+            "date",
+            "symbol",
+            "market",
+            "short_volume",
+            "short_exempt_volume",
+            "total_volume",
+        }
+        assert row["date"] == date(2026, 9, 16)
+        assert row["symbol"]
+        assert row["market"]  # may be a single code or a comma-joined list
+
+
+def test_real_fixture_reconciles_short_le_total():
+    """Per the documented semantics, ShortVolume is a subset of TotalVolume
+    for the same (date, symbol, market) row -- must hold on real data."""
+    parsed = parse_daily_short_volume_file(_load("real_capture_sample.txt"))
+    assert parsed["rows"]
+    for row in parsed["rows"]:
+        assert row["short_volume"] <= row["total_volume"], row
 
 
 def test_series_id_namespace_is_disjoint_from_finra_ats_dot_namespace():
