@@ -131,6 +131,16 @@ def pg_engine():
     except Exception:
         pytest.skip("PostgreSQL not available")
 
+    # Test-only bootstrap of tables that only runtime application code
+    # creates (never schema.sql, never an Alembic revision the CI bootstrap
+    # applies) — see tests/_db_bootstrap.py's docstring for exactly which
+    # tables and which existing idempotent creator each comes from. Behind
+    # the same "a live database was just reached" gate as the rest of this
+    # fixture; a no-op once already applied.
+    from tests._db_bootstrap import bootstrap_test_prerequisites
+
+    bootstrap_test_prerequisites(engine)
+
     yield engine
 
     engine.dispose()

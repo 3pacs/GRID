@@ -74,9 +74,57 @@ jobs:
           pip install -r requirements.txt
           pip install pytest pytest-cov pytest-xdist
 
+      # The PostgreSQL-gated tests (tests/conftest.py `pg_engine`) connect to
+      # GRID_TEST_DB_URL and expect the production schema. Until 2026-09-18 that
+      # variable was never set here and DB_URL is a read-only property that the
+      # environment cannot populate, so every one of them skipped with
+      # "PostgreSQL not available" while the job stayed green. Build the schema
+      # the way a fresh box does (schema.sql, then the Alembic chain from the
+      # last pre-god-view head) and hand the URL to the suite. The guard after
+      # pytest fails the job if any DB test still skips.
+      #
+      # What the stamp does NOT represent (measured 2026-09-18 on a disposable
+      # PostgreSQL 14 against production's table inventory): schema.sql plus
+      # the post-stamp revisions yields 43 tables; production has 216. Nineteen
+      # of the missing ones are created by revisions the stamp skips
+      # (canvas_*, goal_queue/goal_results, investigation_evidence, the
+      # capital-flow tables, congressional_trades, ...); the rest are created
+      # at runtime by modules. Replaying the whole history from nothing is not
+      # possible today: it stops at the ninth revision on a runtime-created
+      # table (analytical_snapshots), after discovered_hypotheses. Tests that
+      # need those tables therefore FAIL or SKIP here — visibly, by design —
+      # until schema.sql declares the runtime prerequisites or the revisions
+      # are made self-contained. Stamping must never be read as proof that
+      # the skipped revisions were exercised.
+      - name: Bootstrap test database schema
+        env:
+          PGPASSWORD: testpass
+          DB_USER: grid
+          DB_PASSWORD: testpass
+          DB_HOST: localhost
+          DB_PORT: "5432"
+          DB_NAME: griddb_test
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -euo pipefail
+          psql -h localhost -U grid -d griddb_test -v ON_ERROR_STOP=0 -q -f schema.sql > /tmp/grid-schema.log 2>&1 || true
+          schema_errors=$(grep -ciE "^psql:.*ERROR" /tmp/grid-schema.log || true); echo "schema.sql: ${schema_errors} statement error(s) (idempotent re-runs report only already-exists notices)"
+          python -m alembic stamp snapshot_actor_col_20260914
+          python -m alembic upgrade head
+          python -m alembic current
+
       - name: Run tests
         env:
           DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          # Consumed by tests/conftest.py::pg_engine (and the tests that read
+          # it directly); without it the fixture dials conftest's default
+          # grid_user@localhost/grid, which does not exist here.
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_USER: grid
+          DB_HOST: localhost
+          DB_PORT: "5432"
+          DB_NAME: griddb_test
           # config.py now rejects an empty DB_PASSWORD unconditionally (see
           # the 2026-09-13 incident) — must match the postgres service
           # password above so Settings() construction doesn't fail collection.
@@ -114,7 +162,7 @@ jobs:
           # tuning has numbers instead of guesses.
           set +e
           python -m pytest tests/ -v --tb=short --maxfail=50 --timeout=180 \
-            -n auto --dist loadgroup --durations=25 \
+            -n auto --dist loadgroup --durations=25 -rs \
             > /tmp/grid-pytest-output.txt 2>&1
           pytest_status=$?
           set -e
@@ -125,6 +173,28 @@ jobs:
           echo "::group::pytest output (tail -300)"
           tail -300 /tmp/grid-pytest-output.txt
           echo "::endgroup::"
+
+          # Database coverage accounting. -v prints one line per test ending
+          # in PASSED/FAILED/SKIPPED (xdist prefixes it with "[gwN] [ nn%]"),
+          # and -rs prints every skip with its reason in the short summary.
+          # Executed = tests in the database-touching files that ran to a
+          # verdict; database skips = any skip whose reason is a missing
+          # database OR a missing table (the stamp gap above shows up here).
+          DB_FILES='tests/(test_journal|test_pit|test_resolver|test_holder_deal_overlap|test_acquisition_decomposition|test_capital_flow_rollups|test_canvas_graph_state_store|test_canvas_predict|test_goal_queue|test_intelligence_search|test_investigation_evidence|test_realtime_freshness_probe|test_realtime_shutdown_semantics|test_parse_datasets_signals|test_reasoning_bank|test_hypothesis_kills|test_crypto_signals)\.py|tests/contracts/(test_dead_letter|test_migration)\.py'
+          db_executed=$(grep -cE "(PASSED|FAILED|ERROR) +(${DB_FILES})::" /tmp/grid-pytest-output.txt || true)
+          # Allow-list: tests/test_reasoning_bank.py::test_pg_round_trip_integration
+          # (GRID_PG_INTEGRATION=1) needs the pgvector Postgres extension
+          # (CAST(:embedding AS vector) + an HNSW index, migrations/0053) and a
+          # separately-wired GRID_DB_URL; the CI postgres:15 service image ships
+          # neither, so this one skip is expected here and excluded from the count
+          # below. Do not broaden this — no other skip is exempted.
+          db_skips=$(grep -iE "^SKIPPED .*(PostgreSQL not available|Postgres not available|griddb not reachable|table missing|missing table|GRID_PG_INTEGRATION)" /tmp/grid-pytest-output.txt | grep -vc "test_reasoning_bank.py:540: set GRID_PG_INTEGRATION=1 to run" || true)
+          echo "database tests executed: ${db_executed}; skipped for a missing database or table: ${db_skips}"
+          if [ "${db_skips}" != "0" ]; then
+            echo "::error::${db_skips} database-gated test(s) skipped although the PostgreSQL service is up (missing database wiring, a hard-coded URL, or a table the stamped bootstrap does not create) — a green job must not imply coverage it skipped"
+            grep -iE "^SKIPPED .*(PostgreSQL not available|Postgres not available|griddb not reachable|table missing|missing table|GRID_PG_INTEGRATION)" /tmp/grid-pytest-output.txt | head -40
+            exit 1
+          fi
           exit "$pytest_status"
 
       - name: Check for SQL injection patterns

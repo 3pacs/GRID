@@ -3,7 +3,7 @@
 import json
 import pytest
 from datetime import datetime, timedelta, timezone
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from intelligence.hypothesis_engine import (
     ensure_tables,
     HypothesisGenerator,
@@ -13,17 +13,18 @@ from intelligence.hypothesis_engine import (
 
 
 @pytest.fixture
-def engine():
-    """Create a test engine with hypothesis tables."""
-    eng = create_engine("postgresql://grid_user:changeme@localhost:5432/grid")
-    try:
-        with eng.connect() as conn:
-            conn.execute(text("SELECT 1"))
-    except Exception:
-        pytest.skip("PostgreSQL not available")
-    ensure_tables(eng)
-    yield eng
-    eng.dispose()
+def engine(pg_engine):
+    """Hypothesis-kill tables on the shared `pg_engine` fixture.
+
+    Previously created its own engine hard-coded to
+    postgresql://grid_user:changeme@localhost:5432/grid, which could never
+    see GRID_TEST_DB_URL and therefore never joined the suite's serialized
+    "postgres" xdist group. Routing through `pg_engine` (tests/conftest.py)
+    picks up GRID_TEST_DB_URL and keeps the same "PostgreSQL not available"
+    skip when no database is configured.
+    """
+    ensure_tables(pg_engine)
+    return pg_engine
 
 
 def test_schema_has_new_columns(engine):

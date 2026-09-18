@@ -38,7 +38,17 @@ def live_engine() -> Engine:
     """Real Postgres engine. Skips if the full schema is missing."""
     try:
         from db import get_engine
+        from tests._db_bootstrap import bootstrap_test_prerequisites
+
         engine = get_engine()
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        # This fixture uses db.get_engine() rather than tests/conftest.py's
+        # pg_engine, so it is not covered by that fixture's bootstrap call —
+        # do the same test-only bootstrap here (idempotent; see
+        # tests/_db_bootstrap.py). Test-only bootstrap of the runtime-created
+        # tables the DB-gated tests need — not a migration-chain repair.
+        bootstrap_test_prerequisites(engine)
         with engine.connect() as conn:
             for t in (
                 "public.capital_flows",

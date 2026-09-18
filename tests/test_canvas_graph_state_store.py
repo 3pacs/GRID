@@ -7,18 +7,9 @@ time so they cannot silently drift back to the legacy canvas_* tables only.
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 
 from sqlalchemy import text
-
-
-def _run(coro):
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
 
 
 class TestCanvasGraphStateHelpers:
@@ -186,34 +177,26 @@ class TestCanvasGraphStateCompatibility:
             )
 
         try:
-            node_a = _run(
-                canvas_graph.add_node(
-                    board_id,
-                    NodeCreate(id="n-a", node_type="actor", label="Actor A", x=10, y=20),
-                    _token="test",
-                ),
+            node_a = canvas_graph.add_node(
+                board_id,
+                NodeCreate(id="n-a", node_type="actor", label="Actor A", x=10, y=20),
+                _token="test",
             )
-            node_b = _run(
-                canvas_graph.add_node(
-                    board_id,
-                    NodeCreate(id="n-b", node_type="ticker", label="Ticker B", x=30, y=40),
-                    _token="test",
-                ),
+            node_b = canvas_graph.add_node(
+                board_id,
+                NodeCreate(id="n-b", node_type="ticker", label="Ticker B", x=30, y=40),
+                _token="test",
             )
-            edge = _run(
-                canvas_graph.add_edge(
-                    board_id,
-                    EdgeCreate(id="e-ab", source="n-a", target="n-b", edge_type="signal"),
-                    _token="test",
-                ),
+            edge = canvas_graph.add_edge(
+                board_id,
+                EdgeCreate(id="e-ab", source="n-a", target="n-b", edge_type="signal"),
+                _token="test",
             )
-            updated = _run(
-                canvas_graph.update_node(
-                    board_id,
-                    "n-a",
-                    NodeUpdate(label="Actor A updated", position_x=55),
-                    _token="test",
-                ),
+            updated = canvas_graph.update_node(
+                board_id,
+                "n-a",
+                NodeUpdate(label="Actor A updated", position_x=55),
+                _token="test",
             )
 
             assert node_a["node_id"] == "n-a"
@@ -270,21 +253,19 @@ class TestCanvasGraphStateCompatibility:
             )
 
         try:
-            result = _run(
-                canvas_graph.bulk_save_graph(
-                    board_id,
-                    BulkGraphSave(
-                        nodes=[
-                            {"id": "n-1", "type": "note", "label": "One"},
-                            {"id": "n-2", "type": "note", "label": "Two"},
-                        ],
-                        edges=[
-                            {"id": "e-1", "source": "n-1", "target": "n-2", "type": "link"},
-                            {"id": "e-bad", "source": "n-1", "target": "missing"},
-                        ],
-                    ),
-                    _token="test",
+            result = canvas_graph.bulk_save_graph(
+                board_id,
+                BulkGraphSave(
+                    nodes=[
+                        {"id": "n-1", "type": "note", "label": "One"},
+                        {"id": "n-2", "type": "note", "label": "Two"},
+                    ],
+                    edges=[
+                        {"id": "e-1", "source": "n-1", "target": "n-2", "type": "link"},
+                        {"id": "e-bad", "source": "n-1", "target": "missing"},
+                    ],
                 ),
+                _token="test",
             )
 
             assert result["status"] == "saved"
