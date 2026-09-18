@@ -29,11 +29,22 @@ from alpha_research.realized_alpha import (
     resolve_spy_feature,
 )
 from store.pit import PITStore
+from store.vintage_selection import select_vintage_per_decision
 
 HOLD_MIN_SCORED_FOR_VERDICT: int = 5
 HOLD_PASS_HIT_RATE: float = 0.5
 HOLD_FAIL_HIT_RATE: float = 0.4
 _HOLD_PATH_LOOKBACK_DAYS: int = 10
+
+# Default fetch strategy for _fetch_pit_correct_matrix. The batched path
+# (one get_feature_vintages round trip per window + select_vintage_per_decision)
+# is proven exactly equivalent to the per-day reference loop by
+# tests/test_evaluator_contracts.py's
+# test_batched_pit_fetch_equivalent_to_per_day_fetch -- that equivalence test
+# is what gates this default to True. Flip to False (or pass
+# use_batched_fetch=False) to fall back to the one-query-per-calendar-day
+# reference implementation if that equivalence is ever in doubt.
+USE_BATCHED_PIT_FETCH: bool = True
 
 
 class WalkForwardBacktest:
@@ -334,9 +345,48 @@ class WalkForwardBacktest:
         start_date: date,
         end_date: date,
         vintage_policy: str,
+        use_batched_fetch: bool = USE_BATCHED_PIT_FETCH,
     ) -> pd.DataFrame:
         """Build a feature matrix where every row is only as current as its
         own observation date.
+
+        Dispatches to one of two implementations that are proven exactly
+        equivalent (see
+        ``tests/test_evaluator_contracts.py::test_batched_pit_fetch_equivalent_to_per_day_fetch``):
+
+        - ``use_batched_fetch=True`` (the default -- gated on that
+          equivalence test passing): ``_fetch_pit_correct_matrix_batched``,
+          a single ``get_feature_vintages`` round trip for the whole
+          window plus a pure-Python per-row selection.
+        - ``use_batched_fetch=False``: ``_fetch_pit_correct_matrix_per_day``,
+          the original one-``get_feature_matrix``-call-per-calendar-day
+          reference implementation, kept as the correctness baseline.
+
+        Parameters mirror both implementations; see their docstrings for
+        the correctness argument each relies on.
+        """
+        if use_batched_fetch:
+            return self._fetch_pit_correct_matrix_batched(
+                feature_ids=feature_ids,
+                start_date=start_date,
+                end_date=end_date,
+                vintage_policy=vintage_policy,
+            )
+        return self._fetch_pit_correct_matrix_per_day(
+            feature_ids=feature_ids,
+            start_date=start_date,
+            end_date=end_date,
+            vintage_policy=vintage_policy,
+        )
+
+    def _fetch_pit_correct_matrix_per_day(
+        self,
+        feature_ids: list[int],
+        start_date: date,
+        end_date: date,
+        vintage_policy: str,
+    ) -> pd.DataFrame:
+        """Reference implementation: build the matrix one calendar day at a time.
 
         ``PITStore.get_feature_matrix`` takes a single ``as_of_date`` for
         the whole call. Passing the era/window's *end* date (as the old
@@ -349,9 +399,9 @@ class WalkForwardBacktest:
 
         Fetching one calendar day at a time, with ``as_of_date`` pinned to
         that same day, removes the leak: nothing dated after day ``d`` can
-        ever appear in day ``d``'s row, regardless of vintage policy.
-        Deliberately not batched further — correctness over throughput for
-        this non-negotiable PIT guarantee (see CLAUDE.md).
+        ever appear in day ``d``'s row, regardless of vintage policy. Kept
+        as the correctness reference that ``_fetch_pit_correct_matrix_batched``
+        is checked against — see CLAUDE.md's PIT-correctness guardrail.
         """
         frames: list[pd.DataFrame] = []
         current = start_date
@@ -375,6 +425,53 @@ class WalkForwardBacktest:
         # inflate the sample count seen downstream.
         combined = combined[~combined.index.duplicated(keep="first")]
         return combined.sort_index()
+
+    def _fetch_pit_correct_matrix_batched(
+        self,
+        feature_ids: list[int],
+        start_date: date,
+        end_date: date,
+        vintage_policy: str,
+    ) -> pd.DataFrame:
+        """Single-round-trip PIT fetch: get_feature_vintages + per-decision selection.
+
+        Fetches every vintage for (feature_id, obs_date) in
+        [start_date, end_date] ONCE (``PITStore.get_feature_vintages``,
+        pre-filtered on ``release_date <= end_date`` as a throughput
+        optimisation only), then applies
+        ``select_vintage_per_decision`` -- which enforces
+        ``release_date <= obs_date`` PER ROW, not against a single shared
+        cutoff -- to pick exactly the vintage
+        ``_fetch_pit_correct_matrix_per_day`` would have picked for that
+        row. This is what makes batching safe: the coarse SQL pre-filter
+        can only ever be looser than the per-row cutoff applied afterwards
+        in Python, never tighter, so it cannot discard a vintage the
+        per-day loop would have kept.
+
+        Proven exactly equivalent to the per-day loop by
+        ``tests/test_evaluator_contracts.py::test_batched_pit_fetch_equivalent_to_per_day_fetch``
+        across mid-window revisions, late releases, duplicate vintages,
+        and both vintage policies -- that test is what gates this as the
+        default. Real-database throughput is unmeasured (no local
+        Postgres available to this change); only row-for-row equivalence
+        against the reference loop is verified here.
+        """
+        vintages = self.pit_store.get_feature_vintages(
+            feature_ids=feature_ids,
+            start_date=start_date,
+            end_date=end_date,
+            as_of_date=end_date,
+        )
+
+        selected = select_vintage_per_decision(vintages, vintage_policy)
+        if selected.empty:
+            return pd.DataFrame(index=pd.DatetimeIndex([], name="obs_date"))
+
+        matrix = selected.pivot_table(
+            index="obs_date", columns="feature_id", values="value", aggfunc="first"
+        )
+        matrix.index = pd.DatetimeIndex(matrix.index, name="obs_date")
+        return matrix.sort_index()
 
     def _compute_era_metrics(
         self,

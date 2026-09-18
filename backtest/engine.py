@@ -22,9 +22,16 @@ import numpy as np
 import pandas as pd
 from loguru import logger as log
 from outputs.path_utils import ensure_output_dir
+from store.vintage_selection import select_vintage_per_decision
 
 # Output directory
 _OUTPUT_DIR = Path(__file__).parent.parent / "outputs" / "backtest"
+
+# Default fetch strategy for PitchBacktester._fetch_pit_correct_matrix. See
+# validation/backtest.py's USE_BATCHED_PIT_FETCH for the full rationale --
+# gated on tests/test_evaluator_contracts.py's
+# test_batched_pit_fetch_equivalent_to_per_day_fetch_engine passing.
+USE_BATCHED_PIT_FETCH: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -331,14 +338,46 @@ class PitchBacktester:
         start_date: date,
         end_date: date,
         vintage_policy: str = "FIRST_RELEASE",
+        use_batched_fetch: bool = USE_BATCHED_PIT_FETCH,
+    ) -> pd.DataFrame:
+        """Build a feature matrix where every row is only as current as its
+        own observation date.
+
+        Dispatches to the batched single-round-trip path (default, gated
+        on the equivalence test) or the per-day reference loop. Twin of
+        ``validation.backtest.WalkForwardBacktest._fetch_pit_correct_matrix``
+        — see that docstring for the full rationale.
+        """
+        if use_batched_fetch:
+            return self._fetch_pit_correct_matrix_batched(
+                feature_ids=feature_ids,
+                start_date=start_date,
+                end_date=end_date,
+                vintage_policy=vintage_policy,
+            )
+        return self._fetch_pit_correct_matrix_per_day(
+            feature_ids=feature_ids,
+            start_date=start_date,
+            end_date=end_date,
+            vintage_policy=vintage_policy,
+        )
+
+    def _fetch_pit_correct_matrix_per_day(
+        self,
+        feature_ids: list[int],
+        start_date: date,
+        end_date: date,
+        vintage_policy: str = "FIRST_RELEASE",
     ) -> pd.DataFrame:
         """Fetch one calendar day at a time so no row's value can reflect
         anything released after that row's own date.
 
-        Twin of ``validation.backtest.WalkForwardBacktest._fetch_pit_correct_matrix``
+        Twin of ``validation.backtest.WalkForwardBacktest._fetch_pit_correct_matrix_per_day``
         — see that docstring for the full rationale. ``PITStore.get_feature_matrix``
         only takes one ``as_of_date`` per call, so per-decision-point PIT
-        correctness requires pinning it to each row's own date.
+        correctness requires pinning it to each row's own date. Kept as the
+        correctness reference that ``_fetch_pit_correct_matrix_batched`` is
+        checked against.
         """
         frames: list[pd.DataFrame] = []
         current = start_date
@@ -360,6 +399,40 @@ class PitchBacktester:
         combined = pd.concat(frames)
         combined = combined[~combined.index.duplicated(keep="first")]
         return combined.sort_index()
+
+    def _fetch_pit_correct_matrix_batched(
+        self,
+        feature_ids: list[int],
+        start_date: date,
+        end_date: date,
+        vintage_policy: str = "FIRST_RELEASE",
+    ) -> pd.DataFrame:
+        """Single-round-trip PIT fetch: get_feature_vintages + per-decision selection.
+
+        Twin of
+        ``validation.backtest.WalkForwardBacktest._fetch_pit_correct_matrix_batched``
+        — see that docstring for the full correctness argument (the coarse
+        SQL ``release_date <= end_date`` pre-filter can only be looser than
+        the per-row ``release_date <= obs_date`` cutoff applied afterwards,
+        never tighter, so it cannot discard a vintage the per-day loop
+        would have kept). Real-database throughput is unmeasured here.
+        """
+        vintages = self.pit_store.get_feature_vintages(
+            feature_ids=feature_ids,
+            start_date=start_date,
+            end_date=end_date,
+            as_of_date=end_date,
+        )
+
+        selected = select_vintage_per_decision(vintages, vintage_policy)
+        if selected.empty:
+            return pd.DataFrame(index=pd.DatetimeIndex([], name="obs_date"))
+
+        matrix = selected.pivot_table(
+            index="obs_date", columns="feature_id", values="value", aggfunc="first"
+        )
+        matrix.index = pd.DatetimeIndex(matrix.index, name="obs_date")
+        return matrix.sort_index()
 
     def run_historical_regime(
         self,
