@@ -34,7 +34,7 @@ from governance.leases import RESEARCH_LEASES_DDL
 
 # revision identifiers, used by Alembic.
 revision: str = "research_leases_0918"
-down_revision: Union[str, Sequence[str], None] = "godview_pit_cmdty_0918"
+down_revision: Union[str, Sequence[str], None] = "godview_pit_gex_0918"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
