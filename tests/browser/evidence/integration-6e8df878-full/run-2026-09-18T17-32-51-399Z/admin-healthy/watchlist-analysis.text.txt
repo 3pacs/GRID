@@ -1,0 +1,181 @@
+Back
+TEST1
+$100
++2.04%
+Test One Corp · STOCK · Regime: RISK_ON
+AI OVERVIEW
+AI Generated · 02:00
+CONSTRUCTIVE
+TEST1 is trading near its 5-day range with a risk-on macro backdrop.
+5D low: $98
+5D high: $100
+INSIDER EDGE
+▼
+🏛 Congress
+BUY
+Test Member
+Sep 4, 2026
+60
+👤 CFO
+BUY
+Test Insider
+Sep 3, 2026
+🌊 Dark Pool
+ACCUMULATION
+1.0x avg volume
+Sep 14, 2026
+🐳 Whale Flow
+BUY
+$100 2026-10-16
+Sep 11, 2026
+🧠 test-forum
+BUY
+test_user
+PRICE
+H: $100 · L: $98
+1W
+1M
+3M
+6M
+1Y
+5D low
+5D high
+$98
+$99
+$99
+$100
+$100
+Sep 11
+Sep 13
+DEALER GEX PROFILE
+long_gamma
+Net: $1.3M
+Flip: $100
+Call Wall: $105
+Put Wall: $95
+Vanna: $200
+Charm: $-50
+VANNA / CHARM COMPASS
+12d to OpEx
+TEST1
+Headwind
+Drag
+Tailwind
+Chop
+IV rise
+dealers sell
+IV drop
+dealers buy
+Time helps bulls
+Time helps bears
+$0
+net delta by OpEx
+Today
+Fri Sep 25
+OpEx
+SELL $600
+-600
+-400
+-200
+0
+0d
+2d
+4d
+6d
+8d
+10d
+12d
+Dealers are modestly long gamma into OpEx.
+FLOW TIMELINE
+90d
+GEX: $1.3M
+GEX = 0
+-1M
+-500K
+0
+500K
+1M
+Net GEX ($)
+$99
+$100
+$100
+$101
+$101
+Sep 14
+OpEx
+FOMC
+CPI
+Earnings
+Spot
+TRADE RECOMMENDATIONS · 2
+TEST1
+CALL
+58
+STRIKE
+$105
+EXPIRY
+2026-10-16
+ENTRY
+--
+TARGET
+--
+STOP
+--
++31.0% exp
+Kelly: 4.0%
+Synthetic fixture recommendation — TEST1 call.
+long_gamma
+TEST1
+CALL
+42
+STRIKE
+$110
+EXPIRY
+2026-10-16
+ENTRY
+--
+TARGET
+--
+STOP
+--
++19.0% exp
+Kelly: 2.0%
+Synthetic fixture recommendation — TEST1 further OTM call.
+long_gamma
+REGIME CONTEXT
+RISK_ON
+Regime
+62%
+Confidence
+Risk-On / Overweight Growth
+Posture
+RELATED FEATURES · 1
+TEST1_close
+·
+raw data
+--
+GRID
+10Y
+CANVAS
+SURFACE
+DASH
+FLOW
+ACTORS
+RISK
+SIGNAL
+Ctrl+K
+MORE
+Ask GRID
+[TEST1]
+×
+What should I watch?
+Explain the current regime
+Any red flags?
+What are the lever pullers doing?
+Ask GRID anything about the market, your portfolio, or the intelligence picture.
+HORIZON
+1D
+1W
+1M
+3M
+6M+
