@@ -22,13 +22,6 @@ Contract (also in docs/reference/AVAILABILITY_CONTRACT.md):
   to snapshot tables, and never averaged into a score.
 
 Helpers here build the payloads; they carry no I/O.
-
-NOTE (godview lane, fable/godview-20260918): this file is vendored
-verbatim from ``feat/availability-provenance-contract`` (#536, tip
-b5babef4) because that branch has not yet merged into this worktree's
-ancestry and ``godview/cftc_pillar.py`` needs ``measured_or_none`` for
-per-field provenance. Content is byte-for-byte the upstream module —
-de-duplicate (drop this file, keep the merged one) once that branch lands.
 """
 
 from __future__ import annotations

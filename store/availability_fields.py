@@ -18,11 +18,6 @@ new ``FieldRecord`` type alongside it. See
 this module exists to enforce.
 
 Helpers here build records; they carry no I/O.
-
-NOTE (godview lane, fable/godview-20260918): vendored verbatim from
-``feat/availability-provenance-contract`` (#567, tip b5babef4) — same reason
-as the note at the top of ``store/availability.py``. De-duplicate once that
-branch merges into this ancestry.
 """
 
 from __future__ import annotations
