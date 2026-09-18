@@ -33,6 +33,60 @@ from api.routers.astrogrid_helpers import (
 
 router = APIRouter(tags=["astrogrid"])
 
+# The 4% swing / 8% macro invalidation levels below are a fixed house rule, not a
+# measurement: they are not derived from the target's realised volatility, its ATR or
+# any backtest. Every payload that carries one of these levels must also carry
+# ``invalidation_basis`` so a reader can tell a house rule from a derived stop.
+INVALIDATION_HOUSE_RULE_SWING_PCT = 4.0
+INVALIDATION_HOUSE_RULE_MACRO_PCT = 8.0
+INVALIDATION_BASIS_HOUSE_RULE = "house_rule_fixed_pct"
+INVALIDATION_BASIS_STRUCTURAL = "structural_level_no_fixed_pct"
+
+_HOUSE_RULE_INVALIDATION_DETAIL = {
+    "basis": INVALIDATION_BASIS_HOUSE_RULE,
+    "swing_pct": INVALIDATION_HOUSE_RULE_SWING_PCT,
+    "macro_pct": INVALIDATION_HOUSE_RULE_MACRO_PCT,
+    "derived_from": None,
+    "note": (
+        "Fixed house rule applied to every call; not derived from realised volatility, "
+        "ATR or any backtest of this target."
+    ),
+}
+
+
+def _directive_call(action: str, selected: str, fallback: str) -> str:
+    """Build a directive line only when a concrete symbol was actually selected."""
+    if selected and selected != "HYBRID":
+        return f"{action} {selected}"
+    return fallback
+
+
+def _overlay_unavailable_reason(
+    overlay: dict[str, Any],
+    target_symbols: list[str],
+    target_group: str,
+) -> str:
+    """Explain, in one sentence, why no relative-strength comparison was possible."""
+    if not isinstance(overlay, dict) or not overlay:
+        return (
+            "no market overlay snapshot was supplied, so no relative-strength "
+            "comparison was performed"
+        )
+    scorecard = overlay.get("scorecard")
+    if not isinstance(scorecard, dict) or not any(
+        scorecard.get(key) for key in ("items", "leaders", "laggards")
+    ):
+        return (
+            "market overlay snapshot carried no scorecard items, so no "
+            "relative-strength comparison was performed"
+        )
+    scope = ", ".join(target_symbols) if target_symbols else (target_group or "the requested universe")
+    return (
+        f"market overlay scorecard held no ranked items matching {scope}, so no "
+        "relative-strength comparison was performed"
+    )
+
+
 
 def _ranked_overlay_items(
     overlay: dict[str, Any],
@@ -69,7 +123,9 @@ def _ranked_overlay_items(
     )
 
 
-def _build_guru_directive(req: AstrogridGuruRequest) -> tuple[AstrogridPredictionRequest, dict[str, Any]]:
+def _build_guru_directive(
+    req: AstrogridGuruRequest,
+) -> tuple[AstrogridPredictionRequest | None, dict[str, Any]]:
     seed = AstrogridPredictionRequest(
         question=req.question,
         call="read field",
@@ -101,22 +157,6 @@ def _build_guru_directive(req: AstrogridGuruRequest) -> tuple[AstrogridPredictio
     top = bullish_items[0] if bullish_items else {}
     weak = bearish_items[0] if bearish_items else {}
 
-    if question_intent == "avoid_now":
-        selected = str(weak.get("symbol") or (target_symbols[0] if target_symbols else target_group)).upper()
-        call = f"avoid {selected}"
-        setup = f"{selected} is the weakest mapped leg in the {target_group} sleeve"
-        invalidation = f"break the avoid call if {selected} reclaims trend and holds a 4% swing test"
-    elif question_intent in {"timing_entry", "buy_or_wait"}:
-        selected = str(top.get("symbol") or (target_symbols[0] if target_symbols else target_group)).upper()
-        call = f"wait for {selected}"
-        setup = f"{selected} is the target, but the entry needs confirmation before size"
-        invalidation = f"cancel the wait if {selected} loses the prior swing low or the regime flips risk-off"
-    else:
-        selected = str(top.get("symbol") or (target_symbols[0] if target_symbols else target_group)).upper()
-        call = f"buy {selected}" if selected and selected != "HYBRID" else "press the best mapped leader"
-        setup = f"{selected} has the cleanest mapped relative-strength read in {target_group}"
-        invalidation = f"stop the read if {selected} gives back 4% on swing or 8% on macro horizon"
-
     timing = "7d swing window" if horizon == "swing" else "30d macro window"
     seer_line = (
         (req.seer or {}).get("prediction")
@@ -126,6 +166,64 @@ def _build_guru_directive(req: AstrogridGuruRequest) -> tuple[AstrogridPredictio
     note = (
         f"Guru read: {question_intent}; scoreable group: {target_group}; "
         f"{str(seer_line)[:120]}"
+    )
+
+    if not bullish_items and not bearish_items:
+        # No comparison was performed, so no comparative directive may be emitted.
+        return None, {
+            "call": None,
+            "status": "no_scoreable_data",
+            "reason": _overlay_unavailable_reason(overlay, target_symbols, target_group),
+            "timing": timing,
+            "setup": None,
+            "invalidation": None,
+            "invalidation_basis": None,
+            "invalidation_detail": None,
+            "note": note,
+            "question_intent": question_intent,
+            "target_group": target_group,
+            "target_symbols": target_symbols,
+            "horizon": horizon,
+            "overlay_ranked_items": 0,
+            "disclaimer": "Entertainment and research only. Not financial advice.",
+        }
+
+    if question_intent == "avoid_now":
+        selected = str(weak.get("symbol") or (target_symbols[0] if target_symbols else target_group)).upper()
+        call = f"avoid {selected}"
+        setup = f"{selected} is the weakest mapped leg in the {target_group} sleeve"
+        invalidation = (
+            f"break the avoid call if {selected} reclaims trend and holds a "
+            f"{INVALIDATION_HOUSE_RULE_SWING_PCT:g}% swing test (fixed house rule)"
+        )
+        invalidation_basis = INVALIDATION_BASIS_HOUSE_RULE
+    elif question_intent in {"timing_entry", "buy_or_wait"}:
+        selected = str(top.get("symbol") or (target_symbols[0] if target_symbols else target_group)).upper()
+        call = f"wait for {selected}"
+        setup = f"{selected} is the target, but the entry needs confirmation before size"
+        invalidation = f"cancel the wait if {selected} loses the prior swing low or the regime flips risk-off"
+        invalidation_basis = INVALIDATION_BASIS_STRUCTURAL
+    else:
+        selected = str(top.get("symbol") or (target_symbols[0] if target_symbols else target_group)).upper()
+        call = _directive_call("buy", selected, "press the best mapped leader")
+        setup = f"{selected} has the cleanest mapped relative-strength read in {target_group}"
+        invalidation = (
+            f"stop the read if {selected} gives back "
+            f"{INVALIDATION_HOUSE_RULE_SWING_PCT:g}% on swing or "
+            f"{INVALIDATION_HOUSE_RULE_MACRO_PCT:g}% on macro horizon (fixed house rule)"
+        )
+        invalidation_basis = INVALIDATION_BASIS_HOUSE_RULE
+
+    invalidation_detail = (
+        dict(_HOUSE_RULE_INVALIDATION_DETAIL)
+        if invalidation_basis == INVALIDATION_BASIS_HOUSE_RULE
+        else {
+            "basis": invalidation_basis,
+            "swing_pct": None,
+            "macro_pct": None,
+            "derived_from": None,
+            "note": "Structural level; no fixed percentage applied.",
+        }
     )
 
     prediction_req = AstrogridPredictionRequest(
@@ -152,14 +250,19 @@ def _build_guru_directive(req: AstrogridGuruRequest) -> tuple[AstrogridPredictio
     )
     return prediction_req, {
         "call": call,
+        "status": "scoreable",
+        "reason": None,
         "timing": timing,
         "setup": setup,
         "invalidation": invalidation,
+        "invalidation_basis": invalidation_basis,
+        "invalidation_detail": invalidation_detail,
         "note": note,
         "question_intent": question_intent,
         "target_group": target_group,
         "target_symbols": target_symbols,
         "horizon": horizon,
+        "overlay_ranked_items": len(bullish_items),
         "disclaimer": "Entertainment and research only. Not financial advice.",
     }
 
@@ -180,12 +283,35 @@ async def create_prediction(
     confidence = _prediction_confidence(req)
 
     market_overlay_snapshot = dict(req.market_overlay_snapshot or {})
+    overlay_ranked = _ranked_overlay_items(
+        market_overlay_snapshot, target_symbols, target_group, reverse=True
+    )
+    overlay_scoreability: dict[str, Any] = {
+        "status": "scoreable" if overlay_ranked else "no_scoreable_data",
+        "ranked_items": len(overlay_ranked),
+        "reason": None
+        if overlay_ranked
+        else _overlay_unavailable_reason(market_overlay_snapshot, target_symbols, target_group),
+    }
+    if not overlay_ranked and str(req.model_version or "").startswith("astrogrid-guru"):
+        # A guru-generated directive is derived from the overlay ranking. With no ranked
+        # items there is no comparison behind it, so nothing is persisted and no call is
+        # returned.
+        return {
+            "call": None,
+            "status": "no_scoreable_data",
+            "reason": overlay_scoreability["reason"],
+            "prediction_id": None,
+            "persisted": False,
+            "market_overlay_scoreability": overlay_scoreability,
+        }
     scorecard_overlay = dict(market_overlay_snapshot.get("scorecard") or {})
     scorecard_overlay["target_statuses"] = target_statuses
     scorecard_overlay["target_group"] = target_group
     market_overlay_snapshot["scorecard"] = scorecard_overlay
     market_overlay_snapshot["question_intent"] = question_intent
     market_overlay_snapshot["target_group"] = target_group
+    market_overlay_snapshot["overlay_scoreability"] = overlay_scoreability
 
     oracle_publish_result: dict[str, Any] = {"status": "not_attempted"}
     publish_payload: dict[str, Any] = {
@@ -278,6 +404,8 @@ async def create_prediction(
     record = store.save_prediction(prediction_payload)
     if not record:
         return {"error": "Prediction persistence failed."}
+    if isinstance(record, dict):
+        record["market_overlay_scoreability"] = overlay_scoreability
     return record
 
 
@@ -288,6 +416,18 @@ async def ask_guru(
 ) -> dict[str, Any]:
     """Answer a plain Guru question; persist only when a valid session is present."""
     prediction_req, answer = _build_guru_directive(req)
+    if prediction_req is None:
+        # The overlay produced nothing to compare, so there is no call to make.
+        return {
+            "answer": answer,
+            "prediction": None,
+            "postmortem": None,
+            "call": None,
+            "status": "no_scoreable_data",
+            "reason": answer["reason"],
+            "disclaimer": answer["disclaimer"],
+            "persistence_status": "not_persisted_no_scoreable_data",
+        }
     auth_header = request.headers.get("authorization") or ""
     token = auth_header.removeprefix("Bearer").strip() if auth_header.lower().startswith("bearer") else ""
     if not token:

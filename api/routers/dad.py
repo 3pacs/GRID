@@ -405,6 +405,26 @@ def _parse_finviz_value(raw: str | None) -> float | str | None:
         return raw.strip()
 
 
+def _finviz_parsed_number(parsed: Any) -> float | None:
+    """Return a Finviz `parsed` payload value as a float, or None when it is not a number.
+
+    Rows written by `_store_finviz_snapshot` carry a real float; rows written by
+    `ingestion/altdata/finviz_scraper.py` historically carried `str(parsed)`, so a
+    numeric string must still count. Anything that does not coerce - "Technology",
+    "N/A", "" - is text, and text is not a measurement.
+    """
+    if parsed is None or isinstance(parsed, bool):
+        return None
+    if isinstance(parsed, (int, float)):
+        return float(parsed)
+    if isinstance(parsed, str):
+        try:
+            return float(parsed.strip())
+        except ValueError:
+            return None
+    return None
+
+
 def _as_utc(value: Any) -> datetime | None:
     if value is None:
         return None
@@ -651,13 +671,24 @@ def _read_finviz_rows(engine: Any, ticker: str) -> dict[str, Any]:
                 payload = {}
         payload = payload if isinstance(payload, dict) else {}
         pull_dt = _as_utc(pull_timestamp)
+        # A row whose payload records a non-numeric parse (Sector, Industry, an
+        # unparsable "N/A") is text. Historically those rows were written with a
+        # 0.0 placeholder in the NOT NULL `value` column and pull_status='SUCCESS'
+        # (B-M17). Those rows still exist; they are read as text here so the
+        # placeholder is never served or scored as a measurement. Nothing is
+        # rewritten in the database.
+        raw_parsed = payload.get("parsed")
+        parsed_number = _finviz_parsed_number(raw_parsed)
+        is_text = parsed_number is None and raw_parsed is not None
         fields[field] = {
             "field": field,
             "label": payload.get("label") or field.replace("_", " ").title(),
             "group": payload.get("group") or "other",
             "raw_value": payload.get("raw_value"),
-            "parsed": payload.get("parsed"),
-            "numeric_value": float(value) if value is not None else None,
+            "parsed": None if is_text else parsed_number,
+            "numeric_value": None if is_text else (float(value) if value is not None else None),
+            "value_kind": "text" if is_text else "numeric",
+            "text_value": raw_parsed if is_text else None,
             "obs_date": str(obs_date) if obs_date else None,
             "pull_timestamp": pull_dt.isoformat() if pull_dt else str(pull_timestamp),
         }
@@ -674,11 +705,20 @@ def _read_finviz_rows(engine: Any, ticker: str) -> dict[str, Any]:
     }
 
 
-def _store_finviz_snapshot(engine: Any, ticker: str, pairs: dict[str, str]) -> int:
+def _store_finviz_snapshot(engine: Any, ticker: str, pairs: dict[str, str]) -> dict[str, int]:
+    """Write the numeric Finviz fields into raw_series. Text fields get no row.
+
+    `raw_series.value` is `DOUBLE PRECISION NOT NULL`, so the table can only hold
+    numeric observations. Sector and Industry are always text, and a numeric field
+    can come back as "N/A" or other unparsable text. Those used to be coerced to
+    `0.0` and written with `pull_status='SUCCESS'` - a fabricated measurement that
+    accumulated in the durable series (B-M17). They are now skipped and counted.
+    """
     source_id = _ensure_finviz_source_id(engine)
     today = date.today()
     now = datetime.now(timezone.utc)
     inserted = 0
+    skipped_text = 0
 
     with engine.begin() as conn:
         for finviz_label, (field_id, display_label, group) in FINVIZ_FIELD_MAP.items():
@@ -687,7 +727,16 @@ def _store_finviz_snapshot(engine: Any, ticker: str, pairs: dict[str, str]) -> i
             if raw_value is None or parsed is None:
                 continue
 
-            numeric_value = parsed if isinstance(parsed, (int, float)) else 0.0
+            if isinstance(parsed, bool) or not isinstance(parsed, (int, float)):
+                # Not a number: no numeric observation exists, so no row is written.
+                skipped_text += 1
+                log.debug(
+                    "Finviz {t}: {f} is not numeric ({v!r}); no raw_series row written",
+                    t=ticker, f=field_id, v=parsed,
+                )
+                continue
+
+            numeric_value = float(parsed)
             payload = {
                 "ticker": ticker,
                 "field": field_id,
@@ -728,7 +777,7 @@ def _store_finviz_snapshot(engine: Any, ticker: str, pairs: dict[str, str]) -> i
             {"source_id": source_id},
         )
 
-    return inserted
+    return {"rows_inserted": inserted, "skipped_text_fields": skipped_text}
 
 
 def _finviz_stat_cards(fields: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
@@ -750,6 +799,7 @@ def _finviz_stat_cards(fields: dict[str, dict[str, Any]]) -> list[dict[str, Any]
             "raw_value": item.get("raw_value"),
             "parsed": item.get("parsed"),
             "numeric_value": item.get("numeric_value"),
+            "value_kind": item.get("value_kind", "numeric"),
         })
     return cards
 
@@ -763,11 +813,12 @@ def _get_finviz_profile(engine: Any, ticker: str, *, refresh: bool = False) -> d
     if refresh and freshness["state"] in {"missing", "aging", "stale"}:
         try:
             pairs = _fetch_finviz_snapshot(ticker)
-            inserted = _store_finviz_snapshot(engine, ticker, pairs)
+            write_summary = _store_finviz_snapshot(engine, ticker, pairs)
             scraped = True
             stored = _read_finviz_rows(engine, ticker)
             freshness = _freshness_state(stored.get("latest_pull"), stale_hours=24)
-            stored["rows_inserted"] = inserted
+            stored["rows_inserted"] = write_summary["rows_inserted"]
+            stored["skipped_text_fields"] = write_summary["skipped_text_fields"]
         except Exception as exc:
             scrape_error = str(exc)
             log.debug("Finviz live scrape failed for {t}: {e}", t=ticker, e=scrape_error)
@@ -785,6 +836,7 @@ def _get_finviz_profile(engine: Any, ticker: str, *, refresh: bool = False) -> d
         "latest_obs_date": str(stored.get("latest_obs_date")) if stored.get("latest_obs_date") else None,
         "field_count": stored.get("field_count", 0),
         "rows_inserted": stored.get("rows_inserted", 0),
+        "skipped_text_fields": stored.get("skipped_text_fields", 0),
         "live_refresh_requested": refresh,
         "refresh_available": True,
         "stats": _finviz_stat_cards(fields),
@@ -793,11 +845,32 @@ def _get_finviz_profile(engine: Any, ticker: str, *, refresh: bool = False) -> d
     }
 
 
+# Hand-picked point weights. Nothing here is calibrated against an outcome; the
+# weights ship with every payload so a reader can see the number is a weighted count
+# of workbook footprint, not a conviction measurement.
+_GOLD_SCORE_WEIGHTS: dict[str, dict[str, Any]] = {
+    "evidence_score": {"weight": 2.5, "cap": None},
+    "file_count": {"weight": 8, "cap": None},
+    "sheet_count": {"weight": 2, "cap": None},
+    "mentions": {"weight": 1, "cap": 30},
+}
+_GOLD_SCORE_CLAMP = {"min": 0, "max": 100}
+_GOLD_VERDICT_THRESHOLDS = {
+    "high_workbook_conviction": {"heuristic_score": 80, "file_count": 3},
+    "known_name": {"heuristic_score": 45},
+    "light_footprint": {"heuristic_score": 15},
+}
+
+
 def _gold_from_summary(summary: dict[str, Any] | None) -> dict[str, Any]:
     if not summary:
+        # No workbook rows were found. That is an absence of evidence, not a zero
+        # score, so no number is published.
         return {
             "verdict": "No workbook history yet",
-            "score": 0,
+            "heuristic_score": None,
+            "weights": None,
+            "score_basis": "no_workbook_history",
             "tone": "neutral",
             "one_liner": "This ticker is not showing up in Dad's copied workbook corpus yet.",
         }
@@ -806,7 +879,28 @@ def _gold_from_summary(summary: dict[str, Any] | None) -> dict[str, Any]:
     file_count = int(summary.get("file_count") or 0)
     sheet_count = int(summary.get("sheet_count") or 0)
     evidence_score = float(summary.get("evidence_score") or 0)
-    score = min(100, round(evidence_score * 2.5 + file_count * 8 + sheet_count * 2 + min(mentions, 30)))
+    inputs = {
+        "evidence_score": evidence_score,
+        "file_count": file_count,
+        "sheet_count": sheet_count,
+        "mentions": mentions,
+    }
+    weights: dict[str, Any] = {}
+    raw_total = 0.0
+    for term, spec in _GOLD_SCORE_WEIGHTS.items():
+        value = inputs[term]
+        capped = min(value, spec["cap"]) if spec["cap"] is not None else value
+        points = capped * spec["weight"]
+        raw_total += points
+        weights[term] = {
+            "weight": spec["weight"],
+            "cap": spec["cap"],
+            "input": value,
+            "points": round(points, 2),
+        }
+    score = min(_GOLD_SCORE_CLAMP["max"], round(raw_total))
+    weights["_clamp"] = dict(_GOLD_SCORE_CLAMP)
+    weights["_verdict_thresholds"] = _GOLD_VERDICT_THRESHOLDS
 
     if score >= 80 and file_count >= 3:
         verdict = "High workbook conviction"
@@ -827,7 +921,9 @@ def _gold_from_summary(summary: dict[str, Any] | None) -> dict[str, Any]:
 
     return {
         "verdict": verdict,
-        "score": score,
+        "heuristic_score": score,
+        "weights": weights,
+        "score_basis": "workbook_footprint_weighted_count",
         "tone": tone,
         "one_liner": one_liner,
     }
@@ -1225,14 +1321,66 @@ def _latest_signal_context(engine: Any, ticker: str) -> dict[str, Any]:
 
 
 def _num_field(finviz: dict[str, Any], field_id: str) -> float | None:
+    """The numeric reading for a Finviz field, or None when there is not one.
+
+    A field that did not parse to a number has no reading. It used to fall through
+    to `numeric_value`, which for a legacy row is the fabricated `0.0` placeholder -
+    so an unparsable Debt/Eq scored the `finviz_debt_equity_0_to_1` award (B-M17).
+    Absence is returned as None and the caller skips the term.
+    """
     item = finviz.get("fields", {}).get(field_id)
     if not item:
         return None
-    value = item.get("parsed")
-    if isinstance(value, (int, float)):
-        return float(value)
+    if item.get("value_kind") == "text":
+        return None
+    parsed = item.get("parsed")
+    number = _finviz_parsed_number(parsed)
+    if number is not None:
+        return number
+    if parsed is not None:
+        return None
     numeric = item.get("numeric_value")
-    return float(numeric) if isinstance(numeric, (int, float)) else None
+    if isinstance(numeric, bool) or not isinstance(numeric, (int, float)):
+        return None
+    return float(numeric)
+
+
+# Every term below is a hand-picked point award chosen by hand, never fitted or scored
+# against an outcome. The table is the single source of truth for the arithmetic *and*
+# is published as `decision_stack.weights`, so the number can never be read as a
+# calibrated 0-100 conviction without its recipe.
+_DECISION_STACK_WEIGHTS: dict[str, Any] = {
+    "workbook_prior_multiplier": 0.35,
+    "grid_return_window_strong_ge_20pct": 15,
+    "grid_return_window_positive": 8,
+    "grid_return_window_negative": -4,
+    "grid_within_10pct_of_52w_high": 5,
+    "grid_below_30pct_of_window_high": -5,
+    "finviz_pe_reviewable_0_to_35": 5,
+    "finviz_pe_rich_above_60": -4,
+    "finviz_roe_ge_15": 5,
+    "finviz_margin_ge_10": 4,
+    "finviz_eps_next_5y_ge_10": 3,
+    "finviz_debt_equity_0_to_1": 4,
+    "finviz_debt_equity_above_2": -4,
+    "finviz_stale": -5,
+    "options_row_present": 5,
+    "options_put_call_ratio_above_1_2": -2,
+    "signals_per_trusted_row": 2,
+    "signals_trusted_cap": 8,
+    "signals_per_tradingview_alert": 2,
+    "signals_tradingview_cap": 6,
+    "regime_cautious": -4,
+    "regime_not_cautious": 2,
+    "stale_source_each": -3,
+    "stale_source_cap": -12,
+    "_clamp": {"min": 0, "max": 100},
+    "_stance_thresholds": {
+        "Deep review first": 70,
+        "Watchlist with checks": 45,
+        "Needs more evidence": 25,
+    },
+}
 
 
 def _grid_decision_stack(
@@ -1246,8 +1394,10 @@ def _grid_decision_stack(
     cards: list[dict[str, Any]] = []
     reasons: list[str] = []
     blockers: list[str] = []
+    w = _DECISION_STACK_WEIGHTS
 
-    score = round(float(gold.get("score") or 0) * 0.35, 1)
+    gold_score = gold.get("heuristic_score")
+    score = round(float(gold_score or 0) * w["workbook_prior_multiplier"], 1)
     cards.append({
         "source": "Dad workbooks",
         "state": "strong" if summary and int(summary.get("file_count") or 0) >= 3 else "watch" if summary else "missing",
@@ -1266,19 +1416,19 @@ def _grid_decision_stack(
     chart_points = 0.0
     if ret_window is not None:
         if ret_window >= 20:
-            chart_points += 15
+            chart_points += w["grid_return_window_strong_ge_20pct"]
             reasons.append(f"GRID {window} trend is strong at {ret_window:.1f}%.")
         elif ret_window > 0:
-            chart_points += 8
+            chart_points += w["grid_return_window_positive"]
             reasons.append(f"GRID {window} trend is positive at {ret_window:.1f}%.")
         else:
-            chart_points -= 4
+            chart_points += w["grid_return_window_negative"]
             blockers.append(f"GRID {window} trend is negative at {ret_window:.1f}%.")
     if from_high is not None:
         if from_high >= -10:
-            chart_points += 5
+            chart_points += w["grid_within_10pct_of_52w_high"]
         elif from_high <= -30:
-            chart_points -= 5
+            chart_points += w["grid_below_30pct_of_window_high"]
             blockers.append(
                 f"Price is {abs(from_high):.1f}% below its {window} high."
             )
@@ -1302,28 +1452,38 @@ def _grid_decision_stack(
     debt_eq = _num_field(finviz, "debt_equity")
     margin = _num_field(finviz, "profit_margin") or _num_field(finviz, "operating_margin")
     eps_5y = _num_field(finviz, "eps_next_5y")
+    # A field with no numeric reading awards nothing, and says so, rather than
+    # scoring a placeholder zero (B-M17).
+    finviz_inputs: dict[str, float | None] = {
+        "forward_pe": forward_pe,
+        "roe": roe,
+        "debt_equity": debt_eq,
+        "profit_margin": margin,
+        "eps_next_5y": eps_5y,
+    }
+    skipped_finviz = sorted(name for name, val in finviz_inputs.items() if val is None)
     if finviz.get("status") in {"ready", "stale"}:
         if forward_pe and 0 < forward_pe <= 35:
-            finviz_points += 5
+            finviz_points += w["finviz_pe_reviewable_0_to_35"]
             reasons.append(f"Finviz valuation is reviewable: forward/ttm P/E {forward_pe:g}.")
         elif forward_pe and forward_pe > 60:
-            finviz_points -= 4
+            finviz_points += w["finviz_pe_rich_above_60"]
             blockers.append(f"Finviz valuation is rich: P/E {forward_pe:g}.")
         if roe and roe >= 15:
-            finviz_points += 5
+            finviz_points += w["finviz_roe_ge_15"]
         if margin and margin >= 10:
-            finviz_points += 4
+            finviz_points += w["finviz_margin_ge_10"]
         if eps_5y and eps_5y >= 10:
-            finviz_points += 3
+            finviz_points += w["finviz_eps_next_5y_ge_10"]
         if debt_eq is not None and 0 <= debt_eq <= 1:
-            finviz_points += 4
+            finviz_points += w["finviz_debt_equity_0_to_1"]
         elif debt_eq and debt_eq > 2:
-            finviz_points -= 4
+            finviz_points += w["finviz_debt_equity_above_2"]
             blockers.append(f"Finviz debt/equity is elevated at {debt_eq:g}.")
     else:
         blockers.append("Finviz fundamentals are not in GRID for this ticker yet.")
     if finviz.get("freshness", {}).get("state") == "stale":
-        finviz_points -= 5
+        finviz_points += w["finviz_stale"]
         blockers.append("Finviz fundamentals are stale; refresh before making the call.")
     score += finviz_points
     cards.append({
@@ -1331,14 +1491,16 @@ def _grid_decision_stack(
         "state": "strong" if finviz_points >= 12 else "watch" if finviz_points > 0 else "missing" if finviz.get("status") == "unavailable" else "caution",
         "points": round(finviz_points, 1),
         "detail": f"{finviz.get('field_count', 0)} fields, {finviz.get('freshness', {}).get('label', 'unknown')}",
+        "inputs": dict(finviz_inputs),
+        "skipped_fields": skipped_finviz,
     })
 
     options_points = 0.0
     if options:
-        options_points += 5
+        options_points += w["options_row_present"]
         pcr = options.get("put_call_ratio")
         if pcr and pcr > 1.2:
-            options_points -= 2
+            options_points += w["options_put_call_ratio_above_1_2"]
             blockers.append(f"Options put/call ratio is elevated at {pcr:.2f}.")
     score += options_points
     cards.append({
@@ -1352,9 +1514,9 @@ def _grid_decision_stack(
     trusted = [row for row in signals.get("signal_sources", []) if row.get("trust_score", 0) >= 0.6]
     tv_alerts = signals.get("tradingview_signals", [])
     if trusted:
-        signal_points += min(8, len(trusted) * 2)
+        signal_points += min(w["signals_trusted_cap"], len(trusted) * w["signals_per_trusted_row"])
     if tv_alerts:
-        signal_points += min(6, len(tv_alerts) * 2)
+        signal_points += min(w["signals_tradingview_cap"], len(tv_alerts) * w["signals_per_tradingview_alert"])
     score += signal_points
     cards.append({
         "source": "GRID signals",
@@ -1367,20 +1529,20 @@ def _grid_decision_stack(
     if regime:
         rec = str(regime.get("grid_recommendation") or "").lower()
         if any(word in rec for word in ("risk", "hedge", "cash", "defensive", "reduce")):
-            score -= 4
+            score += w["regime_cautious"]
             blockers.append(f"Current GRID regime is cautious: {regime.get('grid_recommendation')}.")
         else:
-            score += 2
+            score += w["regime_not_cautious"]
 
     stale_sources = []
     for source in grid.get("source_freshness", []):
         if source.get("state") in {"stale", "missing"}:
             stale_sources.append(source.get("source"))
     if stale_sources:
-        score -= min(12, len(stale_sources) * 3)
+        score += max(w["stale_source_cap"], len(stale_sources) * w["stale_source_each"])
         blockers.append(f"Stale or missing source rows: {', '.join(stale_sources[:5])}.")
 
-    score = max(0, min(100, round(score, 1)))
+    score = max(w["_clamp"]["min"], min(w["_clamp"]["max"], round(score, 1)))
     if score >= 70:
         stance = "Deep review first"
         tone = "strong"
@@ -1401,12 +1563,20 @@ def _grid_decision_stack(
 
     return {
         "stance": stance,
+        "stance_basis": "heuristic_score_thresholds",
         "tone": tone,
-        "score": score,
+        "heuristic_score": score,
+        "weights": dict(w),
+        "score_basis": "hand_picked_point_awards",
+        "skipped_terms": {"finviz": skipped_finviz},
         "cards": cards,
         "reasons": reasons[:5],
         "blockers": blockers[:6],
-        "method": "Workbook prior plus GRID price, fundamentals, options, signal, regime, and freshness checks.",
+        "method": (
+            "Hand-picked point awards over the workbook prior plus GRID price, "
+            "fundamentals, options, signal, regime and freshness checks. Not a "
+            "backtested or calibrated conviction score - every weight is in `weights`."
+        ),
     }
 
 
