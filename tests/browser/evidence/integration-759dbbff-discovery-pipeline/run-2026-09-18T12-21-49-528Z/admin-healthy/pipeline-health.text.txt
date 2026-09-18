@@ -1,0 +1,48 @@
+PIPELINE HEALTH
+1
+TOTAL SOURCES
+1
+HEALTHY
+0
+STALE
+0
+BROKEN
+SOURCE STATUS
+All (1)
+Healthy (1)
+Stale (0)
+Broken (0)
+STATUS ▲	SOURCE	TYPE	LAST PULL	ROWS	FRESHNESS	REASON	ERROR
+healthy	test_puller_fred	MACRO	3d ago	12	
+	-	
+RESOLVER STATUS
+0
+Pending
+4
+Resolved (24h)
+3d ago
+Last Run
+GRID
+10Y
+CANVAS
+SURFACE
+DASH
+FLOW
+ACTORS
+RISK
+SIGNAL
+Ctrl+K
+MORE
+Ask GRID
+×
+What should I watch?
+Explain the current regime
+Any red flags?
+What are the lever pullers doing?
+Ask GRID anything about the market, your portfolio, or the intelligence picture.
+HORIZON
+1D
+1W
+1M
+3M
+6M+
