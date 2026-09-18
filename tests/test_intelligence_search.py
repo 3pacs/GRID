@@ -248,17 +248,28 @@ class TestFTSSearch:
 
             # Create analytical_snapshots table if not exists.
             # Mirrors store/snapshots.py::ANALYTICAL_SNAPSHOTS_DDL — the one
-            # canonical shape. This fixture used to declare title/summary
-            # columns the real table has never had, which is the same phantom
-            # shape the phase4 FTS migration was written against.
+            # canonical shape — exactly, including the lack of column
+            # defaults: snapshot_date/category/as_of_date/payload are all
+            # NOT NULL with no DEFAULT there, so the INSERT below must
+            # supply them explicitly. This fixture used to declare
+            # title/summary columns the real table has never had, and later
+            # to declare defaults the real table has never had either
+            # (relying on a default is a no-op when, as in CI, the real
+            # table already exists from an earlier CREATE TABLE IF NOT
+            # EXISTS elsewhere in the "postgres" xdist group) — both are the
+            # same phantom-shape mistake the phase4 FTS migration was
+            # written against. ``actor_name`` is omitted (nullable, unused
+            # here); ``search_vector`` is kept because the phase4 FTS
+            # revision that would normally ADD COLUMN it is skipped by the
+            # CI bootstrap's Alembic stamp.
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS analytical_snapshots (
                     id BIGSERIAL PRIMARY KEY,
-                    snapshot_date DATE NOT NULL DEFAULT CURRENT_DATE,
-                    category TEXT NOT NULL DEFAULT 'test',
+                    snapshot_date DATE NOT NULL,
+                    category TEXT NOT NULL,
                     subcategory TEXT,
-                    as_of_date DATE NOT NULL DEFAULT CURRENT_DATE,
-                    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    as_of_date DATE NOT NULL,
+                    payload JSONB NOT NULL,
                     metrics JSONB,
                     search_vector tsvector,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -292,12 +303,15 @@ class TestFTSSearch:
                 ON CONFLICT (id) DO NOTHING
             """))
 
+            # Explicit snapshot_date/as_of_date: the real analytical_snapshots
+            # table (store/snapshots.py::ANALYTICAL_SNAPSHOTS_DDL) has no
+            # DEFAULT on either, same reason as signal_date above.
             conn.execute(text("""
-                INSERT INTO analytical_snapshots (category, subcategory, payload)
+                INSERT INTO analytical_snapshots (category, subcategory, snapshot_date, as_of_date, payload)
                 VALUES
-                    ('market_regime', 'Q1 2026 Market Regime',
+                    ('market_regime', 'Q1 2026 Market Regime', CURRENT_DATE, CURRENT_DATE,
                      '{"summary": "Growth regime with strong tech leadership and rising yields"}'::jsonb),
-                    ('sector_analysis', 'Semiconductor Deep Dive',
+                    ('sector_analysis', 'Semiconductor Deep Dive', CURRENT_DATE, CURRENT_DATE,
                      '{"summary": "AI infrastructure spending drives semiconductor revenue growth"}'::jsonb)
             """))
 
