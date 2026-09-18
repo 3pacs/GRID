@@ -173,6 +173,97 @@ def news_momentum(scenario: str) -> dict:
     }
 
 
+def options_recommendations(scenario: str, ticker: str | None = None) -> dict:
+    """GET /api/v1/options/recommendations -> mirrors
+    api/routers/options.py::get_recommendations (~line 200-238) and its
+    fallback `_load_saved_recommendations` (~line 138-194), read from THIS
+    worktree (not composed-h — see README "Provenance note" for why that
+    read was declined).
+
+    Two corrections to how this fixture gap was described, both confirmed
+    by reading source directly rather than assumed:
+
+    1. This endpoint is not called by Portfolio.jsx's OPTIONS P&L card or
+       WatchlistAnalysis.jsx's options panel — grepped the whole `pwa/src`
+       tree and `getOptionsRecommendations`/`/api/v1/options/recommendations`
+       only appears in `pwa/src/views/Options.jsx` and once in
+       `pwa/src/app.jsx:137`, inside `OPERATOR_PRELOAD_API_PATHS` — a
+       generic background preload fired for any admin session, not a
+       per-view fetch. Portfolio.jsx's OPTIONS P&L card reads
+       `get_portfolio`'s own `options_pnl` (already covered by
+       `watchlist_portfolio` above); WatchlistAnalysis.jsx's `OptionsIntel`
+       reads `get_ticker_analysis`'s own `options` field (already covered
+       by `watchlist_ticker_analysis`). The 404 itself was real (this route
+       had no fixture at all) and worth fixing regardless of which code
+       path triggers it.
+    2. `_load_saved_recommendations`'s query is
+       `WHERE (outcome IS NULL OR outcome = 'OPEN')` — this endpoint
+       structurally can never return a closed/WIN recommendation (those
+       only ever appear via `GET /api/v1/options/recommendations/history`,
+       a separate, unfixtured route). A "healthy = one WIN closed, one
+       open" pair was asked for; this fixture instead serves two OPEN
+       recommendations, which is what the real endpoint can honestly
+       return, and says so below rather than serving a shape the API
+       cannot actually produce.
+    """
+    now = GENERATED_AT
+    if scenario == "empty":
+        return {
+            "recommendations": [],
+            "generated_at": now,
+            "scan_summary": {
+                "total_scanned": 0, "passed_sanity": 0, "rejected": 0,
+                "source": "persisted", "fresh_scan": False,
+                "reason": "Options recommender module is not installed",
+            },
+        }
+
+    def _rec(rec_ticker, strike, confidence, expected_return, kelly, note):
+        return {
+            "ticker": rec_ticker, "direction": "CALL", "strike": strike,
+            "expiry": "2026-10-16", "entry_price": 3.2, "target_price": 5.0,
+            "stop_loss": 1.8, "expected_return": expected_return,
+            "kelly_fraction": kelly, "confidence": confidence,
+            "thesis": note,
+            "sanity_status": {"liquidity": {"status": "pass"}, "spread": {"status": "pass"}},
+            "dealer_context": "long_gamma", "generated_at": now,
+            # This endpoint's own query excludes anything else — see
+            # docstring above. Always "OPEN" here, never a WIN/LOSS row.
+            "outcome": "OPEN",
+        }
+
+    recs = [_rec(TICKER, 105.0, 0.58, 0.31, 0.04, "Synthetic fixture recommendation — TEST1 call.")]
+    if scenario == "healthy":
+        recs.append(_rec(TICKER, 110.0, 0.42, 0.19, 0.02, "Synthetic fixture recommendation — TEST1 further OTM call."))
+    if scenario == "partial":
+        # One recommendation with an explicit reason instead of a fabricated
+        # confidence/expected_return: the scanner ran but this particular
+        # opportunity failed a sanity check, so it was never scored.
+        recs = [{
+            "ticker": TICKER, "direction": "CALL", "strike": 105.0,
+            "expiry": "2026-10-16", "entry_price": 3.2, "target_price": None,
+            "stop_loss": None, "expected_return": None,
+            "kelly_fraction": None, "confidence": None,
+            "thesis": "Unscored — dealer gamma context unavailable for this expiry.",
+            "sanity_status": {
+                "liquidity": {"status": "pass"},
+                "spread": {"status": "fail", "reason": "bid-ask spread exceeds 15% of mid"},
+            },
+            "dealer_context": None, "generated_at": now, "outcome": "OPEN",
+        }]
+    if ticker:
+        recs = [r for r in recs if r.get("ticker", "").upper() == ticker.upper()]
+    return {
+        "recommendations": recs,
+        "generated_at": now,
+        "scan_summary": {
+            "total_scanned": len(recs), "passed_sanity": len(recs), "rejected": 0,
+            "source": "persisted", "fresh_scan": False,
+            "reason": "Options recommender module is not installed",
+        },
+    }
+
+
 def alerts_list(scenario: str) -> dict:
     """GET /api/v1/alerts -> mirrors api/routers/price_alerts.py::list_alerts
     (~line 186-203): `{"alerts": [{id,ticker,direction,threshold,note,active,

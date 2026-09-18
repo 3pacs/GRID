@@ -24,7 +24,12 @@
  * Usage:
  *   node run_evidence.mjs --tree-label <sha-or-label> \
  *     [--pwa-dir <path>] [--scenarios healthy,partial,empty] \
- *     [--roles admin,contributor] [--out tests/browser/evidence/<tree-label>/]
+ *     [--roles admin,contributor] [--journeys home,ticker-lookup,...] \
+ *     [--out tests/browser/evidence/<tree-label>/]
+ *
+ * --journeys filters to journey ids already used as keys in summary.json
+ * (e.g. `home`, `ticker-lookup`, `catalyst-timeline-ACME`) — useful for
+ * re-verifying one journey (e.g. after a fix) without a full re-run.
  *
  * Ports: fixture server 8001, PWA dev server 5174 — deliberately not
  * 8000/5173, which are the lead's own running servers.
@@ -46,6 +51,7 @@ function parseArgs(argv) {
         'pwa-dir': 'C:/Users/owner/dev/GRID-fable-wt-composed-g/pwa',
         scenarios: 'healthy,partial,empty',
         roles: 'admin,contributor',
+        journeys: null, // null = all journeys for the role (default)
         out: null,
         'tree-label': null,
     };
@@ -73,6 +79,9 @@ const PWA_DIR = args['pwa-dir'];
 const TREE_LABEL = args['tree-label'];
 const SCENARIOS = args.scenarios.split(',').map((s) => s.trim()).filter(Boolean);
 const ROLES = args.roles.split(',').map((s) => s.trim()).filter(Boolean);
+const JOURNEY_FILTER = args.journeys
+    ? new Set(args.journeys.split(',').map((s) => s.trim()).filter(Boolean))
+    : null;
 const OUT_ROOT = path.resolve(args.out);
 
 const FIXTURE_PORT = 8001;
@@ -113,6 +122,10 @@ const JOURNEYS = {
         { name: 'discovery', hash: '#/discovery' },
         { name: 'pipeline-health', hash: '#/pipeline-health' },
         { name: 'ten-year', hash: '#/ten-year' },
+        // Operator (admin) can reach catalyst-timeline normally, unlike the
+        // contributor gate below — added so the earlier owner-fix on this
+        // view can be re-verified from the admin side too.
+        { name: 'catalyst-timeline-ACME', hash: '#/catalyst-timeline?ticker=ACME' },
     ],
     contributor: [
         { name: 'home', hash: '#/home', clickText: 'How are my stocks doing?' },
@@ -234,6 +247,22 @@ async function clickByVisibleText(page, text) {
     return clicked;
 }
 
+/**
+ * Wait for the page's network to settle before capturing anything. Panels
+ * that fetch their own data independently (see README "Home compose")
+ * can still be mid-flight right after a hash change or click; this is
+ * called again immediately before each screenshot/text dump, not just
+ * once after navigation, per the h-vs-g rerun finding that most text-dump
+ * diffs were unsettled panels / nav-chrome timing / clock strings rather
+ * than a real source difference.
+ */
+async function waitSettled(page) {
+    await page.waitForNetworkIdle({ idleTime: 800, timeout: 8000 }).catch(() => {
+        // Some views (e.g. a chart with a polling widget) never truly go
+        // idle — capture anyway rather than hang the whole run on one view.
+    });
+}
+
 function detectCrash(bodyText) {
     // ViewErrorBoundary.jsx renders "<ViewName> Error" as an <h3>, with
     // "An unexpected error occurred" (or the real error message) below it,
@@ -286,27 +315,33 @@ async function runOne(browser, role, scenario, outDir) {
     await page.reload({ waitUntil: 'networkidle2' });
     await loginThroughRealForm(page);
 
-    for (const journey of JOURNEYS[role] || []) {
+    const journeyList = (JOURNEYS[role] || []).filter(
+        (j) => !JOURNEY_FILTER || JOURNEY_FILTER.has(j.name)
+    );
+    for (const journey of journeyList) {
         const journeyErrorCountBefore = countJsonlLines(consoleLogPath, (l) => l.type === 'error');
         const apiCallsBefore = readJsonl(networkLogPath).length;
 
         try {
             await page.evaluate((hash) => { window.location.hash = hash; }, journey.hash);
-            await page.waitForNetworkIdle({ idleTime: 750, timeout: 10000 }).catch(() => {});
+            await waitSettled(page);
             if (journey.clickText) {
                 await clickByVisibleText(page, journey.clickText);
-                await page.waitForNetworkIdle({ idleTime: 750, timeout: 10000 }).catch(() => {});
+                await waitSettled(page);
             }
 
             // Desktop screenshot
             await page.setViewport({ width: 1280, height: 900 });
+            await waitSettled(page);
             await page.screenshot({ path: path.join(outDir, `${journey.name}.png`), fullPage: true });
 
             // Mobile screenshot
             await page.setViewport({ width: 390, height: 844 });
+            await waitSettled(page);
             await page.screenshot({ path: path.join(outDir, `${journey.name}.mobile.png`), fullPage: true });
             await page.setViewport({ width: 1280, height: 900 });
 
+            await waitSettled(page);
             const bodyText = await page.evaluate(() => document.body.innerText);
             writeFileSync(path.join(outDir, `${journey.name}.text.txt`), bodyText);
 

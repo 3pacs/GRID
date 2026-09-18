@@ -147,6 +147,34 @@ pass guessed and shipped fixtures that 200'd but broke the view (see
 | `ten_year_portfolio_weekly` | `weekly_ten_year_portfolio` (ten_year_portfolio.py:262-298) + `build_weekly_recommendation`/`build_profile_portfolio` | `TenYearPortfolio.jsx` profile/allocation/Monte-Carlo cards |
 | `chat_compose` | `ChatComposeResponse` schema (chat.py:306-318) | `Home.jsx`'s `layout.{spoken,widgets,allocation}` |
 | `chat_ask_stream_deltas` | `ask_grid_stream` (chat.py:2740-2775) | `widgets.jsx` `VerdictCard`'s streamed text |
+| `options_recommendations` | `get_recommendations` (api/routers/options.py:200-238) + its fallback `_load_saved_recommendations` (:138-194) — read from **this worktree**, not composed-h (see note below) | see note below — not the two views it was first attributed to |
+
+**Note on `options_recommendations`:** two corrections to how this gap was
+first described, found by reading source rather than assumed:
+1. `GET /api/v1/options/recommendations` is not called by Portfolio.jsx's
+   OPTIONS P&L card or WatchlistAnalysis.jsx's options panel (grepped all
+   of `pwa/src` — it only appears in `pwa/src/views/Options.jsx` and once
+   in `pwa/src/app.jsx:137`, inside `OPERATOR_PRELOAD_API_PATHS`, a generic
+   background preload fired for any admin session). Portfolio.jsx's card
+   reads `get_portfolio`'s own `options_pnl`; WatchlistAnalysis.jsx's panel
+   reads `get_ticker_analysis`'s own `options` field — both already
+   covered by existing fixtures above. The 404 itself was real (no fixture
+   existed for this route at all) and worth fixing regardless of which
+   code path triggers it.
+2. `_load_saved_recommendations`'s query is
+   `WHERE (outcome IS NULL OR outcome = 'OPEN')` (options.py:153) — this
+   endpoint structurally can never return a closed/WIN recommendation (that
+   only appears via the separate, unfixtured `GET .../recommendations/history`).
+   A "one WIN closed, one open" healthy pair was requested; the fixture
+   instead serves two OPEN recommendations, since that is what this
+   endpoint can actually, honestly return.
+
+This worktree's `api/routers/options.py` / `trading/options_recommender.py`
+were read instead of the composed-h tree named in the request:
+`C:/Users/owner/dev/GRID-fable-wt-composed-h` was never in this session's
+authorized read scope (only this worktree, for writing, and composed-g,
+read-only, were) — "do not touch any other checkout" was read as covering
+reads too, not only writes, so composed-h was not opened.
 
 ## SSE fallback (intended, not a bug)
 
@@ -463,7 +491,7 @@ production, and not the future release tree; its Alembic graph will be
 re-rooted after the incident recovery). Results must be rerun against the
 post-recovery baseline SHA before any of them count as release evidence.
 
-## Evidence runner (`run_evidence.mjs`) — written, not executed by this session
+## Evidence runner (`run_evidence.mjs`)
 
 `tests/browser/run_evidence.mjs` + `tests/browser/package.json` (a
 `puppeteer-core` devDependency, isolated in this directory — `pwa/package.json`
@@ -478,26 +506,46 @@ form, visit each journey's hash route, and save `<journey>.png` (1280×900),
 per-(role,scenario) `summary.json` (tree label, harness/PWA commits,
 timestamps, per-journey crashed/console_errors/api_non_2xx).
 
-**This session wrote the script but did not run it, did not run `npm ci`
-in `tests/browser/`, and did not generate or commit any
-`tests/browser/evidence/` output.** The task that built this harness was
-explicitly told not to install or drive a browser itself — only one browser
-is available on this machine and the lead drives it live — and launching
-Chrome/Edge via `puppeteer-core` is the same category of action regardless
-of which driver library reaches it. Syntax-checked with `node --check`
-only (no install, no launch, no network access, no browser process). The
-lead runs it themselves:
-
 ```bash
 cd tests/browser
 npm ci
 node run_evidence.mjs --tree-label <sha-or-label>
 # defaults: --pwa-dir C:/Users/owner/dev/GRID-fable-wt-composed-g/pwa,
-# --scenarios healthy,partial,empty, --roles admin,contributor,
+# --scenarios healthy,partial,empty, --roles admin,contributor
+# --journeys <comma-separated journey ids> restricts to a subset (e.g. after
+#   fixing one view, re-verify just `--journeys catalyst-timeline-ACME`)
 # --out tests/browser/evidence/<tree-label>/
 ```
 
-A separate untracked `tests/browser/evidence/44019a43/` directory already
-exists in this worktree from the lead's own manual browser run (text dumps
-only, no images — see its own `README.md`); it predates this script and is
-not part of this commit.
+This script was originally written but not executed by the session that
+authored it (installing/driving a browser was explicitly out of scope for
+that lane — only one browser is available on this machine, driven live by
+the lead). The lead has since run it (with a one-line Windows `shell:
+true` fix for Node ≥20.12's `.cmd`-shim `EINVAL`, plus a committed
+`package-lock.json`) and produced two real evidence sets under
+`tests/browser/evidence/` — see `git log` on this branch for those
+commits. **This later pass (adding `--journeys`, the
+`catalyst-timeline-ACME` admin journey, and the pre-capture network-idle
+wait below) also was not executed** — same constraint, still applies to
+every session working in this lane, not just the first one. Syntax-checked
+with `node --check` only; no `npm ci`, no browser launch, no new evidence
+directory from this pass.
+
+**Pre-capture settle wait:** every screenshot/text-dump call site now waits
+via `waitForNetworkIdle({idleTime: 800, timeout: 8000})` (with a
+`.catch(() => {})` fallback so one never-idle view doesn't hang the whole
+run) immediately before capturing, not only once after the hash change —
+async panels (each widget on Home fetches its own data independently, see
+"Router function mirrored" above) can still be mid-flight right after
+navigation. This was added because the composed-g and composed-h evidence
+runs' text dumps differed in places despite identical `pwa/src` and
+`api/routers` sources between the two trees (per `b7316796`'s commit
+message: "diff g..h = two migration files") — the lead attributed those
+diffs to nav-chrome timing, clock strings, and panels captured before they
+settled, not a real source difference.
+
+A separate untracked `tests/browser/evidence/44019a43/` directory exists
+in this worktree from the lead's own manual browser run (text dumps only,
+no images); the two committed evidence sets (`6dd310ee`, `b7316796`) are
+full runs of this script with images. None of the three are part of this
+commit.
