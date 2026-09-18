@@ -74,8 +74,10 @@ this):
 
 from __future__ import annotations
 
+import inspect
 import json
 import math
+import subprocess
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -89,6 +91,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import scripts.autoresearch as autoresearch  # noqa: E402
 from validation.backtest import WalkForwardBacktest  # noqa: E402
 from evaluation import signal_outcomes as sig_out  # noqa: E402
+import tests.integration.conftest as _accept  # noqa: E402
+from tests.integration.conftest import (  # noqa: E402
+    acceptance_mode,
+    record_required_behaviour,
+    require_capability,
+)
 
 _FIXTURE_PATH = (
     Path(__file__).resolve().parents[1] / "fixtures" / "research_slice" / "feature_window.json"
@@ -204,6 +212,55 @@ def _predict_fn_is_live(bt: "WalkForwardBacktest") -> bool:
 
 
 _PREDICT_FN_LIVE: bool = _predict_fn_is_live(WalkForwardBacktest(None, None))
+
+
+# ---------------------------------------------------------------------------
+# Feature detection: the three capabilities that (as of this commit) only
+# have full coverage in tests/test_evaluator_contracts.py on other Fable
+# lanes -- draft #556/f8ad5635 (feature-order invariance, chronological
+# holdout) and draft #563/b56ad1d4 (batched PIT-vintages availability).
+# Same pattern as _predict_fn_is_live above: probe whatever is actually
+# installed, once, at import time.
+# ---------------------------------------------------------------------------
+
+
+def _feature_order_invariance_capable() -> bool:
+    """True iff _compute_era_metrics accepts target_feature_id at all --
+    the parameter draft #556 added to make column selection explicit
+    rather than positional (matrix.columns[0])."""
+    try:
+        sig = inspect.signature(WalkForwardBacktest._compute_era_metrics)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return False
+    return "target_feature_id" in sig.parameters
+
+
+def _chronological_holdout_capable() -> bool:
+    """True iff run_validation accepts both fit_fn and embargo_days --
+    draft #556's leakage-safe walk-forward train/test split."""
+    try:
+        sig = inspect.signature(WalkForwardBacktest.run_validation)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return False
+    return "fit_fn" in sig.parameters and "embargo_days" in sig.parameters
+
+
+def _vintage_availability_capable() -> bool:
+    """True iff WalkForwardBacktest has the batched-fetch dispatch method
+    AND store.vintage_selection (its per-row selector) is importable --
+    draft #563's single-round-trip PIT fetch."""
+    if not hasattr(WalkForwardBacktest, "_fetch_pit_correct_matrix"):
+        return False
+    try:
+        import store.vintage_selection  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+_FEATURE_ORDER_CAPABLE: bool = _feature_order_invariance_capable()
+_CHRONO_HOLDOUT_CAPABLE: bool = _chronological_holdout_capable()
+_VINTAGE_AVAILABILITY_CAPABLE: bool = _vintage_availability_capable()
 
 
 # ---------------------------------------------------------------------------
@@ -723,13 +780,17 @@ class TestPredictFnDeadOnMain20260918:
     """Runs only when the probe finds predict_fn dead — i.e. NOT composed
     with draft #556 (f8ad5635)/#562's live-predictor fix. True on this
     branch (fable/research-slice-20260918) as of this commit.
+
+    Operator direction for acceptance mode: on the final composed tree,
+    the predictor-used and cheating-predictor-rejected behaviours must
+    execute unconditionally. This test's own SUCCESSFUL run is itself the
+    signal that they cannot: if it runs at all (predict_fn is dead), #556
+    is absent. So in acceptance mode, reaching this test body is itself a
+    required-behaviour failure — it does NOT fall through to the
+    structural always-FAIL assertion below, which stays reserved for
+    development mode's "document the current limitation" role.
     """
 
-    @pytest.mark.skipif(
-        _PREDICT_FN_LIVE,
-        reason="predict_fn is live on this (composed) tree — see "
-        "TestPredictFnLiveComposed556::test_honest_predictor_passes_cheating_same_bar_predictor_fails",
-    )
     def test_predict_fn_dead_never_returns_pass_main_20260918(self, record_property):
         """EXACT FINDING #1 (see module docstring): ``predict_fn`` is dead —
         ``_compute_era_metrics`` always scores the same column
@@ -741,9 +802,21 @@ class TestPredictFnDeadOnMain20260918:
         (equal Sharpe, still FAILs on the `<=` gate) and cost_bps=10 (this
         branch's real default, strictly lower Sharpe).
         """
-        record_property("predict_fn_live_on_this_tree", False)
-        print("FEATURE DETECTION: predict_fn dead on this tree — keeping the structural always-FAIL assertion.")
+        if _PREDICT_FN_LIVE:
+            pytest.skip(
+                "predict_fn is live on this (composed) tree — see "
+                "TestPredictFnLiveComposed556::test_honest_predictor_passes_cheating_same_bar_predictor_fails"
+            )
 
+        record_property("predict_fn_live_on_this_tree", False)
+        print("FEATURE DETECTION: predict_fn dead on this tree.")
+
+        if acceptance_mode():
+            record_required_behaviour("predictor_used", executed=True, passed=False)
+            record_required_behaviour("cheating_predictor_rejected", executed=True, passed=False)
+            pytest.fail("required behaviour missing on this tree: predictor_used")
+
+        print("Development mode: keeping the structural always-FAIL assertion.")
         bt = WalkForwardBacktest(None, FakePITStore(SERIES_ROWS))
 
         for cost_bps, expect_equal in ((0.0, True), (10.0, False)):
@@ -768,15 +841,21 @@ class TestPredictFnLiveComposed556:
     """Runs only when the probe finds predict_fn live — i.e. composed with
     draft #556 (f8ad5635)'s leakage-safe predict_fn fix (or a descendant of
     it, such as #562's stack). NOT true on this branch as of this commit;
-    written to activate correctly the moment it is.
+    written to activate correctly the moment it is. In acceptance mode,
+    this behaviour must execute unconditionally: if the tree lacks it,
+    ``require_capability`` below hard-fails naming ``predictor_used``
+    instead of skipping.
     """
 
-    @pytest.mark.skipif(
-        not _PREDICT_FN_LIVE,
-        reason="predict_fn is dead on this tree — see "
-        "TestPredictFnDeadOnMain20260918::test_predict_fn_dead_never_returns_pass_main_20260918",
-    )
     def test_honest_predictor_passes_cheating_same_bar_predictor_fails(self, record_property):
+        require_capability(
+            _PREDICT_FN_LIVE,
+            "predictor_used",
+            reason="predict_fn is dead on this tree — see "
+            "TestPredictFnDeadOnMain20260918::test_predict_fn_dead_never_returns_pass_main_20260918",
+        )
+        record_required_behaviour("predictor_used", executed=True, passed=False)
+        record_required_behaviour("cheating_predictor_rejected", executed=True, passed=False)
         """This is the assertion the plan actually wants: on a fixture
         where an honest, genuinely-predictive next-period-sign predictor
         beats buy-and-hold, it CAN reach a PASS verdict; a same-bar
@@ -875,6 +954,125 @@ class TestPredictFnLiveComposed556:
             honest_result["full_period_metrics"]["sharpe"]
             > cheat_result["full_period_metrics"]["sharpe"]
         )
+
+        record_required_behaviour("predictor_used", executed=True, passed=True)
+        record_required_behaviour("cheating_predictor_rejected", executed=True, passed=True)
+
+
+# ===========================================================================
+# Acceptance-mode required behaviours only fully covered elsewhere
+# ===========================================================================
+
+
+class TestRequiredBehavioursFromEvaluatorContracts:
+    """Thin, composition-compatible versions of properties that (as of this
+    commit) only have full coverage in ``tests/test_evaluator_contracts.py``
+    on other Fable lanes: feature-order invariance and the leakage-safe
+    chronological holdout (draft #556/f8ad5635), and the batched
+    PIT-vintages availability (draft #563/b56ad1d4). Each calls the SAME
+    real helper method the full test proves, on a small fixture built
+    here — not a reimplementation of those tests' larger torture fixtures.
+    Every number below was verified directly against a scratch import of
+    the real composed code (``git show f8ad5635:validation/backtest.py``,
+    ``git show b56ad1d4:validation/backtest.py`` +
+    ``store/vintage_selection.py``) before being written here.
+    """
+
+    def test_feature_order_invariance(self):
+        require_capability(
+            _FEATURE_ORDER_CAPABLE,
+            "feature_order_invariance",
+            reason="WalkForwardBacktest._compute_era_metrics has no target_feature_id "
+            "parameter on this tree — column-order invariance is not yet in scope "
+            "(needs draft #556/f8ad5635 composed in).",
+        )
+        record_required_behaviour("feature_order_invariance", executed=True, passed=False)
+
+        bt = WalkForwardBacktest(None, FakePITStore(SERIES_ROWS))
+        dates = pd.DatetimeIndex(
+            [SERIES_START + timedelta(days=i) for i in range(5)], name="obs_date"
+        )
+        data = {1: [100.0, 105.0, 103.0, 108.0, 110.0], 2: [50.0, 49.0, 51.0, 52.0, 53.0]}
+        ordered = pd.DataFrame(data, index=dates)[[1, 2]]
+        permuted = pd.DataFrame(data, index=dates)[[2, 1]]
+
+        result_ordered = bt._compute_era_metrics(ordered, None, cost_bps=10.0, target_feature_id=1)
+        result_permuted = bt._compute_era_metrics(permuted, None, cost_bps=10.0, target_feature_id=1)
+        assert result_ordered == result_permuted
+
+        baseline_ordered = bt._compute_baseline_metrics(ordered, target_feature_id=1)
+        baseline_permuted = bt._compute_baseline_metrics(permuted, target_feature_id=1)
+        assert baseline_ordered == baseline_permuted
+
+        record_required_behaviour("feature_order_invariance", executed=True, passed=True)
+
+    def test_availability_vintage_batched_fetch_matches_per_day_reference(self):
+        require_capability(
+            _VINTAGE_AVAILABILITY_CAPABLE,
+            "availability_vintage",
+            reason="WalkForwardBacktest has no _fetch_pit_correct_matrix, or "
+            "store.vintage_selection is not importable, on this tree — the batched "
+            "get_feature_vintages fetch path is not yet in scope (needs draft "
+            "#563/b56ad1d4 composed in).",
+        )
+        record_required_behaviour("availability_vintage", executed=True, passed=False)
+
+        pit = FakePITStore(SERIES_ROWS)
+        bt = WalkForwardBacktest(None, pit)
+
+        batched = bt._fetch_pit_correct_matrix(
+            feature_ids=[1, 2], start_date=SERIES_START, end_date=SERIES_END, vintage_policy="LATEST_AS_OF",
+        )
+
+        # Reference: the untouched one-calendar-day-at-a-time loop, built
+        # directly from this fake's own get_feature_matrix -- the same
+        # correctness baseline tests/test_evaluator_contracts.py checks the
+        # batched path against.
+        frames = []
+        d = SERIES_START
+        while d <= SERIES_END:
+            m = pit.get_feature_matrix([1, 2], d, d, as_of_date=d, vintage_policy="LATEST_AS_OF")
+            if not m.empty:
+                frames.append(m)
+            d += timedelta(days=1)
+        reference = pd.concat(frames).sort_index()
+        reference = reference[~reference.index.duplicated(keep="first")]
+
+        assert batched.equals(reference)
+
+        record_required_behaviour("availability_vintage", executed=True, passed=True)
+
+    def test_chronological_holdout_boundaries_never_overlap_and_respect_embargo(self):
+        require_capability(
+            _CHRONO_HOLDOUT_CAPABLE,
+            "chronological_holdout",
+            reason="WalkForwardBacktest.run_validation has no fit_fn/embargo_days "
+            "parameters on this tree — leakage-safe train/test split is not yet in "
+            "scope (needs draft #556/f8ad5635 composed in).",
+        )
+        record_required_behaviour("chronological_holdout", executed=True, passed=False)
+
+        def fit_fn(train_matrix):
+            return lambda features: pd.Series(1.0, index=features.index)
+
+        bt = WalkForwardBacktest(None, FakePITStore(SERIES_ROWS))
+        result = bt.run_validation(
+            hypothesis_id=1, feature_ids=[1], start_date=SERIES_START, end_date=SERIES_END,
+            n_splits=3, cost_bps=0.0, fit_fn=fit_fn, embargo_days=2, target_feature_id=1,
+        )
+
+        checked_any = False
+        for era in result["era_results"]:
+            if "train_end" not in era or "test_start" not in era:
+                continue
+            checked_any = True
+            train_end = date.fromisoformat(era["train_end"])
+            test_start = date.fromisoformat(era["test_start"])
+            embargo_days = era["embargo_days"]
+            assert train_end + timedelta(days=embargo_days) < test_start, era
+        assert checked_any, "expected at least one era with boundary fields to check"
+
+        record_required_behaviour("chronological_holdout", executed=True, passed=True)
 
 
 # ===========================================================================
@@ -1225,23 +1423,37 @@ def _required_tables_present(conn) -> list[str]:
 
 @pytest.mark.integration
 class TestRealPostgresPITBoundary:
-    """The ONE test in this file that touches a real database. Gated on the
-    shared ``pg_engine`` fixture (tests/conftest.py) exactly like every
-    other DB-gated test in this suite: it SKIPS (never fakes a pass) when
-    PostgreSQL is unreachable, and also skips with an explicit reason if the
+    """The ONE test in this file that touches a real database. Gated on
+    ``acceptance_pg_engine`` (tests/integration/conftest.py), which behaves
+    exactly like the shared ``pg_engine`` fixture (tests/conftest.py) OUTSIDE
+    acceptance mode: it SKIPS (never fakes a pass) when PostgreSQL is
+    unreachable, and this test also skips with an explicit reason if the
     schema hasn't been bootstrapped (schema.sql) — that boundary is checked
     here rather than assumed, unlike the older test_pit.py pattern this
-    mirrors. Set ``GRID_TEST_DB_URL`` to point at a real, disposable
-    Postgres to exercise it; see this file's module docstring.
+    mirrors. IN acceptance mode, both of those become hard FAILs instead
+    (required behaviour ``postgres_pit_vintage_proof`` — "acceptance
+    requires the DB proof," per operator direction). Set ``GRID_TEST_DB_URL``
+    to point at a real, disposable Postgres to exercise it; see this file's
+    module docstring.
     """
 
-    def test_pit_correct_vintage_filtering_against_real_postgres(self, pg_engine):
+    def test_pit_correct_vintage_filtering_against_real_postgres(self, acceptance_pg_engine):
         from sqlalchemy import text
         from store.pit import PITStore
+
+        pg_engine = acceptance_pg_engine
+        behaviour = "postgres_pit_vintage_proof"
 
         with pg_engine.connect() as conn:
             missing = _required_tables_present(conn)
         if missing:
+            if acceptance_mode():
+                record_required_behaviour(behaviour, executed=True, passed=False)
+                pytest.fail(
+                    f"required behaviour missing on this tree: {behaviour} "
+                    f"(GRID schema not applied -- missing tables: {missing})"
+                )
+            record_required_behaviour(behaviour, executed=False, passed=None)
             pytest.skip(
                 "GRID_TEST_DB_URL points at a Postgres without the GRID schema "
                 f"applied (missing tables: {missing}). Apply schema.sql to this "
@@ -1315,8 +1527,133 @@ class TestRealPostgresPITBoundary:
             after_release = pit.get_pit([fid], as_of_date=revised_release)
             assert len(after_release) == 1
             assert float(after_release.iloc[0]["value"]) == 999.0
+
+            record_required_behaviour(behaviour, executed=True, passed=True)
         finally:
             with pg_engine.begin() as conn:
                 conn.execute(text("DELETE FROM resolved_series WHERE feature_id = :fid"), {"fid": fid})
                 conn.execute(text("DELETE FROM feature_registry WHERE id = :fid"), {"fid": fid})
                 conn.execute(text("DELETE FROM source_catalog WHERE id = :sid"), {"sid": source_id})
+
+
+# ===========================================================================
+# Acceptance mode — mechanism tests + the summary that runs last
+# ===========================================================================
+
+
+class TestAcceptanceModeItself:
+    """Tests for the acceptance-mode mechanism (tests/integration/conftest.py)
+    itself, using monkeypatched env — not the vertical slice's own required
+    behaviours (those are exercised by every test class above)."""
+
+    def test_acceptance_mode_reads_env_var(self, monkeypatch):
+        monkeypatch.delenv(_accept.ACCEPTANCE_ENV, raising=False)
+        assert _accept.acceptance_mode() is False
+        monkeypatch.setenv(_accept.ACCEPTANCE_ENV, "1")
+        assert _accept.acceptance_mode() is True
+        monkeypatch.setenv(_accept.ACCEPTANCE_ENV, "0")
+        assert _accept.acceptance_mode() is False
+        monkeypatch.setenv(_accept.ACCEPTANCE_ENV, "false")
+        assert _accept.acceptance_mode() is False
+
+    def test_require_capability_skips_outside_acceptance_mode(self, monkeypatch):
+        monkeypatch.delenv(_accept.ACCEPTANCE_ENV, raising=False)
+        with pytest.raises(pytest.skip.Exception):
+            _accept.require_capability(False, "some_required_behaviour", "not available on this tree")
+        assert _accept.required_behaviour_results()["some_required_behaviour"] == {
+            "executed": False,
+            "passed": None,
+        }
+
+    def test_require_capability_hard_fails_in_acceptance_mode(self, monkeypatch):
+        monkeypatch.setenv(_accept.ACCEPTANCE_ENV, "1")
+        with pytest.raises(pytest.fail.Exception) as excinfo:
+            _accept.require_capability(False, "some_required_behaviour", "not available on this tree")
+        assert "required behaviour missing on this tree: some_required_behaviour" in str(excinfo.value)
+        assert _accept.required_behaviour_results()["some_required_behaviour"] == {
+            "executed": True,
+            "passed": False,
+        }
+
+    def test_require_capability_available_is_a_noop_in_either_mode(self, monkeypatch):
+        for env_value in (None, "1"):
+            if env_value is None:
+                monkeypatch.delenv(_accept.ACCEPTANCE_ENV, raising=False)
+            else:
+                monkeypatch.setenv(_accept.ACCEPTANCE_ENV, env_value)
+            _accept.require_capability(True, "irrelevant_name", "irrelevant reason")  # must not raise
+
+    def test_pytest_addoption_acceptance_flag_sets_env_var(self, monkeypatch):
+        # pytest_configure sets os.environ directly (that IS the feature --
+        # a single downstream source of truth for CLI flag or env var), so
+        # it bypasses monkeypatch's own undo tracking. Cleaning up with
+        # monkeypatch.delenv here would be self-defeating: monkeypatch would
+        # capture THIS leaked "1" as the value to restore, then put it right
+        # back during its own (later) teardown. Use a plain, untracked
+        # os.environ.pop instead so the leak cannot survive this test either
+        # way -- this is exactly the bug an earlier version of this test had.
+        import os as _os
+
+        monkeypatch.delenv(_accept.ACCEPTANCE_ENV, raising=False)
+
+        class _FakeConfig:
+            def getoption(self, name):
+                return name == "--acceptance"
+
+        try:
+            _accept.pytest_configure(_FakeConfig())
+            assert _accept.acceptance_mode() is True
+        finally:
+            _os.environ.pop(_accept.ACCEPTANCE_ENV, None)
+
+
+class TestAcceptanceSummary:
+    """Runs last (by source position in this file, preserved by pytest's
+    default, non-random collection order within one module -- verified: no
+    randomize/reorder plugin is active in this suite's pytest.ini). Writes
+    tests/integration/acceptance_summary.json (git-ignored via
+    tests/integration/.gitignore) with the tree SHA, the mode, and every
+    required behaviour's executed/pass status this session observed.
+    """
+
+    def test_acceptance_summary_writes_report(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        try:
+            proc = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                capture_output=True, text=True, cwd=str(repo_root), timeout=5,
+            )
+            tree_sha = proc.stdout.strip() or None if proc.returncode == 0 else None
+        except Exception:
+            tree_sha = None
+
+        results = _accept.required_behaviour_results()
+        summary = {
+            "tree_sha": tree_sha,
+            "mode": "acceptance" if _accept.acceptance_mode() else "development",
+            "required_behaviours": results,
+        }
+
+        out_path = Path(__file__).resolve().parent / "acceptance_summary.json"
+        out_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+
+        if _accept.acceptance_mode():
+            # Final aggregate gate: even if some earlier required-behaviour
+            # test somehow didn't hard-fail itself on a miss, a run cannot
+            # be reported "all clear" while any required behaviour is
+            # missing/failed/never-recorded.
+            required_names = {
+                "predictor_used",
+                "cheating_predictor_rejected",
+                "feature_order_invariance",
+                "availability_vintage",
+                "chronological_holdout",
+                "postgres_pit_vintage_proof",
+            }
+            missing_or_failed = sorted(
+                name for name in required_names
+                if not results.get(name, {}).get("passed")
+            )
+            assert not missing_or_failed, (
+                f"required behaviours missing/failed on this tree: {missing_or_failed}"
+            )
