@@ -409,7 +409,9 @@ def catalyst_timeline(
                     "direction": direction,
                     "target_price": float(target) if target else None,
                     "entry_price": float(entry) if entry else None,
-                    "confidence": float(r[6]) if r[6] else None,
+                    # `is not None`, not truthiness: a measured 0.0 is a
+                    # confidence, a NULL is unscored (CONFIDENCE_POLICY.md).
+                    "confidence": float(r[6]) if r[6] is not None else None,
                     "expected_move_pct": float(r[7]) if r[7] else None,
                     "model": r[8],
                     "verdict": r[9],
@@ -443,7 +445,7 @@ def catalyst_timeline(
                     "date": str(r[10])[:10] if r[10] else str(today),
                     "label": (r[1] or "")[:120],
                     "role": role,
-                    "confidence": float(r[3]) if r[3] else None,
+                    "confidence": float(r[3]) if r[3] is not None else None,
                     "invalidation": r[4] or "No explicit invalidation defined",
                     "status": r[5],
                     "pattern_type": r[7],

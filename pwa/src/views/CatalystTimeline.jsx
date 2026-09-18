@@ -12,7 +12,9 @@
  *   - Purple: hypotheses (active theses)
  *
  * Vertical position = value impact (above = positive, below = negative)
- * Size = probability/confidence
+ * Size = stated probability/confidence. An event that states neither is
+ * UNSCORED (docs/reference/CONFIDENCE_POLICY.md): it draws at the minimum
+ * radius with a dashed ring and reads "unscored", never as a 50% event.
  */
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import * as d3 from 'd3';
@@ -67,6 +69,34 @@ function escapeHtml(str) {
 function formatPrice(val) {
     if (!val && val !== 0) return '--';
     return `$${Number(val).toFixed(2)}`;
+}
+
+const MIN_R = 6;
+const CONF_R = 10;
+
+/**
+ * The confidence an event actually states: `confidence` first, then
+ * `probability` (milestones carry the latter). `null` when neither was
+ * stated. The checks are `== null`, never falsiness, so a measured 0 is
+ * returned as 0 and not skipped over or replaced.
+ */
+export function statedConfidence(e) {
+    if (e == null) return null;
+    if (e.confidence != null) return e.confidence;
+    if (e.probability != null) return e.probability;
+    return null;
+}
+
+/** "unscored" for a null confidence, "NN%" for a stated one (0 -> "0%"). */
+export function formatConfidence(conf) {
+    if (conf == null || Number.isNaN(Number(conf))) return 'unscored';
+    return `${(conf * 100).toFixed(0)}%`;
+}
+
+/** Node radius: sized by the stated confidence; the minimum when unscored. */
+export function nodeRadius(conf) {
+    if (conf == null || Number.isNaN(Number(conf))) return MIN_R;
+    return MIN_R + conf * CONF_R;
 }
 
 export default function CatalystTimeline({ selectedTicker = '' }) {
@@ -222,12 +252,12 @@ export default function CatalystTimeline({ selectedTicker = '' }) {
             const d = new Date(e.date);
             const x = xScale(d);
             const impact = e.value_impact_pct || 0;
-            const conf = e.confidence || e.probability || 0.5;
+            const conf = statedConfidence(e);
             // Positive impact = above center, negative = below
             const yOffset = impact > 0 ? -Math.abs(impact) * plotH * 0.3
                 : impact < 0 ? Math.abs(impact) * plotH * 0.3
                 : (i % 2 === 0 ? -1 : 1) * (30 + (i % 5) * 20);
-            return { ...e, x, y: midY + yOffset, r: 6 + conf * 10, dateObj: d };
+            return { ...e, x, y: midY + yOffset, r: nodeRadius(conf), unscored: conf == null, dateObj: d };
         });
 
         // Past/future split
@@ -249,14 +279,18 @@ export default function CatalystTimeline({ selectedTicker = '' }) {
                 .attr('opacity', isPast ? 0.3 : 0.5);
 
             // Main dot
+            // An unscored node shares the minimum radius with a measured 0%,
+            // so the ring is dashed to keep the two distinguishable.
             const dot = parent.append('circle')
                 .attr('cx', ev.x).attr('cy', ev.y)
                 .attr('r', ev.r)
+                .attr('data-confidence', ev.unscored ? 'unscored' : 'scored')
                 .attr('fill', isPast ? statusColor : color)
                 .attr('fill-opacity', isPast ? 0.6 : 0.85)
                 .attr('stroke', isPast ? statusColor : '#fff')
                 .attr('stroke-width', isPast ? 1 : 1.5)
                 .attr('stroke-opacity', 0.5)
+                .attr('stroke-dasharray', ev.unscored ? '2,2' : null)
                 .style('cursor', 'pointer');
 
             if (!isPast) {
@@ -286,8 +320,7 @@ export default function CatalystTimeline({ selectedTicker = '' }) {
             // Tooltip
             dot.on('mouseenter', (event) => {
                 setSelectedEvent(ev);
-                const confPct = ev.confidence || ev.probability;
-                const confStr = confPct ? `${(confPct * 100).toFixed(0)}%` : '--';
+                const confStr = formatConfidence(statedConfidence(ev));
                 tooltip.style('opacity', 1)
                     .style('left', `${event.clientX + 16}px`)
                     .style('top', `${event.clientY - 16}px`)
@@ -473,6 +506,9 @@ export default function CatalystTimeline({ selectedTicker = '' }) {
                             {selectedEvent.probability != null && (
                                 <Row label="Probability" value={`${(selectedEvent.probability * 100).toFixed(0)}%`}
                                     color={selectedEvent.probability > 0.7 ? '#10B981' : '#F59E0B'} />
+                            )}
+                            {statedConfidence(selectedEvent) == null && (
+                                <Row label="Confidence" value="unscored" color={colors.textMuted} />
                             )}
                             {selectedEvent.value_impact_ps != null && (
                                 <Row label="Value Impact" value={`${selectedEvent.value_impact_ps > 0 ? '+' : ''}$${selectedEvent.value_impact_ps.toFixed(2)}/sh`}
