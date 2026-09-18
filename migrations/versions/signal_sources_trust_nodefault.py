@@ -1,7 +1,7 @@
 """signal_sources.trust_score — drop the 0.5 default so NULL means "unscored".
 
 Revision ID: signal_sources_trust_nodefault
-Revises: snapshot_actor_col_20260914
+Revises: oracle_pred_nullable_0918 (this PR is stacked on #537, which is stacked on #544 at the top of the remediation chain; the chain stays linear)
 Create Date: 2026-09-17 00:00:00.000000
 
 ``schema.sql`` declared ``trust_score NUMERIC DEFAULT 0.5``. Every row the
@@ -58,7 +58,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "signal_sources_trust_nodefault"
-down_revision: Union[str, Sequence[str], None] = "snapshot_actor_col_20260914"
+down_revision: Union[str, Sequence[str], None] = "oracle_pred_nullable_0918"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
