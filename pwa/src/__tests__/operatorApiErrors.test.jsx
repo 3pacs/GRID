@@ -75,4 +75,47 @@ describe('Operator view survives API error-marker responses', () => {
             expect(screen.getByText(/Cycle store offline/i)).toBeInTheDocument();
         });
     });
+
+    // normalizeListResponse's first branch (Array.isArray(res)) — the real
+    // backend contract for these two endpoints is a bare array, not
+    // `{issues: [...]}` / `{snapshots: [...]}`. Confirms that shape is used
+    // directly (no unwrapping needed) and never routed into either error path.
+    it('accepts a bare array response directly and renders it with no unavailable state', async () => {
+        api.getOperatorIssues.mockResolvedValue([
+            { id: 1, severity: 'ERROR', title: 'Bare array issue', created_at: '2026-09-10T12:00:00' },
+        ]);
+        api.getSnapshotLatest.mockResolvedValue([
+            { id: 1, created_at: '2026-09-10T12:00:00', payload: { silhouette_score: 0.5 } },
+        ]);
+
+        expect(() => render(<Operator />)).not.toThrow();
+
+        await waitFor(() => {
+            expect(screen.getByText('Bare array issue')).toBeInTheDocument();
+        });
+        expect(screen.queryByText(/Issues unavailable/i)).not.toBeInTheDocument();
+
+        await waitFor(() => {
+            expect(screen.getByText('RECENT CYCLES')).toBeInTheDocument();
+        });
+        expect(screen.queryByText(/Cycle history unavailable/i)).not.toBeInTheDocument();
+    });
+
+    // normalizeListResponse's final catch-all branch — anything that is
+    // neither an array, the error marker, nor an object with an array at
+    // `key` (e.g. a bare `null`, or an object with an unrelated shape) must
+    // still resolve to an honest "Unexpected response" state, not a throw.
+    it('shows the "Unexpected response" unavailable state for malformed catch-all values (null, {weird:"x"}) without throwing', async () => {
+        api.getOperatorIssues.mockResolvedValue(null);
+        api.getSnapshotLatest.mockResolvedValue({ weird: 'x' });
+
+        expect(() => render(<Operator />)).not.toThrow();
+
+        await waitFor(() => {
+            expect(screen.getByText(/Issues unavailable: Unexpected response/i)).toBeInTheDocument();
+        });
+        await waitFor(() => {
+            expect(screen.getByText(/Cycle history unavailable: Unexpected response/i)).toBeInTheDocument();
+        });
+    });
 });

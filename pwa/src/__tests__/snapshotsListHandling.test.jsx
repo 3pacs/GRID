@@ -159,4 +159,58 @@ describe('Snapshots list handling per the real API contract', () => {
         });
         expect(screen.queryByText(/No snapshot found for category/)).not.toBeInTheDocument();
     });
+
+    // unavailableReason (Snapshots.jsx:32-40) classifies by res.status rather
+    // than surfacing the backend's own message text. Each branch below needs
+    // its own coverage: status 0 (network unreachable), 401/403 (auth), and
+    // api.js's own 'Invalid JSON response' sentinel (a local constant api.js
+    // produces itself, not backend text, so it's checked before status).
+
+    it('shows "the server could not be reached" for a status:0 network failure, without crashing', async () => {
+        api.getSnapshotLatest.mockResolvedValue({ error: true, status: 0, message: 'Failed to fetch' });
+        api.getSnapshotHistory.mockResolvedValue({ error: true, status: 0, message: 'Failed to fetch' });
+
+        expect(() => render(<Snapshots />)).not.toThrow();
+
+        await waitFor(() => {
+            expect(screen.getAllByText('Snapshots unavailable: the server could not be reached.').length).toBeGreaterThan(0);
+        });
+        expect(screen.queryByText(/Failed to fetch/)).not.toBeInTheDocument();
+    });
+
+    it('shows "not authorised" for a status:401 response, without crashing', async () => {
+        api.getSnapshotLatest.mockResolvedValue({ error: true, status: 401, message: 'Not authenticated' });
+        api.getSnapshotHistory.mockResolvedValue({ error: true, status: 401, message: 'Not authenticated' });
+
+        expect(() => render(<Snapshots />)).not.toThrow();
+
+        await waitFor(() => {
+            expect(screen.getAllByText('Snapshots unavailable: not authorised.').length).toBeGreaterThan(0);
+        });
+        expect(screen.queryByText(/Not authenticated/)).not.toBeInTheDocument();
+    });
+
+    it('shows "not authorised" for a status:403 response, without crashing', async () => {
+        api.getSnapshotLatest.mockResolvedValue({ error: true, status: 403, message: 'Forbidden' });
+        api.getSnapshotHistory.mockResolvedValue({ error: true, status: 403, message: 'Forbidden' });
+
+        expect(() => render(<Snapshots />)).not.toThrow();
+
+        await waitFor(() => {
+            expect(screen.getAllByText('Snapshots unavailable: not authorised.').length).toBeGreaterThan(0);
+        });
+        expect(screen.queryByText(/^Forbidden$/)).not.toBeInTheDocument();
+    });
+
+    it('shows "the server sent an unreadable response" for api.js\'s Invalid JSON response sentinel, without crashing', async () => {
+        api.getSnapshotLatest.mockResolvedValue({ error: true, status: 200, message: 'Invalid JSON response' });
+        api.getSnapshotHistory.mockResolvedValue({ error: true, status: 200, message: 'Invalid JSON response' });
+
+        expect(() => render(<Snapshots />)).not.toThrow();
+
+        await waitFor(() => {
+            expect(screen.getAllByText('Snapshots unavailable: the server sent an unreadable response.').length).toBeGreaterThan(0);
+        });
+        expect(screen.queryByText('Snapshots unavailable: the server answered with status 200.')).not.toBeInTheDocument();
+    });
 });
