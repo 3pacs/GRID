@@ -11,9 +11,13 @@ const regimeStages = [
  * Map regime state string to a 0-1 position on the thermometer.
  */
 function regimeToPosition(regime) {
-    if (!regime?.state) return 0.5;
+    if (!regime?.state) return null;
     const state = regime.state.toLowerCase();
-    const confidence = regime.confidence ?? 0.5;
+    // `?? 0.5` used to invent a coin-flip confidence and drive the needle
+    // with it. Unscored means the needle cannot be placed at all: a midpoint
+    // dot would read as "neutral, measured". No position, no dot.
+    if (regime.confidence == null) return null;
+    const confidence = regime.confidence;
 
     if (state.includes('contraction') || state.includes('crisis')) {
         return 0.05 + confidence * 0.15;
@@ -62,7 +66,8 @@ function lerpColor(a, b, t) {
 
 export default function RegimeThermometer({ regime }) {
     const position = useMemo(() => regimeToPosition(regime), [regime]);
-    const dotColor = positionToColor(position);
+    const unscored = position == null;
+    const dotColor = unscored ? '#5A7080' : positionToColor(position);
     const transProb = regime?.transition_probability;
 
     return (
@@ -95,8 +100,8 @@ export default function RegimeThermometer({ regime }) {
                 boxShadow: 'inset 0 1px 3px rgba(0,0,0,0.3)',
                 overflow: 'visible',
             }}>
-                {/* Current position dot */}
-                <div style={{
+                {/* Current position dot; none when the regime is unscored */}
+                {!unscored && <div data-testid="regime-needle" style={{
                     position: 'absolute',
                     left: `${Math.max(2, Math.min(98, position * 100))}%`,
                     top: '50%',
@@ -108,7 +113,7 @@ export default function RegimeThermometer({ regime }) {
                     boxShadow: `0 0 8px ${dotColor}88`,
                     transition: 'left 0.6s ease-out, background 0.6s ease-out',
                     zIndex: 1,
-                }} />
+                }} />}
             </div>
 
             {/* Bottom info */}
@@ -121,9 +126,13 @@ export default function RegimeThermometer({ regime }) {
                     fontFamily: "'JetBrains Mono', monospace", fontWeight: 600,
                 }}>
                     {regime?.state || '--'}
-                    {regime?.confidence != null && (
+                    {regime?.confidence != null ? (
                         <span style={{ color: '#5A7080', fontWeight: 400, marginLeft: '6px' }}>
                             {Math.round(regime.confidence * 100)}%
+                        </span>
+                    ) : (
+                        <span style={{ color: '#5A7080', fontWeight: 400, marginLeft: '6px' }}>
+                            confidence unscored
                         </span>
                     )}
                 </span>

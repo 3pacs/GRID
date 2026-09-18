@@ -659,7 +659,10 @@ class GRIDApi {
     async scanMispricing(minScore = 5.0) {
         return this._fetch(`/api/v1/options/scan?min_score=${minScore}`);
     }
-    async get100xOpportunities() { return this._fetch('/api/v1/options/100x'); }
+    // Renamed backend route (audit C-M20): the flag is a modelled
+    // heuristic, not an observation, and ships its inputs. /100x remains
+    // as a deprecated server-side alias for older installed PWAs.
+    async getHeuristicPayoffOpportunities() { return this._fetch('/api/v1/options/heuristic-payoff'); }
     async getGEXProfile(ticker) {
         return this._fetch(`/api/v1/derivatives/gex/${encodeURIComponent(ticker)}`);
     }
@@ -683,10 +686,10 @@ class GRIDApi {
         return this._fetch(`/api/v1/options/recommendations/history?${qs}`);
     }
 
-    async getOptionsHistory(ticker = '', days = 30, only100x = false, limit = 50) {
+    async getOptionsHistory(ticker = '', days = 30, onlyFlagged = false, limit = 50) {
         const params = new URLSearchParams({ days: String(days), limit: String(limit) });
         if (ticker) params.set('ticker', ticker);
-        if (only100x) params.set('only_100x', 'true');
+        if (onlyFlagged) params.set('only_flagged', 'true');
         return this._fetch(`/api/v1/options/history?${params}`);
     }
 

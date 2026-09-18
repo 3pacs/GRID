@@ -34,7 +34,7 @@ def _empty_history() -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def _make_opportunity(payoff: float = 50.0, **kwargs) -> MispricingOpportunity:
+def _make_opportunity(payoff: float | None = 50.0, **kwargs) -> MispricingOpportunity:
     """Create a MispricingOpportunity with sensible defaults."""
     defaults = dict(
         ticker="TEST",
@@ -49,27 +49,30 @@ def _make_opportunity(payoff: float = 50.0, **kwargs) -> MispricingOpportunity:
 
 
 # ---------------------------------------------------------------------------
-# Tests: MispricingOpportunity.is_100x
+# Tests: MispricingOpportunity.heuristic_payoff_flag
 # ---------------------------------------------------------------------------
 
 class TestMispricingOpportunity:
     """Tests for the MispricingOpportunity dataclass."""
 
-    def test_mispricing_opportunity_is_100x(self) -> None:
-        """Payoff >= 100 should flag is_100x as True."""
+    def test_flag_set_when_modelled_payoff_clears_threshold(self) -> None:
+        """Modelled payoff >= 100 sets heuristic_payoff_flag."""
         opp = _make_opportunity(payoff=100.0)
-        assert opp.is_100x is True
+        assert opp.heuristic_payoff_flag is True
 
         opp2 = _make_opportunity(payoff=500.0)
-        assert opp2.is_100x is True
+        assert opp2.heuristic_payoff_flag is True
 
-    def test_mispricing_opportunity_not_100x(self) -> None:
-        """Payoff < 100 should flag is_100x as False."""
+    def test_flag_clear_when_modelled_payoff_below_threshold(self) -> None:
         opp = _make_opportunity(payoff=99.9)
-        assert opp.is_100x is False
+        assert opp.heuristic_payoff_flag is False
 
         opp2 = _make_opportunity(payoff=0.0)
-        assert opp2.is_100x is False
+        assert opp2.heuristic_payoff_flag is False
+
+    def test_flag_is_none_when_payoff_could_not_be_modelled(self) -> None:
+        opp = _make_opportunity(payoff=None)
+        assert opp.heuristic_payoff_flag is None
 
 
 # ---------------------------------------------------------------------------
@@ -223,8 +226,12 @@ class TestEstimatePayoffMultiple:
             "spot_price": 100.0,
             "max_pain": 90.0,
         }
-        payoff = scanner._estimate_payoff_multiple(current, 7.0, "CALL")
+        payoff, inputs = scanner._estimate_payoff_multiple(current, 7.0, "CALL")
         assert payoff > 0
+        # The flag downstream is only readable if its inputs travel with it.
+        assert set(inputs) >= {
+            "iv_atm", "expected_move_pct", "otm_cost_pct", "leverage",
+        }
 
 
 # ---------------------------------------------------------------------------

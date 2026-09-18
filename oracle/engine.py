@@ -2636,6 +2636,9 @@ class EnsemblePredictor:
                 t=ticker,
                 e=str(exc),
             )
+        # 0.0 means "no catalyst we know of" — and the macro calendar is not
+        # ingested at all, so an FOMC week reads as 0.0 here. Absence of a
+        # catalyst only skips the dampening; it never boosts confidence.
         if catalyst_proximity > 0:
             confidence = round(confidence * (1.0 - 0.5 * catalyst_proximity), 4)
 

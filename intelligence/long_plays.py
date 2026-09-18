@@ -622,7 +622,7 @@ _OPTIONS_SQL = text(
     FROM options_mispricing_scans
     WHERE scan_date >= :start
       AND scan_date <= :as_of
-    ORDER BY ticker, payoff_multiple DESC, scan_date DESC
+    ORDER BY ticker, payoff_multiple DESC NULLS LAST, scan_date DESC
     """
 )
 
@@ -842,7 +842,16 @@ def _load_trial_tickers(engine: Engine, as_of: date) -> dict[str, dict[str, Any]
 
 
 def _load_options_asymmetry(engine: Engine, as_of: date) -> dict[str, dict[str, Any]]:
-    """Best payoff-multiple scan per ticker in the last 30 days."""
+    """Best payoff-multiple scan per ticker in the last 30 days.
+
+    ``payoff_multiple`` is nullable (the payoff can be unmodelled), and in
+    PostgreSQL ``DESC`` sorts NULLs FIRST, so a scan with no modelled payoff
+    used to win the ``DISTINCT ON (ticker)`` race against every scan that had
+    one - silently dropping the real ranking. ``DESC NULLS LAST`` in
+    ``_OPTIONS_SQL`` keeps unmodelled payoffs last; a ticker whose scans are
+    all unmodelled still reports ``max_payoff_multiple`` as None rather than
+    a number.
+    """
     start = as_of - timedelta(days=OPTIONS_LOOKBACK_DAYS)
     with engine.connect() as conn:
         rows = conn.execute(_OPTIONS_SQL, {"start": start, "as_of": as_of}).fetchall()
@@ -857,7 +866,8 @@ def _load_options_asymmetry(engine: Engine, as_of: date) -> dict[str, dict[str, 
             "score": _finite(row[2]),
             "direction": row[4],
             "thesis": row[5],
-            "is_100x": bool(row[6]) if row[6] is not None else None,
+            # Column is still named is_100x; the field says what it is.
+            "heuristic_payoff_flag": bool(row[6]) if row[6] is not None else None,
             "scan_date": scan.isoformat() if hasattr(scan, "isoformat") else scan,
         }
     return out

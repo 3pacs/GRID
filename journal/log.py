@@ -18,7 +18,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-_VALID_OPERATOR_CONFIDENCE = ("LOW", "MEDIUM", "HIGH")
+_VALID_OPERATOR_CONFIDENCE = ("LOW", "MEDIUM", "HIGH", "UNSCORED")
 _VALID_VERDICTS = ("HELPED", "HARMED", "NEUTRAL", "INSUFFICIENT_DATA")
 
 
@@ -45,7 +45,7 @@ class DecisionJournal:
         self,
         model_version_id: int,
         inferred_state: str,
-        state_confidence: float,
+        state_confidence: float | None,
         transition_probability: float,
         contradiction_flags: dict[str, Any],
         grid_recommendation: str,
@@ -53,20 +53,37 @@ class DecisionJournal:
         action_taken: str,
         counterfactual: str,
         operator_confidence: str,
+        confidence_reason: str | None = None,
     ) -> int:
         """Log a new decision to the journal.
+
+        ``state_confidence`` has three states, not two:
+
+        * a number in [0, 1] — a confidence that was actually measured;
+        * ``None`` — UNSCORED: no confidence was ever measured. Legal only
+          together with ``confidence_reason``, which says why. Nothing is
+          invented to fill the gap, and an unscored row must be EXCLUDED from
+          calibration/scoring downstream, never counted as 0.
+        * there is no third option: a missing measurement with no reason is a
+          ``ValueError``, not a silent NULL.
 
         Parameters:
             model_version_id: ID of the model that produced the decision.
             inferred_state: The regime/state the model inferred.
-            state_confidence: Confidence in the inferred state (0–1).
+            state_confidence: Confidence in the inferred state (0–1), or
+                ``None`` when it was never measured (requires
+                ``confidence_reason``).
             transition_probability: Probability of state transition (0–1).
             contradiction_flags: Dict of any contradictory signals.
             grid_recommendation: The GRID system's recommendation.
             baseline_recommendation: What the baseline would recommend.
             action_taken: The actual action taken by the operator.
             counterfactual: What would have happened with the baseline.
-            operator_confidence: Operator's confidence level ('LOW'/'MEDIUM'/'HIGH').
+            operator_confidence: Operator's confidence level ('LOW'/'MEDIUM'/'HIGH'),
+                or 'UNSCORED' when no confidence was measured at all.
+            confidence_reason: Why ``state_confidence`` is what it is.
+                REQUIRED when ``state_confidence`` is ``None``; optional
+                otherwise. Immutable once written.
 
         Returns:
             int: The newly created decision_journal.id.
@@ -74,6 +91,8 @@ class DecisionJournal:
         Raises:
             ValueError: If operator_confidence is not valid.
             ValueError: If state_confidence or transition_probability is outside [0, 1].
+            ValueError: If state_confidence is None and no confidence_reason
+                is given — an unscored decision must say why.
         """
         # Validate inputs
         if operator_confidence not in _VALID_OPERATOR_CONFIDENCE:
@@ -84,14 +103,26 @@ class DecisionJournal:
 
         import math
 
-        if math.isnan(state_confidence) or math.isinf(state_confidence):
-            raise ValueError(
-                f"state_confidence must be a finite number, got {state_confidence}"
-            )
-        if not 0 <= state_confidence <= 1:
-            raise ValueError(
-                f"state_confidence must be between 0 and 1, got {state_confidence}"
-            )
+        if state_confidence is None:
+            # UNSCORED. The one thing that must never happen here is quietly
+            # substituting a number (the pre-#539 behaviour wrote 0.5), so the
+            # only price of admission is an explicit reason.
+            if not confidence_reason or not str(confidence_reason).strip():
+                raise ValueError(
+                    "state_confidence is None (unscored) but no "
+                    "confidence_reason was given. An unscored decision must "
+                    "record why it is unscored — the journal is append-only "
+                    "and a bare NULL cannot be explained after the fact."
+                )
+        else:
+            if math.isnan(state_confidence) or math.isinf(state_confidence):
+                raise ValueError(
+                    f"state_confidence must be a finite number, got {state_confidence}"
+                )
+            if not 0 <= state_confidence <= 1:
+                raise ValueError(
+                    f"state_confidence must be between 0 and 1, got {state_confidence}"
+                )
 
         if math.isnan(transition_probability) or math.isinf(transition_probability):
             raise ValueError(
@@ -103,10 +134,14 @@ class DecisionJournal:
             )
 
         log.info(
-            "Logging decision — model={m}, state={s}, confidence={c:.2f}",
+            "Logging decision — model={m}, state={s}, confidence={c}",
             m=model_version_id,
             s=inferred_state,
-            c=state_confidence,
+            c=(
+                f"{state_confidence:.2f}"
+                if state_confidence is not None
+                else f"UNSCORED ({confidence_reason})"
+            ),
         )
 
         with self.engine.begin() as conn:
@@ -114,17 +149,23 @@ class DecisionJournal:
                 text("""
                     INSERT INTO decision_journal
                     (model_version_id, inferred_state, state_confidence,
-                     transition_probability, contradiction_flags,
+                     confidence_reason, transition_probability,
+                     contradiction_flags,
                      grid_recommendation, baseline_recommendation,
                      action_taken, counterfactual, operator_confidence)
                     VALUES
-                    (:mvid, :state, :sc, :tp, :cf, :gr, :br, :at, :cft, :oc)
+                    (:mvid, :state, :sc, :cr, :tp, :cf, :gr, :br, :at, :cft, :oc)
                     RETURNING id
                 """),
                 {
                     "mvid": model_version_id,
                     "state": inferred_state,
                     "sc": state_confidence,
+                    "cr": (
+                        str(confidence_reason).strip()
+                        if confidence_reason and str(confidence_reason).strip()
+                        else None
+                    ),
                     "tp": transition_probability,
                     "cf": json.dumps(contradiction_flags),
                     "gr": grid_recommendation,
@@ -336,6 +377,9 @@ if __name__ == "__main__":
     recent = journal.get_recent(10)
     if not recent.empty:
         print(f"Recent decisions ({len(recent)}):")
-        print(recent[["id", "inferred_state", "state_confidence", "verdict"]].to_string())
+        cols = ["id", "inferred_state", "state_confidence", "verdict"]
+        if "confidence_reason" in recent.columns:
+            cols.append("confidence_reason")
+        print(recent[cols].to_string())
     else:
         print("No decisions in journal yet")
