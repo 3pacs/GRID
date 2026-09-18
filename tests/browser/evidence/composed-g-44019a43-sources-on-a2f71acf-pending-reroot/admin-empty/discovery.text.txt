@@ -1,0 +1,34 @@
+DISCOVERY
+?
+ORTHOGONALITY AUDIT
+CLUSTER DISCOVERY
+HYPOTHESES
+ALL
+CANDIDATE
+TESTING
+PASSED
+FAILED
+KILLED
+PROMOTED
+No hypotheses found
+10Y
+SURFACE
+DASH
+FLOW
+REFRESH
+SEARCH
+MORE
+ASK
+Ask GRID
+×
+What should I watch?
+Explain the current regime
+Any red flags?
+What are the lever pullers doing?
+Ask GRID anything about the market, your portfolio, or the intelligence picture.
+HORIZON
+1D
+1W
+1M
+3M
+6M+

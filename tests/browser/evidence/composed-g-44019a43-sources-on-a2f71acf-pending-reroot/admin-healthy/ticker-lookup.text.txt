@@ -1,0 +1,206 @@
+DAD TICKER LOOKUP
+RXT
+Workbook match
+Get Gold
+RXT
+PURR
+EVIDENCE
+READY
+CHART
+READY
+FINVIZ
+READY
+OPTIONS
+READY
+GOLD VERDICT
+Known name in Dad's research
+
+This has enough workbook footprint to deserve a serious look.
+
+52
+WORKBOOK FOOTPRINT
+Mentions
+8
+Files
+2
+Sheets
+3
+Evidence
+9
+DAD-METHOD FIT
+Workbook depth
+8 mentions across 2 files and 3 sheets
+Named at file level
+The ticker appears in workbook or file names, not only individual cells.
+GRID DECISION STACK
+Needs more evidence
+43.2
+Hand-picked point awards over the workbook prior plus GRID price, fundamentals, options, signal, regime and freshness checks. Not a backtested or calibrated conviction score - every weight is in `weights`.
+Heuristic score from hand-picked weights (1 terms), not a backtested conviction.
+Dad workbooks
+31.2 pts
+This has enough workbook footprint to deserve a serious look.
+GRID price history
+6.0 pts
+1Y +2.0%, 0.0% from 1Y high
+Finviz fundamentals
+4.0 pts
+2 fields, fresh
+GRID options
+2.0 pts
+Latest options date 2026-09-15
+GRID signals
+0.0 pts
+0 trusted signal rows, 0 TradingView alerts
+Reasons
+Workbook prior exists, but GRID needs more current confirmation.
+Blockers
+No major blockers in the current stack.
+FINVIZ IN POSTGRES
+ready
+2 fields
+fresh
+2026-09-15
+Sector
+Technology
+P/E
+18.00
+GRID FRESHNESS
+Source age
+yfinance
+fresh
+6.0h
+Finviz
+missing
+-
+TradingView
+missing
+-
+Social_Smart_Money
+missing
+-
+SEC_INSIDER
+missing
+-
+Unusual_Whales
+missing
+-
+CHART LANE
+RXT vs Dad's chart question
+$100
++2.0% over 1Y
+Open TradingView
+Symbol search
+RXT chart lane ready
+PRICE
+H: $100 · L: $98
+1W
+1M
+3M
+6M
+1Y
+$98
+$99
+$99
+$100
+$100
+Sep 10
+Sep 11
+Sep 12
+Sep 13
+Sep 14
+
+TradingView webhooks are supported when your alerts post into GRID. The button opens your TradingView chart/session for this symbol.
+
+DAD STATS
+What to show him first
+Chart Quality
+
+Dad checks whether the long-term chart is up-and-right and whether it recovered from prior highs.
+
+Workbook hit: historical, cagr
+Benchmark Fit
+
+He thinks in S&P/QQQ context: what sector or theme am I overweight, missing, or duplicating?
+
+Compare against QQQ/SPY and show whether it adds a new role or just repeats existing exposure.
+Prudent Entry
+
+His buy decision wants zones: speculative, prudent, and back-up-the-truck levels.
+
+Show valuation context, current price versus target zones, and reason not to buy yet.
+Options / Yield
+
+He uses covered calls and spreads to define payoff, premium, stop, and take-profit.
+
+Show premium, days to expiry, return if exercised, max loss, take-profit, and stop-loss.
+Portfolio Role
+
+He wants to know what account, sleeve, and allocation role a name belongs in.
+
+Workbook hit: portfolio
+Risk Control
+
+The spreadsheet language repeatedly checks downside, distance from high, stop-loss, and drawdown.
+
+Show what can break the thesis, downside level, debt/liquidity risk, and exit trigger.
+SOURCE LANES
+Keep Dad, Anik, and gamble evidence separate
+Other Workbook
+8 hits
+Dad Method
+6 hits
+
+This prevents Anik/main portfolio sheets and option logs from being mistaken for Dad's own long-term method.
+
+EVIDENCE ROWS
+Workbook hits
+File	Sheet	Cell	Evidence	Score
+test_workbook_2026.xlsx	Watchlist	B12	
+TEST1 target multiple
+Column: Ticker
+	4.0
+test_workbook_2026_TEST1.xlsx	Summary	A1	
+TEST1 historical CAGR vs QQQ
+	5.0
+TOP FILES
+Where it appears
+test_workbook_2026.xlsx
+6 mentions · score 9
+RISK CHECK
+Before acting
+Workbook footprint is historical evidence, not a live buy/sell recommendation.
+Current price, fundamentals, news, and liquidity still need a fresh market check.
+NEXT CHECKS
+Review queue
+Compare the workbook evidence against a current chart and fundamentals pass.
+Check whether Dad's workbook language is buy, watch, hold, or sell before acting.
+SHEET CONCENTRATION
+Strongest worksheet matches
+Watchlist
+test_workbook_2026.xlsx
+4 mentions · score 6
+Summary
+test_workbook_2026_TEST1.xlsx
+2 mentions · score 5
+10Y
+SURFACE
+DASH
+FLOW
+REFRESH
+SEARCH
+MORE
+ASK
+Ask GRID
+×
+What should I watch?
+Explain the current regime
+Any red flags?
+What are the lever pullers doing?
+Ask GRID anything about the market, your portfolio, or the intelligence picture.
+HORIZON
+1D
+1W
+1M
+3M
+6M+

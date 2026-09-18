@@ -1,0 +1,90 @@
+DAD TICKER LOOKUP
+RXT
+Waiting
+Get Gold
+RXT
+PURR
+GOLD VERDICT
+Looking...
+
+Run a ticker to pull the workbook evidence.
+
+0
+WORKBOOK FOOTPRINT
+Mentions
+0
+Files
+0
+Sheets
+0
+Evidence
+0
+DAD-METHOD FIT
+No fit signals yet
+Lookup needs workbook evidence before scoring fit.
+FINVIZ IN POSTGRES
+unavailable
+0 fields
+missing
+no date
+
+No Finviz snapshot rows found for this ticker yet.
+
+GRID FRESHNESS
+Source age
+
+Freshness data unavailable.
+
+CHART LANE
+RXT vs Dad's chart question
+Price loading
+Needs market history
+Loading chart...
+PRICE
+1W
+1M
+3M
+6M
+1Y
+No price data for this period
+
+TradingView webhooks are supported when your alerts post into GRID. The button opens your TradingView chart/session for this symbol.
+
+DAD STATS
+What to show him first
+EVIDENCE ROWS
+Workbook hits
+No workbook evidence rows found for this ticker.
+TOP FILES
+Where it appears
+
+No matching files yet.
+
+RISK CHECK
+Before acting
+NEXT CHECKS
+Review queue
+GRID
+10Y
+CANVAS
+SURFACE
+DASH
+FLOW
+ACTORS
+RISK
+SIGNAL
+Ctrl+K
+MORE
+Ask GRID
+×
+What should I watch?
+Explain the current regime
+Any red flags?
+What are the lever pullers doing?
+Ask GRID anything about the market, your portfolio, or the intelligence picture.
+HORIZON
+1D
+1W
+1M
+3M
+6M+
