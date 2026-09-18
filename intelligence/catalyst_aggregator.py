@@ -5,8 +5,12 @@ a single ranked stream the oracle can score against:
 
   * ``earnings_calendar``   — quarterly earnings dates per ticker
   * ``catalyst_calendar``   — clinical trial readouts (trial_signals path)
-  * Hard-coded FOMC dates   — Fed meeting calendar for 2026
   * Computed OPEX dates     — third Friday of each month + quarterly OPEX
+
+There is deliberately NO macro (FOMC / CPI) stream: GRID ingests no macro
+event calendar, so there is nothing to aggregate. Scheduled Fed and BLS
+dates are not stored anywhere with a source and an as_of, and this module
+will not hand-type them — see ``MACRO_CALENDAR_UNAVAILABLE_REASON``.
 
 The Tier A shortlist (#102) puts this at ~1.5% Brier lift on the ~30%
 of trades that fall inside a known catalyst window. The lift comes from
@@ -68,21 +72,18 @@ _CATALYST_IMPACT: dict[str, float] = {
 }
 
 
-# ── Hard-coded FOMC calendar ───────────────────────────────────────────────
-# 2026 FOMC dates published by the Fed. Dates are the SECOND day of each
-# two-day meeting (the day the rate decision + dot plot drops). Update
-# annually when the Fed publishes the next year's calendar.
+# ── Macro event calendar: not ingested ─────────────────────────────────────
+# This module used to carry a hand-typed list of FOMC meeting dates and
+# emit them as catalysts. They were never observed or ingested — nothing in
+# GRID pulls the Fed or BLS release calendar into a table with a source and
+# an as_of — so a stale or wrong list silently became "data". The list is
+# gone. ``CATALYST_FOMC`` stays as a type tag so a real macro-calendar
+# puller can populate it later; until one exists, no FOMC event is emitted
+# and consumers see a calendar with no macro events in it.
 
-_FOMC_DATES_2026: list[date] = [
-    date(2026, 1, 28),
-    date(2026, 3, 18),
-    date(2026, 4, 29),
-    date(2026, 6, 17),
-    date(2026, 7, 29),
-    date(2026, 9, 16),
-    date(2026, 11, 4),
-    date(2026, 12, 16),
-]
+MACRO_CALENDAR_UNAVAILABLE_REASON = (
+    "no ingested macro event calendar; scheduled FOMC/CPI dates are not stored"
+)
 
 
 # ── Data class ─────────────────────────────────────────────────────────────
@@ -257,21 +258,15 @@ def _read_clinical_events(
 
 
 def _seeded_market_events(*, start: date, end: date) -> list[CatalystEvent]:
-    """Return FOMC + OPEX events within [start, end]. No DB I/O."""
-    events: list[CatalystEvent] = []
+    """Return computed market-wide events within [start, end]. No DB I/O.
 
-    # FOMC
-    for d in _FOMC_DATES_2026:
-        if start <= d <= end:
-            events.append(CatalystEvent(
-                ticker=None,
-                event_type=CATALYST_FOMC,
-                event_date=d,
-                confidence_window_days=2,
-                source="fomc_seed_2026",
-                notes="FOMC rate decision + dot plot",
-                impact=_CATALYST_IMPACT[CATALYST_FOMC],
-            ))
+    OPEX only. Monthly/quarterly expiry is a rule of the listing calendar
+    (third Friday), not an observation, so it can be computed. Macro
+    events cannot: see ``MACRO_CALENDAR_UNAVAILABLE_REASON``. A window with
+    no OPEX in it therefore returns an empty list — an honest "nothing
+    scheduled that we know of", not a placeholder.
+    """
+    events: list[CatalystEvent] = []
 
     # OPEX — generate for any year that intersects the window
     years = {start.year, end.year}
@@ -320,7 +315,10 @@ def events_for_window(
     Returns
     -------
     A list of :class:`CatalystEvent`, sorted by event_date then by
-    catalyst priority (FOMC first within a tie).
+    catalyst priority. The list is empty when nothing is stored or
+    computed for the window; it never contains a placeholder event. No
+    macro (FOMC / CPI) events are ever returned because GRID stores no
+    macro calendar — see ``MACRO_CALENDAR_UNAVAILABLE_REASON``.
     """
     if start is None:
         start = date.today()
@@ -395,10 +393,16 @@ def proximity_score(
 
         score = impact × exp(-days_to_event / 5)
 
-    so a top-impact catalyst (FOMC) at d=0 gives 1.0, at d=5 gives ~0.37,
-    at d=14 gives ~0.06, at d=30 gives ~0.002. Window density adds a
-    small additive bump (capped) so a week packed with three earnings +
-    an FOMC scores higher than the same FOMC in isolation.
+    so a catalyst of impact 1.0 at d=0 gives 1.0, at d=5 gives ~0.37, at
+    d=14 gives ~0.06, at d=30 gives ~0.002. Window density adds a small
+    additive bump (capped) so a week packed with three earnings scores
+    higher than one earnings date in isolation.
+
+    A window with no known catalyst scores 0.0 with ``nearest: None``.
+    That is "we know of nothing", not "nothing is happening": the macro
+    calendar is not ingested, so an FOMC week looks empty here. Callers
+    must treat 0.0 as absence of evidence and leave their own number
+    untouched — never as a confidence boost.
     """
     import math
 

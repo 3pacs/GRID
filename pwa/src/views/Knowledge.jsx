@@ -63,14 +63,14 @@ const styles = {
     metaText: {
         fontSize: '11px', color: colors.textMuted,
     },
-    confidenceBar: (val) => ({
+    heuristicBar: {
         width: '60px', height: '4px', borderRadius: '2px',
         background: colors.border, position: 'relative', display: 'inline-block',
-    }),
-    confidenceFill: (val) => ({
+    },
+    heuristicFill: (val) => ({
         width: `${Math.round((val || 0) * 100)}%`, height: '100%',
         borderRadius: '2px', position: 'absolute', top: 0, left: 0,
-        background: val > 0.7 ? colors.green : val > 0.4 ? colors.yellow : colors.red,
+        background: colors.textMuted,
     }),
     backButton: {
         background: 'none', border: 'none', cursor: 'pointer',
@@ -87,13 +87,24 @@ const styles = {
     },
 };
 
-function ConfidenceBar({ value }) {
+// The API used to send `confidence` here. It was never a model confidence:
+// it is a shape-of-the-text heuristic over the answer (length, hedging, and
+// a bonus for containing more $/% tokens), so it is labelled as one and
+// carries its own inputs. Nothing is drawn when the score is absent.
+function AnswerHeuristicBar({ entry }) {
+    const value = entry?.answer_heuristic_score;
+    if (value == null) return null;
+    const inputs = entry.answer_heuristic_inputs || {};
+    const title = Object.entries(inputs).map(([k, v]) => `${k}=${v}`).join(', ');
     return (
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-            <span style={styles.confidenceBar(value)}>
-                <span style={styles.confidenceFill(value)} />
+        <span
+            style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+            title={`text-shape heuristic, not a confidence: ${title}`}
+        >
+            <span style={styles.heuristicBar}>
+                <span style={styles.heuristicFill(value)} />
             </span>
-            <span style={styles.metaText}>{Math.round((value || 0) * 100)}%</span>
+            <span style={styles.metaText}>text-shape {Math.round(value * 100)}</span>
         </span>
     );
 }
@@ -135,7 +146,7 @@ function EntryDetail({ entry, related, onBack, onSelect }) {
                     <span style={shared.badge(categoryColors[entry.category] || '#3A4A5A')}>
                         {(entry.category || 'general').toUpperCase()}
                     </span>
-                    <ConfidenceBar value={entry.confidence} />
+                    <AnswerHeuristicBar entry={entry} />
                     <span style={styles.metaText}>{entry.source_model}</span>
                 </div>
 
@@ -326,7 +337,7 @@ export default function Knowledge() {
                             <span style={shared.badge(categoryColors[entry.category] || '#3A4A5A')}>
                                 {(entry.category || 'general').toUpperCase()}
                             </span>
-                            <ConfidenceBar value={entry.confidence} />
+                            <AnswerHeuristicBar entry={entry} />
                             <span style={styles.metaText}>{entry.source_model}</span>
                         </div>
 

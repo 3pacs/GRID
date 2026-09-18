@@ -217,6 +217,9 @@ _SELECT_SCORED_ROWS = text(
     WHERE verdict IN ('hit', 'miss', 'partial')
       AND created_at >= NOW() - (:days || ' days')::INTERVAL
       AND horizon_days = :h
+      -- An unstated confidence has no probability to score: excluded here
+      -- rather than coerced to a stated 0% by the loader below.
+      AND confidence IS NOT NULL
     ORDER BY created_at ASC
     """
 )
@@ -230,6 +233,7 @@ _SELECT_SCORED_ROWS_TICKER = text(
       AND created_at >= NOW() - (:days || ' days')::INTERVAL
       AND horizon_days = :h
       AND ticker = :ticker
+      AND confidence IS NOT NULL
     ORDER BY created_at ASC
     """
 )
@@ -289,8 +293,12 @@ def _fetch_rows(
     for r in raw_rows:
         try:
             created_at = r[1]
+            if r[2] is None:
+                # Unstated confidence: excluded from the Brier comparison
+                # rather than counted as a stated 0%.
+                continue
             try:
-                confidence = float(r[2] or 0.0)
+                confidence = float(r[2])
             except (TypeError, ValueError):
                 continue
             confidence = max(0.0, min(1.0, confidence))

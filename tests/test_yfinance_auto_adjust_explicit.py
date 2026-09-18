@@ -244,7 +244,13 @@ def test_watchlist_live_price_history_fallback_passes_auto_adjust_false():
 # ── 6. Guard: no live yfinance call site may rely on the library default ───
 
 def test_no_unspecified_auto_adjust_in_live_price_paths():
-    """Every ``yf.download`` in the live price stack states its basis.
+    """Every yfinance price call in the live stack states its basis.
+
+    Covers both ``yf.download(...)`` and ``Ticker(...).history(...)`` — the
+    latter defaults to ``auto_adjust=True`` too, and
+    ``api/routers/watchlist_analysis.py`` relied on that default while
+    serving the result as ``price_source: "yfinance"`` *and* caching it into
+    ``raw_series`` next to raw closes (audit C-M13).
 
     Scripted one-off loaders under ``scripts/`` are intentionally excluded —
     this guard covers the always-on service code.
@@ -256,7 +262,7 @@ def test_no_unspecified_auto_adjust_in_live_price_paths():
     packages = ["api", "ingestion", "intelligence", "trading", "backtest"]
 
     offenders: list[str] = []
-    call_re = re.compile(r"yf\.download\s*\(", re.MULTILINE)
+    call_re = re.compile(r"yf\.download\s*\(|\.history\s*\(", re.MULTILINE)
 
     for pkg in packages:
         for path in (root / pkg).rglob("*.py"):
@@ -284,7 +290,7 @@ def test_no_unspecified_auto_adjust_in_live_price_paths():
                     offenders.append(f"{path.relative_to(root)}:{line}")
 
     assert offenders == [], (
-        "yf.download() call sites relying on the library default for "
+        "yfinance call sites relying on the library default for "
         "auto_adjust (it is True in yfinance 0.2.x+, which silently returns "
         f"split/dividend-adjusted OHLC): {offenders}"
     )

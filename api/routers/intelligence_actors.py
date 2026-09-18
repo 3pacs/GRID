@@ -15,6 +15,11 @@ from api.lf_helpers import (
     set_input as _lf_set_input,
     user_id_from_token as _lf_user_id_from_token,
 )
+from intelligence.actors.provenance import (
+    SOURCE_SECTOR_MAP,
+    actor_source,
+    source_as_of,
+)
 from utils.ttl_cache import TTLCache
 
 router = APIRouter(tags=["intelligence"])
@@ -1019,10 +1024,14 @@ def get_sector_power_map(
             "trust": float(row[4]) if row[4] else 0.5,
             "net_worth": float(row[5]) if row[5] else None,
             "title": row[6],
+            "source": actor_source(aid),
+            "source_as_of": source_as_of(aid),
         }
 
     if not actor_map:
-        # Fallback: build from sector_map data alone (no DB matches)
+        # Fallback: build from sector_map data alone (no DB matches). These
+        # are not actors rows at all -- they come from the curated
+        # analysis/sector_map_data.yaml ontology, so they say so.
         nodes = []
         for a in sector_actors[:25]:
             nodes.append({
@@ -1033,6 +1042,8 @@ def get_sector_power_map(
                 "trust": 0.5,
                 "ticker": a.get("ticker"),
                 "subsector": a.get("subsector"),
+                "source": SOURCE_SECTOR_MAP,
+                "source_as_of": None,
             })
         return {
             "nodes": nodes,
@@ -1116,6 +1127,8 @@ def get_sector_power_map(
                         "trust": float(nr[4]) if nr[4] else 0.5,
                         "net_worth": float(nr[5]) if nr[5] else None,
                         "title": nr[6],
+                        "source": actor_source(nr[0]),
+                        "source_as_of": source_as_of(nr[0]),
                     }
 
     # Step 5: Merge sector_map metadata (ticker, subsector, price) into nodes
@@ -1148,6 +1161,8 @@ def get_sector_power_map(
                 "ticker": a["ticker"],
                 "subsector": a.get("subsector"),
                 "synthetic": True,
+                "source": SOURCE_SECTOR_MAP,
+                "source_as_of": None,
             }
 
     nodes = []
@@ -1280,6 +1295,8 @@ def get_ego_graph(
                     "net_worth": float(row[6]) if row[6] else None,
                     "title": row[7],
                     "ring": ring,
+                    "source": actor_source(aid),
+                    "source_as_of": source_as_of(aid),
                 }
                 ring_map[aid] = ring
 
@@ -1703,6 +1720,8 @@ def get_grand_power_map(
                     "net_worth": float(a[6]) if a[6] else None,
                     "title": a[7],
                     "degree": int(a[9]) if len(a) > 9 else 0,
+                    "source": actor_source(a[0]),
+                    "source_as_of": source_as_of(a[0]),
                 })
 
             # Find connections between top actors (lower threshold for grand map)
@@ -1790,6 +1809,8 @@ def get_grand_power_map(
                                 "title": a[7],
                                 "bridge": True,
                                 "degree": 0,
+                                "source": actor_source(a[0]),
+                                "source_as_of": source_as_of(a[0]),
                             })
 
             # Wealth flows involving top actors (as source or target)
