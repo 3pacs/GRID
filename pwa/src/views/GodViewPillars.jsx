@@ -77,6 +77,27 @@ function ProvenanceBadge({ provenance, availability }) {
     );
 }
 
+function InferredBadge({ basis, note }) {
+    if (!basis || basis === 'observed_acquisition') return null;
+    const label = basis === 'inferred_schedule' ? 'inferred' : 'basis unknown';
+    return (
+        <span
+            title={note || ''}
+            data-testid="inferred-badge"
+            style={{
+                fontSize: 10,
+                color: colors.yellow,
+                border: `1px solid ${colors.yellow}`,
+                borderRadius: 4,
+                padding: '1px 5px',
+                marginLeft: 4,
+            }}
+        >
+            {label}
+        </span>
+    );
+}
+
 function FieldRow({ name, field }) {
     if (!field) return null;
     return (
@@ -97,7 +118,10 @@ function FieldRow({ name, field }) {
                     {field.unit ? <span style={{ fontSize: 11, color: colors.textMuted, marginLeft: 4 }}>{field.unit}</span> : null}
                 </div>
             </div>
-            <ProvenanceBadge provenance={field.provenance} availability={field.availability} />
+            <div>
+                <ProvenanceBadge provenance={field.provenance} availability={field.availability} />
+                <InferredBadge basis={field.availability_basis} note={field.availability_basis_note} />
+            </div>
             <div style={{ fontSize: 10, color: colors.textMuted, textAlign: 'right' }}>
                 <div>pub {fmtDateTime(field.published_at)}</div>
                 <div>avail {fmtDateTime(field.available_at)}</div>
@@ -219,6 +243,7 @@ function NotBuiltCard({ label }) {
 
 export default function GodViewPillars() {
     const [asOf, setAsOf] = useState(() => new Date().toISOString().substring(0, 10));
+    const [includeInferred, setIncludeInferred] = useState(false);
     const [data, setData] = useState(null);
     const [error, setError] = useState(null);
     const [loading, setLoading] = useState(true);
@@ -227,7 +252,8 @@ export default function GodViewPillars() {
         let cancelled = false;
         setLoading(true);
         setError(null);
-        api.get(`/api/v1/godview/pillars/cftc?as_of=${encodeURIComponent(asOf)}`)
+        const qs = `as_of=${encodeURIComponent(asOf)}&include_inferred=${includeInferred ? 'true' : 'false'}`;
+        api.get(`/api/v1/godview/pillars/cftc?${qs}`)
             .then((res) => {
                 if (!cancelled) setData(res);
             })
@@ -240,21 +266,33 @@ export default function GodViewPillars() {
         return () => {
             cancelled = true;
         };
-    }, [asOf]);
+    }, [asOf, includeInferred]);
 
     return (
         <div style={{ padding: 20, maxWidth: 720 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 16 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 16, gap: 12, flexWrap: 'wrap' }}>
                 <h2 style={{ color: colors.text, margin: 0 }}>God View — Institutional Pillars</h2>
-                <label style={{ fontSize: 12, color: colors.textDim }}>
-                    as of{' '}
-                    <input
-                        type="date"
-                        value={asOf}
-                        onChange={(e) => setAsOf(e.target.value)}
-                        style={{ background: colors.card, color: colors.text, border: `1px solid ${colors.border}`, borderRadius: 4, padding: '2px 6px' }}
-                    />
-                </label>
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: 12 }}>
+                    <label style={{ fontSize: 12, color: colors.textDim }}>
+                        <input
+                            type="checkbox"
+                            checked={includeInferred}
+                            onChange={(e) => setIncludeInferred(e.target.checked)}
+                            data-testid="include-inferred-toggle"
+                            style={{ marginRight: 4 }}
+                        />
+                        include inferred (backfilled/revised)
+                    </label>
+                    <label style={{ fontSize: 12, color: colors.textDim }}>
+                        as of{' '}
+                        <input
+                            type="date"
+                            value={asOf}
+                            onChange={(e) => setAsOf(e.target.value)}
+                            style={{ background: colors.card, color: colors.text, border: `1px solid ${colors.border}`, borderRadius: 4, padding: '2px 6px' }}
+                        />
+                    </label>
+                </div>
             </div>
 
             {loading ? <CftcPillarCard data={null} error={null} /> : <CftcPillarCard data={data} error={error} />}

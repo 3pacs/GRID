@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { api } from '../api.js';
 
@@ -155,5 +155,49 @@ describe('GodViewPillars view', () => {
 
         await waitFor(() => expect(screen.getAllByTestId('pillar-card-not-built').length).toBe(6));
         expect(screen.getAllByText('not built yet — no data').length).toBe(6);
+    });
+
+    it('shows an inferred badge for a field whose availability_basis is inferred_schedule', async () => {
+        api.get.mockResolvedValue({
+            available: true,
+            status: 'partial',
+            as_of: '2026-09-18',
+            include_inferred: true,
+            coverage: 1.0,
+            contracts_with_data: 4,
+            contracts_expected: 4,
+            stale_reason: null,
+            generation_id: 'gen-inferred',
+            generation_published_at: '2026-09-18T12:00:00+00:00',
+            contracts: { SP500: 'ES', NOTE10Y: 'ZN', GOLD: 'GC', CRUDE_OIL: 'CL' },
+            fields: {
+                ES: {
+                    total_open_interest: {
+                        availability: 'available', provenance: 'measured', value: 2500000, unit: 'contracts',
+                        published_at: '2026-01-09', available_at: '2026-03-20T10:00:00+00:00', ingested_at: null,
+                        availability_basis: 'inferred_schedule',
+                        availability_basis_note: 'availability inferred from schedule; record revised/backfilled',
+                    },
+                },
+            },
+        });
+
+        render(<GodViewPillars />);
+
+        await waitFor(() => expect(screen.getByTestId('cftc-pillar-card')).toHaveAttribute('data-state', 'available'));
+        expect(screen.getByTestId('inferred-badge')).toBeInTheDocument();
+        expect(screen.getByTestId('inferred-badge')).toHaveTextContent('inferred');
+    });
+
+    it('re-fetches with include_inferred=true when the toggle is checked', async () => {
+        api.get.mockResolvedValue({ available: false, reason: 'never_configured' });
+
+        render(<GodViewPillars />);
+
+        await waitFor(() => expect(api.get).toHaveBeenCalledWith(expect.stringContaining('include_inferred=false')));
+
+        fireEvent.click(screen.getByTestId('include-inferred-toggle'));
+
+        await waitFor(() => expect(api.get).toHaveBeenCalledWith(expect.stringContaining('include_inferred=true')));
     });
 });

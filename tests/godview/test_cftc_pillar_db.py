@@ -10,12 +10,14 @@ shared database.
 from __future__ import annotations
 
 import uuid
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import text
 
 from godview.cftc_pillar import (
+    AVAILABILITY_BASIS_INFERRED,
+    AVAILABILITY_BASIS_OBSERVED,
     CFTC_PILLAR_CONTRACTS,
     PILLAR_NAME,
     materialize_cftc_pillar,
@@ -52,6 +54,39 @@ def _insert_raw_series(conn, contract_key: str, records: list[dict], *, source_i
                     "src": source_id,
                     "od": parsed.report_date,
                     "val": value,
+                },
+            )
+
+
+def _insert_raw_series_at(
+    conn, contract_key: str, records: list[dict], *, source_id: int, pull_timestamp: datetime
+) -> None:
+    """Like ``_insert_raw_series`` but with an explicit pull_timestamp.
+
+    Used to simulate a backfill (a pull_timestamp far after the schedule
+    would place it) or a revision (a second pull_timestamp for a report_date
+    that already has an earlier one) -- raw_series.pull_timestamp otherwise
+    defaults to NOW() at insert time, which can't simulate either.
+    """
+    from godview.cftc_pillar import parse_cot_record
+
+    for record in records:
+        parsed = parse_cot_record(record)
+        if parsed is None:
+            continue
+        for metric, value in parsed.metrics.items():
+            conn.execute(
+                text(
+                    "INSERT INTO raw_series (series_id, source_id, obs_date, value, "
+                    "pull_timestamp, pull_status) "
+                    "VALUES (:sid, :src, :od, :val, :pts, 'SUCCESS')"
+                ),
+                {
+                    "sid": _build_series_id(contract_key, metric),
+                    "src": source_id,
+                    "od": parsed.report_date,
+                    "val": value,
+                    "pts": pull_timestamp,
                 },
             )
 
@@ -95,6 +130,7 @@ def test_migration_added_pit_columns_and_generations_table(godview_pg_engine):
         for expected in (
             "release_date", "available_at", "provenance",
             "generation_id", "coverage_fraction", "source_ref",
+            "availability_basis",
         ):
             assert expected in cols
 
@@ -245,6 +281,111 @@ def test_partial_refresh_cannot_expose_a_mixed_generation(godview_pg_engine, sou
     with engine.begin() as conn:
         read = read_cftc_pillar(conn, as_of_date + timedelta(days=10), contracts=contracts)
     assert all(r["contract_code"] != contract_code for r in read.rows)
+
+
+def test_availability_basis_first_release_is_observed_and_included_by_default(
+    godview_pg_engine, source_id
+):
+    """A single, on-schedule pull -> observed_acquisition, visible without include_inferred."""
+    engine = godview_pg_engine
+    contract_key = f"AVOBS_{uuid.uuid4().hex[:8]}"
+    contract_code = f"O{uuid.uuid4().hex[:6]}"
+    contracts = {contract_key: {"contract_code": contract_code, "contract_name": "Basis Observed", "asset_class": "test"}}
+    records = build_cot_records(n_weeks=1, start_date=date(2026, 9, 15))  # a Tuesday
+    report_date = date(2026, 9, 15)
+    release_date = report_date + timedelta(days=3)  # Friday
+    on_schedule_pull = datetime.combine(release_date, datetime.min.time(), tzinfo=timezone.utc) + timedelta(hours=20)
+
+    with engine.begin() as conn:
+        _insert_raw_series_at(conn, contract_key, records, source_id=source_id, pull_timestamp=on_schedule_pull)
+
+    result = materialize_cftc_pillar(engine, as_of=report_date, contracts=contracts)
+    assert result.status == "SUCCESS"
+
+    with engine.begin() as conn:
+        row = conn.execute(
+            text("SELECT availability_basis FROM cftc_positioning_daily WHERE contract_code = :c"),
+            {"c": contract_code},
+        ).fetchone()
+    assert row[0] == AVAILABILITY_BASIS_OBSERVED
+
+    with engine.begin() as conn:
+        default_read = read_cftc_pillar(conn, release_date, contracts=contracts)
+    assert any(r["contract_code"] == contract_code for r in default_read.rows)
+
+
+def test_availability_basis_backfill_is_inferred_and_excluded_unless_flagged(
+    godview_pg_engine, source_id
+):
+    """A pull weeks after the schedule -> inferred_schedule, excluded by default, admitted+labelled with include_inferred."""
+    engine = godview_pg_engine
+    contract_key = f"AVBACK_{uuid.uuid4().hex[:8]}"
+    contract_code = f"B{uuid.uuid4().hex[:6]}"
+    contracts = {contract_key: {"contract_code": contract_code, "contract_name": "Basis Backfill", "asset_class": "test"}}
+    report_date = date(2026, 3, 3)  # a Tuesday
+    records = build_cot_records(n_weeks=1, start_date=report_date)
+    release_date = report_date + timedelta(days=3)
+    backfill_pull = datetime.combine(release_date, datetime.min.time(), tzinfo=timezone.utc) + timedelta(weeks=20)
+
+    with engine.begin() as conn:
+        _insert_raw_series_at(conn, contract_key, records, source_id=source_id, pull_timestamp=backfill_pull)
+
+    result = materialize_cftc_pillar(engine, as_of=backfill_pull.date(), contracts=contracts)
+    assert result.status == "SUCCESS"
+
+    with engine.begin() as conn:
+        row = conn.execute(
+            text("SELECT availability_basis FROM cftc_positioning_daily WHERE contract_code = :c"),
+            {"c": contract_code},
+        ).fetchone()
+    assert row[0] == AVAILABILITY_BASIS_INFERRED
+
+    as_of = backfill_pull.date() + timedelta(days=1)
+    with engine.begin() as conn:
+        default_read = read_cftc_pillar(conn, as_of, contracts=contracts)
+        inferred_read = read_cftc_pillar(conn, as_of, contracts=contracts, include_inferred=True)
+
+    assert all(r["contract_code"] != contract_code for r in default_read.rows)
+    inferred_row = next(r for r in inferred_read.rows if r["contract_code"] == contract_code)
+    assert inferred_row["availability_basis"] == AVAILABILITY_BASIS_INFERRED
+
+
+def test_availability_basis_revised_report_date_labels_the_materialized_vintage_inferred(
+    godview_pg_engine, source_id
+):
+    """Two pulls for the same report_date (a CFTC revision) -> the vintage that gets
+    materialized (the latest, per LATEST_AS_OF) is inferred, never observed for the
+    original release -- even though its own timing alone might look on-schedule."""
+    engine = godview_pg_engine
+    contract_key = f"AVREV_{uuid.uuid4().hex[:8]}"
+    contract_code = f"R{uuid.uuid4().hex[:6]}"
+    contracts = {contract_key: {"contract_code": contract_code, "contract_name": "Basis Revised", "asset_class": "test"}}
+    report_date = date(2026, 5, 5)  # a Tuesday
+    release_date = report_date + timedelta(days=3)
+    records = build_cot_records(n_weeks=1, start_date=report_date)
+
+    original_pull = datetime.combine(release_date, datetime.min.time(), tzinfo=timezone.utc) + timedelta(hours=5)
+    revision_pull = original_pull + timedelta(weeks=6)
+
+    with engine.begin() as conn:
+        _insert_raw_series_at(conn, contract_key, records, source_id=source_id, pull_timestamp=original_pull)
+        _insert_raw_series_at(conn, contract_key, records, source_id=source_id, pull_timestamp=revision_pull)
+
+    result = materialize_cftc_pillar(engine, as_of=revision_pull.date(), contracts=contracts)
+    assert result.status == "SUCCESS"
+    assert result.rows_written == 1  # still exactly one row for this report_date
+
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(
+                "SELECT availability_basis, available_at FROM cftc_positioning_daily "
+                "WHERE contract_code = :c"
+            ),
+            {"c": contract_code},
+        ).mappings().fetchone()
+    assert row["availability_basis"] == AVAILABILITY_BASIS_INFERRED
+    # The stored available_at reflects the (later) winning pull, per LATEST_AS_OF.
+    assert row["available_at"] >= revision_pull - timedelta(seconds=1)
 
 
 def test_api_contract_never_configured_for_unknown_pillar_state(godview_pg_engine):

@@ -21,9 +21,13 @@ from sqlalchemy import text
 from api.auth import require_auth
 from api.dependencies import get_db_engine
 from godview.cftc_pillar import (
+    AVAILABILITY_BASIS_INFERRED,
+    AVAILABILITY_BASIS_UNKNOWN,
     CFTC_PILLAR_CONTRACTS,
+    INFERRED_BASIS_NOTE,
     PILLAR_NAME,
     STALE_AFTER_DAYS,
+    UNKNOWN_BASIS_NOTE,
     read_cftc_pillar,
 )
 from store.availability import unavailable
@@ -77,8 +81,25 @@ def _table_exists(conn: Any, table_name: str) -> bool:
         return False
 
 
+def _availability_basis_note(basis: str | None) -> str | None:
+    """Human-readable caveat for a non-observed basis. See contract doc section 10."""
+    if basis == AVAILABILITY_BASIS_INFERRED:
+        return INFERRED_BASIS_NOTE
+    if basis == AVAILABILITY_BASIS_UNKNOWN:
+        return UNKNOWN_BASIS_NOTE
+    return None
+
+
 def _row_to_field_records(row: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """One FieldRecord per positioning value, per contract doc section 4's two-layer split."""
+    """One FieldRecord per positioning value, per contract doc section 4's two-layer split.
+
+    Every field's dict also carries ``availability_basis`` and
+    ``availability_basis_note`` as SIBLING keys alongside the vendored
+    FieldRecord's own ``to_dict()`` output (contract doc section 10) --
+    deliberately not folded into FieldRecord itself, which is vendored
+    verbatim from feat/availability-provenance-contract and must not diverge
+    further from that upstream shape before it merges.
+    """
     out: dict[str, dict[str, Any]] = {}
     common = {
         "obs_date": row["report_date"],
@@ -88,13 +109,19 @@ def _row_to_field_records(row: dict[str, Any]) -> dict[str, dict[str, Any]]:
         "source_catalog": "raw_series:cftc",
         "series_id": row["contract_code"],
     }
+    basis = row.get("availability_basis")
+    basis_note = _availability_basis_note(basis)
+
     for name, unit in _RAW_FIELD_UNIT.items():
-        out[name] = measured_field(row[name], unit=unit, **common).to_dict()
+        record = measured_field(row[name], unit=unit, **common).to_dict()
+        record["availability_basis"] = basis
+        record["availability_basis_note"] = basis_note
+        out[name] = record
 
     for name, unit in _DERIVED_FIELD_UNIT.items():
         value = row[name]
         if value is None:
-            out[name] = unavailable_field(
+            record = unavailable_field(
                 STALE_PARTIAL_HISTORY,
                 unit=unit,
                 calculation_version="cftc_pillar_v1",
@@ -102,19 +129,30 @@ def _row_to_field_records(row: dict[str, Any]) -> dict[str, dict[str, Any]]:
                 **common,
             ).to_dict()
         else:
-            out[name] = derived_field(
+            record = derived_field(
                 value,
                 unit=unit,
                 calculation_version="cftc_pillar_v1",
                 coverage_fraction=row["coverage_fraction"],
                 **common,
             ).to_dict()
+        record["availability_basis"] = basis
+        record["availability_basis_note"] = basis_note
+        out[name] = record
     return out
 
 
 @router.get("/pillars/cftc")
 def get_cftc_pillar(
     as_of: date | None = Query(default=None),
+    include_inferred: bool = Query(
+        default=False,
+        description=(
+            "Admit availability_basis='inferred_schedule'/'unknown' rows "
+            "(revised/backfilled records). Strict PIT default is False -- "
+            "observed_acquisition rows only. See contract doc section 10."
+        ),
+    ),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Strict-PIT read of the CFTC positioning pillar as of ``as_of`` (default today)."""
@@ -133,7 +171,9 @@ def get_cftc_pillar(
                     coverage=None,
                 )
 
-            result = read_cftc_pillar(conn, as_of, contracts=CFTC_PILLAR_CONTRACTS)
+            result = read_cftc_pillar(
+                conn, as_of, contracts=CFTC_PILLAR_CONTRACTS, include_inferred=include_inferred
+            )
     except Exception as exc:  # noqa: BLE001 -- never 500 on a data-layer surprise
         return unavailable(
             f"godview read failed: {exc}",
@@ -168,6 +208,7 @@ def get_cftc_pillar(
         "status": "ok" if coverage == 1.0 and stale_reason is None else "partial",
         "pillar": PILLAR_NAME,
         "as_of": as_of.isoformat(),
+        "include_inferred": include_inferred,
         "coverage": coverage,
         "contracts_with_data": result.contracts_with_data,
         "contracts_expected": result.contracts_expected,

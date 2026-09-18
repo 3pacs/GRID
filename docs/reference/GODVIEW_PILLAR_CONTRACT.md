@@ -163,6 +163,12 @@ from *strict-PIT* reads: `GET /api/v1/godview/pillars/cftc?as_of=` filters
 | a complete generation exists; the newest qualifying `release_date` is more than 10 days before `as_of` | `available=true`, `stale_reason="stale"` |
 | a complete generation exists; ≥1 qualifying row, no staleness | `available=true`, `coverage` as computed |
 
+"Qualifying" as of section 10 (2026-09-18 addendum) also requires
+`availability_basis = 'observed_acquisition'` unless the caller passes
+`include_inferred=true` — see section 10 below; `coverage` is computed over
+whichever set that query parameter selected, never over rows the request
+excluded.
+
 The endpoint never raises a 500 for a missing table — `to_regclass` / a caught
 `ProgrammingError` on `cftc_positioning_daily` or `godview_generations` degrades to the
 `never_configured` unavailable state.
@@ -176,6 +182,56 @@ re-confirmation, not an error. A run that finds **zero** usable history for **ev
 tracked contract (not just "nothing new") is treated differently — see §7's failure
 path — because that means the upstream adapter itself produced nothing, not that this
 run happened to be a quiet week.
+
+## 10. Availability basis — observed vs. inferred vs. unknown
+
+**Addendum, 2026-09-18 (operator direction, Slice A):** "a published CFTC release
+schedule alone does not establish historical availability for revised or backfilled
+records." Section 8's `release_date` says WHEN a report was scheduled to publish, purely
+from the rule (Tuesday → Friday+3d). It says nothing about whether GRID actually *saw*
+that publication happen, versus reconstructing the date years later from a backfill run.
+`availability_basis` is the answer to that second question, stored per row (nullable
+`TEXT` on `cftc_positioning_daily`, added by `migrations/versions/godview_avail_basis_0918.py`,
+CHECK-constrained to the three values below) and exposed per field at the API layer.
+
+| value | meaning |
+|---|---|
+| `observed_acquisition` | The puller's own `pull_timestamp` (→ `available_at`) lands within `AVAILABILITY_BASIS_TOLERANCE_DAYS` (3 days) on-or-after `release_date`, and `raw_series` shows exactly one pull for this `(contract, report_date)`. We actually watched this get published. |
+| `inferred_schedule` | Either the pull landed more than 3 days after `release_date` (a historical backfill — the schedule, not an observation, is placing the date), or `raw_series` shows **more than one** distinct `pull_timestamp` for this report_date (CFTC revised the report, or GRID re-pulled it). A revised/backfilled record is **never** labelled `observed_acquisition` for the original release, even if the winning (latest) pull's own timing alone would otherwise look on-schedule. |
+| `unknown` | No `release_date` at all (section 8's non-Tuesday quarantine — nothing to compare against), no `available_at` at all, or an acquisition implausibly (>1 day) *before* the schedule says the report could have existed. |
+
+`godview/cftc_pillar.py::classify_availability_basis` is the pure classifier;
+`_distinct_pull_counts` supplies the revision signal by counting every distinct
+`pull_timestamp` `raw_series` has ever recorded for a report_date (not just the winning
+one `_read_contract_history`'s `LATEST_AS_OF` pick keeps) — within one real puller run
+every metric shares one transaction-constant `NOW()`, so more than one distinct timestamp
+only happens across two separate runs.
+
+**Strict-PIT reads default to `observed_acquisition` rows only.** `read_cftc_pillar(...,
+include_inferred=False)` (the default) adds `AND availability_basis = 'observed_acquisition'`
+to the query; `include_inferred=True` admits `inferred_schedule`/`unknown` rows too, and
+every admitted row still carries its own `availability_basis` — the API never silently
+upgrades an inferred row to "observed." The route is
+`GET /api/v1/godview/pillars/cftc?as_of=...&include_inferred=true`.
+
+**Per-field exposure:** each field's `FieldRecord.to_dict()` output (section 4) carries
+two additional sibling keys, `availability_basis` and `availability_basis_note` — added
+beside the vendored `FieldRecord` output rather than inside it, since that module is
+vendored verbatim from `feat/availability-provenance-contract` and must not diverge
+further before that branch merges. `availability_basis_note` is `None` exactly when the
+basis is `observed_acquisition`; otherwise it is the fixed string
+`"availability inferred from schedule; record revised/backfilled"` (inferred) or
+`"acquisition observed before the scheduled release; basis unclear"` (unknown).
+
+**Why two vintages of one row can't literally coexist:** `cftc_positioning_daily` keeps
+its `UNIQUE (report_date, contract_code)` constraint unchanged, and rows are INSERT-only
+(section 7) — so a "revised report_date" scenario is tested as two separate report_dates
+side by side (one pulled once, on schedule → observed; one `raw_series` shows was pulled
+twice → its single materialized row is the later, inferred-labelled vintage), not as two
+rows for the same report_date. See `tests/godview/test_cftc_pillar_pure.py`'s
+`test_availability_basis_revised_vs_first_release_side_by_side` and
+`tests/godview/test_cftc_pillar_db.py`'s
+`test_availability_basis_revised_report_date_labels_the_materialized_vintage_inferred`.
 
 ## What remains for other pillars
 
