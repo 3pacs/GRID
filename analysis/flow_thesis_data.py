@@ -755,8 +755,11 @@ def _get_trust_convergence_state(engine: Engine) -> dict[str, Any]:
         from intelligence.trust_scorer import detect_convergence
         convergence = detect_convergence(engine)
         if convergence:
-            buy_conv = [c for c in convergence if c.get("direction", "").upper() == "BUY"]
-            sell_conv = [c for c in convergence if c.get("direction", "").upper() == "SELL"]
+            # detect_convergence emits direction as bullish/bearish, or None
+            # when the sources disagree or carry no resolvable direction. An
+            # unresolved event counts toward neither side.
+            buy_conv = [c for c in convergence if c.get("direction") == "bullish"]
+            sell_conv = [c for c in convergence if c.get("direction") == "bearish"]
             if len(buy_conv) > len(sell_conv):
                 direction = BULLISH
             elif len(sell_conv) > len(buy_conv):
