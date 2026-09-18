@@ -1,20 +1,30 @@
-"""Downstream consequences of declining to journal a null-confidence ticket.
+"""Downstream consequences of how a null-confidence ticket is journaled.
 
-Batch 3b stopped ``write_ticket_to_journal`` from writing a fabricated 0.5
-``state_confidence`` into the immutable ``decision_journal`` for tickets with
-no backtest history. Review question: does skipping the journal row starve or
-break anything downstream? Two things could plausibly depend on the row:
+History of this file, in three steps:
 
-1. The accuracy history that later *gives* tickets a confidence. It is read
-   from ``contagion_backtest_results`` (prediction-level scoring), never from
-   ``decision_journal``, so the skip cannot create a "no journal row -> no
-   history -> no confidence -> no journal row" deadlock.
-2. Ticket close-out (``finalize_ticket``). It emits ``OptionsTradeOutcome``
-   through the contracts layer keyed on the ticket id and never touches the
-   journal, so an unjournaled ticket closes exactly like a journaled one.
+1. Batch 3b found ``write_ticket_to_journal`` writing a fabricated 0.5
+   ``state_confidence`` into the immutable ``decision_journal`` for tickets
+   with no backtest history.
+2. PR #539 stopped that by SKIPPING the journal row. This file originally
+   asked "does skipping starve anything downstream?" and answered no.
+3. The operator's call: silence is not honesty either. Revision
+   ``journal_unscored_conf_0918`` makes ``state_confidence`` nullable with a
+   mandatory ``confidence_reason``, and the ticket now writes an explicit
+   UNSCORED audit record instead of vanishing.
 
-The only thing lost is the audit row itself; that is the deliberate trade
-(no fabricated number becomes permanent) and is flagged for the controller.
+So the question this file answers has changed. It is no longer "what does the
+missing row cost?" but "the row is back — is it honest, and does its return
+break the two things that could plausibly care?"
+
+The two independence findings from step 2 still hold and are still worth
+pinning, because they are what makes step 3 safe:
+
+1. The accuracy history that later *gives* tickets a confidence comes from
+   ``contagion_backtest_results``, never from ``decision_journal`` — so there
+   is no "no journal row -> no history -> no confidence" feedback loop, and
+   equally no risk that the new unscored rows feed back into their own inputs.
+2. Ticket close-out (``finalize_ticket``) is keyed on the ticket id and never
+   touches the journal, so it behaves identically whether or not a row exists.
 """
 
 from __future__ import annotations
@@ -90,3 +100,90 @@ def test_finalize_ticket_emits_outcome_without_a_journal_row():
     evt = emitted[0]
     assert getattr(evt, "trade_id", None) is not None
     assert getattr(evt, "ticker", "AAPL") == "AAPL"
+
+
+def _unscored_ticket(**overrides):
+    ticket = {
+        "prediction_id": 12,
+        "ticker": "aapl",
+        "direction": "short",
+        "instrument": "put",
+        "strike": 180.0,
+        "expiry": "2026-11-20",
+        "kelly_size": 0.0,
+        "shock_type": "supply_disruption",
+        "shock_node": "TSMC",
+        "thesis": "margin compression",
+        "confidence": None,
+        "confidence_basis": ctt.CONFIDENCE_BASIS_NO_HISTORY,
+        "confidence_n": 0,
+    }
+    ticket.update(overrides)
+    return ticket
+
+
+def _capture_journal(monkeypatch):
+    """Patch DecisionJournal and return the dict its kwargs land in."""
+    captured: dict = {}
+
+    class FakeJournal:
+        def __init__(self, db_engine=None):
+            pass
+
+        def log_decision(self, **kw):
+            captured.update(kw)
+            return 9001
+
+    monkeypatch.setattr("journal.log.DecisionJournal", FakeJournal)
+    monkeypatch.setattr(ctt, "_get_default_model_version_id", lambda engine: 1)
+    return captured
+
+
+def test_null_confidence_ticket_is_recorded_not_skipped(monkeypatch):
+    """The skip is gone: the audit record exists, with a NULL and a reason."""
+    captured = _capture_journal(monkeypatch)
+
+    journal_id = ctt.write_ticket_to_journal(MagicMock(), _unscored_ticket())
+
+    assert journal_id == 9001, "an unscored ticket must still leave an audit row"
+    assert captured["state_confidence"] is None
+    assert captured["confidence_reason"]
+
+
+def test_the_unscored_record_carries_no_number_anywhere(monkeypatch):
+    """Not 0.5, not 0.0, not 1.0 — the whole point of the change."""
+    captured = _capture_journal(monkeypatch)
+    ctt.write_ticket_to_journal(MagicMock(), _unscored_ticket())
+
+    assert captured["state_confidence"] is None
+    # kelly_size is genuinely 0.0 for an unscored ticket (no size was taken),
+    # so transition_probability being 0.0 is a measurement, not a placeholder.
+    assert captured["transition_probability"] == 0.0
+    reason = captured["confidence_reason"]
+    assert "unscored" in reason
+    assert ctt.CONFIDENCE_BASIS_NO_HISTORY in reason
+    assert "n=0" in reason
+    assert "supply_disruption" in reason
+
+
+def test_operator_confidence_floors_at_low_for_an_unscored_ticket(monkeypatch):
+    """A categorical NOT NULL column still has to be filled; LOW is the floor."""
+    captured = _capture_journal(monkeypatch)
+    ctt.write_ticket_to_journal(MagicMock(), _unscored_ticket())
+    assert captured["operator_confidence"] == "LOW"
+
+
+def test_a_scored_ticket_is_unaffected(monkeypatch):
+    captured = _capture_journal(monkeypatch)
+    ctt.write_ticket_to_journal(
+        MagicMock(),
+        _unscored_ticket(
+            confidence=0.62,
+            confidence_basis=ctt.CONFIDENCE_BASIS_BACKTEST,
+            confidence_n=14,
+            kelly_size=0.05,
+        ),
+    )
+    assert captured["state_confidence"] == 0.62
+    assert captured["operator_confidence"] == "MEDIUM"
+    assert "scored" in captured["confidence_reason"]
