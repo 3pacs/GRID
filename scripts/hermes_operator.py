@@ -1436,31 +1436,56 @@ def _run_obsidian_cycle(engine: Any) -> dict[str, Any]:
             log.debug("Concept stubs skipped: {e}", e=str(exc))
 
         # 5. Add wikilinks to docs (only if concept stubs changed)
+        #
+        # IMPORTANT (2026-09-18 fix, see
+        # docs/handoffs/2026-09-18/fable-w4d-hermes-docs-rewrite.md): this
+        # used to write add_wikilinks()'s result straight back onto the
+        # SAME tracked file it read via collect_markdown_files() — silently
+        # rewriting README.md/CLAUDE.md/ATTENTION.md/docs/**/*.md in the
+        # release tree on nearly every Hermes cycle. Source docs are now
+        # read-only here; annotated copies go to
+        # resolve_backlinks_output_dir() (env-configurable, defaults under
+        # the Obsidian vault path this module already uses elsewhere), or
+        # this step is skipped entirely (logged) when that directory is
+        # unavailable. Never falls back to writing inside this checkout.
         backlinks_added = 0
         if stubs_created > 0:
             try:
                 from scripts.obsidian_backlinks import (
                     collect_markdown_files, build_doc_registry,
                     add_wikilinks, CONCEPT_LINKS,
+                    resolve_backlinks_output_dir, write_annotated_copy,
                 )
 
-                files = collect_markdown_files()
-                doc_registry = build_doc_registry(files)
-                all_entities = {**CONCEPT_LINKS}
-                skip_stems = {"README", "CLAUDE", "index", "plan", "config"}
-                for stem, target in doc_registry.items():
-                    if stem not in skip_stems and len(stem) > 3:
-                        all_entities[stem] = target
+                output_dir = resolve_backlinks_output_dir()
+                if output_dir is None:
+                    log.debug(
+                        "Obsidian backlinks skipped this cycle: no output "
+                        "directory configured/available (see "
+                        "resolve_backlinks_output_dir)",
+                    )
+                else:
+                    files = collect_markdown_files()
+                    doc_registry = build_doc_registry(files)
+                    all_entities = {**CONCEPT_LINKS}
+                    skip_stems = {"README", "CLAUDE", "index", "plan", "config"}
+                    for stem, target in doc_registry.items():
+                        if stem not in skip_stems and len(stem) > 3:
+                            all_entities[stem] = target
 
-                for f in files:
-                    content = f.read_text(encoding="utf-8", errors="replace")
-                    new_content, changes = add_wikilinks(content, f, all_entities)
-                    if changes:
-                        f.write_text(new_content, encoding="utf-8")
-                        backlinks_added += len(changes)
+                    for f in files:
+                        content = f.read_text(encoding="utf-8", errors="replace")
+                        new_content, changes = add_wikilinks(content, f, all_entities)
+                        if changes:
+                            write_annotated_copy(output_dir, f, new_content)
+                            backlinks_added += len(changes)
 
-                if backlinks_added:
-                    log.info("Obsidian backlinks: {n} links added", n=backlinks_added)
+                    if backlinks_added:
+                        log.info(
+                            "Obsidian backlinks: {n} links added (written "
+                            "to {d}; source docs untouched)",
+                            n=backlinks_added, d=output_dir,
+                        )
             except Exception as exc:
                 log.debug("Backlinks skipped: {e}", e=str(exc))
 
