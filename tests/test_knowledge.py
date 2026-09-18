@@ -1,8 +1,8 @@
 """
 Tests for the knowledge tree module.
 
-Tests extraction logic (category, tags, tickers, features, confidence)
-without requiring a database connection.
+Tests extraction logic (category, tags, tickers, features, and the renamed
+answer text-shape heuristic) without requiring a database connection.
 """
 
 from __future__ import annotations
@@ -10,10 +10,10 @@ from __future__ import annotations
 
 from knowledge.tree import (
     _detect_category,
-    _estimate_confidence,
     _extract_features,
     _extract_tags,
     _extract_tickers,
+    answer_heuristic_score,
 )
 
 
@@ -119,28 +119,43 @@ class TestExtractFeatures:
         assert _extract_features("") == []
 
 
-class TestEstimateConfidence:
-    """Test confidence estimation heuristic."""
+def _score(answer: str) -> float:
+    """The heuristic's numeric part, for the legacy assertions below."""
+    return answer_heuristic_score(answer)["score"]
 
-    def test_empty_answer(self) -> None:
-        assert _estimate_confidence("") == 0.0
+
+class TestAnswerHeuristicScore:
+    """Test the renamed answer text-shape heuristic."""
+
+    def test_empty_answer_has_no_score(self) -> None:
+        result = answer_heuristic_score("")
+        assert result["score"] is None
+        assert result["basis"] == "empty_answer"
+
+    def test_always_ships_its_inputs(self) -> None:
+        result = answer_heuristic_score("The yield is 4.25% as of 2024-01.")
+        assert set(result["inputs"]) == {
+            "word_count", "hedge_phrase_count", "specific_token_count",
+        }
+        assert result["inputs"]["specific_token_count"] == 2
+        assert result["basis"]
 
     def test_short_answer_lower(self) -> None:
-        score = _estimate_confidence("I don't know.")
+        score = _score("I don't know.")
         assert score < 0.5
 
     def test_detailed_answer_higher(self) -> None:
         answer = " ".join(["detailed analysis"] * 120)
         answer += " The yield is 4.25% as of 2024-01."
-        score = _estimate_confidence(answer)
+        score = _score(answer)
         assert score > 0.5
 
     def test_hedging_reduces(self) -> None:
         hedging = "I'm not sure about this. It's uncertain and unclear."
         confident = "The GDP growth rate is 2.5% based on latest BLS data from 2024-01."
-        assert _estimate_confidence(confident) > _estimate_confidence(hedging)
+        assert _score(confident) > _score(hedging)
 
     def test_bounds(self) -> None:
-        """Confidence should always be between 0 and 1."""
-        assert 0.0 <= _estimate_confidence("x") <= 1.0
-        assert 0.0 <= _estimate_confidence("x " * 1000) <= 1.0
+        """The heuristic score should always be between 0 and 1."""
+        assert 0.0 <= _score("x") <= 1.0
+        assert 0.0 <= _score("x " * 1000) <= 1.0
