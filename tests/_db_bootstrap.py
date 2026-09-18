@@ -39,6 +39,17 @@ Alembic chain the stamp exercises:
   ``tests/test_holder_deal_overlap.py`` (7),
   ``tests/test_acquisition_decomposition.py`` (4) — 18 tests total.
 
+* ``institutional_holdings`` (created by
+  ``migrations/0020_institutional_holdings.sql``) and ``holder_deal_overlap``
+  (created by ``migrations/0034_holder_deal_overlap.sql``) — the other two
+  tables ``tests/test_holder_deal_overlap.py`` needs alongside
+  ``capital_flows`` (its module docstring names all three). Both are
+  single-file, idempotent ``IF NOT EXISTS`` DDL with no later ALTER, "legacy-
+  applied" per ``migrations/RAW_SQL_LEDGER.md``, same as ``capital_flows``.
+  This file's ``live_engine`` fixture uses ``db.get_engine()`` rather than
+  ``pg_engine``, so it calls this bootstrap helper itself (see that
+  fixture) rather than relying on ``tests/conftest.py``.
+
 * ``canvas_boards`` / ``canvas_nodes`` / ``canvas_edges`` — created by the
   idempotent Python function
   ``api.routers.canvas_board_store.ensure_legacy_canvas_tables(conn)``. The
@@ -74,6 +85,8 @@ _CAPITAL_FLOWS_MIGRATIONS = (
     _ROOT / "migrations" / "0021_supply_chain_and_capital_flows.sql",
     _ROOT / "migrations" / "0024_capital_flows_currency.sql",
 )
+_INSTITUTIONAL_HOLDINGS_MIGRATION = _ROOT / "migrations" / "0020_institutional_holdings.sql"
+_HOLDER_DEAL_OVERLAP_MIGRATION = _ROOT / "migrations" / "0034_holder_deal_overlap.sql"
 
 _bootstrapped = False
 
@@ -96,6 +109,10 @@ def bootstrap_test_prerequisites(engine: Engine) -> None:
       functional unique index the tests' ``ON CONFLICT`` targets — 0021
       alone is the older, currency-less shape and does not match what the
       tests insert).
+    * ``institutional_holdings`` — via
+      ``migrations/0020_institutional_holdings.sql``.
+    * ``holder_deal_overlap`` — via
+      ``migrations/0034_holder_deal_overlap.sql``.
     * ``canvas_boards``, ``canvas_nodes``, ``canvas_edges`` — via
       ``api.routers.canvas_board_store.ensure_legacy_canvas_tables(conn)``.
 
@@ -115,6 +132,8 @@ def bootstrap_test_prerequisites(engine: Engine) -> None:
         conn.execute(text(_CONTRACTS_MIGRATION.read_text(encoding="utf-8")))
         for path in _CAPITAL_FLOWS_MIGRATIONS:
             conn.execute(text(path.read_text(encoding="utf-8")))
+        conn.execute(text(_INSTITUTIONAL_HOLDINGS_MIGRATION.read_text(encoding="utf-8")))
+        conn.execute(text(_HOLDER_DEAL_OVERLAP_MIGRATION.read_text(encoding="utf-8")))
         ensure_legacy_canvas_tables(conn)
 
     _bootstrapped = True
