@@ -1124,7 +1124,14 @@ class OptionsScanner:
                     ticker          TEXT NOT NULL,
                     scan_date       DATE NOT NULL,
                     score           DOUBLE PRECISION NOT NULL,
-                    payoff_multiple DOUBLE PRECISION NOT NULL,
+                    -- Nullable for the same reason as is_100x below: an
+                    -- unmodelled payoff is NULL, not a number. schema.sql and
+                    -- alembic revision options_rec_scanner_score_0917 already
+                    -- had it nullable; this CREATE did not, so on a database
+                    -- where the scanner ran FIRST (the ALTERs then skip via
+                    -- IF EXISTS) a NULL payoff INSERT would have raised
+                    -- NotNullViolation.
+                    payoff_multiple DOUBLE PRECISION,
                     direction       TEXT NOT NULL,
                     thesis          TEXT NOT NULL,
                     signals         JSONB,
