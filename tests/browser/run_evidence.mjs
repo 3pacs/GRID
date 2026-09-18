@@ -82,7 +82,11 @@ const ROLES = args.roles.split(',').map((s) => s.trim()).filter(Boolean);
 const JOURNEY_FILTER = args.journeys
     ? new Set(args.journeys.split(',').map((s) => s.trim()).filter(Boolean))
     : null;
-const OUT_ROOT = path.resolve(args.out);
+// Every attempt gets its own run directory so a failed or superseded attempt
+// can never contaminate a later verdict (old 502 rows in an appended
+// network.jsonl once looked like view behaviour).
+const RUN_STAMP = new Date().toISOString().replace(/[:.]/g, '-');
+const OUT_ROOT = path.join(path.resolve(args.out), `run-${RUN_STAMP}`);
 
 const FIXTURE_PORT = 8001;
 const PWA_PORT = 5174;
@@ -122,6 +126,7 @@ const JOURNEYS = {
         { name: 'discovery', hash: '#/discovery', ready: /HYPOTHESES/ },
         { name: 'pipeline-health', hash: '#/pipeline-health', ready: /PIPELINE HEALTH/ },
         { name: 'ten-year', hash: '#/ten-year', ready: /10-Year|TOP CHART|No eligible/ },
+        { name: 'snapshots', hash: '#/snapshots', ready: /LATEST SNAPSHOT|No snapshots|Snapshots unavailable|unexpected response/ },
         // Operator (admin) can reach catalyst-timeline normally, unlike the
         // contributor gate below — added so the earlier owner-fix on this
         // view can be re-verified from the admin side too.
