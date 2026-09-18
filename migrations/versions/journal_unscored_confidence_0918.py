@@ -76,7 +76,11 @@ CK_OPERATOR = "ck_decision_journal_operator_confidence"
 # Drop whatever CHECK currently constrains operator_confidence, whatever it is
 # called (schema.sql creates it inline, so PostgreSQL named it
 # decision_journal_operator_confidence_check; an alembic-built database may
-# differ). Matches on the constraint definition, not the name.
+# differ). Matches on the constraint definition, not the name. NOTE:
+# pg_get_constraintdef renders ``IN (...)`` as ``= ANY (ARRAY[...])``, so the
+# match is on the column name only (the disposable-DB proof on 2026-09-18
+# caught a first version that matched on ``IN`` and therefore dropped
+# nothing, leaving the three-value CHECK to reject 'UNSCORED').
 _DROP_OPERATOR_CHECK = """
 DO $$
 DECLARE c record;
@@ -86,7 +90,7 @@ BEGIN
         FROM pg_constraint
         WHERE conrelid = 'decision_journal'::regclass
           AND contype = 'c'
-          AND pg_get_constraintdef(oid) ILIKE '%operator_confidence%IN%'
+          AND pg_get_constraintdef(oid) ILIKE '%operator_confidence%'
     LOOP
         EXECUTE format('ALTER TABLE decision_journal DROP CONSTRAINT %I', c.conname);
     END LOOP;
