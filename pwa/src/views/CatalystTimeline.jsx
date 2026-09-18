@@ -121,7 +121,7 @@ export default function CatalystTimeline({ selectedTicker = '' }) {
     };
 
     useEffect(() => {
-        const nextTicker = selectedTicker.trim().toUpperCase();
+        const nextTicker = (selectedTicker ?? '').trim().toUpperCase();
         if (!nextTicker) return;
         setSearchInput(nextTicker);
         loadTimeline(nextTicker);
