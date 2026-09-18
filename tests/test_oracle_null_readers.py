@@ -245,7 +245,13 @@ def test_no_data_sweep_names_null_explicitly() -> None:
     assert sweep is not None, "the no_data sweep no longer branches on NULL"
     body = sweep.group(0)
     assert "WHEN entry_price IS NULL" in body
-    assert "entry_price IS NULL OR entry_price = 0" in body
+    # `<= 0`, not `= 0`: a negative entry is no more divisible than a zero
+    # one, and `= 0` would leave it in the pool the chunk query then refuses.
+    assert "entry_price IS NULL OR entry_price <= 0" in body
+    # The three cases are named separately — nobody measured it, the
+    # measurement is zero, the measurement is negative — because they are
+    # three different findings.
+    assert "WHEN entry_price = 0 THEN" in body
     # And it must not have grown a placeholder.
     assert "COALESCE(entry_price" not in body
 
@@ -456,3 +462,216 @@ def test_postmortem_timing_check_tolerates_an_unmeasured_entry():
     )
     assert isinstance(category, str) and category
     assert isinstance(root_cause, str)
+
+
+# ── A zero entry price is a measurement that cannot be a basis ─────────────
+#
+# NULL and 0 are different findings and get different reasons. Neither is
+# repaired, neither is divided by, and neither is skipped without saying so.
+
+class TestEngineScoringLoopEntryPrice:
+    """``OracleEngine.score_expired_predictions`` closes what it cannot score.
+
+    Unlike the scorer's chunk query, the engine's own SELECT has no
+    entry-price filter at all — every pending expired row reaches the loop.
+    So this is the path where a NULL raises TypeError and a measured 0 raises
+    ZeroDivisionError, and the one that has to settle both before dividing.
+    """
+
+    def _engine_under_test(self, engine, prices: dict):
+        from oracle.engine import OracleEngine
+
+        # __init__ runs 8+ CREATE TABLE statements in Postgres dialect and
+        # loads the model registry. Neither is under test here, so the
+        # instance is built directly around the fixture's connection.
+        oe = object.__new__(OracleEngine)
+        oe.engine = engine
+        oe.models = []
+        oe._last_guard_verdicts = []
+        oe._get_price_at_date = lambda ticker, _expiry: prices.get(ticker)
+        return oe
+
+    def _seed(self, engine) -> date:
+        today = date.today()
+        expiry = today - timedelta(days=1)
+        with engine.begin() as conn:
+            _insert(
+                conn, id="null-entry", ticker="AAA", direction="CALL",
+                entry_price=None, confidence=0.6, expiry=expiry,
+            )
+            _insert(
+                conn, id="zero-entry", ticker="BBB", direction="CALL",
+                entry_price=0.0, confidence=0.6, expiry=expiry,
+            )
+            _insert(
+                conn, id="negative-entry", ticker="DDD", direction="CALL",
+                entry_price=-3.0, confidence=0.6, expiry=expiry,
+            )
+            _insert(
+                conn, id="normal", ticker="CCC", direction="CALL",
+                entry_price=100.0, confidence=0.6, expiry=expiry,
+            )
+        return today
+
+    def test_unusable_entries_are_closed_with_their_own_reasons(self, engine):
+        from oracle.entry_price_policy import (
+            SCORE_NOTE_ENTRY_NEGATIVE,
+            SCORE_NOTE_ENTRY_NULL,
+            SCORE_NOTE_ENTRY_ZERO,
+        )
+
+        self._seed(engine)
+        oe = self._engine_under_test(
+            engine, {"AAA": 110.0, "BBB": 110.0, "CCC": 110.0, "DDD": 110.0},
+        )
+
+        # No TypeError on the NULL, no ZeroDivisionError on the measured 0.
+        results = oe.score_expired_predictions()
+
+        with engine.connect() as conn:
+            rows = {
+                r[0]: (r[1], r[2], r[3])
+                for r in conn.execute(text(
+                    "SELECT id, verdict, score_notes, pnl_pct "
+                    "FROM oracle_predictions"
+                )).fetchall()
+            }
+
+        # Each unusable entry is closed — not left 'pending' forever, and not
+        # folded into the miss column.
+        assert rows["null-entry"][0] == "no_data"
+        assert rows["null-entry"][1] == SCORE_NOTE_ENTRY_NULL
+        assert rows["zero-entry"][0] == "no_data"
+        assert rows["zero-entry"][1] == SCORE_NOTE_ENTRY_ZERO
+        assert rows["negative-entry"][0] == "no_data"
+        assert rows["negative-entry"][1] == SCORE_NOTE_ENTRY_NEGATIVE
+
+        # The two reasons are distinct: "nobody measured it" is not the same
+        # finding as "the measurement cannot be a basis".
+        assert SCORE_NOTE_ENTRY_NULL != SCORE_NOTE_ENTRY_ZERO
+
+        # No return was invented for any of them, at any value.
+        for pred_id in ("null-entry", "zero-entry", "negative-entry"):
+            assert rows[pred_id][2] is None, pred_id
+
+        # They are reported, not silently dropped from the tally.
+        assert results["unscorable_entry_price"] == 3, results
+        assert results["misses"] == 0, results
+
+        # The measured row still scores: (110 - 100) / 100 = +10% on a CALL.
+        assert rows["normal"][0] == "hit"
+        assert rows["normal"][2] == pytest.approx(10.0)
+
+    def test_a_zero_entry_never_reaches_a_division(self, engine):
+        """A zero entry must be settled *before* the divide, not caught after.
+
+        Driven by making any arithmetic against the fetched price raise: if
+        the guard sat downstream of ``(actual - entry) / entry`` this would
+        surface as an AssertionError from the operand rather than a clean
+        skip.
+        """
+        self._seed(engine)
+
+        class _Exploding(float):
+            def __sub__(self, other):  # pragma: no cover - must not run
+                raise AssertionError("arithmetic on an unusable entry price")
+
+            def __truediv__(self, other):  # pragma: no cover - must not run
+                raise AssertionError("division by an unusable entry price")
+
+        with engine.begin() as conn:
+            conn.execute(text(
+                "DELETE FROM oracle_predictions WHERE id <> 'zero-entry'"
+            ))
+        oe = self._engine_under_test(engine, {"BBB": _Exploding(110.0)})
+        results = oe.score_expired_predictions()
+        assert results["unscorable_entry_price"] == 1
+        assert results["total"] == 0
+
+
+class TestEntryPricePolicy:
+    """The shared classifier every reader binds its reason from."""
+
+    def test_null_and_zero_are_different_findings(self):
+        from oracle.entry_price_policy import (
+            SCORE_NOTE_ENTRY_NULL,
+            SCORE_NOTE_ENTRY_ZERO,
+            entry_price_score_note,
+        )
+
+        assert entry_price_score_note(None) == SCORE_NOTE_ENTRY_NULL
+        assert entry_price_score_note(0) == SCORE_NOTE_ENTRY_ZERO
+        assert entry_price_score_note(0.0) == SCORE_NOTE_ENTRY_ZERO
+        assert SCORE_NOTE_ENTRY_NULL != SCORE_NOTE_ENTRY_ZERO
+
+    def test_a_positive_entry_has_no_reason_and_divides(self):
+        from oracle.entry_price_policy import (
+            entry_price_score_note,
+            is_divisible_entry_price,
+        )
+
+        assert entry_price_score_note(214.5) is None
+        assert is_divisible_entry_price(214.5) is True
+        assert is_divisible_entry_price(0.0) is False
+        assert is_divisible_entry_price(None) is False
+
+    def test_a_reason_is_never_a_substitute_price(self):
+        """Nothing in the policy hands back a number to divide by."""
+        from oracle import entry_price_policy
+
+        for name in dir(entry_price_policy):
+            if name.startswith("_"):
+                continue
+            value = getattr(entry_price_policy, name)
+            assert not isinstance(value, (int, float)), (
+                f"{name} is a number; this module states reasons, it does "
+                f"not supply stand-in prices"
+            )
+
+
+class TestPostmortemZeroEntry:
+    """A measured zero is narrated as the measurement plus why it is useless."""
+
+    def test_zero_entry_keeps_the_measurement_and_states_the_reason(self):
+        from intelligence.postmortem import _summarise_what_happened
+        from oracle.entry_price_policy import SCORE_NOTE_ENTRY_ZERO
+
+        text_out = _summarise_what_happened(
+            "AAPL", "CALL", 0.0, 210.0, "miss", -0.1, [],
+        )
+        # The measurement is not hidden -- it really was 0.00 ...
+        assert "$0.00" in text_out
+        # ... and the sentence says why no return follows from it.
+        assert SCORE_NOTE_ENTRY_ZERO in text_out
+
+    def test_null_entry_says_nobody_measured_it(self):
+        from intelligence.postmortem import _summarise_what_happened
+
+        text_out = _summarise_what_happened(
+            "AAPL", "CALL", None, 210.0, "miss", -0.1, [],
+        )
+        assert "no measured entry price" in text_out
+        # Never a price nobody looked up.
+        assert "$0.00" not in text_out
+
+    def test_timing_classification_names_the_reason_instead_of_missing(self):
+        from intelligence.postmortem import _classify_prediction_failure
+        from oracle.entry_price_policy import (
+            SCORE_NOTE_ENTRY_NULL,
+            SCORE_NOTE_ENTRY_ZERO,
+        )
+
+        for entry, note in ((None, SCORE_NOTE_ENTRY_NULL),
+                            (0.0, SCORE_NOTE_ENTRY_ZERO)):
+            category, root_cause, _wrong, _right, what_missed = (
+                _classify_prediction_failure(
+                    ticker="AAPL", direction="CALL", entry_price=entry,
+                    target=210.0, expiry=date.today(), actual_price=190.0,
+                    actual_move_pct=-5.0, signals=[], anti_signals=[],
+                    price_path=[{"price": 200.0}, {"price": 190.0}],
+                )
+            )
+            # Not "wrong_signal": nothing here shows the model was wrong.
+            assert category == "not_measured", (entry, category)
+            assert note in root_cause
+            assert note in what_missed

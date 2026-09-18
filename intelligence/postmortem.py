@@ -33,6 +33,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from oracle.entry_price_policy import entry_price_score_note
+
 
 # ── Data Classes ──────────────────────────────────────────────────────────
 
@@ -42,6 +44,11 @@ FAILURE_CATEGORIES = [
     "external_shock",
     "bad_data",
     "model_error",
+    # Not a failure of the model: the prediction had no usable entry price,
+    # so no return and no timing could be reconstructed from it at all. Kept
+    # distinct from "bad_data" so these rows can be counted and fixed rather
+    # than averaged into the model's failure profile.
+    "not_measured",
 ]
 
 
@@ -168,7 +175,9 @@ def generate_postmortem(engine: Engine, trade_id: int) -> PostMortem | None:
         log.debug("Post-mortem: trade {id} outcome={o} — not a failure", id=trade_id, o=outcome)
         return None
 
-    entry_f = float(entry_price) if entry_price else 0.0
+    # Same contract as the prediction path below: an entry price nobody
+    # recorded stays None rather than becoming a stated $0.00 entry.
+    entry_f = float(entry_price) if entry_price is not None else None
     strike_f = float(strike) if strike else 0.0
     target_f = float(target_price) if target_price else 0.0
     actual_ret = float(actual_return) if actual_return else 0.0
@@ -1256,7 +1265,7 @@ def _classify_failure(
     *,
     ticker: str,
     direction: str,
-    entry_price: float,
+    entry_price: float | None,
     strike: float,
     target: float,
     expiry: Any,
@@ -1275,10 +1284,12 @@ def _classify_failure(
     signals_right: list[str] = []
     what_missed = ""
 
-    # Check if direction was ever right during the trade
+    # Check if direction was ever right during the trade. `move_pct` divides
+    # by the entry, so an entry that is None, zero or negative is settled
+    # before the loop: `None > 0` raises and a zero basis is not a 0% move.
     direction_was_right_at_some_point = False
     max_favorable_move = 0.0
-    if price_path and entry_price > 0:
+    if price_path and entry_price is not None and entry_price > 0:
         for p in price_path:
             price = p.get("price", 0)
             if not price:
@@ -1459,11 +1470,22 @@ def _classify_prediction_failure(
                 what_missed,
             )
 
-    # Check timing. A prediction with no measured entry price has no
-    # baseline to time against: `None > 0` raises and a 0 entry would make
-    # every move infinite, so both are excluded from the timing check.
+    # Check timing. The move is `(price - entry) / entry`, so the entry has
+    # to be a positive number before the loop runs: `None > 0` raises and a
+    # zero basis makes every move undefined, not infinite. Both are settled
+    # here, before the division, and the reason is carried into what_missed
+    # rather than being a silent skip that reads as "timing was simply wrong".
+    entry_note = entry_price_score_note(entry_price)
     direction_was_right = False
-    if price_path and entry_price is not None and entry_price > 0:
+    if entry_note is not None:
+        return (
+            "not_measured",
+            f"Timing could not be reconstructed: {entry_note}.",
+            signals_wrong,
+            signals_right,
+            f"No entry basis to time the move against — {entry_note}.",
+        )
+    if price_path:
         for p in price_path:
             price = p.get("price", 0)
             if not price:
@@ -1525,12 +1547,17 @@ def _summarise_what_happened(
     price_path: list[dict],
 ) -> str:
     """Build a factual summary of what happened."""
-    # "entered at $0.00" was a measurement nobody took. An unmeasured entry
-    # price says so instead of printing a price.
-    entry_str = (
-        "no measured entry price" if entry_price is None
-        else f"entered at ${entry_price:.2f}"
-    )
+    # "entered at $0.00" was, for a NULL, a measurement nobody took — it read
+    # as a finding about the prediction. A NULL says so instead of printing a
+    # price. A *measured* zero still prints as $0.00, because that is what was
+    # measured, followed by the reason no return can be taken off it.
+    entry_note = entry_price_score_note(entry_price)
+    if entry_note is None:
+        entry_str = f"entered at ${entry_price:.2f}"
+    elif entry_price is None:
+        entry_str = "no measured entry price"
+    else:
+        entry_str = f"entered at ${float(entry_price):.2f} — {entry_note}"
     parts = [f"{ticker} {direction}: {entry_str}, strike ${strike:.2f}."]
 
     if price_path:
