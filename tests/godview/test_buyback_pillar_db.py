@@ -82,7 +82,22 @@ def test_materializer_writes_a_window_around_a_known_earnings_date(godview_pg_en
 
     result = materialize_buyback_pillar(engine, as_of=earnings_date)
     assert result.status == "SUCCESS"
-    assert result.rows_written == WINDOW_BEFORE_DAYS + WINDOW_AFTER_DAYS + 1
+    # NOT result.rows_written: earnings_calendar is a shared, cumulative
+    # table this materializer discovers EVERY issuer from (never
+    # truncated between test runs), so a global rows_written total
+    # legitimately includes other issuers left by earlier tests/runs on a
+    # persistent scratch DB (real-Postgres run, composition d92ca9fc: 51
+    # rows across 3 issuers, not 17). Scope to this test's own ticker +
+    # the generation_id this call actually produced.
+    with engine.begin() as conn:
+        own_rows_written = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM issuer_buyback_blackout_windows "
+                "WHERE ticker = :t AND generation_id = :gen"
+            ),
+            {"t": ticker, "gen": result.generation_id},
+        ).scalar()
+    assert own_rows_written == WINDOW_BEFORE_DAYS + WINDOW_AFTER_DAYS + 1
 
     with engine.begin() as conn:
         row = conn.execute(
