@@ -1947,7 +1947,7 @@ def get_dot_connections(
                         ),
                     ],
                     "inputs": {"insider_transaction_count": cnt,
-                                         "window_days": days},
+                               "window_days": days},
                     "description": (
                         f"Insider cluster: {cnt} insider trades on {row['ticker']} -- "
                         f"{len(actors_list) if isinstance(actors_list, list) else 1} distinct insiders"
@@ -1988,7 +1988,7 @@ def get_dot_connections(
                         f"Consensus direction: {row['direction']}",
                     ],
                     "inputs": {"agreement_count": cnt,
-                                         "window_days": days},
+                               "window_days": days},
                     "description": (
                         f"Whale convergence: {cnt} whale_options/whale_flow signals agree "
                         f"{row['direction']} on {row['ticker']}"
@@ -2028,7 +2028,7 @@ def get_dot_connections(
                         "Company lobbying activity coincides with insider trading",
                     ],
                     "inputs": {"overlap_count": cnt,
-                                         "window_days": days},
+                               "window_days": days},
                     "description": (
                         f"Lobbying-insider correlation: {row['ticker']} has {cnt} instances "
                         f"of insider trades near lobbying disclosures"
@@ -2147,8 +2147,8 @@ def get_dot_connections(
                         f"Directional lean: {bull} bullish, {bear} bearish ({lean})",
                     ],
                     "inputs": {"unusual_options_signal_count": cnt,
-                                         "bullish": bull, "bearish": bear,
-                                         "window_days": days},
+                               "bullish": bull, "bearish": bear,
+                               "window_days": days},
                     "description": (
                         f"Unusual options: {cnt} signals on {row['ticker']} -- "
                         f"skewing {lean} ({bull}B/{bear}S)"
@@ -2188,7 +2188,7 @@ def get_dot_connections(
                         ),
                     ],
                     "inputs": {"distinct_source_count": src_count,
-                                         "window_days": days},
+                               "window_days": days},
                     "description": (
                         f"Multi-source convergence: {src_count} signal types agree "
                         f"{row['direction']} on {row['ticker']}"
