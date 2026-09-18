@@ -171,6 +171,14 @@ class MaterializationResult:
     status: str
     generation_id: str
     rows_written: int = 0
+    #: Rows this run ATTEMPTED to insert but were silently dropped by
+    #: ``ON CONFLICT (settlement_date, ticker) DO NOTHING`` -- e.g. two
+    #: CUSIPs reporting the same display symbol on the same settlement
+    #: date (the tracked table's unique key is (settlement_date, ticker),
+    #: not cusip). ``rows_written`` counts only rows that actually landed;
+    #: this field makes the discarded ones visible instead of silent.
+    #: 2026-09-18, real-Postgres run (composition d7ffa7f1).
+    rows_skipped_conflict: int = 0
     cusips_with_data: int = 0
     cusips_discovered: int = 0
     message: str = ""
@@ -307,8 +315,10 @@ def materialize_sec_ftd_pillar(engine: Engine, *, as_of: date | None = None) -> 
                     )
                     cusips_with_data.add(cusip)
 
+            rows_written = 0
+            rows_skipped_conflict = 0
             for row in rows_to_insert:
-                conn.execute(
+                insert_result = conn.execute(
                     text(
                         """
                         INSERT INTO sec_regsho_ftd_cns (
@@ -327,19 +337,32 @@ def materialize_sec_ftd_pillar(engine: Engine, *, as_of: date | None = None) -> 
                     ),
                     row,
                 )
+                # ON CONFLICT DO NOTHING reports rowcount == 0 for a row it
+                # silently dropped -- never assume "attempted" == "landed".
+                if insert_result.rowcount and insert_result.rowcount > 0:
+                    rows_written += 1
+                else:
+                    rows_skipped_conflict += 1
 
             coverage_fraction = len(cusips_with_data) / len(cusips) if cusips else None
             record_generation(
                 conn, pillar=PILLAR_NAME, generation_id=generation_id,
-                status=STATUS_COMPLETE, row_count=len(rows_to_insert),
+                status=STATUS_COMPLETE, row_count=rows_written,
                 coverage_fraction=coverage_fraction,
             )
 
-        status = "SUCCESS" if rows_to_insert else "SUCCESS_NOOP"
+        status = "SUCCESS" if rows_written else "SUCCESS_NOOP"
+        message = f"{rows_written} new row(s) across {len(cusips_with_data)} CUSIP(s)"
+        if rows_skipped_conflict:
+            message += (
+                f"; {rows_skipped_conflict} attempted row(s) skipped -- "
+                "(settlement_date, ticker) already claimed by a different CUSIP"
+            )
         return MaterializationResult(
-            status=status, generation_id=generation_id, rows_written=len(rows_to_insert),
+            status=status, generation_id=generation_id, rows_written=rows_written,
+            rows_skipped_conflict=rows_skipped_conflict,
             cusips_with_data=len(cusips_with_data), cusips_discovered=len(cusips),
-            message=f"{len(rows_to_insert)} new row(s) across {len(cusips_with_data)} CUSIP(s)",
+            message=message,
         )
     except _EmptyUpstream:
         _record_failure(engine, generation_id, "empty_upstream")
