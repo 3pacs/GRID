@@ -1,0 +1,11 @@
+{
+  "report_date": "2026-09-16",
+  "metals": [
+    {"metal": "Copper", "total_stocks": 120000, "cancelled_warrants": 30000},
+    {"metal": "Aluminium", "total_stocks": 1500000, "cancelled_warrants": 600000},
+    {"metal": "Zinc", "total_stocks": 250000, "cancelled_warrants": 50000},
+    {"metal": "Nickel", "total_stocks": 60000, "cancelled_warrants": 12000},
+    {"metal": "Lead", "total_stocks": 90000, "cancelled_warrants": 18000},
+    {"metal": "Tin", "total_stocks": 4500, "cancelled_warrants": 900}
+  ]
+}
