@@ -25,6 +25,20 @@ from outputs.path_utils import ensure_output_dir
 _BRIEFING_DIR = Path(__file__).parent.parent / "outputs" / "market_briefings"
 
 
+def _regime_confidence_line(regime: dict) -> str:
+    """Render the regime confidence line for a briefing.
+
+    ``confidence`` is None when the underlying decision was never scored
+    (``decision_journal.state_confidence IS NULL``). Printing a bare ``None``
+    into an LLM prompt invites the model to read it as a value; printing 0
+    would be worse still. Say "unscored".
+    """
+    conf = regime.get("confidence")
+    if conf is None:
+        return "- Confidence: unscored (never measured)"
+    return f"- Confidence: {conf}"
+
+
 class MarketBriefingEngine:
     """Generates AI-powered market condition briefings using Ollama.
 
@@ -164,7 +178,11 @@ class MarketBriefingEngine:
                 if regime_row:
                     snapshot["latest_regime"] = {
                         "state": regime_row[0],
-                        "confidence": round(regime_row[1], 4),
+                        # None = unscored; round(None, 4) raises.
+                        "confidence": (
+                            round(regime_row[1], 4)
+                            if regime_row[1] is not None else None
+                        ),
                         "transition_prob": round(regime_row[2], 4),
                         "contradictions": regime_row[3],
                         "recommendation": regime_row[4],
@@ -268,7 +286,7 @@ class MarketBriefingEngine:
         if regime:
             lines.append("### LATEST REGIME INFERENCE")
             lines.append(f"- State: {regime['state']}")
-            lines.append(f"- Confidence: {regime['confidence']}")
+            lines.append(_regime_confidence_line(regime))
             lines.append(f"- Transition Probability: {regime['transition_prob']}")
             lines.append(f"- Recommendation: {regime['recommendation']}")
             lines.append(f"- Timestamp: {regime['timestamp']}")
@@ -569,7 +587,7 @@ class MarketBriefingEngine:
         if regime:
             lines.append("## Latest Regime")
             lines.append(f"- State: **{regime['state']}**")
-            lines.append(f"- Confidence: {regime['confidence']}")
+            lines.append(_regime_confidence_line(regime))
             lines.append(f"- Recommendation: {regime['recommendation']}")
             lines.append("")
 
