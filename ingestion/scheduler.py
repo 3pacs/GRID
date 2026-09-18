@@ -1345,7 +1345,7 @@ def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
         engine = get_engine()
         scanner = OptionsScanner(engine)
         opps = scanner.scan_all(min_score=5.0)
-        n_100x = sum(1 for o in opps if o.is_100x)
+        n_100x = sum(1 for o in opps if o.heuristic_payoff_flag)
         if opps:
             scanner.persist_scan(opps)
         log.info(

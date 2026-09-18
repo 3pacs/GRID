@@ -23,6 +23,11 @@ DEFAULT_TICKERS: list[str] = [
     "XOM", "JPM", "JNJ", "V", "PG", "MA", "HD", "AVGO", "LLY", "MRK", "COST",
 ]
 
+# Finviz labels whose cell is always prose, never a measurement. They are read for
+# completeness but never written to raw_series, whose `value` column is a NOT NULL
+# numeric observation (B-M17).
+TEXT_FIELDS: frozenset[str] = frozenset({"Sector", "Industry", "Country"})
+
 FIELDS_OF_INTEREST: dict[str, str] = {
     "P/E": "pe_ratio",
     "EPS (ttm)": "eps_ttm",
@@ -169,16 +174,17 @@ class FinvizScraperPuller(BasePuller):
                 "Finviz fetch failed for {t}: {e}", t=ticker, e=str(exc),
             )
             return {"status": "FAILED", "ticker": ticker, "rows_inserted": 0,
-                    "error": str(exc)}
+                    "skipped_text_fields": 0, "error": str(exc)}
 
         raw_pairs = self._parse_snapshot_table(html)
         if not raw_pairs:
             log.warning("Finviz: no data parsed for {t}", t=ticker)
             return {"status": "FAILED", "ticker": ticker, "rows_inserted": 0,
-                    "error": "no snapshot table found"}
+                    "skipped_text_fields": 0, "error": "no snapshot table found"}
 
         today = date.today()
         inserted = 0
+        skipped_text = 0
 
         with self.engine.begin() as conn:
             existing = set()
@@ -200,26 +206,47 @@ class FinvizScraperPuller(BasePuller):
                 if parsed is None:
                     continue
 
+                if isinstance(parsed, bool) or not isinstance(parsed, (int, float)):
+                    # Sector/Industry are text, and a numeric cell can come back as
+                    # "N/A" or other unparsable prose. `raw_series.value` only holds
+                    # numeric observations, so nothing is written: coercing to 0.0
+                    # and stamping pull_status='SUCCESS' fabricated a daily
+                    # measurement for the whole ticker universe (B-M17).
+                    skipped_text += 1
+                    reason = "text_field" if finviz_label in TEXT_FIELDS else "unparsable"
+                    log.debug(
+                        "Finviz {t}: {f} is not numeric ({v!r}, {r}); no raw_series row written",
+                        t=ticker, f=field_name, v=raw_val, r=reason,
+                    )
+                    continue
+
                 sid = f"{_SERIES_PREFIX}.{ticker}.{field_name}"
-                numeric_val = parsed if isinstance(parsed, (int, float)) else 0.0
 
                 self._insert_raw(
                     conn=conn,
                     series_id=sid,
                     obs_date=today,
-                    value=float(numeric_val),
+                    value=float(parsed),
                     raw_payload={
                         "ticker": ticker,
                         "field": finviz_label,
                         "raw_value": raw_val,
-                        "parsed": str(parsed),
+                        "parsed": float(parsed),
                         "source_url": f"{_BASE_URL}?t={ticker}",
                     },
                 )
                 inserted += 1
 
-        log.info("Finviz {t}: {n} fields inserted", t=ticker, n=inserted)
-        return {"status": "SUCCESS", "ticker": ticker, "rows_inserted": inserted}
+        log.info(
+            "Finviz {t}: {n} numeric fields inserted, {s} non-numeric fields skipped",
+            t=ticker, n=inserted, s=skipped_text,
+        )
+        return {
+            "status": "SUCCESS",
+            "ticker": ticker,
+            "rows_inserted": inserted,
+            "skipped_text_fields": skipped_text,
+        }
 
     def pull_all(self, tickers: list[str] | None = None) -> list[dict[str, Any]]:
         """Pull fundamentals for a list of tickers (defaults to top-20 SPY).
@@ -241,9 +268,10 @@ class FinvizScraperPuller(BasePuller):
 
         succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
         total_rows = sum(r["rows_inserted"] for r in results)
+        total_skipped = sum(r.get("skipped_text_fields", 0) for r in results)
         log.info(
-            "Finviz pull_all -- {ok}/{total} tickers, {rows} rows",
-            ok=succeeded, total=len(results), rows=total_rows,
+            "Finviz pull_all -- {ok}/{total} tickers, {rows} rows, {skip} non-numeric fields skipped",
+            ok=succeeded, total=len(results), rows=total_rows, skip=total_skipped,
         )
         return results
 
@@ -254,4 +282,9 @@ class FinvizScraperPuller(BasePuller):
         """
         results = self.pull_all()
         total = sum(r["rows_inserted"] for r in results)
-        return {"status": "SUCCESS", "rows_inserted": total}
+        skipped = sum(r.get("skipped_text_fields", 0) for r in results)
+        return {
+            "status": "SUCCESS",
+            "rows_inserted": total,
+            "skipped_text_fields": skipped,
+        }

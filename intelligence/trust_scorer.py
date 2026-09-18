@@ -25,6 +25,7 @@ import json
 import logging
 import math
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -357,6 +358,55 @@ def _infer_signal_direction(
     return "unknown"
 
 
+def _fmt_trust(value: float | None, digits: int = 3) -> str:
+    """Format a nullable trust/confidence for a log line or report.
+
+    ``None`` is *unscored*, never 0.5 and never 0.000 — a formatted midpoint in
+    a report reads exactly like a measured one.
+    """
+    if value is None:
+        return "unscored"
+    return f"{float(value):.{digits}f}"
+
+
+def _resolve_convergence_direction(
+    signals: Iterable[dict[str, Any]],
+) -> tuple[str | None, str]:
+    """Resolve one direction for a group of converging signals.
+
+    Each source row carries ``signal_type`` (``BUY`` / ``SELL`` /
+    ``CLUSTER_BUY`` / ``insider_sell`` / ``wsb_bullish`` / ...) and an optional
+    ``signal_value`` payload; ``_infer_signal_direction`` maps both onto
+    ``bullish`` / ``bearish`` / ``unknown``.
+
+    Returns ``(direction, basis)`` where ``direction`` is ``"bullish"``,
+    ``"bearish"`` or ``None``. It is **never** ``"neutral"``: "neutral" is a
+    measured market stance, and an unresolvable direction is not one
+    (docs/reference/AVAILABILITY_CONTRACT.md).
+
+    basis values:
+      * ``inferred_from_signal_types``          — every source resolved, all agree
+      * ``inferred_from_signal_types_partial``  — some sources unresolved, the
+        rest agree; the direction reflects only the resolved ones
+      * ``sources_disagree``                    — resolved sources point both ways
+      * ``no_direction_on_sources``             — nothing resolved
+    """
+    seen: set[str] = set()
+    for sig in signals:
+        seen.add(_infer_signal_direction(
+            sig.get("signal_type"), sig.get("signal_value")
+        ))
+    resolved = {d for d in seen if d in ("bullish", "bearish")}
+    if len(resolved) == 1:
+        direction = resolved.pop()
+        if seen - {direction}:
+            return direction, "inferred_from_signal_types_partial"
+        return direction, "inferred_from_signal_types"
+    if not resolved:
+        return None, "no_direction_on_sources"
+    return None, "sources_disagree"
+
+
 # Recency weighting half-life in days
 RECENCY_HALF_LIFE_DAYS: int = 90
 
@@ -372,6 +422,12 @@ _DIRECTIONAL_NOISE_SOURCES: set[str] = {
 
 # Convergence: minimum independent sources pointing the same way
 MIN_CONVERGENCE_SOURCES: int = 3
+
+# Trust level at or above which a *scored* convergence is broadcast as a
+# high-severity alert. This is an alert-routing threshold, not a published
+# measurement: an unscored convergence never reaches it, because there is no
+# number to compare (see ``detect_convergence``'s alert contract).
+CONVERGENCE_HIGH_SEVERITY_TRUST: float = 0.7
 
 # Lookback windows for insider edge queries
 CONGRESSIONAL_LOOKBACK_DAYS: int = 45
@@ -407,8 +463,16 @@ class ConvergenceEvent:
     signal_type: str          # 'BUY' or 'SELL'
     source_count: int
     sources: list[dict]     # [{source_type, source_id, trust_score, signal_date}]
-    combined_confidence: float
+    # None when no source in the group carries a scored trust_score. A NULL
+    # trust_score is unscored, not a 0.5 prior (docs/reference/CONFIDENCE_POLICY.md).
+    combined_confidence: float | None
     detected_at: str
+    # 'bullish' / 'bearish', or None when the sources disagree or carry no
+    # resolvable direction. Never "neutral" as a stand-in for "unknown".
+    direction: str | None = None
+    direction_basis: str = "unresolved"
+    scored_source_count: int = 0
+    confidence_basis: str = "unscored"
 
 
 # ── Table Setup ────────────────────────────────────────────────────────────
@@ -433,8 +497,12 @@ def _ensure_tables(engine: Engine) -> None:
                 outcome_return  DOUBLE PRECISION,
                 scored_at       TIMESTAMPTZ,
 
-                -- Trust aggregates (updated by update_trust_scores)
-                trust_score     DOUBLE PRECISION DEFAULT 0.5,
+                -- Trust aggregates (updated by update_trust_scores).
+                -- No DEFAULT: NULL = unscored. Matches schema.sql and
+                -- migrations/versions/signal_sources_trust_nodefault.py; a 0.5
+                -- default here would reintroduce the fabricated midpoint on any
+                -- database this helper creates the table on.
+                trust_score     DOUBLE PRECISION,
                 hit_count       INTEGER DEFAULT 0,
                 miss_count      INTEGER DEFAULT 0,
                 avg_lead_time_hours DOUBLE PRECISION DEFAULT 0.0,
@@ -1277,7 +1345,9 @@ def get_insider_edge(engine: Engine, ticker: str) -> dict[str, Any] | None:
                 "signal_type": r[1],
                 "date": str(r[2]),
                 "price": float(r[3]) if r[3] else None,
-                "trust_score": float(r[4]) if r[4] else 0.5,
+                # NULL = unscored -> None. A measured 0.0 is a
+                # measurement and survives as 0.0.
+                "trust_score": float(r[4]) if r[4] is not None else None,
                 "outcome": r[5],
                 "return": float(r[6]) if r[6] else None,
                 "metadata": r[7],
@@ -1300,7 +1370,9 @@ def get_insider_edge(engine: Engine, ticker: str) -> dict[str, Any] | None:
                 "signal_type": r[1],
                 "date": str(r[2]),
                 "price": float(r[3]) if r[3] else None,
-                "trust_score": float(r[4]) if r[4] else 0.5,
+                # NULL = unscored -> None. A measured 0.0 is a
+                # measurement and survives as 0.0.
+                "trust_score": float(r[4]) if r[4] is not None else None,
                 "outcome": r[5],
                 "return": float(r[6]) if r[6] else None,
                 "metadata": r[7],
@@ -1323,7 +1395,9 @@ def get_insider_edge(engine: Engine, ticker: str) -> dict[str, Any] | None:
                 "signal_type": r[1],
                 "date": str(r[2]),
                 "price": float(r[3]) if r[3] else None,
-                "trust_score": float(r[4]) if r[4] else 0.5,
+                # NULL = unscored -> None. A measured 0.0 is a
+                # measurement and survives as 0.0.
+                "trust_score": float(r[4]) if r[4] is not None else None,
                 "outcome": r[5],
                 "return": float(r[6]) if r[6] else None,
                 "metadata": r[7],
@@ -1337,33 +1411,70 @@ def get_insider_edge(engine: Engine, ticker: str) -> dict[str, Any] | None:
     if not has_signal:
         return None
 
-    # Compute aggregate signal_typeal signal weighted by trust
-    buy_weight = 0.0
-    sell_weight = 0.0
+    # Aggregate direction. An unscored row (trust_score NULL) carries no trust
+    # weight — it votes unweighted rather than borrowing a 0.5 the scorer never
+    # produced — and the basis string says which tally produced the number.
+    scored_buy = 0.0
+    scored_sell = 0.0
+    vote_buy = 0
+    vote_sell = 0
+    scored_count = 0
+    total_count = 0
     for category in ("congressional", "insider", "darkpool"):
         for sig in edge[category]:
-            ts = sig.get("trust_score", 0.5)
-            if sig["signal_type"] == "BUY":
-                buy_weight += ts
+            ts = sig.get("trust_score")
+            total_count += 1
+            is_buy = sig["signal_type"] == "BUY"
+            if is_buy:
+                vote_buy += 1
             else:
-                sell_weight += ts
+                vote_sell += 1
+            if ts is None:
+                continue
+            scored_count += 1
+            if is_buy:
+                scored_buy += float(ts)
+            else:
+                scored_sell += float(ts)
 
-    edge["net_signal_type"] = "BUY" if buy_weight > sell_weight else "SELL"
-    edge["signal_type_confidence"] = round(
-        max(buy_weight, sell_weight) / (buy_weight + sell_weight)
-        if (buy_weight + sell_weight) > 0 else 0.5,
-        4,
+    if (scored_buy + scored_sell) > 0:
+        buy_weight, sell_weight = scored_buy, scored_sell
+        conf_basis = "trust_weighted_over_scored_sources"
+    else:
+        # Nothing scored, or every scored source measured exactly 0.0: fall back
+        # to a plain head count and label it as such.
+        buy_weight, sell_weight = float(vote_buy), float(vote_sell)
+        conf_basis = "unweighted_vote_count"
+
+    total_weight = buy_weight + sell_weight
+    if buy_weight > sell_weight:
+        edge["net_signal_type"] = "BUY"
+    elif sell_weight > buy_weight:
+        edge["net_signal_type"] = "SELL"
+    else:
+        # A genuine tie is not a SELL. Say nothing rather than pick a side.
+        edge["net_signal_type"] = None
+        conf_basis = conf_basis + "_tied"
+
+    edge["signal_type_confidence"] = (
+        round(max(buy_weight, sell_weight) / total_weight, 4)
+        if total_weight > 0 and edge["net_signal_type"] is not None
+        else None
     )
+    edge["signal_type_confidence_basis"] = conf_basis
+    edge["scored_signal_count"] = scored_count
+    edge["signal_count"] = total_count
 
     log.info(
         "Insider edge for {t}: {c} congressional, {i} insider, {d} darkpool — "
-        "net {dir} (confidence {conf:.1%})",
+        "net {dir} (confidence {conf}, basis {basis})",
         t=ticker,
         c=len(edge["congressional"]),
         i=len(edge["insider"]),
         d=len(edge["darkpool"]),
-        dir=edge["net_signal_type"],
-        conf=edge["signal_type_confidence"],
+        dir=edge["net_signal_type"] or "undetermined",
+        conf=_fmt_trust(edge["signal_type_confidence"]),
+        basis=conf_basis,
     )
     return edge
 
@@ -1384,7 +1495,42 @@ def detect_convergence(
         ticker: Optional — limit search to a single ticker.
 
     Returns:
-        List of convergence event dicts with combined confidence.
+        List of convergence event dicts. Each carries:
+
+        ``source_count``
+            Independent source types that agreed. Always >= MIN_CONVERGENCE_SOURCES.
+        ``scored_source_count``
+            How many of those carry a *scored* ``signal_sources.trust_score``.
+        ``combined_confidence``
+            Mean trust of the **scored** sources only, or ``None`` when none of
+            them is scored. It is never the mean of a 0.5 DDL default: a NULL
+            trust_score is unscored, and an unscored convergence publishes
+            ``None``, not a midpoint (docs/reference/CONFIDENCE_POLICY.md). A
+            source whose trust was *measured* at 0.0 counts as a 0.0.
+        ``confidence_basis``
+            ``"mean_trust_of_scored_sources"`` or ``"unscored"``.
+        ``direction`` / ``direction_basis``
+            ``"bullish"`` / ``"bearish"`` inferred from the sources' own
+            ``signal_type`` (+ ``signal_value``), or ``None`` when they disagree
+            or carry no resolvable direction. Never ``"neutral"`` — see
+            ``_resolve_convergence_direction``. ``signal_type`` (``BUY``/``SELL``)
+            stays on the event for the consumers that already read it.
+
+        Events sort by ``combined_confidence`` descending, **unscored last**.
+
+    WebSocket alert contract:
+        Every event is broadcast as an ``alert``. The severity is never driven
+        by a confidence the scorer did not produce:
+
+        * ``combined_confidence`` measured and >= ``CONVERGENCE_HIGH_SEVERITY_TRUST``
+          -> ``severity: "high"``.
+        * ``combined_confidence`` measured and below it -> ``severity: "medium"``.
+        * ``combined_confidence is None`` (no source scored) -> ``severity:
+          "medium"``, derived from ``source_count`` alone. A 3-source agreement
+          is a real structural event and still worth an alert, but it cannot be
+          ranked "high" on a trust level nobody measured. The payload carries
+          ``combined_confidence: null`` + ``confidence_basis: "unscored"`` and a
+          ``severity_basis`` naming which of the three rules fired.
     """
     _ensure_tables(engine)
     events: list[dict[str, Any]] = []
@@ -1396,7 +1542,7 @@ def detect_convergence(
         params["ticker"] = ticker
         query = text(
             "SELECT ticker, source_type, source_id, signal_type, "
-            "       signal_date, trust_score "
+            "       signal_date, trust_score, signal_value "
             "FROM signal_sources "
             "WHERE signal_date >= :lookback "
             "  AND outcome IN ('PENDING', 'CORRECT') "
@@ -1406,7 +1552,7 @@ def detect_convergence(
     else:
         query = text(
             "SELECT ticker, source_type, source_id, signal_type, "
-            "       signal_date, trust_score "
+            "       signal_date, trust_score, signal_value "
             "FROM signal_sources "
             "WHERE signal_date >= :lookback "
             "  AND outcome IN ('PENDING', 'CORRECT') "
@@ -1428,7 +1574,9 @@ def detect_convergence(
             "source_id": r[2],
             "signal_type": r[3],
             "signal_date": str(r[4]),
-            "trust_score": float(r[5]) if r[5] else 0.5,
+            # NULL = unscored -> None. A measured 0.0 survives as 0.0.
+            "trust_score": float(r[5]) if r[5] is not None else None,
+            "signal_value": r[6],
         })
 
     for t, signals in ticker_signals.items():
@@ -1447,14 +1595,32 @@ def detect_convergence(
         # Check for convergence (3+ independent source types)
         for signal_type, sources_map in [("BUY", buy_sources), ("SELL", sell_sources)]:
             if len(sources_map) >= MIN_CONVERGENCE_SOURCES:
-                # Combined confidence = weighted average of trust scores
-                trust_sum = sum(s["trust_score"] for s in sources_map.values())
-                combined = trust_sum / len(sources_map)
+                # Mean over SCORED sources only. Unscored sources still count in
+                # source_count but contribute no number; when none is scored the
+                # event publishes confidence None, not the mean of a DDL default.
+                scored = [
+                    float(s["trust_score"])
+                    for s in sources_map.values()
+                    if s["trust_score"] is not None
+                ]
+                if scored:
+                    combined: float | None = round(sum(scored) / len(scored), 4)
+                    confidence_basis = "mean_trust_of_scored_sources"
+                else:
+                    combined = None
+                    confidence_basis = "unscored"
+
+                direction, direction_basis = _resolve_convergence_direction(
+                    sources_map.values()
+                )
 
                 events.append({
                     "ticker": t,
                     "signal_type": signal_type,
+                    "direction": direction,
+                    "direction_basis": direction_basis,
                     "source_count": len(sources_map),
+                    "scored_source_count": len(scored),
                     "sources": [
                         {
                             "source_type": st,
@@ -1464,12 +1630,17 @@ def detect_convergence(
                         }
                         for st, s in sources_map.items()
                     ],
-                    "combined_confidence": round(combined, 4),
+                    "combined_confidence": combined,
+                    "confidence_basis": confidence_basis,
                     "detected_at": now.isoformat(),
                 })
 
-    # Sort by combined confidence descending
-    events.sort(key=lambda e: -e["combined_confidence"])
+    # Sort by combined confidence descending, unscored LAST — never ranked as
+    # though it were a 0.5 (docs/reference/CONFIDENCE_POLICY.md).
+    events.sort(key=lambda e: (
+        e["combined_confidence"] is None,
+        -(e["combined_confidence"] if e["combined_confidence"] is not None else 0.0),
+    ))
 
     log.info(
         "Convergence detection: {n} events found across {t} tickers",
@@ -1484,16 +1655,36 @@ def detect_convergence(
                 f"{s['source_type']}({s['source_id']})"
                 for s in ev.get("sources", [])
             )
+            conf = ev["combined_confidence"]
+            if conf is None:
+                # No source scored: severity comes from source_count alone.
+                severity = "medium"
+                severity_basis = "source_count_only_unscored"
+            elif conf >= CONVERGENCE_HIGH_SEVERITY_TRUST:
+                severity = "high"
+                severity_basis = (
+                    f"mean_trust_of_scored_sources>={CONVERGENCE_HIGH_SEVERITY_TRUST}"
+                )
+            else:
+                severity = "medium"
+                severity_basis = (
+                    f"mean_trust_of_scored_sources<{CONVERGENCE_HIGH_SEVERITY_TRUST}"
+                )
             broadcast_event("alert", {
-                "severity": "high",
+                "severity": severity,
+                "severity_basis": severity_basis,
                 "message": (
                     f"Convergence: {ev['source_count']} sources "
                     f"{ev['signal_type']} on {ev['ticker']} — {sources_desc}"
                 ),
                 "ticker": ev["ticker"],
                 "signal_type": ev["signal_type"],
+                "direction": ev["direction"],
+                "direction_basis": ev["direction_basis"],
                 "source_count": ev["source_count"],
-                "combined_confidence": ev["combined_confidence"],
+                "scored_source_count": ev["scored_source_count"],
+                "combined_confidence": conf,
+                "confidence_basis": ev["confidence_basis"],
             })
     except Exception:
         pass  # graceful degradation if API module not loaded
@@ -1573,13 +1764,14 @@ def generate_trust_report(engine: Engine) -> str:
     if recent_convergence:
         for e in recent_convergence:
             src_list = ", ".join(
-                f"{s['source_type']}({s['trust_score']:.2f})"
+                f"{s['source_type']}({_fmt_trust(s['trust_score'], 2)})"
                 for s in e["sources"]
             )
             lines.append(
                 f"  {e['ticker']} {e['signal_type']} — "
-                f"{e['source_count']} sources, "
-                f"confidence={e['combined_confidence']:.3f}  "
+                f"{e['source_count']} sources "
+                f"({e.get('scored_source_count', 0)} scored), "
+                f"confidence={_fmt_trust(e['combined_confidence'])}  "
                 f"[{src_list}]"
             )
     else:
@@ -1636,7 +1828,8 @@ def _get_llm_trust_narrative(
         + f"\n\nConvergence events: {len(convergence_events)}\n"
         + "\n".join(
             f"  {e['ticker']} {e['signal_type']} ({e['source_count']} sources, "
-            f"confidence={e['combined_confidence']:.3f})"
+            f"{e.get('scored_source_count', 0)} scored, "
+            f"confidence={_fmt_trust(e['combined_confidence'])})"
             for e in convergence_events[:5]
         )
         + "\n\nWhat patterns stand out? Any sources worth investigating further? "

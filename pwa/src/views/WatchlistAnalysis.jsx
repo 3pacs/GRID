@@ -237,8 +237,18 @@ const SIGNAL_ICONS = {
     lever_pullers: '\u{1F3AF}',  // target
 };
 
-function TrustBar({ score, width = 48 }) {
-    const pct = Math.max(0, Math.min(1, score || 0));
+/**
+ * Trust / confidence bar.
+ *
+ * `score` is null when nothing scored the source — NOT zero. A half bar (the
+ * old `score || 0.5` upstream) and a zero bar are both measurements; an
+ * unscored source gets an empty track and the word "unscored" instead.
+ * A *measured* 0 renders as a real 0% bar.
+ * See docs/reference/CONFIDENCE_POLICY.md.
+ */
+export function TrustBar({ score, width = 48 }) {
+    const scored = typeof score === 'number' && Number.isFinite(score);
+    const pct = scored ? Math.max(0, Math.min(1, score)) : 0;
     const barColor = pct >= 0.7 ? colors.green : pct >= 0.5 ? colors.yellow : colors.red;
     return (
         <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
@@ -246,14 +256,19 @@ function TrustBar({ score, width = 48 }) {
                 width: `${width}px`, height: '4px', borderRadius: '2px',
                 background: colors.borderSubtle, overflow: 'hidden',
             }}>
-                <div style={{
-                    width: `${pct * 100}%`, height: '100%',
-                    background: barColor, borderRadius: '2px',
-                    transition: 'width 0.3s ease',
-                }} />
+                {scored && (
+                    <div
+                        data-testid="trustbar-fill"
+                        style={{
+                            width: `${pct * 100}%`, height: '100%',
+                            background: barColor, borderRadius: '2px',
+                            transition: 'width 0.3s ease',
+                        }}
+                    />
+                )}
             </div>
             <span style={{ fontSize: '9px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace" }}>
-                {(pct * 100).toFixed(0)}
+                {scored ? (pct * 100).toFixed(0) : 'unscored'}
             </span>
         </div>
     );
@@ -291,7 +306,7 @@ function SignalCard({ icon, label, actor, action, date, trustScore, direction })
     );
 }
 
-function InsiderEdgePanel({ edgeData, loading }) {
+export function InsiderEdgePanel({ edgeData, loading }) {
     const [expanded, setExpanded] = useState(true);
 
     if (loading) return <OverviewSkeleton />;
@@ -337,8 +352,11 @@ function InsiderEdgePanel({ edgeData, loading }) {
                             background: `${dirColor}18`, color: dirColor,
                             border: `1px solid ${dirColor}40`,
                         }}>
-                            {convergence.source_count} sources {convergence.direction}
-                            {convergence.confidence ? ` \u00b7 ${(convergence.confidence * 100).toFixed(0)}%` : ''}
+                            {convergence.source_count} sources{' '}
+                            {convergence.direction || 'direction unresolved'}
+                            {convergence.confidence != null
+                                ? ` \u00b7 ${(convergence.confidence * 100).toFixed(0)}%`
+                                : ' \u00b7 unscored'}
                         </span>
                     )}
                 </div>
@@ -388,7 +406,9 @@ function InsiderEdgePanel({ edgeData, loading }) {
                         {dark_pool && (
                             <SignalCard
                                 icon={SIGNAL_ICONS.dark_pool} label="Dark Pool"
-                                actor={`${dark_pool.volume_vs_avg?.toFixed(1)}x avg volume`}
+                                actor={dark_pool.volume_vs_avg == null
+                                    ? 'volume vs avg not reported'
+                                    : `${dark_pool.volume_vs_avg.toFixed(1)}x avg volume`}
                                 action={dark_pool.signal?.toUpperCase() || 'NEUTRAL'}
                                 date={dark_pool.date}
                                 trustScore={null}
@@ -408,10 +428,14 @@ function InsiderEdgePanel({ edgeData, loading }) {
                             <SignalCard key={`pred-${i}`}
                                 icon={SIGNAL_ICONS.prediction_markets} label="Prediction Mkt"
                                 actor={p.market}
-                                action={p.probability >= 0.6 ? 'LIKELY' : p.probability <= 0.4 ? 'UNLIKELY' : 'TOSS-UP'}
+                                action={p.probability == null
+                                    ? 'NO QUOTE'
+                                    : p.probability >= 0.6 ? 'LIKELY' : p.probability <= 0.4 ? 'UNLIKELY' : 'TOSS-UP'}
                                 date={null}
                                 trustScore={p.probability}
-                                direction={p.change_24h > 0 ? 'bullish' : p.change_24h < 0 ? 'bearish' : 'neutral'}
+                                direction={p.change_24h == null
+                                    ? null
+                                    : p.change_24h > 0 ? 'bullish' : p.change_24h < 0 ? 'bearish' : 'neutral'}
                             />
                         ))}
                         {smart_money?.map((s, i) => (
@@ -481,7 +505,10 @@ function InsiderEdgePanel({ edgeData, loading }) {
                                 TRUST
                             </span>
                             <div style={{ flex: 1 }}>
-                                <TrustBar score={convergence.confidence} width={120} />
+                                {/* null = no source in the convergence is
+                                    scored; TrustBar renders "unscored", never
+                                    a half bar. */}
+                                <TrustBar score={convergence.confidence ?? null} width={120} />
                             </div>
                             <span style={{ fontSize: '10px', color: dirColor, fontFamily: "'JetBrains Mono', monospace", fontWeight: 600 }}>
                                 {convergence.source_count} independent source{convergence.source_count !== 1 ? 's' : ''}

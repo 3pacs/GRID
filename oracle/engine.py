@@ -618,9 +618,9 @@ class OracleEngine:
                     prediction_type TEXT NOT NULL,
                     direction TEXT NOT NULL,
                     target_price DOUBLE PRECISION,
-                    entry_price DOUBLE PRECISION NOT NULL,
+                    entry_price DOUBLE PRECISION,
                     expiry DATE NOT NULL,
-                    confidence DOUBLE PRECISION NOT NULL,
+                    confidence DOUBLE PRECISION,
                     expected_move_pct DOUBLE PRECISION,
                     signal_strength DOUBLE PRECISION,
                     coherence DOUBLE PRECISION,
@@ -643,6 +643,15 @@ class OracleEngine:
                 ALTER TABLE oracle_predictions
                 ADD COLUMN IF NOT EXISTS dedup_keep BOOLEAN NOT NULL DEFAULT TRUE
             """))
+            # D-H11 / D-M32: `confidence` and `entry_price` are NULL when
+            # nothing measured them. Both writers already bind None
+            # (`_store_predictions` for a ticker with no spot, `oracle/publish.py`
+            # for an unsupplied confidence). The CREATE above carries the
+            # nullable shape for a fresh database; an existing table is
+            # relaxed by alembic revision ``oracle_pred_nullable_0918`` at
+            # deploy time, NOT here: ALTER COLUMN takes ACCESS EXCLUSIVE on
+            # the table every time this bootstrap runs.
+            # tests/test_oracle_predictions_schema_parity.py keeps the two in step.
             conn.execute(text("""
                 ALTER TABLE oracle_predictions
                 ADD COLUMN IF NOT EXISTS horizon_days INTEGER
@@ -1593,17 +1602,31 @@ class OracleEngine:
                         if evt.get("signal_type") == pred_dir:
                             # Boost: 10% per source above minimum 3
                             src_count = evt.get("source_count", 0)
-                            combined_conf = evt.get("combined_confidence", 0.5)
-                            convergence_boost = 1.0 + 0.1 * (src_count - 2) * combined_conf
-                            # Inject convergence sources as additional signals
+                            combined_conf = evt.get("combined_confidence")
+                            if combined_conf is None:
+                                # Unscored convergence: the sources agree, but
+                                # nothing measured how far to trust them. The
+                                # old `or 0.5` amplified confidence by a number
+                                # no scorer produced. Agreement alone does not
+                                # size a prediction — no boost.
+                                convergence_boost = 1.0
+                            else:
+                                convergence_boost = 1.0 + 0.1 * (src_count - 2) * combined_conf
+                            # Inject convergence sources as additional signals —
+                            # only the ones carrying a measured trust, since
+                            # that value is both the signal's value and its
+                            # weight and there is no honest stand-in for it.
                             for src in evt.get("sources", []):
+                                src_trust = src.get("trust_score")
+                                if src_trust is None:
+                                    continue
                                 signals.append(Signal(
                                     name=f"convergence:{src['source_type']}",
                                     family="convergence",
-                                    value=src.get("trust_score", 0.5),
+                                    value=src_trust,
                                     z_score=1.5 if pred_dir == "BUY" else -1.5,
                                     direction="bullish" if pred_dir == "BUY" else "bearish",
-                                    weight=src.get("trust_score", 0.5),
+                                    weight=src_trust,
                                     freshness_hours=0,
                                 ))
                             break  # Use first matching convergence event
@@ -2636,6 +2659,9 @@ class EnsemblePredictor:
                 t=ticker,
                 e=str(exc),
             )
+        # 0.0 means "no catalyst we know of" — and the macro calendar is not
+        # ingested at all, so an FOMC week reads as 0.0 here. Absence of a
+        # catalyst only skips the dampening; it never boosts confidence.
         if catalyst_proximity > 0:
             confidence = round(confidence * (1.0 - 0.5 * catalyst_proximity), 4)
 

@@ -27,6 +27,42 @@ from intelligence.entity_resolver import _log_query_failure
 router = APIRouter(tags=["watchlist"])
 
 
+def _round_or_none(value, digits: int = 2) -> float | None:
+    """Round a nullable measurement, or return ``None`` when it is absent.
+
+    ``signal_sources.trust_score`` is NULL until ``intelligence.trust_scorer``
+    scores the source. NULL is *unscored*, not 0.5: the midpoint is
+    indistinguishable from a measured 0.5 on the wire and in the trust bar the
+    PWA draws from it. A measured ``0.0`` is a measurement and survives as
+    ``0.0`` — hence ``is None`` rather than a falsy test.
+
+    See docs/reference/CONFIDENCE_POLICY.md and
+    docs/reference/AVAILABILITY_CONTRACT.md.
+    """
+    if value is None:
+        return None
+    try:
+        return round(float(value), digits)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_price_action(ticker: str, price: float, pct_1d: float | None) -> str:
+    """Render the rule-based "Price Action" sentence.
+
+    ``pct_1d`` is a **fraction** everywhere in the price stack
+    (watchlist_helpers._fetch_live_price returns ``(price - prev) / prev``), so
+    it must be multiplied by 100 before it is printed with a ``%`` sign. The
+    previous code formatted the fraction directly, which rendered a +2.34% day
+    as "up 0.0%".
+    """
+    body = f"{ticker} is trading at ${price:.2f}."
+    if pct_1d is not None:
+        direction = "up" if pct_1d >= 0 else "down"
+        body += f" The stock is {direction} {abs(pct_1d) * 100:.1f}% on the day."
+    return body
+
+
 @router.get("/{ticker}/overview")
 def get_ticker_overview(
     ticker: str,
@@ -42,7 +78,7 @@ def get_ticker_overview(
         dict with keys: overview, key_levels, sentiment, generated_at,
         sector_path (for the capital-flow mini-chart).
     """
-    from datetime import datetime, date
+    from datetime import datetime
 
     _init_table()
     engine = get_db_engine()
@@ -73,8 +109,13 @@ def get_ticker_overview(
         if not price_info:
             live = _fetch_live_price(ticker_upper)
             if live:
-                price_info = {"price": live["price"], "pct_1d": live.get("pct_1d"), "source": "live"}
-                _cache_price_to_db(engine, ticker_upper, live["price"], date.today())
+                price_info = {
+                    "price": live["price"],
+                    "pct_1d": live.get("pct_1d"),
+                    "date": live.get("bar_date"),
+                    "source": "live",
+                }
+                _cache_price_to_db(engine, ticker_upper, live["price"], live.get("bar_date"))
 
         # Options (latest)
         try:
@@ -324,11 +365,9 @@ def get_ticker_overview(
     if sections is None:
         sections = []
         if price_info.get("price"):
-            price_body = f"{ticker_upper} is trading at ${price_info['price']:.2f}."
-            if price_info.get("pct_1d") is not None:
-                pct = price_info["pct_1d"]
-                direction = "up" if pct >= 0 else "down"
-                price_body += f" The stock is {direction} {abs(pct):.1f}% on the day."
+            price_body = _format_price_action(
+                ticker_upper, price_info["price"], price_info.get("pct_1d")
+            )
             sections.append({"title": "Price Action", "body": price_body})
         if options_info and options_info.get("put_call_ratio") is not None:
             pcr = options_info["put_call_ratio"]
@@ -460,7 +499,10 @@ def get_ticker_quote(
                 change_pct = live.get("pct_1d")
                 source = "live"
                 if price is not None:
-                    as_of_date = date.today()
+                    # as_of_date is the quote's own bar date when it has one;
+                    # None means "undated live quote", not "today" (C-M14).
+                    bar_date = live.get("bar_date")
+                    as_of_date = date.fromisoformat(bar_date) if bar_date else None
                     _cache_price_to_db(engine, ticker_upper, price, as_of_date)
         except Exception as exc:
             # Not a query: an outbound HTTP fetch. Always operational.
@@ -542,7 +584,10 @@ def get_ticker_edge(
                     "amount": meta.get("amount", "N/A"),
                     "date": sig.get("date", ""),
                     "committee": meta.get("committee", "N/A"),
-                    "trust_score": round(sig.get("trust_score", 0.5), 2),
+                    # null, never 0.5: a NULL signal_sources.trust_score means
+                    # the scorer has not run on this source, and a half-filled
+                    # trust bar is byte-identical to a measured 0.5.
+                    "trust_score": _round_or_none(sig.get("trust_score")),
                 })
             for sig in edge_data.get("insider", []):
                 meta = sig.get("metadata") or {}
@@ -555,8 +600,10 @@ def get_ticker_edge(
                     "name": sig.get("insider", "Unknown"),
                     "title": meta.get("title", ""),
                     "action": sig.get("direction", "BUY"),
-                    "shares": meta.get("shares", 0),
-                    "value": meta.get("value", 0),
+                    # null, never 0: a "0 shares / $0" insider row reads as an
+                    # observed trade of zero size.
+                    "shares": meta.get("shares"),
+                    "value": meta.get("value"),
                     "date": sig.get("date", ""),
                     "cluster": meta.get("cluster", False),
                 })
@@ -570,7 +617,9 @@ def get_ticker_edge(
                     except Exception:
                         dp_meta = {}
                 dark_pool = {
-                    "volume_vs_avg": dp_meta.get("volume_vs_avg", 1.0),
+                    # null, never 1.0: "exactly average dark-pool volume" is a
+                    # measurement, and this metadata simply did not carry one.
+                    "volume_vs_avg": dp_meta.get("volume_vs_avg"),
                     "signal": (
                         "accumulation" if latest_dp.get("direction") == "BUY"
                         else "distribution"
@@ -599,10 +648,12 @@ def get_ticker_edge(
                     except Exception:
                         meta = {}
                 whale_flow.append({
-                    "strike": meta.get("strike", 0),
-                    "expiry": meta.get("expiry", ""),
+                    # null, never 0: a "$0 strike" / "$0 premium" whale print
+                    # reads as an observed trade that never happened.
+                    "strike": meta.get("strike"),
+                    "expiry": meta.get("expiry") or None,
                     "direction": str(r[1]),
-                    "premium": meta.get("premium", 0),
+                    "premium": meta.get("premium"),
                     "date": str(r[2]),
                 })
             social_rows = conn.execute(text("""
@@ -623,7 +674,8 @@ def get_ticker_edge(
                     "source": meta.get("platform", "unknown"),
                     "user": str(r[0]),
                     "direction": str(r[1]),
-                    "trust_score": round(float(r[3]) if r[3] else 0.5, 2),
+                    # null when unscored; a measured 0.0 survives as 0.0.
+                    "trust_score": _round_or_none(r[3]),
                 })
             pred_rows = conn.execute(text("""
                 SELECT source_id, signal_date, metadata
@@ -641,8 +693,10 @@ def get_ticker_edge(
                         meta = {}
                 prediction_markets.append({
                     "market": meta.get("market", str(r[0])),
-                    "probability": meta.get("probability", 0.5),
-                    "change_24h": meta.get("change_24h", 0.0),
+                    # null, never 0.5/0.0: a 50% market-implied probability is a
+                    # tradeable-looking number that no market ever quoted.
+                    "probability": meta.get("probability"),
+                    "change_24h": meta.get("change_24h"),
                 })
     except Exception as exc:
         log.warning("Edge: signal_sources query failed for {t}: {e}", t=ticker_upper, e=str(exc))
@@ -699,28 +753,62 @@ def get_ticker_edge(
         log.debug("Edge: investigation_leads not available: {e}", e=str(exc))
 
     # 6. Convergence detection
-    convergence: dict = {"direction": "neutral", "source_count": 0, "confidence": 0.5}
+    #
+    # No event found is not a neutral 50% convergence: direction and confidence
+    # are null and ``status`` says which of the three states produced them —
+    # "none" (no event), "detected", "unavailable" (detection failed).
+    convergence: dict = {
+        "direction": None,
+        "source_count": 0,
+        "confidence": None,
+        "status": "none",
+    }
     try:
         from intelligence.trust_scorer import detect_convergence
         conv_events = detect_convergence(engine, ticker=ticker_upper)
         if conv_events:
             best = conv_events[0]
+            # detect_convergence emits direction (bullish/bearish/None) and a
+            # combined_confidence that is None when no source is scored.
             convergence = {
-                "direction": best.get("direction", "neutral").lower(),
+                "direction": best.get("direction"),
+                "direction_basis": best.get("direction_basis"),
                 "source_count": best.get("source_count", 0),
-                "confidence": round(best.get("combined_confidence", 0.5), 2),
+                "scored_source_count": best.get("scored_source_count", 0),
+                "confidence": _round_or_none(best.get("combined_confidence")),
+                "confidence_basis": best.get("confidence_basis"),
+                "status": "detected",
             }
     except Exception as exc:
         log.warning("Edge: convergence failed for {t}: {e}", t=ticker_upper, e=str(exc))
+        # A failed detection is unavailable, not a 0.5 convergence that survives
+        # the failure silently. The reason names the stage, never a number.
+        convergence = {
+            "direction": None,
+            "source_count": 0,
+            "confidence": None,
+            "status": "unavailable",
+            "reason": "convergence_detection_failed",
+        }
 
     # 7. Build edge_summary (rule-based)
-    source_count = convergence["source_count"]
-    direction = convergence["direction"]
+    source_count = convergence.get("source_count") or 0
+    direction = convergence.get("direction")
     parts: list[str] = []
     if source_count >= 3:
-        parts.append(f"{source_count} independent sources {direction}.")
+        # "N independent sources neutral." claimed a measured stance the
+        # convergence never resolved; say the direction is unresolved instead.
+        parts.append(
+            f"{source_count} independent sources {direction}."
+            if direction
+            else f"{source_count} independent sources, direction unresolved."
+        )
     elif source_count > 0:
-        parts.append(f"{source_count} source(s) leaning {direction}.")
+        parts.append(
+            f"{source_count} source(s) leaning {direction}."
+            if direction
+            else f"{source_count} source(s), direction unresolved."
+        )
     else:
         parts.append("Limited intelligence signals.")
 
