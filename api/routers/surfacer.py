@@ -15,7 +15,7 @@ from collections import Counter
 from datetime import date, datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -51,6 +51,35 @@ def _unit(value: Any) -> float:
     if parsed > 1:
         parsed = parsed / 100
     return _clamp(parsed, 0.0, 1.0)
+
+
+def _optional_unit(value: Any) -> float | None:
+    """Unit-scale a value, or return None when the source carried nothing.
+
+    Never invents a neutral default: a missing confidence stays missing so the
+    caller can report "confidence unknown" instead of a fabricated number.
+    """
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(parsed) or math.isinf(parsed):
+        return None
+    return _unit(parsed)
+
+
+def _confidence_phrase(confidence: float | None) -> str:
+    """Human-readable confidence, honest about the unknown case."""
+    if confidence is None:
+        return "confidence unknown"
+    return f"{round(confidence * 100)}% confidence"
+
+
+def _confidence_points(confidence: float | None) -> float:
+    """Score contribution of a confidence reading; unknown earns nothing."""
+    return confidence if confidence is not None else 0.0
 
 
 def _safe_json(value: Any) -> Any:
@@ -420,11 +449,14 @@ def _evidence_from_payload(payload: Any, source: str, timestamp: Any, limit: int
             if isinstance(item, dict):
                 label = item.get("label") or item.get("type") or item.get("source") or f"{source} {idx + 1}"
                 detail = item.get("detail") or item.get("text") or item.get("description") or item.get("reason") or _compact_payload(item)
-                weight = _unit(item.get("weight") or item.get("confidence") or 0.5)
+                raw_weight = item.get("weight")
+                if raw_weight is None:
+                    raw_weight = item.get("confidence")
+                weight = _optional_unit(raw_weight)
             else:
                 label = f"{source} {idx + 1}"
                 detail = _compact_payload(item)
-                weight = 0.5
+                weight = None
             evidence.append({
                 "source": source,
                 "label": _clean_label(label, source),
@@ -441,7 +473,7 @@ def _evidence_from_payload(payload: Any, source: str, timestamp: Any, limit: int
                 "label": _clean_label(key, source),
                 "detail": _sanitize_text(value, 500),
                 "timestamp": _iso(timestamp),
-                "weight": 0.5,
+                "weight": None,
             })
     elif parsed:
         evidence.append({
@@ -449,7 +481,7 @@ def _evidence_from_payload(payload: Any, source: str, timestamp: Any, limit: int
             "label": _clean_label(source, source),
             "detail": _sanitize_text(parsed, 500),
             "timestamp": _iso(timestamp),
-            "weight": 0.5,
+            "weight": None,
         })
 
     return evidence
@@ -720,10 +752,14 @@ def _extract_calibration_context(signals_payload: Any, model_name: Any = None) -
         fci_regime = parsed.get("fci_regime")
     if not contributions and model_name:
         contributions[str(model_name)] = 1.0
+    resolved_regime = str(regime or fci_regime or "").strip() or None
     return {
         "signal_contributions": contributions,
-        "regime": str(regime or fci_regime or "NEUTRAL"),
-        "fci_regime": str(fci_regime or ""),
+        # No regime on the row means the regime is unknown, not "NEUTRAL".
+        # A null here also skips the regime-conditional Brier lookup below,
+        # so a candidate is never calibrated against a guessed regime.
+        "regime": resolved_regime,
+        "fci_regime": str(fci_regime or "").strip() or None,
     }
 
 
@@ -991,7 +1027,7 @@ def _granular_calibration_requests(
     contributions = calibration.get("signal_contributions") or {}
     signal_sources = sorted(contributions) or ["oracle_aggregate"]
     requested_horizon = int(calibration_depth.get("requested_horizon_days") or _canonical_horizon_days(_horizon_days(candidate)))
-    regime = str(calibration.get("regime") or "NEUTRAL")
+    regime = str(calibration.get("regime") or "").strip() or None
     direction = str(candidate.get("direction") or "watch")
     cards = track_record.get("signal_scorecards") or []
     existing_sources = {str(card.get("signal_source")) for card in cards}
@@ -1139,15 +1175,20 @@ def _build_conviction_gate(
     else:
         gates.append(_gate("target", 0, 12, "missing", "No concrete ticker, basket, or instrument."))
 
-    confidence = _unit(candidate.get("confidence"))
+    confidence = _optional_unit(candidate.get("confidence"))
     evidence_count = len(candidate.get("evidence") or [])
-    evidence_score = min(15, confidence * 10 + min(5, evidence_count))
+    # An unknown confidence scores zero for the confidence term instead of
+    # borrowing a neutral default, and the detail says so out loud.
+    evidence_score = min(15, _confidence_points(confidence) * 10 + min(5, evidence_count))
+    confidence_detail = (
+        "confidence unknown" if confidence is None else f"stated confidence {round(confidence * 100)}%"
+    )
     gates.append(_gate(
         "evidence",
         evidence_score,
         15,
         "pass" if evidence_score >= 10 else "weak",
-        f"{evidence_count} evidence item{'s' if evidence_count != 1 else ''}; stated confidence {round(confidence * 100)}%.",
+        f"{evidence_count} evidence item{'s' if evidence_count != 1 else ''}; {confidence_detail}.",
     ))
 
     modeled_move = abs(_safe_float(candidate.get("expected_move_pct")))
@@ -1567,15 +1608,19 @@ def _oracle_candidate(row: Any) -> dict[str, Any]:
     ticker = str(data.get("ticker") or "").upper() or None
     direction = _direction_label(data.get("prediction_type"), data.get("direction"))
     calibration = _extract_calibration_context(data.get("signals"), data.get("model_name"))
-    confidence = _unit(data.get("confidence"))
+    confidence = _optional_unit(data.get("confidence"))
     signal_strength = _unit(data.get("signal_strength"))
     coherence = _unit(data.get("coherence"))
     move_pct = abs(_safe_float(data.get("expected_move_pct")))
     move_score = _clamp(move_pct * 2.0, 0.0, 20.0)
-    backtest = 70 if str(data.get("verdict") or "").lower() in {"hit", "partial"} else 45
-    risk_penalty = 8 if confidence < 0.35 else 0
+    # There is no backtest behind this number. It is a static prior keyed off
+    # the row's own settled verdict; an unsettled row carries no prior at all.
+    verdict = str(data.get("verdict") or "").strip().lower()
+    settled_verdict = verdict in {"hit", "partial", "miss"}
+    prior_weight = (70 if verdict in {"hit", "partial"} else 45) if settled_verdict else None
+    risk_penalty = 8 if (confidence is None or confidence < 0.35) else 0
     score = _clamp(
-        confidence * 35
+        _confidence_points(confidence) * 35
         + signal_strength * 20
         + coherence * 15
         + move_score
@@ -1591,15 +1636,17 @@ def _oracle_candidate(row: Any) -> dict[str, Any]:
     return {
         "id": f"oracle-{data.get('id')}",
         "title": f"{ticker or 'Market'} {_clean_label(direction)} setup",
-        "summary": f"{ticker or 'Market'} has a {direction} oracle read with {round(confidence * 100)}% confidence.",
+        "summary": f"{ticker or 'Market'} has a {direction} oracle read with {_confidence_phrase(confidence)}.",
         "why_now": "Fresh model prediction with supporting signal stack and flow context.",
         "alpha_score": round(score, 1),
         "score_parts": {
             "signal": round(signal_strength * 100, 1),
             "freshness": round(_freshness_points(data.get("created_at")) * 10, 1),
-            "confidence": round(confidence * 100, 1),
-            "backtest": backtest,
+            "confidence": round(confidence * 100, 1) if confidence is not None else None,
+            "prior_weight": prior_weight,
+            "prior_weight_basis": "static" if prior_weight is not None else "unavailable",
             "tradability": 80 if ticker else 45,
+            "tradability_basis": "static",
             "risk_penalty": risk_penalty,
         },
         "confidence": confidence,
@@ -1628,14 +1675,15 @@ def _signal_candidate(row: Any) -> dict[str, Any]:
     direction = _direction_label(data.get("direction"), signal_type)
     raw_confidence = data.get("confidence")
     confidence_known = raw_confidence is not None and _safe_float(raw_confidence) > 0
-    confidence = _unit(raw_confidence if confidence_known else 0.30)
+    # No confidence on the row means unknown — never a 0.30 stand-in.
+    confidence = _optional_unit(raw_confidence) if confidence_known else None
     magnitude = abs(_safe_float(data.get("magnitude")))
     magnitude_score = _clamp(math.log10(magnitude + 1) * 10, 0.0, 28.0)
     fresh_points = _freshness_points(data.get("created_at"))
     speculative = bool(ticker and ":" in ticker) or "dex" in str(signal_type or "").lower()
-    risk_penalty = (18 if speculative else 5) + (8 if not confidence_known else 0)
+    risk_penalty = (18 if speculative else 5) + (8 if confidence is None else 0)
     tradability = 35 if speculative else 65 if ticker else 30
-    score = _clamp(confidence * 30 + magnitude_score + fresh_points + 12 - risk_penalty)
+    score = _clamp(_confidence_points(confidence) * 30 + magnitude_score + fresh_points + 12 - risk_penalty)
     evidence = _evidence_from_payload(data.get("data"), "signal", data.get("created_at"))
     description = data.get("description") or f"{_clean_label(signal_type)} with magnitude {magnitude:.2f}"
 
@@ -1648,9 +1696,12 @@ def _signal_candidate(row: Any) -> dict[str, Any]:
         "score_parts": {
             "signal": round(magnitude_score / 35 * 100, 1),
             "freshness": round(fresh_points * 10, 1),
-            "confidence": round(confidence * 100, 1),
-            "backtest": 35,
+            "confidence": round(confidence * 100, 1) if confidence is not None else None,
+            # Signal rows have no scored verdict history behind them at all.
+            "prior_weight": None,
+            "prior_weight_basis": "unavailable",
             "tradability": tradability,
+            "tradability_basis": "static",
             "risk_penalty": risk_penalty,
         },
         "confidence": confidence,
@@ -1659,7 +1710,7 @@ def _signal_candidate(row: Any) -> dict[str, Any]:
         "horizon": "swing",
         "tickers": [ticker] if ticker else [],
         "trade_expression": _trade_expression(ticker, direction),
-        "status": "needs_research" if speculative or not confidence_known else (
+        "status": "needs_research" if speculative or confidence is None else (
             "new" if _freshness(data.get("created_at"))["label"] == "fresh" else "watch"
         ),
         "freshness": _freshness(data.get("created_at")),
@@ -1677,8 +1728,8 @@ def _signal_candidate(row: Any) -> dict[str, Any]:
         "candidate_type": "signal",
         "calibration": {
             "signal_contributions": {str(signal_type): 1.0} if signal_type else {},
-            "regime": "NEUTRAL",
-            "fci_regime": "",
+            "regime": None,
+            "fci_regime": None,
         },
     }
 
@@ -1686,15 +1737,15 @@ def _signal_candidate(row: Any) -> dict[str, Any]:
 def _hypothesis_candidate(row: Any) -> dict[str, Any]:
     data = row._mapping
     raw_confidence = data.get("confidence")
-    confidence = _unit(raw_confidence if raw_confidence is not None else 0.35)
+    confidence = _optional_unit(raw_confidence)
     tested = max(0, int(_safe_float(data.get("times_tested"))))
     correct = max(0, int(_safe_float(data.get("times_correct"))))
-    accuracy = correct / tested if tested else 0.0
+    accuracy = correct / tested if tested else None
     tested_bonus = min(15, tested * 2)
     unscored_penalty = 10 if tested == 0 else 0
     score = _clamp(
-        confidence * 38
-        + accuracy * 25
+        _confidence_points(confidence) * 38
+        + (accuracy or 0.0) * 25
         + tested_bonus
         + _freshness_points(data.get("created_at"))
         - unscored_penalty
@@ -1704,7 +1755,7 @@ def _hypothesis_candidate(row: Any) -> dict[str, Any]:
     tickers = _extract_tickers(data.get("thesis"), data.get("test_criteria"), data.get("evidence"))
     research_only = not is_internal and not tickers
     if is_internal:
-        confidence = min(confidence, 0.20)
+        confidence = min(confidence, 0.20) if confidence is not None else None
         score = min(score, 12)
         title = "Internal telemetry correlation"
     elif research_only:
@@ -1729,11 +1780,15 @@ def _hypothesis_candidate(row: Any) -> dict[str, Any]:
         ),
         "alpha_score": round(score, 1),
         "score_parts": {
-            "signal": round(confidence * 100, 1),
+            "signal": round(confidence * 100, 1) if confidence is not None else None,
             "freshness": round(_freshness_points(data.get("created_at")) * 10, 1),
-            "confidence": round(confidence * 100, 1),
-            "backtest": round(accuracy * 100, 1),
+            "confidence": round(confidence * 100, 1) if confidence is not None else None,
+            # Real test history from the hypothesis book, not a backtest and
+            # not a static prior — null until the hypothesis has been tested.
+            "prior_weight": round(accuracy * 100, 1) if accuracy is not None else None,
+            "prior_weight_basis": "hypothesis_test_history" if accuracy is not None else "unavailable",
             "tradability": 0 if is_internal else 15 if research_only else 55,
+            "tradability_basis": "static",
             "risk_penalty": 80 if is_internal else 35 if research_only else 10 if tested < 3 else 3,
         },
         "confidence": confidence,
@@ -1771,7 +1826,7 @@ def _hypothesis_candidate(row: Any) -> dict[str, Any]:
         "diagnostic": is_internal,
         "research_only": research_only,
         "candidate_type": "hypothesis",
-        "calibration": {"signal_contributions": {}, "regime": "NEUTRAL", "fci_regime": ""},
+        "calibration": {"signal_contributions": {}, "regime": None, "fci_regime": None},
     }
 
 
@@ -2186,6 +2241,7 @@ def _build_operator_brief(
 
 @router.get("/candidates")
 def list_candidates(
+    response: Response,
     limit: int = Query(16, ge=1, le=50),
     fresh_only: bool = Query(False),
     include_diagnostics: bool = Query(False),
@@ -2208,7 +2264,25 @@ def list_candidates(
                 missing_queue = _queue_missing_data_requests(conn, candidates)
             thesis = _fetch_thesis_snapshot(conn)
     except Exception as exc:
+        # An outage is not a market read. Never fall through to the brief
+        # builder here: an empty candidate list would render as a confident
+        # "Stand down / Nothing cleared the front page" call.
         log.warning("surfacer candidate query unavailable: {e}", e=str(exc))
+        response.headers["Cache-Control"] = "no-store"
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "status": "degraded",
+            "error": f"Surfacer candidate query unavailable: {exc}",
+            "message": "Surfacer could not read candidates. This is an outage, not a market call.",
+            "candidates": None,
+            "thesis": None,
+            "meta": {
+                "status": "degraded",
+                "count": None,
+                "mode": "alpha_triage",
+            },
+            "brief": None,
+        }
 
     selected, filtered_meta = _select_candidates(
         candidates,
@@ -2236,6 +2310,8 @@ def list_candidates(
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "status": "ok",
+        "error": None,
         "candidates": selected,
         "thesis": thesis,
         "meta": meta,
