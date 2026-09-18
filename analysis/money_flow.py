@@ -972,14 +972,21 @@ def _infer_flows(layers: list[dict], engine: Engine, as_of: date) -> list[dict]:
                 if nl_change is not None:
                     abs_vol = abs(nl_change)
                     direction = "inflow" if nl_change > 0 else "outflow"
+                    # The 50% / 30% split of the net-liquidity change into
+                    # equity and bond channels is an assumption, not an
+                    # observed flow, so these edges are "estimated" and
+                    # carry no period-over-period change (an earlier
+                    # version emitted a constant +11.1% "change" computed
+                    # as pct_change(v, 0.9 * v) on every request).
                     flows.append({
                         "from": "fed",
                         "to": "equities",
                         "volume": abs_vol * 0.5,
                         "direction": direction,
-                        "change": _safe_pct_change(abs_vol, abs_vol * 0.9),
+                        "change": None,
                         "label": f"Fed liquidity {'injection' if direction == 'inflow' else 'drain'}",
-                        "confidence": "confirmed",
+                        "confidence": "estimated",
+                        "basis": "net_liquidity_change_1m x 0.5 (assumed equity share)",
                     })
                     flows.append({
                         "from": "fed",
@@ -988,7 +995,8 @@ def _infer_flows(layers: list[dict], engine: Engine, as_of: date) -> list[dict]:
                         "direction": "inflow" if direction == "outflow" else "outflow",
                         "change": None,
                         "label": "Flight to/from safety",
-                        "confidence": "confirmed",
+                        "confidence": "estimated",
+                        "basis": "net_liquidity_change_1m x 0.3 (assumed bond share)",
                     })
                 continue
 
