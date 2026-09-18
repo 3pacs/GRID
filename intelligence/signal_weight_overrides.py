@@ -47,46 +47,39 @@ right/wrong ratios come from a corpus with contaminated scoring
 April 2026 dominates the scored predictions used to compute those
 ratios). Tainted labels must not silently drive live weights.
 
-This workstream (GRID W7b) deliberately separates that *safeguard
-capability* from any *operational policy decision* about whether to
-use it. This module, on its own, changes nothing about current
-production behaviour:
+GRID W7b split the *safeguard capability* (the ledger-enforcement
+knob below) from the *operational policy decision* of whether to turn
+it on. ``fable/learning-safeguards-20260918`` shipped the capability
+with both knobs defaulted to preserve current production behaviour.
 
-1. ``GRID_SIGNAL_OVERRIDES_ENABLED`` keeps its pre-existing default of
-   **True** — the master switch behaves exactly as it did before this
-   workstream. A deployment that leaves the env var unset continues to
-   apply the override table exactly as before.
-2. A NEW, independent knob, ``GRID_SIGNAL_OVERRIDES_REQUIRE_LEDGER``,
-   defaults to **False**. It controls whether a
-   ``governance.promotion_ledger`` approval is *required* before an
-   enabled override table is allowed to affect a live weight:
+**This branch (``fable/overrides-policy-20260918``) is the HELD
+policy flip** — see
+``docs/handoffs/2026-09-18/fable-w7-held-policy-flip.md`` for the
+required approval and rollback path. It changes the two defaults:
 
-   * ``require_ledger=False`` (default): legacy behaviour exactly —
-     overrides are applied whenever the master switch is on, with no
-     ledger check. Because this leaves tainted-corpus-derived weights
-     live with no auditable approval, this module logs **one**
-     WARNING (at first use) naming ``GRID_SIGNAL_OVERRIDES_REQUIRE_LEDGER``
-     and stating that overrides are being applied without a
-     promotion-ledger approval.
-   * ``require_ledger=True``: overrides are applied only if
-     ``governance.promotion_ledger`` has an **approved** record for
-     this exact override set: ``kind="weight_override"``, a
-     ``subject_hash`` over ``{SIGNAL_WEIGHT_OVERRIDES ∪
-     DEFERRED_SIGNAL_OVERRIDES, EVALUATION_VERSION}``, and the matching
-     ``evaluation_version``. No ledger match => log once at WARNING
-     and apply nothing (multiplier 1.0 / empty table).
+1. ``GRID_SIGNAL_OVERRIDES_ENABLED`` now defaults to **False** (was
+   True). A deployment that leaves the env var unset now applies NO
+   signal weight overrides — this stops today's live override
+   cuts/boosts until an operator explicitly re-enables it.
+2. ``GRID_SIGNAL_OVERRIDES_REQUIRE_LEDGER`` now defaults to **True**
+   (was False). Even if re-enabled, overrides are applied only if
+   ``governance.promotion_ledger`` has an **approved** record for
+   this exact override set: ``kind="weight_override"``, a
+   ``subject_hash`` over ``{SIGNAL_WEIGHT_OVERRIDES ∪
+   DEFERRED_SIGNAL_OVERRIDES, EVALUATION_VERSION}``, and the matching
+   ``evaluation_version``. No ledger match => log once at WARNING and
+   apply nothing (multiplier 1.0 / empty table). With
+   ``require_ledger=False`` (opt back in via env), the legacy
+   no-ledger-check path still exists and still logs its one WARNING
+   naming this knob.
 
 ``config.py`` does not define either env var as a pydantic-settings
 field (both are read directly from ``os.environ`` here, as before)
 and is out of scope for this change — **the deploy owner must check
 production's effective value of both env vars directly** (`.env`,
-systemd unit environment, etc.) to know which path is active. Actually
-flipping to the safer defaults (``SIGNAL_OVERRIDES_ENABLED=False``,
-``REQUIRE_LEDGER=True``) is a held operational policy change tracked
-separately — see ``docs/reference/LEARNING_PROMOTION_PROTOCOL.md``'s
-controller-decision list and the ``fable/overrides-policy-20260918``
-branch. The override *values* themselves are untouched by any of
-this — only whether/when they're allowed to affect a live weight.
+systemd unit environment, etc.) to know which path is active. The
+override *values* themselves are untouched by any of this — only
+whether/when they're allowed to affect a live weight.
 
 See ``get_override()`` and ``get_effective_overrides()`` below, and
 ``governance/promotion_ledger.py`` for the ledger API.
@@ -109,23 +102,22 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on", "enabled")
 
 
-# Master switch. Default True — the pre-existing production default,
-# preserved as-is by this workstream (see SAFEGUARDS note above). This
-# is NOT an endorsement that applying a contaminated-corpus-derived
-# override table is safe; it means this module does not silently
-# change current production behaviour. Whether to flip this off is a
-# held operational decision — see GRID_SIGNAL_OVERRIDES_REQUIRE_LEDGER
-# below and docs/handoffs/2026-09-18/fable-w7-held-policy-flip.md on
-# the fable/overrides-policy-20260918 branch.
-SIGNAL_OVERRIDES_ENABLED: bool = _env_bool("GRID_SIGNAL_OVERRIDES_ENABLED", True)
+# Master switch. Default False as of this HELD policy change (was
+# True on fable/learning-safeguards-20260918) — see
+# docs/handoffs/2026-09-18/fable-w7-held-policy-flip.md. This is a
+# live weight-policy change: any deployment that leaves the env var
+# unset now applies NO signal weight overrides, where it previously
+# applied the full table. Do not deploy this default without the
+# approval named in that handoff doc.
+SIGNAL_OVERRIDES_ENABLED: bool = _env_bool("GRID_SIGNAL_OVERRIDES_ENABLED", False)
 
-# Ledger-enforcement knob. Default False — legacy behaviour (no ledger
-# check) is preserved by default. Set to true to require an approved
-# governance.promotion_ledger record (matching this table's
-# subject_hash + EVALUATION_VERSION) before an enabled override table
-# is allowed to affect a live weight. See SAFEGUARDS note above.
+# Ledger-enforcement knob. Default True as of this HELD policy change
+# (was False) — an enabled override table now requires a matching
+# governance.promotion_ledger approval before it can affect a live
+# weight; with no approval, nothing is applied (plus one warning). See
+# docs/handoffs/2026-09-18/fable-w7-held-policy-flip.md.
 SIGNAL_OVERRIDES_REQUIRE_LEDGER: bool = _env_bool(
-    "GRID_SIGNAL_OVERRIDES_REQUIRE_LEDGER", False
+    "GRID_SIGNAL_OVERRIDES_REQUIRE_LEDGER", True
 )
 
 
