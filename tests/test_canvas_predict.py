@@ -279,7 +279,6 @@ class TestCanvasPredictDB:
         """Test that a prediction creates thesis, antithesis, and canvas node."""
         from sqlalchemy import text
         from api.routers.canvas_predict import create_prediction, PredictionRequest
-        import asyncio
 
         with self.engine.begin() as conn:
             board_id, node_ids = self._create_board_with_nodes(conn)
@@ -301,9 +300,7 @@ class TestCanvasPredictDB:
                 confidence=0.7,
             )
 
-            result = asyncio.new_event_loop().run_until_complete(
-                create_prediction(req, _token="test")
-            )
+            result = create_prediction(req, _token="test")
 
             assert result.hypothesis_id
             assert result.pattern_type == "canvas_investigation"
@@ -369,7 +366,6 @@ class TestCanvasPredictDB:
         """Verify thesis.pair_id -> antithesis and antithesis.pair_id -> thesis."""
         from sqlalchemy import text
         from api.routers.canvas_predict import create_prediction, PredictionRequest
-        import asyncio
 
         with self.engine.begin() as conn:
             board_id, node_ids = self._create_board_with_nodes(conn, "test_predict_pair")
@@ -387,9 +383,7 @@ class TestCanvasPredictDB:
                 confidence=0.6,
             )
 
-            result = asyncio.new_event_loop().run_until_complete(
-                create_prediction(req, _token="test")
-            )
+            result = create_prediction(req, _token="test")
 
             with self.engine.connect() as conn:
                 thesis = conn.execute(
@@ -413,7 +407,6 @@ class TestCanvasPredictDB:
         """Test bearish prediction sets correct thresholds."""
         from sqlalchemy import text
         from api.routers.canvas_predict import create_prediction, PredictionRequest
-        import asyncio
 
         with self.engine.begin() as conn:
             board_id, node_ids = self._create_board_with_nodes(conn, "test_predict_bear")
@@ -431,9 +424,7 @@ class TestCanvasPredictDB:
                 confidence=0.9,
             )
 
-            result = asyncio.new_event_loop().run_until_complete(
-                create_prediction(req, _token="test")
-            )
+            result = create_prediction(req, _token="test")
 
             with self.engine.connect() as conn:
                 row = conn.execute(
@@ -452,7 +443,6 @@ class TestCanvasPredictDB:
         """Test that an empty board raises 404."""
         from fastapi import HTTPException
         from api.routers.canvas_predict import create_prediction, PredictionRequest
-        import asyncio
 
         # Create a board with no nodes
         from sqlalchemy import text
@@ -476,9 +466,7 @@ class TestCanvasPredictDB:
             )
 
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.new_event_loop().run_until_complete(
-                    create_prediction(req, _token="test")
-                )
+                create_prediction(req, _token="test")
             assert exc_info.value.status_code == 404
             assert "no nodes" in str(exc_info.value.detail).lower()
 
@@ -489,7 +477,6 @@ class TestCanvasPredictDB:
         """Test that an invalid direction raises 400."""
         from fastapi import HTTPException
         from api.routers.canvas_predict import create_prediction, PredictionRequest
-        import asyncio
 
         with self.engine.begin() as conn:
             board_id, _ = self._create_board_with_nodes(conn, "test_predict_baddir")
@@ -507,9 +494,7 @@ class TestCanvasPredictDB:
             )
 
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.new_event_loop().run_until_complete(
-                    create_prediction(req, _token="test")
-                )
+                create_prediction(req, _token="test")
             assert exc_info.value.status_code == 400
 
         finally:
@@ -519,7 +504,6 @@ class TestCanvasPredictDB:
         """Test that out-of-range confidence gets clamped to [0, 1]."""
         from sqlalchemy import text
         from api.routers.canvas_predict import create_prediction, PredictionRequest
-        import asyncio
 
         with self.engine.begin() as conn:
             board_id, _ = self._create_board_with_nodes(conn, "test_predict_clamp")
@@ -537,9 +521,7 @@ class TestCanvasPredictDB:
                 confidence=1.5,  # Should clamp to 1.0
             )
 
-            result = asyncio.new_event_loop().run_until_complete(
-                create_prediction(req, _token="test")
-            )
+            result = create_prediction(req, _token="test")
             assert result.confidence == 1.0
 
             with self.engine.connect() as conn:
@@ -555,7 +537,6 @@ class TestCanvasPredictDB:
     def test_no_lever_no_conditions(self):
         """Test prediction without lever or conditions uses plain thesis."""
         from api.routers.canvas_predict import create_prediction, PredictionRequest
-        import asyncio
 
         with self.engine.begin() as conn:
             board_id, _ = self._create_board_with_nodes(conn, "test_predict_plain")
@@ -572,9 +553,7 @@ class TestCanvasPredictDB:
                 direction="bullish",
             )
 
-            result = asyncio.new_event_loop().run_until_complete(
-                create_prediction(req, _token="test")
-            )
+            result = create_prediction(req, _token="test")
 
             # Without lever/conditions, thesis should be plain text
             assert result.thesis == "Simple thesis without structure"
