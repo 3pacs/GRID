@@ -114,11 +114,6 @@ ALLOWLIST: dict[str, str] = {
         "prose: docstring usage example for check_recommendation()."
     ),
     # -- (batch) owned by another remediation batch ---------------------------
-    "api/routers/watchlist_overview.py::convergence: dict = {\"direction\": \"neutral\", \"source_count\": 0, \"confidence\": 0.5}": (
-        "batch: C1/C4 member in the watchlist batch (the ESTIMATED_PORTFOLIO "
-        "cluster, ranking #1). `convergence.confidence = 0.5` is the "
-        "no-convergence default."
-    ),
     "intelligence/adapters/earnings_adapter.py::z_score=None, confidence=0.6,": (
         "batch: registered-signal adapters emit a per-adapter prior; the "
         "signal-registry batch owns the adapter confidence contract."
