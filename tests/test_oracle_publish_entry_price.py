@@ -377,4 +377,7 @@ class TestSchemaAllowsNull:
 
         src = Path(engine_mod.__file__).read_text(encoding="utf-8")
         assert "entry_price DOUBLE PRECISION NOT NULL" not in src
-        assert "ALTER COLUMN entry_price DROP NOT NULL" in src
+        # The relaxation of an existing table lives in alembic, not in the
+        # bootstrap (see tests/test_oracle_predictions_schema_parity.py).
+        rev = Path(engine_mod.__file__).resolve().parents[1] / "migrations" / "versions" / "oracle_pred_nullable_0918.py"
+        assert "DROP NOT NULL" in rev.read_text(encoding="utf-8")

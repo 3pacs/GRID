@@ -646,19 +646,12 @@ class OracleEngine:
             # D-H11 / D-M32: `confidence` and `entry_price` are NULL when
             # nothing measured them. Both writers already bind None
             # (`_store_predictions` for a ticker with no spot, `oracle/publish.py`
-            # for an unsupplied confidence), so the original NOT NULL on these
-            # two columns is a constraint no writer honours. Dropped here
-            # rather than in alembic: `oracle_predictions` has no alembic
-            # revision at all -- this bootstrap is the table's only DDL source,
-            # and DROP NOT NULL is idempotent.
-            conn.execute(text("""
-                ALTER TABLE oracle_predictions
-                ALTER COLUMN entry_price DROP NOT NULL
-            """))
-            conn.execute(text("""
-                ALTER TABLE oracle_predictions
-                ALTER COLUMN confidence DROP NOT NULL
-            """))
+            # for an unsupplied confidence). The CREATE above carries the
+            # nullable shape for a fresh database; an existing table is
+            # relaxed by alembic revision ``oracle_pred_nullable_0918`` at
+            # deploy time, NOT here: ALTER COLUMN takes ACCESS EXCLUSIVE on
+            # the table every time this bootstrap runs.
+            # tests/test_oracle_predictions_schema_parity.py keeps the two in step.
             conn.execute(text("""
                 ALTER TABLE oracle_predictions
                 ADD COLUMN IF NOT EXISTS horizon_days INTEGER
