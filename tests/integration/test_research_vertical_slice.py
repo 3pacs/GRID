@@ -898,7 +898,12 @@ class TestHonestNoDataOutcomes:
         )
 
         assert result["era_results"][0]["status"] == "INSUFFICIENT_DATA"
-        assert result["full_period_metrics"] == {"return": 0.0, "sharpe": 0.0, "max_drawdown": 0.0}
+        # Subset check: the honest zero-result must carry these exact values; the
+        # evaluator may add explicit denominators (e.g. n_days=0 on #556) and must
+        # never add a fabricated non-zero figure.
+        fpm = result["full_period_metrics"]
+        assert {k: fpm[k] for k in ("return", "sharpe", "max_drawdown")} == {"return": 0.0, "sharpe": 0.0, "max_drawdown": 0.0}
+        assert all(v in (0, 0.0, None) for k, v in fpm.items() if k.startswith("n_"))
         assert result["overall_verdict"] == "FAIL"  # no valid eras -> FAIL, never PASS
 
         # Same "no data, never a crash" property through the full loop:
