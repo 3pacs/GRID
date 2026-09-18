@@ -48,7 +48,11 @@ LITERAL_PATTERNS = (
 )
 
 # ---------------------------------------------------------------------------
-# Allowlist: "<path>:<line>" -> reason.
+# Allowlist: "<path>::<stripped source line>" -> reason.
+#
+# Keyed by the line's text, not its number, so an unrelated edit above the
+# line (another batch adding code to the same file) cannot silently turn a
+# reviewed exemption into a false failure or a blanket one.
 #
 # A line may be allowlisted only because it is one of:
 #   (scored)   the number comes from a scored track record;
@@ -61,118 +65,118 @@ LITERAL_PATTERNS = (
 # ---------------------------------------------------------------------------
 ALLOWLIST: dict[str, str] = {
     # -- (zero) explicit "we have not measured this" sentinels ---------------
-    "api/routers/regime.py:190": (
+    "api/routers/regime.py::confidence=0.0,": (
         "zero: the UNCALIBRATED branch, returned when decision_journal has no "
         "row at all. 0.0 with state='UNCALIBRATED' is an explicit absence, "
         "not a midpoint."
     ),
-    "api/routers/regime.py:191": (
+    "api/routers/regime.py::transition_probability=0.0,": (
         "zero: transition_probability on the same UNCALIBRATED branch."
     ),
-    "intelligence/historical_scenario_library.py:249": (
+    "intelligence/historical_scenario_library.py::mean_confidence=0.0,": (
         "zero: mean_confidence of an empty match set."
     ),
-    "intelligence/historical_scenario_library.py:953": (
+    "intelligence/historical_scenario_library.py::mean_confidence=0.0,": (
         "zero: mean_confidence of an empty match set."
     ),
-    "intelligence/prediction_market_arbitrage.py:415": (
+    "intelligence/prediction_market_arbitrage.py::safe_confidence = 0.0": (
         "zero: unparseable oracle_confidence is floored to 0.0 and the "
         "multiplier is then held at 1.00 with an advisory explaining why."
     ),
-    "intelligence/prediction_market_arbitrage.py:418": (
+    "intelligence/prediction_market_arbitrage.py::safe_confidence = 0.0": (
         "zero: the NaN branch of the same guard."
     ),
-    "oracle/engine.py:1317": (
+    "oracle/engine.py::confidence=0.0,": (
         "zero: no-signal branch emits confidence 0.0, not a midpoint."
     ),
-    "oracle/engine.py:2573": (
+    "oracle/engine.py::confidence=0.0,": (
         "zero: no-signal branch emits confidence 0.0, not a midpoint."
     ),
-    "oracle/hallucination_guard.py:517": (
+    "oracle/hallucination_guard.py::original_confidence=0.0,": (
         "zero: original_confidence on the nothing-to-adjust branch."
     ),
-    "oracle/hallucination_guard.py:518": (
+    "oracle/hallucination_guard.py::adjusted_confidence=0.0,": (
         "zero: adjusted_confidence on the nothing-to-adjust branch."
     ),
-    "oracle/signal_aggregator.py:198": (
+    "oracle/signal_aggregator.py::direction=\"neutral\", strength=0.0, confidence=0.0, coherence=0.0,": (
         "zero: the empty-aggregate result (direction='neutral', strength=0.0, "
         "confidence=0.0, coherence=0.0) for an empty signal list."
     ),
     # -- (prose) not a live assignment ---------------------------------------
-    "intelligence/confidence_calibration.py:7": (
+    "intelligence/confidence_calibration.py::trades pinned at exactly ``confidence = 0.950`` (and another 65 at": (
         "prose: module docstring describing the defect this module exists to "
         "detect (trades pinned at exactly 0.950)."
     ),
-    "intelligence/self_learning_loop.py:68": (
+    "intelligence/self_learning_loop.py::output={\"classification\": \"bullish\", \"probability\": 0.72},": (
         "prose: module docstring usage example."
     ),
-    "oracle/risk.py:219": (
+    "oracle/risk.py::confidence=0.82,": (
         "prose: docstring usage example for check_recommendation()."
     ),
     # -- (batch) owned by another remediation batch ---------------------------
-    "api/routers/watchlist_overview.py:702": (
+    "api/routers/watchlist_overview.py::convergence: dict = {\"direction\": \"neutral\", \"source_count\": 0, \"confidence\": 0.5}": (
         "batch: C1/C4 member in the watchlist batch (the ESTIMATED_PORTFOLIO "
         "cluster, ranking #1). `convergence.confidence = 0.5` is the "
         "no-convergence default."
     ),
-    "intelligence/adapters/earnings_adapter.py:43": (
+    "intelligence/adapters/earnings_adapter.py::z_score=None, confidence=0.6,": (
         "batch: registered-signal adapters emit a per-adapter prior; the "
         "signal-registry batch owns the adapter confidence contract."
     ),
-    "intelligence/causation_graph.py:152": (
+    "intelligence/causation_graph.py::confidence = 0.1": (
         "batch: causal-chain batch. The geometric-mean branch above it is "
         "computed; only the empty-`probs` fallback is a literal."
     ),
-    "intelligence/causation_graph.py:464": (
+    "intelligence/causation_graph.py::probability=0.95,": (
         "batch: causal-chain batch. A hand-set link probability."
     ),
-    "intelligence/causation_graph.py:508": (
+    "intelligence/causation_graph.py::probability=0.9,": (
         "batch: causal-chain batch. A hand-set link probability."
     ),
-    "intelligence/news_impact.py:226": (
+    "intelligence/news_impact.py::confidence=0.6,": (
         "batch: catalyst/attribution batch owns per-catalyst confidence."
     ),
-    "intelligence/obsidian_agent.py:167": (
+    "intelligence/obsidian_agent.py::\"confidence\": 0.5,": (
         "batch: writes an oracle_predictions row with confidence 0.5 for a "
         "vault_alpha placeholder; the oracle-writers batch owns it. Note "
         "oracle/calibration.py now excludes null-confidence rows, so this "
         "row still scores until that batch lands."
     ),
-    "intelligence/postmortem.py:1587": (
+    "intelligence/postmortem.py::\"confidence\": 0.5,": (
         "batch: post-mortem LLM fallback defaults; the post-mortem batch "
         "owns them."
     ),
-    "intelligence/sec_filing_extractor.py:381": (
+    "intelligence/sec_filing_extractor.py::confidence=0.35,  # Lower confidence for keyword-only match": (
         "batch: filing-extraction batch. A keyword-only match prior."
     ),
-    "intelligence/trend_tracker.py:305": (
+    "intelligence/trend_tracker.py::confidence=0.4,": (
         "batch: trend-tracker batch owns the per-trend confidence priors."
     ),
-    "intelligence/trend_tracker.py:668": (
+    "intelligence/trend_tracker.py::confidence=0.6,": (
         "batch: trend-tracker batch owns the per-trend confidence priors."
     ),
-    "intelligence/trend_tracker.py:693": (
+    "intelligence/trend_tracker.py::confidence=0.55,": (
         "batch: trend-tracker batch owns the per-trend confidence priors."
     ),
-    "intelligence/trend_tracker.py:716": (
+    "intelligence/trend_tracker.py::confidence=0.5,": (
         "batch: trend-tracker batch owns the per-trend confidence priors."
     ),
-    "oracle/claim_extractor.py:153": (
+    "oracle/claim_extractor.py::confidence=0.9,": (
         "batch: publishing-firewall internals. A per-pattern extraction "
         "prior, never emitted as an API `confidence`. /chat/ask's "
         "verified_claim_ratio is built from claim_count and flagged_count "
         "(verdict-based), not from these numbers."
     ),
-    "oracle/claim_extractor.py:167": "batch: publishing-firewall internals.",
-    "oracle/claim_extractor.py:182": "batch: publishing-firewall internals.",
-    "oracle/claim_extractor.py:195": "batch: publishing-firewall internals.",
-    "oracle/claim_verifier.py:127": "batch: publishing-firewall internals.",
-    "oracle/claim_verifier.py:132": "batch: publishing-firewall internals.",
-    "oracle/claim_verifier.py:151": "batch: publishing-firewall internals.",
-    "oracle/claim_verifier.py:156": "batch: publishing-firewall internals.",
-    "oracle/claim_verifier.py:176": "batch: publishing-firewall internals.",
-    "oracle/claim_verifier.py:181": "batch: publishing-firewall internals.",
-    "oracle/claim_verifier.py:190": "batch: publishing-firewall internals.",
+    "oracle/claim_extractor.py::confidence=0.85,": "batch: publishing-firewall internals.",
+    "oracle/claim_extractor.py::confidence=0.7,": "batch: publishing-firewall internals.",
+    "oracle/claim_extractor.py::confidence=0.8,": "batch: publishing-firewall internals.",
+    "oracle/claim_verifier.py::claim=claim, verdict=\"supported\", confidence=0.9,": "batch: publishing-firewall internals.",
+    "oracle/claim_verifier.py::claim=claim, verdict=\"contradicted\", confidence=0.9,": "batch: publishing-firewall internals.",
+    "oracle/claim_verifier.py::claim=claim, verdict=\"supported\", confidence=0.85,": "batch: publishing-firewall internals.",
+    "oracle/claim_verifier.py::claim=claim, verdict=\"contradicted\", confidence=0.85,": "batch: publishing-firewall internals.",
+    "oracle/claim_verifier.py::claim=claim, verdict=\"supported\", confidence=0.8,": "batch: publishing-firewall internals.",
+    "oracle/claim_verifier.py::claim=claim, verdict=\"contradicted\", confidence=0.8,": "batch: publishing-firewall internals.",
+    "oracle/claim_verifier.py::claim=claim, verdict=\"ambiguous\", confidence=0.3,": "batch: publishing-firewall internals.",
 }
 
 _ALLOWED_PREFIXES = ("scored:", "zero:", "prose:", "batch:")
@@ -207,7 +211,7 @@ class TestSourceScan:
         offenders = [
             f"{rel}:{lineno}  {line}"
             for rel, lineno, line in _scan()
-            if f"{rel}:{lineno}" not in ALLOWLIST
+            if f"{rel}::{line}" not in ALLOWLIST
         ]
         assert not offenders, (
             "Literal confidence/probability assignment outside the allowlist.\n"
@@ -224,7 +228,7 @@ class TestSourceScan:
         Without this the allowlist rots into a blanket exemption whose line
         numbers point at unrelated code.
         """
-        live = {f"{rel}:{lineno}" for rel, lineno, _ in _scan()}
+        live = {f"{rel}::{line}" for rel, _, line in _scan()}
         stale = sorted(set(ALLOWLIST) - live)
         assert not stale, (
             "Allowlist entries that no longer match a literal (fixed, moved, "
