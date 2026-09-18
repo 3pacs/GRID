@@ -34,7 +34,7 @@ from governance.promotion_ledger import PROMOTION_LEDGER_DDL
 
 # revision identifiers, used by Alembic.
 revision: str = "promotion_ledger_0918"
-down_revision: Union[str, Sequence[str], None] = "god_view_market_tables_20260918"
+down_revision: Union[str, Sequence[str], None] = "signal_evaluations_0918"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
