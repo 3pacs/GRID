@@ -1192,7 +1192,11 @@ def _latest_signal_context(engine: Any, ticker: str) -> dict[str, Any]:
             if regime_row:
                 regime = {
                     "state": regime_row[0],
-                    "confidence": float(regime_row[1] or 0),
+                    # None = unscored. ``or 0`` fabricated a 0% reading.
+                    "confidence": (
+                        float(regime_row[1]) if regime_row[1] is not None
+                        else None
+                    ),
                     "grid_recommendation": regime_row[2],
                     "operator_confidence": regime_row[3],
                     "as_of": _as_utc(regime_row[4]).isoformat() if _as_utc(regime_row[4]) else str(regime_row[4]),
