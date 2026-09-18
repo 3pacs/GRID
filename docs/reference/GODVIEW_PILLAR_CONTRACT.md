@@ -438,6 +438,61 @@ completely untouched — this pillar writes to a NEW table,
 cannot represent a per-issuer figure without blurring measured vs.
 assumed.
 
+## 16. Dealer gamma exposure (GEX) pillar
+
+`godview/dealer_gex_pillar.py`. A from-scratch engine over the tracked
+`options_snapshots` table — the untracked, incident-evidence
+`derivatives/dealer_gex_engine.py` in the sibling `GRID` checkout was never
+read (explicitly out of bounds for this lane's read-only-cross-branch
+rules). Every output field is `provenance='modeled'`; nothing here is
+`measured` (except the resolved spot price, which is a real PIT-resolved
+price read through `store/pit.py`).
+
+**Sign convention (a stated modeling assumption, not a derivation):**
+`options_snapshots` carries no real dealer/customer position split, so
+dealers are modeled net short the customer side of both calls and puts.
+Following the standard public GEX methodology, CALL open interest
+contributes **+gamma** and PUT open interest contributes **-gamma** to net
+dealer exposure at each strike — disclosed verbatim in every API response
+as `sign_convention_note` (`SIGN_CONVENTION_NOTE`).
+
+**Gamma:** hand-rolled Black-Scholes Gamma, `r=0`, `q=0` (both assumed
+zero, a standard simplification for gamma specifically — disclosed as
+`gamma_assumptions_note`). `implied_vol` is read directly from
+`options_snapshots`, never solved for or defaulted; a contract with a
+missing/non-positive IV, or `expiry <= snap_date`, is skipped and counted
+against `coverage_fraction` (`contracts_used`/`contracts_present`), never
+substituted with a literal (e.g. never a 0.25 IV default).
+
+**Spot price:** resolved via the same candidate-name rule
+`api/routers/watchlist_helpers.py::_resolve_feature_names` uses, then read
+through `store/pit.py::PITStore.get_pit` (`LATEST_AS_OF`) — replicating
+(not importing, since it lives on the unmerged
+`origin/fable/signal-eval-20260918`) `evaluation/prices.py`'s own resolver:
+zero or multiple `feature_registry` matches, or no PIT-available price,
+means the WHOLE ticker/date is `unavailable` — never a median-strike or
+other proxy for a real spot.
+
+**Gamma flip:** cumulative net gamma across strikes in ascending order; the
+flip is the linearly interpolated strike where that cumulative sum's SIGN
+changes. No sign change anywhere in the chain → `gamma_flip_strike:
+unavailable` — never an endpoint strike, never a guess. Validated against
+three synthetic cases in `tests/godview/test_dealer_gex_pillar_pure.py`: a
+symmetric put/call chain (flip lands between the two strikes, near spot),
+an all-calls chain (never crosses → `unavailable`), and a chain with half
+its contracts missing IV (coverage < 1, those contracts skipped rather
+than defaulted).
+
+**Explicitly never computed: any claim that a figure here matches a real
+dealer's actual book.** No real captured options chain fixture exists
+anywhere in this codebase to validate the engine's sign convention or
+modeled-dealer-positioning assumption against a known-correct GEX number —
+named exactly as `MISSING_INPUT`, returned in every API response as
+`missing_input`. This is the concrete input this lane could not obtain and
+the specific claim it prevents: a claim of accuracy against real dealer
+positioning, as opposed to internal mechanical correctness (which the
+three synthetic cases do validate).
+
 ## Status of all seven God View pillars (2026-09-18)
 
 | pillar | status | why |
@@ -449,9 +504,10 @@ assumed.
 | FINRA short volume | **built** | full slice; realistically `unavailable(never_configured)` in production until the puller is scheduled (deployment decision, not a code gap) |
 | SEC Reg SHO FTD | **built** | full slice; outstanding balance only, no timeline/squeeze score; realistically `unavailable(never_configured)` until the puller is scheduled |
 | Corporate buyback blackouts | **built** | modeled quiet-window calendar only; no dollar/% figures — those need EDGAR repurchase disclosures, absent from this DB |
-| Dealer GEX | not built | engine correctness unproven |
+| Dealer GEX | **built** | from-scratch engine, `provenance='modeled'` throughout; mechanically validated by 3 synthetic cases; no real captured chain fixture exists to validate against a known-correct figure — see section 16 |
 
-Every "not built" pillar's specific reason is returned verbatim by
-`GET /api/v1/godview/pillars/<name>` (via `api/routers/godview_pillars.py`'s
-`_KNOWN_UNBUILT_PILLARS` map) and rendered in the corresponding `NotBuiltCard` in
-`GodViewPillars.jsx` — never a silent 404, never a fabricated value.
+Every God View pillar named in this contract is now built (2026-09-18).
+Any pillar name this router does not recognize still renders the honest
+"not built yet" state via `api/routers/godview_pillars.py`'s
+`_KNOWN_UNBUILT_PILLARS` map / catch-all route (currently empty, kept for
+future pillars) — never a silent 404, never a fabricated value.

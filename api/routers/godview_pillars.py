@@ -2,9 +2,13 @@
 
 Built: CFTC positioning, Fed net liquidity, commodity warehouses (LME leg
 only -- Cushing is permanently unavailable(never_configured), see
-godview/commodity_warehouse_pillar.py). Every other pillar name renders the
-honest "not built yet" state, with the specific reason it is blocked --
-see docs/reference/GODVIEW_PILLAR_CONTRACT.md's status table.
+godview/commodity_warehouse_pillar.py), FINRA short volume, SEC
+Reg SHO FTD, corporate buyback blackout windows, and dealer GEX (2026-09-18,
+all four remaining pillars per operator direction -- see
+docs/reference/GODVIEW_PILLAR_CONTRACT.md's status table for each one's
+concrete missing input). Any unrecognized pillar name renders the honest
+"not built yet" state via ``_KNOWN_UNBUILT_PILLARS`` / the catch-all route
+below, never a fabricated value or a silent 404.
 
 Never raises 500 for a missing table: every table this router reads is
 probed with ``to_regclass`` first, mirroring the ``_table_exists`` pattern
@@ -83,6 +87,13 @@ from godview.buyback_pillar import (
     PILLAR_NAME as BUYBACK_PILLAR_NAME,
     read_buyback_pillar,
 )
+from godview.dealer_gex_pillar import (
+    GAMMA_ASSUMPTIONS_NOTE as GEX_GAMMA_ASSUMPTIONS_NOTE,
+    MISSING_INPUT as GEX_MISSING_INPUT,
+    PILLAR_NAME as GEX_PILLAR_NAME,
+    SIGN_CONVENTION_NOTE as GEX_SIGN_CONVENTION_NOTE,
+    read_dealer_gex_pillar,
+)
 from store.availability import unavailable
 from store.availability_fields import (
     STALE_MATERIALIZER_FAILED,
@@ -101,9 +112,7 @@ router = APIRouter(prefix="/api/v1/godview", tags=["godview"])
 #: is blocked (operator direction, 2026-09-18) -- kept explicit (rather than
 #: a catch-all) so a typo in the URL still reads as "not built" honestly,
 #: not a silent 404.
-_KNOWN_UNBUILT_PILLARS = {
-    "dealer_gex": "engine correctness unproven",
-}
+_KNOWN_UNBUILT_PILLARS: dict[str, str] = {}
 
 _RAW_FIELD_UNIT = {
     "total_open_interest": "contracts",
@@ -720,6 +729,99 @@ def get_buyback_pillar(
         "generation_id": result.generation_id,
         "generation_published_at": result.generation_published_at.isoformat() if result.generation_published_at else None,
         "issuers": issuers,
+    }
+
+
+def _gex_field_records(row: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    basis = row.get("availability_basis")
+    basis_note = _availability_basis_note(basis)
+    common = {
+        "obs_date": row["obs_date"],
+        "published_at": row["obs_date"],
+        "available_at": None,
+        "revision": row["generation_id"],
+        "source_catalog": "options_snapshots",
+        "series_id": row["ticker"],
+    }
+    out: dict[str, dict[str, Any]] = {}
+
+    spot_record = measured_field(row["spot_price"], unit="usd_per_share", **common).to_dict()
+    spot_record["availability_basis"] = basis
+    spot_record["availability_basis_note"] = basis_note
+    out["spot_price"] = spot_record
+
+    modeled_specs = {
+        "net_gex_usd_m": "usd_millions_per_1pct_move",
+        "call_gex_usd_m": "usd_millions_per_1pct_move",
+        "put_gex_usd_m": "usd_millions_per_1pct_move",
+        "gamma_flip_strike": "usd_per_share",
+        "spot_to_flip_pct": "pct",
+        "gex_regime": None,
+        "max_pain_strike": "usd_per_share",
+        "put_call_oi_ratio": "ratio",
+        "atm_iv": "annualized_vol",
+    }
+    for name, unit in modeled_specs.items():
+        value = row[name]
+        if value is None:
+            record = unavailable_field(
+                STALE_PARTIAL_HISTORY, unit=unit, calculation_version="dealer_gex_pillar_v1",
+                coverage_fraction=row["coverage_fraction"], **common,
+            ).to_dict()
+        else:
+            record = modeled_field(
+                value, unit=unit, calculation_version="dealer_gex_pillar_v1",
+                coverage_fraction=row["coverage_fraction"], **common,
+            ).to_dict()
+        record["availability_basis"] = basis
+        record["availability_basis_note"] = basis_note
+        out[name] = record
+    return out
+
+
+@router.get("/pillars/dealer_gex")
+def get_dealer_gex_pillar(
+    as_of: Annotated[date | None, Query()] = None,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Dealer gamma exposure (GEX) pillar -- a from-scratch engine over
+    options_snapshots. Every gamma figure is provenance='modeled' (a stated
+    sign convention, never a measured dealer position) -- see
+    GEX_SIGN_CONVENTION_NOTE and godview/dealer_gex_pillar.py's docstring.
+    No real captured chain fixture exists to validate this engine against a
+    known-correct figure -- see GEX_MISSING_INPUT."""
+    as_of = as_of or date.today()
+    engine = get_db_engine()
+
+    try:
+        with engine.connect() as conn:
+            if not _table_exists(conn, "dealer_gex_daily") or not _table_exists(conn, "godview_generations"):
+                return unavailable(
+                    "dealer_gex_daily or godview_generations does not exist yet",
+                    source=GEX_PILLAR_NAME, pillar=GEX_PILLAR_NAME, coverage=None,
+                )
+            result = read_dealer_gex_pillar(conn, as_of)
+    except Exception as exc:  # noqa: BLE001
+        return unavailable(f"godview read failed: {exc}", source=GEX_PILLAR_NAME, pillar=GEX_PILLAR_NAME, coverage=None)
+
+    if result.state == "never_configured":
+        return unavailable(STALE_NEVER_CONFIGURED, source=GEX_PILLAR_NAME, pillar=GEX_PILLAR_NAME, coverage=None)
+    if result.state == "materializer_failed":
+        return unavailable(STALE_MATERIALIZER_FAILED, source=GEX_PILLAR_NAME, pillar=GEX_PILLAR_NAME, coverage=None)
+
+    fields_by_ticker = {row["ticker"]: _gex_field_records(row) for row in result.rows}
+    return {
+        "available": True,
+        "status": "ok" if fields_by_ticker else "partial",
+        "pillar": GEX_PILLAR_NAME,
+        "as_of": as_of.isoformat(),
+        "sign_convention_note": GEX_SIGN_CONVENTION_NOTE,
+        "gamma_assumptions_note": GEX_GAMMA_ASSUMPTIONS_NOTE,
+        "missing_input": GEX_MISSING_INPUT,
+        "tickers_with_data": result.tickers_with_data,
+        "generation_id": result.generation_id,
+        "generation_published_at": result.generation_published_at.isoformat() if result.generation_published_at else None,
+        "fields": fields_by_ticker,
     }
 
 

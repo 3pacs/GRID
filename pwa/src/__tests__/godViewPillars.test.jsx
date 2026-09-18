@@ -24,7 +24,7 @@ function deferred() {
  * commodity_warehouses). Route the mock by path so a test about one pillar
  * doesn't leak its response into the other two cards' assertions.
  */
-function mockPillars({ cftc, fed, cmdty, finra, ftd, buyback } = {}) {
+function mockPillars({ cftc, fed, cmdty, finra, ftd, buyback, gex } = {}) {
     api.get.mockImplementation((path) => {
         if (path.includes('/pillars/cftc')) return Promise.resolve(cftc ?? NEVER_CONFIGURED);
         if (path.includes('/pillars/fed_net_liquidity')) return Promise.resolve(fed ?? NEVER_CONFIGURED);
@@ -34,6 +34,7 @@ function mockPillars({ cftc, fed, cmdty, finra, ftd, buyback } = {}) {
         if (path.includes('/pillars/finra_short_volume')) return Promise.resolve(finra ?? NEVER_CONFIGURED);
         if (path.includes('/pillars/sec_regsho_ftd')) return Promise.resolve(ftd ?? NEVER_CONFIGURED);
         if (path.includes('/pillars/buyback_blackouts')) return Promise.resolve(buyback ?? NEVER_CONFIGURED);
+        if (path.includes('/pillars/dealer_gex')) return Promise.resolve(gex ?? NEVER_CONFIGURED);
         return Promise.resolve(NEVER_CONFIGURED);
     });
 }
@@ -180,13 +181,13 @@ describe('GodViewPillars view', () => {
         expect(within(screen.getByTestId('cftc-pillar-card')).getByText(/network down/)).toBeInTheDocument();
     });
 
-    it('always renders the not-built-yet card for the remaining pillar, with its reason', async () => {
+    it('renders no not-built-yet cards now that every known pillar is built', async () => {
         mockPillars();
 
         render(<GodViewPillars />);
 
-        await waitFor(() => expect(screen.getAllByTestId('pillar-card-not-built').length).toBe(1));
-        expect(screen.getByText(/engine correctness unproven/)).toBeInTheDocument();
+        await waitFor(() => expect(screen.getByTestId('dealer-gex-card')).toHaveAttribute('data-state', 'unavailable'));
+        expect(screen.queryAllByTestId('pillar-card-not-built').length).toBe(0);
     });
 
     it('shows an inferred badge for a field whose availability_basis is inferred_schedule', async () => {
@@ -417,5 +418,43 @@ describe('GodViewPillars view', () => {
         expect(card.getByTestId('missing-input-note')).toHaveTextContent(/EDGAR/);
         expect(card.getByText('AAPL')).toBeInTheDocument();
         expect(card.getByText('quiet_window')).toBeInTheDocument();
+    });
+
+    it('renders the dealer GEX pillar with the sign-convention and missing-input notes', async () => {
+        mockPillars({
+            gex: {
+                available: true,
+                status: 'ok',
+                pillar: 'dealer_gex',
+                as_of: '2026-09-18',
+                sign_convention_note: 'dealers modeled net short the customer side of both calls and puts; call OI contributes +gamma, put OI contributes -gamma to net dealer exposure (standard public GEX methodology, a stated modeling assumption -- options_snapshots carries no real dealer/customer position split)',
+                gamma_assumptions_note: 'Black-Scholes gamma, r=0.0, q=0.0 (both assumed 0, a standard simplification); implied_vol read directly from options_snapshots, never solved for or defaulted',
+                missing_input: 'no real captured options chain fixture exists to validate this engine against a known-correct GEX figure',
+                tickers_with_data: 1,
+                generation_id: 'gen-gex-1',
+                generation_published_at: '2026-09-18T21:00:00+00:00',
+                fields: {
+                    AAPL: {
+                        spot_price: { availability: 'available', provenance: 'measured', value: 100.0, unit: 'usd_per_share' },
+                        net_gex_usd_m: { availability: 'available', provenance: 'modeled', value: 42.5, unit: 'usd_millions_per_1pct_move' },
+                        gamma_flip_strike: { availability: 'available', provenance: 'modeled', value: 100.98, unit: 'usd_per_share' },
+                        spot_to_flip_pct: { availability: 'available', provenance: 'modeled', value: 0.98, unit: 'pct' },
+                        gex_regime: { availability: 'available', provenance: 'modeled', value: 'long_gamma', unit: null },
+                        max_pain_strike: { availability: 'available', provenance: 'modeled', value: 100.0, unit: 'usd_per_share' },
+                        put_call_oi_ratio: { availability: 'available', provenance: 'modeled', value: 1.0, unit: 'ratio' },
+                        atm_iv: { availability: 'available', provenance: 'modeled', value: 0.3, unit: 'annualized_vol' },
+                    },
+                },
+            },
+        });
+
+        render(<GodViewPillars />);
+
+        await waitFor(() => expect(screen.getByTestId('dealer-gex-card')).toHaveAttribute('data-state', 'available'));
+        const card = within(screen.getByTestId('dealer-gex-card'));
+        expect(card.getByTestId('sign-convention-note')).toHaveTextContent(/\+gamma.*-gamma/);
+        expect(card.getByTestId('gex-missing-input-note')).toHaveTextContent(/no real captured options chain fixture/);
+        expect(card.getByText('AAPL')).toBeInTheDocument();
+        expect(card.getByText('long_gamma')).toBeInTheDocument();
     });
 });

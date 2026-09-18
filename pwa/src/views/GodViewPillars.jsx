@@ -7,14 +7,15 @@ import { colors, shared } from '../styles/shared.js';
  *
  * Built: CFTC positioning, Fed net liquidity, commodity warehouses (LME leg
  * only — Cushing is permanently unavailable(never_configured), rendered
- * honestly rather than omitted). Every other pillar renders "not built yet"
- * with the SPECIFIC reason it is blocked, never a silent omission or a
- * fabricated value — see docs/reference/GODVIEW_PILLAR_CONTRACT.md.
+ * honestly rather than omitted), FINRA short volume, SEC Reg SHO FTD,
+ * corporate buyback blackout windows, and dealer gamma exposure (2026-09-18
+ * — all four remaining pillars per operator direction). Any future
+ * not-yet-built pillar renders "not built yet" with the SPECIFIC reason it
+ * is blocked, never a silent omission or a fabricated value — see
+ * docs/reference/GODVIEW_PILLAR_CONTRACT.md.
  */
 
-const NOT_BUILT_PILLARS = [
-    { key: 'dealer_gex', label: 'Dealer Gamma Exposure', reason: 'engine correctness unproven' },
-];
+const NOT_BUILT_PILLARS = [];
 
 function fmtValue(v, digits = 2) {
     if (v == null) return '—';
@@ -508,6 +509,68 @@ function BuybackBlackoutCard({ data, error }) {
     );
 }
 
+function DealerGexCard({ data, error }) {
+    const cardStyle = {
+        background: colors.card, border: `1px solid ${colors.border}`, borderRadius: 10, padding: 16, marginBottom: 16,
+    };
+
+    if (error) {
+        return <div style={cardStyle} data-testid="dealer-gex-card" data-state="error">
+            <div style={{ color: colors.text, fontWeight: 600, marginBottom: 8 }}>Dealer Gamma Exposure</div>
+            <div style={{ color: colors.red }}>Failed to load: {error}</div>
+        </div>;
+    }
+    if (!data) {
+        return <div style={cardStyle} data-testid="dealer-gex-card" data-state="loading">
+            <div style={{ color: colors.text, fontWeight: 600 }}>Dealer Gamma Exposure</div>
+            <div style={{ color: colors.textDim, marginTop: 8 }}>Loading…</div>
+        </div>;
+    }
+    if (data.available === false) {
+        return <div style={cardStyle} data-testid="dealer-gex-card" data-state="unavailable">
+            <UnavailablePanel label="Dealer Gamma Exposure" payload={data} />
+        </div>;
+    }
+
+    const fields = data.fields || {};
+    const tickers = Object.keys(fields);
+
+    return (
+        <div style={cardStyle} data-testid="dealer-gex-card" data-state="available">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 4 }}>
+                <div style={{ color: colors.text, fontWeight: 600, fontSize: 16 }}>Dealer Gamma Exposure</div>
+                <div style={{ fontSize: 11, color: colors.textMuted }}>as of {data.as_of}</div>
+            </div>
+            <div style={{ fontSize: 11, color: colors.yellow, marginBottom: 4 }} data-testid="sign-convention-note">
+                {data.sign_convention_note}
+            </div>
+            <div style={{ fontSize: 11, color: colors.textMuted, marginBottom: 10 }} data-testid="gex-missing-input-note">
+                {data.missing_input}
+            </div>
+            {tickers.length === 0 ? (
+                <div style={{ color: colors.textMuted, fontSize: 13 }}>no qualifying rows as of this date</div>
+            ) : (
+                tickers.map((ticker) => (
+                    <div key={ticker} style={{ marginBottom: 12 }}>
+                        <div style={{ fontSize: 13, color: colors.textDim, marginBottom: 4 }}>{ticker}</div>
+                        <FieldRow name="Spot price" field={fields[ticker].spot_price} />
+                        <FieldRow name="Net GEX ($M / 1% move)" field={fields[ticker].net_gex_usd_m} />
+                        <FieldRow name="Gamma flip strike" field={fields[ticker].gamma_flip_strike} />
+                        <FieldRow name="Spot to flip (%)" field={fields[ticker].spot_to_flip_pct} />
+                        <FieldRow name="Regime" field={fields[ticker].gex_regime} />
+                        <FieldRow name="Max pain strike" field={fields[ticker].max_pain_strike} />
+                        <FieldRow name="Put/call OI ratio" field={fields[ticker].put_call_oi_ratio} />
+                        <FieldRow name="ATM IV" field={fields[ticker].atm_iv} />
+                    </div>
+                ))
+            )}
+            <div style={{ fontSize: 10, color: colors.textDimAlt, marginTop: 8 }}>
+                generation {data.generation_id || '—'} published {fmtDateTime(data.generation_published_at)}
+            </div>
+        </div>
+    );
+}
+
 function NotBuiltCard({ label, reason }) {
     return (
         <div
@@ -548,6 +611,9 @@ export default function GodViewPillars() {
     const [buybackData, setBuybackData] = useState(null);
     const [buybackError, setBuybackError] = useState(null);
     const [buybackLoading, setBuybackLoading] = useState(true);
+    const [gexData, setGexData] = useState(null);
+    const [gexError, setGexError] = useState(null);
+    const [gexLoading, setGexLoading] = useState(true);
 
     useEffect(() => {
         let cancelled = false;
@@ -627,6 +693,17 @@ export default function GodViewPillars() {
         return () => { cancelled = true; };
     }, [asOf]);
 
+    useEffect(() => {
+        let cancelled = false;
+        setGexLoading(true);
+        setGexError(null);
+        api.get(`/api/v1/godview/pillars/dealer_gex?as_of=${encodeURIComponent(asOf)}`)
+            .then((res) => { if (!cancelled) setGexData(res); })
+            .catch((e) => { if (!cancelled) setGexError(e.message || 'request failed'); })
+            .finally(() => { if (!cancelled) setGexLoading(false); });
+        return () => { cancelled = true; };
+    }, [asOf]);
+
     return (
         <div style={{ padding: 20, maxWidth: 720 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 16, gap: 12, flexWrap: 'wrap' }}>
@@ -660,6 +737,7 @@ export default function GodViewPillars() {
             {finraLoading ? <FinraShortVolumeCard data={null} error={null} /> : <FinraShortVolumeCard data={finraData} error={finraError} />}
             {ftdLoading ? <SecFtdCard data={null} error={null} /> : <SecFtdCard data={ftdData} error={ftdError} />}
             {buybackLoading ? <BuybackBlackoutCard data={null} error={null} /> : <BuybackBlackoutCard data={buybackData} error={buybackError} />}
+            {gexLoading ? <DealerGexCard data={null} error={null} /> : <DealerGexCard data={gexData} error={gexError} />}
 
             {NOT_BUILT_PILLARS.map((p) => (
                 <NotBuiltCard key={p.key} label={p.label} reason={p.reason} />
