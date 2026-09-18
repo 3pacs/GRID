@@ -81,15 +81,19 @@ _QUIET_ROUTES = {
 
 
 def test_dry_run_never_calls_send(monkeypatch) -> None:
-    """No notification transport is reachable in dry_run: not the
-    synchronous send path daily_digest uses live (_send_sync), not the
-    fire-and-forget one other alert functions use (_send), and not SMTP
-    itself — proving this at the smtplib.SMTP level, not just by checking
-    that the module's own wrapper functions weren't invoked, so a future
-    change that starts constructing the client directly instead of going
-    through _do_send would still be caught here. daily_digest never
-    imports alerts.push_notify (grep-verified), so push transport isn't a
-    separate call path to assert against for this function.
+    """Scoped to the transport paths this module actually has: the
+    synchronous send path daily_digest uses live (_send_sync), the
+    fire-and-forget one other alert functions in this module use (_send),
+    and smtplib.SMTP itself — proving this at the client-construction
+    level, not just by checking that the module's own wrapper functions
+    weren't invoked, so a future change that builds an SMTP client
+    directly instead of going through _do_send would still be caught
+    here. This does not prove no transport of any kind anywhere in the
+    process fires — only these three paths, which are the ones reachable
+    from alerts/email.py. daily_digest never imports alerts.push_notify
+    (grep-verified), so push transport isn't a separate call path to
+    assert against for this function; it is not exercised or ruled out
+    by this test.
     """
     import smtplib
 
@@ -279,7 +283,10 @@ def test_low_confidence_100x_row_is_visually_flagged(monkeypatch) -> None:
     """is_100x=TRUE alone doesn't mean the row is trustworthy — the scanner
     stores its own LOW/MEDIUM/HIGH confidence alongside the score, and a
     LOW-confidence flagged row must not render with the same purple,
-    unqualified "100x Opportunity" treatment as a HIGH-confidence one.
+    unqualified "100x Opportunity" treatment as a HIGH-confidence one. The
+    label says "heuristic confidence", never the bare word — see
+    docs/reference/CONFIDENCE_POLICY.md — since the scanner computes it
+    from a composite-score threshold, not a scored track record.
     """
     result = _hundredx_result(
         monkeypatch, ("XYZ", "CALL", 9.1, 150.0, "thin-chain dislocation", "LOW"),
@@ -287,27 +294,35 @@ def test_low_confidence_100x_row_is_visually_flagged(monkeypatch) -> None:
 
     body = next(s for s in result["section_bodies"] if s["title"] == "100x Opportunity — XYZ")
     assert body["accent"] == "amber"
-    assert "LOW CONFIDENCE" in body["body"]
+    assert "HEURISTIC CONFIDENCE: LOW" in body["body"]
+    assert "scanner heuristic" in body["body"]
 
 
-def test_high_confidence_100x_row_renders_plainly(monkeypatch) -> None:
+def test_high_confidence_100x_row_is_labelled_heuristic_not_bare_confidence(monkeypatch) -> None:
+    """A HIGH bucket is still just a threshold on the same composite score
+    as LOW/MEDIUM — not a calibrated high-confidence signal. It must not
+    render as an unqualified "confidence", or a reader could mistake the
+    scanner's own bucket for a measured one.
+    """
     result = _hundredx_result(
         monkeypatch, ("XYZ", "CALL", 9.1, 150.0, "thin-chain dislocation", "HIGH"),
     )
 
     body = next(s for s in result["section_bodies"] if s["title"] == "100x Opportunity — XYZ")
     assert body["accent"] == "purple"
-    assert "LOW CONFIDENCE" not in body["body"]
+    assert "heuristic confidence: HIGH" in body["body"]
+    assert "HEURISTIC CONFIDENCE: LOW" not in body["body"]
 
 
-def test_medium_confidence_100x_row_renders_plainly(monkeypatch) -> None:
+def test_medium_confidence_100x_row_is_labelled_heuristic_not_bare_confidence(monkeypatch) -> None:
     result = _hundredx_result(
         monkeypatch, ("XYZ", "CALL", 9.1, 150.0, "thin-chain dislocation", "MEDIUM"),
     )
 
     body = next(s for s in result["section_bodies"] if s["title"] == "100x Opportunity — XYZ")
     assert body["accent"] == "purple"
-    assert "LOW CONFIDENCE" not in body["body"]
+    assert "heuristic confidence: MEDIUM" in body["body"]
+    assert "HEURISTIC CONFIDENCE: LOW" not in body["body"]
 
 
 def test_missing_confidence_100x_row_is_labelled_unknown_not_low(monkeypatch) -> None:
@@ -324,15 +339,20 @@ def test_missing_confidence_100x_row_is_labelled_unknown_not_low(monkeypatch) ->
 
     body = next(s for s in result["section_bodies"] if s["title"] == "100x Opportunity — XYZ")
     assert body["accent"] == "amber"
-    assert "CONFIDENCE UNKNOWN" in body["body"]
-    assert "LOW CONFIDENCE" not in body["body"]
+    assert "HEURISTIC CONFIDENCE: UNKNOWN" in body["body"]
+    assert "HEURISTIC CONFIDENCE: LOW" not in body["body"]
 
 
 def test_malformed_confidence_100x_row_is_labelled_unknown_not_low(monkeypatch) -> None:
     """A value that isn't LOW/MEDIUM/HIGH at all (garbage, a future label
     this code hasn't been taught) must not silently become MEDIUM/HIGH's
     plain rendering, and must not be misreported as the specific "LOW"
-    the scanner never actually recorded either.
+    the scanner never actually recorded either. This is a reachable case,
+    not a hypothetical one: options_mispricing_scans.confidence is
+    `TEXT NOT NULL` with no CHECK constraint on its values (schema.sql
+    verified directly — contrast decision_journal.operator_confidence,
+    which does constrain its values), so nothing in the database stops a
+    non-LOW/MEDIUM/HIGH string from being written.
     """
     result = _hundredx_result(
         monkeypatch, ("XYZ", "CALL", 9.1, 150.0, "thin-chain dislocation", "banana"),
@@ -340,8 +360,8 @@ def test_malformed_confidence_100x_row_is_labelled_unknown_not_low(monkeypatch) 
 
     body = next(s for s in result["section_bodies"] if s["title"] == "100x Opportunity — XYZ")
     assert body["accent"] == "amber"
-    assert "CONFIDENCE UNKNOWN" in body["body"]
-    assert "LOW CONFIDENCE" not in body["body"]
+    assert "HEURISTIC CONFIDENCE: UNKNOWN" in body["body"]
+    assert "HEURISTIC CONFIDENCE: LOW" not in body["body"]
 
 
 def test_alert_on_100x_opportunity_defaults_to_unknown_confidence_rendering(monkeypatch) -> None:
@@ -361,21 +381,22 @@ def test_alert_on_100x_opportunity_defaults_to_unknown_confidence_rendering(monk
     email_mod.alert_on_100x_opportunity("XYZ", 9.1, "CALL", "thesis text")
 
     assert captured["sections"][0]["accent"] == "amber"
-    assert "CONFIDENCE UNKNOWN" in captured["sections"][0]["body"]
-    assert "LOW CONFIDENCE" not in captured["sections"][0]["body"]
+    assert "HEURISTIC CONFIDENCE: UNKNOWN" in captured["sections"][0]["body"]
+    assert "HEURISTIC CONFIDENCE: LOW" not in captured["sections"][0]["body"]
 
     captured.clear()
     email_mod.alert_on_100x_opportunity("XYZ", 9.1, "CALL", "thesis text", confidence="LOW")
 
     assert captured["sections"][0]["accent"] == "amber"
-    assert "LOW CONFIDENCE" in captured["sections"][0]["body"]
+    assert "HEURISTIC CONFIDENCE: LOW" in captured["sections"][0]["body"]
 
     captured.clear()
     email_mod.alert_on_100x_opportunity("XYZ", 9.1, "CALL", "thesis text", confidence="HIGH")
 
     assert captured["sections"][0]["accent"] == "purple"
-    assert "LOW CONFIDENCE" not in captured["sections"][0]["body"]
-    assert "CONFIDENCE UNKNOWN" not in captured["sections"][0]["body"]
+    assert "heuristic confidence: HIGH" in captured["sections"][0]["body"]
+    assert "HEURISTIC CONFIDENCE: LOW" not in captured["sections"][0]["body"]
+    assert "HEURISTIC CONFIDENCE: UNKNOWN" not in captured["sections"][0]["body"]
 
 
 # ---------------------------------------------------------------------------

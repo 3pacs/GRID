@@ -125,34 +125,45 @@ def _section_100x(
 ) -> dict:
     # options_mispricing_scans.confidence (LOW/MEDIUM/HIGH) must survive
     # into the rendered alert — without it, a LOW-confidence flagged row is
-    # visually identical to a HIGH-confidence one: same purple accent, same
-    # "100x Opportunity" title, same weight.
+    # visually identical to a HIGH-confidence one.
     #
-    # Note on what this label actually is: discovery/options_scanner.py sets
-    # it from a fixed threshold on the composite score (>=8.0/>=6.0), not
-    # from a scored track record (hit rate, calibration, verified-vs-flagged
-    # count) — the bar docs/reference/CONFIDENCE_POLICY.md sets for a field
-    # named "confidence". Relaying it here is still strictly better than the
-    # prior behavior (no signal at all reached the alert), but it does not
-    # make the underlying label a measured confidence; renaming it belongs
-    # to whoever next revises discovery/options_scanner.py, not this fix.
+    # What this label actually is, made visible in the email itself (not
+    # only here) per docs/reference/CONFIDENCE_POLICY.md (#544, adopted
+    # 2026-09-17): discovery/options_scanner.py sets it from a fixed
+    # threshold on the composite score (>=8.0/>=6.0), not from a scored
+    # track record (hit rate, calibration, verified-vs-flagged count) —
+    # the bar that policy sets for a field named "confidence". It doesn't
+    # clear that bar, so every rendering below says "heuristic confidence"
+    # and never the bare word, in every branch including MEDIUM/HIGH — a
+    # HIGH bucket is still just a threshold on the same composite score,
+    # not a calibrated high-confidence signal, and saying so only for LOW
+    # would misleadingly imply the other two are measured. Renaming the
+    # underlying field belongs to whoever next revises
+    # discovery/options_scanner.py (#539's lane), not this fix.
     #
-    # The column is `confidence TEXT NOT NULL` today (verified against
-    # main and against #539's reshaping of this table, which leaves this
-    # column untouched), so None/malformed input isn't reachable through
-    # the live schema — the branch below is defensive for a legacy row or
-    # a future write path, not a currently-observed case. It renders
-    # distinctly from a recorded "LOW": labelling it "LOW CONFIDENCE" would
-    # assert something we don't actually know, so it gets its own wording.
+    # The column is `confidence TEXT NOT NULL` — verified against
+    # schema.sql, which puts no CHECK constraint on this column (contrast
+    # decision_journal.operator_confidence, which does constrain its values
+    # to LOW/MEDIUM/HIGH). NOT NULL rules out None; it does NOT rule out an
+    # unexpected non-LOW/MEDIUM/HIGH string reaching here — nothing in the
+    # schema stops one being written, so the "unknown" branch below is a
+    # real, reachable case (a typo, a future code path, a direct edit),
+    # not purely defensive for a hypothetical legacy row.
     label = (confidence or "").strip().upper()
     if label == "LOW":
-        conf_note = ' &nbsp; <span class="badge badge-hold">LOW CONFIDENCE</span>'
+        conf_note = (
+            ' &nbsp; <span class="badge badge-hold">HEURISTIC CONFIDENCE: LOW</span>'
+        )
         accent = "amber"
     elif label in ("MEDIUM", "HIGH"):
-        conf_note = ""
+        conf_note = (
+            f' &nbsp; <span class="badge badge-regime">heuristic confidence: {label}</span>'
+        )
         accent = "purple"
     else:
-        conf_note = ' &nbsp; <span class="badge badge-hold">CONFIDENCE UNKNOWN</span>'
+        conf_note = (
+            ' &nbsp; <span class="badge badge-hold">HEURISTIC CONFIDENCE: UNKNOWN</span>'
+        )
         accent = "amber"
     return {
         "title": f"100x Opportunity — {ticker}",
@@ -163,6 +174,9 @@ def _section_100x(
             f'{f" &nbsp; Est. Payoff: <strong>{payoff:.0f}x</strong>" if payoff else ""}'
             f'{conf_note}'
             f'<br><br>{thesis}'
+            f'<br><br><span style="font-size:11px;color:#5A7A96;">Confidence is a '
+            f'scanner heuristic (a threshold on the composite score) — not a '
+            f'calibrated or track-record-scored confidence.</span>'
         ),
         "accent": accent,
     }
