@@ -48,6 +48,19 @@ this):
      Verified empirically (see this file's ``TestTimeCorrectEvaluation``)
      and independently by hand: cost_bps=0.0 gives sharpe == baseline_sharpe
      (still FAILs on ``<=``); cost_bps=10.0 gives sharpe < baseline_sharpe.
+     THIS IS NOW FEATURE-DETECTED, not hardcoded: ``_predict_fn_is_live``
+     probes whichever ``validation.backtest.WalkForwardBacktest`` is
+     actually installed on the tree these tests run against. When dead
+     (true on this branch), ``TestPredictFnDeadOnMain20260918`` keeps the
+     assertion above. When live (true once composed with draft #556 /
+     f8ad5635's leakage-safe predict_fn fix, or a descendant such as
+     #562's stack), ``TestPredictFnLiveComposed556`` instead asserts the
+     property the plan actually wants: an honest next-period-sign
+     predictor CAN reach PASS on a fixture where it beats buy-and-hold,
+     and a cheating same-bar predictor CANNOT — verified directly against
+     ``git show f8ad5635:validation/backtest.py`` before being written
+     here. Exactly one of the two classes' tests runs; the other is
+     ``skipif``-skipped with a reason naming which one did and why.
   2. A SQL failure DURING the loop body (hypothesis_registry INSERT, the
      backtest call, model_registry INSERT) is caught locally per-iteration
      inside ``run_autoresearch``'s ``for iteration in ...`` loop and turned
@@ -162,6 +175,38 @@ REVISION_RELEASE_DATE = REVISION_OBS_DATE + timedelta(
 
 
 # ---------------------------------------------------------------------------
+# Feature detection: is predict_fn live in the composed validation/backtest.py?
+# ---------------------------------------------------------------------------
+#
+# On THIS branch, WalkForwardBacktest._compute_era_metrics ignores predict_fn
+# entirely (EXACT FINDING #1). Draft #556 (f8ad5635) and its descendants
+# (e.g. #562's stack) make predict_fn genuinely drive the result. Integration
+# composition may bring that fix into this tree without this test file
+# changing, so the probe below is run ONCE at import time against whatever
+# validation.backtest.WalkForwardBacktest actually is here, and the two test
+# classes below key off its result via skipif -- exactly one of them runs.
+
+
+def _predict_fn_is_live(bt: "WalkForwardBacktest") -> bool:
+    """True iff swapping a constant +1 predictor for a constant -1
+    predictor flips the sign of _compute_era_metrics' return -- the
+    smallest possible proof that predict_fn is actually read, reusing the
+    exact fixture shape from f8ad5635's own
+    test_predict_fn_actually_drives_the_return.
+    """
+    dates = pd.DatetimeIndex([date(2024, 1, 1), date(2024, 1, 2), date(2024, 1, 3)], name="obs_date")
+    matrix = pd.DataFrame({1: [100.0, 110.0, 121.0]}, index=dates)
+    plus_fn = lambda m: pd.Series(1.0, index=m.index)
+    minus_fn = lambda m: pd.Series(-1.0, index=m.index)
+    plus_return = bt._compute_era_metrics(matrix, plus_fn, cost_bps=0.0).get("return", 0.0)
+    minus_return = bt._compute_era_metrics(matrix, minus_fn, cost_bps=0.0).get("return", 0.0)
+    return (plus_return > 0 and minus_return < 0) or (plus_return < 0 and minus_return > 0)
+
+
+_PREDICT_FN_LIVE: bool = _predict_fn_is_live(WalkForwardBacktest(None, None))
+
+
+# ---------------------------------------------------------------------------
 # Fake PIT store(s) — pure Python, no database (item 1a)
 # ---------------------------------------------------------------------------
 
@@ -216,6 +261,49 @@ class FakePITStore:
         matrix = df.pivot_table(index="obs_date", columns="feature_id", values="value", aggfunc="first")
         matrix.index = pd.DatetimeIndex(matrix.index, name="obs_date")
         return matrix.sort_index()
+
+    def get_feature_vintages(
+        self,
+        feature_ids: list[int],
+        start_date: date,
+        end_date: date,
+        as_of_date: date | None = None,
+    ) -> pd.DataFrame:
+        """Fake twin of ``store.pit.PITStore.get_feature_vintages`` (draft
+        #563, commit b56ad1d4) and ``tests/fixtures/evaluator/
+        fake_pit_store.py``'s matching fake. Not called by anything on
+        THIS branch (``validation/backtest.py`` here still calls
+        ``get_feature_matrix`` directly — there is no
+        ``_fetch_pit_correct_matrix``/batched dispatch on this branch at
+        all). Added purely so this fake does not raise ``AttributeError``
+        when composed with a tree where ``WalkForwardBacktest`` dispatches
+        to the batched fetch path by default.
+
+        Returns EVERY vintage on record for (feature_id, obs_date) in
+        range, undeduplicated — no DISTINCT ON equivalent, no per-row
+        vintage-policy selection (that is ``select_vintage_per_decision``'s
+        job, one layer up, exactly as the real method documents).
+        ``as_of_date``, when given, is only the same coarse
+        ``release_date <= as_of_date`` pre-filter the real method
+        documents as a throughput optimisation, not a correctness
+        guarantee on its own.
+        """
+        candidates = [
+            r
+            for r in self.rows
+            if r["feature_id"] in feature_ids
+            and start_date <= r["obs_date"] <= end_date
+            and (as_of_date is None or r["release_date"] <= as_of_date)
+        ]
+        if not candidates:
+            return pd.DataFrame(
+                columns=["feature_id", "obs_date", "value", "release_date", "vintage_date"]
+            )
+        return (
+            pd.DataFrame(candidates)[["feature_id", "obs_date", "value", "release_date", "vintage_date"]]
+            .sort_values(["feature_id", "obs_date", "vintage_date"])
+            .reset_index(drop=True)
+        )
 
 
 class LeakyFakePITStore(FakePITStore):
@@ -586,7 +674,63 @@ class TestTimeCorrectEvaluation:
         assert honest_value != revised_value  # honest: revision not yet released, invisible
         assert leaky_value == revised_value  # leaky: ignores release_date, "sees the future"
 
-    def test_real_walk_forward_backtest_never_returns_pass_on_this_branch(self):
+    def test_get_feature_vintages_matches_pit_vintages_interface(self):
+        """Draft #563 (b56ad1d4) added ``PITStore.get_feature_vintages`` and
+        a matching fake in tests/fixtures/evaluator/fake_pit_store.py. This
+        fake's own twin (added for composition-compatibility — see the
+        method's docstring) must return every vintage on record,
+        undeduplicated, honoring only the coarse ``as_of_date`` pre-filter.
+        """
+        store = FakePITStore(SERIES_ROWS)
+
+        all_vintages = store.get_feature_vintages([1], SERIES_START, SERIES_END, as_of_date=None)
+        # Two rows on file for the revision's obs_date (original + revision),
+        # both must come back — this method never dedupes.
+        at_obs = all_vintages[all_vintages["obs_date"] == REVISION_OBS_DATE]
+        assert len(at_obs) == 2
+        assert set(at_obs["value"]) == {
+            next(r["value"] for r in SERIES_ROWS if r["feature_id"] == 1 and r["obs_date"] == REVISION_OBS_DATE and r["release_date"] == REVISION_OBS_DATE),
+            FIXTURE["mid_window_revision"]["revised_value"],
+        }
+
+        # Coarse as_of_date pre-filter: before the revision's release, only
+        # the original row for that obs_date is returned.
+        before_release = store.get_feature_vintages(
+            [1], SERIES_START, SERIES_END, as_of_date=REVISION_RELEASE_DATE - timedelta(days=1)
+        )
+        at_obs_before = before_release[before_release["obs_date"] == REVISION_OBS_DATE]
+        assert len(at_obs_before) == 1
+        assert at_obs_before.iloc[0]["value"] != FIXTURE["mid_window_revision"]["revised_value"]
+
+    def test_predict_fn_liveness_feature_detection_records_which_branch_ran(self, record_property):
+        """Coordinator-requested feature detection: probe whether
+        ``predict_fn`` is live in the composed ``validation/backtest.py``
+        (run ``_compute_era_metrics`` with a +1 and a -1 constant
+        predictor on the same matrix; live iff the returns differ in
+        sign). Recorded either way via ``record_property`` and captured
+        stdout so the outcome is visible in test output, not just implied
+        by which of the two tests below ran.
+        """
+        record_property("predict_fn_live_on_this_tree", _PREDICT_FN_LIVE)
+        print(
+            f"FEATURE DETECTION: predict_fn_live={_PREDICT_FN_LIVE} "
+            f"(probed via _predict_fn_is_live against this tree's "
+            f"validation.backtest.WalkForwardBacktest)"
+        )
+
+
+class TestPredictFnDeadOnMain20260918:
+    """Runs only when the probe finds predict_fn dead — i.e. NOT composed
+    with draft #556 (f8ad5635)/#562's live-predictor fix. True on this
+    branch (fable/research-slice-20260918) as of this commit.
+    """
+
+    @pytest.mark.skipif(
+        _PREDICT_FN_LIVE,
+        reason="predict_fn is live on this (composed) tree — see "
+        "TestPredictFnLiveComposed556::test_honest_predictor_passes_cheating_same_bar_predictor_fails",
+    )
+    def test_predict_fn_dead_never_returns_pass_main_20260918(self, record_property):
         """EXACT FINDING #1 (see module docstring): ``predict_fn`` is dead —
         ``_compute_era_metrics`` always scores the same column
         ``_compute_baseline_metrics`` uses, so a per-day constant cost drag
@@ -597,6 +741,9 @@ class TestTimeCorrectEvaluation:
         (equal Sharpe, still FAILs on the `<=` gate) and cost_bps=10 (this
         branch's real default, strictly lower Sharpe).
         """
+        record_property("predict_fn_live_on_this_tree", False)
+        print("FEATURE DETECTION: predict_fn dead on this tree — keeping the structural always-FAIL assertion.")
+
         bt = WalkForwardBacktest(None, FakePITStore(SERIES_ROWS))
 
         for cost_bps, expect_equal in ((0.0, True), (10.0, False)):
@@ -615,6 +762,119 @@ class TestTimeCorrectEvaluation:
                 assert sharpe == pytest.approx(baseline_sharpe)
             else:
                 assert sharpe < baseline_sharpe
+
+
+class TestPredictFnLiveComposed556:
+    """Runs only when the probe finds predict_fn live — i.e. composed with
+    draft #556 (f8ad5635)'s leakage-safe predict_fn fix (or a descendant of
+    it, such as #562's stack). NOT true on this branch as of this commit;
+    written to activate correctly the moment it is.
+    """
+
+    @pytest.mark.skipif(
+        not _PREDICT_FN_LIVE,
+        reason="predict_fn is dead on this tree — see "
+        "TestPredictFnDeadOnMain20260918::test_predict_fn_dead_never_returns_pass_main_20260918",
+    )
+    def test_honest_predictor_passes_cheating_same_bar_predictor_fails(self, record_property):
+        """This is the assertion the plan actually wants: on a fixture
+        where an honest, genuinely-predictive next-period-sign predictor
+        beats buy-and-hold, it CAN reach a PASS verdict; a same-bar
+        predictor that only ever "predicts" the bar it is standing on
+        (and therefore, once correctly time-shifted by
+        ``_compute_era_metrics``'s own same-bar lookahead guard, ends up
+        trading a period behind) CANNOT.
+
+        Fixture: an 11-day, single-column (target-only) price series that
+        alternates +5%/-5% every day. The honest predictor is handed the
+        exact next day's sign in advance (legitimate in a test — this
+        fixture is built by this test, so knowing its own future path is
+        not a lookahead cheat, it is what "a genuinely skilled model"
+        looks like operationally). The cheating predictor uses the sign of
+        the return that JUST happened at the same bar — after the
+        harness's mandatory ``.shift(1)``, that becomes "yesterday's
+        already-public sign predicts today," which on this deliberately
+        alternating (mean-reverting) fixture is wrong on every single
+        scored day, guaranteeing it cannot beat baseline.
+
+        Reuses the pattern (and the alternating-fixture numbers) verified
+        directly against ``git show f8ad5635:validation/backtest.py``
+        before being written here — see the W4e session notes for the
+        exact reproduction. Every number below is a plain assertion
+        against whatever ``validation/backtest.py`` is actually installed
+        on the composed tree, not a hardcoded expectation.
+        """
+        record_property("predict_fn_live_on_this_tree", True)
+        print("FEATURE DETECTION: predict_fn live on this (composed) tree — asserting honest PASS / cheat FAIL.")
+
+        n = 11
+        start = SERIES_START
+        realized_returns = [0.05 if i % 2 == 1 else -0.05 for i in range(1, n)]
+        prices = [100.0]
+        for r in realized_returns:
+            prices.append(prices[-1] * (1 + r))
+        dates = [start + timedelta(days=i) for i in range(n)]
+        rows = [
+            {"feature_id": 1, "obs_date": d, "release_date": d, "vintage_date": d, "value": p}
+            for d, p in zip(dates, prices)
+        ]
+        pit = FakePITStore(rows)
+        bt = WalkForwardBacktest(None, pit)
+
+        def honest_next_period_sign(features):
+            # features.index == the era's full date index (target column
+            # dropped, but the index survives). raw_signal[day_j] is the
+            # sign of the return realized from day_j to day_{j+1} -- known
+            # here because this test built the price path, not because
+            # the predictor peeked at anything at call time. After the
+            # harness's own shift(1), day_{j+1}'s position becomes exactly
+            # this value, earning exactly that day's real move.
+            vals = []
+            for j in range(len(features.index)):
+                vals.append(1.0 if (j < len(realized_returns) and realized_returns[j] > 0) else -1.0)
+            return pd.Series(vals, index=features.index)
+
+        def cheating_same_bar(features):
+            # raw_signal[day_j] is the sign of the return that JUST
+            # happened getting TO day_j (the bar's own already-realized
+            # move) -- an attempt to trade on today's own outcome. The
+            # harness's shift(1) turns this into "yesterday's sign
+            # predicts today," which on this alternating fixture is wrong
+            # every time.
+            vals = [0.0]
+            for j in range(1, len(features.index)):
+                vals.append(1.0 if realized_returns[j - 1] > 0 else -1.0)
+            return pd.Series(vals, index=features.index)
+
+        honest_result = bt.run_validation(
+            hypothesis_id=101,
+            feature_ids=[1],
+            start_date=start,
+            end_date=dates[-1],
+            n_splits=1,
+            cost_bps=0.0,
+            predict_fn=honest_next_period_sign,
+            target_feature_id=1,
+        )
+        cheat_result = bt.run_validation(
+            hypothesis_id=102,
+            feature_ids=[1],
+            start_date=start,
+            end_date=dates[-1],
+            n_splits=1,
+            cost_bps=0.0,
+            predict_fn=cheating_same_bar,
+            target_feature_id=1,
+        )
+
+        assert honest_result["overall_verdict"] == "PASS", honest_result
+        assert cheat_result["overall_verdict"] != "PASS", cheat_result
+        assert honest_result["full_period_metrics"]["return"] > 0
+        assert cheat_result["full_period_metrics"]["return"] < 0
+        assert (
+            honest_result["full_period_metrics"]["sharpe"]
+            > cheat_result["full_period_metrics"]["sharpe"]
+        )
 
 
 # ===========================================================================
