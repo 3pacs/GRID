@@ -22,14 +22,36 @@ const fmtDate = (d) => d ? d.substring(0, 19).replace('T', ' ') : '-';
 // contracts explicitly rather than falling back through `res || []`, which
 // let the truthy, non-array error marker (or any other malformed value)
 // flow straight into state.
+//
+// `res.message` is built by api.js from `parsed.detail || parsed.message ||
+// body` — the server's own response text. That must never reach the user
+// verbatim (same rule applied elsewhere on this branch); classify by
+// `res.status` instead and show category-only wording. The one exception is
+// checking for api.js's own `'Invalid JSON response'` sentinel, which is a
+// local constant api.js itself produces, not backend text.
+const unavailableReason = (res, notFoundText) => {
+    if (res?.message === 'Invalid JSON response') {
+        return 'the server sent an unreadable response.';
+    }
+    const status = res?.status;
+    if (status === 0) return 'the server could not be reached.';
+    if (status === 401 || status === 403) return 'not authorised.';
+    if (status === 404) return notFoundText;
+    if (typeof status === 'number') return `the server answered with status ${status}.`;
+    return 'the server could not be reached.';
+};
+
 const normalizeSnapshotList = (res) => {
     if (Array.isArray(res)) {
         return { list: res, error: null };
     }
     if (res && typeof res === 'object' && res.error === true) {
-        return { list: [], error: `Snapshots unavailable: ${res.message || 'Request failed'}` };
+        return {
+            list: [],
+            error: `Snapshots unavailable: ${unavailableReason(res, 'this category has no snapshot history on the server.')}`,
+        };
     }
-    return { list: [], error: 'Unexpected response' };
+    return { list: [], error: 'Unexpected response from the snapshots service.' };
 };
 
 export default function Snapshots() {
@@ -83,9 +105,10 @@ export default function Snapshots() {
             if (res && typeof res === 'object' && res.error === true) {
                 // compare_snapshots (api/routers/snapshots.py:81-83) raises a 404
                 // with the store's own message when a date is missing; api.js
-                // resolves that to this marker rather than throwing.
+                // resolves that to this marker rather than throwing. Never echo
+                // res.message (backend text) — category-only wording only.
                 setComparison(null);
-                setError(res.message || 'Comparison failed');
+                setError(`Comparison failed: ${unavailableReason(res, 'the comparison dates could not both be found.')}`);
             } else {
                 setComparison(res);
             }

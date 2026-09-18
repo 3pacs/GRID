@@ -92,16 +92,24 @@ describe('Snapshots list handling per the real API contract', () => {
         expect(screen.queryByText('Unexpected response')).not.toBeInTheDocument();
     });
 
-    it('shows "Snapshots unavailable: <message>" for the api.js error marker, not "No snapshots found"', async () => {
-        api.getSnapshotLatest.mockResolvedValue({ error: true, status: 500, message: 'DB pool exhausted' });
-        api.getSnapshotHistory.mockResolvedValue({ error: true, status: 500, message: 'DB pool exhausted' });
+    // api.js builds `message` from `parsed.detail || parsed.message || body`
+    // — the server's own response text. That must never reach the user
+    // verbatim; the marker's `status` alone drives category-only wording.
+    it('shows category-only wording for the api.js error marker, never the backend message text', async () => {
+        api.getSnapshotLatest.mockResolvedValue({
+            error: true, status: 500, message: 'psycopg2.OperationalError: connection pool exhausted at 10.0.4.2',
+        });
+        api.getSnapshotHistory.mockResolvedValue({
+            error: true, status: 500, message: 'psycopg2.OperationalError: connection pool exhausted at 10.0.4.2',
+        });
 
         render(<Snapshots />);
 
         await waitFor(() => {
-            expect(screen.getAllByText('Snapshots unavailable: DB pool exhausted').length).toBeGreaterThan(0);
+            expect(screen.getAllByText('Snapshots unavailable: the server answered with status 500.').length).toBeGreaterThan(0);
         });
         expect(screen.queryByText(/No snapshots found/)).not.toBeInTheDocument();
+        expect(screen.queryByText(/psycopg2|connection pool exhausted|10\.0\.4\.2/)).not.toBeInTheDocument();
     });
 
     it('shows an explicit "Unexpected response" state for a malformed, non-array, non-error value', async () => {
@@ -111,12 +119,12 @@ describe('Snapshots list handling per the real API contract', () => {
         render(<Snapshots />);
 
         await waitFor(() => {
-            expect(screen.getAllByText('Unexpected response').length).toBeGreaterThan(0);
+            expect(screen.getAllByText('Unexpected response from the snapshots service.').length).toBeGreaterThan(0);
         });
         expect(screen.queryByText(/No snapshots found/)).not.toBeInTheDocument();
     });
 
-    it('shows the compare 404 message instead of silently rendering a blank comparison', async () => {
+    it('shows category-only wording for the compare 404, not the store\'s own detail text', async () => {
         api.getSnapshotLatest.mockResolvedValue([]);
         api.getSnapshotHistory.mockResolvedValue([]);
         api.compareSnapshots.mockResolvedValue({
@@ -147,7 +155,8 @@ describe('Snapshots list handling per the real API contract', () => {
         fireEvent.click(runButton);
 
         await waitFor(() => {
-            expect(screen.getByText('No snapshot found for category "clustering" on 2026-01-01')).toBeInTheDocument();
+            expect(screen.getByText('Comparison failed: the comparison dates could not both be found.')).toBeInTheDocument();
         });
+        expect(screen.queryByText(/No snapshot found for category/)).not.toBeInTheDocument();
     });
 });
