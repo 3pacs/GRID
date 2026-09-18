@@ -87,3 +87,69 @@ describe('FlowTimeline null bars', () => {
         expect(container.textContent).not.toContain('$0');
     });
 });
+
+// Audit C-H3: the API no longer plants hand-typed FOMC/CPI dates in the
+// response. When it has no sourced events for the window it says so with
+// catalysts_status / catalysts_reason, and the chart must draw nothing --
+// a diamond on the axis is a claim that something happens that day.
+describe('FlowTimeline catalyst markers', () => {
+    const unavailable = {
+        ...TIMELINE,
+        catalysts: [],
+        catalysts_status: 'unavailable',
+        catalysts_reason:
+            'no ingested macro event calendar; scheduled FOMC/CPI dates are not stored',
+    };
+
+    it('draws no markers and notes the gap when the calendar is unavailable', () => {
+        const { container } = render(
+            <FlowTimeline ticker="SPY" timelineData={unavailable} />
+        );
+
+        expect(container.querySelectorAll('.catalyst-marker')).toHaveLength(0);
+        expect(container.textContent).toContain('macro calendar unavailable');
+        // No legend entry for a marker type that can never be drawn.
+        expect(container.textContent).not.toContain('FOMC');
+        expect(container.textContent).not.toContain('CPI');
+    });
+
+    it('ignores a list the API flagged unavailable', () => {
+        const contradictory = {
+            ...unavailable,
+            catalysts: [
+                { date: '2026-03-03', type: 'fomc', label: 'FOMC Decision' },
+            ],
+        };
+        const { container } = render(
+            <FlowTimeline ticker="SPY" timelineData={contradictory} />
+        );
+
+        expect(container.querySelectorAll('.catalyst-marker')).toHaveLength(0);
+    });
+
+    it('draws a marker for a sourced catalyst', () => {
+        const sourced = {
+            ...TIMELINE,
+            catalysts: [
+                {
+                    date: '2026-03-03',
+                    type: 'earnings',
+                    label: 'SPY Earnings',
+                    source: 'earnings_calendar',
+                    as_of: '2026-03-01',
+                },
+            ],
+            catalysts_status: 'partial',
+            catalysts_reason:
+                'no ingested macro event calendar; scheduled FOMC/CPI dates are not stored',
+        };
+        const { container } = render(
+            <FlowTimeline ticker="SPY" timelineData={sourced} />
+        );
+
+        expect(container.querySelectorAll('.catalyst-marker')).toHaveLength(1);
+        expect(container.textContent).toContain('Earnings');
+        // The macro calendar is still missing, and the chart still says so.
+        expect(container.textContent).toContain('macro calendar unavailable');
+    });
+});
