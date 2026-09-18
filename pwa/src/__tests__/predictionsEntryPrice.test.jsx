@@ -56,4 +56,17 @@ describe('PredictionCard entry price', () => {
         const { container } = render(<PredictionCard pred={{ ...base, entry_price: 0 }} />);
         expect(container.textContent).toContain('$0.00');
     });
+
+    it('uses --- for a missing entry price, never the confidence word', () => {
+        // "unscored" belongs to confidence (D-H11) and "---" to entry price
+        // (D-M32). A card with a measured confidence and no entry price shows
+        // "---" and says nothing about being unscored.
+        const { container } = render(
+            <PredictionCard pred={{ ...base, entry_price: null, confidence: 0.4 }} />,
+        );
+        const entry = [...container.querySelectorAll('div')]
+            .find(d => d.textContent.trim() === '---');
+        expect(entry).toBeTruthy();
+        expect(container.textContent).not.toContain('unscored');
+    });
 });

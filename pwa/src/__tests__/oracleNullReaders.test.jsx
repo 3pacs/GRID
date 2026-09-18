@@ -2,14 +2,23 @@ import React from 'react';
 import { cleanup, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-// oracle_predictions.entry_price and .confidence are nullable once #544 lands:
-// they hold the measured value, or NULL when nothing measured them.
+// oracle_predictions.entry_price (D-M32) and .confidence (D-H11) are
+// nullable: they hold the measured value, or NULL when nothing measured them.
 //
 // The card used to read `${pred.entry_price?.toFixed(2) || '---'}` and
 // `Math.round((pred.confidence || 0) * 100)`. Neither fired for a genuine 0
 // (not nullish / not distinguishable from missing), and the confidence one
 // printed "0%" for a prediction that stated no confidence at all — a
 // no-confidence call the model never made.
+//
+// The contract the card renders now:
+//
+//   confidence  null -> "unscored"   (the same word ConfidenceMeter uses)
+//   confidence  0    -> "0%"         (a measurement, rendered as one)
+//   entry_price null -> "---"        (no price to show at all)
+//   entry_price 0    -> "$0.00"      (a measurement, rendered as one)
+//
+// Every guard is `== null`, never falsiness.
 
 if (typeof window.matchMedia !== 'function') {
     window.matchMedia = vi.fn().mockReturnValue({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() });
@@ -58,16 +67,35 @@ describe('PredictionCard entry price', () => {
 });
 
 describe('PredictionCard confidence', () => {
-    it('renders --- when no confidence was stated', () => {
+    it('renders the word unscored when no confidence was stated', () => {
         const { container } = render(<PredictionCard pred={{ ...base }} />);
-        // Not 0%. An unstated confidence is unknown, not a stated zero.
+        // Not 0%, and not "---" either: "---" is what a missing *entry price*
+        // reads as, and the two gaps must stay tellable apart on the card.
+        expect(container.textContent).toContain('unscored');
         expect(container.textContent).not.toContain('0%');
-        expect(container.textContent).toContain('---');
     });
 
-    it('renders a genuine measured 0 as 0%', () => {
+    it('renders a genuine measured 0 as 0%, not as unscored', () => {
         const { container } = render(<PredictionCard pred={{ ...base, confidence: 0 }} />);
         expect(container.textContent).toContain('0%');
+        expect(container.textContent).not.toContain('unscored');
+    });
+
+    it('does not read unscored once a confidence was stated', () => {
+        const { container } = render(<PredictionCard pred={{ ...base, confidence: 0.82 }} />);
+        expect(container.textContent).not.toContain('unscored');
+    });
+
+    it('keeps the two gaps distinct on one card', () => {
+        // A prediction that measured neither: entry reads "---", confidence
+        // reads "unscored". Neither borrows the other's vocabulary.
+        const { container } = render(
+            <PredictionCard pred={{ ...base, entry_price: null, confidence: null }} />,
+        );
+        expect(container.textContent).toContain('unscored');
+        const entry = [...container.querySelectorAll('div')]
+            .find(d => d.textContent.trim() === '---');
+        expect(entry).toBeTruthy();
     });
 
     it('renders a stated confidence as a percentage', () => {
