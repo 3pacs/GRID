@@ -679,12 +679,19 @@ class AnomalyHunter:
                 q_oracle, {"window": window_days, "min_src": CONVERGENCE_MIN_SOURCES}
             ):
                 ticker, direction, n_models, models, avg_conf, latest = row
+                # AVG() over a group in which no model stated a confidence is
+                # NULL. `f"{None:.2f}"` and `float(None)` both raise; the
+                # convergence is still real, its average confidence is not
+                # a number and says so.
+                conf_str = (
+                    "unstated" if avg_conf is None else f"{float(avg_conf):.2f}"
+                )
                 anomalies.append(Anomaly(
                     anomaly_type="oracle_convergence",
                     entity=ticker,
                     description=(
                         f"{n_models} prediction models agree: {ticker} → {direction} "
-                        f"(avg confidence: {avg_conf:.2f}, models: {', '.join(models)})"
+                        f"(avg confidence: {conf_str}, models: {', '.join(models)})"
                     ),
                     magnitude=float(n_models),
                     signal_date=latest.date() if hasattr(latest, "date") else latest,
@@ -693,7 +700,9 @@ class AnomalyHunter:
                         "direction": direction,
                         "n_models": int(n_models),
                         "models": list(models),
-                        "avg_confidence": round(float(avg_conf), 4),
+                        "avg_confidence": (
+                            None if avg_conf is None else round(float(avg_conf), 4)
+                        ),
                     },
                 ))
 
