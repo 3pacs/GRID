@@ -36,6 +36,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from oracle.entry_price_policy import entry_price_score_note
+
 import os
 _USE_SIGNAL_REGISTRY = os.getenv("GRID_SIGNAL_REGISTRY", "0") == "1"
 
@@ -618,9 +620,9 @@ class OracleEngine:
                     prediction_type TEXT NOT NULL,
                     direction TEXT NOT NULL,
                     target_price DOUBLE PRECISION,
-                    entry_price DOUBLE PRECISION NOT NULL,
+                    entry_price DOUBLE PRECISION,
                     expiry DATE NOT NULL,
-                    confidence DOUBLE PRECISION NOT NULL,
+                    confidence DOUBLE PRECISION,
                     expected_move_pct DOUBLE PRECISION,
                     signal_strength DOUBLE PRECISION,
                     coherence DOUBLE PRECISION,
@@ -643,6 +645,15 @@ class OracleEngine:
                 ALTER TABLE oracle_predictions
                 ADD COLUMN IF NOT EXISTS dedup_keep BOOLEAN NOT NULL DEFAULT TRUE
             """))
+            # D-H11 / D-M32: `confidence` and `entry_price` are NULL when
+            # nothing measured them. Both writers already bind None
+            # (`_store_predictions` for a ticker with no spot, `oracle/publish.py`
+            # for an unsupplied confidence). The CREATE above carries the
+            # nullable shape for a fresh database; an existing table is
+            # relaxed by alembic revision ``oracle_pred_nullable_0918`` at
+            # deploy time, NOT here: ALTER COLUMN takes ACCESS EXCLUSIVE on
+            # the table every time this bootstrap runs.
+            # tests/test_oracle_predictions_schema_parity.py keeps the two in step.
             conn.execute(text("""
                 ALTER TABLE oracle_predictions
                 ADD COLUMN IF NOT EXISTS horizon_days INTEGER
@@ -1813,7 +1824,16 @@ class OracleEngine:
         """
         today = date.today()
         scored = 0
-        results = {"hits": 0, "misses": 0, "partials": 0, "total": 0}
+        results = {
+            "hits": 0,
+            "misses": 0,
+            "partials": 0,
+            "total": 0,
+            # Rows closed as 'no_data' because their entry price was NULL,
+            # zero or negative. Reported, never folded into misses and never
+            # left out of the tally altogether.
+            "unscorable_entry_price": 0,
+        }
 
         with self.engine.begin() as conn:
             # Get pending predictions past expiry
@@ -1829,6 +1849,28 @@ class OracleEngine:
             rows = [r for r in rows if r[2] != "NONE"]
             for r in rows:
                 pred_id, ticker, direction, target, entry, expiry, conf, expected, model = r
+
+                # An entry price that cannot be divided by is settled here,
+                # BEFORE the division below. NULL is not a zero entry and a
+                # zero entry is not a 0% move: `(actual - entry) / entry`
+                # raises TypeError on the first and ZeroDivisionError on the
+                # second. Neither is skipped silently — the row is closed as
+                # 'no_data' carrying the reason it could not be scored, so it
+                # stops sitting 'pending' forever and the reason survives in
+                # score_notes. The price is never repaired or invented.
+                # Same contract and same strings as
+                # scripts/score_oracle_trades.py.
+                entry_note = entry_price_score_note(entry)
+                if entry_note is not None:
+                    conn.execute(text("""
+                        UPDATE oracle_predictions
+                        SET verdict = 'no_data',
+                            score_notes = :notes,
+                            scored_at = NOW()
+                        WHERE id = :id
+                    """), {"notes": entry_note, "id": pred_id})
+                    results["unscorable_entry_price"] += 1
+                    continue
 
                 # Get actual price at expiry
                 actual = self._get_price_at_date(ticker, expiry)
