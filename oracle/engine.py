@@ -36,6 +36,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from oracle.entry_price_policy import entry_price_score_note
+
 import os
 _USE_SIGNAL_REGISTRY = os.getenv("GRID_SIGNAL_REGISTRY", "0") == "1"
 
@@ -1822,7 +1824,16 @@ class OracleEngine:
         """
         today = date.today()
         scored = 0
-        results = {"hits": 0, "misses": 0, "partials": 0, "total": 0}
+        results = {
+            "hits": 0,
+            "misses": 0,
+            "partials": 0,
+            "total": 0,
+            # Rows closed as 'no_data' because their entry price was NULL,
+            # zero or negative. Reported, never folded into misses and never
+            # left out of the tally altogether.
+            "unscorable_entry_price": 0,
+        }
 
         with self.engine.begin() as conn:
             # Get pending predictions past expiry
@@ -1839,14 +1850,26 @@ class OracleEngine:
             for r in rows:
                 pred_id, ticker, direction, target, entry, expiry, conf, expected, model = r
 
-                # A prediction with no measured entry price is not scorable.
-                # NULL is not a zero entry and a zero entry is not a 0% move:
-                # `(actual - entry) / entry` raises TypeError on the first and
-                # ZeroDivisionError on the second. Same contract as
-                # scripts/score_oracle_trades.py, which requires
-                # `entry_price IS NOT NULL AND entry_price > 0` before it
-                # divides and sweeps everything else to 'no_data'.
-                if entry is None or float(entry) <= 0:
+                # An entry price that cannot be divided by is settled here,
+                # BEFORE the division below. NULL is not a zero entry and a
+                # zero entry is not a 0% move: `(actual - entry) / entry`
+                # raises TypeError on the first and ZeroDivisionError on the
+                # second. Neither is skipped silently — the row is closed as
+                # 'no_data' carrying the reason it could not be scored, so it
+                # stops sitting 'pending' forever and the reason survives in
+                # score_notes. The price is never repaired or invented.
+                # Same contract and same strings as
+                # scripts/score_oracle_trades.py.
+                entry_note = entry_price_score_note(entry)
+                if entry_note is not None:
+                    conn.execute(text("""
+                        UPDATE oracle_predictions
+                        SET verdict = 'no_data',
+                            score_notes = :notes,
+                            scored_at = NOW()
+                        WHERE id = :id
+                    """), {"notes": entry_note, "id": pred_id})
+                    results["unscorable_entry_price"] += 1
                     continue
 
                 # Get actual price at expiry

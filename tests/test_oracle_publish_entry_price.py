@@ -337,12 +337,26 @@ class TestScorerExcludesNullEntry:
 
     def test_a_null_entry_is_swept_to_no_data_with_a_reason(self):
         """`entry_price = 0` never matches a NULL, so a published-with-no-price
-        row would sit 'pending' forever unless NULL is named."""
+        row would sit 'pending' forever unless NULL is named.
+
+        The sweep binds the reasons from ``oracle.entry_price_policy`` rather
+        than spelling them inline, so the scorer, the engine and the API route
+        cannot drift into three different wordings for the same finding.
+        """
+        from oracle.entry_price_policy import (
+            SCORE_NOTE_ENTRY_NULL,
+            SCORE_NOTE_ENTRY_ZERO,
+        )
         from scripts import score_oracle_trades
 
         src = inspect.getsource(score_oracle_trades.main)
-        assert "entry_price IS NULL OR entry_price = 0" in src
-        assert "No entry price was measured at publish time" in src
+        assert "entry_price IS NULL OR entry_price <= 0" in src
+        assert ":note_null" in src and ":note_zero" in src
+        # The two reasons are distinct, and the NULL one still says the
+        # measurement was never taken.
+        assert SCORE_NOTE_ENTRY_NULL != SCORE_NOTE_ENTRY_ZERO
+        assert SCORE_NOTE_ENTRY_NULL == "No entry price was measured at publish time"
+        assert SCORE_NOTE_ENTRY_ZERO == "Entry price is 0, return not computable"
 
     def test_the_backfill_skip_is_an_explicit_none_test(self):
         from scripts import score_oracle_trades
@@ -364,11 +378,33 @@ class TestCalibrationIgnoresEntryPrice:
 
 class TestTrackingPnlGuard:
     def test_the_read_path_refuses_a_null_entry_explicitly(self):
+        """The route decides before it divides, and says which case it hit.
+
+        The guard used to be `and r[6]`, which only escaped a divide-by-zero
+        because 0.0 happens to be falsy. It is now the shared classifier, and
+        the row carries a `tracking_pnl_basis` naming the reason instead of a
+        bare null the client has to interpret.
+        """
         import api.routers.oracle as oracle_router
 
         src = Path(oracle_router.__file__).read_text(encoding="utf-8")
-        assert 'if r[17] == "pending" and r[6] is not None and float(r[6]) > 0:' in src
         assert 'if r[17] == "pending" and r[6]:' not in src
+        assert "entry_price_pnl_basis(entry_raw)" in src
+        assert '"tracking_pnl_basis": tracking_pnl_basis,' in src
+
+    def test_the_basis_names_null_and_zero_differently(self):
+        from oracle.entry_price_policy import (
+            PNL_BASIS_ENTRY_NULL,
+            PNL_BASIS_ENTRY_ZERO,
+            entry_price_pnl_basis,
+        )
+
+        assert entry_price_pnl_basis(None) == PNL_BASIS_ENTRY_NULL
+        assert entry_price_pnl_basis(0) == PNL_BASIS_ENTRY_ZERO
+        assert entry_price_pnl_basis(0.0) == PNL_BASIS_ENTRY_ZERO
+        assert PNL_BASIS_ENTRY_NULL != PNL_BASIS_ENTRY_ZERO
+        # A positive entry divides: no reason, so no basis to report.
+        assert entry_price_pnl_basis(214.5) is None
 
 
 class TestSchemaAllowsNull:
