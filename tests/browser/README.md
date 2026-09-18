@@ -462,3 +462,42 @@ Every result produced with this harness is development evidence against
 production, and not the future release tree; its Alembic graph will be
 re-rooted after the incident recovery). Results must be rerun against the
 post-recovery baseline SHA before any of them count as release evidence.
+
+## Evidence runner (`run_evidence.mjs`) — written, not executed by this session
+
+`tests/browser/run_evidence.mjs` + `tests/browser/package.json` (a
+`puppeteer-core` devDependency, isolated in this directory — `pwa/package.json`
+was not touched) automate what a human driving the browser does by hand:
+start the fixture server (port 8001, `FIXTURE_ROLE` + `--scenario`) and a
+PWA dev server (port 5174, proxy pointed at 8001) for each (role, scenario)
+pair, launch system Chrome/Edge headless via `executablePath` (no browser
+download) with a fresh `userDataDir` per run, log in through the real login
+form, visit each journey's hash route, and save `<journey>.png` (1280×900),
+`<journey>.mobile.png` (390×844), `<journey>.text.txt`
+(`document.body.innerText`), `console.jsonl`, `network.jsonl`, and a
+per-(role,scenario) `summary.json` (tree label, harness/PWA commits,
+timestamps, per-journey crashed/console_errors/api_non_2xx).
+
+**This session wrote the script but did not run it, did not run `npm ci`
+in `tests/browser/`, and did not generate or commit any
+`tests/browser/evidence/` output.** The task that built this harness was
+explicitly told not to install or drive a browser itself — only one browser
+is available on this machine and the lead drives it live — and launching
+Chrome/Edge via `puppeteer-core` is the same category of action regardless
+of which driver library reaches it. Syntax-checked with `node --check`
+only (no install, no launch, no network access, no browser process). The
+lead runs it themselves:
+
+```bash
+cd tests/browser
+npm ci
+node run_evidence.mjs --tree-label <sha-or-label>
+# defaults: --pwa-dir C:/Users/owner/dev/GRID-fable-wt-composed-g/pwa,
+# --scenarios healthy,partial,empty, --roles admin,contributor,
+# --out tests/browser/evidence/<tree-label>/
+```
+
+A separate untracked `tests/browser/evidence/44019a43/` directory already
+exists in this worktree from the lead's own manual browser run (text dumps
+only, no images — see its own `README.md`); it predates this script and is
+not part of this commit.
