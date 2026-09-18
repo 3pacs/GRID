@@ -1225,6 +1225,214 @@ def _field_record(
     }
 
 
+# ── God View pillars (W6) ─────────────────────────────────────────────
+# GET /api/v1/godview/pillars/{cftc|<other>} -> mirrors
+# api/routers/godview_pillars.py (read at commit 7560fb02) exactly, plus
+# godview/cftc_pillar.py (same commit, PILLAR_NAME/CFTC_PILLAR_CONTRACTS/
+# STALE_AFTER_DAYS/read_cftc_pillar/PillarReadResult) and
+# store/availability_fields.py's measured_field/derived_field/
+# unavailable_field -> FieldRecord.to_dict() (same 17-key shape as
+# _field_record above; ingested_at is NEVER set by this router's
+# _row_to_field_records — its `common` dict has no ingested_at key, so it
+# stays None even on a fully healthy read).
+#
+# The route id is `godview` (not `godview-pillars`), confirmed directly:
+# `git show d197c9a3 -- pwa/src/routes.js` adds `{id: 'godview', ...,
+# component: './views/GodViewPillars.jsx'}`. There are SIX (not five)
+# known-unbuilt pillar names in `_KNOWN_UNBUILT_PILLARS`
+# (api/routers/godview_pillars.py): finra_short_volume, sec_regsho_ftd,
+# commodity_warehouses, fed_net_liquidity, buyback_blackouts, dealer_gex.
+
+GODVIEW_PILLAR_NAME = "cftc_positioning"
+GODVIEW_UNBUILT_PILLARS = (
+    "finra_short_volume", "sec_regsho_ftd", "commodity_warehouses",
+    "fed_net_liquidity", "buyback_blackouts", "dealer_gex",
+)
+# key -> contract_code, matching godview/cftc_pillar.py::CFTC_PILLAR_CONTRACTS.
+GODVIEW_CFTC_CONTRACTS = {"SP500": "ES", "NOTE10Y": "ZN", "GOLD": "GC", "CRUDE_OIL": "CL"}
+
+_GODVIEW_RAW_FIELD_UNIT = {
+    "total_open_interest": "contracts", "commercial_long": "contracts",
+    "commercial_short": "contracts", "commercial_net": "contracts",
+    "noncommercial_long": "contracts", "noncommercial_short": "contracts",
+    "noncommercial_net": "contracts", "spec_net_pct_oi": "pct",
+}
+_GODVIEW_DERIVED_FIELD_UNIT = {
+    "z_score_1y": "zscore", "z_score_3y": "zscore",
+    "percentile_3y": "pct", "crowding_regime": None,
+}
+
+
+def _godview_unavailable(reason: str, pillar: str | None = None) -> dict:
+    """Mirrors store/availability.py::unavailable() exactly: every name
+    passed as a `**fields` kwarg is emitted as None, INCLUDING `pillar`
+    itself — api/routers/godview_pillars.py always calls
+    `unavailable(..., source=PILLAR_NAME_OR_pillar_name, pillar=..., coverage=None)`,
+    so the response's own `pillar` key is always null, never the pillar name
+    (that's `source`'s job).
+    """
+    return {
+        "available": False, "status": "unavailable", "reason": reason,
+        "as_of": None, "source": pillar, "pillar": None, "coverage": None,
+    }
+
+
+def _godview_field(
+    *, availability, provenance=None, value=None, unit=None,
+    obs_date=None, published_at=None, available_at=None,
+    revision=None, source_catalog=None, series_id=None,
+    calculation_version=None, coverage_fraction=None, stale_reason=None,
+):
+    """Same 17-key FieldRecord.to_dict() shape as `_field_record` above —
+    kept as its own helper because this pillar never sets ingested_at/
+    obs_start/obs_end/coverage_count/coverage_expected, unlike some future
+    pillar might.
+    """
+    return {
+        "availability": availability, "provenance": provenance, "value": value, "unit": unit,
+        "obs_date": obs_date, "obs_start": None, "obs_end": None,
+        "published_at": published_at, "available_at": available_at, "ingested_at": None,
+        "revision": revision, "source_catalog": source_catalog, "series_id": series_id,
+        "calculation_version": calculation_version, "coverage_fraction": coverage_fraction,
+        "coverage_count": None, "coverage_expected": None, "stale_reason": stale_reason,
+    }
+
+
+def _godview_contract_fields(contract_code: str, *, report_date, release_date, available_at,
+                              generation_id, values: dict, coverage_fraction) -> dict:
+    common = dict(
+        obs_date=report_date, published_at=release_date, available_at=available_at,
+        revision=generation_id, source_catalog="raw_series:cftc", series_id=contract_code,
+    )
+    out = {}
+    for name, unit in _GODVIEW_RAW_FIELD_UNIT.items():
+        out[name] = _godview_field(availability="available", provenance="measured",
+                                     value=values[name], unit=unit, **common)
+    for name, unit in _GODVIEW_DERIVED_FIELD_UNIT.items():
+        value = values.get(name)
+        if value is None:
+            out[name] = _godview_field(
+                availability="unavailable", unit=unit, calculation_version="cftc_pillar_v1",
+                coverage_fraction=coverage_fraction, stale_reason="partial_history", **common,
+            )
+        else:
+            out[name] = _godview_field(
+                availability="available", provenance="derived", value=value, unit=unit,
+                calculation_version="cftc_pillar_v1", coverage_fraction=coverage_fraction, **common,
+            )
+    return out
+
+
+def godview_pillar_cftc(scenario: str) -> dict:
+    """GET /api/v1/godview/pillars/cftc?as_of=... -> mirrors
+    api/routers/godview_pillars.py::get_cftc_pillar exactly.
+
+    - empty: never configured -> `_godview_unavailable("never_configured", GODVIEW_PILLAR_NAME)`
+      (mirrors `unavailable(STALE_NEVER_CONFIGURED, source=PILLAR_NAME, pillar=PILLAR_NAME,
+      coverage=None)` — no `generation_id`/`fields` at all, matching the
+      router's early return before any generation is even looked up).
+    - healthy: one complete generation, all 4 tracked contracts present,
+      `report_date` a Tuesday (2026-09-15), `release_date` the following
+      Friday (2026-09-18, `report_date + 3 days` per the contract doc
+      section 2), coverage 1.0, stale_reason null, status "ok".
+    - partial: CRUDE_OIL (CL) has `release_date IS NULL` in the underlying
+      table, so the strict-PIT query's `WHERE release_date IS NOT NULL`
+      (cftc_pillar.py's `read_cftc_pillar`) excludes it entirely —
+      `contracts_with_data=3`, `coverage=0.75`, status "partial". The
+      remaining 3 contracts' newest qualifying release is old enough that
+      `age_days > STALE_AFTER_DAYS` (10), so top-level `stale_reason` is
+      "stale". GOLD (GC) additionally has a short derived-history window:
+      `coverage_fraction=0.6` on its row, and its `z_score_3y`/
+      `percentile_3y`/`crowding_regime` fields are `unavailable_field
+      (STALE_PARTIAL_HISTORY, ...)` (only `z_score_1y` still has enough
+      history to compute) — this is the per-FIELD `stale_reason`, whose
+      real value is `"partial_history"`, not `"stale"` (`"stale"` is only
+      ever a top-level `stale_reason`, never a per-field one — the router
+      has no code path that sets a field's `stale_reason` to `"stale"`).
+    """
+    if scenario == "empty":
+        return _godview_unavailable("never_configured", GODVIEW_PILLAR_NAME)
+
+    generation_id = "gen-20260918-01"
+    generation_published_at = "2026-09-18T15:50:00+00:00"
+    report_date = "2026-09-15"       # Tuesday
+    release_date = "2026-09-18"      # report_date + 3 days (Friday)
+    available_at = "2026-09-18T15:45:00+00:00"
+
+    base_values = {
+        "SP500": dict(total_open_interest=500000, commercial_long=200000, commercial_short=180000,
+                       commercial_net=20000, noncommercial_long=150000, noncommercial_short=140000,
+                       noncommercial_net=10000, spec_net_pct_oi=2.0,
+                       z_score_1y=0.5, z_score_3y=0.6, percentile_3y=70.0, crowding_regime="neutral"),
+        "NOTE10Y": dict(total_open_interest=300000, commercial_long=140000, commercial_short=120000,
+                          commercial_net=20000, noncommercial_long=90000, noncommercial_short=95000,
+                          noncommercial_net=-5000, spec_net_pct_oi=-1.7,
+                          z_score_1y=-0.3, z_score_3y=-0.4, percentile_3y=35.0, crowding_regime="neutral"),
+        "GOLD": dict(total_open_interest=450000, commercial_long=210000, commercial_short=230000,
+                      commercial_net=-20000, noncommercial_long=160000, noncommercial_short=120000,
+                      noncommercial_net=40000, spec_net_pct_oi=8.9,
+                      z_score_1y=1.8, z_score_3y=None, percentile_3y=None, crowding_regime=None),
+        "CRUDE_OIL": dict(total_open_interest=1800000, commercial_long=900000, commercial_short=950000,
+                            commercial_net=-50000, noncommercial_long=600000, noncommercial_short=550000,
+                            noncommercial_net=50000, spec_net_pct_oi=2.8,
+                            z_score_1y=0.2, z_score_3y=0.1, percentile_3y=55.0, crowding_regime="neutral"),
+    }
+
+    if scenario == "healthy":
+        included = ["SP500", "NOTE10Y", "GOLD", "CRUDE_OIL"]
+        # Give GOLD its 3y fields back for the fully-healthy scenario.
+        base_values["GOLD"] = dict(base_values["GOLD"], z_score_3y=2.1, percentile_3y=96.0, crowding_regime="extreme")
+        coverage_fractions = {"SP500": 1.0, "NOTE10Y": 1.0, "GOLD": 1.0, "CRUDE_OIL": 1.0}
+        stale_reason = None
+        newest_release = release_date
+    else:  # partial
+        included = ["SP500", "NOTE10Y", "GOLD"]  # CRUDE_OIL excluded: release_date IS NULL
+        coverage_fractions = {"SP500": 1.0, "NOTE10Y": 1.0, "GOLD": 0.6}
+        stale_reason = "stale"
+        newest_release = "2026-09-04"  # > STALE_AFTER_DAYS (10) before as_of 2026-09-18
+
+    contracts_with_data = len(included)
+    contracts_expected = len(GODVIEW_CFTC_CONTRACTS)
+    coverage = contracts_with_data / contracts_expected
+
+    fields_by_contract = {}
+    for key in included:
+        code = GODVIEW_CFTC_CONTRACTS[key]
+        fields_by_contract[code] = _godview_contract_fields(
+            code, report_date=report_date if scenario == "healthy" else newest_release,
+            release_date=release_date if scenario == "healthy" else newest_release,
+            available_at=available_at, generation_id=generation_id,
+            values=base_values[key], coverage_fraction=coverage_fractions[key],
+        )
+
+    return {
+        "available": True,
+        "status": "ok" if (coverage == 1.0 and stale_reason is None) else "partial",
+        "pillar": GODVIEW_PILLAR_NAME,
+        "as_of": "2026-09-18",
+        "coverage": coverage,
+        "contracts_with_data": contracts_with_data,
+        "contracts_expected": contracts_expected,
+        "stale_reason": stale_reason,
+        "generation_id": generation_id,
+        "generation_published_at": generation_published_at,
+        "contracts": dict(GODVIEW_CFTC_CONTRACTS),
+        "fields": fields_by_contract,
+    }
+
+
+def godview_pillar_unbuilt(pillar_name: str) -> dict:
+    """GET /api/v1/godview/pillars/{pillar_name} for any pillar other than
+    `cftc` -> mirrors api/routers/godview_pillars.py::get_pillar_not_built
+    exactly: a known-but-unbuilt name gets "not built yet — no data"; any
+    other name gets "unknown godview pillar: {name}" — both via the same
+    `unavailable()` shape, never a 404.
+    """
+    if pillar_name not in GODVIEW_UNBUILT_PILLARS:
+        return _godview_unavailable(f"unknown godview pillar: {pillar_name}", pillar_name)
+    return _godview_unavailable("not built yet — no data", pillar_name)
+
+
 def research_status(scenario: str) -> dict:
     """GET /api/v1/snapshots/research/latest -> mirrors
     api/routers/snapshots.py::get_latest_research_run (read at commit
