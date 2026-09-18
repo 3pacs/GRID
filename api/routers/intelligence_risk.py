@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger as log
 
 from api.auth import require_auth
@@ -40,86 +40,104 @@ def _level_to_score(level: str) -> float:
     return {"critical": 0.95, "high": 0.75, "elevated": 0.55, "moderate": 0.35, "low": 0.15}.get(level, 0.5)
 
 
+class _NoData(LookupError):
+    """Raised inside a sub-system when the series it needs is absent.
+
+    Caught by the per-sub-system handler exactly like a query failure, so
+    the sub-system is reported as unavailable with the reason instead of
+    being scored from a made-up default (VIX 20, HY 400bp, ...).
+    """
+
+
+def _unavailable(reason: str) -> dict[str, Any]:
+    """Honest sub-system payload: no numbers, an explicit reason."""
+    return {"risk_level": "unknown", "available": False, "reason": reason}
+
+
 def _build_risk_map() -> dict[str, Any]:
     """Assemble the full risk map from dealer gamma, volatility, concentration,
-    correlation, credit, and liquidity sub-systems."""
+    correlation, credit, and liquidity sub-systems.
+
+    Each sub-system is either measured (``available: True`` plus its
+    metrics) or reported as ``{"risk_level": "unknown", "available": False,
+    "reason": ...}``. Missing inputs are never replaced by defaults: an
+    earlier version served VIX 20.0 / 50th percentile, HY 400bp, IG 100bp,
+    TED 0.30, ``avg_cross_correlation`` 0.5 and ``risk_level: "moderate"``
+    whenever a query failed or returned nothing, and those literals were
+    indistinguishable from real readings.
+    """
     from datetime import datetime, timezone, date as _date, timedelta
 
     engine = get_db_engine()
     errors: list[str] = []
     sub_scores: list[float] = []
 
+    def _fail(name: str, exc: BaseException) -> dict[str, Any]:
+        reason = str(exc) or exc.__class__.__name__
+        if isinstance(exc, _NoData):
+            log.debug("Risk map {n}: no data ({r})", n=name, r=reason)
+        else:
+            log.debug("Risk map {n} failed: {r}", n=name, r=reason)
+        errors.append(f"{name}: {reason}")
+        return _unavailable(reason)
+
     # ── 1. Dealer Risk ──────────────────────────────────────────────
-    dealer_risk: dict[str, Any] = {
-        "gex_regime": "unknown",
-        "net_gex": 0,
-        "gamma_flip_distance_pct": 0,
-        "vanna_direction": "neutral",
-        "charm_direction": "neutral",
-        "days_to_opex": 30,
-        "risk_level": "moderate",
-    }
     try:
         from physics.dealer_gamma import DealerGammaEngine
 
         gex_engine = DealerGammaEngine(engine)
         spy_gex = gex_engine.compute_gex_profile("SPY")
 
-        if "error" not in spy_gex:
-            regime = spy_gex.get("regime", "NEUTRAL").lower()
-            net_gex = spy_gex.get("gex_aggregate", 0)
-            spot = spy_gex.get("spot", 0)
-            gamma_flip = spy_gex.get("gamma_flip")
-            vanna = spy_gex.get("vanna_exposure", 0)
-            charm = spy_gex.get("charm_exposure", 0)
+        if "error" in spy_gex:
+            raise _NoData(f"SPY gamma profile unavailable: {spy_gex['error']}")
 
-            flip_dist_pct = 0.0
-            if gamma_flip and spot > 0:
-                flip_dist_pct = round((gamma_flip - spot) / spot * 100, 2)
+        regime = spy_gex.get("regime", "NEUTRAL").lower()
+        net_gex = spy_gex.get("gex_aggregate", 0)
+        spot = spy_gex.get("spot", 0)
+        gamma_flip = spy_gex.get("gamma_flip")
+        vanna = spy_gex.get("vanna_exposure", 0)
+        charm = spy_gex.get("charm_exposure", 0)
 
-            # Find nearest OPEX (third Friday)
-            today = _date.today()
-            days_to_opex = 30
-            for d_offset in range(45):
-                candidate = today + timedelta(days=d_offset)
-                if candidate.weekday() == 4:  # Friday
-                    week_num = (candidate.day - 1) // 7 + 1
-                    if week_num == 3:
-                        days_to_opex = d_offset
-                        break
+        flip_dist_pct = 0.0
+        if gamma_flip and spot > 0:
+            flip_dist_pct = round((gamma_flip - spot) / spot * 100, 2)
 
-            # Score: short gamma + close to flip + near OPEX = high risk
-            d_score = 0.3
-            if regime == "short_gamma":
-                d_score += 0.35
-            if abs(flip_dist_pct) < 1.0:
-                d_score += 0.15
-            if days_to_opex < 5:
-                d_score += 0.15
-            d_score = min(d_score, 1.0)
+        # Find nearest OPEX (third Friday)
+        today = _date.today()
+        days_to_opex = 30
+        for d_offset in range(45):
+            candidate = today + timedelta(days=d_offset)
+            if candidate.weekday() == 4:  # Friday
+                week_num = (candidate.day - 1) // 7 + 1
+                if week_num == 3:
+                    days_to_opex = d_offset
+                    break
 
-            dealer_risk = {
-                "gex_regime": regime,
-                "net_gex": round(net_gex),
-                "gamma_flip_distance_pct": flip_dist_pct,
-                "vanna_direction": "adverse" if vanna < 0 else "supportive",
-                "charm_direction": "bearish" if charm < 0 else "bullish",
-                "days_to_opex": days_to_opex,
-                "risk_level": _compute_risk_level(d_score),
-            }
-            sub_scores.append(d_score)
+        # Score: short gamma + close to flip + near OPEX = high risk
+        d_score = 0.3
+        if regime == "short_gamma":
+            d_score += 0.35
+        if abs(flip_dist_pct) < 1.0:
+            d_score += 0.15
+        if days_to_opex < 5:
+            d_score += 0.15
+        d_score = min(d_score, 1.0)
+
+        dealer_risk: dict[str, Any] = {
+            "gex_regime": regime,
+            "net_gex": round(net_gex),
+            "gamma_flip_distance_pct": flip_dist_pct,
+            "vanna_direction": "adverse" if vanna < 0 else "supportive",
+            "charm_direction": "bearish" if charm < 0 else "bullish",
+            "days_to_opex": days_to_opex,
+            "risk_level": _compute_risk_level(d_score),
+            "available": True,
+        }
+        sub_scores.append(d_score)
     except Exception as exc:
-        log.debug("Risk map dealer_risk failed: {e}", e=str(exc))
-        errors.append(f"dealer_risk: {exc}")
+        dealer_risk = _fail("dealer_risk", exc)
 
     # ── 2. Volatility Risk ──────────────────────────────────────────
-    vol_risk: dict[str, Any] = {
-        "vix": 0,
-        "vix_percentile_1y": 50,
-        "vix_term_structure": "contango",
-        "realized_vs_implied": 1.0,
-        "risk_level": "moderate",
-    }
     try:
         from sqlalchemy import text as sql_text
 
@@ -131,7 +149,10 @@ def _build_risk_map() -> dict[str, Any]:
                 ORDER BY rs.obs_date DESC LIMIT 1
             """), {"n": "%vix%close%"}).fetchone()
 
-            vix_val = float(vix_row[0]) if vix_row else 20.0
+            if not vix_row or vix_row[0] is None:
+                raise _NoData("no VIX close series in resolved_series")
+            vix_val = float(vix_row[0])
+            vix_as_of = vix_row[1].isoformat() if len(vix_row) > 1 and vix_row[1] else None
 
             vix_hist = conn.execute(sql_text("""
                 SELECT rs.value FROM resolved_series rs
@@ -141,37 +162,33 @@ def _build_risk_map() -> dict[str, Any]:
                 ORDER BY rs.obs_date
             """), {"n": "%vix%close%"}).fetchall()
 
-            pct = 50
-            if vix_hist:
-                vals = [float(r[0]) for r in vix_hist]
-                pct = int(sum(1 for v in vals if v <= vix_val) / len(vals) * 100)
+        vals = [float(r[0]) for r in vix_hist if r[0] is not None]
+        if not vals:
+            raise _NoData("no 1y VIX history to rank the current level")
+        pct = int(sum(1 for v in vals if v <= vix_val) / len(vals) * 100)
 
         term = "contango"
         if vix_val > 25:
             term = "backwardation"
 
-        rv_iv = min(round(vix_val / max(vix_val * 0.9, 1), 2), 2.0)
-
         v_score = min(pct / 100, 1.0)
-        vol_risk = {
+        vol_risk: dict[str, Any] = {
             "vix": round(vix_val, 1),
+            "vix_as_of": vix_as_of,
             "vix_percentile_1y": pct,
+            "vix_percentile_sample": len(vals),
             "vix_term_structure": term,
-            "realized_vs_implied": rv_iv,
+            # No realized-vol series is read here; the previous value was
+            # vix / (0.9 * vix), a constant 1.11 for every reading.
+            "realized_vs_implied": None,
             "risk_level": _compute_risk_level(v_score),
+            "available": True,
         }
         sub_scores.append(v_score)
     except Exception as exc:
-        log.debug("Risk map vol_risk failed: {e}", e=str(exc))
-        errors.append(f"volatility_risk: {exc}")
+        vol_risk = _fail("volatility_risk", exc)
 
     # ── 3. Concentration Risk ───────────────────────────────────────
-    conc_risk: dict[str, Any] = {
-        "top_5_watchlist_weight": 0,
-        "sector_concentration": {},
-        "single_name_max": {"ticker": "N/A", "weight": 0},
-        "risk_level": "low",
-    }
     try:
         from sqlalchemy import text as sql_text
 
@@ -183,47 +200,44 @@ def _build_risk_map() -> dict[str, Any]:
                 ORDER BY allocation_pct DESC NULLS LAST
             """)).fetchall()
 
-        if positions:
-            allocs = [(r[0], float(r[1] or 0), r[2] or "other") for r in positions]
-            total_alloc = sum(a for _, a, _ in allocs) or 1.0
-            weights = [(t, a / total_alloc, s) for t, a, s in allocs]
+        if not positions:
+            raise _NoData("no active watchlist positions")
 
-            top5_w = sum(w for _, w, _ in weights[:5])
-            sectors: dict[str, float] = {}
-            for _, w, s in weights:
-                sectors[s] = sectors.get(s, 0) + w
+        allocs = [(r[0], float(r[1] or 0), r[2] or "other") for r in positions]
+        total_alloc = sum(a for _, a, _ in allocs) or 1.0
+        weights = [(t, a / total_alloc, s) for t, a, s in allocs]
 
-            max_name = weights[0] if weights else ("N/A", 0, "")
+        top5_w = sum(w for _, w, _ in weights[:5])
+        sectors: dict[str, float] = {}
+        for _, w, s in weights:
+            sectors[s] = sectors.get(s, 0) + w
 
-            c_score = 0.15
-            if top5_w > 0.7:
-                c_score += 0.35
-            elif top5_w > 0.5:
-                c_score += 0.2
-            max_sector = max(sectors.values()) if sectors else 0
-            if max_sector > 0.4:
-                c_score += 0.25
-            if max_name[1] > 0.2:
-                c_score += 0.2
-            c_score = min(c_score, 1.0)
+        max_name = weights[0] if weights else ("N/A", 0, "")
 
-            conc_risk = {
-                "top_5_watchlist_weight": round(top5_w, 2),
-                "sector_concentration": {k: round(v, 2) for k, v in sorted(sectors.items(), key=lambda x: -x[1])[:6]},
-                "single_name_max": {"ticker": max_name[0], "weight": round(max_name[1], 2)},
-                "risk_level": _compute_risk_level(c_score),
-            }
-            sub_scores.append(c_score)
+        c_score = 0.15
+        if top5_w > 0.7:
+            c_score += 0.35
+        elif top5_w > 0.5:
+            c_score += 0.2
+        max_sector = max(sectors.values()) if sectors else 0
+        if max_sector > 0.4:
+            c_score += 0.25
+        if max_name[1] > 0.2:
+            c_score += 0.2
+        c_score = min(c_score, 1.0)
+
+        conc_risk: dict[str, Any] = {
+            "top_5_watchlist_weight": round(top5_w, 2),
+            "sector_concentration": {k: round(v, 2) for k, v in sorted(sectors.items(), key=lambda x: -x[1])[:6]},
+            "single_name_max": {"ticker": max_name[0], "weight": round(max_name[1], 2)},
+            "risk_level": _compute_risk_level(c_score),
+            "available": True,
+        }
+        sub_scores.append(c_score)
     except Exception as exc:
-        log.debug("Risk map conc_risk failed: {e}", e=str(exc))
-        errors.append(f"concentration_risk: {exc}")
+        conc_risk = _fail("concentration_risk", exc)
 
     # ── 4. Correlation Risk ─────────────────────────────────────────
-    corr_risk: dict[str, Any] = {
-        "avg_cross_correlation": 0.5,
-        "decoupling_events": [],
-        "risk_level": "low",
-    }
     try:
         from sqlalchemy import text as sql_text
 
@@ -237,57 +251,57 @@ def _build_risk_map() -> dict[str, Any]:
                 ORDER BY fr.name, rs.obs_date
             """)).fetchall()
 
-        if rows and len(rows) > 50:
-            import pandas as pd
-            import numpy as np
+        if not rows or len(rows) <= 50:
+            raise _NoData(
+                f"insufficient 90d close history ({len(rows) if rows else 0} rows, need >50)"
+            )
 
-            df = pd.DataFrame(rows, columns=["name", "date", "value"])
-            pivot = df.pivot_table(index="date", columns="name", values="value")
-            returns = pivot.pct_change().dropna()
+        import pandas as pd
+        import numpy as np
 
-            if returns.shape[1] >= 2:
-                corr_mat = returns.corr()
-                mask = np.triu(np.ones_like(corr_mat, dtype=bool), k=1)
-                upper = corr_mat.where(mask)
-                avg_corr = float(upper.stack().mean())
+        df = pd.DataFrame(rows, columns=["name", "date", "value"])
+        pivot = df.pivot_table(index="date", columns="name", values="value")
+        returns = pivot.pct_change().dropna()
 
-                decouplings = []
-                recent = returns.tail(22)
-                if len(recent) >= 10:
-                    corr_30d = recent.corr()
-                    cols = list(corr_mat.columns)
-                    for i in range(len(cols)):
-                        for j in range(i + 1, min(len(cols), i + 5)):
-                            c90 = corr_mat.iloc[i, j]
-                            c30 = corr_30d.iloc[i, j]
-                            if abs(c90 - c30) > 0.3:
-                                decouplings.append({
-                                    "pair": f"{cols[i]}/{cols[j]}",
-                                    "correlation_30d": round(float(c30), 2),
-                                    "correlation_90d": round(float(c90), 2),
-                                })
-                    decouplings.sort(key=lambda x: abs(x["correlation_90d"] - x["correlation_30d"]), reverse=True)
+        if returns.shape[1] < 2:
+            raise _NoData("fewer than two close series overlap in the last 90d")
 
-                co_score = max(0, min(avg_corr, 1.0))
+        corr_mat = returns.corr()
+        mask = np.triu(np.ones_like(corr_mat, dtype=bool), k=1)
+        upper = corr_mat.where(mask)
+        avg_corr = float(upper.stack().mean())
 
-                corr_risk = {
-                    "avg_cross_correlation": round(avg_corr, 2),
-                    "decoupling_events": decouplings[:5],
-                    "risk_level": _compute_risk_level(co_score),
-                }
-                sub_scores.append(co_score)
+        decouplings = []
+        recent = returns.tail(22)
+        if len(recent) >= 10:
+            corr_30d = recent.corr()
+            cols = list(corr_mat.columns)
+            for i in range(len(cols)):
+                for j in range(i + 1, min(len(cols), i + 5)):
+                    c90 = corr_mat.iloc[i, j]
+                    c30 = corr_30d.iloc[i, j]
+                    if abs(c90 - c30) > 0.3:
+                        decouplings.append({
+                            "pair": f"{cols[i]}/{cols[j]}",
+                            "correlation_30d": round(float(c30), 2),
+                            "correlation_90d": round(float(c90), 2),
+                        })
+            decouplings.sort(key=lambda x: abs(x["correlation_90d"] - x["correlation_30d"]), reverse=True)
+
+        co_score = max(0, min(avg_corr, 1.0))
+
+        corr_risk: dict[str, Any] = {
+            "avg_cross_correlation": round(avg_corr, 2),
+            "series_count": int(returns.shape[1]),
+            "decoupling_events": decouplings[:5],
+            "risk_level": _compute_risk_level(co_score),
+            "available": True,
+        }
+        sub_scores.append(co_score)
     except Exception as exc:
-        log.debug("Risk map corr_risk failed: {e}", e=str(exc))
-        errors.append(f"correlation_risk: {exc}")
+        corr_risk = _fail("correlation_risk", exc)
 
     # ── 5. Credit Risk ──────────────────────────────────────────────
-    credit_risk: dict[str, Any] = {
-        "hy_spread": 0,
-        "ig_spread": 0,
-        "ted_spread": 0,
-        "spread_direction": "stable",
-        "risk_level": "moderate",
-    }
     try:
         from sqlalchemy import text as sql_text
 
@@ -321,40 +335,41 @@ def _build_risk_map() -> dict[str, Any]:
                 ORDER BY rs.obs_date DESC LIMIT 1
             """), {"n": "%hy%spread%"}).fetchone()
 
-        hy_val = float(hy_row[0]) if hy_row else 400
-        ig_val = float(ig_row[0]) if ig_row else 100
-        ted_val = float(ted_row[0]) if ted_row else 0.3
-        hy_prev_val = float(hy_prev[0]) if hy_prev else hy_val
+        if not hy_row or hy_row[0] is None:
+            raise _NoData("no HY spread series in resolved_series")
+        hy_val = float(hy_row[0])
+        # IG / TED are reported when present and null otherwise; they do
+        # not enter the score, so their absence does not block the read.
+        ig_val = float(ig_row[0]) if ig_row and ig_row[0] is not None else None
+        ted_val = float(ted_row[0]) if ted_row and ted_row[0] is not None else None
+        hy_prev_val = float(hy_prev[0]) if hy_prev and hy_prev[0] is not None else None
 
-        direction = "stable"
-        if hy_val > hy_prev_val * 1.05:
+        if hy_prev_val is None:
+            direction = "unknown"
+        elif hy_val > hy_prev_val * 1.05:
             direction = "widening"
         elif hy_val < hy_prev_val * 0.95:
             direction = "tightening"
+        else:
+            direction = "stable"
 
         cr_score = min(hy_val / 800, 1.0)
         if direction == "widening":
             cr_score = min(cr_score + 0.15, 1.0)
 
-        credit_risk = {
+        credit_risk: dict[str, Any] = {
             "hy_spread": round(hy_val),
-            "ig_spread": round(ig_val),
-            "ted_spread": round(ted_val, 2),
+            "ig_spread": round(ig_val) if ig_val is not None else None,
+            "ted_spread": round(ted_val, 2) if ted_val is not None else None,
             "spread_direction": direction,
             "risk_level": _compute_risk_level(cr_score),
+            "available": True,
         }
         sub_scores.append(cr_score)
     except Exception as exc:
-        log.debug("Risk map credit_risk failed: {e}", e=str(exc))
-        errors.append(f"credit_risk: {exc}")
+        credit_risk = _fail("credit_risk", exc)
 
     # ── 6. Liquidity Risk ───────────────────────────────────────────
-    liq_risk: dict[str, Any] = {
-        "fed_net_liquidity_change_1m": 0,
-        "reverse_repo_trend": "stable",
-        "tga_trend": "stable",
-        "risk_level": "moderate",
-    }
     try:
         from sqlalchemy import text as sql_text
 
@@ -404,17 +419,26 @@ def _build_risk_map() -> dict[str, Any]:
                 ORDER BY rs.obs_date DESC LIMIT 1
             """), {"n": "%tga%"}).fetchone()
 
-        liq_val = float(liq_row[0]) if liq_row else 0
-        liq_prev_val = float(liq_prev[0]) if liq_prev else liq_val
+        if not liq_row or liq_row[0] is None:
+            raise _NoData("no Fed balance sheet series in resolved_series")
+        if not liq_prev or liq_prev[0] is None:
+            raise _NoData("no Fed balance sheet reading >= 30 days old to measure the 1m change")
+        liq_val = float(liq_row[0])
+        liq_prev_val = float(liq_prev[0])
         liq_change = liq_val - liq_prev_val
 
-        rrp_val = float(rrp_row[0]) if rrp_row else 0
-        rrp_prev_val = float(rrp_prev[0]) if rrp_prev else rrp_val
-        rrp_trend = "declining" if rrp_val < rrp_prev_val * 0.95 else "rising" if rrp_val > rrp_prev_val * 1.05 else "stable"
+        def _trend(cur_row, prev_row, up_label: str, down_label: str) -> str:
+            if not cur_row or cur_row[0] is None or not prev_row or prev_row[0] is None:
+                return "unknown"
+            cur, prev = float(cur_row[0]), float(prev_row[0])
+            if cur < prev * 0.95:
+                return down_label
+            if cur > prev * 1.05:
+                return up_label
+            return "stable"
 
-        tga_val = float(tga_row[0]) if tga_row else 0
-        tga_prev_val = float(tga_prev[0]) if tga_prev else tga_val
-        tga_trend = "building" if tga_val > tga_prev_val * 1.05 else "draining" if tga_val < tga_prev_val * 0.95 else "stable"
+        rrp_trend = _trend(rrp_row, rrp_prev, "rising", "declining")
+        tga_trend = _trend(tga_row, tga_prev, "building", "draining")
 
         l_score = 0.3
         if liq_change < -50_000_000_000:
@@ -427,21 +451,18 @@ def _build_risk_map() -> dict[str, Any]:
             l_score -= 0.1
         l_score = max(0, min(l_score, 1.0))
 
-        liq_risk = {
+        liq_risk: dict[str, Any] = {
             "fed_net_liquidity_change_1m": round(liq_change),
             "reverse_repo_trend": rrp_trend,
             "tga_trend": tga_trend,
             "risk_level": _compute_risk_level(l_score),
+            "available": True,
         }
         sub_scores.append(l_score)
     except Exception as exc:
-        log.debug("Risk map liq_risk failed: {e}", e=str(exc))
-        errors.append(f"liquidity_risk: {exc}")
+        liq_risk = _fail("liquidity_risk", exc)
 
     # ── Overall Score & Narrative ────────────────────────────────────
-    overall = round(sum(sub_scores) / max(len(sub_scores), 1), 2)
-
-    parts = []
     all_risks = {
         "Dealer positioning": dealer_risk,
         "Volatility": vol_risk,
@@ -450,20 +471,25 @@ def _build_risk_map() -> dict[str, Any]:
         "Credit spreads": credit_risk,
         "Liquidity": liq_risk,
     }
+    unavailable = [name for name, r in all_risks.items() if not r.get("available")]
+    overall = round(sum(sub_scores) / len(sub_scores), 2) if sub_scores else None
 
+    parts = []
     elevated_cats = [name for name, r in all_risks.items() if r["risk_level"] in ("elevated", "high", "critical")]
-    if not elevated_cats:
-        parts.append("All risk categories are within normal ranges.")
+    if overall is None:
+        parts.append("No risk sub-system could be measured; the overall score is unavailable.")
+    elif not elevated_cats:
+        parts.append("All measured risk categories are within normal ranges.")
     elif len(elevated_cats) == 1:
         parts.append(f"{elevated_cats[0]} risk is elevated and warrants monitoring.")
     else:
         parts.append(f"Multiple risk factors are elevated: {', '.join(elevated_cats)}.")
 
-    if dealer_risk["gex_regime"] == "short_gamma":
+    if dealer_risk.get("gex_regime") == "short_gamma":
         parts.append("Dealers are short gamma, amplifying directional moves.")
-    if vol_risk.get("vix", 0) > 25:
+    if (vol_risk.get("vix") or 0) > 25:
         parts.append(f"VIX at {vol_risk['vix']} signals elevated implied volatility.")
-    if conc_risk.get("top_5_watchlist_weight", 0) > 0.7:
+    if (conc_risk.get("top_5_watchlist_weight") or 0) > 0.7:
         parts.append("Portfolio is highly concentrated in top 5 positions.")
     if credit_risk.get("spread_direction") == "widening":
         parts.append("Credit spreads are widening, signaling deteriorating risk appetite.")
@@ -472,6 +498,10 @@ def _build_risk_map() -> dict[str, Any]:
 
     if len(elevated_cats) >= 3:
         parts.append("RISK CONVERGENCE: multiple risk factors elevated simultaneously -- reduce exposure.")
+    if unavailable:
+        parts.append(
+            f"Unavailable ({len(unavailable)} of {len(all_risks)}): {', '.join(unavailable)}."
+        )
 
     return {
         "dealer_risk": dealer_risk,
@@ -481,6 +511,8 @@ def _build_risk_map() -> dict[str, Any]:
         "credit_risk": credit_risk,
         "liquidity_risk": liq_risk,
         "overall_risk_score": overall,
+        "available_subsystems": len(sub_scores),
+        "unavailable_subsystems": unavailable,
         "risk_narrative": " ".join(parts),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "errors": errors,
@@ -495,7 +527,10 @@ async def get_risk_map(
 
     Returns dealer, volatility, concentration, correlation, credit, and
     liquidity risk assessments with an overall risk score and narrative.
-    Cached for 5 minutes.
+    Sub-systems without data are ``{"risk_level": "unknown", "available":
+    false, "reason": ...}`` and ``overall_risk_score`` is ``null`` when
+    nothing could be measured. A failure of the builder itself is a 503,
+    never a placeholder payload. Cached for 5 minutes.
     """
     cached = _risk_map_cache.get(_RISK_MAP_CACHE_KEY)
     if cached is not None:
@@ -505,21 +540,19 @@ async def get_risk_map(
 
     try:
         result = await asyncio.to_thread(_build_risk_map)
-        _risk_map_cache.set(_RISK_MAP_CACHE_KEY, result)
-        return result
     except Exception as exc:
         log.error("Risk map build failed: {e}", e=str(exc))
-        return {
-            "dealer_risk": {"risk_level": "moderate"},
-            "volatility_risk": {"risk_level": "moderate"},
-            "concentration_risk": {"risk_level": "moderate"},
-            "correlation_risk": {"risk_level": "low"},
-            "credit_risk": {"risk_level": "moderate"},
-            "liquidity_risk": {"risk_level": "moderate"},
-            "overall_risk_score": 0.5,
-            "risk_narrative": f"Risk map computation error: {exc}",
-            "errors": [str(exc)],
-        }
+        raise HTTPException(
+            status_code=503,
+            detail=f"Risk map unavailable: {exc}",
+        ) from exc
+
+    if result.get("available_subsystems", 0) > 0:
+        # Only pin a payload that measured at least one sub-system. A fully
+        # unavailable read is still served honestly, but the next caller
+        # should retry rather than be handed a 5-minute-old "nothing".
+        _risk_map_cache.set(_RISK_MAP_CACHE_KEY, result)
+    return result
 
 
 # ── Unified Intelligence Dashboard ──────────────────────────────────────
