@@ -15,6 +15,23 @@ const fmt = (v) => {
 
 const fmtDate = (d) => d ? d.substring(0, 19).replace('T', ' ') : '-';
 
+// api/routers/snapshots.py::get_latest_snapshots and ::get_snapshot_history
+// both return a BARE array (list[dict]) — never `{snapshots: [...]}`. api.js's
+// request helper never throws on network/HTTP/parse failure; it resolves an
+// `{ error: true, status, message }` marker instead. Normalise both real
+// contracts explicitly rather than falling back through `res || []`, which
+// let the truthy, non-array error marker (or any other malformed value)
+// flow straight into state.
+const normalizeSnapshotList = (res) => {
+    if (Array.isArray(res)) {
+        return { list: res, error: null };
+    }
+    if (res && typeof res === 'object' && res.error === true) {
+        return { list: [], error: `Snapshots unavailable: ${res.message || 'Request failed'}` };
+    }
+    return { list: [], error: 'Unexpected response' };
+};
+
 export default function Snapshots() {
     const [category, setCategory] = useState(CATEGORIES[0]);
     const [latest, setLatest] = useState(null);
@@ -25,6 +42,8 @@ export default function Snapshots() {
     const [comparison, setComparison] = useState(null);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
+    const [latestError, setLatestError] = useState(null);
+    const [historyError, setHistoryError] = useState(null);
     const [expandedId, setExpandedId] = useState(null);
 
     useEffect(() => {
@@ -34,14 +53,21 @@ export default function Snapshots() {
     const loadData = async () => {
         setLoading(true);
         setError(null);
+        setLatestError(null);
+        setHistoryError(null);
         setComparison(null);
         try {
             const [latestRes, historyRes] = await Promise.all([
-                api.getSnapshotLatest(category, 1).catch(() => null),
-                api.getSnapshotHistory(category).catch(() => null),
+                api.getSnapshotLatest(category, 1),
+                api.getSnapshotHistory(category),
             ]);
-            setLatest(latestRes?.snapshots?.[0] || latestRes || null);
-            setHistory(historyRes?.snapshots || historyRes || []);
+            const latestNorm = normalizeSnapshotList(latestRes);
+            setLatest(latestNorm.list[0] || null);
+            setLatestError(latestNorm.error);
+
+            const historyNorm = normalizeSnapshotList(historyRes);
+            setHistory(historyNorm.list);
+            setHistoryError(historyNorm.error);
         } catch (e) {
             setError(e.message || 'Failed to load snapshots');
         }
@@ -54,7 +80,15 @@ export default function Snapshots() {
         setError(null);
         try {
             const res = await api.compareSnapshots(category, dateA, dateB);
-            setComparison(res);
+            if (res && typeof res === 'object' && res.error === true) {
+                // compare_snapshots (api/routers/snapshots.py:81-83) raises a 404
+                // with the store's own message when a date is missing; api.js
+                // resolves that to this marker rather than throwing.
+                setComparison(null);
+                setError(res.message || 'Comparison failed');
+            } else {
+                setComparison(res);
+            }
         } catch (e) {
             setError(e.message || 'Comparison failed');
         }
@@ -136,7 +170,13 @@ export default function Snapshots() {
             {loading && <div style={{ color: colors.textMuted, fontSize: '13px', padding: '12px' }}>Loading...</div>}
 
             {/* Latest Snapshot */}
-            {latest && !loading && (
+            {latestError && !loading && (
+                <div style={shared.card}>
+                    <div style={shared.sectionTitle}>LATEST SNAPSHOT</div>
+                    <div style={{ color: colors.red, fontSize: '13px', marginTop: '6px' }}>{latestError}</div>
+                </div>
+            )}
+            {!latestError && latest && !loading && (
                 <div style={shared.card}>
                     <div style={shared.sectionTitle}>LATEST SNAPSHOT</div>
                     <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
@@ -245,7 +285,12 @@ export default function Snapshots() {
             {!loading && (
                 <div style={{ marginTop: '4px' }}>
                     <div style={shared.sectionTitle}>HISTORY</div>
-                    {history.length === 0 && (
+                    {historyError && (
+                        <div style={{ color: colors.red, fontSize: '13px', padding: '12px', textAlign: 'center' }}>
+                            {historyError}
+                        </div>
+                    )}
+                    {!historyError && history.length === 0 && (
                         <div style={{ color: colors.textMuted, fontSize: '13px', padding: '12px', textAlign: 'center' }}>
                             No snapshots found for {category.replace(/_/g, ' ')}
                         </div>

@@ -37,17 +37,42 @@ export function plainSentiment(raw) {
     return { label: 'Calm / mixed', tone: 'flat' };
 }
 
-/** Market regime string → a full plain sentence + tone. */
-export function plainRegime(raw) {
+/**
+ * Market regime string (+ optional confidence 0-1) → a full plain sentence,
+ * tone, and whether there is actually a reading to show.
+ *
+ * `UNCALIBRATED` (api/routers/regime.py's sentinel for "no decision_journal
+ * row exists yet") and any null/missing/empty state are not a regime
+ * reading at all — they must say so plainly, with no numeric confidence,
+ * rather than being cleaned up into "The market read is "UNCALIBRATED"."
+ * as if it were a real (if unfamiliar) label.
+ *
+ * A genuine reading's confidence can legitimately be 0.0 (a real regime the
+ * model is simply not confident about) — that must still render as a real
+ * reading with 0%, so this checks `typeof === 'number'`, never truthiness.
+ */
+export function plainRegime(raw, confidence) {
     const v = String(raw || '').toLowerCase();
+    const confidencePct = (typeof confidence === 'number' && Number.isFinite(confidence))
+        ? Math.round(confidence * 100)
+        : null;
+
+    if (!raw || v === 'uncalibrated') {
+        return {
+            sentence: "The market read isn't ready yet — no regime reading has been made.",
+            tone: 'flat',
+            available: false,
+            confidencePct: null,
+        };
+    }
     if (/risk.?off|bear|stress|defensive|fear/.test(v))
-        return { sentence: 'Investors are nervous and playing it safe.', tone: 'down' };
+        return { sentence: 'Investors are nervous and playing it safe.', tone: 'down', available: true, confidencePct };
     if (/risk.?on|bull|greed|expansion|growth/.test(v))
-        return { sentence: 'Investors are feeling confident.', tone: 'up' };
+        return { sentence: 'Investors are feeling confident.', tone: 'up', available: true, confidencePct };
     if (/neutral|mixed|transition|chop/.test(v))
-        return { sentence: 'The market is calm and mixed — no strong direction.', tone: 'flat' };
+        return { sentence: 'The market is calm and mixed — no strong direction.', tone: 'flat', available: true, confidencePct };
     // unknown regime label: show it cleaned, neutral tone
-    return { sentence: `The market read is "${String(raw).replace(/_/g, ' ')}".`, tone: 'flat' };
+    return { sentence: `The market read is "${String(raw).replace(/_/g, ' ')}".`, tone: 'flat', available: true, confidencePct };
 }
 
 /** Turn whatever an error throw gives us into one calm sentence. Never leak. */

@@ -211,7 +211,11 @@ function MacroRegimeCard({ title }) {
     const { loading, error, data, reload } = useFetch(() => api.getCurrent(), []);
     // /api/v1/regime/current calls it `state`; `regime` is the older shape.
     const regime = data?.regime ?? data?.state;
-    const r = regime ? plainRegime(regime) : null;
+    // plainRegime itself treats UNCALIBRATED/null/missing as "no reading
+    // yet" (see plain.js) — always run it through, rather than gating on
+    // `regime` truthiness here, so that path is the only place the
+    // decision lives.
+    const r = data ? plainRegime(regime, data?.confidence) : null;
     // The reading's own date is always "today" on a scheduled run. data_as_of is
     // the day its inputs are actually from — the only one worth showing him.
     const dataAge = data?.data_staleness_days;
@@ -221,12 +225,15 @@ function MacroRegimeCard({ title }) {
         <Shell title={title || 'The market right now'}>
             {loading && <Loading />}
             {error && <ErrorState msg={warmError()} onRetry={reload} />}
-            {data && (r
+            {data && (r?.available
                 ? (
                     <div style={CS.col}>
                         <div style={{ ...CS.regime, background: toneBg(r.tone), color: toneColor(r.tone) }}>
                             {r.sentence}
                         </div>
+                        {r.confidencePct != null && (
+                            <div style={CS.dim}>Confidence: {r.confidencePct}%</div>
+                        )}
                         {stale && (
                             <div style={CS.dim}>
                                 {dataDate
@@ -236,7 +243,7 @@ function MacroRegimeCard({ title }) {
                         )}
                     </div>
                 )
-                : <Empty msg="The market read isn’t ready yet — check back shortly." />)}
+                : <Empty msg={r?.sentence || 'The market read isn’t ready yet — check back shortly.'} />)}
         </Shell>
     );
 }
