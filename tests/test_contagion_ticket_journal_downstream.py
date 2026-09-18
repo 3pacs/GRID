@@ -166,11 +166,12 @@ def test_the_unscored_record_carries_no_number_anywhere(monkeypatch):
     assert "supply_disruption" in reason
 
 
-def test_operator_confidence_floors_at_low_for_an_unscored_ticket(monkeypatch):
-    """A categorical NOT NULL column still has to be filled; LOW is the floor."""
+def test_operator_confidence_is_unscored_not_low_for_an_unscored_ticket(monkeypatch):
+    """A categorical NOT NULL column still has to be filled; the category is
+    UNSCORED, because LOW would be an assessment nobody made."""
     captured = _capture_journal(monkeypatch)
     ctt.write_ticket_to_journal(MagicMock(), _unscored_ticket())
-    assert captured["operator_confidence"] == "LOW"
+    assert captured["operator_confidence"] == "UNSCORED"
 
 
 def test_a_scored_ticket_is_unaffected(monkeypatch):

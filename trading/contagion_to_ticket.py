@@ -650,11 +650,10 @@ def write_ticket_to_journal(
             counterfactual=ticket.get("thesis", ""),
             # operator_confidence is a categorical NOT NULL column and is a
             # different thing from the measured state_confidence. With no
-            # measurement at all there is no evidence of an edge, so the
-            # truthful category is the floor, LOW — and the row carries
-            # confidence_reason so "LOW" is never mistaken for a measurement.
+            # measurement at all the category is UNSCORED, not LOW: LOW is
+            # an assessment, and nothing here was assessed.
             operator_confidence=(
-                "LOW" if confidence is None
+                "UNSCORED" if confidence is None
                 else (
                     "HIGH" if confidence >= 0.65
                     else ("MEDIUM" if confidence >= 0.5 else "LOW")
