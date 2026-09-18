@@ -105,14 +105,19 @@ def _render_html(subject: str, sections: list[dict], footer_note: str = "") -> s
 # Section builders
 # ---------------------------------------------------------------------------
 
-def _section_regime(state: str, confidence: float, action: str) -> dict:
+def _section_regime(state: str, confidence: float | None, action: str) -> dict:
+    # confidence is None when the decision was never scored. Formatting
+    # None with ``:.0%`` raises, and both callers swallow that in a bare
+    # except - the regime section then vanishes from the digest with no
+    # error recorded anywhere.
+    conf_txt = f"{confidence:.0%}" if confidence is not None else "unscored"
     accent = "green" if "ON" in state.upper() or "BUY" in action.upper() else "red" if "OFF" in state.upper() or "SELL" in action.upper() else "amber"
     badge_cls = "badge-buy" if "BUY" in action.upper() else "badge-sell" if "SELL" in action.upper() else "badge-hold"
     return {
         "title": "Regime State",
         "body": (
             f'<span class="badge badge-regime">{state}</span> '
-            f'&nbsp; Confidence: <strong>{confidence:.0%}</strong><br><br>'
+            f'&nbsp; Confidence: <strong>{conf_txt}</strong><br><br>'
             f'Suggested Action: <span class="badge {badge_cls}">{action}</span>'
         ),
         "accent": accent,

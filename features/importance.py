@@ -1014,7 +1014,7 @@ class FeatureImportanceTracker:
         from scipy.stats import ttest_ind
         from sqlalchemy import text
 
-        with self.db_engine.connect() as conn:
+        with self.engine.connect() as conn:
             rows = conn.execute(text(
                 "SELECT state_confidence FROM decision_journal "
                 "WHERE model_version_id = :mid "
@@ -1024,7 +1024,13 @@ class FeatureImportanceTracker:
         if len(rows) < window:
             return {"sufficient_data": False}
 
-        confidences = [float(r[0]) for r in rows]
+        # Unscored decisions (state_confidence IS NULL) carry no confidence to
+        # drift, so they are EXCLUDED from the comparison rather than counted
+        # as 0.0 - a zero would read as a genuine collapse in confidence and
+        # manufacture a drift signal out of missing measurements.
+        confidences = [float(r[0]) for r in rows if r[0] is not None]
+        if len(confidences) < window:
+            return {"sufficient_data": False, "reason": "too_many_unscored"}
         recent = confidences[:window]
         prior = confidences[window:window * 2] if len(confidences) >= window * 2 else confidences[window:]
 
@@ -1051,7 +1057,7 @@ class FeatureImportanceTracker:
         from sqlalchemy import text
 
         # Get model's feature set
-        with self.db_engine.connect() as conn:
+        with self.engine.connect() as conn:
             row = conn.execute(text(
                 "SELECT feature_set FROM model_registry WHERE id = :mid"
             ), {"mid": model_id}).fetchone()
