@@ -2,9 +2,13 @@
 
 Built: CFTC positioning, Fed net liquidity, commodity warehouses (LME leg
 only -- Cushing is permanently unavailable(never_configured), see
-godview/commodity_warehouse_pillar.py). Every other pillar name renders the
-honest "not built yet" state, with the specific reason it is blocked --
-see docs/reference/GODVIEW_PILLAR_CONTRACT.md's status table.
+godview/commodity_warehouse_pillar.py), FINRA short volume, SEC
+Reg SHO FTD, corporate buyback blackout windows, and dealer GEX (2026-09-18,
+all four remaining pillars per operator direction -- see
+docs/reference/GODVIEW_PILLAR_CONTRACT.md's status table for each one's
+concrete missing input). Any unrecognized pillar name renders the honest
+"not built yet" state via ``_KNOWN_UNBUILT_PILLARS`` / the catch-all route
+below, never a fabricated value or a silent 404.
 
 Never raises 500 for a missing table: every table this router reads is
 probed with ``to_regclass`` first, mirroring the ``_table_exists`` pattern
@@ -65,6 +69,31 @@ from godview.fed_liquidity_pillar import (
     UNIT as FED_UNIT,
     read_fed_liquidity_pillar,
 )
+from godview.finra_short_volume_pillar import (
+    NOT_SHORT_INTEREST_NOTE,
+    PILLAR_NAME as FINRA_PILLAR_NAME,
+    read_finra_short_volume_pillar,
+)
+from godview.sec_ftd_pillar import (
+    AGE_NOTE as FTD_AGE_NOTE,
+    NOT_A_TIMELINE_NOTE as FTD_NOT_A_TIMELINE_NOTE,
+    PILLAR_NAME as SEC_FTD_PILLAR_NAME,
+    compute_age_days as ftd_compute_age_days,
+    read_sec_ftd_pillar,
+)
+from godview.buyback_pillar import (
+    MISSING_INPUT as BUYBACK_MISSING_INPUT,
+    MODELING_ASSUMPTION_NOTE,
+    PILLAR_NAME as BUYBACK_PILLAR_NAME,
+    read_buyback_pillar,
+)
+from godview.dealer_gex_pillar import (
+    GAMMA_ASSUMPTIONS_NOTE as GEX_GAMMA_ASSUMPTIONS_NOTE,
+    MISSING_INPUT as GEX_MISSING_INPUT,
+    PILLAR_NAME as GEX_PILLAR_NAME,
+    SIGN_CONVENTION_NOTE as GEX_SIGN_CONVENTION_NOTE,
+    read_dealer_gex_pillar,
+)
 from store.availability import unavailable
 from store.availability_fields import (
     STALE_MATERIALIZER_FAILED,
@@ -73,6 +102,7 @@ from store.availability_fields import (
     STALE_STALE,
     derived_field,
     measured_field,
+    modeled_field,
     unavailable_field,
 )
 
@@ -82,12 +112,7 @@ router = APIRouter(prefix="/api/v1/godview", tags=["godview"])
 #: is blocked (operator direction, 2026-09-18) -- kept explicit (rather than
 #: a catch-all) so a typo in the URL still reads as "not built" honestly,
 #: not a silent 404.
-_KNOWN_UNBUILT_PILLARS = {
-    "finra_short_volume": "adapter exists but is unscheduled/unverified live",
-    "sec_regsho_ftd": "adapter exists but is unscheduled/unverified live",
-    "buyback_blackouts": "no measured source",
-    "dealer_gex": "engine correctness unproven",
-}
+_KNOWN_UNBUILT_PILLARS: dict[str, str] = {}
 
 _RAW_FIELD_UNIT = {
     "total_open_interest": "contracts",
@@ -483,6 +508,320 @@ def get_commodity_warehouse_pillar(
         "cushing_crude_stocks": unavailable(
             CUSHING_UNAVAILABLE_REASON, source="eia", pillar=COMMODITY_PILLAR_NAME, coverage=None
         ),
+    }
+
+
+def _finra_field_records(row: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    basis = row.get("availability_basis")
+    basis_note = _availability_basis_note(basis)
+    common = {
+        "obs_date": row["trade_date"],
+        "published_at": row["release_date"],
+        "available_at": row["available_at"],
+        "revision": row["generation_id"],
+        "source_catalog": "raw_series:finra_short_volume",
+        "series_id": row["ticker"],
+    }
+    out: dict[str, dict[str, Any]] = {}
+    for name, unit in (("short_volume", "shares"), ("short_exempt_volume", "shares"), ("total_volume", "shares")):
+        record = measured_field(row[name], unit=unit, **common).to_dict()
+        record["availability_basis"] = basis
+        record["availability_basis_note"] = basis_note
+        out[name] = record
+
+    for name, unit in (("short_ratio", "ratio_0_1"), ("short_ratio_20d_ma", "ratio_0_1"), ("is_spike", None)):
+        value = row[name]
+        if value is None:
+            record = unavailable_field(STALE_PARTIAL_HISTORY, unit=unit, calculation_version="finra_short_volume_pillar_v1", **common).to_dict()
+        else:
+            record = derived_field(value, unit=unit, calculation_version="finra_short_volume_pillar_v1", **common).to_dict()
+        record["availability_basis"] = basis
+        record["availability_basis_note"] = basis_note
+        out[name] = record
+    return out
+
+
+@router.get("/pillars/finra_short_volume")
+def get_finra_short_volume_pillar(
+    as_of: Annotated[date | None, Query()] = None,
+    include_inferred: Annotated[bool, Query()] = False,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Daily short-SALE-VOLUME pillar (NOT short interest, never a squeeze score --
+    see NOT_SHORT_INTEREST_NOTE and godview/finra_short_volume_pillar.py's docstring).
+
+    Realistically returns unavailable(never_configured) in production: the
+    live FINRA puller is deliberately unscheduled (unauthorised live pulls),
+    so raw_series has nothing to materialize from until that changes.
+    """
+    as_of = as_of or date.today()
+    engine = get_db_engine()
+
+    try:
+        with engine.connect() as conn:
+            if not _table_exists(conn, "finra_short_volume_daily") or not _table_exists(conn, "godview_generations"):
+                return unavailable(
+                    "finra_short_volume_daily or godview_generations does not exist yet",
+                    source=FINRA_PILLAR_NAME, pillar=FINRA_PILLAR_NAME, coverage=None,
+                )
+            result = read_finra_short_volume_pillar(conn, as_of, include_inferred=include_inferred)
+    except Exception as exc:  # noqa: BLE001
+        return unavailable(f"godview read failed: {exc}", source=FINRA_PILLAR_NAME, pillar=FINRA_PILLAR_NAME, coverage=None)
+
+    if result.state == "never_configured":
+        return unavailable(STALE_NEVER_CONFIGURED, source=FINRA_PILLAR_NAME, pillar=FINRA_PILLAR_NAME, coverage=None)
+    if result.state == "materializer_failed":
+        return unavailable(STALE_MATERIALIZER_FAILED, source=FINRA_PILLAR_NAME, pillar=FINRA_PILLAR_NAME, coverage=None)
+
+    fields_by_ticker = {row["ticker"]: _finra_field_records(row) for row in result.rows}
+    return {
+        "available": True,
+        "status": "ok" if fields_by_ticker else "partial",
+        "pillar": FINRA_PILLAR_NAME,
+        "as_of": as_of.isoformat(),
+        "include_inferred": include_inferred,
+        "note": NOT_SHORT_INTEREST_NOTE,
+        "symbols_with_data": result.symbols_with_data,
+        "generation_id": result.generation_id,
+        "generation_published_at": result.generation_published_at.isoformat() if result.generation_published_at else None,
+        "fields": fields_by_ticker,
+    }
+
+
+def _ftd_field_records(row: dict[str, Any], as_of: date) -> dict[str, dict[str, Any]]:
+    basis = row.get("availability_basis")
+    basis_note = _availability_basis_note(basis)
+    common = {
+        "obs_date": row["settlement_date"],
+        "published_at": row["release_date"],
+        "available_at": row["available_at"],
+        "revision": row["generation_id"],
+        "source_catalog": "raw_series:sec_ftd",
+        "series_id": row["cusip"],
+    }
+    out: dict[str, dict[str, Any]] = {}
+    record = measured_field(row["failed_shares"], unit="shares", **common).to_dict()
+    record["availability_basis"] = basis
+    record["availability_basis_note"] = basis_note
+    out["failed_shares"] = record
+
+    price = row["closing_price"]
+    if price is None:
+        record = unavailable_field(STALE_PARTIAL_HISTORY, unit="usd_per_share", calculation_version="sec_ftd_pillar_v1", **common).to_dict()
+    else:
+        record = measured_field(price, unit="usd_per_share", **common).to_dict()
+    record["availability_basis"] = basis
+    record["availability_basis_note"] = basis_note
+    out["closing_price"] = record
+
+    total_usd = row["total_failed_usd"]
+    if total_usd is None:
+        record = unavailable_field(STALE_PARTIAL_HISTORY, unit="usd", calculation_version="sec_ftd_pillar_v1", **common).to_dict()
+    else:
+        record = derived_field(total_usd, unit="usd", calculation_version="sec_ftd_pillar_v1", **common).to_dict()
+    record["availability_basis"] = basis
+    record["availability_basis_note"] = basis_note
+    out["total_failed_usd"] = record
+
+    age_days = ftd_compute_age_days(row["settlement_date"], as_of)
+    record = derived_field(age_days, unit="days", calculation_version="sec_ftd_pillar_v1", **common).to_dict()
+    record["availability_basis"] = basis
+    record["availability_basis_note"] = basis_note
+    record["note"] = FTD_AGE_NOTE
+    out["observation_age_days"] = record
+    return out
+
+
+@router.get("/pillars/sec_regsho_ftd")
+def get_sec_ftd_pillar(
+    as_of: Annotated[date | None, Query()] = None,
+    include_inferred: Annotated[bool, Query()] = False,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """SEC Fails-to-Deliver outstanding-balance pillar. NO T+35 timeline, NO squeeze
+    score -- see FTD_NOT_A_TIMELINE_NOTE and godview/sec_ftd_pillar.py's docstring."""
+    as_of = as_of or date.today()
+    engine = get_db_engine()
+
+    try:
+        with engine.connect() as conn:
+            if not _table_exists(conn, "sec_regsho_ftd_cns") or not _table_exists(conn, "godview_generations"):
+                return unavailable(
+                    "sec_regsho_ftd_cns or godview_generations does not exist yet",
+                    source=SEC_FTD_PILLAR_NAME, pillar=SEC_FTD_PILLAR_NAME, coverage=None,
+                )
+            result = read_sec_ftd_pillar(conn, as_of, include_inferred=include_inferred)
+    except Exception as exc:  # noqa: BLE001
+        return unavailable(f"godview read failed: {exc}", source=SEC_FTD_PILLAR_NAME, pillar=SEC_FTD_PILLAR_NAME, coverage=None)
+
+    if result.state == "never_configured":
+        return unavailable(STALE_NEVER_CONFIGURED, source=SEC_FTD_PILLAR_NAME, pillar=SEC_FTD_PILLAR_NAME, coverage=None)
+    if result.state == "materializer_failed":
+        return unavailable(STALE_MATERIALIZER_FAILED, source=SEC_FTD_PILLAR_NAME, pillar=SEC_FTD_PILLAR_NAME, coverage=None)
+
+    fields_by_cusip = {row["cusip"]: _ftd_field_records(row, as_of) for row in result.rows}
+    return {
+        "available": True,
+        "status": "ok" if fields_by_cusip else "partial",
+        "pillar": SEC_FTD_PILLAR_NAME,
+        "as_of": as_of.isoformat(),
+        "include_inferred": include_inferred,
+        "note": FTD_NOT_A_TIMELINE_NOTE,
+        "cusips_with_data": result.cusips_with_data,
+        "generation_id": result.generation_id,
+        "generation_published_at": result.generation_published_at.isoformat() if result.generation_published_at else None,
+        "fields": fields_by_cusip,
+    }
+
+
+@router.get("/pillars/buyback_blackouts")
+def get_buyback_pillar(
+    as_of: Annotated[date | None, Query()] = None,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Issuer-level MODELED quiet-window calendar. NO dollar amounts, NO "%
+    of market in blackout" -- see BUYBACK_MISSING_INPUT and
+    godview/buyback_pillar.py's docstring for exactly why."""
+    as_of = as_of or date.today()
+    engine = get_db_engine()
+
+    try:
+        with engine.connect() as conn:
+            if not _table_exists(conn, "issuer_buyback_blackout_windows") or not _table_exists(conn, "godview_generations"):
+                return unavailable(
+                    "issuer_buyback_blackout_windows or godview_generations does not exist yet",
+                    source=BUYBACK_PILLAR_NAME, pillar=BUYBACK_PILLAR_NAME, coverage=None,
+                )
+            result = read_buyback_pillar(conn, as_of)
+    except Exception as exc:  # noqa: BLE001
+        return unavailable(f"godview read failed: {exc}", source=BUYBACK_PILLAR_NAME, pillar=BUYBACK_PILLAR_NAME, coverage=None)
+
+    if result.state == "never_configured":
+        return unavailable(STALE_NEVER_CONFIGURED, source=BUYBACK_PILLAR_NAME, pillar=BUYBACK_PILLAR_NAME, coverage=None)
+    if result.state == "materializer_failed":
+        return unavailable(STALE_MATERIALIZER_FAILED, source=BUYBACK_PILLAR_NAME, pillar=BUYBACK_PILLAR_NAME, coverage=None)
+
+    issuers = {}
+    for row in result.rows:
+        common = {
+            "obs_date": row["calendar_date"], "published_at": None, "available_at": None,
+            "revision": row["generation_id"], "source_catalog": "earnings_calendar", "series_id": row["ticker"],
+        }
+        record = modeled_field(
+            row["window_status"], unit=None, calculation_version="buyback_pillar_v1",
+            **common,
+        ).to_dict()
+        record["availability_basis"] = row.get("availability_basis")
+        record["availability_basis_note"] = None
+        record["earnings_date_used"] = row["earnings_date_used"].isoformat() if row["earnings_date_used"] else None
+        record["window_start"] = row["window_start"].isoformat() if row["window_start"] else None
+        record["window_end"] = row["window_end"].isoformat() if row["window_end"] else None
+        issuers[row["ticker"]] = record
+
+    return {
+        "available": True,
+        "status": "ok" if issuers else "partial",
+        "pillar": BUYBACK_PILLAR_NAME,
+        "as_of": as_of.isoformat(),
+        "note": MODELING_ASSUMPTION_NOTE,
+        "missing_input": BUYBACK_MISSING_INPUT,
+        "issuers_with_data": result.issuers_with_data,
+        "generation_id": result.generation_id,
+        "generation_published_at": result.generation_published_at.isoformat() if result.generation_published_at else None,
+        "issuers": issuers,
+    }
+
+
+def _gex_field_records(row: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    basis = row.get("availability_basis")
+    basis_note = _availability_basis_note(basis)
+    common = {
+        "obs_date": row["obs_date"],
+        "published_at": row["obs_date"],
+        "available_at": None,
+        "revision": row["generation_id"],
+        "source_catalog": "options_snapshots",
+        "series_id": row["ticker"],
+    }
+    out: dict[str, dict[str, Any]] = {}
+
+    spot_record = measured_field(row["spot_price"], unit="usd_per_share", **common).to_dict()
+    spot_record["availability_basis"] = basis
+    spot_record["availability_basis_note"] = basis_note
+    out["spot_price"] = spot_record
+
+    modeled_specs = {
+        "net_gex_usd_m": "usd_millions_per_1pct_move",
+        "call_gex_usd_m": "usd_millions_per_1pct_move",
+        "put_gex_usd_m": "usd_millions_per_1pct_move",
+        "gamma_flip_strike": "usd_per_share",
+        "spot_to_flip_pct": "pct",
+        "gex_regime": None,
+        "max_pain_strike": "usd_per_share",
+        "put_call_oi_ratio": "ratio",
+        "atm_iv": "annualized_vol",
+    }
+    for name, unit in modeled_specs.items():
+        value = row[name]
+        if value is None:
+            record = unavailable_field(
+                STALE_PARTIAL_HISTORY, unit=unit, calculation_version="dealer_gex_pillar_v1",
+                coverage_fraction=row["coverage_fraction"], **common,
+            ).to_dict()
+        else:
+            record = modeled_field(
+                value, unit=unit, calculation_version="dealer_gex_pillar_v1",
+                coverage_fraction=row["coverage_fraction"], **common,
+            ).to_dict()
+        record["availability_basis"] = basis
+        record["availability_basis_note"] = basis_note
+        out[name] = record
+    return out
+
+
+@router.get("/pillars/dealer_gex")
+def get_dealer_gex_pillar(
+    as_of: Annotated[date | None, Query()] = None,
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Dealer gamma exposure (GEX) pillar -- a from-scratch engine over
+    options_snapshots. Every gamma figure is provenance='modeled' (a stated
+    sign convention, never a measured dealer position) -- see
+    GEX_SIGN_CONVENTION_NOTE and godview/dealer_gex_pillar.py's docstring.
+    No real captured chain fixture exists to validate this engine against a
+    known-correct figure -- see GEX_MISSING_INPUT."""
+    as_of = as_of or date.today()
+    engine = get_db_engine()
+
+    try:
+        with engine.connect() as conn:
+            if not _table_exists(conn, "dealer_gex_daily") or not _table_exists(conn, "godview_generations"):
+                return unavailable(
+                    "dealer_gex_daily or godview_generations does not exist yet",
+                    source=GEX_PILLAR_NAME, pillar=GEX_PILLAR_NAME, coverage=None,
+                )
+            result = read_dealer_gex_pillar(conn, as_of)
+    except Exception as exc:  # noqa: BLE001
+        return unavailable(f"godview read failed: {exc}", source=GEX_PILLAR_NAME, pillar=GEX_PILLAR_NAME, coverage=None)
+
+    if result.state == "never_configured":
+        return unavailable(STALE_NEVER_CONFIGURED, source=GEX_PILLAR_NAME, pillar=GEX_PILLAR_NAME, coverage=None)
+    if result.state == "materializer_failed":
+        return unavailable(STALE_MATERIALIZER_FAILED, source=GEX_PILLAR_NAME, pillar=GEX_PILLAR_NAME, coverage=None)
+
+    fields_by_ticker = {row["ticker"]: _gex_field_records(row) for row in result.rows}
+    return {
+        "available": True,
+        "status": "ok" if fields_by_ticker else "partial",
+        "pillar": GEX_PILLAR_NAME,
+        "as_of": as_of.isoformat(),
+        "sign_convention_note": GEX_SIGN_CONVENTION_NOTE,
+        "gamma_assumptions_note": GEX_GAMMA_ASSUMPTIONS_NOTE,
+        "missing_input": GEX_MISSING_INPUT,
+        "tickers_with_data": result.tickers_with_data,
+        "generation_id": result.generation_id,
+        "generation_published_at": result.generation_published_at.isoformat() if result.generation_published_at else None,
+        "fields": fields_by_ticker,
     }
 
 

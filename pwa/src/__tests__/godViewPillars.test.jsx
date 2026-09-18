@@ -24,13 +24,17 @@ function deferred() {
  * commodity_warehouses). Route the mock by path so a test about one pillar
  * doesn't leak its response into the other two cards' assertions.
  */
-function mockPillars({ cftc, fed, cmdty } = {}) {
+function mockPillars({ cftc, fed, cmdty, finra, ftd, buyback, gex } = {}) {
     api.get.mockImplementation((path) => {
         if (path.includes('/pillars/cftc')) return Promise.resolve(cftc ?? NEVER_CONFIGURED);
         if (path.includes('/pillars/fed_net_liquidity')) return Promise.resolve(fed ?? NEVER_CONFIGURED);
         if (path.includes('/pillars/commodity_warehouses')) {
             return Promise.resolve(cmdty ?? { lme: NEVER_CONFIGURED, cushing_crude_stocks: NEVER_CONFIGURED });
         }
+        if (path.includes('/pillars/finra_short_volume')) return Promise.resolve(finra ?? NEVER_CONFIGURED);
+        if (path.includes('/pillars/sec_regsho_ftd')) return Promise.resolve(ftd ?? NEVER_CONFIGURED);
+        if (path.includes('/pillars/buyback_blackouts')) return Promise.resolve(buyback ?? NEVER_CONFIGURED);
+        if (path.includes('/pillars/dealer_gex')) return Promise.resolve(gex ?? NEVER_CONFIGURED);
         return Promise.resolve(NEVER_CONFIGURED);
     });
 }
@@ -177,15 +181,13 @@ describe('GodViewPillars view', () => {
         expect(within(screen.getByTestId('cftc-pillar-card')).getByText(/network down/)).toBeInTheDocument();
     });
 
-    it('always renders the not-built-yet cards for the other four pillars, each with its own reason', async () => {
+    it('renders no not-built-yet cards now that every known pillar is built', async () => {
         mockPillars();
 
         render(<GodViewPillars />);
 
-        await waitFor(() => expect(screen.getAllByTestId('pillar-card-not-built').length).toBe(4));
-        expect(screen.getAllByText(/adapter exists but is unscheduled\/unverified live/).length).toBe(2);
-        expect(screen.getByText(/no measured source/)).toBeInTheDocument();
-        expect(screen.getByText(/engine correctness unproven/)).toBeInTheDocument();
+        await waitFor(() => expect(screen.getByTestId('dealer-gex-card')).toHaveAttribute('data-state', 'unavailable'));
+        expect(screen.queryAllByTestId('pillar-card-not-built').length).toBe(0);
     });
 
     it('shows an inferred badge for a field whose availability_basis is inferred_schedule', async () => {
@@ -319,5 +321,140 @@ describe('GodViewPillars view', () => {
         const card = within(screen.getByTestId('commodity-warehouse-card'));
         expect(within(card.getByTestId('lme-section')).getByText('copper')).toBeInTheDocument();
         expect(within(card.getByTestId('cushing-section')).getByText(/never_configured/)).toBeInTheDocument();
+    });
+
+    it('renders the FINRA short-volume pillar with the not-short-interest note and per-ticker fields', async () => {
+        mockPillars({
+            finra: {
+                available: true,
+                status: 'ok',
+                pillar: 'finra_short_volume',
+                as_of: '2026-09-16',
+                include_inferred: false,
+                note: "this is daily short-sale VOLUME executed on the trade date, NOT short INTEREST (a bi-monthly position snapshot) and never a squeeze score",
+                symbols_with_data: 1,
+                generation_id: 'gen-finra-1',
+                generation_published_at: '2026-09-16T18:00:00+00:00',
+                fields: {
+                    AAPL: {
+                        short_volume: { availability: 'available', provenance: 'measured', value: 600000, unit: 'shares' },
+                        short_exempt_volume: { availability: 'available', provenance: 'measured', value: 0, unit: 'shares' },
+                        total_volume: { availability: 'available', provenance: 'measured', value: 1000000, unit: 'shares' },
+                        short_ratio: { availability: 'available', provenance: 'derived', value: 0.6, unit: 'ratio_0_1' },
+                        short_ratio_20d_ma: { availability: 'unavailable', provenance: null, value: null, unit: 'ratio_0_1' },
+                        is_spike: { availability: 'available', provenance: 'derived', value: true, unit: null },
+                    },
+                },
+            },
+        });
+
+        render(<GodViewPillars />);
+
+        await waitFor(() => expect(screen.getByTestId('finra-short-volume-card')).toHaveAttribute('data-state', 'available'));
+        const card = within(screen.getByTestId('finra-short-volume-card'));
+        expect(card.getByTestId('not-short-interest-note')).toHaveTextContent(/NOT short INTEREST/);
+        expect(card.getByText('AAPL')).toBeInTheDocument();
+        expect(card.getByText('0.6')).toBeInTheDocument();
+    });
+
+    it('renders the SEC FTD pillar with the not-a-timeline note and per-CUSIP fields', async () => {
+        mockPillars({
+            ftd: {
+                available: true,
+                status: 'ok',
+                pillar: 'sec_ftd',
+                as_of: '2026-09-15',
+                include_inferred: false,
+                note: "outstanding balance as of one settlement date; never summed across dates, no T+35 buy-in timeline, no squeeze score",
+                cusips_with_data: 1,
+                generation_id: 'gen-ftd-1',
+                generation_published_at: '2026-09-15T06:00:00+00:00',
+                fields: {
+                    Y4000A102: {
+                        failed_shares: { availability: 'available', provenance: 'measured', value: 373, unit: 'shares' },
+                        closing_price: { availability: 'available', provenance: 'measured', value: 16.99, unit: 'usd_per_share' },
+                        total_failed_usd: { availability: 'available', provenance: 'derived', value: 6337.27, unit: 'usd' },
+                        observation_age_days: { availability: 'available', provenance: 'derived', value: 29, unit: 'days' },
+                    },
+                },
+            },
+        });
+
+        render(<GodViewPillars />);
+
+        await waitFor(() => expect(screen.getByTestId('sec-ftd-card')).toHaveAttribute('data-state', 'available'));
+        const card = within(screen.getByTestId('sec-ftd-card'));
+        expect(card.getByTestId('not-a-timeline-note')).toHaveTextContent(/no T\+35 buy-in timeline/);
+        expect(card.getByText('Y4000A102')).toBeInTheDocument();
+        expect(card.getByText('373')).toBeInTheDocument();
+    });
+
+    it('renders the buyback blackout pillar with the modeling-assumption and missing-input notes', async () => {
+        mockPillars({
+            buyback: {
+                available: true,
+                status: 'ok',
+                pillar: 'buyback_blackouts',
+                as_of: '2026-10-15',
+                note: 'modeled quiet window = earnings_date -14d to +2d (common issuer self-imposed Rule 10b-18 compliance PRACTICE, not an SEC-mandated period -- the SEC\'s own Rule 10b5-1 statement is explicit: "we are not adopting a cooling-off period for issuers")',
+                missing_input: 'issuer-level repurchase execution data (10-Q/10-K share-repurchase tables via EDGAR) does not exist in this database; no dollar or share buyback figure is ever computed here',
+                issuers_with_data: 1,
+                generation_id: 'gen-buyback-1',
+                generation_published_at: '2026-10-15T00:00:00+00:00',
+                issuers: {
+                    AAPL: {
+                        availability: 'available', provenance: 'modeled', value: 'quiet_window',
+                        earnings_date_used: '2026-10-20', window_start: '2026-10-06', window_end: '2026-10-22',
+                    },
+                },
+            },
+        });
+
+        render(<GodViewPillars />);
+
+        await waitFor(() => expect(screen.getByTestId('buyback-card')).toHaveAttribute('data-state', 'available'));
+        const card = within(screen.getByTestId('buyback-card'));
+        expect(card.getByTestId('modeling-assumption-note')).toHaveTextContent(/not adopting a cooling-off period for issuers/);
+        expect(card.getByTestId('missing-input-note')).toHaveTextContent(/EDGAR/);
+        expect(card.getByText('AAPL')).toBeInTheDocument();
+        expect(card.getByText('quiet_window')).toBeInTheDocument();
+    });
+
+    it('renders the dealer GEX pillar with the sign-convention and missing-input notes', async () => {
+        mockPillars({
+            gex: {
+                available: true,
+                status: 'ok',
+                pillar: 'dealer_gex',
+                as_of: '2026-09-18',
+                sign_convention_note: 'dealers modeled net short the customer side of both calls and puts; call OI contributes +gamma, put OI contributes -gamma to net dealer exposure (standard public GEX methodology, a stated modeling assumption -- options_snapshots carries no real dealer/customer position split)',
+                gamma_assumptions_note: 'Black-Scholes gamma, r=0.0, q=0.0 (both assumed 0, a standard simplification); implied_vol read directly from options_snapshots, never solved for or defaulted',
+                missing_input: 'no real captured options chain fixture exists to validate this engine against a known-correct GEX figure',
+                tickers_with_data: 1,
+                generation_id: 'gen-gex-1',
+                generation_published_at: '2026-09-18T21:00:00+00:00',
+                fields: {
+                    AAPL: {
+                        spot_price: { availability: 'available', provenance: 'measured', value: 100.0, unit: 'usd_per_share' },
+                        net_gex_usd_m: { availability: 'available', provenance: 'modeled', value: 42.5, unit: 'usd_millions_per_1pct_move' },
+                        gamma_flip_strike: { availability: 'available', provenance: 'modeled', value: 100.98, unit: 'usd_per_share' },
+                        spot_to_flip_pct: { availability: 'available', provenance: 'modeled', value: 0.98, unit: 'pct' },
+                        gex_regime: { availability: 'available', provenance: 'modeled', value: 'long_gamma', unit: null },
+                        max_pain_strike: { availability: 'available', provenance: 'modeled', value: 100.0, unit: 'usd_per_share' },
+                        put_call_oi_ratio: { availability: 'available', provenance: 'modeled', value: 1.0, unit: 'ratio' },
+                        atm_iv: { availability: 'available', provenance: 'modeled', value: 0.3, unit: 'annualized_vol' },
+                    },
+                },
+            },
+        });
+
+        render(<GodViewPillars />);
+
+        await waitFor(() => expect(screen.getByTestId('dealer-gex-card')).toHaveAttribute('data-state', 'available'));
+        const card = within(screen.getByTestId('dealer-gex-card'));
+        expect(card.getByTestId('sign-convention-note')).toHaveTextContent(/\+gamma.*-gamma/);
+        expect(card.getByTestId('gex-missing-input-note')).toHaveTextContent(/no real captured options chain fixture/);
+        expect(card.getByText('AAPL')).toBeInTheDocument();
+        expect(card.getByText('long_gamma')).toBeInTheDocument();
     });
 });

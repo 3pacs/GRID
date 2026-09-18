@@ -305,6 +305,194 @@ read therefore bounds results by `report_date <= as_of` only (the one temporal f
 pillar actually has), with no `include_inferred` gate (there is nothing for that flag to
 admit/exclude here).
 
+## 13. FINRA short-volume pillar
+
+`godview/finra_short_volume_pillar.py`. Consumes (read-only) ``raw_series`` under
+``finra:short_volume:<symbol>:<market>``, written by
+`ingestion/altdata/finra_short_volume.py` — that module lives on
+`origin/fable/sources-finra-ftd-20260918` (commit `40a9f1ae`), not merged into
+this branch; read via `git show`, never checked out.
+
+**Emphatically not short interest, never a squeeze score.** Per FINRA's own
+catalog page (https://www.finra.org/finra-data/browse-catalog/short-sale-volume):
+
+> "Short Sale Files do not — and are not intended to — equate to bi-monthly
+> reported short interest position information. The short interest data
+> reflects short positions held by market participants at a specific moment
+> in time on two discrete days each month, while the Daily File reflects the
+> aggregate volume of short trades effected on each trade date..."
+
+`short_ratio` = `short_volume / total_volume` for that trade date — a
+description of that day's trading mix, nothing more.
+
+**Release schedule**, quoted 2026-09-18 via WebFetch against
+https://www.finra.org/finra-data/browse-catalog/short-sale-volume-data/daily-short-sale-volume-files:
+
+> "FINRA posts the Daily Short Sale Volume Files to this no later than
+> 6:00:00pm ET of the same day on the relevant trade date."
+
+So `release_date = trade_date` always (no weekly gate, unlike CFTC/Fed).
+
+**Missing input, named exactly:** `FINRAShortVolumePuller` is deliberately
+NOT registered in `ingestion/scheduler.py` — unauthorised live pulls. This
+pillar's materializer reads whatever rows already exist in `raw_series`
+(a manual pull, a fixture); with none, `GET /api/v1/godview/pillars/finra_short_volume`
+returns `unavailable(never_configured)` — realistically, in production
+today, that is the state this endpoint returns, and that is correct, not
+a bug. `coverage` here means "of the symbols `raw_series` currently
+offers, how many produced a valid ratio row" — there is no curated
+watchlist to define a target universe against, because no scheduled pull
+has ever populated one.
+
+## 14. SEC Fails-to-Deliver (FTD) pillar
+
+`godview/sec_ftd_pillar.py`. Consumes (read-only) `raw_series` under
+`sec:ftd_balance:<cusip>`, written by `ingestion/altdata/sec_ftd.py` on
+`origin/fable/sources-finra-ftd-20260918` (commit `40a9f1ae`, not merged
+into this branch; read via `git show`).
+
+**Each row is an outstanding balance as of one settlement date — never
+summed across dates, no T+35 buy-in timeline, no squeeze score.** Per the
+SEC's own page (https://www.sec.gov/data-research/sec-markets-data/fails-deliver-data):
+
+> "The values of total fails-to-deliver shares represent the aggregate net
+> balance of shares that failed to be delivered as of a particular
+> settlement date."
+
+> "Fails-to-deliver can occur for a number of reasons on both long and
+> short sales. Therefore, fails-to-deliver are not necessarily the result
+> of short selling, and are not evidence of abusive short selling or
+> 'naked' short selling."
+
+`mandatory_buyin_date`/`days_remaining`/`squeeze_risk_score` (already
+columns on the tracked `sec_regsho_ftd_cns` table) stay permanently NULL.
+
+**"Age"** means `as_of - settlement_date` — how stale the observation is,
+computed at read time, never persisted. Explicitly NOT an attempt to
+determine the age of the underlying fails: the same SEC page states "the
+age of fails cannot be determined by looking at these numbers."
+
+**Display symbol:** no CUSIP→ticker mapping table exists in `schema.sql`
+(grepped 2026-09-18) — but `sec_ftd.py`'s own `raw_payload` already
+carries the FTD file's self-reported `symbol` per row. This pillar uses
+that (measured, same source) when present; when a row's payload lacks a
+usable symbol, it exposes the CUSIP itself and labels the row
+`ticker_source=cusip_fallback` rather than guessing.
+
+`closing_price` (measured, from the FTD file's own PRICE field) and
+`total_failed_usd` (derived = `failed_shares * closing_price`, same
+settlement date only) are populated when a price is present; `None`
+otherwise.
+
+**Release schedule** — quoted 2026-09-18 from the same SEC page:
+
+> "The first half of a given month is available at the end of the month.
+> The second half of a given month is available at about the 15th of the
+> next month."
+
+`release_date` is therefore INFERRED from this half-month rule (there is
+no published release calendar to observe directly); `availability_basis`
+uses a wider tolerance (10 days, vs. 3 elsewhere) reflecting the SEC's own
+approximate language ("about the 15th").
+
+## 15. Corporate buyback blackout pillar
+
+`godview/buyback_pillar.py`. Implements ONLY what is measurable or
+explicitly modeled:
+
+* **Measured input:** earnings dates from `earnings_calendar` — a lazily
+  created, untracked table (`ingestion/altdata/earnings_calendar.py::
+  _ensure_earnings_table`, not in `schema.sql` or any migration; grepped
+  2026-09-18, the only earnings/catalyst-dated table anywhere in this
+  codebase). When an issuer has no earnings date there, its window is
+  unavailable — nothing to derive it from, never invented.
+* **Modeled output:** a per-issuer quiet-window calendar, `earnings_date − 14
+  calendar days` through `earnings_date + 2 calendar days`. `provenance` is
+  always `'modeled'`.
+
+**This window is NOT an SEC-mandated rule for issuers — a documented
+assumption, disclosed in every row's `source_ref`.** Rule 10b5-1's 2022
+amendments impose a cooling-off period on directors/officers, quoted from
+SEC Chair Gensler's statement
+(https://www.sec.gov/newsroom/speeches-statements/gensler-insider-trading-20221214):
+
+> "90 days or two days after the release of financial statements,
+> whichever is longer, but no more than 120 days"
+
+but the same statement says plainly:
+
+> "we are not adopting a cooling-off period for issuers"
+
+So this pillar's window models the common Rule 10b-18 self-imposed
+compliance PRACTICE many issuers follow, not an SEC requirement — never
+presented as measured fact.
+
+**Explicitly never computed: any dollar amount, any "% of market in
+blackout."** Those require issuer-level repurchase EXECUTION disclosures
+(10-Q/10-K share-repurchase tables via EDGAR), which do not exist
+anywhere in this database — named exactly as `MISSING_INPUT`, returned in
+every API response. The tracked `corporate_buyback_blackouts` table
+(market-wide `sp500_cap_blackout_pct`/`active_corporate_bid_m`) is left
+completely untouched — this pillar writes to a NEW table,
+`issuer_buyback_blackout_windows`, because the aggregate table's grain
+cannot represent a per-issuer figure without blurring measured vs.
+assumed.
+
+## 16. Dealer gamma exposure (GEX) pillar
+
+`godview/dealer_gex_pillar.py`. A from-scratch engine over the tracked
+`options_snapshots` table — the untracked, incident-evidence
+`derivatives/dealer_gex_engine.py` in the sibling `GRID` checkout was never
+read (explicitly out of bounds for this lane's read-only-cross-branch
+rules). Every output field is `provenance='modeled'`; nothing here is
+`measured` (except the resolved spot price, which is a real PIT-resolved
+price read through `store/pit.py`).
+
+**Sign convention (a stated modeling assumption, not a derivation):**
+`options_snapshots` carries no real dealer/customer position split, so
+dealers are modeled net short the customer side of both calls and puts.
+Following the standard public GEX methodology, CALL open interest
+contributes **+gamma** and PUT open interest contributes **-gamma** to net
+dealer exposure at each strike — disclosed verbatim in every API response
+as `sign_convention_note` (`SIGN_CONVENTION_NOTE`).
+
+**Gamma:** hand-rolled Black-Scholes Gamma, `r=0`, `q=0` (both assumed
+zero, a standard simplification for gamma specifically — disclosed as
+`gamma_assumptions_note`). `implied_vol` is read directly from
+`options_snapshots`, never solved for or defaulted; a contract with a
+missing/non-positive IV, or `expiry <= snap_date`, is skipped and counted
+against `coverage_fraction` (`contracts_used`/`contracts_present`), never
+substituted with a literal (e.g. never a 0.25 IV default).
+
+**Spot price:** resolved via the same candidate-name rule
+`api/routers/watchlist_helpers.py::_resolve_feature_names` uses, then read
+through `store/pit.py::PITStore.get_pit` (`LATEST_AS_OF`) — replicating
+(not importing, since it lives on the unmerged
+`origin/fable/signal-eval-20260918`) `evaluation/prices.py`'s own resolver:
+zero or multiple `feature_registry` matches, or no PIT-available price,
+means the WHOLE ticker/date is `unavailable` — never a median-strike or
+other proxy for a real spot.
+
+**Gamma flip:** cumulative net gamma across strikes in ascending order; the
+flip is the linearly interpolated strike where that cumulative sum's SIGN
+changes. No sign change anywhere in the chain → `gamma_flip_strike:
+unavailable` — never an endpoint strike, never a guess. Validated against
+three synthetic cases in `tests/godview/test_dealer_gex_pillar_pure.py`: a
+symmetric put/call chain (flip lands between the two strikes, near spot),
+an all-calls chain (never crosses → `unavailable`), and a chain with half
+its contracts missing IV (coverage < 1, those contracts skipped rather
+than defaulted).
+
+**Explicitly never computed: any claim that a figure here matches a real
+dealer's actual book.** No real captured options chain fixture exists
+anywhere in this codebase to validate the engine's sign convention or
+modeled-dealer-positioning assumption against a known-correct GEX number —
+named exactly as `MISSING_INPUT`, returned in every API response as
+`missing_input`. This is the concrete input this lane could not obtain and
+the specific claim it prevents: a claim of accuracy against real dealer
+positioning, as opposed to internal mechanical correctness (which the
+three synthetic cases do validate).
+
 ## Status of all seven God View pillars (2026-09-18)
 
 | pillar | status | why |
@@ -313,12 +501,13 @@ admit/exclude here).
 | Fed net liquidity | **built** | full slice; per-component basis; `forward_impulse_score` intentionally NULL (not implemented) |
 | Commodity warehouses (LME leg) | **built** | LME cancelled-warrant ratio, reused from the existing puller |
 | Commodity warehouses (Cushing leg) | **permanently unavailable** | `never_configured` — no real Cushing series id exists in this codebase; will not silently substitute a near-miss |
-| FINRA short volume | not built | adapter exists but is unscheduled/unverified live |
-| SEC Reg SHO FTD | not built | adapter exists but is unscheduled/unverified live |
-| Corporate buyback blackouts | not built | no measured source |
-| Dealer GEX | not built | engine correctness unproven |
+| FINRA short volume | **built** | full slice; realistically `unavailable(never_configured)` in production until the puller is scheduled (deployment decision, not a code gap) |
+| SEC Reg SHO FTD | **built** | full slice; outstanding balance only, no timeline/squeeze score; realistically `unavailable(never_configured)` until the puller is scheduled |
+| Corporate buyback blackouts | **built** | modeled quiet-window calendar only; no dollar/% figures — those need EDGAR repurchase disclosures, absent from this DB |
+| Dealer GEX | **built** | from-scratch engine, `provenance='modeled'` throughout; mechanically validated by 3 synthetic cases; no real captured chain fixture exists to validate against a known-correct figure — see section 16 |
 
-Every "not built" pillar's specific reason is returned verbatim by
-`GET /api/v1/godview/pillars/<name>` (via `api/routers/godview_pillars.py`'s
-`_KNOWN_UNBUILT_PILLARS` map) and rendered in the corresponding `NotBuiltCard` in
-`GodViewPillars.jsx` — never a silent 404, never a fabricated value.
+Every God View pillar named in this contract is now built (2026-09-18).
+Any pillar name this router does not recognize still renders the honest
+"not built yet" state via `api/routers/godview_pillars.py`'s
+`_KNOWN_UNBUILT_PILLARS` map / catch-all route (currently empty, kept for
+future pillars) — never a silent 404, never a fabricated value.

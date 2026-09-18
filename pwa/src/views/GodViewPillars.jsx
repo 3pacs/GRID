@@ -7,17 +7,15 @@ import { colors, shared } from '../styles/shared.js';
  *
  * Built: CFTC positioning, Fed net liquidity, commodity warehouses (LME leg
  * only — Cushing is permanently unavailable(never_configured), rendered
- * honestly rather than omitted). Every other pillar renders "not built yet"
- * with the SPECIFIC reason it is blocked, never a silent omission or a
- * fabricated value — see docs/reference/GODVIEW_PILLAR_CONTRACT.md.
+ * honestly rather than omitted), FINRA short volume, SEC Reg SHO FTD,
+ * corporate buyback blackout windows, and dealer gamma exposure (2026-09-18
+ * — all four remaining pillars per operator direction). Any future
+ * not-yet-built pillar renders "not built yet" with the SPECIFIC reason it
+ * is blocked, never a silent omission or a fabricated value — see
+ * docs/reference/GODVIEW_PILLAR_CONTRACT.md.
  */
 
-const NOT_BUILT_PILLARS = [
-    { key: 'finra_short_volume', label: 'FINRA Short Volume', reason: 'adapter exists but is unscheduled/unverified live' },
-    { key: 'sec_regsho_ftd', label: 'SEC Reg SHO — FTD', reason: 'adapter exists but is unscheduled/unverified live' },
-    { key: 'buyback_blackouts', label: 'Corporate Buyback Blackouts', reason: 'no measured source' },
-    { key: 'dealer_gex', label: 'Dealer Gamma Exposure', reason: 'engine correctness unproven' },
-];
+const NOT_BUILT_PILLARS = [];
 
 function fmtValue(v, digits = 2) {
     if (v == null) return '—';
@@ -341,6 +339,238 @@ function CommodityWarehouseCard({ data, error }) {
     );
 }
 
+function FinraShortVolumeCard({ data, error }) {
+    const cardStyle = {
+        background: colors.card, border: `1px solid ${colors.border}`, borderRadius: 10, padding: 16, marginBottom: 16,
+    };
+
+    if (error) {
+        return <div style={cardStyle} data-testid="finra-short-volume-card" data-state="error">
+            <div style={{ color: colors.text, fontWeight: 600, marginBottom: 8 }}>FINRA Short Sale Volume</div>
+            <div style={{ color: colors.red }}>Failed to load: {error}</div>
+        </div>;
+    }
+    if (!data) {
+        return <div style={cardStyle} data-testid="finra-short-volume-card" data-state="loading">
+            <div style={{ color: colors.text, fontWeight: 600 }}>FINRA Short Sale Volume</div>
+            <div style={{ color: colors.textDim, marginTop: 8 }}>Loading…</div>
+        </div>;
+    }
+    if (data.available === false) {
+        return <div style={cardStyle} data-testid="finra-short-volume-card" data-state="unavailable">
+            <UnavailablePanel label="FINRA Short Sale Volume" payload={data} />
+        </div>;
+    }
+
+    const fields = data.fields || {};
+    const tickers = Object.keys(fields);
+
+    return (
+        <div style={cardStyle} data-testid="finra-short-volume-card" data-state="available">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 4 }}>
+                <div style={{ color: colors.text, fontWeight: 600, fontSize: 16 }}>FINRA Short Sale Volume</div>
+                <div style={{ fontSize: 11, color: colors.textMuted }}>as of {data.as_of}</div>
+            </div>
+            <div style={{ fontSize: 11, color: colors.yellow, marginBottom: 10 }} data-testid="not-short-interest-note">
+                {data.note}
+            </div>
+            {tickers.length === 0 ? (
+                <div style={{ color: colors.textMuted, fontSize: 13 }}>no qualifying rows as of this date</div>
+            ) : (
+                tickers.map((ticker) => (
+                    <div key={ticker} style={{ marginBottom: 12 }}>
+                        <div style={{ fontSize: 13, color: colors.textDim, marginBottom: 4 }}>{ticker}</div>
+                        <FieldRow name="Short ratio" field={fields[ticker].short_ratio} />
+                        <FieldRow name="Short ratio (20d avg)" field={fields[ticker].short_ratio_20d_ma} />
+                        <FieldRow name="Short volume (shares)" field={fields[ticker].short_volume} />
+                        <FieldRow name="Total volume (shares)" field={fields[ticker].total_volume} />
+                        <FieldRow name="Spike flag" field={fields[ticker].is_spike} />
+                    </div>
+                ))
+            )}
+            <div style={{ fontSize: 10, color: colors.textDimAlt, marginTop: 8 }}>
+                generation {data.generation_id || '—'} published {fmtDateTime(data.generation_published_at)}
+            </div>
+        </div>
+    );
+}
+
+function SecFtdCard({ data, error }) {
+    const cardStyle = {
+        background: colors.card, border: `1px solid ${colors.border}`, borderRadius: 10, padding: 16, marginBottom: 16,
+    };
+
+    if (error) {
+        return <div style={cardStyle} data-testid="sec-ftd-card" data-state="error">
+            <div style={{ color: colors.text, fontWeight: 600, marginBottom: 8 }}>SEC Fails-to-Deliver</div>
+            <div style={{ color: colors.red }}>Failed to load: {error}</div>
+        </div>;
+    }
+    if (!data) {
+        return <div style={cardStyle} data-testid="sec-ftd-card" data-state="loading">
+            <div style={{ color: colors.text, fontWeight: 600 }}>SEC Fails-to-Deliver</div>
+            <div style={{ color: colors.textDim, marginTop: 8 }}>Loading…</div>
+        </div>;
+    }
+    if (data.available === false) {
+        return <div style={cardStyle} data-testid="sec-ftd-card" data-state="unavailable">
+            <UnavailablePanel label="SEC Fails-to-Deliver" payload={data} />
+        </div>;
+    }
+
+    const fields = data.fields || {};
+    const cusips = Object.keys(fields);
+
+    return (
+        <div style={cardStyle} data-testid="sec-ftd-card" data-state="available">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 4 }}>
+                <div style={{ color: colors.text, fontWeight: 600, fontSize: 16 }}>SEC Fails-to-Deliver</div>
+                <div style={{ fontSize: 11, color: colors.textMuted }}>as of {data.as_of}</div>
+            </div>
+            <div style={{ fontSize: 11, color: colors.yellow, marginBottom: 10 }} data-testid="not-a-timeline-note">
+                {data.note}
+            </div>
+            {cusips.length === 0 ? (
+                <div style={{ color: colors.textMuted, fontSize: 13 }}>no qualifying rows as of this date</div>
+            ) : (
+                cusips.map((cusip) => (
+                    <div key={cusip} style={{ marginBottom: 12 }}>
+                        <div style={{ fontSize: 13, color: colors.textDim, marginBottom: 4 }}>{cusip}</div>
+                        <FieldRow name="Outstanding balance (shares)" field={fields[cusip].failed_shares} />
+                        <FieldRow name="Closing price" field={fields[cusip].closing_price} />
+                        <FieldRow name="Balance value ($)" field={fields[cusip].total_failed_usd} />
+                        <FieldRow name="Observation age (days)" field={fields[cusip].observation_age_days} />
+                    </div>
+                ))
+            )}
+            <div style={{ fontSize: 10, color: colors.textDimAlt, marginTop: 8 }}>
+                generation {data.generation_id || '—'} published {fmtDateTime(data.generation_published_at)}
+            </div>
+        </div>
+    );
+}
+
+function BuybackBlackoutCard({ data, error }) {
+    const cardStyle = {
+        background: colors.card, border: `1px solid ${colors.border}`, borderRadius: 10, padding: 16, marginBottom: 16,
+    };
+
+    if (error) {
+        return <div style={cardStyle} data-testid="buyback-card" data-state="error">
+            <div style={{ color: colors.text, fontWeight: 600, marginBottom: 8 }}>Corporate Buyback Blackouts</div>
+            <div style={{ color: colors.red }}>Failed to load: {error}</div>
+        </div>;
+    }
+    if (!data) {
+        return <div style={cardStyle} data-testid="buyback-card" data-state="loading">
+            <div style={{ color: colors.text, fontWeight: 600 }}>Corporate Buyback Blackouts</div>
+            <div style={{ color: colors.textDim, marginTop: 8 }}>Loading…</div>
+        </div>;
+    }
+    if (data.available === false) {
+        return <div style={cardStyle} data-testid="buyback-card" data-state="unavailable">
+            <UnavailablePanel label="Corporate Buyback Blackouts" payload={data} />
+        </div>;
+    }
+
+    const issuers = data.issuers || {};
+    const tickers = Object.keys(issuers);
+
+    return (
+        <div style={cardStyle} data-testid="buyback-card" data-state="available">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 4 }}>
+                <div style={{ color: colors.text, fontWeight: 600, fontSize: 16 }}>Corporate Buyback Blackouts</div>
+                <div style={{ fontSize: 11, color: colors.textMuted }}>as of {data.as_of}</div>
+            </div>
+            <div style={{ fontSize: 11, color: colors.yellow, marginBottom: 4 }} data-testid="modeling-assumption-note">
+                {data.note}
+            </div>
+            <div style={{ fontSize: 11, color: colors.textMuted, marginBottom: 10 }} data-testid="missing-input-note">
+                {data.missing_input}
+            </div>
+            {tickers.length === 0 ? (
+                <div style={{ color: colors.textMuted, fontSize: 13 }}>no issuer is in a modeled quiet window as of this date</div>
+            ) : (
+                tickers.map((ticker) => {
+                    const field = issuers[ticker];
+                    return (
+                        <div key={ticker} style={{ display: 'flex', justifyContent: 'space-between', padding: '4px 0', borderBottom: `1px solid ${colors.borderSubtle}` }}>
+                            <span style={{ color: colors.text }}>{ticker}</span>
+                            <span style={{ color: colors.yellow, fontSize: 12 }}>{fmtValue(field.value)}</span>
+                            <ProvenanceBadge provenance={field.provenance} availability={field.availability} />
+                        </div>
+                    );
+                })
+            )}
+            <div style={{ fontSize: 10, color: colors.textDimAlt, marginTop: 8 }}>
+                generation {data.generation_id || '—'} published {fmtDateTime(data.generation_published_at)}
+            </div>
+        </div>
+    );
+}
+
+function DealerGexCard({ data, error }) {
+    const cardStyle = {
+        background: colors.card, border: `1px solid ${colors.border}`, borderRadius: 10, padding: 16, marginBottom: 16,
+    };
+
+    if (error) {
+        return <div style={cardStyle} data-testid="dealer-gex-card" data-state="error">
+            <div style={{ color: colors.text, fontWeight: 600, marginBottom: 8 }}>Dealer Gamma Exposure</div>
+            <div style={{ color: colors.red }}>Failed to load: {error}</div>
+        </div>;
+    }
+    if (!data) {
+        return <div style={cardStyle} data-testid="dealer-gex-card" data-state="loading">
+            <div style={{ color: colors.text, fontWeight: 600 }}>Dealer Gamma Exposure</div>
+            <div style={{ color: colors.textDim, marginTop: 8 }}>Loading…</div>
+        </div>;
+    }
+    if (data.available === false) {
+        return <div style={cardStyle} data-testid="dealer-gex-card" data-state="unavailable">
+            <UnavailablePanel label="Dealer Gamma Exposure" payload={data} />
+        </div>;
+    }
+
+    const fields = data.fields || {};
+    const tickers = Object.keys(fields);
+
+    return (
+        <div style={cardStyle} data-testid="dealer-gex-card" data-state="available">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 4 }}>
+                <div style={{ color: colors.text, fontWeight: 600, fontSize: 16 }}>Dealer Gamma Exposure</div>
+                <div style={{ fontSize: 11, color: colors.textMuted }}>as of {data.as_of}</div>
+            </div>
+            <div style={{ fontSize: 11, color: colors.yellow, marginBottom: 4 }} data-testid="sign-convention-note">
+                {data.sign_convention_note}
+            </div>
+            <div style={{ fontSize: 11, color: colors.textMuted, marginBottom: 10 }} data-testid="gex-missing-input-note">
+                {data.missing_input}
+            </div>
+            {tickers.length === 0 ? (
+                <div style={{ color: colors.textMuted, fontSize: 13 }}>no qualifying rows as of this date</div>
+            ) : (
+                tickers.map((ticker) => (
+                    <div key={ticker} style={{ marginBottom: 12 }}>
+                        <div style={{ fontSize: 13, color: colors.textDim, marginBottom: 4 }}>{ticker}</div>
+                        <FieldRow name="Spot price" field={fields[ticker].spot_price} />
+                        <FieldRow name="Net GEX ($M / 1% move)" field={fields[ticker].net_gex_usd_m} />
+                        <FieldRow name="Gamma flip strike" field={fields[ticker].gamma_flip_strike} />
+                        <FieldRow name="Spot to flip (%)" field={fields[ticker].spot_to_flip_pct} />
+                        <FieldRow name="Regime" field={fields[ticker].gex_regime} />
+                        <FieldRow name="Max pain strike" field={fields[ticker].max_pain_strike} />
+                        <FieldRow name="Put/call OI ratio" field={fields[ticker].put_call_oi_ratio} />
+                        <FieldRow name="ATM IV" field={fields[ticker].atm_iv} />
+                    </div>
+                ))
+            )}
+            <div style={{ fontSize: 10, color: colors.textDimAlt, marginTop: 8 }}>
+                generation {data.generation_id || '—'} published {fmtDateTime(data.generation_published_at)}
+            </div>
+        </div>
+    );
+}
+
 function NotBuiltCard({ label, reason }) {
     return (
         <div
@@ -372,6 +602,18 @@ export default function GodViewPillars() {
     const [cmdtyData, setCmdtyData] = useState(null);
     const [cmdtyError, setCmdtyError] = useState(null);
     const [cmdtyLoading, setCmdtyLoading] = useState(true);
+    const [finraData, setFinraData] = useState(null);
+    const [finraError, setFinraError] = useState(null);
+    const [finraLoading, setFinraLoading] = useState(true);
+    const [ftdData, setFtdData] = useState(null);
+    const [ftdError, setFtdError] = useState(null);
+    const [ftdLoading, setFtdLoading] = useState(true);
+    const [buybackData, setBuybackData] = useState(null);
+    const [buybackError, setBuybackError] = useState(null);
+    const [buybackLoading, setBuybackLoading] = useState(true);
+    const [gexData, setGexData] = useState(null);
+    const [gexError, setGexError] = useState(null);
+    const [gexLoading, setGexLoading] = useState(true);
 
     useEffect(() => {
         let cancelled = false;
@@ -416,6 +658,52 @@ export default function GodViewPillars() {
         return () => { cancelled = true; };
     }, [asOf]);
 
+    useEffect(() => {
+        let cancelled = false;
+        setFinraLoading(true);
+        setFinraError(null);
+        const qs = `as_of=${encodeURIComponent(asOf)}&include_inferred=${includeInferred ? 'true' : 'false'}`;
+        api.get(`/api/v1/godview/pillars/finra_short_volume?${qs}`)
+            .then((res) => { if (!cancelled) setFinraData(res); })
+            .catch((e) => { if (!cancelled) setFinraError(e.message || 'request failed'); })
+            .finally(() => { if (!cancelled) setFinraLoading(false); });
+        return () => { cancelled = true; };
+    }, [asOf, includeInferred]);
+
+    useEffect(() => {
+        let cancelled = false;
+        setFtdLoading(true);
+        setFtdError(null);
+        const qs = `as_of=${encodeURIComponent(asOf)}&include_inferred=${includeInferred ? 'true' : 'false'}`;
+        api.get(`/api/v1/godview/pillars/sec_regsho_ftd?${qs}`)
+            .then((res) => { if (!cancelled) setFtdData(res); })
+            .catch((e) => { if (!cancelled) setFtdError(e.message || 'request failed'); })
+            .finally(() => { if (!cancelled) setFtdLoading(false); });
+        return () => { cancelled = true; };
+    }, [asOf, includeInferred]);
+
+    useEffect(() => {
+        let cancelled = false;
+        setBuybackLoading(true);
+        setBuybackError(null);
+        api.get(`/api/v1/godview/pillars/buyback_blackouts?as_of=${encodeURIComponent(asOf)}`)
+            .then((res) => { if (!cancelled) setBuybackData(res); })
+            .catch((e) => { if (!cancelled) setBuybackError(e.message || 'request failed'); })
+            .finally(() => { if (!cancelled) setBuybackLoading(false); });
+        return () => { cancelled = true; };
+    }, [asOf]);
+
+    useEffect(() => {
+        let cancelled = false;
+        setGexLoading(true);
+        setGexError(null);
+        api.get(`/api/v1/godview/pillars/dealer_gex?as_of=${encodeURIComponent(asOf)}`)
+            .then((res) => { if (!cancelled) setGexData(res); })
+            .catch((e) => { if (!cancelled) setGexError(e.message || 'request failed'); })
+            .finally(() => { if (!cancelled) setGexLoading(false); });
+        return () => { cancelled = true; };
+    }, [asOf]);
+
     return (
         <div style={{ padding: 20, maxWidth: 720 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 16, gap: 12, flexWrap: 'wrap' }}>
@@ -446,6 +734,10 @@ export default function GodViewPillars() {
             {loading ? <CftcPillarCard data={null} error={null} /> : <CftcPillarCard data={data} error={error} />}
             {fedLoading ? <FedLiquidityCard data={null} error={null} /> : <FedLiquidityCard data={fedData} error={fedError} />}
             {cmdtyLoading ? <CommodityWarehouseCard data={null} error={null} /> : <CommodityWarehouseCard data={cmdtyData} error={cmdtyError} />}
+            {finraLoading ? <FinraShortVolumeCard data={null} error={null} /> : <FinraShortVolumeCard data={finraData} error={finraError} />}
+            {ftdLoading ? <SecFtdCard data={null} error={null} /> : <SecFtdCard data={ftdData} error={ftdError} />}
+            {buybackLoading ? <BuybackBlackoutCard data={null} error={null} /> : <BuybackBlackoutCard data={buybackData} error={buybackError} />}
+            {gexLoading ? <DealerGexCard data={null} error={null} /> : <DealerGexCard data={gexData} error={gexError} />}
 
             {NOT_BUILT_PILLARS.map((p) => (
                 <NotBuiltCard key={p.key} label={p.label} reason={p.reason} />
