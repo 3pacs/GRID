@@ -111,7 +111,7 @@ class TestMissingApiKey:
 class TestGoodResponse:
     @patch("ingestion.altdata.eia_puller.requests.get")
     def test_writes_expected_rows(self, mock_get, engine, monkeypatch):
-        monkeypatch.setenv("EIA_API_KEY", "test-key-not-real")
+        monkeypatch.setenv("EIA_API_KEY", "REDACTED-FIXTURE")
         good = _load_json("good_response.json")
         empty = _load_json("empty_response.json")
         # _SERIES_MAP order is RBRTE then RWTC.
@@ -145,7 +145,7 @@ class TestGoodResponse:
         of a distinct `release_date`. This test pins that gap down instead
         of asserting a preservation behaviour that does not exist.
         """
-        monkeypatch.setenv("EIA_API_KEY", "test-key-not-real")
+        monkeypatch.setenv("EIA_API_KEY", "REDACTED-FIXTURE")
         good = _load_json("good_response.json")
         empty = _load_json("empty_response.json")
         mock_get.side_effect = [_resp(good), _resp(empty)]
@@ -172,7 +172,7 @@ class TestGoodResponse:
 class TestEmptyResponse:
     @patch("ingestion.altdata.eia_puller.requests.get")
     def test_empty_writes_nothing(self, mock_get, engine, monkeypatch):
-        monkeypatch.setenv("EIA_API_KEY", "test-key-not-real")
+        monkeypatch.setenv("EIA_API_KEY", "REDACTED-FIXTURE")
         empty = _load_json("empty_response.json")
         mock_get.side_effect = [_resp(empty), _resp(empty)]
 
@@ -196,7 +196,7 @@ class TestEmptyResponse:
 class TestMalformedResponse:
     @patch("ingestion.altdata.eia_puller.requests.get")
     def test_bad_records_are_skipped_not_crashed(self, mock_get, engine, monkeypatch):
-        monkeypatch.setenv("EIA_API_KEY", "test-key-not-real")
+        monkeypatch.setenv("EIA_API_KEY", "REDACTED-FIXTURE")
         malformed = _load_json("malformed_records.json")
         empty = _load_json("empty_response.json")
         mock_get.side_effect = [_resp(malformed), _resp(empty)]
@@ -228,11 +228,14 @@ class TestMalformedResponse:
         use). Both are fixed together: severity is WARNING, and the
         message is redacted through `_redact_api_key()`.
         """
-        monkeypatch.setenv("EIA_API_KEY", "SECRET-REAL-KEY-999")
+        # Placeholder is deliberately unmistakable-fake (no real-looking
+        # secret shape) -- see docs/handoffs/2026-09-18/fable-w5-source-status.md
+        # secret-hygiene note.
+        monkeypatch.setenv("EIA_API_KEY", "REDACTED-FIXTURE")
         leaking_exc = ValueError(
             "404 Client Error: Not Found for url: "
             "https://api.eia.gov/v2/petroleum/pri/spt/data/"
-            "?api_key=SECRET-REAL-KEY-999&frequency=daily&facets%5Bseries%5D%5B%5D=RBRTE"
+            "?api_key=REDACTED-FIXTURE&frequency=daily&facets%5Bseries%5D%5B%5D=RBRTE"
         )
         empty = _load_json("empty_response.json")
         mock_get.side_effect = [_resp(json_error=leaking_exc), _resp(empty)]
@@ -248,11 +251,18 @@ class TestMalformedResponse:
         ) + " ".join(
             f"{k}={v}" for k, v in mock_log.warning.call_args.kwargs.items()
         )
-        assert "SECRET-REAL-KEY-999" not in logged_text
-        assert "***" in logged_text
+        # The fixture's own placeholder key text must not survive redaction,
+        # and the redaction marker must be present -- i.e. this proves the
+        # log message carries no key text at all, not just "not this exact
+        # string".
+        assert "REDACTED-FIXTURE" not in logged_text
+        assert "api_key=***" in logged_text
 
     def test_redact_helper_direct(self):
-        assert _redact_api_key("...&api_key=abc123&other=1") == "...&api_key=***&other=1"
+        assert (
+            _redact_api_key("...&api_key=REDACTED-FIXTURE&other=1")
+            == "...&api_key=***&other=1"
+        )
         assert _redact_api_key("no key here") == "no key here"
 
 
@@ -277,7 +287,7 @@ class TestDuplicateWithinBatch:
         (queried once, up front) could not catch. The fix adds the just-
         inserted date to `existing` immediately after each insert.
         """
-        monkeypatch.setenv("EIA_API_KEY", "test-key-not-real")
+        monkeypatch.setenv("EIA_API_KEY", "REDACTED-FIXTURE")
         empty = _load_json("empty_response.json")
         dup = _load_json("duplicate_in_batch.json")
         mock_get.side_effect = [_resp(empty), _resp(dup)]
@@ -309,7 +319,7 @@ class TestRevisedValue:
         this behaviour would need `_get_existing_dates`
         (ingestion/base.py:400-446) to become vintage-aware.
         """
-        monkeypatch.setenv("EIA_API_KEY", "test-key-not-real")
+        monkeypatch.setenv("EIA_API_KEY", "REDACTED-FIXTURE")
         good = _load_json("good_response.json")
         empty = _load_json("empty_response.json")
         puller = EIAPuller(db_engine=engine)
@@ -336,7 +346,7 @@ class TestRevisedValue:
 class TestIdempotentRerun:
     @patch("ingestion.altdata.eia_puller.requests.get")
     def test_running_pull_twice_does_not_duplicate(self, mock_get, engine, monkeypatch):
-        monkeypatch.setenv("EIA_API_KEY", "test-key-not-real")
+        monkeypatch.setenv("EIA_API_KEY", "REDACTED-FIXTURE")
         good = _load_json("good_response.json")
         empty = _load_json("empty_response.json")
         puller = EIAPuller(db_engine=engine)

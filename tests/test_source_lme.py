@@ -354,6 +354,45 @@ class TestSchedulingTruth:
 
     _REPO_ROOT = Path(__file__).resolve().parents[1]
 
+    def test_lme_absent_from_ingestion_present_in_intelligence_scheduler(self):
+        """Single pinned assertion of both halves of the scheduling truth,
+        read directly from source text (no DB, no network):
+
+        1. `ingestion/scheduler.py` -- the authoritative ingestion scheduler
+           per CLAUDE.md gotcha #39 -- never mentions "lme" anywhere.
+        2. `intelligence/scheduler.py` DOES register it: the job function
+           `_lme_warehouse_daily`, the daily 09:00 registration line, and
+           the `if __name__ == "__main__": run_intelligence_loop()` gate
+           that determines when (if ever) that registration takes effect
+           are all present.
+
+        The per-fact detail tests below (`test_ingestion_scheduler_never_
+        mentions_lme`, `test_intelligence_scheduler_registers_lme_daily_
+        job`, `test_intelligence_loop_only_runs_as_main_entrypoint`) are
+        kept for granular failure messages; this test exists so the two
+        halves of the claim are visibly asserted together in one place.
+        """
+        ingestion_src = (self._REPO_ROOT / "ingestion/scheduler.py").read_text(
+            encoding="utf-8"
+        )
+        intelligence_src = (self._REPO_ROOT / "intelligence/scheduler.py").read_text(
+            encoding="utf-8"
+        )
+
+        # (1) absent from the authoritative ingestion scheduler
+        assert "lme" not in ingestion_src.lower()
+
+        # (2) present in intelligence/scheduler.py: job body, 09:00
+        # registration, and the __main__ gate that governs whether the
+        # registration ever actually runs.
+        assert "_lme_warehouse_daily" in intelligence_src
+        assert (
+            '_sched.every().day.at("09:00").do(_lme_warehouse_daily)'
+            in intelligence_src
+        )
+        assert 'if __name__ == "__main__":' in intelligence_src
+        assert "run_intelligence_loop()" in intelligence_src
+
     def test_ingestion_scheduler_never_mentions_lme(self):
         src = (self._REPO_ROOT / "ingestion/scheduler.py").read_text(encoding="utf-8")
         assert "lme" not in src.lower()
