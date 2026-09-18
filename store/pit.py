@@ -284,6 +284,110 @@ class PITStore:
                 # because engine.begin() rolls back on exception
                 raise
 
+    def get_feature_vintages(
+        self,
+        feature_ids: list[int],
+        start_date: date,
+        end_date: date,
+        as_of_date: date | None = None,
+    ) -> pd.DataFrame:
+        """Return every vintage on record for (feature_id, obs_date) in range.
+
+        Unlike ``get_pit``/``get_feature_matrix``, this does NOT collapse to
+        one row per (feature_id, obs_date) — every ``(release_date,
+        vintage_date, value)`` combination on file is returned, undeduped.
+        There is no ``DISTINCT ON`` and no per-row vintage-policy selection
+        here at all; that decision is deliberately left to the caller so
+        that a batched, per-decision-date PIT fetch (one query for a whole
+        window, instead of one query per calendar day) can apply the
+        *correct* cutoff for each row's own ``obs_date`` after the fact,
+        rather than the query committing to a single vintage under one
+        global ``as_of_date`` the way ``get_pit`` does. See
+        ``select_vintage_per_decision`` in ``store/vintage_selection.py``
+        for that per-row selection step -- it is what actually enforces
+        HARD CONSTRAINT 3 from ``get_pit``'s docstring, applied per
+        obs_date rather than once for the whole call.
+
+        Parameters:
+            feature_ids: List of feature_registry IDs to query.
+            start_date: First observation date to include (inclusive).
+            end_date: Last observation date to include (inclusive).
+            as_of_date: Optional coarse pre-filter -- when given, rows with
+                ``release_date > as_of_date`` are excluded up front (they
+                could never be selected by any decision date <= as_of_date
+                anyway). This is a volume/throughput optimisation only, not
+                a correctness guarantee: passing ``None`` returns literally
+                every vintage on file for the range, and the caller's
+                per-row selector is what actually enforces "no vintage
+                released after its own obs_date" for each decision point.
+                Do not rely on this parameter alone for PIT safety.
+
+        Returns:
+            pd.DataFrame: Columns [feature_id, obs_date, value, release_date,
+                          vintage_date], one row per vintage on file
+                          (NOT deduplicated per (feature_id, obs_date)).
+
+        Note:
+            Real-database throughput for this method (row counts returned,
+            query latency vs. the per-day loop it is meant to replace) is
+            unmeasured -- there is no local Postgres available to this
+            change. Only the batched-vs-per-day equivalence (same rows
+            selected, not raw speed) is verified here, by
+            ``tests/test_evaluator_contracts.py``'s fixture-based
+            equivalence test.
+        """
+        if not feature_ids:
+            log.warning("get_feature_vintages called with empty feature_ids list")
+            return pd.DataFrame(
+                columns=["feature_id", "obs_date", "value", "release_date", "vintage_date"]
+            )
+
+        log.debug(
+            "PIT vintages query — {n} features, {sd} to {ed}, as_of={aod}",
+            n=len(feature_ids),
+            sd=start_date,
+            ed=end_date,
+            aod=as_of_date,
+        )
+
+        if as_of_date is not None:
+            query = text("""
+                SELECT feature_id, obs_date, value, release_date, vintage_date
+                FROM resolved_series
+                WHERE feature_id = ANY(:fids)
+                  AND obs_date >= :sd
+                  AND obs_date <= :ed
+                  AND release_date <= :aod
+                ORDER BY feature_id, obs_date, vintage_date
+            """)
+            params = {
+                "fids": feature_ids,
+                "sd": start_date,
+                "ed": end_date,
+                "aod": as_of_date,
+            }
+        else:
+            query = text("""
+                SELECT feature_id, obs_date, value, release_date, vintage_date
+                FROM resolved_series
+                WHERE feature_id = ANY(:fids)
+                  AND obs_date >= :sd
+                  AND obs_date <= :ed
+                ORDER BY feature_id, obs_date, vintage_date
+            """)
+            params = {"fids": feature_ids, "sd": start_date, "ed": end_date}
+
+        with self.engine.connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+
+        df = pd.DataFrame(
+            rows,
+            columns=["feature_id", "obs_date", "value", "release_date", "vintage_date"],
+        )
+
+        log.debug("PIT vintages query returned {n} rows", n=len(df))
+        return df
+
     def get_latest_values(self, feature_ids: list[int]) -> pd.DataFrame:
         """Return the single most recent value for each feature.
 
