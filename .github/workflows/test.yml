@@ -74,9 +74,44 @@ jobs:
           pip install -r requirements.txt
           pip install pytest pytest-cov pytest-xdist
 
+      # The PostgreSQL-gated tests (tests/conftest.py `pg_engine`) connect to
+      # GRID_TEST_DB_URL and expect the production schema. Until 2026-09-18 that
+      # variable was never set here and DB_URL is a read-only property that the
+      # environment cannot populate, so every one of them skipped with
+      # "PostgreSQL not available" while the job stayed green. Build the schema
+      # the way a fresh box does (schema.sql, then the Alembic chain from the
+      # last pre-god-view head; the history cannot be replayed from nothing —
+      # see tests/test_schema_godview_prerequisites.py) and hand the URL to the
+      # suite. The guard after pytest fails the job if any DB test still skips.
+      - name: Bootstrap test database schema
+        env:
+          PGPASSWORD: testpass
+          DB_USER: grid
+          DB_PASSWORD: testpass
+          DB_HOST: localhost
+          DB_PORT: "5432"
+          DB_NAME: griddb_test
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -euo pipefail
+          psql -h localhost -U grid -d griddb_test -v ON_ERROR_STOP=0 -q -f schema.sql > /tmp/grid-schema.log 2>&1 || true
+          grep -ciE "^psql:.*ERROR" /tmp/grid-schema.log | xargs -I{} echo "schema.sql: {} statement error(s) (idempotent re-runs report 'already exists' only)"
+          python -m alembic stamp snapshot_actor_col_20260914
+          python -m alembic upgrade head
+          python -m alembic current
+
       - name: Run tests
         env:
           DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          # Consumed by tests/conftest.py::pg_engine (and the tests that read
+          # it directly); without it the fixture dials conftest's default
+          # grid_user@localhost/grid, which does not exist here.
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_USER: grid
+          DB_HOST: localhost
+          DB_PORT: "5432"
+          DB_NAME: griddb_test
           # config.py now rejects an empty DB_PASSWORD unconditionally (see
           # the 2026-09-13 incident) — must match the postgres service
           # password above so Settings() construction doesn't fail collection.
@@ -125,6 +160,18 @@ jobs:
           echo "::group::pytest output (tail -300)"
           tail -300 /tmp/grid-pytest-output.txt
           echo "::endgroup::"
+
+          # Database coverage accounting. With -v every test prints one line
+          # ending in PASSED/FAILED/SKIPPED; the database skips carry one of
+          # the fixed reasons below. Executed = DB-fixture tests that ran.
+          db_skips=$(grep -cE "SKIPPED.*(PostgreSQL not available|Postgres not available|griddb not reachable)" /tmp/grid-pytest-output.txt || true)
+          db_executed=$(grep -E "^(tests/(test_journal|test_pit|test_resolver|test_holder_deal_overlap|test_acquisition_decomposition|test_capital_flow_rollups|test_canvas_graph_state_store|test_canvas_predict|test_goal_queue|test_intelligence_search|test_investigation_evidence|test_realtime_freshness_probe|test_realtime_shutdown_semantics|test_parse_datasets_signals)\.py|tests/contracts/(test_dead_letter|test_migration)\.py).* (PASSED|FAILED)" /tmp/grid-pytest-output.txt | wc -l || true)
+          echo "database tests executed: ${db_executed}; skipped for a missing database: ${db_skips}"
+          if [ "${db_skips}" != "0" ]; then
+            echo "::error::${db_skips} database-gated test(s) skipped although the PostgreSQL service is up — the schema bootstrap or GRID_TEST_DB_URL wiring regressed; a green job must not imply coverage it skipped"
+            grep -E "SKIPPED.*(PostgreSQL not available|Postgres not available|griddb not reachable)" /tmp/grid-pytest-output.txt | head -20
+            exit 1
+          fi
           exit "$pytest_status"
 
       - name: Check for SQL injection patterns
