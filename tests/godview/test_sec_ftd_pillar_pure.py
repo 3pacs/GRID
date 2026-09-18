@@ -101,6 +101,9 @@ _FIXED_NOT_NULL_COLUMNS = frozenset({"settlement_date", "ticker", "failed_shares
 
 
 class _FakeResult:
+    def __init__(self, rowcount: int = 1):
+        self.rowcount = rowcount
+
     def mappings(self):
         return self
 
@@ -122,10 +125,16 @@ class _FakeConn:
     one statement that matters here: the raw INSERT into sec_regsho_ftd_cns
     (every other DB call the materializer makes is monkeypatched away at the
     helper-function level below, mirroring test_fed_liquidity_pillar_pure.py's
-    pattern)."""
+    pattern). It also tracks (settlement_date, ticker) pairs it has already
+    "inserted" and reports ``rowcount == 0`` for a repeat -- exactly how
+    Postgres reports an ``ON CONFLICT (settlement_date, ticker) DO NOTHING``
+    that silently dropped a row -- so the materializer's own
+    attempted-vs-landed accounting can be exercised without a real database.
+    """
 
     def __init__(self, not_null_columns: frozenset[str]):
         self._not_null_columns = not_null_columns
+        self._inserted_keys: set[tuple] = set()
 
     def execute(self, stmt, params=None):
         if params is not None and "INSERT INTO sec_regsho_ftd_cns" in str(stmt):
@@ -135,6 +144,11 @@ class _FakeConn:
                         f'null value in column "{column}" of relation '
                         f'"sec_regsho_ftd_cns" violates not-null constraint'
                     )
+            key = (params["settlement_date"], params["ticker"])
+            if key in self._inserted_keys:
+                return _FakeResult(rowcount=0)  # ON CONFLICT DO NOTHING skipped it
+            self._inserted_keys.add(key)
+            return _FakeResult(rowcount=1)
         return _FakeResult()
 
 
@@ -200,3 +214,43 @@ def test_materializer_null_mandatory_buyin_date_fails_pre_fix_schema_passes_fixe
     result_after = _patched_materialize(monkeypatch, not_null_columns=_FIXED_NOT_NULL_COLUMNS)
     assert result_after.status == "SUCCESS"
     assert result_after.rows_written == 1
+
+
+def test_materializer_counts_and_reports_rows_skipped_by_a_settlement_date_ticker_conflict(monkeypatch):
+    """Real-Postgres run (composition d7ffa7f1): two different CUSIPs that
+    happen to report the SAME display symbol on the SAME settlement date
+    collide on sec_regsho_ftd_cns's real unique key -- (settlement_date,
+    ticker), not cusip -- and the second one is silently dropped by
+    ON CONFLICT (settlement_date, ticker) DO NOTHING. Before this fix,
+    MaterializationResult had no way to see that: rows_written counted
+    every ATTEMPTED row, not every row that actually landed. This proves
+    the materializer now counts the discard and surfaces it.
+    """
+    settlement_date = date(2026, 8, 20)
+    pull_timestamp = datetime(2026, 9, 15, 6, 0, tzinfo=timezone.utc)
+    shared_symbol = "DUPTICK"
+
+    monkeypatch.setattr(sec_ftd_pillar, "_discover_cusips", lambda conn, as_of: ["CUSIP_A", "CUSIP_B"])
+    monkeypatch.setattr(
+        sec_ftd_pillar,
+        "_read_cusip_history",
+        lambda conn, cusip, as_of: {
+            settlement_date: {
+                "failed_shares": 100.0,
+                "symbol": shared_symbol,
+                "price": 10.0,
+                "pull_timestamp": pull_timestamp,
+            }
+        },
+    )
+    monkeypatch.setattr(sec_ftd_pillar, "_existing_settlement_dates", lambda conn, ticker, cusip: set())
+    monkeypatch.setattr(sec_ftd_pillar, "_distinct_pull_count", lambda conn, cusip, obs_date: 1)
+    monkeypatch.setattr(sec_ftd_pillar, "record_generation", lambda *a, **k: None)
+
+    result = materialize_sec_ftd_pillar(_FakeEngine(_FIXED_NOT_NULL_COLUMNS), as_of=date(2026, 9, 18))
+
+    assert result.status == "SUCCESS"
+    assert result.rows_written == 1
+    assert result.rows_skipped_conflict == 1
+    assert "skipped" in result.message
+    assert "settlement_date, ticker" in result.message

@@ -80,12 +80,21 @@ def test_migration_added_pit_columns(godview_pg_engine):
 def test_materializer_writes_a_balance_row_with_symbol_and_dollar_value(godview_pg_engine, source_id):
     engine = godview_pg_engine
     cusip = f"Z{uuid.uuid4().hex[:8].upper()}"
+    # Randomized, not a literal "HQ": sec_regsho_ftd_cns's unique key is
+    # (settlement_date, ticker), not cusip -- a fixed symbol on a fixed
+    # settlement_date collides with whatever an earlier run already wrote
+    # for a DIFFERENT cusip on a persistent scratch DB, and the
+    # materializer's ON CONFLICT (settlement_date, ticker) DO NOTHING
+    # silently drops this test's own row (real-Postgres run, composition
+    # d7ffa7f1: own_rows_written == 0, not 1). Random per test == unique
+    # key, same fix as the cusip itself already gets.
+    symbol = f"HQ{uuid.uuid4().hex[:6].upper()}"
     settlement_date = date(2026, 8, 17)  # second half of August -> release 2026-09-15
     release_date = date(2026, 9, 15)
     pts = datetime.combine(release_date, datetime.min.time(), tzinfo=timezone.utc) + timedelta(hours=6)
 
     with engine.begin() as conn:
-        _insert_ftd_row(conn, cusip, settlement_date, failed_shares=373.0, symbol="HQ", price=16.99, source_id=source_id, pull_timestamp=pts)
+        _insert_ftd_row(conn, cusip, settlement_date, failed_shares=373.0, symbol=symbol, price=16.99, source_id=source_id, pull_timestamp=pts)
 
     result = materialize_sec_ftd_pillar(engine, as_of=release_date)
     assert result.status == "SUCCESS"
@@ -116,7 +125,7 @@ def test_materializer_writes_a_balance_row_with_symbol_and_dollar_value(godview_
             {"c": cusip},
         ).mappings().fetchone()
     assert row is not None
-    assert row["ticker"] == "HQ"
+    assert row["ticker"] == symbol
     assert row["failed_shares"] == pytest.approx(373.0)
     assert row["total_failed_usd"] == pytest.approx(373.0 * 16.99)
     assert row["mandatory_buyin_date"] is None
