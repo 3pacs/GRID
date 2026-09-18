@@ -5,6 +5,8 @@ import { useDevice } from '../hooks/useDevice.js';
 
 /* ── Design constants ── */
 
+const DASH = '\u2014'; // em dash: the "not measured" marker across this view
+
 const MONO = "'JetBrains Mono', monospace";
 const SANS = "'IBM Plex Sans', -apple-system, sans-serif";
 
@@ -28,20 +30,26 @@ const SECTOR_COLORS = {
 
 /* ── Formatters ── */
 
+// A null dollar field means "we do not know", which must never look like $0.
+// The API returns total_value: null because GRID stores no position sizes.
 const fmtDollar = (v) => {
-    if (v == null) return '--';
+    if (v == null) return DASH;
     const n = typeof v === 'number' ? v : parseFloat(v);
-    if (isNaN(n)) return '--';
+    if (isNaN(n)) return DASH;
     if (Math.abs(n) >= 1e6) return `$${(n / 1e6).toFixed(1)}M`;
     if (Math.abs(n) >= 1e3) return `$${(n / 1e3).toFixed(1)}K`;
     return `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 };
 
 const fmtPct = (v) => {
-    if (v == null) return '--';
+    if (v == null) return DASH;
     const pct = (v * 100).toFixed(2);
     return v >= 0 ? `+${pct}%` : `${pct}%`;
 };
+
+const fmtNum = (v, digits = 2) => (
+    v == null || isNaN(v) ? DASH : Number(v).toFixed(digits)
+);
 
 const fmtPrice = (v) => {
     if (v == null) return '--';
@@ -218,7 +226,7 @@ function PositionTable({ positions }) {
         { key: 'price', label: 'PRICE', align: 'right' },
         { key: 'change_1d', label: '1D CHG', align: 'right' },
         { key: 'weight', label: 'WEIGHT', align: 'right' },
-        { key: 'pnl_1d', label: '1D P&L', align: 'right' },
+        { key: 'change_1w', label: '1W CHG', align: 'right' },
         { key: 'sector', label: 'SECTOR', align: 'left' },
     ];
 
@@ -278,9 +286,9 @@ function PositionTable({ positions }) {
                             </td>
                             <td style={{
                                 padding: '10px', textAlign: 'right',
-                                color: pnlColor(p.pnl_1d), fontWeight: 600,
+                                color: pnlColor(p.change_1w),
                             }}>
-                                {p.pnl_1d >= 0 ? '+' : ''}{fmtDollar(p.pnl_1d)}
+                                {fmtPct(p.change_1w)}
                             </td>
                             <td style={{ padding: '10px', color: colors.textMuted, fontSize: '11px' }}>
                                 <span style={{
@@ -400,7 +408,9 @@ export default function Portfolio() {
             <div style={{ marginBottom: tokens.space.xl }}>
                 <div style={{ ...shared.header, marginBottom: '4px' }}>Portfolio</div>
                 <div style={{ fontSize: '11px', color: colors.textMuted, fontFamily: MONO }}>
-                    Watchlist as portfolio -- estimated from equal-weight allocation
+                    Watchlist as a weighted basket. No share counts or cost basis are
+                    stored, so returns are shown as percentages and no dollar value is
+                    reported.
                 </div>
             </div>
 
@@ -414,22 +424,36 @@ export default function Portfolio() {
                 <MetricCard
                     label="Portfolio Value"
                     value={fmtDollar(data.total_value)}
-                    subtext="estimated"
+                    subtext={data.total_value == null ? 'no position sizes stored' : undefined}
                 />
                 <MetricCard
-                    label="1D P&L"
-                    value={`${data.total_pnl_1d >= 0 ? '+' : ''}${fmtDollar(data.total_pnl_1d)}`}
-                    subtext={fmtPct(data.total_pnl_1d_pct)}
-                    color={pnlColor(data.total_pnl_1d)}
+                    label="1D Return (weighted)"
+                    value={fmtPct(data.weighted_return_1d_pct)}
+                    subtext={
+                        data.return_1d_weight_coverage == null
+                            ? 'no priced position with a 1D return'
+                            : `${(data.return_1d_weight_coverage * 100).toFixed(0)}% of weight priced`
+                    }
+                    color={pnlColor(data.weighted_return_1d_pct)}
                 />
                 <MetricCard
-                    label="1M P&L (est)"
-                    value={`${data.total_pnl_1m >= 0 ? '+' : ''}${fmtDollar(data.total_pnl_1m)}`}
-                    color={pnlColor(data.total_pnl_1m)}
+                    label="Positions Priced"
+                    value={data.positions?.length ?? 0}
+                    subtext={
+                        data.positions_missing_price
+                            ? `${data.positions_missing_price} without a price`
+                            : 'all holdings priced'
+                    }
                 />
                 <MetricCard
-                    label="Positions"
-                    value={data.positions?.length || 0}
+                    label="Missing Price"
+                    value={data.positions_missing_price ?? 0}
+                    subtext={
+                        data.missing_price_tickers?.length
+                            ? data.missing_price_tickers.join(', ')
+                            : undefined
+                    }
+                    color={data.positions_missing_price ? colors.yellow : colors.textDim}
                 />
             </div>
 
@@ -469,20 +493,29 @@ export default function Portfolio() {
                     }}>
                         <MetricCard
                             label="Top-3 Concentration"
-                            value={`${(risk.concentration_top3 * 100).toFixed(1)}%`}
-                            subtext={risk.concentration_top3 > 0.7 ? 'high concentration' : 'diversified'}
+                            value={risk.concentration_top3 == null
+                                ? DASH
+                                : `${(risk.concentration_top3 * 100).toFixed(1)}%`}
+                            subtext={risk.concentration_top3 == null
+                                ? 'no priced positions'
+                                : risk.concentration_top3 > 0.7 ? 'high concentration' : 'diversified'}
                             color={risk.concentration_top3 > 0.7 ? colors.yellow : colors.green}
                         />
+                        {/* Not a beta: a per-asset-class lookup, labelled as one. */}
                         <MetricCard
-                            label="Beta (Weighted)"
-                            value={risk.beta_weighted?.toFixed(2) || '--'}
-                            subtext={risk.beta_weighted > 1.3 ? 'aggressive' : risk.beta_weighted < 0.8 ? 'defensive' : 'moderate'}
-                            color={risk.beta_weighted > 1.3 ? colors.yellow : colors.text}
+                            label="Beta Proxy (by asset class)"
+                            value={fmtNum(risk.beta_proxy_by_asset_class)}
+                            subtext={risk.beta_proxy_basis || 'asset-class lookup, not a regression vs SPY'}
+                            color={risk.beta_proxy_by_asset_class > 1.3 ? colors.yellow : colors.text}
                         />
                         <MetricCard
                             label="Sector Diversification"
-                            value={`${((risk.sector_diversification_score || 0) * 100).toFixed(0)}%`}
-                            subtext={risk.sector_diversification_score > 0.7 ? 'well diversified' : 'concentrated'}
+                            value={risk.sector_diversification_score == null
+                                ? DASH
+                                : `${(risk.sector_diversification_score * 100).toFixed(0)}%`}
+                            subtext={risk.sector_diversification_score == null
+                                ? 'no priced positions'
+                                : risk.sector_diversification_score > 0.7 ? 'well diversified' : 'concentrated'}
                             color={risk.sector_diversification_score > 0.7 ? colors.green : colors.yellow}
                         />
                     </div>
@@ -496,7 +529,9 @@ export default function Portfolio() {
                     <PositionTable positions={data.positions} />
                 ) : (
                     <div style={{ color: colors.textMuted, fontSize: '12px', padding: '20px 0', textAlign: 'center' }}>
-                        No positions in watchlist.
+                        {data.positions_missing_price
+                            ? `No priced positions. ${data.positions_missing_price} holding(s) have no price.`
+                            : 'No positions in watchlist.'}
                     </div>
                 )}
             </div>
