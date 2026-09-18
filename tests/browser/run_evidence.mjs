@@ -116,7 +116,7 @@ const JOURNEYS = {
     admin: [
         { name: 'home', hash: '#/home', clickText: 'How are my stocks doing?', ready: /Your read|Start over|Here's (how|what)/ },
         { name: 'ticker-lookup', hash: '#/ticker-lookup', ready: /GOLD VERDICT/ },
-        { name: 'watchlist-analysis', hash: '#/watchlist/TEST1', ready: /INSIDER EDGE/ },
+        { name: 'watchlist-analysis', hash: '#/watchlist/TEST1', ready: /INSIDER EDGE|AI OVERVIEW/ },
         { name: 'portfolio', hash: '#/portfolio', ready: /Portfolio Value/ },
         { name: 'operator', hash: '#/operator', ready: /HERMES STATUS/ },
         { name: 'discovery', hash: '#/discovery', ready: /HYPOTHESES/ },
