@@ -176,6 +176,25 @@ function gitRevParse(cwd) {
 
 // ── Server lifecycle for one (role, scenario) pair ──────────────────
 
+/**
+ * Refuse to start a pair while its ports are still held (e.g. a fixture or
+ * Vite process from a previous invocation that has not finished dying).
+ * A pair that starts on a half-dead port produces 502s from the proxy that
+ * look like view failures; fail loudly instead and record it.
+ */
+async function assertPortsFree(ports) {
+    const net = await import('node:net');
+    for (const port of ports) {
+        const busy = await new Promise((resolve) => {
+            const srv = net.createServer();
+            srv.once('error', () => resolve(true));
+            srv.once('listening', () => srv.close(() => resolve(false)));
+            srv.listen(port, '127.0.0.1');
+        });
+        if (busy) throw new Error(`port ${port} is still in use; refusing to start this pair (stale server from a previous run?)`);
+    }
+}
+
 function startFixtureServer(scenario, role) {
     const serverPath = path.join(__dirname, 'fixture_api', 'server.py');
     const child = spawn(
@@ -292,7 +311,7 @@ function detectCrash(bodyText) {
 
 // ── Main per-(role, scenario) run ────────────────────────────────────
 
-async function runOne(browser, role, scenario, outDir) {
+async function runOne(browser, role, scenario, outDir, fixtureChild = { exitCode: null }) {
     mkdirSync(outDir, { recursive: true });
     const consoleLogPath = path.join(outDir, 'console.jsonl');
     const networkLogPath = path.join(outDir, 'network.jsonl');
@@ -342,6 +361,9 @@ async function runOne(browser, role, scenario, outDir) {
         const apiCallsBefore = readJsonl(networkLogPath).length;
 
         try {
+            if (fixtureChild.exitCode !== null) {
+                throw new Error(`fixture server exited (code ${fixtureChild.exitCode}) before journey ${journey.name}; evidence INCOMPLETE`);
+            }
             await page.evaluate((hash) => { window.location.hash = hash; }, journey.hash);
             await waitSettled(page);
             if (journey.clickText) {
@@ -426,6 +448,7 @@ async function main() {
     for (const role of ROLES) {
         for (const scenario of SCENARIOS) {
             console.log(`\n=== role=${role} scenario=${scenario} ===`);
+            await assertPortsFree([FIXTURE_PORT, PWA_PORT]);
             const fixtureChild = startFixtureServer(scenario, role);
             const pwaChild = startPwaDevServer();
             let browserInstance = null;
@@ -443,7 +466,7 @@ async function main() {
                 });
 
                 const outDir = path.join(OUT_ROOT, `${role}-${scenario}`);
-                const summary = await runOne(browserInstance, role, scenario, outDir);
+                const summary = await runOne(browserInstance, role, scenario, outDir, fixtureChild);
                 results.push(summary);
             } catch (err) {
                 console.error(`role=${role} scenario=${scenario} failed: ${err}`);
