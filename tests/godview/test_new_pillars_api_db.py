@@ -20,6 +20,7 @@ from godview.fed_liquidity_pillar import (
     WTREGEN_SERIES_ID,
     materialize_fed_liquidity_pillar,
 )
+from tests.godview.test_fed_liquidity_pillar_db import _random_wednesday
 
 pytestmark = pytest.mark.integration
 
@@ -44,7 +45,7 @@ def test_fed_liquidity_route_exposes_per_component_basis_and_derived_fields(
     godview_pg_engine, monkeypatch
 ):
     engine = godview_pg_engine
-    obs_date = date(2026, 8, 5)  # a Wednesday
+    obs_date = _random_wednesday()
     pts = datetime.combine(obs_date, datetime.min.time(), tzinfo=timezone.utc) + timedelta(days=1, hours=20)
 
     with engine.begin() as conn:
