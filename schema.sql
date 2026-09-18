@@ -904,7 +904,13 @@ CREATE TABLE IF NOT EXISTS signal_sources (
     outcome             TEXT,               -- filled later: 'CORRECT', 'WRONG', 'PENDING'
     outcome_return      NUMERIC,            -- filled later
     scored_at           TIMESTAMPTZ,
-    trust_score         NUMERIC DEFAULT 0.5,
+    -- No DEFAULT: NULL means "intelligence/trust_scorer.py has not scored this
+    -- source yet". A 0.5 default was indistinguishable from a measured 0.5 and
+    -- reached the /watchlist/{t}/edge trust bar and the convergence WebSocket
+    -- alert as though a scorer had produced it. A measured 0.0 is a
+    -- measurement; readers must test IS NULL, never falsiness.
+    -- See migrations/versions/signal_sources_trust_nodefault.py.
+    trust_score         NUMERIC,
     hit_count           INT DEFAULT 0,
     miss_count          INT DEFAULT 0,
     avg_lead_time_hours NUMERIC,
