@@ -396,7 +396,6 @@ function connectionBadge(item) {
 // `score` is null when nothing scored the actor. A 0% gauge is a measurement;
 // an unscored actor gets the word instead (docs/reference/CONFIDENCE_POLICY.md).
 function TrustGauge({ score }) {
-<<<<<<< HEAD
     // An unscored actor has no trust score. Drawing an empty gauge labelled
     // "0%" would read as a measured worst-case
     // (docs/reference/CONFIDENCE_POLICY.md), so say "unrated" instead.
@@ -411,21 +410,17 @@ function TrustGauge({ score }) {
         );
     }
     const pct = score * 100;
-=======
-    const scored = typeof score === 'number' && Number.isFinite(score);
-    const pct = scored ? score * 100 : 0;
->>>>>>> 83dd27c1 (PWA: render an unscored trust score as "unscored", never as a half bar)
     const color = trustColor(score);
     return (
         <div style={S.card}>
             <div style={S.row}>
                 <span style={S.label}>Trust Score</span>
                 <span style={{ ...S.value, color }}>
-                    {scored ? `${pct.toFixed(0)}%` : 'unscored'}
+                    {`${pct.toFixed(0)}%`}
                 </span>
             </div>
             <div style={S.gauge}>
-                {scored && <div style={S.gaugeFill(pct, color)} />}
+                <div style={S.gaugeFill(pct, color)} />
             </div>
         </div>
     );
@@ -444,10 +439,7 @@ function ActorDetail({ node }) {
 
     return (
         <>
-<<<<<<< HEAD
-=======
             {/* ?? not ||: a measured 0 is a score, and null stays null. */}
->>>>>>> 83dd27c1 (PWA: render an unscored trust score as "unscored", never as a half bar)
             <TrustGauge score={data.trust_score ?? data.trustScore ?? null} />
 
             {influenceRank && (
