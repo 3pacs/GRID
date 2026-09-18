@@ -133,10 +133,11 @@ def _clamp_probability(val: float | None) -> float | None:
     return max(0.0, min(1.0, float(val)))
 
 
-# Set once per run from information_schema: until the ALTER in
-# grid/scripts/migrations/2026-09-18_company_milestones_probability_nullable.sql
-# is applied, company_milestones.probability is NOT NULL DEFAULT 0.5 and an
-# unscored row cannot be written honestly. Fail closed: skip it and count it.
+# Set once per run from information_schema: until the Alembic revision that
+# drops NOT NULL / DEFAULT 0.5 on company_milestones.probability lands (it is
+# to be parented on the incident-recovery baseline the fake-data lead will
+# announce; see PR #550), an unscored row cannot be written honestly. Fail
+# closed: skip it and count it.
 _PROBABILITY_NULLABLE: bool | None = None
 _SKIPPED_UNSCORED = 0
 
@@ -873,8 +874,8 @@ def main() -> None:
     if _SKIPPED_UNSCORED:
         log.warning(
             "Skipped {k} unscored milestones: company_milestones.probability is "
-            "still NOT NULL (apply grid/scripts/migrations/"
-            "2026-09-18_company_milestones_probability_nullable.sql)",
+            "still NOT NULL DEFAULT 0.5 (pending the Alembic revision tracked "
+            "in PR #550)",
             k=_SKIPPED_UNSCORED,
         )
 
