@@ -227,10 +227,18 @@ def test_pit_read_excludes_rows_released_after_as_of(godview_pg_engine, source_i
     # The newest report's release_date is report_date + 3 days (Friday).
     newest_release_date = last_report_date + timedelta(days=3)
 
+    # include_inferred=True: this test is about the release_date <= as_of
+    # boundary specifically, not availability_basis (covered by its own
+    # dedicated tests below) -- _insert_raw_series here uses raw_series'
+    # pull_timestamp default (NOW()), which classifies these 2023-dated
+    # fixture rows as 'inferred_schedule' (a real backfill by the time this
+    # test actually runs), so the DEFAULT (observed-only) filter would
+    # exclude them regardless of the release_date check this test exists to
+    # verify -- see docs/reference/GODVIEW_PILLAR_CONTRACT.md section 10.
     with engine.begin() as conn:
         # As-of the day BEFORE release: must not see the newest row.
-        before = read_cftc_pillar(conn, newest_release_date - timedelta(days=1), contracts=contracts)
-        after = read_cftc_pillar(conn, newest_release_date, contracts=contracts)
+        before = read_cftc_pillar(conn, newest_release_date - timedelta(days=1), contracts=contracts, include_inferred=True)
+        after = read_cftc_pillar(conn, newest_release_date, contracts=contracts, include_inferred=True)
 
     before_dates = {r["report_date"] for r in before.rows if r["contract_code"] == contract_code}
     after_dates = {r["report_date"] for r in after.rows if r["contract_code"] == contract_code}

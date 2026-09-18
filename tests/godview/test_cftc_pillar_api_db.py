@@ -20,6 +20,30 @@ from tests.fixtures.godview.cftc_fixture import build_cot_records
 pytestmark = pytest.mark.integration
 
 
+def _build_test_app(monkeypatch, engine, contracts):
+    """A minimal FastAPI app carrying only the godview router, wired to a
+    real (scratch) engine and a stubbed auth dependency -- for exercising
+    the router through REAL ASGI/HTTP request handling via TestClient,
+    rather than calling the route function directly. This is what actually
+    proves the include_inferred/as_of query-string defaulting works (the
+    Annotated[bool, Query(...)] fix) -- a direct function call proves the
+    Python-level default is fixed, but only a real request proves FastAPI's
+    own query-string binding still works too.
+    """
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    import api.routers.godview_pillars as router_module
+
+    monkeypatch.setattr(router_module, "get_db_engine", lambda: engine)
+    monkeypatch.setattr(router_module, "CFTC_PILLAR_CONTRACTS", contracts)
+
+    app = FastAPI()
+    app.include_router(router_module.router)
+    app.dependency_overrides[router_module.require_auth] = lambda: "test-token"
+    return TestClient(app)
+
+
 def _insert_raw_series_on_schedule(conn, contract_key: str, records: list[dict], *, source_id: int) -> None:
     """Insert each record with an explicit pull_timestamp near ITS OWN release_date.
 
@@ -184,3 +208,70 @@ def test_api_router_exposes_availability_basis_and_admits_inferred_rows_when_fla
     field = inferred_response["fields"][contract_code]["total_open_interest"]
     assert field["availability_basis"] == "inferred_schedule"
     assert field["availability_basis_note"] == "availability inferred from schedule; record revised/backfilled"
+
+
+def test_router_via_real_http_excludes_inferred_row_by_default_admits_when_flagged(
+    godview_pg_engine, monkeypatch
+):
+    """Same scenario as the direct-call test above, but through TestClient
+    (real ASGI request handling, real query-string parsing) -- the layer
+    that actually reaches production. Confirms the include_inferred=false
+    DEFAULT is honoured not just when the route function is called directly
+    (the Annotated[bool, Query(...)] fix's Python-level effect) but also
+    when the query parameter is genuinely OMITTED from the URL (FastAPI's
+    own request-handling path, unaffected either way by the fix but worth
+    proving explicitly since this is the path real clients use)."""
+    engine = godview_pg_engine
+    contract_key = f"HTTPBACK_{uuid.uuid4().hex[:8]}"
+    contract_code = f"H{uuid.uuid4().hex[:6]}"
+    contracts = {contract_key: {"contract_code": contract_code, "contract_name": "HTTP Backfill", "asset_class": "test"}}
+    report_date = date(2026, 2, 3)  # a Tuesday
+    records = build_cot_records(n_weeks=1, start_date=report_date)
+    release_date = report_date + timedelta(days=3)
+    backfill_pull = datetime.combine(release_date, datetime.min.time(), tzinfo=timezone.utc) + timedelta(weeks=12)
+
+    with engine.begin() as conn:
+        sid = _ensure_source_catalog_row(conn, f"CFTC_COT_HTTP_TEST_{uuid.uuid4().hex[:8]}")
+        from godview.cftc_pillar import parse_cot_record
+
+        for record in records:
+            parsed = parse_cot_record(record)
+            for metric, value in parsed.metrics.items():
+                conn.execute(
+                    text(
+                        "INSERT INTO raw_series (series_id, source_id, obs_date, value, "
+                        "pull_timestamp, pull_status) "
+                        "VALUES (:sid, :src, :od, :val, :pts, 'SUCCESS')"
+                    ),
+                    {
+                        "sid": f"cftc.{contract_key}.{metric}",
+                        "src": sid,
+                        "od": parsed.report_date,
+                        "val": value,
+                        "pts": backfill_pull,
+                    },
+                )
+
+    result = materialize_cftc_pillar(engine, as_of=backfill_pull.date(), contracts=contracts)
+    assert result.status == "SUCCESS"
+
+    client = _build_test_app(monkeypatch, engine, contracts)
+    as_of = backfill_pull.date() + timedelta(days=1)
+
+    # Query param genuinely OMITTED from the URL -- the real client path.
+    default_resp = client.get("/api/v1/godview/pillars/cftc", params={"as_of": as_of.isoformat()})
+    assert default_resp.status_code == 200
+    default_body = default_resp.json()
+    assert default_body["include_inferred"] is False
+    assert contract_code not in default_body["fields"]
+
+    # Explicit ?include_inferred=true admits the same backfilled row, labelled.
+    inferred_resp = client.get(
+        "/api/v1/godview/pillars/cftc",
+        params={"as_of": as_of.isoformat(), "include_inferred": "true"},
+    )
+    assert inferred_resp.status_code == 200
+    inferred_body = inferred_resp.json()
+    assert inferred_body["include_inferred"] is True
+    assert contract_code in inferred_body["fields"]
+    assert inferred_body["fields"][contract_code]["total_open_interest"]["availability_basis"] == "inferred_schedule"

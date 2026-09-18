@@ -9,12 +9,33 @@ see docs/reference/GODVIEW_PILLAR_CONTRACT.md's status table.
 Never raises 500 for a missing table: every table this router reads is
 probed with ``to_regclass`` first, mirroring the ``_table_exists`` pattern
 already used in api/routers/flows.py and friends.
+
+Root-cause note (2026-09-18, real-Postgres run, composition 783ff735):
+``include_inferred``/``as_of`` used to default via a bare
+``= Query(default=False)`` on the parameter itself. FastAPI's own request
+handling substitutes the real value for that when invoked over ASGI, but
+any DIRECT Python call to the route function (a script, another router, a
+test that doesn't go through TestClient) leaves the parameter bound to the
+``Query`` marker OBJECT -- which is truthy (no ``__bool__``) -- so
+``include_inferred`` silently evaluated as "admit inferred rows" even at
+the documented "false" default. Fixed by switching to
+``Annotated[bool, Query(...)] = False`` (the modern FastAPI style): the
+function's own default is now a plain Python ``False``, so a direct call
+gets the correct value, while FastAPI still recognises the ``Query``
+annotation for query-string binding and OpenAPI docs. ``include_inferred``
+is only threaded through the CFTC and Fed liquidity routes -- the
+commodity warehouse pillar has no schedule-based availability_basis filter
+to admit/exclude in the first place (see
+godview/commodity_warehouse_pillar.py's module docstring: basis is always
+``'unknown'`` there, deliberately, since no LME publication schedule is
+cited), so adding the parameter there would imply a filter that does
+nothing.
 """
 
 from __future__ import annotations
 
 from datetime import date
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import text
@@ -157,15 +178,17 @@ def _row_to_field_records(row: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 @router.get("/pillars/cftc")
 def get_cftc_pillar(
-    as_of: date | None = Query(default=None),
-    include_inferred: bool = Query(
-        default=False,
-        description=(
-            "Admit availability_basis='inferred_schedule'/'unknown' rows "
-            "(revised/backfilled records). Strict PIT default is False -- "
-            "observed_acquisition rows only. See contract doc section 10."
+    as_of: Annotated[date | None, Query()] = None,
+    include_inferred: Annotated[
+        bool,
+        Query(
+            description=(
+                "Admit availability_basis='inferred_schedule'/'unknown' rows "
+                "(revised/backfilled records). Strict PIT default is False -- "
+                "observed_acquisition rows only. See contract doc section 10."
+            ),
         ),
-    ),
+    ] = False,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Strict-PIT read of the CFTC positioning pillar as of ``as_of`` (default today)."""
@@ -299,8 +322,8 @@ def _fed_field_records(row: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 @router.get("/pillars/fed_net_liquidity")
 def get_fed_liquidity_pillar(
-    as_of: date | None = Query(default=None),
-    include_inferred: bool = Query(default=False),
+    as_of: Annotated[date | None, Query()] = None,
+    include_inferred: Annotated[bool, Query()] = False,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Strict-PIT read of the Fed net liquidity pillar as of ``as_of`` (default today)."""
@@ -415,7 +438,7 @@ def _commodity_field_records(row: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 @router.get("/pillars/commodity_warehouses")
 def get_commodity_warehouse_pillar(
-    as_of: date | None = Query(default=None),
+    as_of: Annotated[date | None, Query()] = None,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """LME cancelled-warrant ratio per metal as of ``as_of``. Cushing is permanently

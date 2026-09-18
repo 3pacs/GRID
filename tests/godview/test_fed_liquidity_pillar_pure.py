@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
+import godview.fed_liquidity_pillar as fed_liquidity_pillar
 from godview.fed_liquidity_pillar import (
     RELEASE_RULE_ID,
     RRP_BILLIONS_TO_MILLIONS,
@@ -15,6 +16,7 @@ from godview.fed_liquidity_pillar import (
     compute_rrp_pct_of_peak,
     coverage_fraction_for_window,
     find_nearest_prior,
+    materialize_fed_liquidity_pillar,
 )
 
 
@@ -92,3 +94,106 @@ def test_find_nearest_prior_none_when_nothing_within_tolerance():
 )
 def test_classify_liquidity_regime(delta_30d, expected):
     assert classify_liquidity_regime(delta_30d) == expected
+
+
+# ---------------------------------------------------------------------------
+# Pure fake: reproduces the SUCCESS_NOOP report from RESULTS.md, and proves
+# the unit-normalisation fix (a828f4bf) is NOT the cause.
+#
+# Root cause (2026-09-18, real-Postgres run, composition 42df4362):
+# fed_net_liquidity_daily is keyed by obs_date alone -- unlike
+# cftc_positioning_daily (random contract_code) and
+# commodity_warehouse_inventories (random metal), the DB-gated Fed tests
+# used FIXED obs_dates. Composition 783ff735's first run of those tests
+# passed and wrote real rows for those exact dates into the shared,
+# persistent scratch DB; the SAME test file re-run at composition 42df4362
+# against the SAME DB found those obs_dates already present and correctly
+# reported SUCCESS_NOOP (idempotent no-op, not a bug -- see the module
+# docstring). It was misattributed to a828f4bf only because of when it was
+# first observed. tests/godview/test_fed_liquidity_pillar_db.py now uses a
+# random Wednesday per test to make this collision astronomically
+# unlikely; these two tests lock the underlying behaviour in with a fake
+# so nobody re-diagnoses it as a materializer bug again.
+# ---------------------------------------------------------------------------
+
+
+class _FakeResult:
+    def mappings(self):
+        return self
+
+    def all(self):
+        return []
+
+    def fetchall(self):
+        return []
+
+    def fetchone(self):
+        return None
+
+    def scalar(self):
+        return 1
+
+
+class _FakeConn:
+    def execute(self, *args, **kwargs):
+        return _FakeResult()
+
+
+class _FakeEngineCtx:
+    def __enter__(self):
+        return _FakeConn()
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeEngine:
+    def begin(self):
+        return _FakeEngineCtx()
+
+
+def _patched_materialize(monkeypatch, obs_date, *, existing_obs_dates):
+    """Run materialize_fed_liquidity_pillar against fully faked DB helpers.
+
+    All three raw components are present and well-formed for ``obs_date``
+    (real FRED series ids, real millions/billions values) -- the only
+    variable is whether ``obs_date`` is already in
+    ``fed_net_liquidity_daily`` (``existing_obs_dates``).
+    """
+    on_schedule = datetime.combine(obs_date, datetime.min.time(), tzinfo=timezone.utc) + timedelta(days=1, hours=20)
+    histories = {
+        "WALCL": {obs_date: {"value": 7_500_000.0, "pull_timestamp": on_schedule}},
+        "WTREGEN": {obs_date: {"value": 700_000.0, "pull_timestamp": on_schedule}},
+        "RRPONTSYD": {obs_date: {"value": 300.0, "pull_timestamp": on_schedule}},
+    }
+
+    monkeypatch.setattr(
+        fed_liquidity_pillar,
+        "_read_component_history",
+        lambda conn, series_id, as_of: histories[series_id],
+    )
+    monkeypatch.setattr(fed_liquidity_pillar, "_existing_obs_dates", lambda conn: set(existing_obs_dates))
+    monkeypatch.setattr(fed_liquidity_pillar, "_existing_net_liquidity_history", lambda conn, before: ([], []))
+    monkeypatch.setattr(fed_liquidity_pillar, "_distinct_pull_count", lambda conn, series_id, obs_date: 1)
+    monkeypatch.setattr(fed_liquidity_pillar, "record_generation", lambda *a, **k: None)
+
+    return materialize_fed_liquidity_pillar(_FakeEngine(), as_of=obs_date)
+
+
+def test_materialize_succeeds_on_a_genuinely_fresh_obs_date(monkeypatch):
+    """Confirms the unit-normalisation path itself is fine: with a real FRED
+    id/unit and NO pre-existing row, the materializer writes the row."""
+    obs_date = date(2026, 9, 16)  # a Wednesday
+    result = _patched_materialize(monkeypatch, obs_date, existing_obs_dates=set())
+    assert result.status == "SUCCESS"
+    assert result.rows_written == 1
+
+
+def test_materialize_is_success_noop_when_the_obs_date_already_exists(monkeypatch):
+    """Reproduces the exact SUCCESS_NOOP from RESULTS.md with a fake that
+    mirrors a persistent scratch DB already holding a prior run's row --
+    correct idempotent behaviour, not a regression from a828f4bf."""
+    obs_date = date(2026, 9, 16)
+    result = _patched_materialize(monkeypatch, obs_date, existing_obs_dates={obs_date})
+    assert result.status == "SUCCESS_NOOP"
+    assert result.rows_written == 0

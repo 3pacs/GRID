@@ -6,6 +6,7 @@ Depends on ``godview_pg_engine`` (tests/godview/conftest.py) — skips with
 
 from __future__ import annotations
 
+import random
 import uuid
 from datetime import date, datetime, timedelta, timezone
 
@@ -21,6 +22,30 @@ from godview.fed_liquidity_pillar import (
 )
 
 pytestmark = pytest.mark.integration
+
+
+def _random_wednesday() -> date:
+    """A Wednesday chosen fresh per call, from a ~40-year range.
+
+    Root cause (2026-09-18, real-Postgres run, composition 42df4362):
+    fed_net_liquidity_daily has no per-test isolation key analogous to
+    cftc_positioning_daily's random contract_code or
+    commodity_warehouse_inventories's random metal -- it is genuinely one
+    global row per obs_date. Earlier versions of these tests used fixed
+    dates (e.g. date(2026, 9, 16)); re-running the SAME test file against
+    the SAME persistent/shared scratch DB a second time found those exact
+    obs_dates already present from the first run and correctly reported
+    materialize_fed_liquidity_pillar() -> SUCCESS_NOOP (idempotent no-op,
+    not a bug -- see godview/fed_liquidity_pillar.py's own contract). That
+    was misread as a regression from the unit-normalisation commit; the
+    real fix is here, not in the materializer (confirmed with a fake
+    reader in tests/godview/test_fed_liquidity_pillar_pure.py). A random
+    Wednesday per test invocation makes a collision with any prior run
+    astronomically unlikely, mirroring the uuid4-based isolation the other
+    two pillars' tests already use.
+    """
+    start = date(1990, 1, 3)  # a Wednesday
+    return start + timedelta(weeks=random.randint(0, 52 * 40))
 
 
 def _ensure_source_catalog_row(conn, name: str) -> int:
@@ -79,7 +104,7 @@ def test_materializer_writes_a_row_on_a_wednesday_when_all_three_components_pres
     godview_pg_engine, source_id
 ):
     engine = godview_pg_engine
-    obs_date = date(2026, 9, 16)  # a Wednesday
+    obs_date = _random_wednesday()
     on_schedule = datetime.combine(obs_date, datetime.min.time(), tzinfo=timezone.utc) + timedelta(days=1, hours=20)
 
     with engine.begin() as conn:
@@ -111,7 +136,7 @@ def test_missing_component_leaves_the_wednesday_unavailable_no_fallback(
 ):
     """WALCL and WTREGEN present, RRPONTSYD missing for that exact date -> no row at all."""
     engine = godview_pg_engine
-    obs_date = date(2026, 3, 4)  # a Wednesday
+    obs_date = _random_wednesday()
     pts = datetime.combine(obs_date, datetime.min.time(), tzinfo=timezone.utc) + timedelta(days=1)
 
     with engine.begin() as conn:
@@ -132,7 +157,7 @@ def test_missing_component_leaves_the_wednesday_unavailable_no_fallback(
 
 def test_pit_read_excludes_a_row_released_after_as_of(godview_pg_engine, source_id):
     engine = godview_pg_engine
-    obs_date = date(2026, 6, 3)  # a Wednesday
+    obs_date = _random_wednesday()
     pts = datetime.combine(obs_date, datetime.min.time(), tzinfo=timezone.utc) + timedelta(days=1, hours=20)
 
     with engine.begin() as conn:
