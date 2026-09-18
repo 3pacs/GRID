@@ -40,6 +40,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from store.observations import read_latest
 
 # ── Crowdedness component configuration ──────────────────────────────────
 
@@ -348,22 +349,11 @@ def _read_short_interest(engine: Engine, ticker: str) -> float | None:
     """Read latest short interest ratio from institutional_holdings-adjacent data."""
     try:
         with engine.connect() as conn:
-            row = conn.execute(
-                text(
-                    """
-                    SELECT value
-                    FROM raw_series
-                    WHERE series_id = :sid
-                    ORDER BY obs_date DESC
-                    LIMIT 1
-                    """
-                ),
-                {"sid": f"finra_short_interest:{ticker.upper()}"},
-            ).fetchone()
+            obs = read_latest(conn, f"finra_short_interest:{ticker.upper()}")
     except Exception as exc:  # noqa: BLE001
         log.debug("short_interest read failed for {t}: {e}", t=ticker, e=str(exc))
         return None
-    return float(row[0]) if row else None
+    return obs.value if obs else None
 
 
 def _read_media_velocity(engine: Engine, ticker: str) -> int | None:
