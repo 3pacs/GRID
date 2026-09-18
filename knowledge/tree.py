@@ -218,43 +218,84 @@ def _extract_features(text: str) -> list[str]:
     return sorted(features)
 
 
-def _estimate_confidence(answer: str) -> float:
-    """Estimate response quality/confidence from answer text.
+_HEDGE_PHRASES = (
+    "i'm not sure", "i don't know", "uncertain", "unclear",
+    "cannot determine", "hard to say", "difficult to assess",
+)
 
-    Heuristic based on length, hedging language, and specificity.
-    Returns a float between 0.0 and 1.0.
+_SPECIFIC_TOKEN_RE = re.compile(r"\d+\.?\d*%|\d{4}-\d{2}|\$[\d,.]+")
+
+
+def answer_heuristic_score(answer: str) -> dict[str, Any]:
+    """Shape-of-the-text heuristic for an LLM answer, with its inputs.
+
+    This is NOT a model confidence and is deliberately not published under
+    that name (D-H9, docs/reference/CONFIDENCE_POLICY.md). Nothing in this
+    path is ever scored against an outcome, and the "specificity" term
+    rewards an answer for containing *more* `$`/`%` tokens — i.e. it scores
+    more invented numbers as better, on a hallucination-prone path.
+
+    It survives only as a text-shape rank, renamed, and it always ships the
+    three counts it was computed from so a reader can see what it measured.
+    Returns ``score: None`` for an empty answer (nothing to measure).
     """
     if not answer:
-        return 0.0
+        return {
+            "score": None,
+            "basis": "empty_answer",
+            "inputs": {"word_count": 0, "hedge_phrase_count": 0,
+                       "specific_token_count": 0},
+        }
 
-    score = 0.5  # base
-
-    # Length bonus (longer = more thorough)
     word_count = len(answer.split())
+    lower = answer.lower()
+    hedge_count = sum(1 for h in _HEDGE_PHRASES if h in lower)
+    specifics = len(_SPECIFIC_TOKEN_RE.findall(answer))
+
+    score = 0.5
     if word_count > 200:
         score += 0.15
     elif word_count > 100:
         score += 0.1
     elif word_count < 20:
         score -= 0.15
-
-    # Hedging penalty
-    hedges = ["i'm not sure", "i don't know", "uncertain", "unclear",
-              "cannot determine", "hard to say", "difficult to assess"]
-    lower = answer.lower()
-    hedge_count = sum(1 for h in hedges if h in lower)
     score -= hedge_count * 0.1
-
-    # Specificity bonus (numbers, percentages, dates)
-    specifics = len(re.findall(r"\d+\.?\d*%|\d{4}-\d{2}|\$[\d,.]+", answer))
     score += min(specifics * 0.05, 0.2)
 
-    return max(0.0, min(1.0, round(score, 2)))
+    return {
+        "score": max(0.0, min(1.0, round(score, 2))),
+        "basis": (
+            "text_shape: 0.5 base, length bonus, hedge penalty, "
+            "specific-token bonus (uncalibrated)"
+        ),
+        "inputs": {
+            "word_count": word_count,
+            "hedge_phrase_count": hedge_count,
+            "specific_token_count": specifics,
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+def _with_answer_heuristic(row: dict[str, Any]) -> dict[str, Any]:
+    """Replace the legacy `confidence` column with the renamed heuristic.
+
+    The column holds a text-shape score, not a model confidence, so it is
+    never served under the name `confidence` (D-H9). The score is recomputed
+    from the row's own `answer` text so the inputs shipped alongside it are
+    always the ones that produced it.
+    """
+    out = dict(row)
+    out.pop("confidence", None)
+    heuristic = answer_heuristic_score(out.get("answer") or "")
+    out["answer_heuristic_score"] = heuristic["score"]
+    out["answer_heuristic_basis"] = heuristic["basis"]
+    out["answer_heuristic_inputs"] = heuristic["inputs"]
+    return out
+
 
 def store_qa(
     question: str,
@@ -284,7 +325,7 @@ def store_qa(
     tags = _extract_tags(combined)
     tickers = _extract_tickers(combined)
     features = _extract_features(combined)
-    confidence = _estimate_confidence(answer)
+    heuristic = answer_heuristic_score(answer)
 
     from db import get_connection
 
@@ -303,7 +344,10 @@ def store_qa(
         "category": category,
         "tags": tags,
         "model": model,
-        "confidence": confidence,
+        # The legacy `knowledge_tree.confidence` column keeps taking the
+        # heuristic (no migration in this batch), but it is never served
+        # under that name again - see the read paths below.
+        "confidence": heuristic["score"],
         "features": features,
         "tickers": tickers,
         "parent_id": parent_id,
@@ -329,7 +373,9 @@ def store_qa(
         "tags": tags,
         "tickers": tickers,
         "features": features,
-        "confidence": confidence,
+        "answer_heuristic_score": heuristic["score"],
+        "answer_heuristic_basis": heuristic["basis"],
+        "answer_heuristic_inputs": heuristic["inputs"],
         "created_at": str(created_at) if created_at else None,
     }
 
@@ -389,7 +435,7 @@ def search_knowledge(
 
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(data_sql, params)
-            entries = [dict(row) for row in cur.fetchall()]
+            entries = [_with_answer_heuristic(row) for row in cur.fetchall()]
 
     return {"entries": entries, "total": total}
 
@@ -443,7 +489,7 @@ def get_related(question: str, limit: int = 5) -> list[dict[str, Any]]:
         import psycopg2.extras
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(sql, params)
-            return [dict(row) for row in cur.fetchall()]
+            return [_with_answer_heuristic(row) for row in cur.fetchall()]
 
 
 def get_knowledge_summary() -> dict[str, Any]:
@@ -549,7 +595,7 @@ def get_entry_by_id(entry_id: int) -> dict[str, Any] | None:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(sql, {"id": entry_id})
             row = cur.fetchone()
-            return dict(row) if row else None
+            return _with_answer_heuristic(row) if row else None
 
 
 def delete_entry(entry_id: int) -> bool:
