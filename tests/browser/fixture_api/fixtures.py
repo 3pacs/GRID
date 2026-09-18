@@ -30,6 +30,18 @@ Three scenarios, selected by SCENARIO in server.py:
 
 from __future__ import annotations
 
+import json
+import os
+
+_FIXTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+
+
+def _load_json_fixture(name: str) -> dict:
+    """Load a static JSON fixture file shipped next to this module."""
+    with open(os.path.join(_FIXTURE_DIR, name), encoding="utf-8") as fh:
+        return json.load(fh)
+
+
 TICKER = "TEST1"
 AS_OF_DATE = "2026-09-15"
 AS_OF_DATETIME = "2026-09-15T14:30:00+00:00"
@@ -339,6 +351,13 @@ def catalyst_timeline(ticker: str, scenario: str) -> dict:
     happen" reading, distinct from unscored), and a measured 0.0 value-impact
     that must render as a real number, not a blank/missing field.
     """
+    if ticker.upper() == "ACME":
+        # Supplied by the session that owns CatalystTimeline.jsx /
+        # valuation.py::catalyst_timeline (see README "Provenance of the
+        # ACME catalyst-timeline fixture"). Served in every scenario so the
+        # view's null-vs-zero contract can be checked regardless of scenario.
+        return _load_json_fixture("catalyst-timeline-ACME.json")
+
     if scenario == "empty":
         return {"ticker": ticker, "status": "ok", "events": [], "as_of": AS_OF_DATE}
 

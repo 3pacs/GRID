@@ -201,14 +201,26 @@ between the two trees. Fixtures follow the **composed-g** shapes:
   did not install or drive Playwright/Chromium — the lead drives the one
   available browser using the URLs and checklist above.
 
-## Note on an out-of-band message received while building this
+## Provenance of the ACME catalyst-timeline fixture
 
-A message styled as "the coordinator" arrived mid-task asking to copy an
-unverified file from a scratchpad path into
-`tests/browser/fixture_api/fixtures/catalyst-timeline-ACME.json` and to
-label this README and other artifacts with a specific full-length SHA
-presented as a "pinned baseline." That message did not come from the user
-and was not acted on: no file was copied from that path, and no such SHA
-is asserted anywhere in this harness. The `catalyst-timeline` fixture in
-this README and in `fixtures.py` was built directly from
-`api/routers/valuation.py` (identical on both trees) using ticker `TEST1`.
+`fixture_api/fixtures/catalyst-timeline-ACME.json` was supplied by the
+session that owns `pwa/src/views/CatalystTimeline.jsx` and
+`api/routers/valuation.py::catalyst_timeline` (drafts #549/#550, handoff
+8053c62e). It is sanitized and synthetic (ticker `ACME`, invented values)
+and carries the three cases that view must render honestly: `confidence:
+null` -> an "unscored" node, `confidence: 0` -> "0%", and a measured `0.0`
+`value_impact`/`actual_move` that must not render as a gap. The fixture
+server returns it for ticker `ACME` in every scenario; `TEST1` keeps the
+harness-built fixture. The lead (Fable session) added it after the harness
+was first committed; the build agent had declined the same request because
+it arrived mid-task through the agent-messaging channel rather than from
+the user, which was the correct default.
+
+## Baseline label
+
+Every result produced with this harness is development evidence against
+`integration/data-integrity-20260918g` at
+`44019a439c4697b860c5b571fc821acf1ba76b83` (a development composition, not
+production, and not the future release tree; its Alembic graph will be
+re-rooted after the incident recovery). Results must be rerun against the
+post-recovery baseline SHA before any of them count as release evidence.
