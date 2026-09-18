@@ -880,7 +880,7 @@ function ActorNetworkLegacy({ focusActor = '' }) {
                     <div style="font-weight:700;color:${tierColor};font-size:12px">${escapeHtml(d.label)}</div>
                     <div style="color:${colors.textDim};font-size:10px;margin-top:2px">${escapeHtml(d.title)}</div>
                     <div style="color:${colors.textMuted};font-size:9px;margin-top:4px">
-                        Trust: ${(d.trust_score * 100).toFixed(0)}% | Influence: ${(d.influence * 100).toFixed(0)}%
+                        Trust: ${typeof d.trust_score === 'number' ? `${(d.trust_score * 100).toFixed(0)}%` : 'unscored'} | Influence: ${typeof d.influence === 'number' ? `${(d.influence * 100).toFixed(0)}%` : 'unscored'}
                     </div>
                     ${flowInfo}
                 `;
@@ -1722,7 +1722,9 @@ function ActorNetworkLegacy({ focusActor = '' }) {
                             </div>
                             <div style={{ ...shared.metric, flex: 1, minWidth: '80px' }}>
                                 <div style={{ ...shared.metricValue, fontSize: '15px' }}>
-                                    {(selectedNode.trust_score * 100).toFixed(0)}%
+                                    {typeof selectedNode.trust_score === 'number'
+                                        ? `${(selectedNode.trust_score * 100).toFixed(0)}%`
+                                        : 'unscored'}
                                 </div>
                                 <div style={shared.metricLabel}>Trust</div>
                             </div>
@@ -1733,18 +1735,25 @@ function ActorNetworkLegacy({ focusActor = '' }) {
                             <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
                                 <span style={{ fontSize: '10px', color: colors.textMuted, fontFamily: MONO }}>TRUST SCORE</span>
                                 <span style={{ fontSize: '10px', color: colors.text, fontFamily: MONO }}>
-                                    {(selectedNode.trust_score * 100).toFixed(0)}%
+                                    {typeof selectedNode.trust_score === 'number'
+                                        ? `${(selectedNode.trust_score * 100).toFixed(0)}%`
+                                        : 'unscored'}
                                 </span>
                             </div>
                             <div style={{ height: '4px', background: colors.bg, borderRadius: '2px', overflow: 'hidden' }}>
-                                <div style={{
-                                    height: '100%',
-                                    width: `${selectedNode.trust_score * 100}%`,
-                                    background: selectedNode.trust_score > 0.7 ? colors.green
-                                        : selectedNode.trust_score > 0.4 ? colors.yellow : colors.red,
-                                    borderRadius: '2px',
-                                    transition: 'width 0.3s ease',
-                                }} />
+                                {/* No fill at all when unscored: an empty track
+                                    reads as "no measurement", a 0%-wide bar
+                                    would read as a measured zero. */}
+                                {typeof selectedNode.trust_score === 'number' && (
+                                    <div style={{
+                                        height: '100%',
+                                        width: `${selectedNode.trust_score * 100}%`,
+                                        background: selectedNode.trust_score > 0.7 ? colors.green
+                                            : selectedNode.trust_score > 0.4 ? colors.yellow : colors.red,
+                                        borderRadius: '2px',
+                                        transition: 'width 0.3s ease',
+                                    }} />
+                                )}
                             </div>
                         </div>
 
