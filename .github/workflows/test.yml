@@ -182,7 +182,13 @@ jobs:
           # database OR a missing table (the stamp gap above shows up here).
           DB_FILES='tests/(test_journal|test_pit|test_resolver|test_holder_deal_overlap|test_acquisition_decomposition|test_capital_flow_rollups|test_canvas_graph_state_store|test_canvas_predict|test_goal_queue|test_intelligence_search|test_investigation_evidence|test_realtime_freshness_probe|test_realtime_shutdown_semantics|test_parse_datasets_signals|test_reasoning_bank|test_hypothesis_kills|test_crypto_signals)\.py|tests/contracts/(test_dead_letter|test_migration)\.py'
           db_executed=$(grep -cE "(PASSED|FAILED|ERROR) +(${DB_FILES})::" /tmp/grid-pytest-output.txt || true)
-          db_skips=$(grep -ciE "^SKIPPED .*(PostgreSQL not available|Postgres not available|griddb not reachable|table missing|missing table|GRID_PG_INTEGRATION)" /tmp/grid-pytest-output.txt || true)
+          # Allow-list: tests/test_reasoning_bank.py::test_pg_round_trip_integration
+          # (GRID_PG_INTEGRATION=1) needs the pgvector Postgres extension
+          # (CAST(:embedding AS vector) + an HNSW index, migrations/0053) and a
+          # separately-wired GRID_DB_URL; the CI postgres:15 service image ships
+          # neither, so this one skip is expected here and excluded from the count
+          # below. Do not broaden this — no other skip is exempted.
+          db_skips=$(grep -iE "^SKIPPED .*(PostgreSQL not available|Postgres not available|griddb not reachable|table missing|missing table|GRID_PG_INTEGRATION)" /tmp/grid-pytest-output.txt | grep -vc "test_reasoning_bank.py:540: set GRID_PG_INTEGRATION=1 to run" || true)
           echo "database tests executed: ${db_executed}; skipped for a missing database or table: ${db_skips}"
           if [ "${db_skips}" != "0" ]; then
             echo "::error::${db_skips} database-gated test(s) skipped although the PostgreSQL service is up (missing database wiring, a hard-coded URL, or a table the stamped bootstrap does not create) — a green job must not imply coverage it skipped"
