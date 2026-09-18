@@ -112,51 +112,34 @@ PriceAccessor = Callable[[str, date], Optional[PricePoint]]
 
 
 def make_default_price_accessor(pit_store) -> PriceAccessor:
-    """Build the default PIT-safe price accessor backed by ``store/pit.py``.
+    """Build the default PIT-safe price accessor, backed by the explicit
+    price-series contract (``evaluation/prices.py``, workstream W3d).
 
-    Reads through a caller-supplied ``PITStore`` (``store/pit.py``), never
-    a raw table. The accessor resolves ``instrument`` to a
-    ``feature_registry`` row by exact ``name`` match (equity-close features
-    are registered under the ticker itself, e.g. ``"AAPL"``, or a
-    ``"<TICKER>_CLOSE"`` naming convention — both are tried) and then calls
-    ``PITStore.get_pit([feature_id], as_of_date=as_of, vintage_policy="LATEST_AS_OF")``,
-    taking the row with the latest ``obs_date <= as_of``. This guarantees no
-    row with ``obs_date`` or ``release_date`` beyond ``as_of`` is ever used —
-    i.e. never beyond the requested horizon.
+    This used to resolve ``instrument`` to a ``feature_registry`` row by
+    guessing at names (``instrument``, ``f"{instrument}_CLOSE"``,
+    ``f"{instrument}_close"``) and taking whichever one a bare
+    ``LIMIT 1`` query happened to return first — never distinguishing an
+    explicit mapping from a lucky string match, and not even deterministic
+    about which row won when more than one guess matched. It now delegates
+    entirely to :class:`evaluation.prices.PriceSeriesContract` (the SAME
+    candidate-name rule the GRID app itself uses for a ticker's close,
+    ``api/routers/watchlist_helpers.py::_resolve_feature_names``) and
+    :class:`evaluation.prices.PITPriceAccessor` (PIT-safe via
+    ``store/pit.py``, ``LATEST_AS_OF`` policy) — see that module's
+    docstring and ``docs/reference/PRICE_SERIES_CONTRACT.md`` for the full
+    contract, including its explicit failure modes (unmapped instrument,
+    ambiguous mapping, price outside sanity bounds).
 
     This is intentionally a thin default. Callers evaluating real signals
-    should usually inject their own accessor (e.g. one backed by a proper
-    OHLC bars table) — the important contract is PIT-safety, not this
-    particular feature-registry lookup.
+    may still inject their own accessor — the important contract is
+    PIT-safety plus an explicit, never-guessed instrument mapping, not this
+    particular default's construction.
     """
 
-    from sqlalchemy import text  # local import: keep this module DB-optional
+    from evaluation.prices import PITPriceAccessor, PriceSeriesContract
 
-    def _accessor(instrument: str, as_of: date) -> Optional[PricePoint]:
-        candidate_names = (instrument, f"{instrument}_CLOSE", f"{instrument}_close")
-        with pit_store.engine.connect() as conn:
-            row = conn.execute(
-                text(
-                    "SELECT id FROM feature_registry WHERE name = ANY(:names) LIMIT 1"
-                ),
-                {"names": list(candidate_names)},
-            ).fetchone()
-        if row is None:
-            return None
-        feature_id = row[0]
-        df = pit_store.get_pit([feature_id], as_of_date=as_of, vintage_policy="LATEST_AS_OF")
-        if df.empty:
-            return None
-        df = df.sort_values("obs_date")
-        last = df.iloc[-1]
-        obs_date = last["obs_date"]
-        if isinstance(obs_date, str):
-            obs_date = date.fromisoformat(obs_date)
-        elif hasattr(obs_date, "date"):
-            obs_date = obs_date.date()
-        return PricePoint(price=float(last["value"]), bar_date=obs_date, basis="close")
-
-    return _accessor
+    contract = PriceSeriesContract(pit_store.engine)
+    return PITPriceAccessor(pit_store.engine, contract)
 
 
 # ---------------------------------------------------------------------------
