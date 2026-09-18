@@ -1,0 +1,49 @@
+{
+  "tree_label": "verify-aefd0ae9-home-snapshots",
+  "pwa_dir": "C:/Users/owner/dev/GRID-fable-wt-verify/pwa",
+  "generated_at": "2026-09-18T10:40:11.409Z",
+  "results": [
+    {
+      "tree_label": "verify-aefd0ae9-home-snapshots",
+      "harness_commit": "b09bb9a89fa28f5f544aaaa8ca62a8f2a11ea938",
+      "pwa_dir": "C:/Users/owner/dev/GRID-fable-wt-verify/pwa",
+      "pwa_commit": "aefd0ae96646443b7cdbecfa9e7ecf34bce8942d",
+      "role": "contributor",
+      "scenario": "empty",
+      "started_at": "2026-09-18T10:39:48.617Z",
+      "journeys": {
+        "home": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 17,
+          "evidence": "complete"
+        }
+      },
+      "finished_at": "2026-09-18T10:39:57.981Z"
+    },
+    {
+      "tree_label": "verify-aefd0ae9-home-snapshots",
+      "harness_commit": "b09bb9a89fa28f5f544aaaa8ca62a8f2a11ea938",
+      "pwa_dir": "C:/Users/owner/dev/GRID-fable-wt-verify/pwa",
+      "pwa_commit": "aefd0ae96646443b7cdbecfa9e7ecf34bce8942d",
+      "role": "contributor",
+      "scenario": "healthy",
+      "started_at": "2026-09-18T10:40:02.464Z",
+      "journeys": {
+        "home": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 3,
+          "evidence": "complete"
+        }
+      },
+      "finished_at": "2026-09-18T10:40:10.710Z"
+    }
+  ]
+}

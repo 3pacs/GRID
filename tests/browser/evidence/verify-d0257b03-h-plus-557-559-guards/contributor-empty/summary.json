@@ -1,0 +1,21 @@
+{
+  "tree_label": "verify-d0257b03-h-plus-557-559-guards",
+  "harness_commit": "726f58f7252c35b0baec777323746807ca7d157d",
+  "pwa_dir": "C:/Users/owner/dev/GRID-fable-wt-verify/pwa",
+  "pwa_commit": "d0257b03f3935c3cb519294ef782a0af1cc3c785",
+  "role": "contributor",
+  "scenario": "empty",
+  "started_at": "2026-09-18T10:10:28.360Z",
+  "journeys": {
+    "ten-year": {
+      "crashed": false,
+      "console_errors": 1,
+      "api_non_2xx": [],
+      "allow_crash": false,
+      "ready": "ok",
+      "ready_wait_ms": 1,
+      "evidence": "complete"
+    }
+  },
+  "finished_at": "2026-09-18T10:10:36.594Z"
+}

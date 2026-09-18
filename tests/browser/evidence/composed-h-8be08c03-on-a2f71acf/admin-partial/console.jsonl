@@ -1,0 +1,21 @@
+{"ts":"2026-09-18T09:46:43.526Z","role":"admin","scenario":"partial","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:46:43.538Z","role":"admin","scenario":"partial","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:46:43.638Z","role":"admin","scenario":"partial","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:46:43.675Z","role":"admin","scenario":"partial","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:46:43.678Z","role":"admin","scenario":"partial","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:46:43.724Z","role":"admin","scenario":"partial","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:46:43.753Z","role":"admin","scenario":"partial","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:46:43.754Z","role":"admin","scenario":"partial","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:46:43.822Z","role":"admin","scenario":"partial","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:46:43.824Z","role":"admin","scenario":"partial","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:46:43.825Z","role":"admin","scenario":"partial","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:46:43.892Z","role":"admin","scenario":"partial","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:46:43.921Z","role":"admin","scenario":"partial","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:46:43.954Z","role":"admin","scenario":"partial","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:46:43.987Z","role":"admin","scenario":"partial","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:46:44.025Z","role":"admin","scenario":"partial","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:46:46.825Z","role":"admin","scenario":"partial","type":"error","text":"Each child in a list should have a unique \"key\" prop.%s%s See https://react.dev/link/warning-keys for more information. \n\nCheck the render method of `FinvizPanel`. "}
+{"ts":"2026-09-18T09:46:46.876Z","role":"admin","scenario":"partial","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:46:48.574Z","role":"admin","scenario":"partial","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:46:49.790Z","role":"admin","scenario":"partial","type":"error","text":"%s a style property during rerender (%s) when a conflicting property is set (%s) can lead to styling bugs. To avoid this, don't mix shorthand and non-shorthand properties for the same value; instead, replace the shorthand with separate values. Updating padding paddingTop"}
+{"ts":"2026-09-18T09:46:50.325Z","role":"admin","scenario":"partial","type":"error","text":"%s a style property during rerender (%s) when a conflicting property is set (%s) can lead to styling bugs. To avoid this, don't mix shorthand and non-shorthand properties for the same value; instead, replace the shorthand with separate values. Removing paddingTop padding"}
