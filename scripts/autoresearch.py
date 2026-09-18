@@ -127,6 +127,44 @@ Output ONE hypothesis in this exact JSON format — nothing else:
 _ortho_cache: list[int] | None = None
 
 
+class AutoresearchDataError(RuntimeError):
+    """Raised when a DB query in the autoresearch data-loading phase fails.
+
+    Wraps the underlying driver/DB exception (e.g. a psycopg2 error from a
+    bad column reference or a lost connection) so callers get a typed,
+    identifiable signal naming which phase failed, instead of a bare
+    exception whose origin is hard to trace once it has bubbled up through
+    ``maybe_run_autoresearch``'s generic ``except Exception`` handler.
+    """
+
+    def __init__(self, phase: str, original: Exception):
+        self.phase = phase
+        self.original = original
+        super().__init__(f"autoresearch data load failed in phase '{phase}': {original}")
+
+
+def _failed_result(phase: str, error: str) -> dict[str, Any]:
+    """Build the structured failure result returned by ``run_autoresearch``.
+
+    Keeps the same key set as a successful run (see the return at the end
+    of ``run_autoresearch``) so a caller — or a future status surface —
+    can read ``status``/``phase``/``error`` to distinguish "ran and failed"
+    from "ran and passed/failed hypotheses", instead of the failure being
+    indistinguishable from an ordinary zero-iteration run.
+    """
+    return {
+        "status": "failed",
+        "phase": phase,
+        "error": error,
+        "iterations_run": 0,
+        "iterations": 0,
+        "best_result": None,
+        "best_sharpe": None,
+        "all_attempts": [],
+        "passed": False,
+    }
+
+
 def _select_orthogonal_features(cur, max_features: int = 13, corr_threshold: float = 0.7) -> list[int]:
     """Select a set of uncorrelated features using greedy elimination.
 
@@ -297,6 +335,40 @@ def get_feature_name_map(cur) -> dict[int, str]:
     return {r[0]: r[1] for r in cur.fetchall()}
 
 
+def _load_research_context(cur) -> dict[str, Any]:
+    """Load the feature list, name map, and market snapshot that seed
+    hypothesis generation.
+
+    Each DB call is wrapped individually so that a query failure (a bad
+    column reference, a lost connection, a permissions error, ...) raises
+    a typed ``AutoresearchDataError`` naming which phase failed, rather
+    than an unlabeled driver exception. ``run_autoresearch`` catches this
+    and turns it into an explicit, structured failure result instead of
+    letting it propagate up to be logged as a single generic warning by
+    ``maybe_run_autoresearch`` (scripts/hermes_fixers.py).
+    """
+    try:
+        feature_list = get_feature_list(cur)
+    except Exception as exc:  # noqa: BLE001 - intentionally broad, re-typed below
+        raise AutoresearchDataError("feature_list", exc) from exc
+
+    try:
+        feature_names = get_feature_name_map(cur)
+    except Exception as exc:  # noqa: BLE001
+        raise AutoresearchDataError("feature_name_map", exc) from exc
+
+    try:
+        market_snapshot = get_market_snapshot(cur)
+    except Exception as exc:  # noqa: BLE001
+        raise AutoresearchDataError("market_snapshot", exc) from exc
+
+    return {
+        "feature_list": feature_list,
+        "feature_names": feature_names,
+        "market_snapshot": market_snapshot,
+    }
+
+
 def parse_hypothesis_json(text: str) -> dict[str, Any] | None:
     """Extract hypothesis JSON from LLM output."""
     # Try to find JSON block
@@ -444,7 +516,7 @@ def run_autoresearch(
 
     if not ollama.is_available:
         log.error("Ollama not available — cannot run autoresearch")
-        return {"error": "Ollama not available"}
+        return _failed_result(phase="ollama_availability", error="Ollama not available")
 
     pg = psycopg2.connect(
         host=settings.DB_HOST,
@@ -456,9 +528,22 @@ def run_autoresearch(
     pg.autocommit = True
     cur = pg.cursor()
 
-    feature_list = get_feature_list(cur)
-    feature_names = get_feature_name_map(cur)
-    market_snapshot = get_market_snapshot(cur)
+    try:
+        ctx = _load_research_context(cur)
+    except AutoresearchDataError as exc:
+        # Reserve log.error for unhandled application bugs (CLAUDE.md):
+        # a DB query failing here means the code and the live schema have
+        # drifted apart, which is exactly that class of bug.
+        log.error(
+            "Autoresearch data load failed in phase '{p}': {e}",
+            p=exc.phase, e=exc.original,
+        )
+        pg.close()
+        return _failed_result(phase=exc.phase, error=str(exc.original))
+
+    feature_list = ctx["feature_list"]
+    feature_names = ctx["feature_names"]
+    market_snapshot = ctx["market_snapshot"]
 
     attempts: list[dict[str, Any]] = []
     best_result: dict[str, Any] | None = None
@@ -696,7 +781,14 @@ def run_autoresearch(
     log.info("=" * 70)
 
     return {
+        "status": "ok",
+        # "iterations_run" is the long-standing key (read by scripts/notify.py).
+        # "iterations" is what scripts/hermes_fixers.py::maybe_run_autoresearch
+        # actually reads into state.hypotheses_tested via result.get("iterations", 0).
+        # That mismatch meant hypotheses_tested never advanced even on a fully
+        # successful run; both keys are populated here so it does.
         "iterations_run": len(attempts),
+        "iterations": len(attempts),
         "best_result": best_result,
         "best_sharpe": best_sharpe,
         "all_attempts": attempts,
