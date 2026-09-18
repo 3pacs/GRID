@@ -603,7 +603,7 @@ function PriorityRail({ items, isMobile, routeLabels, onNavigate }) {
                                     fontFamily: mono,
                                     textTransform: 'uppercase',
                                 }}>
-                                    EDGE {Math.round(item.expected_edge_pct || 0)}%
+                                    RANK {item.heuristic_rank ?? '—'}
                                 </span>
                             </div>
 
@@ -698,6 +698,7 @@ function PriorityRail({ items, isMobile, routeLabels, onNavigate }) {
 
 function OpportunityCard({ item, routeLabel, routeLabels, isMobile, onNavigate }) {
     const statusMeta = STATUS_META[item.status] || STATUS_META.watch;
+    const scoreInputs = Array.isArray(item.heuristic_confidence_inputs) ? item.heuristic_confidence_inputs : [];
     const qualityMeta = QUALITY_META[item.quality_label] || QUALITY_META.mixed;
     const targetLabel = routeLabel || 'Next clue chain';
 
@@ -775,7 +776,7 @@ function OpportunityCard({ item, routeLabel, routeLabels, isMobile, onNavigate }
                                 {item.sector_focus}
                             </span>
                         ) : null}
-                        {typeof item.confidence === 'number' ? (
+                        {typeof item.heuristic_confidence === 'number' ? (
                             <span style={{
                                 display: 'inline-flex',
                                 alignItems: 'center',
@@ -790,7 +791,7 @@ function OpportunityCard({ item, routeLabel, routeLabels, isMobile, onNavigate }
                                 letterSpacing: 0,
                                 textTransform: 'uppercase',
                             }}>
-                                CONF {item.confidence}%
+                                HEURISTIC {item.heuristic_confidence}
                             </span>
                         ) : null}
                         {item.quality_label ? (
@@ -860,14 +861,56 @@ function OpportunityCard({ item, routeLabel, routeLabels, isMobile, onNavigate }
                         background: colors.bg,
                     }}>
                         <div style={{ color: colors.textMuted, fontSize: '10px', fontFamily: mono, fontWeight: 800 }}>
-                            EDGE
+                            HEUR RANK
                         </div>
                         <div style={{ marginTop: '6px', color: statusMeta.color, fontSize: '24px', fontFamily: mono, fontWeight: 900 }}>
-                            {Math.round(item.expected_edge_pct)}%
+                            {typeof item.heuristic_rank === 'number' ? item.heuristic_rank : '—'}
+                        </div>
+                        <div style={{ marginTop: '4px', color: colors.textMuted, fontSize: '9px', fontFamily: mono }}>
+                            {item.basis === 'playbook_prior' ? 'PLAYBOOK PRIOR' : 'UNRANKED'}
                         </div>
                     </div>
                 </div>
             </div>
+
+            {scoreInputs.length ? (
+                <div style={{
+                    borderTop: `1px solid ${colors.borderSubtle}`,
+                    paddingTop: '14px',
+                    minWidth: 0,
+                }}>
+                    <div style={{ ...shared.sectionTitle, marginBottom: '6px' }}>
+                        How The Heuristic Score Was Built
+                    </div>
+                    <div style={{ color: colors.textMuted, fontSize: '11px', lineHeight: 1.5, marginBottom: '8px' }}>
+                        Hand-tuned point awards ranked against a playbook prior. Not a backtest, not a
+                        return, and not scored against outcomes.
+                    </div>
+                    <div style={{ display: 'grid', gap: '4px' }}>
+                        {scoreInputs.map((part) => (
+                            <div
+                                key={part.component}
+                                style={{
+                                    display: 'flex',
+                                    justifyContent: 'space-between',
+                                    gap: '10px',
+                                    fontFamily: mono,
+                                    fontSize: '11px',
+                                    color: colors.textDim,
+                                }}
+                            >
+                                <span style={{ overflowWrap: 'anywhere' }}>
+                                    {String(part.component).replace(/_/g, ' ')}
+                                    {part.detail ? ` — ${part.detail}` : ''}
+                                </span>
+                                <span style={{ color: '#E8F0F8', fontWeight: 800, flexShrink: 0 }}>
+                                    {part.points > 0 ? `+${part.points}` : part.points}
+                                </span>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            ) : null}
 
             <div style={{
                 borderTop: `1px solid ${colors.borderSubtle}`,
@@ -1309,7 +1352,11 @@ export default function EdgeScanner({ onNavigate }) {
                     <StatCard label="Arming" value={summary.arming_count ?? 0} tone={colors.yellow} />
                     <StatCard label="Live" value={summary.live_count ?? 0} tone={colors.accent} />
                     <StatCard label="Gaps" value={summary.coverage_gap_count ?? coverageGaps.length} tone={colors.red} />
-                    <StatCard label="Avg Edge" value={`${Math.round(summary.avg_expected_edge_pct || 0)}%`} tone={'#E8F0F8'} />
+                    <StatCard
+                        label="Avg Heur Rank"
+                        value={typeof summary.avg_heuristic_rank === 'number' ? Math.round(summary.avg_heuristic_rank) : '—'}
+                        tone={'#E8F0F8'}
+                    />
                 </div>
 
                 {!loading && priorityRailItems.length ? (

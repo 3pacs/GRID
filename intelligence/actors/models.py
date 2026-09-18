@@ -38,7 +38,14 @@ class Actor:
 
     # Metadata
     data_sources: list[str] = field(default_factory=list)
-    credibility: str = "inferred"  # 'hard_data', 'public_record', 'rumor', 'inferred'
+    # 'public_record', 'rumor', 'inferred', or 'curated_estimate' for a
+    # figure typed in by hand (see intelligence/actors/seed_data.py).
+    credibility: str = "inferred"
+
+    # Provenance — 'seed' (hand-curated row from seed_data.py) or 'observed'
+    # (written by an ingestion path). See intelligence/actors/provenance.py.
+    provenance: str = "observed"
+    provenance_as_of: str | None = None   # curation vintage; None when observed
 
 
 @dataclass
