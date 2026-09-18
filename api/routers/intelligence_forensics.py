@@ -419,7 +419,19 @@ async def get_export_controls(
                 result["revenue_impact"] = impact
             except Exception as exc:
                 log.debug("Revenue impact assessment failed: {e}", e=str(exc))
-                result["revenue_impact"] = None
+                # Shaped like every other revenue_impact record: as_of and
+                # basis are always present, the estimate is never a number
+                # we cannot stand behind.
+                result["revenue_impact"] = {
+                    "ticker": ticker.strip().upper(),
+                    "risk_level": "UNKNOWN",
+                    "estimated_revenue_at_risk_pct": None,
+                    "china_revenue_pct": None,
+                    "as_of": None,
+                    "basis": "assessment_failed",
+                    "data_source": "unavailable",
+                    "error": str(exc),
+                }
 
         return result
 
@@ -454,7 +466,12 @@ async def get_export_control_impact(
     except Exception as exc:
         log.warning("Export control impact endpoint failed: {e}", e=str(exc))
         return {
-            "ticker": ticker,
+            "ticker": ticker.strip().upper(),
             "risk_level": "UNKNOWN",
+            "estimated_revenue_at_risk_pct": None,
+            "china_revenue_pct": None,
+            "as_of": None,
+            "basis": "assessment_failed",
+            "data_source": "unavailable",
             "error": str(exc),
         }
