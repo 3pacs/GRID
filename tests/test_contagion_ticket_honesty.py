@@ -136,8 +136,16 @@ class TestConfidenceWithoutHistory:
     def test_placeholder_constant_is_gone(self):
         assert not hasattr(ctt, "DEFAULT_CONFIDENCE_NO_HISTORY")
 
-    def test_null_confidence_is_not_journalled_as_a_placeholder(self):
-        """The journal is immutable — a fabricated 0.5 there is permanent."""
+    def test_null_confidence_is_journalled_as_unscored_not_as_a_placeholder(self):
+        """The journal is immutable — a fabricated 0.5 there is permanent.
+
+        Batch 3b refused to write the row at all. Revision
+        ``journal_unscored_conf_0918`` gives the journal an explicit third
+        state, so the audit record is written with ``state_confidence`` NULL
+        and a mandatory reason. The invariant under test is unchanged: no
+        number is invented. What changed is that the decision is no longer
+        silently absent from the permanent record.
+        """
         engine = _make_engine(
             prediction_row=_prediction_row(),
             signal_row=_signal_row(),
@@ -148,8 +156,13 @@ class TestConfidenceWithoutHistory:
         with patch("journal.log.DecisionJournal", MagicMock(return_value=fake_journal)):
             tickets = _tickets(engine, journal=True)
 
-        fake_journal.log_decision.assert_not_called()
-        assert "journal_id" not in tickets[0]
+        fake_journal.log_decision.assert_called_once()
+        kwargs = fake_journal.log_decision.call_args.kwargs
+        assert kwargs["state_confidence"] is None
+        # The specific number that used to be written here.
+        assert kwargs["state_confidence"] != 0.5
+        assert "unscored" in kwargs["confidence_reason"]
+        assert tickets[0]["journal_id"] == 4242
 
 
 # ── C-H5: no measured IV means no ticket ───────────────────────────────────
