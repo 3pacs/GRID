@@ -199,7 +199,16 @@ class MarketBriefingEngine:
                                 "ticker": e.get("ticker"),
                                 "direction": e.get("signal_type"),
                                 "sources": e.get("source_count"),
-                                "confidence": round(e.get("combined_confidence", 0), 3),
+                                "scored_sources": e.get("scored_source_count"),
+                                # None when no source in the event is scored:
+                                # the briefing says "unscored", it does not
+                                # round a missing measurement to 0.
+                                "confidence": (
+                                    round(e["combined_confidence"], 3)
+                                    if e.get("combined_confidence") is not None
+                                    else None
+                                ),
+                                "confidence_basis": e.get("confidence_basis"),
                                 "source_types": [s["source_type"] for s in e.get("sources", [])],
                             }
                             for e in convergence[:5]
