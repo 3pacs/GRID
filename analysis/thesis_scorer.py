@@ -50,6 +50,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from ingestion.altdata.fed_liquidity import RRPONTSYD_TO_MILLIONS
+
 
 # ── Constants ───────────────────────────────────────────────────────────
 
@@ -143,7 +145,8 @@ def _score_fed_liquidity(engine: Engine, accuracy: float) -> dict:
                     0, 0, "no data", "", "No Fed balance sheet data available.",
                     status="no_data", historical_accuracy=accuracy)
 
-            net_liq = float(bs[0]) - (float(rr[0]) if rr else 0) - (float(tga[0]) if tga else 0)
+            # RRPONTSYD is billions; WALCL/WTREGEN are millions
+            net_liq = float(bs[0]) - (float(rr[0]) * RRPONTSYD_TO_MILLIONS if rr else 0) - (float(tga[0]) if tga else 0)
             pull_ts = bs[1] if bs[1] else datetime.now(timezone.utc)
             age_hours = (datetime.now(timezone.utc) - pull_ts.replace(tzinfo=timezone.utc)).total_seconds() / 3600 if hasattr(pull_ts, 'replace') else None
 
@@ -173,7 +176,8 @@ def _score_fed_liquidity(engine: Engine, accuracy: float) -> dict:
                     "need 30d history", "Current net liquidity known but no 30-day baseline.",
                     data_age_hours=age_hours, historical_accuracy=accuracy, status="stale")
 
-            net_liq_30 = float(bs_30[0]) - (float(rr_30[0]) if rr_30 else 0) - (float(tga_30[0]) if tga_30 else 0)
+            # RRPONTSYD is billions; WALCL/WTREGEN are millions
+            net_liq_30 = float(bs_30[0]) - (float(rr_30[0]) * RRPONTSYD_TO_MILLIONS if rr_30 else 0) - (float(tga_30[0]) if tga_30 else 0)
             change = net_liq - net_liq_30
 
             # Score: linear scale within bands

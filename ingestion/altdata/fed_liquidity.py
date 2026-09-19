@@ -23,7 +23,7 @@ Already pulled by fred.py (reused here from raw_series):
 - WTREGEN — TGA balance (weekly)
 
 Derived features stored as COMPUTED:* series:
-- fed_net_liquidity = WALCL - WTREGEN - RRPONTSYD
+- fed_net_liquidity = WALCL - WTREGEN - (RRPONTSYD * 1000)   [all in millions USD]
 - fed_net_liquidity_change_1w = week-over-week change
 - fed_net_liquidity_change_1m = month-over-month change
 - reverse_repo_pct_of_peak = current RRP / max(RRP history)
@@ -42,6 +42,26 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, retry_on_failure
+
+# FRED publishes RRPONTSYD in BILLIONS of USD while WALCL and WTREGEN are in
+# MILLIONS of USD. Every net-liquidity combination must scale RRP by this
+# factor first; combining the raw values understates the RRP drain by 1000x.
+RRPONTSYD_TO_MILLIONS: float = 1_000.0
+
+
+def net_liquidity_millions(
+    walcl_millions: float,
+    wtregen_millions: float,
+    rrpontsyd_billions: float,
+) -> float:
+    """Return Fed net liquidity in millions of USD.
+
+    ``walcl_millions`` and ``wtregen_millions`` are the raw FRED values
+    (millions). ``rrpontsyd_billions`` is the raw FRED value (billions) and
+    is converted to millions here before subtraction.
+    """
+    return walcl_millions - wtregen_millions - rrpontsyd_billions * RRPONTSYD_TO_MILLIONS
+
 
 # FRED series this puller is responsible for fetching directly.
 # WALCL and WTREGEN are already in fred.py's FRED_SERIES_LIST,
@@ -369,7 +389,7 @@ class FedLiquidityPuller(BasePuller):
         """Compute derived liquidity features from raw series data.
 
         Reads WALCL, WTREGEN, and RRPONTSYD from raw_series and computes:
-        - fed_net_liquidity = WALCL - WTREGEN - RRPONTSYD
+        - fed_net_liquidity = WALCL - WTREGEN - (RRPONTSYD * 1000)   [all in millions USD]
         - fed_net_liquidity_change_1w = 7-day change
         - fed_net_liquidity_change_1m = 30-day change
         - reverse_repo_pct_of_peak = current / max(historical)
@@ -418,7 +438,7 @@ class FedLiquidityPuller(BasePuller):
                 last_r = rrp[d]
 
             if last_w is not None and last_t is not None and last_r is not None:
-                net_liq[d] = last_w - last_t - last_r
+                net_liq[d] = net_liquidity_millions(last_w, last_t, last_r)
 
         # Convert to sorted list for temporal lookups
         net_liq_dates = sorted(net_liq.keys())
@@ -437,9 +457,11 @@ class FedLiquidityPuller(BasePuller):
                         obs_date=d,
                         value=net_liq[d],
                         raw_payload={
-                            "walcl": walcl.get(d),
-                            "wtregen": wtregen.get(d),
-                            "rrpontsyd": rrp.get(d),
+                            "walcl_millions": walcl.get(d),
+                            "wtregen_millions": wtregen.get(d),
+                            "rrpontsyd_billions": rrp.get(d),
+                            "rrpontsyd_millions": (rrp[d] * RRPONTSYD_TO_MILLIONS) if d in rrp else None,
+                            "units": "millions_usd",
                         },
                     )
                     nl_rows += 1
