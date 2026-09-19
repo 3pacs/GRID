@@ -36,6 +36,27 @@ from scripts.smoke_dad_path import (
     worst_status,
 )
 
+
+# step_alerts_db_count/step_freshness/mint_contributor_token delete
+# "config"/"db"/"api.*" from sys.modules unconditionally as a side effect of
+# being called at all (scripts/smoke_dad_path.py:728-730 and similar) --
+# even via smoke.run(), which now calls step_alerts_db_count unconditionally
+# too. Backend Tests runs the whole suite in one pytest process, so leaking
+# that deletion breaks unrelated test files' own "config"/"db" imports.
+# Autoused so every test in this file is protected.
+@pytest.fixture(autouse=True)
+def _protect_shared_module_cache():
+    tracked = lambda: {  # noqa: E731
+        k: v for k, v in sys.modules.items() if k in ("config", "db") or k.startswith("api.")
+    }
+    snapshot = tracked()
+    yield
+    for k in tracked().keys() - snapshot.keys():
+        del sys.modules[k]
+    for k, v in snapshot.items():
+        sys.modules[k] = v
+
+
 # ── validate_widget_types ────────────────────────────────────────────────
 
 
@@ -416,6 +437,10 @@ class TestRunExitCodeWhenBlocked:
         monkeypatch.setattr(smoke, "step_freshness", lambda release_dir: StepResult("freshness", "ok"))
         monkeypatch.setattr(smoke, "step_logs", lambda: StepResult("logs", "ok"))
         monkeypatch.setattr(smoke, "step_deploy_tree", lambda release_dir: StepResult("deploy_tree", "ok"))
+        monkeypatch.setattr(
+            smoke, "step_alerts_db_count",
+            lambda release_dir, label: StepResult(f"alerts_count:{label}", "blocked", None, "n/a", {"count": None}),
+        )
 
         args = argparse.Namespace(base_url="http://x", release_dir=str(tmp_path), budget_ms=5000, strict=False)
         exit_code, report, result = smoke.run(args)

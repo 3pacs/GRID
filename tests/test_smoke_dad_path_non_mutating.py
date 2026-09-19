@@ -72,6 +72,30 @@ from scripts.smoke_dad_path import (
 
 SMOKE_SOURCE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "smoke_dad_path.py"
 
+# step_alerts_db_count (like the pre-existing step_freshness/
+# mint_contributor_token it copies its connection style from) deletes
+# "config"/"db"/"api.*" from sys.modules UNCONDITIONALLY, before it even
+# checks whether release_dir exists (see scripts/smoke_dad_path.py:728-730)
+# -- a real, if latent, production behavior that every test in this file
+# calling the real step_alerts_db_count/smoke.run() can trigger. Backend
+# Tests runs the *whole* suite in one pytest process, so leaking that
+# deletion breaks unrelated files (tests/contracts/test_api_contracts.py
+# started failing DB auth once a stale-looking sys.modules["db"]/["config"]
+# forced a fresh, differently-configured reimport mid-session). Autoused so
+# every test in this file is protected, not just the ones that call the
+# real function directly.
+@pytest.fixture(autouse=True)
+def _protect_shared_module_cache():
+    tracked = lambda: {  # noqa: E731
+        k: v for k, v in sys.modules.items() if k in ("config", "db") or k.startswith("api.")
+    }
+    snapshot = tracked()
+    yield
+    for k in tracked().keys() - snapshot.keys():
+        del sys.modules[k]
+    for k, v in snapshot.items():
+        sys.modules[k] = v
+
 
 # ── (i) the non-mutating guard itself ────────────────────────────────────
 
@@ -586,6 +610,16 @@ class TestMutatingModeRefusesToStartEndToEnd:
         monkeypatch.setattr(smoke, "step_freshness", lambda release_dir: StepResult("freshness", "ok"))
         monkeypatch.setattr(smoke, "step_logs", lambda: StepResult("logs", "ok"))
         monkeypatch.setattr(smoke, "step_deploy_tree", lambda release_dir: StepResult("deploy_tree", "ok"))
+        # step_alerts_db_count doesn't gate on client.token the way
+        # step_composer/step_widget_data do (it takes release_dir, not a
+        # Client) -- with a real, existing tmp_path and no mock it would
+        # actually import the real repo db.py and attempt a live DB
+        # connection. Mock it explicitly; this test is about the mode gate,
+        # not the alert-count invariant.
+        monkeypatch.setattr(
+            smoke, "step_alerts_db_count",
+            lambda release_dir, label: StepResult(f"alerts_count:{label}", "blocked", None, "n/a", {"count": None}),
+        )
 
         args = argparse.Namespace(
             base_url="http://x", release_dir=str(tmp_path), budget_ms=5000, strict=False,
