@@ -340,7 +340,11 @@ class OperatorState:
         self.last_forced_flow_brief: datetime | None = None  # Daily forced-flow waterfall briefing ~06:30 UTC
         self.last_contagion_backtest: datetime | None = None  # Daily contagion backtest at 5 AM
         self.last_contagion_feedback: datetime | None = None  # Daily contagion feedback loop right after backtest
-        self.last_sector_health: datetime | None = None  # Daily sector health snapshot at 3 AM UTC
+        self.last_sector_health: datetime | None = None  # Daily sector health snapshot, due-period opens 3 AM UTC (marks the due period done — success or no_eligible_sectors)
+        self.last_sector_health_attempt: datetime | None = None  # Last sector-health attempt (success or failure) — drives retry backoff
+        self.sector_health_attempt_count: int = 0  # Attempts made in the current sector-health due period — capped, reset each new period
+        self.last_sector_health_outcome: str | None = None  # "success" | "no_eligible_sectors" | "failure" — see _maybe_run_sector_health_snapshot
+        self.sector_health_attempt_token: int = 0  # Incremented at each attempt start; a worker's result is only committed if this still matches at completion (guards against an abandoned _run_with_timeout worker writing stale state after a later cycle's attempt has already started)
         self.last_active_hypo_scoring: datetime | None = None  # Periodic batch scoring of overdue active hypos (30 min)
         self.last_earnings_calendar_sync: datetime | None = None  # earnings_events → earnings_calendar back-compat sync (30 min)
         self.last_resolution: datetime | None = None  # raw_series → resolved_series watermark (start time of the last clean resolver run)
@@ -408,6 +412,9 @@ class OperatorState:
             "last_contagion_backtest": self.last_contagion_backtest.isoformat() if self.last_contagion_backtest else None,
             "last_contagion_feedback": self.last_contagion_feedback.isoformat() if self.last_contagion_feedback else None,
             "last_sector_health": self.last_sector_health.isoformat() if self.last_sector_health else None,
+            "last_sector_health_attempt": self.last_sector_health_attempt.isoformat() if self.last_sector_health_attempt else None,
+            "sector_health_attempt_count": self.sector_health_attempt_count,
+            "last_sector_health_outcome": self.last_sector_health_outcome,
             "last_active_hypo_scoring": self.last_active_hypo_scoring.isoformat() if self.last_active_hypo_scoring else None,
             "last_earnings_calendar_sync": self.last_earnings_calendar_sync.isoformat() if self.last_earnings_calendar_sync else None,
             "last_resolution": self.last_resolution.isoformat() if self.last_resolution else None,
@@ -450,7 +457,7 @@ class OperatorState:
             "last_lever_pullers", "last_actor_wealth", "last_signal_registry",
             "last_signal_forecasts", "last_enrich_connections",
             "last_contagion_backtest", "last_contagion_feedback",
-            "last_sector_health", "last_active_hypo_scoring",
+            "last_sector_health", "last_sector_health_attempt", "last_active_hypo_scoring",
             "last_earnings_calendar_sync", "last_resolution", "last_ux_audit",
             "last_daily_digest", "last_100x_digest", "last_oracle_cycle",
         ]
@@ -470,7 +477,8 @@ class OperatorState:
 
         # Counters and task_status are cumulative — carry them forward too.
         for int_field in ("cycle_count", "fixes_applied", "pulls_retried",
-                          "hypotheses_tested", "errors_diagnosed"):
+                          "hypotheses_tested", "errors_diagnosed",
+                          "sector_health_attempt_count"):
             val = op_state.get(int_field)
             if isinstance(val, int) and getattr(self, int_field, 0) == 0:
                 setattr(self, int_field, val)
@@ -478,6 +486,15 @@ class OperatorState:
         ts = op_state.get("task_status")
         if isinstance(ts, dict) and not self.task_status:
             self.task_status = ts
+
+        # Plain string fields (not timestamps, not counters) — restore
+        # verbatim, same "only if currently unset" rule as the datetime
+        # fields above.
+        for str_field in ("last_sector_health_outcome",):
+            val = op_state.get(str_field)
+            if isinstance(val, str) and getattr(self, str_field, None) is None:
+                setattr(self, str_field, val)
+                hydrated_any = True
 
         return hydrated_any
 

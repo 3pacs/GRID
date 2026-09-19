@@ -1677,8 +1677,27 @@ def run_self_diagnostics(
 
 # ─── Autoresearch trigger ────────────────────────────────────────────
 
-def maybe_run_autoresearch(state: OperatorState, dry_run: bool = False) -> dict[str, Any] | None:
-    """Run autoresearch if system is healthy and enough time has passed."""
+def maybe_run_autoresearch(
+    state: OperatorState,
+    dry_run: bool = False,
+    run_id: str | None = None,
+    generation: int | None = None,
+    is_current_generation: Any = None,
+) -> dict[str, Any] | None:
+    """Run autoresearch if system is healthy and enough time has passed.
+
+    Parameters:
+        run_id: Forwarded to run_autoresearch() for the research_run
+            snapshot trail / idempotent retry. Assigned by the caller
+            (scripts/hermes_operator.py), which also owns retrying with
+            the same run_id after a timeout.
+        generation: Operator-assigned generation id, forwarded to
+            run_autoresearch() for write fencing. None (the default)
+            disables fencing, matching a direct/standalone call.
+        is_current_generation: Callable(int) -> bool, forwarded to
+            run_autoresearch(). See scripts/hermes_operator.py's
+            ``_AutoresearchGenerationTracker``.
+    """
     now = datetime.now(timezone.utc)
 
     # Only run autoresearch every 12 hours
@@ -1693,9 +1712,19 @@ def maybe_run_autoresearch(state: OperatorState, dry_run: bool = False) -> dict[
     log.info("Running autoresearch cycle")
     try:
         from scripts.autoresearch import run_autoresearch
-        result = run_autoresearch(max_iterations=AUTORESEARCH_MAX_ITER)
+        result = run_autoresearch(
+            max_iterations=AUTORESEARCH_MAX_ITER,
+            run_id=run_id,
+            generation=generation,
+            is_current_generation=is_current_generation,
+        )
         state.last_autoresearch = now
         state.hypotheses_tested += result.get("iterations", 0)
+        if result.get("status") == "failed":
+            log.error(
+                "Autoresearch run failed in phase '{p}': {e}",
+                p=result.get("phase"), e=result.get("error"),
+            )
         return result
     except Exception as exc:
         log.warning("Autoresearch failed: {e}", e=str(exc))

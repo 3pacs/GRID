@@ -49,6 +49,7 @@ import subprocess
 import sys
 import time
 import traceback
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -80,6 +81,19 @@ PIPELINE_INTERVAL_HOURS = 6           # run full pipeline every 6 hours
 DATA_FRESHNESS_THRESHOLD_HOURS = 26   # flag stale sources after 26h
 MAX_PULL_RETRIES = 3                  # retry failed pulls up to 3 times
 AUTORESEARCH_MAX_ITER = 5             # hypothesis iterations per cycle
+# Autoresearch had NO per-step timeout at all before this task (see
+# docs/handoffs/2026-09-18/fable-w4-research-states.md's "Activation
+# condition" section) — the cycle-6 gate called maybe_run_autoresearch()
+# directly inside a plain try/except, never through _run_with_timeout.
+# Duplicated from scripts/autoresearch.py's own AUTORESEARCH_TIMEOUT_SECONDS
+# (same env var, same default) for the same reason AUTORESEARCH_MAX_ITER is
+# duplicated in scripts/hermes_fixers.py: avoiding a circular import, since
+# scripts/autoresearch.py is only ever imported lazily, inside the function
+# that calls it. Conservative default: one iteration can chain an LLM
+# generate call, a walk-forward backtest, and an LLM critique call, so this
+# is sized like the other multi-call LLM steps below (ORACLE_CYCLE_TIMEOUT_
+# SECONDS=4000 for 41 tickers), not the single-call steps (120-240s).
+AUTORESEARCH_TIMEOUT_SECONDS = int(os.getenv("GRID_AUTORESEARCH_TIMEOUT_SECONDS", "1800"))
 HERMES_TEMPERATURE = 0.3              # LLM temperature for diagnostics
 # git-sync committed analytical outputs into the repo (data-exhaust pollution) and the pushes were failing; disabled by default. Set GRID_HERMES_GIT_SYNC=true only with a proper external sync target.
 GIT_SYNC_ENABLED = os.getenv("GRID_HERMES_GIT_SYNC", "false").lower() in ("1", "true", "yes")  # pull/push on each cycle
@@ -121,6 +135,16 @@ POSTMORTEM_BATCH_LIMIT = 20                   # Drain postmortem backlog in boun
 ACTIVE_HYPO_SCORING_BATCH_SIZE = 200
 ACTIVE_HYPO_SCORING_MAX_RUNTIME_S = 240
 ACTIVE_HYPO_SCORING_INTERVAL_MINUTES = 30
+
+# Sector health snapshot — daily due-period scheduling (2026-09-19). Was
+# "now.hour == 3 and now.minute < 10", which only fired on the rare cycle
+# evaluated inside that 10-minute slice; production ran it successfully
+# twice in the last 400 snapshots (2026-07-13, 2026-09-13). See
+# docs/handoffs/2026-09-19/fable-hermes-sector-schedule.md.
+SECTOR_HEALTH_BOUNDARY_HOUR = 3               # UTC hour the daily due-period opens
+SECTOR_HEALTH_RETRY_BACKOFF_MINUTES = 60      # min minutes between failed-attempt retries
+SECTOR_HEALTH_MAX_ATTEMPTS_PER_DAY = 5        # cap on attempts per due period so a
+                                               # persistent failure doesn't retry every cycle forever
 
 # Earnings events → earnings_calendar back-compat sync. The DB-side
 # function ``sync_earnings_events_to_calendar()`` (installed
@@ -262,6 +286,59 @@ def _run_with_timeout(name: str, fn, timeout_s: int, state):
         state.cooldowns.record_attempt(name, success=False, error=str(exc))
         ex.shutdown(wait=False, cancel_futures=True)
         return None, False
+
+
+class _AutoresearchGenerationTracker:
+    """In-process generation counter, used to fence autoresearch writes.
+
+    ``_run_with_timeout`` above abandons a timed-out worker rather than
+    cancelling it (its own docstring explains why: ``ThreadPoolExecutor``/
+    ``concurrent.futures`` has no API to kill a running thread). Without
+    something else stopping it, that orphaned worker keeps running
+    scripts/autoresearch.py::run_autoresearch() to completion and can still
+    insert into hypothesis_registry / model_registry / the research_run
+    snapshot trail, arbitrarily long after the operator moved on to the
+    next cycle.
+
+    This tracker is the compensating control. Every autoresearch
+    invocation is assigned a generation (``next()``) before it is handed to
+    the worker thread. run_autoresearch() (scripts/autoresearch.py) checks
+    ``is_current(generation)`` — via the closure captured in
+    ``is_current_generation`` below — before every write it makes; once
+    this tracker's ``current`` has moved past that generation, the check
+    fails and the write is skipped with a recorded "fenced" reason instead
+    of being made.
+
+    SCOPE: this fences a stale worker THREAD within this SAME PROCESS only.
+    ``current`` is a plain int behind the GIL, which is enough for an
+    orphan thread in the same interpreter to observe a bump made by the
+    main operator thread — it is NOT enough to fence a second Hermes
+    process, or a worker that survives past a process restart. Cross-
+    process fencing needs a DB-backed lease (a row with an owner/epoch
+    that every writer re-checks transactionally, e.g. ``SELECT ... FOR
+    UPDATE`` or an optimistic version column) — not implemented here. That
+    gap is why autoresearch remains explicitly not-yet-safe-to-activate on
+    a schedule; this task only makes it observable and safe to restart
+    within one process.
+    """
+
+    def __init__(self) -> None:
+        self.current = 0
+
+    def next(self) -> int:
+        """Advance to a new generation and return it."""
+        self.current += 1
+        return self.current
+
+    def is_current(self, generation: int) -> bool:
+        """Return whether *generation* is still the latest one assigned."""
+        return generation == self.current
+
+
+# Module-level: one tracker per Hermes operator process, shared by every
+# autoresearch invocation across cycles (see class docstring for scope).
+_autoresearch_generation = _AutoresearchGenerationTracker()
+
 
 # ─── Source registry (DERIVED from PULLER_REGISTRY — task #179) ────────────
 #
@@ -597,6 +674,212 @@ def _dispatch_daily_storage_maintenance(engine: Any, state: OperatorState) -> di
         health={},
         state=state,
     )
+
+
+def _period_boundary(now: datetime, boundary_hour: int) -> datetime:
+    """Return the most recent UTC boundary crossing (``boundary_hour:00``)
+    at or before *now*.
+
+    Internal to :func:`daily_task_due`; also reused by the sector-health
+    retry-attempt bookkeeping in :func:`run_intelligence_tasks` so both
+    share one definition of "due period". *now* must already be
+    timezone-aware (callers normalise before calling this).
+    """
+    today_boundary = now.replace(hour=boundary_hour, minute=0, second=0, microsecond=0)
+    if now >= today_boundary:
+        return today_boundary
+    return today_boundary - timedelta(days=1)
+
+
+def daily_task_due(
+    last_success: datetime | None,
+    now: datetime,
+    boundary_hour: int,
+) -> bool:
+    """Return True if a once-per-due-period daily task is due.
+
+    Replaces the old ``now.hour == H and now.minute < 10`` window pattern,
+    which only executes the task on the rare cycle that happens to be
+    evaluated inside that 10-minute slice. Traced live on the sector-health
+    step (2026-09-19): production went from 2026-07-13 to 2026-09-13
+    between successful runs — 62 days — because cycles routinely take long
+    enough, or start late enough, to miss the window (a cycle starting
+    02:55Z had not reached the check by 03:13Z). See
+    docs/handoffs/2026-09-19/fable-hermes-sector-schedule.md.
+
+    A due *period* is the UTC day starting at ``boundary_hour:00``. The
+    task is due at any evaluation at or after the most recent boundary
+    crossing, as long as no successful run (``last_success``) has landed
+    since that boundary. There is no upper bound on the window: if the
+    process is idle, mid-cycle, or was just restarted, the first
+    evaluation after the boundary still runs the task instead of skipping
+    the period entirely.
+
+    Timezone handling: both arguments are expected to be timezone-aware
+    UTC datetimes — every call site in this module uses
+    ``datetime.now(timezone.utc)``. A naive value is NOT rejected; it is
+    normalised by assuming it is already UTC, the same convention
+    ``OperatorState.hydrate_from_snapshot`` uses when restoring timestamps
+    from a JSON snapshot that predates tzinfo-aware storage.
+    """
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    if last_success is None:
+        return True
+    if last_success.tzinfo is None:
+        last_success = last_success.replace(tzinfo=timezone.utc)
+    return last_success < _period_boundary(now, boundary_hour)
+
+
+def _maybe_run_sector_health_snapshot(
+    engine: Any,
+    state: OperatorState,
+    now: datetime,
+    results: dict[str, Any],
+) -> None:
+    """Run the daily sector-health snapshot if its due period has arrived.
+
+    Computes the composite health score for every sector in ``SECTOR_MAP``
+    and upserts one row per (sector, today) into ``sector_health_snapshots``
+    (``intelligence/sector_health.py::snapshot_all_sectors`` — the INSERT is
+    ``ON CONFLICT (sector_name, snapshot_date) DO UPDATE``, so a re-run
+    inside the same UTC day is idempotent by construction; the state marker
+    below exists to skip redundant compute/DB work, not to guard against
+    duplicate rows). The row ~30 days back is read by the API to label
+    ``trend_30d``.
+
+    Scheduling uses :func:`daily_task_due` (see its docstring) instead of
+    the old ``now.hour == 3 and now.minute < 10`` window — see
+    ``docs/handoffs/2026-09-19/fable-hermes-sector-schedule.md`` for the
+    production trace that motivated this (successful runs 62 days apart
+    despite ~5-minute cycles, because most cycles land outside the
+    10-minute slice).
+
+    Snapshot date identity: every attempt (and retry) within one due
+    period passes the SAME ``snapshot_date`` — the date of
+    ``_period_boundary(now, SECTOR_HEALTH_BOUNDARY_HOUR)`` — to
+    :func:`intelligence.sector_health.snapshot_all_sectors`, not "today"
+    at the moment of the call. Without this, a 23:30 UTC attempt that
+    fails and a 00:30 UTC retry that succeeds would target two different
+    calendar dates even though they are one due period to this
+    scheduler, defeating the (sector_name, snapshot_date) upsert's
+    idempotency.
+
+    Outcome semantics: a call either (a) ``success`` — at least one row
+    written and no upsert failures, (b) ``no_eligible_sectors`` — zero
+    rows written, every sector reported unavailable, no upsert failures;
+    this is a legitimate empty day, so the due period IS marked done, or
+    (c) ``failure`` — any upsert failure or an exception; the due period
+    is NOT marked done. Failure handling: a failed execution does NOT
+    advance ``state.last_sector_health`` (so the due period is not
+    marked done and a later evaluation can retry), but retries are
+    throttled to once every ``SECTOR_HEALTH_RETRY_BACKOFF_MINUTES`` (60)
+    and capped at ``SECTOR_HEALTH_MAX_ATTEMPTS_PER_DAY`` (5) per due
+    period so a persistent failure doesn't re-attempt on every ~5-minute
+    cycle indefinitely. The outcome is recorded on
+    ``state.last_sector_health_outcome`` regardless of which branch runs.
+
+    Cross-cycle race guard: this step runs inside ``run_intelligence_tasks``,
+    which the caller wraps in ``_run_with_timeout`` — a timeout abandons
+    the worker thread rather than killing it, so an orphaned attempt can
+    still be running when a later cycle starts a fresh attempt. To keep
+    an abandoned worker from clobbering a newer attempt's result, this
+    function captures ``state.sector_health_attempt_token`` (incremented
+    at attempt start) locally and only commits ``last_sector_health`` /
+    ``last_sector_health_outcome`` if the token is still current when the
+    call completes; otherwise the result is discarded and logged as
+    stale.
+    """
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+
+    sector_health_period_due = daily_task_due(
+        state.last_sector_health, now, SECTOR_HEALTH_BOUNDARY_HOUR,
+    )
+
+    sector_health_due = False
+    if sector_health_period_due:
+        attempt_in_this_period = (
+            state.last_sector_health_attempt is not None
+            and not daily_task_due(
+                state.last_sector_health_attempt, now, SECTOR_HEALTH_BOUNDARY_HOUR,
+            )
+        )
+        if not attempt_in_this_period:
+            # Fresh due period (or a restart with no attempt recorded yet
+            # for it) — always allowed, and the attempt counter resets.
+            state.sector_health_attempt_count = 0
+            sector_health_due = True
+        else:
+            # Computed from the *passed-in* now, not a fresh wall-clock
+            # read (unlike _minutes_since) — this function is evaluated
+            # with the caller's `now`, and callers (including tests) may
+            # legitimately pass a `now` that differs from the real clock.
+            last_attempt = state.last_sector_health_attempt
+            if last_attempt.tzinfo is None:
+                last_attempt = last_attempt.replace(tzinfo=timezone.utc)
+            minutes_since_attempt = (now - last_attempt).total_seconds() / 60.0
+            backoff_elapsed = minutes_since_attempt >= SECTOR_HEALTH_RETRY_BACKOFF_MINUTES
+            under_attempt_cap = (
+                state.sector_health_attempt_count < SECTOR_HEALTH_MAX_ATTEMPTS_PER_DAY
+            )
+            sector_health_due = backoff_elapsed and under_attempt_cap
+
+    if not sector_health_due:
+        return
+
+    log.info(
+        "Running daily sector health snapshot (due since {h}:00 UTC, attempt {a})",
+        h=SECTOR_HEALTH_BOUNDARY_HOUR, a=state.sector_health_attempt_count + 1,
+    )
+    state.last_sector_health_attempt = now
+    state.sector_health_attempt_count += 1
+    state.sector_health_attempt_token += 1
+    attempt_token = state.sector_health_attempt_token
+    due_period_date = _period_boundary(now, SECTOR_HEALTH_BOUNDARY_HOUR).date()
+
+    def _commit(outcome: str, extra: dict[str, Any]) -> None:
+        """Write the attempt's result to `state`/`results`, but only if no
+        later attempt has started since this one (see docstring)."""
+        if state.sector_health_attempt_token != attempt_token:
+            log.warning(
+                "stale sector-health worker result ignored (token {t}, current {c})",
+                t=attempt_token, c=state.sector_health_attempt_token,
+            )
+            return
+        results["sector_health_snapshot"] = {**extra, "outcome": outcome}
+        state.last_sector_health_outcome = outcome
+        if outcome in ("success", "no_eligible_sectors"):
+            state.last_sector_health = now
+
+    try:
+        from intelligence.sector_health import snapshot_all_sectors
+        sh_result = snapshot_all_sectors(engine, snapshot_date=due_period_date)
+
+        written = sh_result.get("snapshots_written", 0)
+        skipped = sh_result.get("snapshots_skipped_unavailable", 0)
+        upsert_failed = sh_result.get("upsert_failed", 0)
+
+        if upsert_failed > 0:
+            outcome = "failure"
+            log.warning(
+                "sector_health: {n} upsert failure(s), due period not marked done",
+                n=upsert_failed,
+            )
+        elif written == 0 and skipped > 0:
+            outcome = "no_eligible_sectors"
+            log.info(
+                "sector_health: executed, no eligible sectors, nothing to write "
+                "({k} unavailable)", k=skipped,
+            )
+        else:
+            outcome = "success"
+            log.info("sector_health: {n} snapshots written", n=written)
+
+        _commit(outcome, sh_result)
+    except Exception as exc:
+        log.warning("sector_health snapshot failed: {e}", e=str(exc))
+        _commit("failure", {"status": "failed", "error": str(exc)})
 
 
 def run_intelligence_tasks(
@@ -1135,33 +1418,10 @@ def run_intelligence_tasks(
 
         state.last_daily_intel = now
 
-    # ── Daily at 3:00 AM UTC — sector health snapshot ───────────────
-    # Computes the composite health score for every sector in SECTOR_MAP
-    # and upserts one row per (sector, today) into sector_health_snapshots.
-    # The row ~30 days back is read by the API to label trend_30d.
-
-    is_sector_health_window = (now.hour == 3 and now.minute < 10)
-    sector_health_due = (
-        is_sector_health_window
-        and _hours_since(state.last_sector_health) >= 20
-    )
-
-    if sector_health_due:
-        log.info("Running daily sector health snapshot (3:00 AM UTC)")
-        try:
-            from intelligence.sector_health import snapshot_all_sectors
-            sh_result = snapshot_all_sectors(engine)
-            results["sector_health_snapshot"] = sh_result
-            log.info(
-                "sector_health: {n} snapshots written",
-                n=sh_result.get("snapshots_written", 0),
-            )
-        except Exception as exc:
-            log.warning("sector_health snapshot failed: {e}", e=str(exc))
-            results["sector_health_snapshot"] = {
-                "status": "failed", "error": str(exc),
-            }
-        state.last_sector_health = now
+    # ── Daily due-period (opens 3:00 AM UTC) — sector health snapshot ──
+    # See _maybe_run_sector_health_snapshot() docstring for the schedule,
+    # idempotency, and failure/backoff design.
+    _maybe_run_sector_health_snapshot(engine, state, now, results)
 
     # ── Daily at 6:30 UTC — forced-flow waterfall briefing ──────────
     # Implements docs/playbooks/opex_waterfall.md. Runs once per day,
@@ -1369,31 +1629,56 @@ def _run_obsidian_cycle(engine: Any) -> dict[str, Any]:
             log.debug("Concept stubs skipped: {e}", e=str(exc))
 
         # 5. Add wikilinks to docs (only if concept stubs changed)
+        #
+        # IMPORTANT (2026-09-18 fix, see
+        # docs/handoffs/2026-09-18/fable-w4d-hermes-docs-rewrite.md): this
+        # used to write add_wikilinks()'s result straight back onto the
+        # SAME tracked file it read via collect_markdown_files() — silently
+        # rewriting README.md/CLAUDE.md/ATTENTION.md/docs/**/*.md in the
+        # release tree on nearly every Hermes cycle. Source docs are now
+        # read-only here; annotated copies go to
+        # resolve_backlinks_output_dir() (env-configurable, defaults under
+        # the Obsidian vault path this module already uses elsewhere), or
+        # this step is skipped entirely (logged) when that directory is
+        # unavailable. Never falls back to writing inside this checkout.
         backlinks_added = 0
         if stubs_created > 0:
             try:
                 from scripts.obsidian_backlinks import (
                     collect_markdown_files, build_doc_registry,
                     add_wikilinks, CONCEPT_LINKS,
+                    resolve_backlinks_output_dir, write_annotated_copy,
                 )
 
-                files = collect_markdown_files()
-                doc_registry = build_doc_registry(files)
-                all_entities = {**CONCEPT_LINKS}
-                skip_stems = {"README", "CLAUDE", "index", "plan", "config"}
-                for stem, target in doc_registry.items():
-                    if stem not in skip_stems and len(stem) > 3:
-                        all_entities[stem] = target
+                output_dir = resolve_backlinks_output_dir()
+                if output_dir is None:
+                    log.debug(
+                        "Obsidian backlinks skipped this cycle: no output "
+                        "directory configured/available (see "
+                        "resolve_backlinks_output_dir)",
+                    )
+                else:
+                    files = collect_markdown_files()
+                    doc_registry = build_doc_registry(files)
+                    all_entities = {**CONCEPT_LINKS}
+                    skip_stems = {"README", "CLAUDE", "index", "plan", "config"}
+                    for stem, target in doc_registry.items():
+                        if stem not in skip_stems and len(stem) > 3:
+                            all_entities[stem] = target
 
-                for f in files:
-                    content = f.read_text(encoding="utf-8", errors="replace")
-                    new_content, changes = add_wikilinks(content, f, all_entities)
-                    if changes:
-                        f.write_text(new_content, encoding="utf-8")
-                        backlinks_added += len(changes)
+                    for f in files:
+                        content = f.read_text(encoding="utf-8", errors="replace")
+                        new_content, changes = add_wikilinks(content, f, all_entities)
+                        if changes:
+                            write_annotated_copy(output_dir, f, new_content)
+                            backlinks_added += len(changes)
 
-                if backlinks_added:
-                    log.info("Obsidian backlinks: {n} links added", n=backlinks_added)
+                    if backlinks_added:
+                        log.info(
+                            "Obsidian backlinks: {n} links added (written "
+                            "to {d}; source docs untouched)",
+                            n=backlinks_added, d=output_dir,
+                        )
             except Exception as exc:
                 log.debug("Backlinks skipped: {e}", e=str(exc))
 
@@ -1834,12 +2119,55 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
             log.warning("Self-diagnostics failed: {e}", e=str(exc))
 
     # 6. Autoresearch — only every 12th cycle (1 hour)
+    #
+    # Bounded + fenced (this task): previously called maybe_run_autoresearch
+    # directly inside a plain try/except, with NO per-step timeout at all
+    # (see docs/handoffs/2026-09-18/fable-w4-research-states.md's
+    # "Activation condition" — this was the exact gap that made activating
+    # autoresearch on a schedule unsafe). Now wrapped in _run_with_timeout
+    # like resolution/oracle_cycle, AND every invocation gets a generation
+    # id from _autoresearch_generation: if the timeout fires, the worker
+    # thread is abandoned (not killed — see _run_with_timeout's docstring)
+    # but the generation is bumped immediately below, so any write that
+    # orphan later attempts is fenced by scripts/autoresearch.py's
+    # generation checks (recorded there with a "fenced" reason).
     if state.cycle_count % 12 == 0 and health.get("overall_healthy") and hermes_ok:
         try:
             state.current_step = "autoresearch"
-            ar_result = maybe_run_autoresearch(state, dry_run=dry_run)
-            if ar_result is not None:
-                cycle_result["autoresearch"] = ar_result
+            ar_run_id = str(uuid.uuid4())
+            ar_generation = _autoresearch_generation.next()
+
+            def _autoresearch_call():
+                return maybe_run_autoresearch(
+                    state, dry_run=dry_run,
+                    run_id=ar_run_id, generation=ar_generation,
+                    is_current_generation=_autoresearch_generation.is_current,
+                )
+
+            ar_result, ar_ok = _run_with_timeout(
+                "autoresearch", _autoresearch_call,
+                AUTORESEARCH_TIMEOUT_SECONDS, state,
+            )
+            if ar_ok:
+                if ar_result is not None:
+                    cycle_result["autoresearch"] = ar_result
+            else:
+                # Bump NOW, not on the next cycle-6 gate an hour from now —
+                # the abandoned worker thread is still running and could
+                # write at any point between now and then.
+                _autoresearch_generation.next()
+                cycle_result["autoresearch"] = {"status": "timeout", "run_id": ar_run_id}
+                try:
+                    from scripts.autoresearch import _record_research_run
+                    _record_research_run(
+                        engine, ar_run_id, "timeout",
+                        phase="operator_timeout",
+                        error=f"exceeded {AUTORESEARCH_TIMEOUT_SECONDS}s",
+                        error_category="timeout",
+                        generation=ar_generation,
+                    )
+                except Exception as exc:
+                    log.warning("Failed to record autoresearch timeout: {e}", e=str(exc))
         except Exception as exc:
             log.warning("Autoresearch failed: {e}", e=str(exc))
 
