@@ -207,10 +207,98 @@ def test_snapshot_all_sectors_skips_unavailable(monkeypatch):
 
     assert out["snapshots_written"] == 0
     assert out["snapshots_skipped_unavailable"] == len(out["sectors"]) > 0
+    assert out["upsert_failed"] == 0
     for entry in out["sectors"].values():
         assert entry["score"] is None
         assert entry["status"] == "unavailable"
     engine.begin.assert_not_called()
+
+
+def test_snapshot_all_sectors_default_date_is_utc_not_local(monkeypatch):
+    """The default ``snapshot_date`` must come from
+    ``datetime.now(timezone.utc).date()``, not ``date.today()`` (the
+    local calendar date) — Hermes's due-period boundary is a UTC
+    concept, and a naive local date would desync from it near midnight
+    in any non-UTC deployment timezone."""
+    fixed_utc_date = date(2026, 9, 20)
+
+    class _FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 20, 0, 30, tzinfo=tz)
+
+    monkeypatch.setattr(sh, "datetime", _FixedDatetime)
+    monkeypatch.setattr(
+        sh, "compute_sector_health",
+        lambda _engine, name: sh._unavailable(name, "no data"),
+    )
+
+    out = sh.snapshot_all_sectors(MagicMock())
+
+    assert out["date"] == fixed_utc_date.isoformat()
+
+
+def test_snapshot_all_sectors_explicit_snapshot_date_used_for_upsert(monkeypatch):
+    """An explicit ``snapshot_date`` (as passed by the Hermes scheduler
+    for retry-within-due-period identity) must be the date bound into
+    the upsert, not whatever "today" happens to be when the call runs."""
+    from analysis.sector_map import SECTOR_MAP
+
+    monkeypatch.setattr(
+        sh, "compute_sector_health",
+        lambda _engine, name: {
+            "score": 60.0, "trend_30d": 0.0, "components": {"stub": True},
+        },
+    )
+
+    captured_dates = []
+
+    class _FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, stmt):
+            compiled = stmt.compile()
+            captured_dates.append(dict(compiled.params)["d"])
+            return MagicMock()
+
+    class _FakeEngine:
+        def begin(self):
+            return _FakeConn()
+
+    forced_date = date(2026, 1, 5)
+    out = sh.snapshot_all_sectors(_FakeEngine(), snapshot_date=forced_date)
+
+    assert out["date"] == forced_date.isoformat()
+    assert out["upsert_failed"] == 0
+    assert len(captured_dates) == len(SECTOR_MAP)
+    assert all(d == forced_date for d in captured_dates)
+
+
+def test_snapshot_all_sectors_counts_upsert_failures(monkeypatch):
+    """A raised exception during the upsert must be counted in
+    ``upsert_failed`` (additive to the existing warning log) so the
+    Hermes scheduler can distinguish a partial DB failure from a clean
+    run and avoid marking the due period done."""
+    from analysis.sector_map import SECTOR_MAP
+
+    monkeypatch.setattr(
+        sh, "compute_sector_health",
+        lambda _engine, name: {
+            "score": 60.0, "trend_30d": 0.0, "components": {"stub": True},
+        },
+    )
+
+    engine = MagicMock()
+    engine.begin.side_effect = RuntimeError("db gone")
+
+    out = sh.snapshot_all_sectors(engine, snapshot_date=date(2026, 1, 5))
+
+    assert out["snapshots_written"] == 0
+    assert out["upsert_failed"] == len(SECTOR_MAP)
 
 
 def test_endpoint_does_not_cache_unavailable(monkeypatch):

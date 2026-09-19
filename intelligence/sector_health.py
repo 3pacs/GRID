@@ -543,20 +543,40 @@ def compute_sector_health(engine: Engine, sector_name: str) -> dict[str, Any]:
     }
 
 
-def snapshot_all_sectors(engine: Engine) -> dict[str, Any]:
+def snapshot_all_sectors(
+    engine: Engine, snapshot_date: date | None = None,
+) -> dict[str, Any]:
     """Compute health for every sector in ``SECTOR_MAP`` and upsert one
-    row per (sector, today) into ``sector_health_snapshots``.
+    row per (sector, ``snapshot_date``) into ``sector_health_snapshots``.
 
     Used by the Hermes daily scheduler (3:00 UTC). Returns a dict of
     ``{sector_name: {score, trend_30d}}`` plus an aggregate count.
+
+    Args:
+        snapshot_date: The date to stamp every row written this call
+            with. Defaults to ``datetime.now(timezone.utc).date()`` —
+            deliberately NOT ``date.today()`` (the local calendar date),
+            because the caller (``hermes_operator._maybe_run_sector_health_snapshot``)
+            schedules this task against a UTC due-period boundary
+            (``_period_boundary``, 03:00 UTC). Callers that retry within
+            the same due period (e.g. a 23:30 UTC attempt that fails and
+            a 00:30 UTC retry that succeeds) MUST pass the same
+            ``snapshot_date`` — the due-period date, not "today" at the
+            moment of the call — so every attempt in one due period
+            upserts the same (sector_name, snapshot_date) row instead of
+            splitting across two calendar dates. The
+            ``ON CONFLICT (sector_name, snapshot_date) DO UPDATE`` below
+            is what makes retries within a due period idempotent, but
+            only if the date matches.
     """
     import json
 
     from analysis.sector_map import SECTOR_MAP
 
-    today = date.today()
+    today = snapshot_date if snapshot_date is not None else datetime.now(timezone.utc).date()
     written = 0
     skipped = 0
+    upsert_failed = 0
     out: dict[str, Any] = {"date": today.isoformat(), "sectors": {}}
 
     for sector_name in SECTOR_MAP.keys():
@@ -604,6 +624,7 @@ def snapshot_all_sectors(engine: Engine) -> dict[str, Any]:
                 )
                 written += 1
         except Exception as exc:
+            upsert_failed += 1
             log.warning(
                 "snapshot_all_sectors: upsert failed for {s}: {e}",
                 s=sector_name, e=str(exc),
@@ -611,6 +632,7 @@ def snapshot_all_sectors(engine: Engine) -> dict[str, Any]:
 
     out["snapshots_written"] = written
     out["snapshots_skipped_unavailable"] = skipped
-    log.info("sector_health: wrote {n} daily snapshots ({k} unavailable, skipped)",
-             n=written, k=skipped)
+    out["upsert_failed"] = upsert_failed
+    log.info("sector_health: wrote {n} daily snapshots ({k} unavailable, skipped, {f} upsert failed)",
+             n=written, k=skipped, f=upsert_failed)
     return out

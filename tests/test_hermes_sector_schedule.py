@@ -28,7 +28,7 @@ fake engine, never a real connection.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -135,9 +135,12 @@ class TestSectorHealthSchedulerWiring:
     def test_due_period_runs_and_advances_success_marker(self, monkeypatch) -> None:
         calls = []
 
-        def _fake_snapshot(engine: Any) -> dict[str, Any]:
+        def _fake_snapshot(engine: Any, snapshot_date: date | None = None) -> dict[str, Any]:
             calls.append(engine)
-            return {"snapshots_written": 20, "snapshots_skipped_unavailable": 0}
+            return {
+                "snapshots_written": 20, "snapshots_skipped_unavailable": 0,
+                "upsert_failed": 0,
+            }
 
         monkeypatch.setattr(
             "intelligence.sector_health.snapshot_all_sectors", _fake_snapshot,
@@ -155,6 +158,8 @@ class TestSectorHealthSchedulerWiring:
         assert state.last_sector_health_attempt == now
         assert state.sector_health_attempt_count == 1
         assert results["sector_health_snapshot"]["snapshots_written"] == 20
+        assert state.last_sector_health_outcome == "success"
+        assert results["sector_health_snapshot"]["outcome"] == "success"
 
     def test_second_evaluation_same_due_period_does_not_rerun(self, monkeypatch) -> None:
         """(c) at the wiring level: the state marker prevents a second
@@ -162,7 +167,10 @@ class TestSectorHealthSchedulerWiring:
         calls = []
         monkeypatch.setattr(
             "intelligence.sector_health.snapshot_all_sectors",
-            lambda engine: calls.append(engine) or {"snapshots_written": 20},
+            lambda engine, snapshot_date=None: calls.append(engine) or {
+                "snapshots_written": 20, "snapshots_skipped_unavailable": 0,
+                "upsert_failed": 0,
+            },
         )
 
         state = _fresh_state()
@@ -184,7 +192,10 @@ class TestSectorHealthSchedulerWiring:
         calls = []
         monkeypatch.setattr(
             "intelligence.sector_health.snapshot_all_sectors",
-            lambda engine: calls.append(engine) or {"snapshots_written": 20},
+            lambda engine, snapshot_date=None: calls.append(engine) or {
+                "snapshots_written": 20, "snapshots_skipped_unavailable": 0,
+                "upsert_failed": 0,
+            },
         )
 
         state = _fresh_state()
@@ -206,7 +217,7 @@ class TestSectorHealthSchedulerWiring:
         backoff — and stop retrying once the per-day cap is hit."""
         attempts = {"n": 0}
 
-        def _failing_snapshot(engine: Any) -> dict[str, Any]:
+        def _failing_snapshot(engine: Any, snapshot_date: date | None = None) -> dict[str, Any]:
             attempts["n"] += 1
             raise RuntimeError("boom")
 
@@ -224,6 +235,8 @@ class TestSectorHealthSchedulerWiring:
         assert state.last_sector_health is None, "failure must not mark the day done"
         assert state.sector_health_attempt_count == 1
         assert results["sector_health_snapshot"]["status"] == "failed"
+        assert results["sector_health_snapshot"]["outcome"] == "failure"
+        assert state.last_sector_health_outcome == "failure"
 
         # A cycle 10 minutes later must NOT retry yet (backoff = 60 min).
         t1 = t0 + timedelta(minutes=10)
@@ -255,7 +268,7 @@ class TestSectorHealthSchedulerWiring:
         counter even after yesterday's cap was exhausted."""
         monkeypatch.setattr(
             "intelligence.sector_health.snapshot_all_sectors",
-            lambda engine: (_ for _ in ()).throw(RuntimeError("boom")),
+            lambda engine, snapshot_date=None: (_ for _ in ()).throw(RuntimeError("boom")),
         )
 
         state = _fresh_state()
@@ -273,8 +286,11 @@ class TestSectorHealthSchedulerWiring:
         # yesterday's exhausted cap.
         next_day = datetime(2026, 9, 20, 3, 5, tzinfo=timezone.utc)
 
-        def _fake_success(engine: Any) -> dict[str, Any]:
-            return {"snapshots_written": 20}
+        def _fake_success(engine: Any, snapshot_date: date | None = None) -> dict[str, Any]:
+            return {
+                "snapshots_written": 20, "snapshots_skipped_unavailable": 0,
+                "upsert_failed": 0,
+            }
 
         monkeypatch.setattr(
             "intelligence.sector_health.snapshot_all_sectors", _fake_success,
@@ -282,6 +298,237 @@ class TestSectorHealthSchedulerWiring:
         ho._maybe_run_sector_health_snapshot(engine, state, next_day, results)
         assert state.last_sector_health == next_day
         assert state.sector_health_attempt_count == 1
+
+
+# ─── Review finding #1: snapshot_date identity across a due period ──────
+
+
+class TestSnapshotDateIdentity:
+    """A retry that crosses midnight must stamp the SAME snapshot_date as
+    the attempt(s) before it — the due period (UTC 03:00 boundary), not
+    the calendar date at the moment each attempt happens to run."""
+
+    def test_retry_across_midnight_uses_same_due_period_date(self, monkeypatch) -> None:
+        recorded_dates: list[date | None] = []
+
+        def _first_attempt_fails(engine: Any, snapshot_date: date | None = None) -> dict[str, Any]:
+            recorded_dates.append(snapshot_date)
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(
+            "intelligence.sector_health.snapshot_all_sectors", _first_attempt_fails,
+        )
+
+        state = _fresh_state()
+        engine = MagicMock()
+        results: dict[str, Any] = {}
+
+        # 23:30 UTC — still inside the due period that opened at 03:00 UTC
+        # that same calendar day.
+        t0 = datetime(2026, 9, 19, 23, 30, tzinfo=timezone.utc)
+        ho._maybe_run_sector_health_snapshot(engine, state, t0, results)
+        assert len(recorded_dates) == 1
+        assert recorded_dates[0] == date(2026, 9, 19)
+        assert state.last_sector_health is None  # failure: not marked done
+
+        def _retry_succeeds(engine: Any, snapshot_date: date | None = None) -> dict[str, Any]:
+            recorded_dates.append(snapshot_date)
+            return {
+                "snapshots_written": 20, "snapshots_skipped_unavailable": 0,
+                "upsert_failed": 0,
+            }
+
+        monkeypatch.setattr(
+            "intelligence.sector_health.snapshot_all_sectors", _retry_succeeds,
+        )
+
+        # 00:35 UTC the next calendar day — still the SAME due period
+        # (boundary_hour=3), 65 minutes after the failed attempt (clears
+        # the 60-minute backoff).
+        t1 = t0 + timedelta(minutes=65)
+        ho._maybe_run_sector_health_snapshot(engine, state, t1, results)
+
+        assert len(recorded_dates) == 2
+        assert recorded_dates[0] == recorded_dates[1] == date(2026, 9, 19), (
+            "the 23:30 attempt and its 00:35-next-day retry are one due "
+            "period and must upsert the same (sector, snapshot_date) rows"
+        )
+        assert state.last_sector_health == t1
+
+
+# ─── Review finding #2: outcome semantics (success / no_eligible / failure) ─
+
+
+class TestSectorHealthOutcomeSemantics:
+    def test_success_outcome_marks_done(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "intelligence.sector_health.snapshot_all_sectors",
+            lambda engine, snapshot_date=None: {
+                "snapshots_written": 5, "snapshots_skipped_unavailable": 0,
+                "upsert_failed": 0,
+            },
+        )
+        state = _fresh_state()
+        engine = MagicMock()
+        results: dict[str, Any] = {}
+        now = datetime(2026, 9, 19, 3, 5, tzinfo=timezone.utc)
+
+        ho._maybe_run_sector_health_snapshot(engine, state, now, results)
+
+        assert state.last_sector_health == now
+        assert state.last_sector_health_outcome == "success"
+        assert results["sector_health_snapshot"]["outcome"] == "success"
+
+    def test_no_eligible_sectors_outcome_marks_done_without_retry(self, monkeypatch) -> None:
+        """0 written, every sector unavailable, no upsert failures is a
+        legitimate empty day: the due period IS marked done (unlike a
+        real failure) so a genuinely-empty day doesn't retry forever."""
+        calls = []
+        monkeypatch.setattr(
+            "intelligence.sector_health.snapshot_all_sectors",
+            lambda engine, snapshot_date=None: (calls.append(1) or {
+                "snapshots_written": 0, "snapshots_skipped_unavailable": 12,
+                "upsert_failed": 0,
+            }),
+        )
+        state = _fresh_state()
+        engine = MagicMock()
+        results: dict[str, Any] = {}
+        now = datetime(2026, 9, 19, 3, 5, tzinfo=timezone.utc)
+
+        ho._maybe_run_sector_health_snapshot(engine, state, now, results)
+
+        assert state.last_sector_health == now, (
+            "no_eligible_sectors must still mark the due period done"
+        )
+        assert state.last_sector_health_outcome == "no_eligible_sectors"
+        assert results["sector_health_snapshot"]["outcome"] == "no_eligible_sectors"
+
+        # A later evaluation in the SAME due period must not re-run.
+        later = now + timedelta(hours=2)
+        ho._maybe_run_sector_health_snapshot(engine, state, later, results)
+        assert len(calls) == 1, "a marked-done due period must not retry"
+
+    def test_partial_upsert_failure_outcome_is_failure_and_retries(self, monkeypatch) -> None:
+        """Some rows written but at least one upsert failed: must count
+        as failure (NOT success just because count > 0), must not mark
+        the due period done, and must retry after backoff."""
+        calls = []
+
+        def _partial_failure(engine: Any, snapshot_date: date | None = None) -> dict[str, Any]:
+            calls.append(1)
+            return {
+                "snapshots_written": 8, "snapshots_skipped_unavailable": 1,
+                "upsert_failed": 2,
+            }
+
+        monkeypatch.setattr(
+            "intelligence.sector_health.snapshot_all_sectors", _partial_failure,
+        )
+        state = _fresh_state()
+        engine = MagicMock()
+        results: dict[str, Any] = {}
+        t0 = datetime(2026, 9, 19, 3, 5, tzinfo=timezone.utc)
+
+        ho._maybe_run_sector_health_snapshot(engine, state, t0, results)
+
+        assert state.last_sector_health is None, "partial upsert failure must not mark the day done"
+        assert state.last_sector_health_outcome == "failure"
+        assert results["sector_health_snapshot"]["outcome"] == "failure"
+        assert len(calls) == 1
+
+        # Retry after backoff must re-run.
+        t1 = t0 + timedelta(minutes=61)
+        ho._maybe_run_sector_health_snapshot(engine, state, t1, results)
+        assert len(calls) == 2
+
+    def test_exception_outcome_is_failure(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "intelligence.sector_health.snapshot_all_sectors",
+            lambda engine, snapshot_date=None: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        state = _fresh_state()
+        engine = MagicMock()
+        results: dict[str, Any] = {}
+        now = datetime(2026, 9, 19, 3, 5, tzinfo=timezone.utc)
+
+        ho._maybe_run_sector_health_snapshot(engine, state, now, results)
+
+        assert state.last_sector_health is None
+        assert state.last_sector_health_outcome == "failure"
+
+
+# ─── Review finding #3: cross-cycle race (abandoned _run_with_timeout worker) ─
+
+
+class TestSectorHealthCrossCycleRace:
+    def test_abandoned_first_attempt_does_not_clobber_a_later_attempts_result(
+        self, monkeypatch
+    ) -> None:
+        """Simulate _run_with_timeout abandoning (not killing) a worker:
+        attempt 1 starts, runs long, and — while it is still in flight —
+        a later cycle's attempt 2 starts (after backoff has elapsed) and
+        finishes first. Attempt 1's belated return must be discarded
+        (stale token), not overwrite attempt 2's newer, real result."""
+        state = _fresh_state()
+        engine = MagicMock()
+        results: dict[str, Any] = {}
+
+        t0 = datetime(2026, 9, 19, 3, 1, tzinfo=timezone.utc)
+        t1 = t0 + timedelta(minutes=61)  # clears the retry backoff
+
+        def _second_cycle_snapshot(engine: Any, snapshot_date: date | None = None) -> dict[str, Any]:
+            return {
+                "snapshots_written": 3, "snapshots_skipped_unavailable": 0,
+                "upsert_failed": 0,
+            }
+
+        def _first_cycle_snapshot(engine: Any, snapshot_date: date | None = None) -> dict[str, Any]:
+            # While attempt 1 is "in flight" here, a later real cycle
+            # evaluates and completes ITS OWN attempt (a real, nested
+            # call into the function under test — not a hand-rolled
+            # stand-in for it).
+            monkeypatch.setattr(
+                "intelligence.sector_health.snapshot_all_sectors", _second_cycle_snapshot,
+            )
+            ho._maybe_run_sector_health_snapshot(engine, state, t1, results)
+            # Attempt 1 now (belatedly) returns its own, older result.
+            return {
+                "snapshots_written": 1, "snapshots_skipped_unavailable": 0,
+                "upsert_failed": 0,
+            }
+
+        monkeypatch.setattr(
+            "intelligence.sector_health.snapshot_all_sectors", _first_cycle_snapshot,
+        )
+
+        ho._maybe_run_sector_health_snapshot(engine, state, t0, results)
+
+        # Attempt 2 (the later, real cycle) won: its result is what's
+        # recorded, and attempt 1's belated return did not clobber it.
+        assert state.last_sector_health == t1
+        assert state.last_sector_health_outcome == "success"
+        assert results["sector_health_snapshot"]["snapshots_written"] == 3
+
+    def test_non_stale_result_still_commits_normally(self, monkeypatch) -> None:
+        """Sanity check: when no later attempt starts, the token guard
+        must not block the ordinary (non-racy) path."""
+        monkeypatch.setattr(
+            "intelligence.sector_health.snapshot_all_sectors",
+            lambda engine, snapshot_date=None: {
+                "snapshots_written": 4, "snapshots_skipped_unavailable": 0,
+                "upsert_failed": 0,
+            },
+        )
+        state = _fresh_state()
+        engine = MagicMock()
+        results: dict[str, Any] = {}
+        now = datetime(2026, 9, 19, 3, 1, tzinfo=timezone.utc)
+
+        ho._maybe_run_sector_health_snapshot(engine, state, now, results)
+
+        assert state.last_sector_health == now
+        assert results["sector_health_snapshot"]["snapshots_written"] == 4
 
 
 # ─── snapshot_all_sectors idempotency: real upsert path, fake engine ────

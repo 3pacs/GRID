@@ -688,13 +688,40 @@ def _maybe_run_sector_health_snapshot(
     despite ~5-minute cycles, because most cycles land outside the
     10-minute slice).
 
-    Failure handling: a failed execution does NOT advance
-    ``state.last_sector_health`` (so the due period is not marked done and
-    a later evaluation can retry), but retries are throttled to once every
-    ``SECTOR_HEALTH_RETRY_BACKOFF_MINUTES`` (60) and capped at
-    ``SECTOR_HEALTH_MAX_ATTEMPTS_PER_DAY`` (5) per due period so a
-    persistent failure doesn't re-attempt on every ~5-minute cycle
-    indefinitely.
+    Snapshot date identity: every attempt (and retry) within one due
+    period passes the SAME ``snapshot_date`` — the date of
+    ``_period_boundary(now, SECTOR_HEALTH_BOUNDARY_HOUR)`` — to
+    :func:`intelligence.sector_health.snapshot_all_sectors`, not "today"
+    at the moment of the call. Without this, a 23:30 UTC attempt that
+    fails and a 00:30 UTC retry that succeeds would target two different
+    calendar dates even though they are one due period to this
+    scheduler, defeating the (sector_name, snapshot_date) upsert's
+    idempotency.
+
+    Outcome semantics: a call either (a) ``success`` — at least one row
+    written and no upsert failures, (b) ``no_eligible_sectors`` — zero
+    rows written, every sector reported unavailable, no upsert failures;
+    this is a legitimate empty day, so the due period IS marked done, or
+    (c) ``failure`` — any upsert failure or an exception; the due period
+    is NOT marked done. Failure handling: a failed execution does NOT
+    advance ``state.last_sector_health`` (so the due period is not
+    marked done and a later evaluation can retry), but retries are
+    throttled to once every ``SECTOR_HEALTH_RETRY_BACKOFF_MINUTES`` (60)
+    and capped at ``SECTOR_HEALTH_MAX_ATTEMPTS_PER_DAY`` (5) per due
+    period so a persistent failure doesn't re-attempt on every ~5-minute
+    cycle indefinitely. The outcome is recorded on
+    ``state.last_sector_health_outcome`` regardless of which branch runs.
+
+    Cross-cycle race guard: this step runs inside ``run_intelligence_tasks``,
+    which the caller wraps in ``_run_with_timeout`` — a timeout abandons
+    the worker thread rather than killing it, so an orphaned attempt can
+    still be running when a later cycle starts a fresh attempt. To keep
+    an abandoned worker from clobbering a newer attempt's result, this
+    function captures ``state.sector_health_attempt_token`` (incremented
+    at attempt start) locally and only commits ``last_sector_health`` /
+    ``last_sector_health_outcome`` if the token is still current when the
+    call completes; otherwise the result is discarded and logged as
+    stale.
     """
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
@@ -740,20 +767,52 @@ def _maybe_run_sector_health_snapshot(
     )
     state.last_sector_health_attempt = now
     state.sector_health_attempt_count += 1
+    state.sector_health_attempt_token += 1
+    attempt_token = state.sector_health_attempt_token
+    due_period_date = _period_boundary(now, SECTOR_HEALTH_BOUNDARY_HOUR).date()
+
+    def _commit(outcome: str, extra: dict[str, Any]) -> None:
+        """Write the attempt's result to `state`/`results`, but only if no
+        later attempt has started since this one (see docstring)."""
+        if state.sector_health_attempt_token != attempt_token:
+            log.warning(
+                "stale sector-health worker result ignored (token {t}, current {c})",
+                t=attempt_token, c=state.sector_health_attempt_token,
+            )
+            return
+        results["sector_health_snapshot"] = {**extra, "outcome": outcome}
+        state.last_sector_health_outcome = outcome
+        if outcome in ("success", "no_eligible_sectors"):
+            state.last_sector_health = now
+
     try:
         from intelligence.sector_health import snapshot_all_sectors
-        sh_result = snapshot_all_sectors(engine)
-        results["sector_health_snapshot"] = sh_result
-        log.info(
-            "sector_health: {n} snapshots written",
-            n=sh_result.get("snapshots_written", 0),
-        )
-        state.last_sector_health = now
+        sh_result = snapshot_all_sectors(engine, snapshot_date=due_period_date)
+
+        written = sh_result.get("snapshots_written", 0)
+        skipped = sh_result.get("snapshots_skipped_unavailable", 0)
+        upsert_failed = sh_result.get("upsert_failed", 0)
+
+        if upsert_failed > 0:
+            outcome = "failure"
+            log.warning(
+                "sector_health: {n} upsert failure(s), due period not marked done",
+                n=upsert_failed,
+            )
+        elif written == 0 and skipped > 0:
+            outcome = "no_eligible_sectors"
+            log.info(
+                "sector_health: executed, no eligible sectors, nothing to write "
+                "({k} unavailable)", k=skipped,
+            )
+        else:
+            outcome = "success"
+            log.info("sector_health: {n} snapshots written", n=written)
+
+        _commit(outcome, sh_result)
     except Exception as exc:
         log.warning("sector_health snapshot failed: {e}", e=str(exc))
-        results["sector_health_snapshot"] = {
-            "status": "failed", "error": str(exc),
-        }
+        _commit("failure", {"status": "failed", "error": str(exc)})
 
 
 def run_intelligence_tasks(

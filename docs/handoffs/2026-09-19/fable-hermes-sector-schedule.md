@@ -84,6 +84,85 @@ restorable-fields list ~418-479):
   (`cycle_count`, etc.) so a restart doesn't reset an in-progress backoff
   cap.
 
+Two more fields added for the three findings fixed in this update:
+
+- `last_sector_health_outcome: str | None` — `"success"` /
+  `"no_eligible_sectors"` / `"failure"`, persisted in `to_dict()` and
+  hydrated in `hydrate_from_snapshot()` via a small string-field loop
+  (it isn't a datetime, so it can't reuse the `datetime.fromisoformat`
+  loop the other fields share).
+- `sector_health_attempt_token: int` — NOT persisted/hydrated across
+  restarts (deliberately — it only needs to be correct within one live
+  process to guard against an abandoned in-process worker; a restart has
+  no in-flight orphan thread from before it, so starting back at 0 is
+  correct).
+
+## Follow-up: three review findings fixed (this update)
+
+A review of the original cut found three remaining correctness gaps in the
+due-period design above. All three are fixed in this update, still within
+the same scope (`scripts/hermes_operator.py`, `scripts/hermes_health.py`,
+`intelligence/sector_health.py` additive only, plus tests).
+
+### 1. Snapshot-date identity across a due period
+
+`daily_task_due`/`_period_boundary` define "due period" against a 03:00 UTC
+boundary, but `snapshot_all_sectors` stamped `date.today()` — the *local*
+calendar date computed fresh on every call. A retry that crosses midnight
+(23:30 UTC attempt fails, 00:30 UTC retry succeeds) is **one** due period to
+the scheduler but would have written two different `snapshot_date` values,
+splitting what should be one idempotent `(sector_name, snapshot_date)` row
+into two.
+
+Fix: `snapshot_all_sectors(engine, snapshot_date: date | None = None)` now
+takes the date to stamp explicitly. Its default (when called without the
+kwarg) is `datetime.now(timezone.utc).date()` — deliberately not
+`date.today()`, documented in the docstring. `_maybe_run_sector_health_snapshot`
+computes `due_period_date = _period_boundary(now, SECTOR_HEALTH_BOUNDARY_HOUR).date()`
+once per attempt and passes it through, so every attempt and retry inside
+one due period targets the same row regardless of which calendar date the
+wall clock reads at the moment each attempt runs.
+
+### 2. Outcome semantics (success / no_eligible_sectors / failure)
+
+Previously `state.last_sector_health = now` was set unconditionally after
+any non-raising call — "0 written, K unavailable" and a partial upsert
+failure both counted as success and marked the due period done. Three
+explicit outcomes now exist:
+
+- **`success`** — at least one row written and zero upsert failures.
+- **`no_eligible_sectors`** — zero rows written, every sector reported
+  unavailable, zero upsert failures. This is a legitimate empty day, so the
+  due period **is** marked done (no retry storm on a day with genuinely no
+  eligible sectors) and the log says so explicitly ("executed, no eligible
+  sectors, nothing to write").
+- **`failure`** — any upsert failure, or an exception. The due period is
+  **not** marked done; the existing backoff/cap retry logic applies.
+
+`snapshot_all_sectors` now returns `upsert_failed` (additive to its
+existing warning log at the per-sector upsert `except`) so the scheduler
+can tell partial DB failure apart from a clean run. The outcome string is
+persisted on `state.last_sector_health_outcome` (hydrated the same
+"only if currently unset" way as the timestamp fields, via a small
+string-field loop in `hydrate_from_snapshot` since it isn't a datetime).
+
+### 3. Cross-cycle race guard
+
+`run_intelligence_tasks` (which calls `_maybe_run_sector_health_snapshot`)
+runs under `_run_with_timeout`, which — by design (see its docstring) —
+abandons a timed-out worker thread rather than killing it, so the orphan
+keeps running. If it finishes after a later cycle has already started (and
+possibly completed) its own attempt, the orphan's belated write could
+clobber the newer state.
+
+Fix: a monotonic `state.sector_health_attempt_token` is incremented at the
+start of every attempt; the attempt captures its own value locally and
+only commits `last_sector_health` / `last_sector_health_outcome` /
+`results["sector_health_snapshot"]` if `state.sector_health_attempt_token`
+still equals the captured value when the call completes. A mismatch means
+a newer attempt has started since, so the result is discarded and logged
+("stale sector-health worker result ignored") instead of written.
+
 ## Regressions (`tests/test_hermes_sector_schedule.py`, no network/DB)
 
 `TestDailyTaskDue` (pure helper):
@@ -112,14 +191,57 @@ engine + monkeypatched `snapshot_all_sectors`):
   engine (with `compute_sector_health` stubbed) write the same number of
   `(sector, date)` rows both times — no duplicates.
 
-`python -m pytest tests/test_hermes_sector_schedule.py tests/test_hermes_timeout_budgets.py -q` — 18 passed.
+`TestSnapshotDateIdentity` (finding #1):
+- a 23:30 UTC attempt that fails and its 00:35-next-day retry (still one
+  due period) pass the identical `snapshot_date` to `snapshot_all_sectors`.
+
+`TestSectorHealthOutcomeSemantics` (finding #2):
+- `success` marks the due period done.
+- `no_eligible_sectors` (0 written, all unavailable, 0 upsert failures)
+  marks the due period done AND does not retry on a later evaluation in
+  the same period.
+- a partial upsert failure (some rows written, `upsert_failed > 0`) is
+  `failure`, not `success` — due period not marked done, retries after
+  backoff.
+- an exception is `failure`.
+
+`TestSectorHealthCrossCycleRace` (finding #3):
+- an abandoned first attempt that (via a nested real call, not a
+  hand-rolled stand-in) finishes after a later attempt has already
+  committed its result must not clobber that newer result — the stale
+  token is detected and discarded.
+- sanity check: the non-racy single-attempt path still commits normally.
+
+`tests/test_sector_health.py` additions (`intelligence/sector_health.py`
+changes, additive):
+- `snapshot_all_sectors`'s default date comes from
+  `datetime.now(timezone.utc).date()`, not `date.today()`.
+- an explicit `snapshot_date` is the value bound into every upsert.
+- `upsert_failed` counts raised exceptions during the per-sector upsert.
+
+`python -m pytest tests/test_hermes_sector_schedule.py tests/test_hermes_timeout_budgets.py tests/test_sector_health.py -q`
+— 35 passed, 2 pre-existing failures unrelated to this change
+(`test_endpoint_does_not_cache_unavailable`,
+`test_endpoint_shape_and_unknown_sector` fail at import time on
+`DB_PASSWORD` / `.env` not being sourced in this worktree's shell —
+`api.routers.sector_health` pulls in `config.settings`, which this PR's
+diff does not touch).
 
 ## Other daily tasks: NOT touched in this PR
 
-Only `scripts/hermes_operator.py` (the sector-health block + the two new
-helper functions), `scripts/hermes_health.py` (the two new state fields),
-`tests/test_hermes_sector_schedule.py`, and this handoff doc were changed.
-No other daily task's scheduling or behaviour was modified.
+Only `scripts/hermes_operator.py` (the sector-health block + its two
+helper functions), `scripts/hermes_health.py` (the sector-health state
+fields), `intelligence/sector_health.py` (additive: `snapshot_date` param,
+`upsert_failed` return field), `tests/test_hermes_sector_schedule.py`,
+`tests/test_sector_health.py`, and this handoff doc were changed. No other
+daily task's scheduling or behaviour was modified.
+
+`POST /vault/backlinks` (`api/routers/vault.py:433-472`) rewrites tracked
+repo files in place (`_run_backlinks` reads every collected markdown file
+and calls `f.write_text(...)` when it adds wikilinks) — a
+tracked-file-rewrite path noted here because it's the same general class of
+"idempotency/identity" concern as this PR's snapshot-date fix, but it is
+unrelated to Hermes scheduling and was **not** touched by this PR.
 
 ## Sibling minute-window steps (candidates for the same helper, later)
 
