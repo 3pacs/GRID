@@ -136,6 +136,16 @@ ACTIVE_HYPO_SCORING_BATCH_SIZE = 200
 ACTIVE_HYPO_SCORING_MAX_RUNTIME_S = 240
 ACTIVE_HYPO_SCORING_INTERVAL_MINUTES = 30
 
+# Sector health snapshot — daily due-period scheduling (2026-09-19). Was
+# "now.hour == 3 and now.minute < 10", which only fired on the rare cycle
+# evaluated inside that 10-minute slice; production ran it successfully
+# twice in the last 400 snapshots (2026-07-13, 2026-09-13). See
+# docs/handoffs/2026-09-19/fable-hermes-sector-schedule.md.
+SECTOR_HEALTH_BOUNDARY_HOUR = 3               # UTC hour the daily due-period opens
+SECTOR_HEALTH_RETRY_BACKOFF_MINUTES = 60      # min minutes between failed-attempt retries
+SECTOR_HEALTH_MAX_ATTEMPTS_PER_DAY = 5        # cap on attempts per due period so a
+                                               # persistent failure doesn't retry every cycle forever
+
 # Earnings events → earnings_calendar back-compat sync. The DB-side
 # function ``sync_earnings_events_to_calendar()`` (installed
 # 2026-05-17 via migration ``20260517_earnings_events_compat.sql``)
@@ -664,6 +674,212 @@ def _dispatch_daily_storage_maintenance(engine: Any, state: OperatorState) -> di
         health={},
         state=state,
     )
+
+
+def _period_boundary(now: datetime, boundary_hour: int) -> datetime:
+    """Return the most recent UTC boundary crossing (``boundary_hour:00``)
+    at or before *now*.
+
+    Internal to :func:`daily_task_due`; also reused by the sector-health
+    retry-attempt bookkeeping in :func:`run_intelligence_tasks` so both
+    share one definition of "due period". *now* must already be
+    timezone-aware (callers normalise before calling this).
+    """
+    today_boundary = now.replace(hour=boundary_hour, minute=0, second=0, microsecond=0)
+    if now >= today_boundary:
+        return today_boundary
+    return today_boundary - timedelta(days=1)
+
+
+def daily_task_due(
+    last_success: datetime | None,
+    now: datetime,
+    boundary_hour: int,
+) -> bool:
+    """Return True if a once-per-due-period daily task is due.
+
+    Replaces the old ``now.hour == H and now.minute < 10`` window pattern,
+    which only executes the task on the rare cycle that happens to be
+    evaluated inside that 10-minute slice. Traced live on the sector-health
+    step (2026-09-19): production went from 2026-07-13 to 2026-09-13
+    between successful runs — 62 days — because cycles routinely take long
+    enough, or start late enough, to miss the window (a cycle starting
+    02:55Z had not reached the check by 03:13Z). See
+    docs/handoffs/2026-09-19/fable-hermes-sector-schedule.md.
+
+    A due *period* is the UTC day starting at ``boundary_hour:00``. The
+    task is due at any evaluation at or after the most recent boundary
+    crossing, as long as no successful run (``last_success``) has landed
+    since that boundary. There is no upper bound on the window: if the
+    process is idle, mid-cycle, or was just restarted, the first
+    evaluation after the boundary still runs the task instead of skipping
+    the period entirely.
+
+    Timezone handling: both arguments are expected to be timezone-aware
+    UTC datetimes — every call site in this module uses
+    ``datetime.now(timezone.utc)``. A naive value is NOT rejected; it is
+    normalised by assuming it is already UTC, the same convention
+    ``OperatorState.hydrate_from_snapshot`` uses when restoring timestamps
+    from a JSON snapshot that predates tzinfo-aware storage.
+    """
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    if last_success is None:
+        return True
+    if last_success.tzinfo is None:
+        last_success = last_success.replace(tzinfo=timezone.utc)
+    return last_success < _period_boundary(now, boundary_hour)
+
+
+def _maybe_run_sector_health_snapshot(
+    engine: Any,
+    state: OperatorState,
+    now: datetime,
+    results: dict[str, Any],
+) -> None:
+    """Run the daily sector-health snapshot if its due period has arrived.
+
+    Computes the composite health score for every sector in ``SECTOR_MAP``
+    and upserts one row per (sector, today) into ``sector_health_snapshots``
+    (``intelligence/sector_health.py::snapshot_all_sectors`` — the INSERT is
+    ``ON CONFLICT (sector_name, snapshot_date) DO UPDATE``, so a re-run
+    inside the same UTC day is idempotent by construction; the state marker
+    below exists to skip redundant compute/DB work, not to guard against
+    duplicate rows). The row ~30 days back is read by the API to label
+    ``trend_30d``.
+
+    Scheduling uses :func:`daily_task_due` (see its docstring) instead of
+    the old ``now.hour == 3 and now.minute < 10`` window — see
+    ``docs/handoffs/2026-09-19/fable-hermes-sector-schedule.md`` for the
+    production trace that motivated this (successful runs 62 days apart
+    despite ~5-minute cycles, because most cycles land outside the
+    10-minute slice).
+
+    Snapshot date identity: every attempt (and retry) within one due
+    period passes the SAME ``snapshot_date`` — the date of
+    ``_period_boundary(now, SECTOR_HEALTH_BOUNDARY_HOUR)`` — to
+    :func:`intelligence.sector_health.snapshot_all_sectors`, not "today"
+    at the moment of the call. Without this, a 23:30 UTC attempt that
+    fails and a 00:30 UTC retry that succeeds would target two different
+    calendar dates even though they are one due period to this
+    scheduler, defeating the (sector_name, snapshot_date) upsert's
+    idempotency.
+
+    Outcome semantics: a call either (a) ``success`` — at least one row
+    written and no upsert failures, (b) ``no_eligible_sectors`` — zero
+    rows written, every sector reported unavailable, no upsert failures;
+    this is a legitimate empty day, so the due period IS marked done, or
+    (c) ``failure`` — any upsert failure or an exception; the due period
+    is NOT marked done. Failure handling: a failed execution does NOT
+    advance ``state.last_sector_health`` (so the due period is not
+    marked done and a later evaluation can retry), but retries are
+    throttled to once every ``SECTOR_HEALTH_RETRY_BACKOFF_MINUTES`` (60)
+    and capped at ``SECTOR_HEALTH_MAX_ATTEMPTS_PER_DAY`` (5) per due
+    period so a persistent failure doesn't re-attempt on every ~5-minute
+    cycle indefinitely. The outcome is recorded on
+    ``state.last_sector_health_outcome`` regardless of which branch runs.
+
+    Cross-cycle race guard: this step runs inside ``run_intelligence_tasks``,
+    which the caller wraps in ``_run_with_timeout`` — a timeout abandons
+    the worker thread rather than killing it, so an orphaned attempt can
+    still be running when a later cycle starts a fresh attempt. To keep
+    an abandoned worker from clobbering a newer attempt's result, this
+    function captures ``state.sector_health_attempt_token`` (incremented
+    at attempt start) locally and only commits ``last_sector_health`` /
+    ``last_sector_health_outcome`` if the token is still current when the
+    call completes; otherwise the result is discarded and logged as
+    stale.
+    """
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+
+    sector_health_period_due = daily_task_due(
+        state.last_sector_health, now, SECTOR_HEALTH_BOUNDARY_HOUR,
+    )
+
+    sector_health_due = False
+    if sector_health_period_due:
+        attempt_in_this_period = (
+            state.last_sector_health_attempt is not None
+            and not daily_task_due(
+                state.last_sector_health_attempt, now, SECTOR_HEALTH_BOUNDARY_HOUR,
+            )
+        )
+        if not attempt_in_this_period:
+            # Fresh due period (or a restart with no attempt recorded yet
+            # for it) — always allowed, and the attempt counter resets.
+            state.sector_health_attempt_count = 0
+            sector_health_due = True
+        else:
+            # Computed from the *passed-in* now, not a fresh wall-clock
+            # read (unlike _minutes_since) — this function is evaluated
+            # with the caller's `now`, and callers (including tests) may
+            # legitimately pass a `now` that differs from the real clock.
+            last_attempt = state.last_sector_health_attempt
+            if last_attempt.tzinfo is None:
+                last_attempt = last_attempt.replace(tzinfo=timezone.utc)
+            minutes_since_attempt = (now - last_attempt).total_seconds() / 60.0
+            backoff_elapsed = minutes_since_attempt >= SECTOR_HEALTH_RETRY_BACKOFF_MINUTES
+            under_attempt_cap = (
+                state.sector_health_attempt_count < SECTOR_HEALTH_MAX_ATTEMPTS_PER_DAY
+            )
+            sector_health_due = backoff_elapsed and under_attempt_cap
+
+    if not sector_health_due:
+        return
+
+    log.info(
+        "Running daily sector health snapshot (due since {h}:00 UTC, attempt {a})",
+        h=SECTOR_HEALTH_BOUNDARY_HOUR, a=state.sector_health_attempt_count + 1,
+    )
+    state.last_sector_health_attempt = now
+    state.sector_health_attempt_count += 1
+    state.sector_health_attempt_token += 1
+    attempt_token = state.sector_health_attempt_token
+    due_period_date = _period_boundary(now, SECTOR_HEALTH_BOUNDARY_HOUR).date()
+
+    def _commit(outcome: str, extra: dict[str, Any]) -> None:
+        """Write the attempt's result to `state`/`results`, but only if no
+        later attempt has started since this one (see docstring)."""
+        if state.sector_health_attempt_token != attempt_token:
+            log.warning(
+                "stale sector-health worker result ignored (token {t}, current {c})",
+                t=attempt_token, c=state.sector_health_attempt_token,
+            )
+            return
+        results["sector_health_snapshot"] = {**extra, "outcome": outcome}
+        state.last_sector_health_outcome = outcome
+        if outcome in ("success", "no_eligible_sectors"):
+            state.last_sector_health = now
+
+    try:
+        from intelligence.sector_health import snapshot_all_sectors
+        sh_result = snapshot_all_sectors(engine, snapshot_date=due_period_date)
+
+        written = sh_result.get("snapshots_written", 0)
+        skipped = sh_result.get("snapshots_skipped_unavailable", 0)
+        upsert_failed = sh_result.get("upsert_failed", 0)
+
+        if upsert_failed > 0:
+            outcome = "failure"
+            log.warning(
+                "sector_health: {n} upsert failure(s), due period not marked done",
+                n=upsert_failed,
+            )
+        elif written == 0 and skipped > 0:
+            outcome = "no_eligible_sectors"
+            log.info(
+                "sector_health: executed, no eligible sectors, nothing to write "
+                "({k} unavailable)", k=skipped,
+            )
+        else:
+            outcome = "success"
+            log.info("sector_health: {n} snapshots written", n=written)
+
+        _commit(outcome, sh_result)
+    except Exception as exc:
+        log.warning("sector_health snapshot failed: {e}", e=str(exc))
+        _commit("failure", {"status": "failed", "error": str(exc)})
 
 
 def run_intelligence_tasks(
@@ -1202,33 +1418,10 @@ def run_intelligence_tasks(
 
         state.last_daily_intel = now
 
-    # ── Daily at 3:00 AM UTC — sector health snapshot ───────────────
-    # Computes the composite health score for every sector in SECTOR_MAP
-    # and upserts one row per (sector, today) into sector_health_snapshots.
-    # The row ~30 days back is read by the API to label trend_30d.
-
-    is_sector_health_window = (now.hour == 3 and now.minute < 10)
-    sector_health_due = (
-        is_sector_health_window
-        and _hours_since(state.last_sector_health) >= 20
-    )
-
-    if sector_health_due:
-        log.info("Running daily sector health snapshot (3:00 AM UTC)")
-        try:
-            from intelligence.sector_health import snapshot_all_sectors
-            sh_result = snapshot_all_sectors(engine)
-            results["sector_health_snapshot"] = sh_result
-            log.info(
-                "sector_health: {n} snapshots written",
-                n=sh_result.get("snapshots_written", 0),
-            )
-        except Exception as exc:
-            log.warning("sector_health snapshot failed: {e}", e=str(exc))
-            results["sector_health_snapshot"] = {
-                "status": "failed", "error": str(exc),
-            }
-        state.last_sector_health = now
+    # ── Daily due-period (opens 3:00 AM UTC) — sector health snapshot ──
+    # See _maybe_run_sector_health_snapshot() docstring for the schedule,
+    # idempotency, and failure/backoff design.
+    _maybe_run_sector_health_snapshot(engine, state, now, results)
 
     # ── Daily at 6:30 UTC — forced-flow waterfall briefing ──────────
     # Implements docs/playbooks/opex_waterfall.md. Runs once per day,
