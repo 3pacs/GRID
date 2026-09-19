@@ -267,7 +267,13 @@ class TestDefaultPlanEndToEnd:
         assert not any("/chat/compose" in u for (_m, u, _b) in calls)
         assert not any("/chat/ask/stream" in u for (_m, u, _b) in calls)
         statuses = {s["name"]: s["status"] for s in result["steps"]}
-        assert statuses["composer"] == "blocked"
+        # Intentionally not run because of --mode=non-mutating — this is a
+        # "skipped" grading, not a "blocked" one: it must never contribute
+        # to exit_code (see TestFullyOkNonMutatingRun below for the isolated
+        # proof), unlike a genuine environment blockage (no token, missing
+        # release dir, ...) which this test's fake nonexistent release_dir
+        # does still trip on other steps (alerts_count, freshness, ...).
+        assert statuses["composer"] == "skipped"
         assert "non-mutating" in next(
             s["note"] for s in result["steps"] if s["name"] == "composer"
         )
@@ -296,6 +302,68 @@ class TestDefaultPlanEndToEnd:
             text = str(body or "")
             assert "NVDA" not in text
             assert "drops 5 percent" not in text
+
+
+class TestFullyOkNonMutatingRun:
+    """Regression test for the 2026-09-18 production run (deploy run
+    35410892584, artifact exit_code 2): every read step reported "ok" —
+    health, static, auth, widget_data, freshness, logs, deploy_tree — and
+    the only non-"ok" step was composer, intentionally not run under
+    --mode=non-mutating (the only mode dad-smoke.yml/deploy.yml ever pass).
+    Because step_composer graded that mode-skip "blocked" (the same status
+    used for a genuine environment blockage), run() mapped it to exit_code
+    2 and the deploy's smoke job failed on every deployment even though
+    nothing was actually broken or blocked.
+
+    step_composer is deliberately NOT mocked here — this proves the real
+    mode-skip branch (scripts/smoke_dad_path.py's step_composer, `mode !=
+    MODE_MUTATING`) is graded "skipped", not "blocked", and that a
+    "skipped" step never raises the exit code the way a "blocked" one
+    does."""
+
+    def test_all_reads_ok_composer_skipped_by_mode_exits_zero(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(smoke, "step_health", lambda client, budget_ms: StepResult("health", "ok"))
+        monkeypatch.setattr(
+            smoke, "step_static", lambda client, budget_ms, release_dir: StepResult("static", "ok")
+        )
+        monkeypatch.setattr(smoke, "mint_contributor_token", lambda release_dir: ("fake-token", "minted"))
+        monkeypatch.setattr(smoke, "step_widget_data", lambda client, budget_ms: StepResult("widget_data", "ok"))
+        monkeypatch.setattr(
+            smoke, "step_alerts_db_count",
+            lambda release_dir, label: StepResult(f"alerts_count:{label}", "ok", None, "count=3", {"count": 3}),
+        )
+        monkeypatch.setattr(smoke, "step_freshness", lambda release_dir: StepResult("freshness", "ok"))
+        monkeypatch.setattr(smoke, "step_logs", lambda: StepResult("logs", "ok"))
+        monkeypatch.setattr(smoke, "step_deploy_tree", lambda release_dir: StepResult("deploy_tree", "ok"))
+        # step_composer is left as the real function — mode defaults to
+        # MODE_NON_MUTATING, exactly what dad-smoke.yml/deploy.yml pass.
+
+        args = argparse.Namespace(
+            base_url="http://x", release_dir=str(tmp_path), budget_ms=5000, strict=False,
+            mode=MODE_NON_MUTATING, i_accept_production_writes=False,
+        )
+        exit_code, report, result = smoke.run(args)
+
+        statuses = {s["name"]: s["status"] for s in result["steps"]}
+        assert statuses["health"] == "ok"
+        assert statuses["static"] == "ok"
+        assert statuses["auth"] == "ok"
+        assert statuses["widget_data"] == "ok"
+        assert statuses["freshness"] == "ok"
+        assert statuses["logs"] == "ok"
+        assert statuses["deploy_tree"] == "ok"
+        assert statuses["composer"] == "skipped"
+        assert statuses["mutation_guard"] == "ok"
+        assert exit_code == 0, (
+            "a step intentionally skipped by --mode must never raise the "
+            f"exit code (production evidence: run 35410892584); got {exit_code}, steps={statuses}"
+        )
+        assert "## Skipped by mode" in report
+        assert "composer" in report
+        # And specifically: composer must NOT show up under "## Blocked
+        # items" (blocked is reserved for genuine environment blockages).
+        blocked_section = report.split("## Blocked items", 1)[1] if "## Blocked items" in report else ""
+        assert "composer" not in blocked_section
 
 
 # ── (ii) alert_created (or any mutation marker) fails the run ───────────
