@@ -327,10 +327,14 @@ def generate_prediction_postmortem(engine: Engine, prediction_id: str) -> PostMo
         )
         return None
 
-    entry_f = float(entry_price) if entry_price else 0.0
+    # An unmeasured entry price and an unstated confidence are not zeros.
+    # `entry_f = 0.0` narrated "entered at $0.00" and `conf = 0.0` narrated
+    # "with 0% confidence" into the LLM prompt below, both of which read as
+    # findings about the prediction rather than as missing data.
+    entry_f = float(entry_price) if entry_price is not None else None
     target_f = float(target_price) if target_price else 0.0
     actual_ret = float(pnl_pct) if pnl_pct else 0.0
-    conf = float(confidence) if confidence else 0.0
+    conf = float(confidence) if confidence is not None else None
 
     signals = _parse_json(signals_json)
     anti_signals = _parse_json(anti_signals_json)
@@ -350,9 +354,10 @@ def generate_prediction_postmortem(engine: Engine, prediction_id: str) -> PostMo
     signal_names = []
     if isinstance(signals, list):
         signal_names = [s.get("name", "") for s in signals if isinstance(s, dict)]
+    conf_str = "unstated" if conf is None else f"{conf:.0%}"
     thesis_str = (
         f"{model_name} predicted {direction} on {ticker} with "
-        f"{conf:.0%} confidence based on signals: {', '.join(signal_names[:5])}"
+        f"{conf_str} confidence based on signals: {', '.join(signal_names[:5])}"
     )
 
     # Load price path
@@ -1405,7 +1410,7 @@ def _classify_prediction_failure(
     *,
     ticker: str,
     direction: str,
-    entry_price: float,
+    entry_price: float | None,
     target: float,
     expiry: Any,
     actual_price: float | None,
@@ -1454,9 +1459,11 @@ def _classify_prediction_failure(
                 what_missed,
             )
 
-    # Check timing
+    # Check timing. A prediction with no measured entry price has no
+    # baseline to time against: `None > 0` raises and a 0 entry would make
+    # every move infinite, so both are excluded from the timing check.
     direction_was_right = False
-    if price_path and entry_price > 0:
+    if price_path and entry_price is not None and entry_price > 0:
         for p in price_path:
             price = p.get("price", 0)
             if not price:
@@ -1511,14 +1518,20 @@ def _classify_prediction_failure(
 def _summarise_what_happened(
     ticker: str,
     direction: str,
-    entry_price: float,
+    entry_price: float | None,
     strike: float,
     outcome: str,
     actual_return: float,
     price_path: list[dict],
 ) -> str:
     """Build a factual summary of what happened."""
-    parts = [f"{ticker} {direction}: entered at ${entry_price:.2f}, strike ${strike:.2f}."]
+    # "entered at $0.00" was a measurement nobody took. An unmeasured entry
+    # price says so instead of printing a price.
+    entry_str = (
+        "no measured entry price" if entry_price is None
+        else f"entered at ${entry_price:.2f}"
+    )
+    parts = [f"{ticker} {direction}: {entry_str}, strike ${strike:.2f}."]
 
     if price_path:
         first_price = price_path[0].get("price", entry_price)

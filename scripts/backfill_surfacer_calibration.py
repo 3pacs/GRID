@@ -258,8 +258,11 @@ def _materialize_ticker_calibration(conn: Any) -> int:
             AVG(confidence) AS avg_confidence,
             AVG(expected_move_pct) AS avg_expected_move_pct,
             AVG(actual_move_pct) AS avg_actual_move_pct,
-            AVG(POWER(COALESCE(confidence, 0.5) - outcome, 2)) AS brier,
-            AVG(ABS(COALESCE(confidence, 0.5) - outcome)) AS ece,
+            -- Imputing a missing confidence scored an unstated forecast as
+            -- if the model had stated 50%. AVG() already skips NULL, so the
+            -- bare subtraction excludes those rows from brier/ece instead.
+            AVG(POWER(confidence - outcome, 2)) AS brier,
+            AVG(ABS(confidence - outcome)) AS ece,
             MIN(created_at) AS first_seen,
             MAX(created_at) AS last_seen,
             MAX(scored_at) AS last_scored_at,
@@ -328,8 +331,10 @@ def _materialize_signal_calibration(conn: Any) -> int:
             AVG(outcome) AS hit_rate,
             AVG(ABS(contribution_weight)) AS avg_contribution_weight,
             AVG(confidence) AS avg_confidence,
-            AVG(POWER(COALESCE(confidence, 0.5) - outcome, 2)) AS brier,
-            AVG(ABS(COALESCE(confidence, 0.5) - outcome)) AS ece,
+            -- See above: an unstated confidence is excluded from brier/ece,
+            -- not imputed at 0.5.
+            AVG(POWER(confidence - outcome, 2)) AS brier,
+            AVG(ABS(confidence - outcome)) AS ece,
             MIN(created_at) AS first_seen,
             MAX(created_at) AS last_seen,
             MAX(scored_at) AS last_scored_at,

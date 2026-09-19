@@ -119,9 +119,12 @@ def get_predictions(
             expiry_date = date.fromisoformat(expiry_date)
         days_left = (expiry_date - today).days if expiry_date else 0
 
-        # Compute tracking P&L for active predictions
+        # Compute tracking P&L for active predictions.
+        # A NULL entry price (no spot observed at publish time) is not a zero
+        # entry price. Both are excluded, but explicitly: `and r[6]` only
+        # escaped a divide-by-zero because 0.0 happens to be falsy.
         tracking_pnl = None
-        if r[17] == "pending" and r[6]:
+        if r[17] == "pending" and r[6] is not None and float(r[6]) > 0:
             try:
                 with engine.connect() as conn2:
                     spot = conn2.execute(text("""
@@ -216,7 +219,11 @@ def get_latest(
             FROM oracle_predictions
             WHERE created_at >= :ct - INTERVAL '5 minutes'
               AND dedup_keep = TRUE
-            ORDER BY confidence DESC
+            -- A prediction with no stated confidence is unknown, not the
+            -- most confident: NULLS LAST, never first. Postgres sorts NULLs
+            -- FIRST under DESC, so without this an unscored row heads the
+            -- headline list.
+            ORDER BY confidence DESC NULLS LAST
             LIMIT 20
         """), {"ct": cycle_time}).fetchall()
 
