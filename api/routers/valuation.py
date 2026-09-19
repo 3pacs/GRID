@@ -347,8 +347,11 @@ def catalyst_timeline(
                     "achievement_pct": r[8],
                     "probability": r[9],
                     "confidence_source": r[10],
-                    "value_impact_ps": float(r[11]) if r[11] else None,
-                    "value_impact_pct": float(r[12]) if r[12] else None,
+                    # `is not None`, not truthiness: a stored 0.0 impact is a
+                    # measurement, a NULL is unknown. `x if x else None`
+                    # silently turned the former into the latter.
+                    "value_impact_ps": float(r[11]) if r[11] is not None else None,
+                    "value_impact_pct": float(r[12]) if r[12] is not None else None,
                     "notes": r[14],
                     "invalidation": _milestone_invalidation(r[1], r[5], r[6], status),
                 })
@@ -410,11 +413,11 @@ def catalyst_timeline(
                     "target_price": float(target) if target else None,
                     "entry_price": float(entry) if entry else None,
                     "confidence": float(r[6]) if r[6] else None,
-                    "expected_move_pct": float(r[7]) if r[7] else None,
+                    "expected_move_pct": float(r[7]) if r[7] is not None else None,
                     "model": r[8],
                     "verdict": r[9],
-                    "actual_price": float(r[10]) if r[10] else None,
-                    "actual_move_pct": float(r[11]) if r[11] else None,
+                    "actual_price": float(r[10]) if r[10] is not None else None,
+                    "actual_move_pct": float(r[11]) if r[11] is not None else None,
                     "invalidation": _prediction_invalidation(direction, target, entry),
                 })
         except Exception as exc:
