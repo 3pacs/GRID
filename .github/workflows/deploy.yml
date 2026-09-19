@@ -967,6 +967,10 @@ jobs:
     # real deploys — a failure here does not fail this workflow. Same gating as the
     # restart step: only meaningful right after a deploy that actually restarted
     # grid-api, and only if that deploy succeeded.
+    # Always non-mutating: dad-smoke.yml hardcodes --mode non-mutating on the
+    # script invocation (scripts/smoke_dad_path.py) and exposes no input to
+    # change it. --mode=mutating is not wired into any workflow in this
+    # repository; it is a manually-gated CLI escape hatch only.
     if: needs.deploy.result == 'success' && (github.event_name == 'push' || inputs.do_restart == true)
     uses: ./.github/workflows/dad-smoke.yml
     with:

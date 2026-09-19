@@ -58,6 +58,7 @@ jobs:
             --release-dir "$RELEASE_DIR" \
             --json /tmp/dad_smoke.json \
             --budget-ms 5000 \
+            --mode non-mutating \
             $STRICT_FLAG
 
       - name: Upload smoke result JSON
