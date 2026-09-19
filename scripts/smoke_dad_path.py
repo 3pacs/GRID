@@ -43,8 +43,12 @@ target only.
 
 Exit codes: 0 nothing broken, 1 something broken AND --strict was passed (or
 the non-mutating guard caught an actual mutation, regardless of --strict),
-2 something is blocked (regardless of --strict; blocked takes priority
-unless the run was already forced to 1 by a caught mutation).
+2 something is blocked — a genuine environment blockage (no token, release
+dir missing, journalctl unavailable, a DB query failed) — regardless of
+--strict; blocked takes priority unless the run was already forced to 1 by a
+caught mutation. A step that is intentionally not run because of --mode
+(currently: composer, skipped under --mode=non-mutating) is graded
+"skipped", not "blocked" — it never raises the exit code.
 """
 
 from __future__ import annotations
@@ -80,7 +84,7 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8000"
 DEFAULT_RELEASE_DIR = "/data/grid_v4/grid_release"
 DEFAULT_BUDGET_MS = 5000
 
-_STATUS_RANK = {"broken": 0, "blocked": 1, "degraded": 2, "ok": 3}
+_STATUS_RANK = {"broken": 0, "blocked": 1, "degraded": 2, "ok": 3, "skipped": 3}
 
 
 # ── Non-mutating guard ───────────────────────────────────────────────────
@@ -201,7 +205,7 @@ def redact_secrets(text: str) -> str:
 @dataclass
 class StepResult:
     name: str
-    status: str  # ok | degraded | broken | blocked
+    status: str  # ok | degraded | broken | blocked | skipped
     latency_ms: float | None = None
     note: str = ""
     data: dict[str, Any] = field(default_factory=dict)
@@ -768,7 +772,7 @@ def step_composer(client: Client, budget_ms: int, mode: str = MODE_NON_MUTATING)
 
     if mode != MODE_MUTATING:
         return StepResult(
-            "composer", "blocked", None,
+            "composer", "skipped", None,
             f"skipped in --mode={MODE_NON_MUTATING}: /chat/compose and /chat/ask/stream "
             "can persist state and/or spend a real LLM call (see "
             "NON_MUTATING_EXCLUDED_ENDPOINTS); alert-creation/composer smoke only "
@@ -1116,6 +1120,7 @@ def render_report(steps: list[StepResult], meta: dict[str, Any]) -> str:
     degraded = [s for s in steps if s.status == "degraded"]
     broken = [s for s in steps if s.status == "broken"]
     blocked = [s for s in steps if s.status == "blocked"]
+    skipped = [s for s in steps if s.status == "skipped"]
 
     lines.append("## Summary")
     lines.append("")
@@ -1123,6 +1128,7 @@ def render_report(steps: list[StepResult], meta: dict[str, Any]) -> str:
     lines.append(f"- **Degraded** ({len(degraded)}): {', '.join(s.name for s in degraded) or 'none'}")
     lines.append(f"- **Broken** ({len(broken)}): {', '.join(s.name for s in broken) or 'none'}")
     lines.append(f"- **Blocked** ({len(blocked)}): {', '.join(s.name for s in blocked) or 'none'}")
+    lines.append(f"- **Skipped by mode** ({len(skipped)}): {', '.join(s.name for s in skipped) or 'none'}")
     lines.append("")
 
     lines.append("## Evidence")
@@ -1160,6 +1166,13 @@ def render_report(steps: list[StepResult], meta: dict[str, Any]) -> str:
         lines.append("## Blocked items")
         lines.append("")
         for s in blocked:
+            lines.append(f"- **{s.name}**: {redact_secrets(s.note)}")
+        lines.append("")
+
+    if skipped:
+        lines.append("## Skipped by mode")
+        lines.append("")
+        for s in skipped:
             lines.append(f"- **{s.name}**: {redact_secrets(s.note)}")
         lines.append("")
 
