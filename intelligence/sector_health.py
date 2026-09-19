@@ -583,6 +583,17 @@ def snapshot_all_sectors(
             abandoned worker's write reaches the database after a newer
             attempt's write (see ``should_continue`` and the WHERE guard
             below).
+
+            Tie rule: when two attempts compute the SAME ``as_of`` (e.g. one
+            due-period retry started from a shared ``now``), the WHERE guard
+            below uses strict ``<`` — whichever attempt's write reaches
+            Postgres FIRST wins, and the second (equal ``as_of``) attempt's
+            write is rejected (``rowcount == 0``, counted as
+            ``snapshots_stale_skipped``) rather than overwriting the row
+            that already landed. "First committed wins on equal as_of."
+            This was previously ``<=``, which let a strictly OLDER/abandoned
+            attempt whose ``computed_at`` happened to equal the stored row's
+            ``as_of`` clobber it; ``<`` closes that.
         should_continue: Optional callable, checked before each sector's
             compute AND again immediately before each sector's upsert.
             When it returns False, the loop stops where it is (an ordinary
@@ -665,7 +676,7 @@ def snapshot_all_sectors(
                             components = EXCLUDED.components,
                             as_of = EXCLUDED.as_of
                         WHERE sector_health_snapshots.as_of IS NULL
-                           OR sector_health_snapshots.as_of <= EXCLUDED.as_of
+                           OR sector_health_snapshots.as_of < EXCLUDED.as_of
                         """
                     ).bindparams(
                         s=sector_name,
@@ -676,12 +687,14 @@ def snapshot_all_sectors(
                     )
                 )
                 # rowcount is 1 when the INSERT landed or the DO UPDATE's
-                # WHERE guard matched (this attempt is at least as new as
-                # whatever as_of was already stored); 0 means the guard
-                # rejected the write because an already-stored row has a
-                # newer as_of — i.e. a LATER attempt already wrote this
-                # sector, and this (older/abandoned) attempt's write must
-                # not overwrite it. That is not a failure: it is the
+                # WHERE guard matched (this attempt is STRICTLY newer than
+                # whatever as_of was already stored — strict `<`, not `<=`);
+                # 0 means the guard rejected the write because an
+                # already-stored row has an as-new-or-newer as_of — i.e. a
+                # LATER (or, on an exact as_of tie, an earlier-COMMITTED)
+                # attempt already wrote this sector, and this attempt's
+                # write must not overwrite it. First committed wins on
+                # equal as_of. That is not a failure: it is the
                 # cross-attempt protection working as intended, so it is
                 # counted separately from upsert_failed.
                 if upsert_result.rowcount == 1:

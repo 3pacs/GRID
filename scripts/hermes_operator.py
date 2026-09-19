@@ -47,6 +47,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import uuid
@@ -732,6 +733,29 @@ def daily_task_due(
     return last_success < _period_boundary(now, boundary_hour)
 
 
+# Guards the in-process sector-health state marker (state.last_sector_health*,
+# state.sector_health_attempt*) against the check-to-write race described in
+# _maybe_run_sector_health_snapshot's docstring below: without it, Python can
+# switch threads between _commit's token check and its subsequent writes, so
+# an abandoned worker's belated _commit can pass the check, a newer attempt
+# can then start and commit, and the old worker's writes land last anyway.
+# Deliberately module-level, NOT an attribute on OperatorState — OperatorState
+# is serialised via to_dict() (analytical-snapshot persistence), and a
+# threading.Lock is not picklable/JSON-able. The DB row race for the
+# sector_health_snapshots table itself is closed separately, by the upsert's
+# `WHERE ... as_of < EXCLUDED.as_of` guard in
+# intelligence/sector_health.py::snapshot_all_sectors (evaluated atomically
+# on the locked conflicting row in PostgreSQL); this lock only closes the
+# in-process marker race, which the DB guard does not touch.
+_SECTOR_HEALTH_STATE_LOCK = threading.Lock()
+
+# Test-only seam: called inside _commit, between the token check and the
+# state/results writes, so a test can force a specific thread interleaving
+# at that exact point (see tests/test_sector_health_upsert_ordering_pg.py,
+# scenario d). Default no-op; production code never sets this.
+_SECTOR_HEALTH_COMMIT_TEST_HOOK: Callable[[], None] | None = None
+
+
 def _maybe_run_sector_health_snapshot(
     engine: Any,
     state: OperatorState,
@@ -769,11 +793,21 @@ def _maybe_run_sector_health_snapshot(
     Outcome semantics: a call either (a) ``success`` — at least one row
     written and no upsert failures, (b) ``no_eligible_sectors`` — zero
     rows written, every sector reported unavailable, no upsert failures;
-    this is a legitimate empty day, so the due period IS marked done, or
-    (c) ``failure`` — any upsert failure or an exception; the due period
-    is NOT marked done. Failure handling: a failed execution does NOT
-    advance ``state.last_sector_health`` (so the due period is not
-    marked done and a later evaluation can retry), but retries are
+    this is a legitimate empty day, so the due period IS marked done,
+    (c) ``superseded`` — zero rows written, no upsert failures, but at
+    least one sector was ``snapshots_stale_skipped`` (every row this
+    attempt tried already had an as-new-or-newer row from a different
+    attempt — see the ``as_of`` tie rule on
+    ``intelligence.sector_health.snapshot_all_sectors``: "first committed
+    wins on equal as_of"); this attempt did no useful work but is not a
+    failure either, so the due period IS marked done, PROVIDED the token
+    is still current — if a newer attempt is already in-process, that
+    newer attempt owns marking its own due period done, and this stale
+    attempt's ``_commit`` call is a no-op regardless (see the token guard
+    below), or (d) ``failure`` — any upsert failure or an exception; the
+    due period is NOT marked done. Failure handling: a failed execution
+    does NOT advance ``state.last_sector_health`` (so the due period is
+    not marked done and a later evaluation can retry), but retries are
     throttled to once every ``SECTOR_HEALTH_RETRY_BACKOFF_MINUTES`` (60)
     and capped at ``SECTOR_HEALTH_MAX_ATTEMPTS_PER_DAY`` (5) per due
     period so a persistent failure doesn't re-attempt on every ~5-minute
@@ -790,6 +824,23 @@ def _maybe_run_sector_health_snapshot(
     ``last_sector_health_outcome`` if the token is still current when the
     call completes; otherwise the result is discarded and logged as
     stale.
+
+    Check-to-write race on the state marker: the token check above and the
+    subsequent writes to ``state.last_sector_health*`` are NOT atomic on
+    their own — Python can switch threads between ``_commit``'s check and
+    its assignments, so an abandoned worker's ``_commit`` can pass the
+    check, a newer attempt can then start AND commit, and the old worker's
+    assignments can still land last, overwriting the newer attempt's
+    marker. ``_SECTOR_HEALTH_STATE_LOCK`` (module-level, not stored on
+    ``OperatorState`` — see its own docstring) is held around (a) the
+    attempt-start block (token bump + attempt fields) below, (b) the whole
+    of ``_commit`` (check + writes), and (c) the timeout-path token bump in
+    ``_run_sector_and_intelligence_steps``, so the check and the writes for
+    any one attempt happen atomically with respect to every other
+    attempt's check-and-write. This is purely an in-process guard for the
+    Python-level marker; the DB row race for the actual
+    ``sector_health_snapshots`` table is independently closed by the
+    upsert's ``WHERE`` guard (see ``snapshot_all_sectors``).
     """
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
@@ -833,25 +884,33 @@ def _maybe_run_sector_health_snapshot(
         "Running daily sector health snapshot (due since {h}:00 UTC, attempt {a})",
         h=SECTOR_HEALTH_BOUNDARY_HOUR, a=state.sector_health_attempt_count + 1,
     )
-    state.last_sector_health_attempt = now
-    state.sector_health_attempt_count += 1
-    state.sector_health_attempt_token += 1
-    attempt_token = state.sector_health_attempt_token
+    with _SECTOR_HEALTH_STATE_LOCK:
+        state.last_sector_health_attempt = now
+        state.sector_health_attempt_count += 1
+        state.sector_health_attempt_token += 1
+        attempt_token = state.sector_health_attempt_token
     due_period_date = _period_boundary(now, SECTOR_HEALTH_BOUNDARY_HOUR).date()
 
     def _commit(outcome: str, extra: dict[str, Any]) -> None:
         """Write the attempt's result to `state`/`results`, but only if no
-        later attempt has started since this one (see docstring)."""
-        if state.sector_health_attempt_token != attempt_token:
-            log.warning(
-                "stale sector-health worker result ignored (token {t}, current {c})",
-                t=attempt_token, c=state.sector_health_attempt_token,
-            )
-            return
-        results["sector_health_snapshot"] = {**extra, "outcome": outcome}
-        state.last_sector_health_outcome = outcome
-        if outcome in ("success", "no_eligible_sectors"):
-            state.last_sector_health = now
+        later attempt has started since this one (see docstring). The
+        check and the writes happen under _SECTOR_HEALTH_STATE_LOCK so an
+        abandoned worker cannot pass the check and then lose a race to
+        write after a newer attempt has already committed (the
+        check-to-write race described in this function's docstring)."""
+        with _SECTOR_HEALTH_STATE_LOCK:
+            if state.sector_health_attempt_token != attempt_token:
+                log.warning(
+                    "stale sector-health worker result ignored (token {t}, current {c})",
+                    t=attempt_token, c=state.sector_health_attempt_token,
+                )
+                return
+            if _SECTOR_HEALTH_COMMIT_TEST_HOOK is not None:
+                _SECTOR_HEALTH_COMMIT_TEST_HOOK()
+            results["sector_health_snapshot"] = {**extra, "outcome": outcome}
+            state.last_sector_health_outcome = outcome
+            if outcome in ("success", "no_eligible_sectors", "superseded"):
+                state.last_sector_health = now
 
     try:
         from intelligence.sector_health import snapshot_all_sectors
@@ -889,12 +948,28 @@ def _maybe_run_sector_health_snapshot(
         written = sh_result.get("snapshots_written", 0)
         skipped = sh_result.get("snapshots_skipped_unavailable", 0)
         upsert_failed = sh_result.get("upsert_failed", 0)
+        stale_skipped = sh_result.get("snapshots_stale_skipped", 0)
 
         if upsert_failed > 0:
             outcome = "failure"
             log.warning(
                 "sector_health: {n} upsert failure(s), due period not marked done",
                 n=upsert_failed,
+            )
+        elif written == 0 and stale_skipped > 0:
+            # Every row this attempt tried already had an as-new-or-newer
+            # row from a different attempt (the snapshot_all_sectors
+            # `as_of` WHERE guard rejected every write this attempt made).
+            # Not a failure — a different attempt already did the work —
+            # so the due period is marked done via _commit's outcome set,
+            # but only if this attempt's token is still current (a newer
+            # in-process attempt already handles its own marker).
+            outcome = "superseded"
+            log.info(
+                "sector_health: superseded — {n} row(s) already had an "
+                "as-new-or-newer as_of from a different attempt, nothing "
+                "written this attempt",
+                n=stale_skipped,
             )
         elif written == 0 and skipped > 0:
             outcome = "no_eligible_sectors"
@@ -1004,7 +1079,9 @@ def _run_sector_and_intelligence_steps(
     other half of that gap — an abandoned attempt with no later attempt
     ever starting — by bumping the token itself right here on timeout, so
     the orphan's eventual ``_commit``/upsert-guard sees a stale token
-    either way.
+    either way. This bump is taken under ``_SECTOR_HEALTH_STATE_LOCK`` —
+    the same lock ``_commit`` holds — so it can never land between an
+    in-flight ``_commit``'s token check and its writes.
     """
     # ── Sector health snapshot — own step, own (short) timeout ─────────
     try:
@@ -1021,8 +1098,11 @@ def _run_sector_and_intelligence_steps(
             cycle_result["sector_health"] = {"timeout": True}
             # See docstring: bump the token so an abandoned worker's
             # belated _commit()/upsert is discarded as stale even if no
-            # later attempt ever starts.
-            state.sector_health_attempt_token += 1
+            # later attempt ever starts. Under the same lock _commit uses,
+            # so this bump can never interleave with an in-flight
+            # _commit's check-then-write.
+            with _SECTOR_HEALTH_STATE_LOCK:
+                state.sector_health_attempt_token += 1
     except Exception as exc:
         log.warning("Sector health step failed: {e}", e=str(exc))
 

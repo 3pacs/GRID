@@ -413,6 +413,96 @@ Run: `python -m pytest tests/test_hermes_sector_schedule.py
 tests/test_hermes_timeout_budgets.py tests/test_sector_health.py
 tests/test_hermes_sector_step.py -q` — 48 passed.
 
+### Review amendments (2026-09-19)
+
+A release-controller review of this PR found three defects in the above;
+all three are fixed on this branch.
+
+**1. Equal-`as_of` handling.** The upsert guard's `WHERE` clause was
+`sector_health_snapshots.as_of IS NULL OR sector_health_snapshots.as_of <=
+EXCLUDED.as_of`. With `<=`, an attempt whose `computed_at` happened to
+exactly EQUAL the already-stored row's `as_of` could overwrite it even
+though it was not strictly newer — e.g. an abandoned worker resuming after
+a newer attempt had already committed with the same timestamp. Changed to
+strict `<`. **Tie rule: first committed wins on equal `as_of`** —
+whichever write reaches Postgres first for a given `(sector_name,
+snapshot_date)` keeps its row; a second write at the identical `as_of` is
+rejected (`rowcount == 0`, counted as `snapshots_stale_skipped`, same as
+any other stale write) rather than silently overwriting it.
+
+**2. Check-to-write race on the state marker.** `_commit` (inside
+`_maybe_run_sector_health_snapshot`) checks
+`state.sector_health_attempt_token == attempt_token` and then, if it
+matches, assigns `state.last_sector_health` /
+`state.last_sector_health_outcome`. The attempt-start block does the
+token bump (`state.sector_health_attempt_token += 1`) and sets the
+attempt fields. Neither pairing was atomic: Python can switch threads
+between `_commit`'s check and its assignments, so an abandoned worker's
+`_commit` could pass the check, a newer attempt could then start AND
+commit, and the old worker's assignments could still land last —
+overwriting the newer attempt's marker even though the pre-existing DB
+row guard (finding #1) had already correctly protected the actual
+`sector_health_snapshots` rows. Fixed with a module-level
+`threading.Lock`, `_SECTOR_HEALTH_STATE_LOCK` — deliberately NOT an
+attribute on `OperatorState`, since `OperatorState` is serialised via
+`to_dict()` (analytical-snapshot persistence) and a lock is not
+picklable/JSON-able. The lock is held around (a) the attempt-start block
+(token bump + attempt fields), (b) the whole of `_commit` (check +
+writes), and (c) the timeout-path token bump in
+`_run_sector_and_intelligence_steps`. This closes only the in-process
+marker race; the DB row race for `sector_health_snapshots` itself remains
+closed by the `as_of` `WHERE` guard, evaluated atomically on the locked
+conflicting row by PostgreSQL itself. A test-only seam,
+`_SECTOR_HEALTH_COMMIT_TEST_HOOK` (module-level, default no-op, called
+inside `_commit` between the token check and the writes), lets a test
+force a specific interleaving at that exact point without needing an
+unreliable real-timing race —
+`tests/test_sector_health_upsert_ordering_pg.py`'s
+`TestStateMarkerLockClosesTheRace` uses it.
+
+**3. Superseded outcome.** If a call returns `snapshots_written == 0`,
+`upsert_failed == 0`, and `snapshots_stale_skipped > 0` (every row this
+attempt tried already had an as-new-or-newer row from a different
+attempt), the outcome is now classified as `"superseded"` — logged,
+recorded as `state.last_sector_health_outcome = "superseded"`, and the
+due period is marked done via the same `_commit` token-gated path as
+`"success"`/`"no_eligible_sectors"` (so it is only actually marked done
+if this attempt's token is still current; a newer in-process attempt
+already owns its own marker either way). Previously this case fell
+through to `"success"` (technically true — no failures — but misleading,
+since nothing was actually written) alongside legitimate empty-day runs.
+`state.last_sector_health_outcome`'s documented value set (in
+`scripts/hermes_health.py`) and the outcome docstring in
+`_maybe_run_sector_health_snapshot` both now include `"superseded"`.
+`aborted_stale` results remain uncommitted, unchanged.
+
+**New test file: `tests/test_sector_health_upsert_ordering_pg.py`.** Real
+PostgreSQL, real threads, real transactions, against a per-test schema
+(`shs_order_<pid>_<n>`) shaped exactly like
+`migrations/0028_sector_health_snapshots.sql`, via the `pg_engine`
+fixture (skips cleanly with no PostgreSQL reachable — this file is meant
+to be executed by the coordinator against a disposable database via
+`GRID_TEST_DB_URL`, not merged CI-green without ever running for real).
+Covers: an old attempt paused mid-compute while a newer attempt commits
+first (both the in-process `should_continue` short-circuit and, in a
+separate variant with `should_continue=None`, the pure DB-level guard);
+the equal-`as_of` tie rule in both thread orders; newer-`as_of`-always-wins
+regardless of order; and the state-marker lock closing the check-to-write
+race via the `_SECTOR_HEALTH_COMMIT_TEST_HOOK` seam. Pure/no-DB coverage
+for the `"superseded"` classification and for the lock actually being
+acquired (via a recording-lock stand-in) lives alongside the existing
+scheduler tests in `tests/test_hermes_sector_schedule.py`
+(`TestSupersededOutcome`, `TestStateMarkerLock`).
+
+Run (no DB, PG file skips): `DB_PASSWORD=x PYTHONUTF8=1 python -m pytest
+tests/test_hermes_sector_schedule.py tests/test_hermes_timeout_budgets.py
+tests/test_sector_health.py tests/test_hermes_sector_step.py
+tests/test_sector_health_upsert_ordering_pg.py -q` — 54 passed, 6 skipped.
+
+Run (coordinator, disposable DB): `GRID_TEST_DB_URL=<disposable-postgres-url>
+DB_PASSWORD=x PYTHONUTF8=1 python -m pytest
+tests/test_sector_health_upsert_ordering_pg.py -q` — expected 6 passed.
+
 ### NOT fixed here
 
 The daily intelligence block itself still cannot reliably complete inside

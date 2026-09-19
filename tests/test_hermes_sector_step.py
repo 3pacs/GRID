@@ -317,7 +317,7 @@ class TestSnapshotAllSectorsAsOfGuard:
         )
 
         assert captured_sql, "no upsert executed"
-        assert "as_of <= EXCLUDED.as_of" in captured_sql[0]
+        assert "as_of < EXCLUDED.as_of" in captured_sql[0]
         assert "as_of = EXCLUDED.as_of" in captured_sql[0]
         assert out["upsert_failed"] == 0
 
