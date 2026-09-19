@@ -94,7 +94,9 @@ CREATE TABLE IF NOT EXISTS company_milestones (
     achievement_pct     DOUBLE PRECISION,    -- actual / target as percentage
 
     -- Probability & confidence
-    probability         DOUBLE PRECISION NOT NULL DEFAULT 0.5 CHECK (probability >= 0 AND probability <= 1),
+    -- NULL = unscored. No default: a row nobody scored must not carry a
+    -- coin-flip prior. A stated value names its basis in confidence_source.
+    probability         DOUBLE PRECISION CHECK (probability IS NULL OR (probability >= 0 AND probability <= 1)),
     confidence_source   TEXT CHECK (confidence_source IN (
         'MANAGEMENT',    -- Company stated directly
         'ANALYST',       -- Analyst consensus

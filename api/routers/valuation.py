@@ -43,8 +43,10 @@ class MilestoneCreate(BaseModel):
     target_date: str | None = None
     target_value: float | None = None
     target_unit: str | None = None
-    probability: float = Field(default=0.5, ge=0, le=1)
-    confidence_source: str = "ANALYST"
+    # None = unscored. A stated probability must name its basis; the
+    # dataclass rejects a stated value without one.
+    probability: float | None = Field(default=None, ge=0, le=1)
+    confidence_source: str | None = None
     value_impact_ps: float | None = None
     value_impact_pct: float | None = None
     status: str = "PENDING"

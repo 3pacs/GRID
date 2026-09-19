@@ -65,8 +65,12 @@ class Milestone:
     target_unit: str | None = None
     actual_value: float | None = None
     achievement_pct: float | None = None
-    probability: float = 0.5
-    confidence_source: str = "ANALYST"
+    # `probability` is None (UNSCORED) unless someone stated one, and a
+    # stated value must carry `confidence_source` as its basis. The old
+    # dataclass default of 0.5 wrote a coin-flip prior into every row that
+    # nobody scored, indistinguishable from a stated 0.5.
+    probability: float | None = None
+    confidence_source: str | None = None
     value_impact_ps: float | None = None
     value_impact_pct: float | None = None
     status: str = "PENDING"
@@ -79,8 +83,18 @@ class Milestone:
             raise ValueError(f"Invalid milestone_type: {self.milestone_type}")
         if self.status not in VALID_STATUSES:
             raise ValueError(f"Invalid status: {self.status}")
-        if not (0 <= self.probability <= 1):
-            raise ValueError(f"Probability must be 0-1, got {self.probability}")
+        if self.probability is not None:
+            if not (0 <= self.probability <= 1):
+                raise ValueError(f"Probability must be 0-1, got {self.probability}")
+            if self.confidence_source is None:
+                raise ValueError(
+                    "A stated probability needs a confidence_source as its basis"
+                )
+        if (
+            self.confidence_source is not None
+            and self.confidence_source not in VALID_CONFIDENCE_SOURCES
+        ):
+            raise ValueError(f"Invalid confidence_source: {self.confidence_source}")
 
 
 class MilestoneTracker:
@@ -268,8 +282,10 @@ class MilestoneTracker:
             "ahead_of_schedule": row[2],
             "missed_or_behind": row[3],
             "pending": row[4],
-            "avg_achievement_pct": float(row[5]) if row[5] else None,
-            "execution_score": float(execution_score) if execution_score else None,
+            # `is not None`: a 0.0 execution score is POOR_EXECUTION, not
+            # NO_COMPLETED_MILESTONES.
+            "avg_achievement_pct": float(row[5]) if row[5] is not None else None,
+            "execution_score": float(execution_score) if execution_score is not None else None,
             "assessment": assessment,
         }
 
@@ -289,17 +305,23 @@ class MilestoneTracker:
                 "actual_value": m["actual_value"],
                 "achievement_pct": m["achievement_pct"],
                 "probability": m["probability"],
+                "confidence_source": m["confidence_source"],
                 "status": m["status"],
                 "value_impact_ps": m["value_impact_ps"],
             })
 
         return sorted(timeline, key=lambda x: x["date"] or "9999-12-31")
 
-    def probability_weighted_impact(self, ticker: str) -> float:
-        """Compute probability-weighted sum of milestone value impacts.
+    def probability_weighted_impact(self, ticker: str) -> dict[str, Any]:
+        """Probability-weighted sum of milestone value impacts, with its coverage.
 
-        This is the expected value adjustment to intrinsic value
-        from all pending milestones and rumors.
+        This is the expected value adjustment to intrinsic value from all
+        pending milestones and rumors. Only milestones that STATE a
+        probability contribute; an unscored one (probability NULL) is
+        counted in ``unscored_n`` and adds nothing — it is never given a
+        0.5 midpoint. A stated 0 is a measurement and contributes 0 while
+        counting as scored. ``scored_n`` is published beside the total so a
+        reader can see how much of the pipeline the number covers.
         """
         milestones = self.get_for_ticker(
             ticker,
@@ -307,9 +329,25 @@ class MilestoneTracker:
         )
 
         total_impact = 0.0
+        scored_n = 0
+        unscored_n = 0
+        no_impact_n = 0
         for m in milestones:
-            impact = m.get("value_impact_ps") or 0.0
-            prob = m.get("probability") or 0.5
-            total_impact += impact * prob
+            prob = m.get("probability")
+            if prob is None:
+                unscored_n += 1
+                continue
+            impact = m.get("value_impact_ps")
+            if impact is None:
+                no_impact_n += 1
+                continue
+            scored_n += 1
+            total_impact += float(impact) * float(prob)
 
-        return total_impact
+        return {
+            "total_impact": total_impact,
+            "scored_n": scored_n,
+            "unscored_n": unscored_n,
+            "no_impact_n": no_impact_n,
+            "milestones_n": len(milestones),
+        }

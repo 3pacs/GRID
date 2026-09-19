@@ -122,11 +122,40 @@ def _direction_to_status(direction: str | None) -> str:
     return "PENDING"
 
 
-def _clamp_probability(val: float | None) -> float:
-    """Clamp probability to [0, 1]."""
+def _clamp_probability(val: float | None) -> float | None:
+    """Clamp a stated probability to [0, 1]; an unstated one stays None.
+
+    It used to return 0.5 for None, which wrote a coin-flip prior for every
+    upstream row that carried no confidence at all.
+    """
     if val is None:
-        return 0.5
+        return None
     return max(0.0, min(1.0, float(val)))
+
+
+# Set once per run from information_schema: until the Alembic revision that
+# drops NOT NULL / DEFAULT 0.5 on company_milestones.probability lands (it is
+# to be parented on the incident-recovery baseline the fake-data lead will
+# announce; see PR #550), an unscored row cannot be written honestly. Fail
+# closed: skip it and count it.
+_PROBABILITY_NULLABLE: bool | None = None
+_SKIPPED_UNSCORED = 0
+
+
+def _probability_nullable(conn: Any) -> bool:
+    global _PROBABILITY_NULLABLE
+    if _PROBABILITY_NULLABLE is None:
+        row = conn.execute(text(
+            "SELECT is_nullable FROM information_schema.columns "
+            "WHERE table_name = 'company_milestones' AND column_name = 'probability'"
+        )).scalar()
+        _PROBABILITY_NULLABLE = (row == "YES")
+        if not _PROBABILITY_NULLABLE:
+            log.warning(
+                "company_milestones.probability is still NOT NULL; unscored "
+                "milestones will be skipped, not written as 0.5"
+            )
+    return _PROBABILITY_NULLABLE
 
 
 def _bps_to_pct(bps: int | None) -> float | None:
@@ -165,8 +194,8 @@ def _ensure_table(engine: Engine) -> None:
                 target_unit         TEXT,
                 actual_value        DOUBLE PRECISION,
                 achievement_pct     DOUBLE PRECISION,
-                probability         DOUBLE PRECISION NOT NULL DEFAULT 0.5,
-                confidence_source   TEXT DEFAULT 'CALCULATED',
+                probability         DOUBLE PRECISION,
+                confidence_source   TEXT,
                 value_impact_ps     DOUBLE PRECISION,
                 value_impact_pct    DOUBLE PRECISION,
                 status              TEXT NOT NULL DEFAULT 'PENDING',
@@ -221,8 +250,8 @@ def _insert_milestone(
     milestone_type: str,
     announced_date: date,
     description: str,
-    probability: float = 0.5,
-    confidence_source: str = "CALCULATED",
+    probability: float | None = None,
+    confidence_source: str | None = None,
     value_impact_pct: float | None = None,
     status: str = "PENDING",
     source_url: str | None = None,
@@ -236,6 +265,10 @@ def _insert_milestone(
 
     description = _safe_desc(description)
     probability = _clamp_probability(probability)
+    if probability is None and not _probability_nullable(conn):
+        global _SKIPPED_UNSCORED
+        _SKIPPED_UNSCORED += 1
+        return False
 
     if _milestone_exists(conn, ticker, milestone_type, announced_date, description):
         return False
@@ -293,7 +326,7 @@ def _from_business_events(engine: Engine) -> int:
             desc = r[3] or headline
             direction = (r[4] or "neutral").lower()
             estimated_bps = r[5]
-            confidence = r[6] or 0.5
+            confidence = r[6]  # None stays None: unscored, not 0.5
             published_at = r[7]
             article_url = r[8]
             source = r[9] or ""
@@ -352,8 +385,7 @@ def _from_deal_pipeline(engine: Engine) -> int:
             target_co = r[4] or ""
             headline = r[5] or f"{deal_type}: {acquirer} / {target_co}"
             (r[6] or "neutral").lower()
-            probability = r[7] or 0.25
-            r[8] or 0.5
+            probability = r[7]  # None stays None: unscored, not 0.25
             detected_at = r[9]
             deal_value = r[10]
             article_url = r[11]
@@ -444,7 +476,7 @@ def _from_sec_facts(engine: Engine) -> int:
             desc = r[4] or item_name
             direction = (r[5] or "neutral").lower()
             estimated_bps = r[6]
-            confidence = r[7] or 0.5
+            confidence = r[7]  # None stays None: unscored, not 0.5
 
             milestone_type = _SEC_ITEM_MAP.get(item_number, "STRATEGIC")
             ann_date = filing_date or date.today()
@@ -496,7 +528,7 @@ def _from_earnings(engine: Engine) -> int:
             tone_label = r[2] or "neutral"
             overall_tone = r[3] or 0.0
             tone_shift = r[4]
-            confidence = r[5] or 0.5
+            confidence = r[5]  # None stays None: unscored, not 0.5
             fwd_count = r[6] or 0
             r[7]  # JSONB
 
@@ -651,7 +683,7 @@ def _from_oracle(engine: Engine) -> int:
             target_price = r[3]
             entry_price = r[4]
             expiry = r[5]
-            confidence = r[6] or 0.7
+            confidence = r[6]  # None stays None: unscored, not 0.7
             expected_move = r[7]
             model_name = r[8] or "oracle"
             created_at = r[9]
@@ -744,7 +776,7 @@ def _from_catalyst_calendar(engine: Engine) -> int:
                 announced_date=ann_date,
                 description=_safe_desc(desc),
                 probability=prob,
-                confidence_source="ANALYST",
+                confidence_source="CALCULATED",
                 target_date=expected_date,
                 notes=f"Window: ±{window_days}d; Source: {source}; {notes_text}".strip("; "),
             ):
@@ -839,6 +871,13 @@ def main() -> None:
 
     log.info("Milestones populated: {n} new, {total} total in table",
              n=total, total=final)
+    if _SKIPPED_UNSCORED:
+        log.warning(
+            "Skipped {k} unscored milestones: company_milestones.probability is "
+            "still NOT NULL DEFAULT 0.5 (pending the Alembic revision tracked "
+            "in PR #550)",
+            k=_SKIPPED_UNSCORED,
+        )
 
 
 if __name__ == "__main__":
