@@ -28,8 +28,11 @@ except an explicit, code-reviewed allow-list of POSTs proven not to write
 anything (see NON_MUTATING_POST_ALLOWLIST). /chat/compose and
 /chat/ask/stream are NOT on that list — see NON_MUTATING_EXCLUDED_ENDPOINTS
 for the file:line proof — so alert-creation/composer smoke does not run in
-this mode. A before/after `GET /api/v1/alerts` count for the smoke user is
-also checked and must be unchanged.
+this mode. GET /api/v1/alerts is separately blocked outright (see
+NON_MUTATING_GET_BLOCKLIST): its handler runs CREATE TABLE IF NOT EXISTS as
+a side effect, so even a read against it is refused. A before/after active-
+alerts count, read directly via SQL (never HTTP — see
+step_alerts_db_count), is checked instead and must be unchanged.
 
 --mode mutating: also exercises the composer/alert-creation path. Requires
 BOTH the `SMOKE_ALLOW_MUTATIONS=1` environment variable AND
@@ -130,6 +133,28 @@ NON_MUTATING_EXCLUDED_ENDPOINTS: dict[str, str] = {
         "2737). Routine, unattended deploy smoke should not depend on or pay "
         "for an LLM call, and it shares its whole prompt/planner surface "
         "with /chat/compose, so it stays out of the default plan too."
+    ),
+}
+
+# Paths whose GET handler executes DDL as a side effect — the HTTP verb is
+# GET (so the allow/deny logic above would let it through), but the
+# underlying database operation is schema-mutating, not read-only, so it is
+# blocked unconditionally in non-mutating mode too. Checked BEFORE the
+# method check in Client.request() below, so it applies to every verb on
+# these paths, not just GET.
+NON_MUTATING_GET_BLOCKLIST: frozenset[str] = frozenset({"/api/v1/alerts"})
+
+NON_MUTATING_GET_BLOCKLIST_REASONS: dict[str, str] = {
+    "/api/v1/alerts": (
+        "api/routers/price_alerts.py:186-201 list_alerts() calls "
+        "ensure_alerts_table(engine) at line 194, which runs `CREATE TABLE "
+        "IF NOT EXISTS sd_price_alerts` (price_alerts.py:55-57) on every "
+        "call — a DDL statement, even though the HTTP verb is GET. Neither "
+        "the before/after alert-count invariant (step_alerts_db_count) nor "
+        "any other non-mutating step may call this endpoint; the invariant "
+        "instead runs a direct, read-only `SELECT count(*) FROM "
+        "sd_price_alerts WHERE active` (same connection style as "
+        "step_freshness), never DDL, never HTTP."
     ),
 }
 
@@ -239,18 +264,21 @@ def compose_mutation_markers(payload: dict[str, Any]) -> list[str]:
 def check_alerts_invariant(
     mode: str, before_count: int | None, after_count: int | None
 ) -> tuple[bool, str]:
-    """GET /api/v1/alerts count for the smoke user must be unchanged across a
-    --mode=non-mutating run. Not enforced for --mode=mutating, where mutation
-    is the explicit point of the run."""
+    """The direct-SQL active-alerts count (step_alerts_db_count — a pure
+    `SELECT count(*) FROM sd_price_alerts WHERE active`, never GET
+    /api/v1/alerts, see NON_MUTATING_GET_BLOCKLIST) must be unchanged across
+    a --mode=non-mutating run. Not enforced for --mode=mutating, where
+    mutation is the explicit point of the run."""
     if mode != MODE_NON_MUTATING:
         return True, f"invariant not enforced outside --mode={MODE_NON_MUTATING}"
     if before_count is None or after_count is None:
         return True, (
-            "alerts count unavailable (no token, or the request itself "
-            "failed) — cannot check, not graded as a violation"
+            "alerts count unavailable (release dir missing, DB unreachable, "
+            "or the table doesn't exist yet) — cannot check, not graded as "
+            "a violation"
         )
     if before_count != after_count:
-        return False, f"GET /api/v1/alerts count changed for the smoke user: {before_count} -> {after_count}"
+        return False, f"active alerts count changed: {before_count} -> {after_count}"
     return True, f"alerts count unchanged ({before_count})"
 
 
@@ -514,9 +542,13 @@ class Client:
     ):
         import requests
 
-        if self.mode == MODE_NON_MUTATING and method.upper() != "GET" and path not in NON_MUTATING_POST_ALLOWLIST:
-            reason = NON_MUTATING_EXCLUDED_ENDPOINTS.get(path, "not on NON_MUTATING_POST_ALLOWLIST")
-            raise MutationBlocked(f"{method} {path} blocked in --mode={MODE_NON_MUTATING}: {reason}")
+        if self.mode == MODE_NON_MUTATING:
+            if path in NON_MUTATING_GET_BLOCKLIST:
+                reason = NON_MUTATING_GET_BLOCKLIST_REASONS.get(path, "handler executes DDL as a side effect")
+                raise MutationBlocked(f"{method} {path} blocked in --mode={MODE_NON_MUTATING}: {reason}")
+            if method.upper() != "GET" and path not in NON_MUTATING_POST_ALLOWLIST:
+                reason = NON_MUTATING_EXCLUDED_ENDPOINTS.get(path, "not on NON_MUTATING_POST_ALLOWLIST")
+                raise MutationBlocked(f"{method} {path} blocked in --mode={MODE_NON_MUTATING}: {reason}")
 
         url = path if path.startswith("http") else f"{self.base_url}{path}"
         t0 = time.perf_counter()
@@ -674,27 +706,60 @@ def mint_contributor_token(release_dir: str) -> tuple[str | None, str]:
                 del sys.modules[mod_name]
 
 
-def step_alerts_count(client: Client, budget_ms: int, label: str) -> StepResult:
-    """GET /api/v1/alerts for the smoke user — server-side owner-filtered by
-    the bearer token (api/routers/price_alerts.py:198-211). Called once
-    before and once after the rest of the plan; evaluate_mutation_guard()
-    diffs the two counts. Always a GET, so it runs in both modes without
-    ever touching the non-mutating guard."""
-    if not client.token:
-        return StepResult(f"alerts_count:{label}", "blocked", None, "no token (auth blocked) — skipped, not graded as broken")
+def step_alerts_db_count(release_dir: str, label: str) -> StepResult:
+    """Direct, read-only alert count for the before/after mutation-detection
+    invariant — deliberately NOT via GET /api/v1/alerts, whose handler runs
+    `CREATE TABLE IF NOT EXISTS sd_price_alerts` as a side effect on every
+    call (api/routers/price_alerts.py:186-201, :55-57 — see
+    NON_MUTATING_GET_BLOCKLIST, which blocks that endpoint outright in
+    non-mutating mode regardless of what any step tries to do).
+
+    Reuses step_freshness's direct-DB connection style (same sys.path/cwd
+    dance, same `db.get_engine()`) to run a single, pure
+    `SELECT count(*) FROM sd_price_alerts WHERE active` — no DDL, no HTTP,
+    no owner filter (this counts every active alert in the table, not just
+    the smoke user's, so it is a strictly stronger invariant: it also
+    catches a write made under a different owner). Called once before and
+    once after the rest of the plan; evaluate_mutation_guard() diffs the
+    two counts. Runs in both modes — it never touches the HTTP client or
+    the non-mutating guard at all, so it is unaffected by --mode."""
+    original_cwd = os.getcwd()
+    original_path = list(sys.path)
+    for mod_name in list(sys.modules):
+        if mod_name in ("config", "db") or mod_name.startswith("api."):
+            del sys.modules[mod_name]
     try:
-        resp, ms = client.request("GET", "/api/v1/alerts", timeout_s=budget_ms / 1000)
+        release_path = Path(release_dir)
+        if not release_path.is_dir():
+            return StepResult(f"alerts_count:{label}", "blocked", None, f"release dir not found: {release_dir}")
+        os.chdir(release_path)
+        sys.path.insert(0, str(release_path))
+        try:
+            from dotenv import load_dotenv  # type: ignore
+
+            load_dotenv(release_path / ".env")
+        except Exception:
+            pass
+        from db import get_engine  # type: ignore
+        from sqlalchemy import text  # type: ignore
+
+        engine = get_engine()
+        with engine.connect() as conn:
+            row = conn.execute(text("SELECT count(*) FROM sd_price_alerts WHERE active")).fetchone()
+        count = int(row[0]) if row and row[0] is not None else None
+        status = "ok" if count is not None else "broken"
+        return StepResult(f"alerts_count:{label}", status, None, f"count={count}", {"count": count})
     except Exception as exc:
-        return StepResult(f"alerts_count:{label}", "broken", None, f"request failed: {exc}")
-    if resp.status_code != 200:
-        return StepResult(f"alerts_count:{label}", "broken", ms, f"HTTP {resp.status_code}")
-    try:
-        payload = resp.json()
-    except ValueError:
-        return StepResult(f"alerts_count:{label}", "broken", ms, "non-JSON response")
-    count = len(payload.get("alerts", [])) if isinstance(payload, dict) else None
-    status = "ok" if count is not None else "broken"
-    return StepResult(f"alerts_count:{label}", status, ms, f"count={count}", {"count": count})
+        # Table missing, DB unreachable, etc. — not enforced as a violation;
+        # check_alerts_invariant treats a missing count as "cannot check",
+        # the same way step_freshness treats a query failure as "blocked".
+        return StepResult(f"alerts_count:{label}", "blocked", None, f"alerts count query failed: {exc}")
+    finally:
+        os.chdir(original_cwd)
+        sys.path[:] = original_path
+        for mod_name in list(sys.modules):
+            if mod_name in ("config", "db") or mod_name.startswith("api."):
+                del sys.modules[mod_name]
 
 
 def step_composer(client: Client, budget_ms: int, mode: str = MODE_NON_MUTATING) -> StepResult:
@@ -851,16 +916,10 @@ def step_widget_data(client: Client, budget_ms: int) -> StepResult:
     except Exception as exc:
         sub.append(StepResult("flows/sectors", "broken", None, f"request failed: {exc}"))
 
-    try:
-        resp, ms = client.request("GET", "/api/v1/alerts", timeout_s=timeout_s)
-        if resp.status_code != 200:
-            sub.append(StepResult("alerts", "broken", ms, f"HTTP {resp.status_code}"))
-        else:
-            payload = resp.json()
-            count = len(payload.get("alerts", [])) if isinstance(payload, dict) else 0
-            sub.append(StepResult("alerts", "ok", ms, f"count={count}"))
-    except Exception as exc:
-        sub.append(StepResult("alerts", "broken", None, f"request failed: {exc}"))
+    # No GET /api/v1/alerts substep here on purpose — that handler runs
+    # CREATE TABLE IF NOT EXISTS as a side effect (see
+    # NON_MUTATING_GET_BLOCKLIST); the alert count check lives entirely in
+    # step_alerts_db_count's direct, read-only SQL instead.
 
     for section in DAD_TICKER_SECTIONS:
         try:
@@ -1153,13 +1212,13 @@ def run(args: argparse.Namespace) -> tuple[int, str, dict[str, Any]]:
     else:
         steps.append(StepResult("auth", "blocked", None, auth_note))
 
-    before_alerts = step_alerts_count(client, args.budget_ms, "before")
+    before_alerts = step_alerts_db_count(args.release_dir, "before")
     steps.append(before_alerts)
 
     steps.append(step_composer(client, args.budget_ms, mode))
     steps.append(step_widget_data(client, args.budget_ms))
 
-    after_alerts = step_alerts_count(client, args.budget_ms, "after")
+    after_alerts = step_alerts_db_count(args.release_dir, "after")
     steps.append(after_alerts)
 
     compose_step = next((s for s in steps if s.name == "composer"), None)

@@ -11,12 +11,31 @@ api/routers/price_alerts.create_alert_record (INSERT INTO sd_price_alerts,
 price_alerts.py:148-154). It also POSTed /api/v1/chat/ask/stream, a real LLM
 call. Routine, unattended deploy smoke must never be able to do that again.
 
-This file proves, with a fake HTTP client (no network, no real server):
+Follow-up (same day): GET /api/v1/alerts turned out to be unsafe too — its
+handler (api/routers/price_alerts.py:186-201) calls ensure_alerts_table()
+at line 194, which runs `CREATE TABLE IF NOT EXISTS sd_price_alerts`
+(price_alerts.py:55-57) on *every* call, DDL executed by a GET. The
+before/after alert-count invariant and step_widget_data's old "alerts"
+substep both called it. Fixed by: (a) removing every call to
+/api/v1/alerts from the non-mutating plan; (b) replacing the invariant
+with a direct, read-only `SELECT count(*) FROM sd_price_alerts WHERE
+active` (step_alerts_db_count — same connection style as step_freshness,
+never HTTP); (c) adding NON_MUTATING_GET_BLOCKLIST so the request guard
+refuses /api/v1/alerts outright, for any verb, even if some future step
+tries to call it again.
+
+This file proves, with a fake HTTP client (no network, no real server) and,
+where noted, a fake DB engine (no real database):
   (i)   the default (--mode=non-mutating) plan issues no request that is not
-        GET or on the proven-safe allow-list;
+        GET or on the proven-safe allow-list, and specifically no request
+        whose path starts with /api/v1/alerts;
   (ii)  a fake compose response carrying alert_created: true fails the run
-        with a clear reason;
-  (iii) a GET /api/v1/alerts count change across the run fails the run;
+        with a clear reason; a direct attempt to call /api/v1/alerts
+        through the client in non-mutating mode raises MutationBlocked
+        before any HTTP call is made;
+  (iii) an active-alerts count change across the run (read via the direct
+        SQL path, never GET /api/v1/alerts) fails the run; the SQL path
+        itself is proven, with a fake DB engine, to execute only a SELECT;
   (iv)  --mode=mutating without both required gates refuses to start (no
         network call is attempted at all);
   (v)   no notification/email/SMTP path is reachable from the default plan.
@@ -40,11 +59,14 @@ from scripts.smoke_dad_path import (
     Client,
     MutationBlocked,
     NON_MUTATING_EXCLUDED_ENDPOINTS,
+    NON_MUTATING_GET_BLOCKLIST,
+    NON_MUTATING_GET_BLOCKLIST_REASONS,
     NON_MUTATING_POST_ALLOWLIST,
     StepResult,
     check_alerts_invariant,
     compose_mutation_markers,
     evaluate_mutation_guard,
+    step_alerts_db_count,
     validate_mode,
 )
 
@@ -81,9 +103,9 @@ class TestClientGuard:
 
         monkeypatch.setattr(requests, "request", fake_request)
         client = Client("http://x", token="t", mode=MODE_NON_MUTATING)
-        resp, _ms = client.request("GET", "/api/v1/alerts", timeout_s=1)
+        resp, _ms = client.request("GET", "/api/v1/system/health", timeout_s=1)
         assert resp.status_code == 200
-        assert calls == [("GET", "http://x/api/v1/alerts")]
+        assert calls == [("GET", "http://x/api/v1/system/health")]
 
     def test_post_to_compose_is_blocked(self):
         client = Client("http://x", token="t", mode=MODE_NON_MUTATING)
@@ -117,6 +139,54 @@ class TestClientGuard:
         assert resp.status_code == 200
         assert calls == [("POST", "http://x/api/v1/chat/compose")]
 
+    def test_alerts_get_is_blocklisted_with_citation(self):
+        """api/routers/price_alerts.py:186-201 list_alerts() calls
+        ensure_alerts_table() (line 194), which runs `CREATE TABLE IF NOT
+        EXISTS sd_price_alerts` (price_alerts.py:55-57) on every call — DDL
+        executed by a GET. NON_MUTATING_GET_BLOCKLIST must refuse it
+        outright, independent of the POST allow-list logic."""
+        assert "/api/v1/alerts" in NON_MUTATING_GET_BLOCKLIST
+        assert "price_alerts.py:55-57" in NON_MUTATING_GET_BLOCKLIST_REASONS["/api/v1/alerts"]
+
+    def test_get_to_alerts_is_blocked_before_any_http_call(self, monkeypatch):
+        """(ii) A direct attempt via the client in non-mutating mode must
+        raise MutationBlocked BEFORE any HTTP call — not translate the
+        blocked request into a graceful "broken" result after the fact."""
+        def fail_if_called(*args, **kwargs):
+            raise AssertionError("GET /api/v1/alerts must never reach requests.request in non-mutating mode")
+
+        import requests
+
+        monkeypatch.setattr(requests, "request", fail_if_called)
+        client = Client("http://x", token="t", mode=MODE_NON_MUTATING)
+
+        with pytest.raises(MutationBlocked) as exc_info:
+            client.request("GET", "/api/v1/alerts", timeout_s=1)
+
+        assert "price_alerts.py:186-201" in str(exc_info.value) or "price_alerts.py:55-57" in str(exc_info.value)
+
+    def test_delete_to_alerts_is_also_blocked_by_the_blocklist(self):
+        """The blocklist check runs before the method check, so it covers
+        every verb on this path, not just GET."""
+        client = Client("http://x", token="t", mode=MODE_NON_MUTATING)
+        with pytest.raises(MutationBlocked):
+            client.request("DELETE", "/api/v1/alerts", timeout_s=1)
+
+    def test_alerts_get_passes_through_in_mutating_mode(self, monkeypatch):
+        calls = []
+
+        def fake_request(method, url, **kwargs):
+            calls.append((method, url))
+            return SimpleNamespace(status_code=200, text="", json=lambda: {"alerts": []})
+
+        import requests
+
+        monkeypatch.setattr(requests, "request", fake_request)
+        client = Client("http://x", token="t", mode=MODE_MUTATING)
+        resp, _ms = client.request("GET", "/api/v1/alerts", timeout_s=1)
+        assert resp.status_code == 200
+        assert calls == [("GET", "http://x/api/v1/alerts")]
+
 
 class TestDefaultPlanEndToEnd:
     """Drive run() top to bottom with a fake `requests.request` — no real
@@ -129,10 +199,13 @@ class TestDefaultPlanEndToEnd:
 
         def fake_request(method, url, *, headers=None, json=None, timeout=None, stream=False):
             calls.append((method, url, json))
+            # No /api/v1/alerts branch here on purpose: it must never be
+            # requested in non-mutating mode (NON_MUTATING_GET_BLOCKLIST) —
+            # if a regression ever reintroduces that call, Client.request()
+            # raises MutationBlocked before this fake is even reached, which
+            # fails these tests loudly rather than quietly answering it.
             if url.endswith("/api/v1/system/health"):
                 body = {"status": "ok", "checks": {}}
-            elif url.endswith("/api/v1/alerts"):
-                body = {"alerts": []}
             elif url.endswith("/"):
                 return SimpleNamespace(status_code=200, text="<html><title>x</title></html>")
             else:
@@ -155,10 +228,11 @@ class TestDefaultPlanEndToEnd:
 
     def test_no_non_get_request_is_ever_sent(self, monkeypatch, tmp_path):
         calls = self._install_fake_requests(monkeypatch)
-        # No real release dir -> mint_contributor_token fails -> client.token
-        # stays None -> composer/widget_data/alerts_count all short-circuit
-        # to "blocked" without a request. That is itself part of the
-        # invariant this test protects: prove it holds with a token too.
+        # step_alerts_db_count is DB-only (never touches the HTTP client at
+        # all — see TestStepAlertsDbCount below); mint_contributor_token is
+        # faked here so composer/widget_data get a token and actually
+        # attempt their (GET-only) requests, the strongest form of this
+        # proof.
         monkeypatch.setattr(smoke, "mint_contributor_token", lambda release_dir: ("fake-token", "minted"))
 
         exit_code, report, result = smoke.run(self._args(tmp_path))
@@ -173,6 +247,20 @@ class TestDefaultPlanEndToEnd:
         assert "non-mutating" in next(
             s["note"] for s in result["steps"] if s["name"] == "composer"
         )
+
+    def test_no_request_path_starts_with_api_v1_alerts(self, monkeypatch, tmp_path):
+        """(i), specifically: the default plan issues NO request — GET or
+        otherwise — whose path starts with /api/v1/alerts. This is stronger
+        than "no non-GET request": GET /api/v1/alerts is itself forbidden
+        (its handler runs DDL), and the before/after invariant now reads
+        the count directly from the DB instead."""
+        calls = self._install_fake_requests(monkeypatch)
+        monkeypatch.setattr(smoke, "mint_contributor_token", lambda release_dir: ("fake-token", "minted"))
+
+        smoke.run(self._args(tmp_path))
+
+        alerts_calls = [(m, u) for (m, u, _b) in calls if u.split("http://x", 1)[-1].startswith("/api/v1/alerts")]
+        assert alerts_calls == [], f"non-mutating default plan reached /api/v1/alerts: {alerts_calls}"
 
     def test_no_alert_prompt_anywhere_in_requests(self, monkeypatch, tmp_path):
         calls = self._install_fake_requests(monkeypatch)
@@ -236,8 +324,8 @@ class TestEvaluateMutationGuard:
         )
         monkeypatch.setattr(smoke, "mint_contributor_token", lambda release_dir: ("fake-token", "minted"))
         monkeypatch.setattr(
-            smoke, "step_alerts_count",
-            lambda client, budget_ms, label: StepResult(f"alerts_count:{label}", "ok", None, "count=1", {"count": 1}),
+            smoke, "step_alerts_db_count",
+            lambda release_dir, label: StepResult(f"alerts_count:{label}", "ok", None, "count=1", {"count": 1}),
         )
 
         def fake_composer(client, budget_ms, mode):
@@ -306,11 +394,11 @@ class TestCheckAlertsInvariant:
 
         counts = iter([2, 5])  # before=2, after=5 -> something mutated
 
-        def fake_alerts_count(client, budget_ms, label):
+        def fake_alerts_count(release_dir, label):
             n = next(counts)
             return StepResult(f"alerts_count:{label}", "ok", None, f"count={n}", {"count": n})
 
-        monkeypatch.setattr(smoke, "step_alerts_count", fake_alerts_count)
+        monkeypatch.setattr(smoke, "step_alerts_db_count", fake_alerts_count)
 
         args = argparse.Namespace(
             base_url="http://x", release_dir=str(tmp_path), budget_ms=5000, strict=False,
@@ -322,6 +410,111 @@ class TestCheckAlertsInvariant:
         statuses = {s["name"]: s["status"] for s in result["steps"]}
         assert statuses["mutation_guard"] == "broken"
         assert "2 -> 5" in report
+
+
+class TestStepAlertsDbCount:
+    """(iii): step_alerts_db_count is the detector this PR kept (over
+    omitting it entirely) — reusing step_freshness's direct-DB connection
+    style to run a pure `SELECT count(*) FROM sd_price_alerts WHERE
+    active`. Prove, with a fake `db.get_engine()` (no real database, no
+    HTTP), that it executes exactly that SELECT and nothing else — no
+    CREATE/INSERT/UPDATE/DELETE/DROP/ALTER."""
+
+    _FORBIDDEN_SQL_KEYWORDS = ("CREATE", "INSERT", "UPDATE", "DELETE", "DROP", "ALTER")
+
+    def _write_fake_db_module(self, release_dir: Path, *, row=(3,), raise_on_connect: bool = False):
+        """Write a `db.py` into `release_dir` that step_alerts_db_count's
+        `from db import get_engine` (after sys.path.insert(0, release_dir))
+        will import instead of the real repo db.py. Its fake connection
+        appends every statement passed to `.execute()` (as its compiled SQL
+        text) to `executed.log` next to it — a FILE, not a module-level
+        list, because step_alerts_db_count deletes "db" from sys.modules in
+        its own `finally` block, so a module-level list would vanish with
+        it before this test could read it back."""
+        release_dir.mkdir(parents=True, exist_ok=True)
+        raise_flag = "True" if raise_on_connect else "False"
+        (release_dir / "db.py").write_text(
+            "from pathlib import Path\n"
+            "\n"
+            "_LOG_PATH = Path(__file__).with_name('executed.log')\n"
+            "\n"
+            "class _FakeResult:\n"
+            "    def __init__(self, row):\n"
+            "        self._row = row\n"
+            "    def fetchone(self):\n"
+            "        return self._row\n"
+            "\n"
+            "class _FakeConn:\n"
+            "    def __enter__(self):\n"
+            f"        if {raise_flag}:\n"
+            "            raise RuntimeError('relation \"sd_price_alerts\" does not exist')\n"
+            "        return self\n"
+            "    def __exit__(self, *a):\n"
+            "        return False\n"
+            "    def execute(self, stmt, *a, **kw):\n"
+            "        with open(_LOG_PATH, 'a', encoding='utf-8') as f:\n"
+            "            f.write(str(stmt) + '\\n')\n"
+            f"        return _FakeResult({row!r})\n"
+            "\n"
+            "class _FakeEngine:\n"
+            "    def connect(self):\n"
+            "        return _FakeConn()\n"
+            "\n"
+            "def get_engine():\n"
+            "    return _FakeEngine()\n",
+            encoding="utf-8",
+        )
+
+    def _read_executed(self, release_dir: Path) -> list[str]:
+        log_path = release_dir / "executed.log"
+        if not log_path.exists():
+            return []
+        return [line for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    def test_executes_exactly_one_pure_select(self, tmp_path):
+        release_dir = tmp_path / "release"
+        self._write_fake_db_module(release_dir, row=(3,))
+
+        result = step_alerts_db_count(str(release_dir), "before")
+
+        executed = self._read_executed(release_dir)
+        assert executed == ["SELECT count(*) FROM sd_price_alerts WHERE active"]
+        for stmt in executed:
+            for kw in self._FORBIDDEN_SQL_KEYWORDS:
+                assert kw not in stmt.upper(), f"{kw} found in {stmt!r} — detector must be SELECT-only"
+        assert result.status == "ok"
+        assert result.data["count"] == 3
+        assert result.name == "alerts_count:before"
+
+    def test_blocked_when_release_dir_missing(self, tmp_path):
+        result = step_alerts_db_count(str(tmp_path / "no-such-release"), "before")
+        assert result.status == "blocked"
+
+    def test_blocked_not_broken_when_query_fails(self, tmp_path):
+        release_dir = tmp_path / "release"
+        self._write_fake_db_module(release_dir, raise_on_connect=True)
+
+        result = step_alerts_db_count(str(release_dir), "after")
+
+        assert result.status == "blocked"
+        assert "alerts count query failed" in result.note
+
+    def test_never_calls_the_http_client(self, tmp_path, monkeypatch):
+        """step_alerts_db_count takes release_dir, not a Client — there is
+        no HTTP client for it to call. Guard against a future signature
+        change that reintroduces one by asserting requests.request is never
+        touched."""
+        def fail_if_called(*args, **kwargs):
+            raise AssertionError("step_alerts_db_count must never touch the network")
+
+        import requests
+
+        monkeypatch.setattr(requests, "request", fail_if_called)
+        release_dir = tmp_path / "release"
+        self._write_fake_db_module(release_dir, row=(0,))
+
+        result = step_alerts_db_count(str(release_dir), "before")
+        assert result.status == "ok"
 
 
 # ── (iv) --mode=mutating requires both gates ─────────────────────────────
