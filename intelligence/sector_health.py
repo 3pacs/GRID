@@ -17,8 +17,13 @@ Weights (sum to 1.0):
 
 Each sub-score is a float in [0, 1]. Sentiment scores that are natively
 on [-1, 1] (insider/congress/dark_pool) are remapped via ``(x+1)/2``.
-Missing data falls back to 0.5 (neutral) so a sector never scores 0
-because one puller is stale.
+A sub-score with no underlying data returns ``None``; the composite
+fills it with 0.5 (neutral) so a sector never scores 0 because one
+puller is stale, and reports exactly which components were filled in
+``data_coverage``. If *no* component has data, or the computation
+fails, the payload is an explicit unavailable state (``score: None``,
+``status: "unavailable"``, ``reason``) rather than a neutral 50 that
+is indistinguishable from a measured score.
 
 The 30d trend is derived from the nearest ``sector_health_snapshots``
 row >= 25 days old. If no prior snapshot exists the trend is
@@ -113,7 +118,7 @@ def _id_variants(tickers: list[str]) -> list[str]:
 
 # ── Sub-score computations ────────────────────────────────────────
 
-def _margin_score(conn: Any, tickers: list[str]) -> float:
+def _margin_score(conn: Any, tickers: list[str]) -> float | None:
     """Average 3y gross-margin trend across tickers.
 
     Uses ``capital_flows`` directly and mirrors the logic from
@@ -124,7 +129,7 @@ def _margin_score(conn: Any, tickers: list[str]) -> float:
     0.5.
     """
     if not tickers or not _table_exists(conn, "public.capital_flows"):
-        return NEUTRAL
+        return None
 
     _id_variants(tickers)
     scores: list[float] = []
@@ -173,11 +178,11 @@ def _margin_score(conn: Any, tickers: list[str]) -> float:
             scores.append(0.5)
 
     if not scores:
-        return NEUTRAL
+        return None
     return sum(scores) / len(scores)
 
 
-def _chokepoint_score(conn: Any, tickers: list[str]) -> float:
+def _chokepoint_score(conn: Any, tickers: list[str]) -> float | None:
     """Inverse of the average chokepoint_score on edges touching the sector.
 
     ``chokepoint_score`` in ``supply_chain_edges`` is 0..1 where 1 is a
@@ -186,7 +191,7 @@ def _chokepoint_score(conn: Any, tickers: list[str]) -> float:
     ``1 - avg_chokepoint``.
     """
     if not tickers or not _table_exists(conn, "public.supply_chain_edges"):
-        return NEUTRAL
+        return None
 
     id_set = _id_variants(tickers)
     row = conn.execute(
@@ -204,19 +209,19 @@ def _chokepoint_score(conn: Any, tickers: list[str]) -> float:
     ).fetchone()
 
     if row is None or row[0] is None:
-        return NEUTRAL
+        return None
 
     avg_cp = _clamp01(float(row[0]))
     return 1.0 - avg_cp
 
 
-def _capital_allocation_score(conn: Any, tickers: list[str]) -> float:
+def _capital_allocation_score(conn: Any, tickers: list[str]) -> float | None:
     """Reward high fcf_conversion + shareholder_yield, penalize high
     net-debt-issuance intensity. All ratios are derived from the latest
     annual ``capital_flows`` row per ticker.
     """
     if not tickers or not _table_exists(conn, "public.capital_flows"):
-        return NEUTRAL
+        return None
 
     sub_scores: list[float] = []
     for t in tickers:
@@ -273,17 +278,17 @@ def _capital_allocation_score(conn: Any, tickers: list[str]) -> float:
         sub_scores.append((fcf_norm + sy_norm + debt_norm) / 3.0)
 
     if not sub_scores:
-        return NEUTRAL
+        return None
     return sum(sub_scores) / len(sub_scores)
 
 
-def _insider_sentiment_score(conn: Any, tickers: list[str]) -> float:
+def _insider_sentiment_score(conn: Any, tickers: list[str]) -> float | None:
     """Net insider buys - sells over the last 90d, normalized via the
     classic sentiment ratio (buys - sells) / (buys + sells) in [-1,1]
     then remapped to [0,1]. UNUSUAL_* variants count toward their side.
     """
     if not tickers or not _table_exists(conn, "public.insider_trades"):
-        return NEUTRAL
+        return None
 
     row = conn.execute(
         text(
@@ -302,17 +307,17 @@ def _insider_sentiment_score(conn: Any, tickers: list[str]) -> float:
     sells = float(row[1] or 0) if row else 0.0
     total = buys + sells
     if total <= 0:
-        return NEUTRAL
+        return None
     ratio = (buys - sells) / total  # [-1, 1]
     return _remap_signed(ratio)
 
 
-def _congress_sentiment_score(conn: Any, tickers: list[str]) -> float:
+def _congress_sentiment_score(conn: Any, tickers: list[str]) -> float | None:
     """Net congressional buys - sells over the last 180d, normalized
     via (buys - sells) / (buys + sells) and remapped to [0,1].
     """
     if not tickers or not _table_exists(conn, "public.congressional_trades"):
-        return NEUTRAL
+        return None
 
     row = conn.execute(
         text(
@@ -334,12 +339,12 @@ def _congress_sentiment_score(conn: Any, tickers: list[str]) -> float:
     sells = float(row[1] or 0) if row else 0.0
     total = buys + sells
     if total <= 0:
-        return NEUTRAL
+        return None
     ratio = (buys - sells) / total
     return _remap_signed(ratio)
 
 
-def _dark_pool_score(conn: Any, tickers: list[str]) -> float:
+def _dark_pool_score(conn: Any, tickers: list[str]) -> float | None:
     """Average dark-pool positioning across sector tickers.
 
     dark_pool_weekly.short_pct > 0.55 → distribution (-1)
@@ -350,7 +355,7 @@ def _dark_pool_score(conn: Any, tickers: list[str]) -> float:
     [0, 1].
     """
     if not tickers or not _table_exists(conn, "public.dark_pool_weekly"):
-        return NEUTRAL
+        return None
 
     rows = conn.execute(
         text(
@@ -368,7 +373,7 @@ def _dark_pool_score(conn: Any, tickers: list[str]) -> float:
     ).fetchall()
 
     if not rows:
-        return NEUTRAL
+        return None
 
     raw: list[float] = []
     for r in rows:
@@ -446,12 +451,43 @@ def _build_narrative(sector_name: str, score: float, components: dict[str, float
 
 # ── Public API ─────────────────────────────────────────────────────
 
+def _unavailable(sector_name: str, reason: str) -> dict[str, Any]:
+    """Honest payload for a sector whose health cannot be computed."""
+    return {
+        "sector": sector_name,
+        "score": None,
+        "trend_30d": None,
+        "components": {},
+        "narrative": f"{sector_name} health unavailable: {reason}.",
+        "as_of": None,
+        "status": "unavailable",
+        "reason": reason,
+        "data_coverage": {
+            "with_data": [],
+            "missing_neutral_filled": list(WEIGHTS.keys()),
+        },
+    }
+
+
+_SCORERS = {
+    "margin": _margin_score,
+    "chokepoints": _chokepoint_score,
+    "capital_allocation": _capital_allocation_score,
+    "insider": _insider_sentiment_score,
+    "congress": _congress_sentiment_score,
+    "dark_pool": _dark_pool_score,
+}
+
+
 def compute_sector_health(engine: Engine, sector_name: str) -> dict[str, Any]:
     """Return the sector health dict described in the module docstring.
 
-    Safe by construction: any sub-score that fails falls back to the
-    neutral 0.5 value. The function never raises for data errors —
-    only for obviously wrong inputs (unknown sector).
+    Never raises for data errors, only for obviously wrong inputs
+    (unknown sector). A sub-score with no data is neutral-filled and
+    listed in ``data_coverage.missing_neutral_filled``. When no
+    component has data, or the query batch fails, the result is the
+    explicit unavailable payload from :func:`_unavailable` instead of
+    a fabricated neutral 50.
     """
     from analysis.sector_map import SECTOR_MAP
 
@@ -461,16 +497,21 @@ def compute_sector_health(engine: Engine, sector_name: str) -> dict[str, Any]:
     tickers = _sector_tickers(sector_name)
 
     components: dict[str, float] = {}
+    missing: list[str] = []
     try:
         with engine.connect() as conn:
-            components["margin"] = _clamp01(_margin_score(conn, tickers))
-            components["chokepoints"] = _clamp01(_chokepoint_score(conn, tickers))
-            components["capital_allocation"] = _clamp01(
-                _capital_allocation_score(conn, tickers)
-            )
-            components["insider"] = _clamp01(_insider_sentiment_score(conn, tickers))
-            components["congress"] = _clamp01(_congress_sentiment_score(conn, tickers))
-            components["dark_pool"] = _clamp01(_dark_pool_score(conn, tickers))
+            for key, scorer in _SCORERS.items():
+                raw = scorer(conn, tickers)
+                if raw is None:
+                    components[key] = NEUTRAL
+                    missing.append(key)
+                else:
+                    components[key] = _clamp01(raw)
+
+            if len(missing) == len(WEIGHTS):
+                return _unavailable(
+                    sector_name, "no underlying data for any component",
+                )
 
             score_01 = sum(WEIGHTS[k] * components[k] for k in WEIGHTS)
             score = round(100.0 * score_01, 2)
@@ -481,11 +522,11 @@ def compute_sector_health(engine: Engine, sector_name: str) -> dict[str, Any]:
             s=sector_name,
             e=str(exc),
         )
-        components = {k: NEUTRAL for k in WEIGHTS}
-        score = round(100.0 * NEUTRAL, 2)
-        trend = "stable"
+        return _unavailable(sector_name, f"computation failed: {exc}")
 
     narrative = _build_narrative(sector_name, score, components, trend)
+    if missing:
+        narrative += f" Neutral-filled (no data): {', '.join(missing)}."
 
     return {
         "sector": sector_name,
@@ -494,6 +535,11 @@ def compute_sector_health(engine: Engine, sector_name: str) -> dict[str, Any]:
         "components": {k: round(v, 4) for k, v in components.items()},
         "narrative": narrative,
         "as_of": datetime.now(timezone.utc).isoformat(),
+        "status": "ok",
+        "data_coverage": {
+            "with_data": [k for k in WEIGHTS if k not in missing],
+            "missing_neutral_filled": missing,
+        },
     }
 
 
@@ -510,6 +556,7 @@ def snapshot_all_sectors(engine: Engine) -> dict[str, Any]:
 
     today = date.today()
     written = 0
+    skipped = 0
     out: dict[str, Any] = {"date": today.isoformat(), "sectors": {}}
 
     for sector_name in SECTOR_MAP.keys():
@@ -524,6 +571,16 @@ def snapshot_all_sectors(engine: Engine) -> dict[str, Any]:
             "score": result["score"],
             "trend_30d": result["trend_30d"],
         }
+
+        if result.get("score") is None:
+            # An unavailable sector must not be written as a 50.0 row:
+            # the 30d trend and the oracle's sector routing both read
+            # this table as measured history.
+            out["sectors"][sector_name]["status"] = "unavailable"
+            skipped += 1
+            log.info("snapshot_all_sectors: {s} unavailable, not written ({r})",
+                     s=sector_name, r=result.get("reason"))
+            continue
 
         try:
             with engine.begin() as conn:
@@ -553,5 +610,7 @@ def snapshot_all_sectors(engine: Engine) -> dict[str, Any]:
             )
 
     out["snapshots_written"] = written
-    log.info("sector_health: wrote {n} daily snapshots", n=written)
+    out["snapshots_skipped_unavailable"] = skipped
+    log.info("sector_health: wrote {n} daily snapshots ({k} unavailable, skipped)",
+             n=written, k=skipped)
     return out

@@ -5,7 +5,9 @@ function, so every test can tailor the rows returned per table.
 
 Covers:
   * end-to-end ``compute_sector_health`` with full data
-  * graceful fallback when every sub-score is missing
+  * explicit unavailable payload when every sub-score is missing (never a neutral 50)
+  * partial coverage reporting when only some sub-scores have data
+  * snapshot writer and router refuse to persist/cache an unavailable result
   * trend computation with and without prior snapshot rows
   * narrative template formatting
   * FastAPI endpoint shape + 404 for unknown sectors
@@ -19,7 +21,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from intelligence import sector_health as sh
-
 
 # ─────────────────────────────────────────────────────────────────
 # Mock engine helpers
@@ -131,8 +132,8 @@ def test_compute_sector_health_full_data_returns_0_to_100():
     assert result["score"] > 55.0
 
 
-def test_compute_sector_health_missing_data_is_neutral():
-    """Empty tables → neutral 0.5 components → score == 50."""
+def test_compute_sector_health_no_data_is_unavailable_not_neutral_50():
+    """Every table absent -> explicit unavailable payload, never score 50."""
 
     def side_effect(sql: str, params: dict):
         s = sql.lower()
@@ -143,10 +144,93 @@ def test_compute_sector_health_missing_data_is_neutral():
     engine, _ = _make_router_engine(side_effect)
     result = sh.compute_sector_health(engine, "Technology")
 
-    assert result["score"] == 50.0
-    for v in result["components"].values():
-        assert v == 0.5
-    assert result["trend_30d"] == "stable"
+    assert result["status"] == "unavailable"
+    assert result["score"] is None
+    assert result["trend_30d"] is None
+    assert result["components"] == {}
+    assert result["as_of"] is None
+    assert "no underlying data" in result["reason"]
+    assert "unavailable" in result["narrative"]
+    assert result["data_coverage"]["with_data"] == []
+    assert set(result["data_coverage"]["missing_neutral_filled"]) == set(sh.WEIGHTS)
+
+
+def test_compute_sector_health_partial_data_reports_coverage():
+    """Only dark-pool data exists -> the other five are neutral-filled and
+    the payload says so; the score is a real number built on that basis."""
+
+    def side_effect(sql: str, params: dict):
+        s = sql.lower()
+        if "to_regclass" in s:
+            name = params.get("n")
+            return _res(one=_regclass(name if name == "public.dark_pool_weekly" else None))
+        if "from dark_pool_weekly" in s:
+            return _res(rows=[(0.40,), (0.42,), (0.38,)])  # accumulation -> 1.0
+        return _res()
+
+    engine, _ = _make_router_engine(side_effect)
+    result = sh.compute_sector_health(engine, "Technology")
+
+    assert result["status"] == "ok"
+    assert result["data_coverage"]["with_data"] == ["dark_pool"]
+    assert set(result["data_coverage"]["missing_neutral_filled"]) == set(sh.WEIGHTS) - {"dark_pool"}
+    assert result["components"]["dark_pool"] == 1.0
+    for k in sh.WEIGHTS:
+        if k != "dark_pool":
+            assert result["components"][k] == sh.NEUTRAL
+    # 0.9 of the weight neutral-filled at 0.5 + 0.1 weight at 1.0 = 0.55
+    assert result["score"] == 55.0
+    assert "Neutral-filled (no data): " in result["narrative"]
+    assert "dark_pool" not in result["narrative"].split("Neutral-filled")[1]
+
+
+def test_compute_sector_health_query_failure_is_unavailable():
+    engine = MagicMock()
+    engine.connect.side_effect = RuntimeError("connection refused")
+
+    result = sh.compute_sector_health(engine, "Technology")
+
+    assert result["status"] == "unavailable"
+    assert result["score"] is None
+    assert "connection refused" in result["reason"]
+
+
+def test_snapshot_all_sectors_skips_unavailable(monkeypatch):
+    """An unavailable sector must never be persisted as a 50.0 snapshot row."""
+    engine = MagicMock()
+    monkeypatch.setattr(
+        sh, "compute_sector_health",
+        lambda _engine, name: sh._unavailable(name, "no underlying data for any component"),
+    )
+
+    out = sh.snapshot_all_sectors(engine)
+
+    assert out["snapshots_written"] == 0
+    assert out["snapshots_skipped_unavailable"] == len(out["sectors"]) > 0
+    for entry in out["sectors"].values():
+        assert entry["score"] is None
+        assert entry["status"] == "unavailable"
+    engine.begin.assert_not_called()
+
+
+def test_endpoint_does_not_cache_unavailable(monkeypatch):
+    import asyncio
+
+    from api.routers import sector_health as router_mod
+
+    router_mod._CACHE.clear()
+    monkeypatch.setattr(
+        "intelligence.sector_health.compute_sector_health",
+        lambda engine, name: sh._unavailable(name, "computation failed: boom"),
+    )
+    monkeypatch.setattr(
+        "api.routers.sector_health.get_db_engine", lambda: MagicMock(),
+    )
+
+    result = asyncio.run(router_mod.get_sector_health("Technology", "test-token"))
+    assert result["status"] == "unavailable"
+    assert result["score"] is None
+    assert router_mod._CACHE.get("Technology") is None
 
 
 def test_trend_from_snapshots_improving_and_deteriorating():
@@ -212,6 +296,7 @@ def test_endpoint_shape_and_unknown_sector(monkeypatch):
     """Endpoint returns the documented dict for known sectors and
     raises 404 for unknown ones."""
     import asyncio
+
     from fastapi import HTTPException
 
     from api.routers import sector_health as router_mod
