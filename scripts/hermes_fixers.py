@@ -1698,6 +1698,16 @@ def maybe_run_autoresearch(
             run_autoresearch(). See scripts/hermes_operator.py's
             ``_AutoresearchGenerationTracker``.
     """
+    from config import settings
+
+    # Off-by-default research gate (2026-09-19): checked FIRST, before the
+    # 12h cooldown, dry_run, or anything else — a disabled flag must never
+    # advance state.last_autoresearch or create a research_run row, so
+    # this must return before either of those can happen below.
+    if not settings.AUTORESEARCH_ENABLED:
+        log.info("autoresearch disabled (AUTORESEARCH_ENABLED=false) — skipping")
+        return {"status": "skipped", "reason": "disabled"}
+
     now = datetime.now(timezone.utc)
 
     # Only run autoresearch every 12 hours
