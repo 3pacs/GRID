@@ -32,6 +32,7 @@ row >= 25 days old. If no prior snapshot exists the trend is
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import date, datetime, timezone
 from typing import Any
 
@@ -544,7 +545,11 @@ def compute_sector_health(engine: Engine, sector_name: str) -> dict[str, Any]:
 
 
 def snapshot_all_sectors(
-    engine: Engine, snapshot_date: date | None = None,
+    engine: Engine,
+    snapshot_date: date | None = None,
+    *,
+    computed_at: datetime | None = None,
+    should_continue: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Compute health for every sector in ``SECTOR_MAP`` and upsert one
     row per (sector, ``snapshot_date``) into ``sector_health_snapshots``.
@@ -568,18 +573,53 @@ def snapshot_all_sectors(
             ``ON CONFLICT (sector_name, snapshot_date) DO UPDATE`` below
             is what makes retries within a due period idempotent, but
             only if the date matches.
+        computed_at: Timestamp written explicitly as ``as_of`` for every
+            row this call writes. Defaults to ``datetime.now(timezone.utc)``
+            at call start. Passed explicitly (rather than relying on the
+            database's ``NOW()``) so the upsert guard below can compare
+            "when did THIS attempt compute its numbers" against whatever
+            ``as_of`` is already stored, instead of "which upsert statement
+            happened to reach Postgres last" — the two differ whenever an
+            abandoned worker's write reaches the database after a newer
+            attempt's write (see ``should_continue`` and the WHERE guard
+            below).
+        should_continue: Optional callable, checked before each sector's
+            compute AND again immediately before each sector's upsert.
+            When it returns False, the loop stops where it is (an ordinary
+            return, not an exception) and the result carries
+            ``"aborted_stale": True`` plus the counters accumulated so far.
+            Intended for a caller (``hermes_operator._maybe_run_sector_health_snapshot``)
+            to cheaply abandon an in-process attempt once it knows a newer
+            attempt has superseded it — e.g. after
+            ``_run_with_timeout`` orphans a worker on timeout and a later
+            cycle starts a fresh attempt before the orphan finishes. This
+            is a same-process guard only (checked in Python between DB
+            calls); it does not by itself prevent an in-flight upsert from
+            landing — that is what the ``as_of`` WHERE guard below is for.
     """
     import json
 
     from analysis.sector_map import SECTOR_MAP
 
     today = snapshot_date if snapshot_date is not None else datetime.now(timezone.utc).date()
+    computed_at = computed_at if computed_at is not None else datetime.now(timezone.utc)
     written = 0
     skipped = 0
     upsert_failed = 0
+    stale_skipped = 0
+    aborted_stale = False
     out: dict[str, Any] = {"date": today.isoformat(), "sectors": {}}
 
     for sector_name in SECTOR_MAP.keys():
+        if should_continue is not None and not should_continue():
+            aborted_stale = True
+            log.info(
+                "snapshot_all_sectors: aborting before {s} — should_continue() "
+                "returned False (a newer attempt has superseded this one)",
+                s=sector_name,
+            )
+            break
+
         try:
             result = compute_sector_health(engine, sector_name)
         except Exception as exc:
@@ -602,27 +642,58 @@ def snapshot_all_sectors(
                      s=sector_name, r=result.get("reason"))
             continue
 
+        if should_continue is not None and not should_continue():
+            aborted_stale = True
+            log.info(
+                "snapshot_all_sectors: aborting immediately before {s}'s upsert "
+                "— should_continue() returned False (a newer attempt has "
+                "superseded this one)",
+                s=sector_name,
+            )
+            break
+
         try:
             with engine.begin() as conn:
-                conn.execute(
+                upsert_result = conn.execute(
                     text(
                         """
                         INSERT INTO sector_health_snapshots
-                            (sector_name, score, components, snapshot_date)
-                        VALUES (:s, :sc, CAST(:c AS JSONB), :d)
+                            (sector_name, score, components, snapshot_date, as_of)
+                        VALUES (:s, :sc, CAST(:c AS JSONB), :d, :as_of)
                         ON CONFLICT (sector_name, snapshot_date) DO UPDATE
                         SET score = EXCLUDED.score,
                             components = EXCLUDED.components,
-                            as_of = NOW()
+                            as_of = EXCLUDED.as_of
+                        WHERE sector_health_snapshots.as_of IS NULL
+                           OR sector_health_snapshots.as_of <= EXCLUDED.as_of
                         """
                     ).bindparams(
                         s=sector_name,
                         sc=float(result["score"]),
                         c=json.dumps(result["components"]),
                         d=today,
+                        as_of=computed_at,
                     )
                 )
-                written += 1
+                # rowcount is 1 when the INSERT landed or the DO UPDATE's
+                # WHERE guard matched (this attempt is at least as new as
+                # whatever as_of was already stored); 0 means the guard
+                # rejected the write because an already-stored row has a
+                # newer as_of — i.e. a LATER attempt already wrote this
+                # sector, and this (older/abandoned) attempt's write must
+                # not overwrite it. That is not a failure: it is the
+                # cross-attempt protection working as intended, so it is
+                # counted separately from upsert_failed.
+                if upsert_result.rowcount == 1:
+                    written += 1
+                else:
+                    stale_skipped += 1
+                    log.info(
+                        "snapshot_all_sectors: {s} upsert skipped — an "
+                        "as-new-or-newer row already exists for this "
+                        "(sector, snapshot_date)",
+                        s=sector_name,
+                    )
         except Exception as exc:
             upsert_failed += 1
             log.warning(
@@ -633,6 +704,12 @@ def snapshot_all_sectors(
     out["snapshots_written"] = written
     out["snapshots_skipped_unavailable"] = skipped
     out["upsert_failed"] = upsert_failed
-    log.info("sector_health: wrote {n} daily snapshots ({k} unavailable, skipped, {f} upsert failed)",
-             n=written, k=skipped, f=upsert_failed)
+    out["snapshots_stale_skipped"] = stale_skipped
+    out["aborted_stale"] = aborted_stale
+    log.info(
+        "sector_health: wrote {n} daily snapshots ({k} unavailable, skipped, "
+        "{f} upsert failed, {st} stale-skipped{ab})",
+        n=written, k=skipped, f=upsert_failed, st=stale_skipped,
+        ab=", aborted stale" if aborted_stale else "",
+    )
     return out

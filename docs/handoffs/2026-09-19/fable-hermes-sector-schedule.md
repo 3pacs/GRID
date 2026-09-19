@@ -266,6 +266,169 @@ pattern, all still using minute windows today:
 
 None of these were changed in this PR.
 
+## Parent-timeout blocker and own-step fix (2026-09-19)
+
+This section documents a second, follow-up change on top of the due-period
+scheduler above (branch `fable/hermes-sector-step-20260919`, off
+`origin/main` @ `cee8fc99`). Same scope: development only, draft PR, no
+merge, no production access.
+
+### The two defects are separate; neither alone explains the whole gap
+
+1. **Already-merged (above in this doc): the 10-minute evaluation window.**
+   `now.hour == 3 and now.minute < 10` made the sector-health step
+   *unreachable most of the time even when execution reached it* — it only
+   ran on the rare cycle whose evaluation happened to land inside that
+   10-minute slice. Fixed by `daily_task_due` (due-period scheduling, no
+   minute window).
+2. **This change: the 900s `intelligence_tasks` parent timeout is a
+   confirmed CURRENT blocker**, independent of (1). Production journal
+   evidence — 2026-09-19 03:48, 04:35, 05:02 and 06:05 UTC, and the
+   May-2026 log — shows the whole `run_intelligence_tasks` step timing out
+   at `INTELLIGENCE_TASKS_TIMEOUT_SECONDS` (900s) on EVERY observed cycle.
+   Inside that step the order is: earnings sync → 30-minute active-
+   hypothesis scorer (up to 240s) → 4h/6h tasks → the daily intelligence
+   batch (the `daily_due` block, which runs with `catch_up=True` on every
+   cycle because it never advances `state.last_daily_intel` far enough to
+   stop being due) → **then** `_maybe_run_sector_health_snapshot(...)` →
+   forced-flow briefing, etc. Because the daily block runs long enough
+   (with LLM calls) to consume the step's remaining budget on essentially
+   every cycle, `state.last_daily_intel = now` is never reached, and
+   nothing placed after it in the function — including the old
+   sector-health call — was ever reached either.
+
+Neither defect alone is claimed to explain the entire historical gap
+(2026-07-13 to 2026-09-13, 62 days): (1) explains why execution was rare
+even when the parent step returned in time; (2) explains why, once (1) was
+about to be fixed, the sector-health call would still have been
+unreachable on essentially every cycle because the step wrapping it times
+out before reaching it. Both are real, independently confirmed, and this
+PR's fix (giving sector-health its own dispatch and its own timeout) makes
+it reachable regardless of either one.
+
+### What changed
+
+- **`SECTOR_HEALTH_TIMEOUT_SECONDS = 120`** (`scripts/hermes_operator.py`),
+  next to the other per-step timeout constants. Observed sector-health run
+  time for ~20 sectors is 3-8s; 120s is generous headroom, and — unlike
+  `INTELLIGENCE_TASKS_TIMEOUT_SECONDS` — is deliberately NOT sized against
+  or coupled to that budget, because the whole point of the split is that
+  the two are independent.
+- The `_maybe_run_sector_health_snapshot(...)` call was removed from
+  `run_intelligence_tasks` (it used to run right after the `daily_due`
+  block, which is exactly the code that was never reached — see above).
+- New `_run_sector_health_step(engine, state, dry_run)`: thin wrapper that
+  builds `now` and a fresh `results` dict and delegates to
+  `_maybe_run_sector_health_snapshot` (due-period/backoff/idempotency logic
+  unchanged); dry-run short-circuits to `{"skipped": "dry_run"}`.
+- New `_run_sector_and_intelligence_steps(engine, state, dry_run,
+  cycle_result)`: dispatches the sector-health step FIRST, under
+  `_run_with_timeout("sector_health", ..., SECTOR_HEALTH_TIMEOUT_SECONDS,
+  state)`, then dispatches `intelligence_tasks` exactly as before (900s,
+  unchanged). `run_cycle`'s step 7f now calls this helper instead of
+  dispatching `intelligence_tasks` directly.
+
+### Blacklist trace — why the new step does not consult it
+
+`_run_with_timeout` calls `state.cooldowns.blacklist_for_timeout(name)` on
+every timeout, sector-health included. Traced: that blacklist entry is
+only ever honoured by a call site that explicitly checks
+`state.cooldowns.can_retry(<name>)` before running — exactly four call
+sites do this (`oracle_cycle`, `signal_classification`,
+`anomaly_narration`, `knowledge_mapping`). `intelligence_tasks` and
+`resolution` do not consult it either (see `_run_resolution_step`'s own
+docstring for the same trace on `resolution`), so for those steps a
+timeout's blacklist entry is written but never read. The new
+`sector_health` step deliberately joins that second group and does NOT add
+a `can_retry("sector_health")` check: doing so would make a single timeout
+block every retry for `TIMEOUT_BLACKLIST_HOURS` (24h), reintroducing a
+multi-day stall on top of a step that already has its own bounded
+retry/backoff (`SECTOR_HEALTH_RETRY_BACKOFF_MINUTES` = 60,
+`SECTOR_HEALTH_MAX_ATTEMPTS_PER_DAY` = 5, both inside
+`_maybe_run_sector_health_snapshot`, unchanged by this PR).
+
+### Abandoned workers cannot duplicate writes or overwrite newer state
+
+`_run_with_timeout` abandons (does not kill) the worker thread on timeout,
+so a timed-out sector-health attempt can still be running — and can still
+write to the database — after the cycle has moved on. Two layers now guard
+against that:
+
+- **In-process, before `run_cycle` even starts a new attempt:**
+  `_run_sector_and_intelligence_steps` bumps
+  `state.sector_health_attempt_token` itself right when it reports a
+  timeout, so an abandoned worker's own later attempt-token check inside
+  `_maybe_run_sector_health_snapshot` sees a stale token even if no LATER
+  cycle's attempt ever starts. (The pre-existing token check in
+  `_maybe_run_sector_health_snapshot` already covered the case where a
+  later attempt DOES start; this closes the other half.)
+  `snapshot_all_sectors` also now accepts a `should_continue` callable,
+  checked before each sector's compute and again immediately before each
+  sector's upsert; `_maybe_run_sector_health_snapshot` passes
+  `lambda: state.sector_health_attempt_token == attempt_token`, so an
+  abandoned attempt stops issuing further DB writes as soon as it notices
+  it has been superseded, instead of running the whole sector list to
+  completion first. When this trips, the result carries `"aborted_stale":
+  True` and `_maybe_run_sector_health_snapshot` returns without touching
+  `state.last_sector_health*` or `results` at all.
+- **At the database row level, for whatever write is already in flight
+  when the in-process check above hasn't caught it yet:**
+  `snapshot_all_sectors` now writes an explicit `computed_at` timestamp
+  (default `datetime.now(timezone.utc)` at call start) as `as_of` on every
+  row, and the upsert's `ON CONFLICT ... DO UPDATE` carries a `WHERE
+  sector_health_snapshots.as_of IS NULL OR sector_health_snapshots.as_of <=
+  EXCLUDED.as_of` guard. An older attempt's write against a
+  (sector_name, snapshot_date) that a newer attempt already wrote is
+  rejected by Postgres itself (`rowcount == 0`), counted as
+  `snapshots_stale_skipped` — not a failure, not a duplicate write, just
+  the guard doing its job.
+
+### Tests
+
+- `tests/test_hermes_sector_step.py` (new): starvation (sector step runs
+  and returns quickly even when `run_intelligence_tasks` blocks past its
+  patched budget, using the REAL `_run_with_timeout`), source-order +
+  "no longer calls the helper" pins via `inspect.getsource`, the
+  sector-health step's own timeout with an abandoned-worker check, the
+  blacklist trace (blacklisted yet still retried after backoff, and
+  `run_cycle`'s source does not check it), and the `snapshot_all_sectors`
+  DB-row guard (`as_of` bound + WHERE clause present, `rowcount == 0` →
+  `snapshots_stale_skipped` not a failure, `should_continue=False` before
+  the first upsert writes nothing, and an end-to-end token-bump scenario
+  where a stale in-flight attempt stops writing once a newer one starts).
+- `tests/test_hermes_timeout_budgets.py`: added a pin that
+  `SECTOR_HEALTH_TIMEOUT_SECONDS` is a positive int, actually used by the
+  dispatch, and not derived from/tied to `INTELLIGENCE_TASKS_TIMEOUT_SECONDS`.
+- `tests/test_hermes_sector_schedule.py`: unchanged in intent; its fakes
+  were widened to accept the new `computed_at`/`should_continue` keyword
+  arguments `_maybe_run_sector_health_snapshot` now passes through to
+  `snapshot_all_sectors`, and the idempotency fixture's fake connection now
+  returns an explicit `rowcount = 1` (matching what real Postgres returns
+  there, since each call in that test uses a later `computed_at`).
+- `tests/test_sector_health.py`: unchanged; still green against the
+  additive `snapshot_all_sectors` signature (`computed_at`/`should_continue`
+  are keyword-only with defaults).
+
+Run: `python -m pytest tests/test_hermes_sector_schedule.py
+tests/test_hermes_timeout_budgets.py tests/test_sector_health.py
+tests/test_hermes_sector_step.py -q` — 48 passed.
+
+### NOT fixed here
+
+The daily intelligence block itself still cannot reliably complete inside
+`INTELLIGENCE_TASKS_TIMEOUT_SECONDS` (900s) — hypothesis discovery
+(`auto_discover()`), source audit, backtest scanning, postmortem, and the
+other members of the `daily_due` block remain starved on cycles where the
+30-minute active-hypothesis scorer plus whatever ran before it eats most of
+the budget. This PR does not touch `INTELLIGENCE_TASKS_TIMEOUT_SECONDS`,
+`run_intelligence_tasks`'s internal ordering, or the daily block's own
+budget — sector-health is now independent of that problem, but the
+problem itself is a separate, real, unaddressed issue and needs its own
+follow-up (candidates: splitting `intelligence_tasks` the same way this PR
+split sector-health out of it, or re-examining whether the daily block
+needs its own sub-timeout the way `RESOLUTION_SCAN_BUDGET_SECONDS` bounds
+the resolution step's cold-scan case).
+
 ---
 
 **DO NOT MERGE — no production run, backfill, restart or scheduling
