@@ -34,8 +34,9 @@ also checked and must be unchanged.
 --mode mutating: also exercises the composer/alert-creation path. Requires
 BOTH the `SMOKE_ALLOW_MUTATIONS=1` environment variable AND
 `--i-accept-production-writes`; refuses to start (no network calls at all)
-if either is missing. Only .github/workflows/dad-smoke-mutating.yml
-(workflow_dispatch-only) is meant to use it, against an isolated target.
+if either is missing. No workflow in this repository invokes it — it is a
+manually-gated CLI escape hatch, meant to be run by hand against an isolated
+target only.
 
 Exit codes: 0 nothing broken, 1 something broken AND --strict was passed (or
 the non-mutating guard caught an actual mutation, regardless of --strict),
@@ -305,9 +306,9 @@ def validate_mode(mode: str, *, env: dict[str, str], accept_flag: bool) -> str |
         missing.append("--i-accept-production-writes")
     return (
         "--mode=mutating refused to start: missing " + " and ".join(missing) + ". "
-        "Mutating smoke must run from .github/workflows/dad-smoke-mutating.yml "
-        "against an isolated target; it is never invoked from the routine "
-        "deploy path."
+        "No workflow in this repository invokes --mode=mutating; run it by "
+        "hand against an isolated target only. It is never invoked from the "
+        "routine deploy path."
     )
 
 
@@ -705,9 +706,9 @@ def step_composer(client: Client, budget_ms: int, mode: str = MODE_NON_MUTATING)
             "composer", "blocked", None,
             f"skipped in --mode={MODE_NON_MUTATING}: /chat/compose and /chat/ask/stream "
             "can persist state and/or spend a real LLM call (see "
-            "NON_MUTATING_EXCLUDED_ENDPOINTS); alert-creation/composer smoke now "
-            "runs only via --mode=mutating from "
-            ".github/workflows/dad-smoke-mutating.yml against an isolated target",
+            "NON_MUTATING_EXCLUDED_ENDPOINTS); alert-creation/composer smoke only "
+            "runs via --mode=mutating, run by hand against an isolated target — "
+            "no workflow in this repository invokes it",
         )
 
     sub: list[StepResult] = []
@@ -1220,7 +1221,8 @@ def main(argv: list[str] | None = None) -> int:
             "in this file). mutating: also exercises composer/alert-creation "
             "smoke; requires SMOKE_ALLOW_MUTATIONS=1 and "
             "--i-accept-production-writes, and must target an isolated "
-            "environment — see .github/workflows/dad-smoke-mutating.yml."
+            "environment. No workflow in this repository invokes this mode — "
+            "run it by hand only."
         ),
     )
     parser.add_argument(
