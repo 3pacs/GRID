@@ -15,8 +15,6 @@ rather than mutating request history.
 
 from __future__ import annotations
 
-from datetime import date
-
 from fastapi import APIRouter, Depends
 from loguru import logger as log
 from pydantic import BaseModel, Field
@@ -91,7 +89,8 @@ def current_price(ticker: str, *, prefer_live: bool = False) -> tuple[float | No
             if live and live.get("price") is not None:
                 px = float(live["price"])
                 try:
-                    _cache_price_to_db(engine, tk, px, date.today())
+                    # Skipped when the quote carries no bar date of its own.
+                    _cache_price_to_db(engine, tk, px, live.get("bar_date"))
                 except Exception:
                     pass
                 return px

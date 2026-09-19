@@ -121,11 +121,29 @@ class DealerGammaEngine:
         snap_date: date | None = None,
         spot_range_pct: float = 0.15,
         n_points: int = 50,
+        as_of: bool = False,
     ) -> dict[str, Any]:
         """Compute the full GEX profile for a ticker.
 
+        Point-in-time contract (GEX look-ahead fix, audit C-H9):
+            ``snap_date`` is the date the caller is asking about. The chain
+            used is never dated *after* it:
+
+            * ``snap_date`` given and ``as_of`` False (default) — strict. Only
+              a chain stored on exactly that date is used. No chain that day
+              means ``{"available": False, ...}``; a later chain is never
+              substituted.
+            * ``as_of=True`` — "the picture as it stood on ``snap_date``": the
+              most recent chain **on or before** ``snap_date`` is used, and
+              the returned ``snap_date`` is that chain's own date.
+            * ``snap_date=None`` — today, as-of semantics (the latest chain up
+              to and including today).
+
         Returns:
             Dictionary with:
+            - available: bool (False + `error` when no chain/spot was found)
+            - snap_date: str (the date the chain actually came from)
+            - requested_snap_date: str (the date asked for)
             - gex_aggregate: float (total GEX at current spot)
             - gamma_flip: float (spot price where GEX = 0)
             - gamma_wall: float (strike with max |GEX|)
@@ -140,14 +158,34 @@ class DealerGammaEngine:
         """
         if snap_date is None:
             snap_date = date.today()
+            as_of = True
+        requested_snap_date = snap_date
 
-        chain = self._load_chain(ticker, snap_date)
+        chain_date = snap_date
+        chain = self._load_chain(ticker, chain_date)
+        if chain.empty and as_of:
+            earlier = self._latest_snap_date_on_or_before(ticker, snap_date)
+            if earlier is not None and earlier < snap_date:
+                chain_date = earlier
+                chain = self._load_chain(ticker, chain_date)
         if chain.empty:
-            return {"error": f"No options data for {ticker} on {snap_date}", "ticker": ticker}
+            return {
+                "available": False,
+                "error": f"No options data for {ticker} on {snap_date}",
+                "ticker": ticker,
+                "requested_snap_date": str(requested_snap_date),
+                "snap_date": None,
+            }
 
-        spot = self._get_spot(ticker, snap_date)
+        spot = self._get_spot(ticker, chain_date)
         if spot <= 0:
-            return {"error": f"No spot price for {ticker}", "ticker": ticker}
+            return {
+                "available": False,
+                "error": f"No spot price for {ticker}",
+                "ticker": ticker,
+                "requested_snap_date": str(requested_snap_date),
+                "snap_date": str(chain_date),
+            }
 
         # Compute per-strike Greeks and GEX
         per_strike = self._compute_per_strike(chain, spot)
@@ -189,8 +227,11 @@ class DealerGammaEngine:
             regime = "NEUTRAL"
 
         return {
+            "available": True,
             "ticker": ticker,
-            "snap_date": str(snap_date),
+            # The date the chain actually loaded from — never a later one.
+            "snap_date": str(chain_date),
+            "requested_snap_date": str(requested_snap_date),
             "spot": round(spot, 2),
             "gex_aggregate": round(gex_agg, 0),
             "gex_normalized": round(gex_normalized, 4),
@@ -367,7 +408,15 @@ class DealerGammaEngine:
         ]
 
     def _load_chain(self, ticker: str, snap_date: date) -> pd.DataFrame:
-        """Load options chain from database."""
+        """Load the options chain stored for exactly ``snap_date``.
+
+        Strictly point-in-time: an empty frame means there is no chain for
+        that date. This used to fall back to ``MAX(snap_date)``, which handed
+        a *later* chain to a caller asking about an earlier date (audit C-H9:
+        every historical bar of /flow-timeline silently reused the newest
+        chain). Choosing an earlier chain is the caller's decision and lives
+        in ``compute_gex_profile(..., as_of=True)``.
+        """
         with self.engine.connect() as conn:
             rows = conn.execute(text("""
                 SELECT strike, opt_type, open_interest, implied_vol AS implied_volatility,
@@ -380,19 +429,25 @@ class DealerGammaEngine:
             """), {"ticker": ticker, "snap_date": snap_date}).fetchall()
 
         if not rows:
-            # Try most recent snap_date
-            with self.engine.connect() as conn:
-                latest = conn.execute(text(
-                    "SELECT MAX(snap_date) FROM options_snapshots WHERE ticker = :t"
-                ), {"t": ticker}).fetchone()
-                if latest and latest[0]:
-                    return self._load_chain(ticker, latest[0])
             return pd.DataFrame()
 
         df = pd.DataFrame(rows, columns=["strike", "opt_type", "open_interest",
                                           "implied_volatility", "expiry", "dte"])
         df["dte"] = df["dte"].apply(lambda x: x.days if hasattr(x, 'days') else int(x))
         return df[df["dte"] > 0]
+
+    def _latest_snap_date_on_or_before(self, ticker: str, cutoff: date) -> date | None:
+        """Most recent options_snapshots date for ``ticker`` at or before ``cutoff``.
+
+        Bounded by ``cutoff`` so an "as of" read can never reach forward into
+        a chain that did not exist yet.
+        """
+        with self.engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT MAX(snap_date) FROM options_snapshots "
+                "WHERE ticker = :t AND snap_date <= :cutoff"
+            ), {"t": ticker, "cutoff": cutoff}).fetchone()
+        return row[0] if row and row[0] else None
 
     def _get_spot(self, ticker: str, snap_date: date) -> float:
         """Get spot price from resolved_series or options ATM."""
@@ -424,14 +479,22 @@ class DealerGammaEngine:
 
     # ── Convenience methods ──────────────────────────────────────────
 
-    def compute_all_tickers(self, snap_date: date | None = None) -> list[dict]:
-        """Run GEX analysis for all tickers with options data."""
+    def compute_all_tickers(
+        self, snap_date: date | None = None, as_of: bool = False
+    ) -> list[dict]:
+        """Run GEX analysis for all tickers with options data.
+
+        Each ticker is resolved independently, so the results can carry
+        different ``snap_date`` values — see ``get_market_gex_summary``, which
+        reports the min/max of the dates actually used rather than claiming a
+        single date for the whole market.
+        """
         from ingestion.options import EQUITY_TICKERS
 
         results = []
         for ticker in EQUITY_TICKERS:
             try:
-                result = self.compute_gex_profile(ticker, snap_date)
+                result = self.compute_gex_profile(ticker, snap_date, as_of=as_of)
                 if "error" not in result:
                     results.append(result)
             except Exception as exc:
@@ -442,7 +505,9 @@ class DealerGammaEngine:
         log.info("GEX computed for {n} tickers", n=len(results))
         return results
 
-    def get_market_gex_summary(self, snap_date: date | None = None) -> dict:
+    def get_market_gex_summary(
+        self, snap_date: date | None = None, as_of: bool = False
+    ) -> dict:
         """Aggregate GEX summary across all tickers.
 
         Returns the macro-level dealer positioning picture:
@@ -450,9 +515,13 @@ class DealerGammaEngine:
         - Where are the key support/resistance gamma walls?
         - How much vanna/charm exposure is outstanding?
         """
-        results = self.compute_all_tickers(snap_date)
+        results = self.compute_all_tickers(snap_date, as_of=as_of)
         if not results:
-            return {"error": "No GEX data available"}
+            return {"available": False, "error": "No GEX data available"}
+
+        # Each ticker was priced off its own snapshot date; report the range
+        # actually used instead of stamping today over all of them (C-M6).
+        snap_dates = sorted({r["snap_date"] for r in results if r.get("snap_date")})
 
         # SPY is the market proxy
         spy = next((r for r in results if r["ticker"] == "SPY"), None)
@@ -465,7 +534,10 @@ class DealerGammaEngine:
         short_gamma = [r for r in results if r["regime"] == "SHORT_GAMMA"]
 
         return {
-            "snap_date": str(snap_date or date.today()),
+            "available": True,
+            "snap_date_min": snap_dates[0] if snap_dates else None,
+            "snap_date_max": snap_dates[-1] if snap_dates else None,
+            "requested_snap_date": str(snap_date) if snap_date else None,
             "total_tickers": len(results),
             "aggregate_gex": round(total_gex, 0),
             "aggregate_vanna": round(total_vanna, 0),
@@ -481,6 +553,7 @@ class DealerGammaEngine:
             "tickers": [
                 {
                     "ticker": r["ticker"],
+                    "snap_date": r.get("snap_date"),
                     "spot": r["spot"],
                     "gex": r["gex_aggregate"],
                     "regime": r["regime"],
