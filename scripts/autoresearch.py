@@ -435,26 +435,39 @@ def _select_orthogonal_features(cur, max_features: int = 13, corr_threshold: flo
 
 
 def get_feature_list(cur) -> str:
-    """Build a text list of orthogonal features for prompts."""
+    """Build a text list of orthogonal features for prompts.
+
+    Queries ``signal_subtype``, not ``subfamily``: production
+    ``feature_registry`` has no ``subfamily`` column (catalog query run
+    2026-09-19; see tests/test_autoresearch_schema_contract.py), so the
+    original ``COALESCE(f.subfamily, '')`` raised
+    ``psycopg2.errors.UndefinedColumn`` on every eligible run, failing at
+    data-load phase ``feature_list`` (observed 2026-09-19 05:39Z and in
+    May-2026 logs). This is the same fix as grid-svr commit
+    91e1e6750f40ae6eb461aa5455f72ebf01ea2fbb (2026-07-15, author Anik),
+    which existed only in grid-svr's old checkout
+    (/home/grid/grid_v4/grid_repo) and was never pushed; reused verbatim
+    here (with the local loop variable renamed subfamily -> subtype).
+    """
     ortho_ids = _select_orthogonal_features(cur)
     if not ortho_ids:
         return "(no features)"
 
     cur.execute("""
-        SELECT f.id, f.name, f.family, COALESCE(f.subfamily, ''), f.description,
+        SELECT f.id, f.name, f.family, COALESCE(f.signal_subtype, ''), f.description,
                COUNT(rs.id) as obs_count
         FROM feature_registry f
         JOIN resolved_series rs ON rs.feature_id = f.id
         WHERE f.id = ANY(%s)
           AND rs.obs_date >= CURRENT_DATE - INTERVAL '1 year'
-        GROUP BY f.id, f.name, f.family, f.subfamily, f.description
+        GROUP BY f.id, f.name, f.family, f.signal_subtype, f.description
         HAVING COUNT(rs.id) >= 30
         ORDER BY f.family, f.id
     """, (ortho_ids,))
     rows = cur.fetchall()
     lines = []
-    for fid, name, family, subfamily, desc, cnt in rows:
-        label = f"{family}/{subfamily}" if subfamily else family
+    for fid, name, family, subtype, desc, cnt in rows:
+        label = f"{family}/{subtype}" if subtype else family
         lines.append(f"  ID={fid}  {name} ({label}): {desc} [{cnt} obs]")
     return "\n".join(lines) if lines else "(no features)"
 
