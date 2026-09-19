@@ -340,10 +340,10 @@ class OperatorState:
         self.last_forced_flow_brief: datetime | None = None  # Daily forced-flow waterfall briefing ~06:30 UTC
         self.last_contagion_backtest: datetime | None = None  # Daily contagion backtest at 5 AM
         self.last_contagion_feedback: datetime | None = None  # Daily contagion feedback loop right after backtest
-        self.last_sector_health: datetime | None = None  # Daily sector health snapshot, due-period opens 3 AM UTC (marks the due period done — success or no_eligible_sectors)
+        self.last_sector_health: datetime | None = None  # Daily sector health snapshot, due-period opens 3 AM UTC (marks the due period done — success, no_eligible_sectors, or superseded)
         self.last_sector_health_attempt: datetime | None = None  # Last sector-health attempt (success or failure) — drives retry backoff
         self.sector_health_attempt_count: int = 0  # Attempts made in the current sector-health due period — capped, reset each new period
-        self.last_sector_health_outcome: str | None = None  # "success" | "no_eligible_sectors" | "failure" — see _maybe_run_sector_health_snapshot
+        self.last_sector_health_outcome: str | None = None  # "success" | "no_eligible_sectors" | "superseded" | "failure" — see _maybe_run_sector_health_snapshot
         self.sector_health_attempt_token: int = 0  # Incremented at each attempt start; a worker's result is only committed if this still matches at completion (guards against an abandoned _run_with_timeout worker writing stale state after a later cycle's attempt has already started)
         self.last_active_hypo_scoring: datetime | None = None  # Periodic batch scoring of overdue active hypos (30 min)
         self.last_earnings_calendar_sync: datetime | None = None  # earnings_events → earnings_calendar back-compat sync (30 min)
