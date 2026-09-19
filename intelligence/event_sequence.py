@@ -468,7 +468,11 @@ def _pull_decision_journal_events(
                     amount_usd=None,
                     description=desc,
                     source="decision_journal",
-                    confidence=_confidence_label(conf),
+                    # An unscored decision is not "estimated" - that is a real
+                    # tier other sources earn. Label it for what it is.
+                    confidence=(
+                        "unscored" if r[2] is None else _confidence_label(conf)
+                    ),
                     lead_time_to_next_move=None,
                 ))
     except Exception as exc:
