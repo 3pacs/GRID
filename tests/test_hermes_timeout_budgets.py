@@ -56,3 +56,27 @@ def test_scorer_budget_leaves_headroom_for_batch_at_observed_throughput() -> Non
     measured_rows_per_sec = 15.0
     expected_batch_seconds = ho.ACTIVE_HYPO_SCORING_BATCH_SIZE / measured_rows_per_sec
     assert expected_batch_seconds * 4 < ho.ACTIVE_HYPO_SCORING_MAX_RUNTIME_S
+
+
+def test_sector_health_timeout_is_a_positive_int_independent_of_intelligence_budget() -> None:
+    """SECTOR_HEALTH_TIMEOUT_SECONDS (2026-09-19 split — sector-health is
+    now its own run_cycle step, dispatched ahead of intelligence_tasks; see
+    _run_sector_and_intelligence_steps) must be a sane, positive timeout
+    used by that step's dispatch, and must NOT be derived from or tied to
+    INTELLIGENCE_TASKS_TIMEOUT_SECONDS — the whole point of the split is
+    that the two budgets are independent, so sector-health is reachable
+    and bounded regardless of whether intelligence_tasks times out."""
+    assert isinstance(ho.SECTOR_HEALTH_TIMEOUT_SECONDS, int)
+    assert ho.SECTOR_HEALTH_TIMEOUT_SECONDS > 0
+    assert ho.SECTOR_HEALTH_TIMEOUT_SECONDS != ho.INTELLIGENCE_TASKS_TIMEOUT_SECONDS
+    assert ho.SECTOR_HEALTH_TIMEOUT_SECONDS < ho.INTELLIGENCE_TASKS_TIMEOUT_SECONDS, (
+        "sector-health is observed at 3-8s in production; it should stay a "
+        "short step, not scale with the much larger intelligence_tasks budget"
+    )
+    assert ho.SECTOR_HEALTH_TIMEOUT_SECONDS < ho.CYCLE_TIMEOUT_SECONDS
+
+    import inspect
+    src = inspect.getsource(ho._run_sector_and_intelligence_steps)
+    assert "SECTOR_HEALTH_TIMEOUT_SECONDS" in src, (
+        "the sector-health dispatch must actually use the constant"
+    )

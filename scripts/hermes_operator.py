@@ -47,6 +47,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import uuid
@@ -119,6 +120,7 @@ TIMESFM_TIMEOUT_SECONDS = 240                 # oracle/forecaster_adapter.run_ti
 ASTROGRID_CELESTIAL_TIMEOUT_SECONDS = 240      # oracle.astrogrid_cycle.run_celestial_cycle: deterministic sky build is sub-second; the budget is almost entirely the one local-LLM interpretation call (num_predict=1200). Degrades to a deterministic fallback if the model is offline, so a timeout here means the model was slow, not absent.
 DAILY_INTEL_BATCH_OBSERVED_S = 360            # observed run length of the 02:00 daily block (source_audit → backtest_scan → postmortem → options_improvement → hypothesis_review → auto_discover) with LLM calls, measured 2026-05-08
 INTELLIGENCE_TASKS_TIMEOUT_SECONDS = 900      # whole run_intelligence_tasks() step. MUST exceed ACTIVE_HYPO_SCORING_MAX_RUNTIME_S + DAILY_INTEL_BATCH_OBSERVED_S: the 30-min active-hypothesis scorer runs FIRST inside this step, so if its budget alone exceeds this cap the step times out before the daily block — and auto_discover() — is ever reached. That inversion (360s cap vs 600s scorer) is how hypothesis discovery starved from 2026-05-15 onward. Was 360 (2026-05-08); raised 2026-09-10. tests/test_hermes_timeout_budgets.py pins the invariant.
+SECTOR_HEALTH_TIMEOUT_SECONDS = 120           # whole sector-health snapshot step (scripts/hermes_operator.py::_run_sector_health_step), split out of run_intelligence_tasks on 2026-09-19 into its own dispatch with its own timeout. Observed run time for ~20 sectors is 3-8s; 120s is generous headroom, not a sized budget like INTELLIGENCE_TASKS_TIMEOUT_SECONDS above. Deliberately independent of that 900s budget: production traces show intelligence_tasks times out on essentially every cycle (the daily block runs with catch_up=True every cycle, so it never reaches state.last_daily_intel = now, and the sector-health call used to run AFTER that point — i.e. never). Giving this step its own short timeout, dispatched before intelligence_tasks, makes it reachable regardless of whether intelligence_tasks times out. See docs/handoffs/2026-09-19/fable-hermes-sector-schedule.md ("Parent-timeout blocker and own-step fix").
 POSTMORTEM_BATCH_LIMIT = 20                   # Drain postmortem backlog in bounded chunks instead of orphaning long LLM loops.
 
 # Active-hypothesis scoring — periodic batch that closes the loop on the
@@ -731,6 +733,29 @@ def daily_task_due(
     return last_success < _period_boundary(now, boundary_hour)
 
 
+# Guards the in-process sector-health state marker (state.last_sector_health*,
+# state.sector_health_attempt*) against the check-to-write race described in
+# _maybe_run_sector_health_snapshot's docstring below: without it, Python can
+# switch threads between _commit's token check and its subsequent writes, so
+# an abandoned worker's belated _commit can pass the check, a newer attempt
+# can then start and commit, and the old worker's writes land last anyway.
+# Deliberately module-level, NOT an attribute on OperatorState — OperatorState
+# is serialised via to_dict() (analytical-snapshot persistence), and a
+# threading.Lock is not picklable/JSON-able. The DB row race for the
+# sector_health_snapshots table itself is closed separately, by the upsert's
+# `WHERE ... as_of < EXCLUDED.as_of` guard in
+# intelligence/sector_health.py::snapshot_all_sectors (evaluated atomically
+# on the locked conflicting row in PostgreSQL); this lock only closes the
+# in-process marker race, which the DB guard does not touch.
+_SECTOR_HEALTH_STATE_LOCK = threading.Lock()
+
+# Test-only seam: called inside _commit, between the token check and the
+# state/results writes, so a test can force a specific thread interleaving
+# at that exact point (see tests/test_sector_health_upsert_ordering_pg.py,
+# scenario d). Default no-op; production code never sets this.
+_SECTOR_HEALTH_COMMIT_TEST_HOOK: Callable[[], None] | None = None
+
+
 def _maybe_run_sector_health_snapshot(
     engine: Any,
     state: OperatorState,
@@ -768,11 +793,21 @@ def _maybe_run_sector_health_snapshot(
     Outcome semantics: a call either (a) ``success`` — at least one row
     written and no upsert failures, (b) ``no_eligible_sectors`` — zero
     rows written, every sector reported unavailable, no upsert failures;
-    this is a legitimate empty day, so the due period IS marked done, or
-    (c) ``failure`` — any upsert failure or an exception; the due period
-    is NOT marked done. Failure handling: a failed execution does NOT
-    advance ``state.last_sector_health`` (so the due period is not
-    marked done and a later evaluation can retry), but retries are
+    this is a legitimate empty day, so the due period IS marked done,
+    (c) ``superseded`` — zero rows written, no upsert failures, but at
+    least one sector was ``snapshots_stale_skipped`` (every row this
+    attempt tried already had an as-new-or-newer row from a different
+    attempt — see the ``as_of`` tie rule on
+    ``intelligence.sector_health.snapshot_all_sectors``: "first committed
+    wins on equal as_of"); this attempt did no useful work but is not a
+    failure either, so the due period IS marked done, PROVIDED the token
+    is still current — if a newer attempt is already in-process, that
+    newer attempt owns marking its own due period done, and this stale
+    attempt's ``_commit`` call is a no-op regardless (see the token guard
+    below), or (d) ``failure`` — any upsert failure or an exception; the
+    due period is NOT marked done. Failure handling: a failed execution
+    does NOT advance ``state.last_sector_health`` (so the due period is
+    not marked done and a later evaluation can retry), but retries are
     throttled to once every ``SECTOR_HEALTH_RETRY_BACKOFF_MINUTES`` (60)
     and capped at ``SECTOR_HEALTH_MAX_ATTEMPTS_PER_DAY`` (5) per due
     period so a persistent failure doesn't re-attempt on every ~5-minute
@@ -789,6 +824,23 @@ def _maybe_run_sector_health_snapshot(
     ``last_sector_health_outcome`` if the token is still current when the
     call completes; otherwise the result is discarded and logged as
     stale.
+
+    Check-to-write race on the state marker: the token check above and the
+    subsequent writes to ``state.last_sector_health*`` are NOT atomic on
+    their own — Python can switch threads between ``_commit``'s check and
+    its assignments, so an abandoned worker's ``_commit`` can pass the
+    check, a newer attempt can then start AND commit, and the old worker's
+    assignments can still land last, overwriting the newer attempt's
+    marker. ``_SECTOR_HEALTH_STATE_LOCK`` (module-level, not stored on
+    ``OperatorState`` — see its own docstring) is held around (a) the
+    attempt-start block (token bump + attempt fields) below, (b) the whole
+    of ``_commit`` (check + writes), and (c) the timeout-path token bump in
+    ``_run_sector_and_intelligence_steps``, so the check and the writes for
+    any one attempt happen atomically with respect to every other
+    attempt's check-and-write. This is purely an in-process guard for the
+    Python-level marker; the DB row race for the actual
+    ``sector_health_snapshots`` table is independently closed by the
+    upsert's ``WHERE`` guard (see ``snapshot_all_sectors``).
     """
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
@@ -832,39 +884,92 @@ def _maybe_run_sector_health_snapshot(
         "Running daily sector health snapshot (due since {h}:00 UTC, attempt {a})",
         h=SECTOR_HEALTH_BOUNDARY_HOUR, a=state.sector_health_attempt_count + 1,
     )
-    state.last_sector_health_attempt = now
-    state.sector_health_attempt_count += 1
-    state.sector_health_attempt_token += 1
-    attempt_token = state.sector_health_attempt_token
+    with _SECTOR_HEALTH_STATE_LOCK:
+        state.last_sector_health_attempt = now
+        state.sector_health_attempt_count += 1
+        state.sector_health_attempt_token += 1
+        attempt_token = state.sector_health_attempt_token
     due_period_date = _period_boundary(now, SECTOR_HEALTH_BOUNDARY_HOUR).date()
 
     def _commit(outcome: str, extra: dict[str, Any]) -> None:
         """Write the attempt's result to `state`/`results`, but only if no
-        later attempt has started since this one (see docstring)."""
-        if state.sector_health_attempt_token != attempt_token:
-            log.warning(
-                "stale sector-health worker result ignored (token {t}, current {c})",
-                t=attempt_token, c=state.sector_health_attempt_token,
-            )
-            return
-        results["sector_health_snapshot"] = {**extra, "outcome": outcome}
-        state.last_sector_health_outcome = outcome
-        if outcome in ("success", "no_eligible_sectors"):
-            state.last_sector_health = now
+        later attempt has started since this one (see docstring). The
+        check and the writes happen under _SECTOR_HEALTH_STATE_LOCK so an
+        abandoned worker cannot pass the check and then lose a race to
+        write after a newer attempt has already committed (the
+        check-to-write race described in this function's docstring)."""
+        with _SECTOR_HEALTH_STATE_LOCK:
+            if state.sector_health_attempt_token != attempt_token:
+                log.warning(
+                    "stale sector-health worker result ignored (token {t}, current {c})",
+                    t=attempt_token, c=state.sector_health_attempt_token,
+                )
+                return
+            if _SECTOR_HEALTH_COMMIT_TEST_HOOK is not None:
+                _SECTOR_HEALTH_COMMIT_TEST_HOOK()
+            results["sector_health_snapshot"] = {**extra, "outcome": outcome}
+            state.last_sector_health_outcome = outcome
+            if outcome in ("success", "no_eligible_sectors", "superseded"):
+                state.last_sector_health = now
 
     try:
         from intelligence.sector_health import snapshot_all_sectors
-        sh_result = snapshot_all_sectors(engine, snapshot_date=due_period_date)
+        sh_result = snapshot_all_sectors(
+            engine,
+            snapshot_date=due_period_date,
+            computed_at=now,
+            # Cheap in-process staleness guard for an abandoned
+            # _run_with_timeout worker (see this function's "Cross-cycle
+            # race guard" docstring section above): checked by
+            # snapshot_all_sectors before each sector's compute and again
+            # immediately before each upsert. If a LATER attempt has
+            # already bumped state.sector_health_attempt_token past this
+            # attempt's captured value, this closure starts returning
+            # False and the loop stops mid-run instead of racing a newer
+            # attempt's writes. This is in-process only (same caveat as
+            # the token guard below and _AutoresearchGenerationTracker):
+            # it does not fence a second Hermes process.
+            should_continue=lambda: state.sector_health_attempt_token == attempt_token,
+        )
+
+        if sh_result.get("aborted_stale"):
+            # A later attempt already started (token moved past ours)
+            # while snapshot_all_sectors was still running — the _commit
+            # token guard below would discard this result anyway, so
+            # return without touching `results` or state.last_sector_health*
+            # at all, rather than committing a partial/stale outcome.
+            log.info(
+                "sector_health: attempt {a} aborted mid-run (stale token; a "
+                "later attempt already started) — result discarded",
+                a=state.sector_health_attempt_count,
+            )
+            return
 
         written = sh_result.get("snapshots_written", 0)
         skipped = sh_result.get("snapshots_skipped_unavailable", 0)
         upsert_failed = sh_result.get("upsert_failed", 0)
+        stale_skipped = sh_result.get("snapshots_stale_skipped", 0)
 
         if upsert_failed > 0:
             outcome = "failure"
             log.warning(
                 "sector_health: {n} upsert failure(s), due period not marked done",
                 n=upsert_failed,
+            )
+        elif written == 0 and stale_skipped > 0:
+            # Every row this attempt tried already had an as-new-or-newer
+            # row from a different attempt (the snapshot_all_sectors
+            # `as_of` WHERE guard rejected every write this attempt made).
+            # Not a failure — a different attempt already did the work —
+            # so the due period is marked done via _commit's outcome set,
+            # but only if this attempt's token is still current (a newer
+            # in-process attempt already handles its own marker).
+            outcome = "superseded"
+            log.info(
+                "sector_health: superseded — {n} row(s) already had an "
+                "as-new-or-newer as_of from a different attempt, nothing "
+                "written this attempt",
+                n=stale_skipped,
             )
         elif written == 0 and skipped > 0:
             outcome = "no_eligible_sectors"
@@ -880,6 +985,146 @@ def _maybe_run_sector_health_snapshot(
     except Exception as exc:
         log.warning("sector_health snapshot failed: {e}", e=str(exc))
         _commit("failure", {"status": "failed", "error": str(exc)})
+
+
+def _run_sector_health_step(engine: Any, state: OperatorState, dry_run: bool) -> dict[str, Any]:
+    """Entry point for the sector-health snapshot as its own ``run_cycle``
+    step (dispatched by :func:`_run_sector_and_intelligence_steps` under
+    ``_run_with_timeout(..., SECTOR_HEALTH_TIMEOUT_SECONDS)``).
+
+    Split out of ``run_intelligence_tasks`` on 2026-09-19 — see that
+    function's NOTE for why the old placement (inside, and after the daily
+    block of, ``run_intelligence_tasks``) made this step effectively
+    unreachable in production. This wrapper owns only what changed by the
+    split: building ``now`` and a fresh per-call ``results`` dict, and the
+    dry-run short-circuit. All due-period, retry/backoff, idempotency and
+    cross-cycle-race handling is unchanged and still lives in
+    :func:`_maybe_run_sector_health_snapshot`.
+    """
+    if dry_run:
+        log.info("[DRY RUN] Would evaluate sector health")
+        return {"skipped": "dry_run"}
+
+    now = datetime.now(timezone.utc)
+    results: dict[str, Any] = {}
+    _maybe_run_sector_health_snapshot(engine, state, now, results)
+    return results
+
+
+def _run_sector_and_intelligence_steps(
+    engine: Any,
+    state: OperatorState,
+    dry_run: bool,
+    cycle_result: dict[str, Any],
+) -> None:
+    """Run the sector-health snapshot and the intelligence-tasks batch as
+    two INDEPENDENT ``run_cycle`` steps, each under its own
+    ``_run_with_timeout`` budget, sector-health dispatched first.
+
+    Why split (2026-09-19; see
+    docs/handoffs/2026-09-19/fable-hermes-sector-schedule.md, "Parent-
+    timeout blocker and own-step fix"): the sector-health snapshot used to
+    run INSIDE ``run_intelligence_tasks``, after its ``daily_due`` block
+    (source_audit -> backtest_scan -> postmortem -> options_improvement ->
+    hypothesis_review -> auto_discover -> ``state.last_daily_intel = now``).
+    Production journal evidence (2026-09-19 03:48, 04:35, 05:02, 06:05 UTC,
+    and the May-2026 log) shows the whole ``intelligence_tasks`` step times
+    out at ``INTELLIGENCE_TASKS_TIMEOUT_SECONDS`` (900s) on EVERY observed
+    cycle: the daily batch runs with ``catch_up=True`` every cycle because
+    the step is abandoned before ``state.last_daily_intel = now`` is ever
+    reached, so nothing placed after that point in the function — including
+    the old sector-health call — ever ran. This is a separate, confirmed-
+    current blocker from the due-period scheduling fix in
+    ``daily_task_due``/``_maybe_run_sector_health_snapshot`` (which fixed a
+    different, already-merged defect: a 10-minute evaluation window that
+    made execution rare even when reached). Neither defect alone is claimed
+    to explain the full historical gap; both are real and independent.
+    Dispatching sector-health as its own step, ahead of intelligence_tasks
+    and with its own short timeout (``SECTOR_HEALTH_TIMEOUT_SECONDS``,
+    observed 3-8s in production), makes it reachable every cycle regardless
+    of whether intelligence_tasks times out — which it still does; that
+    900s budget is unchanged by this split and is explicitly NOT fixed
+    here (see the handoff doc's "NOT fixed here" note).
+
+    Blacklist trace (do not "fix" this by adding a can_retry check):
+    ``_run_with_timeout`` calls
+    ``state.cooldowns.blacklist_for_timeout("sector_health")`` on a
+    timeout, same as it does for every named step. But that blacklist
+    entry is only ever honoured by a call site that explicitly checks
+    ``state.cooldowns.can_retry(<name>)`` before running — traced here to
+    exactly four such call sites: ``oracle_cycle``, ``signal_classification``,
+    ``anomaly_narration`` and ``knowledge_mapping``. ``intelligence_tasks``
+    and ``resolution`` do not consult it either (see
+    ``_run_resolution_step``'s docstring for the same trace on
+    ``resolution``), so for those steps a timeout's blacklist entry is
+    written but never read — it changes nothing about whether the step
+    runs again. This new ``sector_health`` step deliberately joins that
+    second group: it does NOT check ``can_retry("sector_health")``. Adding
+    that check would make a single timeout block every retry for
+    ``TIMEOUT_BLACKLIST_HOURS`` (24h), reintroducing a multi-day stall on
+    top of a step that already has its own bounded retry/backoff
+    (``SECTOR_HEALTH_RETRY_BACKOFF_MINUTES`` = 60, capped at
+    ``SECTOR_HEALTH_MAX_ATTEMPTS_PER_DAY`` = 5 per due period, both enforced
+    inside ``_maybe_run_sector_health_snapshot``). Retry throttling for
+    this step comes entirely from that backoff, not from the cooldown
+    blacklist.
+
+    Abandoned-worker handling: ``_run_with_timeout`` abandons (does not
+    kill) the worker thread on timeout, so a timed-out sector-health
+    attempt can still be running — and can still call
+    ``snapshot_all_sectors`` / ``_commit`` — after this function has moved
+    on. ``_maybe_run_sector_health_snapshot`` already guards against a
+    LATER attempt starting while an earlier one is still in flight (its
+    ``state.sector_health_attempt_token`` check). This function closes the
+    other half of that gap — an abandoned attempt with no later attempt
+    ever starting — by bumping the token itself right here on timeout, so
+    the orphan's eventual ``_commit``/upsert-guard sees a stale token
+    either way. This bump is taken under ``_SECTOR_HEALTH_STATE_LOCK`` —
+    the same lock ``_commit`` holds — so it can never land between an
+    in-flight ``_commit``'s token check and its writes.
+    """
+    # ── Sector health snapshot — own step, own (short) timeout ─────────
+    try:
+        state.current_step = "sector_health"
+        sector_result, ok = _run_with_timeout(
+            "sector_health",
+            lambda: _run_sector_health_step(engine, state, dry_run),
+            SECTOR_HEALTH_TIMEOUT_SECONDS,
+            state,
+        )
+        if ok and sector_result:
+            cycle_result["sector_health"] = sector_result
+        elif not ok:
+            cycle_result["sector_health"] = {"timeout": True}
+            # See docstring: bump the token so an abandoned worker's
+            # belated _commit()/upsert is discarded as stale even if no
+            # later attempt ever starts. Under the same lock _commit uses,
+            # so this bump can never interleave with an in-flight
+            # _commit's check-then-write.
+            with _SECTOR_HEALTH_STATE_LOCK:
+                state.sector_health_attempt_token += 1
+    except Exception as exc:
+        log.warning("Sector health step failed: {e}", e=str(exc))
+
+    # ── Intelligence tasks — unchanged from before the split; still 900s,
+    #    still the step production shows timing out on effectively every
+    #    cycle (see docstring above). Dispatched second so a slow/timed-out
+    #    intelligence_tasks step can never again prevent sector-health from
+    #    running.
+    try:
+        state.current_step = "intelligence_tasks"
+        intel_result, ok = _run_with_timeout(
+            "intelligence_tasks",
+            lambda: run_intelligence_tasks(engine, state, dry_run=dry_run),
+            INTELLIGENCE_TASKS_TIMEOUT_SECONDS,
+            state,
+        )
+        if ok and intel_result:
+            cycle_result["intelligence"] = intel_result
+        elif not ok:
+            cycle_result["intelligence"] = {"timeout": True}
+    except Exception as exc:
+        log.warning("Intelligence tasks failed: {e}", e=str(exc))
 
 
 def run_intelligence_tasks(
@@ -1418,10 +1663,17 @@ def run_intelligence_tasks(
 
         state.last_daily_intel = now
 
-    # ── Daily due-period (opens 3:00 AM UTC) — sector health snapshot ──
-    # See _maybe_run_sector_health_snapshot() docstring for the schedule,
-    # idempotency, and failure/backoff design.
-    _maybe_run_sector_health_snapshot(engine, state, now, results)
+    # NOTE (2026-09-19): the daily sector-health snapshot used to run here,
+    # AFTER the daily-due block above. It now has its own dispatch and its
+    # own timeout (SECTOR_HEALTH_TIMEOUT_SECONDS), run BEFORE this whole
+    # step in run_cycle — see the sector/intelligence orchestration helper
+    # near the run_cycle dispatch for the design and the traced reason:
+    # production shows this step times out at INTELLIGENCE_TASKS_TIMEOUT_
+    # SECONDS on essentially every cycle, and the daily-due block above runs
+    # with catch_up=True every time (state.last_daily_intel never advances
+    # far enough to reach code after it), so anything placed after this
+    # block was never actually reached in production. Do not re-add a
+    # sector-health call in this function.
 
     # ── Daily at 6:30 UTC — forced-flow waterfall briefing ──────────
     # Implements docs/playbooks/opex_waterfall.md. Runs once per day,
@@ -2715,22 +2967,17 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     except Exception as exc:
         log.warning("Alpha research heartbeat failed: {e}", e=str(exc))
 
-    # 7f. Intelligence modules — trust scoring, cross-reference, lever pullers,
-    #     actor network, source audit, postmortem, options tracking, backtests
-    try:
-        state.current_step = "intelligence_tasks"
-        intel_result, ok = _run_with_timeout(
-            "intelligence_tasks",
-            lambda: run_intelligence_tasks(engine, state, dry_run=dry_run),
-            INTELLIGENCE_TASKS_TIMEOUT_SECONDS,
-            state,
-        )
-        if ok and intel_result:
-            cycle_result["intelligence"] = intel_result
-        elif not ok:
-            cycle_result["intelligence"] = {"timeout": True}
-    except Exception as exc:
-        log.warning("Intelligence tasks failed: {e}", e=str(exc))
+    # 7f. Sector health snapshot, then intelligence modules — trust scoring,
+    #     cross-reference, lever pullers, actor network, source audit,
+    #     postmortem, options tracking, backtests. Split into two
+    #     independent steps (own dispatch, own _run_with_timeout budget)
+    #     on 2026-09-19: intelligence_tasks (900s) was starving the
+    #     sector-health snapshot, which used to run at the very end of it.
+    #     See _run_sector_and_intelligence_steps's docstring for the traced
+    #     production evidence and the blacklist-trace rationale for why the
+    #     new sector-health step deliberately does not consult the cooldown
+    #     retry-eligibility check that a few other steps use.
+    _run_sector_and_intelligence_steps(engine, state, dry_run, cycle_result)
 
     # 7g. Rotation paper trading — daily after 17:00 UTC (market close)
     try:
