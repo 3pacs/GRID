@@ -1,0 +1,36 @@
+From: GRID W4 slice 1 (fable/hermes-research-20260918) — NOT APPLIED
+Target file: scripts/hermes_fixers.py (this is where `maybe_run_autoresearch`
+actually lives, not scripts/hermes_operator.py — hermes_operator.py just
+imports and calls it at line 1840; see docs/handoffs/2026-09-18/fable-w4-research-states.md).
+This file is outside the set this task was allowed to edit
+(scripts/autoresearch.py + tests/test_autoresearch_*.py only), so the change
+below is documented here rather than applied.
+
+Why: scripts/autoresearch.py's run_autoresearch() now returns a structured
+result on a DB-level query failure — {"status": "failed", "phase": ...,
+"error": ..., "iterations": 0, ...} — instead of letting the exception
+propagate. maybe_run_autoresearch already catches that shape correctly
+today (result.get("iterations", 0) now reads the right key, since
+run_autoresearch's success path also sets "iterations"), but it still logs
+nothing when result["status"] == "failed" beyond what run_autoresearch
+itself already logged internally at log.error — the one place that reads
+`ar_result` further up (scripts/hermes_operator.py:1841,
+`cycle_result["autoresearch"] = ar_result`) has no way to tell a "failed"
+result from an "ok, zero hypotheses this cycle" result without inspecting
+the dict shape itself. This one-line addition makes that failure visible
+at the point closest to the status surface (state / cycle_result), instead
+of relying on it having also been logged deeper inside autoresearch.py.
+
+--- a/scripts/hermes_fixers.py
++++ b/scripts/hermes_fixers.py
+@@ -1693,8 +1693,10 @@ def maybe_run_autoresearch(state: OperatorState, dry_run: bool = False) -> dic
+     log.info("Running autoresearch cycle")
+     try:
+         from scripts.autoresearch import run_autoresearch
+         result = run_autoresearch(max_iterations=AUTORESEARCH_MAX_ITER)
+         state.last_autoresearch = now
+         state.hypotheses_tested += result.get("iterations", 0)
++        if result.get("status") == "failed":
++            log.error("Autoresearch run failed in phase '{p}': {e}", p=result.get("phase"), e=result.get("error"))
+         return result
+     except Exception as exc:
