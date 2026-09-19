@@ -1,23 +1,19 @@
 """Static schema-contract check for scripts/autoresearch.py.
 
-GRID W4 slice (2026-09-18): the working hypothesis going into this task was
-that ``scripts/autoresearch.py`` queries a column (``feature_registry.subfamily``)
-that no longer exists on the live schema, that the query therefore raises,
-and that the raised exception is what silently keeps
-``OperatorState.hypotheses_tested`` at 0 (swallowed by a bare
+GRID W4 slice (2026-09-18/19): the working hypothesis going into this task
+was that ``scripts/autoresearch.py`` queries a column
+(``feature_registry.subfamily``) that no longer exists on the live schema,
+that the query therefore raises, and that the raised exception is what
+silently keeps ``OperatorState.hypotheses_tested`` at 0 (swallowed by a bare
 ``log.warning`` in ``scripts/hermes_fixers.py::maybe_run_autoresearch``).
 
-This test is a *static* verifier, and it only ever looks at tracked source in
-this worktree (schema.sql + migrations/versions/ + scripts/autoresearch.py at
-base origin/main 3fe3f5ef) — it never connects to any database, per this
-lane's hard boundary (no local Postgres exists; this lane must not connect to
-one). It parses every ``CREATE TABLE`` in schema.sql and every SQL string
-passed to ``cursor.execute(...)`` in scripts/autoresearch.py, and asserts that
-every ``alias.column`` / bare-column reference actually names a column
-schema.sql defines for that table.
+This test is a *static* verifier — it never connects to any database. It
+parses every ``CREATE TABLE`` in schema.sql and every SQL string passed to
+``cursor.execute(...)`` in scripts/autoresearch.py, and asserts that every
+``alias.column`` / bare-column reference actually names a column schema.sql
+defines for that table.
 
-The original known-finding bundled two separate claims. They resolve
-differently against tracked source:
+The original known-finding bundled two separate claims:
 
 1. **The counter-key bug** (``iterations_run`` vs ``iterations``) —
    **REPRODUCED**, and fixed at commit 8a20c84a (see
@@ -27,40 +23,43 @@ differently against tracked source:
    ``result.get("iterations", 0)`` — fully verifiable from source, no DB
    involved.
 
-2. **``feature_registry.subfamily`` vs ``signal_subtype``** — **not
-   reproducible from tracked source on 3fe3f5ef**. ``schema.sql:89-110``
-   and the alembic baseline migration
-   (migrations/versions/7e4dfecce247_baseline_schema_from_schema_sql.py)
-   both define ``feature_registry.subfamily`` as a live column, and no
-   migration under migrations/versions/ renames or drops it.
-   ``signal_subtype`` is a *different* column, addable to
-   ``feature_registry`` only by the standalone, untracked script
-   scripts/signal_taxonomy.py (its own "ALTER TABLE feature_registry ADD
-   COLUMN signal_domain/signal_subtype", run outside the migrations/ chain
-   and outside schema.sql), plus a genuine, unrelated
-   ``signal_data.signal_subtype`` column added by
-   migrations/0053_signal_subtype.sql.
-
-   Local source cannot disprove the earlier production schema mismatch.
-   This result is UNRESOLVED ACROSS VERSIONS, not a refutation of the
-   2026-09-17 audit: that audit measured `feature_registry` live, and
-   production may have since been (or already was) altered by
-   scripts/signal_taxonomy.py's untracked runtime DDL, or by other
-   out-of-band changes made under the open incident — none of which show
-   up in this worktree's tracked source. This test only proves what
-   schema.sql and migrations/versions/ say on 3fe3f5ef; it says nothing
-   about what is actually deployed.
-
-   The read-only catalog query that would settle it, for whoever has
-   production access to run it:
+2. **``feature_registry.subfamily`` vs ``signal_subtype``** — **SETTLED,
+   2026-09-19**. A read-only catalog query was run directly against griddb
+   on 2026-09-19:
 
        SELECT column_name FROM information_schema.columns
        WHERE table_name = 'feature_registry'
        ORDER BY ordinal_position;
 
-   This lane does **not** run that query, or any query, against any
-   database — no local Postgres exists, and this task's hard boundary
-   forbids connecting to one.
+   Production's actual column list is: id, name, family, description,
+   transformation, transformation_version, lag_days, normalization,
+   missing_data_policy, eligible_from_date, model_eligible, created_at,
+   deprecated_at, signal_domain, signal_subtype. There is **no**
+   ``subfamily`` column in production. ``signal_domain``/``signal_subtype``
+   were added by the untracked runtime DDL in
+   scripts/signal_taxonomy.py (an ``ALTER TABLE feature_registry ADD
+   COLUMN ... TEXT`` inside a ``DO`` block, plus
+   ``CREATE INDEX IF NOT EXISTS idx_feature_domain ON feature_registry
+   (signal_domain)`` / ``idx_feature_subtype ON feature_registry
+   (signal_subtype)``), never through the tracked migrations/ chain or
+   schema.sql — which is exactly the gap this slice closes.
+
+   The fix reuses, verbatim, a fix that was already written and correct but
+   never pushed: commit 91e1e6750f40ae6eb461aa5455f72ebf01ea2fbb (2026-07-15,
+   author Anik), which existed only in grid-svr's old checkout
+   (``/home/grid/grid_v4/grid_repo``). ``scripts/autoresearch.py::get_feature_list``
+   now selects ``COALESCE(f.signal_subtype, '')`` (was ``f.subfamily``) and
+   groups by ``f.signal_subtype`` (was ``f.subfamily``) — see that
+   function's docstring for the full history.
+
+   ``schema.sql`` and a new alembic revision
+   (``migrations/versions/feature_signal_taxonomy_20260919.py``) now declare
+   ``signal_domain``/``signal_subtype`` (and their indexes) on
+   ``feature_registry``, reconciling the tracked schema with what production
+   actually has. ``subfamily`` stays declared in schema.sql — removing it is
+   out of scope (taxonomy_fix.sql still references it) — but production does
+   not have it, and scripts/autoresearch.py must not (and, after this
+   change, does not) query it.
 
 This test is kept as a regression guard against tracked source (it WOULD
 fail if a future edit introduced a genuine column typo against schema.sql),
@@ -78,9 +77,11 @@ lightweight regex/AST-based check, not a real SQL parser):
     delimited token of each resulting fragment is taken as the column name
     unless it is a table-level keyword (CONSTRAINT/PRIMARY/FOREIGN/UNIQUE/
     CHECK). This does not understand ALTER TABLE ... ADD COLUMN anywhere
-    (schema.sql has none for the tables this file touches; taxonomy_migration.sql
-    and scripts/signal_taxonomy.py's runtime ALTER TABLEs are out of scope by
-    design, per the task's instruction to check schema.sql/migrations only).
+    (schema.sql declares signal_domain/signal_subtype as ordinary columns
+    directly, so no ALTER TABLE parsing is needed for those; taxonomy_fix.sql
+    and scripts/signal_taxonomy.py's runtime ALTER TABLEs remain out of
+    scope by design, per the task's instruction to check schema.sql/migrations
+    only).
   - Query strings are extracted from scripts/autoresearch.py via `ast`,
     matched on any ``<expr>.execute(<string literal>, ...)`` call. Adjacent
     string-literal concatenation (``"a" "b"``) is already folded into one
@@ -262,11 +263,19 @@ def autoresearch_queries() -> list[str]:
 def test_extractor_finds_feature_registry_with_subfamily(schema_columns):
     """Sanity check on the extractor itself, independent of autoresearch.py.
 
-    schema.sql:89-110 defines feature_registry with a `subfamily` column.
-    If this fails, the regex extractor above is broken, not the schema.
+    schema.sql declares `signal_domain`/`signal_subtype` on feature_registry
+    (added 2026-09-19 to reconcile with what scripts/signal_taxonomy.py's
+    untracked runtime DDL already put on production — see the module
+    docstring). `subfamily` is also still declared: removing it is out of
+    scope for this change (taxonomy_fix.sql still references it), even
+    though the 2026-09-19 production catalog query found no `subfamily`
+    column live. If this fails, the regex extractor above is broken, not
+    the schema.
     """
     assert "feature_registry" in schema_columns
     assert "subfamily" in schema_columns["feature_registry"]
+    assert "signal_domain" in schema_columns["feature_registry"]
+    assert "signal_subtype" in schema_columns["feature_registry"]
     assert "family" in schema_columns["feature_registry"]
     assert "model_eligible" in schema_columns["feature_registry"]
 
@@ -297,13 +306,11 @@ def test_every_autoresearch_column_reference_exists_in_schema(schema_columns, au
     resolved_series, hypothesis_registry, model_registry, and
     validation_results must be a column schema.sql defines for that table.
 
-    As documented in this module's docstring, this currently finds ZERO
-    violations against tracked source: the originally-hypothesized
-    `f.subfamily` vs `signal_subtype` mismatch is not reproducible from
-    tracked source on 3fe3f5ef (schema.sql / migrations/versions/). That is
-    not the same as settled against production — see the module docstring
-    for the read-only catalog query that would settle it, and why this lane
-    does not run it.
+    As documented in this module's docstring, this finds ZERO violations
+    against tracked source: schema.sql now declares every column
+    scripts/autoresearch.py references (including signal_subtype, added
+    2026-09-19), and the query fix in get_feature_list() means autoresearch.py
+    no longer references subfamily at all.
     """
     all_violations: list[str] = []
     for query in autoresearch_queries:
@@ -312,32 +319,92 @@ def test_every_autoresearch_column_reference_exists_in_schema(schema_columns, au
     assert not all_violations, "column/schema mismatches found:\n" + "\n".join(all_violations)
 
 
-def test_subfamily_is_a_real_column_not_a_typo_for_signal_subtype(schema_columns):
-    """Confirms the known-finding hypothesis is not reproducible from
-    tracked source on 3fe3f5ef. It does NOT settle the question against
-    production — see the module docstring: local source cannot disprove
-    the earlier production schema mismatch, which the 2026-09-17 audit
-    measured live and which untracked runtime DDL (scripts/signal_taxonomy.py)
-    or other out-of-band incident changes could have altered since. This
-    result is UNRESOLVED ACROSS VERSIONS, not "false".
+def test_autoresearch_does_not_query_subfamily(autoresearch_queries):
+    """Regression guard for the fix: no cur.execute(...) string in
+    scripts/autoresearch.py may reference `subfamily` — production has no
+    such column (2026-09-19 catalog query) — and at least one must
+    reference `signal_subtype`, the column get_feature_list() now uses.
 
-    scripts/autoresearch.py:256-269 (get_feature_list) selects
-    `COALESCE(f.subfamily, '')` from feature_registry. The hypothesis was
-    that this column had been renamed/replaced by `signal_subtype`. On
-    tracked source only: both schema.sql and the alembic baseline
-    migration (migrations/versions/7e4dfecce247_baseline_schema_from_schema_sql.py)
-    define `feature_registry.subfamily` as a real column, and no migration
-    under migrations/versions/ touches it. `signal_subtype` is a distinct
-    column addable out-of-band by scripts/signal_taxonomy.py's own ALTER
-    TABLE (outside the tracked migration chain) — on tracked source it
-    coexists with `subfamily` rather than replacing it, but whether that
-    script (or something else) has since altered production is exactly
-    what `information_schema.columns` on the live DB would show, and this
-    lane does not query it.
+    This directly guards against re-introducing the bug this slice fixes
+    (grid-svr commit 91e1e6750f40ae6eb461aa5455f72ebf01ea2fbb, reused here):
+    scripts/autoresearch.py:444-450 (get_feature_list) used to select
+    `COALESCE(f.subfamily, '')` and group by `f.subfamily`; it now selects
+    and groups by `f.signal_subtype`.
     """
-    feature_registry_cols = schema_columns["feature_registry"]
-    assert "subfamily" in feature_registry_cols
-    # signal_subtype is not part of the tracked schema.sql definition for
-    # feature_registry at all (it's bolted on by a separate, untracked
-    # script) — confirming it is not "the" schema column for this table.
-    assert "signal_subtype" not in feature_registry_cols
+    assert not any("subfamily" in q for q in autoresearch_queries), (
+        "scripts/autoresearch.py queries `subfamily`, which does not exist "
+        "on production feature_registry (2026-09-19 catalog query) — this "
+        "is the bug fixed by reusing grid-svr commit 91e1e675"
+    )
+    assert any("signal_subtype" in q for q in autoresearch_queries), (
+        "expected at least one cur.execute(...) string in "
+        "scripts/autoresearch.py to reference signal_subtype "
+        "(get_feature_list's fixed query) — extractor may have broken, or "
+        "the fix was reverted"
+    )
+
+
+def test_taxonomy_migration_is_idempotent_and_non_destructive():
+    """Static check on the new alembic revision's DDL and downgrade.
+
+    migrations/versions/feature_signal_taxonomy_20260919.py's TAXONOMY_DDL
+    must only ever use ADD COLUMN IF NOT EXISTS / CREATE INDEX IF NOT
+    EXISTS (so re-running it, e.g. against griddb where
+    scripts/signal_taxonomy.py already applied the same DDL by hand, is
+    always safe), and its downgrade() must never DROP the columns it added
+    (production data written by scripts/signal_taxonomy.py would be
+    destroyed — see that function's docstring).
+    """
+    import ast
+
+    migration_path = (
+        REPO_ROOT / "migrations" / "versions" / "feature_signal_taxonomy_20260919.py"
+    )
+    source = migration_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    taxonomy_ddl: list[str] = []
+    for node in ast.walk(tree):
+        is_plain_assign = isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "TAXONOMY_DDL" for t in node.targets
+        )
+        is_annotated_assign = (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "TAXONOMY_DDL"
+        )
+        if is_plain_assign or is_annotated_assign:
+            for elt in node.value.elts:
+                assert isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+                taxonomy_ddl.append(elt.value)
+
+    assert taxonomy_ddl, "TAXONOMY_DDL not found or not a literal tuple of strings"
+    for stmt in taxonomy_ddl:
+        upper = stmt.upper()
+        is_safe_add_column = "ADD COLUMN IF NOT EXISTS" in upper
+        is_safe_create_index = "CREATE INDEX IF NOT EXISTS" in upper
+        assert is_safe_add_column or is_safe_create_index, (
+            f"TAXONOMY_DDL statement is not an idempotent ADD COLUMN/CREATE "
+            f"INDEX: {stmt!r}"
+        )
+        assert "DROP" not in upper, f"TAXONOMY_DDL statement contains DROP: {stmt!r}"
+
+    # downgrade() source must contain no DROP statement.
+    downgrade_source = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "downgrade":
+            downgrade_source = ast.get_source_segment(source, node)
+            break
+    assert downgrade_source is not None, "downgrade() function not found"
+    # Look for actual DDL/alembic-op DROP calls, not the English word "drop"
+    # in the docstring's prose (which explains *why* it must not drop).
+    drop_ddl = re.search(
+        r"\bDROP\s+(COLUMN|TABLE|INDEX)\b|op\.drop_(column|index|table)\(",
+        downgrade_source,
+        re.IGNORECASE,
+    )
+    assert drop_ddl is None, (
+        f"downgrade() must not drop signal_domain/signal_subtype — production "
+        f"data written by scripts/signal_taxonomy.py would be destroyed "
+        f"(found: {drop_ddl.group(0) if drop_ddl else None!r})"
+    )

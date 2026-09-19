@@ -106,16 +106,38 @@ CREATE TABLE IF NOT EXISTS feature_registry (
     eligible_from_date    DATE NOT NULL,
     model_eligible        BOOLEAN NOT NULL DEFAULT FALSE,
     created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    deprecated_at         TIMESTAMPTZ
+    deprecated_at         TIMESTAMPTZ,
+    signal_domain         TEXT,
+    signal_subtype        TEXT
 );
 
+-- signal_domain / signal_subtype (above): production has these columns via
+-- scripts/signal_taxonomy.py's untracked runtime DDL (an
+-- "ALTER TABLE feature_registry ADD COLUMN ... TEXT" DO block, plus the
+-- idx_feature_domain / idx_feature_subtype indexes below), confirmed by a
+-- read-only catalog query against griddb on 2026-09-19. They are declared
+-- here so the tracked schema matches what a fresh install ends up with in
+-- practice, and so scripts/autoresearch.py (which queries signal_subtype,
+-- not subfamily) works against a from-scratch database too. See
+-- migrations/versions/feature_signal_taxonomy_20260919.py for the
+-- idempotent alembic revision that adds these on an existing DB.
 CREATE INDEX IF NOT EXISTS idx_feature_registry_family ON feature_registry (family);
 -- Composite index covers both single-family lookups (prefix scan) and
 -- family+subfamily taxonomy queries (autoresearch, taxonomy_fix, audit grouping).
+--
+-- NOTE (2026-09-19): the same 2026-09-19 catalog query that confirmed
+-- signal_domain/signal_subtype exist in production also confirmed
+-- production's feature_registry has NO subfamily column. Removing the
+-- subfamily column/index here is out of scope for this change (taxonomy_fix.sql
+-- still references subfamily), but scripts/autoresearch.py — the only
+-- consumer this task touches — must not query subfamily; it now queries
+-- signal_subtype instead (see get_feature_list()).
 CREATE INDEX IF NOT EXISTS idx_feature_registry_family_subfamily
     ON feature_registry (family, subfamily);
 CREATE INDEX IF NOT EXISTS idx_feature_registry_model_eligible ON feature_registry (model_eligible);
 CREATE INDEX IF NOT EXISTS idx_feature_registry_name ON feature_registry (name);
+CREATE INDEX IF NOT EXISTS idx_feature_domain ON feature_registry (signal_domain);
+CREATE INDEX IF NOT EXISTS idx_feature_subtype ON feature_registry (signal_subtype);
 
 -- ============================================================
 -- TABLE: resolved_series
