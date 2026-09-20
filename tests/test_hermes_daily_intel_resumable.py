@@ -31,12 +31,38 @@ from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 from scripts import hermes_operator as ho
 from scripts.hermes_health import OperatorState
 
 
+@pytest.fixture(autouse=True)
+def _clear_daily_intel_in_flight_registry():
+    """_DAILY_INTEL_IN_FLIGHT is module-level and shared across tests in
+    this file — several tests reuse synthetic task names ("t0", "t1",
+    ...). Clear it before and after every test so no test can observe a
+    leftover in-flight entry (or stale thread ident) from a previous
+    test."""
+    ho._DAILY_INTEL_IN_FLIGHT.clear()
+    yield
+    ho._DAILY_INTEL_IN_FLIGHT.clear()
+
+
 def _task(name: str, fn, budget_s: float = 5.0) -> ho.DailyIntelTask:
     return ho.DailyIntelTask(name, fn, budget_s)
+
+
+def _allow_all(monkeypatch, tasks: tuple[ho.DailyIntelTask, ...]) -> None:
+    """Most of this file's tests predate the allow/hold gate and exercise
+    synthetic task names ("t0", "blocked", "bad", ...) that are not in the
+    real DAILY_INTEL_INITIAL_ALLOWLIST. Allow every synthetic task so the
+    pre-existing resumability behavior under test is unaffected by the
+    allow-list gate — the gate itself is covered separately by
+    TestAllowlistGate/TestDailyIntelAllowlistClassification below."""
+    monkeypatch.setattr(
+        ho, "DAILY_INTEL_INITIAL_ALLOWLIST", frozenset(t.name for t in tasks),
+    )
 
 
 def _recording_fn(name: str, calls: list[str], *, sleep_s: float = 0.0, fail: bool = False):
@@ -69,6 +95,7 @@ class TestBlockedFirstTaskDoesNotBlockLaterTasks:
         t2 = _task("t2", _recording_fn("t2", calls))
         t3 = _task("t3", _recording_fn("t3", calls))
         monkeypatch.setattr(ho, "DAILY_INTEL_TASKS", (blocked, t2, t3))
+        _allow_all(monkeypatch, (blocked, t2, t3))
         monkeypatch.setattr(ho, "DAILY_INTEL_CYCLE_BUDGET_SECONDS", 30)
 
         state = OperatorState()
@@ -93,6 +120,7 @@ class TestRestartMidPeriodResumes:
         calls: list[str] = []
         tasks = tuple(_task(f"t{i}", _recording_fn(f"t{i}", calls)) for i in range(3))
         monkeypatch.setattr(ho, "DAILY_INTEL_TASKS", tasks)
+        _allow_all(monkeypatch, tasks)
         monkeypatch.setattr(ho, "DAILY_INTEL_CYCLE_BUDGET_SECONDS", 30)
 
         state = OperatorState()
@@ -119,6 +147,7 @@ class TestPeriodRollover:
         calls: list[str] = []
         tasks = (_task("t0", _recording_fn("t0", calls)),)
         monkeypatch.setattr(ho, "DAILY_INTEL_TASKS", tasks)
+        _allow_all(monkeypatch, tasks)
         monkeypatch.setattr(ho, "DAILY_INTEL_CYCLE_BUDGET_SECONDS", 30)
 
         state = OperatorState()
@@ -152,6 +181,7 @@ class TestMaxAttemptsSkipsForPeriod:
 
         tasks = (_task("bad", always_fail),)
         monkeypatch.setattr(ho, "DAILY_INTEL_TASKS", tasks)
+        _allow_all(monkeypatch, tasks)
         monkeypatch.setattr(ho, "DAILY_INTEL_CYCLE_BUDGET_SECONDS", 30)
         monkeypatch.setattr(ho, "DAILY_INTEL_MAX_ATTEMPTS", 3)
 
@@ -190,6 +220,7 @@ class TestLastDailyIntelNotSetUntilComplete:
 
         bad = _task("bad", fails_once)
         monkeypatch.setattr(ho, "DAILY_INTEL_TASKS", (good, bad))
+        _allow_all(monkeypatch, (good, bad))
         monkeypatch.setattr(ho, "DAILY_INTEL_CYCLE_BUDGET_SECONDS", 30)
         monkeypatch.setattr(ho, "DAILY_INTEL_MAX_ATTEMPTS", 3)
 
@@ -214,6 +245,7 @@ class TestCycleBudgetExhaustion:
         calls: list[str] = []
         tasks = tuple(_task(f"t{i}", _recording_fn(f"t{i}", calls)) for i in range(3))
         monkeypatch.setattr(ho, "DAILY_INTEL_TASKS", tasks)
+        _allow_all(monkeypatch, tasks)
         monkeypatch.setattr(ho, "DAILY_INTEL_CYCLE_BUDGET_SECONDS", 100)
 
         # Fake a monotonic clock so each task "costs" exactly 60 simulated
@@ -256,6 +288,7 @@ class TestAbandonedWorkerCannotSelfMarkDone:
 
         tasks = (_task("slow", slow, budget_s=0.05),)
         monkeypatch.setattr(ho, "DAILY_INTEL_TASKS", tasks)
+        _allow_all(monkeypatch, tasks)
         monkeypatch.setattr(ho, "DAILY_INTEL_CYCLE_BUDGET_SECONDS", 30)
 
         state = OperatorState()
@@ -315,6 +348,7 @@ class TestSummaryLogLine:
 
         bad = _task("bad", fails)
         monkeypatch.setattr(ho, "DAILY_INTEL_TASKS", (good, bad))
+        _allow_all(monkeypatch, (good, bad))
         monkeypatch.setattr(ho, "DAILY_INTEL_CYCLE_BUDGET_SECONDS", 30)
         monkeypatch.setattr(ho, "DAILY_INTEL_MAX_ATTEMPTS", 3)
 
@@ -364,3 +398,299 @@ class TestRealTaskTableSanity:
             "errors_jsonl_cleanup",
         ]
         assert [t.name for t in ho.DAILY_INTEL_TASKS] == expected_order
+
+
+# ─── Allow-list classification (review amendment, deliverable 1) ────────
+
+
+class TestDailyIntelAllowlistClassification:
+    def test_every_task_classified_exactly_once(self) -> None:
+        all_names = {t.name for t in ho.DAILY_INTEL_TASKS}
+        allow = ho.DAILY_INTEL_INITIAL_ALLOWLIST
+        hold = set(ho.DAILY_INTEL_HOLD_REASONS)
+        assert allow.isdisjoint(hold), "a task cannot be both allowed and held"
+        assert allow | hold == all_names, (
+            "every DAILY_INTEL_TASKS name must be classified exactly once "
+            "(present in exactly one of DAILY_INTEL_INITIAL_ALLOWLIST / "
+            "DAILY_INTEL_HOLD_REASONS)"
+        )
+
+    def test_hold_classified_tasks_are_absent_from_the_allowlist(self) -> None:
+        for name in ho.DAILY_INTEL_HOLD_REASONS:
+            assert name not in ho.DAILY_INTEL_INITIAL_ALLOWLIST, name
+
+    def test_standing_hold_categories_are_represented(self) -> None:
+        # Standing holds (controller instruction): scorer execution/signal
+        # scoring, historical repair/backfill, and learning/research
+        # writes (hypothesis registry, backtests, model registry,
+        # postmortems that feed learning).
+        expected_holds = {
+            "hypothesis_discovery", "hypothesis_review", "backtest_scan",
+            "postmortem_batch", "options_improvement", "milestone_scoring",
+            "actor_research", "edgar_transcripts",
+        }
+        assert set(ho.DAILY_INTEL_HOLD_REASONS) == expected_holds
+
+    def test_expected_allow_set(self) -> None:
+        # Pins the exact review-amendment classification (see
+        # docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md):
+        # source_audit and rag_index were reclassified from the
+        # controller's default-hold "LLM-driven" assumption to `allow`
+        # after reading the code — neither file has any llm.router/Tier
+        # reference, and both write only derived/audit tables
+        # (source_accuracy/source_discrepancies/source_catalog.priority_rank
+        # and intelligence_embeddings respectively).
+        expected_allow = {
+            "storage_maintenance_subagent", "source_audit", "flow_materialize",
+            "rag_index", "icij_linking", "attention_anomaly",
+            "corporate_actions", "capital_flow_rollups",
+            "fundamental_divergence", "holder_deal_overlap",
+            "insight_cleanup", "briefing_cleanup", "errors_jsonl_cleanup",
+        }
+        assert ho.DAILY_INTEL_INITIAL_ALLOWLIST == expected_allow
+
+
+# ─── Held tasks never run, never counted (deliverable 1) ────────────────
+
+
+class TestHeldTasksNeverRun:
+    def test_held_task_is_never_dispatched_and_never_blocks_completion(
+        self, monkeypatch
+    ) -> None:
+        calls: list[str] = []
+        allowed = _task("allowed", _recording_fn("allowed", calls))
+
+        def should_never_run(
+            engine: Any, state: OperatorState, now: datetime, results: dict[str, Any]
+        ) -> None:
+            raise AssertionError("a held task's fn must never be called")
+
+        held_task = _task("held_one", should_never_run)
+        tasks = (allowed, held_task)
+        monkeypatch.setattr(ho, "DAILY_INTEL_TASKS", tasks)
+        monkeypatch.setattr(ho, "DAILY_INTEL_INITIAL_ALLOWLIST", frozenset({"allowed"}))
+        monkeypatch.setattr(ho, "DAILY_INTEL_CYCLE_BUDGET_SECONDS", 30)
+
+        state = OperatorState()
+        results: dict[str, Any] = {}
+        ho._run_daily_intel_block(MagicMock(), state, NOW, results)
+
+        assert "allowed" in calls
+        assert state.daily_intel_task_outcome.get("held_one") == "held"
+        assert state.daily_intel_done.get("held_one") is None
+        assert state.daily_intel_skipped_for_period.get("held_one") is None
+        # Period completion is decided over ENABLED tasks only — the held
+        # task must not block it, and must not appear in "remaining" logic
+        # either (it can never make done_count < total).
+        assert state.last_daily_intel == NOW
+        assert state.daily_intel_period_outcome == "complete"
+
+    def test_summary_line_lists_held_tasks_explicitly(self, monkeypatch) -> None:
+        calls: list[str] = []
+        allowed = _task("allowed", _recording_fn("allowed", calls))
+        held_task = _task("held_one", lambda *a: None)
+        tasks = (allowed, held_task)
+        monkeypatch.setattr(ho, "DAILY_INTEL_TASKS", tasks)
+        monkeypatch.setattr(ho, "DAILY_INTEL_INITIAL_ALLOWLIST", frozenset({"allowed"}))
+        monkeypatch.setattr(ho, "DAILY_INTEL_CYCLE_BUDGET_SECONDS", 30)
+
+        logged: list[tuple[str, dict]] = []
+        monkeypatch.setattr(ho.log, "info", lambda msg, **kw: logged.append((msg, kw)))
+
+        state = OperatorState()
+        results: dict[str, Any] = {}
+        ho._run_daily_intel_block(MagicMock(), state, NOW, results)
+
+        summary = next(kw for msg, kw in logged if msg.startswith("daily_intel: period="))
+        assert summary["h"] == ["held_one"], (
+            "a held task must be listed in the summary line's held=[...] "
+            "so it can never be mistaken for a completed task"
+        )
+        assert "held_one" not in summary["r"]
+
+
+# ─── In-flight no-overlap guard (deliverable 2) ──────────────────────────
+
+
+class TestInFlightOverlapGuard:
+    def test_second_run_skips_in_flight_task_and_proceeds_to_next(
+        self, monkeypatch
+    ) -> None:
+        release = threading.Event()
+        worker_finished = threading.Event()
+        call_count = {"n": 0}
+
+        def slow_then_fast(
+            engine: Any, state: OperatorState, now: datetime, results: dict[str, Any]
+        ) -> None:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # First call blocks past its own budget, simulating a
+                # worker abandoned by _run_with_timeout's timeout.
+                release.wait(timeout=5.0)
+                worker_finished.set()
+            results["slow"] = "ran"
+
+        calls: list[str] = []
+        slow_task = _task("slow", slow_then_fast, budget_s=0.05)
+        t2_task = _task("t2", _recording_fn("t2", calls))
+        tasks = (slow_task, t2_task)
+        monkeypatch.setattr(ho, "DAILY_INTEL_TASKS", tasks)
+        _allow_all(monkeypatch, tasks)
+
+        state = OperatorState()
+        results: dict[str, Any] = {}
+
+        # Call A: a tiny cycle budget so only "slow" is attempted this
+        # call (it times out; its worker thread is left running, blocked
+        # on `release`) — t2 is never reached in call A.
+        monkeypatch.setattr(ho, "DAILY_INTEL_CYCLE_BUDGET_SECONDS", 0.001)
+        ho._run_daily_intel_block(MagicMock(), state, NOW, results)
+
+        assert call_count["n"] == 1
+        assert state.daily_intel_attempts.get("slow") == 1
+        assert state.daily_intel_done.get("slow") is None
+        assert "t2" not in calls, "tiny cycle budget must stop the block before t2"
+
+        # Call B: while the call-A worker is still blocked on `release`, a
+        # second call for the SAME period must skip "slow" as in_flight —
+        # not attempt it, not increment its attempt count — and proceed
+        # to the next task ("t2").
+        monkeypatch.setattr(ho, "DAILY_INTEL_CYCLE_BUDGET_SECONDS", 30)
+        ho._run_daily_intel_block(MagicMock(), state, NOW, results)
+
+        assert call_count["n"] == 1, "in_flight must not start a second worker"
+        assert state.daily_intel_attempts.get("slow") == 1, (
+            "an in_flight skip must not count as an attempt"
+        )
+        assert state.daily_intel_task_outcome.get("slow") == "in_flight"
+        assert "t2" in calls, "the block must proceed past the in_flight task to t2"
+        period_iso = _period_iso(NOW)
+        assert state.daily_intel_done.get("t2") == period_iso
+
+        # Release the call-A worker and let it actually finish.
+        release.set()
+        assert worker_finished.wait(timeout=2.0), "orphaned worker never completed"
+
+        # Its belated completion must not have published anything: "slow"
+        # is still not done, and the shared `results` dict was never
+        # touched by that abandoned worker (it wrote into its own LOCAL
+        # results dict, discarded once its token went stale at call A's
+        # timeout — see _run_daily_intel_block's docstring).
+        assert state.daily_intel_done.get("slow") is None
+        assert "slow" not in results
+
+        # Wait for the orphan's OS thread to actually exit (worker_finished
+        # fires just before the function returns; give the thread pool a
+        # moment to tear down) so the registry no longer reports it alive.
+        deadline = time.monotonic() + 2.0
+        entry = ho._DAILY_INTEL_IN_FLIGHT.get("slow") or {}
+        while (
+            ho._daily_intel_thread_alive(entry.get("thread"))
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+            entry = ho._DAILY_INTEL_IN_FLIGHT.get("slow") or {}
+        assert not ho._daily_intel_thread_alive(entry.get("thread")), (
+            "registry must stop reporting the task in flight once its "
+            "worker thread has actually exited"
+        )
+
+        # A fresh call now retries "slow" normally and succeeds.
+        ho._run_daily_intel_block(MagicMock(), state, NOW, results)
+        assert call_count["n"] == 2
+        assert state.daily_intel_done.get("slow") == period_iso
+        assert results.get("slow") == "ran"
+
+
+# ─── Outcome semantics: done vs skipped_for_period vs held (deliverable 3)
+
+
+class TestOutcomeSemantics:
+    def test_all_enabled_tasks_done_gives_complete_period_outcome(
+        self, monkeypatch
+    ) -> None:
+        calls: list[str] = []
+        a = _task("a", _recording_fn("a", calls))
+        b = _task("b", _recording_fn("b", calls))
+        tasks = (a, b)
+        monkeypatch.setattr(ho, "DAILY_INTEL_TASKS", tasks)
+        _allow_all(monkeypatch, tasks)
+        monkeypatch.setattr(ho, "DAILY_INTEL_CYCLE_BUDGET_SECONDS", 30)
+
+        state = OperatorState()
+        results: dict[str, Any] = {}
+        ho._run_daily_intel_block(MagicMock(), state, NOW, results)
+
+        assert state.daily_intel_period_outcome == "complete"
+        assert state.daily_intel_task_outcome.get("a") == "done"
+        assert state.daily_intel_task_outcome.get("b") == "done"
+        assert state.last_daily_intel == NOW
+
+    def test_one_task_exhausted_gives_complete_with_skips(self, monkeypatch) -> None:
+        calls: list[str] = []
+        good = _task("good", _recording_fn("good", calls))
+
+        def always_fail(
+            engine: Any, state: OperatorState, now: datetime, results: dict[str, Any]
+        ) -> None:
+            raise RuntimeError("boom")
+
+        bad = _task("bad", always_fail)
+        tasks = (good, bad)
+        monkeypatch.setattr(ho, "DAILY_INTEL_TASKS", tasks)
+        _allow_all(monkeypatch, tasks)
+        monkeypatch.setattr(ho, "DAILY_INTEL_CYCLE_BUDGET_SECONDS", 30)
+        monkeypatch.setattr(ho, "DAILY_INTEL_MAX_ATTEMPTS", 2)
+
+        state = OperatorState()
+        results: dict[str, Any] = {}
+        for _ in range(2):
+            ho._run_daily_intel_block(MagicMock(), state, NOW, results)
+
+        assert state.daily_intel_period_outcome == "complete_with_skips"
+        assert state.daily_intel_task_outcome.get("bad") == "skipped_for_period"
+        assert state.daily_intel_task_outcome.get("good") == "done"
+        assert state.last_daily_intel == NOW
+
+    def test_hydration_preserves_outcome_fields(self) -> None:
+        period_iso = _period_iso(NOW)
+        source_state = OperatorState()
+        source_state.daily_intel_period = period_iso
+        source_state.daily_intel_done = {"a": period_iso}
+        source_state.daily_intel_task_outcome = {"a": "done", "h": "held"}
+        source_state.daily_intel_period_outcome = "complete"
+        payload = {"operator_state": source_state.to_dict()}
+
+        engine = MagicMock()
+        conn = MagicMock()
+        engine.connect.return_value.__enter__.return_value = conn
+        conn.execute.return_value.fetchone.return_value = [payload]
+
+        fresh = OperatorState()
+        assert fresh.hydrate_from_snapshot(engine) is True
+        assert fresh.daily_intel_task_outcome == {"a": "done", "h": "held"}
+        assert fresh.daily_intel_period_outcome == "complete"
+
+    def test_held_task_never_appears_as_done_or_skipped(self, monkeypatch) -> None:
+        calls: list[str] = []
+        allowed = _task("allowed", _recording_fn("allowed", calls))
+
+        def should_never_run(
+            engine: Any, state: OperatorState, now: datetime, results: dict[str, Any]
+        ) -> None:
+            raise AssertionError("held task fn must never be called")
+
+        held_task = _task("held_one", should_never_run)
+        tasks = (allowed, held_task)
+        monkeypatch.setattr(ho, "DAILY_INTEL_TASKS", tasks)
+        monkeypatch.setattr(ho, "DAILY_INTEL_INITIAL_ALLOWLIST", frozenset({"allowed"}))
+        monkeypatch.setattr(ho, "DAILY_INTEL_CYCLE_BUDGET_SECONDS", 30)
+
+        state = OperatorState()
+        results: dict[str, Any] = {}
+        ho._run_daily_intel_block(MagicMock(), state, NOW, results)
+
+        assert state.daily_intel_task_outcome.get("held_one") == "held"
+        assert state.daily_intel_done.get("held_one") is None
+        assert state.daily_intel_skipped_for_period.get("held_one") is None

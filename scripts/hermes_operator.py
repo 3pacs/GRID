@@ -1619,26 +1619,238 @@ DAILY_INTEL_TASKS: tuple[DailyIntelTask, ...] = (
 )
 
 
+# ─── Safe initial task allow-list (fable-daily-intel-resumable review ────
+#     amendment, 2026-09-20) ─────────────────────────────────────────────
+#
+# Standing holds (controller instruction, not re-litigated here): scorer
+# execution / signal scoring, historical repair or backfill, and
+# learning/research writes (hypothesis registry, backtests, model
+# registry, postmortems that feed learning) are NOT authorised to run on
+# a schedule yet. DAILY_INTEL_TASKS above is the full ~21-task table this
+# task's resumability work made independently retryable; that table is
+# NOT itself an authorisation to run every task — DAILY_INTEL_INITIAL_
+# ALLOWLIST is the actual gate _run_daily_intel_block enforces. A task
+# absent from this frozenset is "held": _run_daily_intel_block skips its
+# `fn` entirely (never dispatched, never attempted, never timed), and it
+# can never appear in daily_intel_done/daily_intel_skipped_for_period —
+# see DAILY_INTEL_HOLD_REASONS below and the per-task table in
+# docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md for the
+# full writes/classification evidence. Enabling a held task later means
+# editing this frozenset in its own reviewed change — not a runtime flag,
+# not something this scheduler decides on its own.
+#
+# Classification method: read each task's wrapped function body (not just
+# its docstring) for (a) what table(s)/file(s) it writes, (b) whether it
+# calls llm.router (an LLM/Tier reference) anywhere in its own file, and
+# (c) whether what it writes is deterministic-derived (safe) versus
+# learning/scoring/backfill (held). Two tasks whose PRE-EXISTING per-task
+# budget constant name implied "LLM-backed" (DAILY_INTEL_LLM_TASK_BUDGET_S)
+# turned out, on reading the code, to have NO llm.router call anywhere in
+# their module and to write only derived audit tables — reclassified to
+# `allow` below with the file:line evidence in DAILY_INTEL_HOLD_REASONS'
+# sibling comments and the handoff doc; every other task keeps the
+# controller's default hold.
+DAILY_INTEL_INITIAL_ALLOWLIST: frozenset[str] = frozenset({
+    # Dispatch only — enqueues a goal_queue row for a bounded subagent;
+    # no LLM call and no learning-table write in this step itself
+    # (scripts/hermes_fixers.py::_execute_hermes_repair_command,
+    # DISPATCH_SUBAGENT branch -> intelligence.goal_queue.enqueue_goal).
+    "storage_maintenance_subagent",
+    # intelligence/source_audit.py::run_full_audit — no llm.router/Tier
+    # reference anywhere in the file; writes only source_accuracy,
+    # source_discrepancies (both audit/derived tables) and updates
+    # source_catalog.priority_rank from the accuracy scores it just
+    # computed (deterministic ranking, not a learning write). Reclassified
+    # from the controller's default-hold "LLM-driven" assumption — see
+    # docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md.
+    "source_audit",
+    # ingestion/flow_materializer.py::sync_all — deterministic projection
+    # of signal_sources into relational flow tables (dark_pool_weekly,
+    # etf_flows, insider_trades, congressional_trades,
+    # junction_point_readings). No LLM, no learning table.
+    "flow_materialize",
+    # intelligence/rag.py::RAGIndexer — no llm.router/Tier reference
+    # anywhere in the file; embeddings come from a local
+    # sentence-transformers/TF-IDF/word-freq backend, not a generative
+    # LLM call. Writes only intelligence_embeddings (a retrieval index,
+    # not a learning/trading table). Reclassified from the controller's
+    # default-hold "LLM-driven" assumption — see the handoff doc.
+    "rag_index",
+    # intelligence/icij_linker.py::link_actors — deterministic fuzzy
+    # string matching against ICIJ offshore-entity records. No LLM.
+    "icij_linking",
+    # intelligence/attention_anomaly.py::get_alerts — deterministic
+    # Wikipedia/Trends spike detection; read-only for this step (logs
+    # only, no DB write of its own beyond what get_alerts's own upstream
+    # ingestion already persists).
+    "attention_anomaly",
+    # ingestion/altdata/corporate_actions_parser.py — deterministic regex
+    # mining of 8-Ks into capital_flows rows (period_type='announcement').
+    # No LLM.
+    "corporate_actions",
+    # intelligence/company_financial_rollups.py::run_all — deterministic
+    # TTM/annual-rolled capital_flows derivation from XBRL + the
+    # announcement rows corporate_actions just wrote. No LLM.
+    "capital_flow_rollups",
+    # intelligence/fundamental_divergence.py::snapshot_all — deterministic
+    # fundamental-vs-price divergence snapshot. No LLM.
+    "fundamental_divergence",
+    # intelligence/holder_deal_overlap.py::run — deterministic
+    # cross-reference of 13F institutional holdings against capital_flows
+    # acquisition announcements. No LLM.
+    "holder_deal_overlap",
+    # Three filesystem cleanups — pre-existing, bounded, deletion/
+    # truncation only, no new data written.
+    "insight_cleanup",
+    "briefing_cleanup",
+    "errors_jsonl_cleanup",
+})
+
+# Every DAILY_INTEL_TASKS name NOT in DAILY_INTEL_INITIAL_ALLOWLIST above,
+# with the standing-hold category it falls under and the file:line
+# evidence for the write that earns it that category. Exists so the
+# classification is machine-checkable (see
+# TestDailyIntelAllowlistClassification in
+# tests/test_hermes_daily_intel_resumable.py: every DAILY_INTEL_TASKS name
+# must appear in EXACTLY ONE of DAILY_INTEL_INITIAL_ALLOWLIST /
+# DAILY_INTEL_HOLD_REASONS) rather than only documented in prose.
+DAILY_INTEL_HOLD_REASONS: dict[str, str] = {
+    "hypothesis_discovery": (
+        "learning write — HypothesisGenerator.auto_discover() "
+        "(intelligence/hypothesis_engine.py) inserts/updates "
+        "discovered_hypotheses, hypothesis_postmortems and "
+        "hypothesis_boost_log directly"
+    ),
+    "hypothesis_review": (
+        "learning write — review_existing_hypotheses "
+        "(analysis/backtest_scanner.py) is LLM-driven (llm.router "
+        "Tier.ORACLE) and mutates hypothesis_registry state/kill_reason"
+    ),
+    "backtest_scan": (
+        "learning write + backtest — run_full_scan "
+        "(analysis/backtest_scanner.py) is LLM-gated (llm.router "
+        "Tier.ORACLE sanity-checks winners) and inserts into "
+        "hypothesis_registry via generate_hypotheses_from_winners"
+    ),
+    "postmortem_batch": (
+        "postmortem write that feeds learning — batch_postmortem "
+        "(intelligence/postmortem.py) is LLM-narrated (llm.router "
+        "Tier.REASON) and inserts trade_postmortems rows"
+    ),
+    "options_improvement": (
+        "model/weight registry write + scorer — run_improvement_cycle "
+        "(trading/options_tracker.py) writes scanner_weights (a de-facto "
+        "model registry) and updates options_recommendations scoring; "
+        "its report step also calls llm.router Tier.REASON"
+    ),
+    "milestone_scoring": (
+        "scorer execution (standing hold) — scan_all_tickers "
+        "(intelligence/milestone_tracker.py) is execution/milestone "
+        "scoring by category even though the current function body is "
+        "read-only (no INSERT/UPDATE found); held on category, not on "
+        "current write footprint, since a future change to persist "
+        "scorecards must not silently graduate this task"
+    ),
+    "actor_research": (
+        "LLM-driven write, not shown to be derived-only — research_batch "
+        "(intelligence/actor_researcher.py) uses llm.router Tier.REASON "
+        "to synthesize actor profile JSON, updates the actors entity "
+        "registry, and can create new actor rows ('rabbit holes') that "
+        "feed further LLM research"
+    ),
+    "edgar_transcripts": (
+        "LLM-driven write, not shown to be derived-only — "
+        "EdgarTranscriptPuller.pull (ingestion/altdata/edgar_transcripts.py) "
+        "uses llm.router Tier.REASON (and a local Gemma extractor) to "
+        "extract guidance/milestone figures and inserts them as raw_series "
+        "data points, not just audit metadata"
+    ),
+}
+
+
+# ─── No-overlap guard + late-publish fencing for daily-intel tasks ───────
+#     (fable-daily-intel-resumable review amendment, 2026-09-20)
+#
+# Reuses the two patterns already established elsewhere in this module
+# rather than inventing a third: the no-overlap in-flight registry from
+# scripts/hermes_fixers.py::_REPAIRS_IN_FLIGHT (#582), and the
+# capture-a-token-at-start / commit-only-if-still-current pattern from
+# _maybe_run_sector_health_snapshot's _SECTOR_HEALTH_STATE_LOCK /
+# sector_health_attempt_token (#580).
+#
+# _DAILY_INTEL_IN_FLIGHT: task name -> {"token": int, "thread": int | None,
+# "started": float | None}. One entry per task, created just before that
+# task's _run_with_timeout call and never deleted afterwards (bounded to
+# len(DAILY_INTEL_TASKS) entries — harmless to keep). "thread" is filled
+# in BY THE WORKER ITSELF (see _run_task closure below) the moment it
+# starts running — unlike _retry_source, which runs directly inside an
+# already-existing worker thread and can capture threading.get_ident()
+# at its own top, _run_daily_intel_block's per-task call is dispatched
+# via _run_with_timeout's ThreadPoolExecutor, so the new worker's ident
+# does not exist yet at registration time in the driver (main) thread.
+#
+# RLock, not Lock: mirrors _REPAIRS_LOCK's own reasoning — the driver
+# thread and a task's worker thread both take this lock, and a future
+# amendment that has one call another under the same lock (as
+# _retry_source already does with _next_repair_token) would self-deadlock
+# on a plain Lock.
+_DAILY_INTEL_LOCK = threading.RLock()
+_DAILY_INTEL_IN_FLIGHT: dict[str, dict[str, Any]] = {}
+_daily_intel_token_seq = 0
+
+
+def _next_daily_intel_token() -> int:
+    global _daily_intel_token_seq
+    with _DAILY_INTEL_LOCK:
+        _daily_intel_token_seq += 1
+        return _daily_intel_token_seq
+
+
+def _daily_intel_thread_alive(ident: int | None) -> bool:
+    """True if a live thread with this identity still exists.
+
+    Same safety-net reasoning as scripts/hermes_fixers.py::
+    _thread_is_alive: an in-flight entry is not trusted indefinitely on
+    its own — if the process somehow lost track of the thread, a stale
+    entry must not permanently block retries for that task.
+    """
+    if ident is None:
+        return False
+    return any(t.ident == ident and t.is_alive() for t in threading.enumerate())
+
+
 def _run_daily_intel_block(
     engine: Any,
     state: OperatorState,
     now: datetime,
     results: dict[str, Any],
 ) -> None:
-    """Execute DAILY_INTEL_TASKS in order, resumable across cycles.
+    """Execute the ALLOW-LISTED subset of DAILY_INTEL_TASKS in order,
+    resumable across cycles, with no-overlap and late-publish guards.
 
     Called from run_intelligence_tasks when ``daily_due`` (see that
     function's "Daily at 2:00 AM (with catch-up)" scheduling block) — same
     trigger conditions as before this task; only what happens once
     triggered has changed.
 
+    Allow-list gate (review amendment): a task whose name is NOT in
+    ``DAILY_INTEL_INITIAL_ALLOWLIST`` is "held" — its ``fn`` is never
+    called, it is never attempted, it is recorded on
+    ``state.daily_intel_task_outcome[name] = "held"`` every time the loop
+    reaches it, and it is invisible to the period-completion check below
+    (held tasks are excluded from both ``total`` and ``done_count``, so a
+    held task can never block — or fake — period completion). Enabling a
+    held task means editing ``DAILY_INTEL_INITIAL_ALLOWLIST`` in its own
+    reviewed change, not a runtime decision this function makes.
+
     Per-period ledger: ``state.daily_intel_done`` /
-    ``daily_intel_skipped_for_period`` / ``daily_intel_attempts``, keyed to
-    ``state.daily_intel_period`` (the due period's ISO date,
-    boundary_hour=DAILY_INTEL_BOUNDARY_HOUR). A due period that differs
-    from the ledger's recorded period means the ledger has rolled over:
-    the three dicts are cleared and ``state.daily_intel_period`` is
-    updated before anything runs.
+    ``daily_intel_skipped_for_period`` / ``daily_intel_attempts`` /
+    ``daily_intel_task_outcome``, keyed to ``state.daily_intel_period``
+    (the due period's ISO date, boundary_hour=DAILY_INTEL_BOUNDARY_HOUR).
+    A due period that differs from the ledger's recorded period means the
+    ledger has rolled over: all four dicts (plus
+    ``daily_intel_period_outcome``) are cleared/reset and
+    ``state.daily_intel_period`` is updated before anything runs.
 
     Idempotent-redo note: state is only persisted at the END of a cycle
     (the analytical_snapshots write in save_cycle_snapshot), not after
@@ -1652,26 +1864,61 @@ def _run_daily_intel_block(
     BEFORE starting each task (not mid-task) against cumulative wall time
     already spent in this call. Once exhausted, the loop stops for this
     cycle; the next ``daily_due`` call (state.last_daily_intel is not set
-    until every task is done-or-skipped — see below) resumes at the first
-    undone task.
+    until every ALLOW-LISTED task is done-or-skipped — see below) resumes
+    at the first undone task. A held task costs no budget (skipped before
+    the budget check) and an in_flight skip costs no budget either
+    (skipped before the per-task clock starts).
 
-    Per-task timeout/attempts: each task runs under its own
-    ``_run_with_timeout(f"daily_intel:{name}", ..., task.budget_s,
-    state)``. ``ok=True`` marks the task done for the period. ``ok=False``
-    (timeout or exception — see ``_daily_intel_raise_if_task_status_
-    failed`` for the six tasks that go through ``_run_intel_task``)
-    increments its attempt count; at ``DAILY_INTEL_MAX_ATTEMPTS`` the task
-    is marked ``skipped_for_period`` (also recorded in
-    ``daily_intel_done``, so the loop treats it as done — it cannot block
-    the tasks behind it) and the block continues to the NEXT task rather
-    than aborting.
+    No-overlap guard (review amendment): before starting a task, this
+    loop checks ``_DAILY_INTEL_IN_FLIGHT[task.name]`` — if an entry exists
+    AND its recorded thread is still alive (``_daily_intel_thread_alive``),
+    a previous attempt's worker (orphaned by ``_run_with_timeout``'s
+    timeout-abandons-rather-than-kills behaviour — see its own docstring)
+    is still running. This retry is skipped: logged as ``in_flight``,
+    ``state.daily_intel_task_outcome[name] = "in_flight"``, and it counts
+    as NEITHER an attempt NOR a completion — ``daily_intel_attempts`` is
+    not incremented and the loop proceeds to the next task. Otherwise a
+    fresh attempt token is minted (``_next_daily_intel_token``) and
+    registered before the task's ``_run_with_timeout`` call, so a
+    concurrent registration race is impossible (both the check and the
+    register happen under ``_DAILY_INTEL_LOCK``).
 
-    An abandoned (timed-out) task's orphaned worker thread may still
-    finish later (see ``_run_with_timeout``'s own docstring on why it
-    can't be killed) — this cannot mark the task done, because the only
-    place that writes ``daily_intel_done`` is this loop, driven by
-    ``_run_with_timeout``'s SYNCHRONOUS return value at the timeout
-    boundary, not by any callback the orphaned thread could trigger later.
+    Late-publish guard (review amendment): each attempt's task ``fn`` runs
+    against a LOCAL ``results`` dict, not the shared one, via a small
+    ``_run_task`` closure that (a) records its own thread ident into the
+    in-flight entry the moment it starts (under the lock — this is the
+    only place ``"thread"`` is ever set), (b) calls ``task.fn(...)``, then
+    (c) checks — again under the lock — whether its token is still the
+    entry's current token; if not, it logs ``"daily_intel task <name>
+    abandoned — exiting without publishing"`` and does nothing further
+    (its local results dict is simply discarded — never merged into the
+    shared ``results``). After ``_run_with_timeout`` returns to the driver
+    (synchronously, either because the task finished in time or because
+    the budget was exceeded and the worker was abandoned), the driver
+    itself re-checks the token under the same lock: on ``ok=True`` it
+    merges the local results into the shared ``results`` and marks the
+    task done (the token cannot have moved in this branch — nothing
+    invalidates it before this point on the success path); on ``ok=False``
+    it immediately invalidates the entry's token (mints a fresh one this
+    attempt does not hold) BEFORE recording the attempt/skip outcome —
+    this is what makes the timeout path itself bump the token even when
+    no retry ever starts, so a late-returning orphaned worker's own
+    ``_run_task`` epilogue (b)/(c) above sees a stale token and publishes
+    nothing, exactly mirroring ``_run_sector_and_intelligence_steps``'s
+    timeout-path bump of ``sector_health_attempt_token``. The in-flight
+    entry itself (with its now-stale token but still-live thread ident)
+    is deliberately NOT deleted on a timeout — the NEXT attempt's
+    no-overlap check still needs that thread ident to detect the orphan
+    is still running.
+
+    Per-task attempts: ``ok=False`` (timeout or exception — see
+    ``_daily_intel_raise_if_task_status_failed`` for the six tasks that go
+    through ``_run_intel_task``) increments its attempt count; at
+    ``DAILY_INTEL_MAX_ATTEMPTS`` the task is marked ``skipped_for_period``
+    (also recorded in ``daily_intel_done``, so the loop treats it as done
+    — it cannot block the tasks behind it;
+    ``daily_intel_task_outcome[name] = "skipped_for_period"``) and the
+    block continues to the NEXT task rather than aborting.
 
     ``cooldowns.can_retry`` is deliberately NOT consulted here — same
     reasoning ``_run_sector_and_intelligence_steps`` documents for the
@@ -1687,12 +1934,15 @@ def _run_daily_intel_block(
     full day regardless of the per-period ledger's own, much shorter,
     per-period skip.
 
-    ``state.last_daily_intel = now`` is set ONLY when every task in
-    ``DAILY_INTEL_TASKS`` is done or skipped_for_period — i.e.
-    ``state.daily_intel_done`` has an entry, dated to the current period,
-    for every task name. This is what ``daily_due`` (in
-    ``run_intelligence_tasks``) reads to decide whether the whole block is
-    due again.
+    ``state.last_daily_intel = now`` is set ONLY when every ALLOW-LISTED
+    task is done or skipped_for_period — i.e. ``state.daily_intel_done``
+    has an entry, dated to the current period, for every name in
+    ``DAILY_INTEL_INITIAL_ALLOWLIST``. Held tasks are excluded from this
+    check entirely. ``state.daily_intel_period_outcome`` is set in the
+    same branch: ``"complete"`` if no allow-listed task needed
+    ``skipped_for_period`` this period, ``"complete_with_skips"``
+    otherwise. This is what ``daily_due`` (in ``run_intelligence_tasks``)
+    reads to decide whether the whole block is due again.
     """
     period_iso = _period_boundary(now, DAILY_INTEL_BOUNDARY_HOUR).date().isoformat()
 
@@ -1701,59 +1951,148 @@ def _run_daily_intel_block(
         state.daily_intel_done = {}
         state.daily_intel_skipped_for_period = {}
         state.daily_intel_attempts = {}
+        state.daily_intel_task_outcome = {}
+        state.daily_intel_period_outcome = None
 
     ran: list[str] = []
     skipped_for_period: list[str] = []
+    held: list[str] = []
+    in_flight_skipped: list[str] = []
     budget_used = 0.0
 
     for task in DAILY_INTEL_TASKS:
+        if task.name not in DAILY_INTEL_INITIAL_ALLOWLIST:
+            state.daily_intel_task_outcome[task.name] = "held"
+            held.append(task.name)
+            continue
         if state.daily_intel_done.get(task.name) == period_iso:
             continue
         if budget_used >= DAILY_INTEL_CYCLE_BUDGET_SECONDS:
             break
 
+        with _DAILY_INTEL_LOCK:
+            existing = _DAILY_INTEL_IN_FLIGHT.get(task.name)
+            if existing is not None and _daily_intel_thread_alive(existing.get("thread")):
+                age_s = (
+                    time.monotonic() - existing["started"]
+                    if existing.get("started") is not None else 0.0
+                )
+                log.warning(
+                    "daily_intel task '{n}' in_flight (previous worker "
+                    "still running, age {a:.0f}s) — skipping this cycle",
+                    n=task.name, a=age_s,
+                )
+                state.daily_intel_task_outcome[task.name] = "in_flight"
+                in_flight_skipped.append(task.name)
+                continue
+            token = _next_daily_intel_token()
+            _DAILY_INTEL_IN_FLIGHT[task.name] = {
+                "token": token, "thread": None, "started": None,
+            }
+
         t0 = time.monotonic()
+        with _DAILY_INTEL_LOCK:
+            _DAILY_INTEL_IN_FLIGHT[task.name]["started"] = t0
+
+        local_results: dict[str, Any] = {}
+
+        def _run_task(t=task, tok=token, lr=local_results) -> None:
+            with _DAILY_INTEL_LOCK:
+                entry = _DAILY_INTEL_IN_FLIGHT.get(t.name)
+                if entry is not None and entry.get("token") == tok:
+                    entry["thread"] = threading.get_ident()
+            try:
+                t.fn(engine, state, now, lr)
+            finally:
+                # Runs whether t.fn returned normally or raised — a
+                # worker finishing (on time OR late/abandoned) must clear
+                # its own "thread" marker itself, from inside the worker
+                # thread, the instant it is actually done. Relying on the
+                # NEXT call's _daily_intel_thread_alive(ident) check alone
+                # would race the OS thread's own teardown timing: a
+                # thread that just returned from t.fn can still show
+                # is_alive()==True for a brief window while Python tears
+                # it down, which made a fast synchronous failure look
+                # "in_flight" to an immediately-following retry in
+                # testing. Same fix shape as
+                # scripts/hermes_fixers.py::_retry_source's `finally`
+                # block deleting its own _REPAIRS_IN_FLIGHT entry before
+                # returning, rather than trusting is_alive() for the
+                # normal-completion case.
+                with _DAILY_INTEL_LOCK:
+                    entry = _DAILY_INTEL_IN_FLIGHT.get(t.name)
+                    abandoned = entry is None or entry.get("token") != tok
+                    if entry is not None and entry.get("thread") == threading.get_ident():
+                        entry["thread"] = None
+                    if abandoned:
+                        log.warning(
+                            "daily_intel task {n} abandoned — exiting "
+                            "without publishing",
+                            n=t.name,
+                        )
+
         _, ok = _run_with_timeout(
             f"daily_intel:{task.name}",
-            lambda t=task: t.fn(engine, state, now, results),
+            _run_task,
             task.budget_s,
             state,
         )
         budget_used += time.monotonic() - t0
         ran.append(task.name)
 
-        if ok:
-            state.daily_intel_done[task.name] = period_iso
-        else:
-            attempts = state.daily_intel_attempts.get(task.name, 0) + 1
-            state.daily_intel_attempts[task.name] = attempts
-            if attempts >= DAILY_INTEL_MAX_ATTEMPTS:
-                state.daily_intel_done[task.name] = period_iso
-                state.daily_intel_skipped_for_period[task.name] = period_iso
-                skipped_for_period.append(task.name)
-                log.warning(
-                    "daily_intel: task '{n}' skipped_for_period after {a} "
-                    "failed attempts (period={p})",
-                    n=task.name, a=attempts, p=period_iso,
-                )
+        with _DAILY_INTEL_LOCK:
+            entry = _DAILY_INTEL_IN_FLIGHT.get(task.name)
+            current = entry is not None and entry.get("token") == token
+            if not ok and current:
+                # Invalidate NOW so a late-returning orphan cannot publish
+                # later even if no retry ever starts (see docstring). Keep
+                # the entry (thread ident intact) for the next attempt's
+                # no-overlap check.
+                entry["token"] = _next_daily_intel_token()
+                current = False
 
-    total = len(DAILY_INTEL_TASKS)
+            if ok and current:
+                results.update(local_results)
+                state.daily_intel_done[task.name] = period_iso
+                state.daily_intel_task_outcome[task.name] = "done"
+            elif not ok:
+                attempts = state.daily_intel_attempts.get(task.name, 0) + 1
+                state.daily_intel_attempts[task.name] = attempts
+                if attempts >= DAILY_INTEL_MAX_ATTEMPTS:
+                    state.daily_intel_done[task.name] = period_iso
+                    state.daily_intel_skipped_for_period[task.name] = period_iso
+                    state.daily_intel_task_outcome[task.name] = "skipped_for_period"
+                    skipped_for_period.append(task.name)
+                    log.warning(
+                        "daily_intel: task '{n}' skipped_for_period after "
+                        "{a} failed attempts (period={p})",
+                        n=task.name, a=attempts, p=period_iso,
+                    )
+
+    enabled_tasks = [t for t in DAILY_INTEL_TASKS if t.name in DAILY_INTEL_INITIAL_ALLOWLIST]
+    total = len(enabled_tasks)
     done_count = sum(
-        1 for t in DAILY_INTEL_TASKS if state.daily_intel_done.get(t.name) == period_iso
+        1 for t in enabled_tasks if state.daily_intel_done.get(t.name) == period_iso
     )
     remaining = [
-        t.name for t in DAILY_INTEL_TASKS
+        t.name for t in enabled_tasks
         if state.daily_intel_done.get(t.name) != period_iso
     ]
 
-    if done_count == total:
+    if total and done_count == total:
         state.last_daily_intel = now
+        any_skipped_this_period = any(
+            v == period_iso for v in state.daily_intel_skipped_for_period.values()
+        )
+        state.daily_intel_period_outcome = (
+            "complete_with_skips" if any_skipped_this_period else "complete"
+        )
 
     log.info(
         "daily_intel: period={p} done={d}/{t} ran={r} skipped_for_period={s} "
-        "remaining={rem} budget_used={b:.1f}s",
+        "held={h} in_flight={f} remaining={rem} budget_used={b:.1f}s",
         p=period_iso, d=done_count, t=total, r=ran, s=skipped_for_period,
-        rem=remaining, b=budget_used,
+        h=held, f=in_flight_skipped, rem=remaining, b=budget_used,
     )
 
 

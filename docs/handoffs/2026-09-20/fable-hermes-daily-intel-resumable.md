@@ -271,3 +271,189 @@ pre-existing lint findings (net improvement — several bare
 
 No forced run is included in this change — the ledger drains on its own
 schedule once deployed.
+
+## Review amendments (2026-09-20, same branch, development only)
+
+Three gaps identified in review of the original PR: (1) the resumable
+task table above authorised running *every* task, including several that
+touch learning/scoring surfaces the controller has not yet cleared for a
+schedule; (2) the no-overlap and late-publish protections `#580`
+(sector-health) and `#582` (repair pulls) already have did not exist for
+daily-intel tasks, so a timed-out task's orphaned worker could still
+collide with the next cycle's retry of the SAME task; (3) "done" and
+"skipped_for_period" were both folded into `daily_intel_done`, with no
+persisted signal distinguishing a clean period from one that finished
+only because a task gave up. Still development-only: draft PR, no merge,
+no production access, no DB/SSH used to build this.
+
+### 1. `DAILY_INTEL_INITIAL_ALLOWLIST` — safe initial task set
+
+`scripts/hermes_operator.py` adds `DAILY_INTEL_INITIAL_ALLOWLIST:
+frozenset[str]` (13 of 21 tasks) and `DAILY_INTEL_HOLD_REASONS: dict[str,
+str]` (the other 8, each with the file:line evidence for its hold). A
+task not in the allow-list is "held": `_run_daily_intel_block` never
+calls its `fn`, records `daily_intel_task_outcome[name] = "held"` every
+time the loop reaches it, and excludes it from the period-completion
+check (`total`/`done_count` are computed over `DAILY_INTEL_INITIAL_
+ALLOWLIST` tasks only) — a held task can never be mistaken for done or
+skipped, and can never block or fake period completion. Enabling a held
+task later means editing the frozenset in its own reviewed change.
+
+Classification method: read each task's wrapped function body (not just
+its pre-existing budget-constant name) for what it writes and whether it
+calls `llm.router` anywhere in its own file.
+
+| Task | Writes | Class | Verdict |
+|---|---|---|---|
+| storage_maintenance_subagent | goal_queue row (dispatch only) | dispatch, no LLM | **allow** |
+| source_audit | source_accuracy, source_discrepancies, source_catalog.priority_rank | deterministic audit/rollup, no LLM (reclassified — see below) | **allow** |
+| flow_materialize | dark_pool_weekly, etf_flows, insider_trades, congressional_trades, junction_point_readings | deterministic SQL projection | **allow** |
+| rag_index | intelligence_embeddings | local embeddings, no LLM (reclassified — see below) | **allow** |
+| icij_linking | ICIJ match rows | deterministic fuzzy match | **allow** |
+| attention_anomaly | none (read-only this step) | deterministic detection | **allow** |
+| corporate_actions | capital_flows (announcement) | deterministic regex/SQL | **allow** |
+| capital_flow_rollups | capital_flows (ttm/rolled) | deterministic SQL rollup | **allow** |
+| fundamental_divergence | fundamental_divergence | deterministic SQL | **allow** |
+| holder_deal_overlap | holder_deal_overlap | deterministic SQL | **allow** |
+| insight_cleanup / briefing_cleanup / errors_jsonl_cleanup | deletions/truncation only | bounded cleanup | **allow** |
+| hypothesis_discovery | discovered_hypotheses, hypothesis_postmortems, hypothesis_boost_log | learning write (hypothesis registry), no LLM but standing-hold category | **hold** |
+| hypothesis_review | hypothesis_registry state/kill_reason | learning write, LLM (Tier.ORACLE) | **hold** |
+| backtest_scan | hypothesis_registry (via winners) | backtest + learning write, LLM (Tier.ORACLE) | **hold** |
+| postmortem_batch | trade_postmortems | postmortem feeding learning, LLM (Tier.REASON) | **hold** |
+| options_improvement | scanner_weights (model registry), options_recommendations scoring | model registry write + scorer, LLM (report only) | **hold** |
+| milestone_scoring | none found (read-only in current code) | scorer execution — standing hold by category, not by current write footprint | **hold** |
+| actor_research | actors, raw_series (new leads) | LLM-driven (Tier.REASON) entity write | **hold** |
+| edgar_transcripts | raw_series (guidance/milestone data points) | LLM-driven (Tier.REASON + local Gemma) data extraction | **hold** |
+
+**Reclassified from the controller's default-hold assumption:**
+`source_audit` and `rag_index` were named in the controller's brief as
+presumptively "LLM-driven — hold unless shown otherwise." Reading the
+code: neither `intelligence/source_audit.py` nor `intelligence/rag.py`
+contains any `llm.router`/`Tier` reference — `source_audit` writes only
+`source_accuracy`/`source_discrepancies` (audit/derived tables) plus a
+deterministic `source_catalog.priority_rank` re-rank from the accuracy
+scores it just computed; `rag_index` embeds via a local
+sentence-transformers/TF-IDF/word-freq backend (not a generative call)
+into `intelligence_embeddings` (a retrieval index, not a learning or
+trading table). Both moved to `allow` on that evidence.
+`actor_research` and `edgar_transcripts` stayed **hold** — both call
+`llm.router` (Tier.REASON) and write data (new actor entities / extracted
+guidance figures) that feeds further research or downstream analysis,
+not just audit metadata.
+
+Pin test: `TestDailyIntelAllowlistClassification` in
+`tests/test_hermes_daily_intel_resumable.py` — every `DAILY_INTEL_TASKS`
+name is in exactly one of `DAILY_INTEL_INITIAL_ALLOWLIST` /
+`DAILY_INTEL_HOLD_REASONS`, and pins the exact allow/hold sets above so
+an accidental reclassification fails CI.
+
+### 2. No-overlap + late-publish guard for daily-intel workers
+
+Reuses the two patterns already in this module rather than inventing a
+third: `#582`'s `_REPAIRS_IN_FLIGHT` no-overlap registry
+(`scripts/hermes_fixers.py`) and `#580`'s capture-a-token-at-start /
+commit-only-if-current pattern (`_SECTOR_HEALTH_STATE_LOCK` /
+`sector_health_attempt_token` in `_maybe_run_sector_health_snapshot`).
+
+- `_DAILY_INTEL_LOCK` (RLock) + `_DAILY_INTEL_IN_FLIGHT: dict[task_name,
+  {"token": int, "thread": int | None, "started": float | None}]`, both
+  module-level in `scripts/hermes_operator.py`.
+- Before starting a task, `_run_daily_intel_block` checks the existing
+  entry: if its `"thread"` ident is still alive
+  (`_daily_intel_thread_alive`, same `threading.enumerate()` check as
+  `hermes_fixers._thread_is_alive`), the retry is skipped — logged
+  `in_flight`, `daily_intel_task_outcome[name] = "in_flight"` — and
+  counts as **neither an attempt nor a completion**; the loop proceeds to
+  the next task. Otherwise a fresh token is minted and registered before
+  `_run_with_timeout` is called.
+- Each attempt's `fn` runs against a **local** `results` dict via a small
+  `_run_task` closure, not the shared one. The closure records its own
+  thread ident into the entry the moment it starts, and — in a `finally`
+  block that runs whether `fn` returned or raised — checks under the
+  lock whether its token is still current; if not, it logs `daily_intel
+  task <name> abandoned — exiting without publishing` and does nothing
+  further (the local results are discarded, never merged).
+- Back in the driver, after `_run_with_timeout` returns: on `ok=True` the
+  local results are merged into the shared `results` and the task is
+  marked done; on `ok=False` the entry's token is invalidated **first**
+  (minting a token this attempt does not hold) before the
+  attempt/skipped-for-period bookkeeping runs — this is what makes the
+  timeout path itself fence a late return even when no retry ever
+  starts, mirroring `_run_sector_and_intelligence_steps`'s timeout-path
+  bump of `sector_health_attempt_token`. The in-flight entry is not
+  deleted on timeout — the thread ident stays so the next attempt's
+  no-overlap check can still detect the orphan.
+- **Race found and fixed during testing**: a worker's own `finally`
+  block also clears `entry["thread"] = None` the instant `fn` returns
+  (success OR a plain synchronous exception, not just a timeout) —
+  relying solely on `threading.enumerate()`/`is_alive()` at the next
+  call raced the OS thread's own teardown timing and produced a
+  false-positive `in_flight` skip on a fast, back-to-back retry in
+  testing (`test_d`/`TestOutcomeSemantics::test_one_task_exhausted_...`
+  both failed this way before the fix). Same fix shape as
+  `_retry_source`'s own `finally` deleting its `_REPAIRS_IN_FLIGHT` entry
+  before returning, rather than trusting `is_alive()` for the
+  normal-completion case.
+
+Real-thread tests (`TestInFlightOverlapGuard` in
+`tests/test_hermes_daily_intel_resumable.py`): a task blocked past a
+patched budget times out; while its worker is still blocked (proven with
+a `threading.Event`, released only after the assertions), a second call
+to `_run_daily_intel_block` for the same period skips it as `in_flight`
+(not counted as an attempt) and proceeds to the next task; releasing the
+worker lets it finish and confirms nothing was published (ledger
+unchanged, shared `results` untouched); a final call after the registry
+stops reporting the thread alive retries normally and succeeds.
+
+### 3. `daily_intel_task_outcome` / `daily_intel_period_outcome`
+
+`OperatorState` (`scripts/hermes_health.py`) adds:
+- `daily_intel_task_outcome: dict[str, str]` — task name → `"done"` |
+  `"skipped_for_period"` | `"held"` | `"in_flight"`, for the CURRENT
+  period (reset to `{}` on the same rollover as `daily_intel_done`/
+  `daily_intel_skipped_for_period`/`daily_intel_attempts`). Written at
+  the exact same points those dicts already are, plus the two new states
+  neither of them could represent.
+- `daily_intel_period_outcome: str | None` — `"complete"` |
+  `"complete_with_skips"` | `None`, set alongside `state.last_daily_intel
+  = now` the moment every allow-listed task has a `daily_intel_done`
+  entry: `"complete"` if none of them got there via
+  `daily_intel_skipped_for_period`, `"complete_with_skips"` otherwise.
+  Reset to `None` on period rollover.
+
+Both are added to `to_dict()`/`hydrate_from_snapshot()` under the same
+"only restore if currently unset" rule as the other ledger fields. The
+summary log line gained `held=[...]` and `in_flight=[...]` alongside the
+existing `ran`/`skipped_for_period`/`remaining` fields.
+
+Tests (`TestOutcomeSemantics`, `TestHeldTasksNeverRun` in
+`tests/test_hermes_daily_intel_resumable.py`): all-enabled-done →
+`"complete"`; one task exhausted → `"complete_with_skips"` with its
+outcome `"skipped_for_period"`; hydration round-trips both new fields; a
+held task's outcome is always `"held"` and never `"done"`/
+`"skipped_for_period"`.
+
+### Tests and lint
+
+`DB_PASSWORD=x PYTHONUTF8=1 python -m pytest tests/test_hermes_*.py
+tests/test_postmortem_feedback.py -q`: **308 passed, 1 failed** — the
+failure is the same pre-existing Windows-only
+`tests/test_hermes_fixers.py::test_fix_output_dirs_skill_creates_common_output_directories`
+flagged as known/unrelated in the original task brief; nothing in this
+amendment touches that file or that fixer.
+`tests/test_hermes_daily_intel_resumable.py` alone: 24 tests, including
+9 new ones for this amendment (`TestDailyIntelAllowlistClassification`
+×4, `TestHeldTasksNeverRun` ×2, `TestInFlightOverlapGuard` ×1,
+`TestOutcomeSemantics` ×4 — one shared with the classification count).
+
+### Deployment effects (amended)
+
+After this amendment, a fresh deploy runs only the 13 allow-listed tasks
+above once their ledger reaches them — the 8 held tasks
+(`hypothesis_discovery`, `hypothesis_review`, `backtest_scan`,
+`postmortem_batch`, `options_improvement`, `milestone_scoring`,
+`actor_research`, `edgar_transcripts`) do **not** run, and therefore none
+of their writes listed under "Deployment effects" above (hypothesis
+registry inserts, `scanner_weights`, `trade_postmortems`, actor/raw_series
+writes, etc.) happen until a separate reviewed change edits
+`DAILY_INTEL_INITIAL_ALLOWLIST`. No schema change; no forced run.

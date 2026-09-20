@@ -385,6 +385,34 @@ class OperatorState:
         # _run_daily_intel_block). Reset to {} on period rollover along with
         # daily_intel_done/daily_intel_skipped_for_period above.
         self.daily_intel_attempts: dict[str, int] = {}
+        # daily_intel_task_outcome: task name -> "done" | "skipped_for_period"
+        # | "held" | "in_flight", for the CURRENT period only (reset to {} on
+        # the same rollover as daily_intel_done/skipped_for_period/attempts
+        # above). This is a strictly additive, human/test-facing view over
+        # the same facts daily_intel_done/daily_intel_skipped_for_period
+        # already encode — "done" and "skipped_for_period" are written at
+        # the exact same points those two dicts are (see
+        # _run_daily_intel_block) — plus two states neither of those dicts
+        # can represent: "held" (task is not in DAILY_INTEL_INITIAL_
+        # ALLOWLIST this period — never attempted, never counted toward
+        # daily_intel_done, and therefore invisible to the "period complete"
+        # check) and "in_flight" (a retry this cycle was skipped because the
+        # previous attempt's worker thread was still alive — see
+        # _DAILY_INTEL_IN_FLIGHT in scripts/hermes_operator.py). A held task
+        # can never carry "done" or "skipped_for_period" here, by
+        # construction — _run_daily_intel_block never runs a held task's
+        # fn, so there is no code path that could write either value for it.
+        self.daily_intel_task_outcome: dict[str, str] = {}
+        # daily_intel_period_outcome: "complete" | "complete_with_skips" |
+        # None. Set (alongside state.last_daily_intel = now) the moment
+        # every ALLOW-LISTED task for the current period has a
+        # daily_intel_done entry — "complete" if none of them got there via
+        # daily_intel_skipped_for_period, "complete_with_skips" if at least
+        # one did. None while the period is still in progress, and reset to
+        # None on period rollover (same trigger as the four ledger dicts
+        # above) so a stale prior period's outcome can never be read as the
+        # current period's.
+        self.daily_intel_period_outcome: str | None = None
 
         # Bounded-repair backlog (fable-hermes-repair-bound, 2026-09-19):
         # source_key (lowercased source_catalog name) -> list of tickers/ids
@@ -494,6 +522,8 @@ class OperatorState:
             "daily_intel_done": self.daily_intel_done,
             "daily_intel_skipped_for_period": self.daily_intel_skipped_for_period,
             "daily_intel_attempts": self.daily_intel_attempts,
+            "daily_intel_task_outcome": self.daily_intel_task_outcome,
+            "daily_intel_period_outcome": self.daily_intel_period_outcome,
         }
 
     def hydrate_from_snapshot(self, engine: Any) -> bool:
@@ -608,10 +638,20 @@ class OperatorState:
             }
             hydrated_any = hydrated_any or bool(self.daily_intel_attempts)
 
+        daily_intel_task_outcome = op_state.get("daily_intel_task_outcome")
+        if isinstance(daily_intel_task_outcome, dict) and not self.daily_intel_task_outcome:
+            self.daily_intel_task_outcome = {
+                str(k): str(v) for k, v in daily_intel_task_outcome.items() if v is not None
+            }
+            hydrated_any = hydrated_any or bool(self.daily_intel_task_outcome)
+
         # Plain string fields (not timestamps, not counters) — restore
         # verbatim, same "only if currently unset" rule as the datetime
         # fields above.
-        for str_field in ("last_sector_health_outcome", "daily_intel_period"):
+        for str_field in (
+            "last_sector_health_outcome", "daily_intel_period",
+            "daily_intel_period_outcome",
+        ):
             val = op_state.get(str_field)
             if isinstance(val, str) and getattr(self, str_field, None) is None:
                 setattr(self, str_field, val)
