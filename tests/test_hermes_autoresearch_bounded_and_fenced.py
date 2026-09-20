@@ -191,6 +191,16 @@ class TestOperatorTimeoutRecord:
 # ── hypotheses_tested counter on failure vs success ───────────────────────
 
 class TestHypothesesTestedCounter:
+    @pytest.fixture(autouse=True)
+    def _enable_autoresearch(self, monkeypatch):
+        # These tests exercise maybe_run_autoresearch's post-gate behavior
+        # (counter/log-level/plumbing), which is unreachable while the
+        # 2026-09-19 AUTORESEARCH_ENABLED off-by-default gate (see
+        # tests/test_autoresearch_gate.py) is at its default False.
+        from config import settings
+
+        monkeypatch.setattr(settings, "AUTORESEARCH_ENABLED", True)
+
     def test_real_failure_does_not_zero_an_already_accumulated_counter(self, monkeypatch, caplog):
         state = OperatorState()
         state.hypotheses_tested = 5  # accumulated from earlier, real successes
