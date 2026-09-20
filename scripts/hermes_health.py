@@ -431,7 +431,7 @@ class OperatorState:
         # bare "complete"/"complete_with_skips" values are reserved for the
         # (currently hypothetical) case where DAILY_INTEL_INITIAL_ALLOWLIST
         # covers every DAILY_INTEL_TASKS entry (no held tasks at all). As
-        # long as any task is held — true today, 13 of 21 allow-listed —
+        # long as any task is held — true today, 8 of 21 allow-listed —
         # the period outcome is always one of the "_for_enabled_tasks"
         # values, never the bare ones, so "complete" can never be read as
         # "the whole daily-intel batch ran."

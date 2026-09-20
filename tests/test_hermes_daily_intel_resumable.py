@@ -433,24 +433,27 @@ class TestDailyIntelAllowlistClassification:
             # coordinator's initial-subset holds (non-idempotent audit
             # appends + priority_rank rewrite; delete-then-rebuild index)
             "source_audit", "rag_index",
+            # controller's 2026-09-20 narrowing: cleanups held until file
+            # deletion/truncation policy (directories, retention,
+            # exclusions) is accepted separately.
+            "insight_cleanup", "briefing_cleanup", "errors_jsonl_cleanup",
         }
         assert set(ho.DAILY_INTEL_HOLD_REASONS) == expected_holds
 
     def test_expected_allow_set(self) -> None:
-        # Pins the exact review-amendment classification (see
+        # Pins the exact controller-narrowed allow-list (2026-09-20, see
         # docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md):
-        # source_audit and rag_index were reclassified from the
-        # controller's default-hold "LLM-driven" assumption to `allow`
-        # after reading the code — neither file has any llm.router/Tier
-        # reference, and both write only derived/audit tables
-        # (source_accuracy/source_discrepancies/source_catalog.priority_rank
-        # and intelligence_embeddings respectively).
+        # the eight non-cleanup tasks whose late-write analysis came back
+        # `safe` (sole writer, deterministic recompute from current
+        # inputs, idempotent DO UPDATE/DO NOTHING). source_audit and
+        # rag_index are held for the initial subset (non-idempotent audit
+        # appends / delete-then-rebuild); the three cleanups are held
+        # pending a separate deletion/truncation policy review.
         expected_allow = {
             "storage_maintenance_subagent", "flow_materialize",
             "icij_linking", "attention_anomaly",
             "corporate_actions", "capital_flow_rollups",
             "fundamental_divergence", "holder_deal_overlap",
-            "insight_cleanup", "briefing_cleanup", "errors_jsonl_cleanup",
         }
         assert ho.DAILY_INTEL_INITIAL_ALLOWLIST == expected_allow
 
@@ -758,11 +761,11 @@ class TestDoneQueuedOutcome:
 
 
 class TestPeriodOutcomeWordingWithHeldTasks:
-    def test_real_allowlist_with_8_held_reports_complete_for_enabled_tasks(
+    def test_real_allowlist_with_13_held_reports_complete_for_enabled_tasks(
         self, monkeypatch
     ) -> None:
         """Uses the REAL DAILY_INTEL_TASKS/DAILY_INTEL_INITIAL_ALLOWLIST/
-        DAILY_INTEL_HOLD_REASONS (11 allowed, 10 held) with every allow-listed
+        DAILY_INTEL_HOLD_REASONS (8 allowed, 13 held) with every allow-listed
         task's fn replaced by a no-op so no real DB/network is touched.
         Held tasks keep their real (never-called) fn."""
         calls: list[str] = []
@@ -789,8 +792,8 @@ class TestPeriodOutcomeWordingWithHeldTasks:
         results: dict[str, Any] = {}
         ho._run_daily_intel_block(MagicMock(), state, NOW, results)
 
-        assert len(calls) == len(ho.DAILY_INTEL_INITIAL_ALLOWLIST) == 11
-        assert len(ho.DAILY_INTEL_HOLD_REASONS) == 10
+        assert len(calls) == len(ho.DAILY_INTEL_INITIAL_ALLOWLIST) == 8
+        assert len(ho.DAILY_INTEL_HOLD_REASONS) == 13
         assert state.daily_intel_period_outcome == "complete_for_enabled_tasks"
         assert state.last_daily_intel == NOW
 
@@ -799,9 +802,9 @@ class TestPeriodOutcomeWordingWithHeldTasks:
             if msg.startswith("daily_intel: period=") and "outcome" in kw
         )
         assert summary["outcome"] == "complete_for_enabled_tasks"
-        assert summary["n"] == 11
-        assert summary["d"] == 10, (
-            "10 of the 11 allow-listed tasks report plain 'done' — "
+        assert summary["n"] == 8
+        assert summary["d"] == 7, (
+            "7 of the 8 allow-listed tasks report plain 'done' — "
             "storage_maintenance_subagent is the one exception (see below)"
         )
         assert summary["dq"] == 1, (
@@ -813,7 +816,7 @@ class TestPeriodOutcomeWordingWithHeldTasks:
             "dedicated assertion"
         )
         assert summary["s"] == 0, "skipped_for_period must be reported separately from held"
-        assert summary["h"] == 10, "held must be reported separately from skipped_for_period"
+        assert summary["h"] == 13, "held must be reported separately from skipped_for_period"
 
     def test_bare_complete_only_when_zero_tasks_held(self, monkeypatch) -> None:
         calls: list[str] = []
