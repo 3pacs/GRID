@@ -1261,6 +1261,26 @@ def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
             total=len(results),
             rows=total_rows,
         )
+        # Freshness-signal fix (fable-hermes-repair-bound, 2026-09-19):
+        # run_daily_pulls is the function actually wired to the 4x/day
+        # cron in start_scheduler() below, and unlike run_pull_group's
+        # _touch_source_catalog_last_pull (used by the newer group-based
+        # path), it never updated source_catalog.last_pull_at. Traced in
+        # production: yfinance pulled fresh data here every day, but
+        # last_pull_at stayed stuck at a stale timestamp, so Hermes's
+        # staleness check (DATA_FRESHNESS_THRESHOLD_HOURS in
+        # scripts/hermes_operator.py) kept flagging yfinance as stale and
+        # triggering unnecessary REPULL repairs against data that was
+        # already current. Best-effort, same swallow-on-error pattern as
+        # the existing update in scripts/hermes_fixers.py::_retry_source.
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "UPDATE source_catalog SET last_pull_at = NOW() "
+                    "WHERE LOWER(name) = LOWER(:name)"
+                ), {"name": "yfinance"})
+        except Exception:
+            pass
     except Exception as exc:
         log.error("yfinance daily pull failed: {err}", err=str(exc))
         try:

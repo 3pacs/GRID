@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import date
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 import yfinance as yf
@@ -301,7 +301,8 @@ class YFinancePuller(BasePuller):
         self,
         ticker_list: list[str] | None = None,
         start_date: str | date = "1990-01-01",
-    ) -> list[dict[str, Any]]:
+        should_continue: Callable[[], bool] | None = None,
+    ) -> list[dict[str, Any]] | dict[str, Any]:
         """Pull multiple tickers sequentially.
 
         Never stops on a single-ticker failure — logs and continues.
@@ -309,10 +310,30 @@ class YFinancePuller(BasePuller):
         Parameters:
             ticker_list: List of Yahoo Finance ticker symbols.
                          Defaults to YF_TICKER_LIST.
-            start_date: Earliest observation date.
+            start_date: Earliest observation date. Callers doing a bounded
+                        repair (scripts/hermes_fixers.py::_retry_source)
+                        always pass a recent date here — this method's own
+                        default ("1990-01-01") is for deliberate, explicitly
+                        authorised full-history backfills only (see
+                        REPAIR_LOOKBACK_DAYS in hermes_fixers.py).
+            should_continue: Optional cooperative-budget check, polled
+                        between tickers. When it returns False, the pull
+                        stops before the next ticker and this method
+                        returns a dict (not the usual list) describing a
+                        partial run — see Returns below. Ordinary callers
+                        that never pass this keep getting the plain
+                        list[dict] they always got.
 
         Returns:
-            list[dict]: One result dict per ticker.
+            - should_continue is None (default, all existing callers):
+              list[dict], one result dict per ticker, unchanged.
+            - should_continue is given and the budget ran out before every
+              ticker was attempted: a dict — {"status": "PARTIAL",
+              "stopped_by_budget": True, "results": [...per-ticker results
+              attempted so far...], "tickers_not_attempted": [...]}.
+            - should_continue is given and every ticker was attempted: the
+              same dict shape with "status": "SUCCESS",
+              "stopped_by_budget": False, "tickers_not_attempted": [].
         """
         if ticker_list is None:
             ticker_list = YF_TICKER_LIST
@@ -323,7 +344,16 @@ class YFinancePuller(BasePuller):
             sd=start_date,
         )
         results: list[dict[str, Any]] = []
-        for ticker in ticker_list:
+        stopped_by_budget = False
+        for idx, ticker in enumerate(ticker_list):
+            if should_continue is not None and not should_continue():
+                log.warning(
+                    "yfinance bulk pull: budget exhausted after {n}/{total} "
+                    "tickers — stopping",
+                    n=idx, total=len(ticker_list),
+                )
+                stopped_by_budget = True
+                break
             res = self.pull_ticker(ticker, start_date)
             results.append(res)
 
@@ -332,7 +362,17 @@ class YFinancePuller(BasePuller):
             ok=sum(1 for r in results if r["status"] == "SUCCESS"),
             total=len(results),
         )
-        return results
+
+        if should_continue is None:
+            return results
+
+        not_attempted = ticker_list[len(results):]
+        return {
+            "status": "PARTIAL" if stopped_by_budget else "SUCCESS",
+            "stopped_by_budget": stopped_by_budget,
+            "results": results,
+            "tickers_not_attempted": not_attempted,
+        }
 
 
 if __name__ == "__main__":

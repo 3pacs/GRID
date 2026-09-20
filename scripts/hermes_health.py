@@ -349,6 +349,16 @@ class OperatorState:
         self.last_earnings_calendar_sync: datetime | None = None  # earnings_events → earnings_calendar back-compat sync (30 min)
         self.last_resolution: datetime | None = None  # raw_series → resolved_series watermark (start time of the last clean resolver run)
 
+        # Bounded-repair backlog (fable-hermes-repair-bound, 2026-09-19):
+        # source_key (lowercased source_catalog name) -> list of tickers/ids
+        # not yet attempted, left over when a repair pull in
+        # scripts/hermes_fixers.py::_retry_source stops early because
+        # REPAIR_BUDGET_SECONDS ran out. Persisted so the NEXT repair
+        # attempt for that source resumes from the remainder instead of
+        # restarting from the first ticker every cycle. Cleared once a
+        # repair for that source completes without being stopped by budget.
+        self.repair_backlog: dict[str, list[str]] = {}
+
         # Hermes status log: task_name -> {last_run, success, duration_s, error}
         self.task_status: dict[str, dict[str, Any]] = {}
 
@@ -420,6 +430,7 @@ class OperatorState:
             "last_resolution": self.last_resolution.isoformat() if self.last_resolution else None,
             "last_options_scoring": self.last_options_scoring.isoformat() if self.last_options_scoring else None,
             "task_status": self.task_status,
+            "repair_backlog": self.repair_backlog,
         }
 
     def hydrate_from_snapshot(self, engine: Any) -> bool:
@@ -486,6 +497,13 @@ class OperatorState:
         ts = op_state.get("task_status")
         if isinstance(ts, dict) and not self.task_status:
             self.task_status = ts
+
+        backlog = op_state.get("repair_backlog")
+        if isinstance(backlog, dict) and not self.repair_backlog:
+            self.repair_backlog = {
+                str(k): list(v) for k, v in backlog.items() if isinstance(v, list)
+            }
+            hydrated_any = hydrated_any or bool(self.repair_backlog)
 
         # Plain string fields (not timestamps, not counters) — restore
         # verbatim, same "only if currently unset" rule as the datetime

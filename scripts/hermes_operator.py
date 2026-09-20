@@ -114,6 +114,23 @@ SIGNAL_CLASSIFICATION_TIMEOUT_SECONDS = 120   # gemma micro classifier batch
 ANOMALY_NARRATION_TIMEOUT_SECONDS = 90        # gemma micro anomaly narrator
 KNOWLEDGE_MAP_TIMEOUT_SECONDS = 120           # gemma micro knowledge mapper
 DIAGNOSE_PULLS_TIMEOUT_SECONDS = 240          # Hermes pull diagnosis/fix step — bumped 2026-05-08 because diagnose runs per-source retry which can chain HTTP calls
+# Self-diagnostics step (cycle step 5, every 6th cycle). Added
+# fable-hermes-repair-bound (2026-09-19): this step used to call
+# run_self_diagnostics() inside a plain try/except with NO _run_with_timeout
+# at all (see docs/handoffs/2026-09-19/fable-hermes-repair-bound.md). A
+# REPULL action inside diagnostics ran _retry_source synchronously, and
+# because that call defaulted to a full-history pull, cycle 6300 stayed on
+# this one step for 71 minutes, starving every step scheduled after it —
+# including the new sector_health step (SECTOR_HEALTH_TIMEOUT_SECONDS
+# above) and intelligence_tasks. Repair pulls are now bounded to a
+# REPAIR_LOOKBACK_DAYS window with their own REPAIR_BUDGET_SECONDS
+# cooperative budget (scripts/hermes_fixers.py) — this timeout is the
+# step-level backstop: LLM call (~60s observed) + REPAIR_BUDGET_SECONDS
+# (180) + headroom for the rest of run_self_diagnostics's own work.
+# REPAIR_BUDGET_SECONDS must stay under this AND under
+# DIAGNOSE_PULLS_TIMEOUT_SECONDS above — pinned by
+# tests/test_hermes_repair_bounded.py.
+DIAGNOSTICS_TIMEOUT_SECONDS = 300
 RESOLUTION_TIMEOUT_SECONDS = 420              # normalization.resolver.Resolver.resolve_pending. Outer guard only — RESOLUTION_SCAN_BUDGET_SECONDS is what bounds the step. Must hold that budget (180) + one slice of overshoot capped at MIN_SCAN_SLICE_TIMEOUT_S (60) + the worst resolve phase observed live on 2026-09-14 (77.5s, cycle 6014) = 317.5s. Was 240, which the 371-411s cold scan of ops-exec run 292 did not fit inside. tests/test_hermes_resolution_watermark.py pins the invariant.
 SMART_INGESTION_TIMEOUT_SECONDS = 300         # smart_scheduler.tick() — matches TICK_TIME_BUDGET_S in ingestion/smart_scheduler.py so Hermes doesn't pull the plug while SmartScheduler is mid-shutdown
 TIMESFM_TIMEOUT_SECONDS = 240                 # oracle/forecaster_adapter.run_timesfm_forecast_cycle
@@ -985,6 +1002,78 @@ def _maybe_run_sector_health_snapshot(
     except Exception as exc:
         log.warning("sector_health snapshot failed: {e}", e=str(exc))
         _commit("failure", {"status": "failed", "error": str(exc)})
+
+
+def _run_diagnostics_step(
+    engine: Any,
+    hermes_ok: bool,
+    health: dict,
+    state: OperatorState,
+    dry_run: bool,
+    cycle_result: dict[str, Any],
+) -> None:
+    """Run self-diagnostics (cycle step 5, every 6th cycle) under its own
+    ``_run_with_timeout(..., DIAGNOSTICS_TIMEOUT_SECONDS)`` budget.
+
+    Extracted 2026-09-19 (fable-hermes-repair-bound; see
+    docs/handoffs/2026-09-19/fable-hermes-repair-bound.md). Before this the
+    call site was::
+
+        if state.cycle_count % 6 == 0:
+            try:
+                diag = run_self_diagnostics(engine, hermes_ok, health, state, dry_run=dry_run)
+                cycle_result["diagnostics"] = diag
+            except Exception as exc:
+                log.warning(...)
+
+    — a plain try/except with NO per-step timeout. run_self_diagnostics can
+    execute a Hermes-emitted ``REPULL:<source>`` command via
+    ``_execute_hermes_repair_command`` -> ``_retry_source``, which (before
+    this task) called a full-history pull for any puller with a
+    ``start_date`` parameter. Traced: cycle 6300 spent 71 minutes on this
+    one step (``yfinance`` was diagnosed "stale" from a freshness-signal
+    bug — see the E finding in the handoff doc — even though its data was
+    current), and every step scheduled after diagnostics that cycle
+    (including sector_health and intelligence_tasks) never ran.
+
+    Repair pulls are now bounded on two independent axes (both in
+    scripts/hermes_fixers.py): a ``REPAIR_LOOKBACK_DAYS`` window per
+    attempt, and a shared ``REPAIR_BUDGET_SECONDS`` cooperative deadline
+    that ``run_self_diagnostics`` computes once and threads through to the
+    puller. This wrapper is the remaining backstop — it bounds the WHOLE
+    step (including the LLM call itself, and any command that doesn't
+    participate in the cooperative budget) so a hang anywhere inside
+    diagnostics cannot starve due maintenance placed after it in
+    ``run_cycle``.
+
+    Deliberately no ``can_retry("diagnostics")`` check on timeout — same
+    reasoning as ``_run_sector_and_intelligence_steps`` above: the
+    blacklist entry ``_run_with_timeout`` writes on a timeout is only
+    honoured by call sites that explicitly check
+    ``state.cooldowns.can_retry(<name>)`` before running (traced to exactly
+    four: ``oracle_cycle``, ``signal_classification``, ``anomaly_narration``,
+    ``knowledge_mapping``). ``diagnostics`` is not one of them and adding
+    that check now would make a single timeout block every diagnostics
+    cycle for ``TIMEOUT_BLACKLIST_HOURS`` (24h) — this step already has its
+    own per-call budget (``REPAIR_BUDGET_SECONDS``) and its natural
+    cadence (every 6th cycle) as throttling.
+    """
+    if state.cycle_count % 6 != 0:
+        return
+    try:
+        state.current_step = "diagnostics"
+        diag, ok = _run_with_timeout(
+            "diagnostics",
+            lambda: run_self_diagnostics(engine, hermes_ok, health, state, dry_run=dry_run),
+            DIAGNOSTICS_TIMEOUT_SECONDS,
+            state,
+        )
+        if ok:
+            cycle_result["diagnostics"] = diag
+        else:
+            cycle_result["diagnostics"] = {"timeout": True}
+    except Exception as exc:
+        log.warning("Self-diagnostics failed: {e}", e=str(exc))
 
 
 def _run_sector_health_step(engine: Any, state: OperatorState, dry_run: bool) -> dict[str, Any]:
@@ -2306,7 +2395,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
             state.current_step = f"stale_refresh:{src}"
             if state.cooldowns.can_retry(src):
                 try:
-                    _retry_source(src, engine, attempt=1)
+                    _retry_source(src, engine, attempt=1, state=state)
                     state.cooldowns.record_attempt(src, success=True)
                     stale_repulled += 1
                     log.info("Proactively refreshed stale source: {s}", s=src)
@@ -2361,14 +2450,10 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     # SmartScheduler's frequency tracking replaces this.
     cycle_result["data_gaps"] = {"skipped": "handled_by_smart_scheduler"}
 
-    # 5. Self-diagnostics — only every 6th cycle (30 min)
-    if state.cycle_count % 6 == 0:
-        try:
-            state.current_step = "diagnostics"
-            diag = run_self_diagnostics(engine, hermes_ok, health, state, dry_run=dry_run)
-            cycle_result["diagnostics"] = diag
-        except Exception as exc:
-            log.warning("Self-diagnostics failed: {e}", e=str(exc))
+    # 5. Self-diagnostics — only every 6th cycle (30 min), bounded by its
+    # own timeout (see _run_diagnostics_step's docstring for the traced
+    # 71-minute-stall defect this replaces).
+    _run_diagnostics_step(engine, hermes_ok, health, state, dry_run, cycle_result)
 
     # 6. Autoresearch — only every 12th cycle (1 hour)
     #

@@ -14,13 +14,15 @@ Contains:
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
+import threading
 import time
 import traceback
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from loguru import logger as log
 
@@ -38,6 +40,77 @@ MAX_PULL_RETRIES = 3
 AUTORESEARCH_MAX_ITER = 5
 HERMES_TEMPERATURE = 0.3
 
+# ─── Bounded repair (fable-hermes-repair-bound, 2026-09-19) ─────────────
+#
+# Traced (docs/handoffs/2026-09-19/fable-hermes-repair-bound.md): a REPULL
+# repair command used to call _retry_source(attempt=1) with no start_date
+# override, which for pull_all(start_date=...) pullers (YFinancePuller)
+# fell through to the module default start_date="1990-01-01" — a full
+# history backfill masquerading as a routine repair. On cycle 6300 that
+# took 71 minutes (the source was NOT actually stale — every ticker's
+# obs_date already reached yesterday; the "fix" was reprocessing 1.3-2.3M
+# existing rows per series only to insert 0 new ones) and starved every
+# step scheduled after diagnostics for the rest of that cycle and part of
+# the next. REPAIR_LOOKBACK_DAYS bounds every repair attempt to a small,
+# recent window — a full-history backfill is a separately authorised
+# operation (e.g. a one-off script run by a human), never triggered as a
+# side effect of a self-diagnostics repair command.
+REPAIR_LOOKBACK_DAYS = 7
+
+# Cooperative time budget for one repair pass (one run_self_diagnostics or
+# diagnose_and_fix_pulls call, across however many REPULL/retry commands it
+# executes). Pullers that accept a `should_continue` kwarg (currently
+# YFinancePuller.pull_all/pull_ticker) check it between tickers and stop
+# early with a PARTIAL result instead of running unbounded. Must stay
+# under both DIAGNOSTICS_TIMEOUT_SECONDS and DIAGNOSE_PULLS_TIMEOUT_SECONDS
+# in scripts/hermes_operator.py — pinned by
+# tests/test_hermes_repair_bounded.py so the budget can never grow past the
+# step timeout that wraps it.
+REPAIR_BUDGET_SECONDS = 180
+
+# ─── No-overlap guard for repair pulls ───────────────────────────────────
+#
+# _run_with_timeout (scripts/hermes_operator.py) abandons rather than kills
+# a worker thread on timeout — see its docstring. Before this task, a
+# repair pull orphaned that way kept running (observed still pulling
+# tickers 25 minutes into the NEXT cycle) while the next diagnostics cycle
+# started a fresh _retry_source for the same source, doubling the work and
+# never reaching the `last_pull_at` update or cooldown record for either
+# attempt. _REPAIRS_IN_FLIGHT tracks one entry per source while a
+# _retry_source call for it is active; a second call for the same source
+# while the first's thread is still alive is skipped instead of started.
+# Each entry's `token` also flows into that call's `should_continue`, so an
+# abandoned worker's own puller loop sees should_continue() go False (its
+# token was removed/replaced) and stops at its next ticker boundary rather
+# than running for an hour.
+# RLock, not Lock: _retry_source holds _REPAIRS_LOCK while registering its
+# entry and calls _next_repair_token() in that same critical section (and
+# tests call it directly while simulating a takeover under the same lock);
+# a plain Lock would self-deadlock on that reentrant acquire.
+_REPAIRS_LOCK = threading.RLock()
+_REPAIRS_IN_FLIGHT: dict[str, dict[str, Any]] = {}
+_repair_token_seq = 0
+
+
+def _next_repair_token() -> int:
+    global _repair_token_seq
+    with _REPAIRS_LOCK:
+        _repair_token_seq += 1
+        return _repair_token_seq
+
+
+def _thread_is_alive(ident: int | None) -> bool:
+    """True if a live thread with this identity still exists.
+
+    Used instead of trusting an in-flight entry indefinitely: if the
+    process itself somehow lost track of the thread (should not happen
+    with daemon/orphan threads, but this is a safety net), a stale entry
+    does not permanently block retries for a source.
+    """
+    if ident is None:
+        return False
+    return any(t.ident == ident and t.is_alive() for t in threading.enumerate())
+
 _PULL_ACTIONS: dict[str, str] = {
     "RETRY": "transient error; retry with normal strategy",
     "SKIP": "known outage or maintenance; do not spend a retry",
@@ -49,7 +122,7 @@ _PULL_ACTIONS: dict[str, str] = {
 HERMES_REPAIR_SKILLS: tuple[tuple[str, str], ...] = (
     ("RUN_REGIME", "Re-run regime detection."),
     ("RUN_FEATURES", "Recompute feature importance."),
-    ("REPULL:<source_name>", "Re-pull a specific source if it is not in cooldown."),
+    ("REPULL:<source_name>", "Re-pull a specific source if it is not in cooldown (bounded to the last few days — never a full-history backfill)."),
     ("RUN_PIPELINE", "Trigger the standard full pipeline."),
     ("VACUUM_DB", "Run VACUUM ANALYZE on hot data tables."),
     ("FIX_DATA_QUALITY[:family]", "Scan recent resolved_series quality and remove exact duplicates."),
@@ -816,8 +889,15 @@ def _execute_hermes_repair_command(
     engine: Any,
     health: dict,
     state: OperatorState,
+    should_continue: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
-    """Execute one bounded Hermes repair command."""
+    """Execute one bounded Hermes repair command.
+
+    ``should_continue`` (added for fable-hermes-repair-bound, 2026-09-19)
+    is forwarded to REPULL's ``_retry_source`` call — see that function's
+    docstring. Every other command ignores it; only REPULL can trigger a
+    long-running puller loop.
+    """
     raw_cmd = cmd.strip()
     upper_cmd = raw_cmd.upper()
 
@@ -842,9 +922,35 @@ def _execute_hermes_repair_command(
             raise ValueError("REPULL requires a source name")
         if state.cooldowns.can_retry(source):
             log.info("Hermes action: re-pulling {s}", s=source)
-            _retry_source(source, _require_engine(engine, raw_cmd), attempt=1)
+            pull_result = _retry_source(
+                source, _require_engine(engine, raw_cmd), attempt=1,
+                state=state, should_continue=should_continue,
+            )
+            if pull_result.get("status") == "skipped" and pull_result.get("reason") == "in_flight":
+                # Another worker (possibly an abandoned one from a prior
+                # timed-out cycle) is still pulling this source — do not
+                # start a second overlapping pull, and do not touch the
+                # cooldown; the in-flight attempt owns that outcome.
+                log.info(
+                    "REPULL:{s} skipped — repair already in flight (age {a}s)",
+                    s=source, a=pull_result.get("age_s"),
+                )
+                return {"cmd": raw_cmd, "status": "skipped", "reason": "in_flight"}
+            if pull_result.get("stopped_by_budget"):
+                # Ran out of REPAIR_BUDGET_SECONDS before finishing — record
+                # it as a failed attempt so the cooldown engages (prevents
+                # the same source being retried again next cycle before the
+                # remainder has had a chance), and leave the backlog
+                # _retry_source already persisted for the next attempt.
+                state.cooldowns.record_attempt(source, success=False, error="budget")
+                return {
+                    "cmd": raw_cmd,
+                    "status": "partial",
+                    "stopped_by_budget": True,
+                    "pull_result": pull_result,
+                }
             state.cooldowns.record_attempt(source, success=True)
-            return {"cmd": raw_cmd, "status": "ok"}
+            return {"cmd": raw_cmd, "status": "ok", "pull_result": pull_result}
         log.info("Hermes wants REPULL:{s} but source in cooldown", s=source)
         return {"cmd": raw_cmd, "status": "cooldown"}
 
@@ -1181,45 +1287,145 @@ def _resolve_puller(source_name: str, engine: Any) -> tuple[Any, str, dict[str, 
     return puller, method, kwargs
 
 
-def _retry_source(source_name: str, engine: Any, attempt: int = 1) -> dict[str, Any]:
-    """Retry a single source pull with strategy variation per attempt.
+def _retry_source(
+    source_name: str,
+    engine: Any,
+    attempt: int = 1,
+    state: OperatorState | None = None,
+    should_continue: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    """Retry a single source pull, bounded to a recent window and a budget.
 
-    Attempt 1: standard pull (recent data only)
-    Attempt 2: pull with extended lookback
-    Attempt 3: full historical backfill for last 7 days
+    Strategy per attempt — ALWAYS a bounded recent window, never full
+    history (see REPAIR_LOOKBACK_DAYS above for why):
+
+    Attempt 1: last REPAIR_LOOKBACK_DAYS (7) days.
+    Attempt 2: last 2*REPAIR_LOOKBACK_DAYS (14) days.
+    Attempt 3: last 3*REPAIR_LOOKBACK_DAYS (21) days.
+
+    Pullers keyed by `days_back` instead of `start_date` keep the
+    pre-existing widen-on-retry behaviour unchanged (days_back scaled by
+    (attempt + 1) from attempt 2 on) — they were never the source of the
+    full-history defect this bounds.
+
+    Cooperative budget + no-overlap guard:
+    - If a repair for this source is already in flight (a live thread
+      registered in _REPAIRS_IN_FLIGHT), this call does nothing and
+      returns {"status": "skipped", "reason": "in_flight", ...} instead of
+      starting a second, overlapping pull.
+    - Otherwise this call registers itself, and `should_continue` (if
+      given, e.g. a deadline check from run_self_diagnostics or
+      diagnose_and_fix_pulls) is combined with an "am I still the current
+      attempt for this source" check and forwarded to the puller as
+      `should_continue` IF AND ONLY IF the puller's pull method accepts
+      that keyword (currently YFinancePuller.pull_all/pull_ticker).
+      Pullers that don't accept it run exactly as before — one call,
+      uninterruptible for its duration.
+    - If the puller reports `stopped_by_budget`, the unattempted remainder
+      (if any) is persisted to `state.repair_backlog[source]` so the next
+      call resumes from there instead of the first ticker, and
+      `last_pull_at` is NOT advanced (the pull didn't actually finish).
 
     Returns:
-        dict with pull result info.
+        dict with pull result info. Always has a "status" key.
     """
-    log.info("Retrying {s} (attempt {a}/{m})", s=source_name, a=attempt, m=MAX_PULL_RETRIES)
+    source_key = source_name.lower()
 
-    puller, method, kwargs = _resolve_puller(source_name, engine)
+    with _REPAIRS_LOCK:
+        existing = _REPAIRS_IN_FLIGHT.get(source_key)
+        if existing is not None and _thread_is_alive(existing.get("thread")):
+            age_s = time.monotonic() - existing["started"]
+            log.warning(
+                "Repair for {s} already in flight (age {a:.0f}s) — skipping",
+                s=source_name, a=age_s,
+            )
+            return {
+                "status": "skipped",
+                "reason": "in_flight",
+                "age_s": round(age_s, 1),
+            }
+        token = _next_repair_token()
+        _REPAIRS_IN_FLIGHT[source_key] = {
+            "started": time.monotonic(),
+            "token": token,
+            "thread": threading.get_ident(),
+        }
 
-    # Vary strategy per attempt
-    if attempt >= 2:
-        # Extend lookback on retry — pull more historical data
-        if "days_back" in kwargs:
-            kwargs["days_back"] = kwargs["days_back"] * (attempt + 1)
-        elif hasattr(puller, "pull_all"):
-            # For pullers with start_date, go further back on retry
-            from datetime import timedelta
-            kwargs["start_date"] = (date.today() - timedelta(days=7 * attempt)).isoformat()
-
-    pull_fn = getattr(puller, method)
-    result = pull_fn(**kwargs)
-
-    # Update last_pull_at in source_catalog on success
     try:
-        from sqlalchemy import text
-        with engine.begin() as conn:
-            conn.execute(text(
-                "UPDATE source_catalog SET last_pull_at = NOW() "
-                "WHERE LOWER(name) = LOWER(:name)"
-            ), {"name": source_name})
-    except Exception:
-        pass  # Non-critical — pull succeeded even if catalog update fails
+        log.info("Retrying {s} (attempt {a}/{m})", s=source_name, a=attempt, m=MAX_PULL_RETRIES)
 
-    return result if isinstance(result, dict) else {"status": "ok"}
+        puller, method, kwargs = _resolve_puller(source_name, engine)
+        kwargs = dict(kwargs)
+        pull_fn = getattr(puller, method)
+
+        try:
+            params = inspect.signature(pull_fn).parameters
+        except (TypeError, ValueError):
+            params = {}
+
+        # A. Bounded window — never full history.
+        if "start_date" in params:
+            from datetime import timedelta
+            kwargs["start_date"] = (
+                date.today() - timedelta(days=REPAIR_LOOKBACK_DAYS * attempt)
+            ).isoformat()
+        elif attempt >= 2 and "days_back" in kwargs:
+            # Unchanged pre-existing behaviour for days_back-style pullers.
+            kwargs["days_back"] = kwargs["days_back"] * (attempt + 1)
+
+        # Resume from a persisted backlog instead of restarting from the
+        # first ticker, when the puller accepts an explicit ticker_list.
+        backlog: list[str] | None = None
+        if state is not None:
+            backlog = state.repair_backlog.get(source_key) or None
+        if backlog and "ticker_list" in params:
+            kwargs["ticker_list"] = list(backlog)
+
+        # B. Cooperative budget, only for pullers that accept it.
+        if "should_continue" in params:
+            outer_should_continue = should_continue
+
+            def _combined_should_continue() -> bool:
+                if outer_should_continue is not None and not outer_should_continue():
+                    return False
+                current = _REPAIRS_IN_FLIGHT.get(source_key)
+                return current is not None and current.get("token") == token
+
+            kwargs["should_continue"] = _combined_should_continue
+
+        result = pull_fn(**kwargs)
+        result = result if isinstance(result, dict) else {"status": "ok"}
+
+        stopped_by_budget = bool(result.get("stopped_by_budget"))
+
+        if state is not None:
+            if stopped_by_budget:
+                remainder = result.get("tickers_not_attempted") or []
+                if remainder:
+                    state.repair_backlog[source_key] = list(remainder)
+            else:
+                state.repair_backlog.pop(source_key, None)
+
+        # Update last_pull_at in source_catalog only when the pull actually
+        # ran to completion over its (bounded) window — a budget-stopped
+        # attempt did not finish and should not be marked fresh.
+        if not stopped_by_budget:
+            try:
+                from sqlalchemy import text
+                with engine.begin() as conn:
+                    conn.execute(text(
+                        "UPDATE source_catalog SET last_pull_at = NOW() "
+                        "WHERE LOWER(name) = LOWER(:name)"
+                    ), {"name": source_name})
+            except Exception:
+                pass  # Non-critical — pull succeeded even if catalog update fails
+
+        return result
+    finally:
+        with _REPAIRS_LOCK:
+            current = _REPAIRS_IN_FLIGHT.get(source_key)
+            if current is not None and current.get("token") == token:
+                del _REPAIRS_IN_FLIGHT[source_key]
 
 
 def diagnose_and_fix_pulls(
@@ -1328,8 +1534,21 @@ def diagnose_and_fix_pulls(
         result["fix_actions"] = fix_actions
         return result
 
-    # Retry each failed source with cooldown awareness and strategy variation
+    # Retry each failed source with cooldown awareness and strategy variation,
+    # under one shared cooperative budget for the whole call (see
+    # REPAIR_BUDGET_SECONDS / _retry_source's docstring).
+    deadline = time.monotonic() + REPAIR_BUDGET_SECONDS
+    should_continue = lambda: time.monotonic() < deadline  # noqa: E731
+
     for source_name in failed_sources:
+        if time.monotonic() >= deadline:
+            log.info(
+                "diagnose_and_fix_pulls: REPAIR_BUDGET_SECONDS exhausted — "
+                "stopping before {s}", s=source_name,
+            )
+            result["skipped_cooldown"] += 1
+            continue
+
         source_key = _normalize_source_key(source_name)
 
         # Check Hermes recommendation
@@ -1385,7 +1604,20 @@ def diagnose_and_fix_pulls(
             if action == "BACKFILL":
                 attempt = MAX_PULL_RETRIES  # force extended lookback
 
-            _retry_source(source_name, engine, attempt=attempt)
+            pull_result = _retry_source(
+                source_name, engine, attempt=attempt,
+                state=state, should_continue=should_continue,
+            )
+            if pull_result.get("status") == "skipped" and pull_result.get("reason") == "in_flight":
+                log.info("Skipping {s} — repair already in flight", s=source_name)
+                result["skipped_cooldown"] += 1
+                continue
+            if pull_result.get("stopped_by_budget"):
+                state.cooldowns.record_attempt(source_name, success=False, error="budget")
+                result["retried"] += 1
+                log.info("Repair for {s} stopped by budget; backlog persisted", s=source_name)
+                continue
+
             result["retried"] += 1
             result["fixed"] += 1
             state.cooldowns.record_attempt(source_name, success=True)
@@ -1544,7 +1776,7 @@ def fill_data_gaps(engine: Any, state: OperatorState, dry_run: bool = False) -> 
                     "Gap-filling {s} — {n} features, {d} days back",
                     s=source_name, n=len(info["features"]), d=info["days_back"],
                 )
-                _retry_source(source_name, engine, attempt=2)  # use extended strategy
+                _retry_source(source_name, engine, attempt=2, state=state)  # use extended strategy
                 result["gaps_filled"] += len(info["features"])
                 result["sources_repulled"].append(source_name)
                 state.cooldowns.record_attempt(source_name, success=True)
@@ -1574,11 +1806,21 @@ def run_self_diagnostics(
 
     Hermes outputs structured commands that get executed:
     - commands listed in HERMES_REPAIR_SKILLS
+
+    All repair commands executed here (chiefly REPULL) share one
+    REPAIR_BUDGET_SECONDS cooperative deadline, computed once at entry —
+    see REPAIR_BUDGET_SECONDS / _retry_source's docstring. The step itself
+    is additionally wrapped by the caller (scripts/hermes_operator.py's
+    _run_diagnostics_step) in _run_with_timeout(..., DIAGNOSTICS_TIMEOUT_
+    SECONDS), which must stay comfortably above this budget so the LLM
+    call plus this budget both fit inside the step's own timeout.
     """
     if not hermes_available:
         return {"skipped": "hermes_unavailable"}
 
     result: dict[str, Any] = {"actions_taken": []}
+    deadline = time.monotonic() + REPAIR_BUDGET_SECONDS
+    should_continue = lambda: time.monotonic() < deadline  # noqa: E731
 
     try:
         from llm.router import get_llm, Tier
@@ -1658,8 +1900,19 @@ def run_self_diagnostics(
         for cmd in _parse_hermes_action_commands(response, limit=7):
             if cmd.upper() == "NONE":
                 continue
+            if time.monotonic() >= deadline:
+                log.info(
+                    "run_self_diagnostics: REPAIR_BUDGET_SECONDS exhausted — "
+                    "stopping before {c}", c=cmd,
+                )
+                result["actions_taken"].append(
+                    {"cmd": cmd, "status": "skipped", "reason": "budget_exhausted"}
+                )
+                continue
             try:
-                action_result = _execute_hermes_repair_command(cmd, engine, health, state)
+                action_result = _execute_hermes_repair_command(
+                    cmd, engine, health, state, should_continue=should_continue,
+                )
                 if action_result.get("status") != "skipped":
                     result["actions_taken"].append(action_result)
             except Exception as exc:
