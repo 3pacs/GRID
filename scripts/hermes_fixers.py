@@ -936,6 +936,15 @@ def _execute_hermes_repair_command(
                     s=source, a=pull_result.get("age_s"),
                 )
                 return {"cmd": raw_cmd, "status": "skipped", "reason": "in_flight"}
+            if pull_result.get("status") == "abandoned":
+                # _retry_source already determined nothing here is safe to
+                # publish (see its docstring, Check 2c) — do not record a
+                # cooldown outcome for a result that may be stale/superseded.
+                log.warning(
+                    "REPULL:{s} abandoned — not recording a cooldown outcome",
+                    s=source,
+                )
+                return {"cmd": raw_cmd, "status": "abandoned", "pull_result": pull_result}
             if pull_result.get("stopped_by_budget"):
                 # Ran out of REPAIR_BUDGET_SECONDS before finishing — record
                 # it as a failed attempt so the cooldown engages (prevents
@@ -1326,8 +1335,35 @@ def _retry_source(
       call resumes from there instead of the first ticker, and
       `last_pull_at` is NOT advanced (the pull didn't actually finish).
 
+    Abandonment (review Check 2c, fable-hermes-repair-bound follow-up,
+    2026-09-19): determined explicitly at the point the pull call returns,
+    not trusted from the puller's own self-report. Two conditions:
+      - token superseded — this call's `_REPAIRS_IN_FLIGHT` entry is no
+        longer owned by its own token (see the no-overlap guard above).
+      - deadline passed AND the puller did NOT itself report
+        `stopped_by_budget` — i.e. the puller returned something that looks
+        like an ordinary completed result ("ok"), but by the time control
+        is back here the caller's `should_continue` budget had already
+        expired. This covers a puller whose should_continue check is too
+        coarse to catch a single slow provider call finishing after the
+        deadline on what happened to be its last scheduled ticker (see
+        pull_ticker's `timeout` handling in ingestion/yfinance_pull.py for
+        the complementary per-call bound).
+    (A puller that itself reports `stopped_by_budget=True` after checking
+    `should_continue` between tickers is NOT abandonment — that is the
+    ordinary cooperative stop already handled below: backlog persisted,
+    `last_pull_at` withheld, caller records a failed cooldown attempt.)
+    When abandoned, this call publishes NOTHING — no `last_pull_at` update,
+    no `state.repair_backlog`/`repair_last_check`/`repair_uncovered` write —
+    and returns `{"status": "abandoned", ...}` instead of the puller's
+    result, so a caller cannot mistake a stale/superseded result for a
+    fresh one even though the puller itself returned normally.
+
     Returns:
-        dict with pull result info. Always has a "status" key.
+        dict with pull result info. Always has a "status" key. "status" is
+        "abandoned" when this call's result must not be published (see
+        above) — callers must not record a cooldown outcome or touch
+        source_catalog for that status.
     """
     source_key = source_name.lower()
 
@@ -1363,11 +1399,17 @@ def _retry_source(
         except (TypeError, ValueError):
             params = {}
 
-        # A. Bounded window — never full history.
+        # A. Bounded window — never full history. Never widened past
+        # 3 * REPAIR_LOOKBACK_DAYS: attempt is capped at MAX_PULL_RETRIES by
+        # every caller (diagnose_and_fix_pulls does attempt = min(attempt,
+        # MAX_PULL_RETRIES); the REPULL command handler always passes
+        # attempt=1).
+        window_days: int | None = None
         if "start_date" in params:
             from datetime import timedelta
+            window_days = REPAIR_LOOKBACK_DAYS * attempt
             kwargs["start_date"] = (
-                date.today() - timedelta(days=REPAIR_LOOKBACK_DAYS * attempt)
+                date.today() - timedelta(days=window_days)
             ).isoformat()
         elif attempt >= 2 and "days_back" in kwargs:
             # Unchanged pre-existing behaviour for days_back-style pullers.
@@ -1398,6 +1440,85 @@ def _retry_source(
 
         stopped_by_budget = bool(result.get("stopped_by_budget"))
 
+        # Explicit abandonment determination — see this function's docstring.
+        with _REPAIRS_LOCK:
+            current_entry = _REPAIRS_IN_FLIGHT.get(source_key)
+            superseded = current_entry is None or current_entry.get("token") != token
+        deadline_passed = should_continue is not None and not should_continue()
+        abandoned = superseded or (deadline_passed and not stopped_by_budget)
+
+        if abandoned:
+            attempted_n = len(result.get("results") or [])
+            log.warning(
+                "repair worker for {s} abandoned after {n} tickers — exiting "
+                "without publishing state",
+                s=source_name, n=attempted_n,
+            )
+            return {
+                "status": "abandoned",
+                "reason": "superseded" if superseded else "deadline_passed",
+                "tickers_attempted": attempted_n,
+            }
+
+        # Per-ticker outcome summary — only present for pullers whose result
+        # carries the yfinance-shaped "results"/"counts" (Check 1a). Freshness
+        # semantics: this records that the source was CHECKED, with the
+        # per-ticker breakdown preserved (duplicate-only is a successful
+        # check, not evidence of currency) — never a claim that every
+        # symbol is current. See _retry_source's own module docstring block
+        # and ingestion/yfinance_pull.py::pull_all.
+        per_ticker_results = result.get("results")
+        counts = result.get("counts")
+        if (
+            state is not None
+            and window_days is not None
+            and isinstance(per_ticker_results, list)
+            and isinstance(counts, dict)
+        ):
+            total_checked = sum(
+                counts.get(k, 0)
+                for k in ("inserted", "duplicate_only", "no_data", "error", "unattempted")
+            )
+            summary_line = (
+                f"{source_name} repair: checked {total_checked} tickers "
+                f"(window {window_days}d): {counts.get('inserted', 0)} inserted rows, "
+                f"{counts.get('duplicate_only', 0)} duplicate-only, "
+                f"{counts.get('no_data', 0)} no_data, {counts.get('error', 0)} error, "
+                f"{counts.get('unattempted', 0)} unattempted"
+            )
+            log.info(summary_line)
+            state.repair_last_check[source_key] = {
+                "source": source_name,
+                "window_days": window_days,
+                "attempt": attempt,
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+                "counts": dict(counts),
+                "total_tickers": total_checked,
+                "summary": summary_line,
+            }
+
+            # Check 1b — repair needs older than the window stay visible.
+            failing_tickers = [
+                r.get("ticker") for r in per_ticker_results
+                if isinstance(r, dict) and r.get("outcome") in ("no_data", "error") and r.get("ticker")
+            ]
+            attempt_cap_reached = attempt >= MAX_PULL_RETRIES
+            if attempt_cap_reached or failing_tickers:
+                reason = "attempt_cap" if attempt_cap_reached else "per_ticker_failures"
+                state.repair_uncovered[source_key] = {
+                    "window_days": window_days,
+                    "reason": reason,
+                    "tickers": failing_tickers[:50],
+                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                }
+                log.warning(
+                    "{s} repair: {n} ticker(s) not covered by the {w}d repair "
+                    "window (reason={r}) — data older than the window is NOT "
+                    "covered by repair; a separately authorised backfill is "
+                    "required for full coverage",
+                    s=source_name, n=len(failing_tickers), w=window_days, r=reason,
+                )
+
         if state is not None:
             if stopped_by_budget:
                 remainder = result.get("tickers_not_attempted") or []
@@ -1408,7 +1529,9 @@ def _retry_source(
 
         # Update last_pull_at in source_catalog only when the pull actually
         # ran to completion over its (bounded) window — a budget-stopped
-        # attempt did not finish and should not be marked fresh.
+        # attempt did not finish and should not be marked fresh. Semantics:
+        # this records that the source was CHECKED at this time, never that
+        # every symbol of this source is current (Check 1a).
         if not stopped_by_budget:
             try:
                 from sqlalchemy import text
@@ -1446,7 +1569,7 @@ def diagnose_and_fix_pulls(
     result: dict[str, Any] = {
         "retried": 0, "fixed": 0, "diagnosed": 0,
         "skipped_cooldown": 0, "skipped_no_handler": 0,
-        "skipped_key_check": 0, "escalated": 0,
+        "skipped_key_check": 0, "escalated": 0, "abandoned": 0,
     }
 
     # Find sources with recent failures + their error details
@@ -1611,6 +1734,16 @@ def diagnose_and_fix_pulls(
             if pull_result.get("status") == "skipped" and pull_result.get("reason") == "in_flight":
                 log.info("Skipping {s} — repair already in flight", s=source_name)
                 result["skipped_cooldown"] += 1
+                continue
+            if pull_result.get("status") == "abandoned":
+                # See _retry_source's docstring (Check 2c) — a result marked
+                # abandoned must not be published: no cooldown outcome, no
+                # log_issue "recovered" entry.
+                log.warning(
+                    "Repair for {s} abandoned — not recording a cooldown outcome",
+                    s=source_name,
+                )
+                result["abandoned"] += 1
                 continue
             if pull_result.get("stopped_by_budget"):
                 state.cooldowns.record_attempt(source_name, success=False, error="budget")
@@ -1842,6 +1975,13 @@ def run_self_diagnostics(
             "raw_series_count": health["db"].get("raw_series_count", 0),
             "latest_pull": health["db"].get("latest_pull"),
             "sources_in_cooldown": state.cooldowns.skipped_sources(),
+            # Check 1b: surfaced so the LLM cannot mistake a "checked"
+            # source (last_pull_at advanced, repair_last_check populated)
+            # for one with complete coverage — anything listed here is
+            # still missing data older than its repair window and needs a
+            # separately authorised backfill, not another REPULL.
+            "repair_uncovered": state.repair_uncovered,
+            "repair_last_check": state.repair_last_check,
             "task_failures": _summarize_task_failures(state),
             "subagent_roles": _list_subagents()["subagents"],
             "recent_issues": [

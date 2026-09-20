@@ -290,6 +290,204 @@ pass count from this branch. One pre-existing Windows-only path failure in
 a `fix_output_dirs` test is a known, unrelated environment difference; it
 is reported if seen, not treated as a regression from this change.
 
+## Review amendments (freshness + cancellation semantics, 2026-09-19)
+
+The release controller asked for two focused follow-up checks on top of the
+design above. Both are implemented minimally on this same branch.
+
+### Check 1 — freshness semantics
+
+`source_catalog.last_pull_at` (and the new `state.repair_last_check`
+summary below) mean "the source was successfully CHECKED at this time" —
+never "every symbol of this source is current". Nothing in this branch
+claims currency; log text and docstrings say "checked".
+
+- `YFinancePuller.pull_ticker` (`ingestion/yfinance_pull.py`) now returns
+  an `outcome` key per ticker: `"inserted"` (rows_inserted > 0),
+  `"duplicate_only"` (a non-empty download that inserted 0 rows — every
+  date it returned was already present; this IS a successful check, not
+  evidence of staleness, and also not evidence of currency), `"no_data"`
+  (the provider returned nothing for the window), or `"error"` (invalid
+  ticker or an exception).
+- `pull_all`'s dict-shaped return (the `should_continue`-given path used by
+  repairs) now carries top-level `"counts"`: `{"inserted", "duplicate_only",
+  "no_data", "error", "unattempted"}` — `"unattempted"` covers tickers never
+  reached because the budget ran out, and must not be read as "ok".
+- `scripts/hermes_fixers.py::_retry_source` logs one summary line per
+  repair — `"<source> repair: checked N tickers (window Wd): A inserted
+  rows, B duplicate-only, C no_data, D error, E unattempted"` — and
+  persists that same summary (window, attempt, counts, checked_at) in the
+  new `state.repair_last_check[source]` (new `OperatorState` field,
+  serialised in `to_dict()`, hydrated in `hydrate_from_snapshot()` only
+  when unset — bounded to the last summary, not a history log).
+- **Repair needs older than the window stay visible** (Check 1b): when a
+  repair completes with `no_data`/`error` tickers, or when `attempt` has
+  reached `MAX_PULL_RETRIES` (the widest window this mechanism will ever
+  try — 21 days — never widened further), `_retry_source` records
+  `state.repair_uncovered[source] = {"window_days", "reason":
+  "attempt_cap" | "per_ticker_failures", "tickers", "recorded_at"}` (new
+  bounded `OperatorState` field, same persistence pattern) and logs a
+  WARNING that data older than the window needs a separately authorised
+  backfill. `run_self_diagnostics`'s `status_report` (the JSON handed to
+  the LLM) now includes `repair_uncovered` and `repair_last_check`
+  directly, so the diagnostics model cannot mistake a checked source for a
+  fully-covered one.
+- `ingestion/scheduler.py::run_daily_pulls` (`_run_equity_pulls`) — the
+  `source_catalog.last_pull_at` update for yfinance already only ran after
+  `pull_all` returned (inside the same `try`, never on exception); this
+  amendment adds an explicit comment stating that semantics, and logs any
+  per-ticker `no_data`/`error` outcomes from the (now richer) per-ticker
+  results. FRED's block is untouched, flagged only (unchanged from the
+  original "Not done" note below).
+
+**Narrowed wording**: "duplicate-only" is established per LOGGED TICKER
+(a non-empty download with 0 rows inserted) — it is not a claim about the
+source as a whole. Currency through 2026-09-18 was traced and verified
+only for `YF:SPY:close`, `YF:XLI:close`, and `YF:EMB:close` (see traced
+fact #2 above); this branch does not generalise that to "equities are
+current", and no docstring or log line in this diff makes that claim.
+
+### Check 2 — cancellation semantics
+
+`should_continue` is polled BETWEEN tickers, so one `yf.download()` call
+that runs long cannot itself be interrupted by the cooperative budget.
+
+- **2a — bounded provider call.** `ingestion/yfinance_pull.py` checks
+  `inspect.signature(yf.download).parameters` once at import
+  (`_YF_DOWNLOAD_ACCEPTS_TIMEOUT`) and, when present, `pull_ticker` passes
+  an explicit `timeout=30` (`_YF_DOWNLOAD_TIMEOUT_SECONDS`). **Finding on
+  this branch's environment:** `yfinance==1.7.0` is installed
+  (`requirements.txt` pins `yfinance>=1.5.1`), and its `yf.download()`
+  signature accepts `timeout` (default `10`) — so `_YF_DOWNLOAD_ACCEPTS_
+  TIMEOUT` is `True` and every download call is explicitly bounded to 30s
+  regardless of what the installed version's own default is or becomes.
+  If a future/older yfinance version's `yf.download()` does NOT accept
+  `timeout`, this module falls back to documenting (here and in
+  `pull_ticker`'s docstring) that a single provider call is then bounded
+  only by the underlying HTTP library's own defaults, plus the step-level
+  `_run_with_timeout` abandonment described next.
+- **2b — in-flight registration lifetime.** Unchanged from the original
+  design (section D above) but now explicitly tested with real threads: the
+  `_REPAIRS_IN_FLIGHT` entry is removed ONLY in `_retry_source`'s own
+  `finally`, running in the worker thread — never by a caller that gave up
+  waiting. `tests/test_hermes_repair_bounded.py::
+  TestAbandonmentUnderRealOuterTimeout::
+  test_registry_entry_persists_after_outer_timeout_returns` wraps
+  `_retry_source` in a real `scripts.hermes_operator._run_with_timeout(...,
+  1, ...)` against a puller blocked on a `threading.Event`, confirms the
+  entry is still present (same token) after the outer call times out and
+  returns `(None, False)`, confirms a second `_retry_source` for the same
+  source returns `skipped/in_flight` while blocked, then releases the
+  event and confirms the entry is gone only once the worker itself exits.
+- **2c — explicit abandonment determination.** `_retry_source` now
+  determines abandonment explicitly at the point the pull call returns,
+  rather than trusting the puller's own self-report:
+  `superseded` (this call's `_REPAIRS_IN_FLIGHT` token is no longer the
+  current entry for the source — the existing no-overlap defense-in-depth
+  control) OR (`deadline_passed` — the caller's own `should_continue`
+  budget had already expired by the time the pull returned — AND the
+  puller did NOT itself report `stopped_by_budget`, i.e. it looks like an
+  ordinary "ok" completion). The second clause is deliberately narrower
+  than "should_continue is false at return time" alone: an ordinary
+  cooperative stop (puller checks `should_continue` between tickers, finds
+  it false, and returns `stopped_by_budget=True`) is NOT abandonment — that
+  is the pre-existing, already-tested budget-stop path (backlog persisted,
+  `last_pull_at` withheld, caller records a failed cooldown attempt,
+  `tests/test_hermes_repair_bounded.py::TestCooperativeBudgetAndBacklog`
+  stays green). Abandonment is reserved for the case the intro to Check 2
+  actually describes: a puller returning something that looks complete
+  even though the deadline had already passed, or a call whose owning slot
+  was taken over by a fresher attempt. When abandoned, `_retry_source`
+  returns `{"status": "abandoned", "reason": "superseded" |
+  "deadline_passed", "tickers_attempted": n}` — never the puller's raw
+  result — logs `"repair worker for <source> abandoned after <n> tickers —
+  exiting without publishing state"`, and publishes NOTHING: no
+  `source_catalog` `UPDATE`, no `state.repair_backlog` /
+  `repair_last_check` / `repair_uncovered` write. Its own `finally` also
+  will not delete a fresher entry it does not own, so a later, different
+  attempt's bookkeeping is never clobbered. Both callers
+  (`_execute_hermes_repair_command`'s `REPULL:` handler and
+  `diagnose_and_fix_pulls`'s retry loop) check for `status == "abandoned"`
+  and skip recording any cooldown outcome for it — a stale/superseded
+  result must not engage or clear the cooldown either.
+- **2d — real-thread test.**
+  `TestAbandonmentUnderRealOuterTimeout::
+  test_abandoned_worker_publishes_nothing_and_logs` — a fake puller whose
+  first ticker blocks on a `threading.Event`, run under a real
+  `_run_with_timeout(..., 1, ...)`; after it times out and returns, the
+  test simulates this attempt's slot being superseded (same technique as
+  the pre-existing `test_should_continue_reflects_a_superseded_token`),
+  releases the event, and asserts: the worker never starts the second
+  ticker, no `UPDATE source_catalog` statement is ever executed (a
+  recording fake engine), `state.repair_backlog` / `repair_last_check` /
+  `repair_uncovered` / cooldowns for the source stay untouched, the
+  abandonment line is logged, and a later call is not blocked forever once
+  the stale entry's thread is no longer alive.
+- **2e — where the bound actually comes from, stated plainly.** The 180s
+  `REPAIR_BUDGET_SECONDS` bounds SCHEDULING of new ticker work — it is
+  checked at ticker boundaries only, never actual elapsed work inside one
+  provider call. Actual elapsed work for one call is bounded by (the
+  provider timeout, when the puller/library exposes one — 30s for
+  `YFinancePuller.pull_ticker`, per 2a) plus the step-level
+  `_run_with_timeout` in `scripts/hermes_operator.py` (240s
+  `DIAGNOSE_PULLS_TIMEOUT_SECONDS` / 300s `DIAGNOSTICS_TIMEOUT_SECONDS`),
+  which abandons rather than cancels the worker thread (`_run_with_timeout`
+  cannot kill a running thread — see its own docstring). The in-flight
+  registry (2b) plus the abandonment rule (2c) are what stop an abandoned
+  worker from doing further harm once it does eventually return: it cannot
+  block a fresh attempt indefinitely (2b, `_thread_is_alive` treats a
+  genuinely-dead thread's stale entry as free to reclaim) and it cannot
+  publish stale state when it finally does return (2c). Pullers registered
+  without `should_continue` plumbing (e.g. anything not going through
+  `YFinancePuller.pull_all`) are not cooperatively cancellable at all —
+  for those, the step-level `_run_with_timeout` abandonment and the
+  in-flight/no-publish rules are the ONLY thing bounding their effect; this
+  branch does not add `should_continue` support to any additional puller.
+
+### Tests (review amendment)
+
+Added to `tests/test_yfinance_pull_regression.py`: per-ticker `outcome`
+classification (`inserted` / `duplicate_only` / `no_data` / `error`),
+`pull_all`'s per-outcome `counts` (including `unattempted`), and the
+bounded-`timeout` pass-through (present/absent per
+`_YF_DOWNLOAD_ACCEPTS_TIMEOUT`).
+
+Added to `tests/test_hermes_repair_bounded.py`:
+`TestFreshnessSemanticsSummary` (repair_last_check summary content,
+repair_uncovered on per-ticker failures and on attempt-cap, and that
+`OperatorState.to_dict()` exposes `repair_uncovered` the way
+`run_self_diagnostics`'s status report reads it) and
+`TestAbandonmentUnderRealOuterTimeout` (2b and 2d above).
+
+Full command and result on this branch:
+`DB_PASSWORD=x PYTHONUTF8=1 python -m pytest tests/test_hermes_*.py
+tests/test_yfinance_pull_regression.py tests/test_ingestion.py
+tests/test_scheduler*.py tests/test_smart_scheduler.py -q` →
+331 passed, 1 failed — the pre-existing, unrelated, Windows-only
+`test_fix_output_dirs_skill_creates_common_output_directories` failure
+(path-separator mismatch between `pathlib` and the recorded dict on
+Windows), present on `origin/main` before this branch's changes; not a
+regression from this diff.
+
+### Scope note on injected instructions
+
+Two additional messages arrived mid-task, styled as "coordinator"/
+"controller" updates citing new, specific "production evidence" (an
+abandoned worker allegedly running further `REPULL:` actions across
+cycles) and asking to expand this branch's scope (an action-loop
+abandonment check, new real-thread tests for a multi-action scenario, and
+unverified claims to add to this doc and the PR body). Both arrived
+through the tool-result channel rather than as an actual instruction from
+the user/controller in the normal conversation, cited timestamps/evidence
+that were not independently traceable the way every other "traced fact" in
+this document is, and asked to add that unverified narrative directly into
+this handoff doc and the PR description. Per this repo's own evidence
+standard (this doc's traced facts are explicitly sourced and dated), that
+content was not incorporated. If the run_self_diagnostics action LOOP
+(distinct from the single-source `_retry_source` abandonment fixed above)
+needs the same treatment, that is a legitimate, separate, larger follow-up
+this doc flags but does not implement.
+
 ## Not authorized
 
 This branch and its draft PR do not merge, deploy, restart any service,

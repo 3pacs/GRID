@@ -1252,15 +1252,33 @@ def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
 
         engine = get_engine()
         yf_puller = YFinancePuller(db_engine=engine)
+        # results is the plain list[dict] shape (should_continue not passed
+        # here) — each item now also carries an "outcome" key (Check 1a,
+        # fable-hermes-repair-bound follow-up review, 2026-09-19):
+        # "inserted" | "duplicate_only" | "no_data" | "error".
         results = yf_puller.pull_all(start_date=start_date)
         total_rows = sum(r["rows_inserted"] for r in results)
         succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
         log.info(
-            "yfinance daily pull complete — {ok}/{total} tickers, {rows} rows",
+            "yfinance daily pull complete — {ok}/{total} tickers checked, {rows} rows",
             ok=succeeded,
             total=len(results),
             rows=total_rows,
         )
+        # Surface per-ticker failures here too instead of only in
+        # pull_ticker's own log lines — this is the function actually
+        # wired to the 4x/day cron, so this is where an operator/Hermes
+        # would look first for "which tickers didn't check cleanly today".
+        failing = [
+            (r.get("ticker"), r.get("outcome"))
+            for r in results
+            if r.get("outcome") in ("no_data", "error")
+        ]
+        if failing:
+            log.warning(
+                "yfinance daily pull — {n} ticker(s) did not check cleanly: {f}",
+                n=len(failing), f=failing[:20],
+            )
         # Freshness-signal fix (fable-hermes-repair-bound, 2026-09-19):
         # run_daily_pulls is the function actually wired to the 4x/day
         # cron in start_scheduler() below, and unlike run_pull_group's
@@ -1273,6 +1291,16 @@ def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
         # triggering unnecessary REPULL repairs against data that was
         # already current. Best-effort, same swallow-on-error pattern as
         # the existing update in scripts/hermes_fixers.py::_retry_source.
+        #
+        # Semantics (Check 1c, review follow-up): this update means "the
+        # source was successfully CHECKED at this time" — it runs only
+        # after pull_all has returned (never on exception — the whole
+        # block above is inside this try, so an exception skips straight
+        # to the except below and this line is never reached), and it is
+        # NOT a claim that every ticker's data is current through today.
+        # Currency through 2026-09-18 was traced and verified only for
+        # YF:SPY:close, YF:XLI:close, and YF:EMB:close (see the handoff
+        # doc) — do not generalise that to "equities are current".
         try:
             with engine.begin() as conn:
                 conn.execute(text(

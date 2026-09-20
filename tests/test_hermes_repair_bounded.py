@@ -35,6 +35,7 @@ No network/DB — fake engines/pullers and monkeypatched
 """
 from __future__ import annotations
 
+import io
 import threading
 import time
 from datetime import date, timedelta
@@ -42,6 +43,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from loguru import logger as loguru_logger
 
 from scripts import hermes_fixers as hf
 from scripts import hermes_operator as ho
@@ -442,3 +444,273 @@ class TestBudgetConstantsPinInsideStepTimeouts:
         assert 0 < hf.REPAIR_LOOKBACK_DAYS <= 30, (
             "a repair window anywhere near backfill scale defeats the fix"
         )
+
+
+# ─── 7. Freshness semantics — per-ticker outcomes, repair_last_check,
+#        repair_uncovered (review Check 1, 2026-09-19) ─────────────────
+
+
+class TestFreshnessSemanticsSummary:
+    def test_retry_source_persists_repair_last_check_summary(self) -> None:
+        tickers = ["SPY", "XLI", "EMB", "ZZZZ", "BADTICK"]
+
+        class MixedOutcomePuller:
+            def pull_all(self, ticker_list=None, start_date=None, should_continue=None):
+                use = ticker_list if ticker_list is not None else tickers
+                results = []
+                for t in use:
+                    if t == "SPY":
+                        results.append({"ticker": t, "rows_inserted": 3, "status": "SUCCESS", "outcome": "inserted", "errors": []})
+                    elif t in ("XLI", "EMB"):
+                        results.append({"ticker": t, "rows_inserted": 0, "status": "SUCCESS", "outcome": "duplicate_only", "errors": []})
+                    elif t == "ZZZZ":
+                        results.append({"ticker": t, "rows_inserted": 0, "status": "PARTIAL", "outcome": "no_data", "errors": ["No data returned"]})
+                    else:
+                        results.append({"ticker": t, "rows_inserted": 0, "status": "SKIPPED", "outcome": "error", "errors": ["boom"]})
+                counts = {"inserted": 0, "duplicate_only": 0, "no_data": 0, "error": 0, "unattempted": 0}
+                for r in results:
+                    counts[r["outcome"]] += 1
+                return {
+                    "status": "SUCCESS", "stopped_by_budget": False,
+                    "results": results, "tickers_not_attempted": [], "counts": counts,
+                }
+
+        conn = _RecordingConn()
+        engine = _fake_engine(conn)
+        state = OperatorState()
+
+        import scripts.hermes_fixers as hf_mod
+        orig_resolve = hf_mod._resolve_puller
+        hf_mod._resolve_puller = lambda name, engine: (MixedOutcomePuller(), "pull_all", {})
+        try:
+            result = hf._retry_source("yfinance", engine, attempt=1, state=state)
+        finally:
+            hf_mod._resolve_puller = orig_resolve
+
+        assert result["status"] == "SUCCESS"
+        summary = state.repair_last_check.get("yfinance")
+        assert summary is not None
+        assert summary["window_days"] == hf.REPAIR_LOOKBACK_DAYS
+        assert summary["counts"] == {"inserted": 1, "duplicate_only": 2, "no_data": 1, "error": 1, "unattempted": 0}
+        assert summary["total_tickers"] == 5
+        assert "checked 5 tickers" in summary["summary"]
+        assert "duplicate-only" in summary["summary"]
+
+        uncovered = state.repair_uncovered.get("yfinance")
+        assert uncovered is not None
+        assert uncovered["reason"] == "per_ticker_failures"
+        assert set(uncovered["tickers"]) == {"ZZZZ", "BADTICK"}
+
+    def test_attempt_cap_records_repair_uncovered_even_with_no_failures(self) -> None:
+        class CleanPuller:
+            def pull_all(self, ticker_list=None, start_date=None, should_continue=None):
+                use = ticker_list if ticker_list is not None else ["SPY"]
+                results = [
+                    {"ticker": t, "rows_inserted": 0, "status": "SUCCESS", "outcome": "duplicate_only", "errors": []}
+                    for t in use
+                ]
+                return {
+                    "status": "SUCCESS", "stopped_by_budget": False,
+                    "results": results, "tickers_not_attempted": [],
+                    "counts": {"inserted": 0, "duplicate_only": len(use), "no_data": 0, "error": 0, "unattempted": 0},
+                }
+
+        conn = _RecordingConn()
+        engine = _fake_engine(conn)
+        state = OperatorState()
+
+        import scripts.hermes_fixers as hf_mod
+        orig_resolve = hf_mod._resolve_puller
+        hf_mod._resolve_puller = lambda name, engine: (CleanPuller(), "pull_all", {})
+        try:
+            hf._retry_source("yfinance", engine, attempt=hf.MAX_PULL_RETRIES, state=state)
+        finally:
+            hf_mod._resolve_puller = orig_resolve
+
+        uncovered = state.repair_uncovered.get("yfinance")
+        assert uncovered is not None
+        assert uncovered["reason"] == "attempt_cap"
+        assert uncovered["window_days"] == hf.REPAIR_LOOKBACK_DAYS * hf.MAX_PULL_RETRIES
+        assert uncovered["tickers"] == []
+
+    def test_run_self_diagnostics_status_report_exposes_repair_uncovered(self) -> None:
+        """Check 1b: the LLM-facing status report must not let a 'checked'
+        source read as fully covered."""
+        state = OperatorState()
+        state.repair_uncovered["yfinance"] = {
+            "window_days": 21, "reason": "attempt_cap", "tickers": [],
+            "recorded_at": "2026-09-19T00:00:00+00:00",
+        }
+        # status_report (built inside run_self_diagnostics) reads
+        # state.repair_uncovered directly by that attribute name — this
+        # locks in the field exists, is included in to_dict(), and is not
+        # silently dropped, which is what the LLM prompt keys off of.
+        assert state.to_dict()["repair_uncovered"] == state.repair_uncovered
+        assert state.repair_uncovered["yfinance"]["reason"] == "attempt_cap"
+
+
+# ─── 8. In-flight registry persists past an outer _run_with_timeout;
+#        abandonment publishes nothing (review Check 2b/2c, 2026-09-19) ──
+
+
+class TestAbandonmentUnderRealOuterTimeout:
+    def test_registry_entry_persists_after_outer_timeout_returns(self) -> None:
+        """Check 2b: the in-flight entry is removed only by the worker's
+        own finally in the worker thread, never by the caller when
+        _run_with_timeout gives up and returns control."""
+        block_event = threading.Event()
+        started_event = threading.Event()
+        engine = MagicMock()
+        state = OperatorState()
+
+        class BlockingPuller:
+            def pull_all(self, ticker_list=None, start_date=None, should_continue=None):
+                started_event.set()
+                block_event.wait(5)
+                return {"status": "SUCCESS", "stopped_by_budget": False,
+                        "results": [], "tickers_not_attempted": []}
+
+        import scripts.hermes_fixers as hf_mod
+        orig_resolve = hf_mod._resolve_puller
+        hf_mod._resolve_puller = lambda name, engine: (BlockingPuller(), "pull_all", {})
+        try:
+            result, ok = ho._run_with_timeout(
+                "outer_timeout_probe",
+                lambda: hf._retry_source("registrysrc", engine, attempt=1, state=state),
+                1,
+                state,
+            )
+            assert ok is False
+            assert result is None
+            assert started_event.wait(2), "worker never started"
+
+            entry = hf._REPAIRS_IN_FLIGHT.get("registrysrc")
+            assert entry is not None, (
+                "the caller's own timeout must not remove the in-flight entry"
+            )
+
+            second = hf._retry_source("registrysrc", engine, attempt=1, state=state)
+            assert second["status"] == "skipped"
+            assert second["reason"] == "in_flight"
+
+            block_event.set()
+            deadline = time.monotonic() + 5
+            while "registrysrc" in hf._REPAIRS_IN_FLIGHT and time.monotonic() < deadline:
+                time.sleep(0.02)
+        finally:
+            hf_mod._resolve_puller = orig_resolve
+            hf._REPAIRS_IN_FLIGHT.pop("registrysrc", None)
+
+        assert "registrysrc" not in hf._REPAIRS_IN_FLIGHT, (
+            "the worker's own finally must remove its entry once it actually exits"
+        )
+
+    def test_abandoned_worker_publishes_nothing_and_logs(self) -> None:
+        """Check 2c/2d: an already-running provider call cannot be
+        interrupted — it either finishes on its own (bounded by
+        pull_ticker's yf.download timeout when the installed yfinance
+        version supports one) or keeps draining. Either way, once this
+        attempt's registry slot has been superseded by a fresher one (the
+        documented compensating control — see
+        test_should_continue_reflects_a_superseded_token above for why a
+        genuinely live thread is never superseded by the ordinary in-flight
+        guard, and why this defense-in-depth path still needs to behave
+        correctly), the worker must not touch source_catalog, must not
+        start the next ticker, must not write repair_backlog /
+        repair_last_check / repair_uncovered / cooldowns, and must log the
+        abandonment line. Its own finally must not delete the fresher
+        entry — a later call proceeds once that entry's thread is no
+        longer alive."""
+        block_event = threading.Event()
+        started_event = threading.Event()
+        ticker2_started = threading.Event()
+        tickers = ["T0", "T1"]
+
+        class BlockFirstTickerPuller:
+            def pull_all(self, ticker_list=None, start_date=None, should_continue=None):
+                use = ticker_list if ticker_list is not None else tickers
+                attempted = []
+                for i, t in enumerate(use):
+                    if should_continue is not None and not should_continue():
+                        break
+                    if i == 0:
+                        started_event.set()
+                        block_event.wait(5)
+                    else:
+                        ticker2_started.set()
+                    attempted.append(t)
+                stopped = len(attempted) < len(use)
+                return {
+                    "status": "PARTIAL" if stopped else "SUCCESS",
+                    "stopped_by_budget": stopped,
+                    "results": [
+                        {"ticker": t, "rows_inserted": 0, "status": "SUCCESS", "outcome": "duplicate_only", "errors": []}
+                        for t in attempted
+                    ],
+                    "tickers_not_attempted": list(use[len(attempted):]),
+                    "counts": {
+                        "inserted": 0, "duplicate_only": len(attempted), "no_data": 0,
+                        "error": 0, "unattempted": len(use) - len(attempted),
+                    },
+                }
+
+        conn = _RecordingConn()
+        engine = _fake_engine(conn)
+        state = OperatorState()
+
+        import scripts.hermes_fixers as hf_mod
+        orig_resolve = hf_mod._resolve_puller
+        hf_mod._resolve_puller = lambda name, engine: (BlockFirstTickerPuller(), "pull_all", {})
+
+        log_sink = io.StringIO()
+        sink_id = loguru_logger.add(log_sink, level="WARNING")
+        try:
+            result, ok = ho._run_with_timeout(
+                "abandon_step_probe",
+                lambda: hf._retry_source(
+                    "abandonsrc", engine, attempt=1, state=state,
+                    should_continue=lambda: True,
+                ),
+                1,
+                state,
+            )
+            assert ok is False
+            assert started_event.wait(2), "worker never reached the blocking ticker"
+
+            # Simulate this attempt's slot being taken over by a fresher
+            # one. thread=-1 so a later call is not blocked forever once
+            # this (fake) entry goes stale.
+            with hf._REPAIRS_LOCK:
+                hf._REPAIRS_IN_FLIGHT["abandonsrc"] = {
+                    "started": time.monotonic(),
+                    "token": hf._next_repair_token(),
+                    "thread": -1,
+                }
+
+            block_event.set()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and "abandoned after" not in log_sink.getvalue():
+                time.sleep(0.02)
+
+            assert not ticker2_started.is_set(), "an abandoned worker must not start ticker 2"
+
+            update_calls = [c for c in conn.calls if "UPDATE source_catalog" in c]
+            assert not update_calls, "an abandoned worker must not touch source_catalog"
+            assert "abandonsrc" not in state.repair_backlog
+            assert "abandonsrc" not in state.repair_last_check
+            assert "abandonsrc" not in state.repair_uncovered
+            assert state.cooldowns.get_status("abandonsrc") is None
+
+            log_text = log_sink.getvalue()
+            assert "repair worker for abandonsrc abandoned after" in log_text
+            assert "exiting without publishing state" in log_text
+
+            # A fresh call is not blocked forever — the stale fake entry's
+            # thread ident (-1) is not alive. Still inside the
+            # _resolve_puller patch since this call needs the fake puller.
+            third = hf._retry_source("abandonsrc", engine, attempt=1, state=state)
+            assert third.get("status") != "skipped"
+        finally:
+            loguru_logger.remove(sink_id)
+            hf_mod._resolve_puller = orig_resolve
+            hf._REPAIRS_IN_FLIGHT.pop("abandonsrc", None)
