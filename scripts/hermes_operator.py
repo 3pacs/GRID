@@ -1832,6 +1832,144 @@ DAILY_INTEL_HOLD_REASONS: dict[str, str] = {
 }
 
 
+# ─── Overlapping-writer analysis, redone from code (2026-09-20 amendment 2 ──
+#     — release-controller rejection response) ───────────────────────────────
+#
+# The release controller rejected the first version of this analysis for
+# asserting "sole writer" per TABLE without checking whether the same
+# underlying FUNCTIONS could be invoked from paths other than this Hermes
+# task — in particular a hypothesised flow-materializer timer running in a
+# separate process that _DAILY_INTEL_IN_FLIGHT (below) cannot see, and for
+# leaning on "deterministic computation" as a conclusion instead of a
+# derivation. Redone by grepping every caller of each of the 8 allow-listed
+# tasks' underlying function across ingestion/, intelligence/, api/,
+# scripts/, and every server_setup/*.service + *.timer file (the actual
+# process/cadence registrations) plus .github/*.yml — not assumed. Full
+# per-task invocation-path/write-key/bound evidence lives in
+# docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md
+# ("Release-controller rejection response" section, reconciled table).
+# Condensed per task (function -> invocation paths -> verdict):
+#
+#  storage_maintenance_subagent — _dispatch_daily_storage_maintenance ->
+#    enqueue_goal(goal_type="hermes_storage_maintenance"). Only ONE
+#    enqueue call site in the whole repo (scripts/hermes_fixers.py, called
+#    only from this Hermes task); enqueue_goal's partial unique index makes
+#    a duplicate-while-open enqueue a DO NOTHING (returns None), so even
+#    two grid-hermes processes racing cannot double-queue. The queued goal
+#    is claimed by whichever scripts/goal_worker.py process next polls a
+#    cpu-tier goal (no server_setup/*.service found for goal_worker.py in
+#    this repo snapshot — documented as unverified rather than guessed) and
+#    runs a read-only inventory report + conditional operator_issues
+#    insert — no write to any DAILY_INTEL-owned table. ALLOW.
+#
+#  flow_materialize — ingestion/flow_materializer.py::sync_all. Confirmed
+#    by grep: NOT called from ingestion/scheduler.py (grid-scheduler.service)
+#    or ingestion/smart_scheduler.py — smart_scheduler.py's "etf_flows"
+#    registry entry is ingestion.altdata.institutional_flows.
+#    InstitutionalFlowsPuller.pull_all, a DIFFERENT function writing only
+#    signal_sources, never the 5 tables sync_all's sub-materializers write.
+#    No other caller found outside tests/. Sole automated writer:
+#    grid-hermes, daily. Each sub-materializer reads the most recent
+#    5,000-50,000 signal_sources rows (ORDER BY ... DESC LIMIT N — a
+#    row-count window, not a calendar one) and upserts on a key derived
+#    from the source event's own date, so a late/abandoned run's write is
+#    corrected by the next successful grid-hermes run for as long as that
+#    event stays inside the LIMIT-N slice (true across many consecutive
+#    daily runs at observed volumes; not a proven full-history guarantee).
+#    ALLOW.
+#
+#  icij_linking — intelligence/icij_linker.py::link_actors, sole caller
+#    found. INSERT INTO icij_actor_matches ... ON CONFLICT DO NOTHING — the
+#    first successful write for a key wins; later runs never overwrite it.
+#    Safe specifically because the computed value (a fuzzy-match score
+#    between an actor name and a largely-static ICIJ offshore-entity name)
+#    is a pure function of two static text columns, not of when it ran —
+#    there is no "fresher" value a later run could be blocked from
+#    writing. Residual: each run only scans a 1,000-actor/500-match subset,
+#    so full-universe coverage is gradual — a coverage gap, not a
+#    staleness/overwrite risk. ALLOW.
+#
+#  attention_anomaly — intelligence/attention_anomaly.py::get_alerts. Two
+#    invocation paths found: this Hermes task (daily) AND
+#    api/routers/intelligence_actors.py (grid-api, on-demand per HTTP
+#    request) — a genuine second PROCESS, but both paths are read-only
+#    (get_alerts -> score_attention is a SELECT; no INSERT/UPDATE/DELETE
+#    anywhere in the call chain), so there is nothing to race. ALLOW.
+#
+#  corporate_actions — ingestion/altdata/corporate_actions_parser.py::
+#    CorporateActionsParser.pull(days_back=30). Writes capital_flows keyed
+#    on (actor_id, fiscal_period, period_type='announcement', flow_type,
+#    counterparty_id, source_filing) where source_filing embeds the
+#    immutable 8-K accession number — the key is fixed by the filing's own
+#    identity, not by when it's parsed. Incremental: only the trailing 30
+#    days of 8-Ks are in this Hermes task's scope each run, so a filing
+#    drops out of ITS reprocessing window ~30 days after filing. Other
+#    invocation paths: scripts/run_corporate_actions.py (manual CLI,
+#    default days_back=1500) and scripts/backfill_announcement_
+#    counterparties.py (manual, NULL-counterparty-only backfill) — neither
+#    has a server_setup/*.service, *.timer, or .github/*.yml trigger
+#    anywhere in the repo; both are human-run only. Because source_filing
+#    is keyed off the immutable accession and the regex extraction is a
+#    pure function of that filing's static text, ANY writer that
+#    reprocesses the SAME filing computes the SAME value, so the rare
+#    manual-script overlap is convergent, not a staleness risk. Bound:
+#    <= next successful grid-hermes run while the filing is <30 days old.
+#    Residual (same-writer, not cross-process): a filing whose ONLY
+#    successful write happened during an abandoned run near that 30-day
+#    boundary, with no manual script reprocessing it in time, keeps that
+#    value indefinitely once >30 days old. Recorded here rather than
+#    smoothed over; does not change the ALLOW verdict since it requires a
+#    same-writer near-boundary failure, not an uncoordinated race.
+#
+#  capital_flow_rollups — intelligence/company_financial_rollups.py::
+#    run_all (compute_ttm + fold_announcements). Both are FULL RECOMPUTES:
+#    compute_ttm scans ALL period_type='quarter' capital_flows rows (no
+#    date filter) and fold_announcements scans ALL period_type=
+#    'announcement' rows (no date filter) every run, upserting the
+#    complete ttm/announcement_rolled key sets from current state. Sole
+#    automated writer: grid-hermes, daily; scripts/run_capital_flow_
+#    rollups.py is a manual CLI wrapper around the same run_all, not
+#    scheduled anywhere. Full recompute means the next successful run of
+#    run_all (by any writer) rewrites every key it owns, so a stale value
+#    cannot outlive that next run. ALLOW.
+#
+#  fundamental_divergence — intelligence/fundamental_divergence.py::
+#    snapshot_all. FULL RECOMPUTE: _load_universe() has no date/limit
+#    filter — every eligible ticker is rescored and upserted on
+#    (ticker, as_of=today) every run. Sole automated writer: grid-hermes,
+#    daily; scripts/run_fundamental_divergence.py is a manual CLI wrapper,
+#    not scheduled. Bound: <= next successful run today (same as_of key).
+#    ALLOW.
+#
+#  holder_deal_overlap — intelligence/holder_deal_overlap.py::run.
+#    FULL RECOMPUTE — find_deals() returns "every acquisition announcement
+#    with a non-null target" (no date filter); run()'s own docstring calls
+#    itself a "Full detection pass". Sole automated writer: grid-hermes,
+#    daily; scripts/run_holder_deal_overlap.py is a manual CLI wrapper, not
+#    scheduled. ALLOW.
+#
+# Process/cadence registry checked directly, not inferred: every
+# server_setup/*.service and *.timer file in this repo; ingestion/
+# scheduler.py (grid-scheduler.service) and ingestion/smart_scheduler.py;
+# intelligence/scheduler.py (grid-intelligence.service — a genuine
+# 15min/1h/4h/daily/weekly `schedule` loop confirmed running in its OWN
+# always-on process, but its capital-flow task
+# (analysis/capital_flows.py::CapitalFlowResearchEngine.run_research)
+# writes capital_flow_snapshots keyed on snapshot_date, a table disjoint
+# from capital_flows — no key overlap with corporate_actions/
+# capital_flow_rollups); api/main.py's deferred-startup warmers
+# (oracle_models migration, spider graph cache, dashboard cache,
+# sector-flow cache — none touch a DAILY_INTEL-owned table); and
+# scripts/goal_worker.py's HANDLERS dict (only hermes_storage_maintenance
+# overlaps, covered above). No task in this allow-list has an undiscovered
+# SCHEDULED second writer; the manual-script paths found for
+# corporate_actions/capital_flow_rollups/fundamental_divergence/
+# holder_deal_overlap are ad hoc (no cron/systemd/CI trigger anywhere in
+# the repo) and, per the per-task notes above, converge to the same value
+# as grid-hermes regardless of run order — so they do not change any
+# verdict above.
+
+
 # ─── No-overlap guard + late-publish fencing for daily-intel tasks ───────
 #     (fable-daily-intel-resumable review amendment, 2026-09-20)
 #
@@ -1861,6 +1999,37 @@ DAILY_INTEL_HOLD_REASONS: dict[str, str] = {
 _DAILY_INTEL_LOCK = threading.RLock()
 _DAILY_INTEL_IN_FLIGHT: dict[str, dict[str, Any]] = {}
 _daily_intel_token_seq = 0
+
+# SCOPE, stated precisely (release-controller rejection response,
+# 2026-09-20 amendment 2 — do not soften this): _DAILY_INTEL_IN_FLIGHT
+# coordinates ONLY tasks of the SAME name, within THIS grid-hermes
+# process, while the worker thread is alive per threading.enumerate().
+# It does NOT coordinate, and has no visibility into:
+#   - grid-scheduler (ingestion/scheduler.py) or ingestion/smart_scheduler.py
+#   - grid-api (deferred-startup warmers in api/main.py, or any request
+#     handler in api/routers/*)
+#   - grid-intelligence (intelligence/scheduler.py::run_intelligence_loop,
+#     a separate always-on systemd process with its own 15min/1h/4h/daily/
+#     weekly `schedule` timers)
+#   - scripts/goal_worker.py (the process that claims a queued
+#     hermes_storage_maintenance goal — a completely separate execution,
+#     tracked by goal_queue/goal_results, not this dict)
+#   - any manual script run by a human (e.g. scripts/run_corporate_actions.py,
+#     scripts/run_capital_flow_rollups.py, scripts/run_fundamental_divergence.py,
+#     scripts/run_holder_deal_overlap.py)
+#   - a PREVIOUS grid-hermes process — this is a plain in-memory dict, so
+#     it (and every in-flight entry in it) is gone the instant this
+#     process restarts, along with the orphan thread it was tracking.
+# Every one of the 8 allow-listed tasks' underlying functions was grepped
+# against all of the above (server_setup/*.service, *.timer,
+# ingestion/scheduler.py, ingestion/smart_scheduler.py, api/, scripts/,
+# .github/*.yml) to confirm what, if anything, actually calls it from
+# outside this registry's scope — see the "Overlapping-writer analysis"
+# comment block above DAILY_INTEL_INITIAL_ALLOWLIST and the reconciled
+# table in docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md.
+# A held task graduating into the allow-list later must redo this same
+# check for whatever tables IT writes — this registry will not catch a
+# second writer for it either.
 
 
 def _next_daily_intel_token() -> int:

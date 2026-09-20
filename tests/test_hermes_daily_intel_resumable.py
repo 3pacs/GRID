@@ -442,13 +442,19 @@ class TestDailyIntelAllowlistClassification:
 
     def test_expected_allow_set(self) -> None:
         # Pins the exact controller-narrowed allow-list (2026-09-20, see
-        # docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md):
-        # the eight non-cleanup tasks whose late-write analysis came back
-        # `safe` (sole writer, deterministic recompute from current
-        # inputs, idempotent DO UPDATE/DO NOTHING). source_audit and
-        # rag_index are held for the initial subset (non-idempotent audit
-        # appends / delete-then-rebuild); the three cleanups are held
-        # pending a separate deletion/truncation policy review.
+        # docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md
+        # — "Release-controller rejection response" section for the
+        # reconciled per-task invocation-path/write-key/bound analysis,
+        # amendment 2): the eight non-cleanup tasks whose overlapping-
+        # writer risk is resolved per task — read-only, DO NOTHING, or a
+        # full-recompute writer with a stale-write bound derived from
+        # code (not asserted from "deterministic computation" or "sole
+        # writer" alone; every underlying function was grepped against
+        # every other process's call sites, not just the table name).
+        # source_audit and rag_index are held for the initial subset
+        # (non-idempotent audit appends / delete-then-rebuild); the three
+        # cleanups are held pending a separate deletion/truncation policy
+        # review.
         expected_allow = {
             "storage_maintenance_subagent", "flow_materialize",
             "icij_linking", "attention_anomaly",
