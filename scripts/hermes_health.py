@@ -349,6 +349,36 @@ class OperatorState:
         self.last_earnings_calendar_sync: datetime | None = None  # earnings_events → earnings_calendar back-compat sync (30 min)
         self.last_resolution: datetime | None = None  # raw_series → resolved_series watermark (start time of the last clean resolver run)
 
+        # Bounded-repair backlog (fable-hermes-repair-bound, 2026-09-19):
+        # source_key (lowercased source_catalog name) -> list of tickers/ids
+        # not yet attempted, left over when a repair pull in
+        # scripts/hermes_fixers.py::_retry_source stops early because
+        # REPAIR_BUDGET_SECONDS ran out. Persisted so the NEXT repair
+        # attempt for that source resumes from the remainder instead of
+        # restarting from the first ticker every cycle. Cleared once a
+        # repair for that source completes without being stopped by budget.
+        self.repair_backlog: dict[str, list[str]] = {}
+
+        # Freshness-semantics fix (fable-hermes-repair-bound follow-up,
+        # 2026-09-19 review): source_key -> the single most recent bounded-
+        # repair check summary for that source (see _retry_source in
+        # scripts/hermes_fixers.py). Bounded to the LAST summary only — this
+        # is a status snapshot, not a history log. Persisted so a checked-
+        # but-not-fully-current source's most recent check is visible after
+        # a restart, not just in that cycle's log line.
+        self.repair_last_check: dict[str, dict[str, Any]] = {}
+
+        # source_key -> the most recent record of repair coverage that did
+        # NOT reach every ticker (attempt cap hit, or per-ticker no_data/
+        # error outcomes). This is the compensating signal for Check 1b:
+        # source_catalog.last_pull_at (and repair_last_check above) can look
+        # "checked" while some tickers are still outside the repair window's
+        # reach — this field is what tells a human or the diagnostics LLM
+        # that a separately authorised backfill, not another REPULL, is
+        # what would actually close the gap. Bounded to the last record per
+        # source, persisted the same way as repair_backlog/repair_last_check.
+        self.repair_uncovered: dict[str, dict[str, Any]] = {}
+
         # Hermes status log: task_name -> {last_run, success, duration_s, error}
         self.task_status: dict[str, dict[str, Any]] = {}
 
@@ -420,6 +450,9 @@ class OperatorState:
             "last_resolution": self.last_resolution.isoformat() if self.last_resolution else None,
             "last_options_scoring": self.last_options_scoring.isoformat() if self.last_options_scoring else None,
             "task_status": self.task_status,
+            "repair_backlog": self.repair_backlog,
+            "repair_last_check": self.repair_last_check,
+            "repair_uncovered": self.repair_uncovered,
         }
 
     def hydrate_from_snapshot(self, engine: Any) -> bool:
@@ -486,6 +519,27 @@ class OperatorState:
         ts = op_state.get("task_status")
         if isinstance(ts, dict) and not self.task_status:
             self.task_status = ts
+
+        backlog = op_state.get("repair_backlog")
+        if isinstance(backlog, dict) and not self.repair_backlog:
+            self.repair_backlog = {
+                str(k): list(v) for k, v in backlog.items() if isinstance(v, list)
+            }
+            hydrated_any = hydrated_any or bool(self.repair_backlog)
+
+        last_check = op_state.get("repair_last_check")
+        if isinstance(last_check, dict) and not self.repair_last_check:
+            self.repair_last_check = {
+                str(k): v for k, v in last_check.items() if isinstance(v, dict)
+            }
+            hydrated_any = hydrated_any or bool(self.repair_last_check)
+
+        uncovered = op_state.get("repair_uncovered")
+        if isinstance(uncovered, dict) and not self.repair_uncovered:
+            self.repair_uncovered = {
+                str(k): v for k, v in uncovered.items() if isinstance(v, dict)
+            }
+            hydrated_any = hydrated_any or bool(self.repair_uncovered)
 
         # Plain string fields (not timestamps, not counters) — restore
         # verbatim, same "only if currently unset" rule as the datetime

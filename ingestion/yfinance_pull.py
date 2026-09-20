@@ -7,10 +7,11 @@ and stores each field as a separate entry in ``raw_series``.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import re
 from datetime import date
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 import yfinance as yf
@@ -24,6 +25,24 @@ from ingestion.base import BasePuller
 # already downgrades those outcomes to PARTIAL/SKIPPED, so keep the third-party
 # logger from polluting production error scans.
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
+# fable-hermes-repair-bound follow-up (2026-09-19), review Check 2a: one
+# yf.download() call cannot be interrupted by should_continue — that is only
+# polled between tickers (see pull_all below). If the installed yfinance
+# version's yf.download() accepts a `timeout` kwarg, pull_ticker passes a
+# bounded one (_YF_DOWNLOAD_TIMEOUT_SECONDS) so a single hung HTTP call can't
+# run indefinitely. Checked via inspect.signature (not a version-string
+# comparison) so this stays correct across yfinance upgrades. requirements.txt
+# pins yfinance>=1.5.1; the environment this was verified against has 1.7.0,
+# whose yf.download() already accepts and defaults `timeout=10` — this module
+# passes an explicit, slightly larger bound instead of relying on that
+# upstream default, so the behavior doesn't silently change if yfinance drops
+# or alters its own default in a future version.
+try:
+    _YF_DOWNLOAD_ACCEPTS_TIMEOUT = "timeout" in inspect.signature(yf.download).parameters
+except (TypeError, ValueError):
+    _YF_DOWNLOAD_ACCEPTS_TIMEOUT = False
+_YF_DOWNLOAD_TIMEOUT_SECONDS = 30
 
 # Default tickers to pull
 YF_TICKER_LIST: list[str] = [
@@ -130,7 +149,17 @@ class YFinancePuller(BasePuller):
             interval: Data frequency ('1d', '1wk', '1mo').
 
         Returns:
-            dict: Result with keys ``ticker``, ``rows_inserted``, ``status``, ``errors``.
+            dict: Result with keys ``ticker``, ``rows_inserted``, ``status``,
+            ``errors``, and ``outcome``. ``outcome`` is the per-ticker
+            classification consumed by the repair-summary logging in
+            scripts/hermes_fixers.py::_retry_source — one of ``"inserted"``
+            (rows_inserted > 0), ``"duplicate_only"`` (a non-empty download
+            that inserted 0 rows — every date it returned was already
+            present), ``"no_data"`` (the provider returned nothing for the
+            requested window), or ``"error"`` (invalid ticker or an
+            exception). A "checked" outcome (any of these four) is NOT a
+            claim that this ticker's data is current through today — see
+            pull_all's docstring.
         """
         yf_ticker = _normalize_yahoo_ticker(ticker)
         result: dict[str, Any] = {
@@ -138,9 +167,11 @@ class YFinancePuller(BasePuller):
             "rows_inserted": 0,
             "status": "SUCCESS",
             "errors": [],
+            "outcome": "inserted",
         }
         if yf_ticker is None:
             result["status"] = "SKIPPED"
+            result["outcome"] = "error"
             result["errors"].append("Invalid Yahoo ticker")
             log.warning("yfinance {t}: invalid ticker; skipping", t=ticker)
             return result
@@ -148,13 +179,19 @@ class YFinancePuller(BasePuller):
         log.info("Pulling yfinance ticker {t} from {sd}", t=yf_ticker, sd=start_date)
 
         try:
+            download_kwargs: dict[str, Any] = {
+                "start": str(start_date),
+                "end": str(end_date) if end_date else None,
+                "interval": interval,
+                "progress": False,
+            }
+            if _YF_DOWNLOAD_ACCEPTS_TIMEOUT:
+                download_kwargs["timeout"] = _YF_DOWNLOAD_TIMEOUT_SECONDS
+            # auto_adjust is passed literally at the call site (not via the
+            # kwargs dict) so tests/test_yfinance_auto_adjust_explicit.py can
+            # verify the basis statically.
             df: pd.DataFrame = yf.download(
-                yf_ticker,
-                start=str(start_date),
-                end=str(end_date) if end_date else None,
-                interval=interval,
-                progress=False,
-                auto_adjust=False,
+                yf_ticker, auto_adjust=False, **download_kwargs
             )
 
             # yfinance >=0.2.31 returns MultiIndex columns (field, ticker)
@@ -175,6 +212,7 @@ class YFinancePuller(BasePuller):
             if df is None or df.empty:
                 log.warning("yfinance returned no data for {t}", t=yf_ticker)
                 result["status"] = "PARTIAL"
+                result["outcome"] = "no_data"
                 result["errors"].append("No data returned")
                 return result
 
@@ -284,7 +322,17 @@ class YFinancePuller(BasePuller):
                         inserted += 1
 
             result["rows_inserted"] = inserted
-            log.info("yfinance {t}: inserted {n} rows", t=yf_ticker, n=inserted)
+            # "duplicate-only" is established per logged ticker here: a
+            # non-empty download whose every date was already present
+            # (inserted == 0) is a successful CHECK of that ticker, not
+            # evidence its data is stale — but it is also not evidence any
+            # OTHER ticker is current. Do not generalise this per-ticker
+            # result into a source- or asset-class-wide freshness claim.
+            result["outcome"] = "inserted" if inserted > 0 else "duplicate_only"
+            log.info(
+                "yfinance {t}: checked — inserted {n} rows ({o})",
+                t=yf_ticker, n=inserted, o=result["outcome"],
+            )
 
         except Exception as exc:
             log.warning(
@@ -293,6 +341,7 @@ class YFinancePuller(BasePuller):
                 err=str(exc),
             )
             result["status"] = "SKIPPED"
+            result["outcome"] = "error"
             result["errors"].append(str(exc))
 
         return result
@@ -301,38 +350,110 @@ class YFinancePuller(BasePuller):
         self,
         ticker_list: list[str] | None = None,
         start_date: str | date = "1990-01-01",
-    ) -> list[dict[str, Any]]:
+        should_continue: Callable[[], bool] | None = None,
+    ) -> list[dict[str, Any]] | dict[str, Any]:
         """Pull multiple tickers sequentially.
 
         Never stops on a single-ticker failure — logs and continues.
 
+        IMPORTANT — freshness semantics: a "checked" ticker (any of the four
+        outcomes below) means this call attempted the pull and got an
+        answer from the provider. It does NOT mean the ticker's data is
+        current through today, and it does NOT mean any OTHER ticker in
+        ``ticker_list`` is current — each ticker's outcome only describes
+        that ticker. Callers that advance ``source_catalog.last_pull_at``
+        (scripts/hermes_fixers.py::_retry_source, ingestion/scheduler.py)
+        are recording "this source was checked at this time", never "every
+        symbol of this source is current" — see those callers' own
+        docstrings/comments.
+
         Parameters:
             ticker_list: List of Yahoo Finance ticker symbols.
                          Defaults to YF_TICKER_LIST.
-            start_date: Earliest observation date.
+            start_date: Earliest observation date. Callers doing a bounded
+                        repair (scripts/hermes_fixers.py::_retry_source)
+                        always pass a recent date here — this method's own
+                        default ("1990-01-01") is for deliberate, explicitly
+                        authorised full-history backfills only (see
+                        REPAIR_LOOKBACK_DAYS in hermes_fixers.py).
+            should_continue: Optional cooperative-budget check, polled
+                        between tickers. When it returns False, the pull
+                        stops before the next ticker and this method
+                        returns a dict (not the usual list) describing a
+                        partial run — see Returns below. Ordinary callers
+                        that never pass this keep getting the plain
+                        list[dict] they always got. Note this is only
+                        checked BETWEEN tickers — one in-flight provider download
+                        call cannot itself be interrupted this way; see
+                        pull_ticker's own timeout handling and
+                        _run_with_timeout in scripts/hermes_operator.py for
+                        the outer bound on that case.
 
         Returns:
-            list[dict]: One result dict per ticker.
+            - should_continue is None (default, all existing callers):
+              list[dict], one result dict per ticker, unchanged (each dict
+              now also carries an "outcome" key — see pull_ticker).
+            - should_continue is given and the budget ran out before every
+              ticker was attempted: a dict — {"status": "PARTIAL",
+              "stopped_by_budget": True, "results": [...per-ticker results
+              attempted so far...], "tickers_not_attempted": [...],
+              "counts": {"inserted": int, "duplicate_only": int,
+              "no_data": int, "error": int, "unattempted": int}}.
+              "unattempted" counts tickers never reached because the budget
+              ran out — those are NOT checked, and must not be treated as
+              "ok" by anything reading this result.
+            - should_continue is given and every ticker was attempted: the
+              same dict shape with "status": "SUCCESS",
+              "stopped_by_budget": False, "tickers_not_attempted": [],
+              "counts": {..., "unattempted": 0}.
         """
         if ticker_list is None:
             ticker_list = YF_TICKER_LIST
 
         log.info(
-            "Starting yfinance bulk pull — {n} tickers from {sd}",
+            "Starting yfinance bulk pull — checking {n} tickers from {sd}",
             n=len(ticker_list),
             sd=start_date,
         )
         results: list[dict[str, Any]] = []
-        for ticker in ticker_list:
+        stopped_by_budget = False
+        for idx, ticker in enumerate(ticker_list):
+            if should_continue is not None and not should_continue():
+                log.warning(
+                    "yfinance bulk pull: budget exhausted after {n}/{total} "
+                    "tickers — stopping",
+                    n=idx, total=len(ticker_list),
+                )
+                stopped_by_budget = True
+                break
             res = self.pull_ticker(ticker, start_date)
             results.append(res)
 
         log.info(
-            "yfinance bulk pull complete — {ok}/{total} succeeded",
+            "yfinance bulk pull complete — {ok}/{total} checked successfully",
             ok=sum(1 for r in results if r["status"] == "SUCCESS"),
             total=len(results),
         )
-        return results
+
+        if should_continue is None:
+            return results
+
+        not_attempted = ticker_list[len(results):]
+        counts = {"inserted": 0, "duplicate_only": 0, "no_data": 0, "error": 0, "unattempted": 0}
+        for r in results:
+            outcome = r.get("outcome")
+            if outcome in counts:
+                counts[outcome] += 1
+            else:
+                counts["error"] += 1
+        counts["unattempted"] = len(not_attempted)
+        return {
+            "status": "PARTIAL" if stopped_by_budget else "SUCCESS",
+            "stopped_by_budget": stopped_by_budget,
+            "results": results,
+            "tickers_not_attempted": not_attempted,
+            "counts": counts,
+        }
 
 
 if __name__ == "__main__":
