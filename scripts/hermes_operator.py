@@ -1285,7 +1285,42 @@ def _daily_intel_storage_maintenance(
     engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
 ) -> None:
     """Queue the bounded storage-maintenance subagent. Dispatch only — no
-    LLM call in this step itself (see DAILY_INTEL_DISPATCH_TASK_BUDGET_S)."""
+    LLM call in this step itself (see DAILY_INTEL_DISPATCH_TASK_BUDGET_S).
+
+    Done-vs-done_queued (fable-hermes-daily-intel-resumable review, part C,
+    2026-09-20): this step's own work is fully synchronous and finished the
+    moment ``_dispatch_daily_storage_maintenance`` returns — it INSERTs one
+    ``goal_queue`` row (``enqueue_goal``, dedup-checked, goal_type
+    ``hermes_storage_maintenance``; see ``_dispatch_subagent`` in
+    scripts/hermes_fixers.py) and nothing else. That is why
+    ``_run_daily_intel_block`` marks this task's own outcome
+    "done_queued" rather than "done" on success (see
+    ``DailyIntelTask.reports_done_queued`` below) — this step is DONE the
+    instant the goal is queued; the queued goal's own execution is a
+    SEPARATE, asynchronous unit of work tracked by ``goal_queue``/
+    ``goal_results`` (intelligence/goal_queue.py), not by this ledger.
+    Neither this ledger nor ``_run_daily_intel_block`` ever learns whether
+    the queued ``hermes_storage_maintenance`` goal later succeeds, fails,
+    or sits unclaimed.
+
+    Held-category reachability (same review, part C): the queued goal is
+    claimed by whichever ``scripts/goal_worker.py`` node next polls for a
+    ``cpu``-tier goal and executes
+    ``handle_hermes_storage_maintenance`` -> ``_inspect_storage_maintenance``
+    (scripts/hermes_fixers.py) -> ``storage_curator.run_storage_maintenance``
+    (scripts/storage_curator.py). Read end to end: that call chain only
+    builds a read-only filesystem/DB inventory report
+    (``build_storage_maintenance_report``, a plain ``engine.connect()``
+    SELECT — no INSERT/UPDATE/DELETE), writes it to
+    ``outputs/storage_maintenance/*.json``/``*.md`` on disk, and — only
+    when the report's status is not "ok" — INSERTs one row into
+    ``operator_issues`` via ``log_issue`` (scripts/hermes_health.py). No
+    call anywhere in that chain reaches ``hypothesis_registry``,
+    ``discovered_hypotheses``, ``scanner_weights``, ``trade_postmortems``,
+    or any other scoring/learning/backfill/model-registry table — i.e. the
+    HELD categories this allow-list withholds. The dispatched child work
+    cannot be used to bypass a hold.
+    """
     results["storage_maintenance_subagent"] = _dispatch_daily_storage_maintenance(engine, state)
 
 
@@ -1587,6 +1622,14 @@ class DailyIntelTask(NamedTuple):
     name: str
     fn: Callable[[Any, OperatorState, datetime, dict[str, Any]], Any]
     budget_s: int
+    # True only for a task whose own step is DONE once it enqueues a
+    # goal_queue row, before the enqueued work executes (currently only
+    # storage_maintenance_subagent — see its docstring above). Makes
+    # _run_daily_intel_block record daily_intel_task_outcome[name] =
+    # "done_queued" instead of "done" on success, so the ledger cannot be
+    # misread as "the dispatched subagent finished" — see part C of
+    # docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md.
+    reports_done_queued: bool = False
 
 
 # Ordered exactly as the pre-existing inline block ran them. Do not
@@ -1595,7 +1638,7 @@ class DailyIntelTask(NamedTuple):
 # above — they assume the tasks before them in this tuple already ran
 # this period.
 DAILY_INTEL_TASKS: tuple[DailyIntelTask, ...] = (
-    DailyIntelTask("storage_maintenance_subagent", _daily_intel_storage_maintenance, DAILY_INTEL_DISPATCH_TASK_BUDGET_S),
+    DailyIntelTask("storage_maintenance_subagent", _daily_intel_storage_maintenance, DAILY_INTEL_DISPATCH_TASK_BUDGET_S, reports_done_queued=True),
     DailyIntelTask("source_audit", _daily_intel_source_audit, DAILY_INTEL_LLM_TASK_BUDGET_S),
     DailyIntelTask("flow_materialize", _daily_intel_flow_materialize, DAILY_INTEL_SQL_TASK_BUDGET_S),
     DailyIntelTask("backtest_scan", _daily_intel_backtest_scan, DAILY_INTEL_LLM_TASK_BUDGET_S),
@@ -1935,14 +1978,50 @@ def _run_daily_intel_block(
     per-period skip.
 
     ``state.last_daily_intel = now`` is set ONLY when every ALLOW-LISTED
-    task is done or skipped_for_period — i.e. ``state.daily_intel_done``
-    has an entry, dated to the current period, for every name in
-    ``DAILY_INTEL_INITIAL_ALLOWLIST``. Held tasks are excluded from this
-    check entirely. ``state.daily_intel_period_outcome`` is set in the
-    same branch: ``"complete"`` if no allow-listed task needed
-    ``skipped_for_period`` this period, ``"complete_with_skips"``
-    otherwise. This is what ``daily_due`` (in ``run_intelligence_tasks``)
-    reads to decide whether the whole block is due again.
+    task is done, done_queued, or skipped_for_period — i.e.
+    ``state.daily_intel_done`` has an entry, dated to the current period,
+    for every name in ``DAILY_INTEL_INITIAL_ALLOWLIST``. Held tasks are
+    excluded from this check entirely. ``state.daily_intel_period_outcome``
+    is set in the same branch to one of four values — see
+    ``OperatorState.daily_intel_period_outcome``'s docstring
+    (scripts/hermes_health.py) for the full matrix; in short, it is always
+    one of the two ``"..._for_enabled_tasks[_with_skips]"`` values while
+    any task is held (true today), and only the bare
+    ``"complete"``/``"complete_with_skips"`` once none are. This is what
+    ``daily_due`` (in ``run_intelligence_tasks``) reads to decide whether
+    the whole block is due again.
+
+    Abandonment truth (fable-hermes-daily-intel-resumable review, part B,
+    2026-09-20) — read this before assuming a timeout means a task's work
+    did not happen. The attempt-token check above runs AFTER
+    ``task.fn(...)`` has already returned (or, for an abandoned worker,
+    whenever it eventually does) — it decides only whether THIS ledger
+    publishes that return, not whether the call happened. Concretely: on a
+    timeout, ``_run_with_timeout`` abandons the worker thread rather than
+    killing it (Python's ``concurrent.futures`` has no API to kill a
+    running thread — see ``_run_with_timeout``'s own docstring), so
+    ``task.fn`` keeps executing to completion in that orphaned thread and
+    performs EVERY ONE of its underlying effects exactly as if it had
+    finished on time: its DB writes (INSERT/UPDATE/UPSERT), its file
+    writes/deletions, its enqueued goal_queue row (storage_maintenance_
+    subagent only), all happen. What is prevented is narrower: (1) this
+    ledger's ``daily_intel_done``/``daily_intel_task_outcome`` update for
+    that attempt (the token check discards the orphan's local ``results``
+    and skips the ledger write — see the late-publish guard above), and
+    (2) a concurrent retry of the SAME task colliding with the still-
+    running orphan (the in-flight registry above). Neither of those is the
+    task's own work being prevented — none of the 13 allow-listed tasks'
+    ``fn`` accepts a ``should_continue``/cooperative-cancellation
+    parameter (checked: every ``DailyIntelTask.fn`` signature is
+    ``fn(engine, state, now, results)``), so there is no cooperative exit
+    point an abandoned run could even observe. See the per-task "effects
+    an abandoned run can still perform" column in
+    docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md (answer,
+    for every one of the 13: all of its DB writes / dispatched child work
+    / external calls / file writes — the same effects it would have
+    performed on a timely return) and
+    ``tests/test_hermes_daily_intel_resumable.py::
+    TestAbandonmentDoesNotPreventTaskEffects``.
     """
     period_iso = _period_boundary(now, DAILY_INTEL_BOUNDARY_HOUR).date().isoformat()
 
@@ -2054,7 +2133,9 @@ def _run_daily_intel_block(
             if ok and current:
                 results.update(local_results)
                 state.daily_intel_done[task.name] = period_iso
-                state.daily_intel_task_outcome[task.name] = "done"
+                state.daily_intel_task_outcome[task.name] = (
+                    "done_queued" if task.reports_done_queued else "done"
+                )
             elif not ok:
                 attempts = state.daily_intel_attempts.get(task.name, 0) + 1
                 state.daily_intel_attempts[task.name] = attempts
@@ -2084,9 +2165,25 @@ def _run_daily_intel_block(
         any_skipped_this_period = any(
             v == period_iso for v in state.daily_intel_skipped_for_period.values()
         )
-        state.daily_intel_period_outcome = (
-            "complete_with_skips" if any_skipped_this_period else "complete"
-        )
+        # "_for_enabled_tasks" wording (fable-hermes-daily-intel-resumable
+        # review, part E, 2026-09-20): the bare "complete"/"complete_with_
+        # skips" values are reserved for the case where every
+        # DAILY_INTEL_TASKS entry is allow-listed (no held tasks at all).
+        # As long as any task is held — true today (13 of 21 allow-listed)
+        # — "complete" must never be reported on its own, since that could
+        # be misread as "the whole daily-intel batch ran." See
+        # OperatorState.daily_intel_period_outcome's docstring
+        # (scripts/hermes_health.py) for the full four-value matrix.
+        all_tasks_enabled = len(DAILY_INTEL_INITIAL_ALLOWLIST) == len(DAILY_INTEL_TASKS)
+        if all_tasks_enabled:
+            state.daily_intel_period_outcome = (
+                "complete_with_skips" if any_skipped_this_period else "complete"
+            )
+        else:
+            state.daily_intel_period_outcome = (
+                "complete_for_enabled_tasks_with_skips" if any_skipped_this_period
+                else "complete_for_enabled_tasks"
+            )
 
     log.info(
         "daily_intel: period={p} done={d}/{t} ran={r} skipped_for_period={s} "
@@ -2094,6 +2191,41 @@ def _run_daily_intel_block(
         p=period_iso, d=done_count, t=total, r=ran, s=skipped_for_period,
         h=held, f=in_flight_skipped, rem=remaining, b=budget_used,
     )
+
+    if total and done_count == total:
+        # Completion-only summary, in the exact wording the release
+        # controller asked for (part E): done vs done_queued vs
+        # skipped_for_period are kept as SEPARATE counts (not folded
+        # together) so a reader can tell "ran to completion in this step"
+        # (done) apart from "only enqueued a subagent whose own completion
+        # this ledger does not track" (done_queued) — see
+        # DailyIntelTask.reports_done_queued and part C of
+        # docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md.
+        # held is reported separately from skipped_for_period too: a held
+        # task was never attempted at all (standing controller hold),
+        # while skipped_for_period means it WAS attempted DAILY_INTEL_MAX_
+        # ATTEMPTS times and gave up — very different operational meanings
+        # that must not be merged into one count. Emitted AFTER the
+        # per-cycle progress line above (not instead of it) so existing
+        # per-cycle log consumers/tests are unaffected.
+        done_only = sum(
+            1 for t in enabled_tasks
+            if state.daily_intel_task_outcome.get(t.name) == "done"
+        )
+        done_queued = sum(
+            1 for t in enabled_tasks
+            if state.daily_intel_task_outcome.get(t.name) == "done_queued"
+        )
+        skipped_count = sum(
+            1 for t in enabled_tasks
+            if state.daily_intel_task_outcome.get(t.name) == "skipped_for_period"
+        )
+        log.info(
+            "daily_intel: period={p} {outcome} enabled={n} done={d} "
+            "done_queued={dq} skipped_for_period={s} held={h}",
+            p=period_iso, outcome=state.daily_intel_period_outcome, n=total,
+            d=done_only, dq=done_queued, s=skipped_count, h=len(held),
+        )
 
 
 def run_intelligence_tasks(

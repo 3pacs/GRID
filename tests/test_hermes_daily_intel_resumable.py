@@ -49,8 +49,10 @@ def _clear_daily_intel_in_flight_registry():
     ho._DAILY_INTEL_IN_FLIGHT.clear()
 
 
-def _task(name: str, fn, budget_s: float = 5.0) -> ho.DailyIntelTask:
-    return ho.DailyIntelTask(name, fn, budget_s)
+def _task(
+    name: str, fn, budget_s: float = 5.0, *, reports_done_queued: bool = False,
+) -> ho.DailyIntelTask:
+    return ho.DailyIntelTask(name, fn, budget_s, reports_done_queued=reports_done_queued)
 
 
 def _allow_all(monkeypatch, tasks: tuple[ho.DailyIntelTask, ...]) -> None:
@@ -483,7 +485,10 @@ class TestHeldTasksNeverRun:
         # task must not block it, and must not appear in "remaining" logic
         # either (it can never make done_count < total).
         assert state.last_daily_intel == NOW
-        assert state.daily_intel_period_outcome == "complete"
+        # part E (2026-09-20): "complete" alone is reserved for zero held
+        # tasks. A held task is present here, so the outcome must be the
+        # "_for_enabled_tasks" variant even though nothing was skipped.
+        assert state.daily_intel_period_outcome == "complete_for_enabled_tasks"
 
     def test_summary_line_lists_held_tasks_explicitly(self, monkeypatch) -> None:
         calls: list[str] = []
@@ -694,3 +699,190 @@ class TestOutcomeSemantics:
         assert state.daily_intel_task_outcome.get("held_one") == "held"
         assert state.daily_intel_done.get("held_one") is None
         assert state.daily_intel_skipped_for_period.get("held_one") is None
+
+
+# ─── done_queued outcome (deliverable C) ─────────────────────────────────
+
+
+class TestDoneQueuedOutcome:
+    def test_reports_done_queued_task_gets_done_queued_not_done(
+        self, monkeypatch
+    ) -> None:
+        calls: list[str] = []
+        queued = _task(
+            "storage_maintenance_subagent",
+            _recording_fn("storage_maintenance_subagent", calls),
+            reports_done_queued=True,
+        )
+        plain = _task("plain", _recording_fn("plain", calls))
+        tasks = (queued, plain)
+        monkeypatch.setattr(ho, "DAILY_INTEL_TASKS", tasks)
+        _allow_all(monkeypatch, tasks)
+        monkeypatch.setattr(ho, "DAILY_INTEL_CYCLE_BUDGET_SECONDS", 30)
+
+        state = OperatorState()
+        results: dict[str, Any] = {}
+        ho._run_daily_intel_block(MagicMock(), state, NOW, results)
+
+        period_iso = _period_iso(NOW)
+        # done_queued still counts as "done for the period" —
+        # daily_intel_done is unaffected by the distinction.
+        assert state.daily_intel_done.get("storage_maintenance_subagent") == period_iso
+        assert (
+            state.daily_intel_task_outcome.get("storage_maintenance_subagent")
+            == "done_queued"
+        )
+        assert state.daily_intel_task_outcome.get("plain") == "done"
+
+    def test_real_storage_maintenance_subagent_task_reports_done_queued(self) -> None:
+        # No monkeypatching — pins the REAL DAILY_INTEL_TASKS entry so an
+        # accidental revert of reports_done_queued=True fails CI.
+        entry = next(
+            t for t in ho.DAILY_INTEL_TASKS if t.name == "storage_maintenance_subagent"
+        )
+        assert entry.reports_done_queued is True
+        for t in ho.DAILY_INTEL_TASKS:
+            if t.name != "storage_maintenance_subagent":
+                assert t.reports_done_queued is False, (
+                    f"{t.name}: only storage_maintenance_subagent dispatches "
+                    "child work and finishes its OWN step before that work "
+                    "executes; every other task's own step performs its "
+                    "effects directly and should report plain 'done'"
+                )
+
+
+# ─── Period-outcome wording (deliverable E) ──────────────────────────────
+
+
+class TestPeriodOutcomeWordingWithHeldTasks:
+    def test_real_allowlist_with_8_held_reports_complete_for_enabled_tasks(
+        self, monkeypatch
+    ) -> None:
+        """Uses the REAL DAILY_INTEL_TASKS/DAILY_INTEL_INITIAL_ALLOWLIST/
+        DAILY_INTEL_HOLD_REASONS (13 allowed, 8 held) with every allow-listed
+        task's fn replaced by a no-op so no real DB/network is touched.
+        Held tasks keep their real (never-called) fn."""
+        calls: list[str] = []
+
+        def _noop(engine: Any, state: OperatorState, now: datetime, results: dict[str, Any]) -> None:
+            calls.append("ran")
+
+        patched_tasks = tuple(
+            ho.DailyIntelTask(
+                t.name,
+                _noop if t.name in ho.DAILY_INTEL_INITIAL_ALLOWLIST else t.fn,
+                t.budget_s,
+                t.reports_done_queued,
+            )
+            for t in ho.DAILY_INTEL_TASKS
+        )
+        monkeypatch.setattr(ho, "DAILY_INTEL_TASKS", patched_tasks)
+        monkeypatch.setattr(ho, "DAILY_INTEL_CYCLE_BUDGET_SECONDS", 3600)
+
+        logged: list[tuple[str, dict]] = []
+        monkeypatch.setattr(ho.log, "info", lambda msg, **kw: logged.append((msg, kw)))
+
+        state = OperatorState()
+        results: dict[str, Any] = {}
+        ho._run_daily_intel_block(MagicMock(), state, NOW, results)
+
+        assert len(calls) == len(ho.DAILY_INTEL_INITIAL_ALLOWLIST) == 13
+        assert len(ho.DAILY_INTEL_HOLD_REASONS) == 8
+        assert state.daily_intel_period_outcome == "complete_for_enabled_tasks"
+        assert state.last_daily_intel == NOW
+
+        summary = next(
+            kw for msg, kw in logged
+            if msg.startswith("daily_intel: period=") and "outcome" in kw
+        )
+        assert summary["outcome"] == "complete_for_enabled_tasks"
+        assert summary["n"] == 13
+        assert summary["d"] == 12, (
+            "12 of the 13 allow-listed tasks report plain 'done' — "
+            "storage_maintenance_subagent is the one exception (see below)"
+        )
+        assert summary["dq"] == 1, (
+            "storage_maintenance_subagent's outcome is driven by "
+            "DailyIntelTask.reports_done_queued (preserved from the real "
+            "task table even though this test replaces its fn with the "
+            "same no-op as every other allow-listed task), so it reports "
+            "'done_queued' here too — see TestDoneQueuedOutcome for the "
+            "dedicated assertion"
+        )
+        assert summary["s"] == 0, "skipped_for_period must be reported separately from held"
+        assert summary["h"] == 8, "held must be reported separately from skipped_for_period"
+
+    def test_bare_complete_only_when_zero_tasks_held(self, monkeypatch) -> None:
+        calls: list[str] = []
+        a = _task("a", _recording_fn("a", calls))
+        b = _task("b", _recording_fn("b", calls))
+        tasks = (a, b)
+        monkeypatch.setattr(ho, "DAILY_INTEL_TASKS", tasks)
+        _allow_all(monkeypatch, tasks)  # every task allowed -> zero held
+        monkeypatch.setattr(ho, "DAILY_INTEL_CYCLE_BUDGET_SECONDS", 30)
+
+        state = OperatorState()
+        results: dict[str, Any] = {}
+        ho._run_daily_intel_block(MagicMock(), state, NOW, results)
+
+        assert state.daily_intel_period_outcome == "complete", (
+            "zero held tasks is the only case where the bare 'complete' "
+            "value (no '_for_enabled_tasks' suffix) is used"
+        )
+
+
+# ─── Abandonment truth (deliverable B) ───────────────────────────────────
+
+
+class TestAbandonmentDoesNotPreventTaskEffects:
+    def test_abandoned_task_performs_its_effect_but_ledger_stays_unchanged(
+        self, monkeypatch
+    ) -> None:
+        """A task that blocks past its budget, then performs a fake write
+        AFTER _run_with_timeout has already given up on it, must still be
+        seen to have performed that write — the attempt-token check only
+        withholds the LEDGER update, it does not, and cannot, stop the
+        orphaned thread from doing its own work (see
+        _run_daily_intel_block's "Abandonment truth" docstring)."""
+        release = threading.Event()
+        fake_table: list[str] = []  # stands in for a real DB write
+        worker_finished = threading.Event()
+
+        def slow_then_writes(
+            engine: Any, state: OperatorState, now: datetime, results: dict[str, Any]
+        ) -> None:
+            release.wait(timeout=5.0)  # blocks well past its own budget
+            fake_table.append("row-written-by-abandoned-worker")
+            worker_finished.set()
+
+        tasks = (_task("slow_writer", slow_then_writes, budget_s=0.05),)
+        monkeypatch.setattr(ho, "DAILY_INTEL_TASKS", tasks)
+        _allow_all(monkeypatch, tasks)
+        monkeypatch.setattr(ho, "DAILY_INTEL_CYCLE_BUDGET_SECONDS", 30)
+
+        state = OperatorState()
+        results: dict[str, Any] = {}
+        ho._run_daily_intel_block(MagicMock(), state, NOW, results)
+
+        # _run_with_timeout already returned ok=False synchronously — the
+        # ledger has NOT recorded this task as done, and no attempt token
+        # was ever "cancelled": the worker is simply abandoned, still
+        # running, blocked on `release`.
+        assert state.daily_intel_done.get("slow_writer") is None
+        assert fake_table == [], "the write has not happened yet — worker is still blocked"
+
+        # Let the abandoned worker actually perform its write.
+        release.set()
+        assert worker_finished.wait(timeout=2.0), "abandoned worker never completed"
+
+        # The effect happened — nothing in this design prevents an
+        # abandoned task from doing its own work.
+        assert fake_table == ["row-written-by-abandoned-worker"], (
+            "an abandoned (timed-out) task's own effects are NOT prevented "
+            "— only its ledger/result publication is suppressed"
+        )
+        # ...but the ledger was never updated by that late completion —
+        # this is the part that IS prevented (late-publish guard).
+        assert state.daily_intel_done.get("slow_writer") is None
+        assert state.daily_intel_task_outcome.get("slow_writer") != "done"
+        assert "slow_writer" not in results

@@ -385,33 +385,67 @@ class OperatorState:
         # _run_daily_intel_block). Reset to {} on period rollover along with
         # daily_intel_done/daily_intel_skipped_for_period above.
         self.daily_intel_attempts: dict[str, int] = {}
-        # daily_intel_task_outcome: task name -> "done" | "skipped_for_period"
-        # | "held" | "in_flight", for the CURRENT period only (reset to {} on
-        # the same rollover as daily_intel_done/skipped_for_period/attempts
-        # above). This is a strictly additive, human/test-facing view over
-        # the same facts daily_intel_done/daily_intel_skipped_for_period
-        # already encode — "done" and "skipped_for_period" are written at
-        # the exact same points those two dicts are (see
-        # _run_daily_intel_block) — plus two states neither of those dicts
-        # can represent: "held" (task is not in DAILY_INTEL_INITIAL_
-        # ALLOWLIST this period — never attempted, never counted toward
-        # daily_intel_done, and therefore invisible to the "period complete"
-        # check) and "in_flight" (a retry this cycle was skipped because the
-        # previous attempt's worker thread was still alive — see
-        # _DAILY_INTEL_IN_FLIGHT in scripts/hermes_operator.py). A held task
-        # can never carry "done" or "skipped_for_period" here, by
-        # construction — _run_daily_intel_block never runs a held task's
-        # fn, so there is no code path that could write either value for it.
+        # daily_intel_task_outcome: task name -> "done" | "done_queued" |
+        # "skipped_for_period" | "held" | "in_flight", for the CURRENT
+        # period only (reset to {} on the same rollover as
+        # daily_intel_done/skipped_for_period/attempts above). This is a
+        # strictly additive, human/test-facing view over the same facts
+        # daily_intel_done/daily_intel_skipped_for_period already encode —
+        # "done"/"done_queued" and "skipped_for_period" are written at the
+        # exact same points those two dicts are (see _run_daily_intel_block)
+        # — plus two states neither of those dicts can represent: "held"
+        # (task is not in DAILY_INTEL_INITIAL_ALLOWLIST this period — never
+        # attempted, never counted toward daily_intel_done, and therefore
+        # invisible to the "period complete" check) and "in_flight" (a
+        # retry this cycle was skipped because the previous attempt's
+        # worker thread was still alive — see _DAILY_INTEL_IN_FLIGHT in
+        # scripts/hermes_operator.py). A held task can never carry "done"/
+        # "done_queued" or "skipped_for_period" here, by construction —
+        # _run_daily_intel_block never runs a held task's fn, so there is
+        # no code path that could write either value for it.
+        #
+        # "done_queued" (fable-hermes-daily-intel-resumable review, part C,
+        # 2026-09-20): a task whose own step only ENQUEUES a goal_queue row
+        # for a separate subagent process (currently just
+        # storage_maintenance_subagent — see DailyIntelTask.
+        # reports_done_queued in scripts/hermes_operator.py) reports
+        # "done_queued" instead of "done" the moment the enqueue call
+        # returns, deliberately distinct from "done" so this ledger cannot
+        # be misread as "the subagent's work finished." The subagent's own
+        # completion (or failure) is tracked separately, by goal_queue's
+        # state column and the goal_results table
+        # (intelligence/goal_queue.py) — NOT by this ledger. "done_queued"
+        # still counts toward daily_intel_done/period completion exactly
+        # like "done" does; it only changes what the outcome label claims
+        # happened.
         self.daily_intel_task_outcome: dict[str, str] = {}
         # daily_intel_period_outcome: "complete" | "complete_with_skips" |
-        # None. Set (alongside state.last_daily_intel = now) the moment
-        # every ALLOW-LISTED task for the current period has a
-        # daily_intel_done entry — "complete" if none of them got there via
-        # daily_intel_skipped_for_period, "complete_with_skips" if at least
-        # one did. None while the period is still in progress, and reset to
-        # None on period rollover (same trigger as the four ledger dicts
-        # above) so a stale prior period's outcome can never be read as the
-        # current period's.
+        # "complete_for_enabled_tasks" | "complete_for_enabled_tasks_with_
+        # skips" | None. Set (alongside state.last_daily_intel = now) the
+        # moment every ALLOW-LISTED task for the current period has a
+        # daily_intel_done entry.
+        #
+        # The "_for_enabled_tasks" suffix (fable-hermes-daily-intel-
+        # resumable review, part E, 2026-09-20) reports honestly that a
+        # held subset of DAILY_INTEL_TASKS did NOT run this period — the
+        # bare "complete"/"complete_with_skips" values are reserved for the
+        # (currently hypothetical) case where DAILY_INTEL_INITIAL_ALLOWLIST
+        # covers every DAILY_INTEL_TASKS entry (no held tasks at all). As
+        # long as any task is held — true today, 13 of 21 allow-listed —
+        # the period outcome is always one of the "_for_enabled_tasks"
+        # values, never the bare ones, so "complete" can never be read as
+        # "the whole daily-intel batch ran."
+        #   - "complete_for_enabled_tasks": all allow-listed tasks done/
+        #     done_queued, none needed skipped_for_period, at least one
+        #     task is held.
+        #   - "complete_for_enabled_tasks_with_skips": same, but at least
+        #     one allow-listed task got there via skipped_for_period.
+        #   - "complete" / "complete_with_skips": same two conditions, but
+        #     with zero held tasks.
+        # None while the period is still in progress, and reset to None on
+        # period rollover (same trigger as the four ledger dicts above) so
+        # a stale prior period's outcome can never be read as the current
+        # period's.
         self.daily_intel_period_outcome: str | None = None
 
         # Bounded-repair backlog (fable-hermes-repair-bound, 2026-09-19):

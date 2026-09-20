@@ -457,3 +457,160 @@ of their writes listed under "Deployment effects" above (hypothesis
 registry inserts, `scanner_weights`, `trade_postmortems`, actor/raw_series
 writes, etc.) happen until a separate reviewed change edits
 `DAILY_INTEL_INITIAL_ALLOWLIST`. No schema change; no forced run.
+
+## Release-controller pre-approval review (2026-09-20, deliverables A–F)
+
+Development only, same draft PR, same branch, no merge/production/DB/SSH.
+Everything below is traced from the code the 13 allow-listed task bodies
+actually call (imports followed into `intelligence/`, `ingestion/`,
+`outputs/`, `ollama/`, `store/`, `scripts/goal_worker.py`), not assumed.
+
+### A/B. Per-task effects table
+
+Columns: **DB writes** (exact table + statement kind) · **dispatched
+child work** (what's enqueued, which process executes it) · **external
+calls** (host, if literal) · **file writes/deletions** (exact dir,
+retention, exclusions) · **effects an abandoned run can still perform**
+(part B — see the paragraph below the table first).
+
+| Task | DB writes | Dispatched child work | External calls | File writes/deletions | Abandoned-run effects |
+|---|---|---|---|---|---|
+| `storage_maintenance_subagent` | none in this step itself | INSERT 1 row into `goal_queue` (`enqueue_goal`, dedupe_window=`hermes:storage_maintainer`, goal_type=`hermes_storage_maintenance`, cpu tier, allow_cloud=False) — executed later, on any `cpu`-tier node, by `scripts/goal_worker.py::handle_hermes_storage_maintenance` → `_inspect_storage_maintenance` → `storage_curator.run_storage_maintenance` (report-only; conditionally INSERTs into `operator_issues` via `log_issue` when status≠"ok") | none | none in this step; the dispatched child writes `outputs/storage_maintenance/storage_maintenance_<UTCstamp>.{json,md}` + refreshes `storage_maintenance_latest.{json,md}` | all of the above — the goal_queue INSERT is already committed by the time this 60s-budget step could time out |
+| `source_audit` | INSERT `source_accuracy` (plain INSERT, no ON CONFLICT — append-only audit row per compared source pair, NOT deduped); INSERT `source_discrepancies` (same); UPDATE `source_catalog.priority_rank` (deterministic re-rank from scores just computed) | none | none | none | all of the above (retried attempts append additional audit rows rather than colliding, since source_accuracy/source_discrepancies have no dedupe key) |
+| `flow_materialize` | UPSERT (`INSERT ... ON CONFLICT DO UPDATE`) into `insider_trades`, `congressional_trades`, `dark_pool_weekly`, `etf_flows`, `junction_point_readings` | none | none | none | all of the above |
+| `rag_index` | DELETE FROM `intelligence_embeddings WHERE source_type='snapshot'` (then bulk INSERT), same DELETE+INSERT for `source_type='actor'` — full delete-then-rebuild per source_type | none | none — embeddings are local (sentence-transformers → sklearn TF-IDF → word-freq fallback, in that priority order); the module's only `requests.post` (to a local llama.cpp completion endpoint) lives in the unrelated `ask_question`/CLI-`ask` path, never called by `index_snapshots`/`index_actors` | none | all of the above |
+| `icij_linking` | INSERT `icij_actor_matches ... ON CONFLICT DO NOTHING` | none | none | none | same INSERT |
+| `attention_anomaly` | none (read-only SELECT against `attention_anomaly` + `resolved_series`) | none | none (Wikipedia/Trends ingestion happens upstream, in a separate module, not this step) | none | none — re-running is a pure read |
+| `corporate_actions` | UPDATE `capital_flows` (pre-step: expands a NULL-`fiscal_period` row in place); INSERT `capital_flows ... ON CONFLICT (...) DO UPDATE`, `period_type='announcement'` | none | YES — `httpx.Client` GET to `https://www.sec.gov/files/company_tickers.json`, `https://data.sec.gov/submissions/CIK{cik}.json`, `https://www.sec.gov/Archives/edgar/data/...` (8-K filing docs), per ticker, last 30 days | none | all of the above, including in-flight SEC EDGAR requests |
+| `capital_flow_rollups` | INSERT `capital_flows ... ON CONFLICT DO UPDATE`, `period_type='ttm'` (compute_ttm, one executemany); INSERT `capital_flows ... ON CONFLICT DO UPDATE`, `period_type='annual'`/`source_filing='announcement_rolled'` (fold_announcements) | none | none | none | both UPSERTs |
+| `fundamental_divergence` | UPSERT `fundamental_divergence ... ON CONFLICT (ticker, as_of) DO UPDATE`, one row per ticker | none | none | none | same UPSERTs (per-ticker, so a partial abandoned pass is still individually idempotent) |
+| `holder_deal_overlap` | UPSERT `holder_deal_overlap ... ON CONFLICT DO UPDATE` | none | none | none | same UPSERTs |
+| `insight_cleanup` | none | none | none | **deletes** (`Path.unlink`) `outputs/llm_insights/*.md` older than **30 days** (age from the filename's embedded `<...>_<YYYYMMDD>_<HHMMSS>.md` timestamp, via `rsplit("_", 2)`); exclusion: any file whose stem doesn't split into ≥3 parts, or whose trailing two parts don't parse as that timestamp format, is silently skipped (never deleted); only `*.md` globbed | same deletions (idempotent — an already-deleted file is just not found next time) |
+| `briefing_cleanup` | none | none | none | **deletes** `outputs/market_briefings/*.md` older than **90 days**, same filename-timestamp parse rule and same silent-skip exclusion as `insight_cleanup` | same deletions |
+| `errors_jsonl_cleanup` | none | none | none | **truncates** (never deletes the file) `<repo_root>/.server-logs/errors.jsonl` to its **last 5000 lines**, gated on current size **> 1,000,000 bytes** (size-triggered, not purely age-based); writes to `errors.jsonl.tmp` then atomically `.replace()`s the original; exclusion: single named file only, no glob | same truncate-and-replace (already atomic; an abandoned run still performs the full read → rewrite → replace) |
+
+**Part B — abandonment truth, stated plainly.** The attempt-token check in
+`_run_daily_intel_block` runs AFTER `task.fn(...)` has already returned —
+for a task that blows through its budget, `_run_with_timeout` **abandons**
+the worker thread rather than killing it (Python's `concurrent.futures`
+cannot kill a running thread), so `task.fn` keeps running to completion in
+that orphaned thread and performs **every one of the effects in the table
+above**, unchanged. What is actually withheld is narrower and entirely
+bookkeeping-side: (1) this ledger's `daily_intel_done`/
+`daily_intel_task_outcome` update for that attempt (the late-publish guard
+discards the orphan's local `results` and skips the ledger write), and (2)
+a concurrent retry of the *same* task colliding with the still-running
+orphan (the in-flight registry). Neither of those stops the task's own
+work. None of the 13 tasks' `fn` accepts a `should_continue`/cooperative-
+cancellation parameter — every `DailyIntelTask.fn` signature is
+`fn(engine, state, now, results)` — so there is no cooperative exit point
+an abandoned run could even observe; none of the 13 is cooperatively
+cancellable. This is documented in code (not just here) in
+`_run_daily_intel_block`'s "Abandonment truth" docstring paragraph and in
+`OperatorState.daily_intel_task_outcome`'s comment
+(`scripts/hermes_health.py`), and pinned by
+`tests/test_hermes_daily_intel_resumable.py::
+TestAbandonmentDoesNotPreventTaskEffects::
+test_abandoned_task_performs_its_effect_but_ledger_stays_unchanged` — a
+task that blocks past its budget, then performs a fake write after
+release, asserted to have performed the write while the ledger stayed
+unchanged. The words "cancel"/"stopped" are deliberately not used for this
+token check anywhere in the code or here.
+
+### C. Subagent dispatch semantics and held-task bypass
+
+`storage_maintenance_subagent`'s own step is synchronous and finishes the
+moment `enqueue_goal` returns (one INSERT into `goal_queue`) — it does
+**not** wait for the queued goal to execute. `_run_daily_intel_block` now
+marks that task's own outcome `daily_intel_task_outcome[...] =
+"done_queued"` (a distinct value from `"done"`, driven by the new
+`DailyIntelTask.reports_done_queued` field — true only for this task) —
+"done (queued)", not "done (child work finished)". The queued goal's own
+completion is tracked separately, by `goal_queue.state` and the
+`goal_results` table (`intelligence/goal_queue.py`), never by this ledger;
+neither this ledger nor `_run_daily_intel_block` ever learns whether the
+goal later succeeds, fails, or sits unclaimed.
+
+Held-category reachability: traced `enqueue_goal`'s `goal_type=
+"hermes_storage_maintenance"` to its one consumer, `scripts/goal_worker.py`
+(`HANDLERS["hermes_storage_maintenance"] = handle_hermes_storage_
+maintenance`) → `scripts/hermes_fixers.py::_inspect_storage_maintenance` →
+`scripts/storage_curator.py::run_storage_maintenance` →
+`build_storage_maintenance_report` (a single read-only `engine.connect()`
+SELECT scan — no INSERT/UPDATE/DELETE anywhere in that call chain) +
+`write_storage_maintenance_report` (writes the JSON/MD report files) +,
+only on non-"ok" status, one `log_issue` INSERT into `operator_issues`.
+That chain never imports or calls anything in `hypothesis_registry`/
+`discovered_hypotheses`/`scanner_weights`/`trade_postmortems`/model-
+registry code — the HELD categories. Grepped `enqueue_goal` call sites
+project-wide: only `scripts/hermes_operator.py` (this task, via
+`_dispatch_daily_storage_maintenance`) and `scripts/hermes_fixers.py`
+(`_dispatch_subagent`, the general `DISPATCH_SUBAGENT` command) call it;
+none of the other 12 allow-listed tasks enqueue anything. **Finding:
+`storage_maintenance_subagent`'s dispatched child work cannot reach a
+HELD category — kept in the initial allow-list, with `"done_queued"`
+making its true (dispatch-only) semantics explicit rather than implying
+the subagent's work completed.**
+
+### D. Smallest useful initial subset — unchanged, confirmed
+
+The existing 13-task `DAILY_INTEL_INITIAL_ALLOWLIST` (see the table two
+sections up) is confirmed as the smallest subset whose effects AND retry
+behaviour are fully understood from this review: every write is either a
+keyed UPSERT/`ON CONFLICT DO NOTHING` (idempotent re-run safe) or an
+append-only audit insert (`source_audit` — safe to rerun, just adds rows,
+not silently overwritten data) or a full delete-then-rebuild
+(`rag_index` — idempotent); every abandoned-run effect is an accepted,
+already-happening write/deletion, not a new risk introduced by this task.
+The 8 held tasks (`hypothesis_discovery`, `hypothesis_review`,
+`backtest_scan`, `postmortem_batch`, `options_improvement`,
+`milestone_scoring`, `actor_research`, `edgar_transcripts`) stay held —
+each writes a learning/scoring/model-registry-adjacent table or is
+LLM-driven (see `DAILY_INTEL_HOLD_REASONS` in `scripts/hermes_operator.py`
+for the file:line evidence per task); no new information from this review
+changes that. `rag_index` and `source_audit` were double-checked against
+this review's specific worry ("does it call an embedding *service*, are
+its writes idempotent?") and confirmed clean (see the table).
+
+### E. Period wording — implemented
+
+`daily_intel_period_outcome` now has four values instead of two:
+`"complete"` / `"complete_with_skips"` (bare — reserved for the
+hypothetical case of zero held tasks) and `"complete_for_enabled_tasks"` /
+`"complete_for_enabled_tasks_with_skips"` (used whenever any task is
+held — true today, 13 of 21 allow-listed). A new completion-only log line,
+emitted once per call that completes the period (after the pre-existing
+per-cycle progress line, which is unchanged):
+
+```
+daily_intel: period=<date> complete_for_enabled_tasks enabled=13 done=<a> done_queued=<b> skipped_for_period=<c> held=8
+```
+
+`done`, `done_queued`, `skipped_for_period`, and `held` are four separate
+counts (never folded together) — `done_queued` isolates
+`storage_maintenance_subagent`; `held` (never-attempted, standing
+controller hold) is kept distinct from `skipped_for_period` (attempted
+`DAILY_INTEL_MAX_ATTEMPTS` times, then gave up). See
+`OperatorState.daily_intel_period_outcome`'s docstring
+(`scripts/hermes_health.py`) for the full matrix and
+`tests/test_hermes_daily_intel_resumable.py::
+TestPeriodOutcomeWordingWithHeldTasks` (uses the REAL 13-allowed/8-held
+table with no-op fns) for the pin.
+
+### F. Tests and lint
+
+`DB_PASSWORD=x PYTHONUTF8=1 python -m pytest tests/test_hermes_*.py
+tests/test_postmortem_feedback.py -q`: **313 passed, 1 failed** — the
+failure is the same pre-existing Windows-only
+`tests/test_hermes_fixers.py::test_fix_output_dirs_skill_creates_common_output_directories`
+flagged as known/unrelated in the original task brief and every prior
+amendment; nothing in this review touches that file or that fixer.
+`tests/test_hermes_daily_intel_resumable.py` alone: 29 tests (5 new for
+this review — `TestDoneQueuedOutcome` ×2, `TestPeriodOutcomeWordingWithHeldTasks`
+×2, `TestAbandonmentDoesNotPreventTaskEffects` ×1 — plus 1 pre-existing
+assertion updated from `"complete"` to `"complete_for_enabled_tasks"` now
+that a held task is present in that fixture).
+`ruff check` on changed files: `hermes_operator.py` unchanged at 86
+findings, `hermes_health.py` unchanged at 12 (no new findings from this
+review's edits — both are comment/logic additions, not new blind-except
+patterns), both edited test files clean.
