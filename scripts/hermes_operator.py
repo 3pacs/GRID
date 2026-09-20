@@ -2469,44 +2469,57 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     # orphan later attempts is fenced by scripts/autoresearch.py's
     # generation checks (recorded there with a "fenced" reason).
     if state.cycle_count % 12 == 0 and health.get("overall_healthy") and hermes_ok:
-        try:
-            state.current_step = "autoresearch"
-            ar_run_id = str(uuid.uuid4())
-            ar_generation = _autoresearch_generation.next()
+        from config import settings as _ar_settings
 
-            def _autoresearch_call():
-                return maybe_run_autoresearch(
-                    state, dry_run=dry_run,
-                    run_id=ar_run_id, generation=ar_generation,
-                    is_current_generation=_autoresearch_generation.is_current,
-                )
+        if not _ar_settings.AUTORESEARCH_ENABLED:
+            # Same off-by-default gate as maybe_run_autoresearch, checked
+            # here too so the disabled state shows up in this cycle's log
+            # (and cycle_result) even though the cycle-modulo/health gate
+            # above was otherwise satisfied — without this, "Running
+            # autoresearch cycle" would never be reached anyway
+            # (maybe_run_autoresearch's own check returns first), but the
+            # operator's cycle log would stay silent about why.
+            log.info("autoresearch disabled (AUTORESEARCH_ENABLED=false) — skipping")
+            cycle_result["autoresearch"] = {"status": "skipped", "reason": "disabled"}
+        else:
+            try:
+                state.current_step = "autoresearch"
+                ar_run_id = str(uuid.uuid4())
+                ar_generation = _autoresearch_generation.next()
 
-            ar_result, ar_ok = _run_with_timeout(
-                "autoresearch", _autoresearch_call,
-                AUTORESEARCH_TIMEOUT_SECONDS, state,
-            )
-            if ar_ok:
-                if ar_result is not None:
-                    cycle_result["autoresearch"] = ar_result
-            else:
-                # Bump NOW, not on the next cycle-6 gate an hour from now —
-                # the abandoned worker thread is still running and could
-                # write at any point between now and then.
-                _autoresearch_generation.next()
-                cycle_result["autoresearch"] = {"status": "timeout", "run_id": ar_run_id}
-                try:
-                    from scripts.autoresearch import _record_research_run
-                    _record_research_run(
-                        engine, ar_run_id, "timeout",
-                        phase="operator_timeout",
-                        error=f"exceeded {AUTORESEARCH_TIMEOUT_SECONDS}s",
-                        error_category="timeout",
-                        generation=ar_generation,
+                def _autoresearch_call():
+                    return maybe_run_autoresearch(
+                        state, dry_run=dry_run,
+                        run_id=ar_run_id, generation=ar_generation,
+                        is_current_generation=_autoresearch_generation.is_current,
                     )
-                except Exception as exc:
-                    log.warning("Failed to record autoresearch timeout: {e}", e=str(exc))
-        except Exception as exc:
-            log.warning("Autoresearch failed: {e}", e=str(exc))
+
+                ar_result, ar_ok = _run_with_timeout(
+                    "autoresearch", _autoresearch_call,
+                    AUTORESEARCH_TIMEOUT_SECONDS, state,
+                )
+                if ar_ok:
+                    if ar_result is not None:
+                        cycle_result["autoresearch"] = ar_result
+                else:
+                    # Bump NOW, not on the next cycle-6 gate an hour from now —
+                    # the abandoned worker thread is still running and could
+                    # write at any point between now and then.
+                    _autoresearch_generation.next()
+                    cycle_result["autoresearch"] = {"status": "timeout", "run_id": ar_run_id}
+                    try:
+                        from scripts.autoresearch import _record_research_run
+                        _record_research_run(
+                            engine, ar_run_id, "timeout",
+                            phase="operator_timeout",
+                            error=f"exceeded {AUTORESEARCH_TIMEOUT_SECONDS}s",
+                            error_category="timeout",
+                            generation=ar_generation,
+                        )
+                    except Exception as exc:
+                        log.warning("Failed to record autoresearch timeout: {e}", e=str(exc))
+            except Exception as exc:
+                log.warning("Autoresearch failed: {e}", e=str(exc))
 
     # 7. UX Audit — only every 72nd cycle (~6 hours)
     if state.cycle_count % 72 == 0 and health.get("overall_healthy") and hermes_ok:
