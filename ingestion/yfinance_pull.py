@@ -184,11 +184,15 @@ class YFinancePuller(BasePuller):
                 "end": str(end_date) if end_date else None,
                 "interval": interval,
                 "progress": False,
-                "auto_adjust": False,
             }
             if _YF_DOWNLOAD_ACCEPTS_TIMEOUT:
                 download_kwargs["timeout"] = _YF_DOWNLOAD_TIMEOUT_SECONDS
-            df: pd.DataFrame = yf.download(yf_ticker, **download_kwargs)
+            # auto_adjust is passed literally at the call site (not via the
+            # kwargs dict) so tests/test_yfinance_auto_adjust_explicit.py can
+            # verify the basis statically.
+            df: pd.DataFrame = yf.download(
+                yf_ticker, auto_adjust=False, **download_kwargs
+            )
 
             # yfinance >=0.2.31 returns MultiIndex columns (field, ticker)
             if isinstance(df.columns, pd.MultiIndex):
@@ -379,7 +383,7 @@ class YFinancePuller(BasePuller):
                         partial run — see Returns below. Ordinary callers
                         that never pass this keep getting the plain
                         list[dict] they always got. Note this is only
-                        checked BETWEEN tickers — one in-flight yf.download()
+                        checked BETWEEN tickers — one in-flight provider download
                         call cannot itself be interrupted this way; see
                         pull_ticker's own timeout handling and
                         _run_with_timeout in scripts/hermes_operator.py for
