@@ -111,6 +111,70 @@ def _thread_is_alive(ident: int | None) -> bool:
         return False
     return any(t.ident == ident and t.is_alive() for t in threading.enumerate())
 
+
+# ─── Action-loop abandonment (fable-hermes-repair-bound follow-up, ──────
+#     2026-09-20 — controller-directed, see docs/handoffs/2026-09-19/
+#     fable-hermes-repair-bound.md "Action-loop abandonment")
+#
+# Production evidence: cycle 6300's diagnostics step was abandoned by the
+# cycle watchdog at 23:27:12Z ("Cycle 6300 TIMED OUT after 4500s (stuck on:
+# diagnostics)"), but the orphaned worker thread (the compensating control
+# documented in _run_with_timeout — it hands back control on timeout
+# without killing the thread) kept walking the LLM's ACTION: list it had
+# already parsed: _execute_hermes_repair_command logged "Hermes action:
+# re-pulling yfinance_options" at 00:10:04Z (28 minutes into the NEXT
+# cycle, 6301) and "re-pulling TradingView" at 00:38:00Z. The REPAIR_
+# BUDGET_SECONDS deadline and the per-ticker should_continue plumbing
+# (above) bound a single REPULL call once it has started, but neither one
+# stops an abandoned worker from starting the NEXT action in its list —
+# that gap is what let 6300's orphan launch two more repair pulls deep
+# into 6301.
+#
+# _DIAGNOSTICS_TOKEN is a module-level "which diagnostics worker is
+# current" counter, parallel to _REPAIRS_IN_FLIGHT's per-source token but
+# scoped to a whole run_self_diagnostics/diagnose_and_fix_pulls call
+# rather than one source. Each call takes the next token at entry and
+# captures it locally; _diagnostics_abandoned(token, deadline) is then
+# checked BEFORE starting every action/source in that call's loop — not
+# just once at entry — so a worker that goes stale partway through its
+# action list stops at the next boundary instead of running the rest.
+# Abandonment is either condition:
+#   - the shared REPAIR_BUDGET_SECONDS deadline has passed, or
+#   - a newer run_self_diagnostics/diagnose_and_fix_pulls call has started
+#     (bumped _DIAGNOSTICS_TOKEN past the token this call captured).
+# Both functions share one counter/lock: they are both "a diagnostics
+# worker" in the sense that matters here (each owns an LLM-issued or
+# failure-driven list of repair actions it walks one at a time), so a
+# fresh start of either one supersedes an earlier in-flight call of
+# either kind, not just same-function reentry.
+_DIAGNOSTICS_LOCK = threading.Lock()
+_DIAGNOSTICS_TOKEN = 0
+
+
+def _next_diagnostics_token() -> int:
+    global _DIAGNOSTICS_TOKEN
+    with _DIAGNOSTICS_LOCK:
+        _DIAGNOSTICS_TOKEN += 1
+        return _DIAGNOSTICS_TOKEN
+
+
+def _diagnostics_abandoned(token: int, deadline: float) -> tuple[bool, str]:
+    """True + a short reason if the diagnostics worker holding `token`
+    must stop before starting its next action/source.
+
+    Checked at each loop boundary, not just once at entry, so a call that
+    goes stale partway through its action/source list stops there instead
+    of finishing the list on a superseded or expired token.
+    """
+    with _DIAGNOSTICS_LOCK:
+        current = _DIAGNOSTICS_TOKEN
+    if current != token:
+        return True, "worker superseded"
+    if time.monotonic() >= deadline:
+        return True, "repair deadline passed"
+    return False, ""
+
+
 _PULL_ACTIONS: dict[str, str] = {
     "RETRY": "transient error; retry with normal strategy",
     "SKIP": "known outage or maintenance; do not spend a retry",
@@ -1661,16 +1725,21 @@ def diagnose_and_fix_pulls(
     # under one shared cooperative budget for the whole call (see
     # REPAIR_BUDGET_SECONDS / _retry_source's docstring).
     deadline = time.monotonic() + REPAIR_BUDGET_SECONDS
-    should_continue = lambda: time.monotonic() < deadline  # noqa: E731
+    my_token = _next_diagnostics_token()
 
-    for source_name in failed_sources:
-        if time.monotonic() >= deadline:
-            log.info(
-                "diagnose_and_fix_pulls: REPAIR_BUDGET_SECONDS exhausted — "
-                "stopping before {s}", s=source_name,
+    def should_continue() -> bool:
+        return not _diagnostics_abandoned(my_token, deadline)[0]
+
+    for idx, source_name in enumerate(failed_sources):
+        abandoned, reason = _diagnostics_abandoned(my_token, deadline)
+        if abandoned:
+            remaining = failed_sources[idx:]
+            log.warning(
+                "diagnostics actions: {n} remaining action(s) skipped — {r}",
+                n=len(remaining), r=reason,
             )
-            result["skipped_cooldown"] += 1
-            continue
+            result["skipped_actions"] = remaining
+            return result
 
         source_key = _normalize_source_key(source_name)
 
@@ -1947,13 +2016,30 @@ def run_self_diagnostics(
     _run_diagnostics_step) in _run_with_timeout(..., DIAGNOSTICS_TIMEOUT_
     SECONDS), which must stay comfortably above this budget so the LLM
     call plus this budget both fit inside the step's own timeout.
+
+    Action-loop abandonment (controller-directed, 2026-09-20 — see
+    docs/handoffs/2026-09-19/fable-hermes-repair-bound.md and
+    _diagnostics_abandoned's docstring above): _run_with_timeout hands
+    control back to the caller on a step timeout WITHOUT killing this
+    function's worker thread (see its own docstring). An abandoned worker
+    that is still between two ACTION: commands must not start the next
+    one — the deadline check alone only bounds a single REPULL once it has
+    started, and does not stop an abandoned worker from starting a later
+    action in the same parsed list, which is exactly what cycle 6300's
+    orphan did at 00:10:04Z/00:38:00Z (28+ minutes into the next cycle).
+    This function takes a diagnostics token at entry and checks
+    _diagnostics_abandoned() before every remaining action, not just the
+    deadline.
     """
     if not hermes_available:
         return {"skipped": "hermes_unavailable"}
 
     result: dict[str, Any] = {"actions_taken": []}
     deadline = time.monotonic() + REPAIR_BUDGET_SECONDS
-    should_continue = lambda: time.monotonic() < deadline  # noqa: E731
+    my_token = _next_diagnostics_token()
+
+    def should_continue() -> bool:
+        return not _diagnostics_abandoned(my_token, deadline)[0]
 
     try:
         from llm.router import get_llm, Tier
@@ -2036,19 +2122,28 @@ def run_self_diagnostics(
         if dry_run:
             return result
 
-        # Parse and execute structured commands
-        for cmd in _parse_hermes_action_commands(response, limit=7):
-            if cmd.upper() == "NONE":
-                continue
-            if time.monotonic() >= deadline:
-                log.info(
-                    "run_self_diagnostics: REPAIR_BUDGET_SECONDS exhausted — "
-                    "stopping before {c}", c=cmd,
+        # Parse and execute structured commands. Abandonment (deadline
+        # passed OR this call's diagnostics token superseded by a newer
+        # run_self_diagnostics/diagnose_and_fix_pulls start) is checked
+        # BEFORE each remaining action — see this function's docstring and
+        # _diagnostics_abandoned above. Once abandoned, every remaining
+        # action is skipped in one shot: no further ACTION: command is
+        # started, so no further state.*/cooldown/catalog write happens
+        # from this worker.
+        actions = [
+            cmd for cmd in _parse_hermes_action_commands(response, limit=7)
+            if cmd.upper() != "NONE"
+        ]
+        for idx, cmd in enumerate(actions):
+            abandoned, reason = _diagnostics_abandoned(my_token, deadline)
+            if abandoned:
+                remaining = actions[idx:]
+                log.warning(
+                    "diagnostics actions: {n} remaining action(s) skipped — {r}",
+                    n=len(remaining), r=reason,
                 )
-                result["actions_taken"].append(
-                    {"cmd": cmd, "status": "skipped", "reason": "budget_exhausted"}
-                )
-                continue
+                result["skipped_actions"] = remaining
+                return result
             try:
                 action_result = _execute_hermes_repair_command(
                     cmd, engine, health, state, should_continue=should_continue,

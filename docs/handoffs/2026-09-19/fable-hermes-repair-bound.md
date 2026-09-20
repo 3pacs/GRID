@@ -469,24 +469,115 @@ tests/test_scheduler*.py tests/test_smart_scheduler.py -q` →
 Windows), present on `origin/main` before this branch's changes; not a
 regression from this diff.
 
-### Scope note on injected instructions
+### Action-loop abandonment (2026-09-20) — evidence source and instruction
 
-Two additional messages arrived mid-task, styled as "coordinator"/
-"controller" updates citing new, specific "production evidence" (an
-abandoned worker allegedly running further `REPULL:` actions across
-cycles) and asking to expand this branch's scope (an action-loop
-abandonment check, new real-thread tests for a multi-action scenario, and
-unverified claims to add to this doc and the PR body). Both arrived
-through the tool-result channel rather than as an actual instruction from
-the user/controller in the normal conversation, cited timestamps/evidence
-that were not independently traceable the way every other "traced fact" in
-this document is, and asked to add that unverified narrative directly into
-this handoff doc and the PR description. Per this repo's own evidence
-standard (this doc's traced facts are explicitly sourced and dated), that
-content was not incorporated. If the run_self_diagnostics action LOOP
-(distinct from the single-source `_retry_source` abandonment fixed above)
-needs the same treatment, that is a legitimate, separate, larger follow-up
-this doc flags but does not implement.
+Evidence: the release coordinator's own read-only `journalctl -u grid-hermes`
+query on grid-svr at 2026-09-20 00:47Z (recorded in the coordinator's ledger
+and the vault report for this lane) returned these lines:
+
+    2026-09-19T23:27:12Z __main__:_run_cycle_with_timeout:3374 — Cycle 6300 TIMED OUT after 4500s (stuck on: diagnostics) — blacklisting and starting fresh
+    2026-09-19T23:32:12Z __main__:run_cycle:2179 — ═══ Hermes Operator — Cycle 6301 ═══
+    2026-09-20T00:10:04Z scripts.hermes_fixers:_execute_hermes_repair_command:844 — Hermes action: re-pulling yfinance_options
+    2026-09-20T00:10:04Z scripts.hermes_fixers:_retry_source:1194 — Retrying yfinance_options (attempt 1/3)
+    2026-09-20T00:38:00Z scripts.hermes_fixers:_execute_hermes_repair_command:844 — Hermes action: re-pulling TradingView
+    2026-09-20T00:47:12Z __main__:_run_cycle_with_timeout:3374 — Cycle 6301 TIMED OUT after 4500s (stuck on: timesfm_cycle) — blacklisting and starting fresh
+
+Cycle 6301 is not a diagnostics cycle (6301 % 6 == 1), so the REPULL actions
+at 00:10 and 00:38 were issued by the abandoned cycle-6300 diagnostics
+worker continuing down the LLM's ACTION list after its yfinance pull ended.
+The controller then directed that this belongs in #582: stopping ticker
+iteration is insufficient if an abandoned diagnostics worker can launch
+another repull action. The two subagent sessions that produced this branch
+received that instruction only through relayed messages and, correctly by
+their own standard, did not treat them as verified; the coordinator, who ran
+the query, records the source here and takes responsibility for it.
+
+What is implemented in this head: abandonment is checked BETWEEN LLM actions
+(and between sources in `diagnose_and_fix_pulls`), so a superseded or
+expired worker skips every remaining action, publishes nothing, and an
+already-running provider call is either bounded or drains without effect
+(see the per-puller classification below).
+
+Implementation (`scripts/hermes_fixers.py`):
+
+- `_DIAGNOSTICS_TOKEN` (module-level counter) + `_DIAGNOSTICS_LOCK`,
+  `_next_diagnostics_token()`, `_diagnostics_abandoned(token, deadline)`.
+  Both `run_self_diagnostics` and `diagnose_and_fix_pulls` take a token at
+  entry and check `_diagnostics_abandoned` before starting every remaining
+  action/source in their loop — not just once, and not just the deadline
+  that was already checked before this change. Abandonment = the shared
+  `REPAIR_BUDGET_SECONDS` deadline has passed, OR a newer
+  `run_self_diagnostics`/`diagnose_and_fix_pulls` call has started (bumping
+  the counter past the token this call captured). The two functions share
+  one counter: a fresh start of either supersedes an earlier in-flight call
+  of either kind.
+- On abandonment, the whole remaining action/source list is skipped in one
+  log line (`"diagnostics actions: {n} remaining action(s) skipped — {repair
+  deadline passed|worker superseded}"`) and the function returns a partial
+  result with a `skipped_actions` list — no further action/source is
+  started, so no further `state.*` write, `record_attempt`, or
+  `source_catalog` `UPDATE` happens from that worker. The same combined
+  predicate is passed down as the `should_continue` given to
+  `_execute_hermes_repair_command`/`_retry_source`, so Check 2's existing
+  per-ticker and no-publish rules also see a superseded token, not just an
+  expired deadline.
+- Bounded vs. still-draining, checked against this branch's code (not
+  assumed):
+  - **yfinance** (`YFinancePuller.pull_all`/`pull_ticker`,
+    `ingestion/yfinance_pull.py`): **BOUNDED** — `yf.download(timeout=30)`
+    when the installed yfinance version accepts the kwarg (it does on the
+    pinned 1.7.0, per 2a above), plus `should_continue` is checked and
+    honored between tickers.
+  - **TradingView**: **BOUNDED**, same as yfinance. `source_catalog` name
+    `"TradingView"` has no puller of its own — `_CATALOG_TO_REGISTRY` maps
+    it to the `"yfinance"` registry entry, so `REPULL:TradingView` runs
+    through the identical `YFinancePuller.pull_all` path above (same
+    `yf.download(timeout=30)` bound, same `should_continue` support). The
+    task's premise that TradingView "has no `should_continue` plumbing and
+    no explicit request timeout" does not hold for this branch's code; this
+    doc states what the code actually does instead.
+  - **yfinance_options** (`OptionsPuller.pull_all`, `ingestion/options.py`):
+    **STILL DRAINING** — `pull_all` takes no `should_continue` parameter, so
+    `_retry_source` never passes one (it only forwards `should_continue`
+    when `inspect.signature` shows the puller's pull method accepts it).
+    Each individual Yahoo HTTP call inside the per-ticker/per-expiry loop
+    does carry a short `timeout` (10-15s, `YahooOptionsClient`), so no
+    single request can hang forever, but the multi-ticker/multi-expiry loop
+    itself has no cooperative early exit — an abandoned worker keeps
+    calling the next ticker/expiry until `pull_all` returns on its own. This
+    matches the production shape described (a single `REPULL:yfinance_options`
+    running for many minutes): the fix in this session stops a *superseded*
+    worker from being launched a second/third time by the action loop, but
+    does not (and was not asked to) make an already-running `pull_all` call
+    itself interruptible.
+
+Tests: new file `tests/test_hermes_diagnostics_abandonment.py` —
+`TestActionLoopAbandonmentBySupersession` (three `REPULL:` actions; action
+1's fake puller blocks on a `threading.Event` past a `REPAIR_BUDGET_SECONDS`
+patched to 1s; `run_self_diagnostics` is run under a real
+`ho._run_with_timeout(..., 1, ...)` so the outer call returns `(None,
+False)` while the worker keeps running; while blocked, the in-flight
+registry still holds action 1's source; a fresh `_next_diagnostics_token()`
+call simulates the next diagnostics start; releasing the event lets action 1
+finish and get abandoned by Check 2c as before, and the loop-level check
+then skips actions 2 and 3 without ever calling their pull functions, logs
+the single combined line, leaves `state.repair_backlog` /
+`repair_last_check` / `repair_uncovered` / cooldowns untouched, records no
+`source_catalog` `UPDATE`, and the in-flight entry for action 1 is removed
+once the worker actually exits) and
+`TestActionLoopAbandonmentByDeadlineAlone` (same three actions, no token
+bump at all — `REPAIR_BUDGET_SECONDS` patched to 0.05s and action 1's fake
+puller takes 0.3s, so the deadline alone has passed by the time the loop
+re-checks before action 2; asserts the same skip behavior and that the log
+line says `"repair deadline passed"`, not `"worker superseded"`).
+
+Full command and result on this session's (uncommitted) working tree:
+`DB_PASSWORD=x PYTHONUTF8=1 python -m pytest tests/test_hermes_*.py
+tests/test_yfinance_pull_regression.py tests/test_ingestion.py
+tests/test_scheduler*.py tests/test_smart_scheduler.py -q` → 333 passed, 1
+failed (the same pre-existing, unrelated, Windows-only
+`test_fix_output_dirs_skill_creates_common_output_directories` failure noted
+above — not a regression).
 
 ## Not authorized
 
