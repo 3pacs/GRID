@@ -349,6 +349,105 @@ class OperatorState:
         self.last_earnings_calendar_sync: datetime | None = None  # earnings_events → earnings_calendar back-compat sync (30 min)
         self.last_resolution: datetime | None = None  # raw_series → resolved_series watermark (start time of the last clean resolver run)
 
+        # Daily-intel per-task ledger (fable-daily-intel-resumable,
+        # 2026-09-20). See scripts/hermes_operator.py::DAILY_INTEL_TASKS and
+        # _run_daily_intel_block for the executor. Replaces the old
+        # all-or-nothing `state.last_daily_intel = now` (set only at the very
+        # end of the block, after every task ran) with a per-task record so a
+        # cycle-budget cutoff or a restart resumes from the first undone task
+        # instead of re-running the whole ~20-task block from the top.
+        #
+        # daily_intel_period: ISO date of the due period (boundary_hour=
+        # DAILY_INTEL_BOUNDARY_HOUR=2) the three dicts below belong to. When
+        # a new evaluation's due-period date differs from this, the ledger
+        # has rolled over: _run_daily_intel_block clears daily_intel_done,
+        # daily_intel_skipped_for_period and daily_intel_attempts and sets
+        # this to the new period before doing anything else.
+        self.daily_intel_period: str | None = None
+        # daily_intel_done: task name -> ISO date of the due period it
+        # completed (or was skipped_for_period) for. A task present here
+        # with the CURRENT period's date is not re-run this period —
+        # checked regardless of whether it got there via success or via
+        # DAILY_INTEL_MAX_ATTEMPTS-exhaustion (see daily_intel_skipped_for_
+        # period below), so a permanently-broken task cannot block the
+        # tasks scheduled after it.
+        self.daily_intel_done: dict[str, str] = {}
+        # daily_intel_skipped_for_period: task name -> ISO date of the due
+        # period it was marked skipped_for_period for (attempts reached
+        # DAILY_INTEL_MAX_ATTEMPTS without a success). Every entry here also
+        # has a matching entry in daily_intel_done (same date) — this dict
+        # exists only to distinguish "skipped" from "succeeded" for the
+        # per-cycle summary log line and for tests; it is never consulted on
+        # its own to decide whether to (re)run a task.
+        self.daily_intel_skipped_for_period: dict[str, str] = {}
+        # daily_intel_attempts: task name -> attempts made in the CURRENT
+        # period (timeouts and exceptions both count; see
+        # _run_daily_intel_block). Reset to {} on period rollover along with
+        # daily_intel_done/daily_intel_skipped_for_period above.
+        self.daily_intel_attempts: dict[str, int] = {}
+        # daily_intel_task_outcome: task name -> "done" | "done_queued" |
+        # "skipped_for_period" | "held" | "in_flight", for the CURRENT
+        # period only (reset to {} on the same rollover as
+        # daily_intel_done/skipped_for_period/attempts above). This is a
+        # strictly additive, human/test-facing view over the same facts
+        # daily_intel_done/daily_intel_skipped_for_period already encode —
+        # "done"/"done_queued" and "skipped_for_period" are written at the
+        # exact same points those two dicts are (see _run_daily_intel_block)
+        # — plus two states neither of those dicts can represent: "held"
+        # (task is not in DAILY_INTEL_INITIAL_ALLOWLIST this period — never
+        # attempted, never counted toward daily_intel_done, and therefore
+        # invisible to the "period complete" check) and "in_flight" (a
+        # retry this cycle was skipped because the previous attempt's
+        # worker thread was still alive — see _DAILY_INTEL_IN_FLIGHT in
+        # scripts/hermes_operator.py). A held task can never carry "done"/
+        # "done_queued" or "skipped_for_period" here, by construction —
+        # _run_daily_intel_block never runs a held task's fn, so there is
+        # no code path that could write either value for it.
+        #
+        # "done_queued" (fable-hermes-daily-intel-resumable review, part C,
+        # 2026-09-20): a task whose own step only ENQUEUES a goal_queue row
+        # for a separate subagent process (currently just
+        # storage_maintenance_subagent — see DailyIntelTask.
+        # reports_done_queued in scripts/hermes_operator.py) reports
+        # "done_queued" instead of "done" the moment the enqueue call
+        # returns, deliberately distinct from "done" so this ledger cannot
+        # be misread as "the subagent's work finished." The subagent's own
+        # completion (or failure) is tracked separately, by goal_queue's
+        # state column and the goal_results table
+        # (intelligence/goal_queue.py) — NOT by this ledger. "done_queued"
+        # still counts toward daily_intel_done/period completion exactly
+        # like "done" does; it only changes what the outcome label claims
+        # happened.
+        self.daily_intel_task_outcome: dict[str, str] = {}
+        # daily_intel_period_outcome: "complete" | "complete_with_skips" |
+        # "complete_for_enabled_tasks" | "complete_for_enabled_tasks_with_
+        # skips" | None. Set (alongside state.last_daily_intel = now) the
+        # moment every ALLOW-LISTED task for the current period has a
+        # daily_intel_done entry.
+        #
+        # The "_for_enabled_tasks" suffix (fable-hermes-daily-intel-
+        # resumable review, part E, 2026-09-20) reports honestly that a
+        # held subset of DAILY_INTEL_TASKS did NOT run this period — the
+        # bare "complete"/"complete_with_skips" values are reserved for the
+        # (currently hypothetical) case where DAILY_INTEL_INITIAL_ALLOWLIST
+        # covers every DAILY_INTEL_TASKS entry (no held tasks at all). As
+        # long as any task is held — true today, 13 of 21 allow-listed —
+        # the period outcome is always one of the "_for_enabled_tasks"
+        # values, never the bare ones, so "complete" can never be read as
+        # "the whole daily-intel batch ran."
+        #   - "complete_for_enabled_tasks": all allow-listed tasks done/
+        #     done_queued, none needed skipped_for_period, at least one
+        #     task is held.
+        #   - "complete_for_enabled_tasks_with_skips": same, but at least
+        #     one allow-listed task got there via skipped_for_period.
+        #   - "complete" / "complete_with_skips": same two conditions, but
+        #     with zero held tasks.
+        # None while the period is still in progress, and reset to None on
+        # period rollover (same trigger as the four ledger dicts above) so
+        # a stale prior period's outcome can never be read as the current
+        # period's.
+        self.daily_intel_period_outcome: str | None = None
+
         # Bounded-repair backlog (fable-hermes-repair-bound, 2026-09-19):
         # source_key (lowercased source_catalog name) -> list of tickers/ids
         # not yet attempted, left over when a repair pull in
@@ -453,6 +552,12 @@ class OperatorState:
             "repair_backlog": self.repair_backlog,
             "repair_last_check": self.repair_last_check,
             "repair_uncovered": self.repair_uncovered,
+            "daily_intel_period": self.daily_intel_period,
+            "daily_intel_done": self.daily_intel_done,
+            "daily_intel_skipped_for_period": self.daily_intel_skipped_for_period,
+            "daily_intel_attempts": self.daily_intel_attempts,
+            "daily_intel_task_outcome": self.daily_intel_task_outcome,
+            "daily_intel_period_outcome": self.daily_intel_period_outcome,
         }
 
     def hydrate_from_snapshot(self, engine: Any) -> bool:
@@ -541,10 +646,46 @@ class OperatorState:
             }
             hydrated_any = hydrated_any or bool(self.repair_uncovered)
 
+        # Daily-intel ledger (fable-daily-intel-resumable, 2026-09-20) —
+        # same "only if currently unset" rule as repair_backlog above, so a
+        # restart mid-period resumes from the first undone task instead of
+        # re-running everything.
+        daily_intel_done = op_state.get("daily_intel_done")
+        if isinstance(daily_intel_done, dict) and not self.daily_intel_done:
+            self.daily_intel_done = {
+                str(k): str(v) for k, v in daily_intel_done.items() if v is not None
+            }
+            hydrated_any = hydrated_any or bool(self.daily_intel_done)
+
+        daily_intel_skipped = op_state.get("daily_intel_skipped_for_period")
+        if isinstance(daily_intel_skipped, dict) and not self.daily_intel_skipped_for_period:
+            self.daily_intel_skipped_for_period = {
+                str(k): str(v) for k, v in daily_intel_skipped.items() if v is not None
+            }
+            hydrated_any = hydrated_any or bool(self.daily_intel_skipped_for_period)
+
+        daily_intel_attempts = op_state.get("daily_intel_attempts")
+        if isinstance(daily_intel_attempts, dict) and not self.daily_intel_attempts:
+            self.daily_intel_attempts = {
+                str(k): int(v) for k, v in daily_intel_attempts.items()
+                if isinstance(v, int)
+            }
+            hydrated_any = hydrated_any or bool(self.daily_intel_attempts)
+
+        daily_intel_task_outcome = op_state.get("daily_intel_task_outcome")
+        if isinstance(daily_intel_task_outcome, dict) and not self.daily_intel_task_outcome:
+            self.daily_intel_task_outcome = {
+                str(k): str(v) for k, v in daily_intel_task_outcome.items() if v is not None
+            }
+            hydrated_any = hydrated_any or bool(self.daily_intel_task_outcome)
+
         # Plain string fields (not timestamps, not counters) — restore
         # verbatim, same "only if currently unset" rule as the datetime
         # fields above.
-        for str_field in ("last_sector_health_outcome",):
+        for str_field in (
+            "last_sector_health_outcome", "daily_intel_period",
+            "daily_intel_period_outcome",
+        ):
             val = op_state.get(str_field)
             if isinstance(val, str) and getattr(self, str_field, None) is None:
                 setattr(self, str_field, val)

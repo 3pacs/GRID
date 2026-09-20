@@ -23,19 +23,32 @@ from scripts import hermes_operator as ho
 
 
 def test_active_hypo_scorer_fits_inside_intelligence_step_with_daily_batch() -> None:
-    """Scorer budget + observed daily batch must fit inside the step budget.
+    """Scorer budget + the daily-intel per-cycle budget (+ headroom) must
+    fit inside the step budget.
 
-    The scorer runs first and the daily block runs last inside the same
-    step; if their combined worst case exceeds the step cap, the daily
-    block (and hypothesis discovery) is unreachable on the days it matters.
+    The scorer runs first and the daily-intel block (DAILY_INTEL_TASKS,
+    executed by _run_daily_intel_block) runs last inside the same step; if
+    their combined worst case exceeds the step cap, the daily block is
+    starved of any turn at all on the cycles that matter.
+
+    fable-daily-intel-resumable (2026-09-20) replaced the single
+    DAILY_INTEL_BATCH_OBSERVED_S measurement with a hard per-cycle cap,
+    DAILY_INTEL_CYCLE_BUDGET_SECONDS, that _run_daily_intel_block enforces
+    itself (checked before starting each task) — so this pin now compares
+    against the cap the code actually enforces, not an observed value from
+    the monolithic block that preceded it. The +60 covers the
+    earnings-calendar-sync SQL call and active-hypo-scoring bookkeeping
+    that run ahead of both inside the same step.
     """
     assert (
-        ho.ACTIVE_HYPO_SCORING_MAX_RUNTIME_S + ho.DAILY_INTEL_BATCH_OBSERVED_S
+        ho.ACTIVE_HYPO_SCORING_MAX_RUNTIME_S + ho.DAILY_INTEL_CYCLE_BUDGET_SECONDS + 60
         <= ho.INTELLIGENCE_TASKS_TIMEOUT_SECONDS
     ), (
-        "ACTIVE_HYPO_SCORING_MAX_RUNTIME_S + DAILY_INTEL_BATCH_OBSERVED_S must not "
-        "exceed INTELLIGENCE_TASKS_TIMEOUT_SECONDS — otherwise the intelligence "
-        "step times out before auto_discover() runs (regression of 2026-05-15)."
+        "ACTIVE_HYPO_SCORING_MAX_RUNTIME_S + DAILY_INTEL_CYCLE_BUDGET_SECONDS + 60 "
+        "must not exceed INTELLIGENCE_TASKS_TIMEOUT_SECONDS — otherwise the "
+        "intelligence step times out before the daily-intel block ever gets a "
+        "turn (regression of 2026-05-15, re-created one level down before this "
+        "fix)."
     )
 
 
