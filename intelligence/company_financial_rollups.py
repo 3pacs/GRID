@@ -41,6 +41,25 @@ ROLLED_CONFIDENCE: str = "derived"
 # Required number of trailing quarters to compute a TTM bucket.
 TTM_WINDOW_QUARTERS: int = 4
 
+# Bounded-recompute lookback for compute_ttm (fable-daily-intel-sql-tasks,
+# 2026-09-20). Root cause of the SQL-task-budget timeout (see
+# docs/handoffs/2026-09-20/fable-daily-intel-sql-tasks.md): the original
+# query ran the ROW_NUMBER/windowed-SUM computation over EVERY actor's
+# full quarterly history on every call — a full recompute of ~310k
+# capital_flows(period_type='quarter') rows every day, regardless of
+# whether that actor's data had changed since the previous run. That is
+# what statement_timeout (120s, db.py) was cancelling every attempt.
+#
+# compute_ttm is idempotent (ON CONFLICT DO UPDATE), so restricting the
+# ROW_NUMBER/window computation to only the actors with a NEW or UPDATED
+# quarterly row in the trailing window is safe: an actor whose quarterly
+# data hasn't changed already has a correct, unchanged TTM row from a
+# previous run. 3 days (not 1) absorbs a missed cycle or a delayed XBRL
+# ingest without requiring a persisted watermark — capital_flows.as_of
+# already exists and is written by every quarterly-row writer, so no
+# migration/new column is needed to bound this.
+TTM_LOOKBACK_DAYS: int = 3
+
 
 # ── TTM rollup ───────────────────────────────────────────────────────
 
@@ -58,6 +77,19 @@ TTM_WINDOW_QUARTERS: int = 4
 # expression list — so we restate the COALESCE/NULLIF here verbatim.
 _TTM_UPSERT_SQL = text(
     """
+    -- Bound the recompute to actors with a new/updated quarterly row in
+    -- the trailing :lookback_days window (fable-daily-intel-sql-tasks,
+    -- 2026-09-20 — see compute_ttm/TTM_LOOKBACK_DAYS docstrings). This is
+    -- what keeps the ROW_NUMBER/window computation below off the full
+    -- ~310k-row quarter table on every call; an actor with no new
+    -- quarterly data already has a correct TTM row from a previous run.
+    WITH changed_actors AS (
+        SELECT DISTINCT actor_id
+        FROM capital_flows
+        WHERE period_type = 'quarter'
+          AND amount_usd IS NOT NULL
+          AND as_of >= NOW() - make_interval(days => :lookback_days)
+    ),
     -- Dedup base quarterly rows by natural key. The base table can
     -- have multiple source_filing variants for the same logical
     -- (actor, fp, flow_type, cp) — SEC 10-Q + seed + corporate-action
@@ -68,7 +100,7 @@ _TTM_UPSERT_SQL = text(
     -- Picks one row per natural key with the same priority order the
     -- API dedup CTE uses: SEC 10-* > 8-* > seed > other, then
     -- confidence, then most-recent as_of.
-    WITH q_ranked AS (
+    q_ranked AS (
         SELECT
             actor_id,
             fiscal_period,
@@ -103,6 +135,10 @@ _TTM_UPSERT_SQL = text(
         FROM capital_flows
         WHERE period_type = 'quarter'
           AND amount_usd IS NOT NULL
+          -- Still needs each changed actor's FULL quarterly history (not
+          -- just the new row) to sum a correct trailing-4-quarter window
+          -- — only the ACTOR SET is bounded, not the per-actor lookback.
+          AND actor_id IN (SELECT actor_id FROM changed_actors)
     ),
     q AS (
         SELECT actor_id, fiscal_period, flow_type, direction, cp_key,
@@ -185,11 +221,24 @@ _TTM_UPSERT_SQL = text(
 )
 
 
-def compute_ttm(engine: Engine) -> int:
+def compute_ttm(engine: Engine, lookback_days: int | None = TTM_LOOKBACK_DAYS) -> int:
     """Build trailing-twelve-month rollup rows from quarterly data.
+
+    ``lookback_days`` bounds the recompute to actors with a new/updated
+    ``period_type='quarter'`` row (by ``as_of``) in the trailing window —
+    see ``TTM_LOOKBACK_DAYS`` for why this is safe and idempotent. Pass
+    ``None`` to force a full recompute across every actor regardless of
+    ``as_of`` (e.g. for a manual backfill via
+    ``scripts/run_capital_flow_rollups.py`` after a bulk quarterly-data
+    correction that didn't touch ``as_of``) — NOT the daily hermes path,
+    which always uses the bounded default.
 
     Returns the number of TTM rows written/refreshed.
     """
+    # None -> an arbitrarily large window so `as_of >= NOW() - N days`
+    # matches every row, without a second SQL text (still parameterized,
+    # per security.md — no dynamic string formatting of the interval).
+    effective_lookback = lookback_days if lookback_days is not None else 36500  # ~100y
     with engine.begin() as conn:
         result = conn.execute(
             _TTM_UPSERT_SQL,
@@ -197,10 +246,14 @@ def compute_ttm(engine: Engine) -> int:
                 "window": TTM_WINDOW_QUARTERS,
                 "source_filing": TTM_SOURCE_FILING,
                 "confidence": TTM_CONFIDENCE,
+                "lookback_days": effective_lookback,
             },
         )
         rowcount = result.rowcount or 0
-    log.info("capital_flow_rollups.compute_ttm: {n} ttm rows", n=rowcount)
+    log.info(
+        "capital_flow_rollups.compute_ttm: {n} ttm rows (lookback_days={l})",
+        n=rowcount, l=lookback_days,
+    )
     return int(rowcount)
 
 

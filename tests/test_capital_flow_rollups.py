@@ -108,6 +108,50 @@ def _insert_quarter(
         )
 
 
+def _insert_quarter_stale(
+    engine: Engine,
+    actor_id: str,
+    fp: date,
+    flow_type: str,
+    amount: float,
+    *,
+    as_of_days_ago: int,
+    direction: str = "in",
+    counterparty: str | None = None,
+    source_filing: str = "10-Q test",
+) -> None:
+    """Like ``_insert_quarter`` but with an explicit, backdated ``as_of``
+    (fable-daily-intel-sql-tasks, 2026-09-20) — used to simulate a
+    quarterly row that has NOT changed recently, so
+    ``compute_ttm``'s bounded ``changed_actors`` filter should exclude
+    the actor from a default-lookback run."""
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO capital_flows (
+                    actor_id, fiscal_period, period_type, flow_type,
+                    direction, amount_usd, counterparty_id, source_filing,
+                    confidence, currency, as_of
+                ) VALUES (
+                    :a, :fp, 'quarter', :ft, :d, :amt, :cp, :sf,
+                    'confirmed', 'USD', NOW() - make_interval(days => :ago)
+                )
+                ON CONFLICT (
+                    actor_id, fiscal_period, period_type, flow_type,
+                    (COALESCE(NULLIF(counterparty_id,''), '__none__')),
+                    source_filing
+                ) DO UPDATE SET
+                    amount_usd = EXCLUDED.amount_usd,
+                    as_of = EXCLUDED.as_of
+                """,
+            ).bindparams(
+                a=actor_id, fp=fp, ft=flow_type, d=direction,
+                amt=amount, cp=counterparty, sf=source_filing, ago=as_of_days_ago,
+            ),
+        )
+
+
 def _insert_announcement(
     engine: Engine,
     actor_id: str,
@@ -273,6 +317,61 @@ def test_compute_ttm_skips_when_under_four_quarters(
 
     rows = _fetch_ttm_rows(pg_engine, test_actor_id, "revenue")
     assert rows == [], f"expected no TTM rows, got {rows}"
+
+
+def test_compute_ttm_bounded_lookback_skips_stale_actor(
+    pg_engine: Engine, test_actor_id: str,
+):
+    """fable-daily-intel-sql-tasks (2026-09-20): an actor whose quarterly
+    rows are all older than TTM_LOOKBACK_DAYS is excluded from the
+    default-lookback ``changed_actors`` filter — no TTM row is written
+    for it, even though it has 4 qualifying trailing quarters. This pins
+    the bounded-recompute fix that keeps compute_ttm off a full-table
+    scan/window computation on every daily-intel cycle.
+    """
+    quarters = [
+        (date(2024, 3, 31), 100.0),
+        (date(2024, 6, 30), 110.0),
+        (date(2024, 9, 30), 120.0),
+        (date(2024, 12, 31), 130.0),
+    ]
+    for fp, amt in quarters:
+        _insert_quarter_stale(
+            pg_engine, test_actor_id, fp, "revenue", amt, as_of_days_ago=30,
+        )
+
+    compute_ttm(pg_engine)  # default TTM_LOOKBACK_DAYS=3 — misses this actor
+
+    rows = _fetch_ttm_rows(pg_engine, test_actor_id, "revenue")
+    assert rows == [], (
+        f"stale actor (as_of 30 days ago) must be excluded by the default "
+        f"lookback, got {rows}"
+    )
+
+
+def test_compute_ttm_full_recompute_opt_out_picks_up_stale_actor(
+    pg_engine: Engine, test_actor_id: str,
+):
+    """``lookback_days=None`` is the escape hatch for a manual full
+    recompute (e.g. scripts/run_capital_flow_rollups.py after a bulk
+    correction) — it must still find an actor the bounded default skips."""
+    quarters = [
+        (date(2024, 3, 31), 100.0),
+        (date(2024, 6, 30), 110.0),
+        (date(2024, 9, 30), 120.0),
+        (date(2024, 12, 31), 130.0),
+    ]
+    for fp, amt in quarters:
+        _insert_quarter_stale(
+            pg_engine, test_actor_id, fp, "revenue", amt, as_of_days_ago=30,
+        )
+
+    compute_ttm(pg_engine, lookback_days=None)
+
+    rows = _fetch_ttm_rows(pg_engine, test_actor_id, "revenue")
+    latest = [r for r in rows if r["fiscal_period"] == date(2024, 12, 31)]
+    assert len(latest) == 1, f"expected 1 TTM row at 2024-Q4, got {rows}"
+    assert latest[0]["amount_usd"] == pytest.approx(460.0)
 
 
 def test_fold_announcements_creates_rolled_annual(

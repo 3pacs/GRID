@@ -279,6 +279,242 @@ def _load_ticker_fundamentals(conn: Any, ticker: str) -> dict[str, Any] | None:
     }
 
 
+# ── Batched metric extraction (fable-daily-intel-sql-tasks, 2026-09-20) ─
+#
+# compute_divergence used to call _load_ticker_fundamentals and
+# _load_ticker_price_cagr ONCE PER TICKER in the universe (~1,500
+# tickers after dedup — SECTOR_MAP has 3,533 actors / 262 subsectors).
+# Each call is 1 (fundamentals) to 3 (price: count/latest/prior) small,
+# fast, well-indexed queries — no single statement was ever slow enough
+# to trip Postgres's statement_timeout (no QueryCanceled was ever
+# logged for this task). The cost was pure round-trip/parse/plan
+# overhead multiplied by ~4,500-6,000 sequential queries on ONE
+# connection, which summed to the ~120-124s DB-checkout holds evidenced
+# in production (see docs/handoffs/2026-09-20/fable-daily-intel-sql-
+# tasks.md) — an N+1 query pattern, not a slow query or lock
+# contention.
+#
+# The functions below replace the per-ticker loop with ONE batched
+# query per metric (fundamentals, price-count, price-latest,
+# price-prior) covering the WHOLE universe, using the same SEC-over-
+# seed dedup ranking as _load_ticker_fundamentals (kept below, byte-
+# identical, for tests/test_fundamental_divergence_sec_priority.py's
+# drift guard and any manual/debug per-ticker use) and the same
+# count/latest/prior logic as _load_ticker_price_cagr (also kept).
+# raw_series already carries idx_raw_series_series_obs(series_id,
+# obs_date DESC) — see schema.sql — so the batched DISTINCT ON queries
+# are index-backed with no migration needed; capital_flows' annual
+# rows (~162k) are cheap to sequential-scan once per call (vs. once
+# per ticker).
+#
+# Trade-off disclosed: batching loses the per-ticker isolation the old
+# code had (a malformed row for one ticker no longer just costs that
+# ticker — a batch query failure costs the whole universe for that
+# metric this cycle). Both batch loaders keep the same fail-soft shape
+# as the per-ticker code (log + return empty/None on failure) at the
+# coarser, whole-universe granularity.
+
+
+def _load_batch_fundamentals(
+    conn: Any, tickers: list[str],
+) -> dict[str, dict[str, Any] | None]:
+    """Batched equivalent of calling ``_load_ticker_fundamentals`` once
+    per ticker. Returns ``{ticker: fundamentals_dict_or_None}`` for every
+    ticker in ``tickers`` (``None`` where fewer than ``MIN_PERIODS``
+    annual rows exist). ``tickers`` must already be upper-cased (true of
+    every ``SectorTicker.ticker`` — see ``_load_universe``), so
+    ``UPPER(actor_id)`` is a safe, direct join key back to the input.
+    """
+    out: dict[str, dict[str, Any] | None] = {t: None for t in tickers}
+    if not tickers or not _table_exists(conn, "public.capital_flows"):
+        return out
+
+    rows = conn.execute(
+        text(
+            """
+            WITH ranked AS (
+                SELECT
+                    UPPER(actor_id) AS ticker_key,
+                    fiscal_period,
+                    flow_type,
+                    amount_usd,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY actor_id, fiscal_period, period_type,
+                                     flow_type, direction,
+                                     COALESCE(NULLIF(counterparty_id, ''), '__none__')
+                        ORDER BY
+                            CASE
+                                WHEN source_filing LIKE '10-%' THEN 1
+                                WHEN source_filing LIKE '20-%' THEN 2
+                                WHEN source_filing LIKE '8-%'  THEN 3
+                                WHEN source_filing LIKE 'seed%' THEN 5
+                                ELSE 4
+                            END,
+                            CASE confidence
+                                WHEN 'confirmed' THEN 1
+                                WHEN 'derived'   THEN 2
+                                WHEN 'estimated' THEN 3
+                                WHEN 'rumored'   THEN 4
+                                WHEN 'inferred'  THEN 5
+                                ELSE 6
+                            END,
+                            as_of DESC NULLS LAST
+                    ) AS rk
+                FROM capital_flows
+                WHERE UPPER(actor_id) = ANY(:tickers)
+                  AND period_type = 'annual'
+                  AND flow_type IN (
+                    'revenue', 'cogs', 'dividends', 'buybacks'
+                  )
+            )
+            SELECT ticker_key, fiscal_period, flow_type, SUM(amount_usd) AS amt
+            FROM ranked
+            WHERE rk = 1
+            GROUP BY ticker_key, fiscal_period, flow_type
+            ORDER BY ticker_key, fiscal_period DESC
+            """
+        ).bindparams(tickers=list(tickers))
+    ).fetchall()
+
+    by_ticker_period: dict[str, dict[Any, dict[str, float]]] = {}
+    for tk, fp, ft, amt in rows:
+        by_ticker_period.setdefault(tk, {}).setdefault(fp, {})[ft] = float(amt or 0.0)
+
+    for tk, by_period in by_ticker_period.items():
+        out[tk] = _fundamentals_from_period_map(by_period)
+    return out
+
+
+def _fundamentals_from_period_map(
+    by_period: dict[Any, dict[str, float]],
+) -> dict[str, Any] | None:
+    """Shared CAGR/margin-trend/shareholder-yield derivation, factored out
+    of ``_load_ticker_fundamentals`` so the single-ticker and batched
+    loaders compute identical results from identical ``{period:
+    {flow_type: amount}}`` maps."""
+    periods = sorted(by_period.keys(), reverse=True)
+    if len(periods) < MIN_PERIODS:
+        return None
+
+    rev_latest = by_period[periods[0]].get("revenue")
+    rev_3y = by_period[periods[3]].get("revenue")
+    cagr: float | None = None
+    if rev_latest is not None and rev_3y is not None and rev_3y > 0:
+        try:
+            cagr = (rev_latest / rev_3y) ** (1.0 / 3.0) - 1.0
+        except (ValueError, ZeroDivisionError):
+            cagr = None
+
+    margins: list[float] = []
+    for p in periods[:4]:
+        rev = by_period[p].get("revenue")
+        cogs = by_period[p].get("cogs")
+        gm = _safe_div((rev or 0.0) - (cogs or 0.0), rev)
+        if gm is not None:
+            margins.append(gm)
+    margin_trend: str
+    if len(margins) >= 2:
+        delta = margins[0] - margins[-1]
+        if delta > 0.005:
+            margin_trend = "expanding"
+        elif delta < -0.005:
+            margin_trend = "contracting"
+        else:
+            margin_trend = "flat"
+    else:
+        margin_trend = "flat"
+
+    sy_window: list[float] = []
+    for p in periods[:4]:
+        rev = by_period[p].get("revenue")
+        if rev is None or rev <= 0:
+            continue
+        div = by_period[p].get("dividends", 0.0) or 0.0
+        buy = by_period[p].get("buybacks", 0.0) or 0.0
+        sy = _safe_div(div + buy, rev)
+        if sy is not None:
+            sy_window.append(sy)
+    shareholder_yield = (
+        sum(sy_window) / len(sy_window) if sy_window else None
+    )
+
+    return {
+        "revenue_cagr": cagr,
+        "margin_trend": margin_trend,
+        "shareholder_yield": shareholder_yield,
+        "periods": len(periods),
+    }
+
+
+def _load_batch_price_cagrs(
+    conn: Any, tickers: list[str], as_of: date,
+) -> dict[str, float | None]:
+    """Batched equivalent of calling ``_load_ticker_price_cagr`` once per
+    ticker. Returns ``{ticker: cagr_or_None}`` for every ticker."""
+    out: dict[str, float | None] = {t: None for t in tickers}
+    if not tickers or not _table_exists(conn, "public.raw_series"):
+        return out
+
+    series_ids = [f"YF:{t.upper()}:close" for t in tickers]
+    sid_to_ticker = {sid: t for sid, t in zip(series_ids, tickers)}
+
+    count_rows = conn.execute(
+        text(
+            """
+            SELECT series_id, COUNT(*) AS n
+            FROM raw_series
+            WHERE series_id = ANY(:sids) AND value IS NOT NULL
+            GROUP BY series_id
+            """
+        ).bindparams(sids=series_ids)
+    ).fetchall()
+    eligible_sids = [
+        sid for sid, n in count_rows if int(n or 0) >= MIN_PRICE_OBS
+    ]
+    if not eligible_sids:
+        return out
+
+    def _latest_by_sid(d: date) -> dict[str, tuple[float, Any]]:
+        result = conn.execute(
+            text(
+                """
+                SELECT DISTINCT ON (series_id) series_id, value, obs_date
+                FROM raw_series
+                WHERE series_id = ANY(:sids)
+                  AND obs_date <= :d
+                  AND value IS NOT NULL
+                ORDER BY series_id, obs_date DESC
+                """
+            ).bindparams(sids=eligible_sids, d=d)
+        ).fetchall()
+        return {sid: (val, obs) for sid, val, obs in result}
+
+    latest = _latest_by_sid(as_of)
+    target_prior = as_of - timedelta(days=PRICE_LOOKBACK_DAYS)
+    prior = _latest_by_sid(target_prior)
+
+    for sid in eligible_sids:
+        ticker = sid_to_ticker.get(sid)
+        if ticker is None:
+            continue
+        latest_row = latest.get(sid)
+        prior_row = prior.get(sid)
+        if latest_row is None or prior_row is None:
+            continue
+        try:
+            latest_val = float(latest_row[0])
+            prior_val = float(prior_row[0])
+        except (TypeError, ValueError):
+            continue
+        if prior_val <= 0:
+            continue
+        try:
+            out[ticker] = (latest_val / prior_val) ** (1.0 / 3.0) - 1.0
+        except (ValueError, ZeroDivisionError):
+            continue
+    return out
+
+
 # ── Price metric extraction ────────────────────────────────────────
 
 def _load_ticker_price_cagr(
@@ -454,27 +690,34 @@ def compute_divergence(engine: Engine, as_of: date | None = None) -> list[dict[s
     out: list[dict[str, Any]] = []
 
     with engine.connect() as conn:
-        # Preload per-ticker fundamentals + price cagr. Two-pass keeps
-        # the percentile ranks sector-relative without redoing SQL.
-        fund_cache: dict[str, dict[str, Any] | None] = {}
-        price_cache: dict[str, float | None] = {}
-        for st in universe:
-            try:
-                fund_cache[st.ticker] = _load_ticker_fundamentals(conn, st.ticker)
-            except Exception as exc:
-                log.debug(
-                    "fundamental_divergence: fundamentals failed for {t}: {e}",
-                    t=st.ticker, e=str(exc),
-                )
-                fund_cache[st.ticker] = None
-            try:
-                price_cache[st.ticker] = _load_ticker_price_cagr(conn, st.ticker, as_of)
-            except Exception as exc:
-                log.debug(
-                    "fundamental_divergence: price failed for {t}: {e}",
-                    t=st.ticker, e=str(exc),
-                )
-                price_cache[st.ticker] = None
+        # Preload fundamentals + price cagr for the WHOLE universe in a
+        # handful of batched queries (fable-daily-intel-sql-tasks,
+        # 2026-09-20) rather than 1-4 queries PER TICKER — see the
+        # "Batched metric extraction" comment above _load_batch_fundamentals
+        # for why: the per-ticker loop was an N+1 pattern (~4,500-6,000
+        # sequential round trips for ~1,500 tickers), not a slow
+        # statement, and that round-trip overhead summed to the observed
+        # ~120s DB-checkout holds. A batch-query failure is fail-soft at
+        # the whole-universe granularity (log + treat every ticker as
+        # missing that metric this cycle), trading the old code's
+        # per-ticker isolation for the elimination of the N+1 pattern.
+        all_tickers = [st.ticker for st in universe]
+        try:
+            fund_cache = _load_batch_fundamentals(conn, all_tickers)
+        except Exception as exc:
+            log.warning(
+                "fundamental_divergence: batched fundamentals load failed: {e}",
+                e=str(exc),
+            )
+            fund_cache = {t: None for t in all_tickers}
+        try:
+            price_cache = _load_batch_price_cagrs(conn, all_tickers, as_of)
+        except Exception as exc:
+            log.warning(
+                "fundamental_divergence: batched price load failed: {e}",
+                e=str(exc),
+            )
+            price_cache = {t: None for t in all_tickers}
 
         for sector_name, members in by_sector.items():
             # Sector-relative distributions (drop None for cleaner percentiles).
