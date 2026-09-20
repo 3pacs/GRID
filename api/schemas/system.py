@@ -83,12 +83,24 @@ class StaleSource(BaseModel):
     source: str
     last_pull: str | None = None
     stale: bool = True
+    # Contract addition (store/availability_fields.py::FieldRecord.to_dict()).
+    # Carries availability/provenance/stale_reason/ingested_at for this
+    # source's freshness fact so a page's staleness text always traces back
+    # to a record instead of being recomputed ad hoc. None for responses
+    # built before this field existed.
+    field_record: dict[str, Any] | None = None
 
 
 class FreshnessResponse(BaseModel):
     families: list[FamilyFreshness]
     overall_status: str  # GREEN, YELLOW, RED
     stale_sources: list[StaleSource] = []
+    # Contract addition: whole-response availability. "available" (default,
+    # preserves prior behaviour) unless the underlying queries failed, in
+    # which case this is "unavailable" and stale_reason names the category —
+    # never silently returned as empty families/stale_sources with no signal.
+    availability: str = "available"
+    stale_reason: str | None = None
 
 
 class HermesTaskStatus(BaseModel):
@@ -128,6 +140,12 @@ class PipelineSourceStatus(BaseModel):
     freshness: str = "red"  # green, yellow, red
     series_count: int | None = None
     error: str | None = None
+    # Contract addition (store/availability_fields.py::FieldRecord.to_dict()).
+    # Restates this source's status as a per-field record: availability
+    # (available/unavailable), provenance (measured, when we have a real
+    # last-pull timestamp), ingested_at, and stale_reason. None for
+    # responses built before this field existed.
+    field_record: dict[str, Any] | None = None
 
 
 class PipelineSummary(BaseModel):
@@ -161,3 +179,12 @@ class PipelineHealthResponse(BaseModel):
     coverage: dict[str, Any] = {}
     recent_errors: list[PipelineError] = []
     resolver_status: ResolverStatus = ResolverStatus()
+    # Contract addition: whole-response availability. "available" (default,
+    # preserves prior behaviour) unless the pipeline-health query itself
+    # failed, in which case this is "unavailable" and stale_reason names the
+    # failure category. Previously an exception here produced a plain 200
+    # with every list empty and no signal that the *computation* — not the
+    # pipeline — was what failed; a client could not tell "0 sources exist"
+    # from "we could not compute this".
+    availability: str = "available"
+    stale_reason: str | None = None
