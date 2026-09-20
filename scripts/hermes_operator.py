@@ -1727,11 +1727,13 @@ DAILY_INTEL_INITIAL_ALLOWLIST: frozenset[str] = frozenset({
     # cross-reference of 13F institutional holdings against capital_flows
     # acquisition announcements. No LLM.
     "holder_deal_overlap",
-    # Three filesystem cleanups — pre-existing, bounded, deletion/
-    # truncation only, no new data written.
-    "insight_cleanup",
-    "briefing_cleanup",
-    "errors_jsonl_cleanup",
+    # NOTE: the three filesystem cleanups (insight_cleanup,
+    # briefing_cleanup, errors_jsonl_cleanup) are NOT in this initial
+    # subset — see DAILY_INTEL_HOLD_REASONS below. Controller decision
+    # (2026-09-20): file deletion/truncation policy (directories,
+    # retention windows, exclusions) has not yet been separately
+    # accepted, even though each cleanup's own deletion/truncation logic
+    # is deterministic and idempotent.
 })
 
 # Every DAILY_INTEL_TASKS name NOT in DAILY_INTEL_INITIAL_ALLOWLIST above,
@@ -1811,6 +1813,21 @@ DAILY_INTEL_HOLD_REASONS: dict[str, str] = {
         "uses llm.router Tier.REASON (and a local Gemma extractor) to "
         "extract guidance/milestone figures and inserts them as raw_series "
         "data points, not just audit metadata"
+    ),
+    "insight_cleanup": (
+        "held for the initial subset by the controller (2026-09-20): file "
+        "deletion/truncation policy (directories, retention, exclusions) "
+        "to be accepted separately"
+    ),
+    "briefing_cleanup": (
+        "held for the initial subset by the controller (2026-09-20): file "
+        "deletion/truncation policy (directories, retention, exclusions) "
+        "to be accepted separately"
+    ),
+    "errors_jsonl_cleanup": (
+        "held for the initial subset by the controller (2026-09-20): file "
+        "deletion/truncation policy (directories, retention, exclusions) "
+        "to be accepted separately"
     ),
 }
 
@@ -2014,14 +2031,14 @@ def _run_daily_intel_block(
     and skips the ledger write — see the late-publish guard above), and
     (2) a concurrent retry of the SAME task colliding with the still-
     running orphan (the in-flight registry above). Neither of those is the
-    task's own work being prevented — none of the 13 allow-listed tasks'
+    task's own work being prevented — none of the 8 allow-listed tasks'
     ``fn`` accepts a ``should_continue``/cooperative-cancellation
     parameter (checked: every ``DailyIntelTask.fn`` signature is
     ``fn(engine, state, now, results)``), so there is no cooperative exit
     point an abandoned run could even observe. See the per-task "effects
     an abandoned run can still perform" column in
     docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md (answer,
-    for every one of the 13: all of its DB writes / dispatched child work
+    for every one of the 8: all of its DB writes / dispatched child work
     / external calls / file writes — the same effects it would have
     performed on a timely return) and
     ``tests/test_hermes_daily_intel_resumable.py::
@@ -2173,7 +2190,7 @@ def _run_daily_intel_block(
         # review, part E, 2026-09-20): the bare "complete"/"complete_with_
         # skips" values are reserved for the case where every
         # DAILY_INTEL_TASKS entry is allow-listed (no held tasks at all).
-        # As long as any task is held — true today (13 of 21 allow-listed)
+        # As long as any task is held — true today (8 of 21 allow-listed)
         # — "complete" must never be reported on its own, since that could
         # be misread as "the whole daily-intel batch ran." See
         # OperatorState.daily_intel_period_outcome's docstring
