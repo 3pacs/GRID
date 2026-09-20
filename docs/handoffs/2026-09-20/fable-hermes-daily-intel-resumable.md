@@ -614,3 +614,14 @@ that a held task is present in that fixture).
 findings, `hermes_health.py` unchanged at 12 (no new findings from this
 review's edits — both are comment/logic additions, not new blind-except
 patterns), both edited test files clean.
+
+## Coordinator decision (2026-09-20 05:5xZ): smallest useful initial subset = 11 tasks
+
+After the effects table above, two of the thirteen reviewed tasks are **held for the initial subset** even though neither uses an LLM, because their retry/abandonment behaviour is not yet acceptable:
+
+- `source_audit` — appends plain-INSERT rows to `source_accuracy` / `source_discrepancies` on every run (no `ON CONFLICT`), so an abandoned run plus a retry duplicates audit rows; it also rewrites `source_catalog.priority_rank`, which steers ingestion priority.
+- `rag_index` — rebuilds `intelligence_embeddings` by DELETE-then-bulk-INSERT per `source_type`; an abandoned run keeps executing in its orphan thread while readers see a partially emptied index, and a retry repeats the full delete/rebuild.
+
+Initial allow-list (11): `storage_maintenance_subagent` (done_queued; child work traced to a read-only storage report + conditional `operator_issues` insert, no held category reachable), `flow_materialize`, `icij_linking`, `attention_anomaly` (read-only), `corporate_actions` (SEC HTTP reads + idempotent `capital_flows` upserts), `capital_flow_rollups`, `fundamental_divergence`, `holder_deal_overlap`, `insight_cleanup`, `briefing_cleanup`, `errors_jsonl_cleanup`. Held (10): the eight standing-hold tasks plus the two above. With held tasks present the period is reported as **complete for enabled tasks**, with skipped and held counts kept separate.
+
+Abandonment, restated: the attempt-token check runs only after a task returns; it suppresses the late ledger update and the in-flight registry prevents a concurrent retry. It does **not** stop the task: every underlying effect in the table (DB writes, the enqueue, SEC HTTP calls, file deletions/truncation) can still be performed by an abandoned run.

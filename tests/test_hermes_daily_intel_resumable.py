@@ -430,6 +430,9 @@ class TestDailyIntelAllowlistClassification:
             "hypothesis_discovery", "hypothesis_review", "backtest_scan",
             "postmortem_batch", "options_improvement", "milestone_scoring",
             "actor_research", "edgar_transcripts",
+            # coordinator's initial-subset holds (non-idempotent audit
+            # appends + priority_rank rewrite; delete-then-rebuild index)
+            "source_audit", "rag_index",
         }
         assert set(ho.DAILY_INTEL_HOLD_REASONS) == expected_holds
 
@@ -443,8 +446,8 @@ class TestDailyIntelAllowlistClassification:
         # (source_accuracy/source_discrepancies/source_catalog.priority_rank
         # and intelligence_embeddings respectively).
         expected_allow = {
-            "storage_maintenance_subagent", "source_audit", "flow_materialize",
-            "rag_index", "icij_linking", "attention_anomaly",
+            "storage_maintenance_subagent", "flow_materialize",
+            "icij_linking", "attention_anomaly",
             "corporate_actions", "capital_flow_rollups",
             "fundamental_divergence", "holder_deal_overlap",
             "insight_cleanup", "briefing_cleanup", "errors_jsonl_cleanup",

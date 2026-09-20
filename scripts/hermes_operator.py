@@ -1699,26 +1699,11 @@ DAILY_INTEL_INITIAL_ALLOWLIST: frozenset[str] = frozenset({
     # (scripts/hermes_fixers.py::_execute_hermes_repair_command,
     # DISPATCH_SUBAGENT branch -> intelligence.goal_queue.enqueue_goal).
     "storage_maintenance_subagent",
-    # intelligence/source_audit.py::run_full_audit — no llm.router/Tier
-    # reference anywhere in the file; writes only source_accuracy,
-    # source_discrepancies (both audit/derived tables) and updates
-    # source_catalog.priority_rank from the accuracy scores it just
-    # computed (deterministic ranking, not a learning write). Reclassified
-    # from the controller's default-hold "LLM-driven" assumption — see
-    # docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md.
-    "source_audit",
     # ingestion/flow_materializer.py::sync_all — deterministic projection
     # of signal_sources into relational flow tables (dark_pool_weekly,
     # etf_flows, insider_trades, congressional_trades,
     # junction_point_readings). No LLM, no learning table.
     "flow_materialize",
-    # intelligence/rag.py::RAGIndexer — no llm.router/Tier reference
-    # anywhere in the file; embeddings come from a local
-    # sentence-transformers/TF-IDF/word-freq backend, not a generative
-    # LLM call. Writes only intelligence_embeddings (a retrieval index,
-    # not a learning/trading table). Reclassified from the controller's
-    # default-hold "LLM-driven" assumption — see the handoff doc.
-    "rag_index",
     # intelligence/icij_linker.py::link_actors — deterministic fuzzy
     # string matching against ICIJ offshore-entity records. No LLM.
     "icij_linking",
@@ -1758,6 +1743,25 @@ DAILY_INTEL_INITIAL_ALLOWLIST: frozenset[str] = frozenset({
 # must appear in EXACTLY ONE of DAILY_INTEL_INITIAL_ALLOWLIST /
 # DAILY_INTEL_HOLD_REASONS) rather than only documented in prose.
 DAILY_INTEL_HOLD_REASONS: dict[str, str] = {
+    "source_audit": (
+        "held for the INITIAL subset by the release coordinator (2026-09-20): "
+        "no LLM, but its writes are not idempotent — run_full_audit "
+        "(intelligence/source_audit.py) appends plain-INSERT rows to "
+        "source_accuracy and source_discrepancies on every run (no ON "
+        "CONFLICT), so a retry after an abandoned run duplicates audit rows; "
+        "it also rewrites source_catalog.priority_rank, which steers "
+        "ingestion priority. Re-run semantics must be settled before it "
+        "graduates"
+    ),
+    "rag_index": (
+        "held for the INITIAL subset by the release coordinator (2026-09-20): "
+        "no LLM, local embeddings only, but RAGIndexer rebuilds "
+        "intelligence_embeddings by DELETE-then-bulk-INSERT per source_type; "
+        "an abandoned run keeps executing in its orphan thread and readers "
+        "see a partially emptied index until it finishes, and a later retry "
+        "repeats the full delete/rebuild. Needs a swap-in rebuild (or an "
+        "accepted window) before it graduates"
+    ),
     "hypothesis_discovery": (
         "learning write — HypothesisGenerator.auto_discover() "
         "(intelligence/hypothesis_engine.py) inserts/updates "
