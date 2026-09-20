@@ -762,7 +762,7 @@ class TestPeriodOutcomeWordingWithHeldTasks:
         self, monkeypatch
     ) -> None:
         """Uses the REAL DAILY_INTEL_TASKS/DAILY_INTEL_INITIAL_ALLOWLIST/
-        DAILY_INTEL_HOLD_REASONS (13 allowed, 8 held) with every allow-listed
+        DAILY_INTEL_HOLD_REASONS (11 allowed, 10 held) with every allow-listed
         task's fn replaced by a no-op so no real DB/network is touched.
         Held tasks keep their real (never-called) fn."""
         calls: list[str] = []
@@ -789,8 +789,8 @@ class TestPeriodOutcomeWordingWithHeldTasks:
         results: dict[str, Any] = {}
         ho._run_daily_intel_block(MagicMock(), state, NOW, results)
 
-        assert len(calls) == len(ho.DAILY_INTEL_INITIAL_ALLOWLIST) == 13
-        assert len(ho.DAILY_INTEL_HOLD_REASONS) == 8
+        assert len(calls) == len(ho.DAILY_INTEL_INITIAL_ALLOWLIST) == 11
+        assert len(ho.DAILY_INTEL_HOLD_REASONS) == 10
         assert state.daily_intel_period_outcome == "complete_for_enabled_tasks"
         assert state.last_daily_intel == NOW
 
@@ -799,9 +799,9 @@ class TestPeriodOutcomeWordingWithHeldTasks:
             if msg.startswith("daily_intel: period=") and "outcome" in kw
         )
         assert summary["outcome"] == "complete_for_enabled_tasks"
-        assert summary["n"] == 13
-        assert summary["d"] == 12, (
-            "12 of the 13 allow-listed tasks report plain 'done' — "
+        assert summary["n"] == 11
+        assert summary["d"] == 10, (
+            "10 of the 11 allow-listed tasks report plain 'done' — "
             "storage_maintenance_subagent is the one exception (see below)"
         )
         assert summary["dq"] == 1, (
@@ -813,7 +813,7 @@ class TestPeriodOutcomeWordingWithHeldTasks:
             "dedicated assertion"
         )
         assert summary["s"] == 0, "skipped_for_period must be reported separately from held"
-        assert summary["h"] == 8, "held must be reported separately from skipped_for_period"
+        assert summary["h"] == 10, "held must be reported separately from skipped_for_period"
 
     def test_bare_complete_only_when_zero_tasks_held(self, monkeypatch) -> None:
         calls: list[str] = []
