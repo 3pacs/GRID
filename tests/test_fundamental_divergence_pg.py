@@ -41,7 +41,7 @@ def test_ticker() -> str:
 
 
 @pytest.fixture
-def source_id(pg_engine: Engine) -> int:
+def source_id(pg_engine: Engine, test_ticker: str) -> int:
     """A throwaway source_catalog row this test owns end-to-end — does
     not assume any pre-seeded 'FRED'/'yfinance' row exists in the
     disposable test database."""
@@ -64,7 +64,29 @@ def source_id(pg_engine: Engine) -> int:
         ).fetchone()
         sid = int(row[0])
     yield sid
+    # Child rows that FK-reference this source_catalog row (raw_series.
+    # source_id) -- plus any fundamental_divergence rows for this test's
+    # ticker -- must be deleted BEFORE the source_catalog row itself, in
+    # one transaction, or PostgreSQL raises ForeignKeyViolation
+    # (raw_series_source_id_fkey) on the source_catalog delete. Relying
+    # on pytest's cross-fixture teardown LIFO order is what caused that:
+    # this fixture is instantiated (and therefore torn down) after the
+    # autouse cleanup_raw_series fixture, so its own delete must not
+    # depend on that other fixture running first. Every DELETE here
+    # matches on ID/series_id/ticker rather than assuming rows exist, so
+    # this is a no-op (not an error) for a test that failed before
+    # seeding anything.
     with pg_engine.begin() as conn:
+        conn.execute(
+            text("DELETE FROM fundamental_divergence WHERE ticker = :t").bindparams(
+                t=test_ticker,
+            ),
+        )
+        conn.execute(
+            text(
+                "DELETE FROM raw_series WHERE source_id = :src OR series_id = :sid",
+            ).bindparams(src=sid, sid=f"YF:{test_ticker}:close"),
+        )
         conn.execute(text("DELETE FROM source_catalog WHERE id = :id").bindparams(id=sid))
 
 
