@@ -62,12 +62,14 @@ def _parse_args() -> argparse.Namespace:
         "--watermark",
         default=None,
         help=(
-            "ISO-8601 timestamp: only recompute TTM for actors with a "
-            "quarter row newer than this. Omit for a full recompute "
-            "across every actor (this manual/debug runner has no "
-            "persisted watermark of its own — that lives on "
-            "OperatorState.capital_flow_ttm_watermark on the daily "
-            "hermes path; see intelligence/company_financial_rollups.py)."
+            "Vestigial (fable-daily-intel-sql-tasks, 2026-09-20 SECOND "
+            "follow-up): compute_ttm's dirty-actor recompute set is now "
+            "decided entirely by a durable per-actor content fingerprint "
+            "in capital_flows_ttm_state, not by any as_of cursor. This "
+            "flag is accepted and passed through for backward-compatible "
+            "call signatures only and has NO effect on which actors are "
+            "recomputed — see intelligence/company_financial_rollups.py's "
+            "module docstring."
         ),
     )
     return parser.parse_args()

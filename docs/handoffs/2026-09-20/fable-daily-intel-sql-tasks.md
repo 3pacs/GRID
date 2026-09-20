@@ -140,6 +140,24 @@ cycle. Both batch loaders keep the same fail-soft shape (log + return
 `None`/empty) at that coarser granularity, matching how `_table_exists`
 already gates the whole function today.
 
+## SUPERSEDED — see "Third follow-up" at the end of this document
+
+Everything below this point through the end of the "Follow-up ... durable
+TTM recompute tracking" section describes the scalar `as_of` watermark
+design (first and second-draft follow-ups, same day). The controller
+subsequently established that design is **not commit-order safe** and it
+was replaced with a durable per-actor content fingerprint. The precise,
+non-contradictory final statement of what is and is not guaranteed lives
+in the "Third follow-up" section at the end of this file — read that
+section for the current design; the sections below are kept for history
+(what was tried, and why it was wrong) but must not be taken as the
+current behavior. In particular: the "Stale-write classification
+restated" section below says both that corrected rows always advance the
+watermark AND that a stale `ttm` key can survive indefinitely with
+nothing to remove it — those two statements are in tension (the first
+implies coverage the second denies), and the "Third follow-up" section
+resolves it precisely rather than restating either half.
+
 ## Stale-write classification restated (post-review, `TTM_LOOKBACK_DAYS=3`)
 
 CI review flagged that the diagnosis above doesn't say plainly what
@@ -538,3 +556,276 @@ data.
   constraints) — they are written, reviewed for SQL/behavioral
   correctness against `schema.sql`, and confirmed to skip cleanly with
   no Postgres reachable; the coordinator runs them for real.
+
+## Third follow-up (same day, same branch, development only): the scalar
+## watermark was commit-order unsafe — replaced with a durable per-actor
+## content fingerprint
+
+**Controller verdict on the second follow-up's design:** a scalar
+high-water-mark on `capital_flows.as_of` is NOT established to be
+commit-order safe, and "a passing sequential test does not establish
+commit-order safety." In PostgreSQL, `now()`/`CURRENT_TIMESTAMP` (what
+`ingestion/altdata/sec_xbrl_financials.py::_write_rows` binds into
+`as_of`) is the **transaction START time**, not commit time. A writer
+transaction that starts before a `compute_ttm` run's snapshot but commits
+after it carries an `as_of` older than the watermark that run persists —
+`as_of > watermark` then skips that row **forever**, not just for one
+cycle, because the watermark can advance past that row's `as_of` from
+*other* traffic committing in between, before the slow writer ever
+finally commits. A second, narrower hole: two rows with the exact same
+`as_of` fall on either side of strict `>` depending only on which one
+happened to set the watermark first. Both were proved with two
+INDEPENDENT PostgreSQL connections/transactions (real concurrency, not
+sequential seeding) — a sequential test cannot exercise "started before,
+committed after" at all, which is exactly why the second follow-up's
+(sequential) PG tests passing did not establish safety.
+
+A third, separate hole in the second follow-up's design, unrelated to
+commit ordering: it only ever ADDED `ttm` rows. An actor whose quarterly
+rows were deleted or reclassified (`period_type` changed away from
+`'quarter'`) produced no new row and no `as_of` movement at all, so
+nothing in `compute_ttm` would ever remove or update its now-stale `ttm`
+row — the exact "stale key can remain indefinitely" behavior the
+"Stale-write classification restated" section above (correctly)
+described, in direct tension with that same design's "corrected rows
+always advance the watermark" claim. Both halves are now moot: the
+replacement below closes both gaps with the same mechanism.
+
+### What replaced it: a durable per-actor quarter-set content fingerprint
+### (Design B from the controller's brief)
+
+`intelligence/company_financial_rollups.py` — full design rationale is in
+that module's own docstring; summary:
+
+- New table `capital_flows_ttm_state (actor_id TEXT PRIMARY KEY,
+  quarter_fingerprint TEXT, computed_at TIMESTAMPTZ NOT NULL DEFAULT
+  NOW())`, added by migration `capital_flow_ttm_state_20260920`
+  (`down_revision = 'god_view_market_tables_20260918'`, the prior single
+  alembic head — `tests/test_alembic_single_head.py` still passes with
+  exactly one head). **This is the migration the coordinator must apply**
+  — see "Coordinator" below.
+- Every `compute_ttm` call fingerprints EVERY actor's current
+  `period_type='quarter'` rows: `md5(string_agg(...))` over
+  `fiscal_period, flow_type, direction, counterparty_id (coalesced to
+  '__none__'), amount_usd, currency, source_filing, confidence`, in that
+  deterministic sort order. An actor is dirty when that live fingerprint
+  `IS DISTINCT FROM` (NULL-safe) what is stored for it — covering a
+  first-time actor (no stored row), a changed actor (fingerprint differs),
+  and an actor whose quarterly rows are now ALL gone (live fingerprint is
+  NULL, stored one is not).
+- This is commit-order safe **by construction**: it compares committed
+  table CONTENT on each run, never a timestamp. It cannot matter whether
+  a competing writer's transaction started before or after this run's
+  snapshot — only whether it had committed by the time this run's query
+  executed. A commit this run's query missed is, by definition, still
+  uncommitted as far as this run is concerned; the NEXT run's query will
+  see it and flag the actor dirty then. There is no leapfrogging: nothing
+  here is a cursor that can advance past a value it never actually saw.
+- Stale `ttm` rows are now DELETEd: for every dirty actor, any existing
+  `period_type='ttm', source_filing='ttm_rollup'` row whose
+  `(flow_type, direction, counterparty_id, fiscal_period)` group is not
+  present in that run's freshly computed 4-quarter windows is removed —
+  closes case 3 (below) using the compute_ttm's existing, unchanged
+  `n_quarters = 4` qualification rule (read from the code, not
+  reinvented): a group that does not have exactly 4 trailing quarters
+  within a 320-day span does not qualify, same as before.
+- ALL of the fingerprint comparison, the stale-`ttm` delete, the
+  per-actor state upsert, and the `ttm` write itself run inside ONE SQL
+  statement (multiple data-modifying CTEs sharing one query snapshot),
+  inside ONE `engine.begin()` transaction — not two separate statements.
+  This matters: a second, separately-executed "now record the
+  fingerprint" statement would re-read `capital_flows` under READ
+  COMMITTED's per-statement snapshot and could durably record a
+  fingerprint that this run's `ttm` write never actually matched, if a
+  concurrent write landed in the gap between the two statements. One
+  statement, one snapshot, closes that race entirely.
+- **Why not also Design A (`pg_visible_in_snapshot`)**: real and
+  commit-order safe for inserts, but blind to deletes/reclassifications
+  (a `DELETE` or a `period_type` change leaves no new, not-yet-visible
+  `xmin` to catch) — case 3 below. Since the fingerprint already covers
+  inserts, corrections, deletions, and reclassifications with ONE
+  mechanism, Design A would only add a second dependency (PostgreSQL 13+
+  for `pg_current_snapshot()`/`pg_visible_in_snapshot()` — confirmed
+  satisfied; production griddb runs PostgreSQL 15 per
+  `docs/SERVER-SERVICES.md`) for a case already covered. Not used.
+- **Cost, disclosed**: unlike the scalar watermark, the fingerprint step
+  must read every `period_type='quarter'` row on every call (a single
+  `GROUP BY actor_id` aggregate scan — no per-row round trips, no window
+  function over the full table; that part is still bounded to dirty
+  actors only, same as before). At the ~310k-row scale referenced
+  earlier in this doc this is a sub-second sequential scan for a
+  once-daily job. If the table grows enough for this to matter, the
+  natural follow-up is a trigger-maintained fingerprint column on
+  `capital_flows` itself rather than reverting to a commit-order-unsafe
+  shortcut — not done here, disclosed as a future option only.
+
+### The `watermark` parameter and `OperatorState.capital_flow_ttm_watermark`
+### are now vestigial, not removed
+
+`compute_ttm(engine, watermark=None)`, `run_all(engine,
+ttm_watermark=None)`, `scripts/hermes_operator.py::
+_daily_intel_capital_flow_rollups`, `scripts/run_capital_flow_rollups.py
+--watermark`, and `OperatorState.capital_flow_ttm_watermark` are all
+UNCHANGED in shape. The parameter/field is accepted and passed through
+exactly as before, but plays NO role in deciding which actors get
+recomputed — that state lives entirely in `capital_flows_ttm_state`,
+committed atomically with the `ttm` rows it governs. `TtmResult.watermark`
+/ `stats["ttm_watermark"]` is now just the ISO-8601 wall-clock time the
+run completed, kept so existing callers that persist it for telemetry
+don't need to change. Docstrings in `intelligence/
+company_financial_rollups.py`, `scripts/hermes_operator.py`, `scripts/
+hermes_health.py`, and `scripts/run_capital_flow_rollups.py` were all
+updated to say this plainly — no code path anywhere still claims the
+watermark gates anything.
+
+One consequence, strictly stronger than before: the old "crash between DB
+commit and operator-state persistence" scenario is now trivially
+harmless, not just "harmless because a retry recomputes the same set." A
+crash before `state.capital_flow_ttm_watermark` is written changes
+NOTHING about what the next run recomputes, because nothing outside
+`compute_ttm`'s own transaction is needed to gate it. Proved by
+`tests/test_capital_flow_rollups_pg.py::
+test_replay_after_crash_before_watermark_persist_is_a_harmless_noop`.
+`compute_ttm`'s and `run_all`'s docstrings say plainly: operator-state
+persistence happens at cycle end, after the database commit, and a crash
+between them causes exactly this harmless replay (a true no-op — nothing
+dirty, not merely an idempotent overwrite).
+
+### The precise guarantee (resolves the "always advances" vs. "can remain
+### indefinitely" contradiction above)
+
+- **Guaranteed to trigger recomputation, with the mechanism**: any change
+  to a `period_type='quarter'` row's `fiscal_period`, `flow_type`,
+  `direction`, `counterparty_id`, `amount_usd`, `currency`,
+  `source_filing`, or `confidence` — insert, correction (delete+
+  re-insert, matching the one real writer, `_write_rows`), in-place
+  update, deletion, or reclassification of `period_type` away from
+  `'quarter'` — changes that actor's fingerprint and marks it dirty on
+  the NEXT `compute_ttm` call. This holds regardless of commit order,
+  regardless of `as_of`, and regardless of which fiscal period is
+  touched.
+- **Guaranteed removal, with the mechanism**: once dirty, an actor's
+  existing `ttm` group that no longer has exactly 4 trailing quarterly
+  rows within a 320-day span (compute_ttm's pre-existing, unchanged
+  qualification rule) is DELETEd in the same statement/transaction as the
+  recompute — including the case where an actor has zero quarterly rows
+  left at all.
+- **The exact unsupported case(s), stated precisely — no blanket
+  "incremental" acceptance request**: the fingerprint covers exactly the
+  eight columns listed above, scoped to `period_type='quarter'` rows. A
+  write that changes some OTHER column of an existing quarter row (not
+  reachable through the one real writer, `_write_rows`, which always
+  DELETEs and re-INSERTs the full row — every fingerprinted column moves
+  together on every write) would not be detected. Concretely: a
+  hypothetical future writer, or an operator hand-editing the table
+  directly with SQL, that runs `UPDATE capital_flows SET
+  <some-non-fingerprinted-column> = ... WHERE period_type='quarter'`
+  without touching any of the eight fingerprinted columns leaves the
+  fingerprint unchanged and that actor NOT marked dirty. No trigger is
+  used (Design C from the brief was not needed), so there is no
+  "triggers disabled" exception to state separately — the whole mechanism
+  is a plain query `compute_ttm` runs itself, always active whenever
+  `compute_ttm` is called.
+
+### The four PG tests (real concurrency, two independent connections/
+### transactions per commit-order case)
+
+All in `tests/test_capital_flow_rollups_pg.py` (plus the pre-existing
+`tests/test_capital_flow_rollups.py` and the no-DB
+`tests/test_capital_flow_rollups_tracking.py`, both updated to match —
+see below):
+
+1. **Late-committing earlier as_of** —
+   `test_late_committing_earlier_as_of_is_recomputed` (connection A opens
+   a transaction, corrects a quarter row, holds it uncommitted while an
+   unrelated actor commits with a LATER as_of and connection B runs
+   `compute_ttm`, THEN A commits, THEN `compute_ttm` runs again — the
+   correction is picked up) and its variant
+   `test_late_committing_row_with_explicit_older_as_of_is_recomputed`
+   (same proof with an explicitly backdated `as_of`, sequential — the
+   fingerprint design doesn't read `as_of` at all, so no concurrency is
+   even needed to demonstrate this half).
+2. **Equal timestamps** —
+   `test_equal_as_of_timestamps_do_not_skip_the_second_actor` (two
+   actors share the exact same `as_of` on their newest quarter row, one
+   processed in run 1, the other inserted after with the identical
+   `as_of` — recomputed on run 2 regardless of `>` vs `>=`).
+3. **Removal / reclassification** —
+   `test_deleted_quarter_row_without_reinsert_triggers_recompute_and_removes_ttm`
+   (3a, plain DELETE), `test_reclassified_quarter_row_triggers_recompute_and_removes_ttm`
+   (3b, `UPDATE ... SET period_type='annual'`),
+   `test_all_quarter_rows_deleted_removes_stale_ttm_row` (3c, every
+   quarter row gone — asserts the stored fingerprint goes to NULL, not
+   just stops updating).
+4. **Replay harmlessness** —
+   `test_replay_after_crash_before_watermark_persist_is_a_harmless_noop`
+   (run 1 commits and returns a new tracking value; the "crash" is
+   simulated by calling `compute_ttm` again with the OLD, pre-run-1
+   value; asserts `rows_written == 0` on the replay — a true no-op, not
+   merely idempotent — and byte-identical rows).
+
+Two pre-existing baseline tests were also kept, updated for the new
+design: `test_first_time_actor_is_recomputed_regardless_of_watermark_param`
+(was `test_only_actor_with_row_newer_than_watermark_is_recomputed` —
+inverted, since the old assertion, "an actor with no row newer than the
+watermark is skipped," is exactly the behavior being replaced) and
+`test_failed_call_writes_nothing_and_a_later_call_is_unaffected` (kept,
+but its failure-forcing mechanism changed: the old `:watermark`-cast
+trick no longer applies since `:watermark` isn't bound by the SQL any
+more, so it now monkeypatches `_TTM_UPSERT_SQL` to a statement that
+raises a genuine PostgreSQL error while still consuming the real bind
+parameters). `tests/test_capital_flow_rollups.py`'s
+`test_compute_ttm_watermark_skips_actor_with_no_row_since_watermark` was
+similarly inverted and renamed
+`test_compute_ttm_watermark_param_does_not_gate_recompute`.
+`tests/test_capital_flow_rollups_tracking.py` (no-DB, fake engine) was
+rewritten: its old structural guards asserted the RETIRED design's SQL
+shape (a `_TTM_NEW_WATERMARK_SQL` companion query, a `changed_actors` CTE
+with no `fiscal_period` predicate) — replaced with guards for the new
+shape (`capital_flows_ttm_state`, `quarter_fingerprint`,
+`IS DISTINCT FROM` present; `:watermark` bind-parameter absent; exactly
+ONE statement per `compute_ttm` call). Its `run_all` failure/retry and
+`OperatorState` hydration tests did not depend on internal SQL shape and
+are unchanged.
+
+### Coordinator: applying the migration and running the PG tests
+
+Apply the new migration to the disposable database first (idempotent —
+`CREATE TABLE IF NOT EXISTS`):
+
+```
+alembic -c alembic.ini -x db_url=$GRID_TEST_DB_URL upgrade head
+```
+
+(or however the coordinator's existing disposable-DB setup applies
+migrations — this is the one new file, `migrations/versions/
+capital_flow_ttm_state_20260920.py`, `down_revision =
+'god_view_market_tables_20260918'`). Then:
+
+```
+GRID_TEST_DB_URL=postgresql://user:pass@host:5432/disposable_db \
+DB_PASSWORD=x PYTHONUTF8=1 python -m pytest \
+  tests/test_capital_flow_rollups_pg.py -v
+```
+
+Every test creates and cleans up its own uniquely-prefixed
+(`rollup_test_<uuid>`) rows in both `capital_flows` and the new
+`capital_flows_ttm_state`; none assume pre-seeded data.
+
+### What was NOT done (disclosed)
+
+- No trigger-maintained fingerprint (Design C) — not needed, Design B
+  alone passes all four required cases; disclosed as a future
+  optimization only if the full-quarter-table scan cost above ever
+  becomes measured (not just estimated) to matter.
+- `pg_visible_in_snapshot`/Design A was evaluated and deliberately not
+  used (see "Why not also Design A" above) — not a gap, a documented
+  choice.
+- `OperatorState.capital_flow_ttm_watermark` and the `watermark`/
+  `ttm_watermark` parameters were left in place, unused for gating,
+  rather than removed — removing them would touch
+  `scripts/hermes_operator.py`, `scripts/hermes_health.py`, and
+  `scripts/run_capital_flow_rollups.py`'s call signatures and every
+  test that constructs `OperatorState` for this field, for no
+  correctness benefit. Disclosed, not silently left as dead-looking
+  code: every touched docstring says plainly that it is now vestigial.

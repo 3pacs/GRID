@@ -70,6 +70,11 @@ def cleanup_test_rows(pg_engine: Engine, test_actor_id: str):
                 a=test_actor_id,
             ),
         )
+        conn.execute(
+            text("DELETE FROM capital_flows_ttm_state WHERE actor_id = :a").bindparams(
+                a=test_actor_id,
+            ),
+        )
 
 
 def _insert_quarter(
@@ -121,10 +126,12 @@ def _insert_quarter_stale(
     source_filing: str = "10-Q test",
 ) -> None:
     """Like ``_insert_quarter`` but with an explicit, backdated ``as_of``
-    (fable-daily-intel-sql-tasks, 2026-09-20) — used to simulate a
-    quarterly row that has NOT changed recently, so
-    ``compute_ttm``'s bounded ``changed_actors`` filter should exclude
-    the actor from a default-lookback run."""
+    (fable-daily-intel-sql-tasks, 2026-09-20) — used to prove
+    ``compute_ttm``'s dirty-actor gating (content-fingerprint based since
+    the 2026-09-20 SECOND follow-up; see
+    ``intelligence/company_financial_rollups.py``'s module docstring)
+    does not care how "recent" a row's ``as_of`` looks, only whether its
+    content differs from what was last durably recorded."""
     with engine.begin() as conn:
         conn.execute(
             text(
@@ -319,18 +326,21 @@ def test_compute_ttm_skips_when_under_four_quarters(
     assert rows == [], f"expected no TTM rows, got {rows}"
 
 
-def test_compute_ttm_watermark_skips_actor_with_no_row_since_watermark(
+def test_compute_ttm_watermark_param_does_not_gate_recompute(
     pg_engine: Engine, test_actor_id: str,
 ):
-    """fable-daily-intel-sql-tasks (2026-09-20 follow-up): TTM_LOOKBACK_DAYS
-    was replaced with a durable, persisted watermark (see
-    intelligence/company_financial_rollups.py's module docstring and
-    tests/test_capital_flow_rollups_pg.py for the full design). An actor
-    whose quarterly rows are all older than an EXPLICIT watermark is
-    excluded from the ``changed_actors`` filter — no TTM row is written
-    for it, even though it has 4 qualifying trailing quarters. This pins
-    the bounded-recompute property that keeps compute_ttm off a full-table
-    scan/window computation on every daily-intel cycle.
+    """fable-daily-intel-sql-tasks (2026-09-20, SECOND follow-up):
+    superseded test. The original version of this test pinned a scalar
+    ``as_of`` watermark excluding an actor whose rows were all older than
+    it — the controller established that mechanism is NOT commit-order
+    safe (see intelligence/company_financial_rollups.py's module
+    docstring and tests/test_capital_flow_rollups_pg.py's case-1/case-2
+    tests for the concurrent-connection proofs) and it was replaced with
+    a durable per-actor content fingerprint. Under the new design, an
+    EXPLICIT watermark — even one that would have excluded this actor
+    under the retired design — has NO effect: the actor is first-time-
+    seen (no capital_flows_ttm_state row yet), so it is recomputed
+    regardless.
     """
     quarters = [
         (date(2024, 3, 31), 100.0),
@@ -345,24 +355,27 @@ def test_compute_ttm_watermark_skips_actor_with_no_row_since_watermark(
 
     with pg_engine.connect() as conn:
         watermark = conn.execute(
-            text("SELECT (NOW() - make_interval(days => 3))"),
+            text("SELECT NOW() - make_interval(days => 3)"),
         ).fetchone()[0].isoformat()
-    compute_ttm(pg_engine, watermark)  # 3 days ago — misses the 30-day-old actor
+    compute_ttm(pg_engine, watermark)  # would have excluded a 30-day-old actor under the retired design
 
     rows = _fetch_ttm_rows(pg_engine, test_actor_id, "revenue")
-    assert rows == [], (
-        f"stale actor (as_of 30 days ago) must be excluded by a watermark "
-        f"newer than its rows, got {rows}"
+    latest = [r for r in rows if r["fiscal_period"] == date(2024, 12, 31)]
+    assert len(latest) == 1, (
+        f"a first-time actor must be recomputed regardless of the (now "
+        f"vestigial) watermark parameter, got {rows}"
     )
+    assert latest[0]["amount_usd"] == pytest.approx(460.0)
 
 
 def test_compute_ttm_none_watermark_picks_up_stale_actor(
     pg_engine: Engine, test_actor_id: str,
 ):
-    """``watermark=None`` is BOTH the first-ever-run default AND the
-    escape hatch for a manual full recompute (e.g.
-    scripts/run_capital_flow_rollups.py with no --watermark flag) — it
-    must still find an actor a bounded watermark would skip."""
+    """``watermark=None`` (the default, and what
+    scripts/run_capital_flow_rollups.py passes with no --watermark flag)
+    still finds a stale actor — trivially true now since the parameter
+    is vestigial and dirty-actor gating is decided entirely by comparing
+    content against ``capital_flows_ttm_state``, never by ``as_of``."""
     quarters = [
         (date(2024, 3, 31), 100.0),
         (date(2024, 6, 30), 110.0),

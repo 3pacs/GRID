@@ -207,15 +207,19 @@ DAILY_INTEL_DISPATCH_TASK_BUDGET_S = DAILY_INTEL_SQL_TASK_BUDGET_S  # storage_ma
 #   ONE production number this task has ever actually measured
 #   completing is fold_announcements alone — 16s (see
 #   docs/handoffs/2026-09-20/fable-daily-intel-sql-tasks.md's evidence
-#   quote, 07:51:13->07:51:29). compute_ttm is now bounded to actors
-#   with a quarterly row newer than the persisted
-#   OperatorState.capital_flow_ttm_watermark rather than the full table
-#   — cheap on a normal day, but evidence-uncertain on a catch-up day
-#   after downtime (more actors fall past the watermark at once). 90s
+#   quote, 07:51:13->07:51:29). compute_ttm's expensive ROW_NUMBER/
+#   window recompute is still bounded to DIRTY actors only — but as of
+#   the 2026-09-20 SECOND follow-up, dirtiness is decided by a per-actor
+#   content-fingerprint comparison (capital_flows_ttm_state), not by
+#   OperatorState.capital_flow_ttm_watermark (now vestigial — see
+#   intelligence/company_financial_rollups.py's module docstring for
+#   why the scalar watermark was replaced). That comparison itself DOES
+#   read every quarter row every cycle (a single GROUP BY aggregate
+#   scan, not a window function) — cheap on a normal day at the ~310k-
+#   row scale measured here, but evidence-uncertain on a catch-up day
+#   after downtime (more actors dirty at once, more window work). 90s
 #   keeps ~5.6x headroom over the one measured baseline (16s) for that
-#   uncertainty while staying a small fraction of the 480s cycle budget
-#   — NOT "wait longer for the same unbounded scan," since the scan
-#   itself no longer touches the full table.
+#   uncertainty while staying a small fraction of the 480s cycle budget.
 #
 #   fundamental_divergence (60s, UNCHANGED from the shared default):
 #   batching collapses the ~4,500-6,000 sequential per-ticker round
@@ -1571,14 +1575,19 @@ def _daily_intel_capital_flow_rollups(
     so it always sees the freshest base rows (corporate_actions dispatched
     just before this in DAILY_INTEL_TASKS, same as before this task).
 
-    compute_ttm's recompute is bounded by the durable, restart-safe
-    watermark on ``state.capital_flow_ttm_watermark`` (fable-daily-intel-
-    sql-tasks, 2026-09-20 follow-up — replaces the earlier fixed
-    ``TTM_LOOKBACK_DAYS=3`` window; see
+    compute_ttm's recompute is bounded to DIRTY actors, decided by a
+    durable per-actor content fingerprint (``capital_flows_ttm_state``) —
+    fable-daily-intel-sql-tasks, 2026-09-20 SECOND follow-up. This
+    replaced the first follow-up's scalar ``as_of`` watermark
+    (``state.capital_flow_ttm_watermark``), which the controller
+    established is NOT commit-order safe (see
     ``intelligence/company_financial_rollups.py``'s module docstring for
-    the full design). The watermark is advanced here, unconditionally as
-    soon as ``run_all`` reports ``ttm_ok`` — the DB write it corresponds
-    to already committed inside ``compute_ttm``'s own transaction,
+    the full design and why). ``state.capital_flow_ttm_watermark`` is
+    still set here, unconditionally, as soon as ``run_all`` reports
+    ``ttm_ok`` — but it is now purely informational telemetry (the wall-
+    clock time the run completed), not a gating cursor; the state that
+    actually governs recomputation already committed, atomically with
+    the ttm rows themselves, inside ``compute_ttm``'s own transaction,
     regardless of whether this ledger later credits the attempt as
     done/done_late/abandoned (see the "abandonment truth" doc on
     ``_run_daily_intel_block``: an abandoned run still performs its DB

@@ -449,24 +449,26 @@ class OperatorState:
         self.daily_intel_period_outcome: str | None = None
 
         # capital_flow_ttm_watermark (fable-daily-intel-sql-tasks,
-        # 2026-09-20 follow-up): durable, restart-safe tracking cursor for
-        # intelligence/company_financial_rollups.py::compute_ttm — the
-        # ISO-8601 string of the highest capital_flows.as_of (period_
-        # type='quarter') already considered by a successful compute_ttm
-        # run, or None before the first successful run (which then
-        # recomputes every actor, unconditionally — see compute_ttm's
-        # docstring). Replaces the earlier fixed TTM_LOOKBACK_DAYS=3
-        # window, which silently missed both a downtime gap longer than 3
-        # days and a late correction to an OLD fiscal period that arrived
-        # more than 3 days after the correction. Advanced by
-        # scripts/hermes_operator.py::_daily_intel_capital_flow_rollups
-        # ONLY after compute_ttm's own UPSERT transaction has committed —
-        # a cancelled/failed run leaves this exactly where it was, so the
-        # next call recomputes the identical actor set (see compute_ttm's
-        # advance-after-write contract). Persisted/hydrated the same
-        # "only if currently unset" way as the daily-intel ledger fields
-        # above — a single scalar, so it lives directly on OperatorState
-        # rather than a new table.
+        # 2026-09-20 follow-up; made VESTIGIAL by the SAME-DAY SECOND
+        # follow-up): originally a durable, restart-safe scalar ``as_of``
+        # cursor gating intelligence/company_financial_rollups.py::
+        # compute_ttm's recompute set. The controller established that
+        # design is NOT commit-order safe — PostgreSQL's NOW() is
+        # transaction-START time, so a late-committing writer can carry
+        # an as_of this cursor already passed, permanently skipping it
+        # (see that module's docstring for the full writeup and
+        # tests/test_capital_flow_rollups_pg.py for the concurrent-
+        # connection proofs). Replaced with a durable PER-ACTOR content
+        # fingerprint stored in ``capital_flows_ttm_state`` (migration
+        # ``capital_flow_ttm_state_20260920``), committed atomically with
+        # the ttm rows it governs — no caller-owned cursor is load-
+        # bearing for correctness any more. This field is KEPT, still set
+        # by scripts/hermes_operator.py::_daily_intel_capital_flow_
+        # rollups as soon as ``run_all`` reports ``ttm_ok``, purely as
+        # telemetry (the ISO-8601 wall-clock time the run completed) —
+        # removing it would touch call signatures with no correctness
+        # benefit. Persisted/hydrated the same "only if currently unset"
+        # way as the daily-intel ledger fields above.
         self.capital_flow_ttm_watermark: str | None = None
 
         # Bounded-repair backlog (fable-hermes-repair-bound, 2026-09-19):
