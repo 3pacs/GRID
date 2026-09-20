@@ -1699,11 +1699,6 @@ DAILY_INTEL_INITIAL_ALLOWLIST: frozenset[str] = frozenset({
     # (scripts/hermes_fixers.py::_execute_hermes_repair_command,
     # DISPATCH_SUBAGENT branch -> intelligence.goal_queue.enqueue_goal).
     "storage_maintenance_subagent",
-    # ingestion/flow_materializer.py::sync_all — deterministic projection
-    # of signal_sources into relational flow tables (dark_pool_weekly,
-    # etf_flows, insider_trades, congressional_trades,
-    # junction_point_readings). No LLM, no learning table.
-    "flow_materialize",
     # intelligence/icij_linker.py::link_actors — deterministic fuzzy
     # string matching against ICIJ offshore-entity records. No LLM.
     "icij_linking",
@@ -1745,6 +1740,20 @@ DAILY_INTEL_INITIAL_ALLOWLIST: frozenset[str] = frozenset({
 # must appear in EXACTLY ONE of DAILY_INTEL_INITIAL_ALLOWLIST /
 # DAILY_INTEL_HOLD_REASONS) rather than only documented in prose.
 DAILY_INTEL_HOLD_REASONS: dict[str, str] = {
+    "flow_materialize": (
+        "held for the INITIAL subset by the release coordinator (2026-09-20): "
+        "a LIVE systemd timer on grid-svr, grid-flow-materializer.timer "
+        "(enabled, every 30 min, Persistent), runs the same "
+        "ingestion.flow_materializer.sync_all from the OLD checkout "
+        "/home/grid/grid_v4/grid_repo as a separate oneshot process; the "
+        "unit lives in /etc/systemd/system (not in server_setup/), so a "
+        "repository invocation search could not see it. Two automated "
+        "writers of the same incremental (row-count-window) keys in "
+        "different processes, which _DAILY_INTEL_IN_FLIGHT cannot "
+        "coordinate → unresolved overlapping-writer risk. The timer already "
+        "materialises every 30 min, so the Hermes daily task adds nothing; "
+        "keep it held unless cross-process coordination is implemented"
+    ),
     "source_audit": (
         "held for the INITIAL subset by the release coordinator (2026-09-20): "
         "no LLM, but its writes are not idempotent — run_full_audit "
