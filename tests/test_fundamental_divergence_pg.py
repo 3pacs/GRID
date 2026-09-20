@@ -125,7 +125,7 @@ def _seed_daily_success_rows(
                 )
                 SELECT
                     :sid, :src,
-                    (:as_of::date - i),
+                    (CAST(:as_of AS date) - i),
                     NOW() - INTERVAL '1 hour',
                     100.0 * POWER(1.0 + :rate, :n - i),
                     'SUCCESS'
