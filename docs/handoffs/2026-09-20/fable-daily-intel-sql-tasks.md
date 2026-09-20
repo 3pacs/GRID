@@ -86,8 +86,8 @@ sum a correct trailing-4-quarter total — only the *actor set* is bounded,
 not the per-actor lookback, so correctness (and idempotency — ON CONFLICT
 DO UPDATE is untouched) is unaffected. `compute_ttm(engine,
 lookback_days=None)` is kept as an explicit full-recompute escape hatch
-for `scripts/run_capital_flow_rollups.py` (manual backfill use, not the
-daily hermes path). No index change was needed: the `changed_actors` CTE's
+(see the corrected classification below — it is not currently wired to
+any `scripts/run_capital_flow_rollups.py` CLI flag). No index change was needed: the `changed_actors` CTE's
 `WHERE period_type='quarter' AND as_of >= ...` filter is an unindexed
 sequential scan, but at 238 MB / ~310k quarter rows that is a
 sub-second cost — the removed cost was the window/sort computation across
@@ -139,6 +139,38 @@ batch-query exception now costs the whole universe that metric for the
 cycle. Both batch loaders keep the same fail-soft shape (log + return
 `None`/empty) at that coarser granularity, matching how `_table_exists`
 already gates the whole function today.
+
+## Stale-write classification restated (post-review, `TTM_LOOKBACK_DAYS=3`)
+
+CI review flagged that the diagnosis above doesn't say plainly what
+`compute_ttm`'s bounding does to `ttm` freshness, so restating without
+softening it:
+
+- `capital_flow_rollups` is now an **INCREMENTAL writer for `ttm` rows**,
+  not a full recompute: `run_all`'s `compute_ttm(engine)` call (the only
+  one on the daily hermes path) recomputes a `ttm` row only for actors
+  with a `period_type='quarter'` row whose `as_of` falls inside the
+  trailing `TTM_LOOKBACK_DAYS = 3`-day window.
+- A `ttm` key for an actor with **no** new quarterly row in that window
+  goes stale and **nothing rewrites it automatically** — not the next
+  daily cycle, and not `scripts/run_capital_flow_rollups.py` either:
+  every path that script exposes today (bare invocation → `run_all`,
+  `--ttm-only`, `--rollup-only` skips `compute_ttm` entirely) still calls
+  `compute_ttm(engine)` with the same bounded 3-day default. The
+  `compute_ttm(engine, lookback_days=None)` full-recompute escape hatch
+  exists as a function argument (and is unit-tested), but **no CLI flag
+  wires it up** — the docstring's claim that
+  `scripts/run_capital_flow_rollups.py` is how you'd reach it is
+  currently wrong. Today the only way to force a full `ttm` recompute is
+  calling `compute_ttm(engine, lookback_days=None)` directly (e.g. a
+  one-off Python/REPL invocation) — there is no packaged/CLI path. That
+  gap is disclosed here, not fixed, since wiring a CLI flag is outside
+  this PR's three scoped tasks.
+- `fold_announcements` is **unaffected and remains a full recompute every
+  run** — `_ROLL_UPSERT_SQL` groups ALL `period_type='announcement'` rows
+  unconditionally on every call, with no changed-actor scoping. So
+  `announcement_rolled` (`period_type='annual'`) rows do not have this
+  staleness class; only `ttm` rows do.
 
 ## Migration: not included, deliberately
 

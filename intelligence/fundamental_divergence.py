@@ -458,12 +458,17 @@ def _load_batch_price_cagrs(
     series_ids = [f"YF:{t.upper()}:close" for t in tickers]
     sid_to_ticker = {sid: t for sid, t in zip(series_ids, tickers)}
 
+    # SUCCESS-only, matching the per-ticker reads' intent: a raw_series row
+    # with pull_status = 'FAILED' (value=0, obs_date=today) or 'PARTIAL'
+    # must never count toward MIN_PRICE_OBS or be picked as the latest/prior
+    # close (see .claude/rules/data-integrity.md and store/observations.py).
     count_rows = conn.execute(
         text(
             """
             SELECT series_id, COUNT(*) AS n
             FROM raw_series
             WHERE series_id = ANY(:sids) AND value IS NOT NULL
+              AND pull_status = 'SUCCESS'
             GROUP BY series_id
             """
         ).bindparams(sids=series_ids)
@@ -475,6 +480,10 @@ def _load_batch_price_cagrs(
         return out
 
     def _latest_by_sid(d: date) -> dict[str, tuple[float, Any]]:
+        # DISTINCT ON (series_id) keeps the first row per series in ORDER BY
+        # order, so ordering by obs_date DESC, pull_timestamp DESC picks the
+        # latest vintage of the latest accepted obs_date — the same
+        # SUCCESS + latest-pull_timestamp tiebreak store/observations.py uses.
         result = conn.execute(
             text(
                 """
@@ -483,7 +492,8 @@ def _load_batch_price_cagrs(
                 WHERE series_id = ANY(:sids)
                   AND obs_date <= :d
                   AND value IS NOT NULL
-                ORDER BY series_id, obs_date DESC
+                  AND pull_status = 'SUCCESS'
+                ORDER BY series_id, obs_date DESC, pull_timestamp DESC
                 """
             ).bindparams(sids=eligible_sids, d=d)
         ).fetchall()

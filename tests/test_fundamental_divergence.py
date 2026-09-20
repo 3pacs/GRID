@@ -200,6 +200,43 @@ def test_load_batch_price_cagrs_computes_per_ticker_and_respects_min_obs():
     assert out["AAA"] == pytest.approx(0.0)
 
 
+def test_load_batch_price_cagrs_filters_pull_status_success():
+    """Regression guard for the raw_series read-guard fix: both new
+    batched raw_series reads (the MIN_PRICE_OBS count and the
+    DISTINCT ON latest/prior vintage lookup) must filter
+    pull_status = 'SUCCESS', the same way store/observations.py and
+    the sanctioned per-ticker pattern do. Without this, a FAILED pull
+    (value=0, obs_date=today) or a stale PARTIAL vintage could feed
+    the batched CAGR the way tests/test_raw_series_read_guard.py
+    exists to catch file-wide."""
+    as_of = date(2026, 4, 11)
+    captured: list[str] = []
+
+    def side_effect(sql: str):
+        captured.append(sql)
+        s = sql.lower()
+        if "to_regclass" in s:
+            return _res(one=_regclass("public.x"))
+        if "count(*)" in s and "from raw_series" in s:
+            return _res(rows=[("YF:AAA:close", 800)])
+        if "distinct on" in s and "from raw_series" in s:
+            return _res(rows=[("YF:AAA:close", 120.0, as_of)])
+        return _res()
+
+    engine = _make_engine(side_effect)
+    with engine.connect() as conn:
+        fd._load_batch_price_cagrs(conn, ["AAA"], as_of)
+
+    raw_series_reads = [sql for sql in captured if "from raw_series" in sql.lower()]
+    # 1 count query + 2 DISTINCT ON calls (_latest_by_sid runs once for
+    # `as_of` and once for the prior-3y date).
+    assert len(raw_series_reads) == 3, "expected the count + 2 DISTINCT ON reads"
+    for sql in raw_series_reads:
+        assert "pull_status" in sql and "SUCCESS" in sql, (
+            f"raw_series read missing pull_status = 'SUCCESS' filter: {sql}"
+        )
+
+
 def test_load_batch_price_cagrs_missing_table_returns_all_none():
     engine = _make_engine(lambda sql: _res(one=(None,)) if "to_regclass" in sql.lower() else _res())
     with engine.connect() as conn:
