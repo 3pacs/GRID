@@ -53,7 +53,7 @@ import traceback
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 # Ensure grid/ is on sys.path
 _GRID_DIR = str(Path(__file__).resolve().parent.parent)
@@ -135,8 +135,8 @@ RESOLUTION_TIMEOUT_SECONDS = 420              # normalization.resolver.Resolver.
 SMART_INGESTION_TIMEOUT_SECONDS = 300         # smart_scheduler.tick() — matches TICK_TIME_BUDGET_S in ingestion/smart_scheduler.py so Hermes doesn't pull the plug while SmartScheduler is mid-shutdown
 TIMESFM_TIMEOUT_SECONDS = 240                 # oracle/forecaster_adapter.run_timesfm_forecast_cycle
 ASTROGRID_CELESTIAL_TIMEOUT_SECONDS = 240      # oracle.astrogrid_cycle.run_celestial_cycle: deterministic sky build is sub-second; the budget is almost entirely the one local-LLM interpretation call (num_predict=1200). Degrades to a deterministic fallback if the model is offline, so a timeout here means the model was slow, not absent.
-DAILY_INTEL_BATCH_OBSERVED_S = 360            # observed run length of the 02:00 daily block (source_audit → backtest_scan → postmortem → options_improvement → hypothesis_review → auto_discover) with LLM calls, measured 2026-05-08
-INTELLIGENCE_TASKS_TIMEOUT_SECONDS = 900      # whole run_intelligence_tasks() step. MUST exceed ACTIVE_HYPO_SCORING_MAX_RUNTIME_S + DAILY_INTEL_BATCH_OBSERVED_S: the 30-min active-hypothesis scorer runs FIRST inside this step, so if its budget alone exceeds this cap the step times out before the daily block — and auto_discover() — is ever reached. That inversion (360s cap vs 600s scorer) is how hypothesis discovery starved from 2026-05-15 onward. Was 360 (2026-05-08); raised 2026-09-10. tests/test_hermes_timeout_budgets.py pins the invariant.
+DAILY_INTEL_BATCH_OBSERVED_S = 360            # HISTORICAL — observed run length of the OLD monolithic 02:00 daily block (source_audit → backtest_scan → postmortem → options_improvement → hypothesis_review → auto_discover) with LLM calls, measured 2026-05-08. Superseded by DAILY_INTEL_CYCLE_BUDGET_SECONDS below for the timeout-budget pin (fable-daily-intel-resumable, 2026-09-20) — kept only because it is a documented historical measurement other notes reference; nothing computes with it anymore.
+INTELLIGENCE_TASKS_TIMEOUT_SECONDS = 900      # whole run_intelligence_tasks() step. MUST exceed ACTIVE_HYPO_SCORING_MAX_RUNTIME_S + DAILY_INTEL_CYCLE_BUDGET_SECONDS + 60: the 30-min active-hypothesis scorer runs FIRST inside this step, so if its budget plus the daily-intel block's own per-cycle budget (plus headroom for the earnings-sync bookkeeping ahead of both) exceeds this cap, the step times out before the daily block ever gets a turn. That inversion (360s cap vs 600s scorer) is how hypothesis discovery starved from 2026-05-15 onward, and — after the 2026-09-10 raise — the still-unbounded daily block re-created the same starvation one level down (fable-daily-intel-resumable, 2026-09-20: the block itself, not just the scorer, could run unbounded and get orphaned mid-list every cycle after 02:00Z). The per-task/per-cycle budgets on DAILY_INTEL_TASKS + DAILY_INTEL_CYCLE_BUDGET_SECONDS below fix that. tests/test_hermes_timeout_budgets.py pins the invariant.
 SECTOR_HEALTH_TIMEOUT_SECONDS = 120           # whole sector-health snapshot step (scripts/hermes_operator.py::_run_sector_health_step), split out of run_intelligence_tasks on 2026-09-19 into its own dispatch with its own timeout. Observed run time for ~20 sectors is 3-8s; 120s is generous headroom, not a sized budget like INTELLIGENCE_TASKS_TIMEOUT_SECONDS above. Deliberately independent of that 900s budget: production traces show intelligence_tasks times out on essentially every cycle (the daily block runs with catch_up=True every cycle, so it never reaches state.last_daily_intel = now, and the sector-health call used to run AFTER that point — i.e. never). Giving this step its own short timeout, dispatched before intelligence_tasks, makes it reachable regardless of whether intelligence_tasks times out. See docs/handoffs/2026-09-19/fable-hermes-sector-schedule.md ("Parent-timeout blocker and own-step fix").
 POSTMORTEM_BATCH_LIMIT = 20                   # Drain postmortem backlog in bounded chunks instead of orphaning long LLM loops.
 
@@ -154,6 +154,33 @@ POSTMORTEM_BATCH_LIMIT = 20                   # Drain postmortem backlog in boun
 ACTIVE_HYPO_SCORING_BATCH_SIZE = 200
 ACTIVE_HYPO_SCORING_MAX_RUNTIME_S = 240
 ACTIVE_HYPO_SCORING_INTERVAL_MINUTES = 30
+
+# Daily intelligence batch (fable-daily-intel-resumable, 2026-09-20) — see
+# DAILY_INTEL_TASKS and _run_daily_intel_block below.
+#
+# Traced defect: the old daily block (formerly inline in
+# run_intelligence_tasks under "Daily at 2:00 AM") ran ~20 sequential tasks
+# in one undifferentiated try/except chain with NO timeout of its own,
+# inside the 900s INTELLIGENCE_TASKS_TIMEOUT_SECONDS step. Production was
+# abandoned at 900s on every post-02:00Z cycle before reaching
+# `state.last_daily_intel = now`, so the whole block restarted from the
+# top as catch-up every cycle and nothing past the first ~10 minutes of it
+# (hypothesis_discovery, rag_index, actor_research, ... onward) ever ran —
+# hypothesis discovery starved since 2026-09-17.
+#
+# Fix: each task now runs under its OWN _run_with_timeout budget
+# (DailyIntelTask.budget_s) and a persisted per-period ledger
+# (OperatorState.daily_intel_done/daily_intel_attempts) tracks which tasks
+# are already done for the current due period, so a restart or a new cycle
+# resumes from the first undone task instead of re-running everything.
+DAILY_INTEL_BOUNDARY_HOUR = 2                 # UTC hour the daily-intel due-period opens — matches the block's pre-existing "Daily at 2:00 AM" schedule (daily_task_due's boundary-hour convention, same helper the sector-health scheduler uses with boundary_hour=3).
+DAILY_INTEL_MAX_ATTEMPTS = 3                  # a task that fails (timeout or exception) this many times within one due period is marked skipped_for_period so it cannot block the tasks behind it forever.
+DAILY_INTEL_CYCLE_BUDGET_SECONDS = 480        # cumulative wall-time budget for the daily-intel block PER CYCLE, checked before starting each task (not mid-task). When exhausted, the block stops for this cycle and _run_daily_intel_block resumes from the first undone task on the next due call. Pin: ACTIVE_HYPO_SCORING_MAX_RUNTIME_S + DAILY_INTEL_CYCLE_BUDGET_SECONDS + 60 <= INTELLIGENCE_TASKS_TIMEOUT_SECONDS (240 + 480 + 60 = 780 <= 900) — the +60 covers the earnings-calendar-sync SQL call and active-hypo-scoring bookkeeping that run ahead of both in the same step. tests/test_hermes_timeout_budgets.py pins this.
+DAILY_INTEL_LLM_TASK_BUDGET_S = 180           # documented default per-task budget for LLM-backed daily-intel tasks (source_audit, backtest_scan, options_improvement, hypothesis_review, hypothesis_discovery, rag_index, actor_research, edgar_transcripts) — sized like the other single-to-few-call LLM steps above (e.g. TIMESFM_TIMEOUT_SECONDS, KNOWLEDGE_MAP_TIMEOUT_SECONDS), not the many-ticker ORACLE_CYCLE_TIMEOUT_SECONDS.
+DAILY_INTEL_SQL_TASK_BUDGET_S = 60            # documented default per-task budget for SQL/CPU-only daily-intel tasks (flow_materialize, icij_linking, milestone_scoring, attention_anomaly, corporate_actions, capital_flow_rollups, fundamental_divergence, holder_deal_overlap) — matches SMART_INGESTION/RESOLUTION-class steps, generous headroom over the sub-10s runtimes those steps observe.
+DAILY_INTEL_CLEANUP_TASK_BUDGET_S = 30        # documented default per-task budget for the three daily-intel file/log cleanup tasks (insight_cleanup, briefing_cleanup, errors_jsonl_cleanup) — cheap filesystem work, not DB or LLM bound.
+DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S = DAILY_INTEL_LLM_TASK_BUDGET_S  # postmortem_batch is LLM-backed but bounded on the WORK axis by POSTMORTEM_BATCH_LIMIT (20 rows/cycle, see above) rather than its own time constant; the time budget still uses the LLM default.
+DAILY_INTEL_DISPATCH_TASK_BUDGET_S = DAILY_INTEL_SQL_TASK_BUDGET_S  # storage_maintenance_subagent only QUEUES a subagent dispatch command (_execute_hermes_repair_command) — no LLM call in this step itself — so it gets the SQL-class default, not the LLM one.
 
 # Sector health snapshot — daily due-period scheduling (2026-09-19). Was
 # "now.hour == 3 and now.minute < 10", which only fired on the rare cycle
@@ -1216,6 +1243,520 @@ def _run_sector_and_intelligence_steps(
         log.warning("Intelligence tasks failed: {e}", e=str(exc))
 
 
+# ─── Daily intelligence batch — task table (fable-daily-intel-resumable) ──
+#
+# Each function below is one step of the old monolithic 02:00 UTC daily
+# block, moved verbatim (same imports, same log lines, same results[...]
+# keys) into its own callable. The ONE behavioral change versus the
+# pre-existing body: the bare `try/except Exception: log.warning(...)`
+# that used to wrap each step (swallowing the failure so the sequential
+# block could keep going) is gone — that job now belongs to
+# _run_with_timeout, called once per task by _run_daily_intel_block below,
+# which is what makes each task's success/failure visible to the per-period
+# ledger (state.daily_intel_done/daily_intel_attempts). A task that used to
+# silently log "X import failed" and move on now silently logs
+# "Step 'daily_intel:X' raised: ..." (via _run_with_timeout) and moves on
+# — same effect, but now the ledger also counts the attempt.
+#
+# `_run_intel_task` (scripts/hermes_fixers.py) already swallows exceptions
+# from the call it wraps (returns None, records state.task_status, logs a
+# warning) — for the six tasks that use it, _daily_intel_raise_if_task_
+# status_failed re-raises when task_status shows failure, so
+# _run_with_timeout still sees it.
+
+
+def _daily_intel_raise_if_task_status_failed(state: OperatorState, name: str) -> None:
+    """Make a `_run_intel_task`-swallowed failure visible to `_run_with_timeout`.
+
+    `_run_intel_task` records the outcome on `state.task_status[name]` and
+    returns None instead of raising. Without this check, every daily-intel
+    task that goes through `_run_intel_task` would report ok=True to
+    `_run_with_timeout` (and therefore "done" to the per-period ledger)
+    even when the wrapped call actually raised — only a genuine timeout
+    would ever be visible. This is the only behavioral addition versus the
+    pre-existing task body.
+    """
+    status = state.task_status.get(name)
+    if status is not None and status.get("success") is False:
+        raise RuntimeError(status.get("error") or f"{name} failed")
+
+
+def _daily_intel_storage_maintenance(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Queue the bounded storage-maintenance subagent. Dispatch only — no
+    LLM call in this step itself (see DAILY_INTEL_DISPATCH_TASK_BUDGET_S)."""
+    results["storage_maintenance_subagent"] = _dispatch_daily_storage_maintenance(engine, state)
+
+
+def _daily_intel_source_audit(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    from intelligence.source_audit import run_full_audit
+    results["source_audit"] = _run_intel_task(
+        "source_audit", run_full_audit, state, engine,
+    )
+    _daily_intel_raise_if_task_status_failed(state, "source_audit")
+
+
+def _daily_intel_flow_materialize(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Projects signal_sources into the relational flow tables
+    (dark_pool_weekly, etf_flows, insider_trades, congressional_trades,
+    junction_point_readings)."""
+    from ingestion.flow_materializer import sync_all as _flow_sync_all
+    results["flow_materialize"] = _run_intel_task(
+        "flow_materialize", _flow_sync_all, state, engine,
+    )
+    _daily_intel_raise_if_task_status_failed(state, "flow_materialize")
+
+
+def _daily_intel_backtest_scan(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    from analysis.backtest_scanner import run_full_scan
+    results["backtest_scan"] = _run_intel_task(
+        "backtest_scan", run_full_scan, state, engine,
+    )
+    _daily_intel_raise_if_task_status_failed(state, "backtest_scan")
+
+
+def _daily_intel_postmortem_batch(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    from intelligence.postmortem import batch_postmortem
+    results["postmortem_batch"] = _run_intel_task(
+        "postmortem_batch", batch_postmortem, state, engine,
+        limit=POSTMORTEM_BATCH_LIMIT,
+    )
+    _daily_intel_raise_if_task_status_failed(state, "postmortem_batch")
+
+
+def _daily_intel_options_improvement(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    from trading.options_tracker import run_improvement_cycle
+    results["options_improvement"] = _run_intel_task(
+        "options_improvement", run_improvement_cycle, state, engine,
+    )
+    _daily_intel_raise_if_task_status_failed(state, "options_improvement")
+
+
+def _daily_intel_hypothesis_review(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    from analysis.backtest_scanner import review_existing_hypotheses
+    results["hypothesis_review"] = _run_intel_task(
+        "hypothesis_review", review_existing_hypotheses, state, engine,
+    )
+    _daily_intel_raise_if_task_status_failed(state, "hypothesis_review")
+
+
+def _daily_intel_hypothesis_discovery(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Auto-discover new hypotheses from data patterns. Kept its own
+    ``_hours_since(last_hypothesis_discovery) >= 20`` guard from the
+    pre-existing body — redundant with the per-period ledger now (a task
+    only runs once per period regardless), but harmless, and
+    ``state.last_hypothesis_discovery`` is still read elsewhere for
+    diagnostics (see the log line near the bottom of this module)."""
+    if _hours_since(state.last_hypothesis_discovery) >= 20:
+        from intelligence.hypothesis_engine import HypothesisGenerator
+        hyp_engine = HypothesisGenerator(engine)
+        discovered = hyp_engine.auto_discover()
+        results["hypothesis_discovery"] = {
+            "new_hypotheses": len(discovered),
+        }
+        log.info(
+            "Hypothesis discovery: {n} new hypotheses generated",
+            n=len(discovered),
+        )
+        state.last_hypothesis_discovery = now
+
+
+def _daily_intel_rag_index(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Re-embed latest intelligence data. Kept its own
+    ``_hours_since(last_rag_index) >= 20`` guard — see
+    _daily_intel_hypothesis_discovery's docstring for why that's harmless."""
+    if _hours_since(state.last_rag_index) >= 20:
+        from intelligence.rag import RAGIndexer
+        indexer = RAGIndexer(engine)
+        indexer.ensure_tables()
+        snap_count = indexer.index_snapshots()
+        actor_count = indexer.index_actors()
+        results["rag_index"] = {
+            "snapshots_indexed": snap_count,
+            "actors_indexed": actor_count,
+        }
+        log.info(
+            "RAG index refreshed: {s} snapshot chunks, {a} actor chunks",
+            s=snap_count, a=actor_count,
+        )
+        state.last_rag_index = now
+
+
+def _daily_intel_actor_research(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """LLM enriches sparse actors, follows rabbit holes."""
+    from intelligence.actor_researcher import research_batch
+    actor_result = research_batch(engine, batch_size=20)
+    results["actor_research"] = actor_result
+    log.info(
+        "Actor research: {u} enriched, {n} new actors, {r} rabbit holes",
+        u=actor_result.get("updated", 0),
+        n=actor_result.get("new_actors", 0),
+        r=actor_result.get("rabbit_holes", 0),
+    )
+
+
+def _daily_intel_icij_linking(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Fuzzy match actors against offshore entities."""
+    from intelligence.icij_linker import link_actors
+    icij_result = link_actors(engine, min_similarity=0.6, limit=500)
+    results["icij_linking"] = {"matches": len(icij_result)}
+    log.info("ICIJ linking: {n} matches found", n=len(icij_result))
+
+
+def _daily_intel_milestone_scoring(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Execution scorecards for all companies."""
+    from intelligence.milestone_tracker import scan_all_tickers
+    milestones = scan_all_tickers(engine)
+    results["milestone_scoring"] = {"companies_scored": len(milestones)}
+    log.info("Milestone scoring: {n} companies scored", n=len(milestones))
+
+
+def _daily_intel_attention_anomaly(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Wikipedia + Trends spike detection."""
+    from intelligence.attention_anomaly import get_alerts
+    alerts = get_alerts(engine, threshold=60.0)
+    results["attention_alerts"] = {"high_alerts": len(alerts)}
+    if alerts:
+        log.info("ATTENTION: {n} entities with unusual attention", n=len(alerts))
+
+
+def _daily_intel_edgar_transcripts(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """8-K filings with LLM milestone extraction."""
+    from ingestion.altdata.edgar_transcripts import EdgarTranscriptPuller
+    edgar = EdgarTranscriptPuller(engine)
+    edgar_result = edgar.pull(days_back=30)
+    results["edgar_transcripts"] = edgar_result
+    log.info("EDGAR: {f} filings, {g} guidance phrases",
+             f=edgar_result.get("filings_processed", 0),
+             g=edgar_result.get("guidance_extracted", 0))
+
+
+def _daily_intel_corporate_actions(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Regex-mine 8-Ks for M&A, buybacks, dividends, debt, equity issuance.
+    Writes capital_flows rows with period_type='announcement'. Daily: last
+    30 days of 8-Ks."""
+    from ingestion.altdata.corporate_actions_parser import (
+        CorporateActionsParser,
+    )
+    corp = CorporateActionsParser(engine)
+    try:
+        corp_result = corp.pull(days_back=30)
+    finally:
+        corp.close()
+    results["corporate_actions"] = corp_result
+    log.info(
+        "corporate_actions: {r} rows from {f} filings "
+        "({h} tickers with hits)",
+        r=corp_result.get("rows_inserted", 0),
+        f=corp_result.get("filings_scanned", 0),
+        h=corp_result.get("tickers_with_hits", 0),
+    )
+
+
+def _daily_intel_capital_flow_rollups(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Derives ttm rows from quarterly XBRL data and folds announcement rows
+    into annual_rolled rows. Runs after the XBRL ingestor + corporate_actions
+    so it always sees the freshest base rows (corporate_actions dispatched
+    just before this in DAILY_INTEL_TASKS, same as before this task)."""
+    from intelligence.company_financial_rollups import run_all as cf_rollup_run
+    cf_stats = cf_rollup_run(engine)
+    results["capital_flow_rollups"] = cf_stats
+    log.info(
+        "capital_flow_rollups: ttm={t} rolled={r}",
+        t=cf_stats.get("ttm_rows", 0),
+        r=cf_stats.get("rolled_rows", 0),
+    )
+
+
+def _daily_intel_fundamental_divergence(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Snapshot fundamental-vs-price divergence daily. Runs after
+    capital_flow_rollups (same ordering as before this task) so it sees the
+    freshest revenue/margin rows."""
+    from intelligence.fundamental_divergence import (
+        snapshot_all as fd_snapshot_all,
+    )
+    fd_stats = fd_snapshot_all(engine)
+    results["fundamental_divergence"] = fd_stats
+    log.info(
+        "fundamental_divergence: wrote={w} long={l} short={s}",
+        w=fd_stats.get("written", 0),
+        l=(fd_stats.get("counts") or {}).get("long_candidate", 0),
+        s=(fd_stats.get("counts") or {}).get("short_candidate", 0),
+    )
+
+
+def _daily_intel_holder_deal_overlap(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Pre-positioning detector: cross-references institutional_holdings 13F
+    snapshots against capital_flows acquisition announcements. Must run
+    after corporate_actions and after the 13F ingestor (same ordering as
+    before this task)."""
+    from intelligence.holder_deal_overlap import run as hdo_run
+    hdo_stats = hdo_run(engine)
+    results["holder_deal_overlap"] = hdo_stats
+    log.info(
+        "holder_deal_overlap: deals={d} overlaps={o} pre={p}",
+        d=hdo_stats.get("deals_scanned", 0),
+        o=hdo_stats.get("overlaps_written", 0),
+        p=hdo_stats.get("pre_positioned", 0),
+    )
+
+
+def _daily_intel_insight_cleanup(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """outputs/llm_insights/ 30-day retention (audit #49, #61)."""
+    from outputs.llm_logger import cleanup_old_insights
+    n_cleaned = cleanup_old_insights(max_age_days=30)
+    if n_cleaned:
+        log.info("Insight cleanup: deleted {n} files (>30d)", n=n_cleaned)
+
+
+def _daily_intel_briefing_cleanup(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Market briefings — 90-day retention (higher-value artifacts)."""
+    from ollama.market_briefing import MarketBriefingEngine
+    n_briefings = MarketBriefingEngine.cleanup_old_briefings(max_age_days=90)
+    if n_briefings:
+        log.info("Briefing cleanup: deleted {n} files (>90d)", n=n_briefings)
+
+
+def _daily_intel_errors_jsonl_cleanup(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """errors.jsonl — append-only log, truncate to last 5000 lines (~3-4
+    days of errors at current rate). Cheap, atomic."""
+    from pathlib import Path
+    errfile = Path(_GRID_DIR) / ".server-logs" / "errors.jsonl"
+    if errfile.exists() and errfile.stat().st_size > 1_000_000:
+        lines = errfile.read_text(encoding="utf-8", errors="replace").splitlines()
+        if len(lines) > 5000:
+            keep = lines[-5000:]
+            tmp = errfile.with_suffix(".jsonl.tmp")
+            tmp.write_text("\n".join(keep) + "\n", encoding="utf-8")
+            tmp.replace(errfile)
+            log.info("errors.jsonl rotated: {n} → 5000 lines",
+                     n=len(lines))
+
+
+class DailyIntelTask(NamedTuple):
+    """One step of the daily intelligence batch (see DAILY_INTEL_TASKS).
+
+    ``fn(engine, state, now, results)`` runs the step's existing body —
+    same imports, same log lines, same ``results[...]`` keys as the
+    pre-existing inline block. ``budget_s`` is this step's own
+    ``_run_with_timeout`` budget, independent of every other step's (see
+    DAILY_INTEL_LLM_TASK_BUDGET_S / _SQL_ / _CLEANUP_ above for the
+    documented defaults each task below draws from).
+    """
+    name: str
+    fn: Callable[[Any, OperatorState, datetime, dict[str, Any]], Any]
+    budget_s: int
+
+
+# Ordered exactly as the pre-existing inline block ran them. Do not
+# reorder without checking the ordering-dependency notes on
+# capital_flow_rollups, fundamental_divergence and holder_deal_overlap
+# above — they assume the tasks before them in this tuple already ran
+# this period.
+DAILY_INTEL_TASKS: tuple[DailyIntelTask, ...] = (
+    DailyIntelTask("storage_maintenance_subagent", _daily_intel_storage_maintenance, DAILY_INTEL_DISPATCH_TASK_BUDGET_S),
+    DailyIntelTask("source_audit", _daily_intel_source_audit, DAILY_INTEL_LLM_TASK_BUDGET_S),
+    DailyIntelTask("flow_materialize", _daily_intel_flow_materialize, DAILY_INTEL_SQL_TASK_BUDGET_S),
+    DailyIntelTask("backtest_scan", _daily_intel_backtest_scan, DAILY_INTEL_LLM_TASK_BUDGET_S),
+    DailyIntelTask("postmortem_batch", _daily_intel_postmortem_batch, DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S),
+    DailyIntelTask("options_improvement", _daily_intel_options_improvement, DAILY_INTEL_LLM_TASK_BUDGET_S),
+    DailyIntelTask("hypothesis_review", _daily_intel_hypothesis_review, DAILY_INTEL_LLM_TASK_BUDGET_S),
+    DailyIntelTask("hypothesis_discovery", _daily_intel_hypothesis_discovery, DAILY_INTEL_LLM_TASK_BUDGET_S),
+    DailyIntelTask("rag_index", _daily_intel_rag_index, DAILY_INTEL_LLM_TASK_BUDGET_S),
+    DailyIntelTask("actor_research", _daily_intel_actor_research, DAILY_INTEL_LLM_TASK_BUDGET_S),
+    DailyIntelTask("icij_linking", _daily_intel_icij_linking, DAILY_INTEL_SQL_TASK_BUDGET_S),
+    DailyIntelTask("milestone_scoring", _daily_intel_milestone_scoring, DAILY_INTEL_SQL_TASK_BUDGET_S),
+    DailyIntelTask("attention_anomaly", _daily_intel_attention_anomaly, DAILY_INTEL_SQL_TASK_BUDGET_S),
+    DailyIntelTask("edgar_transcripts", _daily_intel_edgar_transcripts, DAILY_INTEL_LLM_TASK_BUDGET_S),
+    DailyIntelTask("corporate_actions", _daily_intel_corporate_actions, DAILY_INTEL_SQL_TASK_BUDGET_S),
+    DailyIntelTask("capital_flow_rollups", _daily_intel_capital_flow_rollups, DAILY_INTEL_SQL_TASK_BUDGET_S),
+    DailyIntelTask("fundamental_divergence", _daily_intel_fundamental_divergence, DAILY_INTEL_SQL_TASK_BUDGET_S),
+    DailyIntelTask("holder_deal_overlap", _daily_intel_holder_deal_overlap, DAILY_INTEL_SQL_TASK_BUDGET_S),
+    DailyIntelTask("insight_cleanup", _daily_intel_insight_cleanup, DAILY_INTEL_CLEANUP_TASK_BUDGET_S),
+    DailyIntelTask("briefing_cleanup", _daily_intel_briefing_cleanup, DAILY_INTEL_CLEANUP_TASK_BUDGET_S),
+    DailyIntelTask("errors_jsonl_cleanup", _daily_intel_errors_jsonl_cleanup, DAILY_INTEL_CLEANUP_TASK_BUDGET_S),
+)
+
+
+def _run_daily_intel_block(
+    engine: Any,
+    state: OperatorState,
+    now: datetime,
+    results: dict[str, Any],
+) -> None:
+    """Execute DAILY_INTEL_TASKS in order, resumable across cycles.
+
+    Called from run_intelligence_tasks when ``daily_due`` (see that
+    function's "Daily at 2:00 AM (with catch-up)" scheduling block) — same
+    trigger conditions as before this task; only what happens once
+    triggered has changed.
+
+    Per-period ledger: ``state.daily_intel_done`` /
+    ``daily_intel_skipped_for_period`` / ``daily_intel_attempts``, keyed to
+    ``state.daily_intel_period`` (the due period's ISO date,
+    boundary_hour=DAILY_INTEL_BOUNDARY_HOUR). A due period that differs
+    from the ledger's recorded period means the ledger has rolled over:
+    the three dicts are cleared and ``state.daily_intel_period`` is
+    updated before anything runs.
+
+    Idempotent-redo note: state is only persisted at the END of a cycle
+    (the analytical_snapshots write in save_cycle_snapshot), not after
+    each task inside this function. A mid-cycle process restart therefore
+    can re-run a task this call already finished but hadn't yet had a
+    chance to persist — safe, because every task's own DB writes are
+    idempotent upserts/inserts-with-dedupe (a property this task
+    explicitly did NOT change), so a redo just repeats the same write.
+
+    Per-cycle budget: ``DAILY_INTEL_CYCLE_BUDGET_SECONDS`` is checked
+    BEFORE starting each task (not mid-task) against cumulative wall time
+    already spent in this call. Once exhausted, the loop stops for this
+    cycle; the next ``daily_due`` call (state.last_daily_intel is not set
+    until every task is done-or-skipped — see below) resumes at the first
+    undone task.
+
+    Per-task timeout/attempts: each task runs under its own
+    ``_run_with_timeout(f"daily_intel:{name}", ..., task.budget_s,
+    state)``. ``ok=True`` marks the task done for the period. ``ok=False``
+    (timeout or exception — see ``_daily_intel_raise_if_task_status_
+    failed`` for the six tasks that go through ``_run_intel_task``)
+    increments its attempt count; at ``DAILY_INTEL_MAX_ATTEMPTS`` the task
+    is marked ``skipped_for_period`` (also recorded in
+    ``daily_intel_done``, so the loop treats it as done — it cannot block
+    the tasks behind it) and the block continues to the NEXT task rather
+    than aborting.
+
+    An abandoned (timed-out) task's orphaned worker thread may still
+    finish later (see ``_run_with_timeout``'s own docstring on why it
+    can't be killed) — this cannot mark the task done, because the only
+    place that writes ``daily_intel_done`` is this loop, driven by
+    ``_run_with_timeout``'s SYNCHRONOUS return value at the timeout
+    boundary, not by any callback the orphaned thread could trigger later.
+
+    ``cooldowns.can_retry`` is deliberately NOT consulted here — same
+    reasoning ``_run_sector_and_intelligence_steps`` documents for the
+    sector-health/intelligence-tasks split: the blacklist entry
+    ``_run_with_timeout`` writes on a timeout is only honoured by call
+    sites that explicitly check ``state.cooldowns.can_retry(<name>)``
+    before running (exactly four elsewhere in this module — oracle_cycle,
+    signal_classification, anomaly_narration, knowledge_mapping), and
+    daily-intel task names are not among them. This ledger's own
+    ``DAILY_INTEL_MAX_ATTEMPTS`` is the throttle for a
+    persistently-failing daily-intel task; adding the 24h can_retry
+    blacklist on top would mean a single timeout blocks that task for a
+    full day regardless of the per-period ledger's own, much shorter,
+    per-period skip.
+
+    ``state.last_daily_intel = now`` is set ONLY when every task in
+    ``DAILY_INTEL_TASKS`` is done or skipped_for_period — i.e.
+    ``state.daily_intel_done`` has an entry, dated to the current period,
+    for every task name. This is what ``daily_due`` (in
+    ``run_intelligence_tasks``) reads to decide whether the whole block is
+    due again.
+    """
+    period_iso = _period_boundary(now, DAILY_INTEL_BOUNDARY_HOUR).date().isoformat()
+
+    if state.daily_intel_period != period_iso:
+        state.daily_intel_period = period_iso
+        state.daily_intel_done = {}
+        state.daily_intel_skipped_for_period = {}
+        state.daily_intel_attempts = {}
+
+    ran: list[str] = []
+    skipped_for_period: list[str] = []
+    budget_used = 0.0
+
+    for task in DAILY_INTEL_TASKS:
+        if state.daily_intel_done.get(task.name) == period_iso:
+            continue
+        if budget_used >= DAILY_INTEL_CYCLE_BUDGET_SECONDS:
+            break
+
+        t0 = time.monotonic()
+        _, ok = _run_with_timeout(
+            f"daily_intel:{task.name}",
+            lambda t=task: t.fn(engine, state, now, results),
+            task.budget_s,
+            state,
+        )
+        budget_used += time.monotonic() - t0
+        ran.append(task.name)
+
+        if ok:
+            state.daily_intel_done[task.name] = period_iso
+        else:
+            attempts = state.daily_intel_attempts.get(task.name, 0) + 1
+            state.daily_intel_attempts[task.name] = attempts
+            if attempts >= DAILY_INTEL_MAX_ATTEMPTS:
+                state.daily_intel_done[task.name] = period_iso
+                state.daily_intel_skipped_for_period[task.name] = period_iso
+                skipped_for_period.append(task.name)
+                log.warning(
+                    "daily_intel: task '{n}' skipped_for_period after {a} "
+                    "failed attempts (period={p})",
+                    n=task.name, a=attempts, p=period_iso,
+                )
+
+    total = len(DAILY_INTEL_TASKS)
+    done_count = sum(
+        1 for t in DAILY_INTEL_TASKS if state.daily_intel_done.get(t.name) == period_iso
+    )
+    remaining = [
+        t.name for t in DAILY_INTEL_TASKS
+        if state.daily_intel_done.get(t.name) != period_iso
+    ]
+
+    if done_count == total:
+        state.last_daily_intel = now
+
+    log.info(
+        "daily_intel: period={p} done={d}/{t} ran={r} skipped_for_period={s} "
+        "remaining={rem} budget_used={b:.1f}s",
+        p=period_iso, d=done_count, t=total, r=ran, s=skipped_for_period,
+        rem=remaining, b=budget_used,
+    )
+
+
 def run_intelligence_tasks(
     engine: Any,
     state: OperatorState,
@@ -1472,297 +2013,27 @@ def run_intelligence_tasks(
             "Running daily intelligence batch (window={w} catch_up={c})",
             w=is_daily_window, c=(is_catch_up and not is_daily_window),
         )
-
-        try:
-            results["storage_maintenance_subagent"] = _dispatch_daily_storage_maintenance(engine, state)
-        except Exception as exc:
-            log.warning("Storage maintenance subagent dispatch failed: {e}", e=str(exc))
-
-        try:
-            from intelligence.source_audit import run_full_audit
-            results["source_audit"] = _run_intel_task(
-                "source_audit", run_full_audit, state, engine,
-            )
-        except Exception as exc:
-            log.warning("Source audit import failed: {e}", e=str(exc))
-
-        # Flow materialization — projects signal_sources into the relational
-        # flow tables (dark_pool_weekly, etf_flows, insider_trades,
-        # congressional_trades, junction_point_readings). The module existed
-        # with zero callers, which is why those tables were documented empty
-        # (docs/planning/FILL-EMPTY-TABLES.md; LEVER-PACKAGE.md §7 T1.4).
-        try:
-            from ingestion.flow_materializer import sync_all as _flow_sync_all
-            results["flow_materialize"] = _run_intel_task(
-                "flow_materialize", _flow_sync_all, state, engine,
-            )
-        except Exception as exc:
-            log.warning("Flow materializer import failed: {e}", e=str(exc))
-
-        try:
-            from analysis.backtest_scanner import run_full_scan
-            results["backtest_scan"] = _run_intel_task(
-                "backtest_scan", run_full_scan, state, engine,
-            )
-        except Exception as exc:
-            log.warning("Backtest scanner import failed: {e}", e=str(exc))
-
-        try:
-            from intelligence.postmortem import batch_postmortem
-            results["postmortem_batch"] = _run_intel_task(
-                "postmortem_batch", batch_postmortem, state, engine,
-                limit=POSTMORTEM_BATCH_LIMIT,
-            )
-        except Exception as exc:
-            log.warning("Postmortem import failed: {e}", e=str(exc))
-
-        try:
-            from trading.options_tracker import run_improvement_cycle
-            results["options_improvement"] = _run_intel_task(
-                "options_improvement",
-                run_improvement_cycle,
-                state,
-                engine,
-            )
-        except Exception as exc:
-            log.warning("Options improvement import failed: {e}", e=str(exc))
-
-        try:
-            from analysis.backtest_scanner import review_existing_hypotheses
-            results["hypothesis_review"] = _run_intel_task(
-                "hypothesis_review",
-                review_existing_hypotheses,
-                state,
-                engine,
-            )
-        except Exception as exc:
-            log.warning("Hypothesis review import failed: {e}", e=str(exc))
-
-        # Hypothesis discovery — auto-discover new hypotheses from data patterns
-        if _hours_since(state.last_hypothesis_discovery) >= 20:
-            try:
-                from intelligence.hypothesis_engine import HypothesisGenerator
-                hyp_engine = HypothesisGenerator(engine)
-                discovered = hyp_engine.auto_discover()
-                results["hypothesis_discovery"] = {
-                    "new_hypotheses": len(discovered),
-                }
-                log.info(
-                    "Hypothesis discovery: {n} new hypotheses generated",
-                    n=len(discovered),
-                )
-            except Exception as exc:
-                log.warning("Hypothesis discovery failed: {e}", e=str(exc))
-            state.last_hypothesis_discovery = now
-
-        # RAG index refresh — re-embed latest intelligence data
-        if _hours_since(state.last_rag_index) >= 20:
-            try:
-                from intelligence.rag import RAGIndexer
-                indexer = RAGIndexer(engine)
-                indexer.ensure_tables()
-                snap_count = indexer.index_snapshots()
-                actor_count = indexer.index_actors()
-                results["rag_index"] = {
-                    "snapshots_indexed": snap_count,
-                    "actors_indexed": actor_count,
-                }
-                log.info(
-                    "RAG index refreshed: {s} snapshot chunks, {a} actor chunks",
-                    s=snap_count, a=actor_count,
-                )
-            except Exception as exc:
-                log.warning("RAG indexing failed: {e}", e=str(exc))
-            state.last_rag_index = now
-
-        # ── 13F mining + actor enrichment + milestone scoring ────────
-
-        # Actor research — LLM enriches sparse actors, follows rabbit holes
-        try:
-            from intelligence.actor_researcher import research_batch
-            actor_result = research_batch(engine, batch_size=20)
-            results["actor_research"] = actor_result
-            log.info(
-                "Actor research: {u} enriched, {n} new actors, {r} rabbit holes",
-                u=actor_result.get("updated", 0),
-                n=actor_result.get("new_actors", 0),
-                r=actor_result.get("rabbit_holes", 0),
-            )
-        except Exception as exc:
-            log.warning("Actor research failed: {e}", e=str(exc))
-
-        # ICIJ cross-reference — fuzzy match actors against offshore entities
-        try:
-            from intelligence.icij_linker import link_actors
-            icij_result = link_actors(engine, min_similarity=0.6, limit=500)
-            results["icij_linking"] = {"matches": len(icij_result)}
-            log.info("ICIJ linking: {n} matches found", n=len(icij_result))
-        except Exception as exc:
-            log.warning("ICIJ linking failed: {e}", e=str(exc))
-
-        # Milestone scoring — execution scorecards for all companies
-        try:
-            from intelligence.milestone_tracker import scan_all_tickers
-            milestones = scan_all_tickers(engine)
-            results["milestone_scoring"] = {"companies_scored": len(milestones)}
-            log.info("Milestone scoring: {n} companies scored", n=len(milestones))
-        except Exception as exc:
-            log.warning("Milestone scoring failed: {e}", e=str(exc))
-
-        # Attention anomaly — Wikipedia + Trends spike detection
-        try:
-            from intelligence.attention_anomaly import get_alerts
-            alerts = get_alerts(engine, threshold=60.0)
-            results["attention_alerts"] = {"high_alerts": len(alerts)}
-            if alerts:
-                log.info("ATTENTION: {n} entities with unusual attention", n=len(alerts))
-        except Exception as exc:
-            log.warning("Attention anomaly failed: {e}", e=str(exc))
-
-        # EDGAR transcripts — 8-K filings with LLM milestone extraction
-        try:
-            from ingestion.altdata.edgar_transcripts import EdgarTranscriptPuller
-            edgar = EdgarTranscriptPuller(engine)
-            edgar_result = edgar.pull(days_back=30)
-            results["edgar_transcripts"] = edgar_result
-            log.info("EDGAR: {f} filings, {g} guidance phrases",
-                     f=edgar_result.get("filings_processed", 0),
-                     g=edgar_result.get("guidance_extracted", 0))
-        except Exception as exc:
-            log.warning("EDGAR transcripts failed: {e}", e=str(exc))
-
-        # Corporate actions — regex-mine 8-Ks for M&A, buybacks,
-        # dividends, debt, equity issuance. Writes capital_flows rows
-        # with period_type='announcement'. Daily: last 30 days of 8-Ks.
-        try:
-            from ingestion.altdata.corporate_actions_parser import (
-                CorporateActionsParser,
-            )
-            corp = CorporateActionsParser(engine)
-            try:
-                corp_result = corp.pull(days_back=30)
-            finally:
-                corp.close()
-            results["corporate_actions"] = corp_result
-            log.info(
-                "corporate_actions: {r} rows from {f} filings "
-                "({h} tickers with hits)",
-                r=corp_result.get("rows_inserted", 0),
-                f=corp_result.get("filings_scanned", 0),
-                h=corp_result.get("tickers_with_hits", 0),
-            )
-        except Exception as exc:
-            log.warning("corporate_actions failed: {e}", e=str(exc))
-
-        # Capital-flow rollups — derives ttm rows from quarterly XBRL
-        # data and folds announcement rows into annual_rolled rows so
-        # the API layer can show M&A / buyback events inside annual
-        # totals without losing the original event records.
-        # Runs daily AFTER the XBRL ingestor + corporate_actions so it
-        # always sees the freshest base rows.
-        try:
-            from intelligence.company_financial_rollups import run_all as cf_rollup_run
-            cf_stats = cf_rollup_run(engine)
-            results["capital_flow_rollups"] = cf_stats
-            log.info(
-                "capital_flow_rollups: ttm={t} rolled={r}",
-                t=cf_stats.get("ttm_rows", 0),
-                r=cf_stats.get("rolled_rows", 0),
-            )
-        except Exception as exc:
-            log.warning("capital_flow_rollups failed: {e}", e=str(exc))
-
-        # Fundamental-vs-price divergence — snapshot daily so the
-        # `fundamental_divergence` table always has a fresh row per
-        # ticker in the latest snapshot. Runs AFTER capital_flow_rollups
-        # so it sees the freshest revenue / margin rows.
-        try:
-            from intelligence.fundamental_divergence import (
-                snapshot_all as fd_snapshot_all,
-            )
-            fd_stats = fd_snapshot_all(engine)
-            results["fundamental_divergence"] = fd_stats
-            log.info(
-                "fundamental_divergence: wrote={w} long={l} short={s}",
-                w=fd_stats.get("written", 0),
-                l=(fd_stats.get("counts") or {}).get("long_candidate", 0),
-                s=(fd_stats.get("counts") or {}).get("short_candidate", 0),
-            )
-        except Exception as exc:
-            log.warning("fundamental_divergence failed: {e}", e=str(exc))
-
-        # Holder / deal overlap — pre-positioning detector. Cross-
-        # references institutional_holdings 13F snapshots against
-        # capital_flows acquisition announcements to find filers that
-        # held BOTH the acquirer and the target before the deal was
-        # announced. Must run AFTER corporate_actions (announcement
-        # rows) and AFTER the 13F ingestor. Writes holder_deal_overlap.
-        try:
-            from intelligence.holder_deal_overlap import run as hdo_run
-            hdo_stats = hdo_run(engine)
-            results["holder_deal_overlap"] = hdo_stats
-            log.info(
-                "holder_deal_overlap: deals={d} overlaps={o} pre={p}",
-                d=hdo_stats.get("deals_scanned", 0),
-                o=hdo_stats.get("overlaps_written", 0),
-                p=hdo_stats.get("pre_positioned", 0),
-            )
-        except Exception as exc:
-            log.warning("holder_deal_overlap failed: {e}", e=str(exc))
-
-        # ── Daily file rotation (audit #49, #61) ────────────────────
-        # Insight files in outputs/llm_insights/ accumulate forever
-        # without cleanup; the dir hit 100k+ files (45 days, ~22k/day
-        # peaks) before this hook was wired in. 30-day retention caps
-        # steady-state at ~660k worst case, manageable.
-        try:
-            from outputs.llm_logger import cleanup_old_insights
-            n_cleaned = cleanup_old_insights(max_age_days=30)
-            if n_cleaned:
-                log.info("Insight cleanup: deleted {n} files (>30d)", n=n_cleaned)
-        except Exception as exc:
-            log.warning("Insight cleanup failed: {e}", e=str(exc))
-
-        # Market briefings — same pattern, 90-day retention since these
-        # are higher-value artifacts (full market write-ups).
-        try:
-            from ollama.market_briefing import MarketBriefingEngine
-            n_briefings = MarketBriefingEngine.cleanup_old_briefings(max_age_days=90)
-            if n_briefings:
-                log.info("Briefing cleanup: deleted {n} files (>90d)", n=n_briefings)
-        except Exception as exc:
-            log.warning("Briefing cleanup failed: {e}", e=str(exc))
-
-        # errors.jsonl — append-only log, just truncate to last 5000 lines
-        # (~3-4 days of errors at current rate). Cheap, atomic.
-        try:
-            from pathlib import Path
-            errfile = Path(_GRID_DIR) / ".server-logs" / "errors.jsonl"
-            if errfile.exists() and errfile.stat().st_size > 1_000_000:
-                lines = errfile.read_text(encoding="utf-8", errors="replace").splitlines()
-                if len(lines) > 5000:
-                    keep = lines[-5000:]
-                    tmp = errfile.with_suffix(".jsonl.tmp")
-                    tmp.write_text("\n".join(keep) + "\n", encoding="utf-8")
-                    tmp.replace(errfile)
-                    log.info("errors.jsonl rotated: {n} → 5000 lines",
-                             n=len(lines))
-        except Exception as exc:
-            log.warning("errors.jsonl rotation failed: {e}", e=str(exc))
-
-        state.last_daily_intel = now
+        _run_daily_intel_block(engine, state, now, results)
 
     # NOTE (2026-09-19): the daily sector-health snapshot used to run here,
     # AFTER the daily-due block above. It now has its own dispatch and its
     # own timeout (SECTOR_HEALTH_TIMEOUT_SECONDS), run BEFORE this whole
     # step in run_cycle — see the sector/intelligence orchestration helper
     # near the run_cycle dispatch for the design and the traced reason:
-    # production shows this step times out at INTELLIGENCE_TASKS_TIMEOUT_
-    # SECONDS on essentially every cycle, and the daily-due block above runs
-    # with catch_up=True every time (state.last_daily_intel never advances
+    # production showed this step timing out at INTELLIGENCE_TASKS_TIMEOUT_
+    # SECONDS on essentially every cycle, and the daily-due block above ran
+    # with catch_up=True every time (state.last_daily_intel never advanced
     # far enough to reach code after it), so anything placed after this
     # block was never actually reached in production. Do not re-add a
     # sector-health call in this function.
+    #
+    # UPDATE (fable-daily-intel-resumable, 2026-09-20): the daily-due block
+    # above is no longer monolithic or all-or-nothing (see
+    # _run_daily_intel_block/DAILY_INTEL_TASKS) — it now makes bounded
+    # per-cycle progress and can reach `state.last_daily_intel = now` over
+    # several cycles instead of needing one uninterrupted ~360s+ run. This
+    # does not change the sector-health placement/reasoning above; still
+    # do not re-add a sector-health call in this function.
 
     # ── Daily at 6:30 UTC — forced-flow waterfall briefing ──────────
     # Implements docs/playbooks/opex_waterfall.md. Runs once per day,
