@@ -287,3 +287,254 @@ continues to check.
   `held` / `in_flight` / `done` / `done_queued` / `skipped_for_period`.
   Any downstream consumer of that dict that enumerates outcome values by
   an exhaustive allowlist (none found in this repo) would need to add it.
+
+## Follow-up (same day, same branch, development only): durable TTM
+## recompute tracking, done_late correctness proofs, PG validation
+
+Controller instruction for this pass: replace the fixed
+`TTM_LOOKBACK_DAYS = 3` window above with restart-safe tracking that
+covers BOTH new AND corrected quarterly rows, regardless of fiscal
+period; prove `done_late`'s guarantees with targeted tests; and validate
+the SQL from the original pass against real Postgres. Still draft PR, no
+merge, no production access, no DB/SSH used to build this (the new PG
+tests are written to run against a disposable database the coordinator
+provisions separately — never executed here).
+
+### Corrected-row signal: established from code
+
+The only writer of `capital_flows` `period_type='quarter'` rows is
+`ingestion/altdata/sec_xbrl_financials.py::_write_rows` (confirmed by
+grepping every `INSERT INTO capital_flows` site in the repo —
+`ingestion/altdata/corporate_actions_parser.py` only ever writes
+`period_type='announcement'`, and `scripts/load_supply_capital_seed.py`
+is an offline one-off seed script, not part of the daily ingest path).
+`_write_rows` DELETEs the exact
+`(actor_id, fiscal_period, period_type, flow_type, source_filing)` row
+(if any exists) and then plain-INSERTs a fresh one with `as_of = NOW()`
+on **every** call — there is no `ON CONFLICT DO NOTHING` short-circuit
+that could leave `as_of` untouched. **Answer: yes, a re-ingested/
+corrected row moves `as_of`**, identically to a brand-new row, regardless
+of which fiscal period it corrects. That means the "best available"
+per-actor content-fingerprint fallback the brief allowed for was not
+needed — a single scalar high-water-mark watermark over `as_of` is
+sufficient and strictly simpler.
+
+### What was implemented: a single persisted watermark
+
+`intelligence/company_financial_rollups.py`:
+- `TTM_LOOKBACK_DAYS` is gone. `compute_ttm(engine, watermark: str | None
+  = None) -> TtmResult(rows_written, watermark)`. `watermark` is an
+  ISO-8601 string (or `None`, meaning "no watermark yet" — unconditional
+  full recompute, used both for the first-ever run and as the explicit
+  full-recompute escape hatch `scripts/run_capital_flow_rollups.py`
+  already exposed as a CLI flag, `--watermark` omitted).
+- The `changed_actors` CTE's filter changed from
+  `as_of >= NOW() - make_interval(days => :lookback_days)` to
+  `CAST(:watermark AS timestamptz) IS NULL OR as_of > CAST(:watermark AS
+  timestamptz)` — an absolute cursor, not a relative N-day window, so a
+  downtime gap of any length (not just >3 days) is caught the same way.
+  The CTE still has no `fiscal_period` predicate at all (pinned by
+  `tests/test_capital_flow_rollups_tracking.py::
+  test_changed_actors_cte_has_no_fiscal_period_predicate`), which is
+  exactly what makes a correction to an OLD fiscal period indistinguishable,
+  at this gate, from a brand-new row.
+- A companion query, `_TTM_NEW_WATERMARK_SQL`
+  (`SELECT MAX(as_of) FROM capital_flows WHERE period_type='quarter' ...
+  AND (same watermark predicate)`), runs inside the SAME
+  `engine.begin()` transaction as the UPSERT. `compute_ttm` returns the
+  new watermark only after that transaction has committed — if the
+  UPSERT raises, the transaction rolls back and the exception propagates
+  BEFORE any watermark is computed, so a failed run's caller never
+  receives (and therefore can never persist) an advanced watermark. A
+  retry with the same watermark recomputes the identical actor set.
+
+### Where the watermark is persisted
+
+`OperatorState.capital_flow_ttm_watermark: str | None`
+(`scripts/hermes_health.py`) — a single scalar, so it lives directly on
+`OperatorState` (serialised/hydrated under the same "only restore if
+currently unset" rule as every other daily-intel ledger field) rather
+than a new table. A per-actor table was considered and rejected: there is
+exactly one scalar of durable state for the whole rollup, not one row per
+actor, so a table would add a migration and a query for no correctness
+benefit. `scripts/hermes_operator.py::_daily_intel_capital_flow_rollups`
+reads it as `ttm_watermark` into `run_all`, and advances it —
+unconditionally, the instant `run_all` reports `ttm_ok: True` — because
+the DB write it corresponds to already committed inside `compute_ttm`'s
+own transaction, independent of whatever this ledger later decides about
+crediting the *attempt* (done/done_late/abandoned; see "Abandonment
+truth" on `_run_daily_intel_block`).
+
+### `run_all` partial-failure semantics (fixes a real gap in the
+### original pass)
+
+The original `run_all` swallowed both `compute_ttm` and
+`fold_announcements` exceptions into a stats dict and never raised — so
+`_daily_intel_capital_flow_rollups` never raised either, and a cancelled
+`compute_ttm` with a successful `fold_announcements` (exactly the
+production evidence quoted at the top of this doc) would have let
+`_run_with_timeout` see `ok=True` and the ledger mark the task **done**,
+hiding the fact that no TTM rows were written that cycle. Fixed:
+- `run_all(engine, ttm_watermark=None) -> dict` still attempts both
+  sub-steps independently (fold still runs even when TTM fails — matches
+  the production evidence) and never raises itself, but now returns
+  `"ttm_ok"`, `"fold_ok"`, and `"ok"` (`= ttm_ok and fold_ok`) alongside
+  the existing row counts, plus `"ttm_watermark"` (the value to persist
+  next — unchanged from the input when `ttm_ok` is `False`).
+- `_daily_intel_capital_flow_rollups` now RAISES when `cf_stats["ok"]`
+  is `False`, so `_run_with_timeout` reports `ok=False` and the
+  daily-intel ledger counts a genuine attempt toward
+  `DAILY_INTEL_MAX_ATTEMPTS`/`skipped_for_period` — never `done`, never
+  `done_late`. Pinned by
+  `tests/test_hermes_daily_intel_resumable.py::
+  TestCapitalFlowRollupsPartialFailure::
+  test_ttm_cancelled_fold_ok_is_never_done_or_done_late` (uses the REAL
+  task function with `run_all` monkeypatched to the exact
+  ttm-cancelled/fold-ok shape from the original evidence).
+
+### done_late guarantees: what was already true vs. what needed a new test
+
+Re-reading `_run_daily_intel_block`/`_run_task` (added in the original
+pass, this doc's "Ledger fix" section above) against the controller's
+four correctness properties:
+- **(a) credits only the attempt that timed out and only its own due
+  period** — the code already compared `state.daily_intel_period` (live,
+  checked at the moment the late worker's `finally` block runs) against
+  `period_iso` (closure-captured at the ORIGINAL attempt's start) as part
+  of the `same_period` check. This was correct but UNTESTED — added
+  `tests/test_hermes_daily_intel_resumable.py::TestDoneLatePeriodBoundary::
+  test_a_late_return_after_period_rollover_does_not_credit_new_period`,
+  fully real-thread (a period rollover happens naturally via a second
+  `_run_daily_intel_block` call for a later `now` while the first
+  worker is still blocked).
+- **(b) never overwrites a newer attempt's outcome** — the pre-existing
+  `TestDoneLateLedgerOutcome::
+  test_superseded_late_return_is_rejected_not_done_late` covered "a newer
+  attempt has REGISTERED a token" (not yet completed). Added
+  `TestDoneLateNeverOverwritesNewerAttempt::
+  test_bd_newer_attempt_already_done_is_not_overwritten_by_stale_late_return`
+  for the stronger case: the newer attempt has ALREADY recorded a real
+  `"done"` outcome and a real published result before the stale worker's
+  belated result lands — confirms neither is clobbered.
+- **(c) never hides a partially failed task** — `TestDoneLateLedgerOutcome::
+  test_late_failure_never_marks_done` already covered a late EXCEPTION.
+  The capital_flow_rollups partial-failure test above covers the other
+  shape: a task that returns normally but reports partial failure through
+  its own return contract, now converted to a raised exception by this
+  pass's `_daily_intel_capital_flow_rollups` fix — same mechanism, wired
+  end to end.
+- **(d) not credited when the worker's token was superseded** — same
+  mechanism as (b); the new test above doubles as this proof (a fresh
+  token was minted for the newer attempt, and the stale worker's `finally`
+  block observes its own token no longer matches the entry's current one).
+
+### PostgreSQL-backed validation (new files, real Postgres, no SQL-text
+### assertions — behavior only)
+
+`tests/test_capital_flow_rollups_pg.py` — real `compute_ttm` against
+`public.capital_flows` (unique `rollup_test_<uuid>` actor ids, cleaned up
+per test):
+- only the actor with a row newer than the watermark is recomputed (two
+  actors, both with a full 4-quarter window; only one gets a post-
+  watermark correction to its Q4 row);
+- the written `ttm` amount equals a plain independent sum of the four
+  quarterly amounts;
+- a call that fails mid-transaction (forced via a watermark value that
+  fails `CAST(... AS timestamptz)`) writes nothing, and a later call is
+  unaffected — the PG-level proof that "failure leaves nothing to have
+  advanced past";
+- `watermark=None` still recomputes an actor whose rows are ALL old (the
+  literal `TTM_LOOKBACK_DAYS=3` regression this design replaces).
+
+`tests/test_fundamental_divergence_pg.py` — real `_load_batch_price_cagrs`
+/ `_load_ticker_price_cagr` / `_load_batch_fundamentals` /
+`_load_ticker_fundamentals` against `public.raw_series` /
+`public.capital_flows` (unique `PG<hex>` tickers / `fd_pg_test_<uuid>`
+actor ids, a throwaway `source_catalog` row per test, all cleaned up):
+- `pull_status='FAILED'` rows (even with a bogus value and a newer
+  `pull_timestamp` than the real data) are excluded from the CAGR;
+- a measured `SUCCESS` value of `0` is treated as a real observation
+  (CAGR resolves to exactly `-1.0`, not `None`) — and, since this
+  specific dataset has no FAILED rows, `_load_batch_price_cagrs` and the
+  pre-batching `_load_ticker_price_cagr` are asserted equal, per the
+  brief;
+- competing vintages (two SUCCESS rows, same `obs_date`, different
+  `pull_timestamp`) — the latest pull wins, and the batched and
+  per-ticker functions are asserted equal;
+- bonus: `_load_batch_fundamentals` vs. `_load_ticker_fundamentals` on
+  the same annual `capital_flows` data (byte-equal dict, not just a
+  matching CAGR).
+
+**Real bug found and fixed while writing the competing-vintages test**:
+`_load_ticker_price_cagr` (`intelligence/fundamental_divergence.py`) had
+`ORDER BY obs_date DESC LIMIT 1` with NO `pull_timestamp` tiebreak, unlike
+the batched loader's deterministic `DISTINCT ON (series_id) ... ORDER BY
+series_id, obs_date DESC, pull_timestamp DESC`. Two SUCCESS rows sharing
+an `obs_date` (a same-day price correction) made this legacy function's
+"latest pull wins" behavior Postgres-plan-dependent, not deterministic —
+violating the same SUCCESS + latest-`pull_timestamp` policy
+`.claude/rules/data-integrity.md` documents for `store/observations.py`.
+Fixed by adding `, pull_timestamp DESC` to both of its `ORDER BY`
+clauses (latest-close and prior-close). This is the ONLY behavioral
+change made to `_load_ticker_price_cagr` in this pass — its missing
+`pull_status='SUCCESS'` filter (the batched loader has one, this
+function still doesn't) was deliberately left alone: fixing it is a
+larger, separately-reviewable change, and none of this pass's PG tests
+depend on it (the "failed observations" test only calls the batched
+loader, not the legacy one, specifically to sidestep this pre-existing
+gap). Flagged here, not silently left for someone to rediscover.
+
+The existing `tests/test_fundamental_divergence_sec_priority.py`
+(SQLite, `_load_ticker_fundamentals`'s SEC-over-seed dedup) is unchanged
+and still the fast/no-PG regression guard for that ranking logic — the
+new PG file is the "real Postgres, real table shapes, real functions"
+complement, not a replacement.
+
+### No-DB tracking unit tests
+
+`tests/test_capital_flow_rollups_tracking.py` — hand-rolled fake
+SQLAlchemy engine (no `pg_engine`, always runs): watermark passed through
+unbound by any reintroduced day-count constant; `None` watermark forces
+an unconditional full recompute; the `changed_actors` CTE and the new-
+watermark query both have no `fiscal_period` predicate (structural drift
+guards); a raising UPSERT never yields a watermark and `run_all` keeps
+the caller's watermark unchanged on failure so a retry recomputes the
+identical set; `OperatorState` hydration restores the watermark only
+when currently unset and never overwrites a live in-process value.
+
+### Coordinator: running the PG tests
+
+Point `GRID_TEST_DB_URL` at a disposable Postgres database with the
+project's `schema.sql` (+ migrations) applied, then:
+
+```
+GRID_TEST_DB_URL=postgresql://user:pass@host:5432/disposable_db \
+DB_PASSWORD=x PYTHONUTF8=1 python -m pytest \
+  tests/test_capital_flow_rollups_pg.py \
+  tests/test_fundamental_divergence_pg.py \
+  tests/test_capital_flow_rollups.py \
+  -v
+```
+
+(`tests/test_capital_flow_rollups.py` is the pre-existing PG file, now
+updated for the `watermark`-based `compute_ttm` signature — includes it
+here as a regression check on the same disposable DB.) Every test in
+both new files creates and cleans up its own uniquely-prefixed rows; none
+of them assume any pre-seeded `source_catalog` row, table, or production
+data.
+
+### What was NOT done (disclosed)
+
+- `_load_ticker_price_cagr`'s missing `pull_status='SUCCESS'` filter
+  (see "Real bug found" above) — left as-is, flagged for a separate
+  reviewed change.
+- No migration/CLI change beyond the pre-existing
+  `scripts/run_capital_flow_rollups.py --watermark` flag added in this
+  pass (replaces the old, never-wired `lookback_days=None` escape
+  hatch with an actual CLI knob) — no other script or endpoint was
+  touched.
+- The PG tests in this pass have not been executed against a real
+  database by this agent (no DB access here, per the controller's
+  constraints) — they are written, reviewed for SQL/behavioral
+  correctness against `schema.sql`, and confirmed to skip cleanly with
+  no Postgres reachable; the coordinator runs them for real.

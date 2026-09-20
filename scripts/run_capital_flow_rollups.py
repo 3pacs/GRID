@@ -58,6 +58,18 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable debug logging.",
     )
+    parser.add_argument(
+        "--watermark",
+        default=None,
+        help=(
+            "ISO-8601 timestamp: only recompute TTM for actors with a "
+            "quarter row newer than this. Omit for a full recompute "
+            "across every actor (this manual/debug runner has no "
+            "persisted watermark of its own — that lives on "
+            "OperatorState.capital_flow_ttm_watermark on the daily "
+            "hermes path; see intelligence/company_financial_rollups.py)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -74,8 +86,11 @@ def main() -> int:
         return 2
 
     if args.ttm_only:
-        n = compute_ttm(engine)
-        print(f"capital_flow_rollups: ttm rows={n}")
+        result = compute_ttm(engine, args.watermark)
+        print(
+            f"capital_flow_rollups: ttm rows={result.rows_written} "
+            f"watermark={args.watermark!r} -> {result.watermark!r}"
+        )
         return 0
 
     if args.rollup_only:
@@ -83,11 +98,11 @@ def main() -> int:
         print(f"capital_flow_rollups: rolled rows={n}")
         return 0
 
-    stats = run_all(engine)
+    stats = run_all(engine, ttm_watermark=args.watermark)
     print("capital_flow_rollups summary:")
     for k, v in stats.items():
         print(f"  {k}: {v}")
-    if stats.get("ttm_error") or stats.get("rolled_error"):
+    if not stats.get("ok", False):
         return 1
     return 0
 

@@ -551,7 +551,17 @@ def _load_ticker_price_cagr(
     if count_row is None or int(count_row[0] or 0) < MIN_PRICE_OBS:
         return None
 
-    # Latest close at/before as_of
+    # Latest close at/before as_of. ``pull_timestamp DESC`` as a second
+    # ORDER BY key (fable-daily-intel-sql-tasks, 2026-09-20 follow-up) is
+    # required for a deterministic "latest pull wins" pick when two
+    # SUCCESS rows share the same obs_date (a competing-vintages
+    # correction) — without it, Postgres is free to return either row for
+    # a tied obs_date and this legacy per-ticker function silently
+    # disagreed with the batched loader's deterministic
+    # ``DISTINCT ON (series_id) ... ORDER BY series_id, obs_date DESC,
+    # pull_timestamp DESC`` (see _load_batch_price_cagrs above). Restated
+    # to match store/observations.py's SUCCESS + latest-pull_timestamp
+    # policy (.claude/rules/data-integrity.md).
     latest_row = conn.execute(
         text(
             """
@@ -560,7 +570,7 @@ def _load_ticker_price_cagr(
             WHERE series_id = :sid
               AND obs_date <= :d
               AND value IS NOT NULL
-            ORDER BY obs_date DESC
+            ORDER BY obs_date DESC, pull_timestamp DESC
             LIMIT 1
             """
         ).bindparams(sid=series_id, d=as_of)
@@ -577,7 +587,7 @@ def _load_ticker_price_cagr(
             WHERE series_id = :sid
               AND obs_date <= :d
               AND value IS NOT NULL
-            ORDER BY obs_date DESC
+            ORDER BY obs_date DESC, pull_timestamp DESC
             LIMIT 1
             """
         ).bindparams(sid=series_id, d=target_prior)

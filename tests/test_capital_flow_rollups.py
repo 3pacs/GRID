@@ -319,14 +319,17 @@ def test_compute_ttm_skips_when_under_four_quarters(
     assert rows == [], f"expected no TTM rows, got {rows}"
 
 
-def test_compute_ttm_bounded_lookback_skips_stale_actor(
+def test_compute_ttm_watermark_skips_actor_with_no_row_since_watermark(
     pg_engine: Engine, test_actor_id: str,
 ):
-    """fable-daily-intel-sql-tasks (2026-09-20): an actor whose quarterly
-    rows are all older than TTM_LOOKBACK_DAYS is excluded from the
-    default-lookback ``changed_actors`` filter — no TTM row is written
+    """fable-daily-intel-sql-tasks (2026-09-20 follow-up): TTM_LOOKBACK_DAYS
+    was replaced with a durable, persisted watermark (see
+    intelligence/company_financial_rollups.py's module docstring and
+    tests/test_capital_flow_rollups_pg.py for the full design). An actor
+    whose quarterly rows are all older than an EXPLICIT watermark is
+    excluded from the ``changed_actors`` filter — no TTM row is written
     for it, even though it has 4 qualifying trailing quarters. This pins
-    the bounded-recompute fix that keeps compute_ttm off a full-table
+    the bounded-recompute property that keeps compute_ttm off a full-table
     scan/window computation on every daily-intel cycle.
     """
     quarters = [
@@ -340,21 +343,26 @@ def test_compute_ttm_bounded_lookback_skips_stale_actor(
             pg_engine, test_actor_id, fp, "revenue", amt, as_of_days_ago=30,
         )
 
-    compute_ttm(pg_engine)  # default TTM_LOOKBACK_DAYS=3 — misses this actor
+    with pg_engine.connect() as conn:
+        watermark = conn.execute(
+            text("SELECT (NOW() - make_interval(days => 3))"),
+        ).fetchone()[0].isoformat()
+    compute_ttm(pg_engine, watermark)  # 3 days ago — misses the 30-day-old actor
 
     rows = _fetch_ttm_rows(pg_engine, test_actor_id, "revenue")
     assert rows == [], (
-        f"stale actor (as_of 30 days ago) must be excluded by the default "
-        f"lookback, got {rows}"
+        f"stale actor (as_of 30 days ago) must be excluded by a watermark "
+        f"newer than its rows, got {rows}"
     )
 
 
-def test_compute_ttm_full_recompute_opt_out_picks_up_stale_actor(
+def test_compute_ttm_none_watermark_picks_up_stale_actor(
     pg_engine: Engine, test_actor_id: str,
 ):
-    """``lookback_days=None`` is the escape hatch for a manual full
-    recompute (e.g. scripts/run_capital_flow_rollups.py after a bulk
-    correction) — it must still find an actor the bounded default skips."""
+    """``watermark=None`` is BOTH the first-ever-run default AND the
+    escape hatch for a manual full recompute (e.g.
+    scripts/run_capital_flow_rollups.py with no --watermark flag) — it
+    must still find an actor a bounded watermark would skip."""
     quarters = [
         (date(2024, 3, 31), 100.0),
         (date(2024, 6, 30), 110.0),
@@ -366,7 +374,7 @@ def test_compute_ttm_full_recompute_opt_out_picks_up_stale_actor(
             pg_engine, test_actor_id, fp, "revenue", amt, as_of_days_ago=30,
         )
 
-    compute_ttm(pg_engine, lookback_days=None)
+    compute_ttm(pg_engine, None)
 
     rows = _fetch_ttm_rows(pg_engine, test_actor_id, "revenue")
     latest = [r for r in rows if r["fiscal_period"] == date(2024, 12, 31)]

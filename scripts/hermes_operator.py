@@ -192,7 +192,10 @@ DAILY_INTEL_DISPATCH_TASK_BUDGET_S = DAILY_INTEL_SQL_TASK_BUDGET_S  # storage_ma
 # unbounded ROW_NUMBER/window recompute over ALL ~310k
 # capital_flows(period_type='quarter') rows every cycle (cancelled by
 # db.py's 120s statement_timeout every attempt — company_financial_
-# rollups.py::compute_ttm/TTM_LOOKBACK_DAYS) and fundamental_divergence
+# rollups.py::compute_ttm, originally bounded by a fixed
+# TTM_LOOKBACK_DAYS=3 window and now by a durable persisted watermark,
+# OperatorState.capital_flow_ttm_watermark — see that module's docstring)
+# and fundamental_divergence
 # issued 1-4 queries PER TICKER (~1,500 tickers, an N+1 pattern summing
 # to ~120-124s of round-trip overhead — fundamental_divergence.py's
 # "Batched metric extraction" comment). The controller's instruction was
@@ -205,11 +208,11 @@ DAILY_INTEL_DISPATCH_TASK_BUDGET_S = DAILY_INTEL_SQL_TASK_BUDGET_S  # storage_ma
 #   completing is fold_announcements alone — 16s (see
 #   docs/handoffs/2026-09-20/fable-daily-intel-sql-tasks.md's evidence
 #   quote, 07:51:13->07:51:29). compute_ttm is now bounded to actors
-#   with a new/updated quarterly row in the trailing
-#   TTM_LOOKBACK_DAYS=3 window rather than the full table — cheap on a
-#   normal day, but evidence-uncertain on a catch-up day after a missed
-#   cycle (more actors fall inside the 3-day window at once). 90s keeps
-#   ~5.6x headroom over the one measured baseline (16s) for that
+#   with a quarterly row newer than the persisted
+#   OperatorState.capital_flow_ttm_watermark rather than the full table
+#   — cheap on a normal day, but evidence-uncertain on a catch-up day
+#   after downtime (more actors fall past the watermark at once). 90s
+#   keeps ~5.6x headroom over the one measured baseline (16s) for that
 #   uncertainty while staying a small fraction of the 480s cycle budget
 #   — NOT "wait longer for the same unbounded scan," since the scan
 #   itself no longer touches the full table.
@@ -1566,15 +1569,50 @@ def _daily_intel_capital_flow_rollups(
     """Derives ttm rows from quarterly XBRL data and folds announcement rows
     into annual_rolled rows. Runs after the XBRL ingestor + corporate_actions
     so it always sees the freshest base rows (corporate_actions dispatched
-    just before this in DAILY_INTEL_TASKS, same as before this task)."""
+    just before this in DAILY_INTEL_TASKS, same as before this task).
+
+    compute_ttm's recompute is bounded by the durable, restart-safe
+    watermark on ``state.capital_flow_ttm_watermark`` (fable-daily-intel-
+    sql-tasks, 2026-09-20 follow-up — replaces the earlier fixed
+    ``TTM_LOOKBACK_DAYS=3`` window; see
+    ``intelligence/company_financial_rollups.py``'s module docstring for
+    the full design). The watermark is advanced here, unconditionally as
+    soon as ``run_all`` reports ``ttm_ok`` — the DB write it corresponds
+    to already committed inside ``compute_ttm``'s own transaction,
+    regardless of whether this ledger later credits the attempt as
+    done/done_late/abandoned (see the "abandonment truth" doc on
+    ``_run_daily_intel_block``: an abandoned run still performs its DB
+    writes).
+
+    ``run_all`` never raises on its own — a partial failure (e.g.
+    ``compute_ttm`` cancelled but ``fold_announcements`` fine) is
+    reported honestly by re-raising HERE when ``cf_stats["ok"]`` is
+    False, so ``_run_with_timeout`` sees this task as ``ok=False`` and
+    the daily-intel ledger records a genuine FAILURE (attempt counted,
+    eventually skipped_for_period) rather than silently letting
+    done_late — or a same-cycle "done" from _run_with_timeout's
+    synchronous ok=True path — hide a compute_ttm that never wrote
+    anything this cycle.
+    """
     from intelligence.company_financial_rollups import run_all as cf_rollup_run
-    cf_stats = cf_rollup_run(engine)
+    cf_stats = cf_rollup_run(engine, ttm_watermark=state.capital_flow_ttm_watermark)
     results["capital_flow_rollups"] = cf_stats
     log.info(
-        "capital_flow_rollups: ttm={t} rolled={r}",
+        "capital_flow_rollups: ttm={t} rolled={r} ttm_ok={to} fold_ok={fo}",
         t=cf_stats.get("ttm_rows", 0),
         r=cf_stats.get("rolled_rows", 0),
+        to=cf_stats.get("ttm_ok"),
+        fo=cf_stats.get("fold_ok"),
     )
+    if cf_stats.get("ttm_ok"):
+        state.capital_flow_ttm_watermark = cf_stats.get("ttm_watermark")
+    if not cf_stats.get("ok"):
+        raise RuntimeError(
+            "capital_flow_rollups partial failure: "
+            f"ttm_ok={cf_stats.get('ttm_ok')} fold_ok={cf_stats.get('fold_ok')} "
+            f"ttm_error={cf_stats.get('ttm_error')} "
+            f"fold_error={cf_stats.get('fold_error')}"
+        )
 
 
 def _daily_intel_fundamental_divergence(

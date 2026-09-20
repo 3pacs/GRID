@@ -483,6 +483,213 @@ class TestDoneLateLedgerOutcome:
         assert summary["d"] == 1
 
 
+# ─── done_late correctness (fable-daily-intel-sql-tasks, 2026-09-20 ─────
+#     follow-up, controller brief section 3) — period-boundary crediting,
+#     never overwriting a newer attempt, and explicit token-supersession
+#     framing. TestDoneLateLedgerOutcome above already covers (c) (a late
+#     FAILURE never marks done) and one shape of (b)/(d) (a newer attempt
+#     that only REGISTERED a token, not yet completed). These add: (a) a
+#     late return crediting only its OWN due period, never a period that
+#     has since rolled over, and (b)/(d) a newer attempt that has already
+#     recorded a REAL "done" outcome before the stale worker's result
+#     lands.
+
+
+class TestDoneLatePeriodBoundary:
+    def test_a_late_return_after_period_rollover_does_not_credit_new_period(
+        self, monkeypatch,
+    ) -> None:
+        """(a) a late return credits only the attempt that timed out, and
+        only ITS OWN due period — a late return from a previous period's
+        attempt must not mark the CURRENT (rolled-over) period done.
+
+        Fully real-thread: the old worker is still blocked (a
+        threading.Event) when a SECOND call, for a LATER `now` (a new due
+        period), runs _run_daily_intel_block. That call rolls the ledger
+        over to the new period unconditionally (before the per-task loop
+        even starts) and — since the old worker's thread is still alive —
+        skips 'slow' as in_flight rather than starting a new attempt. Only
+        after that does the first (old-period) worker's belated result
+        land.
+        """
+        release = threading.Event()
+        finished = threading.Event()
+
+        def slow(engine: Any, state: OperatorState, now: datetime, results: dict[str, Any]) -> None:
+            release.wait(timeout=5.0)
+            results["slow"] = "stale-period-result"
+            finished.set()
+
+        tasks = (_task("slow", slow, budget_s=0.05),)
+        monkeypatch.setattr(ho, "DAILY_INTEL_TASKS", tasks)
+        _allow_all(monkeypatch, tasks)
+        monkeypatch.setattr(ho, "DAILY_INTEL_CYCLE_BUDGET_SECONDS", 30)
+
+        state = OperatorState()
+        results: dict[str, Any] = {}
+
+        old_period_iso = _period_iso(NOW)
+        ho._run_daily_intel_block(MagicMock(), state, NOW, results)
+        assert state.daily_intel_period == old_period_iso
+        assert state.daily_intel_done.get("slow") is None
+
+        # A later due period (next day, same boundary hour) — rolls the
+        # ledger over. The old worker is still blocked on `release`, so
+        # this call's no-overlap guard must skip 'slow' as in_flight
+        # rather than starting a fresh attempt for it.
+        NEXT_DAY = NOW.replace(day=NOW.day + 1)
+        new_period_iso = _period_iso(NEXT_DAY)
+        assert new_period_iso != old_period_iso
+        ho._run_daily_intel_block(MagicMock(), state, NEXT_DAY, results)
+        assert state.daily_intel_period == new_period_iso
+        assert state.daily_intel_task_outcome.get("slow") == "in_flight"
+        assert state.daily_intel_done.get("slow") is None
+
+        # Now let the FIRST (old-period) worker's belated result land.
+        release.set()
+        assert finished.wait(timeout=2.0), "orphaned worker never completed"
+
+        # Give the finally block a moment to run, then assert it did NOT
+        # credit the (now current) new period.
+        import time as _time
+        deadline = _time.monotonic() + 2.0
+        while _time.monotonic() < deadline:
+            _time.sleep(0.01)
+        assert state.daily_intel_period == new_period_iso
+        assert state.daily_intel_done.get("slow") is None, (
+            "a late return from a PREVIOUS period's attempt must not "
+            "mark the CURRENT (rolled-over) period done"
+        )
+        assert state.daily_intel_task_outcome.get("slow") != "done_late"
+        assert "slow" not in results
+
+
+class TestDoneLateNeverOverwritesNewerAttempt:
+    def test_bd_newer_attempt_already_done_is_not_overwritten_by_stale_late_return(
+        self, monkeypatch,
+    ) -> None:
+        """(b) never overwrites a newer attempt's outcome — the "newer
+        attempt done" half (TestDoneLateLedgerOutcome::
+        test_superseded_late_return_is_rejected_not_done_late already
+        covers the "newer attempt in_flight/registered-but-not-yet-done"
+        half). Also stands for (d): the stale worker's token was
+        superseded, so its late return is not credited.
+
+        Same unreachable-via-real-threading caveat documented on
+        test_superseded_late_return_is_rejected_not_done_late applies
+        here too (the no-overlap guard means a second attempt can only
+        ever start once the first's thread is no longer alive) — this
+        test drives the token-supersession branch directly, but goes one
+        step further than that existing test by simulating the newer
+        attempt having ALREADY completed successfully (a real "done"
+        ledger entry and a real published result), not merely registered.
+        """
+        release = threading.Event()
+        finished = threading.Event()
+
+        def slow(engine: Any, state: OperatorState, now: datetime, results: dict[str, Any]) -> None:
+            release.wait(timeout=5.0)
+            results["slow"] = "stale-result"
+            finished.set()
+
+        tasks = (_task("slow", slow, budget_s=0.05),)
+        monkeypatch.setattr(ho, "DAILY_INTEL_TASKS", tasks)
+        _allow_all(monkeypatch, tasks)
+        monkeypatch.setattr(ho, "DAILY_INTEL_CYCLE_BUDGET_SECONDS", 30)
+
+        state = OperatorState()
+        results: dict[str, Any] = {}
+        ho._run_daily_intel_block(MagicMock(), state, NOW, results)
+
+        period_iso = _period_iso(NOW)
+        assert state.daily_intel_done.get("slow") is None
+        entry = ho._DAILY_INTEL_IN_FLIGHT.get("slow")
+        assert entry is not None and entry.get("timed_out") is True
+
+        # Simulate a genuine SECOND attempt that has ALREADY run to
+        # completion successfully — a new token, and the ledger already
+        # updated exactly the way the driver's own ok=True branch would
+        # update it.
+        new_token = ho._next_daily_intel_token()
+        ho._DAILY_INTEL_IN_FLIGHT["slow"] = {
+            "token": new_token, "thread": None, "started": time.monotonic(),
+        }
+        state.daily_intel_done["slow"] = period_iso
+        state.daily_intel_task_outcome["slow"] = "done"
+        results["slow"] = "fresh-result"
+
+        # Now let the FIRST (stale, superseded) worker's belated result
+        # land.
+        release.set()
+        assert finished.wait(timeout=2.0), "orphaned worker never completed"
+
+        # The newer attempt's outcome must be untouched by the stale one.
+        assert state.daily_intel_done.get("slow") == period_iso
+        assert state.daily_intel_task_outcome.get("slow") == "done"
+        assert results.get("slow") == "fresh-result", (
+            "the stale (superseded) worker's local results must never "
+            "publish over the newer attempt's real result"
+        )
+
+
+# ─── Capital-flow-rollups partial-failure -> ledger FAILURE (fable- ──────
+#     daily-intel-sql-tasks, 2026-09-20 follow-up, controller brief
+#     section 2e) — exercises the REAL _daily_intel_capital_flow_rollups
+#     task function (not a synthetic fake), with intelligence.
+#     company_financial_rollups.run_all monkeypatched to report the exact
+#     "compute_ttm cancelled, fold_announcements fine" shape production
+#     evidence showed. Proves the fix in _daily_intel_capital_flow_
+#     rollups: run_all's honest "ok": False must propagate as a raised
+#     exception, so this ledger records a genuine FAILURE — never "done",
+#     never "done_late".
+
+
+class TestCapitalFlowRollupsPartialFailure:
+    def test_ttm_cancelled_fold_ok_is_never_done_or_done_late(
+        self, monkeypatch,
+    ) -> None:
+        def fake_run_all(engine: Any, ttm_watermark: str | None = None) -> dict[str, Any]:
+            return {
+                "ttm_watermark_in": ttm_watermark,
+                "ttm_rows": 0,
+                "ttm_error": "QueryCanceled: canceling statement due to statement timeout",
+                "ttm_ok": False,
+                "ttm_watermark": ttm_watermark,  # unchanged — never advance on failure
+                "rolled_rows": 90,
+                "fold_ok": True,
+                "completed_at": "2026-09-20",
+                "ok": False,
+            }
+
+        monkeypatch.setattr(
+            "intelligence.company_financial_rollups.run_all", fake_run_all,
+        )
+        tasks = (
+            _task("capital_flow_rollups", ho._daily_intel_capital_flow_rollups, budget_s=5.0),
+        )
+        monkeypatch.setattr(ho, "DAILY_INTEL_TASKS", tasks)
+        _allow_all(monkeypatch, tasks)
+        monkeypatch.setattr(ho, "DAILY_INTEL_CYCLE_BUDGET_SECONDS", 30)
+        monkeypatch.setattr(ho, "DAILY_INTEL_MAX_ATTEMPTS", 2)
+
+        state = OperatorState()
+        state.capital_flow_ttm_watermark = "2026-09-15T00:00:00+00:00"
+        results: dict[str, Any] = {}
+
+        for _ in range(2):
+            ho._run_daily_intel_block(MagicMock(), state, NOW, results)
+
+        period_iso = _period_iso(NOW)
+        outcome = state.daily_intel_task_outcome.get("capital_flow_rollups")
+        assert outcome == "skipped_for_period"
+        assert outcome != "done"
+        assert outcome != "done_late"
+        assert state.daily_intel_skipped_for_period.get("capital_flow_rollups") == period_iso
+        # The write never committed -- the watermark must stay exactly
+        # where it was.
+        assert state.capital_flow_ttm_watermark == "2026-09-15T00:00:00+00:00"
+
+
 # ─── (h) budget pins ──────────────────────────────────────────────────
 
 

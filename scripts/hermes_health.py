@@ -448,6 +448,27 @@ class OperatorState:
         # period's.
         self.daily_intel_period_outcome: str | None = None
 
+        # capital_flow_ttm_watermark (fable-daily-intel-sql-tasks,
+        # 2026-09-20 follow-up): durable, restart-safe tracking cursor for
+        # intelligence/company_financial_rollups.py::compute_ttm — the
+        # ISO-8601 string of the highest capital_flows.as_of (period_
+        # type='quarter') already considered by a successful compute_ttm
+        # run, or None before the first successful run (which then
+        # recomputes every actor, unconditionally — see compute_ttm's
+        # docstring). Replaces the earlier fixed TTM_LOOKBACK_DAYS=3
+        # window, which silently missed both a downtime gap longer than 3
+        # days and a late correction to an OLD fiscal period that arrived
+        # more than 3 days after the correction. Advanced by
+        # scripts/hermes_operator.py::_daily_intel_capital_flow_rollups
+        # ONLY after compute_ttm's own UPSERT transaction has committed —
+        # a cancelled/failed run leaves this exactly where it was, so the
+        # next call recomputes the identical actor set (see compute_ttm's
+        # advance-after-write contract). Persisted/hydrated the same
+        # "only if currently unset" way as the daily-intel ledger fields
+        # above — a single scalar, so it lives directly on OperatorState
+        # rather than a new table.
+        self.capital_flow_ttm_watermark: str | None = None
+
         # Bounded-repair backlog (fable-hermes-repair-bound, 2026-09-19):
         # source_key (lowercased source_catalog name) -> list of tickers/ids
         # not yet attempted, left over when a repair pull in
@@ -558,6 +579,7 @@ class OperatorState:
             "daily_intel_attempts": self.daily_intel_attempts,
             "daily_intel_task_outcome": self.daily_intel_task_outcome,
             "daily_intel_period_outcome": self.daily_intel_period_outcome,
+            "capital_flow_ttm_watermark": self.capital_flow_ttm_watermark,
         }
 
     def hydrate_from_snapshot(self, engine: Any) -> bool:
@@ -684,7 +706,7 @@ class OperatorState:
         # fields above.
         for str_field in (
             "last_sector_health_outcome", "daily_intel_period",
-            "daily_intel_period_outcome",
+            "daily_intel_period_outcome", "capital_flow_ttm_watermark",
         ):
             val = op_state.get(str_field)
             if isinstance(val, str) and getattr(self, str_field, None) is None:

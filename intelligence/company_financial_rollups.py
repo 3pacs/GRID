@@ -21,12 +21,58 @@ Two derived views off the base ``capital_flows`` table:
 Both functions are idempotent (ON CONFLICT DO UPDATE / DELETE+INSERT)
 and use parameterised SQL only. Designed to run daily after the XBRL
 ingestor inside the Hermes operator.
+
+Durable TTM recompute tracking (fable-daily-intel-sql-tasks, 2026-09-20
+follow-up — replaces the earlier fixed ``TTM_LOOKBACK_DAYS=3`` window).
+
+**Corrected-row signal, established from code, not assumed:** the only
+writer of ``period_type='quarter'`` rows is
+``ingestion/altdata/sec_xbrl_financials.py::_write_rows`` (confirmed by
+grepping every ``INSERT INTO capital_flows`` site;
+``ingestion/altdata/corporate_actions_parser.py`` only ever writes
+``period_type='announcement'``, and ``scripts/load_supply_capital_seed.py``
+is an offline one-off seed script, not part of the daily ingest path).
+``_write_rows`` DELETEs the exact
+``(actor_id, fiscal_period, period_type, flow_type, source_filing)`` row
+(if any) and then plain-INSERTs a fresh one with ``as_of = NOW()`` on
+*every* call — there is no ``ON CONFLICT DO NOTHING`` short-circuit. That
+means ``as_of`` moves forward on a re-ingested/corrected quarterly row
+exactly the same way it does on a brand-new one: a correction to an OLD
+fiscal period is indistinguishable, at the ``as_of`` level, from a new
+row. So a single scalar **watermark** — the maximum ``as_of`` among
+``period_type='quarter'`` rows already processed by a successful
+``compute_ttm`` call — is sufficient to detect both cases; no per-actor
+content fingerprint is needed (that fallback would only be required if
+corrections did NOT move any monotonic column, which is not what the code
+shows).
+
+**Persistence:** the watermark is a single ISO-8601 string (or ``None``
+before the first successful run), small enough to live directly on
+``OperatorState.capital_flow_ttm_watermark`` (scripts/hermes_health.py),
+serialised/hydrated the same "only if currently unset" way as the other
+daily-intel ledger fields — no new table, no migration. A tiny table was
+considered and rejected: there is exactly one scalar of state for the
+whole rollup (not one row per actor), so a table would only add a
+migration and a query for no correctness benefit over the existing
+``OperatorState`` snapshot path every other piece of daily-intel ledger
+state already uses.
+
+**Advance-after-write:** ``compute_ttm`` runs its UPSERT inside a single
+``engine.begin()`` transaction and only computes/returns the new
+watermark value (``MAX(as_of)`` over the exact set of quarter rows the
+UPSERT just considered) after that transaction has committed
+successfully. If the UPSERT raises, the transaction rolls back and the
+exception propagates BEFORE any new watermark is computed or returned —
+the caller (``run_all`` / the daily-intel task) never sees an updated
+value to persist, so a failed run leaves the persisted watermark exactly
+where it was and the next call recomputes the identical actor set. See
+``compute_ttm``'s own docstring for the exact contract.
 """
 
 from __future__ import annotations
 
 from datetime import date
-from typing import Any
+from typing import Any, NamedTuple
 
 from loguru import logger as log
 from sqlalchemy import text
@@ -40,25 +86,6 @@ ROLLED_CONFIDENCE: str = "derived"
 
 # Required number of trailing quarters to compute a TTM bucket.
 TTM_WINDOW_QUARTERS: int = 4
-
-# Bounded-recompute lookback for compute_ttm (fable-daily-intel-sql-tasks,
-# 2026-09-20). Root cause of the SQL-task-budget timeout (see
-# docs/handoffs/2026-09-20/fable-daily-intel-sql-tasks.md): the original
-# query ran the ROW_NUMBER/windowed-SUM computation over EVERY actor's
-# full quarterly history on every call — a full recompute of ~310k
-# capital_flows(period_type='quarter') rows every day, regardless of
-# whether that actor's data had changed since the previous run. That is
-# what statement_timeout (120s, db.py) was cancelling every attempt.
-#
-# compute_ttm is idempotent (ON CONFLICT DO UPDATE), so restricting the
-# ROW_NUMBER/window computation to only the actors with a NEW or UPDATED
-# quarterly row in the trailing window is safe: an actor whose quarterly
-# data hasn't changed already has a correct, unchanged TTM row from a
-# previous run. 3 days (not 1) absorbs a missed cycle or a delayed XBRL
-# ingest without requiring a persisted watermark — capital_flows.as_of
-# already exists and is written by every quarterly-row writer, so no
-# migration/new column is needed to bound this.
-TTM_LOOKBACK_DAYS: int = 3
 
 
 # ── TTM rollup ───────────────────────────────────────────────────────
@@ -77,18 +104,24 @@ TTM_LOOKBACK_DAYS: int = 3
 # expression list — so we restate the COALESCE/NULLIF here verbatim.
 _TTM_UPSERT_SQL = text(
     """
-    -- Bound the recompute to actors with a new/updated quarterly row in
-    -- the trailing :lookback_days window (fable-daily-intel-sql-tasks,
-    -- 2026-09-20 — see compute_ttm/TTM_LOOKBACK_DAYS docstrings). This is
-    -- what keeps the ROW_NUMBER/window computation below off the full
-    -- ~310k-row quarter table on every call; an actor with no new
-    -- quarterly data already has a correct TTM row from a previous run.
+    -- Bound the recompute to actors with a quarterly row newer than the
+    -- persisted watermark (fable-daily-intel-sql-tasks, 2026-09-20
+    -- follow-up — see the module docstring and compute_ttm's docstring
+    -- for the durable-tracking design). This is what keeps the
+    -- ROW_NUMBER/window computation below off the full ~310k-row quarter
+    -- table on every call; an actor with no quarterly row newer than
+    -- :watermark already has a correct TTM row from a previous run.
+    -- :watermark IS NULL means "no watermark persisted yet" (first run /
+    -- explicit full-recompute) and matches every quarter row.
     WITH changed_actors AS (
         SELECT DISTINCT actor_id
         FROM capital_flows
         WHERE period_type = 'quarter'
           AND amount_usd IS NOT NULL
-          AND as_of >= NOW() - make_interval(days => :lookback_days)
+          AND (
+            CAST(:watermark AS timestamptz) IS NULL
+            OR as_of > CAST(:watermark AS timestamptz)
+          )
     ),
     -- Dedup base quarterly rows by natural key. The base table can
     -- have multiple source_filing variants for the same logical
@@ -220,25 +253,73 @@ _TTM_UPSERT_SQL = text(
     """
 )
 
+# Companion query: the new watermark to persist after a successful
+# compute_ttm run is MAX(as_of) over the exact same predicate the
+# changed_actors CTE above used — i.e. "how far did this run actually
+# look". Run inside the SAME transaction as the UPSERT (see compute_ttm)
+# so it reflects a consistent snapshot with what was just written.
+_TTM_NEW_WATERMARK_SQL = text(
+    """
+    SELECT MAX(as_of) FROM capital_flows
+    WHERE period_type = 'quarter'
+      AND amount_usd IS NOT NULL
+      AND (
+        CAST(:watermark AS timestamptz) IS NULL
+        OR as_of > CAST(:watermark AS timestamptz)
+      )
+    """
+)
 
-def compute_ttm(engine: Engine, lookback_days: int | None = TTM_LOOKBACK_DAYS) -> int:
+
+class TtmResult(NamedTuple):
+    """``compute_ttm``'s return value.
+
+    ``watermark`` is the value the CALLER should persist next (e.g. onto
+    ``OperatorState.capital_flow_ttm_watermark``) — see ``compute_ttm``'s
+    docstring for the advance-after-write contract. It is:
+      * the new ``MAX(as_of)`` this run considered, as an ISO-8601 string,
+        when at least one quarter row qualified;
+      * the INPUT ``watermark`` unchanged when nothing qualified (nothing
+        to advance past).
+    ``compute_ttm`` never returns a value at all when the UPSERT raises —
+    the exception propagates instead, so a failed run cannot produce a
+    watermark to advance past.
+    """
+    rows_written: int
+    watermark: str | None
+
+
+def compute_ttm(engine: Engine, watermark: str | None = None) -> TtmResult:
     """Build trailing-twelve-month rollup rows from quarterly data.
 
-    ``lookback_days`` bounds the recompute to actors with a new/updated
-    ``period_type='quarter'`` row (by ``as_of``) in the trailing window —
-    see ``TTM_LOOKBACK_DAYS`` for why this is safe and idempotent. Pass
-    ``None`` to force a full recompute across every actor regardless of
-    ``as_of`` (e.g. for a manual backfill via
-    ``scripts/run_capital_flow_rollups.py`` after a bulk quarterly-data
-    correction that didn't touch ``as_of``) — NOT the daily hermes path,
-    which always uses the bounded default.
+    ``watermark`` is an ISO-8601 timestamp string — the durable, restart-
+    safe tracking cursor described in the module docstring — or ``None``.
+    An actor is included in this run's recompute when it has a
+    ``period_type='quarter'`` row with ``as_of`` strictly greater than
+    ``watermark`` (or unconditionally when ``watermark`` is ``None``: no
+    watermark persisted yet, i.e. the first-ever run, or an explicit
+    caller-requested full recompute — e.g. a manual backfill via
+    ``scripts/run_capital_flow_rollups.py`` after a bulk correction).
+    Because ``as_of`` moves forward on every write from the XBRL ingestor
+    — new row OR corrected row, regardless of which fiscal period it
+    corrects (see the module docstring's "corrected-row signal" finding)
+    — this single scalar watermark catches both a plain gap (an actor
+    idle beyond any fixed lookback window) and a late correction to an
+    OLD fiscal period, with no per-actor state needed.
 
-    Returns the number of TTM rows written/refreshed.
+    **Advance-after-write contract**: the UPSERT and the "what's the new
+    watermark" query both run inside ONE ``engine.begin()`` transaction.
+    If the UPSERT raises (e.g. a cancelled statement), the transaction
+    rolls back and the exception propagates out of this function BEFORE
+    any watermark is computed — the caller never receives (and therefore
+    can never persist) an advanced watermark for a run that didn't
+    actually commit its TTM rows. A retry with the SAME unchanged
+    watermark therefore recomputes exactly the same actor set. On
+    success, the returned ``TtmResult.watermark`` is safe to persist
+    immediately — the TTM rows it corresponds to are already committed.
+
+    Returns a ``TtmResult(rows_written, watermark)``.
     """
-    # None -> an arbitrarily large window so `as_of >= NOW() - N days`
-    # matches every row, without a second SQL text (still parameterized,
-    # per security.md — no dynamic string formatting of the interval).
-    effective_lookback = lookback_days if lookback_days is not None else 36500  # ~100y
     with engine.begin() as conn:
         result = conn.execute(
             _TTM_UPSERT_SQL,
@@ -246,15 +327,32 @@ def compute_ttm(engine: Engine, lookback_days: int | None = TTM_LOOKBACK_DAYS) -
                 "window": TTM_WINDOW_QUARTERS,
                 "source_filing": TTM_SOURCE_FILING,
                 "confidence": TTM_CONFIDENCE,
-                "lookback_days": effective_lookback,
+                "watermark": watermark,
             },
         )
         rowcount = result.rowcount or 0
+        new_watermark_row = conn.execute(
+            _TTM_NEW_WATERMARK_SQL, {"watermark": watermark},
+        ).fetchone()
+
+    new_max_as_of = new_watermark_row[0] if new_watermark_row else None
+    if new_max_as_of is not None:
+        effective_watermark = (
+            new_max_as_of.isoformat()
+            if hasattr(new_max_as_of, "isoformat")
+            else str(new_max_as_of)
+        )
+    else:
+        # Nothing qualified this run (no quarter row newer than
+        # `watermark`) — keep the watermark exactly where it was; there
+        # is nothing new to advance past.
+        effective_watermark = watermark
+
     log.info(
-        "capital_flow_rollups.compute_ttm: {n} ttm rows (lookback_days={l})",
-        n=rowcount, l=lookback_days,
+        "capital_flow_rollups.compute_ttm: {n} ttm rows (watermark {w} -> {nw})",
+        n=rowcount, w=watermark, nw=effective_watermark,
     )
-    return int(rowcount)
+    return TtmResult(rows_written=int(rowcount), watermark=effective_watermark)
 
 
 # ── Announcement folding ─────────────────────────────────────────────
@@ -372,20 +470,57 @@ def fold_announcements(engine: Engine) -> int:
 # ── Orchestrator ─────────────────────────────────────────────────────
 
 
-def run_all(engine: Engine) -> dict[str, Any]:
-    """Run every rollup. Returns a stats dict for telemetry."""
-    stats: dict[str, Any] = {}
+def run_all(engine: Engine, ttm_watermark: str | None = None) -> dict[str, Any]:
+    """Run every rollup. Returns a stats dict for telemetry.
+
+    ``ttm_watermark`` is the persisted durable-tracking cursor (see the
+    module docstring) — pass ``state.capital_flow_ttm_watermark`` from
+    ``OperatorState``, or ``None`` before the first successful run.
+
+    ``compute_ttm`` and ``fold_announcements`` are attempted
+    INDEPENDENTLY — a failure in one does not skip the other. This
+    mirrors production evidence (docs/handoffs/2026-09-20/
+    fable-daily-intel-sql-tasks.md) that a cancelled ``compute_ttm``
+    statement still let ``fold_announcements`` complete and write its
+    rolled rows in the same cycle.
+
+    This function itself never raises. The returned dict's ``"ok"`` key
+    is ``True`` only when BOTH sub-steps succeeded — the caller (see
+    ``scripts/hermes_operator.py::_daily_intel_capital_flow_rollups``)
+    MUST check it and raise/propagate a failure when it is ``False``, so
+    a partial failure (e.g. ``compute_ttm`` cancelled but
+    ``fold_announcements`` fine) is recorded as a genuine task FAILURE by
+    the daily-intel ledger, never as ``done``/``done_late``.
+
+    ``stats["ttm_watermark"]`` is the value the caller should persist
+    next: the new watermark ``compute_ttm`` returned on success, or the
+    INPUT ``ttm_watermark`` unchanged when ``compute_ttm`` failed (its
+    transaction never committed, so there is nothing new to advance
+    past — see ``compute_ttm``'s docstring).
+    """
+    stats: dict[str, Any] = {"ttm_watermark_in": ttm_watermark}
     try:
-        stats["ttm_rows"] = compute_ttm(engine)
+        ttm_result = compute_ttm(engine, ttm_watermark)
+        stats["ttm_rows"] = ttm_result.rows_written
+        stats["ttm_watermark"] = ttm_result.watermark
+        stats["ttm_ok"] = True
     except Exception as exc:
         log.error("compute_ttm failed: {e}", e=str(exc))
         stats["ttm_rows"] = 0
         stats["ttm_error"] = str(exc)
+        stats["ttm_ok"] = False
+        # Never advance past a failed write (see compute_ttm's
+        # advance-after-write contract) — the next call must recompute
+        # the identical actor set.
+        stats["ttm_watermark"] = ttm_watermark
     try:
         stats["rolled_rows"] = fold_announcements(engine)
+        stats["fold_ok"] = True
     except Exception as exc:
         log.error("fold_announcements failed: {e}", e=str(exc))
         stats["rolled_rows"] = 0
         stats["rolled_error"] = str(exc)
+        stats["fold_ok"] = False
     stats["completed_at"] = date.today().isoformat()
+    stats["ok"] = bool(stats["ttm_ok"] and stats["fold_ok"])
     return stats
