@@ -576,8 +576,14 @@ def main(argv: list[str] | None = None) -> None:
         args.max_rows if args.max_rows is not None else "all",
     )
 
+    # unscorable_entry_price is score_one_chunk's own belt-and-braces
+    # counter (rows its WHERE should already have excluded -- see that
+    # function). Listed explicitly so a reader sees every key the chunk
+    # loop can report, but the accumulation below never assumes this is
+    # the complete set: a chunk counters dict growing a new key must never
+    # crash main() with a KeyError, it should just be accumulated.
     totals = {"scored": 0, "hits": 0, "misses": 0, "partials": 0,
-              "skipped": 0, "no_data": 0}
+              "skipped": 0, "no_data": 0, "unscorable_entry_price": 0}
     processed = 0
     chunk_idx = 0
     while True:
@@ -599,8 +605,14 @@ def main(argv: list[str] | None = None) -> None:
 
         chunk_idx += 1
         fetched = chunk_counters.pop("fetched", 0)
+        # .get(k, 0) rather than totals[k]: score_one_chunk's counters dict
+        # is not required to carry exactly the keys totals was seeded
+        # with -- a chunk reporting a key totals does not already have
+        # must be accumulated, not raise KeyError (this crashed main() on
+        # the very first chunk that reported unscorable_entry_price before
+        # this fix).
         for k, v in chunk_counters.items():
-            totals[k] += v
+            totals[k] = totals.get(k, 0) + v
         processed += fetched
 
         # No more pending rows — done.
