@@ -163,6 +163,15 @@ Single head, as required.
 
 ## Historical-write hold — implementation (Step 4)
 
+**Two scoring paths, both enforced.** `scripts/score_oracle_trades.py` is a
+**manual CLI** — not invoked by any systemd unit, timer, cron entry, or by
+Hermes (confirmed: no reference in the release tree's `hermes_operator.py`,
+no journal lines in 24h on grid-svr). The **automatic** prediction →
+outcome → score path Hermes actually runs is
+`oracle/engine.py::OracleEngine.score_expired_predictions`, called directly
+from Hermes's oracle step (`hermes_operator.py:3964`: `from oracle.engine
+import OracleEngine`). The hold had to be — and is — enforced in **both**.
+
 The slice's own close-out sweep (`oracle/engine.py::score_expired_predictions`,
 comment "Rows closed as 'no_data' because their entry price was NULL, zero
 or negative") and the scorer script's equivalent sweep both closed **any**
@@ -262,7 +271,7 @@ Test-file changes on branch A:
 
 `tests/test_oracle_null_policy_pg.py` (new), using the `pg_engine` fixture
 pattern from `tests/test_capital_flow_rollups_pg.py` (skips cleanly when no
-Postgres is reachable / `GRID_TEST_DB_URL` unset — confirmed: 4 skipped in
+Postgres is reachable / `GRID_TEST_DB_URL` unset — confirmed: 5 skipped in
 this sandbox, which has no local Postgres). Proves, against a real
 PostgreSQL instance:
 
@@ -275,18 +284,26 @@ PostgreSQL instance:
    than imputing 0.5; `api/routers/oracle.py::get_predictions`/`get_latest`
    never raise and return honest `None`/named `tracking_pnl_basis` for a
    NULL-entry pending row.
-3. `test_preservation_legacy_rows_survive_a_real_scorer_run` — seeds two
-   legacy pending rows (`entry_price=0.0`, non-null confidence) and one
-   new-policy row (`entry_price IS NULL`), runs the real
-   `scripts/score_oracle_trades.py::main()` (network calls stubbed via
-   monkeypatching `fetch_prices`; `create_engine` monkeypatched to the test
-   engine) and asserts the two legacy rows come back **byte-identical**
-   (`verdict`, `entry_price`, `confidence`, `actual_price`,
-   `actual_move_pct`, `pnl_pct`, `scored_at`, `score_notes` all compared as
-   one dict-equality — this table has no `updated_at` column, so
-   `scored_at` stands in as the "last touched" column) while the NULL row
-   is closed to `no_data` with `SCORE_NOTE_ENTRY_NULL`.
-4. `test_migration_downgrade_with_null_rows_present` — calls the real
+3. `test_preservation_legacy_rows_survive_a_real_scorer_run` — the hold on
+   the **manual** path. Seeds two legacy pending rows (`entry_price=0.0`,
+   non-null confidence) and one new-policy row (`entry_price IS NULL`),
+   runs the real `scripts/score_oracle_trades.py::main()` (network calls
+   stubbed via monkeypatching `fetch_prices`; `create_engine` monkeypatched
+   to the test engine) and asserts the two legacy rows come back
+   **byte-identical** (`verdict`, `entry_price`, `confidence`,
+   `actual_price`, `actual_move_pct`, `pnl_pct`, `scored_at`, `score_notes`
+   all compared as one dict-equality — this table has no `updated_at`
+   column, so `scored_at` stands in as the "last touched" column) while the
+   NULL row is closed to `no_data` with `SCORE_NOTE_ENTRY_NULL`.
+4. `test_preservation_legacy_rows_survive_engine_score_expired_predictions`
+   — the same hold, proved on the **automatic** path (the one Hermes
+   actually calls): `OracleEngine.score_expired_predictions()` against a
+   stubbed price lookup (`__init__` bypassed via `object.__new__`, mirroring
+   `tests/test_oracle_null_readers.py::TestEngineScoringLoopEntryPrice`'s
+   own helper — `__init__` runs CREATE TABLE/INDEX statements and loads the
+   model registry, unrelated to this test). Same two legacy rows
+   byte-identical, same new-policy row closed with the same reason.
+5. `test_migration_downgrade_with_null_rows_present` — calls the real
    migration's `downgrade()` (via `alembic.operations.Operations` bound to
    a `MigrationContext`) with a NULL row present, asserts it does **not**
    raise and leaves both columns nullable (`information_schema.columns.
@@ -296,11 +313,101 @@ PostgreSQL instance:
    exists there.
 
 Runs against the whole shared `oracle_predictions` table where the real
-top-level functions require it (test 3's `main()`, following the same
-precedent as `test_capital_flow_rollups_pg.py::compute_ttm` calls), scoped
-to this file's own unique `pkt2a_pg_<uuid>` ids / `ZPKT2A<n>` tickers for
-every assertion; the autouse `cleanup_test_rows` fixture deletes this
+top-level functions require it (tests 3/4, following the same precedent as
+`test_capital_flow_rollups_pg.py::compute_ttm` calls), scoped to this
+file's own unique `pkt2a_pg_<uuid>` ids / `ZPKT2A<n>` tickers for every
+assertion; the autouse `cleanup_test_rows` fixture deletes this
 file's own rows by id afterward.
+
+## Coordinator PostgreSQL proof — round 1 findings and fixes
+
+The coordinator ran `tests/test_oracle_null_policy_pg.py` against a
+disposable PostgreSQL 14 database (`oracle_predictions`/`oracle_models`
+bootstrapped with main's `OracleEngine._ensure_tables` DDL, then this
+branch's migration applied — nullability NO→YES confirmed; the downgrade
+test passed as written). Found two test-harness defects and one scope gap,
+plus escalated one of the harness defects into a real production bug fixed
+in the same round.
+
+**1. Dedup-key collisions in the seed helper (harness defect).**
+`test_547_readers_handle_null_rows_honestly` and
+`test_preservation_legacy_rows_survive_a_real_scorer_run` failed with
+`UniqueViolation: duplicate key value violates unique constraint
+"oracle_predictions_dedup_unique"` — a real partial unique index (from the
+engine bootstrap DDL: `(ticker, direction, expiry, prediction_type,
+COALESCE(model_version,''), (created_at AT TIME ZONE 'UTC')::date) WHERE
+dedup_keep`) that this extraction does not touch or weaken. Multiple seeded
+rows shared a ticker, direction, expiry and creation day. Fixed by varying
+`direction` (test 2's two rows) or `expiry` (tests 3/4's three rows) per
+seeded row, keeping the same semantics (two legacy `entry_price=0.0` rows,
+one new-policy NULL row). Commit `128d413a`.
+
+**2. `tests/test_oracle_null_readers.py` failed collection on the gridz4
+proof host** with `ModuleNotFoundError: No module named
+'oracle.entry_price_policy'`, although `python -c "import
+oracle.entry_price_policy"` succeeded with the same `PYTHONPATH`. Root
+cause: `scripts/score_oracle_trades.py` does `sys.path.insert(0,
+"/data/grid_v4/grid_repo")` at import time; that directory is real on the
+gridz4 host and its own `oracle` package predates
+`oracle/entry_price_policy.py`. `tests/test_oracle_null_readers.py`
+imports `scripts.score_oracle_trades` before `oracle.entry_price_policy`,
+so the stale tree's `oracle` package shadowed the real one.
+  - **Harness fix** (commit `128d413a`): both
+    `tests/test_oracle_null_readers.py` and
+    `tests/test_oracle_null_policy_pg.py` now import `oracle.engine` and
+    `oracle.entry_price_policy` eagerly, at module top, before
+    `scripts.score_oracle_trades` — caching the real `oracle` package in
+    `sys.modules` first means nothing added to `sys.path` afterward can
+    shadow it, in this file or anywhere else in the process.
+  - **Escalation — this is a production bug, not just a proof-host
+    artefact** (coordinator, read-only check): `/data/grid_v4/grid_repo`
+    exists on **grid-svr** too — a stale checkout at revision `5facbdf0`
+    with no `oracle/entry_price_policy.py`. Hermes runs from
+    `/data/grid_v4/grid_release`. `scripts/score_oracle_trades.py`'s own
+    top-level import order put the `sys.path.insert` **before** its own
+    `from oracle.entry_price_policy import ...` — so the very first time
+    anything in a process imports that module (before `oracle` is
+    otherwise cached), the stale tree can shadow the real package for
+    that process, exactly as reproduced on gridz4.
+  - **Production fix** (commit `fbce2862`): reordered
+    `scripts/score_oracle_trades.py` so its own `from
+    oracle.entry_price_policy import ...` runs **before** the
+    `sys.path.insert`. The insert itself and its target string are
+    unchanged — this is an import-order fix only. New regression test
+    `tests/test_score_oracle_trades_stale_repo_shadow.py`: exercises the
+    real, unmodified `sys.path.insert("/data/grid_v4/grid_repo")` line,
+    redirecting *only* that literal target (via a `sys.path` list
+    subclass) to a harmless `tmp_path` built to look exactly like the
+    stale checkout — never touches the real absolute path on disk.
+    Verified locally to fail against the pre-fix import order
+    (`ModuleNotFoundError`, as expected) and pass against the fix, before
+    landing.
+  - **Confirmed on `scripts/score_oracle_trades.py` only**: `scripts/score_oracle_trades.py` is a
+    manual CLI — not invoked by any systemd unit, timer, cron entry, or
+    Hermes (no reference in the release tree's `hermes_operator.py`, no
+    journal lines in 24h). Three other scripts carry the identical
+    `sys.path.insert(0, "/data/grid_v4/grid_repo")` (confirmed via `git
+    grep` on `main`): `scripts/paper_trading_review.py`,
+    `scripts/run_forensics_batch.py`,
+    `scripts/run_intelligence_cycles.py`. **Not touched** — out of scope
+    for this extraction. **Follow-up for the coordinator**: the same
+    import-order class of bug may exist in any of these three if they
+    import an `oracle.*`/other repo submodule after their own insert;
+    worth the same audit.
+
+**3. Scope gap: the automatic scoring path wasn't proved.**
+`scripts/score_oracle_trades.py` (test 3) is the manual CLI; the automatic
+prediction → outcome → score cycle Hermes actually runs is
+`oracle/engine.py::OracleEngine.score_expired_predictions`
+(`hermes_operator.py:3964`). Added
+`test_preservation_legacy_rows_survive_engine_score_expired_predictions`
+(test 4) to prove the hold on that path too. Commit `128d413a`. See
+"Historical-write hold — implementation (Step 4)" above, now corrected to
+name both paths.
+
+All fixes mirrored onto `fable/packet2a-recovery-20260921` (cherry-picked
+cleanly — none of these files were touched by that branch's writer-revert
+commit).
 
 ## Recovery tree (Step 6)
 
