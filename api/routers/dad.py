@@ -2191,22 +2191,27 @@ def _mark_stale_response(payload: dict[str, Any], *, ticker: str) -> dict[str, A
 def _unmeasured_gold(one_liner: str) -> dict[str, Any]:
     """Gold card for 'we do not know', distinct from _gold_from_summary(None)'s 'we checked, there is nothing'.
 
-    _gold_from_summary(None) -- score 0, tone "neutral", verdict "No
-    workbook history yet" -- is a genuine, already-established result: it
-    means Dad's workbook corpus was actually queried and this ticker truly
-    has no footprint in it. A budget/capacity timeout means the opposite:
-    nothing was measured at all. Returning _gold_from_summary(None) verbatim
-    for a timeout would make an unmeasured ticker structurally identical to
-    a measured-and-empty one -- score, tone, and verdict text all the same
-    -- so a consumer reading only the gold card could not tell "verified
-    zero" from "unknown, ask again." score is None (not 0: 0 is a
-    measurement), tone is "unknown" (not any of _gold_from_summary's real
-    tones: strong/watch/light/neutral), and the verdict names the
-    distinction explicitly.
+    _gold_from_summary(None) -- heuristic_score None, tone "neutral",
+    verdict "No workbook history yet" -- is a genuine, already-established
+    result: it means Dad's workbook corpus was actually queried and this
+    ticker truly has no footprint in it (heuristic_score is None there too
+    -- an absent summary carries no inputs to score from, so no number is
+    published; see that function). A budget/capacity timeout means
+    something different again: nothing was even queried. Returning
+    _gold_from_summary(None) verbatim for a timeout would make an
+    unmeasured ticker structurally identical to a measured-and-empty one --
+    tone and verdict text both the same, even though heuristic_score is
+    None on both -- so a consumer reading only the gold card could not tell
+    "checked, nothing there" from "unknown, ask again." tone is "unknown"
+    (not any of _gold_from_summary's real tones: strong/watch/light/neutral)
+    and the verdict names the distinction explicitly; heuristic_score keeps
+    the same key name as _gold_from_summary's output so both shapes are
+    directly comparable, but None here means "not checked" while None there
+    means "checked, nothing to score."
     """
     return {
         "verdict": "Not checked yet",
-        "score": None,
+        "heuristic_score": None,
         "tone": "unknown",
         "one_liner": one_liner,
     }
