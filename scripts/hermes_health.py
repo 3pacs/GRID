@@ -448,6 +448,29 @@ class OperatorState:
         # period's.
         self.daily_intel_period_outcome: str | None = None
 
+        # capital_flow_ttm_watermark (fable-daily-intel-sql-tasks,
+        # 2026-09-20 follow-up; made VESTIGIAL by the SAME-DAY SECOND
+        # follow-up): originally a durable, restart-safe scalar ``as_of``
+        # cursor gating intelligence/company_financial_rollups.py::
+        # compute_ttm's recompute set. The controller established that
+        # design is NOT commit-order safe — PostgreSQL's NOW() is
+        # transaction-START time, so a late-committing writer can carry
+        # an as_of this cursor already passed, permanently skipping it
+        # (see that module's docstring for the full writeup and
+        # tests/test_capital_flow_rollups_pg.py for the concurrent-
+        # connection proofs). Replaced with a durable PER-ACTOR content
+        # fingerprint stored in ``capital_flows_ttm_state`` (migration
+        # ``capital_flow_ttm_state_20260920``), committed atomically with
+        # the ttm rows it governs — no caller-owned cursor is load-
+        # bearing for correctness any more. This field is KEPT, still set
+        # by scripts/hermes_operator.py::_daily_intel_capital_flow_
+        # rollups as soon as ``run_all`` reports ``ttm_ok``, purely as
+        # telemetry (the ISO-8601 wall-clock time the run completed) —
+        # removing it would touch call signatures with no correctness
+        # benefit. Persisted/hydrated the same "only if currently unset"
+        # way as the daily-intel ledger fields above.
+        self.capital_flow_ttm_watermark: str | None = None
+
         # Bounded-repair backlog (fable-hermes-repair-bound, 2026-09-19):
         # source_key (lowercased source_catalog name) -> list of tickers/ids
         # not yet attempted, left over when a repair pull in
@@ -558,6 +581,7 @@ class OperatorState:
             "daily_intel_attempts": self.daily_intel_attempts,
             "daily_intel_task_outcome": self.daily_intel_task_outcome,
             "daily_intel_period_outcome": self.daily_intel_period_outcome,
+            "capital_flow_ttm_watermark": self.capital_flow_ttm_watermark,
         }
 
     def hydrate_from_snapshot(self, engine: Any) -> bool:
@@ -684,7 +708,7 @@ class OperatorState:
         # fields above.
         for str_field in (
             "last_sector_health_outcome", "daily_intel_period",
-            "daily_intel_period_outcome",
+            "daily_intel_period_outcome", "capital_flow_ttm_watermark",
         ):
             val = op_state.get(str_field)
             if isinstance(val, str) and getattr(self, str_field, None) is None:

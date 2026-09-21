@@ -182,6 +182,56 @@ DAILY_INTEL_CLEANUP_TASK_BUDGET_S = 30        # documented default per-task budg
 DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S = DAILY_INTEL_LLM_TASK_BUDGET_S  # postmortem_batch is LLM-backed but bounded on the WORK axis by POSTMORTEM_BATCH_LIMIT (20 rows/cycle, see above) rather than its own time constant; the time budget still uses the LLM default.
 DAILY_INTEL_DISPATCH_TASK_BUDGET_S = DAILY_INTEL_SQL_TASK_BUDGET_S  # storage_maintenance_subagent only QUEUES a subagent dispatch command (_execute_hermes_repair_command) — no LLM call in this step itself — so it gets the SQL-class default, not the LLM one.
 
+# capital_flow_rollups / fundamental_divergence per-task budgets
+# (fable-daily-intel-sql-tasks, 2026-09-20) — deliberately SEPARATE
+# constants from DAILY_INTEL_SQL_TASK_BUDGET_S (not a shared-constant
+# bump, which would also loosen the other 6 SQL-class tasks with no
+# evidence behind it). See docs/handoffs/2026-09-20/
+# fable-daily-intel-sql-tasks.md for the full diagnosis; both tasks were
+# timing out at the shared 60s default because compute_ttm ran an
+# unbounded ROW_NUMBER/window recompute over ALL ~310k
+# capital_flows(period_type='quarter') rows every cycle (cancelled by
+# db.py's 120s statement_timeout every attempt — company_financial_
+# rollups.py::compute_ttm, originally bounded by a fixed
+# TTM_LOOKBACK_DAYS=3 window and now by a durable persisted watermark,
+# OperatorState.capital_flow_ttm_watermark — see that module's docstring)
+# and fundamental_divergence
+# issued 1-4 queries PER TICKER (~1,500 tickers, an N+1 pattern summing
+# to ~120-124s of round-trip overhead — fundamental_divergence.py's
+# "Batched metric extraction" comment). The controller's instruction was
+# explicit: do not just raise these budgets to paper over the timeout —
+# the numbers below are set AFTER the query-side fixes, sized off what
+# the fix leaves each task to do, not a guess at "give it more time":
+#
+#   capital_flow_rollups (90s, up from the 60s shared default): the
+#   ONE production number this task has ever actually measured
+#   completing is fold_announcements alone — 16s (see
+#   docs/handoffs/2026-09-20/fable-daily-intel-sql-tasks.md's evidence
+#   quote, 07:51:13->07:51:29). compute_ttm's expensive ROW_NUMBER/
+#   window recompute is still bounded to DIRTY actors only — but as of
+#   the 2026-09-20 SECOND follow-up, dirtiness is decided by a per-actor
+#   content-fingerprint comparison (capital_flows_ttm_state), not by
+#   OperatorState.capital_flow_ttm_watermark (now vestigial — see
+#   intelligence/company_financial_rollups.py's module docstring for
+#   why the scalar watermark was replaced). That comparison itself DOES
+#   read every quarter row every cycle (a single GROUP BY aggregate
+#   scan, not a window function) — cheap on a normal day at the ~310k-
+#   row scale measured here, but evidence-uncertain on a catch-up day
+#   after downtime (more actors dirty at once, more window work). 90s
+#   keeps ~5.6x headroom over the one measured baseline (16s) for that
+#   uncertainty while staying a small fraction of the 480s cycle budget.
+#
+#   fundamental_divergence (60s, UNCHANGED from the shared default):
+#   batching collapses the ~4,500-6,000 sequential per-ticker round
+#   trips the evidence attributes the ~120-124s DB-checkout holds to
+#   (no QueryCanceled was ever logged for this task — see the same
+#   evidence doc) into 4 queries total for the whole universe. There is
+#   no evidence this needs MORE time than the existing SQL-class
+#   default; raising it without evidence is exactly what the controller
+#   said not to do, so it stays at 60s.
+DAILY_INTEL_CAPITAL_FLOW_ROLLUPS_BUDGET_S = 90
+DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S = DAILY_INTEL_SQL_TASK_BUDGET_S
+
 # Sector health snapshot — daily due-period scheduling (2026-09-19). Was
 # "now.hour == 3 and now.minute < 10", which only fired on the rare cycle
 # evaluated inside that 10-minute slice; production ran it successfully
@@ -1523,15 +1573,55 @@ def _daily_intel_capital_flow_rollups(
     """Derives ttm rows from quarterly XBRL data and folds announcement rows
     into annual_rolled rows. Runs after the XBRL ingestor + corporate_actions
     so it always sees the freshest base rows (corporate_actions dispatched
-    just before this in DAILY_INTEL_TASKS, same as before this task)."""
+    just before this in DAILY_INTEL_TASKS, same as before this task).
+
+    compute_ttm's recompute is bounded to DIRTY actors, decided by a
+    durable per-actor content fingerprint (``capital_flows_ttm_state``) —
+    fable-daily-intel-sql-tasks, 2026-09-20 SECOND follow-up. This
+    replaced the first follow-up's scalar ``as_of`` watermark
+    (``state.capital_flow_ttm_watermark``), which the controller
+    established is NOT commit-order safe (see
+    ``intelligence/company_financial_rollups.py``'s module docstring for
+    the full design and why). ``state.capital_flow_ttm_watermark`` is
+    still set here, unconditionally, as soon as ``run_all`` reports
+    ``ttm_ok`` — but it is now purely informational telemetry (the wall-
+    clock time the run completed), not a gating cursor; the state that
+    actually governs recomputation already committed, atomically with
+    the ttm rows themselves, inside ``compute_ttm``'s own transaction,
+    regardless of whether this ledger later credits the attempt as
+    done/done_late/abandoned (see the "abandonment truth" doc on
+    ``_run_daily_intel_block``: an abandoned run still performs its DB
+    writes).
+
+    ``run_all`` never raises on its own — a partial failure (e.g.
+    ``compute_ttm`` cancelled but ``fold_announcements`` fine) is
+    reported honestly by re-raising HERE when ``cf_stats["ok"]`` is
+    False, so ``_run_with_timeout`` sees this task as ``ok=False`` and
+    the daily-intel ledger records a genuine FAILURE (attempt counted,
+    eventually skipped_for_period) rather than silently letting
+    done_late — or a same-cycle "done" from _run_with_timeout's
+    synchronous ok=True path — hide a compute_ttm that never wrote
+    anything this cycle.
+    """
     from intelligence.company_financial_rollups import run_all as cf_rollup_run
-    cf_stats = cf_rollup_run(engine)
+    cf_stats = cf_rollup_run(engine, ttm_watermark=state.capital_flow_ttm_watermark)
     results["capital_flow_rollups"] = cf_stats
     log.info(
-        "capital_flow_rollups: ttm={t} rolled={r}",
+        "capital_flow_rollups: ttm={t} rolled={r} ttm_ok={to} fold_ok={fo}",
         t=cf_stats.get("ttm_rows", 0),
         r=cf_stats.get("rolled_rows", 0),
+        to=cf_stats.get("ttm_ok"),
+        fo=cf_stats.get("fold_ok"),
     )
+    if cf_stats.get("ttm_ok"):
+        state.capital_flow_ttm_watermark = cf_stats.get("ttm_watermark")
+    if not cf_stats.get("ok"):
+        raise RuntimeError(
+            "capital_flow_rollups partial failure: "
+            f"ttm_ok={cf_stats.get('ttm_ok')} fold_ok={cf_stats.get('fold_ok')} "
+            f"ttm_error={cf_stats.get('ttm_error')} "
+            f"fold_error={cf_stats.get('fold_error')}"
+        )
 
 
 def _daily_intel_fundamental_divergence(
@@ -1653,8 +1743,8 @@ DAILY_INTEL_TASKS: tuple[DailyIntelTask, ...] = (
     DailyIntelTask("attention_anomaly", _daily_intel_attention_anomaly, DAILY_INTEL_SQL_TASK_BUDGET_S),
     DailyIntelTask("edgar_transcripts", _daily_intel_edgar_transcripts, DAILY_INTEL_LLM_TASK_BUDGET_S),
     DailyIntelTask("corporate_actions", _daily_intel_corporate_actions, DAILY_INTEL_SQL_TASK_BUDGET_S),
-    DailyIntelTask("capital_flow_rollups", _daily_intel_capital_flow_rollups, DAILY_INTEL_SQL_TASK_BUDGET_S),
-    DailyIntelTask("fundamental_divergence", _daily_intel_fundamental_divergence, DAILY_INTEL_SQL_TASK_BUDGET_S),
+    DailyIntelTask("capital_flow_rollups", _daily_intel_capital_flow_rollups, DAILY_INTEL_CAPITAL_FLOW_ROLLUPS_BUDGET_S),
+    DailyIntelTask("fundamental_divergence", _daily_intel_fundamental_divergence, DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S),
     DailyIntelTask("holder_deal_overlap", _daily_intel_holder_deal_overlap, DAILY_INTEL_SQL_TASK_BUDGET_S),
     DailyIntelTask("insight_cleanup", _daily_intel_insight_cleanup, DAILY_INTEL_CLEANUP_TASK_BUDGET_S),
     DailyIntelTask("briefing_cleanup", _daily_intel_briefing_cleanup, DAILY_INTEL_CLEANUP_TASK_BUDGET_S),
@@ -2125,33 +2215,70 @@ def _run_daily_intel_block(
     concurrent registration race is impossible (both the check and the
     register happen under ``_DAILY_INTEL_LOCK``).
 
-    Late-publish guard (review amendment): each attempt's task ``fn`` runs
-    against a LOCAL ``results`` dict, not the shared one, via a small
-    ``_run_task`` closure that (a) records its own thread ident into the
-    in-flight entry the moment it starts (under the lock — this is the
-    only place ``"thread"`` is ever set), (b) calls ``task.fn(...)``, then
-    (c) checks — again under the lock — whether its token is still the
-    entry's current token; if not, it logs ``"daily_intel task <name>
-    abandoned — exiting without publishing"`` and does nothing further
-    (its local results dict is simply discarded — never merged into the
-    shared ``results``). After ``_run_with_timeout`` returns to the driver
-    (synchronously, either because the task finished in time or because
-    the budget was exceeded and the worker was abandoned), the driver
-    itself re-checks the token under the same lock: on ``ok=True`` it
-    merges the local results into the shared ``results`` and marks the
-    task done (the token cannot have moved in this branch — nothing
-    invalidates it before this point on the success path); on ``ok=False``
-    it immediately invalidates the entry's token (mints a fresh one this
-    attempt does not hold) BEFORE recording the attempt/skip outcome —
-    this is what makes the timeout path itself bump the token even when
-    no retry ever starts, so a late-returning orphaned worker's own
-    ``_run_task`` epilogue (b)/(c) above sees a stale token and publishes
-    nothing, exactly mirroring ``_run_sector_and_intelligence_steps``'s
-    timeout-path bump of ``sector_health_attempt_token``. The in-flight
-    entry itself (with its now-stale token but still-live thread ident)
-    is deliberately NOT deleted on a timeout — the NEXT attempt's
-    no-overlap check still needs that thread ident to detect the orphan
-    is still running.
+    Late-publish guard, with done_late (fable-daily-intel-sql-tasks,
+    2026-09-20 amendment — supersedes the original review amendment's
+    "always reject a late return" behavior): each attempt's task ``fn``
+    runs against a LOCAL ``results`` dict, not the shared one, via a
+    small ``_run_task`` closure that (a) records its own thread ident
+    into the in-flight entry the moment it starts (under the lock — this
+    is the only place ``"thread"`` is ever set), (b) calls
+    ``task.fn(...)``, recording whether it returned normally or raised,
+    then (c) checks — again under the lock — whether its token is still
+    the entry's current token AND whether the driver already reported a
+    timeout for THIS attempt (``entry["timed_out"]``, set by the driver
+    below). Three outcomes:
+
+      * token no longer current (a genuine NEW attempt has since started
+        for this task+period — the fresh-attempt registration above
+        fully replaces the entry dict, token included) — this is the
+        real overlap case: log ``"...abandoned — exiting without
+        publishing (superseded by a new attempt)"`` and discard the
+        local results, exactly as before this amendment.
+      * token still current, ``timed_out`` is set, and ``task.fn``
+        returned successfully (no exception), within the SAME due
+        period, and the task is not already recorded done: mark
+        ``state.daily_intel_done[name] = period_iso`` and
+        ``state.daily_intel_task_outcome[name] = "done_late"``. This is
+        a late-but-successful return with no retry ever having started —
+        the ledger stops re-attempting the task (no more 3x-repeated
+        late writes for the identical period), but the local ``results``
+        are still NEVER merged into the shared ``results`` dict — there
+        is no driver call left waiting to consume them.
+      * token still current, ``timed_out`` is set, and ``task.fn``
+        raised (or the period rolled over, or it's already done): log
+        ``"...abandoned — exiting without publishing"`` and discard —
+        a late FAILURE never marks done.
+      * token still current and ``timed_out`` is NOT set: this is the
+        ordinary on-time path — do nothing here; the driver's own
+        post-``_run_with_timeout`` handling (below) records the outcome
+        synchronously right after this call returns.
+
+    The driver's own post-``_run_with_timeout`` handling, under the same
+    lock: on ``ok=True`` it merges the local results into the shared
+    ``results`` and marks the task done (the token cannot have moved in
+    this branch — nothing invalidates it before this point on the
+    success path); on ``ok=False`` it sets ``entry["timed_out"] = True``
+    — deliberately NOT a token bump — BEFORE recording the attempt/skip
+    outcome. Before this amendment the timeout path bumped the token
+    itself (mirroring ``_run_sector_and_intelligence_steps``'s
+    ``sector_health_attempt_token`` bump), which made every late return
+    look identical to "a retry already started" and made done_late
+    undecidable; ``timed_out`` now carries that "this attempt's wrapper
+    already gave up" signal instead, leaving the token free to serve
+    ONLY as the overlap/supersession signal described above. The
+    in-flight entry itself (with its thread ident intact) is deliberately
+    NOT deleted on a timeout — the NEXT attempt's no-overlap check still
+    needs that thread ident to detect the orphan is still running, and a
+    genuine new attempt only ever starts once that check reports the
+    orphan is no longer alive (which, in a single continuously-running
+    process, can only be true after the orphan's own ``_run_task``
+    epilogue has already run and already decided done_late vs abandoned
+    for its attempt — see
+    ``tests/test_hermes_daily_intel_resumable.py``'s done_late tests for
+    how the "retry already started" case is exercised by direct
+    entry/token manipulation rather than a real thread race, since the
+    no-overlap guard makes that ordering effectively unreachable via real
+    threading alone).
 
     Per-task attempts: ``ok=False`` (timeout or exception — see
     ``_daily_intel_raise_if_task_status_failed`` for the six tasks that go
@@ -2221,6 +2348,17 @@ def _run_daily_intel_block(
     performed on a timely return) and
     ``tests/test_hermes_daily_intel_resumable.py::
     TestAbandonmentDoesNotPreventTaskEffects``.
+
+    fable-daily-intel-sql-tasks (2026-09-20) amendment: (1) above is now
+    NARROWER than the paragraph above suggests — "the ledger write" is
+    only unconditionally skipped when there's a genuine reason to (a
+    superseding retry, a late failure, or a period rollover). A late
+    SUCCESS with no superseding retry now DOES get a ledger write — just
+    the narrower ``"done_late"`` one described in the late-publish guard
+    above, never the ``results`` payload merge. This does not change the
+    "effects an abandoned run can still perform" analysis above at all —
+    it only changes what THIS ledger does with the fact that those
+    effects already happened.
     """
     period_iso = _period_boundary(now, DAILY_INTEL_BOUNDARY_HOUR).date().isoformat()
 
@@ -2279,8 +2417,10 @@ def _run_daily_intel_block(
                 entry = _DAILY_INTEL_IN_FLIGHT.get(t.name)
                 if entry is not None and entry.get("token") == tok:
                     entry["thread"] = threading.get_ident()
+            fn_ok = False
             try:
                 t.fn(engine, state, now, lr)
+                fn_ok = True
             finally:
                 # Runs whether t.fn returned normally or raised — a
                 # worker finishing (on time OR late/abandoned) must clear
@@ -2299,15 +2439,79 @@ def _run_daily_intel_block(
                 # normal-completion case.
                 with _DAILY_INTEL_LOCK:
                     entry = _DAILY_INTEL_IN_FLIGHT.get(t.name)
-                    abandoned = entry is None or entry.get("token") != tok
+                    # "current" here means: no NEW attempt has been
+                    # registered for this task since THIS attempt's token
+                    # was minted — i.e. nothing has superseded it. A
+                    # superseding new attempt fully replaces the entry
+                    # dict (see the fresh-attempt registration above),
+                    # token included, so entry.get("token") != tok is the
+                    # signal a genuine retry has started. This is
+                    # DIFFERENT from "timed_out" below: a driver-side
+                    # wrapper timeout no longer bumps the token by
+                    # itself (fable-daily-intel-sql-tasks, 2026-09-20) —
+                    # only a real new attempt does.
+                    current = entry is not None and entry.get("token") == tok
+                    timed_out = bool(entry is not None and entry.get("timed_out"))
                     if entry is not None and entry.get("thread") == threading.get_ident():
                         entry["thread"] = None
-                    if abandoned:
+                    if not current:
+                        # A genuine retry already started for this task —
+                        # this is the real overlap case. Reject: exiting
+                        # without publishing, exactly as before.
                         log.warning(
                             "daily_intel task {n} abandoned — exiting "
-                            "without publishing",
+                            "without publishing (superseded by a new "
+                            "attempt)",
                             n=t.name,
                         )
+                    elif timed_out:
+                        # This attempt's wrapper already gave up on it
+                        # (ok=False was reported to the driver) and no
+                        # retry has started since — this is the late-
+                        # return case (fable-daily-intel-sql-tasks,
+                        # 2026-09-20, deliverable 3). A successful late
+                        # return, still within the same due period,
+                        # marks the task done via a NEW outcome —
+                        # "done_late" — so the ledger stops re-attempting
+                        # it (no more 3x repeats of the same late write)
+                        # WITHOUT publishing local_results into the
+                        # shared results dict: nothing downstream of this
+                        # driver call is still around to consume it, and
+                        # publishing a stale/partial payload out of band
+                        # would be worse than not publishing at all. A
+                        # late FAILURE must never mark done — the task
+                        # stays exactly as the driver already left it
+                        # (an attempt was counted; skipped_for_period
+                        # applies normally at DAILY_INTEL_MAX_ATTEMPTS).
+                        same_period = state.daily_intel_period == period_iso
+                        already_done = (
+                            state.daily_intel_done.get(t.name) == period_iso
+                        )
+                        if fn_ok and same_period and not already_done:
+                            state.daily_intel_done[t.name] = period_iso
+                            state.daily_intel_task_outcome[t.name] = "done_late"
+                            log.info(
+                                "daily_intel task {n} done_late — worker "
+                                "finished successfully after its wrapper "
+                                "timed out; period marked done, results "
+                                "payload not published",
+                                n=t.name,
+                            )
+                        else:
+                            log.warning(
+                                "daily_intel task {n} abandoned — exiting "
+                                "without publishing ({why})",
+                                n=t.name,
+                                why=(
+                                    "late failure" if not fn_ok
+                                    else "period rolled over" if not same_period
+                                    else "already done"
+                                ),
+                            )
+                    # else: current and not timed_out -> this is the
+                    # normal on-time path; the driver handles the
+                    # outcome synchronously right after _run_with_timeout
+                    # returns below. Nothing to do here.
 
         _, ok = _run_with_timeout(
             f"daily_intel:{task.name}",
@@ -2322,12 +2526,21 @@ def _run_daily_intel_block(
             entry = _DAILY_INTEL_IN_FLIGHT.get(task.name)
             current = entry is not None and entry.get("token") == token
             if not ok and current:
-                # Invalidate NOW so a late-returning orphan cannot publish
-                # later even if no retry ever starts (see docstring). Keep
-                # the entry (thread ident intact) for the next attempt's
-                # no-overlap check.
-                entry["token"] = _next_daily_intel_token()
-                current = False
+                # Mark this attempt's entry timed_out NOW so a late-
+                # returning orphan's own _run_task epilogue can recognize
+                # "my wrapper already gave up" the instant it finishes,
+                # however long that takes — see _run_task's finally block
+                # for the done_late / abandoned decision this flag
+                # drives. Unlike before fable-daily-intel-sql-tasks
+                # (2026-09-20), the TOKEN itself is deliberately left
+                # alone here: bumping it eagerly would make every late
+                # return look identical to "a retry already started",
+                # which is exactly the distinction done_late depends on.
+                # The token is only ever bumped by a genuine NEW attempt
+                # (the fresh-attempt registration above, which replaces
+                # this whole entry dict) — that is the real overlap case,
+                # still rejected exactly as before.
+                entry["timed_out"] = True
 
             if ok and current:
                 results.update(local_results)
@@ -2358,6 +2571,21 @@ def _run_daily_intel_block(
         t.name for t in enabled_tasks
         if state.daily_intel_done.get(t.name) != period_iso
     ]
+    # done_late tasks are a SUBSET of done_count (done_late sets
+    # daily_intel_done same as any other done outcome — see _run_task's
+    # finally block) — reported separately (deliverable 3d) so a reader
+    # can tell "finished on time" apart from "its wrapper had already
+    # given up and reported a timeout/attempt before the worker's late
+    # success was discovered" without re-deriving it from raw state. Most
+    # of the time this reflects a done_late written by a PREVIOUS call's
+    # orphaned worker (the async completion generally lands well after
+    # this synchronous log line for the SAME call — see
+    # tests/test_hermes_daily_intel_resumable.py's done_late tests).
+    done_late_names = [
+        t.name for t in enabled_tasks
+        if state.daily_intel_task_outcome.get(t.name) == "done_late"
+        and state.daily_intel_done.get(t.name) == period_iso
+    ]
 
     if total and done_count == total:
         state.last_daily_intel = now
@@ -2386,9 +2614,11 @@ def _run_daily_intel_block(
 
     log.info(
         "daily_intel: period={p} done={d}/{t} ran={r} skipped_for_period={s} "
-        "held={h} in_flight={f} remaining={rem} budget_used={b:.1f}s",
+        "held={h} in_flight={f} remaining={rem} budget_used={b:.1f}s "
+        "done_late={dl}",
         p=period_iso, d=done_count, t=total, r=ran, s=skipped_for_period,
         h=held, f=in_flight_skipped, rem=remaining, b=budget_used,
+        dl=len(done_late_names),
     )
 
     if total and done_count == total:
@@ -2419,11 +2649,19 @@ def _run_daily_intel_block(
             1 for t in enabled_tasks
             if state.daily_intel_task_outcome.get(t.name) == "skipped_for_period"
         )
+        # done_late is a subset of "done" by ledger state (daily_intel_done
+        # is set either way) but deliberately NOT folded into done_only
+        # here — done_only is specifically outcome=="done" (on-time
+        # publish), and a reader needs to be able to tell a late-but-
+        # successful completion apart from that (deliverable 3d).
+        done_late_count = len(done_late_names)
         log.info(
             "daily_intel: period={p} {outcome} enabled={n} done={d} "
-            "done_queued={dq} skipped_for_period={s} held={h}",
+            "done_queued={dq} skipped_for_period={s} held={h} "
+            "done_late={dl}",
             p=period_iso, outcome=state.daily_intel_period_outcome, n=total,
             d=done_only, dq=done_queued, s=skipped_count, h=len(held),
+            dl=done_late_count,
         )
 
 
