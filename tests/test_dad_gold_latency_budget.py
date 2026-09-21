@@ -136,18 +136,60 @@ def test_dependency_timeout_with_no_cache_returns_honest_unavailable(monkeypatch
     assert result["ticker"] == "SLOW"
     assert result["status"] == "unavailable"
     assert result["performance"]["budget_exceeded"] is True
+    assert result["performance"]["capacity_exceeded"] is False
     assert result["cache"] == {"hit": False, "stale": False, "ttl_seconds": dad.SUMMARY_CACHE_TTL_SECONDS}
     # No fabricated values: the honest-empty gold/decision-stack shape, same as
     # a genuinely missing-workbook ticker (_gold_from_summary(None)).
     assert result["gold"] == dad._gold_from_summary(None)
 
 
+def test_budget_only_ends_the_wait_the_compute_keeps_running_and_still_caches(monkeypatch):
+    """The 8s budget bounds the caller's wait, not the compute: it finishes and still writes cache."""
+    monkeypatch.setattr(dad, "GOLD_COMPACT_BUDGET_SECONDS", 0.1)
+    write_calls = []
+
+    def _slow_workbook(ticker, **kwargs):
+        time.sleep(0.4)  # comfortably past the 0.1s budget
+        return {"status": "ready", "summary": None, "workbook": {"files": [], "sheets": [], "evidence": []},
+                "source_lanes": [], "dad_stats": [], "fit_signals": [], "source": {"attached": True, "db_path": "x"}}
+
+    def _fake_write(engine, ticker, db_path, payload, timings):
+        write_calls.append(ticker)
+
+    with patch.object(dad, "_read_summary_cache", return_value=None), \
+         patch.object(dad, "_load_workbook_context", side_effect=_slow_workbook), \
+         patch.object(dad, "_load_grid_payload", return_value=dad._empty_grid_payload("unused")), \
+         patch.object(dad, "_write_summary_cache", side_effect=_fake_write), \
+         patch.object(dad, "get_db_engine", return_value=MagicMock()):
+        result = dad._build_compact_dad_response("ORPHAN", use_cache=True)
+        assert result["performance"]["budget_exceeded"] is True
+        assert write_calls == []  # not written yet -- the caller gave up before compute finished
+
+        # Single-flight ownership is retained until the orphan actually
+        # exits: the same key must still map to the (still-running) future.
+        orphan = dad._GOLD_INFLIGHT.get("ORPHAN:False")
+        assert orphan is not None
+        assert not orphan.done()
+
+        orphan.result(timeout=5)  # let it finish while mocks are still active
+
+    # The abandoned compute ran to completion and populated the cache, even
+    # though its own caller had already received a degraded response.
+    assert write_calls == ["ORPHAN"]
+    # And single-flight cleaned itself up once the orphan exited.
+    assert dad._GOLD_INFLIGHT.get("ORPHAN:False") is None
+
+
 def test_dependency_timeout_falls_back_to_stale_cache(monkeypatch):
-    """Compute exceeds the budget but a stale (past-TTL) cache row exists: return it, not a blank unavailable shape."""
+    """Compute exceeds the budget but a stale (past-TTL) cache row exists: return it, visibly marked stale."""
     monkeypatch.setattr(dad, "GOLD_COMPACT_BUDGET_SECONDS", 0.15)
     stale_payload = _fresh_payload("STALE")
+    stale_payload["message"] = None
+    stale_payload["decision_stack"] = {"stance": "Watchlist with checks", "tone": "watch", "score": 50,
+                                        "cards": [], "reasons": [], "blockers": [], "method": "x"}
+    two_hours_ago_seconds = 2 * 3600
     stale_payload["cache"] = {"hit": True, "stale": True, "generated_at": "2026-09-01T00:00:00+00:00",
-                               "ttl_seconds": dad.SUMMARY_CACHE_TTL_SECONDS}
+                               "age_seconds": two_hours_ago_seconds, "ttl_seconds": dad.SUMMARY_CACHE_TTL_SECONDS}
 
     def _slow_workbook(ticker, **kwargs):
         time.sleep(0.6)
@@ -176,6 +218,72 @@ def test_dependency_timeout_falls_back_to_stale_cache(monkeypatch):
     assert result["cache"]["stale"] is True
     # Confirms the fallback read actually used the wider stale window, not the fresh TTL.
     assert dad.GOLD_STALE_MAX_AGE_SECONDS in read_calls
+
+    # A stale response must not appear current: age/stale status visible at
+    # the top level (not just buried in `cache`), and reaching the actual
+    # displayed guidance -- the gold verdict text and the decision-stack
+    # blockers a person would read as advice -- not only a nested flag.
+    assert result["stale"] is True
+    assert "2.0h" in result["message"]
+    assert "cached snapshot" in result["message"].lower()
+    assert "2.0h" in result["gold"]["one_liner"]
+    assert result["gold"]["one_liner"] != _fresh_payload("STALE")["gold"]["one_liner"]
+    assert "cached snapshot" in result["decision_stack"]["blockers"][0].lower()
+    assert "2.0h" in result["decision_stack"]["blockers"][0]
+
+
+def test_stale_marking_does_not_mutate_the_cached_row(monkeypatch):
+    """_mark_stale_response must return a new dict, never rewrite the row _read_summary_cache handed back."""
+    original = _fresh_payload("KEEP")
+    original["cache"] = {"hit": True, "stale": True, "age_seconds": 5400, "generated_at": "x",
+                          "ttl_seconds": dad.SUMMARY_CACHE_TTL_SECONDS}
+    original_one_liner = original["gold"]["one_liner"]
+
+    marked = dad._mark_stale_response(original, ticker="KEEP")
+
+    assert marked is not original
+    assert marked["gold"] is not original["gold"]
+    assert original["gold"]["one_liner"] == original_one_liner  # untouched
+    assert marked["gold"]["one_liner"] != original_one_liner
+
+
+def test_stale_flag_reflects_actual_row_age_not_the_query_window():
+    """A stale-tier query (wide max_age_seconds) landing on an actually-fresh row must not be mislabeled stale."""
+    from datetime import datetime, timedelta, timezone
+
+    very_recent = datetime.now(timezone.utc) - timedelta(seconds=5)
+
+    class _FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, statement, params=None):
+            class _Result:
+                def fetchone(self_inner):
+                    if "SELECT payload" not in str(statement):
+                        return None
+                    return ('{"ticker": "FRESHROW"}', very_recent, "{}")
+
+            return _Result()
+
+    class _FakeEngine:
+        def begin(self):
+            return _FakeConn()
+
+        def connect(self):
+            return _FakeConn()
+
+    result = dad._read_summary_cache(
+        _FakeEngine(), "FRESHROW", __import__("pathlib").Path("/tmp/does-not-exist.duckdb"),
+        max_age_seconds=dad.GOLD_STALE_MAX_AGE_SECONDS,  # the wide stale-tier window
+    )
+
+    assert result is not None
+    assert result["cache"]["stale"] is False  # the row itself is only 5s old
+    assert result["cache"]["age_seconds"] < 60
 
 
 # --- concurrent requests / single-flight -------------------------------------
@@ -285,3 +393,126 @@ def test_read_summary_cache_binds_max_age_as_a_parameter():
     assert "make_interval" in sql
     assert "999" not in sql
     assert params["max_age_seconds"] == 999
+
+
+# --- bounding background work across *different* tickers --------------------
+
+
+def test_max_inflight_cap_bounds_background_work_across_tickers(monkeypatch):
+    """Single-flight only dedupes repeats of one ticker; this caps the total across all tickers."""
+    monkeypatch.setattr(dad, "GOLD_COMPACT_MAX_INFLIGHT", 2)
+    gate = threading.Event()
+    started = []
+
+    def _blocked_workbook(ticker, **kwargs):
+        started.append(ticker)
+        gate.wait(timeout=5)  # held open until the test releases it
+        return {"status": "ready", "summary": None, "workbook": {"files": [], "sheets": [], "evidence": []},
+                "source_lanes": [], "dad_stats": [], "fit_signals": [], "source": {"attached": True, "db_path": "x"}}
+
+    with patch.object(dad, "_load_workbook_context", side_effect=_blocked_workbook), \
+         patch.object(dad, "_load_grid_payload", return_value=dad._empty_grid_payload("unused")), \
+         patch.object(dad, "_write_summary_cache", return_value=None):
+        try:
+            engine = MagicMock()
+            f1 = dad._get_or_start_gold_compact("TICKER_A", refresh_finviz=False, engine=engine, db_path=None)
+            f2 = dad._get_or_start_gold_compact("TICKER_B", refresh_finviz=False, engine=engine, db_path=None)
+            assert f1 is not None and f2 is not None
+            # Wait for both to actually be occupying the cap (not just queued)
+            # before asserting the cap -- avoids a race against the executor
+            # scheduling them.
+            for _ in range(200):
+                if len(started) >= 2:
+                    break
+                time.sleep(0.01)
+            assert len(started) == 2
+
+            # A third, DIFFERENT ticker must be refused a background compute
+            # outright -- the cap is across tickers, not per-ticker.
+            f3 = dad._get_or_start_gold_compact("TICKER_C", refresh_finviz=False, engine=engine, db_path=None)
+            assert f3 is None
+            assert "TICKER_C" not in started  # never even started
+        finally:
+            gate.set()
+            for f in (f1, f2):
+                if f is not None:
+                    f.result(timeout=5)  # drain before mocks are reverted
+
+    assert dad._GOLD_INFLIGHT == {}
+
+
+def test_capacity_exceeded_falls_back_honestly_without_waiting(monkeypatch):
+    """When the inflight cap is already full, a new ticker's request gets an honest fallback, not a wait."""
+    monkeypatch.setattr(dad, "GOLD_COMPACT_MAX_INFLIGHT", 1)
+    monkeypatch.setattr(dad, "GOLD_COMPACT_BUDGET_SECONDS", 5.0)  # would be slow if we actually waited
+    gate = threading.Event()
+
+    def _blocked_workbook(ticker, **kwargs):
+        gate.wait(timeout=5)
+        return {"status": "ready", "summary": None, "workbook": {"files": [], "sheets": [], "evidence": []},
+                "source_lanes": [], "dad_stats": [], "fit_signals": [], "source": {"attached": True, "db_path": "x"}}
+
+    with patch.object(dad, "_read_summary_cache", return_value=None), \
+         patch.object(dad, "_load_workbook_context", side_effect=_blocked_workbook), \
+         patch.object(dad, "_load_grid_payload", return_value=dad._empty_grid_payload("unused")), \
+         patch.object(dad, "_write_summary_cache", return_value=None), \
+         patch.object(dad, "get_db_engine", return_value=MagicMock()):
+        try:
+            occupying = dad._get_or_start_gold_compact("OCCUPY", refresh_finviz=False, engine=MagicMock(), db_path=None)
+            for _ in range(200):
+                if occupying.running():
+                    break
+                time.sleep(0.01)
+
+            start = time.perf_counter()
+            result = dad._build_compact_dad_response("REFUSED", use_cache=True)
+            elapsed = time.perf_counter() - start
+        finally:
+            gate.set()
+            occupying.result(timeout=5)
+
+    assert elapsed < 1.0  # did not wait out the 5s budget -- refused immediately
+    assert result["status"] == "unavailable"
+    assert result["performance"]["capacity_exceeded"] is True
+    assert result["performance"]["budget_exceeded"] is False
+    assert "REFUSED" not in dad._GOLD_INFLIGHT  # nothing was ever queued for it
+
+
+# --- DB/DuckDB resource release on the timed-out (orphaned) path ------------
+
+
+def test_orphaned_compute_always_releases_db_and_duckdb_via_context_managers():
+    """Static guard: every engine checkout in the compute path is a `with` block, so it releases on any exit path
+    (normal return, an internal exception, or -- the case this PR adds -- the caller having already timed out and
+    stopped waiting). There is no `engine.connect()`/`engine.begin()` call in this file that is not immediately a
+    context manager, and DuckDB's connection is closed in a `finally`. This guards against a future edit
+    reintroducing an un-released checkout in the very code path this PR made reachable after a caller gives up.
+    """
+    import re
+    from pathlib import Path as _Path
+
+    src = _Path(dad.__file__).read_text(encoding="utf-8")
+
+    # Every `engine.connect(`/`engine.begin(` call must be preceded on the
+    # same line by `with ` (SQLAlchemy releases the checkout in
+    # Connection.__exit__, on success or exception).
+    bad_checkouts = [
+        line for line in src.splitlines()
+        if re.search(r"engine\.(connect|begin)\s*\(", line) and "with " not in line
+    ]
+    assert bad_checkouts == [], f"non-context-managed engine checkout(s): {bad_checkouts}"
+
+    # _connect_duckdb's result must be closed in a `finally` inside
+    # _load_workbook_context (the only caller in this file).
+    workbook_src = src[src.index("def _load_workbook_context("):]
+    workbook_src = workbook_src[: workbook_src.index("\n\n\ndef ")]
+    assert "finally:" in workbook_src and "conn.close()" in workbook_src
+
+    # Honesty about what this does NOT prove: these are process-level
+    # release guarantees (the `with`/`finally` blocks always run once the
+    # underlying call returns, whether it returns a value or raises). They
+    # do not by themselves bound how long a single blocked network call can
+    # hold the checkout before returning -- that bound is the DB's own
+    # statement/connection timeout (already present in production; see the
+    # preserved "canceling statement due to statement timeout" log lines),
+    # not something this PR adds or changes.
