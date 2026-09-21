@@ -62,12 +62,16 @@ from __future__ import annotations
 import io
 import os
 import time
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import Engine
 
+import contracts.emit as contracts_emit
+import intelligence.fundamental_divergence as fd
 from intelligence.company_financial_rollups import compute_ttm, fold_announcements
 from intelligence.fundamental_divergence import (
     MIN_PRICE_OBS,
@@ -75,12 +79,56 @@ from intelligence.fundamental_divergence import (
     _load_batch_fundamentals,
     _load_batch_price_cagrs,
     _load_universe,
+    _table_exists,
+    compute_divergence,
     snapshot_all,
 )
 from scripts.hermes_operator import (
     DAILY_INTEL_CAPITAL_FLOW_ROLLUPS_BUDGET_S,
     DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S,
 )
+
+_CONTRACTS_MIGRATION_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "scripts" / "migrations" / "20260411_contracts_infrastructure.sql"
+)
+
+
+def _apply_contracts_migration(engine: Engine) -> None:
+    """Apply the CREATE TABLE/INDEX statements from
+    ``scripts/migrations/20260411_contracts_infrastructure.sql`` against
+    the scratch DB so the real ``contracts.emit`` path (used by the
+    emitter measurement below) has ``contracts_audit`` to write into.
+    Idempotent — every statement in that file is ``IF NOT EXISTS``."""
+    sql_text = _CONTRACTS_MIGRATION_PATH.read_text()
+    with engine.begin() as conn:
+        for stmt in sql_text.split(";"):
+            stmt = stmt.strip()
+            if not stmt or stmt.upper() in ("BEGIN", "COMMIT"):
+                continue
+            conn.execute(text(stmt))
+
+
+@contextmanager
+def _count_db_statements(engine: Engine):
+    """Count SQL statements actually sent to ``engine`` (INSERT/SELECT/
+    etc. via ``before_cursor_execute``, plus each transaction ``COMMIT``)
+    for the duration of the ``with`` block."""
+    counts = {"n": 0}
+
+    def _before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+        counts["n"] += 1
+
+    def _on_commit(conn):
+        counts["n"] += 1
+
+    event.listen(engine, "before_cursor_execute", _before_cursor_execute)
+    event.listen(engine, "commit", _on_commit)
+    try:
+        yield counts
+    finally:
+        event.remove(engine, "before_cursor_execute", _before_cursor_execute)
+        event.remove(engine, "commit", _on_commit)
 
 _GRID_TEST_DB_URL = os.environ.get("GRID_TEST_DB_URL")
 _SCALE_TESTS_ON = os.environ.get("GRID_SCALE_TESTS") == "1"
@@ -411,7 +459,7 @@ _TTM_WINDOW_EXPLAIN_SQL = text(
 # ── The harness ──────────────────────────────────────────────────────
 
 
-def test_representative_scale_timings(scale_engine: Engine):
+def test_representative_scale_timings(scale_engine: Engine, monkeypatch: pytest.MonkeyPatch):
     engine = scale_engine
     tickers = sorted({st.ticker for st in _load_universe()})
     assert tickers, (
@@ -424,6 +472,8 @@ def test_representative_scale_timings(scale_engine: Engine):
     as_of = date(2026, 9, 20)
     timings: dict[str, float] = {}
     source_id: int | None = None
+    emitter_run_start: datetime | None = None
+    contracts_audit_present = False
 
     try:
         t0 = time.perf_counter()
@@ -486,9 +536,64 @@ def test_representative_scale_timings(scale_engine: Engine):
             price_cache = _load_batch_price_cagrs(conn, tickers, as_of)
             timings["divergence_load_batch_price_cagrs"] = time.perf_counter() - t0
 
-        t0 = time.perf_counter()
-        snapshot_result = snapshot_all(engine, as_of=as_of)
-        timings["divergence_snapshot_all"] = time.perf_counter() - t0
+        # (e2) core snapshot_all — batched loads + batched upsert only.
+        # ``_emit_divergence_signal`` is monkeypatched to a counting
+        # no-op so this isolates the SQL-task-owned code path from the
+        # pre-existing per-event contracts.emit fanout measured
+        # separately below (fable-daily-intel-sql-tasks, 2026-09-20
+        # follow-up).
+        core_emit_calls = {"n": 0}
+
+        def _noop_emit_divergence_signal(r):
+            core_emit_calls["n"] += 1
+
+        with monkeypatch.context() as m:
+            m.setattr(fd, "_emit_divergence_signal", _noop_emit_divergence_signal)
+            t0 = time.perf_counter()
+            snapshot_result = snapshot_all(engine, as_of=as_of)
+            timings["divergence_snapshot_all_core"] = time.perf_counter() - t0
+
+        # (e3) emitter — the real per-event contracts.emit path, run
+        # once with contracts_audit present on the scratch DB. This is
+        # RTT-bound by design (1 audit INSERT + 1 pg_notify + 1 COMMIT
+        # per emitted SignalFired — see snapshot_all's "SYNTH-26" comment
+        # in intelligence/fundamental_divergence.py) and is NOT held to
+        # the 60s divergence budget; it is reported for visibility only.
+        emitter_events = [
+            r for r in compute_divergence(engine, as_of=as_of)
+            if r["classification"] in ("long_candidate", "short_candidate")
+        ]
+        emitter_statements = 0
+        timings["divergence_emitter"] = 0.0
+        if emitter_events:
+            _apply_contracts_migration(engine)
+            with engine.connect() as conn:
+                contracts_audit_present = _table_exists(conn, "public.contracts_audit")
+            if contracts_audit_present:
+                emitter_run_start = datetime.now(timezone.utc)
+                with monkeypatch.context() as m:
+                    m.setattr(contracts_emit, "_get_engine", lambda: engine)
+                    with _count_db_statements(engine) as counts:
+                        t0 = time.perf_counter()
+                        for r in emitter_events:
+                            fd._emit_divergence_signal(r)
+                        timings["divergence_emitter"] = time.perf_counter() - t0
+                emitter_statements = counts["n"]
+            else:
+                print(
+                    "\n[emitter] contracts_audit could not be created on "
+                    "the scratch DB — emitter measurement skipped"
+                )
+
+        per_stmt_ms = (
+            (timings["divergence_emitter"] * 1000.0 / emitter_statements)
+            if emitter_statements else 0.0
+        )
+        print(
+            f"\nemitter: {len(emitter_events)} events, {emitter_statements} "
+            f"statements, {timings['divergence_emitter']:.2f} seconds, "
+            f"{per_stmt_ms:.2f} ms per statement"
+        )
 
         # ── EXPLAIN (ANALYZE, BUFFERS) — printed for the coordinator ────
         with engine.connect() as conn:
@@ -521,9 +626,11 @@ def test_representative_scale_timings(scale_engine: Engine):
         print(f"{'divergence_load_batch_price_cagrs':38s} "
               f"{timings['divergence_load_batch_price_cagrs']:10.2f}  "
               f"< {DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S}s")
-        print(f"{'divergence_snapshot_all':38s} "
-              f"{timings['divergence_snapshot_all']:10.2f}  "
+        print(f"{'divergence_snapshot_all_core':38s} "
+              f"{timings['divergence_snapshot_all_core']:10.2f}  "
               f"< {DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S}s")
+        print(f"{'divergence_emitter':38s} "
+              f"{timings['divergence_emitter']:10.2f}  n/a (RTT-bound, not budgeted)")
         print(f"(result_a rows_written={result_a.rows_written}, "
               f"result_b rows_written={result_b.rows_written}, "
               f"result_c rows_written={result_c.rows_written}, "
@@ -545,8 +652,9 @@ def test_representative_scale_timings(scale_engine: Engine):
         assert timings["fold_announcements"] < DAILY_INTEL_CAPITAL_FLOW_ROLLUPS_BUDGET_S
         assert timings["divergence_load_batch_fundamentals"] < DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S
         assert timings["divergence_load_batch_price_cagrs"] < DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S
-        assert timings["divergence_snapshot_all"] < DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S, (
-            f"snapshot_all took {timings['divergence_snapshot_all']:.1f}s, over "
+        assert timings["divergence_snapshot_all_core"] < DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S, (
+            f"core snapshot_all (emitter no-op'd) took "
+            f"{timings['divergence_snapshot_all_core']:.1f}s, over "
             f"the {DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S}s divergence "
             f"budget. snapshot_all's write phase batches the whole universe "
             f"into one multi-row INSERT ... ON CONFLICT statement per "
@@ -557,12 +665,29 @@ def test_representative_scale_timings(scale_engine: Engine):
             f"conn.execute() call inside a per-row loop before raising the "
             f"budget."
         )
+        if contracts_audit_present and emitter_events:
+            assert emitter_statements == 3 * len(emitter_events), (
+                f"expected exactly 3 statements per emitted signal (1 "
+                f"contracts_audit INSERT + 1 pg_notify + 1 COMMIT — the "
+                f"pre-existing per-event audit/notify design documented in "
+                f"snapshot_all's 'SYNTH-26' comment, which #587 does not "
+                f"change), got {emitter_statements} statements for "
+                f"{len(emitter_events)} events. This assertion documents "
+                f"the per-event cost shape, not a performance budget — a "
+                f"later batch-emit change would be a separate, reviewed "
+                f"contract-design decision."
+            )
 
         # Every individual statement must also stay under the DB's own
         # statement_timeout — a phase that got cancelled would have raised
         # already, but this restates the ceiling explicitly for the
-        # printed table's sake.
+        # printed table's sake. ``divergence_emitter`` is excluded: it is
+        # the wall time of hundreds of individually-cheap, individually
+        # under-timeout statements summed over an RTT-bound loop, not one
+        # statement subject to the ceiling itself.
         for name, secs in timings.items():
+            if name == "divergence_emitter":
+                continue
             assert secs < STATEMENT_TIMEOUT_S, (
                 f"{name} took {secs:.1f}s, at or over the {STATEMENT_TIMEOUT_S}s "
                 f"statement_timeout ceiling itself — should have raised a "
@@ -591,6 +716,16 @@ def test_representative_scale_timings(scale_engine: Engine):
             conn.execute(
                 text("DELETE FROM capital_flows_ttm_state WHERE actor_id LIKE 'scale_ttm_%'"),
             )
+            if contracts_audit_present and emitter_run_start is not None:
+                conn.execute(
+                    text(
+                        "DELETE FROM contracts_audit WHERE producer_module = "
+                        ":pm AND emitted_at >= :start",
+                    ).bindparams(
+                        pm="intelligence.fundamental_divergence",
+                        start=emitter_run_start,
+                    ),
+                )
             if source_id is not None:
                 conn.execute(
                     text("DELETE FROM raw_series WHERE source_id = :sid").bindparams(sid=source_id),
