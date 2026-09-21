@@ -212,8 +212,13 @@ TTM_WINDOW_QUARTERS: int = 4
 # call for the state upsert would re-read a possibly-different snapshot
 # and could durably record a fingerprint that this call's OWN ttm write
 # never actually matched.
-_TTM_UPSERT_SQL = text(
-    """
+#
+# Kept as a plain string (``_TTM_UPSERT_SQL_TEXT``), wrapped in
+# ``text()`` below for execution. ``ttm_statement_sql()`` hands the same
+# string to ``scripts/run_capital_flow_rollups.py --explain-ttm`` so the
+# EXPLAINed plan and the statement ``compute_ttm`` actually executes can
+# never drift apart into two hand-copied versions of the same SQL.
+_TTM_UPSERT_SQL_TEXT = """
     WITH current_fp AS (
         SELECT
             actor_id,
@@ -406,7 +411,22 @@ _TTM_UPSERT_SQL = text(
         currency   = EXCLUDED.currency,
         as_of      = NOW()
     """
-)
+
+_TTM_UPSERT_SQL = text(_TTM_UPSERT_SQL_TEXT)
+
+
+def ttm_statement_sql() -> str:
+    """Return the raw SQL text of ``compute_ttm``'s UPSERT statement.
+
+    Exists so a read-only plan check (``scripts/run_capital_flow_rollups.py
+    --explain-ttm``) can EXPLAIN the *exact* statement ``compute_ttm``
+    executes, from the same source, rather than a hand-maintained copy
+    that could silently drift out of sync with the real query. Returns a
+    plain string (no bind markers resolved) — the caller is responsible
+    for supplying the same ``:window``/``:source_filing``/``:confidence``
+    bind parameters ``compute_ttm`` uses.
+    """
+    return _TTM_UPSERT_SQL_TEXT
 
 
 class TtmResult(NamedTuple):

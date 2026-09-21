@@ -1156,3 +1156,80 @@ same number as the fix this PR makes. A future batch-emit change to
 `contracts.emit` would alter `SignalFired` delivery semantics for
 downstream SSE consumers and is out of scope here; it belongs in its own
 reviewed contract-design change, not folded into this SQL-task PR.
+
+## Coordinator's scratch-DB rerun: statistics sensitivity + harness cleanup gap (SIXTH follow-up)
+
+The coordinator reran `tests/test_daily_intel_scale_pg.py` against a
+disposable scratch DB after the fifth follow-up above. Evidence, not a
+request to reproduce: post-seed (bulk `COPY` loads + deletes/reloads),
+the scratch `capital_flows` table showed **672,420 dead tuples vs
+210,150 live**, and an autoanalyze had fired while it held **0 quarter
+rows** — a snapshot autovacuum happened to catch mid-reload. On that
+statistics state the first-run `compute_ttm` statement **exceeded the
+120s `statement_timeout`** the harness mirrors from production; earlier
+runs against representative statistics completed in **9-12s**. Same
+statement, same data volume, only the planner's row estimates differed.
+This is consistent with the "zero rows estimated" state driving the
+planner toward a nested-loop plan for `q_ranked`'s scan of
+`capital_flows` against the `changed_actors` set (cheap when the
+planner believes few actors are dirty and the quarter table is
+~empty; catastrophic once ~5,000 actors are actually dirty on a
+first run and the table actually holds ~300k quarter rows) instead of
+a hash-based join that scans `capital_flows` once. Production stays
+off this cliff because autovacuum's autoanalyze runs continuously
+against live traffic and never observes a "just bulk-loaded, nothing
+counted yet" state the way one-shot harness/migration seeding can.
+
+The same rerun also found the harness's own cleanup incomplete:
+"every seeded row, nothing else" deleted rows by `source_filing`, but
+`compute_ttm` writes `period_type='ttm', source_filing='ttm_rollup'`
+rows (a derived filing tag, not one of the three seeded ones) and
+`fold_announcements` writes `period_type='annual',
+source_filing='announcement_rolled'` rows — neither matched the
+delete's `source_filing IN (...)` list, so **210,150 live derived
+`ttm` rows** (`period_type='ttm'`, actor_id `scale_ttm_%`) were left
+behind on the scratch DB after the run.
+
+**Fixes landed in this PR:**
+
+- `tests/test_daily_intel_scale_pg.py` now runs `ANALYZE capital_flows`
+  and `ANALYZE raw_series` (on an `AUTOCOMMIT` connection) immediately
+  after seeding and before any timed phase, with the elapsed time
+  folded into the `[seed]` print line. This makes the harness reproduce
+  production's steady-state statistics (kept current by autovacuum)
+  rather than the post-bulk-load zero-estimate state production code
+  never actually runs against.
+- The harness's `finally` cleanup now also deletes
+  `capital_flows WHERE period_type = 'ttm' AND actor_id LIKE
+  'scale_ttm_%'` and `capital_flows WHERE period_type = 'annual' AND
+  source_filing = 'announcement_rolled' AND actor_id LIKE
+  'scale_ttm_%'` — both are exact, seed-only predicates because the
+  `scale_ttm_%` actor_id namespace is exclusively synthetic in this
+  harness (see the added inline comments for why each predicate is
+  distinguishable).
+- `scripts/run_capital_flow_rollups.py` gained `--explain-ttm`: prints
+  `EXPLAIN` (plain — no `ANALYZE`, executes nothing, writes nothing,
+  documented as such in `--help`) of the exact `compute_ttm` UPSERT
+  statement, using the same bind parameters, then exits 0 without
+  running any task. The EXPLAINed SQL text and the executed statement
+  now share one source — `intelligence/company_financial_rollups.py::
+  ttm_statement_sql()` — so they cannot drift apart. Covered by
+  `tests/test_run_capital_flow_rollups_explain.py` against a fake
+  engine (no DB): asserts exactly one statement is issued, that it
+  begins with `EXPLAIN ` (not `EXPLAIN (ANALYZE`), and that none of
+  `compute_ttm`/`fold_announcements`/`run_all` are called.
+- **Release gate addition**: before a production release that touches
+  `compute_ttm`/`_TTM_UPSERT_SQL`, the operator/coordinator should run
+  `python scripts/run_capital_flow_rollups.py --explain-ttm` read-only
+  against production and confirm the plan is **not** a nested loop over
+  `capital_flows` keyed by the dirty-actor set — reasoning from the SQL
+  under representative (post-ANALYZE) statistics, a healthy plan scans
+  `capital_flows` once for `current_fp`'s `GROUP BY actor_id` aggregate
+  (Seq Scan or Index-Only Scan + a Hash/GroupAggregate), then joins
+  `changed_actors` into the `q_ranked` scan via a Hash Join / Hash Semi
+  Join (build the dirty-actor set once, probe once) rather than a
+  Nested Loop that re-scans or re-probes `capital_flows` once per dirty
+  actor — the latter is the shape that produced this rerun's timeout.
+  The coordinator will record the actual EXPLAIN output from
+  production at gate time rather than this document asserting a plan
+  it did not itself observe.

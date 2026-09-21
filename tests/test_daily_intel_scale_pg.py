@@ -483,10 +483,31 @@ def test_representative_scale_timings(scale_engine: Engine, monkeypatch: pytest.
         source_id = _seed_source_catalog_row(engine)
         n_p = _seed_price_rows(engine, tickers, source_id, as_of)
         seed_elapsed = time.perf_counter() - t0
+
+        # Production keeps capital_flows/raw_series statistics current via
+        # autovacuum's autoanalyze running continuously against live
+        # traffic. This harness's bulk COPY seed happens all at once with
+        # no autovacuum cycle in between, so without an explicit ANALYZE
+        # here the planner would see the post-bulk-load "zero rows
+        # estimated" state (0 live tuples recorded as of the last
+        # analyze) rather than the representative statistics production
+        # queries actually run against — exactly the gap that let the
+        # scratch-DB rerun's first compute_ttm blow through the 120s
+        # statement_timeout despite 9-12s runs under representative
+        # statistics. ANALYZE on an AUTOCOMMIT connection (so it is not
+        # rolled back with anything else and takes effect immediately)
+        # reproduces production's steady state instead.
+        t0 = time.perf_counter()
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            conn.execute(text("ANALYZE capital_flows"))
+            conn.execute(text("ANALYZE raw_series"))
+        analyze_elapsed = time.perf_counter() - t0
+
         print(
             f"\n[seed] {n_q} quarter rows, {n_a} annual rows ({len(tickers)} "
             f"tickers), {n_ann} announcement rows, {n_p} raw_series rows "
-            f"in {seed_elapsed:.1f}s"
+            f"in {seed_elapsed:.1f}s (+ {analyze_elapsed:.1f}s ANALYZE "
+            f"capital_flows, raw_series)"
         )
         assert seed_elapsed < 240, (
             f"seeding took {seed_elapsed:.1f}s, over the 2-3 minute budget "
@@ -742,6 +763,37 @@ def test_representative_scale_timings(scale_engine: Engine, monkeypatch: pytest.
                 text(
                     "DELETE FROM capital_flows WHERE source_filing IN (:q, :a, :ann)",
                 ).bindparams(q=_QUARTER_SOURCE_FILING, a=_ANNUAL_SOURCE_FILING, ann=_ANNOUNCEMENT_SOURCE_FILING),
+            )
+            # compute_ttm derives period_type='ttm', source_filing='ttm_rollup'
+            # rows from the seeded quarter rows above (only scale_ttm_%
+            # actors ever have quarter rows in this harness, so this
+            # predicate is exact — no real actor uses this actor_id
+            # namespace). These are not covered by the source_filing
+            # delete above and were previously left behind on every run
+            # (evidence: coordinator's scratch-DB rerun found 210,150 live
+            # ttm rows post-cleanup).
+            conn.execute(
+                text(
+                    "DELETE FROM capital_flows WHERE period_type = 'ttm' "
+                    "AND actor_id LIKE 'scale_ttm_%'",
+                ),
+            )
+            # fold_announcements() derives period_type='annual',
+            # source_filing='announcement_rolled' rows from the seeded
+            # announcement rows above. Those rolled rows keep the
+            # announcement rows' own actor_id (scale_ttm_00000..49, see
+            # _seed_announcement_rows) and that actor_id namespace is
+            # exclusively synthetic/seed-only in this harness, so
+            # period_type + source_filing + actor_id together are an
+            # exact, distinguishable seed-only predicate here — see
+            # intelligence/company_financial_rollups.py::fold_announcements
+            # and its _ROLL_UPSERT_SQL for how these rows are produced.
+            conn.execute(
+                text(
+                    "DELETE FROM capital_flows WHERE period_type = 'annual' "
+                    "AND source_filing = 'announcement_rolled' "
+                    "AND actor_id LIKE 'scale_ttm_%'",
+                ),
             )
             conn.execute(
                 text("DELETE FROM capital_flows_ttm_state WHERE actor_id LIKE 'scale_ttm_%'"),
