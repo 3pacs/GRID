@@ -37,7 +37,7 @@ from alembic import op
 
 # 25 characters; alembic_version.version_num is VARCHAR(32).
 revision: str = "oracle_pred_nullable_0918"
-down_revision: str | Sequence[str] | None = "journal_unscored_conf_0918"
+down_revision: str | Sequence[str] | None = "capital_flow_ttm_state_20260920"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
