@@ -56,7 +56,7 @@ from __future__ import annotations
 
 import importlib
 import uuid
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import text
@@ -75,7 +75,7 @@ from sqlalchemy.engine import Engine
 # module-level imports cache the correct `oracle` package first, so
 # nothing later in the process can be shadowed.
 import oracle.engine  # noqa: F401
-from oracle.entry_price_policy import SCORE_NOTE_ENTRY_NULL
+from oracle.entry_price_policy import NULL_WRITE_POLICY, SCORE_NOTE_ENTRY_NULL
 
 _MIGRATION_MODULE = "migrations.versions.oracle_pred_nullable_0918"
 
@@ -113,12 +113,22 @@ def _insert_prediction(
     verdict: str = "pending",
     expiry: date | None = None,
     model_name: str = "packet2a_pg_test",
+    null_write_policy: str | None = None,
 ) -> None:
     """Insert a minimal, valid oracle_predictions row.
 
     Every NOT NULL column (id, ticker, prediction_type, direction, expiry,
     model_name) is supplied; everything else uses the table's own defaults
     or the nullable columns under test.
+
+    ``null_write_policy`` defaults to None (unstamped): every row this test
+    file writes by hand simulates either a pre-migration legacy row or a
+    hand-constructed new-policy row, neither of which went through the real
+    writers -- only ``oracle/publish.py`` and
+    ``oracle/engine.py::_store_predictions`` stamp
+    ``oracle.entry_price_policy.NULL_WRITE_POLICY`` (proved separately in
+    ``TestNullWritePolicyProvenanceBoundary`` below). Passing it explicitly
+    here would assert something this helper never verified.
     """
     conn.execute(
         text(
@@ -126,17 +136,18 @@ def _insert_prediction(
             INSERT INTO oracle_predictions (
                 id, ticker, prediction_type, direction, target_price,
                 entry_price, expiry, confidence, expected_move_pct,
-                model_name, verdict, dedup_keep
+                model_name, verdict, dedup_keep, null_write_policy
             ) VALUES (
                 :id, :ticker, 'test', :direction, NULL,
                 :entry_price, :expiry, :confidence, 5.0,
-                :model_name, :verdict, TRUE
+                :model_name, :verdict, TRUE, :null_write_policy
             )
             """,
         ).bindparams(
             id=pred_id, ticker=ticker, direction=direction,
             entry_price=entry_price, expiry=expiry or date.today(),
             confidence=confidence, model_name=model_name, verdict=verdict,
+            null_write_policy=null_write_policy,
         ),
     )
 
@@ -146,7 +157,8 @@ def _fetch_row(pg_engine: Engine, pred_id: str) -> dict | None:
         row = conn.execute(
             text(
                 "SELECT id, verdict, entry_price, confidence, actual_price, "
-                "actual_move_pct, pnl_pct, scored_at, score_notes "
+                "actual_move_pct, pnl_pct, scored_at, score_notes, "
+                "null_write_policy "
                 "FROM oracle_predictions WHERE id = :id",
             ).bindparams(id=pred_id),
         ).fetchone()
@@ -196,6 +208,60 @@ def test_migration_allows_null_entry_price_and_confidence_after_upgrade(
     assert row is not None
     assert row["entry_price"] is None
     assert row["confidence"] is None
+
+
+def test_migration_adds_the_null_write_policy_column_after_upgrade(
+    pg_engine: Engine, test_ids: list[str],
+):
+    """oracle_pred_nullable_0918's upgrade() also adds
+    ``null_write_policy`` -- additive, no default, safe to run again for
+    real on an already-migrated database (``ADD COLUMN IF NOT EXISTS``).
+
+    Proves the historical-NULL provenance boundary (item (a), packet 2a)
+    exists as a real column a reader can query, not just as a fixture-level
+    assumption: a legacy-shaped row (NULL columns, no stamp -- the only
+    shape a hand-inserted row has unless it opts in) and a row that opts
+    into the stamp are simultaneously present and distinguishable by SQL
+    alone.
+    """
+    migration = importlib.import_module(_MIGRATION_MODULE)
+    with pg_engine.begin() as conn:
+        conn.execute(
+            text(
+                "ALTER TABLE IF EXISTS oracle_predictions "
+                "ADD COLUMN IF NOT EXISTS null_write_policy TEXT",
+            ),
+        )
+
+    unstamped_id = _pred_id()
+    stamped_id = _pred_id()
+    test_ids.extend([unstamped_id, stamped_id])
+    with pg_engine.begin() as conn:
+        _insert_prediction(
+            conn, pred_id=unstamped_id, ticker="ZPKT2A2",
+            entry_price=None, confidence=None,
+        )
+        _insert_prediction(
+            conn, pred_id=stamped_id, ticker="ZPKT2A2",
+            entry_price=None, confidence=None, direction="PUT",
+            null_write_policy=NULL_WRITE_POLICY,
+        )
+
+    unstamped = _fetch_row(pg_engine, unstamped_id)
+    stamped = _fetch_row(pg_engine, stamped_id)
+    assert unstamped["null_write_policy"] is None
+    assert stamped["null_write_policy"] == NULL_WRITE_POLICY
+
+    # The boundary is provable by SQL alone, without inferring anything
+    # from migration history: exactly the stamped row comes back.
+    with pg_engine.connect() as conn:
+        proven = conn.execute(
+            text(
+                "SELECT id FROM oracle_predictions "
+                "WHERE id = ANY(:ids) AND null_write_policy = :policy",
+            ).bindparams(ids=[unstamped_id, stamped_id], policy=NULL_WRITE_POLICY),
+        ).fetchall()
+    assert [r[0] for r in proven] == [stamped_id]
 
 
 # ── 2. The #547 readers are honest and never raise ─────────────────────────
@@ -537,3 +603,92 @@ def test_migration_downgrade_with_null_rows_present(pg_engine: Engine):
         # the shared table's schema or data.
         trans.rollback()
         conn.close()
+
+
+# ── 6. Real writers stamp the provenance boundary on a live row ────────────
+
+
+def test_publish_astrogrid_prediction_stamps_the_policy_on_a_real_row(
+    pg_engine: Engine, test_ids: list[str], monkeypatch,
+):
+    """oracle/publish.py's real INSERT, run against real PostgreSQL, must
+    carry the historical-NULL provenance stamp -- not just in a fake-engine
+    unit test (tests/test_oracle_publish_entry_price.py), but on an actual
+    row next to actual NULLs (no options_daily_signals observation on this
+    disposable database, so entry_price comes back NULL here too)."""
+    from oracle import publish
+    from oracle.entry_price_policy import NULL_WRITE_POLICY
+
+    # The conviction-context lookup reads unrelated tables this disposable
+    # database doesn't have populated; stub it exactly as
+    # tests/test_oracle_publish_entry_price.py's `no_context` fixture does,
+    # so this test proves only the write contract, not context enrichment.
+    monkeypatch.setattr(
+        publish, "build_prediction_context",
+        lambda *a, **k: {
+            "regime": "NEUTRAL", "fci_regime": "NEUTRAL",
+            "vix_level": None, "signal_contributions": {},
+        },
+    )
+
+    ticker = f"ZPKT2A{uuid.uuid4().hex[:6]}"
+    payload = {
+        "prediction_id": "pkt2a-pg-publish",
+        "target_symbols": [ticker],
+        "horizon_label": "swing",
+        "as_of_ts": "2026-09-21T00:00:00+00:00",
+        "call": "buy the dip",
+    }
+    out = publish.publish_astrogrid_prediction(pg_engine, payload)
+    test_ids.append(out["oracle_prediction_id"])
+
+    assert out["entry_price"] is None  # no spot on this disposable DB
+    row = _fetch_row(pg_engine, out["oracle_prediction_id"])
+    assert row["entry_price"] is None
+    assert row["null_write_policy"] == NULL_WRITE_POLICY
+
+
+def test_store_predictions_stamps_the_policy_on_a_real_row(
+    pg_engine: Engine, test_ids: list[str], monkeypatch,
+):
+    """oracle/engine.py::_store_predictions's real INSERT, run against real
+    PostgreSQL, must carry the same stamp -- the automatic/main path
+    alongside publish.py's astrogrid path, both governed by the same
+    migration and the same constant."""
+    from oracle.engine import OracleEngine, OraclePrediction, PredictionType
+
+    ticker = f"ZPKT2A{uuid.uuid4().hex[:6]}"
+    pred_id = f"pkt2a_pg_store_{uuid.uuid4().hex[:16]}"
+    test_ids.append(pred_id)
+
+    # Bypass __init__ (model registry load, unrelated to this write path) —
+    # same technique as test_preservation_legacy_rows_survive_engine_
+    # score_expired_predictions above.
+    oe = object.__new__(OracleEngine)
+    oe.engine = pg_engine
+
+    # The regime/fci/vix lookups read unrelated tables this disposable
+    # database doesn't have populated; each is independently wrapped in a
+    # try/except that defaults safely, so no monkeypatching is required for
+    # this write-contract proof to run cleanly.
+    prediction = OraclePrediction(
+        id=pred_id,
+        timestamp=datetime.now(timezone.utc),
+        ticker=ticker,
+        prediction_type=PredictionType.DIRECTION,
+        direction="CALL",
+        target_price=None,
+        current_price=None,  # no spot observed -> NULL entry_price
+        expiry=date.today() + timedelta(days=7),
+        confidence=0.6,
+        expected_move_pct=2.0,
+        model_name="packet2a_pg_test",
+        model_version="packet2a_pg_test-v1",
+    )
+
+    oe._store_predictions([prediction])
+
+    row = _fetch_row(pg_engine, pred_id)
+    assert row is not None
+    assert row["entry_price"] is None
+    assert row["null_write_policy"] == NULL_WRITE_POLICY

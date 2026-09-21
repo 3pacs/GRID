@@ -219,6 +219,43 @@ class TestPublishedRow:
         assert params["entry_price"] is None
 
 
+class TestNullWritePolicyStamp:
+    """Historical-NULL provenance boundary (item (a), packet 2a): every row
+    this writer inserts must carry the policy stamp, whether or not this
+    particular row ends up NULL -- the stamp proves the boundary, not just
+    the NULL case. Never set in the ON CONFLICT UPDATE (written once)."""
+
+    def test_every_insert_carries_the_policy_stamp_measured(self, no_context):
+        from oracle.entry_price_policy import NULL_WRITE_POLICY
+        from oracle.publish import publish_astrogrid_prediction
+
+        engine = _Engine(spot_rows=[(214.5, date(2026, 9, 15))])
+        publish_astrogrid_prediction(engine, dict(_PAYLOAD))
+
+        assert _insert_params(engine)["null_write_policy"] == NULL_WRITE_POLICY
+
+    def test_every_insert_carries_the_policy_stamp_unavailable(self, no_context):
+        from oracle.entry_price_policy import NULL_WRITE_POLICY
+        from oracle.publish import publish_astrogrid_prediction
+
+        engine = _Engine()  # no options_daily_signals row -> NULL entry_price
+        publish_astrogrid_prediction(engine, dict(_PAYLOAD))
+
+        params = _insert_params(engine)
+        assert params["entry_price"] is None
+        assert params["null_write_policy"] == NULL_WRITE_POLICY
+
+    def test_the_stamp_is_absent_from_the_on_conflict_update(self):
+        from oracle import publish
+
+        src = inspect.getsource(publish.publish_astrogrid_prediction)
+        do_update = src[src.index("DO UPDATE SET"):src.index('"id": oracle_prediction_id')]
+        assert "null_write_policy" not in do_update, (
+            "the stamp is written once at INSERT and must never be "
+            "reset on the dedup ON CONFLICT UPDATE path"
+        )
+
+
 # -- Scoring consumers -------------------------------------------------------
 
 

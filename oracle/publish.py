@@ -11,6 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from oracle.dedup_index import ensure_dedup_index
+from oracle.entry_price_policy import NULL_WRITE_POLICY
 from oracle.prediction_context import (
     build_prediction_context,
     enrich_signals_payload,
@@ -236,7 +237,8 @@ def publish_astrogrid_prediction(engine: Engine, payload: dict[str, Any]) -> dic
                     signals,
                     anti_signals,
                     flow_context,
-                    model_weights
+                    model_weights,
+                    null_write_policy
                 )
                 VALUES (
                     :id,
@@ -256,7 +258,8 @@ def publish_astrogrid_prediction(engine: Engine, payload: dict[str, Any]) -> dic
                     CAST(:signals AS jsonb),
                     CAST(:anti_signals AS jsonb),
                     CAST(:flow_context AS jsonb),
-                    CAST(:model_weights AS jsonb)
+                    CAST(:model_weights AS jsonb),
+                    :null_write_policy
                 )
                 ON CONFLICT (
                     ticker, direction, expiry, prediction_type,
@@ -306,6 +309,12 @@ def publish_astrogrid_prediction(engine: Engine, payload: dict[str, Any]) -> dic
                     "weight_version": payload.get("weight_version") or "astrogrid-v1",
                     "publish_contract": "oracle.publish.v1",
                 }),
+                # Historical-NULL provenance boundary: stamped on every
+                # INSERT, never on the ON CONFLICT UPDATE below, so a reader
+                # can prove this row's entry_price/confidence NULL (if
+                # either is NULL) is this policy's honest NULL. See
+                # oracle/entry_price_policy.py and the migration docstring.
+                "null_write_policy": NULL_WRITE_POLICY,
             },
         )
     return {

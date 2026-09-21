@@ -114,7 +114,7 @@ def get_predictions(
                 "expected_move_pct, signal_strength, coherence, "
                 "model_name, model_version, signals, anti_signals, "
                 "flow_context, verdict, actual_price, actual_move_pct, "
-                "pnl_pct, scored_at, score_notes "
+                "pnl_pct, scored_at, score_notes, null_write_policy "
                 "FROM oracle_predictions WHERE " + where_sql + " "
                 "ORDER BY created_at DESC LIMIT :lim OFFSET :off"
             ),
@@ -186,6 +186,12 @@ def get_predictions(
             "pnl_pct": r[20],
             "scored_at": r[21].isoformat() if r[21] else None,
             "score_notes": r[22],
+            # Historical-NULL provenance boundary (oracle_pred_nullable_0918):
+            # non-null here proves this row's entry_price/confidence NULL,
+            # if either is NULL, is the honest-measurement policy's NULL,
+            # without a reader having to re-derive that from migration
+            # history. NULL means "predates the policy, or unknown."
+            "null_write_policy": r[23],
             "days_left": days_left,
             "tracking_pnl": round(tracking_pnl, 2) if tracking_pnl is not None else None,
             "tracking_pnl_basis": tracking_pnl_basis,

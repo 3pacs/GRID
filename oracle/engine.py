@@ -36,7 +36,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from oracle.entry_price_policy import entry_price_score_note
+from oracle.entry_price_policy import NULL_WRITE_POLICY, entry_price_score_note
 
 import os
 _USE_SIGNAL_REGISTRY = os.getenv("GRID_SIGNAL_REGISTRY", "0") == "1"
@@ -638,12 +638,22 @@ class OracleEngine:
                     pnl_pct DOUBLE PRECISION,
                     scored_at TIMESTAMPTZ,
                     score_notes TEXT,
-                    dedup_keep BOOLEAN NOT NULL DEFAULT TRUE
+                    dedup_keep BOOLEAN NOT NULL DEFAULT TRUE,
+                    null_write_policy TEXT
                 )
             """))
             conn.execute(text("""
                 ALTER TABLE oracle_predictions
                 ADD COLUMN IF NOT EXISTS dedup_keep BOOLEAN NOT NULL DEFAULT TRUE
+            """))
+            # Historical-NULL provenance boundary (oracle_pred_nullable_0918):
+            # NULL here means "predates the policy, or provenance unknown";
+            # oracle.entry_price_policy.NULL_WRITE_POLICY means "this row's
+            # entry_price/confidence NULL is the honest-measurement policy's
+            # NULL." Both writers stamp it at INSERT, never on UPDATE.
+            conn.execute(text("""
+                ALTER TABLE oracle_predictions
+                ADD COLUMN IF NOT EXISTS null_write_policy TEXT
             """))
             # D-H11 / D-M32: `confidence` and `entry_price` are NULL when
             # nothing measured them. Both writers already bind None
@@ -2417,9 +2427,9 @@ class OracleEngine:
                     (id, ticker, prediction_type, direction, target_price, entry_price,
                      expiry, confidence, expected_move_pct, signal_strength, coherence,
                      model_name, model_version, signals, anti_signals, flow_context, model_weights,
-                     horizon_days)
+                     horizon_days, null_write_policy)
                     VALUES (:id, :t, :pt, :d, :tp, :ep, :exp, :conf, :em, :ss, :coh,
-                            :mn, :mv, :sig, :anti, :fc, :mw, :hd)
+                            :mn, :mv, :sig, :anti, :fc, :mw, :hd, :nwp)
                     ON CONFLICT (
                         ticker, direction, expiry, prediction_type,
                         (COALESCE(model_version, '')),
@@ -2448,6 +2458,7 @@ class OracleEngine:
                     "fc": json.dumps(p.flow_context, default=str),
                     "mw": json.dumps(p.model_weights, default=str),
                     "hd": int(p.horizon_days) if p.horizon_days is not None else None,
+                    "nwp": NULL_WRITE_POLICY,
                 })
                 written += 1
                 try:

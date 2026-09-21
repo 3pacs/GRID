@@ -28,6 +28,20 @@ a fact, not a defect).
 Locking: ALTER COLUMN ... DROP NOT NULL is a catalog-only change on PostgreSQL
 14 but takes ACCESS EXCLUSIVE on ``oracle_predictions`` for its duration; it
 runs once at deploy time.
+
+``null_write_policy``: the NOT NULL relax above makes a NULL possible, but a
+NULL alone does not say *why* -- that proof lives in this revision's history,
+not on the row. Both writers now stamp every new row's ``null_write_policy``
+with ``oracle.entry_price_policy.NULL_WRITE_POLICY`` at INSERT time so a
+reader can tell a post-migration honest-NULL row from any other NULL without
+re-deriving the constraint history. ``ADD COLUMN IF NOT EXISTS`` with no
+default is a catalog-only, near-instant change (unlike the DROP NOT NULL
+above, it needs no table rewrite and no value backfill). Existing rows keep
+NULL here -- that IS the record that they predate the policy; never
+backfilled. downgrade() never drops this column: it is provenance metadata
+written by this revision's code paths, not a constraint, and dropping it
+would destroy the very audit trail this revision exists to create -- the
+same "never repair or relabel" hold as the NULL rows themselves.
 """
 
 import logging
@@ -51,6 +65,13 @@ def upgrade() -> None:
         op.execute(
             f"ALTER TABLE IF EXISTS oracle_predictions ALTER COLUMN {col} DROP NOT NULL"
         )
+    # Provenance boundary marker -- see module docstring. Additive, no
+    # default, no table rewrite; a no-op if the table doesn't exist yet
+    # (the engine's own bootstrap declares this column for a fresh install).
+    op.execute(
+        "ALTER TABLE IF EXISTS oracle_predictions "
+        "ADD COLUMN IF NOT EXISTS null_write_policy TEXT"
+    )
 
 
 def downgrade() -> None:
@@ -60,6 +81,8 @@ def downgrade() -> None:
     ).scalar()
     if not exists:
         return
+    # null_write_policy is never dropped here -- see module docstring: it is
+    # the audit trail this revision creates, not a constraint to reverse.
     for col in _COLUMNS:
         nulls = conn.exec_driver_sql(
             f"SELECT count(*) FROM oracle_predictions WHERE {col} IS NULL"

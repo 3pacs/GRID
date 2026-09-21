@@ -40,6 +40,25 @@ _NULL_PAIR = (SCORE_NOTE_ENTRY_NULL, PNL_BASIS_ENTRY_NULL)
 _ZERO_PAIR = (SCORE_NOTE_ENTRY_ZERO, PNL_BASIS_ENTRY_ZERO)
 _NEGATIVE_PAIR = (SCORE_NOTE_ENTRY_NEGATIVE, PNL_BASIS_ENTRY_NEGATIVE)
 
+# ── historical-NULL provenance boundary ─────────────────────────────────────
+#
+# Before ``oracle_pred_nullable_0918``, ``entry_price``/``confidence`` were
+# NOT NULL, so today every NULL in either column is provably a post-migration
+# honest-NULL row -- but that proof lives in migration history, not on the
+# row. A future restore from an older backup, a re-imported dataset, or a
+# reader working from the row alone has no way to tell "unmeasured, written
+# under this policy" apart from some other, unanticipated source of NULL
+# without re-deriving the constraint's history.
+#
+# Both writers (``oracle/publish.py``, ``oracle/engine.py::_store_predictions``)
+# stamp every new row with this value, once, at INSERT -- never on UPDATE, and
+# never backfilled onto a row that predates it. NULL in this column means
+# "written before this policy existed, or provenance unknown"; this exact
+# string means "this row's entry_price/confidence NULL, if either is NULL, is
+# the honest-measurement policy's NULL." A new policy would need a new
+# string, never a rewrite of this one.
+NULL_WRITE_POLICY = "oracle_pred_nullable_0918"
+
 
 def _classify(entry_price: Any) -> tuple[str, str] | None:
     """Return the (score note, pnl basis) pair, or None if the entry divides.

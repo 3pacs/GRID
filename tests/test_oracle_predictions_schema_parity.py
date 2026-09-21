@@ -68,3 +68,21 @@ def test_revision_never_updates_or_deletes_rows():
     body = src[src.index("def upgrade"):]
     assert "UPDATE oracle_predictions" not in body
     assert "DELETE FROM oracle_predictions" not in body
+
+
+def test_engine_create_declares_the_provenance_boundary_column():
+    block = _create_block()
+    decl = _column_decl(block, "null_write_policy")
+    assert "NOT NULL" not in decl.upper(), decl
+
+
+def test_revision_adds_the_provenance_boundary_column():
+    src = REVISION.read_text(encoding="utf-8")
+    upgrade_body = src[src.index("def upgrade"):src.index("def downgrade")]
+    assert "ADD COLUMN IF NOT EXISTS null_write_policy" in upgrade_body
+
+
+def test_revision_downgrade_never_drops_the_provenance_column():
+    src = REVISION.read_text(encoding="utf-8")
+    downgrade_body = src[src.index("def downgrade"):]
+    assert "DROP COLUMN" not in downgrade_body.upper()
