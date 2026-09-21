@@ -1083,22 +1083,37 @@ Exactly what changes in production if this PR merges and deploys:
 
 The coordinator re-ran the scale harness at `9f671d38` (the batched-write
 fix above) on the same disposable-DB shape (1,268 `SECTOR_MAP` tickers,
-1.47M price rows, 162k annual rows), same tunnel (27–35ms RTT/statement).
-`divergence_snapshot_all` end to end (batched upsert **+** the per-row
-`_emit_divergence_signal` fanout together) came back at **114.4s — still
-over the 60s budget** — with 1,593 `contracts.emit` warnings logged
-(`relation "contracts_audit" does not exist` on that disposable DB): 531
-emitted signals × 3 statements each. An ad-hoc breakdown with the emitter
-skipped isolated the two costs: `snapshot_all` end-to-end **without** the
-emit fanout is **6.44s**, 10 engine statements total (6 SELECT 2.56s, 1
-WITH 2.15s, 3 INSERT 0.31s), 1,268 rows written, 0.35s of that in RTT — so
-the batched loads + batched upsert this PR actually owns are ~6.4s at
-this scale, comfortably under the 60s budget. The remaining ~108s of the
-114.4s figure is entirely `_emit_divergence_signal` → `contracts.emit.emit`
-(1 audit INSERT + 1 `pg_notify` + 1 COMMIT per emitted signal, ~531
-signals ≈ 1,600 statements over a 27–35ms tunnel) — the pre-existing
-per-event `SignalFired` audit/notify design described above, unchanged by
-this PR, and RTT-bound rather than slow-query-bound.
+1.47M price rows, 162k annual rows), tunnel RTT ~30.6ms/statement, this
+time with `contracts_audit` actually present and the emitter's own
+config-resolved engine pointed through the same tunnel (an earlier
+"emitter skipped" run undercounted this — it was an artefact of an
+ad-hoc script shadowing the real `contracts` package with a local
+`tests/contracts/`, not a real measurement). Corrected numbers:
+`divergence_snapshot_all` total **100.8s** = **CORE 5.98s** (10 engine
+statements: 6 SELECT 2.55s, 1 WITH 1.23s, 3 INSERT 0.29s; 1,268 rows
+written) **+ EMITTER 94.85s** for 531 emitted signals = **178.6ms per
+signal** (≈5.8 round trips' worth each — audit INSERT + `pg_notify` +
+connection/transaction overhead on `_get_engine()`'s own pool, not a
+fixed "3 statements"), 531 `contracts_audit` rows (exactly 1 per
+signal), 0 errors. So the batched loads + batched upsert this PR
+actually owns are ~6s at this scale, comfortably under the 60s budget.
+The remaining ~95s is entirely the pre-existing per-event
+`_emit_divergence_signal` → `contracts.emit.emit` fanout — unchanged by
+this PR, RTT-bound rather than slow-query-bound. On production
+(localhost, sub-millisecond RTT) the same fanout is expected to cost
+roughly 1–3s, not 95s.
+
+Important design note the coordinator's correction surfaced: the
+emitter does **not** run through the same SQLAlchemy `Engine` object
+this harness passes to `snapshot_all` / `compute_divergence`.
+`contracts.emit._get_engine()` resolves its own engine from `DB_*`
+config (`api.dependencies.get_db_engine()`), independently pooled and
+potentially pointed at a different database entirely. A test cannot
+safely assume that engine lands on the scratch DB just because
+`GRID_TEST_DB_URL` does, so the harness cannot count "statements sent to
+the emitter's engine" the way it can for its own — doing so would
+either instrument the wrong connection or silently write real audit
+rows / `pg_notify` traffic to whatever DB is otherwise configured.
 
 `tests/test_daily_intel_scale_pg.py::test_representative_scale_timings`
 was split to measure and report these separately instead of conflating
@@ -1107,24 +1122,31 @@ them:
 - **`divergence_snapshot_all_core`** — `snapshot_all` with
   `_emit_divergence_signal` monkeypatched to a counting no-op. Asserted
   `< 60s` (the actual `DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S` this
-  PR is responsible for).
+  PR is responsible for) — the only time-bounded assertion in this
+  split.
 - **`divergence_emitter`** — the real `contracts.emit` path run once,
   with `contracts_audit`/`contracts_dead_letter` created on the scratch
   DB from `scripts/migrations/20260411_contracts_infrastructure.sql`
   (applied idempotently in the harness's own setup, `CREATE ... IF NOT
-  EXISTS` throughout) so the emit path succeeds instead of warning-and-
-  skipping. Printed as `emitter: N events, S statements, T seconds, T/S
-  ms per statement`; asserted only `statements == 3 * events`
-  (documents the per-event design; not held to any time budget — on
-  production, localhost RTT is sub-millisecond, so the same ~531-signal,
-  ~1,600-statement fanout is expected to cost roughly 1–2s, not 108s).
-  `contracts_audit` rows this measurement writes are deleted in the
-  harness's teardown (`producer_module = 'intelligence.fundamental_divergence'
-  AND emitted_at >= <run start>`).
+  EXISTS` throughout). Before running it, the harness fetches
+  `contracts.emit._get_engine()` and checks its host/port/database
+  against the scratch DB's own; the real emit path only runs when they
+  match (coordinator's environment responsibility to point `DB_*` config
+  at the same scratch DB as `GRID_TEST_DB_URL` — otherwise the
+  measurement is skipped with a printed explanation rather than risking
+  a write to the wrong database). Printed as `emitter: N events, T
+  seconds, ms per signal, audit_rows=R (ran=...)`; when it ran, asserted
+  only `audit_rows == events` (1 audit row per emitted signal — the
+  pre-existing per-event design; NOT a statement count, and NOT bounded
+  by any time budget — the elapsed seconds are reported for visibility
+  only, since this leg is RTT-bound on an engine this harness doesn't
+  control). `contracts_audit` rows this measurement writes are deleted
+  in the harness's teardown (`producer_module =
+  'intelligence.fundamental_divergence' AND emitted_at >= <run start>`).
 
 **Net assessment**: the SQL-task work in this PR (batched fingerprint
 reads, batched TTM upsert, batched divergence-snapshot upsert) is done
-and measured at ~6.4s for the divergence side at representative scale —
+and measured at ~6s for the divergence side at representative scale —
 no further query work needed there. The one remaining per-row loop
 touched by this task's scope is the `contracts.emit` fanout inside
 `_emit_divergence_signal`, and it is **intentionally** left per-row (see

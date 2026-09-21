@@ -62,12 +62,11 @@ from __future__ import annotations
 import io
 import os
 import time
-from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 import contracts.emit as contracts_emit
@@ -109,26 +108,23 @@ def _apply_contracts_migration(engine: Engine) -> None:
             conn.execute(text(stmt))
 
 
-@contextmanager
-def _count_db_statements(engine: Engine):
-    """Count SQL statements actually sent to ``engine`` (INSERT/SELECT/
-    etc. via ``before_cursor_execute``, plus each transaction ``COMMIT``)
-    for the duration of the ``with`` block."""
-    counts = {"n": 0}
+def _emit_engine_matches_scratch_db(emit_engine: Engine, scratch_engine: Engine) -> bool:
+    """True when ``contracts.emit``'s own config-resolved engine
+    (``contracts.emit._get_engine()`` -> ``api.dependencies.get_db_engine()``,
+    built from ``DB_*`` config env vars, NOT the ``GRID_TEST_DB_URL`` engine
+    the rest of this harness uses) points at the same physical database as
+    the scratch DB. The emitter writes through its own engine/connection
+    pool by design (see snapshot_all's "SYNTH-26" comment) — this harness
+    must not run the real emit path unless that separate engine is
+    confirmed to land on the same disposable database, or it risks writing
+    audit rows/pg_notify traffic to whatever DB is otherwise configured."""
+    e_url, s_url = emit_engine.url, scratch_engine.url
+    return (
+        (e_url.host or "") == (s_url.host or "")
+        and (e_url.port or None) == (s_url.port or None)
+        and (e_url.database or "") == (s_url.database or "")
+    )
 
-    def _before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
-        counts["n"] += 1
-
-    def _on_commit(conn):
-        counts["n"] += 1
-
-    event.listen(engine, "before_cursor_execute", _before_cursor_execute)
-    event.listen(engine, "commit", _on_commit)
-    try:
-        yield counts
-    finally:
-        event.remove(engine, "before_cursor_execute", _before_cursor_execute)
-        event.remove(engine, "commit", _on_commit)
 
 _GRID_TEST_DB_URL = os.environ.get("GRID_TEST_DB_URL")
 _SCALE_TESTS_ON = os.environ.get("GRID_SCALE_TESTS") == "1"
@@ -553,46 +549,76 @@ def test_representative_scale_timings(scale_engine: Engine, monkeypatch: pytest.
             snapshot_result = snapshot_all(engine, as_of=as_of)
             timings["divergence_snapshot_all_core"] = time.perf_counter() - t0
 
-        # (e3) emitter — the real per-event contracts.emit path, run
-        # once with contracts_audit present on the scratch DB. This is
-        # RTT-bound by design (1 audit INSERT + 1 pg_notify + 1 COMMIT
-        # per emitted SignalFired — see snapshot_all's "SYNTH-26" comment
-        # in intelligence/fundamental_divergence.py) and is NOT held to
-        # the 60s divergence budget; it is reported for visibility only.
+        # (e3) emitter — the real per-event contracts.emit path, run once
+        # with contracts_audit present on the scratch DB. contracts.emit
+        # resolves its OWN engine from DB_* config
+        # (contracts.emit._get_engine() -> api.dependencies.get_db_engine()),
+        # separate from the GRID_TEST_DB_URL engine this harness otherwise
+        # uses — NOT overridden here, so this only runs the real path when
+        # that separately-configured engine is confirmed to point at the
+        # same scratch database (coordinator's setup responsibility: DB_*
+        # config env vars matching GRID_TEST_DB_URL). This is RTT-bound by
+        # design (audit INSERT + pg_notify + connection/transaction
+        # overhead per emitted SignalFired — see snapshot_all's "SYNTH-26"
+        # comment in intelligence/fundamental_divergence.py) and is NOT
+        # held to the 60s divergence budget; it is reported for
+        # visibility only. Statement counts are not measured through this
+        # harness's own engine — that engine is not the one the emitter
+        # actually uses, so any count taken there would not reflect the
+        # emitter's real cost.
         emitter_events = [
             r for r in compute_divergence(engine, as_of=as_of)
             if r["classification"] in ("long_candidate", "short_candidate")
         ]
-        emitter_statements = 0
+        emitter_audit_rows = 0
         timings["divergence_emitter"] = 0.0
+        emitter_ran = False
         if emitter_events:
             _apply_contracts_migration(engine)
             with engine.connect() as conn:
                 contracts_audit_present = _table_exists(conn, "public.contracts_audit")
             if contracts_audit_present:
-                emitter_run_start = datetime.now(timezone.utc)
-                with monkeypatch.context() as m:
-                    m.setattr(contracts_emit, "_get_engine", lambda: engine)
-                    with _count_db_statements(engine) as counts:
-                        t0 = time.perf_counter()
-                        for r in emitter_events:
-                            fd._emit_divergence_signal(r)
-                        timings["divergence_emitter"] = time.perf_counter() - t0
-                emitter_statements = counts["n"]
+                emit_engine = contracts_emit._get_engine()
+                if _emit_engine_matches_scratch_db(emit_engine, engine):
+                    emitter_run_start = datetime.now(timezone.utc)
+                    t0 = time.perf_counter()
+                    for r in emitter_events:
+                        fd._emit_divergence_signal(r)
+                    timings["divergence_emitter"] = time.perf_counter() - t0
+                    emitter_ran = True
+                    with engine.connect() as conn:
+                        emitter_audit_rows = conn.execute(
+                            text(
+                                "SELECT COUNT(*) FROM contracts_audit WHERE "
+                                "producer_module = :pm AND emitted_at >= :start",
+                            ).bindparams(
+                                pm="intelligence.fundamental_divergence",
+                                start=emitter_run_start,
+                            ),
+                        ).scalar_one()
+                else:
+                    print(
+                        "\n[emitter] contracts.emit's own configured engine "
+                        "does not point at the scratch DB (GRID_TEST_DB_URL) "
+                        "— emitter measurement skipped to avoid writing to "
+                        "the wrong database. Point DB_* config env vars at "
+                        "the same scratch DB to enable it."
+                    )
             else:
                 print(
                     "\n[emitter] contracts_audit could not be created on "
                     "the scratch DB — emitter measurement skipped"
                 )
 
-        per_stmt_ms = (
-            (timings["divergence_emitter"] * 1000.0 / emitter_statements)
-            if emitter_statements else 0.0
+        per_signal_ms = (
+            (timings["divergence_emitter"] * 1000.0 / len(emitter_events))
+            if emitter_ran and emitter_events else 0.0
         )
         print(
-            f"\nemitter: {len(emitter_events)} events, {emitter_statements} "
-            f"statements, {timings['divergence_emitter']:.2f} seconds, "
-            f"{per_stmt_ms:.2f} ms per statement"
+            f"\nemitter: {len(emitter_events)} events, "
+            f"{timings['divergence_emitter']:.2f} seconds, "
+            f"{per_signal_ms:.1f} ms per signal, "
+            f"audit_rows={emitter_audit_rows} (ran={emitter_ran})"
         )
 
         # ── EXPLAIN (ANALYZE, BUFFERS) — printed for the coordinator ────
@@ -665,17 +691,17 @@ def test_representative_scale_timings(scale_engine: Engine, monkeypatch: pytest.
             f"conn.execute() call inside a per-row loop before raising the "
             f"budget."
         )
-        if contracts_audit_present and emitter_events:
-            assert emitter_statements == 3 * len(emitter_events), (
-                f"expected exactly 3 statements per emitted signal (1 "
-                f"contracts_audit INSERT + 1 pg_notify + 1 COMMIT — the "
-                f"pre-existing per-event audit/notify design documented in "
-                f"snapshot_all's 'SYNTH-26' comment, which #587 does not "
-                f"change), got {emitter_statements} statements for "
+        if emitter_ran:
+            assert emitter_audit_rows == len(emitter_events), (
+                f"expected exactly 1 contracts_audit row per emitted signal "
+                f"(the pre-existing per-event audit/notify design documented "
+                f"in snapshot_all's 'SYNTH-26' comment, which #587 does not "
+                f"change), got {emitter_audit_rows} audit rows for "
                 f"{len(emitter_events)} events. This assertion documents "
-                f"the per-event cost shape, not a performance budget — a "
-                f"later batch-emit change would be a separate, reviewed "
-                f"contract-design decision."
+                f"the per-event write shape, not a performance budget — the "
+                f"emitter's elapsed time itself is reported above but not "
+                f"asserted against any bound (it is RTT-bound, over its own "
+                f"separately-configured engine, not this harness's)."
             )
 
         # Every individual statement must also stay under the DB's own
