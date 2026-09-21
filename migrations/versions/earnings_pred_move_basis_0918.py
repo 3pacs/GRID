@@ -1,7 +1,7 @@
 """Record which inputs an earnings prediction's expected move was built from.
 
 Revision ID: earnings_pred_move_basis_0918
-Revises: god_view_market_tables_20260918
+Revises: oracle_pred_nullable_0918
 Create Date: 2026-09-18
 
 Why this exists
@@ -66,7 +66,7 @@ from alembic import op
 # 29 characters -- alembic_version.version_num is VARCHAR(32); see
 # tests/test_alembic_single_head.py::test_revision_ids_fit_the_version_column.
 revision: str = "earnings_pred_move_basis_0918"
-down_revision: str | Sequence[str] | None = "god_view_market_tables_20260918"
+down_revision: str | Sequence[str] | None = "oracle_pred_nullable_0918"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
