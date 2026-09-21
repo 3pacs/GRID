@@ -448,6 +448,15 @@ class TestKnowledgeHeuristic:
 
 
 class TestOraclePublish:
+    @pytest.mark.skip(
+        reason=(
+            "recovery branch (fable/packet2a-recovery-20260921): "
+            "oracle/publish.py's writer was reverted to the pre-#544 "
+            "literal defaults; _measured_or_none no longer exists on this "
+            "branch. See "
+            "docs/handoffs/2026-09-21/fable-packet2a-extraction.md."
+        ),
+    )
     def test_missing_metrics_become_null_not_a_midpoint(self) -> None:
         from oracle.publish import _measured_or_none
 
@@ -456,6 +465,15 @@ class TestOraclePublish:
         assert _measured_or_none(0.0) == 0.0
         assert _measured_or_none(0.61) == 0.61
 
+    @pytest.mark.skip(
+        reason=(
+            "recovery branch (fable/packet2a-recovery-20260921): "
+            "oracle/publish.py's writer was reverted to the pre-#544 "
+            "literal defaults (payload.get(...) or 0.5, all three metrics "
+            "from the same key). See "
+            "docs/handoffs/2026-09-21/fable-packet2a-extraction.md."
+        ),
+    )
     def test_the_three_metrics_read_three_different_keys(self) -> None:
         """They were `payload.get("confidence") or 0.5` three times over."""
         import inspect

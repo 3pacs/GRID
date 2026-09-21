@@ -117,7 +117,28 @@ _PAYLOAD = {
     "confidence": 0.61,
 }
 
+# fable/packet2a-recovery-20260921 reverted oracle/publish.py's writer to
+# the pre-#544 literal defaults (entry_price=0.0, confidence/signal_strength/
+# coherence = payload value or 0.5) so the recovery tree stops producing new
+# NULL entry_price/confidence rows, while keeping the #547 readers, the
+# historical-write hold and the migration (schema stays nullable). These two
+# classes pin the retired _measured_entry_price/_measured_or_none write-path
+# behavior and cannot pass against the reverted writer -- marked skipped on
+# this branch only, not deleted, so the assertions still exist for whichever
+# tree is deployed next.
+_RECOVERY_WRITER_REVERTED = pytest.mark.skip(
+    reason=(
+        "recovery branch (fable/packet2a-recovery-20260921): "
+        "oracle/publish.py's writer was reverted to the pre-#544 literal "
+        "defaults (entry_price=0.0, confidence/signal_strength/coherence = "
+        "payload value or 0.5); _measured_entry_price/_measured_or_none no "
+        "longer exist on this branch. See "
+        "docs/handoffs/2026-09-21/fable-packet2a-extraction.md."
+    ),
+)
 
+
+@_RECOVERY_WRITER_REVERTED
 class TestMeasuredEntryPrice:
     def test_an_observed_spot_comes_back_with_the_day_it_was_observed(self):
         from oracle.publish import _measured_entry_price
@@ -162,6 +183,7 @@ class TestMeasuredEntryPrice:
         assert "lookup failed" in basis["reason"]
 
 
+@_RECOVERY_WRITER_REVERTED
 class TestPublishedRow:
     def test_the_published_row_carries_the_measured_price(self, no_context):
         from oracle.publish import publish_astrogrid_prediction
