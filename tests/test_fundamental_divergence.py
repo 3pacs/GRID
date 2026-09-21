@@ -402,3 +402,134 @@ def test_compute_divergence_empty_universe_returns_empty_list():
     with patch.object(fd, "_load_universe", return_value=[]):
         rows = fd.compute_divergence(engine, as_of=date(2026, 4, 11))
     assert rows == []
+
+
+# ─────────────────────────────────────────────────────────────────
+# 6. snapshot_all write phase — O(1) statements, not O(n) per ticker
+#    (fable-daily-intel-sql-tasks, 2026-09-20 follow-up)
+#
+# The scale harness (tests/test_daily_intel_scale_pg.py) measured
+# divergence_snapshot_all at 153.79s for 1,268 tickers over a
+# ~32.5ms-RTT tunnel — an N+1 per-ticker INSERT loop. snapshot_all now
+# batches the write phase into one multi-row INSERT ... ON CONFLICT
+# statement per _DIVERGENCE_UPSERT_CHUNK_SIZE-row chunk. This test
+# asserts the number of SQL statements issued is a function of the
+# number of CHUNKS, not the number of tickers.
+# ─────────────────────────────────────────────────────────────────
+
+
+def _fake_divergence_rows(n: int, as_of):
+    return [
+        {
+            "ticker": f"T{i:04d}",
+            "as_of": as_of,
+            "sector": "Technology",
+            "fundamental_score": 50.0,
+            "price_score": 50.0,
+            "divergence": 0.0,
+            "classification": "aligned",
+            "narrative": "n/a",
+        }
+        for i in range(n)
+    ]
+
+
+def _run_snapshot_all_counting_statements(n: int):
+    """Run snapshot_all against a fake engine that counts every
+    conn.execute() call, with compute_divergence patched to hand back
+    ``n`` synthetic rows so this test targets ONLY the write phase in
+    snapshot_all (compute_divergence's own batching is covered by the
+    tests above)."""
+    as_of = date(2026, 4, 11)
+    rows = _fake_divergence_rows(n, as_of)
+    calls = {"count": 0}
+
+    engine = MagicMock()
+    conn = MagicMock()
+
+    def execute(stmt, *args, **kwargs):
+        calls["count"] += 1
+        sql = str(getattr(stmt, "text", stmt))
+        if "to_regclass" in sql.lower():
+            return _res(one=_regclass("public.fundamental_divergence"))
+        return _res()
+
+    conn.execute.side_effect = execute
+    engine.begin.return_value.__enter__ = MagicMock(return_value=conn)
+    engine.begin.return_value.__exit__ = MagicMock(return_value=False)
+
+    with patch.object(fd, "compute_divergence", return_value=rows), \
+         patch.object(fd, "_emit_divergence_signal"):
+        summary = fd.snapshot_all(engine, as_of=as_of)
+
+    return calls["count"], summary
+
+
+def test_snapshot_all_write_phase_statement_count_is_chunked_not_per_ticker():
+    chunk = fd._DIVERGENCE_UPSERT_CHUNK_SIZE
+
+    n_small = 50
+    n_large = 2 * chunk + 137  # spans 3 chunks, not a multiple of chunk size
+
+    calls_small, summary_small = _run_snapshot_all_counting_statements(n_small)
+    calls_large, summary_large = _run_snapshot_all_counting_statements(n_large)
+
+    # 1 statement for the table-existence check + one multi-row upsert
+    # statement per chunk (ceil(n / chunk)) — never one per ticker.
+    expected_small = 1 + -(-n_small // chunk)
+    expected_large = 1 + -(-n_large // chunk)
+    assert calls_small == expected_small
+    assert calls_large == expected_large
+
+    # The regression this test guards against: under the old per-ticker
+    # loop, calls_large would be ~n_large (one INSERT per ticker, plus
+    # one per-ticker emit check). Statement count must stay far below
+    # ticker count and must not grow 1:1 with it.
+    assert calls_large < n_large
+    assert calls_large <= 1 + -(-n_large // chunk)
+
+    # Outcome semantics unchanged: every row still counted as written
+    # and tallied into its classification bucket.
+    assert summary_small["written"] == n_small
+    assert summary_large["written"] == n_large
+    assert summary_small["counts"]["aligned"] == n_small
+    assert summary_large["counts"]["aligned"] == n_large
+
+
+def test_snapshot_all_chunk_failure_is_fail_soft_and_does_not_abort_run():
+    """A statement error in one chunk should be caught, logged, and
+    should not prevent other chunks (or the emit fanout) from running —
+    same fail-soft contract the batched loaders document."""
+    chunk = fd._DIVERGENCE_UPSERT_CHUNK_SIZE
+    n = chunk + 10  # exactly 2 chunks
+    as_of = date(2026, 4, 11)
+    rows = _fake_divergence_rows(n, as_of)
+
+    calls = {"count": 0, "upserts": 0}
+    engine = MagicMock()
+    conn = MagicMock()
+
+    def execute(stmt, *args, **kwargs):
+        calls["count"] += 1
+        sql = str(getattr(stmt, "text", stmt))
+        if "to_regclass" in sql.lower():
+            return _res(one=_regclass("public.fundamental_divergence"))
+        if "insert into fundamental_divergence" in sql.lower():
+            calls["upserts"] += 1
+            if calls["upserts"] == 1:
+                raise RuntimeError("simulated statement failure")
+            return _res()
+        return _res()
+
+    conn.execute.side_effect = execute
+    engine.begin.return_value.__enter__ = MagicMock(return_value=conn)
+    engine.begin.return_value.__exit__ = MagicMock(return_value=False)
+
+    with patch.object(fd, "compute_divergence", return_value=rows), \
+         patch.object(fd, "_emit_divergence_signal"):
+        summary = fd.snapshot_all(engine, as_of=as_of)
+
+    # First chunk failed (chunk-size rows lost), second chunk succeeded.
+    assert summary["written"] == n - chunk
+    # Counts still reflect ALL computed rows, not just written ones.
+    assert summary["counts"]["aligned"] == n

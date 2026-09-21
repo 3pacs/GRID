@@ -545,7 +545,18 @@ def test_representative_scale_timings(scale_engine: Engine):
         assert timings["fold_announcements"] < DAILY_INTEL_CAPITAL_FLOW_ROLLUPS_BUDGET_S
         assert timings["divergence_load_batch_fundamentals"] < DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S
         assert timings["divergence_load_batch_price_cagrs"] < DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S
-        assert timings["divergence_snapshot_all"] < DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S
+        assert timings["divergence_snapshot_all"] < DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S, (
+            f"snapshot_all took {timings['divergence_snapshot_all']:.1f}s, over "
+            f"the {DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S}s divergence "
+            f"budget. snapshot_all's write phase batches the whole universe "
+            f"into one multi-row INSERT ... ON CONFLICT statement per "
+            f"fundamental_divergence._DIVERGENCE_UPSERT_CHUNK_SIZE-row chunk "
+            f"(fable-daily-intel-sql-tasks, 2026-09-20 follow-up) — a "
+            f"regression here almost certainly means a per-ticker statement "
+            f"crept back into snapshot_all or compute_divergence; check for a "
+            f"conn.execute() call inside a per-row loop before raising the "
+            f"budget."
+        )
 
         # Every individual statement must also stay under the DB's own
         # statement_timeout — a phase that got cancelled would have raised

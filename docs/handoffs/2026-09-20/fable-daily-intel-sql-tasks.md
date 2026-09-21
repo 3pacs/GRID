@@ -928,6 +928,79 @@ brief) is an idempotent `CREATE INDEX IF NOT EXISTS` added to
 `migrations/versions/capital_flow_ttm_state_20260920.py`, re-measured
 with the same harness — not a budget increase.
 
+## Coordinator's representative-scale run + snapshot write batching
+## (2026-09-20, FOURTH follow-up)
+
+The coordinator ran the harness above on a disposable PostgreSQL 14
+database at representative scale (300,000 quarter rows / 5,000 actors,
+162,304 annual rows, 1,268 real `SECTOR_MAP` tickers, 1,465,808
+`raw_series` price rows; seeding 69s), over an SSH tunnel with a measured
+~32.5ms round trip per statement:
+
+| phase | seconds | budget |
+|---|---|---|
+| ttm_first_run (210,000 ttm rows written) | 9.25 | < 90 |
+| ttm_steady_state | 0.73 | < 90 |
+| ttm_after_50_changed (2,100 rows) | 3.60 | < 90 |
+| fold_announcements | 0.21 | < 90 |
+| divergence_load_batch_fundamentals | 2.62 | < 60 |
+| divergence_load_batch_price_cagrs | 2.35 | < 60 |
+| **divergence_snapshot_all (1,268 tickers, 1,268 rows written)** | **153.79** | **< 60 → FAILED** |
+
+Every phase passed except `divergence_snapshot_all`. `EXPLAIN` confirmed
+the *read* side was already fixed and fast (the fingerprint aggregate
+0.54s via `idx_capital_flows_actor`, the 50-actor TTM window query
+29ms) — the failure was entirely in `snapshot_all`'s **write** phase: a
+per-ticker `INSERT ... ON CONFLICT` inside the loop over `compute_divergence`'s
+result rows, i.e. the same N+1 pattern already fixed on the read side
+(batched loaders above), just not yet applied to the write. ~1,268
+tickers x one round trip each x ~32ms measured tunnel RTT ≈ the 150s
+observed; on production (localhost, ~0.1–0.3ms RTT) the absolute number
+would be much smaller, but the *pattern* — O(n) statements for n tickers
+— doesn't stop being a bug just because production RTT is cheap, so it
+was fixed rather than budget-raised.
+
+**Fix**: `intelligence/fundamental_divergence.py::snapshot_all` now
+batches its write phase into ONE multi-row `INSERT ... ON CONFLICT
+(ticker, as_of) DO UPDATE` statement per
+`_DIVERGENCE_UPSERT_CHUNK_SIZE` (500)-row chunk, via the new
+`_build_divergence_upsert_sql` / `_upsert_divergence_chunk` helpers, all
+inside the same single `engine.begin()` transaction as before. All row
+values stay bound parameters (`:ticker0`, `:as_of0`, ... per row in the
+chunk) — only the *count* of VALUES tuples varies with chunk size, so
+this remains fully parameterized per `.claude/rules/security.md`.
+Outcome semantics are unchanged: `counts` still tallies every computed
+row by classification regardless of write outcome, `written` still
+reflects rows actually upserted (now at chunk granularity — a chunk
+failure is logged and skips that chunk's 500-row credit, the same
+fail-soft trade-off already documented for the batched *read* loaders,
+just at a smaller blast radius), and the summary dict shape is
+unchanged. `compute_divergence` itself was already grep-verified to
+issue no per-ticker SQL (its only `conn.execute` calls are the two
+batched loaders, called once each for the whole universe) — nothing
+else needed batching there.
+
+`_emit_divergence_signal` (SYNTH-26 `SignalFired` fanout) intentionally
+**stays per-row**: it writes to `contracts_audit` via its own separate
+engine (`contracts/emit.py::_get_engine()`, not the connection/
+transaction `snapshot_all` uses for `fundamental_divergence`) and
+`pg_notify`s per event so the SSE listener gets one notification per
+signal — collapsing that into a batch would change delivery semantics
+for downstream consumers, not just performance, so it was left alone
+and documented in-line instead.
+
+New fake-engine test
+`tests/test_fundamental_divergence.py::test_snapshot_all_write_phase_statement_count_is_chunked_not_per_ticker`
+asserts statement count for the write phase is `1 (existence check) +
+ceil(n_tickers / chunk_size)` — i.e. a function of chunk count, not
+ticker count — for two ticker counts spanning multiple chunks (50 and
+`2*chunk + 137`), and a companion
+`test_snapshot_all_chunk_failure_is_fail_soft_and_does_not_abort_run`
+proves a chunk failure is caught, logged, and doesn't stop later
+chunks or the emit fanout. The scale harness's
+`divergence_snapshot_all` assertion message was extended (bound kept at
+`< 60s`) to point at this fix if the phase regresses again.
+
 ## Deployment effects of #587
 
 Exactly what changes in production if this PR merges and deploys:

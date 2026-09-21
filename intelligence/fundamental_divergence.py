@@ -793,6 +793,84 @@ def compute_divergence(engine: Engine, as_of: date | None = None) -> list[dict[s
     return out
 
 
+# ── Batched snapshot write (fable-daily-intel-sql-tasks, 2026-09-20) ─
+#
+# snapshot_all used to issue ONE INSERT ... ON CONFLICT statement PER
+# TICKER inside a single engine.begin() transaction — another N+1
+# pattern, this time on the write side. At representative scale
+# (1,268 real SECTOR_MAP tickers) the coordinator's scale harness
+# measured divergence_snapshot_all at 153.79s over a ~32.5ms-RTT SSH
+# tunnel (budget < 60s): ~1,268 sequential per-ticker upserts × several
+# ms of parse/plan/round-trip each. Same diagnosis as the read-side
+# fix above — round-trip overhead multiplied by ticker count, not a
+# slow statement.
+#
+# Replaced with ONE multi-row INSERT ... VALUES (...), (...) ...
+# ON CONFLICT (ticker, as_of) DO UPDATE per chunk of
+# _DIVERGENCE_UPSERT_CHUNK_SIZE rows, still inside a single
+# engine.begin() transaction. All row values are bound parameters
+# (never interpolated into the SQL string) — only the *number* of
+# VALUES tuples/placeholders varies with chunk size, so this stays a
+# parameterized statement per security.md's SQL-safety rule.
+#
+# Trade-off disclosed (same shape as the batched loaders above): a
+# chunk failure is fail-soft at chunk granularity, not per-ticker —
+# log + skip that chunk's ``written`` credit — trading the old code's
+# per-ticker isolation for eliminating the N+1 write pattern. Chunk
+# size 500 keeps that blast radius small (worst case: 500 of ~1,268
+# tickers skipped for one cycle) while keeping statement count O(1)
+# rather than O(n).
+
+_DIVERGENCE_UPSERT_CHUNK_SIZE: int = 500
+
+_DIVERGENCE_UPSERT_COLUMNS: tuple[str, ...] = (
+    "ticker", "as_of", "sector", "fundamental_score",
+    "price_score", "divergence", "classification", "narrative",
+)
+
+
+def _chunked(items: list[Any], size: int) -> list[list[Any]]:
+    """Split ``items`` into consecutive chunks of at most ``size``."""
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+def _build_divergence_upsert_sql(n_rows: int) -> str:
+    """Multi-row ``INSERT ... ON CONFLICT DO UPDATE`` covering ``n_rows``
+    rows in a single statement, with per-row bound-parameter names
+    ``ticker0``/``as_of0``/... through ``ticker{n_rows-1}``/... .
+    """
+    values_sql = ", ".join(
+        "(:ticker{i}, :as_of{i}, :sector{i}, :fundamental_score{i}, "
+        ":price_score{i}, :divergence{i}, :classification{i}, "
+        ":narrative{i})".format(i=i)
+        for i in range(n_rows)
+    )
+    return (
+        "INSERT INTO fundamental_divergence "
+        "(ticker, as_of, sector, fundamental_score, price_score, "
+        "divergence, classification, narrative) "
+        f"VALUES {values_sql} "
+        "ON CONFLICT (ticker, as_of) DO UPDATE SET "
+        "sector = EXCLUDED.sector, "
+        "fundamental_score = EXCLUDED.fundamental_score, "
+        "price_score = EXCLUDED.price_score, "
+        "divergence = EXCLUDED.divergence, "
+        "classification = EXCLUDED.classification, "
+        "narrative = EXCLUDED.narrative"
+    )
+
+
+def _upsert_divergence_chunk(conn: Any, chunk: list[dict[str, Any]]) -> None:
+    """Execute ONE multi-row upsert statement for ``chunk``. Raises on
+    failure — caller decides fail-soft handling."""
+    params: dict[str, Any] = {}
+    for i, r in enumerate(chunk):
+        for col in _DIVERGENCE_UPSERT_COLUMNS:
+            params[f"{col}{i}"] = r[col]
+    sql = _build_divergence_upsert_sql(len(chunk))
+    conn.execute(text(sql).bindparams(**params))
+
+
 def snapshot_all(engine: Engine, as_of: date | None = None) -> dict[str, Any]:
     """Compute + upsert divergence rows into ``fundamental_divergence``.
 
@@ -811,6 +889,9 @@ def snapshot_all(engine: Engine, as_of: date | None = None) -> dict[str, Any]:
             "counts": counts,
         }
 
+    for r in rows:
+        counts[r["classification"]] = counts.get(r["classification"], 0) + 1
+
     with engine.begin() as conn:
         if not _table_exists(conn, "public.fundamental_divergence"):
             log.warning(
@@ -823,40 +904,30 @@ def snapshot_all(engine: Engine, as_of: date | None = None) -> dict[str, Any]:
                 "counts": counts,
                 "error": "table_missing",
             }
-        for r in rows:
-            counts[r["classification"]] = counts.get(r["classification"], 0) + 1
+
+        # ONE multi-row statement per chunk covers the whole write phase —
+        # no per-ticker SQL. See "Batched snapshot write" comment above.
+        for chunk in _chunked(rows, _DIVERGENCE_UPSERT_CHUNK_SIZE):
             try:
-                conn.execute(
-                    text(
-                        """
-                        INSERT INTO fundamental_divergence
-                            (ticker, as_of, sector, fundamental_score,
-                             price_score, divergence, classification,
-                             narrative)
-                        VALUES
-                            (:ticker, :as_of, :sector, :fundamental_score,
-                             :price_score, :divergence, :classification,
-                             :narrative)
-                        ON CONFLICT (ticker, as_of) DO UPDATE
-                        SET sector = EXCLUDED.sector,
-                            fundamental_score = EXCLUDED.fundamental_score,
-                            price_score = EXCLUDED.price_score,
-                            divergence = EXCLUDED.divergence,
-                            classification = EXCLUDED.classification,
-                            narrative = EXCLUDED.narrative
-                        """
-                    ).bindparams(**r)
-                )
-                written += 1
+                _upsert_divergence_chunk(conn, chunk)
+                written += len(chunk)
             except Exception as exc:
                 log.warning(
-                    "fundamental_divergence: upsert failed for {t}: {e}",
-                    t=r["ticker"], e=str(exc),
+                    "fundamental_divergence: upsert chunk failed "
+                    "({n} tickers, first={t}): {e}",
+                    n=len(chunk), t=chunk[0]["ticker"], e=str(exc),
                 )
 
-            # SYNTH-26: non-fatal SignalFired fanout. Only non-aligned
-            # classifications carry information — aligned rows are the
-            # "everything in line" null hypothesis.
+        # SYNTH-26: non-fatal SignalFired fanout. Only non-aligned
+        # classifications carry information — aligned rows are the
+        # "everything in line" null hypothesis. This is an audit-log +
+        # pub/sub emit against `contracts_audit` via its own engine
+        # (contracts/emit.py::_get_engine), NOT the fundamental_divergence
+        # table — each SignalFired event needs its own audit row and
+        # pg_notify so the SSE listener receives one notification per
+        # signal; collapsing these into a batch would change delivery
+        # semantics for downstream consumers. Left per-row on purpose.
+        for r in rows:
             if r["classification"] in ("long_candidate", "short_candidate"):
                 try:
                     _emit_divergence_signal(r)
