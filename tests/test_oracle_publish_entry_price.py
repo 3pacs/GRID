@@ -339,24 +339,24 @@ class TestScorerExcludesNullEntry:
         """`entry_price = 0` never matches a NULL, so a published-with-no-price
         row would sit 'pending' forever unless NULL is named.
 
-        The sweep binds the reasons from ``oracle.entry_price_policy`` rather
-        than spelling them inline, so the scorer, the engine and the API route
-        cannot drift into three different wordings for the same finding.
+        The sweep binds the reason from ``oracle.entry_price_policy`` rather
+        than spelling it inline, so the scorer, the engine and the API route
+        cannot drift into different wordings for the same finding.
+
+        HISTORICAL-WRITE HOLD: the sweep's WHERE names only
+        ``entry_price IS NULL``. A non-null invalid entry_price (0 or
+        negative) can only be a legacy row written before the column was
+        nullable, and it must never be part of this sweep — it is held,
+        never updated/closed/rescored/re-labelled.
         """
-        from oracle.entry_price_policy import (
-            SCORE_NOTE_ENTRY_NULL,
-            SCORE_NOTE_ENTRY_ZERO,
-        )
+        from oracle.entry_price_policy import SCORE_NOTE_ENTRY_NULL
         from scripts import score_oracle_trades
 
         src = inspect.getsource(score_oracle_trades.main)
-        assert "entry_price IS NULL OR entry_price <= 0" in src
-        assert ":note_null" in src and ":note_zero" in src
-        # The two reasons are distinct, and the NULL one still says the
-        # measurement was never taken.
-        assert SCORE_NOTE_ENTRY_NULL != SCORE_NOTE_ENTRY_ZERO
+        assert "AND entry_price IS NULL" in src
+        assert "entry_price IS NULL OR entry_price <= 0" not in src
+        assert ":note_null" in src
         assert SCORE_NOTE_ENTRY_NULL == "No entry price was measured at publish time"
-        assert SCORE_NOTE_ENTRY_ZERO == "Entry price is 0, return not computable"
 
     def test_the_backfill_skip_is_an_explicit_none_test(self):
         from scripts import score_oracle_trades

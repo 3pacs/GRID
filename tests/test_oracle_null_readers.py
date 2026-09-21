@@ -237,25 +237,30 @@ def test_no_data_sweep_names_null_explicitly() -> None:
     Without this the sweep silently skips a price-less prediction, which then
     sits 'pending' forever — neither scored nor accounted for — because the
     chunk query excludes it too.
+
+    HISTORICAL-WRITE HOLD: the sweep's WHERE must select only
+    ``entry_price IS NULL`` (a new-policy row nothing measured). It must NOT
+    also sweep a non-null 0/negative entry_price — that can only be a legacy
+    row written before the column was nullable, and historical
+    rescoring/repair of those rows is on hold: they are left 'pending',
+    never updated/closed/rescored/re-labelled here.
     """
     src = (REPO_ROOT / "scripts" / "score_oracle_trades.py").read_text(
         encoding="utf-8"
     )
     sweep = re.search(
-        r"SET verdict = 'no_data',\s*\n\s*score_notes = CASE.*?\"\"\"\)\)",
+        r"SET verdict = 'no_data',\s*\n\s*score_notes = :note_null,.*?\"\"\"\)",
         src,
         re.S,
     )
-    assert sweep is not None, "the no_data sweep no longer branches on NULL"
+    assert sweep is not None, "the no_data sweep no longer names NULL"
     body = sweep.group(0)
-    assert "WHEN entry_price IS NULL" in body
-    # `<= 0`, not `= 0`: a negative entry is no more divisible than a zero
-    # one, and `= 0` would leave it in the pool the chunk query then refuses.
-    assert "entry_price IS NULL OR entry_price <= 0" in body
-    # The three cases are named separately — nobody measured it, the
-    # measurement is zero, the measurement is negative — because they are
-    # three different findings.
-    assert "WHEN entry_price = 0 THEN" in body
+    assert "WHERE verdict = 'pending'" in body
+    assert "AND entry_price IS NULL" in body
+    # The hold: a non-null invalid entry (0 or negative) must never be part
+    # of this sweep's WHERE — that would touch a legacy row.
+    assert "entry_price <= 0" not in body
+    assert "entry_price = 0" not in body
     # And it must not have grown a placeholder.
     assert "COALESCE(entry_price" not in body
 
@@ -517,12 +522,20 @@ class TestEngineScoringLoopEntryPrice:
             )
         return today
 
-    def test_unusable_entries_are_closed_with_their_own_reasons(self, engine):
-        from oracle.entry_price_policy import (
-            SCORE_NOTE_ENTRY_NEGATIVE,
-            SCORE_NOTE_ENTRY_NULL,
-            SCORE_NOTE_ENTRY_ZERO,
-        )
+    def test_unusable_entries_are_closed_or_held_by_the_hold_policy(
+        self, engine,
+    ):
+        """NULL is closed with a reason; a non-null invalid entry is held.
+
+        HISTORICAL-WRITE HOLD: ``zero-entry`` and ``negative-entry`` are
+        legacy rows — a non-null invalid ``entry_price`` can only exist from
+        before ``oracle_pred_nullable_0918`` made the column nullable, since
+        the new publish path writes NULL, never 0/negative, when nothing was
+        measured. Historical rescoring/repair of those rows is on hold: this
+        loop must never update, close, rescore or re-label them. Only
+        ``null-entry`` (a new-policy row) is closed to 'no_data'.
+        """
+        from oracle.entry_price_policy import SCORE_NOTE_ENTRY_NULL
 
         self._seed(engine)
         oe = self._engine_under_test(
@@ -541,25 +554,20 @@ class TestEngineScoringLoopEntryPrice:
                 )).fetchall()
             }
 
-        # Each unusable entry is closed — not left 'pending' forever, and not
-        # folded into the miss column.
+        # The new-policy NULL row is closed — not left 'pending' forever, and
+        # not folded into the miss column.
         assert rows["null-entry"][0] == "no_data"
         assert rows["null-entry"][1] == SCORE_NOTE_ENTRY_NULL
-        assert rows["zero-entry"][0] == "no_data"
-        assert rows["zero-entry"][1] == SCORE_NOTE_ENTRY_ZERO
-        assert rows["negative-entry"][0] == "no_data"
-        assert rows["negative-entry"][1] == SCORE_NOTE_ENTRY_NEGATIVE
+        assert rows["null-entry"][2] is None
 
-        # The two reasons are distinct: "nobody measured it" is not the same
-        # finding as "the measurement cannot be a basis".
-        assert SCORE_NOTE_ENTRY_NULL != SCORE_NOTE_ENTRY_ZERO
+        # The legacy non-null-invalid rows are held: still 'pending', no
+        # score_notes, no pnl_pct — byte-identical to how they were seeded.
+        assert rows["zero-entry"] == ("pending", None, None)
+        assert rows["negative-entry"] == ("pending", None, None)
 
-        # No return was invented for any of them, at any value.
-        for pred_id in ("null-entry", "zero-entry", "negative-entry"):
-            assert rows[pred_id][2] is None, pred_id
-
-        # They are reported, not silently dropped from the tally.
-        assert results["unscorable_entry_price"] == 3, results
+        # Reported through separate counters, not folded together.
+        assert results["unscorable_entry_price"] == 1, results
+        assert results["held_legacy_entry_price"] == 2, results
         assert results["misses"] == 0, results
 
         # The measured row still scores: (110 - 100) / 100 = +10% on a CALL.
@@ -570,9 +578,10 @@ class TestEngineScoringLoopEntryPrice:
         """A zero entry must be settled *before* the divide, not caught after.
 
         Driven by making any arithmetic against the fetched price raise: if
-        the guard sat downstream of ``(actual - entry) / entry`` this would
-        surface as an AssertionError from the operand rather than a clean
-        skip.
+        the hold check sat downstream of ``(actual - entry) / entry`` this
+        would surface as an AssertionError from the operand rather than a
+        clean hold. The legacy zero-entry row is held (never scored, never
+        closed) rather than divided by or repaired.
         """
         self._seed(engine)
 
@@ -589,8 +598,16 @@ class TestEngineScoringLoopEntryPrice:
             ))
         oe = self._engine_under_test(engine, {"BBB": _Exploding(110.0)})
         results = oe.score_expired_predictions()
-        assert results["unscorable_entry_price"] == 1
+        assert results["unscorable_entry_price"] == 0
+        assert results["held_legacy_entry_price"] == 1
         assert results["total"] == 0
+
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT verdict, score_notes FROM oracle_predictions "
+                "WHERE id = 'zero-entry'"
+            )).fetchone()
+        assert row == ("pending", None)
 
 
 class TestEntryPricePolicy:
