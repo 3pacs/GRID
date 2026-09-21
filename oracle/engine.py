@@ -1829,10 +1829,14 @@ class OracleEngine:
             "misses": 0,
             "partials": 0,
             "total": 0,
-            # Rows closed as 'no_data' because their entry price was NULL,
-            # zero or negative. Reported, never folded into misses and never
-            # left out of the tally altogether.
+            # Rows closed as 'no_data' because their entry price was NULL
+            # (a new-policy row nothing measured). Reported, never folded
+            # into misses and never left out of the tally altogether.
             "unscorable_entry_price": 0,
+            # Legacy pending rows (non-null 0/negative entry_price, written
+            # before the column was nullable) that the historical-write
+            # hold left untouched this run.
+            "held_legacy_entry_price": 0,
         }
 
         with self.engine.begin() as conn:
@@ -1854,22 +1858,38 @@ class OracleEngine:
                 # BEFORE the division below. NULL is not a zero entry and a
                 # zero entry is not a 0% move: `(actual - entry) / entry`
                 # raises TypeError on the first and ZeroDivisionError on the
-                # second. Neither is skipped silently — the row is closed as
-                # 'no_data' carrying the reason it could not be scored, so it
-                # stops sitting 'pending' forever and the reason survives in
-                # score_notes. The price is never repaired or invented.
-                # Same contract and same strings as
-                # scripts/score_oracle_trades.py.
+                # second. The price is never repaired or invented.
+                #
+                # Historical-write hold: a non-null invalid entry_price (0 or
+                # negative) can only be a legacy row written before
+                # oracle_pred_nullable_0918 made the column nullable -- the
+                # new publish path writes NULL, never 0, when nothing was
+                # measured. Historical rescoring/repair is on hold, so that
+                # row is left exactly as it is: not updated, closed, rescored
+                # or re-labelled. Only a NULL entry_price (a new-policy row)
+                # is closed to 'no_data' here, carrying the reason it could
+                # not be scored so it stops sitting 'pending' forever and the
+                # reason survives in score_notes. Same contract and same
+                # strings as scripts/score_oracle_trades.py.
                 entry_note = entry_price_score_note(entry)
                 if entry_note is not None:
-                    conn.execute(text("""
-                        UPDATE oracle_predictions
-                        SET verdict = 'no_data',
-                            score_notes = :notes,
-                            scored_at = NOW()
-                        WHERE id = :id
-                    """), {"notes": entry_note, "id": pred_id})
-                    results["unscorable_entry_price"] += 1
+                    if entry is None:
+                        conn.execute(text("""
+                            UPDATE oracle_predictions
+                            SET verdict = 'no_data',
+                                score_notes = :notes,
+                                scored_at = NOW()
+                            WHERE id = :id
+                        """), {"notes": entry_note, "id": pred_id})
+                        results["unscorable_entry_price"] += 1
+                    else:
+                        log.debug(
+                            "score_expired_predictions: legacy pending row "
+                            "{id} held (entry_price={e!r}, historical-write "
+                            "hold — never updated/closed/rescored)",
+                            id=pred_id, e=entry,
+                        )
+                        results["held_legacy_entry_price"] += 1
                     continue
 
                 # Get actual price at expiry

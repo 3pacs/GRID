@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Score Oracle Trades — Backfill entry prices, fix directions, score expired predictions.
+Score Oracle Trades — fix directions, score expired predictions.
 
 Steps:
 1. Fetch historical prices via yfinance for all prediction tickers
-2. Backfill entry_price where it's 0
+2. Count (never backfill) missing/invalid entry_price -- HISTORICAL-WRITE
+   HOLD: a non-null 0/negative entry_price is a legacy row and is left
+   exactly as it is; a NULL entry_price is a new-policy row and is never
+   fabricated with a price discovered after the fact.
 3. Map BULLISH→CALL, NEUTRAL→no_data verdict
 4. Score expired predictions (expiry <= today)  ← CHUNKED since 2026-05-13
 5. Print scorecard
@@ -31,9 +34,7 @@ from sqlalchemy.engine import Engine
 
 from config import settings
 from oracle.entry_price_policy import (
-    SCORE_NOTE_ENTRY_NEGATIVE,
     SCORE_NOTE_ENTRY_NULL,
-    SCORE_NOTE_ENTRY_ZERO,
     entry_price_score_note,
 )
 
@@ -430,9 +431,23 @@ def main(argv: list[str] | None = None) -> None:
         prices = fetch_prices(tickers, fetch_start, fetch_end)
 
         # ── Step 2: Backfill entry prices ──
-        log.info("\n--- STEP 2: Backfill Entry Prices ---")
-        backfilled = 0
-        no_price = 0
+        # HISTORICAL-WRITE HOLD: this step used to backfill a missing/zero
+        # entry_price with a historical close looked up just now. That is
+        # repair of an already-published row, which is on hold for both
+        # cases below:
+        #   * entry_price is a non-null 0/negative value -- only possible on
+        #     a legacy row written before oracle_pred_nullable_0918 made the
+        #     column nullable. Never updated, closed, rescored or
+        #     re-labelled; left exactly as it is.
+        #   * entry_price IS NULL -- a new-policy row: nothing was measured
+        #     at publish time. Writing a price discovered after the fact
+        #     would be exactly the fabrication the new policy exists to
+        #     avoid, so it is never backfilled either.
+        # This step therefore only counts what it is holding; it writes
+        # nothing to oracle_predictions.
+        log.info("\n--- STEP 2: Backfill Entry Prices (historical-write hold) ---")
+        held_legacy = 0
+        held_new_policy = 0
 
         for r in rows:
             pred_id, ticker, direction, entry_price, created_date, expiry = r
@@ -440,20 +455,13 @@ def main(argv: list[str] | None = None) -> None:
             if entry_price is not None and entry_price > 0:
                 continue  # Already has a price
 
-            price = get_price_for_date(prices, ticker, created_date)
-            if price is None:
-                no_price += 1
-                continue
+            if entry_price is None:
+                held_new_policy += 1
+            else:
+                held_legacy += 1
 
-            conn.execute(text("""
-                UPDATE oracle_predictions
-                SET entry_price = :price
-                WHERE id = :id
-            """), {"price": price, "id": pred_id})
-            backfilled += 1
-
-        log.info("  Backfilled: {}", backfilled)
-        log.info("  No price available: {}", no_price)
+        log.info("  Held (legacy, non-null invalid entry_price): {}", held_legacy)
+        log.info("  Held (new-policy, entry_price IS NULL): {}", held_new_policy)
 
         # ── Step 3: Fix direction mapping ──
         log.info("\n--- STEP 3: Fix Direction Mapping ---")
@@ -484,31 +492,28 @@ def main(argv: list[str] | None = None) -> None:
         """))
         log.info("  NEUTRAL → no_data: {}", res.rowcount)
 
-        # No usable entry price → no_data, each case named. NULL must be
-        # listed explicitly: `entry_price = 0` is NULL for a NULL row, so a
-        # prediction published with no observed spot (D-M32) would otherwise
-        # sit 'pending' forever, neither scored nor accounted for.
+        # No entry price measured → no_data. Only entry_price IS NULL is
+        # closed here: a new-policy row where nothing was measured at
+        # publish time, so it would otherwise sit 'pending' forever, neither
+        # scored nor accounted for. Not repaired — the row is closed and the
+        # note says why.
         #
-        # The three reasons are distinct because they are distinct findings:
-        # nobody measured it, the measurement is zero, the measurement is
-        # negative. None of them is a 0% return, and none of them is repaired
-        # here — the row is closed and the note says why. `<= 0` rather than
-        # `= 0` so a negative entry cannot slip past into the scoring chunk.
+        # HISTORICAL-WRITE HOLD: a non-null 0/negative entry_price can only
+        # be a legacy row written before oracle_pred_nullable_0918 made the
+        # column nullable (the new publish path writes NULL, never 0/neg,
+        # when nothing was measured). That row is deliberately excluded from
+        # this WHERE — historical rescoring/repair is on hold, so it is
+        # never updated, closed, rescored or re-labelled here. It is left
+        # pending, exactly as it was before this branch.
         res = conn.execute(text("""
             UPDATE oracle_predictions
             SET verdict = 'no_data',
-                score_notes = CASE
-                    WHEN entry_price IS NULL THEN :note_null
-                    WHEN entry_price = 0 THEN :note_zero
-                    ELSE :note_negative
-                END,
+                score_notes = :note_null,
                 scored_at = NOW()
             WHERE verdict = 'pending'
-              AND (entry_price IS NULL OR entry_price <= 0)
+              AND entry_price IS NULL
         """), {
             "note_null": SCORE_NOTE_ENTRY_NULL,
-            "note_zero": SCORE_NOTE_ENTRY_ZERO,
-            "note_negative": SCORE_NOTE_ENTRY_NEGATIVE,
         })
         log.info("  no usable entry_price → no_data: {}", res.rowcount)
 
