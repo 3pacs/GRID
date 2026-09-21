@@ -20,27 +20,10 @@ window where ~2.27M predictions expire at once).
 """
 
 import argparse
+import importlib.util
 import json
 import sys
 from typing import Any
-
-# oracle.entry_price_policy must be imported -- and so cached in
-# sys.modules -- BEFORE the sys.path.insert below. On grid-svr,
-# /data/grid_v4/grid_repo is a stale checkout (confirmed at revision
-# 5facbdf0) whose own `oracle` package predates entry_price_policy.py.
-# Hermes runs this module from /data/grid_v4/grid_release; if that stale
-# path lands at sys.path[0] before this import has resolved, `oracle`
-# resolves from the stale tree instead and this raises ModuleNotFoundError
-# (reproduced during the packet2a PostgreSQL proof on the gridz4 host,
-# which also has that directory). Importing it first means the insert
-# below can no longer shadow it, regardless of import order elsewhere in
-# the process. See tests/test_score_oracle_trades_stale_repo_shadow.py.
-from oracle.entry_price_policy import (
-    SCORE_NOTE_ENTRY_NULL,
-    entry_price_score_note,
-)
-
-sys.path.insert(0, "/data/grid_v4/grid_repo")
 
 from datetime import date, timedelta
 
@@ -49,7 +32,50 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
+# Every first-party (repo-root) import this module needs -- directly or,
+# like intelligence.postmortem below, lazily inside a function -- must be
+# resolvable BEFORE the sys.path insertion further down ever has a chance
+# to run. See that insertion's own comment for why, and
+# tests/test_score_oracle_trades_stale_repo_shadow.py for the regression
+# proof (it also covers db and intelligence.postmortem, which this module
+# does not import itself but which must be equally unaffected by anything
+# this import does to sys.path).
 from config import settings
+from oracle.entry_price_policy import (
+    SCORE_NOTE_ENTRY_NULL,
+    entry_price_score_note,
+)
+
+# Compute-node fallback for a genuinely standalone
+# `python scripts/score_oracle_trades.py` invocation whose CWD/PYTHONPATH
+# does not already make this repo importable. Two guards, both required:
+#
+# * `__name__ == "__main__"` -- this must NEVER run when the module is
+#   merely imported (Hermes's oracle step does not import this module, but
+#   anything that ever does -- directly or transitively -- must not have
+#   sys.path mutated as a side effect). The imports above already
+#   succeeded by this point however this module ended up loaded, so this
+#   line can only ever add a path, never fix a failure that already
+#   happened.
+# * `importlib.util.find_spec("config") is None` -- even under direct
+#   execution, only insert the fallback if this repo is not ALREADY
+#   importable (e.g. via PYTHONPATH or CWD). Preferring whatever already
+#   resolves correctly over a hardcoded, potentially stale path is strictly
+#   safer, and `find_spec` never imports/executes `config` -- it only
+#   locates it.
+#
+# /data/grid_v4/grid_repo is a STALE checkout confirmed on grid-svr
+# (revision 5facbdf0, no oracle/entry_price_policy.py) and on the gridz4
+# PostgreSQL-proof host. The previous, unconditional
+# `sys.path.insert(0, "/data/grid_v4/grid_repo")` ran on every import of
+# this module, on every host where that directory exists, for the rest of
+# the process's lifetime -- shadowing this repo's real `oracle`, `config`
+# and any other first-party package for every import that happened to run
+# after it, not just the first one (reproduced: ModuleNotFoundError on
+# oracle.entry_price_policy during pytest collection, and separately on
+# scripts/score_oracle_trades.py's own real scorer-path PostgreSQL proof).
+if __name__ == "__main__" and importlib.util.find_spec("config") is None:
+    sys.path.insert(0, "/data/grid_v4/grid_repo")
 
 # Ticker → yfinance symbol mapping
 YF_MAP = {
