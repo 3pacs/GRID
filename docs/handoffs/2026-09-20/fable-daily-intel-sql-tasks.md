@@ -829,3 +829,179 @@ Every test creates and cleans up its own uniquely-prefixed
   test that constructs `OperatorState` for this field, for no
   correctness benefit. Disclosed, not silently left as dead-looking
   code: every touched docstring says plainly that it is now vestigial.
+
+## Fingerprint coverage proof (2026-09-20, THIRD follow-up)
+
+`tests/test_capital_flow_ttm_fingerprint_coverage.py` (new) makes the
+fingerprint-coverage claim above mechanically checked instead of merely
+asserted:
+
+- **Covered columns, re-derived from the SQL, not hand-typed**:
+  `fiscal_period, flow_type, direction, counterparty_id, amount_usd,
+  currency, source_filing, confidence` — parsed straight out of
+  `_TTM_UPSERT_SQL`'s `string_agg` concatenation expression and asserted
+  equal to the documented set
+  (`test_fingerprint_concatenation_covers_exactly_the_documented_columns`).
+- **Every column the whole TTM statement reads** is asserted to be either
+  in that fingerprinted set or on a short, justified allow-list —
+  `actor_id` (the GROUP BY key, not per-row content), `period_type` (a
+  WHERE-clause constant within this computation, not a varying value),
+  `id` and `as_of` (read only as the LAST two `ROW_NUMBER()` tie-breaks,
+  reachable only between rows already forced identical on every
+  fingerprinted column by the `capital_flows_dedup_nullable_cp_key`
+  UNIQUE index from migration 0024 — see the allow-list's inline comment
+  in the test file for the full argument)
+  (`test_every_column_the_ttm_sql_reads_is_covered`). This is the test
+  that fails if a future column addition gets wired into the TTM
+  computation without being fingerprinted — verified by hand: injecting
+  a synthetic extra referenced column makes the assertion fail as
+  expected.
+- **Unsupported case, restated precisely**: identical to what the module
+  docstring already says — a direct `UPDATE` that touches a quarter row's
+  `id` or (hypothetically) some future column outside the eight
+  fingerprinted ones, without changing any of those eight, would not be
+  detected. Not reachable through the one real write path
+  (`_write_rows` always DELETEs + re-INSERTs the full row).
+- **Order-independence**: `test_string_agg_order_by_makes_ties_impossible_given_the_unique_index`
+  is a no-DB structural proof — the `string_agg` `ORDER BY` clause
+  (`fiscal_period, flow_type, direction, counterparty_id, source_filing,
+  confidence`) covers the variable part of the real UNIQUE index
+  (`capital_flows_dedup_nullable_cp_key`: actor_id, fiscal_period,
+  period_type, flow_type, cp_key, source_filing — actor_id/period_type
+  constant within one actor's scan), so no two distinct rows can ever tie
+  on ORDER BY and PostgreSQL cannot concatenate them in an
+  insertion-dependent order.
+  `test_same_rows_different_insertion_order_same_fingerprint` (PG,
+  skips cleanly without a reachable database) proves it for real:
+  identical 4 quarters inserted forward under one actor_id and reversed
+  under another both durably record the same `quarter_fingerprint`.
+
+## Representative-scale timing harness (2026-09-20, THIRD follow-up)
+
+`tests/test_daily_intel_scale_pg.py` (new) — only runs with both
+`GRID_TEST_DB_URL` and `GRID_SCALE_TESTS=1` set (skips cleanly otherwise,
+including against a default local Postgres, since it seeds well over a
+million rows). Seeds ~5,000 synthetic TTM actors x ~60 quarter rows
+(~300k rows), the REAL production ticker universe
+(`analysis.sector_map.SECTOR_MAP`, 1,268 tickers as of 2026-09-20 — close
+to the ~1,500 target and literally what `snapshot_all`'s `_load_universe()`
+reads, so the "snapshot_all end to end" measurement exercises the actual
+production code path) with ~160k annual rows and raw_series price history
+clearing `MIN_PRICE_OBS`, and ~150 announcement rows — all via chunked
+`COPY ... FROM STDIN`, not per-row round trips. It times (a) `compute_ttm`
+first run, (b) steady state, (c) after 50 actors change, (d)
+`fold_announcements`, (e) the batched divergence loaders and
+`snapshot_all` end to end; asserts each against the real budget constants
+imported from `scripts/hermes_operator.py`
+(`DAILY_INTEL_CAPITAL_FLOW_ROLLUPS_BUDGET_S=90`,
+`DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S=60`) and against the DB's own
+120s `statement_timeout` (reproduced on this test's own engine exactly as
+`db.py::get_engine()` sets it); prints `EXPLAIN (ANALYZE, BUFFERS)` for
+the fingerprint aggregate and the TTM window query (scoped to the 50
+changed actors) so a missing index shows up in the coordinator's output.
+
+**Not yet run against a live database** — this worktree has no DB, no
+SSH, and no production access by design (see the scope line at the top of
+this doc), so every number in this section is a query-plan/design
+argument, not a measured one. The coordinator runs it with:
+
+```
+alembic -c alembic.ini -x db_url=$GRID_TEST_DB_URL upgrade head   # applies capital_flow_ttm_state_20260920
+GRID_TEST_DB_URL=postgresql://user:pass@host:5432/disposable_db \
+GRID_SCALE_TESTS=1 DB_PASSWORD=x PYTHONUTF8=1 \
+python -m pytest tests/test_daily_intel_scale_pg.py -q -s
+```
+
+Seeding is expected to take well under the task's 2-3 minute allowance
+(all bulk loads are chunked `COPY`, not per-row inserts) — expect the
+`raw_series` load (~1.5M rows across 1,268 tickers x ~1,155 days) to
+dominate seeding time. No index was added speculatively: the existing
+`idx_capital_flows_actor_period(actor_id, period_type, fiscal_period
+DESC)` (migration 0046) already covers the TTM window query's per-actor
+scan shape, and the fingerprint aggregate's `WHERE period_type='quarter'
+AND amount_usd IS NOT NULL GROUP BY actor_id` has no obviously-missing
+index to propose without first seeing whether PostgreSQL's planner
+actually needs one at this row count — that is exactly what this
+harness's `EXPLAIN (ANALYZE, BUFFERS)` output will show. If the
+coordinator's run comes back slow, the natural next step (per the task
+brief) is an idempotent `CREATE INDEX IF NOT EXISTS` added to
+`migrations/versions/capital_flow_ttm_state_20260920.py`, re-measured
+with the same harness — not a budget increase.
+
+## Deployment effects of #587
+
+Exactly what changes in production if this PR merges and deploys:
+
+- **Migration**: one new file,
+  `migrations/versions/capital_flow_ttm_state_20260920.py` — creates
+  `capital_flows_ttm_state (actor_id TEXT PRIMARY KEY,
+  quarter_fingerprint TEXT, computed_at TIMESTAMPTZ NOT NULL DEFAULT
+  NOW())`, idempotent (`CREATE TABLE IF NOT EXISTS`), plus a
+  conditional `GRANT ALL ... TO grid` (guarded on the `grid` role
+  existing). **No index was added** in this PR — see the scale-harness
+  section above for why (no measured evidence yet that one is needed).
+- **First post-deploy daily period**: `capital_flows_ttm_state` starts
+  empty, so `compute_ttm`'s `changed_actors` CTE treats every actor that
+  has ever had a `period_type='quarter'` row as "never seen before" and
+  performs **one full TTM recompute for every actor** (~5,000 actors at
+  the scale this harness models; production's real actor count is
+  whatever currently has quarter rows — not independently counted in
+  this review-only branch). Expected duration: bounded by the
+  `DAILY_INTEL_CAPITAL_FLOW_ROLLUPS_BUDGET_S=90` budget with the
+  headroom argument in that constant's own comment in
+  `scripts/hermes_operator.py` (16s measured fold_announcements baseline
+  x ~5.6); the scale harness above is what turns that into an actual
+  measured number once the coordinator runs it against the disposable
+  DB.
+- **Every later run**: `compute_ttm` recomputes ONLY actors whose
+  `period_type='quarter'` row content fingerprint differs from what
+  `capital_flows_ttm_state` has stored — a cheap `GROUP BY actor_id`
+  aggregate scan of the quarter table every time (unavoidable — see the
+  module docstring's "Cost, disclosed" section), full TTM window
+  recompute only for the actors that are actually dirty.
+- **`done_late` ledger semantics** (from the earlier follow-up on this
+  same branch, see "Ledger fix" above, unchanged by today's work): a
+  daily-intel task that times out at the wrapper level but then finishes
+  successfully in its orphaned worker thread — same attempt token still
+  current, no newer attempt registered — is now recorded as
+  `daily_intel_task_outcome[name] = "done_late"` and
+  `daily_intel_done[name] = period_iso`, instead of being silently
+  dropped and re-attempted from scratch on every subsequent cycle. The
+  task's `results` payload is still never published downstream. A late
+  FAILURE, or a late success after a genuine newer attempt has already
+  registered, is still rejected exactly as before — only the
+  late-success/no-newer-attempt case changed.
+- **Budget values** (all imported constants in
+  `scripts/hermes_operator.py`, unchanged by today's work, restated
+  here for completeness): `DAILY_INTEL_CAPITAL_FLOW_ROLLUPS_BUDGET_S =
+  90`, `DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S = 60` (same as the
+  shared `DAILY_INTEL_SQL_TASK_BUDGET_S` default, unchanged), DB
+  `statement_timeout` = 120s (`db.py`, unchanged), per-cycle daily-intel
+  wall-time budget `DAILY_INTEL_CYCLE_BUDGET_SECONDS = 480` (unchanged).
+- **What is NOT changed by this PR**: no other daily-intel task's
+  budget, timeout, or scheduling; no task is held back or gated behind
+  this one; `DAILY_INTEL_CYCLE_BUDGET_SECONDS` (480s) is untouched; no
+  statement or wrapper timeout was raised anywhere — the whole point of
+  the fingerprint redesign was to make the existing 90s/60s/120s
+  ceilings sufficient by doing less work per call, not to loosen the
+  ceilings.
+- **Exact production reads/writes of the first run**: reads every
+  `capital_flows` row with `period_type='quarter' AND amount_usd IS NOT
+  NULL` (one sequential/index scan, `GROUP BY actor_id`) plus, for every
+  actor (all of them, since none are in `capital_flows_ttm_state` yet),
+  every one of that actor's `period_type='quarter'` rows again for the
+  window computation (`q_ranked`/`windowed`/`ttm` CTEs). Writes: one row
+  per actor into `capital_flows_ttm_state` (INSERT, since the table
+  starts empty — `ON CONFLICT DO UPDATE` never fires on this first run),
+  and `period_type='ttm', source_filing='ttm_rollup'` rows into
+  `capital_flows` for every actor/flow_type/direction/counterparty
+  combination with a qualifying trailing-4-quarter window (INSERT or
+  `ON CONFLICT DO UPDATE` depending on whether a stale `ttm` row from
+  the old design already exists at that key), plus a `DELETE` of any
+  existing `ttm, source_filing='ttm_rollup'` row whose group no longer
+  qualifies. All of it inside ONE transaction per `compute_ttm()` call
+  (the whole thing is a single parameterized SQL statement — see
+  `_TTM_UPSERT_SQL`'s own comment for why it has to be one statement,
+  not several). `fold_announcements` is unaffected by this migration —
+  it reads/writes `period_type='announcement'`/`'annual'` rows exactly
+  as before.
