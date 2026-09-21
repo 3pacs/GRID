@@ -69,7 +69,11 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-import contracts.emit as contracts_emit
+import importlib
+
+# `contracts/__init__` re-exports the *function* `emit`, so `import contracts.emit as x`
+# binds that function, not the module; resolve the module explicitly.
+contracts_emit = importlib.import_module("contracts.emit")
 import intelligence.fundamental_divergence as fd
 from intelligence.company_financial_rollups import compute_ttm, fold_announcements
 from intelligence.fundamental_divergence import (
