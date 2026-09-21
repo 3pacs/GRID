@@ -9,19 +9,21 @@ entirely in worktree `GRID-fable-wt-packet2a`.
 
 ## Combined head
 
-`12ab556a7ef5d5bcf7a5ed4f0702b93b02415038` — "scripts/score_oracle_trades.py:
-never mutate sys.path when merely imported" (branch tip after coordinator
-round 2; the head at the end of Steps 1-5 proper was
-`9198bb2a6a2cda63a15476b8147367cf5f760b15`, and after round 1 was
-`86fabb3a273b10931522ba9785582684685b577e`).
+`506738bdf451d0215021f9332a5f82ed0103893a` — "scripts/score_oracle_trades.py:
+fix KeyError in main()'s chunk-totals accumulator" (branch tip after
+coordinator round 3; the head at the end of Steps 1-5 proper was
+`9198bb2a6a2cda63a15476b8147367cf5f760b15`, after round 1 was
+`86fabb3a273b10931522ba9785582684685b577e`, and after round 2 was
+`12ab556a7ef5d5bcf7a5ed4f0702b93b02415038`).
 
 ## Recovery head
 
-`c47c56fc7bcce6274ba1ce68c714a0817514b40b` — "scripts/score_oracle_trades.py:
-never mutate sys.path when merely imported" (branch tip after mirroring
-round 2; the original single revert commit was
-`fcfff061e6154748e3dc9c67702ffd3763c7fb5a`, and after round 1 was
-`d9c368715b647c3b0717daddea0330f10b080444`).
+`f418a6bdbec46f9fdbba627f9b03d408ce78baa6` — "scripts/score_oracle_trades.py:
+fix KeyError in main()'s chunk-totals accumulator" (branch tip after
+mirroring round 3; the original single revert commit was
+`fcfff061e6154748e3dc9c67702ffd3763c7fb5a`, after round 1 was
+`d9c368715b647c3b0717daddea0330f10b080444`, and after round 2 was
+`c47c56fc7bcce6274ba1ce68c714a0817514b40b`).
 
 ## Commit provenance
 
@@ -68,6 +70,7 @@ All applied commits carry `-x` provenance (`(cherry picked from commit
 | `86fabb3a273b10931522ba9785582684685b577e` | docs: record the coordinator's PG-proof round 1 findings and fixes |
 | `aa0945f49432802a1696e067873322bca3ff944f` | docs: update handoff heads and provenance tables after round 1 mirroring |
 | `12ab556a7ef5d5bcf7a5ed4f0702b93b02415038` | scripts/score_oracle_trades.py: never mutate sys.path when merely imported (coordinator round 2) |
+| `506738bdf451d0215021f9332a5f82ed0103893a` | scripts/score_oracle_trades.py: fix KeyError in main()'s chunk-totals accumulator (coordinator round 3) |
 
 ### Recovery branch
 
@@ -77,6 +80,7 @@ All applied commits carry `-x` provenance (`(cherry picked from commit
 | `8b1cf9bfe9d1bcc4006577468e205c69ec6c01d6` (cherry-pick -x of `128d413a`) | tests: fix PG dedup-key collisions; robust oracle.* import order; engine-path preservation proof |
 | `d9c368715b647c3b0717daddea0330f10b080444` (cherry-pick -x of `fbce2862`) | scripts/score_oracle_trades.py: import oracle.entry_price_policy before the legacy sys.path insert |
 | `c47c56fc7bcce6274ba1ce68c714a0817514b40b` (cherry-pick -x of `12ab556a`) | scripts/score_oracle_trades.py: never mutate sys.path when merely imported |
+| `f418a6bdbec46f9fdbba627f9b03d408ce78baa6` (cherry-pick -x of `506738bd`) | scripts/score_oracle_trades.py: fix KeyError in main()'s chunk-totals accumulator |
 
 ## Dependency stop: commit `b1d3dd8b` NOT cherry-picked
 
@@ -479,6 +483,65 @@ itself — all resolve under this repo afterward; (3) running the module as
 trying to reach a database) still skips the fallback when the repo is
 already importable. All three verified locally to fail against round 1's
 (partial) fix and pass against this one before landing.
+
+## Coordinator PostgreSQL proof — round 3 finding and fix
+
+Proof run 4 on the round-2 heads (branch A `9fe2c214`, branch B
+`c47c56fc`): module resolution confirmed correct on the stale-path host
+(config/postmortem/script all resolve from the real checkout), the
+focused suites fully green there (124 passed, 2 xfailed), and 4 of 5
+PostgreSQL contract tests passing on both branches. One remaining
+failure, confirmed by the coordinator as **a real defect in the
+candidate, not the environment**:
+`test_preservation_legacy_rows_survive_a_real_scorer_run` →
+`sot.main(["--chunk-size", "500"])` → `KeyError: 'unscorable_entry_price'`
+at `totals[k] += v`.
+
+**Root cause.** `score_one_chunk`'s own counters dict has always carried
+`unscorable_entry_price` (its own belt-and-braces counter — rows its
+`WHERE` should already have excluded). `main()`'s `totals` accumulator was
+seeded without that key, so the first chunk reporting it — with any value,
+since plain `dict[k] += v` raises on an unseen key regardless of whether
+the value is zero — crashed the whole run. This predates this extraction's
+own Step 4 changes (`score_one_chunk` itself was left unmodified, since
+its `SELECT` already excludes legacy/NULL rows — see "Historical-write
+hold" above) but was never exercised end-to-end until the coordinator's
+real-scorer-path PostgreSQL proof; `score_one_chunk`'s own fixture tests
+call it directly and never exercise `main()`'s accumulation loop.
+
+**Fix** (commit `506738bd`, mirrored onto the recovery branch as
+`f418a6bd`): `totals` now seeds `unscorable_entry_price: 0` explicitly
+(documents every key the chunk loop is known to report today), and the
+accumulation itself changed from `totals[k] += v` to
+`totals[k] = totals.get(k, 0) + v` — generically robust against any future
+counter key `score_one_chunk`'s dict grows, not just this one.
+
+New test `tests/test_score_oracle_trades_totals_accumulator.py`: runs
+`main()` genuinely end-to-end. Real Postgres-flavoured SQL
+(`created_at::date`, etc.) means SQLite cannot stand in the way it does in
+`tests/test_oracle_null_readers.py`, so the DB is a small fake that
+inspects the SQL text and returns canned results — the same pattern
+`tests/test_oracle_publish_entry_price.py`'s `_Engine`/`_Conn`/`_Result`
+already use for this module's Postgres-flavoured queries. `score_one_chunk`
+itself is replaced with a fake returning every counter key it can produce,
+plus a hypothetical future one, so a regression back to `totals[k] += v`
+fails loudly without needing a specific DB row shape to trigger the real
+code path that produces `unscorable_entry_price`. Verified locally to fail
+against the pre-fix accumulator (reproduced the exact `KeyError`) and pass
+against this one, before landing.
+
+**CI note, reported honestly per the coordinator's instruction rather than
+silently rerun:** the first attempt of round-2's GRID Tests run
+(`35581869262`, branch A) failed only `Frontend Build`'s `Unit tests
+(vitest)` step, in `src/__tests__/correlationMatrix.test.jsx` (a
+`waitFor(() => cells.length > 0)` timing assertion) — a file this
+extraction never touches (confirmed: `git diff --stat` between the
+previous and that push shows only `scripts/score_oracle_trades.py`,
+`tests/test_score_oracle_trades_stale_repo_shadow.py`, and the handoff
+doc). Backend Tests and Lint passed on that same attempt. Re-running just
+the failed job (`gh run rerun <id> --failed`) passed on the second
+attempt, consistent with a known pre-existing flake rather than anything
+this extraction introduced.
 
 ## Recovery tree (Step 6)
 
