@@ -482,11 +482,21 @@ def test_capacity_exceeded_falls_back_honestly_without_waiting(monkeypatch):
 
 
 def test_orphaned_compute_always_releases_db_and_duckdb_via_context_managers():
-    """Static guard: every engine checkout in the compute path is a `with` block, so it releases on any exit path
-    (normal return, an internal exception, or -- the case this PR adds -- the caller having already timed out and
-    stopped waiting). There is no `engine.connect()`/`engine.begin()` call in this file that is not immediately a
-    context manager, and DuckDB's connection is closed in a `finally`. This guards against a future edit
-    reintroducing an un-released checkout in the very code path this PR made reachable after a caller gives up.
+    """Static guard: every engine checkout in the compute path is inside a `with` block, so it releases whenever
+    the *worker's own call* returns or raises -- a normal return or an internal exception.
+
+    This is a claim about the worker only. The caller's request timeout
+    (GOLD_COMPACT_BUDGET_SECONDS via `future.result(timeout=...)`) is a
+    separate thread giving up on waiting; it does not run, signal, cancel,
+    or otherwise touch the worker in any way, and is therefore NOT one of
+    the exit paths this guards. A worker that is single-flighted after its
+    original caller already timed out releases its connection on exactly
+    the same schedule it always would have -- when its own blocking call
+    returns. There is no `engine.connect()`/`engine.begin()` call in this
+    file that is not immediately a context manager, and DuckDB's connection
+    is closed in a `finally`. This guards against a future edit
+    reintroducing an un-released checkout in the orphaned-worker code path
+    this PR made reachable.
     """
     import re
     from pathlib import Path as _Path
@@ -508,11 +518,15 @@ def test_orphaned_compute_always_releases_db_and_duckdb_via_context_managers():
     workbook_src = workbook_src[: workbook_src.index("\n\n\ndef ")]
     assert "finally:" in workbook_src and "conn.close()" in workbook_src
 
-    # Honesty about what this does NOT prove: these are process-level
-    # release guarantees (the `with`/`finally` blocks always run once the
-    # underlying call returns, whether it returns a value or raises). They
-    # do not by themselves bound how long a single blocked network call can
-    # hold the checkout before returning -- that bound is the DB's own
-    # statement/connection timeout (already present in production; see the
-    # preserved "canceling statement due to statement timeout" log lines),
-    # not something this PR adds or changes.
+    # Honesty about what this static check does NOT prove: it is a
+    # structural claim (every checkout site is guarded), not a runtime
+    # demonstration of prompt cancellation. It says nothing about *how long*
+    # a currently-blocked call holds its connection -- context managers and
+    # `finally` blocks only run once the call they wrap returns or raises;
+    # they do not interrupt a call that is still in progress, and this
+    # codebase has no mechanism that does. The actual bound on a stuck call
+    # is the DB's own statement/connection timeout (already present in
+    # production; see the preserved "canceling statement due to statement
+    # timeout" log lines) -- not this test, not `with`, and not
+    # GOLD_COMPACT_BUDGET_SECONDS. That dependency predates this PR and is
+    # unchanged by it.

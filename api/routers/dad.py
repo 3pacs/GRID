@@ -70,6 +70,23 @@ GOLD_COMPACT_BUDGET_SECONDS = float(os.getenv("GRID_DAD_GOLD_BUDGET_SECONDS", "8
 # pressure that makes them slow in the first place (see
 # api.main:_sync_deferred_startup and the sector-flow-warm/spider-graph-warmer
 # threads in the preserved smoke logs).
+#
+# PER-PROCESS, NOT DEPLOYMENT-WIDE: this executor (and GOLD_COMPACT_MAX_INFLIGHT
+# below) is module-level state inside one Python process. If grid-api ever
+# runs as more than one OS process (uvicorn/gunicorn `--workers N`, multiple
+# systemd instances, etc.), each process gets its own independent executor
+# and in-flight table -- the real ceiling on simultaneous cold computes
+# across the whole deployment is then (this cap) x (process count), not
+# this cap alone. As checked against the live unit at
+# server_setup/grid-api.service (`ExecStart=... uvicorn api.main:app --host
+# 0.0.0.0 --port 8000`, no `--workers` flag, `Type=simple`) on 2026-09-21,
+# grid-api runs as a single process, so today this cap *is* the
+# deployment-wide ceiling -- but that is a fact about the current systemd
+# unit, not a guarantee this code enforces. (Note: docs/deployment.md has a
+# stale example unit showing `--workers 2` that does not match the actual
+# installed server_setup/grid-api.service; don't use that doc as the source
+# of truth for this.) If the process count ever changes, these two
+# constants must be re-derived as effective_cap = constant x worker_count.
 _GOLD_COMPACT_EXECUTOR_WORKERS = int(os.getenv("GRID_DAD_GOLD_EXECUTOR_WORKERS", "4"))
 _GOLD_COMPACT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=_GOLD_COMPACT_EXECUTOR_WORKERS,
@@ -77,15 +94,16 @@ _GOLD_COMPACT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
 )
 
 # Caps the number of *distinct* (ticker, refresh_finviz) computes allowed to
-# be queued-or-running at once. max_workers alone only bounds concurrency
-# (threads actually executing); ThreadPoolExecutor's internal work queue is
-# unbounded, so without this cap a burst of many different cold tickers
-# (not repeats of the same one -- single-flight above already covers that
-# case) could queue an ever-growing backlog of orphaned computes behind the
-# fixed-size executor, each still eventually opening a DuckDB handle and ~5
-# Postgres connections once it gets a worker slot, long after its original
-# caller gave up. Once this cap is hit, a new ticker's cold request is
-# refused a background compute outright and goes straight to the
+# be queued-or-running at once, per process (see the per-process note
+# above). max_workers alone only bounds concurrency (threads actually
+# executing); ThreadPoolExecutor's internal work queue is unbounded, so
+# without this cap a burst of many different cold tickers (not repeats of
+# the same one -- single-flight above already covers that case) could queue
+# an ever-growing backlog of orphaned computes behind the fixed-size
+# executor, each still eventually opening a DuckDB handle and ~5 Postgres
+# connections once it gets a worker slot, long after its original caller
+# gave up. Once this cap is hit, a new ticker's cold request is refused a
+# background compute outright and goes straight to the
 # stale-cache-or-honest-unavailable fallback -- see
 # _get_or_start_gold_compact / _build_compact_dad_response.
 GOLD_COMPACT_MAX_INFLIGHT = int(
@@ -2020,13 +2038,22 @@ def _build_compact_dad_response(ticker: str, *, refresh_finviz: bool = False, us
     stale (see _mark_stale_response), otherwise an explicit "unavailable"
     payload -- never a fabricated value and never an unbounded wait.
 
-    The budget only ends *this request's wait*, not the compute itself: on
-    timeout the submitted compute keeps running in _GOLD_COMPACT_EXECUTOR
-    (still single-flight-owned until it actually exits -- see
-    _get_or_start_gold_compact's `finally`), bounded by the DB/DuckDB's own
-    statement/connection timeouts (already present in production; not
-    modified here), and still writes the cache so the next request gets a
-    fresh or stale hit instead of repeating the same cold work.
+    The budget only ends *this request's wait*, not the compute itself.
+    `future.result(timeout=...)` returning does not touch the worker: it
+    keeps running in _GOLD_COMPACT_EXECUTOR, still holding whatever DB
+    connection or DuckDB handle it currently has checked out (still
+    single-flight-owned until it actually exits -- see
+    _get_or_start_gold_compact's `finally`). There is no cancellation here:
+    nothing about our timeout firing releases, interrupts, or closes that
+    connection. Release happens only when the worker's own blocking call
+    returns or raises and its `with`/`finally` block runs -- which is
+    bounded by the DB/DuckDB's own statement/connection timeouts (already
+    present in production; not modified here), not by GOLD_COMPACT_BUDGET_SECONDS.
+    If that call never returns, the connection is held for as long as the
+    DB-side timeout allows, regardless of how many callers have already
+    given up. Once the worker does unwind, it still writes the cache so the
+    next request gets a fresh or stale hit instead of repeating the same
+    cold work.
     """
     engine = get_db_engine()
     db_path = _research_db_path()
