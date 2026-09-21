@@ -170,6 +170,81 @@ def _fetch_row(pg_engine: Engine, pred_id: str) -> dict | None:
 # ── 1. Migration produces a genuinely nullable schema ──────────────────────
 
 
+def test_upgrade_runs_for_real_with_finite_timeouts_scoped_to_its_own_transaction(
+    pg_engine: Engine,
+):
+    """The real ``upgrade()`` -- not a hand-replicated copy of its SQL, the
+    actual function -- must run cleanly with its new ``SET LOCAL
+    lock_timeout``/``statement_timeout`` guards, and those guards must never
+    outlive the migration's own transaction. Idempotent (DROP NOT NULL /
+    ADD COLUMN IF NOT EXISTS never fails on an already-migrated table), so
+    this is safe to run for real against the shared disposable database.
+    """
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    migration = importlib.import_module(_MIGRATION_MODULE)
+
+    with pg_engine.connect() as baseline_conn:
+        baseline_lock_timeout = baseline_conn.execute(
+            text("SHOW lock_timeout"),
+        ).scalar()
+        baseline_statement_timeout = baseline_conn.execute(
+            text("SHOW statement_timeout"),
+        ).scalar()
+
+    conn = pg_engine.connect()
+    trans = conn.begin()
+    try:
+        ctx = MigrationContext.configure(conn)
+        ops = Operations(ctx)
+        real_op = migration.op
+        migration.op = ops
+        try:
+            migration.upgrade()
+        finally:
+            migration.op = real_op
+
+        # Still in effect INSIDE the transaction that ran the migration.
+        assert conn.execute(text("SHOW lock_timeout")).scalar() == (
+            migration._LOCK_TIMEOUT
+        )
+        assert conn.execute(text("SHOW statement_timeout")).scalar() == (
+            migration._STATEMENT_TIMEOUT
+        )
+        trans.commit()
+    except Exception:
+        trans.rollback()
+        raise
+    finally:
+        conn.close()
+
+    # A fresh connection/session must see the ordinary baseline, never the
+    # migration's SET LOCAL values -- proves the scoping, not just that the
+    # statements ran without raising.
+    with pg_engine.connect() as after_conn:
+        assert after_conn.execute(text("SHOW lock_timeout")).scalar() == (
+            baseline_lock_timeout
+        )
+        assert after_conn.execute(text("SHOW statement_timeout")).scalar() == (
+            baseline_statement_timeout
+        )
+
+    # The migration's real effect still happened.
+    with pg_engine.connect() as verify_conn:
+        cols = verify_conn.execute(
+            text(
+                "SELECT column_name, is_nullable FROM information_schema.columns "
+                "WHERE table_name = 'oracle_predictions' "
+                "AND column_name IN ('entry_price', 'confidence', 'null_write_policy')",
+            ),
+        ).fetchall()
+    by_col = {r[0]: r[1] for r in cols}
+    assert by_col["entry_price"] == "YES"
+    assert by_col["confidence"] == "YES"
+    assert "null_write_policy" in by_col
+
+
 def test_migration_allows_null_entry_price_and_confidence_after_upgrade(
     pg_engine: Engine, test_ids: list[str],
 ):

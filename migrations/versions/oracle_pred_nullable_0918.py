@@ -27,7 +27,17 @@ a fact, not a defect).
 
 Locking: ALTER COLUMN ... DROP NOT NULL is a catalog-only change on PostgreSQL
 14 but takes ACCESS EXCLUSIVE on ``oracle_predictions`` for its duration; it
-runs once at deploy time.
+runs once at deploy time. Every statement here (upgrade and downgrade) is
+preceded by ``SET LOCAL lock_timeout``/``SET LOCAL statement_timeout``,
+scoped to this migration's own transaction only (``LOCAL`` never survives
+COMMIT/ROLLBACK and never touches any other session, including grid-api's
+and grid-hermes's own connections) -- explicit, finite bounds instead of an
+unbounded wait: if something else is holding a conflicting lock on
+``oracle_predictions`` when this runs, the migration fails fast and loudly
+with a lock-timeout error rather than blocking indefinitely (and blocking
+every other statement queued behind it) or silently taking however long it
+takes. The DDL itself is expected to complete in well under either bound
+once the lock is granted (no table rewrite, no row-count-dependent work).
 
 ``null_write_policy``: the NOT NULL relax above makes a NULL possible, but a
 NULL alone does not say *why* -- that proof lives in this revision's history,
@@ -59,8 +69,26 @@ log = logging.getLogger("alembic.runtime.migration")
 
 _COLUMNS = ("entry_price", "confidence")
 
+# SET LOCAL: scoped to this migration's own transaction only, never any
+# other session. lock_timeout is deliberately short -- this is a deploy-time
+# DDL statement, not a query; if it can't acquire ACCESS EXCLUSIVE promptly,
+# failing fast (and letting whatever holds the conflicting lock finish
+# undisturbed) is safer than an unbounded wait that also blocks every other
+# statement queued behind this one. statement_timeout is generous because
+# the statements themselves are catalog-only and expected sub-second; it
+# exists as a hard safety net, not because normal execution is expected to
+# approach it.
+_LOCK_TIMEOUT = "5s"
+_STATEMENT_TIMEOUT = "30s"
+
+
+def _set_finite_timeouts() -> None:
+    op.execute(f"SET LOCAL lock_timeout = '{_LOCK_TIMEOUT}'")
+    op.execute(f"SET LOCAL statement_timeout = '{_STATEMENT_TIMEOUT}'")
+
 
 def upgrade() -> None:
+    _set_finite_timeouts()
     for col in _COLUMNS:
         op.execute(
             f"ALTER TABLE IF EXISTS oracle_predictions ALTER COLUMN {col} DROP NOT NULL"
@@ -81,6 +109,7 @@ def downgrade() -> None:
     ).scalar()
     if not exists:
         return
+    _set_finite_timeouts()
     # null_write_policy is never dropped here -- see module docstring: it is
     # the audit trail this revision creates, not a constraint to reverse.
     for col in _COLUMNS:
