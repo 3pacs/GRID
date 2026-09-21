@@ -111,10 +111,26 @@ def test_every_subsystem_unavailable_when_nothing_is_measurable(monkeypatch):
     assert len(result["errors"]) == 6
     assert "unavailable" in result["risk_narrative"].lower()
 
-    # The retired literals must not appear anywhere in the payload.
-    flat = repr(result)
-    for literal in ("20.0", "400", "'ig_spread': 100", "0.3", "'avg_cross_correlation': 0.5", "'overall_risk_score': 0.5"):
-        assert literal not in flat, literal
+    # The retired default literals (VIX 20.0, HY 400bp, IG 100bp, TED
+    # 0.30, avg_cross_correlation 0.5, overall 0.5) must never surface as
+    # real subsystem readings when nothing was measurable. Assert this on
+    # the actual fields rather than via a repr(result) substring search:
+    # a substring check is fragile because any timestamp, id, or unrelated
+    # float elsewhere in the payload can coincidentally contain "0.3" or
+    # "400" -- e.g. generated_at's isoformat microseconds -- which is what
+    # flaked CI run 35565266397 (AssertionError: 0.3) on an otherwise
+    # green tree.
+    assert result["volatility_risk"].get("vix") is None
+    assert result["volatility_risk"].get("vix") != 20.0
+    assert result["credit_risk"].get("hy_spread") is None
+    assert result["credit_risk"].get("hy_spread") != 400
+    assert result["credit_risk"].get("ig_spread") is None
+    assert result["credit_risk"].get("ig_spread") != 100
+    assert result["credit_risk"].get("ted_spread") is None
+    assert result["credit_risk"].get("ted_spread") != 0.3
+    assert result["correlation_risk"].get("avg_cross_correlation") is None
+    assert result["correlation_risk"].get("avg_cross_correlation") != 0.5
+    assert result["overall_risk_score"] != 0.5
 
 
 def test_measured_subsystems_carry_real_numbers_and_overall_averages_only_them(monkeypatch):
