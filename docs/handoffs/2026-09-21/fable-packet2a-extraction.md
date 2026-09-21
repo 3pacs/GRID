@@ -9,13 +9,17 @@ entirely in worktree `GRID-fable-wt-packet2a`.
 
 ## Combined head
 
-`9198bb2a6a2cda63a15476b8147367cf5f760b15` — "tests: pin the historical-write
-hold; mark the b1d3dd8b-dependent tests xfail"
+`86fabb3a273b10931522ba9785582684685b577e` — "docs: record the coordinator's
+PG-proof round 1 findings and fixes" (branch tip after the round-1 harness/
+production fixes below; the head at the end of Steps 1-5 proper was
+`9198bb2a6a2cda63a15476b8147367cf5f760b15`).
 
 ## Recovery head
 
-`fcfff061e6154748e3dc9c67702ffd3763c7fb5a` — "recovery: revert
-oracle/publish.py's writer to pre-#544 literal defaults"
+`d9c368715b647c3b0717daddea0330f10b080444` — "scripts/score_oracle_trades.py:
+import oracle.entry_price_policy before the legacy sys.path insert" (branch
+tip after mirroring the round-1 fixes; the original single revert commit
+was `fcfff061e6154748e3dc9c67702ffd3763c7fb5a`).
 
 ## Commit provenance
 
@@ -56,12 +60,18 @@ All applied commits carry `-x` provenance (`(cherry picked from commit
 | `96f573e51b2e6f71995db593e2dcf29c334a83d5` | migrations: re-parent oracle_pred_nullable_0918 onto capital_flow_ttm_state_20260920 (Step 3) |
 | `830d78028387c60db9e5fe1eebf85a58752e6979` | oracle: enforce the historical-write hold on entry_price/confidence in code (Step 4) |
 | `9198bb2a6a2cda63a15476b8147367cf5f760b15` | tests: pin the historical-write hold; mark the b1d3dd8b-dependent tests xfail (Step 5) |
+| `02b30a227f5a1f7f9db9012f6a571f6fdccb27f6` | docs: packet 2a extraction handoff (Step 7, this doc's first version) |
+| `128d413a5c321adba1885302ff9411d1ae153560` | tests: fix PG dedup-key collisions; robust oracle.* import order; engine-path preservation proof (coordinator round 1) |
+| `fbce2862bd8e866f7724bf032d4d2ba4200286f2` | scripts/score_oracle_trades.py: import oracle.entry_price_policy before the legacy sys.path insert (coordinator round 1) |
+| `86fabb3a273b10931522ba9785582684685b577e` | docs: record the coordinator's PG-proof round 1 findings and fixes |
 
 ### Recovery branch
 
 | SHA | Subject |
 |---|---|
 | `fcfff061e6154748e3dc9c67702ffd3763c7fb5a` | recovery: revert oracle/publish.py's writer to pre-#544 literal defaults (Step 6) |
+| `8b1cf9bfe9d1bcc4006577468e205c69ec6c01d6` (cherry-pick -x of `128d413a`) | tests: fix PG dedup-key collisions; robust oracle.* import order; engine-path preservation proof |
+| `d9c368715b647c3b0717daddea0330f10b080444` (cherry-pick -x of `fbce2862`) | scripts/score_oracle_trades.py: import oracle.entry_price_policy before the legacy sys.path insert |
 
 ## Dependency stop: commit `b1d3dd8b` NOT cherry-picked
 
