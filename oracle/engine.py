@@ -1840,20 +1840,28 @@ class OracleEngine:
             "partials": 0,
             "total": 0,
             # Rows closed as 'no_data' because their entry price was NULL
-            # (a new-policy row nothing measured). Reported, never folded
-            # into misses and never left out of the tally altogether.
+            # AND the row is stamped as written under the honest-NULL policy
+            # (null_write_policy == NULL_WRITE_POLICY). Reported, never
+            # folded into misses and never left out of the tally altogether.
             "unscorable_entry_price": 0,
             # Legacy pending rows (non-null 0/negative entry_price, written
             # before the column was nullable) that the historical-write
             # hold left untouched this run.
             "held_legacy_entry_price": 0,
+            # entry_price IS NULL but null_write_policy does NOT prove it --
+            # unmarked provenance. The nullable schema alone does not
+            # establish this is an honest-policy NULL (item (a)'s whole
+            # point); held rather than closed, same as a legacy row. Should
+            # be structurally impossible on today's writers (both stamp
+            # every INSERT) -- a nonzero count here is itself a finding.
+            "held_unmarked_null_entry_price": 0,
         }
 
         with self.engine.begin() as conn:
             # Get pending predictions past expiry
             rows = conn.execute(text("""
                 SELECT id, ticker, direction, target_price, entry_price, expiry,
-                       confidence, expected_move_pct, model_name
+                       confidence, expected_move_pct, model_name, null_write_policy
                 FROM oracle_predictions
                 WHERE verdict = 'pending' AND expiry <= :today
                 ORDER BY expiry
@@ -1862,7 +1870,7 @@ class OracleEngine:
             # no_data rows are already final - exclude from scoring loop
             rows = [r for r in rows if r[2] != "NONE"]
             for r in rows:
-                pred_id, ticker, direction, target, entry, expiry, conf, expected, model = r
+                pred_id, ticker, direction, target, entry, expiry, conf, expected, model, policy = r
 
                 # An entry price that cannot be divided by is settled here,
                 # BEFORE the division below. NULL is not a zero entry and a
@@ -1876,14 +1884,17 @@ class OracleEngine:
                 # new publish path writes NULL, never 0, when nothing was
                 # measured. Historical rescoring/repair is on hold, so that
                 # row is left exactly as it is: not updated, closed, rescored
-                # or re-labelled. Only a NULL entry_price (a new-policy row)
-                # is closed to 'no_data' here, carrying the reason it could
-                # not be scored so it stops sitting 'pending' forever and the
-                # reason survives in score_notes. Same contract and same
-                # strings as scripts/score_oracle_trades.py.
+                # or re-labelled. Only a NULL entry_price whose
+                # null_write_policy PROVES it was written under the honest
+                # policy (item (a)'s provenance boundary -- a bare NULL
+                # entry_price is not enough on its own) is closed to
+                # 'no_data' here, carrying the reason it could not be scored
+                # so it stops sitting 'pending' forever and the reason
+                # survives in score_notes. Same contract and same strings as
+                # scripts/score_oracle_trades.py.
                 entry_note = entry_price_score_note(entry)
                 if entry_note is not None:
-                    if entry is None:
+                    if entry is None and policy == NULL_WRITE_POLICY:
                         conn.execute(text("""
                             UPDATE oracle_predictions
                             SET verdict = 'no_data',
@@ -1892,6 +1903,16 @@ class OracleEngine:
                             WHERE id = :id
                         """), {"notes": entry_note, "id": pred_id})
                         results["unscorable_entry_price"] += 1
+                    elif entry is None:
+                        log.warning(
+                            "score_expired_predictions: pending row {id} has "
+                            "entry_price IS NULL but null_write_policy={p!r} "
+                            "does not prove the honest-NULL policy -- held, "
+                            "not closed (should be structurally impossible; "
+                            "investigate the writer that produced this row)",
+                            id=pred_id, p=policy,
+                        )
+                        results["held_unmarked_null_entry_price"] += 1
                     else:
                         log.debug(
                             "score_expired_predictions: legacy pending row "

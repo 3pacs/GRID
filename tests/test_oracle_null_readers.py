@@ -44,6 +44,7 @@ from sqlalchemy import create_engine, event, text
 import oracle.engine  # noqa: F401
 from oracle.calibration import compute_calibration
 from oracle.entry_price_policy import (
+    NULL_WRITE_POLICY,
     SCORE_NOTE_ENTRY_NULL,
     SCORE_NOTE_ENTRY_ZERO,
 )
@@ -87,7 +88,8 @@ CREATE TABLE oracle_predictions (
     scored_at TEXT,
     score_notes TEXT,
     dedup_keep BOOLEAN NOT NULL DEFAULT 1,
-    horizon_days INTEGER
+    horizon_days INTEGER,
+    null_write_policy TEXT
 )
 """
 
@@ -520,6 +522,7 @@ class TestEngineScoringLoopEntryPrice:
             _insert(
                 conn, id="null-entry", ticker="AAA", direction="CALL",
                 entry_price=None, confidence=0.6, expiry=expiry,
+                null_write_policy=NULL_WRITE_POLICY,
             )
             _insert(
                 conn, id="zero-entry", ticker="BBB", direction="CALL",
@@ -533,12 +536,22 @@ class TestEngineScoringLoopEntryPrice:
                 conn, id="normal", ticker="CCC", direction="CALL",
                 entry_price=100.0, confidence=0.6, expiry=expiry,
             )
+            # entry_price IS NULL but UNMARKED (null_write_policy left at
+            # its column default, NULL) — provenance not proved. Item (a)'s
+            # whole point: a bare NULL entry_price never authorises the
+            # close-out on its own, only the stamp does. Must be held like
+            # a legacy row, not closed.
+            _insert(
+                conn, id="unmarked-null-entry", ticker="EEE", direction="CALL",
+                entry_price=None, confidence=0.6, expiry=expiry,
+            )
         return today
 
     def test_unusable_entries_are_closed_or_held_by_the_hold_policy(
         self, engine,
     ):
-        """NULL is closed with a reason; a non-null invalid entry is held.
+        """A MARKED NULL is closed with a reason; a non-null invalid entry,
+        and an UNMARKED NULL, are held.
 
         HISTORICAL-WRITE HOLD: ``zero-entry`` and ``negative-entry`` are
         legacy rows — a non-null invalid ``entry_price`` can only exist from
@@ -546,13 +559,20 @@ class TestEngineScoringLoopEntryPrice:
         the new publish path writes NULL, never 0/negative, when nothing was
         measured. Historical rescoring/repair of those rows is on hold: this
         loop must never update, close, rescore or re-label them. Only
-        ``null-entry`` (a new-policy row) is closed to 'no_data'.
+        ``null-entry`` (entry_price IS NULL AND null_write_policy proves the
+        honest-NULL policy) is closed to 'no_data'. ``unmarked-null-entry``
+        has entry_price IS NULL too, but no stamp — held exactly like a
+        legacy row, proving the nullable schema alone never authorises the
+        close-out (item (a) is a check the scorer runs, not just a column).
         """
         from oracle.entry_price_policy import SCORE_NOTE_ENTRY_NULL
 
         self._seed(engine)
         oe = self._engine_under_test(
-            engine, {"AAA": 110.0, "BBB": 110.0, "CCC": 110.0, "DDD": 110.0},
+            engine, {
+                "AAA": 110.0, "BBB": 110.0, "CCC": 110.0, "DDD": 110.0,
+                "EEE": 110.0,
+            },
         )
 
         # No TypeError on the NULL, no ZeroDivisionError on the measured 0.
@@ -567,8 +587,8 @@ class TestEngineScoringLoopEntryPrice:
                 )).fetchall()
             }
 
-        # The new-policy NULL row is closed — not left 'pending' forever, and
-        # not folded into the miss column.
+        # The MARKED new-policy NULL row is closed — not left 'pending'
+        # forever, and not folded into the miss column.
         assert rows["null-entry"][0] == "no_data"
         assert rows["null-entry"][1] == SCORE_NOTE_ENTRY_NULL
         assert rows["null-entry"][2] is None
@@ -578,9 +598,14 @@ class TestEngineScoringLoopEntryPrice:
         assert rows["zero-entry"] == ("pending", None, None)
         assert rows["negative-entry"] == ("pending", None, None)
 
+        # The UNMARKED NULL row is held the same way — entry_price IS NULL
+        # alone is not proof of the honest-NULL policy.
+        assert rows["unmarked-null-entry"] == ("pending", None, None)
+
         # Reported through separate counters, not folded together.
         assert results["unscorable_entry_price"] == 1, results
         assert results["held_legacy_entry_price"] == 2, results
+        assert results["held_unmarked_null_entry_price"] == 1, results
         assert results["misses"] == 0, results
 
         # The measured row still scores: (110 - 100) / 100 = +10% on a CALL.

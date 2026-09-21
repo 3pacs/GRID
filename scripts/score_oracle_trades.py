@@ -42,6 +42,7 @@ from sqlalchemy.engine import Engine
 # this import does to sys.path).
 from config import settings
 from oracle.entry_price_policy import (
+    NULL_WRITE_POLICY,
     SCORE_NOTE_ENTRY_NULL,
     entry_price_score_note,
 )
@@ -440,7 +441,8 @@ def main(argv: list[str] | None = None) -> None:
     with engine.begin() as conn:
         # ── Step 0: Get all pending predictions ──
         rows = conn.execute(text("""
-            SELECT id, ticker, direction, entry_price, created_at::date, expiry
+            SELECT id, ticker, direction, entry_price, created_at::date, expiry,
+                   null_write_policy
             FROM oracle_predictions
             WHERE verdict = 'pending'
             ORDER BY created_at
@@ -484,23 +486,41 @@ def main(argv: list[str] | None = None) -> None:
         #     avoid, so it is never backfilled either.
         # This step therefore only counts what it is holding; it writes
         # nothing to oracle_predictions.
+        #
+        # A NULL entry_price is split further by null_write_policy (item
+        # (a)'s provenance boundary): NULL alone does not prove the row was
+        # written under the honest-NULL policy, only the stamp does. An
+        # entry_price IS NULL row whose null_write_policy does NOT match
+        # NULL_WRITE_POLICY is unmarked -- held like a legacy row, not
+        # closed in Step 3.5 below, and should be structurally impossible
+        # today (both writers stamp every INSERT).
         log.info("\n--- STEP 2: Backfill Entry Prices (historical-write hold) ---")
         held_legacy = 0
         held_new_policy = 0
+        held_unmarked_null = 0
 
         for r in rows:
-            pred_id, ticker, direction, entry_price, created_date, expiry = r
+            pred_id, ticker, direction, entry_price, created_date, expiry, null_write_policy = r
 
             if entry_price is not None and entry_price > 0:
                 continue  # Already has a price
 
-            if entry_price is None:
+            if entry_price is None and null_write_policy == NULL_WRITE_POLICY:
                 held_new_policy += 1
+            elif entry_price is None:
+                held_unmarked_null += 1
             else:
                 held_legacy += 1
 
         log.info("  Held (legacy, non-null invalid entry_price): {}", held_legacy)
-        log.info("  Held (new-policy, entry_price IS NULL): {}", held_new_policy)
+        log.info("  Held (new-policy, entry_price IS NULL, stamped): {}", held_new_policy)
+        if held_unmarked_null:
+            log.warning(
+                "  Held (UNMARKED entry_price IS NULL, null_write_policy "
+                "does not prove the honest-NULL policy): {} -- should be "
+                "structurally impossible; investigate the writer",
+                held_unmarked_null,
+            )
 
         # ── Step 3: Fix direction mapping ──
         log.info("\n--- STEP 3: Fix Direction Mapping ---")
@@ -531,18 +551,24 @@ def main(argv: list[str] | None = None) -> None:
         """))
         log.info("  NEUTRAL → no_data: {}", res.rowcount)
 
-        # No entry price measured → no_data. Only entry_price IS NULL is
-        # closed here: a new-policy row where nothing was measured at
-        # publish time, so it would otherwise sit 'pending' forever, neither
-        # scored nor accounted for. Not repaired — the row is closed and the
-        # note says why.
+        # No entry price measured → no_data. Only entry_price IS NULL AND
+        # null_write_policy proving the honest-NULL policy is closed here: a
+        # new-policy row where nothing was measured at publish time, so it
+        # would otherwise sit 'pending' forever, neither scored nor
+        # accounted for. Not repaired — the row is closed and the note says
+        # why. A bare `entry_price IS NULL` is NOT sufficient on its own
+        # (item (a)'s provenance boundary exists precisely because the
+        # nullable schema alone cannot prove this) -- the stamp is what
+        # proves it.
         #
         # HISTORICAL-WRITE HOLD: a non-null 0/negative entry_price can only
         # be a legacy row written before oracle_pred_nullable_0918 made the
         # column nullable (the new publish path writes NULL, never 0/neg,
         # when nothing was measured). That row is deliberately excluded from
         # this WHERE — historical rescoring/repair is on hold, so it is
-        # never updated, closed, rescored or re-labelled here. It is left
+        # never updated, closed, rescored or re-labelled here. Likewise, an
+        # entry_price IS NULL row whose null_write_policy does not match
+        # NULL_WRITE_POLICY (unmarked provenance) is excluded and stays
         # pending, exactly as it was before this branch.
         res = conn.execute(text("""
             UPDATE oracle_predictions
@@ -551,8 +577,10 @@ def main(argv: list[str] | None = None) -> None:
                 scored_at = NOW()
             WHERE verdict = 'pending'
               AND entry_price IS NULL
+              AND null_write_policy = :policy
         """), {
             "note_null": SCORE_NOTE_ENTRY_NULL,
+            "policy": NULL_WRITE_POLICY,
         })
         log.info("  no usable entry_price → no_data: {}", res.rowcount)
 

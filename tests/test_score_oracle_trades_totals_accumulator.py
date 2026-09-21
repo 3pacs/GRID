@@ -97,7 +97,7 @@ def test_main_accumulates_every_counter_key_score_one_chunk_can_report(monkeypat
     # `rows` list is non-empty (main() calls min()/max() on it before the
     # chunked loop even starts).
     pending_rows = [
-        ("p-1", "AAA", "CALL", 100.0, date(2026, 9, 1), date(2026, 9, 20)),
+        ("p-1", "AAA", "CALL", 100.0, date(2026, 9, 1), date(2026, 9, 20), None),
     ]
     fake_engine = _Engine(pending_rows)
 

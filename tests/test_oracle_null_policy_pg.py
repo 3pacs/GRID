@@ -341,9 +341,15 @@ def test_preservation_legacy_rows_survive_a_real_scorer_run(
     only shape possible before this migration, since the column was NOT
     NULL) must come out of a real scripts/score_oracle_trades.py run
     byte-identical: same status, entry_price, confidence, outcome/score
-    columns. A third, new-policy row (entry_price IS NULL) must be handled
-    per Step 4 -- closed to 'no_data' with an explicit reason, never scored
-    as if the entry were 0.
+    columns. A third, MARKED new-policy row (entry_price IS NULL AND
+    null_write_policy = NULL_WRITE_POLICY) must be handled per Step 4 --
+    closed to 'no_data' with an explicit reason, never scored as if the
+    entry were 0. A fourth, UNMARKED row (entry_price IS NULL but
+    null_write_policy IS NULL -- provenance not proved) must be held
+    exactly like a legacy row: the nullable schema alone never authorises
+    the close-out, only the stamp does (item (a)'s whole point; adding and
+    stamping the column is not enough without the scorer actually checking
+    it -- this proves the check, not just the column).
 
     The scorer's own price lookups are stubbed (no network access); this
     only proves the hold, not price-fetching.
@@ -354,17 +360,19 @@ def test_preservation_legacy_rows_survive_a_real_scorer_run(
     # already expired -> scoreable. oracle_predictions_dedup_unique is a
     # real partial unique index on (ticker, direction, expiry,
     # prediction_type, COALESCE(model_version,''), created_at::date) WHERE
-    # dedup_keep; these three rows share a ticker, direction and
-    # created_at date, so each gets its own expiry day to give it a
-    # distinct natural key -- all still in the past, all still scoreable.
+    # dedup_keep; these four rows share a ticker, direction and created_at
+    # date, so each gets its own expiry day to give it a distinct natural
+    # key -- all still in the past, all still scoreable.
     expiry_a = date.today() - timedelta(days=1)
     expiry_b = date.today() - timedelta(days=2)
     expiry_c = date.today() - timedelta(days=3)
+    expiry_d = date.today() - timedelta(days=4)
 
     legacy_a = _pred_id()
     legacy_b = _pred_id()
     new_policy_null = _pred_id()
-    test_ids.extend([legacy_a, legacy_b, new_policy_null])
+    unmarked_null = _pred_id()
+    test_ids.extend([legacy_a, legacy_b, new_policy_null, unmarked_null])
 
     with pg_engine.begin() as conn:
         _insert_prediction(
@@ -378,11 +386,17 @@ def test_preservation_legacy_rows_survive_a_real_scorer_run(
         _insert_prediction(
             conn, pred_id=new_policy_null, ticker=ticker, entry_price=None,
             confidence=None, verdict="pending", expiry=expiry_c,
+            null_write_policy=NULL_WRITE_POLICY,
+        )
+        _insert_prediction(
+            conn, pred_id=unmarked_null, ticker=ticker, entry_price=None,
+            confidence=None, verdict="pending", expiry=expiry_d,
+            # null_write_policy defaults to None -- unmarked on purpose.
         )
 
     before = {
         pid: _fetch_row(pg_engine, pid)
-        for pid in (legacy_a, legacy_b, new_policy_null)
+        for pid in (legacy_a, legacy_b, new_policy_null, unmarked_null)
     }
     for pid, row in before.items():
         assert row is not None, pid
@@ -396,7 +410,7 @@ def test_preservation_legacy_rows_survive_a_real_scorer_run(
         return {
             ticker: {
                 expiry_a: 999.0, expiry_b: 999.0, expiry_c: 999.0,
-                date.today(): 999.0,
+                expiry_d: 999.0, date.today(): 999.0,
             },
         }
 
@@ -407,7 +421,7 @@ def test_preservation_legacy_rows_survive_a_real_scorer_run(
 
     after = {
         pid: _fetch_row(pg_engine, pid)
-        for pid in (legacy_a, legacy_b, new_policy_null)
+        for pid in (legacy_a, legacy_b, new_policy_null, unmarked_null)
     }
 
     # PRESERVATION: the legacy rows are byte-identical. Historical-write
@@ -417,12 +431,19 @@ def test_preservation_legacy_rows_survive_a_real_scorer_run(
     assert after[legacy_a]["verdict"] == "pending"
     assert after[legacy_b]["verdict"] == "pending"
 
-    # The new-policy NULL row is closed honestly -- never scored as if the
-    # entry were 0, and the reason is the shared, named one.
+    # The MARKED new-policy NULL row is closed honestly -- never scored as
+    # if the entry were 0, and the reason is the shared, named one.
     assert after[new_policy_null]["verdict"] == "no_data"
     assert after[new_policy_null]["score_notes"] == SCORE_NOTE_ENTRY_NULL
     assert after[new_policy_null]["entry_price"] is None
     assert after[new_policy_null]["pnl_pct"] is None
+
+    # The UNMARKED NULL row is held byte-identical, exactly like a legacy
+    # row -- entry_price IS NULL alone never authorises the close-out.
+    assert after[unmarked_null] == before[unmarked_null], (
+        unmarked_null, before[unmarked_null], after[unmarked_null],
+    )
+    assert after[unmarked_null]["verdict"] == "pending"
 
 
 # ── 4. Historical-write hold on the AUTOMATIC path (Hermes) ────────────────
@@ -440,8 +461,12 @@ def test_preservation_legacy_rows_survive_engine_score_expired_predictions(
     directly (``hermes_operator.py:3964``: ``from oracle.engine import
     OracleEngine``). The historical-write hold has to hold there too: two
     legacy pending rows (entry_price=0.0, non-null confidence) survive
-    byte-identical; a new-policy NULL-entry row is closed to 'no_data' with
-    the shared reason.
+    byte-identical; a MARKED new-policy NULL-entry row (null_write_policy =
+    NULL_WRITE_POLICY) is closed to 'no_data' with the shared reason; an
+    UNMARKED NULL-entry row (null_write_policy IS NULL -- provenance not
+    proved) is held byte-identical, exactly like a legacy row -- proving
+    the engine path also checks the stamp and not just entry_price's
+    nullness.
     """
     from oracle.engine import OracleEngine
 
@@ -451,11 +476,13 @@ def test_preservation_legacy_rows_survive_engine_score_expired_predictions(
     expiry_a = date.today() - timedelta(days=1)
     expiry_b = date.today() - timedelta(days=2)
     expiry_c = date.today() - timedelta(days=3)
+    expiry_d = date.today() - timedelta(days=4)
 
     legacy_a = _pred_id()
     legacy_b = _pred_id()
     new_policy_null = _pred_id()
-    test_ids.extend([legacy_a, legacy_b, new_policy_null])
+    unmarked_null = _pred_id()
+    test_ids.extend([legacy_a, legacy_b, new_policy_null, unmarked_null])
 
     with pg_engine.begin() as conn:
         _insert_prediction(
@@ -469,11 +496,17 @@ def test_preservation_legacy_rows_survive_engine_score_expired_predictions(
         _insert_prediction(
             conn, pred_id=new_policy_null, ticker=ticker, entry_price=None,
             confidence=None, verdict="pending", expiry=expiry_c,
+            null_write_policy=NULL_WRITE_POLICY,
+        )
+        _insert_prediction(
+            conn, pred_id=unmarked_null, ticker=ticker, entry_price=None,
+            confidence=None, verdict="pending", expiry=expiry_d,
+            # null_write_policy defaults to None -- unmarked on purpose.
         )
 
     before = {
         pid: _fetch_row(pg_engine, pid)
-        for pid in (legacy_a, legacy_b, new_policy_null)
+        for pid in (legacy_a, legacy_b, new_policy_null, unmarked_null)
     }
     for pid, row in before.items():
         assert row is not None, pid
@@ -495,7 +528,7 @@ def test_preservation_legacy_rows_survive_engine_score_expired_predictions(
 
     after = {
         pid: _fetch_row(pg_engine, pid)
-        for pid in (legacy_a, legacy_b, new_policy_null)
+        for pid in (legacy_a, legacy_b, new_policy_null, unmarked_null)
     }
 
     # PRESERVATION on the automatic path too.
@@ -504,15 +537,25 @@ def test_preservation_legacy_rows_survive_engine_score_expired_predictions(
     assert after[legacy_a]["verdict"] == "pending"
     assert after[legacy_b]["verdict"] == "pending"
 
+    # MARKED new-policy NULL row: closed as intended.
     assert after[new_policy_null]["verdict"] == "no_data"
     assert after[new_policy_null]["score_notes"] == SCORE_NOTE_ENTRY_NULL
     assert after[new_policy_null]["entry_price"] is None
     assert after[new_policy_null]["pnl_pct"] is None
 
-    # This test's own two legacy rows are counted among the held ones, and
-    # its own NULL row among the closed ones -- >= because the loop also
-    # sees every other expired pending row in this shared table.
+    # UNMARKED NULL row: held byte-identical -- entry_price IS NULL alone
+    # never authorises the close-out on the automatic path either.
+    assert after[unmarked_null] == before[unmarked_null], (
+        unmarked_null, before[unmarked_null], after[unmarked_null],
+    )
+    assert after[unmarked_null]["verdict"] == "pending"
+
+    # This test's own two legacy rows and its own unmarked-NULL row are
+    # counted among the held ones, and its own marked-NULL row among the
+    # closed ones -- >= because the loop also sees every other expired
+    # pending row in this shared table.
     assert results["held_legacy_entry_price"] >= 2, results
+    assert results["held_unmarked_null_entry_price"] >= 1, results
     assert results["unscorable_entry_price"] >= 1, results
 
 
