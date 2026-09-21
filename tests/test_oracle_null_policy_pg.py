@@ -651,16 +651,17 @@ def test_migration_downgrade_with_null_rows_present(pg_engine: Engine):
 # ── 6. Real writers stamp the provenance boundary on a live row ────────────
 
 
-def test_publish_astrogrid_prediction_stamps_the_policy_on_a_real_row(
-    pg_engine: Engine, test_ids: list[str], monkeypatch,
+def test_publish_astrogrid_prediction_skips_an_unmeasured_entry_on_a_real_db(
+    pg_engine: Engine, monkeypatch,
 ):
-    """oracle/publish.py's real INSERT, run against real PostgreSQL, must
-    carry the historical-NULL provenance stamp -- not just in a fake-engine
-    unit test (tests/test_oracle_publish_entry_price.py), but on an actual
-    row next to actual NULLs (no options_daily_signals observation on this
-    disposable database, so entry_price comes back NULL here too)."""
+    """RECOVERY (packet 2a item b): against real PostgreSQL, with no
+    options_daily_signals observation for this ticker, the real writer must
+    publish nothing rather than a NULL-entry row (the candidate's behaviour,
+    proved for the candidate tree in the item (a) commit this recovery is
+    built on) or a fabricated 0.0 (the pre-#544 behaviour). No row means the
+    historical-NULL provenance stamp (item a) never applies here -- proving
+    it would-be-null is moot when nothing is ever written."""
     from oracle import publish
-    from oracle.entry_price_policy import NULL_WRITE_POLICY
 
     # The conviction-context lookup reads unrelated tables this disposable
     # database doesn't have populated; stub it exactly as
@@ -676,19 +677,25 @@ def test_publish_astrogrid_prediction_stamps_the_policy_on_a_real_row(
 
     ticker = f"ZPKT2A{uuid.uuid4().hex[:6]}"
     payload = {
-        "prediction_id": "pkt2a-pg-publish",
+        "prediction_id": "pkt2a-pg-publish-recovery",
         "target_symbols": [ticker],
         "horizon_label": "swing",
         "as_of_ts": "2026-09-21T00:00:00+00:00",
         "call": "buy the dip",
     }
-    out = publish.publish_astrogrid_prediction(pg_engine, payload)
-    test_ids.append(out["oracle_prediction_id"])
+    def _count() -> int:
+        with pg_engine.connect() as conn:
+            return conn.execute(
+                text("SELECT COUNT(*) FROM oracle_predictions WHERE ticker = :t"),
+                {"t": ticker},
+            ).scalar()
 
-    assert out["entry_price"] is None  # no spot on this disposable DB
-    row = _fetch_row(pg_engine, out["oracle_prediction_id"])
-    assert row["entry_price"] is None
-    assert row["null_write_policy"] == NULL_WRITE_POLICY
+    before_count = _count()
+    out = publish.publish_astrogrid_prediction(pg_engine, payload)
+
+    assert out["status"] == "skipped"
+    assert out["reason"] == "no_measured_entry_price"
+    assert _count() == before_count == 0, "no row may be written"
 
 
 def test_store_predictions_stamps_the_policy_on_a_real_row(

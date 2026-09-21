@@ -186,18 +186,22 @@ class TestPublishedRow:
             "options_daily_signals.spot_price"
         )
 
-    def test_no_observation_publishes_null_not_zero(self, no_context):
+    def test_no_observation_skips_the_publish_rather_than_zero_or_null(self, no_context):
+        """RECOVERY (packet 2a item b): candidate #593 would publish this row
+        with entry_price NULL; this recovery target never creates the row at
+        all rather than fabricating 0.0 -- see the guard's comment in
+        oracle/publish.py::publish_astrogrid_prediction."""
         from oracle.publish import publish_astrogrid_prediction
 
         engine = _Engine()          # no options_daily_signals row at all
         out = publish_astrogrid_prediction(engine, dict(_PAYLOAD))
 
-        params = _insert_params(engine)
-        assert params["entry_price"] is None, "a missing price is NULL, not 0.0"
-        assert out["entry_price"] is None
-
-        signals = json.loads(params["signals"])
-        assert signals["entry_price_basis"]["status"] == "unavailable"
+        assert out["status"] == "skipped"
+        assert out["reason"] == "no_measured_entry_price"
+        assert out["entry_price_basis"]["status"] == "unavailable"
+        assert not any(
+            "INSERT INTO oracle_predictions" in sql for sql, _ in engine.calls
+        ), "no row may be written when nothing measured an entry price"
 
     def test_the_retired_literal_is_gone_from_the_source(self):
         from oracle import publish
@@ -211,12 +215,12 @@ class TestPublishedRow:
 
         payload = dict(_PAYLOAD)
         payload.pop("target_symbols")
-        engine = _Engine()
+        engine = _Engine(spot_rows=[(214.5, date(2026, 9, 15))])
         publish_astrogrid_prediction(engine, payload)
 
         params = _insert_params(engine)
         assert params["ticker"] == "HYBRID"
-        assert params["entry_price"] is None
+        assert params["entry_price"] == pytest.approx(214.5)
 
 
 class TestNullWritePolicyStamp:
@@ -234,16 +238,24 @@ class TestNullWritePolicyStamp:
 
         assert _insert_params(engine)["null_write_policy"] == NULL_WRITE_POLICY
 
-    def test_every_insert_carries_the_policy_stamp_unavailable(self, no_context):
-        from oracle.entry_price_policy import NULL_WRITE_POLICY
+    def test_an_unmeasured_entry_never_reaches_insert_so_carries_no_stamp(
+        self, no_context,
+    ):
+        """RECOVERY (packet 2a item b): this branch never inserts a row with
+        a NULL entry_price at all (see TestPublishedRow's skip test above),
+        so there is no NULL-entry INSERT for the stamp to appear on. The
+        boundary this stamp exists to prove (item a) is vacuous, not
+        violated, on this recovery target: every row that IS published has
+        a measured entry_price."""
         from oracle.publish import publish_astrogrid_prediction
 
-        engine = _Engine()  # no options_daily_signals row -> NULL entry_price
-        publish_astrogrid_prediction(engine, dict(_PAYLOAD))
+        engine = _Engine()  # no options_daily_signals row -> unmeasured
+        out = publish_astrogrid_prediction(engine, dict(_PAYLOAD))
 
-        params = _insert_params(engine)
-        assert params["entry_price"] is None
-        assert params["null_write_policy"] == NULL_WRITE_POLICY
+        assert out["status"] == "skipped"
+        assert not any(
+            "INSERT INTO oracle_predictions" in sql for sql, _ in engine.calls
+        )
 
     def test_the_stamp_is_absent_from_the_on_conflict_update(self):
         from oracle import publish

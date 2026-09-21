@@ -32,7 +32,15 @@ def _reset_schema_guard():
 
 
 class _RecordingConn:
-    """Context-manager connection that records every executed SQL string."""
+    """Context-manager connection that records every executed SQL string.
+
+    RECOVERY (packet 2a item b): ``oracle/publish.py`` now skips the insert
+    entirely when nothing measured an entry price (never fabricates 0.0), so
+    the entry-price lookup this writer issues (``FROM options_daily_signals``)
+    must answer with a real, positive spot -- otherwise this file's own
+    dedup/index-ordering assertions below would never reach the INSERT they
+    exist to check.
+    """
 
     def __init__(self, sink: list[str]) -> None:
         self._sink = sink
@@ -44,16 +52,22 @@ class _RecordingConn:
         return None
 
     def execute(self, clause: Any, params: dict[str, Any] | None = None) -> "_Result":
-        self._sink.append(str(clause))
+        sql = str(clause)
+        self._sink.append(sql)
+        if "FROM options_daily_signals" in sql:
+            return _Result(fetchone_value=(214.5, "2026-09-15"))
         return _Result()
 
 
 class _Result:
+    def __init__(self, fetchone_value: Any = None) -> None:
+        self._fetchone_value = fetchone_value
+
     def fetchall(self) -> list[Any]:
         return []
 
     def fetchone(self) -> Any:
-        return None
+        return self._fetchone_value
 
     def scalar(self) -> Any:
         return None

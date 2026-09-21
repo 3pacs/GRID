@@ -211,6 +211,24 @@ def publish_astrogrid_prediction(engine: Engine, payload: dict[str, Any]) -> dic
         engine, ticker, as_of_date
     )
     signals["entry_price_basis"] = entry_price_basis
+    # RECOVERY (packet 2a item b): stop publishing a comparable prediction
+    # record when nothing measured an entry price, rather than fabricating
+    # one. This branch exists only on the recovery target -- the candidate
+    # (#593) publishes the row with entry_price NULL, closed later by the
+    # scorers' no_data path; this recovery instead never creates that row,
+    # so the scorers' no_data close-out never has to run for astrogrid
+    # publishes at all. Never restores the retired `entry_price = 0.0` /
+    # `confidence = payload.get(...) or 0.5` literals (docs/reference/
+    # CONFIDENCE_POLICY.md, D-M32) -- an unscorable prediction is skipped,
+    # not stamped with a value nobody measured. No row, no fabrication.
+    if entry_price is None:
+        return {
+            "status": "skipped",
+            "reason": "no_measured_entry_price",
+            "oracle_prediction_id": oracle_prediction_id,
+            "contract": "oracle.publish.v1",
+            "entry_price_basis": entry_price_basis,
+        }
     # Pre-migration safety: the ON CONFLICT below targets the partial unique
     # index oracle_predictions_dedup_unique. Ensure it exists (once/process)
     # so this insert can't raise 42P10 on a not-yet-migrated DB.
