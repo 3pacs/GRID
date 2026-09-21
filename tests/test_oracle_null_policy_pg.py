@@ -20,7 +20,18 @@ established pattern this file follows). Every row this file writes carries a
 unique ``pkt2a_pg_<uuid>`` id and/or a unique ``ZPKT2A<n>`` ticker, and the
 autouse fixture deletes them by id afterwards.
 
-Four things proved here, matching the extraction's handoff doc:
+Two scoring paths write the historical-write hold's outcome, and both are
+proved separately here:
+
+* ``scripts/score_oracle_trades.py`` is a MANUAL CLI -- not invoked by any
+  systemd unit, timer, cron entry or by Hermes (confirmed: no reference in
+  the release tree's ``hermes_operator.py``, no journal lines in 24h on
+  grid-svr).
+* ``oracle/engine.py::OracleEngine.score_expired_predictions`` is the
+  AUTOMATIC path -- Hermes's oracle step imports and calls it directly
+  (``from oracle.engine import OracleEngine``, ``hermes_operator.py:3964``).
+
+Five things proved here, matching the extraction's handoff doc:
 
 1. test_migration_allows_null_entry_price_and_confidence_after_upgrade --
    after the migration, a prediction row can be inserted with
@@ -29,11 +40,14 @@ Four things proved here, matching the extraction's handoff doc:
    (api/routers/oracle.py, oracle/calibration.py) return honest
    nulls/unscored for such rows and never raise.
 3. test_preservation_legacy_rows_survive_a_real_scorer_run -- the
-   historical-write hold: two legacy pending rows (entry_price=0.0,
-   non-null confidence) run through the real scorer path
-   (scripts/score_oracle_trades.py) against a stubbed price source and come
+   historical-write hold on the MANUAL path: two legacy pending rows
+   (entry_price=0.0, non-null confidence) run through the real
+   scripts/score_oracle_trades.py against a stubbed price source and come
    out byte-identical; a new-policy NULL row is closed per Step 4.
-4. test_migration_downgrade_with_null_rows_present -- alembic downgrade
+4. test_preservation_legacy_rows_survive_engine_score_expired_predictions --
+   the same hold, proved on the AUTOMATIC path:
+   OracleEngine.score_expired_predictions() against a stubbed price lookup.
+5. test_migration_downgrade_with_null_rows_present -- alembic downgrade
    behaviour with NULL rows present, run inside a transaction that is always
    rolled back so it can never touch the shared table's real constraints.
 """
@@ -48,6 +62,19 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+# oracle.* must be imported BEFORE scripts.score_oracle_trades (imported
+# lazily, inside test_preservation_legacy_rows_survive_a_real_scorer_run).
+# That module does `sys.path.insert(0, "/data/grid_v4/grid_repo")` (a
+# compute-node checkout path, pre-existing on main, out of scope here)
+# whose own `oracle` package predates entry_price_policy.py. On a host
+# where that directory exists, importing score_oracle_trades first would
+# cache THAT `oracle` package in sys.modules, and every `oracle.*` import
+# afterward -- including api.routers.oracle's own `from oracle.engine
+# import ...` in test_547_readers_handle_null_rows_honestly -- would
+# resolve from it instead of this repo's real package. These two eager,
+# module-level imports cache the correct `oracle` package first, so
+# nothing later in the process can be shadowed.
+import oracle.engine  # noqa: F401
 from oracle.entry_price_policy import SCORE_NOTE_ENTRY_NULL
 
 _MIGRATION_MODULE = "migrations.versions.oracle_pred_nullable_0918"
@@ -190,14 +217,23 @@ def test_547_readers_handle_null_rows_honestly(
     with pg_engine.begin() as conn:
         # A scored row with no stated confidence -- must be excluded from
         # calibration's Brier/ECE inputs, never imputed at 0.5.
+        #
+        # oracle_predictions_dedup_unique is a real partial unique index on
+        # (ticker, direction, expiry, prediction_type,
+        # COALESCE(model_version,''), created_at::date) WHERE dedup_keep.
+        # Both rows share a ticker and (by default) a created_at date, so
+        # direction is varied per row to give each a distinct natural key
+        # without touching the index or the semantics under test.
         _insert_prediction(
             conn, pred_id=null_conf_scored_id, ticker=ticker,
             entry_price=100.0, confidence=None, verdict="hit",
+            direction="CALL",
         )
         # A pending row with no measured entry price.
         _insert_prediction(
             conn, pred_id=null_entry_pending_id, ticker=ticker,
             entry_price=None, confidence=0.6, verdict="pending",
+            direction="PUT",
         )
 
     # -- oracle/calibration.py --------------------------------------------
@@ -249,7 +285,15 @@ def test_preservation_legacy_rows_survive_a_real_scorer_run(
     import scripts.score_oracle_trades as sot
 
     ticker = f"ZPKT2A{uuid.uuid4().hex[:6]}"
-    expiry = date.today() - timedelta(days=1)  # already expired -> scoreable
+    # already expired -> scoreable. oracle_predictions_dedup_unique is a
+    # real partial unique index on (ticker, direction, expiry,
+    # prediction_type, COALESCE(model_version,''), created_at::date) WHERE
+    # dedup_keep; these three rows share a ticker, direction and
+    # created_at date, so each gets its own expiry day to give it a
+    # distinct natural key -- all still in the past, all still scoreable.
+    expiry_a = date.today() - timedelta(days=1)
+    expiry_b = date.today() - timedelta(days=2)
+    expiry_c = date.today() - timedelta(days=3)
 
     legacy_a = _pred_id()
     legacy_b = _pred_id()
@@ -259,15 +303,15 @@ def test_preservation_legacy_rows_survive_a_real_scorer_run(
     with pg_engine.begin() as conn:
         _insert_prediction(
             conn, pred_id=legacy_a, ticker=ticker, entry_price=0.0,
-            confidence=0.55, verdict="pending", expiry=expiry,
+            confidence=0.55, verdict="pending", expiry=expiry_a,
         )
         _insert_prediction(
             conn, pred_id=legacy_b, ticker=ticker, entry_price=0.0,
-            confidence=0.72, verdict="pending", expiry=expiry,
+            confidence=0.72, verdict="pending", expiry=expiry_b,
         )
         _insert_prediction(
             conn, pred_id=new_policy_null, ticker=ticker, entry_price=None,
-            confidence=None, verdict="pending", expiry=expiry,
+            confidence=None, verdict="pending", expiry=expiry_c,
         )
 
     before = {
@@ -283,7 +327,12 @@ def test_preservation_legacy_rows_survive_a_real_scorer_run(
     # safe, honest outcome for those unrelated rows on a disposable test
     # database -- not a claim this test makes about them.
     def _stub_fetch_prices(tickers, start, end):
-        return {ticker: {expiry: 999.0, date.today(): 999.0}}
+        return {
+            ticker: {
+                expiry_a: 999.0, expiry_b: 999.0, expiry_c: 999.0,
+                date.today(): 999.0,
+            },
+        }
 
     monkeypatch.setattr(sot, "fetch_prices", _stub_fetch_prices)
     monkeypatch.setattr(sot, "create_engine", lambda *a, **kw: pg_engine)
@@ -310,7 +359,98 @@ def test_preservation_legacy_rows_survive_a_real_scorer_run(
     assert after[new_policy_null]["pnl_pct"] is None
 
 
-# ── 4. Migration downgrade behaviour, isolated in a rolled-back txn ────────
+# ── 4. Historical-write hold on the AUTOMATIC path (Hermes) ────────────────
+
+
+def test_preservation_legacy_rows_survive_engine_score_expired_predictions(
+    pg_engine: Engine, test_ids: list[str],
+):
+    """The hold on the path Hermes actually calls automatically.
+
+    scripts/score_oracle_trades.py (test 3, above) is a manual CLI -- not
+    invoked by any systemd unit, timer, cron entry or by Hermes. The
+    prediction -> outcome -> score cycle that runs on its own is Hermes's
+    oracle step calling ``OracleEngine.score_expired_predictions()``
+    directly (``hermes_operator.py:3964``: ``from oracle.engine import
+    OracleEngine``). The historical-write hold has to hold there too: two
+    legacy pending rows (entry_price=0.0, non-null confidence) survive
+    byte-identical; a new-policy NULL-entry row is closed to 'no_data' with
+    the shared reason.
+    """
+    from oracle.engine import OracleEngine
+
+    ticker = f"ZPKT2A{uuid.uuid4().hex[:6]}"
+    # oracle_predictions_dedup_unique (see test 3's comment) -- distinct
+    # expiry per row for a distinct natural key.
+    expiry_a = date.today() - timedelta(days=1)
+    expiry_b = date.today() - timedelta(days=2)
+    expiry_c = date.today() - timedelta(days=3)
+
+    legacy_a = _pred_id()
+    legacy_b = _pred_id()
+    new_policy_null = _pred_id()
+    test_ids.extend([legacy_a, legacy_b, new_policy_null])
+
+    with pg_engine.begin() as conn:
+        _insert_prediction(
+            conn, pred_id=legacy_a, ticker=ticker, entry_price=0.0,
+            confidence=0.55, verdict="pending", expiry=expiry_a,
+        )
+        _insert_prediction(
+            conn, pred_id=legacy_b, ticker=ticker, entry_price=0.0,
+            confidence=0.72, verdict="pending", expiry=expiry_b,
+        )
+        _insert_prediction(
+            conn, pred_id=new_policy_null, ticker=ticker, entry_price=None,
+            confidence=None, verdict="pending", expiry=expiry_c,
+        )
+
+    before = {
+        pid: _fetch_row(pg_engine, pid)
+        for pid in (legacy_a, legacy_b, new_policy_null)
+    }
+    for pid, row in before.items():
+        assert row is not None, pid
+
+    # __init__ runs 8+ CREATE TABLE/INDEX statements and loads the model
+    # registry -- unrelated to this test and unneeded against a live,
+    # already-bootstrapped table. Bypassed the same way
+    # tests/test_oracle_null_readers.py::TestEngineScoringLoopEntryPrice.
+    # _engine_under_test does. The price lookup is stubbed for our own
+    # ticker only -- no network access, and every other ticker's expired
+    # row in this shared table is left alone (None -> skipped, not scored).
+    oe = object.__new__(OracleEngine)
+    oe.engine = pg_engine
+    oe.models = []
+    oe._last_guard_verdicts = []
+    oe._get_price_at_date = lambda t, _expiry: 999.0 if t == ticker else None
+
+    results = oe.score_expired_predictions()
+
+    after = {
+        pid: _fetch_row(pg_engine, pid)
+        for pid in (legacy_a, legacy_b, new_policy_null)
+    }
+
+    # PRESERVATION on the automatic path too.
+    assert after[legacy_a] == before[legacy_a], (legacy_a, before[legacy_a], after[legacy_a])
+    assert after[legacy_b] == before[legacy_b], (legacy_b, before[legacy_b], after[legacy_b])
+    assert after[legacy_a]["verdict"] == "pending"
+    assert after[legacy_b]["verdict"] == "pending"
+
+    assert after[new_policy_null]["verdict"] == "no_data"
+    assert after[new_policy_null]["score_notes"] == SCORE_NOTE_ENTRY_NULL
+    assert after[new_policy_null]["entry_price"] is None
+    assert after[new_policy_null]["pnl_pct"] is None
+
+    # This test's own two legacy rows are counted among the held ones, and
+    # its own NULL row among the closed ones -- >= because the loop also
+    # sees every other expired pending row in this shared table.
+    assert results["held_legacy_entry_price"] >= 2, results
+    assert results["unscorable_entry_price"] >= 1, results
+
+
+# ── 5. Migration downgrade behaviour, isolated in a rolled-back txn ────────
 
 
 def test_migration_downgrade_with_null_rows_present(pg_engine: Engine):
