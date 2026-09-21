@@ -23,6 +23,23 @@ import argparse
 import json
 import sys
 from typing import Any
+
+# oracle.entry_price_policy must be imported -- and so cached in
+# sys.modules -- BEFORE the sys.path.insert below. On grid-svr,
+# /data/grid_v4/grid_repo is a stale checkout (confirmed at revision
+# 5facbdf0) whose own `oracle` package predates entry_price_policy.py.
+# Hermes runs this module from /data/grid_v4/grid_release; if that stale
+# path lands at sys.path[0] before this import has resolved, `oracle`
+# resolves from the stale tree instead and this raises ModuleNotFoundError
+# (reproduced during the packet2a PostgreSQL proof on the gridz4 host,
+# which also has that directory). Importing it first means the insert
+# below can no longer shadow it, regardless of import order elsewhere in
+# the process. See tests/test_score_oracle_trades_stale_repo_shadow.py.
+from oracle.entry_price_policy import (
+    SCORE_NOTE_ENTRY_NULL,
+    entry_price_score_note,
+)
+
 sys.path.insert(0, "/data/grid_v4/grid_repo")
 
 from datetime import date, timedelta
@@ -33,10 +50,6 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 from config import settings
-from oracle.entry_price_policy import (
-    SCORE_NOTE_ENTRY_NULL,
-    entry_price_score_note,
-)
 
 # Ticker → yfinance symbol mapping
 YF_MAP = {
