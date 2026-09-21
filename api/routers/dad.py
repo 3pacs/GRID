@@ -77,16 +77,24 @@ GOLD_COMPACT_BUDGET_SECONDS = float(os.getenv("GRID_DAD_GOLD_BUDGET_SECONDS", "8
 # systemd instances, etc.), each process gets its own independent executor
 # and in-flight table -- the real ceiling on simultaneous cold computes
 # across the whole deployment is then (this cap) x (process count), not
-# this cap alone. As checked against the live unit at
-# server_setup/grid-api.service (`ExecStart=... uvicorn api.main:app --host
-# 0.0.0.0 --port 8000`, no `--workers` flag, `Type=simple`) on 2026-09-21,
-# grid-api runs as a single process, so today this cap *is* the
-# deployment-wide ceiling -- but that is a fact about the current systemd
-# unit, not a guarantee this code enforces. (Note: docs/deployment.md has a
-# stale example unit showing `--workers 2` that does not match the actual
-# installed server_setup/grid-api.service; don't use that doc as the source
-# of truth for this.) If the process count ever changes, these two
-# constants must be re-derived as effective_cap = constant x worker_count.
+# this cap alone.
+#
+# The CHECKED-IN unit, server_setup/grid-api.service (`ExecStart=...
+# uvicorn api.main:app --host 0.0.0.0 --port 8000`, no `--workers` flag,
+# `Type=simple`), describes INTENDED single-process topology as of
+# 2026-09-21 -- that is a fact about the repo, not a live read of grid-svr.
+# This codebase has direct precedent for production drifting from what's
+# tracked in git (the 2026-09-18 god-view incident ran from untracked
+# files on the deployed host). Do not state "grid-api runs as N processes"
+# as settled without a live check at release time (e.g. `systemctl show
+# grid-api -p MainPID`, then confirm exactly one uvicorn worker process
+# under it, or `ss -ltnp` on :8000) -- the checked-in unit is a starting
+# assumption, not a substitute for that read. (Also: docs/deployment.md has
+# a stale example unit showing `--workers 2` that does not match
+# server_setup/grid-api.service; don't use that doc as the source of truth
+# either.) If the live process count is ever more than 1, these two
+# constants' deployment-wide effect is effective_cap = constant x
+# worker_count, not the constant alone.
 _GOLD_COMPACT_EXECUTOR_WORKERS = int(os.getenv("GRID_DAD_GOLD_EXECUTOR_WORKERS", "4"))
 _GOLD_COMPACT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=_GOLD_COMPACT_EXECUTOR_WORKERS,
@@ -1987,15 +1995,45 @@ def _mark_stale_response(payload: dict[str, Any], *, ticker: str) -> dict[str, A
     return payload
 
 
+def _unmeasured_gold(one_liner: str) -> dict[str, Any]:
+    """Gold card for 'we do not know', distinct from _gold_from_summary(None)'s 'we checked, there is nothing'.
+
+    _gold_from_summary(None) -- score 0, tone "neutral", verdict "No
+    workbook history yet" -- is a genuine, already-established result: it
+    means Dad's workbook corpus was actually queried and this ticker truly
+    has no footprint in it. A budget/capacity timeout means the opposite:
+    nothing was measured at all. Returning _gold_from_summary(None) verbatim
+    for a timeout would make an unmeasured ticker structurally identical to
+    a measured-and-empty one -- score, tone, and verdict text all the same
+    -- so a consumer reading only the gold card could not tell "verified
+    zero" from "unknown, ask again." score is None (not 0: 0 is a
+    measurement), tone is "unknown" (not any of _gold_from_summary's real
+    tones: strong/watch/light/neutral), and the verdict names the
+    distinction explicitly.
+    """
+    return {
+        "verdict": "Not checked yet",
+        "score": None,
+        "tone": "unknown",
+        "one_liner": one_liner,
+    }
+
+
 def _build_degraded_gold_response(ticker: str, *, elapsed_ms: float, reason: str = "budget_exceeded") -> dict[str, Any]:
     """Honest 'still loading' shape: nothing usable is cached and no compute finished in time.
 
     Reuses the same "no data yet" building blocks this module already uses
     for a missing workbook (_empty_workbook_context) or a failed GRID
     payload (_empty_grid_payload), assembled through the same
-    _assemble_dad_response the real path uses -- so this is the existing
-    honest-empty contract, not a new divergent shape, and carries no
-    fabricated numeric values.
+    _assemble_dad_response the real path uses -- so the overall contract
+    (top-level keys, status="unavailable") is the existing honest-empty
+    shape, not a new divergent one, and carries no fabricated numeric
+    values. The one deliberate exception is the `gold` card itself (see
+    _unmeasured_gold): _assemble_dad_response would otherwise compute it as
+    _gold_from_summary(None), which is indistinguishable from a genuinely
+    measured "no workbook history" ticker -- overridden below, along with
+    the matching decision-stack card/blocker, so a timeout can never read
+    as a measured zero or a neutral verdict.
 
     `reason` distinguishes "this ticker's own compute exceeded the budget"
     (budget_exceeded) from "the shared background-compute capacity was
@@ -2008,6 +2046,10 @@ def _build_degraded_gold_response(ticker: str, *, elapsed_ms: float, reason: str
         detail = f"too many other tickers are already loading (cap {GOLD_COMPACT_MAX_INFLIGHT})"
     else:
         detail = f"budget {GOLD_COMPACT_BUDGET_SECONDS:.0f}s exceeded after {elapsed_ms:.0f}ms"
+    not_measured_note = (
+        f"Dad's workbook and market checks for {ticker} did not complete in time ({detail}). "
+        "This is an unmeasured result, not a verified zero -- try again in a moment."
+    )
     workbook = _empty_workbook_context(
         ticker,
         _research_db_path(),
@@ -2017,6 +2059,21 @@ def _build_degraded_gold_response(ticker: str, *, elapsed_ms: float, reason: str
     )
     grid_payload = _empty_grid_payload(f"Still loading {ticker}'s market context ({detail}).")
     payload = _assemble_dad_response(ticker, workbook, grid_payload, timings={}, compact=True)
+
+    unmeasured = _unmeasured_gold(not_measured_note)
+    payload["gold"] = unmeasured
+    decision_stack = payload.get("decision_stack")
+    if isinstance(decision_stack, dict):
+        decision_stack = dict(decision_stack)
+        cards = list(decision_stack.get("cards") or [])
+        if cards and cards[0].get("source") == "Dad workbooks":
+            cards[0] = {**cards[0], "state": "unknown", "points": None, "detail": unmeasured["one_liner"]}
+            decision_stack["cards"] = cards
+        blockers = list(decision_stack.get("blockers") or [])
+        blockers.insert(0, not_measured_note)
+        decision_stack["blockers"] = blockers[:6]
+        payload["decision_stack"] = decision_stack
+
     payload["performance"] = {
         "budget_exceeded": reason == "budget_exceeded",
         "capacity_exceeded": reason == "capacity_exceeded",

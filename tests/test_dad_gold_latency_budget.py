@@ -138,9 +138,13 @@ def test_dependency_timeout_with_no_cache_returns_honest_unavailable(monkeypatch
     assert result["performance"]["budget_exceeded"] is True
     assert result["performance"]["capacity_exceeded"] is False
     assert result["cache"] == {"hit": False, "stale": False, "ttl_seconds": dad.SUMMARY_CACHE_TTL_SECONDS}
-    # No fabricated values: the honest-empty gold/decision-stack shape, same as
-    # a genuinely missing-workbook ticker (_gold_from_summary(None)).
-    assert result["gold"] == dad._gold_from_summary(None)
+    # No fabricated values, AND not a measured zero: gold.score is None (a
+    # measurement was never taken), not 0 (a measurement of exactly zero) --
+    # see test_unavailable_gold_is_distinguishable_from_a_measured_zero below
+    # for why this distinction is the point, not an implementation detail.
+    assert result["gold"]["score"] is None
+    assert result["gold"]["tone"] == "unknown"
+    assert result["gold"] != dad._gold_from_summary(None)
 
 
 def test_budget_only_ends_the_wait_the_compute_keeps_running_and_still_caches(monkeypatch):
@@ -530,3 +534,51 @@ def test_orphaned_compute_always_releases_db_and_duckdb_via_context_managers():
     # timeout" log lines) -- not this test, not `with`, and not
     # GOLD_COMPACT_BUDGET_SECONDS. That dependency predates this PR and is
     # unchanged by it.
+
+
+# --- unavailable must not read as a measured zero/neutral --------------------
+
+
+def test_unavailable_gold_is_distinguishable_from_a_measured_zero():
+    """A budget/capacity timeout must not produce the same gold card as a genuinely-checked, empty-history ticker.
+
+    _gold_from_summary(None) is what the real (non-timeout) path returns
+    for a ticker that WAS checked and truly has no workbook footprint --
+    score 0, tone "neutral", verdict "No workbook history yet". If the
+    degraded/unavailable path reused that verbatim, a consumer looking only
+    at the gold card could not tell "Dad's corpus was searched and this
+    ticker isn't in it" (a real, measured finding) from "we don't know
+    because the compute didn't finish in time" (no finding at all). These
+    must differ structurally, not just in a footnote.
+    """
+    measured_empty = dad._gold_from_summary(None)
+    unavailable = dad._build_degraded_gold_response("NOPE", elapsed_ms=123.0, reason="budget_exceeded")["gold"]
+
+    assert measured_empty["score"] == 0          # a real measurement: exactly zero
+    assert unavailable["score"] is None           # no measurement was taken at all
+    assert measured_empty["tone"] == "neutral"    # one of _gold_from_summary's real tones
+    assert unavailable["tone"] == "unknown"       # not a tone _gold_from_summary ever produces
+    assert unavailable["tone"] not in {"strong", "watch", "light", "neutral"}
+    assert measured_empty["verdict"] != unavailable["verdict"]
+    assert "not" in unavailable["one_liner"].lower() and "measur" in unavailable["one_liner"].lower()
+
+
+def test_unavailable_decision_stack_card_and_blocker_also_say_unmeasured():
+    """The decision-stack's Dad-workbooks card and blockers must carry the same distinction as the gold card."""
+    payload = dad._build_degraded_gold_response("NOPE", elapsed_ms=50.0, reason="capacity_exceeded")
+
+    dad_card = payload["decision_stack"]["cards"][0]
+    assert dad_card["source"] == "Dad workbooks"
+    assert dad_card["state"] == "unknown"
+    assert dad_card["points"] is None             # not 0.0 -- no score was computed
+
+    assert any("did not complete in time" in b and "not" in b.lower() and "verified" in b.lower()
+               for b in payload["decision_stack"]["blockers"])
+
+
+def test_capacity_exceeded_also_produces_unmeasured_gold():
+    """Both refusal reasons (budget_exceeded, capacity_exceeded) get the same honest-unmeasured gold, not a zero."""
+    for reason in ("budget_exceeded", "capacity_exceeded"):
+        gold = dad._build_degraded_gold_response("X", elapsed_ms=1.0, reason=reason)["gold"]
+        assert gold["score"] is None
+        assert gold["tone"] == "unknown"
