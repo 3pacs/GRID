@@ -30,15 +30,28 @@ from pathlib import Path
 import pytest
 from sqlalchemy import create_engine, event, text
 
-import scripts.score_oracle_trades as sot
-from intelligence import source_quality_ablation as sqa
+# oracle.* must be imported BEFORE scripts.score_oracle_trades. That module
+# does `sys.path.insert(0, "/data/grid_v4/grid_repo")` (a compute-node
+# checkout path, pre-existing on main, out of scope here) whose own `oracle`
+# package predates entry_price_policy.py. On a host where that directory
+# exists, importing score_oracle_trades first caches THAT `oracle` package
+# in sys.modules, and every `oracle.*` import anywhere in this file after
+# that point -- including the lazy `from oracle.engine import OracleEngine`
+# further down -- resolves from it instead of this repo's real package,
+# raising ModuleNotFoundError for oracle.entry_price_policy. Importing the
+# real submodules first caches the correct `oracle` package in sys.modules,
+# so nothing later in the process (this file or otherwise) can be shadowed.
+import oracle.engine  # noqa: F401
 from oracle.calibration import compute_calibration
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-from oracle.entry_price_policy import (  # noqa: E402
+from oracle.entry_price_policy import (
     SCORE_NOTE_ENTRY_NULL,
     SCORE_NOTE_ENTRY_ZERO,
 )
+
+import scripts.score_oracle_trades as sot
+from intelligence import source_quality_ablation as sqa
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 # ── In-memory fixture ──────────────────────────────────────────────────────
