@@ -572,6 +572,19 @@ def pipeline_health(
 
     try:
         with engine.connect() as conn:
+            # This handler's source_rows query samples up to
+            # _SERIES_COUNT_SAMPLE_LIMIT raw_series rows per source through a
+            # non-covering index (idx_raw_series_source_pull has no
+            # series_id), so each sampled row needs its own heap fetch. On
+            # griddb's ~1.94B-row raw_series that can run past the engine's
+            # 120s default statement_timeout (db.py) instead of failing
+            # fast — verified in prod 2026-09-21, ~120s to a QueryCanceled.
+            # Bound this specific query to a few seconds so a slow/degraded
+            # raw_series still yields a prompt `fetch_failed` response via
+            # the except block below, instead of holding the request (and
+            # the PWA) for two minutes before doing the same thing anyway.
+            conn.execute(text("SET LOCAL statement_timeout = '5s'"))
+
             # ── Per-source pull status ─────────────────────────────────
             source_rows = conn.execute(
                 text(

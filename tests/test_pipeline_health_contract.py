@@ -146,6 +146,47 @@ class TestPipelineHealthFieldRecords:
         assert by_name["acme_widgets"]["field_record"]["availability"] == "unavailable"
 
 
+class TestPipelineHealthStatementTimeout:
+    def test_source_rows_query_is_bounded_by_a_short_local_timeout(self):
+        # Regression for the 2026-09-21 production incident: source_rows
+        # samples up to _SERIES_COUNT_SAMPLE_LIMIT raw_series rows per
+        # source through a non-covering index, which took ~120s (the
+        # engine-wide default) to be cancelled once raw_series reached
+        # ~1.94B rows. This query must set its own short SET LOCAL
+        # statement_timeout as the first statement on the connection so a
+        # degraded raw_series fails fast into the existing fetch_failed
+        # path instead of blocking the request for two minutes.
+        engine = _make_engine(source_rows=[("yfinance", datetime.now(timezone.utc), 5, 2)])
+        with patch("api.routers.system.get_db_engine", return_value=engine):
+            resp = client.get("/api/v1/system/pipeline-health", headers=_auth_header())
+        assert resp.status_code == 200
+
+        conn = engine.connect.return_value.__enter__.return_value
+        executed_sql = [str(call.args[0]) for call in conn.execute.call_args_list]
+        assert executed_sql, "expected at least one query to run"
+        assert "SET LOCAL statement_timeout" in executed_sql[0], (
+            "statement_timeout must be set as the first statement on the "
+            "connection, before the expensive source_rows query"
+        )
+        assert "5s" in executed_sql[0]
+
+    def test_statement_timeout_cancellation_still_degrades_to_fetch_failed(self):
+        # If postgres cancels the query because of the bound above, the
+        # existing exception path must still classify it as fetch_failed
+        # (it already does for "timeout" in the message) rather than
+        # surfacing a raw 500 or a misleading empty-but-200 response.
+        engine = MagicMock()
+        engine.connect.side_effect = RuntimeError(
+            "canceling statement due to statement timeout"
+        )
+        with patch("api.routers.system.get_db_engine", return_value=engine):
+            resp = client.get("/api/v1/system/pipeline-health", headers=_auth_header())
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["availability"] == "unavailable"
+        assert data["stale_reason"] == "fetch_failed"
+
+
 class TestPipelineHealthFailurePath:
     def test_query_exception_returns_explicit_unavailable_not_empty_zero(self):
         engine = MagicMock()
