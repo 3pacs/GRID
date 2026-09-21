@@ -9,17 +9,19 @@ entirely in worktree `GRID-fable-wt-packet2a`.
 
 ## Combined head
 
-`86fabb3a273b10931522ba9785582684685b577e` — "docs: record the coordinator's
-PG-proof round 1 findings and fixes" (branch tip after the round-1 harness/
-production fixes below; the head at the end of Steps 1-5 proper was
-`9198bb2a6a2cda63a15476b8147367cf5f760b15`).
+`12ab556a7ef5d5bcf7a5ed4f0702b93b02415038` — "scripts/score_oracle_trades.py:
+never mutate sys.path when merely imported" (branch tip after coordinator
+round 2; the head at the end of Steps 1-5 proper was
+`9198bb2a6a2cda63a15476b8147367cf5f760b15`, and after round 1 was
+`86fabb3a273b10931522ba9785582684685b577e`).
 
 ## Recovery head
 
-`d9c368715b647c3b0717daddea0330f10b080444` — "scripts/score_oracle_trades.py:
-import oracle.entry_price_policy before the legacy sys.path insert" (branch
-tip after mirroring the round-1 fixes; the original single revert commit
-was `fcfff061e6154748e3dc9c67702ffd3763c7fb5a`).
+`c47c56fc7bcce6274ba1ce68c714a0817514b40b` — "scripts/score_oracle_trades.py:
+never mutate sys.path when merely imported" (branch tip after mirroring
+round 2; the original single revert commit was
+`fcfff061e6154748e3dc9c67702ffd3763c7fb5a`, and after round 1 was
+`d9c368715b647c3b0717daddea0330f10b080444`).
 
 ## Commit provenance
 
@@ -64,6 +66,8 @@ All applied commits carry `-x` provenance (`(cherry picked from commit
 | `128d413a5c321adba1885302ff9411d1ae153560` | tests: fix PG dedup-key collisions; robust oracle.* import order; engine-path preservation proof (coordinator round 1) |
 | `fbce2862bd8e866f7724bf032d4d2ba4200286f2` | scripts/score_oracle_trades.py: import oracle.entry_price_policy before the legacy sys.path insert (coordinator round 1) |
 | `86fabb3a273b10931522ba9785582684685b577e` | docs: record the coordinator's PG-proof round 1 findings and fixes |
+| `aa0945f49432802a1696e067873322bca3ff944f` | docs: update handoff heads and provenance tables after round 1 mirroring |
+| `12ab556a7ef5d5bcf7a5ed4f0702b93b02415038` | scripts/score_oracle_trades.py: never mutate sys.path when merely imported (coordinator round 2) |
 
 ### Recovery branch
 
@@ -72,6 +76,7 @@ All applied commits carry `-x` provenance (`(cherry picked from commit
 | `fcfff061e6154748e3dc9c67702ffd3763c7fb5a` | recovery: revert oracle/publish.py's writer to pre-#544 literal defaults (Step 6) |
 | `8b1cf9bfe9d1bcc4006577468e205c69ec6c01d6` (cherry-pick -x of `128d413a`) | tests: fix PG dedup-key collisions; robust oracle.* import order; engine-path preservation proof |
 | `d9c368715b647c3b0717daddea0330f10b080444` (cherry-pick -x of `fbce2862`) | scripts/score_oracle_trades.py: import oracle.entry_price_policy before the legacy sys.path insert |
+| `c47c56fc7bcce6274ba1ce68c714a0817514b40b` (cherry-pick -x of `12ab556a`) | scripts/score_oracle_trades.py: never mutate sys.path when merely imported |
 
 ## Dependency stop: commit `b1d3dd8b` NOT cherry-picked
 
@@ -418,6 +423,62 @@ name both paths.
 All fixes mirrored onto `fable/packet2a-recovery-20260921` (cherry-picked
 cleanly — none of these files were touched by that branch's writer-revert
 commit).
+
+## Coordinator PostgreSQL proof — round 2 finding and fix
+
+Proof run 3 on the round-1 heads (branch A `aa0945f4`, branch B `d9c36871`)
+found round 1's `scripts/score_oracle_trades.py` fix was incomplete:
+`test_preservation_legacy_rows_survive_a_real_scorer_run` (the real scorer
+path) and 7 focused-suite tests (e.g.
+`tests/test_oracle_null_readers.py::TestPostmortemZeroEntry::
+test_timing_classification_names_the_reason_instead_of_missing`) still
+failed on the gridz4 host — the same host that, like grid-svr, has the
+stale `/data/grid_v4/grid_repo` checkout.
+
+**Root cause.** Round 1 only moved `oracle.entry_price_policy` above the
+`sys.path.insert`. The insert itself still ran **unconditionally**, on
+**every** import of the module. Everything imported *after* it — this
+module's own `from config import settings` (still below the insert), and
+any first-party import that happened to run *later in the process*, e.g.
+the **lazy** `from intelligence.postmortem import record_success_lesson`
+inside `_record_success_lesson_safe`, triggered only when an actual
+hit/partial prediction is scored — could still resolve from the stale
+tree, on any host where it exists. Moving one import above the insert only
+ever protects that one import; the insert itself staying on `sys.path` for
+the rest of the process's life is the actual hazard.
+
+**Fix** (commit `12ab556a`, mirrored onto the recovery branch as
+`c47c56fc`):
+
+1. Every first-party import this module needs *directly* (`config`,
+   `oracle.entry_price_policy`) now runs before the insertion point (kept
+   from round 1, now complete — `config` was the missing one).
+2. The insertion itself is now **conditional** on both:
+   - `__name__ == "__main__"` — never runs merely by importing the module.
+     This is what actually closes the hole for good: if `sys.path` is
+     never mutated in the first place, a *lazy* import like
+     `intelligence.postmortem` — triggered arbitrarily later, from
+     anywhere in the process — is never at risk either, regardless of
+     import order within this file.
+   - `importlib.util.find_spec("config") is None` — even under direct
+     `python scripts/score_oracle_trades.py` execution, the fallback only
+     fires if this repo is not already importable some other way.
+     `find_spec` locates but never imports/executes `config`, so this
+     check has no side effects of its own.
+
+`tests/test_score_oracle_trades_stale_repo_shadow.py` extended per the
+coordinator's request: the simulated stale checkout now also contains
+decoy `config.py`, `db.py` and `intelligence/postmortem.py` (each raises
+if actually imported — a regression fails loudly, not silently). Three
+tests: (1) importing the module as a module never puts the stale path on
+`sys.path` at all; (2) `config`, `db`, `oracle.entry_price_policy` and
+`intelligence.postmortem` — including the two this module never imports
+itself — all resolve under this repo afterward; (3) running the module as
+`__main__` (via `runpy.run_module(..., run_name="__main__")`, with
+`sys.argv` pointed at `--help` so `main()` exits immediately rather than
+trying to reach a database) still skips the fallback when the repo is
+already importable. All three verified locally to fail against round 1's
+(partial) fix and pass against this one before landing.
 
 ## Recovery tree (Step 6)
 
