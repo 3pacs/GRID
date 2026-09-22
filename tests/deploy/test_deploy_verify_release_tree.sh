@@ -11,20 +11,23 @@
 #
 # Proves, against real processes and a real git repository (not mocks):
 #   1. A process whose cwd resolves to the CURRENT live-release symlink
-#      target, checked against that target's own actual HEAD commit,
-#      passes.
-#   1b. Ancestor semantics, not exact equality: an OLDER commit that is a
-#       real ancestor of the live target's HEAD also passes -- mirrors
-#       deploy_build_hook.sh's own `merge-base --is-ancestor` check, since a
-#       legitimate later push can legitimately carry the deployed candidate
-#       past the expected commit, not merely to it.
+#      target, checked against that target's own actual HEAD commit
+#      (exact match), passes.
+#   1b. Exact equality, not ancestry: the SAME process/target, checked
+#       against an OLDER commit that is a genuine ancestor of the live
+#       target's HEAD -- i.e. the live target is a DESCENDANT of the
+#       expected SHA, not that exact commit -- still FAILS. A release-
+#       identity check that accepted "at least this commit" would have let
+#       this incident-class bug (the wrong exact commit, but a real
+#       ancestor) through silently.
 #   2. A process whose cwd resolves to an OLD release directory -- not what
 #      the live symlink currently points at -- fails the resolved-cwd
 #      check, even though that old directory is itself a perfectly valid
 #      git checkout.
 #   3. A process correctly running from the live target still fails when the
-#      expected SHA is not an ancestor of that target's HEAD -- the
-#      independent SHA check this script adds beyond the cwd check alone.
+#      expected SHA is unrelated entirely (not an ancestor, not a
+#      descendant) -- the independent SHA check this script adds beyond the
+#      cwd check alone.
 #
 # Runs entirely inside a temp sandbox with real git repositories and real
 # background processes -- never touches any real GRID path, any real
@@ -155,15 +158,21 @@ assert_eq "correct target + exact HEAD sha: exits 0" "0" "$exit1"
 assert_true "correct target + exact HEAD sha: reports the resolved target and commit" \
   "$(echo "$out1" | grep -qF "$rel_new" && echo "$out1" | grep -qF "$sha_b" && echo true || echo false)"
 
-# ── Test 1b: correct symlink target, an OLDER ancestor SHA -- still passes
-#    (ancestor semantics, not exact equality -- see the script's own header)
+# ── Test 1b: correct symlink target, but the live target's HEAD is a
+#    DESCENDANT of the expected SHA (sha_a is a real ancestor of sha_b, the
+#    live target's actual HEAD) -- must FAIL. Exact equality, not ancestry
+#    -- see the script's own header. Same cwd, same process as test 1;
+#    only the expected SHA changes, isolating this to the SHA check alone.
 
 set +e
 out1b="$(bash "$VERIFY_SCRIPT" "$live" "$pid_current" "$sha_a" 2>&1)"
 exit1b=$?
 set -e
-if [ "$exit1b" -ne 0 ]; then echo "--- test1b output ---"; echo "$out1b"; echo "--- end ---"; fi
-assert_eq "correct target + OLDER ancestor sha: exits 0 (ancestor, not exact-equality, semantics)" "0" "$exit1b"
+assert_eq "live target is a DESCENDANT of expected sha: exits non-zero (exact equality required)" "1" "$exit1b"
+assert_true "descendant case: error names it as a commit mismatch (not the expected deployed commit)" \
+  "$(echo "$out1b" | grep -qF "not the expected deployed commit" && echo true || echo false)"
+assert_true "descendant case: does NOT claim a cwd mismatch (the cwd check genuinely passed here)" \
+  "$(echo "$out1b" | grep -qF "does not resolve to the live release target" && echo false || echo true)"
 
 # ── Test 2: process cwd resolves to the OLD release directory, not what the
 #    live symlink currently points at -- fails the resolved-cwd check ──────
@@ -179,16 +188,17 @@ assert_true "old release directory: error names the mismatch (does not resolve t
   "$(echo "$out2" | grep -qF "does not resolve to the live release target" && echo true || echo false)"
 
 # ── Test 3: process correctly running from the live target, but the
-#    expected SHA is not an ancestor of that target's HEAD -- fails the
-#    independent SHA check even though the cwd check alone would pass ──────
+#    expected SHA is entirely unrelated (not an ancestor, not a descendant)
+#    -- fails the independent SHA check even though the cwd check alone
+#    would pass ─────────────────────────────────────────────────────────
 
 set +e
 out3="$(bash "$VERIFY_SCRIPT" "$live" "$pid_current" "$sha_unrelated" 2>&1)"
 exit3=$?
 set -e
 assert_eq "correct cwd target, wrong/unrelated expected sha: exits non-zero" "1" "$exit3"
-assert_true "wrong sha: error names it as an ancestor mismatch, not a cwd mismatch" \
-  "$(echo "$out3" | grep -qF "does not have expected commit" && echo true || echo false)"
+assert_true "wrong sha: error names it as a commit mismatch, not a cwd mismatch" \
+  "$(echo "$out3" | grep -qF "not the expected deployed commit" && echo true || echo false)"
 assert_true "wrong sha: does NOT claim a cwd mismatch (the cwd check genuinely passed here)" \
   "$(echo "$out3" | grep -qF "does not resolve to the live release target" && echo false || echo true)"
 

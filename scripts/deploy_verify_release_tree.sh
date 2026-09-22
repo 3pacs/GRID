@@ -25,23 +25,33 @@
 #      target actually is. A symlink quietly left pointing at a stale or
 #      otherwise-wrong release directory would satisfy it just as happily.
 #
-#   2. The resolved target's own git history, read directly and
-#      independently right now -- not inferred from
-#      deploy_build_hook.sh's in-build ancestry check, which only proved
-#      this BEFORE the swap, the restart, and this fresh process existed --
-#      has expected_sha as an ancestor of its HEAD. Ancestor, not exact
-#      equality: deliberately mirrors deploy_build_hook.sh's own semantics
-#      (git_merge-base --is-ancestor "$EXPECTED_SHA" HEAD after a fresh
-#      `git fetch main`), since a legitimate later push landing on main
-#      between this run's checkout and deploy_release_swap.sh's own fetch
-#      can legitimately carry the deployed candidate PAST expected_sha, not
-#      merely to it -- that is not a failure this check should raise.
+#   2. The resolved target's own git HEAD, read directly and independently
+#      right now -- not inferred from deploy_build_hook.sh's in-build
+#      check, which only proved something BEFORE the swap, the restart,
+#      and this fresh process existed -- equals expected_sha EXACTLY.
+#      Exact equality, not ancestry: this is a release-identity check, not
+#      a "did we get at least this far" check -- "the deployed tree is
+#      commit X" should mean X, not X-or-anything-after-it. A live target
+#      whose HEAD is a DESCENDANT of expected_sha (not just an unrelated or
+#      older commit) must still fail this: something else besides this
+#      exact push produced what is running.
+#
+#      Known, accepted asymmetry: deploy_build_hook.sh's own in-build check
+#      is looser (`git merge-base --is-ancestor "$EXPECTED_SHA" HEAD` after
+#      a fresh `git fetch main`), because a legitimate later push landing
+#      on main between checkout and that fetch can carry the CANDIDATE build
+#      past expected_sha before this script ever runs. That is a build-time
+#      tolerance for a real race; it is a deliberately separate question
+#      from this script's job, which is to state plainly what commit is
+#      actually live right now. If that race ever occurs, this check will
+#      correctly fail the deploy rather than silently accepting "close
+#      enough" -- a stricter outcome than before, on purpose.
 #
 # Usage: deploy_verify_release_tree.sh <deploy_path> <pid> <expected_sha>
 #
 # Exit status:
 #   0  pid's cwd resolves to deploy_path's resolved target, and that
-#      target's HEAD has expected_sha as an ancestor
+#      target's HEAD is EXACTLY expected_sha
 #   1  verification failed -- see the message on stderr for which check
 #   2  usage error
 
@@ -71,7 +81,7 @@ cwd_resolved="$(readlink -f "$cwd")"
 deployed_sha="$(git -C "$want" rev-parse HEAD 2>/dev/null)" || fail "could not read a git HEAD commit inside $want -- is it a real checkout?"
 echo "resolved live target: $want (commit $deployed_sha)"
 
-git -C "$want" merge-base --is-ancestor "$EXPECTED_SHA" HEAD 2>/dev/null \
-  || fail "live release target $want is at commit $deployed_sha, which does not have expected commit $EXPECTED_SHA as an ancestor"
+[ "$deployed_sha" = "$EXPECTED_SHA" ] \
+  || fail "live release target $want is at commit $deployed_sha, not the expected deployed commit $EXPECTED_SHA"
 
-echo "verify: pid=$PID is running the deployed tree at $want (commit $deployed_sha, includes expected $EXPECTED_SHA)"
+echo "verify: pid=$PID is running the deployed tree at $want (commit $deployed_sha, exactly matches expected $EXPECTED_SHA)"
