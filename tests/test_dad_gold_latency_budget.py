@@ -35,7 +35,7 @@ def _fresh_payload(ticker: str) -> dict:
     return {
         "ticker": ticker,
         "status": "ready",
-        "gold": {"verdict": "test", "heuristic_score": 42, "tone": "watch", "one_liner": "x"},
+        "gold": {"verdict": "test", "score": 42, "tone": "watch", "one_liner": "x"},
         "performance": {"timings_ms": {}, "total_ms": 5.0},
     }
 
@@ -138,12 +138,11 @@ def test_dependency_timeout_with_no_cache_returns_honest_unavailable(monkeypatch
     assert result["performance"]["budget_exceeded"] is True
     assert result["performance"]["capacity_exceeded"] is False
     assert result["cache"] == {"hit": False, "stale": False, "ttl_seconds": dad.SUMMARY_CACHE_TTL_SECONDS}
-    # No fabricated values: gold.heuristic_score is None here (as it is for
-    # a genuinely-checked, empty-history ticker too -- see
-    # test_unavailable_gold_is_distinguishable_from_a_measured_zero below
-    # for why tone/verdict, not the score value, is what actually
-    # distinguishes "unmeasured" from "checked, nothing there").
-    assert result["gold"]["heuristic_score"] is None
+    # No fabricated values, AND not a measured zero: gold.score is None (a
+    # measurement was never taken), not 0 (a measurement of exactly zero) --
+    # see test_unavailable_gold_is_distinguishable_from_a_measured_zero below
+    # for why this distinction is the point, not an implementation detail.
+    assert result["gold"]["score"] is None
     assert result["gold"]["tone"] == "unknown"
     assert result["gold"] != dad._gold_from_summary(None)
 
@@ -190,7 +189,7 @@ def test_dependency_timeout_falls_back_to_stale_cache(monkeypatch):
     monkeypatch.setattr(dad, "GOLD_COMPACT_BUDGET_SECONDS", 0.15)
     stale_payload = _fresh_payload("STALE")
     stale_payload["message"] = None
-    stale_payload["decision_stack"] = {"stance": "Watchlist with checks", "tone": "watch", "heuristic_score": 50,
+    stale_payload["decision_stack"] = {"stance": "Watchlist with checks", "tone": "watch", "score": 50,
                                         "cards": [], "reasons": [], "blockers": [], "method": "x"}
     two_hours_ago_seconds = 2 * 3600
     stale_payload["cache"] = {"hit": True, "stale": True, "generated_at": "2026-09-01T00:00:00+00:00",
@@ -544,25 +543,19 @@ def test_unavailable_gold_is_distinguishable_from_a_measured_zero():
     """A budget/capacity timeout must not produce the same gold card as a genuinely-checked, empty-history ticker.
 
     _gold_from_summary(None) is what the real (non-timeout) path returns
-    for a ticker that WAS checked and truly has no workbook footprint. Its
-    heuristic_score is None there too -- an absent summary carries no
-    evidence_score/file_count/mentions to compute from, so no number is
-    published, same honesty rule as everywhere else in this module. That
-    means heuristic_score alone cannot be the distinguishing signal between
-    "checked, nothing there" and "timed out, never checked" -- both are
-    None. tone and verdict are what actually differ: "neutral" / "No
-    workbook history yet" for a real check that found nothing, vs "unknown"
-    / "Not checked yet" for a timeout. If the degraded/unavailable path
-    reused _gold_from_summary(None) verbatim, a consumer looking only at
-    the gold card could not tell these apart at all -- tone and verdict
-    must differ structurally, not just heuristic_score's already-shared
-    None.
+    for a ticker that WAS checked and truly has no workbook footprint --
+    score 0, tone "neutral", verdict "No workbook history yet". If the
+    degraded/unavailable path reused that verbatim, a consumer looking only
+    at the gold card could not tell "Dad's corpus was searched and this
+    ticker isn't in it" (a real, measured finding) from "we don't know
+    because the compute didn't finish in time" (no finding at all). These
+    must differ structurally, not just in a footnote.
     """
     measured_empty = dad._gold_from_summary(None)
     unavailable = dad._build_degraded_gold_response("NOPE", elapsed_ms=123.0, reason="budget_exceeded")["gold"]
 
-    assert measured_empty["heuristic_score"] is None  # checked; nothing to score from
-    assert unavailable["heuristic_score"] is None      # never checked at all
+    assert measured_empty["score"] == 0          # a real measurement: exactly zero
+    assert unavailable["score"] is None           # no measurement was taken at all
     assert measured_empty["tone"] == "neutral"    # one of _gold_from_summary's real tones
     assert unavailable["tone"] == "unknown"       # not a tone _gold_from_summary ever produces
     assert unavailable["tone"] not in {"strong", "watch", "light", "neutral"}
@@ -587,5 +580,5 @@ def test_capacity_exceeded_also_produces_unmeasured_gold():
     """Both refusal reasons (budget_exceeded, capacity_exceeded) get the same honest-unmeasured gold, not a zero."""
     for reason in ("budget_exceeded", "capacity_exceeded"):
         gold = dad._build_degraded_gold_response("X", elapsed_ms=1.0, reason=reason)["gold"]
-        assert gold["heuristic_score"] is None
+        assert gold["score"] is None
         assert gold["tone"] == "unknown"

@@ -204,15 +204,8 @@ def get_scorecard(
             )
             live_quote = live_quotes.get(asset["lookup_ticker"])
             if live_quote and live_quote.get("price") is not None:
-                # The quote's own bar date, never today's: called on a
-                # weekend this used to write Friday's close into raw_series
-                # as Sunday's observation, which the scorer then re-read as
-                # a real Sunday bar (audit D-M30).
                 _cache_price_to_db(
-                    engine,
-                    asset["lookup_ticker"],
-                    float(live_quote["price"]),
-                    live_quote.get("bar_date"),
+                    engine, asset["lookup_ticker"], float(live_quote["price"]), date.today()
                 )
             item = _build_scorecard_item(
                 asset, feature_name, candidate_features, history, live_quote

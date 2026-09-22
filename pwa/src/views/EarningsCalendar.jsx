@@ -176,16 +176,12 @@ function PreEarningsCard({ entry, onPredict }) {
                         <div style={shared.metricLabel}>IV Rank</div>
                     </div>
                 )}
-                <div style={shared.metric}>
-                    <div style={shared.metricValue}>
-                        {entry.expected_move_options != null
-                            ? `${entry.expected_move_options.toFixed(1)}%`
-                            : '--'}
+                {entry.expected_move_options != null && (
+                    <div style={shared.metric}>
+                        <div style={shared.metricValue}>{entry.expected_move_options.toFixed(1)}%</div>
+                        <div style={shared.metricLabel}>Exp Move</div>
                     </div>
-                    <div style={shared.metricLabel}>
-                        {entry.expected_move_options != null ? 'Exp Move (IV)' : 'Exp Move (no IV)'}
-                    </div>
-                </div>
+                )}
             </div>
 
             {entry.prediction && (
@@ -202,11 +198,6 @@ function PreEarningsCard({ entry, onPredict }) {
                     }}>
                         {entry.prediction.direction?.toUpperCase()} {fmtPct(entry.prediction.move_pct)}
                     </span>
-                    {entry.prediction.move_basis && entry.prediction.move_basis !== 'history_and_options' && (
-                        <span style={{ fontSize: '10px', color: colors.textMuted, textTransform: 'uppercase' }}>
-                            {entry.prediction.move_basis.replace(/_/g, ' ')}
-                        </span>
-                    )}
                     <span style={{ fontSize: '11px', color: colors.textMuted }}>
                         Confidence: {((entry.prediction.confidence || 0) * 100).toFixed(0)}%
                     </span>
@@ -283,19 +274,16 @@ function Scorecard({ data }) {
                     <div style={shared.metric}>
                         <div style={{
                             ...shared.metricValue,
-                            color: o.accuracy_pct == null ? colors.textMuted
-                                : o.accuracy_pct >= 60 ? colors.green
+                            color: o.accuracy_pct >= 60 ? colors.green
                                 : o.accuracy_pct >= 40 ? colors.yellow : colors.red,
                             fontSize: '22px',
                         }}>
-                            {o.accuracy_pct != null ? `${o.accuracy_pct}%` : '--'}
+                            {o.accuracy_pct}%
                         </div>
-                        <div style={shared.metricLabel}>
-                            {o.accuracy_pct != null ? 'Accuracy' : 'Accuracy (nothing scored)'}
-                        </div>
+                        <div style={shared.metricLabel}>Accuracy</div>
                     </div>
                     <div style={shared.metric}>
-                        <div style={shared.metricValue}>{o.scored_n ?? o.total_scored ?? 0}</div>
+                        <div style={shared.metricValue}>{o.total_scored}</div>
                         <div style={shared.metricLabel}>Scored</div>
                     </div>
                     <div style={shared.metric}>
@@ -329,7 +317,7 @@ function Scorecard({ data }) {
                                     background: colors.bg, borderRadius: tokens.radius.sm,
                                 }}>
                                     <div style={{ fontSize: '14px', fontWeight: 700, color: '#E8F0F8', fontFamily: colors.mono }}>
-                                        {c.accuracy_pct != null ? `${c.accuracy_pct}%` : '--'}
+                                        {c.accuracy_pct}%
                                     </div>
                                     <div style={{ fontSize: '10px', color: colors.textMuted, textTransform: 'uppercase' }}>
                                         {c.bucket} ({c.total})
@@ -363,11 +351,6 @@ function Scorecard({ data }) {
                             <span style={{ color: colors.textMuted, minWidth: '60px' }}>
                                 {fmtPct(p.predicted_move_pct)}
                             </span>
-                            {p.predicted_move_basis && p.predicted_move_basis !== 'history_and_options' && (
-                                <span style={{ fontSize: '10px', color: colors.textMuted, textTransform: 'uppercase' }}>
-                                    {p.predicted_move_basis.replace(/_/g, ' ')}
-                                </span>
-                            )}
                             {p.actual_move_pct != null && (
                                 <span style={{
                                     fontFamily: colors.mono, minWidth: '60px',

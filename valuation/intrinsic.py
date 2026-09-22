@@ -42,14 +42,6 @@ class FinancialInputs:
     filing_date: date
     period: str  # 'Q1', 'Q2', etc.
 
-    # Provenance of the numbers below. `filing_date` is the as-of date the
-    # inputs were resolved at; `statements_as_of` is the newest obs_date of
-    # the statement series actually used, and `data_freshness` flags when
-    # those statements are old. Both are declared fields so the valid_fields
-    # filter in gather_inputs cannot silently drop them (audit C-M17).
-    statements_as_of: date | None = None
-    data_freshness: str = "CURRENT"
-
     # Balance sheet
     total_assets: float | None = None
     total_current_assets: float | None = None
@@ -115,9 +107,6 @@ class ValuationResult:
     margin_of_safety: float | None = None
 
     data_freshness: str = "CURRENT"
-    # max(obs_date) of the financial statements the valuation rests on —
-    # months older than valuation_date when the filings are stale.
-    statements_as_of: date | None = None
     input_payload: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -178,12 +167,7 @@ class IntrinsicValueEngine:
             "pe_ratio": "pe_ratio",
         }
 
-        values: dict[str, Any] = {"ticker": ticker, "period": "TTM"}
-        # Newest obs_date seen across the statement series, and across every
-        # series (statements + market data). The valuation is only valid as
-        # of the latter; the former is what "the statements" are dated.
-        statements_as_of: date | None = None
-        inputs_as_of: date | None = None
+        values: dict[str, Any] = {"ticker": ticker, "filing_date": as_of, "period": "TTM"}
 
         with self.engine.connect() as conn:
             # Pull latest value for each FMP series
@@ -206,16 +190,8 @@ class IntrinsicValueEngine:
 
                 if row is not None:
                     values[field_name] = row[0]
-                    obs_date = row[1]
-                    if inputs_as_of is None or obs_date > inputs_as_of:
-                        inputs_as_of = obs_date
-                    is_statement_series = field_name not in market_fields.values()
-                    if is_statement_series and (
-                        statements_as_of is None or obs_date > statements_as_of
-                    ):
-                        statements_as_of = obs_date
                     # Track data staleness
-                    if obs_date < as_of - timedelta(days=120):
+                    if row[1] < as_of - timedelta(days=120):
                         values["data_freshness"] = "STALE"
 
             # Also try Tiingo fundamentals for market data
@@ -241,8 +217,6 @@ class IntrinsicValueEngine:
                 ).fetchone()
                 if row is not None:
                     values[field_name] = row[0]
-                    if inputs_as_of is None or row[1] > inputs_as_of:
-                        inputs_as_of = row[1]
 
             # Derive shares outstanding from market cap / price
             if values.get("market_cap") and values.get("market_price") and values["market_price"] > 0:
@@ -253,14 +227,7 @@ class IntrinsicValueEngine:
             log.warning("Insufficient financial data for {t}", t=ticker)
             return None
 
-        # filing_date is the date this input set is actually valid at: the
-        # newest observation used, never today when everything on file is
-        # months old (audit C-M17).
-        values["filing_date"] = inputs_as_of or as_of
-        values["statements_as_of"] = statements_as_of
-
-        # Filter to only FinancialInputs fields. data_freshness and
-        # statements_as_of are declared fields, so they survive this.
+        # Filter to only FinancialInputs fields
         valid_fields = {f.name for f in FinancialInputs.__dataclass_fields__.values()}
         filtered = {k: v for k, v in values.items() if k in valid_fields}
         return FinancialInputs(**filtered)
@@ -274,17 +241,11 @@ class IntrinsicValueEngine:
             market_price=inputs.market_price,
             shares_outstanding=shares,
             market_cap=inputs.market_cap,
-            data_freshness=inputs.data_freshness,
-            statements_as_of=inputs.statements_as_of,
         )
 
         if not shares or shares <= 0:
             log.warning("No shares outstanding for {t}, limited valuation", t=inputs.ticker)
-            # Don't overwrite a STALE flag: "we had to estimate" and "the
-            # filings are a year old" are different facts, and staleness is
-            # the one a reader must not lose.
-            if result.data_freshness == "CURRENT":
-                result.data_freshness = "ESTIMATED"
+            result.data_freshness = "ESTIMATED"
             return result
 
         # 1. Book Value per Share
@@ -401,12 +362,6 @@ class IntrinsicValueEngine:
             "ebitda": inputs.ebitda,
             "capex": inputs.capex,
             "shares": shares,
-            # No company_valuations column for this yet, so the persisted
-            # row carries the statement date in its payload.
-            "statements_as_of": (
-                inputs.statements_as_of.isoformat() if inputs.statements_as_of else None
-            ),
-            "data_freshness": inputs.data_freshness,
         }
 
         return result

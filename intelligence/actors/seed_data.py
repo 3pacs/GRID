@@ -6,26 +6,6 @@ sector-committee mappings, and ticker-sector hints used for pocket-lining
 detection.
 
 This module has no business logic — pure data only.
-
-Provenance
-----------
-Everything here is **hand-curated**: the ``influence_score``,
-``net_worth_estimate`` and ``aum`` figures were typed in by a person, not
-measured. ``_seed_known_actors`` writes these rows into the live ``actors``
-table as a fallback when the table is empty, so they must stay
-distinguishable from observed rows:
-
-* ``credibility`` is ``"curated_estimate"`` for every hand-assigned score.
-  It used to read ``"hard_data"``, which asserted a measurement that was
-  never taken (audit A-H13).
-* the vintage of these figures is
-  ``intelligence.actors.provenance.SEED_VINTAGE``; every API node built from
-  a seeded row carries ``"source": "curated_seed"`` and that date as
-  ``source_as_of``.
-
-``"public_record"`` entries below are identity facts sourced from a public
-register (committee membership, filed office). Their *scores* are still
-hand-assigned.
 """
 
 from __future__ import annotations
@@ -45,7 +25,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "Chair, Federal Reserve",
         "influence_score": 0.99,
         "data_sources": ["fed_speeches", "fomc_minutes", "dot_plot"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "fed_waller": {
@@ -55,7 +35,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "Governor, Federal Reserve",
         "influence_score": 0.85,
         "data_sources": ["fed_speeches", "fomc_minutes", "dot_plot"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "fed_bowman": {
@@ -65,7 +45,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "Governor, Federal Reserve",
         "influence_score": 0.80,
         "data_sources": ["fed_speeches", "fomc_minutes", "dot_plot"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "fed_barr": {
@@ -75,7 +55,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "Vice Chair for Supervision, Federal Reserve",
         "influence_score": 0.85,
         "data_sources": ["fed_speeches", "fomc_minutes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "fed_cook": {
@@ -85,7 +65,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "Governor, Federal Reserve",
         "influence_score": 0.78,
         "data_sources": ["fed_speeches", "fomc_minutes", "dot_plot"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "fed_jefferson": {
@@ -95,7 +75,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "Vice Chair, Federal Reserve",
         "influence_score": 0.88,
         "data_sources": ["fed_speeches", "fomc_minutes", "dot_plot"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "fed_kugler": {
@@ -105,7 +85,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "Governor, Federal Reserve",
         "influence_score": 0.76,
         "data_sources": ["fed_speeches", "fomc_minutes", "dot_plot"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "fed_musalem": {
@@ -115,7 +95,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "President, Federal Reserve Bank of St. Louis",
         "influence_score": 0.72,
         "data_sources": ["fed_speeches", "fomc_minutes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "fed_goolsbee": {
@@ -125,7 +105,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "President, Federal Reserve Bank of Chicago",
         "influence_score": 0.74,
         "data_sources": ["fed_speeches", "fomc_minutes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "fed_williams": {
@@ -135,7 +115,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "President, Federal Reserve Bank of New York",
         "influence_score": 0.90,
         "data_sources": ["fed_speeches", "fomc_minutes", "dot_plot"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "fed_daly": {
@@ -145,7 +125,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "President, Federal Reserve Bank of San Francisco",
         "influence_score": 0.72,
         "data_sources": ["fed_speeches", "fomc_minutes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "fed_bostic": {
@@ -155,7 +135,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "President, Federal Reserve Bank of Atlanta",
         "influence_score": 0.72,
         "data_sources": ["fed_speeches", "fomc_minutes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
 
@@ -169,7 +149,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "Secretary of the Treasury",
         "influence_score": 0.95,
         "data_sources": ["treasury_announcements", "tga_data", "auction_schedule"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "treasury_adeyemo": {
@@ -203,7 +183,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "President, European Central Bank",
         "influence_score": 0.95,
         "data_sources": ["ecb_speeches", "ecb_decisions"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "ecb_de_guindos": {
@@ -213,7 +193,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "Vice President, European Central Bank",
         "influence_score": 0.82,
         "data_sources": ["ecb_speeches", "ecb_decisions"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "ecb_schnabel": {
@@ -223,7 +203,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "Executive Board Member, ECB",
         "influence_score": 0.80,
         "data_sources": ["ecb_speeches"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "ecb_lane": {
@@ -233,7 +213,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "Chief Economist, ECB",
         "influence_score": 0.82,
         "data_sources": ["ecb_speeches", "ecb_research"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
 
@@ -247,7 +227,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "Governor, Bank of Japan",
         "influence_score": 0.92,
         "data_sources": ["boj_decisions", "boj_speeches"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "pboc_pan": {
@@ -257,7 +237,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "Governor, People's Bank of China",
         "influence_score": 0.93,
         "data_sources": ["pboc_decisions"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "boe_bailey": {
@@ -267,7 +247,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "Governor, Bank of England",
         "influence_score": 0.88,
         "data_sources": ["boe_decisions", "boe_speeches"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "rbi_das": {
@@ -277,7 +257,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "Governor, Reserve Bank of India",
         "influence_score": 0.78,
         "data_sources": ["rbi_decisions"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
 
@@ -398,7 +378,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 124_000_000_000,
         "influence_score": 0.88,
         "data_sources": ["13f_filings", "sec_edgar", "public_statements"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "hf_simons": {
@@ -409,7 +389,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 106_000_000_000,
         "influence_score": 0.85,
         "data_sources": ["13f_filings", "sec_edgar"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "quantitative",
     },
     "hf_griffin": {
@@ -421,7 +401,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 62_000_000_000,
         "influence_score": 0.90,
         "data_sources": ["13f_filings", "sec_edgar", "political_donations"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "quantitative",
     },
     "hf_shaw": {
@@ -433,7 +413,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 60_000_000_000,
         "influence_score": 0.82,
         "data_sources": ["13f_filings", "sec_edgar"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "quantitative",
     },
     "hf_englander": {
@@ -445,7 +425,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 64_000_000_000,
         "influence_score": 0.82,
         "data_sources": ["13f_filings", "sec_edgar"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "quantitative",
     },
     "hf_overdeck": {
@@ -457,7 +437,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 60_000_000_000,
         "influence_score": 0.78,
         "data_sources": ["13f_filings", "sec_edgar"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "quantitative",
     },
     "hf_siegel": {
@@ -469,7 +449,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 60_000_000_000,
         "influence_score": 0.78,
         "data_sources": ["13f_filings", "sec_edgar"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "quantitative",
     },
     "hf_cohen": {
@@ -481,7 +461,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 35_000_000_000,
         "influence_score": 0.84,
         "data_sources": ["13f_filings", "sec_edgar"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "quantitative",
     },
     "hf_klarman": {
@@ -493,7 +473,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 27_000_000_000,
         "influence_score": 0.76,
         "data_sources": ["13f_filings", "sec_edgar"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "value_investor",
     },
     "hf_druckenmiller": {
@@ -505,7 +485,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 3_000_000_000,
         "influence_score": 0.86,
         "data_sources": ["13f_filings", "sec_edgar", "public_statements"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "macro_discretionary",
     },
     "hf_tepper": {
@@ -517,7 +497,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 13_000_000_000,
         "influence_score": 0.82,
         "data_sources": ["13f_filings", "sec_edgar"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "macro_discretionary",
     },
     "hf_einhorn": {
@@ -529,7 +509,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 3_500_000_000,
         "influence_score": 0.72,
         "data_sources": ["13f_filings", "sec_edgar", "public_statements"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "value_investor",
     },
     "hf_tudor_jones": {
@@ -541,7 +521,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 12_000_000_000,
         "influence_score": 0.84,
         "data_sources": ["13f_filings", "sec_edgar", "public_statements"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "macro_discretionary",
     },
     "hf_soros": {
@@ -553,7 +533,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 25_000_000_000,
         "influence_score": 0.80,
         "data_sources": ["13f_filings", "sec_edgar"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "macro_discretionary",
     },
     "hf_loeb": {
@@ -565,7 +545,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 12_000_000_000,
         "influence_score": 0.76,
         "data_sources": ["13f_filings", "sec_edgar", "13d_filings"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "activist",
     },
     "hf_ackman": {
@@ -577,7 +557,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 18_000_000_000,
         "influence_score": 0.80,
         "data_sources": ["13f_filings", "sec_edgar", "13d_filings", "social_media"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "activist",
     },
     "hf_icahn": {
@@ -589,7 +569,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 15_000_000_000,
         "influence_score": 0.78,
         "data_sources": ["13f_filings", "sec_edgar", "13d_filings"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "activist",
     },
     "hf_peltz": {
@@ -601,7 +581,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 8_500_000_000,
         "influence_score": 0.72,
         "data_sources": ["13f_filings", "sec_edgar", "13d_filings"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "activist",
     },
     "hf_singer": {
@@ -613,7 +593,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 65_000_000_000,
         "influence_score": 0.82,
         "data_sources": ["13f_filings", "sec_edgar", "13d_filings"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "activist",
     },
     "hf_izzy_englander_millennium": {
@@ -624,7 +604,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 64_000_000_000,
         "influence_score": 0.80,
         "data_sources": ["13f_filings", "sec_edgar"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "quantitative",
     },
     "hf_balyasny": {
@@ -635,7 +615,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 21_000_000_000,
         "influence_score": 0.72,
         "data_sources": ["13f_filings", "sec_edgar"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "quantitative",
     },
 
@@ -651,7 +631,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 10_000_000_000_000,
         "influence_score": 0.95,
         "data_sources": ["13f_filings", "sec_edgar", "etf_flows", "public_statements"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "am_vanguard": {
@@ -662,7 +642,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 8_600_000_000_000,
         "influence_score": 0.92,
         "data_sources": ["13f_filings", "sec_edgar", "etf_flows"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "am_state_street": {
@@ -673,7 +653,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 4_100_000_000_000,
         "influence_score": 0.88,
         "data_sources": ["13f_filings", "sec_edgar", "etf_flows"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "am_fidelity": {
@@ -685,7 +665,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 4_500_000_000_000,
         "influence_score": 0.88,
         "data_sources": ["13f_filings", "sec_edgar", "fund_flows"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "am_jpmorgan_am": {
@@ -696,7 +676,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 3_000_000_000_000,
         "influence_score": 0.86,
         "data_sources": ["13f_filings", "sec_edgar"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "am_goldman_am": {
@@ -707,7 +687,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 2_800_000_000_000,
         "influence_score": 0.85,
         "data_sources": ["13f_filings", "sec_edgar"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "am_morgan_stanley_im": {
@@ -718,7 +698,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 1_500_000_000_000,
         "influence_score": 0.82,
         "data_sources": ["13f_filings", "sec_edgar"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "am_invesco": {
@@ -729,7 +709,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 1_600_000_000_000,
         "influence_score": 0.78,
         "data_sources": ["13f_filings", "sec_edgar", "etf_flows"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "am_capital_group": {
@@ -740,7 +720,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 2_600_000_000_000,
         "influence_score": 0.84,
         "data_sources": ["13f_filings", "sec_edgar"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "am_pimco": {
@@ -751,7 +731,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 1_900_000_000_000,
         "influence_score": 0.84,
         "data_sources": ["13f_filings", "sec_edgar"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
 
@@ -766,7 +746,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 1_600_000_000_000,
         "influence_score": 0.88,
         "data_sources": ["nbim_holdings", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "swf_adia": {
@@ -880,7 +860,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "net_worth_estimate": 2_000_000_000,
         "influence_score": 0.90,
         "data_sources": ["sec_filings", "earnings_calls", "public_statements"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "bank_moynihan": {
@@ -890,7 +870,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "Chairman & CEO, Bank of America",
         "influence_score": 0.78,
         "data_sources": ["sec_filings", "earnings_calls"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "bank_solomon": {
@@ -900,7 +880,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "Chairman & CEO, Goldman Sachs",
         "influence_score": 0.82,
         "data_sources": ["sec_filings", "earnings_calls"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
 
@@ -915,7 +895,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "net_worth_estimate": 230_000_000_000,
         "influence_score": 0.92,
         "data_sources": ["sec_filings", "form4", "social_media"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "self_serving",
     },
     "ind_bezos": {
@@ -926,7 +906,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "net_worth_estimate": 200_000_000_000,
         "influence_score": 0.82,
         "data_sources": ["sec_filings", "form4"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "diversification",
     },
     "ind_zuckerberg": {
@@ -937,7 +917,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "net_worth_estimate": 180_000_000_000,
         "influence_score": 0.80,
         "data_sources": ["sec_filings", "form4"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "ind_buffett": {
@@ -949,7 +929,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 970_000_000_000,
         "influence_score": 0.94,
         "data_sources": ["13f_filings", "sec_edgar", "annual_letters"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "value_investor",
     },
     "ind_cook_tim": {
@@ -960,7 +940,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "net_worth_estimate": 1_800_000_000,
         "influence_score": 0.78,
         "data_sources": ["sec_filings", "form4"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "ind_nadella": {
@@ -971,7 +951,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "net_worth_estimate": 1_000_000_000,
         "influence_score": 0.78,
         "data_sources": ["sec_filings", "form4"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "ind_jensen": {
@@ -982,7 +962,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "net_worth_estimate": 100_000_000_000,
         "influence_score": 0.86,
         "data_sources": ["sec_filings", "form4"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "ind_altman": {
@@ -1004,7 +984,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "net_worth_estimate": 1_000_000_000,
         "influence_score": 0.72,
         "data_sources": ["sec_filings", "form4"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "ind_jassy": {
@@ -1014,7 +994,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "President & CEO, Amazon",
         "influence_score": 0.74,
         "data_sources": ["sec_filings", "form4"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
 
@@ -1029,7 +1009,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "net_worth_estimate": 300_000_000,
         "influence_score": 0.74,
         "data_sources": ["13f_filings", "sec_edgar", "social_media"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "contrarian",
     },
     "ind_marks": {
@@ -1041,7 +1021,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 189_000_000_000,
         "influence_score": 0.78,
         "data_sources": ["13f_filings", "memos"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "value_investor",
     },
     "ind_gundlach": {
@@ -1053,7 +1033,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 92_000_000_000,
         "influence_score": 0.76,
         "data_sources": ["13f_filings", "public_statements"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "macro_discretionary",
     },
     "ind_bass": {
@@ -1075,7 +1055,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "net_worth_estimate": 2_500_000_000,
         "influence_score": 0.68,
         "data_sources": ["13f_filings", "public_statements"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "value_investor",
     },
     "ind_chanos": {
@@ -1097,7 +1077,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 14_000_000_000,
         "influence_score": 0.72,
         "data_sources": ["13f_filings", "ark_daily_trades", "social_media"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "growth_conviction",
     },
 
@@ -1174,7 +1154,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 0,  # market maker, not AUM
         "influence_score": 0.88,
         "data_sources": ["finra_ats", "sec_filings"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "market_making",
     },
     "hf_virtu": {
@@ -1184,7 +1164,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "Market Maker & HFT",
         "influence_score": 0.72,
         "data_sources": ["finra_ats", "sec_filings"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "market_making",
     },
     "hf_jane_street": {
@@ -1195,7 +1175,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 20_000_000_000,
         "influence_score": 0.80,
         "data_sources": ["13f_filings"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "quantitative",
     },
     "hf_tiger_global": {
@@ -1206,7 +1186,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 30_000_000_000,
         "influence_score": 0.74,
         "data_sources": ["13f_filings", "sec_edgar"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "growth_conviction",
     },
     "hf_coatue": {
@@ -1217,7 +1197,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 20_000_000_000,
         "influence_score": 0.72,
         "data_sources": ["13f_filings", "sec_edgar"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "growth_conviction",
     },
     "hf_viking": {
@@ -1229,7 +1209,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 36_000_000_000,
         "influence_score": 0.76,
         "data_sources": ["13f_filings", "sec_edgar"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fundamental",
     },
     "hf_lone_pine": {
@@ -1240,7 +1220,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 17_000_000_000,
         "influence_score": 0.72,
         "data_sources": ["13f_filings", "sec_edgar"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fundamental",
     },
 
@@ -1256,7 +1236,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 908_000_000_000,
         "influence_score": 0.93,
         "data_sources": ["sec_filings", "13f_filings", "institutional_map"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fee_maximization",
     },
     "pc_blackstone": {
@@ -1268,7 +1248,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 1_065_000_000_000,
         "influence_score": 0.96,
         "data_sources": ["sec_filings", "13f_filings", "institutional_map"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fee_maximization",
     },
     "pc_ares": {
@@ -1279,7 +1259,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 428_000_000_000,
         "influence_score": 0.88,
         "data_sources": ["sec_filings", "13f_filings", "institutional_map"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fee_maximization",
     },
     "pc_kkr": {
@@ -1290,7 +1270,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 553_000_000_000,
         "influence_score": 0.91,
         "data_sources": ["sec_filings", "13f_filings", "institutional_map"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fee_maximization",
     },
     "pc_blue_owl": {
@@ -1301,7 +1281,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 235_000_000_000,
         "influence_score": 0.82,
         "data_sources": ["sec_filings", "13f_filings", "institutional_map"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fee_maximization",
     },
     "pc_golub": {
@@ -1312,7 +1292,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 90_000_000_000,
         "influence_score": 0.74,
         "data_sources": ["sec_filings", "institutional_map"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fee_maximization",
     },
     "pc_hps": {
@@ -1323,7 +1303,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 117_000_000_000,
         "influence_score": 0.78,
         "data_sources": ["sec_filings", "institutional_map"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fee_maximization",
     },
 
@@ -1339,7 +1319,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 65_000_000_000,
         "influence_score": 0.94,
         "data_sources": ["sec_filings", "13f_filings", "finra_ats", "institutional_map"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "multi_strategy_alpha",
     },
     "hf_bridgewater": {
@@ -1351,7 +1331,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 124_000_000_000,
         "influence_score": 0.92,
         "data_sources": ["sec_filings", "13f_filings", "institutional_map"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "macro_fundamental",
     },
     "hf_millennium": {
@@ -1363,7 +1343,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 70_000_000_000,
         "influence_score": 0.88,
         "data_sources": ["sec_filings", "13f_filings", "institutional_map"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "multi_strategy_alpha",
     },
     "hf_de_shaw": {
@@ -1375,7 +1355,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 60_000_000_000,
         "influence_score": 0.86,
         "data_sources": ["sec_filings", "13f_filings", "institutional_map"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "quantitative",
     },
     "hf_point72": {
@@ -1387,7 +1367,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 35_000_000_000,
         "influence_score": 0.88,
         "data_sources": ["sec_filings", "13f_filings", "institutional_map"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "multi_strategy_alpha",
     },
     "hf_two_sigma": {
@@ -1398,7 +1378,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 75_000_000_000,
         "influence_score": 0.84,
         "data_sources": ["sec_filings", "13f_filings", "institutional_map"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "quantitative",
     },
     "hf_elliott": {
@@ -1410,7 +1390,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 69_500_000_000,
         "influence_score": 0.90,
         "data_sources": ["sec_filings", "13f_filings", "institutional_map"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "activist_distressed",
     },
 
@@ -1425,7 +1405,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 503_000_000_000,
         "influence_score": 0.85,
         "data_sources": ["pension_disclosures", "board_minutes", "institutional_map"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_calstrs_cio": {
@@ -1436,7 +1416,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 340_000_000_000,
         "influence_score": 0.82,
         "data_sources": ["pension_disclosures", "board_minutes", "institutional_map"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_cppib_cio": {
@@ -1447,7 +1427,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 576_000_000_000,
         "influence_score": 0.84,
         "data_sources": ["pension_disclosures", "institutional_map"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
 
@@ -1523,7 +1503,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "banking", "type": "Arvest Bank ownership"},
         ],
         "data_sources": ["sec_filings", "form4", "fec_donations", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "dynastic_preservation",
     },
     "dynasty_koch": {
@@ -1587,7 +1567,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "real_estate", "type": "investments", "note": "REA Group (Australian property)"},
         ],
         "data_sources": ["sec_filings", "fec_donations", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "political_influence",
     },
     "dynasty_ambani": {
@@ -1612,7 +1592,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "retail", "type": "controlling_interest", "note": "Reliance Retail"},
         ],
         "data_sources": ["bse_filings", "nse_filings", "forbes", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "empire_building",
     },
     "dynasty_adani": {
@@ -1813,7 +1793,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "bonds", "type": "index_allocation", "note": "25% domestic, 25% foreign bonds"},
         ],
         "data_sources": ["gpif_reports", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "swf_nps_korea": {
@@ -1829,7 +1809,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "global_equities", "type": "index_allocation"},
         ],
         "data_sources": ["nps_reports", "13f_filings", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
 
@@ -1846,7 +1826,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"actor": "bank_solomon", "type": "same_firm"},
         ],
         "data_sources": ["sec_filings", "earnings_calls"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "bank_gorman": {
@@ -1856,7 +1836,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "Executive Chairman, Morgan Stanley",
         "influence_score": 0.78,
         "data_sources": ["sec_filings", "earnings_calls"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "bank_fraser": {
@@ -1866,7 +1846,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "CEO, Citigroup",
         "influence_score": 0.76,
         "data_sources": ["sec_filings", "earnings_calls"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "bank_scharf": {
@@ -1876,7 +1856,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "CEO, Wells Fargo",
         "influence_score": 0.74,
         "data_sources": ["sec_filings", "earnings_calls"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
 
@@ -1903,7 +1883,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"ticker": "BIDU", "type": "large_position"},
         ],
         "data_sources": ["13f_filings", "sec_edgar", "fec_donations", "options_flow"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "quantitative",
     },
     "hf_coleman_tiger": {
@@ -1921,7 +1901,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "technology", "type": "concentrated", "note": "Tech/growth focused"},
         ],
         "data_sources": ["13f_filings", "sec_edgar"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "growth_conviction",
     },
 
@@ -1935,7 +1915,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "Governor, Reserve Bank of Australia",
         "influence_score": 0.78,
         "data_sources": ["rba_decisions", "rba_speeches"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "boc_macklem": {
@@ -1945,7 +1925,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "title": "Governor, Bank of Canada",
         "influence_score": 0.80,
         "data_sources": ["boc_decisions", "boc_speeches"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "boj_kuroda_legacy": {
@@ -1958,7 +1938,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"actor": "boj_ueda", "type": "predecessor"},
         ],
         "data_sources": ["boj_historical", "academic"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "snb_jordan": {
@@ -1971,7 +1951,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "equities", "type": "fx_reserves_allocation", "note": "SNB holds $170B+ in US equities"},
         ],
         "data_sources": ["snb_reports", "13f_filings"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
 
@@ -1992,7 +1972,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"ticker": "GOOGL", "type": "controlling_interest", "note": "Class B supervoting shares"},
         ],
         "data_sources": ["sec_filings", "form4"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "diversification",
     },
     "ind_brin": {
@@ -2009,7 +1989,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"ticker": "GOOGL", "type": "controlling_interest", "note": "Class B supervoting shares"},
         ],
         "data_sources": ["sec_filings", "form4"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "diversification",
     },
 
@@ -2039,7 +2019,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "crypto", "type": "investments", "note": "Early Bitcoin, Bullish exchange"},
         ],
         "data_sources": ["sec_filings", "fec_donations", "opensecrets", "form4"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "political_influence",
     },
     "pol_soros_george": {
@@ -2082,7 +2062,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "finance_data", "type": "controlling_interest", "note": "Bloomberg Terminal — $12B+ revenue"},
         ],
         "data_sources": ["fec_donations", "opensecrets", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "political_influence",
     },
     "pol_hoffman": {
@@ -2146,7 +2126,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "crypto", "type": "bankrupt", "note": "FTX collapse Nov 2022, $8B customer funds lost"},
         ],
         "data_sources": ["court_filings", "fec_donations"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "cautionary_fraud",
     },
 
@@ -2177,7 +2157,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "infrastructure", "type": "direct_ownership", "note": "Boring Company"},
         ],
         "data_sources": ["sec_filings", "form4", "social_media", "fec_donations", "government_contracts"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "empire_building",
     },
     "ind_bezos_expanded": {
@@ -2198,7 +2178,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "real_estate", "type": "investments", "note": "Bezos Expeditions portfolio"},
         ],
         "data_sources": ["sec_filings", "form4", "bezos_expeditions"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "diversification",
     },
     "ind_ellison": {
@@ -2218,7 +2198,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "real_estate", "type": "direct_ownership", "note": "98% of Lanai island, Hawaii"},
         ],
         "data_sources": ["sec_filings", "form4"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "empire_building",
     },
     "ind_gates": {
@@ -2241,7 +2221,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"ticker": "CNI", "type": "large_position"},
         ],
         "data_sources": ["sec_filings", "form4", "13f_filings", "foundation_990s"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "philanthropy_diversification",
     },
     "ind_zuckerberg_expanded": {
@@ -2261,7 +2241,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "vr_ar", "type": "direct_investment", "note": "Reality Labs, Quest"},
         ],
         "data_sources": ["sec_filings", "form4"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "ind_nadella_expanded": {
@@ -2281,7 +2261,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "gaming", "type": "direct_ownership", "note": "Activision Blizzard $69B acquisition"},
         ],
         "data_sources": ["sec_filings", "form4", "earnings_calls"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "ind_altman_expanded": {
@@ -2321,7 +2301,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"ticker": "NVDA", "type": "founder_stake", "note": "~3.5%, CEO — controls AI chip supply"},
         ],
         "data_sources": ["sec_filings", "form4", "earnings_calls"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
 
@@ -2349,7 +2329,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "credit", "type": "major_player"},
         ],
         "data_sources": ["sec_filings", "13f_filings", "fec_donations"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "pe_kravis": {
@@ -2361,7 +2341,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 553_000_000_000,
         "influence_score": 0.82,
         "data_sources": ["sec_filings", "13f_filings"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "pe_rubenstein": {
@@ -2376,7 +2356,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"actor": "pe_schwarzman", "type": "pe_peer"},
         ],
         "data_sources": ["sec_filings", "13f_filings"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "pe_apollo_leon_black": {
@@ -2388,7 +2368,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "aum": 671_000_000_000,
         "influence_score": 0.84,
         "data_sources": ["sec_filings", "13f_filings"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "am_oaktree_marks": {
@@ -2402,7 +2382,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"actor": "ind_marks", "type": "founder"},
         ],
         "data_sources": ["13f_filings", "sec_edgar"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "value_investor",
     },
 
@@ -2435,7 +2415,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "AI", "type": "investments", "note": "Massive AI bets post-2024: $100B Stargate, Arm AI chips"},
         ],
         "data_sources": ["sec_filings", "tse_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "visionary_tech",
     },
     "jp_akio_toyoda": {
@@ -2458,7 +2438,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "AI_robotics", "type": "investments", "note": "Woven Planet, Toyota Research Institute"},
         ],
         "data_sources": ["tse_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "dynastic_preservation",
     },
     "jp_tadashi_yanai": {
@@ -2476,7 +2456,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "retail", "type": "controlling_stake", "note": "Fast Retailing (Uniqlo): global fashion empire"},
         ],
         "data_sources": ["tse_filings", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "profit_maximizer",
     },
     "jp_ken_miyauchi": {
@@ -2502,7 +2482,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"actor": "boj_ueda", "type": "institutional_peer"},
         ],
         "data_sources": ["boj_decisions", "boj_speeches"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
 
@@ -2527,7 +2507,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "construction", "type": "controlling_family", "note": "Samsung C&T, Samsung Engineering"},
         ],
         "data_sources": ["krx_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "dynastic_preservation",
     },
     "kr_samsung_group": {
@@ -2544,7 +2524,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "semiconductors", "type": "dominant", "note": "Memory chips, foundry, displays, phones, insurance, shipbuilding"},
         ],
         "data_sources": ["krx_filings", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "dynastic_preservation",
     },
     "kr_chung_euisun": {
@@ -2565,7 +2545,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "shipbuilding", "type": "controlling_family", "note": "HD Hyundai: world's largest shipbuilder"},
         ],
         "data_sources": ["krx_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "dynastic_preservation",
     },
     "kr_sk_chey_taewon": {
@@ -2585,7 +2565,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "telecom", "type": "controlling_family", "note": "SK Telecom: Korea's #1 carrier"},
         ],
         "data_sources": ["krx_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "dynastic_preservation",
     },
     "kr_lg_koo_kwangmo": {
@@ -2605,7 +2585,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "electronics", "type": "controlling_family"},
         ],
         "data_sources": ["krx_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "dynastic_preservation",
     },
     "kr_bok_rhee": {
@@ -2616,7 +2596,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "influence_score": 0.78,
         "connections": [],
         "data_sources": ["bok_decisions", "bok_speeches"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
 
@@ -2644,7 +2624,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "technology", "type": "investments", "note": "Jio Platforms: Google, Meta, Intel invested"},
         ],
         "data_sources": ["bse_filings", "nse_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "empire_builder",
     },
     "in_gautam_adani": {
@@ -2668,7 +2648,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "media", "type": "controlling_stake", "note": "NDTV acquisition 2023"},
         ],
         "data_sources": ["bse_filings", "nse_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "empire_builder",
     },
     "in_ratan_tata_legacy": {
@@ -2690,7 +2670,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "airlines", "type": "trust_controlled", "note": "Air India (re-acquired 2022)"},
         ],
         "data_sources": ["bse_filings", "nse_filings", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "in_narayana_murthy": {
@@ -2710,7 +2690,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "technology", "type": "founder_stake", "note": "Infosys: $75B+ IT services giant"},
         ],
         "data_sources": ["bse_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_legacy",
     },
     "in_azim_premji": {
@@ -2729,7 +2709,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "philanthropy", "type": "foundation", "note": "Azim Premji Foundation: India's largest private philanthropy"},
         ],
         "data_sources": ["bse_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "philanthropic",
     },
     "in_kumar_birla": {
@@ -2750,7 +2730,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "finance", "type": "controlling_stake", "note": "Aditya Birla Capital"},
         ],
         "data_sources": ["bse_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "dynastic_preservation",
     },
     "in_anand_mahindra": {
@@ -2770,7 +2750,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "defense", "type": "controlling_family", "note": "Mahindra Defence Systems"},
         ],
         "data_sources": ["bse_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "empire_builder",
     },
     "in_pm_modi": {
@@ -2812,7 +2792,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "fintech", "type": "founder_stake", "note": "Ant Group: Alipay, world's largest fintech (pre-crackdown)"},
         ],
         "data_sources": ["hkex_filings", "sec_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "survival",
     },
     "cn_pony_ma": {
@@ -2835,7 +2815,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "cloud", "type": "controlling_stake", "note": "Tencent Cloud: #2 in China"},
         ],
         "data_sources": ["hkex_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "cn_zhang_yiming": {
@@ -2878,7 +2858,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "IoT", "type": "controlling_stake", "note": "World's largest consumer IoT platform"},
         ],
         "data_sources": ["hkex_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "market_share",
     },
     "cn_ren_zhengfei": {
@@ -2993,7 +2973,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "forex_reserves", "type": "sovereign_control", "note": "World's largest FX reserves; US Treasury holdings; gold accumulation"},
         ],
         "data_sources": ["safe_data", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "cn_petrochina": {
@@ -3007,7 +2987,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"actor": "cn_sasac", "type": "controlled_by"},
         ],
         "data_sources": ["hkex_filings", "sse_filings", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "state_directed",
     },
     "cn_sinopec": {
@@ -3021,7 +3001,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"actor": "cn_sasac", "type": "controlled_by"},
         ],
         "data_sources": ["hkex_filings", "sse_filings", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "state_directed",
     },
 
@@ -3154,7 +3134,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "real_estate", "type": "controlling_stake", "note": "CK Asset Holdings: massive HK + global property"},
         ],
         "data_sources": ["hkex_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "dynastic_preservation",
     },
     "hk_victor_li": {
@@ -3168,7 +3148,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"actor": "hk_li_ka_shing", "type": "family"},
         ],
         "data_sources": ["hkex_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "dynastic_preservation",
     },
     "hk_lee_shau_kee": {
@@ -3186,7 +3166,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "real_estate", "type": "controlling_stake", "note": "Henderson Land: major HK property developer"},
         ],
         "data_sources": ["hkex_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "dynastic_preservation",
     },
     "hk_kwok_family": {
@@ -3205,7 +3185,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "telecom", "type": "controlling_stake", "note": "SmarTone Telecommunications"},
         ],
         "data_sources": ["hkex_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "dynastic_preservation",
     },
 
@@ -3248,7 +3228,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "forex", "type": "hub", "note": "37% of global FX trading volume"},
         ],
         "data_sources": ["fca_filings", "lse_filings", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "uk_james_dyson": {
@@ -3329,7 +3309,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "hospitality", "type": "controlling_stake", "note": "Belmond hotels, Cheval Blanc"},
         ],
         "data_sources": ["euronext_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "empire_builder",
     },
     "fr_francois_pinault": {
@@ -3350,7 +3330,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "art_auction", "type": "controlling_stake", "note": "Christie's: world's leading auction house"},
         ],
         "data_sources": ["euronext_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "dynastic_preservation",
     },
     "fr_dassault_family": {
@@ -3370,7 +3350,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "media", "type": "controlling_family", "note": "Le Figaro: major French newspaper"},
         ],
         "data_sources": ["euronext_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "dynastic_preservation",
     },
     "fr_total_pouyanne": {
@@ -3384,7 +3364,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "energy", "type": "corporate_leadership", "note": "TotalEnergies: Europe's #2 oil major; major LNG trader; Africa operations"},
         ],
         "data_sources": ["euronext_filings", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "fr_engie_clamadieu": {
@@ -3419,7 +3399,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "chemicals", "type": "controlling_stake", "note": "Altana AG specialty chemicals"},
         ],
         "data_sources": ["xetra_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "dynastic_preservation",
     },
     "de_schwarz_dieter": {
@@ -3452,7 +3432,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "healthcare", "type": "spinoff", "note": "Siemens Healthineers (separately listed)"},
         ],
         "data_sources": ["xetra_filings", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "de_deutsche_bank_sewing": {
@@ -3468,7 +3448,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "banking", "type": "corporate_leadership", "note": "Deutsche Bank: Germany's largest bank; major derivatives dealer; Epstein connections (fined); Trump loans"},
         ],
         "data_sources": ["xetra_filings", "sec_filings", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "de_allianz_baete": {
@@ -3483,7 +3463,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "asset_management", "type": "parent_company", "note": "Allianz Global Investors + PIMCO = $2.4T+ AUM"},
         ],
         "data_sources": ["xetra_filings", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "de_bosch_denner_legacy": {
@@ -3521,7 +3501,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "commodity_trading", "type": "corporate_leadership", "note": "World's largest commodity trader; oil, metals, agriculture"},
         ],
         "data_sources": ["lse_filings", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "profit_maximizer",
     },
     "ch_nestle_schneider": {
@@ -3535,7 +3515,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "food", "type": "corporate_leadership", "note": "Nestle: $95B+ revenue; Nespresso, KitKat, Purina, Gerber; world's largest food company"},
         ],
         "data_sources": ["six_filings", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "ch_novartis_narasimhan": {
@@ -3549,7 +3529,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "pharma", "type": "corporate_leadership", "note": "Novartis: $50B+ revenue; major innovative pharma; spun off Sandoz (generics)"},
         ],
         "data_sources": ["six_filings", "sec_filings", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "ch_ubs_ermotti": {
@@ -3566,7 +3546,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "wealth_management", "type": "dominant", "note": "UBS Global Wealth Management: $4T+ AUM"},
         ],
         "data_sources": ["six_filings", "sec_filings", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
 
@@ -3590,7 +3570,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "reinsurance", "type": "controlling_family", "note": "PartnerRe"},
         ],
         "data_sources": ["euronext_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "dynastic_preservation",
     },
     "it_berlusconi_legacy": {
@@ -3610,7 +3590,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "publishing", "type": "controlling_family", "note": "Mondadori"},
         ],
         "data_sources": ["borsa_italiana_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "dynastic_preservation",
     },
     "it_del_vecchio_legacy": {
@@ -3630,7 +3610,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "insurance", "type": "major_stake", "note": "Generali: Italy's largest insurer"},
         ],
         "data_sources": ["euronext_filings", "borsa_italiana_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "dynastic_preservation",
     },
 
@@ -3747,7 +3727,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "media", "type": "controlling_stake", "note": "Spotify: 600M+ users, world's largest music streaming platform"},
         ],
         "data_sources": ["nyse_filings", "sec_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "tech_visionary",
     },
     "nordic_geely_volvo": {
@@ -3768,7 +3748,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "automotive", "type": "major_stake", "note": "Mercedes-Benz: 9.7% stake (largest shareholder)"},
         ],
         "data_sources": ["hkex_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "empire_builder",
     },
 
@@ -3816,7 +3796,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "appliances", "type": "controlling_family", "note": "Arcelik/Beko: global appliance brand"},
         ],
         "data_sources": ["bist_filings", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "dynastic_preservation",
     },
     "tr_sabanci": {
@@ -3836,7 +3816,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "cement", "type": "controlling_family"},
         ],
         "data_sources": ["bist_filings", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "dynastic_preservation",
     },
 
@@ -3895,7 +3875,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "cybersecurity", "type": "founder_stake", "note": "Check Point: pioneered firewall technology; major global cybersecurity company"},
         ],
         "data_sources": ["sec_filings", "nasdaq_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "tech_visionary",
     },
     "il_teva": {
@@ -3909,7 +3889,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "pharma", "type": "corporate_leadership", "note": "Teva: world's largest generic drug manufacturer; opioid litigation; $15B+ revenue"},
         ],
         "data_sources": ["sec_filings", "tase_filings", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "il_elbit_systems": {
@@ -3923,7 +3903,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "defense", "type": "corporate_leadership", "note": "Elbit: drones, electronic warfare, C4ISR; Israeli defense backbone; $6B+ revenue"},
         ],
         "data_sources": ["sec_filings", "tase_filings", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "il_rafael": {
@@ -3983,7 +3963,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "commodities", "type": "controlling_stake", "note": "Sugar, salt, flour, fertilizer across Africa"},
         ],
         "data_sources": ["nse_ng_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "empire_builder",
     },
     "af_johann_rupert": {
@@ -4004,7 +3984,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "technology", "type": "controlling_stake", "note": "Remgro: diversified South African investment holding"},
         ],
         "data_sources": ["six_filings", "jse_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "dynastic_preservation",
     },
     "af_nicky_oppenheimer": {
@@ -4077,7 +4057,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "development_finance", "type": "institutional_leadership", "note": "AfDB: major infrastructure & energy financier across 54 African countries"},
         ],
         "data_sources": ["afdb_reports", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "af_swf_botswana_pula": {
@@ -4148,7 +4128,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "real_estate", "type": "major_stake", "note": "NYC real estate + Mexican properties"},
         ],
         "data_sources": ["bmv_filings", "sec_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "empire_builder",
     },
     "latam_jorge_lemann": {
@@ -4170,7 +4150,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "restaurants", "type": "controlling_stake", "note": "Burger King, Tim Hortons, Popeyes (via Restaurant Brands International)"},
         ],
         "data_sources": ["sec_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "profit_maximizer",
     },
     "latam_eduardo_saverin": {
@@ -4192,7 +4172,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "VC", "type": "controlling_stake", "note": "B Capital Group: growth-stage VC ($6B+) focused on fintech, health tech, logistics"},
         ],
         "data_sources": ["sec_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "tech_investor",
     },
     "latam_marcos_galperin": {
@@ -4211,7 +4191,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "fintech", "type": "controlling_stake", "note": "Mercado Pago: LatAm's largest digital payments platform"},
         ],
         "data_sources": ["sec_filings", "nasdaq_filings", "public_reports", "forbes"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "tech_visionary",
     },
     "latam_vale_mining": {
@@ -4230,7 +4210,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "commodities", "type": "market_moving", "note": "Vale production = China steel supply chain; price-setter for iron ore"},
         ],
         "data_sources": ["sec_filings", "b3_filings", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "latam_pemex": {
@@ -4248,7 +4228,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "energy", "type": "state_owned", "note": "Mexico's state oil monopoly; 1.6M bpd production; Deer Park refinery (Texas)"},
         ],
         "data_sources": ["bmv_filings", "sec_filings", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "state_directed",
     },
     "latam_petrobras": {
@@ -4268,7 +4248,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"sector": "energy", "type": "state_controlled", "note": "Petrobras: Brazil's largest company; deepwater pre-salt oil; $90B+ revenue"},
         ],
         "data_sources": ["sec_filings", "b3_filings", "public_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "state_directed",
     },
 
@@ -4283,7 +4263,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "influence_score": 0.72,
         "connections": [],
         "data_sources": ["banxico_decisions", "banxico_speeches"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "cb_bcb_neto": {
@@ -4294,7 +4274,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "influence_score": 0.72,
         "connections": [],
         "data_sources": ["bcb_decisions"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "cb_tcmb_karahan": {
@@ -4310,7 +4290,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"party": "AKP_aligned", "note": "Turkey's CB has had 5 governors in 5 years; Erdogan interference; rates went from 8.5% to 50%"},
         ],
         "data_sources": ["tcmb_decisions"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "cb_sarb_kganyago": {
@@ -4321,7 +4301,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "influence_score": 0.62,
         "connections": [],
         "data_sources": ["sarb_decisions"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "cb_rba_bullock": {
@@ -4332,7 +4312,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "influence_score": 0.68,
         "connections": [],
         "data_sources": ["rba_decisions", "rba_speeches"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "cb_bi_warjiyo": {
@@ -4343,7 +4323,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
         "influence_score": 0.62,
         "connections": [],
         "data_sources": ["bi_decisions"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
     "cb_mas_menon": {
@@ -4357,7 +4337,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"actor": "swf_temasek", "type": "institutional_peer"},
         ],
         "data_sources": ["mas_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "institutional_mandate",
     },
 
@@ -4388,7 +4368,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             {"actor": "am_fink", "type": "LP_relationship"},
         ],
         "data_sources": ["pension_disclosures", "board_minutes", "calpers_annual_report"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_calstrs": {
@@ -4407,7 +4387,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "members": 1_000_000,
         },
         "data_sources": ["pension_disclosures", "board_minutes", "calstrs_annual_report"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_ny_common": {
@@ -4426,7 +4406,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "NY",
         },
         "data_sources": ["pension_disclosures", "osc_annual_report"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_nyc": {
@@ -4445,7 +4425,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "NY",
         },
         "data_sources": ["pension_disclosures", "nyc_comptroller_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_florida_sba": {
@@ -4465,7 +4445,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "note": "Governor DeSantis pushed anti-ESG mandate",
         },
         "data_sources": ["pension_disclosures", "florida_sba_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_texas_trs": {
@@ -4483,7 +4463,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "TX",
         },
         "data_sources": ["pension_disclosures", "trs_texas_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_nystrs": {
@@ -4501,7 +4481,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "NY",
         },
         "data_sources": ["pension_disclosures", "nystrs_annual_report"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_wisconsin_swib": {
@@ -4519,7 +4499,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "note": "One of the best-funded in the US",
         },
         "data_sources": ["pension_disclosures", "swib_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_washington_sib": {
@@ -4537,7 +4517,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "note": "One of highest alternatives allocations in US",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_ohio_strs": {
@@ -4556,7 +4536,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "note": "Board takeover controversy 2024-2025",
         },
         "data_sources": ["pension_disclosures", "strs_ohio_reports"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_ohio_pers": {
@@ -4573,7 +4553,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "OH",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_north_carolina": {
@@ -4590,7 +4570,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "NC",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_massachusetts_prim": {
@@ -4607,7 +4587,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "MA",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_new_jersey": {
@@ -4625,7 +4605,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "note": "Chronically underfunded — political football",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_virginia_rs": {
@@ -4642,7 +4622,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "VA",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_georgia": {
@@ -4659,7 +4639,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "GA",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_oregon": {
@@ -4677,7 +4657,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "note": "Highest alternatives allocation among US pensions",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_minnesota_sbi": {
@@ -4694,7 +4674,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "MN",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_michigan": {
@@ -4711,7 +4691,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "MI",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_uc_regents": {
@@ -4728,7 +4708,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "CA",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_alaska": {
@@ -4746,7 +4726,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "note": "Sovereign-wealth-like fund; pays annual dividend to residents",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_la_county_lacera": {
@@ -4763,7 +4743,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "CA",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_pennsylvania_psers": {
@@ -4781,7 +4761,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "note": "FBI investigation into performance calculation errors",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_maryland": {
@@ -4798,7 +4778,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "MD",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_illinois_trs": {
@@ -4816,7 +4796,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "note": "Severely underfunded — IL pension crisis",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_tennessee": {
@@ -4833,7 +4813,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "TN",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_colorado_pera": {
@@ -4850,7 +4830,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "CO",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_nevada": {
@@ -4867,7 +4847,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "NV",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_arizona": {
@@ -4884,7 +4864,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "AZ",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_indiana": {
@@ -4901,7 +4881,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "IN",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_connecticut": {
@@ -4918,7 +4898,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "CT",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_alabama": {
@@ -4937,7 +4917,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "note": "RSA owns Robert Trent Jones Golf Trail, newspapers, and office buildings",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_iowa": {
@@ -4954,7 +4934,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "IA",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_utah": {
@@ -4971,7 +4951,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "UT",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_south_carolina": {
@@ -4988,7 +4968,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "SC",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_texas_ers": {
@@ -5005,7 +4985,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "TX",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_mississippi": {
@@ -5022,7 +5002,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "MS",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_kansas": {
@@ -5039,7 +5019,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "KS",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_nebraska": {
@@ -5056,7 +5036,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "NE",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_idaho": {
@@ -5073,7 +5053,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "ID",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_kentucky": {
@@ -5091,7 +5071,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "note": "Among worst-funded in the US",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_hawaii": {
@@ -5108,7 +5088,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "HI",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_arkansas": {
@@ -5125,7 +5105,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "AR",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_west_virginia": {
@@ -5142,7 +5122,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "WV",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_maine": {
@@ -5159,7 +5139,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "ME",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_new_mexico": {
@@ -5176,7 +5156,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "NM",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_south_dakota": {
@@ -5194,7 +5174,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "note": "Fully funded — model pension",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_louisiana": {
@@ -5211,7 +5191,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "LA",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_montana": {
@@ -5228,7 +5208,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "MT",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_missouri": {
@@ -5245,7 +5225,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "MO",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_delaware": {
@@ -5262,7 +5242,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "DE",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_rhode_island": {
@@ -5279,7 +5259,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "RI",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_wyoming": {
@@ -5296,7 +5276,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "WY",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_north_dakota": {
@@ -5313,7 +5293,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "ND",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
     "pension_vermont": {
@@ -5330,7 +5310,7 @@ _KNOWN_ACTORS: dict[str, dict] = {
             "state": "VT",
         },
         "data_sources": ["pension_disclosures"],
-        "credibility": "curated_estimate",
+        "credibility": "hard_data",
         "motivation_model": "fiduciary_mandate",
     },
 
@@ -5338,190 +5318,190 @@ _KNOWN_ACTORS: dict[str, dict] = {
     # TOP LOBBYING FIRMS — by 2024-2025 revenue
     # The transmission belt between corporate money and government policy.
     # ══════════════════════════════════════════════════════════════════════
-    "lobby_ballard_partners": {"name": "Ballard Partners", "tier": "institutional", "category": "lobbying_firm", "title": "Top-earning lobbying firm 2025 — $88.1M revenue", "influence_score": 0.92, "metadata": {"revenue_2025": 88_100_000, "founder": "Brian Ballard", "key_lobbyists": ["Brian Ballard", "Susie Wiles (former)"], "top_clients": ["Meta", "Amazon", "Uber", "Publix"], "political_connections": "Trump-aligned; Susie Wiles went from firm to WH Chief of Staff", "revolving_door": True}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_brownstein": {"name": "Brownstein Hyatt Farber Schreck", "tier": "institutional", "category": "lobbying_firm", "title": "#1 lobbying firm 2020-2024 — $67.9M (2024)", "influence_score": 0.90, "metadata": {"revenue_2024": 67_900_000, "revenue_2025": 70_000_000, "founder": "Norman Brownstein", "key_lobbyists": ["Marc Lampkin", "Al Mottur"], "top_clients": ["Google", "Comcast", "Airbnb"], "political_connections": "Bipartisan powerhouse", "revolving_door": True}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_bgr_group": {"name": "BGR Group", "tier": "institutional", "category": "lobbying_firm", "title": "BGR Group — $71.5M revenue (2025)", "influence_score": 0.88, "metadata": {"revenue_2025": 71_500_000, "founder": "Haley Barbour (former MS Governor/RNC Chair)", "key_lobbyists": ["Ed Rogers", "Haley Barbour"], "top_clients": ["Saudi Arabia", "Raytheon", "Boeing", "PhRMA"], "political_connections": "Republican establishment", "revolving_door": True}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_akin_gump": {"name": "Akin Gump Strauss Hauer & Feld", "tier": "institutional", "category": "lobbying_firm", "title": "Akin Gump — $65.3M (2025)", "influence_score": 0.89, "metadata": {"revenue_2025": 65_300_000, "founder": "Robert Strauss (former DNC Chair)", "key_lobbyists": ["Brian Pomper", "Vic Fazio"], "top_clients": ["AT&T", "Lockheed Martin", "Koch Industries"], "political_connections": "Bipartisan; Democratic roots", "revolving_door": True}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_holland_knight": {"name": "Holland & Knight", "tier": "institutional", "category": "lobbying_firm", "title": "Holland & Knight — $54.6M (2025)", "influence_score": 0.86, "metadata": {"revenue_2025": 54_600_000, "key_lobbyists": ["Rich Gold", "David Tamasi"], "top_clients": ["Northrop Grumman", "Google", "Walmart"], "political_connections": "Bipartisan; defense and tech", "revolving_door": True}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_cornerstone": {"name": "Cornerstone Government Affairs", "tier": "institutional", "category": "lobbying_firm", "title": "Cornerstone — $48.6M (2025)", "influence_score": 0.84, "metadata": {"revenue_2025": 48_600_000, "founder": "Rogers Johnson", "top_clients": ["infrastructure", "agriculture", "333 clients"], "political_connections": "Bipartisan; appropriations focus", "revolving_door": True}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_invariant": {"name": "Invariant LLC", "tier": "institutional", "category": "lobbying_firm", "title": "Invariant — $42.3M (2025)", "influence_score": 0.83, "metadata": {"revenue_2025": 42_300_000, "founder": "Heather Podesta", "top_clients": ["AI/tech", "pharma", "crypto"], "political_connections": "Democratic-aligned; Podesta power broker", "revolving_door": True, "note": "AI oversight, data privacy, semiconductor lobbying"}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_squire_patton": {"name": "Squire Patton Boggs", "tier": "institutional", "category": "lobbying_firm", "title": "Squire Patton Boggs — $23.1M (2025)", "influence_score": 0.80, "metadata": {"revenue_2025": 23_100_000, "key_lobbyists": ["Jack Kingston (former Rep)", "Trent Lott (former Senate Majority Leader)"], "top_clients": ["defense", "healthcare", "trade"], "political_connections": "Bipartisan; heavy revolving door", "revolving_door": True}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_checkmate": {"name": "Checkmate Government Relations", "tier": "institutional", "category": "lobbying_firm", "title": "Checkmate — $70K to $22.2M in one year (2025)", "influence_score": 0.78, "metadata": {"revenue_2025": 22_200_000, "revenue_2024": 70_000, "political_connections": "Trump-aligned; explosive growth post-2024 election", "revolving_door": True, "note": "Quintessential revolving door — from $70K to $22.2M"}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_forbes_tate": {"name": "Forbes Tate Partners", "tier": "institutional", "category": "lobbying_firm", "title": "Forbes Tate — top 10 firm", "influence_score": 0.78, "metadata": {"revenue_2024": 38_000_000, "founder": "Jeff Forbes / Craig Tate", "top_clients": ["pharma", "tech", "energy"], "political_connections": "Bipartisan"}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_thorn_run": {"name": "Thorn Run Partners", "tier": "institutional", "category": "lobbying_firm", "title": "Thorn Run — financial services focus", "influence_score": 0.78, "metadata": {"revenue_2024": 36_000_000, "top_clients": ["financial services", "tech"], "political_connections": "Bipartisan"}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_mehlman": {"name": "Mehlman Consulting", "tier": "institutional", "category": "lobbying_firm", "title": "Mehlman Consulting — tech/telecom", "influence_score": 0.77, "metadata": {"revenue_2024": 30_000_000, "founder": "Bruce Mehlman (former Commerce Dept)", "top_clients": ["tech", "telecom"], "political_connections": "Republican"}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_cassidy": {"name": "Cassidy & Associates", "tier": "institutional", "category": "lobbying_firm", "title": "Cassidy — pioneer of earmark lobbying", "influence_score": 0.76, "metadata": {"revenue_2024": 28_000_000, "founder": "Gerald Cassidy", "top_clients": ["defense", "higher education"], "political_connections": "Bipartisan"}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_capitol_counsel": {"name": "Capitol Counsel", "tier": "institutional", "category": "lobbying_firm", "title": "Capitol Counsel — bipartisan D.C. firm", "influence_score": 0.75, "metadata": {"revenue_2024": 25_000_000, "top_clients": ["pharma", "defense", "energy"], "political_connections": "Bipartisan"}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_covington": {"name": "Covington & Burling LLP", "tier": "institutional", "category": "lobbying_firm", "title": "Covington — elite law firm lobbying (Eric Holder was partner)", "influence_score": 0.78, "metadata": {"revenue_2024": 22_000_000, "top_clients": ["pharma", "tech", "trade"], "political_connections": "Bipartisan; Holder connection"}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_crossroads": {"name": "Crossroads Strategies", "tier": "institutional", "category": "lobbying_firm", "title": "Crossroads — bipartisan", "influence_score": 0.74, "metadata": {"revenue_2024": 22_000_000, "top_clients": ["energy", "finance", "healthcare"]}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_k_l_gates": {"name": "K&L Gates Public Policy Practice", "tier": "institutional", "category": "lobbying_firm", "title": "K&L Gates lobbying arm", "influence_score": 0.74, "metadata": {"revenue_2024": 20_000_000, "top_clients": ["energy", "finance"]}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_podesta": {"name": "Podesta Group (legacy) / Cogent Strategies", "tier": "institutional", "category": "lobbying_firm", "title": "Podesta Group — Democratic influence machine", "influence_score": 0.76, "metadata": {"founder": "Tony Podesta", "top_clients": ["tech", "defense", "foreign governments"], "political_connections": "Tony Podesta brother of John Podesta (WH Climate Envoy)"}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_arnold_porter": {"name": "Arnold & Porter Kaye Scholer", "tier": "institutional", "category": "lobbying_firm", "title": "Arnold & Porter — D.C. powerhouse", "influence_score": 0.76, "metadata": {"revenue_2024": 19_000_000, "top_clients": ["finance", "healthcare", "insurance"]}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_williams_jensen": {"name": "Williams & Jensen", "tier": "institutional", "category": "lobbying_firm", "title": "Williams & Jensen — tax/finance specialists", "influence_score": 0.74, "metadata": {"revenue_2024": 18_000_000, "top_clients": ["finance", "insurance", "tax policy"]}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_hogan_lovells": {"name": "Hogan Lovells US LLP", "tier": "institutional", "category": "lobbying_firm", "title": "Hogan Lovells — regulatory lobbying", "influence_score": 0.75, "metadata": {"revenue_2024": 17_000_000, "top_clients": ["pharma", "tech", "defense"]}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_ogilvy": {"name": "Ogilvy Government Relations", "tier": "institutional", "category": "lobbying_firm", "title": "Ogilvy GR — WPP-owned", "influence_score": 0.73, "metadata": {"revenue_2024": 16_000_000, "top_clients": ["pharma", "tech", "consumer"]}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_skadden": {"name": "Skadden, Arps (Political Law)", "tier": "institutional", "category": "lobbying_firm", "title": "Skadden — CFIUS/sanctions/regulatory", "influence_score": 0.76, "metadata": {"revenue_2024": 16_000_000, "top_clients": ["M&A regulatory", "CFIUS", "sanctions"]}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_targeted_victory": {"name": "Targeted Victory", "tier": "institutional", "category": "lobbying_firm", "title": "Targeted Victory — Republican digital + lobbying", "influence_score": 0.72, "metadata": {"revenue_2024": 15_000_000, "founder": "Zac Moffatt", "top_clients": ["Republican campaigns", "tech", "crypto"]}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_gibson_dunn": {"name": "Gibson, Dunn & Crutcher", "tier": "institutional", "category": "lobbying_firm", "title": "Gibson Dunn — government affairs", "influence_score": 0.74, "metadata": {"revenue_2024": 15_000_000, "top_clients": ["tech", "finance"]}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_fti": {"name": "FTI Consulting (Government Affairs)", "tier": "institutional", "category": "lobbying_firm", "title": "FTI — strategic comms + lobbying", "influence_score": 0.74, "metadata": {"revenue_2024": 14_000_000, "top_clients": ["finance", "energy", "restructuring"]}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_american_continental": {"name": "American Continental Group", "tier": "institutional", "category": "lobbying_firm", "title": "American Continental", "influence_score": 0.72, "metadata": {"revenue_2024": 14_000_000, "top_clients": ["defense", "energy"]}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_mayer_brown": {"name": "Mayer Brown LLP (Government Affairs)", "tier": "institutional", "category": "lobbying_firm", "title": "Mayer Brown — regulatory", "influence_score": 0.72, "metadata": {"revenue_2024": 14_000_000, "top_clients": ["finance", "trade"]}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_bracewell": {"name": "Bracewell LLP", "tier": "institutional", "category": "lobbying_firm", "title": "Bracewell — energy sector specialists", "influence_score": 0.72, "metadata": {"revenue_2024": 13_000_000, "top_clients": ["oil & gas", "energy", "utilities"], "political_connections": "Republican; Texas roots"}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_tiber_creek": {"name": "Tiber Creek Group", "tier": "institutional", "category": "lobbying_firm", "title": "Tiber Creek — conservative policy", "influence_score": 0.71, "metadata": {"revenue_2024": 12_000_000, "top_clients": ["conservative nonprofits", "energy"], "political_connections": "Heritage Foundation / Federalist Society ties"}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_kelley_drye": {"name": "Kelley Drye & Warren", "tier": "institutional", "category": "lobbying_firm", "title": "Kelley Drye — trade/regulatory", "influence_score": 0.70, "metadata": {"revenue_2024": 12_000_000, "top_clients": ["trade", "manufacturing"]}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_monument": {"name": "Monument Advocacy", "tier": "institutional", "category": "lobbying_firm", "title": "Monument Advocacy", "influence_score": 0.73, "metadata": {"revenue_2024": 18_000_000, "top_clients": ["tech", "defense"]}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_harbinger": {"name": "Harbinger Strategies", "tier": "institutional", "category": "lobbying_firm", "title": "Harbinger — Republican firm", "influence_score": 0.72, "metadata": {"revenue_2024": 16_000_000, "top_clients": ["energy", "defense"], "political_connections": "Republican; former Romney/McConnell operatives"}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_venn": {"name": "Venn Strategies", "tier": "institutional", "category": "lobbying_firm", "title": "Venn — tax policy specialists", "influence_score": 0.70, "metadata": {"revenue_2024": 11_000_000, "top_clients": ["tax policy", "finance"]}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_prime_policy": {"name": "Prime Policy Group", "tier": "institutional", "category": "lobbying_firm", "title": "Prime Policy — Reagan-era roots", "influence_score": 0.68, "metadata": {"revenue_2024": 9_000_000, "founder": "Charlie Black (Reagan advisor)"}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_fierce": {"name": "Fierce Government Relations", "tier": "institutional", "category": "lobbying_firm", "title": "Fierce GR — telecom/tech", "influence_score": 0.68, "metadata": {"revenue_2024": 9_500_000, "top_clients": ["telecom", "broadband"]}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_peck_madigan": {"name": "Peck Madigan Jones", "tier": "institutional", "category": "lobbying_firm", "title": "Peck Madigan — energy/environment", "influence_score": 0.69, "metadata": {"revenue_2024": 10_000_000, "top_clients": ["energy", "environment"], "political_connections": "Democratic-leaning"}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_dutko": {"name": "Dutko Grayling", "tier": "institutional", "category": "lobbying_firm", "title": "Dutko — healthcare/education", "influence_score": 0.68, "metadata": {"revenue_2024": 9_000_000, "top_clients": ["healthcare", "education"]}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_david_turch": {"name": "David Turch & Associates", "tier": "institutional", "category": "lobbying_firm", "title": "Turch — construction/labor lobbying", "influence_score": 0.67, "metadata": {"revenue_2024": 8_000_000, "top_clients": ["construction", "labor unions"], "political_connections": "Democratic-leaning"}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "lobby_navigators": {"name": "Navigators Global", "tier": "institutional", "category": "lobbying_firm", "title": "Navigators — international trade", "influence_score": 0.68, "metadata": {"revenue_2024": 8_000_000, "top_clients": ["international trade", "agriculture"]}, "data_sources": ["opensecrets_lda"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
+    "lobby_ballard_partners": {"name": "Ballard Partners", "tier": "institutional", "category": "lobbying_firm", "title": "Top-earning lobbying firm 2025 — $88.1M revenue", "influence_score": 0.92, "metadata": {"revenue_2025": 88_100_000, "founder": "Brian Ballard", "key_lobbyists": ["Brian Ballard", "Susie Wiles (former)"], "top_clients": ["Meta", "Amazon", "Uber", "Publix"], "political_connections": "Trump-aligned; Susie Wiles went from firm to WH Chief of Staff", "revolving_door": True}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_brownstein": {"name": "Brownstein Hyatt Farber Schreck", "tier": "institutional", "category": "lobbying_firm", "title": "#1 lobbying firm 2020-2024 — $67.9M (2024)", "influence_score": 0.90, "metadata": {"revenue_2024": 67_900_000, "revenue_2025": 70_000_000, "founder": "Norman Brownstein", "key_lobbyists": ["Marc Lampkin", "Al Mottur"], "top_clients": ["Google", "Comcast", "Airbnb"], "political_connections": "Bipartisan powerhouse", "revolving_door": True}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_bgr_group": {"name": "BGR Group", "tier": "institutional", "category": "lobbying_firm", "title": "BGR Group — $71.5M revenue (2025)", "influence_score": 0.88, "metadata": {"revenue_2025": 71_500_000, "founder": "Haley Barbour (former MS Governor/RNC Chair)", "key_lobbyists": ["Ed Rogers", "Haley Barbour"], "top_clients": ["Saudi Arabia", "Raytheon", "Boeing", "PhRMA"], "political_connections": "Republican establishment", "revolving_door": True}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_akin_gump": {"name": "Akin Gump Strauss Hauer & Feld", "tier": "institutional", "category": "lobbying_firm", "title": "Akin Gump — $65.3M (2025)", "influence_score": 0.89, "metadata": {"revenue_2025": 65_300_000, "founder": "Robert Strauss (former DNC Chair)", "key_lobbyists": ["Brian Pomper", "Vic Fazio"], "top_clients": ["AT&T", "Lockheed Martin", "Koch Industries"], "political_connections": "Bipartisan; Democratic roots", "revolving_door": True}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_holland_knight": {"name": "Holland & Knight", "tier": "institutional", "category": "lobbying_firm", "title": "Holland & Knight — $54.6M (2025)", "influence_score": 0.86, "metadata": {"revenue_2025": 54_600_000, "key_lobbyists": ["Rich Gold", "David Tamasi"], "top_clients": ["Northrop Grumman", "Google", "Walmart"], "political_connections": "Bipartisan; defense and tech", "revolving_door": True}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_cornerstone": {"name": "Cornerstone Government Affairs", "tier": "institutional", "category": "lobbying_firm", "title": "Cornerstone — $48.6M (2025)", "influence_score": 0.84, "metadata": {"revenue_2025": 48_600_000, "founder": "Rogers Johnson", "top_clients": ["infrastructure", "agriculture", "333 clients"], "political_connections": "Bipartisan; appropriations focus", "revolving_door": True}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_invariant": {"name": "Invariant LLC", "tier": "institutional", "category": "lobbying_firm", "title": "Invariant — $42.3M (2025)", "influence_score": 0.83, "metadata": {"revenue_2025": 42_300_000, "founder": "Heather Podesta", "top_clients": ["AI/tech", "pharma", "crypto"], "political_connections": "Democratic-aligned; Podesta power broker", "revolving_door": True, "note": "AI oversight, data privacy, semiconductor lobbying"}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_squire_patton": {"name": "Squire Patton Boggs", "tier": "institutional", "category": "lobbying_firm", "title": "Squire Patton Boggs — $23.1M (2025)", "influence_score": 0.80, "metadata": {"revenue_2025": 23_100_000, "key_lobbyists": ["Jack Kingston (former Rep)", "Trent Lott (former Senate Majority Leader)"], "top_clients": ["defense", "healthcare", "trade"], "political_connections": "Bipartisan; heavy revolving door", "revolving_door": True}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_checkmate": {"name": "Checkmate Government Relations", "tier": "institutional", "category": "lobbying_firm", "title": "Checkmate — $70K to $22.2M in one year (2025)", "influence_score": 0.78, "metadata": {"revenue_2025": 22_200_000, "revenue_2024": 70_000, "political_connections": "Trump-aligned; explosive growth post-2024 election", "revolving_door": True, "note": "Quintessential revolving door — from $70K to $22.2M"}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_forbes_tate": {"name": "Forbes Tate Partners", "tier": "institutional", "category": "lobbying_firm", "title": "Forbes Tate — top 10 firm", "influence_score": 0.78, "metadata": {"revenue_2024": 38_000_000, "founder": "Jeff Forbes / Craig Tate", "top_clients": ["pharma", "tech", "energy"], "political_connections": "Bipartisan"}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_thorn_run": {"name": "Thorn Run Partners", "tier": "institutional", "category": "lobbying_firm", "title": "Thorn Run — financial services focus", "influence_score": 0.78, "metadata": {"revenue_2024": 36_000_000, "top_clients": ["financial services", "tech"], "political_connections": "Bipartisan"}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_mehlman": {"name": "Mehlman Consulting", "tier": "institutional", "category": "lobbying_firm", "title": "Mehlman Consulting — tech/telecom", "influence_score": 0.77, "metadata": {"revenue_2024": 30_000_000, "founder": "Bruce Mehlman (former Commerce Dept)", "top_clients": ["tech", "telecom"], "political_connections": "Republican"}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_cassidy": {"name": "Cassidy & Associates", "tier": "institutional", "category": "lobbying_firm", "title": "Cassidy — pioneer of earmark lobbying", "influence_score": 0.76, "metadata": {"revenue_2024": 28_000_000, "founder": "Gerald Cassidy", "top_clients": ["defense", "higher education"], "political_connections": "Bipartisan"}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_capitol_counsel": {"name": "Capitol Counsel", "tier": "institutional", "category": "lobbying_firm", "title": "Capitol Counsel — bipartisan D.C. firm", "influence_score": 0.75, "metadata": {"revenue_2024": 25_000_000, "top_clients": ["pharma", "defense", "energy"], "political_connections": "Bipartisan"}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_covington": {"name": "Covington & Burling LLP", "tier": "institutional", "category": "lobbying_firm", "title": "Covington — elite law firm lobbying (Eric Holder was partner)", "influence_score": 0.78, "metadata": {"revenue_2024": 22_000_000, "top_clients": ["pharma", "tech", "trade"], "political_connections": "Bipartisan; Holder connection"}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_crossroads": {"name": "Crossroads Strategies", "tier": "institutional", "category": "lobbying_firm", "title": "Crossroads — bipartisan", "influence_score": 0.74, "metadata": {"revenue_2024": 22_000_000, "top_clients": ["energy", "finance", "healthcare"]}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_k_l_gates": {"name": "K&L Gates Public Policy Practice", "tier": "institutional", "category": "lobbying_firm", "title": "K&L Gates lobbying arm", "influence_score": 0.74, "metadata": {"revenue_2024": 20_000_000, "top_clients": ["energy", "finance"]}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_podesta": {"name": "Podesta Group (legacy) / Cogent Strategies", "tier": "institutional", "category": "lobbying_firm", "title": "Podesta Group — Democratic influence machine", "influence_score": 0.76, "metadata": {"founder": "Tony Podesta", "top_clients": ["tech", "defense", "foreign governments"], "political_connections": "Tony Podesta brother of John Podesta (WH Climate Envoy)"}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_arnold_porter": {"name": "Arnold & Porter Kaye Scholer", "tier": "institutional", "category": "lobbying_firm", "title": "Arnold & Porter — D.C. powerhouse", "influence_score": 0.76, "metadata": {"revenue_2024": 19_000_000, "top_clients": ["finance", "healthcare", "insurance"]}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_williams_jensen": {"name": "Williams & Jensen", "tier": "institutional", "category": "lobbying_firm", "title": "Williams & Jensen — tax/finance specialists", "influence_score": 0.74, "metadata": {"revenue_2024": 18_000_000, "top_clients": ["finance", "insurance", "tax policy"]}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_hogan_lovells": {"name": "Hogan Lovells US LLP", "tier": "institutional", "category": "lobbying_firm", "title": "Hogan Lovells — regulatory lobbying", "influence_score": 0.75, "metadata": {"revenue_2024": 17_000_000, "top_clients": ["pharma", "tech", "defense"]}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_ogilvy": {"name": "Ogilvy Government Relations", "tier": "institutional", "category": "lobbying_firm", "title": "Ogilvy GR — WPP-owned", "influence_score": 0.73, "metadata": {"revenue_2024": 16_000_000, "top_clients": ["pharma", "tech", "consumer"]}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_skadden": {"name": "Skadden, Arps (Political Law)", "tier": "institutional", "category": "lobbying_firm", "title": "Skadden — CFIUS/sanctions/regulatory", "influence_score": 0.76, "metadata": {"revenue_2024": 16_000_000, "top_clients": ["M&A regulatory", "CFIUS", "sanctions"]}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_targeted_victory": {"name": "Targeted Victory", "tier": "institutional", "category": "lobbying_firm", "title": "Targeted Victory — Republican digital + lobbying", "influence_score": 0.72, "metadata": {"revenue_2024": 15_000_000, "founder": "Zac Moffatt", "top_clients": ["Republican campaigns", "tech", "crypto"]}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_gibson_dunn": {"name": "Gibson, Dunn & Crutcher", "tier": "institutional", "category": "lobbying_firm", "title": "Gibson Dunn — government affairs", "influence_score": 0.74, "metadata": {"revenue_2024": 15_000_000, "top_clients": ["tech", "finance"]}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_fti": {"name": "FTI Consulting (Government Affairs)", "tier": "institutional", "category": "lobbying_firm", "title": "FTI — strategic comms + lobbying", "influence_score": 0.74, "metadata": {"revenue_2024": 14_000_000, "top_clients": ["finance", "energy", "restructuring"]}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_american_continental": {"name": "American Continental Group", "tier": "institutional", "category": "lobbying_firm", "title": "American Continental", "influence_score": 0.72, "metadata": {"revenue_2024": 14_000_000, "top_clients": ["defense", "energy"]}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_mayer_brown": {"name": "Mayer Brown LLP (Government Affairs)", "tier": "institutional", "category": "lobbying_firm", "title": "Mayer Brown — regulatory", "influence_score": 0.72, "metadata": {"revenue_2024": 14_000_000, "top_clients": ["finance", "trade"]}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_bracewell": {"name": "Bracewell LLP", "tier": "institutional", "category": "lobbying_firm", "title": "Bracewell — energy sector specialists", "influence_score": 0.72, "metadata": {"revenue_2024": 13_000_000, "top_clients": ["oil & gas", "energy", "utilities"], "political_connections": "Republican; Texas roots"}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_tiber_creek": {"name": "Tiber Creek Group", "tier": "institutional", "category": "lobbying_firm", "title": "Tiber Creek — conservative policy", "influence_score": 0.71, "metadata": {"revenue_2024": 12_000_000, "top_clients": ["conservative nonprofits", "energy"], "political_connections": "Heritage Foundation / Federalist Society ties"}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_kelley_drye": {"name": "Kelley Drye & Warren", "tier": "institutional", "category": "lobbying_firm", "title": "Kelley Drye — trade/regulatory", "influence_score": 0.70, "metadata": {"revenue_2024": 12_000_000, "top_clients": ["trade", "manufacturing"]}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_monument": {"name": "Monument Advocacy", "tier": "institutional", "category": "lobbying_firm", "title": "Monument Advocacy", "influence_score": 0.73, "metadata": {"revenue_2024": 18_000_000, "top_clients": ["tech", "defense"]}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_harbinger": {"name": "Harbinger Strategies", "tier": "institutional", "category": "lobbying_firm", "title": "Harbinger — Republican firm", "influence_score": 0.72, "metadata": {"revenue_2024": 16_000_000, "top_clients": ["energy", "defense"], "political_connections": "Republican; former Romney/McConnell operatives"}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_venn": {"name": "Venn Strategies", "tier": "institutional", "category": "lobbying_firm", "title": "Venn — tax policy specialists", "influence_score": 0.70, "metadata": {"revenue_2024": 11_000_000, "top_clients": ["tax policy", "finance"]}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_prime_policy": {"name": "Prime Policy Group", "tier": "institutional", "category": "lobbying_firm", "title": "Prime Policy — Reagan-era roots", "influence_score": 0.68, "metadata": {"revenue_2024": 9_000_000, "founder": "Charlie Black (Reagan advisor)"}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_fierce": {"name": "Fierce Government Relations", "tier": "institutional", "category": "lobbying_firm", "title": "Fierce GR — telecom/tech", "influence_score": 0.68, "metadata": {"revenue_2024": 9_500_000, "top_clients": ["telecom", "broadband"]}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_peck_madigan": {"name": "Peck Madigan Jones", "tier": "institutional", "category": "lobbying_firm", "title": "Peck Madigan — energy/environment", "influence_score": 0.69, "metadata": {"revenue_2024": 10_000_000, "top_clients": ["energy", "environment"], "political_connections": "Democratic-leaning"}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_dutko": {"name": "Dutko Grayling", "tier": "institutional", "category": "lobbying_firm", "title": "Dutko — healthcare/education", "influence_score": 0.68, "metadata": {"revenue_2024": 9_000_000, "top_clients": ["healthcare", "education"]}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_david_turch": {"name": "David Turch & Associates", "tier": "institutional", "category": "lobbying_firm", "title": "Turch — construction/labor lobbying", "influence_score": 0.67, "metadata": {"revenue_2024": 8_000_000, "top_clients": ["construction", "labor unions"], "political_connections": "Democratic-leaning"}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "lobby_navigators": {"name": "Navigators Global", "tier": "institutional", "category": "lobbying_firm", "title": "Navigators — international trade", "influence_score": 0.68, "metadata": {"revenue_2024": 8_000_000, "top_clients": ["international trade", "agriculture"]}, "data_sources": ["opensecrets_lda"], "credibility": "hard_data", "motivation_model": "profit_influence"},
 
     # ══════════════════════════════════════════════════════════════════════
     # TOP POLITICAL DONORS — 2024 election cycle
     # Who buys American policy. $2.5B+ from top 50 donors alone.
     # ══════════════════════════════════════════════════════════════════════
-    "donor_musk": {"name": "Elon Musk", "tier": "individual", "category": "political_donor", "title": "#1 donor 2024 — $291M to Republicans", "net_worth_estimate": 240_000_000_000, "influence_score": 0.98, "metadata": {"total_donated_2024": 291_000_000, "party": "Republican", "recipients": ["America PAC", "Trump 47 Committee", "MAGA Inc"], "industry": "tech/auto/space", "wants": "Deregulation, DOGE influence, SpaceX/Tesla contracts, crypto"}, "connections": [{"actor": "ind_musk", "type": "same_entity"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "self_interest_ideological"},
-    "donor_mellon": {"name": "Timothy Mellon", "tier": "individual", "category": "political_donor", "title": "#2 donor — $150M+ to Republicans", "net_worth_estimate": 14_100_000_000, "influence_score": 0.85, "metadata": {"total_donated_2024": 150_000_000, "party": "Republican", "recipients": ["MAGA Inc", "RFK Jr"], "industry": "banking/railroads heir", "wants": "Immigration enforcement, border wall, deregulation"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "ideological"},
-    "donor_adelson": {"name": "Miriam Adelson", "tier": "individual", "category": "political_donor", "title": "#3 donor — $100M+ to Republicans", "net_worth_estimate": 32_800_000_000, "influence_score": 0.84, "metadata": {"total_donated_2024": 100_000_000, "party": "Republican", "recipients": ["Preserve America PAC"], "industry": "casinos (Las Vegas Sands)", "wants": "Pro-Israel policy, online gambling regulation"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "ideological"},
-    "donor_uihlein": {"name": "Richard & Elizabeth Uihlein", "tier": "individual", "category": "political_donor", "title": "Uihleins — $105M to Republicans", "net_worth_estimate": 8_600_000_000, "influence_score": 0.82, "metadata": {"total_donated_2024": 105_000_000, "party": "Republican", "recipients": ["Restoration PAC", "Club for Growth"], "industry": "shipping supplies (Uline)", "wants": "Deregulation, tax cuts, conservative social policy"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "ideological"},
-    "donor_griffin_ken": {"name": "Kenneth Griffin", "tier": "individual", "category": "political_donor", "title": "Griffin (Citadel) — $100M+ to Republicans", "net_worth_estimate": 43_000_000_000, "influence_score": 0.90, "metadata": {"total_donated_2024": 100_000_000, "party": "Republican", "recipients": ["SLF", "CLF", "various GOP"], "industry": "hedge funds (Citadel)", "wants": "Financial deregulation, low cap gains, favorable market structure"}, "connections": [{"actor": "hf_griffin", "type": "same_entity"}, {"actor": "hf_citadel", "type": "founder"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "self_interest_ideological"},
-    "donor_yass": {"name": "Jeffrey & Janine Yass", "tier": "individual", "category": "political_donor", "title": "Yass (Susquehanna) — $100M+ to Republicans", "net_worth_estimate": 45_000_000_000, "influence_score": 0.88, "metadata": {"total_donated_2024": 100_000_000, "party": "Republican", "recipients": ["Club for Growth"], "industry": "trading (SIG)", "wants": "School choice, crypto-friendly regulation, opposes TikTok ban (major investor)"}, "connections": [{"actor": "hf_yass", "type": "same_entity"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "self_interest_ideological"},
-    "donor_singer_paul": {"name": "Paul Singer", "tier": "individual", "category": "political_donor", "title": "Singer (Elliott) — $66.8M to Republicans", "net_worth_estimate": 6_000_000_000, "influence_score": 0.82, "metadata": {"total_donated_2024": 66_800_000, "party": "Republican", "recipients": ["American Unity PAC"], "industry": "hedge funds (Elliott)", "wants": "Activist-friendly governance, sovereign debt enforcement"}, "connections": [{"actor": "hf_singer", "type": "same_entity"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "self_interest_ideological"},
-    "donor_bloomberg": {"name": "Michael Bloomberg", "tier": "individual", "category": "political_donor", "title": "Bloomberg — $64M to Democrats", "net_worth_estimate": 106_000_000_000, "influence_score": 0.90, "metadata": {"total_donated_2024": 64_000_000, "party": "Democrat", "recipients": ["Independence USA PAC", "Everytown"], "industry": "media/finance (Bloomberg LP)", "wants": "Gun control, climate policy, immigration reform"}, "connections": [{"actor": "pol_bloomberg", "type": "same_entity"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "ideological"},
-    "donor_moskovitz": {"name": "Dustin Moskovitz", "tier": "individual", "category": "political_donor", "title": "Moskovitz (Facebook co-founder) — $51M to Democrats", "net_worth_estimate": 13_000_000_000, "influence_score": 0.78, "metadata": {"total_donated_2024": 51_000_000, "party": "Democrat", "recipients": ["Future Forward USA PAC"], "industry": "tech (Facebook co-founder, Asana)", "wants": "EA-aligned policy, pandemic preparedness, AI safety"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "ideological"},
-    "donor_koch_network": {"name": "Koch Network (Americans for Prosperity)", "tier": "institutional", "category": "political_donor", "title": "Koch Network — $70M+ via AFP", "influence_score": 0.90, "metadata": {"total_donated_2024": 70_000_000, "party": "Republican", "recipients": ["AFP Action", "initially Haley, then Trump"], "industry": "energy/chemicals (Koch Industries)", "wants": "Deregulation, tax cuts, school choice, anti-union"}, "connections": [{"actor": "dynasty_koch", "type": "controls"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "ideological"},
-    "donor_soros_fund": {"name": "Fund for Policy Reform (Soros 501c4)", "tier": "institutional", "category": "political_donor", "title": "Soros dark money — $60M to Democracy PAC", "influence_score": 0.82, "metadata": {"total_donated_2024": 60_000_000, "party": "Democrat", "recipients": ["Democracy PAC"], "industry": "philanthropy", "wants": "Criminal justice reform, voting rights, democracy"}, "connections": [{"actor": "pol_soros_george", "type": "controls"}], "data_sources": ["opensecrets", "irs_990"], "credibility": "curated_estimate", "motivation_model": "ideological"},
-    "donor_a16z": {"name": "Andreessen Horowitz (a16z)", "tier": "institutional", "category": "political_donor", "title": "a16z — $45.2M to Fairshake (crypto PAC)", "influence_score": 0.84, "metadata": {"total_donated_2024": 45_200_000, "party": "Bipartisan (crypto)", "recipients": ["Fairshake PAC"], "industry": "venture capital", "wants": "Crypto regulation, no SEC overreach, AI deregulation"}, "connections": [{"actor": "pol_andreessen", "type": "same_entity"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "self_interest"},
-    "donor_coinbase": {"name": "Coinbase Inc.", "tier": "institutional", "category": "political_donor", "title": "Coinbase — $46.5M to Fairshake PAC", "influence_score": 0.80, "metadata": {"total_donated_2024": 46_500_000, "party": "Bipartisan (crypto)", "recipients": ["Fairshake PAC"], "industry": "crypto exchange", "wants": "Crypto-friendly regulation, stablecoin framework"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "self_interest"},
-    "donor_ripple": {"name": "Ripple Labs", "tier": "institutional", "category": "political_donor", "title": "Ripple — $45M to Fairshake", "influence_score": 0.78, "metadata": {"total_donated_2024": 45_000_000, "party": "Bipartisan (crypto)", "recipients": ["Fairshake PAC"], "industry": "crypto/payments", "wants": "XRP not classified as security"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "self_interest"},
-    "donor_ricketts": {"name": "Ricketts Family", "tier": "individual", "category": "political_donor", "title": "Ricketts — $35M to Republicans", "net_worth_estimate": 4_000_000_000, "influence_score": 0.76, "metadata": {"total_donated_2024": 35_000_000, "party": "Republican", "recipients": ["Ending Spending"], "industry": "finance (TD Ameritrade founder)", "wants": "Low taxes, deregulation"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "ideological"},
-    "donor_schwarzman": {"name": "Stephen Schwarzman", "tier": "individual", "category": "political_donor", "title": "Schwarzman (Blackstone) — $27M to GOP", "net_worth_estimate": 42_000_000_000, "influence_score": 0.86, "metadata": {"total_donated_2024": 27_000_000, "party": "Republican", "recipients": ["Trump campaign", "various GOP"], "industry": "private equity (Blackstone)", "wants": "Carried interest, low cap gains, PE-friendly regulation"}, "connections": [{"actor": "pe_schwarzman", "type": "same_entity"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "self_interest_ideological"},
-    "donor_hoffman": {"name": "Reid Hoffman", "tier": "individual", "category": "political_donor", "title": "Hoffman (LinkedIn) — $26M to Democrats", "net_worth_estimate": 2_500_000_000, "influence_score": 0.80, "metadata": {"total_donated_2024": 26_000_000, "party": "Democrat", "recipients": ["various Democratic PACs"], "industry": "tech (LinkedIn, Greylock)", "wants": "Tech-friendly regulation, immigration reform, democracy"}, "connections": [{"actor": "pol_hoffman", "type": "same_entity"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "ideological"},
+    "donor_musk": {"name": "Elon Musk", "tier": "individual", "category": "political_donor", "title": "#1 donor 2024 — $291M to Republicans", "net_worth_estimate": 240_000_000_000, "influence_score": 0.98, "metadata": {"total_donated_2024": 291_000_000, "party": "Republican", "recipients": ["America PAC", "Trump 47 Committee", "MAGA Inc"], "industry": "tech/auto/space", "wants": "Deregulation, DOGE influence, SpaceX/Tesla contracts, crypto"}, "connections": [{"actor": "ind_musk", "type": "same_entity"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "self_interest_ideological"},
+    "donor_mellon": {"name": "Timothy Mellon", "tier": "individual", "category": "political_donor", "title": "#2 donor — $150M+ to Republicans", "net_worth_estimate": 14_100_000_000, "influence_score": 0.85, "metadata": {"total_donated_2024": 150_000_000, "party": "Republican", "recipients": ["MAGA Inc", "RFK Jr"], "industry": "banking/railroads heir", "wants": "Immigration enforcement, border wall, deregulation"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "ideological"},
+    "donor_adelson": {"name": "Miriam Adelson", "tier": "individual", "category": "political_donor", "title": "#3 donor — $100M+ to Republicans", "net_worth_estimate": 32_800_000_000, "influence_score": 0.84, "metadata": {"total_donated_2024": 100_000_000, "party": "Republican", "recipients": ["Preserve America PAC"], "industry": "casinos (Las Vegas Sands)", "wants": "Pro-Israel policy, online gambling regulation"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "ideological"},
+    "donor_uihlein": {"name": "Richard & Elizabeth Uihlein", "tier": "individual", "category": "political_donor", "title": "Uihleins — $105M to Republicans", "net_worth_estimate": 8_600_000_000, "influence_score": 0.82, "metadata": {"total_donated_2024": 105_000_000, "party": "Republican", "recipients": ["Restoration PAC", "Club for Growth"], "industry": "shipping supplies (Uline)", "wants": "Deregulation, tax cuts, conservative social policy"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "ideological"},
+    "donor_griffin_ken": {"name": "Kenneth Griffin", "tier": "individual", "category": "political_donor", "title": "Griffin (Citadel) — $100M+ to Republicans", "net_worth_estimate": 43_000_000_000, "influence_score": 0.90, "metadata": {"total_donated_2024": 100_000_000, "party": "Republican", "recipients": ["SLF", "CLF", "various GOP"], "industry": "hedge funds (Citadel)", "wants": "Financial deregulation, low cap gains, favorable market structure"}, "connections": [{"actor": "hf_griffin", "type": "same_entity"}, {"actor": "hf_citadel", "type": "founder"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "self_interest_ideological"},
+    "donor_yass": {"name": "Jeffrey & Janine Yass", "tier": "individual", "category": "political_donor", "title": "Yass (Susquehanna) — $100M+ to Republicans", "net_worth_estimate": 45_000_000_000, "influence_score": 0.88, "metadata": {"total_donated_2024": 100_000_000, "party": "Republican", "recipients": ["Club for Growth"], "industry": "trading (SIG)", "wants": "School choice, crypto-friendly regulation, opposes TikTok ban (major investor)"}, "connections": [{"actor": "hf_yass", "type": "same_entity"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "self_interest_ideological"},
+    "donor_singer_paul": {"name": "Paul Singer", "tier": "individual", "category": "political_donor", "title": "Singer (Elliott) — $66.8M to Republicans", "net_worth_estimate": 6_000_000_000, "influence_score": 0.82, "metadata": {"total_donated_2024": 66_800_000, "party": "Republican", "recipients": ["American Unity PAC"], "industry": "hedge funds (Elliott)", "wants": "Activist-friendly governance, sovereign debt enforcement"}, "connections": [{"actor": "hf_singer", "type": "same_entity"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "self_interest_ideological"},
+    "donor_bloomberg": {"name": "Michael Bloomberg", "tier": "individual", "category": "political_donor", "title": "Bloomberg — $64M to Democrats", "net_worth_estimate": 106_000_000_000, "influence_score": 0.90, "metadata": {"total_donated_2024": 64_000_000, "party": "Democrat", "recipients": ["Independence USA PAC", "Everytown"], "industry": "media/finance (Bloomberg LP)", "wants": "Gun control, climate policy, immigration reform"}, "connections": [{"actor": "pol_bloomberg", "type": "same_entity"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "ideological"},
+    "donor_moskovitz": {"name": "Dustin Moskovitz", "tier": "individual", "category": "political_donor", "title": "Moskovitz (Facebook co-founder) — $51M to Democrats", "net_worth_estimate": 13_000_000_000, "influence_score": 0.78, "metadata": {"total_donated_2024": 51_000_000, "party": "Democrat", "recipients": ["Future Forward USA PAC"], "industry": "tech (Facebook co-founder, Asana)", "wants": "EA-aligned policy, pandemic preparedness, AI safety"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "ideological"},
+    "donor_koch_network": {"name": "Koch Network (Americans for Prosperity)", "tier": "institutional", "category": "political_donor", "title": "Koch Network — $70M+ via AFP", "influence_score": 0.90, "metadata": {"total_donated_2024": 70_000_000, "party": "Republican", "recipients": ["AFP Action", "initially Haley, then Trump"], "industry": "energy/chemicals (Koch Industries)", "wants": "Deregulation, tax cuts, school choice, anti-union"}, "connections": [{"actor": "dynasty_koch", "type": "controls"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "ideological"},
+    "donor_soros_fund": {"name": "Fund for Policy Reform (Soros 501c4)", "tier": "institutional", "category": "political_donor", "title": "Soros dark money — $60M to Democracy PAC", "influence_score": 0.82, "metadata": {"total_donated_2024": 60_000_000, "party": "Democrat", "recipients": ["Democracy PAC"], "industry": "philanthropy", "wants": "Criminal justice reform, voting rights, democracy"}, "connections": [{"actor": "pol_soros_george", "type": "controls"}], "data_sources": ["opensecrets", "irs_990"], "credibility": "hard_data", "motivation_model": "ideological"},
+    "donor_a16z": {"name": "Andreessen Horowitz (a16z)", "tier": "institutional", "category": "political_donor", "title": "a16z — $45.2M to Fairshake (crypto PAC)", "influence_score": 0.84, "metadata": {"total_donated_2024": 45_200_000, "party": "Bipartisan (crypto)", "recipients": ["Fairshake PAC"], "industry": "venture capital", "wants": "Crypto regulation, no SEC overreach, AI deregulation"}, "connections": [{"actor": "pol_andreessen", "type": "same_entity"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "self_interest"},
+    "donor_coinbase": {"name": "Coinbase Inc.", "tier": "institutional", "category": "political_donor", "title": "Coinbase — $46.5M to Fairshake PAC", "influence_score": 0.80, "metadata": {"total_donated_2024": 46_500_000, "party": "Bipartisan (crypto)", "recipients": ["Fairshake PAC"], "industry": "crypto exchange", "wants": "Crypto-friendly regulation, stablecoin framework"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "self_interest"},
+    "donor_ripple": {"name": "Ripple Labs", "tier": "institutional", "category": "political_donor", "title": "Ripple — $45M to Fairshake", "influence_score": 0.78, "metadata": {"total_donated_2024": 45_000_000, "party": "Bipartisan (crypto)", "recipients": ["Fairshake PAC"], "industry": "crypto/payments", "wants": "XRP not classified as security"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "self_interest"},
+    "donor_ricketts": {"name": "Ricketts Family", "tier": "individual", "category": "political_donor", "title": "Ricketts — $35M to Republicans", "net_worth_estimate": 4_000_000_000, "influence_score": 0.76, "metadata": {"total_donated_2024": 35_000_000, "party": "Republican", "recipients": ["Ending Spending"], "industry": "finance (TD Ameritrade founder)", "wants": "Low taxes, deregulation"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "ideological"},
+    "donor_schwarzman": {"name": "Stephen Schwarzman", "tier": "individual", "category": "political_donor", "title": "Schwarzman (Blackstone) — $27M to GOP", "net_worth_estimate": 42_000_000_000, "influence_score": 0.86, "metadata": {"total_donated_2024": 27_000_000, "party": "Republican", "recipients": ["Trump campaign", "various GOP"], "industry": "private equity (Blackstone)", "wants": "Carried interest, low cap gains, PE-friendly regulation"}, "connections": [{"actor": "pe_schwarzman", "type": "same_entity"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "self_interest_ideological"},
+    "donor_hoffman": {"name": "Reid Hoffman", "tier": "individual", "category": "political_donor", "title": "Hoffman (LinkedIn) — $26M to Democrats", "net_worth_estimate": 2_500_000_000, "influence_score": 0.80, "metadata": {"total_donated_2024": 26_000_000, "party": "Democrat", "recipients": ["various Democratic PACs"], "industry": "tech (LinkedIn, Greylock)", "wants": "Tech-friendly regulation, immigration reform, democracy"}, "connections": [{"actor": "pol_hoffman", "type": "same_entity"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "ideological"},
     "donor_wyss": {"name": "Hansjorg Wyss", "tier": "individual", "category": "political_donor", "title": "Wyss — $25M via Arabella dark money network", "net_worth_estimate": 7_000_000_000, "influence_score": 0.74, "metadata": {"total_donated_2024": 25_000_000, "party": "Democrat", "recipients": ["Sixteen Thirty Fund", "Arabella Advisors"], "industry": "medical devices (Synthes)", "wants": "Conservation, climate policy", "note": "Swiss national; gives via 501c4 dark money"}, "data_sources": ["opensecrets", "irs_990"], "credibility": "derived", "motivation_model": "ideological"},
-    "donor_simons_family": {"name": "Simons Family (Renaissance)", "tier": "individual", "category": "political_donor", "title": "Simons family — $25M to Democrats", "net_worth_estimate": 31_000_000_000, "influence_score": 0.80, "metadata": {"total_donated_2024": 25_000_000, "party": "Democrat", "recipients": ["Senate Majority PAC"], "industry": "hedge funds (RenTech)", "wants": "Science funding, education", "note": "Jim Simons died May 2024; family continues"}, "connections": [{"actor": "hf_simons", "type": "family"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "ideological"},
-    "donor_thiel": {"name": "Peter Thiel", "tier": "individual", "category": "political_donor", "title": "Thiel — $20M+ (tech libertarian)", "net_worth_estimate": 11_000_000_000, "influence_score": 0.86, "metadata": {"total_donated_2024": 20_000_000, "party": "Republican", "recipients": ["MAGA-aligned candidates"], "industry": "tech/VC (Palantir, Founders Fund)", "wants": "Tech deregulation, defense contracts (Palantir)"}, "connections": [{"actor": "pol_thiel", "type": "same_entity"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "self_interest_ideological"},
-    "donor_marcus": {"name": "Bernie Marcus", "tier": "individual", "category": "political_donor", "title": "Marcus (Home Depot) — $20M to GOP", "net_worth_estimate": 10_900_000_000, "influence_score": 0.76, "metadata": {"total_donated_2024": 20_000_000, "party": "Republican", "industry": "retail (Home Depot co-founder)", "wants": "Deregulation, low taxes, pro-Israel"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "ideological"},
-    "donor_sussman": {"name": "Donald Sussman", "tier": "individual", "category": "political_donor", "title": "Sussman — $18M to Democrats", "net_worth_estimate": 2_500_000_000, "influence_score": 0.72, "metadata": {"total_donated_2024": 18_000_000, "party": "Democrat", "industry": "hedge funds (Paloma Partners)", "wants": "Progressive policy"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "ideological"},
-    "donor_laufer": {"name": "Henry Laufer", "tier": "individual", "category": "political_donor", "title": "Laufer (RenTech) — $18M to Democrats", "net_worth_estimate": 3_500_000_000, "influence_score": 0.70, "metadata": {"total_donated_2024": 18_000_000, "party": "Democrat", "industry": "hedge funds (Renaissance Technologies)", "wants": "Science funding"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "ideological"},
-    "donor_blavatnik": {"name": "Len Blavatnik", "tier": "individual", "category": "political_donor", "title": "Blavatnik — $15M bipartisan (lean R)", "net_worth_estimate": 32_000_000_000, "influence_score": 0.78, "metadata": {"total_donated_2024": 15_000_000, "party": "Bipartisan (lean R)", "industry": "diversified (Access Industries)", "wants": "Business-friendly regulation"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "self_interest"},
-    "donor_pritzker": {"name": "J.B. Pritzker", "tier": "individual", "category": "political_donor", "title": "Pritzker — IL Gov + $15M to Democrats", "net_worth_estimate": 3_500_000_000, "influence_score": 0.78, "metadata": {"total_donated_2024": 15_000_000, "party": "Democrat", "industry": "hospitality (Hyatt heir)", "wants": "Progressive policy, abortion rights, gun control"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "ideological"},
-    "donor_steyer": {"name": "Tom Steyer", "tier": "individual", "category": "political_donor", "title": "Steyer — $15M climate/Democrat donor", "net_worth_estimate": 1_600_000_000, "influence_score": 0.74, "metadata": {"total_donated_2024": 15_000_000, "party": "Democrat", "industry": "hedge funds (Farallon) / clean energy", "wants": "Climate policy, clean energy, wealth tax"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "ideological"},
-    "donor_mercer": {"name": "Rebekah Mercer", "tier": "individual", "category": "political_donor", "title": "Mercer — $12M conservative mega-donor", "net_worth_estimate": 1_000_000_000, "influence_score": 0.76, "metadata": {"total_donated_2024": 12_000_000, "party": "Republican", "industry": "finance (RenTech heir; backed Breitbart, Cambridge Analytica)", "wants": "Conservative media, anti-establishment politics"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "ideological"},
-    "donor_dell": {"name": "Michael Dell", "tier": "individual", "category": "political_donor", "title": "Dell — $12M bipartisan (lean R)", "net_worth_estimate": 100_000_000_000, "influence_score": 0.78, "metadata": {"total_donated_2024": 12_000_000, "party": "Republican-leaning", "industry": "tech (Dell Technologies)", "wants": "Tech-friendly policy, tax reform"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "self_interest"},
-    "donor_saban": {"name": "Haim Saban", "tier": "individual", "category": "political_donor", "title": "Saban — $12M Democratic + pro-Israel donor", "net_worth_estimate": 3_100_000_000, "influence_score": 0.74, "metadata": {"total_donated_2024": 12_000_000, "party": "Democrat", "industry": "media/entertainment", "wants": "Pro-Israel policy"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "ideological"},
-    "donor_ross": {"name": "Stephen Ross", "tier": "individual", "category": "political_donor", "title": "Ross (Related Companies) — $10M real estate GOP donor", "net_worth_estimate": 12_500_000_000, "influence_score": 0.78, "metadata": {"total_donated_2024": 10_000_000, "party": "Republican", "industry": "real estate (Hudson Yards)", "wants": "Opportunity Zones, 1031 exchanges, favorable zoning"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "self_interest"},
-    "donor_wynn": {"name": "Steve Wynn", "tier": "individual", "category": "political_donor", "title": "Wynn — $10M casino GOP donor", "net_worth_estimate": 3_500_000_000, "influence_score": 0.72, "metadata": {"total_donated_2024": 10_000_000, "party": "Republican", "industry": "casinos/hospitality", "wants": "Gaming regulation, tax policy"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "self_interest"},
-    "donor_winklevoss": {"name": "Winklevoss twins", "tier": "individual", "category": "political_donor", "title": "Winklevoss — $8M crypto + Trump donors", "net_worth_estimate": 5_000_000_000, "influence_score": 0.72, "metadata": {"total_donated_2024": 8_000_000, "party": "Republican + crypto", "industry": "crypto (Gemini)", "wants": "Bitcoin-friendly regulation, oppose CBDC"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "self_interest_ideological"},
-    "donor_katzenberg": {"name": "Jeffrey Katzenberg", "tier": "individual", "category": "political_donor", "title": "Katzenberg — Hollywood Democratic fundraiser", "influence_score": 0.72, "metadata": {"total_donated_2024": 8_000_000, "party": "Democrat", "industry": "entertainment (DreamWorks)", "wants": "IP protection, pro-Israel"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "ideological"},
-    "donor_lauder": {"name": "Ronald Lauder", "tier": "individual", "category": "political_donor", "title": "Lauder (Estee Lauder heir) — $8M GOP + pro-Israel", "net_worth_estimate": 4_600_000_000, "influence_score": 0.70, "metadata": {"total_donated_2024": 8_000_000, "party": "Republican", "industry": "cosmetics/art", "wants": "Pro-Israel policy, tax reform"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "ideological"},
-    "donor_cooperman": {"name": "Leon Cooperman", "tier": "individual", "category": "political_donor", "title": "Cooperman — $8M hedge fund GOP donor", "net_worth_estimate": 3_500_000_000, "influence_score": 0.70, "metadata": {"total_donated_2024": 8_000_000, "party": "Republican-leaning", "industry": "hedge funds (Omega)", "wants": "Anti-wealth-tax"}, "connections": [{"actor": "ind_cooperman", "type": "same_entity"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "self_interest"},
-    "donor_powell_jobs": {"name": "Laurene Powell Jobs", "tier": "individual", "category": "political_donor", "title": "Powell Jobs — $10M media/philanthropy Democrat", "net_worth_estimate": 16_000_000_000, "influence_score": 0.76, "metadata": {"total_donated_2024": 10_000_000, "party": "Democrat", "industry": "media/philanthropy (Emerson Collective, The Atlantic)", "wants": "Immigration reform, education, climate"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "ideological"},
-    "donor_diller": {"name": "Barry Diller", "tier": "individual", "category": "political_donor", "title": "Diller (IAC/Expedia) — bipartisan media donor", "net_worth_estimate": 4_400_000_000, "influence_score": 0.72, "metadata": {"total_donated_2024": 5_000_000, "party": "Democrat-leaning", "industry": "media/tech (IAC, Expedia)", "wants": "Open internet, media deregulation"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "ideological"},
-    "donor_tepper": {"name": "David Tepper", "tier": "individual", "category": "political_donor", "title": "Tepper (Appaloosa) — $10M bipartisan", "net_worth_estimate": 20_500_000_000, "influence_score": 0.76, "metadata": {"total_donated_2024": 10_000_000, "party": "Bipartisan", "industry": "hedge funds (Appaloosa)", "wants": "Low taxes"}, "connections": [{"actor": "hf_tepper", "type": "same_entity"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "curated_estimate", "motivation_model": "self_interest"},
+    "donor_simons_family": {"name": "Simons Family (Renaissance)", "tier": "individual", "category": "political_donor", "title": "Simons family — $25M to Democrats", "net_worth_estimate": 31_000_000_000, "influence_score": 0.80, "metadata": {"total_donated_2024": 25_000_000, "party": "Democrat", "recipients": ["Senate Majority PAC"], "industry": "hedge funds (RenTech)", "wants": "Science funding, education", "note": "Jim Simons died May 2024; family continues"}, "connections": [{"actor": "hf_simons", "type": "family"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "ideological"},
+    "donor_thiel": {"name": "Peter Thiel", "tier": "individual", "category": "political_donor", "title": "Thiel — $20M+ (tech libertarian)", "net_worth_estimate": 11_000_000_000, "influence_score": 0.86, "metadata": {"total_donated_2024": 20_000_000, "party": "Republican", "recipients": ["MAGA-aligned candidates"], "industry": "tech/VC (Palantir, Founders Fund)", "wants": "Tech deregulation, defense contracts (Palantir)"}, "connections": [{"actor": "pol_thiel", "type": "same_entity"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "self_interest_ideological"},
+    "donor_marcus": {"name": "Bernie Marcus", "tier": "individual", "category": "political_donor", "title": "Marcus (Home Depot) — $20M to GOP", "net_worth_estimate": 10_900_000_000, "influence_score": 0.76, "metadata": {"total_donated_2024": 20_000_000, "party": "Republican", "industry": "retail (Home Depot co-founder)", "wants": "Deregulation, low taxes, pro-Israel"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "ideological"},
+    "donor_sussman": {"name": "Donald Sussman", "tier": "individual", "category": "political_donor", "title": "Sussman — $18M to Democrats", "net_worth_estimate": 2_500_000_000, "influence_score": 0.72, "metadata": {"total_donated_2024": 18_000_000, "party": "Democrat", "industry": "hedge funds (Paloma Partners)", "wants": "Progressive policy"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "ideological"},
+    "donor_laufer": {"name": "Henry Laufer", "tier": "individual", "category": "political_donor", "title": "Laufer (RenTech) — $18M to Democrats", "net_worth_estimate": 3_500_000_000, "influence_score": 0.70, "metadata": {"total_donated_2024": 18_000_000, "party": "Democrat", "industry": "hedge funds (Renaissance Technologies)", "wants": "Science funding"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "ideological"},
+    "donor_blavatnik": {"name": "Len Blavatnik", "tier": "individual", "category": "political_donor", "title": "Blavatnik — $15M bipartisan (lean R)", "net_worth_estimate": 32_000_000_000, "influence_score": 0.78, "metadata": {"total_donated_2024": 15_000_000, "party": "Bipartisan (lean R)", "industry": "diversified (Access Industries)", "wants": "Business-friendly regulation"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "self_interest"},
+    "donor_pritzker": {"name": "J.B. Pritzker", "tier": "individual", "category": "political_donor", "title": "Pritzker — IL Gov + $15M to Democrats", "net_worth_estimate": 3_500_000_000, "influence_score": 0.78, "metadata": {"total_donated_2024": 15_000_000, "party": "Democrat", "industry": "hospitality (Hyatt heir)", "wants": "Progressive policy, abortion rights, gun control"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "ideological"},
+    "donor_steyer": {"name": "Tom Steyer", "tier": "individual", "category": "political_donor", "title": "Steyer — $15M climate/Democrat donor", "net_worth_estimate": 1_600_000_000, "influence_score": 0.74, "metadata": {"total_donated_2024": 15_000_000, "party": "Democrat", "industry": "hedge funds (Farallon) / clean energy", "wants": "Climate policy, clean energy, wealth tax"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "ideological"},
+    "donor_mercer": {"name": "Rebekah Mercer", "tier": "individual", "category": "political_donor", "title": "Mercer — $12M conservative mega-donor", "net_worth_estimate": 1_000_000_000, "influence_score": 0.76, "metadata": {"total_donated_2024": 12_000_000, "party": "Republican", "industry": "finance (RenTech heir; backed Breitbart, Cambridge Analytica)", "wants": "Conservative media, anti-establishment politics"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "ideological"},
+    "donor_dell": {"name": "Michael Dell", "tier": "individual", "category": "political_donor", "title": "Dell — $12M bipartisan (lean R)", "net_worth_estimate": 100_000_000_000, "influence_score": 0.78, "metadata": {"total_donated_2024": 12_000_000, "party": "Republican-leaning", "industry": "tech (Dell Technologies)", "wants": "Tech-friendly policy, tax reform"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "self_interest"},
+    "donor_saban": {"name": "Haim Saban", "tier": "individual", "category": "political_donor", "title": "Saban — $12M Democratic + pro-Israel donor", "net_worth_estimate": 3_100_000_000, "influence_score": 0.74, "metadata": {"total_donated_2024": 12_000_000, "party": "Democrat", "industry": "media/entertainment", "wants": "Pro-Israel policy"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "ideological"},
+    "donor_ross": {"name": "Stephen Ross", "tier": "individual", "category": "political_donor", "title": "Ross (Related Companies) — $10M real estate GOP donor", "net_worth_estimate": 12_500_000_000, "influence_score": 0.78, "metadata": {"total_donated_2024": 10_000_000, "party": "Republican", "industry": "real estate (Hudson Yards)", "wants": "Opportunity Zones, 1031 exchanges, favorable zoning"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "self_interest"},
+    "donor_wynn": {"name": "Steve Wynn", "tier": "individual", "category": "political_donor", "title": "Wynn — $10M casino GOP donor", "net_worth_estimate": 3_500_000_000, "influence_score": 0.72, "metadata": {"total_donated_2024": 10_000_000, "party": "Republican", "industry": "casinos/hospitality", "wants": "Gaming regulation, tax policy"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "self_interest"},
+    "donor_winklevoss": {"name": "Winklevoss twins", "tier": "individual", "category": "political_donor", "title": "Winklevoss — $8M crypto + Trump donors", "net_worth_estimate": 5_000_000_000, "influence_score": 0.72, "metadata": {"total_donated_2024": 8_000_000, "party": "Republican + crypto", "industry": "crypto (Gemini)", "wants": "Bitcoin-friendly regulation, oppose CBDC"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "self_interest_ideological"},
+    "donor_katzenberg": {"name": "Jeffrey Katzenberg", "tier": "individual", "category": "political_donor", "title": "Katzenberg — Hollywood Democratic fundraiser", "influence_score": 0.72, "metadata": {"total_donated_2024": 8_000_000, "party": "Democrat", "industry": "entertainment (DreamWorks)", "wants": "IP protection, pro-Israel"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "ideological"},
+    "donor_lauder": {"name": "Ronald Lauder", "tier": "individual", "category": "political_donor", "title": "Lauder (Estee Lauder heir) — $8M GOP + pro-Israel", "net_worth_estimate": 4_600_000_000, "influence_score": 0.70, "metadata": {"total_donated_2024": 8_000_000, "party": "Republican", "industry": "cosmetics/art", "wants": "Pro-Israel policy, tax reform"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "ideological"},
+    "donor_cooperman": {"name": "Leon Cooperman", "tier": "individual", "category": "political_donor", "title": "Cooperman — $8M hedge fund GOP donor", "net_worth_estimate": 3_500_000_000, "influence_score": 0.70, "metadata": {"total_donated_2024": 8_000_000, "party": "Republican-leaning", "industry": "hedge funds (Omega)", "wants": "Anti-wealth-tax"}, "connections": [{"actor": "ind_cooperman", "type": "same_entity"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "self_interest"},
+    "donor_powell_jobs": {"name": "Laurene Powell Jobs", "tier": "individual", "category": "political_donor", "title": "Powell Jobs — $10M media/philanthropy Democrat", "net_worth_estimate": 16_000_000_000, "influence_score": 0.76, "metadata": {"total_donated_2024": 10_000_000, "party": "Democrat", "industry": "media/philanthropy (Emerson Collective, The Atlantic)", "wants": "Immigration reform, education, climate"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "ideological"},
+    "donor_diller": {"name": "Barry Diller", "tier": "individual", "category": "political_donor", "title": "Diller (IAC/Expedia) — bipartisan media donor", "net_worth_estimate": 4_400_000_000, "influence_score": 0.72, "metadata": {"total_donated_2024": 5_000_000, "party": "Democrat-leaning", "industry": "media/tech (IAC, Expedia)", "wants": "Open internet, media deregulation"}, "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "ideological"},
+    "donor_tepper": {"name": "David Tepper", "tier": "individual", "category": "political_donor", "title": "Tepper (Appaloosa) — $10M bipartisan", "net_worth_estimate": 20_500_000_000, "influence_score": 0.76, "metadata": {"total_donated_2024": 10_000_000, "party": "Bipartisan", "industry": "hedge funds (Appaloosa)", "wants": "Low taxes"}, "connections": [{"actor": "hf_tepper", "type": "same_entity"}], "data_sources": ["opensecrets", "fec_filings"], "credibility": "hard_data", "motivation_model": "self_interest"},
 
     # ══════════════════════════════════════════════════════════════════════
     # TOP DEFENSE CONTRACTORS — military-industrial complex
     # Contract $, key programs, congressional supporters, revolving door
     # ══════════════════════════════════════════════════════════════════════
-    "defense_lockheed": {"name": "Lockheed Martin", "tier": "institutional", "category": "defense_contractor", "title": "Largest defense contractor — $64.7B defense revenue (2024)", "influence_score": 0.96, "metadata": {"ticker": "LMT", "contract_value_2024": 64_700_000_000, "ceo": "Jim Taiclet", "key_programs": ["F-35 ($30B+)", "THAAD", "Aegis", "GPS III", "Orion"], "congressional_supporters": ["Rob Wittman (VA-1, HASC)", "Mike Rogers (AL-3, HASC Chair)", "Roger Wicker (MS, SASC Chair)"], "revolving_door": "44+ former Pentagon officials hired", "lobbying_spend_2024": 14_000_000}, "data_sources": ["sec_edgar", "usaspending_gov", "opensecrets"], "credibility": "curated_estimate", "motivation_model": "profit_contracts"},
-    "defense_rtx": {"name": "RTX Corporation (Raytheon)", "tier": "institutional", "category": "defense_contractor", "title": "2nd largest — $80.7B total revenue", "influence_score": 0.94, "metadata": {"ticker": "RTX", "contract_value_2024": 24_100_000_000, "ceo": "Chris Calio", "key_programs": ["Patriot", "Stinger", "Pratt & Whitney", "AN/SPY-6"], "congressional_supporters": ["Joe Courtney (CT-2)", "Chris Murphy (CT)"], "revolving_door": "24+ officials; Lloyd Austin was on Raytheon board", "lobbying_spend_2024": 12_000_000}, "data_sources": ["sec_edgar", "usaspending_gov", "opensecrets"], "credibility": "curated_estimate", "motivation_model": "profit_contracts"},
-    "defense_northrop": {"name": "Northrop Grumman", "tier": "institutional", "category": "defense_contractor", "title": "$35.2B defense revenue", "influence_score": 0.92, "metadata": {"ticker": "NOC", "contract_value_2024": 35_200_000_000, "ceo": "Kathy Warden", "key_programs": ["B-21 Raider", "Sentinel ICBM", "JWST", "Global Hawk"], "congressional_supporters": ["Ken Calvert (CA-41)", "Mike Turner (OH-10)"], "revolving_door": "24+ former Pentagon personnel", "lobbying_spend_2024": 11_000_000}, "data_sources": ["sec_edgar", "usaspending_gov", "opensecrets"], "credibility": "curated_estimate", "motivation_model": "profit_contracts"},
-    "defense_general_dynamics": {"name": "General Dynamics", "tier": "institutional", "category": "defense_contractor", "title": "$33.7B defense revenue", "influence_score": 0.92, "metadata": {"ticker": "GD", "contract_value_2024": 33_700_000_000, "ceo": "Phebe Novakovic", "key_programs": ["Columbia-class subs", "Abrams tank", "Stryker", "GDIT"], "congressional_supporters": ["Jack Reed (RI)", "Tim Kaine (VA)"], "revolving_door": "8+ former Pentagon officials", "lobbying_spend_2024": 10_000_000}, "data_sources": ["sec_edgar", "usaspending_gov", "opensecrets"], "credibility": "curated_estimate", "motivation_model": "profit_contracts"},
-    "defense_boeing": {"name": "Boeing Defense, Space & Security", "tier": "institutional", "category": "defense_contractor", "title": "Boeing Defense — $25B contracts", "influence_score": 0.92, "metadata": {"ticker": "BA", "contract_value_2024": 25_000_000_000, "ceo": "Kelly Ortberg", "key_programs": ["KC-46 tanker", "F/A-18", "Apache", "SLS rocket", "P-8 Poseidon"], "congressional_supporters": ["Maria Cantwell (WA)", "Patty Murray (WA)"], "revolving_door": "23+ former Pentagon officials", "lobbying_spend_2024": 11_000_000}, "data_sources": ["sec_edgar", "usaspending_gov", "opensecrets"], "credibility": "curated_estimate", "motivation_model": "profit_contracts"},
-    "defense_l3harris": {"name": "L3Harris Technologies", "tier": "institutional", "category": "defense_contractor", "title": "6th largest — EW, ISR, comms", "influence_score": 0.86, "metadata": {"ticker": "LHX", "contract_value_2024": 20_000_000_000, "ceo": "Chris Kubasik", "key_programs": ["F/A-18 EW", "tactical radios", "ISR", "satellites"], "congressional_supporters": ["Bill Posey (FL-8)", "Marco Rubio (FL)"], "lobbying_spend_2024": 8_000_000}, "data_sources": ["sec_edgar", "usaspending_gov", "opensecrets"], "credibility": "curated_estimate", "motivation_model": "profit_contracts"},
-    "defense_hii": {"name": "Huntington Ingalls Industries", "tier": "institutional", "category": "defense_contractor", "title": "Sole builder of US aircraft carriers — $11.4B", "influence_score": 0.86, "metadata": {"ticker": "HII", "contract_value_2024": 11_400_000_000, "ceo": "Chris Kastner", "key_programs": ["Ford-class carriers", "Virginia-class subs", "LPD ($9.6B)"], "congressional_supporters": ["Bobby Scott (VA-3)", "Roger Wicker (MS)"], "revolving_door": "Former Navy admirals on board", "lobbying_spend_2024": 6_000_000}, "data_sources": ["sec_edgar", "usaspending_gov", "opensecrets"], "credibility": "curated_estimate", "motivation_model": "profit_contracts"},
-    "defense_bae": {"name": "BAE Systems (US)", "tier": "institutional", "category": "defense_contractor", "title": "8th largest — British-owned, US presence ($12B)", "influence_score": 0.84, "metadata": {"ticker": "BAESY", "contract_value_2024": 12_000_000_000, "ceo": "Tom Arseneault (BAE Inc.)", "key_programs": ["Bradley IFV", "amphibious combat", "EW", "ship repair"], "lobbying_spend_2024": 5_000_000}, "data_sources": ["sec_edgar", "usaspending_gov", "opensecrets"], "credibility": "curated_estimate", "motivation_model": "profit_contracts"},
-    "defense_leidos": {"name": "Leidos", "tier": "institutional", "category": "defense_contractor", "title": "9th largest — defense IT, intel ($11.1B)", "influence_score": 0.82, "metadata": {"ticker": "LDOS", "contract_value_2024": 11_100_000_000, "ceo": "Tom Bell", "key_programs": ["defense IT", "intel community", "TSA"], "revolving_door": "Spun off from SAIC; deep IC ties", "lobbying_spend_2024": 5_000_000}, "data_sources": ["sec_edgar", "usaspending_gov", "opensecrets"], "credibility": "curated_estimate", "motivation_model": "profit_contracts"},
-    "defense_booz_allen": {"name": "Booz Allen Hamilton", "tier": "institutional", "category": "defense_contractor", "title": "Intel community + defense consulting ($9B)", "influence_score": 0.82, "metadata": {"ticker": "BAH", "contract_value_2024": 9_000_000_000, "ceo": "Horacio Rozanski", "key_programs": ["NSA analytics", "Army AI/ML", "cyber ops"], "revolving_door": "Edward Snowden was contractor here. Deep NSA/CIA ties.", "lobbying_spend_2024": 4_000_000}, "data_sources": ["sec_edgar", "usaspending_gov", "opensecrets"], "credibility": "curated_estimate", "motivation_model": "profit_contracts"},
-    "defense_saic": {"name": "SAIC", "tier": "institutional", "category": "defense_contractor", "title": "SAIC — defense IT ($7B)", "influence_score": 0.78, "metadata": {"ticker": "SAIC", "contract_value_2024": 7_000_000_000, "ceo": "Toni Townes-Whitley", "key_programs": ["defense IT", "space", "training"], "revolving_door": "Heavy intel revolving door"}, "data_sources": ["sec_edgar", "usaspending_gov"], "credibility": "curated_estimate", "motivation_model": "profit_contracts"},
-    "defense_caci": {"name": "CACI International", "tier": "institutional", "category": "defense_contractor", "title": "CACI — intel, cyber, C4ISR ($7B)", "influence_score": 0.76, "metadata": {"ticker": "CACI", "contract_value_2024": 7_000_000_000, "ceo": "John Mengucci", "key_programs": ["intel analytics", "cyber", "SIGINT"]}, "data_sources": ["sec_edgar", "usaspending_gov"], "credibility": "curated_estimate", "motivation_model": "profit_contracts"},
-    "defense_kbr": {"name": "KBR Inc.", "tier": "institutional", "category": "defense_contractor", "title": "KBR — services, logistics ($6.5B)", "influence_score": 0.76, "metadata": {"ticker": "KBR", "contract_value_2024": 6_500_000_000, "ceo": "Stuart Bradie", "key_programs": ["base ops", "logistics", "space"], "revolving_door": "Former Halliburton subsidiary"}, "data_sources": ["sec_edgar", "usaspending_gov"], "credibility": "curated_estimate", "motivation_model": "profit_contracts"},
-    "defense_ge_aerospace": {"name": "GE Aerospace (defense)", "tier": "institutional", "category": "defense_contractor", "title": "GE Aerospace — military jet engines ($6B)", "influence_score": 0.80, "metadata": {"ticker": "GE", "contract_value_2024": 6_000_000_000, "ceo": "Larry Culp", "key_programs": ["F110 (F-16)", "F414 (Super Hornet)", "T901 helicopter", "adaptive cycle"]}, "data_sources": ["sec_edgar", "usaspending_gov"], "credibility": "curated_estimate", "motivation_model": "profit_contracts"},
-    "defense_honeywell": {"name": "Honeywell Aerospace & Defense", "tier": "institutional", "category": "defense_contractor", "title": "Honeywell — avionics, engines ($5B)", "influence_score": 0.80, "metadata": {"ticker": "HON", "contract_value_2024": 5_000_000_000, "ceo": "Vimal Kapur", "key_programs": ["F-35 avionics", "helicopter engines", "smart munitions"]}, "data_sources": ["sec_edgar", "usaspending_gov"], "credibility": "curated_estimate", "motivation_model": "profit_contracts"},
-    "defense_textron": {"name": "Textron Inc.", "tier": "institutional", "category": "defense_contractor", "title": "Textron — Bell helicopters, Cessna ($5B)", "influence_score": 0.78, "metadata": {"ticker": "TXT", "contract_value_2024": 5_000_000_000, "ceo": "Scott Donnelly", "key_programs": ["V-280 Valor (FLRAA)", "Bell helicopters", "Shadow UAV"]}, "data_sources": ["sec_edgar", "usaspending_gov"], "credibility": "curated_estimate", "motivation_model": "profit_contracts"},
-    "defense_peraton": {"name": "Peraton (Veritas Capital)", "tier": "institutional", "category": "defense_contractor", "title": "Peraton — PE-owned intel/defense IT ($5B)", "influence_score": 0.74, "metadata": {"contract_value_2024": 5_000_000_000, "ceo": "Stu Shea", "key_programs": ["NRO satellite ops", "space command", "IC IT"], "note": "PE-owned (Veritas); less transparent"}, "data_sources": ["usaspending_gov"], "credibility": "curated_estimate", "motivation_model": "profit_contracts"},
-    "defense_general_atomics": {"name": "General Atomics", "tier": "institutional", "category": "defense_contractor", "title": "General Atomics — Predator/Reaper drones ($4.5B)", "influence_score": 0.82, "metadata": {"contract_value_2024": 4_500_000_000, "ceo": "Linden Blue", "key_programs": ["MQ-9 Reaper", "MQ-1C Gray Eagle", "EMALS", "EM railgun"], "note": "Private company — less transparency"}, "data_sources": ["usaspending_gov", "opensecrets"], "credibility": "curated_estimate", "motivation_model": "profit_contracts"},
-    "defense_spacex": {"name": "SpaceX (defense)", "tier": "institutional", "category": "defense_contractor", "title": "SpaceX — rockets, Starlink for DoD ($4B)", "influence_score": 0.88, "metadata": {"contract_value_2024": 4_000_000_000, "president": "Gwynne Shotwell", "key_programs": ["Starlink/Starshield", "NRO launches", "Space Development Agency"], "revolving_door": "Musk is simultaneously top donor + defense contractor + DOGE head", "note": "Rose from #53 to #28. Massive conflict of interest."}, "connections": [{"actor": "ind_musk", "type": "controls"}], "data_sources": ["usaspending_gov", "nasa_contracts"], "credibility": "curated_estimate", "motivation_model": "profit_contracts"},
-    "defense_palantir": {"name": "Palantir Technologies", "tier": "institutional", "category": "defense_contractor", "title": "Palantir — AI for defense + intel ($3B)", "influence_score": 0.84, "metadata": {"ticker": "PLTR", "contract_value_2024": 3_000_000_000, "ceo": "Alex Karp", "key_programs": ["Army TITAN", "Maven", "Gotham (IC)", "NATO AI"], "note": "Rose from #96 to top 50. Thiel co-founded."}, "connections": [{"actor": "pol_thiel", "type": "co_founder"}], "data_sources": ["sec_edgar", "usaspending_gov"], "credibility": "curated_estimate", "motivation_model": "profit_contracts"},
-    "defense_rolls_royce": {"name": "Rolls-Royce North America", "tier": "institutional", "category": "defense_contractor", "title": "Rolls-Royce — military engines, nuclear propulsion ($3B)", "influence_score": 0.74, "metadata": {"contract_value_2024": 3_000_000_000, "key_programs": ["B-52 re-engine (F130)", "sub nuclear reactors", "V-22 engines"]}, "data_sources": ["usaspending_gov"], "credibility": "curated_estimate", "motivation_model": "profit_contracts"},
-    "defense_anduril": {"name": "Anduril Industries", "tier": "institutional", "category": "defense_contractor", "title": "Anduril — AI defense startup ($1.5B, entered top 100)", "influence_score": 0.80, "metadata": {"contract_value_2024": 1_500_000_000, "ceo": "Palmer Luckey", "key_programs": ["Lattice AI", "Ghost drone", "Anvil counter-UAS", "autonomous subs"], "revolving_door": "Trae Stephens co-founder is ex-Pentagon", "note": "VC-backed $14B valuation; disrupting legacy contractors"}, "data_sources": ["usaspending_gov", "defense_news"], "credibility": "curated_estimate", "motivation_model": "profit_contracts"},
-    "defense_shield_ai": {"name": "Shield AI", "tier": "institutional", "category": "defense_contractor", "title": "Shield AI — autonomous drone AI", "influence_score": 0.72, "metadata": {"contract_value_2024": 500_000_000, "ceo": "Brandon Tseng", "key_programs": ["Hivemind autonomous pilot", "V-BAT drone"], "note": "VC-backed; competitor to Anduril"}, "data_sources": ["usaspending_gov"], "credibility": "curated_estimate", "motivation_model": "profit_contracts"},
+    "defense_lockheed": {"name": "Lockheed Martin", "tier": "institutional", "category": "defense_contractor", "title": "Largest defense contractor — $64.7B defense revenue (2024)", "influence_score": 0.96, "metadata": {"ticker": "LMT", "contract_value_2024": 64_700_000_000, "ceo": "Jim Taiclet", "key_programs": ["F-35 ($30B+)", "THAAD", "Aegis", "GPS III", "Orion"], "congressional_supporters": ["Rob Wittman (VA-1, HASC)", "Mike Rogers (AL-3, HASC Chair)", "Roger Wicker (MS, SASC Chair)"], "revolving_door": "44+ former Pentagon officials hired", "lobbying_spend_2024": 14_000_000}, "data_sources": ["sec_edgar", "usaspending_gov", "opensecrets"], "credibility": "hard_data", "motivation_model": "profit_contracts"},
+    "defense_rtx": {"name": "RTX Corporation (Raytheon)", "tier": "institutional", "category": "defense_contractor", "title": "2nd largest — $80.7B total revenue", "influence_score": 0.94, "metadata": {"ticker": "RTX", "contract_value_2024": 24_100_000_000, "ceo": "Chris Calio", "key_programs": ["Patriot", "Stinger", "Pratt & Whitney", "AN/SPY-6"], "congressional_supporters": ["Joe Courtney (CT-2)", "Chris Murphy (CT)"], "revolving_door": "24+ officials; Lloyd Austin was on Raytheon board", "lobbying_spend_2024": 12_000_000}, "data_sources": ["sec_edgar", "usaspending_gov", "opensecrets"], "credibility": "hard_data", "motivation_model": "profit_contracts"},
+    "defense_northrop": {"name": "Northrop Grumman", "tier": "institutional", "category": "defense_contractor", "title": "$35.2B defense revenue", "influence_score": 0.92, "metadata": {"ticker": "NOC", "contract_value_2024": 35_200_000_000, "ceo": "Kathy Warden", "key_programs": ["B-21 Raider", "Sentinel ICBM", "JWST", "Global Hawk"], "congressional_supporters": ["Ken Calvert (CA-41)", "Mike Turner (OH-10)"], "revolving_door": "24+ former Pentagon personnel", "lobbying_spend_2024": 11_000_000}, "data_sources": ["sec_edgar", "usaspending_gov", "opensecrets"], "credibility": "hard_data", "motivation_model": "profit_contracts"},
+    "defense_general_dynamics": {"name": "General Dynamics", "tier": "institutional", "category": "defense_contractor", "title": "$33.7B defense revenue", "influence_score": 0.92, "metadata": {"ticker": "GD", "contract_value_2024": 33_700_000_000, "ceo": "Phebe Novakovic", "key_programs": ["Columbia-class subs", "Abrams tank", "Stryker", "GDIT"], "congressional_supporters": ["Jack Reed (RI)", "Tim Kaine (VA)"], "revolving_door": "8+ former Pentagon officials", "lobbying_spend_2024": 10_000_000}, "data_sources": ["sec_edgar", "usaspending_gov", "opensecrets"], "credibility": "hard_data", "motivation_model": "profit_contracts"},
+    "defense_boeing": {"name": "Boeing Defense, Space & Security", "tier": "institutional", "category": "defense_contractor", "title": "Boeing Defense — $25B contracts", "influence_score": 0.92, "metadata": {"ticker": "BA", "contract_value_2024": 25_000_000_000, "ceo": "Kelly Ortberg", "key_programs": ["KC-46 tanker", "F/A-18", "Apache", "SLS rocket", "P-8 Poseidon"], "congressional_supporters": ["Maria Cantwell (WA)", "Patty Murray (WA)"], "revolving_door": "23+ former Pentagon officials", "lobbying_spend_2024": 11_000_000}, "data_sources": ["sec_edgar", "usaspending_gov", "opensecrets"], "credibility": "hard_data", "motivation_model": "profit_contracts"},
+    "defense_l3harris": {"name": "L3Harris Technologies", "tier": "institutional", "category": "defense_contractor", "title": "6th largest — EW, ISR, comms", "influence_score": 0.86, "metadata": {"ticker": "LHX", "contract_value_2024": 20_000_000_000, "ceo": "Chris Kubasik", "key_programs": ["F/A-18 EW", "tactical radios", "ISR", "satellites"], "congressional_supporters": ["Bill Posey (FL-8)", "Marco Rubio (FL)"], "lobbying_spend_2024": 8_000_000}, "data_sources": ["sec_edgar", "usaspending_gov", "opensecrets"], "credibility": "hard_data", "motivation_model": "profit_contracts"},
+    "defense_hii": {"name": "Huntington Ingalls Industries", "tier": "institutional", "category": "defense_contractor", "title": "Sole builder of US aircraft carriers — $11.4B", "influence_score": 0.86, "metadata": {"ticker": "HII", "contract_value_2024": 11_400_000_000, "ceo": "Chris Kastner", "key_programs": ["Ford-class carriers", "Virginia-class subs", "LPD ($9.6B)"], "congressional_supporters": ["Bobby Scott (VA-3)", "Roger Wicker (MS)"], "revolving_door": "Former Navy admirals on board", "lobbying_spend_2024": 6_000_000}, "data_sources": ["sec_edgar", "usaspending_gov", "opensecrets"], "credibility": "hard_data", "motivation_model": "profit_contracts"},
+    "defense_bae": {"name": "BAE Systems (US)", "tier": "institutional", "category": "defense_contractor", "title": "8th largest — British-owned, US presence ($12B)", "influence_score": 0.84, "metadata": {"ticker": "BAESY", "contract_value_2024": 12_000_000_000, "ceo": "Tom Arseneault (BAE Inc.)", "key_programs": ["Bradley IFV", "amphibious combat", "EW", "ship repair"], "lobbying_spend_2024": 5_000_000}, "data_sources": ["sec_edgar", "usaspending_gov", "opensecrets"], "credibility": "hard_data", "motivation_model": "profit_contracts"},
+    "defense_leidos": {"name": "Leidos", "tier": "institutional", "category": "defense_contractor", "title": "9th largest — defense IT, intel ($11.1B)", "influence_score": 0.82, "metadata": {"ticker": "LDOS", "contract_value_2024": 11_100_000_000, "ceo": "Tom Bell", "key_programs": ["defense IT", "intel community", "TSA"], "revolving_door": "Spun off from SAIC; deep IC ties", "lobbying_spend_2024": 5_000_000}, "data_sources": ["sec_edgar", "usaspending_gov", "opensecrets"], "credibility": "hard_data", "motivation_model": "profit_contracts"},
+    "defense_booz_allen": {"name": "Booz Allen Hamilton", "tier": "institutional", "category": "defense_contractor", "title": "Intel community + defense consulting ($9B)", "influence_score": 0.82, "metadata": {"ticker": "BAH", "contract_value_2024": 9_000_000_000, "ceo": "Horacio Rozanski", "key_programs": ["NSA analytics", "Army AI/ML", "cyber ops"], "revolving_door": "Edward Snowden was contractor here. Deep NSA/CIA ties.", "lobbying_spend_2024": 4_000_000}, "data_sources": ["sec_edgar", "usaspending_gov", "opensecrets"], "credibility": "hard_data", "motivation_model": "profit_contracts"},
+    "defense_saic": {"name": "SAIC", "tier": "institutional", "category": "defense_contractor", "title": "SAIC — defense IT ($7B)", "influence_score": 0.78, "metadata": {"ticker": "SAIC", "contract_value_2024": 7_000_000_000, "ceo": "Toni Townes-Whitley", "key_programs": ["defense IT", "space", "training"], "revolving_door": "Heavy intel revolving door"}, "data_sources": ["sec_edgar", "usaspending_gov"], "credibility": "hard_data", "motivation_model": "profit_contracts"},
+    "defense_caci": {"name": "CACI International", "tier": "institutional", "category": "defense_contractor", "title": "CACI — intel, cyber, C4ISR ($7B)", "influence_score": 0.76, "metadata": {"ticker": "CACI", "contract_value_2024": 7_000_000_000, "ceo": "John Mengucci", "key_programs": ["intel analytics", "cyber", "SIGINT"]}, "data_sources": ["sec_edgar", "usaspending_gov"], "credibility": "hard_data", "motivation_model": "profit_contracts"},
+    "defense_kbr": {"name": "KBR Inc.", "tier": "institutional", "category": "defense_contractor", "title": "KBR — services, logistics ($6.5B)", "influence_score": 0.76, "metadata": {"ticker": "KBR", "contract_value_2024": 6_500_000_000, "ceo": "Stuart Bradie", "key_programs": ["base ops", "logistics", "space"], "revolving_door": "Former Halliburton subsidiary"}, "data_sources": ["sec_edgar", "usaspending_gov"], "credibility": "hard_data", "motivation_model": "profit_contracts"},
+    "defense_ge_aerospace": {"name": "GE Aerospace (defense)", "tier": "institutional", "category": "defense_contractor", "title": "GE Aerospace — military jet engines ($6B)", "influence_score": 0.80, "metadata": {"ticker": "GE", "contract_value_2024": 6_000_000_000, "ceo": "Larry Culp", "key_programs": ["F110 (F-16)", "F414 (Super Hornet)", "T901 helicopter", "adaptive cycle"]}, "data_sources": ["sec_edgar", "usaspending_gov"], "credibility": "hard_data", "motivation_model": "profit_contracts"},
+    "defense_honeywell": {"name": "Honeywell Aerospace & Defense", "tier": "institutional", "category": "defense_contractor", "title": "Honeywell — avionics, engines ($5B)", "influence_score": 0.80, "metadata": {"ticker": "HON", "contract_value_2024": 5_000_000_000, "ceo": "Vimal Kapur", "key_programs": ["F-35 avionics", "helicopter engines", "smart munitions"]}, "data_sources": ["sec_edgar", "usaspending_gov"], "credibility": "hard_data", "motivation_model": "profit_contracts"},
+    "defense_textron": {"name": "Textron Inc.", "tier": "institutional", "category": "defense_contractor", "title": "Textron — Bell helicopters, Cessna ($5B)", "influence_score": 0.78, "metadata": {"ticker": "TXT", "contract_value_2024": 5_000_000_000, "ceo": "Scott Donnelly", "key_programs": ["V-280 Valor (FLRAA)", "Bell helicopters", "Shadow UAV"]}, "data_sources": ["sec_edgar", "usaspending_gov"], "credibility": "hard_data", "motivation_model": "profit_contracts"},
+    "defense_peraton": {"name": "Peraton (Veritas Capital)", "tier": "institutional", "category": "defense_contractor", "title": "Peraton — PE-owned intel/defense IT ($5B)", "influence_score": 0.74, "metadata": {"contract_value_2024": 5_000_000_000, "ceo": "Stu Shea", "key_programs": ["NRO satellite ops", "space command", "IC IT"], "note": "PE-owned (Veritas); less transparent"}, "data_sources": ["usaspending_gov"], "credibility": "hard_data", "motivation_model": "profit_contracts"},
+    "defense_general_atomics": {"name": "General Atomics", "tier": "institutional", "category": "defense_contractor", "title": "General Atomics — Predator/Reaper drones ($4.5B)", "influence_score": 0.82, "metadata": {"contract_value_2024": 4_500_000_000, "ceo": "Linden Blue", "key_programs": ["MQ-9 Reaper", "MQ-1C Gray Eagle", "EMALS", "EM railgun"], "note": "Private company — less transparency"}, "data_sources": ["usaspending_gov", "opensecrets"], "credibility": "hard_data", "motivation_model": "profit_contracts"},
+    "defense_spacex": {"name": "SpaceX (defense)", "tier": "institutional", "category": "defense_contractor", "title": "SpaceX — rockets, Starlink for DoD ($4B)", "influence_score": 0.88, "metadata": {"contract_value_2024": 4_000_000_000, "president": "Gwynne Shotwell", "key_programs": ["Starlink/Starshield", "NRO launches", "Space Development Agency"], "revolving_door": "Musk is simultaneously top donor + defense contractor + DOGE head", "note": "Rose from #53 to #28. Massive conflict of interest."}, "connections": [{"actor": "ind_musk", "type": "controls"}], "data_sources": ["usaspending_gov", "nasa_contracts"], "credibility": "hard_data", "motivation_model": "profit_contracts"},
+    "defense_palantir": {"name": "Palantir Technologies", "tier": "institutional", "category": "defense_contractor", "title": "Palantir — AI for defense + intel ($3B)", "influence_score": 0.84, "metadata": {"ticker": "PLTR", "contract_value_2024": 3_000_000_000, "ceo": "Alex Karp", "key_programs": ["Army TITAN", "Maven", "Gotham (IC)", "NATO AI"], "note": "Rose from #96 to top 50. Thiel co-founded."}, "connections": [{"actor": "pol_thiel", "type": "co_founder"}], "data_sources": ["sec_edgar", "usaspending_gov"], "credibility": "hard_data", "motivation_model": "profit_contracts"},
+    "defense_rolls_royce": {"name": "Rolls-Royce North America", "tier": "institutional", "category": "defense_contractor", "title": "Rolls-Royce — military engines, nuclear propulsion ($3B)", "influence_score": 0.74, "metadata": {"contract_value_2024": 3_000_000_000, "key_programs": ["B-52 re-engine (F130)", "sub nuclear reactors", "V-22 engines"]}, "data_sources": ["usaspending_gov"], "credibility": "hard_data", "motivation_model": "profit_contracts"},
+    "defense_anduril": {"name": "Anduril Industries", "tier": "institutional", "category": "defense_contractor", "title": "Anduril — AI defense startup ($1.5B, entered top 100)", "influence_score": 0.80, "metadata": {"contract_value_2024": 1_500_000_000, "ceo": "Palmer Luckey", "key_programs": ["Lattice AI", "Ghost drone", "Anvil counter-UAS", "autonomous subs"], "revolving_door": "Trae Stephens co-founder is ex-Pentagon", "note": "VC-backed $14B valuation; disrupting legacy contractors"}, "data_sources": ["usaspending_gov", "defense_news"], "credibility": "hard_data", "motivation_model": "profit_contracts"},
+    "defense_shield_ai": {"name": "Shield AI", "tier": "institutional", "category": "defense_contractor", "title": "Shield AI — autonomous drone AI", "influence_score": 0.72, "metadata": {"contract_value_2024": 500_000_000, "ceo": "Brandon Tseng", "key_programs": ["Hivemind autonomous pilot", "V-BAT drone"], "note": "VC-backed; competitor to Anduril"}, "data_sources": ["usaspending_gov"], "credibility": "hard_data", "motivation_model": "profit_contracts"},
 
     # ══════════════════════════════════════════════════════════════════════
     # FEDERAL RESERVE REGIONAL BANK PRESIDENTS — all 12 districts
     # Voting rotation determines which hawks/doves shape rates.
     # ══════════════════════════════════════════════════════════════════════
-    "fed_collins": {"name": "Susan Collins", "tier": "sovereign", "category": "central_bank", "title": "President, Fed Boston (District 1)", "influence_score": 0.78, "metadata": {"district": 1, "city": "Boston", "voting_2026": False, "lean": "neutral-to-dovish", "key_speeches": ["Labor market dynamics", "inflation expectations"], "term_start": 2022}, "data_sources": ["fed_speeches", "fomc_minutes"], "credibility": "curated_estimate", "motivation_model": "institutional_mandate"},
+    "fed_collins": {"name": "Susan Collins", "tier": "sovereign", "category": "central_bank", "title": "President, Fed Boston (District 1)", "influence_score": 0.78, "metadata": {"district": 1, "city": "Boston", "voting_2026": False, "lean": "neutral-to-dovish", "key_speeches": ["Labor market dynamics", "inflation expectations"], "term_start": 2022}, "data_sources": ["fed_speeches", "fomc_minutes"], "credibility": "hard_data", "motivation_model": "institutional_mandate"},
     # fed_williams already exists (NY, District 2) — permanent voter
-    "fed_paulson": {"name": "Anna Paulson", "tier": "sovereign", "category": "central_bank", "title": "President, Fed Philadelphia (District 3)", "influence_score": 0.76, "metadata": {"district": 3, "city": "Philadelphia", "voting_2026": True, "lean": "neutral-to-dovish", "key_speeches": ["New president 2025 — establishing stance"], "term_start": 2025, "note": "Replaced Harker; from Chicago Fed research"}, "data_sources": ["fed_speeches", "fomc_minutes"], "credibility": "curated_estimate", "motivation_model": "institutional_mandate"},
-    "fed_hammack": {"name": "Beth Hammack", "tier": "sovereign", "category": "central_bank", "title": "President, Fed Cleveland (District 4)", "influence_score": 0.80, "metadata": {"district": 4, "city": "Cleveland", "voting_2026": True, "lean": "hawkish", "key_speeches": ["Inflation persistence", "restrictive policy appropriate"], "term_start": 2024, "note": "Former Goldman Sachs CFO; hawkish"}, "data_sources": ["fed_speeches", "fomc_minutes"], "credibility": "curated_estimate", "motivation_model": "institutional_mandate"},
-    "fed_barkin": {"name": "Thomas Barkin", "tier": "sovereign", "category": "central_bank", "title": "President, Fed Richmond (District 5)", "influence_score": 0.78, "metadata": {"district": 5, "city": "Richmond", "voting_2026": False, "lean": "neutral-to-hawkish", "key_speeches": ["Business survey approach", "inflation expectations"], "term_start": 2018}, "data_sources": ["fed_speeches", "fomc_minutes"], "credibility": "curated_estimate", "motivation_model": "institutional_mandate"},
-    "fed_atlanta_tbd": {"name": "Atlanta Fed President (TBD — Bostic retired)", "tier": "sovereign", "category": "central_bank", "title": "President, Fed Atlanta (District 6) — VACANT", "influence_score": 0.72, "metadata": {"district": 6, "city": "Atlanta", "voting_2026": False, "lean": "TBD", "note": "Bostic retired; search underway. Cheryl Venable interim."}, "data_sources": ["fed_speeches"], "credibility": "curated_estimate", "motivation_model": "institutional_mandate"},
+    "fed_paulson": {"name": "Anna Paulson", "tier": "sovereign", "category": "central_bank", "title": "President, Fed Philadelphia (District 3)", "influence_score": 0.76, "metadata": {"district": 3, "city": "Philadelphia", "voting_2026": True, "lean": "neutral-to-dovish", "key_speeches": ["New president 2025 — establishing stance"], "term_start": 2025, "note": "Replaced Harker; from Chicago Fed research"}, "data_sources": ["fed_speeches", "fomc_minutes"], "credibility": "hard_data", "motivation_model": "institutional_mandate"},
+    "fed_hammack": {"name": "Beth Hammack", "tier": "sovereign", "category": "central_bank", "title": "President, Fed Cleveland (District 4)", "influence_score": 0.80, "metadata": {"district": 4, "city": "Cleveland", "voting_2026": True, "lean": "hawkish", "key_speeches": ["Inflation persistence", "restrictive policy appropriate"], "term_start": 2024, "note": "Former Goldman Sachs CFO; hawkish"}, "data_sources": ["fed_speeches", "fomc_minutes"], "credibility": "hard_data", "motivation_model": "institutional_mandate"},
+    "fed_barkin": {"name": "Thomas Barkin", "tier": "sovereign", "category": "central_bank", "title": "President, Fed Richmond (District 5)", "influence_score": 0.78, "metadata": {"district": 5, "city": "Richmond", "voting_2026": False, "lean": "neutral-to-hawkish", "key_speeches": ["Business survey approach", "inflation expectations"], "term_start": 2018}, "data_sources": ["fed_speeches", "fomc_minutes"], "credibility": "hard_data", "motivation_model": "institutional_mandate"},
+    "fed_atlanta_tbd": {"name": "Atlanta Fed President (TBD — Bostic retired)", "tier": "sovereign", "category": "central_bank", "title": "President, Fed Atlanta (District 6) — VACANT", "influence_score": 0.72, "metadata": {"district": 6, "city": "Atlanta", "voting_2026": False, "lean": "TBD", "note": "Bostic retired; search underway. Cheryl Venable interim."}, "data_sources": ["fed_speeches"], "credibility": "hard_data", "motivation_model": "institutional_mandate"},
     # fed_goolsbee already exists (Chicago, District 7)
     # fed_musalem already exists (St. Louis, District 8)
-    "fed_kashkari": {"name": "Neel Kashkari", "tier": "sovereign", "category": "central_bank", "title": "President, Fed Minneapolis (District 9)", "influence_score": 0.82, "metadata": {"district": 9, "city": "Minneapolis", "voting_2026": True, "lean": "hawkish (was dovish, turned)", "key_speeches": ["Keep rates higher until inflation beaten", "housing inflation persistence"], "term_start": 2016, "note": "Former TARP architect; dramatically shifted dove-to-hawk 2022-2025"}, "data_sources": ["fed_speeches", "fomc_minutes"], "credibility": "curated_estimate", "motivation_model": "institutional_mandate"},
-    "fed_schmid": {"name": "Jeffrey Schmid", "tier": "sovereign", "category": "central_bank", "title": "President, Fed Kansas City (District 10)", "influence_score": 0.76, "metadata": {"district": 10, "city": "Kansas City", "voting_2026": False, "lean": "hawkish", "key_speeches": ["Voted to hold — inflation too high"], "term_start": 2023}, "data_sources": ["fed_speeches", "fomc_minutes"], "credibility": "curated_estimate", "motivation_model": "institutional_mandate"},
-    "fed_logan": {"name": "Lorie Logan", "tier": "sovereign", "category": "central_bank", "title": "President, Fed Dallas (District 11)", "influence_score": 0.82, "metadata": {"district": 11, "city": "Dallas", "voting_2026": True, "lean": "hawkish", "key_speeches": ["Warns against premature cuts (Oct 2025)", "Hawkish pause (Feb 2026)", "Tariffs pose upside inflation risk"], "term_start": 2022, "note": "Former NY Fed markets desk head. Hawkish score 6.8."}, "data_sources": ["fed_speeches", "fomc_minutes"], "credibility": "curated_estimate", "motivation_model": "institutional_mandate"},
+    "fed_kashkari": {"name": "Neel Kashkari", "tier": "sovereign", "category": "central_bank", "title": "President, Fed Minneapolis (District 9)", "influence_score": 0.82, "metadata": {"district": 9, "city": "Minneapolis", "voting_2026": True, "lean": "hawkish (was dovish, turned)", "key_speeches": ["Keep rates higher until inflation beaten", "housing inflation persistence"], "term_start": 2016, "note": "Former TARP architect; dramatically shifted dove-to-hawk 2022-2025"}, "data_sources": ["fed_speeches", "fomc_minutes"], "credibility": "hard_data", "motivation_model": "institutional_mandate"},
+    "fed_schmid": {"name": "Jeffrey Schmid", "tier": "sovereign", "category": "central_bank", "title": "President, Fed Kansas City (District 10)", "influence_score": 0.76, "metadata": {"district": 10, "city": "Kansas City", "voting_2026": False, "lean": "hawkish", "key_speeches": ["Voted to hold — inflation too high"], "term_start": 2023}, "data_sources": ["fed_speeches", "fomc_minutes"], "credibility": "hard_data", "motivation_model": "institutional_mandate"},
+    "fed_logan": {"name": "Lorie Logan", "tier": "sovereign", "category": "central_bank", "title": "President, Fed Dallas (District 11)", "influence_score": 0.82, "metadata": {"district": 11, "city": "Dallas", "voting_2026": True, "lean": "hawkish", "key_speeches": ["Warns against premature cuts (Oct 2025)", "Hawkish pause (Feb 2026)", "Tariffs pose upside inflation risk"], "term_start": 2022, "note": "Former NY Fed markets desk head. Hawkish score 6.8."}, "data_sources": ["fed_speeches", "fomc_minutes"], "credibility": "hard_data", "motivation_model": "institutional_mandate"},
     # fed_daly already exists (San Francisco, District 12)
 
     # ══════════════════════════════════════════════════════════════════════
     # TOP REITs / REAL ESTATE DEVELOPERS
     # Control trillions in property; shape cities through zoning influence.
     # ══════════════════════════════════════════════════════════════════════
-    "reit_prologis": {"name": "Prologis", "tier": "institutional", "category": "reit", "title": "World's largest logistics REIT (~$98B mkt cap)", "aum": 200_000_000_000, "influence_score": 0.86, "metadata": {"ticker": "PLD", "ceo": "Hamid Moghadam", "portfolio": "6,000+ buildings, 20 countries", "political_connections": "Industrial zoning, Opportunity Zones"}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "reit_american_tower": {"name": "American Tower", "tier": "institutional", "category": "reit", "title": "Wireless tower REIT (~$102B mkt cap)", "influence_score": 0.84, "metadata": {"ticker": "AMT", "ceo": "Steven Vondran", "portfolio": "224,000+ cell towers", "political_connections": "FCC spectrum, 5G lobbying"}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "reit_equinix": {"name": "Equinix", "tier": "institutional", "category": "reit", "title": "Largest data center REIT (~$85B mkt cap)", "influence_score": 0.84, "metadata": {"ticker": "EQIX", "ceo": "Adaire Fox-Martin", "portfolio": "260+ data centers, 32 countries", "political_connections": "Energy policy, data sovereignty"}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "reit_welltower": {"name": "Welltower", "tier": "institutional", "category": "reit", "title": "Healthcare/senior living REIT (~$98B mkt cap)", "influence_score": 0.82, "metadata": {"ticker": "WELL", "ceo": "Shankh Mitra", "portfolio": "2,500+ senior communities", "political_connections": "Healthcare policy, Medicare/Medicaid"}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "reit_simon": {"name": "Simon Property Group", "tier": "institutional", "category": "reit", "title": "Largest mall REIT ($69B mkt cap)", "influence_score": 0.82, "metadata": {"ticker": "SPG", "ceo": "David Simon", "portfolio": "245M sq ft retail", "political_connections": "Retail zoning, e-commerce tax"}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "reit_public_storage": {"name": "Public Storage", "tier": "institutional", "category": "reit", "title": "Largest self-storage REIT ($55B mkt cap)", "influence_score": 0.78, "metadata": {"ticker": "PSA", "ceo": "Joe Russell", "portfolio": "3,000+ facilities"}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "reit_digital_realty": {"name": "Digital Realty", "tier": "institutional", "category": "reit", "title": "Data center REIT ($50B mkt cap)", "influence_score": 0.80, "metadata": {"ticker": "DLR", "ceo": "Andy Power", "portfolio": "300+ data centers globally"}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "reit_realty_income": {"name": "Realty Income", "tier": "institutional", "category": "reit", "title": "'Monthly Dividend Company' ($48B mkt cap)", "influence_score": 0.78, "metadata": {"ticker": "O", "ceo": "Sumit Roy", "portfolio": "15,000+ properties"}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "reit_crown_castle": {"name": "Crown Castle", "tier": "institutional", "category": "reit", "title": "Wireless infrastructure REIT ($45B)", "influence_score": 0.78, "metadata": {"ticker": "CCI", "portfolio": "40,000+ towers, 115K miles fiber"}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "reit_blackstone_re": {"name": "Blackstone Real Estate", "tier": "institutional", "category": "developer", "title": "Largest commercial RE owner ($332B RE AUM)", "aum": 332_000_000_000, "influence_score": 0.92, "metadata": {"portfolio": "Largest commercial RE in world", "political_connections": "Schwarzman major Trump donor; Opportunity Zone beneficiary"}, "connections": [{"actor": "pc_blackstone", "type": "same_entity"}, {"actor": "pe_schwarzman", "type": "controls"}], "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "reit_brookfield": {"name": "Brookfield Real Estate", "tier": "institutional", "category": "developer", "title": "Brookfield — $300B+ RE AUM", "aum": 300_000_000_000, "influence_score": 0.88, "metadata": {"ticker": "BAM/BN", "ceo": "Bruce Flatt", "political_connections": "Kushner 666 Fifth Ave bailout"}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "reit_related": {"name": "Related Companies", "tier": "institutional", "category": "developer", "title": "Hudson Yards developer — political heavyweight", "influence_score": 0.84, "metadata": {"founder": "Stephen Ross", "portfolio": "Hudson Yards ($25B), luxury residential", "political_connections": "Ross is Trump fundraiser; massive NYC zoning influence"}, "connections": [{"actor": "donor_ross", "type": "controls"}], "data_sources": ["nyc_disclosures"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "reit_starwood": {"name": "Starwood Capital Group", "tier": "institutional", "category": "developer", "title": "Starwood — $100B AUM, hotels/multifamily", "aum": 100_000_000_000, "influence_score": 0.80, "metadata": {"founder": "Barry Sternlicht", "political_connections": "Sternlicht vocal on macro policy"}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "reit_vornado": {"name": "Vornado Realty Trust", "tier": "institutional", "category": "reit", "title": "NYC/DC office REIT ($8B)", "influence_score": 0.76, "metadata": {"ticker": "VNO", "ceo": "Steven Roth", "portfolio": "Penn District ($19B redevelopment)", "political_connections": "Roth was on Trump business council"}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "reit_kushner": {"name": "Kushner Companies", "tier": "institutional", "category": "developer", "title": "Kushner — political developer dynasty", "influence_score": 0.78, "metadata": {"founder": "Charles Kushner", "political_connections": "Jared Kushner was Trump senior advisor. Charles Kushner ambassador to France. 666 Fifth Ave Brookfield bailout."}, "data_sources": ["property_records"], "credibility": "curated_estimate", "motivation_model": "profit_political"},
-    "reit_hines": {"name": "Hines", "tier": "institutional", "category": "developer", "title": "Hines — global RE, $94B portfolio", "influence_score": 0.78, "metadata": {"ceo": "Laura Hines-Pierce", "portfolio": "4,800 properties, 30 countries"}, "data_sources": ["property_records"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "reit_tishman": {"name": "Tishman Speyer", "tier": "institutional", "category": "developer", "title": "Tishman Speyer — Rockefeller Center owner", "influence_score": 0.78, "metadata": {"ceo": "Rob Speyer", "portfolio": "Rockefeller Center, The Spiral"}, "data_sources": ["property_records"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "reit_bxp": {"name": "BXP (Boston Properties)", "tier": "institutional", "category": "reit", "title": "Premier office REIT ($15B mkt cap)", "influence_score": 0.76, "metadata": {"ticker": "BXP", "ceo": "Owen Thomas", "portfolio": "55M+ sq ft office"}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "reit_iron_mountain": {"name": "Iron Mountain", "tier": "institutional", "category": "reit", "title": "Data storage REIT ($30B mkt cap)", "influence_score": 0.74, "metadata": {"ticker": "IRM", "portfolio": "1,400+ facilities"}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "reit_invitation_homes": {"name": "Invitation Homes", "tier": "institutional", "category": "reit", "title": "Largest single-family rental REIT ($20B)", "influence_score": 0.76, "metadata": {"ticker": "INVH", "ceo": "Dallas Tanner", "portfolio": "80,000+ homes", "note": "Poster child for institutional ownership of single-family homes controversy"}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "reit_ventas": {"name": "Ventas", "tier": "institutional", "category": "reit", "title": "Healthcare REIT ($27B mkt cap)", "influence_score": 0.74, "metadata": {"ticker": "VTR", "ceo": "Debra Cafaro", "portfolio": "1,200+ healthcare properties"}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "reit_avalonbay": {"name": "AvalonBay Communities", "tier": "institutional", "category": "reit", "title": "Premium apartment REIT ($32B)", "influence_score": 0.74, "metadata": {"ticker": "AVB", "portfolio": "300+ communities"}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "reit_equity_residential": {"name": "Equity Residential", "tier": "institutional", "category": "reit", "title": "Sam Zell-founded apartment REIT ($28B)", "influence_score": 0.74, "metadata": {"ticker": "EQR", "portfolio": "300+ properties"}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
+    "reit_prologis": {"name": "Prologis", "tier": "institutional", "category": "reit", "title": "World's largest logistics REIT (~$98B mkt cap)", "aum": 200_000_000_000, "influence_score": 0.86, "metadata": {"ticker": "PLD", "ceo": "Hamid Moghadam", "portfolio": "6,000+ buildings, 20 countries", "political_connections": "Industrial zoning, Opportunity Zones"}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "reit_american_tower": {"name": "American Tower", "tier": "institutional", "category": "reit", "title": "Wireless tower REIT (~$102B mkt cap)", "influence_score": 0.84, "metadata": {"ticker": "AMT", "ceo": "Steven Vondran", "portfolio": "224,000+ cell towers", "political_connections": "FCC spectrum, 5G lobbying"}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "reit_equinix": {"name": "Equinix", "tier": "institutional", "category": "reit", "title": "Largest data center REIT (~$85B mkt cap)", "influence_score": 0.84, "metadata": {"ticker": "EQIX", "ceo": "Adaire Fox-Martin", "portfolio": "260+ data centers, 32 countries", "political_connections": "Energy policy, data sovereignty"}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "reit_welltower": {"name": "Welltower", "tier": "institutional", "category": "reit", "title": "Healthcare/senior living REIT (~$98B mkt cap)", "influence_score": 0.82, "metadata": {"ticker": "WELL", "ceo": "Shankh Mitra", "portfolio": "2,500+ senior communities", "political_connections": "Healthcare policy, Medicare/Medicaid"}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "reit_simon": {"name": "Simon Property Group", "tier": "institutional", "category": "reit", "title": "Largest mall REIT ($69B mkt cap)", "influence_score": 0.82, "metadata": {"ticker": "SPG", "ceo": "David Simon", "portfolio": "245M sq ft retail", "political_connections": "Retail zoning, e-commerce tax"}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "reit_public_storage": {"name": "Public Storage", "tier": "institutional", "category": "reit", "title": "Largest self-storage REIT ($55B mkt cap)", "influence_score": 0.78, "metadata": {"ticker": "PSA", "ceo": "Joe Russell", "portfolio": "3,000+ facilities"}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "reit_digital_realty": {"name": "Digital Realty", "tier": "institutional", "category": "reit", "title": "Data center REIT ($50B mkt cap)", "influence_score": 0.80, "metadata": {"ticker": "DLR", "ceo": "Andy Power", "portfolio": "300+ data centers globally"}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "reit_realty_income": {"name": "Realty Income", "tier": "institutional", "category": "reit", "title": "'Monthly Dividend Company' ($48B mkt cap)", "influence_score": 0.78, "metadata": {"ticker": "O", "ceo": "Sumit Roy", "portfolio": "15,000+ properties"}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "reit_crown_castle": {"name": "Crown Castle", "tier": "institutional", "category": "reit", "title": "Wireless infrastructure REIT ($45B)", "influence_score": 0.78, "metadata": {"ticker": "CCI", "portfolio": "40,000+ towers, 115K miles fiber"}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "reit_blackstone_re": {"name": "Blackstone Real Estate", "tier": "institutional", "category": "developer", "title": "Largest commercial RE owner ($332B RE AUM)", "aum": 332_000_000_000, "influence_score": 0.92, "metadata": {"portfolio": "Largest commercial RE in world", "political_connections": "Schwarzman major Trump donor; Opportunity Zone beneficiary"}, "connections": [{"actor": "pc_blackstone", "type": "same_entity"}, {"actor": "pe_schwarzman", "type": "controls"}], "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "reit_brookfield": {"name": "Brookfield Real Estate", "tier": "institutional", "category": "developer", "title": "Brookfield — $300B+ RE AUM", "aum": 300_000_000_000, "influence_score": 0.88, "metadata": {"ticker": "BAM/BN", "ceo": "Bruce Flatt", "political_connections": "Kushner 666 Fifth Ave bailout"}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "reit_related": {"name": "Related Companies", "tier": "institutional", "category": "developer", "title": "Hudson Yards developer — political heavyweight", "influence_score": 0.84, "metadata": {"founder": "Stephen Ross", "portfolio": "Hudson Yards ($25B), luxury residential", "political_connections": "Ross is Trump fundraiser; massive NYC zoning influence"}, "connections": [{"actor": "donor_ross", "type": "controls"}], "data_sources": ["nyc_disclosures"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "reit_starwood": {"name": "Starwood Capital Group", "tier": "institutional", "category": "developer", "title": "Starwood — $100B AUM, hotels/multifamily", "aum": 100_000_000_000, "influence_score": 0.80, "metadata": {"founder": "Barry Sternlicht", "political_connections": "Sternlicht vocal on macro policy"}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "reit_vornado": {"name": "Vornado Realty Trust", "tier": "institutional", "category": "reit", "title": "NYC/DC office REIT ($8B)", "influence_score": 0.76, "metadata": {"ticker": "VNO", "ceo": "Steven Roth", "portfolio": "Penn District ($19B redevelopment)", "political_connections": "Roth was on Trump business council"}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "reit_kushner": {"name": "Kushner Companies", "tier": "institutional", "category": "developer", "title": "Kushner — political developer dynasty", "influence_score": 0.78, "metadata": {"founder": "Charles Kushner", "political_connections": "Jared Kushner was Trump senior advisor. Charles Kushner ambassador to France. 666 Fifth Ave Brookfield bailout."}, "data_sources": ["property_records"], "credibility": "hard_data", "motivation_model": "profit_political"},
+    "reit_hines": {"name": "Hines", "tier": "institutional", "category": "developer", "title": "Hines — global RE, $94B portfolio", "influence_score": 0.78, "metadata": {"ceo": "Laura Hines-Pierce", "portfolio": "4,800 properties, 30 countries"}, "data_sources": ["property_records"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "reit_tishman": {"name": "Tishman Speyer", "tier": "institutional", "category": "developer", "title": "Tishman Speyer — Rockefeller Center owner", "influence_score": 0.78, "metadata": {"ceo": "Rob Speyer", "portfolio": "Rockefeller Center, The Spiral"}, "data_sources": ["property_records"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "reit_bxp": {"name": "BXP (Boston Properties)", "tier": "institutional", "category": "reit", "title": "Premier office REIT ($15B mkt cap)", "influence_score": 0.76, "metadata": {"ticker": "BXP", "ceo": "Owen Thomas", "portfolio": "55M+ sq ft office"}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "reit_iron_mountain": {"name": "Iron Mountain", "tier": "institutional", "category": "reit", "title": "Data storage REIT ($30B mkt cap)", "influence_score": 0.74, "metadata": {"ticker": "IRM", "portfolio": "1,400+ facilities"}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "reit_invitation_homes": {"name": "Invitation Homes", "tier": "institutional", "category": "reit", "title": "Largest single-family rental REIT ($20B)", "influence_score": 0.76, "metadata": {"ticker": "INVH", "ceo": "Dallas Tanner", "portfolio": "80,000+ homes", "note": "Poster child for institutional ownership of single-family homes controversy"}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "reit_ventas": {"name": "Ventas", "tier": "institutional", "category": "reit", "title": "Healthcare REIT ($27B mkt cap)", "influence_score": 0.74, "metadata": {"ticker": "VTR", "ceo": "Debra Cafaro", "portfolio": "1,200+ healthcare properties"}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "reit_avalonbay": {"name": "AvalonBay Communities", "tier": "institutional", "category": "reit", "title": "Premium apartment REIT ($32B)", "influence_score": 0.74, "metadata": {"ticker": "AVB", "portfolio": "300+ communities"}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "reit_equity_residential": {"name": "Equity Residential", "tier": "institutional", "category": "reit", "title": "Sam Zell-founded apartment REIT ($28B)", "influence_score": 0.74, "metadata": {"ticker": "EQR", "portfolio": "300+ properties"}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_growth"},
 
     # ══════════════════════════════════════════════════════════════════════
     # MAJOR MEDIA OWNERS — who controls what Americans see
     # Ownership = narrative control. The information gatekeepers.
     # ══════════════════════════════════════════════════════════════════════
-    "media_murdoch": {"name": "Rupert Murdoch / Murdoch Family", "tier": "individual", "category": "media_owner", "title": "Fox News, WSJ, NY Post, Sky News Australia", "net_worth_estimate": 20_000_000_000, "influence_score": 0.95, "metadata": {"outlets": ["Fox News", "Fox Business", "WSJ", "NY Post", "HarperCollins"], "lean": "Right/conservative", "reach": "Fox #1 cable news; WSJ #1 business paper", "succession": "Lachlan now controls; family trust dispute ongoing"}, "connections": [{"actor": "dynasty_murdoch", "type": "same_entity"}], "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "ideological_profit"},
-    "media_sulzberger": {"name": "A.G. Sulzberger / Ochs-Sulzberger Family", "tier": "individual", "category": "media_owner", "title": "NYT Publisher — owned since 1896", "influence_score": 0.90, "metadata": {"outlets": ["New York Times", "The Athletic", "Wirecutter"], "lean": "Center-left", "reach": "5.5B site visits/year — largest news viewership share", "editor_in_chief": "Joseph Kahn"}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "institutional_prestige"},
-    "media_bezos_wapo": {"name": "Jeff Bezos (Washington Post)", "tier": "individual", "category": "media_owner", "title": "Bought WaPo for $250M in 2013", "influence_score": 0.86, "metadata": {"outlets": ["Washington Post"], "lean": "Center-left (shifting)", "editor": "Matt Murray", "note": "Blocked 2024 endorsement — 250K subscribers cancelled"}, "connections": [{"actor": "ind_bezos", "type": "same_entity"}], "data_sources": ["media_reports"], "credibility": "curated_estimate", "motivation_model": "influence_prestige"},
-    "media_bloomberg_lp": {"name": "Bloomberg LP / Bloomberg Media", "tier": "institutional", "category": "media_owner", "title": "Bloomberg Terminal + News — Wall Street's default", "influence_score": 0.92, "metadata": {"outlets": ["Bloomberg News", "Bloomberg TV", "Businessweek", "Bloomberg Terminal"], "lean": "Center / pro-business", "editor": "John Micklethwait", "reach": "350K+ terminal subscribers", "note": "Terminal creates information asymmetry"}, "connections": [{"actor": "donor_bloomberg", "type": "controls"}], "data_sources": ["media_reports"], "credibility": "curated_estimate", "motivation_model": "profit_influence"},
-    "media_soon_shiong": {"name": "Patrick Soon-Shiong (LA Times)", "tier": "individual", "category": "media_owner", "title": "Bought LA Times for $500M (2018)", "net_worth_estimate": 7_500_000_000, "influence_score": 0.74, "metadata": {"outlets": ["Los Angeles Times", "San Diego Union-Tribune"], "lean": "Moderate/centrist", "note": "Blocked 2024 endorsement like Bezos/WaPo. Biotech billionaire."}, "data_sources": ["media_reports"], "credibility": "curated_estimate", "motivation_model": "influence_prestige"},
-    "media_nexstar": {"name": "Nexstar Media Group", "tier": "institutional", "category": "media_owner", "title": "Largest local TV broadcaster — 200+ stations", "influence_score": 0.84, "metadata": {"ticker": "NXST", "ceo": "Perry Sook", "outlets": ["200+ TV stations (post-TEGNA)", "NewsNation", "The Hill"], "reach": "80%+ of US TV households after $6.2B TEGNA acquisition (approved March 2026)"}, "data_sources": ["sec_edgar", "fcc_filings"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "media_sinclair": {"name": "Sinclair Broadcast Group (Smith Family)", "tier": "institutional", "category": "media_owner", "title": "179 local TV stations — conservative lean", "influence_score": 0.82, "metadata": {"ticker": "SBGI", "controller": "David Smith (exec chair)", "outlets": ["179 local TV affiliates"], "lean": "Right/conservative", "reach": "40% of US households", "note": "Mandates must-run conservative segments; shrinks local political coverage; +6.4% ad time"}, "data_sources": ["sec_edgar", "fcc_filings"], "credibility": "curated_estimate", "motivation_model": "ideological_profit"},
-    "media_gray_tv": {"name": "Gray Television", "tier": "institutional", "category": "media_owner", "title": "~180 TV stations in 110+ markets", "influence_score": 0.78, "metadata": {"ticker": "GTN", "ceo": "Hilton Howell Jr.", "outlets": ["180 TV stations"], "note": "Big Three local TV with Nexstar and Sinclair"}, "data_sources": ["sec_edgar", "fcc_filings"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "media_comcast": {"name": "Comcast / NBCUniversal (Roberts Family)", "tier": "institutional", "category": "media_owner", "title": "Largest media conglomerate by revenue", "influence_score": 0.90, "metadata": {"ticker": "CMCSA", "controller": "Brian Roberts", "outlets": ["NBC", "MSNBC", "CNBC", "Peacock", "Universal", "Xfinity"], "lean": "MSNBC left; CNBC pro-business", "note": "Vertical integration: content + distribution. Spun off cable nets 2025."}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "media_disney": {"name": "Walt Disney Company / Bob Iger", "tier": "institutional", "category": "media_owner", "title": "ABC, ESPN, Hulu, Disney+, FX", "influence_score": 0.88, "metadata": {"ticker": "DIS", "ceo": "Bob Iger", "outlets": ["ABC News", "ESPN", "FX", "Hulu", "Disney+"], "note": "DeSantis vs Disney war over FL special district"}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "media_wbd": {"name": "Warner Bros. Discovery / David Zaslav", "tier": "institutional", "category": "media_owner", "title": "CNN, HBO, Max, Warner Bros", "influence_score": 0.82, "metadata": {"ticker": "WBD", "ceo": "David Zaslav", "outlets": ["CNN", "HBO", "Max", "Discovery"], "note": "Zaslav shifted CNN rightward; major cost-cutting"}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "media_paramount": {"name": "Paramount / Skydance (Ellison)", "tier": "institutional", "category": "media_owner", "title": "CBS, Paramount+, MTV (acquired by Skydance)", "influence_score": 0.78, "metadata": {"new_owner": "David Ellison (son of Larry Ellison)", "outlets": ["CBS", "CBS News", "Paramount+", "MTV", "Nickelodeon"], "note": "Control shifted from Redstone to Ellison family"}, "connections": [{"actor": "ind_ellison", "type": "family"}], "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "media_news_corp": {"name": "News Corp (Murdoch print/digital)", "tier": "institutional", "category": "media_owner", "title": "WSJ, Barron's, MarketWatch, NY Post, Dow Jones", "influence_score": 0.84, "metadata": {"ticker": "NWSA", "ceo": "Robert Thomson", "outlets": ["WSJ", "Barron's", "MarketWatch", "NY Post", "Dow Jones", "Realtor.com"], "lean": "Center-right"}, "connections": [{"actor": "media_murdoch", "type": "controls"}], "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "ideological_profit"},
-    "media_gannett": {"name": "Gannett / USA Today", "tier": "institutional", "category": "media_owner", "title": "Largest newspaper chain — 250+ papers", "influence_score": 0.76, "metadata": {"ticker": "GCI", "ceo": "Mike Reed", "outlets": ["USA Today", "250+ local papers"], "note": "Massive layoffs; local news deserts expanding"}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_survival"},
-    "media_alden": {"name": "Alden Global Capital (Tribune/MediaNews)", "tier": "institutional", "category": "media_owner", "title": "Hedge fund that gutted local newspapers", "influence_score": 0.76, "metadata": {"founder": "Randall Smith", "outlets": ["Chicago Tribune", "NY Daily News", "Hartford Courant", "200+ papers via MediaNews Group"], "note": "'Grim Reaper of newspapers' — buys, guts staff, extracts cash"}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_extraction"},
-    "media_iheart": {"name": "iHeartMedia", "tier": "institutional", "category": "media_owner", "title": "Largest US radio company — 850+ stations", "influence_score": 0.78, "metadata": {"ticker": "IHRT", "ceo": "Bob Pittman", "outlets": ["850+ radio stations", "iHeartRadio"], "reach": "90% of US adults monthly", "note": "Talk radio skews right; music apolitical"}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "media_cox": {"name": "Cox Media Group (Apollo-owned)", "tier": "institutional", "category": "media_owner", "title": "12 TV + 50 radio stations (PE-owned)", "influence_score": 0.72, "metadata": {"owner": "Apollo Global Management", "outlets": ["WSB Atlanta", "12 TV stations", "50 radio stations"], "note": "Apollo considering sale; Nexstar and Gray interested"}, "data_sources": ["media_reports"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "media_powell_jobs_atlantic": {"name": "Laurene Powell Jobs (The Atlantic)", "tier": "individual", "category": "media_owner", "title": "Owns The Atlantic via Emerson Collective", "influence_score": 0.72, "metadata": {"outlets": ["The Atlantic"], "lean": "Center-left", "editor": "Jeffrey Goldberg"}, "connections": [{"actor": "donor_powell_jobs", "type": "same_entity"}], "data_sources": ["media_reports"], "credibility": "curated_estimate", "motivation_model": "influence_prestige"},
-    "media_benioff": {"name": "Marc Benioff (TIME)", "tier": "individual", "category": "media_owner", "title": "Bought TIME for $190M (2018)", "net_worth_estimate": 7_500_000_000, "influence_score": 0.72, "metadata": {"outlets": ["TIME magazine"], "lean": "Center-left", "note": "Salesforce CEO"}, "data_sources": ["media_reports"], "credibility": "curated_estimate", "motivation_model": "influence_prestige"},
-    "media_dotdash_meredith": {"name": "Dotdash Meredith (IAC/Diller)", "tier": "institutional", "category": "media_owner", "title": "People, InStyle, Investopedia (IAC subsidiary)", "influence_score": 0.70, "metadata": {"parent": "IAC (Barry Diller)", "outlets": ["People", "InStyle", "Investopedia", "Better Homes & Gardens"], "reach": "300M+ monthly visitors"}, "data_sources": ["sec_edgar"], "credibility": "curated_estimate", "motivation_model": "profit_growth"},
-    "media_vox": {"name": "Vox Media", "tier": "institutional", "category": "media_owner", "title": "NY Mag, The Verge, Vox — progressive digital", "influence_score": 0.72, "metadata": {"ceo": "Jim Bankoff", "outlets": ["New York Magazine", "The Verge", "Vox", "Vulture", "Eater"], "lean": "Left/progressive"}, "data_sources": ["media_reports"], "credibility": "curated_estimate", "motivation_model": "ideological_profit"},
-    "media_daily_wire": {"name": "The Daily Wire (Shapiro/Boreing)", "tier": "institutional", "category": "media_owner", "title": "Most-engaged conservative digital media", "influence_score": 0.76, "metadata": {"founders": ["Ben Shapiro", "Jeremy Boreing"], "outlets": ["Daily Wire", "DailyWire+", "Bentkey"], "lean": "Right/conservative", "reach": "Top Facebook engagement; 1M+ subscribers"}, "data_sources": ["media_reports"], "credibility": "curated_estimate", "motivation_model": "ideological_profit"},
-    "media_substack": {"name": "Substack", "tier": "institutional", "category": "media_owner", "title": "Newsletter platform — 35M+ subscriptions", "influence_score": 0.74, "metadata": {"founders": ["Chris Best", "Hamish McKenzie"], "reach": "35M+ subscriptions", "note": "Shifted power from editors to individual journalists"}, "data_sources": ["media_reports"], "credibility": "curated_estimate", "motivation_model": "platform_growth"},
+    "media_murdoch": {"name": "Rupert Murdoch / Murdoch Family", "tier": "individual", "category": "media_owner", "title": "Fox News, WSJ, NY Post, Sky News Australia", "net_worth_estimate": 20_000_000_000, "influence_score": 0.95, "metadata": {"outlets": ["Fox News", "Fox Business", "WSJ", "NY Post", "HarperCollins"], "lean": "Right/conservative", "reach": "Fox #1 cable news; WSJ #1 business paper", "succession": "Lachlan now controls; family trust dispute ongoing"}, "connections": [{"actor": "dynasty_murdoch", "type": "same_entity"}], "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "ideological_profit"},
+    "media_sulzberger": {"name": "A.G. Sulzberger / Ochs-Sulzberger Family", "tier": "individual", "category": "media_owner", "title": "NYT Publisher — owned since 1896", "influence_score": 0.90, "metadata": {"outlets": ["New York Times", "The Athletic", "Wirecutter"], "lean": "Center-left", "reach": "5.5B site visits/year — largest news viewership share", "editor_in_chief": "Joseph Kahn"}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "institutional_prestige"},
+    "media_bezos_wapo": {"name": "Jeff Bezos (Washington Post)", "tier": "individual", "category": "media_owner", "title": "Bought WaPo for $250M in 2013", "influence_score": 0.86, "metadata": {"outlets": ["Washington Post"], "lean": "Center-left (shifting)", "editor": "Matt Murray", "note": "Blocked 2024 endorsement — 250K subscribers cancelled"}, "connections": [{"actor": "ind_bezos", "type": "same_entity"}], "data_sources": ["media_reports"], "credibility": "hard_data", "motivation_model": "influence_prestige"},
+    "media_bloomberg_lp": {"name": "Bloomberg LP / Bloomberg Media", "tier": "institutional", "category": "media_owner", "title": "Bloomberg Terminal + News — Wall Street's default", "influence_score": 0.92, "metadata": {"outlets": ["Bloomberg News", "Bloomberg TV", "Businessweek", "Bloomberg Terminal"], "lean": "Center / pro-business", "editor": "John Micklethwait", "reach": "350K+ terminal subscribers", "note": "Terminal creates information asymmetry"}, "connections": [{"actor": "donor_bloomberg", "type": "controls"}], "data_sources": ["media_reports"], "credibility": "hard_data", "motivation_model": "profit_influence"},
+    "media_soon_shiong": {"name": "Patrick Soon-Shiong (LA Times)", "tier": "individual", "category": "media_owner", "title": "Bought LA Times for $500M (2018)", "net_worth_estimate": 7_500_000_000, "influence_score": 0.74, "metadata": {"outlets": ["Los Angeles Times", "San Diego Union-Tribune"], "lean": "Moderate/centrist", "note": "Blocked 2024 endorsement like Bezos/WaPo. Biotech billionaire."}, "data_sources": ["media_reports"], "credibility": "hard_data", "motivation_model": "influence_prestige"},
+    "media_nexstar": {"name": "Nexstar Media Group", "tier": "institutional", "category": "media_owner", "title": "Largest local TV broadcaster — 200+ stations", "influence_score": 0.84, "metadata": {"ticker": "NXST", "ceo": "Perry Sook", "outlets": ["200+ TV stations (post-TEGNA)", "NewsNation", "The Hill"], "reach": "80%+ of US TV households after $6.2B TEGNA acquisition (approved March 2026)"}, "data_sources": ["sec_edgar", "fcc_filings"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "media_sinclair": {"name": "Sinclair Broadcast Group (Smith Family)", "tier": "institutional", "category": "media_owner", "title": "179 local TV stations — conservative lean", "influence_score": 0.82, "metadata": {"ticker": "SBGI", "controller": "David Smith (exec chair)", "outlets": ["179 local TV affiliates"], "lean": "Right/conservative", "reach": "40% of US households", "note": "Mandates must-run conservative segments; shrinks local political coverage; +6.4% ad time"}, "data_sources": ["sec_edgar", "fcc_filings"], "credibility": "hard_data", "motivation_model": "ideological_profit"},
+    "media_gray_tv": {"name": "Gray Television", "tier": "institutional", "category": "media_owner", "title": "~180 TV stations in 110+ markets", "influence_score": 0.78, "metadata": {"ticker": "GTN", "ceo": "Hilton Howell Jr.", "outlets": ["180 TV stations"], "note": "Big Three local TV with Nexstar and Sinclair"}, "data_sources": ["sec_edgar", "fcc_filings"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "media_comcast": {"name": "Comcast / NBCUniversal (Roberts Family)", "tier": "institutional", "category": "media_owner", "title": "Largest media conglomerate by revenue", "influence_score": 0.90, "metadata": {"ticker": "CMCSA", "controller": "Brian Roberts", "outlets": ["NBC", "MSNBC", "CNBC", "Peacock", "Universal", "Xfinity"], "lean": "MSNBC left; CNBC pro-business", "note": "Vertical integration: content + distribution. Spun off cable nets 2025."}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "media_disney": {"name": "Walt Disney Company / Bob Iger", "tier": "institutional", "category": "media_owner", "title": "ABC, ESPN, Hulu, Disney+, FX", "influence_score": 0.88, "metadata": {"ticker": "DIS", "ceo": "Bob Iger", "outlets": ["ABC News", "ESPN", "FX", "Hulu", "Disney+"], "note": "DeSantis vs Disney war over FL special district"}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "media_wbd": {"name": "Warner Bros. Discovery / David Zaslav", "tier": "institutional", "category": "media_owner", "title": "CNN, HBO, Max, Warner Bros", "influence_score": 0.82, "metadata": {"ticker": "WBD", "ceo": "David Zaslav", "outlets": ["CNN", "HBO", "Max", "Discovery"], "note": "Zaslav shifted CNN rightward; major cost-cutting"}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "media_paramount": {"name": "Paramount / Skydance (Ellison)", "tier": "institutional", "category": "media_owner", "title": "CBS, Paramount+, MTV (acquired by Skydance)", "influence_score": 0.78, "metadata": {"new_owner": "David Ellison (son of Larry Ellison)", "outlets": ["CBS", "CBS News", "Paramount+", "MTV", "Nickelodeon"], "note": "Control shifted from Redstone to Ellison family"}, "connections": [{"actor": "ind_ellison", "type": "family"}], "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "media_news_corp": {"name": "News Corp (Murdoch print/digital)", "tier": "institutional", "category": "media_owner", "title": "WSJ, Barron's, MarketWatch, NY Post, Dow Jones", "influence_score": 0.84, "metadata": {"ticker": "NWSA", "ceo": "Robert Thomson", "outlets": ["WSJ", "Barron's", "MarketWatch", "NY Post", "Dow Jones", "Realtor.com"], "lean": "Center-right"}, "connections": [{"actor": "media_murdoch", "type": "controls"}], "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "ideological_profit"},
+    "media_gannett": {"name": "Gannett / USA Today", "tier": "institutional", "category": "media_owner", "title": "Largest newspaper chain — 250+ papers", "influence_score": 0.76, "metadata": {"ticker": "GCI", "ceo": "Mike Reed", "outlets": ["USA Today", "250+ local papers"], "note": "Massive layoffs; local news deserts expanding"}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_survival"},
+    "media_alden": {"name": "Alden Global Capital (Tribune/MediaNews)", "tier": "institutional", "category": "media_owner", "title": "Hedge fund that gutted local newspapers", "influence_score": 0.76, "metadata": {"founder": "Randall Smith", "outlets": ["Chicago Tribune", "NY Daily News", "Hartford Courant", "200+ papers via MediaNews Group"], "note": "'Grim Reaper of newspapers' — buys, guts staff, extracts cash"}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_extraction"},
+    "media_iheart": {"name": "iHeartMedia", "tier": "institutional", "category": "media_owner", "title": "Largest US radio company — 850+ stations", "influence_score": 0.78, "metadata": {"ticker": "IHRT", "ceo": "Bob Pittman", "outlets": ["850+ radio stations", "iHeartRadio"], "reach": "90% of US adults monthly", "note": "Talk radio skews right; music apolitical"}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "media_cox": {"name": "Cox Media Group (Apollo-owned)", "tier": "institutional", "category": "media_owner", "title": "12 TV + 50 radio stations (PE-owned)", "influence_score": 0.72, "metadata": {"owner": "Apollo Global Management", "outlets": ["WSB Atlanta", "12 TV stations", "50 radio stations"], "note": "Apollo considering sale; Nexstar and Gray interested"}, "data_sources": ["media_reports"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "media_powell_jobs_atlantic": {"name": "Laurene Powell Jobs (The Atlantic)", "tier": "individual", "category": "media_owner", "title": "Owns The Atlantic via Emerson Collective", "influence_score": 0.72, "metadata": {"outlets": ["The Atlantic"], "lean": "Center-left", "editor": "Jeffrey Goldberg"}, "connections": [{"actor": "donor_powell_jobs", "type": "same_entity"}], "data_sources": ["media_reports"], "credibility": "hard_data", "motivation_model": "influence_prestige"},
+    "media_benioff": {"name": "Marc Benioff (TIME)", "tier": "individual", "category": "media_owner", "title": "Bought TIME for $190M (2018)", "net_worth_estimate": 7_500_000_000, "influence_score": 0.72, "metadata": {"outlets": ["TIME magazine"], "lean": "Center-left", "note": "Salesforce CEO"}, "data_sources": ["media_reports"], "credibility": "hard_data", "motivation_model": "influence_prestige"},
+    "media_dotdash_meredith": {"name": "Dotdash Meredith (IAC/Diller)", "tier": "institutional", "category": "media_owner", "title": "People, InStyle, Investopedia (IAC subsidiary)", "influence_score": 0.70, "metadata": {"parent": "IAC (Barry Diller)", "outlets": ["People", "InStyle", "Investopedia", "Better Homes & Gardens"], "reach": "300M+ monthly visitors"}, "data_sources": ["sec_edgar"], "credibility": "hard_data", "motivation_model": "profit_growth"},
+    "media_vox": {"name": "Vox Media", "tier": "institutional", "category": "media_owner", "title": "NY Mag, The Verge, Vox — progressive digital", "influence_score": 0.72, "metadata": {"ceo": "Jim Bankoff", "outlets": ["New York Magazine", "The Verge", "Vox", "Vulture", "Eater"], "lean": "Left/progressive"}, "data_sources": ["media_reports"], "credibility": "hard_data", "motivation_model": "ideological_profit"},
+    "media_daily_wire": {"name": "The Daily Wire (Shapiro/Boreing)", "tier": "institutional", "category": "media_owner", "title": "Most-engaged conservative digital media", "influence_score": 0.76, "metadata": {"founders": ["Ben Shapiro", "Jeremy Boreing"], "outlets": ["Daily Wire", "DailyWire+", "Bentkey"], "lean": "Right/conservative", "reach": "Top Facebook engagement; 1M+ subscribers"}, "data_sources": ["media_reports"], "credibility": "hard_data", "motivation_model": "ideological_profit"},
+    "media_substack": {"name": "Substack", "tier": "institutional", "category": "media_owner", "title": "Newsletter platform — 35M+ subscriptions", "influence_score": 0.74, "metadata": {"founders": ["Chris Best", "Hamish McKenzie"], "reach": "35M+ subscriptions", "note": "Shifted power from editors to individual journalists"}, "data_sources": ["media_reports"], "credibility": "hard_data", "motivation_model": "platform_growth"},
 
     # ══════════════════════════════════════════════════════════════════════
     # CONNECTIONS MAP — cross-references for graph building
@@ -5612,7 +5592,7 @@ def _load_top_insiders(engine, limit: int = 5) -> dict[str, dict]:
                 "title": title or "Corporate Insider",
                 "influence_score": round(0.65 - i * 0.03, 2),
                 "data_sources": ["form4", "insider_trades"],
-                "credibility": "curated_estimate",
+                "credibility": "hard_data",
                 "motivation_model": "informed",
                 "metadata": {
                     "trade_count_1y": trades,

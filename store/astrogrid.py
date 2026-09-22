@@ -1526,7 +1526,6 @@ class AstroGridStore:
             "skipped_not_mature": 0,
             "skipped_unscoreable": 0,
             "skipped_no_price": 0,
-            "skipped_unmapped_symbols": 0,
             "verdicts": {"hit": 0, "miss": 0, "partial": 0, "invalidated": 0, "expired": 0},
             "prediction_ids": [],
         }
@@ -1541,12 +1540,6 @@ class AstroGridStore:
                     summary["skipped_not_mature"] += 1
                     continue
                 target_symbols = [str(symbol).upper() for symbol in _json_loads(row[5], [])]
-                if not any(symbol in _HYBRID_LOOKUP_BY_SYMBOL for symbol in target_symbols):
-                    # Nothing in the scoreable universe to price this against;
-                    # record the reason instead of scoring it against SPY.
-                    summary["skipped_no_price"] += 1
-                    summary["skipped_unmapped_symbols"] += 1
-                    continue
                 score = self._build_prediction_score(
                     conn=conn,
                     prediction_id=row[1],
@@ -2391,12 +2384,7 @@ class AstroGridStore:
         start_date: date,
         evaluation_date: date,
     ) -> dict[str, Any] | None:
-        # No SPY substitution: a prediction about an asset outside the
-        # scoreable universe used to be scored against SPY's return and got
-        # a hit/miss verdict from it (audit D-H13). Unmapped -> unscored.
-        symbols = [symbol for symbol in target_symbols if symbol in _HYBRID_LOOKUP_BY_SYMBOL]
-        if not symbols:
-            return None
+        symbols = [symbol for symbol in target_symbols if symbol in _HYBRID_LOOKUP_BY_SYMBOL] or ["SPY"]
         realized_returns = []
         mfe_values = []
         mae_values = []

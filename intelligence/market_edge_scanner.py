@@ -92,8 +92,8 @@ class PlaybookBlueprint:
     primary_sources: tuple[str, ...]
     supporting_sources: tuple[str, ...]
     clue_prompts: tuple[str, ...]
-    prior_confidence_points: int
-    prior_rank_points: int
+    base_confidence: int
+    base_edge: int
     setup_type: str
     horizon: str
     bias: str = "long"
@@ -141,8 +141,8 @@ PLAYBOOKS: tuple[PlaybookBlueprint, ...] = (
             "Watch procurement language around Title 10, force readiness, and mission systems.",
             "Keep the basket tight to primes and mission IT names, not defense ETFs.",
         ),
-        prior_confidence_points=74,
-        prior_rank_points=18,
+        base_confidence=74,
+        base_edge=18,
         setup_type="procurement-compound",
         horizon="1-3 months",
     ),
@@ -165,8 +165,8 @@ PLAYBOOKS: tuple[PlaybookBlueprint, ...] = (
             "Separate software licensing and systems integration spend from generic AI chatter.",
             "Require named-award confirmation before promoting any adjacent vendor.",
         ),
-        prior_confidence_points=70,
-        prior_rank_points=16,
+        base_confidence=70,
+        base_edge=16,
         setup_type="gov-it-refresh",
         horizon="1-3 months",
     ),
@@ -189,8 +189,8 @@ PLAYBOOKS: tuple[PlaybookBlueprint, ...] = (
             "Demand ticker-level call skew before surfacing peers.",
             "Treat ETF options activity as noise unless the named compute chain confirms it.",
         ),
-        prior_confidence_points=71,
-        prior_rank_points=17,
+        base_confidence=71,
+        base_edge=17,
         setup_type="policy-supply-gate",
         horizon="2-8 weeks",
     ),
@@ -213,8 +213,8 @@ PLAYBOOKS: tuple[PlaybookBlueprint, ...] = (
             "Promote only the builders repeatedly named by the policy map.",
             "Ignore broad housing baskets unless the builders confirm first.",
         ),
-        prior_confidence_points=64,
-        prior_rank_points=14,
+        base_confidence=64,
+        base_edge=14,
         setup_type="policy-demand-release",
         horizon="1-3 months",
     ),
@@ -237,8 +237,8 @@ PLAYBOOKS: tuple[PlaybookBlueprint, ...] = (
             "Keep payors separated from drug manufacturers in the read-through.",
             "Demand repeated name-level hits before escalating confidence.",
         ),
-        prior_confidence_points=61,
-        prior_rank_points=12,
+        base_confidence=61,
+        base_edge=12,
         setup_type="policy-pressure",
         horizon="1-3 months",
     ),
@@ -261,8 +261,8 @@ PLAYBOOKS: tuple[PlaybookBlueprint, ...] = (
             "Stay with named producers instead of crude proxies.",
             "Look for company-specific confirmation before broadening the basket.",
         ),
-        prior_confidence_points=60,
-        prior_rank_points=13,
+        base_confidence=60,
+        base_edge=13,
         setup_type="policy-optionality",
         horizon="1-3 months",
     ),
@@ -285,8 +285,8 @@ PLAYBOOKS: tuple[PlaybookBlueprint, ...] = (
             "Keep the focus on fuel suppliers before looking at second-order names.",
             "Require policy follow-through because this theme reprices slowly.",
         ),
-        prior_confidence_points=59,
-        prior_rank_points=15,
+        base_confidence=59,
+        base_edge=15,
         setup_type="policy-scarcity",
         horizon="2-6 months",
     ),
@@ -309,8 +309,8 @@ PLAYBOOKS: tuple[PlaybookBlueprint, ...] = (
             "Stay with the filing rails, not generic fintech.",
             "Wait for repeated company-level matches before increasing size.",
         ),
-        prior_confidence_points=57,
-        prior_rank_points=12,
+        base_confidence=57,
+        base_edge=12,
         setup_type="policy-plumbing",
         horizon="1-3 months",
     ),
@@ -333,8 +333,8 @@ PLAYBOOKS: tuple[PlaybookBlueprint, ...] = (
             "Require named-bank flow confirmation before upgrading confidence.",
             "Ignore basket signals unless the large banks move first.",
         ),
-        prior_confidence_points=63,
-        prior_rank_points=13,
+        base_confidence=63,
+        base_edge=13,
         setup_type="policy-plus-flow",
         horizon="2-8 weeks",
     ),
@@ -357,8 +357,8 @@ PLAYBOOKS: tuple[PlaybookBlueprint, ...] = (
             "Keep Boeing separate from airline read-through when the signal splits.",
             "Avoid broad transport ETFs unless the carriers confirm first.",
         ),
-        prior_confidence_points=58,
-        prior_rank_points=11,
+        base_confidence=58,
+        base_edge=11,
         setup_type="rule-cycle",
         horizon="1-3 months",
     ),
@@ -437,8 +437,7 @@ def _dedupe(items: list[str], limit: int) -> list[str]:
     return result
 
 
-def _heuristic_confidence_label(value: int) -> str:
-    """Bucket the heuristic score. This is a rank label, not a calibrated confidence."""
+def _confidence_label(value: int) -> str:
     if value >= 78:
         return "high"
     if value >= 62:
@@ -446,7 +445,7 @@ def _heuristic_confidence_label(value: int) -> str:
     return "low"
 
 
-def _status_from_heuristic_score(value: int) -> str:
+def _status_from_confidence(value: int) -> str:
     if value >= 78:
         return "active"
     if value >= 64:
@@ -1013,12 +1012,12 @@ def _build_upgrade_trigger(
     return "Need a fresh confirming print to tighten the window."
 
 
-def _build_quality_label(lagging_factors: list[str], heuristic_score: int) -> str:
-    if heuristic_score >= 84 and len(lagging_factors) <= 1:
+def _build_quality_label(lagging_factors: list[str], confidence: int) -> str:
+    if confidence >= 84 and len(lagging_factors) <= 1:
         return "tight"
-    if heuristic_score >= 72 and len(lagging_factors) <= 2:
+    if confidence >= 72 and len(lagging_factors) <= 2:
         return "mixed"
-    if len(lagging_factors) >= 2 or heuristic_score < 62:
+    if len(lagging_factors) >= 2 or confidence < 62:
         return "lagging"
     return "mixed"
 
@@ -1068,64 +1067,36 @@ def _base_opportunity(
     target_names = _profile_names(profiles)
     source_types = _supporting_source_types(profiles)
 
-    # Every term below is a hand-tuned point award, not a measurement. The ledger is
-    # published with the opportunity so a reader can see exactly what produced the
-    # number and that nothing in this path was ever scored against outcomes.
-    components: list[dict[str, Any]] = []
-
-    def _award(component: str, points: int, detail: str) -> None:
-        if points:
-            components.append({"component": component, "points": int(points), "detail": detail})
-
-    _award("playbook_prior", playbook.prior_confidence_points, f"fixed prior for playbook {playbook.id}")
+    confidence = playbook.base_confidence
     unique_sources = len(source_types)
-    _award(
-        "unique_source_types",
-        min(unique_sources * 3, 9),
-        f"{unique_sources} distinct supporting source type(s), 3 points each, capped at 9",
-    )
-    _award(
-        "multiple_targets",
-        min(max(len(targets) - 1, 0) * 2, 6),
-        f"{len(targets)} target(s), 2 points per extra target, capped at 6",
-    )
+    confidence += min(unique_sources * 3, 9)
+    confidence += min(max(len(targets) - 1, 0) * 2, 6)
     if any(profile.options_calls > profile.options_puts for profile in profiles):
-        _award("call_skew", 3, "at least one profile shows more call than put prints")
+        confidence += 3
     if any(profile.influence_contracts_received >= 25_000_000 for profile in profiles):
-        _award("influence_contracts_25m", 4, "influence loop shows >= $25m contracts received")
+        confidence += 4
     if any(
         sum(_to_float(item.get("amount")) for item in profile.gov_contract_items) >= 50_000_000
         for profile in profiles
     ):
-        _award("gov_contracts_50m", 4, "government contract items total >= $50m")
+        confidence += 4
     if any(profile.export_control_items for profile in profiles):
-        _award("export_controls", 4, "at least one export-control item maps to a target")
+        confidence += 4
     latest_date = max((profile.last_signal_date for profile in profiles if profile.last_signal_date), default=None)
     if latest_date and latest_date >= (date.today() - timedelta(days=60)):
-        _award("recent_signal_60d", 2, f"most recent mapped signal {latest_date.isoformat()}")
+        confidence += 2
 
     evidence = _collect_evidence(playbook, profiles)
     decision_window = _build_decision_window(playbook, profiles, as_of)
     driver_stack = _build_driver_stack(playbook, profiles, target_names, targets, evidence)
     confirmation_board = _build_confirmation_board(playbook, profiles, targets, as_of)
-    penalty = _apply_quality_penalty(playbook, confirmation_board, source_types, targets, decision_window)
-    _award("quality_penalty", -penalty, "deductions for missing, due or late confirmation rows")
-
-    raw_score = sum(int(entry["points"]) for entry in components)
-    heuristic_score = max(35, min(int(round(raw_score)), 94))
-    if heuristic_score != raw_score:
-        components.append(
-            {
-                "component": "clamp",
-                "points": heuristic_score - raw_score,
-                "detail": f"raw {raw_score} clamped into the fixed [35, 94] band",
-            }
-        )
-    heuristic_rank = max(10, playbook.prior_rank_points + max(0, (heuristic_score - 58) // 7))
+    confidence -= _apply_quality_penalty(playbook, confirmation_board, source_types, targets, decision_window)
+    confidence = max(35, min(int(round(confidence)), 94))
+    expected_edge = max(10, playbook.base_edge + max(0, (confidence - 58) // 7))
     stakes = _build_stakes(profiles, targets, source_types)
     lagging_factors = _build_lagging_factors(playbook, confirmation_board, targets, source_types)
     upgrade_trigger = _build_upgrade_trigger(playbook, confirmation_board, targets, source_types, decision_window)
-    quality_label = _build_quality_label(lagging_factors, heuristic_score)
+    quality_label = _build_quality_label(lagging_factors, confidence)
 
     return {
         "id": playbook.id,
@@ -1134,15 +1105,11 @@ def _base_opportunity(
         "setup_type": playbook.setup_type,
         "data_mode": "live",
         "bias": playbook.bias,
-        "heuristic_rank": int(heuristic_rank),
-        "basis": "playbook_prior",
-        "score": heuristic_score,
-        "heuristic_confidence": heuristic_score,
-        "heuristic_confidence_label": _heuristic_confidence_label(heuristic_score),
-        "heuristic_confidence_inputs": components,
-        "confidence": None,
-        "confidence_basis": "no_scored_track_record",
-        "status": _status_from_heuristic_score(heuristic_score),
+        "expected_edge_pct": int(expected_edge),
+        "score": confidence,
+        "confidence": confidence,
+        "confidence_label": _confidence_label(confidence),
+        "status": _status_from_confidence(confidence),
         "horizon": playbook.horizon,
         "sector_focus": playbook.sector_focus,
         "thesis": f"{playbook.thesis_stub} Focus names: {target_names}.",
@@ -1326,15 +1293,15 @@ def _build_live_opportunities(
         if selected_profiles:
             opportunities.append(_base_opportunity(playbook, selected_profiles, as_of))
 
-    opportunities.sort(key=lambda item: (item["score"], item["heuristic_rank"]), reverse=True)
+    opportunities.sort(key=lambda item: (item["score"], item["expected_edge_pct"]), reverse=True)
     return opportunities[:limit]
 
 
 def _build_summary(opportunities: list[dict[str, Any]], coverage_gaps: list[dict[str, Any]]) -> dict[str, Any]:
-    avg_heuristic_rank = (
-        sum(_to_float(item.get("heuristic_rank")) for item in opportunities) / len(opportunities)
+    avg_edge = (
+        sum(_to_float(item.get("expected_edge_pct")) for item in opportunities) / len(opportunities)
         if opportunities
-        else None
+        else 0.0
     )
     active_count = sum(1 for item in opportunities if item.get("status") == "active")
     arming_count = sum(1 for item in opportunities if item.get("status") == "arming")
@@ -1342,7 +1309,7 @@ def _build_summary(opportunities: list[dict[str, Any]], coverage_gaps: list[dict
     background_count = sum(1 for item in opportunities if item.get("status") == "background")
     live_count = sum(1 for item in opportunities if item.get("data_mode") == "live")
     evidence_count = sum(len(item.get("evidence") or []) for item in opportunities)
-    high_heuristic_count = sum(1 for item in opportunities if _to_float(item.get("score")) >= 78)
+    high_confidence_count = sum(1 for item in opportunities if _to_float(item.get("confidence")) >= 78)
 
     return {
         "count": len(opportunities),
@@ -1351,9 +1318,8 @@ def _build_summary(opportunities: list[dict[str, Any]], coverage_gaps: list[dict
         "watch_count": watch_count,
         "background_count": background_count,
         "live_count": live_count,
-        "high_heuristic_count": high_heuristic_count,
-        "avg_heuristic_rank": round(avg_heuristic_rank, 1) if avg_heuristic_rank is not None else None,
-        "heuristic_basis": "playbook_prior",
+        "high_confidence_count": high_confidence_count,
+        "avg_expected_edge_pct": round(avg_edge, 1),
         "evidence_count": evidence_count,
         "coverage_gap_count": len(coverage_gaps),
         "top_setup": opportunities[0]["id"] if opportunities else None,

@@ -719,16 +719,7 @@ export default function LeverMap() {
         {/* Key personnel */}
         {a.key_personnel && a.key_personnel.length > 0 && (
           <>
-            {/* roster_as_of is the curation date of this hand-typed roster.
-                Boards change; a reader has to see how old the list is. */}
-            <div style={S.sectionLabel}>
-              Key Personnel
-              {a.roster_as_of && (
-                <span style={{ color: '#8AA0B8', fontSize: '10px', marginLeft: '6px', fontWeight: 400 }}>
-                  curated roster · as of {a.roster_as_of}
-                </span>
-              )}
-            </div>
+            <div style={S.sectionLabel}>Key Personnel</div>
             {a.key_personnel.map((p, i) => (
               <div key={i} style={S.personRow}>
                 <span>{p.name}</span>

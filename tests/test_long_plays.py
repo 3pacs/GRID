@@ -71,7 +71,7 @@ def _patch_loaders(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> None:
                     "horizon": "3-6 months",
                     "category": "Energy",
                     "sector_focus": "Nuclear fuel",
-                    "prior_rank_points": 15.0,
+                    "base_edge": 15.0,
                 }
             ]
         },
