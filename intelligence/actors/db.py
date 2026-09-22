@@ -82,9 +82,36 @@ def _ensure_tables(engine: Engine) -> None:
 def _seed_known_actors(engine: Engine) -> int:
     """Insert or update all _KNOWN_ACTORS into the actors table.
 
+    Every row written here is hand-curated content about a named real person
+    or organization, so each one is stamped ``provenance = 'seed'`` and
+    ``updated_at = SEED_VINTAGE_TS`` -- the date those figures were last
+    hand-edited, *not* ``NOW()``. Stamping wall-clock time made a net-worth
+    literal typed in months ago look like a reading taken this second
+    (audit A-H13).
+
+    ``provenance = 'seed'`` is a claim about current state, not permanent
+    origin (see ``migrations/versions/actors_provenance_columns_0922.py`` and
+    ``intelligence/actors/provenance.py`` for the precise definition,
+    including why a moved ``updated_at`` alone is not proof of a real
+    observation). A row already stamped anything other than
+    ``PROVENANCE_SEED`` -- ``'observed'`` (confirmed by ``save_actor``'s
+    writer contract) or ``'unconfirmed'`` (touched by something else, not
+    confirmed) -- must not be reset by a later call here: that would either
+    relabel genuinely-observed data as a hand-typed guess, or paper over an
+    unconfirmed modification by reasserting "still pristine seed data" over
+    it. Because ``influence_score`` and the other seed-authored fields would
+    otherwise keep refreshing from ``_KNOWN_ACTORS`` on every call regardless
+    of the row's provenance -- silently overwriting genuinely observed or
+    unconfirmed-but-real values while the label claims something else -- the
+    ``ON CONFLICT ... WHERE`` clause below suppresses the *entire* update,
+    not just the provenance columns, unless the existing row is still
+    exactly ``'seed'``.
+
     Returns:
         Number of actors upserted.
     """
+    from intelligence.actors.provenance import PROVENANCE_SEED, SEED_VINTAGE, SEED_VINTAGE_TS
+
     _ensure_tables(engine)
     count = 0
     with engine.begin() as conn:
@@ -94,12 +121,14 @@ def _seed_known_actors(engine: Engine) -> int:
                     id, name, tier, category, title,
                     net_worth_estimate, aum, influence_score,
                     trust_score, motivation_model,
-                    data_sources, credibility, updated_at
+                    data_sources, credibility,
+                    provenance, provenance_as_of, updated_at
                 ) VALUES (
                     :id, :name, :tier, :category, :title,
                     :nw, :aum, :inf,
                     :trust, :motivation,
-                    :sources, :cred, NOW()
+                    :sources, :cred,
+                    :provenance, :vintage_date, :vintage_ts
                 )
                 ON CONFLICT (id) DO UPDATE SET
                     name = EXCLUDED.name,
@@ -112,7 +141,10 @@ def _seed_known_actors(engine: Engine) -> int:
                     motivation_model = EXCLUDED.motivation_model,
                     data_sources = EXCLUDED.data_sources,
                     credibility = EXCLUDED.credibility,
-                    updated_at = NOW()
+                    provenance = EXCLUDED.provenance,
+                    provenance_as_of = EXCLUDED.provenance_as_of,
+                    updated_at = EXCLUDED.updated_at
+                WHERE actors.provenance = :seed
             """), {
                 "id": actor_id,
                 "name": data["name"],
@@ -126,6 +158,10 @@ def _seed_known_actors(engine: Engine) -> int:
                 "motivation": data.get("motivation_model", "unknown"),
                 "sources": json.dumps(data.get("data_sources", [])),
                 "cred": data.get("credibility", "inferred"),
+                "provenance": PROVENANCE_SEED,
+                "vintage_date": SEED_VINTAGE,
+                "vintage_ts": SEED_VINTAGE_TS,
+                "seed": PROVENANCE_SEED,
             })
             count += 1
     log.info("Seeded {n} actors into the database", n=count)
