@@ -21,6 +21,7 @@ from sqlalchemy import text
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from intelligence.actors.provenance import stamp_actor_node
 
 router = APIRouter(prefix="/api/v1/intel", tags=["intel-product"])
 
@@ -978,6 +979,19 @@ async def intel_deep_dive(
 
 # ── 7. Network Graph Traversal ───────────────────────────────────────────
 
+# Each hop issues one query per frontier NAME (not a single batched query,
+# unlike get_ego_graph's per-hop LIMIT), and until the actor-traversal fix
+# above, the actor branch could never contribute to next_frontier at all --
+# so growth was bounded in practice by ICIJ's much sparser fan-out. Fixing
+# that branch means a well-connected actor's `connections` column (which can
+# run far denser than ICIJ leak relationships) can now drive next_frontier
+# growth too, at up to depth=5. Without a total-node cap, a single request
+# against a highly-connected root could fan out to a very large number of
+# sequential per-name queries. Mirrors get_ego_graph's existing
+# `len(actor_map) >= max_nodes` pattern (api/routers/intelligence_actors.py).
+_MAX_NETWORK_NODES = 500
+
+
 @router.get("/network/{entity:path}")
 def intel_network(
     entity: str = Path(..., description="Entity or actor name"),
@@ -997,13 +1011,15 @@ def intel_network(
 
     with engine.connect() as conn:
         for hop in range(depth):
-            if not frontier:
+            if not frontier or len(nodes) >= _MAX_NETWORK_NODES:
                 break
 
             next_frontier: set[str] = set()
             for name in frontier:
                 if name in visited:
                     continue
+                if len(nodes) >= _MAX_NETWORK_NODES:
+                    break
                 visited.add(name)
 
                 # Add this node
@@ -1059,17 +1075,18 @@ def intel_network(
                 try:
                     rows = conn.execute(
                         text(
-                            "SELECT actor_id, name, tier, sector, connections "
+                            "SELECT id, name, tier, category, connections, "
+                            "provenance, provenance_as_of "
                             "FROM actors "
                             "WHERE UPPER(name) = :n "
-                            "   OR UPPER(actor_id) = :n"
+                            "   OR UPPER(id) = :n"
                         ),
                         {"n": name},
                     ).fetchall()
                     for r in rows:
                         actor_name = r[1].upper() if r[1] else name
                         if actor_name not in nodes:
-                            nodes[actor_name] = {
+                            node = {
                                 "id": actor_name,
                                 "type": "actor",
                                 "tier": r[2],
@@ -1077,6 +1094,8 @@ def intel_network(
                                 "hop": hop,
                                 "confidence": "derived",
                             }
+                            stamp_actor_node(node, r[0], stored=r[5], vintage=r[6])
+                            nodes[actor_name] = node
                         # Parse connections to find adjacent nodes
                         connections = _safe_json(r[4])
                         if isinstance(connections, list):
