@@ -1040,7 +1040,10 @@ def get_sector_power_map(
         }
 
     if not actor_map:
-        # Fallback: build from sector_map data alone (no DB matches)
+        # Fallback: build from sector_map data alone (no DB matches at all).
+        # No `actors` row exists for anything in this sector -- same
+        # synthesized-from-sector_map situation as the per-ticker synthetic
+        # nodes built below when some (but not all) actors have DB matches.
         nodes = []
         for a in sector_actors[:25]:
             nodes.append({
@@ -1051,6 +1054,9 @@ def get_sector_power_map(
                 "trust": 0.5,
                 "ticker": a.get("ticker"),
                 "subsector": a.get("subsector"),
+                "synthetic": True,
+                "source": SOURCE_SECTOR_MAP,
+                "source_as_of": None,
             })
         return {
             "nodes": nodes,

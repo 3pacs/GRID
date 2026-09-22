@@ -120,6 +120,25 @@ CREATE TABLE IF NOT EXISTS wealth_flows (
 )
 """
 
+# intel.py's network-graph traversal queries this table (ICIJ relationships)
+# unconditionally, in its own try/except, BEFORE the actor-lookup query runs
+# on the same connection -- a real, pre-existing fragility: if that query
+# throws (e.g. because the table doesn't exist), the connection's transaction
+# is left aborted, and the actor-lookup query on the SAME connection then
+# ALSO fails (also silently swallowed by its own broad except). Empty is
+# fine; it only needs to exist so that query succeeds (trivially, with zero
+# rows) rather than poisoning the transaction for the query this file
+# actually tests.
+_ICIJ_RELATIONSHIPS_DDL = """
+CREATE TABLE IF NOT EXISTS icij_relationships (
+    entity_name TEXT,
+    linked_to TEXT,
+    relationship_type TEXT,
+    jurisdiction TEXT,
+    source_dataset TEXT
+)
+"""
+
 
 @pytest.fixture(autouse=True)
 def _schema(pg_engine: Engine):
@@ -127,6 +146,7 @@ def _schema(pg_engine: Engine):
         conn.execute(text(_ACTORS_DDL))
         conn.execute(text(_ACTOR_CONNECTIONS_DDL))
         conn.execute(text(_WEALTH_FLOWS_DDL))
+        conn.execute(text(_ICIJ_RELATIONSHIPS_DDL))
         for stmt in (
             "ALTER TABLE actors ADD COLUMN IF NOT EXISTS provenance TEXT NOT NULL DEFAULT 'unknown'",
             "ALTER TABLE actors ADD COLUMN IF NOT EXISTS provenance_as_of DATE",
@@ -257,9 +277,12 @@ def test_get_sector_power_map_stamps_source_on_db_matched_actor(pg_engine: Engin
     aid = f"prov_router_pg_{uuid.uuid4().hex[:10]}_sector"
     test_ids.append(aid)
     with pg_engine.begin() as conn:
-        _insert_actor(conn, actor_id=aid, name="NVIDIA CORP (NVDA)", provenance=PROVENANCE_SEED, provenance_as_of=SEED_VINTAGE)
+        # Name must match the sector_map's own registered name (case-insensitive)
+        # so the endpoint's pre-existing ticker-inheritance step (required to
+        # survive its final node filter) resolves a ticker for this row.
+        _insert_actor(conn, actor_id=aid, name="NVIDIA", provenance=PROVENANCE_SEED, provenance_as_of=SEED_VINTAGE)
 
-    result = router.get_sector_power_map(sector_name="AI", _token="t")
+    result = router.get_sector_power_map(sector_name="Technology", _token="t")
     matches = [n for n in result["nodes"] if n["id"] == aid]
     assert matches, "the ticker-match branch must find the seeded actor"
     node = matches[0]
@@ -268,13 +291,15 @@ def test_get_sector_power_map_stamps_source_on_db_matched_actor(pg_engine: Engin
     assert node.get("synthetic") is not True
 
 
-def test_get_sector_power_map_synthetic_node_carries_sector_map_source(pg_engine: Engine):
+def test_get_sector_power_map_synthetic_node_carries_sector_map_source(pg_engine: Engine, monkeypatch):
     """A sector_map-only entity with no DB row at all must be tagged
     SOURCE_SECTOR_MAP, not left unstamped or defaulted to observed."""
     from api.routers import intelligence_actors as router
     from intelligence.actors.provenance import SOURCE_SECTOR_MAP
 
-    result = router.get_sector_power_map(sector_name="AI", _token="t")
+    monkeypatch.setattr(router, "get_db_engine", lambda: pg_engine)
+
+    result = router.get_sector_power_map(sector_name="Technology", _token="t")
     synthetic_nodes = [n for n in result["nodes"] if n.get("synthetic")]
     assert synthetic_nodes, "fixture check: at least one sector_map-only actor with no DB match is expected for AI"
     for n in synthetic_nodes:
