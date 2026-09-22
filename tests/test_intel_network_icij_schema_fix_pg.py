@@ -20,9 +20,15 @@ Because the old query always threw (UndefinedColumn), and PostgreSQL aborts
 the whole connection's transaction on a failed statement, this ALSO
 silently broke every later statement on the same connection -- including
 the (separately fixed, in #602) actor-traversal query right after it, on
-every single hop, for the lifetime of this endpoint. This file proves two
+every single hop, for the lifetime of this endpoint. This file proves four
 independent things: (1) the corrected ICIJ query works against the real
-schema, and (2) a genuine ICIJ-side failure no longer poisons anything that
+schema, matching via the from_node/n1 side; (2) it also correctly matches
+via the to_node/n2 side, across all three name-bearing tables chained
+together (entity -> officer -> intermediary), not just entity+officer;
+(3) the query's own LIMIT 200 actually bounds row processing for a single
+well-connected ("hub") name, which can legitimately have far more
+relationships than the actor side's connections[:20] slice would ever
+see; and (4) a genuine ICIJ-side failure no longer poisons anything that
 runs after it on the same connection.
 
 Development-only. No production changes, no deployment. DDL below mirrors
@@ -207,6 +213,93 @@ def test_intel_network_icij_traversal_works_against_the_real_schema(pg_engine: E
     assert edge["relationship"] == "officer_of"
     assert edge["jurisdiction"] == "BVI", "jurisdiction must be resolved from icij_entities, the only table that carries it"
     assert edge["dataset"] == "Test Leaks"
+
+
+def test_intel_network_icij_matches_via_linked_to_side_across_all_three_node_tables(pg_engine: Engine, cleanup_ids: dict[str, list], monkeypatch):
+    """The first traversal test only searches by the from_node/n1 side
+    (the entity). This proves the OTHER branch of the WHERE clause --
+    matching by the to_node/n2 side -- also works, and exercises all three
+    name-bearing tables in one chain (entity -> officer -> intermediary),
+    not just entity+officer."""
+    import api.routers.intel as intel_router
+
+    monkeypatch.setattr(intel_router, "get_db_engine", lambda: pg_engine)
+
+    entity_node = _node_id()
+    officer_node = _node_id()
+    intermediary_node = _node_id()
+    cleanup_ids["node_ids"].extend([entity_node, officer_node, intermediary_node])
+
+    entity_name = f"Chain Entity {uuid.uuid4().hex[:8]}"
+    officer_name = f"Chain Officer {uuid.uuid4().hex[:8]}"
+    intermediary_name = f"Chain Intermediary {uuid.uuid4().hex[:8]}"
+
+    with pg_engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO icij_entities (node_id, name, jurisdiction, source_dataset) "
+            "VALUES (:nid, :name, 'BVI', 'Test Leaks')"
+        ).bindparams(nid=entity_node, name=entity_name))
+        conn.execute(text(
+            "INSERT INTO icij_officers (node_id, name, source_dataset) "
+            "VALUES (:nid, :name, 'Test Leaks')"
+        ).bindparams(nid=officer_node, name=officer_name))
+        conn.execute(text(
+            "INSERT INTO icij_intermediaries (node_id, name, source_dataset) "
+            "VALUES (:nid, :name, 'Test Leaks')"
+        ).bindparams(nid=intermediary_node, name=intermediary_name))
+        conn.execute(text(
+            "INSERT INTO icij_relationships (from_node, to_node, rel_type, source_dataset) "
+            "VALUES (:f, :t, 'introduced_by', 'Test Leaks')"
+        ).bindparams(f=officer_node, t=intermediary_node))
+
+    # Search by the intermediary's name -- it is the to_node/n2 side of the
+    # relationship (officer -> intermediary), never exercised by the other
+    # traversal test, which only searches by the from_node/n1 side.
+    result = intel_router.intel_network(entity=intermediary_name, depth=1, _token="t")
+
+    nodes_by_id = {n["id"]: n for n in result["data"]["nodes"]}
+    assert officer_name.upper() in nodes_by_id, "matching via the to_node/n2 side of the JOIN must still reach the other end (the officer)"
+    edge = next(e for e in result["data"]["edges"] if officer_name.upper() in (e["source"], e["target"]))
+    assert edge["relationship"] == "introduced_by"
+    assert edge["jurisdiction"] is None, "neither officers nor intermediaries carry jurisdiction"
+
+
+def test_intel_network_icij_query_limit_bounds_a_single_hub_names_row_count(pg_engine: Engine, cleanup_ids: dict[str, list], monkeypatch):
+    """A single well-connected ICIJ entity can legitimately have far more
+    relationships than the actor side's connections[:20] slice would ever
+    see -- the ICIJ query has no equivalent cap of its own except its new
+    LIMIT 200. Proves that LIMIT actually bounds the row count processed
+    for one hub name, not just that the clause exists in source."""
+    import api.routers.intel as intel_router
+
+    monkeypatch.setattr(intel_router, "get_db_engine", lambda: pg_engine)
+
+    hub_node = _node_id()
+    cleanup_ids["node_ids"].append(hub_node)
+    hub_name = f"Hub Registered Agent {uuid.uuid4().hex[:8]}"
+
+    leaf_nodes = [_node_id() for _ in range(250)]
+    cleanup_ids["node_ids"].extend(leaf_nodes)
+
+    with pg_engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO icij_entities (node_id, name, jurisdiction, source_dataset) "
+            "VALUES (:nid, :name, 'BVI', 'Test Leaks')"
+        ).bindparams(nid=hub_node, name=hub_name))
+        for i, leaf_id in enumerate(leaf_nodes):
+            conn.execute(text(
+                "INSERT INTO icij_entities (node_id, name, jurisdiction, source_dataset) "
+                "VALUES (:nid, :name, 'BVI', 'Test Leaks')"
+            ).bindparams(nid=leaf_id, name=f"Hub Leaf {i} {uuid.uuid4().hex[:6]}"))
+            conn.execute(text(
+                "INSERT INTO icij_relationships (from_node, to_node, rel_type, source_dataset) "
+                "VALUES (:f, :t, 'registered_by', 'Test Leaks')"
+            ).bindparams(f=hub_node, t=leaf_id))
+
+    result = intel_router.intel_network(entity=hub_name, depth=1, _token="t")
+
+    hub_edges = [e for e in result["data"]["edges"] if e["source"] == hub_name.upper()]
+    assert len(hub_edges) <= 200, "a single hub name's ICIJ query must respect its LIMIT 200, not return all 250 relationships"
 
 
 def test_intel_network_icij_failure_does_not_poison_the_actor_query(pg_engine: Engine, cleanup_ids: dict[str, list], monkeypatch):
