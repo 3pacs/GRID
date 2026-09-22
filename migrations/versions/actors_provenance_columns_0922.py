@@ -50,14 +50,15 @@ version of this same bug, found and fixed alongside this default change).
 row -- including the 486 seed-list ids -- is ``'seed'``, ``'observed'``, or
 ``'unconfirmed'`` until something with real evidence says so: the separate backfill
 script (classifies the seed-list ids from their pre-existing ``updated_at``),
-``_seed_known_actors`` (seeds/reseeds a row still at ``'unknown'`` or already
-``'seed'``), or ``save_actor`` (stamps ``'observed'`` only alongside its own evidence
-contract -- see that function). ``intelligence/actors/db.py::_seed_known_actors``'s
-``WHERE actors.provenance IN ('seed', 'unknown')`` reseed guard (added alongside this
-migration) treats ``'unknown'`` as fair game to seed, exactly like a row that does not
-exist yet -- legitimate seeding is unaffected by this default. What the guard still
-refuses, unconditionally, is overwriting a row already ``'observed'`` or
-``'unconfirmed'`` -- a real classification decision, never a default.
+``_seed_known_actors`` (seeds/reseeds a row still at ``'unknown'`` -- but only when it
+is ALSO still pristine, with no recorded ``data_sources``; ``'unknown'`` means
+unverified, not disposable -- or already ``'seed'``), or ``save_actor`` (stamps
+``'observed'`` only alongside its own evidence contract -- a non-empty
+``data_sources`` list -- see that function). What every one of these guards refuses,
+unconditionally, is overwriting a row that already carries real information --
+whether that is a formal classification (``'observed'``/``'unconfirmed'``) or, for a
+still-``'unknown'`` row, real enrichment some other writer recorded before it was ever
+classified -- never a bare column default.
 
 No index is added: neither column is a filter in any query today (the API resolves
 provenance in Python), and an index on a two-value-mostly column over a table this size
