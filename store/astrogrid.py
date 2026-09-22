@@ -18,6 +18,7 @@ from uuid import uuid4
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
 from config import settings
 from oracle.astrogrid_universe import scoreable_universe_by_symbol
@@ -1526,6 +1527,7 @@ class AstroGridStore:
             "skipped_not_mature": 0,
             "skipped_unscoreable": 0,
             "skipped_no_price": 0,
+            "unscored": [],
             "verdicts": {"hit": 0, "miss": 0, "partial": 0, "invalidated": 0, "expired": 0},
             "prediction_ids": [],
         }
@@ -1553,8 +1555,13 @@ class AstroGridStore:
                     start_date=start_date,
                     evaluation_date=evaluation_date,
                 )
-                if not score:
+                if score.get("unscored"):
                     summary["skipped_no_price"] += 1
+                    summary["unscored"].append({
+                        "prediction_id": row[1],
+                        "status": "unscored",
+                        **score["unscored"],
+                    })
                     continue
                 inserted = conn.execute(
                     insert_sql,
@@ -2383,16 +2390,29 @@ class AstroGridStore:
         target_symbols: list[str],
         start_date: date,
         evaluation_date: date,
-    ) -> dict[str, Any] | None:
-        symbols = [symbol for symbol in target_symbols if symbol in _HYBRID_LOOKUP_BY_SYMBOL] or ["SPY"]
+    ) -> dict[str, Any]:
+        symbols = [symbol for symbol in target_symbols if symbol in _PRICE_FEATURE_BY_SYMBOL]
+        if not symbols or len(symbols) != len(target_symbols):
+            return {"unscored": {"reason": "unsupported_target", "symbols": target_symbols}}
         realized_returns = []
         mfe_values = []
         mae_values = []
         for symbol in symbols:
-            entry_price = self._get_symbol_price_at_date(symbol, start_date)
-            exit_price = self._get_symbol_price_at_date(symbol, evaluation_date)
-            if entry_price is None or exit_price is None or entry_price == 0:
-                continue
+            entry = self._lookup_symbol_price(symbol, start_date)
+            exit_observation = self._lookup_symbol_price(symbol, evaluation_date)
+            for phase, observation in (("entry", entry), ("outcome", exit_observation)):
+                if observation["status"] != "ok":
+                    return {"unscored": {
+                        "reason": observation["status"],
+                        "phase": phase,
+                        "symbol": symbol,
+                        "feature": observation["feature"],
+                        "target_date": observation["target_date"],
+                        "latest_obs_date": observation["latest_obs_date"],
+                        "max_age_days": observation["max_age_days"],
+                    }}
+            entry_price = entry["price"]
+            exit_price = exit_observation["price"]
             realized = (float(exit_price) - float(entry_price)) / float(entry_price)
             realized_returns.append(realized)
             path = self._load_price_path(symbol, start_date, evaluation_date)
@@ -2400,8 +2420,6 @@ class AstroGridStore:
                 rel_path = [((price - float(entry_price)) / float(entry_price)) for _, price in path]
                 mfe_values.append(max(rel_path))
                 mae_values.append(min(rel_path))
-        if not realized_returns:
-            return None
         realized_return = sum(realized_returns) / len(realized_returns)
         benchmark_symbol, benchmark_return = self._benchmark_return(symbols, start_date, evaluation_date)
         alpha = realized_return - benchmark_return if benchmark_return is not None else None
@@ -2471,32 +2489,9 @@ class AstroGridStore:
                         },
                     ).fetchall()
                 return [(row[0], float(row[1])) for row in rows if row[0] is not None and row[1] is not None]
-            except Exception:
-                pass
-        lookup_ticker = _HYBRID_LOOKUP_BY_SYMBOL.get(symbol.upper(), symbol)
-        sql = text(
-            """
-            SELECT obs_date, value
-            FROM raw_series
-            WHERE series_id = :series_id
-              AND obs_date BETWEEN :start_date AND :evaluation_date
-              AND pull_status = 'SUCCESS'
-            ORDER BY obs_date
-            """
-        )
-        try:
-            with self.engine.connect() as conn:
-                rows = conn.execute(
-                    sql,
-                    {
-                        "series_id": f"YF:{lookup_ticker}:close",
-                        "start_date": start_date,
-                        "evaluation_date": evaluation_date,
-                    },
-                ).fetchall()
-            return [(row[0], float(row[1])) for row in rows if row[0] is not None and row[1] is not None]
-        except Exception:
-            return []
+            except (SQLAlchemyError, TypeError, ValueError):
+                return []
+        return []
 
     def _benchmark_return(self, symbols: list[str], start_date: date, evaluation_date: date) -> tuple[str, float | None]:
         resolved_symbols = [symbol for symbol in symbols if symbol in _UNIVERSE_BY_SYMBOL]
@@ -2598,50 +2593,69 @@ class AstroGridStore:
         return _build_historical_regime_lookup(valid_dates, rows)
 
     def _get_symbol_price_at_date(self, symbol: str, target_date: date) -> float | None:
+        observation = self._lookup_symbol_price(symbol, target_date)
+        return observation["price"] if observation["status"] == "ok" else None
+
+    def _lookup_symbol_price(self, symbol: str, target_date: date) -> dict[str, Any]:
+        """Use only the canonical feature and report why a price cannot be scored.
+
+        Crypto trades every day, so the observation must match the target day.
+        Exchange traded assets may use the preceding close for an ordinary
+        weekend or market holiday, up to three calendar days. The universe
+        contract's 14-day *history coverage* limit is too loose for a return.
+        """
         symbol = str(symbol or "").upper()
         feature_name = _PRICE_FEATURE_BY_SYMBOL.get(symbol)
-        if feature_name:
-            sql = text(
-                """
-                SELECT rs.value
-                FROM feature_registry fr
-                JOIN resolved_series rs ON rs.feature_id = fr.id
-                WHERE fr.name = :feature_name
-                  AND rs.obs_date <= :target_date
-                ORDER BY rs.obs_date DESC
-                LIMIT 1
-                """
-            )
-            try:
-                with self.engine.connect() as conn:
-                    row = conn.execute(sql, {"feature_name": feature_name, "target_date": target_date}).fetchone()
-                if row and row[0] is not None:
-                    return float(row[0])
-            except Exception:
-                pass
-        lookup_ticker = _HYBRID_LOOKUP_BY_SYMBOL.get(symbol, symbol)
+        max_age_days = 0 if _UNIVERSE_BY_SYMBOL.get(symbol, {}).get("asset_class") == "crypto" else 3
+        result: dict[str, Any] = {
+            "status": "missing_canonical_price",
+            "price": None,
+            "feature": feature_name,
+            "target_date": target_date.isoformat(),
+            "latest_obs_date": None,
+            "max_age_days": max_age_days,
+        }
+        if not feature_name:
+            result["status"] = "unsupported_target"
+            return result
         sql = text(
             """
-            SELECT value
-            FROM raw_series
-            WHERE series_id = :series_id
-              AND obs_date <= :target_date
-              AND pull_status = 'SUCCESS'
-            ORDER BY obs_date DESC
+            SELECT rs.value, rs.obs_date
+            FROM feature_registry fr
+            JOIN resolved_series rs ON rs.feature_id = fr.id
+            WHERE fr.name = :feature_name
+              AND rs.obs_date <= :target_date
+            ORDER BY rs.obs_date DESC, rs.release_date DESC, rs.vintage_date DESC
             LIMIT 1
             """
         )
         try:
             with self.engine.connect() as conn:
-                row = conn.execute(
-                    sql,
-                    {"series_id": f"YF:{lookup_ticker}:close", "target_date": target_date},
-                ).fetchone()
-            if row and row[0] is not None:
-                return float(row[0])
-        except Exception:
-            return None
-        return None
+                row = conn.execute(sql, {"feature_name": feature_name, "target_date": target_date}).fetchone()
+        except SQLAlchemyError:
+            result["status"] = "canonical_price_lookup_failed"
+            return result
+        if not row:
+            return result
+        obs_date = row[1].date() if isinstance(row[1], datetime) else row[1]
+        if not isinstance(obs_date, date):
+            result["status"] = "invalid_observation_date"
+            return result
+        result["latest_obs_date"] = obs_date.isoformat()
+        if (target_date - obs_date).days > max_age_days:
+            result["status"] = "stale_canonical_price"
+            return result
+        try:
+            price = float(row[0])
+        except (TypeError, ValueError):
+            result["status"] = "invalid_canonical_price"
+            return result
+        if not (0 < price < float("inf")):
+            result["status"] = "invalid_canonical_price"
+            return result
+        result["status"] = "ok"
+        result["price"] = price
+        return result
 
     def _scored_prediction_date_range(self, *, horizon_label: str | None = None) -> tuple[date | None, date | None] | None:
         filters = []
