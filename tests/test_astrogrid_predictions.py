@@ -329,20 +329,22 @@ def test_spy_current_canonical_price_passes_exchange_age_guard(mock_engine) -> N
     assert observation["status"] == "ok"
     assert observation["price"] == 681.25
     assert observation["feature"] == "spy_full"
-    assert observation["max_age_days"] == 3
+    assert observation["max_age_days"] == 0
 
 
-def test_spy_weekend_close_is_bounded_to_three_calendar_days(mock_engine) -> None:
+def test_spy_weekend_close_is_valid_but_a_missing_weekday_close_is_not(mock_engine) -> None:
     store = AstroGridStore(mock_engine)
     conn = mock_engine.connect.return_value.__enter__.return_value
     conn.execute.return_value.fetchone.return_value = (680.0, date(2026, 9, 18))
 
+    sunday = store._lookup_symbol_price("SPY", date(2026, 9, 20))
     monday = store._lookup_symbol_price("SPY", date(2026, 9, 21))
-    tuesday = store._lookup_symbol_price("SPY", date(2026, 9, 22))
 
-    assert monday["status"] == "ok"
-    assert tuesday["status"] == "stale_canonical_price"
-    assert tuesday["latest_obs_date"] == "2026-09-18"
+    assert sunday["status"] == "ok"
+    assert sunday["max_age_days"] == 2
+    assert monday["status"] == "stale_canonical_price"
+    assert monday["max_age_days"] == 0
+    assert monday["latest_obs_date"] == "2026-09-18"
 
 
 @pytest.mark.parametrize(

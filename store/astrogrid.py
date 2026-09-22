@@ -2600,13 +2600,15 @@ class AstroGridStore:
         """Use only the canonical feature and report why a price cannot be scored.
 
         Crypto trades every day, so the observation must match the target day.
-        Exchange traded assets may use the preceding close for an ordinary
-        weekend or market holiday, up to three calendar days. The universe
-        contract's 14-day *history coverage* limit is too loose for a return.
+        Exchange traded assets require the target day's close on weekdays;
+        Saturday and Sunday may use Friday's close. Exchange holidays without
+        a matching close remain unscored. The universe contract's 14-day
+        *history coverage* limit is too loose for a return.
         """
         symbol = str(symbol or "").upper()
         feature_name = _PRICE_FEATURE_BY_SYMBOL.get(symbol)
-        max_age_days = 0 if _UNIVERSE_BY_SYMBOL.get(symbol, {}).get("asset_class") == "crypto" else 3
+        is_crypto = _UNIVERSE_BY_SYMBOL.get(symbol, {}).get("asset_class") == "crypto"
+        max_age_days = 0 if is_crypto else max(0, target_date.weekday() - 4)
         result: dict[str, Any] = {
             "status": "missing_canonical_price",
             "price": None,
