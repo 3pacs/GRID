@@ -89,7 +89,10 @@ def test_upgrade_adds_both_columns_with_correct_shape(pg_engine: Engine):
             )).fetchall()
         }
     assert cols["provenance"][0] == "NO", "provenance must be NOT NULL"
-    assert "'observed'" in (cols["provenance"][2] or ""), "provenance default must be 'observed'"
+    assert "'unknown'" in (cols["provenance"][2] or ""), (
+        "provenance default must be 'unknown' -- an honest 'no evidence yet' state, "
+        "not 'observed', which is a specific earned claim (see provenance.py)"
+    )
     assert cols["provenance_as_of"][0] == "YES", "provenance_as_of must be nullable"
 
 
@@ -129,7 +132,7 @@ def test_upgrade_does_not_touch_existing_row_values(pg_engine: Engine):
         row = conn.execute(text(
             "SELECT provenance, provenance_as_of FROM actors WHERE id = 'sch0922_test_actor'"
         )).fetchone()
-    assert row.provenance == "observed", "schema-only migration must not classify any row"
+    assert row.provenance == "unknown", "schema-only migration must not classify any row"
     assert row.provenance_as_of is None
 
     with pg_engine.begin() as conn:
@@ -200,7 +203,7 @@ def test_downgrade_drops_both_columns(pg_engine: Engine):
     try:
         conn.execute(text(
             "ALTER TABLE actors ADD COLUMN IF NOT EXISTS provenance TEXT "
-            "NOT NULL DEFAULT 'observed'"
+            "NOT NULL DEFAULT 'unknown'"
         ))
         conn.execute(text(
             "ALTER TABLE actors ADD COLUMN IF NOT EXISTS provenance_as_of DATE"

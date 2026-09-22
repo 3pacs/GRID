@@ -26,10 +26,15 @@ Design, per the remediation plan's own preconditions:
     lasts until the next commit, so it must be set again per transaction, not once for
     the whole run.
   - --dry-run prints the classification each chunk WOULD apply without writing anything.
-  - Exactly the same three-way classification the original migration used -- see
-    intelligence/actors/provenance.py's module docstring for why "touched" is not
-    "observed", and PROVENANCE_UNCONFIRMED's own reasoning. This script does not
-    reinterpret or simplify that logic.
+  - Only ever classifies a row still exactly PROVENANCE_UNKNOWN (the column default,
+    meaning nothing has classified it yet) -- see intelligence/actors/provenance.py's
+    module docstring for why "touched" is not "observed", PROVENANCE_UNCONFIRMED's own
+    reasoning, and why a column default of 'observed' (the original design) made an
+    already-confirmed row indistinguishable from an unclassified one, which is what
+    let a backfill attempt reclassify a real observation -- not just during a
+    concurrent race, but any time a row was already 'observed' before the backfill
+    even started. This script never reclassifies a row already 'seed', 'observed', or
+    'unconfirmed' -- classified state is permanent from this script's perspective.
 
 Usage:
     python3 scripts/backfill_actor_provenance.py --dry-run
@@ -56,6 +61,7 @@ from db import get_engine
 from intelligence.actors.provenance import (
     PROVENANCE_SEED,
     PROVENANCE_UNCONFIRMED,
+    PROVENANCE_UNKNOWN,
     SEED_ACTOR_IDS,
     SEED_VINTAGE,
     SEED_VINTAGE_TS,
@@ -76,36 +82,44 @@ def backfill_chunk(
     dry_run: bool,
 ) -> tuple[int, int, int]:
     """Classify one chunk of seed-list ids. Returns (promoted_to_seed,
-    marked_unconfirmed, skipped_due_to_concurrent_write).
+    marked_unconfirmed, skipped_due_to_conflict).
 
     Each call is meant to run inside its OWN transaction (the caller commits or rolls
     back around this), so SET LOCAL is re-issued every time.
 
-    Concurrency: ``save_actor`` (the one writer contract this whole design trusts as
-    evidence of a real observation -- see intelligence/actors/provenance.py's module
-    docstring) always touches ``updated_at`` on every write, insert or conflict-update,
-    with no exception (verified directly against its current source, unchanged since
-    #596). The ORIGINAL migration's bulk `UPDATE ... WHERE updated_at > :seed_ts`
-    approach cannot tell "touched by an unrelated maintenance writer, still
-    unclassified" apart from "just received a genuine save_actor observation between
-    this backfill's chunk selection and its own UPDATE" -- both look identical at
-    UPDATE time (id in the target list, updated_at moved since the seed vintage). A
-    real concurrent save_actor write landing in that window would get its DATA
-    correctly preserved but its PROVENANCE wrongly stamped 'unconfirmed' by the
-    backfill, mislabeling a fresh, real observation as merely "touched by something".
+    Eligibility: only a row still exactly PROVENANCE_UNKNOWN (nothing has classified
+    it yet -- the column default) is ever classified. A row already 'seed',
+    'observed', or 'unconfirmed' is permanently out of scope for this function, not
+    just temporarily protected during a race -- classified state does not expire and
+    this script never re-evaluates it. This is what actually makes an already-observed
+    row safe: under the ORIGINAL design (a column default of 'observed', identical in
+    value to a genuinely confirmed observation), no rule stated here could have told
+    the two apart, so a bulk `UPDATE ... WHERE updated_at > :seed_ts` would have
+    reclassified an already-observed row to 'unconfirmed' any time its updated_at
+    happened to be recent -- not only during a live race with a concurrent writer, but
+    for ANY row observed before this script ever ran. Splitting 'unknown' out as its
+    own honest default (migrations/versions/actors_provenance_columns_0922.py) closes
+    that at the source: only 'unknown' rows are ever touched, full stop.
 
-    Fixed here with an explicit compare-and-swap: this function reads each row's
-    CURRENT (provenance, updated_at) first, decides a classification from that exact
-    snapshot, then applies the UPDATE guarded by
+    Conflict detection (not "observation detection" -- this function does not need to
+    know WHAT changed a row, only THAT one did): reads each row's CURRENT
+    (provenance, updated_at) first, decides a classification from that exact snapshot,
+    then applies the UPDATE guarded by
     ``WHERE updated_at = :snapshot_updated_at AND provenance = :snapshot_provenance``.
-    If a concurrent writer touched the row in the interval between the read and the
-    UPDATE, updated_at (and/or provenance) will have moved, the WHERE clause will not
-    match, 0 rows are affected for that id, and the row is left exactly as the
-    concurrent writer left it -- not reclassified from stale information. A later
-    backfill pass (this script is idempotent/resumable by design) picks up a
-    still-eligible row cleanly on a fresh snapshot. No FOR UPDATE / row locking is
-    used -- the compare-and-swap needs no lock, and not blocking a concurrent writer
-    at all is strictly better than taking a lock a real writer might have to wait on.
+    Since only 'unknown' rows reach this guard at all, `snapshot_provenance` is always
+    'unknown' at the time it's captured -- so if ANYTHING moved either column since
+    (`save_actor` confirming a real observation, a maintenance writer touching only
+    `updated_at`, or in principle this same script's own concurrent invocation), the
+    WHERE clause no longer matches, 0 rows are affected for that id, and the row is
+    left exactly as whatever touched it left it -- not reclassified from stale
+    information. A later backfill pass (this script is idempotent/resumable by design)
+    re-evaluates a still-'unknown' row cleanly on a fresh snapshot; a row a concurrent
+    writer moved OUT of 'unknown' (e.g. to 'observed') is simply no longer eligible on
+    that later pass either, by the ordinary eligibility check above -- the compare-and-
+    swap and the eligibility check reinforce each other, they are not two separate
+    mechanisms. No FOR UPDATE / row locking is used -- the compare-and-swap needs no
+    lock, and not blocking a concurrent writer at all is strictly better than taking a
+    lock a real writer might have to wait on.
     """
     rows = conn.execute(text(
         "SELECT id, provenance, updated_at FROM actors WHERE id = ANY(:ids)"
@@ -119,8 +133,8 @@ def backfill_chunk(
     unconfirmed = 0
     skipped = 0
     for row in rows:
-        if row.provenance in (PROVENANCE_SEED, PROVENANCE_UNCONFIRMED):
-            continue  # already classified -- idempotent, nothing to do
+        if row.provenance != PROVENANCE_UNKNOWN:
+            continue  # already classified (or confirmed observed) -- permanently out of scope
 
         target_seed = row.updated_at <= SEED_VINTAGE_TS
         target_provenance = PROVENANCE_SEED if target_seed else PROVENANCE_UNCONFIRMED
@@ -147,9 +161,10 @@ def backfill_chunk(
             "snapshot_provenance": row.provenance,
         })
         if result.rowcount == 0:
-            # A concurrent writer touched this row between our SELECT and this
-            # UPDATE -- their write stands untouched, we do not retry within this
-            # pass (a later run's fresh snapshot will pick it up if still eligible).
+            # Conflict detected: something changed this row's (provenance, updated_at)
+            # between our SELECT and this UPDATE -- we don't know or need to know what.
+            # Its write stands untouched; we do not retry within this pass (a later
+            # run's fresh snapshot re-evaluates it if it's still eligible).
             skipped += 1
         elif target_seed:
             promoted += 1
@@ -206,8 +221,8 @@ def main() -> int:
         if skipped:
             log.info(
                 "chunk {i}/{tc}: {p} {verb} seed, {u} {verb} unconfirmed, "
-                "{s} skipped (concurrent write since this chunk's snapshot -- "
-                "their write stands, a later run will re-evaluate if still eligible)",
+                "{s} skipped (conflict detected since this chunk's snapshot -- "
+                "whatever changed the row stands, a later run will re-evaluate if still eligible)",
                 i=i, tc=total_chunks, p=promoted, u=unconfirmed, s=skipped,
                 verb="would be marked" if args.dry_run else "marked",
             )
@@ -222,7 +237,7 @@ def main() -> int:
 
     log.info(
         "backfill_actor_provenance complete: {p} total {verb} seed, {u} total {verb} "
-        "unconfirmed, {s} total skipped (concurrent writes preserved)",
+        "unconfirmed, {s} total skipped (conflicting writes preserved)",
         p=total_seed, u=total_unconfirmed, s=total_skipped,
         verb="would be marked" if args.dry_run else "marked",
     )

@@ -94,23 +94,32 @@ def _seed_known_actors(engine: Engine) -> int:
     ``intelligence/actors/provenance.py`` for the precise definition,
     including why a moved ``updated_at`` alone is not proof of a real
     observation). A row already stamped anything other than
-    ``PROVENANCE_SEED`` -- ``'observed'`` (confirmed by ``save_actor``'s
-    writer contract) or ``'unconfirmed'`` (touched by something else, not
-    confirmed) -- must not be reset by a later call here: that would either
-    relabel genuinely-observed data as a hand-typed guess, or paper over an
-    unconfirmed modification by reasserting "still pristine seed data" over
-    it. Because ``influence_score`` and the other seed-authored fields would
-    otherwise keep refreshing from ``_KNOWN_ACTORS`` on every call regardless
-    of the row's provenance -- silently overwriting genuinely observed or
+    ``PROVENANCE_SEED`` or ``PROVENANCE_UNKNOWN`` -- ``'observed'`` (confirmed
+    by ``save_actor``'s writer contract) or ``'unconfirmed'`` (touched by
+    something else, not confirmed) -- must not be reset by a later call here:
+    that would either relabel genuinely-observed data as a hand-typed guess,
+    or paper over an unconfirmed modification by reasserting "still pristine
+    seed data" over it. ``PROVENANCE_UNKNOWN`` -- the column's own default,
+    meaning nothing has ever classified this row -- IS fair game to seed:
+    it carries no real claim to protect, exactly like a row that doesn't
+    exist yet (which the plain ``INSERT`` branch already handles). Because
+    ``influence_score`` and the other seed-authored fields would otherwise
+    keep refreshing from ``_KNOWN_ACTORS`` on every call regardless of the
+    row's provenance -- silently overwriting genuinely observed or
     unconfirmed-but-real values while the label claims something else -- the
     ``ON CONFLICT ... WHERE`` clause below suppresses the *entire* update,
     not just the provenance columns, unless the existing row is still
-    exactly ``'seed'``.
+    exactly ``'seed'`` or still ``'unknown'``.
 
     Returns:
         Number of actors upserted.
     """
-    from intelligence.actors.provenance import PROVENANCE_SEED, SEED_VINTAGE, SEED_VINTAGE_TS
+    from intelligence.actors.provenance import (
+        PROVENANCE_SEED,
+        PROVENANCE_UNKNOWN,
+        SEED_VINTAGE,
+        SEED_VINTAGE_TS,
+    )
 
     _ensure_tables(engine)
     count = 0
@@ -144,7 +153,7 @@ def _seed_known_actors(engine: Engine) -> int:
                     provenance = EXCLUDED.provenance,
                     provenance_as_of = EXCLUDED.provenance_as_of,
                     updated_at = EXCLUDED.updated_at
-                WHERE actors.provenance = :seed
+                WHERE actors.provenance IN (:seed, :unknown)
             """), {
                 "id": actor_id,
                 "name": data["name"],
@@ -162,6 +171,7 @@ def _seed_known_actors(engine: Engine) -> int:
                 "vintage_date": SEED_VINTAGE,
                 "vintage_ts": SEED_VINTAGE_TS,
                 "seed": PROVENANCE_SEED,
+                "unknown": PROVENANCE_UNKNOWN,
             })
             count += 1
     log.info("Seeded {n} actors into the database", n=count)
@@ -301,17 +311,37 @@ def save_actor(engine: Engine, actor_id: str, data: dict[str, Any]) -> None:
     Moved from intelligence/spider/db.py during SYNTH-15 dedupe. Note: this
     spider-oriented upsert uses a slim column set (influence/trust/degree/source)
     and is distinct from _seed_known_actors which uses the fuller seed schema.
+
+    The smallest writer transition to ``PROVENANCE_OBSERVED``: this is the one
+    writer contract intelligence/actors/provenance.py trusts as evidence of a
+    real observation (see that module's docstring), and this function is what
+    makes that trust earned rather than assumed -- every call writes real
+    evidence (a merged ``data_sources`` list, a ``GREATEST``-combined
+    ``influence_score``) alongside ``provenance = 'observed'``, never just a
+    timestamp. Stamped unconditionally on every write (insert and
+    conflict-update), overriding whatever the row's provenance was before --
+    ``'unknown'``, ``'seed'``, or a stale ``'unconfirmed'`` -- because a
+    genuine observation right now supersedes any of those. No other writer in
+    this codebase touches the ``provenance`` column at all: a plain
+    ``updated_at`` touch from anywhere else must never cause this transition
+    (see the module docstring's "Timestamp changes alone never qualify" rule).
     """
+    from intelligence.actors.provenance import PROVENANCE_OBSERVED
+
     with engine.connect() as conn:
         conn.execute(
             text("""
                 INSERT INTO actors (id, name, tier, category, title, influence_score,
-                    trust_score, degree, source, credibility, data_sources, updated_at)
+                    trust_score, degree, source, credibility, data_sources,
+                    provenance, provenance_as_of, updated_at)
                 VALUES (:id, :name, :tier, :category, :title, :influence,
-                    :trust, :degree, :source, :credibility, :data_sources, NOW())
+                    :trust, :degree, :source, :credibility, :data_sources,
+                    :provenance, NULL, NOW())
                 ON CONFLICT (id) DO UPDATE SET
                     influence_score = GREATEST(actors.influence_score, EXCLUDED.influence_score),
                     data_sources = EXCLUDED.data_sources,
+                    provenance = :provenance,
+                    provenance_as_of = NULL,
                     updated_at = NOW()
             """),
             {
@@ -326,6 +356,7 @@ def save_actor(engine: Engine, actor_id: str, data: dict[str, Any]) -> None:
                 "source": data.get("source", "spider"),
                 "credibility": data.get("credibility", "inferred"),
                 "data_sources": json.dumps(data.get("data_sources", [])),
+                "provenance": PROVENANCE_OBSERVED,
             },
         )
         conn.commit()

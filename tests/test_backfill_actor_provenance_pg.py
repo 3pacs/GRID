@@ -18,13 +18,29 @@ Proves, against the real script (not a re-implementation):
      untouched, then confirming a rerun resumes and completes it.
   4. --dry-run (exercised via the module's own backfill_chunk(..., dry_run=True)) writes
      nothing.
-  5. Concurrency: a REAL second connection (not simulated) writes to a row -- the exact
-     shape of intelligence.actors.db.save_actor's own contract, verified against its
-     actual current source: always touches updated_at, on every write, no exception --
-     BETWEEN this function's own snapshot read and its UPDATE. The backfill must not
+  5. Concurrency: a REAL second connection runs the ACTUAL
+     intelligence.actors.db.save_actor -- not a hand-rolled re-implementation of its SQL
+     -- BETWEEN this function's own snapshot read and its UPDATE. The backfill must not
      overwrite that newer write with a stale classification; it must skip the row for
      this pass and leave the concurrent writer's data (and provenance) exactly as it
      left them.
+  6. Genuine observation, sequential (no race at all): a row already 'observed' by a
+     real, ordinary PRIOR call to save_actor() -- not concurrent with anything -- stays
+     'observed' and completely untouched. This is the exact bug the honest 'unknown'
+     column default (migrations/versions/actors_provenance_columns_0922.py) exists to
+     fix: under the old design, a column default of 'observed' made an already-confirmed
+     row indistinguishable from an unclassified one, so ANY row observed before a
+     backfill run -- not only one raced against it -- was at risk of reclassification.
+  7. A maintenance-only touch -- updated_at moves, nothing else, the exact shape of
+     intelligence/actors/trial_bridge.py, intelligence/actor_discovery.py,
+     scripts/fold_actor_aliases.py, none of which touch the provenance column at all --
+     is classified 'unconfirmed', never 'observed'. Timestamp movement alone must never
+     earn the strongest claim (see intelligence/actors/provenance.py's "Timestamp
+     changes alone never qualify" rule).
+  8. A subsequent, ordinary (non-racing) backfill rerun, run twice more after a genuine
+     observation, leaves the row completely untouched -- including its updated_at.
+     Confirmed provenance survives repeated backfill passes, not just the one live race
+     case 5 exercises.
 
 Uses the shared ``pg_engine`` fixture (tests/conftest.py) -- skips cleanly if no
 PostgreSQL is reachable.
@@ -40,7 +56,14 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from intelligence.actors.provenance import PROVENANCE_SEED, PROVENANCE_UNCONFIRMED, SEED_VINTAGE_TS
+from intelligence.actors import db as actors_db
+from intelligence.actors.provenance import (
+    PROVENANCE_OBSERVED,
+    PROVENANCE_SEED,
+    PROVENANCE_UNCONFIRMED,
+    PROVENANCE_UNKNOWN,
+    SEED_VINTAGE_TS,
+)
 
 _SCRIPT_MODULE = "scripts.backfill_actor_provenance"
 
@@ -50,7 +73,14 @@ CREATE TABLE IF NOT EXISTS actors (
     name TEXT NOT NULL,
     tier TEXT NOT NULL,
     category TEXT NOT NULL,
-    provenance TEXT NOT NULL DEFAULT 'observed',
+    title TEXT,
+    influence_score DOUBLE PRECISION,
+    trust_score DOUBLE PRECISION,
+    degree INT,
+    source TEXT,
+    credibility TEXT,
+    data_sources JSONB,
+    provenance TEXT NOT NULL DEFAULT 'unknown',
     provenance_as_of DATE,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 )
@@ -64,13 +94,20 @@ def _actors_table(pg_engine: Engine):
         # This suite shares one disposable database across files within a
         # run, so CREATE TABLE IF NOT EXISTS alone is a no-op once any other
         # file has already created the table -- ensure this file's needed
-        # columns are present regardless of which DDL got there first.
-        conn.execute(text(
-            "ALTER TABLE actors ADD COLUMN IF NOT EXISTS provenance TEXT NOT NULL DEFAULT 'observed'"
-        ))
-        conn.execute(text("ALTER TABLE actors ADD COLUMN IF NOT EXISTS provenance_as_of DATE"))
-        conn.execute(text("ALTER TABLE actors ADD COLUMN IF NOT EXISTS influence_score DOUBLE PRECISION"))
-        conn.execute(text("ALTER TABLE actors ADD COLUMN IF NOT EXISTS data_sources JSONB"))
+        # columns (including every column the REAL save_actor() writes) are
+        # present regardless of which DDL got there first.
+        for stmt in (
+            "ALTER TABLE actors ADD COLUMN IF NOT EXISTS provenance TEXT NOT NULL DEFAULT 'unknown'",
+            "ALTER TABLE actors ADD COLUMN IF NOT EXISTS provenance_as_of DATE",
+            "ALTER TABLE actors ADD COLUMN IF NOT EXISTS title TEXT",
+            "ALTER TABLE actors ADD COLUMN IF NOT EXISTS influence_score DOUBLE PRECISION",
+            "ALTER TABLE actors ADD COLUMN IF NOT EXISTS trust_score DOUBLE PRECISION",
+            "ALTER TABLE actors ADD COLUMN IF NOT EXISTS degree INT",
+            "ALTER TABLE actors ADD COLUMN IF NOT EXISTS source TEXT",
+            "ALTER TABLE actors ADD COLUMN IF NOT EXISTS credibility TEXT",
+            "ALTER TABLE actors ADD COLUMN IF NOT EXISTS data_sources JSONB",
+        ):
+            conn.execute(text(stmt))
     yield
 
 
@@ -148,7 +185,7 @@ def test_backfill_chunk_is_idempotent(pg_engine: Engine, test_ids: list[str]):
         )
     assert second_promoted == 0, "a second pass over an already-classified row must be a no-op"
     assert second_unconfirmed == 0
-    assert second_skipped == 0, "an already-classified row is skipped by the classification filter, not the concurrency guard"
+    assert second_skipped == 0, "an already-classified row is out of scope via the eligibility check, not the conflict guard"
 
 
 def test_dry_run_writes_nothing(pg_engine: Engine, test_ids: list[str]):
@@ -170,7 +207,7 @@ def test_dry_run_writes_nothing(pg_engine: Engine, test_ids: list[str]):
         row = conn.execute(text(
             "SELECT provenance FROM actors WHERE id = :id"
         ).bindparams(id=actor_id)).fetchone()
-    assert row.provenance == "observed", "dry-run must not have written anything"
+    assert row.provenance == PROVENANCE_UNKNOWN, "dry-run must not have written anything -- still the column default"
 
 
 def test_a_later_chunk_failing_does_not_roll_back_an_earlier_chunks_commit(
@@ -222,7 +259,7 @@ def test_a_later_chunk_failing_does_not_roll_back_an_earlier_chunks_commit(
             "SELECT provenance FROM actors WHERE id = :id"
         ).bindparams(id=chunk2_id)).fetchone()
     assert row1.provenance == PROVENANCE_SEED, "chunk 1 must remain committed"
-    assert row2.provenance == "observed", "chunk 2 must have rolled back to its pre-attempt state"
+    assert row2.provenance == PROVENANCE_UNKNOWN, "chunk 2 must have rolled back to its pre-attempt state"
 
     # Resumability: rerunning chunk 2 (the only thing an operator needs to do)
     # completes it, with chunk 1 untouched by the resume.
@@ -262,41 +299,113 @@ def test_main_dry_run_end_to_end_against_real_seed_list(
         row = conn.execute(text(
             "SELECT provenance FROM actors WHERE id = :id"
         ).bindparams(id=a_id)).fetchone()
-    assert row.provenance == "observed", "--dry-run through main() must not write"
+    assert row.provenance == PROVENANCE_UNKNOWN, "--dry-run through main() must not write"
+
+
+def test_genuine_observation_via_real_save_actor_is_permanently_out_of_scope(
+    pg_engine: Engine, test_ids: list[str],
+):
+    """No race at all -- a row already classified 'observed' by a real, ordinary
+    PRIOR call to save_actor() must never be reclassified by a backfill pass that
+    runs afterward. This is exactly the bug the honest 'unknown' default fixes:
+    under the old design (column default 'observed'), this row would have been
+    indistinguishable from an unclassified one, and any row observed before a
+    backfill run -- not only one raced against it -- was at risk."""
+    script = importlib.import_module(_SCRIPT_MODULE)
+    actor_id = f"bf_prov_pg_{uuid.uuid4().hex[:16]}"
+    test_ids.append(actor_id)
+
+    actors_db.save_actor(pg_engine, actor_id, {
+        "name": "Observed Actor", "tier": "test", "category": "test",
+        "influence_score": 0.64, "data_sources": ["10-K"],
+    })
+    with pg_engine.connect() as conn:
+        before = conn.execute(text(
+            "SELECT provenance FROM actors WHERE id = :id"
+        ).bindparams(id=actor_id)).fetchone()
+    assert before.provenance == PROVENANCE_OBSERVED, "fixture check: save_actor must have stamped 'observed'"
+
+    with pg_engine.begin() as conn:
+        promoted, unconfirmed, skipped = script.backfill_chunk(
+            conn, [actor_id], lock_timeout="5s", statement_timeout="30s", dry_run=False,
+        )
+    assert (promoted, unconfirmed, skipped) == (0, 0, 0), (
+        "a row already 'observed' before backfill ever ran must not be touched at all "
+        "-- not reclassified, and not even counted as a conflict, since it was never "
+        "eligible in the first place"
+    )
+
+    with pg_engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT provenance, influence_score FROM actors WHERE id = :id"
+        ).bindparams(id=actor_id)).fetchone()
+    assert row.provenance == PROVENANCE_OBSERVED
+    assert row.influence_score == 0.64
+
+
+def test_maintenance_only_touch_is_classified_unconfirmed_never_observed(
+    pg_engine: Engine, test_ids: list[str],
+):
+    """A maintenance writer's exact shape -- intelligence/actors/trial_bridge.py,
+    intelligence/actor_discovery.py, scripts/fold_actor_aliases.py, none of which
+    touch the provenance column -- moves updated_at and nothing else. Backfill must
+    classify the result 'unconfirmed': modification is real, but nothing confirms
+    an observation, so it must never earn 'observed'."""
+    script = importlib.import_module(_SCRIPT_MODULE)
+    actor_id = f"bf_prov_pg_{uuid.uuid4().hex[:16]}"
+    test_ids.append(actor_id)
+
+    with pg_engine.begin() as conn:
+        _insert_actor(conn, actor_id=actor_id, updated_at=SEED_VINTAGE_TS)
+
+    # The maintenance writer's contract: updated_at only.
+    with pg_engine.begin() as conn:
+        conn.execute(text(
+            "UPDATE actors SET updated_at = NOW() WHERE id = :id"
+        ).bindparams(id=actor_id))
+
+    with pg_engine.begin() as conn:
+        promoted, unconfirmed, skipped = script.backfill_chunk(
+            conn, [actor_id], lock_timeout="5s", statement_timeout="30s", dry_run=False,
+        )
+    assert promoted == 0
+    assert unconfirmed == 1, "touched since the seed vintage by something, but not through save_actor's contract"
+    assert skipped == 0
+
+    with pg_engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT provenance FROM actors WHERE id = :id"
+        ).bindparams(id=actor_id)).fetchone()
+    assert row.provenance == PROVENANCE_UNCONFIRMED, "a bare timestamp touch must never produce 'observed'"
 
 
 def test_concurrent_real_writer_evidence_survives_backfill(pg_engine: Engine, test_ids: list[str]):
-    """The concurrency case this design exists to handle: a REAL second connection
-    (intelligence.actors.db.save_actor's exact contract -- always touches updated_at,
-    never touches provenance, verified against its current source) writes to a row
-    AFTER backfill_chunk() has taken its snapshot but BEFORE its UPDATE runs.
+    """The concurrency case this design exists to handle: a REAL second connection,
+    running the ACTUAL intelligence.actors.db.save_actor (not a hand-rolled
+    re-implementation of its SQL), writes to a row AFTER backfill_chunk() has taken
+    its snapshot but BEFORE its UPDATE runs.
 
-    Reproduced deterministically (not as a timing-dependent race) by calling
-    backfill_chunk() with pre-fetched rows via a monkeypatched connection wrapper that
-    performs the real concurrent write, on a REAL second connection, at the exact
-    moment between the snapshot SELECT and the per-row UPDATE -- both statements are
-    still the function's own real SQL, only the trigger point is controlled so the
-    test does not depend on winning an actual timing race to be meaningful.
+    Reproduced deterministically (not as a timing-dependent race) by intercepting
+    backfill_chunk()'s own snapshot SELECT and triggering the real save_actor() call
+    at that exact moment -- both the interception point's target and save_actor()
+    itself are real, only the trigger point is controlled so the test does not
+    depend on winning an actual timing race to be meaningful.
     """
     script = importlib.import_module(_SCRIPT_MODULE)
 
     actor_id = f"bf_prov_pg_{uuid.uuid4().hex[:16]}"
     test_ids.append(actor_id)
 
-    # Pristine seed-list row: eligible to be promoted to 'seed' by an ordinary pass.
+    # Pristine row at the column default: eligible to be promoted to 'seed' by an
+    # ordinary pass, exactly like any other never-classified seed-list id.
     with pg_engine.begin() as conn:
         _insert_actor(conn, actor_id=actor_id, updated_at=SEED_VINTAGE_TS)
 
-    # A second, REAL, independent connection -- simulates save_actor's exact writer
-    # contract landing concurrently: new data_sources, GREATEST-combined
-    # influence_score, updated_at = NOW(). Committed in its own transaction, exactly
-    # as save_actor's `with engine.connect() as conn: ...; conn.commit()` does.
-    concurrent_conn = pg_engine.connect()
-
     class _InterceptingConnection:
         """Wraps the real connection backfill_chunk() uses; after its snapshot
-        SELECT returns, performs the real concurrent write on a SEPARATE real
-        connection/transaction before backfill_chunk()'s own UPDATE runs."""
+        SELECT returns, calls the REAL save_actor() -- which opens and commits its
+        own separate real connection, exactly as it always does in production --
+        before backfill_chunk()'s own UPDATE gets a chance to run."""
 
         def __init__(self, real_conn):
             self._real = real_conn
@@ -307,27 +416,20 @@ def test_concurrent_real_writer_evidence_survives_backfill(pg_engine: Engine, te
             sql_text = str(stmt)
             if not self._select_seen and "SELECT id, provenance, updated_at" in sql_text:
                 self._select_seen = True
-                # The real concurrent write, on the real second connection, committed
-                # before backfill_chunk()'s UPDATE gets a chance to run.
-                concurrent_conn.execute(text(
-                    "UPDATE actors SET data_sources = :ds, "
-                    "influence_score = GREATEST(COALESCE(influence_score, 0), :inf), "
-                    "updated_at = NOW() WHERE id = :id"
-                ), {"ds": '["sec_form4"]', "inf": 0.83, "id": actor_id})
-                concurrent_conn.commit()
+                actors_db.save_actor(pg_engine, actor_id, {
+                    "name": "Concurrent Observation", "tier": "test", "category": "test",
+                    "influence_score": 0.83, "data_sources": ["sec_form4"],
+                })
             return result
 
         def __getattr__(self, name):
             return getattr(self._real, name)
 
-    try:
-        with pg_engine.begin() as real_conn:
-            wrapped = _InterceptingConnection(real_conn)
-            promoted, unconfirmed, skipped = script.backfill_chunk(
-                wrapped, [actor_id], lock_timeout="5s", statement_timeout="30s", dry_run=False,
-            )
-    finally:
-        concurrent_conn.close()
+    with pg_engine.begin() as real_conn:
+        wrapped = _InterceptingConnection(real_conn)
+        promoted, unconfirmed, skipped = script.backfill_chunk(
+            wrapped, [actor_id], lock_timeout="5s", statement_timeout="30s", dry_run=False,
+        )
 
     assert skipped == 1, "the concurrent write must be detected and the row skipped, not overwritten"
     assert promoted == 0
@@ -342,25 +444,66 @@ def test_concurrent_real_writer_evidence_survives_backfill(pg_engine: Engine, te
     # The concurrent writer's evidence is fully intact -- backfill did not touch it.
     assert row.influence_score == 0.83, "the concurrent writer's real data must survive"
     assert row.data_sources == '["sec_form4"]'
-    # provenance itself: save_actor's real contract never touches this column (verified
-    # against its actual source), so it is still whatever it was before -- the column
-    # DEFAULT 'observed' here, since this row had never been classified yet. The
-    # decisive assertion is not this value but that backfill did NOT overwrite it to
-    # 'unconfirmed', which the pre-fix bulk-UPDATE design would have done (updated_at
-    # moved past SEED_VINTAGE_TS by the concurrent write, and the old WHERE clause only
-    # checked "is it not already 'unconfirmed'", which an 'observed' row satisfies).
-    assert row.provenance == "observed"
+    assert row.provenance == PROVENANCE_OBSERVED, (
+        "save_actor's real contract stamps 'observed' explicitly and unconditionally "
+        "-- verified against its actual current source, not assumed"
+    )
 
-    # A later pass, with a fresh snapshot, re-evaluates the row on its own terms (now
-    # touched well after the seed vintage by a real writer) -- this documents what
-    # happens next, not a claim that it becomes semantically perfect: save_actor's
-    # current contract does not stamp provenance itself (a separate, pre-existing gap,
-    # not introduced or fixed here -- see the PR description), so a fresh pass still
-    # sees an unclassified 'observed' row touched after the seed vintage and marks it
-    # 'unconfirmed', exactly as it would for any other post-vintage touch.
+    # A later pass must leave the row alone entirely -- not merely refrain from
+    # overwriting the concurrent write in THIS pass, but never reconsider an
+    # 'observed' row again. Under the pre-'unknown'-default design, a later pass
+    # would have seen an unclassified 'observed' row touched after the seed vintage
+    # and wrongly marked it 'unconfirmed'; see
+    # test_genuine_observation_via_real_save_actor_is_permanently_out_of_scope and
+    # test_subsequent_backfill_rerun_after_genuine_observation_leaves_it_untouched
+    # for the same property proven without any race scaffolding at all.
     with pg_engine.begin() as conn:
         promoted2, unconfirmed2, skipped2 = script.backfill_chunk(
             conn, [actor_id], lock_timeout="5s", statement_timeout="30s", dry_run=False,
         )
-    assert skipped2 == 0
-    assert unconfirmed2 == 1
+    assert (promoted2, unconfirmed2, skipped2) == (0, 0, 0)
+
+    with pg_engine.connect() as conn:
+        row2 = conn.execute(text(
+            "SELECT provenance FROM actors WHERE id = :id"
+        ).bindparams(id=actor_id)).fetchone()
+    assert row2.provenance == PROVENANCE_OBSERVED
+
+
+def test_subsequent_backfill_rerun_after_genuine_observation_leaves_it_untouched(
+    pg_engine: Engine, test_ids: list[str],
+):
+    """Confirmed provenance survives repeated, ORDINARY (non-racing) backfill
+    reruns -- not just the one live race the concurrency test exercises. Two
+    sequential passes, days apart in spirit, with no interleaving at all."""
+    script = importlib.import_module(_SCRIPT_MODULE)
+    actor_id = f"bf_prov_pg_{uuid.uuid4().hex[:16]}"
+    test_ids.append(actor_id)
+
+    actors_db.save_actor(pg_engine, actor_id, {
+        "name": "Real Observation", "tier": "test", "category": "test",
+        "influence_score": 0.71, "data_sources": ["sec_form4"],
+    })
+    with pg_engine.connect() as conn:
+        before = conn.execute(text(
+            "SELECT provenance, influence_score, updated_at FROM actors WHERE id = :id"
+        ).bindparams(id=actor_id)).fetchone()
+    assert before.provenance == PROVENANCE_OBSERVED
+
+    for _ in range(2):
+        with pg_engine.begin() as conn:
+            promoted, unconfirmed, skipped = script.backfill_chunk(
+                conn, [actor_id], lock_timeout="5s", statement_timeout="30s", dry_run=False,
+            )
+        assert (promoted, unconfirmed, skipped) == (0, 0, 0), (
+            "an already-observed row is permanently out of scope on every rerun -- "
+            "not reclassified, not even counted as a conflict"
+        )
+
+    with pg_engine.connect() as conn:
+        after = conn.execute(text(
+            "SELECT provenance, influence_score, updated_at FROM actors WHERE id = :id"
+        ).bindparams(id=actor_id)).fetchone()
+    assert after.provenance == PROVENANCE_OBSERVED
+    assert after.influence_score == before.influence_score
+    assert after.updated_at == before.updated_at, "backfill must not even touch updated_at on an out-of-scope row"

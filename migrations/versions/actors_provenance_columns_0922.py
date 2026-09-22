@@ -26,24 +26,38 @@ independent commits gives none of the intended benefit).
 
 Safety
 ------
-Both columns are additive and nullable-or-defaulted, unchanged from the original
-revision's design:
+Both columns are additive and nullable-or-defaulted:
 
-* ``provenance`` is ``TEXT NOT NULL DEFAULT 'observed'``. Postgres 11+ stores a
+* ``provenance`` is ``TEXT NOT NULL DEFAULT 'unknown'``. Postgres 11+ stores a
   non-volatile column default in the catalog rather than rewriting the heap, so this is
   a metadata-only ALTER even on the full table.
 * ``provenance_as_of`` is a nullable ``DATE``.
 
-No backfill runs here. Every row -- including the 486 seed-list ids -- reads
-``provenance = 'observed'`` (the column default) until the separate backfill script is
-run by an operator. This is a known, temporary, accepted gap: until backfill completes,
-seed rows are not yet distinguishable from truly-observed rows on the wire, and
-``intelligence/actors/db.py::_seed_known_actors``'s ``WHERE actors.provenance = 'seed'``
-reseed guard (added alongside this migration) does not yet protect any row, since no row
-is 'seed' yet either -- it starts protecting rows as soon as the backfill script marks
-them, not before. This is strictly safer than the combined design, not just split: a
-failure here can only ever leave two additive, harmless, defaulted columns in place, never
-a stalled backfill inside the same transaction.
+**Amended from the original design's ``DEFAULT 'observed'``.** ``'observed'`` is a
+specific, earned claim -- confirmed by a real writer's evidence contract (see
+``intelligence/actors/provenance.py``'s module docstring and
+``intelligence/actors/db.py::save_actor``) -- not a safe thing for a column default to
+assert about a row nothing has actually classified yet. A default of ``'observed'``
+meant every one of the 486 seed-list rows, and every other row in the table, read as
+"observed" the instant this migration ran, before any evidence existed either way --
+and made the schema-default value and the genuinely-confirmed value literally
+indistinguishable by looking at the column alone, which is also what let a backfill
+attempt incorrectly reclassify an already-confirmed row (see
+scripts/backfill_actor_provenance.py's module docstring for the concurrency-adjacent
+version of this same bug, found and fixed alongside this default change).
+
+``'unknown'`` is honest about what schema deployment alone establishes: nothing. No
+row -- including the 486 seed-list ids -- is ``'seed'``, ``'observed'``, or
+``'unconfirmed'`` until something with real evidence says so: the separate backfill
+script (classifies the seed-list ids from their pre-existing ``updated_at``),
+``_seed_known_actors`` (seeds/reseeds a row still at ``'unknown'`` or already
+``'seed'``), or ``save_actor`` (stamps ``'observed'`` only alongside its own evidence
+contract -- see that function). ``intelligence/actors/db.py::_seed_known_actors``'s
+``WHERE actors.provenance IN ('seed', 'unknown')`` reseed guard (added alongside this
+migration) treats ``'unknown'`` as fair game to seed, exactly like a row that does not
+exist yet -- legitimate seeding is unaffected by this default. What the guard still
+refuses, unconditionally, is overwriting a row already ``'observed'`` or
+``'unconfirmed'`` -- a real classification decision, never a default.
 
 No index is added: neither column is a filter in any query today (the API resolves
 provenance in Python), and an index on a two-value-mostly column over a table this size
@@ -86,7 +100,7 @@ def upgrade() -> None:
     _set_finite_timeouts()
     conn.execute(text(
         "ALTER TABLE actors "
-        "ADD COLUMN IF NOT EXISTS provenance TEXT NOT NULL DEFAULT 'observed'"
+        "ADD COLUMN IF NOT EXISTS provenance TEXT NOT NULL DEFAULT 'unknown'"
     ))
     conn.execute(text(
         "ALTER TABLE actors ADD COLUMN IF NOT EXISTS provenance_as_of DATE"

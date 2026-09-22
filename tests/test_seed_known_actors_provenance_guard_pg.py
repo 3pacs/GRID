@@ -6,11 +6,14 @@ Proves, against the real function (not a re-implementation):
   1. A brand-new row is inserted with provenance='seed' and updated_at=SEED_VINTAGE_TS
      (not NOW() -- the original audit A-H13 bug this design fixes).
   2. A row still exactly 'seed' DOES get refreshed by a reseed call.
-  3. A row that has become 'observed' is left COMPLETELY untouched by a reseed --
+  3. A row still at the column default 'unknown' (never classified by anything) DOES
+     get seeded/refreshed -- legitimate seeding under the revised honest default must
+     keep working exactly as if the row didn't exist yet.
+  4. A row that has become 'observed' is left COMPLETELY untouched by a reseed --
      not just its provenance columns, but every other seed-authored field too
      (influence_score specifically, since that is the field the module docstring
      names as the concrete harm of overwriting a genuinely-observed value).
-  4. Same for 'unconfirmed'.
+  5. Same for 'unconfirmed'.
 
 Uses the shared ``pg_engine`` fixture (tests/conftest.py) -- skips cleanly if no
 PostgreSQL is reachable. Requires the actors_provenance_columns_0922 columns, which
@@ -27,7 +30,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from intelligence.actors.db import _seed_known_actors
-from intelligence.actors.provenance import PROVENANCE_SEED, SEED_VINTAGE_TS
+from intelligence.actors.provenance import PROVENANCE_SEED, PROVENANCE_UNKNOWN, SEED_VINTAGE_TS
 
 _MINIMAL_ACTORS_DDL = """
 CREATE TABLE IF NOT EXISTS actors (
@@ -43,7 +46,7 @@ CREATE TABLE IF NOT EXISTS actors (
     motivation_model TEXT,
     data_sources JSONB,
     credibility TEXT,
-    provenance TEXT NOT NULL DEFAULT 'observed',
+    provenance TEXT NOT NULL DEFAULT 'unknown',
     provenance_as_of DATE,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 )
@@ -68,7 +71,7 @@ def _actors_table(pg_engine: Engine):
             "ALTER TABLE actors ADD COLUMN IF NOT EXISTS motivation_model TEXT",
             "ALTER TABLE actors ADD COLUMN IF NOT EXISTS data_sources JSONB",
             "ALTER TABLE actors ADD COLUMN IF NOT EXISTS credibility TEXT",
-            "ALTER TABLE actors ADD COLUMN IF NOT EXISTS provenance TEXT NOT NULL DEFAULT 'observed'",
+            "ALTER TABLE actors ADD COLUMN IF NOT EXISTS provenance TEXT NOT NULL DEFAULT 'unknown'",
             "ALTER TABLE actors ADD COLUMN IF NOT EXISTS provenance_as_of DATE",
         ):
             conn.execute(text(stmt))
@@ -132,6 +135,36 @@ def test_reseed_refreshes_a_row_still_exactly_seed(pg_engine: Engine, test_ids, 
         ).bindparams(id=actor_id)).fetchone()
     assert row.provenance == PROVENANCE_SEED
     assert row.influence_score == 0.9, "a row still exactly 'seed' must refresh from the seed table"
+
+
+def test_seeding_a_row_still_at_the_unknown_default_succeeds(pg_engine: Engine, test_ids, monkeypatch):
+    """Legitimate seeding under the revised honest default. A row can be at 'unknown'
+    without ever having gone through _seed_known_actors before -- e.g. created by the
+    schema migration's own default, or by some other minimal writer -- and the seeder
+    must still be able to claim it, exactly as if the row did not exist yet."""
+    actor_id = f"seed_guard_pg_{uuid.uuid4().hex[:16]}"
+    test_ids.append(actor_id)
+
+    # Row pre-exists at the column default 'unknown' -- NOT via _seed_known_actors.
+    with pg_engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO actors (id, name, tier, category) VALUES (:id, 'Pre-existing', 'test', 'test')"
+        ).bindparams(id=actor_id))
+        row = conn.execute(text(
+            "SELECT provenance FROM actors WHERE id = :id"
+        ).bindparams(id=actor_id)).fetchone()
+    assert row.provenance == PROVENANCE_UNKNOWN, "fixture check: row must start at the real column default"
+
+    _seed_one(monkeypatch, actor_id, influence_score=0.42)
+    _seed_known_actors(pg_engine)
+
+    with pg_engine.connect() as conn:
+        after = conn.execute(text(
+            "SELECT provenance, updated_at, influence_score FROM actors WHERE id = :id"
+        ).bindparams(id=actor_id)).fetchone()
+    assert after.provenance == PROVENANCE_SEED
+    assert after.updated_at == SEED_VINTAGE_TS
+    assert after.influence_score == 0.42
 
 
 def test_reseed_does_not_touch_an_observed_row_at_all(pg_engine: Engine, test_ids, monkeypatch):
