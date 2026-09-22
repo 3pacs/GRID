@@ -74,50 +74,89 @@ def backfill_chunk(
     lock_timeout: str,
     statement_timeout: str,
     dry_run: bool,
-) -> tuple[int, int]:
-    """Classify one chunk of seed-list ids. Returns (promoted_to_seed, marked_unconfirmed).
+) -> tuple[int, int, int]:
+    """Classify one chunk of seed-list ids. Returns (promoted_to_seed,
+    marked_unconfirmed, skipped_due_to_concurrent_write).
 
     Each call is meant to run inside its OWN transaction (the caller commits or rolls
     back around this), so SET LOCAL is re-issued every time.
+
+    Concurrency: ``save_actor`` (the one writer contract this whole design trusts as
+    evidence of a real observation -- see intelligence/actors/provenance.py's module
+    docstring) always touches ``updated_at`` on every write, insert or conflict-update,
+    with no exception (verified directly against its current source, unchanged since
+    #596). The ORIGINAL migration's bulk `UPDATE ... WHERE updated_at > :seed_ts`
+    approach cannot tell "touched by an unrelated maintenance writer, still
+    unclassified" apart from "just received a genuine save_actor observation between
+    this backfill's chunk selection and its own UPDATE" -- both look identical at
+    UPDATE time (id in the target list, updated_at moved since the seed vintage). A
+    real concurrent save_actor write landing in that window would get its DATA
+    correctly preserved but its PROVENANCE wrongly stamped 'unconfirmed' by the
+    backfill, mislabeling a fresh, real observation as merely "touched by something".
+
+    Fixed here with an explicit compare-and-swap: this function reads each row's
+    CURRENT (provenance, updated_at) first, decides a classification from that exact
+    snapshot, then applies the UPDATE guarded by
+    ``WHERE updated_at = :snapshot_updated_at AND provenance = :snapshot_provenance``.
+    If a concurrent writer touched the row in the interval between the read and the
+    UPDATE, updated_at (and/or provenance) will have moved, the WHERE clause will not
+    match, 0 rows are affected for that id, and the row is left exactly as the
+    concurrent writer left it -- not reclassified from stale information. A later
+    backfill pass (this script is idempotent/resumable by design) picks up a
+    still-eligible row cleanly on a fresh snapshot. No FOR UPDATE / row locking is
+    used -- the compare-and-swap needs no lock, and not blocking a concurrent writer
+    at all is strictly better than taking a lock a real writer might have to wait on.
     """
-    if dry_run:
-        seed_count = conn.execute(text(
-            "SELECT count(*) FROM actors "
-            " WHERE id = ANY(:ids) AND provenance IS DISTINCT FROM :seed AND updated_at <= :seed_ts"
-        ), {"ids": chunk, "seed": PROVENANCE_SEED, "seed_ts": SEED_VINTAGE_TS}).scalar()
-        unconfirmed_count = conn.execute(text(
-            "SELECT count(*) FROM actors "
-            " WHERE id = ANY(:ids) AND provenance IS DISTINCT FROM :unconfirmed AND updated_at > :seed_ts"
-        ), {"ids": chunk, "unconfirmed": PROVENANCE_UNCONFIRMED, "seed_ts": SEED_VINTAGE_TS}).scalar()
-        return int(seed_count or 0), int(unconfirmed_count or 0)
+    rows = conn.execute(text(
+        "SELECT id, provenance, updated_at FROM actors WHERE id = ANY(:ids)"
+    ), {"ids": chunk}).fetchall()
 
-    conn.execute(text(f"SET LOCAL lock_timeout = '{lock_timeout}'"))
-    conn.execute(text(f"SET LOCAL statement_timeout = '{statement_timeout}'"))
+    if not dry_run:
+        conn.execute(text(f"SET LOCAL lock_timeout = '{lock_timeout}'"))
+        conn.execute(text(f"SET LOCAL statement_timeout = '{statement_timeout}'"))
 
-    seed_result = conn.execute(text(
-        "UPDATE actors "
-        "   SET provenance = :seed, provenance_as_of = :vintage "
-        " WHERE id = ANY(:ids) "
-        "   AND provenance IS DISTINCT FROM :seed "
-        "   AND updated_at <= :seed_ts"
-    ), {
-        "seed": PROVENANCE_SEED,
-        "vintage": SEED_VINTAGE,
-        "seed_ts": SEED_VINTAGE_TS,
-        "ids": chunk,
-    })
-    unconfirmed_result = conn.execute(text(
-        "UPDATE actors "
-        "   SET provenance = :unconfirmed, provenance_as_of = NULL "
-        " WHERE id = ANY(:ids) "
-        "   AND provenance IS DISTINCT FROM :unconfirmed "
-        "   AND updated_at > :seed_ts"
-    ), {
-        "unconfirmed": PROVENANCE_UNCONFIRMED,
-        "seed_ts": SEED_VINTAGE_TS,
-        "ids": chunk,
-    })
-    return seed_result.rowcount, unconfirmed_result.rowcount
+    promoted = 0
+    unconfirmed = 0
+    skipped = 0
+    for row in rows:
+        if row.provenance in (PROVENANCE_SEED, PROVENANCE_UNCONFIRMED):
+            continue  # already classified -- idempotent, nothing to do
+
+        target_seed = row.updated_at <= SEED_VINTAGE_TS
+        target_provenance = PROVENANCE_SEED if target_seed else PROVENANCE_UNCONFIRMED
+        target_vintage = SEED_VINTAGE if target_seed else None
+
+        if dry_run:
+            if target_seed:
+                promoted += 1
+            else:
+                unconfirmed += 1
+            continue
+
+        result = conn.execute(text(
+            "UPDATE actors "
+            "   SET provenance = :target, provenance_as_of = :vintage "
+            " WHERE id = :id "
+            "   AND updated_at = :snapshot_updated_at "
+            "   AND provenance = :snapshot_provenance"
+        ), {
+            "target": target_provenance,
+            "vintage": target_vintage,
+            "id": row.id,
+            "snapshot_updated_at": row.updated_at,
+            "snapshot_provenance": row.provenance,
+        })
+        if result.rowcount == 0:
+            # A concurrent writer touched this row between our SELECT and this
+            # UPDATE -- their write stands untouched, we do not retry within this
+            # pass (a later run's fresh snapshot will pick it up if still eligible).
+            skipped += 1
+        elif target_seed:
+            promoted += 1
+        else:
+            unconfirmed += 1
+
+    return promoted, unconfirmed, skipped
 
 
 def main() -> int:
@@ -143,10 +182,11 @@ def main() -> int:
 
     total_seed = 0
     total_unconfirmed = 0
+    total_skipped = 0
     for i, chunk in enumerate(_chunks(seed_ids, args.chunk_size), start=1):
         try:
             with engine.begin() as conn:
-                promoted, unconfirmed = backfill_chunk(
+                promoted, unconfirmed, skipped = backfill_chunk(
                     conn, chunk,
                     lock_timeout=args.lock_timeout,
                     statement_timeout=args.statement_timeout,
@@ -162,17 +202,28 @@ def main() -> int:
             return 1
         total_seed += promoted
         total_unconfirmed += unconfirmed
-        log.info(
-            "chunk {i}/{tc}: {p} {verb} seed, {u} {verb} unconfirmed",
-            i=i, tc=total_chunks, p=promoted, u=unconfirmed,
-            verb="would be marked" if args.dry_run else "marked",
-        )
+        total_skipped += skipped
+        if skipped:
+            log.info(
+                "chunk {i}/{tc}: {p} {verb} seed, {u} {verb} unconfirmed, "
+                "{s} skipped (concurrent write since this chunk's snapshot -- "
+                "their write stands, a later run will re-evaluate if still eligible)",
+                i=i, tc=total_chunks, p=promoted, u=unconfirmed, s=skipped,
+                verb="would be marked" if args.dry_run else "marked",
+            )
+        else:
+            log.info(
+                "chunk {i}/{tc}: {p} {verb} seed, {u} {verb} unconfirmed",
+                i=i, tc=total_chunks, p=promoted, u=unconfirmed,
+                verb="would be marked" if args.dry_run else "marked",
+            )
         if args.sleep_between_chunks:
             time.sleep(args.sleep_between_chunks)
 
     log.info(
-        "backfill_actor_provenance complete: {p} total {verb} seed, {u} total {verb} unconfirmed",
-        p=total_seed, u=total_unconfirmed,
+        "backfill_actor_provenance complete: {p} total {verb} seed, {u} total {verb} "
+        "unconfirmed, {s} total skipped (concurrent writes preserved)",
+        p=total_seed, u=total_unconfirmed, s=total_skipped,
         verb="would be marked" if args.dry_run else "marked",
     )
     return 0

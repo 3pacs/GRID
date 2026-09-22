@@ -18,6 +18,13 @@ Proves, against the real script (not a re-implementation):
      untouched, then confirming a rerun resumes and completes it.
   4. --dry-run (exercised via the module's own backfill_chunk(..., dry_run=True)) writes
      nothing.
+  5. Concurrency: a REAL second connection (not simulated) writes to a row -- the exact
+     shape of intelligence.actors.db.save_actor's own contract, verified against its
+     actual current source: always touches updated_at, on every write, no exception --
+     BETWEEN this function's own snapshot read and its UPDATE. The backfill must not
+     overwrite that newer write with a stale classification; it must skip the row for
+     this pass and leave the concurrent writer's data (and provenance) exactly as it
+     left them.
 
 Uses the shared ``pg_engine`` fixture (tests/conftest.py) -- skips cleanly if no
 PostgreSQL is reachable.
@@ -62,6 +69,8 @@ def _actors_table(pg_engine: Engine):
             "ALTER TABLE actors ADD COLUMN IF NOT EXISTS provenance TEXT NOT NULL DEFAULT 'observed'"
         ))
         conn.execute(text("ALTER TABLE actors ADD COLUMN IF NOT EXISTS provenance_as_of DATE"))
+        conn.execute(text("ALTER TABLE actors ADD COLUMN IF NOT EXISTS influence_score DOUBLE PRECISION"))
+        conn.execute(text("ALTER TABLE actors ADD COLUMN IF NOT EXISTS data_sources JSONB"))
     yield
 
 
@@ -98,12 +107,13 @@ def test_backfill_chunk_classifies_seed_vs_unconfirmed(pg_engine: Engine, test_i
         _insert_actor(conn, actor_id=touched_id, updated_at=SEED_VINTAGE_TS + timedelta(days=30))
 
     with pg_engine.begin() as conn:
-        promoted, unconfirmed = script.backfill_chunk(
+        promoted, unconfirmed, skipped = script.backfill_chunk(
             conn, [pristine_id, touched_id],
             lock_timeout="5s", statement_timeout="30s", dry_run=False,
         )
     assert promoted == 1
     assert unconfirmed == 1
+    assert skipped == 0
 
     with pg_engine.connect() as conn:
         rows = {
@@ -127,17 +137,18 @@ def test_backfill_chunk_is_idempotent(pg_engine: Engine, test_ids: list[str]):
         _insert_actor(conn, actor_id=actor_id, updated_at=SEED_VINTAGE_TS)
 
     with pg_engine.begin() as conn:
-        first_promoted, _ = script.backfill_chunk(
+        first_promoted, _, _ = script.backfill_chunk(
             conn, [actor_id], lock_timeout="5s", statement_timeout="30s", dry_run=False,
         )
     assert first_promoted == 1
 
     with pg_engine.begin() as conn:
-        second_promoted, second_unconfirmed = script.backfill_chunk(
+        second_promoted, second_unconfirmed, second_skipped = script.backfill_chunk(
             conn, [actor_id], lock_timeout="5s", statement_timeout="30s", dry_run=False,
         )
     assert second_promoted == 0, "a second pass over an already-classified row must be a no-op"
     assert second_unconfirmed == 0
+    assert second_skipped == 0, "an already-classified row is skipped by the classification filter, not the concurrency guard"
 
 
 def test_dry_run_writes_nothing(pg_engine: Engine, test_ids: list[str]):
@@ -149,10 +160,11 @@ def test_dry_run_writes_nothing(pg_engine: Engine, test_ids: list[str]):
         _insert_actor(conn, actor_id=actor_id, updated_at=SEED_VINTAGE_TS)
 
     with pg_engine.begin() as conn:
-        promoted, unconfirmed = script.backfill_chunk(
+        promoted, unconfirmed, skipped = script.backfill_chunk(
             conn, [actor_id], lock_timeout="5s", statement_timeout="30s", dry_run=True,
         )
     assert promoted == 1, "dry-run must still REPORT what it would do"
+    assert skipped == 0
 
     with pg_engine.connect() as conn:
         row = conn.execute(text(
@@ -215,7 +227,7 @@ def test_a_later_chunk_failing_does_not_roll_back_an_earlier_chunks_commit(
     # Resumability: rerunning chunk 2 (the only thing an operator needs to do)
     # completes it, with chunk 1 untouched by the resume.
     with pg_engine.begin() as conn:
-        promoted, _ = script.backfill_chunk(
+        promoted, _, _ = script.backfill_chunk(
             conn, [chunk2_id], lock_timeout="5s", statement_timeout="30s", dry_run=False,
         )
     assert promoted == 1
@@ -251,3 +263,104 @@ def test_main_dry_run_end_to_end_against_real_seed_list(
             "SELECT provenance FROM actors WHERE id = :id"
         ).bindparams(id=a_id)).fetchone()
     assert row.provenance == "observed", "--dry-run through main() must not write"
+
+
+def test_concurrent_real_writer_evidence_survives_backfill(pg_engine: Engine, test_ids: list[str]):
+    """The concurrency case this design exists to handle: a REAL second connection
+    (intelligence.actors.db.save_actor's exact contract -- always touches updated_at,
+    never touches provenance, verified against its current source) writes to a row
+    AFTER backfill_chunk() has taken its snapshot but BEFORE its UPDATE runs.
+
+    Reproduced deterministically (not as a timing-dependent race) by calling
+    backfill_chunk() with pre-fetched rows via a monkeypatched connection wrapper that
+    performs the real concurrent write, on a REAL second connection, at the exact
+    moment between the snapshot SELECT and the per-row UPDATE -- both statements are
+    still the function's own real SQL, only the trigger point is controlled so the
+    test does not depend on winning an actual timing race to be meaningful.
+    """
+    script = importlib.import_module(_SCRIPT_MODULE)
+
+    actor_id = f"bf_prov_pg_{uuid.uuid4().hex[:16]}"
+    test_ids.append(actor_id)
+
+    # Pristine seed-list row: eligible to be promoted to 'seed' by an ordinary pass.
+    with pg_engine.begin() as conn:
+        _insert_actor(conn, actor_id=actor_id, updated_at=SEED_VINTAGE_TS)
+
+    # A second, REAL, independent connection -- simulates save_actor's exact writer
+    # contract landing concurrently: new data_sources, GREATEST-combined
+    # influence_score, updated_at = NOW(). Committed in its own transaction, exactly
+    # as save_actor's `with engine.connect() as conn: ...; conn.commit()` does.
+    concurrent_conn = pg_engine.connect()
+
+    class _InterceptingConnection:
+        """Wraps the real connection backfill_chunk() uses; after its snapshot
+        SELECT returns, performs the real concurrent write on a SEPARATE real
+        connection/transaction before backfill_chunk()'s own UPDATE runs."""
+
+        def __init__(self, real_conn):
+            self._real = real_conn
+            self._select_seen = False
+
+        def execute(self, stmt, params=None):
+            result = self._real.execute(stmt, params) if params is not None else self._real.execute(stmt)
+            sql_text = str(stmt)
+            if not self._select_seen and "SELECT id, provenance, updated_at" in sql_text:
+                self._select_seen = True
+                # The real concurrent write, on the real second connection, committed
+                # before backfill_chunk()'s UPDATE gets a chance to run.
+                concurrent_conn.execute(text(
+                    "UPDATE actors SET data_sources = :ds, "
+                    "influence_score = GREATEST(COALESCE(influence_score, 0), :inf), "
+                    "updated_at = NOW() WHERE id = :id"
+                ), {"ds": '["sec_form4"]', "inf": 0.83, "id": actor_id})
+                concurrent_conn.commit()
+            return result
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    try:
+        with pg_engine.begin() as real_conn:
+            wrapped = _InterceptingConnection(real_conn)
+            promoted, unconfirmed, skipped = script.backfill_chunk(
+                wrapped, [actor_id], lock_timeout="5s", statement_timeout="30s", dry_run=False,
+            )
+    finally:
+        concurrent_conn.close()
+
+    assert skipped == 1, "the concurrent write must be detected and the row skipped, not overwritten"
+    assert promoted == 0
+    assert unconfirmed == 0
+
+    with pg_engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT provenance, influence_score, data_sources::text AS data_sources "
+            "FROM actors WHERE id = :id"
+        ).bindparams(id=actor_id)).fetchone()
+
+    # The concurrent writer's evidence is fully intact -- backfill did not touch it.
+    assert row.influence_score == 0.83, "the concurrent writer's real data must survive"
+    assert row.data_sources == '["sec_form4"]'
+    # provenance itself: save_actor's real contract never touches this column (verified
+    # against its actual source), so it is still whatever it was before -- the column
+    # DEFAULT 'observed' here, since this row had never been classified yet. The
+    # decisive assertion is not this value but that backfill did NOT overwrite it to
+    # 'unconfirmed', which the pre-fix bulk-UPDATE design would have done (updated_at
+    # moved past SEED_VINTAGE_TS by the concurrent write, and the old WHERE clause only
+    # checked "is it not already 'unconfirmed'", which an 'observed' row satisfies).
+    assert row.provenance == "observed"
+
+    # A later pass, with a fresh snapshot, re-evaluates the row on its own terms (now
+    # touched well after the seed vintage by a real writer) -- this documents what
+    # happens next, not a claim that it becomes semantically perfect: save_actor's
+    # current contract does not stamp provenance itself (a separate, pre-existing gap,
+    # not introduced or fixed here -- see the PR description), so a fresh pass still
+    # sees an unclassified 'observed' row touched after the seed vintage and marks it
+    # 'unconfirmed', exactly as it would for any other post-vintage touch.
+    with pg_engine.begin() as conn:
+        promoted2, unconfirmed2, skipped2 = script.backfill_chunk(
+            conn, [actor_id], lock_timeout="5s", statement_timeout="30s", dry_run=False,
+        )
+    assert skipped2 == 0
+    assert unconfirmed2 == 1

@@ -8,6 +8,11 @@ continuous lock/activity sampler that answers the remediation plan's preconditio
 
 Proves the script's own query actually observes a REAL held lock from a second,
 independent connection -- not a mock of what pg_locks/pg_stat_activity would say.
+Also proves the redaction pass on a REAL literal value captured in pg_stat_activity's
+own query text (psycopg2's default parameter style substitutes bound values
+client-side, so the server -- and this sampler -- would otherwise see them verbatim;
+confirmed directly while building this file, not assumed), and that the duration bound
+actually stops the run.
 
 Uses the shared ``pg_engine`` fixture (tests/conftest.py) -- skips cleanly if no
 PostgreSQL is reachable.
@@ -19,6 +24,7 @@ import importlib
 import threading
 import time
 
+import psycopg2
 import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -91,3 +97,96 @@ def test_sample_query_runs_clean_with_no_relevant_activity(pg_engine: Engine):
     assert all(
         r["relation"] in (None, "monitor_pg_activity_test_target") for r in rows
     )
+
+
+def test_redaction_removes_a_real_literal_value_captured_in_query_text(pg_engine: Engine):
+    """Proves the redaction pass against a REAL literal captured from
+    pg_stat_activity.query on a genuine second connection -- not a synthetic string
+    handed straight to _redact_query(). Confirms psycopg2's client-side parameter
+    substitution really does put the literal in the server-visible query text (the
+    exact finding that motivated adding redaction at all), then confirms the
+    script's own function removes it.
+    """
+    script = importlib.import_module(_SCRIPT_MODULE)
+    url = pg_engine.url
+    dsn = (
+        f"dbname={url.database} user={url.username} password={url.password} "
+        f"host={url.host or 'localhost'} port={url.port or 5432}"
+    )
+
+    holder_ready = threading.Event()
+    release_holder = threading.Event()
+    secret_marker = "MONITOR_REDACTION_TEST_SECRET_9f3a"
+
+    def _hold_with_literal():
+        conn = psycopg2.connect(dsn)
+        conn.autocommit = True
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT pg_sleep(3), %s", (secret_marker,))
+        except Exception:
+            pass
+        finally:
+            conn.close()
+
+    def _wait_until_visible():
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with pg_engine.connect() as conn:
+                found = conn.execute(text(
+                    "SELECT 1 FROM pg_stat_activity WHERE query ILIKE '%pg_sleep%'"
+                )).first()
+            if found:
+                holder_ready.set()
+                return
+            time.sleep(0.05)
+
+    holder_thread = threading.Thread(target=_hold_with_literal, daemon=True)
+    holder_thread.start()
+    watcher_thread = threading.Thread(target=_wait_until_visible, daemon=True)
+    watcher_thread.start()
+    try:
+        assert holder_ready.wait(timeout=5), "the pg_sleep query never became visible in pg_stat_activity"
+
+        with pg_engine.connect() as conn:
+            raw_row = conn.execute(text(
+                "SELECT query FROM pg_stat_activity WHERE query ILIKE '%pg_sleep%'"
+            )).first()
+        assert raw_row is not None
+        assert secret_marker in raw_row.query, (
+            "fixture check: the literal must genuinely be present in the server's own "
+            "query text, or this test proves nothing about the redaction pass"
+        )
+
+        redacted = script._redact_query(raw_row.query)
+        assert secret_marker not in redacted, "the redaction pass must remove a real captured literal"
+        assert "pg_sleep" in redacted, "redaction must not destroy the query STRUCTURE, only literal values"
+    finally:
+        release_holder.set()
+        holder_thread.join(timeout=6)
+        watcher_thread.join(timeout=6)
+
+
+def test_redact_query_handles_none_and_short_text():
+    script = importlib.import_module(_SCRIPT_MODULE)
+    assert script._redact_query(None) is None
+    assert script._redact_query("") == ""
+    assert "pg_sleep" in script._redact_query("SELECT pg_sleep(1)")
+
+
+def test_main_stops_at_the_duration_bound(pg_engine: Engine, monkeypatch):
+    """The bound is the default, not opt-in -- this proves main() actually
+    respects --max-duration-seconds and returns instead of running forever."""
+    script = importlib.import_module(_SCRIPT_MODULE)
+    monkeypatch.setattr(script, "get_engine", lambda: pg_engine)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["monitor_pg_activity_during_migration.py", "--interval", "0.05", "--max-duration-seconds", "0.3"],
+    )
+
+    start = time.monotonic()
+    rc = script.main()
+    elapsed = time.monotonic() - start
+
+    assert rc == 0
+    assert elapsed < 2.0, f"main() ran {elapsed:.2f}s, well past its 0.3s bound -- the duration cap did not stop it"
