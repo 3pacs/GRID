@@ -55,6 +55,17 @@ on:
         required: false
         default: false
 
+# Two runs targeting the same ref (a push immediately followed by another,
+# or a workflow_dispatch overlapping a push) must never build/migrate/swap
+# concurrently against the same $DEPLOY_PATH -- scripts/deploy_release_swap.sh
+# takes its own flock as a backstop, but queuing here is cheaper (no runner
+# occupied waiting) and is the primary defense. cancel-in-progress stays
+# false: a deploy already mid-restart or mid-migration must run to
+# completion, never be killed partway.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   DEPLOY_PATH: /data/grid_v4/grid_release
 
