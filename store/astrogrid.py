@@ -56,6 +56,10 @@ _PRICE_FEATURE_BY_SYMBOL = {
 }
 _PRICE_FEATURE_BY_SYMBOL["GOOG"] = _PRICE_FEATURE_BY_SYMBOL["GOOGL"]
 
+
+def _utc_today() -> date:
+    return datetime.now(timezone.utc).date()
+
 _VALID_SCORING_CLASSES = {
     "liquid_market",
     "illiquid_real_asset",
@@ -1385,7 +1389,7 @@ class AstroGridStore:
         provider_mode: str = "deterministic",
         horizon_label: str | None = None,
     ) -> dict[str, Any]:
-        evaluation_date = as_of_date or date.today()
+        evaluation_date = as_of_date or _utc_today()
         score_summary = self.score_predictions(
             as_of_date=evaluation_date,
             limit=score_limit,
@@ -1437,7 +1441,7 @@ class AstroGridStore:
         limit: int = 100,
         prediction_ids: list[str] | None = None,
     ) -> dict[str, Any]:
-        evaluation_date = as_of_date or date.today()
+        evaluation_date = as_of_date or _utc_today()
         filters = []
         params: dict[str, Any] = {"limit": limit}
         if prediction_ids:
@@ -2409,6 +2413,7 @@ class AstroGridStore:
                         "feature": observation["feature"],
                         "target_date": observation["target_date"],
                         "latest_obs_date": observation["latest_obs_date"],
+                        "latest_release_date": observation["latest_release_date"],
                         "max_age_days": observation["max_age_days"],
                     }}
             entry_price = entry["price"]
@@ -2488,7 +2493,17 @@ class AstroGridStore:
                             "evaluation_date": evaluation_date,
                         },
                     ).fetchall()
-                return [(row[0], float(row[1])) for row in rows if row[0] is not None and row[1] is not None]
+                path = []
+                for obs_date, value in rows:
+                    if obs_date is None:
+                        continue
+                    try:
+                        price = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 < price < float("inf"):
+                        path.append((obs_date, price))
+                return path
             except (SQLAlchemyError, TypeError, ValueError):
                 return []
         return []
@@ -2602,8 +2617,11 @@ class AstroGridStore:
         Crypto trades every day, so the observation must match the target day.
         Exchange traded assets require the target day's close on weekdays;
         Saturday and Sunday may use Friday's close. Exchange holidays without
-        a matching close remain unscored. The universe contract's 14-day
-        *history coverage* limit is too loose for a return.
+        a matching close remain unscored. An observation dated today in UTC
+        cannot be treated as a completed daily bar. This date-only table does
+        not prove that older rows were final closes; that requires provenance
+        from the producer. The universe contract's 14-day *history coverage*
+        limit is too loose for a return.
         """
         symbol = str(symbol or "").upper()
         feature_name = _PRICE_FEATURE_BY_SYMBOL.get(symbol)
@@ -2615,14 +2633,19 @@ class AstroGridStore:
             "feature": feature_name,
             "target_date": target_date.isoformat(),
             "latest_obs_date": None,
+            "latest_release_date": None,
             "max_age_days": max_age_days,
         }
         if not feature_name:
             result["status"] = "unsupported_target"
             return result
+        today_utc = _utc_today()
+        if target_date > today_utc:
+            result["status"] = "future_evaluation_date"
+            return result
         sql = text(
             """
-            SELECT rs.value, rs.obs_date
+            SELECT rs.value, rs.obs_date, rs.release_date
             FROM feature_registry fr
             JOIN resolved_series rs ON rs.feature_id = fr.id
             WHERE fr.name = :feature_name
@@ -2644,6 +2667,14 @@ class AstroGridStore:
             result["status"] = "invalid_observation_date"
             return result
         result["latest_obs_date"] = obs_date.isoformat()
+        release_date = row[2].date() if isinstance(row[2], datetime) else row[2]
+        if not isinstance(release_date, date):
+            result["status"] = "invalid_release_date"
+            return result
+        result["latest_release_date"] = release_date.isoformat()
+        if release_date > today_utc:
+            result["status"] = "future_release_date"
+            return result
         if (target_date - obs_date).days > max_age_days:
             result["status"] = "stale_canonical_price"
             return result
@@ -2654,6 +2685,9 @@ class AstroGridStore:
             return result
         if not (0 < price < float("inf")):
             result["status"] = "invalid_canonical_price"
+            return result
+        if obs_date >= today_utc:
+            result["status"] = "open_observation_day"
             return result
         result["status"] = "ok"
         result["price"] = price
