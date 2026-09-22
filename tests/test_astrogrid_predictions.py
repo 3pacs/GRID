@@ -143,7 +143,8 @@ def test_score_predictions_prefers_mature_as_of_dates(mock_engine) -> None:
     assert "pr.as_of_ts::date" in str(captured["sql"])
     assert "THEN 30" in str(captured["sql"])
     assert "ELSE 7" in str(captured["sql"])
-    assert "ORDER BY pr.as_of_ts ASC, pr.created_at ASC" in str(captured["sql"])
+    assert "price_close_contract'->>'version'" in str(captured["sql"])
+    assert "pr.as_of_ts ASC, pr.created_at ASC" in str(captured["sql"])
     assert captured["params"]["evaluation_date"] == date(2026, 3, 29)
 
 

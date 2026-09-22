@@ -1497,7 +1497,12 @@ class AstroGridStore:
                     END
               ) <= :evaluation_date
             {where_sql}
-            ORDER BY pr.as_of_ts ASC, pr.created_at ASC
+            -- Legacy unanchored rows may remain pending forever. Do not let
+            -- them fill the batch ahead of a new SPY receipt-contract run.
+            ORDER BY CASE WHEN pr.target_symbols = '["SPY"]'::jsonb
+                            AND pr.market_overlay_snapshot->'price_close_contract'->>'version'
+                                = 'spy_close_v1' THEN 0 ELSE 1 END,
+                     pr.as_of_ts ASC, pr.created_at ASC
             LIMIT :limit
             """
         )
