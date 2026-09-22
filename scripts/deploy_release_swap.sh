@@ -51,11 +51,15 @@
 # held via an open file descriptor cannot span them). To keep a manual
 # rollback from racing that still-in-flight activation window, this script
 # also writes <live_path>.releases/.activation-in-progress on every
-# successful swap; deploy.yml clears it as its own last step
-# (`if: always()`, after this run's restarts/verifications). See
-# deploy_release_rollback.sh for how it uses that marker, and its own header
-# for the residual gap if a job crashes outright instead of merely failing a
-# step.
+# successful swap; deploy.yml clears it (via
+# scripts/deploy_clear_activation_marker.sh, label-scoped so it only ever
+# clears its OWN deploy's marker) as its own last step (`if: always()`,
+# after this run's restarts/verifications). deploy_release_rollback.sh
+# refuses outright while this marker is present -- there is no
+# staleness-based auto-proceed; only an operator passing
+# --override-stuck-activation, a deliberate acknowledgment that they have
+# positively confirmed no deploy is actually running, gets past it. See
+# that script's own header.
 #
 # Concurrency: this script holds an exclusive lock
 # (<live_path>.releases/.lock) for its ENTIRE run, from the crash-recovery
@@ -92,7 +96,8 @@
 # Linux resolves a relative path against a process's cwd via the pinned
 # directory inode, not the name, so a process that had already chdir()'d
 # into <live_path> keeps reading exactly the same files straight through
-# this whole conversion -- proven empirically, not just asserted, in
+# this whole conversion -- proven empirically (with real, measured failure
+# counts for the contrasting cases, not just asserted) in
 # tests/deploy/test_deploy_release_swap.sh. The ENOENT window itself has no
 # fully atomic fix on POSIX without a filesystem-specific syscall (Linux's
 # renameat2(RENAME_EXCHANGE), not exposed by coreutils' mv or worth a custom
@@ -100,6 +105,23 @@
 # Accepted as a bounded, self-healing residual risk, not a silent one, and
 # it can only ever occur on whichever single future deploy is the first to
 # run this script against a target that is still a plain directory today.
+#
+# "Self-heals on the next run" describes what THIS SCRIPT does once it
+# executes again -- it is not a claim that recovery happens on its own with
+# no operator involved. Nothing on grid-svr retries a crashed deploy
+# automatically; this script only ever runs as part of a deploy.yml job,
+# and nothing starts a new one by itself. If the very first conversion
+# (today, against production's still-plain-directory $DEPLOY_PATH) is
+# interrupted, <live_path> stays missing -- and grid-api/grid-hermes cannot
+# be (re)started onto it, though already-running processes are unaffected
+# per the paragraph above -- until an operator deliberately starts a new
+# deploy.yml run: either a normal push to main, or, for the specific case
+# of the triggering run itself having failed/been interrupted,
+# `gh run rerun <run_id> --failed --repo 3pacs/GRID` (this session's own
+# established retry mechanism). That new run's "Build release tree" step
+# invokes this script again, and recovery then happens as its first action,
+# automatically, within that run -- but getting to that point is a human
+# decision, not a background process.
 #
 # A build_hook that succeeds -- including a migration that COMMITS schema
 # changes -- does not guarantee the swap that follows it also succeeds (the

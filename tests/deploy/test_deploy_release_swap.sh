@@ -34,12 +34,18 @@
 #       crash). States the remaining availability gap with numbers.
 #   11. scripts/deploy_release_rollback.sh: refuses cleanly with nothing to
 #       roll back to, rolls back correctly, is idempotent, refuses to race
-#       an in-flight deploy build/swap holding the lock, REQUIRES an
-#       explicit --schema-compatible acknowledgment (reverting files does
-#       not revert a committed migration) and refuses without it, and
-#       refuses to race a still-in-flight post-swap activation window (a
-#       fresh .activation-in-progress marker) while still proceeding, with
-#       a loud warning, past a stale one left by a job that crashed outright.
+#       an in-flight deploy build/swap holding the lock (proven to win over
+#       a merely-present marker -- the marker is only ever examined AFTER
+#       the lock is held), REQUIRES an explicit --schema-compatible
+#       acknowledgment (an operator's claim, not a check this script
+#       performs) and refuses without it, and REFUSES OUTRIGHT -- with no
+#       staleness-based auto-proceed, age is never dispositive -- while
+#       .activation-in-progress is present, only proceeding when an
+#       operator separately passes --override-stuck-activation.
+#   12. scripts/deploy_clear_activation_marker.sh: a missing marker is a
+#       silent no-op; a marker matching the given label is cleared; a
+#       marker belonging to a DIFFERENT label is left alone (and says so),
+#       so one deploy's cleanup can never clear a later deploy's marker.
 #
 # Runs entirely inside a temp sandbox -- never touches any real GRID path,
 # any real database, or any production host. Safe to run anywhere with a
@@ -55,6 +61,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 SWAP_SCRIPT="${REPO_ROOT}/scripts/deploy_release_swap.sh"
 ROLLBACK_SCRIPT="${REPO_ROOT}/scripts/deploy_release_rollback.sh"
+CLEAR_MARKER_SCRIPT="${REPO_ROOT}/scripts/deploy_clear_activation_marker.sh"
 
 SANDBOX="$(mktemp -d)"
 trap 'rm -rf "$SANDBOX"' EXIT
@@ -613,10 +620,10 @@ echo "INFO: absolute-path reader across a real SIGKILL-interrupted conversion: $
 # enforced acknowledgment (not just documented) that reverting FILES does
 # not revert a committed migration -- see the dedicated sub-test below that
 # confirms omitting it is refused. After each successful swap this test
-# clears .activation-in-progress itself, standing in for deploy.yml's own
-# end-of-job cleanup step, so the rollback assertions below exercise
-# rollback's core swap-target logic; the activation-marker gate itself gets
-# its own dedicated sub-test further down.
+# clears .activation-in-progress via the real deploy_clear_activation_marker.sh
+# (the same mechanism deploy.yml's own end-of-job step uses), so the
+# rollback assertions below exercise rollback's core swap-target logic; the
+# activation-marker gate itself gets its own dedicated sub-tests further down.
 
 t11_live="${SANDBOX}/t11/grid_release"
 mkdir -p "$(dirname "$t11_live")"
@@ -637,7 +644,7 @@ echo "release-2" > "$1/marker.txt"
 HOOK
 chmod +x "$t11_hook1"
 bash "$SWAP_SCRIPT" "$t11_live" "r2" "$t11_hook1" > "${SANDBOX}/t11/swap1.log" 2>&1
-rm -f "${t11_live}.releases/.activation-in-progress"
+bash "$CLEAR_MARKER_SCRIPT" "$t11_live" "r2" > "${SANDBOX}/t11/clear1.log" 2>&1
 
 t11_hook2="${SANDBOX}/t11/build2.sh"
 cat > "$t11_hook2" << 'HOOK'
@@ -647,7 +654,7 @@ echo "release-3" > "$1/marker.txt"
 HOOK
 chmod +x "$t11_hook2"
 bash "$SWAP_SCRIPT" "$t11_live" "r3" "$t11_hook2" > "${SANDBOX}/t11/swap2.log" 2>&1
-rm -f "${t11_live}.releases/.activation-in-progress"
+bash "$CLEAR_MARKER_SCRIPT" "$t11_live" "r3" > "${SANDBOX}/t11/clear2.log" 2>&1
 assert_eq "rollback setup: two swaps landed release-3 live" "release-3" "$(cat "$t11_live/marker.txt")"
 
 bash "$ROLLBACK_SCRIPT" "$t11_live" --schema-compatible > "${SANDBOX}/t11/rollback.log" 2>&1
@@ -691,14 +698,15 @@ DEPLOY_LOCK_WAIT_SECS=1 bash "$ROLLBACK_SCRIPT" "$t11_live" --schema-compatible 
 t11_exit_contended=$?
 set -e
 wait "$t11_slow_pid"
-rm -f "${t11_live}.releases/.activation-in-progress"
+bash "$CLEAR_MARKER_SCRIPT" "$t11_live" "r4" > "${SANDBOX}/t11/clear4.log" 2>&1
 
 assert_eq "rollback during an in-flight deploy build/swap: fails fast with the lock-contention exit code" "3" "$t11_exit_contended"
 
 # Activation-in-progress marker: written by deploy_release_swap.sh on every
-# successful swap, normally cleared by deploy.yml's own last step. A FRESH
-# marker means that clearing step (and everything before it -- restart,
-# health check) may not have run yet -- rollback must refuse, not race it.
+# successful swap, normally cleared by deploy.yml's own last step. Its mere
+# PRESENCE means that clearing step (and everything before it -- restart,
+# health check) may not have run yet -- rollback must refuse, unconditionally,
+# never guessing from age.
 bash "$SWAP_SCRIPT" "$t11_live" "r5" "$t11_hook1" > "${SANDBOX}/t11/swap5.log" 2>&1
 assert_true "activation marker: a successful swap leaves .activation-in-progress behind" \
   "$([ -f "${t11_live}.releases/.activation-in-progress" ] && echo true || echo false)"
@@ -707,29 +715,113 @@ set +e
 bash "$ROLLBACK_SCRIPT" "$t11_live" --schema-compatible > "${SANDBOX}/t11/rollback_fresh_marker.log" 2>&1
 t11_exit_fresh_marker=$?
 set -e
-assert_eq "rollback with a FRESH activation-in-progress marker: refuses with its own distinct exit code" "6" "$t11_exit_fresh_marker"
-assert_eq "rollback with a FRESH activation-in-progress marker: touched nothing -- content still release-2" \
+assert_eq "rollback with an activation-in-progress marker present, no override: refuses with its own distinct exit code" "6" "$t11_exit_fresh_marker"
+assert_true "rollback refusal: message states age alone is never a reason to proceed" \
+  "$(grep -q 'Age alone is never a reason to proceed' "${SANDBOX}/t11/rollback_fresh_marker.log" && echo true || echo false)"
+assert_eq "rollback with the marker present, no override: touched nothing -- content still release-2" \
   "release-2" "$(cat "$t11_live/marker.txt")"
 
-# A STALE marker (older than the threshold -- simulating a deploy.yml job
-# that crashed outright before its own cleanup step could run) is a
-# warning, not a refusal. Backdate the marker's mtime directly rather than
-# racing a real clock against a short threshold.
-touch -d '-30 minutes' "${t11_live}.releases/.activation-in-progress"
+# Backdating the marker's mtime must NOT change the outcome -- there is no
+# staleness-based auto-proceed. Only --override-stuck-activation does.
+touch -d '-2 hours' "${t11_live}.releases/.activation-in-progress"
 set +e
-bash "$ROLLBACK_SCRIPT" "$t11_live" --schema-compatible > "${SANDBOX}/t11/rollback_stale_marker.log" 2>&1
-t11_exit_stale=$?
+bash "$ROLLBACK_SCRIPT" "$t11_live" --schema-compatible > "${SANDBOX}/t11/rollback_old_marker_no_override.log" 2>&1
+t11_exit_old_no_override=$?
 set -e
-assert_eq "rollback with a STALE activation-in-progress marker: proceeds (exit 0), does not refuse" "0" "$t11_exit_stale"
-assert_true "rollback with a STALE marker: logs a loud warning rather than proceeding silently" \
-  "$(grep -q 'STALE activation-in-progress marker' "${SANDBOX}/t11/rollback_stale_marker.log" && echo true || echo false)"
+assert_eq "rollback with an OLD (2h) marker but still no override: still refuses -- age never decides this" "6" "$t11_exit_old_no_override"
+assert_eq "rollback with an old marker, no override: touched nothing -- content still release-2" \
+  "release-2" "$(cat "$t11_live/marker.txt")"
+
+# --override-stuck-activation is the only way past it -- a deliberate,
+# separate acknowledgment from --schema-compatible.
+bash "$ROLLBACK_SCRIPT" "$t11_live" --schema-compatible --override-stuck-activation > "${SANDBOX}/t11/rollback_override.log" 2>&1
+assert_true "rollback with --override-stuck-activation: logs that it is proceeding past the marker, not silently" \
+  "$(grep -q -- '--override-stuck-activation was passed' "${SANDBOX}/t11/rollback_override.log" && echo true || echo false)"
 # .previous-release is overwritten on every successful swap to whatever was
 # JUST live going into it -- by the time swap r5 ran, the concurrency
-# sub-test's slow r4 swap had already completed in the background and
-# become live, so r5's recorded previous release is release-4 (r2's own
-# directory, not merely r2's text, which r5 happens to also write).
-assert_eq "rollback with a STALE marker: content rolled back to whichever release was live before swap r5 (release-4, from the earlier concurrency sub-test's slow swap completing in the background)" \
+# sub-test's r4 swap had already completed and become live, so r5's
+# recorded previous release is release-4's own directory (not merely text
+# that happens to also read "release-2", which r5 itself writes).
+assert_eq "rollback with --override-stuck-activation: proceeds, content rolled back to whichever release was live before swap r5 (release-4)" \
   "release-4" "$(cat "$t11_live/marker.txt")"
+
+# ── Ordering proof: the lock is acquired BEFORE the marker is ever examined.
+# A marker present from an earlier swap must not "leak" a marker-refusal
+# (exit 6) when the real, more fundamental blocker is a concurrent deploy
+# still holding the lock -- lock contention (exit 3) must win outright.
+
+t11o_live="${SANDBOX}/t11o/grid_release"
+mkdir -p "$(dirname "$t11o_live")"
+mkdir -p "$t11o_live"
+echo "release-x" > "$t11o_live/marker.txt"
+
+t11o_hook="${SANDBOX}/t11o/build_ok.sh"
+cat > "$t11o_hook" << 'HOOK'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "release-y" > "$1/marker.txt"
+HOOK
+chmod +x "$t11o_hook"
+bash "$SWAP_SCRIPT" "$t11o_live" "y" "$t11o_hook" > "${SANDBOX}/t11o/swap1.log" 2>&1
+# Deliberately leave .activation-in-progress in place -- this test wants a
+# marker already present when the lock-contention check fires.
+assert_true "ordering setup: a marker is present before the contention test" \
+  "$([ -f "${t11o_live}.releases/.activation-in-progress" ] && echo true || echo false)"
+
+t11o_slow_hook="${SANDBOX}/t11o/build_slow.sh"
+cat > "$t11o_slow_hook" << 'HOOK'
+#!/usr/bin/env bash
+set -euo pipefail
+sleep 3
+echo "release-z" > "$1/marker.txt"
+HOOK
+chmod +x "$t11o_slow_hook"
+bash "$SWAP_SCRIPT" "$t11o_live" "z" "$t11o_slow_hook" > "${SANDBOX}/t11o/swap_slow.log" 2>&1 &
+t11o_slow_pid=$!
+sleep 1
+set +e
+DEPLOY_LOCK_WAIT_SECS=1 bash "$ROLLBACK_SCRIPT" "$t11o_live" --schema-compatible > "${SANDBOX}/t11o/rollback_ordering.log" 2>&1
+t11o_exit=$?
+set -e
+wait "$t11o_slow_pid"
+bash "$CLEAR_MARKER_SCRIPT" "$t11o_live" "z" > "${SANDBOX}/t11o/clear.log" 2>&1
+
+assert_eq "ordering: lock contention (exit 3) wins over a present marker -- the marker is only checked AFTER the lock is held" \
+  "3" "$t11o_exit"
+
+# ── Test 12: deploy_clear_activation_marker.sh ──────────────────────────────
+
+t12_live="${SANDBOX}/t12/grid_release"
+mkdir -p "$(dirname "$t12_live")"
+mkdir -p "$t12_live"
+echo "content" > "$t12_live/marker.txt"
+
+set +e
+bash "$CLEAR_MARKER_SCRIPT" "$t12_live" "some-label" > "${SANDBOX}/t12/clear_none.log" 2>&1
+t12_exit_none=$?
+set -e
+assert_eq "clear-marker with no marker present: exits 0 (nothing to do is not an error)" "0" "$t12_exit_none"
+
+t12_hook="${SANDBOX}/t12/build_ok.sh"
+cat > "$t12_hook" << 'HOOK'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "content-v2" > "$1/marker.txt"
+HOOK
+chmod +x "$t12_hook"
+bash "$SWAP_SCRIPT" "$t12_live" "labelA" "$t12_hook" > "${SANDBOX}/t12/swap.log" 2>&1
+assert_true "clear-marker setup: a marker exists after the swap" \
+  "$([ -f "${t12_live}.releases/.activation-in-progress" ] && echo true || echo false)"
+
+bash "$CLEAR_MARKER_SCRIPT" "$t12_live" "labelB-not-the-one-that-swapped" > "${SANDBOX}/t12/clear_wrong.log" 2>&1
+assert_true "clear-marker with the WRONG label: leaves the marker in place" \
+  "$([ -f "${t12_live}.releases/.activation-in-progress" ] && echo true || echo false)"
+assert_true "clear-marker with the wrong label: says so, doesn't silently do nothing" \
+  "$(grep -q 'belongs to a different deploy' "${SANDBOX}/t12/clear_wrong.log" && echo true || echo false)"
+
+bash "$CLEAR_MARKER_SCRIPT" "$t12_live" "labelA" > "${SANDBOX}/t12/clear_right.log" 2>&1
+assert_true "clear-marker with the RIGHT label: removes the marker" \
+  "$([ ! -f "${t12_live}.releases/.activation-in-progress" ] && echo true || echo false)"
 
 echo
 echo "=== ${pass_count} passed, ${fail_count} failed ==="

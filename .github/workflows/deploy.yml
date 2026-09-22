@@ -55,15 +55,20 @@ on:
         required: false
         default: false
 
-# Two runs targeting the same ref (a push immediately followed by another,
-# or a workflow_dispatch overlapping a push) must never build/migrate/swap
-# concurrently against the same $DEPLOY_PATH -- scripts/deploy_release_swap.sh
-# takes its own flock as a backstop, but queuing here is cheaper (no runner
+# Fixed group, deliberately NOT scoped by github.ref: $DEPLOY_PATH is one
+# single, fixed resource regardless of which ref triggers a run (a push to
+# main and a workflow_dispatch against some other ref would otherwise land
+# in different groups and queue separately -- while still eventually
+# serialized by scripts/deploy_release_swap.sh's own flock during the
+# build+swap phase, their unlocked marker-write/clear steps could still
+# clash; not worth the exposure when the fix is a fixed string). Two runs
+# must never build/migrate/swap concurrently against the same $DEPLOY_PATH
+# -- the flock is a backstop, but queuing here is cheaper (no runner
 # occupied waiting) and is the primary defense. cancel-in-progress stays
 # false: a deploy already mid-restart or mid-migration must run to
 # completion, never be killed partway.
 concurrency:
-  group: deploy-${{ github.ref }}
+  group: deploy-grid-release
   cancel-in-progress: false
 
 env:
@@ -934,17 +939,28 @@ jobs:
       # invoked mid-job would otherwise be free to swap the live path out
       # from under a restart or health check still in flight against it.
       # deploy_release_swap.sh writes .activation-in-progress on every
-      # successful swap specifically so the rollback script can refuse that
-      # race; clearing it here, as the LAST step of this job, `if: always()`
-      # so it runs regardless of which optional activation gates fired or
-      # failed above, is what tells that script this job's activation
-      # window is over. If the job is killed outright (not just a failed
-      # step), this step never runs and the marker is left stale -- handled
-      # by deploy_release_rollback.sh's own age-based staleness check, not
-      # here.
+      # successful swap specifically so the rollback script refuses that
+      # race outright (no auto-proceed on age -- an operator must pass
+      # --override-stuck-activation, a deliberate acknowledgment, never
+      # inferred from elapsed time). Clearing it here, as the LAST step of
+      # this job, `if: always()` so it runs regardless of which optional
+      # activation gates fired or failed above, is the ONLY thing that
+      # normally clears it -- this IS the "positively established
+      # deployment completion" signal the rollback script waits for.
+      # Label-scoped (via ${{ github.sha }}) so this only ever clears a
+      # marker THIS job's own swap wrote, never a later deploy's, even
+      # though the fixed concurrency group above should make that
+      # impossible in practice. If the job is killed outright (not just a
+      # failed step), this step never runs and the marker is left behind
+      # indefinitely -- deploy_release_rollback.sh does not time it out; an
+      # operator who has confirmed no deploy is actually running must pass
+      # --override-stuck-activation to proceed past it.
       - name: Clear activation-in-progress marker
         if: always()
-        run: rm -f "${DEPLOY_PATH}.releases/.activation-in-progress"
+        run: |
+          set -euo pipefail
+          chmod +x scripts/deploy_clear_activation_marker.sh
+          ./scripts/deploy_clear_activation_marker.sh "$DEPLOY_PATH" "${{ github.sha }}"
 
       - name: Notify success
         if: success()
