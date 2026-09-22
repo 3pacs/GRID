@@ -96,6 +96,7 @@ the real HTTP response body, without the ASGI/auth-dependency machinery.
 
 from __future__ import annotations
 
+import json
 import uuid
 
 import pytest
@@ -482,6 +483,38 @@ def test_intel_network_graph_stamps_source_and_the_column_name_fix_works(pg_engi
     node = nodes_by_id[actor_name.upper()]
     assert node["type"] == "actor"
     assert node["source"] == SOURCE_OBSERVED, "the query must have actually run (not silently failed) and stamped provenance"
+
+
+def test_intel_network_caps_total_nodes_to_bound_runaway_traversal(pg_engine: Engine, test_ids, monkeypatch):
+    """The column-name fix above means a hub actor's ``connections`` column
+    can now drive ``next_frontier`` growth for the first time -- before the
+    fix, the actor branch always failed and could never expand the frontier
+    at all, so growth was bounded in practice by ICIJ's much sparser
+    relationships. A well-connected actor's connections list can run far
+    denser than ICIJ leak data, and intel_network issues one sequential
+    query PER frontier name (not a single batched per-hop query, unlike
+    get_ego_graph) -- so this fix newly exposes a real unbounded-fan-out
+    risk. Proves the ``_MAX_NETWORK_NODES`` cap actually stops growth,
+    not just that it exists in source.
+    """
+    import api.routers.intel as intel_router
+
+    monkeypatch.setattr(intel_router, "get_db_engine", lambda: pg_engine)
+    monkeypatch.setattr(intel_router, "_MAX_NETWORK_NODES", 3)
+
+    hub_id = f"prov_router_pg_{uuid.uuid4().hex[:10]}_hub"
+    test_ids.append(hub_id)
+    fanout_names = [f"FANOUT_TARGET_{i}_{uuid.uuid4().hex[:6]}" for i in range(20)]
+    with pg_engine.begin() as conn:
+        _insert_actor(conn, actor_id=hub_id, name=f"Hub Actor {uuid.uuid4().hex[:6]}", provenance=PROVENANCE_OBSERVED)
+        conn.execute(text("UPDATE actors SET connections = CAST(:c AS jsonb) WHERE id = :id").bindparams(
+            c=json.dumps(fanout_names), id=hub_id,
+        ))
+
+    result = intel_router.intel_network(entity=hub_id, depth=3, _token="t")
+
+    assert len(result["data"]["nodes"]) <= 3, "node count must respect the _MAX_NETWORK_NODES cap, not fan out through all 20 connections"
+    assert result["meta"]["node_count"] <= 3
 
 
 # ── Cache-hit compatibility: GET /actor-network (30-minute TTLCache) ───────
