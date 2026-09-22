@@ -4,7 +4,7 @@
 # Keep this separate from GRID's hourly catch-up. AstroGrid has its own working
 # tree in production and its own model/backtest tables.
 
-set -u
+set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ASTROGRID_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
@@ -31,8 +31,12 @@ run_step() {
     local start_ts
     start_ts="$(date -Is)"
     echo "[$start_ts] START ${name}"
-    "$@"
-    local rc=$?
+    local rc=0
+    if "$@"; then
+        rc=0
+    else
+        rc=$?
+    fi
     local end_ts
     end_ts="$(date -Is)"
     if [[ ${rc} -eq 0 ]]; then
@@ -40,21 +44,34 @@ run_step() {
     else
         echo "[$end_ts] FAIL ${name} rc=${rc}"
     fi
-    return 0
+    return ${rc}
 }
 
-run_step "astrogrid_learning_loop_swing" \
+failures=0
+
+if ! run_step "astrogrid_learning_loop_swing" \
     "${PYTHON_BIN}" scripts/run_astrogrid_learning_loop.py \
     --provider-mode deterministic \
     --horizon swing \
     --score-limit "${ASTROGRID_SCORE_LIMIT:-500}" \
     --backtest-limit "${ASTROGRID_BACKTEST_LIMIT:-500}" \
-    --backtest-window-days "${ASTROGRID_BACKTEST_WINDOW_DAYS:-365}"
+    --backtest-window-days "${ASTROGRID_BACKTEST_WINDOW_DAYS:-365}"; then
+    failures=$((failures + 1))
+fi
 
-run_step "astrogrid_learning_loop_macro" \
+if ! run_step "astrogrid_learning_loop_macro" \
     "${PYTHON_BIN}" scripts/run_astrogrid_learning_loop.py \
     --provider-mode deterministic \
     --horizon macro \
     --score-limit "${ASTROGRID_SCORE_LIMIT:-500}" \
     --backtest-limit "${ASTROGRID_BACKTEST_LIMIT:-500}" \
-    --backtest-window-days "${ASTROGRID_BACKTEST_WINDOW_DAYS:-365}"
+    --backtest-window-days "${ASTROGRID_BACKTEST_WINDOW_DAYS:-365}"; then
+    failures=$((failures + 1))
+fi
+
+if [[ ${failures} -gt 0 ]]; then
+    echo "[$(date -Is)] FAIL astrogrid_hourly_catchup failures=${failures}"
+    exit 1
+fi
+
+echo "[$(date -Is)] OK astrogrid_hourly_catchup"
