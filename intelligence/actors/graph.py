@@ -23,6 +23,11 @@ from intelligence.actors.db import (
     _seed_known_actors,
 )
 from intelligence.actors.models import Actor
+from intelligence.actors.provenance import (
+    PROVENANCE_OBSERVED,
+    actor_source,
+    source_as_of,
+)
 
 # ── Sector inference ───────────────────────────────────────────────────────
 # Maps actor categories and keywords to user-facing sector labels.
@@ -205,6 +210,9 @@ def build_actor_graph(
                 data_sources=ins.get("data_sources", []),
                 credibility=ins.get("credibility", "hard_data"),
                 motivation_model=ins.get("motivation_model", "informed"),
+                # Resolved from signal_sources/trust_scorer, not from the
+                # curated seed table.
+                provenance=PROVENANCE_OBSERVED,
             )
 
     # Compute propagated influence
@@ -227,6 +235,13 @@ def build_actor_graph(
             "aum": actor.aum,
             "motivation": actor.motivation_model,
             "credibility": actor.credibility,
+            # Provenance: "curated_seed" for a row written from seed_data.py,
+            # "observed" for one written by an ingestion path. source_as_of
+            # carries the curation vintage (None when observed).
+            "source": actor_source(actor_id, actor.provenance),
+            "source_as_of": source_as_of(
+                actor_id, actor.provenance, actor.provenance_as_of
+            ),
             # D3 sizing: scale radius by influence
             "size": max(4, int(effective_influence * 30)),
         })

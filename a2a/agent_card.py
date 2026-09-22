@@ -6,6 +6,13 @@ capabilities, supported input/output modes, and authentication requirements.
 External agents discover GRID via this card (served at /.well-known/agent.json).
 
 Spec reference: Google A2A Protocol (Linux Foundation open standard).
+
+Entity counts do not belong in this document. It is a machine-readable
+capability descriptor consumed by third-party agents and it has no update
+path from ``SELECT COUNT(*) FROM actors`` or ``source_catalog``; the actor
+and data-source count literals it used to advertise were frozen at whatever
+those tables held on the day they were typed (audit D-M25). Skill
+descriptions state capabilities; the skills themselves report live counts.
 """
 
 from __future__ import annotations
@@ -128,9 +135,10 @@ def build_grid_agent_card(base_url: str) -> AgentCard:
             id="signal_analysis",
             name="Signal Analysis",
             description=(
-                "Analyze trading signals across 464+ data sources with "
-                "trust scoring, source auditing, and cross-reference "
-                "lie detection (government stats vs physical reality)."
+                "Analyze trading signals across GRID's registered data "
+                "sources with trust scoring, source auditing, and "
+                "cross-reference lie detection (government stats vs "
+                "physical reality)."
             ),
             tags=["signals", "analysis", "trust", "cross-reference"],
             examples=[
@@ -142,9 +150,11 @@ def build_grid_agent_card(base_url: str) -> AgentCard:
             id="actor_network",
             name="Actor Network Query",
             description=(
-                "Query the financial actor network — 495 named actors "
-                "with wealth flow tracking, congressional trades, "
-                "lobbying disclosure, and campaign finance mapping."
+                "Query the financial actor network — named actors with "
+                "wealth flow tracking, congressional trades, lobbying "
+                "disclosure, and campaign finance mapping. Every actor "
+                "node reports its own provenance (curated_seed vs "
+                "observed); call the actor_network skill for live counts."
             ),
             tags=["actors", "network", "intelligence", "flows"],
             examples=[
@@ -174,7 +184,7 @@ def build_grid_agent_card(base_url: str) -> AgentCard:
         name="GRID Trading Intelligence",
         description=(
             "Systematic multi-agent trading intelligence platform. "
-            "Ingests 464+ macro/market signals, performs regime detection, "
+            "Ingests macro/market signals, performs regime detection, "
             "generates scored predictions, and tracks actor networks."
         ),
         url=base_url,

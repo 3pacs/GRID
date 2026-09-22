@@ -15,6 +15,13 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from intelligence.actors.models import Actor
+from intelligence.actors.provenance import (
+    PROVENANCE_SEED,
+    SEED_VINTAGE,
+    SEED_VINTAGE_DATE,
+    SEED_VINTAGE_TS,
+    resolve_provenance,
+)
 from intelligence.actors.seed_data import _KNOWN_ACTORS
 
 
@@ -44,9 +51,21 @@ def _ensure_tables(engine: Engine) -> None:
                 data_sources    JSONB DEFAULT '[]',
                 credibility     TEXT DEFAULT 'inferred',
                 metadata        JSONB DEFAULT '{}',
+                provenance      TEXT NOT NULL DEFAULT 'observed',
+                provenance_as_of DATE,
                 updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """))
+        # Older databases predate the provenance columns. Mirrors alembic
+        # revision actors_provenance_20260917 so a table that already exists
+        # gains them without waiting for a migration run.
+        conn.execute(text(
+            "ALTER TABLE actors ADD COLUMN IF NOT EXISTS "
+            "provenance TEXT NOT NULL DEFAULT 'observed'"
+        ))
+        conn.execute(text(
+            "ALTER TABLE actors ADD COLUMN IF NOT EXISTS provenance_as_of DATE"
+        ))
         conn.execute(text("""
             CREATE INDEX IF NOT EXISTS idx_actors_tier
                 ON actors (tier)
@@ -82,6 +101,31 @@ def _ensure_tables(engine: Engine) -> None:
 def _seed_known_actors(engine: Engine) -> int:
     """Insert or update all _KNOWN_ACTORS into the actors table.
 
+    Every row written here is hand-curated content about a named real person
+    or organization, so each one is stamped ``provenance = 'seed'`` and
+    ``updated_at = SEED_VINTAGE_TS`` -- the date those figures were last
+    hand-edited, *not* ``NOW()``. Stamping wall-clock time made a net-worth
+    literal typed in months ago look like a reading taken this second
+    (audit A-H13).
+
+    ``provenance = 'seed'`` is a claim about current state, not permanent
+    origin (see ``migrations/versions/actors_provenance_20260917.py``'s
+    module docstring for the precise definition, including why a moved
+    ``updated_at`` alone is not proof of a real observation). A row already
+    stamped anything other than ``PROVENANCE_SEED`` -- ``'observed'``
+    (confirmed by ``save_actor``'s writer contract) or ``'unconfirmed'``
+    (touched by something else, not confirmed) -- must not be reset by a
+    later call here: that would either relabel genuinely-observed data as a
+    hand-typed guess, or paper over an unconfirmed modification by
+    reasserting "still pristine seed data" over it. Because
+    ``influence_score`` and the other seed-authored fields would otherwise
+    keep refreshing from ``_KNOWN_ACTORS`` on every call regardless of the
+    row's provenance -- silently overwriting genuinely observed or
+    unconfirmed-but-real values while the label claims something else -- the
+    ``ON CONFLICT ... WHERE`` clause below suppresses the *entire* update,
+    not just the provenance columns, unless the existing row is still
+    exactly ``'seed'``.
+
     Returns:
         Number of actors upserted.
     """
@@ -94,12 +138,14 @@ def _seed_known_actors(engine: Engine) -> int:
                     id, name, tier, category, title,
                     net_worth_estimate, aum, influence_score,
                     trust_score, motivation_model,
-                    data_sources, credibility, updated_at
+                    data_sources, credibility,
+                    provenance, provenance_as_of, updated_at
                 ) VALUES (
                     :id, :name, :tier, :category, :title,
                     :nw, :aum, :inf,
                     :trust, :motivation,
-                    :sources, :cred, NOW()
+                    :sources, :cred,
+                    :provenance, :vintage_date, :vintage_ts
                 )
                 ON CONFLICT (id) DO UPDATE SET
                     name = EXCLUDED.name,
@@ -112,7 +158,10 @@ def _seed_known_actors(engine: Engine) -> int:
                     motivation_model = EXCLUDED.motivation_model,
                     data_sources = EXCLUDED.data_sources,
                     credibility = EXCLUDED.credibility,
-                    updated_at = NOW()
+                    provenance = EXCLUDED.provenance,
+                    provenance_as_of = EXCLUDED.provenance_as_of,
+                    updated_at = EXCLUDED.updated_at
+                WHERE actors.provenance = :seed
             """), {
                 "id": actor_id,
                 "name": data["name"],
@@ -126,13 +175,33 @@ def _seed_known_actors(engine: Engine) -> int:
                 "motivation": data.get("motivation_model", "unknown"),
                 "sources": json.dumps(data.get("data_sources", [])),
                 "cred": data.get("credibility", "inferred"),
+                "provenance": PROVENANCE_SEED,
+                "vintage_date": SEED_VINTAGE_DATE,
+                "vintage_ts": SEED_VINTAGE_TS,
+                "seed": PROVENANCE_SEED,
             })
             count += 1
-    log.info("Seeded {n} actors into the database", n=count)
+    log.info(
+        "Seeded {n} actors into the database (provenance=seed, as_of={v})",
+        n=count, v=SEED_VINTAGE,
+    )
     return count
 
 
 _ICIJ_CATEGORIES = frozenset({"icij_entity", "icij_officer", "icij_intermediary"})
+
+# Column list for _load_actors_from_db. The provenance pair is appended last
+# so the legacy variant is a strict prefix: a database that predates alembic
+# revision actors_provenance_20260917 (and never ran _ensure_tables) still
+# loads, and provenance falls back to seed-set membership.
+_ACTOR_COLUMNS = (
+    "id, name, tier, category, title, "
+    "net_worth_estimate, aum, influence_score, "
+    "trust_score, motivation_model, "
+    "connections, known_positions, board_seats, "
+    "political_affiliations, data_sources, credibility"
+)
+_ACTOR_COLUMNS_WITH_PROVENANCE = _ACTOR_COLUMNS + ", provenance, provenance_as_of"
 
 
 def _load_actors_from_db(
@@ -153,31 +222,10 @@ def _load_actors_from_db(
     actors: dict[str, Actor] = {}
     try:
         with engine.connect() as conn:
-            if exclude_categories:
-                query = text("""
-                    SELECT id, name, tier, category, title,
-                           net_worth_estimate, aum, influence_score,
-                           trust_score, motivation_model,
-                           connections, known_positions, board_seats,
-                           political_affiliations, data_sources, credibility
-                    FROM actors
-                    WHERE category != ALL(:excluded)
-                    ORDER BY influence_score DESC
-                """)
-                rows = conn.execute(
-                    query, {"excluded": list(exclude_categories)}
-                ).fetchall()
-            else:
-                rows = conn.execute(text("""
-                    SELECT id, name, tier, category, title,
-                           net_worth_estimate, aum, influence_score,
-                           trust_score, motivation_model,
-                           connections, known_positions, board_seats,
-                           political_affiliations, data_sources, credibility
-                    FROM actors
-                    ORDER BY influence_score DESC
-                """)).fetchall()
+            rows = _fetch_actor_rows(conn, exclude_categories)
             for r in rows:
+                stored_provenance = r[16] if len(r) > 16 else None
+                stored_vintage = r[17] if len(r) > 17 else None
                 actors[r[0]] = Actor(
                     id=r[0],
                     name=r[1],
@@ -195,10 +243,50 @@ def _load_actors_from_db(
                     political_affiliations=_parse_jsonb(r[13]),
                     data_sources=_parse_jsonb(r[14]),
                     credibility=r[15] or "inferred",
+                    provenance=resolve_provenance(r[0], stored_provenance),
+                    provenance_as_of=(
+                        str(stored_vintage) if stored_vintage else None
+                    ),
                 )
     except Exception as exc:
         log.warning("Failed to load actors from DB: {e}", e=str(exc))
     return actors
+
+
+def _fetch_actor_rows(conn: Any, exclude_categories: frozenset[str] | None) -> list:
+    """Select actor rows, degrading to the pre-provenance column list.
+
+    A database that has not yet run alembic revision
+    ``actors_provenance_20260917`` has no ``provenance`` column; rather than
+    failing the whole load (which would look like an empty actors table and
+    re-trigger the seeder), fall back to the legacy columns and let
+    ``resolve_provenance`` derive the label from seed-set membership.
+    """
+    where = "WHERE category != ALL(:excluded) " if exclude_categories else ""
+    params = {"excluded": list(exclude_categories)} if exclude_categories else {}
+    for columns in (_ACTOR_COLUMNS_WITH_PROVENANCE, _ACTOR_COLUMNS):
+        query = text(
+            f"SELECT {columns} FROM actors {where}ORDER BY influence_score DESC"
+        )
+        try:
+            return conn.execute(query, params).fetchall()
+        except Exception as exc:
+            if columns is _ACTOR_COLUMNS:
+                raise
+            log.debug(
+                "actors.provenance unavailable, using legacy columns: {e}",
+                e=str(exc),
+            )
+            _rollback_quietly(conn)
+    return []
+
+
+def _rollback_quietly(conn: Any) -> None:
+    """Roll back a failed probe so the connection can be reused."""
+    try:
+        conn.rollback()
+    except Exception as exc:  # pragma: no cover - connection already clean
+        log.debug("rollback after column probe failed: {e}", e=str(exc))
 
 
 def _parse_jsonb(val: Any) -> list:

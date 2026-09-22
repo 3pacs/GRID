@@ -21,6 +21,7 @@ from sqlalchemy import text
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from intelligence.actors.provenance import actor_source, source_as_of
 
 router = APIRouter(prefix="/api/v1/intel", tags=["intel-product"])
 
@@ -177,7 +178,7 @@ def intel_search(
                 rows = conn.execute(
                     text(
                         "SELECT id, name, tier, category, aum, trust_score, "
-                        "credibility "
+                        "credibility, provenance, provenance_as_of "
                         "FROM actors "
                         "WHERE UPPER(name) LIKE UPPER(:q) "
                         "   OR UPPER(id) LIKE UPPER(:q) "
@@ -195,7 +196,11 @@ def intel_search(
                         "sector": r[3],
                         "aum_usd": r[4],
                         "trust_score": r[5],
-                        "confidence": r[6] or "derived",
+                        # The row's own provenance column. A NULL is unknown,
+                        # not "derived" (A-M11).
+                        "source_class": r[6] or "unknown",
+                        "source": actor_source(r[0], r[7]),
+                        "source_as_of": source_as_of(r[0], r[7], r[8]),
                     })
             except Exception as exc:
                 log.debug("Actor search skipped: {e}", e=str(exc))
@@ -234,7 +239,7 @@ def intel_search(
                         "source_dataset": r[2],
                         "linked_to": r[3],
                         "relationship_type": r[4],
-                        "confidence": "confirmed",  # ICIJ is primary source
+                        "source_class": "icij_offshore_leaks",
                     })
             except Exception as exc:
                 log.debug("Entity search skipped: {e}", e=str(exc))
@@ -271,7 +276,7 @@ def intel_search(
                         "confidence": float(r[3]) if r[3] else None,
                         "verdict": r[4],
                         "created_at": _safe_isoformat(r[5]),
-                        "confidence_label": "derived",
+                        "source_class": "oracle_predictions",
                     })
             except Exception as exc:
                 log.debug("Ticker search skipped: {e}", e=str(exc))
@@ -318,7 +323,7 @@ def intel_entity_profile(
         "trust_score": None,
         "wealth_estimate": None,
         "red_flags": [],
-        "confidence": "derived",
+        "source_class": "aggregate_of_sections",
     }
 
     with engine.connect() as conn:
@@ -344,7 +349,7 @@ def intel_entity_profile(
                     "source_dataset": r[4],
                     "intermediary": r[5],
                     "status": r[6],
-                    "confidence": "confirmed",
+                    "source_class": "icij_offshore_leaks",
                 })
         except Exception as exc:
             log.debug("ICIJ lookup skipped for {n}: {e}", n=name, e=str(exc))
@@ -353,7 +358,8 @@ def intel_entity_profile(
         try:
             rows = conn.execute(
                 text(
-                    "SELECT id, name, tier, category, aum, trust_score "
+                    "SELECT id, name, tier, category, aum, trust_score, "
+                    "provenance, provenance_as_of "
                     "FROM actors "
                     "WHERE UPPER(name) LIKE UPPER(:q) "
                     "   OR connections::text ILIKE :q2"
@@ -368,7 +374,9 @@ def intel_entity_profile(
                     "sector": r[3],
                     "aum_usd": r[4],
                     "trust_score": r[5],
-                    "confidence": "derived",
+                    "source_class": "actors_table_name_match",
+                    "source": actor_source(r[0], r[6]),
+                    "source_as_of": source_as_of(r[0], r[6], r[7]),
                 })
         except Exception as exc:
             log.debug("Actor lookup skipped for {n}: {e}", n=name, e=str(exc))
@@ -382,7 +390,7 @@ def intel_entity_profile(
                 "detail": f"Entity appears in {len(jurisdictions)} jurisdictions: "
                           f"{', '.join(sorted(jurisdictions))}",
                 "severity": "high",
-                "confidence": "confirmed",
+                "source_class": "rule:multi_jurisdiction_count",
             })
         intermediaries = [c for c in offshore if c.get("intermediary")]
         if len(intermediaries) >= 2:
@@ -390,7 +398,7 @@ def intel_entity_profile(
                 "flag": "intermediary_chain",
                 "detail": f"{len(intermediaries)} intermediary relationships detected",
                 "severity": "medium",
-                "confidence": "confirmed",
+                "source_class": "rule:intermediary_chain_count",
             })
 
     if not entity["offshore_connections"] and not entity["connected_actors"]:
@@ -424,7 +432,12 @@ def intel_actor_dossier(
         "trust_history": [],
         "connected_entities": [],
         "sector_influence": [],
-        "confidence": "derived",
+        "source_class": "aggregate_of_sections",
+        # Provenance of the identity row: "curated_seed" when the actor came
+        # from the hand-curated seed table, "observed" otherwise. None until
+        # an identity row is found.
+        "source": None,
+        "source_as_of": None,
     }
 
     with engine.connect() as conn:
@@ -433,7 +446,8 @@ def intel_actor_dossier(
             row = conn.execute(
                 text(
                     "SELECT id, name, tier, category, aum, trust_score, "
-                    "motivation_model, connections, credibility, known_positions "
+                    "motivation_model, connections, credibility, known_positions, "
+                    "provenance, provenance_as_of "
                     "FROM actors "
                     "WHERE UPPER(name) = UPPER(:n) "
                     "   OR UPPER(id) = UPPER(:n) "
@@ -451,9 +465,13 @@ def intel_actor_dossier(
                     "trust_score": row[5],
                     "motivation": row[6],
                     "connections": _safe_json(row[7]),
-                    "confidence": row[8] or "derived",
+                    "source_class": row[8] or "unknown",
                     "known_positions": _safe_json(row[9]),
+                    "source": actor_source(row[0], row[10]),
+                    "source_as_of": source_as_of(row[0], row[10], row[11]),
                 }
+                dossier["source"] = dossier["identity"]["source"]
+                dossier["source_as_of"] = dossier["identity"]["source_as_of"]
         except Exception as exc:
             log.debug("Actor identity lookup failed: {e}", e=str(exc))
 
@@ -478,7 +496,7 @@ def intel_actor_dossier(
                     "to": r[2],
                     "amount_usd": r[3],
                     "implication": r[4],
-                    "confidence": r[5] or "estimated",
+                    "source_class": r[5] or "unknown",
                 })
         except Exception as exc:
             log.debug("Wealth flows lookup failed: {e}", e=str(exc))
@@ -505,7 +523,7 @@ def intel_actor_dossier(
                     "misses": r[4],
                     "total_signals": r[5],
                     "recency_weighted": r[6],
-                    "confidence": "confirmed",
+                    "source_class": "actor_trust_history",
                 })
         except Exception as exc:
             log.debug("Trust score history lookup failed: {e}", e=str(exc))
@@ -531,7 +549,7 @@ def intel_actor_dossier(
                     "relationship": r[2],
                     "jurisdiction": r[3],
                     "source": r[4],
-                    "confidence": "confirmed",
+                    "source_class": "icij_offshore_leaks",
                 })
         except Exception as exc:
             log.debug("ICIJ entity lookup failed: {e}", e=str(exc))
@@ -606,7 +624,7 @@ def intel_ticker(
                     "created_at": _safe_isoformat(r[9]),
                     "signals": _safe_json(r[10]),
                     "anti_signals": _safe_json(r[11]),
-                    "confidence_label": "derived",
+                    "source_class": "oracle_predictions",
                 })
         except Exception as exc:
             log.debug("Predictions lookup failed for {t}: {e}", t=ticker, e=str(exc))
@@ -634,7 +652,7 @@ def intel_ticker(
                     "raw_value": r[5],
                     "confidence": float(r[6]) if r[6] else None,
                     "source_name": r[7],
-                    "confidence_label": "confirmed",
+                    "source_class": "signal_data",
                 })
         except Exception as exc:
             log.debug("Signal lookup failed for {t}: {e}", t=ticker, e=str(exc))
@@ -669,7 +687,7 @@ def intel_ticker(
                     "sector": r[3],
                     "aum_usd": r[4],
                     "position": ticker_position,
-                    "confidence": "derived",
+                    "source_class": "actors_table_positions_json",
                 })
         except Exception as exc:
             log.debug("Actor exposure lookup failed for {t}: {e}", t=ticker, e=str(exc))
@@ -696,7 +714,7 @@ def intel_ticker(
                     "magnitude": float(r[3]) if r[3] else None,
                     "value": r[4],
                     "confidence": float(r[5]) if r[5] else None,
-                    "confidence_label": "confirmed",
+                    "source_class": "signal_data:insider",
                 })
         except Exception as exc:
             log.debug("Insider lookup failed for {t}: {e}", t=ticker, e=str(exc))
@@ -720,7 +738,7 @@ def intel_ticker(
                     "magnitude": float(r[1]) if r[1] else None,
                     "value": r[2],
                     "confidence": float(r[3]) if r[3] else None,
-                    "confidence_label": "confirmed",
+                    "source_class": "signal_data:darkpool",
                 })
         except Exception as exc:
             log.debug("Dark pool lookup failed for {t}: {e}", t=ticker, e=str(exc))
@@ -748,7 +766,7 @@ def intel_ticker(
                     "magnitude": float(r[3]) if r[3] else None,
                     "value": r[4],
                     "confidence": float(r[5]) if r[5] else None,
-                    "confidence_label": "derived",
+                    "source_class": "signal_data:options_flow",
                 })
         except Exception as exc:
             log.debug("Options flow lookup failed for {t}: {e}", t=ticker, e=str(exc))
@@ -770,7 +788,7 @@ def intel_ticker(
                     "date": _safe_isoformat(row[0]),
                     "value": _safe_json(row[1]),
                     "confidence": float(row[2]) if row[2] else None,
-                    "confidence_label": "derived",
+                    "source_class": "dealer_gamma",
                 }
         except Exception as exc:
             log.debug("Dealer gamma lookup failed for {t}: {e}", t=ticker, e=str(exc))
@@ -795,7 +813,7 @@ def intel_ticker(
                               or payload.get("regime")
                               or payload.get("current_regime"),
                         "snapshot_at": _safe_isoformat(row[1]),
-                        "confidence_label": "derived",
+                        "source_class": "analytical_snapshots:regime",
                     }
         except Exception as exc:
             log.debug("Regime lookup failed: {e}", e=str(exc))
@@ -842,7 +860,7 @@ async def intel_cross_reference(
             if indicator.lower() in item_name.lower():
                 matches.append({
                     **item,
-                    "confidence": item.get("confidence_label", "derived"),
+                    "source_class": item.get("source_class", "unknown"),
                 })
 
         if not matches:
@@ -852,7 +870,7 @@ async def intel_cross_reference(
                     "indicator": indicator,
                     "message": "No exact match. Returning full cross-reference report.",
                     "report": report,
-                    "confidence": "derived",
+                    "source_class": "cross_reference_report",
                 },
                 meta={"indicator": indicator},
                 tier_required=Tier.PRO,
@@ -921,7 +939,7 @@ async def intel_deep_dive(
                         "estimated_bps": c.estimated_bps,
                         "confidence": c.confidence,
                         "date": _safe_isoformat(c.event_date),
-                        "confidence_label": "derived",
+                        "source_class": "attribution_engine:catalyst",
                     }
                     for c in report.top_catalysts
                 ],
@@ -940,7 +958,7 @@ async def intel_deep_dive(
                                 "type": c.catalyst_type,
                                 "bps": c.estimated_bps,
                                 "direction": c.direction,
-                                "confidence_label": "derived",
+                                "source_class": "attribution_engine:catalyst",
                             }
                             for c in a.catalysts[:5]
                         ],
@@ -956,13 +974,13 @@ async def intel_deep_dive(
                         "magnitude_bps": e.expected_magnitude_bps,
                         "baked_in_pct": e.baked_in_pct,
                         "deadline": _safe_isoformat(e.deadline),
-                        "confidence_label": "estimated",
+                        "source_class": "attribution_engine:active_expectation",
                     }
                     for e in report.active_expectations
                 ],
                 "narrative": report.narrative,
                 "confidence": report.confidence,
-                "confidence_label": "derived",
+                "source_class": "attribution_engine:report",
             },
             meta={"ticker": ticker, "lookback_days": days},
             tier_required=Tier.ENTERPRISE,
@@ -1012,7 +1030,7 @@ def intel_network(
                         "id": name,
                         "type": "unknown",
                         "hop": hop,
-                        "confidence": "derived",
+                        "source_class": "network_walk:unresolved_node",
                     }
 
                 # ICIJ relationships
@@ -1037,7 +1055,7 @@ def intel_network(
                             "jurisdiction": r[3],
                             "dataset": r[4],
                             "hop": hop,
-                            "confidence": "confirmed",
+                            "source_class": "icij_offshore_leaks",
                         })
                         for n in (src, tgt):
                             if n not in visited:
@@ -1047,7 +1065,7 @@ def intel_network(
                                     "id": n,
                                     "type": "entity",
                                     "hop": hop + 1,
-                                    "confidence": "confirmed",
+                                    "source_class": "icij_offshore_leaks",
                                 }
                 except Exception as exc:
                     log.debug(
@@ -1075,7 +1093,7 @@ def intel_network(
                                 "tier": r[2],
                                 "sector": r[3],
                                 "hop": hop,
-                                "confidence": "derived",
+                                "source_class": "actor_connections",
                             }
                         # Parse connections to find adjacent nodes
                         connections = _safe_json(r[4])
@@ -1088,7 +1106,7 @@ def intel_network(
                                         "target": cn,
                                         "relationship": "connected",
                                         "hop": hop,
-                                        "confidence": "derived",
+                                        "source_class": "actors.connections_json",
                                     })
                                     if cn not in visited:
                                         next_frontier.add(cn)
@@ -1105,7 +1123,7 @@ def intel_network(
                                                 "relationship", "connected"
                                             ),
                                             "hop": hop,
-                                            "confidence": "derived",
+                                            "source_class": "actors.connections_json",
                                         })
                                         if cn not in visited:
                                             next_frontier.add(cn)
@@ -1197,7 +1215,7 @@ def intel_market_brief(
                               or payload.get("regime")
                               or payload.get("current_regime"),
                         "updated_at": _safe_isoformat(row[1]),
-                        "confidence_label": "derived",
+                        "source_class": "analytical_snapshots:regime",
                     }
         except Exception as exc:
             log.debug("Regime lookup failed: {e}", e=str(exc))
@@ -1225,7 +1243,7 @@ def intel_market_brief(
                     "magnitude": float(r[5]) if r[5] else None,
                     "confidence": float(r[6]) if r[6] else None,
                     "source": r[7],
-                    "confidence_label": "confirmed",
+                    "source_class": "signal_data",
                 })
         except Exception as exc:
             log.debug("Top signals lookup failed: {e}", e=str(exc))
@@ -1254,7 +1272,7 @@ def intel_market_brief(
                     "entry_price": float(r[6]) if r[6] else None,
                     "expiry": _safe_isoformat(r[7]),
                     "created_at": _safe_isoformat(r[8]),
-                    "confidence_label": "derived",
+                    "source_class": "oracle_predictions",
                 })
         except Exception as exc:
             log.debug("Active predictions lookup failed: {e}", e=str(exc))
@@ -1279,7 +1297,7 @@ def intel_market_brief(
                     "to": r[2],
                     "amount_usd": r[3],
                     "implication": r[4],
-                    "confidence": r[5] or "estimated",
+                    "source_class": r[5] or "unknown",
                 })
         except Exception as exc:
             log.debug("Wealth flows lookup failed: {e}", e=str(exc))
@@ -1303,7 +1321,7 @@ def intel_market_brief(
                     "active_predictions": stats_row[0],
                     "signals_7d": stats_row[1],
                     "tickers_active": stats_row[2],
-                    "confidence_label": "confirmed",
+                    "source_class": "aggregate_counts",
                 }
         except Exception as exc:
             log.debug("Summary stats failed: {e}", e=str(exc))
@@ -1412,7 +1430,7 @@ def intel_predictions_active(
                     "anti_signals": anti_signals,
                     "flow_context": flow_context,
                     "days_remaining": (r[7] - today).days if r[7] else None,
-                    "confidence_label": "derived",
+                    "source_class": "oracle_predictions",
                 })
         except Exception as exc:
             log.warning("Active predictions query failed: {e}", e=str(exc))
@@ -1581,7 +1599,7 @@ def intel_predictions_track_record(
                     "avg_confidence": round(float(row[5]), 4) if row[5] else None,
                     "first_scored": _safe_isoformat(row[6]),
                     "last_scored": _safe_isoformat(row[7]),
-                    "confidence_label": "confirmed",
+                    "source_class": "oracle_predictions:scored",
                 }
 
             # By model
@@ -1597,7 +1615,7 @@ def intel_predictions_track_record(
                     "hit_rate": round(h_count / t_count, 4) if t_count else 0,
                     "avg_pnl_pct": round(float(r[4]), 2) if r[4] else None,
                     "avg_confidence": round(float(r[5]), 4) if r[5] else None,
-                    "confidence_label": "confirmed",
+                    "source_class": "oracle_predictions:scored",
                 })
 
             # By ticker (top 20)
@@ -1612,7 +1630,7 @@ def intel_predictions_track_record(
                     "misses": r[3],
                     "hit_rate": round(h_count / t_count, 4) if t_count else 0,
                     "avg_pnl_pct": round(float(r[4]), 2) if r[4] else None,
-                    "confidence_label": "confirmed",
+                    "source_class": "oracle_predictions:scored",
                 })
 
             # By direction
@@ -1626,7 +1644,7 @@ def intel_predictions_track_record(
                     "hits": h_count,
                     "hit_rate": round(h_count / t_count, 4) if t_count else 0,
                     "avg_pnl_pct": round(float(r[3]), 2) if r[3] else None,
-                    "confidence_label": "confirmed",
+                    "source_class": "oracle_predictions:scored",
                 })
 
             # Recent results (last 20 scored)
@@ -1643,7 +1661,7 @@ def intel_predictions_track_record(
                     "actual_move_pct": round(float(r[7]), 2) if r[7] else None,
                     "scored_at": _safe_isoformat(r[8]),
                     "notes": r[9],
-                    "confidence_label": "confirmed",
+                    "source_class": "oracle_predictions:scored",
                 })
 
             # Calibration: confidence bucket vs actual hit rate
@@ -1660,7 +1678,7 @@ def intel_predictions_track_record(
                     "stated_confidence": round(stated, 4),
                     "actual_hit_rate": round(actual, 4),
                     "calibration_error": round(abs(stated - actual), 4),
-                    "confidence_label": "confirmed",
+                    "source_class": "oracle_predictions:scored",
                 })
 
         except Exception as exc:
@@ -1764,7 +1782,7 @@ def intel_briefing(
                     "confidence": float(row[1]) if row[1] else None,
                     "as_of": _safe_isoformat(row[2]),
                     "source": row[3],
-                    "confidence_label": "derived",
+                    "source_class": "analytical_snapshots:regime",
                 }
         except Exception as exc:
             log.debug("Intel briefing: regime query failed: {e}", e=str(exc))
@@ -1784,7 +1802,7 @@ def intel_briefing(
                     "key_drivers": _safe_json(row[3]),
                     "risk_factors": _safe_json(row[4]),
                     "generated_at": _safe_isoformat(row[5]),
-                    "confidence_label": "derived",
+                    "source_class": "thesis_snapshots",
                 }
         except Exception as exc:
             log.debug("Intel briefing: thesis query failed: {e}", e=str(exc))
@@ -1856,7 +1874,10 @@ def intel_briefing(
                     "influence_rank": puller.get("influence_rank"),
                     "confidence": evt_dict.get("confidence"),
                     "invalidation": f"Reversed if {puller.get('name', 'actor')} closes position within 5 days",
-                    "confidence_label": "confirmed" if evt_dict.get("confidence", 0) > 0.7 else "derived",
+                    # A-M12: a model confidence over an arbitrary 0.7 threshold is not
+                    # source confirmation. The numeric confidence is already on this
+                    # row; the branch that produced it is named instead.
+                    "source_class": "lever_events",
                 })
         except ImportError:
             # Fallback: raw signal_data query if intelligence modules not available
@@ -1873,7 +1894,7 @@ def intel_briefing(
                         "tickers": [r[1]] if r[1] else [],
                         "action": r[2],
                         "confidence": float(r[3]) if r[3] else None,
-                        "confidence_label": "confirmed",
+                        "source_class": "signal_data",
                     })
             except Exception as exc:
                 log.debug("Intel briefing: signal_data actor fallback failed: {e}", e=str(exc))
@@ -1901,7 +1922,7 @@ def intel_briefing(
                     "narrative": r[7],
                     "confidence": float(r[8]) if r[8] else None,
                     "created_at": _safe_isoformat(r[9]),
-                    "confidence_label": "derived",
+                    "source_class": "causal_chains",
                 })
         except Exception as exc:
             log.debug("Intel briefing: causal chains query failed: {e}", e=str(exc))
@@ -1949,7 +1970,7 @@ def intel_briefing(
                     "avg_source_trust": avg_trust,
                     "total_signals": int(r[5]),
                     "invalidation": f"Drops below {r[1]-1} confirming sources or avg trust < 0.5",
-                    "confidence_label": "derived",
+                    "source_class": "signal_data+signal_sources",
                 })
         except Exception as exc:
             log.debug("Intel briefing: trust-weighted convergence failed, trying unweighted: {e}", e=str(exc))
@@ -1980,7 +2001,7 @@ def intel_briefing(
                         "avg_source_trust": None,
                         "total_signals": int(r[5]),
                         "invalidation": f"Drops below {r[1]-1} confirming sources",
-                        "confidence_label": "derived",
+                        "source_class": "signal_data",
                     })
             except Exception as exc:
                 log.debug("Intel briefing: unweighted convergence fallback also failed: {e}", e=str(exc))
@@ -2008,7 +2029,7 @@ def intel_briefing(
                     "assessment": r[7],
                     "implication": r[8],
                     "invalidation": "Flag clears when z-score drops below 2.0",
-                    "confidence_label": "confirmed",
+                    "source_class": "cross_reference_flags",
                 })
         except Exception as exc:
             log.debug("Intel briefing: cross-reference red flags query failed: {e}", e=str(exc))
@@ -2042,7 +2063,7 @@ def intel_briefing(
                         "Score drops below 4.0 or IV normalizes above 50th pct"
                         + (f" or {r[0]} moves >5% against {r[3]} before {expiry_str}" if expiry_str else "")
                     ),
-                    "confidence_label": "derived",
+                    "source_class": "options_mispricing_scan",
                 })
         except Exception as exc:
             log.debug("Intel briefing: options mispricing query failed: {e}", e=str(exc))
@@ -2103,7 +2124,7 @@ def intel_briefing(
                         "entry_price": float(r[6]) if r[6] else None,
                         "expiry": _safe_isoformat(r[7]),
                         "created_at": _safe_isoformat(r[8]),
-                        "confidence_label": "derived",
+                        "source_class": "oracle_predictions:scored",
                     }
                     tr = track_map.get((r[2], r[1]))
                     if tr:
@@ -2131,7 +2152,7 @@ def intel_briefing(
                     "partials": int(row[3]),
                     "hit_rate": round(int(row[1]) / int(row[0]), 3),
                     "avg_pnl_pct": round(float(row[4]), 2) if row[4] else None,
-                    "confidence_label": "confirmed",
+                    "source_class": "oracle_predictions:scored",
                 }
         except Exception as exc:
             log.debug("Intel briefing: overall track record query failed: {e}", e=str(exc))
@@ -2158,7 +2179,7 @@ def intel_briefing(
                     "evidence": _safe_json(r[5]),
                     "implication": r[6],
                     "actor_trust_score": round(float(r[7]), 3) if r[7] else None,
-                    "confidence_label": r[4] or "estimated",
+                    "source_class": r[4] or "unknown",
                 })
         except Exception:
             # Fallback without trust join
@@ -2180,7 +2201,7 @@ def intel_briefing(
                         "evidence": _safe_json(r[5]),
                         "implication": r[6],
                         "actor_trust_score": None,
-                        "confidence_label": r[4] or "estimated",
+                        "source_class": r[4] or "unknown",
                     })
             except Exception as exc:
                 log.debug("Intel briefing: notable flows unjoined fallback failed: {e}", e=str(exc))
