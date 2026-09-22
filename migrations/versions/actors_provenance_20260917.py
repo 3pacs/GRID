@@ -41,10 +41,38 @@ when ``actors`` comes back *empty* and would therefore never re-stamp them.
 No index is added: neither column is a filter in any query today (the API
 resolves provenance in Python), and an index on a two-value column over a
 table this size would not be used.
+
+Precise meaning of ``provenance = 'seed'``
+-------------------------------------------
+This is a claim about the row's *current* state, not a permanent record of
+where the row was first created: "as of this read, nothing has confirmed or
+updated this row since it was hand-typed." Seed-list membership is therefore
+**not sufficient on its own** to backfill a row -- an id can be in
+``_KNOWN_ACTORS`` and still have been touched since by a real observed
+writer (``intelligence.actors.db.save_actor``, the spider), which upserts by
+the same ``id`` on purpose so live data merges onto a seeded skeleton. The
+backfill additionally requires ``updated_at <= SEED_VINTAGE_TS``: a row the
+real seeder created and nothing has touched since carries exactly
+``SEED_VINTAGE_TS`` (a fixed historical constant, never ``NOW()`` -- see
+``_seed_known_actors``); any later write moves ``updated_at`` forward and the
+row is excluded, keeping whatever ``provenance`` it already has (the
+``'observed'`` default from this same revision's ``ADD COLUMN``, for a row
+that has never had anything explicitly mark it otherwise). This is the only
+freshness signal available at backfill time, because the ``provenance``
+column itself does not exist until the two ``ADD COLUMN`` statements just
+above run -- there is no prior stored value to consult instead.
+
+Callers that label an actor node without selecting the stored ``provenance``
+column (see ``intelligence/actors/provenance.py``'s "Resolution order") fall
+back to bare ``SEED_ACTOR_IDS`` membership, which cannot see this same
+distinction. That is a pre-existing, documented, and separately tested
+degradation for those call sites (they do not have the row in hand to check),
+not something this revision changes or is able to fix from a migration.
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Sequence, Union
 
 from alembic import op
@@ -62,10 +90,26 @@ depends_on: Union[str, Sequence[str], None] = None
 PROVENANCE_SEED = "seed"
 PROVENANCE_OBSERVED = "observed"
 SEED_VINTAGE = "2026-04-07"
+SEED_VINTAGE_TS = datetime(2026, 4, 7, tzinfo=timezone.utc)
+
+# SET LOCAL: scoped to this migration's own transaction only -- see
+# oracle_pred_nullable_0918 for the precedent this follows. lock_timeout
+# short (fail fast rather than block every other statement queued behind an
+# ACCESS EXCLUSIVE wait on `actors`, a table the live API reads and writes);
+# statement_timeout generous (the ADD COLUMNs are catalog-only and the
+# backfill UPDATE covers at most len(_KNOWN_ACTORS) rows by primary key).
+_LOCK_TIMEOUT = "5s"
+_STATEMENT_TIMEOUT = "30s"
+
+
+def _set_finite_timeouts() -> None:
+    op.execute(f"SET LOCAL lock_timeout = '{_LOCK_TIMEOUT}'")
+    op.execute(f"SET LOCAL statement_timeout = '{_STATEMENT_TIMEOUT}'")
 
 
 def upgrade() -> None:
     conn = op.get_bind()
+    _set_finite_timeouts()
     conn.execute(text(
         "ALTER TABLE actors "
         "ADD COLUMN IF NOT EXISTS provenance TEXT NOT NULL "
@@ -85,10 +129,12 @@ def upgrade() -> None:
             "UPDATE actors "
             "   SET provenance = :seed, provenance_as_of = :vintage "
             " WHERE id = ANY(:ids) "
-            "   AND provenance IS DISTINCT FROM :seed"
+            "   AND provenance IS DISTINCT FROM :seed "
+            "   AND updated_at <= :seed_ts"
         ), {
             "seed": PROVENANCE_SEED,
             "vintage": SEED_VINTAGE,
+            "seed_ts": SEED_VINTAGE_TS,
             "ids": seed_ids[start:start + 500],
         })
 
@@ -108,5 +154,6 @@ def _seed_actor_ids() -> list[str]:
 
 def downgrade() -> None:
     conn = op.get_bind()
+    _set_finite_timeouts()
     conn.execute(text("ALTER TABLE actors DROP COLUMN IF EXISTS provenance_as_of"))
     conn.execute(text("ALTER TABLE actors DROP COLUMN IF EXISTS provenance"))

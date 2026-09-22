@@ -16,6 +16,7 @@ from sqlalchemy.engine import Engine
 
 from intelligence.actors.models import Actor
 from intelligence.actors.provenance import (
+    PROVENANCE_OBSERVED,
     PROVENANCE_SEED,
     SEED_VINTAGE,
     SEED_VINTAGE_DATE,
@@ -108,6 +109,19 @@ def _seed_known_actors(engine: Engine) -> int:
     literal typed in months ago look like a reading taken this second
     (audit A-H13).
 
+    ``provenance = 'seed'`` is a claim about current state, not permanent
+    origin (see ``migrations/versions/actors_provenance_20260917.py``'s
+    module docstring for the precise definition). A row already stamped
+    ``PROVENANCE_OBSERVED`` -- meaning a real writer (``save_actor``, which
+    upserts by this same ``id`` on purpose so live data merges onto a seeded
+    skeleton) has confirmed or updated it since it was seeded -- must not be
+    reset back to ``'seed'`` by a later call here: that would relabel
+    genuinely-observed data as a hand-typed guess. The ``ON CONFLICT`` clause
+    below therefore only reasserts ``provenance``/``provenance_as_of``/
+    ``updated_at`` when the existing row is not already ``'observed'``;
+    every other seeded field (name, tier, financial figures, etc.) keeps
+    refreshing from ``_KNOWN_ACTORS`` unconditionally, as before.
+
     Returns:
         Number of actors upserted.
     """
@@ -140,9 +154,18 @@ def _seed_known_actors(engine: Engine) -> int:
                     motivation_model = EXCLUDED.motivation_model,
                     data_sources = EXCLUDED.data_sources,
                     credibility = EXCLUDED.credibility,
-                    provenance = EXCLUDED.provenance,
-                    provenance_as_of = EXCLUDED.provenance_as_of,
-                    updated_at = EXCLUDED.updated_at
+                    provenance = CASE
+                        WHEN actors.provenance = :observed THEN actors.provenance
+                        ELSE EXCLUDED.provenance
+                    END,
+                    provenance_as_of = CASE
+                        WHEN actors.provenance = :observed THEN actors.provenance_as_of
+                        ELSE EXCLUDED.provenance_as_of
+                    END,
+                    updated_at = CASE
+                        WHEN actors.provenance = :observed THEN actors.updated_at
+                        ELSE EXCLUDED.updated_at
+                    END
             """), {
                 "id": actor_id,
                 "name": data["name"],
@@ -159,6 +182,7 @@ def _seed_known_actors(engine: Engine) -> int:
                 "provenance": PROVENANCE_SEED,
                 "vintage_date": SEED_VINTAGE_DATE,
                 "vintage_ts": SEED_VINTAGE_TS,
+                "observed": PROVENANCE_OBSERVED,
             })
             count += 1
     log.info(

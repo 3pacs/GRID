@@ -53,9 +53,12 @@ on PostgreSQL 14 is a catalog-only change -- no table rewrite, no scan. It
 still takes ``ACCESS EXCLUSIVE`` on ``earnings_predictions`` for the duration,
 so it queues behind any open transaction holding a lock on the table and blocks
 every reader behind it while it waits. ``earnings_predictions`` is small (it is
-written only by the earnings endpoints, at most 50 predictions per cycle), and
-alembic runs at deploy time rather than inside request handling, so no bound is
-set here beyond the deploy's own.
+written only by the earnings endpoints, at most 50 predictions per cycle), but
+this revision follows the ``oracle_pred_nullable_0918`` precedent and sets an
+explicit, finite ``SET LOCAL lock_timeout``/``statement_timeout`` anyway,
+scoped to this migration's own transaction only: if something else holds a
+conflicting lock, this fails fast and loudly instead of blocking indefinitely
+and everything queued behind it along with it.
 """
 
 from collections.abc import Sequence
@@ -70,8 +73,19 @@ down_revision: str | Sequence[str] | None = "oracle_pred_nullable_0918"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
+# SET LOCAL: scoped to this migration's own transaction only, never any
+# other session -- see oracle_pred_nullable_0918 for the precedent.
+_LOCK_TIMEOUT = "5s"
+_STATEMENT_TIMEOUT = "30s"
+
+
+def _set_finite_timeouts() -> None:
+    op.execute(f"SET LOCAL lock_timeout = '{_LOCK_TIMEOUT}'")
+    op.execute(f"SET LOCAL statement_timeout = '{_STATEMENT_TIMEOUT}'")
+
 
 def upgrade() -> None:
+    _set_finite_timeouts()
     op.execute(
         "ALTER TABLE IF EXISTS earnings_predictions "
         "ADD COLUMN IF NOT EXISTS predicted_move_basis TEXT"
@@ -83,6 +97,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    _set_finite_timeouts()
     # Data loss, stated plainly: dropping these columns discards, for every row
     # written since the upgrade, the record of which inputs produced
     # predicted_move_pct and what the IV-implied term was. It is not

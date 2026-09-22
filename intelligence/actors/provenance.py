@@ -22,14 +22,36 @@ Every actor node served by the API now carries ``source``:
 ``source_as_of`` carries the vintage of a curated node (``None`` for observed
 rows, whose freshness is already reported by ``updated_at``).
 
+Precise meaning of ``provenance = 'seed'``
+-------------------------------------------
+``'seed'`` is a claim about the row's *current* state: "nothing has confirmed
+or updated this row since it was hand-typed." It is not a permanent record of
+where the row was first created, and it is not sticky by default in the
+direction that would let it re-assert itself — the moment a real observed
+writer (:func:`intelligence.actors.db.save_actor`, which upserts by the same
+``id`` on purpose so live data merges onto a seeded skeleton) touches a row,
+that row's stored ``provenance`` becomes (and, per
+``_seed_known_actors``'s own ``ON CONFLICT`` clause, stays) ``'observed'`` —
+a later seed rerun for that same id must not relabel it ``'seed'`` again.
+Seed-list (``SEED_ACTOR_IDS``) membership alone is therefore not sufficient
+to classify a row ``'seed'``; both the one-time migration backfill
+(``actors_provenance_20260917``) and the seeder's own upsert additionally
+require evidence the row was never touched after the seed vintage (see each
+one's own docstring for its exact check).
+
 Resolution order
 ----------------
 ``resolve_provenance`` prefers the row's own ``provenance`` column (added by
-alembic revision ``actors_provenance_20260917``). Where that column is not
+alembic revision ``actors_provenance_20260917``) — this is the only source
+that reflects the current-state definition above. Where that column is not
 available to a call site — the read-only router queries that select a narrow
-column list — membership of ``SEED_ACTOR_IDS`` is used instead. The two agree
-by construction: ``_seed_known_actors`` writes ``provenance = 'seed'`` for
-exactly the ids in ``_KNOWN_ACTORS``.
+column list — membership of ``SEED_ACTOR_IDS`` is used instead, as a
+documented, degraded approximation. The two usually agree, but can diverge
+for a seed id that has since been re-sourced from a real observation: the
+stored column would correctly read ``'observed'``, while the membership
+fallback has no way to see that and still reports ``'seed'``. Callers that
+need the current-state guarantee must select and pass the stored column;
+callers using the bare functions below accept this known approximation.
 """
 
 from __future__ import annotations
