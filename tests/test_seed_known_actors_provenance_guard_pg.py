@@ -4,33 +4,38 @@ provenance-aware ON CONFLICT guard -- part of the #596 remediation reconciliatio
 
 Proves, against the real function (not a re-implementation):
   1. A brand-new row is inserted with provenance='seed' and updated_at=SEED_VINTAGE_TS
-     (not NOW() -- the original audit A-H13 bug this design fixes).
+     (not NOW() -- the original audit A-H13 bug this design fixes). This is the only
+     path by which this function ever produces 'seed' from a NEW id -- there is no
+     legacy history to protect for a row that didn't exist a moment ago.
   2. A row still exactly 'seed' DOES get refreshed by a reseed call.
-  3. A row still at the column default 'unknown', with no recorded data_sources
-     (never classified OR touched by anything) DOES get seeded/refreshed --
-     legitimate seeding under the revised honest default must keep working exactly
-     as if the row didn't exist yet.
+  3. An EXISTING row still at the column default 'unknown' is left COMPLETELY
+     untouched by a reseed call, unconditionally -- not promoted to 'seed', no field
+     changed, even when the row looks pristine (no data_sources, no title, no
+     financials) and would have qualified as "fair game" under an earlier design of
+     this guard. Classifying a legacy 'unknown' row is the separately authorized
+     backfill script's job alone, using its own updated_at-vs-SEED_VINTAGE_TS
+     evidence -- this function no longer makes that call by any means, including a
+     "looks untouched" guess.
   4. A row that has become 'observed' is left COMPLETELY untouched by a reseed --
      not just its provenance columns, but every other seed-authored field too
      (influence_score specifically, since that is the field the module docstring
      names as the concrete harm of overwriting a genuinely-observed value).
   5. Same for 'unconfirmed'.
-  6. 'unknown' means unverified, not disposable: a row still 'unknown' but ENRICHED
-     with real data_sources by some other writer (actor_discovery.py's own shape) is
-     left completely untouched by a reseed too -- the guard must check more than the
-     provenance label alone, or it would silently clobber real, unclassified
-     information the moment its id happens to collide with the curated seed list.
-  7. By contrast, a row still 'unknown' that was merely TOUCHED (updated_at moved,
-     no data_sources recorded) remains eligible for reseeding -- a bare timestamp
-     move carries no evidentiary content, so it is not itself grounds to withhold
-     seeding either. This draws the precise boundary case 6 sits on the other side
-     of.
-  8. The data_sources check alone is not enough: a row with EMPTY data_sources but
-     real identity/enrichment content in title/net_worth_estimate/aum -- the exact
-     shape actor_discovery.py's own upsert (unconditionally overwrites name/title
-     regardless of whether data_sources was passed) and scripts/seed_vip_network.py
-     (writes title/net_worth_estimate directly, never touches data_sources) both
-     produce -- must also survive a reseed untouched.
+  6. An 'unknown' row ENRICHED with real data_sources by some other writer
+     (actor_discovery.py's own shape) is untouched too -- a specific case of rule 3,
+     kept as a concrete example.
+  7. An 'unknown' row that was merely TOUCHED (updated_at moved, no data_sources
+     recorded) is untouched as well -- rule 3 applies uniformly regardless of
+     whether the row looks pristine or touched; there is no longer a boundary
+     between the two to draw.
+  8. An 'unknown' row enriched via title/net_worth_estimate/aum with EMPTY
+     data_sources is untouched -- another concrete case of rule 3.
+  9. The decisive proof that rule 3 is now a genuinely uniform, single-column check
+     and not another column-enumerating guard: an 'unknown' row with EMPTY
+     data_sources/title/net_worth_estimate/aum (i.e. "pristine" under every earlier
+     draft's checklist) but a real, changed name AND influence_score is still left
+     completely untouched -- name/score are not, and were never meant to be, part of
+     any pristine checklist; the guard no longer has a checklist at all.
 
 Uses the shared ``pg_engine`` fixture (tests/conftest.py) -- skips cleanly if no
 PostgreSQL is reachable. Requires the actors_provenance_columns_0922 columns, which
@@ -154,11 +159,18 @@ def test_reseed_refreshes_a_row_still_exactly_seed(pg_engine: Engine, test_ids, 
     assert row.influence_score == 0.9, "a row still exactly 'seed' must refresh from the seed table"
 
 
-def test_seeding_a_row_still_at_the_unknown_default_succeeds(pg_engine: Engine, test_ids, monkeypatch):
-    """Legitimate seeding under the revised honest default. A row can be at 'unknown'
-    without ever having gone through _seed_known_actors before -- e.g. created by the
-    schema migration's own default, or by some other minimal writer -- and the seeder
-    must still be able to claim it, exactly as if the row did not exist yet."""
+def test_reseed_does_not_touch_an_existing_unknown_row_even_when_pristine(
+    pg_engine: Engine, test_ids, monkeypatch,
+):
+    """A row can be at 'unknown' without ever having gone through
+    _seed_known_actors before -- e.g. created by the schema migration's own
+    default, or by some other minimal writer. Even when that row looks
+    completely pristine (no data_sources, no title, no financials -- exactly the
+    shape an earlier design of this guard treated as "fair game"), an EXISTING
+    row is never this function's to reclassify. Only a genuinely NEW id (no row
+    at all) gets inserted as 'seed' -- see
+    test_fresh_row_is_seeded_as_seed_with_vintage_timestamp for that path.
+    Classifying this row is the separately authorized backfill script's job."""
     actor_id = f"seed_guard_pg_{uuid.uuid4().hex[:16]}"
     test_ids.append(actor_id)
 
@@ -167,33 +179,32 @@ def test_seeding_a_row_still_at_the_unknown_default_succeeds(pg_engine: Engine, 
         conn.execute(text(
             "INSERT INTO actors (id, name, tier, category) VALUES (:id, 'Pre-existing', 'test', 'test')"
         ).bindparams(id=actor_id))
-        row = conn.execute(text(
-            "SELECT provenance FROM actors WHERE id = :id"
+        before = conn.execute(text(
+            "SELECT provenance, updated_at, influence_score FROM actors WHERE id = :id"
         ).bindparams(id=actor_id)).fetchone()
-    assert row.provenance == PROVENANCE_UNKNOWN, "fixture check: row must start at the real column default"
+    assert before.provenance == PROVENANCE_UNKNOWN, "fixture check: row must start at the real column default"
 
     _seed_one(monkeypatch, actor_id, influence_score=0.42)
     _seed_known_actors(pg_engine)
 
     with pg_engine.connect() as conn:
         after = conn.execute(text(
-            "SELECT provenance, updated_at, influence_score FROM actors WHERE id = :id"
+            "SELECT provenance, name, updated_at, influence_score FROM actors WHERE id = :id"
         ).bindparams(id=actor_id)).fetchone()
-    assert after.provenance == PROVENANCE_SEED
-    assert after.updated_at == SEED_VINTAGE_TS
-    assert after.influence_score == 0.42
+    assert after.provenance == PROVENANCE_UNKNOWN, "an existing unknown row must never be promoted to 'seed' by this function"
+    assert after.name == "Pre-existing", "reseed must not overwrite the existing name"
+    assert after.updated_at == before.updated_at, "reseed must not touch updated_at either -- nothing about this row changes"
+    assert after.influence_score is None, "reseed must not write the seed table's influence_score onto this row"
 
 
 def test_reseed_does_not_overwrite_an_unknown_row_enriched_with_real_data_sources(
     pg_engine: Engine, test_ids, monkeypatch,
 ):
-    """'unknown' means unverified, not disposable. A row can sit at the column
-    default 'unknown' forever while still carrying real, non-trivial information --
-    several writers besides save_actor/_seed_known_actors insert or update actors
-    rows directly and never touch provenance at all (actor_discovery.py's own
-    INSERT shape is reproduced here: real name/influence_score/data_sources, no
-    provenance stamp). Reseeding must not treat that row as equivalent to one that
-    doesn't exist yet merely because its label still reads 'unknown'."""
+    """One concrete case of the uniform rule: an EXISTING 'unknown' row is never
+    this function's to reclassify, regardless of what it carries. Reproduces
+    actor_discovery.py's own INSERT shape (real name/influence_score/data_sources,
+    no provenance stamp) to prove reseeding doesn't touch it, same as it wouldn't
+    touch a pristine 'unknown' row either."""
     actor_id = f"seed_guard_pg_{uuid.uuid4().hex[:16]}"
     test_ids.append(actor_id)
 
@@ -223,15 +234,14 @@ def test_reseed_does_not_overwrite_an_unknown_row_enriched_with_real_data_source
     assert after.data_sources == '["actor_discovery"]', "reseed must not overwrite the enriched data_sources"
 
 
-def test_reseed_still_claims_an_unknown_row_that_was_merely_touched_with_no_real_data(
+def test_reseed_does_not_touch_an_unknown_row_that_was_merely_touched_with_no_real_data(
     pg_engine: Engine, test_ids, monkeypatch,
 ):
-    """The other side of the boundary the previous test draws: a row still
-    'unknown' with NO recorded data_sources remains fair game to seed even after a
-    bare updated_at touch (e.g. a maintenance-only save_actor call, or any of the
-    other writers that only ever move updated_at). A timestamp move alone carries
-    no evidentiary content in this design -- neither earning a promotion nor
-    earning protection from one."""
+    """A row still 'unknown' with NO recorded data_sources, touched only by a bare
+    updated_at move (e.g. a maintenance-only save_actor call, or any of the other
+    writers that only ever move updated_at), is left alone by a reseed -- same as
+    every other existing 'unknown' row, touched or not. There is no boundary left
+    to draw here: rule 3 in the module docstring above applies uniformly."""
     actor_id = f"seed_guard_pg_{uuid.uuid4().hex[:16]}"
     test_ids.append(actor_id)
 
@@ -243,7 +253,7 @@ def test_reseed_still_claims_an_unknown_row_that_was_merely_touched_with_no_real
         # The maintenance writer's exact shape: updated_at only, nothing else.
         conn.execute(text("UPDATE actors SET updated_at = NOW() WHERE id = :id").bindparams(id=actor_id))
         before = conn.execute(text(
-            "SELECT provenance, data_sources FROM actors WHERE id = :id"
+            "SELECT provenance, updated_at, data_sources FROM actors WHERE id = :id"
         ).bindparams(id=actor_id)).fetchone()
     assert before.provenance == PROVENANCE_UNKNOWN
     assert before.data_sources is None, "fixture check: no real content was ever recorded"
@@ -253,23 +263,24 @@ def test_reseed_still_claims_an_unknown_row_that_was_merely_touched_with_no_real
 
     with pg_engine.connect() as conn:
         after = conn.execute(text(
-            "SELECT provenance, influence_score FROM actors WHERE id = :id"
+            "SELECT provenance, updated_at, influence_score FROM actors WHERE id = :id"
         ).bindparams(id=actor_id)).fetchone()
-    assert after.provenance == PROVENANCE_SEED, "a merely-touched unknown row (no real data) must still be claimable"
-    assert after.influence_score == 0.33
+    assert after.provenance == PROVENANCE_UNKNOWN, "a merely-touched unknown row must not be claimed by a reseed either"
+    assert after.updated_at == before.updated_at, "reseed must not touch updated_at"
+    assert after.influence_score is None, "reseed must not write the seed table's influence_score onto this row"
 
 
 def test_reseed_does_not_overwrite_an_unknown_row_enriched_via_title_or_financials_with_empty_data_sources(
     pg_engine: Engine, test_ids, monkeypatch,
 ):
-    """The data_sources check alone is not sufficient. A row can carry real,
-    non-trivial content in title/net_worth_estimate/aum while data_sources stays
-    empty -- the exact shape two real writers produce: actor_discovery.py's own
-    upsert function unconditionally overwrites name/title on every conflict
-    regardless of whether its caller passed data_sources (a None default on that
-    function), and scripts/seed_vip_network.py writes title/net_worth_estimate
-    directly and never touches data_sources at all. Reseeding must preserve this
-    enrichment, not just data_sources-flavored enrichment."""
+    """Another concrete case of the uniform rule, reproducing two real writers'
+    shapes: actor_discovery.py's own upsert function unconditionally overwrites
+    name/title on every conflict regardless of whether its caller passed
+    data_sources (a None default on that function), and
+    scripts/seed_vip_network.py writes title/net_worth_estimate directly and never
+    touches data_sources at all -- both leave a row with empty data_sources but
+    real title/financial content. Reseeding preserves it, same as it would any
+    other existing 'unknown' row."""
     actor_id = f"seed_guard_pg_{uuid.uuid4().hex[:16]}"
     test_ids.append(actor_id)
 
@@ -297,6 +308,52 @@ def test_reseed_does_not_overwrite_an_unknown_row_enriched_via_title_or_financia
     assert after.title == "Chairman", "reseed must not overwrite the real title"
     assert after.net_worth_estimate == 2500000000, "reseed must not overwrite the real net_worth_estimate"
     assert after.aum == 900000000, "reseed must not overwrite the real aum"
+
+
+def test_reseed_does_not_touch_an_unknown_row_with_empty_sources_but_a_changed_name_or_score(
+    pg_engine: Engine, test_ids, monkeypatch,
+):
+    """The decisive proof that the guard is now a uniform, single-column check and
+    not another entry in a column checklist. Every earlier draft of this guard --
+    data_sources alone, then data_sources+title+net_worth_estimate+aum -- would have
+    treated THIS row as "pristine" and reseeded it, because none of those drafts
+    ever checked name or influence_score. A row with empty data_sources AND empty
+    title/net_worth_estimate/aum, but a real, analyst-assigned name and score that
+    differ from the curated seed table's values, must still be left completely
+    untouched -- proving there is no longer any checklist to defeat by touching an
+    uncovered column, because EXISTING 'unknown' rows are never reclassified by
+    this function at all, regardless of which fields they carry."""
+    actor_id = f"seed_guard_pg_{uuid.uuid4().hex[:16]}"
+    test_ids.append(actor_id)
+
+    with pg_engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO actors (id, name, tier, category, influence_score) "
+            "VALUES (:id, 'Real Analyst-Assigned Name', 'test', 'test', 0.71)"
+        ).bindparams(id=actor_id))
+        before = conn.execute(text(
+            "SELECT provenance, name, influence_score, updated_at, data_sources, title, "
+            "net_worth_estimate, aum FROM actors WHERE id = :id"
+        ).bindparams(id=actor_id)).fetchone()
+    assert before.provenance == PROVENANCE_UNKNOWN, "fixture check: still the column default"
+    assert before.data_sources is None
+    assert before.title is None
+    assert before.net_worth_estimate is None
+    assert before.aum is None
+    assert before.name == "Real Analyst-Assigned Name", "fixture check: a real, changed name is recorded"
+    assert before.influence_score == 0.71, "fixture check: a real, changed score is recorded"
+
+    _seed_one(monkeypatch, actor_id, influence_score=0.5)  # deliberately a DIFFERENT value
+    _seed_known_actors(pg_engine)
+
+    with pg_engine.connect() as conn:
+        after = conn.execute(text(
+            "SELECT provenance, name, influence_score, updated_at FROM actors WHERE id = :id"
+        ).bindparams(id=actor_id)).fetchone()
+    assert after.provenance == PROVENANCE_UNKNOWN, "an existing unknown row must never be promoted to 'seed', empty sources or not"
+    assert after.name == "Real Analyst-Assigned Name", "reseed must not overwrite the real name"
+    assert after.influence_score == 0.71, "reseed must not overwrite the real score with the seed table's 0.5"
+    assert after.updated_at == before.updated_at, "reseed must not touch updated_at either"
 
 
 def test_reseed_does_not_touch_an_observed_row_at_all(pg_engine: Engine, test_ids, monkeypatch):

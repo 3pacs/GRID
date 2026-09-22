@@ -94,69 +94,46 @@ def _seed_known_actors(engine: Engine) -> int:
     ``intelligence/actors/provenance.py`` for the precise definition,
     including why a moved ``updated_at`` alone is not proof of a real
     observation). A row already stamped anything other than
-    ``PROVENANCE_SEED`` or ``PROVENANCE_UNKNOWN`` -- ``'observed'`` (confirmed
-    by ``save_actor``'s writer contract) or ``'unconfirmed'`` (touched by
-    something else, not confirmed) -- must not be reset by a later call here:
-    that would either relabel genuinely-observed data as a hand-typed guess,
-    or paper over an unconfirmed modification by reasserting "still pristine
-    seed data" over it.
+    ``PROVENANCE_SEED`` -- ``'observed'`` (confirmed by ``save_actor``'s
+    writer contract), ``'unconfirmed'`` (touched by something else, not
+    confirmed), or ``'unknown'`` (nothing has classified it) -- must not be
+    reset by a later call here.
 
-    ``PROVENANCE_UNKNOWN`` alone is NOT enough to make a row fair game,
-    though. ``'unknown'`` means *unverified* -- nothing has formally
-    classified this row -- not *disposable*. Several writers besides
-    ``save_actor`` insert or update ``actors`` rows directly and never touch
-    ``provenance`` at all (``intelligence/actor_discovery.py``,
-    ``intelligence/actors/trial_bridge.py``, ``intelligence/actor_ingest.py``,
-    among others) -- a row one of them created or enriched with real
-    ``data_sources`` content can sit at the column default ``'unknown'``
-    indefinitely despite carrying genuine, non-trivial information. Treating
-    every ``'unknown'`` row as equivalent to "doesn't exist yet" would let
-    this reseed silently clobber that enrichment the moment its id happens to
-    also be on the curated seed list. The guard below therefore only treats
-    an ``'unknown'`` row as fair game when it is ALSO still pristine, checked
-    across every column a writer can populate independently of
-    ``data_sources``: ``data_sources`` itself empty or absent (the same
-    evidence signal ``save_actor`` gates on -- see that function), AND
-    ``title`` empty or absent, AND ``net_worth_estimate`` absent, AND ``aum``
-    absent. This closes a real gap the ``data_sources``-only check left open:
-    ``intelligence/actor_discovery.py``'s own upsert function unconditionally
-    overwrites ``name``/``title`` on every conflict regardless of whether its
-    caller passed ``data_sources`` (a ``None`` default on that function), and
-    ``scripts/seed_vip_network.py`` writes ``title``/``net_worth_estimate``
-    directly without ever touching ``data_sources`` at all -- both can leave
-    a row with real, enriched content sitting behind an empty
-    ``data_sources`` list. ``influence_score``, ``trust_score``,
-    ``motivation_model``, and ``credibility`` are deliberately NOT part of
-    this check: unlike ``title``/``net_worth_estimate``/``aum`` (nullable,
-    no schema default -- non-null is unambiguous evidence a writer set them),
-    these four columns carry non-null defaults in ``_ensure_tables``
-    (``0.5``, ``0.5``, ``'unknown'``, ``'inferred'``) that a genuine writer
-    could also plausibly assign for real, so a value equal to the default
-    cannot be told apart from "never touched" -- this is a known, bounded
-    limitation of the pristine check, not a silent gap. A row still
-    ``'unknown'`` but merely touched (``updated_at`` moved, none of the
-    checked columns carrying real content) remains eligible: a bare
-    timestamp move carries no evidentiary content in this design, on either
-    side of a promotion OR a protection decision, so it is not itself
-    grounds to withhold seeding. What must be protected is recorded data,
-    not clock movement.
+    ``'unknown'`` is NOT fair game for this function to reclassify, even
+    when it looks pristine. Earlier drafts of this guard tried to detect
+    "pristine" by checking ``data_sources``, then widened that to also check
+    ``title``/``net_worth_estimate``/``aum`` after finding writers that leave
+    those columns real while ``data_sources`` stays empty -- an
+    enumeration that can always be defeated by the next writer that touches
+    some field the checklist doesn't cover yet (e.g. ``name`` or
+    ``influence_score`` directly, with everything else still blank). Rather
+    than keep enumerating columns, this function now draws one clean line:
+    for an EXISTING row, reseeding only ever touches a row already exactly
+    ``'seed'``. An existing ``'unknown'`` row -- pristine or not, whatever
+    columns it does or doesn't carry -- is left completely alone by this
+    function. A genuinely NEW id (no existing row at all) still gets
+    inserted as ``'seed'`` immediately via the plain ``INSERT`` branch --
+    there is no legacy history to protect for a row that didn't exist a
+    moment ago. Classifying an EXISTING legacy ``'unknown'`` row as
+    ``'seed'`` (vs. ``'unconfirmed'``) is the separately authorized backfill
+    script's job alone (``scripts/backfill_actor_provenance.py``, which uses
+    its own ``updated_at``-vs-``SEED_VINTAGE_TS`` evidence, not a "does this
+    look untouched" guess) -- this function no longer shares that decision
+    with it.
 
     Because ``influence_score`` and the other seed-authored fields would
     otherwise keep refreshing from ``_KNOWN_ACTORS`` on every call regardless
     of the row's provenance -- silently overwriting genuinely observed,
-    unconfirmed-but-real, or enriched-but-unclassified values while the label
-    claims something else -- the ``ON CONFLICT ... WHERE`` clause below
-    suppresses the *entire* update, not just the provenance columns, unless
-    the existing row is still exactly ``'seed'``, or still ``'unknown'`` AND
-    still pristine across ``data_sources``/``title``/``net_worth_estimate``/
-    ``aum`` as described above.
+    unconfirmed-but-real, still-unclassified, or legacy-unknown values while
+    the label claims something else -- the ``ON CONFLICT ... WHERE`` clause
+    below suppresses the *entire* update, not just the provenance columns,
+    unless the existing row is still exactly ``'seed'``.
 
     Returns:
         Number of actors upserted.
     """
     from intelligence.actors.provenance import (
         PROVENANCE_SEED,
-        PROVENANCE_UNKNOWN,
         SEED_VINTAGE,
         SEED_VINTAGE_TS,
     )
@@ -194,13 +171,6 @@ def _seed_known_actors(engine: Engine) -> int:
                     provenance_as_of = EXCLUDED.provenance_as_of,
                     updated_at = EXCLUDED.updated_at
                 WHERE actors.provenance = :seed
-                   OR (
-                       actors.provenance = :unknown
-                       AND (actors.data_sources IS NULL OR actors.data_sources = '[]'::jsonb)
-                       AND (actors.title IS NULL OR actors.title = '')
-                       AND actors.net_worth_estimate IS NULL
-                       AND actors.aum IS NULL
-                   )
             """), {
                 "id": actor_id,
                 "name": data["name"],
@@ -218,7 +188,6 @@ def _seed_known_actors(engine: Engine) -> int:
                 "vintage_date": SEED_VINTAGE,
                 "vintage_ts": SEED_VINTAGE_TS,
                 "seed": PROVENANCE_SEED,
-                "unknown": PROVENANCE_UNKNOWN,
             })
             count += 1
     log.info("Seeded {n} actors into the database", n=count)

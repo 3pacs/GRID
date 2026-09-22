@@ -159,41 +159,39 @@ similar strings from ``seed_data.py``) are not evaluated by this gate at
 all -- they belong to the separate ``PROVENANCE_SEED`` path, which never
 goes through ``save_actor``.
 
-``'unknown'`` is unverified, not disposable
----------------------------------------------
-``_seed_known_actors``'s reseed guard treats a row still ``'seed'`` as
-always fair game to refresh, and a row still ``PROVENANCE_UNKNOWN`` as fair
-game ONLY when it is ALSO still pristine -- checked across every column a
-writer can populate independently of ``data_sources``: ``data_sources``
-itself empty or absent (the same evidence signal ``save_actor`` gates on),
-AND ``title`` empty or absent, AND ``net_worth_estimate`` absent, AND
-``aum`` absent. Several writers besides ``save_actor`` insert or update
-``actors`` rows directly and never touch ``provenance`` at all
-(``actor_discovery.py``, ``trial_bridge.py``, ``actor_ingest.py``, among
-others); a row one of them created or enriched can sit at the column
-default ``'unknown'`` indefinitely despite carrying genuine information --
-and not always via ``data_sources`` specifically: ``actor_discovery.py``'s
-own upsert function unconditionally overwrites ``name``/``title`` on every
-conflict regardless of whether its caller passed ``data_sources`` (a
-``None`` default on that function), and ``scripts/seed_vip_network.py``
-writes ``title``/``net_worth_estimate`` directly without ever touching
-``data_sources`` at all. Treating every ``'unknown'`` row as equivalent to
-"doesn't exist yet" would let a reseed silently clobber that enrichment the
-moment its id happens to also be on the curated seed list -- the same class
-of silent overwrite this whole module exists to prevent, just for
-``'unknown'`` instead of ``'observed'``/``'unconfirmed'``.
-``influence_score``/``trust_score``/``motivation_model``/``credibility`` are
-deliberately NOT part of this pristine check: unlike the four columns above
-(nullable, no schema default -- non-null is unambiguous evidence a writer
-set them), these carry non-null defaults (``0.5``, ``0.5``, ``'unknown'``,
-``'inferred'``) a genuine writer could also plausibly assign for real, so a
-value equal to the default cannot be told apart from "never touched" -- a
-known, bounded limitation, not a silent gap. A row still ``'unknown'`` but
-merely touched (``updated_at`` moved, none of the checked columns carrying
-real content) remains eligible: a bare timestamp move carries no
-evidentiary content on either side of a decision in this design, so it is
-not itself grounds to withhold seeding either. What must be protected is
-recorded data, not clock movement.
+``'unknown'`` is unverified, not disposable -- and not this function's to reclassify
+---------------------------------------------------------------------------------------
+``_seed_known_actors``'s reseed guard treats ONLY a row still exactly
+``'seed'`` as fair game to refresh. An EXISTING row still
+``PROVENANCE_UNKNOWN`` is left completely alone, unconditionally -- not
+"unless it looks enriched," not "unless something else touched it," just
+alone, full stop. A genuinely NEW id (no row at all yet) still gets
+inserted as ``'seed'`` immediately, since there is no legacy history to
+protect for a row that didn't exist a moment ago; the distinction that
+matters is EXISTING vs. NEW, not "does the existing row look pristine."
+
+This replaces an earlier, column-enumerating design (still visible in this
+branch's own history): first "fair game if ``data_sources`` is empty," then
+widened to also require ``title``/``net_worth_estimate``/``aum`` empty
+after real writers were found that leave those columns real while
+``data_sources`` stays empty (``actor_discovery.py``'s upsert
+unconditionally overwrites ``name``/``title`` regardless of whether its
+caller passed ``data_sources``; ``scripts/seed_vip_network.py`` writes
+``title``/``net_worth_estimate`` directly and never touches
+``data_sources`` at all). That checklist could always be defeated by the
+next writer that touches some field it didn't cover yet -- there is no
+column left to add that closes the class of gap, only individual instances
+of it. The fix is structural, not another entry in the list: this function
+no longer decides ``'unknown'`` → ``'seed'`` for ANY existing row at all.
+
+That decision belongs exclusively to the separately authorized backfill
+script (``scripts/backfill_actor_provenance.py``), which classifies a
+legacy ``'unknown'`` seed-list row using its own real evidence --
+``updated_at`` compared against ``SEED_VINTAGE_TS`` -- not a "does this
+still look untouched" guess made independently by a different function with
+different criteria. Two paths deciding the same transition by different
+rules was itself the residual risk; removing one of the two paths removes
+it, rather than trying to make the losing path's guess more accurate.
 
 Resolution order
 ----------------

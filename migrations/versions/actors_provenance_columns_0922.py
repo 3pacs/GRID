@@ -49,18 +49,18 @@ version of this same bug, found and fixed alongside this default change).
 ``'unknown'`` is honest about what schema deployment alone establishes: nothing. No
 row -- including the 486 seed-list ids -- is ``'seed'``, ``'observed'``, or
 ``'unconfirmed'`` until something with real evidence says so: the separate backfill
-script (classifies the seed-list ids from their pre-existing ``updated_at``),
-``_seed_known_actors`` (seeds/reseeds a row still at ``'unknown'`` -- but only when it
-is ALSO still pristine across ``data_sources``/``title``/``net_worth_estimate``/``aum``;
-``'unknown'`` means unverified, not disposable -- or already ``'seed'``), or
-``save_actor`` (stamps ``'observed'`` only alongside its own evidence contract -- a
-non-empty ``data_sources`` list, a claim about provenance, not independent
-verification of every field -- see that function). What every one of these guards
-refuses,
-unconditionally, is overwriting a row that already carries real information --
-whether that is a formal classification (``'observed'``/``'unconfirmed'``) or, for a
-still-``'unknown'`` row, real enrichment some other writer recorded before it was ever
-classified -- never a bare column default.
+script alone (classifies the seed-list ids from their pre-existing ``updated_at``
+against ``SEED_VINTAGE_TS``) decides whether an EXISTING legacy ``'unknown'`` row
+becomes ``'seed'`` or ``'unconfirmed'``. ``_seed_known_actors`` no longer shares that
+decision: it only ever inserts a genuinely new row (as ``'seed'``, since there is no
+legacy history to protect) or refreshes a row already exactly ``'seed'`` -- an
+existing ``'unknown'`` row is left completely alone by that function, unconditionally,
+not just when it happens to look untouched. ``save_actor`` stamps ``'observed'`` only
+alongside its own evidence contract -- a non-empty ``data_sources`` list, a claim
+about provenance, not independent verification of every field -- see that function.
+What every one of these guards refuses, unconditionally, is a writer other than the
+one specifically authorized for a given transition making that transition on a row
+that already carries real information -- never a bare column default.
 
 No index is added: neither column is a filter in any query today (the API resolves
 provenance in Python), and an index on a two-value-mostly column over a table this size
