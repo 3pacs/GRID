@@ -248,3 +248,12 @@ jobs:
       # each case proves.
       - name: Deploy pipeline — release-tree verification (failure injection)
         run: bash tests/deploy/test_deploy_verify_release_tree.sh
+
+      # Failure-injection proof for scripts/deploy_pin_candidate_sha.sh:
+      # `main` advancing during a build must not change the commit a
+      # candidate is built from, or -- via the real
+      # scripts/deploy_release_swap.sh -- the commit that ends up live. See
+      # tests/deploy/test_deploy_pin_candidate_sha.sh's own header for what
+      # each case proves.
+      - name: Deploy pipeline — build-time exact-SHA pinning (failure injection)
+        run: bash tests/deploy/test_deploy_pin_candidate_sha.sh
