@@ -509,9 +509,132 @@ def test_score_predictions_does_not_write_same_day_spy_outcome(mock_engine) -> N
         summary = store.score_predictions(as_of_date=date(2026, 9, 22))
 
     assert summary["scored"] == 0
-    assert summary["unscored"][0]["reason"] == "open_observation_day"
-    assert summary["unscored"][0]["phase"] == "outcome"
+    assert summary["unscored"][0]["reason"] == "missing_entry_anchor"
+    assert summary["unscored"][0]["phase"] == "entry"
     assert summary["unscored"][0]["feature"] == "spy_full"
+
+
+def test_spy_contract_scores_only_frozen_entry_and_declared_outcome(mock_engine) -> None:
+    from price_close_contract import SPY_CLOSE_CONTRACT, SPY_ENTRY_RULE, SPY_OUTCOME_RULE
+
+    store = AstroGridStore(mock_engine)
+    created = datetime(2026, 9, 1, 15, tzinfo=timezone.utc)
+    cutoff = datetime(2026, 9, 22, 15, tzinfo=timezone.utc)
+    entry = {
+        "receipt_id": 10, "raw_series_id": 20, "resolved_series_id": 30,
+        "obs_date": date(2026, 8, 31), "price": 680.0,
+        "available_at": datetime(2026, 9, 1, 0, 30, tzinfo=timezone.utc),
+    }
+    outcome = {
+        "receipt_id": 11, "raw_series_id": 21, "resolved_series_id": 31,
+        "obs_date": date(2026, 9, 8), "price": 700.0,
+        "available_at": datetime(2026, 9, 9, 0, 30, tzinfo=timezone.utc),
+    }
+    anchor = {
+        "version": SPY_CLOSE_CONTRACT, "entry_rule": SPY_ENTRY_RULE,
+        "outcome_rule": SPY_OUTCOME_RULE, "basis": "YF:SPY:close",
+        "symbol": "SPY", "entry_receipt_id": 10,
+        "entry_raw_series_id": 20, "entry_resolved_series_id": 30,
+        "entry_obs_date": "2026-08-31", "entry_price": 680.0,
+        "entry_available_at": entry["available_at"].isoformat(),
+    }
+    store._verified_spy_receipt = MagicMock(side_effect=[entry, outcome])
+    score = store._build_prediction_score(
+        conn=MagicMock(), prediction_id="spy-contract", call="buy SPY",
+        setup="", invalidation="", market_overlay={"price_close_contract": anchor},
+        mystical_payload={}, grid_payload={}, target_symbols=["SPY"],
+        start_date=date(2026, 9, 1), evaluation_date=date(2026, 9, 22),
+        prediction_as_of_ts=created, prediction_created_at=created,
+        declared_horizon="swing", score_cutoff=cutoff,
+    )
+
+    assert "unscored" not in score
+    assert score["realized_return"] == round(20 / 680, 6)
+    assert score["benchmark_return"] is None
+    assert score["max_favorable_excursion"] is None
+    assert score["raw_payload"]["price_close_evidence"]["outcome_receipt_id"] == 11
+    assert score["raw_payload"]["price_close_evidence"]["outcome_target_date"] == "2026-09-08"
+    assert store._verified_spy_receipt.call_args_list[0].kwargs["cutoff"] == created
+    assert store._verified_spy_receipt.call_args_list[1].kwargs["cutoff"] == cutoff
+
+    store._verified_spy_receipt.reset_mock(side_effect=True)
+    store._verified_spy_receipt.side_effect = [entry, None]
+    missing = store._build_prediction_score(
+        conn=MagicMock(), prediction_id="spy-contract", call="buy SPY",
+        setup="", invalidation="", market_overlay={"price_close_contract": anchor},
+        mystical_payload={}, grid_payload={}, target_symbols=["SPY"],
+        start_date=date(2026, 9, 1), evaluation_date=date(2026, 9, 22),
+        prediction_as_of_ts=created, prediction_created_at=created,
+        declared_horizon="swing", score_cutoff=cutoff,
+    )
+    assert missing["unscored"]["reason"] == "missing_verified_outcome"
+
+
+def test_spy_contract_rejects_backdated_prediction_even_with_anchor(mock_engine) -> None:
+    store = AstroGridStore(mock_engine)
+    store._verified_spy_receipt = MagicMock()
+    result = store._build_prediction_score(
+        conn=MagicMock(), prediction_id="backdated", call="buy SPY",
+        setup="", invalidation="", market_overlay={"price_close_contract": {
+            "version": "spy_close_v1", "entry_rule": "last_verified_close_available_at_creation_v1",
+            "outcome_rule": "first_verified_close_on_or_after_horizon_within_4d_v1",
+            "basis": "YF:SPY:close", "symbol": "SPY",
+        }}, mystical_payload={}, grid_payload={}, target_symbols=["SPY"],
+        start_date=date(2026, 9, 1), evaluation_date=date(2026, 9, 22),
+        prediction_as_of_ts=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        prediction_created_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+        declared_horizon="swing", score_cutoff=datetime(2026, 9, 22, tzinfo=timezone.utc),
+    )
+    assert result["unscored"]["reason"] == "invalid_entry_anchor"
+    store._verified_spy_receipt.assert_not_called()
+
+
+def test_spy_entry_anchor_is_created_by_store_and_backdated_input_cannot_get_one(mock_engine) -> None:
+    import json
+
+    store = AstroGridStore(mock_engine)
+    store.ensure_lens_set = MagicMock(return_value=None)
+    store.save_prediction_stub_postmortem = MagicMock()
+    store.get_prediction = MagicMock(return_value={"prediction_id": "spy-new"})
+    created = datetime(2026, 9, 1, 15, tzinfo=timezone.utc)
+    receipt = {
+        "receipt_id": 10, "raw_series_id": 20, "resolved_series_id": 30,
+        "obs_date": date(2026, 8, 31), "price": 680.0,
+        "available_at": datetime(2026, 9, 1, 0, 30, tzinfo=timezone.utc),
+    }
+    store._verified_spy_receipt = MagicMock(return_value=receipt)
+    conn = mock_engine.begin.return_value.__enter__.return_value
+    inserted = []
+
+    def execute(statement, params=None):
+        result = MagicMock()
+        if "SELECT NOW()" in str(statement):
+            result.scalar_one.return_value = created
+        elif "INSERT INTO astrogrid.prediction_run" in str(statement):
+            inserted.append(dict(params))
+            result.fetchone.return_value = (42,)
+        else:
+            raise AssertionError(str(statement))
+        return result
+
+    conn.execute.side_effect = execute
+    payload = {
+        "prediction_id": "spy-new", "as_of_ts": created.isoformat(),
+        "price_contract_version": "spy_close_v1", "target_symbols": ["SPY"],
+        "scoring_class": "liquid_market", "live_or_local": "live",
+        "market_overlay_snapshot": {"price_close_contract": {"forged": True}},
+    }
+    assert store.save_prediction(payload) == {"prediction_id": "spy-new"}
+    anchor = json.loads(inserted[0]["market_overlay_snapshot"])["price_close_contract"]
+    assert anchor["entry_receipt_id"] == 10
+    assert "forged" not in anchor
+    assert store._verified_spy_receipt.call_args.kwargs["cutoff"] == created
+
+    store._verified_spy_receipt.reset_mock()
+    payload["as_of_ts"] = datetime(2026, 8, 1, tzinfo=timezone.utc).isoformat()
+    assert store.save_prediction(payload) == {"prediction_id": "spy-new"}
+    assert "price_close_contract" not in json.loads(inserted[1]["market_overlay_snapshot"])
+    store._verified_spy_receipt.assert_not_called()
 
 
 def test_score_predictions_default_evaluation_day_uses_utc(mock_engine) -> None:

@@ -127,6 +127,17 @@ jobs:
           echo "::endgroup::"
           exit "$pytest_status"
 
+      # This module must connect to the disposable PostgreSQL service. The
+      # general suite intentionally leaves GRID_TEST_DB_URL unset and may skip
+      # its database fixtures; a separate invocation makes this proof a gate.
+      - name: SPY close receipt PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_spy_price_receipt_pg.py -q -rA
+
       - name: Check for SQL injection patterns
         run: |
           echo "Checking for unsafe SQL patterns..."
