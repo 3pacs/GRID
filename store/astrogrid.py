@@ -71,6 +71,11 @@ _PRICE_FEATURE_BY_SYMBOL["GOOG"] = _PRICE_FEATURE_BY_SYMBOL["GOOGL"]
 def _utc_today() -> date:
     return datetime.now(timezone.utc).date()
 
+
+def _utc_now() -> datetime:
+    """Clock seam for point-in-time score cutoffs and disposable DB tests."""
+    return datetime.now(timezone.utc)
+
 _VALID_SCORING_CLASSES = {
     "liquid_market",
     "illiquid_real_asset",
@@ -1562,7 +1567,7 @@ class AstroGridStore:
             rows = conn.execute(sql, params).fetchall()
             summary["candidates"] = len(rows)
             score_cutoff = min(
-                datetime.now(timezone.utc),
+                _utc_now(),
                 datetime.combine(evaluation_date + timedelta(days=1), time.min, timezone.utc),
             )
             for row in rows:
