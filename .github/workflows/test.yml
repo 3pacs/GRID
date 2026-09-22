@@ -227,3 +227,12 @@ jobs:
 
       - name: Security scan (medium audit)
         run: bandit -r api/ store/ intelligence/ -ll --exit-zero
+
+      # Failure-injection proof for scripts/deploy_release_swap.sh: a failed
+      # build/migration must never leave the live release directory
+      # half-updated. Runs entirely inside its own temp sandbox -- no
+      # database, no grid-svr, no production path is touched. See
+      # tests/deploy/test_deploy_release_swap.sh's own header for what each
+      # case proves.
+      - name: Deploy pipeline — atomic release swap (failure injection)
+        run: bash tests/deploy/test_deploy_release_swap.sh
