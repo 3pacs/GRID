@@ -25,6 +25,12 @@ Proves, against the real function (not a re-implementation):
      move carries no evidentiary content, so it is not itself grounds to withhold
      seeding either. This draws the precise boundary case 6 sits on the other side
      of.
+  8. The data_sources check alone is not enough: a row with EMPTY data_sources but
+     real identity/enrichment content in title/net_worth_estimate/aum -- the exact
+     shape actor_discovery.py's own upsert (unconditionally overwrites name/title
+     regardless of whether data_sources was passed) and scripts/seed_vip_network.py
+     (writes title/net_worth_estimate directly, never touches data_sources) both
+     produce -- must also survive a reseed untouched.
 
 Uses the shared ``pg_engine`` fixture (tests/conftest.py) -- skips cleanly if no
 PostgreSQL is reachable. Requires the actors_provenance_columns_0922 columns, which
@@ -251,6 +257,46 @@ def test_reseed_still_claims_an_unknown_row_that_was_merely_touched_with_no_real
         ).bindparams(id=actor_id)).fetchone()
     assert after.provenance == PROVENANCE_SEED, "a merely-touched unknown row (no real data) must still be claimable"
     assert after.influence_score == 0.33
+
+
+def test_reseed_does_not_overwrite_an_unknown_row_enriched_via_title_or_financials_with_empty_data_sources(
+    pg_engine: Engine, test_ids, monkeypatch,
+):
+    """The data_sources check alone is not sufficient. A row can carry real,
+    non-trivial content in title/net_worth_estimate/aum while data_sources stays
+    empty -- the exact shape two real writers produce: actor_discovery.py's own
+    upsert function unconditionally overwrites name/title on every conflict
+    regardless of whether its caller passed data_sources (a None default on that
+    function), and scripts/seed_vip_network.py writes title/net_worth_estimate
+    directly and never touches data_sources at all. Reseeding must preserve this
+    enrichment, not just data_sources-flavored enrichment."""
+    actor_id = f"seed_guard_pg_{uuid.uuid4().hex[:16]}"
+    test_ids.append(actor_id)
+
+    with pg_engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO actors (id, name, tier, category, title, net_worth_estimate, aum) "
+            "VALUES (:id, 'Enriched Via Title', 'institutional', 'corporation', "
+            "'Chairman', 2500000000, 900000000)"
+        ).bindparams(id=actor_id))
+        before = conn.execute(text(
+            "SELECT provenance, data_sources FROM actors WHERE id = :id"
+        ).bindparams(id=actor_id)).fetchone()
+    assert before.provenance == PROVENANCE_UNKNOWN, "fixture check: still the column default"
+    assert before.data_sources is None, "fixture check: data_sources alone gives no signal here"
+
+    _seed_one(monkeypatch, actor_id, influence_score=0.5)
+    _seed_known_actors(pg_engine)
+
+    with pg_engine.connect() as conn:
+        after = conn.execute(text(
+            "SELECT provenance, name, title, net_worth_estimate, aum FROM actors WHERE id = :id"
+        ).bindparams(id=actor_id)).fetchone()
+    assert after.provenance == PROVENANCE_UNKNOWN, "must not be promoted to 'seed' merely because data_sources was empty"
+    assert after.name == "Enriched Via Title", "reseed must not overwrite the real name"
+    assert after.title == "Chairman", "reseed must not overwrite the real title"
+    assert after.net_worth_estimate == 2500000000, "reseed must not overwrite the real net_worth_estimate"
+    assert after.aum == 900000000, "reseed must not overwrite the real aum"
 
 
 def test_reseed_does_not_touch_an_observed_row_at_all(pg_engine: Engine, test_ids, monkeypatch):

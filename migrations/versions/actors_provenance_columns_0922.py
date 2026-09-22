@@ -51,10 +51,12 @@ row -- including the 486 seed-list ids -- is ``'seed'``, ``'observed'``, or
 ``'unconfirmed'`` until something with real evidence says so: the separate backfill
 script (classifies the seed-list ids from their pre-existing ``updated_at``),
 ``_seed_known_actors`` (seeds/reseeds a row still at ``'unknown'`` -- but only when it
-is ALSO still pristine, with no recorded ``data_sources``; ``'unknown'`` means
-unverified, not disposable -- or already ``'seed'``), or ``save_actor`` (stamps
-``'observed'`` only alongside its own evidence contract -- a non-empty
-``data_sources`` list -- see that function). What every one of these guards refuses,
+is ALSO still pristine across ``data_sources``/``title``/``net_worth_estimate``/``aum``;
+``'unknown'`` means unverified, not disposable -- or already ``'seed'``), or
+``save_actor`` (stamps ``'observed'`` only alongside its own evidence contract -- a
+non-empty ``data_sources`` list, a claim about provenance, not independent
+verification of every field -- see that function). What every one of these guards
+refuses,
 unconditionally, is overwriting a row that already carries real information --
 whether that is a formal classification (``'observed'``/``'unconfirmed'``) or, for a
 still-``'unknown'`` row, real enrichment some other writer recorded before it was ever

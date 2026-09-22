@@ -113,15 +113,33 @@ def _seed_known_actors(engine: Engine) -> int:
     every ``'unknown'`` row as equivalent to "doesn't exist yet" would let
     this reseed silently clobber that enrichment the moment its id happens to
     also be on the curated seed list. The guard below therefore only treats
-    an ``'unknown'`` row as fair game when it is ALSO still pristine --
-    ``data_sources`` empty or absent, the same evidence signal
-    ``save_actor`` itself gates on (see that function). A row still
-    ``'unknown'`` but merely touched (``updated_at`` moved, no real content
-    recorded -- e.g. by a maintenance-only ``save_actor`` call) remains
-    eligible: a bare timestamp move carries no evidentiary content in this
-    design, on either side of a promotion OR a protection decision, so it is
-    not itself grounds to withhold seeding. What must be protected is
-    recorded data, not clock movement.
+    an ``'unknown'`` row as fair game when it is ALSO still pristine, checked
+    across every column a writer can populate independently of
+    ``data_sources``: ``data_sources`` itself empty or absent (the same
+    evidence signal ``save_actor`` gates on -- see that function), AND
+    ``title`` empty or absent, AND ``net_worth_estimate`` absent, AND ``aum``
+    absent. This closes a real gap the ``data_sources``-only check left open:
+    ``intelligence/actor_discovery.py``'s own upsert function unconditionally
+    overwrites ``name``/``title`` on every conflict regardless of whether its
+    caller passed ``data_sources`` (a ``None`` default on that function), and
+    ``scripts/seed_vip_network.py`` writes ``title``/``net_worth_estimate``
+    directly without ever touching ``data_sources`` at all -- both can leave
+    a row with real, enriched content sitting behind an empty
+    ``data_sources`` list. ``influence_score``, ``trust_score``,
+    ``motivation_model``, and ``credibility`` are deliberately NOT part of
+    this check: unlike ``title``/``net_worth_estimate``/``aum`` (nullable,
+    no schema default -- non-null is unambiguous evidence a writer set them),
+    these four columns carry non-null defaults in ``_ensure_tables``
+    (``0.5``, ``0.5``, ``'unknown'``, ``'inferred'``) that a genuine writer
+    could also plausibly assign for real, so a value equal to the default
+    cannot be told apart from "never touched" -- this is a known, bounded
+    limitation of the pristine check, not a silent gap. A row still
+    ``'unknown'`` but merely touched (``updated_at`` moved, none of the
+    checked columns carrying real content) remains eligible: a bare
+    timestamp move carries no evidentiary content in this design, on either
+    side of a promotion OR a protection decision, so it is not itself
+    grounds to withhold seeding. What must be protected is recorded data,
+    not clock movement.
 
     Because ``influence_score`` and the other seed-authored fields would
     otherwise keep refreshing from ``_KNOWN_ACTORS`` on every call regardless
@@ -130,7 +148,8 @@ def _seed_known_actors(engine: Engine) -> int:
     claims something else -- the ``ON CONFLICT ... WHERE`` clause below
     suppresses the *entire* update, not just the provenance columns, unless
     the existing row is still exactly ``'seed'``, or still ``'unknown'`` AND
-    still carries no recorded ``data_sources``.
+    still pristine across ``data_sources``/``title``/``net_worth_estimate``/
+    ``aum`` as described above.
 
     Returns:
         Number of actors upserted.
@@ -178,6 +197,9 @@ def _seed_known_actors(engine: Engine) -> int:
                    OR (
                        actors.provenance = :unknown
                        AND (actors.data_sources IS NULL OR actors.data_sources = '[]'::jsonb)
+                       AND (actors.title IS NULL OR actors.title = '')
+                       AND actors.net_worth_estimate IS NULL
+                       AND actors.aum IS NULL
                    )
             """), {
                 "id": actor_id,

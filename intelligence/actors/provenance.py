@@ -15,9 +15,9 @@ the wire:
   named real people and organizations whose ``influence_score``,
   ``net_worth_estimate`` and ``aum`` figures were typed in by hand on a single
   day and have not moved since.
-* **observed rows**: confirmed by a real writer's evidence contract -- see
-  ``PROVENANCE_OBSERVED`` below for exactly what that requires. This is an
-  EARNED claim, never a default.
+* **observed rows**: the writer supplied qualifying source evidence for this
+  write -- see ``PROVENANCE_OBSERVED`` below for the precise, narrow claim
+  this makes (and does not make). This is an EARNED claim, never a default.
 * **unconfirmed rows**: a seed-list id whose row has been modified since the
   seed vintage by *something*, but not through a writer whose contract
   proves a real observation happened. See ``PROVENANCE_UNCONFIRMED`` below —
@@ -32,8 +32,10 @@ Every actor node served by the API now carries ``source``:
   see :func:`actor_source`.
 * ``"curated_seed"``  — the figures on this node came out of ``seed_data.py``
   and nothing has touched the row since.
-* ``"observed"``      — the row was written or confirmed by an ingestion path
-  whose contract is known to write real data.
+* ``"observed"``      — the row was written by a path that supplied
+  qualifying source evidence (a non-empty ``data_sources`` list). A claim
+  about provenance, not verification -- see "What ``PROVENANCE_OBSERVED``
+  actually claims" below for the precise boundary.
 * ``"unconfirmed"``   — the row started as a seed row and has since been
   modified by something outside that known-observing set; what is on it now
   is not guaranteed to still be the hand-typed seed figures, but nothing
@@ -117,26 +119,81 @@ already ``'seed'``, ``'observed'``, or ``'unconfirmed'``). The same holds for
 ``PROVENANCE_UNCONFIRMED``: real modification is on record, and nothing may
 paper over it by reasserting "still pristine seed data".
 
+What ``PROVENANCE_OBSERVED`` actually claims -- and does not
+---------------------------------------------------------------
+``'observed'`` means the writer supplied qualifying source evidence FOR THIS
+WRITE -- a non-empty ``data_sources`` list naming where the information came
+from. It does **not** mean every field on the row has been independently
+verified, that the source is authoritative, or that the row is currently
+accurate. It is a claim about *provenance* (something cited a source),
+not about *correctness* or *completeness* -- those are tracked separately,
+where they are tracked at all, by the ``credibility`` column (e.g.
+``'public_record'`` vs ``'rumor'``) and by whatever downstream consumer
+chooses to weigh a given source. A row stamped ``'observed'`` from a single
+low-credibility source (see below) is exactly as ``'observed'`` as one
+stamped from a dozen SEC filings -- the gate is binary (evidence present or
+not), not a quality or confidence score.
+
+**What qualifies as a source value**: any truthy, non-empty entry in
+``data_sources`` -- the gate does not inspect or discriminate by *which*
+string is present, only that at least one is. In this codebase, the values
+that actually flow through ``save_actor``'s two real call sites are:
+
+* Via ``intelligence/spider/daemon.py`` → ``DiscoveryOrchestrator.expand()``
+  (``intelligence/spider/discovery.py``), tagged by whichever adapter found
+  the connection: ``"wikidata"``, ``"opencorporates"``, ``"gdelt"``,
+  ``"sec_edgar"``, ``"icij_offshore_leaks"``, ``"google_knowledge_graph"``,
+  or ``"operator"`` (an operator-submitted lead routed through the spider
+  queue, distinct from the direct inject route below).
+* Via ``api/routers/intelligence_spider.py``'s ``/spider/inject`` endpoint
+  (an operator directly injecting an actor): the literal ``["operator"]``,
+  always paired with ``credibility = 'rumor'`` on that specific path --
+  this is the clearest concrete case of "observed but not verified": the
+  row qualifies for ``PROVENANCE_OBSERVED`` (a human explicitly asserted
+  it), while ``credibility`` separately and correctly records that the
+  assertion itself is unconfirmed.
+
+A different writer's ``data_sources`` values (e.g. ``_seed_known_actors``'s
+own ``"fed_speeches"``, ``"sec_13f"``, ``"congressional_disclosures"``, and
+similar strings from ``seed_data.py``) are not evaluated by this gate at
+all -- they belong to the separate ``PROVENANCE_SEED`` path, which never
+goes through ``save_actor``.
+
 ``'unknown'`` is unverified, not disposable
 ---------------------------------------------
 ``_seed_known_actors``'s reseed guard treats a row still ``'seed'`` as
 always fair game to refresh, and a row still ``PROVENANCE_UNKNOWN`` as fair
-game ONLY when it is ALSO still pristine -- ``data_sources`` empty or absent.
-Several writers besides ``save_actor`` insert or update ``actors`` rows
-directly and never touch ``provenance`` at all (``actor_discovery.py``,
-``trial_bridge.py``, ``actor_ingest.py``, among others); a row one of them
-created or enriched with real ``data_sources`` content can sit at the column
-default ``'unknown'`` indefinitely despite carrying genuine information.
-Treating every ``'unknown'`` row as equivalent to "doesn't exist yet" would
-let a reseed silently clobber that enrichment the moment its id happens to
-also be on the curated seed list -- the same class of silent overwrite this
-whole module exists to prevent, just for ``'unknown'`` instead of
-``'observed'``/``'unconfirmed'``. A row still ``'unknown'`` but merely
-touched (``updated_at`` moved, no real content recorded -- e.g. by a
-maintenance-only ``save_actor`` call) remains eligible: a bare timestamp
-move carries no evidentiary content on either side of a decision in this
-design, so it is not itself grounds to withhold seeding either. What must be
-protected is recorded data, not clock movement.
+game ONLY when it is ALSO still pristine -- checked across every column a
+writer can populate independently of ``data_sources``: ``data_sources``
+itself empty or absent (the same evidence signal ``save_actor`` gates on),
+AND ``title`` empty or absent, AND ``net_worth_estimate`` absent, AND
+``aum`` absent. Several writers besides ``save_actor`` insert or update
+``actors`` rows directly and never touch ``provenance`` at all
+(``actor_discovery.py``, ``trial_bridge.py``, ``actor_ingest.py``, among
+others); a row one of them created or enriched can sit at the column
+default ``'unknown'`` indefinitely despite carrying genuine information --
+and not always via ``data_sources`` specifically: ``actor_discovery.py``'s
+own upsert function unconditionally overwrites ``name``/``title`` on every
+conflict regardless of whether its caller passed ``data_sources`` (a
+``None`` default on that function), and ``scripts/seed_vip_network.py``
+writes ``title``/``net_worth_estimate`` directly without ever touching
+``data_sources`` at all. Treating every ``'unknown'`` row as equivalent to
+"doesn't exist yet" would let a reseed silently clobber that enrichment the
+moment its id happens to also be on the curated seed list -- the same class
+of silent overwrite this whole module exists to prevent, just for
+``'unknown'`` instead of ``'observed'``/``'unconfirmed'``.
+``influence_score``/``trust_score``/``motivation_model``/``credibility`` are
+deliberately NOT part of this pristine check: unlike the four columns above
+(nullable, no schema default -- non-null is unambiguous evidence a writer
+set them), these carry non-null defaults (``0.5``, ``0.5``, ``'unknown'``,
+``'inferred'``) a genuine writer could also plausibly assign for real, so a
+value equal to the default cannot be told apart from "never touched" -- a
+known, bounded limitation, not a silent gap. A row still ``'unknown'`` but
+merely touched (``updated_at`` moved, none of the checked columns carrying
+real content) remains eligible: a bare timestamp move carries no
+evidentiary content on either side of a decision in this design, so it is
+not itself grounds to withhold seeding either. What must be protected is
+recorded data, not clock movement.
 
 Resolution order
 ----------------
