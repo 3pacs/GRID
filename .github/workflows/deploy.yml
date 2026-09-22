@@ -134,21 +134,24 @@ jobs:
     if: always() && (needs.verify.result == 'success' || needs.verify.result == 'skipped')
 
     steps:
+      # Fetches ONLY this job's own orchestration scripts
+      # (scripts/deploy_release_swap.sh, scripts/deploy_build_hook.sh) into
+      # the ephemeral $GITHUB_WORKSPACE at the exact commit being deployed --
+      # it does not touch $DEPLOY_PATH, which remains the persistent,
+      # separately-managed checkout that grid-api/grid-hermes actually run
+      # from. Needed because "Build release tree" below no longer builds
+      # in-place on $DEPLOY_PATH (see that step's own comment for why); the
+      # scripts that now do that work have to come from somewhere that is
+      # guaranteed to already be at the pushed commit, and $DEPLOY_PATH -- by
+      # design -- is not that, until the swap this step's script performs.
+      - uses: actions/checkout@v7
+
       # Scoped to this job only, via actions/setup-node's own tool-cache --
       # does NOT touch grid-svr's global Node install (still whatever
       # `node -v` shows in an interactive shell there). Must be its own
       # step: setup-node adds its installed version to $GITHUB_PATH, which
       # only takes effect for steps that run *after* this one in the same
       # job -- the "Build release tree" step's npm commands rely on that.
-      #
-      # No `cache: npm` here, unlike test.yml's equivalent step: this job
-      # has no actions/checkout step at all (it manages $DEPLOY_PATH as a
-      # persistent git checkout via its own `git fetch`/`reset --hard`
-      # below, not a fresh clone into GITHUB_WORKSPACE), so there is no
-      # lockfile at a path relative to the default workspace for the cache
-      # action to key off. Caching is a speed optimization, not required
-      # for the version pin itself -- left out rather than pointed at a
-      # path that may not resolve the way it does in test.yml.
       - name: Set up Node (this job only)
         uses: actions/setup-node@v7
         with:
@@ -158,75 +161,36 @@ jobs:
           # for this today.
           node-version: "22.23.2"
 
+      # Builds and migrates in an ISOLATED CANDIDATE directory, never on
+      # $DEPLOY_PATH itself, and only repoints $DEPLOY_PATH at that candidate
+      # if every step -- fetch, pip install, npm build, alembic upgrade --
+      # succeeds. Introduced 2026-09-22 after #596's deploy fetched, built,
+      # and reset directly on top of the LIVE release directory, then failed
+      # during `alembic upgrade head`: the new source and freshly-built PWA
+      # bundle were already sitting in the live path when the migration
+      # failed, so grid-api/grid-hermes's on-disk tree no longer matched the
+      # database schema even though neither process had been restarted yet --
+      # any restart (planned, or an unplanned crash; both units are
+      # Restart=always) would have run new code against the old schema.
+      # Recovering required a coordinated pause of every writer touching the
+      # affected tables and an isolated revert PR before either service
+      # could safely restart. See scripts/deploy_release_swap.sh's own
+      # comment for the swap mechanism and
+      # tests/deploy/test_deploy_release_swap.sh for failure-injection proof
+      # that a failed build leaves the previous release fully usable.
       - name: Build release tree
         env:
           SRC_URL: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git
         run: |
           set -euo pipefail
-          cd "$DEPLOY_PATH"
-          echo "before: $(git log --oneline -1)"
-          # Fetch from GitHub itself with the job token, not from whatever `origin`
-          # points at: the clone's origin went stale in 2026 and every deploy after
-          # #364 reset to the same old commit while reporting success.
-          git fetch "$SRC_URL" main
-          git reset --hard FETCH_HEAD
-          echo "after:  $(git log --oneline -1)"
-          # A merge burst (several PRs landing within a minute) means an older run's
-          # `main` fetch can already be a strict ancestor of a newer commit that merged
-          # in the meantime — the release tree still contains the pushed commit, it's
-          # just not HEAD anymore. Accept "pushed commit is an ancestor of HEAD" instead
-          # of requiring exact equality, so only the newest run (which is what should
-          # deploy anyway) needs to pass.
-          git merge-base --is-ancestor "${{ github.sha }}" HEAD || { echo "::error::release tree is not at the pushed commit ${{ github.sha }}"; exit 1; }
-          pip install -r requirements.txt
-          # Node itself is now pinned by the "Set up Node (this job only)"
-          # step above, via actions/setup-node's own tool-cache -- it
-          # prepended that version to $GITHUB_PATH before this step ran, so
-          # `npm` here resolves to 22.23.2, not grid-svr's global install.
-          # pwa/.npmrc still sets engine-strict=true, so `npm ci` fails
-          # loudly (not the non-fatal EBADENGINE warning npm prints by
-          # default) on any installed package's real `engines.node` range
-          # this pinned version doesn't satisfy -- no hand-rolled version
-          # check to keep in sync here.
-          cd pwa && npm ci && npm run build && cd ..
-          if [ "${{ inputs.skip_migrations }}" = "true" ]; then
-            echo "::warning::alembic upgrade head skipped via workflow_dispatch input skip_migrations=true"
-          else
-            # Source the same GRID .env candidates ops-exec.yml uses so alembic gets DB
-            # credentials — the release tree carries no .env of its own, which is why
-            # every deploy before this one failed on "no password supplied" (or, before
-            # PR #443, on the divergent alembic heads) and had the failure swallowed by
-            # `|| echo "no migrations"`. No migration has ever actually been applied by
-            # a deploy; echo only which file was sourced, never its contents.
-            for f in /data/grid_v4/grid_release/.env /home/grid/grid_v4/grid_repo/.env /home/grid/grid_v4/grid_repo/grid/.env; do
-              if [ -f "$f" ]; then set -a; . "$f"; set +a; echo "(env sourced from $f)"; break; fi
-            done
-            {
-              echo "## Alembic"
-              echo '### current (before upgrade)'
-              echo '```'
-              python3 -m alembic current
-              echo '```'
-              echo '### heads'
-              echo '```'
-              python3 -m alembic heads
-              echo '```'
-            } | tee -a "$GITHUB_STEP_SUMMARY"
-            python3 -m alembic upgrade head
-            # ...and again afterwards. Without this the summary records only
-            # where the database *was*: `alembic current` before the upgrade,
-            # and then silence. Run 641 is the case -- the upgrade ran, a
-            # revision took its deferral branch, and the log showed neither
-            # which revisions were applied nor where head ended up. A deploy
-            # that migrates the production database should say so in its own
-            # record.
-            {
-              echo '### current (after upgrade)'
-              echo '```'
-              python3 -m alembic current
-              echo '```'
-            } | tee -a "$GITHUB_STEP_SUMMARY"
-          fi
+          chmod +x scripts/deploy_release_swap.sh scripts/deploy_build_hook.sh
+          ./scripts/deploy_release_swap.sh \
+            "$DEPLOY_PATH" \
+            "${{ github.sha }}" \
+            "$(pwd)/scripts/deploy_build_hook.sh" \
+            "$SRC_URL" \
+            "${{ github.sha }}" \
+            "${{ inputs.skip_migrations }}"
 
       - name: Restart grid-api
         if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
