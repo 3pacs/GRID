@@ -43,11 +43,20 @@ def test_id() -> str:
 # database -- every statement here is idempotent.
 @pytest.fixture(autouse=True)
 def _full_actors_shape(pg_engine: Engine):
-    from intelligence.actors.db import _ensure_tables
-
-    _ensure_tables(pg_engine)  # CREATE TABLE IF NOT EXISTS -- no-op if present
-
     with pg_engine.begin() as conn:
+        # Base shape, matching what a sibling test file's minimal DDL
+        # already establishes -- a no-op if `actors` already exists in any
+        # shape, minimal or full. Columns must land *before* the real
+        # _seed_known_actors() call (below, in each test) runs its own
+        # internal _ensure_tables(), whose CREATE INDEX statements need
+        # influence_score/tier to already exist -- they fail outright
+        # against a table missing those columns, so this fixture cannot
+        # rely on that call to add them itself.
+        conn.execute(text(
+            "CREATE TABLE IF NOT EXISTS actors ("
+            "id TEXT PRIMARY KEY, name TEXT NOT NULL, "
+            "tier TEXT NOT NULL, category TEXT NOT NULL)",
+        ))
         for column_ddl in (
             "title TEXT",
             "net_worth_estimate NUMERIC",
