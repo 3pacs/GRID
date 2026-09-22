@@ -99,6 +99,27 @@ def test_string_index_entries_never_reach_obs_date(engine_recording_inserts):
     assert result["status"] in ("SUCCESS", "PARTIAL")
 
 
+@pytest.mark.xfail(strict=True, reason="Existing-date de-dup freezes an earlier SPY daily close")
+def test_spy_daily_close_repull_is_not_frozen_by_earlier_value(engine_recording_inserts):
+    """Characterize the provisional-close freeze without choosing its repair."""
+    from ingestion import yfinance_pull
+
+    engine, _conn = engine_recording_inserts
+    obs_date = date(2026, 9, 22)
+    early = pd.DataFrame({"Close": [680.0]}, index=pd.DatetimeIndex([pd.Timestamp(obs_date)]))
+    completed = pd.DataFrame({"Close": [685.0]}, index=pd.DatetimeIndex([pd.Timestamp(obs_date)]))
+
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", side_effect=[set(), {obs_date}]), \
+         patch.object(yfinance_pull.yf, "download", side_effect=[early, completed]):
+        puller = yfinance_pull.YFinancePuller(engine)
+        first = puller.pull_ticker("SPY", start_date=obs_date)
+        second = puller.pull_ticker("SPY", start_date=obs_date)
+
+    assert first["rows_inserted"] == 1
+    assert second["outcome"] != "duplicate_only"
+
+
 def test_duplicate_columns_dont_iterate_column_names(engine_recording_inserts):
     """MultiIndex flattening producing duplicate column headers must not
     turn `df[col].items()` into a column-name iteration (which was the root
