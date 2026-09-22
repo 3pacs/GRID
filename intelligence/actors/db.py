@@ -221,7 +221,8 @@ def _load_actors_from_db(
                            net_worth_estimate, aum, influence_score,
                            trust_score, motivation_model,
                            connections, known_positions, board_seats,
-                           political_affiliations, data_sources, credibility
+                           political_affiliations, data_sources, credibility,
+                           provenance, provenance_as_of
                     FROM actors
                     WHERE category != ALL(:excluded)
                     ORDER BY influence_score DESC
@@ -235,7 +236,8 @@ def _load_actors_from_db(
                            net_worth_estimate, aum, influence_score,
                            trust_score, motivation_model,
                            connections, known_positions, board_seats,
-                           political_affiliations, data_sources, credibility
+                           political_affiliations, data_sources, credibility,
+                           provenance, provenance_as_of
                     FROM actors
                     ORDER BY influence_score DESC
                 """)).fetchall()
@@ -257,6 +259,8 @@ def _load_actors_from_db(
                     political_affiliations=_parse_jsonb(r[13]),
                     data_sources=_parse_jsonb(r[14]),
                     credibility=r[15] or "inferred",
+                    provenance=r[16] or "unknown",
+                    provenance_as_of=str(r[17]) if r[17] else None,
                 )
     except Exception as exc:
         log.warning("Failed to load actors from DB: {e}", e=str(exc))

@@ -15,6 +15,7 @@ from api.lf_helpers import (
     set_input as _lf_set_input,
     user_id_from_token as _lf_user_id_from_token,
 )
+from intelligence.actors.provenance import SOURCE_SECTOR_MAP, stamp_actor_node
 from utils.ttl_cache import TTLCache
 
 router = APIRouter(tags=["intelligence"])
@@ -735,7 +736,8 @@ def get_actor_network_db(
                 SELECT a.id, a.name, a.tier, a.category, a.degree,
                        a.influence_score, a.title, a.source,
                        a.metadata->'llm_profile'->>'title' as llm_title,
-                       a.metadata->'llm_profile'->>'confidence' as llm_confidence
+                       a.metadata->'llm_profile'->>'confidence' as llm_confidence,
+                       a.provenance, a.provenance_as_of
                 FROM actors a
                 WHERE a.degree >= :min_deg {source_filter}
                 ORDER BY a.degree DESC
@@ -747,8 +749,14 @@ def get_actor_network_db(
                 {
                     "id": a[0], "label": a[1], "tier": a[2], "category": a[3],
                     "degree": a[4], "influence": float(a[5] or 0),
-                    "title": a[8] or a[6] or "", "source": a[7],
+                    "title": a[8] or a[6] or "",
+                    # `a.source` is the legacy ingestion-origin column (e.g.
+                    # "spider") -- a different concept from the provenance
+                    # module's wire "source" label below; kept under its own key
+                    # to avoid the two silently colliding on the same JSON key.
+                    "ingestion_source": a[7],
                     "llm_confidence": a[9],
+                    **stamp_actor_node({}, a[0], stored=a[10], vintage=a[11]),
                 }
                 for a in actors
             ]
@@ -807,7 +815,8 @@ def get_actor_enriched_profile(
             # Actor details
             actor = conn.execute(text(
                 "SELECT id, name, tier, category, title, influence_score, "
-                "trust_score, degree, source, metadata, credibility "
+                "trust_score, degree, source, metadata, credibility, "
+                "provenance, provenance_as_of "
                 "FROM actors WHERE id = :id"
             ), {"id": actor_id}).fetchone()
 
@@ -847,8 +856,13 @@ def get_actor_enriched_profile(
                     "category": actor[3], "title": actor[4],
                     "influence_score": float(actor[5] or 0),
                     "trust_score": float(actor[6] or 0),
-                    "degree": actor[7], "source": actor[8],
+                    "degree": actor[7],
+                    # `actor[8]` (actors.source) is the legacy ingestion-origin
+                    # column -- kept under its own key so it doesn't collide
+                    # with the provenance module's wire "source" label below.
+                    "ingestion_source": actor[8],
                     "credibility": actor[10],
+                    **stamp_actor_node({}, actor[0], stored=actor[11], vintage=actor[12]),
                 },
                 "llm_profile": llm_profile,
                 "connections": [
@@ -971,7 +985,8 @@ def get_sector_power_map(
             for ticker in sector_tickers:
                 rows = conn.execute(text(
                     "SELECT id, name, category, influence_score, trust_score, "
-                    "net_worth_estimate, title, known_positions "
+                    "net_worth_estimate, title, known_positions, "
+                    "provenance, provenance_as_of "
                     "FROM actors "
                     "WHERE category NOT IN ('icij_entity', 'icij_officer', 'icij_intermediary') "
                     "AND (name ILIKE :paren OR UPPER(name) LIKE :upper_pat) "
@@ -991,7 +1006,8 @@ def get_sector_power_map(
                 continue
             rows = conn.execute(text(
                 "SELECT id, name, category, influence_score, trust_score, "
-                "net_worth_estimate, title, known_positions "
+                "net_worth_estimate, title, known_positions, "
+                "provenance, provenance_as_of "
                 "FROM actors "
                 "WHERE category NOT IN ('icij_entity', 'icij_officer', 'icij_intermediary') "
                 "AND name ILIKE :pat "
@@ -1019,6 +1035,8 @@ def get_sector_power_map(
             "trust": float(row[4]) if row[4] else 0.5,
             "net_worth": float(row[5]) if row[5] else None,
             "title": row[6],
+            "_provenance": row[8],
+            "_provenance_as_of": row[9],
         }
 
     if not actor_map:
@@ -1104,7 +1122,7 @@ def get_sector_power_map(
             if new_ids:
                 new_rows = conn.execute(text(
                     "SELECT id, name, category, influence_score, trust_score, "
-                    "net_worth_estimate, title "
+                    "net_worth_estimate, title, provenance, provenance_as_of "
                     "FROM actors WHERE id = ANY(:ids)"
                 ), {"ids": list(new_ids)}).fetchall()
                 for nr in new_rows:
@@ -1116,6 +1134,8 @@ def get_sector_power_map(
                         "trust": float(nr[4]) if nr[4] else 0.5,
                         "net_worth": float(nr[5]) if nr[5] else None,
                         "title": nr[6],
+                        "_provenance": nr[7],
+                        "_provenance_as_of": nr[8],
                     }
 
     # Step 5: Merge sector_map metadata (ticker, subsector, price) into nodes
@@ -1148,11 +1168,19 @@ def get_sector_power_map(
                 "ticker": a["ticker"],
                 "subsector": a.get("subsector"),
                 "synthetic": True,
+                # Not an `actors` row at all -- synthesized from
+                # analysis/sector_map_data.yaml, so there is no stored
+                # provenance to look up. This is exactly the case
+                # SOURCE_SECTOR_MAP exists for.
+                "source": SOURCE_SECTOR_MAP,
+                "source_as_of": None,
             }
 
     nodes = []
     for actor in actor_map.values():
         name_lower = actor["name"].lower()
+        stored_provenance = actor.pop("_provenance", None)
+        stored_vintage = actor.pop("_provenance_as_of", None)
         node = {
             **actor,
             "ticker": actor.get("ticker") or ticker_by_name.get(name_lower),
@@ -1161,6 +1189,8 @@ def get_sector_power_map(
         # Use sector_map influence if available (more curated)
         if name_lower in influence_by_name:
             node["influence"] = influence_by_name[name_lower]
+        if not node.get("synthetic"):
+            stamp_actor_node(node, node["id"], stored=stored_provenance, vintage=stored_vintage)
         nodes.append(node)
 
     # Deduplicate edges
@@ -1208,7 +1238,8 @@ def ego_graph_search(
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT id, name, category, tier, influence_score, title
+                SELECT id, name, category, tier, influence_score, title,
+                       provenance, provenance_as_of
                 FROM actors
                 WHERE category NOT IN ('icij_entity', 'icij_officer', 'icij_intermediary')
                 AND (name ILIKE :pat OR name ILIKE :paren)
@@ -1218,11 +1249,14 @@ def ego_graph_search(
 
             return {
                 "results": [
-                    {
-                        "id": r[0], "name": r[1], "category": r[2],
-                        "tier": r[3], "influence": float(r[4]) if r[4] else 0.5,
-                        "title": r[5],
-                    }
+                    stamp_actor_node(
+                        {
+                            "id": r[0], "name": r[1], "category": r[2],
+                            "tier": r[3], "influence": float(r[4]) if r[4] else 0.5,
+                            "title": r[5],
+                        },
+                        r[0], stored=r[6], vintage=r[7],
+                    )
                     for r in rows
                 ],
             }
@@ -1255,7 +1289,8 @@ def get_ego_graph(
             # Verify center actor exists
             center = conn.execute(text(
                 "SELECT id, name, category, tier, influence_score, trust_score, "
-                "net_worth_estimate, title, known_positions "
+                "net_worth_estimate, title, known_positions, "
+                "provenance, provenance_as_of "
                 "FROM actors WHERE id = :id"
             ), {"id": actor_id}).fetchone()
 
@@ -1272,7 +1307,7 @@ def get_ego_graph(
                 aid = row[0]
                 if aid in actor_map:
                     return
-                actor_map[aid] = {
+                node = {
                     "id": aid, "name": row[1], "category": row[2],
                     "tier": row[3],
                     "influence": float(row[4]) if row[4] else 0.5,
@@ -1281,6 +1316,8 @@ def get_ego_graph(
                     "title": row[7],
                     "ring": ring,
                 }
+                stamp_actor_node(node, aid, stored=row[9], vintage=row[10])
+                actor_map[aid] = node
                 ring_map[aid] = ring
 
             _add_actor(center, 0)
@@ -1327,7 +1364,8 @@ def get_ego_graph(
                     new_ids = list(next_frontier)[:remaining]
                     new_rows = conn.execute(text(
                         "SELECT id, name, category, tier, influence_score, trust_score, "
-                        "net_worth_estimate, title, known_positions "
+                        "net_worth_estimate, title, known_positions, "
+                        "provenance, provenance_as_of "
                         "FROM actors WHERE id = ANY(:ids)"
                     ), {"ids": new_ids}).fetchall()
                     for nr in new_rows:
@@ -1645,6 +1683,7 @@ def get_grand_power_map(
                     SELECT a.id, a.name, a.category, a.tier, a.influence_score,
                            a.trust_score, a.net_worth_estimate, a.title, a.known_positions,
                            COALESCE(c.degree, 0) AS degree,
+                           a.provenance, a.provenance_as_of,
                            ROW_NUMBER() OVER (
                                PARTITION BY a.category
                                ORDER BY c.degree DESC, a.influence_score DESC
@@ -1660,7 +1699,8 @@ def get_grand_power_map(
                     AND a.id NOT LIKE 'pol_qq_%%'
                 )
                 SELECT id, name, category, tier, influence_score,
-                       trust_score, net_worth_estimate, title, known_positions, degree
+                       trust_score, net_worth_estimate, title, known_positions, degree,
+                       provenance, provenance_as_of
                 FROM ranked
                 WHERE (category = 'corporation' AND cat_rank <= 15)
                    OR (category = 'politician' AND cat_rank <= 8)
@@ -1695,7 +1735,7 @@ def get_grand_power_map(
             actor_ids = []
             for a in deduped_actors:
                 actor_ids.append(a[0])
-                nodes.append({
+                node = {
                     "id": a[0], "name": a[1], "category": a[2],
                     "tier": a[3],
                     "influence": float(a[4]) if a[4] else 0.5,
@@ -1703,7 +1743,9 @@ def get_grand_power_map(
                     "net_worth": float(a[6]) if a[6] else None,
                     "title": a[7],
                     "degree": int(a[9]) if len(a) > 9 else 0,
-                })
+                }
+                stamp_actor_node(node, a[0], stored=a[10], vintage=a[11])
+                nodes.append(node)
 
             # Find connections between top actors (lower threshold for grand map)
             edges = []
@@ -1776,12 +1818,13 @@ def get_grand_power_map(
                     if new_ids:
                         bridge_actors = conn.execute(text(
                             "SELECT id, name, category, tier, influence_score, "
-                            "trust_score, net_worth_estimate, title "
+                            "trust_score, net_worth_estimate, title, "
+                            "provenance, provenance_as_of "
                             "FROM actors WHERE id = ANY(:ids)"
                         ), {"ids": new_ids}).fetchall()
                         for a in bridge_actors:
                             actor_ids.append(a[0])
-                            nodes.append({
+                            bridge_node = {
                                 "id": a[0], "name": a[1], "category": a[2],
                                 "tier": a[3],
                                 "influence": float(a[4]) if a[4] else 0.3,
@@ -1790,7 +1833,9 @@ def get_grand_power_map(
                                 "title": a[7],
                                 "bridge": True,
                                 "degree": 0,
-                            })
+                            }
+                            stamp_actor_node(bridge_node, a[0], stored=a[8], vintage=a[9])
+                            nodes.append(bridge_node)
 
             # Wealth flows involving top actors (as source or target)
             flows = []

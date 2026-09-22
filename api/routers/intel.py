@@ -21,6 +21,7 @@ from sqlalchemy import text
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from intelligence.actors.provenance import stamp_actor_node
 
 router = APIRouter(prefix="/api/v1/intel", tags=["intel-product"])
 
@@ -1059,17 +1060,18 @@ def intel_network(
                 try:
                     rows = conn.execute(
                         text(
-                            "SELECT actor_id, name, tier, sector, connections "
+                            "SELECT id, name, tier, category, connections, "
+                            "provenance, provenance_as_of "
                             "FROM actors "
                             "WHERE UPPER(name) = :n "
-                            "   OR UPPER(actor_id) = :n"
+                            "   OR UPPER(id) = :n"
                         ),
                         {"n": name},
                     ).fetchall()
                     for r in rows:
                         actor_name = r[1].upper() if r[1] else name
                         if actor_name not in nodes:
-                            nodes[actor_name] = {
+                            node = {
                                 "id": actor_name,
                                 "type": "actor",
                                 "tier": r[2],
@@ -1077,6 +1079,8 @@ def intel_network(
                                 "hop": hop,
                                 "confidence": "derived",
                             }
+                            stamp_actor_node(node, r[0], stored=r[5], vintage=r[6])
+                            nodes[actor_name] = node
                         # Parse connections to find adjacent nodes
                         connections = _safe_json(r[4])
                         if isinstance(connections, list):
