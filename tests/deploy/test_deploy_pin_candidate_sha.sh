@@ -159,7 +159,7 @@ t3_hook="${SANDBOX}/t3/pin_only_hook.sh"
 cat > "$t3_hook" << HOOK
 #!/usr/bin/env bash
 set -euo pipefail
-"$PIN_SCRIPT" "\$1" "$origin" "\$3"
+bash "$PIN_SCRIPT" "\$1" "$origin" "\$3"
 HOOK
 chmod +x "$t3_hook"
 

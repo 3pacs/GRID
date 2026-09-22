@@ -34,7 +34,12 @@ EXPECTED_SHA="$3"
 SKIP_MIGRATIONS="$4"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-"${SCRIPT_DIR}/deploy_pin_candidate_sha.sh" "$CANDIDATE_DIR" "$SRC_URL" "$EXPECTED_SHA"
+# Invoked via `bash`, not `./script`: this repo has core.filemode=false, so a
+# fresh checkout never carries an executable bit regardless of what was
+# committed -- relying on it directly fails with "Permission denied" (found
+# running this exact change in CI, on the self-hosted runner's fresh
+# checkout).
+bash "${SCRIPT_DIR}/deploy_pin_candidate_sha.sh" "$CANDIDATE_DIR" "$SRC_URL" "$EXPECTED_SHA"
 
 cd "$CANDIDATE_DIR"
 
