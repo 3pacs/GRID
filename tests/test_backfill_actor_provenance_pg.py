@@ -54,6 +54,14 @@ CREATE TABLE IF NOT EXISTS actors (
 def _actors_table(pg_engine: Engine):
     with pg_engine.begin() as conn:
         conn.execute(text(_MINIMAL_ACTORS_DDL))
+        # This suite shares one disposable database across files within a
+        # run, so CREATE TABLE IF NOT EXISTS alone is a no-op once any other
+        # file has already created the table -- ensure this file's needed
+        # columns are present regardless of which DDL got there first.
+        conn.execute(text(
+            "ALTER TABLE actors ADD COLUMN IF NOT EXISTS provenance TEXT NOT NULL DEFAULT 'observed'"
+        ))
+        conn.execute(text("ALTER TABLE actors ADD COLUMN IF NOT EXISTS provenance_as_of DATE"))
     yield
 
 

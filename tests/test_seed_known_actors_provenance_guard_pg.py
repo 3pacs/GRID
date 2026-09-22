@@ -54,6 +54,24 @@ CREATE TABLE IF NOT EXISTS actors (
 def _actors_table(pg_engine: Engine):
     with pg_engine.begin() as conn:
         conn.execute(text(_MINIMAL_ACTORS_DDL))
+        # A table left behind by another test file's narrower DDL (this suite
+        # shares one disposable database across files within a run) still
+        # needs every column this file depends on added -- CREATE TABLE IF
+        # NOT EXISTS alone is a no-op once any file has created the table
+        # first, regardless of which columns that first DDL included.
+        for stmt in (
+            "ALTER TABLE actors ADD COLUMN IF NOT EXISTS title TEXT",
+            "ALTER TABLE actors ADD COLUMN IF NOT EXISTS net_worth_estimate DOUBLE PRECISION",
+            "ALTER TABLE actors ADD COLUMN IF NOT EXISTS aum DOUBLE PRECISION",
+            "ALTER TABLE actors ADD COLUMN IF NOT EXISTS influence_score DOUBLE PRECISION",
+            "ALTER TABLE actors ADD COLUMN IF NOT EXISTS trust_score DOUBLE PRECISION",
+            "ALTER TABLE actors ADD COLUMN IF NOT EXISTS motivation_model TEXT",
+            "ALTER TABLE actors ADD COLUMN IF NOT EXISTS data_sources JSONB",
+            "ALTER TABLE actors ADD COLUMN IF NOT EXISTS credibility TEXT",
+            "ALTER TABLE actors ADD COLUMN IF NOT EXISTS provenance TEXT NOT NULL DEFAULT 'observed'",
+            "ALTER TABLE actors ADD COLUMN IF NOT EXISTS provenance_as_of DATE",
+        ):
+            conn.execute(text(stmt))
     yield
 
 
