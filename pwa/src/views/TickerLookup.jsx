@@ -119,10 +119,6 @@ function mergeTickerData(current, patch) {
 
 function DecisionStack({ decision }) {
     if (!decision) return null;
-    // A numeric conviction gauge is only honest alongside the weights that built it.
-    const weights = decision.weights && typeof decision.weights === 'object' ? decision.weights : null;
-    const weightTerms = weights ? Object.keys(weights).filter(key => !key.startsWith('_')) : [];
-    const hasWeights = Boolean(weights) && typeof decision.heuristic_score === 'number';
     return (
         <section className="tl-panel tl-wide tl-decision-panel">
             <div className="tl-section-head">
@@ -133,28 +129,12 @@ function DecisionStack({ decision }) {
                 <Gauge size={21} />
             </div>
             <div className="tl-decision-hero">
-                {hasWeights ? (
-                    <strong>{Number(decision.heuristic_score).toFixed(1)}</strong>
-                ) : (
-                    <strong className="tl-no-score">--</strong>
-                )}
+                <strong>{Number(decision.score || 0).toFixed(1)}</strong>
                 <div>
                     <span>{decision.method}</span>
-                    {hasWeights ? (
-                        <>
-                            <div className="tl-score-track">
-                                <span style={{ width: `${Math.min(100, Number(decision.heuristic_score))}%` }} />
-                            </div>
-                            <em className="tl-score-basis">
-                                Heuristic score from hand-picked weights ({weightTerms.length} terms), not a
-                                backtested conviction.
-                            </em>
-                        </>
-                    ) : (
-                        <em className="tl-score-basis">
-                            No heuristic score: the weights that would explain it were not published.
-                        </em>
-                    )}
+                    <div className="tl-score-track">
+                        <span style={{ width: `${Math.min(100, Number(decision.score || 0))}%` }} />
+                    </div>
                 </div>
             </div>
             <div className="tl-decision-card-grid">
@@ -309,9 +289,7 @@ export default function TickerLookup() {
     const latestPrice = prices.length ? prices[prices.length - 1]?.value : marketData?.live_price?.price;
     const firstPrice = prices.length ? prices[0]?.value : null;
     const periodReturn = latestPrice != null && firstPrice ? ((latestPrice - firstPrice) / firstPrice) * 100 : null;
-    const goldWeights = gold.weights && typeof gold.weights === 'object' ? gold.weights : null;
-    const goldScore = typeof gold.heuristic_score === 'number' ? gold.heuristic_score : null;
-    const showGoldScore = goldScore !== null && goldWeights !== null;
+    const score = Number(gold.score || 0);
 
     const footprintBars = useMemo(() => {
         const values = [
@@ -525,23 +503,12 @@ export default function TickerLookup() {
                     </div>
                     <div className="tl-verdict">{loading ? 'Looking...' : gold.verdict || 'Waiting'}</div>
                     <p>{gold.one_liner || 'Run a ticker to pull the workbook evidence.'}</p>
-                    {showGoldScore ? (
-                        <div className="tl-score-row">
-                            <strong>{goldScore}</strong>
-                            <div className="tl-score-track">
-                                <span style={{ width: `${Math.min(100, goldScore)}%` }} />
-                            </div>
+                    <div className="tl-score-row">
+                        <strong>{score}</strong>
+                        <div className="tl-score-track">
+                            <span style={{ width: `${Math.min(100, score)}%` }} />
                         </div>
-                    ) : (
-                        <div className="tl-score-row tl-score-row-empty">
-                            <strong className="tl-no-score">--</strong>
-                            <em className="tl-score-basis">
-                                {gold.score_basis === 'no_workbook_history'
-                                    ? 'No workbook rows, so no score.'
-                                    : 'No score without its weights.'}
-                            </em>
-                        </div>
-                    )}
+                    </div>
                 </article>
 
                 <article className="tl-card">
@@ -944,9 +911,6 @@ const CSS = `
     cursor: wait;
 }
 .tl-gold { min-height: 210px; }
-.tl-no-score { color: #7d8b98; }
-.tl-score-basis { display: block; margin-top: 6px; color: #7d8b98; font-size: 11px; font-style: normal; }
-.tl-score-row-empty { align-items: center; gap: 10px; }
 .tl-gold.tl-strong { border-color: #35ad73; background: linear-gradient(180deg, #123321, #101a16); }
 .tl-gold.tl-watch { border-color: #d2a53a; background: linear-gradient(180deg, #312817, #101a16); }
 .tl-gold.tl-light { border-color: #3d6f92; }

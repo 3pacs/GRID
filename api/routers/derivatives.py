@@ -78,37 +78,21 @@ def get_overview() -> dict[str, Any]:
 
 # ── GET /gex/{ticker} ───────────────────────────────────────────────
 
-# Read as a module-level singleton so the route signature carries no call in
-# its default (flake8-bugbear B008).
-_SNAP_DATE_QUERY = Query(
-    None,
-    description=(
-        "Chain date to price off (YYYY-MM-DD). Strict: if no chain was stored "
-        "that day the response is available:false — a later chain is never "
-        "substituted. Omit for the latest chain up to today."
-    ),
-)
-
-
 @router.get("/gex/{ticker}")
-async def get_gex(
-    ticker: str,
-    snap_date: date | None = _SNAP_DATE_QUERY,
-) -> dict[str, Any]:
+async def get_gex(ticker: str) -> dict[str, Any]:
     """Full GEX profile for a single ticker.
 
     Returns gex_aggregate, gamma_flip, gamma_wall, put_wall, call_wall,
     dealer_delta, vanna_exposure, charm_exposure, regime, profile curve,
-    and per_strike breakdown, plus the snap_date the chain actually came
-    from (never later than the requested date).
+    and per_strike breakdown.
     """
     try:
         engine_gex = _get_gex_engine()
-        result = engine_gex.compute_gex_profile(ticker.upper(), snap_date=snap_date)
+        result = engine_gex.compute_gex_profile(ticker.upper())
         return result
     except Exception as exc:
         log.warning("GEX computation failed for {t}: {e}", t=ticker, e=str(exc))
-        return {"available": False, "error": str(exc), "ticker": ticker.upper()}
+        return {"error": str(exc), "ticker": ticker.upper()}
 
 
 # ── GET /regime ──────────────────────────────────────────────────────
@@ -583,16 +567,6 @@ async def get_flow_narrative() -> dict[str, Any]:
     try:
         engine_gex = _get_gex_engine()
         spy = engine_gex.compute_gex_profile("SPY")
-        if not spy.get("available"):
-            # No chain -> no narrative. Narrating off a missing profile
-            # printed "SPY is trading at $0.00" with a NEUTRAL regime.
-            return {
-                "content": None,
-                "positioning_data": None,
-                "briefing_date": None,
-                "stale": True,
-                "error": spy.get("error", "No SPY GEX profile available"),
-            }
 
         regime = spy.get("regime", "UNKNOWN")
         spot = spy.get("spot", 0)
@@ -915,45 +889,22 @@ def get_flow_timeline(
             for r in rows:
                 sig_date = r[0]
                 spot = float(r[1]) if r[1] else 0
-                # as_of=True: the chain that existed on or before this bar's
-                # date. Never a later one — a historical bar priced off the
-                # newest chain is look-ahead (C-H9).
-                net_gex = None
-                regime_raw = None
-                chain_snap_date = None
                 try:
-                    gex_result = engine_gex.compute_gex_profile(
-                        ticker, snap_date=sig_date, as_of=True
-                    )
-                    if gex_result.get("available"):
-                        net_gex = gex_result.get("gex_aggregate")
-                        regime_raw = (gex_result.get("regime") or "").lower()
-                        chain_snap_date = gex_result.get("snap_date")
-                        spot = gex_result.get("spot", spot)
-                except Exception as exc:
-                    # A failed computation is not a zero-GEX neutral day
-                    # (C-M5): the bar reports null and the chart shows a gap.
-                    log.debug(
-                        "Flow timeline GEX failed for {t} on {d}: {e}",
-                        t=ticker, d=sig_date, e=str(exc),
-                    )
-
-                regime = None
-                if regime_raw in {"short_gamma", "long_gamma", "neutral"}:
-                    regime = regime_raw
+                    gex_result = engine_gex.compute_gex_profile(ticker, snap_date=sig_date)
+                    net_gex = gex_result.get("gex_aggregate", 0)
+                    regime_raw = (gex_result.get("regime") or "NEUTRAL").lower()
+                    spot = gex_result.get("spot", spot)
+                except Exception:
+                    net_gex = 0
+                    regime_raw = "neutral"
 
                 history.append({
                     "date": str(sig_date),
-                    "net_gex": round(net_gex) if net_gex is not None else None,
-                    "regime": regime,
-                    "chain_snap_date": chain_snap_date,
+                    "net_gex": round(net_gex),
+                    "regime": "short_gamma" if regime_raw == "short_gamma" else
+                              "long_gamma" if regime_raw == "long_gamma" else "neutral",
                     "spot": round(spot, 2),
                 })
-
-                if net_gex is None:
-                    # Unknown, not zero: it can neither confirm nor break a
-                    # gamma-flip crossing, so the previous sign is kept.
-                    continue
 
                 if prev_gex is not None and prev_gex * net_gex < 0:
                     gamma_flip_crossings.append({
@@ -971,13 +922,11 @@ def get_flow_timeline(
         try:
             engine_gex = _get_gex_engine()
             result = engine_gex.compute_gex_profile(ticker)
-            if result.get("available"):
-                # Dated by the chain itself, not by today.
+            if not result.get("error"):
                 history.append({
-                    "date": result.get("snap_date"),
+                    "date": result.get("snap_date", str(end_date)),
                     "net_gex": round(result.get("gex_aggregate", 0)),
                     "regime": (result.get("regime") or "NEUTRAL").lower(),
-                    "chain_snap_date": result.get("snap_date"),
                     "spot": result.get("spot", 0),
                 })
         except Exception as exc:

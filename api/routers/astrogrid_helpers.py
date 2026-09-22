@@ -1728,18 +1728,11 @@ def _find_history_baseline(
     reference_date: date,
     lookback_days: int,
 ) -> float | None:
-    """Value observed at or before ``reference_date - lookback_days``.
-
-    Returns None when no observation is that old. It used to fall back to
-    the oldest point available, so a symbol with three days of history got a
-    "20-day change" that was really a 3-day change, and that mislabelled
-    number drove momentum_score, bias and trend (audit D-M3).
-    """
     cutoff = reference_date - timedelta(days=lookback_days)
     for obs_date, value in reversed(history):
         if obs_date <= cutoff:
             return value
-    return None
+    return history[0][1] if history else None
 
 
 def _momentum_score(

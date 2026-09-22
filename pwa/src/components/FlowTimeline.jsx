@@ -72,12 +72,7 @@ export default function FlowTimeline({ ticker, timelineData }) {
         const catalysts = timelineData.catalysts || [];
         const flipCrossings = timelineData.gamma_flip_crossings || [];
 
-        // Bars the API could not compute carry net_gex: null (rather than a
-        // fabricated 0 / "neutral"). Drop them so the chart shows a gap
-        // instead of plotting a zero-GEX neutral day that never happened.
-        const measured = history.filter(d => d.net_gex != null);
-
-        if (measured.length === 0) return;
+        if (history.length === 0) return;
 
         const svg = d3.select(svgRef.current);
         svg.selectAll('*').remove();
@@ -90,9 +85,9 @@ export default function FlowTimeline({ ticker, timelineData }) {
             .attr('transform', `translate(${MARGIN.left},${MARGIN.top})`);
 
         // Parse dates
-        const parsed = measured.map(d => ({
+        const parsed = history.map(d => ({
             date: new Date(d.date),
-            gex: d.net_gex,
+            gex: d.net_gex || 0,
             spot: d.spot || 0,
             regime: d.regime || 'neutral',
         }));
@@ -500,11 +495,7 @@ export default function FlowTimeline({ ticker, timelineData }) {
     }
 
     const history = timelineData.history || [];
-    // Latest bar that was actually computed; null bars are gaps, not zeros.
-    const measuredHistory = history.filter(d => d.net_gex != null);
-    const latestGex = measuredHistory.length > 0
-        ? measuredHistory[measuredHistory.length - 1].net_gex
-        : null;
+    const latestGex = history.length > 0 ? history[history.length - 1].net_gex : 0;
     const flipCount = (timelineData.gamma_flip_crossings || []).length;
 
     return (
@@ -534,13 +525,8 @@ export default function FlowTimeline({ ticker, timelineData }) {
                     fontFamily: "'JetBrains Mono', monospace",
                 }}>
                     <span style={{ color: colors.textMuted }}>
-                        GEX: <span style={{
-                            color: latestGex == null
-                                ? colors.textMuted
-                                : latestGex >= 0 ? colors.green : colors.red,
-                            fontWeight: 600,
-                        }}>
-                            {latestGex == null ? 'n/a' : formatGEX(latestGex)}
+                        GEX: <span style={{ color: latestGex >= 0 ? colors.green : colors.red, fontWeight: 600 }}>
+                            {formatGEX(latestGex)}
                         </span>
                     </span>
                     {flipCount > 0 && (

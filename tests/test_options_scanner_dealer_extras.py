@@ -19,14 +19,9 @@ def scanner():
 
 
 def _patch_dg(profile):
-    """Helper: build a MagicMock DealerGammaEngine that returns the given profile.
-
-    ``available`` is filled in because that is the flag the scanner now
-    checks: compute_gex_profile returns available:false (instead of a
-    profile off some later chain) when no chain exists for the scan date.
-    """
+    """Helper: build a MagicMock DealerGammaEngine that returns the given profile."""
     eng = MagicMock()
-    eng.compute_gex_profile.return_value = {"available": True, **profile}
+    eng.compute_gex_profile.return_value = profile
     return eng
 
 

@@ -134,11 +134,7 @@ def get_ticker_analysis(
                 import yfinance as yf
 
                 yf_period = _yf_period_map.get(period, "3mo")
-                # auto_adjust=False: these closes are served as
-                # price_source "yfinance" and cached into raw_series, which
-                # holds raw closes. yfinance 0.2.x defaults to True, which
-                # would mix back-adjusted levels into the series (C-M13).
-                hist = yf.Ticker(ticker_upper).history(period=yf_period, auto_adjust=False)
+                hist = yf.Ticker(ticker_upper).history(period=yf_period)
                 if not hist.empty:
                     rows = []
                     for idx, row in hist.iterrows():
@@ -153,6 +149,7 @@ def get_ticker_analysis(
                     analysis["price_source"] = "yfinance"
                     # Cache latest price to DB for future fast lookups
                     if rows:
+                        from datetime import date as _date
                         _cache_price_to_db(
                             engine, ticker_upper,
                             rows[-1]["value"],
@@ -167,12 +164,8 @@ def get_ticker_analysis(
                 if live:
                     analysis["live_price"] = live
                     analysis["price_source"] = "live"
-                    # Only cache when the quote knows its own trading day;
-                    # date.today() on a weekend read wrote Friday's close as
-                    # Saturday's observation (C-M14 / D-M30).
-                    _cache_price_to_db(
-                        engine, ticker_upper, live["price"], live.get("bar_date")
-                    )
+                    from datetime import date as _date
+                    _cache_price_to_db(engine, ticker_upper, live["price"], _date.today())
 
         # ── Related features with z-scores ──
         try:

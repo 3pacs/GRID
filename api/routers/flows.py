@@ -945,8 +945,7 @@ async def get_sector_dive(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Alias for sector detail — used by the SectorDive frontend view."""
-    # get_sector_detail is a sync def; awaiting its dict raised TypeError.
-    return get_sector_detail(sector_name, _token)
+    return await get_sector_detail(sector_name, _token)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -959,24 +958,6 @@ _sector_connections_cache: TTLCache = TTLCache(ttl=_SECTOR_CONNECTIONS_TTL, max_
 
 # Static power/control maps. V1 is hardcoded because these relationships
 # don't move daily and auditability matters more than dynamism.
-#
-# Nothing below is observed. Every edge built from these maps is stamped
-# provenance="curated_static" with the curation date, carries
-# confidence="curated" (never "confirmed" -- they used to be the *only*
-# edges labelled that, sitting beside genuine 13F-derived ones), and ships
-# no numeric strength, because the 0.8/0.6/0.5/0.55 weights were editorial
-# and the frontend rendered them as measured edge weight (audit B-H11).
-
-#: Wire values for edge provenance.
-PROVENANCE_CURATED = "curated_static"
-PROVENANCE_DB_DERIVED = "db_derived"
-
-#: Confidence label a curated edge carries. Deliberately not "confirmed".
-CONFIDENCE_CURATED = "curated"
-
-#: Vintage of the curated maps: the last hand-edit of this file
-#: (`git log -1 --date=short -- api/routers/flows.py`).
-CURATED_MAPS_AS_OF = "2026-09-10"
 
 # Activist / dynasty / family-office → holdings mapping.
 # Edges type="activist_holder" or "private_control".
@@ -1267,67 +1248,47 @@ def _build_sector_connections(
     # ── Build edges ───────────────────────────────────────────
     edges: list[dict[str, Any]] = []
 
-    def add_edge(source: str, target: str, etype: str, strength: float | None,
-                 evidence: str, confidence: str = "derived",
-                 provenance: str = PROVENANCE_DB_DERIVED,
-                 strength_basis: str = "measured") -> None:
-        """Append an edge.
-
-        Every edge declares where it came from. ``provenance`` is
-        ``"curated_static"`` for the hand-written maps at the top of this
-        module and ``"db_derived"`` for everything computed from a table.
-        A curated edge carries no numeric ``strength`` -- the 0.8/0.6/0.5
-        weights it used to ship were editorial, and the frontend rendered
-        them as measured edge weight (audit B-H11).
-        """
+    def add_edge(source: str, target: str, etype: str, strength: float,
+                 evidence: str, confidence: str = "derived") -> None:
         if source in node_ids and target in node_ids and source != target:
             edges.append({
                 "source": source,
                 "target": target,
                 "type": etype,
-                "strength": None if strength is None else round(strength, 3),
-                "strength_basis": strength_basis,
+                "strength": round(strength, 3),
                 "evidence": evidence,
                 "confidence": confidence,
-                "provenance": provenance,
-                "as_of": CURATED_MAPS_AS_OF if provenance == PROVENANCE_CURATED else None,
             })
 
     # Static edges: activist/private holders → targets
     for slug, info in _ACTIVIST_HOLDERS.items():
         for tk in info["targets"]:
             if tk in ticker_set:
-                add_edge(slug, tk, info["kind"], None, info["evidence"],
-                         CONFIDENCE_CURATED, PROVENANCE_CURATED, "editorial")
+                add_edge(slug, tk, info["kind"], 0.8, info["evidence"], "confirmed")
 
     # Supply chain edges
     for tk, inputs in _SUPPLY_CHAIN.items():
         if tk in ticker_set:
             for c in inputs:
-                add_edge(f"commodity_{c}", tk, "supply_chain", None,
-                         f"{c} is a primary input cost for {tk}",
-                         CONFIDENCE_CURATED, PROVENANCE_CURATED, "editorial")
+                add_edge(f"commodity_{c}", tk, "supply_chain", 0.6,
+                         f"{c} is a primary input cost for {tk}", "confirmed")
 
     # Regulator threat edges
     for slug, info in _REGULATOR_THREATS.items():
         for tk in info["targets"]:
             if tk in ticker_set:
-                add_edge(slug, tk, "regulatory_threat", None, info["evidence"],
-                         CONFIDENCE_CURATED, PROVENANCE_CURATED, "editorial")
+                add_edge(slug, tk, "regulatory_threat", 0.5, info["evidence"], "confirmed")
 
     # GLP-1 demand destruction edges
     for slug, info in _GLP1_PRESSURE.items():
         for tk in info["targets"]:
             if tk in ticker_set:
-                add_edge(slug, tk, "demand_destruction", None, info["evidence"],
-                         CONFIDENCE_CURATED, PROVENANCE_CURATED, "editorial")
+                add_edge(slug, tk, "demand_destruction", 0.55, info["evidence"], "estimated")
 
     # ── Dynamic DB-driven edges ───────────────────────────────
     if not sector_tickers:
         payload = {"nodes": nodes, "edges": edges, "clusters": [],
-                   "lineage": _LINEAGE_CHAINS.get(sector_name, []),
-                   "lineage_provenance": PROVENANCE_CURATED,
-                   "lineage_as_of": CURATED_MAPS_AS_OF}
+                   "lineage": _LINEAGE_CHAINS.get(sector_name, [])}
         _sector_connections_cache.set(cache_key, payload)
         return payload
 
@@ -1479,7 +1440,7 @@ def _build_sector_connections(
                             accumulators[i], accumulators[j],
                             "co_dark_pool_accumulation", 0.5,
                             "Both showing dark-pool accumulation (short/total < 40%)",
-                            "derived", strength_basis="ui_weight",
+                            "derived",
                         )
     except Exception as exc:
         log.warning("connections: dark_pool_weekly failed: {e}", e=str(exc))
@@ -1500,8 +1461,7 @@ def _build_sector_connections(
                         "size": 45,
                     })
                     add_edge(slug, tk, "lever_puller", 0.7,
-                             lp.get("reason", "Identified lever puller"), "derived",
-                             strength_basis="ui_weight")
+                             lp.get("reason", "Identified lever puller"), "derived")
     except Exception as exc:
         log.debug("connections: lever_pullers skipped: {e}", e=str(exc))
 
@@ -1536,9 +1496,6 @@ def _build_sector_connections(
                 "target": tk,
                 "type": "convergence",
                 "strength": round(0.65, 3),
-                "strength_basis": "ui_weight",
-                "provenance": PROVENANCE_DB_DERIVED,
-                "as_of": None,
                 "evidence": evidence,
                 "confidence": "derived",
                 "signal_types": sorted(set(signal_types)),
@@ -1567,7 +1524,7 @@ def _build_sector_connections(
                     0.9,
                     f"{s.get('source_id', 'SEC filing')} "
                     f"{s.get('signal_date', '')} (confirmed)",
-                    "confirmed", strength_basis="ui_weight",
+                    "confirmed",
                 )
                 break  # one badge per ticker is enough
 
@@ -1590,7 +1547,7 @@ def _build_sector_connections(
                     f"Chokepoint score "
                     f"{meta.get('chokepoint_score', 0):.2f} on "
                     f"{meta.get('input_type', 'input')}",
-                    s.get("confidence", "derived"), strength_basis="ui_weight",
+                    s.get("confidence", "derived"),
                 )
                 break
     except Exception as exc:
@@ -1626,8 +1583,6 @@ def _build_sector_connections(
         "edges": edges,
         "clusters": clusters,
         "lineage": _LINEAGE_CHAINS.get(sector_name, []),
-        "lineage_provenance": PROVENANCE_CURATED,
-        "lineage_as_of": CURATED_MAPS_AS_OF,
     }
     _sector_connections_cache.set(cache_key, payload)
     return payload
@@ -1917,11 +1872,8 @@ def _apply_physics_scores(engine, today, setups: list) -> None:
         tickers = {s["ticker"] for s in setups if s.get("ticker")}
         for ticker in tickers:
             try:
-                # as_of=True: today's picture may legitimately rest on the
-                # last stored chain (weekend/holiday), but never on a later
-                # one. The date used is surfaced as physics.gex_snap_date.
-                result = dge.compute_gex_profile(ticker, today, as_of=True)
-                if result.get("available"):
+                result = dge.compute_gex_profile(ticker, today)
+                if "error" not in result:
                     gex_by_ticker[ticker] = result
             except Exception as exc:
                 log.debug("Flows: GEX profile failed for {t}: {e}", t=ticker, e=str(exc))
@@ -1965,7 +1917,6 @@ def _apply_physics_scores(engine, today, setups: list) -> None:
             regime = gex_data.get("regime", "NEUTRAL")
             physics["gex"] = round(gex_norm, 4)
             physics["gex_regime"] = regime
-            physics["gex_snap_date"] = gex_data.get("snap_date")
             if regime == "SHORT_GAMMA":
                 physics["gex_interpretation"] = (
                     "Dealers short gamma \u2014 moves will be amplified"

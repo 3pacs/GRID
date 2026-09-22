@@ -22,24 +22,6 @@ Each actor has:
     - who influences them
     - known connections to actors in other lever categories
 
-PROVENANCE
-----------
-``LEVER_HIERARCHY`` is a hand-curated map. The ``influence`` weights and the
-``key_personnel`` rosters -- named real people, with titles -- were typed in
-by a person and are never recomputed; ``get_lever_hierarchy`` deep-copies the
-constant and only *adds* live metrics beside it, so ``has_live_data`` flags
-the live half and says nothing about the static half.
-
-So:
-
-* ``confidence`` on a curated actor is ``"curated_estimate"``. It used to
-  read ``"hard_data"``, which claimed a measurement behind a hand-assigned
-  0.99 (audit A-M13).
-* every actor record that carries a ``key_personnel`` block also carries
-  ``roster_as_of``: ``ROSTER_AS_OF`` for the curated rosters, ``None`` for
-  the dynamically injected actors that have no roster at all. Rosters drift
-  (boards change), and a reader has to be able to see how old one is.
-
 Key entry points:
     get_lever_hierarchy        -- full hierarchy (all 8 domains)
     get_lever_domain           -- single domain deep-dive
@@ -58,37 +40,6 @@ from typing import Any
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# CURATION PROVENANCE
-# ══════════════════════════════════════════════════════════════════════════
-
-#: Vintage of the curated ``key_personnel`` rosters below: the last hand-edit
-#: of this file (``git log -1 --date=short -- intelligence/global_levers.py``).
-#: Stamped onto every actor record that carries a roster.
-ROSTER_AS_OF = "2026-09-10"
-
-
-def _stamp_roster_vintage(hierarchy: dict[str, Any]) -> dict[str, Any]:
-    """Add ``roster_as_of`` to every actor that carries a key_personnel block.
-
-    A curated roster gets ``ROSTER_AS_OF``. A dynamically injected actor has
-    an empty roster and no curation date, so it gets ``None`` -- the key is
-    still present, so "has key_personnel" always implies "has roster_as_of".
-
-    Mutates in place; callers pass a deep copy, never the module constant.
-    """
-    for domain in hierarchy.values():
-        for tier_actors in domain.get("actors", {}).values():
-            for actor in tier_actors.values():
-                if "key_personnel" not in actor:
-                    continue
-                actor["roster_as_of"] = (
-                    None if actor.get("dynamic") or not actor["key_personnel"]
-                    else ROSTER_AS_OF
-                )
-    return hierarchy
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -128,7 +79,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                         {"name": "Lisa Cook", "title": "Governor", "influence": 0.78},
                         {"name": "Adriana Kugler", "title": "Governor", "influence": 0.76},
                     ],
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
                 "ecb": {
                     "name": "European Central Bank",
@@ -150,7 +101,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                         {"name": "Isabel Schnabel", "title": "Executive Board", "influence": 0.72},
                         {"name": "Philip Lane", "title": "Chief Economist", "influence": 0.74},
                     ],
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
                 "boj": {
                     "name": "Bank of Japan",
@@ -170,7 +121,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                         {"name": "Kazuo Ueda", "title": "Governor", "influence": 0.70},
                         {"name": "Shinichi Uchida", "title": "Deputy Governor", "influence": 0.55},
                     ],
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
                 "pboc": {
                     "name": "People's Bank of China",
@@ -189,7 +140,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                     "key_personnel": [
                         {"name": "Pan Gongsheng", "title": "Governor", "influence": 0.80},
                     ],
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
                 "boe": {
                     "name": "Bank of England",
@@ -204,7 +155,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                     "key_personnel": [
                         {"name": "Andrew Bailey", "title": "Governor", "influence": 0.55},
                     ],
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
             },
             "tier_2": {
@@ -224,7 +175,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                         {"name": "Janet Yellen", "title": "Secretary", "influence": 0.90},
                         {"name": "Wally Adeyemo", "title": "Deputy Secretary", "influence": 0.75},
                     ],
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
                 "congress": {
                     "name": "US Congress",
@@ -281,7 +232,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                         {"name": "Jane Fraser", "title": "CEO, Citigroup", "influence": 0.50},
                         {"name": "Brian Moynihan", "title": "CEO, Bank of America", "influence": 0.50},
                     ],
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
                 "market_makers": {
                     "name": "Market Makers & Dealers",
@@ -381,7 +332,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                         {"name": "Janet Yellen", "title": "Secretary", "influence": 0.90},
                         {"name": "IRS Commissioner", "title": "Commissioner", "influence": 0.55},
                     ],
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
             },
             "tier_2": {
@@ -501,7 +452,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                     "key_personnel": [
                         {"name": "Gary Gensler", "title": "Chair", "influence": 0.80},
                     ],
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
                 "cftc": {
                     "name": "Commodity Futures Trading Commission",
@@ -520,7 +471,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                     "key_personnel": [
                         {"name": "CFTC Chair", "title": "Chair", "influence": 0.55},
                     ],
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
                 "fed_supervision": {
                     "name": "Federal Reserve Supervision",
@@ -539,7 +490,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                     "key_personnel": [
                         {"name": "Michael Barr", "title": "Vice Chair for Supervision", "influence": 0.80},
                     ],
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
                 "doj": {
                     "name": "Department of Justice",
@@ -559,7 +510,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                         {"name": "Attorney General", "title": "AG", "influence": 0.70},
                         {"name": "AAG Antitrust", "title": "Assistant AG", "influence": 0.60},
                     ],
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
             },
             "tier_2": {
@@ -669,7 +620,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                         {"name": "Rob Kapito", "title": "President", "influence": 0.60},
                     ],
                     "aum": 10_500_000_000_000,
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
                 "vanguard": {
                     "name": "Vanguard Group",
@@ -685,7 +636,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                         "regulation": "vanguard_proxy_voting_shapes_governance",
                     },
                     "aum": 8_600_000_000_000,
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
                 "state_street": {
                     "name": "State Street Global Advisors",
@@ -701,7 +652,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                         "regulation": "state_street_custody_is_systemic",
                     },
                     "aum": 4_100_000_000_000,
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
             },
             "tier_2": {
@@ -902,7 +853,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                     "key_personnel": [
                         {"name": "Michael Bloomberg", "title": "Founder", "influence": 0.75},
                     ],
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
                 "reuters": {
                     "name": "Reuters / LSEG",
@@ -917,7 +868,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                     "cross_domain": {
                         "trade": "reuters_fx_benchmarks_used_globally",
                     },
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
                 "fed_communications": {
                     "name": "Federal Reserve Communications",
@@ -932,7 +883,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                     "cross_domain": {
                         "monetary_policy": "communications_IS_monetary_policy",
                     },
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
             },
             "tier_2": {
@@ -1085,7 +1036,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                         {"name": "Satya Nadella", "title": "Microsoft CEO (Azure parent)", "influence": 0.80},
                         {"name": "Sundar Pichai", "title": "Alphabet CEO (GCP parent)", "influence": 0.72},
                     ],
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
                 "chip_makers": {
                     "name": "Semiconductor Companies",
@@ -1107,7 +1058,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                         {"name": "Peter Wennink", "title": "ASML CEO", "influence": 0.65},
                         {"name": "Lisa Su", "title": "AMD CEO", "influence": 0.60},
                     ],
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
                 "network_infra": {
                     "name": "Network Infrastructure",
@@ -1141,7 +1092,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                         "regulation": "platform_antitrust_scrutiny",
                         "information": "software_platforms_control_data_access",
                     },
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
                 "ai_companies": {
                     "name": "AI Companies",
@@ -1234,7 +1185,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                         {"name": "Haitham Al Ghais", "title": "OPEC Secretary General", "influence": 0.50},
                         {"name": "Alexander Novak", "title": "Russian Deputy PM (Energy)", "influence": 0.65},
                     ],
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
                 "russia": {
                     "name": "Russia (Energy)",
@@ -1276,7 +1227,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                         {"name": "Darren Woods", "title": "ExxonMobil CEO", "influence": 0.60},
                         {"name": "Mike Wirth", "title": "Chevron CEO", "influence": 0.55},
                     ],
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
             },
             "tier_2": {
@@ -1290,7 +1241,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                     "cross_domain": {
                         "trade": "refining_capacity_affects_product_exports",
                     },
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
                 "pipelines": {
                     "name": "Pipeline Operators",
@@ -1302,7 +1253,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                     "cross_domain": {
                         "regulation": "pipeline_permitting_is_political",
                     },
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
                 "utilities": {
                     "name": "Electric Utilities",
@@ -1315,7 +1266,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                         "technology": "ai_data_center_power_demand",
                         "regulation": "utility_rate_cases",
                     },
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
             },
             "tier_3": {
@@ -1330,7 +1281,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                         "fiscal_policy": "ira_subsidies_drive_renewable_investment",
                         "technology": "battery_tech_determines_grid_storage",
                     },
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
                 "nuclear": {
                     "name": "Nuclear Power",
@@ -1355,7 +1306,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                     "cross_domain": {
                         "technology": "grid_operators_gate_data_center_buildout",
                     },
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
             },
         },
@@ -1390,7 +1341,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                     "key_personnel": [
                         {"name": "USTR", "title": "US Trade Representative", "influence": 0.80},
                     ],
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
                 "china_mofcom": {
                     "name": "China Ministry of Commerce",
@@ -1423,7 +1374,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                         "technology": "eu_digital_regulation_shapes_tech",
                         "energy": "eu_carbon_border_tax",
                     },
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
             },
             "tier_2": {
@@ -1437,7 +1388,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                     "cross_domain": {
                         "regulation": "wto_rules_constrain_domestic_regulation",
                     },
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
                 "shipping_companies": {
                     "name": "Global Shipping",
@@ -1456,7 +1407,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                         {"name": "Maersk", "title": "Largest container line", "influence": 0.45},
                         {"name": "MSC", "title": "#2 container line", "influence": 0.40},
                     ],
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
                 "port_operators": {
                     "name": "Major Port Operators",
@@ -1482,7 +1433,7 @@ LEVER_HIERARCHY: dict[str, dict[str, Any]] = {
                     "cross_domain": {
                         "fiscal_policy": "customs_collects_tariff_revenue",
                     },
-                    "confidence": "curated_estimate",
+                    "confidence": "hard_data",
                 },
                 "freight_forwarders": {
                     "name": "Freight Forwarders & Logistics",
@@ -1648,9 +1599,6 @@ def get_lever_hierarchy(engine: Engine | None = None) -> dict[str, Any]:
     # Inject dynamic actors discovered from signal_sources
     if engine:
         _inject_dynamic_actors(engine, hierarchy)
-
-    # Stamp roster vintages after injection so the dynamic actors are covered.
-    _stamp_roster_vintage(hierarchy)
 
     for domain_key, domain in hierarchy.items():
         actor_count = 0
@@ -2121,10 +2069,6 @@ def get_lever_domain(domain: str) -> dict[str, Any]:
         enriched_tier: dict[str, dict] = {}
         for actor_id, actor_data in tier_actors.items():
             enriched = dict(actor_data)
-            if "key_personnel" in enriched:
-                enriched["roster_as_of"] = (
-                    ROSTER_AS_OF if enriched["key_personnel"] else None
-                )
             # Add appearances in other domains
             other_appearances = [
                 a for a in _ACTOR_INDEX.get(actor_id, [])

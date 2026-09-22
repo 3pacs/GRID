@@ -38,9 +38,7 @@ class EarningsPrediction:
     ticker: str
     earnings_date: str
     predicted_direction: str      # up / down / flat
-    predicted_move_pct: float | None   # expected % move; None when nothing was measured
-    predicted_move_basis: str     # history_and_options / options_only / history_only / unavailable
-    expected_move_options: float | None  # IV-implied move; None with no options snapshot
+    predicted_move_pct: float     # expected % move
     confidence: float             # 0-1
     iv_rank: float | None         # current IV percentile
     historical_surprise_avg: float | None
@@ -72,8 +70,6 @@ def _ensure_tables(engine: Engine) -> None:
                 earnings_date DATE NOT NULL,
                 predicted_direction TEXT NOT NULL,
                 predicted_move_pct DOUBLE PRECISION,
-                predicted_move_basis TEXT,
-                expected_move_options DOUBLE PRECISION,
                 confidence DOUBLE PRECISION,
                 iv_rank DOUBLE PRECISION,
                 historical_surprise_avg DOUBLE PRECISION,
@@ -89,14 +85,6 @@ def _ensure_tables(engine: Engine) -> None:
                 UNIQUE (ticker, earnings_date)
             )
         """))
-        # predicted_move_basis / expected_move_options were added after the
-        # original table shipped, so a stored row says which inputs actually
-        # existed behind predicted_move_pct. They are in the CREATE above for a
-        # fresh database; an already-created table is migrated by alembic
-        # revision ``earnings_pred_move_basis_0918``, NOT by a runtime ALTER
-        # here -- ADD COLUMN takes ACCESS EXCLUSIVE on the table and this
-        # function runs on every earnings request.
-        # tests/test_earnings_predictions_schema_parity.py keeps the two in step.
         conn.execute(text("""
             CREATE INDEX IF NOT EXISTS idx_earnings_pred_date
             ON earnings_predictions (earnings_date)
@@ -130,7 +118,7 @@ def get_earnings_calendar(engine: Engine, days_ahead: int = 30) -> list[dict]:
             SELECT ec.ticker, ec.earnings_date, ec.fiscal_quarter,
                    ec.eps_estimate, ec.revenue_estimate, ec.reported,
                    ep.predicted_direction, ep.predicted_move_pct,
-                   ep.confidence, ep.verdict, ep.predicted_move_basis
+                   ep.confidence, ep.verdict
             FROM earnings_calendar ec
             LEFT JOIN earnings_predictions ep
                 ON ec.ticker = ep.ticker AND ec.earnings_date = ep.earnings_date
@@ -157,15 +145,14 @@ def get_earnings_calendar(engine: Engine, days_ahead: int = 30) -> list[dict]:
                 "move_pct": r[7],
                 "confidence": r[8],
                 "verdict": r[9],
-                "move_basis": r[10],
             }
 
-        # Enrich with IV data. The keys are always present so "no options snapshot"
-        # is explicitly null rather than a silently absent field.
+        # Enrich with IV data
         iv_data = _get_iv_data(conn, r[0])
-        entry["iv_rank"] = iv_data.get("iv_rank") if iv_data else None
-        entry["iv_atm"] = iv_data.get("iv_atm") if iv_data else None
-        entry["expected_move_options"] = iv_data.get("expected_move") if iv_data else None
+        if iv_data:
+            entry["iv_rank"] = iv_data.get("iv_rank")
+            entry["iv_atm"] = iv_data.get("iv_atm")
+            entry["expected_move_options"] = iv_data.get("expected_move")
 
         results.append(entry)
 
@@ -370,20 +357,16 @@ def predict_earnings_reaction(engine: Engine, ticker: str) -> dict:
         bull_score = 0.0
         bear_score = 0.0
 
-        # Historical pattern weight. With no reported quarters there is no beat rate,
-        # so the term is dropped entirely rather than imputed at the 0.5 midpoint.
-        beat_rate = signals.get("historical_beat_rate")
-        if beat_rate is not None:
-            if beat_rate > 0.5:
-                bull_score += (beat_rate - 0.5) * 4.0
-            else:
-                bear_score += (0.5 - beat_rate) * 4.0
+        # Historical pattern weight
+        beat_rate = signals.get("historical_beat_rate", 0.5)
+        if beat_rate > 0.5:
+            bull_score += (beat_rate - 0.5) * 4.0
+        else:
+            bear_score += (0.5 - beat_rate) * 4.0
 
         # Sector momentum
-        sec_mom = signals.get("sector_momentum")
-        if sec_mom is None:
-            pass
-        elif sec_mom > 0:
+        sec_mom = signals.get("sector_momentum", 0)
+        if sec_mom > 0:
             bull_score += min(sec_mom * 10, 1.0)
         else:
             bear_score += min(abs(sec_mom) * 10, 1.0)
@@ -409,24 +392,11 @@ def predict_earnings_reaction(engine: Engine, ticker: str) -> dict:
         # Confidence
         confidence = min(0.9, max(0.1, net / 3.0))
 
-        # Expected move magnitude. The options term is used only when an options
-        # snapshot actually produced one - there is no default magnitude.
-        raw_hist = signals.get("historical_surprise_avg")
-        hist_avg = abs(raw_hist) if raw_hist is not None else None
-        expected_move_options = signals.get("expected_move_options")
-        if hist_avg is not None and expected_move_options is not None:
-            predicted_move = hist_avg * 0.3 + expected_move_options * 0.7
-            predicted_move_basis = "history_and_options"
-        elif expected_move_options is not None:
-            predicted_move = expected_move_options
-            predicted_move_basis = "options_only"
-        elif hist_avg is not None:
-            predicted_move = hist_avg
-            predicted_move_basis = "history_only"
-        else:
-            predicted_move = None
-            predicted_move_basis = "unavailable"
-        if predicted_move is not None and direction == "down":
+        # Expected move magnitude
+        hist_avg = abs(signals.get("historical_surprise_avg", 0))
+        opt_move = signals.get("expected_move_options", 2.0)
+        predicted_move = (hist_avg * 0.3 + opt_move * 0.7) if opt_move else hist_avg
+        if direction == "down":
             predicted_move = -predicted_move
 
         # Build reasoning
@@ -436,7 +406,7 @@ def predict_earnings_reaction(engine: Engine, ticker: str) -> dict:
         reasoning = "; ".join(reasoning_parts)
 
         # Clamp predicted move to ±30%
-        if predicted_move is not None and (predicted_move < -30.0 or predicted_move > 30.0):
+        if predicted_move < -30.0 or predicted_move > 30.0:
             log.debug("Clamping predicted_move from {orig} to ±30% for {ticker}",
                        orig=predicted_move, ticker=ticker)
             predicted_move = max(-30.0, min(30.0, predicted_move))
@@ -452,9 +422,7 @@ def predict_earnings_reaction(engine: Engine, ticker: str) -> dict:
             ticker=ticker,
             earnings_date=earn_date.isoformat(),
             predicted_direction=direction,
-            predicted_move_pct=round(predicted_move, 2) if predicted_move is not None else None,
-            predicted_move_basis=predicted_move_basis,
-            expected_move_options=expected_move_options,
+            predicted_move_pct=round(predicted_move, 2),
             confidence=round(confidence, 3),
             iv_rank=signals.get("iv_rank"),
             historical_surprise_avg=signals.get("historical_surprise_avg"),
@@ -494,8 +462,7 @@ def get_prediction_scorecard(engine: Engine) -> dict[str, Any]:
         totals = {r[0]: r[1] for r in scored}
         total_scored = sum(totals.values())
         hits = totals.get("hit", 0)
-        # Nothing scored is not 0% accuracy; it is no accuracy.
-        overall_pct = round(hits / total_scored * 100, 1) if total_scored > 0 else None
+        overall_pct = round(hits / total_scored * 100, 1) if total_scored > 0 else 0.0
 
         # Per-direction accuracy
         dir_stats = conn.execute(text("""
@@ -512,7 +479,7 @@ def get_prediction_scorecard(engine: Engine) -> dict[str, Any]:
                 "direction": r[0],
                 "total": r[1],
                 "hits": r[2],
-                "accuracy_pct": round(r[2] / r[1] * 100, 1) if r[1] > 0 else None,
+                "accuracy_pct": round(r[2] / r[1] * 100, 1) if r[1] > 0 else 0,
             }
             for r in dir_stats
         ]
@@ -520,8 +487,7 @@ def get_prediction_scorecard(engine: Engine) -> dict[str, Any]:
         # Recent predictions with outcomes
         recent = conn.execute(text("""
             SELECT ticker, earnings_date, predicted_direction, predicted_move_pct,
-                   confidence, actual_direction, actual_move_pct, verdict, scored_at,
-                   predicted_move_basis, expected_move_options
+                   confidence, actual_direction, actual_move_pct, verdict, scored_at
             FROM earnings_predictions
             ORDER BY earnings_date DESC
             LIMIT 30
@@ -533,8 +499,6 @@ def get_prediction_scorecard(engine: Engine) -> dict[str, Any]:
                 "earnings_date": r[1].isoformat() if r[1] else None,
                 "predicted_direction": r[2],
                 "predicted_move_pct": r[3],
-                "predicted_move_basis": r[9],
-                "expected_move_options": r[10],
                 "confidence": r[4],
                 "actual_direction": r[5],
                 "actual_move_pct": r[6],
@@ -564,7 +528,7 @@ def get_prediction_scorecard(engine: Engine) -> dict[str, Any]:
                 "bucket": r[0],
                 "total": r[1],
                 "hits": r[2],
-                "accuracy_pct": round(r[2] / r[1] * 100, 1) if r[1] > 0 else None,
+                "accuracy_pct": round(r[2] / r[1] * 100, 1) if r[1] > 0 else 0,
             }
             for r in calibration
         ]
@@ -572,7 +536,6 @@ def get_prediction_scorecard(engine: Engine) -> dict[str, Any]:
     return {
         "overall": {
             "accuracy_pct": overall_pct,
-            "scored_n": total_scored,
             "total_scored": total_scored,
             "hits": hits,
             "misses": totals.get("miss", 0),
@@ -791,19 +754,15 @@ def _store_prediction(engine: Engine, pred: EarningsPrediction) -> None:
         conn.execute(text("""
             INSERT INTO earnings_predictions
                 (id, ticker, earnings_date, predicted_direction, predicted_move_pct,
-                 predicted_move_basis, expected_move_options,
                  confidence, iv_rank, historical_surprise_avg, historical_beat_rate,
                  sector_momentum, insider_signal, congressional_signal, reasoning)
             VALUES
-                (:id, :ticker, :edate, :dir, :move, :move_basis, :opt_move,
-                 :conf, :iv, :hist_avg,
+                (:id, :ticker, :edate, :dir, :move, :conf, :iv, :hist_avg,
                  :beat_rate, :sec_mom, :insider, :congress, :reasoning)
             ON CONFLICT (ticker, earnings_date)
             DO UPDATE SET
                 predicted_direction = EXCLUDED.predicted_direction,
                 predicted_move_pct = EXCLUDED.predicted_move_pct,
-                predicted_move_basis = EXCLUDED.predicted_move_basis,
-                expected_move_options = EXCLUDED.expected_move_options,
                 confidence = EXCLUDED.confidence,
                 reasoning = EXCLUDED.reasoning
         """), {
@@ -812,8 +771,6 @@ def _store_prediction(engine: Engine, pred: EarningsPrediction) -> None:
             "edate": pred.earnings_date,
             "dir": pred.predicted_direction,
             "move": pred.predicted_move_pct,
-            "move_basis": pred.predicted_move_basis,
-            "opt_move": pred.expected_move_options,
             "conf": pred.confidence,
             "iv": pred.iv_rank,
             "hist_avg": pred.historical_surprise_avg,

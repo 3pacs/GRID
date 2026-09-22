@@ -7,9 +7,6 @@ import { colors } from '../../styles/shared.js';
 
 const CONFIDENCE_MAP = {
   confirmed: { label: 'LIVE', bg: colors.greenBg, color: colors.green, dot: colors.green },
-  // Hand-curated static content (provenance: "curated_static"). Never
-  // rendered as LIVE — it is an editorial relationship, not an observation.
-  curated:   { label: 'CURATED', bg: `${colors.textMuted}20`, color: colors.textMuted, dot: colors.textMuted },
   derived:   { label: 'DERIVED', bg: colors.yellowBg, color: colors.yellow, dot: colors.yellow },
   estimated: { label: 'EST', bg: `${colors.accent}20`, color: colors.accent, dot: colors.accent },
   stale:     { label: 'STALE', bg: colors.redBg, color: colors.red, dot: colors.red },
@@ -51,7 +48,6 @@ export default function FreshnessIndicator({ confidence, compact = false, style 
 export function confidenceOpacity(c) {
   const s = String(c || '').toLowerCase();
   if (s === 'confirmed') return 1.0;
-  if (s === 'curated') return 0.45;
   if (s === 'derived') return 0.85;
   if (s === 'estimated') return 0.7;
   if (s === 'rumored') return 0.5;

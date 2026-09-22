@@ -43,7 +43,6 @@ function confidenceOpacity(confidence) {
   if (!confidence) return 0.85;
   const c = String(confidence).toLowerCase();
   if (c === 'confirmed') return 1.0;
-  if (c === 'curated') return 0.45;   // hand-curated static edge, not observed
   if (c === 'derived')   return 0.85;
   if (c === 'estimated') return 0.7;
   if (c === 'rumored')   return 0.5;

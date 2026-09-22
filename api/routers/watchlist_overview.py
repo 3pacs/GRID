@@ -42,7 +42,7 @@ def get_ticker_overview(
         dict with keys: overview, key_levels, sentiment, generated_at,
         sector_path (for the capital-flow mini-chart).
     """
-    from datetime import datetime
+    from datetime import datetime, date
 
     _init_table()
     engine = get_db_engine()
@@ -73,13 +73,8 @@ def get_ticker_overview(
         if not price_info:
             live = _fetch_live_price(ticker_upper)
             if live:
-                price_info = {
-                    "price": live["price"],
-                    "pct_1d": live.get("pct_1d"),
-                    "date": live.get("bar_date"),
-                    "source": "live",
-                }
-                _cache_price_to_db(engine, ticker_upper, live["price"], live.get("bar_date"))
+                price_info = {"price": live["price"], "pct_1d": live.get("pct_1d"), "source": "live"}
+                _cache_price_to_db(engine, ticker_upper, live["price"], date.today())
 
         # Options (latest)
         try:
@@ -465,10 +460,7 @@ def get_ticker_quote(
                 change_pct = live.get("pct_1d")
                 source = "live"
                 if price is not None:
-                    # as_of_date is the quote's own bar date when it has one;
-                    # None means "undated live quote", not "today" (C-M14).
-                    bar_date = live.get("bar_date")
-                    as_of_date = date.fromisoformat(bar_date) if bar_date else None
+                    as_of_date = date.today()
                     _cache_price_to_db(engine, ticker_upper, price, as_of_date)
         except Exception as exc:
             # Not a query: an outbound HTTP fetch. Always operational.

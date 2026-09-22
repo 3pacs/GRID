@@ -1802,29 +1802,6 @@ function ActorNetworkLegacy({ focusActor = '' }) {
                                         <span style={{ color: colors.textMuted }}>AUM</span>
                                         <span style={{ color: colors.text, fontFamily: MONO, fontWeight: 600 }}>
                                             {formatMoney(selectedNode.aum)}
-                                            <span style={{ fontSize: '8px', color: colors.textMuted, marginLeft: '4px' }}>
-                                                {selectedNode.credibility}
-                                            </span>
-                                        </span>
-                                    </div>
-                                )}
-                                {/* Where these figures came from. A curated_seed node's
-                                    net worth / AUM was typed in by hand on source_as_of;
-                                    it is not a reading taken today. */}
-                                {selectedNode.source === 'curated_seed' && (
-                                    <div style={S.metricRow}>
-                                        <span style={{ color: colors.textMuted }}>Source</span>
-                                        <span style={{ color: colors.textMuted, fontFamily: MONO, fontSize: '9px' }}>
-                                            curated (hand-entered)
-                                            {selectedNode.source_as_of ? ` · as of ${selectedNode.source_as_of}` : ''}
-                                        </span>
-                                    </div>
-                                )}
-                                {selectedNode.source === 'observed' && (
-                                    <div style={S.metricRow}>
-                                        <span style={{ color: colors.textMuted }}>Source</span>
-                                        <span style={{ color: colors.textMuted, fontFamily: MONO, fontSize: '9px' }}>
-                                            observed
                                         </span>
                                     </div>
                                 )}

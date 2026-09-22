@@ -625,6 +625,18 @@ class TestAstrogridSeerAndScorecard:
 
 
 class TestSourceClassLabels:
+    @pytest.mark.xfail(
+        reason=(
+            "packet2a extraction: commit b1d3dd8b (intel.py: confidence "
+            "labels become source_class naming the branch) was NOT "
+            "cherry-picked. It imports `actor_source`/`source_as_of` from "
+            "`intelligence.actors.provenance`, a module added by an earlier "
+            "commit (e37bdf18) that lives in the #544 lower stack "
+            "(#539-#542), which is out of scope for this extraction. See "
+            "docs/handoffs/2026-09-21/fable-packet2a-extraction.md."
+        ),
+        strict=True,
+    )
     def test_intel_has_no_per_branch_confidence_literal(self) -> None:
         path = REPO_ROOT / "api" / "routers" / "intel.py"
         src = path.read_text(encoding="utf-8")
@@ -634,6 +646,15 @@ class TestSourceClassLabels:
             "provenance column or renamed source_class"
         )
 
+    @pytest.mark.xfail(
+        reason=(
+            "packet2a extraction: commit b1d3dd8b was NOT cherry-picked "
+            "(depends on the #544 lower stack's intelligence.actors."
+            "provenance module). See "
+            "docs/handoffs/2026-09-21/fable-packet2a-extraction.md."
+        ),
+        strict=True,
+    )
     def test_intel_label_is_never_a_numeric_threshold(self) -> None:
         path = REPO_ROOT / "api" / "routers" / "intel.py"
         src = path.read_text(encoding="utf-8")
