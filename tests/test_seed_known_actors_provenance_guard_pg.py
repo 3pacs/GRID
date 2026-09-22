@@ -6,14 +6,25 @@ Proves, against the real function (not a re-implementation):
   1. A brand-new row is inserted with provenance='seed' and updated_at=SEED_VINTAGE_TS
      (not NOW() -- the original audit A-H13 bug this design fixes).
   2. A row still exactly 'seed' DOES get refreshed by a reseed call.
-  3. A row still at the column default 'unknown' (never classified by anything) DOES
-     get seeded/refreshed -- legitimate seeding under the revised honest default must
-     keep working exactly as if the row didn't exist yet.
+  3. A row still at the column default 'unknown', with no recorded data_sources
+     (never classified OR touched by anything) DOES get seeded/refreshed --
+     legitimate seeding under the revised honest default must keep working exactly
+     as if the row didn't exist yet.
   4. A row that has become 'observed' is left COMPLETELY untouched by a reseed --
      not just its provenance columns, but every other seed-authored field too
      (influence_score specifically, since that is the field the module docstring
      names as the concrete harm of overwriting a genuinely-observed value).
   5. Same for 'unconfirmed'.
+  6. 'unknown' means unverified, not disposable: a row still 'unknown' but ENRICHED
+     with real data_sources by some other writer (actor_discovery.py's own shape) is
+     left completely untouched by a reseed too -- the guard must check more than the
+     provenance label alone, or it would silently clobber real, unclassified
+     information the moment its id happens to collide with the curated seed list.
+  7. By contrast, a row still 'unknown' that was merely TOUCHED (updated_at moved,
+     no data_sources recorded) remains eligible for reseeding -- a bare timestamp
+     move carries no evidentiary content, so it is not itself grounds to withhold
+     seeding either. This draws the precise boundary case 6 sits on the other side
+     of.
 
 Uses the shared ``pg_engine`` fixture (tests/conftest.py) -- skips cleanly if no
 PostgreSQL is reachable. Requires the actors_provenance_columns_0922 columns, which
@@ -165,6 +176,81 @@ def test_seeding_a_row_still_at_the_unknown_default_succeeds(pg_engine: Engine, 
     assert after.provenance == PROVENANCE_SEED
     assert after.updated_at == SEED_VINTAGE_TS
     assert after.influence_score == 0.42
+
+
+def test_reseed_does_not_overwrite_an_unknown_row_enriched_with_real_data_sources(
+    pg_engine: Engine, test_ids, monkeypatch,
+):
+    """'unknown' means unverified, not disposable. A row can sit at the column
+    default 'unknown' forever while still carrying real, non-trivial information --
+    several writers besides save_actor/_seed_known_actors insert or update actors
+    rows directly and never touch provenance at all (actor_discovery.py's own
+    INSERT shape is reproduced here: real name/influence_score/data_sources, no
+    provenance stamp). Reseeding must not treat that row as equivalent to one that
+    doesn't exist yet merely because its label still reads 'unknown'."""
+    actor_id = f"seed_guard_pg_{uuid.uuid4().hex[:16]}"
+    test_ids.append(actor_id)
+
+    with pg_engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO actors (id, name, tier, category, influence_score, data_sources) "
+            "VALUES (:id, 'Independently Discovered', 'institutional', 'corporation', "
+            "0.58, :sources)"
+        ).bindparams(id=actor_id, sources='["actor_discovery"]'))
+        before = conn.execute(text(
+            "SELECT provenance, data_sources::text AS data_sources FROM actors WHERE id = :id"
+        ).bindparams(id=actor_id)).fetchone()
+    assert before.provenance == PROVENANCE_UNKNOWN, "fixture check: still the column default"
+    assert before.data_sources == '["actor_discovery"]', "fixture check: real evidence is recorded"
+
+    _seed_one(monkeypatch, actor_id, influence_score=0.5)
+    _seed_known_actors(pg_engine)
+
+    with pg_engine.connect() as conn:
+        after = conn.execute(text(
+            "SELECT provenance, name, influence_score, data_sources::text AS data_sources "
+            "FROM actors WHERE id = :id"
+        ).bindparams(id=actor_id)).fetchone()
+    assert after.provenance == PROVENANCE_UNKNOWN, "an enriched unknown row must not be promoted to 'seed'"
+    assert after.name == "Independently Discovered", "reseed must not overwrite the enriched name"
+    assert after.influence_score == 0.58, "reseed must not overwrite the enriched influence_score"
+    assert after.data_sources == '["actor_discovery"]', "reseed must not overwrite the enriched data_sources"
+
+
+def test_reseed_still_claims_an_unknown_row_that_was_merely_touched_with_no_real_data(
+    pg_engine: Engine, test_ids, monkeypatch,
+):
+    """The other side of the boundary the previous test draws: a row still
+    'unknown' with NO recorded data_sources remains fair game to seed even after a
+    bare updated_at touch (e.g. a maintenance-only save_actor call, or any of the
+    other writers that only ever move updated_at). A timestamp move alone carries
+    no evidentiary content in this design -- neither earning a promotion nor
+    earning protection from one."""
+    actor_id = f"seed_guard_pg_{uuid.uuid4().hex[:16]}"
+    test_ids.append(actor_id)
+
+    with pg_engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO actors (id, name, tier, category) VALUES (:id, 'Barely Touched', 'test', 'test')"
+        ).bindparams(id=actor_id))
+    with pg_engine.begin() as conn:
+        # The maintenance writer's exact shape: updated_at only, nothing else.
+        conn.execute(text("UPDATE actors SET updated_at = NOW() WHERE id = :id").bindparams(id=actor_id))
+        before = conn.execute(text(
+            "SELECT provenance, data_sources FROM actors WHERE id = :id"
+        ).bindparams(id=actor_id)).fetchone()
+    assert before.provenance == PROVENANCE_UNKNOWN
+    assert before.data_sources is None, "fixture check: no real content was ever recorded"
+
+    _seed_one(monkeypatch, actor_id, influence_score=0.33)
+    _seed_known_actors(pg_engine)
+
+    with pg_engine.connect() as conn:
+        after = conn.execute(text(
+            "SELECT provenance, influence_score FROM actors WHERE id = :id"
+        ).bindparams(id=actor_id)).fetchone()
+    assert after.provenance == PROVENANCE_SEED, "a merely-touched unknown row (no real data) must still be claimable"
+    assert after.influence_score == 0.33
 
 
 def test_reseed_does_not_touch_an_observed_row_at_all(pg_engine: Engine, test_ids, monkeypatch):

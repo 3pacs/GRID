@@ -99,17 +99,38 @@ def _seed_known_actors(engine: Engine) -> int:
     something else, not confirmed) -- must not be reset by a later call here:
     that would either relabel genuinely-observed data as a hand-typed guess,
     or paper over an unconfirmed modification by reasserting "still pristine
-    seed data" over it. ``PROVENANCE_UNKNOWN`` -- the column's own default,
-    meaning nothing has ever classified this row -- IS fair game to seed:
-    it carries no real claim to protect, exactly like a row that doesn't
-    exist yet (which the plain ``INSERT`` branch already handles). Because
-    ``influence_score`` and the other seed-authored fields would otherwise
-    keep refreshing from ``_KNOWN_ACTORS`` on every call regardless of the
-    row's provenance -- silently overwriting genuinely observed or
-    unconfirmed-but-real values while the label claims something else -- the
-    ``ON CONFLICT ... WHERE`` clause below suppresses the *entire* update,
-    not just the provenance columns, unless the existing row is still
-    exactly ``'seed'`` or still ``'unknown'``.
+    seed data" over it.
+
+    ``PROVENANCE_UNKNOWN`` alone is NOT enough to make a row fair game,
+    though. ``'unknown'`` means *unverified* -- nothing has formally
+    classified this row -- not *disposable*. Several writers besides
+    ``save_actor`` insert or update ``actors`` rows directly and never touch
+    ``provenance`` at all (``intelligence/actor_discovery.py``,
+    ``intelligence/actors/trial_bridge.py``, ``intelligence/actor_ingest.py``,
+    among others) -- a row one of them created or enriched with real
+    ``data_sources`` content can sit at the column default ``'unknown'``
+    indefinitely despite carrying genuine, non-trivial information. Treating
+    every ``'unknown'`` row as equivalent to "doesn't exist yet" would let
+    this reseed silently clobber that enrichment the moment its id happens to
+    also be on the curated seed list. The guard below therefore only treats
+    an ``'unknown'`` row as fair game when it is ALSO still pristine --
+    ``data_sources`` empty or absent, the same evidence signal
+    ``save_actor`` itself gates on (see that function). A row still
+    ``'unknown'`` but merely touched (``updated_at`` moved, no real content
+    recorded -- e.g. by a maintenance-only ``save_actor`` call) remains
+    eligible: a bare timestamp move carries no evidentiary content in this
+    design, on either side of a promotion OR a protection decision, so it is
+    not itself grounds to withhold seeding. What must be protected is
+    recorded data, not clock movement.
+
+    Because ``influence_score`` and the other seed-authored fields would
+    otherwise keep refreshing from ``_KNOWN_ACTORS`` on every call regardless
+    of the row's provenance -- silently overwriting genuinely observed,
+    unconfirmed-but-real, or enriched-but-unclassified values while the label
+    claims something else -- the ``ON CONFLICT ... WHERE`` clause below
+    suppresses the *entire* update, not just the provenance columns, unless
+    the existing row is still exactly ``'seed'``, or still ``'unknown'`` AND
+    still carries no recorded ``data_sources``.
 
     Returns:
         Number of actors upserted.
@@ -153,7 +174,11 @@ def _seed_known_actors(engine: Engine) -> int:
                     provenance = EXCLUDED.provenance,
                     provenance_as_of = EXCLUDED.provenance_as_of,
                     updated_at = EXCLUDED.updated_at
-                WHERE actors.provenance IN (:seed, :unknown)
+                WHERE actors.provenance = :seed
+                   OR (
+                       actors.provenance = :unknown
+                       AND (actors.data_sources IS NULL OR actors.data_sources = '[]'::jsonb)
+                   )
             """), {
                 "id": actor_id,
                 "name": data["name"],
@@ -314,51 +339,99 @@ def save_actor(engine: Engine, actor_id: str, data: dict[str, Any]) -> None:
 
     The smallest writer transition to ``PROVENANCE_OBSERVED``: this is the one
     writer contract intelligence/actors/provenance.py trusts as evidence of a
-    real observation (see that module's docstring), and this function is what
-    makes that trust earned rather than assumed -- every call writes real
-    evidence (a merged ``data_sources`` list, a ``GREATEST``-combined
-    ``influence_score``) alongside ``provenance = 'observed'``, never just a
-    timestamp. Stamped unconditionally on every write (insert and
-    conflict-update), overriding whatever the row's provenance was before --
-    ``'unknown'``, ``'seed'``, or a stale ``'unconfirmed'`` -- because a
-    genuine observation right now supersedes any of those. No other writer in
-    this codebase touches the ``provenance`` column at all: a plain
-    ``updated_at`` touch from anywhere else must never cause this transition
-    (see the module docstring's "Timestamp changes alone never qualify" rule).
+    real observation (see that module's docstring) -- but the trust is EARNED
+    per call, not assumed from the mere fact that this function was the
+    caller. ``provenance = 'observed'`` is stamped only when ``data`` carries
+    qualifying evidence -- a non-empty ``data_sources`` list, the same
+    "where did this come from" signal every other real writer in this
+    codebase uses (``intelligence/actor_discovery.py``,
+    ``intelligence/actors/trial_bridge.py``, and ``_seed_known_actors``'s own
+    reseed guard). A call with no ``data_sources`` (missing, ``None``, or an
+    empty list) is a maintenance-only touch: it still writes the row's
+    identity fields and bumps ``updated_at`` (the same liveness signal every
+    other maintenance writer produces), but it MUST NOT create or overwrite
+    ``provenance`` -- a brand-new row reads the column's own honest
+    ``'unknown'`` default, and an existing row's classification, whatever it
+    is (``'unknown'``, ``'seed'``, a confirmed ``'observed'``, or an
+    ``'unconfirmed'``), is left completely untouched. This is what makes
+    "timestamp changes alone never qualify" (see the module docstring) true
+    of THIS writer too, not just the other maintenance-only ones -- an empty
+    or missing evidence payload must never manufacture a confirmed
+    observation.
+
+    ``influence_score`` is deliberately NOT part of the evidence test: a
+    legitimate observation can carry a real score of exactly ``0.0``, and
+    every caller in this codebase (``intelligence/spider/discovery.py``)
+    always supplies SOME numeric default regardless of whether real evidence
+    exists, so gating on it would both reject a genuine zero-score
+    observation and let a placeholder-only call through. ``data_sources`` is
+    the one field that is reliably empty when nothing was actually found
+    (see ``intelligence/spider/discovery.py``'s
+    ``[dc.evidence[0]...] if dc.evidence else []`` -- a real, existing
+    no-evidence path this gate closes).
+
+    When evidence IS present, the write stamps ``provenance = 'observed'``
+    regardless of what the row's provenance was before (``'unknown'``,
+    ``'seed'``, or a stale ``'unconfirmed'``), because a genuine observation
+    right now supersedes any of those -- alongside the real evidence itself
+    (a merged ``data_sources`` list, a ``GREATEST``-combined
+    ``influence_score``).
     """
     from intelligence.actors.provenance import PROVENANCE_OBSERVED
 
+    data_sources = data.get("data_sources") or []
+    has_evidence = bool(data_sources)
+
+    params = {
+        "id": actor_id,
+        "name": data.get("name", ""),
+        "tier": data.get("tier", "institutional"),
+        "category": data.get("category", "corporation"),
+        "title": data.get("title", ""),
+        "influence": data.get("influence_score", 0.3),
+        "trust": data.get("trust_score", 0.5),
+        "degree": data.get("degree", 0),
+        "source": data.get("source", "spider"),
+        "credibility": data.get("credibility", "inferred"),
+        "data_sources": json.dumps(data_sources),
+    }
+
     with engine.connect() as conn:
-        conn.execute(
-            text("""
-                INSERT INTO actors (id, name, tier, category, title, influence_score,
-                    trust_score, degree, source, credibility, data_sources,
-                    provenance, provenance_as_of, updated_at)
-                VALUES (:id, :name, :tier, :category, :title, :influence,
-                    :trust, :degree, :source, :credibility, :data_sources,
-                    :provenance, NULL, NOW())
-                ON CONFLICT (id) DO UPDATE SET
-                    influence_score = GREATEST(actors.influence_score, EXCLUDED.influence_score),
-                    data_sources = EXCLUDED.data_sources,
-                    provenance = :provenance,
-                    provenance_as_of = NULL,
-                    updated_at = NOW()
-            """),
-            {
-                "id": actor_id,
-                "name": data.get("name", ""),
-                "tier": data.get("tier", "institutional"),
-                "category": data.get("category", "corporation"),
-                "title": data.get("title", ""),
-                "influence": data.get("influence_score", 0.3),
-                "trust": data.get("trust_score", 0.5),
-                "degree": data.get("degree", 0),
-                "source": data.get("source", "spider"),
-                "credibility": data.get("credibility", "inferred"),
-                "data_sources": json.dumps(data.get("data_sources", [])),
-                "provenance": PROVENANCE_OBSERVED,
-            },
-        )
+        if has_evidence:
+            conn.execute(
+                text("""
+                    INSERT INTO actors (id, name, tier, category, title, influence_score,
+                        trust_score, degree, source, credibility, data_sources,
+                        provenance, provenance_as_of, updated_at)
+                    VALUES (:id, :name, :tier, :category, :title, :influence,
+                        :trust, :degree, :source, :credibility, :data_sources,
+                        :provenance, NULL, NOW())
+                    ON CONFLICT (id) DO UPDATE SET
+                        influence_score = GREATEST(actors.influence_score, EXCLUDED.influence_score),
+                        data_sources = EXCLUDED.data_sources,
+                        provenance = :provenance,
+                        provenance_as_of = NULL,
+                        updated_at = NOW()
+                """),
+                {**params, "provenance": PROVENANCE_OBSERVED},
+            )
+        else:
+            # No qualifying evidence -- a maintenance-only call. provenance /
+            # provenance_as_of are never referenced here at all: a brand-new
+            # row reads the column's own honest default, and an existing
+            # row's classification -- confirmed or not -- is left exactly as
+            # it was.
+            conn.execute(
+                text("""
+                    INSERT INTO actors (id, name, tier, category, title, influence_score,
+                        trust_score, degree, source, credibility, data_sources, updated_at)
+                    VALUES (:id, :name, :tier, :category, :title, :influence,
+                        :trust, :degree, :source, :credibility, :data_sources, NOW())
+                    ON CONFLICT (id) DO UPDATE SET
+                        updated_at = NOW()
+                """),
+                params,
+            )
         conn.commit()
 
 

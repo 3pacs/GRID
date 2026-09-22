@@ -71,36 +71,72 @@ The smallest writer transition to ``'observed'``
 Exactly one writer's contract is trusted: :func:`intelligence.actors.db.save_actor`.
 Its contract is what makes it trustworthy, and this module (and ``save_actor``
 itself) only ever act on the contract, never on the mere fact that
-``save_actor`` was the caller: every call writes real evidence alongside the
-timestamp -- a merged ``data_sources`` list and a ``GREATEST``-combined
-``influence_score``, never just ``updated_at``. ``save_actor`` stamps
-``provenance = PROVENANCE_OBSERVED`` explicitly, on every write (insert and
-conflict-update, unconditionally overriding whatever the row's provenance
-was before -- ``'unknown'``, ``'seed'``, or a stale ``'unconfirmed'``), for
-exactly that reason. No other writer touches the ``provenance`` column at
-all, so:
+``save_actor`` was the caller -- and the contract is checked PER CALL, not
+assumed. ``save_actor`` stamps ``provenance = PROVENANCE_OBSERVED`` only when
+the call carries qualifying evidence: a non-empty ``data_sources`` list, the
+same "where did this come from" signal every other real writer in this
+codebase records (``intelligence/actor_discovery.py``,
+``intelligence/actors/trial_bridge.py``, and ``_seed_known_actors``'s own
+reseed guard below). A ``save_actor`` call with no ``data_sources`` --
+missing, ``None``, or an empty list, which is a real path
+(``intelligence/spider/discovery.py`` produces exactly this when a discovered
+connection carries no evidence) -- is a maintenance-only touch: it still
+bumps ``updated_at``, but it never references the ``provenance`` column at
+all, so a brand-new row reads the column's own honest default and an
+existing row's classification is left completely untouched, confirmed or
+not. ``influence_score`` is deliberately not part of this test -- a
+legitimate observation can carry a real score of exactly ``0.0``, and every
+real caller always supplies some numeric default whether or not real
+evidence exists, so a score-based gate would both reject a genuine zero and
+let a placeholder-only call through.
+
+When evidence IS present, ``provenance = PROVENANCE_OBSERVED`` is stamped
+unconditionally, overriding whatever the row's provenance was before --
+``'unknown'``, ``'seed'``, or a stale ``'unconfirmed'`` -- because a genuine
+observation right now supersedes any of those. No other writer touches the
+``provenance`` column at all, so:
 
 * A row nothing has ever classified → ``PROVENANCE_UNKNOWN`` (the column
   default).
 * A seed-list row untouched since ``SEED_VINTAGE_TS`` → ``PROVENANCE_SEED``
   (via the separate backfill script).
-* A row confirmed by ``save_actor``'s contract → ``PROVENANCE_OBSERVED``,
-  regardless of what it was before.
-* A seed-list row whose ``updated_at`` has moved but not through
-  ``save_actor`` → ``PROVENANCE_UNCONFIRMED`` (via the same backfill script)
-  — modification is real, observation is not established, and the row must
-  not claim either "still seed" or "confirmed observed".
+* A row confirmed by ``save_actor``'s evidence-gated contract →
+  ``PROVENANCE_OBSERVED``, regardless of what it was before.
+* A seed-list row whose ``updated_at`` has moved but not through a
+  qualifying ``save_actor`` call → ``PROVENANCE_UNCONFIRMED`` (via the same
+  backfill script) — modification is real, observation is not established,
+  and the row must not claim either "still seed" or "confirmed observed".
 
 Once a row is ``PROVENANCE_OBSERVED``, it is permanent from every OTHER
 writer's perspective: a later seed rerun must not touch it (see
-``_seed_known_actors``'s own ``ON CONFLICT ... WHERE`` clause, which only
-ever refreshes a row still ``'seed'`` or still ``'unknown'``), and the
+``_seed_known_actors``'s own ``ON CONFLICT ... WHERE`` clause below), and the
 backfill script must not touch it either (see
 ``scripts/backfill_actor_provenance.py``'s own module docstring — it only
 ever classifies a row still exactly ``'unknown'``, never re-evaluates one
 already ``'seed'``, ``'observed'``, or ``'unconfirmed'``). The same holds for
 ``PROVENANCE_UNCONFIRMED``: real modification is on record, and nothing may
 paper over it by reasserting "still pristine seed data".
+
+``'unknown'`` is unverified, not disposable
+---------------------------------------------
+``_seed_known_actors``'s reseed guard treats a row still ``'seed'`` as
+always fair game to refresh, and a row still ``PROVENANCE_UNKNOWN`` as fair
+game ONLY when it is ALSO still pristine -- ``data_sources`` empty or absent.
+Several writers besides ``save_actor`` insert or update ``actors`` rows
+directly and never touch ``provenance`` at all (``actor_discovery.py``,
+``trial_bridge.py``, ``actor_ingest.py``, among others); a row one of them
+created or enriched with real ``data_sources`` content can sit at the column
+default ``'unknown'`` indefinitely despite carrying genuine information.
+Treating every ``'unknown'`` row as equivalent to "doesn't exist yet" would
+let a reseed silently clobber that enrichment the moment its id happens to
+also be on the curated seed list -- the same class of silent overwrite this
+whole module exists to prevent, just for ``'unknown'`` instead of
+``'observed'``/``'unconfirmed'``. A row still ``'unknown'`` but merely
+touched (``updated_at`` moved, no real content recorded -- e.g. by a
+maintenance-only ``save_actor`` call) remains eligible: a bare timestamp
+move carries no evidentiary content on either side of a decision in this
+design, so it is not itself grounds to withhold seeding either. What must be
+protected is recorded data, not clock movement.
 
 Resolution order
 ----------------
