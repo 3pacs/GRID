@@ -117,10 +117,12 @@ def test_redaction_removes_a_real_literal_value_captured_in_query_text(pg_engine
     holder_ready = threading.Event()
     release_holder = threading.Event()
     secret_marker = "MONITOR_REDACTION_TEST_SECRET_9f3a"
+    holder_pid: list[int] = []
 
     def _hold_with_literal():
         conn = psycopg2.connect(dsn)
         conn.autocommit = True
+        holder_pid.append(conn.get_backend_pid())
         cur = conn.cursor()
         try:
             cur.execute("SELECT pg_sleep(3), %s", (secret_marker,))
@@ -129,16 +131,25 @@ def test_redaction_removes_a_real_literal_value_captured_in_query_text(pg_engine
         finally:
             conn.close()
 
+    # Matched on the holder's own backend PID -- a plain integer, no textual
+    # overlap with the query text at all. Matching on any TEXT pattern here
+    # (even a bound parameter) is unsafe: SQLAlchemy's psycopg2 dialect also
+    # substitutes bound values client-side (the exact finding this whole
+    # redaction pass exists for), so a text-based filter's own query would
+    # then contain that same text and self-match -- a real bug found while
+    # first writing this test with an ILIKE '%pg_sleep%' filter, which
+    # matched its own query text.
     def _wait_until_visible():
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            with pg_engine.connect() as conn:
-                found = conn.execute(text(
-                    "SELECT 1 FROM pg_stat_activity WHERE query ILIKE '%pg_sleep%'"
-                )).first()
-            if found:
-                holder_ready.set()
-                return
+            if holder_pid:
+                with pg_engine.connect() as conn:
+                    found = conn.execute(text(
+                        "SELECT 1 FROM pg_stat_activity WHERE pid = :pid"
+                    ), {"pid": holder_pid[0]}).first()
+                if found:
+                    holder_ready.set()
+                    return
             time.sleep(0.05)
 
     holder_thread = threading.Thread(target=_hold_with_literal, daemon=True)
@@ -150,8 +161,8 @@ def test_redaction_removes_a_real_literal_value_captured_in_query_text(pg_engine
 
         with pg_engine.connect() as conn:
             raw_row = conn.execute(text(
-                "SELECT query FROM pg_stat_activity WHERE query ILIKE '%pg_sleep%'"
-            )).first()
+                "SELECT query FROM pg_stat_activity WHERE pid = :pid"
+            ), {"pid": holder_pid[0]}).first()
         assert raw_row is not None
         assert secret_marker in raw_row.query, (
             "fixture check: the literal must genuinely be present in the server's own "
