@@ -9,6 +9,12 @@
 # touched" (see deploy_release_swap.sh) rather than "the live path was left
 # half-updated," are new.
 #
+# 2026-09-22: the fetch/reset/identity-check step now delegates to
+# scripts/deploy_pin_candidate_sha.sh, which fetches the EXACT expected
+# commit rather than the floating `main` ref -- see that script's own header
+# for why (closes a real, if rare, race with deploy_verify_release_tree.sh's
+# exact-SHA-match requirement). No other change to this file.
+#
 # Usage: deploy_build_hook.sh <candidate_dir> <src_url> <expected_sha> <skip_migrations: true|false>
 #
 # Exits non-zero on any failure (fetch, install, PWA build, or migration).
@@ -27,15 +33,15 @@ SRC_URL="$2"
 EXPECTED_SHA="$3"
 SKIP_MIGRATIONS="$4"
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# Invoked via `bash`, not `./script`: this repo has core.filemode=false, so a
+# fresh checkout never carries an executable bit regardless of what was
+# committed -- relying on it directly fails with "Permission denied" (found
+# running this exact change in CI, on the self-hosted runner's fresh
+# checkout).
+bash "${SCRIPT_DIR}/deploy_pin_candidate_sha.sh" "$CANDIDATE_DIR" "$SRC_URL" "$EXPECTED_SHA"
+
 cd "$CANDIDATE_DIR"
-echo "before: $(git log --oneline -1 2>/dev/null || echo '<no commit yet>')"
-git fetch "$SRC_URL" main
-git reset --hard FETCH_HEAD
-echo "after:  $(git log --oneline -1)"
-git merge-base --is-ancestor "$EXPECTED_SHA" HEAD || {
-  echo "::error::candidate release tree is not at the pushed commit $EXPECTED_SHA"
-  exit 1
-}
 
 pip install -r requirements.txt
 
