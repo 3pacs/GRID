@@ -1032,14 +1032,33 @@ def intel_network(
                     }
 
                 # ICIJ relationships
+                #
+                # icij_relationships.from_node/to_node are integer node_id
+                # references, not name strings -- they can point into any of
+                # three separate ICIJ tables (icij_entities, icij_officers,
+                # icij_intermediaries), each with its own node_id/name, per
+                # ingestion/altdata/icij_puller.py's own insert statements.
+                # Resolve both ends' names via a union of those three tables
+                # before matching by name. Only icij_entities carries
+                # jurisdiction; officers/intermediaries have none.
                 try:
                     rows = conn.execute(
                         text(
-                            "SELECT entity_name, linked_to, relationship_type, "
-                            "jurisdiction, source_dataset "
-                            "FROM icij_relationships "
-                            "WHERE UPPER(entity_name) = :n "
-                            "   OR UPPER(linked_to) = :n"
+                            "WITH icij_nodes AS ("
+                            "    SELECT node_id, name, jurisdiction FROM icij_entities"
+                            "    UNION ALL"
+                            "    SELECT node_id, name, NULL AS jurisdiction FROM icij_officers"
+                            "    UNION ALL"
+                            "    SELECT node_id, name, NULL AS jurisdiction FROM icij_intermediaries"
+                            ") "
+                            "SELECT n1.name AS entity_name, n2.name AS linked_to, "
+                            "       r.rel_type AS relationship_type, "
+                            "       n1.jurisdiction, r.source_dataset "
+                            "FROM icij_relationships r "
+                            "JOIN icij_nodes n1 ON n1.node_id = r.from_node "
+                            "JOIN icij_nodes n2 ON n2.node_id = r.to_node "
+                            "WHERE UPPER(n1.name) = :n "
+                            "   OR UPPER(n2.name) = :n"
                         ),
                         {"n": name},
                     ).fetchall()
@@ -1070,6 +1089,13 @@ def intel_network(
                         "ICIJ traversal failed at hop {h} for {n}: {e}",
                         h=hop, n=name, e=str(exc),
                     )
+                    # A failed statement aborts the connection's transaction
+                    # in PostgreSQL -- every later statement on this SAME
+                    # connection (the actor query below, and every later
+                    # hop's queries) would otherwise also fail until rolled
+                    # back. Isolate this block's failure from everything
+                    # that runs after it on the same connection.
+                    conn.rollback()
 
                 # Actor connections
                 try:
@@ -1133,6 +1159,11 @@ def intel_network(
                         "Actor traversal failed at hop {h} for {n}: {e}",
                         h=hop, n=name, e=str(exc),
                     )
+                    # Same isolation reasoning as the ICIJ block above --
+                    # without this, a failure here would abort the
+                    # connection's transaction for every later hop's queries
+                    # on this same connection.
+                    conn.rollback()
 
             frontier = next_frontier
 
