@@ -1,17 +1,20 @@
 """Real-PostgreSQL proof for migrations/versions/actors_provenance_20260917.py.
 
 Unlike most migrations in this lane, this one does not stop at adding
-columns -- it also runs a real, scoped ``UPDATE`` backfilling every existing
-``actors`` row the hand-curated seed list owns. This file proves that write
-against a real database: exactly the seed ids that are still pristine
-(untouched since ``SEED_VINTAGE_TS``) get stamped, a seed id touched by a
-real writer since seeding is left alone, every non-seed id keeps the column
-default, a second run is a no-op, downgrade removes both columns cleanly,
-and the migration's ``SET LOCAL`` timeouts never leak past its own
-transaction. ``_KNOWN_ACTORS`` (500+ entries) is monkeypatched to a handful
-of ids for a fast, deterministic proof -- the migration's own
-``_seed_actor_ids()`` reads it by name at call time, so patching the module
-attribute is sufficient.
+columns -- it also runs two real, scoped ``UPDATE`` statements backfilling
+every existing ``actors`` row the hand-curated seed list owns. This file
+proves that write against a real database: exactly the seed ids that are
+still pristine (untouched since ``SEED_VINTAGE_TS``) get stamped ``'seed'``,
+a seed id touched by *something* since seeding -- a maintenance-only
+timestamp bump, not a confirmed observation -- is explicitly stamped
+``'unconfirmed'`` rather than silently inheriting the column's ``'observed'``
+default, every non-seed id keeps that default untouched, a second run is a
+no-op, downgrade removes both columns cleanly, and the migration's
+``SET LOCAL`` timeouts are proven to reset on the *same* connection once its
+own transaction ends, not just observed as already-baseline on a fresh one.
+``_KNOWN_ACTORS`` (500+ entries) is monkeypatched to a handful of ids for a
+fast, deterministic proof -- the migration's own ``_seed_actor_ids()`` reads
+it by name at call time, so patching the module attribute is sufficient.
 
 Uses the shared ``pg_engine`` fixture (tests/conftest.py) -- skips cleanly if
 no PostgreSQL is reachable. Every row this file writes uses a unique
@@ -180,29 +183,31 @@ def test_upgrade_backfills_exactly_the_seed_ids_and_defaults_everyone_else(
     assert rows_again == rows, "a second upgrade() run must be a no-op"
 
 
-def test_upgrade_does_not_backfill_a_seed_id_touched_since_seeding(
+def test_upgrade_marks_a_maintenance_touched_seed_id_unconfirmed(
     pg_engine: Engine, test_ids: list[str], monkeypatch,
 ):
-    """Seed-list membership alone is not sufficient for the backfill.
+    """Seed-list membership alone is not sufficient for the backfill, and a
+    moved ``updated_at`` alone is not proof of a real observation either.
 
-    A row whose id is in ``_KNOWN_ACTORS`` but whose ``updated_at`` has moved
-    past ``SEED_VINTAGE_TS`` has been touched by a real writer since it was
-    seeded (``save_actor`` upserts by the same id on purpose so live data
-    merges onto a seeded skeleton, stamping ``updated_at = NOW()``). The
-    backfill must leave that row's provenance at the column default
-    (``'observed'``), not relabel it ``'seed'`` just because its id happens
-    to appear in the static seed table.
+    Simulates the realistic case a repo-wide writer survey actually found:
+    something like ``intelligence/actors/trial_bridge.py``'s connection-merge
+    path touches a row's ``updated_at`` (and an unrelated field, here
+    ``connections``) with no confirmed measurement attached at all -- not
+    ``save_actor``'s contract, which always writes real evidence alongside
+    the timestamp. The backfill must not call this ``'seed'`` (it is not
+    pristine) and must not call it ``'observed'`` either (nothing confirms
+    it) -- it must be explicitly ``'unconfirmed'``.
     """
     migration = importlib.import_module(_MIGRATION_MODULE)
 
     touched_id = f"pkt2prov_pg_{uuid.uuid4().hex[:16]}"
     test_ids.append(touched_id)
 
-    touched_since_seeding = migration.SEED_VINTAGE_TS + timedelta(days=30)
+    maintenance_touch_time = migration.SEED_VINTAGE_TS + timedelta(days=30)
     with pg_engine.begin() as conn:
         _insert_actor(
-            conn, actor_id=touched_id, name="Enriched Since Seeding",
-            updated_at=touched_since_seeding,
+            conn, actor_id=touched_id, name="Maintenance Touched Actor",
+            updated_at=maintenance_touch_time,
         )
 
     _reset_provenance_columns(pg_engine)
@@ -220,9 +225,10 @@ def test_upgrade_does_not_backfill_a_seed_id_touched_since_seeding(
             ).bindparams(id=touched_id),
         ).fetchone()._mapping)
 
-    assert row["provenance"] == migration.PROVENANCE_OBSERVED, (
-        "a seed id touched since seeding must not be relabeled 'seed' just "
-        "because it is in the static seed list"
+    assert row["provenance"] == migration.PROVENANCE_UNCONFIRMED, (
+        "a seed id touched by something other than a confirmed observation "
+        "must be explicitly 'unconfirmed', not silently 'observed' and not "
+        "relabeled 'seed' just because it is in the static seed list"
     )
     assert row["provenance_as_of"] is None
 
@@ -233,6 +239,15 @@ def test_upgrade_runs_for_real_with_finite_timeouts_scoped_to_its_own_transactio
     """The real ``upgrade()`` must set its SET LOCAL guards, and those guards
     must never outlive the migration's own transaction -- see
     oracle_pred_nullable_0918 for the precedent this follows.
+
+    The decisive proof is on the *same* connection: SET LOCAL is scoped to
+    the transaction, so it must reset the instant that transaction ends,
+    before the connection is ever returned or reused. Checking only a fresh
+    connection afterward would not actually prove this -- a fresh connection
+    always starts at the server/role default regardless of whether SET LOCAL
+    ever leaked, so that alone cannot distinguish "scoped correctly" from
+    "happened to match by coincidence". Both checks are kept: same-connection
+    (decisive) and fresh-connection (confirms no session-wide side effect).
     """
     migration = importlib.import_module(_MIGRATION_MODULE)
 
@@ -275,15 +290,26 @@ def test_upgrade_runs_for_real_with_finite_timeouts_scoped_to_its_own_transactio
             migration._STATEMENT_TIMEOUT
         )
         trans.commit()
+
+        # Decisive: the SAME connection, immediately after COMMIT, must have
+        # reset to whatever it saw before the transaction started -- this is
+        # what actually proves SET LOCAL's transaction scoping, not just that
+        # some other, unrelated connection happens to look unaffected.
+        assert conn.execute(text("SHOW lock_timeout")).scalar() == (
+            baseline_lock_timeout
+        )
+        assert conn.execute(text("SHOW statement_timeout")).scalar() == (
+            baseline_statement_timeout
+        )
     except Exception:
         trans.rollback()
         raise
     finally:
         conn.close()
 
-    # A fresh connection/session must see the ordinary baseline, never the
-    # migration's SET LOCAL values -- proves the scoping, not just that the
-    # statements ran without raising.
+    # Corroborating, not decisive on its own: a fresh connection/session
+    # must also see the ordinary baseline, confirming SET LOCAL had no
+    # session-wide or server-wide side effect beyond the one transaction.
     with pg_engine.connect() as after_conn:
         assert after_conn.execute(text("SHOW lock_timeout")).scalar() == (
             baseline_lock_timeout

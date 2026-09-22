@@ -16,7 +16,6 @@ from sqlalchemy.engine import Engine
 
 from intelligence.actors.models import Actor
 from intelligence.actors.provenance import (
-    PROVENANCE_OBSERVED,
     PROVENANCE_SEED,
     SEED_VINTAGE,
     SEED_VINTAGE_DATE,
@@ -111,16 +110,21 @@ def _seed_known_actors(engine: Engine) -> int:
 
     ``provenance = 'seed'`` is a claim about current state, not permanent
     origin (see ``migrations/versions/actors_provenance_20260917.py``'s
-    module docstring for the precise definition). A row already stamped
-    ``PROVENANCE_OBSERVED`` -- meaning a real writer (``save_actor``, which
-    upserts by this same ``id`` on purpose so live data merges onto a seeded
-    skeleton) has confirmed or updated it since it was seeded -- must not be
-    reset back to ``'seed'`` by a later call here: that would relabel
-    genuinely-observed data as a hand-typed guess. The ``ON CONFLICT`` clause
-    below therefore only reasserts ``provenance``/``provenance_as_of``/
-    ``updated_at`` when the existing row is not already ``'observed'``;
-    every other seeded field (name, tier, financial figures, etc.) keeps
-    refreshing from ``_KNOWN_ACTORS`` unconditionally, as before.
+    module docstring for the precise definition, including why a moved
+    ``updated_at`` alone is not proof of a real observation). A row already
+    stamped anything other than ``PROVENANCE_SEED`` -- ``'observed'``
+    (confirmed by ``save_actor``'s writer contract) or ``'unconfirmed'``
+    (touched by something else, not confirmed) -- must not be reset by a
+    later call here: that would either relabel genuinely-observed data as a
+    hand-typed guess, or paper over an unconfirmed modification by
+    reasserting "still pristine seed data" over it. Because
+    ``influence_score`` and the other seed-authored fields would otherwise
+    keep refreshing from ``_KNOWN_ACTORS`` on every call regardless of the
+    row's provenance -- silently overwriting genuinely observed or
+    unconfirmed-but-real values while the label claims something else -- the
+    ``ON CONFLICT ... WHERE`` clause below suppresses the *entire* update,
+    not just the provenance columns, unless the existing row is still
+    exactly ``'seed'``.
 
     Returns:
         Number of actors upserted.
@@ -154,18 +158,10 @@ def _seed_known_actors(engine: Engine) -> int:
                     motivation_model = EXCLUDED.motivation_model,
                     data_sources = EXCLUDED.data_sources,
                     credibility = EXCLUDED.credibility,
-                    provenance = CASE
-                        WHEN actors.provenance = :observed THEN actors.provenance
-                        ELSE EXCLUDED.provenance
-                    END,
-                    provenance_as_of = CASE
-                        WHEN actors.provenance = :observed THEN actors.provenance_as_of
-                        ELSE EXCLUDED.provenance_as_of
-                    END,
-                    updated_at = CASE
-                        WHEN actors.provenance = :observed THEN actors.updated_at
-                        ELSE EXCLUDED.updated_at
-                    END
+                    provenance = EXCLUDED.provenance,
+                    provenance_as_of = EXCLUDED.provenance_as_of,
+                    updated_at = EXCLUDED.updated_at
+                WHERE actors.provenance = :seed
             """), {
                 "id": actor_id,
                 "name": data["name"],
@@ -182,7 +178,7 @@ def _seed_known_actors(engine: Engine) -> int:
                 "provenance": PROVENANCE_SEED,
                 "vintage_date": SEED_VINTAGE_DATE,
                 "vintage_ts": SEED_VINTAGE_TS,
-                "observed": PROVENANCE_OBSERVED,
+                "seed": PROVENANCE_SEED,
             })
             count += 1
     log.info(

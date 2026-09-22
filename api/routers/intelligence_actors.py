@@ -976,7 +976,8 @@ def get_sector_power_map(
             for ticker in sector_tickers:
                 rows = conn.execute(text(
                     "SELECT id, name, category, influence_score, trust_score, "
-                    "net_worth_estimate, title, known_positions "
+                    "net_worth_estimate, title, known_positions, "
+                    "provenance, provenance_as_of "
                     "FROM actors "
                     "WHERE category NOT IN ('icij_entity', 'icij_officer', 'icij_intermediary') "
                     "AND (name ILIKE :paren OR UPPER(name) LIKE :upper_pat) "
@@ -996,7 +997,8 @@ def get_sector_power_map(
                 continue
             rows = conn.execute(text(
                 "SELECT id, name, category, influence_score, trust_score, "
-                "net_worth_estimate, title, known_positions "
+                "net_worth_estimate, title, known_positions, "
+                "provenance, provenance_as_of "
                 "FROM actors "
                 "WHERE category NOT IN ('icij_entity', 'icij_officer', 'icij_intermediary') "
                 "AND name ILIKE :pat "
@@ -1024,8 +1026,8 @@ def get_sector_power_map(
             "trust": float(row[4]) if row[4] else 0.5,
             "net_worth": float(row[5]) if row[5] else None,
             "title": row[6],
-            "source": actor_source(aid),
-            "source_as_of": source_as_of(aid),
+            "source": actor_source(aid, row[8]),
+            "source_as_of": source_as_of(aid, row[8], row[9]),
         }
 
     if not actor_map:
@@ -1115,7 +1117,7 @@ def get_sector_power_map(
             if new_ids:
                 new_rows = conn.execute(text(
                     "SELECT id, name, category, influence_score, trust_score, "
-                    "net_worth_estimate, title "
+                    "net_worth_estimate, title, provenance, provenance_as_of "
                     "FROM actors WHERE id = ANY(:ids)"
                 ), {"ids": list(new_ids)}).fetchall()
                 for nr in new_rows:
@@ -1127,8 +1129,8 @@ def get_sector_power_map(
                         "trust": float(nr[4]) if nr[4] else 0.5,
                         "net_worth": float(nr[5]) if nr[5] else None,
                         "title": nr[6],
-                        "source": actor_source(nr[0]),
-                        "source_as_of": source_as_of(nr[0]),
+                        "source": actor_source(nr[0], nr[7]),
+                        "source_as_of": source_as_of(nr[0], nr[7], nr[8]),
                     }
 
     # Step 5: Merge sector_map metadata (ticker, subsector, price) into nodes
@@ -1270,7 +1272,8 @@ def get_ego_graph(
             # Verify center actor exists
             center = conn.execute(text(
                 "SELECT id, name, category, tier, influence_score, trust_score, "
-                "net_worth_estimate, title, known_positions "
+                "net_worth_estimate, title, known_positions, "
+                "provenance, provenance_as_of "
                 "FROM actors WHERE id = :id"
             ), {"id": actor_id}).fetchone()
 
@@ -1295,8 +1298,8 @@ def get_ego_graph(
                     "net_worth": float(row[6]) if row[6] else None,
                     "title": row[7],
                     "ring": ring,
-                    "source": actor_source(aid),
-                    "source_as_of": source_as_of(aid),
+                    "source": actor_source(aid, row[9]),
+                    "source_as_of": source_as_of(aid, row[9], row[10]),
                 }
                 ring_map[aid] = ring
 
@@ -1344,7 +1347,8 @@ def get_ego_graph(
                     new_ids = list(next_frontier)[:remaining]
                     new_rows = conn.execute(text(
                         "SELECT id, name, category, tier, influence_score, trust_score, "
-                        "net_worth_estimate, title, known_positions "
+                        "net_worth_estimate, title, known_positions, "
+                        "provenance, provenance_as_of "
                         "FROM actors WHERE id = ANY(:ids)"
                     ), {"ids": new_ids}).fetchall()
                     for nr in new_rows:
@@ -1661,6 +1665,7 @@ def get_grand_power_map(
                 ranked AS (
                     SELECT a.id, a.name, a.category, a.tier, a.influence_score,
                            a.trust_score, a.net_worth_estimate, a.title, a.known_positions,
+                           a.provenance, a.provenance_as_of,
                            COALESCE(c.degree, 0) AS degree,
                            ROW_NUMBER() OVER (
                                PARTITION BY a.category
@@ -1677,7 +1682,8 @@ def get_grand_power_map(
                     AND a.id NOT LIKE 'pol_qq_%%'
                 )
                 SELECT id, name, category, tier, influence_score,
-                       trust_score, net_worth_estimate, title, known_positions, degree
+                       trust_score, net_worth_estimate, title, known_positions,
+                       provenance, provenance_as_of, degree
                 FROM ranked
                 WHERE (category = 'corporation' AND cat_rank <= 15)
                    OR (category = 'politician' AND cat_rank <= 8)
@@ -1702,7 +1708,7 @@ def get_grand_power_map(
                 if base in seen_base_names:
                     # Keep the one with higher degree
                     existing_idx = seen_base_names[base]
-                    if int(a[9] or 0) > int(deduped_actors[existing_idx][9] or 0):
+                    if int(a[11] or 0) > int(deduped_actors[existing_idx][11] or 0):
                         deduped_actors[existing_idx] = a
                 else:
                     seen_base_names[base] = len(deduped_actors)
@@ -1719,9 +1725,9 @@ def get_grand_power_map(
                     "trust": float(a[5]) if a[5] else 0.5,
                     "net_worth": float(a[6]) if a[6] else None,
                     "title": a[7],
-                    "degree": int(a[9]) if len(a) > 9 else 0,
-                    "source": actor_source(a[0]),
-                    "source_as_of": source_as_of(a[0]),
+                    "degree": int(a[11]) if len(a) > 11 else 0,
+                    "source": actor_source(a[0], a[9]),
+                    "source_as_of": source_as_of(a[0], a[9], a[10]),
                 })
 
             # Find connections between top actors (lower threshold for grand map)
@@ -1795,7 +1801,8 @@ def get_grand_power_map(
                     if new_ids:
                         bridge_actors = conn.execute(text(
                             "SELECT id, name, category, tier, influence_score, "
-                            "trust_score, net_worth_estimate, title "
+                            "trust_score, net_worth_estimate, title, "
+                            "provenance, provenance_as_of "
                             "FROM actors WHERE id = ANY(:ids)"
                         ), {"ids": new_ids}).fetchall()
                         for a in bridge_actors:
@@ -1809,8 +1816,8 @@ def get_grand_power_map(
                                 "title": a[7],
                                 "bridge": True,
                                 "degree": 0,
-                                "source": actor_source(a[0]),
-                                "source_as_of": source_as_of(a[0]),
+                                "source": actor_source(a[0], a[8]),
+                                "source_as_of": source_as_of(a[0], a[8], a[9]),
                             })
 
             # Wealth flows involving top actors (as source or target)

@@ -358,12 +358,15 @@ def _router_engine(rows: list[tuple]):
 def test_ego_graph_labels_seed_and_observed_nodes(monkeypatch) -> None:
     from api.routers import intelligence_actors as ia
 
-    # (id, name, category, tier, influence, trust, net_worth, title, positions)
+    # (id, name, category, tier, influence, trust, net_worth, title, positions,
+    #  provenance, provenance_as_of) -- the router now selects and passes the
+    # stored column on every query; it no longer relies on SEED_ACTOR_IDS
+    # membership for any of these rows.
     rows = [
         ("fed_powell", "Jerome Powell", "central_bank", "sovereign",
-         0.99, 0.9, None, "Chair", "[]"),
+         0.99, 0.9, None, "Chair", "[]", PROVENANCE_SEED, SEED_VINTAGE),
         ("ins_form4_x", "Observed Insider", "insider", "individual",
-         0.4, 0.5, None, "", "[]"),
+         0.4, 0.5, None, "", "[]", PROVENANCE_OBSERVED, None),
     ]
     monkeypatch.setattr(ia, "get_db_engine", lambda: _router_engine(rows))
 
@@ -376,14 +379,41 @@ def test_ego_graph_labels_seed_and_observed_nodes(monkeypatch) -> None:
 
 
 @pytest.mark.unit
+def test_ego_graph_does_not_relabel_an_enriched_seed_id_via_membership(monkeypatch) -> None:
+    """A seed-list id whose STORED provenance says 'observed' must not be
+    reported as 'curated_seed' just because its id is in SEED_ACTOR_IDS.
+
+    fed_powell is a real entry in _KNOWN_ACTORS -- membership alone would
+    say 'seed' -- but the row simulates one that _seed_known_actors's
+    ON CONFLICT ... WHERE guard has already left alone after a real
+    confirmation, so the stored column says 'observed'. The router must
+    trust the stored column, not the static membership set.
+    """
+    from api.routers import intelligence_actors as ia
+
+    rows = [
+        ("fed_powell", "Jerome Powell", "central_bank", "sovereign",
+         0.99, 0.9, None, "Chair", "[]", PROVENANCE_OBSERVED, None),
+    ]
+    monkeypatch.setattr(ia, "get_db_engine", lambda: _router_engine(rows))
+
+    result = ia.get_ego_graph("fed_powell", depth=1, max_nodes=50, _token="t")
+    by_id = {n["id"]: n for n in result["nodes"]}
+
+    assert "fed_powell" in SEED_ACTOR_IDS, "test premise: this id is on the seed list"
+    assert by_id["fed_powell"]["source"] == "observed"
+    assert by_id["fed_powell"]["source_as_of"] is None
+
+
+@pytest.mark.unit
 def test_grand_power_map_labels_every_node(monkeypatch) -> None:
     from api.routers import intelligence_actors as ia
 
     rows = [
         ("fed_powell", "Jerome Powell", "central_bank", "sovereign",
-         0.99, 0.9, None, "Chair", "[]"),
+         0.99, 0.9, None, "Chair", "[]", PROVENANCE_SEED, SEED_VINTAGE),
         ("ins_form4_x", "Observed Insider", "insider", "individual",
-         0.4, 0.5, None, "", "[]"),
+         0.4, 0.5, None, "", "[]", PROVENANCE_OBSERVED, None),
     ]
     monkeypatch.setattr(ia, "get_db_engine", lambda: _router_engine(rows))
 

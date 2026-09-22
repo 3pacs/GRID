@@ -178,7 +178,7 @@ def intel_search(
                 rows = conn.execute(
                     text(
                         "SELECT id, name, tier, category, aum, trust_score, "
-                        "credibility "
+                        "credibility, provenance, provenance_as_of "
                         "FROM actors "
                         "WHERE UPPER(name) LIKE UPPER(:q) "
                         "   OR UPPER(id) LIKE UPPER(:q) "
@@ -199,8 +199,8 @@ def intel_search(
                         # The row's own provenance column. A NULL is unknown,
                         # not "derived" (A-M11).
                         "source_class": r[6] or "unknown",
-                        "source": actor_source(r[0]),
-                        "source_as_of": source_as_of(r[0]),
+                        "source": actor_source(r[0], r[7]),
+                        "source_as_of": source_as_of(r[0], r[7], r[8]),
                     })
             except Exception as exc:
                 log.debug("Actor search skipped: {e}", e=str(exc))
@@ -358,7 +358,8 @@ def intel_entity_profile(
         try:
             rows = conn.execute(
                 text(
-                    "SELECT id, name, tier, category, aum, trust_score "
+                    "SELECT id, name, tier, category, aum, trust_score, "
+                    "provenance, provenance_as_of "
                     "FROM actors "
                     "WHERE UPPER(name) LIKE UPPER(:q) "
                     "   OR connections::text ILIKE :q2"
@@ -374,8 +375,8 @@ def intel_entity_profile(
                     "aum_usd": r[4],
                     "trust_score": r[5],
                     "source_class": "actors_table_name_match",
-                    "source": actor_source(r[0]),
-                    "source_as_of": source_as_of(r[0]),
+                    "source": actor_source(r[0], r[6]),
+                    "source_as_of": source_as_of(r[0], r[6], r[7]),
                 })
         except Exception as exc:
             log.debug("Actor lookup skipped for {n}: {e}", n=name, e=str(exc))
@@ -445,7 +446,8 @@ def intel_actor_dossier(
             row = conn.execute(
                 text(
                     "SELECT id, name, tier, category, aum, trust_score, "
-                    "motivation_model, connections, credibility, known_positions "
+                    "motivation_model, connections, credibility, known_positions, "
+                    "provenance, provenance_as_of "
                     "FROM actors "
                     "WHERE UPPER(name) = UPPER(:n) "
                     "   OR UPPER(id) = UPPER(:n) "
@@ -465,8 +467,8 @@ def intel_actor_dossier(
                     "connections": _safe_json(row[7]),
                     "source_class": row[8] or "unknown",
                     "known_positions": _safe_json(row[9]),
-                    "source": actor_source(row[0]),
-                    "source_as_of": source_as_of(row[0]),
+                    "source": actor_source(row[0], row[10]),
+                    "source_as_of": source_as_of(row[0], row[10], row[11]),
                 }
                 dossier["source"] = dossier["identity"]["source"]
                 dossier["source_as_of"] = dossier["identity"]["source_as_of"]

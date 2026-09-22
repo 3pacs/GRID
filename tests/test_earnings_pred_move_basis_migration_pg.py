@@ -76,6 +76,13 @@ def test_upgrade_runs_for_real_with_finite_timeouts_scoped_to_its_own_transactio
     guards, and those guards must never outlive the migration's own
     transaction. Idempotent (``ADD COLUMN IF NOT EXISTS``), so safe to run
     for real against the shared disposable database.
+
+    The decisive proof is on the *same* connection: SET LOCAL is scoped to
+    the transaction, so it must reset the instant that transaction ends. A
+    fresh connection afterward cannot distinguish "scoped correctly" from
+    "happened to match the default regardless" -- it always starts at the
+    server/role default either way. Both checks are kept: same-connection
+    (decisive) and fresh-connection (confirms no session-wide side effect).
     """
     migration = importlib.import_module(_MIGRATION_MODULE)
 
@@ -110,15 +117,23 @@ def test_upgrade_runs_for_real_with_finite_timeouts_scoped_to_its_own_transactio
             migration._STATEMENT_TIMEOUT
         )
         trans.commit()
+
+        # Decisive: the SAME connection, immediately after COMMIT, must be
+        # back to what it saw before the transaction started.
+        assert conn.execute(text("SHOW lock_timeout")).scalar() == (
+            baseline_lock_timeout
+        )
+        assert conn.execute(text("SHOW statement_timeout")).scalar() == (
+            baseline_statement_timeout
+        )
     except Exception:
         trans.rollback()
         raise
     finally:
         conn.close()
 
-    # A fresh connection/session must see the ordinary baseline, never the
-    # migration's SET LOCAL values -- proves the scoping, not just that the
-    # statements ran without raising.
+    # Corroborating, not decisive on its own: a fresh connection/session
+    # must also see the ordinary baseline.
     with pg_engine.connect() as after_conn:
         assert after_conn.execute(text("SHOW lock_timeout")).scalar() == (
             baseline_lock_timeout

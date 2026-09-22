@@ -2,15 +2,26 @@
 that has been enriched by a real observed writer since it was seeded.
 
 intelligence/actors/db.py::_seed_known_actors's ON CONFLICT clause used to
-unconditionally reset provenance/provenance_as_of/updated_at to the seed
-values on every rerun. That branch is not reachable through
-build_actor_graph's own gate today (it only calls the seeder when the actors
-query comes back empty, and any existing row -- seeded or observed -- makes
-that query non-empty), but the function is public and callable directly, and
-nothing should rely on the caller's gate to keep it honest. This test calls
-the real function against a real database: seed an actor, simulate a real
-writer confirming/updating it (provenance -> 'observed'), rerun the seeder
-for the same id, and confirm the stronger provenance survives.
+unconditionally reset every seed-authored field, including
+provenance/provenance_as_of/updated_at, to the seed values on every rerun.
+That branch is not reachable through build_actor_graph's own gate today (it
+only calls the seeder when the actors query comes back empty, and any
+existing row -- seeded or observed -- makes that query non-empty), but the
+function is public and callable directly, and nothing should rely on the
+caller's gate to keep it honest. Fixed with a single ``WHERE
+actors.provenance = 'seed'`` guard on the whole ``ON CONFLICT DO UPDATE`` --
+not per-column CASE guards -- so an already-observed row is left completely
+untouched, not just relabeled: overwriting influence_score with the
+hand-typed seed figure while the row's provenance still read 'observed'
+would have made that label a lie for the overwritten field.
+
+This file proves two things against a real database: (1) an enriched row's
+entire state, not just its provenance columns, survives a reseed, with a
+pristine row still correctly promoted as a control case; (2) the same
+enriched-then-reseeded row is read correctly through the real router
+(api.routers.intelligence_actors.get_ego_graph), proving the seeder fix and
+the router's switch from seed-list membership to the stored provenance
+column work together end to end, not just in isolation.
 
 Uses the shared pg_engine fixture (tests/conftest.py) -- skips cleanly if no
 PostgreSQL is reachable.
@@ -128,17 +139,23 @@ def test_seed_rerun_preserves_an_already_observed_row(
 
     # Simulate a real writer (save_actor / a Form4-13F puller) confirming
     # this row since it was seeded: provenance flips to 'observed', with a
-    # fresh updated_at -- exactly the state a later seed rerun must not
-    # discard.
+    # fresh updated_at and a real influence_score reading distinct from the
+    # seed's hand-typed figure -- exactly the state a later seed rerun must
+    # not discard, in whole or in part.
     enriched_updated_at = datetime.now(timezone.utc)
+    enriched_influence = 0.87
+    seed_influence = _seed_data_for(test_id)[test_id]["influence_score"]
+    assert enriched_influence != seed_influence, "test premise: values must differ"
+    enriched_name = "Enriched Canonical Name"
     with pg_engine.begin() as conn:
         conn.execute(
             text(
                 "UPDATE actors SET provenance = :observed, provenance_as_of = NULL, "
-                "updated_at = :updated_at "
+                "updated_at = :updated_at, influence_score = :inf, name = :name "
                 "WHERE id = :id",
             ).bindparams(
-                observed=PROVENANCE_OBSERVED, updated_at=enriched_updated_at, id=test_id,
+                observed=PROVENANCE_OBSERVED, updated_at=enriched_updated_at,
+                inf=enriched_influence, name=enriched_name, id=test_id,
             ),
         )
 
@@ -160,23 +177,25 @@ def test_seed_rerun_preserves_an_already_observed_row(
     assert after["updated_at"] == enriched_updated_at, (
         "updated_at must not be reset to the seed vintage once a row is observed"
     )
-    # This fix is scoped to provenance/provenance_as_of/updated_at only, per
-    # the literal ask ("preserve stronger existing provenance"). Every other
-    # seed-authored field -- name, tier, category, title, influence_score,
-    # motivation_model, data_sources, credibility -- keeps refreshing from
-    # _KNOWN_ACTORS unconditionally on every rerun, exactly as before this
-    # change; net_worth_estimate/aum keep their pre-existing COALESCE
-    # (prefer the seed's value when non-null, else keep what's there).
-    # Whether influence_score (and similar "measurement-shaped" fields)
-    # should ALSO be protected once a row is 'observed' is a real, separate
-    # design question this fix does not resolve -- flagged, not silently
-    # assumed away.
-    expected_seed_influence = _seed_data_for(test_id)[test_id]["influence_score"]
-    assert float(after["influence_score"]) == pytest.approx(expected_seed_influence), (
-        "influence_score is not covered by this fix and is expected to keep "
-        "refreshing from the seed table, same as before"
+    # The fix guards the WHOLE update, not just the provenance columns: an
+    # already-observed row must not have ANY seed-authored field silently
+    # overwritten while its label still claims 'observed' -- that would make
+    # the label a lie for the overwritten field. influence_score (a real
+    # measurement-shaped field, distinct from the identity fields below)
+    # must survive exactly like provenance did.
+    assert float(after["influence_score"]) == pytest.approx(enriched_influence), (
+        "influence_score must survive the reseed once the row is 'observed' -- "
+        "overwriting it with the seed's hand-typed figure would make the "
+        "'observed' label false for this field"
     )
-    assert after["name"] == "Enriched Then Reseeded Test Actor"
+    # Identity fields the seed table would otherwise refresh are also left
+    # alone once the row is 'observed' -- a real overwrite-vs-preserve test,
+    # not tautological: the enriched name differs from the seed's own name,
+    # so a reseed clobbering it would be caught here.
+    assert after["name"] == enriched_name, (
+        "name must also survive the reseed -- the WHERE guard suppresses "
+        "the whole update, not just the provenance columns"
+    )
 
 
 def test_seed_rerun_still_promotes_a_pristine_row(
@@ -201,3 +220,72 @@ def test_seed_rerun_still_promotes_a_pristine_row(
 
     assert row["provenance"] == PROVENANCE_SEED
     assert row["provenance_as_of"] is not None
+
+
+def test_enriched_row_survives_reseeding_and_reports_correctly_through_the_router(
+    pg_engine: Engine, test_id: str, monkeypatch,
+):
+    """End to end: seed -> enrich -> reseed -> read through the real router.
+
+    Ties the seeder's ON CONFLICT ... WHERE fix together with the router's
+    switch from seed-list membership to the stored provenance column.
+    ``test_id`` is deliberately added to the membership set too (on top of
+    being patched into ``_KNOWN_ACTORS``), so a regression to
+    membership-only fallback would be caught here rather than masked by the
+    id never appearing on the real seed list.
+    """
+    import intelligence.actors.db as actors_db
+    import intelligence.actors.provenance as provenance_module
+
+    monkeypatch.setattr(actors_db, "_KNOWN_ACTORS", _seed_data_for(test_id))
+    monkeypatch.setattr(
+        provenance_module, "SEED_ACTOR_IDS",
+        provenance_module.SEED_ACTOR_IDS | {test_id},
+    )
+
+    _seed_known_actors(pg_engine)
+
+    enriched_influence = 0.91
+    enriched_updated_at = datetime.now(timezone.utc)
+    with pg_engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE actors SET provenance = :observed, provenance_as_of = NULL, "
+                "updated_at = :updated_at, influence_score = :inf "
+                "WHERE id = :id",
+            ).bindparams(
+                observed=PROVENANCE_OBSERVED, updated_at=enriched_updated_at,
+                inf=enriched_influence, id=test_id,
+            ),
+        )
+
+    # Reseed -- exercises the ON CONFLICT ... WHERE suppression again.
+    _seed_known_actors(pg_engine)
+
+    with pg_engine.connect() as conn:
+        row = dict(conn.execute(
+            text(
+                "SELECT influence_score, provenance FROM actors WHERE id = :id",
+            ).bindparams(id=test_id),
+        ).fetchone()._mapping)
+    assert row["provenance"] == PROVENANCE_OBSERVED
+    assert float(row["influence_score"]) == pytest.approx(enriched_influence), (
+        "enrichment must survive the reseed before it ever reaches the router"
+    )
+
+    # Now read it through the REAL router (not a fake connection) -- proves
+    # the stored column, not seed-list membership, drives the wire label.
+    from api.routers import intelligence_actors as ia
+
+    monkeypatch.setattr(ia, "get_db_engine", lambda: pg_engine)
+    result = ia.get_ego_graph(test_id, depth=0, max_nodes=5, _token="t")
+    node = next(n for n in result["nodes"] if n["id"] == test_id)
+
+    assert test_id in provenance_module.SEED_ACTOR_IDS, (
+        "test premise: this id is (deliberately) on the seed-membership set"
+    )
+    assert node["source"] == "observed", (
+        "the router must report the stored provenance, not fall back to "
+        "seed-list membership just because this id is on that list"
+    )
+    assert node["source_as_of"] is None
