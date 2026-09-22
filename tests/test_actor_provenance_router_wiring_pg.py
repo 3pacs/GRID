@@ -19,15 +19,29 @@ prior, still-unmerged extraction) and touching them here would be exactly the
 kind of broader audit this reconciliation has repeatedly stayed out of.
 
 The 8:
-  1. ``intelligence/actors/graph.py::build_actor_graph`` (shared helper feeding
-     ``GET /actor-network``, via ``intelligence/actors/db.py::_load_actors_from_db``)
+  1. ``intelligence/actors/graph.py::build_actor_graph`` (shared helper)
   2. ``get_actor_network_db``      (``GET /actor-network/db``)
   3. ``get_actor_enriched_profile`` (``GET /actor/{id}/profile``)
-  4. ``get_sector_power_map``      (``GET /power-map/{sector_name}``)
+  4. ``get_sector_power_map``      (``GET /power-map/{sector_name}``, both its
+     normal path and its zero-DB-match fallback -- see below)
   5. ``ego_graph_search``          (``GET /ego-graph/search``)
   6. ``get_ego_graph``             (``GET /ego-graph/{actor_id}``)
   7. ``get_grand_power_map``       (``GET /grand-power-map``)
   8. intel.py's network-graph actor-traversal branch (``GET /api/v1/intel/network/{entity}``)
+
+Transitively (not separately enumerated, since it builds no node dicts of its
+own): ``GET /actor-network`` (the async, cache-fronted handler
+``get_actor_network``) calls ``intelligence.actor_network.build_actor_graph``,
+and that module is a thin re-export facade for the exact same function wired
+as site 1 -- see ``test_get_actor_network_cached_endpoint_stamps_source_and_survives_cache_hit``
+below, which proves stamped provenance survives this endpoint's 30-minute
+``TTLCache`` (``_actor_graph_cache``). ``PowerMap.jsx`` and
+``ActorNetwork.jsx`` are real PWA consumers of this and several of the 8
+sites above (``power-map``, ``ego-graph``, ``grand-power-map``) -- checked
+directly for any read of a node-level ``source``/``synthetic`` field; none
+exists, every ``.source`` reference in those files is the unrelated D3
+force-graph *edge* convention (``link.source``), so the new field is purely
+additive there.
 
 A pre-existing, unrelated collision was found and resolved while wiring sites
 2 and 3: ``actors.source`` is a DIFFERENT, legacy ingestion-origin column
@@ -35,13 +49,42 @@ A pre-existing, unrelated collision was found and resolved while wiring sites
 already exposed it under the JSON key ``"source"``. That raw value now ships
 under ``"ingestion_source"`` instead, freeing ``"source"``/``"source_as_of"``
 to consistently mean the provenance module's wire label at all 8 sites.
+Checked directly: no PWA code calls either of these two endpoints at all
+(``get_actor_network_db``/``get_actor_enriched_profile`` have no
+``pwa/src/api.js`` wrapper), so nothing could have been reading the old
+ingestion-origin value under the ``"source"`` key in the first place.
 
 Also found and fixed, as a precondition for site 8 to be reachable at all:
 intel.py's network-graph actor-traversal query selected non-existent columns
-(``actor_id``, ``sector`` instead of the real ``id``, ``category``) and had
-therefore always failed silently, caught by that block's own broad
-``except Exception: log.debug(...)``. Fixed to the real column names --
-without this the query never runs, so provenance could never be wired at all.
+(``actor_id``, ``sector`` instead of the real ``id``, ``category``). Every
+version of the ``actors`` table's DDL, from its first commit onward
+(``git log -S"CREATE TABLE IF NOT EXISTS actors"``), has used ``id``/
+``category`` -- this query could never have executed successfully against
+this table's schema at any point in its history. What that history does NOT
+establish: whether this code path was ever actually invoked by production
+traffic, or what (if anything) reached error monitoring -- the exception is
+caught and logged at ``DEBUG`` level by that block's own broad
+``except Exception: log.debug(...)``, which is silent by design regardless
+of whether it fired. Production error logs were not checked (out of scope
+for this task). Fixed to the real column names -- without this the query
+never runs, so provenance could never be wired at all.
+
+Fixing this query is a behavior change beyond provenance labeling: for any
+entity search that matches a real ``actors`` row, this endpoint now (a)
+returns an additional graph node for that actor (previously never added --
+the searched entity's own pre-seeded placeholder node was, and remains, the
+only thing this branch could ever contribute), (b) emits up to 20
+``"connected"`` edges per matched actor per hop, parsed from that actor's
+``connections`` JSONB column (previously never parsed, since the query
+never returned rows to parse), and (c) for the first time actually expands
+`next_frontier` through real actor-relationship data, meaning the ``depth``
+parameter (1-5) is now effective for multi-hop traversal through actors --
+previously only ICIJ relationships (a disjoint data source/table) could ever
+expand the frontier past hop 0. No in-repo caller of this endpoint was
+found (no PWA usage, no other backend module) -- it is documented in
+``.coordination.md`` as a standalone, ``PRO``-tier-gated public API surface,
+so its real audience is external API clients outside this repository, which
+cannot be verified from source alone.
 
 Uses the shared ``pg_engine`` fixture (tests/conftest.py) -- skips cleanly if
 no PostgreSQL is reachable. Router functions are called directly (matching
@@ -439,3 +482,49 @@ def test_intel_network_graph_stamps_source_and_the_column_name_fix_works(pg_engi
     node = nodes_by_id[actor_name.upper()]
     assert node["type"] == "actor"
     assert node["source"] == SOURCE_OBSERVED, "the query must have actually run (not silently failed) and stamped provenance"
+
+
+# ── Cache-hit compatibility: GET /actor-network (30-minute TTLCache) ───────
+#
+# Not one of the 8 sites above -- it was never separately enumerated because
+# it doesn't build its own node dicts. But `get_actor_network` (the async
+# handler behind `GET /actor-network`, a real, PWA-consumed endpoint per
+# pwa/src/components/PowerMap.jsx and pwa/src/views/ActorNetwork.jsx) calls
+# `intelligence.actor_network.build_actor_graph`, and that module is a thin
+# re-export facade (see its own module docstring) for the EXACT same
+# `intelligence.actors.graph.build_actor_graph` wired as site 1 -- so this
+# endpoint is transitively, not directly, affected. Its result is cached for
+# 30 minutes in an in-process `TTLCache` (`_actor_graph_cache`, already
+# covered mechanically by tests/test_intelligence_actors_cache.py). No
+# existing test exercises the endpoint function itself or proves stamped
+# provenance actually survives a cache hit -- that's the concrete gap this
+# closes.
+
+def test_get_actor_network_cached_endpoint_stamps_source_and_survives_cache_hit(pg_engine: Engine, test_ids, monkeypatch):
+    import asyncio
+
+    from api.routers import intelligence_actors as router
+
+    monkeypatch.setattr(router, "get_db_engine", lambda: pg_engine)
+    router._actor_graph_cache.clear()
+
+    aid = f"prov_router_pg_{uuid.uuid4().hex[:10]}_cachedgraph"
+    test_ids.append(aid)
+    with pg_engine.begin() as conn:
+        # influence_score >= 0.7 so the node survives the endpoint's own
+        # pre-existing default-view filter without needing a sector match.
+        _insert_actor(conn, actor_id=aid, name="Cached Graph Actor", provenance=PROVENANCE_OBSERVED, influence_score=0.9)
+
+    try:
+        result1 = asyncio.run(router.get_actor_network(limit=500, sector=None, _token="t"))
+        node1 = next(n for n in result1["nodes"] if n["id"] == aid)
+        assert node1["source"] == SOURCE_OBSERVED
+
+        # Second call within the 30-minute TTL window is a cache hit, not a
+        # rebuild -- the cached payload must still carry the same stamped
+        # provenance, not something stale or missing the field entirely.
+        result2 = asyncio.run(router.get_actor_network(limit=500, sector=None, _token="t"))
+        node2 = next(n for n in result2["nodes"] if n["id"] == aid)
+        assert node2["source"] == SOURCE_OBSERVED
+    finally:
+        router._actor_graph_cache.clear()
