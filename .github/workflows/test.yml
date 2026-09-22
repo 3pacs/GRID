@@ -236,3 +236,15 @@ jobs:
       # case proves.
       - name: Deploy pipeline — atomic release swap (failure injection)
         run: bash tests/deploy/test_deploy_release_swap.sh
+
+      # Failure-injection proof for scripts/deploy_verify_release_tree.sh,
+      # the resolved-cwd + independent-SHA check every "verify running the
+      # deployed tree" step in deploy.yml now shares. Added after the
+      # 2026-09-22 incident where the grid-api verify step's literal
+      # `$cwd = $DEPLOY_PATH` comparison could never pass again once
+      # deploy_release_swap.sh made $DEPLOY_PATH a symlink -- it failed a
+      # genuinely healthy deploy. See
+      # tests/deploy/test_deploy_verify_release_tree.sh's own header for what
+      # each case proves.
+      - name: Deploy pipeline — release-tree verification (failure injection)
+        run: bash tests/deploy/test_deploy_verify_release_tree.sh

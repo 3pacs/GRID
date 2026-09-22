@@ -238,9 +238,14 @@ jobs:
           echo
           fail() { echo "::error::verify failed: $*"; exit 1; }
           api_pid="$(systemctl show -p MainPID --value grid-api)"
-          cwd="$(sudo -n readlink "/proc/${api_pid}/cwd" 2>/dev/null || readlink "/proc/${api_pid}/cwd" 2>/dev/null || true)"
-          echo "grid-api pid=$api_pid cwd=$cwd"
-          [ "$cwd" = "$DEPLOY_PATH" ] || fail "grid-api cwd '$cwd' != $DEPLOY_PATH"
+          # Compares grid-api's resolved cwd against the resolved live-release
+          # target (not the literal $DEPLOY_PATH string, which can never match
+          # once it's a symlink -- see scripts/deploy_verify_release_tree.sh's
+          # own header) and independently verifies the deployed SHA by reading
+          # the target's own git history directly.
+          chmod +x scripts/deploy_verify_release_tree.sh
+          ./scripts/deploy_verify_release_tree.sh "$DEPLOY_PATH" "$api_pid" "${{ github.sha }}" \
+            || fail "release-tree verification failed for grid-api (pid=$api_pid) -- see the deploy_verify_release_tree output above"
           curl -fsS http://localhost:8000/ > /tmp/grid-index.html || fail "GET / failed"
           index_js="$(grep -o '/assets/index-[^"]*\.js' /tmp/grid-index.html | head -1 || true)"
           echo "index asset: ${index_js:-<none>}"
@@ -301,16 +306,10 @@ jobs:
             sleep 2
           done
           pid="$(systemctl show -p MainPID --value grid-hermes)"
-          cwd="$(sudo -n readlink "/proc/${pid}/cwd" 2>/dev/null || readlink "/proc/${pid}/cwd" 2>/dev/null || true)"
-          echo "grid-hermes pid=$pid cwd=$cwd"
-          # DEPLOY_PATH is reached through a symlink on this host, so compare
-          # resolved paths rather than the literal strings.
-          want="$(readlink -f "$DEPLOY_PATH")"
-          [ -n "$cwd" ] && [ "$(readlink -f "$cwd")" = "$want" ] || {
-            echo "::error::grid-hermes cwd '$cwd' does not resolve to $want -- it is running a different tree"
-            exit 1
-          }
-          echo "verify: grid-hermes is running the deployed tree"
+          # Resolved-cwd comparison plus an independent read of the deployed
+          # SHA -- see scripts/deploy_verify_release_tree.sh's own header.
+          chmod +x scripts/deploy_verify_release_tree.sh
+          ./scripts/deploy_verify_release_tree.sh "$DEPLOY_PATH" "$pid" "${{ github.sha }}"
 
       # grid-realtime has the exact same class of bug already fixed for
       # grid-hermes (#487/#490): its unit runs `ExecStart=/usr/bin/python3 -m
@@ -444,13 +443,10 @@ jobs:
             sleep 2
           done
           pid="$(systemctl show -p MainPID --value grid-realtime)"
-          cwd="$(sudo -n readlink "/proc/${pid}/cwd" 2>/dev/null || readlink "/proc/${pid}/cwd" 2>/dev/null || true)"
-          echo "grid-realtime pid=$pid cwd=$cwd"
-          want="$(readlink -f "$DEPLOY_PATH")"
-          [ -n "$cwd" ] && [ "$(readlink -f "$cwd")" = "$want" ] || {
-            echo "::error::grid-realtime cwd '$cwd' does not resolve to $want -- it is running a different tree"
-            exit 1
-          }
+          # Resolved-cwd comparison plus an independent read of the deployed
+          # SHA -- see scripts/deploy_verify_release_tree.sh's own header.
+          chmod +x scripts/deploy_verify_release_tree.sh
+          ./scripts/deploy_verify_release_tree.sh "$DEPLOY_PATH" "$pid" "${{ github.sha }}"
           restart_ts="$(cat "$RUNNER_TEMP/grid-realtime-restart-ts")"
           for attempt in {1..30}; do
             if journalctl -u grid-realtime --since "@${restart_ts}" --no-pager -q 2>/dev/null \
@@ -665,14 +661,10 @@ jobs:
             sleep 2
           done
           pid="$(systemctl show -p MainPID --value grid-scheduler)"
-          cwd="$(sudo -n readlink "/proc/${pid}/cwd" 2>/dev/null || readlink "/proc/${pid}/cwd" 2>/dev/null || true)"
-          echo "grid-scheduler pid=$pid cwd=$cwd"
-          want="$(readlink -f "$DEPLOY_PATH")"
-          [ -n "$cwd" ] && [ "$(readlink -f "$cwd")" = "$want" ] || {
-            echo "::error::grid-scheduler cwd '$cwd' does not resolve to $want -- it is running a different tree"
-            exit 1
-          }
-          echo "verify: grid-scheduler is running the deployed tree"
+          # Resolved-cwd comparison plus an independent read of the deployed
+          # SHA -- see scripts/deploy_verify_release_tree.sh's own header.
+          chmod +x scripts/deploy_verify_release_tree.sh
+          ./scripts/deploy_verify_release_tree.sh "$DEPLOY_PATH" "$pid" "${{ github.sha }}"
 
       # Beyond PID/cwd: prove the pool override actually reached the new
       # process and that it initialized cleanly under that config (not just
@@ -870,13 +862,10 @@ jobs:
             sleep 2
           done
           pid="$(systemctl show -p MainPID --value grid-intelligence)"
-          cwd="$(sudo -n readlink "/proc/${pid}/cwd" 2>/dev/null || readlink "/proc/${pid}/cwd" 2>/dev/null || true)"
-          echo "grid-intelligence pid=$pid cwd=$cwd"
-          want="$(readlink -f "$DEPLOY_PATH")"
-          [ -n "$cwd" ] && [ "$(readlink -f "$cwd")" = "$want" ] || {
-            echo "::error::grid-intelligence cwd '$cwd' does not resolve to $want -- it is running a different tree"
-            exit 1
-          }
+          # Resolved-cwd comparison plus an independent read of the deployed
+          # SHA -- see scripts/deploy_verify_release_tree.sh's own header.
+          chmod +x scripts/deploy_verify_release_tree.sh
+          ./scripts/deploy_verify_release_tree.sh "$DEPLOY_PATH" "$pid" "${{ github.sha }}"
           # Persisted for the telemetry-verify step below: filtering
           # journalctl by --since alone is not enough. If this were a
           # *re*-activation (not the first one), the OLD process --
