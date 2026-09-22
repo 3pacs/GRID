@@ -927,6 +927,25 @@ jobs:
           fi
           echo "**grid-intelligence activated successfully** (pid=${new_pid} logged the deployed pool telemetry and is still the current active process)." | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # scripts/deploy_release_swap.sh's own lock only covers ITS run (build
+      # + swap) -- it's released the instant that script exits, before any
+      # of the restart/verify steps above ever run. Those steps hold no lock
+      # of their own, so a manual scripts/deploy_release_rollback.sh
+      # invoked mid-job would otherwise be free to swap the live path out
+      # from under a restart or health check still in flight against it.
+      # deploy_release_swap.sh writes .activation-in-progress on every
+      # successful swap specifically so the rollback script can refuse that
+      # race; clearing it here, as the LAST step of this job, `if: always()`
+      # so it runs regardless of which optional activation gates fired or
+      # failed above, is what tells that script this job's activation
+      # window is over. If the job is killed outright (not just a failed
+      # step), this step never runs and the marker is left stale -- handled
+      # by deploy_release_rollback.sh's own age-based staleness check, not
+      # here.
+      - name: Clear activation-in-progress marker
+        if: always()
+        run: rm -f "${DEPLOY_PATH}.releases/.activation-in-progress"
+
       - name: Notify success
         if: success()
         run: echo "Deployment successful"

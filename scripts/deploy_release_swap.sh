@@ -44,6 +44,19 @@
 # header for why), not something to do unattended the moment a restart
 # hiccups.
 #
+# What the lock above does NOT cover: this script exits (and releases the
+# lock) the moment the FILE swap succeeds. deploy.yml's restart and
+# health-verification steps for that release run AFTER this script has
+# already exited, as separate steps (separate shell processes -- a flock
+# held via an open file descriptor cannot span them). To keep a manual
+# rollback from racing that still-in-flight activation window, this script
+# also writes <live_path>.releases/.activation-in-progress on every
+# successful swap; deploy.yml clears it as its own last step
+# (`if: always()`, after this run's restarts/verifications). See
+# deploy_release_rollback.sh for how it uses that marker, and its own header
+# for the residual gap if a job crashes outright instead of merely failing a
+# step.
+#
 # Concurrency: this script holds an exclusive lock
 # (<live_path>.releases/.lock) for its ENTIRE run, from the crash-recovery
 # check below through the final prune. Two runs targeting the same
@@ -172,6 +185,14 @@ if [ -d "$LIVE_PATH" ] && [ ! -L "$LIVE_PATH" ]; then
   existing_label="pre-atomic-$(date -u +%Y%m%dT%H%M%SZ)"
   echo "migrating existing plain directory at $LIVE_PATH -> ${RELEASES_DIR}/${existing_label}" >&2
   mv -T "$LIVE_PATH" "${RELEASES_DIR}/${existing_label}"
+  # Test-only hook, a no-op in every real run (default 0): widens the gap
+  # between the two syscalls above and below so a test can deterministically
+  # observe what a concurrent reader sees during it, instead of relying on
+  # the sub-millisecond natural window to be caught by chance. Never set
+  # outside tests/deploy/test_deploy_release_swap.sh.
+  if [ "${DEPLOY_TEST_MIGRATION_DELAY:-0}" != "0" ]; then
+    sleep "$DEPLOY_TEST_MIGRATION_DELAY"
+  fi
   ln -sfn "${RELEASES_DIR}/${existing_label}" "$LIVE_PATH"
 fi
 
@@ -237,6 +258,18 @@ echo "swapped $LIVE_PATH -> $CANDIDATE_DIR" >&2
 if [ -n "$previous_target" ]; then
   echo "$previous_target" > "${RELEASES_DIR}/.previous-release"
 fi
+
+# The FILE swap is done, but deploy.yml's restart/health-verification steps
+# for THIS release haven't run yet -- they're separate steps (separate shell
+# processes) that start after this script has already exited and released
+# its lock above. Until the caller confirms those steps finished (deploy.yml
+# clears this marker as its own last step, `if: always()`), a concurrent
+# deploy_release_rollback.sh must not swap the live path out from under a
+# restart or health check still in flight against it. Written unconditionally
+# on every successful swap; a stale one left behind by a job that crashed
+# outright (not just failed a step) before reaching its clearing step is
+# handled by deploy_release_rollback.sh's own staleness check, not here.
+echo "label=$LABEL swapped_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${RELEASES_DIR}/.activation-in-progress"
 
 # Prune old releases, keeping the one just replaced (for manual rollback)
 # plus the new one -- never the candidate we just failed to promote, since a
