@@ -74,7 +74,8 @@ def test_edge_reads_persisted_signal_types_and_marks_unscored_convergence(monkey
         "status": "detected",
     }
     assert "independent sources SELL" in payload["edge_summary"]
-    assert payload["availability"]["lever_pullers"]["status"] == "unavailable"
+    assert payload["availability"]["lever_pullers"]["status"] == "available"
+    assert payload["availability"]["actor_context"]["status"] == "available"
 
 
 def test_edge_missing_signal_sources_is_explicitly_unavailable():

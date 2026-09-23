@@ -311,7 +311,9 @@ export function InsiderEdgePanel({ edgeData, loading }) {
     }
 
     const { congressional, insider, dark_pool, whale_flow, prediction_markets,
-            smart_money, lever_pullers, leads, convergence, edge_summary } = edgeData;
+            smart_money, lever_pullers, leads, convergence, edge_summary, availability } = edgeData;
+    const enrichmentUnavailable = availability?.lever_pullers?.status === 'unavailable'
+        || availability?.actor_context?.status === 'unavailable';
 
     const hasSignals = (congressional?.length || insider?.length || dark_pool ||
         whale_flow?.length || prediction_markets?.length || smart_money?.length ||
@@ -376,7 +378,7 @@ export function InsiderEdgePanel({ edgeData, loading }) {
                             {edge_summary}
                         </div>
                     )}
-                    {edgeData.status === 'partial' && (
+                    {edgeData.status === 'partial' && enrichmentUnavailable && (
                         <div style={{ fontSize: '10px', color: colors.textMuted, marginBottom: '10px', fontFamily: colors.sans }}>
                             Lever and actor enrichment is unavailable in this read-only view.
                         </div>
