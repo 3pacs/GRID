@@ -251,3 +251,19 @@ class TestWatchlistPriceEndpoints:
             "prices",
             {"SPY": {"price": 501.0, "pct_1d": 0.02}},
         )
+
+
+class TestPortfolioReadContract:
+    @patch("api.routers.watchlist_core._init_table")
+    @patch("api.routers.watchlist_core.get_db_engine")
+    def test_storage_failure_is_unavailable_without_bootstrap(self, mock_engine, mock_init):
+        mock_engine.return_value.connect.return_value.__enter__.side_effect = RuntimeError(
+            "unavailable"
+        )
+
+        response = client.get("/api/v1/watchlist/portfolio", headers=_auth_header())
+
+        assert response.status_code == 503
+        assert response.json() == {"detail": "Portfolio watchlist data is unavailable"}
+        mock_init.assert_not_called()
+        mock_engine.return_value.begin.assert_not_called()

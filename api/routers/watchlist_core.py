@@ -126,23 +126,19 @@ def get_portfolio(
     options P&L from the recommendation tracker.
     """
 
-    _init_table()
-    engine = get_db_engine()
-
-    # ── Ensure weight column exists ──────────────────────────────
-    try:
-        with engine.begin() as conn:
-            conn.execute(text(
-                "ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS weight NUMERIC DEFAULT NULL"
-            ))
-    except Exception as exc:
-        log.debug("Watchlist: weight column migration failed (may already exist): {e}", e=str(exc))
-
     # ── Load watchlist with weights ──────────────────────────────
-    with engine.connect() as conn:
-        rows = conn.execute(text(
-            "SELECT ticker, display_name, asset_type, weight FROM watchlist ORDER BY added_at"
-        )).fetchall()
+    try:
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT ticker, display_name, asset_type, weight FROM watchlist ORDER BY added_at"
+            )).fetchall()
+    except Exception as exc:
+        log.warning("Portfolio watchlist read failed: {error_type}", error_type=type(exc).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Portfolio watchlist data is unavailable",
+        ) from exc
 
     if not rows:
         return {
