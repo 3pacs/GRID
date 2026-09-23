@@ -1120,6 +1120,9 @@ function CapitalFlowPath({ sectorPath, ticker }) {
 
 export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
     const { isMobile } = useDevice();
+    const currentTickerRef = useRef(ticker);
+    currentTickerRef.current = ticker;
+    const periodRequestRef = useRef(0);
     const [data, setData] = useState(null);
     const [dataLoading, setDataLoading] = useState(true);
     const [error, setError] = useState(null);
@@ -1140,6 +1143,7 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
     useEffect(() => {
         if (!ticker) return;
         let active = true;
+        periodRequestRef.current += 1;
 
         // Reset state for new ticker
         setData(null);
@@ -1156,9 +1160,11 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
         setSecondaryLoading(true);
         setEdgeData(null);
         setEdgeLoading(true);
+        setPriceLoading(false);
 
         // Phase 1: Fetch core analysis data (fastest — often cached)
         api.getTickerAnalysis(ticker, period).then(result => {
+            if (!active) return;
             if (result?.error) {
                 setError(result.message || 'Failed to load');
                 setData(null);
@@ -1167,23 +1173,28 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
             }
             setDataLoading(false);
         }).catch(err => {
+            if (!active) return;
             setError(err.message || 'Failed to load');
             setDataLoading(false);
         });
 
         // Phase 2: Fetch AI overview (may be slow due to LLM)
         api.getTickerOverview(ticker).then(result => {
+            if (!active) return;
             setOverview(result?.error ? null : result);
             setOverviewLoading(false);
         }).catch(() => {
+            if (!active) return;
             setOverviewLoading(false);
         });
 
         // Phase 2b: Fetch insider edge intelligence
         api.getTickerEdge(ticker).then(result => {
+            if (!active) return;
             setEdgeData(result?.error ? null : result);
             setEdgeLoading(false);
         }).catch(() => {
+            if (!active) return;
             setEdgeLoading(false);
         });
 
@@ -1195,14 +1206,30 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
         ]).then(([gexResult, vcResult, ftResult]) => {
             if (!active) return;
             const gex = gexResult.status === 'fulfilled' ? gexResult.value : null;
-            const hasGexProfile = (gex?.profile?.length || 0) > 0 || (gex?.per_strike?.length || 0) > 0;
-            setGexData(!gex?.error && hasGexProfile ? gex : null);
-            setGexAvailability(gex?.error || !gex ? 'unavailable' : hasGexProfile ? 'available' : 'empty');
+            const perStrike = gex?.per_strike;
+            const profile = gex?.profile;
+            const hasGexProfile = (Array.isArray(profile) && profile.length > 0)
+                || (Array.isArray(perStrike) && perStrike.length > 0);
+            const validRows = (rows, x, y) => !Array.isArray(rows) || rows.every(row =>
+                row && typeof row === 'object' && Number.isFinite(row[x]) && Number.isFinite(row[y]));
+            const validGex = (profile == null || Array.isArray(profile))
+                && (perStrike == null || Array.isArray(perStrike))
+                && Number.isFinite(gex?.spot) && gex.spot > 0
+                && Number.isFinite(gex?.gex_aggregate)
+                && validRows(profile, 'spot', 'gex')
+                && validRows(perStrike, 'strike', 'net_gex');
+            setGexData(!gex?.error && hasGexProfile && validGex ? gex : null);
+            setGexAvailability(gex?.error || !gex || (hasGexProfile && !validGex)
+                || (profile != null && !Array.isArray(profile))
+                || (perStrike != null && !Array.isArray(perStrike))
+                ? 'unavailable' : hasGexProfile ? 'available' : 'empty');
             setGexLoading(false);
             const vannaCharm = vcResult.status === 'fulfilled' ? vcResult.value : null;
-            const hasVannaCharm = vannaCharm?.vanna_exposure != null || vannaCharm?.charm_exposure != null;
+            const hasVannaCharm = Number.isFinite(vannaCharm?.vanna_exposure)
+                && Number.isFinite(vannaCharm?.charm_exposure);
             setVannaCharmData(!vannaCharm?.error && hasVannaCharm ? vannaCharm : null);
-            setVannaCharmAvailability(vannaCharm?.error || !vannaCharm ? 'unavailable' : hasVannaCharm ? 'available' : 'empty');
+            setVannaCharmAvailability(vannaCharm?.error || !vannaCharm || !hasVannaCharm
+                ? 'unavailable' : 'available');
             if (ftResult.status === 'fulfilled' && !ftResult.value?.error) {
                 setFlowTimelineData(ftResult.value);
             }
@@ -1213,10 +1240,13 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
 
     const handlePeriodChange = useCallback(async (newPeriod) => {
         if (newPeriod === period) return;
+        const requestId = ++periodRequestRef.current;
+        const requestTicker = ticker;
         setPeriod(newPeriod);
         setPriceLoading(true);
         try {
             const refreshed = await api.getTickerAnalysis(ticker, newPeriod);
+            if (periodRequestRef.current !== requestId || currentTickerRef.current !== requestTicker) return;
             if (refreshed?.error) {
                 return;
             }
@@ -1228,8 +1258,11 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
             }));
         } catch (err) {
             // Keep existing data on failure
+        } finally {
+            if (periodRequestRef.current === requestId && currentTickerRef.current === requestTicker) {
+                setPriceLoading(false);
+            }
         }
-        setPriceLoading(false);
     }, [ticker, period]);
 
     // Use enrichedData for instant display while analysis loads
