@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import socket
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import schedule
@@ -1211,6 +1211,50 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
     log.info("Daily pulls finished")
 
 
+def _completed_spy_close_window(
+    start_date: str | date, *, now_utc: datetime | None = None,
+) -> tuple[date, date] | None:
+    """One completed trading session omitted by this scheduler's start date.
+
+    This is a forward daily check, bounded by the close contract's existing
+    four-calendar-day capture policy. It never selects a historical range.
+    """
+    from ingestion.market_calendar import last_trading_day
+    from price_close_contract import SPY_CAPTURE_MAX_LOOKBACK_DAYS
+
+    now = now_utc or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        raise ValueError("SPY close window requires an aware UTC clock")
+    utc_today = now.astimezone(timezone.utc).date()
+    completed_session = last_trading_day(utc_today - timedelta(days=1))
+    requested_start = (
+        start_date if isinstance(start_date, date)
+        else date.fromisoformat(start_date)
+    )
+    if (requested_start <= completed_session or
+            (utc_today - completed_session).days > SPY_CAPTURE_MAX_LOOKBACK_DAYS):
+        return None
+    return completed_session, completed_session + timedelta(days=1)
+
+
+def _pull_completed_spy_close(
+    puller: Any, start_date: str | date, *, now_utc: datetime | None = None,
+) -> tuple[date, dict[str, Any]] | None:
+    """Fetch only the omitted completed SPY close through the marked writer.
+
+    Yahoo's end is exclusive. The puller retains the post-UTC-day marker and
+    exact raw-row dedupe; this request writes no other OHLCV field.
+    """
+    window = _completed_spy_close_window(start_date, now_utc=now_utc)
+    if window is None:
+        return None
+    result = puller.pull_ticker(
+        "SPY", start_date=window[0], end_date=window[1],
+        interval="1d", only_fields=frozenset({"close"}),
+    )
+    return window[0], result
+
+
 def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
     """Equity-hours pullers — only called when market is open."""
     from db import get_engine
@@ -1265,6 +1309,14 @@ def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
             total=len(results),
             rows=total_rows,
         )
+        completed_spy = _pull_completed_spy_close(yf_puller, start_date)
+        if completed_spy is not None:
+            completed_day, spy_result = completed_spy
+            log.info(
+                "SPY completed-close check for {d}: outcome={o}, rows={n}",
+                d=completed_day, o=spy_result["outcome"],
+                n=spy_result["rows_inserted"],
+            )
         # Surface per-ticker failures here too instead of only in
         # pull_ticker's own log lines — this is the function actually
         # wired to the 4x/day cron, so this is where an operator/Hermes
