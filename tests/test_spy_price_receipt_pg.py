@@ -390,7 +390,7 @@ def test_missing_outcomes_do_not_fill_bounded_batch(receipt_pg_engine: Engine) -
     engine = receipt_pg_engine
     today = datetime.now(timezone.utc).date()
     old_ids = []
-    for days_ago in (40, 30):
+    for days_ago in (70, 45):
         created_day = today - timedelta(days=days_ago)
         entry = _receipt(engine, created_day - timedelta(days=1), 680.0)
         old_ids.append(_prediction(engine, created_day, entry))
@@ -414,7 +414,7 @@ def test_malformed_outcomes_do_not_fill_bounded_batch(receipt_pg_engine: Engine)
     engine = receipt_pg_engine
     today = datetime.now(timezone.utc).date()
     old_ids = []
-    for days_ago in (40, 30):
+    for days_ago in (70, 45):
         created_day = today - timedelta(days=days_ago)
         entry = _receipt(engine, created_day - timedelta(days=1), 680.0)
         old_ids.append(_prediction(engine, created_day, entry))
