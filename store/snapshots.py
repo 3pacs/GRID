@@ -490,7 +490,7 @@ class AnalyticalSnapshotStore:
             # fresh install and the database is briefly unreachable during a
             # restart. Warning, so errors.jsonl stays signal-rich (CLAUDE.md).
             log.warning("Could not list snapshot categories: {e}", e=str(exc))
-            return []
+            raise
 
         categories = [
             {

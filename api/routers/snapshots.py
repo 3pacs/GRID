@@ -26,6 +26,11 @@ router = APIRouter(prefix="/api/v1/snapshots", tags=["snapshots"])
 _MAX_CATEGORY_LEN = 128
 
 
+def _snapshot_unavailable(exc: Exception) -> None:
+    """Do not represent a failed persisted read as an empty snapshot set."""
+    raise HTTPException(status_code=503, detail="snapshot_store_unavailable") from exc
+
+
 # ------------------------------------------------------------------
 # Research run status (GRID W4c) — read-only surface over the
 # scripts/autoresearch.py run-state trail (category="research_run",
@@ -93,7 +98,10 @@ def get_latest_snapshots(
     engine = get_db_engine()
     store = AnalyticalSnapshotStore(db_engine=engine, ensure_table=False)
 
-    return store.get_latest(category, n=n)
+    try:
+        return store.get_latest(category, n=n)
+    except Exception as exc:
+        _snapshot_unavailable(exc)
 
 
 @router.get("/history/{category}")
@@ -109,7 +117,10 @@ def get_snapshot_history(
     engine = get_db_engine()
     store = AnalyticalSnapshotStore(db_engine=engine, ensure_table=False)
 
-    df = store.get_history(category, start_date=start_date, end_date=end_date)
+    try:
+        df = store.get_history(category, start_date=start_date, end_date=end_date)
+    except Exception as exc:
+        _snapshot_unavailable(exc)
     if df.empty:
         return []
     return df.to_dict("records")
@@ -128,7 +139,10 @@ def compare_snapshots(
     engine = get_db_engine()
     store = AnalyticalSnapshotStore(db_engine=engine, ensure_table=False)
 
-    result = store.compare_snapshots(category, date_a, date_b)
+    try:
+        result = store.compare_snapshots(category, date_a, date_b)
+    except Exception as exc:
+        _snapshot_unavailable(exc)
     if "error" in result:
         raise HTTPException(status_code=404, detail=result["error"])
     return result
@@ -153,7 +167,10 @@ def list_categories(
     engine = get_db_engine()
     store = AnalyticalSnapshotStore(db_engine=engine, ensure_table=False)
 
-    categories = store.list_categories()
+    try:
+        categories = store.list_categories()
+    except Exception as exc:
+        _snapshot_unavailable(exc)
     total = len(categories)
     return {
         "entries": categories[offset : offset + limit],
