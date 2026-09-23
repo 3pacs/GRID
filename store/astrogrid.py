@@ -24,6 +24,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from config import settings
 from oracle.astrogrid_universe import scoreable_universe_by_symbol
 from price_close_contract import (
+    SPY_CLOSE_CAPTURE_POLICY,
     SPY_CLOSE_CONTRACT,
     SPY_CLOSE_FEATURE,
     SPY_CLOSE_SERIES,
@@ -1504,6 +1505,8 @@ class AstroGridStore:
         params["score_cutoff"] = score_cutoff
         params["spy_feature"] = SPY_CLOSE_FEATURE
         params["spy_contract"] = SPY_CLOSE_CONTRACT
+        params["spy_basis"] = SPY_CLOSE_SERIES
+        params["spy_capture_policy"] = SPY_CLOSE_CAPTURE_POLICY
         params["spy_outcome_grace_days"] = SPY_OUTCOME_GRACE_DAYS
         where_sql = f"AND {' AND '.join(filters)}" if filters else ""
         sql = text(
@@ -1548,9 +1551,31 @@ class AstroGridStore:
                                 = 'spy_close_v1'
                             AND EXISTS (
                                 SELECT 1 FROM {self.schema}.price_close_receipt pc
+                                JOIN raw_series raw ON raw.id = pc.raw_series_id
+                                JOIN resolved_series rs ON rs.id = pc.resolved_series_id
                                 JOIN feature_registry fr ON fr.id = pc.feature_id
+                                JOIN source_catalog sc ON sc.id = raw.source_id
                                 WHERE fr.name = :spy_feature
                                   AND pc.contract_version = :spy_contract
+                                  AND pc.price_basis = :spy_basis
+                                  AND raw.series_id = :spy_basis
+                                  AND raw.pull_status = 'SUCCESS'
+                                  AND sc.name = 'yfinance'
+                                  AND rs.feature_id = pc.feature_id
+                                  AND rs.source_priority_used = raw.source_id
+                                  AND rs.obs_date = pc.obs_date
+                                  AND raw.obs_date = pc.obs_date
+                                  AND rs.value = pc.value
+                                  AND raw.value = pc.value
+                                  AND raw.pull_timestamp = pc.available_at
+                                  AND raw.raw_payload->>'price_contract_version' = :spy_contract
+                                  AND raw.raw_payload->>'capture_policy' = :spy_capture_policy
+                                  AND raw.raw_payload->>'price_basis' = :spy_basis
+                                  AND raw.raw_payload->>'interval' = '1d'
+                                  AND raw.raw_payload->>'obs_date' = pc.obs_date::text
+                                  AND raw.raw_payload->'provider_certified_final' = 'false'::jsonb
+                                  AND raw.pull_timestamp >=
+                                      ((pc.obs_date + 1)::timestamp AT TIME ZONE 'UTC')
                                   AND pc.obs_date BETWEEN
                                       (pr.created_at AT TIME ZONE 'UTC')::date
                                         + CASE WHEN pr.horizon_label = 'macro' THEN 30 ELSE 7 END

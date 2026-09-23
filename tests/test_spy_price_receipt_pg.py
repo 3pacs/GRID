@@ -410,6 +410,37 @@ def test_missing_outcomes_do_not_fill_bounded_batch(receipt_pg_engine: Engine) -
         """), {"ids": old_ids}).scalar_one() == 0
 
 
+def test_malformed_outcomes_do_not_fill_bounded_batch(receipt_pg_engine: Engine) -> None:
+    engine = receipt_pg_engine
+    today = datetime.now(timezone.utc).date()
+    old_ids = []
+    for days_ago in (40, 30):
+        created_day = today - timedelta(days=days_ago)
+        entry = _receipt(engine, created_day - timedelta(days=1), 680.0)
+        old_ids.append(_prediction(engine, created_day, entry))
+        outcome = _receipt(engine, created_day + timedelta(days=7), 700.0)
+        # Simulate a broken source lineage after the receipt was created.
+        # The receipt still exists, but _verified_spy_receipt rejects it.
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE raw_series SET raw_payload = '{}'::jsonb WHERE id = :raw_id
+            """), {"raw_id": outcome["raw_series_id"]})
+    created_day = today - timedelta(days=20)
+    entry = _receipt(engine, created_day - timedelta(days=1), 680.0)
+    wanted_id = _prediction(engine, created_day, entry)
+    _receipt(engine, created_day + timedelta(days=7), 705.0)
+
+    summary = AstroGridStore(engine).score_predictions(as_of_date=today, limit=2)
+    assert summary["scored"] == 1
+    assert summary["prediction_ids"] == [wanted_id]
+    with engine.connect() as conn:
+        assert conn.execute(text("""
+            SELECT count(*) FROM astrogrid.prediction_score ps
+            JOIN astrogrid.prediction_run pr ON pr.id = ps.prediction_run_id
+            WHERE pr.prediction_id = ANY(:ids)
+        """), {"ids": old_ids}).scalar_one() == 0
+
+
 def test_outcome_window_edges_and_earliest_date(receipt_pg_engine: Engine) -> None:
     engine = receipt_pg_engine
     created_day = datetime.now(timezone.utc).date() - timedelta(days=20)
