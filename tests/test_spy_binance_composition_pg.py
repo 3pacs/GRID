@@ -236,8 +236,9 @@ def test_spy_and_binance_resolve_together_in_one_partition_without_interference(
     )
 
 
+@pytest.mark.parametrize("adjusted_first", [True, False])
 def test_spy_adjusted_close_cannot_displace_marked_unadjusted_close(
-    composed_pg_engine: Engine,
+    composed_pg_engine: Engine, adjusted_first: bool,
 ) -> None:
     engine = composed_pg_engine
     now = datetime.now(timezone.utc)
@@ -249,8 +250,12 @@ def test_spy_adjusted_close_cannot_displace_marked_unadjusted_close(
     assert entity_map.get_feature_id(SPY_CLOSE_SERIES) == 2791
 
     with engine.begin() as conn:
-        _insert_unmarked_spy_raw(conn, "YF:SPY:adj_close", obs, pulled_at, 678.0)
-        _insert_spy_raw(conn, obs, pulled_at, 680.0)
+        if adjusted_first:
+            _insert_unmarked_spy_raw(conn, "YF:SPY:adj_close", obs, pulled_at, 678.0)
+            _insert_spy_raw(conn, obs, pulled_at, 680.0)
+        else:
+            _insert_spy_raw(conn, obs, pulled_at, 680.0)
+            _insert_unmarked_spy_raw(conn, "YF:SPY:adj_close", obs, pulled_at, 678.0)
     result = Resolver(engine).resolve_pending(
         workers=1, since=pulled_at - timedelta(hours=1),
     )
@@ -269,8 +274,9 @@ def test_spy_adjusted_close_cannot_displace_marked_unadjusted_close(
     print("SPY_ADJ_CLOSE_BOUNDARY marked_close_resolved=1 adjusted_displaced=0 receipts=1")
 
 
+@pytest.mark.parametrize("adjusted_first", [True, False])
 def test_spy_adjusted_close_without_marked_close_leaves_shared_feature_unresolved(
-    composed_pg_engine: Engine,
+    composed_pg_engine: Engine, adjusted_first: bool,
 ) -> None:
     engine = composed_pg_engine
     now = datetime.now(timezone.utc)
@@ -278,8 +284,12 @@ def test_spy_adjusted_close_without_marked_close_leaves_shared_feature_unresolve
     pulled_at = datetime.combine(obs + timedelta(days=1), time(1), timezone.utc)
     assert pulled_at < now
     with engine.begin() as conn:
-        _insert_unmarked_spy_raw(conn, "YF:SPY:adj_close", obs, pulled_at, 678.0)
-        _insert_unmarked_spy_raw(conn, SPY_CLOSE_SERIES, obs, pulled_at, 680.0)
+        if adjusted_first:
+            _insert_unmarked_spy_raw(conn, "YF:SPY:adj_close", obs, pulled_at, 678.0)
+            _insert_unmarked_spy_raw(conn, SPY_CLOSE_SERIES, obs, pulled_at, 680.0)
+        else:
+            _insert_unmarked_spy_raw(conn, SPY_CLOSE_SERIES, obs, pulled_at, 680.0)
+            _insert_unmarked_spy_raw(conn, "YF:SPY:adj_close", obs, pulled_at, 678.0)
     result = Resolver(engine).resolve_pending(
         workers=1, since=pulled_at - timedelta(hours=1),
     )
