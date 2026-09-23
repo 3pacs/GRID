@@ -297,6 +297,18 @@ export function InsiderEdgePanel({ edgeData, loading }) {
 
     if (loading) return <OverviewSkeleton />;
     if (!edgeData) return null;
+    if (edgeData.status === 'unavailable') {
+        return (
+            <div style={{ ...shared.cardGradient, borderLeft: `3px solid ${colors.textMuted}`, marginTop: '12px' }}>
+                <div style={{ fontSize: '9px', fontWeight: 700, letterSpacing: '1.5px', color: colors.accent }}>
+                    INSIDER EDGE UNAVAILABLE
+                </div>
+                <div style={{ fontSize: '12px', color: colors.textMuted, marginTop: '8px', fontFamily: colors.sans }}>
+                    Persisted intelligence data is unavailable.
+                </div>
+            </div>
+        );
+    }
 
     const { congressional, insider, dark_pool, whale_flow, prediction_markets,
             smart_money, lever_pullers, leads, convergence, edge_summary } = edgeData;
@@ -362,6 +374,11 @@ export function InsiderEdgePanel({ edgeData, loading }) {
                             border: `1px solid ${dirColor}20`,
                         }}>
                             {edge_summary}
+                        </div>
+                    )}
+                    {edgeData.status === 'partial' && (
+                        <div style={{ fontSize: '10px', color: colors.textMuted, marginBottom: '10px', fontFamily: colors.sans }}>
+                            Lever and actor enrichment is unavailable in this read-only view.
                         </div>
                     )}
 
