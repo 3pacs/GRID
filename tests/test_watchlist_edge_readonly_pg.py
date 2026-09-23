@@ -137,7 +137,19 @@ def test_edge_route_uses_only_selects_against_prepared_postgres_schema():
         with engine.begin() as conn:
             conn.execute(text("""
                 UPDATE signal_sources SET trust_score = NULL
-                WHERE ticker = 'TEST' AND source_type IN ('insider', 'darkpool')
+                WHERE ticker = 'TEST' AND source_type = 'darkpool'
+            """))
+        statements.clear()
+        partially_scored = get_ticker_edge("test", user={}, engine=engine)["convergence"]
+        assert partially_scored["source_count"] == 3
+        assert partially_scored["scored_source_count"] == 2
+        assert partially_scored["confidence"] == 0.4
+        assert statements and all(statement.startswith("SELECT") for statement in statements)
+
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE signal_sources SET trust_score = NULL
+                WHERE ticker = 'TEST' AND source_type = 'insider'
             """))
         statements.clear()
         mixed = get_ticker_edge("test", user={}, engine=engine)["convergence"]
