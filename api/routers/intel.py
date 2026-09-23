@@ -982,13 +982,18 @@ async def intel_deep_dive(
 # Each hop issues one query per frontier NAME (not a single batched query,
 # unlike get_ego_graph's per-hop LIMIT), and until the actor-traversal fix
 # above, the actor branch could never contribute to next_frontier at all --
-# so growth was bounded in practice by ICIJ's much sparser fan-out. Fixing
-# that branch means a well-connected actor's `connections` column (which can
-# run far denser than ICIJ leak relationships) can now drive next_frontier
-# growth too, at up to depth=5. Without a total-node cap, a single request
-# against a highly-connected root could fan out to a very large number of
-# sequential per-name queries. Mirrors get_ego_graph's existing
-# `len(actor_map) >= max_nodes` pattern (api/routers/intelligence_actors.py).
+# so growth was bounded in practice only by whatever the (then-always-broken)
+# ICIJ query alone could ever contribute (effectively nothing, since it was
+# broken too -- see the ICIJ query's own LIMIT/schema-fix comment below).
+# With both branches now able to actually run, a well-connected actor's
+# `connections` column or a well-connected ICIJ entity's relationships can
+# drive next_frontier growth, at up to depth=5. Without a total-node cap, a
+# single request against a highly-connected root could fan out to a very
+# large number of sequential per-name queries. Mirrors get_ego_graph's
+# existing `len(actor_map) >= max_nodes` pattern
+# (api/routers/intelligence_actors.py). This caps the NUMBER OF NAMES
+# processed; the ICIJ query's own LIMIT (below) caps rows WITHIN a single
+# name's query, since this check alone only re-evaluates between names.
 _MAX_NETWORK_NODES = 500
 
 
@@ -1032,14 +1037,47 @@ def intel_network(
                     }
 
                 # ICIJ relationships
+                #
+                # icij_relationships.from_node/to_node are integer node_id
+                # references, not name strings -- they can point into any of
+                # three separate ICIJ tables (icij_entities, icij_officers,
+                # icij_intermediaries), each with its own node_id/name, per
+                # ingestion/altdata/icij_puller.py's own insert statements.
+                # Resolve both ends' names via a union of those three tables
+                # before matching by name. Only icij_entities carries
+                # jurisdiction; officers/intermediaries have none.
+                #
+                # LIMIT 200: every other query in this file that can match
+                # more than a handful of rows carries one (see e.g.
+                # get_actor_network_db's default LIMIT 200); this one is a
+                # real name-equality match against relationship data, where
+                # a single well-connected ICIJ entity (a large law firm or
+                # registered-agent hub) can legitimately have thousands of
+                # relationships -- unlike the actor query below, which reads
+                # a JSONB column already capped by the writer.
+                # _MAX_NETWORK_NODES only re-checks BETWEEN frontier names,
+                # not within a single query's row loop, so without this a
+                # single hub name could add thousands of nodes/edges in one
+                # pass before that cap has a chance to matter again.
                 try:
                     rows = conn.execute(
                         text(
-                            "SELECT entity_name, linked_to, relationship_type, "
-                            "jurisdiction, source_dataset "
-                            "FROM icij_relationships "
-                            "WHERE UPPER(entity_name) = :n "
-                            "   OR UPPER(linked_to) = :n"
+                            "WITH icij_nodes AS ("
+                            "    SELECT node_id, name, jurisdiction FROM icij_entities"
+                            "    UNION ALL"
+                            "    SELECT node_id, name, NULL AS jurisdiction FROM icij_officers"
+                            "    UNION ALL"
+                            "    SELECT node_id, name, NULL AS jurisdiction FROM icij_intermediaries"
+                            ") "
+                            "SELECT n1.name AS entity_name, n2.name AS linked_to, "
+                            "       r.rel_type AS relationship_type, "
+                            "       n1.jurisdiction, r.source_dataset "
+                            "FROM icij_relationships r "
+                            "JOIN icij_nodes n1 ON n1.node_id = r.from_node "
+                            "JOIN icij_nodes n2 ON n2.node_id = r.to_node "
+                            "WHERE UPPER(n1.name) = :n "
+                            "   OR UPPER(n2.name) = :n "
+                            "LIMIT 200"
                         ),
                         {"n": name},
                     ).fetchall()
@@ -1070,6 +1108,13 @@ def intel_network(
                         "ICIJ traversal failed at hop {h} for {n}: {e}",
                         h=hop, n=name, e=str(exc),
                     )
+                    # A failed statement aborts the connection's transaction
+                    # in PostgreSQL -- every later statement on this SAME
+                    # connection (the actor query below, and every later
+                    # hop's queries) would otherwise also fail until rolled
+                    # back. Isolate this block's failure from everything
+                    # that runs after it on the same connection.
+                    conn.rollback()
 
                 # Actor connections
                 try:
@@ -1133,6 +1178,11 @@ def intel_network(
                         "Actor traversal failed at hop {h} for {n}: {e}",
                         h=hop, n=name, e=str(exc),
                     )
+                    # Same isolation reasoning as the ICIJ block above --
+                    # without this, a failure here would abort the
+                    # connection's transaction for every later hop's queries
+                    # on this same connection.
+                    conn.rollback()
 
             frontier = next_frontier
 
