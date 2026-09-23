@@ -1091,14 +1091,33 @@ def run_daily_binance_close() -> dict[str, Any]:
 
         engine = get_engine()
     except Exception as exc:
-        # Without an engine there is no honest pull_log receipt to claim.
-        log.error(
-            "Binance_Crypto scheduled cycle could not obtain DB engine; "
-            "pull_log unavailable ({kind})",
-            kind=type(exc).__name__,
-        )
-        raise
-    return run_pull_group("crypto", engine)
+        return _unverified_binance_failure("engine_unavailable", exc)
+    try:
+        return run_pull_group("crypto", engine)
+    except Exception as exc:
+        # Preserve the scheduler loop and its other jobs. This is one failed
+        # attempted cycle, not a request to retry or ingest a previous day.
+        return _unverified_binance_failure("cycle_unverified", exc)
+
+
+def _unverified_binance_failure(phase: str, exc: Exception) -> dict[str, Any]:
+    """Report a failed scheduled attempt without claiming a completed receipt."""
+    error = f"{phase}:{type(exc).__name__}"
+    provider_write_state = "not_started" if phase == "engine_unavailable" else "unknown"
+    log.error(
+        "Binance_Crypto scheduled cycle FAILED; pull_log completion unverified "
+        "({error}); provider_write_state={write_state}",
+        error=error, write_state=provider_write_state,
+    )
+    return {
+        "group": "crypto",
+        "results": [{
+            "puller": "Binance_Crypto", "status": "FAILED", "error": error,
+            "pull_log_id": None, "completed_log_persisted": False,
+            "provider_write_state": provider_write_state,
+        }],
+        "success_count": 0, "failure_count": 1, "skipped_count": 0,
+    }
 
 
 def backfill_all(start_date: str = "1970-01-01") -> None:

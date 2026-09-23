@@ -130,10 +130,11 @@ class PullContext:
         else:
             status = "SUCCESS"
             error_msg = None
-            log.info(
-                "Pull SUCCESS: {p} — {r} rows",
-                p=self._puller_name, r=self._rows_inserted,
-            )
+            if not self._require_persisted_log:
+                log.info(
+                    "Pull SUCCESS: {p} — {r} rows",
+                    p=self._puller_name, r=self._rows_inserted,
+                )
 
         # ── Sanity checks on row counts ───────────────────────────────
         self._sanity_check_row_counts(status)
@@ -141,7 +142,7 @@ class PullContext:
         if self._log_id is not None:
             try:
                 with self._engine.begin() as conn:
-                    conn.execute(
+                    result = conn.execute(
                         text("""
                             UPDATE pull_log SET
                                 completed_at = :completed,
@@ -151,6 +152,7 @@ class PullContext:
                                 error_message = :error,
                                 features_affected = :features
                             WHERE id = :id
+                            RETURNING id
                         """),
                         {
                             "completed": now,
@@ -162,6 +164,10 @@ class PullContext:
                             "id": self._log_id,
                         },
                     )
+                    if self._require_persisted_log and result.fetchone() is None:
+                        raise PullLogPersistenceError(
+                            f"pull_log finish matched no row for {self._puller_name}"
+                        )
             except Exception as db_exc:
                 if self._require_persisted_log:
                     log.error(
@@ -175,6 +181,12 @@ class PullContext:
                     "PullContext: failed to update pull_log for {p}: {e}",
                     p=self._puller_name, e=str(db_exc),
                 )
+
+        if self._require_persisted_log and status == "SUCCESS":
+            log.info(
+                "Pull SUCCESS: {p} — {r} rows (pull_log committed)",
+                p=self._puller_name, r=self._rows_inserted,
+            )
 
         # Emit event for bus integration (best-effort)
         try:
