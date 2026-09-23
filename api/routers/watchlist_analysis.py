@@ -11,12 +11,10 @@ from sqlalchemy import text
 from api.auth import require_auth
 from api.dependencies import get_db_engine
 from api.routers.watchlist_helpers import (
-    _cache_price_to_db,
     _fetch_live_price,
     _get_analysis_cached,
     _get_display_name,
     _guess_asset_type,
-    _init_table,
     _interpret_feature,
     _resolve_feature_names,
     _row_to_dict,
@@ -78,7 +76,6 @@ def get_ticker_analysis(
     if cached is not None:
         return {**cached, "_cached": True}
 
-    _init_table()
     engine = get_db_engine()
     ticker_lower = ticker_upper.lower()
 
@@ -89,11 +86,18 @@ def get_ticker_analysis(
     # Map to yfinance period strings (used for fallback)
     _yf_period_map = {"1W": "1mo", "1M": "1mo", "3M": "3mo", "6M": "6mo", "1Y": "1y"}
 
-    with engine.connect() as conn:
-        item = conn.execute(
-            text("SELECT * FROM watchlist WHERE ticker = :ticker"),
-            {"ticker": ticker_upper},
-        ).fetchone()
+    try:
+        with engine.connect() as conn:
+            item = conn.execute(
+                text("SELECT * FROM watchlist WHERE ticker = :ticker"),
+                {"ticker": ticker_upper},
+            ).fetchone()
+        watchlist_status = "available"
+    except Exception as exc:
+        # An ad hoc ticker does not require the optional saved-watchlist table.
+        log.debug("Watchlist item read for {t}: {e}", t=ticker_upper, e=str(exc))
+        item = None
+        watchlist_status = "unavailable"
 
     watchlist_item, watchlist_saved = _build_watchlist_item(ticker_upper, item)
 
@@ -101,6 +105,7 @@ def get_ticker_analysis(
         "ticker": ticker_upper,
         "watchlist_item": watchlist_item,
         "watchlist_saved": watchlist_saved,
+        "availability": {"watchlist": watchlist_status},
         "period": period,
     }
 
@@ -125,6 +130,7 @@ def get_ticker_analysis(
             ]
             analysis["price_source"] = "grid"
         except Exception as exc:
+            conn.rollback()
             log.debug("Price history for {t}: {e}", t=ticker_upper, e=str(exc))
             analysis["price_history"] = []
 
@@ -147,14 +153,6 @@ def get_ticker_analysis(
                         rows.append(entry)
                     analysis["price_history"] = rows
                     analysis["price_source"] = "yfinance"
-                    # Cache latest price to DB for future fast lookups
-                    if rows:
-                        from datetime import date as _date
-                        _cache_price_to_db(
-                            engine, ticker_upper,
-                            rows[-1]["value"],
-                            rows[-1]["date"],
-                        )
             except Exception as exc:
                 log.debug("yfinance fallback for {t}: {e}", t=ticker_upper, e=str(exc))
 
@@ -164,8 +162,11 @@ def get_ticker_analysis(
                 if live:
                     analysis["live_price"] = live
                     analysis["price_source"] = "live"
-                    from datetime import date as _date
-                    _cache_price_to_db(engine, ticker_upper, live["price"], _date.today())
+
+        analysis["price_source"] = analysis.get("price_source", "unavailable")
+        analysis["availability"]["price"] = (
+            "available" if analysis["price_source"] != "unavailable" else "unavailable"
+        )
 
         # ── Related features with z-scores ──
         try:
@@ -219,9 +220,12 @@ def get_ticker_analysis(
                     "signal": signal,
                 })
             analysis["related_features"] = enriched
+            analysis["availability"]["related_features"] = "available"
         except Exception as exc:
+            conn.rollback()
             log.debug("Related features for {t}: {e}", t=ticker_upper, e=str(exc))
             analysis["related_features"] = []
+            analysis["availability"]["related_features"] = "unavailable"
 
         # ── Options signals ──
         try:
@@ -246,9 +250,12 @@ def get_ticker_analysis(
                 }
                 for r in opts
             ]
+            analysis["availability"]["options"] = "available"
         except Exception as exc:
+            conn.rollback()
             log.debug("Options for {t}: {e}", t=ticker_upper, e=str(exc))
             analysis["options"] = []
+            analysis["availability"]["options"] = "unavailable"
 
         # ── Current regime context ──
         try:
@@ -265,8 +272,11 @@ def get_ticker_analysis(
                     "state": regime[0], "confidence": float(regime[1]) if regime[1] else None,
                     "posture": regime[2], "as_of": str(regime[3]),
                 }
+            analysis["availability"]["regime"] = "available"
         except Exception:
+            conn.rollback()
             analysis["regime"] = None
+            analysis["availability"]["regime"] = "unavailable"
 
         # ── TradingView webhook signals for this ticker ──
         try:
@@ -290,11 +300,17 @@ def get_ticker_analysis(
                 }
                 for r in tv_rows
             ]
+            analysis["availability"]["tradingview_signals"] = "available"
         except Exception as exc:
+            conn.rollback()
             log.debug("TV signals for {t}: {e}", t=ticker_upper, e=str(exc))
             analysis["tradingview_signals"] = []
+            analysis["availability"]["tradingview_signals"] = "unavailable"
 
     # Cache for subsequent requests
-    _set_analysis_cache(ticker_upper, period, analysis)
+    # A partial failure should be retried on the next request, not cached as
+    # checked-empty for five minutes.
+    if all(status == "available" for status in analysis["availability"].values()):
+        _set_analysis_cache(ticker_upper, period, analysis)
 
     return analysis
