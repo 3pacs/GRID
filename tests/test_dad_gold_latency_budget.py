@@ -45,9 +45,40 @@ def _reset_inflight():
     """Each test gets a clean single-flight table regardless of prior test outcomes."""
     dad._GOLD_INFLIGHT.clear()
     dad._GOLD_MEMORY_CACHE.clear()
+    dad._FINVIZ_MEMORY_CACHE.clear()
     yield
     dad._GOLD_INFLIGHT.clear()
     dad._GOLD_MEMORY_CACHE.clear()
+    dad._FINVIZ_MEMORY_CACHE.clear()
+
+
+def test_live_finviz_refresh_is_reused_without_writes_and_newer_stored_row_wins():
+    from datetime import datetime, timedelta, timezone
+
+    missing = {"fields": {}, "field_count": 0, "latest_pull": None, "latest_obs_date": None}
+    with patch.object(dad, "_read_finviz_rows", return_value=missing) as read, \
+         patch.object(dad, "_fetch_finviz_snapshot", return_value={"Price": "123.45"}) as fetch, \
+         patch.object(dad, "_store_finviz_snapshot", side_effect=AssertionError("GET must not persist")):
+        first = dad._get_finviz_profile(None, "COLD", refresh=True, persist_refresh=False)
+        second = dad._get_finviz_profile(None, "COLD", persist_refresh=False)
+        assert first["source"] == "live-readonly"
+        assert second["source"] == "live-memory"
+        assert second["fields"]["price"]["parsed"] == 123.45
+        assert fetch.call_count == 1
+        assert read.call_count == 2
+
+        created, remembered = dad._FINVIZ_MEMORY_CACHE["COLD"]
+        dad._FINVIZ_MEMORY_CACHE["COLD"] = (created - timedelta(minutes=2), remembered)
+        stored = {
+            "fields": {"price": {"field": "price", "label": "Price", "group": "market",
+                                 "raw_value": "200", "parsed": 200.0, "numeric_value": 200.0}},
+            "field_count": 1, "latest_pull": datetime.now(timezone.utc) - timedelta(minutes=1),
+            "latest_obs_date": datetime.now(timezone.utc).date(),
+        }
+        read.return_value = stored
+        newer = dad._get_finviz_profile(None, "COLD", persist_refresh=False)
+        assert newer["source"] == "postgres"
+        assert newer["fields"]["price"]["parsed"] == 200.0
 
 
 # --- warm cache -------------------------------------------------------------
