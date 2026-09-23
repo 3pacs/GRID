@@ -114,6 +114,24 @@ def _build_client(engine, monkeypatch) -> TestClient:
     return TestClient(app)
 
 
+@pytest.mark.parametrize("path", [
+    "/api/v1/snapshots/latest/test",
+    "/api/v1/snapshots/history/test",
+    "/api/v1/snapshots/compare/test?date_a=2026-09-01&date_b=2026-09-02",
+    "/api/v1/snapshots/categories",
+])
+def test_snapshot_get_engine_failure_is_unavailable(path, monkeypatch):
+    client = _build_client(None, monkeypatch)
+
+    def unavailable():
+        raise RuntimeError("database engine unavailable")
+
+    monkeypatch.setattr(snapshots_router, "get_db_engine", unavailable)
+    response = client.get(path)
+    assert response.status_code == 503
+    assert response.json() == {"detail": "snapshot_store_unavailable"}
+
+
 # ── The bug: /latest/{category} 400'd almost everything ───────────────────
 
 

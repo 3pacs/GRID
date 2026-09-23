@@ -95,10 +95,9 @@ def get_latest_snapshots(
     """
     from store.snapshots import AnalyticalSnapshotStore
 
-    engine = get_db_engine()
-    store = AnalyticalSnapshotStore(db_engine=engine, ensure_table=False)
-
     try:
+        engine = get_db_engine()
+        store = AnalyticalSnapshotStore(db_engine=engine, ensure_table=False)
         return store.get_latest(category, n=n)
     except Exception as exc:
         _snapshot_unavailable(exc)
@@ -114,10 +113,9 @@ def get_snapshot_history(
     """Return metrics history for a category (for trending/charting)."""
     from store.snapshots import AnalyticalSnapshotStore
 
-    engine = get_db_engine()
-    store = AnalyticalSnapshotStore(db_engine=engine, ensure_table=False)
-
     try:
+        engine = get_db_engine()
+        store = AnalyticalSnapshotStore(db_engine=engine, ensure_table=False)
         df = store.get_history(category, start_date=start_date, end_date=end_date)
     except Exception as exc:
         _snapshot_unavailable(exc)
@@ -136,10 +134,9 @@ def compare_snapshots(
     """Compare two snapshots from different dates."""
     from store.snapshots import AnalyticalSnapshotStore
 
-    engine = get_db_engine()
-    store = AnalyticalSnapshotStore(db_engine=engine, ensure_table=False)
-
     try:
+        engine = get_db_engine()
+        store = AnalyticalSnapshotStore(db_engine=engine, ensure_table=False)
         result = store.compare_snapshots(category, date_a, date_b)
     except Exception as exc:
         _snapshot_unavailable(exc)
@@ -164,10 +161,9 @@ def list_categories(
     """
     from store.snapshots import AnalyticalSnapshotStore
 
-    engine = get_db_engine()
-    store = AnalyticalSnapshotStore(db_engine=engine, ensure_table=False)
-
     try:
+        engine = get_db_engine()
+        store = AnalyticalSnapshotStore(db_engine=engine, ensure_table=False)
         categories = store.list_categories()
     except Exception as exc:
         _snapshot_unavailable(exc)

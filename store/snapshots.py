@@ -222,6 +222,8 @@ class AnalyticalSnapshotStore:
                 rows after every successful insert. `None` (default) keeps
                 every row, matching pre-existing behavior for callers that
                 don't opt in.
+            ensure_table: Keep the writer/bootstrap default. Read-only GET
+                callers pass False and receive database errors if schema is absent.
         """
         self.engine = db_engine
         self.retention_per_category = retention_per_category
@@ -467,7 +469,8 @@ class AnalyticalSnapshotStore:
             list[dict]: One entry per category, ordered by category name, with
                 ``category``, ``snapshot_count``, and ``latest_snapshot_date``
                 (ISO date string, or None if the category has no dated rows).
-                Empty list if the table is unreachable or absent.
+                Empty list when the reachable table has no categories.
+                Database errors (including a missing table) are raised.
         """
         if use_cache:
             cached = _category_cache.get(_CATEGORY_CACHE_KEY)
