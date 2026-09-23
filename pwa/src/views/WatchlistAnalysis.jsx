@@ -237,8 +237,9 @@ const SIGNAL_ICONS = {
     lever_pullers: '\u{1F3AF}',  // target
 };
 
-function TrustBar({ score, width = 48 }) {
-    const pct = Math.max(0, Math.min(1, score || 0));
+export function TrustBar({ score, width = 48 }) {
+    const scored = typeof score === 'number' && Number.isFinite(score);
+    const pct = scored ? Math.max(0, Math.min(1, score)) : 0;
     const barColor = pct >= 0.7 ? colors.green : pct >= 0.5 ? colors.yellow : colors.red;
     return (
         <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
@@ -246,14 +247,14 @@ function TrustBar({ score, width = 48 }) {
                 width: `${width}px`, height: '4px', borderRadius: '2px',
                 background: colors.borderSubtle, overflow: 'hidden',
             }}>
-                <div style={{
+                {scored && <div data-testid="trustbar-fill" style={{
                     width: `${pct * 100}%`, height: '100%',
                     background: barColor, borderRadius: '2px',
                     transition: 'width 0.3s ease',
-                }} />
+                }} />}
             </div>
             <span style={{ fontSize: '9px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace" }}>
-                {(pct * 100).toFixed(0)}
+                {scored ? (pct * 100).toFixed(0) : 'unscored'}
             </span>
         </div>
     );
@@ -291,14 +292,28 @@ function SignalCard({ icon, label, actor, action, date, trustScore, direction })
     );
 }
 
-function InsiderEdgePanel({ edgeData, loading }) {
+export function InsiderEdgePanel({ edgeData, loading }) {
     const [expanded, setExpanded] = useState(true);
 
     if (loading) return <OverviewSkeleton />;
     if (!edgeData) return null;
+    if (edgeData.status === 'unavailable') {
+        return (
+            <div style={{ ...shared.cardGradient, borderLeft: `3px solid ${colors.textMuted}`, marginTop: '12px' }}>
+                <div style={{ fontSize: '9px', fontWeight: 700, letterSpacing: '1.5px', color: colors.accent }}>
+                    INSIDER EDGE UNAVAILABLE
+                </div>
+                <div style={{ fontSize: '12px', color: colors.textMuted, marginTop: '8px', fontFamily: colors.sans }}>
+                    Persisted intelligence data is unavailable.
+                </div>
+            </div>
+        );
+    }
 
     const { congressional, insider, dark_pool, whale_flow, prediction_markets,
-            smart_money, lever_pullers, leads, convergence, edge_summary } = edgeData;
+            smart_money, lever_pullers, leads, convergence, edge_summary, availability } = edgeData;
+    const enrichmentUnavailable = availability?.lever_pullers?.status === 'unavailable'
+        || availability?.actor_context?.status === 'unavailable';
 
     const hasSignals = (congressional?.length || insider?.length || dark_pool ||
         whale_flow?.length || prediction_markets?.length || smart_money?.length ||
@@ -337,8 +352,8 @@ function InsiderEdgePanel({ edgeData, loading }) {
                             background: `${dirColor}18`, color: dirColor,
                             border: `1px solid ${dirColor}40`,
                         }}>
-                            {convergence.source_count} sources {convergence.direction}
-                            {convergence.confidence ? ` \u00b7 ${(convergence.confidence * 100).toFixed(0)}%` : ''}
+                            {convergence.source_count} sources {convergence.direction || convergence.signal_type || 'direction unresolved'}
+                            {convergence.confidence != null ? ` \u00b7 ${(convergence.confidence * 100).toFixed(0)}%` : ' \u00b7 unscored'}
                         </span>
                     )}
                 </div>
@@ -361,6 +376,11 @@ function InsiderEdgePanel({ edgeData, loading }) {
                             border: `1px solid ${dirColor}20`,
                         }}>
                             {edge_summary}
+                        </div>
+                    )}
+                    {edgeData.status === 'partial' && enrichmentUnavailable && (
+                        <div style={{ fontSize: '10px', color: colors.textMuted, marginBottom: '10px', fontFamily: colors.sans }}>
+                            Lever and actor enrichment is unavailable in this read-only view.
                         </div>
                     )}
 

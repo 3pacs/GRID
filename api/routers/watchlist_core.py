@@ -29,6 +29,40 @@ import api.routers.watchlist_helpers as _wh
 router = APIRouter(tags=["watchlist"])
 
 
+def _read_portfolio_options_pnl(engine) -> dict:
+    """Read optional options results without turning a failed read into zero."""
+    try:
+        with engine.connect() as conn:
+            stats = conn.execute(text("""
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE outcome = 'WIN') AS wins,
+                    COUNT(*) FILTER (WHERE outcome = 'LOSS') AS losses,
+                    COUNT(*) FILTER (WHERE outcome = 'EXPIRED') AS expired,
+                    COUNT(*) FILTER (WHERE outcome IS NULL AND expiry > CURRENT_DATE) AS open,
+                    COALESCE(SUM(actual_return) FILTER (WHERE outcome IS NOT NULL), 0) AS total_return
+                FROM options_recommendations
+            """)).fetchone()
+        return {
+            "status": "available",
+            "total_recommendations": stats[0],
+            "wins": stats[1],
+            "losses": stats[2] + stats[3],
+            "open": stats[4],
+            "total_return": round(float(stats[5]), 2),
+        }
+    except Exception as exc:
+        log.warning("Portfolio options read failed: {error_type}", error_type=type(exc).__name__)
+        return {
+            "status": "unavailable",
+            "total_recommendations": None,
+            "wins": None,
+            "losses": None,
+            "open": None,
+            "total_return": None,
+        }
+
+
 @router.get("/")
 def list_watchlist(
     limit: int = Query(default=50, ge=1, le=200),
@@ -126,23 +160,21 @@ def get_portfolio(
     options P&L from the recommendation tracker.
     """
 
-    _init_table()
-    engine = get_db_engine()
-
-    # ── Ensure weight column exists ──────────────────────────────
-    try:
-        with engine.begin() as conn:
-            conn.execute(text(
-                "ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS weight NUMERIC DEFAULT NULL"
-            ))
-    except Exception as exc:
-        log.debug("Watchlist: weight column migration failed (may already exist): {e}", e=str(exc))
-
     # ── Load watchlist with weights ──────────────────────────────
-    with engine.connect() as conn:
-        rows = conn.execute(text(
-            "SELECT ticker, display_name, asset_type, weight FROM watchlist ORDER BY added_at"
-        )).fetchall()
+    try:
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT ticker, display_name, asset_type, weight FROM watchlist ORDER BY added_at"
+            )).fetchall()
+    except Exception as exc:
+        log.warning("Portfolio watchlist read failed: {error_type}", error_type=type(exc).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Portfolio watchlist data is unavailable",
+        ) from exc
+
+    options_pnl = _read_portfolio_options_pnl(engine)
 
     if not rows:
         return {
@@ -152,10 +184,7 @@ def get_portfolio(
             }, "risk_metrics": {
                 "concentration_top3": 0, "beta_weighted": 0,
                 "sector_diversification_score": 0,
-            }, "options_pnl": {
-                "total_recommendations": 0, "wins": 0, "losses": 0,
-                "open": 0, "total_return": 0,
-            },
+            }, "options_pnl": options_pnl,
         }
 
     items = []
@@ -274,34 +303,6 @@ def get_portfolio(
     # Sector diversification: 1 - HHI (Herfindahl) of sector weights
     hhi = sum(w ** 2 for w in by_sector.values())
     sector_diversification = round(1.0 - hhi, 4)
-
-    # ── Options P&L from recommendation tracker ──────────────────
-    options_pnl = {
-        "total_recommendations": 0, "wins": 0, "losses": 0,
-        "open": 0, "total_return": 0,
-    }
-    try:
-        with engine.connect() as conn:
-            stats = conn.execute(text("""
-                SELECT
-                    COUNT(*) AS total,
-                    COUNT(*) FILTER (WHERE outcome = 'WIN') AS wins,
-                    COUNT(*) FILTER (WHERE outcome = 'LOSS') AS losses,
-                    COUNT(*) FILTER (WHERE outcome = 'EXPIRED') AS expired,
-                    COUNT(*) FILTER (WHERE outcome IS NULL AND expiry > CURRENT_DATE) AS open,
-                    COALESCE(SUM(actual_return) FILTER (WHERE outcome IS NOT NULL), 0) AS total_return
-                FROM options_recommendations
-            """)).fetchone()
-            if stats:
-                options_pnl = {
-                    "total_recommendations": stats[0] or 0,
-                    "wins": stats[1] or 0,
-                    "losses": (stats[2] or 0) + (stats[3] or 0),
-                    "open": stats[4] or 0,
-                    "total_return": round(float(stats[5] or 0), 2),
-                }
-    except Exception as exc:
-        log.debug("Options P&L query failed: {e}", e=str(exc))
 
     return {
         "total_value": ESTIMATED_PORTFOLIO,
