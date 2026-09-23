@@ -958,8 +958,8 @@ def get_flow_timeline(
         "history": history,
         "history_status": (
             "unavailable" if not history else
-            "partial" if failed_dates or stored_read_failed else
-            "fallback" if used_fallback else "available"
+            "fallback" if used_fallback else
+            "partial" if failed_dates or stored_read_failed else "available"
         ),
         "failed_dates": failed_dates,
         **({"error": "No usable GEX history is available"} if not history else {}),
