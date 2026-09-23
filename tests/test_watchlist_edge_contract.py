@@ -67,13 +67,16 @@ def test_edge_reads_persisted_signal_types_and_marks_unscored_convergence(monkey
     assert payload["congressional"][0]["action"] == "SELL"
     assert payload["congressional"][0]["trust_score"] is None
     assert payload["convergence"] == {
-        "direction": None,
+        "direction": "bearish",
+        "direction_basis": "inferred_from_signal_types",
         "signal_type": "SELL",
         "source_count": 3,
-        "confidence": 0.63,
+        "scored_source_count": 2,
+        "confidence": 0.7,
+        "confidence_basis": "mean_trust_of_scored_sources",
         "status": "detected",
     }
-    assert "independent sources SELL" in payload["edge_summary"]
+    assert "independent sources bearish" in payload["edge_summary"]
     assert payload["availability"]["lever_pullers"]["status"] == "available"
     assert payload["availability"]["actor_context"]["status"] == "available"
 
