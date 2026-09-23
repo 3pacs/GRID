@@ -77,6 +77,8 @@ jobs:
       - name: Run tests
         env:
           DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          # Explicit opt-in for the isolated briefing route PostgreSQL test.
+          GRID_BRIEFING_ROUTE_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
           # config.py now rejects an empty DB_PASSWORD unconditionally (see
           # the 2026-09-13 incident) — must match the postgres service
           # password above so Settings() construction doesn't fail collection.
