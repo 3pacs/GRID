@@ -75,7 +75,8 @@ def _edge_unavailable_response(ticker: str) -> dict:
         "congressional": [], "insider": [], "dark_pool": None, "whale_flow": [],
         "prediction_markets": [], "smart_money": [], "lever_pullers": [], "leads": [],
         "convergence": {"direction": None, "signal_type": None, "source_count": 0,
-                        "confidence": None, "status": "unavailable", "reason": "signal_sources_unavailable"},
+                        "confidence": None, "persisted_trust_mean": None,
+                        "status": "unavailable", "reason": "signal_sources_unavailable"},
         "edge_summary": "Intelligence data is currently unavailable.",
     }
 
@@ -758,7 +759,8 @@ def get_ticker_edge(
     # without its schema initializer.
     convergence: dict = {"direction": None, "signal_type": None, "source_count": 0,
                          "non_null_trust_score_count": 0, "confidence": None,
-                         "confidence_basis": "unscored", "direction_basis": None,
+                         "confidence_basis": "unverified_score_provenance",
+                         "persisted_trust_mean": None, "direction_basis": None,
                          "status": "none"}
     by_direction: dict[str, dict[str, float | None]] = {"BUY": {}, "SELL": {}}
     for source_type, _source_id, signal_type, _signal_date, trust_score in convergence_rows:
@@ -780,8 +782,12 @@ def get_ticker_edge(
             "signal_type": signal_type,
             "source_count": len(scores),
             "non_null_trust_score_count": len(persisted_scores),
-            "confidence": _round_or_none(sum(persisted_scores) / len(persisted_scores)) if persisted_scores else None,
-            "confidence_basis": "mean_non_null_persisted_trust_scores" if persisted_scores else "unscored",
+            # This legacy key cannot honestly carry a probability: the table's
+            # 0.5 DEFAULT is indistinguishable from a scorer-produced 0.5.
+            "confidence": None,
+            "confidence_basis": "unverified_score_provenance",
+            "persisted_trust_mean": _round_or_none(sum(persisted_scores) / len(persisted_scores)) if persisted_scores else None,
+            "persisted_trust_basis": "mean_non_null_persisted_trust_scores" if persisted_scores else "unscored",
             "status": "detected",
         }
 

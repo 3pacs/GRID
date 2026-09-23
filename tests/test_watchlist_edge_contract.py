@@ -72,8 +72,10 @@ def test_edge_reads_persisted_signal_types_and_marks_unscored_convergence(monkey
         "signal_type": "SELL",
         "source_count": 3,
         "non_null_trust_score_count": 2,
-        "confidence": 0.7,
-        "confidence_basis": "mean_non_null_persisted_trust_scores",
+        "confidence": None,
+        "confidence_basis": "unverified_score_provenance",
+        "persisted_trust_mean": 0.7,
+        "persisted_trust_basis": "mean_non_null_persisted_trust_scores",
         "status": "detected",
     }
     assert "independent sources bearish" in payload["edge_summary"]

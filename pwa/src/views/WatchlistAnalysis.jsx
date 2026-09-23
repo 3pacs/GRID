@@ -324,6 +324,14 @@ export function InsiderEdgePanel({ edgeData, loading }) {
     const dirColor = convergence?.direction === 'bullish'
         ? colors.green : convergence?.direction === 'bearish'
             ? colors.red : colors.textMuted;
+    // Older API workers can still send a numeric `confidence` without score
+    // provenance. Never render that legacy number as a probability or bar.
+    const hasPersistedTrust = convergence && Object.prototype.hasOwnProperty.call(convergence, 'persisted_trust_mean');
+    const persistedTrustMean = typeof convergence?.persisted_trust_mean === 'number'
+        && Number.isFinite(convergence.persisted_trust_mean)
+        ? convergence.persisted_trust_mean : null;
+    const persistedTrustLabel = persistedTrustMean != null
+        ? persistedTrustMean.toFixed(2) : hasPersistedTrust ? 'unscored' : 'unavailable';
 
     return (
         <div style={{
@@ -353,7 +361,6 @@ export function InsiderEdgePanel({ edgeData, loading }) {
                             border: `1px solid ${dirColor}40`,
                         }}>
                             {convergence.source_count} sources {convergence.direction || convergence.signal_type || 'direction unresolved'}
-                            {convergence.confidence != null ? ` \u00b7 ${(convergence.confidence * 100).toFixed(0)}%` : ' \u00b7 unscored'}
                         </span>
                     )}
                 </div>
@@ -489,7 +496,7 @@ export function InsiderEdgePanel({ edgeData, loading }) {
                         </div>
                     )}
 
-                    {/* Trust Indicator */}
+                    {/* Persisted trust statistic; score provenance is not certified. */}
                     {convergence && convergence.source_count > 0 && (
                         <div style={{
                             display: 'flex', alignItems: 'center', gap: '12px',
@@ -498,10 +505,12 @@ export function InsiderEdgePanel({ edgeData, loading }) {
                             border: `1px solid ${colors.borderSubtle}`,
                         }}>
                             <span style={{ fontSize: '10px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace" }}>
-                                TRUST
+                                PERSISTED TRUST MEAN
                             </span>
                             <div style={{ flex: 1 }}>
-                                <TrustBar score={convergence.confidence} width={120} />
+                                <span style={{ fontSize: '10px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace" }}>
+                                    {persistedTrustLabel} · score provenance unverified
+                                </span>
                             </div>
                             <span style={{ fontSize: '10px', color: dirColor, fontFamily: "'JetBrains Mono', monospace", fontWeight: 600 }}>
                                 {convergence.source_count} independent source{convergence.source_count !== 1 ? 's' : ''}

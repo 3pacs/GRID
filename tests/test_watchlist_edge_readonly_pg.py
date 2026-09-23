@@ -41,7 +41,7 @@ def _create_signal_sources(engine) -> None:
                 signal_value JSONB,
                 metadata JSONB,
                 outcome TEXT,
-                trust_score DOUBLE PRECISION
+                trust_score DOUBLE PRECISION DEFAULT 0.5
             )
         """))
         conn.execute(text("""
@@ -115,8 +115,10 @@ def test_edge_route_uses_only_selects_against_prepared_postgres_schema():
         assert payload["convergence"]["direction_basis"] == "inferred_from_signal_types"
         assert payload["convergence"]["source_count"] == 3
         assert payload["convergence"]["non_null_trust_score_count"] == 3
-        assert payload["convergence"]["confidence"] == 0.47
-        assert payload["convergence"]["confidence_basis"] == "mean_non_null_persisted_trust_scores"
+        assert payload["convergence"]["confidence"] is None
+        assert payload["convergence"]["confidence_basis"] == "unverified_score_provenance"
+        assert payload["convergence"]["persisted_trust_mean"] == 0.47
+        assert payload["convergence"]["persisted_trust_basis"] == "mean_non_null_persisted_trust_scores"
         assert payload["congressional"][0]["trust_score"] == 0.0
         assert payload["smart_money"][0]["trust_score"] is None
         assert payload["lever_pullers"] == [
@@ -132,6 +134,26 @@ def test_edge_route_uses_only_selects_against_prepared_postgres_schema():
             "status": "unsupported", "reason": "no_ticker_association",
         }
 
+        # Schema/writer defaults can persist 0.5 without a scorer. A GET may
+        # expose that stored mean, but must not certify it as confidence.
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO signal_sources
+                    (source_type, source_id, ticker, signal_type, signal_date, outcome)
+                VALUES
+                    ('congressional', 'Default A', 'DEFAULT', 'BUY', NOW(), 'PENDING'),
+                    ('insider', 'Default B', 'DEFAULT', 'BUY', NOW(), 'PENDING'),
+                    ('darkpool', 'Default C', 'DEFAULT', 'BUY', NOW(), 'PENDING')
+            """))
+        statements.clear()
+        defaulted = get_ticker_edge("default", user={}, engine=engine)["convergence"]
+        assert defaulted["source_count"] == 3
+        assert defaulted["non_null_trust_score_count"] == 3
+        assert defaulted["persisted_trust_mean"] == 0.5
+        assert defaulted["confidence"] is None
+        assert defaulted["confidence_basis"] == "unverified_score_provenance"
+        assert statements and all(statement.startswith("SELECT") for statement in statements)
+
         # Disposable setup changes the persisted measurements between GETs.
         # The route itself must continue to issue SELECTs only.
         with engine.begin() as conn:
@@ -143,7 +165,8 @@ def test_edge_route_uses_only_selects_against_prepared_postgres_schema():
         partially_scored = get_ticker_edge("test", user={}, engine=engine)["convergence"]
         assert partially_scored["source_count"] == 3
         assert partially_scored["non_null_trust_score_count"] == 2
-        assert partially_scored["confidence"] == 0.4
+        assert partially_scored["confidence"] is None
+        assert partially_scored["persisted_trust_mean"] == 0.4
         assert statements and all(statement.startswith("SELECT") for statement in statements)
 
         with engine.begin() as conn:
@@ -155,8 +178,9 @@ def test_edge_route_uses_only_selects_against_prepared_postgres_schema():
         mixed = get_ticker_edge("test", user={}, engine=engine)["convergence"]
         assert mixed["source_count"] == 3
         assert mixed["non_null_trust_score_count"] == 1
-        assert mixed["confidence"] == 0.0
-        assert mixed["confidence_basis"] == "mean_non_null_persisted_trust_scores"
+        assert mixed["confidence"] is None
+        assert mixed["persisted_trust_mean"] == 0.0
+        assert mixed["persisted_trust_basis"] == "mean_non_null_persisted_trust_scores"
         assert statements and all(statement.startswith("SELECT") for statement in statements)
 
         with engine.begin() as conn:
@@ -170,7 +194,8 @@ def test_edge_route_uses_only_selects_against_prepared_postgres_schema():
         assert unscored["source_count"] == 3
         assert unscored["non_null_trust_score_count"] == 0
         assert unscored["confidence"] is None
-        assert unscored["confidence_basis"] == "unscored"
+        assert unscored["persisted_trust_mean"] is None
+        assert unscored["persisted_trust_basis"] == "unscored"
         assert statements and all(statement.startswith("SELECT") for statement in statements)
 
         with engine.begin() as conn:
@@ -184,7 +209,8 @@ def test_edge_route_uses_only_selects_against_prepared_postgres_schema():
         assert bearish_zero["direction"] == "bearish"
         assert bearish_zero["source_count"] == 3
         assert bearish_zero["non_null_trust_score_count"] == 3
-        assert bearish_zero["confidence"] == 0.0
+        assert bearish_zero["confidence"] is None
+        assert bearish_zero["persisted_trust_mean"] == 0.0
         assert statements and all(statement.startswith("SELECT") for statement in statements)
     finally:
         engine.dispose()
