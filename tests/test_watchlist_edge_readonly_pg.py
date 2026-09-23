@@ -48,10 +48,30 @@ def _create_signal_sources(engine) -> None:
                 (source_type, source_id, ticker, signal_type, signal_date, metadata, outcome, trust_score)
             VALUES (:source_type, :source_id, 'TEST', 'BUY', NOW(), CAST(:metadata AS JSONB), :outcome, :trust_score)
         """), [
-            {"source_type": "congressional", "source_id": "Member A", "metadata": '{"amount":"$1000"}', "outcome": "PENDING", "trust_score": None},
+            {"source_type": "congressional", "source_id": "Member A", "metadata": '{"amount":"$1000"}', "outcome": "PENDING", "trust_score": 0.0},
             {"source_type": "insider", "source_id": "Officer B", "metadata": '{"title":"CEO"}', "outcome": "CORRECT", "trust_score": 0.8},
             {"source_type": "darkpool", "source_id": "Pool C", "metadata": '{"volume_vs_avg":2.1}', "outcome": "PENDING", "trust_score": 0.6},
         ])
+        conn.execute(text("""
+            CREATE TABLE lever_pullers (
+                id SERIAL PRIMARY KEY, source_type TEXT NOT NULL, source_id TEXT NOT NULL,
+                name TEXT NOT NULL, motivation_model TEXT
+            )
+        """))
+        conn.execute(text("""
+            INSERT INTO lever_pullers (source_type, source_id, name, motivation_model)
+            VALUES ('congressional', 'Member A', 'Member A', 'committee overlap')
+        """))
+        conn.execute(text("""
+            CREATE TABLE actors (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, title TEXT,
+                motivation_model TEXT, known_positions JSONB NOT NULL DEFAULT '[]'
+            )
+        """))
+        conn.execute(text("""
+            INSERT INTO actors (id, name, title, motivation_model, known_positions)
+            VALUES ('officer-b', 'Officer B', 'CEO', 'issuer exposure', '[]')
+        """))
 
 
 def test_edge_route_uses_only_selects_against_prepared_postgres_schema():
@@ -73,6 +93,14 @@ def test_edge_route_uses_only_selects_against_prepared_postgres_schema():
         assert payload["status"] == "partial"
         assert payload["convergence"]["signal_type"] == "BUY"
         assert payload["convergence"]["source_count"] == 3
+        assert payload["congressional"][0]["trust_score"] == 0.0
+        assert payload["lever_pullers"] == [
+            {"name": "Member A", "action": "BUY", "context": "committee overlap"},
+            {"name": "Officer B", "action": "WATCHING", "context": "CEO — issuer exposure"},
+        ]
+        assert payload["availability"]["lever_pullers"]["status"] == "available"
+        assert payload["availability"]["actor_context"]["status"] == "available"
+        assert payload["availability"]["investigation_leads"]["status"] == "unavailable"
         assert statements and all(statement.startswith("SELECT") for statement in statements)
     finally:
         engine.dispose()
