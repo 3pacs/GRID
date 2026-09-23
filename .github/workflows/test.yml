@@ -127,6 +127,16 @@ jobs:
           echo "::endgroup::"
           exit "$pytest_status"
 
+      # The general suite leaves GRID_TEST_DB_URL unset. Exercise the real
+      # producer -> raw -> resolver contract against the disposable PG service.
+      - name: Binance canonical close PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_binance_canonical_close_pg.py -q -rA
+
       - name: Check for SQL injection patterns
         run: |
           echo "Checking for unsafe SQL patterns..."

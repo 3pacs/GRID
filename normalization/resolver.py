@@ -18,6 +18,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from binance_close_contract import CANONICAL_CLOSE_SERIES, is_completed_canonical_close
 from normalization.entity_map import EntityMap
 
 # Default window for manual/CLI runs. The Hermes cycle passes a much smaller
@@ -664,6 +665,16 @@ class Resolver:
                     feature_id = _feature_id(series_id)
                     if feature_id is None:
                         continue
+
+                    if series_id in CANONICAL_CLOSE_SERIES:
+                        # A provisional or legacy unmarked Binance row must
+                        # never become a canonical BTC/ETH daily close merely
+                        # because its observation date is current.
+                        sources = [s for s in sources if is_completed_canonical_close(
+                            s["raw_payload"], obs_date_val, s["pull_timestamp"]
+                        )]
+                        if not sources:
+                            continue
 
                     sources.sort(key=lambda s: s["priority_rank"])
                     winner = sources[0]
