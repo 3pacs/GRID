@@ -1124,6 +1124,7 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
     const [dataLoading, setDataLoading] = useState(true);
     const [error, setError] = useState(null);
     const [overview, setOverview] = useState(null);
+    const [overviewUnavailable, setOverviewUnavailable] = useState(false);
     const [overviewLoading, setOverviewLoading] = useState(true);
     const [period, setPeriod] = useState('3M');
     const [priceLoading, setPriceLoading] = useState(false);
@@ -1143,6 +1144,7 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
         setDataLoading(true);
         setError(null);
         setOverview(null);
+        setOverviewUnavailable(false);
         setOverviewLoading(true);
         setGexData(null);
         setGexLoading(true);
@@ -1169,8 +1171,10 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
         // Phase 2: Fetch AI overview (may be slow due to LLM)
         api.getTickerOverview(ticker).then(result => {
             setOverview(result?.error ? null : result);
+            setOverviewUnavailable(Boolean(result?.error));
             setOverviewLoading(false);
         }).catch(() => {
+            setOverviewUnavailable(true);
             setOverviewLoading(false);
         });
 
@@ -1195,9 +1199,8 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
             if (vcResult.status === 'fulfilled' && !vcResult.value?.error) {
                 setVannaCharmData(vcResult.value);
             }
-            if (ftResult.status === 'fulfilled' && !ftResult.value?.error) {
-                setFlowTimelineData(ftResult.value);
-            }
+            setFlowTimelineData(ftResult.status === 'fulfilled'
+                ? ftResult.value : { error: 'Flow timeline unavailable' });
             setSecondaryLoading(false);
         });
     }, [ticker]);
@@ -1215,6 +1218,10 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
                 ...prev,
                 price_history: refreshed.price_history,
                 price_source: refreshed.price_source,
+                availability: {
+                    ...prev?.availability,
+                    price: refreshed.availability?.price,
+                },
                 period: refreshed.period,
             }));
         } catch (err) {
@@ -1247,6 +1254,9 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
     const regime = data?.regime;
     const related = data?.related_features || [];
     const tvSignals = data?.tradingview_signals || [];
+    const unavailableSections = Object.entries(data?.availability || {})
+        .filter(([, status]) => status === 'unavailable')
+        .map(([name]) => name.replaceAll('_', ' '));
 
     // Use enriched price as fallback if analysis data hasn't loaded yet
     const lastPrice = prices.length ? prices[prices.length - 1].value : (enrichedPrice || null);
@@ -1308,6 +1318,12 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
                 <OverviewSkeleton />
             ) : overview ? (
                 <AIOverviewCard overview={overview} />
+            ) : overviewUnavailable ? (
+                <div role="status" style={{
+                    color: colors.yellow, fontSize: '11px', padding: '12px',
+                    background: colors.card, border: `1px solid ${colors.border}`,
+                    borderRadius: tokens.radius.md,
+                }}>AI overview unavailable. Other Watchlist data may still be available.</div>
             ) : null}
 
             {/* ═══ CAPITAL FLOW PATH ═══ */}
@@ -1321,6 +1337,11 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
             <InsiderEdgePanel edgeData={edgeData} loading={edgeLoading} />
 
             {/* ═══ DATA GRID ═══ */}
+            {unavailableSections.length > 0 && (
+                <div style={{ color: colors.yellow, fontSize: '11px', marginTop: '12px' }}>
+                    Data unavailable: {unavailableSections.join(', ')}.
+                </div>
+            )}
             <div style={{
                 display: 'grid',
                 gridTemplateColumns: isMobile ? '1fr' : 'repeat(auto-fit, minmax(280px, 1fr))',

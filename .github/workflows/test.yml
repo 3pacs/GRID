@@ -144,6 +144,22 @@ jobs:
           DB_PASSWORD: testpass
         run: python -m pytest tests/test_watchlist_edge_readonly_pg.py -q -rA
 
+      - name: Watchlist overview read-only PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_watchlist_overview_readonly_pg.py -q -rA
+
+      - name: Watchlist analysis and flow PostgreSQL read contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_watchlist_analysis_derivatives_readonly_pg.py -q -rA
+
       # The general suite leaves GRID_TEST_DB_URL unset. Gate both producer
       # and resolver contracts against the isolated disposable PG schemas.
       # test_spy_binance_composition_pg.py proves the two policies resolve
@@ -174,6 +190,22 @@ jobs:
           GRID_JWT_SECRET: test-secret-ci
           TESTING: "true"
         run: python -m pytest tests/test_snapshots_readonly_pg.py -q -rA
+
+      - name: Dad gold read-only PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_dad_gold_readonly_pg.py -q -rA
+
+      - name: Dad ticker detail read-only PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_dad_ticker_detail_readonly_pg.py -q -rA
 
       - name: Check for SQL injection patterns
         run: |

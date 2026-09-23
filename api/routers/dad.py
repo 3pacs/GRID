@@ -8,6 +8,7 @@ usable while the ingestion model is still evolving.
 from __future__ import annotations
 
 import concurrent.futures
+import copy
 import json
 import os
 import re
@@ -126,6 +127,12 @@ GOLD_COMPACT_MAX_INFLIGHT = int(
 # background work is outstanding right now" count for the cap above.
 _GOLD_INFLIGHT: dict[str, concurrent.futures.Future] = {}
 _GOLD_INFLIGHT_LOCK = threading.Lock()
+_GOLD_MEMORY_CACHE: dict[tuple[str, str, str, float | None], tuple[datetime, dict[str, Any]]] = {}
+_GOLD_MEMORY_CACHE_LOCK = threading.Lock()
+GOLD_MEMORY_CACHE_MAX_ENTRIES = 512
+_FINVIZ_MEMORY_CACHE: dict[str, tuple[datetime, dict[str, Any]]] = {}
+_FINVIZ_MEMORY_CACHE_LOCK = threading.Lock()
+FINVIZ_MEMORY_CACHE_MAX_ENTRIES = 512
 
 DAD_CACHE_VERSION = "dad-ticker-v2"
 DEFAULT_CHART_POINTS = 220
@@ -525,26 +532,19 @@ def _research_db_fingerprint(db_path: Path) -> tuple[str, float | None]:
         return str(db_path), None
 
 
-def _ensure_summary_cache_table(engine: Any) -> None:
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS dad_ticker_summary_cache (
-                    ticker             TEXT PRIMARY KEY,
-                    payload_version    TEXT NOT NULL,
-                    generated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    research_db_path   TEXT,
-                    research_db_mtime  DOUBLE PRECISION,
-                    payload            JSONB NOT NULL,
-                    timings            JSONB NOT NULL DEFAULT '{}'::jsonb
-                )
-            """))
-            conn.execute(text("""
-                CREATE INDEX IF NOT EXISTS idx_dad_summary_cache_generated
-                    ON dad_ticker_summary_cache (generated_at DESC)
-            """))
-    except Exception as exc:
-        log.debug("Dad summary cache table unavailable: {e}", e=str(exc))
+def _remember_summary_cache(ticker: str, db_path: Path, payload: dict[str, Any]) -> None:
+    """Bounded per-process cache; a GET never persists a computed payload."""
+    path, mtime = _research_db_fingerprint(db_path)
+    key = (ticker, DAD_CACHE_VERSION, path, mtime)
+    now = datetime.now(timezone.utc)
+    with _GOLD_MEMORY_CACHE_LOCK:
+        expired = [item for item, (created, _) in _GOLD_MEMORY_CACHE.items()
+                   if (now - created).total_seconds() > GOLD_STALE_MAX_AGE_SECONDS]
+        for item in expired:
+            del _GOLD_MEMORY_CACHE[item]
+        if key not in _GOLD_MEMORY_CACHE and len(_GOLD_MEMORY_CACHE) >= GOLD_MEMORY_CACHE_MAX_ENTRIES:
+            del _GOLD_MEMORY_CACHE[min(_GOLD_MEMORY_CACHE, key=lambda item: _GOLD_MEMORY_CACHE[item][0])]
+        _GOLD_MEMORY_CACHE[key] = (now, copy.deepcopy(payload))
 
 
 def _read_summary_cache(
@@ -564,8 +564,21 @@ def _read_summary_cache(
     string -- see .claude/rules/security.md.
     """
     path, mtime = _research_db_fingerprint(db_path)
+    key = (ticker, DAD_CACHE_VERSION, path, mtime)
+    with _GOLD_MEMORY_CACHE_LOCK:
+        remembered = _GOLD_MEMORY_CACHE.get(key)
+    if remembered:
+        generated_at, memory_payload = remembered
+        age_seconds = (datetime.now(timezone.utc) - generated_at).total_seconds()
+        if age_seconds <= max_age_seconds:
+            payload = copy.deepcopy(memory_payload)
+            payload["cache"] = {
+                "hit": True, "stale": age_seconds > SUMMARY_CACHE_TTL_SECONDS,
+                "generated_at": generated_at.isoformat(), "age_seconds": age_seconds,
+                "ttl_seconds": SUMMARY_CACHE_TTL_SECONDS,
+            }
+            return payload
     try:
-        _ensure_summary_cache_table(engine)
         with engine.connect() as conn:
             row = conn.execute(
                 text(
@@ -616,39 +629,6 @@ def _read_summary_cache(
         "ttl_seconds": SUMMARY_CACHE_TTL_SECONDS,
     }
     return payload
-
-
-def _write_summary_cache(engine: Any, ticker: str, db_path: Path, payload: dict[str, Any], timings: dict[str, float]) -> None:
-    path, mtime = _research_db_fingerprint(db_path)
-    to_store = dict(payload)
-    to_store["cache"] = {"hit": False, "ttl_seconds": SUMMARY_CACHE_TTL_SECONDS}
-    try:
-        _ensure_summary_cache_table(engine)
-        with engine.begin() as conn:
-            conn.execute(
-                text(
-                    "INSERT INTO dad_ticker_summary_cache "
-                    "(ticker, payload_version, generated_at, research_db_path, research_db_mtime, payload, timings) "
-                    "VALUES (:ticker, :version, NOW(), :path, :mtime, CAST(:payload AS JSONB), CAST(:timings AS JSONB)) "
-                    "ON CONFLICT (ticker) DO UPDATE SET "
-                    "payload_version = EXCLUDED.payload_version, "
-                    "generated_at = EXCLUDED.generated_at, "
-                    "research_db_path = EXCLUDED.research_db_path, "
-                    "research_db_mtime = EXCLUDED.research_db_mtime, "
-                    "payload = EXCLUDED.payload, "
-                    "timings = EXCLUDED.timings"
-                ),
-                {
-                    "ticker": ticker,
-                    "version": DAD_CACHE_VERSION,
-                    "path": path,
-                    "mtime": mtime,
-                    "payload": json.dumps(to_store, default=str),
-                    "timings": json.dumps(timings, default=str),
-                },
-            )
-    except Exception as exc:
-        log.debug("Dad summary cache write failed for {t}: {e}", t=ticker, e=str(exc))
 
 
 def _ensure_finviz_source_id(engine: Any) -> int:
@@ -863,8 +843,35 @@ def _finviz_stat_cards(fields: dict[str, dict[str, Any]]) -> list[dict[str, Any]
     return cards
 
 
-def _get_finviz_profile(engine: Any, ticker: str, *, refresh: bool = False) -> dict[str, Any]:
+def _remember_finviz_profile(ticker: str, stored: dict[str, Any]) -> None:
+    """Keep a live GET refresh useful to subsequent detail reads in this process."""
+    now = datetime.now(timezone.utc)
+    with _FINVIZ_MEMORY_CACHE_LOCK:
+        expired = [key for key, (created, _) in _FINVIZ_MEMORY_CACHE.items()
+                   if (now - created).total_seconds() > 24 * 3600]
+        for key in expired:
+            del _FINVIZ_MEMORY_CACHE[key]
+        if ticker not in _FINVIZ_MEMORY_CACHE and len(_FINVIZ_MEMORY_CACHE) >= FINVIZ_MEMORY_CACHE_MAX_ENTRIES:
+            del _FINVIZ_MEMORY_CACHE[min(_FINVIZ_MEMORY_CACHE, key=lambda key: _FINVIZ_MEMORY_CACHE[key][0])]
+        _FINVIZ_MEMORY_CACHE[ticker] = (now, copy.deepcopy(stored))
+
+
+def _get_finviz_profile(
+    engine: Any, ticker: str, *, refresh: bool = False, persist_refresh: bool = True
+) -> dict[str, Any]:
     stored = _read_finviz_rows(engine, ticker)
+    from_memory = False
+    if not persist_refresh:
+        with _FINVIZ_MEMORY_CACHE_LOCK:
+            remembered = _FINVIZ_MEMORY_CACHE.get(ticker)
+        if remembered:
+            created, memory_stored = remembered
+            stored_pull = _as_utc(stored.get("latest_pull"))
+            if (datetime.now(timezone.utc) - created).total_seconds() <= 24 * 3600 and (
+                stored_pull is None or created > stored_pull
+            ):
+                stored = copy.deepcopy(memory_stored)
+                from_memory = True
     freshness = _freshness_state(stored.get("latest_pull"), stale_hours=24)
     scraped = False
     scrape_error: str | None = None
@@ -872,11 +879,32 @@ def _get_finviz_profile(engine: Any, ticker: str, *, refresh: bool = False) -> d
     if refresh and freshness["state"] in {"missing", "aging", "stale"}:
         try:
             pairs = _fetch_finviz_snapshot(ticker)
-            inserted = _store_finviz_snapshot(engine, ticker, pairs)
+            if persist_refresh:
+                inserted = _store_finviz_snapshot(engine, ticker, pairs)
+                stored = _read_finviz_rows(engine, ticker)
+                freshness = _freshness_state(stored.get("latest_pull"), stale_hours=24)
+                stored["rows_inserted"] = inserted
+            else:
+                now = datetime.now(timezone.utc)
+                live_fields = {}
+                for label, (field_id, display_label, group) in FINVIZ_FIELD_MAP.items():
+                    raw_value = pairs.get(label)
+                    parsed = _parse_finviz_value(raw_value)
+                    if raw_value is None or parsed is None:
+                        continue
+                    live_fields[field_id] = {
+                        "field": field_id, "label": display_label, "group": group,
+                        "raw_value": raw_value, "parsed": parsed,
+                        "numeric_value": float(parsed) if isinstance(parsed, (int, float)) else 0.0,
+                        "obs_date": date.today().isoformat(), "pull_timestamp": now.isoformat(),
+                    }
+                if not live_fields:
+                    raise RuntimeError("no recognized Finviz snapshot fields")
+                stored = {"fields": live_fields, "field_count": len(live_fields),
+                          "latest_pull": now, "latest_obs_date": date.today(), "rows_inserted": 0}
+                freshness = _freshness_state(now, stale_hours=24)
+                _remember_finviz_profile(ticker, stored)
             scraped = True
-            stored = _read_finviz_rows(engine, ticker)
-            freshness = _freshness_state(stored.get("latest_pull"), stale_hours=24)
-            stored["rows_inserted"] = inserted
         except Exception as exc:
             scrape_error = str(exc)
             log.debug("Finviz live scrape failed for {t}: {e}", t=ticker, e=scrape_error)
@@ -888,7 +916,8 @@ def _get_finviz_profile(engine: Any, ticker: str, *, refresh: bool = False) -> d
 
     return {
         "status": status,
-        "source": "postgres+live" if scraped else "postgres",
+        "source": (("postgres+live" if persist_refresh else "live-readonly") if scraped
+                   else "live-memory" if from_memory else "postgres"),
         "freshness": freshness,
         "latest_pull": stored.get("latest_pull").isoformat() if stored.get("latest_pull") else None,
         "latest_obs_date": str(stored.get("latest_obs_date")) if stored.get("latest_obs_date") else None,
@@ -1540,10 +1569,13 @@ def _load_grid_payload(
     include_price_history: bool = False,
     chart_points: int | None = None,
     feature_limit: int = 8,
+    persist_finviz_refresh: bool = True,
 ) -> dict[str, Any]:
     try:
         engine = engine or get_db_engine()
-        finviz = _get_finviz_profile(engine, ticker, refresh=refresh_finviz)
+        finviz = _get_finviz_profile(
+            engine, ticker, refresh=refresh_finviz, persist_refresh=persist_finviz_refresh
+        )
         grid = _grid_market_context(
             engine,
             ticker,
@@ -1837,13 +1869,13 @@ def _assemble_dad_response(
 def _compute_compact_dad_payload(
     ticker: str, *, refresh_finviz: bool, engine: Any, db_path: Path
 ) -> dict[str, Any]:
-    """Cold-cache compute path: workbook + GRID context, assembled, cached.
+    """Cold-cache compute path: workbook + GRID context, assembled, cached in process.
 
     Split out of _build_compact_dad_response so it can run inside
     _GOLD_COMPACT_EXECUTOR, possibly as a single-flight task whose original
     caller already gave up and returned a stale/degraded response (see
     _build_compact_dad_response). It still runs to completion and still
-    writes the cache here -- bounded by the same DB statement/connection
+    remembers the result in process here -- bounded by the same DB statement/connection
     timeouts the rest of the app already relies on, nothing unbounded added
     by this function -- so the next request for this ticker gets a fresh or
     stale cache hit instead of repeating the same cold compute.
@@ -1868,10 +1900,11 @@ def _compute_compact_dad_payload(
             include_price_history=False,
             chart_points=None,
             feature_limit=8,
+            persist_finviz_refresh=False,
         ),
     )
     payload = _assemble_dad_response(ticker, workbook, grid_payload, timings=timings, compact=True)
-    _timed("cache_write", timings, lambda: _write_summary_cache(engine, ticker, db_path, payload, timings))
+    _timed("cache_write", timings, lambda: _remember_summary_cache(ticker, db_path, payload))
     payload["performance"] = {"timings_ms": timings, "total_ms": round(sum(timings.values()), 1)}
     _log_slow_ticker(ticker, timings, route="gold_compact")
     return payload
@@ -2108,7 +2141,7 @@ def _build_compact_dad_response(ticker: str, *, refresh_finviz: bool = False, us
     present in production; not modified here), not by GOLD_COMPACT_BUDGET_SECONDS.
     If that call never returns, the connection is held for as long as the
     DB-side timeout allows, regardless of how many callers have already
-    given up. Once the worker does unwind, it still writes the cache so the
+    given up. Once the worker does unwind, it still fills the local cache so the
     next request gets a fresh or stale hit instead of repeating the same
     cold work.
     """
@@ -2256,7 +2289,9 @@ def _build_finviz_payload(
         "finviz",
         timings,
         lambda: _compact_finviz(
-            _get_finviz_profile(engine, ticker, refresh=refresh_finviz),
+            _get_finviz_profile(
+                engine, ticker, refresh=refresh_finviz, persist_refresh=False
+            ),
             include_fields=True,
         ),
     )
@@ -2299,7 +2334,7 @@ def get_dad_ticker_gold(
     ticker: str,
     refresh_finviz: bool = Query(
         default=False,
-        description="Explicitly refresh the ticker's Finviz snapshot before returning cached rows.",
+        description="Fetch current Finviz fields for this response without storing a snapshot.",
     ),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -2348,7 +2383,7 @@ def get_dad_ticker_finviz(
     refresh_finviz: bool = Query(False),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
-    """Return the full cached Finviz snapshot, optionally refreshing stale rows."""
+    """Return stored Finviz rows or live refreshed fields without persisting a GET."""
     ticker_upper = _normalize_ticker(ticker)
     if not ticker_upper:
         return {"ticker": "", "status": "invalid", "message": "Enter a ticker symbol."}
