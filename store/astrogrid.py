@@ -24,6 +24,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from config import settings
 from oracle.astrogrid_universe import scoreable_universe_by_symbol
 from price_close_contract import (
+    SPY_CLOSE_CAPTURE_POLICY,
     SPY_CLOSE_CONTRACT,
     SPY_CLOSE_FEATURE,
     SPY_CLOSE_SERIES,
@@ -1497,6 +1498,16 @@ class AstroGridStore:
             filters.append("pr.prediction_id = ANY(:prediction_ids)")
             params["prediction_ids"] = prediction_ids
         params["evaluation_date"] = evaluation_date
+        score_cutoff = min(
+            _utc_now(),
+            datetime.combine(evaluation_date + timedelta(days=1), time.min, timezone.utc),
+        )
+        params["score_cutoff"] = score_cutoff
+        params["spy_feature"] = SPY_CLOSE_FEATURE
+        params["spy_contract"] = SPY_CLOSE_CONTRACT
+        params["spy_basis"] = SPY_CLOSE_SERIES
+        params["spy_capture_policy"] = SPY_CLOSE_CAPTURE_POLICY
+        params["spy_outcome_grace_days"] = SPY_OUTCOME_GRACE_DAYS
         where_sql = f"AND {' AND '.join(filters)}" if filters else ""
         sql = text(
             f"""
@@ -1531,11 +1542,53 @@ class AstroGridStore:
                     END
               ) <= :evaluation_date
             {where_sql}
-            -- Legacy unanchored rows may remain pending forever. Do not let
-            -- them fill the batch ahead of a new SPY receipt-contract run.
+            -- A missing outcome leaves the prediction pending. Prefer SPY
+            -- predictions with an available receipt so old gaps cannot fill
+            -- every bounded batch ahead of scoreable predictions. The scorer
+            -- still verifies complete lineage before writing a score.
             ORDER BY CASE WHEN pr.target_symbols = '["SPY"]'::jsonb
                             AND pr.market_overlay_snapshot->'price_close_contract'->>'version'
-                                = 'spy_close_v1' THEN 0 ELSE 1 END,
+                                = 'spy_close_v1'
+                            AND EXISTS (
+                                SELECT 1 FROM {self.schema}.price_close_receipt pc
+                                JOIN raw_series raw ON raw.id = pc.raw_series_id
+                                JOIN resolved_series rs ON rs.id = pc.resolved_series_id
+                                JOIN feature_registry fr ON fr.id = pc.feature_id
+                                JOIN source_catalog sc ON sc.id = raw.source_id
+                                WHERE fr.name = :spy_feature
+                                  AND pc.contract_version = :spy_contract
+                                  AND pc.price_basis = :spy_basis
+                                  AND raw.series_id = :spy_basis
+                                  AND raw.pull_status = 'SUCCESS'
+                                  AND sc.name = 'yfinance'
+                                  AND rs.feature_id = pc.feature_id
+                                  AND rs.source_priority_used = raw.source_id
+                                  AND rs.obs_date = pc.obs_date
+                                  AND raw.obs_date = pc.obs_date
+                                  AND rs.value = pc.value
+                                  AND raw.value = pc.value
+                                  AND raw.pull_timestamp = pc.available_at
+                                  AND raw.raw_payload->>'price_contract_version' = :spy_contract
+                                  AND raw.raw_payload->>'capture_policy' = :spy_capture_policy
+                                  AND raw.raw_payload->>'price_basis' = :spy_basis
+                                  AND raw.raw_payload->>'interval' = '1d'
+                                  AND raw.raw_payload->>'obs_date' = pc.obs_date::text
+                                  AND raw.raw_payload->'provider_certified_final' = 'false'::jsonb
+                                  AND raw.pull_timestamp >=
+                                      ((pc.obs_date + 1)::timestamp AT TIME ZONE 'UTC')
+                                  AND pc.obs_date BETWEEN
+                                      (pr.created_at AT TIME ZONE 'UTC')::date
+                                        + CASE WHEN pr.horizon_label = 'macro' THEN 30 ELSE 7 END
+                                      AND (pr.created_at AT TIME ZONE 'UTC')::date
+                                        + CASE WHEN pr.horizon_label = 'macro' THEN 30 ELSE 7 END
+                                        + :spy_outcome_grace_days
+                                  AND pc.obs_date < (:score_cutoff AT TIME ZONE 'UTC')::date
+                                  AND pc.available_at <= :score_cutoff
+                            ) THEN 0
+                          WHEN pr.target_symbols = '["SPY"]'::jsonb
+                            AND pr.market_overlay_snapshot->'price_close_contract'->>'version'
+                                = 'spy_close_v1' THEN 1
+                          ELSE 2 END,
                      pr.as_of_ts ASC, pr.created_at ASC
             LIMIT :limit
             """
@@ -1595,10 +1648,6 @@ class AstroGridStore:
         with self.engine.begin() as conn:
             rows = conn.execute(sql, params).fetchall()
             summary["candidates"] = len(rows)
-            score_cutoff = min(
-                _utc_now(),
-                datetime.combine(evaluation_date + timedelta(days=1), time.min, timezone.utc),
-            )
             for row in rows:
                 maturity_days = 30 if row[3] == "macro" else 7
                 target_symbols = [str(symbol).upper() for symbol in _json_loads(row[5], [])]
@@ -2588,12 +2637,17 @@ class AstroGridStore:
                 conn, cutoff=prediction_created_at, mode="id",
                 receipt_id=entry_receipt_id,
             )
+            try:
+                anchor_available_at = datetime.fromisoformat(anchor["entry_available_at"])
+            except (KeyError, TypeError, ValueError):
+                anchor_available_at = None
             if not entry or any((
                 anchor.get("entry_raw_series_id") != entry["raw_series_id"],
                 anchor.get("entry_resolved_series_id") != entry["resolved_series_id"],
                 anchor.get("entry_obs_date") != entry["obs_date"].isoformat(),
                 anchor.get("entry_price") != entry["price"],
-                anchor.get("entry_available_at") != entry["available_at"].isoformat(),
+                anchor_available_at is None or anchor_available_at.tzinfo is None
+                or anchor_available_at != entry["available_at"],
                 (prediction_created_at.astimezone(timezone.utc).date() - entry["obs_date"]).days > SPY_ENTRY_MAX_AGE_DAYS
             )):
                 return {"unscored": {"reason": "unverified_entry_anchor", "phase": "entry",
