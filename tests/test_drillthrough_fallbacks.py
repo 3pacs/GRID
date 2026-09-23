@@ -54,7 +54,6 @@ def test_watchlist_analysis_allows_unsaved_ticker(monkeypatch) -> None:
     )
 
     monkeypatch.setattr(watchlist_analysis, "_get_analysis_cached", lambda *_args: None)
-    monkeypatch.setattr(watchlist_analysis, "_init_table", lambda: None)
     monkeypatch.setattr(watchlist_analysis, "get_db_engine", lambda: engine)
     monkeypatch.setattr(
         watchlist_analysis,
@@ -66,7 +65,6 @@ def test_watchlist_analysis_allows_unsaved_ticker(monkeypatch) -> None:
         "_fetch_live_price",
         lambda _ticker: {"price": 200.0, "prev_close": 198.0, "pct_1d": 0.01, "source": "live"},
     )
-    monkeypatch.setattr(watchlist_analysis, "_cache_price_to_db", lambda *_args, **_kwargs: None)
 
     response = client.get("/api/v1/watchlist/GD/analysis")
 

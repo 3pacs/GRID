@@ -537,6 +537,14 @@ export default function FlowTimeline({ ticker, timelineData }) {
                 </div>
             </div>
 
+            {(timelineData.history_status === 'partial' || timelineData.history_status === 'fallback') && (
+                <div style={{ color: colors.yellow, fontSize: '10px', padding: '4px 12px' }}>
+                    {timelineData.history_status === 'partial'
+                        ? 'Some GEX dates are unavailable; only measured dates are shown.'
+                        : 'Showing one latest GEX snapshot; stored history is unavailable.'}
+                </div>
+            )}
+
             {/* Tooltip bar */}
             <div
                 ref={tooltipRef}
