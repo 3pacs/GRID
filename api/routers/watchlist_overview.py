@@ -757,21 +757,30 @@ def get_ticker_edge(
     # 6. Convergence detection, equivalent to trust_scorer.detect_convergence
     # without its schema initializer.
     convergence: dict = {"direction": None, "signal_type": None, "source_count": 0,
-                         "confidence": None, "status": "none"}
-    by_direction: dict[str, dict[str, float]] = {"BUY": {}, "SELL": {}}
+                         "scored_source_count": 0, "confidence": None,
+                         "confidence_basis": "unscored", "direction_basis": None,
+                         "status": "none"}
+    by_direction: dict[str, dict[str, float | None]] = {"BUY": {}, "SELL": {}}
     for source_type, _source_id, signal_type, _signal_date, trust_score in convergence_rows:
         if signal_type in by_direction and source_type not in by_direction[signal_type]:
-            by_direction[signal_type][source_type] = float(trust_score) if trust_score is not None else 0.5
+            # A source can establish structural convergence before it is scored.
+            # NULL trust contributes no numeric confidence; measured zero does.
+            by_direction[signal_type][source_type] = float(trust_score) if trust_score is not None else None
     detected = next(
         ((signal_type, scores) for signal_type, scores in by_direction.items() if len(scores) >= 3),
         None,
     )
     if detected:
         signal_type, scores = detected
+        scored = [score for score in scores.values() if score is not None]
         convergence = {
-            "direction": None, "signal_type": signal_type,
+            "direction": "bullish" if signal_type == "BUY" else "bearish",
+            "direction_basis": "inferred_from_signal_types",
+            "signal_type": signal_type,
             "source_count": len(scores),
-            "confidence": _round_or_none(sum(scores.values()) / len(scores)),
+            "scored_source_count": len(scored),
+            "confidence": _round_or_none(sum(scored) / len(scored)) if scored else None,
+            "confidence_basis": "mean_trust_of_scored_sources" if scored else "unscored",
             "status": "detected",
         }
 

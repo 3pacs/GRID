@@ -111,7 +111,12 @@ def test_edge_route_uses_only_selects_against_prepared_postgres_schema():
 
         assert payload["status"] == "partial"
         assert payload["convergence"]["signal_type"] == "BUY"
+        assert payload["convergence"]["direction"] == "bullish"
+        assert payload["convergence"]["direction_basis"] == "inferred_from_signal_types"
         assert payload["convergence"]["source_count"] == 3
+        assert payload["convergence"]["scored_source_count"] == 3
+        assert payload["convergence"]["confidence"] == 0.47
+        assert payload["convergence"]["confidence_basis"] == "mean_trust_of_scored_sources"
         assert payload["congressional"][0]["trust_score"] == 0.0
         assert payload["smart_money"][0]["trust_score"] is None
         assert payload["lever_pullers"] == [
@@ -126,6 +131,48 @@ def test_edge_route_uses_only_selects_against_prepared_postgres_schema():
         assert payload["availability"]["investigation_leads"] == {
             "status": "unsupported", "reason": "no_ticker_association",
         }
+
+        # Disposable setup changes the persisted measurements between GETs.
+        # The route itself must continue to issue SELECTs only.
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE signal_sources SET trust_score = NULL
+                WHERE ticker = 'TEST' AND source_type IN ('insider', 'darkpool')
+            """))
+        statements.clear()
+        mixed = get_ticker_edge("test", user={}, engine=engine)["convergence"]
+        assert mixed["source_count"] == 3
+        assert mixed["scored_source_count"] == 1
+        assert mixed["confidence"] == 0.0
+        assert mixed["confidence_basis"] == "mean_trust_of_scored_sources"
+        assert statements and all(statement.startswith("SELECT") for statement in statements)
+
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE signal_sources SET trust_score = NULL
+                WHERE ticker = 'TEST' AND source_type = 'congressional'
+            """))
+        statements.clear()
+        unscored = get_ticker_edge("test", user={}, engine=engine)["convergence"]
+        assert unscored["status"] == "detected"
+        assert unscored["source_count"] == 3
+        assert unscored["scored_source_count"] == 0
+        assert unscored["confidence"] is None
+        assert unscored["confidence_basis"] == "unscored"
+        assert statements and all(statement.startswith("SELECT") for statement in statements)
+
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE signal_sources SET trust_score = 0.0, signal_type = 'SELL'
+                WHERE ticker = 'TEST' AND source_type IN ('congressional', 'insider', 'darkpool')
+            """))
+        statements.clear()
+        bearish_zero = get_ticker_edge("test", user={}, engine=engine)["convergence"]
+        assert bearish_zero["signal_type"] == "SELL"
+        assert bearish_zero["direction"] == "bearish"
+        assert bearish_zero["source_count"] == 3
+        assert bearish_zero["scored_source_count"] == 3
+        assert bearish_zero["confidence"] == 0.0
         assert statements and all(statement.startswith("SELECT") for statement in statements)
     finally:
         engine.dispose()
