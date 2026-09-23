@@ -74,14 +74,16 @@ def test_saved_populated_and_checked_empty_gets_are_select_only(isolated_db):
             INSERT INTO options_recommendations
                 (ticker, direction, strike, expiry, entry_price, target_price,
                  stop_loss, expected_return, kelly_fraction, confidence, thesis,
-                 generated_at, outcome)
+                 sanity_status, generated_at, outcome)
             VALUES
                 ('AAPL', 'CALL', 200, '2026-10-16', 10, 12, 8, 0, 0, 0,
-                 'Persisted recommendation', NOW(), 'OPEN'),
+                 'Persisted recommendation',
+                 '{"DATA_QUALITY":{"status":"PASS"},"DEALER_FLOW":{"status":"SKIP"}}',
+                 NOW(), 'OPEN'),
                 ('MSFT', 'PUT', 400, '2026-10-16', 9, 11, 7, 0.2, 0.1, 0.8,
-                 'Other ticker', NOW(), 'OPEN'),
+                 'Other ticker', NULL, NOW(), 'OPEN'),
                 ('AAPL', 'PUT', 180, '2026-10-16', 4, 6, 2, 0.1, 0.1, 0.8,
-                 'Closed recommendation', NOW(), 'CLOSED')
+                 'Closed recommendation', NULL, NOW(), 'CLOSED')
         """))
     statements, record = _capture(engine)
     try:
@@ -95,6 +97,10 @@ def test_saved_populated_and_checked_empty_gets_are_select_only(isolated_db):
         assert body["recommendations"][0]["ticker"] == "AAPL"
         assert body["recommendations"][0]["confidence"] == 0.0
         assert body["recommendations"][0]["expected_return"] == 0.0
+        assert body["recommendations"][0]["entry_price"] == 10.0
+        assert body["recommendations"][0]["target_price"] == 12.0
+        assert body["recommendations"][0]["stop_loss"] == 8.0
+        assert body["recommendations"][0]["sanity_status"]["DATA_QUALITY"]["status"] == "PASS"
         assert body["scan_summary"]["source"] == "persisted"
         assert body["scan_summary"]["fresh_scan"] is False
         assert empty.json()["recommendations"] == []
@@ -116,3 +122,11 @@ def test_missing_table_reports_unavailable_without_bootstrap(isolated_db):
         assert statements and all(statement.startswith("SELECT") for statement in statements)
     finally:
         event.remove(engine, "before_cursor_execute", record)
+
+
+def test_engine_construction_failure_is_unavailable_without_query():
+    with patch("api.routers.options.get_db_engine", side_effect=RuntimeError("engine unavailable")):
+        response = _client().get("/api/v1/options/recommendations?ticker=AAPL")
+    assert response.status_code == 200
+    assert response.json()["recommendations"] == []
+    assert response.json()["scan_summary"]["source"] == "unavailable"

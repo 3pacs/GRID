@@ -21,6 +21,28 @@ describe('Watchlist ticker recommendations', () => {
         expect(screen.getByText('+0.0% exp')).toBeInTheDocument();
     });
 
+    it('renders persisted price fields, risk/reward, and keyed sanity status', async () => {
+        api.getOptionsRecommendations.mockResolvedValue({
+            scan_summary: { source: 'persisted' },
+            recommendations: [{ ticker: 'AAPL', direction: 'CALL', strike: 200,
+                entry_price: 10, target_price: 12, stop_loss: 8,
+                sanity_status: {
+                    DATA_QUALITY: { status: 'PASS' }, DEALER_FLOW: { status: 'SKIP' },
+                    CROSS_ASSET: { status: 'PASS' }, LLM_REVIEW: { status: 'SKIP' },
+                    HISTORICAL_ANALOG: { status: 'PASS' },
+                },
+            }],
+        });
+        render(<TickerRecommendations ticker="AAPL" />);
+        expect(await screen.findByText('$10.00')).toBeInTheDocument();
+        expect(screen.getByText('$12.00')).toBeInTheDocument();
+        expect(screen.getByText('$8.00')).toBeInTheDocument();
+        expect(screen.getByText('ENTRY')).toBeInTheDocument();
+        expect(screen.getByText('STOP')).toBeInTheDocument();
+        expect(screen.getByTitle('Data quality: PASS')).toBeInTheDocument();
+        expect(screen.getByTitle('Dealer flow: SKIP')).toBeInTheDocument();
+    });
+
     it('distinguishes checked empty from unavailable', async () => {
         api.getOptionsRecommendations.mockResolvedValue({
             scan_summary: { source: 'persisted' }, recommendations: [],

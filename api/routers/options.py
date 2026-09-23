@@ -203,7 +203,18 @@ async def get_recommendations(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Read open recommendations produced by the separate Hermes writer."""
-    engine = get_db_engine()
+    try:
+        engine = get_db_engine()
+    except Exception as exc:
+        log.warning("Saved recommendations engine unavailable: {e}", e=str(exc))
+        return _format_recommendation_response([], {
+            "total_scanned": 0,
+            "passed_sanity": 0,
+            "rejected": 0,
+            "source": "unavailable",
+            "fresh_scan": False,
+            "reason": "saved_recommendations_read_failed",
+        })
     recommendations, scan_summary, generated_at = _load_saved_recommendations(
         engine, ticker=ticker,
     )
