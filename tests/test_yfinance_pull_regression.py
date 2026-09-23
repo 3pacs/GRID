@@ -24,7 +24,7 @@ if "multitasking" not in sys.modules:
     _shim.wait_for_tasks = lambda *a, **k: None
     sys.modules["multitasking"] = _shim
 
-from datetime import date
+from datetime import date, datetime, timezone
 from unittest.mock import MagicMock, create_autospec, patch
 
 import pandas as pd
@@ -97,6 +97,43 @@ def test_string_index_entries_never_reach_obs_date(engine_recording_inserts):
         f"obs_date received string values — regression of the TLT bug: {offending}"
     )
     assert result["status"] in ("SUCCESS", "PARTIAL")
+
+
+def test_spy_daily_close_repull_is_not_frozen_by_earlier_value(engine_recording_inserts):
+    """A provisional daily value cannot block a later post-period capture."""
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    obs_date = date(2026, 9, 22)
+    early = pd.DataFrame({"Close": [680.0]}, index=pd.DatetimeIndex([pd.Timestamp(obs_date)]))
+    completed = pd.DataFrame({"Close": [685.0]}, index=pd.DatetimeIndex([pd.Timestamp(obs_date)]))
+
+    def execute(statement, params=None):
+        result = MagicMock()
+        result.fetchone.return_value = None
+        result.fetchall.return_value = []
+        return result
+
+    conn.execute.side_effect = execute
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", side_effect=[set(), {obs_date}]), \
+         patch.object(yfinance_pull, "_utc_now", side_effect=[
+             datetime(2026, 9, 22, 13, 33, tzinfo=timezone.utc),
+             datetime(2026, 9, 23, 0, 30, tzinfo=timezone.utc),
+         ]), \
+         patch.object(yfinance_pull.yf, "download", side_effect=[early, completed]):
+        puller = yfinance_pull.YFinancePuller(engine)
+        first = puller.pull_ticker("SPY", start_date=obs_date)
+        second = puller.pull_ticker("SPY", start_date=obs_date)
+
+    assert first["rows_inserted"] == 0
+    assert second["rows_inserted"] == 1
+    assert second["outcome"] == "inserted"
+    marked = [c.args[1] for c in conn.execute.call_args_list
+              if "INSERT INTO raw_series" in str(c.args[0])]
+    assert len(marked) == 1
+    assert marked[0]["sid"] == "YF:SPY:close"
+    assert marked[0]["val"] == 685.0
 
 
 def test_duplicate_columns_dont_iterate_column_names(engine_recording_inserts):

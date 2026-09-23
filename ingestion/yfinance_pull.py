@@ -8,9 +8,11 @@ and stores each field as a separate entry in ``raw_series``.
 from __future__ import annotations
 
 import inspect
+import json
 import logging
+import math
 import re
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 
 import pandas as pd
@@ -20,6 +22,16 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller
+from price_close_contract import (
+    SPY_CAPTURE_MAX_LOOKBACK_DAYS,
+    SPY_CLOSE_SERIES,
+    capture_payload,
+    observation_end_utc,
+)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 # yfinance logs missing/delisted symbols at ERROR level internally. The puller
 # already downgrades those outcomes to PARTIAL/SKIPPED, so keep the third-party
@@ -302,6 +314,49 @@ class YFinancePuller(BasePuller):
                             continue
 
                         obs_date_val = dt_parsed.date()
+                        if series_id == SPY_CLOSE_SERIES and interval == "1d":
+                            if not math.isfinite(float_val) or float_val <= 0:
+                                continue
+                            captured_at = _utc_now()
+                            # No provisional SPY close and no implicit history
+                            # backfill. A later pull may append one marked row
+                            # even if an older unmarked row exists.
+                            if obs_date_val < captured_at.date() - timedelta(
+                                days=SPY_CAPTURE_MAX_LOOKBACK_DAYS
+                            ):
+                                continue
+                            marker = capture_payload(obs_date_val, captured_at)
+                            if marker is None:
+                                continue
+                            already_marked = conn.execute(
+                                text(
+                                    "SELECT 1 FROM raw_series "
+                                    "WHERE series_id = :sid AND source_id = :src "
+                                    "AND obs_date = :od AND pull_status = 'SUCCESS' "
+                                    "AND raw_payload @> CAST(:payload AS jsonb) "
+                                    "AND pull_timestamp >= :period_end "
+                                    "LIMIT 1"
+                                ),
+                                {"sid": series_id, "src": self.source_id,
+                                 "od": obs_date_val, "payload": json.dumps(marker),
+                                 "period_end": observation_end_utc(obs_date_val)},
+                            ).fetchone()
+                            if already_marked:
+                                continue
+                            conn.execute(
+                                text(
+                                    "INSERT INTO raw_series "
+                                    "(series_id, source_id, obs_date, pull_timestamp, "
+                                    "value, raw_payload, pull_status) "
+                                    "VALUES (:sid, :src, :od, :pulled_at, :val, "
+                                    "CAST(:payload AS jsonb), 'SUCCESS')"
+                                ),
+                                {"sid": series_id, "src": self.source_id,
+                                 "od": obs_date_val, "pulled_at": captured_at,
+                                 "val": float_val, "payload": json.dumps(marker)},
+                            )
+                            inserted += 1
+                            continue
                         if obs_date_val in existing_dates:
                             continue
 

@@ -8,6 +8,7 @@ Shared GRID tables remain upstream-only inputs.
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections import Counter
 from collections.abc import Mapping
@@ -18,9 +19,20 @@ from uuid import uuid4
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
 from config import settings
 from oracle.astrogrid_universe import scoreable_universe_by_symbol
+from price_close_contract import (
+    SPY_CLOSE_CONTRACT,
+    SPY_CLOSE_FEATURE,
+    SPY_CLOSE_SERIES,
+    SPY_ENTRY_MAX_AGE_DAYS,
+    SPY_ENTRY_RULE,
+    SPY_OUTCOME_GRACE_DAYS,
+    SPY_OUTCOME_RULE,
+    is_policy_capture,
+)
 
 _DEFAULT_GRID_WEIGHTS = {
     "regime": 0.9,
@@ -54,6 +66,15 @@ _PRICE_FEATURE_BY_SYMBOL = {
     for symbol, item in _UNIVERSE_BY_SYMBOL.items()
 }
 _PRICE_FEATURE_BY_SYMBOL["GOOG"] = _PRICE_FEATURE_BY_SYMBOL["GOOGL"]
+
+
+def _utc_today() -> date:
+    return datetime.now(timezone.utc).date()
+
+
+def _utc_now() -> datetime:
+    """Clock seam for point-in-time score cutoffs and disposable DB tests."""
+    return datetime.now(timezone.utc)
 
 _VALID_SCORING_CLASSES = {
     "liquid_market",
@@ -837,6 +858,10 @@ class AstroGridStore:
             """
         )
 
+        overlay_snapshot = dict(payload.get("market_overlay_snapshot") or {})
+        # Caller-supplied evidence cannot impersonate the store's creation-time
+        # anchor. A missing anchor leaves the prediction explicitly unscored.
+        overlay_snapshot.pop("price_close_contract", None)
         params = {
             "prediction_id": prediction_id,
             "as_of_ts": as_of_ts_value,
@@ -851,7 +876,7 @@ class AstroGridStore:
             "invalidation": _compact_text(payload.get("invalidation")),
             "note": _compact_text(payload.get("note")),
             "seer_summary": _compact_text(payload.get("seer_summary")),
-            "market_overlay_snapshot": _safe_json(payload.get("market_overlay_snapshot") or {}),
+            "market_overlay_snapshot": _safe_json(overlay_snapshot),
             "mystical_feature_payload": _safe_json(payload.get("mystical_feature_payload") or {}),
             "grid_feature_payload": _safe_json(payload.get("grid_feature_payload") or {}),
             "weight_version": _compact_text(payload.get("weight_version"), "astrogrid-v1"),
@@ -869,6 +894,35 @@ class AstroGridStore:
 
         try:
             with self.engine.begin() as conn:
+                if (
+                    payload.get("price_contract_version") == SPY_CLOSE_CONTRACT
+                    and [str(s).upper() for s in payload.get("target_symbols") or []] == ["SPY"]
+                    and live_or_local == "live"
+                    and params["scoring_class"] == "liquid_market"
+                    and isinstance(as_of_ts_value, datetime)
+                    and as_of_ts_value.tzinfo is not None
+                ):
+                    creation_ts = conn.execute(text("SELECT NOW()" )).scalar_one()
+                    if abs((creation_ts - as_of_ts_value).total_seconds()) <= 300:
+                        entry = self._verified_spy_receipt(
+                            conn, cutoff=creation_ts, mode="entry"
+                        )
+                        if entry and (creation_ts.astimezone(timezone.utc).date() - entry["obs_date"]).days <= SPY_ENTRY_MAX_AGE_DAYS:
+                            overlay_snapshot["price_close_contract"] = {
+                                "version": SPY_CLOSE_CONTRACT,
+                                "entry_rule": SPY_ENTRY_RULE,
+                                "outcome_rule": SPY_OUTCOME_RULE,
+                                "symbol": "SPY",
+                                "basis": SPY_CLOSE_SERIES,
+                                "entry_receipt_id": entry["receipt_id"],
+                                "entry_raw_series_id": entry["raw_series_id"],
+                                "entry_resolved_series_id": entry["resolved_series_id"],
+                                "entry_obs_date": entry["obs_date"].isoformat(),
+                                "entry_price": entry["price"],
+                                "entry_available_at": entry["available_at"].isoformat(),
+                                "creation_cutoff": creation_ts.isoformat(),
+                            }
+                            params["market_overlay_snapshot"] = _safe_json(overlay_snapshot)
                 row = conn.execute(insert_sql, params).fetchone()
                 if not row:
                     return None
@@ -1384,7 +1438,7 @@ class AstroGridStore:
         provider_mode: str = "deterministic",
         horizon_label: str | None = None,
     ) -> dict[str, Any]:
-        evaluation_date = as_of_date or date.today()
+        evaluation_date = as_of_date or _utc_today()
         score_summary = self.score_predictions(
             as_of_date=evaluation_date,
             limit=score_limit,
@@ -1436,7 +1490,7 @@ class AstroGridStore:
         limit: int = 100,
         prediction_ids: list[str] | None = None,
     ) -> dict[str, Any]:
-        evaluation_date = as_of_date or date.today()
+        evaluation_date = as_of_date or _utc_today()
         filters = []
         params: dict[str, Any] = {"limit": limit}
         if prediction_ids:
@@ -1460,21 +1514,29 @@ class AstroGridStore:
                 pr.mystical_feature_payload,
                 pr.grid_feature_payload,
                 pr.question,
-                ps.id
+                ps.id,
+                pr.created_at
             FROM {self.schema}.prediction_run pr
             LEFT JOIN {self.schema}.prediction_score ps
                 ON ps.prediction_run_id = pr.id
             WHERE ps.id IS NULL
               AND pr.scoring_class = 'liquid_market'
               AND (
-                  pr.as_of_ts::date
+                  CASE WHEN pr.target_symbols = '["SPY"]'::jsonb
+                       THEN (pr.created_at AT TIME ZONE 'UTC')::date
+                       ELSE pr.as_of_ts::date END
                   + CASE
                         WHEN pr.horizon_label = 'macro' THEN 30
                         ELSE 7
                     END
               ) <= :evaluation_date
             {where_sql}
-            ORDER BY pr.as_of_ts ASC, pr.created_at ASC
+            -- Legacy unanchored rows may remain pending forever. Do not let
+            -- them fill the batch ahead of a new SPY receipt-contract run.
+            ORDER BY CASE WHEN pr.target_symbols = '["SPY"]'::jsonb
+                            AND pr.market_overlay_snapshot->'price_close_contract'->>'version'
+                                = 'spy_close_v1' THEN 0 ELSE 1 END,
+                     pr.as_of_ts ASC, pr.created_at ASC
             LIMIT :limit
             """
         )
@@ -1526,20 +1588,31 @@ class AstroGridStore:
             "skipped_not_mature": 0,
             "skipped_unscoreable": 0,
             "skipped_no_price": 0,
+            "unscored": [],
             "verdicts": {"hit": 0, "miss": 0, "partial": 0, "invalidated": 0, "expired": 0},
             "prediction_ids": [],
         }
         with self.engine.begin() as conn:
             rows = conn.execute(sql, params).fetchall()
             summary["candidates"] = len(rows)
+            score_cutoff = min(
+                _utc_now(),
+                datetime.combine(evaluation_date + timedelta(days=1), time.min, timezone.utc),
+            )
             for row in rows:
                 maturity_days = 30 if row[3] == "macro" else 7
-                start_date = row[2].date() if row[2] else evaluation_date
+                target_symbols = [str(symbol).upper() for symbol in _json_loads(row[5], [])]
+                created_at = row[14] if len(row) > 14 else None
+                start_date = (
+                    created_at.astimezone(timezone.utc).date()
+                    if target_symbols == ["SPY"] and isinstance(created_at, datetime)
+                    and created_at.tzinfo is not None
+                    else row[2].date() if row[2] else evaluation_date
+                )
                 maturity_date = start_date + timedelta(days=maturity_days)
                 if evaluation_date < maturity_date:
                     summary["skipped_not_mature"] += 1
                     continue
-                target_symbols = [str(symbol).upper() for symbol in _json_loads(row[5], [])]
                 score = self._build_prediction_score(
                     conn=conn,
                     prediction_id=row[1],
@@ -1552,9 +1625,18 @@ class AstroGridStore:
                     target_symbols=target_symbols,
                     start_date=start_date,
                     evaluation_date=evaluation_date,
+                    prediction_as_of_ts=row[2],
+                    prediction_created_at=created_at,
+                    declared_horizon=row[3],
+                    score_cutoff=score_cutoff,
                 )
-                if not score:
+                if score.get("unscored"):
                     summary["skipped_no_price"] += 1
+                    summary["unscored"].append({
+                        "prediction_id": row[1],
+                        "status": "unscored",
+                        **score["unscored"],
+                    })
                     continue
                 inserted = conn.execute(
                     insert_sql,
@@ -2369,6 +2451,85 @@ class AstroGridStore:
             },
         }
 
+    def _verified_spy_receipt(
+        self, conn: Any, *, cutoff: datetime, mode: str,
+        receipt_id: int | None = None, min_date: date | None = None,
+        max_date: date | None = None,
+    ) -> dict[str, Any] | None:
+        """Read exact raw/resolved SPY lineage under an availability cutoff."""
+        if cutoff.tzinfo is None or mode not in {"entry", "outcome", "id"}:
+            return None
+        cutoff_day = cutoff.astimezone(timezone.utc).date()
+        if mode == "entry":
+            min_date = cutoff_day - timedelta(days=SPY_ENTRY_MAX_AGE_DAYS)
+            max_date = cutoff_day - timedelta(days=1)
+        elif mode == "id" and receipt_id is None:
+            return None
+        elif mode == "outcome" and (min_date is None or max_date is None):
+            return None
+        mode_filter = "AND pc.id = :receipt_id" if mode == "id" else (
+            "AND pc.obs_date BETWEEN :min_date AND :max_date"
+        )
+        order = "ASC" if mode == "outcome" else "DESC"
+        sql = text(f"""
+            SELECT pc.id, raw.id, rs.id, fr.name, pc.obs_date, pc.value,
+                   pc.available_at, raw.raw_payload, raw.pull_timestamp,
+                   sc.name, pc.price_basis
+            FROM astrogrid.price_close_receipt pc
+            JOIN raw_series raw ON raw.id = pc.raw_series_id
+            JOIN resolved_series rs ON rs.id = pc.resolved_series_id
+            JOIN feature_registry fr ON fr.id = pc.feature_id
+            JOIN source_catalog sc ON sc.id = raw.source_id
+            WHERE pc.contract_version = :contract
+              AND fr.name = :feature
+              AND pc.price_basis = :basis
+              AND raw.series_id = :basis
+              AND raw.pull_status = 'SUCCESS'
+              AND sc.name = 'yfinance'
+              AND rs.feature_id = pc.feature_id
+              AND rs.source_priority_used = raw.source_id
+              AND rs.obs_date = pc.obs_date AND raw.obs_date = pc.obs_date
+              AND rs.value = pc.value AND raw.value = pc.value
+              AND raw.pull_timestamp = pc.available_at
+              AND pc.available_at <= :cutoff
+              AND pc.obs_date < :cutoff_day
+              {mode_filter}
+            ORDER BY pc.obs_date {order}, pc.id ASC
+            LIMIT 1
+        """)
+        try:
+            # A missing migration must fail closed without poisoning the
+            # surrounding prediction/score transaction in PostgreSQL.
+            with conn.begin_nested():
+                row = conn.execute(sql, {
+                    "contract": SPY_CLOSE_CONTRACT, "feature": SPY_CLOSE_FEATURE,
+                    "basis": SPY_CLOSE_SERIES, "cutoff": cutoff,
+                    "cutoff_day": cutoff_day,
+                    "receipt_id": receipt_id, "min_date": min_date,
+                    "max_date": max_date,
+                }).fetchone()
+        except SQLAlchemyError:
+            return None
+        if not row:
+            return None
+        obs_date = row[4]
+        pulled_at = row[8]
+        if not isinstance(obs_date, date) or not isinstance(pulled_at, datetime):
+            return None
+        if not is_policy_capture(row[7], obs_date, pulled_at):
+            return None
+        try:
+            price = float(row[5])
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(price) or price <= 0:
+            return None
+        return {
+            "receipt_id": int(row[0]), "raw_series_id": int(row[1]),
+            "resolved_series_id": int(row[2]), "obs_date": obs_date,
+            "price": price, "available_at": row[6],
+        }
+
     def _build_prediction_score(
         self,
         *,
@@ -2383,42 +2544,129 @@ class AstroGridStore:
         target_symbols: list[str],
         start_date: date,
         evaluation_date: date,
-    ) -> dict[str, Any] | None:
-        symbols = [symbol for symbol in target_symbols if symbol in _HYBRID_LOOKUP_BY_SYMBOL] or ["SPY"]
+        prediction_as_of_ts: datetime | None = None,
+        prediction_created_at: datetime | None = None,
+        declared_horizon: str | None = None,
+        score_cutoff: datetime | None = None,
+    ) -> dict[str, Any]:
+        symbols = [symbol for symbol in target_symbols if symbol in _PRICE_FEATURE_BY_SYMBOL]
+        if not symbols or len(symbols) != len(target_symbols):
+            return {"unscored": {"reason": "unsupported_target", "symbols": target_symbols}}
         realized_returns = []
         mfe_values = []
         mae_values = []
-        for symbol in symbols:
-            entry_price = self._get_symbol_price_at_date(symbol, start_date)
-            exit_price = self._get_symbol_price_at_date(symbol, evaluation_date)
-            if entry_price is None or exit_price is None or entry_price == 0:
-                continue
-            realized = (float(exit_price) - float(entry_price)) / float(entry_price)
-            realized_returns.append(realized)
-            path = self._load_price_path(symbol, start_date, evaluation_date)
-            if path:
-                rel_path = [((price - float(entry_price)) / float(entry_price)) for _, price in path]
-                mfe_values.append(max(rel_path))
-                mae_values.append(min(rel_path))
-        if not realized_returns:
-            return None
+        spy_evidence: dict[str, Any] | None = None
+        if "SPY" in symbols:
+            if symbols != ["SPY"]:
+                return {"unscored": {"reason": "unsupported_spy_contract_combination",
+                                     "feature": SPY_CLOSE_FEATURE}}
+            anchor = market_overlay.get("price_close_contract")
+            if not isinstance(anchor, dict) or anchor.get("version") != SPY_CLOSE_CONTRACT:
+                return {"unscored": {"reason": "missing_entry_anchor", "phase": "entry",
+                                     "feature": SPY_CLOSE_FEATURE}}
+            if (
+                anchor.get("entry_rule") != SPY_ENTRY_RULE
+                or anchor.get("outcome_rule") != SPY_OUTCOME_RULE
+                or anchor.get("basis") != SPY_CLOSE_SERIES
+                or anchor.get("symbol") != "SPY"
+                or not isinstance(prediction_created_at, datetime)
+                or not isinstance(prediction_as_of_ts, datetime)
+                or prediction_created_at.tzinfo is None
+                or prediction_as_of_ts.tzinfo is None
+                or abs((prediction_created_at - prediction_as_of_ts).total_seconds()) > 300
+                or score_cutoff is None
+                or declared_horizon not in {"swing", "macro"}
+            ):
+                return {"unscored": {"reason": "invalid_entry_anchor", "phase": "entry",
+                                     "feature": SPY_CLOSE_FEATURE}}
+            try:
+                entry_receipt_id = int(anchor["entry_receipt_id"])
+            except (KeyError, TypeError, ValueError):
+                return {"unscored": {"reason": "invalid_entry_anchor", "phase": "entry",
+                                     "feature": SPY_CLOSE_FEATURE}}
+            entry = self._verified_spy_receipt(
+                conn, cutoff=prediction_created_at, mode="id",
+                receipt_id=entry_receipt_id,
+            )
+            if not entry or any((
+                anchor.get("entry_raw_series_id") != entry["raw_series_id"],
+                anchor.get("entry_resolved_series_id") != entry["resolved_series_id"],
+                anchor.get("entry_obs_date") != entry["obs_date"].isoformat(),
+                anchor.get("entry_price") != entry["price"],
+                anchor.get("entry_available_at") != entry["available_at"].isoformat(),
+                (prediction_created_at.astimezone(timezone.utc).date() - entry["obs_date"]).days > SPY_ENTRY_MAX_AGE_DAYS
+            )):
+                return {"unscored": {"reason": "unverified_entry_anchor", "phase": "entry",
+                                     "feature": SPY_CLOSE_FEATURE}}
+            target_day = prediction_created_at.astimezone(timezone.utc).date() + timedelta(
+                days=30 if declared_horizon == "macro" else 7
+            )
+            outcome = self._verified_spy_receipt(
+                conn, cutoff=score_cutoff, mode="outcome",
+                min_date=target_day,
+                max_date=target_day + timedelta(days=SPY_OUTCOME_GRACE_DAYS),
+            )
+            if not outcome:
+                return {"unscored": {"reason": "missing_verified_outcome", "phase": "outcome",
+                                     "feature": SPY_CLOSE_FEATURE,
+                                     "target_date": target_day.isoformat()}}
+            start_date = entry["obs_date"]
+            evaluation_date = outcome["obs_date"]
+            realized_returns.append((outcome["price"] - entry["price"]) / entry["price"])
+            spy_evidence = {
+                "contract_version": SPY_CLOSE_CONTRACT,
+                "entry_receipt_id": entry["receipt_id"],
+                "outcome_receipt_id": outcome["receipt_id"],
+                "outcome_target_date": target_day.isoformat(),
+                "outcome_obs_date": outcome["obs_date"].isoformat(),
+                "outcome_available_at": outcome["available_at"].isoformat(),
+                "score_cutoff": score_cutoff.isoformat(),
+            }
+            benchmark_symbol, benchmark_return = "SPY", None
+        else:
+            for symbol in symbols:
+                entry = self._lookup_symbol_price(symbol, start_date)
+                exit_observation = self._lookup_symbol_price(symbol, evaluation_date)
+                for phase, observation in (("entry", entry), ("outcome", exit_observation)):
+                    if observation["status"] != "ok":
+                        return {"unscored": {
+                            "reason": observation["status"],
+                            "phase": phase,
+                            "symbol": symbol,
+                            "feature": observation["feature"],
+                            "target_date": observation["target_date"],
+                            "latest_obs_date": observation["latest_obs_date"],
+                            "latest_release_date": observation["latest_release_date"],
+                            "max_age_days": observation["max_age_days"],
+                        }}
+                entry_price = entry["price"]
+                exit_price = exit_observation["price"]
+                realized = (float(exit_price) - float(entry_price)) / float(entry_price)
+                realized_returns.append(realized)
+                path = self._load_price_path(symbol, start_date, evaluation_date)
+                if path:
+                    rel_path = [((price - float(entry_price)) / float(entry_price)) for _, price in path]
+                    mfe_values.append(max(rel_path))
+                    mae_values.append(min(rel_path))
+            benchmark_symbol, benchmark_return = self._benchmark_return(symbols, start_date, evaluation_date)
         realized_return = sum(realized_returns) / len(realized_returns)
-        benchmark_symbol, benchmark_return = self._benchmark_return(symbols, start_date, evaluation_date)
         alpha = realized_return - benchmark_return if benchmark_return is not None else None
         direction = _prediction_direction(" ".join([call, setup]))
         sign = _direction_sign(direction)
         signed_return = realized_return * sign if sign else realized_return
-        horizon_label = "macro" if (evaluation_date - start_date).days >= 30 else "swing"
+        horizon_label = (declared_horizon if spy_evidence else
+                         ("macro" if (evaluation_date - start_date).days >= 30 else "swing"))
         verdict = _effective_verdict(direction, realized_return, horizon_label=horizon_label)
         invalid_status = _invalidation_status(verdict, signed_return)
         grid_attr = self._attribution_grid(market_overlay, grid_payload)
         mystical_attr = self._attribution_mystical(mystical_payload)
         noise_attr = self._attribution_noise(grid_attr, mystical_attr, benchmark_symbol, benchmark_return)
         hit_threshold, partial_threshold = _horizon_thresholds(horizon_label)
-        regime_context = self._load_regime_context(
-            conn=conn,
-            target_date=start_date,
-            market_overlay=market_overlay,
+        regime_context = (
+            {"source": "price_close_receipt", "contract_version": SPY_CLOSE_CONTRACT}
+            if spy_evidence else self._load_regime_context(
+                conn=conn, target_date=start_date, market_overlay=market_overlay,
+            )
         )
         return {
             "benchmark_symbol": benchmark_symbol,
@@ -2444,6 +2692,7 @@ class AstroGridStore:
                 "hit_threshold": hit_threshold,
                 "partial_threshold": partial_threshold,
                 "neutral_move_band": _NEUTRAL_MOVE_BAND,
+                "price_close_evidence": spy_evidence,
             },
         }
 
@@ -2470,33 +2719,20 @@ class AstroGridStore:
                             "evaluation_date": evaluation_date,
                         },
                     ).fetchall()
-                return [(row[0], float(row[1])) for row in rows if row[0] is not None and row[1] is not None]
-            except Exception:
-                pass
-        lookup_ticker = _HYBRID_LOOKUP_BY_SYMBOL.get(symbol.upper(), symbol)
-        sql = text(
-            """
-            SELECT obs_date, value
-            FROM raw_series
-            WHERE series_id = :series_id
-              AND obs_date BETWEEN :start_date AND :evaluation_date
-              AND pull_status = 'SUCCESS'
-            ORDER BY obs_date
-            """
-        )
-        try:
-            with self.engine.connect() as conn:
-                rows = conn.execute(
-                    sql,
-                    {
-                        "series_id": f"YF:{lookup_ticker}:close",
-                        "start_date": start_date,
-                        "evaluation_date": evaluation_date,
-                    },
-                ).fetchall()
-            return [(row[0], float(row[1])) for row in rows if row[0] is not None and row[1] is not None]
-        except Exception:
-            return []
+                path = []
+                for obs_date, value in rows:
+                    if obs_date is None:
+                        continue
+                    try:
+                        price = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 < price < float("inf"):
+                        path.append((obs_date, price))
+                return path
+            except (SQLAlchemyError, TypeError, ValueError):
+                return []
+        return []
 
     def _benchmark_return(self, symbols: list[str], start_date: date, evaluation_date: date) -> tuple[str, float | None]:
         resolved_symbols = [symbol for symbol in symbols if symbol in _UNIVERSE_BY_SYMBOL]
@@ -2598,50 +2834,90 @@ class AstroGridStore:
         return _build_historical_regime_lookup(valid_dates, rows)
 
     def _get_symbol_price_at_date(self, symbol: str, target_date: date) -> float | None:
+        observation = self._lookup_symbol_price(symbol, target_date)
+        return observation["price"] if observation["status"] == "ok" else None
+
+    def _lookup_symbol_price(self, symbol: str, target_date: date) -> dict[str, Any]:
+        """Use only the canonical feature and report why a price cannot be scored.
+
+        Crypto trades every day, so the observation must match the target day.
+        Exchange traded assets require the target day's close on weekdays;
+        Saturday and Sunday may use Friday's close. Exchange holidays without
+        a matching close remain unscored. An observation dated today in UTC
+        cannot be treated as a completed daily bar. This date-only table does
+        not prove that older rows were final closes; that requires provenance
+        from the producer. The universe contract's 14-day *history coverage*
+        limit is too loose for a return.
+        """
         symbol = str(symbol or "").upper()
         feature_name = _PRICE_FEATURE_BY_SYMBOL.get(symbol)
-        if feature_name:
-            sql = text(
-                """
-                SELECT rs.value
-                FROM feature_registry fr
-                JOIN resolved_series rs ON rs.feature_id = fr.id
-                WHERE fr.name = :feature_name
-                  AND rs.obs_date <= :target_date
-                ORDER BY rs.obs_date DESC
-                LIMIT 1
-                """
-            )
-            try:
-                with self.engine.connect() as conn:
-                    row = conn.execute(sql, {"feature_name": feature_name, "target_date": target_date}).fetchone()
-                if row and row[0] is not None:
-                    return float(row[0])
-            except Exception:
-                pass
-        lookup_ticker = _HYBRID_LOOKUP_BY_SYMBOL.get(symbol, symbol)
+        is_crypto = _UNIVERSE_BY_SYMBOL.get(symbol, {}).get("asset_class") == "crypto"
+        max_age_days = 0 if is_crypto else max(0, target_date.weekday() - 4)
+        result: dict[str, Any] = {
+            "status": "missing_canonical_price",
+            "price": None,
+            "feature": feature_name,
+            "target_date": target_date.isoformat(),
+            "latest_obs_date": None,
+            "latest_release_date": None,
+            "max_age_days": max_age_days,
+        }
+        if not feature_name:
+            result["status"] = "unsupported_target"
+            return result
+        today_utc = _utc_today()
+        if target_date > today_utc:
+            result["status"] = "future_evaluation_date"
+            return result
         sql = text(
             """
-            SELECT value
-            FROM raw_series
-            WHERE series_id = :series_id
-              AND obs_date <= :target_date
-              AND pull_status = 'SUCCESS'
-            ORDER BY obs_date DESC
+            SELECT rs.value, rs.obs_date, rs.release_date
+            FROM feature_registry fr
+            JOIN resolved_series rs ON rs.feature_id = fr.id
+            WHERE fr.name = :feature_name
+              AND rs.obs_date <= :target_date
+            ORDER BY rs.obs_date DESC, rs.release_date DESC, rs.vintage_date DESC
             LIMIT 1
             """
         )
         try:
             with self.engine.connect() as conn:
-                row = conn.execute(
-                    sql,
-                    {"series_id": f"YF:{lookup_ticker}:close", "target_date": target_date},
-                ).fetchone()
-            if row and row[0] is not None:
-                return float(row[0])
-        except Exception:
-            return None
-        return None
+                row = conn.execute(sql, {"feature_name": feature_name, "target_date": target_date}).fetchone()
+        except SQLAlchemyError:
+            result["status"] = "canonical_price_lookup_failed"
+            return result
+        if not row:
+            return result
+        obs_date = row[1].date() if isinstance(row[1], datetime) else row[1]
+        if not isinstance(obs_date, date):
+            result["status"] = "invalid_observation_date"
+            return result
+        result["latest_obs_date"] = obs_date.isoformat()
+        release_date = row[2].date() if isinstance(row[2], datetime) else row[2]
+        if not isinstance(release_date, date):
+            result["status"] = "invalid_release_date"
+            return result
+        result["latest_release_date"] = release_date.isoformat()
+        if release_date > today_utc:
+            result["status"] = "future_release_date"
+            return result
+        if (target_date - obs_date).days > max_age_days:
+            result["status"] = "stale_canonical_price"
+            return result
+        try:
+            price = float(row[0])
+        except (TypeError, ValueError):
+            result["status"] = "invalid_canonical_price"
+            return result
+        if not (0 < price < float("inf")):
+            result["status"] = "invalid_canonical_price"
+            return result
+        if obs_date >= today_utc:
+            result["status"] = "open_observation_day"
+            return result
+        result["status"] = "ok"
+        result["price"] = price
+        return result
 
     def _scored_prediction_date_range(self, *, horizon_label: str | None = None) -> tuple[date | None, date | None] | None:
         filters = []
