@@ -137,7 +137,7 @@ def _fetch_raw_rows(
 
 
 def _load_price_history(engine: Engine, *, years: int) -> dict[str, list[tuple[date, float]]]:
-    """Load deduped Yahoo adjusted-close history for chart candidate universes.
+    """Load deduped stored price history for chart candidate universes.
 
     Performance design
     ------------------
@@ -221,6 +221,58 @@ def _load_price_history(engine: Engine, *, years: int) -> dict[str, list[tuple[d
     return dict(history)
 
 
+def _history_source_metadata(history: dict[str, list[tuple[date, float]]]) -> dict[str, Any]:
+    """Describe storage and declared basis of tickers actually returned.
+
+    A ``*_full`` resolved feature does not prove its underlying price basis;
+    do not call the mixed result Yahoo adjusted close merely because the
+    separate frontier raw-series identifiers carry ``adj_close``.
+    """
+    raw_tickers = set(FRONTIER_RAW_HISTORY_TICKERS)
+    resolved_features = {
+        **_RESOLVED_TICKER_TO_FEATURE,
+        **{ticker: f"{ticker.lower()}_full" for ticker in FRONTIER_THEMATIC_UNIVERSE
+           if ticker not in raw_tickers},
+    }
+    by_ticker: dict[str, dict[str, str]] = {}
+    for ticker in sorted(history):
+        if ticker in resolved_features:
+            by_ticker[ticker] = {
+                "storage": "resolved_series",
+                "series": resolved_features[ticker],
+                "price_basis": "unknown",
+            }
+        elif ticker in raw_tickers:
+            by_ticker[ticker] = {
+                "storage": "raw_series",
+                "series": f"YF:{ticker}:adj_close",
+                "price_basis": "declared_adj_close_unverified",
+            }
+        else:
+            by_ticker[ticker] = {
+                "storage": "unknown", "series": "unknown", "price_basis": "unknown",
+            }
+
+    def label(tickers) -> str:
+        stores = {by_ticker[ticker]["storage"] for ticker in tickers if ticker in by_ticker}
+        if stores == {"resolved_series"}:
+            return "resolved_series:ticker_full"
+        if stores == {"raw_series"}:
+            return "raw_series:YF:*:adj_close"
+        if stores == {"resolved_series", "raw_series"}:
+            return "mixed:resolved_series+raw_series"
+        return "unknown"
+
+    return {
+        "source": label(history),
+        "frontier_source": label(FRONTIER_THEMATIC_UNIVERSE),
+        "price_basis": "unknown" if any(
+            item["price_basis"] == "unknown" for item in by_ticker.values()
+        ) else "declared_adj_close_unverified" if by_ticker else "unknown",
+        "source_by_ticker": by_ticker,
+    }
+
+
 async def _read_private_upload(file: UploadFile) -> bytes:
     content = await file.read()
     if not content:
@@ -277,8 +329,7 @@ async def weekly_ten_year_portfolio(
         )
         result["universe"] = {
             **result["universe"],
-            "source": "raw_series:yfinance_adjusted_close",
-            "frontier_source": "resolved_series:ticker_full",
+            **_history_source_metadata(history),
             "input_universe_size": len(set(DEFAULT_CHART_UNIVERSE)),
             "input_universe": "dad_chart_core_universe",
             "frontier_input_universe_size": len(set(FRONTIER_THEMATIC_UNIVERSE)),
@@ -287,7 +338,7 @@ async def weekly_ten_year_portfolio(
             return {
                 **result,
                 "status": "empty",
-                "message": "No eligible Yahoo adjusted-close price history found.",
+                "message": "No eligible stored price history found.",
             }
         return result
     except Exception as exc:

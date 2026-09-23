@@ -28,6 +28,9 @@ vi.mock('../api.js', () => ({
 const HEALTHY_RESULT = {
     status: 'ok',
     as_of: '2026-09-12',
+    as_of_basis: 'latest_observation_on_any_loaded_ticker',
+    oldest_ticker_latest_date: '2026-09-08',
+    mixed_latest_dates: true,
     capital: 1000000,
     benchmark: {
         ticker: 'QQQ',
@@ -35,7 +38,7 @@ const HEALTHY_RESULT = {
         total_return: 1.2,
         sparkline: [{ value: 100 }, { value: 115 }],
     },
-    universe: { ranked_candidates: 5 },
+    universe: { ranked_candidates: 5, source: 'mixed:resolved_series+raw_series' },
     ranked: [],
     profiles: [
         {
@@ -58,6 +61,7 @@ const HEALTHY_RESULT = {
             allocations: [
                 {
                     ticker: 'AAPL',
+                    last_date: '2026-09-08',
                     score: 8.2,
                     cagr: 0.22,
                     relative_cagr: 0.05,
@@ -84,18 +88,18 @@ describe('TenYearPortfolio API status handling', () => {
     it('shows no "$0", no stuck "loading", and the router message when status is "empty"', async () => {
         api.getTenYearPortfolio.mockResolvedValue({
             status: 'empty',
-            message: 'No eligible Yahoo adjusted-close price history found.',
+            message: 'No eligible stored price history found.',
         });
 
         render(<TenYearPortfolio />);
 
         await waitFor(() => {
-            expect(screen.getAllByText(/No eligible Yahoo adjusted-close price history found\./).length).toBeGreaterThan(0);
+            expect(screen.getAllByText(/No eligible stored price history found\./).length).toBeGreaterThan(0);
         });
 
         expect(screen.queryByText('$0')).not.toBeInTheDocument();
         expect(screen.queryByText('loading')).not.toBeInTheDocument();
-        expect(screen.getByText('As of').nextSibling.textContent).toBe('—');
+        expect(screen.getByText('Latest loaded date').nextSibling.textContent).toBe('—');
     });
 
     it('shows an explicit error state (not a stuck loader) when status is "error"', async () => {
@@ -112,7 +116,7 @@ describe('TenYearPortfolio API status handling', () => {
 
         expect(screen.queryByText('$0')).not.toBeInTheDocument();
         expect(screen.queryByText('loading')).not.toBeInTheDocument();
-        expect(screen.getByText('As of').nextSibling.textContent).toBe('—');
+        expect(screen.getByText('Latest loaded date').nextSibling.textContent).toBe('—');
     });
 
     it('renders the healthy sample unchanged (real numbers, no placeholders)', async () => {
@@ -121,8 +125,12 @@ describe('TenYearPortfolio API status handling', () => {
         render(<TenYearPortfolio />);
 
         await waitFor(() => {
-            expect(screen.getByText('As of').nextSibling.textContent).toBe('2026-09-12');
+            expect(screen.getByText('Latest loaded date').nextSibling.textContent).toBe('2026-09-12');
         });
+
+        expect(screen.getByText('Other tickers date back to 2026-09-08.')).toBeInTheDocument();
+        expect(screen.getByText('Resolved + raw stored series')).toBeInTheDocument();
+        expect(screen.getAllByText('2026-09-08').length).toBeGreaterThan(0);
 
         expect(screen.getByText('Steady big companies with strong long-term charts.')).toBeInTheDocument();
         expect(screen.getByText('15%')).toBeInTheDocument(); // max_position via pct(0.15, 0)
@@ -157,7 +165,7 @@ describe('TenYearPortfolio dad-mode (contributor) empty vs error copy', () => {
     it('says there is no data yet, not that loading failed, when status is "empty"', async () => {
         api.getTenYearPortfolio.mockResolvedValue({
             status: 'empty',
-            message: 'No eligible Yahoo adjusted-close price history found.',
+            message: 'No eligible stored price history found.',
         });
 
         render(<TenYearPortfolio />);

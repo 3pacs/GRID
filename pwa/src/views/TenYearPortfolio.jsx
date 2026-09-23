@@ -203,6 +203,7 @@ function PickTable({ picks }) {
                         <th>Drawdown</th>
                         <th>Target</th>
                         <th>Shares</th>
+                        <th>Last price date</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -221,6 +222,7 @@ function PickTable({ picks }) {
                             <td>{pct(pick.max_drawdown, 0)}</td>
                             <td>{money(pick.target_dollars)}</td>
                             <td>{pick.whole_shares?.toLocaleString?.() || 0}</td>
+                            <td>{pick.last_date || 'unknown'}</td>
                         </tr>
                     ))}
                 </tbody>
@@ -253,6 +255,7 @@ function CandidateTable({ candidates }) {
                         <th>Vs QQQ</th>
                         <th>Trend</th>
                         <th>Drawdown</th>
+                        <th>Last price date</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -271,6 +274,7 @@ function CandidateTable({ candidates }) {
                             <td className={pick.relative_cagr >= 0 ? 'ty-good' : 'ty-bad'}>{pct(pick.relative_cagr)}</td>
                             <td>{pct(pick.trend_r2, 0)}</td>
                             <td>{pct(pick.max_drawdown, 0)}</td>
+                            <td>{pick.last_date || 'unknown'}</td>
                         </tr>
                     ))}
                 </tbody>
@@ -775,8 +779,21 @@ export default function TenYearPortfolio() {
 
                 <aside className="ty-side">
                     <div className="ty-side-block">
-                        <span>As of</span>
+                        <span>Latest loaded date</span>
                         <strong>{loading ? 'loading' : (data?.as_of || '—')}</strong>
+                        {data?.mixed_latest_dates && (
+                            <small>Other tickers date back to {data.oldest_ticker_latest_date}.</small>
+                        )}
+                    </div>
+                    <div className="ty-side-block">
+                        <span>Price inputs</span>
+                        <strong>{data?.universe?.source === 'mixed:resolved_series+raw_series'
+                            ? 'Resolved + raw stored series'
+                            : data?.universe?.source === 'resolved_series:ticker_full'
+                                ? 'Resolved stored series'
+                                : data?.universe?.source === 'raw_series:YF:*:adj_close'
+                                    ? 'Raw Yahoo series'
+                                    : 'Source unverified'}</strong>
                     </div>
                     <div className="ty-side-block">
                         <span>Benchmark</span>
@@ -787,7 +804,7 @@ export default function TenYearPortfolio() {
                         <strong>{data?.universe?.ranked_candidates ?? 0} ranked</strong>
                     </div>
                     <div className="ty-note">
-                        Research screen, not financial advice. The first version uses GRID Yahoo price history and chart-quality rules; fundamentals can be added next.
+                        Research screen, not financial advice. This uses GRID stored price history and chart-quality rules. Resolved-series price basis is unverified; check each ticker's last price date.
                     </div>
                 </aside>
             </main>
