@@ -585,8 +585,7 @@ def pipeline_health(
                 text(
                     "SELECT sc.name, "
                     "  COALESCE(latest.last_pull, sc.last_pull_at) AS last_pull, "
-                    "  COALESCE(recent.recent_rows, 0) AS recent_rows, "
-                    "  COALESCE(series.series_count, 0) AS series_count "
+                    "  COALESCE(recent.recent_rows, 0) AS recent_rows "
                     "FROM source_catalog sc "
                     "LEFT JOIN LATERAL ("
                     "  SELECT rs.pull_timestamp AS last_pull "
@@ -601,19 +600,8 @@ def pipeline_health(
                     "  WHERE rs.source_id = sc.id "
                     "  AND rs.pull_timestamp >= NOW() - INTERVAL '48 hours'"
                     ") recent ON TRUE "
-                    "LEFT JOIN LATERAL ("
-                    "  SELECT COUNT(DISTINCT sampled.series_id) AS series_count "
-                    "  FROM ("
-                    "    SELECT rs.series_id "
-                    "    FROM raw_series rs "
-                    "    WHERE rs.source_id = sc.id "
-                    "    ORDER BY rs.pull_timestamp DESC "
-                    "    LIMIT :series_limit"
-                    "  ) sampled"
-                    ") series ON TRUE "
                     "ORDER BY sc.name"
                 ),
-                {"series_limit": _SERIES_COUNT_SAMPLE_LIMIT},
             ).fetchall()
             conn.execute(
                 text("SELECT set_config('statement_timeout', :timeout, true)"),
@@ -624,7 +612,6 @@ def pipeline_health(
                 src_name = row[0]
                 last_pull = row[1]
                 recent_rows = row[2]
-                series_count = row[3]
 
                 src_type = _SOURCE_TYPE_MAP.get(src_name, "unknown")
                 schedule_info = _SOURCE_SCHEDULE.get(src_name)
@@ -705,7 +692,10 @@ def pipeline_health(
                     rows_last_pull=recent_rows,
                     next_scheduled=next_scheduled,
                     freshness=freshness,
-                    series_count=series_count,
+                    # The sampled distinct count required up to 50,000 heap
+                    # fetches per source, yet this view does not display it.
+                    # Leave the nullable API field unknown, rather than 0.
+                    series_count=None,
                     field_record=field_record.to_dict(),
                 ))
 

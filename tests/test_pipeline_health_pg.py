@@ -132,3 +132,76 @@ def test_optional_postgres_failure_is_visible_and_resolver_continues(pipeline_pg
     assert data["summary"]["total_sources"] == 2
     assert data["coverage"]["by_family"]["market"]["with_data"] == 1
     assert data["resolver_status"]["pending"] == 1
+
+
+def test_source_query_avoids_sample_and_preserves_health_values(pipeline_pg):
+    """Compare the actual route SQL with its former sampled-count query on PG."""
+    with pipeline_pg.begin() as conn:
+        conn.execute(text("CREATE INDEX idx_raw_series_source_pull ON raw_series (source_id, pull_timestamp DESC)"))
+        conn.execute(text(
+            "INSERT INTO raw_series (source_id, series_id, pull_timestamp, pull_status) "
+            "SELECT 1, 'series-' || (g % 1000), now() - (g % 72) * interval '1 hour', 'SUCCESS' "
+            "FROM generate_series(1, 50000) AS g"
+        ))
+        conn.execute(text(
+            "INSERT INTO raw_series (source_id, series_id, pull_timestamp, pull_status) "
+            "SELECT 2, 'series-' || (g % 400), now() - (g % 240) * interval '1 hour', 'SUCCESS' "
+            "FROM generate_series(1, 20000) AS g"
+        ))
+        conn.execute(text("ANALYZE raw_series"))
+
+    captured = []
+
+    def capture_source(_conn, _cursor, statement, parameters, _context, _many):
+        if "FROM source_catalog sc" in statement:
+            captured.append((statement, parameters))
+
+    event.listen(pipeline_pg, "before_cursor_execute", capture_source)
+    try:
+        response = _response(pipeline_pg)
+    finally:
+        event.remove(pipeline_pg, "before_cursor_execute", capture_source)
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["availability"] == "available"
+    assert payload["summary"]["total_sources"] == 2
+    assert all(source["series_count"] is None for source in payload["sources"])
+    assert len(captured) == 1
+    candidate_sql, candidate_params = captured[0]
+    assert "COUNT(DISTINCT sampled.series_id)" not in candidate_sql
+
+    old_sql = candidate_sql.replace(
+        "COALESCE(recent.recent_rows, 0) AS recent_rows ",
+        "COALESCE(recent.recent_rows, 0) AS recent_rows, "
+        "COALESCE(series.series_count, 0) AS series_count ",
+    ).replace(
+        "ORDER BY sc.name",
+        "LEFT JOIN LATERAL ("
+        "  SELECT COUNT(DISTINCT sampled.series_id) AS series_count "
+        "  FROM (SELECT rs.series_id FROM raw_series rs "
+        "        WHERE rs.source_id = sc.id ORDER BY rs.pull_timestamp DESC "
+        "        LIMIT %(series_limit)s) sampled"
+        ") series ON TRUE ORDER BY sc.name",
+    )
+    with pipeline_pg.connect() as conn:
+        candidate_rows = conn.exec_driver_sql(candidate_sql, candidate_params).fetchall()
+        original_rows = conn.exec_driver_sql(old_sql, {"series_limit": 50_000}).fetchall()
+        assert [tuple(row[:3]) for row in candidate_rows] == [tuple(row[:3]) for row in original_rows]
+        assert all(row[3] > 0 for row in original_rows)
+        candidate_plan = conn.exec_driver_sql(
+            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + candidate_sql, candidate_params
+        ).scalar_one()[0]
+        original_plan = conn.exec_driver_sql(
+            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + old_sql,
+            {"series_limit": 50_000},
+        ).scalar_one()[0]
+    print(
+        "pipeline_source_pg_plan "
+        f"rows={len(candidate_rows)} raw_fixture_rows=70001 "
+        f"candidate_ms={candidate_plan['Execution Time']:.3f} "
+        f"original_ms={original_plan['Execution Time']:.3f} "
+        f"candidate_shared_hit={candidate_plan['Plan'].get('Shared Hit Blocks', 0)} "
+        f"original_shared_hit={original_plan['Plan'].get('Shared Hit Blocks', 0)} "
+        f"candidate_shared_read={candidate_plan['Plan'].get('Shared Read Blocks', 0)} "
+        f"original_shared_read={original_plan['Plan'].get('Shared Read Blocks', 0)}"
+    )
