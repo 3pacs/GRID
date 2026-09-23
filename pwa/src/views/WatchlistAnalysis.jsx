@@ -1129,7 +1129,9 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
     const [priceLoading, setPriceLoading] = useState(false);
     const [gexData, setGexData] = useState(null);
     const [gexLoading, setGexLoading] = useState(true);
+    const [gexAvailability, setGexAvailability] = useState(null);
     const [vannaCharmData, setVannaCharmData] = useState(null);
+    const [vannaCharmAvailability, setVannaCharmAvailability] = useState(null);
     const [flowTimelineData, setFlowTimelineData] = useState(null);
     const [secondaryLoading, setSecondaryLoading] = useState(true);
     const [edgeData, setEdgeData] = useState(null);
@@ -1137,6 +1139,7 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
 
     useEffect(() => {
         if (!ticker) return;
+        let active = true;
 
         // Reset state for new ticker
         setData(null);
@@ -1146,7 +1149,9 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
         setOverviewLoading(true);
         setGexData(null);
         setGexLoading(true);
+        setGexAvailability(null);
         setVannaCharmData(null);
+        setVannaCharmAvailability(null);
         setFlowTimelineData(null);
         setSecondaryLoading(true);
         setEdgeData(null);
@@ -1188,18 +1193,22 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
             api.getVannaCharm(ticker),
             api.getFlowTimeline(ticker, 90),
         ]).then(([gexResult, vcResult, ftResult]) => {
-            if (gexResult.status === 'fulfilled' && !gexResult.value?.error) {
-                setGexData(gexResult.value);
-            }
+            if (!active) return;
+            const gex = gexResult.status === 'fulfilled' ? gexResult.value : null;
+            const hasGexProfile = (gex?.profile?.length || 0) > 0 || (gex?.per_strike?.length || 0) > 0;
+            setGexData(!gex?.error && hasGexProfile ? gex : null);
+            setGexAvailability(gex?.error || !gex ? 'unavailable' : hasGexProfile ? 'available' : 'empty');
             setGexLoading(false);
-            if (vcResult.status === 'fulfilled' && !vcResult.value?.error) {
-                setVannaCharmData(vcResult.value);
-            }
+            const vannaCharm = vcResult.status === 'fulfilled' ? vcResult.value : null;
+            const hasVannaCharm = vannaCharm?.vanna_exposure != null || vannaCharm?.charm_exposure != null;
+            setVannaCharmData(!vannaCharm?.error && hasVannaCharm ? vannaCharm : null);
+            setVannaCharmAvailability(vannaCharm?.error || !vannaCharm ? 'unavailable' : hasVannaCharm ? 'available' : 'empty');
             if (ftResult.status === 'fulfilled' && !ftResult.value?.error) {
                 setFlowTimelineData(ftResult.value);
             }
             setSecondaryLoading(false);
         });
+        return () => { active = false; };
     }, [ticker]);
 
     const handlePeriodChange = useCallback(async (newPeriod) => {
@@ -1377,10 +1386,14 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
                     <div style={{ gridColumn: '1 / -1' }}>
                         <OverviewSkeleton />
                     </div>
+                ) : gexAvailability !== 'available' ? (
+                    <div role="status" style={{ gridColumn: '1 / -1', color: colors.textMuted, fontSize: '11px' }}>
+                        {gexAvailability === 'empty' ? 'No GEX profile data available.' : 'GEX profile unavailable.'}
+                    </div>
                 ) : null}
 
                 {/* Vanna / Charm Compass */}
-                {vannaCharmData && (
+                {vannaCharmData ? (
                     <div style={{ gridColumn: '1 / -1' }}>
                         {isMobile ? (
                             <CollapsibleSection title="VANNA / CHARM" defaultExpanded={false}
@@ -1389,7 +1402,11 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
                             <VannaCharmViz ticker={ticker} vannaCharmData={vannaCharmData} />
                         )}
                     </div>
-                )}
+                ) : !secondaryLoading && vannaCharmAvailability !== 'available' ? (
+                    <div role="status" style={{ gridColumn: '1 / -1', color: colors.textMuted, fontSize: '11px' }}>
+                        {vannaCharmAvailability === 'empty' ? 'No vanna/charm data available.' : 'Vanna/charm unavailable.'}
+                    </div>
+                ) : null}
 
                 {/* Flow Timeline */}
                 {flowTimelineData ? (
