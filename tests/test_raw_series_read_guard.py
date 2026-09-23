@@ -37,7 +37,7 @@ LEGACY_UNFILTERED_READS: dict[str, int] = {
     "analysis/thesis_scorer.py": 14,
     "api/routers/dad.py": 3,
     "api/routers/flows.py": 1,
-    "api/routers/system.py": 7,
+    "api/routers/system.py": 6,
     "api/routers/tradingview.py": 1,
     "api/routers/watchlist_analysis.py": 1,
     "api/routers/watchlist_helpers.py": 1,

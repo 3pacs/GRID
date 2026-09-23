@@ -77,6 +77,8 @@ jobs:
       - name: Run tests
         env:
           DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          # Explicit opt-in for the isolated briefing route PostgreSQL test.
+          GRID_BRIEFING_ROUTE_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
           # config.py now rejects an empty DB_PASSWORD unconditionally (see
           # the 2026-09-13 incident) — must match the postgres service
           # password above so Settings() construction doesn't fail collection.
@@ -127,6 +129,21 @@ jobs:
           echo "::endgroup::"
           exit "$pytest_status"
 
+      - name: Pipeline health PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_PIPELINE_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_pipeline_health_pg.py -q -rA
+
+      - name: Watchlist edge PostgreSQL identity contract
+        env:
+          GRID_WATCHLIST_EDGE_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+        run: python -m pytest tests/test_watchlist_edge_readonly_pg.py -q -rA
+
       # The general suite leaves GRID_TEST_DB_URL unset. Gate both producer
       # and resolver contracts against the isolated disposable PG schemas.
       # test_spy_binance_composition_pg.py proves the two policies resolve
@@ -141,6 +158,22 @@ jobs:
           GRID_JWT_SECRET: test-secret-ci
           TESTING: "true"
         run: python -m pytest tests/test_spy_price_receipt_pg.py tests/test_binance_canonical_close_pg.py tests/test_spy_binance_composition_pg.py -q -rA
+
+      - name: Portfolio GET PostgreSQL read contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_watchlist_portfolio_pg.py -q -rA
+
+      - name: Snapshot GET PostgreSQL read contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_snapshots_readonly_pg.py -q -rA
 
       - name: Dad gold read-only PostgreSQL contract
         env:
