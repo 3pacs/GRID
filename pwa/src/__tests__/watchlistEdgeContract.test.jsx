@@ -41,7 +41,7 @@ describe('watchlist edge contract', () => {
             congressional: [{ member: 'A', action: 'BUY', trust_score: null }],
             convergence: {
                 status: 'detected', signal_type: 'BUY', direction: 'bullish',
-                source_count: 3, scored_source_count: 0, confidence: null,
+                source_count: 3, non_null_trust_score_count: 0, confidence: null,
                 confidence_basis: 'unscored',
             },
         };
@@ -53,8 +53,8 @@ describe('watchlist edge contract', () => {
         rerender(<InsiderEdgePanel edgeData={{
             ...edgeData,
             convergence: {
-                ...edgeData.convergence, scored_source_count: 3, confidence: 0,
-                confidence_basis: 'mean_trust_of_scored_sources',
+                ...edgeData.convergence, non_null_trust_score_count: 3, confidence: 0,
+                confidence_basis: 'mean_non_null_persisted_trust_scores',
             },
         }} loading={false} />);
         expect(screen.getByText(/3 sources bullish.*0%/)).toBeInTheDocument();
