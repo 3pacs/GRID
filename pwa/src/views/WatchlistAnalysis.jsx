@@ -1212,16 +1212,13 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
                 || (Array.isArray(perStrike) && perStrike.length > 0);
             const validRows = (rows, x, y) => !Array.isArray(rows) || rows.every(row =>
                 row && typeof row === 'object' && Number.isFinite(row[x]) && Number.isFinite(row[y]));
-            const validGex = (profile == null || Array.isArray(profile))
-                && (perStrike == null || Array.isArray(perStrike))
+            const validGex = Array.isArray(profile) && Array.isArray(perStrike)
                 && Number.isFinite(gex?.spot) && gex.spot > 0
                 && Number.isFinite(gex?.gex_aggregate)
                 && validRows(profile, 'spot', 'gex')
                 && validRows(perStrike, 'strike', 'net_gex');
             setGexData(!gex?.error && hasGexProfile && validGex ? gex : null);
-            setGexAvailability(gex?.error || !gex || (hasGexProfile && !validGex)
-                || (profile != null && !Array.isArray(profile))
-                || (perStrike != null && !Array.isArray(perStrike))
+            setGexAvailability(gex?.error || !validGex
                 ? 'unavailable' : hasGexProfile ? 'available' : 'empty');
             setGexLoading(false);
             const vannaCharm = vcResult.status === 'fulfilled' ? vcResult.value : null;

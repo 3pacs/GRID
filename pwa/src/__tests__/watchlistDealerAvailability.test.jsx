@@ -58,13 +58,24 @@ describe('Watchlist dealer availability', () => {
     });
 
     it('distinguishes checked-empty GEX from missing vanna evidence', async () => {
-        api.getGEXProfile.mockResolvedValue({ ticker: 'AAPL', profile: [], per_strike: [], gex_aggregate: 0 });
+        api.getGEXProfile.mockResolvedValue({ ticker: 'AAPL', profile: [], per_strike: [], spot: 100, gex_aggregate: 0 });
         api.getVannaCharm.mockResolvedValue({ ticker: 'AAPL', vanna_exposure: null, charm_exposure: null });
         render(<WatchlistAnalysis ticker="AAPL" onBack={() => {}} />);
 
         expect(await screen.findByText('No GEX profile data available.')).toBeInTheDocument();
         expect(screen.getByText('Vanna/charm unavailable.')).toBeInTheDocument();
         expect(screen.queryByTestId('gex-profile')).not.toBeInTheDocument();
+    });
+
+    it('treats absent GEX metrics as unavailable without affirmative empty evidence', async () => {
+        api.getGEXProfile.mockResolvedValue({
+            ticker: 'AAPL', profile: null, per_strike: null, spot: null, gex_aggregate: null,
+        });
+        api.getVannaCharm.mockResolvedValue({ ticker: 'AAPL' });
+        render(<WatchlistAnalysis ticker="AAPL" onBack={() => {}} />);
+        expect(await screen.findByText('GEX profile unavailable.')).toBeInTheDocument();
+        expect(screen.getByText('Vanna/charm unavailable.')).toBeInTheDocument();
+        expect(screen.queryByText('No GEX profile data available.')).not.toBeInTheDocument();
     });
 
     it.each([
@@ -162,7 +173,7 @@ describe('Watchlist dealer availability', () => {
         api.getGEXProfile.mockResolvedValue({ error: 'No options data' });
         api.getVannaCharm.mockResolvedValue({ error: 'No options data' });
         const { rerender } = render(<WatchlistAnalysis ticker="AAPL" onBack={() => {}} />);
-        expect(await screen.findByTestId('chart-values')).toHaveTextContent('100');
+        await waitFor(() => expect(screen.getByTestId('chart-values')).toHaveTextContent('100'));
         await act(async () => { screen.getByText('Switch period').click(); });
         rerender(<WatchlistAnalysis ticker="MSFT" onBack={() => {}} />);
         await waitFor(() => expect(screen.getByTestId('chart-values')).toHaveTextContent('200'));
