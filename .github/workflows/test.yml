@@ -325,6 +325,9 @@ jobs:
       - name: Deploy pipeline — atomic release swap (failure injection)
         run: bash tests/deploy/test_deploy_release_swap.sh
 
+      - name: Deploy pipeline — immutable runtime preservation
+        run: bash tests/deploy/test_runtime_preservation.sh
+
       # Failure-injection proof for scripts/deploy_verify_release_tree.sh,
       # the resolved-cwd + independent-SHA check every "verify running the
       # deployed tree" step in deploy.yml now shares. Added after the

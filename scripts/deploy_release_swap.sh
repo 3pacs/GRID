@@ -219,16 +219,22 @@ if [ "${test_only_skip_preservation:-0}" != 1 ]; then
     exit 5
   fi
   mapfile -t preservation_lines < "$PRESERVATION_FILE"
-  if [ "${#preservation_lines[@]}" -ne 3 ] ||
+  if [ "${#preservation_lines[@]}" -ne 6 ] ||
      [[ "${preservation_lines[0]}" != scheduler=* ]] ||
      [[ "${preservation_lines[1]}" != recovery=* ]] ||
-     [[ "${preservation_lines[2]}" != scheduler_sha=* ]]; then
-    echo "invalid runtime preservation record: expected scheduler, recovery, scheduler_sha" >&2
+     [[ "${preservation_lines[2]}" != scheduler_sha=* ]] ||
+     [[ "${preservation_lines[3]}" != scheduler_tree=* ]] ||
+     [[ "${preservation_lines[4]}" != recovery_sha=* ]] ||
+     [[ "${preservation_lines[5]}" != recovery_tree=* ]]; then
+    echo "invalid runtime preservation record: expected two paths and their SHA/tree identities" >&2
     exit 5
   fi
   scheduler_dir="${preservation_lines[0]#scheduler=}"
   recovery_dir="${preservation_lines[1]#recovery=}"
   scheduler_sha="${preservation_lines[2]#scheduler_sha=}"
+  scheduler_tree="${preservation_lines[3]#scheduler_tree=}"
+  recovery_sha="${preservation_lines[4]#recovery_sha=}"
+  recovery_tree="${preservation_lines[5]#recovery_tree=}"
   releases_root="$(realpath -e -- "$RELEASES_DIR")"
   if [ "$releases_root" != "$RELEASES_DIR" ]; then
     echo "release root must be an absolute canonical directory: $RELEASES_DIR" >&2
@@ -242,11 +248,20 @@ if [ "${test_only_skip_preservation:-0}" != 1 ]; then
       exit 5
     fi
   done
-  if [[ ! "$scheduler_sha" =~ ^[0-9a-f]{40}$ ]] ||
-     [ "$(git -C "$scheduler_dir" rev-parse HEAD 2>/dev/null || true)" != "$scheduler_sha" ]; then
-    echo "scheduler preservation SHA does not match its release folder" >&2
-    exit 5
-  fi
+  verify_preserved_checkout() {
+    local name="$1" dir="$2" expected_sha="$3" expected_tree="$4"
+    if [[ ! "$expected_sha" =~ ^[0-9a-f]{40}$ ]] ||
+       [[ ! "$expected_tree" =~ ^[0-9a-f]{40}$ ]] ||
+       [ "$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null || true)" != "$dir" ] ||
+       [ "$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)" != "$expected_sha" ] ||
+       [ "$(git -C "$dir" rev-parse 'HEAD^{tree}' 2>/dev/null || true)" != "$expected_tree" ] ||
+       ! git -C "$dir" diff --quiet HEAD --; then
+      echo "$name preservation Git HEAD/tree or tracked files do not match approved identity" >&2
+      exit 5
+    fi
+  }
+  verify_preserved_checkout scheduler "$scheduler_dir" "$scheduler_sha" "$scheduler_tree"
+  verify_preserved_checkout recovery "$recovery_dir" "$recovery_sha" "$recovery_tree"
   scheduler_pid="$(systemctl show -p MainPID --value grid-scheduler 2>/dev/null || true)"
   scheduler_workdir="$(systemctl show -p WorkingDirectory --value grid-scheduler 2>/dev/null || true)"
   if [[ ! "$scheduler_pid" =~ ^[1-9][0-9]*$ ]] ||

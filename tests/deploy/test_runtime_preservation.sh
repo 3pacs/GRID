@@ -4,17 +4,22 @@ set -euo pipefail
 repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 swap="$repo/scripts/deploy_release_swap.sh"
 box="$(mktemp -d)"
-trap 'kill "${scheduler_pid:-}" 2>/dev/null || true; rm -rf "$box"' EXIT
+trap 'kill "${scheduler_pid:-}" "${activated_pid:-}" 2>/dev/null || true; rm -rf "$box"' EXIT
 live="$box/grid_release"
 root="${live}.releases"
 mkdir -p "$root/scheduler-old" "$root/recovery-old" "$root/current" "$box/bin"
 for dir in scheduler-old recovery-old current; do
   printf '%s\n' "$dir" > "$root/$dir/marker.txt"
 done
-git -C "$root/scheduler-old" init -q
-git -C "$root/scheduler-old" -c user.name=Test -c user.email=test@example.invalid add marker.txt
-git -C "$root/scheduler-old" -c user.name=Test -c user.email=test@example.invalid commit -qm initial
-sha="$(git -C "$root/scheduler-old" rev-parse HEAD)"
+for dir in scheduler-old recovery-old; do
+  git -C "$root/$dir" init -q
+  git -C "$root/$dir" add marker.txt
+  git -C "$root/$dir" -c user.name=Test -c user.email=test@example.invalid commit -qm initial
+done
+scheduler_sha="$(git -C "$root/scheduler-old" rev-parse HEAD)"
+scheduler_tree="$(git -C "$root/scheduler-old" rev-parse 'HEAD^{tree}')"
+recovery_sha="$(git -C "$root/recovery-old" rev-parse HEAD)"
+recovery_tree="$(git -C "$root/recovery-old" rev-parse 'HEAD^{tree}')"
 ln -s "$root/current" "$live"
 cat > "$box/bin/systemctl" <<'SH'
 #!/usr/bin/env bash
@@ -36,8 +41,9 @@ scheduler_pid=$!
 export TEST_SCHEDULER_PID="$scheduler_pid" TEST_SCHEDULER_WORKDIR="$root/scheduler-old"
 export PATH="$box/bin:$PATH"
 record="$root/.runtime-preservation"
-printf 'scheduler=%s\nrecovery=%s\nscheduler_sha=%s\n' \
-  "$root/scheduler-old" "$root/recovery-old" "$sha" > "$record"
+printf 'scheduler=%s\nrecovery=%s\nscheduler_sha=%s\nscheduler_tree=%s\nrecovery_sha=%s\nrecovery_tree=%s\n' \
+  "$root/scheduler-old" "$root/recovery-old" "$scheduler_sha" "$scheduler_tree" \
+  "$recovery_sha" "$recovery_tree" > "$record"
 
 fail_without_swap() {
   local expected="$1" label="$2"
@@ -62,6 +68,18 @@ fail_without_swap "$root/current" outside-target
 sed -i "s|^recovery=.*|recovery=$root/gone|" "$record"
 fail_without_swap "$root/current" missing-target
 sed -i "s|^recovery=.*|recovery=$root/recovery-old|" "$record"
+sed -i 's/^recovery_sha=.*/recovery_sha=0000000000000000000000000000000000000000/' "$record"
+fail_without_swap "$root/current" wrong-recovery-sha
+sed -i "s|^recovery_sha=.*|recovery_sha=$recovery_sha|" "$record"
+sed -i 's/^recovery_tree=.*/recovery_tree=0000000000000000000000000000000000000000/' "$record"
+fail_without_swap "$root/current" wrong-recovery-tree
+sed -i "s|^recovery_tree=.*|recovery_tree=$recovery_tree|" "$record"
+sed -i '/^recovery_sha=/d' "$record"
+fail_without_swap "$root/current" missing-recovery-sha
+sed -i "/^recovery_tree=/i recovery_sha=$recovery_sha" "$record"
+printf '%s\n' altered > "$root/recovery-old/marker.txt"
+fail_without_swap "$root/current" dirty-recovery-tree
+git -C "$root/recovery-old" restore marker.txt
 TEST_SCHEDULER_WORKDIR="$live" fail_without_swap "$root/current" mutable-unit
 
 # Old scheduler dir sorts last by mtime; both protected identities survive
@@ -78,4 +96,11 @@ test ! -d "$root/current"
 # Retrying the live label is a no-op, including when it is a protected path.
 bash "$swap" "$live" next-2 "$box/build" overwritten > "$box/same.log" 2>&1
 test "$(cat "$live/marker.txt")" = next-2
-echo 'PASS: runtime preservation, two swaps, invalid targets, and same release'
+
+# After an acknowledged scheduler activation, the old record must stop the
+# next deployment until the controller updates both approved identities.
+( cd "$root/next-2" && exec sleep 120 ) &
+activated_pid=$!
+TEST_SCHEDULER_PID="$activated_pid" TEST_SCHEDULER_WORKDIR="$root/next-2" \
+  fail_without_swap "$root/next-2" stale-after-activation
+echo 'PASS: runtime preservation, two swaps, invalid identities, same release, and stale activation record'
