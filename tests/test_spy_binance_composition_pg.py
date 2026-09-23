@@ -40,6 +40,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.engine.url import make_url
 
 from binance_close_contract import CANONICAL_CLOSE_SERIES
+from normalization.entity_map import EntityMap
 from normalization.resolver import Resolver
 from price_close_contract import SPY_CLOSE_SERIES, capture_payload
 
@@ -167,6 +168,16 @@ def _insert_binance_raw(conn, obs_date: date, pulled_at: datetime, price: float)
     """), {"od": obs_date, "ts": pulled_at, "val": price, "payload": json.dumps(evidence)})
 
 
+def _insert_unmarked_spy_raw(
+    conn, series_id: str, obs_date: date, pulled_at: datetime, price: float,
+) -> None:
+    conn.execute(text("""
+        INSERT INTO raw_series
+            (series_id, source_id, obs_date, pull_timestamp, value, raw_payload, pull_status)
+        VALUES (:sid, 1, :od, :ts, :val, NULL, 'SUCCESS')
+    """), {"sid": series_id, "od": obs_date, "ts": pulled_at, "val": price})
+
+
 def test_spy_and_binance_resolve_together_in_one_partition_without_interference(
     composed_pg_engine: Engine,
 ) -> None:
@@ -223,3 +234,57 @@ def test_spy_and_binance_resolve_together_in_one_partition_without_interference(
         f"spy_resolved=1 btc_resolved=1 receipts={len(receipts)} "
         f"canonical_series_member={'binance.BTCUSDT.close' in CANONICAL_CLOSE_SERIES}"
     )
+
+
+def test_spy_adjusted_close_cannot_displace_marked_unadjusted_close(
+    composed_pg_engine: Engine,
+) -> None:
+    engine = composed_pg_engine
+    now = datetime.now(timezone.utc)
+    obs = (now - timedelta(days=2)).date()
+    pulled_at = datetime.combine(obs + timedelta(days=1), time(1), timezone.utc)
+    assert pulled_at < now
+    entity_map = EntityMap(engine)
+    assert entity_map.get_feature_id("YF:SPY:adj_close") == 2791
+    assert entity_map.get_feature_id(SPY_CLOSE_SERIES) == 2791
+
+    with engine.begin() as conn:
+        _insert_unmarked_spy_raw(conn, "YF:SPY:adj_close", obs, pulled_at, 678.0)
+        _insert_spy_raw(conn, obs, pulled_at, 680.0)
+    result = Resolver(engine).resolve_pending(
+        workers=1, since=pulled_at - timedelta(hours=1),
+    )
+    assert result["errors"] == 0
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT rs.value, raw.series_id
+            FROM resolved_series rs
+            JOIN astrogrid.price_close_receipt pc ON pc.resolved_series_id = rs.id
+            JOIN raw_series raw ON raw.id = pc.raw_series_id
+            WHERE rs.feature_id = 2791
+        """)).fetchall()
+        assert [(row[0], row[1]) for row in rows] == [(680.0, SPY_CLOSE_SERIES)]
+        assert conn.execute(text("SELECT count(*) FROM resolved_series")).scalar_one() == 1
+        assert conn.execute(text("SELECT count(*) FROM astrogrid.price_close_receipt")).scalar_one() == 1
+    print("SPY_ADJ_CLOSE_BOUNDARY marked_close_resolved=1 adjusted_displaced=0 receipts=1")
+
+
+def test_spy_adjusted_close_without_marked_close_leaves_shared_feature_unresolved(
+    composed_pg_engine: Engine,
+) -> None:
+    engine = composed_pg_engine
+    now = datetime.now(timezone.utc)
+    obs = (now - timedelta(days=2)).date()
+    pulled_at = datetime.combine(obs + timedelta(days=1), time(1), timezone.utc)
+    assert pulled_at < now
+    with engine.begin() as conn:
+        _insert_unmarked_spy_raw(conn, "YF:SPY:adj_close", obs, pulled_at, 678.0)
+        _insert_unmarked_spy_raw(conn, SPY_CLOSE_SERIES, obs, pulled_at, 680.0)
+    result = Resolver(engine).resolve_pending(
+        workers=1, since=pulled_at - timedelta(hours=1),
+    )
+    assert result["errors"] == 0
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT count(*) FROM resolved_series")).scalar_one() == 0
+        assert conn.execute(text("SELECT count(*) FROM astrogrid.price_close_receipt")).scalar_one() == 0
+    print("SPY_ADJ_CLOSE_BOUNDARY no_marked_close=1 adjusted_suppressed=1 resolved=0 receipts=0")
