@@ -237,8 +237,9 @@ const SIGNAL_ICONS = {
     lever_pullers: '\u{1F3AF}',  // target
 };
 
-function TrustBar({ score, width = 48 }) {
-    const pct = Math.max(0, Math.min(1, score || 0));
+export function TrustBar({ score, width = 48 }) {
+    const scored = typeof score === 'number' && Number.isFinite(score);
+    const pct = scored ? Math.max(0, Math.min(1, score)) : 0;
     const barColor = pct >= 0.7 ? colors.green : pct >= 0.5 ? colors.yellow : colors.red;
     return (
         <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
@@ -246,14 +247,14 @@ function TrustBar({ score, width = 48 }) {
                 width: `${width}px`, height: '4px', borderRadius: '2px',
                 background: colors.borderSubtle, overflow: 'hidden',
             }}>
-                <div style={{
+                {scored && <div data-testid="trustbar-fill" style={{
                     width: `${pct * 100}%`, height: '100%',
                     background: barColor, borderRadius: '2px',
                     transition: 'width 0.3s ease',
-                }} />
+                }} />}
             </div>
             <span style={{ fontSize: '9px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace" }}>
-                {(pct * 100).toFixed(0)}
+                {scored ? (pct * 100).toFixed(0) : 'unscored'}
             </span>
         </div>
     );
@@ -291,7 +292,7 @@ function SignalCard({ icon, label, actor, action, date, trustScore, direction })
     );
 }
 
-function InsiderEdgePanel({ edgeData, loading }) {
+export function InsiderEdgePanel({ edgeData, loading }) {
     const [expanded, setExpanded] = useState(true);
 
     if (loading) return <OverviewSkeleton />;
@@ -337,8 +338,8 @@ function InsiderEdgePanel({ edgeData, loading }) {
                             background: `${dirColor}18`, color: dirColor,
                             border: `1px solid ${dirColor}40`,
                         }}>
-                            {convergence.source_count} sources {convergence.direction}
-                            {convergence.confidence ? ` \u00b7 ${(convergence.confidence * 100).toFixed(0)}%` : ''}
+                            {convergence.source_count} sources {convergence.direction || convergence.signal_type || 'direction unresolved'}
+                            {convergence.confidence != null ? ` \u00b7 ${(convergence.confidence * 100).toFixed(0)}%` : ' \u00b7 unscored'}
                         </span>
                     )}
                 </div>
