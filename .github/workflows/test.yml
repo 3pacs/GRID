@@ -129,13 +129,18 @@ jobs:
 
       # The general suite leaves GRID_TEST_DB_URL unset. Gate both producer
       # and resolver contracts against the isolated disposable PG schemas.
+      # test_spy_binance_composition_pg.py proves the two policies resolve
+      # correctly TOGETHER in one Resolver.resolve_pending() call -- the
+      # actual composition question this branch exists to answer -- and was
+      # added after this step was first written; it was never in this list
+      # and so never actually ran in CI despite CI reporting green.
       - name: SPY and Binance close PostgreSQL contracts
         env:
           GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
           DB_PASSWORD: testpass
           GRID_JWT_SECRET: test-secret-ci
           TESTING: "true"
-        run: python -m pytest tests/test_spy_price_receipt_pg.py tests/test_binance_canonical_close_pg.py -q -rA
+        run: python -m pytest tests/test_spy_price_receipt_pg.py tests/test_binance_canonical_close_pg.py tests/test_spy_binance_composition_pg.py -q -rA
 
       - name: Check for SQL injection patterns
         run: |
