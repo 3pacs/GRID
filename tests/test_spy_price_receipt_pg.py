@@ -41,11 +41,11 @@ def receipt_pg_engine() -> Engine:
     admin = create_engine(url)
     with admin.begin() as conn:
         conn.execute(text(f"CREATE SCHEMA {schema}"))
-        conn.execute(text("CREATE SCHEMA IF NOT EXISTS astrogrid"))
-        # Only the named disposable test database may be used here.
-        conn.execute(text("DROP TABLE IF EXISTS astrogrid.prediction_score"))
-        conn.execute(text("DROP TABLE IF EXISTS astrogrid.prediction_run"))
-        conn.execute(text("DROP TABLE IF EXISTS astrogrid.price_close_receipt"))
+        # This separately invoked CI proof owns the local disposable test DB.
+        # The general suite may have left AstroGrid tables with dependent FKs;
+        # reset its schema instead of dropping individual tables in FK order.
+        conn.execute(text("DROP SCHEMA IF EXISTS astrogrid CASCADE"))
+        conn.execute(text("CREATE SCHEMA astrogrid"))
     engine = create_engine(url, connect_args={"options": f"-csearch_path={schema},public"})
     migration = importlib.import_module("migrations.versions.spy_close_receipt_20260922")
     try:
@@ -117,9 +117,7 @@ def receipt_pg_engine() -> Engine:
     finally:
         engine.dispose()
         with admin.begin() as conn:
-            conn.execute(text("DROP TABLE IF EXISTS astrogrid.prediction_score"))
-            conn.execute(text("DROP TABLE IF EXISTS astrogrid.prediction_run"))
-            conn.execute(text("DROP TABLE IF EXISTS astrogrid.price_close_receipt"))
+            conn.execute(text("DROP SCHEMA IF EXISTS astrogrid CASCADE"))
             conn.execute(text(f"DROP SCHEMA IF EXISTS {schema} CASCADE"))
         admin.dispose()
 
