@@ -77,7 +77,7 @@ def test_watchlist_analysis_allows_unsaved_ticker(monkeypatch) -> None:
     assert body["price_source"] in {"live", "yfinance"}
 
 
-def test_options_recommendations_fall_back_to_saved_rows(monkeypatch) -> None:
+def test_options_recommendations_read_saved_rows(monkeypatch) -> None:
     client = _build_client(options_router)
     engine = _engine_with_results(
         _result(
@@ -104,11 +104,6 @@ def test_options_recommendations_fall_back_to_saved_rows(monkeypatch) -> None:
     )
 
     monkeypatch.setattr(options_module, "get_db_engine", lambda: engine)
-
-    def _missing_engine(_engine, *, force_refresh: bool = False) -> dict:
-        raise ImportError("missing recommender")
-
-    monkeypatch.setattr(options_module, "_generate_recommendations", _missing_engine)
 
     response = client.get("/api/v1/options/recommendations?ticker=NVDA")
 
