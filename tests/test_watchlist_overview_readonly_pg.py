@@ -1,7 +1,7 @@
 """Overview GET is useful and read-only on disposable PostgreSQL."""
 
 import os
-from datetime import date
+from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
@@ -32,7 +32,8 @@ def test_overview_populated_then_failed_price_read_uses_live_and_keeps_options_w
     with engine.begin() as conn:
         conn.execute(text("CREATE TABLE feature_registry (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"))
         conn.execute(text("""CREATE TABLE resolved_series (
-            feature_id INTEGER NOT NULL, obs_date DATE NOT NULL, value DOUBLE PRECISION)"""))
+            feature_id INTEGER NOT NULL, obs_date DATE NOT NULL,
+            vintage_date DATE NOT NULL, value DOUBLE PRECISION)"""))
         conn.execute(text("""CREATE TABLE options_daily_signals (
             ticker TEXT, signal_date DATE, put_call_ratio DOUBLE PRECISION,
             max_pain DOUBLE PRECISION, iv_atm DOUBLE PRECISION,
@@ -42,7 +43,10 @@ def test_overview_populated_then_failed_price_read_uses_live_and_keeps_options_w
             inferred_state TEXT, state_confidence DOUBLE PRECISION,
             grid_recommendation TEXT, decision_timestamp TIMESTAMPTZ)"""))
         conn.execute(text("INSERT INTO feature_registry VALUES (1, 'aapl_close')"))
-        conn.execute(text("INSERT INTO resolved_series VALUES (1, :today, 100.0)"), {"today": date.today()})
+        conn.execute(text("INSERT INTO resolved_series VALUES (1, :today, :today, 100.0)"),
+                     {"today": date.today()})
+        conn.execute(text("INSERT INTO resolved_series VALUES (1, :prior, :prior, 90.0)"),
+                     {"prior": date.today() - timedelta(days=1)})
         conn.execute(text("""INSERT INTO options_daily_signals
             (ticker, signal_date, put_call_ratio, max_pain, iv_atm, iv_skew, spot_price, total_oi)
             VALUES ('AAPL', :today, 0.5, 105, 0.2, 0.9, 100, 1000)"""), {"today": date.today()})
@@ -71,6 +75,11 @@ def test_overview_populated_then_failed_price_read_uses_live_and_keeps_options_w
                 assert populated.status_code == 200
                 assert populated.json()["sentiment"] == "bullish"
                 assert {item["label"]: item["value"] for item in populated.json()["key_levels"]}["Last"] == 100.0
+                stored_quote = client.get("/api/v1/watchlist/AAPL/quote")
+                assert stored_quote.status_code == 200
+                assert stored_quote.json()["price"] == 100.0
+                assert stored_quote.json()["source"] == "grid"
+                assert stored_quote.json()["put_call_ratio"] == 0.5
                 live.assert_not_called()
                 assert not any(sql.startswith(("CREATE", "ALTER", "INSERT", "UPDATE", "DELETE"))
                                for sql in statements)
@@ -86,7 +95,12 @@ def test_overview_populated_then_failed_price_read_uses_live_and_keeps_options_w
                 assert {item["label"]: item["value"] for item in fallback.json()["key_levels"]}["Max Pain"] == 105.0
                 assert fallback.json()["sentiment"] == "bullish"
                 assert any(section["title"] == "Options Flow" for section in fallback.json()["sections"])
-                assert live.call_count == 1
+                fallback_quote = client.get("/api/v1/watchlist/AAPL/quote")
+                assert fallback_quote.status_code == 200
+                assert fallback_quote.json()["price"] == 123.0
+                assert fallback_quote.json()["source"] == "live"
+                assert fallback_quote.json()["put_call_ratio"] == 0.5
+                assert live.call_count == 2
                 assert not any(sql.startswith(("CREATE", "ALTER", "INSERT", "UPDATE", "DELETE"))
                                for sql in statements)
                 assert all("watchlist" not in sql.lower() for sql in statements)
