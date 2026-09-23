@@ -12,9 +12,7 @@ from sqlalchemy import text
 from api.auth import require_auth
 from api.dependencies import get_db_engine
 from api.routers.watchlist_helpers import (
-    _cache_price_to_db,
     _fetch_live_price,
-    _init_table,
     _resolve_feature_names,
 )
 
@@ -113,9 +111,8 @@ def get_ticker_overview(
         dict with keys: overview, key_levels, sentiment, generated_at,
         sector_path (for the capital-flow mini-chart).
     """
-    from datetime import datetime, date
+    from datetime import datetime
 
-    _init_table()
     engine = get_db_engine()
     ticker_upper = ticker.strip().upper()
 
@@ -139,13 +136,15 @@ def get_ticker_overview(
             if price_row:
                 price_info = {"price": float(price_row[0]), "date": str(price_row[1]), "source": "grid"}
         except Exception as exc:
+            # A failed SELECT aborts PostgreSQL's current transaction. Clear it
+            # before independent options/regime/features reads on this connection.
+            conn.rollback()
             _log_query_failure(f"Overview price query for {ticker_upper}", exc)
 
         if not price_info:
             live = _fetch_live_price(ticker_upper)
             if live:
                 price_info = {"price": live["price"], "pct_1d": live.get("pct_1d"), "source": "live"}
-                _cache_price_to_db(engine, ticker_upper, live["price"], date.today())
 
         # Options (latest)
         try:
@@ -167,6 +166,7 @@ def get_ticker_overview(
                     "total_oi": opt_row[6],
                 }
         except Exception as exc:
+            conn.rollback()
             _log_query_failure(f"Overview options query for {ticker_upper}", exc)
 
         # Regime
@@ -182,6 +182,7 @@ def get_ticker_overview(
                     "posture": regime_row[2],
                 }
         except Exception as exc:
+            conn.rollback()
             _log_query_failure("Overview regime query", exc)
 
         # Related features (recent values for context)
@@ -218,6 +219,7 @@ def get_ticker_overview(
                 for r in feat_rows
             ]
         except Exception as exc:
+            conn.rollback()
             _log_query_failure(f"Overview related-features query for {ticker_upper}", exc)
 
     # ── Sector path (for capital-flow mini-chart) ────────────────
@@ -453,7 +455,7 @@ def get_ticker_quote(
 ) -> dict:
     """Fast, LLM-free price/options snapshot for a single ticker.
 
-    Powers the stepdad.finance ticker_pulse widget. Pure DB reads + rule-based
+    Powers the stepdad.finance ticker_pulse widget. DB reads + rule-based
     sentiment so the home page populates instantly (the /overview narrative is
     far too slow for a tile). Prefers the cached GRID price; only falls back to
     a live fetch when nothing is stored.
@@ -463,7 +465,6 @@ def get_ticker_quote(
     """
     from datetime import date
 
-    _init_table()
     engine = get_db_engine()
     ticker_upper = ticker.strip().upper()
     feature_names = _resolve_feature_names(ticker_upper)
@@ -506,6 +507,7 @@ def get_ticker_quote(
                     if prev_close:
                         change_pct = round((price - prev_close) / prev_close, 5)
         except Exception as exc:
+            conn.rollback()
             # A dead price query is why the ticker_pulse card silently fell
             # back to a live fetch for two months. At debug level, in
             # production, nothing recorded that it had happened at all.
@@ -520,6 +522,7 @@ def get_ticker_quote(
             if opt:
                 put_call_ratio, max_pain, iv_atm = opt[0], opt[1], opt[2]
         except Exception as exc:
+            conn.rollback()
             _log_query_failure(f"Quote options query for {ticker_upper}", exc)
 
     # Live fallback only when nothing is stored (kept off the hot path).
@@ -532,7 +535,6 @@ def get_ticker_quote(
                 source = "live"
                 if price is not None:
                     as_of_date = date.today()
-                    _cache_price_to_db(engine, ticker_upper, price, as_of_date)
         except Exception as exc:
             # Not a query: an outbound HTTP fetch. Always operational.
             log.warning(
