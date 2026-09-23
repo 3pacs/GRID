@@ -267,3 +267,21 @@ class TestPortfolioReadContract:
         assert response.json() == {"detail": "Portfolio watchlist data is unavailable"}
         mock_init.assert_not_called()
         mock_engine.return_value.begin.assert_not_called()
+
+    @patch("api.routers.watchlist_core._read_portfolio_options_pnl")
+    @patch("api.routers.watchlist_core.get_db_engine")
+    def test_empty_holdings_do_not_hide_optional_read_failure(self, mock_engine, mock_options):
+        mock_conn = MagicMock()
+        mock_engine.return_value.connect.return_value.__enter__.return_value = mock_conn
+        mock_conn.execute.return_value.fetchall.return_value = []
+        mock_options.return_value = {
+            "status": "unavailable", "total_recommendations": None,
+            "wins": None, "losses": None, "open": None, "total_return": None,
+        }
+
+        response = client.get("/api/v1/watchlist/portfolio", headers=_auth_header())
+
+        assert response.status_code == 200
+        assert response.json()["positions"] == []
+        assert response.json()["options_pnl"] == mock_options.return_value
+        mock_engine.return_value.begin.assert_not_called()

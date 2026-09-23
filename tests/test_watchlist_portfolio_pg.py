@@ -98,6 +98,7 @@ def test_populated_portfolio_reads_actual_positions_and_cached_quotes(isolated_w
         assert payload["allocation"]["by_asset_type"] == {"stock": 0.25, "etf": 0.75}
         assert payload["options_pnl"]["wins"] == 1
         assert payload["options_pnl"]["total_return"] == 12.5
+        assert payload["options_pnl"]["status"] == "available"
         init.assert_not_called()
         fetch.assert_not_called()
         assert len(statements) == 2
@@ -135,14 +136,24 @@ def test_empty_table_is_zero_and_missing_table_is_unavailable(isolated_watchlist
 
         with patch("api.routers.watchlist_helpers.get_db_engine", return_value=engine):
             watchlist_helpers._ensure_watchlist_table()
+        with engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE options_recommendations (
+                    outcome TEXT, expiry DATE, actual_return NUMERIC
+                )
+            """))
         statements, recorder = _record_statements(engine)
         try:
             empty = _get_portfolio()
             assert empty.status_code == 200
             assert empty.json()["positions"] == []
             assert empty.json()["total_value"] == 0
-            assert len(statements) == 1
-            assert statements[0].upper().startswith("SELECT")
+            assert empty.json()["options_pnl"] == {
+                "status": "available", "total_recommendations": 0,
+                "wins": 0, "losses": 0, "open": 0, "total_return": 0.0,
+            }
+            assert len(statements) == 2
+            assert all(s.upper().startswith("SELECT") for s in statements)
         finally:
             event.remove(engine, "before_cursor_execute", recorder)
         init.assert_not_called()
@@ -163,5 +174,13 @@ def test_cache_miss_keeps_quote_fetch_and_process_local_cache(isolated_watchlist
         response = _get_portfolio()
     assert response.status_code == 200, response.text
     assert response.json()["positions"][0]["price"] == 42.0
+    assert response.json()["options_pnl"] == {
+        "status": "unavailable", "total_recommendations": None,
+        "wins": None, "losses": None, "open": None, "total_return": None,
+    }
     fetch.assert_called_once_with(["AAA"])
     cache_set.assert_called_once_with("prices", prices)
+
+    # Failed optional SELECT was isolated; the same engine remains usable.
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT COUNT(*) FROM watchlist")).scalar_one() == 1
