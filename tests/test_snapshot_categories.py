@@ -273,7 +273,7 @@ def test_list_categories_tolerates_a_null_latest_date():
     assert store.list_categories()[0]["latest_snapshot_date"] is None
 
 
-def test_list_categories_returns_empty_and_warns_when_table_is_unreachable(monkeypatch):
+def test_list_categories_raises_when_table_is_unreachable(monkeypatch):
     """Missing table / DB blip is operational, so it warns rather than errors
     (CLAUDE.md: log.error is for unhandled application bugs, and errors.jsonl
     is the canonical health signal). Asserted on the loguru logger directly —
@@ -290,7 +290,8 @@ def test_list_categories_returns_empty_and_warns_when_table_is_unreachable(monke
     fake_log = MagicMock()
     monkeypatch.setattr(snapshots_store, "log", fake_log)
 
-    assert store.list_categories() == []
+    with pytest.raises(RuntimeError, match="analytical_snapshots"):
+        store.list_categories()
 
     assert fake_log.warning.call_count == 1
     fake_log.error.assert_not_called()
