@@ -572,13 +572,20 @@ def pipeline_health(
 
     try:
         with engine.connect() as conn:
+            # Bound the expensive source aggregate without changing the
+            # timeout of the later, independent health queries.  SQLAlchemy
+            # keeps all of these reads in one implicit transaction, so a
+            # bare SET LOCAL would otherwise affect every later statement.
+            prior_timeout = conn.execute(
+                text("SELECT current_setting('statement_timeout')")
+            ).scalar_one()
+            conn.execute(text("SET LOCAL statement_timeout = '5s'"))
             # ── Per-source pull status ─────────────────────────────────
             source_rows = conn.execute(
                 text(
                     "SELECT sc.name, "
                     "  COALESCE(latest.last_pull, sc.last_pull_at) AS last_pull, "
-                    "  COALESCE(recent.recent_rows, 0) AS recent_rows, "
-                    "  COALESCE(series.series_count, 0) AS series_count "
+                    "  COALESCE(recent.recent_rows, 0) AS recent_rows "
                     "FROM source_catalog sc "
                     "LEFT JOIN LATERAL ("
                     "  SELECT rs.pull_timestamp AS last_pull "
@@ -593,26 +600,18 @@ def pipeline_health(
                     "  WHERE rs.source_id = sc.id "
                     "  AND rs.pull_timestamp >= NOW() - INTERVAL '48 hours'"
                     ") recent ON TRUE "
-                    "LEFT JOIN LATERAL ("
-                    "  SELECT COUNT(DISTINCT sampled.series_id) AS series_count "
-                    "  FROM ("
-                    "    SELECT rs.series_id "
-                    "    FROM raw_series rs "
-                    "    WHERE rs.source_id = sc.id "
-                    "    ORDER BY rs.pull_timestamp DESC "
-                    "    LIMIT :series_limit"
-                    "  ) sampled"
-                    ") series ON TRUE "
                     "ORDER BY sc.name"
                 ),
-                {"series_limit": _SERIES_COUNT_SAMPLE_LIMIT},
             ).fetchall()
+            conn.execute(
+                text("SELECT set_config('statement_timeout', :timeout, true)"),
+                {"timeout": prior_timeout},
+            )
 
             for row in source_rows:
                 src_name = row[0]
                 last_pull = row[1]
                 recent_rows = row[2]
-                series_count = row[3]
 
                 src_type = _SOURCE_TYPE_MAP.get(src_name, "unknown")
                 schedule_info = _SOURCE_SCHEDULE.get(src_name)
@@ -693,7 +692,10 @@ def pipeline_health(
                     rows_last_pull=recent_rows,
                     next_scheduled=next_scheduled,
                     freshness=freshness,
-                    series_count=series_count,
+                    # The sampled distinct count required up to 50,000 heap
+                    # fetches per source, yet this view does not display it.
+                    # Leave the nullable API field unknown, rather than 0.
+                    series_count=None,
                     field_record=field_record.to_dict(),
                 ))
 
@@ -725,13 +727,14 @@ def pipeline_health(
 
             # ── Recent errors from server_log ──────────────────────────
             try:
-                err_rows = conn.execute(text(
-                    "SELECT created_at, source, message "
-                    "FROM server_log "
-                    "WHERE level IN ('ERROR', 'CRITICAL') "
-                    "ORDER BY created_at DESC "
-                    "LIMIT 25"
-                )).fetchall()
+                with conn.begin_nested():
+                    err_rows = conn.execute(text(
+                        "SELECT created_at, source, message "
+                        "FROM server_log "
+                        "WHERE level IN ('ERROR', 'CRITICAL') "
+                        "ORDER BY created_at DESC "
+                        "LIMIT 25"
+                    )).fetchall()
                 for row in err_rows:
                     recent_errors.append(PipelineError(
                         timestamp=row[0].isoformat() if row[0] else None,
@@ -740,48 +743,52 @@ def pipeline_health(
                     ))
             except Exception as exc:
                 log.debug("Pipeline: server_log table unavailable: {e}", e=str(exc))
+                query_failed_reason = query_failed_reason or _classify_query_failure(exc)
 
             # ── Resolver status ────────────────────────────────────────
             try:
-                r = conn.execute(
-                    text(
-                        "WITH recent_raw AS ("
-                        "  SELECT series_id "
-                        "  FROM raw_series "
-                        "  WHERE pull_status = 'SUCCESS' "
-                        "  ORDER BY id DESC "
-                        "  LIMIT :pending_limit"
-                        ") "
-                        "SELECT COUNT(DISTINCT rr.series_id) "
-                        "FROM recent_raw rr "
-                        "LEFT JOIN feature_registry fr ON fr.name = rr.series_id "
-                        "WHERE fr.id IS NULL"
-                    ),
-                    {"pending_limit": _RESOLVER_PENDING_SAMPLE_LIMIT},
-                ).fetchone()
-                resolver.pending = r[0] if r else 0
+                with conn.begin_nested():
+                    r = conn.execute(
+                        text(
+                            "WITH recent_raw AS ("
+                            "  SELECT series_id "
+                            "  FROM raw_series "
+                            "  WHERE pull_status = 'SUCCESS' "
+                            "  ORDER BY id DESC "
+                            "  LIMIT :pending_limit"
+                            ") "
+                            "SELECT COUNT(DISTINCT rr.series_id) "
+                            "FROM recent_raw rr "
+                            "LEFT JOIN feature_registry fr ON fr.name = rr.series_id "
+                            "WHERE fr.id IS NULL"
+                        ),
+                        {"pending_limit": _RESOLVER_PENDING_SAMPLE_LIMIT},
+                    ).fetchone()
+                    resolver.pending = r[0] if r else 0
 
-                # Vintages are clamped to today: sources that publish
-                # forward-dated releases (FRED calendar rows reach
-                # 2026-12-31) would otherwise make an idle resolver look
-                # like it ran in the future. Verified on griddb 2026-09-11,
-                # ops-exec run 34547844805: MAX(vintage_date) = 2026-12-31
-                # while the last real resolution was 2026-04-04.
-                r = conn.execute(text(
-                    "SELECT MAX(vintage_date) FROM resolved_series "
-                    "WHERE vintage_date <= CURRENT_DATE"
-                )).fetchone()
-                if r and r[0]:
-                    resolver.last_run = r[0].isoformat()
+                    # Vintages are clamped to today: sources that publish
+                    # forward-dated releases (FRED calendar rows reach
+                    # 2026-12-31) would otherwise make an idle resolver look
+                    # like it ran in the future. Verified on griddb 2026-09-11,
+                    # ops-exec run 34547844805: MAX(vintage_date) = 2026-12-31
+                    # while the last real resolution was 2026-04-04.
+                    r = conn.execute(text(
+                        "SELECT MAX(vintage_date) FROM resolved_series "
+                        "WHERE vintage_date <= CURRENT_DATE"
+                    )).fetchone()
+                    if r and r[0]:
+                        resolver.last_run = r[0].isoformat()
 
-                r = conn.execute(text(
-                    "SELECT COUNT(*) FROM resolved_series "
-                    "WHERE vintage_date >= CURRENT_DATE - INTERVAL '1 day' "
-                    "AND vintage_date <= CURRENT_DATE"
-                )).fetchone()
-                resolver.last_resolved = r[0] if r else 0
+                    r = conn.execute(text(
+                        "SELECT COUNT(*) FROM resolved_series "
+                        "WHERE vintage_date >= CURRENT_DATE - INTERVAL '1 day' "
+                        "AND vintage_date <= CURRENT_DATE"
+                    )).fetchone()
+                    resolver.last_resolved = r[0] if r else 0
             except Exception as exc:
                 log.debug("Pipeline: resolver status query failed: {e}", e=str(exc))
+                resolver = ResolverStatus()
+                query_failed_reason = query_failed_reason or _classify_query_failure(exc)
 
     except Exception as exc:
         log.warning("Pipeline health query failed: {e}", e=str(exc))
