@@ -44,8 +44,10 @@ def _fresh_payload(ticker: str) -> dict:
 def _reset_inflight():
     """Each test gets a clean single-flight table regardless of prior test outcomes."""
     dad._GOLD_INFLIGHT.clear()
+    dad._GOLD_MEMORY_CACHE.clear()
     yield
     dad._GOLD_INFLIGHT.clear()
+    dad._GOLD_MEMORY_CACHE.clear()
 
 
 # --- warm cache -------------------------------------------------------------
@@ -72,8 +74,8 @@ def test_warm_cache_hit_returns_immediately_without_compute():
 # --- cold start --------------------------------------------------------------
 
 
-def test_cold_start_within_budget_computes_and_writes_cache():
-    """No cache row, compute finishes well inside budget -> normal fresh payload, cache written."""
+def test_cold_start_within_budget_computes_and_remembers_cache():
+    """No cache row, compute finishes well inside budget -> normal fresh payload, cache remembered."""
     write_calls = []
 
     def _fake_workbook(ticker, **kwargs):
@@ -84,13 +86,13 @@ def test_cold_start_within_budget_computes_and_writes_cache():
         return {"status": "ready", "finviz": {"status": "ready"}, "grid": {"status": "ready"},
                 "options": None, "signals": {"signal_sources": [], "tradingview_signals": [], "regime": None}}
 
-    def _fake_write(engine, ticker, db_path, payload, timings):
+    def _fake_write(ticker, db_path, payload):
         write_calls.append(ticker)
 
     with patch.object(dad, "_read_summary_cache", return_value=None), \
          patch.object(dad, "_load_workbook_context", side_effect=_fake_workbook), \
          patch.object(dad, "_load_grid_payload", side_effect=_fake_grid), \
-         patch.object(dad, "_write_summary_cache", side_effect=_fake_write), \
+         patch.object(dad, "_remember_summary_cache", side_effect=_fake_write), \
          patch.object(dad, "get_db_engine", return_value=MagicMock()):
         result = dad._build_compact_dad_response("MSFT", use_cache=True)
 
@@ -115,7 +117,7 @@ def test_dependency_timeout_with_no_cache_returns_honest_unavailable(monkeypatch
     with patch.object(dad, "_read_summary_cache", return_value=None), \
          patch.object(dad, "_load_workbook_context", side_effect=_slow_workbook), \
          patch.object(dad, "_load_grid_payload", return_value=dad._empty_grid_payload("unused")), \
-         patch.object(dad, "_write_summary_cache", return_value=None), \
+         patch.object(dad, "_remember_summary_cache", return_value=None), \
          patch.object(dad, "get_db_engine", return_value=MagicMock()):
         start = time.perf_counter()
         result = dad._build_compact_dad_response("SLOW", use_cache=True)
@@ -148,7 +150,7 @@ def test_dependency_timeout_with_no_cache_returns_honest_unavailable(monkeypatch
 
 
 def test_budget_only_ends_the_wait_the_compute_keeps_running_and_still_caches(monkeypatch):
-    """The 8s budget bounds the caller's wait, not the compute: it finishes and still writes cache."""
+    """The 8s budget bounds the caller's wait, not the compute: it still fills local cache."""
     monkeypatch.setattr(dad, "GOLD_COMPACT_BUDGET_SECONDS", 0.1)
     write_calls = []
 
@@ -157,17 +159,17 @@ def test_budget_only_ends_the_wait_the_compute_keeps_running_and_still_caches(mo
         return {"status": "ready", "summary": None, "workbook": {"files": [], "sheets": [], "evidence": []},
                 "source_lanes": [], "dad_stats": [], "fit_signals": [], "source": {"attached": True, "db_path": "x"}}
 
-    def _fake_write(engine, ticker, db_path, payload, timings):
+    def _fake_write(ticker, db_path, payload):
         write_calls.append(ticker)
 
     with patch.object(dad, "_read_summary_cache", return_value=None), \
          patch.object(dad, "_load_workbook_context", side_effect=_slow_workbook), \
          patch.object(dad, "_load_grid_payload", return_value=dad._empty_grid_payload("unused")), \
-         patch.object(dad, "_write_summary_cache", side_effect=_fake_write), \
+         patch.object(dad, "_remember_summary_cache", side_effect=_fake_write), \
          patch.object(dad, "get_db_engine", return_value=MagicMock()):
         result = dad._build_compact_dad_response("ORPHAN", use_cache=True)
         assert result["performance"]["budget_exceeded"] is True
-        assert write_calls == []  # not written yet -- the caller gave up before compute finished
+        assert write_calls == []  # not remembered yet -- the caller gave up before compute finished
 
         # Single-flight ownership is retained until the orphan actually
         # exits: the same key must still map to the (still-running) future.
@@ -211,7 +213,7 @@ def test_dependency_timeout_falls_back_to_stale_cache(monkeypatch):
     with patch.object(dad, "_read_summary_cache", side_effect=_fake_read), \
          patch.object(dad, "_load_workbook_context", side_effect=_slow_workbook), \
          patch.object(dad, "_load_grid_payload", return_value=dad._empty_grid_payload("unused")), \
-         patch.object(dad, "_write_summary_cache", return_value=None), \
+         patch.object(dad, "_remember_summary_cache", return_value=None), \
          patch.object(dad, "get_db_engine", return_value=MagicMock()):
         result = dad._build_compact_dad_response("STALE", use_cache=True)
         orphan = dad._GOLD_INFLIGHT.get("STALE:False")
@@ -310,7 +312,7 @@ def test_concurrent_requests_for_same_ticker_share_one_compute(monkeypatch):
     with patch.object(dad, "_read_summary_cache", return_value=None), \
          patch.object(dad, "_load_workbook_context", side_effect=_counted_workbook), \
          patch.object(dad, "_load_grid_payload", return_value=dad._empty_grid_payload("unused")), \
-         patch.object(dad, "_write_summary_cache", return_value=None), \
+         patch.object(dad, "_remember_summary_cache", return_value=None), \
          patch.object(dad, "get_db_engine", return_value=MagicMock()):
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             futures = [pool.submit(dad._build_compact_dad_response, "SHARED", use_cache=True) for _ in range(8)]
@@ -346,7 +348,7 @@ def test_inflight_key_distinguishes_refresh_finviz(monkeypatch):
     with patch.object(dad, "_read_summary_cache", return_value=None), \
          patch.object(dad, "_load_workbook_context", side_effect=_fake_workbook), \
          patch.object(dad, "_load_grid_payload", side_effect=_fake_grid), \
-         patch.object(dad, "_write_summary_cache", return_value=None), \
+         patch.object(dad, "_remember_summary_cache", return_value=None), \
          patch.object(dad, "get_db_engine", return_value=MagicMock()):
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             f1 = pool.submit(dad._build_compact_dad_response, "BOTH", use_cache=True, refresh_finviz=False)
@@ -416,7 +418,7 @@ def test_max_inflight_cap_bounds_background_work_across_tickers(monkeypatch):
 
     with patch.object(dad, "_load_workbook_context", side_effect=_blocked_workbook), \
          patch.object(dad, "_load_grid_payload", return_value=dad._empty_grid_payload("unused")), \
-         patch.object(dad, "_write_summary_cache", return_value=None):
+         patch.object(dad, "_remember_summary_cache", return_value=None):
         try:
             engine = MagicMock()
             f1 = dad._get_or_start_gold_compact("TICKER_A", refresh_finviz=False, engine=engine, db_path=None)
@@ -459,7 +461,7 @@ def test_capacity_exceeded_falls_back_honestly_without_waiting(monkeypatch):
     with patch.object(dad, "_read_summary_cache", return_value=None), \
          patch.object(dad, "_load_workbook_context", side_effect=_blocked_workbook), \
          patch.object(dad, "_load_grid_payload", return_value=dad._empty_grid_payload("unused")), \
-         patch.object(dad, "_write_summary_cache", return_value=None), \
+         patch.object(dad, "_remember_summary_cache", return_value=None), \
          patch.object(dad, "get_db_engine", return_value=MagicMock()):
         try:
             occupying = dad._get_or_start_gold_compact("OCCUPY", refresh_finviz=False, engine=MagicMock(), db_path=None)

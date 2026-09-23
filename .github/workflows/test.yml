@@ -142,6 +142,14 @@ jobs:
           TESTING: "true"
         run: python -m pytest tests/test_spy_price_receipt_pg.py tests/test_binance_canonical_close_pg.py tests/test_spy_binance_composition_pg.py -q -rA
 
+      - name: Dad gold read-only PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_dad_gold_readonly_pg.py -q -rA
+
       - name: Check for SQL injection patterns
         run: |
           echo "Checking for unsafe SQL patterns..."
