@@ -54,24 +54,42 @@ def _create_signal_sources(engine) -> None:
             {"source_type": "darkpool", "source_id": "Pool C", "metadata": '{"volume_vs_avg":2.1}', "outcome": "PENDING", "trust_score": 0.6},
         ])
         conn.execute(text("""
+            INSERT INTO signal_sources
+                (source_type, source_id, ticker, signal_type, signal_date,
+                 signal_value, metadata, outcome, trust_score)
+            VALUES
+                ('options_flow', 'whale_TEST_450.0', 'TEST', 'CALL', NOW(), NULL, NULL, 'WRONG', NULL),
+                ('quiverquant:house', 'quiverquant_house_feed', 'TEST', 'BUY', NOW(),
+                 CAST('{"Representative":"Rep C"}' AS JSONB), NULL, 'WRONG', NULL),
+                ('other', 'Office of Analyst D', 'TEST', 'BUY', NOW(), NULL, NULL, 'WRONG', NULL),
+                ('social', 'User E', 'TEST', 'BUY', NOW(), NULL,
+                 CAST('{"platform":"forum"}' AS JSONB), 'WRONG', NULL)
+        """))
+        conn.execute(text("""
             CREATE TABLE lever_pullers (
                 id SERIAL PRIMARY KEY, source_type TEXT NOT NULL, source_id TEXT NOT NULL,
-                name TEXT NOT NULL, motivation_model TEXT
+                name TEXT NOT NULL, category TEXT NOT NULL, motivation_model TEXT
             )
         """))
         conn.execute(text("""
-            INSERT INTO lever_pullers (source_type, source_id, name, motivation_model)
-            VALUES ('congressional', 'Member A', 'Member A', 'committee overlap')
+            INSERT INTO lever_pullers (source_type, source_id, name, category, motivation_model)
+            VALUES
+                ('congressional', 'Member A', 'Member A', 'politician', 'committee overlap'),
+                ('options_flow', 'whale_TEST', 'Options tape', 'options', 'flow concentration'),
+                ('quiverquant:house', 'Rep C', 'Rep C', 'politician', 'filing context')
         """))
         conn.execute(text("""
             CREATE TABLE actors (
-                id TEXT PRIMARY KEY, name TEXT NOT NULL, title TEXT,
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, tier TEXT NOT NULL,
+                category TEXT NOT NULL, title TEXT,
                 motivation_model TEXT, known_positions JSONB NOT NULL DEFAULT '[]'
             )
         """))
         conn.execute(text("""
-            INSERT INTO actors (id, name, title, motivation_model, known_positions)
-            VALUES ('officer-b', 'Officer B', 'CEO', 'issuer exposure', '[]')
+            INSERT INTO actors (id, name, tier, category, title, motivation_model, known_positions)
+            VALUES
+                ('officer-b', 'Officer B', 'individual', 'insider', 'CEO', 'issuer exposure', '[]'),
+                ('analyst-d', 'Analyst D', 'individual', 'analyst', 'Analyst', 'issuer research', '[]')
         """))
 
 
@@ -95,13 +113,19 @@ def test_edge_route_uses_only_selects_against_prepared_postgres_schema():
         assert payload["convergence"]["signal_type"] == "BUY"
         assert payload["convergence"]["source_count"] == 3
         assert payload["congressional"][0]["trust_score"] == 0.0
+        assert payload["smart_money"][0]["trust_score"] is None
         assert payload["lever_pullers"] == [
             {"name": "Member A", "action": "BUY", "context": "committee overlap"},
+            {"name": "Options tape", "action": "CALL", "context": "flow concentration"},
+            {"name": "Rep C", "action": "BUY", "context": "filing context"},
+            {"name": "Analyst D", "action": "WATCHING", "context": "Analyst — issuer research"},
             {"name": "Officer B", "action": "WATCHING", "context": "CEO — issuer exposure"},
         ]
         assert payload["availability"]["lever_pullers"]["status"] == "available"
         assert payload["availability"]["actor_context"]["status"] == "available"
-        assert payload["availability"]["investigation_leads"]["status"] == "unavailable"
+        assert payload["availability"]["investigation_leads"] == {
+            "status": "unsupported", "reason": "no_ticker_association",
+        }
         assert statements and all(statement.startswith("SELECT") for statement in statements)
     finally:
         engine.dispose()

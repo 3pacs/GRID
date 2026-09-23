@@ -138,6 +138,12 @@ jobs:
           TESTING: "true"
         run: python -m pytest tests/test_pipeline_health_pg.py -q -rA
 
+      - name: Watchlist edge PostgreSQL identity contract
+        env:
+          GRID_WATCHLIST_EDGE_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+        run: python -m pytest tests/test_watchlist_edge_readonly_pg.py -q -rA
+
       - name: Check for SQL injection patterns
         run: |
           echo "Checking for unsafe SQL patterns..."
