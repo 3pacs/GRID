@@ -1120,6 +1120,9 @@ function CapitalFlowPath({ sectorPath, ticker }) {
 
 export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
     const { isMobile } = useDevice();
+    const currentTickerRef = useRef(ticker);
+    currentTickerRef.current = ticker;
+    const periodRequestRef = useRef(0);
     const [data, setData] = useState(null);
     const [dataLoading, setDataLoading] = useState(true);
     const [error, setError] = useState(null);
@@ -1130,7 +1133,9 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
     const [priceLoading, setPriceLoading] = useState(false);
     const [gexData, setGexData] = useState(null);
     const [gexLoading, setGexLoading] = useState(true);
+    const [gexAvailability, setGexAvailability] = useState(null);
     const [vannaCharmData, setVannaCharmData] = useState(null);
+    const [vannaCharmAvailability, setVannaCharmAvailability] = useState(null);
     const [flowTimelineData, setFlowTimelineData] = useState(null);
     const [secondaryLoading, setSecondaryLoading] = useState(true);
     const [edgeData, setEdgeData] = useState(null);
@@ -1138,6 +1143,8 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
 
     useEffect(() => {
         if (!ticker) return;
+        let active = true;
+        periodRequestRef.current += 1;
 
         // Reset state for new ticker
         setData(null);
@@ -1148,14 +1155,18 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
         setOverviewLoading(true);
         setGexData(null);
         setGexLoading(true);
+        setGexAvailability(null);
         setVannaCharmData(null);
+        setVannaCharmAvailability(null);
         setFlowTimelineData(null);
         setSecondaryLoading(true);
         setEdgeData(null);
         setEdgeLoading(true);
+        setPriceLoading(false);
 
         // Phase 1: Fetch core analysis data (fastest — often cached)
         api.getTickerAnalysis(ticker, period).then(result => {
+            if (!active) return;
             if (result?.error) {
                 setError(result.message || 'Failed to load');
                 setData(null);
@@ -1164,25 +1175,30 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
             }
             setDataLoading(false);
         }).catch(err => {
+            if (!active) return;
             setError(err.message || 'Failed to load');
             setDataLoading(false);
         });
 
         // Phase 2: Fetch AI overview (may be slow due to LLM)
         api.getTickerOverview(ticker).then(result => {
+            if (!active) return;
             setOverview(result?.error ? null : result);
             setOverviewUnavailable(Boolean(result?.error));
             setOverviewLoading(false);
         }).catch(() => {
+            if (!active) return;
             setOverviewUnavailable(true);
             setOverviewLoading(false);
         });
 
         // Phase 2b: Fetch insider edge intelligence
         api.getTickerEdge(ticker).then(result => {
+            if (!active) return;
             setEdgeData(result?.error ? null : result);
             setEdgeLoading(false);
         }).catch(() => {
+            if (!active) return;
             setEdgeLoading(false);
         });
 
@@ -1192,25 +1208,45 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
             api.getVannaCharm(ticker),
             api.getFlowTimeline(ticker, 90),
         ]).then(([gexResult, vcResult, ftResult]) => {
-            if (gexResult.status === 'fulfilled' && !gexResult.value?.error) {
-                setGexData(gexResult.value);
-            }
+            if (!active) return;
+            const gex = gexResult.status === 'fulfilled' ? gexResult.value : null;
+            const perStrike = gex?.per_strike;
+            const profile = gex?.profile;
+            const hasGexProfile = (Array.isArray(profile) && profile.length > 0)
+                || (Array.isArray(perStrike) && perStrike.length > 0);
+            const validRows = (rows, x, y) => !Array.isArray(rows) || rows.every(row =>
+                row && typeof row === 'object' && Number.isFinite(row[x]) && Number.isFinite(row[y]));
+            const validGex = Array.isArray(profile) && Array.isArray(perStrike)
+                && Number.isFinite(gex?.spot) && gex.spot > 0
+                && Number.isFinite(gex?.gex_aggregate)
+                && validRows(profile, 'spot', 'gex')
+                && validRows(perStrike, 'strike', 'net_gex');
+            setGexData(!gex?.error && hasGexProfile && validGex ? gex : null);
+            setGexAvailability(gex?.error || !validGex
+                ? 'unavailable' : hasGexProfile ? 'available' : 'empty');
             setGexLoading(false);
-            if (vcResult.status === 'fulfilled' && !vcResult.value?.error) {
-                setVannaCharmData(vcResult.value);
-            }
+            const vannaCharm = vcResult.status === 'fulfilled' ? vcResult.value : null;
+            const hasVannaCharm = Number.isFinite(vannaCharm?.vanna_exposure)
+                && Number.isFinite(vannaCharm?.charm_exposure);
+            setVannaCharmData(!vannaCharm?.error && hasVannaCharm ? vannaCharm : null);
+            setVannaCharmAvailability(vannaCharm?.error || !vannaCharm || !hasVannaCharm
+                ? 'unavailable' : 'available');
             setFlowTimelineData(ftResult.status === 'fulfilled'
                 ? ftResult.value : { error: 'Flow timeline unavailable' });
             setSecondaryLoading(false);
         });
+        return () => { active = false; };
     }, [ticker]);
 
     const handlePeriodChange = useCallback(async (newPeriod) => {
         if (newPeriod === period) return;
+        const requestId = ++periodRequestRef.current;
+        const requestTicker = ticker;
         setPeriod(newPeriod);
         setPriceLoading(true);
         try {
             const refreshed = await api.getTickerAnalysis(ticker, newPeriod);
+            if (periodRequestRef.current !== requestId || currentTickerRef.current !== requestTicker) return;
             if (refreshed?.error) {
                 return;
             }
@@ -1226,8 +1262,11 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
             }));
         } catch (err) {
             // Keep existing data on failure
+        } finally {
+            if (periodRequestRef.current === requestId && currentTickerRef.current === requestTicker) {
+                setPriceLoading(false);
+            }
         }
-        setPriceLoading(false);
     }, [ticker, period]);
 
     // Use enrichedData for instant display while analysis loads
@@ -1398,10 +1437,14 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
                     <div style={{ gridColumn: '1 / -1' }}>
                         <OverviewSkeleton />
                     </div>
+                ) : gexAvailability !== 'available' ? (
+                    <div role="status" style={{ gridColumn: '1 / -1', color: colors.textMuted, fontSize: '11px' }}>
+                        {gexAvailability === 'empty' ? 'No GEX profile data available.' : 'GEX profile unavailable.'}
+                    </div>
                 ) : null}
 
                 {/* Vanna / Charm Compass */}
-                {vannaCharmData && (
+                {vannaCharmData ? (
                     <div style={{ gridColumn: '1 / -1' }}>
                         {isMobile ? (
                             <CollapsibleSection title="VANNA / CHARM" defaultExpanded={false}
@@ -1410,7 +1453,11 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
                             <VannaCharmViz ticker={ticker} vannaCharmData={vannaCharmData} />
                         )}
                     </div>
-                )}
+                ) : !secondaryLoading && vannaCharmAvailability !== 'available' ? (
+                    <div role="status" style={{ gridColumn: '1 / -1', color: colors.textMuted, fontSize: '11px' }}>
+                        {vannaCharmAvailability === 'empty' ? 'No vanna/charm data available.' : 'Vanna/charm unavailable.'}
+                    </div>
+                ) : null}
 
                 {/* Flow Timeline */}
                 {flowTimelineData ? (

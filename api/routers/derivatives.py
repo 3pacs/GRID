@@ -8,6 +8,7 @@ DealerGammaEngine and options_snapshots tables.
 
 from __future__ import annotations
 
+import math
 from datetime import date, timedelta
 from typing import Any
 
@@ -184,8 +185,14 @@ async def get_vanna_charm(ticker: str) -> dict[str, Any]:
         if result.get("error"):
             return {"error": result["error"], "ticker": ticker.upper()}
 
-        vanna = result.get("vanna_exposure", 0)
-        charm = result.get("charm_exposure", 0)
+        vanna = result.get("vanna_exposure")
+        charm = result.get("charm_exposure")
+        if any(
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            for value in (vanna, charm)
+        ):
+            return {"error": "Vanna/charm exposure unavailable", "ticker": ticker.upper()}
         spot = result.get("spot", 0)
         per_strike = result.get("per_strike", [])
 
