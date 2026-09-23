@@ -215,3 +215,69 @@ def test_access_failure_is_not_recorded_as_success_or_watermark(
     assert status == ("FAILED", 0)
     assert watermark is None
     print("BINANCE_FAILURE_ACCOUNTING pull_log_failed=1 watermark_unchanged=1")
+
+
+def test_partial_btc_commit_then_eth_failure_retries_without_duplicate_close(
+    crypto_pg_engine: Engine, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = crypto_pg_engine
+    puller = BinancePuller(engine)
+    yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
+    today = yesterday + timedelta(days=1)
+    eth_blocked = True
+
+    def klines(symbol: str) -> list:
+        nonlocal eth_blocked
+        if symbol == "ETHUSDT" and eth_blocked:
+            raise BinanceAccessBlocked("test access denial")
+        return [_kline(yesterday, 65000.0 if symbol == "BTCUSDT" else 3200.0),
+                _kline(today, 65010.0 if symbol == "BTCUSDT" else 3210.0)]
+
+    monkeypatch.setattr(puller, "_fetch_klines", klines)
+    monkeypatch.setattr(puller, "_fetch_ticker", lambda _symbol: {
+        "volume": "10", "priceChangePercent": "1", "lastPrice": "1",
+    })
+    monkeypatch.setattr(binance_puller, "_SYMBOLS", ["BTCUSDT", "ETHUSDT"])
+    monkeypatch.setattr(binance_puller.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(scheduler, "_get_pullers_for_group", lambda *_args: [
+        ("Binance_Crypto", puller, "pull", {})
+    ])
+
+    failed = scheduler.run_pull_group("daily", engine, config={})
+    assert failed["failure_count"] == 1
+    with engine.connect() as conn:
+        before = conn.execute(text("""
+            SELECT series_id,COUNT(*) FROM raw_series
+            WHERE series_id IN ('binance.BTCUSDT.close','binance.ETHUSDT.close')
+            GROUP BY series_id ORDER BY series_id
+        """)).fetchall()
+        failed_log = conn.execute(text("""
+            SELECT status,rows_inserted FROM pull_log ORDER BY id DESC LIMIT 1
+        """)).one()
+        failed_watermark = conn.execute(text("""
+            SELECT last_pull_at FROM source_catalog WHERE name='binance'
+        """)).scalar_one()
+    assert before == [("binance.BTCUSDT.close", 1)]
+    assert failed_log == ("FAILED", 0)
+    assert failed_watermark is None
+
+    eth_blocked = False
+    succeeded = scheduler.run_pull_group("daily", engine, config={})
+    assert succeeded["success_count"] == 1
+    with engine.connect() as conn:
+        after = conn.execute(text("""
+            SELECT series_id,COUNT(*) FROM raw_series
+            WHERE series_id IN ('binance.BTCUSDT.close','binance.ETHUSDT.close')
+            GROUP BY series_id ORDER BY series_id
+        """)).fetchall()
+        retry_log = conn.execute(text("""
+            SELECT status,rows_inserted FROM pull_log ORDER BY id DESC LIMIT 1
+        """)).one()
+        retry_watermark = conn.execute(text("""
+            SELECT last_pull_at FROM source_catalog WHERE name='binance'
+        """)).scalar_one()
+    assert after == [("binance.BTCUSDT.close", 1), ("binance.ETHUSDT.close", 1)]
+    assert retry_log == ("SUCCESS", 7)
+    assert retry_watermark is not None
+    print("BINANCE_PARTIAL_RETRY partial_btc_rows=1 failed_log=1 "
+          "watermark_unchanged=1 btc_not_duplicated=1 eth_completed=1")

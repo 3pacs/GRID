@@ -35,8 +35,8 @@ class FakeRow(tuple):
 
 
 def _worker_row(row):
-    """Match the resolver SELECT, which now includes raw_payload at index 5."""
-    return row[:5] + (None,) + row[5:] if len(row) == 7 else row
+    """Match the combined SELECT's trailing raw_id and raw_payload columns."""
+    return row + (None, None) if len(row) == 7 else row
 
 
 def _mock_engine(
