@@ -141,7 +141,7 @@ def _load_saved_recommendations(
     ticker: str | None = None,
     limit: int = 50,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
-    """Return persisted open recommendations when the live engine is unavailable."""
+    """Read persisted open recommendations without running a scan or writer."""
     from sqlalchemy import text
 
     try:
@@ -173,7 +173,7 @@ def _load_saved_recommendations(
                 "rejected": 0,
                 "source": "persisted",
                 "fresh_scan": False,
-                "reason": "Options recommender module is not installed",
+                "reason": "saved_recommendations",
             },
             generated_at,
         )
@@ -188,7 +188,7 @@ def _load_saved_recommendations(
                 "rejected": 0,
                 "source": "unavailable",
                 "fresh_scan": False,
-                "reason": "Options recommender module is not installed",
+                "reason": "saved_recommendations_read_failed",
             },
             now,
         )
@@ -202,40 +202,12 @@ async def get_recommendations(
     ticker: str | None = Query(None, description="Filter to a single ticker"),
     _token: str = Depends(require_auth),
 ) -> dict:
-    """Generate options trade recommendations and persist new ones."""
+    """Read open recommendations produced by the separate Hermes writer."""
     engine = get_db_engine()
-    try:
-        result = _generate_recommendations(engine)
-
-        # result is expected to be a dict with at least 'recommendations' list
-        recommendations = result.get("recommendations", [])
-        scan_summary = result.get("scan_summary")
-        generated_at = result.get("generated_at", datetime.now(timezone.utc).isoformat())
-
-        # Persist new recommendations (skip duplicates)
-        _persist_recommendations(engine, recommendations)
-
-        # Filter by ticker if requested
-        if ticker:
-            recommendations = [
-                r for r in recommendations if r.get("ticker", "").upper() == ticker.upper()
-            ]
-
-        return _format_recommendation_response(recommendations, scan_summary, generated_at)
-
-    except ImportError:
-        log.warning("trading.options_recommender module not available")
-        recommendations, scan_summary, generated_at = _load_saved_recommendations(
-            engine,
-            ticker=ticker,
-        )
-        return _format_recommendation_response(recommendations, scan_summary, generated_at)
-    except Exception as exc:
-        log.error("Recommendation generation failed: {e}", e=str(exc))
-        raise HTTPException(
-            status_code=500,
-            detail=f"Recommendation generation failed: {exc}",
-        )
+    recommendations, scan_summary, generated_at = _load_saved_recommendations(
+        engine, ticker=ticker,
+    )
+    return _format_recommendation_response(recommendations, scan_summary, generated_at)
 
 
 @router.post("/recommendations/refresh")

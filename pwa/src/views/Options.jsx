@@ -708,18 +708,46 @@ function TradesTab() {
 export function TickerRecommendations({ ticker }) {
     const [recs, setRecs] = useState([]);
     const [loading, setLoading] = useState(true);
+    const [availability, setAvailability] = useState('loading');
 
     useEffect(() => {
-        if (!ticker) return;
+        if (!ticker) {
+            setRecs([]);
+            setAvailability('empty');
+            setLoading(false);
+            return;
+        }
+        let active = true;
         setLoading(true);
+        setRecs([]);
+        setAvailability('loading');
         api.getOptionsRecommendations(ticker)
-            .then(data => setRecs(data?.error ? [] : (data.recommendations || [])))
-            .catch(() => setRecs([]))
-            .finally(() => setLoading(false));
+            .then(data => {
+                if (!active) return;
+                if (data?.error || data?.scan_summary?.source === 'unavailable'
+                    || !Array.isArray(data?.recommendations)) {
+                    setAvailability('unavailable');
+                    return;
+                }
+                const tickerRecs = data.recommendations.filter(
+                    rec => rec?.ticker?.toUpperCase() === ticker.toUpperCase(),
+                );
+                setRecs(tickerRecs);
+                setAvailability(tickerRecs.length > 0 ? 'available' : 'empty');
+            })
+            .catch(() => { if (active) setAvailability('unavailable'); })
+            .finally(() => { if (active) setLoading(false); });
+        return () => { active = false; };
     }, [ticker]);
 
     if (loading) return null;
-    if (recs.length === 0) return null;
+    if (availability !== 'available') {
+        return <div role="status" style={styles.emptyState}>
+            {availability === 'empty'
+                ? `No active trade recommendations for ${ticker}.`
+                : 'Trade recommendations unavailable.'}
+        </div>;
+    }
 
     return (
         <div>
