@@ -26,6 +26,28 @@ const jobStatusColors = {
 
 const HYPO_STATES = ['ALL', 'CANDIDATE', 'TESTING', 'PASSED', 'FAILED', 'KILLED', 'PROMOTED'];
 
+async function loadAuditResult(type) {
+    try {
+        const response = await api.getResults(type);
+        if (!response || response.error || !Object.hasOwn(response, 'result')) {
+            return { status: 'unavailable', result: null };
+        }
+        if (response.result === null) return { status: 'empty', result: null };
+        if (typeof response.result !== 'object' || response.result.error) {
+            return { status: 'unavailable', result: null };
+        }
+        return { status: 'available', result: response.result };
+    } catch {
+        return { status: 'unavailable', result: null };
+    }
+}
+
+function resultTime(result) {
+    if (result?.as_of_date) return `As of ${result.as_of_date}`;
+    const timestamp = result?.completed_at || result?.generated_at || result?.timestamp;
+    return timestamp ? `Result time: ${timestamp}` : 'Result time unknown';
+}
+
 const researchRunStatusColors = {
     started: { bg: '#1A6EBF22', color: '#1A6EBF' },
     running: { bg: '#1A6EBF22', color: '#1A6EBF' },
@@ -277,6 +299,8 @@ export default function Discovery({ focusHypothesis = '' }) {
     const { jobs, hypotheses, setJobs, setHypotheses, addNotification } = useStore();
     const [orthoResult, setOrthoResult] = useState(null);
     const [clusterResult, setClusterResult] = useState(null);
+    const [orthoStatus, setOrthoStatus] = useState('loading');
+    const [clusterStatus, setClusterStatus] = useState('loading');
     const [nComponents, setNComponents] = useState(3);
     const [hypoFilter, setHypoFilter] = useState('ALL');
     const [hypoQuery, setHypoQuery] = useState(focusHypothesis || '');
@@ -287,15 +311,22 @@ export default function Discovery({ focusHypothesis = '' }) {
     useEffect(() => { setHypoQuery(focusHypothesis || ''); }, [focusHypothesis]);
 
     const { loading, error, refetch: loadData } = useAsyncData(async () => {
+        setOrthoStatus('loading');
+        setClusterStatus('loading');
+        setOrthoResult(null);
+        setClusterResult(null);
         try {
-            const [j, ortho, cluster] = await Promise.all([
-                api.getJobs(),
-                api.getResults('orthogonality').catch(() => null),
-                api.getResults('clustering').catch(() => null),
+            await Promise.all([
+                api.getJobs().then((j) => setJobs(j.jobs || [])),
+                loadAuditResult('orthogonality').then((ortho) => {
+                    setOrthoResult(ortho.result);
+                    setOrthoStatus(ortho.status);
+                }),
+                loadAuditResult('clustering').then((cluster) => {
+                    setClusterResult(cluster.result);
+                    setClusterStatus(cluster.status);
+                }),
             ]);
-            setJobs(j.jobs || []);
-            if (ortho?.result) setOrthoResult(ortho.result);
-            if (cluster?.result) setClusterResult(cluster.result);
         } finally {
             await loadHypotheses();
         }
@@ -356,7 +387,7 @@ export default function Discovery({ focusHypothesis = '' }) {
 
             <ResearchRunPanel />
 
-            {loading && !jobs.length && !orthoResult && !clusterResult ? (
+            {loading && !jobs.length && orthoStatus === 'loading' && clusterStatus === 'loading' ? (
                 <LoadingSkeleton variant="card" count={3} />
             ) : error ? (
                 <ErrorState error={error} onRetry={loadData} title="Discovery data unavailable" />
@@ -412,7 +443,8 @@ export default function Discovery({ focusHypothesis = '' }) {
                                         fontSize: tokens.fontSize.xs, color: colors.textMuted,
                                         marginLeft: tokens.space.sm,
                                     }}>
-                                        {j.started?.substring(11, 19)}
+                                        {j.started ? `Started: ${j.started}` : 'Start time unknown'}
+                                        {j.finished ? ` · Finished: ${j.finished}` : ''}
                                     </span>
                                 </div>
                                 <span style={{
@@ -429,9 +461,13 @@ export default function Discovery({ focusHypothesis = '' }) {
                 </div>
             )}
 
-            {orthoResult && !orthoResult.error && (
-                <div style={shared.cardGradient}>
-                    <div style={shared.sectionTitle}>ORTHOGONALITY</div>
+            <div style={shared.cardGradient}>
+                <div style={shared.sectionTitle}>ORTHOGONALITY</div>
+                {orthoStatus === 'loading' && <div>Loading orthogonality result...</div>}
+                {orthoStatus === 'empty' && <div>No completed orthogonality audit found.</div>}
+                {orthoStatus === 'unavailable' && <div>Orthogonality result unavailable.</div>}
+                {orthoStatus === 'available' && orthoResult && <>
+                <div style={{ color: colors.textMuted, fontSize: tokens.fontSize.xs }}>{resultTime(orthoResult)}</div>
                     {[
                         { label: 'Features analyzed', value: orthoResult.n_features_analyzed },
                         { label: 'True dimensionality', value: orthoResult.true_dimensionality, accent: true },
@@ -454,12 +490,16 @@ export default function Discovery({ focusHypothesis = '' }) {
                             </span>
                         </div>
                     ))}
-                </div>
-            )}
+                </>}
+            </div>
 
-            {clusterResult && !clusterResult.error && (
-                <div style={shared.cardGradient}>
-                    <div style={shared.sectionTitle}>CLUSTERING</div>
+            <div style={shared.cardGradient}>
+                <div style={shared.sectionTitle}>CLUSTERING</div>
+                {clusterStatus === 'loading' && <div>Loading clustering result...</div>}
+                {clusterStatus === 'empty' && <div>No completed clustering run found.</div>}
+                {clusterStatus === 'unavailable' && <div>Clustering result unavailable.</div>}
+                {clusterStatus === 'available' && clusterResult && <>
+                <div style={{ color: colors.textMuted, fontSize: tokens.fontSize.xs }}>{resultTime(clusterResult)}</div>
                     {[
                         { label: 'Best k', value: clusterResult.best_k, accent: true },
                         { label: 'PCA components', value: clusterResult.pca_components_used },
@@ -482,8 +522,8 @@ export default function Discovery({ focusHypothesis = '' }) {
                             </span>
                         </div>
                     ))}
-                </div>
-            )}
+                </>}
+            </div>
 
             {/* ═══ TESTED HYPOTHESES (RESULTS) ═══ */}
             <TestedHypotheses />
@@ -568,7 +608,7 @@ export default function Discovery({ focusHypothesis = '' }) {
                                     {h.state}
                                 </span>
                                 <span style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted }}>
-                                    {h.created_at?.substring(0, 10)}
+                                    {h.created_at ? `Created: ${h.created_at}` : 'Creation time unknown'}
                                 </span>
                             </div>
                         </div>
