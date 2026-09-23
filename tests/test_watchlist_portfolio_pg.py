@@ -170,7 +170,7 @@ def test_cache_miss_keeps_quote_fetch_and_process_local_cache(isolated_watchlist
     with patch("api.routers.watchlist_core.get_db_engine", return_value=engine), \
          patch("api.routers.watchlist_core._get_cached_prices", return_value=None), \
          patch("api.routers.watchlist_core._batch_fetch_prices", return_value=prices) as fetch, \
-         patch("api.routers.watchlist_core._wh._price_cache.set") as cache_set:
+         patch("api.routers.watchlist_core._wh._price_cache") as cache:
         response = _get_portfolio()
     assert response.status_code == 200, response.text
     assert response.json()["positions"][0]["price"] == 42.0
@@ -179,7 +179,7 @@ def test_cache_miss_keeps_quote_fetch_and_process_local_cache(isolated_watchlist
         "wins": None, "losses": None, "open": None, "total_return": None,
     }
     fetch.assert_called_once_with(["AAA"])
-    cache_set.assert_called_once_with("prices", prices)
+    cache.set.assert_called_once_with("prices", prices)
 
     # Failed optional SELECT was isolated; the same engine remains usable.
     with engine.connect() as conn:
