@@ -29,6 +29,7 @@ describe('watchlist edge contract', () => {
     it('labels intentionally unavailable enrichment on a partial persisted response', () => {
         render(<InsiderEdgePanel edgeData={{
             status: 'partial', congressional: [{ member: 'A', action: 'BUY' }],
+            availability: { lever_pullers: { status: 'unavailable' } },
         }} loading={false} />);
 
         expect(screen.getByText('Lever and actor enrichment is unavailable in this read-only view.')).toBeInTheDocument();

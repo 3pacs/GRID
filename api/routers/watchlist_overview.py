@@ -82,6 +82,22 @@ def _edge_unavailable_response(ticker: str) -> dict:
     }
 
 
+def _edge_optional_rows(engine, statement, params, section: str, availability: dict) -> list:
+    """Run one bounded persisted-data read without masking a failed section."""
+    try:
+        with engine.connect() as conn:
+            # Transaction-local timeout; this is a SELECT so the edge route's
+            # SQL capture remains read-only even when an optional table stalls.
+            conn.execute(text("SELECT set_config('statement_timeout', '2500ms', true)"))
+            rows = conn.execute(text(statement), params).fetchall()
+        availability[section] = {"status": "available"}
+        return rows
+    except Exception as exc:
+        log.warning("Edge: {section} read unavailable: {error}", section=section, error=str(exc))
+        availability[section] = {"status": "unavailable", "reason": f"{section}_unavailable"}
+        return []
+
+
 @router.get("/{ticker}/overview")
 def get_ticker_overview(
     ticker: str,
@@ -575,6 +591,7 @@ def get_ticker_edge(
     whale_flow: list[dict] = []
     prediction_markets: list[dict] = []
     smart_money: list[dict] = []
+    availability: dict = {}
 
     # This endpoint is a read path.  The trust/lever/actor helpers initialize
     # tables (and the lever helper recomputes and persists profiles), so do not
@@ -605,13 +622,13 @@ def get_ticker_edge(
                 elif source_type == "insider" and _edge_within_days(signal_date, 30):
                     insider.append({
                         "name": str(source_id), "title": meta.get("title", ""),
-                        "action": signal, "shares": meta.get("shares", 0),
-                        "value": meta.get("value", 0), "date": str(signal_date),
+                        "action": signal, "shares": meta.get("shares"),
+                        "value": meta.get("value"), "date": str(signal_date),
                         "cluster": meta.get("cluster", False),
                     })
                 elif source_type == "darkpool" and _edge_within_days(signal_date, 7) and dark_pool is None:
                     dark_pool = {
-                        "volume_vs_avg": meta.get("volume_vs_avg", 1.0),
+                        "volume_vs_avg": meta.get("volume_vs_avg"),
                         "signal": "accumulation" if signal == "BUY" else "distribution" if signal == "SELL" else "unavailable",
                         "date": str(signal_date),
                     }
@@ -628,14 +645,14 @@ def get_ticker_edge(
                 meta = r[3] or {}
                 if isinstance(meta, str):
                     try:
-                        import json; meta = json.loads(meta)
+                            meta = json.loads(meta)
                     except Exception:
                         meta = {}
                 whale_flow.append({
-                    "strike": meta.get("strike", 0),
+                    "strike": meta.get("strike"),
                     "expiry": meta.get("expiry", ""),
                     "direction": str(r[1]),
-                    "premium": meta.get("premium", 0),
+                    "premium": meta.get("premium"),
                     "date": str(r[2]),
                 })
             social_rows = conn.execute(text("""
@@ -649,7 +666,7 @@ def get_ticker_edge(
                 meta = r[4] or {}
                 if isinstance(meta, str):
                     try:
-                        import json; meta = json.loads(meta)
+                            meta = json.loads(meta)
                     except Exception:
                         meta = {}
                 smart_money.append({
@@ -669,13 +686,13 @@ def get_ticker_edge(
                 meta = r[2] or {}
                 if isinstance(meta, str):
                     try:
-                        import json; meta = json.loads(meta)
+                            meta = json.loads(meta)
                     except Exception:
                         meta = {}
                 prediction_markets.append({
                     "market": meta.get("market", str(r[0])),
-                    "probability": meta.get("probability", 0.5),
-                    "change_24h": meta.get("change_24h", 0.0),
+                    "probability": meta.get("probability"),
+                    "change_24h": meta.get("change_24h"),
                 })
             convergence_rows = conn.execute(text("""
                 SELECT source_type, source_id, signal_type, signal_date, trust_score
@@ -689,31 +706,48 @@ def get_ticker_edge(
         log.warning("Edge: signal_sources read unavailable for {t}: {e}", t=ticker_upper, e=str(exc))
         return _edge_unavailable_response(ticker_upper)
 
-    # Lever and actor helpers are intentionally not called: they can initialize
-    # or persist.  Do not substitute empty data for that unavailable enrichment.
-    lever_pullers: list[dict] = []
+    availability["signal_sources"] = {"status": "available"}
+
+    # Persisted profiles only: do not invoke helpers that rebuild or seed them.
+    lever_rows = _edge_optional_rows(engine, """
+        SELECT DISTINCT ON (lp.id) lp.name, s.signal_type, lp.motivation_model
+        FROM lever_pullers lp
+        JOIN signal_sources s ON s.source_type = lp.source_type AND s.source_id = lp.source_id
+        WHERE s.ticker = :t
+        ORDER BY lp.id, s.signal_date DESC
+        LIMIT 20
+    """, {"t": ticker_upper}, "lever_pullers", availability)
+    lever_pullers = [
+        {"name": str(row[0]), "action": str(row[1]) if row[1] else None,
+         "context": row[2] if row[2] else None}
+        for row in lever_rows
+    ]
+
+    actor_rows = _edge_optional_rows(engine, """
+        SELECT DISTINCT ON (a.id) a.name, a.title, a.motivation_model
+        FROM actors a
+        LEFT JOIN signal_sources s ON lower(a.name) = lower(s.source_id) AND s.ticker = :t
+        WHERE s.source_id IS NOT NULL
+           OR a.known_positions @> CAST(:position AS JSONB)
+        ORDER BY a.id, s.signal_date DESC NULLS LAST
+        LIMIT 20
+    """, {"t": ticker_upper, "position": json.dumps([{"ticker": ticker_upper}])}, "actor_context", availability)
+    known_levers = {entry["name"].lower() for entry in lever_pullers}
+    for name, title, motivation in actor_rows:
+        if str(name).lower() not in known_levers:
+            lever_pullers.append({
+                "name": str(name), "action": "WATCHING",
+                "context": " — ".join(str(value) for value in (title, motivation) if value) or None,
+            })
 
     # 5. Investigation leads
     leads: list[dict] = []
-    try:
-        with engine.connect() as conn:
-            tbl_check = conn.execute(text("""
-                SELECT EXISTS (
-                    SELECT 1 FROM information_schema.tables
-                    WHERE table_name = 'investigation_leads'
-                )
-            """)).scalar()
-            if tbl_check:
-                lead_rows = conn.execute(text("""
-                    SELECT question, status, created_at
-                    FROM investigation_leads
-                    WHERE ticker = :t
-                    ORDER BY created_at DESC LIMIT 10
-                """), {"t": ticker_upper}).fetchall()
-                for r in lead_rows:
-                    leads.append({"question": str(r[0]), "status": str(r[1])})
-    except Exception as exc:
-        log.debug("Edge: investigation_leads not available: {e}", e=str(exc))
+    lead_rows = _edge_optional_rows(engine, """
+        SELECT question, status, created_at FROM investigation_leads
+        WHERE ticker = :t ORDER BY created_at DESC LIMIT 10
+    """, {"t": ticker_upper}, "investigation_leads", availability)
+    for r in lead_rows:
+        leads.append({"question": str(r[0]), "status": str(r[1])})
 
     # 6. Convergence detection, equivalent to trust_scorer.detect_convergence
     # without its schema initializer.
@@ -775,11 +809,7 @@ def get_ticker_edge(
     return {
         "ticker": ticker_upper,
         "status": "partial",
-        "availability": {
-            "signal_sources": {"status": "available"},
-            "lever_pullers": {"status": "unavailable", "reason": "read_only_enrichment_unavailable"},
-            "actor_context": {"status": "unavailable", "reason": "read_only_enrichment_unavailable"},
-        },
+        "availability": availability,
         "congressional": congressional,
         "insider": insider,
         "dark_pool": dark_pool,
