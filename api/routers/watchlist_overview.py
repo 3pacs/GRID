@@ -712,7 +712,14 @@ def get_ticker_edge(
     lever_rows = _edge_optional_rows(engine, """
         SELECT DISTINCT ON (lp.id) lp.name, s.signal_type, lp.motivation_model
         FROM lever_pullers lp
-        JOIN signal_sources s ON s.source_type = lp.source_type AND s.source_id = lp.source_id
+        JOIN signal_sources s ON s.source_type = lp.source_type
+          AND lp.source_id = CASE
+              WHEN s.source_type = 'options_flow' THEN regexp_replace(s.source_id, '_[0-9.]+$', '')
+              WHEN s.source_type = 'quiverquant:house' THEN COALESCE(s.signal_value->>'Representative', s.source_id)
+              WHEN s.source_type = 'quiverquant:senate' THEN COALESCE(s.signal_value->>'Senator', s.source_id)
+              WHEN s.source_type = 'quiverquant:insider' THEN COALESCE(s.signal_value->>'Name', s.source_id)
+              WHEN s.source_type = 'quiverquant:lobbying' THEN COALESCE(s.signal_value->>'Registrant', s.signal_value->>'Client', s.source_id)
+              ELSE s.source_id END
         WHERE s.ticker = :t
         ORDER BY lp.id, s.signal_date DESC
         LIMIT 20
@@ -726,7 +733,7 @@ def get_ticker_edge(
     actor_rows = _edge_optional_rows(engine, """
         SELECT DISTINCT ON (a.id) a.name, a.title, a.motivation_model
         FROM actors a
-        LEFT JOIN signal_sources s ON lower(a.name) = lower(s.source_id) AND s.ticker = :t
+        LEFT JOIN signal_sources s ON lower(s.source_id) LIKE '%' || lower(a.name) || '%' AND s.ticker = :t
         WHERE s.source_id IS NOT NULL
            OR a.known_positions @> CAST(:position AS JSONB)
         ORDER BY a.id, s.signal_date DESC NULLS LAST
@@ -742,12 +749,8 @@ def get_ticker_edge(
 
     # 5. Investigation leads
     leads: list[dict] = []
-    lead_rows = _edge_optional_rows(engine, """
-        SELECT question, status, created_at FROM investigation_leads
-        WHERE ticker = :t ORDER BY created_at DESC LIMIT 10
-    """, {"t": ticker_upper}, "investigation_leads", availability)
-    for r in lead_rows:
-        leads.append({"question": str(r[0]), "status": str(r[1])})
+    # Sleuth's persisted DDL has no ticker association; do not invent one.
+    availability["investigation_leads"] = {"status": "unsupported", "reason": "no_ticker_association"}
 
     # 6. Convergence detection, equivalent to trust_scorer.detect_convergence
     # without its schema initializer.

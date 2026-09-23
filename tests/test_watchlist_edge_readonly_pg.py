@@ -38,6 +38,7 @@ def _create_signal_sources(engine) -> None:
                 ticker TEXT NOT NULL,
                 signal_type TEXT NOT NULL,
                 signal_date TIMESTAMPTZ NOT NULL,
+                signal_value JSONB,
                 metadata JSONB,
                 outcome TEXT,
                 trust_score DOUBLE PRECISION
