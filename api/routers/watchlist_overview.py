@@ -27,6 +27,16 @@ from intelligence.entity_resolver import _log_query_failure
 router = APIRouter(tags=["watchlist"])
 
 
+def _round_or_none(value, digits: int = 2) -> float | None:
+    """Round a nullable measurement without turning absence into a midpoint."""
+    if value is None:
+        return None
+    try:
+        return round(float(value), digits)
+    except (TypeError, ValueError):
+        return None
+
+
 @router.get("/{ticker}/overview")
 def get_ticker_overview(
     ticker: str,
@@ -538,11 +548,11 @@ def get_ticker_edge(
                         meta = {}
                 congressional.append({
                     "member": sig.get("member", "Unknown"),
-                    "action": sig.get("direction", "BUY"),
+                    "action": sig.get("signal_type") or "UNAVAILABLE",
                     "amount": meta.get("amount", "N/A"),
                     "date": sig.get("date", ""),
                     "committee": meta.get("committee", "N/A"),
-                    "trust_score": round(sig.get("trust_score", 0.5), 2),
+                    "trust_score": _round_or_none(sig.get("trust_score")),
                 })
             for sig in edge_data.get("insider", []):
                 meta = sig.get("metadata") or {}
@@ -554,7 +564,7 @@ def get_ticker_edge(
                 insider.append({
                     "name": sig.get("insider", "Unknown"),
                     "title": meta.get("title", ""),
-                    "action": sig.get("direction", "BUY"),
+                    "action": sig.get("signal_type") or "UNAVAILABLE",
                     "shares": meta.get("shares", 0),
                     "value": meta.get("value", 0),
                     "date": sig.get("date", ""),
@@ -572,8 +582,9 @@ def get_ticker_edge(
                 dark_pool = {
                     "volume_vs_avg": dp_meta.get("volume_vs_avg", 1.0),
                     "signal": (
-                        "accumulation" if latest_dp.get("direction") == "BUY"
-                        else "distribution"
+                        "accumulation" if latest_dp.get("signal_type") == "BUY"
+                        else "distribution" if latest_dp.get("signal_type") == "SELL"
+                        else "unavailable"
                     ),
                     "date": latest_dp.get("date", ""),
                 }
@@ -623,7 +634,7 @@ def get_ticker_edge(
                     "source": meta.get("platform", "unknown"),
                     "user": str(r[0]),
                     "direction": str(r[1]),
-                    "trust_score": round(float(r[3]) if r[3] else 0.5, 2),
+                    "trust_score": _round_or_none(r[3]),
                 })
             pred_rows = conn.execute(text("""
                 SELECT source_id, signal_date, metadata
@@ -699,28 +710,34 @@ def get_ticker_edge(
         log.debug("Edge: investigation_leads not available: {e}", e=str(exc))
 
     # 6. Convergence detection
-    convergence: dict = {"direction": "neutral", "source_count": 0, "confidence": 0.5}
+    convergence: dict = {"direction": None, "signal_type": None, "source_count": 0,
+                         "confidence": None, "status": "none"}
     try:
         from intelligence.trust_scorer import detect_convergence
         conv_events = detect_convergence(engine, ticker=ticker_upper)
         if conv_events:
             best = conv_events[0]
             convergence = {
-                "direction": best.get("direction", "neutral").lower(),
+                "direction": best.get("direction"),
+                "signal_type": best.get("signal_type"),
                 "source_count": best.get("source_count", 0),
-                "confidence": round(best.get("combined_confidence", 0.5), 2),
+                "confidence": _round_or_none(best.get("combined_confidence")),
+                "status": "detected",
             }
     except Exception as exc:
         log.warning("Edge: convergence failed for {t}: {e}", t=ticker_upper, e=str(exc))
+        convergence = {"direction": None, "signal_type": None, "source_count": 0,
+                       "confidence": None, "status": "unavailable",
+                       "reason": "convergence_detection_failed"}
 
     # 7. Build edge_summary (rule-based)
-    source_count = convergence["source_count"]
-    direction = convergence["direction"]
+    source_count = convergence.get("source_count") or 0
+    direction = convergence.get("direction") or convergence.get("signal_type")
     parts: list[str] = []
     if source_count >= 3:
-        parts.append(f"{source_count} independent sources {direction}.")
+        parts.append(f"{source_count} independent sources {direction}." if direction else f"{source_count} independent sources, direction unresolved.")
     elif source_count > 0:
-        parts.append(f"{source_count} source(s) leaning {direction}.")
+        parts.append(f"{source_count} source(s) leaning {direction}." if direction else f"{source_count} source(s), direction unresolved.")
     else:
         parts.append("Limited intelligence signals.")
 
