@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from datetime import date, datetime, timedelta
+
 from fastapi import APIRouter, Depends
 from loguru import logger as log
 from sqlalchemy import text
@@ -35,6 +38,48 @@ def _round_or_none(value, digits: int = 2) -> float | None:
         return round(float(value), digits)
     except (TypeError, ValueError):
         return None
+
+
+def _edge_metadata(value) -> dict:
+    """Decode stored JSON metadata without inventing a payload on failure."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _edge_within_days(value, days: int) -> bool:
+    """Apply the trust scorer's per-source window to a persisted timestamp."""
+    if isinstance(value, datetime):
+        observed = value.date()
+    elif isinstance(value, date):
+        observed = value
+    else:
+        try:
+            observed = datetime.fromisoformat(str(value).replace("Z", "+00:00")).date()
+        except ValueError:
+            return False
+    return observed >= date.today() - timedelta(days=days)
+
+
+def _edge_unavailable_response(ticker: str) -> dict:
+    """A stable, explicit response when the persisted read model is absent."""
+    return {
+        "ticker": ticker,
+        "status": "unavailable",
+        "reason": "signal_sources_unavailable",
+        "availability": {"signal_sources": {"status": "unavailable", "reason": "signal_sources_unavailable"}},
+        "congressional": [], "insider": [], "dark_pool": None, "whale_flow": [],
+        "prediction_markets": [], "smart_money": [], "lever_pullers": [], "leads": [],
+        "convergence": {"direction": None, "signal_type": None, "source_count": 0,
+                        "confidence": None, "status": "unavailable", "reason": "signal_sources_unavailable"},
+        "edge_summary": "Intelligence data is currently unavailable.",
+    }
 
 
 @router.get("/{ticker}/overview")
@@ -522,8 +567,6 @@ def get_ticker_edge(
     whale flow, prediction markets, smart money, lever pullers,
     investigation leads, and convergence into one response.
     """
-    from datetime import date, timedelta
-
     ticker_upper = ticker.upper().strip()
 
     congressional: list[dict] = []
@@ -533,70 +576,49 @@ def get_ticker_edge(
     prediction_markets: list[dict] = []
     smart_money: list[dict] = []
 
-    # 1. Trust scorer: congressional, insider, dark pool
-    try:
-        from intelligence.trust_scorer import get_insider_edge, detect_convergence
-
-        edge_data = get_insider_edge(engine, ticker_upper)
-        if edge_data:
-            for sig in edge_data.get("congressional", []):
-                meta = sig.get("metadata") or {}
-                if isinstance(meta, str):
-                    try:
-                        import json; meta = json.loads(meta)
-                    except Exception:
-                        meta = {}
-                congressional.append({
-                    "member": sig.get("member", "Unknown"),
-                    "action": sig.get("signal_type") or "UNAVAILABLE",
-                    "amount": meta.get("amount", "N/A"),
-                    "date": sig.get("date", ""),
-                    "committee": meta.get("committee", "N/A"),
-                    "trust_score": _round_or_none(sig.get("trust_score")),
-                })
-            for sig in edge_data.get("insider", []):
-                meta = sig.get("metadata") or {}
-                if isinstance(meta, str):
-                    try:
-                        import json; meta = json.loads(meta)
-                    except Exception:
-                        meta = {}
-                insider.append({
-                    "name": sig.get("insider", "Unknown"),
-                    "title": meta.get("title", ""),
-                    "action": sig.get("signal_type") or "UNAVAILABLE",
-                    "shares": meta.get("shares", 0),
-                    "value": meta.get("value", 0),
-                    "date": sig.get("date", ""),
-                    "cluster": meta.get("cluster", False),
-                })
-            dp_signals = edge_data.get("darkpool", [])
-            if dp_signals:
-                latest_dp = dp_signals[0]
-                dp_meta = latest_dp.get("metadata") or {}
-                if isinstance(dp_meta, str):
-                    try:
-                        import json; dp_meta = json.loads(dp_meta)
-                    except Exception:
-                        dp_meta = {}
-                dark_pool = {
-                    "volume_vs_avg": dp_meta.get("volume_vs_avg", 1.0),
-                    "signal": (
-                        "accumulation" if latest_dp.get("signal_type") == "BUY"
-                        else "distribution" if latest_dp.get("signal_type") == "SELL"
-                        else "unavailable"
-                    ),
-                    "date": latest_dp.get("date", ""),
-                }
-    except Exception as exc:
-        log.warning("Edge: trust_scorer failed for {t}: {e}", t=ticker_upper, e=str(exc))
-
-    # 2. Whale flow + prediction markets + smart money from signal_sources
+    # This endpoint is a read path.  The trust/lever/actor helpers initialize
+    # tables (and the lever helper recomputes and persists profiles), so do not
+    # call them from an authenticated GET.  These selects deliberately mirror
+    # the trust scorer's windows and convergence calculation using persisted
+    # signal_sources rows only.
     try:
         with engine.connect() as conn:
+            core_rows = conn.execute(text("""
+                SELECT source_type, source_id, signal_type, signal_date,
+                       trust_score, metadata
+                FROM signal_sources
+                WHERE ticker = :t
+                  AND source_type IN ('congressional', 'insider', 'darkpool')
+                  AND signal_date >= NOW() - INTERVAL '45 days'
+                ORDER BY signal_date DESC
+            """), {"t": ticker_upper}).fetchall()
+            for source_type, source_id, signal_type, signal_date, trust_score, metadata in core_rows:
+                meta = _edge_metadata(metadata)
+                signal = str(signal_type) if signal_type else "UNAVAILABLE"
+                if source_type == "congressional" and _edge_within_days(signal_date, 45):
+                    congressional.append({
+                        "member": str(source_id), "action": signal,
+                        "amount": meta.get("amount", "N/A"), "date": str(signal_date),
+                        "committee": meta.get("committee", "N/A"),
+                        "trust_score": _round_or_none(trust_score),
+                    })
+                elif source_type == "insider" and _edge_within_days(signal_date, 30):
+                    insider.append({
+                        "name": str(source_id), "title": meta.get("title", ""),
+                        "action": signal, "shares": meta.get("shares", 0),
+                        "value": meta.get("value", 0), "date": str(signal_date),
+                        "cluster": meta.get("cluster", False),
+                    })
+                elif source_type == "darkpool" and _edge_within_days(signal_date, 7) and dark_pool is None:
+                    dark_pool = {
+                        "volume_vs_avg": meta.get("volume_vs_avg", 1.0),
+                        "signal": "accumulation" if signal == "BUY" else "distribution" if signal == "SELL" else "unavailable",
+                        "date": str(signal_date),
+                    }
+
             lookback = date.today() - timedelta(days=14)
             whale_rows = conn.execute(text("""
-                SELECT source_id, direction, signal_date, metadata
+                SELECT source_id, signal_type, signal_date, metadata
                 FROM signal_sources
                 WHERE ticker = :t AND source_type = 'scanner'
                   AND signal_date >= :lb
@@ -617,7 +639,7 @@ def get_ticker_edge(
                     "date": str(r[2]),
                 })
             social_rows = conn.execute(text("""
-                SELECT source_id, direction, signal_date, trust_score, metadata
+                SELECT source_id, signal_type, signal_date, trust_score, metadata
                 FROM signal_sources
                 WHERE ticker = :t AND source_type = 'social'
                   AND signal_date >= :lb
@@ -655,37 +677,21 @@ def get_ticker_edge(
                     "probability": meta.get("probability", 0.5),
                     "change_24h": meta.get("change_24h", 0.0),
                 })
+            convergence_rows = conn.execute(text("""
+                SELECT source_type, source_id, signal_type, signal_date, trust_score
+                FROM signal_sources
+                WHERE ticker = :t
+                  AND signal_date >= :lookback
+                  AND outcome IN ('PENDING', 'CORRECT')
+                ORDER BY signal_date DESC
+            """), {"t": ticker_upper, "lookback": lookback}).fetchall()
     except Exception as exc:
-        log.warning("Edge: signal_sources query failed for {t}: {e}", t=ticker_upper, e=str(exc))
+        log.warning("Edge: signal_sources read unavailable for {t}: {e}", t=ticker_upper, e=str(exc))
+        return _edge_unavailable_response(ticker_upper)
 
-    # 3. Lever pullers
+    # Lever and actor helpers are intentionally not called: they can initialize
+    # or persist.  Do not substitute empty data for that unavailable enrichment.
     lever_pullers: list[dict] = []
-    try:
-        from intelligence.lever_pullers import get_lever_context_for_ticker
-        lp_data = get_lever_context_for_ticker(engine, ticker_upper)
-        for puller in lp_data.get("active_pullers", []):
-            lever_pullers.append({
-                "name": puller.get("name", "Unknown"),
-                "action": puller.get("latest_direction", "UNKNOWN"),
-                "context": puller.get("motivation_summary", ""),
-            })
-    except Exception as exc:
-        log.warning("Edge: lever_pullers failed for {t}: {e}", t=ticker_upper, e=str(exc))
-
-    # 4. Actor network context
-    try:
-        from intelligence.actor_network import get_actor_context_for_ticker
-        actor_data = get_actor_context_for_ticker(engine, ticker_upper)
-        lp_names = {lp["name"].lower() for lp in lever_pullers}
-        for actor in actor_data.get("actors", []):
-            if actor.get("name", "").lower() not in lp_names:
-                lever_pullers.append({
-                    "name": actor.get("name", "Unknown"),
-                    "action": "WATCHING",
-                    "context": f"{actor.get('title', '')} — {actor.get('motivation', '')}",
-                })
-    except Exception as exc:
-        log.warning("Edge: actor_network failed for {t}: {e}", t=ticker_upper, e=str(exc))
 
     # 5. Investigation leads
     leads: list[dict] = []
@@ -709,26 +715,26 @@ def get_ticker_edge(
     except Exception as exc:
         log.debug("Edge: investigation_leads not available: {e}", e=str(exc))
 
-    # 6. Convergence detection
+    # 6. Convergence detection, equivalent to trust_scorer.detect_convergence
+    # without its schema initializer.
     convergence: dict = {"direction": None, "signal_type": None, "source_count": 0,
                          "confidence": None, "status": "none"}
-    try:
-        from intelligence.trust_scorer import detect_convergence
-        conv_events = detect_convergence(engine, ticker=ticker_upper)
-        if conv_events:
-            best = conv_events[0]
-            convergence = {
-                "direction": best.get("direction"),
-                "signal_type": best.get("signal_type"),
-                "source_count": best.get("source_count", 0),
-                "confidence": _round_or_none(best.get("combined_confidence")),
-                "status": "detected",
-            }
-    except Exception as exc:
-        log.warning("Edge: convergence failed for {t}: {e}", t=ticker_upper, e=str(exc))
-        convergence = {"direction": None, "signal_type": None, "source_count": 0,
-                       "confidence": None, "status": "unavailable",
-                       "reason": "convergence_detection_failed"}
+    by_direction: dict[str, dict[str, float]] = {"BUY": {}, "SELL": {}}
+    for source_type, _source_id, signal_type, _signal_date, trust_score in convergence_rows:
+        if signal_type in by_direction and source_type not in by_direction[signal_type]:
+            by_direction[signal_type][source_type] = float(trust_score) if trust_score is not None else 0.5
+    detected = next(
+        ((signal_type, scores) for signal_type, scores in by_direction.items() if len(scores) >= 3),
+        None,
+    )
+    if detected:
+        signal_type, scores = detected
+        convergence = {
+            "direction": None, "signal_type": signal_type,
+            "source_count": len(scores),
+            "confidence": _round_or_none(sum(scores.values()) / len(scores)),
+            "status": "detected",
+        }
 
     # 7. Build edge_summary (rule-based)
     source_count = convergence.get("source_count") or 0
@@ -768,6 +774,12 @@ def get_ticker_edge(
 
     return {
         "ticker": ticker_upper,
+        "status": "partial",
+        "availability": {
+            "signal_sources": {"status": "available"},
+            "lever_pullers": {"status": "unavailable", "reason": "read_only_enrichment_unavailable"},
+            "actor_context": {"status": "unavailable", "reason": "read_only_enrichment_unavailable"},
+        },
         "congressional": congressional,
         "insider": insider,
         "dark_pool": dark_pool,

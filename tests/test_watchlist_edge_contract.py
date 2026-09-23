@@ -1,13 +1,13 @@
-"""Contract coverage for truthful watchlist edge fields."""
+"""Contract coverage for the read-only watchlist edge response."""
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import os
 
 os.environ.setdefault("DB_PASSWORD", "test-password")
 
 from api.routers import watchlist_overview
-from intelligence import trust_scorer
 
 
 class _Result:
@@ -23,8 +23,22 @@ class _Result:
 
 
 class _Connection:
+    def __init__(self):
+        now = datetime.now(timezone.utc)
+        self.core = [("congressional", "A", "SELL", now, None, {"amount": "$1K"})]
+        self.convergence = [
+            ("congressional", "A", "SELL", now, None),
+            ("insider", "B", "SELL", now, 0.8),
+            ("darkpool", "C", "SELL", now, 0.6),
+        ]
+
     def execute(self, statement, *_args):
-        if "information_schema.tables" in str(statement):
+        sql = str(statement)
+        if "outcome IN ('PENDING', 'CORRECT')" in sql:
+            return _Result(self.convergence)
+        if "source_type IN ('congressional', 'insider', 'darkpool')" in sql:
+            return _Result(self.core)
+        if "information_schema.tables" in sql:
             return _Result(scalar_value=False)
         return _Result()
 
@@ -40,28 +54,46 @@ class _Engine:
         return _Connection()
 
 
-def test_edge_uses_signal_type_and_marks_unscored_convergence(monkeypatch):
-    monkeypatch.setattr(watchlist_overview, "get_insider_edge", None, raising=False)
-    monkeypatch.setattr(
-        trust_scorer,
-        "get_insider_edge",
-        lambda *_args: {"congressional": [{"member": "A", "signal_type": "SELL", "trust_score": None}], "insider": [], "darkpool": []},
-    )
-    monkeypatch.setattr(
-        trust_scorer,
-        "detect_convergence",
-        lambda *_args, **_kwargs: [{"signal_type": "SELL", "source_count": 2, "combined_confidence": None}],
-    )
+def test_edge_reads_persisted_signal_types_and_marks_unscored_convergence(monkeypatch):
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("GET edge must not use an initializing helper")
+
+    monkeypatch.setattr(watchlist_overview, "get_insider_edge", forbidden, raising=False)
+    monkeypatch.setattr(watchlist_overview, "detect_convergence", forbidden, raising=False)
 
     payload = watchlist_overview.get_ticker_edge("test", user={}, engine=_Engine())
 
+    assert payload["status"] == "partial"
     assert payload["congressional"][0]["action"] == "SELL"
     assert payload["congressional"][0]["trust_score"] is None
     assert payload["convergence"] == {
         "direction": None,
         "signal_type": "SELL",
-        "source_count": 2,
-        "confidence": None,
+        "source_count": 3,
+        "confidence": 0.63,
         "status": "detected",
     }
-    assert "leaning SELL" in payload["edge_summary"]
+    assert "independent sources SELL" in payload["edge_summary"]
+    assert payload["availability"]["lever_pullers"]["status"] == "unavailable"
+
+
+def test_edge_missing_signal_sources_is_explicitly_unavailable():
+    class MissingConnection:
+        def execute(self, *_args, **_kwargs):
+            raise RuntimeError("relation signal_sources does not exist")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class MissingEngine:
+        def connect(self):
+            return MissingConnection()
+
+    payload = watchlist_overview.get_ticker_edge("test", user={}, engine=MissingEngine())
+
+    assert payload["status"] == "unavailable"
+    assert payload["reason"] == "signal_sources_unavailable"
+    assert payload["convergence"]["status"] == "unavailable"
