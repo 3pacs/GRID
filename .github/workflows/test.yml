@@ -183,6 +183,14 @@ jobs:
           TESTING: "true"
         run: python -m pytest tests/test_dad_gold_readonly_pg.py -q -rA
 
+      - name: Dad ticker detail read-only PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_dad_ticker_detail_readonly_pg.py -q -rA
+
       - name: Check for SQL injection patterns
         run: |
           echo "Checking for unsafe SQL patterns..."

@@ -130,6 +130,9 @@ _GOLD_INFLIGHT_LOCK = threading.Lock()
 _GOLD_MEMORY_CACHE: dict[tuple[str, str, str, float | None], tuple[datetime, dict[str, Any]]] = {}
 _GOLD_MEMORY_CACHE_LOCK = threading.Lock()
 GOLD_MEMORY_CACHE_MAX_ENTRIES = 512
+_FINVIZ_MEMORY_CACHE: dict[str, tuple[datetime, dict[str, Any]]] = {}
+_FINVIZ_MEMORY_CACHE_LOCK = threading.Lock()
+FINVIZ_MEMORY_CACHE_MAX_ENTRIES = 512
 
 DAD_CACHE_VERSION = "dad-ticker-v2"
 DEFAULT_CHART_POINTS = 220
@@ -840,10 +843,35 @@ def _finviz_stat_cards(fields: dict[str, dict[str, Any]]) -> list[dict[str, Any]
     return cards
 
 
+def _remember_finviz_profile(ticker: str, stored: dict[str, Any]) -> None:
+    """Keep a live GET refresh useful to subsequent detail reads in this process."""
+    now = datetime.now(timezone.utc)
+    with _FINVIZ_MEMORY_CACHE_LOCK:
+        expired = [key for key, (created, _) in _FINVIZ_MEMORY_CACHE.items()
+                   if (now - created).total_seconds() > 24 * 3600]
+        for key in expired:
+            del _FINVIZ_MEMORY_CACHE[key]
+        if ticker not in _FINVIZ_MEMORY_CACHE and len(_FINVIZ_MEMORY_CACHE) >= FINVIZ_MEMORY_CACHE_MAX_ENTRIES:
+            del _FINVIZ_MEMORY_CACHE[min(_FINVIZ_MEMORY_CACHE, key=lambda key: _FINVIZ_MEMORY_CACHE[key][0])]
+        _FINVIZ_MEMORY_CACHE[ticker] = (now, copy.deepcopy(stored))
+
+
 def _get_finviz_profile(
     engine: Any, ticker: str, *, refresh: bool = False, persist_refresh: bool = True
 ) -> dict[str, Any]:
     stored = _read_finviz_rows(engine, ticker)
+    from_memory = False
+    if not persist_refresh:
+        with _FINVIZ_MEMORY_CACHE_LOCK:
+            remembered = _FINVIZ_MEMORY_CACHE.get(ticker)
+        if remembered:
+            created, memory_stored = remembered
+            stored_pull = _as_utc(stored.get("latest_pull"))
+            if (datetime.now(timezone.utc) - created).total_seconds() <= 24 * 3600 and (
+                stored_pull is None or created > stored_pull
+            ):
+                stored = copy.deepcopy(memory_stored)
+                from_memory = True
     freshness = _freshness_state(stored.get("latest_pull"), stale_hours=24)
     scraped = False
     scrape_error: str | None = None
@@ -874,6 +902,7 @@ def _get_finviz_profile(
                 stored = {"fields": live_fields, "field_count": len(live_fields),
                           "latest_pull": now, "latest_obs_date": date.today(), "rows_inserted": 0}
                 freshness = _freshness_state(now, stale_hours=24)
+                _remember_finviz_profile(ticker, stored)
         except Exception as exc:
             scrape_error = str(exc)
             log.debug("Finviz live scrape failed for {t}: {e}", t=ticker, e=scrape_error)
@@ -885,7 +914,8 @@ def _get_finviz_profile(
 
     return {
         "status": status,
-        "source": ("postgres+live" if persist_refresh else "live-readonly") if scraped else "postgres",
+        "source": (("postgres+live" if persist_refresh else "live-readonly") if scraped
+                   else "live-memory" if from_memory else "postgres"),
         "freshness": freshness,
         "latest_pull": stored.get("latest_pull").isoformat() if stored.get("latest_pull") else None,
         "latest_obs_date": str(stored.get("latest_obs_date")) if stored.get("latest_obs_date") else None,
@@ -2257,7 +2287,9 @@ def _build_finviz_payload(
         "finviz",
         timings,
         lambda: _compact_finviz(
-            _get_finviz_profile(engine, ticker, refresh=refresh_finviz),
+            _get_finviz_profile(
+                engine, ticker, refresh=refresh_finviz, persist_refresh=False
+            ),
             include_fields=True,
         ),
     )
@@ -2349,7 +2381,7 @@ def get_dad_ticker_finviz(
     refresh_finviz: bool = Query(False),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
-    """Return the full cached Finviz snapshot, optionally refreshing stale rows."""
+    """Return stored Finviz rows or live refreshed fields without persisting a GET."""
     ticker_upper = _normalize_ticker(ticker)
     if not ticker_upper:
         return {"ticker": "", "status": "invalid", "message": "Enter a ticker symbol."}
