@@ -24,6 +24,13 @@ function cleanTicker(value) {
     return String(value || '').replace(/[^A-Za-z0-9.^-]/g, '').toUpperCase().slice(0, 12);
 }
 
+function tickerFromHash() {
+    if (typeof window === 'undefined') return 'RXT';
+    const [, search = ''] = window.location.hash.slice(1).split('?', 2);
+    const params = new URLSearchParams(search);
+    return cleanTicker(params.get('ticker') || params.get('symbol')) || 'RXT';
+}
+
 function metric(value, fallback = '0') {
     if (value == null || value === '') return fallback;
     if (typeof value === 'number') return value.toLocaleString();
@@ -263,9 +270,11 @@ function EvidenceTable({ rows }) {
 }
 
 export default function TickerLookup() {
+    const initialTicker = useMemo(tickerFromHash, []);
     const streamRef = useRef(null);
-    const [query, setQuery] = useState('RXT');
-    const [activeTicker, setActiveTicker] = useState('RXT');
+    const currentTickerRef = useRef(initialTicker);
+    const [query, setQuery] = useState(initialTicker);
+    const [activeTicker, setActiveTicker] = useState(initialTicker);
     const [data, setData] = useState(null);
     const [marketData, setMarketData] = useState(null);
     const [period, setPeriod] = useState('1Y');
@@ -413,6 +422,7 @@ export default function TickerLookup() {
         streamRef.current = null;
         setQuery(ticker);
         setActiveTicker(ticker);
+        currentTickerRef.current = ticker;
         setLoading(true);
         setMarketLoading(true);
         setSectionStatus(DETAIL_STATUS_LOADING);
@@ -433,8 +443,14 @@ export default function TickerLookup() {
     }
 
     useEffect(() => {
-        lookup('RXT');
+        lookup(initialTicker);
+        const handleHashChange = () => {
+            const routeTicker = tickerFromHash();
+            if (routeTicker !== currentTickerRef.current) lookup(routeTicker);
+        };
+        window.addEventListener('hashchange', handleHashChange);
         return () => {
+            window.removeEventListener('hashchange', handleHashChange);
             streamRef.current?.close();
             streamRef.current = null;
         };
