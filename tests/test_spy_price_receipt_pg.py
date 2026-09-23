@@ -240,8 +240,16 @@ def test_receipt_to_astrogrid_api_anchor_to_score_without_hindsight(
 
     with engine.connect() as conn:
         real_now = conn.execute(text("SELECT NOW()")).scalar_one()
-    entry_day = real_now.astimezone(timezone.utc).date() - timedelta(days=2)
-    entry_available = datetime.combine(entry_day + timedelta(days=1), datetime.min.time(), timezone.utc) + timedelta(minutes=5)
+    # Use a completed trading weekday. A Sunday synthetic SPY close would
+    # prove links but could never be produced by the intended daily feed.
+    entry_day = real_now.astimezone(timezone.utc).date() - timedelta(days=1)
+    while True:
+        entry_available = datetime.combine(
+            entry_day + timedelta(days=1), datetime.min.time(), timezone.utc,
+        ) + timedelta(minutes=5)
+        if entry_day.weekday() < 5 and entry_available < real_now:
+            break
+        entry_day -= timedelta(days=1)
     entry_marker = capture_payload(entry_day, entry_available)
     entry_raw_id = _raw(engine, entry_day, entry_available, 680.0, entry_marker)
     assert _resolve_spy_close_receipt(
@@ -250,11 +258,14 @@ def test_receipt_to_astrogrid_api_anchor_to_score_without_hindsight(
     ) == 1
 
     target_day = real_now.astimezone(timezone.utc).date() + timedelta(days=7)
-    outcome_available = datetime.combine(target_day + timedelta(days=1), datetime.min.time(), timezone.utc) + timedelta(minutes=5)
-    outcome_marker = capture_payload(target_day, outcome_available)
-    outcome_raw_id = _raw(engine, target_day, outcome_available, 700.0, outcome_marker)
+    outcome_day = target_day
+    while outcome_day.weekday() >= 5:
+        outcome_day += timedelta(days=1)
+    outcome_available = datetime.combine(outcome_day + timedelta(days=1), datetime.min.time(), timezone.utc) + timedelta(minutes=5)
+    outcome_marker = capture_payload(outcome_day, outcome_available)
+    outcome_raw_id = _raw(engine, outcome_day, outcome_available, 700.0, outcome_marker)
     assert _resolve_spy_close_receipt(
-        engine, 2791, target_day,
+        engine, 2791, outcome_day,
         [_source(outcome_raw_id, outcome_available, 700.0, outcome_marker)],
     ) == 1
 
@@ -294,7 +305,7 @@ def test_receipt_to_astrogrid_api_anchor_to_score_without_hindsight(
 
     monkeypatch.setattr(store_module, "_utc_now", lambda: outcome_available + timedelta(days=1))
     scored = client.post("/predictions/score", json={
-        "as_of_date": (target_day + timedelta(days=2)).isoformat(),
+        "as_of_date": (outcome_day + timedelta(days=1)).isoformat(),
         "prediction_ids": [prediction_id],
     })
     assert scored.status_code == 200, scored.text
@@ -307,12 +318,12 @@ def test_receipt_to_astrogrid_api_anchor_to_score_without_hindsight(
             WHERE pr.prediction_id = :pid
         """), {"pid": prediction_id}).one()
         assert evidence[0]["price_close_evidence"]["entry_receipt_id"] == anchor["entry_receipt_id"]
-        assert evidence[0]["price_close_evidence"]["outcome_obs_date"] == target_day.isoformat()
+        assert evidence[0]["price_close_evidence"]["outcome_obs_date"] == outcome_day.isoformat()
         assert evidence[1] == pytest.approx((700.0 - 680.0) / 680.0, abs=1e-6)
     # CI keeps this sanitized receipt in its log before the fixture removes
     # the disposable schema and test rows.
     print(
         "SPY_RECEIPT_E2E version=spy_close_v1 "
-        f"entry_obs={entry_day.isoformat()} outcome_obs={target_day.isoformat()} "
+        f"entry_obs={entry_day.isoformat()} outcome_obs={outcome_day.isoformat()} "
         "preavailability_unscored=1 entry_linked=1 outcome_linked=1 scored=1"
     )
