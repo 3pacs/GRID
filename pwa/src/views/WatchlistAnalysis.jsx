@@ -1124,6 +1124,7 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
     const [dataLoading, setDataLoading] = useState(true);
     const [error, setError] = useState(null);
     const [overview, setOverview] = useState(null);
+    const [overviewUnavailable, setOverviewUnavailable] = useState(false);
     const [overviewLoading, setOverviewLoading] = useState(true);
     const [period, setPeriod] = useState('3M');
     const [priceLoading, setPriceLoading] = useState(false);
@@ -1143,6 +1144,7 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
         setDataLoading(true);
         setError(null);
         setOverview(null);
+        setOverviewUnavailable(false);
         setOverviewLoading(true);
         setGexData(null);
         setGexLoading(true);
@@ -1169,8 +1171,10 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
         // Phase 2: Fetch AI overview (may be slow due to LLM)
         api.getTickerOverview(ticker).then(result => {
             setOverview(result?.error ? null : result);
+            setOverviewUnavailable(Boolean(result?.error));
             setOverviewLoading(false);
         }).catch(() => {
+            setOverviewUnavailable(true);
             setOverviewLoading(false);
         });
 
@@ -1314,6 +1318,12 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
                 <OverviewSkeleton />
             ) : overview ? (
                 <AIOverviewCard overview={overview} />
+            ) : overviewUnavailable ? (
+                <div role="status" style={{
+                    color: colors.yellow, fontSize: '11px', padding: '12px',
+                    background: colors.card, border: `1px solid ${colors.border}`,
+                    borderRadius: tokens.radius.md,
+                }}>AI overview unavailable. Other Watchlist data may still be available.</div>
             ) : null}
 
             {/* ═══ CAPITAL FLOW PATH ═══ */}

@@ -541,7 +541,9 @@ export default function FlowTimeline({ ticker, timelineData }) {
                 <div style={{ color: colors.yellow, fontSize: '10px', padding: '4px 12px' }}>
                     {timelineData.history_status === 'partial'
                         ? 'Some GEX dates are unavailable; only measured dates are shown.'
-                        : 'Showing one latest GEX snapshot; stored history is unavailable.'}
+                        : timelineData.failed_dates > 0
+                            ? `Showing one latest GEX snapshot; ${timelineData.failed_dates} dated GEX calculation${timelineData.failed_dates === 1 ? '' : 's'} failed.`
+                            : 'Showing one latest GEX snapshot, not a measured daily timeline.'}
                 </div>
             )}
 

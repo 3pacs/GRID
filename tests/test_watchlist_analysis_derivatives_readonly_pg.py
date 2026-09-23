@@ -102,6 +102,27 @@ def test_analysis_and_flow_keep_measured_data_without_get_writes():
                 assert flow.json()["failed_dates"] == 1
                 assert [row["net_gex"] for row in flow.json()["history"]] == [42]
 
+                class AllDatedFail:
+                    def compute_gex_profile(self, _ticker, snap_date=None):
+                        if snap_date is not None:
+                            return {"error": "Dated GEX unavailable", "ticker": "AAPL"}
+                        # A measured zero in the latest snapshot is still zero.
+                        return {"gex_aggregate": 0, "regime": "NEUTRAL", "spot": 100,
+                                "snap_date": str(today)}
+
+                gex_factory.return_value = AllDatedFail()
+                statements.clear()
+                dated_failed = client.get("/api/v1/derivatives/flow-timeline/AAPL?days=7")
+                assert dated_failed.status_code == 200
+                assert dated_failed.json()["history_status"] == "fallback"
+                assert dated_failed.json()["failed_dates"] == 2
+                assert dated_failed.json()["history"] == [
+                    {"date": str(today), "net_gex": 0, "regime": "neutral", "spot": 100}
+                ]
+                assert not any(sql.startswith(("CREATE", "ALTER", "INSERT", "UPDATE", "DELETE"))
+                               for sql in statements)
+                gex_factory.return_value = FakeGex()
+
                 # A missing price table aborts that transaction; later options,
                 # regime and TradingView reads must still succeed independently.
                 with engine.begin() as conn:
