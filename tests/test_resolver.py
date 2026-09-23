@@ -34,6 +34,11 @@ class FakeRow(tuple):
     pass
 
 
+def _worker_row(row):
+    """Match the resolver SELECT, which now includes raw_payload at index 5."""
+    return row[:5] + (None,) + row[5:] if len(row) == 7 else row
+
+
 def _mock_engine(
     pending_rows=None,
     feature_families=None,
@@ -137,7 +142,7 @@ def _mock_engine(
             sids = set(params.get("sids", [])) if isinstance(params, dict) else set()
             result = MagicMock()
             result.fetchall.return_value = [
-                r for r in rows
+                _worker_row(r) for r in rows
                 if isinstance(r, (tuple, FakeRow)) and r[0] in sids
             ]
             return result
@@ -186,7 +191,7 @@ def _dispatch_begin(engine, series_result, worker_rows, write_conn):
             sids = set(params.get("sids", [])) if isinstance(params, dict) else set()
             result = MagicMock()
             result.fetchall.return_value = [
-                r for r in worker_rows
+                _worker_row(r) for r in worker_rows
                 if not sids or (r[0] in sids)
             ]
             return result
@@ -1214,7 +1219,7 @@ class _RecordingEngine:
                     )
                 if "FROM raw_series rs" in sql:
                     sids = set(params.get("sids", [])) if params else set()
-                    return _Result([r for r in engine._raw_rows if r[0] in sids])
+                    return _Result([_worker_row(r) for r in engine._raw_rows if r[0] in sids])
                 if "feature_registry" in sql:
                     return _Result([(1, "vol")])
                 return _Result([])
