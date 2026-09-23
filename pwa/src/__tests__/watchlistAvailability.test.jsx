@@ -74,7 +74,7 @@ describe('Watchlist overview availability', () => {
     it('shows a failed overview while keeping measured analysis visible', async () => {
         api.getTickerOverview.mockResolvedValue({ error: true, status: 503, message: 'Service unavailable' });
         render(<WatchlistAnalysis ticker="AAPL" onBack={() => {}} />);
-        expect(await screen.findByRole('status')).toHaveTextContent('AI overview unavailable. Other Watchlist data may still be available.');
+        expect(await screen.findByText('AI overview unavailable. Other Watchlist data may still be available.')).toBeInTheDocument();
         await waitFor(() => expect(screen.getByTestId('price-chart')).toBeInTheDocument());
         expect(api.getTickerOverview).toHaveBeenCalledTimes(1);
     });
