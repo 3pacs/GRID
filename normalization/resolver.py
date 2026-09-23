@@ -634,7 +634,7 @@ class Resolver:
                     self._set_statement_timeout(conn)
                     rows = conn.execute(text("""
                         SELECT rs.series_id, rs.obs_date, rs.value,
-                               rs.source_id, rs.pull_timestamp,
+                               rs.source_id, rs.pull_timestamp, rs.raw_payload,
                                sc.priority_rank, sc.name AS source_name
                         FROM raw_series rs
                         JOIN source_catalog sc ON rs.source_id = sc.id
@@ -654,8 +654,8 @@ class Resolver:
                         groups[key] = []
                     groups[key].append({
                         "value": row[2], "source_id": row[3],
-                        "pull_timestamp": row[4], "priority_rank": row[5],
-                        "source_name": row[6],
+                        "pull_timestamp": row[4], "priority_rank": row[6],
+                        "source_name": row[7], "raw_payload": row[5],
                     })
 
                 # Resolve and batch insert
