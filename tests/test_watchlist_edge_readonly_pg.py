@@ -46,11 +46,12 @@ def _create_signal_sources(engine) -> None:
         conn.execute(text("""
             INSERT INTO signal_sources
                 (source_type, source_id, ticker, signal_type, signal_date, metadata, outcome, trust_score)
-            VALUES
-                ('congressional', 'Member A', 'TEST', 'BUY', NOW(), '{"amount":"$1000"}', 'PENDING', NULL),
-                ('insider', 'Officer B', 'TEST', 'BUY', NOW(), '{"title":"CEO"}', 'CORRECT', 0.8),
-                ('darkpool', 'Pool C', 'TEST', 'BUY', NOW(), '{"volume_vs_avg":2.1}', 'PENDING', 0.6)
-        """))
+            VALUES (:source_type, :source_id, 'TEST', 'BUY', NOW(), CAST(:metadata AS JSONB), :outcome, :trust_score)
+        """), [
+            {"source_type": "congressional", "source_id": "Member A", "metadata": '{"amount":"$1000"}', "outcome": "PENDING", "trust_score": None},
+            {"source_type": "insider", "source_id": "Officer B", "metadata": '{"title":"CEO"}', "outcome": "CORRECT", "trust_score": 0.8},
+            {"source_type": "darkpool", "source_id": "Pool C", "metadata": '{"volume_vs_avg":2.1}', "outcome": "PENDING", "trust_score": 0.6},
+        ])
 
 
 def test_edge_route_uses_only_selects_against_prepared_postgres_schema():
