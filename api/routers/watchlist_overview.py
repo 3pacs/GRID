@@ -113,9 +113,8 @@ def get_ticker_overview(
         dict with keys: overview, key_levels, sentiment, generated_at,
         sector_path (for the capital-flow mini-chart).
     """
-    from datetime import datetime, date
+    from datetime import datetime
 
-    _init_table()
     engine = get_db_engine()
     ticker_upper = ticker.strip().upper()
 
@@ -139,13 +138,15 @@ def get_ticker_overview(
             if price_row:
                 price_info = {"price": float(price_row[0]), "date": str(price_row[1]), "source": "grid"}
         except Exception as exc:
+            # A failed SELECT aborts PostgreSQL's current transaction. Clear it
+            # before independent options/regime/features reads on this connection.
+            conn.rollback()
             _log_query_failure(f"Overview price query for {ticker_upper}", exc)
 
         if not price_info:
             live = _fetch_live_price(ticker_upper)
             if live:
                 price_info = {"price": live["price"], "pct_1d": live.get("pct_1d"), "source": "live"}
-                _cache_price_to_db(engine, ticker_upper, live["price"], date.today())
 
         # Options (latest)
         try:
@@ -167,6 +168,7 @@ def get_ticker_overview(
                     "total_oi": opt_row[6],
                 }
         except Exception as exc:
+            conn.rollback()
             _log_query_failure(f"Overview options query for {ticker_upper}", exc)
 
         # Regime
@@ -182,6 +184,7 @@ def get_ticker_overview(
                     "posture": regime_row[2],
                 }
         except Exception as exc:
+            conn.rollback()
             _log_query_failure("Overview regime query", exc)
 
         # Related features (recent values for context)
@@ -218,6 +221,7 @@ def get_ticker_overview(
                 for r in feat_rows
             ]
         except Exception as exc:
+            conn.rollback()
             _log_query_failure(f"Overview related-features query for {ticker_upper}", exc)
 
     # ── Sector path (for capital-flow mini-chart) ────────────────
