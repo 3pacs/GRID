@@ -212,6 +212,7 @@ class AnalyticalSnapshotStore:
         self,
         db_engine: Engine,
         retention_per_category: int | None = None,
+        ensure_table: bool = True,
     ) -> None:
         """
         Parameters:
@@ -224,7 +225,8 @@ class AnalyticalSnapshotStore:
         """
         self.engine = db_engine
         self.retention_per_category = retention_per_category
-        self._ensure_table()
+        if ensure_table:
+            self._ensure_table()
 
     def _ensure_table(self) -> None:
         """Create the analytical_snapshots table if it doesn't exist."""

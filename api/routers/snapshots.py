@@ -91,7 +91,7 @@ def get_latest_snapshots(
     from store.snapshots import AnalyticalSnapshotStore
 
     engine = get_db_engine()
-    store = AnalyticalSnapshotStore(db_engine=engine)
+    store = AnalyticalSnapshotStore(db_engine=engine, ensure_table=False)
 
     return store.get_latest(category, n=n)
 
@@ -107,7 +107,7 @@ def get_snapshot_history(
     from store.snapshots import AnalyticalSnapshotStore
 
     engine = get_db_engine()
-    store = AnalyticalSnapshotStore(db_engine=engine)
+    store = AnalyticalSnapshotStore(db_engine=engine, ensure_table=False)
 
     df = store.get_history(category, start_date=start_date, end_date=end_date)
     if df.empty:
@@ -126,7 +126,7 @@ def compare_snapshots(
     from store.snapshots import AnalyticalSnapshotStore
 
     engine = get_db_engine()
-    store = AnalyticalSnapshotStore(db_engine=engine)
+    store = AnalyticalSnapshotStore(db_engine=engine, ensure_table=False)
 
     result = store.compare_snapshots(category, date_a, date_b)
     if "error" in result:
@@ -151,7 +151,7 @@ def list_categories(
     from store.snapshots import AnalyticalSnapshotStore
 
     engine = get_db_engine()
-    store = AnalyticalSnapshotStore(db_engine=engine)
+    store = AnalyticalSnapshotStore(db_engine=engine, ensure_table=False)
 
     categories = store.list_categories()
     total = len(categories)
