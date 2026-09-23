@@ -24,6 +24,10 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 
+class PullLogPersistenceError(RuntimeError):
+    """A required pull_log start or finish could not be durably recorded."""
+
+
 class PullContext:
     """Context manager that wraps puller execution with accountability.
 
@@ -37,11 +41,13 @@ class PullContext:
         puller_name: str,
         source_id: int | None = None,
         node_name: str = "grid-svr",
+        require_persisted_log: bool = False,
     ) -> None:
         self._engine = engine
         self._puller_name = puller_name
         self._source_id = source_id
         self._node_name = node_name
+        self._require_persisted_log = require_persisted_log
         self._log_id: int | None = None
         self._rows_inserted: int = 0
         self._rows_expected: int | None = None
@@ -84,9 +90,21 @@ class PullContext:
                 row = result.fetchone()
                 self._log_id = row[0] if row else None
         except Exception as exc:
+            if self._require_persisted_log:
+                log.error(
+                    "PullContext: required pull_log start failed for {p} ({kind})",
+                    p=self._puller_name, kind=type(exc).__name__,
+                )
+                raise PullLogPersistenceError(
+                    f"pull_log start unavailable for {self._puller_name}"
+                ) from exc
             log.warning(
                 "PullContext: failed to create pull_log entry for {p}: {e}",
                 p=self._puller_name, e=str(exc),
+            )
+        if self._require_persisted_log and self._log_id is None:
+            raise PullLogPersistenceError(
+                f"pull_log start returned no id for {self._puller_name}"
             )
         return self
 
@@ -145,6 +163,14 @@ class PullContext:
                         },
                     )
             except Exception as db_exc:
+                if self._require_persisted_log:
+                    log.error(
+                        "PullContext: required pull_log finish failed for {p} ({kind})",
+                        p=self._puller_name, kind=type(db_exc).__name__,
+                    )
+                    raise PullLogPersistenceError(
+                        f"pull_log finish unavailable for {self._puller_name}"
+                    ) from db_exc
                 log.warning(
                     "PullContext: failed to update pull_log for {p}: {e}",
                     p=self._puller_name, e=str(db_exc),

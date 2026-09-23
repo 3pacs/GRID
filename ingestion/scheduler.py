@@ -280,7 +280,7 @@ def run_pull_group(
     """Run all pullers in a named schedule group.
 
     Parameters:
-        group_name: One of 'daily', 'weekly', 'monthly', 'annual'.
+        group_name: One of 'crypto', 'daily', 'weekly', 'monthly', 'annual'.
         db_engine: SQLAlchemy engine for database access.
         config: Optional config dict with API keys, etc.
         skip_sources: Source names to skip (e.g. blacklisted after timeout).
@@ -311,7 +311,30 @@ def run_pull_group(
         "skipped_count": 0,
     }
 
-    pullers = _get_pullers_for_group(group_name, db_engine, config)
+    try:
+        pullers = _get_pullers_for_group(group_name, db_engine, config)
+    except Exception as exc:
+        if group_name != "crypto":
+            raise
+        # Binance is a required source for this dedicated group.  Record an
+        # import/constructor failure as a real FAILED pull, not an omitted
+        # source or a synthetic SUCCESS.  A DB outage must not be reported as
+        # a persisted failure when the pull_log insert itself did not commit.
+        error_kind = type(exc).__name__
+        pull_log_id = _record_binance_init_failure(db_engine, error_kind)
+        log.error(
+            "Binance_Crypto initialization failed ({kind}); pull_log_id={log_id}",
+            kind=error_kind, log_id=pull_log_id,
+        )
+        summary["results"].append({
+            "puller": "Binance_Crypto", "status": "FAILED",
+            "error": f"initialization_failed:{error_kind}",
+            "pull_log_id": pull_log_id,
+        })
+        summary["failure_count"] = 1
+        return summary
+
+    from ingestion.pull_context import PullContext, PullLogPersistenceError
 
     node_name = socket.gethostname()
 
@@ -324,11 +347,17 @@ def run_pull_group(
             continue
 
         try:
-            source_id, source_name = _resolve_source_catalog_entry(
-                db_engine,
-                puller_name,
-                puller_instance,
-            )
+            if group_name == "crypto":
+                # The required Binance constructor already resolved its
+                # canonical source id. Avoid a second catalog round trip
+                # before the strict pull_log start can be persisted.
+                source_id, source_name = puller_instance.source_id, "binance"
+            else:
+                source_id, source_name = _resolve_source_catalog_entry(
+                    db_engine,
+                    puller_name,
+                    puller_instance,
+                )
             if step_callback:
                 step_callback(puller_name)
             log.info("Running {p}.{m}()", p=puller_name, m=method_name)
@@ -343,13 +372,12 @@ def run_pull_group(
                     )
 
             method = getattr(puller_instance, method_name)
-            from ingestion.pull_context import PullContext
-
             with PullContext(
                 db_engine,
                 puller_name,
                 source_id=source_id,
                 node_name=node_name,
+                require_persisted_log=(group_name == "crypto"),
             ) as ctx:
                 result = method(**resolved_kwargs)
                 ctx.record_rows(_extract_rows_inserted(result))
@@ -365,6 +393,10 @@ def run_pull_group(
             log.info("{p} complete", p=puller_name)
 
         except Exception as exc:
+            if isinstance(exc, PullLogPersistenceError):
+                # PullContext is best-effort for legacy sources, but Binance
+                # must never claim a complete cycle with no durable log.
+                raise
             log.error("{p} failed: {err}", p=puller_name, err=str(exc))
             summary["results"].append({"puller": puller_name, "status": "FAILED", "error": str(exc)})
             summary["failure_count"] += 1
@@ -379,6 +411,39 @@ def run_pull_group(
     return summary
 
 
+def _record_binance_init_failure(db_engine: Engine, error_kind: str) -> int:
+    """Persist one FAILED required-source attempt, or raise if it cannot be logged."""
+    observed_at = datetime.now(timezone.utc)
+    try:
+        with db_engine.begin() as conn:
+            row = conn.execute(text("""
+                INSERT INTO pull_log
+                    (puller_name, source_id, started_at, completed_at,
+                     status, rows_inserted, error_message, node_name)
+                VALUES
+                    (:name, NULL, :observed, :observed,
+                     'FAILED', 0, :error, :node)
+                RETURNING id
+            """), {
+                "name": "Binance_Crypto",
+                "observed": observed_at,
+                "error": f"initialization_failed:{error_kind}",
+                "node": socket.gethostname(),
+            }).fetchone()
+            if row is None:
+                raise RuntimeError("pull_log insert returned no id")
+            return int(row[0])
+    except Exception as exc:
+        log.error(
+            "Binance_Crypto initialization failure could not be persisted "
+            "to pull_log ({kind})",
+            kind=type(exc).__name__,
+        )
+        raise RuntimeError(
+            "Binance_Crypto initialization failure could not be persisted"
+        ) from exc
+
+
 def _get_pullers_for_group(
     group_name: str,
     db_engine: Engine,
@@ -391,7 +456,15 @@ def _get_pullers_for_group(
     """
     pullers: list[tuple[str, Any, str, dict]] = []
 
-    if group_name == "daily":
+    if group_name == "crypto":
+        # One owner of Binance daily UTC closes, on all seven days.  Let an
+        # import or constructor failure reach run_pull_group's required-source
+        # failure path so it is counted and durably logged when DB is healthy.
+        from ingestion.altdata.binance_puller import BinancePuller
+
+        pullers.append(("Binance_Crypto", BinancePuller(db_engine), "pull", {}))
+
+    elif group_name == "daily":
         try:
             from ingestion.international.ecb import ECBPuller
             pullers.append(("ECB_SDW", ECBPuller(db_engine), "pull_all", {"start_date": "incremental"}))
@@ -733,12 +806,6 @@ def _get_pullers_for_group(
             pullers.append(("Wikidata_Relations", WikidataPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("Wikidata init failed: {err}", err=str(exc))
-        # Binance — crypto OHLCV + 24hr ticker (daily, no key)
-        try:
-            from ingestion.altdata.binance_puller import BinancePuller
-            pullers.append(("Binance_Crypto", BinancePuller(db_engine), "pull", {}))
-        except Exception as exc:
-            log.warning("Binance init failed: {err}", err=str(exc))
         # Fed Speeches — canonical puller registered below (fed_speeches.FedSpeechPuller).
         # Wave 3 dedupe 2026-04-13: deleted fed_speeches_puller.py (orphaned output).
         # Wikipedia pageviews — anomaly detection on financial topics (daily)
@@ -1015,6 +1082,23 @@ def _get_pullers_for_group(
             log.warning("Patents puller init failed: {err}", err=str(exc))
 
     return pullers
+
+
+def run_daily_binance_close() -> dict[str, Any]:
+    """Run only Binance's current completed UTC day; never catch up old days."""
+    try:
+        from db import get_engine
+
+        engine = get_engine()
+    except Exception as exc:
+        # Without an engine there is no honest pull_log receipt to claim.
+        log.error(
+            "Binance_Crypto scheduled cycle could not obtain DB engine; "
+            "pull_log unavailable ({kind})",
+            kind=type(exc).__name__,
+        )
+        raise
+    return run_pull_group("crypto", engine)
 
 
 def backfill_all(start_date: str = "1970-01-01") -> None:
@@ -1599,7 +1683,8 @@ def start_scheduler() -> None:
 
     Domestic:
     - 4x daily: open (9:30 AM ET), midday (12 PM ET), close (4 PM ET), post-close (6 PM ET)
-    - Equity pullers gated by market calendar; 24/7 pullers (crypto, OSINT, sentiment) run every day
+    - Equity pullers gated by market calendar; domestic 24/7 pullers run every day
+    - Binance completed UTC daily closes: one independent seven-day UTC slot
     - Monthly pulls on the 5th at 9:00 AM (BLS, EDGAR 13F)
     - Weekly SEC velocity on Sundays at 10:00 AM
 
@@ -1615,6 +1700,12 @@ def start_scheduler() -> None:
 
     # For ongoing pulls, use recent date
     ongoing_start = date.today().isoformat()
+
+    # Register the required crypto close before the 20:00 domestic and extended
+    # jobs. schedule.at(..., "UTC") converts from UTC even on a non-UTC host.
+    # The scheduler is still single-threaded: an earlier hung job can delay
+    # this slot, and a missed UTC day is not repaired automatically.
+    schedule.every().day.at("20:00", "UTC").do(run_daily_binance_close)
 
     # --- Domestic schedules ---
 
