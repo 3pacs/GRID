@@ -1,5 +1,6 @@
 """Disposable PostgreSQL proof for the gold GET cache and refresh paths."""
 
+import json
 import os
 from pathlib import Path
 from unittest.mock import patch
@@ -66,8 +67,10 @@ def test_gold_get_absent_schema_legacy_hit_and_live_refresh_are_read_only():
                 conn.execute(text("""INSERT INTO dad_ticker_summary_cache
                     (ticker, payload_version, generated_at, research_db_path, payload)
                     VALUES ('MSFT', :version, NOW(), '/missing/research.duckdb',
-                    '{"ticker":"MSFT","status":"ready","gold":{"score":77},"performance":{}}'::jsonb)"""),
-                    {"version": dad.DAD_CACHE_VERSION})
+                    CAST(:payload AS JSONB))"""),
+                    {"version": dad.DAD_CACHE_VERSION, "payload": json.dumps({
+                        "ticker": "MSFT", "status": "ready", "gold": {"score": 77}, "performance": {},
+                    })})
             statements.clear()
             hit = dad.get_dad_ticker_gold("MSFT", refresh_finviz=False, _token="test")
             assert hit["cache"]["hit"] is True
