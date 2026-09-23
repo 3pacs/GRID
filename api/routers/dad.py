@@ -879,7 +879,6 @@ def _get_finviz_profile(
     if refresh and freshness["state"] in {"missing", "aging", "stale"}:
         try:
             pairs = _fetch_finviz_snapshot(ticker)
-            scraped = True
             if persist_refresh:
                 inserted = _store_finviz_snapshot(engine, ticker, pairs)
                 stored = _read_finviz_rows(engine, ticker)
@@ -899,10 +898,13 @@ def _get_finviz_profile(
                         "numeric_value": float(parsed) if isinstance(parsed, (int, float)) else 0.0,
                         "obs_date": date.today().isoformat(), "pull_timestamp": now.isoformat(),
                     }
+                if not live_fields:
+                    raise RuntimeError("no recognized Finviz snapshot fields")
                 stored = {"fields": live_fields, "field_count": len(live_fields),
                           "latest_pull": now, "latest_obs_date": date.today(), "rows_inserted": 0}
                 freshness = _freshness_state(now, stale_hours=24)
                 _remember_finviz_profile(ticker, stored)
+            scraped = True
         except Exception as exc:
             scrape_error = str(exc)
             log.debug("Finviz live scrape failed for {t}: {e}", t=ticker, e=scrape_error)

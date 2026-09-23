@@ -81,6 +81,25 @@ def test_live_finviz_refresh_is_reused_without_writes_and_newer_stored_row_wins(
         assert newer["fields"]["price"]["parsed"] == 200.0
 
 
+def test_unrecognized_live_finviz_fields_keep_stale_stored_snapshot():
+    from datetime import datetime, timedelta, timezone
+
+    old = datetime.now(timezone.utc) - timedelta(days=3)
+    stored = {
+        "fields": {"price": {"field": "price", "label": "Price", "group": "market",
+                             "raw_value": "88", "parsed": 88.0, "numeric_value": 88.0}},
+        "field_count": 1, "latest_pull": old, "latest_obs_date": old.date(),
+    }
+    with patch.object(dad, "_read_finviz_rows", return_value=stored), \
+         patch.object(dad, "_fetch_finviz_snapshot", return_value={"Unknown label": "x"}), \
+         patch.object(dad, "_store_finviz_snapshot", side_effect=AssertionError("GET must not persist")):
+        result = dad._get_finviz_profile(None, "STALE", refresh=True, persist_refresh=False)
+    assert result["status"] == "stale"
+    assert result["source"] == "postgres"
+    assert result["fields"]["price"]["parsed"] == 88.0
+    assert result["error"] == "no recognized Finviz snapshot fields"
+
+
 # --- warm cache -------------------------------------------------------------
 
 
