@@ -84,6 +84,25 @@ def test_parser_has_no_persist_option():
         parser.parse_args(["--persist"])
 
 
+@pytest.mark.parametrize("flag,value", [
+    ("--dead-band-pct", "nan"), ("--dead-band-pct", "inf"),
+    ("--dead-band-pct", "-1"), ("--dead-band-pct", "101"),
+    ("--cost-bps", "nan"), ("--cost-bps", "-1"),
+])
+def test_parser_refuses_invalid_scoring_numbers(flag, value):
+    with pytest.raises(SystemExit):
+        build_arg_parser().parse_args(["--db-url", "postgresql://test", "--source-type", "news",
+                                       "--date-from", "2026-09-01", "--date-to", "2026-09-02",
+                                       flag, value])
+
+
+def test_cli_cannot_assert_live_origin_without_row_evidence():
+    with pytest.raises(SystemExit):
+        build_arg_parser().parse_args(["--db-url", "postgresql://test", "--source-type", "news",
+                                       "--date-from", "2026-09-01", "--date-to", "2026-09-02",
+                                       "--origin-tag", "live"])
+
+
 def test_empty_read_only_run_prints_provisional_version():
     parser = build_arg_parser()
     args = parser.parse_args(["--db-url", "postgresql://test", "--source-type", "news",
@@ -101,6 +120,7 @@ def test_cli_refuses_unverified_raw_basis_without_price_query():
     engine = Engine("date", [(1, "news", "AAA", date(2026, 9, 1), "BUY", datetime(2026, 9, 1, 18, tzinfo=timezone.utc))])
     result = run(engine, args, out=io.StringIO(), today=date(2026, 9, 8))
     assert result["cohort_summary"]["n_ineligible_by_reason"] == {"unsupported_instrument_history": 1}
+    assert result["cohort_summary"]["origin_tag_counts"] == {"unknown": 1}
     assert len(engine.calls) == 2  # schema introspection and source SELECT only
 
 
