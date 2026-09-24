@@ -1,6 +1,7 @@
 # Pre-registration: SPY GEX structural levels, forward paper log v1
 
 Status: registered 2026-09-24 (the git commit that adds this file is the registration record).
+Amended once, 2026-09-24, before the first logged session (see Amendment 1 at the end).
 Owner: Anik. Author: Claude (Opus 5.5), from the 2026-09-24 review of Gemini's dealer-gamma plan.
 Nothing below may change after the first logged session. Any change is a new version (v2) with a
 new start date; the v1 log is kept as-is.
@@ -32,9 +33,18 @@ placed, and the database is read-only for this job.
 - Chain: GRID `options_snapshots` for SPY, the latest `snap_date` whose rows were created before
   the run. Record `snap_date` and `created_at`.
 - Levels, from `physics.dealer_gamma.DealerGammaEngine` at the pinned code commit (recorded in
-  every record): gamma flip, put wall, call wall, the engine's spot and its source, aggregate GEX,
-  normalized GEX, and regime (LONG_GAMMA / SHORT_GAMMA / NEUTRAL, the engine's own thresholds).
-  Sign convention: dealers modeled long calls and short puts; GEX > 0 means dealers long gamma.
+  every record): gamma flip, the engine's spot and its source, aggregate GEX, normalized GEX, and
+  regime (LONG_GAMMA / SHORT_GAMMA / NEUTRAL, the engine's own thresholds). Sign convention:
+  dealers modeled long calls and short puts; GEX > 0 means dealers long gamma.
+- Walls (Amendment 1). The engine's own put wall and call wall are recorded as
+  `engine_put_wall` / `engine_call_wall` but are not tested. The tested walls come from the
+  engine's per-strike output:
+  - Put wall: among strikes at or below 0.995 * P0, the strike with the largest put gamma exposure
+    by magnitude (|put_gex|).
+  - Call wall: among strikes at or above 1.005 * P0, the strike with the largest call gamma exposure
+    (call_gex).
+  - Ties go to the strike closer to P0. If no strike qualifies on a side, that wall is missing for
+    the session (recorded, not an exclusion); H2 and H3 use the levels that exist.
 - Reference price P0: SPY's previous regular-session close (yfinance daily bar, unadjusted),
   with fetch time. Cross-check against the engine's spot; if they differ by more than 0.25%, the
   session is excluded (reason `ref_mismatch`).
@@ -49,9 +59,10 @@ exist) and the session open, high, low and close, from yfinance, with fetch time
 
 ## Definitions
 
-- Reached: a level above the open is reached at the first bar with high >= L; a level below the
-  open at the first bar with low <= L. If the open is already beyond L, it is a gap-through, logged
-  separately and not counted in H2.
+- Side: a level above P0 is an "above" level; a level below P0 is a "below" level.
+- Reached: an above level is reached at the first bar with high >= L; a below level at the first
+  bar with low <= L. If the session opens at or beyond the level (open >= L for an above level,
+  open <= L for a below level), it is a gap-through, logged separately and not counted in H2.
 - Held: after being reached, the session closes on the same side of L as the open. Otherwise broke.
 - Range: ln(session high / session low).
 - Costs: 1 basis point adverse slippage per side, no commission. Notional $1,000 per trade.
@@ -70,8 +81,8 @@ inconclusive.
 **H2. Levels hold more than chance.** Across all first reaches of the flip, put wall and call wall,
 the held rate is higher than for their mirror placebos reached in the same sessions.
 Permutation test on the difference (real minus placebo held rate), shuffling real/placebo labels
-within each session, 10,000 draws. Pass if one-sided p < 0.0167. Fewer than 20 real-level reaches
-means inconclusive.
+within each session, 10,000 draws with fixed seed 20260924. Pass if one-sided p < 0.0167. Fewer
+than 20 real-level reaches means inconclusive.
 
 **H3. A simple level rule makes money after costs.**
 - LONG_GAMMA morning (fade): first reach of the call wall, pretend short at the wall; first reach of
@@ -88,9 +99,13 @@ means inconclusive.
 
 - `no_chain`: no chain for the run, or the latest chain was created after the pre-open run.
 - `stale_chain`: the latest chain is more than one trading day old.
-- `engine_unavailable`: the engine returns no spot, flip or walls.
+- `engine_unavailable`: the engine returns its unavailable result (no measured spot) or no regime.
+  A missing flip or wall is recorded, not excluded.
 - `ref_mismatch`: see P0 above.
 - `late_preopen`: the pre-open record was written at or after 09:30 America/New_York.
+- `data_unavailable` (Amendment 1): the market-data source for P0 or VIX was unreachable or
+  returned nothing at the pre-open run, after one retry.
+- `no_preopen` (Amendment 1): the post-close run found no pre-open record for the session.
 - `bars_missing`: more than 10% of the expected 5-minute bars are missing.
 - `market_closed`: no regular session that day.
 
@@ -112,3 +127,20 @@ stops and the problem is fixed in a v2 with a new start date.
 - H2 or H3 pass: the levels carry information about where price stalls, and the rule is worth a
   second, independent forward test before any real money.
 - No pass: the levels and regime stay out of trading decisions.
+
+## Amendment 1 (2026-09-24, before the first logged session)
+
+Made before any session was logged. The only record written so far was a smoke test in a temporary
+directory on grid-svr, which was deleted; it is not part of the log. The first real record carries
+the SHA-256 of this amended file.
+
+1. Tested walls are defined here instead of taken from the engine. In the 2026-09-24 smoke check
+   the engine's put wall and call wall were both 765.0 with spot 764.9: short-dated at-the-money
+   gamma dominates both, so "reached" and "held" at a level sitting on the open price would be a
+   coin flip, not a test of structure. The tested walls must be at least 0.5% from P0, on the
+   correct side. The engine's own walls are still recorded, untested.
+2. `engine_unavailable` now means no measured spot or no regime; a missing flip or wall is
+   recorded, not excluded.
+3. Two exclusion codes added so no session can go missing silently: `data_unavailable` and
+   `no_preopen`.
+4. Wording only: "side" is set by P0, the permutation seed is fixed at 20260924.
