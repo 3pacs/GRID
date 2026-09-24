@@ -222,6 +222,20 @@ jobs:
           TESTING: "true"
         run: python -m pytest tests/test_dad_ticker_detail_readonly_pg.py -q -rA
 
+      # Robinhood guards (fix/robinhood-live-guards-20260924): proves the
+      # persisted drawdown/daily-loss/order-rate state and the idempotent
+      # order log actually work against real Postgres (trading_risk_state /
+      # trading_order_log — migrations/versions/robinhood_guards_20260924.py),
+      # not just against InMemoryRiskStore's Python-only logic
+      # (tests/test_robinhood_risk_store.py, part of the main run above).
+      - name: Robinhood risk store PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_robinhood_risk_store_pg.py -q -rA
+
       - name: Check for SQL injection patterns
         run: |
           echo "Checking for unsafe SQL patterns..."

@@ -535,6 +535,47 @@ class Settings(BaseSettings):
     ROBINHOOD_MAX_DRAWDOWN_PCT: float = 0.20
     ROBINHOOD_BASE_URL: str = "https://trading.robinhood.com"
 
+    # Robinhood brakes (fix/robinhood-live-guards-20260924): every limit here
+    # reads/writes the persisted state in trading_risk_state / trading_order_log
+    # (trading/robinhood_risk_store.py) so it survives restarts, unlike the old
+    # in-memory drawdown high-water mark.
+    #   * Daily loss cap blocks new BUYS once today's loss from start-of-day
+    #     equity reaches this fraction; sells/closes stay allowed so a position
+    #     can still be de-risked.
+    ROBINHOOD_MAX_DAILY_LOSS_PCT: float = 0.05
+    #   * Order-rate cap: max new positions opened per UTC day.
+    ROBINHOOD_MAX_ORDERS_PER_DAY: int = 6
+    #   * Reject a quote older than this many seconds (Robinhood's own
+    #     `timestamp` field when present, else GRID's local fetch time).
+    ROBINHOOD_MAX_QUOTE_AGE_S: float = 30.0
+    #   * Reject an order whose (ask-bid)/mid spread exceeds this many basis
+    #     points. 50bps is a deliberately loose ceiling: BTC/ETH on Robinhood
+    #     typically trade inside 5-10bps, so 50bps only ever fires on a
+    #     genuinely dislocated or illiquid quote, while leaving headroom for
+    #     smaller-cap pairs GRID might route later. Tune down once real spread
+    #     data is on hand.
+    ROBINHOOD_MAX_SPREAD_BPS: float = 50.0
+    #   * Marketable limit orders instead of market orders when True (see
+    #     trading/robinhood.py — Robinhood's Crypto Trading API supports
+    #     type=limit with time_in_force="gtc", its only documented value).
+    #     False keeps market orders behind the same stale-quote/spread guards.
+    ROBINHOOD_USE_LIMIT_ORDERS: bool = True
+    #   * Slippage added past the touch price so a marketable limit still
+    #     crosses the spread and fills like a market order: buy at
+    #     ask*(1+slip), sell at bid*(1-slip).
+    ROBINHOOD_LIMIT_SLIPPAGE_BPS: float = 25.0
+    #   * Robinhood crypto limit orders only support time_in_force="gtc" (no
+    #     IOC/FOK), so a marketable limit that doesn't fill immediately would
+    #     otherwise rest indefinitely. RobinhoodCryptoTrader.reconcile_stale_orders()
+    #     cancels our own open orders older than this many seconds — wire it
+    #     into a periodic job before ROBINHOOD_LIVE_TRADING is ever set True.
+    ROBINHOOD_LIMIT_CANCEL_AFTER_S: float = 15.0
+    #   * Email (alerts/email.py, gated by ALERT_EMAIL_ENABLED) fires on every
+    #     LIVE order and every guard trip unconditionally. A dry-run order that
+    #     passed every guard only alerts when this is also True — off by
+    #     default so a normal dry-run cycle doesn't spam the inbox.
+    ROBINHOOD_ALERT_ON_DRY_RUN: bool = False
+
     # Solana trading (AutoHedge-derived 4-agent pipeline)
     JUPITER_API_KEY: str = ""              # Unlocks Jupiter rate limits
     SOLANA_PRIVATE_KEY: str = ""           # Base58 wallet key; required for live

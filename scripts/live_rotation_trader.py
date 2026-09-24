@@ -110,7 +110,19 @@ def _mode_label(venue: str, mainnet: bool, trader: Any) -> str:
 
 def _log_trade_to_journal(engine, coin: str, direction: str, size_usd: float,
                           regime: str, result: dict, venue: str = "hyperliquid") -> None:
-    """Log every live trade to the decision journal for audit."""
+    """Log every live trade to the decision journal for audit.
+
+    Robinhood trades are NOT written here: RobinhoodCryptoTrader.open_position
+    / close_position already write every attempt (dry-run or live) to the
+    persisted trading_order_log (trading/robinhood_risk_store.py) internally,
+    so a second, parallel write here would just be a duplicate audit trail
+    for that venue. This still runs for Hyperliquid, whose journal_entries
+    table does not exist in griddb -- see docs/ROBINHOOD_SETUP.md's audit
+    notes. That gap is Hyperliquid's own, tracked separately; fixing it is
+    out of scope for the Robinhood brakes this module is part of.
+    """
+    if venue == "robinhood":
+        return
     try:
         with engine.begin() as conn:
             conn.execute(text(
@@ -125,8 +137,8 @@ def _log_trade_to_journal(engine, coin: str, direction: str, size_usd: float,
                            f"${size_usd:.2f} on {venue}"),
                 "meta": str(result)[:500],
             })
-    except Exception:
-        pass  # Journal is optional — don't block trading
+    except Exception as exc:  # noqa: BLE001 — the journal is optional, but a failure must be visible
+        log.warning("Journal insert failed for {c} {d} on {v}: {e}", c=coin, d=direction, v=venue, e=str(exc))
 
 
 def _tradable_targets(trader: Any, target: dict[str, float], venue: str) -> dict[str, float] | None:
@@ -157,17 +169,31 @@ def _tradable_targets(trader: Any, target: dict[str, float], venue: str) -> dict
     return kept
 
 
+def _rotation_decision_id(regime: str, action: str) -> str:
+    """Idempotency seed for one rotation cycle's decision on a given action
+    (CLOSE / OPEN-or-TRIM) — combined with the coin, side and today's date in
+    trading.robinhood.deterministic_client_order_id() so re-running the
+    script twice today for the same regime doesn't double-submit."""
+    return f"rotation:{action}:{regime}"
+
+
 def _rebalance_spot(trader: Any, engine, target: dict[str, float], regime: str,
                     current: dict[str, dict], venue: str) -> list[dict]:
     """Long-only spot rebalance: trade the delta, risk-off sells to cash."""
+    from datetime import date as _date
+
+    from trading.robinhood import deterministic_client_order_id
+
     results: list[dict] = []
     cap = float(getattr(trader, "max_position_usd", MAX_POSITION_USD))
+    today = _date.today()
 
     # Sell anything the regime no longer wants — risk-off empties the book.
     for coin, pos in current.items():
         if coin not in target:
             log.info("Selling {c} to cash (not in target for {r} regime)", c=coin, r=regime)
-            result = trader.close_position(coin)
+            key = deterministic_client_order_id(venue, _rotation_decision_id(regime, "close"), coin, "sell", today)
+            result = trader.close_position(coin, client_order_id=key)
             results.append({"action": "CLOSE", "coin": coin, "result": result})
             _log_trade_to_journal(engine, coin, "CLOSE", pos["size_usd"], regime, result, venue)
 
@@ -185,11 +211,13 @@ def _rebalance_spot(trader: Any, engine, target: dict[str, float], regime: str,
             continue
 
         direction = "LONG" if delta > 0 else "SHORT"  # SHORT = sell held quantity
+        side = "buy" if direction == "LONG" else "sell"
         size_usd = min(abs(delta), cap)
         log.info("{a} {c} — ${usd:.2f} (target {w:.0%}, held ${held:.2f})",
                  a="Buying" if delta > 0 else "Trimming", c=coin, usd=size_usd,
                  w=weight, held=held_usd)
-        result = trader.open_position(ticker=coin, direction=direction, size_usd=size_usd)
+        key = deterministic_client_order_id(venue, _rotation_decision_id(regime, "rebalance"), coin, side, today)
+        result = trader.open_position(ticker=coin, direction=direction, size_usd=size_usd, client_order_id=key)
         results.append({"action": "OPEN" if delta > 0 else "TRIM", "coin": coin,
                         "size_usd": size_usd, "result": result})
         _log_trade_to_journal(engine, coin, direction, size_usd, regime, result, venue)

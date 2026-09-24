@@ -195,6 +195,12 @@ def health() -> HealthResponse:
             "live_trading": rh.live,
             "max_position_usd": rh.max_position_usd,
             "max_drawdown_pct": rh.max_drawdown_pct,
+            "max_daily_loss_pct": rh.max_daily_loss_pct,
+            "max_orders_per_day": rh.max_orders_per_day,
+            "max_quote_age_s": rh.max_quote_age_s,
+            "max_spread_bps": rh.max_spread_bps,
+            "use_limit_orders": rh.use_limit_orders,
+            "limit_slippage_bps": rh.limit_slippage_bps,
         }
     except Exception as exc:
         log.warning("Health: Robinhood connector check failed: {e}", e=str(exc))
