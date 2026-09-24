@@ -25,6 +25,7 @@ def _dated_spy() -> dict:
         "spot_release_date": today.isoformat(), "spot_vintage_date": today.isoformat(),
         "snap_date": today.isoformat(), "chain_snap_date": today.isoformat(),
         "chain_batch_id": "11111111-1111-4111-8111-111111111111",
+        "chain_capture_ordinal": 1,
         "chain_capture_started_at": captured.isoformat(),
         "chain_capture_completed_at": (captured + timedelta(minutes=1)).isoformat(),
         "chain_created_at": (captured + timedelta(minutes=2)).isoformat(),
@@ -95,6 +96,7 @@ def test_generation_stamps_only_a_verified_dated_spot(
     {"spot_receipt_created_at": "2099-01-01T00:00:00+00:00"},
     {"chain_snap_date": "2099-01-01"},
     {"chain_batch_id": None},
+    {"chain_capture_ordinal": None},
     {"chain_capture_started_at": None},
     {"chain_capture_completed_at": "2099-01-01T00:00:00+00:00"},
 ])
@@ -142,6 +144,7 @@ def test_reading_missing_briefing_never_creates_table(
 @pytest.mark.parametrize("contract", [
     "resolved_series_only_v1", "spy_receipt_chain_pit_v2",
     "spy_receipt_chain_batch_pit_v3",
+    "spy_receipt_chain_batch_pit_v4",
 ])
 def test_legacy_saved_row_is_withheld_even_if_dated_today(contract: str) -> None:
     saved = (date.today(), "Legacy dealer narrative", {

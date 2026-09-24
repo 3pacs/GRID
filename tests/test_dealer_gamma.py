@@ -83,6 +83,7 @@ def _compute_profile(
     chain.attrs.update(snap_date=SNAP_DATE, created_at_min=chain_time,
                        created_at_max=chain_time,
                        batch_id="11111111-1111-4111-8111-111111111111",
+                       capture_ordinal=1,
                        capture_started_at=chain_time,
                        capture_completed_at=chain_time + timedelta(minutes=1))
     engine = DealerGammaEngine(MagicMock(), risk_free_rate=RISK_FREE_RATE)

@@ -185,6 +185,7 @@ class OptionsPuller(BasePuller):
     def _ensure_tables(self) -> None:
         """Create options tables if they don't exist."""
         with self.engine.begin() as conn:
+            conn.execute(text("CREATE SEQUENCE IF NOT EXISTS options_capture_ordinal_seq"))
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS options_snapshots (
                     id           BIGSERIAL PRIMARY KEY,
@@ -202,6 +203,7 @@ class OptionsPuller(BasePuller):
                     in_the_money BOOLEAN,
                     created_at   TIMESTAMPTZ DEFAULT NOW(),
                     capture_batch_id TEXT,
+                    capture_ordinal BIGINT,
                     capture_started_at TIMESTAMPTZ,
                     capture_completed_at TIMESTAMPTZ,
                     UNIQUE (ticker, snap_date, expiry, opt_type, strike)
@@ -292,7 +294,13 @@ class OptionsPuller(BasePuller):
         """Pull options chain for a single ticker and compute signals."""
         try:
             capture_clock = time.monotonic()
-            capture_started_at = datetime.now(timezone.utc)
+            # Sequence values survive rollback and give every worker one
+            # database-ordered capture start, independent of host clock skew.
+            # This transaction ends before any provider request.
+            with self.engine.begin() as conn:
+                capture_ordinal, capture_started_at = conn.execute(
+                    text("SELECT nextval('options_capture_ordinal_seq'), clock_timestamp()"),
+                ).fetchone()
             first = self._yahoo.get_options(ticker)
             if not first:
                 return {"ticker": ticker, "status": "FAILED", "error": "no data from Yahoo"}
@@ -405,26 +413,23 @@ class OptionsPuller(BasePuller):
             if not complete or not snap_count or time.monotonic() - capture_clock >= MAX_CAPTURE_SECONDS:
                 raise ValueError("incomplete options chain response")
 
-            # Provider availability begins after the final response; the
-            # database created_at will be later, at publication.
-            completed_at = datetime.now(timezone.utc)
-
-            # Only the publication phase holds a database connection. A later
-            # capture start wins even if an older worker finishes last.
+            # Provider availability begins after the final response. Sample
+            # the database clock before waiting for the short publish lock.
             publish_clock = time.monotonic()
             with self.engine.begin() as conn:
                 conn.execute(text("SET LOCAL lock_timeout = '5s'"))
                 conn.execute(text("SET LOCAL statement_timeout = '30s'"))
+                completed_at = conn.execute(text("SELECT clock_timestamp()")).fetchone()[0]
                 conn.execute(
                     text("SELECT pg_advisory_xact_lock(hashtext(:ticker), hashtext(:snap_date))"),
                     {"ticker": ticker, "snap_date": today_str},
                 )
                 latest = conn.execute(
-                    text("""SELECT MAX(capture_started_at) FROM options_snapshots
+                    text("""SELECT MAX(capture_ordinal) FROM options_snapshots
                              WHERE ticker = :ticker AND snap_date = :snap_date"""),
                     {"ticker": ticker, "snap_date": today_str},
                 ).fetchone()
-                if latest and latest[0] is not None and latest[0] > capture_started_at:
+                if latest and latest[0] is not None and latest[0] > capture_ordinal:
                     log.info("{t}: older overlapping options capture skipped", t=ticker)
                     return {"ticker": ticker, "status": "SKIPPED",
                             "reason": "newer options capture already published"}
@@ -444,13 +449,14 @@ class OptionsPuller(BasePuller):
                             "(ticker, snap_date, expiry, opt_type, strike, "
                             "last_price, bid, ask, volume, open_interest, "
                             "implied_vol, in_the_money, capture_batch_id, "
-                            "capture_started_at, capture_completed_at) "
+                            "capture_ordinal, capture_started_at, capture_completed_at) "
                             "VALUES (:ticker, :snap_date, :expiry, :opt_type, :strike, "
                             ":last_price, :bid, :ask, :volume, :oi, :iv, :itm, "
-                            ":batch_id, :started_at, :completed_at) "
+                            ":batch_id, :ordinal, :started_at, :completed_at) "
                             "ON CONFLICT DO NOTHING"
                         ),
-                        {**row, "started_at": capture_started_at, "completed_at": completed_at},
+                        {**row, "ordinal": capture_ordinal,
+                         "started_at": capture_started_at, "completed_at": completed_at},
                     )
 
                 # Compute signals from nearest LIQUID expiration

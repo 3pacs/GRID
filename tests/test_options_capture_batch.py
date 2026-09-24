@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from threading import Event, Lock, Thread
+from threading import Event, Lock, Thread, current_thread
 from typing import Any, Self
 
 import pytest
@@ -24,6 +24,9 @@ class _DB:
         self.calls: list[tuple[str, dict]] = []
         self.rows: list[dict] = []
         self.fail_after_inserts: int | None = None
+        self.next_ordinal = 0
+        self.clock_offsets: dict[str, timedelta] = {}
+        self.allocations: list[tuple[str, int, datetime]] = []
 
     def begin(self) -> Self:
         return self
@@ -41,10 +44,21 @@ class _DB:
         sql = str(statement)
         values = params or {}
         self.calls.append((sql, values))
-        if "MAX(capture_started_at)" in sql:
-            starts = [row["started_at"] for row in self.rows if row["ticker"] == values["ticker"]
-                      and row["snap_date"] == values["snap_date"] and row.get("started_at")]
-            return _Result((max(starts) if starts else None,))
+        if "nextval(" in sql:
+            self.next_ordinal += 1
+            started = datetime.now(timezone.utc) + self.clock_offsets.get(
+                current_thread().name, timedelta(),
+            )
+            self.allocations.append((current_thread().name, self.next_ordinal, started))
+            return _Result((self.next_ordinal, started))
+        if "SELECT clock_timestamp()" in sql:
+            return _Result((datetime.now(timezone.utc) + self.clock_offsets.get(
+                current_thread().name, timedelta(),
+            ),))
+        if "MAX(capture_ordinal)" in sql:
+            ordinals = [row["ordinal"] for row in self.rows if row["ticker"] == values["ticker"]
+                        and row["snap_date"] == values["snap_date"] and row.get("ordinal")]
+            return _Result((max(ordinals) if ordinals else None,))
         if "DELETE FROM options_snapshots" in sql:
             self.rows = [row for row in self.rows if not (
                 row["ticker"] == values["ticker"] and row["snap_date"] == values["snap_date"]
@@ -140,6 +154,7 @@ def test_completed_batch_time_follows_final_provider_response(
     assert yahoo.calls == 2
     assert len(db.rows) == 4
     assert len({row["batch_id"] for row in db.rows}) == 1
+    assert len({row["ordinal"] for row in db.rows}) == 1
     assert len({row["started_at"] for row in db.rows}) == 1
     assert len({row["completed_at"] for row in db.rows}) == 1
     assert yahoo.final_response_at is not None
@@ -161,6 +176,7 @@ def test_second_complete_pull_replaces_added_and_removed_strikes(
     assert {row["strike"] for row in rows} == {100.0, 120.0}
     assert len({row["batch_id"] for row in rows}) == 1
     assert {row["batch_id"] for row in rows} != first_batch
+    assert {row["ordinal"] for row in rows} == {2}
     assert len({row["completed_at"] for row in rows}) == 1
 
 
@@ -173,12 +189,13 @@ def test_failed_second_pull_preserves_first_complete_batch(
     assert puller.engine.rows == prior
 
 
-def test_capture_deadline_fails_closed_without_database_checkout(
+def test_capture_deadline_fails_closed_after_short_ordinal_checkout(
     puller: options.OptionsPuller, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(options, "MAX_CAPTURE_SECONDS", 0)
     assert _run(puller, [100.0])[0]["status"] == "FAILED"
-    assert puller.engine.calls == []
+    assert any("nextval(" in sql for sql, _ in puller.engine.calls)
+    assert not any("options_snapshots" in sql for sql, _ in puller.engine.calls)
     assert puller.engine.rows == []
 
 
@@ -196,6 +213,7 @@ def test_older_overlapping_worker_cannot_replace_newer_capture(
     puller: options.OptionsPuller,
 ) -> None:
     db = _SerializedDB()
+    db.clock_offsets = {"older": timedelta(hours=1), "newer": -timedelta(hours=1)}
     puller.engine = db
     newer = options.OptionsPuller.__new__(options.OptionsPuller)
     newer.engine = db
@@ -224,8 +242,8 @@ def test_older_overlapping_worker_cannot_replace_newer_capture(
         if name == "newer":
             newer_done.set()
 
-    old_thread = Thread(target=run, args=("older", puller), daemon=True)
-    new_thread = Thread(target=run, args=("newer", newer), daemon=True)
+    old_thread = Thread(target=run, args=("older", puller), name="older", daemon=True)
+    new_thread = Thread(target=run, args=("newer", newer), name="newer", daemon=True)
     old_thread.start()
     try:
         assert first_page_entered.wait(5)
@@ -240,6 +258,8 @@ def test_older_overlapping_worker_cannot_replace_newer_capture(
     assert not old_thread.is_alive() and not new_thread.is_alive()
     assert results["newer"]["status"] == "SUCCESS"
     assert results["older"]["status"] == "SKIPPED"
+    assert [entry[1] for entry in db.allocations] == [1, 2]
+    assert db.allocations[0][2] > db.allocations[1][2]  # inverted wall clocks
     assert {row["strike"] for row in db.rows} == {120.0}
     assert len({row["batch_id"] for row in db.rows}) == 1
 
@@ -247,11 +267,12 @@ def test_older_overlapping_worker_cannot_replace_newer_capture(
 def test_complete_pull_replaces_preexisting_legacy_rows(puller: options.OptionsPuller) -> None:
     puller.engine.rows = [{
         "ticker": "SPY", "snap_date": datetime.now(timezone.utc).date().isoformat(),
-        "strike": 999.0, "batch_id": None, "started_at": None, "completed_at": None,
+        "strike": 999.0, "batch_id": None, "ordinal": None,
+        "started_at": None, "completed_at": None,
     }]
     assert _run(puller, [100.0], fail_second=True)[0]["status"] == "FAILED"
     assert puller.engine.rows[0]["batch_id"] is None  # still reader-unavailable
     assert _run(puller, [100.0])[0]["status"] == "SUCCESS"
     assert {row["strike"] for row in puller.engine.rows} == {100.0}
-    assert all(row["batch_id"] and row["started_at"] and row["completed_at"]
+    assert all(row["batch_id"] and row["ordinal"] and row["started_at"] and row["completed_at"]
                for row in puller.engine.rows)

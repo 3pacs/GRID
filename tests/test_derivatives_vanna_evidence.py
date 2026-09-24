@@ -21,6 +21,7 @@ def _profile() -> dict:
         "chain_created_at": first.isoformat(),
         "chain_created_at_max": first.isoformat(),
         "chain_batch_id": "11111111-1111-4111-8111-111111111111",
+        "chain_capture_ordinal": 1,
         "chain_capture_started_at": first.isoformat(),
         "chain_capture_completed_at": completed.isoformat(),
         "spot": 100.0, "spot_source": "spy_close_receipt",

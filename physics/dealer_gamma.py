@@ -205,6 +205,7 @@ class DealerGammaEngine:
             "snap_date": str(snap_date),
             "chain_snap_date": chain.attrs["snap_date"].isoformat(),
             "chain_batch_id": chain.attrs["batch_id"],
+            "chain_capture_ordinal": chain.attrs["capture_ordinal"],
             "chain_capture_started_at": chain.attrs["capture_started_at"].isoformat(),
             "chain_capture_completed_at": chain_completed_at.isoformat(),
             "chain_created_at": chain.attrs["created_at_min"].isoformat(),
@@ -398,14 +399,15 @@ class DealerGammaEngine:
         """Load only the requested day's chain; reject mixed or late captures.
 
         Only one fully completed capture is eligible. A legacy or partially
-        published chain without start, batch, and completion provenance fails
+        published chain without ordinal, start, batch, and completion provenance fails
         closed, as do rows mixed with an older writer.
         """
         with self.engine.connect() as conn:
             rows = conn.execute(text("""
                 SELECT strike, opt_type, open_interest, implied_vol AS implied_volatility,
                        expiry, (expiry - :snap_date) AS dte, created_at,
-                       capture_batch_id, capture_started_at, capture_completed_at
+                       capture_batch_id, capture_ordinal,
+                       capture_started_at, capture_completed_at
                 FROM options_snapshots
                 WHERE ticker = :ticker AND snap_date = :snap_date
                 ORDER BY expiry, strike, opt_type
@@ -416,20 +418,25 @@ class DealerGammaEngine:
 
         created = [row[6] for row in rows]
         batches = {row[7] for row in rows}
-        starts = {row[8] for row in rows}
-        completions = {row[9] for row in rows}
+        ordinals = {row[8] for row in rows}
+        starts = {row[9] for row in rows}
+        completions = {row[10] for row in rows}
         now = datetime.now(timezone.utc)
         if (any(not isinstance(ts, datetime) or ts.tzinfo is None for ts in created)
                 or len(batches) != 1 or not next(iter(batches))
+                or len(ordinals) != 1
                 or len(starts) != 1
                 or len(completions) != 1):
             return pd.DataFrame()
         batch_id = next(iter(batches))
+        ordinal = next(iter(ordinals))
         started_at = next(iter(starts))
         completed_at = next(iter(completions))
         try:
             UUID(batch_id)
         except (TypeError, ValueError, AttributeError):
+            return pd.DataFrame()
+        if not isinstance(ordinal, int) or isinstance(ordinal, bool) or ordinal <= 0:
             return pd.DataFrame()
         if (not isinstance(started_at, datetime) or started_at.tzinfo is None
                 or not isinstance(completed_at, datetime) or completed_at.tzinfo is None):
@@ -444,13 +451,14 @@ class DealerGammaEngine:
 
         df = pd.DataFrame(rows, columns=["strike", "opt_type", "open_interest",
                                           "implied_volatility", "expiry", "dte",
-                                          "created_at", "capture_batch_id", "capture_started_at",
-                                          "capture_completed_at"])
+                                          "created_at", "capture_batch_id", "capture_ordinal",
+                                          "capture_started_at", "capture_completed_at"])
         df["dte"] = df["dte"].apply(lambda x: x.days if hasattr(x, 'days') else int(x))
         df = df[(df["dte"] > 0)
                 & (df["open_interest"] > 0)
                 & (df["implied_volatility"] > 0)].copy()
         df.attrs.update(snap_date=snap_date, batch_id=batch_id,
+                        capture_ordinal=ordinal,
                         capture_started_at=started_at,
                         capture_completed_at=completed_at,
                         created_at_min=first, created_at_max=last)

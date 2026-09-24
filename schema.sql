@@ -670,6 +670,8 @@ CREATE INDEX IF NOT EXISTS idx_agent_runs_journal
 -- TABLE: options_snapshots
 -- Raw options chain snapshots per ticker/expiry/strike.
 -- ============================================================
+CREATE SEQUENCE IF NOT EXISTS options_capture_ordinal_seq;
+
 CREATE TABLE IF NOT EXISTS options_snapshots (
     id              BIGSERIAL PRIMARY KEY,
     ticker          TEXT NOT NULL,
@@ -686,6 +688,7 @@ CREATE TABLE IF NOT EXISTS options_snapshots (
     in_the_money    BOOLEAN,
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     capture_batch_id TEXT,
+    capture_ordinal BIGINT,
     capture_started_at TIMESTAMPTZ,
     capture_completed_at TIMESTAMPTZ,
     UNIQUE (ticker, snap_date, expiry, opt_type, strike)

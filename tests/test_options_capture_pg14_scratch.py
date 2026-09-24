@@ -7,6 +7,7 @@ The test creates and drops a random schema; it never uses production tables.
 from __future__ import annotations
 
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 from threading import Event, Thread
 from types import SimpleNamespace
@@ -14,7 +15,7 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import create_engine, event, text
-from sqlalchemy.engine import make_url
+from sqlalchemy.engine import URL, make_url
 
 from ingestion import options
 from migrations.versions import options_capture_batch_20260924 as migration
@@ -45,26 +46,90 @@ def _puller(engine, yahoo):
     return puller
 
 
+def _scratch_url(dsn: str) -> URL:
+    """Require an unambiguous TCP loopback route before libpq can connect."""
+    url = make_url(dsn)
+    if (url.drivername != "postgresql+psycopg2"
+            or url.host != "127.0.0.1"
+            or url.port is None
+            or url.query
+            or not (url.database or "").startswith("grid_gex_scratch_")):
+        raise ValueError(
+            "GRID_GEX_SCRATCH_DSN requires explicit 127.0.0.1:PORT, "
+            "a grid_gex_scratch_* database, and no URL query parameters"
+        )
+    return url
+
+
+def _create_scratch_engine(url: URL, **kwargs):
+    # Explicit libpq connection values outrank PGHOSTADDR/PGSERVICE defaults.
+    return create_engine(url, connect_args={
+        "host": "127.0.0.1", "hostaddr": "127.0.0.1",
+        "port": url.port, "dbname": url.database,
+    }, **kwargs)
+
+
+@pytest.mark.parametrize("dsn", [
+    "postgresql+psycopg2:///grid_gex_scratch_test",
+    "postgresql+psycopg2://scratch@remote:55432/grid_gex_scratch_test",
+    "postgresql+psycopg2://scratch@127.0.0.1/grid_gex_scratch_test",
+    "postgresql+psycopg2://scratch@127.0.0.1:55432/grid_prod",
+    "postgresql+psycopg2://scratch@127.0.0.1:55432/grid_gex_scratch_test?hostaddr=10.0.0.5",
+    "postgresql+psycopg2://scratch@127.0.0.1:55432/grid_gex_scratch_test?service=production",
+    "postgresql+psycopg2://scratch@127.0.0.1:55432/grid_gex_scratch_test?host=/tmp",
+    "postgresql+psycopg2://scratch@127.0.0.1:55432/grid_gex_scratch_test?options=-csearch_path%3Dpublic",
+])
+def test_scratch_dsn_rejects_ambiguous_or_nonlocal_routes(dsn: str) -> None:
+    with pytest.raises(ValueError, match="GRID_GEX_SCRATCH_DSN"):
+        _scratch_url(dsn)
+
+
+def test_scratch_dsn_accepts_explicit_loopback_without_overrides() -> None:
+    url = _scratch_url(
+        "postgresql+psycopg2://scratch@127.0.0.1:55432/grid_gex_scratch_test"
+    )
+    assert url.host == "127.0.0.1"
+    assert url.port == 55432
+    assert not url.query
+
+
+def test_scratch_engine_pins_libpq_route(monkeypatch) -> None:
+    seen = {}
+
+    def capture(_url, **kwargs):
+        seen.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(sys.modules[__name__], "create_engine", capture)
+    url = _scratch_url(
+        "postgresql+psycopg2://scratch@127.0.0.1:55432/grid_gex_scratch_test"
+    )
+    _create_scratch_engine(url, pool_pre_ping=True)
+    assert seen["connect_args"] == {
+        "host": "127.0.0.1", "hostaddr": "127.0.0.1",
+        "port": 55432, "dbname": "grid_gex_scratch_test",
+    }
+
+
 @pytest.fixture
 def scratch_pg14(monkeypatch):
     dsn = os.getenv("GRID_GEX_SCRATCH_DSN")
     if not dsn:
         pytest.skip("set GRID_GEX_SCRATCH_DSN for a disposable local PG14 database")
-    url = make_url(dsn)
-    if (url.drivername != "postgresql+psycopg2"
-            or url.host not in (None, "localhost", "127.0.0.1", "::1")
-            or not (url.database or "").startswith("grid_gex_scratch_")):
-        pytest.fail("GRID_GEX_SCRATCH_DSN must target a local disposable grid_gex_scratch_* DB")
+    url = _scratch_url(dsn)
 
-    admin = create_engine(url, pool_pre_ping=True)
+    admin = _create_scratch_engine(url, pool_pre_ping=True)
     schema = f"gex_capture_{uuid4().hex}"
     with admin.begin() as conn:
+        server_addr = conn.exec_driver_sql("SELECT inet_server_addr()::text").scalar_one()
+        if server_addr != "127.0.0.1":
+            pytest.fail(f"scratch server did not accept a loopback connection: {server_addr}")
         version = int(conn.exec_driver_sql("SHOW server_version_num").scalar_one())
         if version // 10000 != 14:
             pytest.fail(f"scratch server must be PostgreSQL 14, got {version}")
         conn.exec_driver_sql(f'CREATE SCHEMA "{schema}"')
 
-    engine = create_engine(url, pool_size=3, max_overflow=0, pool_pre_ping=True)
+    engine = _create_scratch_engine(url, pool_size=3, max_overflow=0, pool_pre_ping=True)
 
     @event.listens_for(engine, "connect")
     def _set_search_path(dbapi_conn, _record):
@@ -124,7 +189,11 @@ def test_pg14_migration_replacement_rollback_and_overlap(scratch_pg14, monkeypat
             SELECT column_name FROM information_schema.columns
             WHERE table_schema = current_schema() AND table_name = 'options_snapshots'
         """))}
-        assert {"capture_batch_id", "capture_started_at", "capture_completed_at"} <= columns
+        assert {"capture_batch_id", "capture_ordinal", "capture_started_at",
+                "capture_completed_at"} <= columns
+        assert conn.exec_driver_sql(
+            "SELECT to_regclass('options_capture_ordinal_seq')"
+        ).scalar_one() is not None
         conn.execute(text("""
             INSERT INTO options_snapshots (ticker, snap_date, expiry, opt_type, strike,
                                            open_interest, implied_vol)
@@ -140,14 +209,15 @@ def test_pg14_migration_replacement_rollback_and_overlap(scratch_pg14, monkeypat
     )["status"] == "SUCCESS"
     with engine.connect() as conn:
         rows = conn.execute(text("""
-            SELECT strike, capture_batch_id, capture_started_at,
+            SELECT strike, capture_batch_id, capture_ordinal, capture_started_at,
                    capture_completed_at, created_at FROM options_snapshots
             WHERE ticker = 'SPY' AND snap_date = :day
         """), {"day": day}).fetchall()
     assert len(rows) == 8
     assert {row[0] for row in rows} == {100.0, 120.0}
     assert len({row[1] for row in rows}) == 1
-    assert all(row[2] <= row[3] <= row[4] for row in rows)
+    assert len({row[2] for row in rows}) == 1 and rows[0][2] > 0
+    assert all(row[3] <= row[4] for row in rows)
     assert not DealerGammaEngine(engine)._load_chain("SPY", day).empty
 
     with engine.begin() as conn:
