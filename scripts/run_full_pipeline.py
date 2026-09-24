@@ -397,7 +397,10 @@ def run_pipeline(historical: bool = False) -> dict:
     summary["steps"]["digest"] = _safe_run("Daily Digest Email", _digest)
 
     # -----------------------------------------------------------------------
-    # STEP 12: File rotation / cleanup (insights, briefings, error archives)
+    # STEP 12: File rotation / cleanup (insights)
+    # Briefing retention is owned by hermes_operator's briefing_cleanup task,
+    # gated by DAILY_INTEL_INITIAL_ALLOWLIST. Don't duplicate it here: Hermes'
+    # RUN_PIPELINE skill runs this step, which would bypass that gate.
     # -----------------------------------------------------------------------
     def _cleanup():
         cleaned = {}
@@ -406,11 +409,6 @@ def run_pipeline(historical: bool = False) -> dict:
             cleaned["insights"] = cleanup_old_insights(max_age_days=90)
         except Exception as exc:
             log.debug("Insight cleanup skipped: {e}", e=str(exc))
-        try:
-            from ollama.market_briefing import MarketBriefingGenerator
-            cleaned["briefings"] = MarketBriefingGenerator.cleanup_old_briefings(max_age_days=90)
-        except Exception as exc:
-            log.debug("Briefing cleanup skipped: {e}", e=str(exc))
         return cleaned
     summary["steps"]["cleanup"] = _safe_run("File Rotation Cleanup", _cleanup)
 
