@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from physics.dealer_gamma import DealerGammaEngine, bs_gamma
+from physics.dealer_gamma import FLIP_SEARCH_STEP_PCT, DealerGammaEngine, bs_gamma
 
 
 SNAP_DATE = date(2026, 1, 15)
@@ -121,21 +121,33 @@ def _expected_per_strike(rows: list[dict[str, float | str]]) -> dict[float, dict
     return expected
 
 
-def _expected_gamma_flip(rows: list[dict[str, float | str]]) -> float | None:
-    prices = np.linspace(SPOT * (1.0 - RANGE_PCT), SPOT * (1.0 + RANGE_PCT), N_POINTS)
+def _expected_gamma_flip(rows: list[dict[str, float | str]]) -> tuple[float | None, int]:
+    """Independent reimplementation of _find_gamma_flip's fine search grid
+    (FLIP_SEARCH_STEP_PCT of SPOT per step — NOT the coarser RANGE_PCT/
+    N_POINTS used elsewhere in this file for the chart-oriented profile
+    curve) and its nearest-to-spot crossing selection."""
+    lo = SPOT * (1.0 - RANGE_PCT)
+    hi = SPOT * (1.0 + RANGE_PCT)
+    step = SPOT * FLIP_SEARCH_STEP_PCT
+    n = max(int(round((hi - lo) / step)) + 1, 2)
+    prices = np.linspace(lo, hi, n)
     gex_values = [
         sum(_row_gex(row, spot=float(price)) for row in rows)
         for price in prices
     ]
 
+    crossings: list[float] = []
     for i in range(1, len(gex_values)):
         prev_gex = gex_values[i - 1]
         curr_gex = gex_values[i]
         if prev_gex * curr_gex < 0:
             ratio = abs(prev_gex) / (abs(prev_gex) + abs(curr_gex) + 1e-12)
-            return float(prices[i - 1] + ratio * (prices[i] - prices[i - 1]))
+            crossings.append(float(prices[i - 1] + ratio * (prices[i] - prices[i - 1])))
 
-    return None
+    if not crossings:
+        return None, 0
+    nearest = min(crossings, key=lambda p: abs(p - SPOT))
+    return nearest, len(crossings)
 
 
 def test_compute_gex_profile_aggregates_per_strike_and_selects_walls(
@@ -167,12 +179,14 @@ def test_compute_gex_profile_interpolates_gamma_flip_from_crossing_grid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rows = _base_rows()
-    expected_flip = _expected_gamma_flip(rows)
+    expected_flip, expected_crossings = _expected_gamma_flip(rows)
 
     profile = _compute_profile(monkeypatch, rows)
 
     assert expected_flip is not None
     assert profile["gamma_flip"] == pytest.approx(round(expected_flip, 2), abs=0.01)
+    assert profile["gamma_flip_crossings"] == expected_crossings
+    assert profile["gamma_flip_crossings"] == 1  # unambiguous for this simple fixture
     # Dealers long calls / short puts: below the flip GEX is negative
     # (short gamma), above it GEX is positive (long gamma).
     assert profile["profile"][0]["gex"] < 0
@@ -346,9 +360,10 @@ def test_compute_gex_profile_unavailable_when_spot_missing(
     assert result["reason"]
     assert "error" in result  # legacy key several existing callers still check
     for field in (
-        "regime", "gamma_flip", "gamma_wall", "put_wall", "call_wall",
-        "gex_aggregate", "gex_normalized", "dealer_delta",
-        "vanna_exposure", "charm_exposure", "profile", "per_strike", "spot",
+        "regime", "gamma_flip", "gamma_flip_crossings", "gamma_wall",
+        "put_wall", "call_wall", "gex_aggregate", "gex_normalized",
+        "dealer_delta", "vanna_exposure", "charm_exposure", "profile",
+        "per_strike", "spot",
     ):
         assert result[field] is None
 
@@ -499,3 +514,91 @@ def test_regime_sign_matches_which_side_of_the_flip_spot_is_on(
     assert profile["gex_aggregate"] > 0
     assert profile["gamma_flip"] is not None
     assert SPOT > profile["gamma_flip"]  # spot is on the long-gamma side of the flip
+
+
+# ── _find_gamma_flip: nearest-to-spot selection (2026-09-24 fine-grid fix) ─
+#
+# The flip search used to scan a coarse grid (the same n_points as the
+# chart-oriented profile curve) and return the FIRST sign crossing found
+# scanning from the low end of the range. Real chains routinely cross zero
+# more than once; the first crossing from far below spot is not necessarily
+# the one that describes dealer positioning at today's spot. Fixed to scan
+# a fine, fixed-resolution grid (FLIP_SEARCH_STEP_PCT of spot) and return
+# the crossing NEAREST spot, plus how many crossings it found.
+
+
+def _patch_vectorized_gex(
+    monkeypatch: pytest.MonkeyPatch, engine: DealerGammaEngine, gex_fn,
+) -> None:
+    """Stub out the chain-array prep + vectorized evaluator so
+    _find_gamma_flip's grid/selection logic can be tested against a
+    hand-crafted GEX(spot) curve, independent of chain/Greek plumbing."""
+    monkeypatch.setattr(engine, "_prepare_chain_arrays", lambda _chain: (None,) * 5)
+    monkeypatch.setattr(engine, "_gex_at_spots_vectorized", gex_fn)
+
+
+def test_find_gamma_flip_returns_crossing_nearest_spot_not_first_from_bottom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two crossings in range: one far from spot (~92), one near it
+    (~99). The flip must be the near one, not the first-from-the-bottom
+    (~92) one the old code would have returned."""
+    engine = DealerGammaEngine(MagicMock(), risk_free_rate=RISK_FREE_RATE)
+    spot = 100.0
+
+    def fake_gex(_strikes, _T, _iv, _oi, _sign, spots):
+        return np.array([
+            -1_000_000.0 if p < 92.0 else (1_000_000.0 if p < 99.0 else -500_000.0)
+            for p in spots
+        ])
+
+    _patch_vectorized_gex(monkeypatch, engine, fake_gex)
+
+    flip, crossings = engine._find_gamma_flip(pd.DataFrame(), spot, 0.10)
+
+    assert crossings == 2
+    assert flip is not None
+    assert 98.5 < flip < 99.5  # the crossing near spot, not the ~92 one
+    assert abs(flip - spot) < abs(92.0 - spot)
+
+
+def test_find_gamma_flip_no_crossing_returns_none_and_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Aggregate GEX the same sign throughout the range -> (None, 0), never
+    a fabricated price."""
+    engine = DealerGammaEngine(MagicMock(), risk_free_rate=RISK_FREE_RATE)
+
+    def fake_gex_always_positive(_strikes, _T, _iv, _oi, _sign, spots):
+        return np.full(len(spots), 1_000_000.0)
+
+    _patch_vectorized_gex(monkeypatch, engine, fake_gex_always_positive)
+
+    flip, crossings = engine._find_gamma_flip(pd.DataFrame(), 100.0, 0.10)
+
+    assert flip is None
+    assert crossings == 0
+
+
+def test_find_gamma_flip_uses_fine_grid_independent_of_n_points(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_find_gamma_flip takes no n_points argument — its grid resolution is
+    fixed (FLIP_SEARCH_STEP_PCT of spot), not tied to the profile curve's
+    (much coarser) point count. A 30% range at 0.1% steps is ~300 points,
+    materially finer than the old 50-point default."""
+    engine = DealerGammaEngine(MagicMock(), risk_free_rate=RISK_FREE_RATE)
+    spot = 100.0
+    range_pct = 0.15
+    seen_lengths: list[int] = []
+
+    def fake_gex(_strikes, _T, _iv, _oi, _sign, spots):
+        seen_lengths.append(len(spots))
+        return np.array([-1.0 if p < spot else 1.0 for p in spots])  # one crossing, at spot
+
+    _patch_vectorized_gex(monkeypatch, engine, fake_gex)
+
+    engine._find_gamma_flip(pd.DataFrame(), spot, range_pct)
+
+    assert seen_lengths == [round(2 * range_pct / FLIP_SEARCH_STEP_PCT) + 1]
+    assert seen_lengths[0] > 250

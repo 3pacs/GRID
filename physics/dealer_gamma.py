@@ -84,6 +84,12 @@ from store.availability import unavailable as _unavailable_result
 DEALER_CALL_SIGN: float = 1.0   # dealers modeled LONG calls  -> long gamma at that strike
 DEALER_PUT_SIGN: float = -1.0   # dealers modeled SHORT puts  -> short gamma at that strike
 
+# Gamma-flip search grid resolution: 0.1% of spot per step, independent of
+# the much coarser n_points used for the chart-oriented profile curve. Real
+# chains routinely cross zero more than once in the search range (lumpy
+# per-strike open interest, not a smooth curve) — see _find_gamma_flip.
+FLIP_SEARCH_STEP_PCT: float = 0.001
+
 
 # ── Black-Scholes Greeks (shims over physics/greeks/black_scholes) ───────────
 
@@ -163,7 +169,13 @@ class DealerGammaEngine:
         Returns:
             Dictionary with:
             - gex_aggregate: float (total GEX at current spot)
-            - gamma_flip: float (spot price where GEX = 0)
+            - gamma_flip: float (the GEX(spot)=0 crossing NEAREST the
+              current spot — see _find_gamma_flip; None if the search grid
+              finds no crossing at all)
+            - gamma_flip_crossings: int (how many zero-crossings the flip
+              search found in range; 0 = none, 1 = the common
+              unambiguous case, 2+ = more than one nearby crossing, so
+              gamma_flip is the closest of several, not the only one)
             - gamma_wall: float (strike with max |GEX|)
             - put_wall: float (strike with the largest-magnitude PUT gamma
               exposure, i.e. most negative put_gex — typically a support level)
@@ -201,6 +213,7 @@ class DealerGammaEngine:
                 spot=None,
                 regime=None,
                 gamma_flip=None,
+                gamma_flip_crossings=None,
                 gamma_wall=None,
                 put_wall=None,
                 call_wall=None,
@@ -223,8 +236,9 @@ class DealerGammaEngine:
         # Aggregate GEX at current spot
         gex_agg = sum(s["net_gex"] for s in per_strike)
 
-        # Find gamma flip (spot where GEX crosses zero)
-        gamma_flip = self._find_gamma_flip(chain, spot, spot_range_pct, n_points)
+        # Find gamma flip: the crossing nearest spot, plus how many
+        # crossings the fine-grained scan found (ambiguity signal).
+        gamma_flip, gamma_flip_crossings = self._find_gamma_flip(chain, spot, spot_range_pct)
 
         # Gamma/put/call walls. Under DEALER_CALL_SIGN/DEALER_PUT_SIGN,
         # call_gex is >= 0 and put_gex is <= 0 at every strike (barring an
@@ -268,6 +282,7 @@ class DealerGammaEngine:
             "gex_aggregate": round(gex_agg, 0),
             "gex_normalized": round(gex_normalized, 4),
             "gamma_flip": round(gamma_flip, 2) if gamma_flip else None,
+            "gamma_flip_crossings": gamma_flip_crossings,
             "gamma_wall": round(gamma_wall, 2),
             "put_wall": round(put_wall, 2) if put_wall else None,
             "call_wall": round(call_wall, 2) if call_wall else None,
@@ -437,26 +452,57 @@ class DealerGammaEngine:
         return gex
 
     def _find_gamma_flip(
-        self, chain: pd.DataFrame, spot: float,
-        range_pct: float, n_points: int,
-    ) -> float | None:
-        """Find the spot price where aggregate GEX crosses zero."""
+        self, chain: pd.DataFrame, spot: float, range_pct: float,
+    ) -> tuple[float | None, int]:
+        """Find the gamma flip: the zero-crossing of aggregate GEX(spot)
+        NEAREST to the actual current ``spot``, linearly interpolated
+        between the two grid points bracketing it.
+
+        Scans a fixed-resolution grid — ``FLIP_SEARCH_STEP_PCT`` (0.1%) of
+        ``spot`` per step — across ``[spot*(1-range_pct),
+        spot*(1+range_pct)]``, independent of the much coarser ``n_points``
+        used for the chart-oriented profile curve (``_compute_profile_curve``).
+        Real chains are lumpy (per-strike open interest, not a smooth
+        curve) and routinely cross zero more than once in that range.
+        Returning the FIRST crossing scanning from the low end of the
+        range — the previous behavior — can return a crossing far from
+        where dealer positioning actually flips relative to today's spot;
+        confirmed on the real 2026-09-24 SPY chain, where a coarse 50-point
+        grid found a crossing at $766.21 while the true curve, scanned
+        finely, whipsaws through several crossings between $762 and $765 —
+        much closer to that day's $765.88 spot.
+
+        Returns ``(flip_price, crossing_count)``:
+          - ``flip_price`` is ``None`` when the scan finds no sign change
+            anywhere in the range (aggregate GEX is one sign throughout).
+          - ``crossing_count`` is how many sign changes the scan found — 0
+            when there is none, 1 in the common single-crossing case, 2+
+            when the flip is ambiguous (more than one nearby crossing, so
+            a caller should not treat the single returned price as the
+            only regime boundary nearby).
+        """
         lo = spot * (1 - range_pct)
         hi = spot * (1 + range_pct)
+        step = spot * FLIP_SEARCH_STEP_PCT
+        n_points = max(int(round((hi - lo) / step)) + 1, 2) if step > 0 else 2
         prices = np.linspace(lo, hi, n_points)
 
         arrays = self._prepare_chain_arrays(chain)
         gex_values = self._gex_at_spots_vectorized(*arrays, prices)
 
-        # Find first sign change
+        crossings: list[float] = []
         for i in range(1, len(gex_values)):
-            if gex_values[i - 1] * gex_values[i] < 0:
-                prev_gex = gex_values[i - 1]
-                curr_gex = gex_values[i]
+            prev_gex = gex_values[i - 1]
+            curr_gex = gex_values[i]
+            if prev_gex * curr_gex < 0:
                 ratio = abs(prev_gex) / (abs(prev_gex) + abs(curr_gex) + 1e-12)
-                return float(prices[i - 1] + ratio * (prices[i] - prices[i - 1]))
+                crossings.append(float(prices[i - 1] + ratio * (prices[i] - prices[i - 1])))
 
-        return None
+        if not crossings:
+            return None, 0
+
+        nearest = min(crossings, key=lambda p: abs(p - spot))
+        return nearest, len(crossings)
 
     def _gex_at_spot(self, chain: pd.DataFrame, spot: float) -> float:
         """Compute aggregate GEX at a hypothetical spot price."""
