@@ -25,7 +25,7 @@ class _Result:
 class _Connection:
     def __init__(self):
         now = datetime.now(timezone.utc)
-        self.core = [("congressional", "A", "SELL", now, None, {"amount": "$1K"})]
+        self.core = [("congressional", "A", "SELL", now, None, {"amount_range": "$1K"})]
         self.convergence = [
             ("congressional", "A", "SELL", now, None),
             ("insider", "B", "SELL", now, 0.8),

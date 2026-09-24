@@ -38,8 +38,8 @@ def _round_or_none(value, digits: int = 2) -> float | None:
         return None
 
 
-def _edge_metadata(value) -> dict:
-    """Decode stored JSON metadata without inventing a payload on failure."""
+def _edge_signal_value(value) -> dict:
+    """Decode the stored signal_value object without inventing payload fields."""
     if isinstance(value, dict):
         return value
     if isinstance(value, str):
@@ -605,52 +605,47 @@ def get_ticker_edge(
         with engine.connect() as conn:
             core_rows = conn.execute(text("""
                 SELECT source_type, source_id, signal_type, signal_date,
-                       trust_score, metadata
+                       trust_score, signal_value
                 FROM signal_sources
                 WHERE ticker = :t
                   AND source_type IN ('congressional', 'insider', 'darkpool')
                   AND signal_date >= NOW() - INTERVAL '45 days'
                 ORDER BY signal_date DESC
             """), {"t": ticker_upper}).fetchall()
-            for source_type, source_id, signal_type, signal_date, trust_score, metadata in core_rows:
-                meta = _edge_metadata(metadata)
+            for source_type, source_id, signal_type, signal_date, trust_score, signal_value in core_rows:
+                meta = _edge_signal_value(signal_value)
                 signal = str(signal_type) if signal_type else "UNAVAILABLE"
                 if source_type == "congressional" and _edge_within_days(signal_date, 45):
                     congressional.append({
                         "member": str(source_id), "action": signal,
-                        "amount": meta.get("amount", "N/A"), "date": str(signal_date),
+                        "amount": meta.get("amount_range", meta.get("amount", "N/A")), "date": str(signal_date),
                         "committee": meta.get("committee", "N/A"),
                         "trust_score": _round_or_none(trust_score),
                     })
                 elif source_type == "insider" and _edge_within_days(signal_date, 30):
                     insider.append({
-                        "name": str(source_id), "title": meta.get("title", ""),
+                        "name": str(source_id), "title": meta.get("insider_title", meta.get("title", "")),
                         "action": signal, "shares": meta.get("shares"),
                         "value": meta.get("value"), "date": str(signal_date),
                         "cluster": meta.get("cluster", False),
                     })
                 elif source_type == "darkpool" and _edge_within_days(signal_date, 7) and dark_pool is None:
                     dark_pool = {
-                        "volume_vs_avg": meta.get("volume_vs_avg"),
+                        "volume_vs_avg": meta.get("spike_ratio", meta.get("volume_vs_avg")),
                         "signal": "accumulation" if signal == "BUY" else "distribution" if signal == "SELL" else "unavailable",
                         "date": str(signal_date),
                     }
 
             lookback = date.today() - timedelta(days=14)
             whale_rows = conn.execute(text("""
-                SELECT source_id, signal_type, signal_date, metadata
+                SELECT source_id, signal_type, signal_date, signal_value
                 FROM signal_sources
                 WHERE ticker = :t AND source_type = 'scanner'
                   AND signal_date >= :lb
                 ORDER BY signal_date DESC LIMIT 10
             """), {"t": ticker_upper, "lb": lookback}).fetchall()
             for r in whale_rows:
-                meta = r[3] or {}
-                if isinstance(meta, str):
-                    try:
-                            meta = json.loads(meta)
-                    except Exception:
-                        meta = {}
+                meta = _edge_signal_value(r[3])
                 whale_flow.append({
                     "strike": meta.get("strike"),
                     "expiry": meta.get("expiry", ""),
@@ -659,19 +654,14 @@ def get_ticker_edge(
                     "date": str(r[2]),
                 })
             social_rows = conn.execute(text("""
-                SELECT source_id, signal_type, signal_date, trust_score, metadata
+                SELECT source_id, signal_type, signal_date, trust_score, signal_value
                 FROM signal_sources
                 WHERE ticker = :t AND source_type = 'social'
                   AND signal_date >= :lb
                 ORDER BY signal_date DESC LIMIT 10
             """), {"t": ticker_upper, "lb": lookback}).fetchall()
             for r in social_rows:
-                meta = r[4] or {}
-                if isinstance(meta, str):
-                    try:
-                            meta = json.loads(meta)
-                    except Exception:
-                        meta = {}
+                meta = _edge_signal_value(r[4])
                 smart_money.append({
                     "source": meta.get("platform", "unknown"),
                     "user": str(r[0]),
@@ -679,19 +669,14 @@ def get_ticker_edge(
                     "trust_score": _round_or_none(r[3]),
                 })
             pred_rows = conn.execute(text("""
-                SELECT source_id, signal_date, metadata
+                SELECT source_id, signal_date, signal_value
                 FROM signal_sources
                 WHERE ticker = :t AND source_type IN ('prediction', 'polymarket')
                   AND signal_date >= :lb
                 ORDER BY signal_date DESC LIMIT 5
             """), {"t": ticker_upper, "lb": lookback}).fetchall()
             for r in pred_rows:
-                meta = r[2] or {}
-                if isinstance(meta, str):
-                    try:
-                            meta = json.loads(meta)
-                    except Exception:
-                        meta = {}
+                meta = _edge_signal_value(r[2])
                 prediction_markets.append({
                     "market": meta.get("market", str(r[0])),
                     "probability": meta.get("probability"),
