@@ -4,7 +4,8 @@ from datetime import date
 
 import pytest
 
-from paper_log.gex_levels.engine_adapter import DealerGammaAdapter, LevelsResult
+from paper_log.gex_levels.engine_adapter import DealerGammaAdapter, LevelsResult, _DEFAULT_SPOT_SOURCE
+from store.availability import unavailable
 
 
 class _FakeEngine:
@@ -39,14 +40,16 @@ def test_available_result_translates_all_fields() -> None:
 
     assert result == LevelsResult(
         available=True, unavailable_reason=None,
-        spot=555.0, spot_source="physics.dealer_gamma.DealerGammaEngine",
+        spot=555.0, spot_source=_DEFAULT_SPOT_SOURCE,
         gamma_flip=550.0, put_wall=540.0, call_wall=560.0,
         gex_aggregate=1_234_000.0, gex_normalized=0.6, regime="LONG_GAMMA",
         raw=FULL_RESULT,
     )
 
 
-def test_error_result_is_unavailable() -> None:
+def test_legacy_error_result_is_unavailable() -> None:
+    """The empty-options-chain case: still the bare legacy shape (only
+    `error`/`ticker`), unchanged by the dealer-gamma sign/spot fix."""
     adapter = DealerGammaAdapter(engine=_FakeEngine({"error": "No options data for SPY", "ticker": "SPY"}))
     result = adapter.get_levels("SPY", date(2026, 9, 24))
 
@@ -57,6 +60,45 @@ def test_error_result_is_unavailable() -> None:
     assert result.put_wall is None
     assert result.call_wall is None
     assert result.regime is None
+
+
+def test_rich_unavailable_payload_prefers_reason_over_legacy_error() -> None:
+    """The merged engine's real "no measured spot" shape: a
+    store.availability.unavailable() payload with a legacy `error` key
+    bolted on. The adapter should surface the far more diagnostic `reason`
+    in the paper log, not the terser legacy `error` string."""
+    raw = unavailable(
+        "no measured spot price for SPY on 2026-09-24 "
+        "(checked options_daily_signals.spot_price and resolved_series)",
+        source="options_daily_signals",
+        ticker="SPY", snap_date="2026-09-24", spot=None, regime=None,
+        gamma_flip=None, gamma_wall=None, put_wall=None, call_wall=None,
+        gex_aggregate=None, gex_normalized=None, dealer_delta=None,
+        vanna_exposure=None, charm_exposure=None, profile=None, per_strike=None,
+    )
+    raw["error"] = "No spot price for SPY"
+
+    adapter = DealerGammaAdapter(engine=_FakeEngine(raw))
+    result = adapter.get_levels("SPY", date(2026, 9, 24))
+
+    assert result.available is False
+    assert result.unavailable_reason == (
+        "no measured spot price for SPY on 2026-09-24 "
+        "(checked options_daily_signals.spot_price and resolved_series)"
+    )
+    assert result.spot is None
+    assert result.gamma_flip is None
+    assert result.put_wall is None
+    assert result.call_wall is None
+    assert result.regime is None
+
+
+def test_rich_unavailable_payload_without_legacy_error_key_still_works() -> None:
+    raw = unavailable("no measured spot price", source="options_daily_signals", spot=None)
+    adapter = DealerGammaAdapter(engine=_FakeEngine(raw))
+    result = adapter.get_levels("SPY", date(2026, 9, 24))
+    assert result.available is False
+    assert result.unavailable_reason == "no measured spot price"
 
 
 def test_empty_result_is_unavailable() -> None:

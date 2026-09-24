@@ -1,15 +1,14 @@
 """Thin adapter over ``physics.dealer_gamma.DealerGammaEngine``.
 
-Why this exists: a second lane (``fix/dealer-gamma-sign-spot-20260924``) is
-fixing the engine's sign convention and spot source while this package is
-being built. Rather than call ``DealerGammaEngine`` directly from
+Why this exists: a second lane (``fix/dealer-gamma-sign-spot-20260924``,
+merged into this branch 2026-09-24 at head 1bc63cf9 / PR #644) fixed the
+engine's sign convention and spot source while this package was being
+built. Rather than call ``DealerGammaEngine`` directly from
 ``preopen.py``, every caller in this package goes through
 :class:`DealerGammaAdapter`, and every field the engine's returned dict
-might rename/add lives behind :func:`DealerGammaAdapter._translate`. When
-the fix lands and is merged into this branch, only ``_translate`` (and its
-tests) should need to change — everything else in ``paper_log.gex_levels``
-depends on the stable :class:`LevelsResult` shape, and can also be pointed
-at a mock/fake engine in tests without touching a database.
+might rename/add lives behind :func:`DealerGammaAdapter._translate` — so
+adapting to the merged engine (below) only required editing this one
+function and its tests, not every call site.
 
 Pre-registration inputs this maps directly:
   "Levels, from `physics.dealer_gamma.DealerGammaEngine` at the pinned code
@@ -18,6 +17,39 @@ Pre-registration inputs this maps directly:
   dealers modeled long calls and short puts; GEX > 0 means dealers long
   gamma."
   "engine_unavailable: the engine returns no spot, flip or walls."
+
+The merged engine's ``compute_gex_profile`` returns one of three shapes,
+all handled below:
+  1. Success: a flat dict with spot/gamma_flip/put_wall/call_wall/
+     gex_aggregate/gex_normalized/regime (+ gamma_wall/dealer_delta/
+     vanna_exposure/charm_exposure/profile/per_strike, not used here).
+  2. No options chain at all (``chain.empty``): the legacy
+     ``{"error": "No options data for ...", "ticker": ...}`` — unchanged
+     from before the fix, still just those two keys.
+  3. No measured spot (checked ``options_daily_signals.spot_price`` then
+     ``resolved_series``): the richer ``store.availability.unavailable()``
+     payload — ``available: False``, ``status: "unavailable"``,
+     ``reason`` (a specific, human-readable explanation — e.g. "no
+     measured spot price for SPY on 2026-09-24 (checked
+     options_daily_signals.spot_price and resolved_series)"), ``source``,
+     every measured field explicitly ``None`` — *plus* a legacy
+     ``error: "No spot price for {ticker}"`` key kept for older callers.
+     ``_translate`` prefers the specific ``reason`` over the terser
+     legacy ``error`` string when both are present.
+
+Note on PIT correctness (task spec's "only data created before the
+pre-open run", and the coordinator's note on merging this fix): the
+engine's spot source, ``options_daily_signals.spot_price``, is upserted on
+every re-pull for a given ``(ticker, signal_date)`` with no ``updated_at``
+column — see ``DealerGammaEngine._get_spot``'s docstring. That makes it
+contemporaneous (safe) for a *live* pre-open read of *today's* row, which
+is the only thing this package ever does (``preopen.py`` always resolves
+``snap_date``/``session_date`` from the injected clock, never accepts a
+historical date to backfill) — but it would NOT be safe to reuse this
+adapter for a historical/backfill read of a past date, since a later
+same-day re-pull can silently overwrite what an earlier pre-open run would
+have seen. If this package ever grows a backfill mode, that gap needs
+closing first (an append-only spot history, or an ``updated_at`` column).
 """
 
 from __future__ import annotations
@@ -55,12 +87,17 @@ class LevelsEngine(Protocol):
     def compute_gex_profile(self, ticker: str, snap_date: date | None = None) -> dict[str, Any]: ...
 
 
-# Default label used when the engine's own result carries no explicit
-# source for `spot` (true of the engine's interface as of 51e67988). If a
-# future engine version adds a `spot_source` / `source` key to its result,
-# `_translate` prefers that value automatically — see the fallback chain
-# below.
-_DEFAULT_SPOT_SOURCE = "physics.dealer_gamma.DealerGammaEngine"
+# Default label for a *successful* result: the engine's success-path dict
+# still has no per-call `spot_source`/`source` key (only its unavailable
+# payload does), so this documents, from DealerGammaEngine._get_spot's own
+# docstring, what actually supplied `spot` on the success path. If a
+# future engine version adds an explicit `spot_source`/`source` key to the
+# success dict, `_translate` prefers that value automatically instead —
+# see the fallback chain below.
+_DEFAULT_SPOT_SOURCE = (
+    "options_daily_signals.spot_price (or resolved_series as a secondary "
+    "source) via physics.dealer_gamma.DealerGammaEngine"
+)
 
 _REQUIRED_KEYS = ("spot", "gamma_flip", "put_wall", "call_wall")
 
@@ -94,7 +131,25 @@ class DealerGammaAdapter:
                 regime=None, raw={},
             )
 
+        if raw.get("available") is False:
+            # store.availability.unavailable() payload — the engine's "no
+            # measured spot" case. Prefer its specific `reason` over the
+            # legacy `error` key the engine also sets for older callers;
+            # `source` here is *how the engine knew it had nothing*
+            # (e.g. "options_daily_signals"), not a value to trust as
+            # spot_source since there is no spot.
+            return LevelsResult(
+                available=False,
+                unavailable_reason=str(raw.get("reason") or raw.get("error") or "engine result unavailable"),
+                spot=None, spot_source=None, gamma_flip=None, put_wall=None,
+                call_wall=None, gex_aggregate=None, gex_normalized=None,
+                regime=None, raw=raw,
+            )
+
         if "error" in raw:
+            # Legacy shape only: `{"error": ..., "ticker": ...}` with no
+            # other keys at all (e.g. an empty options chain — the engine
+            # never got far enough to look up spot).
             return LevelsResult(
                 available=False,
                 unavailable_reason=str(raw["error"]),
