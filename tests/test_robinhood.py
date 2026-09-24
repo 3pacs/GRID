@@ -456,15 +456,45 @@ class TestQuoteGuards:
         trader = _trader(session=FakeSession(_routes()), max_quote_age_s=5.0)
         assert trader.open_position("BTC", "LONG", 10)["status"] == "dry_run"
 
+    def test_explicit_null_timestamp_falls_back_to_local_fetch_time(self):
+        """Matches the real Robinhood response observed 2026-09-24 14:23Z via
+        a read-only quote pull through the deployed connector: the
+        best_bid_ask row's `timestamp` field was present but null (not
+        merely absent from the payload, which test_missing_timestamp_...
+        above already covers) -- row.get("timestamp") returns None either
+        way, but this proves the exact observed shape explicitly rather
+        than relying on that equivalence."""
+        routes = _routes()
+        routes[("GET", rh.PATH_BEST_BID_ASK)] = lambda q, _b: {"results": [
+            {"symbol": s, "price": "60000", "bid_inclusive_of_sell_spread": "59940",
+             "ask_inclusive_of_buy_spread": "60060", "timestamp": None}
+            for s in q.get("symbol", [])
+        ]}
+        trader = _trader(session=FakeSession(routes), max_quote_age_s=5.0)
+        assert trader.open_position("BTC", "LONG", 10)["status"] == "dry_run"
+
     def test_wide_spread_is_rejected(self):
-        trader = _trader(session=FakeSession(_routes(spread_pct=0.05)), max_spread_bps=50.0)
+        trader = _trader(session=FakeSession(_routes(spread_pct=0.05)), max_spread_bps=250.0)
         out = trader.open_position("BTC", "LONG", 10)
         assert out["status"] == "blocked" and out["guard"] == "spread"
         assert "spread" in out["error"]
 
     def test_spread_within_cap_passes(self):
-        trader = _trader(session=FakeSession(_routes(spread_pct=0.001)), max_spread_bps=50.0)
+        trader = _trader(session=FakeSession(_routes(spread_pct=0.001)), max_spread_bps=250.0)
         assert trader.open_position("BTC", "LONG", 10)["status"] == "dry_run"
+
+    def test_realistic_robinhood_spread_passes_with_the_new_default(self):
+        """Matches the live read-only observation on 2026-09-24 14:23Z (BTC
+        188.7bps, ETH 189.7bps, SOL 187.8bps -- ~190bps is NORMAL Robinhood
+        crypto pricing, matching its own ~95bps-per-side published fee).
+        The guard must not block normal spread, only abnormal widening --
+        see config.py's ROBINHOOD_MAX_SPREAD_BPS comment. Uses the
+        connector's real default (no explicit max_spread_bps override) so
+        this tracks whatever ROBINHOOD_MAX_SPREAD_BPS actually defaults to."""
+        trader = _trader(session=FakeSession(_routes(spread_pct=0.0095)))  # (ask-bid)/mid ~= 190bps
+        out = trader.open_position("BTC", "LONG", 10)
+        assert out["status"] == "dry_run"
+        assert out["spread_bps"] == pytest.approx(190.0, rel=1e-3)
 
     def test_close_is_also_guarded_by_stale_quote_and_spread(self):
         old_ts = (datetime.now(timezone.utc) - timedelta(seconds=90)).isoformat()
@@ -472,7 +502,7 @@ class TestQuoteGuards:
         out = trader.close_position("BTC-USD")
         assert out["status"] == "blocked" and out["guard"] == "stale_quote"
 
-        wide = _trader(session=FakeSession(_routes(spread_pct=0.05)), max_spread_bps=50.0)
+        wide = _trader(session=FakeSession(_routes(spread_pct=0.05)), max_spread_bps=250.0)
         out2 = wide.close_position("BTC-USD")
         assert out2["status"] == "blocked" and out2["guard"] == "spread"
 

@@ -549,12 +549,21 @@ class Settings(BaseSettings):
     #     `timestamp` field when present, else GRID's local fetch time).
     ROBINHOOD_MAX_QUOTE_AGE_S: float = 30.0
     #   * Reject an order whose (ask-bid)/mid spread exceeds this many basis
-    #     points. 50bps is a deliberately loose ceiling: BTC/ETH on Robinhood
-    #     typically trade inside 5-10bps, so 50bps only ever fires on a
-    #     genuinely dislocated or illiquid quote, while leaving headroom for
-    #     smaller-cap pairs GRID might route later. Tune down once real spread
-    #     data is on hand.
-    ROBINHOOD_MAX_SPREAD_BPS: float = 50.0
+    #     points. MEASURED, not assumed: a read-only quote pull through the
+    #     deployed connector (DRY_RUN) on 2026-09-24 14:23Z found Robinhood's
+    #     own spread-inclusive executable gap ((ask-bid)/mid, i.e.
+    #     ask_inclusive_of_buy_spread vs bid_inclusive_of_sell_spread) running
+    #     ~188-190bps as NORMAL pricing: BTC 188.7bps, ETH 189.7bps,
+    #     SOL 187.8bps. That matches Robinhood's own published crypto fee of
+    #     ~95bps per side (2 x 95 = 190). A round trip (buy then immediately
+    #     sell) costs ~1.9% before any other fee. An earlier default of 50bps
+    #     was an unverified assumption ("BTC/ETH typically trade inside
+    #     5-10bps") that does not hold for Robinhood's retail crypto product
+    #     and would have blocked every single order. 250bps leaves headroom
+    #     above the ~190bps normal range so the guard still catches genuinely
+    #     abnormal widening (a flash move, an illiquid pair) rather than
+    #     normal Robinhood pricing.
+    ROBINHOOD_MAX_SPREAD_BPS: float = 250.0
     #   * Marketable limit orders instead of market orders when True (see
     #     trading/robinhood.py — Robinhood's Crypto Trading API supports
     #     type=limit with time_in_force="gtc", its only documented value).
