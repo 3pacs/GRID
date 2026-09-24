@@ -312,6 +312,7 @@ class OptionsPuller(BasePuller):
             snap_count = 0
             batch_id = str(uuid4())
             complete = True
+            snapshot_rows: list[dict[str, Any]] = []
 
             # Per-expiry IV data for term structure
             expiry_ivs: list[tuple[str, float]] = []
@@ -323,6 +324,13 @@ class OptionsPuller(BasePuller):
             near_puts_df = pd.DataFrame()
 
             with self.engine.begin() as conn:
+                # The first page above discovers expiries. Serialize all
+                # remaining capture and replacement for this ticker/day so
+                # overlapping canonical jobs cannot publish out of order.
+                conn.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext(:ticker), hashtext(:snap_date))"),
+                    {"ticker": ticker, "snap_date": today_str},
+                )
                 for i, exp_ts in enumerate(expirations[:MAX_EXPIRATIONS]):
                     # Use data from first request for first expiry, fetch rest
                     if i == 0:
@@ -356,25 +364,14 @@ class OptionsPuller(BasePuller):
                             ask = opt.get("ask")
                             itm = opt.get("inTheMoney", False)
 
-                            conn.execute(
-                                text(
-                                    "INSERT INTO options_snapshots "
-                                    "(ticker, snap_date, expiry, opt_type, strike, "
-                                    "last_price, bid, ask, volume, open_interest, "
-                                    "implied_vol, in_the_money, capture_batch_id) "
-                                    "VALUES (:ticker, :snap_date, :expiry, :opt_type, :strike, "
-                                    ":last_price, :bid, :ask, :volume, :oi, :iv, :itm, :batch_id) "
-                                    "ON CONFLICT DO NOTHING"
-                                ),
-                                {
-                                    "ticker": ticker, "snap_date": today_str,
-                                    "expiry": exp_date, "opt_type": opt_type,
-                                    "strike": strike, "last_price": last_price,
-                                    "bid": bid, "ask": ask, "volume": vol,
-                                    "oi": oi, "iv": iv, "itm": itm,
-                                    "batch_id": batch_id,
-                                },
-                            )
+                            snapshot_rows.append({
+                                "ticker": ticker, "snap_date": today_str,
+                                "expiry": exp_date, "opt_type": opt_type,
+                                "strike": strike, "last_price": last_price,
+                                "bid": bid, "ask": ask, "volume": vol,
+                                "oi": oi, "iv": iv, "itm": itm,
+                                "batch_id": batch_id,
+                            })
                             snap_count += 1
                             rows_for_df.append({
                                 "strike": strike, "volume": vol,
@@ -410,21 +407,31 @@ class OptionsPuller(BasePuller):
                 if not complete or not snap_count:
                     raise ValueError("incomplete options chain response")
 
-                # This is wall-clock time after the final provider response.
-                # options_snapshots.created_at uses PostgreSQL transaction-start
-                # NOW(), which is too early to serve as a PIT availability time.
-                # Legacy rows retain NULL completion and fail closed. This
-                # update is in the same transaction as this batch's inserts.
-                conn.execute(text("""
-                    UPDATE options_snapshots
-                    SET capture_completed_at = :completed_at
-                    WHERE ticker = :ticker AND snap_date = :snap_date
-                      AND capture_batch_id = :batch_id
-                """), {
-                    "ticker": ticker, "snap_date": today_str,
-                    "batch_id": batch_id,
-                    "completed_at": datetime.now(timezone.utc),
-                })
+                # PostgreSQL created_at=NOW() is the transaction start, before
+                # later expiry responses. Stamp only after the final response.
+                completed_at = datetime.now(timezone.utc)
+
+                # A ticker/day is one full capture, not a growing union of four
+                # scheduled pulls. Remove old/legacy rows and publish the new
+                # batch in the same transaction. A concurrent legacy insert
+                # after commit remains mixed and is rejected by the reader.
+                conn.execute(
+                    text("DELETE FROM options_snapshots WHERE ticker = :ticker AND snap_date = :snap_date"),
+                    {"ticker": ticker, "snap_date": today_str},
+                )
+                for row in snapshot_rows:
+                    conn.execute(
+                        text(
+                            "INSERT INTO options_snapshots "
+                            "(ticker, snap_date, expiry, opt_type, strike, "
+                            "last_price, bid, ask, volume, open_interest, "
+                            "implied_vol, in_the_money, capture_batch_id, capture_completed_at) "
+                            "VALUES (:ticker, :snap_date, :expiry, :opt_type, :strike, "
+                            ":last_price, :bid, :ask, :volume, :oi, :iv, :itm, :batch_id, :completed_at) "
+                            "ON CONFLICT DO NOTHING"
+                        ),
+                        {**row, "completed_at": completed_at},
+                    )
 
                 # Compute signals from nearest LIQUID expiration
                 # Skip expiries within 2 days (near-worthless, garbage data)
