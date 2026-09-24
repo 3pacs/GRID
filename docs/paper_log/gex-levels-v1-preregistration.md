@@ -152,3 +152,6 @@ the SHA-256 of this amended file.
    strike and returns only 30 rows. The pinned engine commit must compute the regime's aggregate
    GEX contract by contract as well (the same way as its flip search), so that the regime and the
    flip come from one consistent calculation.
+6. The gamma flip is the engine's zero crossing of its per-contract GEX profile nearest the
+   engine's spot, found on a 0.1%-of-spot grid over +/-15% (the pinned engine commit's
+   definition). The number of crossings the scan found is recorded with every pre-open record.
