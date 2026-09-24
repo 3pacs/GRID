@@ -1,9 +1,13 @@
 """
 GRID — Dealer gamma exposure and hedging flow mechanics.
 
-Implements Cem Karsan's core insight: when dealers are short gamma (negative GEX),
-they must hedge by buying into rallies and selling into drops — amplifying moves.
-When dealers are long gamma (positive GEX), they do the opposite — dampening moves.
+Implements the standard public dealer-gamma framework (SqueezeMetrics'
+2017 "Gamma Exposure" white paper; the same convention SpotGamma, Menthor Q
+and the Cem Karsan / Kai Volatility commentary build on): when dealers are
+short gamma (negative GEX), they must hedge by buying into rallies and
+selling into drops — amplifying moves. When dealers are long gamma (positive
+GEX), they do the opposite — selling into rallies and buying into drops —
+dampening moves.
 
 Key outputs:
   - GEX (Gamma Exposure Index): net dealer gamma at each strike and aggregate
@@ -11,23 +15,42 @@ Key outputs:
   - Dealer delta: net delta dealers need to hedge
   - GEX profile: gamma exposure vs spot price curve
   - Gamma wall: strike with maximum absolute gamma exposure
-  - Put wall: strike with maximum put gamma (support level)
-  - Call wall: strike with maximum call gamma (resistance level)
+  - Put wall: strike with the largest-magnitude PUT gamma exposure (support level)
+  - Call wall: strike with the largest CALL gamma exposure (resistance level)
   - Vanna exposure: sensitivity of dealer delta to IV changes
   - Charm exposure: sensitivity of dealer delta to time decay
 
-Dealer position assumption: dealers are NET SHORT options (market-making).
-Retail/institutional clients BUY options; dealers sell them and delta-hedge.
-This means for calls: dealer is short call = short gamma at strike.
-For puts: dealer is short put = long gamma at strike (put gamma is negative
-for the buyer, so dealer who is short the put has positive gamma).
+DEALER POSITIONING ASSUMPTION (modeled, not observed — see DEALER_CALL_SIGN /
+DEALER_PUT_SIGN below):
 
-Wait — that's wrong. Let's be precise:
-  - Dealer SHORT a call: gamma is NEGATIVE (they get shorter delta as spot rises)
-  - Dealer SHORT a put: gamma is POSITIVE (they get longer delta as spot drops)
-  - GEX = Σ(call_OI × call_gamma × 100 × spot) - Σ(put_OI × put_gamma × 100 × spot)
-  - When GEX > 0: dealer is long gamma (stabilizing flows)
-  - When GEX < 0: dealer is short gamma (amplifying flows)
+No feed tells us what dealers actually hold; every GEX model in the industry
+*assumes* a book and derives exposure from open interest against that
+assumption. This module adopts the standard convention: dealers are modeled
+as net LONG the calls and net SHORT the puts that retail/institutional flow
+tends to buy (covered-call / put-buying-for-protection flow ends up on the
+dealer's book as the opposite side). Concretely, for every strike:
+
+  - Dealer modeled LONG a call  -> gamma is POSITIVE at that strike
+    (a long option position, call or put, always has positive gamma —
+    Black-Scholes gamma itself is identical for calls and puts; only the
+    holder's sign differs).
+  - Dealer modeled SHORT a put  -> gamma is NEGATIVE at that strike
+    (any SHORT option position has negative gamma — there is no "short a
+    put = positive gamma" special case; that was a bug in an earlier
+    version of this docstring/module).
+  - GEX = Σ(call_OI × call_gamma × 100 × spot) − Σ(put_OI × put_gamma × 100 × spot)
+  - GEX > 0 at spot: dealers long gamma (dampening / pinning; "rubber band")
+  - GEX < 0 at spot: dealers short gamma (amplifying; "slingshot")
+  - Empirically (and by construction of the flip search below), spot ABOVE
+    the gamma flip -> GEX > 0 (long gamma); spot BELOW the flip -> GEX < 0
+    (short gamma). The flip's PRICE LEVEL does not depend on which side of
+    the convention you pick (negating every term leaves its zero crossing
+    unchanged) — only the sign of GEX on each side, and therefore the
+    LONG_GAMMA/SHORT_GAMMA labels, depend on it.
+
+dealer_delta, vanna_exposure and charm_exposure below are derived using this
+exact same per-leg sign convention (DEALER_CALL_SIGN on the call leg,
+DEALER_PUT_SIGN on the put leg) — they are not independently guessed.
 """
 
 from __future__ import annotations
@@ -50,6 +73,11 @@ from sqlalchemy.engine import Engine
 # with any external caller still importing them by name.
 from physics.greeks import black_scholes as _bs
 from store.availability import unavailable
+
+
+# Assumed dealer-side positioning used for every modeled Greek below.
+DEALER_CALL_SIGN: float = 1.0
+DEALER_PUT_SIGN: float = -1.0
 
 # ── Black-Scholes Greeks (shims over physics/greeks/black_scholes) ───────────
 
@@ -131,14 +159,23 @@ class DealerGammaEngine:
             - gex_aggregate: float (total GEX at current spot)
             - gamma_flip: float (spot price where GEX = 0)
             - gamma_wall: float (strike with max |GEX|)
-            - put_wall: float (strike with max put gamma OI)
-            - call_wall: float (strike with max call gamma OI)
+            - put_wall: float (strike with the largest-magnitude PUT gamma
+              exposure, i.e. most negative put_gex — typically a support level)
+            - call_wall: float (strike with the largest CALL gamma exposure,
+              i.e. most positive call_gex — typically a resistance level)
             - dealer_delta: float (net delta dealers must hedge)
             - regime: str (LONG_GAMMA / SHORT_GAMMA / NEUTRAL)
             - profile: list of {spot, gex} for charting
             - per_strike: list of {strike, call_gex, put_gex, net_gex}
             - vanna_exposure: float (aggregate vanna)
             - charm_exposure: float (aggregate charm)
+
+            When no measured spot price exists for ``ticker``/``snap_date``,
+            returns an explicit unavailable result instead (``available``:
+            False, ``status``: "unavailable", ``reason``, plus the legacy
+            ``error`` key some older callers still check) with every
+            measured field — regime, gamma_flip, gex_aggregate, walls,
+            profile, per_strike — set to ``None``. Never a guessed number.
         """
         if snap_date is None:
             snap_date = date.today()
@@ -170,16 +207,21 @@ class DealerGammaEngine:
         # Find gamma flip (spot where GEX crosses zero)
         gamma_flip = self._find_gamma_flip(chain, spot, spot_range_pct, n_points)
 
-        # Gamma/put/call walls
+        # Gamma/put/call walls. Under DEALER_CALL_SIGN/DEALER_PUT_SIGN,
+        # call_gex is >= 0 and put_gex is <= 0 at every strike (barring an
+        # empty leg, which nets to exactly 0) — so "largest call exposure"
+        # is the max call_gex, and "largest put exposure" is the min
+        # (most negative) put_gex. `.get("strike")` defaults to None (no
+        # qualifying strike), never a fabricated 0 or spot.
         gamma_wall = max(per_strike, key=lambda s: abs(s["net_gex"]), default={}).get("strike", spot)
-        put_wall = max(
-            [s for s in per_strike if s["put_gex"] > 0],
+        put_wall = min(
+            [s for s in per_strike if s["put_gex"] < 0],
             key=lambda s: s["put_gex"], default={},
-        ).get("strike", 0)
+        ).get("strike")
         call_wall = max(
-            [s for s in per_strike if s["call_gex"] < 0],
-            key=lambda s: abs(s["call_gex"]), default={},
-        ).get("strike", 0)
+            [s for s in per_strike if s["call_gex"] > 0],
+            key=lambda s: s["call_gex"], default={},
+        ).get("strike")
 
         # Dealer delta
         dealer_delta = sum(s.get("dealer_delta", 0) for s in per_strike)
@@ -259,24 +301,37 @@ class DealerGammaEngine:
 
             K = float(strike)
 
-            # Gamma per option × OI × 100 shares × spot (dollar gamma)
+            # Gamma per option × OI × 100 shares × spot (dollar gamma).
+            # Dealer modeled LONG calls / SHORT puts (DEALER_CALL_SIGN /
+            # DEALER_PUT_SIGN, see module docstring) — call GEX is positive,
+            # put GEX is negative, at every strike.
             call_gamma = bs_gamma(spot, K, T, self.r, call_iv) * call_oi * 100 * spot
             put_gamma = bs_gamma(spot, K, T, self.r, put_iv) * put_oi * 100 * spot
+            call_gex = DEALER_CALL_SIGN * call_gamma
+            put_gex = DEALER_PUT_SIGN * put_gamma
 
-            # Dealer is SHORT options → dealer call GEX is negative, put GEX is positive
-            call_gex = -call_gamma  # dealer short calls = short gamma
-            put_gex = put_gamma     # dealer short puts = long gamma (put gamma is positive from dealer side)
+            # Dealer delta, signed the same way (long calls -> long delta,
+            # short puts -> the negated put delta contribution).
+            call_delta = DEALER_CALL_SIGN * bs_delta_call(spot, K, T, self.r, call_iv) * call_oi * 100
+            put_delta = DEALER_PUT_SIGN * bs_delta_put(spot, K, T, self.r, put_iv) * put_oi * 100
 
-            # Dealer delta (short calls = negative delta, short puts = positive delta)
-            call_delta = -bs_delta_call(spot, K, T, self.r, call_iv) * call_oi * 100
-            put_delta = -bs_delta_put(spot, K, T, self.r, put_iv) * put_oi * 100
-
-            # Vanna and charm (aggregate across OI)
-            v = bs_vanna(spot, K, T, self.r, (call_iv + put_iv) / 2)
-            c = bs_charm(spot, K, T, self.r, (call_iv + put_iv) / 2)
-            total_oi = call_oi + put_oi
-            vanna_val = -v * total_oi * 100  # dealer is short → negate
-            charm_val = -c * total_oi * 100
+            # Vanna and charm, computed per leg from each leg's own IV (not
+            # an averaged IV — that discarded information the two legs
+            # already carry) and signed the same way as gamma/delta above.
+            # Vanna is identical for calls and puts at the same S/K/T/sigma;
+            # charm is not, hence the explicit is_call on each leg.
+            call_vanna = bs_vanna(spot, K, T, self.r, call_iv)
+            put_vanna = bs_vanna(spot, K, T, self.r, put_iv)
+            call_charm = bs_charm(spot, K, T, self.r, call_iv, is_call=True)
+            put_charm = bs_charm(spot, K, T, self.r, put_iv, is_call=False)
+            vanna_val = (
+                DEALER_CALL_SIGN * call_vanna * call_oi
+                + DEALER_PUT_SIGN * put_vanna * put_oi
+            ) * 100.0
+            charm_val = (
+                DEALER_CALL_SIGN * call_charm * call_oi
+                + DEALER_PUT_SIGN * put_charm * put_oi
+            ) * 100.0
 
             results.append({
                 "strike": K,
@@ -297,9 +352,10 @@ class DealerGammaEngine:
     def _prepare_chain_arrays(self, chain: pd.DataFrame) -> tuple:
         """Pre-extract numpy arrays from chain for vectorized GEX computation.
 
-        Returns (strikes, T_arr, iv_arr, oi_arr, sign_arr) where sign_arr
-        is -1 for calls (dealer short gamma) and +1 for puts (dealer long gamma).
-        Only rows with dte > 0 are included.
+        Returns (strikes, T_arr, iv_arr, oi_arr, sign_arr) where sign_arr is
+        DEALER_CALL_SIGN (+1, dealer long gamma) for calls and
+        DEALER_PUT_SIGN (-1, dealer short gamma) for puts — see the module
+        docstring. Only rows with dte > 0 are included.
         """
         valid = chain[chain["dte"] > 0].copy()
         if valid.empty:
@@ -311,7 +367,9 @@ class DealerGammaEngine:
         iv_arr = valid["implied_volatility"].to_numpy(dtype=np.float64)
         iv_arr = np.where(iv_arr > 0, iv_arr, 0.25)
         oi_arr = valid["open_interest"].to_numpy(dtype=np.float64)
-        sign_arr = np.where(valid["opt_type"].to_numpy() == "call", -1.0, 1.0)
+        sign_arr = np.where(
+            valid["opt_type"].to_numpy() == "call", DEALER_CALL_SIGN, DEALER_PUT_SIGN
+        )
         return strikes, T_arr, iv_arr, oi_arr, sign_arr
 
     def _gex_at_spots_vectorized(
