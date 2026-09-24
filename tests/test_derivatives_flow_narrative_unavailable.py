@@ -22,6 +22,7 @@ class _GEX:
 
 def _without_saved_briefing(monkeypatch: pytest.MonkeyPatch) -> None:
     briefing = types.ModuleType("ollama.dealer_flow_briefing")
+    briefing.SPOT_CONTRACT = "resolved_series_only_v1"
     briefing.get_latest_flow_briefing = lambda _db: {}
     monkeypatch.setitem(sys.modules, "ollama.dealer_flow_briefing", briefing)
     monkeypatch.setattr(derivatives, "get_db_engine", lambda: object())
@@ -102,3 +103,81 @@ def test_legacy_error_profile_without_availability_fields_stays_unavailable(
     assert result["content"] is None
     assert result["status"] == "unavailable"
     assert result["reason"] == "No options chain for SPY"
+
+
+@pytest.mark.parametrize("positioning_data", [
+    {"gex": {"SPY": {"spot": 785.0}}},
+    {"spot_contract": "resolved_series_only_v1",
+     "gex": {"SPY": {"spot": 0.0, "spot_source": "resolved_series"}}},
+])
+def test_unverified_saved_briefing_cannot_bypass_missing_spot(
+    monkeypatch: pytest.MonkeyPatch,
+    positioning_data: dict,
+) -> None:
+    _without_saved_briefing(monkeypatch)
+    briefing = sys.modules["ollama.dealer_flow_briefing"]
+    briefing.get_latest_flow_briefing = lambda _db: {
+        "content": "SPY is trading at $785.00",
+        "positioning_data": positioning_data,
+        "briefing_date": "2026-09-24",
+        "stale": False,
+    }
+    monkeypatch.setattr(
+        derivatives,
+        "_get_gex_engine",
+        lambda: _GEX({"error": "No spot price for SPY", "ticker": "SPY"}),
+    )
+
+    result = asyncio.run(derivatives.get_flow_narrative())
+
+    assert result["content"] is None
+    assert result["status"] == "unavailable"
+
+
+def test_source_guarded_saved_briefing_is_retained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _without_saved_briefing(monkeypatch)
+    briefing = sys.modules["ollama.dealer_flow_briefing"]
+    saved = {
+        "content": "Measured SPY close $767.12",
+        "positioning_data": {
+            "spot_contract": "resolved_series_only_v1",
+            "gex": {"SPY": {"spot": 767.12, "spot_source": "resolved_series"}},
+        },
+        "briefing_date": "2026-09-24",
+        "stale": False,
+    }
+    briefing.get_latest_flow_briefing = lambda _db: saved
+    monkeypatch.setattr(
+        derivatives,
+        "_get_gex_engine",
+        lambda: pytest.fail("source-guarded saved briefing should not recompute GEX"),
+    )
+
+    assert asyncio.run(derivatives.get_flow_narrative()) is saved
+
+
+def test_stale_saved_briefing_falls_back_to_current_unavailable_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _without_saved_briefing(monkeypatch)
+    briefing = sys.modules["ollama.dealer_flow_briefing"]
+    briefing.get_latest_flow_briefing = lambda _db: {
+        "content": "Yesterday SPY was trading at $785.00",
+        "positioning_data": {
+            "spot_contract": "resolved_series_only_v1",
+            "gex": {"SPY": {"spot": 785.0, "spot_source": "resolved_series"}},
+        },
+        "stale": True,
+    }
+    monkeypatch.setattr(
+        derivatives,
+        "_get_gex_engine",
+        lambda: _GEX({"error": "No spot price for SPY", "ticker": "SPY"}),
+    )
+
+    result = asyncio.run(derivatives.get_flow_narrative())
+
+    assert result["content"] is None
+    assert result["status"] == "unavailable"

@@ -201,6 +201,7 @@ class DealerGammaEngine:
             "ticker": ticker,
             "snap_date": str(snap_date),
             "spot": round(spot, 2),
+            "spot_source": "resolved_series",
             "gex_aggregate": round(gex_agg, 0),
             "gex_normalized": round(gex_normalized, 4),
             "gamma_flip": round(gamma_flip, 2) if gamma_flip else None,
