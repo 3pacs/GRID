@@ -190,13 +190,13 @@ dealer-hedging forced flows, and only that.**
 
 ## References
 
-- SqueezeMetrics — the 2017 "Gamma Exposure (GEX): A Powerful, Overlooked
-  Signal for Predicting the Market" white paper and DIX; the origin of the
-  [[Dealer Gamma|dealer gamma]] framework and sign convention this playbook
-  and `physics/dealer_gamma.py` use
-- Cem Karsan (Kai Volatility / Kai Wealth Management) — gamma-flow
-  commentary and the rubber-band/slingshot framing used above; a separate
-  firm from SqueezeMetrics, not its author
+- SqueezeMetrics — its December 2017 "Gamma Exposure" (GEX) white paper and
+  the DIX index; the public GEX convention this playbook and
+  `physics/dealer_gamma.py` follow
+- Cem Karsan (Kai Volatility Advisors / Kai Wealth) — widely cited
+  dealer-flow commentary (gamma, vanna, charm); a separate firm from
+  SqueezeMetrics. Who first used the "rubber band / slingshot" phrasing is
+  unverified.
 - Kris Sidial — tail vol, long-volatility strategy
 - JP Morgan Hedged Equity Fund prospectus — JHEQX roll mechanics
 - SpotGamma / Menthor Q — daily gamma flip publication
