@@ -100,6 +100,57 @@ class TestRegimeDetection:
         assert regime.fast_risk_off is True
 
 
+class TestRegimeDetectionUnavailable:
+    """VERIFIED FACT 4: detect_regime used to default spy_trend/vix_zscore to
+    0.0 when history was too short, which its own thresholds then read as a
+    calm/neutral market — a fabricated regime out of missing data. It must
+    instead say the regime is unavailable and never emit a numeric 0.0."""
+
+    def test_short_spy_history_is_unavailable_even_with_full_vix(self, vix_series):
+        short_spy = pd.Series(
+            [500.0] * 50, index=pd.bdate_range("2025-01-01", periods=50), name="SPY"
+        )
+        regime = detect_regime(short_spy, vix_series, date(2025, 10, 1))
+
+        assert regime.label == "unavailable"
+        assert regime.available is False
+        assert regime.spy_trend is None
+        assert regime.vix_zscore is None
+        assert regime.reason and "SPY" in regime.reason
+        assert regime.max_groups == 0
+        assert regime.cash_floor == 1.0
+
+    def test_short_vix_history_is_unavailable_even_with_full_spy(self, spy_prices):
+        short_vix = pd.Series(
+            [20.0] * 5, index=pd.bdate_range("2025-01-01", periods=5), name="VIX"
+        )
+        regime = detect_regime(spy_prices, short_vix, date(2025, 10, 1))
+
+        assert regime.label == "unavailable"
+        assert regime.available is False
+        assert regime.spy_trend is None
+        assert regime.vix_zscore is None
+        assert regime.reason and "VIX" in regime.reason
+
+    def test_empty_vix_series_is_unavailable_not_zero(self, spy_prices):
+        """An empty VIX read (e.g. no vix_spot rows found) must never
+        resolve to vix_zscore=0.0 — that reads as a perfectly calm market."""
+        empty_vix = pd.Series(dtype=float, name="VIX")
+        regime = detect_regime(spy_prices, empty_vix, date(2025, 10, 1))
+
+        assert regime.available is False
+        assert regime.vix_zscore is None
+        assert regime.vix_zscore != 0.0
+
+    def test_available_regime_defaults(self, spy_prices, vix_series):
+        """Sanity check: a normal, sufficient-data regime is still available=True."""
+        regime = detect_regime(spy_prices, vix_series, date(2025, 10, 1))
+        assert regime.available is True
+        assert regime.reason is None
+        assert regime.spy_trend is not None
+        assert regime.vix_zscore is not None
+
+
 # ── Group Scoring Tests ───────────────────────────────────────────────
 
 
@@ -231,7 +282,14 @@ class TestRunRotationDeterministicVix:
         # No silent random fallback: vix_zscore is computed from the real series
         assert r1.regime.vix_zscore != 0.0
 
-    def test_run_rotation_falls_back_safely_when_vix_unavailable(self, monkeypatch, multi_ticker_prices):
+    def test_run_rotation_returns_unavailable_regime_when_vix_missing(self, monkeypatch, multi_ticker_prices):
+        """2026-09-24 rotation-inputs fix (VERIFIED FACT 2): run_rotation used
+        to paper over an empty VIX read by calling compute_vix_exposure_scalar
+        and falling back to `vix_result.get("vix") or 20.0` — a fabricated
+        VIX reading fed straight into detect_regime. That fallback is gone:
+        an empty VIX series now flows into detect_regime as-is, which reports
+        the regime unavailable (not a fabricated vix_zscore=0.0), and
+        run_rotation returns no target weights."""
         from alpha_research.strategies import adaptive_rotation
 
         monkeypatch.setattr(
@@ -244,16 +302,48 @@ class TestRunRotationDeterministicVix:
             "build_price_panel",
             lambda *a, **kw: multi_ticker_prices,
         )
-        # compute_vix_exposure_scalar is imported lazily inside run_rotation;
-        # patch its module so the lazy import resolves to our stub.
         import alpha_research.signals.exposure_scaler as exposure_scaler
 
+        calls = []
         monkeypatch.setattr(
             exposure_scaler,
             "compute_vix_exposure_scalar",
-            lambda *a, **kw: {"vix": 21.5, "vix_ma": 20.0},
+            lambda *a, **kw: calls.append((a, kw)) or {"vix": 21.5, "vix_ma": 20.0},
         )
 
         result = run_rotation(engine=object(), as_of_date=date(2025, 5, 1))
-        # With <20 obs, detect_regime returns vix_zscore=0 (deterministic).
-        assert result.regime.vix_zscore == 0.0
+
+        assert result.regime.label == "unavailable"
+        assert result.regime.available is False
+        assert result.regime.vix_zscore is None
+        assert result.weights == {}
+        # The old 20.0-fabrication fallback called compute_vix_exposure_scalar
+        # as a substitute VIX source; that code path no longer exists.
+        assert calls == [], "run_rotation must not fall back to compute_vix_exposure_scalar"
+
+    def test_run_rotation_unavailable_when_price_panel_empty(self, monkeypatch):
+        """VERIFIED FACT 4: an empty price panel used to fabricate a hardcoded
+        neutral RegimeState + equal-weight FALLBACK_TICKERS. It must now
+        report an explicit unavailable regime with no target weights."""
+        from alpha_research.strategies import adaptive_rotation
+
+        monkeypatch.setattr(adaptive_rotation, "build_price_panel", lambda *a, **kw: pd.DataFrame())
+
+        result = run_rotation(engine=object(), as_of_date=date(2025, 5, 1))
+
+        assert result.regime.label == "unavailable"
+        assert result.regime.available is False
+        assert result.regime.spy_trend is None
+        assert result.weights == {}
+        assert result.active_groups == []
+
+    def test_run_rotation_unavailable_when_spy_missing(self, monkeypatch, multi_ticker_prices):
+        from alpha_research.strategies import adaptive_rotation
+
+        no_spy = multi_ticker_prices.drop(columns=["SPY"])
+        monkeypatch.setattr(adaptive_rotation, "build_price_panel", lambda *a, **kw: no_spy)
+
+        result = run_rotation(engine=object(), as_of_date=date(2025, 5, 1))
+
+        assert result.regime.label == "unavailable"
+        assert result.weights == {}
