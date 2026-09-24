@@ -628,7 +628,7 @@ class TestHealthRobinhoodBlock:
             "mode": "DRY_RUN", "configured": True, "live_trading": False,
             "max_position_usd": 100.0, "max_drawdown_pct": 0.20,
             "max_daily_loss_pct": 0.05, "max_orders_per_day": 6,
-            "max_quote_age_s": 30.0, "max_spread_bps": 50.0,
+            "max_quote_age_s": 30.0, "max_spread_bps": 250.0,
             "use_limit_orders": True, "limit_slippage_bps": 25.0,
         }
         assert session.calls == []  # health never reaches out to the venue

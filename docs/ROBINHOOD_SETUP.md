@@ -73,15 +73,33 @@ call:
 | Order-rate cap (blocks new buys) | `ROBINHOOD_MAX_ORDERS_PER_DAY` | 6/day | yes |
 | Idempotent submission | `client_order_id` / API `idempotency_key` | n/a | yes — repeat comes back `status="duplicate"` |
 | Stale-quote guard | `ROBINHOOD_MAX_QUOTE_AGE_S` | 30s | n/a (checked fresh every call) |
-| Spread guard | `ROBINHOOD_MAX_SPREAD_BPS` | 50bps | n/a |
+| Spread guard | `ROBINHOOD_MAX_SPREAD_BPS` | 250bps | n/a |
 | Marketable limit orders | `ROBINHOOD_USE_LIMIT_ORDERS` / `ROBINHOOD_LIMIT_SLIPPAGE_BPS` | on / 25bps | n/a |
 | Wallet gate (KILLED/PAUSED/no wallet blocks orders) | n/a — an ACTIVE `trading_wallets` row for `exchange='robinhood'` | n/a | reads `trading_wallets` |
 | Shorts | n/a | spot only — SHORT sells held quantity, never goes net short | n/a |
 
-The 50bps spread cap is a deliberately loose ceiling: BTC/ETH on Robinhood
-typically trade inside 5-10bps, so 50bps only fires on a genuinely
-dislocated or illiquid quote while leaving headroom for smaller pairs GRID
-might route later.
+**Spread guard, measured not assumed.** A read-only quote pull through the
+deployed connector (DRY_RUN) on **2026-09-24 14:23Z** found Robinhood's own
+spread-inclusive executable gap — `(ask_inclusive_of_buy_spread -
+bid_inclusive_of_sell_spread) / mid` — running as **normal** pricing at:
+
+| Pair | Measured spread |
+|---|---|
+| BTC-USD | 188.7 bps |
+| ETH-USD | 189.7 bps |
+| SOL-USD | 187.8 bps |
+
+That lines up with Robinhood's own published crypto fee of **~95bps per
+side** (2 × 95 = 190) — the spread *is* the fee, not extra slippage on top
+of it. **A round trip (buy then immediately sell) costs ~1.9% before any
+other fee.** The original 50bps default was an unverified assumption ("BTC/
+ETH typically trade inside 5-10bps") that does not hold for Robinhood's
+retail crypto product and would have blocked **every single order** — a
+guard that always fires isn't protecting against abnormal conditions, it's
+just disabling the connector. `ROBINHOOD_MAX_SPREAD_BPS=250` leaves ~60bps
+of headroom above the measured ~188-190bps normal range, so the guard still
+catches genuinely abnormal widening (a flash move, an illiquid pair)
+without blocking normal Robinhood pricing.
 
 ### Persisted state
 
