@@ -1,13 +1,28 @@
 # OPEX Waterfall Playbook
 
-> The short-term tape is written by ~$2T of structured-product hedging flows,
-> because that is where dealers are forced to transact predictably. The rest
-> of the $14T alternative-asset pool (crypto, metals, hedge funds) does not
-> set the short-term tape because nobody in those pools is mechanically
-> forced to buy or sell at a specific time for a specific reason.
+> The short-term tape is written by structured-product hedging flows —
+> rough, unsourced estimates put the pool at ~$2T, against a ~$14T
+> alternative-asset universe (crypto, metals, hedge funds) — because that
+> smaller pool is where dealers are forced to transact predictably. Neither
+> figure is measured anywhere in GRID; treat them as order-of-magnitude
+> color, not inputs to size anything.
 >
 > The entire discipline below exists to keep us on the right side of the
 > waterfall when dealer positioning flips from rubber band to slingshot.
+
+## Sign Convention
+
+GRID's dealer-gamma engine (`physics/dealer_gamma.py`) models dealers as net
+LONG the calls and net SHORT the puts that customer flow tends to buy (the
+standard SqueezeMetrics / SpotGamma convention — see that module's docstring
+for the full derivation). Dealer positioning is **modeled, not observed**;
+no feed tells us what dealers actually hold. Under this convention:
+
+- **GEX > 0** at spot: dealers long gamma (dampening / pinning)
+- **GEX < 0** at spot: dealers short gamma (amplifying)
+- **Spot above the gamma flip → long gamma. Spot below the flip → short
+  gamma.** The flip's price level itself does not depend on sign
+  convention; only which side is "long" vs "short" does.
 
 ## Core Principle
 
@@ -57,14 +72,19 @@ tripped simultaneously fires `alerts/waterfall_watch.py`.
 - A new rubber band gets installed at new strike levels for the next quarter
 
 ### JHEQX + buffer ETF roll (last business day of Mar/Jun/Sep/Dec)
-- JPMorgan Hedged Equity Fund (~$20B) always does the same trade:
+- JPMorgan Hedged Equity Fund (~$18B; JHEQX alone — the sister JPMorgan
+  Hedged Equity funds reset in other months, so don't add them into this
+  window's size) always does the same trade:
     - Buys SPX put spread ~5% OTM
     - Sells SPX call ~3–5% OTM
     - Same quarterly expiry forward
 - The **sold call strike** becomes a natural ceiling for the next quarter
 - The **bought put strike** becomes a softer floor
-- Innovator / First Trust / Global X buffer suites roll around the same window
-  for another ~$80–100B of forced collar flow
+- Innovator / First Trust / Global X buffer (defined-outcome) ETFs total
+  roughly ~$85–89B industry-wide, but many series reset monthly rather than
+  quarterly — only the quarterly-reset series actually roll in this window,
+  so the forced flow landing on any single quarterly date is a fraction of
+  the total pool, not the whole ~$85–89B
 
 ### FOMC statement days
 - Vol crush immediately after the release
@@ -170,7 +190,13 @@ dealer-hedging forced flows, and only that.**
 
 ## References
 
-- Cem Karsan — SqueezeMetrics and [[Dealer Gamma|dealer gamma]] framework
+- SqueezeMetrics — the 2017 "Gamma Exposure (GEX): A Powerful, Overlooked
+  Signal for Predicting the Market" white paper and DIX; the origin of the
+  [[Dealer Gamma|dealer gamma]] framework and sign convention this playbook
+  and `physics/dealer_gamma.py` use
+- Cem Karsan (Kai Volatility / Kai Wealth Management) — gamma-flow
+  commentary and the rubber-band/slingshot framing used above; a separate
+  firm from SqueezeMetrics, not its author
 - Kris Sidial — tail vol, long-volatility strategy
 - JP Morgan Hedged Equity Fund prospectus — JHEQX roll mechanics
 - SpotGamma / Menthor Q — daily gamma flip publication
