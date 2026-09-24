@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from math import isfinite
 
 from fastapi import APIRouter, Depends
 from loguru import logger as log
@@ -458,8 +459,8 @@ def get_ticker_quote(
 
     Powers the stepdad.finance ticker_pulse widget. DB reads + rule-based
     sentiment so the home page populates instantly (the /overview narrative is
-    far too slow for a tile). Prefers the cached GRID price; only falls back to
-    a live fetch when nothing is stored.
+    far too slow for a tile). SPY prefers a recent, timestamped intraday
+    candle; other tickers use the cached daily price.
 
     Returns: ticker, price, change_pct, put_call_ratio, max_pain, iv_atm,
     sentiment, source, as_of, stale (as_of more than 3 calendar days old).
@@ -474,7 +475,10 @@ def get_ticker_quote(
     change_pct: float | None = None
     as_of_date: date | None = None
     source = "grid"
+    price_bar_end_at: str | None = None
+    price_tier = "daily"
     put_call_ratio = max_pain = iv_atm = None
+    daily_rows = []
 
     with engine.connect() as conn:
         try:
@@ -500,6 +504,7 @@ def get_ticker_quote(
                 "WHERE rs.feature_id = (SELECT feature_id FROM winner) "
                 "ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 2"
             ), {"names": feature_names}).fetchall()
+            daily_rows = rows
             if rows:
                 price = float(rows[0][0])
                 as_of_date = rows[0][1]
@@ -526,6 +531,43 @@ def get_ticker_quote(
             conn.rollback()
             _log_query_failure(f"Quote options query for {ticker_upper}", exc)
 
+        if ticker_upper == "SPY":
+            try:
+                candle = conn.execute(text(
+                    "SELECT close, ts FROM realtime_candles "
+                    "WHERE symbol = 'SPY' AND interval = '5m' "
+                    "AND source = 'yahoo' "
+                    "AND ts >= now() - INTERVAL '40 minutes' "
+                    "ORDER BY ts DESC LIMIT 1"
+                )).fetchone()
+                if candle and candle[0] is not None and candle[1] is not None:
+                    bar_end = candle[1] + timedelta(minutes=5)
+                    if bar_end.tzinfo is not None:
+                        bar_end = bar_end.astimezone(timezone.utc)
+                        age = datetime.now(timezone.utc) - bar_end
+                        candidate = float(candle[0])
+                        if (timedelta(0) <= age <= timedelta(minutes=30)
+                                and isfinite(candidate) and candidate > 0):
+                            price = candidate
+                            as_of_date = bar_end.date()
+                            price_bar_end_at = bar_end.isoformat()
+                            price_tier = "intraday_delayed"
+                            source = "yahoo_intraday"
+                            # Compare with the preceding completed session,
+                            # not another vintage of today's daily bar.
+                            reference = next(
+                                (float(row[0]) for row in daily_rows
+                                 if row[0] is not None and row[1] < as_of_date),
+                                None,
+                            )
+                            change_pct = (
+                                round((price - reference) / reference, 5)
+                                if reference and isfinite(reference) else None
+                            )
+            except Exception as exc:  # noqa: BLE001 - optional quote table must not break daily fallback
+                conn.rollback()
+                _log_query_failure("Quote SPY intraday query", exc)
+
     # Live fallback only when nothing is stored (kept off the hot path).
     if price is None:
         try:
@@ -534,6 +576,7 @@ def get_ticker_quote(
                 price = live.get("price")
                 change_pct = live.get("pct_1d")
                 source = "live"
+                price_tier = "live_fallback"
                 if price is not None:
                     as_of_date = date.today()
         except Exception as exc:
@@ -565,6 +608,8 @@ def get_ticker_quote(
         "iv_atm": iv_atm,
         "sentiment": sentiment,
         "source": source,
+        "price_tier": price_tier,
+        "price_bar_end_at": price_bar_end_at,
         "as_of": str(as_of_date) if as_of_date is not None else None,
         "stale": stale,
     }

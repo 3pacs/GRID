@@ -94,6 +94,19 @@ describe('TickerPulseCard (via WidgetGrid)', () => {
         expect(api.getTickerQuote).toHaveBeenCalledWith('AAPL');
     });
 
+    it('labels an intraday SPY bar as delayed with its observation time', async () => {
+        api.getTickerQuote.mockResolvedValue({
+            price: 767.28,
+            sentiment: 'neutral',
+            price_tier: 'intraday_delayed',
+            price_bar_end_at: '2026-09-24T19:55:00+00:00',
+        });
+        render(<WidgetGrid widgets={[{ type: 'ticker_pulse', props: { ticker: 'SPY' } }]} />);
+
+        expect(await screen.findByText('Delayed intraday price · bar ended 19:55 UTC'))
+            .toBeInTheDocument();
+    });
+
     it('shows the "market may be closed" stale state when the quote has no numeric price', async () => {
         api.getTickerQuote.mockResolvedValue({ sentiment: 'neutral' });
         render(<WidgetGrid widgets={[{ type: 'ticker_pulse', props: { ticker: 'TSLA' } }]} />);
