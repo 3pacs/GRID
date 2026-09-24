@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
+import pandas as pd
 import pytest
 
 from alpha_research.signals.credit_cycle import (
@@ -20,10 +21,8 @@ from alpha_research.signals.credit_cycle import (
     TREND_WINDOW_DAYS,
     compute_credit_cycle,
 )
-from alpha_research.signals.exposure_scaler import (
-    VIX_FEATURE_ID,
-    compute_vix_exposure_scalar,
-)
+from alpha_research.signals import exposure_scaler
+from alpha_research.signals.exposure_scaler import compute_vix_exposure_scalar
 
 
 # ── Fake Engine ───────────────────────────────────────────────────────
@@ -164,89 +163,148 @@ class TestComputeCreditCycle:
 
 
 # ── compute_vix_exposure_scalar ───────────────────────────────────────
+#
+# 2026-09-24 rotation-inputs fix: compute_vix_exposure_scalar used to query a
+# hardcoded VIX_FEATURE_ID=105 directly (dead since 2026-04-02). It now reads
+# through panel_builder.get_vix_series — the same PIT-correct, exact-name
+# ("vix_spot") source adaptive_rotation.py uses (VERIFIED FACTS 1 & 2). These
+# tests monkeypatch exposure_scaler.get_vix_series with a synthetic pd.Series
+# rather than poking a fake DB engine — get_vix_series's own DB-query
+# correctness (no vvix mixing, deterministic latest-vintage) is covered in
+# tests/test_panel_builder.py.
+
+
+def _vix_series(values: list[float], end_date: date) -> pd.Series:
+    idx = pd.date_range(end=pd.Timestamp(end_date), periods=len(values), freq="D")
+    return pd.Series(values, index=idx, name="VIX")
 
 
 class TestComputeVixExposureScalar:
-    def test_insufficient_data_returns_full_exposure(self) -> None:
+    def test_insufficient_data_returns_full_exposure(self, monkeypatch) -> None:
         """Fewer than MA_WINDOW rows → scalar=1.0 with unknown regime."""
-        engine = _FakeEngine({VIX_FEATURE_ID: _date_rows(date(2026, 5, 1), [18.0] * 5)})
-        result = compute_vix_exposure_scalar(engine, as_of_date=date(2026, 6, 15))
+        monkeypatch.setattr(
+            exposure_scaler, "get_vix_series",
+            lambda *a, **kw: _vix_series([18.0] * 5, date(2026, 6, 15)),
+        )
+        result = compute_vix_exposure_scalar(object(), as_of_date=date(2026, 6, 15))
         assert result["scalar"] == 1.0
         assert result["regime_hint"] == "unknown"
         assert result["vix"] is None
         assert "error" in result
 
-    def test_calm_regime_below_moving_average(self) -> None:
+    def test_calm_regime_below_moving_average(self, monkeypatch) -> None:
         """Current VIX < MA → ratio < 1.0 → scalar capped at 1.0, regime calm."""
         # 20 days at 20, then current VIX dropped to 14 → MA still ~20, ratio < 1
         values = [20.0] * 20 + [14.0]
-        engine = _FakeEngine({VIX_FEATURE_ID: _date_rows(date(2026, 5, 1), values)})
-        result = compute_vix_exposure_scalar(engine, as_of_date=date(2026, 6, 15))
+        monkeypatch.setattr(
+            exposure_scaler, "get_vix_series",
+            lambda *a, **kw: _vix_series(values, date(2026, 6, 15)),
+        )
+        result = compute_vix_exposure_scalar(object(), as_of_date=date(2026, 6, 15))
         assert result["regime_hint"] == "calm"
         assert result["scalar"] == pytest.approx(1.0)
         assert result["ratio"] < 1.0
         assert result["vix"] == pytest.approx(14.0)
 
-    def test_elevated_regime_between_1_and_1_3(self) -> None:
+    def test_elevated_regime_between_1_and_1_3(self, monkeypatch) -> None:
         """1.0 <= ratio < 1.3 → elevated."""
         # 20 days at 20 then current 23 → ratio ≈ 1.15
         values = [20.0] * 20 + [23.0]
-        engine = _FakeEngine({VIX_FEATURE_ID: _date_rows(date(2026, 5, 1), values)})
-        result = compute_vix_exposure_scalar(engine, as_of_date=date(2026, 6, 15))
+        monkeypatch.setattr(
+            exposure_scaler, "get_vix_series",
+            lambda *a, **kw: _vix_series(values, date(2026, 6, 15)),
+        )
+        result = compute_vix_exposure_scalar(object(), as_of_date=date(2026, 6, 15))
         assert result["regime_hint"] == "elevated"
         assert 1.0 <= result["ratio"] < 1.3
         # scalar = clip(1 - (ratio-1), 0, 1)
         assert 0.0 < result["scalar"] < 1.0
 
-    def test_stressed_regime_above_1_3(self) -> None:
+    def test_stressed_regime_above_1_3(self, monkeypatch) -> None:
         """ratio >= 1.3 → stressed, scalar drops sharply."""
         # 20 days at 20, current 30 → ratio ≈ 1.5
         values = [20.0] * 20 + [30.0]
-        engine = _FakeEngine({VIX_FEATURE_ID: _date_rows(date(2026, 5, 1), values)})
-        result = compute_vix_exposure_scalar(engine, as_of_date=date(2026, 6, 15))
+        monkeypatch.setattr(
+            exposure_scaler, "get_vix_series",
+            lambda *a, **kw: _vix_series(values, date(2026, 6, 15)),
+        )
+        result = compute_vix_exposure_scalar(object(), as_of_date=date(2026, 6, 15))
         assert result["regime_hint"] == "stressed"
         assert result["ratio"] >= 1.3
         assert result["scalar"] < 0.6
 
-    def test_scalar_clamped_to_zero_when_vix_doubles_ma(self) -> None:
+    def test_scalar_clamped_to_zero_when_vix_doubles_ma(self, monkeypatch) -> None:
         """When ratio >= 2.0, the linear formula yields a clipped 0.0 scalar."""
         values = [20.0] * 20 + [50.0]
-        engine = _FakeEngine({VIX_FEATURE_ID: _date_rows(date(2026, 5, 1), values)})
-        result = compute_vix_exposure_scalar(engine, as_of_date=date(2026, 6, 15))
+        monkeypatch.setattr(
+            exposure_scaler, "get_vix_series",
+            lambda *a, **kw: _vix_series(values, date(2026, 6, 15)),
+        )
+        result = compute_vix_exposure_scalar(object(), as_of_date=date(2026, 6, 15))
         assert result["scalar"] == 0.0
         assert result["regime_hint"] == "stressed"
 
-    def test_zero_vix_ma_returns_safe_default(self) -> None:
+    def test_zero_vix_ma_returns_safe_default(self, monkeypatch) -> None:
         """vix_ma <= 0 (degenerate data) → scalar 1.0 with unknown regime."""
         values = [0.0] * 20 + [0.0]
-        engine = _FakeEngine({VIX_FEATURE_ID: _date_rows(date(2026, 5, 1), values)})
-        result = compute_vix_exposure_scalar(engine, as_of_date=date(2026, 6, 15))
+        monkeypatch.setattr(
+            exposure_scaler, "get_vix_series",
+            lambda *a, **kw: _vix_series(values, date(2026, 6, 15)),
+        )
+        result = compute_vix_exposure_scalar(object(), as_of_date=date(2026, 6, 15))
         assert result["scalar"] == 1.0
         assert result["regime_hint"] == "unknown"
         assert result["vix_ma"] == 0
         assert result["ratio"] is None
 
-    def test_default_as_of_uses_today(self) -> None:
-        engine = _FakeEngine({VIX_FEATURE_ID: []})
-        result = compute_vix_exposure_scalar(engine, as_of_date=None)
+    def test_default_as_of_uses_today(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            exposure_scaler, "get_vix_series",
+            lambda *a, **kw: pd.Series(dtype=float, name="VIX"),
+        )
+        result = compute_vix_exposure_scalar(object(), as_of_date=None)
         assert result["scalar"] == 1.0
 
-    def test_query_uses_pit_release_date_filter(self) -> None:
-        """The DB query must bind a release_date <= :as_of guard (PIT correctness)."""
-        as_of = date(2026, 6, 15)
-        engine = _FakeEngine({VIX_FEATURE_ID: _date_rows(date(2026, 5, 1), [20.0] * 21)})
-        compute_vix_exposure_scalar(engine, as_of_date=as_of)
-        # exactly one call recorded with as_of binding equal to as_of_date
-        assert len(engine.calls) == 1
-        assert engine.calls[0]["params"]["as_of"] == as_of
-        assert engine.calls[0]["params"]["fid"] == VIX_FEATURE_ID
+    def test_no_20_0_fabrication_when_series_is_empty(self, monkeypatch) -> None:
+        """VERIFIED FACT 2: an empty/insufficient VIX read must never be
+        papered over with a fabricated 20.0 — it returns the honest
+        'insufficient data' payload with vix=None."""
+        monkeypatch.setattr(
+            exposure_scaler, "get_vix_series",
+            lambda *a, **kw: pd.Series(dtype=float, name="VIX"),
+        )
+        result = compute_vix_exposure_scalar(object(), as_of_date=date(2026, 6, 15))
+        assert result["vix"] is None
+        assert result["vix"] != 20.0
+        assert "error" in result
 
-    def test_custom_ma_window(self) -> None:
+    def test_passes_as_of_date_through_pit_correctly(self, monkeypatch) -> None:
+        """as_of_date must reach get_vix_series as both the end_date and the
+        as_of_date bound (PIT correctness end-to-end)."""
+        as_of = date(2026, 6, 15)
+        captured = {}
+
+        def fake_get_vix_series(engine, start_date=None, end_date=None, as_of_date=None):
+            captured["start_date"] = start_date
+            captured["end_date"] = end_date
+            captured["as_of_date"] = as_of_date
+            return _vix_series([20.0] * 21, as_of)
+
+        monkeypatch.setattr(exposure_scaler, "get_vix_series", fake_get_vix_series)
+        compute_vix_exposure_scalar(object(), as_of_date=as_of)
+
+        assert captured["end_date"] == as_of
+        assert captured["as_of_date"] == as_of
+
+    def test_custom_ma_window(self, monkeypatch) -> None:
         """Passing a smaller ma_window reduces the rows-needed gate."""
         values = [20.0] * 5 + [15.0]
-        engine = _FakeEngine({VIX_FEATURE_ID: _date_rows(date(2026, 6, 1), values)})
+        monkeypatch.setattr(
+            exposure_scaler, "get_vix_series",
+            lambda *a, **kw: _vix_series(values, date(2026, 6, 15)),
+        )
         result = compute_vix_exposure_scalar(
-            engine, as_of_date=date(2026, 6, 15), ma_window=5
+            object(), as_of_date=date(2026, 6, 15), ma_window=5
         )
         assert result["regime_hint"] == "calm"
         assert result["scalar"] == pytest.approx(1.0)
