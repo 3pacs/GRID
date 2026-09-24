@@ -689,6 +689,11 @@ function TradesTab() {
                     Saved recommendations are stale{savedAt ? ` (last generated ${savedAt.slice(0, 10)} UTC)` : ''}. No fresh scan was run.
                 </div>
             )}
+            {savedStatus === 'unknown_age' && (
+                <div role="status" style={styles.emptyState}>
+                    Saved recommendation age is unknown. No fresh scan was run.
+                </div>
+            )}
             {savedStatus === 'unavailable' && (
                 <div role="status" style={styles.emptyState}>Saved trade recommendations are unavailable.</div>
             )}
