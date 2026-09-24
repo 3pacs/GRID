@@ -1568,20 +1568,41 @@ class AstroGridStore:
                                 JOIN resolved_series ers ON ers.id = epc.resolved_series_id
                                 JOIN feature_registry efr ON efr.id = epc.feature_id
                                 JOIN source_catalog esc ON esc.id = eraw.source_id
+                                CROSS JOIN LATERAL (
+                                    SELECT regexp_match(
+                                        pr.market_overlay_snapshot->'price_close_contract'->>'entry_available_at',
+                                        '^([0-9]{{4}})-([0-9]{{2}})-([0-9]{{2}})T([0-9]{{2}}):([0-9]{{2}}):([0-9]{{2}})(\\.([0-9]{{1,6}}))?([+-])(0[0-9]|1[0-9]|2[0-3]):([0-5][0-9])$'
+                                    ) AS fields
+                                ) entry_iso
                                 WHERE epc.id::text = pr.market_overlay_snapshot->'price_close_contract'->>'entry_receipt_id'
                                   AND eraw.id::text = pr.market_overlay_snapshot->'price_close_contract'->>'entry_raw_series_id'
                                   AND ers.id::text = pr.market_overlay_snapshot->'price_close_contract'->>'entry_resolved_series_id'
                                   AND epc.obs_date::text = pr.market_overlay_snapshot->'price_close_contract'->>'entry_obs_date'
                                   AND to_jsonb(epc.value) = pr.market_overlay_snapshot->'price_close_contract'->'entry_price'
-                                  AND (
-                                      to_jsonb(epc.available_at) = pr.market_overlay_snapshot->'price_close_contract'->'entry_available_at'
-                                      OR to_char(epc.available_at AT TIME ZONE 'UTC',
-                                                 'YYYY-MM-DD"T"HH24:MI:SS') || '+00:00'
-                                          = pr.market_overlay_snapshot->'price_close_contract'->>'entry_available_at'
-                                      OR to_char(epc.available_at AT TIME ZONE 'UTC',
-                                                 'YYYY-MM-DD"T"HH24:MI:SS.US') || '+00:00'
-                                          = pr.market_overlay_snapshot->'price_close_contract'->>'entry_available_at'
-                                  )
+                                  -- regexp_match yields only digits or NULL, so malformed
+                                  -- anchors never reach a risky cast or date constructor.
+                                  AND CASE WHEN entry_iso.fields IS NULL THEN FALSE
+                                    WHEN entry_iso.fields[1]::integer NOT BETWEEN 1 AND 9999
+                                      OR entry_iso.fields[2]::integer NOT BETWEEN 1 AND 12
+                                      OR entry_iso.fields[3]::integer NOT BETWEEN 1 AND 31
+                                      OR entry_iso.fields[4]::integer NOT BETWEEN 0 AND 23
+                                      OR entry_iso.fields[5]::integer NOT BETWEEN 0 AND 59
+                                      OR entry_iso.fields[6]::integer NOT BETWEEN 0 AND 59
+                                    THEN FALSE
+                                    WHEN entry_iso.fields[3]::integer > EXTRACT(DAY FROM
+                                      make_date(entry_iso.fields[1]::integer, entry_iso.fields[2]::integer, 1)
+                                      + INTERVAL '1 month - 1 day') THEN FALSE
+                                    ELSE epc.available_at =
+                                      (make_timestamp(
+                                          entry_iso.fields[1]::integer, entry_iso.fields[2]::integer,
+                                          entry_iso.fields[3]::integer, entry_iso.fields[4]::integer,
+                                          entry_iso.fields[5]::integer, entry_iso.fields[6]::integer)
+                                       AT TIME ZONE 'UTC')
+                                      + rpad(COALESCE(entry_iso.fields[8], ''), 6, '0')::integer * INTERVAL '1 microsecond'
+                                      - (CASE WHEN entry_iso.fields[9] = '-' THEN -1 ELSE 1 END)
+                                        * (entry_iso.fields[10]::integer * 60 + entry_iso.fields[11]::integer)
+                                        * INTERVAL '1 minute'
+                                  END
                                   AND efr.name = :spy_feature
                                   AND epc.contract_version = :spy_contract
                                   AND epc.price_basis = :spy_basis
