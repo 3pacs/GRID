@@ -15,9 +15,11 @@ depends_on = None
 def upgrade() -> None:
     op.execute("SET LOCAL lock_timeout = '5s'")
     op.execute("SET LOCAL statement_timeout = '30s'")
+    op.execute("CREATE SEQUENCE IF NOT EXISTS options_capture_ordinal_seq")
     op.execute("""
         ALTER TABLE options_snapshots
             ADD COLUMN IF NOT EXISTS capture_batch_id TEXT,
+            ADD COLUMN IF NOT EXISTS capture_ordinal BIGINT,
             ADD COLUMN IF NOT EXISTS capture_started_at TIMESTAMPTZ,
             ADD COLUMN IF NOT EXISTS capture_completed_at TIMESTAMPTZ
     """)
@@ -30,5 +32,7 @@ def downgrade() -> None:
         ALTER TABLE options_snapshots
             DROP COLUMN IF EXISTS capture_completed_at,
             DROP COLUMN IF EXISTS capture_started_at,
+            DROP COLUMN IF EXISTS capture_ordinal,
             DROP COLUMN IF EXISTS capture_batch_id
     """)
+    op.execute("DROP SEQUENCE IF EXISTS options_capture_ordinal_seq")

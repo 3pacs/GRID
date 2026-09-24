@@ -45,10 +45,11 @@ class _DB:
 
 def _option_row(created_at: datetime = CHAIN_TIME, *,
                 batch: str | None = BATCH,
+                ordinal: int | None = 1,
                 started: datetime | None = CHAIN_TIME,
                 completed: datetime | None = COMPLETE) -> tuple:
     return (765.0, "call", 100, 0.2, AS_OF + timedelta(days=7),
-            timedelta(days=7), created_at, batch, started, completed)
+            timedelta(days=7), created_at, batch, ordinal, started, completed)
 
 
 def _receipt() -> dict:
@@ -75,6 +76,7 @@ def test_chain_has_no_implicit_future_or_old_date_fallback() -> None:
 @pytest.mark.parametrize("row", [
     _option_row(CHAIN_TIME + timedelta(days=1)),
     _option_row(batch="22222222-2222-4222-8222-222222222222"),
+    _option_row(ordinal=2),
     _option_row(started=CHAIN_TIME + timedelta(minutes=1)),
     _option_row(batch=None, completed=None),
     _option_row(completed=None),
@@ -87,6 +89,7 @@ def test_chain_rejects_late_mixed_legacy_or_uncompleted_batch(row: tuple) -> Non
 
 @pytest.mark.parametrize("row", [
     _option_row(batch=None, completed=None),
+    _option_row(ordinal=None),
     _option_row(started=None),
     _option_row(completed=None),
     _option_row(started=COMPLETE + timedelta(minutes=1)),
@@ -102,6 +105,7 @@ def test_chain_preserves_actual_capture_and_requested_date() -> None:
     assert chain.attrs["snap_date"] == AS_OF
     assert chain.attrs["created_at_min"] == CHAIN_TIME
     assert chain.attrs["batch_id"] == BATCH
+    assert chain.attrs["capture_ordinal"] == 1
     assert chain.attrs["capture_started_at"] == CHAIN_TIME
     assert chain.attrs["capture_completed_at"] == COMPLETE
 
@@ -117,7 +121,7 @@ def test_publication_created_at_after_provider_completion_is_valid() -> None:
 def test_invalid_option_row_from_second_pull_still_invalidates_chain() -> None:
     late_invalid = (765.0, "put", 0, 0.0, AS_OF + timedelta(days=7),
                     timedelta(days=7), CHAIN_TIME + timedelta(minutes=5),
-                    "22222222-2222-4222-8222-222222222222", CHAIN_TIME, COMPLETE)
+                    "22222222-2222-4222-8222-222222222222", 2, CHAIN_TIME, COMPLETE)
     db = _DB([_option_row(), late_invalid])
     assert DealerGammaEngine(db)._load_chain("SPY", AS_OF).empty
 

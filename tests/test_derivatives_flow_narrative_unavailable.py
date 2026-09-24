@@ -27,6 +27,7 @@ def _dated_spy() -> dict:
         "spot_release_date": today.isoformat(), "spot_vintage_date": today.isoformat(),
         "snap_date": today.isoformat(), "chain_snap_date": today.isoformat(),
         "chain_batch_id": "11111111-1111-4111-8111-111111111111",
+        "chain_capture_ordinal": 1,
         "chain_capture_started_at": captured.isoformat(),
         "chain_capture_completed_at": (captured + timedelta(minutes=1)).isoformat(),
         "chain_created_at": (captured + timedelta(minutes=2)).isoformat(),

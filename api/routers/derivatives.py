@@ -44,7 +44,8 @@ def _gex_provenance(profile: dict[str, Any]) -> dict[str, Any]:
     return {key: profile[key] for key in (
         "estimated", "basis", "spot_source", "spot_basis", "spot_obs_date",
         "spot_available_at", "spot_receipt_id", "chain_snap_date",
-        "chain_batch_id", "chain_capture_started_at", "chain_capture_completed_at",
+        "chain_batch_id", "chain_capture_ordinal", "chain_capture_started_at",
+        "chain_capture_completed_at",
     )}
 
 

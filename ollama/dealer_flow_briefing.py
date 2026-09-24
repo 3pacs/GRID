@@ -22,7 +22,7 @@ from sqlalchemy.engine import Engine
 
 from store.availability import unavailable
 
-SPOT_CONTRACT = "spy_receipt_chain_batch_pit_v4"
+SPOT_CONTRACT = "spy_receipt_chain_batch_pit_v5"
 
 
 def valid_spy_gex_profile(profile: Any, briefing_date: date) -> bool:
@@ -37,7 +37,10 @@ def valid_spy_gex_profile(profile: Any, briefing_date: date) -> bool:
             or profile.get("estimated") is not True
             or profile.get("basis") != "options_open_interest_with_assumed_dealer_sign_and_black_scholes"
             or not isinstance(profile.get("spot_receipt_id"), int)
-            or profile["spot_receipt_id"] <= 0):
+            or profile["spot_receipt_id"] <= 0
+            or not isinstance(profile.get("chain_capture_ordinal"), int)
+            or isinstance(profile["chain_capture_ordinal"], bool)
+            or profile["chain_capture_ordinal"] <= 0):
         return False
     try:
         chain_date = date.fromisoformat(profile["chain_snap_date"])
