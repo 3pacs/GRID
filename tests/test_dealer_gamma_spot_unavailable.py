@@ -95,6 +95,18 @@ def test_get_spot_returns_the_measured_close() -> None:
     assert engine._get_spot("SPY", SNAP_DATE) == 767.12
 
 
+def test_profile_with_measured_close_labels_its_spot_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = DealerGammaEngine(_FakeDB({"spy": 767.12}))
+    monkeypatch.setattr(engine, "_load_chain", lambda _ticker, _snap_date: _chain())
+
+    profile = engine.compute_gex_profile("SPY", SNAP_DATE)
+
+    assert profile["spot"] == 767.12
+    assert profile["spot_source"] == "resolved_series"
+
+
 def test_profile_without_measured_spot_is_explicitly_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

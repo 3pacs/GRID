@@ -564,9 +564,23 @@ async def get_flow_narrative() -> dict[str, Any]:
 
     # Try the LLM-powered briefing first
     try:
-        from ollama.dealer_flow_briefing import get_latest_flow_briefing
+        from ollama.dealer_flow_briefing import SPOT_CONTRACT, get_latest_flow_briefing
         result = get_latest_flow_briefing(db)
-        if result.get("content"):
+        positioning = result.get("positioning_data")
+        saved_gex = positioning.get("gex") if isinstance(positioning, dict) else None
+        spy_saved = saved_gex.get("SPY") if isinstance(saved_gex, dict) else None
+        saved_spot = spy_saved.get("spot") if isinstance(spy_saved, dict) else None
+        if (
+            result.get("content")
+            and result.get("stale") is False
+            and isinstance(positioning, dict)
+            and positioning.get("spot_contract") == SPOT_CONTRACT
+            and isinstance(spy_saved, dict)
+            and spy_saved.get("spot_source") == "resolved_series"
+            and isinstance(saved_spot, (int, float))
+            and math.isfinite(saved_spot)
+            and saved_spot > 0
+        ):
             return result
     except Exception as exc:
         log.debug("LLM flow briefing unavailable: {e}", e=str(exc))

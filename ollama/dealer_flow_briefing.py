@@ -13,12 +13,17 @@ from __future__ import annotations
 
 import calendar
 import json
+import math
 from datetime import date, datetime, timezone
 from typing import Any
 
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+from store.availability import unavailable
+
+SPOT_CONTRACT = "resolved_series_only_v1"
 
 # ── DB table DDL ──────────────────────────────────────────────────────
 
@@ -412,10 +417,28 @@ def generate_dealer_flow_briefing(engine: Engine) -> dict[str, Any]:
     Returns:
         dict with keys: content, positioning_data, briefing_date, created_at.
     """
-    _ensure_table(engine)
-
     # Gather data
     positioning = _gather_positioning_data(engine)
+
+    spy = positioning.get("gex", {}).get("SPY", {})
+    spot = spy.get("spot") if isinstance(spy, dict) else None
+    if (
+        not isinstance(spot, (int, float))
+        or not math.isfinite(spot)
+        or spot <= 0
+        or spy.get("spot_source") != "resolved_series"
+    ):
+        return unavailable(
+            "SPY GEX profile has no resolved_series close",
+            source="resolved_series",
+            content=None,
+            positioning_data=None,
+            briefing_date=None,
+            created_at=None,
+        )
+    positioning["spot_contract"] = SPOT_CONTRACT
+
+    _ensure_table(engine)
 
     # Build prompt
     system_prompt, user_prompt = _build_prompt(positioning)
@@ -483,8 +506,6 @@ def get_latest_flow_briefing(engine: Engine) -> dict[str, Any]:
         dict with keys: content, positioning_data, briefing_date,
                         created_at, stale.
     """
-    _ensure_table(engine)
-
     try:
         with engine.connect() as conn:
             row = conn.execute(
