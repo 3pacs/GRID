@@ -83,9 +83,8 @@ def _wire_engine(mock_engine, mock_conn):
 
 
 class TestQuoteChangePct:
-    @patch("api.routers.watchlist_overview._init_table")
     @patch("api.routers.watchlist_overview.get_db_engine")
-    def test_change_pct_computed_from_prior_close(self, mock_engine, _mock_init):
+    def test_change_pct_computed_from_prior_close(self, mock_engine):
         today = date.today()
         yesterday = today - timedelta(days=1)
         _wire_engine(mock_engine, _mock_quote_conn([(110.0, today), (100.0, yesterday)]))
@@ -98,9 +97,8 @@ class TestQuoteChangePct:
         assert data["change_pct"] == 0.1
         assert data["source"] == "grid"
 
-    @patch("api.routers.watchlist_overview._init_table")
     @patch("api.routers.watchlist_overview.get_db_engine")
-    def test_change_pct_null_with_only_one_stored_close(self, mock_engine, _mock_init):
+    def test_change_pct_null_with_only_one_stored_close(self, mock_engine):
         """No prior day on record -> change_pct stays null rather than crashing."""
         today = date.today()
         _wire_engine(mock_engine, _mock_quote_conn([(100.0, today)]))
@@ -112,9 +110,8 @@ class TestQuoteChangePct:
         assert data["price"] == 100.0
         assert data["change_pct"] is None
 
-    @patch("api.routers.watchlist_overview._init_table")
     @patch("api.routers.watchlist_overview.get_db_engine")
-    def test_change_pct_none_when_no_price_history(self, mock_engine, _mock_init):
+    def test_change_pct_none_when_no_price_history(self, mock_engine):
         _wire_engine(mock_engine, _mock_quote_conn([]))
 
         # No stored price falls through to the live-fetch fallback; force it
@@ -131,9 +128,8 @@ class TestQuoteChangePct:
 
 
 class TestQuoteStaleFlag:
-    @patch("api.routers.watchlist_overview._init_table")
     @patch("api.routers.watchlist_overview.get_db_engine")
-    def test_fresh_price_is_not_stale(self, mock_engine, _mock_init):
+    def test_fresh_price_is_not_stale(self, mock_engine):
         today = date.today()
         _wire_engine(mock_engine, _mock_quote_conn([(110.0, today)]))
 
@@ -141,9 +137,8 @@ class TestQuoteStaleFlag:
 
         assert response.json()["stale"] is False
 
-    @patch("api.routers.watchlist_overview._init_table")
     @patch("api.routers.watchlist_overview.get_db_engine")
-    def test_price_older_than_three_days_is_stale(self, mock_engine, _mock_init):
+    def test_price_older_than_three_days_is_stale(self, mock_engine):
         old_date = date.today() - timedelta(days=57)
         older_date = old_date - timedelta(days=1)
         _wire_engine(mock_engine, _mock_quote_conn([(327.50, old_date), (320.0, older_date)]))
@@ -157,9 +152,8 @@ class TestQuoteStaleFlag:
         # is on record — the card can show both facts together.
         assert data["change_pct"] is not None
 
-    @patch("api.routers.watchlist_overview._init_table")
     @patch("api.routers.watchlist_overview.get_db_engine")
-    def test_price_exactly_three_days_old_is_not_stale(self, mock_engine, _mock_init):
+    def test_price_exactly_three_days_old_is_not_stale(self, mock_engine):
         boundary_date = date.today() - timedelta(days=3)
         _wire_engine(mock_engine, _mock_quote_conn([(100.0, boundary_date)]))
 
@@ -167,9 +161,8 @@ class TestQuoteStaleFlag:
 
         assert response.json()["stale"] is False
 
-    @patch("api.routers.watchlist_overview._init_table")
     @patch("api.routers.watchlist_overview.get_db_engine")
-    def test_no_price_at_all_leaves_stale_none(self, mock_engine, _mock_init):
+    def test_no_price_at_all_leaves_stale_none(self, mock_engine):
         """No as_of at all (not even a live fallback hit) -> stale is None,
         not a false claim of freshness or staleness."""
         _wire_engine(mock_engine, _mock_quote_conn([]))
@@ -184,11 +177,9 @@ class TestQuoteStaleFlag:
 
 
 class TestQuoteLiveFallback:
-    @patch("api.routers.watchlist_overview._init_table")
     @patch("api.routers.watchlist_overview.get_db_engine")
-    @patch("api.routers.watchlist_overview._cache_price_to_db")
     def test_live_fallback_carries_honest_as_of_and_stale(
-        self, _mock_cache, mock_engine, _mock_init
+        self, mock_engine
     ):
         """Previously as_of stayed null on the live-fallback path even
         though a fresh live price was returned."""
@@ -273,9 +264,8 @@ class TestQuoteQueryFailureIsAudible:
         assert response.status_code == 200
         return records
 
-    @patch("api.routers.watchlist_overview._init_table")
     @patch("api.routers.watchlist_overview.get_db_engine")
-    def test_schema_fault_in_price_query_logs_at_error(self, mock_engine, _mock_init):
+    def test_schema_fault_in_price_query_logs_at_error(self, mock_engine):
         """SQLSTATE 42703 can't succeed on any retry — it is a code bug."""
         records = self._quote_with_price_query_raising(
             mock_engine, _FakeDBAPIError("boom", _FakeOrig("42703"))
@@ -285,9 +275,8 @@ class TestQuoteQueryFailureIsAudible:
         assert "ERROR" in levels, records
         assert any("Quote price query for AAPL" in msg for _, msg in records), records
 
-    @patch("api.routers.watchlist_overview._init_table")
     @patch("api.routers.watchlist_overview.get_db_engine")
-    def test_undefined_column_message_logs_at_error(self, mock_engine, _mock_init):
+    def test_undefined_column_message_logs_at_error(self, mock_engine):
         """Same fault via the message, for drivers that expose no SQLSTATE."""
         records = self._quote_with_price_query_raising(
             mock_engine, _FakeDBAPIError('column "obs_date" does not exist')
@@ -295,9 +284,8 @@ class TestQuoteQueryFailureIsAudible:
 
         assert "ERROR" in [level for level, _ in records], records
 
-    @patch("api.routers.watchlist_overview._init_table")
     @patch("api.routers.watchlist_overview.get_db_engine")
-    def test_transient_failure_stays_a_warning(self, mock_engine, _mock_init):
+    def test_transient_failure_stays_a_warning(self, mock_engine):
         """A statement timeout is operational — errors.jsonl keeps its signal."""
         records = self._quote_with_price_query_raising(
             mock_engine,

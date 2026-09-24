@@ -8,6 +8,7 @@ DealerGammaEngine and options_snapshots tables.
 
 from __future__ import annotations
 
+import math
 from datetime import date, timedelta
 from typing import Any
 
@@ -184,8 +185,14 @@ async def get_vanna_charm(ticker: str) -> dict[str, Any]:
         if result.get("error"):
             return {"error": result["error"], "ticker": ticker.upper()}
 
-        vanna = result.get("vanna_exposure", 0)
-        charm = result.get("charm_exposure", 0)
+        vanna = result.get("vanna_exposure")
+        charm = result.get("charm_exposure")
+        if any(
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            for value in (vanna, charm)
+        ):
+            return {"error": "Vanna/charm exposure unavailable", "ticker": ticker.upper()}
         spot = result.get("spot", 0)
         per_strike = result.get("per_strike", [])
 
@@ -870,6 +877,9 @@ def get_flow_timeline(
     db = get_db_engine()
     history: list[dict] = []
     gamma_flip_crossings: list[dict] = []
+    failed_dates = 0
+    stored_read_failed = False
+    used_fallback = False
 
     # ── Try options_daily_signals first for stored data ──
     try:
@@ -888,15 +898,21 @@ def get_flow_timeline(
 
             for r in rows:
                 sig_date = r[0]
-                spot = float(r[1]) if r[1] else 0
                 try:
                     gex_result = engine_gex.compute_gex_profile(ticker, snap_date=sig_date)
-                    net_gex = gex_result.get("gex_aggregate", 0)
-                    regime_raw = (gex_result.get("regime") or "NEUTRAL").lower()
-                    spot = gex_result.get("spot", spot)
-                except Exception:
-                    net_gex = 0
-                    regime_raw = "neutral"
+                    if gex_result.get("error") or any(
+                        gex_result.get(field) is None
+                        for field in ("gex_aggregate", "regime", "spot")
+                    ):
+                        failed_dates += 1
+                        continue
+                    net_gex = gex_result["gex_aggregate"]
+                    regime_raw = gex_result["regime"].lower()
+                    spot = gex_result["spot"]
+                except Exception as exc:
+                    log.debug("Flow timeline GEX for {t} on {d}: {e}", t=ticker, d=sig_date, e=str(exc))
+                    failed_dates += 1
+                    continue
 
                 history.append({
                     "date": str(sig_date),
@@ -915,6 +931,7 @@ def get_flow_timeline(
                 prev_gex = net_gex
 
     except Exception as exc:
+        stored_read_failed = True
         log.debug("Flow timeline daily signals query failed: {e}", e=str(exc))
 
     # ── Fallback: compute from latest snapshot ──
@@ -922,12 +939,16 @@ def get_flow_timeline(
         try:
             engine_gex = _get_gex_engine()
             result = engine_gex.compute_gex_profile(ticker)
-            if not result.get("error"):
+            if not result.get("error") and all(
+                result.get(field) is not None
+                for field in ("gex_aggregate", "regime", "spot")
+            ):
+                used_fallback = True
                 history.append({
                     "date": result.get("snap_date", str(end_date)),
-                    "net_gex": round(result.get("gex_aggregate", 0)),
-                    "regime": (result.get("regime") or "NEUTRAL").lower(),
-                    "spot": result.get("spot", 0),
+                    "net_gex": round(result["gex_aggregate"]),
+                    "regime": result["regime"].lower(),
+                    "spot": result["spot"],
                 })
         except Exception as exc:
             log.debug("Flow timeline GEX fallback failed: {e}", e=str(exc))
@@ -942,6 +963,13 @@ def get_flow_timeline(
         "ticker": ticker,
         "days": days,
         "history": history,
+        "history_status": (
+            "unavailable" if not history else
+            "fallback" if used_fallback else
+            "partial" if failed_dates or stored_read_failed else "available"
+        ),
+        "failed_dates": failed_dates,
+        **({"error": "No usable GEX history is available"} if not history else {}),
         "opex_calendar": opex_calendar,
         "catalysts": catalysts,
         "gamma_flip_crossings": gamma_flip_crossings,

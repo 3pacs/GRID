@@ -144,6 +144,30 @@ jobs:
           DB_PASSWORD: testpass
         run: python -m pytest tests/test_watchlist_edge_readonly_pg.py -q -rA
 
+      - name: Watchlist overview read-only PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_watchlist_overview_readonly_pg.py -q -rA
+
+      - name: Watchlist analysis and flow PostgreSQL read contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_watchlist_analysis_derivatives_readonly_pg.py -q -rA
+
+      - name: Watchlist options recommendations PostgreSQL read contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_watchlist_options_readonly_pg.py -q -rA
+
       # The general suite leaves GRID_TEST_DB_URL unset. Gate both producer
       # and resolver contracts against the isolated disposable PG schemas.
       # test_spy_binance_composition_pg.py proves the two policies resolve
@@ -158,6 +182,13 @@ jobs:
           GRID_JWT_SECRET: test-secret-ci
           TESTING: "true"
         run: python -m pytest tests/test_spy_price_receipt_pg.py tests/test_binance_canonical_close_pg.py tests/test_spy_binance_composition_pg.py -q -rA
+
+      - name: Binance forward cadence and scheduler pull logging
+        env:
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_binance_forward_cadence.py tests/test_spy_completed_close_schedule.py tests/test_scheduler_pull_logging.py -q -rA
 
       - name: Portfolio GET PostgreSQL read contract
         env:
@@ -174,6 +205,22 @@ jobs:
           GRID_JWT_SECRET: test-secret-ci
           TESTING: "true"
         run: python -m pytest tests/test_snapshots_readonly_pg.py -q -rA
+
+      - name: Dad gold read-only PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_dad_gold_readonly_pg.py -q -rA
+
+      - name: Dad ticker detail read-only PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_dad_ticker_detail_readonly_pg.py -q -rA
 
       - name: Check for SQL injection patterns
         run: |
@@ -284,6 +331,9 @@ jobs:
       # case proves.
       - name: Deploy pipeline — atomic release swap (failure injection)
         run: bash tests/deploy/test_deploy_release_swap.sh
+
+      - name: Deploy pipeline — immutable runtime preservation
+        run: bash tests/deploy/test_runtime_preservation.sh
 
       # Failure-injection proof for scripts/deploy_verify_release_tree.sh,
       # the resolved-cwd + independent-SHA check every "verify running the

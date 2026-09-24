@@ -52,6 +52,7 @@ SWAP_SCRIPT="${REPO_ROOT}/scripts/deploy_release_swap.sh"
 
 SANDBOX="$(mktemp -d)"
 trap 'rm -rf "$SANDBOX"' EXIT
+export GRID_DEPLOY_TEST_SANDBOX="$SANDBOX"
 
 pass_count=0
 fail_count=0

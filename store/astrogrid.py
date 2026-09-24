@@ -24,6 +24,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from config import settings
 from oracle.astrogrid_universe import scoreable_universe_by_symbol
 from price_close_contract import (
+    SPY_CLOSE_CAPTURE_POLICY,
     SPY_CLOSE_CONTRACT,
     SPY_CLOSE_FEATURE,
     SPY_CLOSE_SERIES,
@@ -1497,6 +1498,19 @@ class AstroGridStore:
             filters.append("pr.prediction_id = ANY(:prediction_ids)")
             params["prediction_ids"] = prediction_ids
         params["evaluation_date"] = evaluation_date
+        score_cutoff = min(
+            _utc_now(),
+            datetime.combine(evaluation_date + timedelta(days=1), time.min, timezone.utc),
+        )
+        params["score_cutoff"] = score_cutoff
+        params["spy_feature"] = SPY_CLOSE_FEATURE
+        params["spy_contract"] = SPY_CLOSE_CONTRACT
+        params["spy_basis"] = SPY_CLOSE_SERIES
+        params["spy_capture_policy"] = SPY_CLOSE_CAPTURE_POLICY
+        params["spy_entry_rule"] = SPY_ENTRY_RULE
+        params["spy_outcome_rule"] = SPY_OUTCOME_RULE
+        params["spy_entry_max_age_days"] = SPY_ENTRY_MAX_AGE_DAYS
+        params["spy_outcome_grace_days"] = SPY_OUTCOME_GRACE_DAYS
         where_sql = f"AND {' AND '.join(filters)}" if filters else ""
         sql = text(
             f"""
@@ -1522,7 +1536,9 @@ class AstroGridStore:
             WHERE ps.id IS NULL
               AND pr.scoring_class = 'liquid_market'
               AND (
-                  CASE WHEN pr.target_symbols = '["SPY"]'::jsonb
+                  CASE WHEN jsonb_typeof(pr.target_symbols) = 'array'
+                                 AND jsonb_array_length(pr.target_symbols) = 1
+                                 AND upper(pr.target_symbols->>0) = 'SPY'
                        THEN (pr.created_at AT TIME ZONE 'UTC')::date
                        ELSE pr.as_of_ts::date END
                   + CASE
@@ -1531,11 +1547,128 @@ class AstroGridStore:
                     END
               ) <= :evaluation_date
             {where_sql}
-            -- Legacy unanchored rows may remain pending forever. Do not let
-            -- them fill the batch ahead of a new SPY receipt-contract run.
-            ORDER BY CASE WHEN pr.target_symbols = '["SPY"]'::jsonb
+            -- A missing outcome leaves the prediction pending. Prefer SPY
+            -- predictions with an available receipt so old gaps cannot fill
+            -- every bounded batch ahead of scoreable predictions. The scorer
+            -- still verifies complete lineage before writing a score.
+            ORDER BY CASE WHEN jsonb_typeof(pr.target_symbols) = 'array'
+                            AND jsonb_array_length(pr.target_symbols) = 1
+                            AND upper(pr.target_symbols->>0) = 'SPY'
                             AND pr.market_overlay_snapshot->'price_close_contract'->>'version'
-                                = 'spy_close_v1' THEN 0 ELSE 1 END,
+                                = 'spy_close_v1'
+                            AND pr.market_overlay_snapshot->'price_close_contract'->>'entry_rule' = :spy_entry_rule
+                            AND pr.market_overlay_snapshot->'price_close_contract'->>'outcome_rule' = :spy_outcome_rule
+                            AND pr.market_overlay_snapshot->'price_close_contract'->>'basis' = :spy_basis
+                            AND pr.market_overlay_snapshot->'price_close_contract'->>'symbol' = 'SPY'
+                            AND pr.horizon_label IN ('swing', 'macro')
+                            AND abs(extract(epoch FROM (pr.created_at - pr.as_of_ts))) <= 300
+                            AND EXISTS (
+                                SELECT 1 FROM {self.schema}.price_close_receipt epc
+                                JOIN raw_series eraw ON eraw.id = epc.raw_series_id
+                                JOIN resolved_series ers ON ers.id = epc.resolved_series_id
+                                JOIN feature_registry efr ON efr.id = epc.feature_id
+                                JOIN source_catalog esc ON esc.id = eraw.source_id
+                                CROSS JOIN LATERAL (
+                                    SELECT regexp_match(
+                                        pr.market_overlay_snapshot->'price_close_contract'->>'entry_available_at',
+                                        '^([0-9]{{4}})-([0-9]{{2}})-([0-9]{{2}})T([0-9]{{2}}):([0-9]{{2}}):([0-9]{{2}})(\\.([0-9]{{1,6}}))?([+-])(0[0-9]|1[0-9]|2[0-3]):([0-5][0-9])$'
+                                    ) AS fields
+                                ) entry_iso
+                                WHERE epc.id::text = pr.market_overlay_snapshot->'price_close_contract'->>'entry_receipt_id'
+                                  AND eraw.id::text = pr.market_overlay_snapshot->'price_close_contract'->>'entry_raw_series_id'
+                                  AND ers.id::text = pr.market_overlay_snapshot->'price_close_contract'->>'entry_resolved_series_id'
+                                  AND epc.obs_date::text = pr.market_overlay_snapshot->'price_close_contract'->>'entry_obs_date'
+                                  AND to_jsonb(epc.value) = pr.market_overlay_snapshot->'price_close_contract'->'entry_price'
+                                  -- regexp_match yields only digits or NULL, so malformed
+                                  -- anchors never reach a risky cast or date constructor.
+                                  AND CASE WHEN entry_iso.fields IS NULL THEN FALSE
+                                    WHEN entry_iso.fields[1]::integer NOT BETWEEN 1 AND 9999
+                                      OR entry_iso.fields[2]::integer NOT BETWEEN 1 AND 12
+                                      OR entry_iso.fields[3]::integer NOT BETWEEN 1 AND 31
+                                      OR entry_iso.fields[4]::integer NOT BETWEEN 0 AND 23
+                                      OR entry_iso.fields[5]::integer NOT BETWEEN 0 AND 59
+                                      OR entry_iso.fields[6]::integer NOT BETWEEN 0 AND 59
+                                    THEN FALSE
+                                    WHEN entry_iso.fields[3]::integer > EXTRACT(DAY FROM
+                                      make_date(entry_iso.fields[1]::integer, entry_iso.fields[2]::integer, 1)
+                                      + INTERVAL '1 month - 1 day') THEN FALSE
+                                    ELSE epc.available_at =
+                                      (make_timestamp(
+                                          entry_iso.fields[1]::integer, entry_iso.fields[2]::integer,
+                                          entry_iso.fields[3]::integer, entry_iso.fields[4]::integer,
+                                          entry_iso.fields[5]::integer, entry_iso.fields[6]::integer)
+                                       AT TIME ZONE 'UTC')
+                                      + rpad(COALESCE(entry_iso.fields[8], ''), 6, '0')::integer * INTERVAL '1 microsecond'
+                                      - (CASE WHEN entry_iso.fields[9] = '-' THEN -1 ELSE 1 END)
+                                        * (entry_iso.fields[10]::integer * 60 + entry_iso.fields[11]::integer)
+                                        * INTERVAL '1 minute'
+                                  END
+                                  AND efr.name = :spy_feature
+                                  AND epc.contract_version = :spy_contract
+                                  AND epc.price_basis = :spy_basis
+                                  AND eraw.series_id = :spy_basis
+                                  AND eraw.pull_status = 'SUCCESS'
+                                  AND esc.name = 'yfinance'
+                                  AND ers.feature_id = epc.feature_id
+                                  AND ers.source_priority_used = eraw.source_id
+                                  AND ers.obs_date = epc.obs_date
+                                  AND eraw.obs_date = epc.obs_date
+                                  AND ers.value = epc.value
+                                  AND eraw.value = epc.value
+                                  AND eraw.pull_timestamp = epc.available_at
+                                  AND eraw.raw_payload->>'price_contract_version' = :spy_contract
+                                  AND eraw.raw_payload->>'capture_policy' = :spy_capture_policy
+                                  AND eraw.raw_payload->>'price_basis' = :spy_basis
+                                  AND eraw.raw_payload->>'interval' = '1d'
+                                  AND eraw.raw_payload->>'obs_date' = epc.obs_date::text
+                                  AND eraw.raw_payload->'provider_certified_final' = 'false'::jsonb
+                                  AND eraw.pull_timestamp >= ((epc.obs_date + 1)::timestamp AT TIME ZONE 'UTC')
+                                  AND epc.obs_date BETWEEN (pr.created_at AT TIME ZONE 'UTC')::date - :spy_entry_max_age_days
+                                                       AND (pr.created_at AT TIME ZONE 'UTC')::date - 1
+                                  AND epc.available_at <= pr.created_at
+                            )
+                            AND EXISTS (
+                                SELECT 1 FROM {self.schema}.price_close_receipt pc
+                                JOIN raw_series raw ON raw.id = pc.raw_series_id
+                                JOIN resolved_series rs ON rs.id = pc.resolved_series_id
+                                JOIN feature_registry fr ON fr.id = pc.feature_id
+                                JOIN source_catalog sc ON sc.id = raw.source_id
+                                WHERE fr.name = :spy_feature
+                                  AND pc.contract_version = :spy_contract
+                                  AND pc.price_basis = :spy_basis
+                                  AND raw.series_id = :spy_basis
+                                  AND raw.pull_status = 'SUCCESS'
+                                  AND sc.name = 'yfinance'
+                                  AND rs.feature_id = pc.feature_id
+                                  AND rs.source_priority_used = raw.source_id
+                                  AND rs.obs_date = pc.obs_date
+                                  AND raw.obs_date = pc.obs_date
+                                  AND rs.value = pc.value
+                                  AND raw.value = pc.value
+                                  AND raw.pull_timestamp = pc.available_at
+                                  AND raw.raw_payload->>'price_contract_version' = :spy_contract
+                                  AND raw.raw_payload->>'capture_policy' = :spy_capture_policy
+                                  AND raw.raw_payload->>'price_basis' = :spy_basis
+                                  AND raw.raw_payload->>'interval' = '1d'
+                                  AND raw.raw_payload->>'obs_date' = pc.obs_date::text
+                                  AND raw.raw_payload->'provider_certified_final' = 'false'::jsonb
+                                  AND raw.pull_timestamp >=
+                                      ((pc.obs_date + 1)::timestamp AT TIME ZONE 'UTC')
+                                  AND pc.obs_date BETWEEN
+                                      (pr.created_at AT TIME ZONE 'UTC')::date
+                                        + CASE WHEN pr.horizon_label = 'macro' THEN 30 ELSE 7 END
+                                      AND (pr.created_at AT TIME ZONE 'UTC')::date
+                                        + CASE WHEN pr.horizon_label = 'macro' THEN 30 ELSE 7 END
+                                        + :spy_outcome_grace_days
+                                  AND pc.obs_date < (:score_cutoff AT TIME ZONE 'UTC')::date
+                                  AND pc.available_at <= :score_cutoff
+                            ) THEN 0
+                          WHEN jsonb_typeof(pr.target_symbols) = 'array'
+                            AND jsonb_array_length(pr.target_symbols) = 1
+                            AND upper(pr.target_symbols->>0) = 'SPY'
+                            AND pr.market_overlay_snapshot->'price_close_contract'->>'version'
+                                = 'spy_close_v1' THEN 2
+                          ELSE 1 END,
                      pr.as_of_ts ASC, pr.created_at ASC
             LIMIT :limit
             """
@@ -1595,10 +1728,6 @@ class AstroGridStore:
         with self.engine.begin() as conn:
             rows = conn.execute(sql, params).fetchall()
             summary["candidates"] = len(rows)
-            score_cutoff = min(
-                _utc_now(),
-                datetime.combine(evaluation_date + timedelta(days=1), time.min, timezone.utc),
-            )
             for row in rows:
                 maturity_days = 30 if row[3] == "macro" else 7
                 target_symbols = [str(symbol).upper() for symbol in _json_loads(row[5], [])]
@@ -2491,6 +2620,13 @@ class AstroGridStore:
               AND rs.obs_date = pc.obs_date AND raw.obs_date = pc.obs_date
               AND rs.value = pc.value AND raw.value = pc.value
               AND raw.pull_timestamp = pc.available_at
+              AND raw.raw_payload->>'price_contract_version' = :contract
+              AND raw.raw_payload->>'capture_policy' = :capture_policy
+              AND raw.raw_payload->>'price_basis' = :basis
+              AND raw.raw_payload->>'interval' = '1d'
+              AND raw.raw_payload->>'obs_date' = pc.obs_date::text
+              AND raw.raw_payload->'provider_certified_final' = 'false'::jsonb
+              AND raw.pull_timestamp >= ((pc.obs_date + 1)::timestamp AT TIME ZONE 'UTC')
               AND pc.available_at <= :cutoff
               AND pc.obs_date < :cutoff_day
               {mode_filter}
@@ -2503,7 +2639,8 @@ class AstroGridStore:
             with conn.begin_nested():
                 row = conn.execute(sql, {
                     "contract": SPY_CLOSE_CONTRACT, "feature": SPY_CLOSE_FEATURE,
-                    "basis": SPY_CLOSE_SERIES, "cutoff": cutoff,
+                    "basis": SPY_CLOSE_SERIES, "capture_policy": SPY_CLOSE_CAPTURE_POLICY,
+                    "cutoff": cutoff,
                     "cutoff_day": cutoff_day,
                     "receipt_id": receipt_id, "min_date": min_date,
                     "max_date": max_date,
@@ -2588,12 +2725,17 @@ class AstroGridStore:
                 conn, cutoff=prediction_created_at, mode="id",
                 receipt_id=entry_receipt_id,
             )
+            try:
+                anchor_available_at = datetime.fromisoformat(anchor["entry_available_at"])
+            except (KeyError, TypeError, ValueError):
+                anchor_available_at = None
             if not entry or any((
                 anchor.get("entry_raw_series_id") != entry["raw_series_id"],
                 anchor.get("entry_resolved_series_id") != entry["resolved_series_id"],
                 anchor.get("entry_obs_date") != entry["obs_date"].isoformat(),
                 anchor.get("entry_price") != entry["price"],
-                anchor.get("entry_available_at") != entry["available_at"].isoformat(),
+                anchor_available_at is None or anchor_available_at.tzinfo is None
+                or anchor_available_at != entry["available_at"],
                 (prediction_created_at.astimezone(timezone.utc).date() - entry["obs_date"]).days > SPY_ENTRY_MAX_AGE_DAYS
             )):
                 return {"unscored": {"reason": "unverified_entry_anchor", "phase": "entry",

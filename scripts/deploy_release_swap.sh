@@ -172,6 +172,10 @@ LIVE_PATH="$1"
 LABEL="$2"
 BUILD_HOOK="$3"
 shift 3
+if [[ ! "$LABEL" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || [ "$LABEL" = ".." ]; then
+  echo "release label must be one safe path segment" >&2
+  exit 2
+fi
 
 RELEASES_DIR="${LIVE_PATH}.releases"
 CANDIDATE_DIR="${RELEASES_DIR}/${LABEL}"
@@ -187,6 +191,86 @@ exec {lock_fd}>"$LOCK_FILE"
 if ! flock -w "$LOCK_WAIT_SECS" "$lock_fd"; then
   echo "could not acquire deploy lock on $LOCK_FILE within ${LOCK_WAIT_SECS}s -- another deploy against $LIVE_PATH is running long, or stuck" >&2
   exit 3
+fi
+
+# This record is created by the release controller BEFORE the first swap.
+# It deliberately lives outside the mutable checkout and is never overwritten
+# by a later deployment. Both paths must name real, immutable release folders.
+# An old scheduler process can keep its cwd after a rename, but pruning that
+# folder makes its next import (or an incidental restart) unsafe.
+PRESERVATION_FILE="${RELEASES_DIR}/.runtime-preservation"
+if [ -n "${GRID_DEPLOY_TEST_SANDBOX:-}" ]; then
+  # Legacy filesystem failure-injection tests predate this production gate.
+  # The escape hatch is confined to their temporary sandbox, never the live
+  # GRID path, and new preservation tests exercise the real gate below.
+  test_root="$(realpath -e -- "$GRID_DEPLOY_TEST_SANDBOX")"
+  case "$test_root" in
+    /tmp/tmp.*) ;;
+    *) echo "test sandbox must be a mktemp directory under /tmp" >&2; exit 2 ;;
+  esac
+  case "$(realpath -m -- "$LIVE_PATH")" in
+    "$test_root"/*) test_only_skip_preservation=1 ;;
+    *) echo "test sandbox does not contain live path" >&2; exit 2 ;;
+  esac
+fi
+if [ "${test_only_skip_preservation:-0}" != 1 ]; then
+  if [ ! -f "$PRESERVATION_FILE" ] || [ -L "$PRESERVATION_FILE" ]; then
+    echo "runtime preservation record missing or linked: $PRESERVATION_FILE; bootstrap before any swap" >&2
+    exit 5
+  fi
+  mapfile -t preservation_lines < "$PRESERVATION_FILE"
+  if [ "${#preservation_lines[@]}" -ne 6 ] ||
+     [[ "${preservation_lines[0]}" != scheduler=* ]] ||
+     [[ "${preservation_lines[1]}" != recovery=* ]] ||
+     [[ "${preservation_lines[2]}" != scheduler_sha=* ]] ||
+     [[ "${preservation_lines[3]}" != scheduler_tree=* ]] ||
+     [[ "${preservation_lines[4]}" != recovery_sha=* ]] ||
+     [[ "${preservation_lines[5]}" != recovery_tree=* ]]; then
+    echo "invalid runtime preservation record: expected two paths and their SHA/tree identities" >&2
+    exit 5
+  fi
+  scheduler_dir="${preservation_lines[0]#scheduler=}"
+  recovery_dir="${preservation_lines[1]#recovery=}"
+  scheduler_sha="${preservation_lines[2]#scheduler_sha=}"
+  scheduler_tree="${preservation_lines[3]#scheduler_tree=}"
+  recovery_sha="${preservation_lines[4]#recovery_sha=}"
+  recovery_tree="${preservation_lines[5]#recovery_tree=}"
+  releases_root="$(realpath -e -- "$RELEASES_DIR")"
+  if [ "$releases_root" != "$RELEASES_DIR" ]; then
+    echo "release root must be an absolute canonical directory: $RELEASES_DIR" >&2
+    exit 5
+  fi
+  for protected_dir in "$scheduler_dir" "$recovery_dir"; do
+    if [ ! -d "$protected_dir" ] || [ -L "$protected_dir" ] ||
+       [ "$(realpath -e -- "$protected_dir")" != "$protected_dir" ] ||
+       [ "$(dirname -- "$protected_dir")" != "$releases_root" ]; then
+      echo "runtime preservation target is missing, linked, outside or noncanonical: $protected_dir" >&2
+      exit 5
+    fi
+  done
+  verify_preserved_checkout() {
+    local name="$1" dir="$2" expected_sha="$3" expected_tree="$4"
+    if [[ ! "$expected_sha" =~ ^[0-9a-f]{40}$ ]] ||
+       [[ ! "$expected_tree" =~ ^[0-9a-f]{40}$ ]] ||
+       [ "$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null || true)" != "$dir" ] ||
+       [ "$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)" != "$expected_sha" ] ||
+       [ "$(git -C "$dir" rev-parse 'HEAD^{tree}' 2>/dev/null || true)" != "$expected_tree" ] ||
+       ! git -C "$dir" diff --quiet HEAD --; then
+      echo "$name preservation Git HEAD/tree or tracked files do not match approved identity" >&2
+      exit 5
+    fi
+  }
+  verify_preserved_checkout scheduler "$scheduler_dir" "$scheduler_sha" "$scheduler_tree"
+  verify_preserved_checkout recovery "$recovery_dir" "$recovery_sha" "$recovery_tree"
+  scheduler_pid="$(systemctl show -p MainPID --value grid-scheduler 2>/dev/null || true)"
+  scheduler_workdir="$(systemctl show -p WorkingDirectory --value grid-scheduler 2>/dev/null || true)"
+  if [[ ! "$scheduler_pid" =~ ^[1-9][0-9]*$ ]] ||
+     [ ! -d "/proc/${scheduler_pid}/cwd" ] ||
+     [ "$(readlink -f -- "/proc/${scheduler_pid}/cwd" 2>/dev/null || true)" != "$scheduler_dir" ] ||
+     [ "$scheduler_workdir" != "$scheduler_dir" ]; then
+    echo "scheduler PID/cwd/effective WorkingDirectory is not pinned to $scheduler_dir" >&2
+    exit 5
+  fi
 fi
 
 # Crash recovery: see header. Only fires when <live_path> does not exist as
@@ -239,6 +323,11 @@ if [ -L "$LIVE_PATH" ]; then
 fi
 
 if [ -e "$CANDIDATE_DIR" ]; then
+  if [ "${test_only_skip_preservation:-0}" != 1 ] &&
+     { [ "$CANDIDATE_DIR" = "$scheduler_dir" ] || [ "$CANDIDATE_DIR" = "$recovery_dir" ]; }; then
+    echo "candidate label names a protected runtime directory" >&2
+    exit 5
+  fi
   echo "removing stale candidate at $CANDIDATE_DIR from a prior interrupted run" >&2
   rm -rf "$CANDIDATE_DIR"
 fi
@@ -300,7 +389,9 @@ if [ -n "$previous_target" ]; then
   mapfile -t all_releases < <(find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-)
   kept=0
   for rel in "${all_releases[@]}"; do
-    if [ "$rel" = "$CANDIDATE_DIR" ] || [ "$rel" = "$previous_target" ]; then
+    if [ "$rel" = "$CANDIDATE_DIR" ] || [ "$rel" = "$previous_target" ] ||
+       { [ "${test_only_skip_preservation:-0}" != 1 ] &&
+         { [ "$rel" = "$scheduler_dir" ] || [ "$rel" = "$recovery_dir" ]; }; }; then
       kept=$((kept + 1))
       continue
     fi

@@ -324,6 +324,14 @@ export function InsiderEdgePanel({ edgeData, loading }) {
     const dirColor = convergence?.direction === 'bullish'
         ? colors.green : convergence?.direction === 'bearish'
             ? colors.red : colors.textMuted;
+    // Older API workers can still send a numeric `confidence` without score
+    // provenance. Never render that legacy number as a probability or bar.
+    const hasPersistedTrust = convergence && Object.prototype.hasOwnProperty.call(convergence, 'persisted_trust_mean');
+    const persistedTrustMean = typeof convergence?.persisted_trust_mean === 'number'
+        && Number.isFinite(convergence.persisted_trust_mean)
+        ? convergence.persisted_trust_mean : null;
+    const persistedTrustLabel = persistedTrustMean != null
+        ? persistedTrustMean.toFixed(2) : hasPersistedTrust ? 'unscored' : 'unavailable';
 
     return (
         <div style={{
@@ -353,7 +361,6 @@ export function InsiderEdgePanel({ edgeData, loading }) {
                             border: `1px solid ${dirColor}40`,
                         }}>
                             {convergence.source_count} sources {convergence.direction || convergence.signal_type || 'direction unresolved'}
-                            {convergence.confidence != null ? ` \u00b7 ${(convergence.confidence * 100).toFixed(0)}%` : ' \u00b7 unscored'}
                         </span>
                     )}
                 </div>
@@ -489,7 +496,7 @@ export function InsiderEdgePanel({ edgeData, loading }) {
                         </div>
                     )}
 
-                    {/* Trust Indicator */}
+                    {/* Persisted trust statistic; score provenance is not certified. */}
                     {convergence && convergence.source_count > 0 && (
                         <div style={{
                             display: 'flex', alignItems: 'center', gap: '12px',
@@ -498,10 +505,12 @@ export function InsiderEdgePanel({ edgeData, loading }) {
                             border: `1px solid ${colors.borderSubtle}`,
                         }}>
                             <span style={{ fontSize: '10px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace" }}>
-                                TRUST
+                                PERSISTED TRUST MEAN
                             </span>
                             <div style={{ flex: 1 }}>
-                                <TrustBar score={convergence.confidence} width={120} />
+                                <span style={{ fontSize: '10px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace" }}>
+                                    {persistedTrustLabel} · score provenance unverified
+                                </span>
                             </div>
                             <span style={{ fontSize: '10px', color: dirColor, fontFamily: "'JetBrains Mono', monospace", fontWeight: 600 }}>
                                 {convergence.source_count} independent source{convergence.source_count !== 1 ? 's' : ''}
@@ -1120,16 +1129,22 @@ function CapitalFlowPath({ sectorPath, ticker }) {
 
 export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
     const { isMobile } = useDevice();
+    const currentTickerRef = useRef(ticker);
+    currentTickerRef.current = ticker;
+    const periodRequestRef = useRef(0);
     const [data, setData] = useState(null);
     const [dataLoading, setDataLoading] = useState(true);
     const [error, setError] = useState(null);
     const [overview, setOverview] = useState(null);
+    const [overviewUnavailable, setOverviewUnavailable] = useState(false);
     const [overviewLoading, setOverviewLoading] = useState(true);
     const [period, setPeriod] = useState('3M');
     const [priceLoading, setPriceLoading] = useState(false);
     const [gexData, setGexData] = useState(null);
     const [gexLoading, setGexLoading] = useState(true);
+    const [gexAvailability, setGexAvailability] = useState(null);
     const [vannaCharmData, setVannaCharmData] = useState(null);
+    const [vannaCharmAvailability, setVannaCharmAvailability] = useState(null);
     const [flowTimelineData, setFlowTimelineData] = useState(null);
     const [secondaryLoading, setSecondaryLoading] = useState(true);
     const [edgeData, setEdgeData] = useState(null);
@@ -1137,23 +1152,30 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
 
     useEffect(() => {
         if (!ticker) return;
+        let active = true;
+        periodRequestRef.current += 1;
 
         // Reset state for new ticker
         setData(null);
         setDataLoading(true);
         setError(null);
         setOverview(null);
+        setOverviewUnavailable(false);
         setOverviewLoading(true);
         setGexData(null);
         setGexLoading(true);
+        setGexAvailability(null);
         setVannaCharmData(null);
+        setVannaCharmAvailability(null);
         setFlowTimelineData(null);
         setSecondaryLoading(true);
         setEdgeData(null);
         setEdgeLoading(true);
+        setPriceLoading(false);
 
         // Phase 1: Fetch core analysis data (fastest — often cached)
         api.getTickerAnalysis(ticker, period).then(result => {
+            if (!active) return;
             if (result?.error) {
                 setError(result.message || 'Failed to load');
                 setData(null);
@@ -1162,23 +1184,30 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
             }
             setDataLoading(false);
         }).catch(err => {
+            if (!active) return;
             setError(err.message || 'Failed to load');
             setDataLoading(false);
         });
 
         // Phase 2: Fetch AI overview (may be slow due to LLM)
         api.getTickerOverview(ticker).then(result => {
+            if (!active) return;
             setOverview(result?.error ? null : result);
+            setOverviewUnavailable(Boolean(result?.error));
             setOverviewLoading(false);
         }).catch(() => {
+            if (!active) return;
+            setOverviewUnavailable(true);
             setOverviewLoading(false);
         });
 
         // Phase 2b: Fetch insider edge intelligence
         api.getTickerEdge(ticker).then(result => {
+            if (!active) return;
             setEdgeData(result?.error ? null : result);
             setEdgeLoading(false);
         }).catch(() => {
+            if (!active) return;
             setEdgeLoading(false);
         });
 
@@ -1188,26 +1217,45 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
             api.getVannaCharm(ticker),
             api.getFlowTimeline(ticker, 90),
         ]).then(([gexResult, vcResult, ftResult]) => {
-            if (gexResult.status === 'fulfilled' && !gexResult.value?.error) {
-                setGexData(gexResult.value);
-            }
+            if (!active) return;
+            const gex = gexResult.status === 'fulfilled' ? gexResult.value : null;
+            const perStrike = gex?.per_strike;
+            const profile = gex?.profile;
+            const hasGexProfile = (Array.isArray(profile) && profile.length > 0)
+                || (Array.isArray(perStrike) && perStrike.length > 0);
+            const validRows = (rows, x, y) => !Array.isArray(rows) || rows.every(row =>
+                row && typeof row === 'object' && Number.isFinite(row[x]) && Number.isFinite(row[y]));
+            const validGex = Array.isArray(profile) && Array.isArray(perStrike)
+                && Number.isFinite(gex?.spot) && gex.spot > 0
+                && Number.isFinite(gex?.gex_aggregate)
+                && validRows(profile, 'spot', 'gex')
+                && validRows(perStrike, 'strike', 'net_gex');
+            setGexData(!gex?.error && hasGexProfile && validGex ? gex : null);
+            setGexAvailability(gex?.error || !validGex
+                ? 'unavailable' : hasGexProfile ? 'available' : 'empty');
             setGexLoading(false);
-            if (vcResult.status === 'fulfilled' && !vcResult.value?.error) {
-                setVannaCharmData(vcResult.value);
-            }
-            if (ftResult.status === 'fulfilled' && !ftResult.value?.error) {
-                setFlowTimelineData(ftResult.value);
-            }
+            const vannaCharm = vcResult.status === 'fulfilled' ? vcResult.value : null;
+            const hasVannaCharm = Number.isFinite(vannaCharm?.vanna_exposure)
+                && Number.isFinite(vannaCharm?.charm_exposure);
+            setVannaCharmData(!vannaCharm?.error && hasVannaCharm ? vannaCharm : null);
+            setVannaCharmAvailability(vannaCharm?.error || !vannaCharm || !hasVannaCharm
+                ? 'unavailable' : 'available');
+            setFlowTimelineData(ftResult.status === 'fulfilled'
+                ? ftResult.value : { error: 'Flow timeline unavailable' });
             setSecondaryLoading(false);
         });
+        return () => { active = false; };
     }, [ticker]);
 
     const handlePeriodChange = useCallback(async (newPeriod) => {
         if (newPeriod === period) return;
+        const requestId = ++periodRequestRef.current;
+        const requestTicker = ticker;
         setPeriod(newPeriod);
         setPriceLoading(true);
         try {
             const refreshed = await api.getTickerAnalysis(ticker, newPeriod);
+            if (periodRequestRef.current !== requestId || currentTickerRef.current !== requestTicker) return;
             if (refreshed?.error) {
                 return;
             }
@@ -1215,12 +1263,19 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
                 ...prev,
                 price_history: refreshed.price_history,
                 price_source: refreshed.price_source,
+                availability: {
+                    ...prev?.availability,
+                    price: refreshed.availability?.price,
+                },
                 period: refreshed.period,
             }));
         } catch (err) {
             // Keep existing data on failure
+        } finally {
+            if (periodRequestRef.current === requestId && currentTickerRef.current === requestTicker) {
+                setPriceLoading(false);
+            }
         }
-        setPriceLoading(false);
     }, [ticker, period]);
 
     // Use enrichedData for instant display while analysis loads
@@ -1247,6 +1302,9 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
     const regime = data?.regime;
     const related = data?.related_features || [];
     const tvSignals = data?.tradingview_signals || [];
+    const unavailableSections = Object.entries(data?.availability || {})
+        .filter(([, status]) => status === 'unavailable')
+        .map(([name]) => name.replaceAll('_', ' '));
 
     // Use enriched price as fallback if analysis data hasn't loaded yet
     const lastPrice = prices.length ? prices[prices.length - 1].value : (enrichedPrice || null);
@@ -1308,6 +1366,12 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
                 <OverviewSkeleton />
             ) : overview ? (
                 <AIOverviewCard overview={overview} />
+            ) : overviewUnavailable ? (
+                <div role="status" style={{
+                    color: colors.yellow, fontSize: '11px', padding: '12px',
+                    background: colors.card, border: `1px solid ${colors.border}`,
+                    borderRadius: tokens.radius.md,
+                }}>AI overview unavailable. Other Watchlist data may still be available.</div>
             ) : null}
 
             {/* ═══ CAPITAL FLOW PATH ═══ */}
@@ -1321,6 +1385,11 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
             <InsiderEdgePanel edgeData={edgeData} loading={edgeLoading} />
 
             {/* ═══ DATA GRID ═══ */}
+            {unavailableSections.length > 0 && (
+                <div style={{ color: colors.yellow, fontSize: '11px', marginTop: '12px' }}>
+                    Data unavailable: {unavailableSections.join(', ')}.
+                </div>
+            )}
             <div style={{
                 display: 'grid',
                 gridTemplateColumns: isMobile ? '1fr' : 'repeat(auto-fit, minmax(280px, 1fr))',
@@ -1377,10 +1446,14 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
                     <div style={{ gridColumn: '1 / -1' }}>
                         <OverviewSkeleton />
                     </div>
+                ) : gexAvailability !== 'available' ? (
+                    <div role="status" style={{ gridColumn: '1 / -1', color: colors.textMuted, fontSize: '11px' }}>
+                        {gexAvailability === 'empty' ? 'No GEX profile data available.' : 'GEX profile unavailable.'}
+                    </div>
                 ) : null}
 
                 {/* Vanna / Charm Compass */}
-                {vannaCharmData && (
+                {vannaCharmData ? (
                     <div style={{ gridColumn: '1 / -1' }}>
                         {isMobile ? (
                             <CollapsibleSection title="VANNA / CHARM" defaultExpanded={false}
@@ -1389,7 +1462,11 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
                             <VannaCharmViz ticker={ticker} vannaCharmData={vannaCharmData} />
                         )}
                     </div>
-                )}
+                ) : !secondaryLoading && vannaCharmAvailability !== 'available' ? (
+                    <div role="status" style={{ gridColumn: '1 / -1', color: colors.textMuted, fontSize: '11px' }}>
+                        {vannaCharmAvailability === 'empty' ? 'No vanna/charm data available.' : 'Vanna/charm unavailable.'}
+                    </div>
+                ) : null}
 
                 {/* Flow Timeline */}
                 {flowTimelineData ? (
