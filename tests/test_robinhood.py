@@ -647,28 +647,112 @@ class TestReconcileStaleOrders:
 
     def test_noop_in_dry_run(self):
         trader = _trader(live=False, use_limit_orders=True)
-        assert trader.reconcile_stale_orders() == {"checked": 0, "cancelled": []}
+        assert trader.reconcile_stale_orders() == {"checked": 0, "cancelled": [], "error": None}
 
     def test_noop_for_market_orders(self):
         trader = _trader(live=True, use_limit_orders=False)
-        assert trader.reconcile_stale_orders() == {"checked": 0, "cancelled": []}
+        assert trader.reconcile_stale_orders() == {"checked": 0, "cancelled": [], "error": None}
 
     def test_cancels_an_order_older_than_the_cutoff(self):
         old = (datetime.now(timezone.utc) - timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
         session = FakeSession(self._routes_with_open_order(old))
         trader = _trader(live=True, session=session, use_limit_orders=True, limit_cancel_after_s=15.0)
         result = trader.reconcile_stale_orders()
-        assert result == {"checked": 1, "cancelled": ["stale-1"]}
+        assert result == {"checked": 1, "cancelled": ["stale-1"], "error": None}
 
     def test_leaves_a_recent_order_alone(self):
         recent = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         session = FakeSession(self._routes_with_open_order(recent))
         trader = _trader(live=True, session=session, use_limit_orders=True, limit_cancel_after_s=15.0)
         result = trader.reconcile_stale_orders()
-        assert result == {"checked": 1, "cancelled": []}
+        assert result == {"checked": 1, "cancelled": [], "error": None}
 
     def test_ignores_filled_orders(self):
         old = (datetime.now(timezone.utc) - timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
         session = FakeSession(self._routes_with_open_order(old, state="filled"))
         trader = _trader(live=True, session=session, use_limit_orders=True, limit_cancel_after_s=15.0)
-        assert trader.reconcile_stale_orders() == {"checked": 0, "cancelled": []}
+        assert trader.reconcile_stale_orders() == {"checked": 0, "cancelled": [], "error": None}
+
+    def test_listing_failure_is_reported_as_an_error(self):
+        """A blip fetching the order list must not look like "nothing to
+        reconcile" — the caller (open_position/close_position) treats any
+        error here as "can't currently prove the book is clean"."""
+        trader = _trader(live=True, session=FakeSession({}), use_limit_orders=True)  # every route 404s
+        result = trader.reconcile_stale_orders()
+        assert result["checked"] == 0 and result["cancelled"] == []
+        assert result["error"] and "could not list orders" in result["error"]
+
+    def test_a_cancel_that_is_not_confirmed_is_reported_as_an_error(self):
+        old = (datetime.now(timezone.utc) - timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        routes = self._routes_with_open_order(old)
+        routes[("POST", f"{rh.PATH_ORDERS}stale-1/cancel/")] = {"error": "not found"}
+        session = FakeSession(routes)
+        trader = _trader(live=True, session=session, use_limit_orders=True, limit_cancel_after_s=15.0)
+        result = trader.reconcile_stale_orders()
+        assert result["checked"] == 1 and result["cancelled"] == []
+        assert result["error"] and "failed to cancel" in result["error"]
+
+
+class TestReconcileWiredIntoOrders:
+    """reconcile_stale_orders() runs automatically at the start of every LIVE
+    (non-simulated) open_position/close_position call, and a reconcile
+    failure blocks the new order — see RobinhoodCryptoTrader._reconcile_guard."""
+
+    def test_live_open_calls_reconcile_before_submitting(self):
+        session = FakeSession(_routes())
+        trader = _trader(live=True, session=session)
+        out = trader.open_position("BTC", "LONG", 10)
+        assert out["status"] == "submitted"
+        calls = [(c["method"], c["path"]) for c in session.calls]
+        assert calls.index(("GET", rh.PATH_ORDERS)) < calls.index(("POST", rh.PATH_ORDERS))
+
+    def test_live_close_calls_reconcile_before_submitting(self):
+        session = FakeSession(_routes())
+        trader = _trader(live=True, session=session)
+        out = trader.close_position("BTC-USD")
+        assert out["status"] == "submitted"
+        calls = [(c["method"], c["path"]) for c in session.calls]
+        assert calls.index(("GET", rh.PATH_ORDERS)) < calls.index(("POST", rh.PATH_ORDERS))
+
+    def test_reconcile_error_blocks_a_new_open(self):
+        session = FakeSession(_routes())
+        trader = _trader(live=True, session=session)
+        trader.reconcile_stale_orders = MagicMock(
+            return_value={"checked": 1, "cancelled": [], "error": "failed to cancel stale order(s): x: boom"})
+        out = trader.open_position("BTC", "LONG", 10)
+        assert out["status"] == "blocked" and out["guard"] == "reconcile_failed"
+        assert "Could not reconcile" in out["error"]
+        assert not any(c["method"] == "POST" for c in session.calls)  # never reached the order POST
+
+    def test_reconcile_error_blocks_a_close_too(self):
+        session = FakeSession(_routes())
+        trader = _trader(live=True, session=session)
+        trader.reconcile_stale_orders = MagicMock(
+            return_value={"checked": 0, "cancelled": [], "error": "could not list orders to reconcile: boom"})
+        out = trader.close_position("BTC-USD")
+        assert out["status"] == "blocked" and out["guard"] == "reconcile_failed"
+        assert not any(c["method"] == "POST" for c in session.calls)
+
+    def test_reconcile_error_alerts(self):
+        session = FakeSession(_routes())
+        alert_fn = MagicMock()
+        trader = _trader(live=True, session=session, alert_fn=alert_fn)
+        trader.reconcile_stale_orders = MagicMock(
+            return_value={"checked": 0, "cancelled": [], "error": "boom"})
+        trader.open_position("BTC", "LONG", 10)
+        assert alert_fn.called
+        assert "reconcile_failed" in alert_fn.call_args_list[-1].args[0]
+
+    def test_dry_run_never_calls_reconcile(self):
+        trader = _trader(live=False)  # normal dry-run mode (ROBINHOOD_LIVE_TRADING=false)
+        trader.reconcile_stale_orders = MagicMock()
+        assert trader.open_position("BTC", "LONG", 10)["status"] == "dry_run"
+        assert trader.close_position("BTC-USD")["status"] == "dry_run"
+        trader.reconcile_stale_orders.assert_not_called()
+
+    def test_simulate_never_calls_reconcile_even_when_live_configured(self):
+        trader = _trader(live=True, session=FakeSession(_routes()))
+        trader.reconcile_stale_orders = MagicMock()
+        assert trader.simulate_order("BTC", "LONG", 10)["status"] == "dry_run"
+        assert trader.simulate_close("BTC-USD")["status"] == "dry_run"
+        trader.reconcile_stale_orders.assert_not_called()

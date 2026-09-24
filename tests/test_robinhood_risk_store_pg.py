@@ -10,6 +10,14 @@ Every test uses a venue name prefixed "test-" and unique to itself, and the
 `store` fixture deletes every "test-%" row on teardown, so this is safe to
 run repeatedly against a shared database without colliding with real
 "robinhood" rows or with itself.
+
+PostgresRiskStore itself does NOT create tables at runtime (see its
+docstring) — the migration owns the schema. Test setup here creates the
+schema explicitly, deliberately duplicating the migration's DDL rather than
+importing it, for the same reason the migration doesn't import from
+trading/robinhood_risk_store.py: a migration (and by extension what test
+setup needs to reproduce it) must stay a frozen, self-contained record, not
+something that silently changes if application code changes later.
 """
 
 from __future__ import annotations
@@ -18,14 +26,69 @@ from datetime import timedelta
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.exc import ProgrammingError
 
 from trading.robinhood_risk_store import PostgresRiskStore, utc_today
+
+# Mirrors migrations/versions/robinhood_guards_20260924.py's upgrade() DDL —
+# test-only, so it deliberately does NOT import from that migration (or from
+# PostgresRiskStore, which no longer carries this DDL at all after this was
+# moved out of runtime code — see the module docstring above).
+_SCHEMA_DDL = (
+    """
+    CREATE TABLE IF NOT EXISTS trading_risk_state (
+        venue             TEXT PRIMARY KEY,
+        peak_equity       DOUBLE PRECISION NOT NULL,
+        day_start_equity  DOUBLE PRECISION NOT NULL,
+        day_start_date    DATE NOT NULL,
+        orders_today      INTEGER NOT NULL DEFAULT 0,
+        updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS trading_order_log (
+        id                BIGSERIAL PRIMARY KEY,
+        venue             TEXT NOT NULL,
+        client_order_id   TEXT NOT NULL,
+        wallet_id         TEXT,
+        ticker            TEXT NOT NULL,
+        side              TEXT NOT NULL,
+        direction         TEXT NOT NULL,
+        size_usd          DOUBLE PRECISION NOT NULL,
+        quantity          TEXT,
+        bid               DOUBLE PRECISION,
+        ask               DOUBLE PRECISION,
+        mid               DOUBLE PRECISION,
+        executable_price  DOUBLE PRECISION,
+        spread_bps        DOUBLE PRECISION,
+        spread_cost_usd   DOUBLE PRECISION,
+        order_type        TEXT NOT NULL,
+        status            TEXT NOT NULL,
+        fill_price        DOUBLE PRECISION,
+        guard_results     JSONB,
+        error             TEXT,
+        raw_response      JSONB,
+        simulated         BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_trading_order_log_lookup "
+    "ON trading_order_log (venue, client_order_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_trading_order_log_recent "
+    "ON trading_order_log (venue, created_at DESC)",
+)
+
+
+def _create_schema(engine) -> None:
+    with engine.begin() as conn:
+        for stmt in _SCHEMA_DDL:
+            conn.execute(text(stmt))
 
 
 @pytest.fixture
 def store(pg_engine):
+    _create_schema(pg_engine)
     s = PostgresRiskStore(pg_engine)
-    s._ensure_tables()
     yield s
     with pg_engine.begin() as conn:
         conn.execute(text("DELETE FROM trading_order_log WHERE venue LIKE :pattern"), {"pattern": "test-%"})
@@ -142,3 +205,35 @@ class TestAverageCost:
 
     def test_none_without_history(self, store):
         assert store.average_cost(_venue("no-history"), "BTC-USD") is None
+
+
+class TestFailsClosedWithoutMigration:
+    """PostgresRiskStore creates no tables of its own — a database the
+    migration hasn't been applied to must block orders (raise), not get a
+    schema bootstrapped for it under whatever role the app happens to run
+    as. This class owns its own drop/recreate around each test rather than
+    depending on the `store` fixture, so it's correct regardless of test
+    execution order relative to the rest of this file."""
+
+    @pytest.fixture
+    def dropped(self, pg_engine):
+        with pg_engine.begin() as conn:
+            conn.execute(text("DROP TABLE IF EXISTS trading_order_log"))
+            conn.execute(text("DROP TABLE IF EXISTS trading_risk_state"))
+        yield pg_engine
+        _create_schema(pg_engine)  # restore for any other test in this file
+
+    def test_touch_raises_when_the_table_is_missing(self, dropped):
+        store = PostgresRiskStore(dropped)
+        with pytest.raises(ProgrammingError):
+            store.touch(_venue("no-migration-touch"), 100.0, utc_today())
+
+    def test_is_duplicate_raises_when_the_table_is_missing(self, dropped):
+        store = PostgresRiskStore(dropped)
+        with pytest.raises(ProgrammingError):
+            store.is_duplicate(_venue("no-migration-dup"), "k1")
+
+    def test_get_state_raises_when_the_table_is_missing(self, dropped):
+        store = PostgresRiskStore(dropped)
+        with pytest.raises(ProgrammingError):
+            store.get_state(_venue("no-migration-state"))

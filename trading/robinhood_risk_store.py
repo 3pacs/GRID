@@ -19,7 +19,10 @@ connector talks to. ``RobinhoodCryptoTrader`` never touches SQL directly:
   ``migrations/versions/robinhood_guards_20260924.py`` for the schema:
   ``trading_risk_state`` + ``trading_order_log``). Every process reads and
   writes the same row per venue, so the peak survives restarts and the
-  factory's fresh-instance-per-call pattern.
+  factory's fresh-instance-per-call pattern. It does NOT create its own
+  tables at runtime — the migration owns the schema, and a missing table
+  raises (fails closed) rather than being silently bootstrapped under
+  whatever role the app happens to run as.
 
 Both implement the same small protocol (:class:`RiskStore`), so a caller
 (``get_robinhood_trader()`` in production, a test fixture elsewhere) picks
@@ -164,55 +167,12 @@ class InMemoryRiskStore:
 
 # ---------------------------------------------------------------------------
 # Postgres (production) store
+#
+# Schema DDL lives ONLY in migrations/versions/robinhood_guards_20260924.py
+# (the frozen, historical record of what ran) -- deliberately not duplicated
+# or imported from here, so this module can never drift from what that
+# migration actually applied. See PostgresRiskStore's docstring below.
 # ---------------------------------------------------------------------------
-
-_CREATE_STATE_SQL = """
-    CREATE TABLE IF NOT EXISTS trading_risk_state (
-        venue             TEXT PRIMARY KEY,
-        peak_equity       DOUBLE PRECISION NOT NULL,
-        day_start_equity  DOUBLE PRECISION NOT NULL,
-        day_start_date    DATE NOT NULL,
-        orders_today      INTEGER NOT NULL DEFAULT 0,
-        updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-"""
-
-_CREATE_ORDER_LOG_SQL = """
-    CREATE TABLE IF NOT EXISTS trading_order_log (
-        id                BIGSERIAL PRIMARY KEY,
-        venue             TEXT NOT NULL,
-        client_order_id   TEXT NOT NULL,
-        wallet_id         TEXT,
-        ticker            TEXT NOT NULL,
-        side              TEXT NOT NULL,
-        direction         TEXT NOT NULL,
-        size_usd          DOUBLE PRECISION NOT NULL,
-        quantity          TEXT,
-        bid               DOUBLE PRECISION,
-        ask               DOUBLE PRECISION,
-        mid               DOUBLE PRECISION,
-        executable_price  DOUBLE PRECISION,
-        spread_bps        DOUBLE PRECISION,
-        spread_cost_usd   DOUBLE PRECISION,
-        order_type        TEXT NOT NULL,
-        status            TEXT NOT NULL,
-        fill_price        DOUBLE PRECISION,
-        guard_results     JSONB,
-        error             TEXT,
-        raw_response      JSONB,
-        simulated         BOOLEAN NOT NULL DEFAULT FALSE,
-        created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-"""
-
-_CREATE_ORDER_LOG_LOOKUP_IDX = (
-    "CREATE INDEX IF NOT EXISTS idx_trading_order_log_lookup "
-    "ON trading_order_log (venue, client_order_id, status)"
-)
-_CREATE_ORDER_LOG_RECENT_IDX = (
-    "CREATE INDEX IF NOT EXISTS idx_trading_order_log_recent "
-    "ON trading_order_log (venue, created_at DESC)"
-)
 
 # Single atomic upsert: refreshes the high-water mark, rolls the day (and
 # resets the order counter) when `today` has moved on, and optionally counts
@@ -289,34 +249,26 @@ def _json_or_none(value: Any) -> str | None:
 class PostgresRiskStore:
     """Postgres-backed :class:`RiskStore`.
 
-    Schema is created by ``migrations/versions/robinhood_guards_20260924.py``
-    (run by ``alembic upgrade head`` on every deploy — see deploy.yml). Table
-    creation here is a defensive fallback for a database that hasn't been
-    migrated yet (mirrors the bootstrap pattern in
-    ``trading/wallet_manager.py::WalletManager._ensure_tables``), deferred to
-    first use rather than ``__init__`` so simply constructing a trader (e.g.
-    the unauthenticated ``/system/health`` check) never touches the
-    database.
+    Schema is owned entirely by
+    ``migrations/versions/robinhood_guards_20260924.py`` (run by ``alembic
+    upgrade head`` on every deploy — see deploy.yml). This class does NOT
+    create tables at runtime — GRID has been bitten before by untracked
+    runtime DDL, and a table created ad hoc under the application role can
+    end up with the wrong owner/grants (see the GRANT-footer convention
+    every real migration follows). If ``trading_risk_state`` /
+    ``trading_order_log`` don't exist yet, every method below raises
+    (a plain ``sqlalchemy.exc.ProgrammingError`` — undefined table) instead
+    of silently creating them: orders must fail closed until the migration
+    has actually been applied, not proceed against a schema nobody
+    provisioned on purpose.
     """
 
     def __init__(self, engine: Engine) -> None:
         self.engine = engine
-        self._ensured = False
-
-    def _ensure_tables(self) -> None:
-        if self._ensured:
-            return
-        with self.engine.begin() as conn:
-            conn.execute(text(_CREATE_STATE_SQL))
-            conn.execute(text(_CREATE_ORDER_LOG_SQL))
-            conn.execute(text(_CREATE_ORDER_LOG_LOOKUP_IDX))
-            conn.execute(text(_CREATE_ORDER_LOG_RECENT_IDX))
-        self._ensured = True
 
     def touch(
         self, venue: str, equity: float, today: date, increment_order: bool = False,
     ) -> RiskState:
-        self._ensure_tables()
         with self.engine.begin() as conn:
             row = conn.execute(text(_TOUCH_SQL), {
                 "venue": venue, "equity": float(equity), "today": today,
@@ -325,7 +277,6 @@ class PostgresRiskStore:
         return RiskState(venue, row[0], row[1], row[2], row[3])
 
     def is_duplicate(self, venue: str, client_order_id: str) -> bool:
-        self._ensure_tables()
         with self.engine.connect() as conn:
             row = conn.execute(text(_IS_DUPLICATE_SQL), {
                 "venue": venue, "client_order_id": client_order_id,
@@ -334,7 +285,6 @@ class PostgresRiskStore:
         return row is not None
 
     def log_order(self, venue: str, client_order_id: str, **fields: Any) -> None:
-        self._ensure_tables()
         params: dict[str, Any] = {"venue": venue, "client_order_id": client_order_id}
         for name in _ORDER_LOG_FIELDS:
             params[name] = fields.get(name)
@@ -345,11 +295,17 @@ class PostgresRiskStore:
             with self.engine.begin() as conn:
                 conn.execute(text(_LOG_ORDER_SQL), params)
         except Exception as exc:  # noqa: BLE001 — audit logging must never block an order decision
+            # Note: in practice this branch is unreachable for a genuinely
+            # missing table -- touch() (called earlier in the same
+            # open_position/close_position flow, via check_risk_limits())
+            # already raised and blocked the order before log_order() could
+            # ever be reached. This stays a warn-and-continue for any other
+            # (non-schema) failure, so a logging hiccup never blocks an
+            # already-decided order.
             log.warning("Robinhood order-log insert failed (venue={v}, key={k}): {e}",
                         v=venue, k=client_order_id, e=str(exc))
 
     def get_state(self, venue: str) -> RiskState | None:
-        self._ensure_tables()
         with self.engine.connect() as conn:
             row = conn.execute(text(_GET_STATE_SQL), {"venue": venue}).fetchone()
         if row is None:
@@ -361,7 +317,6 @@ class PostgresRiskStore:
         most recent SELL — a best-effort cost basis from GRID's own order
         log (Robinhood's API exposes none; see
         ``RobinhoodCryptoTrader._settle_wallet_pnl``)."""
-        self._ensure_tables()
         with self.engine.connect() as conn:
             row = conn.execute(text(_AVERAGE_COST_SQL), {
                 "venue": venue, "ticker": ticker, "statuses": list(_CONSUMED_STATUSES),
