@@ -32,6 +32,7 @@ Wait — that's wrong. Let's be precise:
 
 from __future__ import annotations
 
+import math
 from datetime import date
 from typing import Any
 
@@ -48,7 +49,6 @@ from sqlalchemy.engine import Engine
 # with any external caller still importing them by name.
 from physics.greeks import black_scholes as _bs
 from store.availability import unavailable
-
 
 # ── Black-Scholes Greeks (shims over physics/greeks/black_scholes) ───────────
 
@@ -147,7 +147,7 @@ class DealerGammaEngine:
             return {"error": f"No options data for {ticker} on {snap_date}", "ticker": ticker}
 
         spot = self._get_spot(ticker, snap_date)
-        if spot <= 0:
+        if not math.isfinite(spot) or spot <= 0:
             # Explicitly unavailable (store/availability contract); `error`
             # stays because every consumer keys on it.
             result = unavailable(
@@ -426,7 +426,13 @@ class DealerGammaEngine:
                 "d": snap_date,
             }).fetchone()
 
-        return float(row[0]) if row else 0.0
+        if not row:
+            return 0.0
+        try:
+            spot = float(row[0])
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        return spot if math.isfinite(spot) and spot > 0 else 0.0
 
     # ── Convenience methods ──────────────────────────────────────────
 
