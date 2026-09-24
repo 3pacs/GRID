@@ -425,8 +425,11 @@ def build_posture(
             if nearest else "No high-impact catalyst in lookahead window"
         )
         invalidation = (
-            "SPY reclaims gamma flip level and holds for 2 consecutive sessions "
-            "AND aggregate GEX crosses back above zero"
+            "SPY closes back above the gamma flip level for 2 consecutive "
+            "sessions, confirmed by the next recomputed aggregate GEX being "
+            "positive (spot above the flip and GEX > 0 are the same event "
+            "under the standard convention — this checks it held, not just "
+            "wicked through)"
         )
     elif regime.regime == "LONG_GAMMA":
         lever = (
