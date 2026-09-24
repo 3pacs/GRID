@@ -1,4 +1,4 @@
-# Provisional signal-evaluation price contract (sig-eval-2-dryrun)
+# Provisional signal-evaluation price contract (sig-eval-3-dryrun)
 
 This is an isolated, manual, read-only evaluator. It has no schema migration,
 persistence path, imported production call site, provider call, or scheduler
@@ -20,8 +20,11 @@ It does not infer basis from `feature_registry` or `resolved_series`: the
 entity map can send both `close` and `adj_close` into the same feature, while
 resolved rows omit raw `series_id`.
 
-The evaluator currently assumes a four-calendar-day maximum gap between
-requested day and observed bar; a calendar-day horizon; and an after-16:00
+The evaluator requires an exact-date entry and exact-date exit bar: a latest
+bar before the entry target predates signal availability, and a bar before
+the exit target cannot stand in for the nominal horizon. On weekends or
+holidays this conservatively yields an ineligible result; it does not infer
+the next tradable session. It assumes a calendar-day horizon and an after-16:00
 New York timestamp becoming eligible on the following **calendar** date.
 These are versioned dry-run assumptions, not approved exchange-calendar or
 execution policy. The signal entry date is at least its `signal_date` and
@@ -40,7 +43,11 @@ values and rejects naive timestamps. This avoids claiming a blanket SQL
 tested against a real database in this branch.
 
 An immature horizon remains `UNRESOLVED` without fetching an exit. A stale
-entry or stale/same exit is `INELIGIBLE`, never `NO_MOVE`. A later provider
+entry or stale/same exit is `INELIGIBLE`, never `NO_MOVE`. Dead-band and cost
+parameters must be finite and within declared bounds. The input record has
+no origin tag and all outcomes remain `unknown` because no row-level origin
+proof is read.
+A later provider
 pull cannot retroactively establish a bar was known on an earlier day.
 Historical bars first pulled after the cutoff will be absent by design;
 without a verified raw-basis cutover, the cohort cannot have priced outcomes.

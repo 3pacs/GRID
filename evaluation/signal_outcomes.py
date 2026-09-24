@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
+from math import isfinite
 from zoneinfo import ZoneInfo
 from typing import Callable, Iterable, Optional
 
@@ -30,8 +31,7 @@ from typing import Callable, Iterable, Optional
 # Versioning
 # ---------------------------------------------------------------------------
 
-EVALUATION_VERSION: str = "sig-eval-2-dryrun"
-MAX_BAR_GAP_DAYS = 4  # provisional calendar-day assumption, not market policy
+EVALUATION_VERSION: str = "sig-eval-3-dryrun"
 MARKET_TZ = ZoneInfo("America/New_York")
 
 # ---------------------------------------------------------------------------
@@ -40,7 +40,7 @@ MARKET_TZ = ZoneInfo("America/New_York")
 
 DIRECTIONS = ("BUY", "SELL", "NEUTRAL", "UNKNOWN")
 OUTCOMES = ("CORRECT", "WRONG", "NO_MOVE", "UNRESOLVED", "INELIGIBLE")
-ORIGIN_TAGS = ("synthetic", "backfill", "live", "unknown")
+ORIGIN_TAGS = ("unknown",)  # no row-level origin provenance in this dry run
 
 # eligibility_reason vocabulary (INELIGIBLE only) — not exhaustive by design,
 # callers may pass through other short snake_case reasons, but these are the
@@ -53,6 +53,14 @@ REASON_PRICE_OUT_OF_BOUNDS = "price_outside_sanity_bounds"
 REASON_STALE_ENTRY = "stale_entry_bar"
 REASON_STALE_EXIT = "stale_exit_bar"
 REASON_UNVERIFIED_KNOWN_AT = "known_at_unverified"
+
+
+def validate_scoring_parameters(dead_band_pct: float, cost_bps: float) -> None:
+    """Refuse values that make directional comparisons or returns meaningless."""
+    if not isfinite(dead_band_pct) or not 0 <= dead_band_pct <= 100:
+        raise ValueError("dead_band_pct must be finite and between 0 and 100")
+    if not isfinite(cost_bps) or not 0 <= cost_bps <= 10_000:
+        raise ValueError("cost_bps must be finite and between 0 and 10000")
 
 
 class UnsupportedInstrumentError(Exception):
@@ -76,8 +84,8 @@ class SignalRecord:
 
     ``signal_source_id`` is provenance only in this dry-run implementation.
 
-    ``origin_tag`` is passed in from the record's own metadata by the
-    caller — it is never inferred/guessed by this module.
+    Origin is deliberately omitted: the selected source rows carry no
+    verified row-level origin provenance.
     """
 
     source_type: str
@@ -86,7 +94,6 @@ class SignalRecord:
     direction: str  # one of DIRECTIONS
     horizon_days: int
     signal_source_id: Optional[int] = None
-    origin_tag: str = "unknown"  # one of ORIGIN_TAGS
     metadata: dict = field(default_factory=dict)
     known_at: Optional[datetime] = None  # source publication timestamp, if proven
     created_at: Optional[datetime] = None  # conservative ingestion-time proxy
@@ -174,7 +181,7 @@ def _ineligible(record: SignalRecord, reason: str, *, dead_band_pct: float, cost
         direction=record.direction,
         horizon_days=record.horizon_days,
         evaluation_version=EVALUATION_VERSION,
-        origin_tag=record.origin_tag,
+        origin_tag="unknown",
         dead_band_pct=dead_band_pct,
         cost_bps=cost_bps,
         entry_price=entry.price if entry else None,
@@ -257,6 +264,8 @@ def evaluate_signal(
     if today is None:
         today = datetime.now(MARKET_TZ).date()
 
+    validate_scoring_parameters(dead_band_pct, cost_bps)
+
     if isinstance(record.signal_date, datetime) or not isinstance(record.signal_date, date):
         raise TypeError("signal_date must be a normalized DATE")
 
@@ -295,7 +304,10 @@ def evaluate_signal(
     if entry.basis != "raw_close":
         return _ineligible(record, REASON_UNSUPPORTED_INSTRUMENT, dead_band_pct=dead_band_pct, cost_bps=cost_bps, entry=entry)
 
-    if not isinstance(entry.bar_date, date) or isinstance(entry.bar_date, datetime) or entry.bar_date > entry_as_of or (entry_as_of - entry.bar_date).days > MAX_BAR_GAP_DAYS:
+    # The accessor returns the latest bar at or before the target. An older
+    # close cannot be an entry after the signal became available. Without a
+    # verified next-session calendar, only an exact-date bar is eligible.
+    if not isinstance(entry.bar_date, date) or isinstance(entry.bar_date, datetime) or entry.bar_date != entry_as_of:
         return _ineligible(record, REASON_STALE_ENTRY, dead_band_pct=dead_band_pct, cost_bps=cost_bps, entry=entry)
     if entry.price <= 0:
         return _ineligible(record, REASON_PRICE_OUT_OF_BOUNDS, dead_band_pct=dead_band_pct, cost_bps=cost_bps, entry=entry)
@@ -314,7 +326,7 @@ def evaluate_signal(
             signal_source_id=record.signal_source_id, source_type=record.source_type,
             instrument=record.instrument, signal_date=record.signal_date,
             direction=record.direction, horizon_days=record.horizon_days,
-            evaluation_version=EVALUATION_VERSION, origin_tag=record.origin_tag,
+            evaluation_version=EVALUATION_VERSION, origin_tag="unknown",
             dead_band_pct=dead_band_pct, cost_bps=cost_bps,
             entry_price=entry.price, entry_price_date=entry.bar_date,
             entry_price_basis=entry.basis, exit_price=None, exit_price_date=None,
@@ -333,7 +345,9 @@ def evaluate_signal(
     if exit_.basis != "raw_close":
         return _ineligible(record, REASON_UNSUPPORTED_INSTRUMENT, dead_band_pct=dead_band_pct, cost_bps=cost_bps, entry=entry)
 
-    if not isinstance(exit_.bar_date, date) or isinstance(exit_.bar_date, datetime) or exit_.bar_date > exit_as_of or exit_.bar_date <= entry.bar_date or (exit_as_of - exit_.bar_date).days > MAX_BAR_GAP_DAYS:
+    # An earlier bar cannot stand in for the nominal horizon. An exact-date
+    # exit is the only eligible case until session rules are established.
+    if not isinstance(exit_.bar_date, date) or isinstance(exit_.bar_date, datetime) or exit_.bar_date != exit_as_of or exit_.bar_date <= entry.bar_date:
         return _ineligible(record, REASON_STALE_EXIT, dead_band_pct=dead_band_pct, cost_bps=cost_bps, entry=entry)
 
     if not (lo <= exit_.price <= hi):
@@ -353,7 +367,7 @@ def evaluate_signal(
         direction=record.direction,
         horizon_days=record.horizon_days,
         evaluation_version=EVALUATION_VERSION,
-        origin_tag=record.origin_tag,
+        origin_tag="unknown",
         dead_band_pct=dead_band_pct,
         cost_bps=cost_bps,
         entry_price=entry.price,
@@ -498,8 +512,3 @@ def summarize_outcomes(outcomes: Iterable[SignalOutcomeRecord]) -> CohortSummary
         baseline_by_horizon=baseline_by_horizon,
         origin_tag_counts=origin_tag_counts,
     )
-
-
-def filter_by_origin_tag(outcomes: Iterable[SignalOutcomeRecord], origin_tag: str) -> list[SignalOutcomeRecord]:
-    """Convenience: pull out just one origin_tag's records (e.g. 'synthetic') for a separate cohort summary."""
-    return [o for o in outcomes if o.origin_tag == origin_tag]

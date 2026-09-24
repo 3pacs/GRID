@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 
 from evaluation.signal_outcomes import PricePoint, SignalRecord, evaluate_signal
+from evaluation.prices import PITPriceAccessor
 
 
 def rec(**kw):
@@ -107,3 +108,79 @@ def test_adjusted_close_basis_is_refused():
 def test_horizon_must_be_positive():
     with pytest.raises(ValueError, match="positive"):
         evaluate_signal(rec(horizon_days=0), accessor({}, []))
+
+
+def test_direct_record_cannot_assert_unverified_live_origin():
+    with pytest.raises(TypeError):
+        rec(origin_tag="live")
+
+
+class _RawResult:
+    def __init__(self, row):
+        self.row = row
+
+    def fetchone(self):
+        return self.row
+
+
+class _RawEngine:
+    """Fake SQL transport exercising the real PITPriceAccessor selection path."""
+
+    def __init__(self, bars):
+        self.bars = bars
+        self.requests = []
+
+    def connect(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def execute(self, query, params):
+        self.requests.append((str(query), params))
+        candidates = [bar for bar in self.bars if bar[0] <= params["as_of"] and
+                      params["verified_since"] <= bar[3] <= params["cutoff"]]
+        return _RawResult(max(candidates, key=lambda bar: (bar[0], bar[3])) if candidates else None)
+
+
+def _raw_bar(day, value):
+    return (day, value, "YF:AAA:close", datetime(day.year, day.month, day.day, 22, tzinfo=timezone.utc))
+
+
+def _real_accessor(bars):
+    engine = _RawEngine(bars)
+    verified = datetime(2026, 8, 1, tzinfo=timezone.utc)  # test fixture, not live cutover evidence
+    return PITPriceAccessor(engine, verified_raw_close_since=verified), engine
+
+
+def test_real_accessor_friday_close_cannot_be_post_known_weekend_entry():
+    prices, engine = _real_accessor([_raw_bar(date(2026, 9, 4), 100)])
+    signal = rec(signal_date=date(2026, 9, 4),
+                 created_at=datetime(2026, 9, 4, 21, 30, tzinfo=timezone.utc))
+    result = evaluate_signal(signal, prices, today=date(2026, 9, 15))
+    assert result.outcome == "INELIGIBLE"
+    assert result.eligibility_reason == "stale_entry_bar"
+    assert engine.requests[0][1]["as_of"] == date(2026, 9, 5)
+
+
+def test_real_accessor_early_exit_cannot_score_nominal_horizon():
+    prices, engine = _real_accessor([_raw_bar(date(2026, 9, 1), 100),
+                                    _raw_bar(date(2026, 9, 3), 110)])
+    result = evaluate_signal(rec(), prices, today=date(2026, 9, 15))
+    assert result.outcome == "INELIGIBLE"
+    assert result.eligibility_reason == "stale_exit_bar"
+    assert engine.requests[-1][1]["as_of"] == date(2026, 9, 6)
+
+
+@pytest.mark.parametrize("band,cost", [
+    (float("nan"), 0), (float("inf"), 0), (-1, 0), (101, 0),
+    (1, float("nan")), (1, float("inf")), (1, -1), (1, 10001),
+])
+def test_invalid_scoring_parameters_refused_before_price_lookup(band, cost):
+    calls = []
+    with pytest.raises(ValueError):
+        evaluate_signal(rec(), accessor({}, calls), dead_band_pct=band, cost_bps=cost)
+    assert calls == []
