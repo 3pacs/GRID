@@ -17,6 +17,8 @@ def _dated_spy() -> dict:
     today = date.today()
     captured = datetime.combine(today, datetime.min.time(), timezone.utc) + timedelta(hours=1)
     return {
+        "estimated": True,
+        "basis": "options_open_interest_with_assumed_dealer_sign_and_black_scholes",
         "spot": 767.12, "spot_source": "spy_close_receipt",
         "spot_basis": "prior_completed_unadjusted_close",
         "spot_receipt_id": 123, "spot_obs_date": (today - timedelta(days=1)).isoformat(),
@@ -24,6 +26,8 @@ def _dated_spy() -> dict:
         "spot_receipt_created_at": (datetime.combine(today, datetime.min.time(), timezone.utc) + timedelta(minutes=30)).isoformat(),
         "spot_release_date": today.isoformat(), "spot_vintage_date": today.isoformat(),
         "snap_date": today.isoformat(), "chain_snap_date": today.isoformat(),
+        "chain_batch_id": "11111111-1111-4111-8111-111111111111",
+        "chain_capture_completed_at": (captured + timedelta(minutes=1)).isoformat(),
         "chain_created_at": captured.isoformat(),
         "chain_created_at_max": captured.isoformat(),
     }

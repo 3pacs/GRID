@@ -14,6 +14,7 @@ import json
 import math
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from uuid import UUID
 
 from loguru import logger as log
 from sqlalchemy import text
@@ -21,7 +22,7 @@ from sqlalchemy.engine import Engine
 
 from store.availability import unavailable
 
-SPOT_CONTRACT = "spy_receipt_chain_pit_v2"
+SPOT_CONTRACT = "spy_receipt_chain_batch_pit_v3"
 
 
 def valid_spy_gex_profile(profile: Any, briefing_date: date) -> bool:
@@ -33,6 +34,8 @@ def valid_spy_gex_profile(profile: Any, briefing_date: date) -> bool:
             or profile.get("spot_basis") != "prior_completed_unadjusted_close"
             or not isinstance(spot, (int, float)) or isinstance(spot, bool)
             or not math.isfinite(spot) or spot <= 0
+            or profile.get("estimated") is not True
+            or profile.get("basis") != "options_open_interest_with_assumed_dealer_sign_and_black_scholes"
             or not isinstance(profile.get("spot_receipt_id"), int)
             or profile["spot_receipt_id"] <= 0):
         return False
@@ -45,10 +48,12 @@ def valid_spy_gex_profile(profile: Any, briefing_date: date) -> bool:
         vintage_date = date.fromisoformat(profile["spot_vintage_date"])
         chain_first = datetime.fromisoformat(profile["chain_created_at"])
         chain_last = datetime.fromisoformat(profile["chain_created_at_max"])
-    except (KeyError, TypeError, ValueError):
+        chain_completed = datetime.fromisoformat(profile["chain_capture_completed_at"])
+        UUID(profile["chain_batch_id"])
+    except (KeyError, TypeError, ValueError, AttributeError):
         return False
     if any(ts.tzinfo is None for ts in (
-        available_at, receipt_created_at, chain_first, chain_last,
+        available_at, receipt_created_at, chain_first, chain_last, chain_completed,
     )):
         return False
     return (
@@ -59,11 +64,11 @@ def valid_spy_gex_profile(profile: Any, briefing_date: date) -> bool:
             spot_date + timedelta(days=1), datetime.min.time(), timezone.utc
         )
         and release_date <= chain_date and vintage_date <= chain_date
-        and available_at <= receipt_created_at <= chain_first
-        and available_at <= chain_first <= chain_last <= datetime.now(timezone.utc)
-        and chain_last == chain_first
+        and available_at <= receipt_created_at <= chain_completed
+        and chain_first <= chain_last <= chain_completed <= datetime.now(timezone.utc)
         and chain_first.astimezone(timezone.utc).date() == chain_date
         and chain_last.astimezone(timezone.utc).date() == chain_date
+        and chain_completed.astimezone(timezone.utc).date() == chain_date
     )
 
 # ── DB table DDL ──────────────────────────────────────────────────────

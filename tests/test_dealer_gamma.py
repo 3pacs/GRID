@@ -9,7 +9,6 @@ import pytest
 
 from physics.dealer_gamma import DealerGammaEngine, bs_gamma
 
-
 SNAP_DATE = date(2026, 1, 15)
 RISK_FREE_RATE = 0.01
 SPOT = 100.0
@@ -82,7 +81,9 @@ def _compute_profile(
     chain = pd.DataFrame(rows)
     chain_time = datetime.combine(SNAP_DATE, datetime.min.time(), timezone.utc) + timedelta(hours=19)
     chain.attrs.update(snap_date=SNAP_DATE, created_at_min=chain_time,
-                       created_at_max=chain_time)
+                       created_at_max=chain_time,
+                       batch_id="11111111-1111-4111-8111-111111111111",
+                       capture_completed_at=chain_time + timedelta(minutes=1))
     engine = DealerGammaEngine(MagicMock(), risk_free_rate=RISK_FREE_RATE)
     monkeypatch.setattr(engine, "_load_chain", lambda _ticker, _snap_date: chain)
     monkeypatch.setattr(engine, "_get_spot_receipt", lambda _ticker, _time: {

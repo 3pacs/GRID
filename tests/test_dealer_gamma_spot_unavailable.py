@@ -81,7 +81,9 @@ def _chain() -> pd.DataFrame:
     ])
     captured = datetime(2026, 9, 24, 19, tzinfo=timezone.utc)
     chain.attrs.update(snap_date=SNAP_DATE, created_at_min=captured,
-                       created_at_max=captured)
+                       created_at_max=captured,
+                       batch_id="11111111-1111-4111-8111-111111111111",
+                       capture_completed_at=captured + timedelta(minutes=1))
     return chain
 
 

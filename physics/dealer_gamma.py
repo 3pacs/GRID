@@ -35,6 +35,7 @@ from __future__ import annotations
 import math
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from uuid import UUID
 
 import numpy as np
 import pandas as pd
@@ -146,8 +147,8 @@ class DealerGammaEngine:
         if chain.empty:
             return {"error": f"No options data for {ticker} on {snap_date}", "ticker": ticker}
 
-        chain_created_at = chain.attrs.get("created_at_min")
-        spot_receipt = self._get_spot_receipt(ticker, chain_created_at)
+        chain_completed_at = chain.attrs.get("capture_completed_at")
+        spot_receipt = self._get_spot_receipt(ticker, chain_completed_at)
         if spot_receipt is None:
             # Explicitly unavailable (store/availability contract); `error`
             # stays because every consumer keys on it.
@@ -163,7 +164,7 @@ class DealerGammaEngine:
         # Compute per-strike Greeks and GEX
         per_strike = self._compute_per_strike(chain, spot)
 
-        # Aggregate GEX at current spot
+        # Aggregate GEX at the prior verified close used as reference spot
         gex_agg = sum(s["net_gex"] for s in per_strike)
 
         # Find gamma flip (spot where GEX crosses zero)
@@ -203,7 +204,9 @@ class DealerGammaEngine:
             "ticker": ticker,
             "snap_date": str(snap_date),
             "chain_snap_date": chain.attrs["snap_date"].isoformat(),
-            "chain_created_at": chain_created_at.isoformat(),
+            "chain_batch_id": chain.attrs["batch_id"],
+            "chain_capture_completed_at": chain_completed_at.isoformat(),
+            "chain_created_at": chain.attrs["created_at_min"].isoformat(),
             "chain_created_at_max": chain.attrs["created_at_max"].isoformat(),
             "spot": round(spot, 2),
             "spot_source": "spy_close_receipt",
@@ -394,13 +397,14 @@ class DealerGammaEngine:
         """Load only the requested day's chain; reject mixed or late captures.
 
         The daily unique key uses ON CONFLICT DO NOTHING, so a retry can leave
-        rows from multiple pulls under one snap_date. Such a chain has no
-        defensible single known-at time and is unavailable.
+        rows from multiple pulls under one snap_date. Only one fully completed
+        pull batch is eligible. Legacy rows without batch provenance fail closed.
         """
         with self.engine.connect() as conn:
             rows = conn.execute(text("""
                 SELECT strike, opt_type, open_interest, implied_vol AS implied_volatility,
-                       expiry, (expiry - :snap_date) AS dte, created_at
+                       expiry, (expiry - :snap_date) AS dte, created_at,
+                       capture_batch_id, capture_completed_at
                 FROM options_snapshots
                 WHERE ticker = :ticker AND snap_date = :snap_date
                 ORDER BY expiry, strike, opt_type
@@ -410,56 +414,70 @@ class DealerGammaEngine:
             return pd.DataFrame()
 
         created = [row[6] for row in rows]
+        batches = {row[7] for row in rows}
+        completions = {row[8] for row in rows}
         now = datetime.now(timezone.utc)
         if (any(not isinstance(ts, datetime) or ts.tzinfo is None for ts in created)
-                or snap_date > now.date()):
+                or len(batches) != 1 or not next(iter(batches))
+                or len(completions) != 1):
+            return pd.DataFrame()
+        batch_id = next(iter(batches))
+        completed_at = next(iter(completions))
+        try:
+            UUID(batch_id)
+        except (TypeError, ValueError, AttributeError):
+            return pd.DataFrame()
+        if not isinstance(completed_at, datetime) or completed_at.tzinfo is None:
             return pd.DataFrame()
         first, last = min(created), max(created)
         if (first.astimezone(timezone.utc).date() != snap_date
                 or last.astimezone(timezone.utc).date() != snap_date
-                or last > now or last != first):
+                or completed_at.astimezone(timezone.utc).date() != snap_date
+                or completed_at > now or completed_at < last):
             return pd.DataFrame()
 
         df = pd.DataFrame(rows, columns=["strike", "opt_type", "open_interest",
                                           "implied_volatility", "expiry", "dte",
-                                          "created_at"])
+                                          "created_at", "capture_batch_id",
+                                          "capture_completed_at"])
         df["dte"] = df["dte"].apply(lambda x: x.days if hasattr(x, 'days') else int(x))
         df = df[(df["dte"] > 0)
                 & (df["open_interest"] > 0)
                 & (df["implied_volatility"] > 0)].copy()
-        df.attrs.update(snap_date=snap_date, created_at_min=first,
-                        created_at_max=last)
+        df.attrs.update(snap_date=snap_date, batch_id=batch_id,
+                        capture_completed_at=completed_at,
+                        created_at_min=first, created_at_max=last)
         return df
 
-    def _get_spot_receipt(self, ticker: str, chain_created_at: datetime | None) -> dict | None:
-        """Use only a verified SPY close known before the actual chain capture.
+    def _get_spot_receipt(self, ticker: str, chain_completed_at: datetime | None) -> dict | None:
+        """Use only a verified SPY close known before pull completion.
 
         The shared receipt verifier checks raw/resolved identity, the unadjusted
         price basis, the post-observation-day marker, and a four-calendar-day
         maximum age. Other tickers have no equivalent receipt contract yet.
         """
-        if ticker != "SPY" or chain_created_at is None:
+        if ticker != "SPY" or chain_completed_at is None:
             return None
         from store.astrogrid import AstroGridStore
 
         with self.engine.connect() as conn:
             receipt = AstroGridStore(self.engine)._verified_spy_receipt(
-                conn, cutoff=chain_created_at, mode="entry")
+                conn, cutoff=chain_completed_at, mode="entry")
         if receipt is None:
             return None
         created = receipt.get("receipt_created_at")
         available = receipt.get("available_at")
         observed = receipt.get("obs_date")
         price = receipt.get("price")
-        chain_day = chain_created_at.astimezone(timezone.utc).date()
+        chain_day = chain_completed_at.astimezone(timezone.utc).date()
         if (not isinstance(created, datetime) or created.tzinfo is None
                 or not isinstance(available, datetime) or available.tzinfo is None
                 or not isinstance(observed, date)
                 or not 1 <= (chain_day - observed).days <= 4
                 or available < datetime.combine(
                     observed + timedelta(days=1), datetime.min.time(), timezone.utc)
-                or available > chain_created_at
-                or not available <= created <= chain_created_at
+                or available > chain_completed_at
+                or not available <= created <= chain_completed_at
                 or not isinstance(price, (int, float)) or not math.isfinite(price)
                 or price <= 0
                 or receipt.get("conflict_flag") is not False
