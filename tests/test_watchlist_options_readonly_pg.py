@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 from urllib.parse import urlparse
 
@@ -15,7 +16,7 @@ from sqlalchemy import create_engine, event, text
 os.environ.setdefault("DB_PASSWORD", "test-password")
 
 from api.auth import require_auth  # noqa: E402
-from api.routers.options import router  # noqa: E402
+from api.routers.options import _serialize_saved_recommendation, router  # noqa: E402
 
 
 @pytest.fixture
@@ -55,6 +56,12 @@ def _capture(engine):
 
     event.listen(engine, "before_cursor_execute", record)
     return statements, record
+
+
+def test_saved_timestamp_is_serialized_in_utc():
+    row = [None] * 15
+    row[13] = datetime(2026, 9, 24, 0, 30, tzinfo=timezone(timedelta(hours=14)))
+    assert _serialize_saved_recommendation(row)["generated_at"] == "2026-09-23T10:30:00+00:00"
 
 
 def test_saved_populated_and_checked_empty_gets_are_select_only(isolated_db):
@@ -142,6 +149,38 @@ def test_newest_saved_timestamp_is_not_the_highest_confidence_row(isolated_db):
     assert body["scan_summary"]["data_status"] == "recent_saved"
     assert body["scan_summary"]["age_seconds"] < 2 * 3600
     assert body["generated_at"] == body["recommendations"][1]["generated_at"]
+
+
+def test_page_status_excludes_recent_row_beyond_confidence_limit(isolated_db):
+    engine = isolated_db
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE options_recommendations (
+                ticker TEXT, direction TEXT, strike NUMERIC, expiry DATE,
+                entry_price NUMERIC, target_price NUMERIC, stop_loss NUMERIC,
+                expected_return NUMERIC, kelly_fraction NUMERIC, confidence NUMERIC,
+                thesis TEXT, sanity_status JSONB, dealer_context TEXT,
+                generated_at TIMESTAMPTZ, outcome TEXT
+            )
+        """))
+        conn.execute(text("""
+            INSERT INTO options_recommendations
+                (ticker, confidence, thesis, generated_at, outcome)
+            SELECT 'AAPL', 0.9, 'old displayed', NOW() - INTERVAL '10 days', 'OPEN'
+            FROM generate_series(1, 50)
+        """))
+        conn.execute(text("""
+            INSERT INTO options_recommendations
+                (ticker, confidence, thesis, generated_at, outcome)
+            VALUES ('AAPL', 0.1, 'recent hidden', NOW() - INTERVAL '1 hour', 'OPEN')
+        """))
+    with patch("api.routers.options.get_db_engine", return_value=engine):
+        body = _client().get("/api/v1/options/recommendations?ticker=AAPL").json()
+    assert len(body["recommendations"]) == 50
+    assert all(row["data_status"] == "stale" for row in body["recommendations"])
+    assert body["scan_summary"]["status_scope"] == "returned_recommendations"
+    assert body["scan_summary"]["data_status"] == "stale"
+    assert body["generated_at"] == body["recommendations"][0]["generated_at"]
 
 
 def test_missing_table_reports_unavailable_without_bootstrap(isolated_db):

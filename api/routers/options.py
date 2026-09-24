@@ -29,6 +29,13 @@ def _saved_age_status(when: Any, now: datetime) -> tuple[str, int | None]:
     )
 
 
+def _utc_timestamp(when: Any) -> str | None:
+    """Only label an aware saved timestamp as UTC after converting it."""
+    if not isinstance(when, datetime) or when.tzinfo is None:
+        return None
+    return when.astimezone(timezone.utc).isoformat()
+
+
 # ── Recommendation helpers ───────────────────────────────────
 
 
@@ -143,7 +150,7 @@ def _serialize_saved_recommendation(row: Any) -> dict[str, Any]:
         "thesis": row[10],
         "sanity_status": sanity_status,
         "dealer_context": row[12],
-        "generated_at": row[13].isoformat() if row[13] else None,
+        "generated_at": _utc_timestamp(row[13]),
         "outcome": row[14],
     }
 
@@ -161,8 +168,7 @@ def _load_saved_recommendations(
         query = (
             "SELECT ticker, direction, strike, expiry, entry_price, target_price, "
             "stop_loss, expected_return, kelly_fraction, confidence, thesis, "
-            "sanity_status, dealer_context, generated_at, outcome, "
-            "MAX(generated_at) OVER () AS latest_saved_at "
+            "sanity_status, dealer_context, generated_at, outcome "
             "FROM options_recommendations "
             "WHERE (outcome IS NULL OR outcome = 'OPEN')"
         )
@@ -179,9 +185,14 @@ def _load_saved_recommendations(
         now = datetime.now(timezone.utc)
         for recommendation, row in zip(recommendations, rows):
             recommendation["data_status"], recommendation["age_seconds"] = _saved_age_status(row[13], now)
-        latest_saved = rows[0][15] if rows else None
+        # The envelope describes the displayed, confidence-ranked page. A newer
+        # recommendation beyond LIMIT must not make an all-stale page look fresh.
+        latest_saved = max(
+            (row[13] for row in rows if isinstance(row[13], datetime) and row[13].tzinfo),
+            default=None,
+        )
         data_status, age_seconds = _saved_age_status(latest_saved, now)
-        generated_at = latest_saved.isoformat() if isinstance(latest_saved, datetime) else None
+        generated_at = _utc_timestamp(latest_saved)
         if not recommendations:
             data_status = "missing"
         return (
@@ -193,6 +204,7 @@ def _load_saved_recommendations(
                 "source": "persisted" if recommendations else "missing",
                 "fresh_scan": False,
                 "data_status": data_status,
+                "status_scope": "returned_recommendations",
                 "age_seconds": age_seconds,
                 "stale_after_seconds": int(SAVED_RECOMMENDATION_MAX_AGE.total_seconds()),
                 "reason": "saved_recommendations" if recommendations else "no_saved_recommendations",
