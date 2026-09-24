@@ -22,24 +22,34 @@ EASTERN = ZoneInfo("America/New_York")
 # dev checkout (``resolve_prereg_sha256`` in storage.py). Production never
 # re-reads this file — it carries the hash below as a pinned constant.
 PREREG_RELATIVE_PATH = Path("docs/paper_log/gex-levels-v1-preregistration.md")
-# Amendment 1 (2951e4cc, 2026-09-24) landed before any session was logged —
-# the document's own rule ("nothing below may change after the first
-# logged session") explicitly permits this, and the amendment says so
-# itself. PREREG_COMMIT/PREREG_SHA256 below are pinned to the AMENDED
-# text — the only text that will ever back a real (non-smoke) record.
-PREREG_COMMIT = "2951e4cc"
+# The pre-registration has been amended twice, both times before any
+# session was logged — the document's own rule ("nothing below may change
+# after the first logged session") explicitly permits this, and each
+# amendment says so itself. PREREG_COMMIT/PREREG_SHA256 below are pinned
+# to the CURRENT amended text — the only text that will ever back a real
+# (non-smoke) record. History, in case anything needs to be traced back:
+#   47c05fc8 — original registration
+#   2951e4cc — Amendment 1 items 1-4 (tested walls, narrower
+#              engine_unavailable, data_unavailable/no_preopen, wording)
+#   07ef4a3c — Amendment 1 item 5 (tested walls computed contract by
+#              contract, matching what tested_walls.py already did; notes
+#              the pinned engine must compute regime the same way as flip)
+PREREG_COMMIT = "07ef4a3c"
 
 # SHA-256 of the pre-registration file's exact committed bytes (LF line
 # endings), computed once and pinned here so the value written into the
 # first JSONL record never depends on a working copy's line endings or on
 # git being available at run time:
 #
-#   git show 2951e4cc:docs/paper_log/gex-levels-v1-preregistration.md | sha256sum
+#   git show 07ef4a3c:docs/paper_log/gex-levels-v1-preregistration.md | sha256sum
 #
 # Verified 2026-09-24 to match both `git show <commit>:<path>` and the
 # working copy (repo core.autocrlf=true did not rewrite this particular
-# file — confirmed independently rather than assumed).
-PREREG_SHA256 = "551c4643cdcc7f7f30c509956b00e03fcaa1554c0ed1baf195e55372cc629acb"
+# file — confirmed independently rather than assumed). Recompute and
+# update both PREREG_COMMIT and PREREG_SHA256 together if the
+# pre-registration is ever amended again before the first logged session
+# — never let one change without the other.
+PREREG_SHA256 = "8e4ce28ba9fc3479449f04e278532273224bce14edacfae14ab060329b8087f6"
 
 # ── Schedule / lateness gate ─────────────────────────────────────────────
 # "A session counts only if its pre-open record was written before 09:30

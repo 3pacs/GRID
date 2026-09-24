@@ -30,6 +30,17 @@ but, unlike that private method, never falls back to a different
 ``snap_date`` — the caller has already resolved a PIT-safe `snap_date` via
 ``chain.select_chain_snapshot``, and a silent fallback here would
 reopen exactly the leak that guards against.
+
+Amendment 1 item 5 (07ef4a3c) confirms and makes explicit a property this
+module already had: gamma is computed *contract by contract* —
+:func:`aggregate_per_strike_gex` derives ``T`` from each row's own
+``expiry`` and uses each row's own ``implied_volatility``, never a
+strike-grouped first-row value applied to the strike's whole open
+interest. That grouped shortcut is the separate bug item 5 describes in
+``DealerGammaEngine._compute_per_strike`` itself (one expiry's
+time-to-expiry applied to all OI at a strike, on top of the 30-row cap) —
+a fix for the pinned engine, tracked on the `fix/dealer-gamma-sign-spot-
+20260924` lane, not something this module needed to change.
 """
 
 from __future__ import annotations
