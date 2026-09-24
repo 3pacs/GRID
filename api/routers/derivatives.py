@@ -33,6 +33,21 @@ def _get_gex_engine():
     return DealerGammaEngine(get_db_engine())
 
 
+def _verified_gex_profile(profile: dict[str, Any]) -> bool:
+    """Require the current completed SPY chain/close contract at API edges."""
+    from ollama.dealer_flow_briefing import valid_spy_gex_profile
+
+    return valid_spy_gex_profile(profile, date.today())
+
+
+def _gex_provenance(profile: dict[str, Any]) -> dict[str, Any]:
+    return {key: profile[key] for key in (
+        "estimated", "basis", "spot_source", "spot_basis", "spot_obs_date",
+        "spot_available_at", "spot_receipt_id", "chain_snap_date",
+        "chain_batch_id", "chain_capture_completed_at",
+    )}
+
+
 # ── GET /overview ────────────────────────────────────────────────────
 
 @router.get("/overview")
@@ -101,7 +116,7 @@ async def get_gex(ticker: str) -> dict[str, Any]:
 
 @router.get("/regime")
 async def get_regime() -> dict[str, Any]:
-    """Current dealer regime with plain-English interpretation.
+    """Estimated SPY gamma regime with source and model provenance.
 
     Computes SPY GEX and returns regime classification plus explanation
     of what it means for market dynamics.
@@ -110,26 +125,36 @@ async def get_regime() -> dict[str, Any]:
         engine_gex = _get_gex_engine()
         spy = engine_gex.compute_gex_profile("SPY")
 
+        if spy.get("error") or not _verified_gex_profile(spy):
+            reason = spy.get("reason") or spy.get("error") or "Dated SPY GEX evidence unavailable"
+            result = unavailable(
+                reason, source="dealer_gamma", regime=None,
+                interpretation=None, gex_aggregate=None,
+                gex_normalized=None, gamma_flip=None, spot=None,
+            )
+            result["error"] = reason
+            return result
+
         regime = spy.get("regime", "UNKNOWN")
         interpretations = {
             "LONG_GAMMA": (
-                "Dealers are long gamma. They hedge by selling rallies and buying dips, "
-                "dampening volatility. Expect mean-reversion and range-bound price action. "
-                "Intraday moves tend to fade. Realized vol will likely undershoot implied."
+                "The assumed dealer-sign model estimates positive gamma at the prior "
+                "verified close. If dealer positions match that assumption, hedge "
+                "sensitivity could dampen moves. Actual positions are unknown."
             ),
             "SHORT_GAMMA": (
-                "Dealers are short gamma. They hedge by buying rallies and selling dips, "
-                "amplifying moves in both directions. Expect trend-following dynamics, "
-                "potential breakouts, and elevated realized volatility. Directional risk is high."
+                "The assumed dealer-sign model estimates negative gamma at the prior "
+                "verified close. If dealer positions match that assumption, hedge "
+                "sensitivity could amplify moves. Actual positions are unknown."
             ),
             "NEUTRAL": (
-                "Gamma exposure is near zero. The market is at or near the gamma flip point. "
-                "Small changes in spot could shift dealers from stabilizing to amplifying flows. "
-                "Watch for regime transitions — this is an inflection zone."
+                "The assumed dealer-sign model estimates gamma near zero at the "
+                "prior verified close. Actual dealer positioning is unknown."
             ),
         }
 
         return {
+            **_gex_provenance(spy),
             "regime": regime,
             "interpretation": interpretations.get(regime, "Unable to determine regime."),
             "gex_aggregate": spy.get("gex_aggregate"),
@@ -173,18 +198,18 @@ async def get_walls(ticker: str) -> dict[str, Any]:
 
 @router.get("/vanna-charm/{ticker}")
 async def get_vanna_charm(ticker: str) -> dict[str, Any]:
-    """Decomposed vanna and charm exposures with per-strike breakdown.
+    """Estimated vanna and charm with dated chain/spot provenance.
 
-    Returns aggregate vanna/charm, per-strike decomposition, net dealer
-    delta change from charm decay, days to next OpEx, and a plain-English
-    interpretation of projected dealer hedging flows.
+    Returns modeled sensitivities and per-strike decomposition. It does not
+    infer required hedge orders from open interest.
     """
     try:
         engine_gex = _get_gex_engine()
         result = engine_gex.compute_gex_profile(ticker.upper())
 
-        if result.get("error"):
-            return {"error": result["error"], "ticker": ticker.upper()}
+        if result.get("error") or not _verified_gex_profile(result):
+            return {"error": result.get("error") or "Dated GEX evidence unavailable",
+                    "ticker": ticker.upper()}
 
         vanna = result.get("vanna_exposure")
         charm = result.get("charm_exposure")
@@ -228,26 +253,20 @@ async def get_vanna_charm(ticker: str) -> dict[str, Any]:
         opex = _next_opex(today)
         days_to_opex = (opex - today).days
 
-        # Net dealer delta change: charm accumulates daily until OpEx
-        # charm_exposure is daily delta decay; project forward
-        net_delta_change = round(charm * days_to_opex, 0)
-
-        # Build interpretation
-        action = "sell" if net_delta_change < 0 else "buy"
-        abs_delta_m = abs(net_delta_change) / 1e6
         interpretation = (
-            f"Dealers will need to {action} ~${abs_delta_m:.1f}M delta by "
-            f"{opex.strftime('%b %d')} OpEx due to charm decay"
+            "Vanna and charm are sensitivities from an assumed dealer-sign model. "
+            "Open interest does not establish actual dealer positions or required trades."
         )
 
         return {
+            **_gex_provenance(result),
             "ticker": ticker.upper(),
             "spot": spot,
             "vanna_exposure": vanna,
             "charm_exposure": charm,
             "vanna_by_strike": vanna_by_strike,
             "charm_by_strike": charm_by_strike,
-            "net_dealer_delta_change": net_delta_change,
+            "net_dealer_delta_change": None,
             "interpretation": interpretation,
             "days_to_opex": days_to_opex,
             "opex_date": str(opex),
@@ -565,7 +584,9 @@ async def get_flow_narrative() -> dict[str, Any]:
     # Try the LLM-powered briefing first
     try:
         from ollama.dealer_flow_briefing import (
-            SPOT_CONTRACT, get_latest_flow_briefing, valid_spy_gex_profile,
+            SPOT_CONTRACT,
+            get_latest_flow_briefing,
+            valid_spy_gex_profile,
         )
         result = get_latest_flow_briefing(db)
         positioning = result.get("positioning_data")

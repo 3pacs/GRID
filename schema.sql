@@ -685,6 +685,8 @@ CREATE TABLE IF NOT EXISTS options_snapshots (
     implied_vol     DOUBLE PRECISION,
     in_the_money    BOOLEAN,
     created_at      TIMESTAMPTZ DEFAULT NOW(),
+    capture_batch_id TEXT,
+    capture_completed_at TIMESTAMPTZ,
     UNIQUE (ticker, snap_date, expiry, opt_type, strike)
 );
 

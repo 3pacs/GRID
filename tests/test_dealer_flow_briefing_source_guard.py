@@ -15,6 +15,8 @@ def _dated_spy() -> dict:
     today = date.today()
     captured = datetime.combine(today, datetime.min.time(), timezone.utc) + timedelta(hours=1)
     return {
+        "estimated": True,
+        "basis": "options_open_interest_with_assumed_dealer_sign_and_black_scholes",
         "spot": 767.12, "spot_source": "spy_close_receipt",
         "spot_basis": "prior_completed_unadjusted_close",
         "spot_receipt_id": 123, "spot_obs_date": (today - timedelta(days=1)).isoformat(),
@@ -22,6 +24,8 @@ def _dated_spy() -> dict:
         "spot_receipt_created_at": (datetime.combine(today, datetime.min.time(), timezone.utc) + timedelta(minutes=30)).isoformat(),
         "spot_release_date": today.isoformat(), "spot_vintage_date": today.isoformat(),
         "snap_date": today.isoformat(), "chain_snap_date": today.isoformat(),
+        "chain_batch_id": "11111111-1111-4111-8111-111111111111",
+        "chain_capture_completed_at": (captured + timedelta(minutes=1)).isoformat(),
         "chain_created_at": captured.isoformat(),
         "chain_created_at_max": captured.isoformat(),
     }
@@ -89,8 +93,10 @@ def test_generation_stamps_only_a_verified_dated_spot(
     {"spot_available_at": "2099-01-01T00:00:00+00:00"},
     {"spot_receipt_created_at": "2099-01-01T00:00:00+00:00"},
     {"chain_snap_date": "2099-01-01"},
+    {"chain_batch_id": None},
+    {"chain_capture_completed_at": "2099-01-01T00:00:00+00:00"},
 ])
-def test_v2_guard_rejects_stale_future_or_revised_saved_spot(change: dict) -> None:
+def test_v3_guard_rejects_stale_future_or_revised_saved_spot(change: dict) -> None:
     assert not flow.valid_spy_gex_profile({**_dated_spy(), **change}, date.today())
 
 
@@ -131,9 +137,12 @@ def test_reading_missing_briefing_never_creates_table(
     assert result["stale"] is True
 
 
-def test_legacy_v1_saved_row_is_withheld_even_if_dated_today() -> None:
+@pytest.mark.parametrize("contract", [
+    "resolved_series_only_v1", "spy_receipt_chain_pit_v2",
+])
+def test_legacy_saved_row_is_withheld_even_if_dated_today(contract: str) -> None:
     saved = (date.today(), "Legacy dealer narrative", {
-        "spot_contract": "resolved_series_only_v1",
+        "spot_contract": contract,
         "gex": {"SPY": {"spot": 767.12, "spot_source": "resolved_series"}},
     }, datetime.now(timezone.utc))
     result = flow.get_latest_flow_briefing(_ReadOnlyEngine(saved))

@@ -13,6 +13,7 @@ from __future__ import annotations
 import time
 from datetime import date, datetime, timezone
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -22,7 +23,6 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller
-
 
 # Tickers with listed equity options
 EQUITY_TICKERS: list[str] = [
@@ -200,6 +200,8 @@ class OptionsPuller(BasePuller):
                     implied_vol  DOUBLE PRECISION,
                     in_the_money BOOLEAN,
                     created_at   TIMESTAMPTZ DEFAULT NOW(),
+                    capture_batch_id TEXT,
+                    capture_completed_at TIMESTAMPTZ,
                     UNIQUE (ticker, snap_date, expiry, opt_type, strike)
                 )
             """))
@@ -308,6 +310,8 @@ class OptionsPuller(BasePuller):
             total_call_vol = 0
             total_put_vol = 0
             snap_count = 0
+            batch_id = str(uuid4())
+            complete = True
 
             # Per-expiry IV data for term structure
             expiry_ivs: list[tuple[str, float]] = []
@@ -327,7 +331,10 @@ class OptionsPuller(BasePuller):
                         chain_data = self._yahoo.get_options(ticker, exp_ts)
                         time.sleep(0.2)
                     if not chain_data:
+                        complete = False
                         continue
+                    if not chain_data.get("calls") or not chain_data.get("puts"):
+                        complete = False
 
                     exp_date = datetime.utcfromtimestamp(exp_ts).strftime("%Y-%m-%d")
 
@@ -354,9 +361,9 @@ class OptionsPuller(BasePuller):
                                     "INSERT INTO options_snapshots "
                                     "(ticker, snap_date, expiry, opt_type, strike, "
                                     "last_price, bid, ask, volume, open_interest, "
-                                    "implied_vol, in_the_money) "
+                                    "implied_vol, in_the_money, capture_batch_id) "
                                     "VALUES (:ticker, :snap_date, :expiry, :opt_type, :strike, "
-                                    ":last_price, :bid, :ask, :volume, :oi, :iv, :itm) "
+                                    ":last_price, :bid, :ask, :volume, :oi, :iv, :itm, :batch_id) "
                                     "ON CONFLICT DO NOTHING"
                                 ),
                                 {
@@ -365,6 +372,7 @@ class OptionsPuller(BasePuller):
                                     "strike": strike, "last_price": last_price,
                                     "bid": bid, "ask": ask, "volume": vol,
                                     "oi": oi, "iv": iv, "itm": itm,
+                                    "batch_id": batch_id,
                                 },
                             )
                             snap_count += 1
@@ -398,6 +406,25 @@ class OptionsPuller(BasePuller):
                     ]
                     if atm_ivs:
                         expiry_ivs.append((exp_date, float(np.mean(atm_ivs))))
+
+                if not complete or not snap_count:
+                    raise ValueError("incomplete options chain response")
+
+                # This is wall-clock time after the final provider response.
+                # options_snapshots.created_at uses PostgreSQL transaction-start
+                # NOW(), which is too early to serve as a PIT availability time.
+                # Legacy rows retain NULL completion and fail closed. This
+                # update is in the same transaction as this batch's inserts.
+                conn.execute(text("""
+                    UPDATE options_snapshots
+                    SET capture_completed_at = :completed_at
+                    WHERE ticker = :ticker AND snap_date = :snap_date
+                      AND capture_batch_id = :batch_id
+                """), {
+                    "ticker": ticker, "snap_date": today_str,
+                    "batch_id": batch_id,
+                    "completed_at": datetime.now(timezone.utc),
+                })
 
                 # Compute signals from nearest LIQUID expiration
                 # Skip expiries within 2 days (near-worthless, garbage data)
