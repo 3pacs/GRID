@@ -27,11 +27,14 @@ guess a successor quote or create next-session evidence.
 The signal evaluator now leaves immature horizons unresolved before an exit
 lookup; rejects an old entry, a stopped/same-date exit, adjusted basis, and
 unverified congressional disclosure time. The dry-run rule version assumes
-four calendar days of bar tolerance, calendar-day horizons, and entry on the
+exact-date entry/exit bars, calendar-day horizons, and entry on the
 next calendar date after 16:00 America/New_York. These are exploratory
 assumptions, not approved exchange-session or execution policy. `created_at`
 is used only as an ingestion-time availability proxy; it does not prove public
 publication, especially for congressional transaction dates.
+The exact-date rule is intentionally conservative on weekends and holidays;
+no next-session calendar has been accepted. Scoring parameters require finite
+values within 0..100 percent dead band and 0..10000 basis points cost.
 
 The manual CLI requires explicit source/date bounds and a finite row limit.
 It selects DATE and TIMESTAMPTZ columns with type-specific predicates,
@@ -39,11 +42,14 @@ normalizes typed Python values, and refuses naive timestamps. It has no
 persist option or write function. The constructed PostgreSQL engine enforces
 a read-only transaction default and statement timeout. No database, provider,
 network, or production execution occurred during this work.
+The input record has no origin-tag argument, and every outcome remains
+`unknown` because it reads no verified row-level origin field; there is no
+operator `--origin-tag` assertion.
 
 Verification: `python -m pytest -q tests/test_signal_outcomes.py
 tests/test_evaluation_prices.py tests/test_evaluate_signals_cli.py
 tests/test_alembic_single_head.py tests/test_yfinance_auto_adjust_explicit.py`
-passed 47 tests locally. `git diff --cached --check` passed. Tests used
+passed 65 tests locally after the independent-review fixes. Tests used
 fake engines/accessors; the migration-head and ingestion-basis tests were
 unchanged from the frozen base.
 No PostgreSQL integration proof is claimed. A disposable PostgreSQL read-only

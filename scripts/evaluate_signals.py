@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from evaluation.prices import PITPriceAccessor
-from evaluation.signal_outcomes import EVALUATION_VERSION, SignalRecord, evaluate_signal, summarize_outcomes
+from evaluation.signal_outcomes import EVALUATION_VERSION, SignalRecord, evaluate_signal, summarize_outcomes, validate_scoring_parameters
 
 MARKET_TZ = ZoneInfo("America/New_York")
 _DIRECTION = {"BUY": "BUY", "CLUSTER_BUY": "BUY", "SELL": "SELL"}
@@ -33,10 +33,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--date-to", required=True, type=date.fromisoformat)
     p.add_argument("--limit", type=int, default=200)
     p.add_argument("--horizon-days", type=int, default=5)
-    p.add_argument("--dead-band-pct", type=float, default=1.0)
-    p.add_argument("--cost-bps", type=float, default=0.0)
-    p.add_argument("--origin-tag", choices=("synthetic", "backfill", "live", "unknown"), default="unknown")
+    p.add_argument("--dead-band-pct", type=_finite_band, default=1.0)
+    p.add_argument("--cost-bps", type=_finite_cost, default=0.0)
     return p
+
+
+def _finite_band(value: str) -> float:
+    try:
+        number = float(value)
+        validate_scoring_parameters(number, 0.0)
+        return number
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _finite_cost(value: str) -> float:
+    try:
+        number = float(value)
+        validate_scoring_parameters(0.0, number)
+        return number
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _build_engine(url: str):
@@ -117,27 +134,28 @@ def select_signal_sources(engine, *, source_type: str, date_from: date, date_to:
     return selected
 
 
-def to_signal_record(row: SelectedRow, *, horizon_days: int, origin_tag: str) -> SignalRecord:
+def to_signal_record(row: SelectedRow, *, horizon_days: int) -> SignalRecord:
     return SignalRecord(
         source_type=row.source_type, instrument=row.ticker or "", signal_date=row.signal_date,
         direction=_DIRECTION.get(row.signal_type, "UNKNOWN"), horizon_days=horizon_days,
-        signal_source_id=row.id, origin_tag=origin_tag, created_at=row.created_at,
+        signal_source_id=row.id, created_at=row.created_at,
     )
 
 
 def run(engine, args: argparse.Namespace, *, out=None, today: Optional[date] = None) -> dict:
     if out is None:
         out = sys.stdout
+    validate_scoring_parameters(args.dead_band_pct, args.cost_bps)
     rows = select_signal_sources(engine, source_type=args.source_type, date_from=args.date_from,
                                  date_to=args.date_to, limit=args.limit)
     accessor = PITPriceAccessor(engine)
-    outcomes = [evaluate_signal(to_signal_record(r, horizon_days=args.horizon_days, origin_tag=args.origin_tag),
+    outcomes = [evaluate_signal(to_signal_record(r, horizon_days=args.horizon_days),
                                 accessor, dead_band_pct=args.dead_band_pct, cost_bps=args.cost_bps, today=today)
                 for r in rows if r.ticker]
     result = {
         "evaluation_version": EVALUATION_VERSION,
         "dry_run": True,
-        "assumptions": "provisional: calendar-day horizon; 4-day bar gap; after-16:00 America/New_York next calendar date; created_at ingestion proxy",
+        "assumptions": "provisional: calendar-day horizon; exact-date entry and exit bars; after-16:00 America/New_York next calendar date; created_at ingestion proxy; origin unknown",
         "n_selected": len(rows), "n_skipped_null_ticker": sum(not r.ticker for r in rows),
         "cohort_summary": dataclasses.asdict(summarize_outcomes(outcomes)),
     }
