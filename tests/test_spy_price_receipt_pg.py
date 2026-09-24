@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 from datetime import timedelta
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import pytest
 from alembic.migration import MigrationContext
@@ -148,10 +149,10 @@ def _source(raw_id: int, pulled_at: datetime, price: float, payload: dict | None
 
 
 def _receipt(engine: Engine, obs_date: date, price: float,
-             *, delay_days: int = 1) -> dict:
+             *, delay_days: int = 1, microseconds: int = 0) -> dict:
     pulled_at = datetime.combine(
         obs_date + timedelta(days=delay_days), datetime.min.time(), timezone.utc,
-    ) + timedelta(minutes=5)
+    ) + timedelta(minutes=5, microseconds=microseconds)
     marker = capture_payload(obs_date, pulled_at)
     raw_id = _raw(engine, obs_date, pulled_at, price, marker)
     assert _resolve_spy_close_receipt(
@@ -483,24 +484,18 @@ def test_earlier_malformed_receipt_does_not_hide_later_verified_close(
     assert int(chosen) == valid["receipt_id"]
 
 
-def test_missing_spy_backlog_does_not_starve_non_spy_candidate(
-    receipt_pg_engine: Engine,
-) -> None:
-    engine = receipt_pg_engine
-    today = datetime.now(timezone.utc).date()
-    for days_ago in (70, 45):
-        created_day = today - timedelta(days=days_ago)
-        entry = _receipt(engine, created_day - timedelta(days=1), 680.0)
-        _prediction(engine, created_day, entry)
+def _scoreable_btc_prediction(engine: Engine, today: date) -> str:
     non_spy_id = "non-spy-test-" + uuid4().hex
     created_at = datetime.combine(today - timedelta(days=20), datetime.min.time(), timezone.utc)
     with engine.begin() as conn:
         conn.execute(text("""
             INSERT INTO resolved_series
                 (feature_id, obs_date, release_date, vintage_date, value, source_priority_used)
-            VALUES (2792, :entry_day, :entry_day, :entry_day, 70000, 1),
+            VALUES (2792, :prior_day, :prior_day, :prior_day, 69000, 1),
+                   (2792, :entry_day, :entry_day, :entry_day, 70000, 1),
                    (2792, :outcome_day, :outcome_day, :outcome_day, 71000, 1)
-        """), {"entry_day": created_at.date(), "outcome_day": today - timedelta(days=1)})
+        """), {"prior_day": created_at.date() - timedelta(days=1),
+                "entry_day": created_at.date(), "outcome_day": today - timedelta(days=1)})
         conn.execute(text("""
             INSERT INTO astrogrid.prediction_run (
                 prediction_id, created_at, as_of_ts, horizon_label, target_universe,
@@ -515,15 +510,99 @@ def test_missing_spy_backlog_does_not_starve_non_spy_candidate(
                 'test', 'test', 'live', 'created', 'not_attempted', '{}'::jsonb
             )
         """), {"pid": non_spy_id, "created": created_at})
+    return non_spy_id
+
+
+def test_missing_spy_backlog_does_not_starve_non_spy_candidate(
+    receipt_pg_engine: Engine,
+) -> None:
+    engine = receipt_pg_engine
+    today = datetime.now(timezone.utc).date()
+    for days_ago in (70, 45):
+        created_day = today - timedelta(days=days_ago)
+        entry = _receipt(engine, created_day - timedelta(days=1), 680.0)
+        _prediction(engine, created_day, entry)
+    non_spy_id = _scoreable_btc_prediction(engine, today)
     summary = AstroGridStore(engine).score_predictions(as_of_date=today - timedelta(days=1), limit=1)
     assert summary["candidates"] == 1
     assert summary["scored"] == 1
     assert summary["prediction_ids"] == [non_spy_id]
 
 
+@pytest.mark.parametrize("writer_zone,scorer_zone,microseconds,lowercase", [
+    ("UTC", "America/New_York", 0, False),
+    ("America/New_York", "UTC", 123456, False),
+    ("Asia/Kolkata", "UTC", 654321, False),
+    ("UTC", "Asia/Kolkata", 123456, True),
+])
+def test_valid_spy_anchor_keeps_priority_across_time_zone_offsets(
+    receipt_pg_engine: Engine, writer_zone: str, scorer_zone: str,
+    microseconds: int, lowercase: bool,
+) -> None:
+    from sqlalchemy import event
+
+    engine = receipt_pg_engine
+    today = datetime.now(timezone.utc).date()
+    created_day = today - timedelta(days=20)
+
+    @event.listens_for(engine, "checkout")
+    def set_writer_zone(dbapi_conn, _record, _proxy) -> None:
+        with dbapi_conn.cursor() as cursor:
+            cursor.execute(f"SET TIME ZONE '{writer_zone}'")
+
+    try:
+        engine.dispose()
+        entry = _receipt(engine, created_day - timedelta(days=1), 680.0,
+                         microseconds=microseconds)
+        spy_id = _prediction(engine, created_day, entry)
+    finally:
+        event.remove(engine, "checkout", set_writer_zone)
+        engine.dispose()
+    _receipt(engine, created_day + timedelta(days=7), 700.0)
+    btc_id = _scoreable_btc_prediction(engine, today)
+    if lowercase:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE astrogrid.prediction_run SET target_symbols = '["spy"]'::jsonb
+                WHERE prediction_id = :pid
+            """), {"pid": spy_id})
+
+    @event.listens_for(engine, "checkout")
+    def set_scorer_zone(dbapi_conn, _record, _proxy) -> None:
+        with dbapi_conn.cursor() as cursor:
+            cursor.execute(f"SET TIME ZONE '{scorer_zone}'")
+
+    try:
+        engine.dispose()
+        btc_start_day = datetime.combine(
+            today - timedelta(days=20), datetime.min.time(), timezone.utc,
+        ).astimezone(ZoneInfo(scorer_zone)).date()
+        assert AstroGridStore(engine)._lookup_symbol_price("BTC", btc_start_day)["status"] == "ok"
+        assert AstroGridStore(engine)._lookup_symbol_price(
+            "BTC", today - timedelta(days=1),
+        )["status"] == "ok"
+        summary = AstroGridStore(engine).score_predictions(
+            as_of_date=today - timedelta(days=1), limit=1,
+        )
+    finally:
+        event.remove(engine, "checkout", set_scorer_zone)
+        engine.dispose()
+    assert summary["candidates"] == 1
+    assert summary["scored"] == 1, summary
+    assert summary["prediction_ids"] == [spy_id], summary
+    with engine.connect() as conn:
+        assert conn.execute(text("""
+            SELECT count(*) FROM astrogrid.prediction_score ps
+            JOIN astrogrid.prediction_run pr ON pr.id = ps.prediction_run_id
+            WHERE pr.prediction_id = :pid
+        """), {"pid": btc_id}).scalar_one() == 0
+
+
 @pytest.mark.parametrize("field,value", [
     ("entry_receipt_id", "0"),
     ("entry_available_at", '"invalid timestamp"'),
+    ("entry_available_at", '"2026-13-40T00:05:00+04:00"'),
+    ("entry_available_at", '"2026-09-04T00:05:00.123456+25:00"'),
 ])
 def test_invalid_entry_anchor_cannot_occupy_ready_slot(
     receipt_pg_engine: Engine, field: str, value: str,
