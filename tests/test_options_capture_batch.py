@@ -24,7 +24,7 @@ class _DB:
         self.calls: list[tuple[str, dict]] = []
         self.rows: list[dict] = []
         self.fail_after_inserts: int | None = None
-        self.next_ordinal = 0
+        self.next_xid = 0
         self.clock_offsets: dict[str, timedelta] = {}
         self.allocations: list[tuple[str, int, datetime]] = []
 
@@ -44,13 +44,13 @@ class _DB:
         sql = str(statement)
         values = params or {}
         self.calls.append((sql, values))
-        if "nextval(" in sql:
-            self.next_ordinal += 1
+        if "txid_current()" in sql:
+            self.next_xid += 1
             started = datetime.now(timezone.utc) + self.clock_offsets.get(
                 current_thread().name, timedelta(),
             )
-            self.allocations.append((current_thread().name, self.next_ordinal, started))
-            return _Result((self.next_ordinal, started))
+            self.allocations.append((current_thread().name, self.next_xid, started))
+            return _Result((self.next_xid, started))
         if "SELECT clock_timestamp()" in sql:
             return _Result((datetime.now(timezone.utc) + self.clock_offsets.get(
                 current_thread().name, timedelta(),
@@ -160,6 +160,8 @@ def test_completed_batch_time_follows_final_provider_response(
     assert yahoo.final_response_at is not None
     assert db.rows[0]["completed_at"] >= yahoo.final_response_at
     sql = [statement for statement, _ in db.calls]
+    assert "txid_current()" in sql[0]
+    assert not any("nextval(" in statement for statement in sql)
     assert next(i for i, s in enumerate(sql) if "pg_advisory_xact_lock" in s) < next(
         i for i, s in enumerate(sql) if "DELETE FROM options_snapshots" in s
     ) < next(i for i, s in enumerate(sql) if "INSERT INTO options_snapshots" in s)
@@ -189,12 +191,12 @@ def test_failed_second_pull_preserves_first_complete_batch(
     assert puller.engine.rows == prior
 
 
-def test_capture_deadline_fails_closed_after_short_ordinal_checkout(
+def test_capture_deadline_fails_closed_after_short_xid_checkout(
     puller: options.OptionsPuller, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(options, "MAX_CAPTURE_SECONDS", 0)
     assert _run(puller, [100.0])[0]["status"] == "FAILED"
-    assert any("nextval(" in sql for sql, _ in puller.engine.calls)
+    assert any("txid_current()" in sql for sql, _ in puller.engine.calls)
     assert not any("options_snapshots" in sql for sql, _ in puller.engine.calls)
     assert puller.engine.rows == []
 

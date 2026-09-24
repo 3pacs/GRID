@@ -185,7 +185,6 @@ class OptionsPuller(BasePuller):
     def _ensure_tables(self) -> None:
         """Create options tables if they don't exist."""
         with self.engine.begin() as conn:
-            conn.execute(text("CREATE SEQUENCE IF NOT EXISTS options_capture_ordinal_seq"))
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS options_snapshots (
                     id           BIGSERIAL PRIMARY KEY,
@@ -294,12 +293,13 @@ class OptionsPuller(BasePuller):
         """Pull options chain for a single ticker and compute signals."""
         try:
             capture_clock = time.monotonic()
-            # Sequence values survive rollback and give every worker one
-            # database-ordered capture start, independent of host clock skew.
-            # This transaction ends before any provider request.
+            # Force a 64-bit PostgreSQL transaction ID for each capture. It is
+            # allocated in database order, survives rollback, and needs no
+            # separate sequence grant for a runtime role. This transaction
+            # ends before any provider request.
             with self.engine.begin() as conn:
                 capture_ordinal, capture_started_at = conn.execute(
-                    text("SELECT nextval('options_capture_ordinal_seq'), clock_timestamp()"),
+                    text("SELECT txid_current(), clock_timestamp()"),
                 ).fetchone()
             first = self._yahoo.get_options(ticker)
             if not first:
