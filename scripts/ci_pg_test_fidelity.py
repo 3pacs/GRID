@@ -121,13 +121,54 @@ def _nodeid_set(value: object, label: str) -> set[str]:
     return set(value)
 
 
+def _junit_cases(root: ET.Element) -> tuple[list[ET.Element], int, int]:
+    """Require coherent JUnit suite totals and count failed/error cases."""
+    if root.tag == "testsuite":
+        suites = [root]
+    elif root.tag == "testsuites":
+        suites = root.findall("testsuite")
+    else:
+        raise ValueError("JUnit XML has no recognized suite root")
+    if not suites:
+        raise ValueError("JUnit XML has no test suites")
+    cases: list[ET.Element] = []
+    failures = errors = 0
+    for suite in suites:
+        suite_cases = suite.findall("testcase")
+        counts = {}
+        for field in ("tests", "skipped", "failures", "errors"):
+            raw = suite.get(field)
+            if raw is None or not raw.isdecimal():
+                raise ValueError(f"JUnit suite has malformed {field} total")
+            counts[field] = int(raw)
+        actual = {field: 0 for field in ("skipped", "failures", "errors")}
+        for case in suite_cases:
+            outcomes = {
+                "skipped": case.find("skipped") is not None,
+                "failures": case.find("failure") is not None,
+                "errors": case.find("error") is not None,
+            }
+            if sum(outcomes.values()) > 1:
+                raise ValueError("JUnit testcase has conflicting outcomes")
+            for field, present in outcomes.items():
+                actual[field] += present
+        if counts["tests"] != len(suite_cases) or any(
+            counts[field] != actual[field] for field in actual
+        ):
+            raise ValueError("JUnit suite totals differ from testcases")
+        failures += actual["failures"]
+        errors += actual["errors"]
+        cases.extend(suite_cases)
+    if not cases:
+        raise ValueError("JUnit XML has no testcases")
+    return cases, failures, errors
+
+
 def check_skips(junit_path: Path, report_path: Path, discovery_path: Path,
                 allowlist_path: Path) -> dict[str, object]:
     """Fail closed on unknown, changed, duplicate, or stale exact-ID skips."""
     root = ET.parse(junit_path).getroot()
-    cases = root.findall(".//testcase")
-    if not cases:
-        raise ValueError("JUnit XML has no testcases")
+    cases, junit_failures, junit_errors = _junit_cases(root)
     report = json.loads(report_path.read_text(encoding="utf-8"))
     if not isinstance(report, dict) or set(report) != {"version", "complete", "exitstatus", "events", "collect_errors", "executed_nodeids"}:
         raise ValueError("exact-ID report has missing or unexpected fields")
@@ -203,11 +244,14 @@ def check_skips(junit_path: Path, report_path: Path, discovery_path: Path,
         "version": 1,
         "testcase_count": len(cases),
         "skipped_count": len(observed),
+        "junit_failures": junit_failures,
+        "junit_errors": junit_errors,
         "unexpected": [{"nodeid": n, "reason": r} for n, r in unexpected],
         "stale_allowlist": [{"nodeid": n, "reason": r} for n, r in stale],
         "xpasses": xpasses,
         "pytest_exitstatus": report["exitstatus"],
-        "ok": report["exitstatus"] == 0 and not unexpected and not stale and not xpasses,
+        "ok": report["exitstatus"] == 0 and not junit_failures and not junit_errors
+              and not unexpected and not stale and not xpasses,
     }
 
 

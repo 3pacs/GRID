@@ -9,8 +9,9 @@ import sys
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-from scripts.ci_pytest_report import _nodeid
+import pytest
 
+from scripts.ci_pytest_report import _nodeid
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "ci_pg_test_fidelity.py"
 ROOT = SCRIPT.parent.parent
@@ -286,3 +287,55 @@ def test_parametrized_junit_properties_bind_exact_nodeids(tmp_path: Path) -> Non
     checked, data = _check(tmp_path, junit, report, allowlist)
     assert checked.returncode == 0, checked.stderr
     assert data["ok"] is True
+
+
+@pytest.mark.parametrize("outcome,source", [
+    ("failure", "def test_case(): assert False\n"),
+    ("error", "\n".join([
+        "import pytest",
+        "@pytest.fixture",
+        "def broken(): raise RuntimeError('setup broke')",
+        "def test_case(broken): pass",
+        "",
+    ])),
+])
+def test_junit_failure_or_error_rejects_zero_exit_report(
+    tmp_path: Path, outcome: str, source: str,
+) -> None:
+    junit, report, run = _pytest_run(tmp_path, source)
+    assert run.returncode == 1, run.stdout + run.stderr
+    root = ET.parse(junit).getroot()
+    case = root.find(".//testcase")
+    assert case is not None
+    assert case.find(outcome) is not None
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    payload["exitstatus"] = 0
+    report.write_text(json.dumps(payload), encoding="utf-8")
+    allowlist = tmp_path / "allowed.json"
+    allowlist.write_text('{"version":1,"allowed_skips":[]}', encoding="utf-8")
+
+    checked, data = _check(tmp_path, junit, report, allowlist)
+    assert checked.returncode == 1, checked.stderr
+    assert data["ok"] is False
+    assert data["pytest_exitstatus"] == 0
+    assert data[f"junit_{outcome}s"] == 1
+
+
+@pytest.mark.parametrize("field,value", [
+    ("tests", "2"), ("skipped", "1"), ("failures", "1"),
+    ("errors", "1"), ("tests", "bad"),
+])
+def test_junit_suite_totals_fail_closed(tmp_path: Path, field: str, value: str) -> None:
+    junit, report, run = _pytest_run(tmp_path, "def test_case(): pass\n")
+    assert run.returncode == 0, run.stdout + run.stderr
+    root = ET.parse(junit).getroot()
+    suite = root.find(".//testsuite")
+    assert suite is not None
+    suite.set(field, value)
+    ET.ElementTree(root).write(junit, encoding="unicode")
+    allowlist = tmp_path / "allowed.json"
+    allowlist.write_text('{"version":1,"allowed_skips":[]}', encoding="utf-8")
+
+    checked, _ = _check(tmp_path, junit, report, allowlist)
+    assert checked.returncode == 2
+    assert "JUnit suite" in checked.stderr
