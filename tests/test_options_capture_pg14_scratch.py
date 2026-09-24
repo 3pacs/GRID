@@ -216,7 +216,7 @@ def test_pg14_migration_replacement_rollback_and_overlap(scratch_pg14, monkeypat
                 "capture_completed_at"} <= columns
         assert conn.exec_driver_sql(
             "SELECT to_regclass('options_capture_ordinal_seq')"
-        ).scalar_one() is not None
+        ).scalar_one() is None
         conn.execute(text("""
             INSERT INTO options_snapshots (ticker, snap_date, expiry, opt_type, strike,
                                            open_interest, implied_vol)
