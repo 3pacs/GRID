@@ -446,8 +446,9 @@ def list_watchlist_enriched(
                             "pct_1m": None,
                             "source": "live",
                         }
-                        # Write back to DB so next lookup is fast
-                        _cache_price_to_db(engine, tk, live["price"], today)
+                        # Cache only a dated observation; fast_info has no bar date.
+                        if live.get("bar_date") is not None:
+                            _cache_price_to_db(engine, tk, live["price"], live["bar_date"])
     except Exception as exc:
         log.debug("Watchlist: price data enrichment failed: {e}", e=str(exc))
 

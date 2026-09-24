@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -99,7 +99,7 @@ def test_prediction_move_uses_only_finite_available_inputs(surprises, iv_atm, ex
 
     conn = MagicMock()
     upcoming = MagicMock()
-    upcoming.fetchone.return_value = (date.today() + timedelta(days=7), None, None)
+    upcoming.fetchone.return_value = (date(2026, 10, 1), None, None)
     history = MagicMock()
     history.fetchall.return_value = surprises
     conn.execute.side_effect = [upcoming, history]
