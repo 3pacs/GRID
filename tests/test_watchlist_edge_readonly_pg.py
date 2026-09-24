@@ -37,33 +37,38 @@ def _create_signal_sources(engine) -> None:
                 source_id TEXT NOT NULL,
                 ticker TEXT NOT NULL,
                 signal_type TEXT NOT NULL,
-                signal_date TIMESTAMPTZ NOT NULL,
+                signal_date DATE NOT NULL,
                 signal_value JSONB,
-                metadata JSONB,
                 outcome TEXT,
                 trust_score DOUBLE PRECISION DEFAULT 0.5
             )
         """))
         conn.execute(text("""
             INSERT INTO signal_sources
-                (source_type, source_id, ticker, signal_type, signal_date, metadata, outcome, trust_score)
-            VALUES (:source_type, :source_id, 'TEST', 'BUY', NOW(), CAST(:metadata AS JSONB), :outcome, :trust_score)
+                (source_type, source_id, ticker, signal_type, signal_date, signal_value, outcome, trust_score)
+            VALUES (:source_type, :source_id, 'TEST', 'BUY', CURRENT_DATE, CAST(:signal_value AS JSONB), :outcome, :trust_score)
         """), [
-            {"source_type": "congressional", "source_id": "Member A", "metadata": '{"amount":"$1000"}', "outcome": "PENDING", "trust_score": 0.0},
-            {"source_type": "insider", "source_id": "Officer B", "metadata": '{"title":"CEO"}', "outcome": "CORRECT", "trust_score": 0.8},
-            {"source_type": "darkpool", "source_id": "Pool C", "metadata": '{"volume_vs_avg":2.1}', "outcome": "PENDING", "trust_score": 0.6},
+            {"source_type": "congressional", "source_id": "Member A", "signal_value": '{"amount":"$1000"}', "outcome": "PENDING", "trust_score": 0.0},
+            {"source_type": "insider", "source_id": "Officer B", "signal_value": '{"title":"CEO"}', "outcome": "CORRECT", "trust_score": 0.8},
+            {"source_type": "darkpool", "source_id": "Pool C", "signal_value": '{"volume_vs_avg":2.1}', "outcome": "PENDING", "trust_score": 0.6},
         ])
         conn.execute(text("""
             INSERT INTO signal_sources
                 (source_type, source_id, ticker, signal_type, signal_date,
-                 signal_value, metadata, outcome, trust_score)
+                 signal_value, outcome, trust_score)
             VALUES
-                ('options_flow', 'whale_TEST_450.0', 'TEST', 'CALL', NOW(), NULL, NULL, 'WRONG', NULL),
-                ('quiverquant:house', 'quiverquant_house_feed', 'TEST', 'BUY', NOW(),
-                 CAST('{"Representative":"Rep C"}' AS JSONB), NULL, 'WRONG', NULL),
-                ('other', 'Office of Analyst D', 'TEST', 'BUY', NOW(), NULL, NULL, 'WRONG', NULL),
-                ('social', 'User E', 'TEST', 'BUY', NOW(), NULL,
+                ('options_flow', 'whale_TEST_450.0', 'TEST', 'CALL', CURRENT_DATE, NULL, 'WRONG', NULL),
+                ('quiverquant:house', 'quiverquant_house_feed', 'TEST', 'BUY', CURRENT_DATE,
+                 CAST('{"Representative":"Rep C"}' AS JSONB), 'WRONG', NULL),
+                ('other', 'Office of Analyst D', 'TEST', 'BUY', CURRENT_DATE, NULL, 'WRONG', NULL),
+                ('social', 'User E', 'TEST', 'BUY', CURRENT_DATE,
                  CAST('{"platform":"forum"}' AS JSONB), 'WRONG', NULL)
+        """))
+        conn.execute(text("""
+            INSERT INTO signal_sources
+                (source_type, source_id, ticker, signal_type, signal_date, signal_value)
+            VALUES ('social', 'Scalar E', 'SCALAR', 'BUY', CURRENT_DATE,
+                    CAST('["not an object"]' AS JSONB))
         """))
         conn.execute(text("""
             CREATE TABLE lever_pullers (
@@ -120,6 +125,10 @@ def test_edge_route_uses_only_selects_against_prepared_postgres_schema():
         assert payload["convergence"]["persisted_trust_mean"] == 0.47
         assert payload["convergence"]["persisted_trust_basis"] == "mean_non_null_persisted_trust_scores"
         assert payload["congressional"][0]["trust_score"] == 0.0
+        assert payload["congressional"][0]["amount"] == "$1000"
+        assert payload["insider"][0]["title"] == "CEO"
+        assert payload["dark_pool"]["volume_vs_avg"] == 2.1
+        assert payload["smart_money"][0]["source"] == "forum"
         assert payload["smart_money"][0]["trust_score"] is None
         assert payload["lever_pullers"] == [
             {"name": "Member A", "action": "BUY", "context": "committee overlap"},
@@ -130,6 +139,13 @@ def test_edge_route_uses_only_selects_against_prepared_postgres_schema():
         ]
         assert payload["availability"]["lever_pullers"]["status"] == "available"
         assert payload["availability"]["actor_context"]["status"] == "available"
+        absent = get_ticker_edge("absent", user={}, engine=engine)
+        assert absent["availability"]["signal_sources"]["status"] == "available"
+        assert absent["congressional"] == []
+        assert absent["insider"] == []
+        scalar = get_ticker_edge("scalar", user={}, engine=engine)
+        assert scalar["availability"]["signal_sources"]["status"] == "available"
+        assert scalar["smart_money"][0]["source"] == "unknown"
         assert payload["availability"]["investigation_leads"] == {
             "status": "unsupported", "reason": "no_ticker_association",
         }
