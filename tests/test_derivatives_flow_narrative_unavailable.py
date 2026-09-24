@@ -5,10 +5,28 @@ from __future__ import annotations
 import asyncio
 import sys
 import types
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
 from api.routers import derivatives
+from ollama import dealer_flow_briefing as flow
+
+
+def _dated_spy() -> dict:
+    today = date.today()
+    captured = datetime.combine(today, datetime.min.time(), timezone.utc) + timedelta(hours=1)
+    return {
+        "spot": 767.12, "spot_source": "spy_close_receipt",
+        "spot_basis": "prior_completed_unadjusted_close",
+        "spot_receipt_id": 123, "spot_obs_date": (today - timedelta(days=1)).isoformat(),
+        "spot_available_at": datetime.combine(today, datetime.min.time(), timezone.utc).isoformat(),
+        "spot_receipt_created_at": (datetime.combine(today, datetime.min.time(), timezone.utc) + timedelta(minutes=30)).isoformat(),
+        "spot_release_date": today.isoformat(), "spot_vintage_date": today.isoformat(),
+        "snap_date": today.isoformat(), "chain_snap_date": today.isoformat(),
+        "chain_created_at": captured.isoformat(),
+        "chain_created_at_max": captured.isoformat(),
+    }
 
 
 class _GEX:
@@ -22,7 +40,8 @@ class _GEX:
 
 def _without_saved_briefing(monkeypatch: pytest.MonkeyPatch) -> None:
     briefing = types.ModuleType("ollama.dealer_flow_briefing")
-    briefing.SPOT_CONTRACT = "resolved_series_only_v1"
+    briefing.SPOT_CONTRACT = flow.SPOT_CONTRACT
+    briefing.valid_spy_gex_profile = flow.valid_spy_gex_profile
     briefing.get_latest_flow_briefing = lambda _db: {}
     monkeypatch.setitem(sys.modules, "ollama.dealer_flow_briefing", briefing)
     monkeypatch.setattr(derivatives, "get_db_engine", lambda: object())
@@ -68,7 +87,7 @@ def test_measured_spot_still_builds_inline_narrative(
         derivatives,
         "_get_gex_engine",
         lambda: _GEX({
-            "spot": 767.12,
+            **_dated_spy(),
             "gex_aggregate": 1_000_000.0,
             "regime": "LONG_GAMMA",
             "gamma_flip": 760.0,
@@ -76,16 +95,15 @@ def test_measured_spot_still_builds_inline_narrative(
             "call_wall": 775.0,
             "vanna_exposure": 10.0,
             "charm_exposure": 20.0,
-            "snap_date": "2026-09-24",
         }),
     )
 
     result = asyncio.run(derivatives.get_flow_narrative())
 
-    assert "SPY is trading at $767.12" in result["content"]
+    assert "SPY prior verified close was $767.12" in result["content"]
     assert "LONG GAMMA" in result["content"]
     assert result["positioning_data"]["gex"]["SPY"]["spot"] == 767.12
-    assert result["briefing_date"] == "2026-09-24"
+    assert result["briefing_date"] == date.today().isoformat()
 
 
 def test_legacy_error_profile_without_availability_fields_stays_unavailable(
@@ -142,10 +160,10 @@ def test_source_guarded_saved_briefing_is_retained(
     saved = {
         "content": "Measured SPY close $767.12",
         "positioning_data": {
-            "spot_contract": "resolved_series_only_v1",
-            "gex": {"SPY": {"spot": 767.12, "spot_source": "resolved_series"}},
+            "spot_contract": flow.SPOT_CONTRACT,
+            "gex": {"SPY": _dated_spy()},
         },
-        "briefing_date": "2026-09-24",
+        "briefing_date": date.today().isoformat(),
         "stale": False,
     }
     briefing.get_latest_flow_briefing = lambda _db: saved
