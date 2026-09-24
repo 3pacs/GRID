@@ -5,6 +5,21 @@
 Read-only against the database (preopen only; postclose/status/evaluate
 touch no database at all), no orders, no brokerage/trading API calls —
 see ``db.py`` and the pre-registration's "Integrity" section.
+
+Every command-specific module is imported *lazily*, inside its own branch
+below, rather than at the top of this file. This isn't just style: GRID's
+root ``config.py`` validates ``DB_PASSWORD`` at import time, and
+``db.py``/``preopen.py`` import it transitively — an eager top-level
+import here would make ``status`` and ``evaluate`` (which never open a
+database connection) fail with a confusing DB_PASSWORD error in any
+environment that hasn't sourced ``.env``, exactly the class of "why does
+a read-only status check need database credentials" bug this package
+exists to avoid elsewhere. Caught via the 2026-09-24 production smoke
+test (see the PR/handoff report), not by the test suite, since every
+existing test imports the CLI module directly, in one process — the
+smoke test's separate `ssh` invocation of `status` (no `.env` sourced,
+since that command was never supposed to need it) is what actually
+exercised a fresh, real interpreter with no DB env vars set at all.
 """
 
 from __future__ import annotations
@@ -16,11 +31,6 @@ from pathlib import Path
 from loguru import logger as log
 
 from paper_log.gex_levels.config import TICKER
-from paper_log.gex_levels.db import build_readonly_engine
-from paper_log.gex_levels.evaluate import format_evaluate, run_evaluate
-from paper_log.gex_levels.postclose import run_postclose
-from paper_log.gex_levels.preopen import run_preopen
-from paper_log.gex_levels.status import compute_status, format_status
 from paper_log.gex_levels.storage import resolve_code_sha
 
 
@@ -59,6 +69,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--interim is only valid with the evaluate command")
 
     if args.command == "preopen":
+        from paper_log.gex_levels.db import build_readonly_engine
+        from paper_log.gex_levels.preopen import run_preopen
+
         code_sha = resolve_code_sha(_repo_root(), override=args.code_sha)
         engine = build_readonly_engine()
         try:
@@ -72,6 +85,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "postclose":
+        from paper_log.gex_levels.postclose import run_postclose
+
         code_sha = resolve_code_sha(_repo_root(), override=args.code_sha)
         record = run_postclose(log_dir=args.log_dir, code_sha=code_sha, ticker=TICKER)
         log.info(
@@ -81,11 +96,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "status":
+        from paper_log.gex_levels.status import compute_status, format_status
+
         report = compute_status(args.log_dir)
         print(format_status(report))
         return 0
 
     if args.command == "evaluate":
+        from paper_log.gex_levels.evaluate import format_evaluate, run_evaluate
+
         report = run_evaluate(args.log_dir, interim=args.interim)
         print(format_evaluate(report))
         return 1 if report.refused else 0
