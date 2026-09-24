@@ -281,71 +281,98 @@ class DealerGammaEngine:
         }
 
     def _compute_per_strike(self, chain: pd.DataFrame, spot: float) -> list[dict]:
-        """Compute GEX, delta, vanna, charm per strike."""
-        results = []
-        grouped = chain.groupby("strike")
+        """Compute GEX, delta, vanna, charm per strike.
 
-        for strike, group in grouped:
-            T = group["dte"].iloc[0] / 365.0
+        Aggregates CONTRACT-level Greeks — each row (one strike/expiry/
+        opt_type) gets its OWN dte-derived T and its OWN IV — up to one
+        output row per strike. A strike is not one option: the same strike
+        commonly carries open interest across several expiries at once
+        (e.g. a 1-DTE weekly and a 60-DTE monthly at the same round
+        number), and gamma is extremely sensitive to T near-the-money.
+        Collapsing a strike's whole multi-expiry OI onto a single
+        arbitrary expiry's T (the pre-2026-09-24 bug here: `group by
+        strike`, then `T = group["dte"].iloc[0]` for ALL of that strike's
+        OI) badly misprices gamma and is what made put_wall/call_wall
+        collapse onto the same ATM strike regardless of true positioning.
+
+        This computation must agree with `_gex_at_spots_vectorized` (also
+        per-contract, used for the gamma flip search and the profile
+        curve) — see test_gex_aggregate_matches_vectorized_at_spot in
+        tests/test_dealer_gamma.py, which asserts
+        ``sum(net_gex for per_strike) == self._gex_at_spot(chain, spot)``
+        within float tolerance. Before this fix the two could disagree
+        (regime label and gamma flip effectively came from two different
+        calculations) whenever any strike spanned multiple expiries.
+        """
+        buckets: dict[float, dict[str, float]] = {}
+
+        valid = chain[chain["dte"] > 0]
+        for row in valid.itertuples(index=False):
+            T = float(row.dte) / 365.0
             if T <= 0:
                 continue
+            K = float(row.strike)
+            iv = float(row.implied_volatility)
+            if not (iv > 0):
+                iv = 0.25
+            oi = float(row.open_interest)
+            is_call = row.opt_type == "call"
 
-            call_rows = group[group["opt_type"] == "call"]
-            put_rows = group[group["opt_type"] == "put"]
+            # Dollar gamma for this contract × its own OI × 100 shares ×
+            # spot, signed by the dealer-positioning convention (module
+            # docstring): long calls (+), short puts (-).
+            gamma = bs_gamma(spot, K, T, self.r, iv) * oi * 100.0 * spot
+            sign = DEALER_CALL_SIGN if is_call else DEALER_PUT_SIGN
+            gex = sign * gamma
 
-            call_oi = float(call_rows["open_interest"].sum()) if not call_rows.empty else 0
-            put_oi = float(put_rows["open_interest"].sum()) if not put_rows.empty else 0
+            delta_fn = bs_delta_call if is_call else bs_delta_put
+            delta = sign * delta_fn(spot, K, T, self.r, iv) * oi * 100.0
 
-            call_iv = float(call_rows["implied_volatility"].mean()) if not call_rows.empty and call_rows["implied_volatility"].mean() > 0 else 0.25
-            put_iv = float(put_rows["implied_volatility"].mean()) if not put_rows.empty and put_rows["implied_volatility"].mean() > 0 else 0.25
+            vanna = sign * bs_vanna(spot, K, T, self.r, iv) * oi * 100.0
+            charm = sign * bs_charm(spot, K, T, self.r, iv, is_call=is_call) * oi * 100.0
 
-            K = float(strike)
+            b = buckets.get(K)
+            if b is None:
+                b = {
+                    "strike": K, "call_oi": 0.0, "put_oi": 0.0,
+                    "call_gex": 0.0, "put_gex": 0.0,
+                    "dealer_delta": 0.0, "vanna": 0.0, "charm": 0.0,
+                    "min_dte": float(row.dte),
+                }
+                buckets[K] = b
+            else:
+                b["min_dte"] = min(b["min_dte"], float(row.dte))
 
-            # Gamma per option × OI × 100 shares × spot (dollar gamma).
-            # Dealer modeled LONG calls / SHORT puts (DEALER_CALL_SIGN /
-            # DEALER_PUT_SIGN, see module docstring) — call GEX is positive,
-            # put GEX is negative, at every strike.
-            call_gamma = bs_gamma(spot, K, T, self.r, call_iv) * call_oi * 100 * spot
-            put_gamma = bs_gamma(spot, K, T, self.r, put_iv) * put_oi * 100 * spot
-            call_gex = DEALER_CALL_SIGN * call_gamma
-            put_gex = DEALER_PUT_SIGN * put_gamma
+            if is_call:
+                b["call_oi"] += oi
+                b["call_gex"] += gex
+            else:
+                b["put_oi"] += oi
+                b["put_gex"] += gex
+            b["dealer_delta"] += delta
+            b["vanna"] += vanna
+            b["charm"] += charm
 
-            # Dealer delta, signed the same way (long calls -> long delta,
-            # short puts -> the negated put delta contribution).
-            call_delta = DEALER_CALL_SIGN * bs_delta_call(spot, K, T, self.r, call_iv) * call_oi * 100
-            put_delta = DEALER_PUT_SIGN * bs_delta_put(spot, K, T, self.r, put_iv) * put_oi * 100
-
-            # Vanna and charm, computed per leg from each leg's own IV (not
-            # an averaged IV — that discarded information the two legs
-            # already carry) and signed the same way as gamma/delta above.
-            # Vanna is identical for calls and puts at the same S/K/T/sigma;
-            # charm is not, hence the explicit is_call on each leg.
-            call_vanna = bs_vanna(spot, K, T, self.r, call_iv)
-            put_vanna = bs_vanna(spot, K, T, self.r, put_iv)
-            call_charm = bs_charm(spot, K, T, self.r, call_iv, is_call=True)
-            put_charm = bs_charm(spot, K, T, self.r, put_iv, is_call=False)
-            vanna_val = (
-                DEALER_CALL_SIGN * call_vanna * call_oi
-                + DEALER_PUT_SIGN * put_vanna * put_oi
-            ) * 100.0
-            charm_val = (
-                DEALER_CALL_SIGN * call_charm * call_oi
-                + DEALER_PUT_SIGN * put_charm * put_oi
-            ) * 100.0
-
-            results.append({
-                "strike": K,
-                "call_oi": call_oi,
-                "put_oi": put_oi,
-                "call_gex": call_gex,
-                "put_gex": put_gex,
-                "net_gex": call_gex + put_gex,
-                "dealer_delta": call_delta + put_delta,
-                "vanna": vanna_val,
-                "charm": charm_val,
-                "dte": float(group["dte"].iloc[0]),
-            })
-
+        results = [
+            {
+                "strike": b["strike"],
+                "call_oi": b["call_oi"],
+                "put_oi": b["put_oi"],
+                "call_gex": b["call_gex"],
+                "put_gex": b["put_gex"],
+                "net_gex": b["call_gex"] + b["put_gex"],
+                "dealer_delta": b["dealer_delta"],
+                "vanna": b["vanna"],
+                "charm": b["charm"],
+                # Nearest expiry at this strike — informational only (not
+                # used in any Greek above, each contract already used its
+                # own dte). A strike spanning multiple expiries has no
+                # single correct "dte"; the nearest one is the most
+                # actionable to display.
+                "dte": b["min_dte"],
+            }
+            for b in buckets.values()
+        ]
         results.sort(key=lambda x: x["strike"])
         return results
 
