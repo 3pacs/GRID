@@ -1,6 +1,6 @@
 # Release runtime preservation gate
 
-The release swap now requires `/data/grid_v4/grid_release.releases/.runtime-preservation` before it builds or swaps a candidate. The file has exactly three lines:
+The release swap now requires `/data/grid_v4/grid_release.releases/.runtime-preservation` before it builds or swaps a candidate. The file has exactly six lines:
 
 ```text
 scheduler=/data/grid_v4/grid_release.releases/<immutable-running-scheduler-release>
