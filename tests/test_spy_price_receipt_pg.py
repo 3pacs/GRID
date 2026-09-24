@@ -388,7 +388,10 @@ def test_receipt_to_astrogrid_api_anchor_to_score_without_hindsight(
     )
 
 
-def test_missing_outcomes_do_not_fill_bounded_batch(receipt_pg_engine: Engine) -> None:
+@pytest.mark.parametrize("scoring_zone", ["UTC", "America/New_York"])
+def test_missing_outcomes_do_not_fill_bounded_batch(
+    receipt_pg_engine: Engine, scoring_zone: str,
+) -> None:
     engine = receipt_pg_engine
     today = datetime.now(timezone.utc).date()
     old_ids = []
@@ -401,7 +404,18 @@ def test_missing_outcomes_do_not_fill_bounded_batch(receipt_pg_engine: Engine) -
     wanted_id = _prediction(engine, created_day, entry)
     _receipt(engine, created_day + timedelta(days=7), 700.0)
 
-    summary = AstroGridStore(engine).score_predictions(as_of_date=today, limit=2)
+    from sqlalchemy import event
+
+    @event.listens_for(engine, "checkout")
+    def set_scoring_zone(dbapi_conn, _record, _proxy) -> None:
+        with dbapi_conn.cursor() as cursor:
+            cursor.execute(f"SET TIME ZONE '{scoring_zone}'")
+
+    try:
+        engine.dispose()
+        summary = AstroGridStore(engine).score_predictions(as_of_date=today, limit=2)
+    finally:
+        event.remove(engine, "checkout", set_scoring_zone)
     assert summary["scored"] == 1
     assert summary["prediction_ids"] == [wanted_id]
     with engine.connect() as conn:
