@@ -83,6 +83,7 @@ def _chain() -> pd.DataFrame:
     chain.attrs.update(snap_date=SNAP_DATE, created_at_min=captured,
                        created_at_max=captured,
                        batch_id="11111111-1111-4111-8111-111111111111",
+                       capture_started_at=captured,
                        capture_completed_at=captured + timedelta(minutes=1))
     return chain
 

@@ -18,6 +18,7 @@ def upgrade() -> None:
     op.execute("""
         ALTER TABLE options_snapshots
             ADD COLUMN IF NOT EXISTS capture_batch_id TEXT,
+            ADD COLUMN IF NOT EXISTS capture_started_at TIMESTAMPTZ,
             ADD COLUMN IF NOT EXISTS capture_completed_at TIMESTAMPTZ
     """)
 
@@ -28,5 +29,6 @@ def downgrade() -> None:
     op.execute("""
         ALTER TABLE options_snapshots
             DROP COLUMN IF EXISTS capture_completed_at,
+            DROP COLUMN IF EXISTS capture_started_at,
             DROP COLUMN IF EXISTS capture_batch_id
     """)

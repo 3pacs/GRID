@@ -205,6 +205,7 @@ class DealerGammaEngine:
             "snap_date": str(snap_date),
             "chain_snap_date": chain.attrs["snap_date"].isoformat(),
             "chain_batch_id": chain.attrs["batch_id"],
+            "chain_capture_started_at": chain.attrs["capture_started_at"].isoformat(),
             "chain_capture_completed_at": chain_completed_at.isoformat(),
             "chain_created_at": chain.attrs["created_at_min"].isoformat(),
             "chain_created_at_max": chain.attrs["created_at_max"].isoformat(),
@@ -396,15 +397,15 @@ class DealerGammaEngine:
     def _load_chain(self, ticker: str, snap_date: date) -> pd.DataFrame:
         """Load only the requested day's chain; reject mixed or late captures.
 
-        The daily unique key uses ON CONFLICT DO NOTHING, so a retry can leave
-        rows from multiple pulls under one snap_date. Only one fully completed
-        pull batch is eligible. Legacy rows without batch provenance fail closed.
+        Only one fully completed capture is eligible. A legacy or partially
+        published chain without start, batch, and completion provenance fails
+        closed, as do rows mixed with an older writer.
         """
         with self.engine.connect() as conn:
             rows = conn.execute(text("""
                 SELECT strike, opt_type, open_interest, implied_vol AS implied_volatility,
                        expiry, (expiry - :snap_date) AS dte, created_at,
-                       capture_batch_id, capture_completed_at
+                       capture_batch_id, capture_started_at, capture_completed_at
                 FROM options_snapshots
                 WHERE ticker = :ticker AND snap_date = :snap_date
                 ORDER BY expiry, strike, opt_type
@@ -415,36 +416,42 @@ class DealerGammaEngine:
 
         created = [row[6] for row in rows]
         batches = {row[7] for row in rows}
-        completions = {row[8] for row in rows}
+        starts = {row[8] for row in rows}
+        completions = {row[9] for row in rows}
         now = datetime.now(timezone.utc)
         if (any(not isinstance(ts, datetime) or ts.tzinfo is None for ts in created)
                 or len(batches) != 1 or not next(iter(batches))
+                or len(starts) != 1
                 or len(completions) != 1):
             return pd.DataFrame()
         batch_id = next(iter(batches))
+        started_at = next(iter(starts))
         completed_at = next(iter(completions))
         try:
             UUID(batch_id)
         except (TypeError, ValueError, AttributeError):
             return pd.DataFrame()
-        if not isinstance(completed_at, datetime) or completed_at.tzinfo is None:
+        if (not isinstance(started_at, datetime) or started_at.tzinfo is None
+                or not isinstance(completed_at, datetime) or completed_at.tzinfo is None):
             return pd.DataFrame()
         first, last = min(created), max(created)
         if (first.astimezone(timezone.utc).date() != snap_date
                 or last.astimezone(timezone.utc).date() != snap_date
+                or started_at.astimezone(timezone.utc).date() != snap_date
                 or completed_at.astimezone(timezone.utc).date() != snap_date
-                or completed_at > now or completed_at < last):
+                or started_at > completed_at or completed_at > now):
             return pd.DataFrame()
 
         df = pd.DataFrame(rows, columns=["strike", "opt_type", "open_interest",
                                           "implied_volatility", "expiry", "dte",
-                                          "created_at", "capture_batch_id",
+                                          "created_at", "capture_batch_id", "capture_started_at",
                                           "capture_completed_at"])
         df["dte"] = df["dte"].apply(lambda x: x.days if hasattr(x, 'days') else int(x))
         df = df[(df["dte"] > 0)
                 & (df["open_interest"] > 0)
                 & (df["implied_volatility"] > 0)].copy()
         df.attrs.update(snap_date=snap_date, batch_id=batch_id,
+                        capture_started_at=started_at,
                         capture_completed_at=completed_at,
                         created_at_min=first, created_at_max=last)
         return df

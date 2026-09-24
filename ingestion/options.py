@@ -38,6 +38,7 @@ EQUITY_TICKERS: list[str] = [
 
 # Maximum expirations to pull per ticker
 MAX_EXPIRATIONS = 12
+MAX_CAPTURE_SECONDS = 120  # each in-flight Yahoo request also has a 15s timeout
 
 # Catalyst-universe coverage (2026-09-10).
 #
@@ -201,6 +202,7 @@ class OptionsPuller(BasePuller):
                     in_the_money BOOLEAN,
                     created_at   TIMESTAMPTZ DEFAULT NOW(),
                     capture_batch_id TEXT,
+                    capture_started_at TIMESTAMPTZ,
                     capture_completed_at TIMESTAMPTZ,
                     UNIQUE (ticker, snap_date, expiry, opt_type, strike)
                 )
@@ -289,7 +291,8 @@ class OptionsPuller(BasePuller):
     def _pull_ticker(self, ticker: str, today_str: str) -> dict[str, Any]:
         """Pull options chain for a single ticker and compute signals."""
         try:
-            # Fetch first page to get expirations and spot price
+            capture_clock = time.monotonic()
+            capture_started_at = datetime.now(timezone.utc)
             first = self._yahoo.get_options(ticker)
             if not first:
                 return {"ticker": ticker, "status": "FAILED", "error": "no data from Yahoo"}
@@ -323,93 +326,108 @@ class OptionsPuller(BasePuller):
             near_calls_df = pd.DataFrame()
             near_puts_df = pd.DataFrame()
 
+            for i, exp_ts in enumerate(expirations[:MAX_EXPIRATIONS]):
+                if time.monotonic() - capture_clock >= MAX_CAPTURE_SECONDS:
+                    complete = False
+                    break
+                # Use data from first request for first expiry, fetch rest
+                if i == 0:
+                    chain_data = first
+                else:
+                    chain_data = self._yahoo.get_options(ticker, exp_ts)
+                    time.sleep(0.2)
+                if not chain_data:
+                    complete = False
+                    continue
+                if not chain_data.get("calls") or not chain_data.get("puts"):
+                    complete = False
+
+                exp_date = datetime.utcfromtimestamp(exp_ts).strftime("%Y-%m-%d")
+
+                for opt_type, raw_list in [("call", chain_data.get("calls", [])),
+                                           ("put", chain_data.get("puts", []))]:
+                    if not raw_list:
+                        continue
+
+                    rows_for_df = []
+                    for opt in raw_list:
+                        strike = opt.get("strike")
+                        if strike is None:
+                            continue
+                        vol = opt.get("volume", 0) or 0
+                        oi = opt.get("openInterest", 0) or 0
+                        iv = opt.get("impliedVolatility")
+                        last_price = opt.get("lastPrice")
+                        bid = opt.get("bid")
+                        ask = opt.get("ask")
+                        itm = opt.get("inTheMoney", False)
+
+                        snapshot_rows.append({
+                            "ticker": ticker, "snap_date": today_str,
+                            "expiry": exp_date, "opt_type": opt_type,
+                            "strike": strike, "last_price": last_price,
+                            "bid": bid, "ask": ask, "volume": vol,
+                            "oi": oi, "iv": iv, "itm": itm,
+                            "batch_id": batch_id,
+                        })
+                        snap_count += 1
+                        rows_for_df.append({
+                            "strike": strike, "volume": vol,
+                            "openInterest": oi, "impliedVolatility": iv,
+                            "lastPrice": last_price, "bid": bid, "ask": ask,
+                            "inTheMoney": itm,
+                        })
+
+                    df = pd.DataFrame(rows_for_df) if rows_for_df else pd.DataFrame()
+                    if opt_type == "call":
+                        total_call_oi += df["openInterest"].fillna(0).sum() if not df.empty else 0
+                        total_call_vol += df["volume"].fillna(0).sum() if not df.empty else 0
+                        all_calls_dfs.append(df)
+                        if i == 0:
+                            near_calls_df = df
+                    else:
+                        total_put_oi += df["openInterest"].fillna(0).sum() if not df.empty else 0
+                        total_put_vol += df["volume"].fillna(0).sum() if not df.empty else 0
+                        all_puts_dfs.append(df)
+                        if i == 0:
+                            near_puts_df = df
+
+                # ATM IV for this expiry
+                all_opts = chain_data.get("calls", []) + chain_data.get("puts", [])
+                atm_ivs = [
+                    o["impliedVolatility"] for o in all_opts
+                    if o.get("impliedVolatility") and o.get("strike")
+                    and spot_price * 0.97 <= o["strike"] <= spot_price * 1.03
+                ]
+                if atm_ivs:
+                    expiry_ivs.append((exp_date, float(np.mean(atm_ivs))))
+
+            if not complete or not snap_count or time.monotonic() - capture_clock >= MAX_CAPTURE_SECONDS:
+                raise ValueError("incomplete options chain response")
+
+            # Provider availability begins after the final response; the
+            # database created_at will be later, at publication.
+            completed_at = datetime.now(timezone.utc)
+
+            # Only the publication phase holds a database connection. A later
+            # capture start wins even if an older worker finishes last.
+            publish_clock = time.monotonic()
             with self.engine.begin() as conn:
-                # The first page above discovers expiries. Serialize all
-                # remaining capture and replacement for this ticker/day so
-                # overlapping canonical jobs cannot publish out of order.
+                conn.execute(text("SET LOCAL lock_timeout = '5s'"))
+                conn.execute(text("SET LOCAL statement_timeout = '30s'"))
                 conn.execute(
                     text("SELECT pg_advisory_xact_lock(hashtext(:ticker), hashtext(:snap_date))"),
                     {"ticker": ticker, "snap_date": today_str},
                 )
-                for i, exp_ts in enumerate(expirations[:MAX_EXPIRATIONS]):
-                    # Use data from first request for first expiry, fetch rest
-                    if i == 0:
-                        chain_data = first
-                    else:
-                        chain_data = self._yahoo.get_options(ticker, exp_ts)
-                        time.sleep(0.2)
-                    if not chain_data:
-                        complete = False
-                        continue
-                    if not chain_data.get("calls") or not chain_data.get("puts"):
-                        complete = False
-
-                    exp_date = datetime.utcfromtimestamp(exp_ts).strftime("%Y-%m-%d")
-
-                    for opt_type, raw_list in [("call", chain_data.get("calls", [])),
-                                               ("put", chain_data.get("puts", []))]:
-                        if not raw_list:
-                            continue
-
-                        rows_for_df = []
-                        for opt in raw_list:
-                            strike = opt.get("strike")
-                            if strike is None:
-                                continue
-                            vol = opt.get("volume", 0) or 0
-                            oi = opt.get("openInterest", 0) or 0
-                            iv = opt.get("impliedVolatility")
-                            last_price = opt.get("lastPrice")
-                            bid = opt.get("bid")
-                            ask = opt.get("ask")
-                            itm = opt.get("inTheMoney", False)
-
-                            snapshot_rows.append({
-                                "ticker": ticker, "snap_date": today_str,
-                                "expiry": exp_date, "opt_type": opt_type,
-                                "strike": strike, "last_price": last_price,
-                                "bid": bid, "ask": ask, "volume": vol,
-                                "oi": oi, "iv": iv, "itm": itm,
-                                "batch_id": batch_id,
-                            })
-                            snap_count += 1
-                            rows_for_df.append({
-                                "strike": strike, "volume": vol,
-                                "openInterest": oi, "impliedVolatility": iv,
-                                "lastPrice": last_price, "bid": bid, "ask": ask,
-                                "inTheMoney": itm,
-                            })
-
-                        df = pd.DataFrame(rows_for_df) if rows_for_df else pd.DataFrame()
-                        if opt_type == "call":
-                            total_call_oi += df["openInterest"].fillna(0).sum() if not df.empty else 0
-                            total_call_vol += df["volume"].fillna(0).sum() if not df.empty else 0
-                            all_calls_dfs.append(df)
-                            if i == 0:
-                                near_calls_df = df
-                        else:
-                            total_put_oi += df["openInterest"].fillna(0).sum() if not df.empty else 0
-                            total_put_vol += df["volume"].fillna(0).sum() if not df.empty else 0
-                            all_puts_dfs.append(df)
-                            if i == 0:
-                                near_puts_df = df
-
-                    # ATM IV for this expiry
-                    all_opts = chain_data.get("calls", []) + chain_data.get("puts", [])
-                    atm_ivs = [
-                        o["impliedVolatility"] for o in all_opts
-                        if o.get("impliedVolatility") and o.get("strike")
-                        and spot_price * 0.97 <= o["strike"] <= spot_price * 1.03
-                    ]
-                    if atm_ivs:
-                        expiry_ivs.append((exp_date, float(np.mean(atm_ivs))))
-
-                if not complete or not snap_count:
-                    raise ValueError("incomplete options chain response")
-
-                # PostgreSQL created_at=NOW() is the transaction start, before
-                # later expiry responses. Stamp only after the final response.
-                completed_at = datetime.now(timezone.utc)
+                latest = conn.execute(
+                    text("""SELECT MAX(capture_started_at) FROM options_snapshots
+                             WHERE ticker = :ticker AND snap_date = :snap_date"""),
+                    {"ticker": ticker, "snap_date": today_str},
+                ).fetchone()
+                if latest and latest[0] is not None and latest[0] > capture_started_at:
+                    log.info("{t}: older overlapping options capture skipped", t=ticker)
+                    return {"ticker": ticker, "status": "SKIPPED",
+                            "reason": "newer options capture already published"}
 
                 # A ticker/day is one full capture, not a growing union of four
                 # scheduled pulls. Remove old/legacy rows and publish the new
@@ -425,12 +443,14 @@ class OptionsPuller(BasePuller):
                             "INSERT INTO options_snapshots "
                             "(ticker, snap_date, expiry, opt_type, strike, "
                             "last_price, bid, ask, volume, open_interest, "
-                            "implied_vol, in_the_money, capture_batch_id, capture_completed_at) "
+                            "implied_vol, in_the_money, capture_batch_id, "
+                            "capture_started_at, capture_completed_at) "
                             "VALUES (:ticker, :snap_date, :expiry, :opt_type, :strike, "
-                            ":last_price, :bid, :ask, :volume, :oi, :iv, :itm, :batch_id, :completed_at) "
+                            ":last_price, :bid, :ask, :volume, :oi, :iv, :itm, "
+                            ":batch_id, :started_at, :completed_at) "
                             "ON CONFLICT DO NOTHING"
                         ),
-                        {**row, "completed_at": completed_at},
+                        {**row, "started_at": capture_started_at, "completed_at": completed_at},
                     )
 
                 # Compute signals from nearest LIQUID expiration
@@ -526,8 +546,11 @@ class OptionsPuller(BasePuller):
                 })
 
             log.info(
-                "{t}: {n} snaps, PCR={pcr}, MaxPain={mp}, OI={oi}, IV_ATM={iv}",
+                "{t}: {n} snaps, capture={capture:.1f}s, publish={publish:.1f}s, "
+                "PCR={pcr}, MaxPain={mp}, OI={oi}, IV_ATM={iv}",
                 t=ticker, n=snap_count,
+                capture=publish_clock - capture_clock,
+                publish=time.monotonic() - publish_clock,
                 pcr=f"{put_call_ratio:.2f}" if put_call_ratio else "N/A",
                 mp=f"${max_pain:,.0f}" if max_pain else "N/A",
                 oi=f"{total_oi:,}",
