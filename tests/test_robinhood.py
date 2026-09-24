@@ -7,12 +7,15 @@ from __future__ import annotations
 
 import base64
 import json
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from unittest.mock import MagicMock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 
 from trading import robinhood as rh
+from trading.robinhood_risk_store import InMemoryRiskStore, utc_today
 
 pytest.importorskip("cryptography")
 
@@ -54,7 +57,15 @@ class FakeSession:
 PRIVATE_B64, PUBLIC_B64 = rh.generate_keypair()
 
 
-def _routes(buying_power="1000", btc_qty="0.5", price="60000"):
+def _routes(buying_power="1000", btc_qty="0.5", price="60000", spread_pct=0.001, quote_timestamp=None):
+    """*quote_timestamp*, when given, is an ISO string echoed back as the
+    best_bid_ask row's own ``timestamp`` field (Robinhood's real schema) —
+    tests use it to simulate a stale quote. Omitted, the connector falls
+    back to its local fetch time, so the quote is always "fresh"."""
+    quote_row = {"price": price, "bid_inclusive_of_sell_spread": str(float(price) * (1 - spread_pct)),
+                 "ask_inclusive_of_buy_spread": str(float(price) * (1 + spread_pct))}
+    if quote_timestamp is not None:
+        quote_row["timestamp"] = quote_timestamp
     return {
         ("GET", rh.PATH_ACCOUNT): {"account_number": "RH123456789", "status": "active",
                                    "buying_power": buying_power, "buying_power_currency": "USD"},
@@ -63,8 +74,7 @@ def _routes(buying_power="1000", btc_qty="0.5", price="60000"):
             {"asset_code": "ETH", "total_quantity": "0", "quantity_available_for_trading": "0"},
         ]},
         ("GET", rh.PATH_BEST_BID_ASK): lambda q, _b: {"results": [
-            {"symbol": s, "price": price, "bid_inclusive_of_sell_spread": str(float(price) * 0.999),
-             "ask_inclusive_of_buy_spread": str(float(price) * 1.001)} for s in q.get("symbol", [])
+            {"symbol": s, **quote_row} for s in q.get("symbol", [])
         ]},
         ("GET", rh.PATH_TRADING_PAIRS): {"results": [
             {"symbol": "BTC-USD", "status": "tradable", "min_order_size": "0.000001",
@@ -74,7 +84,8 @@ def _routes(buying_power="1000", btc_qty="0.5", price="60000"):
             {"id": "o1", "symbol": "BTC-USD", "side": "buy", "type": "market", "state": "filled",
              "filled_asset_quantity": "0.001", "average_price": "59990", "created_at": "2026-09-10T10:00:00Z"},
         ]},
-        ("POST", rh.PATH_ORDERS): lambda _q, body: {"id": "o-new", "state": "open", **json.loads(body)},
+        ("POST", rh.PATH_ORDERS): lambda _q, body: {"id": "o-new", "state": "open", "average_price": price,
+                                                     **json.loads(body)},
     }
 
 
@@ -197,11 +208,29 @@ class TestTrades:
         out = trader.open_position("btc", "LONG", 30)
         assert out["status"] == "dry_run"
         order = out["order"]
-        assert order["side"] == "buy" and order["symbol"] == "BTC-USD" and order["type"] == "market"
-        # $30 at the ask (60060) floored to the 1e-6 increment
-        assert order["market_order_config"]["asset_quantity"] == "0.000499"
+        # Marketable limit by default (ROBINHOOD_USE_LIMIT_ORDERS=True) —
+        # Robinhood's Crypto Trading API supports type=limit / time_in_force=gtc.
+        assert order["side"] == "buy" and order["symbol"] == "BTC-USD" and order["type"] == "limit"
+        cfg = order["limit_order_config"]
+        # $30 at the ask (60060, unpadded) floored to the 1e-6 increment —
+        # quantity is sized off the touch price, not the slippage-padded limit.
+        assert cfg["asset_quantity"] == "0.000499"
+        assert cfg["time_in_force"] == "gtc"
+        # limit_price = ask * (1 + slippage_bps/10000), 25bps default.
+        assert float(cfg["limit_price"]) == pytest.approx(60060.0 * 1.0025, rel=1e-6)
         assert out["reference_price"] == pytest.approx(60060.0)
+        assert out["executable_price"] == pytest.approx(60060.0 * 1.0025, rel=1e-6)
+        assert out["bid"] == pytest.approx(59940.0) and out["ask"] == pytest.approx(60060.0)
+        assert out["spread_bps"] == pytest.approx(20.0, rel=1e-3)
         assert not any(c["method"] == "POST" for c in session.calls)
+
+    def test_dry_run_uses_market_order_when_limit_orders_disabled(self):
+        session = FakeSession(_routes())
+        trader = _trader(session=session, use_limit_orders=False)
+        out = trader.open_position("btc", "LONG", 30)
+        order = out["order"]
+        assert order["type"] == "market"
+        assert order["market_order_config"]["asset_quantity"] == "0.000499"
 
     def test_live_posts_signed_json_body(self):
         session = FakeSession(_routes())
@@ -210,7 +239,9 @@ class TestTrades:
         assert out["status"] == "submitted" and out["order_id"] == "o-new"
         post = next(c for c in session.calls if c["method"] == "POST")
         body = json.loads(post["data"])
-        assert body["market_order_config"]["asset_quantity"] == "0.000499"
+        assert body["type"] == "limit"
+        assert body["limit_order_config"]["asset_quantity"] == "0.000499"
+        assert body["limit_order_config"]["time_in_force"] == "gtc"
         expected = rh.sign_request(
             rh.load_signing_key(PRIVATE_B64), "rh-key", int(post["headers"]["x-timestamp"]),
             rh.PATH_ORDERS, "POST", post["data"],
@@ -229,7 +260,7 @@ class TestTrades:
         out = trader.open_position("BTC", "SHORT", 30)
         assert out["status"] == "dry_run"
         assert out["order"]["side"] == "sell"
-        assert out["order"]["market_order_config"]["asset_quantity"] == "0.0001"
+        assert out["order"]["limit_order_config"]["asset_quantity"] == "0.0001"
 
     def test_short_without_holding_is_refused(self):
         trader = _trader(session=FakeSession(_routes(btc_qty="0")))
@@ -239,7 +270,8 @@ class TestTrades:
     def test_close_sells_whole_available_holding(self):
         out = _trader().close_position("BTC-USD")
         assert out["status"] == "dry_run" and out["direction"] == "CLOSE"
-        assert out["order"]["market_order_config"]["asset_quantity"] == "0.5"
+        assert out["order"]["limit_order_config"]["asset_quantity"] == "0.5"
+        assert out["order"]["limit_order_config"]["time_in_force"] == "gtc"
 
     def test_close_without_position(self):
         out = _trader(session=FakeSession(_routes(btc_qty="0"))).close_position("BTC")
@@ -247,9 +279,15 @@ class TestTrades:
 
     def test_drawdown_breach_halts_trading(self):
         trader = _trader()
-        trader._high_water_mark = 100000.0  # equity is 31,000 -> 69% drawdown
+        # Equity is 31,000 (see _routes() defaults) -> seeding a 100,000 peak
+        # through the persisted store is a 69% drawdown from the high-water
+        # mark, same scenario the old `trader._high_water_mark = 100000.0`
+        # attribute assignment used to set up before that attribute moved
+        # into RiskStore.
+        trader.risk_store.touch(trader.venue, 100000.0, utc_today())
         out = trader.open_position("BTC", "LONG", 10)
         assert "Max drawdown breached" in out["error"]
+        assert out["status"] == "blocked" and out["guard"] == "drawdown"
         assert trader.check_risk_limits()["drawdown_breached"] is True
 
     def test_cancel_dry_run_and_live(self):
@@ -279,3 +317,358 @@ class TestFactory:
         assert fields["ROBINHOOD_LIVE_TRADING"].default is False
         assert fields["ROBINHOOD_MAX_POSITION_USD"].default == 100.0
         assert fields["ROBINHOOD_BASE_URL"].default == rh.ROBINHOOD_BASE_URL
+        assert fields["ROBINHOOD_MAX_DAILY_LOSS_PCT"].default == 0.05
+        assert fields["ROBINHOOD_MAX_ORDERS_PER_DAY"].default == 6
+        assert fields["ROBINHOOD_USE_LIMIT_ORDERS"].default is True
+
+
+# ── persisted risk state (drawdown HWM, daily loss, order rate) ────────────
+
+
+class TestPersistedRiskState:
+    def test_peak_survives_a_new_trader_instance(self):
+        """The bug this module exists to fix: get_robinhood_trader() builds a
+        fresh RobinhoodCryptoTrader on every call, so the drawdown high-water
+        mark has to live outside that object to survive it — here, a
+        RiskStore shared across two independently-constructed traders,
+        exactly as two requests handled by the factory would share the same
+        Postgres-backed store."""
+        store = InMemoryRiskStore()
+        trader1 = _trader(risk_store=store)
+        seeded = trader1.check_risk_limits()
+        assert seeded["high_water_mark"] == pytest.approx(31000.0)
+
+        # A brand new instance, same store — as if get_robinhood_trader() had
+        # been called again on the next request after equity dropped to 0.
+        trader2 = _trader(session=FakeSession(_routes(buying_power="0", btc_qty="0")), risk_store=store)
+        risk = trader2.check_risk_limits()
+        assert risk["high_water_mark"] == pytest.approx(31000.0)  # survived the new instance
+        assert risk["current_drawdown_pct"] == pytest.approx(1.0)
+        assert risk["drawdown_breached"] is True
+
+    def test_daily_loss_cap_blocks_new_buys_not_sells(self):
+        trader = _trader(max_daily_loss_pct=0.05)
+        # Day started at 33,000; equity is 31,000 (_routes() defaults) — a
+        # 6.06% loss from the open, over the 5% cap. Drawdown from the same
+        # reference is also 6.06%, comfortably under the 20% default
+        # drawdown limit, so this trips ONLY the daily loss cap.
+        trader.risk_store.touch(trader.venue, 33000.0, utc_today())
+        out = trader.open_position("BTC", "LONG", 10)
+        assert out["status"] == "blocked" and out["guard"] == "daily_loss"
+        assert "Daily loss cap breached" in out["error"]
+        assert trader.check_risk_limits()["drawdown_breached"] is False
+        # Sells/closes stay allowed.
+        assert trader.close_position("BTC-USD")["status"] == "dry_run"
+
+    def test_daily_loss_resets_on_a_new_day(self):
+        trader = _trader(max_daily_loss_pct=0.05)
+        yesterday = utc_today() - timedelta(days=1)
+        # Yesterday's start (33,000) would itself be a daily-loss breach
+        # against today's 31,000 equity if it were still the reference —
+        # peak stays 33,000 either way (a high-water mark never resets).
+        trader.risk_store.touch(trader.venue, 33000.0, yesterday)
+        # check_risk_limits() (called inside open_position) uses utc_today(),
+        # which has moved on from `yesterday` -> day_start_equity rolls to
+        # TODAY's actual equity (31,000) in that same touch, so there is no
+        # loss "from today" even though peak/drawdown history is unaffected.
+        out = trader.open_position("BTC", "LONG", 10)
+        assert out["status"] == "dry_run"
+        risk = trader.check_risk_limits()
+        assert risk["day_start_equity"] == pytest.approx(31000.0)
+        assert risk["daily_loss_breached"] is False
+
+    def test_order_rate_cap_blocks_after_the_limit(self):
+        trader = _trader(max_orders_per_day=2)
+        assert trader.open_position("BTC", "LONG", 10)["status"] == "dry_run"
+        assert trader.open_position("BTC", "LONG", 10)["status"] == "dry_run"
+        out = trader.open_position("BTC", "LONG", 10)
+        assert out["status"] == "blocked" and out["guard"] == "order_rate"
+        assert "Order-rate cap reached" in out["error"]
+
+    def test_order_rate_cap_does_not_block_closes(self):
+        trader = _trader(max_orders_per_day=1)
+        trader.risk_store.touch(trader.venue, 31000.0, utc_today(), increment_order=True)
+        assert trader.check_risk_limits()["order_rate_breached"] is True
+        assert trader.close_position("BTC-USD")["status"] == "dry_run"
+
+
+# ── idempotency ──────────────────────────────────────────────────────────
+
+
+class TestIdempotency:
+    def test_duplicate_client_order_id_is_rejected(self):
+        trader = _trader()
+        first = trader.open_position("BTC", "LONG", 10, client_order_id="decision-1")
+        assert first["status"] == "dry_run"
+        second = trader.open_position("BTC", "LONG", 10, client_order_id="decision-1")
+        assert second["status"] == "duplicate"
+        assert second["client_order_id"] == "decision-1"
+
+    def test_different_keys_are_independent(self):
+        trader = _trader()
+        assert trader.open_position("BTC", "LONG", 10, client_order_id="a")["status"] == "dry_run"
+        assert trader.open_position("BTC", "LONG", 10, client_order_id="b")["status"] == "dry_run"
+
+    def test_close_position_is_deduplicated_too(self):
+        trader = _trader()
+        first = trader.close_position("BTC-USD", client_order_id="close-1")
+        assert first["status"] == "dry_run"
+        second = trader.close_position("BTC-USD", client_order_id="close-1")
+        assert second["status"] == "duplicate"
+
+    def test_a_blocked_attempt_does_not_burn_the_key(self):
+        """A guard rejection never reaches the order log, so the SAME
+        decision can retry once whatever guard tripped clears — see the
+        _CONSUMED_STATUSES note in trading/robinhood_risk_store.py."""
+        store = InMemoryRiskStore()
+        wallet_state = {"active": False}
+        trader = _trader(risk_store=store,
+                         wallet_lookup=lambda: {"id": "w1", "status": "ACTIVE"} if wallet_state["active"] else None)
+        blocked = trader.open_position("BTC", "LONG", 10, client_order_id="retry-me")
+        assert blocked["status"] == "blocked" and blocked["guard"] == "wallet"
+        assert store.is_duplicate("robinhood", "retry-me") is False
+
+        wallet_state["active"] = True
+        retried = trader.open_position("BTC", "LONG", 10, client_order_id="retry-me")
+        assert retried["status"] == "dry_run"
+
+
+# ── stale-quote and spread guards ───────────────────────────────────────
+
+
+class TestQuoteGuards:
+    def test_stale_quote_is_rejected(self):
+        old_ts = (datetime.now(timezone.utc) - timedelta(seconds=90)).isoformat()
+        trader = _trader(session=FakeSession(_routes(quote_timestamp=old_ts)), max_quote_age_s=30.0)
+        out = trader.open_position("BTC", "LONG", 10)
+        assert out["status"] == "blocked" and out["guard"] == "stale_quote"
+        assert "old" in out["error"]
+
+    def test_fresh_quote_passes(self):
+        fresh_ts = datetime.now(timezone.utc).isoformat()
+        trader = _trader(session=FakeSession(_routes(quote_timestamp=fresh_ts)), max_quote_age_s=30.0)
+        assert trader.open_position("BTC", "LONG", 10)["status"] == "dry_run"
+
+    def test_missing_timestamp_falls_back_to_local_fetch_time(self):
+        """_routes() with no quote_timestamp omits Robinhood's `timestamp`
+        field entirely -- the connector must fall back to its own fetch
+        time rather than treat that as infinitely stale."""
+        trader = _trader(session=FakeSession(_routes()), max_quote_age_s=5.0)
+        assert trader.open_position("BTC", "LONG", 10)["status"] == "dry_run"
+
+    def test_wide_spread_is_rejected(self):
+        trader = _trader(session=FakeSession(_routes(spread_pct=0.05)), max_spread_bps=50.0)
+        out = trader.open_position("BTC", "LONG", 10)
+        assert out["status"] == "blocked" and out["guard"] == "spread"
+        assert "spread" in out["error"]
+
+    def test_spread_within_cap_passes(self):
+        trader = _trader(session=FakeSession(_routes(spread_pct=0.001)), max_spread_bps=50.0)
+        assert trader.open_position("BTC", "LONG", 10)["status"] == "dry_run"
+
+    def test_close_is_also_guarded_by_stale_quote_and_spread(self):
+        old_ts = (datetime.now(timezone.utc) - timedelta(seconds=90)).isoformat()
+        trader = _trader(session=FakeSession(_routes(quote_timestamp=old_ts)), max_quote_age_s=30.0)
+        out = trader.close_position("BTC-USD")
+        assert out["status"] == "blocked" and out["guard"] == "stale_quote"
+
+        wide = _trader(session=FakeSession(_routes(spread_pct=0.05)), max_spread_bps=50.0)
+        out2 = wide.close_position("BTC-USD")
+        assert out2["status"] == "blocked" and out2["guard"] == "spread"
+
+
+# ── wallet gate ──────────────────────────────────────────────────────────
+
+
+class TestWalletGate:
+    def test_wallet_not_wired_never_blocks(self):
+        """Default state for a directly-constructed trader (no wallet_lookup)
+        — every pre-existing caller that never opted in keeps working."""
+        trader = _trader()
+        assert trader.wallet_lookup is None
+        assert trader.open_position("BTC", "LONG", 10)["status"] == "dry_run"
+
+    def test_killed_wallet_blocks_open(self):
+        trader = _trader(wallet_lookup=lambda: {"id": "w1", "status": "KILLED"})
+        out = trader.open_position("BTC", "LONG", 10)
+        assert out["status"] == "blocked" and out["guard"] == "wallet"
+
+    def test_no_active_wallet_blocks_open(self):
+        trader = _trader(wallet_lookup=lambda: None)
+        out = trader.open_position("BTC", "LONG", 10)
+        assert out["status"] == "blocked" and out["guard"] == "wallet"
+
+    def test_killed_wallet_blocks_close(self):
+        trader = _trader(wallet_lookup=lambda: {"id": "w1", "status": "KILLED"})
+        out = trader.close_position("BTC-USD")
+        assert out["status"] == "blocked" and out["guard"] == "wallet"
+
+    def test_active_wallet_allows_orders(self):
+        trader = _trader(wallet_lookup=lambda: {"id": "w1", "status": "ACTIVE"})
+        assert trader.open_position("BTC", "LONG", 10)["status"] == "dry_run"
+
+    def test_wallet_lookup_failure_fails_closed(self):
+        def _boom():
+            raise RuntimeError("db down")
+
+        trader = _trader(wallet_lookup=_boom)
+        out = trader.open_position("BTC", "LONG", 10)
+        assert out["status"] == "blocked" and out["guard"] == "wallet"
+
+    def test_cancel_is_not_wallet_gated(self):
+        """Cancelling only reduces risk — it stays available even when the
+        wallet is KILLED."""
+        session = FakeSession({**_routes(), ("POST", f"{rh.PATH_ORDERS}o1/cancel/"): {"ok": True}})
+        trader = _trader(live=True, session=session, wallet_lookup=lambda: {"id": "w1", "status": "KILLED"})
+        assert trader.cancel_order("o1")["status"] == "cancel_requested"
+
+
+# ── alerts ───────────────────────────────────────────────────────────────
+
+
+class TestAlerts:
+    def test_alert_fires_on_live_order(self):
+        session = FakeSession(_routes())
+        alert_fn = MagicMock()
+        trader = _trader(live=True, session=session, alert_fn=alert_fn)
+        out = trader.open_position("BTC", "LONG", 10)
+        assert out["status"] == "submitted"
+        assert alert_fn.called
+        assert "LIVE" in alert_fn.call_args_list[-1].args[0]
+
+    def test_no_alert_on_a_clean_dry_run_by_default(self):
+        alert_fn = MagicMock()
+        trader = _trader(alert_fn=alert_fn)
+        assert trader.open_position("BTC", "LONG", 10)["status"] == "dry_run"
+        assert not alert_fn.called
+
+    def test_dry_run_alert_is_opt_in(self):
+        alert_fn = MagicMock()
+        trader = _trader(alert_fn=alert_fn, alert_on_dry_run=True)
+        trader.open_position("BTC", "LONG", 10)
+        assert alert_fn.called
+
+    def test_alert_fires_on_guard_trip(self):
+        alert_fn = MagicMock()
+        trader = _trader(alert_fn=alert_fn)
+        trader.risk_store.touch(trader.venue, 100000.0, utc_today())
+        trader.open_position("BTC", "LONG", 10)
+        assert alert_fn.called
+        assert "guard tripped" in alert_fn.call_args_list[-1].args[0].lower()
+
+    def test_alert_failure_never_breaks_the_order(self):
+        def _boom(*_a, **_kw):
+            raise RuntimeError("smtp down")
+
+        trader = _trader(session=FakeSession(_routes()), live=True, alert_fn=_boom)
+        out = trader.open_position("BTC", "LONG", 10)
+        assert out["status"] == "submitted"
+
+
+# ── wallet P&L settlement ────────────────────────────────────────────────
+
+
+class TestWalletPnl:
+    def test_update_pnl_called_on_sell_fill_with_estimated_cost_basis(self):
+        store = InMemoryRiskStore()
+        pnl_fn = MagicMock()
+        wallet = {"id": "w1", "status": "ACTIVE"}
+
+        buyer = _trader(session=FakeSession(_routes(price="60000")),
+                        risk_store=store, wallet_lookup=lambda: wallet, wallet_pnl_fn=pnl_fn)
+        assert buyer.open_position("BTC", "LONG", 100, client_order_id="buy-1")["status"] == "dry_run"
+        assert not pnl_fn.called  # a BUY never realizes P&L
+
+        # Sell at a higher price than the recorded buy -> a profit, estimated
+        # from GRID's own order log (Robinhood's API exposes no cost basis).
+        seller = _trader(session=FakeSession(_routes(price="66000", btc_qty="0.5")),
+                         risk_store=store, wallet_lookup=lambda: wallet, wallet_pnl_fn=pnl_fn)
+        assert seller.close_position("BTC-USD", client_order_id="sell-1")["status"] == "dry_run"
+        assert pnl_fn.called
+        wallet_id, pnl, is_win = pnl_fn.call_args.args
+        assert wallet_id == "w1"
+        assert is_win is True and pnl > 0
+
+    def test_no_update_pnl_without_prior_cost_history(self):
+        pnl_fn = MagicMock()
+        trader = _trader(wallet_lookup=lambda: {"id": "w1", "status": "ACTIVE"}, wallet_pnl_fn=pnl_fn)
+        trader.close_position("BTC-USD")  # nothing bought through this connector yet
+        assert not pnl_fn.called
+
+    def test_no_update_pnl_without_a_wallet(self):
+        pnl_fn = MagicMock()
+        trader = _trader(wallet_pnl_fn=pnl_fn)  # wallet_lookup not wired -> wallet is always None
+        trader.close_position("BTC-USD")
+        assert not pnl_fn.called
+
+
+# ── simulate_order / simulate_close (the forward-paper-log API) ────────────
+
+
+class TestSimulate:
+    def test_simulate_order_never_submits_or_touches_counters(self):
+        trader = _trader(live=True)  # even a LIVE-configured trader
+        out = trader.simulate_order("BTC", "LONG", 10)
+        assert out["status"] == "dry_run"
+        assert not any(c["method"] == "POST" for c in trader._session.calls)
+        assert trader.risk_store.get_state(trader.venue).orders_today == 0
+
+    def test_simulate_still_evaluates_every_guard(self):
+        trader = _trader()
+        trader.risk_store.touch(trader.venue, 100000.0, utc_today())
+        out = trader.simulate_order("BTC", "LONG", 10)
+        assert out["status"] == "blocked" and out["guard"] == "drawdown"
+
+    def test_simulate_does_not_burn_the_idempotency_key(self):
+        trader = _trader()
+        trader.simulate_order("BTC", "LONG", 10, client_order_id="probe-1")
+        real = trader.open_position("BTC", "LONG", 10, client_order_id="probe-1")
+        assert real["status"] == "dry_run"  # not reported as a duplicate of the simulation
+
+    def test_simulate_close(self):
+        trader = _trader(live=True)
+        out = trader.simulate_close("BTC-USD")
+        assert out["status"] == "dry_run"
+        assert not any(c["method"] == "POST" for c in trader._session.calls)
+
+
+# ── reconcile_stale_orders (explicit cancel-after for gtc limit orders) ────
+
+
+class TestReconcileStaleOrders:
+    def _routes_with_open_order(self, created_at: str, state: str = "open"):
+        routes = _routes()
+        routes[("GET", rh.PATH_ORDERS)] = {"results": [
+            {"id": "stale-1", "symbol": "BTC-USD", "side": "buy", "type": "limit", "state": state,
+             "filled_asset_quantity": "0", "average_price": None, "created_at": created_at},
+        ]}
+        routes[("POST", f"{rh.PATH_ORDERS}stale-1/cancel/")] = {"ok": True}
+        return routes
+
+    def test_noop_in_dry_run(self):
+        trader = _trader(live=False, use_limit_orders=True)
+        assert trader.reconcile_stale_orders() == {"checked": 0, "cancelled": []}
+
+    def test_noop_for_market_orders(self):
+        trader = _trader(live=True, use_limit_orders=False)
+        assert trader.reconcile_stale_orders() == {"checked": 0, "cancelled": []}
+
+    def test_cancels_an_order_older_than_the_cutoff(self):
+        old = (datetime.now(timezone.utc) - timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        session = FakeSession(self._routes_with_open_order(old))
+        trader = _trader(live=True, session=session, use_limit_orders=True, limit_cancel_after_s=15.0)
+        result = trader.reconcile_stale_orders()
+        assert result == {"checked": 1, "cancelled": ["stale-1"]}
+
+    def test_leaves_a_recent_order_alone(self):
+        recent = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        session = FakeSession(self._routes_with_open_order(recent))
+        trader = _trader(live=True, session=session, use_limit_orders=True, limit_cancel_after_s=15.0)
+        result = trader.reconcile_stale_orders()
+        assert result == {"checked": 1, "cancelled": []}
+
+    def test_ignores_filled_orders(self):
+        old = (datetime.now(timezone.utc) - timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        session = FakeSession(self._routes_with_open_order(old, state="filled"))
+        trader = _trader(live=True, session=session, use_limit_orders=True, limit_cancel_after_s=15.0)
+        assert trader.reconcile_stale_orders() == {"checked": 0, "cancelled": []}

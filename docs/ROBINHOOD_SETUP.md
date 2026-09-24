@@ -59,13 +59,86 @@ Nothing reaches Robinhood.
 ## 5. Go live
 
 Set `ROBINHOOD_LIVE_TRADING=true`, restart `grid-api`, and repeat step 4 with a
-small size. Risk rails that stay on regardless:
+small size. Risk rails that stay on regardless — every persisted one lives in
+`trading_risk_state` / `trading_order_log` (see "Persisted state" below), not
+on the connector object, so they survive a restart and the fresh
+`RobinhoodCryptoTrader` instance `get_robinhood_trader()` builds on every
+call:
 
-| Rail | Setting | Default |
-|---|---|---|
-| Per-order notional cap | `ROBINHOOD_MAX_POSITION_USD` | $100 |
-| Equity drawdown halt | `ROBINHOOD_MAX_DRAWDOWN_PCT` | 20 % from the high-water mark |
-| Shorts | n/a | spot only — SHORT sells held quantity, never goes net short |
+| Rail | Setting | Default | Persisted? |
+|---|---|---|---|
+| Per-order notional cap | `ROBINHOOD_MAX_POSITION_USD` | $100 | no (a pure input check) |
+| Equity drawdown halt | `ROBINHOOD_MAX_DRAWDOWN_PCT` | 20% from the high-water mark | yes |
+| Daily loss cap (blocks new buys; sells/closes stay allowed) | `ROBINHOOD_MAX_DAILY_LOSS_PCT` | 5% from start-of-day equity | yes |
+| Order-rate cap (blocks new buys) | `ROBINHOOD_MAX_ORDERS_PER_DAY` | 6/day | yes |
+| Idempotent submission | `client_order_id` / API `idempotency_key` | n/a | yes — repeat comes back `status="duplicate"` |
+| Stale-quote guard | `ROBINHOOD_MAX_QUOTE_AGE_S` | 30s | n/a (checked fresh every call) |
+| Spread guard | `ROBINHOOD_MAX_SPREAD_BPS` | 50bps | n/a |
+| Marketable limit orders | `ROBINHOOD_USE_LIMIT_ORDERS` / `ROBINHOOD_LIMIT_SLIPPAGE_BPS` | on / 25bps | n/a |
+| Wallet gate (KILLED/PAUSED/no wallet blocks orders) | n/a — an ACTIVE `trading_wallets` row for `exchange='robinhood'` | n/a | reads `trading_wallets` |
+| Shorts | n/a | spot only — SHORT sells held quantity, never goes net short | n/a |
+
+The 50bps spread cap is a deliberately loose ceiling: BTC/ETH on Robinhood
+typically trade inside 5-10bps, so 50bps only fires on a genuinely
+dislocated or illiquid quote while leaving headroom for smaller pairs GRID
+might route later.
+
+### Persisted state
+
+`trading_risk_state` (one row per venue) holds the drawdown high-water mark,
+start-of-day equity and today's order count; `trading_order_log` is the
+idempotent, cost-accounting audit trail (bid/ask/mid, the executable price,
+spread cost, and — once known — the fill price for every attempt that got
+far enough to be built). Both are created by
+`migrations/versions/robinhood_guards_20260924.py`, applied by the normal
+`alembic upgrade head` every deploy already runs. `RobinhoodCryptoTrader`
+never touches SQL directly — it talks to a `RiskStore`
+(`trading/robinhood_risk_store.py`): `PostgresRiskStore` in production,
+`InMemoryRiskStore` (process-local, resets per instance — the old behavior)
+for anything that doesn't wire a database in, e.g. tests and ad-hoc scripts.
+
+### Wallet gate
+
+Every order (open and close, on all three paths: the API routes,
+`scripts/live_rotation_trader.py --venue robinhood`, and
+`trading/signal_executor.py`'s `VenueTag`) requires an ACTIVE
+`trading_wallets` row for `exchange='robinhood'` — see "Tracking wallet"
+below to create one. A KILLED or PAUSED wallet, or none at all, blocks
+every order with `status="blocked", guard="wallet"`. Cancelling an order is
+NOT wallet-gated — it only reduces risk, so it stays available regardless.
+A wallet-lookup failure (e.g. the database is unreachable) fails closed
+(blocks), never open.
+
+### Order type
+
+Robinhood's Crypto Trading API supports `type=limit` with
+`limit_order_config: {asset_quantity, limit_price, time_in_force}` — `"gtc"`
+(good-till-canceled) is the only documented `time_in_force`, no IOC/FOK/
+expiry. With `ROBINHOOD_USE_LIMIT_ORDERS=true` (the default), GRID sends a
+*marketable* limit: buy at `ask * (1 + slippage_bps/10000)`, sell at
+`bid * (1 - slippage_bps/10000)` — priced to cross the spread and fill like
+a market order, with `ROBINHOOD_LIMIT_SLIPPAGE_BPS` (25bps default) as
+headroom against the price moving between quote and fill. Quantity is still
+sized off the raw touch price (ask/bid), not the padded limit price.
+Because `"gtc"` never expires on its own, `RobinhoodCryptoTrader.reconcile_stale_orders()`
+is the explicit cancel-after handling for a limit that doesn't fill
+immediately: it cancels our own LIVE orders resting past
+`ROBINHOOD_LIMIT_CANCEL_AFTER_S` (15s default). **This method is not wired
+into a scheduler by this change** — call it from a periodic job (Hermes
+step or otherwise) before ever setting `ROBINHOOD_LIVE_TRADING=true`.
+Setting `ROBINHOOD_USE_LIMIT_ORDERS=false` falls back to plain market
+orders, still behind the stale-quote and spread guards.
+
+### Simulate / forward paper log
+
+`RobinhoodCryptoTrader.simulate_order(ticker, direction, size_usd)` and
+`.simulate_close(ticker)` run every guard (wallet, drawdown, daily loss,
+order rate, stale quote, spread) against real current data and return the
+same full decision record `open_position`/`close_position` would in
+DRY_RUN — but never POST/cancel an order, and never touch the persisted
+order-rate counter, the idempotency log, or wallet P&L. This is the API a
+forward paper log should call to see "what would happen" without
+consuming an order-rate slot or an idempotency key.
 
 ## Endpoints
 
@@ -75,16 +148,23 @@ small size. Risk rails that stay on regardless:
 | GET | `/api/v1/trading/robinhood/balance` | buying power, holdings value, equity, HWM |
 | GET | `/api/v1/trading/robinhood/positions` | holdings valued at mid |
 | GET | `/api/v1/trading/robinhood/orders?limit=50` | recent orders |
-| POST | `/api/v1/trading/robinhood/trade` | `{ticker, direction, size_usd}` market order |
-| POST | `/api/v1/trading/robinhood/close` | `{ticker}` sell the whole holding |
+| POST | `/api/v1/trading/robinhood/trade` | `{ticker, direction, size_usd, idempotency_key?}` |
+| POST | `/api/v1/trading/robinhood/close` | `{ticker, idempotency_key?}` sell the whole holding |
 | POST | `/api/v1/trading/robinhood/orders/{id}/cancel` | cancel an open order |
 
-All endpoints require the normal GRID bearer token.
+All endpoints require the normal GRID bearer token. `idempotency_key` is
+optional; repeating it returns `status="duplicate"` instead of resubmitting.
+A tripped guard (drawdown, daily loss, order rate, wallet, stale quote, wide
+spread) returns HTTP 200 with `status="blocked"` and a `guard` field, not a
+400 — it's a deliberate risk decision, not a malformed request.
 
 `GET /api/v1/system/health` carries a `checks.robinhood` block (mode,
-configured, live_trading, caps). It reads local config only — health never
-calls Robinhood — and reports `mode: ERROR` plus a degraded reason when the
-key in `.env` cannot be loaded.
+configured, live_trading, and every cap above:
+max_position_usd/max_drawdown_pct/max_daily_loss_pct/max_orders_per_day/
+max_quote_age_s/max_spread_bps/use_limit_orders/limit_slippage_bps). It
+reads local config only — health never calls Robinhood or the database for
+this block — and reports `mode: ERROR` plus a degraded reason when the key
+in `.env` cannot be loaded.
 
 ## Wiring into the paper → live chain
 
@@ -93,6 +173,11 @@ paper P&L positive, oracle scoring positive, then a small live allocation.
 Every step below stays dry-run until `ROBINHOOD_LIVE_TRADING=true`.
 
 ### 1. Tracking wallet
+
+**Required, not just informative, as of the 2026-09-24 guards**: no ACTIVE
+`trading_wallets` row for `exchange='robinhood'` means every order — on all
+three paths — is blocked with `status="blocked", guard="wallet"`. Create one
+before anything else:
 
 ```bash
 curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
