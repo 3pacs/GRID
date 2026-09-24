@@ -158,6 +158,27 @@ def test_fetch_spy_put_call_returns_none_when_unavailable(tmp_path):
     assert engine._fetch_spy_put_call(conn) is None
 
 
+def test_fetch_spy_put_call_treats_stored_zero_as_unavailable_not_a_reading(tmp_path):
+    # spy_pcr has repeated 0 rows in production (2026-09-17 and others) --
+    # a put/call ratio of 0 is a bad write, never a real SPY reading.
+    engine = _make_engine(_FakeOllamaClient(""), None, tmp_path)
+    conn = _FakeConnection(pcr_row=(0, date(2026, 9, 17)), options_row=None)
+    assert engine._fetch_spy_put_call(conn) is None
+
+
+def test_fetch_spy_put_call_falls_through_a_stored_zero_to_the_next_source(tmp_path):
+    engine = _make_engine(_FakeOllamaClient(""), None, tmp_path)
+    conn = _FakeConnection(pcr_row=(0, date(2026, 9, 17)), options_row=(2.51, date(2026, 9, 23)))
+    result = engine._fetch_spy_put_call(conn)
+    assert result == {"value": 2.51, "date": "2026-09-23", "source": "options_daily_signals"}
+
+
+def test_fetch_spy_put_call_rejects_a_zero_options_daily_signals_fallback_too(tmp_path):
+    engine = _make_engine(_FakeOllamaClient(""), None, tmp_path)
+    conn = _FakeConnection(pcr_row=None, options_row=(0, date(2026, 9, 17)))
+    assert engine._fetch_spy_put_call(conn) is None
+
+
 def test_fetch_spy_put_call_never_raises_on_bad_connection(tmp_path):
     engine = _make_engine(_FakeOllamaClient(""), None, tmp_path)
 

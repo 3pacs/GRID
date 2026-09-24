@@ -234,6 +234,16 @@ class MarketBriefingEngine:
         ``None`` rather than a fabricated number if neither has data, per
         ``docs/reference/AVAILABILITY_CONTRACT.md``.
 
+        A stored value of exactly 0 is treated as unavailable, not as a
+        real reading: ``spy_pcr`` has repeated ``0`` rows (confirmed via a
+        read-only production query — 2026-09-17 and at least 14 other dates
+        in its history), which is put OI of 0 against real call OI, not a
+        plausible SPY put/call ratio. ``value <= 0`` can only be a bad
+        write for a ratio of two positive open-interest counts; treating it
+        as "no data" and falling back (or reporting unavailable) is the
+        same honesty rule this whole module exists to enforce, applied to
+        its own new input.
+
         Parameters:
             conn: Open SQLAlchemy connection, reused from the caller's
                 ``with self.engine.connect() as conn:`` block.
@@ -255,7 +265,7 @@ class MarketBriefingEngine:
                 ),
                 {"name": "spy_pcr"},
             ).fetchone()
-            if row and row[0] is not None:
+            if row and row[0] is not None and float(row[0]) > 0:
                 return {
                     "value": round(float(row[0]), 4),
                     "date": str(row[1]),
@@ -271,14 +281,14 @@ class MarketBriefingEngine:
                 ),
                 {"ticker": "SPY"},
             ).fetchone()
-            if row and row[0] is not None:
+            if row and row[0] is not None and float(row[0]) > 0:
                 return {
                     "value": round(float(row[0]), 4),
                     "date": str(row[1]),
                     "source": "options_daily_signals",
                 }
         except Exception as exc:
-            log.debug("Could not fetch SPY put/call ratio: {e}", e=str(exc))
+            log.warning("Could not fetch SPY put/call ratio: {e}", e=str(exc))
 
         return None
 
