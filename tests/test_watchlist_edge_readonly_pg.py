@@ -48,9 +48,9 @@ def _create_signal_sources(engine) -> None:
                 (source_type, source_id, ticker, signal_type, signal_date, signal_value, outcome, trust_score)
             VALUES (:source_type, :source_id, 'TEST', 'BUY', CURRENT_DATE, CAST(:signal_value AS JSONB), :outcome, :trust_score)
         """), [
-            {"source_type": "congressional", "source_id": "Member A", "signal_value": '{"amount":"$1000"}', "outcome": "PENDING", "trust_score": 0.0},
-            {"source_type": "insider", "source_id": "Officer B", "signal_value": '{"title":"CEO"}', "outcome": "CORRECT", "trust_score": 0.8},
-            {"source_type": "darkpool", "source_id": "Pool C", "signal_value": '{"volume_vs_avg":2.1}', "outcome": "PENDING", "trust_score": 0.6},
+            {"source_type": "congressional", "source_id": "Member A", "signal_value": '{"amount_range":"$1000"}', "outcome": "PENDING", "trust_score": 0.0},
+            {"source_type": "insider", "source_id": "Officer B", "signal_value": '{"insider_title":"CEO"}', "outcome": "CORRECT", "trust_score": 0.8},
+            {"source_type": "darkpool", "source_id": "Pool C", "signal_value": '{"spike_ratio":2.1}', "outcome": "PENDING", "trust_score": 0.6},
         ])
         conn.execute(text("""
             INSERT INTO signal_sources

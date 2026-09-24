@@ -618,20 +618,20 @@ def get_ticker_edge(
                 if source_type == "congressional" and _edge_within_days(signal_date, 45):
                     congressional.append({
                         "member": str(source_id), "action": signal,
-                        "amount": meta.get("amount", "N/A"), "date": str(signal_date),
+                        "amount": meta.get("amount_range", meta.get("amount", "N/A")), "date": str(signal_date),
                         "committee": meta.get("committee", "N/A"),
                         "trust_score": _round_or_none(trust_score),
                     })
                 elif source_type == "insider" and _edge_within_days(signal_date, 30):
                     insider.append({
-                        "name": str(source_id), "title": meta.get("title", ""),
+                        "name": str(source_id), "title": meta.get("insider_title", meta.get("title", "")),
                         "action": signal, "shares": meta.get("shares"),
                         "value": meta.get("value"), "date": str(signal_date),
                         "cluster": meta.get("cluster", False),
                     })
                 elif source_type == "darkpool" and _edge_within_days(signal_date, 7) and dark_pool is None:
                     dark_pool = {
-                        "volume_vs_avg": meta.get("volume_vs_avg"),
+                        "volume_vs_avg": meta.get("spike_ratio", meta.get("volume_vs_avg")),
                         "signal": "accumulation" if signal == "BUY" else "distribution" if signal == "SELL" else "unavailable",
                         "date": str(signal_date),
                     }
