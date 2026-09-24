@@ -10,13 +10,25 @@ might rename/add lives behind :func:`DealerGammaAdapter._translate` — so
 adapting to the merged engine (below) only required editing this one
 function and its tests, not every call site.
 
-Pre-registration inputs this maps directly:
-  "Levels, from `physics.dealer_gamma.DealerGammaEngine` at the pinned code
-  commit ...: gamma flip, put wall, call wall, the engine's spot and its
-  source, aggregate GEX, normalized GEX, and regime ... Sign convention:
-  dealers modeled long calls and short puts; GEX > 0 means dealers long
-  gamma."
-  "engine_unavailable: the engine returns no spot, flip or walls."
+Pre-registration inputs this maps directly (as amended by Amendment 1,
+2951e4cc):
+  "Levels, from `physics.dealer_gamma.DealerGammaEngine` ...: gamma flip,
+  the engine's spot and its source, aggregate GEX, normalized GEX, and
+  regime ... Sign convention: dealers modeled long calls and short puts;
+  GEX > 0 means dealers long gamma."
+  "Walls (Amendment 1). The engine's own put wall and call wall are
+  recorded as `engine_put_wall` / `engine_call_wall` but are not tested."
+  "`engine_unavailable`: the engine returns its unavailable result (no
+  measured spot) or no regime. A missing flip or wall is recorded, not
+  excluded."
+
+Note what changed in Amendment 1 versus the original pre-registration:
+`put_wall`/`call_wall` are no longer part of what this adapter calls
+"available" — they're recorded as `engine_put_wall`/`engine_call_wall`
+(untested; the *tested* walls, per Amendment 1, come from
+``tested_walls.py``, computed from the full per-strike chain, not from
+this adapter). A missing `gamma_flip` also no longer makes a result
+unavailable — only a missing `spot` or `regime` does.
 
 The merged engine's ``compute_gex_profile`` returns one of three shapes,
 all handled below:
@@ -65,15 +77,21 @@ from physics.dealer_gamma import DealerGammaEngine
 
 @dataclass(frozen=True)
 class LevelsResult:
-    """Canonical, engine-version-independent shape for a levels lookup."""
+    """Canonical, engine-version-independent shape for a levels lookup.
+
+    ``available`` gates only on ``spot``/``regime`` (Amendment 1) — a
+    ``None`` ``gamma_flip``, ``engine_put_wall``, or ``engine_call_wall``
+    can still appear on an ``available=True`` result; callers record that
+    as a missing level, not an exclusion.
+    """
 
     available: bool
     unavailable_reason: str | None
     spot: float | None
     spot_source: str | None
     gamma_flip: float | None
-    put_wall: float | None
-    call_wall: float | None
+    engine_put_wall: float | None
+    engine_call_wall: float | None
     gex_aggregate: float | None
     gex_normalized: float | None
     regime: str | None
@@ -99,7 +117,8 @@ _DEFAULT_SPOT_SOURCE = (
     "source) via physics.dealer_gamma.DealerGammaEngine"
 )
 
-_REQUIRED_KEYS = ("spot", "gamma_flip", "put_wall", "call_wall")
+# Amendment 1: only these two gate availability now.
+_REQUIRED_KEYS = ("spot", "regime")
 
 
 class DealerGammaAdapter:
@@ -123,74 +142,58 @@ class DealerGammaAdapter:
     @staticmethod
     def _translate(raw: dict[str, Any] | None) -> LevelsResult:
         if not raw:
-            return LevelsResult(
-                available=False,
-                unavailable_reason="engine returned no result",
-                spot=None, spot_source=None, gamma_flip=None, put_wall=None,
-                call_wall=None, gex_aggregate=None, gex_normalized=None,
-                regime=None, raw={},
-            )
+            return _unavailable("engine returned no result", raw={})
 
         if raw.get("available") is False:
             # store.availability.unavailable() payload — the engine's "no
             # measured spot" case. Prefer its specific `reason` over the
-            # legacy `error` key the engine also sets for older callers;
-            # `source` here is *how the engine knew it had nothing*
-            # (e.g. "options_daily_signals"), not a value to trust as
-            # spot_source since there is no spot.
-            return LevelsResult(
-                available=False,
-                unavailable_reason=str(raw.get("reason") or raw.get("error") or "engine result unavailable"),
-                spot=None, spot_source=None, gamma_flip=None, put_wall=None,
-                call_wall=None, gex_aggregate=None, gex_normalized=None,
-                regime=None, raw=raw,
+            # legacy `error` key the engine also sets for older callers.
+            return _unavailable(
+                str(raw.get("reason") or raw.get("error") or "engine result unavailable"),
+                raw=raw,
             )
 
         if "error" in raw:
             # Legacy shape only: `{"error": ..., "ticker": ...}` with no
             # other keys at all (e.g. an empty options chain — the engine
             # never got far enough to look up spot).
-            return LevelsResult(
-                available=False,
-                unavailable_reason=str(raw["error"]),
-                spot=None, spot_source=None, gamma_flip=None, put_wall=None,
-                call_wall=None, gex_aggregate=None, gex_normalized=None,
-                regime=None, raw=raw,
-            )
+            return _unavailable(str(raw["error"]), raw=raw)
 
         values = {k: raw.get(k) for k in _REQUIRED_KEYS}
         missing = [k for k, v in values.items() if v is None]
-        spot_source = raw.get("spot_source") or raw.get("source") or _DEFAULT_SPOT_SOURCE
 
         if missing:
-            # "the engine returns no spot, flip or walls" — engine_unavailable.
-            return LevelsResult(
-                available=False,
-                unavailable_reason=f"engine result missing: {', '.join(sorted(missing))}",
-                spot=_as_float(values["spot"]),
-                spot_source=spot_source if values["spot"] is not None else None,
-                gamma_flip=_as_float(values["gamma_flip"]),
-                put_wall=_as_float(values["put_wall"]),
-                call_wall=_as_float(values["call_wall"]),
-                gex_aggregate=_as_float(raw.get("gex_aggregate")),
-                gex_normalized=_as_float(raw.get("gex_normalized")),
-                regime=raw.get("regime"),
-                raw=raw,
-            )
+            # Amendment 1: "engine_unavailable ... means no measured spot
+            # or no regime" — narrower than the original pre-registration;
+            # a missing flip/wall no longer lands here.
+            return _unavailable(f"engine result missing: {', '.join(sorted(missing))}", raw=raw)
+
+        spot_source = raw.get("spot_source") or raw.get("source") or _DEFAULT_SPOT_SOURCE
 
         return LevelsResult(
             available=True,
             unavailable_reason=None,
-            spot=_as_float(values["spot"]),
+            spot=_as_float(raw.get("spot")),
             spot_source=str(spot_source),
-            gamma_flip=_as_float(values["gamma_flip"]),
-            put_wall=_as_float(values["put_wall"]),
-            call_wall=_as_float(values["call_wall"]),
+            gamma_flip=_as_float(raw.get("gamma_flip")),
+            engine_put_wall=_as_float(raw.get("put_wall")),
+            engine_call_wall=_as_float(raw.get("call_wall")),
             gex_aggregate=_as_float(raw.get("gex_aggregate")),
             gex_normalized=_as_float(raw.get("gex_normalized")),
             regime=raw.get("regime"),
             raw=raw,
         )
+
+
+def _unavailable(reason: str, *, raw: dict[str, Any]) -> LevelsResult:
+    return LevelsResult(
+        available=False,
+        unavailable_reason=reason,
+        spot=None, spot_source=None, gamma_flip=None,
+        engine_put_wall=None, engine_call_wall=None,
+        gex_aggregate=None, gex_normalized=None,
+        regime=None, raw=raw,
+    )
 
 
 def _as_float(value: Any) -> float | None:

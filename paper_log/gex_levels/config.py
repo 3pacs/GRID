@@ -22,19 +22,24 @@ EASTERN = ZoneInfo("America/New_York")
 # dev checkout (``resolve_prereg_sha256`` in storage.py). Production never
 # re-reads this file — it carries the hash below as a pinned constant.
 PREREG_RELATIVE_PATH = Path("docs/paper_log/gex-levels-v1-preregistration.md")
-PREREG_COMMIT = "47c05fc8"
+# Amendment 1 (2951e4cc, 2026-09-24) landed before any session was logged —
+# the document's own rule ("nothing below may change after the first
+# logged session") explicitly permits this, and the amendment says so
+# itself. PREREG_COMMIT/PREREG_SHA256 below are pinned to the AMENDED
+# text — the only text that will ever back a real (non-smoke) record.
+PREREG_COMMIT = "2951e4cc"
 
 # SHA-256 of the pre-registration file's exact committed bytes (LF line
 # endings), computed once and pinned here so the value written into the
 # first JSONL record never depends on a working copy's line endings or on
 # git being available at run time:
 #
-#   git show 47c05fc8:docs/paper_log/gex-levels-v1-preregistration.md | sha256sum
+#   git show 2951e4cc:docs/paper_log/gex-levels-v1-preregistration.md | sha256sum
 #
 # Verified 2026-09-24 to match both `git show <commit>:<path>` and the
 # working copy (repo core.autocrlf=true did not rewrite this particular
 # file — confirmed independently rather than assumed).
-PREREG_SHA256 = "5fbb6b302d5ec4955f107612b3cd90e15cdc4285b4b62435a9ed4628592beb99"
+PREREG_SHA256 = "551c4643cdcc7f7f30c509956b00e03fcaa1554c0ed1baf195e55372cc629acb"
 
 # ── Schedule / lateness gate ─────────────────────────────────────────────
 # "A session counts only if its pre-open record was written before 09:30
@@ -54,6 +59,11 @@ REF_MISMATCH_THRESHOLD_PCT = 0.0025
 
 # "A placebo within 0.10% of any real level is dropped."
 PLACEBO_COLLISION_THRESHOLD_PCT = 0.0010
+
+# Amendment 1: tested walls "must be at least 0.5% from P0, on the correct
+# side" — put wall among strikes <= (1 - this) * P0, call wall among
+# strikes >= (1 + this) * P0.
+TESTED_WALL_MIN_DISTANCE_PCT = 0.005
 
 # "more than one trading day old" -> stale_chain
 MAX_CHAIN_AGE_TRADING_DAYS = 1
@@ -112,6 +122,8 @@ EXCL_STALE_CHAIN = "stale_chain"
 EXCL_ENGINE_UNAVAILABLE = "engine_unavailable"
 EXCL_REF_MISMATCH = "ref_mismatch"
 EXCL_LATE_PREOPEN = "late_preopen"
+EXCL_DATA_UNAVAILABLE = "data_unavailable"  # Amendment 1
+EXCL_NO_PREOPEN = "no_preopen"  # Amendment 1
 EXCL_BARS_MISSING = "bars_missing"
 EXCL_MARKET_CLOSED = "market_closed"
 
@@ -121,9 +133,16 @@ ALL_EXCLUSION_CODES = (
     EXCL_ENGINE_UNAVAILABLE,
     EXCL_REF_MISMATCH,
     EXCL_LATE_PREOPEN,
+    EXCL_DATA_UNAVAILABLE,
+    EXCL_NO_PREOPEN,
     EXCL_BARS_MISSING,
     EXCL_MARKET_CLOSED,
 )
+
+# Amendment 1: "the market-data source for P0 or VIX was unreachable or
+# returned nothing at the pre-open run, after one retry" -> one retry
+# means two attempts total.
+DATA_FETCH_ATTEMPTS = 2
 
 # ── Read-only DB session guard ────────────────────────────────────────────
 

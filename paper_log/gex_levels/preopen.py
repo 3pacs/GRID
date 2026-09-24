@@ -1,19 +1,21 @@
-"""The pre-open run — pre-registration step 2 / task spec item 2.
+"""The pre-open run — pre-registration step 2 / task spec item 2 (as
+amended by Amendment 1, 2951e4cc).
 
 Orchestrates: chain selection (PIT-safe), the dealer-gamma engine (via the
-adapter), P0 + VIX (yfinance), the ref-mismatch cross-check, and placebo
-construction — applying every exclusion rule along the way — then writes
-exactly one JSONL record.
+adapter), P0 + VIX (yfinance, with one retry each), the ref-mismatch
+cross-check, tested-wall selection (Amendment 1), and placebo construction
+— applying every exclusion rule along the way — then writes exactly one
+JSONL record.
 
-All I/O is injected (``db_engine``, ``adapter``, ``now_fn``) so tests can
-run every branch of this function with no network and no database. See
-``tests/test_paper_log_preopen.py``.
+All I/O is injected (``db_engine``, ``adapter``, ``now_fn``,
+``compute_tested_walls``) so tests can run every branch of this function
+with no network and no database. See ``tests/test_paper_log_gex_levels_preopen.py``.
 """
 
 from __future__ import annotations
 
 from dataclasses import asdict
-from datetime import timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -23,24 +25,61 @@ from sqlalchemy.engine import Engine
 from paper_log.gex_levels.chain import select_chain_snapshot
 from paper_log.gex_levels.clock import now_utc, session_date_for, to_eastern
 from paper_log.gex_levels.config import (
+    DATA_FETCH_ATTEMPTS,
+    EXCL_DATA_UNAVAILABLE,
     EXCL_ENGINE_UNAVAILABLE,
-    EXCL_MARKET_CLOSED,
     EXCL_LATE_PREOPEN,
+    EXCL_MARKET_CLOSED,
     EXCL_NO_CHAIN,
     EXCL_REF_MISMATCH,
     EXCL_STALE_CHAIN,
     PREOPEN_DEADLINE_ET,
     REF_MISMATCH_THRESHOLD_PCT,
+    TESTED_WALL_MIN_DISTANCE_PCT,
     TICKER,
     VIX_TICKER,
 )
 from paper_log.gex_levels.db import assert_read_only
 from paper_log.gex_levels.engine_adapter import DealerGammaAdapter
-from paper_log.gex_levels.market_data import fetch_previous_close
+from paper_log.gex_levels.market_data import PricePoint, fetch_previous_close
 from paper_log.gex_levels.placebo import build_placebos
 from paper_log.gex_levels.records import envelope, levels_result_to_dict, price_point_to_dict
 from paper_log.gex_levels.sessions import is_market_open, last_trading_day
 from paper_log.gex_levels.storage import PaperLogStore
+from paper_log.gex_levels.tested_walls import WallSelection, compute_tested_walls_from_db
+
+
+def _fetch_with_retry(
+    fetch_fn: Callable[..., PricePoint | None],
+    *args: Any,
+    attempts: int = DATA_FETCH_ATTEMPTS,
+    label: str,
+    **kwargs: Any,
+) -> PricePoint | None:
+    """Amendment 1: "the market-data source for P0 or VIX was unreachable
+    or returned nothing at the pre-open run, after one retry." Treats a
+    raised exception ("unreachable") the same as a clean ``None`` return
+    ("returned nothing") — both count as an attempt that needs a retry —
+    and never raises itself; the caller decides what a final ``None``
+    means (``data_unavailable``)."""
+    result: PricePoint | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            result = fetch_fn(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 — any yfinance/network failure counts as "unreachable"
+            log.warning(
+                "paper_log preopen: {label} fetch attempt {a}/{n} raised: {e}",
+                label=label, a=attempt, n=attempts, e=str(exc),
+            )
+            result = None
+        if result is not None:
+            return result
+        if attempt < attempts:
+            log.warning(
+                "paper_log preopen: {label} fetch attempt {a}/{n} returned nothing, retrying",
+                label=label, a=attempt, n=attempts,
+            )
+    return None
 
 
 def run_preopen(
@@ -50,6 +89,7 @@ def run_preopen(
     code_sha: str,
     now_fn: Callable[[], Any] = now_utc,
     adapter: DealerGammaAdapter | None = None,
+    compute_tested_walls: Callable[[Engine, str, date, float, float], WallSelection] | None = None,
     ticker: str = TICKER,
 ) -> dict[str, Any]:
     """Run one pre-open cycle and append exactly one record. Returns it."""
@@ -113,28 +153,19 @@ def run_preopen(
     fields["engine"] = levels_result_to_dict(levels)
 
     if not levels.available:
+        # Amendment 1: engine_unavailable now means no measured spot or no
+        # regime only — a missing flip/wall no longer lands here (handled
+        # in `engine_adapter.py`).
         return _finish(excluded=True, reason=EXCL_ENGINE_UNAVAILABLE)
 
-    p0 = fetch_previous_close(ticker, session_date, now_fn=now_fn)
-    vix = fetch_previous_close(VIX_TICKER, session_date, now_fn=now_fn)
-    if p0 is None or vix is None:
-        # Not one of the pre-registration's seven exclusion codes — that
-        # list covers session-level data-quality problems (a stale chain,
-        # an unavailable engine, ...), not "the data vendor was briefly
-        # unreachable". Treating a yfinance outage as, say, engine_unavailable
-        # would misattribute the cause and pollute the exclusion-rate audit
-        # in status/evaluate. Instead: fail loudly, write nothing (the log
-        # stays append-only-clean — no line at all for this attempt, same
-        # as any other crashed run), and let the operator re-run before
-        # 09:30 ET or rely on the next scheduled attempt.
-        missing = "P0 (SPY previous close)" if p0 is None else "VIX previous close"
-        raise RuntimeError(
-            f"preopen: yfinance returned no data for {missing} "
-            f"(session_date={session_date}) — not a pre-registered exclusion "
-            "reason, so no record was written. Re-run before 09:30 ET."
-        )
-
+    p0 = _fetch_with_retry(fetch_previous_close, ticker, session_date, now_fn=now_fn, label="P0")
+    if p0 is None:
+        return _finish(excluded=True, reason=EXCL_DATA_UNAVAILABLE)
     fields["p0"] = price_point_to_dict(p0)
+
+    vix = _fetch_with_retry(fetch_previous_close, VIX_TICKER, session_date, now_fn=now_fn, label="VIX")
+    if vix is None:
+        return _finish(excluded=True, reason=EXCL_DATA_UNAVAILABLE)
     fields["vix_prev_close"] = price_point_to_dict(vix)
 
     ref_mismatch_pct = abs(levels.spot - p0.price) / p0.price
@@ -142,14 +173,36 @@ def run_preopen(
     if ref_mismatch_pct > REF_MISMATCH_THRESHOLD_PCT:
         return _finish(excluded=True, reason=EXCL_REF_MISMATCH)
 
-    real_levels = {
-        "gamma_flip": levels.gamma_flip,
-        "put_wall": levels.put_wall,
-        "call_wall": levels.call_wall,
-    }
-    placebos = build_placebos(real_levels, p0.price)
+    # Amendment 1: tested walls, from the full per-strike chain — not the
+    # engine's own (untested) put_wall/call_wall, recorded separately in
+    # fields["engine"] as engine_put_wall/engine_call_wall.
+    if compute_tested_walls is None:
+        tested = compute_tested_walls_from_db(
+            db_engine, ticker, chain.snap_date, levels.spot, p0.price,
+            min_distance_pct=TESTED_WALL_MIN_DISTANCE_PCT,
+        )
+    else:
+        tested = compute_tested_walls(db_engine, ticker, chain.snap_date, levels.spot, p0.price)
+
+    tested_present: dict[str, float] = {}
+    if levels.gamma_flip is not None:
+        tested_present["gamma_flip"] = levels.gamma_flip
+    if tested.put_wall is not None:
+        tested_present["put_wall"] = tested.put_wall
+    if tested.call_wall is not None:
+        tested_present["call_wall"] = tested.call_wall
+
+    placebos = build_placebos(tested_present, p0.price)
+
     fields["levels"] = {
-        "real": real_levels,
+        "real": {
+            "gamma_flip": levels.gamma_flip,
+            "gamma_flip_missing": levels.gamma_flip is None,
+            "put_wall": tested.put_wall,
+            "put_wall_missing": tested.put_wall is None,
+            "call_wall": tested.call_wall,
+            "call_wall_missing": tested.call_wall is None,
+        },
         "placebo": {name: asdict(pb) for name, pb in placebos.items()},
     }
 

@@ -21,6 +21,7 @@ from paper_log.gex_levels.clock import now_utc, session_date_for
 from paper_log.gex_levels.config import (
     EXCL_BARS_MISSING,
     EXCL_MARKET_CLOSED,
+    EXCL_NO_PREOPEN,
     H3_LEVEL_NAMES,
     LEVEL_NAMES,
     MAX_MISSING_BARS_PCT,
@@ -85,16 +86,11 @@ def run_postclose(
 
     preopen_record = _find_latest_preopen(store, session_date)
     if preopen_record is None:
-        # No taxonomy code covers "preopen never ran" (the seven exclusion
-        # codes are session-level data-quality outcomes, not "the prior
-        # step is missing"). Fail loudly instead of guessing; nothing is
-        # written, matching the same reasoning as preopen's own P0/VIX
-        # fetch-failure case.
-        raise RuntimeError(
-            f"postclose: no preopen record found for session_date={session_date} "
-            f"in {store.log_path} — run preopen first. Not a pre-registered "
-            "exclusion reason, so no record was written."
-        )
+        # Amendment 1: "no_preopen: the post-close run found no pre-open
+        # record for the session" -- so no session can go missing
+        # silently (this used to raise instead; the pre-amendment
+        # taxonomy had no code for it).
+        return _finish(excluded=True, reason=EXCL_NO_PREOPEN)
 
     if preopen_record["excluded"]:
         # The session was never validly registered at pre-open — there are
@@ -131,15 +127,21 @@ def run_postclose(
     fields["range_ln"] = range_ln(ohlc.high, ohlc.low)
 
     p0_price = preopen_record["p0"]["price"]
-    real_levels: dict[str, float] = preopen_record["levels"]["real"]
+    real_levels: dict[str, Any] = preopen_record["levels"]["real"]
     placebo_raw: dict[str, dict[str, Any]] = preopen_record["levels"]["placebo"]
     regime = preopen_record["engine"]["regime"]
     bars_seq = bars_result.bars
 
-    reaches_real = {
-        name: asdict(evaluate_reach(real_levels[name], p0_price, ohlc.open, ohlc.close, bars_seq))
-        for name in LEVEL_NAMES
-    }
+    # Amendment 1: a real level can be missing (recorded as `<name>: null`,
+    # `<name>_missing: true`) without excluding the session -- skip it here
+    # rather than assuming all three of LEVEL_NAMES are present.
+    reaches_real: dict[str, dict[str, Any] | None] = {}
+    for name in LEVEL_NAMES:
+        value = real_levels.get(name)
+        reaches_real[name] = (
+            None if value is None
+            else asdict(evaluate_reach(value, p0_price, ohlc.open, ohlc.close, bars_seq))
+        )
 
     reaches_placebo: dict[str, dict[str, Any] | None] = {}
     placebo_values: dict[str, float] = {}
@@ -155,7 +157,9 @@ def run_postclose(
 
     fields["reaches"] = {"real": reaches_real, "placebo": reaches_placebo}
 
-    real_walls = {name: real_levels[name] for name in H3_LEVEL_NAMES}
+    real_walls = {
+        name: real_levels[name] for name in H3_LEVEL_NAMES if real_levels.get(name) is not None
+    }
     placebo_walls = {name: placebo_values[name] for name in H3_LEVEL_NAMES if name in placebo_values}
 
     real_trade = compute_h3_trade(regime, real_walls, p0_price, ohlc.open, ohlc.close, bars_seq)

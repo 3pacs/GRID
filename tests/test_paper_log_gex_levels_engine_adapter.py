@@ -41,7 +41,7 @@ def test_available_result_translates_all_fields() -> None:
     assert result == LevelsResult(
         available=True, unavailable_reason=None,
         spot=555.0, spot_source=_DEFAULT_SPOT_SOURCE,
-        gamma_flip=550.0, put_wall=540.0, call_wall=560.0,
+        gamma_flip=550.0, engine_put_wall=540.0, engine_call_wall=560.0,
         gex_aggregate=1_234_000.0, gex_normalized=0.6, regime="LONG_GAMMA",
         raw=FULL_RESULT,
     )
@@ -57,8 +57,8 @@ def test_legacy_error_result_is_unavailable() -> None:
     assert result.unavailable_reason == "No options data for SPY"
     assert result.spot is None
     assert result.gamma_flip is None
-    assert result.put_wall is None
-    assert result.call_wall is None
+    assert result.engine_put_wall is None
+    assert result.engine_call_wall is None
     assert result.regime is None
 
 
@@ -88,8 +88,8 @@ def test_rich_unavailable_payload_prefers_reason_over_legacy_error() -> None:
     )
     assert result.spot is None
     assert result.gamma_flip is None
-    assert result.put_wall is None
-    assert result.call_wall is None
+    assert result.engine_put_wall is None
+    assert result.engine_call_wall is None
     assert result.regime is None
 
 
@@ -108,10 +108,10 @@ def test_empty_result_is_unavailable() -> None:
     assert result.unavailable_reason == "engine returned no result"
 
 
-@pytest.mark.parametrize("missing_key", ["spot", "gamma_flip", "put_wall", "call_wall"])
-def test_missing_any_required_key_is_engine_unavailable(missing_key: str) -> None:
-    """"the engine returns no spot, flip or walls" -> engine_unavailable,
-    regardless of which one is missing."""
+@pytest.mark.parametrize("missing_key", ["spot", "regime"])
+def test_missing_spot_or_regime_is_engine_unavailable(missing_key: str) -> None:
+    """Amendment 1: "engine_unavailable ... means no measured spot or no
+    regime" -- narrower than the original pre-registration."""
     broken = dict(FULL_RESULT)
     broken[missing_key] = None
     adapter = DealerGammaAdapter(engine=_FakeEngine(broken))
@@ -121,20 +121,32 @@ def test_missing_any_required_key_is_engine_unavailable(missing_key: str) -> Non
     assert missing_key in result.unavailable_reason
 
 
-def test_missing_key_still_surfaces_whatever_was_present() -> None:
-    """Partial results (e.g. spot came back but walls didn't) are still
-    recorded for audit even though the session will be excluded."""
+@pytest.mark.parametrize("missing_key", ["gamma_flip", "put_wall", "call_wall"])
+def test_missing_flip_or_wall_is_available_not_excluded(missing_key: str) -> None:
+    """Amendment 1: "A missing flip or wall is recorded, not excluded" --
+    the opposite of the pre-amendment behavior for these same three keys."""
     broken = dict(FULL_RESULT)
+    broken[missing_key] = None
+    adapter = DealerGammaAdapter(engine=_FakeEngine(broken))
+    result = adapter.get_levels("SPY", date(2026, 9, 24))
+
+    assert result.available is True
+    assert result.unavailable_reason is None
+
+
+def test_missing_flip_and_both_walls_together_still_available() -> None:
+    broken = dict(FULL_RESULT)
+    broken["gamma_flip"] = None
     broken["put_wall"] = None
     broken["call_wall"] = None
     adapter = DealerGammaAdapter(engine=_FakeEngine(broken))
     result = adapter.get_levels("SPY", date(2026, 9, 24))
 
-    assert result.available is False
+    assert result.available is True
     assert result.spot == 555.0
-    assert result.gamma_flip == 550.0
-    assert result.put_wall is None
-    assert result.call_wall is None
+    assert result.gamma_flip is None
+    assert result.engine_put_wall is None
+    assert result.engine_call_wall is None
 
 
 def test_prefers_engine_provided_spot_source_when_present() -> None:

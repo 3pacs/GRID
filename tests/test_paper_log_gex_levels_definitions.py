@@ -83,6 +83,28 @@ def test_gap_through_when_realized_open_crosses_level_relative_to_p0() -> None:
     assert outcome.held is None
 
 
+def test_gap_through_boundary_open_exactly_at_level_above() -> None:
+    # Amendment 1: "open >= L for an above level" is gap-through -- the
+    # exact boundary (open == L) counts, not just strictly past it.
+    bars = [_bar(0, 105, 106, 104, 105.5)]
+    outcome = evaluate_reach(level=105.0, p0=100.0, session_open=105.0, session_close=105.5, bars=bars)
+    assert outcome.status == STATUS_GAP_THROUGH
+
+
+def test_gap_through_boundary_open_exactly_at_level_below() -> None:
+    # "open <= L for a below level" -- same boundary rule downside.
+    bars = [_bar(0, 95, 96, 94, 95.5)]
+    outcome = evaluate_reach(level=95.0, p0=100.0, session_open=95.0, session_close=95.5, bars=bars)
+    assert outcome.status == STATUS_GAP_THROUGH
+
+
+def test_just_short_of_gap_through_boundary_is_not_gap_through() -> None:
+    # One cent short of the boundary: a normal reach, not a gap-through.
+    bars = [_bar(0, 104.99, 106, 104, 105.5)]
+    outcome = evaluate_reach(level=105.0, p0=100.0, session_open=104.99, session_close=105.5, bars=bars)
+    assert outcome.status == STATUS_REACHED
+
+
 def test_gap_through_downside() -> None:
     # Level (95) was below P0 (100), but session gapped down and opened at 90.
     bars = [_bar(0, 90, 91, 88, 89)]

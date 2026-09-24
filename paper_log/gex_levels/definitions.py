@@ -3,30 +3,21 @@ and "Hypotheses" H3 section, translated to code. Shared by ``postclose.py``
 (computes these once per session, writes them to the record) and
 ``evaluate.py`` (re-reads the written outcomes; does not recompute them).
 
-Interpretive note on "the open" (documented here once, since both
-`Reached` and `Held` depend on it): the pre-registration's Definitions
-section says a level is a "gap-through" when "the open is already beyond
-L", but also defines a level's above/below classification as "a level
-above the open" / "a level below the open". Taken as a single literal
-reference to the realized session open, those two sentences are
-self-contradictory — a level classified as "above the open" can, by that
-same classification, never have "the open already beyond it" (that would
-require the open to be above a level that is itself above the open).
-
-The reading that makes both sentences true simultaneously, and matches
-standard market usage of "gap-through" (price gaps across a level
-overnight, before the session even trades): classify each level's side
-using P0 (the pre-registration's own reference price, also the anchor the
-placebo mirrors are built from) at the time the level was set, and detect
-gap-through by checking whether the *realized* session open ended up on
-the *other* side of the level from where P0 was. When there is no gap
-(P0 and the realized open agree on which side of L they're on — the
-common case), classifying by P0 or by the realized open gives the same
-answer, so "a level above the open" is simultaneously true either way and
-the sentence is not being loose about which "open" it means. Held then
-compares the close's side to the open's side directly (no gap-through
-subtlety applies once a level has actually been reached, since a reached,
-non-gap-through level has side-vs-P0 == side-vs-open by construction).
+Side and gap-through (Amendment 1 made this literal and unambiguous —
+history for anyone diffing against the pre-amendment version of this
+file): "Side: a level above P0 is an 'above' level; a level below P0 is a
+'below' level." / "If the session opens at or beyond the level (open >= L
+for an above level, open <= L for a below level), it is a gap-through."
+Side is fixed by P0, not by the realized open; gap-through is then a
+direct, boundary-inclusive comparison of the realized open against L.
+(The original pre-registration text was ambiguous here — "a level above
+the open" vs. "the open is already beyond L" read as contradictory taken
+completely literally — and this module's first version resolved that
+ambiguity by inferring the P0-anchored reading via a side-vs-P0-vs-
+side-vs-open comparison. Amendment 1 confirms that inferred reading was
+right in substance, but is stricter at the exact boundary open == L than
+that inference was — this version implements the amendment's literal
+`open >= L` / `open <= L` directly rather than keeping the old derivation.)
 """
 
 from __future__ import annotations
@@ -56,14 +47,18 @@ SIDE_BELOW = "below"
 @dataclass(frozen=True)
 class ReachOutcome:
     status: str  # "reached" | "gap_through" | "none"
-    side: str  # "above" | "below" — level's side relative to P0/open
+    side: str  # "above" | "below" — level's side relative to P0
     bar_time: datetime | None
     held: bool | None  # only meaningful when status == "reached"
 
 
-def _level_side(level: float, reference: float) -> str:
-    """'above' if level is at-or-above the reference price, else 'below'."""
-    return SIDE_ABOVE if level >= reference else SIDE_BELOW
+def _level_side(level: float, p0: float) -> str:
+    """"a level above P0 is an 'above' level; a level below P0 is a 'below'
+    level" (Amendment 1). ``level == p0`` exactly is not addressed by the
+    text either; treated as "above" for a single, documented, harmless
+    tie-break — real P0/level floats coinciding exactly is not a case that
+    occurs in practice."""
+    return SIDE_ABOVE if level >= p0 else SIDE_BELOW
 
 
 def is_held(level: float, session_open: float, session_close: float) -> bool:
@@ -80,14 +75,14 @@ def evaluate_reach(
     session_close: float,
     bars: Sequence[Bar],
 ) -> ReachOutcome:
-    """Reached / gap-through / none, per the pre-registration's Definitions."""
-    side_vs_p0 = _level_side(level, p0)
-    side_vs_open = _level_side(level, session_open)
+    """Reached / gap-through / none, per the pre-registration's Definitions
+    (Amendment 1's literal side/gap-through wording)."""
+    side = _level_side(level, p0)
 
-    if side_vs_p0 != side_vs_open:
-        return ReachOutcome(status=STATUS_GAP_THROUGH, side=side_vs_p0, bar_time=None, held=None)
+    gap_through = session_open >= level if side == SIDE_ABOVE else session_open <= level
+    if gap_through:
+        return ReachOutcome(status=STATUS_GAP_THROUGH, side=side, bar_time=None, held=None)
 
-    side = side_vs_open
     for bar in bars:
         touched = bar.high >= level if side == SIDE_ABOVE else bar.low <= level
         if touched:

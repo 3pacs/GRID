@@ -34,13 +34,29 @@ def _seed_preopen(
     excluded: bool = False,
     exclusion_reason: str | None = None,
     p0: float = 500.0,
-    gamma_flip: float = 495.0,
-    put_wall: float = 490.0,
-    call_wall: float = 520.0,
+    gamma_flip: float | None = 495.0,
+    put_wall: float | None = 490.0,
+    call_wall: float | None = 520.0,
     regime: str = "SHORT_GAMMA",
 ) -> dict[str, Any]:
-    real = {"gamma_flip": gamma_flip, "put_wall": put_wall, "call_wall": call_wall}
-    placebo = build_placebos(real, p0)
+    # Mirrors preopen.py's own construction: placebos are built from only
+    # the present (non-None) tested levels, and the recorded "real" dict
+    # carries an explicit `<name>_missing` flag alongside each value
+    # (Amendment 1).
+    present = {}
+    if gamma_flip is not None:
+        present["gamma_flip"] = gamma_flip
+    if put_wall is not None:
+        present["put_wall"] = put_wall
+    if call_wall is not None:
+        present["call_wall"] = call_wall
+    placebo = build_placebos(present, p0)
+
+    real = {
+        "gamma_flip": gamma_flip, "gamma_flip_missing": gamma_flip is None,
+        "put_wall": put_wall, "put_wall_missing": put_wall is None,
+        "call_wall": call_wall, "call_wall_missing": call_wall is None,
+    }
     record = {
         "kind": "preopen",
         "run_at": datetime.combine(session_date, datetime.min.time(), tzinfo=timezone.utc),
@@ -53,7 +69,7 @@ def _seed_preopen(
         },
         "engine": {
             "available": True, "unavailable_reason": None, "spot": p0, "spot_source": "test",
-            "gamma_flip": gamma_flip, "put_wall": put_wall, "call_wall": call_wall,
+            "gamma_flip": gamma_flip, "engine_put_wall": put_wall, "engine_call_wall": call_wall,
             "gex_aggregate": 1.0, "gex_normalized": 0.1, "regime": regime,
         },
         "p0": {"price": p0, "as_of_date": session_date - timedelta(days=1), "fetched_at": FETCH_TIME},
@@ -92,11 +108,15 @@ def test_market_closed_never_looks_for_preopen(tmp_path: Path, monkeypatch: pyte
 # ── missing / excluded preopen ──────────────────────────────────────
 
 
-def test_no_preopen_record_raises_and_writes_nothing(tmp_path: Path) -> None:
-    with pytest.raises(RuntimeError, match="no preopen record"):
-        run_postclose(log_dir=tmp_path, code_sha="deadbeef", now_fn=_now_fn(TRADING_DAY))
+def test_no_preopen_record_excludes_no_preopen(tmp_path: Path) -> None:
+    """Amendment 1: this used to raise (no taxonomy code covered it); now
+    it writes an excluded no_preopen record instead, so no session can go
+    missing silently."""
+    record = run_postclose(log_dir=tmp_path, code_sha="deadbeef", now_fn=_now_fn(TRADING_DAY))
+    assert record["excluded"] is True
+    assert record["exclusion_reason"] == "no_preopen"
     store = PaperLogStore(tmp_path)
-    assert store.read_all() == []
+    assert len(store.read_all()) == 1
 
 
 def test_excluded_preopen_propagates_same_reason(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -262,6 +282,34 @@ def test_neutral_regime_never_produces_a_trade(tmp_path: Path, monkeypatch: pyte
     assert record["excluded"] is False
     assert record["h3_trade"]["real"]["triggered"] is False
     assert record["h3_trade"]["placebo"]["triggered"] is False
+
+
+def test_missing_real_wall_cannot_reach_or_trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Amendment 1: a tested wall can be missing (no strike qualified) —
+    postclose must record it as `null` rather than crash, and it must not
+    be able to reach or trigger an H3 trade."""
+    store = PaperLogStore(tmp_path)
+    _seed_preopen(
+        store, session_date=TRADING_DAY, p0=500.0,
+        gamma_flip=495.0, put_wall=None, call_wall=520.0, regime="SHORT_GAMMA",
+    )
+    monkeypatch.setattr(
+        postclose_mod, "fetch_session_ohlc",
+        lambda ticker, d, now_fn: SessionOHLC(open=500.0, high=505.0, low=470.0, close=500.0, fetched_at=FETCH_TIME),
+    )
+    monkeypatch.setattr(postclose_mod, "expected_bar_count", lambda d: 1)
+    # Low of 470 would have reached a put_wall of 490 if one existed.
+    bars = (_bar(TRADING_DAY, 9, 30, 500.0, 505.0, 470.0, 500.0),)
+    monkeypatch.setattr(
+        postclose_mod, "fetch_intraday_bars",
+        lambda ticker, d, now_fn: IntradayBars(bars=bars, fetched_at=FETCH_TIME),
+    )
+
+    record = run_postclose(log_dir=tmp_path, code_sha="deadbeef", now_fn=_now_fn(TRADING_DAY))
+    assert record["excluded"] is False
+    assert record["reaches"]["real"]["put_wall"] is None
+    assert record["reaches"]["real"]["gamma_flip"] is not None  # unaffected
+    assert record["h3_trade"]["real"]["trigger_level_name"] != "put_wall"
 
 
 def test_dropped_placebo_wall_cannot_trigger_or_reach(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
