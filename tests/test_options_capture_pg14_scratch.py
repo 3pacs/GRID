@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import sys
 from datetime import datetime, timedelta, timezone
+from ipaddress import IPv4Address, ip_interface
 from threading import Event, Thread
 from types import SimpleNamespace
 from uuid import uuid4
@@ -69,6 +70,28 @@ def _create_scratch_engine(url: URL, **kwargs):
     }, **kwargs)
 
 
+def _is_expected_server_address(value: str | None) -> bool:
+    """PostgreSQL inet text includes a prefix, e.g. 127.0.0.1/32."""
+    try:
+        return ip_interface(value).ip == IPv4Address("127.0.0.1")
+    except (TypeError, ValueError):
+        return False
+
+
+@pytest.mark.parametrize(("server_addr", "expected"), [
+    ("127.0.0.1/32", True),
+    ("127.0.0.1", True),
+    ("127.0.0.2/32", False),
+    ("10.0.0.1/32", False),
+    ("::1/128", False),
+    (None, False),
+])
+def test_scratch_server_address_accepts_only_expected_loopback(
+    server_addr: str | None, expected: bool,
+) -> None:
+    assert _is_expected_server_address(server_addr) is expected
+
+
 @pytest.mark.parametrize("dsn", [
     "postgresql+psycopg2:///grid_gex_scratch_test",
     "postgresql+psycopg2://scratch@remote:55432/grid_gex_scratch_test",
@@ -122,7 +145,7 @@ def scratch_pg14(monkeypatch):
     schema = f"gex_capture_{uuid4().hex}"
     with admin.begin() as conn:
         server_addr = conn.exec_driver_sql("SELECT inet_server_addr()::text").scalar_one()
-        if server_addr != "127.0.0.1":
+        if not _is_expected_server_address(server_addr):
             pytest.fail(f"scratch server did not accept a loopback connection: {server_addr}")
         version = int(conn.exec_driver_sql("SHOW server_version_num").scalar_one())
         if version // 10000 != 14:
