@@ -1573,7 +1573,15 @@ class AstroGridStore:
                                   AND ers.id::text = pr.market_overlay_snapshot->'price_close_contract'->>'entry_resolved_series_id'
                                   AND epc.obs_date::text = pr.market_overlay_snapshot->'price_close_contract'->>'entry_obs_date'
                                   AND to_jsonb(epc.value) = pr.market_overlay_snapshot->'price_close_contract'->'entry_price'
-                                  AND to_jsonb(epc.available_at) = pr.market_overlay_snapshot->'price_close_contract'->'entry_available_at'
+                                  AND (
+                                      to_jsonb(epc.available_at) = pr.market_overlay_snapshot->'price_close_contract'->'entry_available_at'
+                                      OR to_char(epc.available_at AT TIME ZONE 'UTC',
+                                                 'YYYY-MM-DD"T"HH24:MI:SS') || '+00:00'
+                                          = pr.market_overlay_snapshot->'price_close_contract'->>'entry_available_at'
+                                      OR to_char(epc.available_at AT TIME ZONE 'UTC',
+                                                 'YYYY-MM-DD"T"HH24:MI:SS.US') || '+00:00'
+                                          = pr.market_overlay_snapshot->'price_close_contract'->>'entry_available_at'
+                                  )
                                   AND efr.name = :spy_feature
                                   AND epc.contract_version = :spy_contract
                                   AND epc.price_basis = :spy_basis
