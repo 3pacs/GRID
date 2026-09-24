@@ -95,6 +95,13 @@ def test_get_spot_returns_the_measured_close() -> None:
     assert engine._get_spot("SPY", SNAP_DATE) == 767.12
 
 
+@pytest.mark.parametrize("bad_close", [float("nan"), float("inf"), -1.0, "invalid"])
+def test_get_spot_rejects_invalid_resolved_close(bad_close: object) -> None:
+    engine = DealerGammaEngine(_FakeDB({"spy": bad_close}))
+
+    assert engine._get_spot("SPY", SNAP_DATE) == 0.0
+
+
 def test_profile_with_measured_close_labels_its_spot_source(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
