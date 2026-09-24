@@ -22,7 +22,7 @@ EASTERN = ZoneInfo("America/New_York")
 # dev checkout (``resolve_prereg_sha256`` in storage.py). Production never
 # re-reads this file — it carries the hash below as a pinned constant.
 PREREG_RELATIVE_PATH = Path("docs/paper_log/gex-levels-v1-preregistration.md")
-# The pre-registration has been amended twice, both times before any
+# The pre-registration has been amended three times, always before any
 # session was logged — the document's own rule ("nothing below may change
 # after the first logged session") explicitly permits this, and each
 # amendment says so itself. PREREG_COMMIT/PREREG_SHA256 below are pinned
@@ -34,14 +34,17 @@ PREREG_RELATIVE_PATH = Path("docs/paper_log/gex-levels-v1-preregistration.md")
 #   07ef4a3c — Amendment 1 item 5 (tested walls computed contract by
 #              contract, matching what tested_walls.py already did; notes
 #              the pinned engine must compute regime the same way as flip)
-PREREG_COMMIT = "07ef4a3c"
+#   4e6bc21b — Amendment 1 item 6 (defines the flip as the pinned engine's
+#              nearest-to-spot crossing on a 0.1%-of-spot grid, after PR
+#              #644's flip-search fix landed; records gamma_flip_crossings)
+PREREG_COMMIT = "4e6bc21b"
 
 # SHA-256 of the pre-registration file's exact committed bytes (LF line
 # endings), computed once and pinned here so the value written into the
 # first JSONL record never depends on a working copy's line endings or on
 # git being available at run time:
 #
-#   git show 07ef4a3c:docs/paper_log/gex-levels-v1-preregistration.md | sha256sum
+#   git show 4e6bc21b:docs/paper_log/gex-levels-v1-preregistration.md | sha256sum
 #
 # Verified 2026-09-24 to match both `git show <commit>:<path>` and the
 # working copy (repo core.autocrlf=true did not rewrite this particular
@@ -49,7 +52,7 @@ PREREG_COMMIT = "07ef4a3c"
 # update both PREREG_COMMIT and PREREG_SHA256 together if the
 # pre-registration is ever amended again before the first logged session
 # — never let one change without the other.
-PREREG_SHA256 = "8e4ce28ba9fc3479449f04e278532273224bce14edacfae14ab060329b8087f6"
+PREREG_SHA256 = "ce9b55e27913626a0259852ce1f39d81616b7cbe64fddc43bcaa4513c3ffcf77"
 
 # ── Schedule / lateness gate ─────────────────────────────────────────────
 # "A session counts only if its pre-open record was written before 09:30

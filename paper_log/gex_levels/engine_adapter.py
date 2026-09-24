@@ -30,6 +30,14 @@ Note what changed in Amendment 1 versus the original pre-registration:
 this adapter). A missing `gamma_flip` also no longer makes a result
 unavailable — only a missing `spot` or `regime` does.
 
+Amendment 1 item 6 (4e6bc21b, after PR #644's flip-search fix landed):
+the flip is defined as the engine's per-contract GEX zero crossing
+nearest spot on a 0.1%-of-spot grid, and the number of crossings the scan
+found (`gamma_flip_crossings` — 0/1/2+, an ambiguity signal when more than
+one nearby crossing exists) is recorded with every pre-open record. Not a
+new availability gate — it's diagnostic, carried straight through from the
+engine's own result.
+
 The merged engine's ``compute_gex_profile`` returns one of three shapes,
 all handled below:
   1. Success: a flat dict with spot/gamma_flip/put_wall/call_wall/
@@ -90,6 +98,7 @@ class LevelsResult:
     spot: float | None
     spot_source: str | None
     gamma_flip: float | None
+    gamma_flip_crossings: int | None
     engine_put_wall: float | None
     engine_call_wall: float | None
     gex_aggregate: float | None
@@ -176,6 +185,7 @@ class DealerGammaAdapter:
             spot=_as_float(raw.get("spot")),
             spot_source=str(spot_source),
             gamma_flip=_as_float(raw.get("gamma_flip")),
+            gamma_flip_crossings=_as_int(raw.get("gamma_flip_crossings")),
             engine_put_wall=_as_float(raw.get("put_wall")),
             engine_call_wall=_as_float(raw.get("call_wall")),
             gex_aggregate=_as_float(raw.get("gex_aggregate")),
@@ -189,7 +199,7 @@ def _unavailable(reason: str, *, raw: dict[str, Any]) -> LevelsResult:
     return LevelsResult(
         available=False,
         unavailable_reason=reason,
-        spot=None, spot_source=None, gamma_flip=None,
+        spot=None, spot_source=None, gamma_flip=None, gamma_flip_crossings=None,
         engine_put_wall=None, engine_call_wall=None,
         gex_aggregate=None, gex_normalized=None,
         regime=None, raw=raw,
@@ -198,3 +208,7 @@ def _unavailable(reason: str, *, raw: dict[str, Any]) -> LevelsResult:
 
 def _as_float(value: Any) -> float | None:
     return None if value is None else float(value)
+
+
+def _as_int(value: Any) -> int | None:
+    return None if value is None else int(value)

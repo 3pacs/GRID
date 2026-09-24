@@ -21,8 +21,8 @@ class _FakeEngine:
 
 
 FULL_RESULT = {
-    "ticker": "SPY", "spot": 555.0, "gamma_flip": 550.0, "put_wall": 540.0,
-    "call_wall": 560.0, "gex_aggregate": 1_234_000.0, "gex_normalized": 0.6,
+    "ticker": "SPY", "spot": 555.0, "gamma_flip": 550.0, "gamma_flip_crossings": 1,
+    "put_wall": 540.0, "call_wall": 560.0, "gex_aggregate": 1_234_000.0, "gex_normalized": 0.6,
     "regime": "LONG_GAMMA",
 }
 
@@ -41,7 +41,7 @@ def test_available_result_translates_all_fields() -> None:
     assert result == LevelsResult(
         available=True, unavailable_reason=None,
         spot=555.0, spot_source=_DEFAULT_SPOT_SOURCE,
-        gamma_flip=550.0, engine_put_wall=540.0, engine_call_wall=560.0,
+        gamma_flip=550.0, gamma_flip_crossings=1, engine_put_wall=540.0, engine_call_wall=560.0,
         gex_aggregate=1_234_000.0, gex_normalized=0.6, regime="LONG_GAMMA",
         raw=FULL_RESULT,
     )
@@ -147,6 +147,25 @@ def test_missing_flip_and_both_walls_together_still_available() -> None:
     assert result.gamma_flip is None
     assert result.engine_put_wall is None
     assert result.engine_call_wall is None
+
+
+def test_gamma_flip_crossings_passed_through() -> None:
+    """Amendment 1 item 6: the crossing count is carried straight through
+    (0 = no crossing, 1 = the common case, 2+ = ambiguous)."""
+    for n in (0, 1, 2, 5):
+        raw = dict(FULL_RESULT)
+        raw["gamma_flip_crossings"] = n
+        result = DealerGammaAdapter(engine=_FakeEngine(raw)).get_levels("SPY", date(2026, 9, 24))
+        assert result.gamma_flip_crossings == n
+
+
+def test_gamma_flip_crossings_missing_key_is_none_not_zero() -> None:
+    """A result with no `gamma_flip_crossings` key at all (e.g. an older
+    engine) must translate to None, not a fabricated 0."""
+    raw = dict(FULL_RESULT)
+    del raw["gamma_flip_crossings"]
+    result = DealerGammaAdapter(engine=_FakeEngine(raw)).get_levels("SPY", date(2026, 9, 24))
+    assert result.gamma_flip_crossings is None
 
 
 def test_prefers_engine_provided_spot_source_when_present() -> None:

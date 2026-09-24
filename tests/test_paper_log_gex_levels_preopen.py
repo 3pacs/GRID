@@ -44,14 +44,16 @@ def _price_point(price: float, as_of: date = date(2026, 9, 23)) -> PricePoint:
 
 FULL_LEVELS = LevelsResult(
     available=True, unavailable_reason=None,
-    spot=500.5, spot_source="test", gamma_flip=495.0, engine_put_wall=489.0, engine_call_wall=511.0,
+    spot=500.5, spot_source="test", gamma_flip=495.0, gamma_flip_crossings=1,
+    engine_put_wall=489.0, engine_call_wall=511.0,
     gex_aggregate=1.0, gex_normalized=0.1, regime="NEUTRAL", raw={"ok": True},
 )
 
 # Amendment 1: engine_unavailable is narrower now -- only spot/regime missing.
 UNAVAILABLE_LEVELS = LevelsResult(
     available=False, unavailable_reason="engine result missing: regime",
-    spot=500.5, spot_source="test", gamma_flip=495.0, engine_put_wall=489.0, engine_call_wall=None,
+    spot=500.5, spot_source="test", gamma_flip=495.0, gamma_flip_crossings=1,
+    engine_put_wall=489.0, engine_call_wall=None,
     gex_aggregate=None, gex_normalized=None, regime=None, raw={},
 )
 
@@ -197,7 +199,7 @@ def test_missing_flip_or_wall_is_not_engine_unavailable(tmp_path: Path, monkeypa
     _patch_success_path(monkeypatch, chain_snap_date=date(2026, 9, 23))
     levels = LevelsResult(
         available=True, unavailable_reason=None, spot=500.5, spot_source="test",
-        gamma_flip=None, engine_put_wall=None, engine_call_wall=None,
+        gamma_flip=None, gamma_flip_crossings=0, engine_put_wall=None, engine_call_wall=None,
         gex_aggregate=1.0, gex_normalized=0.1, regime="NEUTRAL", raw={},
     )
     record = _run(log_dir=tmp_path, adapter=_FakeAdapter(levels))
@@ -302,6 +304,9 @@ def test_successful_preopen_builds_real_levels_and_placebos(tmp_path: Path, monk
     # Engine's own (untested) walls, recorded separately.
     assert record["engine"]["engine_put_wall"] == 489.0
     assert record["engine"]["engine_call_wall"] == 511.0
+
+    # Amendment 1 item 6: recorded with every pre-open record.
+    assert record["engine"]["gamma_flip_crossings"] == 1
 
     real = record["levels"]["real"]
     assert real["gamma_flip"] == 495.0
