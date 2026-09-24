@@ -170,19 +170,20 @@ class TestIdempotencyLog:
         venue = _venue("dup")
         assert store.is_duplicate(venue, "k1") is False
         store.log_order(venue, "k1", ticker="BTC-USD", side="buy", direction="LONG",
-                        size_usd=10.0, quantity="0.0001", status="dry_run", simulated=True)
+                        size_usd=10.0, quantity="0.0001", order_type="limit",
+                        status="dry_run", simulated=True)
         assert store.is_duplicate(venue, "k1") is True
 
     def test_blocked_status_is_not_a_duplicate(self, store):
         venue = _venue("blocked")
         store.log_order(venue, "k1", ticker="BTC-USD", side="buy", direction="LONG",
-                        size_usd=10.0, status="blocked", simulated=False)
+                        size_usd=10.0, order_type="limit", status="blocked", simulated=False)
         assert store.is_duplicate(venue, "k1") is False
 
     def test_guard_results_and_raw_response_round_trip_as_jsonb(self, pg_engine, store):
         venue = _venue("jsonb")
         store.log_order(venue, "k1", ticker="BTC-USD", side="buy", direction="LONG", size_usd=10.0,
-                        status="dry_run", simulated=True,
+                        order_type="limit", status="dry_run", simulated=True,
                         guard_results={"drawdown": "ok"}, raw_response={"id": "o-1"})
         with pg_engine.connect() as conn:
             row = conn.execute(text(
@@ -198,9 +199,11 @@ class TestAverageCost:
     def test_volume_weighted_since_the_last_sell(self, store):
         venue = _venue("avg-cost")
         store.log_order(venue, "buy-1", ticker="BTC-USD", side="buy", direction="LONG",
-                        size_usd=100.0, quantity="1.0", fill_price=100.0, status="dry_run", simulated=True)
+                        size_usd=100.0, quantity="1.0", fill_price=100.0, order_type="limit",
+                        status="dry_run", simulated=True)
         store.log_order(venue, "buy-2", ticker="BTC-USD", side="buy", direction="LONG",
-                        size_usd=300.0, quantity="3.0", fill_price=200.0, status="dry_run", simulated=True)
+                        size_usd=300.0, quantity="3.0", fill_price=200.0, order_type="limit",
+                        status="dry_run", simulated=True)
         assert store.average_cost(venue, "BTC-USD") == pytest.approx(175.0)
 
     def test_none_without_history(self, store):
