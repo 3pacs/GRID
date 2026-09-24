@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 from scripts import ci_pg_module_runner as runner
 
@@ -93,6 +94,19 @@ def test_privileged_database_owner_is_refused(
     monkeypatch.setattr(runner, "create_engine", lambda *args, **kwargs: engine)
     with pytest.raises(ValueError, match="ownership marker"):
         runner._database_identity(URL, plan, plan["modules"][0], TOKEN)
+    engine.dispose.assert_called_once()
+
+
+def test_connection_failure_is_secret_free_and_prevents_pytest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, _, _ = _plan(tmp_path)
+    engine = MagicMock()
+    engine.connect.side_effect = OperationalError("connect", {}, Exception("placeholder secret"))
+    monkeypatch.setattr(runner, "create_engine", lambda *args, **kwargs: engine)
+    with pytest.raises(ValueError, match="disposable database identity check failed") as error:
+        runner._database_identity(URL, plan, plan["modules"][0], TOKEN)
+    assert "placeholder secret" not in str(error.value)
     engine.dispose.assert_called_once()
 
 

@@ -19,6 +19,7 @@ from pathlib import Path
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine.url import make_url
+from sqlalchemy.exc import SQLAlchemyError
 
 if __package__:
     from scripts.ci_pg_isolation_plan import LOCAL_HOSTS, URL_VARIABLES
@@ -72,7 +73,10 @@ def _entry(plan: dict[str, object], module: str, repo_root: Path) -> dict[str, o
 
 def _database_identity(url: str, plan: dict[str, object], entry: dict[str, object],
                        token: str) -> dict[str, object]:
-    parsed = make_url(url)
+    try:
+        parsed = make_url(url)
+    except SQLAlchemyError:
+        raise ValueError("malformed disposable database URL") from None
     database = entry["database_name"]
     if parsed.drivername not in ("postgresql", "postgresql+psycopg2", "postgresql+psycopg"):
         raise ValueError("pilot requires PostgreSQL URL")
@@ -85,17 +89,23 @@ def _database_identity(url: str, plan: dict[str, object], entry: dict[str, objec
     if not TOKEN_PATTERN.fullmatch(token):
         raise ValueError("disposable owner token must be 32-64 lowercase hex characters")
     expected_comment = f"grid_ci_disposable_v1:{token}:{database}"
-    engine = create_engine(url, pool_pre_ping=True, connect_args={"connect_timeout": 3})
     try:
-        with engine.connect() as conn:
-            row = conn.execute(text("""
-                SELECT current_database(), current_user, d.oid, r.rolname,
-                       shobj_description(d.oid, 'pg_database'),
-                       d.datistemplate, d.datallowconn,
-                       r.rolsuper, r.rolcreatedb
-                FROM pg_database d JOIN pg_roles r ON r.oid = d.datdba
-                WHERE d.datname = current_database()
-            """)).one()
+        engine = create_engine(url, pool_pre_ping=True, connect_args={"connect_timeout": 3})
+    except SQLAlchemyError:
+        raise ValueError("disposable database identity check failed") from None
+    try:
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(text("""
+                    SELECT current_database(), current_user, d.oid, r.rolname,
+                           shobj_description(d.oid, 'pg_database'),
+                           d.datistemplate, d.datallowconn,
+                           r.rolsuper, r.rolcreatedb
+                    FROM pg_database d JOIN pg_roles r ON r.oid = d.datdba
+                    WHERE d.datname = current_database()
+                """)).one()
+        except SQLAlchemyError:
+            raise ValueError("disposable database identity check failed") from None
         if (row[0] != database or row[1] != row[3] or row[4] != expected_comment
                 or row[5] or not row[6] or row[7] or row[8]):
             raise ValueError("database ownership marker, owner, or identity mismatch")
