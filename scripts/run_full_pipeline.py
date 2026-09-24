@@ -397,21 +397,9 @@ def run_pipeline(historical: bool = False) -> dict:
     summary["steps"]["digest"] = _safe_run("Daily Digest Email", _digest)
 
     # -----------------------------------------------------------------------
-    # STEP 12: File rotation / cleanup (insights)
-    # Briefing retention is owned by hermes_operator's briefing_cleanup task,
-    # gated by DAILY_INTEL_INITIAL_ALLOWLIST. Don't duplicate it here: Hermes'
-    # RUN_PIPELINE skill runs this step, which would bypass that gate.
-    # -----------------------------------------------------------------------
-    def _cleanup():
-        cleaned = {}
-        try:
-            from outputs.llm_logger import cleanup_old_insights
-            cleaned["insights"] = cleanup_old_insights(max_age_days=90)
-        except Exception as exc:
-            log.debug("Insight cleanup skipped: {e}", e=str(exc))
-        return cleaned
-    summary["steps"]["cleanup"] = _safe_run("File Rotation Cleanup", _cleanup)
-
+    # STEP 12: Retention is held in hermes_operator until its deletion policy
+    # is accepted. RUN_PIPELINE can invoke this runner, so neither insight nor
+    # briefing cleanup may run here around that allow-list gate.
     # -----------------------------------------------------------------------
     # Summary
     # -----------------------------------------------------------------------

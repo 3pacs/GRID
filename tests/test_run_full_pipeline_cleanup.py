@@ -1,37 +1,17 @@
-"""Regression: ``scripts/run_full_pipeline.py`` Step 12 ("File Rotation
-Cleanup") must only import names that exist, and must not own
-market-briefing retention.
+"""Regression: full-pipeline runs must respect the held retention policy.
 
-Step 12 used to run::
-
-    try:
-        from ollama.market_briefing import MarketBriefingGenerator
-        cleaned["briefings"] = MarketBriefingGenerator.cleanup_old_briefings(max_age_days=90)
-    except Exception as exc:
-        log.debug("Briefing cleanup skipped: {e}", e=str(exc))
-
-``ollama/market_briefing.py`` has only ever defined ``MarketBriefingEngine``
-(the wrong name dates from the commit that added the block, 1c2c7022), so
-every run raised ImportError, logged it at debug, reported the step "OK",
-and deleted nothing.
-
-The block is removed rather than renamed. Briefing retention already has a
-single owner, ``scripts/hermes_operator.py::_daily_intel_briefing_cleanup``
-(same 90-day window, correct class), gated by
-``DAILY_INTEL_INITIAL_ALLOWLIST`` and held out of it by the controller until
-a file-deletion policy is accepted (2026-09-20). ``run_pipeline`` is reachable
-from Hermes' ``RUN_PIPELINE`` repair skill (``scripts/hermes_fixers.py``), so
-correcting the name here would have turned a no-op into a second, ungated
-deletion path around that hold.
-
-No DB, network or filesystem side effects: every step except Step 12 is
-skipped, and both cleanup functions are stubs.
+Hermes' insight_cleanup and briefing_cleanup tasks are excluded from
+DAILY_INTEL_INITIAL_ALLOWLIST pending a deletion policy. RUN_PIPELINE can
+invoke this runner, so neither file deletion path may run here.
 """
+
 from __future__ import annotations
 
 import ast
+import sys
 from collections.abc import Callable
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -101,45 +81,35 @@ def rfp(monkeypatch: pytest.MonkeyPatch) -> Any:
     return module
 
 
-def test_cleanup_step_rotates_insights_and_leaves_briefings_to_hermes(
+def test_pipeline_does_not_bypass_held_retention_tasks(
     rfp: Any, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import db
-    import outputs.llm_logger
-    from ollama.market_briefing import MarketBriefingEngine
-
-    insight_calls: list[int] = []
-    briefing_calls: list[int] = []
-
-    def fake_insight_cleanup(max_age_days: int = 90) -> int:
-        insight_calls.append(max_age_days)
-        return 4
-
-    def fake_briefing_cleanup(max_age_days: int = 90) -> int:
-        briefing_calls.append(max_age_days)
-        return 0
-
-    monkeypatch.setattr(db, "get_engine", lambda: object())
-    monkeypatch.setattr(outputs.llm_logger, "cleanup_old_insights", fake_insight_cleanup)
-    monkeypatch.setattr(
-        MarketBriefingEngine, "cleanup_old_briefings", staticmethod(fake_briefing_cleanup),
-    )
+    # run_pipeline imports db once before invoking steps. Stub that import so
+    # no database settings, connection or other pipeline step is exercised.
+    fake_db = ModuleType("db")
+    fake_db.get_engine = lambda: object()
+    monkeypatch.setitem(sys.modules, "db", fake_db)
 
     ran: list[str] = []
 
-    def only_cleanup_step(label: str, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    def skip_step(label: str, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
         ran.append(label)
-        return fn(*args, **kwargs) if label == "File Rotation Cleanup" else None
 
-    monkeypatch.setattr(rfp, "_safe_run", only_cleanup_step)
-
+    monkeypatch.setattr(rfp, "_safe_run", skip_step)
     summary = rfp.run_pipeline(historical=False)
 
-    assert "File Rotation Cleanup" in ran
-    assert summary["steps"]["cleanup"]["insights"] == 4
-    assert insight_calls == [90]
-    assert "briefings" not in summary["steps"]["cleanup"]
-    assert briefing_calls == [], (
-        "briefing retention belongs to hermes_operator's allow-list-gated "
-        "briefing_cleanup task; run_pipeline must not delete briefings"
+    assert "File Rotation Cleanup" not in ran
+    assert "cleanup" not in summary["steps"]
+
+    # A direct call outside _safe_run would bypass the preceding assertion.
+    pipeline = next(
+        node for node in ast.parse(_PIPELINE.read_text(encoding="utf-8")).body
+        if isinstance(node, ast.FunctionDef) and node.name == "run_pipeline"
+    )
+    held_names = {"cleanup_old_insights", "cleanup_old_briefings"}
+    assert not any(
+        (isinstance(node, ast.Name) and node.id in held_names)
+        or (isinstance(node, ast.Attribute) and node.attr in held_names)
+        or (isinstance(node, ast.ImportFrom) and any(a.name in held_names for a in node.names))
+        for node in ast.walk(pipeline)
     )
