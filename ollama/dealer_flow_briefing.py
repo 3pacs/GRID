@@ -22,7 +22,7 @@ from sqlalchemy.engine import Engine
 
 from store.availability import unavailable
 
-SPOT_CONTRACT = "spy_receipt_chain_batch_pit_v3"
+SPOT_CONTRACT = "spy_receipt_chain_batch_pit_v4"
 
 
 def valid_spy_gex_profile(profile: Any, briefing_date: date) -> bool:
@@ -48,12 +48,14 @@ def valid_spy_gex_profile(profile: Any, briefing_date: date) -> bool:
         vintage_date = date.fromisoformat(profile["spot_vintage_date"])
         chain_first = datetime.fromisoformat(profile["chain_created_at"])
         chain_last = datetime.fromisoformat(profile["chain_created_at_max"])
+        chain_started = datetime.fromisoformat(profile["chain_capture_started_at"])
         chain_completed = datetime.fromisoformat(profile["chain_capture_completed_at"])
         UUID(profile["chain_batch_id"])
     except (KeyError, TypeError, ValueError, AttributeError):
         return False
     if any(ts.tzinfo is None for ts in (
-        available_at, receipt_created_at, chain_first, chain_last, chain_completed,
+        available_at, receipt_created_at, chain_first, chain_last,
+        chain_started, chain_completed,
     )):
         return False
     return (
@@ -65,7 +67,9 @@ def valid_spy_gex_profile(profile: Any, briefing_date: date) -> bool:
         )
         and release_date <= chain_date and vintage_date <= chain_date
         and available_at <= receipt_created_at <= chain_completed
-        and chain_first <= chain_last <= chain_completed <= datetime.now(timezone.utc)
+        and chain_started <= chain_completed <= datetime.now(timezone.utc)
+        and chain_first <= chain_last <= datetime.now(timezone.utc)
+        and chain_started.astimezone(timezone.utc).date() == chain_date
         and chain_first.astimezone(timezone.utc).date() == chain_date
         and chain_last.astimezone(timezone.utc).date() == chain_date
         and chain_completed.astimezone(timezone.utc).date() == chain_date
