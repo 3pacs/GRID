@@ -37,8 +37,11 @@ placed, and the database is read-only for this job.
   regime (LONG_GAMMA / SHORT_GAMMA / NEUTRAL, the engine's own thresholds). Sign convention:
   dealers modeled long calls and short puts; GEX > 0 means dealers long gamma.
 - Walls (Amendment 1). The engine's own put wall and call wall are recorded as
-  `engine_put_wall` / `engine_call_wall` but are not tested. The tested walls come from the
-  engine's per-strike output:
+  `engine_put_wall` / `engine_call_wall` but are not tested. The tested walls come from per-strike
+  gamma exposure computed contract by contract, the way the engine's flip search computes it (same
+  chain filters: open interest > 0, implied vol > 0, expiry after the snapshot date; each
+  contract's own expiry and implied vol; same Black-Scholes gamma, sign convention and spot), summed
+  by strike over the full chain:
   - Put wall: among strikes at or below 0.995 * P0, the strike with the largest put gamma exposure
     by magnitude (|put_gex|).
   - Call wall: among strikes at or above 1.005 * P0, the strike with the largest call gamma exposure
@@ -144,3 +147,8 @@ the SHA-256 of this amended file.
 3. Two exclusion codes added so no session can go missing silently: `data_unavailable` and
    `no_preopen`.
 4. Wording only: "side" is set by P0, the permutation seed is fixed at 20260924.
+5. The tested walls' per-strike exposure is recomputed contract by contract over the full chain.
+   The engine's own per-strike routine applied one expiry's time-to-expiry to all open interest at a
+   strike and returns only 30 rows. The pinned engine commit must compute the regime's aggregate
+   GEX contract by contract as well (the same way as its flip search), so that the regime and the
+   flip come from one consistent calculation.
