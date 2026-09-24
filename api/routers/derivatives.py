@@ -564,22 +564,20 @@ async def get_flow_narrative() -> dict[str, Any]:
 
     # Try the LLM-powered briefing first
     try:
-        from ollama.dealer_flow_briefing import SPOT_CONTRACT, get_latest_flow_briefing
+        from ollama.dealer_flow_briefing import (
+            SPOT_CONTRACT, get_latest_flow_briefing, valid_spy_gex_profile,
+        )
         result = get_latest_flow_briefing(db)
         positioning = result.get("positioning_data")
         saved_gex = positioning.get("gex") if isinstance(positioning, dict) else None
         spy_saved = saved_gex.get("SPY") if isinstance(saved_gex, dict) else None
-        saved_spot = spy_saved.get("spot") if isinstance(spy_saved, dict) else None
         if (
             result.get("content")
             and result.get("stale") is False
+            and result.get("briefing_date") == date.today().isoformat()
             and isinstance(positioning, dict)
             and positioning.get("spot_contract") == SPOT_CONTRACT
-            and isinstance(spy_saved, dict)
-            and spy_saved.get("spot_source") == "resolved_series"
-            and isinstance(saved_spot, (int, float))
-            and math.isfinite(saved_spot)
-            and saved_spot > 0
+            and valid_spy_gex_profile(spy_saved, date.today())
         ):
             return result
     except Exception as exc:
@@ -592,7 +590,8 @@ async def get_flow_narrative() -> dict[str, Any]:
 
         spot = spy.get("spot")
         if (
-            spy.get("available") is False
+            not valid_spy_gex_profile(spy, date.today())
+            or spy.get("available") is False
             or spy.get("error")
             or not isinstance(spot, (int, float))
             or not math.isfinite(spot)
@@ -618,37 +617,37 @@ async def get_flow_narrative() -> dict[str, Any]:
         vanna = spy.get("vanna_exposure", 0)
         charm = spy.get("charm_exposure", 0)
 
-        parts = [f"SPY is trading at ${spot:.2f}."]
+        parts = [f"SPY prior verified close was ${spot:.2f}."]
 
         if regime == "LONG_GAMMA":
             parts.append(
-                "Dealers are currently LONG GAMMA, meaning hedging flows will dampen "
-                "price moves. Expect range-bound, mean-reverting action."
+                "The assumed dealer-sign model estimates LONG GAMMA. Conditional "
+                "hedging could dampen moves; actual dealer positions are unknown."
             )
         elif regime == "SHORT_GAMMA":
             parts.append(
-                "Dealers are currently SHORT GAMMA. Hedging flows amplify directional "
-                "moves. Risk of gap moves and sustained trends is elevated."
+                "The assumed dealer-sign model estimates SHORT GAMMA. Conditional "
+                "hedging could amplify moves; actual dealer positions are unknown."
             )
         else:
             parts.append(
-                "Dealer gamma is near NEUTRAL. The market sits close to the gamma "
-                "flip point, making regime transitions likely on small moves."
+                "The assumed dealer-sign model estimates near NEUTRAL gamma. "
+                "Actual dealer positions are unknown."
             )
 
         if flip:
             position = "above" if spot > flip else "below"
-            parts.append(f"Gamma flip is at ${flip:.0f} (spot is {position}).")
+            parts.append(f"Modeled gamma flip is at ${flip:.0f} (prior close is {position}).")
 
         if put_wall and call_wall:
             parts.append(
-                f"Gamma walls: put wall (support) at ${put_wall:.0f}, "
-                f"call wall (resistance) at ${call_wall:.0f}."
+                f"Modeled exposure walls: put at ${put_wall:.0f}, "
+                f"call at ${call_wall:.0f}."
             )
 
         parts.append(
-            f"Aggregate GEX: ${gex:,.0f}. "
-            f"Vanna exposure: ${vanna:,.0f}. Charm exposure: ${charm:,.0f}."
+            f"Modeled aggregate GEX: ${gex:,.0f}. "
+            f"Modeled vanna: ${vanna:,.0f}. Modeled charm: ${charm:,.0f}."
         )
 
         narrative = " ".join(parts)

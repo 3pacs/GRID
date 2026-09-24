@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -80,9 +80,18 @@ def _compute_profile(
     spot: float = SPOT,
 ) -> dict:
     chain = pd.DataFrame(rows)
+    chain_time = datetime.combine(SNAP_DATE, datetime.min.time(), timezone.utc) + timedelta(hours=19)
+    chain.attrs.update(snap_date=SNAP_DATE, created_at_min=chain_time,
+                       created_at_max=chain_time)
     engine = DealerGammaEngine(MagicMock(), risk_free_rate=RISK_FREE_RATE)
     monkeypatch.setattr(engine, "_load_chain", lambda _ticker, _snap_date: chain)
-    monkeypatch.setattr(engine, "_get_spot", lambda _ticker, _snap_date: spot)
+    monkeypatch.setattr(engine, "_get_spot_receipt", lambda _ticker, _time: {
+        "price": spot, "receipt_id": 1,
+        "obs_date": SNAP_DATE - timedelta(days=1),
+        "available_at": chain_time - timedelta(hours=1),
+        "receipt_created_at": chain_time - timedelta(minutes=30),
+        "release_date": SNAP_DATE, "vintage_date": SNAP_DATE,
+    })
 
     return engine.compute_gex_profile(
         "XYZ",

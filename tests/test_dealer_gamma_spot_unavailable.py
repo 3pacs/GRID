@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import sys
 import types
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Self
 
 import pandas as pd
@@ -73,33 +73,21 @@ class _FakeDB:
 def _chain() -> pd.DataFrame:
     # Heavy call open interest at the 785 strike: priced at spot 785 (the old
     # fallback) this chain classifies as SHORT_GAMMA.
-    return pd.DataFrame([
+    chain = pd.DataFrame([
         {"strike": 750.0, "opt_type": "put", "open_interest": 200_000.0,
          "implied_volatility": 0.15, "dte": 30.0},
         {"strike": TOP_OI_CALL_STRIKE, "opt_type": "call",
          "open_interest": 1_000_000.0, "implied_volatility": 0.15, "dte": 30.0},
     ])
+    captured = datetime(2026, 9, 24, 19, tzinfo=timezone.utc)
+    chain.attrs.update(snap_date=SNAP_DATE, created_at_min=captured,
+                       created_at_max=captured)
+    return chain
 
 
-def test_get_spot_without_measured_close_is_zero_not_a_strike() -> None:
-    db = _FakeDB()
-    engine = DealerGammaEngine(db)
-
-    assert engine._get_spot("SPY", SNAP_DATE) == 0.0
-    assert not any("options_snapshots" in sql for sql in db.statements)
-
-
-def test_get_spot_returns_the_measured_close() -> None:
-    engine = DealerGammaEngine(_FakeDB({"spy": 767.12}))
-
-    assert engine._get_spot("SPY", SNAP_DATE) == 767.12
-
-
-@pytest.mark.parametrize("bad_close", [float("nan"), float("inf"), -1.0, "invalid"])
-def test_get_spot_rejects_invalid_resolved_close(bad_close: object) -> None:
-    engine = DealerGammaEngine(_FakeDB({"spy": bad_close}))
-
-    assert engine._get_spot("SPY", SNAP_DATE) == 0.0
+def test_other_ticker_cannot_borrow_spy_receipt() -> None:
+    engine = DealerGammaEngine(_FakeDB())
+    assert engine._get_spot_receipt("QQQ", _chain().attrs["created_at_min"]) is None
 
 
 def test_profile_with_measured_close_labels_its_spot_source(
@@ -107,11 +95,20 @@ def test_profile_with_measured_close_labels_its_spot_source(
 ) -> None:
     engine = DealerGammaEngine(_FakeDB({"spy": 767.12}))
     monkeypatch.setattr(engine, "_load_chain", lambda _ticker, _snap_date: _chain())
+    monkeypatch.setattr(engine, "_get_spot_receipt", lambda _ticker, _time: {
+        "price": 767.12, "receipt_id": 123,
+        "obs_date": SNAP_DATE - timedelta(days=1),
+        "available_at": datetime(2026, 9, 24, 1, tzinfo=timezone.utc),
+        "receipt_created_at": datetime(2026, 9, 24, 2, tzinfo=timezone.utc),
+        "release_date": SNAP_DATE, "vintage_date": SNAP_DATE,
+    })
 
     profile = engine.compute_gex_profile("SPY", SNAP_DATE)
 
     assert profile["spot"] == 767.12
-    assert profile["spot_source"] == "resolved_series"
+    assert profile["spot_source"] == "spy_close_receipt"
+    assert profile["spot_obs_date"] == "2026-09-23"
+    assert profile["chain_snap_date"] == "2026-09-24"
 
 
 def test_profile_without_measured_spot_is_explicitly_unavailable(
@@ -119,12 +116,13 @@ def test_profile_without_measured_spot_is_explicitly_unavailable(
 ) -> None:
     engine = DealerGammaEngine(_FakeDB())
     monkeypatch.setattr(engine, "_load_chain", lambda _ticker, _snap_date: _chain())
+    monkeypatch.setattr(engine, "_get_spot_receipt", lambda _ticker, _time: None)
 
     result = engine.compute_gex_profile("SPY", SNAP_DATE)
 
     assert result["available"] is False
     assert result["status"] == "unavailable"
-    assert "no measured close for SPY" in result["reason"]
+    assert "no verified prior close for SPY" in result["reason"]
     assert result["as_of"] is None
     assert result["ticker"] == "SPY"
     # Every consumer keys on `error`; it must still be present and truthy.
@@ -166,6 +164,7 @@ def test_forced_flow_briefing_does_not_score_a_regime_off_a_strike(
         DealerGammaEngine, "_load_chain",
         lambda self, _ticker, _snap_date: _chain(),
     )
+    monkeypatch.setattr(DealerGammaEngine, "_get_spot_receipt", lambda self, _ticker, _time: None)
     # QQQ has a measured close; SPY has none.
     briefing = build_morning_briefing(_FakeDB({"qqq": 600.0}))
 

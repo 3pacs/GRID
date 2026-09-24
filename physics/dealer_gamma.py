@@ -33,7 +33,7 @@ Wait — that's wrong. Let's be precise:
 from __future__ import annotations
 
 import math
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
@@ -146,17 +146,19 @@ class DealerGammaEngine:
         if chain.empty:
             return {"error": f"No options data for {ticker} on {snap_date}", "ticker": ticker}
 
-        spot = self._get_spot(ticker, snap_date)
-        if not math.isfinite(spot) or spot <= 0:
+        chain_created_at = chain.attrs.get("created_at_min")
+        spot_receipt = self._get_spot_receipt(ticker, chain_created_at)
+        if spot_receipt is None:
             # Explicitly unavailable (store/availability contract); `error`
             # stays because every consumer keys on it.
             result = unavailable(
-                f"no measured close for {ticker} on or before {snap_date} "
-                "in resolved_series",
-                source="resolved_series",
+                f"no verified prior close for {ticker} available at the "
+                f"{snap_date} options snapshot",
+                source="spy_close_receipt",
             )
             result.update({"ticker": ticker, "error": f"No spot price for {ticker}"})
             return result
+        spot = spot_receipt["price"]
 
         # Compute per-strike Greeks and GEX
         per_strike = self._compute_per_strike(chain, spot)
@@ -200,8 +202,20 @@ class DealerGammaEngine:
         return {
             "ticker": ticker,
             "snap_date": str(snap_date),
+            "chain_snap_date": chain.attrs["snap_date"].isoformat(),
+            "chain_created_at": chain_created_at.isoformat(),
+            "chain_created_at_max": chain.attrs["created_at_max"].isoformat(),
             "spot": round(spot, 2),
-            "spot_source": "resolved_series",
+            "spot_source": "spy_close_receipt",
+            "spot_basis": "prior_completed_unadjusted_close",
+            "spot_obs_date": spot_receipt["obs_date"].isoformat(),
+            "spot_available_at": spot_receipt["available_at"].isoformat(),
+            "spot_receipt_created_at": spot_receipt["receipt_created_at"].isoformat(),
+            "spot_release_date": spot_receipt["release_date"].isoformat(),
+            "spot_vintage_date": spot_receipt["vintage_date"].isoformat(),
+            "spot_receipt_id": spot_receipt["receipt_id"],
+            "estimated": True,
+            "basis": "options_open_interest_with_assumed_dealer_sign_and_black_scholes",
             "gex_aggregate": round(gex_agg, 0),
             "gex_normalized": round(gex_normalized, 4),
             "gamma_flip": round(gamma_flip, 2) if gamma_flip else None,
@@ -377,62 +391,84 @@ class DealerGammaEngine:
         ]
 
     def _load_chain(self, ticker: str, snap_date: date) -> pd.DataFrame:
-        """Load options chain from database."""
+        """Load only the requested day's chain; reject mixed or late captures.
+
+        The daily unique key uses ON CONFLICT DO NOTHING, so a retry can leave
+        rows from multiple pulls under one snap_date. Such a chain has no
+        defensible single known-at time and is unavailable.
+        """
         with self.engine.connect() as conn:
             rows = conn.execute(text("""
                 SELECT strike, opt_type, open_interest, implied_vol AS implied_volatility,
-                       expiry, (expiry - :snap_date) AS dte
+                       expiry, (expiry - :snap_date) AS dte, created_at
                 FROM options_snapshots
                 WHERE ticker = :ticker AND snap_date = :snap_date
-                AND open_interest > 0 AND implied_vol > 0
-                AND expiry > :snap_date
-                ORDER BY expiry, strike
+                ORDER BY expiry, strike, opt_type
             """), {"ticker": ticker, "snap_date": snap_date}).fetchall()
 
         if not rows:
-            # Try most recent snap_date
-            with self.engine.connect() as conn:
-                latest = conn.execute(text(
-                    "SELECT MAX(snap_date) FROM options_snapshots WHERE ticker = :t"
-                ), {"t": ticker}).fetchone()
-                if latest and latest[0]:
-                    return self._load_chain(ticker, latest[0])
+            return pd.DataFrame()
+
+        created = [row[6] for row in rows]
+        now = datetime.now(timezone.utc)
+        if (any(not isinstance(ts, datetime) or ts.tzinfo is None for ts in created)
+                or snap_date > now.date()):
+            return pd.DataFrame()
+        first, last = min(created), max(created)
+        if (first.astimezone(timezone.utc).date() != snap_date
+                or last.astimezone(timezone.utc).date() != snap_date
+                or last > now or last != first):
             return pd.DataFrame()
 
         df = pd.DataFrame(rows, columns=["strike", "opt_type", "open_interest",
-                                          "implied_volatility", "expiry", "dte"])
+                                          "implied_volatility", "expiry", "dte",
+                                          "created_at"])
         df["dte"] = df["dte"].apply(lambda x: x.days if hasattr(x, 'days') else int(x))
-        return df[df["dte"] > 0]
+        df = df[(df["dte"] > 0)
+                & (df["open_interest"] > 0)
+                & (df["implied_volatility"] > 0)].copy()
+        df.attrs.update(snap_date=snap_date, created_at_min=first,
+                        created_at_max=last)
+        return df
 
-    def _get_spot(self, ticker: str, snap_date: date) -> float:
-        """Get the measured close from resolved_series; 0.0 when there is none.
+    def _get_spot_receipt(self, ticker: str, chain_created_at: datetime | None) -> dict | None:
+        """Use only a verified SPY close known before the actual chain capture.
 
-        No strike is ever substituted. This used to fall back to the
-        highest-open-interest call strike (commented "ATM", but not ATM), which
-        was then published as ``spot`` with the flip, walls, regime and the
-        forced-flow waterfall score all computed around it.
+        The shared receipt verifier checks raw/resolved identity, the unadjusted
+        price basis, the post-observation-day marker, and a four-calendar-day
+        maximum age. Other tickers have no equivalent receipt contract yet.
         """
-        with self.engine.connect() as conn:
-            # Try resolved_series (yfinance close)
-            row = conn.execute(text("""
-                SELECT rs.value FROM resolved_series rs
-                JOIN feature_registry fr ON rs.feature_id = fr.id
-                WHERE (fr.name = :name1 OR fr.name = :name2)
-                AND rs.obs_date <= :d
-                ORDER BY rs.obs_date DESC LIMIT 1
-            """), {
-                "name1": f"{ticker.lower()}_close",
-                "name2": ticker.lower(),
-                "d": snap_date,
-            }).fetchone()
+        if ticker != "SPY" or chain_created_at is None:
+            return None
+        from store.astrogrid import AstroGridStore
 
-        if not row:
-            return 0.0
-        try:
-            spot = float(row[0])
-        except (TypeError, ValueError, OverflowError):
-            return 0.0
-        return spot if math.isfinite(spot) and spot > 0 else 0.0
+        with self.engine.connect() as conn:
+            receipt = AstroGridStore(self.engine)._verified_spy_receipt(
+                conn, cutoff=chain_created_at, mode="entry")
+        if receipt is None:
+            return None
+        created = receipt.get("receipt_created_at")
+        available = receipt.get("available_at")
+        observed = receipt.get("obs_date")
+        price = receipt.get("price")
+        chain_day = chain_created_at.astimezone(timezone.utc).date()
+        if (not isinstance(created, datetime) or created.tzinfo is None
+                or not isinstance(available, datetime) or available.tzinfo is None
+                or not isinstance(observed, date)
+                or not 1 <= (chain_day - observed).days <= 4
+                or available < datetime.combine(
+                    observed + timedelta(days=1), datetime.min.time(), timezone.utc)
+                or available > chain_created_at
+                or not available <= created <= chain_created_at
+                or not isinstance(price, (int, float)) or not math.isfinite(price)
+                or price <= 0
+                or receipt.get("conflict_flag") is not False
+                or not isinstance(receipt.get("release_date"), date)
+                or not isinstance(receipt.get("vintage_date"), date)
+                or receipt["release_date"] > chain_day
+                or receipt["vintage_date"] > chain_day):
+            return None
+        return receipt
 
     # ── Convenience methods ──────────────────────────────────────────
 
