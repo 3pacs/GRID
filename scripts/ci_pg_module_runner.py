@@ -73,6 +73,11 @@ def _entry(plan: dict[str, object], module: str, repo_root: Path) -> dict[str, o
 
 def _database_identity(url: str, plan: dict[str, object], entry: dict[str, object],
                        token: str) -> dict[str, object]:
+    # libpq can prefer PGHOSTADDR over a URL's host. Refuse all inherited PG*
+    # selectors before opening the preflight socket, including service/options
+    # files that could change routing or authentication without appearing in URL.
+    if any(name.upper().startswith("PG") for name in os.environ):
+        raise ValueError("inherited libpq environment must be cleared before preflight")
     try:
         parsed = make_url(url)
     except SQLAlchemyError:
@@ -89,8 +94,11 @@ def _database_identity(url: str, plan: dict[str, object], entry: dict[str, objec
     if not TOKEN_PATTERN.fullmatch(token):
         raise ValueError("disposable owner token must be 32-64 lowercase hex characters")
     expected_comment = f"grid_ci_disposable_v1:{token}:{database}"
+    loopback_address = "::1" if parsed.host == "::1" else "127.0.0.1"
     try:
-        engine = create_engine(url, pool_pre_ping=True, connect_args={"connect_timeout": 3})
+        engine = create_engine(url, pool_pre_ping=True, connect_args={
+            "connect_timeout": 3, "host": loopback_address, "hostaddr": loopback_address,
+        })
     except SQLAlchemyError:
         raise ValueError("disposable database identity check failed") from None
     try:
@@ -127,10 +135,12 @@ def run_module(repo_root: Path, plan_path: Path, output_dir: Path, module: str,
         raise ValueError("output directory must be empty")
     output_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
-    for name in ("PGSERVICE", "PGSERVICEFILE", "PGHOSTADDR", "PGOPTIONS", "PGDATABASE",
-                 "PGUSER", "PGPASSWORD", "PGHOST", "PGPORT", "DATABASE_URL",
-                 "SQLALCHEMY_DATABASE_URL", "TEST_DATABASE_URL"):
-        env.pop(name, None)
+    for name in tuple(env):
+        if name.upper().startswith("PG") or name in (
+            "DATABASE_URL", "SQLALCHEMY_DATABASE_URL", "TEST_DATABASE_URL",
+            "GRID_CI_DISPOSABLE_DB_URL", "GRID_CI_DISPOSABLE_OWNER_TOKEN",
+        ):
+            env.pop(name, None)
     for name in URL_VARIABLES:
         env[name] = url
     env.update({"DB_HOST": plan["host"], "DB_PORT": str(plan["port"]),

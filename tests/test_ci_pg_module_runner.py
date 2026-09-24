@@ -63,6 +63,42 @@ def test_nonlocal_or_wrong_database_url_is_rejected_before_connection(
     connect.assert_not_called()
 
 
+@pytest.mark.parametrize("name,value", [
+    ("PGHOSTADDR", "198.51.100.7"),
+    ("PGSERVICE", "production"),
+    ("PGOPTIONS", "-csearch_path=public"),
+    ("PGHOST", "grid-svr"),
+    ("PGPORT", "5432"),
+    ("PGPASSWORD", "placeholder"),
+])
+def test_inherited_libpq_override_refused_before_any_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, value: str,
+) -> None:
+    plan, _, _ = _plan(tmp_path)
+    monkeypatch.setenv(name, value)
+    connect = MagicMock(side_effect=AssertionError("must not connect"))
+    monkeypatch.setattr(runner, "create_engine", connect)
+    with pytest.raises(ValueError, match="inherited libpq environment"):
+        runner._database_identity(URL, plan, plan["modules"][0], TOKEN)
+    connect.assert_not_called()
+
+
+def test_preflight_socket_explicitly_binds_loopback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, _, _ = _plan(tmp_path)
+    engine = MagicMock()
+    engine.connect.return_value.__enter__.return_value.execute.return_value.one.return_value = (
+        DATABASE, "pilot", 1234, "pilot",
+        f"grid_ci_disposable_v1:{TOKEN}:{DATABASE}", False, True, False, False,
+    )
+    connect = MagicMock(return_value=engine)
+    monkeypatch.setattr(runner, "create_engine", connect)
+    assert runner._database_identity(URL, plan, plan["modules"][0], TOKEN)["database"] == DATABASE
+    assert connect.call_args.kwargs["connect_args"]["host"] == "127.0.0.1"
+    assert connect.call_args.kwargs["connect_args"]["hostaddr"] == "127.0.0.1"
+
+
 @pytest.mark.parametrize("comment,owner", [
     (f"grid_ci_disposable_v1:wrong:{DATABASE}", "pilot"),
     (f"grid_ci_disposable_v1:{TOKEN}:{DATABASE}", "other_role"),
@@ -184,6 +220,8 @@ def test_success_artifacts_are_hashed_and_all_db_routes_are_isolated(
         assert env["DB_NAME"] == DATABASE
         assert "PGHOSTADDR" not in env
         assert "DATABASE_URL" not in env
+        assert "GRID_CI_DISPOSABLE_DB_URL" not in env
+        assert "GRID_CI_DISPOSABLE_OWNER_TOKEN" not in env
         artifact = ("junit.xml", "exact.json", "discovery.json", "audit.json")
         for name in artifact:
             (output / name).write_text(f"{name}\n", encoding="utf-8")
@@ -191,6 +229,8 @@ def test_success_artifacts_are_hashed_and_all_db_routes_are_isolated(
 
     monkeypatch.setenv("PGHOSTADDR", "grid-svr")
     monkeypatch.setenv("DATABASE_URL", "postgresql://production")
+    monkeypatch.setenv("GRID_CI_DISPOSABLE_DB_URL", URL)
+    monkeypatch.setenv("GRID_CI_DISPOSABLE_OWNER_TOKEN", TOKEN)
     monkeypatch.setattr(runner.subprocess, "run", fake_run)
     status = runner.run_module(tmp_path / "repo", plan_path, output,
                                runner.PILOT_MODULE, URL, TOKEN, allowlist)
