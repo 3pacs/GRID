@@ -38,7 +38,12 @@ Safety rails:
     buy at ask*(1+slip), sell at bid*(1-slip),
     ``ROBINHOOD_LIMIT_SLIPPAGE_BPS`` — with Robinhood's only documented
     ``time_in_force`` ("gtc"). ``reconcile_stale_orders()`` is the explicit
-    cancel-after handling that stands in for a short time-in-force.
+    cancel-after handling that stands in for a short time-in-force: it runs
+    automatically before every LIVE (non-simulated) order, and blocks that
+    new order (``guard="reconcile_failed"``) if it can't confirm the book is
+    clean of stale resting orders first. It should ALSO be wired into a
+    periodic job independent of new orders — see docs/ROBINHOOD_SETUP.md's
+    go-live checklist.
   * A wallet gate (``wallet_lookup``) blocks every order when there is no
     ACTIVE ``trading_wallets`` row for this venue — wired by
     ``get_robinhood_trader()`` for every production caller (API routes,
@@ -895,6 +900,10 @@ class RobinhoodCryptoTrader:
         if not self.configured:
             return {"error": "Robinhood API credentials not configured."}
 
+        reconcile_block = self._reconcile_guard(force_dry_run)
+        if reconcile_block is not None:
+            return reconcile_block
+
         blocked, wallet = self._wallet_gate()
         if blocked:
             msg = "No ACTIVE robinhood wallet — trading blocked. Create or resume a wallet first."
@@ -1001,6 +1010,10 @@ class RobinhoodCryptoTrader:
         if not self.configured:
             return {"error": "Robinhood API credentials not configured."}
 
+        reconcile_block = self._reconcile_guard(force_dry_run)
+        if reconcile_block is not None:
+            return reconcile_block
+
         blocked, wallet = self._wallet_gate()
         if blocked:
             msg = "No ACTIVE robinhood wallet — trading blocked. Create or resume a wallet first."
@@ -1093,32 +1106,72 @@ class RobinhoodCryptoTrader:
         (no IOC/FOK/expiry) — see :meth:`_build_order` — so a marketable
         limit that doesn't fill immediately would otherwise rest
         indefinitely. This is the explicit cancel-after handling that stands
-        in for a short time-in-force. A no-op in DRY_RUN or when market
-        orders are configured. NOT wired into a scheduler by this change —
-        see docs/ROBINHOOD_SETUP.md; call it from a periodic job before
-        ``ROBINHOOD_LIVE_TRADING`` is ever set True.
+        in for a short time-in-force. A no-op (``error=None``) in DRY_RUN or
+        when market orders are configured.
+
+        Called automatically at the start of every LIVE (non-simulated)
+        :meth:`open_position` / :meth:`close_position` via
+        :meth:`_reconcile_guard` — a caller placing a new order is exactly
+        the moment a stale resting order from a previous attempt matters
+        most. ``error`` is set (and the new order is blocked by the caller)
+        when the order list couldn't be fetched, or a stale order couldn't
+        be confirmed cancelled — a new order must not be layered on top of
+        a book we can't currently prove is clean. This method is ALSO meant
+        to be wired into a periodic job independent of new orders (see
+        docs/ROBINHOOD_SETUP.md's go-live checklist) — the pre-order call
+        only reconciles at the moment of the next order, which could be a
+        long time after a resting order actually went stale.
         """
         if not self.live or not self.use_limit_orders:
-            return {"checked": 0, "cancelled": []}
+            return {"checked": 0, "cancelled": [], "error": None}
+        payload = self._request("GET", PATH_ORDERS, params={"limit": 50})
+        if isinstance(payload, dict) and "error" in payload:
+            msg = f"could not list orders to reconcile: {payload['error']}"
+            log.warning("Robinhood reconcile: {m}", m=msg)
+            return {"checked": 0, "cancelled": [], "error": msg}
         cutoff = datetime.now(timezone.utc).timestamp() - self.limit_cancel_after_s
         checked = 0
         cancelled: list[str] = []
-        for o in self.get_orders(limit=50):
-            state = str(o.get("state") or "").lower()
+        cancel_errors: list[str] = []
+        for row in self._results(payload):
+            state = str(row.get("state") or "").lower()
             if state not in _OPEN_ORDER_STATES:
                 continue
-            created = _parse_iso(o.get("created_at"))
+            created = _parse_iso(row.get("created_at"))
             if created is None:
                 continue
             checked += 1
             if created.timestamp() < cutoff:
-                result = self.cancel_order(o["id"])
+                order_id = row.get("id")
+                result = self.cancel_order(order_id)
                 if result.get("status") == "cancel_requested":
-                    cancelled.append(o["id"])
+                    cancelled.append(order_id)
+                else:
+                    cancel_errors.append(f"{order_id}: {result.get('error', 'cancel not confirmed')}")
         if cancelled:
             log.warning("Robinhood reconcile: cancelled {n} stale resting order(s): {ids}",
                         n=len(cancelled), ids=cancelled)
-        return {"checked": checked, "cancelled": cancelled}
+        if cancel_errors:
+            msg = "failed to cancel stale order(s): " + "; ".join(cancel_errors)
+            log.warning("Robinhood reconcile: {m}", m=msg)
+            return {"checked": checked, "cancelled": cancelled, "error": msg}
+        return {"checked": checked, "cancelled": cancelled, "error": None}
+
+    def _reconcile_guard(self, force_dry_run: bool) -> dict[str, Any] | None:
+        """Run :meth:`reconcile_stale_orders` before a LIVE order, and turn a
+        reconcile failure into a blocked result rather than letting a new
+        order stack on top of a book we can't currently prove is clean.
+        Returns ``None`` to proceed (dry-run, force_dry_run, or a clean
+        reconcile), else the blocked result to return immediately."""
+        if not self.live or force_dry_run:
+            return None
+        reconcile = self.reconcile_stale_orders()
+        if reconcile.get("error"):
+            msg = f"Could not reconcile stale resting orders before placing a new one: {reconcile['error']}"
+            log.warning("Robinhood order blocked: {m}", m=msg)
+            self._alert_guard_trip("reconcile_failed", msg)
+            return {"error": msg, "status": "blocked", "guard": "reconcile_failed"}
+        return None
 
     def status(self) -> dict[str, Any]:
         """Connector status for the API and the health page."""

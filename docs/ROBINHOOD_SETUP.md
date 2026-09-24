@@ -89,13 +89,23 @@ might route later.
 start-of-day equity and today's order count; `trading_order_log` is the
 idempotent, cost-accounting audit trail (bid/ask/mid, the executable price,
 spread cost, and — once known — the fill price for every attempt that got
-far enough to be built). Both are created by
+far enough to be built). Both are created **only** by
 `migrations/versions/robinhood_guards_20260924.py`, applied by the normal
 `alembic upgrade head` every deploy already runs. `RobinhoodCryptoTrader`
 never touches SQL directly — it talks to a `RiskStore`
 (`trading/robinhood_risk_store.py`): `PostgresRiskStore` in production,
 `InMemoryRiskStore` (process-local, resets per instance — the old behavior)
 for anything that doesn't wire a database in, e.g. tests and ad-hoc scripts.
+
+**`PostgresRiskStore` does not create these tables at runtime.** If the
+migration hasn't been applied, every order fails closed with an unhandled
+`sqlalchemy.exc.ProgrammingError` (undefined table) rather than silently
+bootstrapping a schema under the API's own role — deliberately, since a
+table created ad hoc that way can end up with the wrong owner/grants (see
+the GRANT-footer convention in `migrations/_TEMPLATE.sql`). Confirm the
+migration has actually run (`alembic current` on the server, or
+`SELECT 1 FROM trading_risk_state LIMIT 1` via read-only psql) before
+expecting any Robinhood order — dry-run or live — to succeed.
 
 ### Wallet gate
 
@@ -123,11 +133,40 @@ sized off the raw touch price (ask/bid), not the padded limit price.
 Because `"gtc"` never expires on its own, `RobinhoodCryptoTrader.reconcile_stale_orders()`
 is the explicit cancel-after handling for a limit that doesn't fill
 immediately: it cancels our own LIVE orders resting past
-`ROBINHOOD_LIMIT_CANCEL_AFTER_S` (15s default). **This method is not wired
-into a scheduler by this change** — call it from a periodic job (Hermes
-step or otherwise) before ever setting `ROBINHOOD_LIVE_TRADING=true`.
-Setting `ROBINHOOD_USE_LIMIT_ORDERS=false` falls back to plain market
-orders, still behind the stale-quote and spread guards.
+`ROBINHOOD_LIMIT_CANCEL_AFTER_S` (15s default). It now runs **automatically**
+at the start of every LIVE (non-simulated) `open_position`/`close_position`
+call — if it can't confirm the order book is clean (the order list couldn't
+be fetched, or a stale order couldn't be confirmed cancelled), the new order
+is blocked with `status="blocked", guard="reconcile_failed"` rather than
+stacking on top of a book we can't currently verify. That per-order call
+only reconciles at the moment of the *next* order, though — a resting order
+could sit stale for a long time if no new order comes in. **Wiring
+`reconcile_stale_orders()` into a periodic job (a Hermes step or otherwise),
+independent of new orders, is a go-live prerequisite** — see the checklist
+below. Setting `ROBINHOOD_USE_LIMIT_ORDERS=false` falls back to plain market
+orders, still behind the stale-quote and spread guards (and
+`reconcile_stale_orders()` no-ops for market orders, since there is no
+resting limit to reconcile).
+
+### Go-live checklist
+
+Before ever setting `ROBINHOOD_LIVE_TRADING=true`, beyond the account
+set-up above:
+
+1. **Migration applied.** `migrations/versions/robinhood_guards_20260924.py`
+   has run against the target database — see "Persisted state" above.
+   Orders fail closed (raise) otherwise, so this is self-enforcing, but
+   confirm it before the first live order rather than discovering it then.
+2. **Tracking wallet ACTIVE.** See "Tracking wallet" below — every order on
+   all three paths is blocked without one.
+3. **`reconcile_stale_orders()` wired into a periodic job**, independent of
+   new orders — the automatic pre-order call alone is not sufficient if the
+   bot goes quiet after a partial/unconfirmed fill (see "Order type" above).
+   Not implemented by this change; needs a scheduler entry (Hermes or
+   otherwise) before go-live.
+4. **Alert routing confirmed** (`ALERT_EMAIL_ENABLED` and the destination in
+   `alerts/email.py`'s settings) — every LIVE order and every guard trip
+   alerts; verify those emails actually arrive before relying on them.
 
 ### Simulate / forward paper log
 
