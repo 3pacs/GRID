@@ -12,8 +12,6 @@ Covers:
 
 from __future__ import annotations
 
-from datetime import date
-
 import pytest
 
 import scripts.live_rotation_trader as lrt
