@@ -486,16 +486,39 @@ class DealerGammaEngine:
     def _get_spot(self, ticker: str, snap_date: date) -> float | None:
         """Get the real, same-date spot price for ``ticker`` — never a strike.
 
-        Source order, both PIT-correct (neither ever reads past ``snap_date``):
+        Source order, neither ever reads a row dated past ``snap_date``:
 
           1. ``options_daily_signals.spot_price`` for the exact
-             (ticker, signal_date) row. ``OptionsPuller`` (ingestion/options.py)
-             writes this from the underlying quote in the same pull as the
-             options chain, so it is guaranteed contemporaneous with the
-             chain used for this profile — the primary source.
+             (ticker, signal_date) row — the primary source.
+             ``OptionsPuller`` (ingestion/options.py) writes it from the
+             underlying quote in the same pull as the options chain.
+             **This is contemporaneous with the chain for a live read of
+             today's row (the normal pre-open call site), but it is NOT
+             point-in-time safe for a read of a past ``snap_date``.** The
+             row is upserted — ``ON CONFLICT (ticker, signal_date) DO
+             UPDATE SET ... spot_price = EXCLUDED.spot_price`` — every time
+             ``OptionsPuller`` re-runs for that ticker/date, there is no
+             ``updated_at`` column, and ``created_at`` reflects only the
+             first insert. ``options_snapshots`` (the chain), by contrast,
+             inserts with ``ON CONFLICT DO NOTHING`` and never gets
+             overwritten. So on a day the puller ran more than once, a
+             historical read of this table can return a spot_price captured
+             *later* than the paired chain snapshot — a look-ahead risk for
+             backtests or any as-of-a-past-date read. Confirmed against
+             production 2026-09-24: SPY's options_snapshots for
+             2026-09-23 span created_at 02:02:52-07:54:50 UTC (two distinct
+             pulls that day), while options_daily_signals' 2026-09-23 row
+             stays at created_at 02:02:52 regardless of which pull's spot
+             ended up stored. Fixing the upsert (e.g. append-only history,
+             or an ``updated_at``/``pulled_at`` column) is a follow-up, not
+             part of this change — this docstring only documents the
+             existing risk.
           2. ``resolved_series`` (e.g. a yfinance close feature), as of
              ``snap_date``, as a secondary source when no
              options_daily_signals row exists yet for this date.
+             ``obs_date <= snap_date`` keeps this leg PIT-bounded, but it
+             inherits whatever vintage policy resolved_series itself uses —
+             it is not independently verified point-in-time-safe here.
 
         Returns ``None`` — never 0.0, never an options strike — when neither
         source has a measured spot. The old fallback (highest-open-interest
