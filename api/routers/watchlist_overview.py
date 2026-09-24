@@ -534,8 +534,7 @@ def get_ticker_quote(
                 price = live.get("price")
                 change_pct = live.get("pct_1d")
                 source = "live"
-                if price is not None:
-                    as_of_date = date.today()
+                as_of_date = live.get("bar_date") if price is not None else None
         except Exception as exc:
             # Not a query: an outbound HTTP fetch. Always operational.
             log.warning(

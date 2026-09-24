@@ -140,7 +140,7 @@ def get_ticker_analysis(
                 import yfinance as yf
 
                 yf_period = _yf_period_map.get(period, "3mo")
-                hist = yf.Ticker(ticker_upper).history(period=yf_period)
+                hist = yf.Ticker(ticker_upper).history(period=yf_period, auto_adjust=False)
                 if not hist.empty:
                     rows = []
                     for idx, row in hist.iterrows():

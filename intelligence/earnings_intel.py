@@ -38,7 +38,7 @@ class EarningsPrediction:
     ticker: str
     earnings_date: str
     predicted_direction: str      # up / down / flat
-    predicted_move_pct: float     # expected % move
+    predicted_move_pct: float | None  # expected % move, absent without measured inputs
     confidence: float             # 0-1
     iv_rank: float | None         # current IV percentile
     historical_surprise_avg: float | None
@@ -55,6 +55,17 @@ class EarningsPrediction:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def _finite_number(value: Any) -> float | None:
+    """Keep real zeroes, but never treat missing or non-finite data as a move."""
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 # ── Table Setup ──────────────────────────────────────────────────────────
@@ -299,7 +310,8 @@ def predict_earnings_reaction(engine: Engine, ticker: str) -> dict:
             ORDER BY earnings_date DESC LIMIT 8
         """), {"ticker": ticker}).fetchall()
 
-        hist_surprises = [float(h[0]) for h in hist if h[0] is not None]
+        hist_surprises = [number for h in hist
+                          if (number := _finite_number(h[0])) is not None]
         hist_beats = sum(1 for h in hist if h[1] == "beat")
         hist_total = len(hist)
 
@@ -323,8 +335,8 @@ def predict_earnings_reaction(engine: Engine, ticker: str) -> dict:
         iv_data = _get_iv_data(conn, ticker)
         if iv_data:
             signals["iv_rank"] = iv_data.get("iv_rank")
-            iv_atm = iv_data.get("iv_atm")
-            if iv_atm:
+            iv_atm = _finite_number(iv_data.get("iv_atm"))
+            if iv_atm is not None and iv_atm > 0:
                 # Expected move from options = IV * sqrt(1/252)
                 expected_move = iv_atm * 100 * math.sqrt(1 / 252)
                 signals["expected_move_options"] = round(expected_move, 2)
@@ -393,10 +405,14 @@ def predict_earnings_reaction(engine: Engine, ticker: str) -> dict:
         confidence = min(0.9, max(0.1, net / 3.0))
 
         # Expected move magnitude
-        hist_avg = abs(signals.get("historical_surprise_avg", 0))
-        opt_move = signals.get("expected_move_options", 2.0)
-        predicted_move = (hist_avg * 0.3 + opt_move * 0.7) if opt_move else hist_avg
-        if direction == "down":
+        hist_avg = _finite_number(signals.get("historical_surprise_avg"))
+        hist_avg = abs(hist_avg) if hist_avg is not None else None
+        opt_move = _finite_number(signals.get("expected_move_options"))
+        if hist_avg is not None and opt_move is not None:
+            predicted_move = hist_avg * 0.3 + opt_move * 0.7
+        else:
+            predicted_move = hist_avg if hist_avg is not None else opt_move
+        if direction == "down" and predicted_move is not None:
             predicted_move = -predicted_move
 
         # Build reasoning
@@ -406,7 +422,7 @@ def predict_earnings_reaction(engine: Engine, ticker: str) -> dict:
         reasoning = "; ".join(reasoning_parts)
 
         # Clamp predicted move to ±30%
-        if predicted_move < -30.0 or predicted_move > 30.0:
+        if predicted_move is not None and (predicted_move < -30.0 or predicted_move > 30.0):
             log.debug("Clamping predicted_move from {orig} to ±30% for {ticker}",
                        orig=predicted_move, ticker=ticker)
             predicted_move = max(-30.0, min(30.0, predicted_move))
@@ -422,7 +438,7 @@ def predict_earnings_reaction(engine: Engine, ticker: str) -> dict:
             ticker=ticker,
             earnings_date=earn_date.isoformat(),
             predicted_direction=direction,
-            predicted_move_pct=round(predicted_move, 2),
+            predicted_move_pct=round(predicted_move, 2) if predicted_move is not None else None,
             confidence=round(confidence, 3),
             iv_rank=signals.get("iv_rank"),
             historical_surprise_avg=signals.get("historical_surprise_avg"),
@@ -623,7 +639,9 @@ def _get_iv_data(conn, ticker: str) -> dict | None:
         if not row:
             return None
 
-        iv_atm = float(row[0]) if row[0] else None
+        iv_atm = _finite_number(row[0])
+        if iv_atm is None:
+            return None
 
         # IV rank: compare current IV to 52-week range
         iv_rank = None

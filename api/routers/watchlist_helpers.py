@@ -214,7 +214,8 @@ def _row_to_dict(row: Any) -> dict:
 def _fetch_live_price(ticker: str) -> dict | None:
     """Fetch a live/recent price from yfinance as fallback.
 
-    Returns {"price": float, "prev_close": float, "pct_1d": float, "source": "live"}
+    Returns {"price": float, "prev_close": float, "pct_1d": float,
+    "source": "live", "bar_date": date | None}
     or None on failure.
     """
     try:
@@ -236,6 +237,7 @@ def _fetch_live_price(ticker: str) -> dict | None:
         info = tk.fast_info
         price = getattr(info, "last_price", None)
         prev = getattr(info, "previous_close", None)
+        bar_date = None  # fast_info does not establish the observation date
         if price is None:
             # auto_adjust=False to match the fast_info branch above:
             # last_price/previous_close are raw quotes, so the fallback must
@@ -244,6 +246,8 @@ def _fetch_live_price(ticker: str) -> dict | None:
             hist = tk.history(period="5d", auto_adjust=False)
             if not hist.empty:
                 price = float(hist["Close"].iloc[-1])
+                last_index = hist.index[-1]
+                bar_date = last_index.date() if hasattr(last_index, "date") else None
                 if len(hist) >= 2:
                     prev = float(hist["Close"].iloc[-2])
         if price is None:
@@ -254,6 +258,7 @@ def _fetch_live_price(ticker: str) -> dict | None:
             "prev_close": round(prev, 4) if prev else None,
             "pct_1d": pct_1d,
             "source": "live",
+            "bar_date": bar_date,
         }
     except Exception as exc:
         log.debug("Live price fetch failed for {t}: {e}", t=ticker, e=str(exc))

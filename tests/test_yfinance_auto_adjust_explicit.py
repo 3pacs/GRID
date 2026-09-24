@@ -238,13 +238,54 @@ def test_watchlist_live_price_history_fallback_passes_auto_adjust_false():
 
     assert result is not None
     assert result["price"] == pytest.approx(182.0)
+    assert str(result["bar_date"]) == "2026-03-11"
     assert fake_ticker.history.call_args.kwargs["auto_adjust"] is False
+
+
+def test_watchlist_analysis_fallback_uses_raw_closes():
+    from api.routers.watchlist_analysis import get_ticker_analysis
+
+    raw = _ohlc_frame(["2026-03-10", "2026-03-11"], [180.0, 182.0])
+    adjusted = _ohlc_frame(["2026-03-10", "2026-03-11"], [176.4, 178.4])
+    fake_ticker = MagicMock()
+    fake_ticker.history.side_effect = lambda **kw: raw if kw.get("auto_adjust") is False else adjusted
+    conn = MagicMock()
+    conn.execute.return_value.fetchone.return_value = None
+    conn.execute.return_value.fetchall.return_value = []
+    engine = MagicMock()
+    engine.connect.return_value.__enter__.return_value = conn
+
+    with patch("api.routers.watchlist_analysis._get_analysis_cached", return_value=None), \
+         patch("api.routers.watchlist_analysis.get_db_engine", return_value=engine), \
+         patch("api.routers.watchlist_analysis._build_watchlist_item", return_value=({}, False)), \
+         patch("api.routers.watchlist_analysis._set_analysis_cache"), \
+         patch("yfinance.Ticker", return_value=fake_ticker):
+        result = get_ticker_analysis("AAPL", period="1Y", _token="test")
+
+    assert result["price_source"] == "yfinance"
+    assert [row["value"] for row in result["price_history"]] == [180.0, 182.0]
+    assert fake_ticker.history.call_args.kwargs["auto_adjust"] is False
+    engine.begin.assert_not_called()
+
+
+def test_watchlist_fast_info_price_has_no_invented_bar_date():
+    from api.routers.watchlist_helpers import _fetch_live_price
+
+    fake_ticker = MagicMock()
+    fake_ticker.fast_info.last_price = 182.0
+    fake_ticker.fast_info.previous_close = 180.0
+    with patch("yfinance.Ticker", return_value=fake_ticker):
+        result = _fetch_live_price("AAPL")
+
+    assert result["price"] == 182.0
+    assert result["bar_date"] is None
+    fake_ticker.history.assert_not_called()
 
 
 # ── 6. Guard: no live yfinance call site may rely on the library default ───
 
 def test_no_unspecified_auto_adjust_in_live_price_paths():
-    """Every ``yf.download`` in the live price stack states its basis.
+    """Every yfinance download/history read in the live price stack states its basis.
 
     Scripted one-off loaders under ``scripts/`` are intentionally excluded —
     this guard covers the always-on service code.
@@ -253,10 +294,10 @@ def test_no_unspecified_auto_adjust_in_live_price_paths():
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1]
-    packages = ["api", "ingestion", "intelligence", "trading", "backtest"]
+    packages = ["api", "ingestion", "intelligence", "trading", "backtest", "analysis", "physics", "valuation", "discovery"]
 
     offenders: list[str] = []
-    call_re = re.compile(r"yf\.download\s*\(", re.MULTILINE)
+    call_re = re.compile(r"(?:yf\.download|\.history)\s*\(", re.MULTILINE)
 
     for pkg in packages:
         for path in (root / pkg).rglob("*.py"):
@@ -284,7 +325,7 @@ def test_no_unspecified_auto_adjust_in_live_price_paths():
                     offenders.append(f"{path.relative_to(root)}:{line}")
 
     assert offenders == [], (
-        "yf.download() call sites relying on the library default for "
+        "yfinance download/history call sites relying on the library default for "
         "auto_adjust (it is True in yfinance 0.2.x+, which silently returns "
         f"split/dividend-adjusted OHLC): {offenders}"
     )

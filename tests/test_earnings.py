@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import date, timedelta
+from unittest.mock import MagicMock, patch
+
+import pytest
+
 
 
 
@@ -76,3 +81,47 @@ def test_earnings_prediction_to_dict():
     assert d["predicted_direction"] == "up"
     assert d["verdict"] == "pending"
     assert d["confidence"] == 0.72
+
+
+@pytest.mark.parametrize(
+    "surprises,iv_atm,expected",
+    [
+        ([], None, None),
+        ([], 0.50, 3.15),
+        ([(4.0, "beat"), (6.0, "beat")], None, 5.0),
+        ([(4.0, "beat"), (6.0, "beat")], 0.50, 3.70),
+        ([(0.0, "inline")], None, 0.0),
+        ([(float("nan"), "beat")], float("inf"), None),
+    ],
+)
+def test_prediction_move_uses_only_finite_available_inputs(surprises, iv_atm, expected):
+    from intelligence.earnings_intel import predict_earnings_reaction
+
+    conn = MagicMock()
+    upcoming = MagicMock()
+    upcoming.fetchone.return_value = (date.today() + timedelta(days=7), None, None)
+    history = MagicMock()
+    history.fetchall.return_value = surprises
+    conn.execute.side_effect = [upcoming, history]
+    engine = MagicMock()
+    engine.connect.return_value.__enter__.return_value = conn
+    iv_data = {"iv_atm": iv_atm, "iv_rank": None} if iv_atm is not None else None
+
+    with patch("intelligence.earnings_intel._ensure_tables"), \
+         patch("intelligence.earnings_intel._get_iv_data", return_value=iv_data), \
+         patch("intelligence.earnings_intel._get_sector_momentum", return_value=None), \
+         patch("intelligence.earnings_intel._get_insider_signal", return_value=None), \
+         patch("intelligence.earnings_intel._get_congressional_signal", return_value=None), \
+         patch("intelligence.earnings_intel._store_prediction") as store:
+        result = predict_earnings_reaction(engine, "AAPL")
+
+    assert result["predicted_move_pct"] == expected
+    assert store.call_args.args[1].predicted_move_pct == expected
+
+
+def test_null_predicted_move_does_not_change_direction_verdict():
+    from intelligence.earnings_intel import _score_prediction
+
+    engine = MagicMock()
+    result = _score_prediction(engine, "prediction", "up", None, 4.0)
+    assert result["verdict"] == "hit"

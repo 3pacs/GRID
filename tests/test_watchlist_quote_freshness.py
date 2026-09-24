@@ -181,12 +181,12 @@ class TestQuoteLiveFallback:
     def test_live_fallback_carries_honest_as_of_and_stale(
         self, mock_engine
     ):
-        """Previously as_of stayed null on the live-fallback path even
-        though a fresh live price was returned."""
+        """An old history bar must not become a fresh quote."""
         _wire_engine(mock_engine, _mock_quote_conn([]))
+        bar_date = date.today() - timedelta(days=5)
         with patch(
             "api.routers.watchlist_overview._fetch_live_price",
-            return_value={"price": 42.0, "pct_1d": 0.01},
+            return_value={"price": 42.0, "pct_1d": 0.01, "bar_date": bar_date},
         ):
             response = client.get("/api/v1/watchlist/ZZZ/quote", headers=_auth_header())
 
@@ -194,8 +194,23 @@ class TestQuoteLiveFallback:
         assert data["source"] == "live"
         assert data["price"] == 42.0
         assert data["change_pct"] == 0.01
-        assert data["as_of"] == str(date.today())
-        assert data["stale"] is False
+        assert data["as_of"] == str(bar_date)
+        assert data["stale"] is True
+        mock_engine.return_value.begin.assert_not_called()
+
+    @patch("api.routers.watchlist_overview.get_db_engine")
+    def test_undated_live_quote_has_unknown_freshness(self, mock_engine):
+        _wire_engine(mock_engine, _mock_quote_conn([]))
+        with patch(
+            "api.routers.watchlist_overview._fetch_live_price",
+            return_value={"price": 42.0, "pct_1d": 0.01, "bar_date": None},
+        ):
+            response = client.get("/api/v1/watchlist/ZZZ/quote", headers=_auth_header())
+        data = response.json()
+        assert data["price"] == 42.0
+        assert data["as_of"] is None
+        assert data["stale"] is None
+        mock_engine.return_value.begin.assert_not_called()
 
 
 class TestQuoteQueryCollapsesVintages:

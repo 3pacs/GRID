@@ -420,7 +420,7 @@ def fill_missing_stocks(engine: Engine) -> dict[str, Any]:
         for ticker in missing_tickers:
             try:
                 stock = yf.Ticker(ticker)
-                hist = stock.history(start=start.isoformat(), end=today.isoformat())
+                hist = stock.history(start=start.isoformat(), end=today.isoformat(), auto_adjust=False)
                 if hist.empty:
                     results.append({"ticker": ticker, "status": "NO_DATA"})
                     continue
