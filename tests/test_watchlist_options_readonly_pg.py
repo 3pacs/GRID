@@ -103,11 +103,45 @@ def test_saved_populated_and_checked_empty_gets_are_select_only(isolated_db):
         assert body["recommendations"][0]["sanity_status"]["DATA_QUALITY"]["status"] == "PASS"
         assert body["scan_summary"]["source"] == "persisted"
         assert body["scan_summary"]["fresh_scan"] is False
+        assert body["scan_summary"]["data_status"] == "recent_saved"
+        assert body["generated_at"] is not None
         assert empty.json()["recommendations"] == []
-        assert empty.json()["scan_summary"]["source"] == "persisted"
+        assert empty.json()["scan_summary"]["source"] == "missing"
+        assert empty.json()["scan_summary"]["data_status"] == "missing"
+        assert empty.json()["generated_at"] is None
         assert statements and all(statement.startswith("SELECT") for statement in statements)
     finally:
         event.remove(engine, "before_cursor_execute", record)
+
+
+def test_newest_saved_timestamp_is_not_the_highest_confidence_row(isolated_db):
+    engine = isolated_db
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE options_recommendations (
+                ticker TEXT, direction TEXT, strike NUMERIC, expiry DATE,
+                entry_price NUMERIC, target_price NUMERIC, stop_loss NUMERIC,
+                expected_return NUMERIC, kelly_fraction NUMERIC, confidence NUMERIC,
+                thesis TEXT, sanity_status JSONB, dealer_context TEXT,
+                generated_at TIMESTAMPTZ, outcome TEXT
+            )
+        """))
+        conn.execute(text("""
+            INSERT INTO options_recommendations
+                (ticker, confidence, thesis, generated_at, outcome)
+            VALUES
+                ('AAPL', 0.9, 'older high confidence', NOW() - INTERVAL '10 days', 'OPEN'),
+                ('AAPL', 0.1, 'newer low confidence', NOW() - INTERVAL '1 hour', 'OPEN')
+        """))
+    with patch("api.routers.options.get_db_engine", return_value=engine):
+        body = _client().get("/api/v1/options/recommendations?ticker=AAPL").json()
+    assert [row["thesis"] for row in body["recommendations"]] == [
+        "older high confidence", "newer low confidence",
+    ]
+    assert [row["data_status"] for row in body["recommendations"]] == ["stale", "recent_saved"]
+    assert body["scan_summary"]["data_status"] == "recent_saved"
+    assert body["scan_summary"]["age_seconds"] < 2 * 3600
+    assert body["generated_at"] == body["recommendations"][1]["generated_at"]
 
 
 def test_missing_table_reports_unavailable_without_bootstrap(isolated_db):
@@ -119,6 +153,7 @@ def test_missing_table_reports_unavailable_without_bootstrap(isolated_db):
         assert response.status_code == 200
         assert response.json()["recommendations"] == []
         assert response.json()["scan_summary"]["source"] == "unavailable"
+        assert response.json()["generated_at"] is None
         assert statements and all(statement.startswith("SELECT") for statement in statements)
     finally:
         event.remove(engine, "before_cursor_execute", record)
@@ -130,3 +165,4 @@ def test_engine_construction_failure_is_unavailable_without_query():
     assert response.status_code == 200
     assert response.json()["recommendations"] == []
     assert response.json()["scan_summary"]["source"] == "unavailable"
+    assert response.json()["generated_at"] is None

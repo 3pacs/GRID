@@ -45,16 +45,28 @@ describe('Watchlist ticker recommendations', () => {
 
     it('distinguishes checked empty from unavailable', async () => {
         api.getOptionsRecommendations.mockResolvedValue({
-            scan_summary: { source: 'persisted' }, recommendations: [],
+            scan_summary: { source: 'missing', data_status: 'missing' }, recommendations: [],
         });
         const view = render(<TickerRecommendations ticker="AAPL" />);
-        expect(await screen.findByText('No active trade recommendations for AAPL.')).toBeInTheDocument();
+        expect(await screen.findByText('No saved trade recommendations for AAPL. No fresh scan was run.')).toBeInTheDocument();
         api.getOptionsRecommendations.mockResolvedValue({
             scan_summary: { source: 'unavailable' }, recommendations: [],
         });
         view.rerender(<TickerRecommendations ticker="MSFT" />);
         expect(await screen.findByText('Trade recommendations unavailable.')).toBeInTheDocument();
-        expect(screen.queryByText('No active trade recommendations for MSFT.')).not.toBeInTheDocument();
+        expect(screen.queryByText('No saved trade recommendations for MSFT. No fresh scan was run.')).not.toBeInTheDocument();
+    });
+
+    it('labels old saved rows as stale without hiding the recommendation', async () => {
+        api.getOptionsRecommendations.mockResolvedValue({
+            generated_at: '2026-09-15T13:30:00+00:00',
+            scan_summary: { source: 'persisted', data_status: 'stale', fresh_scan: false },
+            recommendations: [{ ticker: 'AAPL', direction: 'CALL', strike: 200,
+                confidence: 0.5, thesis: 'Old saved thesis' }],
+        });
+        render(<TickerRecommendations ticker="AAPL" />);
+        expect(await screen.findByText('Old saved thesis')).toBeInTheDocument();
+        expect(screen.getByText(/Saved recommendations are stale.*2026-09-15 UTC.*No fresh scan was run/)).toBeInTheDocument();
     });
 
     it('shows unavailable for an error envelope and ignores a late prior ticker', async () => {

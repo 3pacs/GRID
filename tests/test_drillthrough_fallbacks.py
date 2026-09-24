@@ -98,6 +98,7 @@ def test_options_recommendations_read_saved_rows(monkeypatch) -> None:
                     "Gamma support holding above spot",
                     datetime(2026, 4, 18, 15, 0, tzinfo=timezone.utc),
                     None,
+                    datetime(2026, 4, 18, 15, 0, tzinfo=timezone.utc),
                 )
             ]
         )
@@ -111,6 +112,47 @@ def test_options_recommendations_read_saved_rows(monkeypatch) -> None:
     body = response.json()
     assert body["scan_summary"]["source"] == "persisted"
     assert body["scan_summary"]["fresh_scan"] is False
+    assert body["scan_summary"]["data_status"] == "stale"
+    assert body["generated_at"] == "2026-04-18T15:00:00+00:00"
     assert len(body["recommendations"]) == 1
     assert body["recommendations"][0]["ticker"] == "NVDA"
     assert body["recommendations"][0]["sanity_status"] == {"passed": True}
+
+
+def test_options_recommendations_empty_saved_result_has_no_generated_time(monkeypatch) -> None:
+    client = _build_client(options_router)
+    engine = _engine_with_results(_result(fetchall=[]))
+    monkeypatch.setattr(options_module, "get_db_engine", lambda: engine)
+
+    response = client.get("/api/v1/options/recommendations?ticker=ABSENT")
+
+    assert response.status_code == 200
+    assert response.json()["recommendations"] == []
+    assert response.json()["generated_at"] is None
+    assert response.json()["scan_summary"]["source"] == "missing"
+    assert response.json()["scan_summary"]["data_status"] == "missing"
+
+
+def test_options_recommendations_latest_time_ignores_confidence_order(monkeypatch) -> None:
+    client = _build_client(options_router)
+    old = datetime(2026, 9, 15, 13, 30, tzinfo=timezone.utc)
+    latest = datetime.now(timezone.utc)
+
+    def saved_row(thesis, confidence, generated_at):
+        return (
+            "AAPL", "CALL", 200, date(2026, 10, 16), 10, 12, 8,
+            0, 0, confidence, thesis, None, None, generated_at, None, latest,
+        )
+
+    engine = _engine_with_results(_result(fetchall=[
+        saved_row("old high confidence", 0.9, old),
+        saved_row("new low confidence", 0.1, latest),
+    ]))
+    monkeypatch.setattr(options_module, "get_db_engine", lambda: engine)
+
+    body = client.get("/api/v1/options/recommendations?ticker=AAPL").json()
+
+    assert body["recommendations"][0]["data_status"] == "stale"
+    assert body["recommendations"][1]["data_status"] == "recent_saved"
+    assert body["scan_summary"]["data_status"] == "recent_saved"
+    assert body["generated_at"] == latest.isoformat()
