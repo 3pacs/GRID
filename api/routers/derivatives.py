@@ -18,6 +18,7 @@ from sqlalchemy import text
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from store.availability import unavailable
 
 router = APIRouter(
     prefix="/api/v1/derivatives",
@@ -575,8 +576,27 @@ async def get_flow_narrative() -> dict[str, Any]:
         engine_gex = _get_gex_engine()
         spy = engine_gex.compute_gex_profile("SPY")
 
+        spot = spy.get("spot")
+        if (
+            spy.get("available") is False
+            or spy.get("error")
+            or not isinstance(spot, (int, float))
+            or not math.isfinite(spot)
+            or spot <= 0
+        ):
+            reason = spy.get("reason") or spy.get("error") or "No measured SPY spot available"
+            result = unavailable(
+                reason,
+                source=spy.get("source") or "dealer_gamma",
+                content=None,
+                positioning_data=None,
+                briefing_date=None,
+                created_at=None,
+            )
+            result.update({"stale": True, "error": spy.get("error") or reason})
+            return result
+
         regime = spy.get("regime", "UNKNOWN")
-        spot = spy.get("spot", 0)
         gex = spy.get("gex_aggregate", 0)
         flip = spy.get("gamma_flip")
         put_wall = spy.get("put_wall")
