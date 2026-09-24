@@ -47,6 +47,7 @@ from sqlalchemy.engine import Engine
 # the canonical module and stay only as thin shims for backward compatibility
 # with any external caller still importing them by name.
 from physics.greeks import black_scholes as _bs
+from store.availability import unavailable
 
 
 # ── Black-Scholes Greeks (shims over physics/greeks/black_scholes) ───────────
@@ -147,7 +148,15 @@ class DealerGammaEngine:
 
         spot = self._get_spot(ticker, snap_date)
         if spot <= 0:
-            return {"error": f"No spot price for {ticker}", "ticker": ticker}
+            # Explicitly unavailable (store/availability contract); `error`
+            # stays because every consumer keys on it.
+            result = unavailable(
+                f"no measured close for {ticker} on or before {snap_date} "
+                "in resolved_series",
+                source="resolved_series",
+            )
+            result.update({"ticker": ticker, "error": f"No spot price for {ticker}"})
+            return result
 
         # Compute per-strike Greeks and GEX
         per_strike = self._compute_per_strike(chain, spot)
@@ -395,7 +404,13 @@ class DealerGammaEngine:
         return df[df["dte"] > 0]
 
     def _get_spot(self, ticker: str, snap_date: date) -> float:
-        """Get spot price from resolved_series or options ATM."""
+        """Get the measured close from resolved_series; 0.0 when there is none.
+
+        No strike is ever substituted. This used to fall back to the
+        highest-open-interest call strike (commented "ATM", but not ATM), which
+        was then published as ``spot`` with the flip, walls, regime and the
+        forced-flow waterfall score all computed around it.
+        """
         with self.engine.connect() as conn:
             # Try resolved_series (yfinance close)
             row = conn.execute(text("""
@@ -410,17 +425,7 @@ class DealerGammaEngine:
                 "d": snap_date,
             }).fetchone()
 
-            if row:
-                return float(row[0])
-
-            # Fallback: use ATM strike from options chain
-            row = conn.execute(text("""
-                SELECT strike FROM options_snapshots
-                WHERE ticker = :t AND snap_date = :d AND opt_type = 'call'
-                ORDER BY open_interest DESC LIMIT 1
-            """), {"t": ticker, "d": snap_date}).fetchone()
-
-            return float(row[0]) if row else 0.0
+        return float(row[0]) if row else 0.0
 
     # ── Convenience methods ──────────────────────────────────────────
 
@@ -477,7 +482,7 @@ class DealerGammaEngine:
             "spy_gamma_flip": spy["gamma_flip"] if spy else None,
             "spy_put_wall": spy["put_wall"] if spy else None,
             "spy_call_wall": spy["call_wall"] if spy else None,
-            "spy_gex": spy["gex_aggregate"] if spy else 0,
+            "spy_gex": spy["gex_aggregate"] if spy else None,
             "tickers": [
                 {
                     "ticker": r["ticker"],
