@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 from scripts.ci_pytest_report import _nodeid
 
@@ -67,8 +68,13 @@ def _pytest_run(tmp_path: Path, source: str, *extra: str) -> tuple[Path, Path, s
 
 def _check(tmp_path: Path, junit: Path, report: Path, allowlist: Path) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
     output = tmp_path / "check.json"
+    discovery = tmp_path / "discovery.json"
+    collected = _run(tmp_path, "discover", "--tests-root", ".",
+                     "--output", str(discovery))
+    assert collected.returncode == 0, collected.stdout + collected.stderr
     result = _run(tmp_path, "check-skips", "--junit", str(junit),
-                  "--report", str(report), "--allowlist", str(allowlist),
+                  "--report", str(report), "--discovery", str(discovery),
+                  "--allowlist", str(allowlist),
                   "--output", str(output))
     return result, json.loads(output.read_text(encoding="utf-8")) if output.exists() else {}
 
@@ -78,6 +84,11 @@ def test_unknown_junit_skip_fails_and_exact_allowlist_passes(tmp_path: Path) -> 
         "import pytest\n"
         "def test_new_contract(): pytest.skip('database bootstrap unavailable')\n")
     assert run.returncode == 0, run.stdout + run.stderr
+    case = ET.parse(junit).find(".//testcase")
+    assert case is not None
+    assert [(p.get("name"), p.get("value")) for p in case.findall("./properties/property")]
+    assert ("nodeid", "test_new_contract_pg.py::test_new_contract") in [
+        (p.get("name"), p.get("value")) for p in case.findall("./properties/property")]
     allowlist = tmp_path / "allowed.json"
     allowlist.write_text('{"version":1,"allowed_skips":[]}', encoding="utf-8")
 
@@ -128,6 +139,9 @@ def test_collection_level_skip_is_reported_with_module_id(tmp_path: Path) -> Non
         "import pytest\n"
         "pytest.skip('module bootstrap hold', allow_module_level=True)\n")
     assert run.returncode == 5, run.stdout + run.stderr
+    case = ET.parse(junit).find(".//testcase")
+    assert case is not None
+    assert case.attrib
     events = json.loads(report.read_text(encoding="utf-8"))["events"]
     assert events == [{"nodeid": "test_new_contract_pg.py",
                        "outcome": "skip", "reason": "Skipped: module bootstrap hold"}]
@@ -136,8 +150,9 @@ def test_collection_level_skip_is_reported_with_module_id(tmp_path: Path) -> Non
         "nodeid": "test_new_contract_pg.py", "reason": "Skipped: module bootstrap hold",
     }]}), encoding="utf-8")
     checked, data = _check(tmp_path, junit, report, allowlist)
-    assert checked.returncode == 0, checked.stderr
+    assert checked.returncode == 1, checked.stderr
     assert data["skipped_count"] == 1
+    assert data["pytest_exitstatus"] == 5
 
 
 def test_xdist_controller_reports_one_exact_skip(tmp_path: Path) -> None:
@@ -150,6 +165,13 @@ def test_xdist_controller_reports_one_exact_skip(tmp_path: Path) -> None:
     events = json.loads(report.read_text(encoding="utf-8"))["events"]
     assert events == [{"nodeid": "test_new_contract_pg.py::test_one",
                        "outcome": "skip", "reason": "Skipped: grouped hold"}]
+    allowlist = tmp_path / "allowed.json"
+    allowlist.write_text(json.dumps({"version": 1, "allowed_skips": [{
+        "nodeid": "test_new_contract_pg.py::test_one", "reason": "Skipped: grouped hold",
+    }]}), encoding="utf-8")
+    checked, data = _check(tmp_path, junit, report, allowlist)
+    assert checked.returncode == 0, checked.stderr
+    assert data["ok"] is True
 
 
 def test_xpass_and_missing_reports_fail_closed(tmp_path: Path) -> None:
@@ -192,3 +214,75 @@ def test_xdist_group_suffix_normalization() -> None:
     assert _nodeid("tests/test_new_pg.py::test_case@param@postgres") == "tests/test_new_pg.py::test_case@param"
     assert _nodeid("tests/test_new_pg.py::test_case@tests/test_new_pg.py") == "tests/test_new_pg.py::test_case"
     assert _nodeid("tests/test_new_pg.py::test_case[email@example.com]") == "tests/test_new_pg.py::test_case[email@example.com]"
+
+
+def test_same_skip_count_with_different_junit_and_report_ids_fails(tmp_path: Path) -> None:
+    junit, report, run = _pytest_run(tmp_path,
+        "import pytest\n"
+        "def test_a(): pytest.skip('hold')\n"
+        "def test_b(): pass\n")
+    assert run.returncode == 0, run.stdout + run.stderr
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    payload["events"][0]["nodeid"] = "test_new_contract_pg.py::test_b"
+    report.write_text(json.dumps(payload), encoding="utf-8")
+    allowlist = tmp_path / "allowed.json"
+    allowlist.write_text(json.dumps({"version": 1, "allowed_skips": [{
+        "nodeid": "test_new_contract_pg.py::test_b", "reason": "Skipped: hold",
+    }]}), encoding="utf-8")
+    checked, _ = _check(tmp_path, junit, report, allowlist)
+    assert checked.returncode == 2
+    assert "JUnit skipped IDs differ" in checked.stderr
+
+
+def test_nonzero_status_and_discovery_mismatch_fail(tmp_path: Path) -> None:
+    junit, report, run = _pytest_run(tmp_path,
+        "import pytest\n"
+        "def test_a(): pytest.skip('hold')\n")
+    assert run.returncode == 0, run.stdout + run.stderr
+    allowlist = tmp_path / "allowed.json"
+    allowlist.write_text(json.dumps({"version": 1, "allowed_skips": [{
+        "nodeid": "test_new_contract_pg.py::test_a", "reason": "Skipped: hold",
+    }]}), encoding="utf-8")
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    payload["exitstatus"] = 1
+    report.write_text(json.dumps(payload), encoding="utf-8")
+    checked, data = _check(tmp_path, junit, report, allowlist)
+    assert checked.returncode == 1
+    assert data["pytest_exitstatus"] == 1
+    assert data["ok"] is False
+
+    discovery = tmp_path / "wrong-discovery.json"
+    discovery.write_text(json.dumps({
+        "version": 1, "collected_count": 1,
+        "all_collected_nodeids": ["test_new_contract_pg.py::test_b"],
+        "collection_skips": [], "pg_test_count": 1,
+        "pg_tests": [{"nodeid": "test_new_contract_pg.py::test_b",
+                      "signals": ["pg_filename"]}],
+    }), encoding="utf-8")
+    wrong = _run(tmp_path, "check-skips", "--junit", str(junit),
+                 "--report", str(report), "--discovery", str(discovery),
+                 "--allowlist", str(allowlist), "--output", str(tmp_path / "wrong.json"))
+    assert wrong.returncode == 2
+    assert "executed test IDs differ" in wrong.stderr
+
+
+def test_parametrized_junit_properties_bind_exact_nodeids(tmp_path: Path) -> None:
+    junit, report, run = _pytest_run(tmp_path,
+        "import pytest\n"
+        "@pytest.mark.parametrize('value', [0, 1])\n"
+        "def test_parameter(value):\n"
+        "    if value == 0: pytest.skip('zero hold')\n")
+    assert run.returncode == 0, run.stdout + run.stderr
+    cases = ET.parse(junit).findall(".//testcase")
+    ids = [p.get("value") for case in cases for p in case.findall("./properties/property")
+           if p.get("name") == "nodeid"]
+    assert set(ids) == {"test_new_contract_pg.py::test_parameter[0]",
+                        "test_new_contract_pg.py::test_parameter[1]"}
+    allowlist = tmp_path / "allowed.json"
+    allowlist.write_text(json.dumps({"version": 1, "allowed_skips": [{
+        "nodeid": "test_new_contract_pg.py::test_parameter[0]",
+        "reason": "Skipped: zero hold",
+    }]}), encoding="utf-8")
+    checked, data = _check(tmp_path, junit, report, allowlist)
+    assert checked.returncode == 0, checked.stderr
+    assert data["ok"] is True

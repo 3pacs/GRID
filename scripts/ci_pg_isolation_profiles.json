@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "status": "source_inventory_only_no_database_bootstrap_verified",
+  "profiles": {
+    "module_owned_schema": {
+      "bootstrap": "module_creates_unique_schema_and_tables",
+      "destructive_scope": "module_unique_schema",
+      "modules": [
+        "tests/test_binance_canonical_close_pg.py",
+        "tests/test_briefing_sentiment_readonly_pg.py",
+        "tests/test_dad_gold_readonly_pg.py",
+        "tests/test_dad_ticker_detail_readonly_pg.py",
+        "tests/test_pipeline_health_pg.py",
+        "tests/test_sector_health_upsert_ordering_pg.py",
+        "tests/test_snapshots_readonly_pg.py",
+        "tests/test_watchlist_analysis_derivatives_readonly_pg.py",
+        "tests/test_watchlist_edge_readonly_pg.py",
+        "tests/test_watchlist_options_readonly_pg.py",
+        "tests/test_watchlist_overview_readonly_pg.py",
+        "tests/test_watchlist_portfolio_pg.py"
+      ]
+    },
+    "fixed_astrogrid_schema": {
+      "bootstrap": "module_creates_tables_but_drops_fixed_astrogrid_schema",
+      "destructive_scope": "fixed_astrogrid_schema",
+      "modules": [
+        "tests/test_spy_binance_composition_pg.py",
+        "tests/test_spy_price_receipt_pg.py"
+      ]
+    },
+    "shared_public_tables": {
+      "bootstrap": "public_schema_or_seed_prerequisites_need_disposable_validation",
+      "destructive_scope": "public_tables",
+      "modules": [
+        "tests/test_actor_provenance_router_wiring_pg.py",
+        "tests/test_actors_provenance_columns_migration_pg.py",
+        "tests/test_backfill_actor_provenance_pg.py",
+        "tests/test_capital_flow_rollups_pg.py",
+        "tests/test_fundamental_divergence_pg.py",
+        "tests/test_intel_network_icij_schema_fix_pg.py",
+        "tests/test_monitor_pg_activity_pg.py",
+        "tests/test_oracle_null_policy_pg.py",
+        "tests/test_save_actor_evidence_gate_pg.py",
+        "tests/test_seed_known_actors_provenance_guard_pg.py"
+      ]
+    },
+    "scale_opt_in": {
+      "bootstrap": "requires_GRID_SCALE_TESTS_1_and_capital_flows_prerequisites",
+      "destructive_scope": "public_tables",
+      "modules": ["tests/test_daily_intel_scale_pg.py"]
+    },
+    "non_pg_seeded_fixture": {
+      "bootstrap": "schema_sql_seeds_alembic_and_contracts_require_disposable_validation",
+      "destructive_scope": "public_tables_or_rows",
+      "modules": [
+        "tests/contracts/test_dead_letter.py",
+        "tests/contracts/test_migration.py",
+        "tests/test_acquisition_decomposition.py",
+        "tests/test_canvas_api.py",
+        "tests/test_canvas_graph_state_store.py",
+        "tests/test_canvas_predict.py",
+        "tests/test_capital_flow_rollups.py",
+        "tests/test_capital_flow_ttm_fingerprint_coverage.py",
+        "tests/test_goal_queue.py",
+        "tests/test_holder_deal_overlap.py",
+        "tests/test_intelligence_search.py",
+        "tests/test_investigation_evidence.py",
+        "tests/test_journal.py",
+        "tests/test_pit.py",
+        "tests/test_resolver.py"
+      ]
+    },
+    "unrouted_or_extra_opt_in": {
+      "bootstrap": "fixture_routing_or_extension_opt_in_needs_repair_and_disposable_validation",
+      "destructive_scope": "unverified",
+      "modules": [
+        "tests/test_crypto_signals.py",
+        "tests/test_hypothesis_kills.py",
+        "tests/test_reasoning_bank.py",
+        "tests/test_realtime_freshness_probe.py",
+        "tests/test_realtime_shutdown_semantics.py"
+      ]
+    }
+  }
+}

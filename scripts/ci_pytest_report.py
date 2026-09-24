@@ -37,6 +37,13 @@ class _Reporter:
         self.controller = controller
         self.events: list[dict[str, str]] = []
         self.collect_errors: list[str] = []
+        self.executed_nodeids: set[str] = set()
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtest_makereport(self, item: object, call: object):
+        outcome = yield
+        report = outcome.get_result()
+        report.user_properties.append(("nodeid", _nodeid(item.nodeid)))
 
     @pytest.hookimpl
     def pytest_collectreport(self, report: object) -> None:
@@ -52,6 +59,7 @@ class _Reporter:
     def pytest_runtest_logreport(self, report: object) -> None:
         if not self.controller:
             return
+        self.executed_nodeids.add(_nodeid(report.nodeid))
         if report.skipped:
             outcome = "xfail" if hasattr(report, "wasxfail") else "skip"
         elif report.passed and hasattr(report, "wasxfail"):
@@ -78,6 +86,7 @@ class _Reporter:
             "exitstatus": int(exitstatus),
             "events": self.events,
             "collect_errors": self.collect_errors,
+            "executed_nodeids": sorted(self.executed_nodeids),
         }
         self.path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
