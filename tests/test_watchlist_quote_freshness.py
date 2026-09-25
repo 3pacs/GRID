@@ -25,6 +25,7 @@ import os
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 from loguru import logger as loguru_logger
 
@@ -203,10 +204,12 @@ class TestSpyIntradayQuote:
     def _wire_spy(mock_engine, candle):
         mock_conn = MagicMock()
         prices = MagicMock()
-        today_utc = datetime.now(timezone.utc).date()
+        # Daily fixtures must follow the bar's date, even just after midnight
+        # when a recent delayed bar still belongs to the previous UTC day.
+        bar_date = (candle[1] + timedelta(minutes=5)).date()
         prices.fetchall.return_value = [
-            (104.0, today_utc),
-            (100.0, today_utc - timedelta(days=1)),
+            (104.0, bar_date),
+            (100.0, bar_date - timedelta(days=1)),
         ]
         options = MagicMock()
         options.fetchone.return_value = None
@@ -216,12 +219,18 @@ class TestSpyIntradayQuote:
         _wire_engine(mock_engine, mock_conn)
         return mock_conn
 
+    @pytest.mark.parametrize("now", [
+        datetime(2026, 9, 24, 18, 0, tzinfo=timezone.utc),
+        datetime(2026, 9, 25, 0, 10, tzinfo=timezone.utc),
+    ], ids=["daytime", "utc-midnight"])
     @patch("api.routers.watchlist_overview.get_db_engine")
-    def test_recent_delayed_bar_beats_daily_price_with_its_own_timestamp(self, mock_engine):
-        bucket = datetime.now(timezone.utc) - timedelta(minutes=20)
+    def test_recent_delayed_bar_beats_daily_price_with_its_own_timestamp(self, mock_engine, now):
+        bucket = now - timedelta(minutes=20)
         conn = self._wire_spy(mock_engine, (105.0, bucket))
 
-        response = client.get("/api/v1/watchlist/SPY/quote", headers=_auth_header())
+        with patch("api.routers.watchlist_overview.datetime", wraps=datetime) as clock:
+            clock.now.return_value = now
+            response = client.get("/api/v1/watchlist/SPY/quote", headers=_auth_header())
 
         assert response.status_code == 200
         data = response.json()
