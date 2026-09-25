@@ -167,6 +167,48 @@ def test_completed_batch_time_follows_final_provider_response(
     ) < next(i for i, s in enumerate(sql) if "INSERT INTO options_snapshots" in s)
 
 
+def test_explicit_six_expiry_cap_preserves_legacy_gem_scope(
+    puller: options.OptionsPuller,
+) -> None:
+    now = datetime.now(timezone.utc)
+    expirations = [int((now + timedelta(days=10 * n)).timestamp()) for n in range(1, 8)]
+    yahoo = _Yahoo(expirations, [100.0])
+    puller._yahoo = yahoo
+
+    result = puller._pull_ticker("OPCH", now.date().isoformat(), max_expirations=6)
+
+    assert result["status"] == "SUCCESS"
+    assert yahoo.calls == 6
+    assert len(puller.engine.rows) == 12  # six complete call/put expiries
+    assert len({row["batch_id"] for row in puller.engine.rows}) == 1
+
+
+def test_near_expiry_signal_stays_within_captured_six(
+    puller: options.OptionsPuller,
+) -> None:
+    now = datetime.now(timezone.utc)
+    expirations = [int((now + timedelta(days=1, hours=n)).timestamp()) for n in range(6)]
+    expirations.append(int((now + timedelta(days=10)).timestamp()))
+    yahoo = _Yahoo(expirations, [100.0])
+    puller._yahoo = yahoo
+
+    assert puller._pull_ticker("OPCH", now.date().isoformat(),
+                               max_expirations=6)["status"] == "SUCCESS"
+    signal_params = next(params for sql, params in puller.engine.calls
+                         if "INSERT INTO options_daily_signals" in sql)
+    assert signal_params["ne"] == datetime.fromtimestamp(
+        expirations[0], timezone.utc,
+    ).date().isoformat()
+
+
+@pytest.mark.parametrize("cap", [0, 13, True, 6.5])
+def test_invalid_expiry_cap_fails_before_client_or_provider(
+    puller: options.OptionsPuller, cap: object,
+) -> None:
+    with pytest.raises(ValueError, match="max_expirations"):
+        puller.pull_all(tickers=["OPCH"], max_expirations=cap)
+
+
 def test_second_complete_pull_replaces_added_and_removed_strikes(
     puller: options.OptionsPuller,
 ) -> None:

@@ -243,6 +243,7 @@ class OptionsPuller(BasePuller):
         tickers: list[str] | None = None,
         *,
         include_catalyst_universe: bool = True,
+        max_expirations: int = MAX_EXPIRATIONS,
     ) -> list[dict[str, Any]]:
         """Pull options chains for all tickers and compute signals.
 
@@ -254,10 +255,17 @@ class OptionsPuller(BasePuller):
                 ``catalyst_options_universe``). On by default: without it the
                 sub-$2B names the Long Plays board gates on have no chain and
                 no IV surface, which is the state measured on 2026-09-10.
+            max_expirations: Limit the nearest complete expiries per ticker.
+                The default preserves the scheduler's existing 12-expiry cap;
+                the legacy GEM timer used six.
 
         Returns:
             list[dict]: Per-ticker results with status and row counts.
         """
+        if (not isinstance(max_expirations, int) or isinstance(max_expirations, bool)
+                or not 1 <= max_expirations <= MAX_EXPIRATIONS):
+            raise ValueError(f"max_expirations must be between 1 and {MAX_EXPIRATIONS}")
+
         self._yahoo = YahooOptionsClient()
         if not self._yahoo.is_available:
             log.error("Yahoo options client unavailable — cannot pull options")
@@ -277,7 +285,7 @@ class OptionsPuller(BasePuller):
         results: list[dict[str, Any]] = []
 
         for ticker in tickers:
-            result = self._pull_ticker(ticker, today_str)
+            result = self._pull_ticker(ticker, today_str, max_expirations=max_expirations)
             results.append(result)
             time.sleep(0.3)  # rate limit
 
@@ -289,7 +297,9 @@ class OptionsPuller(BasePuller):
         )
         return results
 
-    def _pull_ticker(self, ticker: str, today_str: str) -> dict[str, Any]:
+    def _pull_ticker(
+        self, ticker: str, today_str: str, *, max_expirations: int = MAX_EXPIRATIONS,
+    ) -> dict[str, Any]:
         """Pull options chain for a single ticker and compute signals."""
         try:
             capture_clock = time.monotonic()
@@ -315,6 +325,7 @@ class OptionsPuller(BasePuller):
             if not expirations:
                 log.warning("{t}: no options expirations", t=ticker)
                 return {"ticker": ticker, "status": "SKIPPED", "reason": "no expirations"}
+            selected_expirations = expirations[:max_expirations]
 
             total_call_oi = 0
             total_put_oi = 0
@@ -334,7 +345,7 @@ class OptionsPuller(BasePuller):
             near_calls_df = pd.DataFrame()
             near_puts_df = pd.DataFrame()
 
-            for i, exp_ts in enumerate(expirations[:MAX_EXPIRATIONS]):
+            for i, exp_ts in enumerate(selected_expirations):
                 if time.monotonic() - capture_clock >= MAX_CAPTURE_SECONDS:
                     complete = False
                     break
@@ -463,16 +474,17 @@ class OptionsPuller(BasePuller):
                 # Skip expiries within 2 days (near-worthless, garbage data)
                 today_ts = datetime.now(timezone.utc).timestamp()
                 min_dte_seconds = 2 * 86400  # 2 days
-                liquid_expirations = [e for e in expirations if e - today_ts >= min_dte_seconds]
+                liquid_expirations = [e for e in selected_expirations
+                                      if e - today_ts >= min_dte_seconds]
                 if not liquid_expirations:
-                    liquid_expirations = expirations  # Fallback
+                    liquid_expirations = selected_expirations  # Fallback within captured chain
                 near_expiry = datetime.utcfromtimestamp(liquid_expirations[0]).strftime("%Y-%m-%d")
 
                 # If the nearest expiry was skipped, rebuild near_calls/puts from the correct expiry
-                if liquid_expirations[0] != expirations[0]:
+                if liquid_expirations[0] != selected_expirations[0]:
                     # Find which index in our pulled chains matches the liquid expiry
                     liquid_idx = None
-                    for ci, e in enumerate(expirations[:MAX_EXPIRATIONS]):
+                    for ci, e in enumerate(selected_expirations):
                         if e == liquid_expirations[0]:
                             liquid_idx = ci
                             break
