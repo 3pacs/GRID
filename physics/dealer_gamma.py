@@ -170,7 +170,7 @@ class DealerGammaEngine:
               exposure, i.e. most negative put_gex — typically a support level)
             - call_wall: float (strike with the largest CALL gamma exposure,
               i.e. most positive call_gex — typically a resistance level)
-            - dealer_delta: float (net delta dealers must hedge)
+            - dealer_delta: float (modeled net dealer-side option delta)
             - regime: str (LONG_GAMMA / SHORT_GAMMA / NEUTRAL)
             - profile: list of {spot, gex} for charting
             - per_strike: list of {strike, call_gex, put_gex, net_gex}
@@ -181,7 +181,7 @@ class DealerGammaEngine:
             returns an explicit unavailable result instead (``available``:
             False, ``status``: "unavailable", ``reason``, plus the legacy
             ``error`` key some older callers still check) with every
-            measured field — regime, gamma_flip, gex_aggregate, walls,
+            spot and modeled fields — regime, gamma_flip, gex_aggregate, walls,
             profile, per_strike — set to ``None``. Never a guessed number.
         """
         if snap_date is None:

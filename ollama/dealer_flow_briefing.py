@@ -289,7 +289,7 @@ def _fmt_ticker_block(ticker: str, gex_data: dict[str, Any]) -> str:
         f"- Modeled Call Wall: {call_wall if call_wall else 'N/A'}",
         f"- Modeled Vanna Exposure: {_fmt_dollar(vanna)}",
         f"- Modeled Charm Exposure: {_fmt_dollar(charm)}",
-        f"- Net Dealer Delta: {_fmt_dollar(delta)}",
+        f"- Modeled Net Dealer-Side Delta: {_fmt_dollar(delta)}",
         "",
     ]
     return "\n".join(lines)
