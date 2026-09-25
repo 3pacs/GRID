@@ -72,12 +72,15 @@ def test_gem_wrapper_real_batch_writer_nine_tickers_six_expiries(scratch_pg14, m
               FROM options_snapshots GROUP BY ticker ORDER BY ticker
         """)).fetchall()
         signals = conn.execute(text("SELECT COUNT(*) FROM options_daily_signals")).scalar_one()
+        snap_date = conn.execute(text(
+            "SELECT DISTINCT snap_date FROM options_snapshots WHERE ticker = 'SPY'"
+        )).scalar_one()
     assert {row[0] for row in rows} == set(expected)
     assert all((row[1], row[2], row[3], row[4], row[5]) == (12, 6, 1, 1, True)
                for row in rows)
     assert signals == 9
     assert not DealerGammaEngine(engine)._load_chain(
-        "SPY", datetime.now(timezone.utc).date(),
+        "SPY", snap_date,
     ).empty
 
 
