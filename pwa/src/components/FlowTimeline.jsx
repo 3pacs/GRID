@@ -70,7 +70,7 @@ export default function FlowTimeline({ ticker, timelineData }) {
         const history = timelineData.history || [];
         const opexCal = timelineData.opex_calendar || [];
         const catalysts = timelineData.catalysts || [];
-        const flipCrossings = timelineData.gamma_flip_crossings || [];
+        const signChanges = timelineData.gex_sign_changes || [];
 
         if (history.length === 0) return;
 
@@ -241,8 +241,8 @@ export default function FlowTimeline({ ticker, timelineData }) {
                 .attr('d', priceLine);
         }
 
-        // ── Gamma flip crossings (vertical dashed) ──
-        flipCrossings.forEach(fc => {
+        // ── Dated modeled GEX sign changes (not spot/flip crossings) ──
+        signChanges.forEach(fc => {
             const fcDate = new Date(fc.date);
             const fx = xScale(fcDate);
             if (fx >= 0 && fx <= chartW) {
@@ -261,7 +261,7 @@ export default function FlowTimeline({ ticker, timelineData }) {
                     .attr('font-family', "'JetBrains Mono', monospace")
                     .attr('fill', colors.yellow)
                     .attr('opacity', 0.7)
-                    .text(fc.direction === 'below' ? 'FLIP -' : 'FLIP +');
+                    .text(fc.gex_sign === 'negative' ? 'GEX -' : 'GEX +');
             }
         });
 
@@ -496,7 +496,7 @@ export default function FlowTimeline({ ticker, timelineData }) {
 
     const history = timelineData.history || [];
     const latestGex = history.length > 0 ? history[history.length - 1].net_gex : 0;
-    const flipCount = (timelineData.gamma_flip_crossings || []).length;
+    const signChangeCount = (timelineData.gex_sign_changes || []).length;
 
     return (
         <div ref={containerRef} style={{
@@ -529,9 +529,9 @@ export default function FlowTimeline({ ticker, timelineData }) {
                             {formatGEX(latestGex)}
                         </span>
                     </span>
-                    {flipCount > 0 && (
+                    {signChangeCount > 0 && (
                         <span style={{ color: colors.yellow }}>
-                            {flipCount} flip{flipCount > 1 ? 's' : ''}
+                            {signChangeCount} GEX sign change{signChangeCount > 1 ? 's' : ''}
                         </span>
                     )}
                 </div>

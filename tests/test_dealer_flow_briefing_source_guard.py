@@ -155,3 +155,20 @@ def test_legacy_saved_row_is_withheld_even_if_dated_today(contract: str) -> None
     assert result["content"] is None
     assert result["positioning_data"] is None
     assert result["stale"] is True
+
+
+def test_downward_flip_uses_computed_gex_sign_in_briefing_prompt() -> None:
+    """Spot above one flip can still have negative modeled GEX."""
+    profile = {
+        **_dated_spy(), "spot": 102.0, "spot_obs_date": "2026-09-23",
+        "gex_aggregate": -357535.0, "gamma_flip": 99.30,
+        "gamma_flip_crossings": 1, "regime": "SHORT_GAMMA",
+    }
+
+    block = flow._fmt_ticker_block("SPY", profile)
+    system_prompt, user_prompt = flow._build_prompt({"gex": {"SPY": profile}})
+
+    assert "Modeled SHORT GAMMA" in block
+    assert "LONG GAMMA (above flip)" not in block
+    assert "either side can have either GEX sign" in system_prompt
+    assert "crossing a flip price alone does not establish a regime direction" in user_prompt

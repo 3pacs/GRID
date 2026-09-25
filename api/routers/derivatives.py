@@ -931,7 +931,7 @@ def get_flow_timeline(
 
     db = get_db_engine()
     history: list[dict] = []
-    gamma_flip_crossings: list[dict] = []
+    gex_sign_changes: list[dict] = []
     failed_dates = 0
     stored_read_failed = False
     used_fallback = False
@@ -978,10 +978,12 @@ def get_flow_timeline(
                 })
 
                 if prev_gex is not None and prev_gex * net_gex < 0:
-                    gamma_flip_crossings.append({
+                    # This is a change between dated modeled GEX estimates,
+                    # not proof that spot crossed a same-chain flip price.
+                    gex_sign_changes.append({
                         "date": str(sig_date),
-                        "direction": "below" if net_gex < 0 else "above",
-                        "spot_at_crossing": round(spot, 2),
+                        "gex_sign": "negative" if net_gex < 0 else "positive",
+                        "spot": round(spot, 2),
                     })
                 prev_gex = net_gex
 
@@ -1027,7 +1029,8 @@ def get_flow_timeline(
         **({"error": "No usable GEX history is available"} if not history else {}),
         "opex_calendar": opex_calendar,
         "catalysts": catalysts,
-        "gamma_flip_crossings": gamma_flip_crossings,
+        "gex_sign_changes": gex_sign_changes,
+        "gamma_flip_crossings": [],  # legacy field; price crossings unverified
     }
 
 

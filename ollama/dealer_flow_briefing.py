@@ -275,16 +275,15 @@ def _fmt_ticker_block(ticker: str, gex_data: dict[str, Any]) -> str:
     charm = gex_data.get("charm_exposure", 0)
     regime = gex_data.get("regime", "UNKNOWN")
 
-    # Determine position relative to gamma flip
-    if flip and spot != "?":
-        territory = "LONG GAMMA (above flip)" if spot > flip else "SHORT GAMMA (below flip)"
-    else:
-        territory = regime.replace("_", " ")
+    # The nearest zero crossing has no universal sign direction. The engine
+    # classifies the regime from modeled GEX at the verified reference spot.
+    territory = regime.replace("_", " ") if isinstance(regime, str) else "UNKNOWN"
 
     lines = [
         f"### {ticker}",
         f"- Modeled GEX Aggregate: {_fmt_dollar(gex)} (assumed dealer sign)",
         f"- Modeled Gamma Flip: {flip if flip else 'N/A'}",
+        f"- Flip crossings in search range: {gex_data.get('gamma_flip_crossings', 'N/A')}",
         f"- Prior verified close ({gex_data.get('spot_obs_date')}): {spot} --> Modeled {territory}",
         f"- Modeled Put Wall: {put_wall if put_wall else 'N/A'}",
         f"- Modeled Call Wall: {call_wall if call_wall else 'N/A'}",
@@ -350,7 +349,8 @@ def _build_prompt(data: dict[str, Any]) -> tuple[str, str]:
         "it is not a measured hedge order.\n"
         "- Charm: as time passes, option delta decays. Near OpEx, gamma concentrates. "
         "Post-OpEx, gamma unwinds and vol can expand.\n"
-        "- A computed gamma flip is a model zero crossing, not a verified regime boundary.\n"
+        "- A computed gamma flip is a model zero crossing, not a verified regime boundary; "
+        "either side can have either GEX sign, and there may be multiple crossings.\n"
         "- Put and call walls are modeled exposure concentrations.\n"
         "- Expiry changes modeled exposure; direction and size of actual flows "
         "are unknown.\n\n"
@@ -418,8 +418,8 @@ def _build_prompt(data: dict[str, Any]) -> tuple[str, str]:
         "### Regime Assessment\n"
         "One paragraph: Does the assumed model estimate long or short gamma? "
         "What does this mean mechanically? Use specific numbers. Explain whether "
-        "the market is in a mean-reverting (pinned) or trending (volatile) regime "
-        "and what the GEX numbers tell you about realized vol expectations.\n\n"
+        "the model conditionally implies damping or amplification. Do not "
+        "infer observed realized volatility from GEX alone.\n\n"
 
         "### Key Levels\n"
         "Gamma flip, put wall, call wall for SPY (and QQQ if different story). "
@@ -431,16 +431,15 @@ def _build_prompt(data: dict[str, Any]) -> tuple[str, str]:
         "trades or forecasted price moves without a calibrated conversion.\n\n"
 
         "### OpEx Dynamics\n"
-        "Days to OpEx, gamma pin potential, expected vol expansion/compression. "
-        "'With N days to monthly OpEx, $XB of gamma will expire -- releasing the "
-        "pinning effect.' Explain what the OpEx gamma unwind means for the "
-        "following week.\n\n"
+        "Days to OpEx and conditional changes to modeled exposure as contracts "
+        "expire. Do not assert an amount of actual dealer gamma will unwind "
+        "or forecast realized volatility without evidence.\n\n"
 
         "### Flow Outlook\n"
         "Synthesis: given all the above, what are the mechanical forces saying? "
-        "Mean-reversion or trend? Where are the support/resistance magnets? "
-        "What would change the picture? (VIX spike, spot crossing gamma flip, "
-        "new large OI buildup, etc.) Be specific about scenarios and levels."
+        "Which conditional model scenario matters? What observations would "
+        "change the picture? Recompute GEX at a new verified spot and chain; "
+        "crossing a flip price alone does not establish a regime direction."
     )
 
     return system_prompt, user_prompt

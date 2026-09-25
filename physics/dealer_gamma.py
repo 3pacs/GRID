@@ -1,9 +1,9 @@
 """
 GRID — Dealer gamma exposure and hedging flow mechanics.
 
-Implements the standard public dealer-gamma framework (SqueezeMetrics'
-2017 "Gamma Exposure" white paper; the same convention SpotGamma, Menthor Q
-and the Cem Karsan / Kai Volatility commentary build on): when dealers are
+Implements an independent, assumed-position gamma model using a public sign
+convention; the computed output is not SqueezeMetrics or another vendor feed.
+Under this model, when dealers are
 short gamma (negative GEX), they must hedge by buying into rallies and
 selling into drops — amplifying moves. When dealers are long gamma (positive
 GEX), they do the opposite — selling into rallies and buying into drops —
@@ -41,12 +41,10 @@ dealer's book as the opposite side). Concretely, for every strike:
   - GEX = Σ(call_OI × call_gamma × 100 × spot) − Σ(put_OI × put_gamma × 100 × spot)
   - GEX > 0 at spot: dealers long gamma (dampening / pinning; "rubber band")
   - GEX < 0 at spot: dealers short gamma (amplifying; "slingshot")
-  - Empirically (and by construction of the flip search below), spot ABOVE
-    the gamma flip -> GEX > 0 (long gamma); spot BELOW the flip -> GEX < 0
-    (short gamma). The flip's PRICE LEVEL does not depend on which side of
-    the convention you pick (negating every term leaves its zero crossing
-    unchanged) — only the sign of GEX on each side, and therefore the
-    LONG_GAMMA/SHORT_GAMMA labels, depend on it.
+  - A flip is a zero crossing, not a direction guarantee. Either side may
+    have either sign, and a chain may have several crossings. The regime is
+    classified from modeled GEX at the verified reference spot itself.
+    Negating every term changes the regime sign but not crossing prices.
 
 dealer_delta, vanna_exposure and charm_exposure below are derived using this
 exact same per-leg sign convention (DEALER_CALL_SIGN on the call leg,
@@ -57,6 +55,7 @@ from __future__ import annotations
 
 import math
 from datetime import date, datetime, timedelta, timezone
+from itertools import pairwise
 from typing import Any
 from uuid import UUID
 
@@ -74,10 +73,12 @@ from sqlalchemy.engine import Engine
 from physics.greeks import black_scholes as _bs
 from store.availability import unavailable
 
-
 # Assumed dealer-side positioning used for every modeled Greek below.
 DEALER_CALL_SIGN: float = 1.0
 DEALER_PUT_SIGN: float = -1.0
+
+# Fixed gamma-flip search resolution, independent of chart point count.
+FLIP_SEARCH_STEP_PCT: float = 0.001
 
 # ── Black-Scholes Greeks (shims over physics/greeks/black_scholes) ───────────
 
@@ -199,6 +200,11 @@ class DealerGammaEngine:
                 f"no verified prior close for {ticker} available at the "
                 f"{snap_date} options snapshot",
                 source="spy_close_receipt",
+                spot=None, regime=None, gamma_flip=None,
+                gamma_flip_crossings=None, gamma_wall=None, put_wall=None,
+                call_wall=None, gex_aggregate=None, gex_normalized=None,
+                dealer_delta=None, vanna_exposure=None, charm_exposure=None,
+                profile=None, per_strike=None,
             )
             result.update({"ticker": ticker, "error": f"No spot price for {ticker}"})
             return result
@@ -475,19 +481,29 @@ class DealerGammaEngine:
         lo = spot * (1 - range_pct)
         hi = spot * (1 + range_pct)
         step = spot * FLIP_SEARCH_STEP_PCT
-        n_points = max(int(round((hi - lo) / step)) + 1, 2) if step > 0 else 2
+        n_points = max(round((hi - lo) / step) + 1, 2) if step > 0 else 2
         prices = np.linspace(lo, hi, n_points)
 
         arrays = self._prepare_chain_arrays(chain)
         gex_values = self._gex_at_spots_vectorized(*arrays, prices)
 
+        if not np.all(np.isfinite(gex_values)):
+            return None, 0
+
         crossings: list[float] = []
-        for i in range(1, len(gex_values)):
-            prev_gex = gex_values[i - 1]
-            curr_gex = gex_values[i]
-            if prev_gex * curr_gex < 0:
-                ratio = abs(prev_gex) / (abs(prev_gex) + abs(curr_gex) + 1e-12)
-                crossings.append(float(prices[i - 1] + ratio * (prices[i] - prices[i - 1])))
+        nonzero = np.flatnonzero(gex_values != 0)
+        for left, right in pairwise(nonzero):
+            prev_gex, curr_gex = gex_values[left], gex_values[right]
+            if np.signbit(prev_gex) == np.signbit(curr_gex):
+                continue
+            if right == left + 1:
+                ratio = abs(prev_gex) / (abs(prev_gex) + abs(curr_gex))
+                crossing = prices[left] + ratio * (prices[right] - prices[left])
+            else:
+                # An exact zero grid point (or a zero plateau) is a crossing
+                # only when its nonzero neighbors have opposite signs.
+                crossing = (prices[left + 1] + prices[right - 1]) / 2
+            crossings.append(float(crossing))
 
         if not crossings:
             return None, 0

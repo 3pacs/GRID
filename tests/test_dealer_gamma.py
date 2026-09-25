@@ -77,6 +77,7 @@ def _compute_profile(
     rows: list[dict[str, float | str]],
     *,
     spot: float = SPOT,
+    risk_free_rate: float = RISK_FREE_RATE,
 ) -> dict:
     chain = pd.DataFrame(rows)
     chain_time = datetime.combine(SNAP_DATE, datetime.min.time(), timezone.utc) + timedelta(hours=19)
@@ -86,7 +87,7 @@ def _compute_profile(
                        capture_ordinal=1,
                        capture_started_at=chain_time,
                        capture_completed_at=chain_time + timedelta(minutes=1))
-    engine = DealerGammaEngine(MagicMock(), risk_free_rate=RISK_FREE_RATE)
+    engine = DealerGammaEngine(MagicMock(), risk_free_rate=risk_free_rate)
     monkeypatch.setattr(engine, "_load_chain", lambda _ticker, _snap_date: chain)
     monkeypatch.setattr(engine, "_get_spot_receipt", lambda _ticker, _time: {
         "price": spot, "receipt_id": 1,
@@ -141,7 +142,7 @@ def _expected_gamma_flip(rows: list[dict[str, float | str]]) -> tuple[float | No
     lo = SPOT * (1.0 - RANGE_PCT)
     hi = SPOT * (1.0 + RANGE_PCT)
     step = SPOT * FLIP_SEARCH_STEP_PCT
-    n = max(int(round((hi - lo) / step)) + 1, 2)
+    n = max(round((hi - lo) / step) + 1, 2)
     prices = np.linspace(lo, hi, n)
     gex_values = [
         sum(_row_gex(row, spot=float(price)) for row in rows)
@@ -303,57 +304,6 @@ def test_gex_negative_below_flip_positive_above_with_puts_low_calls_high(
     assert profile["call_wall"] is not None and profile["call_wall"] > SPOT
 
 
-# ── _get_spot: real spot only, never an options strike ────────────────────
-
-
-def _mock_connect(engine: DealerGammaEngine, fetchone_results: list) -> MagicMock:
-    """Wire ``engine.engine.connect()`` to a context manager whose
-    successive ``execute(...).fetchone()`` calls return ``fetchone_results``
-    in order."""
-    mock_conn = MagicMock()
-    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
-    mock_conn.__exit__ = MagicMock(return_value=False)
-    mock_conn.execute.return_value.fetchone.side_effect = fetchone_results
-    engine.engine.connect = MagicMock(return_value=mock_conn)
-    return mock_conn
-
-
-def test_get_spot_reads_options_daily_signals_as_primary_source() -> None:
-    engine = DealerGammaEngine(MagicMock())
-    _mock_connect(engine, [(773.38,)])
-
-    spot = engine._get_spot("SPY", date(2026, 9, 22))
-
-    assert spot == 773.38
-
-
-def test_get_spot_falls_back_to_resolved_series_when_no_daily_signal_row() -> None:
-    engine = DealerGammaEngine(MagicMock())
-    _mock_connect(engine, [None, (767.81,)])
-
-    spot = engine._get_spot("SPY", date(2026, 9, 24))
-
-    assert spot == 767.81
-
-
-def test_get_spot_returns_none_and_never_queries_a_strike_when_no_source_has_data() -> None:
-    """No options_daily_signals row and no resolved_series row -> None.
-
-    Also proves there is no third, strike-based fallback query left: the
-    old bug used the highest-open-interest CALL strike as a fake spot.
-    """
-    engine = DealerGammaEngine(MagicMock())
-    mock_conn = _mock_connect(engine, [None, None])
-
-    spot = engine._get_spot("SPY", date(2026, 9, 24))
-
-    assert spot is None
-    assert mock_conn.execute.call_count == 2
-    executed_sql = " ".join(str(c.args[0]) for c in mock_conn.execute.call_args_list)
-    assert "options_snapshots" not in executed_sql
-    assert "open_interest" not in executed_sql
-
-
 def test_compute_gex_profile_unavailable_when_spot_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -363,7 +313,7 @@ def test_compute_gex_profile_unavailable_when_spot_missing(
     chain = pd.DataFrame(rows)
     engine = DealerGammaEngine(MagicMock(), risk_free_rate=RISK_FREE_RATE)
     monkeypatch.setattr(engine, "_load_chain", lambda _ticker, _snap_date: chain)
-    monkeypatch.setattr(engine, "_get_spot", lambda _ticker, _snap_date: None)
+    monkeypatch.setattr(engine, "_get_spot_receipt", lambda _ticker, _time: None)
 
     result = engine.compute_gex_profile("XYZ", SNAP_DATE)
 
@@ -498,10 +448,8 @@ def test_walls_do_not_collapse_onto_atm_strike_when_most_oi_is_long_dated(
 def test_regime_sign_matches_which_side_of_the_flip_spot_is_on(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The regime label (from the per-strike aggregate) and the gamma flip
-    (from the vectorized per-contract curve) must agree: a spot clearly
-    above the flip must be LONG_GAMMA with GEX > 0, and that same GEX must
-    equal the vectorized per-contract GEX at that exact spot."""
+    """This fixture has positive GEX above its flip, and both pricing paths
+    must agree at spot. The direction is chain-specific, not a flip rule."""
     rows = [
         {"strike": 90.0, "opt_type": "put", "open_interest": 5_000.0,
          "implied_volatility": 0.30, "dte": 30.0},
@@ -514,10 +462,7 @@ def test_regime_sign_matches_which_side_of_the_flip_spot_is_on(
     ]
     chain = pd.DataFrame(rows)
     engine = DealerGammaEngine(MagicMock(), risk_free_rate=RISK_FREE_RATE)
-    monkeypatch.setattr(engine, "_load_chain", lambda _t, _d: chain)
-    monkeypatch.setattr(engine, "_get_spot", lambda _t, _d: SPOT)
-
-    profile = engine.compute_gex_profile("XYZ", SNAP_DATE, spot_range_pct=RANGE_PCT, n_points=N_POINTS)
+    profile = _compute_profile(monkeypatch, rows)
     vectorized_at_spot = engine._gex_at_spot(chain, SPOT)
 
     assert profile["gex_aggregate"] == pytest.approx(round(vectorized_at_spot, 0), abs=1.0)
@@ -525,7 +470,29 @@ def test_regime_sign_matches_which_side_of_the_flip_spot_is_on(
     assert profile["regime"] == "LONG_GAMMA"
     assert profile["gex_aggregate"] > 0
     assert profile["gamma_flip"] is not None
-    assert SPOT > profile["gamma_flip"]  # spot is on the long-gamma side of the flip
+    assert SPOT > profile["gamma_flip"]  # true for this fixture only
+
+
+def test_single_flip_can_have_negative_gex_above_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real Black-Scholes chain disproves above-flip implies long gamma."""
+    rows = [
+        {"strike": 95.0, "opt_type": "call", "open_interest": 1000.0,
+         "implied_volatility": 0.2, "dte": 30.0},
+        {"strike": 105.0, "opt_type": "put", "open_interest": 1000.0,
+         "implied_volatility": 0.2, "dte": 30.0},
+    ]
+    profile = _compute_profile(monkeypatch, rows, spot=102.0, risk_free_rate=0.05)
+    engine = DealerGammaEngine(MagicMock(), risk_free_rate=0.05)
+    chain = pd.DataFrame(rows)
+
+    assert profile["gamma_flip_crossings"] == 1
+    assert profile["gamma_flip"] == pytest.approx(99.30, abs=0.02)
+    assert profile["spot"] > profile["gamma_flip"]
+    assert profile["gex_aggregate"] < 0
+    assert engine._gex_at_spot(chain, 95.0) > 0
+    assert engine._gex_at_spot(chain, 102.0) < 0
 
 
 # ── _find_gamma_flip: nearest-to-spot selection (2026-09-24 fine-grid fix) ─
@@ -590,6 +557,33 @@ def test_find_gamma_flip_no_crossing_returns_none_and_zero(
 
     assert flip is None
     assert crossings == 0
+
+
+@pytest.mark.parametrize(
+    ("curve", "expected_crossings"),
+    [
+        (lambda prices: prices - 100.0, 1),
+        (lambda prices: 100.0 - prices, 1),
+        (lambda prices: (prices - 100.0) ** 2, 0),
+        (lambda prices: -(prices - 100.0) ** 2, 0),
+        (lambda prices: np.zeros_like(prices), 0),
+        (lambda prices: np.where(abs(prices - 100.0) <= 0.1, 0, prices - 100.0), 1),
+    ],
+)
+def test_find_gamma_flip_handles_exact_grid_zero_and_touching_zero(
+    monkeypatch: pytest.MonkeyPatch, curve, expected_crossings: int,
+) -> None:
+    engine = DealerGammaEngine(MagicMock())
+    _patch_vectorized_gex(monkeypatch, engine,
+                          lambda _strikes, _T, _iv, _oi, _sign, prices: curve(prices))
+
+    flip, crossings = engine._find_gamma_flip(pd.DataFrame(), 100.0, 0.10)
+
+    assert crossings == expected_crossings
+    if expected_crossings:
+        assert flip == pytest.approx(100.0, abs=0.11)
+    else:
+        assert flip is None
 
 
 def test_find_gamma_flip_uses_fine_grid_independent_of_n_points(

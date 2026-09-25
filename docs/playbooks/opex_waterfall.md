@@ -12,17 +12,17 @@
 
 ## Sign Convention
 
-GRID's dealer-gamma engine (`physics/dealer_gamma.py`) models dealers as net
-LONG the calls and net SHORT the puts that customer flow tends to buy (the
-standard SqueezeMetrics / SpotGamma convention — see that module's docstring
-for the full derivation). Dealer positioning is **modeled, not observed**;
-no feed tells us what dealers actually hold. Under this convention:
+GRID's dealer-gamma engine (`physics/dealer_gamma.py`) independently models
+dealers as net LONG calls and net SHORT puts. This is an assumed sign
+convention, not SqueezeMetrics-sourced data. Dealer positioning is
+**modeled, not observed**; no feed tells us what dealers actually hold.
+Under this convention:
 
 - **GEX > 0** at spot: dealers long gamma (dampening / pinning)
 - **GEX < 0** at spot: dealers short gamma (amplifying)
-- **Spot above the gamma flip → long gamma. Spot below the flip → short
-  gamma.** The flip's price level itself does not depend on sign
-  convention; only which side is "long" vs "short" does.
+- **A gamma flip is a modeled zero crossing, not a direction rule.** Either
+  side may have either sign, and a chain can cross zero more than once. Use
+  modeled GEX at the verified reference spot for the regime label.
 
 ## Core Principle
 
@@ -166,7 +166,8 @@ Every short-vol or pinning trade must carry a written invalidation at entry:
 
 ```
 INVALIDATION:
-  - SPY closes below gamma flip level for 2 consecutive sessions, OR
+  - Recomputed modeled GEX at verified SPY reference spot is negative
+    for 2 consecutive sessions, OR
   - VIX term structure inverts (1M > 3M), OR
   - Realized 5d vol exceeds implied 5d vol by > 20%, OR
   - Waterfall score reaches 3+ of 5 tripped conditions

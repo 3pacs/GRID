@@ -425,11 +425,9 @@ def build_posture(
             if nearest else "No high-impact catalyst in lookahead window"
         )
         invalidation = (
-            "SPY closes back above the gamma flip level for 2 consecutive "
-            "sessions, confirmed by the next recomputed aggregate GEX being "
-            "positive (spot above the flip and GEX > 0 are the same event "
-            "under the standard convention — this checks it held, not just "
-            "wicked through)"
+            "Two consecutive SPY closes with recomputed modeled GEX positive "
+            "at the reference spot; crossing the nearest gamma flip alone "
+            "does not establish the direction of the regime change"
         )
     elif regime.regime == "LONG_GAMMA":
         lever = (
@@ -446,8 +444,9 @@ def build_posture(
             if nearest else "Quiet calendar; structural pinning dominant"
         )
         invalidation = (
-            "SPY closes below gamma flip for 2 sessions OR VIX term structure "
-            "inverts OR realized 5d vol exceeds implied 5d vol by >20%"
+            "Two consecutive SPY closes with recomputed modeled GEX negative "
+            "at the reference spot, or a separately verified volatility "
+            "invalidation; crossing the nearest flip alone is insufficient"
         )
     else:
         lever = "Regime unknown — dealer_gamma data unavailable or stale."
