@@ -1,9 +1,13 @@
 """
 GRID — Dealer gamma exposure and hedging flow mechanics.
 
-Implements Cem Karsan's core insight: when dealers are short gamma (negative GEX),
-they must hedge by buying into rallies and selling into drops — amplifying moves.
-When dealers are long gamma (positive GEX), they do the opposite — dampening moves.
+Implements an independent, assumed-position gamma model using a public sign
+convention; the computed output is not SqueezeMetrics or another vendor feed.
+Under this model, when dealers are
+short gamma (negative GEX), they must hedge by buying into rallies and
+selling into drops — amplifying moves. When dealers are long gamma (positive
+GEX), they do the opposite — selling into rallies and buying into drops —
+dampening moves.
 
 Key outputs:
   - GEX (Gamma Exposure Index): net dealer gamma at each strike and aggregate
@@ -11,29 +15,49 @@ Key outputs:
   - Dealer delta: net delta dealers need to hedge
   - GEX profile: gamma exposure vs spot price curve
   - Gamma wall: strike with maximum absolute gamma exposure
-  - Put wall: strike with maximum put gamma (support level)
-  - Call wall: strike with maximum call gamma (resistance level)
+  - Put wall: strike with the largest-magnitude PUT gamma exposure (support level)
+  - Call wall: strike with the largest CALL gamma exposure (resistance level)
   - Vanna exposure: sensitivity of dealer delta to IV changes
   - Charm exposure: sensitivity of dealer delta to time decay
 
-Dealer position assumption: dealers are NET SHORT options (market-making).
-Retail/institutional clients BUY options; dealers sell them and delta-hedge.
-This means for calls: dealer is short call = short gamma at strike.
-For puts: dealer is short put = long gamma at strike (put gamma is negative
-for the buyer, so dealer who is short the put has positive gamma).
+DEALER POSITIONING ASSUMPTION (modeled, not observed — see DEALER_CALL_SIGN /
+DEALER_PUT_SIGN below):
 
-Wait — that's wrong. Let's be precise:
-  - Dealer SHORT a call: gamma is NEGATIVE (they get shorter delta as spot rises)
-  - Dealer SHORT a put: gamma is POSITIVE (they get longer delta as spot drops)
-  - GEX = Σ(call_OI × call_gamma × 100 × spot) - Σ(put_OI × put_gamma × 100 × spot)
-  - When GEX > 0: dealer is long gamma (stabilizing flows)
-  - When GEX < 0: dealer is short gamma (amplifying flows)
+No feed tells us what dealers actually hold; every GEX model in the industry
+*assumes* a book and derives exposure from open interest against that
+assumption. This module adopts the standard convention: dealers are modeled
+as net LONG the calls and net SHORT the puts that retail/institutional flow
+tends to buy (covered-call / put-buying-for-protection flow ends up on the
+dealer's book as the opposite side). Concretely, for every strike:
+
+  - Dealer modeled LONG a call  -> gamma is POSITIVE at that strike
+    (a long option position, call or put, always has positive gamma —
+    Black-Scholes gamma itself is identical for calls and puts; only the
+    holder's sign differs).
+  - Dealer modeled SHORT a put  -> gamma is NEGATIVE at that strike
+    (any SHORT option position has negative gamma — there is no "short a
+    put = positive gamma" special case; that was a bug in an earlier
+    version of this docstring/module).
+  - GEX = Σ(call_OI × call_gamma × 100 × spot) − Σ(put_OI × put_gamma × 100 × spot)
+  - GEX > 0 at spot: dealers long gamma (dampening / pinning; "rubber band")
+  - GEX < 0 at spot: dealers short gamma (amplifying; "slingshot")
+  - A flip is a zero crossing, not a direction guarantee. Either side may
+    have either sign, and a chain may have several crossings. The regime is
+    classified from modeled GEX at the verified reference spot itself.
+    Negating every term changes the regime sign but not crossing prices.
+
+dealer_delta, vanna_exposure and charm_exposure below are derived using this
+exact same per-leg sign convention (DEALER_CALL_SIGN on the call leg,
+DEALER_PUT_SIGN on the put leg) — they are not independently guessed.
 """
 
 from __future__ import annotations
 
-from datetime import date
+import math
+from datetime import date, datetime, timedelta, timezone
+from itertools import pairwise
 from typing import Any
+from uuid import UUID
 
 import numpy as np
 import pandas as pd
@@ -47,7 +71,14 @@ from sqlalchemy.engine import Engine
 # the canonical module and stay only as thin shims for backward compatibility
 # with any external caller still importing them by name.
 from physics.greeks import black_scholes as _bs
+from store.availability import unavailable
 
+# Assumed dealer-side positioning used for every modeled Greek below.
+DEALER_CALL_SIGN: float = 1.0
+DEALER_PUT_SIGN: float = -1.0
+
+# Fixed gamma-flip search resolution, independent of chart point count.
+FLIP_SEARCH_STEP_PCT: float = 0.001
 
 # ── Black-Scholes Greeks (shims over physics/greeks/black_scholes) ───────────
 
@@ -127,16 +158,31 @@ class DealerGammaEngine:
         Returns:
             Dictionary with:
             - gex_aggregate: float (total GEX at current spot)
-            - gamma_flip: float (spot price where GEX = 0)
+            - gamma_flip: float (the GEX(spot)=0 crossing NEAREST the
+              current spot — see _find_gamma_flip; None if the search grid
+              finds no crossing at all)
+            - gamma_flip_crossings: int (how many zero-crossings the flip
+              search found in range; 0 = none, 1 = the common
+              unambiguous case, 2+ = more than one nearby crossing, so
+              gamma_flip is the closest of several, not the only one)
             - gamma_wall: float (strike with max |GEX|)
-            - put_wall: float (strike with max put gamma OI)
-            - call_wall: float (strike with max call gamma OI)
-            - dealer_delta: float (net delta dealers must hedge)
+            - put_wall: float (strike with the largest-magnitude PUT gamma
+              exposure, i.e. most negative put_gex — typically a support level)
+            - call_wall: float (strike with the largest CALL gamma exposure,
+              i.e. most positive call_gex — typically a resistance level)
+            - dealer_delta: float (modeled net dealer-side option delta)
             - regime: str (LONG_GAMMA / SHORT_GAMMA / NEUTRAL)
             - profile: list of {spot, gex} for charting
             - per_strike: list of {strike, call_gex, put_gex, net_gex}
             - vanna_exposure: float (aggregate vanna)
             - charm_exposure: float (aggregate charm)
+
+            When no measured spot price exists for ``ticker``/``snap_date``,
+            returns an explicit unavailable result instead (``available``:
+            False, ``status``: "unavailable", ``reason``, plus the legacy
+            ``error`` key some older callers still check) with every
+            spot and modeled fields — regime, gamma_flip, gex_aggregate, walls,
+            profile, per_strike — set to ``None``. Never a guessed number.
         """
         if snap_date is None:
             snap_date = date.today()
@@ -145,29 +191,50 @@ class DealerGammaEngine:
         if chain.empty:
             return {"error": f"No options data for {ticker} on {snap_date}", "ticker": ticker}
 
-        spot = self._get_spot(ticker, snap_date)
-        if spot <= 0:
-            return {"error": f"No spot price for {ticker}", "ticker": ticker}
+        chain_completed_at = chain.attrs.get("capture_completed_at")
+        spot_receipt = self._get_spot_receipt(ticker, chain_completed_at)
+        if spot_receipt is None:
+            # Explicitly unavailable (store/availability contract); `error`
+            # stays because every consumer keys on it.
+            result = unavailable(
+                f"no verified prior close for {ticker} available at the "
+                f"{snap_date} options snapshot",
+                source="spy_close_receipt",
+                spot=None, regime=None, gamma_flip=None,
+                gamma_flip_crossings=None, gamma_wall=None, put_wall=None,
+                call_wall=None, gex_aggregate=None, gex_normalized=None,
+                dealer_delta=None, vanna_exposure=None, charm_exposure=None,
+                profile=None, per_strike=None,
+            )
+            result.update({"ticker": ticker, "error": f"No spot price for {ticker}"})
+            return result
+        spot = spot_receipt["price"]
 
         # Compute per-strike Greeks and GEX
         per_strike = self._compute_per_strike(chain, spot)
 
-        # Aggregate GEX at current spot
+        # Aggregate GEX at the prior verified close used as reference spot
         gex_agg = sum(s["net_gex"] for s in per_strike)
 
-        # Find gamma flip (spot where GEX crosses zero)
-        gamma_flip = self._find_gamma_flip(chain, spot, spot_range_pct, n_points)
+        # Find gamma flip: the crossing nearest spot, plus how many
+        # crossings the fine-grained scan found (ambiguity signal).
+        gamma_flip, gamma_flip_crossings = self._find_gamma_flip(chain, spot, spot_range_pct)
 
-        # Gamma/put/call walls
+        # Gamma/put/call walls. Under DEALER_CALL_SIGN/DEALER_PUT_SIGN,
+        # call_gex is >= 0 and put_gex is <= 0 at every strike (barring an
+        # empty leg, which nets to exactly 0) — so "largest call exposure"
+        # is the max call_gex, and "largest put exposure" is the min
+        # (most negative) put_gex. `.get("strike")` defaults to None (no
+        # qualifying strike), never a fabricated 0 or spot.
         gamma_wall = max(per_strike, key=lambda s: abs(s["net_gex"]), default={}).get("strike", spot)
-        put_wall = max(
-            [s for s in per_strike if s["put_gex"] > 0],
+        put_wall = min(
+            [s for s in per_strike if s["put_gex"] < 0],
             key=lambda s: s["put_gex"], default={},
-        ).get("strike", 0)
+        ).get("strike")
         call_wall = max(
-            [s for s in per_strike if s["call_gex"] < 0],
-            key=lambda s: abs(s["call_gex"]), default={},
-        ).get("strike", 0)
+            [s for s in per_strike if s["call_gex"] > 0],
+            key=lambda s: s["call_gex"], default={},
+        ).get("strike")
 
         # Dealer delta
         dealer_delta = sum(s.get("dealer_delta", 0) for s in per_strike)
@@ -191,10 +258,28 @@ class DealerGammaEngine:
         return {
             "ticker": ticker,
             "snap_date": str(snap_date),
+            "chain_snap_date": chain.attrs["snap_date"].isoformat(),
+            "chain_batch_id": chain.attrs["batch_id"],
+            "chain_capture_ordinal": chain.attrs["capture_ordinal"],
+            "chain_capture_started_at": chain.attrs["capture_started_at"].isoformat(),
+            "chain_capture_completed_at": chain_completed_at.isoformat(),
+            "chain_created_at": chain.attrs["created_at_min"].isoformat(),
+            "chain_created_at_max": chain.attrs["created_at_max"].isoformat(),
             "spot": round(spot, 2),
+            "spot_source": "spy_close_receipt",
+            "spot_basis": "prior_completed_unadjusted_close",
+            "spot_obs_date": spot_receipt["obs_date"].isoformat(),
+            "spot_available_at": spot_receipt["available_at"].isoformat(),
+            "spot_receipt_created_at": spot_receipt["receipt_created_at"].isoformat(),
+            "spot_release_date": spot_receipt["release_date"].isoformat(),
+            "spot_vintage_date": spot_receipt["vintage_date"].isoformat(),
+            "spot_receipt_id": spot_receipt["receipt_id"],
+            "estimated": True,
+            "basis": "options_open_interest_with_assumed_dealer_sign_and_black_scholes",
             "gex_aggregate": round(gex_agg, 0),
             "gex_normalized": round(gex_normalized, 4),
             "gamma_flip": round(gamma_flip, 2) if gamma_flip else None,
+            "gamma_flip_crossings": gamma_flip_crossings,
             "gamma_wall": round(gamma_wall, 2),
             "put_wall": round(put_wall, 2) if put_wall else None,
             "call_wall": round(call_wall, 2) if call_wall else None,
@@ -210,67 +295,108 @@ class DealerGammaEngine:
         }
 
     def _compute_per_strike(self, chain: pd.DataFrame, spot: float) -> list[dict]:
-        """Compute GEX, delta, vanna, charm per strike."""
-        results = []
-        grouped = chain.groupby("strike")
+        """Compute GEX, delta, vanna, charm per strike.
 
-        for strike, group in grouped:
-            T = group["dte"].iloc[0] / 365.0
+        Aggregates CONTRACT-level Greeks — each row (one strike/expiry/
+        opt_type) gets its OWN dte-derived T and its OWN IV — up to one
+        output row per strike. A strike is not one option: the same strike
+        commonly carries open interest across several expiries at once
+        (e.g. a 1-DTE weekly and a 60-DTE monthly at the same round
+        number), and gamma is extremely sensitive to T near-the-money.
+        Collapsing a strike's whole multi-expiry OI onto a single
+        arbitrary expiry's T (the pre-2026-09-24 bug here: `group by
+        strike`, then `T = group["dte"].iloc[0]` for ALL of that strike's
+        OI) badly misprices gamma and is what made put_wall/call_wall
+        collapse onto the same ATM strike regardless of true positioning.
+
+        This computation must agree with `_gex_at_spots_vectorized` (also
+        per-contract, used for the gamma flip search and the profile
+        curve) — see test_gex_aggregate_matches_vectorized_at_spot in
+        tests/test_dealer_gamma.py, which asserts
+        ``sum(net_gex for per_strike) == self._gex_at_spot(chain, spot)``
+        within float tolerance. Before this fix the two could disagree
+        (regime label and gamma flip effectively came from two different
+        calculations) whenever any strike spanned multiple expiries.
+        """
+        buckets: dict[float, dict[str, float]] = {}
+
+        valid = chain[chain["dte"] > 0]
+        for row in valid.itertuples(index=False):
+            T = float(row.dte) / 365.0
             if T <= 0:
                 continue
+            K = float(row.strike)
+            iv = float(row.implied_volatility)
+            if not (iv > 0):
+                iv = 0.25
+            oi = float(row.open_interest)
+            is_call = row.opt_type == "call"
 
-            call_rows = group[group["opt_type"] == "call"]
-            put_rows = group[group["opt_type"] == "put"]
+            # Dollar gamma for this contract × its own OI × 100 shares ×
+            # spot, signed by the dealer-positioning convention (module
+            # docstring): long calls (+), short puts (-).
+            gamma = bs_gamma(spot, K, T, self.r, iv) * oi * 100.0 * spot
+            sign = DEALER_CALL_SIGN if is_call else DEALER_PUT_SIGN
+            gex = sign * gamma
 
-            call_oi = float(call_rows["open_interest"].sum()) if not call_rows.empty else 0
-            put_oi = float(put_rows["open_interest"].sum()) if not put_rows.empty else 0
+            delta_fn = bs_delta_call if is_call else bs_delta_put
+            delta = sign * delta_fn(spot, K, T, self.r, iv) * oi * 100.0
 
-            call_iv = float(call_rows["implied_volatility"].mean()) if not call_rows.empty and call_rows["implied_volatility"].mean() > 0 else 0.25
-            put_iv = float(put_rows["implied_volatility"].mean()) if not put_rows.empty and put_rows["implied_volatility"].mean() > 0 else 0.25
+            vanna = sign * bs_vanna(spot, K, T, self.r, iv) * oi * 100.0
+            charm = sign * bs_charm(spot, K, T, self.r, iv, is_call=is_call) * oi * 100.0
 
-            K = float(strike)
+            b = buckets.get(K)
+            if b is None:
+                b = {
+                    "strike": K, "call_oi": 0.0, "put_oi": 0.0,
+                    "call_gex": 0.0, "put_gex": 0.0,
+                    "dealer_delta": 0.0, "vanna": 0.0, "charm": 0.0,
+                    "min_dte": float(row.dte),
+                }
+                buckets[K] = b
+            else:
+                b["min_dte"] = min(b["min_dte"], float(row.dte))
 
-            # Gamma per option × OI × 100 shares × spot (dollar gamma)
-            call_gamma = bs_gamma(spot, K, T, self.r, call_iv) * call_oi * 100 * spot
-            put_gamma = bs_gamma(spot, K, T, self.r, put_iv) * put_oi * 100 * spot
+            if is_call:
+                b["call_oi"] += oi
+                b["call_gex"] += gex
+            else:
+                b["put_oi"] += oi
+                b["put_gex"] += gex
+            b["dealer_delta"] += delta
+            b["vanna"] += vanna
+            b["charm"] += charm
 
-            # Dealer is SHORT options → dealer call GEX is negative, put GEX is positive
-            call_gex = -call_gamma  # dealer short calls = short gamma
-            put_gex = put_gamma     # dealer short puts = long gamma (put gamma is positive from dealer side)
-
-            # Dealer delta (short calls = negative delta, short puts = positive delta)
-            call_delta = -bs_delta_call(spot, K, T, self.r, call_iv) * call_oi * 100
-            put_delta = -bs_delta_put(spot, K, T, self.r, put_iv) * put_oi * 100
-
-            # Vanna and charm (aggregate across OI)
-            v = bs_vanna(spot, K, T, self.r, (call_iv + put_iv) / 2)
-            c = bs_charm(spot, K, T, self.r, (call_iv + put_iv) / 2)
-            total_oi = call_oi + put_oi
-            vanna_val = -v * total_oi * 100  # dealer is short → negate
-            charm_val = -c * total_oi * 100
-
-            results.append({
-                "strike": K,
-                "call_oi": call_oi,
-                "put_oi": put_oi,
-                "call_gex": call_gex,
-                "put_gex": put_gex,
-                "net_gex": call_gex + put_gex,
-                "dealer_delta": call_delta + put_delta,
-                "vanna": vanna_val,
-                "charm": charm_val,
-                "dte": float(group["dte"].iloc[0]),
-            })
-
+        results = [
+            {
+                "strike": b["strike"],
+                "call_oi": b["call_oi"],
+                "put_oi": b["put_oi"],
+                "call_gex": b["call_gex"],
+                "put_gex": b["put_gex"],
+                "net_gex": b["call_gex"] + b["put_gex"],
+                "dealer_delta": b["dealer_delta"],
+                "vanna": b["vanna"],
+                "charm": b["charm"],
+                # Nearest expiry at this strike — informational only (not
+                # used in any Greek above, each contract already used its
+                # own dte). A strike spanning multiple expiries has no
+                # single correct "dte"; the nearest one is the most
+                # actionable to display.
+                "dte": b["min_dte"],
+            }
+            for b in buckets.values()
+        ]
         results.sort(key=lambda x: x["strike"])
         return results
 
     def _prepare_chain_arrays(self, chain: pd.DataFrame) -> tuple:
         """Pre-extract numpy arrays from chain for vectorized GEX computation.
 
-        Returns (strikes, T_arr, iv_arr, oi_arr, sign_arr) where sign_arr
-        is -1 for calls (dealer short gamma) and +1 for puts (dealer long gamma).
-        Only rows with dte > 0 are included.
+        Returns (strikes, T_arr, iv_arr, oi_arr, sign_arr) where sign_arr is
+        DEALER_CALL_SIGN (+1, dealer long gamma) for calls and
+        DEALER_PUT_SIGN (-1, dealer short gamma) for puts — see the module
+        docstring. Only rows with dte > 0 are included.
         """
         valid = chain[chain["dte"] > 0].copy()
         if valid.empty:
@@ -282,7 +408,9 @@ class DealerGammaEngine:
         iv_arr = valid["implied_volatility"].to_numpy(dtype=np.float64)
         iv_arr = np.where(iv_arr > 0, iv_arr, 0.25)
         oi_arr = valid["open_interest"].to_numpy(dtype=np.float64)
-        sign_arr = np.where(valid["opt_type"].to_numpy() == "call", -1.0, 1.0)
+        sign_arr = np.where(
+            valid["opt_type"].to_numpy() == "call", DEALER_CALL_SIGN, DEALER_PUT_SIGN
+        )
         return strikes, T_arr, iv_arr, oi_arr, sign_arr
 
     def _gex_at_spots_vectorized(
@@ -321,26 +449,67 @@ class DealerGammaEngine:
         return gex
 
     def _find_gamma_flip(
-        self, chain: pd.DataFrame, spot: float,
-        range_pct: float, n_points: int,
-    ) -> float | None:
-        """Find the spot price where aggregate GEX crosses zero."""
+        self, chain: pd.DataFrame, spot: float, range_pct: float,
+    ) -> tuple[float | None, int]:
+        """Find the gamma flip: the zero-crossing of aggregate GEX(spot)
+        NEAREST to the actual current ``spot``, linearly interpolated
+        between the two grid points bracketing it.
+
+        Scans a fixed-resolution grid — ``FLIP_SEARCH_STEP_PCT`` (0.1%) of
+        ``spot`` per step — across ``[spot*(1-range_pct),
+        spot*(1+range_pct)]``, independent of the much coarser ``n_points``
+        used for the chart-oriented profile curve (``_compute_profile_curve``).
+        Real chains are lumpy (per-strike open interest, not a smooth
+        curve) and routinely cross zero more than once in that range.
+        Returning the FIRST crossing scanning from the low end of the
+        range — the previous behavior — can return a crossing far from
+        where dealer positioning actually flips relative to today's spot;
+        confirmed on the real 2026-09-24 SPY chain, where a coarse 50-point
+        grid found a crossing at $766.21 while the true curve, scanned
+        finely, whipsaws through several crossings between $762 and $765 —
+        much closer to that day's $765.88 spot.
+
+        Returns ``(flip_price, crossing_count)``:
+          - ``flip_price`` is ``None`` when the scan finds no sign change
+            anywhere in the range (aggregate GEX is one sign throughout).
+          - ``crossing_count`` is how many sign changes the scan found — 0
+            when there is none, 1 in the common single-crossing case, 2+
+            when the flip is ambiguous (more than one nearby crossing, so
+            a caller should not treat the single returned price as the
+            only regime boundary nearby).
+        """
         lo = spot * (1 - range_pct)
         hi = spot * (1 + range_pct)
+        step = spot * FLIP_SEARCH_STEP_PCT
+        n_points = max(round((hi - lo) / step) + 1, 2) if step > 0 else 2
         prices = np.linspace(lo, hi, n_points)
 
         arrays = self._prepare_chain_arrays(chain)
         gex_values = self._gex_at_spots_vectorized(*arrays, prices)
 
-        # Find first sign change
-        for i in range(1, len(gex_values)):
-            if gex_values[i - 1] * gex_values[i] < 0:
-                prev_gex = gex_values[i - 1]
-                curr_gex = gex_values[i]
-                ratio = abs(prev_gex) / (abs(prev_gex) + abs(curr_gex) + 1e-12)
-                return float(prices[i - 1] + ratio * (prices[i] - prices[i - 1]))
+        if not np.all(np.isfinite(gex_values)):
+            return None, 0
 
-        return None
+        crossings: list[float] = []
+        nonzero = np.flatnonzero(gex_values != 0)
+        for left, right in pairwise(nonzero):
+            prev_gex, curr_gex = gex_values[left], gex_values[right]
+            if np.signbit(prev_gex) == np.signbit(curr_gex):
+                continue
+            if right == left + 1:
+                ratio = abs(prev_gex) / (abs(prev_gex) + abs(curr_gex))
+                crossing = prices[left] + ratio * (prices[right] - prices[left])
+            else:
+                # An exact zero grid point (or a zero plateau) is a crossing
+                # only when its nonzero neighbors have opposite signs.
+                crossing = (prices[left + 1] + prices[right - 1]) / 2
+            crossings.append(float(crossing))
+
+        if not crossings:
+            return None, 0
+
+        nearest = min(crossings, key=lambda p: abs(p - spot))
+        return nearest, len(crossings)
 
     def _gex_at_spot(self, chain: pd.DataFrame, spot: float) -> float:
         """Compute aggregate GEX at a hypothetical spot price."""
@@ -367,60 +536,112 @@ class DealerGammaEngine:
         ]
 
     def _load_chain(self, ticker: str, snap_date: date) -> pd.DataFrame:
-        """Load options chain from database."""
+        """Load only the requested day's chain; reject mixed or late captures.
+
+        Only one fully completed capture is eligible. A legacy or partially
+        published chain without ordinal, start, batch, and completion provenance fails
+        closed, as do rows mixed with an older writer.
+        """
         with self.engine.connect() as conn:
             rows = conn.execute(text("""
                 SELECT strike, opt_type, open_interest, implied_vol AS implied_volatility,
-                       expiry, (expiry - :snap_date) AS dte
+                       expiry, (expiry - :snap_date) AS dte, created_at,
+                       capture_batch_id, capture_ordinal,
+                       capture_started_at, capture_completed_at
                 FROM options_snapshots
                 WHERE ticker = :ticker AND snap_date = :snap_date
-                AND open_interest > 0 AND implied_vol > 0
-                AND expiry > :snap_date
-                ORDER BY expiry, strike
+                ORDER BY expiry, strike, opt_type
             """), {"ticker": ticker, "snap_date": snap_date}).fetchall()
 
         if not rows:
-            # Try most recent snap_date
-            with self.engine.connect() as conn:
-                latest = conn.execute(text(
-                    "SELECT MAX(snap_date) FROM options_snapshots WHERE ticker = :t"
-                ), {"t": ticker}).fetchone()
-                if latest and latest[0]:
-                    return self._load_chain(ticker, latest[0])
+            return pd.DataFrame()
+
+        created = [row[6] for row in rows]
+        batches = {row[7] for row in rows}
+        ordinals = {row[8] for row in rows}
+        starts = {row[9] for row in rows}
+        completions = {row[10] for row in rows}
+        now = datetime.now(timezone.utc)
+        if (any(not isinstance(ts, datetime) or ts.tzinfo is None for ts in created)
+                or len(batches) != 1 or not next(iter(batches))
+                or len(ordinals) != 1
+                or len(starts) != 1
+                or len(completions) != 1):
+            return pd.DataFrame()
+        batch_id = next(iter(batches))
+        ordinal = next(iter(ordinals))
+        started_at = next(iter(starts))
+        completed_at = next(iter(completions))
+        try:
+            UUID(batch_id)
+        except (TypeError, ValueError, AttributeError):
+            return pd.DataFrame()
+        if not isinstance(ordinal, int) or isinstance(ordinal, bool) or ordinal <= 0:
+            return pd.DataFrame()
+        if (not isinstance(started_at, datetime) or started_at.tzinfo is None
+                or not isinstance(completed_at, datetime) or completed_at.tzinfo is None):
+            return pd.DataFrame()
+        first, last = min(created), max(created)
+        if (first.astimezone(timezone.utc).date() != snap_date
+                or last.astimezone(timezone.utc).date() != snap_date
+                or started_at.astimezone(timezone.utc).date() != snap_date
+                or completed_at.astimezone(timezone.utc).date() != snap_date
+                or started_at > completed_at or completed_at > now):
             return pd.DataFrame()
 
         df = pd.DataFrame(rows, columns=["strike", "opt_type", "open_interest",
-                                          "implied_volatility", "expiry", "dte"])
+                                          "implied_volatility", "expiry", "dte",
+                                          "created_at", "capture_batch_id", "capture_ordinal",
+                                          "capture_started_at", "capture_completed_at"])
         df["dte"] = df["dte"].apply(lambda x: x.days if hasattr(x, 'days') else int(x))
-        return df[df["dte"] > 0]
+        df = df[(df["dte"] > 0)
+                & (df["open_interest"] > 0)
+                & (df["implied_volatility"] > 0)].copy()
+        df.attrs.update(snap_date=snap_date, batch_id=batch_id,
+                        capture_ordinal=ordinal,
+                        capture_started_at=started_at,
+                        capture_completed_at=completed_at,
+                        created_at_min=first, created_at_max=last)
+        return df
 
-    def _get_spot(self, ticker: str, snap_date: date) -> float:
-        """Get spot price from resolved_series or options ATM."""
+    def _get_spot_receipt(self, ticker: str, chain_completed_at: datetime | None) -> dict | None:
+        """Use only a verified SPY close known before pull completion.
+
+        The shared receipt verifier checks raw/resolved identity, the unadjusted
+        price basis, the post-observation-day marker, and a four-calendar-day
+        maximum age. Other tickers have no equivalent receipt contract yet.
+        """
+        if ticker != "SPY" or chain_completed_at is None:
+            return None
+        from store.astrogrid import AstroGridStore
+
         with self.engine.connect() as conn:
-            # Try resolved_series (yfinance close)
-            row = conn.execute(text("""
-                SELECT rs.value FROM resolved_series rs
-                JOIN feature_registry fr ON rs.feature_id = fr.id
-                WHERE (fr.name = :name1 OR fr.name = :name2)
-                AND rs.obs_date <= :d
-                ORDER BY rs.obs_date DESC LIMIT 1
-            """), {
-                "name1": f"{ticker.lower()}_close",
-                "name2": ticker.lower(),
-                "d": snap_date,
-            }).fetchone()
-
-            if row:
-                return float(row[0])
-
-            # Fallback: use ATM strike from options chain
-            row = conn.execute(text("""
-                SELECT strike FROM options_snapshots
-                WHERE ticker = :t AND snap_date = :d AND opt_type = 'call'
-                ORDER BY open_interest DESC LIMIT 1
-            """), {"t": ticker, "d": snap_date}).fetchone()
-
-            return float(row[0]) if row else 0.0
+            receipt = AstroGridStore(self.engine)._verified_spy_receipt(
+                conn, cutoff=chain_completed_at, mode="entry")
+        if receipt is None:
+            return None
+        created = receipt.get("receipt_created_at")
+        available = receipt.get("available_at")
+        observed = receipt.get("obs_date")
+        price = receipt.get("price")
+        chain_day = chain_completed_at.astimezone(timezone.utc).date()
+        if (not isinstance(created, datetime) or created.tzinfo is None
+                or not isinstance(available, datetime) or available.tzinfo is None
+                or not isinstance(observed, date)
+                or not 1 <= (chain_day - observed).days <= 4
+                or available < datetime.combine(
+                    observed + timedelta(days=1), datetime.min.time(), timezone.utc)
+                or available > chain_completed_at
+                or not available <= created <= chain_completed_at
+                or not isinstance(price, (int, float)) or not math.isfinite(price)
+                or price <= 0
+                or receipt.get("conflict_flag") is not False
+                or not isinstance(receipt.get("release_date"), date)
+                or not isinstance(receipt.get("vintage_date"), date)
+                or receipt["release_date"] > chain_day
+                or receipt["vintage_date"] > chain_day):
+            return None
+        return receipt
 
     # ── Convenience methods ──────────────────────────────────────────
 
@@ -477,7 +698,7 @@ class DealerGammaEngine:
             "spy_gamma_flip": spy["gamma_flip"] if spy else None,
             "spy_put_wall": spy["put_wall"] if spy else None,
             "spy_call_wall": spy["call_wall"] if spy else None,
-            "spy_gex": spy["gex_aggregate"] if spy else 0,
+            "spy_gex": spy["gex_aggregate"] if spy else None,
             "tickers": [
                 {
                     "ticker": r["ticker"],

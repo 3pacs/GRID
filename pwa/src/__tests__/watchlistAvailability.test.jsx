@@ -20,9 +20,9 @@ vi.mock('../hooks/useDevice.js', () => ({ useDevice: () => ({ isMobile: false })
 vi.mock('../components/PriceChart.jsx', () => ({ default: () => <div data-testid="price-chart" /> }));
 vi.mock('../views/Options.jsx', () => ({ TickerRecommendations: () => null }));
 
-const measured = { date: '2026-09-23', net_gex: 0, regime: 'neutral', spot: 100 };
+const modeled = { date: '2026-09-23', net_gex: 0, regime: 'neutral', spot: 100 };
 const timeline = (extra = {}) => ({
-    ticker: 'AAPL', days: 90, history: [measured], opex_calendar: [],
+    ticker: 'AAPL', days: 90, history: [modeled], opex_calendar: [],
     catalysts: [], gamma_flip_crossings: [], ...extra,
 });
 
@@ -35,17 +35,17 @@ beforeAll(() => {
 });
 
 describe('Watchlist flow availability', () => {
-    it('shows partial dates without losing a measured zero', () => {
+    it('shows partial dates without losing a modeled zero', () => {
         render(<FlowTimeline ticker="AAPL" timelineData={timeline({ history_status: 'partial', failed_dates: 1 })} />);
-        expect(screen.getByText('Some GEX dates are unavailable; only measured dates are shown.')).toBeInTheDocument();
+        expect(screen.getByText('Some dates lack a usable chain or verified reference spot; only dated modeled GEX estimates are shown.')).toBeInTheDocument();
         expect(screen.getByText('$0')).toBeInTheDocument();
     });
 
     it('distinguishes failed dated calculations from an unavailable stored-history query', () => {
         const { rerender } = render(<FlowTimeline ticker="AAPL" timelineData={timeline({ history_status: 'fallback', failed_dates: 2 })} />);
-        expect(screen.getByText('Showing one latest GEX snapshot; 2 dated GEX calculations failed.')).toBeInTheDocument();
+        expect(screen.getByText('Showing one latest modeled GEX estimate; 2 dated GEX calculations failed.')).toBeInTheDocument();
         rerender(<FlowTimeline ticker="AAPL" timelineData={timeline({ history_status: 'fallback', failed_dates: 0 })} />);
-        expect(screen.getByText('Showing one latest GEX snapshot, not a measured daily timeline.')).toBeInTheDocument();
+        expect(screen.getByText('Showing one latest modeled GEX estimate, not a complete daily timeline.')).toBeInTheDocument();
     });
 
     it('renders unavailable history as an error instead of a zero-GEX chart', () => {

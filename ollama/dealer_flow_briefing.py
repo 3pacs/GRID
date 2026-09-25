@@ -1,24 +1,82 @@
 """
 DerivativesGrid Dealer Flow Narrative Synthesis.
 
-Generates briefings in the style of Cem Karsan / SqueezeMetrics / SpotGamma —
-explaining market mechanics through the lens of dealer positioning, gamma exposure,
-vanna/charm flows, and options structure.
+Generates model-based dealer-flow briefings from GRID options snapshots.
+The sign convention is assumed; open interest does not measure dealer books.
 
-Core thesis: dealers hedging their book ARE the market's mechanical force.
-Price is downstream of positioning.
+Outputs describe conditional hedging under an assumed position model.
 """
 
 from __future__ import annotations
 
 import calendar
 import json
-from datetime import date, datetime, timezone
+import math
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from uuid import UUID
 
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+from store.availability import unavailable
+
+SPOT_CONTRACT = "spy_receipt_chain_batch_pit_v5"
+
+
+def valid_spy_gex_profile(profile: Any, briefing_date: date) -> bool:
+    """Validate the dated source pair before saving or serving a narrative."""
+    if not isinstance(profile, dict):
+        return False
+    spot = profile.get("spot")
+    if (profile.get("spot_source") != "spy_close_receipt"
+            or profile.get("spot_basis") != "prior_completed_unadjusted_close"
+            or not isinstance(spot, (int, float)) or isinstance(spot, bool)
+            or not math.isfinite(spot) or spot <= 0
+            or profile.get("estimated") is not True
+            or profile.get("basis") != "options_open_interest_with_assumed_dealer_sign_and_black_scholes"
+            or not isinstance(profile.get("spot_receipt_id"), int)
+            or profile["spot_receipt_id"] <= 0
+            or not isinstance(profile.get("chain_capture_ordinal"), int)
+            or isinstance(profile["chain_capture_ordinal"], bool)
+            or profile["chain_capture_ordinal"] <= 0):
+        return False
+    try:
+        chain_date = date.fromisoformat(profile["chain_snap_date"])
+        spot_date = date.fromisoformat(profile["spot_obs_date"])
+        available_at = datetime.fromisoformat(profile["spot_available_at"])
+        receipt_created_at = datetime.fromisoformat(profile["spot_receipt_created_at"])
+        release_date = date.fromisoformat(profile["spot_release_date"])
+        vintage_date = date.fromisoformat(profile["spot_vintage_date"])
+        chain_first = datetime.fromisoformat(profile["chain_created_at"])
+        chain_last = datetime.fromisoformat(profile["chain_created_at_max"])
+        chain_started = datetime.fromisoformat(profile["chain_capture_started_at"])
+        chain_completed = datetime.fromisoformat(profile["chain_capture_completed_at"])
+        UUID(profile["chain_batch_id"])
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return False
+    if any(ts.tzinfo is None for ts in (
+        available_at, receipt_created_at, chain_first, chain_last,
+        chain_started, chain_completed,
+    )):
+        return False
+    return (
+        chain_date == briefing_date == date.today()
+        and profile.get("snap_date") == chain_date.isoformat()
+        and 1 <= (chain_date - spot_date).days <= 4
+        and available_at >= datetime.combine(
+            spot_date + timedelta(days=1), datetime.min.time(), timezone.utc
+        )
+        and release_date <= chain_date and vintage_date <= chain_date
+        and available_at <= receipt_created_at <= chain_completed
+        and chain_started <= chain_completed <= datetime.now(timezone.utc)
+        and chain_first <= chain_last <= datetime.now(timezone.utc)
+        and chain_started.astimezone(timezone.utc).date() == chain_date
+        and chain_first.astimezone(timezone.utc).date() == chain_date
+        and chain_last.astimezone(timezone.utc).date() == chain_date
+        and chain_completed.astimezone(timezone.utc).date() == chain_date
+    )
 
 # ── DB table DDL ──────────────────────────────────────────────────────
 
@@ -217,26 +275,21 @@ def _fmt_ticker_block(ticker: str, gex_data: dict[str, Any]) -> str:
     charm = gex_data.get("charm_exposure", 0)
     regime = gex_data.get("regime", "UNKNOWN")
 
-    # Determine position relative to gamma flip
-    if flip and spot != "?":
-        territory = "LONG GAMMA (above flip)" if spot > flip else "SHORT GAMMA (below flip)"
-    else:
-        territory = regime.replace("_", " ")
+    # The nearest zero crossing has no universal sign direction. The engine
+    # classifies the regime from modeled GEX at the verified reference spot.
+    territory = regime.replace("_", " ") if isinstance(regime, str) else "UNKNOWN"
 
     lines = [
         f"### {ticker}",
-        f"- GEX Aggregate: {_fmt_dollar(gex)} "
-        f"({'positive = dealers long gamma = mean-reverting' if gex >= 0 else 'negative = dealers short gamma = trending/amplifying'})",
-        f"- Gamma Flip: {flip if flip else 'N/A'} "
-        f"(above this = long gamma territory, below = short gamma)",
-        f"- Current Price: {spot} --> Currently in {territory}",
-        f"- Put Wall: {put_wall if put_wall else 'N/A'} (max put gamma = support magnet)",
-        f"- Call Wall: {call_wall if call_wall else 'N/A'} (max call gamma = resistance magnet)",
-        f"- Vanna Exposure: {_fmt_dollar(vanna)} "
-        f"(if VIX moves 1pt, dealers must hedge this much delta)",
-        f"- Charm Exposure: {_fmt_dollar(charm)} "
-        f"(each day that passes, dealers must adjust this much delta)",
-        f"- Net Dealer Delta: {_fmt_dollar(delta)}",
+        f"- Modeled GEX Aggregate: {_fmt_dollar(gex)} (assumed dealer sign)",
+        f"- Modeled Gamma Flip: {flip if flip else 'N/A'}",
+        f"- Flip crossings in search range: {gex_data.get('gamma_flip_crossings', 'N/A')}",
+        f"- Prior verified close ({gex_data.get('spot_obs_date')}): {spot} --> Modeled {territory}",
+        f"- Modeled Put Wall: {put_wall if put_wall else 'N/A'}",
+        f"- Modeled Call Wall: {call_wall if call_wall else 'N/A'}",
+        f"- Modeled Vanna Exposure: {_fmt_dollar(vanna)}",
+        f"- Modeled Charm Exposure: {_fmt_dollar(charm)}",
+        f"- Modeled Net Dealer-Side Delta: {_fmt_dollar(delta)}",
         "",
     ]
     return "\n".join(lines)
@@ -279,35 +332,33 @@ def _build_prompt(data: dict[str, Any]) -> tuple[str, str]:
         (system_prompt, user_prompt)
     """
     system_prompt = (
-        "You are a derivatives market analyst specializing in dealer positioning "
-        "and options market microstructure. You explain market mechanics through "
-        "the lens of gamma exposure, vanna flows, charm decay, and dealer hedging "
-        "-- in the tradition of Cem Karsan, Brent Kochuba (SpotGamma), and "
-        "SqueezeMetrics.\n\n"
+        "You are a derivatives market analyst explaining an estimated options "
+        "exposure model. Dealer signs are assumed from open interest, not observed "
+        "positions. The input spot is a prior verified close, not a live quote. "
+        "Do not claim provider-sourced dealer positioning, current dealer books, "
+        "forced trades, or certain support and resistance.\n\n"
 
         "Your job is NOT to predict direction. Your job is to explain the "
-        "MECHANICAL FORCES acting on the market right now and what they imply "
-        "for volatility, mean-reversion vs trend, and key levels.\n\n"
+        "model's conditional implications, uncertainty and key levels.\n\n"
 
         "KEY PRINCIPLES:\n"
-        "- Dealers are net short options (market-making). They delta-hedge.\n"
-        "- When dealers are LONG gamma (positive GEX), they buy dips and sell "
-        "rallies = mean-reversion, low realized vol, pinning to strikes.\n"
-        "- When dealers are SHORT gamma (negative GEX), they sell into drops "
-        "and buy into rallies = trend amplification, high realized vol, gap risk.\n"
-        "- Vanna: as IV rises, dealer delta shifts. If dealers are short calls, "
-        "rising IV makes them shorter delta = forced selling = accelerant.\n"
+        "- The model assumes a dealer sign for options open interest.\n"
+        "- Under the assumed positions, long gamma can imply dampening hedges; "
+        "short gamma can imply amplifying hedges. This is conditional.\n"
+        "- Vanna describes model sensitivity of delta to implied volatility; "
+        "it is not a measured hedge order.\n"
         "- Charm: as time passes, option delta decays. Near OpEx, gamma concentrates. "
         "Post-OpEx, gamma unwinds and vol can expand.\n"
-        "- The gamma flip level is the REGIME BOUNDARY. Above it = stability. "
-        "Below it = instability.\n"
-        "- Put wall = gravitational support. Call wall = gravitational resistance.\n"
-        "- OpEx is a gamma event: open interest rolls off, releasing the pin.\n\n"
+        "- A computed gamma flip is a model zero crossing, not a verified regime boundary; "
+        "either side can have either GEX sign, and there may be multiple crossings.\n"
+        "- Put and call walls are modeled exposure concentrations.\n"
+        "- Expiry changes modeled exposure; direction and size of actual flows "
+        "are unknown.\n\n"
 
         "STYLE:\n"
         "- Be technical but accessible. Use specific dollar amounts.\n"
         "- No vague hand-waving. Every claim must reference a number.\n"
-        "- Think mechanistically: what are dealers FORCED to do given their book?\n"
+        "- Describe conditional hedging under the assumed position model.\n"
         "- Keep the briefing under 800 words."
     )
 
@@ -319,7 +370,7 @@ def _build_prompt(data: dict[str, Any]) -> tuple[str, str]:
     signals = data.get("top_signals", [])
 
     context_lines: list[str] = [
-        "## Current Dealer Positioning Data",
+        "## Estimated Dealer Exposure From Dated Inputs",
         "",
     ]
 
@@ -365,37 +416,30 @@ def _build_prompt(data: dict[str, Any]) -> tuple[str, str]:
         "## Generate a Dealer Flow Briefing with these sections:\n\n"
 
         "### Regime Assessment\n"
-        "One paragraph: Are dealers net long or short gamma across the market? "
+        "One paragraph: Does the assumed model estimate long or short gamma? "
         "What does this mean mechanically? Use specific numbers. Explain whether "
-        "the market is in a mean-reverting (pinned) or trending (volatile) regime "
-        "and what the GEX numbers tell you about realized vol expectations.\n\n"
+        "the model conditionally implies damping or amplification. Do not "
+        "infer observed realized volatility from GEX alone.\n\n"
 
         "### Key Levels\n"
         "Gamma flip, put wall, call wall for SPY (and QQQ if different story). "
-        "Explain what happens at each level in mechanical terms. Example: "
-        "'If SPY drops below {gamma_flip}, dealers switch from dampening to "
-        "amplifying moves. The put wall at {put_wall} becomes the gravitational "
-        "target where dealer hedging creates a floor.'\n\n"
+        "Explain these as conditional model levels; do not present a floor as certain.\n\n"
 
         "### Vanna & Charm Dynamics\n"
         "Explain the vol-sensitivity and time-sensitivity of current positioning. "
-        "Quantify: 'Vanna exposure of $X means a VIX spike from Y to Z would "
-        "force dealers to sell/buy $W of delta -- mechanically pushing prices "
-        "lower/higher.' Include charm: 'Over the next 3 days, charm decay will "
-        "reduce/increase short gamma by $X -- the regime is slowly healing/"
-        "deteriorating.'\n\n"
+        "Quote the model outputs, but do not translate them into forced dollar "
+        "trades or forecasted price moves without a calibrated conversion.\n\n"
 
         "### OpEx Dynamics\n"
-        "Days to OpEx, gamma pin potential, expected vol expansion/compression. "
-        "'With N days to monthly OpEx, $XB of gamma will expire -- releasing the "
-        "pinning effect.' Explain what the OpEx gamma unwind means for the "
-        "following week.\n\n"
+        "Days to OpEx and conditional changes to modeled exposure as contracts "
+        "expire. Do not assert an amount of actual dealer gamma will unwind "
+        "or forecast realized volatility without evidence.\n\n"
 
         "### Flow Outlook\n"
         "Synthesis: given all the above, what are the mechanical forces saying? "
-        "Mean-reversion or trend? Where are the support/resistance magnets? "
-        "What would change the picture? (VIX spike, spot crossing gamma flip, "
-        "new large OI buildup, etc.) Be specific about scenarios and levels."
+        "Which conditional model scenario matters? What observations would "
+        "change the picture? Recompute GEX at a new verified spot and chain; "
+        "crossing a flip price alone does not establish a regime direction."
     )
 
     return system_prompt, user_prompt
@@ -412,10 +456,22 @@ def generate_dealer_flow_briefing(engine: Engine) -> dict[str, Any]:
     Returns:
         dict with keys: content, positioning_data, briefing_date, created_at.
     """
-    _ensure_table(engine)
-
     # Gather data
     positioning = _gather_positioning_data(engine)
+
+    spy = positioning.get("gex", {}).get("SPY", {})
+    if not valid_spy_gex_profile(spy, date.today()):
+        return unavailable(
+            "SPY GEX profile lacks a dated verified close and chain pair",
+            source="spy_close_receipt",
+            content=None,
+            positioning_data=None,
+            briefing_date=None,
+            created_at=None,
+        )
+    positioning["spot_contract"] = SPOT_CONTRACT
+
+    _ensure_table(engine)
 
     # Build prompt
     system_prompt, user_prompt = _build_prompt(positioning)
@@ -483,8 +539,6 @@ def get_latest_flow_briefing(engine: Engine) -> dict[str, Any]:
         dict with keys: content, positioning_data, briefing_date,
                         created_at, stale.
     """
-    _ensure_table(engine)
-
     try:
         with engine.connect() as conn:
             row = conn.execute(
@@ -508,10 +562,27 @@ def get_latest_flow_briefing(engine: Engine) -> dict[str, Any]:
 
         briefing_date = row[0]
         is_stale = briefing_date < date.today()
+        positioning = row[2]
+        saved_spy = (
+            positioning.get("gex", {}).get("SPY")
+            if isinstance(positioning, dict) and isinstance(positioning.get("gex"), dict)
+            else None
+        )
+        if (briefing_date != date.today()
+                or not isinstance(positioning, dict)
+                or positioning.get("spot_contract") != SPOT_CONTRACT
+                or not valid_spy_gex_profile(saved_spy, briefing_date)):
+            return {
+                "content": None, "positioning_data": None,
+                "briefing_date": str(briefing_date),
+                "created_at": str(row[3]) if row[3] else None,
+                "stale": True,
+                "note": "Saved dealer flow briefing lacks the current dated-source contract.",
+            }
 
         result: dict[str, Any] = {
             "content": row[1],
-            "positioning_data": row[2],
+            "positioning_data": positioning,
             "briefing_date": str(briefing_date),
             "created_at": str(row[3]) if row[3] else None,
             "stale": is_stale,
@@ -563,7 +634,7 @@ def _generate_fallback(positioning: dict[str, Any]) -> str:
         gex_data = positioning.get("gex", {}).get(ticker)
         if gex_data:
             lines.append(f"## {ticker}")
-            lines.append(f"- Spot: {gex_data.get('spot')}")
+            lines.append(f"- Prior verified close ({gex_data.get('spot_obs_date')}): {gex_data.get('spot')}")
             lines.append(f"- GEX: {_fmt_dollar(gex_data.get('gex_aggregate'))}")
             lines.append(f"- Regime: **{gex_data.get('regime')}**")
             lines.append(f"- Gamma Flip: {gex_data.get('gamma_flip')}")

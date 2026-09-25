@@ -2603,7 +2603,8 @@ class AstroGridStore:
         sql = text(f"""
             SELECT pc.id, raw.id, rs.id, fr.name, pc.obs_date, pc.value,
                    pc.available_at, raw.raw_payload, raw.pull_timestamp,
-                   sc.name, pc.price_basis
+                   sc.name, pc.price_basis, pc.created_at,
+                   rs.release_date, rs.vintage_date, rs.conflict_flag
             FROM astrogrid.price_close_receipt pc
             JOIN raw_series raw ON raw.id = pc.raw_series_id
             JOIN resolved_series rs ON rs.id = pc.resolved_series_id
@@ -2665,6 +2666,8 @@ class AstroGridStore:
             "receipt_id": int(row[0]), "raw_series_id": int(row[1]),
             "resolved_series_id": int(row[2]), "obs_date": obs_date,
             "price": price, "available_at": row[6],
+            "receipt_created_at": row[11], "release_date": row[12],
+            "vintage_date": row[13], "conflict_flag": row[14],
         }
 
     def _build_prediction_score(
