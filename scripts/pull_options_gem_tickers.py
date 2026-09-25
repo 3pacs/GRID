@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Compatibility entrypoint for the nine-ticker GEM options timer.
 
-The retired installed script wrote options_snapshots directly, with no capture
-batch metadata. All chain publication now belongs to ingestion.options.
+The separately installed legacy script writes options_snapshots directly,
+without capture metadata. Retire or repoint that timer before activating this
+entrypoint; all chain publication here belongs to ingestion.options.
 """
 
 from __future__ import annotations
