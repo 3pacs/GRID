@@ -397,23 +397,9 @@ def run_pipeline(historical: bool = False) -> dict:
     summary["steps"]["digest"] = _safe_run("Daily Digest Email", _digest)
 
     # -----------------------------------------------------------------------
-    # STEP 12: File rotation / cleanup (insights, briefings, error archives)
-    # -----------------------------------------------------------------------
-    def _cleanup():
-        cleaned = {}
-        try:
-            from outputs.llm_logger import cleanup_old_insights
-            cleaned["insights"] = cleanup_old_insights(max_age_days=90)
-        except Exception as exc:
-            log.debug("Insight cleanup skipped: {e}", e=str(exc))
-        try:
-            from ollama.market_briefing import MarketBriefingGenerator
-            cleaned["briefings"] = MarketBriefingGenerator.cleanup_old_briefings(max_age_days=90)
-        except Exception as exc:
-            log.debug("Briefing cleanup skipped: {e}", e=str(exc))
-        return cleaned
-    summary["steps"]["cleanup"] = _safe_run("File Rotation Cleanup", _cleanup)
-
+    # STEP 12: Retention is held in hermes_operator until its deletion policy
+    # is accepted. RUN_PIPELINE can invoke this runner, so neither insight nor
+    # briefing cleanup may run here around that allow-list gate.
     # -----------------------------------------------------------------------
     # Summary
     # -----------------------------------------------------------------------

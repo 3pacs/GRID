@@ -27,7 +27,6 @@ three-day-old code.
 from __future__ import annotations
 
 import os
-import subprocess
 
 import pytest
 
@@ -56,6 +55,27 @@ def _step_named(steps: list[dict], needle: str) -> dict | None:
         if needle.lower() in (step.get("name") or "").lower():
             return step
     return None
+
+
+def _effective_run(step: dict) -> str:
+    """The step's own `run:` text, plus scripts/deploy_verify_release_tree.sh's
+    content when the step delegates to it.
+
+    2026-09-22: the cwd-vs-deploy-path check this file guards moved out of
+    each verify step's inline `run:` block and into one shared script (also
+    fixing a real bug -- the old inline check compared the literal
+    $DEPLOY_PATH string, which can never match once it's a symlink). The
+    logic these guards care about still runs, just not inline any more, so
+    the guards read the delegated script's content too rather than being
+    fooled by the refactor into passing on a step that no longer checks
+    anything.
+    """
+    run = step.get("run", "")
+    if "deploy_verify_release_tree.sh" in run:
+        script_path = os.path.join(REPO_ROOT, "scripts", "deploy_verify_release_tree.sh")
+        with open(script_path, encoding="utf-8") as handle:
+            run += "\n" + handle.read()
+    return run
 
 
 @pytest.mark.unit
@@ -117,7 +137,7 @@ def test_hermes_verification_reads_the_running_cwd_not_just_liveness():
     step = _step_named(_deploy_steps(), "verify grid-hermes")
     assert step is not None, "deploy.yml does not verify grid-hermes after restarting it"
 
-    run = step.get("run", "")
+    run = _effective_run(step)
     assert "/proc/" in run and "cwd" in run, (
         "the verify step does not read the running process's cwd. Checking only "
         "`systemctl is-active` reproduces the bug: it reported active for three "
@@ -159,20 +179,28 @@ def test_hermes_steps_are_gated_like_the_api_restart():
 
 @pytest.mark.unit
 def test_guard_fails_against_the_pre_fix_workflow():
-    """Red/green, against the real previous file rather than a hand-made one.
+    """Red/green, against a stable fixture rather than git history.
 
-    Reads deploy.yml as of the commit before this change and asserts the two
-    load-bearing guards would have failed on it. Skips where git history is not
-    available (shallow clones without the parent, exported trees).
+    Originally read deploy.yml via `git show HEAD~1:...` -- fragile, because
+    HEAD~1 is only "the commit before this change" for the very first commit
+    built on top of the true pre-fix baseline. Any later, ordinary commit on
+    this branch (a fixup, a rebase, a second PR stacked on this one, or --
+    concretely, what actually broke this -- 2026-09-22's cwd-check refactor,
+    which left grid-hermes's own check correct but landed as a new commit on
+    top of one where it already was) shifts HEAD~1 to point at an
+    already-fixed state instead, silently breaking this test's red/green
+    premise without changing anything this test is actually supposed to be
+    guarding. tests/fixtures/deploy_pre_grid_hermes_fix.yml is a small,
+    permanent, hand-written snippet with the same shape as deploy.yml before
+    grid-hermes had any restart/verify step at all -- not a copy of history,
+    just "the known-bad shape the guards below must catch". It never needs to
+    change again regardless of how this branch's commit history evolves --
+    the same fix already applied to the equivalent grid-realtime guard in
+    tests/test_deploy_restarts_realtime.py, for exactly this reason.
     """
-    prev = subprocess.run(
-        ["git", "show", "HEAD~1:.github/workflows/deploy.yml"],
-        cwd=REPO_ROOT, capture_output=True, text=True,
-    )
-    if prev.returncode != 0:
-        pytest.skip("previous revision of deploy.yml not available in this checkout")
-
-    old_steps = yaml.safe_load(prev.stdout)["jobs"]["deploy"]["steps"]
+    fixture_path = os.path.join(REPO_ROOT, "tests", "fixtures", "deploy_pre_grid_hermes_fix.yml")
+    with open(fixture_path, encoding="utf-8") as handle:
+        old_steps = yaml.safe_load(handle)["jobs"]["deploy"]["steps"]
 
     # Run the real predicates this file enforces, against the real old content.
     # Asserting merely that the step names are absent would be a weaker claim

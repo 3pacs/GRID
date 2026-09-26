@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Score Oracle Trades — Backfill entry prices, fix directions, score expired predictions.
+Score Oracle Trades — fix directions, score expired predictions.
 
 Steps:
 1. Fetch historical prices via yfinance for all prediction tickers
-2. Backfill entry_price where it's 0
+2. Count (never backfill) missing/invalid entry_price -- HISTORICAL-WRITE
+   HOLD: a non-null 0/negative entry_price is a legacy row and is left
+   exactly as it is; a NULL entry_price is a new-policy row and is never
+   fabricated with a price discovered after the fact.
 3. Map BULLISH→CALL, NEUTRAL→no_data verdict
 4. Score expired predictions (expiry <= today)  ← CHUNKED since 2026-05-13
 5. Print scorecard
@@ -17,10 +20,10 @@ window where ~2.27M predictions expire at once).
 """
 
 import argparse
+import importlib.util
 import json
 import sys
 from typing import Any
-sys.path.insert(0, "/data/grid_v4/grid_repo")
 
 from datetime import date, timedelta
 
@@ -29,7 +32,51 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
+# Every first-party (repo-root) import this module needs -- directly or,
+# like intelligence.postmortem below, lazily inside a function -- must be
+# resolvable BEFORE the sys.path insertion further down ever has a chance
+# to run. See that insertion's own comment for why, and
+# tests/test_score_oracle_trades_stale_repo_shadow.py for the regression
+# proof (it also covers db and intelligence.postmortem, which this module
+# does not import itself but which must be equally unaffected by anything
+# this import does to sys.path).
 from config import settings
+from oracle.entry_price_policy import (
+    NULL_WRITE_POLICY,
+    SCORE_NOTE_ENTRY_NULL,
+    entry_price_score_note,
+)
+
+# Compute-node fallback for a genuinely standalone
+# `python scripts/score_oracle_trades.py` invocation whose CWD/PYTHONPATH
+# does not already make this repo importable. Two guards, both required:
+#
+# * `__name__ == "__main__"` -- this must NEVER run when the module is
+#   merely imported (Hermes's oracle step does not import this module, but
+#   anything that ever does -- directly or transitively -- must not have
+#   sys.path mutated as a side effect). The imports above already
+#   succeeded by this point however this module ended up loaded, so this
+#   line can only ever add a path, never fix a failure that already
+#   happened.
+# * `importlib.util.find_spec("config") is None` -- even under direct
+#   execution, only insert the fallback if this repo is not ALREADY
+#   importable (e.g. via PYTHONPATH or CWD). Preferring whatever already
+#   resolves correctly over a hardcoded, potentially stale path is strictly
+#   safer, and `find_spec` never imports/executes `config` -- it only
+#   locates it.
+#
+# /data/grid_v4/grid_repo is a STALE checkout confirmed on grid-svr
+# (revision 5facbdf0, no oracle/entry_price_policy.py) and on the gridz4
+# PostgreSQL-proof host. The previous, unconditional
+# `sys.path.insert(0, "/data/grid_v4/grid_repo")` ran on every import of
+# this module, on every host where that directory exists, for the rest of
+# the process's lifetime -- shadowing this repo's real `oracle`, `config`
+# and any other first-party package for every import that happened to run
+# after it, not just the first one (reproduced: ModuleNotFoundError on
+# oracle.entry_price_policy during pytest collection, and separately on
+# scripts/score_oracle_trades.py's own real scorer-path PostgreSQL proof).
+if __name__ == "__main__" and importlib.util.find_spec("config") is None:
+    sys.path.insert(0, "/data/grid_v4/grid_repo")
 
 # Ticker → yfinance symbol mapping
 YF_MAP = {
@@ -246,13 +293,18 @@ def score_one_chunk(
         FROM oracle_predictions
         WHERE verdict = 'pending'
           AND expiry <= :today
+          AND entry_price IS NOT NULL
           AND entry_price > 0
         ORDER BY expiry
         LIMIT :chunk_size
     """), {"today": today, "chunk_size": int(chunk_size)}).fetchall()
 
     counters = {"scored": 0, "hits": 0, "misses": 0, "partials": 0,
-                "skipped": 0, "no_data": 0, "fetched": len(chunk)}
+                "skipped": 0, "no_data": 0, "fetched": len(chunk),
+                # Rows the chunk WHERE should already have excluded. Counted
+                # separately from `skipped` so a non-zero value is visible as
+                # the defect it would be, rather than hiding in the noise.
+                "unscorable_entry_price": 0}
 
     for r in chunk:
         (
@@ -262,6 +314,23 @@ def score_one_chunk(
 
         if direction not in ("CALL", "PUT"):
             counters["skipped"] += 1
+            continue
+
+        # Belt-and-braces against a future edit to the chunk WHERE above.
+        # Settled BEFORE the division: a NULL entry is not a zero entry, a
+        # zero entry is not a 0% move, and neither is an infinite one. The
+        # row is closed with the reason rather than skipped silently, so it
+        # cannot sit 'pending' forever, and the two reasons stay distinct.
+        entry_note = entry_price_score_note(entry)
+        if entry_note is not None:
+            conn.execute(text("""
+                UPDATE oracle_predictions
+                SET verdict = 'no_data', scored_at = NOW(),
+                    score_notes = :notes
+                WHERE id = :id
+            """), {"id": pred_id, "notes": entry_note})
+            counters["unscorable_entry_price"] += 1
+            counters["no_data"] += 1
             continue
 
         actual = get_price_for_date(prices, ticker, expiry)
@@ -372,7 +441,8 @@ def main(argv: list[str] | None = None) -> None:
     with engine.begin() as conn:
         # ── Step 0: Get all pending predictions ──
         rows = conn.execute(text("""
-            SELECT id, ticker, direction, entry_price, created_at::date, expiry
+            SELECT id, ticker, direction, entry_price, created_at::date, expiry,
+                   null_write_policy
             FROM oracle_predictions
             WHERE verdict = 'pending'
             ORDER BY created_at
@@ -402,30 +472,55 @@ def main(argv: list[str] | None = None) -> None:
         prices = fetch_prices(tickers, fetch_start, fetch_end)
 
         # ── Step 2: Backfill entry prices ──
-        log.info("\n--- STEP 2: Backfill Entry Prices ---")
-        backfilled = 0
-        no_price = 0
+        # HISTORICAL-WRITE HOLD: this step used to backfill a missing/zero
+        # entry_price with a historical close looked up just now. That is
+        # repair of an already-published row, which is on hold for both
+        # cases below:
+        #   * entry_price is a non-null 0/negative value -- only possible on
+        #     a legacy row written before oracle_pred_nullable_0918 made the
+        #     column nullable. Never updated, closed, rescored or
+        #     re-labelled; left exactly as it is.
+        #   * entry_price IS NULL -- a new-policy row: nothing was measured
+        #     at publish time. Writing a price discovered after the fact
+        #     would be exactly the fabrication the new policy exists to
+        #     avoid, so it is never backfilled either.
+        # This step therefore only counts what it is holding; it writes
+        # nothing to oracle_predictions.
+        #
+        # A NULL entry_price is split further by null_write_policy (item
+        # (a)'s provenance boundary): NULL alone does not prove the row was
+        # written under the honest-NULL policy, only the stamp does. An
+        # entry_price IS NULL row whose null_write_policy does NOT match
+        # NULL_WRITE_POLICY is unmarked -- held like a legacy row, not
+        # closed in Step 3.5 below, and should be structurally impossible
+        # today (both writers stamp every INSERT).
+        log.info("\n--- STEP 2: Backfill Entry Prices (historical-write hold) ---")
+        held_legacy = 0
+        held_new_policy = 0
+        held_unmarked_null = 0
 
         for r in rows:
-            pred_id, ticker, direction, entry_price, created_date, expiry = r
+            pred_id, ticker, direction, entry_price, created_date, expiry, null_write_policy = r
 
-            if entry_price and entry_price > 0:
+            if entry_price is not None and entry_price > 0:
                 continue  # Already has a price
 
-            price = get_price_for_date(prices, ticker, created_date)
-            if price is None:
-                no_price += 1
-                continue
+            if entry_price is None and null_write_policy == NULL_WRITE_POLICY:
+                held_new_policy += 1
+            elif entry_price is None:
+                held_unmarked_null += 1
+            else:
+                held_legacy += 1
 
-            conn.execute(text("""
-                UPDATE oracle_predictions
-                SET entry_price = :price
-                WHERE id = :id
-            """), {"price": price, "id": pred_id})
-            backfilled += 1
-
-        log.info("  Backfilled: {}", backfilled)
-        log.info("  No price available: {}", no_price)
+        log.info("  Held (legacy, non-null invalid entry_price): {}", held_legacy)
+        log.info("  Held (new-policy, entry_price IS NULL, stamped): {}", held_new_policy)
+        if held_unmarked_null:
+            log.warning(
+                "  Held (UNMARKED entry_price IS NULL, null_write_policy "
+                "does not prove the honest-NULL policy): {} -- should be "
+                "structurally impossible; investigate the writer",
+                held_unmarked_null,
+            )
 
         # ── Step 3: Fix direction mapping ──
         log.info("\n--- STEP 3: Fix Direction Mapping ---")
@@ -456,15 +551,38 @@ def main(argv: list[str] | None = None) -> None:
         """))
         log.info("  NEUTRAL → no_data: {}", res.rowcount)
 
-        # entry_price still 0 → no_data
+        # No entry price measured → no_data. Only entry_price IS NULL AND
+        # null_write_policy proving the honest-NULL policy is closed here: a
+        # new-policy row where nothing was measured at publish time, so it
+        # would otherwise sit 'pending' forever, neither scored nor
+        # accounted for. Not repaired — the row is closed and the note says
+        # why. A bare `entry_price IS NULL` is NOT sufficient on its own
+        # (item (a)'s provenance boundary exists precisely because the
+        # nullable schema alone cannot prove this) -- the stamp is what
+        # proves it.
+        #
+        # HISTORICAL-WRITE HOLD: a non-null 0/negative entry_price can only
+        # be a legacy row written before oracle_pred_nullable_0918 made the
+        # column nullable (the new publish path writes NULL, never 0/neg,
+        # when nothing was measured). That row is deliberately excluded from
+        # this WHERE — historical rescoring/repair is on hold, so it is
+        # never updated, closed, rescored or re-labelled here. Likewise, an
+        # entry_price IS NULL row whose null_write_policy does not match
+        # NULL_WRITE_POLICY (unmarked provenance) is excluded and stays
+        # pending, exactly as it was before this branch.
         res = conn.execute(text("""
             UPDATE oracle_predictions
             SET verdict = 'no_data',
-                score_notes = 'No entry price available for scoring',
+                score_notes = :note_null,
                 scored_at = NOW()
-            WHERE verdict = 'pending' AND entry_price = 0
-        """))
-        log.info("  entry_price=0 → no_data: {}", res.rowcount)
+            WHERE verdict = 'pending'
+              AND entry_price IS NULL
+              AND null_write_policy = :policy
+        """), {
+            "note_null": SCORE_NOTE_ENTRY_NULL,
+            "policy": NULL_WRITE_POLICY,
+        })
+        log.info("  no usable entry_price → no_data: {}", res.rowcount)
 
     # ── Step 4: Score expired predictions (CHUNKED) ──
     log.info("\n--- STEP 4: Score Expired Predictions ---")
@@ -475,6 +593,7 @@ def main(argv: list[str] | None = None) -> None:
             SELECT COUNT(*) FROM oracle_predictions
             WHERE verdict = 'pending'
               AND expiry <= :today
+              AND entry_price IS NOT NULL
               AND entry_price > 0
         """), {"today": today}).scalar() or 0)
 
@@ -485,8 +604,14 @@ def main(argv: list[str] | None = None) -> None:
         args.max_rows if args.max_rows is not None else "all",
     )
 
+    # unscorable_entry_price is score_one_chunk's own belt-and-braces
+    # counter (rows its WHERE should already have excluded -- see that
+    # function). Listed explicitly so a reader sees every key the chunk
+    # loop can report, but the accumulation below never assumes this is
+    # the complete set: a chunk counters dict growing a new key must never
+    # crash main() with a KeyError, it should just be accumulated.
     totals = {"scored": 0, "hits": 0, "misses": 0, "partials": 0,
-              "skipped": 0, "no_data": 0}
+              "skipped": 0, "no_data": 0, "unscorable_entry_price": 0}
     processed = 0
     chunk_idx = 0
     while True:
@@ -508,8 +633,14 @@ def main(argv: list[str] | None = None) -> None:
 
         chunk_idx += 1
         fetched = chunk_counters.pop("fetched", 0)
+        # .get(k, 0) rather than totals[k]: score_one_chunk's counters dict
+        # is not required to carry exactly the keys totals was seeded
+        # with -- a chunk reporting a key totals does not already have
+        # must be accumulated, not raise KeyError (this crashed main() on
+        # the very first chunk that reported unscorable_entry_price before
+        # this fix).
         for k, v in chunk_counters.items():
-            totals[k] += v
+            totals[k] = totals.get(k, 0) + v
         processed += fetched
 
         # No more pending rows — done.

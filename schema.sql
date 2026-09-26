@@ -685,6 +685,10 @@ CREATE TABLE IF NOT EXISTS options_snapshots (
     implied_vol     DOUBLE PRECISION,
     in_the_money    BOOLEAN,
     created_at      TIMESTAMPTZ DEFAULT NOW(),
+    capture_batch_id TEXT,
+    capture_ordinal BIGINT,
+    capture_started_at TIMESTAMPTZ,
+    capture_completed_at TIMESTAMPTZ,
     UNIQUE (ticker, snap_date, expiry, opt_type, strike)
 );
 
@@ -1112,6 +1116,24 @@ CREATE INDEX IF NOT EXISTS idx_thesis_pm_snapshot
 -- AstroGrid may read from shared GRID inputs, but it writes only here.
 -- ============================================================
 CREATE SCHEMA IF NOT EXISTS astrogrid;
+
+-- New SPY close evidence only. Legacy resolved rows have no receipt and are
+-- deliberately not promoted or backfilled.
+CREATE TABLE IF NOT EXISTS astrogrid.price_close_receipt (
+    id                  BIGSERIAL PRIMARY KEY,
+    contract_version    TEXT NOT NULL CHECK (contract_version = 'spy_close_v1'),
+    raw_series_id       BIGINT NOT NULL UNIQUE REFERENCES raw_series(id),
+    resolved_series_id  BIGINT NOT NULL UNIQUE REFERENCES resolved_series(id),
+    feature_id          INTEGER NOT NULL REFERENCES feature_registry(id),
+    obs_date            DATE NOT NULL,
+    price_basis         TEXT NOT NULL CHECK (price_basis = 'YF:SPY:close'),
+    available_at        TIMESTAMPTZ NOT NULL,
+    value               DOUBLE PRECISION NOT NULL CHECK (value > 0 AND value < 'Infinity'::float8),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (contract_version, feature_id, obs_date)
+);
+CREATE INDEX IF NOT EXISTS idx_price_close_receipt_available
+    ON astrogrid.price_close_receipt (feature_id, obs_date, available_at);
 
 CREATE TABLE IF NOT EXISTS astrogrid.grid_input_allowlist (
     id            BIGSERIAL PRIMARY KEY,
