@@ -2,8 +2,8 @@
 
     python -m scripts.research_forward_log run    --log-dir DIR
     python -m scripts.research_forward_log admit  --log-dir DIR --scan-dir SCAN --repo CLONE
-    python -m scripts.research_forward_log status --log-dir DIR
-    python -m scripts.research_forward_log verify --log-dir DIR
+    python -m scripts.research_forward_log status --log-dir DIR [--anchor OFFHOST_COPY]
+    python -m scripts.research_forward_log verify --log-dir DIR [--anchor OFFHOST_COPY]
 
 Rules: ``docs/paper_log/hypothesis-forward-v1-preregistration.md``.
 
@@ -15,7 +15,12 @@ Rules: ``docs/paper_log/hypothesis-forward-v1-preregistration.md``.
 * ``admit`` (operator step): checks one scan output directory against the
   pre-registered eligibility rules and appends its candidates, all or none.
   ``--repo`` is a git clone used to prove the scan's code includes #661. No DB.
-* ``status`` / ``verify``: no DB. ``verify`` exits 1 on a broken chain.
+* ``status`` / ``verify``: no DB. ``verify`` exits 1 on a broken chain or a
+  log that disagrees with its anchor file, or with ``--anchor`` (a copy of the
+  anchor file held off-host, the only anchor a same-host tamperer cannot edit).
+
+The recorded ``code_sha`` has no override: it comes from the installed
+archive's ``VERSION`` file, or from ``HEAD`` of a clean git checkout.
 
 Commands that need no database never import ``config`` (which validates
 ``DB_PASSWORD`` at import).
@@ -40,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-dir", required=True, type=Path)
     parser.add_argument("--scan-dir", type=Path, help="admit: scan output directory")
     parser.add_argument("--repo", type=Path, help="admit: git clone holding the scan's commit")
-    parser.add_argument("--code-sha", default=None, help="override the recorded code_sha (dev)")
+    parser.add_argument("--anchor", type=Path, help="verify/status: off-host anchor-file copy")
     parser.add_argument("--statement-timeout-s", type=int, default=60)
     return parser
 
@@ -52,15 +57,16 @@ def main(argv: list[str] | None = None) -> int:
     now = datetime.now(timezone.utc)
 
     if args.command == "verify":
-        check = log.verify_chain()
+        check = log.verify_chain(args.anchor)
         print(json.dumps(check, indent=2))
         return 0 if check["ok"] else 1
 
     if args.command == "status":
-        print(fl.format_status(fl.status_report(log, now)), end="")
-        return 0 if log.verify_chain()["ok"] else 1
+        report = fl.status_report(log, now, args.anchor)
+        print(fl.format_status(report), end="")
+        return 0 if report["chain"]["ok"] else 1
 
-    code_sha = fl.resolve_code_sha(REPO, args.code_sha)
+    code_sha = fl.resolve_code_sha(REPO)
 
     if args.command == "admit":
         if args.scan_dir is None or args.repo is None:

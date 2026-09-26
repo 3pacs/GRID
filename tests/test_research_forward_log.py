@@ -248,7 +248,13 @@ def test_admission_writes_header_and_frozen_plans(scan_dir, tmp_path):
         assert plan["horizon_sessions"] == 1 and plan["spacing_sessions"] == 5
         assert plan["target"]["series_id"] == "TGT" and plan["feature"]["series_id"] == "FEAT_X"
         assert pd.Timestamp(plan["first_decision_at"]) > pd.Timestamp(FROZEN_AT)
-        assert plan["first_decision_at"] == "2021-07-05T00:00:00+00:00"
+        # 07-05 is the observed Independence Day holiday: the first session is 07-06
+        assert plan["first_decision_at"] == "2021-07-06T00:00:00+00:00"
+        assert record["identity"] == {
+            "target": "TGT", "label": "change", "horizon_sessions": 1,
+            "feature_series": "FEAT_X", "feature_suffix": record["plan"]["feature"]["suffix"],
+        }
+        assert record["identity_sha256"] == orp.digest(record["identity"])
         assert 1 <= plan["block"] <= 30 // orp.MIN_BLOCKS
         assert plan["target"]["publication"] == asdict(H15) == plan["feature"]["publication"]
     assert fl.ForwardLog(tmp_path / "log").verify_chain()["ok"]
@@ -426,10 +432,10 @@ def test_the_real_ef0d564b_artifact_is_refused(tmp_path):
         admit(tmp_path / "log", EF0D564B, repo=fl.GitRepo(REPO))
 
 
-def test_git_repo_ancestry_and_file_lookup(tmp_path):
+def scratch_git(root: Path):
+    """A throwaway fixture repository (identity and signing set for it only)."""
     if shutil.which("git") is None:
         pytest.skip("git not installed")
-    root = tmp_path / "repo"
     root.mkdir()
 
     def git(*args):
@@ -440,6 +446,12 @@ def test_git_repo_ancestry_and_file_lookup(tmp_path):
         ).stdout.strip()
 
     git("init", "-q")
+    return git
+
+
+def test_git_repo_ancestry_and_file_lookup(tmp_path):
+    root = tmp_path / "repo"
+    git = scratch_git(root)
     (root / "a.py").write_text("one\n", encoding="utf-8")
     git("add", "a.py")
     git("commit", "-q", "-m", "one")
@@ -462,7 +474,7 @@ def chained(scan_dir, tmp_path):
     log_dir = tmp_path / "log"
     admit(log_dir, scan_dir)
     with build_engine().connect() as conn:
-        for day in (5, 13):  # the 07-05 prediction on time, then its outcome
+        for day in (6, 13):  # the 07-06 prediction on time, then its outcome
             fl.run_forward(fl.ForwardLog(log_dir), conn,
                            datetime(2021, 7, day, 6, tzinfo=timezone.utc), "c" * 40)
     log = fl.ForwardLog(log_dir)
@@ -532,7 +544,7 @@ def test_empty_log_run_writes_the_header_only(tmp_path):
     assert [r["kind"] for r in written] == ["header"]
     assert fl.run_forward(log, None, datetime(2026, 9, 28, 6, 20, tzinfo=timezone.utc), "d" * 40) == []
     assert log.verify_chain() == {
-        "ok": True, "records": 1,
+        "ok": True, "records": 1, "anchored_records": 1,
         "head_sha256": hashlib.sha256(lines_of(log)[0]).hexdigest(), "detail": None,
     }
     assert cli.main(["verify", "--log-dir", str(log.log_dir)]) == 0
@@ -555,9 +567,9 @@ def test_predictions_precede_outcomes_and_follow_the_freeze(chained):
         assert decided <= pd.Timestamp(p["run_at"]) < pd.Timestamp(p["label_known_at"])
     for o in outcomes:
         assert pd.Timestamp(o["run_at"]) >= pd.Timestamp(o["label_known_at"])
-    # the decision of 07-12 has label end 07-13, published 07-14 21:17Z: no outcome yet
-    assert {o["decision_at"][:10] for o in outcomes} == {"2021-07-05"}
-    assert {p["decision_at"][:10] for p in predictions} == {"2021-07-05", "2021-07-12"}
+    # the decision of 07-13 has label end 07-14, published 07-15 21:17Z: no outcome yet
+    assert {o["decision_at"][:10] for o in outcomes} == {"2021-07-06"}
+    assert {p["decision_at"][:10] for p in predictions} == {"2021-07-06", "2021-07-13"}
 
 
 def test_prediction_ignores_values_pulled_after_the_decision(scan_dir, tmp_path):
@@ -592,9 +604,9 @@ def test_late_predictions_are_excluded_not_backfilled(scan_dir, tmp_path):
     by_day = {}
     for p in predictions:
         by_day.setdefault(p["decision_at"][:10], set()).add(p["exclusion_reason"])
-    # labels of 07-05 and 07-12 were already published: late; 07-19's is not
-    assert by_day == {"2021-07-05": {"late_prediction"}, "2021-07-12": {"late_prediction"},
-                      "2021-07-19": {None}}
+    # labels of 07-06 and 07-13 were already published: late; 07-20's is not
+    assert by_day == {"2021-07-06": {"late_prediction"}, "2021-07-13": {"late_prediction"},
+                      "2021-07-20": {None}}
     assert all(p["feature"]["value"] is None for p in predictions if p["excluded"])
 
 
@@ -602,13 +614,13 @@ def test_missing_target_waits_for_the_grace_period_then_is_excluded(scan_dir, tm
     log_dir = tmp_path / "log"
     admit(log_dir, scan_dir)
     log = fl.ForwardLog(log_dir)
-    engine = build_engine(drop=("TGT", date(2021, 7, 6)))  # label end of decision 07-05
+    engine = build_engine(drop=("TGT", date(2021, 7, 7)))  # label end of decision 07-06
     with engine.connect() as conn:
-        # label known 07-07 21:17Z; grace ends 07-12 21:17Z
-        for day in (5, 8, 12):
+        # label known 07-08 21:17Z; grace ends 07-13 21:17Z
+        for day in (6, 9, 13):
             fl.run_forward(log, conn, datetime(2021, 7, day, 6, tzinfo=timezone.utc), "c" * 40)
         assert not [r for r in log.read_all() if r["kind"] == "outcome"]
-        fl.run_forward(log, conn, datetime(2021, 7, 13, 6, tzinfo=timezone.utc), "c" * 40)
+        fl.run_forward(log, conn, datetime(2021, 7, 14, 6, tzinfo=timezone.utc), "c" * 40)
     outcomes = [r for r in log.read_all() if r["kind"] == "outcome"]
     assert outcomes and {o["exclusion_reason"] for o in outcomes} == {"target_missing"}
 
@@ -664,12 +676,17 @@ def make_entry(values, labels, direction=1, excluded=(), min_n=30, pending=()):
     plan = {
         "min_n": min_n, "max_decisions": 2 * min_n, "direction": direction,
         "statistic": "spearman", "block": 1, "perms": 999, "seed": 1, "alpha": 0.025,
+        "family": "TGT|change|fwd1", "feature": {"name": "FEAT_X|chg5"}, "family_size": 2,
+        "first_decision_at": "2021-07-06T00:00:00+00:00", "spacing_sessions": 5,
+        "horizon_sessions": 1,
     }
+    identity = fl.scientific_identity("TGT|change|fwd1", "FEAT_X|chg5")
     admission = {"candidate_id": "x" * 64, "plan": plan, "plan_sha256": orp.digest(plan),
-                 "run_at": "2021-07-02T09:00:00+00:00"}
+                 "run_at": "2021-07-02T09:00:00+00:00", "identity": identity,
+                 "identity_sha256": orp.digest(identity)}
     entry = {"admission": admission, "predictions": {}, "outcomes": {}, "verdict": None}
     for k, (value, label) in enumerate(zip(values, labels)):
-        decided = pd.Timestamp("2021-07-05T00:00:00+00:00") + pd.offsets.BDay(5 * k)
+        decided = fl.decision_at(plan, k)
         known = decided + pd.Timedelta(days=2, hours=21)
         entry["predictions"][k] = {
             "decision_at": decided.isoformat(), "label_known_at": known.isoformat(),
@@ -751,6 +768,17 @@ def test_forward_run_end_to_end_reaches_one_verdict_per_candidate(scan_dir, tmp_
     assert set(verdicts) == set(admissions)
     for cid, v in verdicts.items():
         assert v["n"] == 30 and v["promotion_allowed"] is False
+        # what a consumer (S11) needs to verify the verdict against the log
+        assert v["candidate_id"] == cid and v["identity"] == admissions[cid]["identity"]
+        assert v["identity_sha256"] == admissions[cid]["identity_sha256"]
+        assert v["family"] == admissions[cid]["plan"]["family"]
+        assert v["feature"] == admissions[cid]["plan"]["feature"]["name"]
+        assert v["prereg_sha256"] == fl.PREREG_SHA256
+        assert v["log_head_sha256"] == v["prev_sha256"] is not None
+        windows = v["windows"]
+        assert windows["first_decision_at"] == admissions[cid]["plan"]["first_decision_at"]
+        assert pd.Timestamp(v["admitted_at"]) < pd.Timestamp(windows["pairs_first_decision_at"])
+        assert windows["pairs_last_decision_at"] < windows["pairs_last_label_end"]
         index = records.index(v)
         assert not [r for r in records[index + 1:] if r.get("candidate_id") == cid]
     chg5 = next(v for cid, v in verdicts.items()
@@ -777,3 +805,130 @@ def test_module_never_names_the_registry_tables_or_builds_sql():
 def test_read_only_engine_refuses_unsafe_application_names(name):
     with pytest.raises(ValueError, match="application_name"):
         scan_script.read_only_engine(60, name)
+
+
+# --- review round 1: one test per pair, anchors, code sha, holidays ------------------
+
+
+def forge_rescan(scan_dir: Path, tmp_path: Path, name: str = "rescan") -> Path:
+    """A later scan that re-freezes the same pairs under a new, consistent manifest."""
+    scan = tmp_path / name
+    shutil.copytree(scan_dir, scan)
+    resign_payload(scan, lambda payload: payload["protocol"].__setitem__("run_id", name))
+    manifest = read(scan / "run" / "discovery-frozen.json")["sha256"]
+    rewrite_candidates(
+        scan, lambda c: c["specification"].__setitem__("discovery_manifest", manifest)
+    )
+    holdout = read(scan / "run" / "holdout-result.json")
+    holdout["discovery_manifest"] = manifest
+    write(scan / "run" / "holdout-result.json", holdout)
+    summary = read(scan / "summary.json")
+    summary["discovery_manifest_sha256"] = manifest
+    write(scan / "summary.json", summary)
+    return scan
+
+
+def test_a_rescan_cannot_re_admit_an_open_or_decided_pair(scan_dir, tmp_path):
+    log_dir = tmp_path / "log"
+    first = admit(log_dir, scan_dir)
+    rescan = forge_rescan(scan_dir, tmp_path)
+    # the rescan is admissible on its own (new manifest, new candidate ids) ...
+    fresh = [r for r in admit(tmp_path / "fresh", rescan) if r["kind"] == "admission"]
+    assert len(fresh) == 2
+    assert {r["candidate_id"] for r in fresh}.isdisjoint(r.get("candidate_id") for r in first)
+    assert {r["identity_sha256"] for r in fresh} == {
+        r["identity_sha256"] for r in first if r["kind"] == "admission"
+    }
+    # ... but never where its pairs already have a forward test
+    with pytest.raises(fl.Refused, match=r"already has a forward test \(OPEN\)"):
+        admit(log_dir, rescan)
+    log = fl.ForwardLog(log_dir)
+    log.append([{"kind": "verdict", "candidate_id": r["candidate_id"], "run_at": "x"}
+                for r in first if r["kind"] == "admission"])
+    with pytest.raises(fl.Refused, match=r"already has a forward test \(DECIDED\)"):
+        admit(log_dir, forge_rescan(scan_dir, tmp_path, "rescan-2"))
+    assert sum(r["kind"] == "admission" for r in log.read_all()) == 2
+
+
+def test_scientific_identity_ignores_scan_and_direction():
+    a = fl.scientific_identity("TGT|change|fwd5", "FEAT_X|z60")
+    assert a == {"target": "TGT", "label": "change", "horizon_sessions": 5,
+                 "feature_series": "FEAT_X", "feature_suffix": "z60"}
+    assert fl.scientific_identity("TGT|change|fwd1", "FEAT_X|z60") != a
+
+
+def test_every_append_writes_a_chained_anchor(chained):
+    anchors = [json.loads(line) for line in chained.anchor_path.read_bytes().splitlines()]
+    assert len(anchors) == 3  # admission, then two runs
+    check = chained.verify_chain()
+    assert anchors[-1]["records"] == check["records"] == check["anchored_records"]
+    assert anchors[-1]["head_sha256"] == check["head_sha256"]
+    assert anchors[0]["prev_anchor_sha256"] is None
+    assert all(a["prev_anchor_sha256"] for a in anchors[1:])
+
+
+def test_anchors_catch_what_the_chain_cannot(chained, tmp_path):
+    offhost = tmp_path / "offhost-anchors.jsonl"
+    shutil.copy(chained.anchor_path, offhost)
+    lines = lines_of(chained)
+    anchor_lines = chained.anchor_path.read_bytes().splitlines()
+    # 1. truncating trailing lines keeps a valid chain; the anchor sees it
+    put_lines(chained, lines[:-1])
+    check = chained.verify_chain()
+    assert not check["ok"] and "truncated below anchor" in check["detail"]
+    # 2. a full recompute with an edited record, header kept: the anchor sees it
+    recomputed, previous = [], None
+    for i, line in enumerate(lines):
+        record = json.loads(line)
+        if i == 1:
+            record["plan"]["alpha"] = 0.05
+        record["prev_sha256"] = previous
+        line = fl.canonical(record)
+        previous = hashlib.sha256(line).hexdigest()
+        recomputed.append(line)
+    put_lines(chained, recomputed)
+    check = chained.verify_chain()
+    assert not check["ok"] and "rewritten below anchor" in check["detail"]
+    # 3. truncating the log AND the local anchors consistently passes locally,
+    #    and only the off-host copy catches it: the local file is not an anchor
+    keep = json.loads(anchor_lines[-2])["records"]
+    put_lines(chained, lines[:keep])
+    chained.anchor_path.write_bytes(b"\n".join(anchor_lines[:-1]) + b"\n")
+    assert chained.verify_chain()["ok"]
+    check = chained.verify_chain(offhost)
+    assert not check["ok"] and "offhost-anchors.jsonl: log truncated" in check["detail"]
+    assert cli.main(["verify", "--log-dir", str(chained.log_dir), "--anchor", str(offhost)]) == 1
+    # 4. a log without its anchor file is refused
+    chained.anchor_path.unlink()
+    assert "anchor file missing" in chained.verify_chain()["detail"]
+
+
+def test_code_sha_cannot_be_overridden(tmp_path):
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["run", "--log-dir", "x", "--code-sha", "f" * 40])
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    (installed / "VERSION").write_text("a" * 40 + "\n", encoding="utf-8")
+    assert fl.resolve_code_sha(installed) == "a" * 40
+    (installed / "VERSION").write_text("not-a-sha\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="full commit sha"):
+        fl.resolve_code_sha(installed)
+    root = tmp_path / "checkout"
+    git = scratch_git(root)
+    (root / "a.py").write_text("one\n", encoding="utf-8")
+    git("add", "a.py")
+    git("commit", "-q", "-m", "one")
+    assert fl.resolve_code_sha(root) == git("rev-parse", "HEAD")
+    (root / "a.py").write_text("edited\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="modified tracked files"):
+        fl.resolve_code_sha(root)
+
+
+def test_sessions_skip_us_federal_holidays():
+    assert fl.first_decision(FROZEN_AT).isoformat() == "2021-07-06T00:00:00+00:00"  # 07-05 off
+    plan = {"first_decision_at": "2021-11-22T00:00:00+00:00", "spacing_sessions": 5,
+            "horizon_sessions": 3, "target": {"publication": asdict(H15)}}
+    assert fl.label_end(plan, 0).date() == date(2021, 11, 26)  # skips Thanksgiving 11-25
+    assert fl.decision_at(plan, 1).date() == date(2021, 11, 30)
+    # published one session after 11-26 (Monday 11-29) at 21:17Z
+    assert fl.label_known_at(plan, 0).isoformat() == "2021-11-29T21:17:00+00:00"

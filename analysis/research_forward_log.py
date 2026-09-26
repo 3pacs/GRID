@@ -22,7 +22,14 @@ of the previous record's exact canonical JSON line (``sort_keys``, compact
 separators, UTF-8, no trailing newline); the file separates lines with a
 single ``\\n`` written in binary mode. The first record is a ``header`` with
 ``prereg_sha256``. ``verify_chain`` detects an edited, reordered, inserted or
-deleted line.
+deleted line. It cannot, on its own, detect truncation of trailing lines or a
+recompute of the whole file: after every append ``(records, head_sha256)`` is
+also appended to a chained anchor file, and the log is tamper-evident only
+relative to a copy of that file held off-host. ``STATUS.md`` is regenerated
+from the log and is not an anchor.
+
+Admission is keyed on the scientific pair (target, label, horizon, feature
+series and transform), not on the scan: a pair is forward-tested at most once.
 
 Boundaries: DB reads go only through
 ``research_real_panel.load_latest_vintage_panel`` (``store.observations.read_window``:
@@ -48,6 +55,7 @@ from typing import Any, Iterator
 
 import numpy as np
 import pandas as pd
+from pandas.tseries.holiday import USFederalHolidayCalendar
 from scipy.stats import rankdata
 
 from analysis.offline_research_proof import (
@@ -74,9 +82,10 @@ VERSION = "v1"
 PREREG_PATH = Path("docs/paper_log/hypothesis-forward-v1-preregistration.md")
 # sha256 of the pre-registration's LF bytes. Recompute and re-pin only before
 # the first record is ever written; afterwards any change is a v2.
-PREREG_SHA256 = "e67e298de1a8dc67c9753ba991679a2d8c1dd0d9a366462230d22978d2f14c82"
+PREREG_SHA256 = "b0bfbd11e1047dde0c2d692f0ad0615b9fd52a6fcc36b010a42fbe387b33e814"
 
 LOG_FILENAME = "hypothesis_forward_v1.jsonl"
+ANCHOR_FILENAME = "hypothesis_forward_v1.anchors.jsonl"
 STATUS_FILENAME = "STATUS.md"
 LOCK_FILENAME = ".hypothesis_forward_v1.lock"
 LOCK_TIMEOUT_S = 30.0
@@ -112,6 +121,12 @@ INCONCLUSIVE = "FORWARD_INCONCLUSIVE_STOPPED"
 EXCL_FEATURE = "feature_abstained"
 EXCL_LATE = "late_prediction"
 EXCL_TARGET = "target_missing"
+SESSION_HOLIDAYS = (
+    USFederalHolidayCalendar()
+    .holidays("1990-01-01", "2040-12-31")
+    .to_numpy()
+    .astype("datetime64[D]")
+)
 HEX40 = re.compile(r"[0-9a-f]{40}")
 HEX64 = re.compile(r"[0-9a-f]{64}")
 
@@ -153,14 +168,24 @@ class ForwardLog:
     def __init__(self, log_dir: Path) -> None:
         self.log_dir = Path(log_dir)
         self.path = self.log_dir / LOG_FILENAME
+        self.anchor_path = self.log_dir / ANCHOR_FILENAME
         self.lock_path = self.log_dir / LOCK_FILENAME
 
     def read_all(self) -> list[dict]:
         return [json.loads(line) for line in _lines(self.path)]
 
-    def verify_chain(self) -> dict:
+    def verify_chain(self, external_anchors: Path | None = None) -> dict:
+        """Walk the chain, then check it against the anchor file(s).
+
+        The chain alone detects an edited, reordered, inserted or deleted line
+        but not truncation of trailing lines or a full recompute. Anchors
+        (``records``, ``head_sha256`` after every append) detect those for every
+        anchored prefix -- but only as far as the anchor file itself is out of
+        the tamperer's reach, i.e. a copy held off-host (``external_anchors``).
+        """
         previous = None
         lines = list(_lines(self.path))
+        heads = []
         for i, line in enumerate(lines):
             try:
                 record = json.loads(line)
@@ -178,7 +203,25 @@ class ForwardLog:
             if i > 0 and record.get("kind") == "header":
                 return _broken(len(lines), i, "second header")
             previous = hashlib.sha256(line).hexdigest()
-        return {"ok": True, "records": len(lines), "head_sha256": previous, "detail": None}
+            heads.append(previous)
+        if lines and not self.anchor_path.exists():
+            return _broken(len(lines), len(lines), "anchor file missing")
+        anchored = 0
+        for source in (self.anchor_path, external_anchors):
+            if source is None:
+                continue
+            problem, count = _check_anchors(Path(source), heads)
+            if problem:
+                return _broken(len(lines), count, f"{Path(source).name}: {problem}")
+            if source == self.anchor_path:
+                anchored = count
+        return {
+            "ok": True,
+            "records": len(lines),
+            "head_sha256": previous,
+            "anchored_records": anchored,
+            "detail": None,
+        }
 
     def append(self, records: list[dict]) -> list[dict]:
         """Append records under the lock, chaining each to the previous line."""
@@ -196,10 +239,24 @@ class ForwardLog:
         out = []
         with open(self.path, "ab") as stream:
             for record in records:
+                if record.get("kind") == "verdict":
+                    # the log a consumer must verify this verdict against
+                    record = {**record, "log_head_sha256": previous}
                 line = canonical({**record, "prev_sha256": previous})
                 stream.write(line + b"\n")
                 previous = hashlib.sha256(line).hexdigest()
                 out.append(json.loads(line))
+            stream.flush()
+            os.fsync(stream.fileno())
+        anchors = list(_lines(self.anchor_path))
+        anchor = {
+            "records": check["records"] + len(records),
+            "head_sha256": previous,
+            "run_at": out[-1].get("run_at"),
+            "prev_anchor_sha256": hashlib.sha256(anchors[-1]).hexdigest() if anchors else None,
+        }
+        with open(self.anchor_path, "ab") as stream:
+            stream.write(canonical(anchor) + b"\n")
             stream.flush()
             os.fsync(stream.fileno())
         return out
@@ -233,7 +290,39 @@ class ForwardLog:
 
 
 def _broken(n: int, index: int, detail: str) -> dict:
-    return {"ok": False, "records": n, "head_sha256": None, "detail": f"record {index}: {detail}"}
+    return {
+        "ok": False,
+        "records": n,
+        "head_sha256": None,
+        "anchored_records": 0,
+        "detail": f"record {index}: {detail}",
+    }
+
+
+def _check_anchors(path: Path, heads: list[str]) -> tuple[str | None, int]:
+    """Every anchor must name a prefix the log still has, with the same head hash.
+
+    Returns ``(problem, records)``: the first problem found (and the anchor's
+    record count), or ``None`` and the last anchored count. Records written
+    after the last anchor (a crash between the two appends) are allowed.
+    """
+    previous, count = None, 0
+    for i, line in enumerate(_lines(path)):
+        try:
+            anchor = json.loads(line)
+        except ValueError:
+            return f"anchor {i} is not JSON", count
+        if line != canonical(anchor) or anchor.get("prev_anchor_sha256") != previous:
+            return f"anchor {i} breaks the anchor chain", count
+        records = anchor.get("records")
+        if not isinstance(records, int) or records < count or records < 1:
+            return f"anchor {i} is not monotone", count
+        if records > len(heads):
+            return f"log truncated below anchor {i} ({records} records anchored)", records
+        if heads[records - 1] != anchor.get("head_sha256"):
+            return f"log rewritten below anchor {i}", records
+        previous, count = hashlib.sha256(line).hexdigest(), records
+    return None, count
 
 
 def header_record(now: datetime, code_sha: str) -> dict:
@@ -251,6 +340,8 @@ def header_record(now: datetime, code_sha: str) -> dict:
             "family_alpha": FAMILY_ALPHA,
             "max_decisions_factor": MAX_DECISIONS_FACTOR,
             "grace_days": GRACE.days,
+            "one_forward_test_per_pair": True,
+            "sessions": "weekdays excluding US federal holidays",
         },
         "promotion_allowed": False,
     }
@@ -370,10 +461,42 @@ def _publication(summary: dict, source: str) -> dict:
     return recorded
 
 
+def shift_sessions(start: pd.Timestamp, n: int) -> pd.Timestamp:
+    """00:00Z of the session ``n`` sessions after ``start`` (``n=0`` rolls forward).
+
+    Sessions are weekdays that are not US federal holidays: the calendar
+    ``research_real_panel.publication_times`` uses for business-day lags.
+    """
+    day = np.busday_offset(
+        np.datetime64(start.date(), "D"), n, roll="forward", holidays=SESSION_HOLIDAYS
+    )
+    return pd.Timestamp(day).tz_localize("UTC")
+
+
+def scientific_identity(family: str, feature: str) -> dict:
+    """What a forward test is a test of, independent of the scan that froze it.
+
+    Target series, label kind, horizon and the feature (series and transform
+    suffix). Direction, manifest and scan are deliberately left out: a pair
+    re-frozen by another scan, with either sign, is the same hypothesis.
+    """
+    target, label, fwd = family.rsplit("|", 2)
+    series, suffix = feature.rsplit("|", 1)
+    if not fwd.startswith("fwd") or not fwd[3:].isdigit():
+        raise Refused(f"unknown family shape {family!r}")
+    return {
+        "target": target,
+        "label": label,
+        "horizon_sessions": int(fwd[3:]),
+        "feature_series": series,
+        "feature_suffix": suffix,
+    }
+
+
 def first_decision(frozen_at: datetime) -> pd.Timestamp:
-    """The first business-day session (00:00Z) strictly after ``frozen_at``."""
+    """The first session (00:00Z) strictly after ``frozen_at``."""
     day = pd.Timestamp(frozen_at.astimezone(timezone.utc).date(), tz="UTC") + pd.Timedelta(days=1)
-    return day if day.dayofweek < 5 else day + pd.offsets.BDay(1)
+    return shift_sessions(day, 0)  # rolls a weekend or holiday forward
 
 
 def admit_scan(
@@ -444,6 +567,13 @@ def _admit_locked(
     manifests = {r["scan"]["discovery_manifest"] for r in records if r.get("kind") == "admission"}
     if manifest in manifests:
         raise Refused("this scan was already admitted")
+    # One forward test per scientific pair, ever: keyed on the pair, not the scan.
+    decided = {r["candidate_id"] for r in records if r.get("kind") == "verdict"}
+    tested = {
+        r["identity_sha256"]: ("DECIDED" if r["candidate_id"] in decided else "OPEN")
+        for r in records
+        if r.get("kind") == "admission"
+    }
 
     ledger = {(t["family"], t["feature"]): t for t in payload.get("ledger") or ()}
     checks = {c["trial_id"]: c for c in holdout.get("holdout_checks") or ()}
@@ -472,6 +602,14 @@ def _admit_locked(
             raise Refused(
                 f"candidate {cid[:12]} is SELF_LAG: {feature_id} proxies target {target_id}"
             )
+        identity = scientific_identity(family, feature)
+        identity_sha = digest(identity)
+        if identity_sha in tested:
+            raise Refused(
+                f"{family} <- {feature} already has a forward test ({tested[identity_sha]}) in "
+                "this log: each scientific pair is tested forward at most once"
+            )
+        tested[identity_sha] = "ADMITTING"
         trial = ledger.get((family, feature))
         if (
             trial is None
@@ -551,6 +689,8 @@ def _admit_locked(
                 "run_at": now.isoformat(),
                 "code_sha": code_sha,
                 "candidate_id": cid,
+                "identity": identity,
+                "identity_sha256": identity_sha,
                 "specification": spec,
                 "scan": {
                     "dir": scan_dir.name,
@@ -586,11 +726,11 @@ def _admit_locked(
 
 
 def decision_at(plan: dict, k: int) -> pd.Timestamp:
-    return pd.Timestamp(plan["first_decision_at"]) + pd.offsets.BDay(k * plan["spacing_sessions"])
+    return shift_sessions(pd.Timestamp(plan["first_decision_at"]), k * plan["spacing_sessions"])
 
 
 def label_end(plan: dict, k: int) -> pd.Timestamp:
-    return decision_at(plan, k) + pd.offsets.BDay(plan["horizon_sessions"])
+    return shift_sessions(decision_at(plan, k), plan["horizon_sessions"])
 
 
 def label_known_at(plan: dict, k: int) -> pd.Timestamp:
@@ -718,10 +858,26 @@ def verdict(entry: dict) -> dict | None:
     base = {
         "kind": "verdict",
         "candidate_id": admission["candidate_id"],
+        "identity": admission["identity"],
+        "identity_sha256": admission["identity_sha256"],
+        "family": plan["family"],
+        "feature": plan["feature"]["name"],
+        "direction": plan["direction"],
+        "prereg_sha256": PREREG_SHA256,
         "plan_sha256": admission["plan_sha256"],
+        "admitted_at": admission["run_at"],
+        "windows": {
+            "first_decision_at": plan["first_decision_at"],
+            "pairs_first_decision_at": decision_at(plan, pairs[0][0]).isoformat() if pairs else None,
+            "pairs_last_decision_at": decision_at(plan, pairs[-1][0]).isoformat() if pairs else None,
+            "pairs_last_label_end": label_end(plan, pairs[-1][0]).isoformat() if pairs else None,
+            "last_resolved_decision_at": decision_at(plan, k - 1).isoformat() if k else None,
+        },
         "decisions_resolved": k,
         "n": len(pairs),
         "pairs_sha256": digest(pairs),
+        "family_size": plan["family_size"],
+        "alpha": plan["alpha"],
         "promotion_allowed": False,
     }
     if len(pairs) < plan["min_n"]:
@@ -743,7 +899,6 @@ def verdict(entry: dict) -> dict | None:
         "state": SUPPORTED if supported else FAILED,
         "rho": rho,
         "p_one_sided": p,
-        "alpha": plan["alpha"],
         "block": plan["block"],
         "reason": None if supported else "direction*rho <= 0 or p > alpha",
     }
@@ -836,14 +991,18 @@ def _run_locked(log: ForwardLog, conn, now: datetime, code_sha: str) -> list[dic
 # --- status (activity only until the look) ------------------------------------------
 
 
-def status_report(log: ForwardLog, now: datetime | None = None) -> dict:
-    check = log.verify_chain()
+def status_report(
+    log: ForwardLog, now: datetime | None = None, external_anchors: Path | None = None
+) -> dict:
+    check = log.verify_chain(external_anchors)
     report: dict[str, Any] = {"chain": check, "generated_at": (now or datetime.now(timezone.utc)).isoformat()}
     if not check["ok"]:
         report["candidates"] = []
         return report
     records = log.read_all()
     report["header"] = records[0] if records else None
+    admissions = [r for r in records if r.get("kind") == "admission"]
+    report["scans_admitted"] = len({r["scan"]["discovery_manifest"] for r in admissions})
     rows = []
     for cid, entry in candidates_state(records).items():
         plan = entry["admission"]["plan"]
@@ -891,8 +1050,15 @@ def format_status(report: dict) -> str:
         f"- Chain: {'OK' if chain['ok'] else 'BROKEN'} ({chain['records']} records)"
         + (f", head `{chain['head_sha256']}`" if chain["ok"] and chain["head_sha256"] else "")
         + (f": {chain['detail']}" if not chain["ok"] else ""),
+        f"- Anchored records: {chain.get('anchored_records', 0)} (`{ANCHOR_FILENAME}`). The "
+        "chain proves nothing against truncation or a full recompute except relative to "
+        "an anchor copy held off-host; this STATUS.md is regenerated from the log and is "
+        "not an anchor.",
         f"- Pre-registration sha256: `{PREREG_SHA256}` ({PREREG_PATH.as_posix()})",
-        f"- Candidates: {len(report['candidates'])}",
+        f"- Candidates: {len(report['candidates'])} from {report.get('scans_admitted', 0)} "
+        f"scan(s). Each scan's candidates share alpha {FAMILY_ALPHA} (Bonferroni); each "
+        "scientific pair is tested at most once; so P(any false 'supported') <= "
+        f"{FAMILY_ALPHA} x scans = {FAMILY_ALPHA * report.get('scans_admitted', 0):.2f}.",
     ]
     for row in report["candidates"]:
         lines += [
@@ -926,20 +1092,33 @@ def write_status(log: ForwardLog, now: datetime | None = None) -> str:
     return text
 
 
-def resolve_code_sha(repo_root: Path, override: str | None = None) -> str:
-    """``--code-sha``, else a ``VERSION`` file (installed archives), else ``git rev-parse``."""
-    if override:
-        return override
+def resolve_code_sha(repo_root: Path) -> str:
+    """The running code's commit; there is no caller override.
+
+    An installed archive carries a ``VERSION`` file (the installer's pinned
+    commit). Otherwise the checkout must be a git work tree with no modified
+    tracked files, and its ``HEAD`` is used.
+    """
     version = Path(repo_root) / "VERSION"
-    if version.exists() and version.read_text(encoding="utf-8").strip():
-        return version.read_text(encoding="utf-8").strip()
-    result = subprocess.run(
-        ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
-    if result.returncode != 0 or not HEX40.fullmatch(result.stdout.strip()):
-        raise RuntimeError(f"could not resolve code_sha under {repo_root}")
-    return result.stdout.strip()
+    if version.exists():
+        sha = version.read_text(encoding="utf-8").strip()
+        if not HEX40.fullmatch(sha):
+            raise RuntimeError(f"{version} does not hold a full commit sha")
+        return sha
+
+    def git(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+    head = git("rev-parse", "HEAD")
+    if head.returncode != 0 or not HEX40.fullmatch(head.stdout.strip()):
+        raise RuntimeError(f"could not resolve code_sha under {repo_root}: no VERSION, no git")
+    dirty = git("status", "--porcelain", "--untracked-files=no")
+    if dirty.returncode != 0 or dirty.stdout.strip():
+        raise RuntimeError(f"{repo_root} has modified tracked files: code_sha would not match")
+    return head.stdout.strip()

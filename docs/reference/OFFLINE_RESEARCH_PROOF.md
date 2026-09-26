@@ -466,9 +466,27 @@ log's header record). Code: `analysis/research_forward_log.py`, CLI
   carries `prev_sha256` (sha256 of the previous canonical JSON line), the
   code commit and its run time; the first record is a header with the
   pre-registration hash. `verify` walks the chain; `run` and `admit` refuse to
-  append to a broken chain, and `STATUS.md` says BROKEN. The chain cannot
-  detect an edit to the last line on its own: the head hash in `STATUS.md`
-  (and any off-host mirror of it) is the anchor.
+  append to a broken chain, and `STATUS.md` says BROKEN.
+- **Tamper evidence, honestly.** The chain alone cannot detect truncation of
+  trailing lines or a recompute of the whole file. Every append also appends
+  `(records, head_sha256)` to the chained anchor file
+  `hypothesis_forward_v1.anchors.jsonl`. `verify` checks every anchored
+  prefix locally and against a copy given with `--anchor`. The log is
+  tamper-evident only relative to an anchor copy held off-host. `STATUS.md` is
+  regenerated from the log and is **not** an anchor. Until an off-host mirror
+  exists, the anchor file catches accidents, not a deliberate same-host
+  rewrite. The mirror is a follow-up that needs owner approval.
+- **One forward test per scientific pair.** Admission is keyed on (target,
+  label, horizon, feature series, transform), not on the scan or candidate id.
+  A rescan that re-freezes an open or decided pair is refused. Error control:
+  Bonferroni 0.05/K within a scan, so P(any false supported verdict) is at
+  most 0.05 x admitted scans. `STATUS.md` reports that bound.
+- **Consumers (S11).** Each verdict record carries `candidate_id`, the
+  scientific `identity`, family, feature, direction, windows, n, rho, p,
+  alpha, `prereg_sha256` and `log_head_sha256` (its `prev_sha256`).
+- **Code commit and sessions.** `code_sha` has no override: it is the
+  archive's `VERSION` or `HEAD` of a clean checkout. Sessions skip US federal
+  holidays, the same calendar as the publication lags.
 - **Starts empty.** `run` on an empty log writes the header only. Candidates
   enter only through `admit` from one scan directory, all or none. The scan
   must be `latest_vintage_read` on code that descends from the #661 head
