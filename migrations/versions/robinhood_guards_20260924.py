@@ -1,7 +1,7 @@
 """Persisted risk state and order log for Robinhood trading guards
 
 Revision ID: robinhood_guards_20260924
-Revises: spy_close_receipt_20260922
+Revises: options_quote_time_20260925
 
 Adds the two tables trading/robinhood_risk_store.py needs so the Robinhood
 connector's drawdown high-water mark, start-of-day equity and order-rate
@@ -19,7 +19,7 @@ connector's guards can reuse the same store later.
 from alembic import op
 
 revision = "robinhood_guards_20260924"
-down_revision = "spy_close_receipt_20260922"
+down_revision = "options_quote_time_20260925"
 branch_labels = None
 depends_on = None
 
@@ -95,5 +95,6 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.execute("SET LOCAL lock_timeout = '5s'")
+    op.execute("SET LOCAL statement_timeout = '30s'")
     op.execute("DROP TABLE IF EXISTS trading_order_log")
     op.execute("DROP TABLE IF EXISTS trading_risk_state")
