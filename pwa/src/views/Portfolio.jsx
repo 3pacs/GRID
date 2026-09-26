@@ -301,7 +301,15 @@ function PositionTable({ positions }) {
 /* ── Options P&L Section ── */
 
 function OptionsPnL({ data }) {
-    if (!data || data.total_recommendations === 0) {
+    if (!data || data.status === 'unavailable' || data.total_recommendations == null) {
+        return (
+            <div style={{ ...shared.card, textAlign: 'center', color: colors.textMuted, padding: '24px' }}>
+                Options recommendations are currently unavailable.
+            </div>
+        );
+    }
+
+    if (data.total_recommendations === 0) {
         return (
             <div style={{ ...shared.card, textAlign: 'center', color: colors.textMuted, padding: '24px' }}>
                 No options recommendations tracked yet.

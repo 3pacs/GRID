@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Query, Request
 from loguru import logger as log
+from price_close_contract import SPY_CLOSE_CONTRACT
 
 from astrogrid_api.auth import require_auth, verify_token
 from astrogrid_api.dependencies import get_astrogrid_store, get_db_engine
@@ -390,6 +391,9 @@ def _persist_prediction(
     prediction_payload["feature_family_summary"]["target_group"] = target_group
     prediction_payload["feature_family_summary"]["actor_type"] = actor_context.get("actor_type")
     prediction_payload["prediction_id"] = str(uuid4())
+    if (req.as_of_ts is None and target_symbols == ["SPY"]
+            and req.live_or_local == "live" and scoring_class == "liquid_market"):
+        prediction_payload["price_contract_version"] = SPY_CLOSE_CONTRACT
     market_overlay_snapshot["actor_context"] = actor_context
     prediction_payload["market_overlay_snapshot"] = market_overlay_snapshot
     prediction_payload["mystical_feature_payload"]["actor_context"] = actor_context

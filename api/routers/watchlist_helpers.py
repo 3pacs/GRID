@@ -176,13 +176,19 @@ def _ensure_watchlist_table() -> None:
                                      'etf', 'index', 'forex'
                                  )),
                 added_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                notes        TEXT
+                notes        TEXT,
+                weight       NUMERIC DEFAULT NULL
             )
         """))
         conn.execute(text("""
             CREATE INDEX IF NOT EXISTS idx_watchlist_ticker
             ON watchlist (ticker)
         """))
+        # Existing watchlists predate portfolio weights. Schema setup belongs
+        # to the lazy writer/init path, never to the portfolio read request.
+        conn.execute(text(
+            "ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS weight NUMERIC DEFAULT NULL"
+        ))
     log.debug("Watchlist table ensured")
 
 

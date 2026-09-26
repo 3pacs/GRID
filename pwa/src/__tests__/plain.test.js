@@ -50,6 +50,8 @@ describe('plainRegime', () => {
         expect(plainRegime('risk_off')).toEqual({
             sentence: 'Investors are nervous and playing it safe.',
             tone: 'down',
+            available: true,
+            confidencePct: null,
         });
         expect(plainRegime('DEFENSIVE')).toMatchObject({ tone: 'down' });
     });
@@ -58,6 +60,8 @@ describe('plainRegime', () => {
         expect(plainRegime('risk_on')).toEqual({
             sentence: 'Investors are feeling confident.',
             tone: 'up',
+            available: true,
+            confidencePct: null,
         });
         expect(plainRegime('expansion')).toMatchObject({ tone: 'up' });
     });
@@ -66,6 +70,8 @@ describe('plainRegime', () => {
         expect(plainRegime('neutral')).toEqual({
             sentence: 'The market is calm and mixed — no strong direction.',
             tone: 'flat',
+            available: true,
+            confidencePct: null,
         });
     });
 
@@ -73,6 +79,49 @@ describe('plainRegime', () => {
         expect(plainRegime('some_weird_state')).toEqual({
             sentence: 'The market read is "some weird state".',
             tone: 'flat',
+            available: true,
+            confidencePct: null,
+        });
+    });
+
+    // Regression: api/routers/regime.py:188-199 returns state="UNCALIBRATED",
+    // confidence=0.0 when no decision_journal row exists yet at all. That is
+    // not a real regime reading — plainRegime must say so plainly, with no
+    // numeric confidence, instead of cleaning it up into
+    // `The market read is "UNCALIBRATED".` as if it were a real label.
+    it('treats UNCALIBRATED as "no reading yet", not a real regime label', () => {
+        const r = plainRegime('UNCALIBRATED', 0.0);
+        expect(r.available).toBe(false);
+        expect(r.confidencePct).toBeNull();
+        expect(r.sentence).not.toMatch(/UNCALIBRATED/i);
+        expect(r.sentence).toMatch(/isn't ready yet|no regime reading/i);
+    });
+
+    it('treats a null/missing state the same as UNCALIBRATED', () => {
+        expect(plainRegime(null).available).toBe(false);
+        expect(plainRegime(undefined).available).toBe(false);
+        expect(plainRegime('').available).toBe(false);
+        expect(plainRegime(null).confidencePct).toBeNull();
+    });
+
+    // Regression: a genuine reading can legitimately have confidence 0.0 (a
+    // real regime the model just isn't confident about). That must still
+    // render as a real reading with 0% — never collapse a falsy-but-valid
+    // 0.0 into "unavailable" the way `confidence && ...` would.
+    it('renders a genuine reading with confidence exactly 0 as a real 0% reading, not unavailable', () => {
+        const r = plainRegime('risk_off', 0.0);
+        expect(r.available).toBe(true);
+        expect(r.confidencePct).toBe(0);
+        expect(r.sentence).toBe('Investors are nervous and playing it safe.');
+    });
+
+    it('carries a real confidence value through unchanged for a genuine reading', () => {
+        const r = plainRegime('risk_on', 0.62);
+        expect(r).toEqual({
+            sentence: 'Investors are feeling confident.',
+            tone: 'up',
+            available: true,
+            confidencePct: 62,
         });
     });
 });
