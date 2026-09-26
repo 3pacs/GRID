@@ -66,6 +66,24 @@ class Settings(BaseSettings):
     USDA_NASS_API_KEY: str = ""
     NOAA_TOKEN: str = ""
     EIA_API_KEY: str = ""
+    # Public v2 API base (documented at https://www.eia.gov/opendata/documentation.php).
+    # Not a secret -- the key itself is EIA_API_KEY above.
+    EIA_BASE_URL: str = "https://api.eia.gov/v2/"
+
+    # FINRA Daily Short Sale Volume (Reg SHO daily files) -- public CDN, no
+    # key required. Documented at
+    # https://www.finra.org/finra-data/browse-catalog/short-sale-volume-data/daily-short-sale-volume-files
+    # (naming convention "<MarketPrefix>shvol<YYYYMMDD>.txt", e.g.
+    # CNMSshvol20260917.txt). Not a secret -- just the CDN base path.
+    FINRA_SHORT_VOLUME_BASE_URL: str = "https://cdn.finra.org/equity/regsho/daily/"
+
+    # SEC requires a descriptive User-Agent with contact info on every
+    # request (https://www.sec.gov/data-research/sec-markets-data/fails-deliver-data
+    # and SEC's general fair-access guidance) -- generic/default UAs get
+    # throttled or blocked. Deliberately NO default value here: sec_ftd.py's
+    # SECFTDPuller fails closed with a clear error if this is unset rather
+    # than silently sending an unidentified request.
+    SEC_USER_AGENT: str = ""
     GDELT_API_KEY: str = ""
     WORLDNEWS_API_KEY: str = ""
     NEWSAPI_KEY: str = ""                # newsapi.org headline counts (scripts/load_wave2.py)
