@@ -11,6 +11,7 @@ puller happily fed it to PostgreSQL as obs_date:
 
 from __future__ import annotations
 
+import json
 import sys
 import types
 
@@ -134,6 +135,54 @@ def test_spy_daily_close_repull_is_not_frozen_by_earlier_value(engine_recording_
     assert len(marked) == 1
     assert marked[0]["sid"] == "YF:SPY:close"
     assert marked[0]["val"] == 685.0
+
+
+def test_bounded_completed_spy_close_writes_only_marked_requested_day(engine_recording_inserts):
+    """Today's scheduler start can fetch yesterday without other OHLCV writes."""
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    frame = pd.DataFrame(
+        {"Open": [680.0, 684.0, 687.0],
+         "Close": [681.0, 685.0, 688.0],
+         "Adj Close": [681.0, 685.0, 688.0]},
+        index=pd.DatetimeIndex([
+            pd.Timestamp("2026-09-21"),
+            pd.Timestamp("2026-09-22"),
+            pd.Timestamp("2026-09-23"),
+        ]),
+    )
+    conn.execute.return_value.fetchone.return_value = None
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", return_value=set()), \
+         patch.object(yfinance_pull, "_utc_now", return_value=datetime(
+             2026, 9, 23, 13, 30, tzinfo=timezone.utc)), \
+         patch.object(yfinance_pull.yf, "download", return_value=frame) as download:
+        result = yfinance_pull.YFinancePuller(engine).pull_ticker(
+            "SPY", start_date=date(2026, 9, 22), end_date=date(2026, 9, 23),
+            interval="1d", only_fields=frozenset({"close"}),
+        )
+
+    assert result["rows_inserted"] == 1
+    assert result["outcome"] == "inserted"
+    download.assert_called_once()
+    assert download.call_args.kwargs["start"] == "2026-09-22"
+    assert download.call_args.kwargs["end"] == "2026-09-23"
+    assert download.call_args.kwargs["auto_adjust"] is False
+    inserted = [call.args[1] for call in conn.execute.call_args_list
+                if "INSERT INTO raw_series" in str(call.args[0])]
+    assert len(inserted) == 1
+    assert inserted[0]["sid"] == "YF:SPY:close"
+    assert inserted[0]["od"] == date(2026, 9, 22)
+    assert inserted[0]["val"] == 685.0
+    assert json.loads(inserted[0]["payload"]) == {
+        "price_contract_version": "spy_close_v1",
+        "capture_policy": "post_utc_day_end_v1",
+        "price_basis": "YF:SPY:close",
+        "interval": "1d",
+        "obs_date": "2026-09-22",
+        "provider_certified_final": False,
+    }
 
 
 def test_duplicate_columns_dont_iterate_column_names(engine_recording_inserts):

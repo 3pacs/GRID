@@ -25,7 +25,7 @@ class _Result:
 class _Connection:
     def __init__(self):
         now = datetime.now(timezone.utc)
-        self.core = [("congressional", "A", "SELL", now, None, {"amount": "$1K"})]
+        self.core = [("congressional", "A", "SELL", now, None, {"amount_range": "$1K"})]
         self.convergence = [
             ("congressional", "A", "SELL", now, None),
             ("insider", "B", "SELL", now, 0.8),
@@ -67,13 +67,18 @@ def test_edge_reads_persisted_signal_types_and_marks_unscored_convergence(monkey
     assert payload["congressional"][0]["action"] == "SELL"
     assert payload["congressional"][0]["trust_score"] is None
     assert payload["convergence"] == {
-        "direction": None,
+        "direction": "bearish",
+        "direction_basis": "inferred_from_signal_types",
         "signal_type": "SELL",
         "source_count": 3,
-        "confidence": 0.63,
+        "non_null_trust_score_count": 2,
+        "confidence": None,
+        "confidence_basis": "unverified_score_provenance",
+        "persisted_trust_mean": 0.7,
+        "persisted_trust_basis": "mean_non_null_persisted_trust_scores",
         "status": "detected",
     }
-    assert "independent sources SELL" in payload["edge_summary"]
+    assert "independent sources bearish" in payload["edge_summary"]
     assert payload["availability"]["lever_pullers"]["status"] == "available"
     assert payload["availability"]["actor_context"]["status"] == "available"
 

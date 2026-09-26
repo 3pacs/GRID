@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from math import isfinite
 
 from fastapi import APIRouter, Depends
 from loguru import logger as log
@@ -12,9 +13,7 @@ from sqlalchemy import text
 from api.auth import require_auth
 from api.dependencies import get_db_engine
 from api.routers.watchlist_helpers import (
-    _cache_price_to_db,
     _fetch_live_price,
-    _init_table,
     _resolve_feature_names,
 )
 
@@ -40,8 +39,8 @@ def _round_or_none(value, digits: int = 2) -> float | None:
         return None
 
 
-def _edge_metadata(value) -> dict:
-    """Decode stored JSON metadata without inventing a payload on failure."""
+def _edge_signal_value(value) -> dict:
+    """Decode the stored signal_value object without inventing payload fields."""
     if isinstance(value, dict):
         return value
     if isinstance(value, str):
@@ -77,7 +76,8 @@ def _edge_unavailable_response(ticker: str) -> dict:
         "congressional": [], "insider": [], "dark_pool": None, "whale_flow": [],
         "prediction_markets": [], "smart_money": [], "lever_pullers": [], "leads": [],
         "convergence": {"direction": None, "signal_type": None, "source_count": 0,
-                        "confidence": None, "status": "unavailable", "reason": "signal_sources_unavailable"},
+                        "confidence": None, "persisted_trust_mean": None,
+                        "status": "unavailable", "reason": "signal_sources_unavailable"},
         "edge_summary": "Intelligence data is currently unavailable.",
     }
 
@@ -113,9 +113,8 @@ def get_ticker_overview(
         dict with keys: overview, key_levels, sentiment, generated_at,
         sector_path (for the capital-flow mini-chart).
     """
-    from datetime import datetime, date
+    from datetime import datetime
 
-    _init_table()
     engine = get_db_engine()
     ticker_upper = ticker.strip().upper()
 
@@ -139,13 +138,15 @@ def get_ticker_overview(
             if price_row:
                 price_info = {"price": float(price_row[0]), "date": str(price_row[1]), "source": "grid"}
         except Exception as exc:
+            # A failed SELECT aborts PostgreSQL's current transaction. Clear it
+            # before independent options/regime/features reads on this connection.
+            conn.rollback()
             _log_query_failure(f"Overview price query for {ticker_upper}", exc)
 
         if not price_info:
             live = _fetch_live_price(ticker_upper)
             if live:
                 price_info = {"price": live["price"], "pct_1d": live.get("pct_1d"), "source": "live"}
-                _cache_price_to_db(engine, ticker_upper, live["price"], date.today())
 
         # Options (latest)
         try:
@@ -167,6 +168,7 @@ def get_ticker_overview(
                     "total_oi": opt_row[6],
                 }
         except Exception as exc:
+            conn.rollback()
             _log_query_failure(f"Overview options query for {ticker_upper}", exc)
 
         # Regime
@@ -182,6 +184,7 @@ def get_ticker_overview(
                     "posture": regime_row[2],
                 }
         except Exception as exc:
+            conn.rollback()
             _log_query_failure("Overview regime query", exc)
 
         # Related features (recent values for context)
@@ -218,6 +221,7 @@ def get_ticker_overview(
                 for r in feat_rows
             ]
         except Exception as exc:
+            conn.rollback()
             _log_query_failure(f"Overview related-features query for {ticker_upper}", exc)
 
     # ── Sector path (for capital-flow mini-chart) ────────────────
@@ -453,17 +457,16 @@ def get_ticker_quote(
 ) -> dict:
     """Fast, LLM-free price/options snapshot for a single ticker.
 
-    Powers the stepdad.finance ticker_pulse widget. Pure DB reads + rule-based
+    Powers the stepdad.finance ticker_pulse widget. DB reads + rule-based
     sentiment so the home page populates instantly (the /overview narrative is
-    far too slow for a tile). Prefers the cached GRID price; only falls back to
-    a live fetch when nothing is stored.
+    far too slow for a tile). SPY prefers a recent, timestamped intraday
+    candle; other tickers use the cached daily price.
 
     Returns: ticker, price, change_pct, put_call_ratio, max_pain, iv_atm,
     sentiment, source, as_of, stale (as_of more than 3 calendar days old).
     """
     from datetime import date
 
-    _init_table()
     engine = get_db_engine()
     ticker_upper = ticker.strip().upper()
     feature_names = _resolve_feature_names(ticker_upper)
@@ -472,7 +475,10 @@ def get_ticker_quote(
     change_pct: float | None = None
     as_of_date: date | None = None
     source = "grid"
+    price_bar_end_at: str | None = None
+    price_tier = "daily"
     put_call_ratio = max_pain = iv_atm = None
+    daily_rows = []
 
     with engine.connect() as conn:
         try:
@@ -498,6 +504,7 @@ def get_ticker_quote(
                 "WHERE rs.feature_id = (SELECT feature_id FROM winner) "
                 "ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 2"
             ), {"names": feature_names}).fetchall()
+            daily_rows = rows
             if rows:
                 price = float(rows[0][0])
                 as_of_date = rows[0][1]
@@ -506,6 +513,7 @@ def get_ticker_quote(
                     if prev_close:
                         change_pct = round((price - prev_close) / prev_close, 5)
         except Exception as exc:
+            conn.rollback()
             # A dead price query is why the ticker_pulse card silently fell
             # back to a live fetch for two months. At debug level, in
             # production, nothing recorded that it had happened at all.
@@ -520,7 +528,45 @@ def get_ticker_quote(
             if opt:
                 put_call_ratio, max_pain, iv_atm = opt[0], opt[1], opt[2]
         except Exception as exc:
+            conn.rollback()
             _log_query_failure(f"Quote options query for {ticker_upper}", exc)
+
+        if ticker_upper == "SPY":
+            try:
+                candle = conn.execute(text(
+                    "SELECT close, ts FROM realtime_candles "
+                    "WHERE symbol = 'SPY' AND interval = '5m' "
+                    "AND source = 'yahoo' "
+                    "AND ts >= now() - INTERVAL '40 minutes' "
+                    "ORDER BY ts DESC LIMIT 1"
+                )).fetchone()
+                if candle and candle[0] is not None and candle[1] is not None:
+                    bar_end = candle[1] + timedelta(minutes=5)
+                    if bar_end.tzinfo is not None:
+                        bar_end = bar_end.astimezone(timezone.utc)
+                        age = datetime.now(timezone.utc) - bar_end
+                        candidate = float(candle[0])
+                        if (timedelta(0) <= age <= timedelta(minutes=30)
+                                and isfinite(candidate) and candidate > 0):
+                            price = candidate
+                            as_of_date = bar_end.date()
+                            price_bar_end_at = bar_end.isoformat()
+                            price_tier = "intraday_delayed"
+                            source = "yahoo_intraday"
+                            # Compare with the preceding completed session,
+                            # not another vintage of today's daily bar.
+                            reference = next(
+                                (float(row[0]) for row in daily_rows
+                                 if row[0] is not None and row[1] < as_of_date),
+                                None,
+                            )
+                            change_pct = (
+                                round((price - reference) / reference, 5)
+                                if reference and isfinite(reference) else None
+                            )
+            except Exception as exc:  # noqa: BLE001 - optional quote table must not break daily fallback
+                conn.rollback()
+                _log_query_failure("Quote SPY intraday query", exc)
 
     # Live fallback only when nothing is stored (kept off the hot path).
     if price is None:
@@ -530,9 +576,9 @@ def get_ticker_quote(
                 price = live.get("price")
                 change_pct = live.get("pct_1d")
                 source = "live"
+                price_tier = "live_fallback"
                 if price is not None:
                     as_of_date = date.today()
-                    _cache_price_to_db(engine, ticker_upper, price, as_of_date)
         except Exception as exc:
             # Not a query: an outbound HTTP fetch. Always operational.
             log.warning(
@@ -562,6 +608,8 @@ def get_ticker_quote(
         "iv_atm": iv_atm,
         "sentiment": sentiment,
         "source": source,
+        "price_tier": price_tier,
+        "price_bar_end_at": price_bar_end_at,
         "as_of": str(as_of_date) if as_of_date is not None else None,
         "stale": stale,
     }
@@ -602,52 +650,47 @@ def get_ticker_edge(
         with engine.connect() as conn:
             core_rows = conn.execute(text("""
                 SELECT source_type, source_id, signal_type, signal_date,
-                       trust_score, metadata
+                       trust_score, signal_value
                 FROM signal_sources
                 WHERE ticker = :t
                   AND source_type IN ('congressional', 'insider', 'darkpool')
                   AND signal_date >= NOW() - INTERVAL '45 days'
                 ORDER BY signal_date DESC
             """), {"t": ticker_upper}).fetchall()
-            for source_type, source_id, signal_type, signal_date, trust_score, metadata in core_rows:
-                meta = _edge_metadata(metadata)
+            for source_type, source_id, signal_type, signal_date, trust_score, signal_value in core_rows:
+                meta = _edge_signal_value(signal_value)
                 signal = str(signal_type) if signal_type else "UNAVAILABLE"
                 if source_type == "congressional" and _edge_within_days(signal_date, 45):
                     congressional.append({
                         "member": str(source_id), "action": signal,
-                        "amount": meta.get("amount", "N/A"), "date": str(signal_date),
+                        "amount": meta.get("amount_range", meta.get("amount", "N/A")), "date": str(signal_date),
                         "committee": meta.get("committee", "N/A"),
                         "trust_score": _round_or_none(trust_score),
                     })
                 elif source_type == "insider" and _edge_within_days(signal_date, 30):
                     insider.append({
-                        "name": str(source_id), "title": meta.get("title", ""),
+                        "name": str(source_id), "title": meta.get("insider_title", meta.get("title", "")),
                         "action": signal, "shares": meta.get("shares"),
                         "value": meta.get("value"), "date": str(signal_date),
                         "cluster": meta.get("cluster", False),
                     })
                 elif source_type == "darkpool" and _edge_within_days(signal_date, 7) and dark_pool is None:
                     dark_pool = {
-                        "volume_vs_avg": meta.get("volume_vs_avg"),
+                        "volume_vs_avg": meta.get("spike_ratio", meta.get("volume_vs_avg")),
                         "signal": "accumulation" if signal == "BUY" else "distribution" if signal == "SELL" else "unavailable",
                         "date": str(signal_date),
                     }
 
             lookback = date.today() - timedelta(days=14)
             whale_rows = conn.execute(text("""
-                SELECT source_id, signal_type, signal_date, metadata
+                SELECT source_id, signal_type, signal_date, signal_value
                 FROM signal_sources
                 WHERE ticker = :t AND source_type = 'scanner'
                   AND signal_date >= :lb
                 ORDER BY signal_date DESC LIMIT 10
             """), {"t": ticker_upper, "lb": lookback}).fetchall()
             for r in whale_rows:
-                meta = r[3] or {}
-                if isinstance(meta, str):
-                    try:
-                            meta = json.loads(meta)
-                    except Exception:
-                        meta = {}
+                meta = _edge_signal_value(r[3])
                 whale_flow.append({
                     "strike": meta.get("strike"),
                     "expiry": meta.get("expiry", ""),
@@ -656,19 +699,14 @@ def get_ticker_edge(
                     "date": str(r[2]),
                 })
             social_rows = conn.execute(text("""
-                SELECT source_id, signal_type, signal_date, trust_score, metadata
+                SELECT source_id, signal_type, signal_date, trust_score, signal_value
                 FROM signal_sources
                 WHERE ticker = :t AND source_type = 'social'
                   AND signal_date >= :lb
                 ORDER BY signal_date DESC LIMIT 10
             """), {"t": ticker_upper, "lb": lookback}).fetchall()
             for r in social_rows:
-                meta = r[4] or {}
-                if isinstance(meta, str):
-                    try:
-                            meta = json.loads(meta)
-                    except Exception:
-                        meta = {}
+                meta = _edge_signal_value(r[4])
                 smart_money.append({
                     "source": meta.get("platform", "unknown"),
                     "user": str(r[0]),
@@ -676,19 +714,14 @@ def get_ticker_edge(
                     "trust_score": _round_or_none(r[3]),
                 })
             pred_rows = conn.execute(text("""
-                SELECT source_id, signal_date, metadata
+                SELECT source_id, signal_date, signal_value
                 FROM signal_sources
                 WHERE ticker = :t AND source_type IN ('prediction', 'polymarket')
                   AND signal_date >= :lb
                 ORDER BY signal_date DESC LIMIT 5
             """), {"t": ticker_upper, "lb": lookback}).fetchall()
             for r in pred_rows:
-                meta = r[2] or {}
-                if isinstance(meta, str):
-                    try:
-                            meta = json.loads(meta)
-                    except Exception:
-                        meta = {}
+                meta = _edge_signal_value(r[2])
                 prediction_markets.append({
                     "market": meta.get("market", str(r[0])),
                     "probability": meta.get("probability"),
@@ -755,21 +788,36 @@ def get_ticker_edge(
     # 6. Convergence detection, equivalent to trust_scorer.detect_convergence
     # without its schema initializer.
     convergence: dict = {"direction": None, "signal_type": None, "source_count": 0,
-                         "confidence": None, "status": "none"}
-    by_direction: dict[str, dict[str, float]] = {"BUY": {}, "SELL": {}}
+                         "non_null_trust_score_count": 0, "confidence": None,
+                         "confidence_basis": "unverified_score_provenance",
+                         "persisted_trust_mean": None, "direction_basis": None,
+                         "status": "none"}
+    by_direction: dict[str, dict[str, float | None]] = {"BUY": {}, "SELL": {}}
     for source_type, _source_id, signal_type, _signal_date, trust_score in convergence_rows:
         if signal_type in by_direction and source_type not in by_direction[signal_type]:
-            by_direction[signal_type][source_type] = float(trust_score) if trust_score is not None else 0.5
+            # A source can establish structural convergence with NULL trust.
+            # This aggregates persisted non-NULL values only; the current table
+            # default means a stored 0.5 cannot prove scorer provenance.
+            by_direction[signal_type][source_type] = float(trust_score) if trust_score is not None else None
     detected = next(
         ((signal_type, scores) for signal_type, scores in by_direction.items() if len(scores) >= 3),
         None,
     )
     if detected:
         signal_type, scores = detected
+        persisted_scores = [score for score in scores.values() if score is not None]
         convergence = {
-            "direction": None, "signal_type": signal_type,
+            "direction": "bullish" if signal_type == "BUY" else "bearish",
+            "direction_basis": "inferred_from_signal_types",
+            "signal_type": signal_type,
             "source_count": len(scores),
-            "confidence": _round_or_none(sum(scores.values()) / len(scores)),
+            "non_null_trust_score_count": len(persisted_scores),
+            # This legacy key cannot honestly carry a probability: the table's
+            # 0.5 DEFAULT is indistinguishable from a scorer-produced 0.5.
+            "confidence": None,
+            "confidence_basis": "unverified_score_provenance",
+            "persisted_trust_mean": _round_or_none(sum(persisted_scores) / len(persisted_scores)) if persisted_scores else None,
+            "persisted_trust_basis": "mean_non_null_persisted_trust_scores" if persisted_scores else "unscored",
             "status": "detected",
         }
 

@@ -148,6 +148,8 @@ class YFinancePuller(BasePuller):
         start_date: str | date,
         end_date: str | date | None = None,
         interval: str = "1d",
+        *,
+        only_fields: frozenset[str] | None = None,
     ) -> dict[str, Any]:
         """Download OHLCV data for a single ticker and insert into raw_series.
 
@@ -159,6 +161,9 @@ class YFinancePuller(BasePuller):
             start_date: Earliest date to download.
             end_date: Latest date (default: today).
             interval: Data frequency ('1d', '1wk', '1mo').
+            only_fields: Optional field keys to persist from the bounded
+                download. The scheduled completed-SPY-close request uses
+                ``frozenset({'close'})`` so it cannot write other OHLCV fields.
 
         Returns:
             dict: Result with keys ``ticker``, ``rows_inserted``, ``status``,
@@ -244,9 +249,12 @@ class YFinancePuller(BasePuller):
                 if end_date
                 else None
             )
+            requested_start_bound = pd.Timestamp(start_date).date()
 
             with self.engine.begin() as conn:
                 for col_name, field_key in _FIELD_MAP.items():
+                    if only_fields is not None and field_key not in only_fields:
+                        continue
                     if col_name not in df.columns:
                         continue
 
@@ -275,7 +283,7 @@ class YFinancePuller(BasePuller):
                     existing_dates = self._get_existing_dates(
                         series_id,
                         conn,
-                        start_date=pd.Timestamp(start_date).date(),
+                        start_date=requested_start_bound,
                         end_date=existing_end_bound,
                     )
 
@@ -314,6 +322,15 @@ class YFinancePuller(BasePuller):
                             continue
 
                         obs_date_val = dt_parsed.date()
+                        # The close-only scheduled request is for exactly one
+                        # completed session. Do not trust a provider response
+                        # to obey the requested one-day bounds.
+                        if only_fields is not None and (
+                            obs_date_val < requested_start_bound
+                            or (existing_end_bound is not None
+                                and obs_date_val > existing_end_bound)
+                        ):
+                            continue
                         if series_id == SPY_CLOSE_SERIES and interval == "1d":
                             if not math.isfinite(float_val) or float_val <= 0:
                                 continue
