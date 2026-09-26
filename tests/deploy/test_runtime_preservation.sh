@@ -7,12 +7,13 @@ box="$(mktemp -d)"
 trap 'kill "${scheduler_pid:-}" "${activated_pid:-}" "${realtime_pid:-}" "${deleted_pid:-}" 2>/dev/null || true; rm -rf "$box"' EXIT
 live="$box/grid_release"
 root="${live}.releases"
-mkdir -p "$box/cgroup/scheduler" "$box/cgroup/realtime/workers"
+mkdir -p "$box/cgroup/scheduler" "$box/cgroup/realtime/workers" "$box/proc"
 touch "$box/cgroup/cgroup.controllers" "$box/cgroup/realtime/cgroup.procs"
-# Only the immutable sysfs root literal is substituted in this test copy.
-# Membership is fixture-backed; process cwd inspection still uses real /proc.
+# Only cgroup membership roots are substituted in this test copy. Process cwd
+# and start-time identity inspection still use real /proc.
 swap="$box/swap.sh"
-sed "s|^CGROUP_ROOT=/sys/fs/cgroup$|CGROUP_ROOT=$box/cgroup|" "$source_swap" > "$swap"
+sed -e "s|^CGROUP_ROOT=/sys/fs/cgroup$|CGROUP_ROOT=$box/cgroup|" \
+    -e "s|^PROC_CGROUP_ROOT=/proc$|PROC_CGROUP_ROOT=$box/proc|" "$source_swap" > "$swap"
 mkdir -p "$root/scheduler-old" "$root/recovery-old" "$root/current" "$box/bin" \
   "$root/realtime-old/subdir" "$root/realtime-restart"
 printf 'retained\n' > "$root/realtime-old/subdir/module.txt"
@@ -36,12 +37,14 @@ cat > "$box/bin/systemctl" <<'SH'
 case "$*" in
   'list-unit-files --no-legend --no-pager grid-*.service'|'list-units --all --plain --no-legend --no-pager grid-*.service')
     [ "${TEST_INVENTORY_FAIL:-0}" != 1 ] || exit 1
-    printf '%s\n' grid-scheduler.service grid-realtime.service grid-worker@.service ;;
-  'show --property=LoadState,MainPID,WorkingDirectory,ActiveState,ControlGroup -- grid-scheduler.service')
-    printf 'LoadState=loaded\nMainPID=%s\nWorkingDirectory=%s\nActiveState=active\nControlGroup=/scheduler\n' "$TEST_SCHEDULER_PID" "$TEST_SCHEDULER_WORKDIR" ;;
-  'show --property=LoadState,MainPID,WorkingDirectory,ActiveState,ControlGroup -- grid-realtime.service')
+    printf '%s\n' grid-scheduler.service grid-realtime.service grid-db.service grid-worker@.service ;;
+  'show --property=LoadState,MainPID,WorkingDirectory,ActiveState,ControlGroup,SubState,Type,RemainAfterExit,ExecMainPID -- grid-scheduler.service')
+    printf 'LoadState=loaded\nMainPID=%s\nWorkingDirectory=%s\nActiveState=active\nControlGroup=/scheduler\nSubState=running\nType=simple\nRemainAfterExit=no\nExecMainPID=%s\n' "$TEST_SCHEDULER_PID" "$TEST_SCHEDULER_WORKDIR" "$TEST_SCHEDULER_PID" ;;
+  'show --property=LoadState,MainPID,WorkingDirectory,ActiveState,ControlGroup,SubState,Type,RemainAfterExit,ExecMainPID -- grid-realtime.service')
     [ "${TEST_SHOW_FAIL:-0}" != 1 ] || exit 1
-    printf 'LoadState=loaded\nMainPID=%s\nWorkingDirectory=%s\nActiveState=%s\nControlGroup=%s\n' "$TEST_REALTIME_PID" "$TEST_REALTIME_WORKDIR" "$TEST_REALTIME_STATE" "$TEST_REALTIME_CGROUP" ;;
+    printf 'LoadState=loaded\nMainPID=%s\nWorkingDirectory=%s\nActiveState=%s\nControlGroup=%s\nSubState=running\nType=simple\nRemainAfterExit=no\nExecMainPID=%s\n' "$TEST_REALTIME_PID" "$TEST_REALTIME_WORKDIR" "$TEST_REALTIME_STATE" "$TEST_REALTIME_CGROUP" "${TEST_REALTIME_EXEC_PID:-$TEST_REALTIME_PID}" ;;
+  'show --property=LoadState,MainPID,WorkingDirectory,ActiveState,ControlGroup,SubState,Type,RemainAfterExit,ExecMainPID -- grid-db.service')
+    printf 'LoadState=loaded\nMainPID=0\nWorkingDirectory=\nActiveState=active\nControlGroup=\nSubState=%s\nType=%s\nRemainAfterExit=%s\nExecMainPID=0\n' "${TEST_DB_SUBSTATE-exited}" "${TEST_DB_TYPE-oneshot}" "${TEST_DB_REMAIN-yes}" ;;
   'show -p MainPID --value grid-scheduler') printf '%s\n' "$TEST_SCHEDULER_PID" ;;
   'show -p WorkingDirectory --value grid-scheduler') printf '%s\n' "$TEST_SCHEDULER_WORKDIR" ;;
   *) exit 1 ;;
@@ -68,6 +71,9 @@ chmod +x "$box/build"
 scheduler_pid=$!
 ( cd "$root/realtime-old/subdir" && exec sleep 300 ) &
 realtime_pid=$!
+mkdir -p "$box/proc/$scheduler_pid" "$box/proc/$realtime_pid"
+printf '0::/scheduler\n' > "$box/proc/$scheduler_pid/cgroup"
+printf '0::/realtime/workers\n' > "$box/proc/$realtime_pid/cgroup"
 printf '%s\n' "$scheduler_pid" > "$box/cgroup/scheduler/cgroup.procs"
 printf '%s\n' "$realtime_pid" > "$box/cgroup/realtime/workers/cgroup.procs"
 export TEST_SCHEDULER_PID="$scheduler_pid" TEST_SCHEDULER_WORKDIR="$root/scheduler-old"
@@ -117,7 +123,15 @@ git -C "$root/recovery-old" restore marker.txt
 TEST_SCHEDULER_WORKDIR="$live" fail_without_swap "$root/current" mutable-unit
 TEST_INVENTORY_FAIL=1 fail_without_swap "$root/current" failed-inventory
 TEST_SHOW_FAIL=1 fail_without_swap "$root/current" failed-show
-TEST_REALTIME_CGROUP= fail_without_swap "$root/current" no-active-cgroup
+TEST_REALTIME_PID=0 TEST_REALTIME_CGROUP= fail_without_swap "$root/current" no-active-cgroup
+TEST_DB_TYPE=simple fail_without_swap "$root/current" non-oneshot-active-empty
+TEST_DB_REMAIN=no fail_without_swap "$root/current" non-remaining-oneshot
+TEST_DB_SUBSTATE=running fail_without_swap "$root/current" running-oneshot-empty
+TEST_DB_TYPE= fail_without_swap "$root/current" missing-oneshot-type
+TEST_REALTIME_EXEC_PID=999999 fail_without_swap "$root/current" mismatched-exec-main-pid
+printf '1:cpu:/realtime/workers\n' > "$box/proc/$realtime_pid/cgroup"
+fail_without_swap "$root/current" unsupported-actual-cgroup
+printf '0::/realtime/workers\n' > "$box/proc/$realtime_pid/cgroup"
 TEST_REALTIME_CGROUP=/realtime/../scheduler fail_without_swap "$root/current" traversed-cgroup
 ln -s "$box/cgroup/realtime" "$box/cgroup/linked"
 TEST_REALTIME_CGROUP=/linked fail_without_swap "$root/current" linked-cgroup
@@ -144,6 +158,8 @@ test -L "$root/realtime-alias"
 mkdir "$box/deleted-cwd"
 ( cd "$box/deleted-cwd" && exec sleep 300 ) &
 deleted_pid=$!
+mkdir "$box/proc/$deleted_pid"
+printf '0::/realtime/workers\n' > "$box/proc/$deleted_pid/cgroup"
 for _ in {1..50}; do
   [ "$(readlink "/proc/$deleted_pid/cwd")" = "$box/deleted-cwd" ] && break
   sleep 0.02
@@ -174,6 +190,17 @@ TEST_REALTIME_PID=0 bash "$swap" "$live" next-3 "$box/build" next-3 > "$box/thir
 test "$(cat "/proc/$realtime_pid/cwd/module.txt")" = retained
 test -d "$root/realtime-restart"
 test ! -d "$root/next-1"
+
+# Production-shaped escaped MainPID: declared system cgroup is empty, actual
+# unified user scope contains the verified process. Preserve it without a
+# service-name exemption, while still inspecting the declared group.
+mkdir "$box/cgroup/escaped-user-scope"
+printf '%s\n' "$realtime_pid" > "$box/cgroup/escaped-user-scope/cgroup.procs"
+: > "$box/cgroup/realtime/workers/cgroup.procs"
+printf '0::/escaped-user-scope\n' > "$box/proc/$realtime_pid/cgroup"
+bash "$swap" "$live" escaped-main "$box/build" escaped-main > "$box/escaped.log" 2>&1
+test "$(cat "/proc/$realtime_pid/cwd/module.txt")" = retained
+test -d "$root/realtime-restart"
 
 # Inactive service has no process, but its symlink-resolved restart tree survives.
 kill "$realtime_pid"
