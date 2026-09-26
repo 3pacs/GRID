@@ -813,6 +813,17 @@ export default function Timeline({ onNavigate, selectedTicker = '' }) {
                 >CAUSAL{showCausalArrows ? ' ON' : ''}</button>
             </div>
 
+            {/* Honest state: causal arrows are on but nothing was generated —
+                say so instead of silently drawing an empty overlay. */}
+            {showCausalArrows && !loading && causalLinks.length === 0 && (
+                <div style={{
+                    fontSize: '10px', fontFamily: MONO, color: colors.textMuted,
+                    padding: '2px 4px 10px',
+                }}>
+                    No causal links generated for {ticker || 'this ticker'} in the last {period}d — causal-link detection has no scheduled writer.
+                </div>
+            )}
+
             {/* ── Filter checkboxes ── */}
             <div style={{
                 display: 'flex', flexWrap: 'wrap', gap: '8px',
