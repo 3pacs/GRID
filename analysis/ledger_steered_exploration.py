@@ -26,6 +26,26 @@ Flow (one run)
 4. :func:`ingest_forward_outcomes` (later, S10) appends final forward-log
    verdicts for holdout survivors from an input file.
 
+Identity, catalog and anchor (review of #663)
+---------------------------------------------
+* A trial's *scientific identity* is feature x target x horizon
+  (``feature=>TARGET|label|fwdH``), independent of class labels. The window
+  registry is keyed on it.
+* The catalog (families, features, classes, self_lag pairs) is frozen at
+  genesis by hash; an allocation with any other catalog is refused, so
+  classes cannot be relabelled to re-open a window.
+* A file ledger cannot be opened, created or appended without its external
+  anchor: a second append-only, hash-chained JSONL file that records the
+  ledger id and the ledger's (seq, head sha256) after every append. Loading
+  refuses a ledger that is shorter or longer than its anchor or whose lines
+  do not hash to the anchored heads, so truncation at a line boundary, an
+  edit of the last record and a restarted run counter are all refused.
+  Genesis refuses an existing anchor: one anchor pins one canonical ledger
+  id for good (``CANONICAL_LEDGER_ID`` for the real program), and a fresh
+  ledger file cannot reset ``k`` to 1 against it. Keep the anchor on a
+  separate append-only location from the ledger; a caller who deletes both
+  files can start over, which no file-level check can prevent.
+
 Allocation policy
 -----------------
 Each eligible family is a Beta-Bernoulli arm. A trial is a success when it was
@@ -54,6 +74,11 @@ at ``alpha_k`` under arbitrary dependence, so by the union bound the
 probability of *any* false discovery across every run the ledger will ever
 record is at most ``sum_k alpha_k < q``. FWER <= q implies FDR <= q. Holdout
 confirmation (Bonferroni over the run's selections) only removes selections.
+The bound is nominal: it assumes each null p-value is valid, and the
+block-permutation null is itself anti-conservative in small samples (about
+7% rejections at nominal 5% when the 8-block cap binds at n = 60, see
+``offline_research_proof.CAPPED_BLOCK_CALIBRATION``), so the realised
+cross-run error can exceed ``q`` by the same factor there.
 
 Why not LORD / SAFFRON / alpha-investing or a cumulative global BH: the
 p-values here are dependent inside a run (every feature of a family shares
@@ -70,25 +95,31 @@ a larger Holm level per trial).
 
 Windows (single-use holdout registry)
 -------------------------------------
-Adaptive allocation is only honest if a re-tested family's null p-values are
+Adaptive allocation is only honest if a re-tested trial's null p-value is
 still valid given the outcomes that steered it there. Every run declares one
 window ``[start, end)`` (discovery ``[start, split)`` + holdout
-``[split, end)``) on *label* time, and the ledger refuses to allocate a family
-whose earlier runs touched any part of it. A holdout is therefore never
-re-tested, and a family is never re-tested on outcomes it has already seen:
-once a family has spent the history, it can only be re-tested on new data
-(e.g. S10's forward log). Other families can still use the same history. The
-registry is per family; a caveat stays: families that share a target share
-its labels, so their conditional validity rests on the permutation null
-being valid given the target sequence.
+``[split, end)``) on *label* time. Every declared trial touches that window
+for its scientific identity, and a forward verdict touches
+``[end of the trial's run, evaluated_through]`` for its identity. The
+allocator never declares an identity on a window that overlaps anything the
+identity touched before. A holdout is therefore never re-tested, forward
+data that produced a verdict is never re-used by a later run, and no
+identity is re-tested on outcomes it has already seen. A family stays
+eligible while it has fresh identities. Caveat: identities that share a
+target share its labels, so their conditional validity rests on the
+permutation null being valid given the target sequence.
 
 Forward-log input (S10 interface)
 ---------------------------------
 :func:`ingest_forward_outcomes` reads a JSONL file whose lines carry
-:data:`FORWARD_OUTCOME_FIELDS`. Only final verdicts are accepted (``pass`` or
-``fail``, after the pre-registered stop rule), only for ledger trials that
-survived their holdout and whose ``candidate_sha256`` matches, and at most
-one per trial. The file's sha256 is recorded with each verdict.
+:data:`FORWARD_OUTCOME_FIELDS`. Only final verdicts are accepted (``pass``,
+``fail`` or ``inconclusive``, after the pre-registered stop rule), only for
+ledger trials that survived their holdout and whose ``candidate_sha256``
+matches, and at most one per trial. ``inconclusive`` updates no score but
+still touches the forward window. A verdict whose forward window overlaps a
+window a later run already declared for the same identity is recorded with
+``scored: false`` (that data was used twice; neither use may count twice).
+The file's sha256 is recorded with each verdict.
 """
 
 from __future__ import annotations
@@ -98,6 +129,7 @@ import json
 import math
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -122,19 +154,22 @@ KEY_SEPARATOR = "::"
 SPENDING = "alpha_k = q / (k * (k + 1)), k = 1, 2, ... (sums to q * k / (k + 1) < q)"
 WITHIN_RUN = "holm"
 WINDOW_RULE = (
-    "a family may not be allocated a run whose label window [start, end) overlaps "
-    "any window an earlier run of that family touched (single-use holdout, fresh "
-    "discovery)"
+    "a trial identity (feature x target x horizon) may not be declared on a run "
+    "whose label window [start, end) overlaps any window it touched before: earlier "
+    "runs' [start, end) and forward verdicts' [run end, evaluated_through]"
 )
+CANONICAL_LEDGER_ID = "grid-hypothesis-loop"
+IDENTITY_SEPARATOR = "=>"
 MAX_Q = 0.10
 PERMS_CAP = 20000
 STATUSES = ("tested", "untestable", SELF_LAG)
 HOLDOUT_OUTCOMES = ("survived", "failed", "not_selected")
-FORWARD_OUTCOMES = ("pass", "fail")
+FORWARD_OUTCOMES = ("pass", "fail", "inconclusive")
+SCORED_FORWARD = {"pass": True, "fail": False}  # inconclusive: no score update
 FORWARD_OUTCOME_FIELDS = (
     "trial_id",  # the ledger trial (digest([run_id, family, feature]))
     "candidate_sha256",  # the frozen candidate the forward log followed
-    "outcome",  # final verdict after the pre-registered stop rule: pass | fail
+    "outcome",  # final verdict after the stop rule: pass | fail | inconclusive
     "n",  # forward observations evaluated
     "evaluated_through",  # tz-aware ISO timestamp of the last forward outcome
     "prereg_sha256",  # the forward log's pre-registration hash
@@ -177,6 +212,11 @@ def sha256_bytes(data: bytes) -> str:
 def trial_id(run_id: str, family: str, feature: str) -> str:
     """Same id the contract's ``discover`` gives the trial."""
     return digest([run_id, family, feature])
+
+
+def identity(family: str, feature: str) -> str:
+    """Scientific identity: feature x target x horizon, independent of class labels."""
+    return f"{feature}{IDENTITY_SEPARATOR}{family}"
 
 
 # --- catalog ------------------------------------------------------------------------
@@ -282,37 +322,81 @@ def catalog_from_specs(features, targets, horizons) -> Catalog:
 # --- ledger -------------------------------------------------------------------------
 
 
+class Anchor:
+    """External append-only, hash-chained anchor of one ledger's (seq, head).
+
+    One canonical JSON record per line: ``seq``, ``prev_sha256``, the pinned
+    ``ledger_id`` and the ledger's ``ledger_seq`` / ``ledger_head_sha256``
+    after each append. The first record pins the ledger id for good.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+
+    def lines(self) -> list[bytes]:
+        if not self.path.exists():
+            return []
+        data = self.path.read_bytes()
+        if not data:
+            return []
+        if not data.endswith(b"\n"):
+            raise ValueError("anchor file is truncated (no trailing newline)")
+        return data[:-1].split(b"\n")
+
+    def records(self) -> list[dict]:
+        records, previous = [], None
+        for seq, line in enumerate(self.lines()):
+            record = json.loads(line)
+            if canonical(record) != line:
+                raise ValueError(f"anchor record {seq}: not canonical JSON")
+            if record.get("seq") != seq or record.get("prev_sha256") != previous:
+                raise ValueError(f"anchor record {seq}: hash chain broken")
+            if records and record.get("ledger_id") != records[0]["ledger_id"]:
+                raise ValueError(f"anchor record {seq}: a second ledger id")
+            records.append(record)
+            previous = sha256_bytes(line)
+        return records
+
+    def append(self, ledger_id: str, ledger_seq: int, ledger_head: str) -> None:
+        lines = self.lines()
+        self.records()  # refuses a broken anchor
+        record = {
+            "kind": "anchor",
+            "seq": len(lines),
+            "prev_sha256": sha256_bytes(lines[-1]) if lines else None,
+            "ledger_id": ledger_id,
+            "ledger_seq": ledger_seq,
+            "ledger_head_sha256": ledger_head,
+        }
+        with self.path.open("ab") as stream:
+            stream.write(canonical(record) + b"\n")
+
+
 class Ledger:
     """Append-only, hash-chained JSONL ledger (one canonical JSON record per line).
 
     Every record carries ``seq`` and ``prev_sha256`` (the sha256 of the
-    previous line's bytes; ``None`` for the genesis record). The chain is
-    re-verified on load and the file head is re-checked before every append,
-    so an edited, reordered, truncated or concurrently appended file is
-    refused. The chain cannot see an edit of the *last* record on its own:
-    pass ``expected_head`` (the head recorded elsewhere, e.g. in a run's
-    ``summary.json``) to anchor it. ``path=None`` keeps the ledger in memory
-    (simulations only).
+    previous line's bytes; ``None`` for the genesis record). The chain alone
+    detects an edited, reordered or inserted *interior* record, but not a
+    file truncated at a line boundary, an edit of the last record or a fresh
+    file restarting the run counter. A file ledger is therefore opened only
+    together with its :class:`Anchor`, which must match it line for line (see
+    the module docstring). Both files are byte-checked before every append.
+    ``path=None`` keeps a ledger in memory, without an anchor (simulations
+    only; it cannot be written to disk).
     """
 
-    def __init__(
-        self,
-        path: str | Path | None = None,
-        *,
-        expected_head: str | None = None,
-        _lines=None,
-    ) -> None:
-        self.path = Path(path) if path is not None else None
-        if _lines is None:
-            if self.path is None:
-                raise ValueError("an in-memory ledger is made with Ledger.create")
-            _lines = self._read_lines()
-        self._lines: list[bytes] = list(_lines)
+    def __init__(self, path: str | Path, *, anchor: str | Path) -> None:
+        if path is None or anchor is None:
+            raise ValueError("a file ledger is opened only with its anchor")
+        self.path = Path(path)
+        self.anchor = Anchor(anchor)
+        self._init(self._read_lines())
+        self._check_anchor()
+
+    def _init(self, lines: list[bytes]) -> None:
+        self._lines: list[bytes] = list(lines)
         self._records: list[dict] = verify_chain(self._lines)
-        if expected_head is not None and expected_head not in {
-            sha256_bytes(line) for line in self._lines
-        }:
-            raise ValueError("ledger does not contain the expected head")
 
     # --- construction ---------------------------------------------------------------
 
@@ -321,12 +405,28 @@ class Ledger:
         cls,
         path: str | Path | None,
         *,
-        ledger_id: str,
+        catalog: Catalog,
+        anchor: str | Path | None = None,
+        ledger_id: str = CANONICAL_LEDGER_ID,
         q: float = MAX_Q,
         recorded_at: str | None = None,
     ) -> Ledger:
         if not ledger_id or not 0 < q <= MAX_Q:
             raise ValueError(f"ledger needs an id and 0 < q <= {MAX_Q}")
+        if (path is None) != (anchor is None):
+            raise ValueError("a file ledger needs an anchor; an in-memory one has none")
+        catalog.validate()
+        if anchor is not None:
+            pinned = Anchor(anchor).records()
+            if pinned:
+                if pinned[0]["ledger_id"] != ledger_id:
+                    raise ValueError(
+                        f"the anchor pins ledger {pinned[0]['ledger_id']!r}, not {ledger_id!r}"
+                    )
+                raise ValueError(
+                    f"ledger {ledger_id!r} already has an anchor: a new genesis would "
+                    "reset its run counter"
+                )
         genesis = {
             "kind": "genesis",
             "seq": 0,
@@ -337,20 +437,45 @@ class Ledger:
             "spending": SPENDING,
             "within_run": WITHIN_RUN,
             "window_rule": WINDOW_RULE,
+            "catalog": asdict(catalog),
+            "catalog_sha256": catalog.sha256(),
+            "storage": "memory" if path is None else "file+anchor",
             "promotion_allowed": False,
             "recorded_at": recorded_at or now_iso(),
         }
         line = canonical(genesis)
+        ledger = cls.__new__(cls)
+        ledger.path = None if path is None else Path(path)
+        ledger.anchor = None if anchor is None else Anchor(anchor)
         if path is not None:
             with Path(path).open("xb") as stream:  # a new ledger never overwrites one
                 stream.write(line + b"\n")
-        return cls(path, _lines=[line])
+            ledger.anchor.append(ledger_id, 0, sha256_bytes(line))
+        ledger._init([line])
+        return ledger
 
     def _read_lines(self) -> list[bytes]:
         data = self.path.read_bytes()
         if not data.endswith(b"\n"):
             raise ValueError("ledger file is truncated (no trailing newline)")
         return data[:-1].split(b"\n")
+
+    def _check_anchor(self) -> None:
+        anchored = self.anchor.records()
+        if not anchored:
+            raise ValueError("the anchor is empty: this ledger was never anchored")
+        if anchored[0]["ledger_id"] != self.genesis["ledger_id"]:
+            raise ValueError("the anchor pins a different ledger id")
+        if [a["ledger_seq"] for a in anchored] != list(range(len(anchored))):
+            raise ValueError("the anchor skips ledger records")
+        if len(anchored) != len(self._lines):
+            raise ValueError(
+                f"ledger has {len(self._lines)} records but its anchor has "
+                f"{len(anchored)}: truncated, extended or restarted"
+            )
+        for a in anchored:
+            if a["ledger_head_sha256"] != sha256_bytes(self._lines[a["ledger_seq"]]):
+                raise ValueError(f"ledger record {a['ledger_seq']} differs from its anchor")
 
     # --- chain ----------------------------------------------------------------------
 
@@ -370,19 +495,26 @@ class Ledger:
     def q(self) -> float:
         return self.genesis["q"]
 
+    @property
+    def catalog_sha256(self) -> str:
+        return self.genesis["catalog_sha256"]
+
     def line_sha(self, seq: int) -> str:
         return sha256_bytes(self._lines[seq])
 
     def verify(self, full: bool = False) -> None:
-        """The file still holds exactly this ledger's lines (``full``: re-walk the chain).
+        """Ledger and anchor files still match this ledger (``full``: re-walk the chain).
 
         The chain is verified on load, and ``_append`` only ever extends it
-        canonically, so the per-append check is a byte comparison.
+        canonically, so the per-append check is a byte comparison plus the
+        anchor match.
         """
         if full:
             verify_chain(self._lines)
-        if self.path is not None and self.path.read_bytes() != self._file_bytes():
-            raise ValueError("ledger file changed outside this ledger")
+        if self.path is not None:
+            if self.path.read_bytes() != self._file_bytes():
+                raise ValueError("ledger file changed outside this ledger")
+            self._check_anchor()
 
     def _file_bytes(self) -> bytes:
         return b"".join(line + b"\n" for line in self._lines)
@@ -397,6 +529,7 @@ class Ledger:
         if self.path is not None:
             with self.path.open("ab") as stream:
                 stream.write(line + b"\n")
+            self.anchor.append(self.genesis["ledger_id"], record["seq"], sha256_bytes(line))
         self._lines.append(line)
         self._records.append(json.loads(line))
         return self._records[-1], sha256_bytes(line)
@@ -426,13 +559,26 @@ class Ledger:
     def alpha_spent(self) -> float:
         return float(sum(a["alpha"] for a in self.allocations()))
 
-    def touched_windows(self) -> dict[str, list[tuple[str, str]]]:
-        """Label windows every family key has touched (allocated = touched)."""
-        out: dict[str, list[tuple[str, str]]] = {}
+    def touched_windows(self) -> dict[str, list[dict]]:
+        """Label windows each trial identity has touched.
+
+        Allocated = touched (``[start, end)``, abandoned runs included); a
+        forward verdict touches ``[run end, evaluated_through]`` (closed).
+        """
+        out: dict[str, list[dict]] = {}
         for allocation in self.allocations():
-            window = (allocation["windows"]["start"], allocation["windows"]["end"])
-            for key in sorted({t["family_key"] for t in allocation["trials"]}):
-                out.setdefault(key, []).append(window)
+            window = {
+                "start": allocation["windows"]["start"],
+                "end": allocation["windows"]["end"],
+                "closed": False,
+                "source": allocation["run_id"],
+            }
+            for t in allocation["trials"]:
+                out.setdefault(identity(t["family"], t["feature"]), []).append(window)
+        for verdict in self.of_kind("forward_outcome"):
+            out.setdefault(verdict["identity"], []).append(
+                {**verdict["forward_window"], "closed": True, "source": "forward"}
+            )
         return out
 
     def trial_results(self) -> list[dict]:
@@ -457,8 +603,9 @@ class Ledger:
                 trial["holdout_outcome"] == "survived",
             )
         for verdict in self.of_kind("forward_outcome"):
-            trial = by_id[verdict["trial_id"]]
-            tally(trial["family_key"], trial["feature"], verdict["outcome"] == "pass")
+            if verdict["scored"] and verdict["outcome"] in SCORED_FORWARD:
+                trial = by_id[verdict["trial_id"]]
+                tally(trial["family_key"], trial["feature"], SCORED_FORWARD[verdict["outcome"]])
         return {"families": families, "features": features}
 
 
@@ -510,8 +657,17 @@ class Policy:
             raise ValueError("invalid allocation policy")
 
 
-def overlaps(a: tuple[str, str], b: tuple[str, str]) -> bool:
-    return stamp(a[0]) < stamp(b[1]) and stamp(b[0]) < stamp(a[1])
+@lru_cache(maxsize=65536)
+def cached_stamp(value: str) -> datetime:
+    return stamp(value)
+
+
+def overlaps(window: tuple[str, str], touched: dict) -> bool:
+    """Does the half-open ``window`` overlap a touched window (closed if flagged)?"""
+    start, end = cached_stamp(window[0]), cached_stamp(window[1])
+    t_start, t_end = cached_stamp(touched["start"]), cached_stamp(touched["end"])
+    before_end = start <= t_end if touched.get("closed") else start < t_end
+    return before_end and t_start < end
 
 
 def validate_windows(windows: dict) -> dict:
@@ -591,6 +747,8 @@ def allocate(
     """
     ledger.verify()
     catalog.validate()
+    if catalog.sha256() != ledger.catalog_sha256:
+        raise ValueError("catalog differs from the one frozen at the ledger's genesis")
     policy.validate()
     windows = validate_windows(windows)
     if ledger.open_allocation() is not None:
@@ -604,16 +762,25 @@ def allocate(
     touched = ledger.touched_windows()
     history = ledger.outcomes()
     window = (windows["start"], windows["end"])
-    arms = {}
+    arms, fresh = {}, {}
     for key, arm in catalog.arms().items():
         stats = history["families"].get(key, {"successes": 0, "failures": 0})
         reason = arm.get("never")
-        if reason is None and any(overlaps(window, w) for w in touched.get(key, [])):
-            reason = "no fresh window: an earlier run of this family touched it"
+        fresh[key] = [
+            feature
+            for feature in arm["pool"]
+            if not any(
+                overlaps(window, w)
+                for w in touched.get(identity(arm["family"], feature), [])
+            )
+        ]
+        if reason is None and not fresh[key]:
+            reason = "no fresh window: every identity of this family touched it before"
         arms[key] = {
             "family": arm["family"],
             "feature_class": arm["feature_class"],
-            "pool": len(arm["pool"]),
+            "pool": len(fresh[key]) if reason is None else 0,
+            "stale": len(arm["pool"]) - len(fresh[key]),
             "successes": stats["successes"],
             "failures": stats["failures"],
             "posterior": [
@@ -636,17 +803,16 @@ def allocate(
         policy.floor,
         {k2: digest([policy.seed, run_id, k2]) for k2 in eligible},
     )
-    pools = catalog.arms()
     trials = []
     for key in sorted(eligible):
         arms[key]["p_best"] = shares[key]
         arms[key]["count"] = counts[key]
         ranked = sorted(
-            pools[key]["pool"],
+            fresh[key],
             key=lambda feature: (
                 -history["features"].get((key, feature), {}).get("successes", 0),
                 sum(history["features"].get((key, feature), {}).values()),
-                digest([policy.seed, run_id, key, feature]),
+                sha256_bytes(f"{policy.seed}|{run_id}|{key}|{feature}".encode()),
             ),
         )
         family = arms[key]["family"]
@@ -659,6 +825,7 @@ def allocate(
                     "family": family,
                     "feature": feature,
                     "family_key": key,
+                    "identity": identity(family, feature),
                 }
             )
     m = len(trials)
@@ -674,7 +841,6 @@ def allocate(
         "windows": windows,
         "policy": asdict(policy),
         "catalog_sha256": catalog.sha256(),
-        "catalog": asdict(catalog),
         "arms": arms,
         "trials": trials,
         "trial_count": m,
@@ -683,7 +849,8 @@ def allocate(
         "recorded_at": recorded_at or now_iso(),
     }
     record, sha = ledger._append(record)
-    return {"record": record, "sha256": sha}
+    # the catalog lives in the genesis record (frozen); handed on for the protocol
+    return {"record": record, "sha256": sha, "catalog": ledger.genesis["catalog"]}
 
 
 def abandon(ledger: Ledger, reason: str, recorded_at: str | None = None) -> dict:
@@ -715,7 +882,7 @@ def protocol_for_allocation(allocation: dict, **settings) -> Protocol:
     those families.
     """
     record = allocation["record"]
-    catalog = record["catalog"]
+    catalog = allocation["catalog"]
     declared = {t["family"] for t in record["trials"]}
     families = tuple(f for f in catalog["families"] if f in declared)
     for key in ("run_id", "features", "families", "trials", "self_lag", "selection",
@@ -877,13 +1044,24 @@ def ingest_forward_outcomes(
 ) -> int:
     """Append final forward-log verdicts (S10 output) for holdout survivors.
 
-    All lines are validated before any is appended. Returns the count appended.
+    All lines are validated before any is appended. Each verdict touches its
+    identity's forward window ``[end of the trial's run, evaluated_through]``;
+    ``inconclusive`` updates no score, and a verdict whose window overlaps a
+    window a later run declared for the same identity is recorded with
+    ``scored: false``. Returns the count appended.
     """
     data = Path(path).read_bytes()
     source_sha = sha256_bytes(data)
     lines = [line for line in data.decode("utf-8").splitlines() if line.strip()]
     trials = {t["trial_id"]: t for t in ledger.trial_results()}
+    run_end = {
+        t["trial_id"]: a["windows"]["end"] for a in ledger.allocations() for t in a["trials"]
+    }
+    run_of = {
+        t["trial_id"]: a["run_id"] for a in ledger.allocations() for t in a["trials"]
+    }
     seen = {v["trial_id"] for v in ledger.of_kind("forward_outcome")}
+    touched = ledger.touched_windows()
     verdicts = []
     for number, line in enumerate(lines, 1):
         entry = json.loads(line)
@@ -895,20 +1073,42 @@ def ingest_forward_outcomes(
         if entry["candidate_sha256"] != trial["candidate_sha256"]:
             raise ValueError(f"line {number}: candidate hash differs from the ledger")
         if entry["outcome"] not in FORWARD_OUTCOMES:
-            raise ValueError(f"line {number}: only final pass/fail verdicts are ingested")
-        if not isinstance(entry["n"], int) or entry["n"] < 1:
-            raise ValueError(f"line {number}: n must be a positive integer")
-        stamp(entry["evaluated_through"])
+            raise ValueError(f"line {number}: only final pass/fail/inconclusive verdicts")
+        if not isinstance(entry["n"], int) or entry["n"] < 0:
+            raise ValueError(f"line {number}: n must be a non-negative integer")
+        if entry["outcome"] != "inconclusive" and entry["n"] < 1:
+            raise ValueError(f"line {number}: a pass/fail verdict needs n >= 1")
+        start = run_end[entry["trial_id"]]
+        if stamp(entry["evaluated_through"]) < stamp(start):
+            raise ValueError(f"line {number}: evaluated_through precedes the run's end")
+        if not isinstance(entry["prereg_sha256"], str) or len(entry["prereg_sha256"]) != 64:
+            raise ValueError(f"line {number}: prereg_sha256 must be a sha256")
         if entry["trial_id"] in seen:
             raise ValueError(f"line {number}: trial already has a forward verdict")
         seen.add(entry["trial_id"])
-        verdicts.append(entry)
-    for entry in verdicts:
+        forward_window = {"start": start, "end": entry["evaluated_through"]}
+        key = identity(trial["family"], trial["feature"])
+        reused = [
+            w["source"]
+            for w in touched.get(key, [])
+            if w["source"] != run_of[entry["trial_id"]]
+            and overlaps((w["start"], w["end"]), {**forward_window, "closed": True})
+        ]
+        verdicts.append((entry, key, forward_window, reused))
+    for entry, key, forward_window, reused in verdicts:
         ledger._append(
             {
                 "kind": "forward_outcome",
                 **entry,
                 "family_key": trials[entry["trial_id"]]["family_key"],
+                "identity": key,
+                "forward_window": forward_window,
+                "scored": entry["outcome"] in SCORED_FORWARD and not reused,
+                **(
+                    {"unscored_reason": f"forward window re-used by {sorted(reused)}"}
+                    if reused
+                    else {}
+                ),
                 "source_sha256": source_sha,
                 "recorded_at": recorded_at or now_iso(),
             }
@@ -939,13 +1139,18 @@ def summarize(ledger: Ledger) -> dict:
             o: sum(v["outcome"] == o for v in ledger.of_kind("forward_outcome"))
             for o in FORWARD_OUTCOMES
         },
+        "forward_unscored": sum(
+            not v["scored"] for v in ledger.of_kind("forward_outcome")
+        ),
         "families": {
             key: {**stats, "trials": stats["successes"] + stats["failures"]}
             for key, stats in sorted(outcomes.items())
         },
         "error_control": (
             f"P(any false discovery over every run) <= sum_k alpha_k < q = {ledger.q} "
-            "(Holm per run, arbitrary dependence)"
+            "(Holm per run, arbitrary dependence); nominal: assumes valid null "
+            "p-values, and the block-permutation null is ~7% at 5% when its block "
+            "cap binds in small samples"
         ),
         "promotion_allowed": False,
     }
@@ -1098,7 +1303,13 @@ def run_synthetic_dry_runs(
     output.mkdir(parents=True, exist_ok=False)
     catalog = synthetic_catalog()
     policy = policy or Policy(budget=21, floor=1, seed=seed)
-    ledger = Ledger.create(output / "ledger.jsonl", ledger_id=f"s11-synthetic-{seed}", q=q)
+    ledger = Ledger.create(
+        output / "ledger.jsonl",
+        catalog=catalog,
+        anchor=output / "ledger.anchor.jsonl",
+        ledger_id=f"s11-synthetic-{seed}",
+        q=q,
+    )
     steps = []
     for k in range(1, runs + 1):
         epoch = synthetic_epoch(catalog, k, seed=seed, planted=planted)
