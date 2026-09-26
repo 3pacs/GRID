@@ -108,6 +108,105 @@ measures only frozen selections in the holdout, by design. The test
 `tests/test_offline_research_replay_v2.py` asserts all of the above and takes
 about 35 s locally.
 
+## S09: fixes from the #658 review, PIT origin, real-panel adapter (2026-09-26)
+
+Run the tests with `python -m pytest tests/test_offline_research_stats_core.py tests/test_research_real_panel.py tests/test_run_real_panel_scan.py -q`.
+
+- **Fixed-step runs are diagnostic only.** At its default block (overlap
+  depth + 1), `fixed_step_block_null` is anti-conservative. The #658 reviewer
+  measured 8.5% at n=60 and 10.75% at n=240 for a nominal 5%. It still reports
+  every p-value and BH-adjusted p, but it never sets `selected`, so it produces
+  no holdout checks and no candidates. The manifest records
+  `candidate_eligible: false` and the caveat under `caveats`, and the `method`
+  string ends with `CAVEAT: ...`. A re-signed fixed-step manifest that carries
+  a selection is refused. Candidates come only from `horizon_spaced` runs.
+- **Horizon-spaced block-1 calibration test.** An independent AR(1)
+  (phi 0.95) feature against serially independent outcomes gives 4.0% at
+  n=60 and 3.9% at n=240, with 800 simulations and 499 permutations. The
+  exact size of `p < 0.05` at that resolution is 4.8%. The reviewer measured
+  4.25%.
+- **`change` labels.** `build_family_rows(..., label="change")` labels
+  `end - start` for rates, spreads and indexes that can be 0 or negative. The
+  label is part of the horizon identity, so a family cannot mix label kinds.
+- **Distinct PIT origin `pit_vintage_read`.** `exploratory_replay` is a
+  self-declared label, so this origin is gated differently. A `Protocol` with
+  this origin must carry `pit_receipt`, the sha256 of a `PitPanel` receipt,
+  and no other origin may carry one. `analysis/research_real_panel.py` is the
+  only constructor of a `PitPanel` (`load_pit_panel`, guarded by a capability
+  token). It reads each declared series once through
+  `store.observations.read_window` with `as_of` and `as_of_ts`: `SUCCESS`
+  rows only, the latest vintage per date, nothing pulled after `as_of_ts`.
+  `discover` and `evaluate_holdout` re-derive every row from the verified
+  panel and refuse:
+  - the label without a panel;
+  - a look-alike object;
+  - a mismatched receipt;
+  - tampered rows;
+  - a panel changed after its read;
+  - a window past `as_of`;
+  - a panel passed with any other origin.
+- **Adapter availability rules.** A feature observation dated `d` becomes
+  usable at the first business-day session on or after `d + lag_days`, where
+  `lag_days` is a conservative per-series publication lag: 1 for daily
+  H.15/ICE/VIX, 8 for H.10 FX, 2 for H.4.1. It is then carried forward at
+  most `stale_sessions` sessions. A target's label becomes known at the first
+  session on or after `label_end + lag_days`, and a label not known inside
+  its window is purged.
+- **Adapter refusals.** The adapter refuses `snap:*`, LLM/telemetry counters,
+  astro/celestial ids, yfinance ids (`YF:`/`YF_ADJ:`, see S07/#642) and
+  `revised=True` series. It builds no SQL of its own and never names
+  `discovered_hypotheses` or `hypothesis_registry`.
+- **`scripts/run_real_panel_scan.py`.** The scan engine is read-only: a
+  NullPool engine with `default_transaction_read_only=on`,
+  `statement_timeout` of at most 60 s and autocommit. It writes
+  `summary.json`, `trial-ledger.csv`, `frozen-candidates.json` and the
+  contract receipts to a new directory.
+
+### First real-panel ledger (grid-svr, read-only, commit `ef0d564b`)
+
+Artifact: `wha/outputs/hypothesis-loop-20260926/` (operator outputs folder).
+
+**Setup:**
+
+- **Universe:** 30 FRED/AAII series. Each is single-source with 0
+  multi-valued dates in a bounded pre-run probe, and none is materially
+  revised. With chg5/chg20/z60 transforms that gives 90 features.
+- **Targets:** forward *changes* over 1/5/20 sessions in VIXCLS, DGS2, T10Y2Y
+  and BAMLH0A0HYM2, for 12 families. There are no price targets.
+- **Windows:** discovery 2004-01-02 to 2018-01-02; holdout 2018-01-02 to
+  2026-09-26 (`as_of` 2026-09-25).
+- **Protocol:** 20,000 permutations and BH q=0.10.
+
+**Results:**
+
+- **Trials:** 1,080, all of them testable.
+- **BH rejections:** 89 (critical p = 0.0081; the first-rank cut is 9.3e-5).
+- **Holdout:** 8 retrospective survivors, which are frozen as
+  `FORWARD_EVIDENCE_PENDING` with `promotion_allowed: false`.
+
+This is not the near-zero of the ETF-return replay. The targets are
+non-traded levels with known serial structure: the HY OAS 5-session change has
+acf1 = +0.34 and the VIX 5-session change has acf1 = -0.18. The selections are
+a few known effects counted many times:
+
+- credit-spread momentum;
+- VIX mean reversion and vol-state spillover;
+- short-rate policy drift.
+
+A post-hoc re-read of the identical panel (receipt hash matched; not a scan,
+nothing frozen) keeps 102, 102 and 108 selections with blocks 2, 4 and 8, so
+the result is not an artifact of the block-1 null. The machinery detects real
+dependence. Tradable targets still need the price-basis split, and those scans
+should exclude each target's own-family proxies.
+
+**Known limits.**
+
+- **Revisions are hindsight.** Every row of this universe was pulled on or
+  after 2026-03-24 (backfill). `as_of_ts` makes the read reproducible, but it
+  does not give first-release values.
+- **Sessions are business days**, not an exchange calendar.
+- **Publication lags are declared constants**, not per-release timestamps.
+
 ## Lineage and boundaries
 
 Claude's corrected vault #101 retracts its original leaking 12/3 survivors and
@@ -136,7 +235,7 @@ reads `hypothesis_registry`, `discovered_hypotheses` or `scanner_weights`.
 - The block null preserves within-block target dependence and the feature's
   autocorrelation. It is not an exact test for every dependence structure: in
   the calibration test it cuts a 29% IID false-positive rate to about 9%, not
-  to 5%.
+  to 5%. Since S09, fixed-step runs are diagnostic only for this reason.
 - A durable cross-run trial budget and single-use holdout registry; authenticated
   code/protocol/input hashes; no repeated tuning against the same holdout.
 - Prospective prediction logging before outcomes, frozen sample-size and stopping
