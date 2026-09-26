@@ -87,6 +87,85 @@ describe('Discovery view async data', () => {
         });
         expect(screen.queryByText('discovery jobs unavailable')).not.toBeInTheDocument();
     });
+
+    it('keeps a populated orthogonality result visible when clustering fails', async () => {
+        api.getJobs.mockResolvedValue({ jobs: [] });
+        api.getResults.mockImplementation((type) => type === 'clustering'
+            ? Promise.reject(new Error('503'))
+            : Promise.resolve({ result: {
+                n_features_analyzed: 7,
+                true_dimensionality: 3,
+                highly_correlated_pairs: [],
+                as_of_date: '2026-09-19',
+            } }));
+
+        render(<Discovery />);
+
+        expect(await screen.findByText('Clustering result unavailable.')).toBeInTheDocument();
+        expect(screen.getByText('Features analyzed')).toBeInTheDocument();
+        expect(screen.getByText('As of 2026-09-19')).toBeInTheDocument();
+        expect(screen.queryByText('No completed clustering run found.')).not.toBeInTheDocument();
+    });
+
+    it('keeps a populated clustering result visible when orthogonality fails', async () => {
+        api.getJobs.mockResolvedValue({ jobs: [] });
+        api.getResults.mockImplementation((type) => type === 'orthogonality'
+            ? Promise.reject(new Error('503'))
+            : Promise.resolve({ result: {
+                best_k: 4,
+                pca_components_used: 2,
+                variance_explained: 0.8,
+            } }));
+
+        render(<Discovery />);
+
+        expect(await screen.findByText('Orthogonality result unavailable.')).toBeInTheDocument();
+        expect(screen.getByText('Best k')).toBeInTheDocument();
+        expect(screen.getByText('Result time unknown')).toBeInTheDocument();
+    });
+
+    it('shows checked-empty only for explicit null results and unavailable for invalid responses', async () => {
+        api.getJobs.mockResolvedValue({ jobs: [] });
+        api.getResults.mockImplementation((type) => Promise.resolve(type === 'orthogonality'
+            ? { result: null }
+            : { message: 'missing result field' }));
+
+        render(<Discovery />);
+
+        expect(await screen.findByText('No completed orthogonality audit found.')).toBeInTheDocument();
+        expect(screen.getByText('Clustering result unavailable.')).toBeInTheDocument();
+    });
+
+    it('does not render a failed audit payload as a successful result', async () => {
+        api.getJobs.mockResolvedValue({ jobs: [] });
+        api.getResults.mockImplementation((type) => Promise.resolve(type === 'orthogonality'
+            ? { result: { error: 'No eligible features', n_features_analyzed: 0 } }
+            : { result: null }));
+
+        render(<Discovery />);
+
+        expect(await screen.findByText('Orthogonality result unavailable.')).toBeInTheDocument();
+        expect(screen.getByText('No completed clustering run found.')).toBeInTheDocument();
+        expect(screen.queryByText('Features analyzed')).not.toBeInTheDocument();
+    });
+
+    it('shows a settled result while the other section loads and preserves full job timestamps', async () => {
+        const gate = deferred();
+        api.getJobs.mockResolvedValue({ jobs: [{
+            id: 'j1', type: 'clustering', status: 'complete',
+            started: '2026-09-01T01:02:03Z', finished: '2026-09-01T01:04:05Z',
+        }] });
+        api.getResults.mockImplementation((type) => type === 'clustering' ? gate.promise : Promise.resolve({ result: null }));
+
+        render(<Discovery />);
+
+        expect(screen.getAllByTestId('loading-skeleton').length).toBeGreaterThan(0);
+        expect(await screen.findByText('No completed orthogonality audit found.')).toBeInTheDocument();
+        expect(screen.getByText('Loading clustering result...')).toBeInTheDocument();
+        gate.resolve({ result: null });
+        expect(await screen.findByText('No completed clustering run found.')).toBeInTheDocument();
+        expect(screen.getByText(/Started: 2026-09-01T01:02:03Z.*Finished: 2026-09-01T01:04:05Z/)).toBeInTheDocument();
+    });
 });
 
 // GRID W4c — GET /api/v1/snapshots/research/latest, rendered by the
