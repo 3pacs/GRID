@@ -32,9 +32,11 @@ fi
 
 mkdir -p "${LOG_DIR}"
 cd "${CODE_ROOT}"
+set +u  # .env is not written for nounset
 set -a
 # shellcheck disable=SC1090
 source "${ENV_FILE}"
 set +a
+set -u
 echo "$(date -u +%FT%TZ) hypothesis_forward_v1 run, code $(cat "${CODE_ROOT}/VERSION")"
 PYTHONPATH="${CODE_ROOT}" "${VENV_PYTHON}" -m scripts.research_forward_log run --log-dir "${LOG_DIR}"
