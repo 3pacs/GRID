@@ -1436,7 +1436,7 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
                 {gexData ? (
                     <div style={{ gridColumn: '1 / -1' }}>
                         {isMobile ? (
-                            <CollapsibleSection title="DEALER GEX PROFILE" defaultExpanded={false}
+                            <CollapsibleSection title="MODELED GEX PROFILE" defaultExpanded={false}
                                 body={<GEXProfile ticker={ticker} gexData={gexData} spotPrice={gexData.spot} />} />
                         ) : (
                             <GEXProfile ticker={ticker} gexData={gexData} spotPrice={gexData.spot} />
