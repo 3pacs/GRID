@@ -1385,8 +1385,11 @@ def detect_convergence(
 
     Returns:
         List of convergence event dicts with combined confidence.
+
+    Read-only: it runs on GET paths (thesis, risk, money-flow), so it does
+    not call ``_ensure_tables`` — ``signal_sources`` is owned by schema.sql
+    and the writer paths (``register_signal``, scoring) that ensure it.
     """
-    _ensure_tables(engine)
     events: list[dict[str, Any]] = []
     now = datetime.now(timezone.utc)
 
