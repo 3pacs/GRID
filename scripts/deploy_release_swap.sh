@@ -273,6 +273,194 @@ if [ "${test_only_skip_preservation:-0}" != 1 ]; then
   fi
 fi
 
+# Preserve every installed/loaded GRID service's current and restart directory,
+# not just the scheduler recorded above. Activation is intentionally independent
+# of a release swap (notably for realtime). Keep the union across the swap so a
+# mutable WorkingDirectory symlink cannot erase its former target from this set.
+# Service repoints must share release coordination; refresh before each deletion
+# as well, failing closed on an unreadable/deleted process cwd or systemd query.
+declare -A runtime_release_dirs=()
+CGROUP_ROOT=/sys/fs/cgroup
+PROC_CGROUP_ROOT=/proc
+runtime_pid_start() {
+  local raw rest
+  local -a fields
+  raw="$(cat -- "/proc/$1/stat")" || return 1
+  rest="${raw##*) }"
+  read -r -a fields <<< "$rest"
+  [ "${#fields[@]}" -ge 20 ] && [[ "${fields[19]}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${fields[19]}"
+}
+runtime_pid_cgroup() {
+  local raw
+  raw="$(cat -- "$PROC_CGROUP_ROOT/$1/cgroup")" || return 1
+  # Only a single unified-v2 entry is understood; never guess at v1/hybrid.
+  [[ "$raw" == 0::/* && "$raw" != *$'\n'* ]] || return 1
+  printf '%s\n' "${raw#0::}"
+}
+runtime_pid_cwd() {
+  local pid="$1" result
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  if result="$(LC_ALL=C readlink -v -- "/proc/$pid/cwd" 2>&1)"; then
+    printf '%s\n' "$result"
+  elif [ "$result" = "readlink: /proc/$pid/cwd: Permission denied" ]; then
+    # Root-owned registered service processes can deny the deploy user's read.
+    # Escalate only this numeric PID's read-only link lookup, never a shell.
+    sudo -n -- readlink -- "/proc/$pid/cwd" 2>/dev/null
+  else
+    return 1
+  fi
+}
+protect_runtime_pid() {
+  local pid="$1" owner="$2" cwd start end
+  if [[ ! "$pid" =~ ^[1-9][0-9]*$ ]] ||
+     ! start="$(runtime_pid_start "$pid")" ||
+     ! cwd="$(runtime_pid_cwd "$pid")" || [[ "$cwd" == *' (deleted)' ]]; then
+    echo "missing/deleted runtime cwd for $owner PID $pid" >&2
+    exit 5
+  fi
+  protect_runtime_path "$cwd" "$owner PID $pid"
+  if ! end="$(runtime_pid_start "$pid")" || [ "$start" != "$end" ]; then
+    echo "runtime PID identity changed for $owner PID $pid" >&2
+    exit 5
+  fi
+}
+protect_runtime_path() {
+  local path="$1" owner="$2" resolved relative release
+  if [[ "$path" != /* ]] || ! resolved="$(realpath -e -- "$path")" || [ ! -d "$resolved" ]; then
+    echo "cannot resolve $owner runtime directory: $path" >&2
+    exit 5
+  fi
+  # Also retain a configured alias inside the releases directory: deleting the
+  # alias would break a future restart even though its resolved target survives.
+  case "$path" in
+    "$RELEASES_DIR"/*)
+      relative="${path#"$RELEASES_DIR"/}"
+      runtime_release_dirs["${RELEASES_DIR}/${relative%%/*}"]=1
+      ;;
+  esac
+  case "$resolved" in
+    "$RELEASES_DIR"/*)
+      relative="${resolved#"$RELEASES_DIR"/}"
+      release="${RELEASES_DIR}/${relative%%/*}"
+      runtime_release_dirs["$release"]=1
+      ;;
+  esac
+}
+protect_runtime_cgroup() {
+  local cgroup="$1" owner="$2" main_pid="$3" cgroup_dir files file members member
+  if [ ! -f "$CGROUP_ROOT/cgroup.controllers" ] || [[ "$cgroup" != /* ]] ||
+     [ "$cgroup" = / ] || ! cgroup_dir="$(realpath -e -- "$CGROUP_ROOT$cgroup")" ||
+     [ "$cgroup_dir" != "$CGROUP_ROOT$cgroup" ] ||
+     [ "$(realpath -e -- "$CGROUP_ROOT")" != "$CGROUP_ROOT" ] || [ ! -d "$cgroup_dir" ]; then
+    echo "unsupported or unresolved cgroup for $owner: $cgroup" >&2
+    exit 5
+  fi
+  if ! files="$(find "$cgroup_dir" -type f -name cgroup.procs -print)" ||
+     [ ! -f "$cgroup_dir/cgroup.procs" ] || [ -z "$files" ]; then
+    echo "cannot completely inventory cgroup for $owner" >&2
+    exit 5
+  fi
+  while IFS= read -r file; do
+    if ! members="$(cat -- "$file")"; then
+      echo "cannot read cgroup membership for $owner" >&2
+      exit 5
+    fi
+    while IFS= read -r member; do
+      [ -n "$member" ] || continue
+      protect_runtime_pid "$member" "$owner cgroup"
+      runtime_member_count=$((runtime_member_count + 1))
+      [ "$member" != "$main_pid" ] || runtime_main_seen=1
+    done <<< "$members"
+  done <<< "$files"
+}
+refresh_runtime_release_dirs() {
+  [ "${test_only_skip_preservation:-0}" != 1 ] || return 0
+  local installed loaded units unit details key value load pid workdir workdir_seen
+  local state substate type remain exec_pid cgroup cgroup_seen actual_cgroup start end
+  local runtime_member_count runtime_main_seen
+  if ! installed="$(systemctl list-unit-files --no-legend --no-pager 'grid-*.service')" ||
+     ! loaded="$(systemctl list-units --all --plain --no-legend --no-pager 'grid-*.service')"; then
+    echo 'cannot inventory GRID service runtimes; refusing release deletion' >&2
+    exit 5
+  fi
+  units="$(printf '%s\n%s\n' "$installed" "$loaded" | awk 'NF {print $1}' | sort -u)"
+  if [ -z "$units" ]; then
+    echo 'empty GRID service inventory; refusing release deletion' >&2
+    exit 5
+  fi
+  while IFS= read -r unit; do
+    [[ "$unit" == grid-*.service ]] || { echo "invalid runtime unit: $unit" >&2; exit 5; }
+    # A template cannot run without an instance; loaded instances are included
+    # by list-units above and must still be inspected.
+    [[ "$unit" != *@.service ]] || continue
+    if ! details="$(systemctl show --property=LoadState,MainPID,WorkingDirectory,ActiveState,ControlGroup,SubState,Type,RemainAfterExit,ExecMainPID -- "$unit")"; then
+      echo "cannot inspect runtime unit $unit" >&2
+      exit 5
+    fi
+    load= pid= workdir= workdir_seen=0 state= cgroup= cgroup_seen=0
+    substate= type= remain= exec_pid=
+    while IFS='=' read -r key value; do
+      case "$key" in
+        LoadState) load="$value" ;;
+        MainPID) pid="$value" ;;
+        WorkingDirectory) workdir="$value"; workdir_seen=1 ;;
+        ActiveState) state="$value" ;;
+        ControlGroup) cgroup="$value"; cgroup_seen=1 ;;
+        SubState) substate="$value" ;;
+        Type) type="$value" ;;
+        RemainAfterExit) remain="$value" ;;
+        ExecMainPID) exec_pid="$value" ;;
+      esac
+    done <<< "$details"
+    if [ "$load" != loaded ] || [[ ! "$pid" =~ ^[0-9]+$ ]] ||
+       [ "$workdir_seen" != 1 ] || [ "$cgroup_seen" != 1 ] || [ -z "$state" ] ||
+       [ -z "$substate" ] || [ -z "$type" ] || [[ ! "$remain" =~ ^(yes|no)$ ]] ||
+       [[ ! "$exec_pid" =~ ^[0-9]+$ ]]; then
+      echo "ambiguous runtime identity for $unit" >&2
+      exit 5
+    fi
+    # Empty WorkingDirectory means systemd's default /, not an unknown value.
+    protect_runtime_path "${workdir:-/}" "$unit configured"
+    # MainPID=0 does not prove an empty unit: forked workers can remain in its
+    # cgroup during failure/stopping. The only active empty-group exception is
+    # an explicitly exited RemainAfterExit oneshot, which has no running task.
+    if [ "$pid" = 0 ] && [ -z "$cgroup" ] && [ "$type" = oneshot ] &&
+       [ "$remain" = yes ] && [ "$state" = active ] && [ "$substate" = exited ]; then
+      continue
+    fi
+    runtime_member_count=0 runtime_main_seen=0 actual_cgroup=
+    if [ "$pid" != 0 ]; then
+      if [ "$pid" != "$exec_pid" ] || ! start="$(runtime_pid_start "$pid")" ||
+         ! actual_cgroup="$(runtime_pid_cgroup "$pid")"; then
+        echo "unverifiable main process identity for $unit" >&2
+        exit 5
+      fi
+      protect_runtime_pid "$pid" "$unit"
+      protect_runtime_cgroup "$actual_cgroup" "$unit actual" "$pid"
+      if [ "$runtime_main_seen" != 1 ]; then
+        echo "main PID missing from actual cgroup for $unit" >&2
+        exit 5
+      fi
+    fi
+    if [ -n "$cgroup" ] && [ "$cgroup" != "$actual_cgroup" ]; then
+      protect_runtime_cgroup "$cgroup" "$unit declared" "$pid"
+    fi
+    if [ "$runtime_member_count" = 0 ] && [ "$state" != inactive ] && [ "$state" != failed ]; then
+      echo "ambiguous empty/inconsistent cgroup for $unit" >&2
+      exit 5
+    fi
+    if [ "$pid" != 0 ]; then
+      if ! end="$(runtime_pid_start "$pid")" || [ "$start" != "$end" ] ||
+         [ "$(runtime_pid_cgroup "$pid")" != "$actual_cgroup" ]; then
+        echo "runtime identity changed during inventory for $unit" >&2
+        exit 5
+      fi
+    fi
+  done <<< "$units"
+}
+refresh_runtime_release_dirs
+
 # Crash recovery: see header. Only fires when <live_path> does not exist as
 # anything at all (a prior run was killed mid-conversion).
 if [ ! -e "$LIVE_PATH" ] && [ ! -L "$LIVE_PATH" ]; then
@@ -323,8 +511,10 @@ if [ -L "$LIVE_PATH" ]; then
 fi
 
 if [ -e "$CANDIDATE_DIR" ]; then
+  refresh_runtime_release_dirs
   if [ "${test_only_skip_preservation:-0}" != 1 ] &&
-     { [ "$CANDIDATE_DIR" = "$scheduler_dir" ] || [ "$CANDIDATE_DIR" = "$recovery_dir" ]; }; then
+     { [ "$CANDIDATE_DIR" = "$scheduler_dir" ] || [ "$CANDIDATE_DIR" = "$recovery_dir" ] ||
+       [ "${runtime_release_dirs[$CANDIDATE_DIR]:-0}" = 1 ]; }; then
     echo "candidate label names a protected runtime directory" >&2
     exit 5
   fi
@@ -385,13 +575,29 @@ echo "label=$LABEL swapped_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${RELEASES_DIR}
 # Prune old releases, keeping the one just replaced (for manual rollback)
 # plus the new one -- never the candidate we just failed to promote, since a
 # failed run exits above before reaching this point.
+# Cleanup is best-effort AFTER the pointer/activation marker are committed.
+# A pruning failure must not turn a successful swap into a failed build step,
+# which would prevent deploy.yml from restarting API/Hermes onto the new tree.
+# An asynchronous subshell preserves errexit (unlike `if function ...`) and the
+# inherited protected-path union, while containing helper `exit` and rm errors.
 if [ -n "$previous_target" ]; then
-  mapfile -t all_releases < <(find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-)
+  (
+  set -euo pipefail
+  # Process substitution hides find/sort errors from mapfile and set -e. Never
+  # act on a partial directory inventory even if it contains plausible paths.
+  if ! release_inventory="$(find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-)" ||
+     [ -z "$release_inventory" ]; then
+    echo 'cannot completely inventory releases; refusing prune' >&2
+    exit 5
+  fi
+  mapfile -t all_releases <<< "$release_inventory"
   kept=0
   for rel in "${all_releases[@]}"; do
+    refresh_runtime_release_dirs
     if [ "$rel" = "$CANDIDATE_DIR" ] || [ "$rel" = "$previous_target" ] ||
        { [ "${test_only_skip_preservation:-0}" != 1 ] &&
-         { [ "$rel" = "$scheduler_dir" ] || [ "$rel" = "$recovery_dir" ]; }; }; then
+         { [ "$rel" = "$scheduler_dir" ] || [ "$rel" = "$recovery_dir" ] ||
+           [ "${runtime_release_dirs[$rel]:-0}" = 1 ]; }; }; then
       kept=$((kept + 1))
       continue
     fi
@@ -402,6 +608,14 @@ if [ -n "$previous_target" ]; then
       kept=$((kept + 1))
     fi
   done
+  ) &
+  prune_pid=$!
+  if wait "$prune_pid"; then
+    :
+  else
+    prune_status=$?
+    echo "::warning::Release swap succeeded; pruning stopped (status $prune_status). Remaining old releases are retained; continue activation of $CANDIDATE_DIR." >&2
+  fi
 fi
 
 exit 0
