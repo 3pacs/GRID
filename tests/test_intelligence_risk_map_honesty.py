@@ -111,10 +111,9 @@ def test_every_subsystem_unavailable_when_nothing_is_measurable(monkeypatch):
     assert len(result["errors"]) == 6
     assert "unavailable" in result["risk_narrative"].lower()
 
-    # The retired literals must not appear anywhere in the payload.
-    flat = repr(result)
-    for literal in ("20.0", "400", "'ig_spread': 100", "0.3", "'avg_cross_correlation': 0.5", "'overall_risk_score': 0.5"):
-        assert literal not in flat, literal
+    # The structural numeric checks above cover placeholder readings. Searching
+    # repr(result) also inspects generated_at, whose fractional seconds can
+    # coincidentally contain a retired value such as "400".
 
 
 def test_measured_subsystems_carry_real_numbers_and_overall_averages_only_them(monkeypatch):

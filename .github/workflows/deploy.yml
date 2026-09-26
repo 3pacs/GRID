@@ -633,13 +633,22 @@ jobs:
             BACKUP="${DROPIN}.bak-$(date -u +%Y%m%dT%H%M%SZ)"
             sudo cp -a "$DROPIN" "$BACKUP"
             echo "Existing drop-in backed up to $BACKUP"
-            echo "Exact rollback: sudo cp -a $BACKUP $DROPIN && sudo systemctl daemon-reload && sudo systemctl restart grid-scheduler" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "Prior scheduler drop-in backup: $BACKUP. Restoration requires a separate code/schema/writer decision; this file may contain a mutable path." | tee -a "$GITHUB_STEP_SUMMARY"
           else
             echo "No pre-existing drop-in at $DROPIN (first activation)."
-            echo "Exact rollback: sudo rm $DROPIN && sudo systemctl daemon-reload && sudo systemctl restart grid-scheduler" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "No prior scheduler drop-in. Restoration requires a separate code/schema/writer decision; removing this drop-in may expose a different base-unit path." | tee -a "$GITHUB_STEP_SUMMARY"
           fi
-          printf '%s\n' '[Service]' "WorkingDirectory=$DEPLOY_PATH" | sudo tee "$DROPIN" >/dev/null
+          # A mutable release link would select new code on any later
+          # Restart=always recovery, even without activate_scheduler=true.
+          # Keep future restarts on this exact reviewed release directory.
+          SCHEDULER_RELEASE="$(readlink -f -- "$DEPLOY_PATH")"
+          RELEASES_ROOT="$(readlink -f -- "${DEPLOY_PATH}.releases")"
+          test -d "$SCHEDULER_RELEASE"
+          test "$(dirname -- "$SCHEDULER_RELEASE")" = "$RELEASES_ROOT"
+          test "$(git -C "$SCHEDULER_RELEASE" rev-parse HEAD)" = "${{ github.sha }}"
+          printf '%s\n' '[Service]' "WorkingDirectory=$SCHEDULER_RELEASE" | sudo tee "$DROPIN" >/dev/null
           sudo systemctl daemon-reload
+          test "$(systemctl show -p WorkingDirectory --value grid-scheduler)" = "$SCHEDULER_RELEASE"
           sudo systemctl restart grid-scheduler
 
       # Same proof-of-tree pattern as the grid-hermes verify above -- a bare

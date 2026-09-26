@@ -9,9 +9,11 @@ from __future__ import annotations
 import importlib
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 from datetime import timedelta
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import pytest
 from alembic.migration import MigrationContext
@@ -24,7 +26,10 @@ from sqlalchemy.engine.url import make_url
 from sqlalchemy.exc import IntegrityError
 
 from normalization.resolver import _resolve_spy_close_receipt
-from price_close_contract import capture_payload
+from price_close_contract import (
+    SPY_CLOSE_CONTRACT, SPY_CLOSE_SERIES, SPY_ENTRY_RULE, SPY_OUTCOME_RULE,
+    capture_payload,
+)
 from store.astrogrid import AstroGridStore
 
 
@@ -72,6 +77,8 @@ def receipt_pg_engine() -> Engine:
             """))
             conn.execute(text("INSERT INTO source_catalog VALUES (1, 'yfinance', 1)"))
             conn.execute(text("INSERT INTO feature_registry VALUES (2791, 'spy_full')"))
+            conn.execute(text("INSERT INTO feature_registry VALUES (2792, 'btc_full')"))
+            conn.execute(text("CREATE TABLE regime_history (obs_date DATE, regime TEXT, confidence DOUBLE PRECISION)"))
             conn.execute(text("""
                 CREATE TABLE astrogrid.prediction_run (
                     id BIGSERIAL PRIMARY KEY, prediction_id TEXT NOT NULL UNIQUE,
@@ -139,6 +146,59 @@ def _raw(engine: Engine, obs_date: date, pulled_at: datetime, price: float,
 def _source(raw_id: int, pulled_at: datetime, price: float, payload: dict | None) -> dict:
     return {"source_name": "yfinance", "source_id": 1, "raw_id": raw_id,
             "pull_timestamp": pulled_at, "value": price, "raw_payload": payload}
+
+
+def _receipt(engine: Engine, obs_date: date, price: float,
+             *, delay_days: int = 1, microseconds: int = 0) -> dict:
+    pulled_at = datetime.combine(
+        obs_date + timedelta(days=delay_days), datetime.min.time(), timezone.utc,
+    ) + timedelta(minutes=5, microseconds=microseconds)
+    marker = capture_payload(obs_date, pulled_at)
+    raw_id = _raw(engine, obs_date, pulled_at, price, marker)
+    assert _resolve_spy_close_receipt(
+        engine, 2791, obs_date, [_source(raw_id, pulled_at, price, marker)],
+    ) == 1
+    with engine.connect() as conn:
+        receipt = AstroGridStore(engine)._verified_spy_receipt(
+            conn, cutoff=pulled_at + timedelta(days=1), mode="id",
+            receipt_id=conn.execute(text("""
+                SELECT id FROM astrogrid.price_close_receipt WHERE raw_series_id = :raw_id
+            """), {"raw_id": raw_id}).scalar_one(),
+        )
+    assert receipt is not None
+    return receipt
+
+
+def _prediction(engine: Engine, created_day: date, entry: dict) -> str:
+    created_at = datetime.combine(created_day, datetime.min.time(), timezone.utc) + timedelta(hours=12)
+    prediction_id = "spy-test-" + uuid4().hex
+    anchor = {
+        "version": SPY_CLOSE_CONTRACT, "entry_rule": SPY_ENTRY_RULE,
+        "outcome_rule": SPY_OUTCOME_RULE, "basis": SPY_CLOSE_SERIES,
+        "symbol": "SPY", "entry_receipt_id": entry["receipt_id"],
+        "entry_raw_series_id": entry["raw_series_id"],
+        "entry_resolved_series_id": entry["resolved_series_id"],
+        "entry_obs_date": entry["obs_date"].isoformat(),
+        "entry_price": entry["price"],
+        "entry_available_at": entry["available_at"].isoformat(),
+    }
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO astrogrid.prediction_run (
+                prediction_id, created_at, as_of_ts, horizon_label, target_universe,
+                scoring_class, target_symbols, question, call, timing, setup,
+                invalidation, market_overlay_snapshot, mystical_feature_payload,
+                grid_feature_payload, weight_version, model_version, live_or_local,
+                status, comparable_publish_status, comparable_publish_payload
+            ) VALUES (
+                :pid, :created, :created, 'swing', 'equity', 'liquid_market',
+                '["SPY"]'::jsonb, 'SPY test', 'buy SPY', 'one week', 'test',
+                'invalidate', CAST(:overlay AS jsonb), '{}'::jsonb, '{}'::jsonb,
+                'test', 'test', 'live', 'created', 'not_attempted', '{}'::jsonb
+            )
+        """), {"pid": prediction_id, "created": created_at,
+                "overlay": json.dumps({"price_close_contract": anchor})})
+    return prediction_id
 
 
 def test_provisional_transition_exact_lineage_atomicity_and_pit(receipt_pg_engine: Engine) -> None:
@@ -327,3 +387,374 @@ def test_receipt_to_astrogrid_api_anchor_to_score_without_hindsight(
         f"entry_obs={entry_day.isoformat()} outcome_obs={outcome_day.isoformat()} "
         "preavailability_unscored=1 entry_linked=1 outcome_linked=1 scored=1"
     )
+
+
+@pytest.mark.parametrize("scoring_zone", ["UTC", "America/New_York"])
+def test_missing_outcomes_do_not_fill_bounded_batch(
+    receipt_pg_engine: Engine, scoring_zone: str,
+) -> None:
+    engine = receipt_pg_engine
+    today = datetime.now(timezone.utc).date()
+    old_ids = []
+    for days_ago in (70, 45):
+        created_day = today - timedelta(days=days_ago)
+        entry = _receipt(engine, created_day - timedelta(days=1), 680.0)
+        old_ids.append(_prediction(engine, created_day, entry))
+    created_day = today - timedelta(days=20)
+    entry = _receipt(engine, created_day - timedelta(days=1), 680.0)
+    wanted_id = _prediction(engine, created_day, entry)
+    _receipt(engine, created_day + timedelta(days=7), 700.0)
+
+    from sqlalchemy import event
+
+    @event.listens_for(engine, "checkout")
+    def set_scoring_zone(dbapi_conn, _record, _proxy) -> None:
+        with dbapi_conn.cursor() as cursor:
+            cursor.execute(f"SET TIME ZONE '{scoring_zone}'")
+
+    try:
+        engine.dispose()
+        summary = AstroGridStore(engine).score_predictions(as_of_date=today, limit=2)
+    finally:
+        event.remove(engine, "checkout", set_scoring_zone)
+    assert summary["scored"] == 1
+    assert summary["prediction_ids"] == [wanted_id]
+    with engine.connect() as conn:
+        assert conn.execute(text("""
+            SELECT count(*) FROM astrogrid.prediction_score ps
+            JOIN astrogrid.prediction_run pr ON pr.id = ps.prediction_run_id
+            WHERE pr.prediction_id = ANY(:ids)
+        """), {"ids": old_ids}).scalar_one() == 0
+
+
+def test_malformed_outcomes_do_not_fill_bounded_batch(receipt_pg_engine: Engine) -> None:
+    engine = receipt_pg_engine
+    today = datetime.now(timezone.utc).date()
+    old_ids = []
+    for days_ago in (70, 45):
+        created_day = today - timedelta(days=days_ago)
+        entry = _receipt(engine, created_day - timedelta(days=1), 680.0)
+        old_ids.append(_prediction(engine, created_day, entry))
+        outcome = _receipt(engine, created_day + timedelta(days=7), 700.0)
+        # Simulate a broken source lineage after the receipt was created.
+        # The receipt still exists, but _verified_spy_receipt rejects it.
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE raw_series SET raw_payload = '{}'::jsonb WHERE id = :raw_id
+            """), {"raw_id": outcome["raw_series_id"]})
+    created_day = today - timedelta(days=20)
+    entry = _receipt(engine, created_day - timedelta(days=1), 680.0)
+    wanted_id = _prediction(engine, created_day, entry)
+    _receipt(engine, created_day + timedelta(days=7), 705.0)
+
+    summary = AstroGridStore(engine).score_predictions(as_of_date=today, limit=2)
+    assert summary["scored"] == 1
+    assert summary["prediction_ids"] == [wanted_id]
+    with engine.connect() as conn:
+        assert conn.execute(text("""
+            SELECT count(*) FROM astrogrid.prediction_score ps
+            JOIN astrogrid.prediction_run pr ON pr.id = ps.prediction_run_id
+            WHERE pr.prediction_id = ANY(:ids)
+        """), {"ids": old_ids}).scalar_one() == 0
+
+
+def test_earlier_malformed_receipt_does_not_hide_later_verified_close(
+    receipt_pg_engine: Engine,
+) -> None:
+    engine = receipt_pg_engine
+    created_day = datetime.now(timezone.utc).date() - timedelta(days=20)
+    entry = _receipt(engine, created_day - timedelta(days=1), 680.0)
+    prediction_id = _prediction(engine, created_day, entry)
+    malformed = _receipt(engine, created_day + timedelta(days=7), 690.0)
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE raw_series SET raw_payload = '{}'::jsonb WHERE id = :id"),
+                     {"id": malformed["raw_series_id"]})
+    valid = _receipt(engine, created_day + timedelta(days=8), 700.0)
+
+    summary = AstroGridStore(engine).score_predictions(as_of_date=datetime.now(timezone.utc).date(), limit=1)
+    assert summary["scored"] == 1
+    assert summary["prediction_ids"] == [prediction_id]
+    with engine.connect() as conn:
+        chosen = conn.execute(text("""
+            SELECT ps.raw_payload->'price_close_evidence'->>'outcome_receipt_id'
+            FROM astrogrid.prediction_score ps
+            JOIN astrogrid.prediction_run pr ON pr.id = ps.prediction_run_id
+            WHERE pr.prediction_id = :pid
+        """), {"pid": prediction_id}).scalar_one()
+    assert int(chosen) == valid["receipt_id"]
+
+
+def _scoreable_btc_prediction(engine: Engine, today: date) -> str:
+    non_spy_id = "non-spy-test-" + uuid4().hex
+    created_at = datetime.combine(today - timedelta(days=20), datetime.min.time(), timezone.utc)
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO resolved_series
+                (feature_id, obs_date, release_date, vintage_date, value, source_priority_used)
+            VALUES (2792, :prior_day, :prior_day, :prior_day, 69000, 1),
+                   (2792, :entry_day, :entry_day, :entry_day, 70000, 1),
+                   (2792, :outcome_day, :outcome_day, :outcome_day, 71000, 1)
+        """), {"prior_day": created_at.date() - timedelta(days=1),
+                "entry_day": created_at.date(), "outcome_day": today - timedelta(days=1)})
+        conn.execute(text("""
+            INSERT INTO astrogrid.prediction_run (
+                prediction_id, created_at, as_of_ts, horizon_label, target_universe,
+                scoring_class, target_symbols, question, call, timing, setup,
+                invalidation, market_overlay_snapshot, mystical_feature_payload,
+                grid_feature_payload, weight_version, model_version, live_or_local,
+                status, comparable_publish_status, comparable_publish_payload
+            ) VALUES (
+                :pid, :created, :created, 'swing', 'crypto', 'liquid_market',
+                '["BTC"]'::jsonb, 'BTC test', 'buy BTC', 'one week', 'test',
+                'invalidate', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
+                'test', 'test', 'live', 'created', 'not_attempted', '{}'::jsonb
+            )
+        """), {"pid": non_spy_id, "created": created_at})
+    return non_spy_id
+
+
+def test_missing_spy_backlog_does_not_starve_non_spy_candidate(
+    receipt_pg_engine: Engine,
+) -> None:
+    engine = receipt_pg_engine
+    today = datetime.now(timezone.utc).date()
+    for days_ago in (70, 45):
+        created_day = today - timedelta(days=days_ago)
+        entry = _receipt(engine, created_day - timedelta(days=1), 680.0)
+        _prediction(engine, created_day, entry)
+    non_spy_id = _scoreable_btc_prediction(engine, today)
+    summary = AstroGridStore(engine).score_predictions(as_of_date=today - timedelta(days=1), limit=1)
+    assert summary["candidates"] == 1
+    assert summary["scored"] == 1
+    assert summary["prediction_ids"] == [non_spy_id]
+
+
+@pytest.mark.parametrize("writer_zone,scorer_zone,microseconds,lowercase", [
+    ("UTC", "America/New_York", 0, False),
+    ("America/New_York", "UTC", 123456, False),
+    ("Asia/Kolkata", "UTC", 654321, False),
+    ("UTC", "Asia/Kolkata", 123456, True),
+])
+def test_valid_spy_anchor_keeps_priority_across_time_zone_offsets(
+    receipt_pg_engine: Engine, writer_zone: str, scorer_zone: str,
+    microseconds: int, lowercase: bool,
+) -> None:
+    from sqlalchemy import event
+
+    engine = receipt_pg_engine
+    today = datetime.now(timezone.utc).date()
+    created_day = today - timedelta(days=20)
+
+    @event.listens_for(engine, "checkout")
+    def set_writer_zone(dbapi_conn, _record, _proxy) -> None:
+        with dbapi_conn.cursor() as cursor:
+            cursor.execute(f"SET TIME ZONE '{writer_zone}'")
+
+    try:
+        engine.dispose()
+        entry = _receipt(engine, created_day - timedelta(days=1), 680.0,
+                         microseconds=microseconds)
+        spy_id = _prediction(engine, created_day, entry)
+    finally:
+        event.remove(engine, "checkout", set_writer_zone)
+        engine.dispose()
+    _receipt(engine, created_day + timedelta(days=7), 700.0)
+    btc_id = _scoreable_btc_prediction(engine, today)
+    if lowercase:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE astrogrid.prediction_run SET target_symbols = '["spy"]'::jsonb
+                WHERE prediction_id = :pid
+            """), {"pid": spy_id})
+
+    @event.listens_for(engine, "checkout")
+    def set_scorer_zone(dbapi_conn, _record, _proxy) -> None:
+        with dbapi_conn.cursor() as cursor:
+            cursor.execute(f"SET TIME ZONE '{scorer_zone}'")
+
+    try:
+        engine.dispose()
+        btc_start_day = datetime.combine(
+            today - timedelta(days=20), datetime.min.time(), timezone.utc,
+        ).astimezone(ZoneInfo(scorer_zone)).date()
+        assert AstroGridStore(engine)._lookup_symbol_price("BTC", btc_start_day)["status"] == "ok"
+        assert AstroGridStore(engine)._lookup_symbol_price(
+            "BTC", today - timedelta(days=1),
+        )["status"] == "ok"
+        summary = AstroGridStore(engine).score_predictions(
+            as_of_date=today - timedelta(days=1), limit=1,
+        )
+    finally:
+        event.remove(engine, "checkout", set_scorer_zone)
+        engine.dispose()
+    assert summary["candidates"] == 1
+    assert summary["scored"] == 1, summary
+    assert summary["prediction_ids"] == [spy_id], summary
+    with engine.connect() as conn:
+        assert conn.execute(text("""
+            SELECT count(*) FROM astrogrid.prediction_score ps
+            JOIN astrogrid.prediction_run pr ON pr.id = ps.prediction_run_id
+            WHERE pr.prediction_id = :pid
+        """), {"pid": btc_id}).scalar_one() == 0
+
+
+@pytest.mark.parametrize("field,value", [
+    ("entry_receipt_id", "0"),
+    ("entry_available_at", '"invalid timestamp"'),
+    ("entry_available_at", '"2026-13-40T00:05:00+04:00"'),
+    ("entry_available_at", '"2026-09-04T00:05:00.123456+25:00"'),
+])
+def test_invalid_entry_anchor_cannot_occupy_ready_slot(
+    receipt_pg_engine: Engine, field: str, value: str,
+) -> None:
+    engine = receipt_pg_engine
+    today = datetime.now(timezone.utc).date()
+    bad_day = today - timedelta(days=40)
+    bad_entry = _receipt(engine, bad_day - timedelta(days=1), 680.0)
+    bad_id = _prediction(engine, bad_day, bad_entry)
+    _receipt(engine, bad_day + timedelta(days=7), 700.0)
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE astrogrid.prediction_run
+            SET market_overlay_snapshot = jsonb_set(
+                market_overlay_snapshot, CAST(:path AS text[]), CAST(:value AS jsonb))
+            WHERE prediction_id = :pid
+        """), {"pid": bad_id, "path": ["price_close_contract", field], "value": value})
+    good_day = today - timedelta(days=20)
+    good_entry = _receipt(engine, good_day - timedelta(days=1), 680.0)
+    good_id = _prediction(engine, good_day, good_entry)
+    _receipt(engine, good_day + timedelta(days=7), 710.0)
+    summary = AstroGridStore(engine).score_predictions(as_of_date=today, limit=1)
+    assert summary["prediction_ids"] == [good_id]
+
+
+def test_case_normalized_spy_uses_created_utc_day_for_maturity(
+    receipt_pg_engine: Engine,
+) -> None:
+    engine = receipt_pg_engine
+    today = datetime.now(timezone.utc).date()
+    created_day = today - timedelta(days=8)
+    entry = _receipt(engine, created_day - timedelta(days=1), 680.0)
+    prediction_id = _prediction(engine, created_day, entry)
+    _receipt(engine, created_day + timedelta(days=7), 700.0)
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE astrogrid.prediction_run
+            SET target_symbols = '["spy"]'::jsonb,
+                as_of_ts = created_at + INTERVAL '1 day'
+            WHERE prediction_id = :pid
+        """), {"pid": prediction_id})
+    # The scorer recognizes lowercase SPY, but its anchor rejects a forged
+    # as_of timestamp. Candidate maturity must still match created_at UTC.
+    summary = AstroGridStore(engine).score_predictions(
+        as_of_date=created_day + timedelta(days=7), prediction_ids=[prediction_id],
+    )
+    assert summary["candidates"] == 1
+    assert summary["unscored"][0]["reason"] == "invalid_entry_anchor"
+
+
+def test_outcome_window_edges_and_earliest_date(receipt_pg_engine: Engine) -> None:
+    engine = receipt_pg_engine
+    created_day = datetime.now(timezone.utc).date() - timedelta(days=20)
+    target_day = created_day + timedelta(days=7)
+    entry = _receipt(engine, created_day - timedelta(days=1), 680.0)
+    prediction_id = _prediction(engine, created_day, entry)
+    _receipt(engine, target_day - timedelta(days=1), 690.0)
+    _receipt(engine, target_day + timedelta(days=5), 710.0)
+    store = AstroGridStore(engine)
+    before = store.score_predictions(prediction_ids=[prediction_id])
+    assert before["scored"] == 0
+    assert before["unscored"][0]["reason"] == "missing_verified_outcome"
+
+    late_edge = _receipt(engine, target_day + timedelta(days=4), 704.0)
+    with engine.connect() as conn:
+        selected = store._verified_spy_receipt(
+            conn, cutoff=datetime.now(timezone.utc), mode="outcome",
+            min_date=target_day, max_date=target_day + timedelta(days=4),
+        )
+    assert selected and selected["receipt_id"] == late_edge["receipt_id"]
+    early_edge = _receipt(engine, target_day, 700.0)
+    scored = store.score_predictions(prediction_ids=[prediction_id])
+    assert scored["scored"] == 1
+    with engine.connect() as conn:
+        evidence = conn.execute(text("""
+            SELECT ps.raw_payload->'price_close_evidence'->>'outcome_receipt_id'
+            FROM astrogrid.prediction_score ps
+            JOIN astrogrid.prediction_run pr ON pr.id = ps.prediction_run_id
+            WHERE pr.prediction_id = :pid
+        """), {"pid": prediction_id}).scalar_one()
+    assert int(evidence) == early_edge["receipt_id"]
+    assert early_edge["receipt_id"] != late_edge["receipt_id"]
+
+
+def test_scoring_is_idempotent_with_concurrent_callers(receipt_pg_engine: Engine) -> None:
+    engine = receipt_pg_engine
+    created_day = datetime.now(timezone.utc).date() - timedelta(days=20)
+    entry = _receipt(engine, created_day - timedelta(days=1), 680.0)
+    prediction_id = _prediction(engine, created_day, entry)
+    _receipt(engine, created_day + timedelta(days=7), 700.0)
+    store = AstroGridStore(engine)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(
+            lambda _: store.score_predictions(prediction_ids=[prediction_id]), range(2),
+        ))
+    assert sum(result["scored"] for result in results) == 1
+    assert store.score_predictions(prediction_ids=[prediction_id])["scored"] == 0
+    with engine.connect() as conn:
+        assert conn.execute(text("""
+            SELECT count(*) FROM astrogrid.prediction_score ps
+            JOIN astrogrid.prediction_run pr ON pr.id = ps.prediction_run_id
+            WHERE pr.prediction_id = :pid
+        """), {"pid": prediction_id}).scalar_one() == 1
+
+
+def test_entry_timestamp_matches_across_session_time_zones(receipt_pg_engine: Engine) -> None:
+    engine = receipt_pg_engine
+    created_day = datetime.now(timezone.utc).date() - timedelta(days=20)
+    entry = _receipt(engine, created_day - timedelta(days=1), 680.0)
+    prediction_id = _prediction(engine, created_day, entry)
+    _receipt(engine, created_day + timedelta(days=7), 700.0)
+    # Force all pooled sessions used by the scorer to represent timestamptz
+    # values in New York time while the frozen anchor remains in UTC text.
+    from sqlalchemy import event
+
+    @event.listens_for(engine, "checkout")
+    def set_scoring_zone(dbapi_conn, _record, _proxy) -> None:
+        with dbapi_conn.cursor() as cursor:
+            cursor.execute("SET TIME ZONE 'America/New_York'")
+
+    try:
+        engine.dispose()
+        assert AstroGridStore(engine).score_predictions(
+            prediction_ids=[prediction_id],
+        )["scored"] == 1
+    finally:
+        event.remove(engine, "checkout", set_scoring_zone)
+
+
+def test_late_earlier_close_exposes_outcome_finality_gap(receipt_pg_engine: Engine) -> None:
+    """Document existing v1 behavior for a separate controller policy decision."""
+    engine = receipt_pg_engine
+    created_day = datetime.now(timezone.utc).date() - timedelta(days=20)
+    target_day = created_day + timedelta(days=7)
+    entry = _receipt(engine, created_day - timedelta(days=1), 680.0)
+    prediction_id = _prediction(engine, created_day, entry)
+    later_day = _receipt(engine, target_day + timedelta(days=1), 705.0)
+    store = AstroGridStore(engine)
+    assert store.score_predictions(prediction_ids=[prediction_id])["scored"] == 1
+    earlier_day = _receipt(engine, target_day, 700.0, delay_days=3)
+
+    with engine.connect() as conn:
+        now_selected = store._verified_spy_receipt(
+            conn, cutoff=datetime.now(timezone.utc), mode="outcome",
+            min_date=target_day, max_date=target_day + timedelta(days=4),
+        )
+        stored_id = int(conn.execute(text("""
+            SELECT ps.raw_payload->'price_close_evidence'->>'outcome_receipt_id'
+            FROM astrogrid.prediction_score ps
+            JOIN astrogrid.prediction_run pr ON pr.id = ps.prediction_run_id
+            WHERE pr.prediction_id = :pid
+        """), {"pid": prediction_id}).scalar_one())
+    assert now_selected and now_selected["receipt_id"] == earlier_day["receipt_id"]
+    assert stored_id == later_day["receipt_id"]
+    assert store.score_predictions(prediction_ids=[prediction_id])["scored"] == 0

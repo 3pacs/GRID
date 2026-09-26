@@ -1,8 +1,25 @@
 from pathlib import Path
 
+from packaging.requirements import Requirement
+from sqlalchemy import create_engine
+
 
 REQUIREMENTS_PATH = Path(__file__).resolve().parents[1] / "requirements.txt"
 REQUIREMENTS_API_PATH = Path(__file__).resolve().parents[1] / "requirements-api.txt"
+
+
+def test_postgresql_engine_uses_installed_psycopg2_driver() -> None:
+    # Engine construction imports the driver but does not open a connection.
+    # SQLAlchemy 2.1 changed the default to psycopg v3, which GRID does not ship.
+    requirement = Requirement(_requirement_line(REQUIREMENTS_PATH, "sqlalchemy"))
+    assert "2.0.52" in requirement.specifier
+    assert "2.1.0" not in requirement.specifier
+    engine = create_engine("postgresql://localhost/grid_driver_contract")
+    try:
+        assert engine.dialect.driver == "psycopg2"
+        assert engine.dialect.dbapi.__name__ == "psycopg2"
+    finally:
+        engine.dispose()
 
 
 def _read_non_comment_lines(path: Path) -> list[str]:

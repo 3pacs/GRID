@@ -188,9 +188,12 @@ def test_spy_and_binance_resolve_together_in_one_partition_without_interference(
     # never finds them at all -- confirmed directly: an earlier version of
     # this test picked timestamps outside that window and the scan found
     # only 1 of the 2 series (a test-setup bug, not a resolver bug).
-    spy_obs = (now - timedelta(days=2)).date()
+    # Keep both captures on prior UTC dates: today's 01:00 is still in the
+    # future when this test runs between midnight and 01:00. Distinct older
+    # observation dates retain the same cross-series composition coverage.
+    spy_obs = (now - timedelta(days=3)).date()
     spy_pulled_at = datetime.combine(spy_obs + timedelta(days=1), time(1, 0), tzinfo=timezone.utc)
-    btc_obs = (now - timedelta(days=1)).date()
+    btc_obs = (now - timedelta(days=2)).date()
     btc_pulled_at = datetime.combine(btc_obs + timedelta(days=1), time(1, 0), tzinfo=timezone.utc)
     assert spy_pulled_at < now and btc_pulled_at < now, "test setup: both pulls must be in the past"
 
